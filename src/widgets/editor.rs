@@ -2611,6 +2611,23 @@ pub enum ExternalChange {
     /// The buffer had unsaved edits, so the external change was flagged as a
     /// conflict instead of being applied.
     Conflict,
+    /// The file is gone from disk (#900). The buffer, dirty or not, stays
+    /// as it is and the next explicit save puts the file back.
+    Deleted,
+}
+
+/// What the FS sweep last reported about a tab whose file stopped matching
+/// it (#900): a failed reload or a deletion is announced once per change on
+/// disk, not on every sweep while disk stays put.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DiskReport {
+    /// The tab's `disk_stamp` when reported. A reload, save or reopen moves
+    /// that on, which retires the report.
+    synced: Option<(SystemTime, u64)>,
+    /// What disk held then: `None` when it could not be read.
+    found: Option<(SystemTime, u64)>,
+    /// Whether the file was gone, not merely unreadable.
+    deleted: bool,
 }
 
 /// Why a buffer is written. Only an auto-save, which fires mid-typing,
@@ -2703,11 +2720,17 @@ pub struct ExternalReloadReport {
     /// floor left the user staring at stale content with no indication
     /// the sweep even tried (#37).
     pub failed: Vec<PathBuf>,
+    /// Paths of tabs whose file was deleted on disk (#900). The tab keeps
+    /// its buffer and is marked `(deleted)` until a save puts the file back.
+    pub deleted: Vec<PathBuf>,
 }
 
 impl ExternalReloadReport {
     pub fn is_empty(&self) -> bool {
-        self.reloaded.is_empty() && self.conflicts.is_empty() && self.failed.is_empty()
+        self.reloaded.is_empty()
+            && self.conflicts.is_empty()
+            && self.failed.is_empty()
+            && self.deleted.is_empty()
     }
 }
 
@@ -3726,6 +3749,9 @@ pub struct Editor {
     /// the flag drives the conflict warning and makes `save_to_disk` refuse
     /// to overwrite until the user forces it.
     pub disk_conflict: bool,
+    /// The sweep's last report of a failed reload or a deletion (#900), so
+    /// it is not repeated while disk stays where it was reported.
+    disk_report: Option<DiskReport>,
     /// Set when a save was refused because `encoding` cannot represent the
     /// buffer. Latches like `disk_conflict` so auto save stops retrying (and
     /// stops re-reporting) a file only an explicit Cmd+S can resolve; cleared
@@ -3936,6 +3962,7 @@ impl Editor {
             disk_stamp: None,
             disk_expect_absent: false,
             disk_conflict: false,
+            disk_report: None,
             encoding_loss: false,
             lossy_save_armed: false,
             write_protected: false,
@@ -5383,6 +5410,11 @@ impl Editor {
             self.stash_history();
         }
         let opened = self.open_file(path);
+        if opened.is_ok() {
+            // What the sweep said about the file this tab held is not about
+            // this one, even with the same stamp (#900).
+            self.disk_report = None;
+        }
         if changed_file {
             // On a failed open the tab may still hold the file it left, and
             // takes its history back the same way.
@@ -11558,10 +11590,56 @@ impl Editor {
     ///   * dirty buffer + external change -> flag a conflict so neither the
     ///     buffer nor the disk is clobbered,
     ///   * no change -> nothing.
+    ///
+    /// A failed reload or a deletion is reported once, then the sweep stays
+    /// quiet until disk changes again (#900).
     pub fn reload_or_flag_conflict(&mut self) -> ExternalChange {
         if !self.disk_changed_externally() {
+            self.disk_report = None;
             return ExternalChange::Unchanged;
         }
+        let found = self
+            .path
+            .as_deref()
+            .and_then(|p| self.current_disk_stamp(p));
+        // Only a file that is not there is deleted: a stat that fails any
+        // other way (an I/O error, a parent turned unreadable) is a failed
+        // reload, and its save keeps the conflict check.
+        let deleted = found.is_none() && self.path.as_deref().is_some_and(gone_from_disk);
+        let report = DiskReport {
+            synced: self.disk_stamp,
+            found,
+            deleted,
+        };
+        if self.disk_report == Some(report) {
+            if deleted || self.dirty {
+                return ExternalChange::Unchanged;
+            }
+            // Reported once, but a clean tab keeps trying: a read can start
+            // working again with nothing on disk moving, as when a
+            // permission is put back.
+            return match self.reload_from_disk() {
+                Ok(()) => {
+                    self.disk_report = None;
+                    ExternalChange::Reloaded
+                }
+                Err(_) => {
+                    self.disk_report = Some(DiskReport {
+                        synced: self.disk_stamp,
+                        ..report
+                    });
+                    ExternalChange::Unchanged
+                }
+            };
+        }
+        if deleted {
+            // Gone, not changed: there is nothing to reload, and no external
+            // edit for the buffer to conflict with or a save to clobber.
+            self.disk_report = Some(report);
+            self.disk_conflict = false;
+            return ExternalChange::Deleted;
+        }
+        self.disk_report = None;
         if self.dirty {
             // Announce the conflict only on the transition into it. A buffer
             // that stays dirty while disk keeps differing must not re-fire on
@@ -11576,8 +11654,24 @@ impl Editor {
         }
         match self.reload_from_disk() {
             Ok(()) => ExternalChange::Reloaded,
-            Err(_) => ExternalChange::ReloadFailed,
+            Err(_) => {
+                // Keyed on the stamp as the failed open left it, which is
+                // what the next sweep compares.
+                self.disk_report = Some(DiskReport {
+                    synced: self.disk_stamp,
+                    found,
+                    deleted: false,
+                });
+                ExternalChange::ReloadFailed
+            }
         }
+    }
+
+    /// True while this tab's file is known to be gone from disk (#900): the
+    /// sweep reported it deleted and nothing has synced the tab since.
+    pub fn deleted_on_disk(&self) -> bool {
+        self.disk_report
+            .is_some_and(|r| r.deleted && r.synced == self.disk_stamp)
     }
 
     /// Save, refusing to overwrite if the file changed on disk since we last
@@ -11596,6 +11690,15 @@ impl Editor {
 
     fn save_to_disk_for(&mut self, reason: SaveReason) -> Result<SaveOutcome> {
         if self.disk_changed_externally() {
+            // A file deleted on disk holds no external edit to clobber, so an
+            // explicit save puts it back, as VS Code does (#900). Auto save
+            // leaves it gone: a checkout or `git stash` may have meant that.
+            if self.path.as_deref().is_some_and(gone_from_disk) {
+                if reason == SaveReason::Auto {
+                    anyhow::bail!("Deleted on disk: only an explicit save recreates it");
+                }
+                return self.write_buffer_to_disk(reason);
+            }
             self.disk_conflict = true;
             return Ok(SaveOutcome::DiskConflict);
         }
@@ -21334,6 +21437,11 @@ impl EditorTabs {
                         report.failed.push(p);
                     }
                 }
+                ExternalChange::Deleted => {
+                    if let Some(p) = path {
+                        report.deleted.push(p);
+                    }
+                }
                 ExternalChange::Unchanged => {}
             }
         }
@@ -22823,6 +22931,12 @@ fn comment_line(line: &str) -> bool {
         || t == "*"
 }
 
+/// Whether `path` is gone from disk (#900): not there at all, as opposed to
+/// there but unreadable, which a deleted tab's save must not treat alike.
+fn gone_from_disk(path: &Path) -> bool {
+    matches!(std::fs::metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+}
+
 fn tab_label(e: &Editor) -> String {
     if let Some(diff) = e.diff.as_ref() {
         let l = diff
@@ -22871,6 +22985,12 @@ fn tab_label(e: &Editor) -> String {
     // The lock VS Code shows on a file the user can't write (#1379).
     let name = if e.write_protected {
         format!("{name} \u{f023}")
+    } else {
+        name
+    };
+    // VS Code's mark on a tab whose file is gone from disk (#900).
+    let name = if e.deleted_on_disk() {
+        format!("{name} (deleted)")
     } else {
         name
     };
@@ -32715,6 +32835,135 @@ mod tests {
             "one",
             "the last good buffer survives the failed reload"
         );
+    }
+
+    /// #900: the failure re-fired on every FS sweep, pinning its status
+    /// over every other message. Once per change on disk; a later change is
+    /// tried afresh.
+    #[test]
+    fn a_failed_external_reload_is_reported_once_per_change_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.txt");
+        std::fs::write(&path, "one\n").unwrap();
+        let mut e = Editor::new();
+        e.open(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert_eq!(e.reload_or_flag_conflict(), ExternalChange::ReloadFailed);
+        assert_eq!(e.reload_or_flag_conflict(), ExternalChange::Unchanged);
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(&path, "two, longer\n").unwrap();
+        assert_eq!(e.reload_or_flag_conflict(), ExternalChange::Reloaded);
+        assert_eq!(e.lines[0], "two, longer");
+    }
+
+    /// #900: a failed reload is announced once, but a clean tab keeps
+    /// trying it: a read can start working again with nothing on disk
+    /// moving (a permission put back), and the tab must not stay stale.
+    #[test]
+    fn a_failed_reload_is_retried_quietly_until_it_works() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.txt");
+        std::fs::write(&path, "one\n").unwrap();
+        let mut e = Editor::new();
+        e.open(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert_eq!(e.reload_or_flag_conflict(), ExternalChange::ReloadFailed);
+        // Readable again with the same (mtime, len) the failed read saw.
+        let meta = std::fs::metadata(&path).unwrap();
+        std::fs::remove_dir(&path).unwrap();
+        let body = "x".repeat(usize::try_from(meta.len()).unwrap());
+        std::fs::write(&path, &body).unwrap();
+        let file = std::fs::File::options().write(true).open(&path).unwrap();
+        file.set_modified(meta.modified().unwrap()).unwrap();
+        drop(file);
+        assert_eq!(e.reload_or_flag_conflict(), ExternalChange::Reloaded);
+        assert_eq!(e.lines.join("\n"), body);
+    }
+
+    /// #900: only a file that is not there is deleted. One that cannot be
+    /// stat'd for another reason (here a parent turned into a file) is a
+    /// failed reload: no `(deleted)` mark, and its save keeps the check.
+    #[test]
+    fn a_file_that_cannot_be_statd_is_not_reported_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let path = sub.join("f.txt");
+        std::fs::write(&path, "one\n").unwrap();
+        let mut e = Editor::new();
+        e.open(&path).unwrap();
+        std::fs::remove_dir_all(&sub).unwrap();
+        std::fs::write(&sub, "a file now").unwrap();
+        assert_eq!(e.reload_or_flag_conflict(), ExternalChange::ReloadFailed);
+        assert!(!e.deleted_on_disk());
+        assert_eq!(tab_label(&e), "f.txt");
+    }
+
+    /// #900: a preview tab reuses its editor, so what the sweep said about
+    /// the file it held must not stick to the next one, even one with the
+    /// same timestamp and length.
+    #[test]
+    fn opening_another_file_clears_the_deleted_mark() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.txt");
+        let b = dir.path().join("b.txt");
+        std::fs::write(&a, "same\n").unwrap();
+        std::fs::write(&b, "same\n").unwrap();
+        let stamp = std::fs::metadata(&a).unwrap().modified().unwrap();
+        let file = std::fs::File::options().write(true).open(&b).unwrap();
+        file.set_modified(stamp).unwrap();
+        drop(file);
+        let mut e = Editor::new();
+        e.open(&a).unwrap();
+        std::fs::remove_file(&a).unwrap();
+        assert_eq!(e.reload_or_flag_conflict(), ExternalChange::Deleted);
+        e.open(&b).unwrap();
+        assert!(!e.deleted_on_disk());
+        assert_eq!(tab_label(&e), "b.txt");
+    }
+
+    /// #900: a file deleted on disk is its own state, not a failed reload:
+    /// reported once, the buffer kept, the tab marked `(deleted)`.
+    #[test]
+    fn a_file_deleted_on_disk_is_reported_once_and_marks_its_tab() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.txt");
+        std::fs::write(&path, "alpha\n").unwrap();
+        let mut e = Editor::new();
+        e.open(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(e.reload_or_flag_conflict(), ExternalChange::Deleted);
+        assert_eq!(e.reload_or_flag_conflict(), ExternalChange::Unchanged);
+        assert_eq!(e.lines[0], "alpha", "the buffer is kept");
+        assert_eq!(tab_label(&e), "notes.txt (deleted)");
+        // Put back (`git stash pop`): the clean tab reloads it as usual.
+        std::fs::write(&path, "alpha, restored\n").unwrap();
+        assert_eq!(e.reload_or_flag_conflict(), ExternalChange::Reloaded);
+        assert_eq!(tab_label(&e), "notes.txt");
+    }
+
+    /// #900 (comment): unsaved edits to a file deleted on disk were treated
+    /// as a conflict with a disk copy that no longer exists. No conflict:
+    /// the first explicit save puts the file back, and auto save never does.
+    #[test]
+    fn a_dirty_tab_deleted_on_disk_is_no_conflict_and_its_save_recreates_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("b.txt");
+        std::fs::write(&path, "beta\n").unwrap();
+        let mut e = Editor::new();
+        e.open(&path).unwrap();
+        e.insert_str("my ");
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(e.reload_or_flag_conflict(), ExternalChange::Deleted);
+        assert!(!e.disk_conflict);
+        assert!(e.auto_save_to_disk().is_err());
+        assert!(!path.exists(), "auto save leaves the deletion alone");
+        assert_eq!(e.save_to_disk().unwrap(), SaveOutcome::Saved);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "my beta\n");
+        assert!(!e.deleted_on_disk());
+        assert_eq!(tab_label(&e), "b.txt");
     }
 
     #[test]
