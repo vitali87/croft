@@ -3205,10 +3205,15 @@ impl WorkerState {
             // semantic-token request queued right behind it) block on the SUM of
             // ty + basedpyright + ruff init handshakes. Concurrent spawn bounds
             // the cold-root stall to the SLOWEST single handshake instead.
-            let resolved: Vec<(ServerConfig, Vec<PathBuf>)> = configs
-                .iter()
-                .filter_map(|config| resolve_config(config, first_attempt))
-                .collect();
+            let resolved: Vec<(ServerConfig, Vec<PathBuf>)> = futures::future::join_all(
+                configs
+                    .iter()
+                    .map(|config| resolve_for_root(config, root, first_attempt)),
+            )
+            .await
+            .into_iter()
+            .flatten()
+            .collect();
             let outcomes =
                 futures::future::join_all(resolved.into_iter().map(|(config, extra_path)| {
                     let caps = build_client_capabilities();
@@ -7689,9 +7694,11 @@ fn resolve_config(config: &ServerConfig, log_skip: bool) -> Option<(ServerConfig
         // for rust-analyzer `resolve_path_only` prepends that dir to the child
         // PATH so the server can find cargo/rustc under a stripped GUI launch.
         // Only when no real binary exists anywhere do we fall back to a managed
-        // download / Termux `pkg` install. npm/uv servers keep their own
-        // managed-first (vtsls) or PATH-first (ty/ruff) ordering inside
-        // `resolve_managed`, so this preference is scoped to the Binary backend.
+        // download / Termux `pkg` install (`resolve_for_root` also does when the
+        // binary is a rustup proxy with no component behind it). npm/uv servers
+        // keep their own managed-first (vtsls) or PATH-first (ty/ruff) ordering
+        // inside `resolve_managed`, so this preference is scoped to the Binary
+        // backend.
         if matches!(provision, crate::lsp::install::Provision::Binary { .. })
             && let Some(resolved) = resolve_path_only(
                 config,
@@ -7791,6 +7798,154 @@ fn resolve_path_only(
     let mut resolved = config.clone();
     resolved.command = abs.to_string_lossy().into_owned();
     Some((resolved, extra))
+}
+
+/// [`resolve_config`] for the servers of the project at `root` (#927). A
+/// native server found on PATH or in `~/.cargo/bin` that is a rustup proxy is
+/// only a server when the toolchain `root` selects has the component behind
+/// it. rustup puts a `rust-analyzer` proxy there for every toolchain, but its
+/// default profile installs no `rust-analyzer`, and that proxy only prints
+/// "Unknown binary" and exits, so croft's managed copy serves instead.
+async fn resolve_for_root(
+    config: &ServerConfig,
+    root: &Path,
+    log_skip: bool,
+) -> Option<(ServerConfig, Vec<PathBuf>)> {
+    let found = resolve_config(config, log_skip)?;
+    let Some(provision @ crate::lsp::install::Provision::Binary { bin, .. }) = &config.provision
+    else {
+        return Some(found);
+    };
+    let Some(rustup) = command_path(&found.0.command).and_then(|p| rustup_behind(&p)) else {
+        return Some(found);
+    };
+    let key = (config.name, root.to_path_buf());
+    let known = RUSTUP_VERDICTS
+        .lock()
+        .ok()
+        .and_then(|verdicts| verdicts.get(&key).cloned());
+    let lacks = match known {
+        Some(lacks) => lacks,
+        None => {
+            let lacks = rustup_lacks(&rustup, bin, root).await;
+            if let Ok(mut verdicts) = RUSTUP_VERDICTS.lock() {
+                verdicts.insert(key, lacks.clone());
+            }
+            lacks
+        }
+    };
+    let Some(why) = lacks else {
+        return Some(found);
+    };
+    if log_skip {
+        let msg = format!(
+            "{why} (at {}); falling back to croft's managed copy",
+            root.display()
+        );
+        log_file::log(&format!("lsp[{}] {msg}", config.name));
+        crate::output::push(
+            crate::output::CHANNEL_PROVISION,
+            crate::output::OutputLevel::Info,
+            &format!("{}: {msg}", config.name),
+        );
+    }
+    crate::lsp::install::resolve_managed_instead(
+        config,
+        provision,
+        &why,
+        &format!("rustup component add {bin}"),
+    )
+}
+
+/// What [`rustup_lacks`] answered per (server, project root), so the
+/// re-probe each request makes while croft's copy downloads does not ask
+/// rustup again. Kept until croft restarts.
+static RUSTUP_VERDICTS: StdMutex<std::collections::BTreeMap<(&str, PathBuf), Option<String>>> =
+    StdMutex::new(std::collections::BTreeMap::new());
+
+/// How long rustup gets to answer before croft stops asking and keeps the
+/// proxy, as it did before it asked.
+const RUSTUP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// The file a resolved server `command` runs: itself when absolute, else
+/// the first executable of that name on PATH.
+fn command_path(command: &str) -> Option<PathBuf> {
+    let path = Path::new(command);
+    if path.is_absolute() {
+        return Some(path.to_path_buf());
+    }
+    let dirs: Vec<PathBuf> = std::env::split_paths(&std::env::var_os("PATH")?).collect();
+    find_executable_in(command, &dirs)
+}
+
+/// The `rustup` that `candidate` is a proxy for, or `None` when it is a
+/// program of its own. rustup installs its proxies as hard links to itself,
+/// or symlinks where it cannot, so a proxy is the same file as the `rustup`
+/// beside it, or beside wherever its links lead.
+fn rustup_behind(candidate: &Path) -> Option<PathBuf> {
+    let id = file_id(candidate)?;
+    let rustup = format!("rustup{}", std::env::consts::EXE_SUFFIX);
+    std::iter::once(candidate.to_path_buf())
+        .chain(std::fs::canonicalize(candidate).ok())
+        .map(|p| p.with_file_name(&rustup))
+        .find(|p| file_id(p) == Some(id))
+}
+
+/// What identifies the file `path` leads to, links followed.
+#[cfg(unix)]
+fn file_id(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
+}
+#[cfg(not(unix))]
+fn file_id(path: &Path) -> Option<PathBuf> {
+    std::fs::canonicalize(path).ok()
+}
+
+/// Why the proxy `rustup` puts in front of `bin` cannot start it for the
+/// project at `root`, or `None` when it can or rustup cannot say. Asked from
+/// `root`, since that picks the toolchain (`rust-toolchain.toml`, a directory
+/// override). `RUSTUP_AUTO_INSTALL=0` stops the question from installing a
+/// toolchain. A toolchain that is not installed at all is left to the proxy,
+/// which installs it as before, and so is a rustup too old to honour that
+/// variable that is still busy at [`RUSTUP_DEADLINE`].
+async fn rustup_lacks(rustup: &Path, bin: &str, root: &Path) -> Option<String> {
+    if rustup_says(rustup, root, &["which", bin])
+        .await?
+        .status
+        .success()
+    {
+        return None;
+    }
+    let active = rustup_says(rustup, root, &["show", "active-toolchain"]).await?;
+    if !active.status.success() {
+        return None;
+    }
+    let toolchain = String::from_utf8_lossy(&active.stdout)
+        .split_whitespace()
+        .next()?
+        .to_owned();
+    // Named the way users name it: `stable`, not `stable-<host triple>`.
+    let triple = format!("-{}-", std::env::consts::ARCH);
+    let channel = toolchain
+        .split_once(&triple)
+        .map_or(&*toolchain, |(c, _)| c);
+    Some(format!("rustup's '{channel}' toolchain has no {bin}"))
+}
+
+/// `rustup` run with `args` from `root`, or `None` when it could not be run
+/// or did not finish within [`RUSTUP_DEADLINE`] (it is killed then).
+async fn rustup_says(rustup: &Path, root: &Path, args: &[&str]) -> Option<std::process::Output> {
+    let run = tokio::process::Command::new(rustup)
+        .args(args)
+        .current_dir(root)
+        .env("RUSTUP_AUTO_INSTALL", "0")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .output();
+    tokio::time::timeout(RUSTUP_DEADLINE, run).await.ok()?.ok()
 }
 
 #[cfg(test)]
@@ -9311,6 +9466,141 @@ while True:
         assert!(
             resolve_path_only(&cfg, false, &[]).is_none(),
             "a server missing everywhere must be skipped"
+        );
+    }
+
+    /// A stand-in rustup in `dir/bin` with a `rust-analyzer` proxy linked to
+    /// it, returned as (rustup, proxy). Like the real one, it finds
+    /// `rust-analyzer` only for a project whose `rust-toolchain.toml` pins a
+    /// toolchain carrying it, names `stable` the active toolchain elsewhere,
+    /// and cannot name one where the pinned toolchain is not installed.
+    #[cfg(unix)]
+    fn fake_rustup(dir: &Path) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let rustup = bin.join("rustup");
+        let script = r#"#!/bin/sh
+case "$1" in
+which)
+  [ "$RUSTUP_AUTO_INSTALL" = 0 ] || touch installed-a-toolchain
+  if [ -f rust-toolchain.toml ]; then echo "$PWD/$2"; exit 0; fi
+  echo "error: not a file" >&2
+  exit 1 ;;
+show)
+  [ -f not-installed ] && exit 1
+  echo "stable-ARCH-unknown-linux-gnu (default)" ;;
+esac
+"#;
+        std::fs::write(&rustup, script.replace("ARCH", std::env::consts::ARCH)).unwrap();
+        std::fs::set_permissions(&rustup, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let proxy = bin.join("rust-analyzer");
+        std::os::unix::fs::symlink("rustup", &proxy).unwrap();
+        // Wait out "Text file busy" once: a test forking while the script
+        // was open for writing holds it until that child execs.
+        crate::review_ops::output_retrying_busy(std::process::Command::new(&rustup).arg("-V"))
+            .expect("the stand-in rustup runs");
+        (rustup, proxy)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_rustup_proxy_is_told_apart_from_a_program_of_its_own() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (rustup, proxy) = fake_rustup(tmp.path());
+        let hard = tmp.path().join("bin/cargo-fmt");
+        std::fs::hard_link(&rustup, &hard).unwrap();
+        let elsewhere = tmp.path().join("rust-analyzer");
+        std::os::unix::fs::symlink(&proxy, &elsewhere).unwrap();
+        for (link, how) in [
+            (proxy, "symlink"),
+            (hard, "hard link"),
+            (elsewhere, "link to a proxy"),
+        ] {
+            let found =
+                rustup_behind(&link).unwrap_or_else(|| panic!("a {how} to rustup is a proxy"));
+            assert_eq!(
+                (found.file_name(), file_id(&found)),
+                (rustup.file_name(), file_id(&rustup))
+            );
+        }
+        let own = tmp.path().join("bin/clangd");
+        std::fs::copy(&rustup, &own).unwrap();
+        assert_eq!(
+            rustup_behind(&own),
+            None,
+            "a binary of its own is never questioned"
+        );
+    }
+
+    /// #927: rustup has a `rust-analyzer` proxy for every toolchain, so
+    /// whether it can start one is a question about the toolchain the project
+    /// selects, asked from its root. Where it cannot, croft must not spawn it.
+    #[cfg(unix)]
+    #[test]
+    fn a_rustup_proxy_without_the_component_is_not_the_server_croft_starts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (rustup, proxy) = fake_rustup(tmp.path());
+        let project = |name: &str, file: Option<&str>| {
+            let dir = tmp.path().join(name);
+            std::fs::create_dir(&dir).unwrap();
+            if let Some(file) = file {
+                std::fs::write(dir.join(file), "").unwrap();
+            }
+            dir
+        };
+        let default = project("default", None);
+        let pinned = project("pinned", Some("rust-toolchain.toml"));
+        let uninstalled = project("uninstalled", Some("not-installed"));
+        let name = "croft-test-927-rust-analyzer";
+        let config = ServerConfig {
+            name,
+            command: proxy.to_string_lossy().into_owned(),
+            args: vec![],
+            language: Language::RUST,
+            initialization_options: None,
+            // No download for any platform, so croft's copy never lands here.
+            provision: Some(crate::lsp::install::Provision::Binary {
+                targets: &[],
+                bin: "rust-analyzer",
+                archive: crate::lsp::install::ArchiveKind::Gz,
+                bin_path: None,
+                termux_pkg: None,
+                sha256: &[],
+            }),
+        };
+        let rt = stub_runtime();
+        let kept = rt.block_on(resolve_for_root(&config, &pinned, false));
+        assert_eq!(
+            kept.map(|(c, _)| c.command),
+            Some(config.command.clone()),
+            "a toolchain that has rust-analyzer keeps rustup's proxy, matching the user's compiler"
+        );
+        assert!(
+            rt.block_on(resolve_for_root(&config, &default, false))
+                .is_none(),
+            "a proxy that can only print 'Unknown binary' must give way to croft's copy"
+        );
+        assert_eq!(
+            crate::lsp::install::failure_status(name, "download failed".into()),
+            "download failed; run: rustup component add rust-analyzer",
+            "if croft's copy cannot be had either, the status line says how to get rustup's"
+        );
+        assert_eq!(
+            rt.block_on(rustup_lacks(&rustup, "rust-analyzer", &default))
+                .as_deref(),
+            Some("rustup's 'stable' toolchain has no rust-analyzer"),
+        );
+        assert_eq!(
+            rt.block_on(rustup_lacks(&rustup, "rust-analyzer", &uninstalled)),
+            None,
+            "a toolchain that is not installed yet is the proxy's to install"
+        );
+        assert!(
+            [default, pinned, uninstalled]
+                .iter()
+                .all(|dir| !dir.join("installed-a-toolchain").exists()),
+            "asking must never install a toolchain"
         );
     }
 
