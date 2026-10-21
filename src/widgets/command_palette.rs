@@ -577,6 +577,9 @@ pub enum Command {
     SendHttpRequest,
     /// Copy the `.http` request under the caret as a curl command (#370).
     CopyHttpRequestAsCurl,
+    /// Pick the named environment of the `.http` env files whose values
+    /// fill requests (#924).
+    SwitchHttpEnvironment,
     /// Hand the navigator the floor on the active file: a comment-only
     /// review turn, its say anchored as comment boxes.
     YieldToNavigator,
@@ -1041,6 +1044,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::FixProblemWithNavigator,
     Command::SendHttpRequest,
     Command::CopyHttpRequestAsCurl,
+    Command::SwitchHttpEnvironment,
     Command::YieldToNavigator,
     Command::ToggleNavigator,
     Command::ClearNavigatorNotes,
@@ -1524,6 +1528,7 @@ impl Command {
             Command::FixProblemWithNavigator => "Problems: Fix With Navigator",
             Command::SendHttpRequest => "HTTP: Send Request Under Caret",
             Command::CopyHttpRequestAsCurl => "HTTP: Copy Request as curl",
+            Command::SwitchHttpEnvironment => "HTTP: Switch Environment",
             Command::YieldToNavigator => "Navigator: Yield the Turn",
             Command::ToggleNavigator => "Navigator: Activate or Deactivate",
             Command::ClearNavigatorNotes => "Navigator: Clear Comments",
@@ -2014,6 +2019,7 @@ impl Command {
             Command::FixProblemWithNavigator => "",
             Command::SendHttpRequest => "Cmd+Enter",
             Command::CopyHttpRequestAsCurl => "",
+            Command::SwitchHttpEnvironment => "",
             Command::YieldToNavigator => "Cmd+K Y",
             Command::ToggleNavigator => "",
             Command::ClearNavigatorNotes => "",
@@ -2472,6 +2478,7 @@ impl Command {
             Command::FixProblemWithNavigator => "problems_fix_navigator",
             Command::SendHttpRequest => "http_send_request",
             Command::CopyHttpRequestAsCurl => "http_copy_curl",
+            Command::SwitchHttpEnvironment => "http_switch_environment",
             Command::YieldToNavigator => "navigator_yield",
             Command::ToggleNavigator => "navigator_toggle",
             Command::ClearNavigatorNotes => "navigator_clear_notes",

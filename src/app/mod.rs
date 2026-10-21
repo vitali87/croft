@@ -4923,6 +4923,10 @@ pub struct App {
     /// worker owns the socket, the drain owns the tab, and a second send
     /// while one runs is refused rather than queued.
     http_run: Option<std::sync::mpsc::Receiver<HttpRunOutcome>>,
+    /// The `.http` env files' named environment whose values requests use
+    /// (#924), picked with HTTP: Switch Environment; `None` uses only
+    /// `$shared` and flat values, as REST Client's "No Environment" does.
+    http_environment: Option<String>,
     /// The presentation edits behind the open Change Color Presentation
     /// picker (#254), indexed by row id; cleared after a pick.
     pending_color_presentations: Vec<(String, Vec<crate::widgets::editor::TextSpanEdit>)>,
@@ -7083,6 +7087,7 @@ impl App {
             pending_lane_picks: Vec::new(),
             problems_fix_started: None,
             http_run: None,
+            http_environment: None,
             pending_color_presentations: Vec::new(),
             pending_color_context: None,
             color_presentations_request: None,
@@ -41400,6 +41405,14 @@ impl App {
                 }
             }
             ListPurpose::NotebookKernel => self.choose_notebook_kernel(&row.id),
+            ListPurpose::HttpEnvironment => {
+                self.status = if row.id.is_empty() {
+                    String::from("HTTP: no environment")
+                } else {
+                    format!("HTTP: environment {}", row.id)
+                };
+                self.http_environment = (!row.id.is_empty()).then_some(row.id);
+            }
             ListPurpose::QuickInputPosition => {
                 if let Some((pos, ..)) = QuickInputPosition::OPTIONS
                     .iter()
@@ -48934,19 +48947,83 @@ impl App {
             self.status = String::from("No request under the caret");
             return None;
         };
-        let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
-        let vars = crate::http_file::variables(&text, crate::http_file::load_env(&dir));
+        let dir = path.parent().unwrap_or(Path::new("."));
+        let env = crate::http_file::load_env(dir, self.http_environment.as_deref());
+        let vars = crate::http_file::variables(&text, env.vars);
         let (resolved, missing) = crate::http_file::resolve(&req, &vars);
         if !missing.is_empty() {
             let holes: Vec<String> = missing.iter().map(|m| format!("{{{{{m}}}}}")).collect();
-            self.status = format!(
-                "HTTP: no value for {} (set it with @name = … in the file, in {} beside it, or $env)",
-                holes.join(", "),
-                crate::http_file::ENV_FILE
-            );
+            let active = self
+                .http_environment
+                .as_ref()
+                .filter(|e| env.environments.contains(e));
+            // Named environments nobody picked are the likely gap (#924):
+            // say so rather than point at the files that hold the values.
+            self.status = match active {
+                None if !env.environments.is_empty() => format!(
+                    "HTTP: no value for {}; pick an environment ({}) with HTTP: Switch Environment",
+                    holes.join(", "),
+                    env.environments.join(", ")
+                ),
+                Some(e) => format!(
+                    "HTTP: no value for {} in environment {e} (or set it with @name = … in the file, or $env)",
+                    holes.join(", "),
+                ),
+                None => format!(
+                    "HTTP: no value for {} (set it with @name = … in the file, in {} beside it, or $env)",
+                    holes.join(", "),
+                    crate::http_file::ENV_FILE
+                ),
+            };
             return None;
         }
         Some((req, resolved, path))
+    }
+
+    /// HTTP: Switch Environment (#924): pick which named environment of the
+    /// env files beside the active `.http` file fills its requests, or none.
+    fn open_http_environment_picker(&mut self) {
+        use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+        let Some(path) = self.editor.path.clone() else {
+            self.status = String::from("No file open");
+            return;
+        };
+        if !crate::http_file::is_http_file(&path) {
+            self.status = String::from("Not a .http/.rest file");
+            return;
+        }
+        let dir = path.parent().unwrap_or(Path::new("."));
+        let envs = crate::http_file::load_env(dir, None).environments;
+        if envs.is_empty() {
+            self.status = format!(
+                "No named environments in {} beside this file",
+                crate::http_file::ENV_FILES.join(" or ")
+            );
+            return;
+        }
+        let current = self.http_environment.clone().unwrap_or_default();
+        let rows: Vec<ListRow> = std::iter::once(String::new())
+            .chain(envs)
+            .map(|id| {
+                let name = if id.is_empty() {
+                    format!("No Environment ({} only)", crate::http_file::SHARED_ENV)
+                } else {
+                    id.clone()
+                };
+                let mark = if id == current { "  (current)" } else { "" };
+                ListRow {
+                    label: format!("{name}{mark}"),
+                    id,
+                }
+            })
+            .collect();
+        let mut picker = ListPicker::new(ListPurpose::HttpEnvironment, "HTTP Environment", rows);
+        picker.selected = picker
+            .rows
+            .iter()
+            .position(|r| r.id == current)
+            .unwrap_or(0);
+        self.open_list_picker(picker, "");
     }
 
     /// Fold in a finished `.http` request (#370): record it in the durable
@@ -56594,6 +56671,7 @@ impl App {
             },
             Cmd::SendHttpRequest => self.send_http_request_under_caret(),
             Cmd::CopyHttpRequestAsCurl => self.copy_http_request_as_curl(),
+            Cmd::SwitchHttpEnvironment => self.open_http_environment_picker(),
             Cmd::AskNavigator => {
                 let (range, selection) = match self.editor.selection_rows() {
                     Some(rows) => (rows, self.editor.selection_text()),
