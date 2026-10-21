@@ -1609,6 +1609,7 @@ enum CommitAction {
 /// side of a context-menu row, when one exists. Mirrors the bindings in
 /// `handle_tree_key` / `handle_explorer_shortcut` so the menu is a
 /// discovery surface for the same accelerators the keyboard accepts.
+/// [`platform_shortcut_for`] spells it for the platform croft runs on.
 fn shortcut_for(action: &MenuAction) -> Option<&'static str> {
     match action {
         MenuAction::Create(CreateKind::File) => Some("⌘F"),
@@ -1723,12 +1724,39 @@ fn menu_action_command(action: &MenuAction) -> Option<crate::widgets::command_pa
     })
 }
 
+/// [`shortcut_for`] as a Mac (`macos`) or anything else spells it (#885):
+/// the glyphs on a Mac, elsewhere `Ctrl`, `Alt` and `Super` as
+/// [`glyph_hint_for_platform`](crate::widgets::command_palette::glyph_hint_for_platform)
+/// writes them. Off macOS the terminal pane gives `Ctrl+C`, `Ctrl+V` and
+/// `Ctrl+W` to the shell, so its Copy, Paste and Kill rows name the
+/// `Ctrl+Shift` chords it takes instead (docs/LINUX.md).
+fn platform_shortcut_for(
+    action: &MenuAction,
+    macos: bool,
+) -> Option<std::borrow::Cow<'static, str>> {
+    let glyphs = shortcut_for(action)?;
+    let in_the_terminal = match action {
+        MenuAction::TerminalCopySelection => Some("Ctrl+Shift+C"),
+        MenuAction::TerminalPaste => Some("Ctrl+Shift+V"),
+        MenuAction::KillTerminal(_) => Some("Ctrl+Shift+W"),
+        _ => None,
+    };
+    match in_the_terminal {
+        Some(chord) if !macos => Some(std::borrow::Cow::Borrowed(chord)),
+        _ => Some(crate::widgets::command_palette::glyph_hint_for_platform(
+            glyphs, macos,
+        )),
+    }
+}
+
 /// The hint on a menu row's right: the user's own chord for the command the
-/// row runs, else the built-in one.
+/// row runs, else the built-in one as this platform spells it.
 fn menu_hint(action: &MenuAction, keymap: &crate::keymap::Keymap) -> Option<String> {
     menu_action_command(action)
         .and_then(|cmd| keymap.chord_for(cmd))
-        .or_else(|| shortcut_for(action).map(str::to_string))
+        .or_else(|| {
+            platform_shortcut_for(action, cfg!(target_os = "macos")).map(|s| s.into_owned())
+        })
 }
 
 /// Display width (in cells) a menu entry needs: its label plus the right-aligned
