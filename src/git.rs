@@ -3202,9 +3202,17 @@ pub fn list_branches(root: &Path) -> Result<Vec<BranchInfo>, String> {
     Ok(branches)
 }
 
+/// Git's messages in English, whatever the user's locale (#925): a
+/// refusal to switch is told apart by its text
+/// ([`local_changes_block_switch`]), which a translated git words otherwise.
+/// `LANGUAGE` picks gettext's catalog ahead of `LC_ALL` and `LANG` and
+/// leaves the character set alone; git has no `en` catalog, so its own
+/// text is what prints.
+const ENGLISH_MESSAGES: (&str, &str) = ("LANGUAGE", "en");
+
 /// Switch to an existing local branch (`git switch <name>`).
 pub fn checkout_branch(root: &Path, name: &str) -> Result<String, String> {
-    run_mutation(root, &["switch", name])
+    run_mutation_with_env(root, &["switch", name], &[ENGLISH_MESSAGES])
 }
 
 /// Check out a remote-tracking branch as local branch `name` tracking it
@@ -3213,7 +3221,11 @@ pub fn checkout_branch(root: &Path, name: &str) -> Result<String, String> {
 /// The name is spelled out because `--track` alone guesses it by cutting
 /// at the first `/`, which makes `my/fork/solo` a `fork/solo` branch.
 pub fn track_remote_branch(root: &Path, remote_ref: &str, name: &str) -> Result<String, String> {
-    run_mutation(root, &["switch", "-c", name, "--track", remote_ref])
+    run_mutation_with_env(
+        root,
+        &["switch", "-c", name, "--track", remote_ref],
+        &[ENGLISH_MESSAGES],
+    )
 }
 
 /// Create a new branch off the current HEAD and switch to it

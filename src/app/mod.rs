@@ -2879,13 +2879,21 @@ enum ScmWrite {
     Stash,
     StashIncludeUntracked,
     StashStaged,
+    /// Stash & Checkout on a switch local changes blocked (#925).
+    StashAndSwitch,
+    /// Migrate Changes on a switch local changes blocked (#925).
+    MigrateAndSwitch,
 }
 
 impl ScmWrite {
     fn is_stash(self) -> bool {
         matches!(
             self,
-            Self::Stash | Self::StashIncludeUntracked | Self::StashStaged
+            Self::Stash
+                | Self::StashIncludeUntracked
+                | Self::StashStaged
+                | Self::StashAndSwitch
+                | Self::MigrateAndSwitch
         )
     }
 
@@ -37853,6 +37861,8 @@ impl App {
             ScmWrite::Stash => self.stash_source_control(),
             ScmWrite::StashIncludeUntracked => self.stash_include_untracked_source_control(),
             ScmWrite::StashStaged => self.stash_staged_source_control(),
+            ScmWrite::StashAndSwitch => self.stash_and_switch_picked(false),
+            ScmWrite::MigrateAndSwitch => self.stash_and_switch_picked(true),
         }
         // A write that stopped before its check (busy git, empty message)
         // must not carry the clearance to the next request.
@@ -41058,11 +41068,7 @@ impl App {
                 self.run_scm_op("stash pop", r, "Popped stash", "Pop stash");
             }
             ListPurpose::StashView => self.open_stash_patch(index),
-            ListPurpose::BlockedSwitch => {
-                if let Some((root, action)) = self.blocked_switch.take() {
-                    self.stash_and_switch(root, action, row.id == "migrate");
-                }
-            }
+            ListPurpose::BlockedSwitch => self.stash_and_switch_picked(row.id == "migrate"),
             // Asked first: the drop cannot be undone (#1128).
             ListPurpose::StashDrop => {
                 let root = self.scm_root();
@@ -57055,6 +57061,24 @@ impl App {
         self.blocked_switch = Some((self.scm_root(), action));
         let title = format!("Your changes block the switch to {name}");
         self.open_list_picker(ListPicker::new(ListPurpose::BlockedSwitch, title, rows), "");
+    }
+
+    /// Stash & Checkout or Migrate Changes picked (#925), past the
+    /// unsaved-changes prompt as any stash is (#1438): git stashes the files
+    /// on disk, so an edit still only in a tab would be left out, and the
+    /// switch would change the file under it.
+    fn stash_and_switch_picked(&mut self, migrate: bool) {
+        let op = if migrate {
+            ScmWrite::MigrateAndSwitch
+        } else {
+            ScmWrite::StashAndSwitch
+        };
+        if self.hold_for_unsaved(op) {
+            return;
+        }
+        if let Some((root, action)) = self.blocked_switch.take() {
+            self.stash_and_switch(root, action, migrate);
+        }
     }
 
     /// Stash & Checkout, or with `migrate` Migrate Changes (#925): stash the

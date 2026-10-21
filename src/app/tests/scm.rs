@@ -6594,6 +6594,41 @@ fn migrating_changes_that_conflict_names_the_conflict_and_keeps_the_stash() {
     assert_eq!(git_858(tmp.path(), &["stash", "list"]).lines().count(), 1);
 }
 
+/// #925: git stashes the files on disk, so with an edit still only in a
+/// tab, Stash & Checkout asks first, as any stash does (#1438): nothing is
+/// stashed or switched until Save All & Stash, and then the stash holds
+/// the tab's text.
+#[test]
+fn stash_and_checkout_asks_to_save_an_unsaved_tab_first() {
+    use crate::widgets::scm_menu::ScmAction;
+    let tmp = blocked_switch_repo_925();
+    let seed = tmp.path().join("seed.txt");
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::SourceControl);
+    app.editor.open_pinned(&seed).unwrap();
+    app.editor.insert_str("zero\n");
+    assert!(app.editor.dirty);
+    pick_branch_858(&mut app, ScmAction::CheckoutTo, "main");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    let pending = app.pending_unsaved_scm.as_ref().expect("the prompt opens");
+    assert_eq!(pending.op, ScmWrite::StashAndSwitch);
+    assert_eq!(
+        git_858(tmp.path(), &["branch", "--show-current"]),
+        "feature"
+    );
+    assert_eq!(git_858(tmp.path(), &["stash", "list"]), "");
+    app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.pending_unsaved_scm.is_none());
+    assert_eq!(git_858(tmp.path(), &["branch", "--show-current"]), "main");
+    assert_eq!(
+        git_858(tmp.path(), &["show", "stash@{0}:seed.txt"]),
+        "zero\none\ntwo\nthree\nfour\nFIVE"
+    );
+    assert_eq!(app.status, "Stashed your changes and switched to main");
+}
+
 /// #858: popping the latest stash reported git's `git status` dump
 /// ("Stash popped: On branch main\nChanges not staged…"); it now reports
 /// the stash it dropped.
