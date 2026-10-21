@@ -6499,8 +6499,12 @@ impl App {
             sidebar_dwell: SidebarDwell::default(),
             pre_zen: None,
             layout_icon_areas: LayoutIconAreas::default(),
-            status: match hook_bind_error {
-                Some(hook) if view_bind_error.is_none() => hook,
+            status: match (
+                merged_settings.user_config_error.as_deref(),
+                hook_bind_error,
+            ) {
+                (Some(error), _) => settings_not_loaded_status(error),
+                (None, Some(hook)) if view_bind_error.is_none() => hook,
                 _ => view_status(view_bind_error.as_deref()),
             },
             persistence_warning: remote_persistence_status(
@@ -12135,7 +12139,7 @@ impl App {
             self.status = String::from("Inlay Hints: off");
         }
         if !cfg!(test) {
-            let _ = crate::prefs::save_inlay_hints(self.inlay_hints_enabled);
+            self.report_unsaved_setting(crate::prefs::save_inlay_hints(self.inlay_hints_enabled));
         }
     }
 
@@ -14058,13 +14062,14 @@ impl App {
         self.open_customize_layout_menu_at(0);
     }
 
-    /// Persist the current Customize Layout chrome to `~/.config/croft`.
-    /// Best-effort and skipped under test (hermetic suite, like `apply_theme`).
-    fn persist_layout(&self) {
+    /// Persist the current Customize Layout chrome to `~/.config/croft`,
+    /// saying so when that fails. Skipped under test (hermetic suite, like
+    /// `apply_theme`).
+    fn persist_layout(&mut self) {
         if cfg!(test) {
             return;
         }
-        let _ = crate::prefs::save_layout(crate::prefs::LayoutPrefs {
+        let saved = crate::prefs::save_layout(crate::prefs::LayoutPrefs {
             activity_bar: self.activity_bar_visible,
             status_bar: self.status_bar_visible,
             side_bar_position: self.side_bar_position,
@@ -14075,6 +14080,7 @@ impl App {
             zen_center_layout: self.zen_center_layout,
             centered_layout_width: self.centered_layout_width,
         });
+        self.report_unsaved_setting(saved);
     }
 
     /// Show or hide the activity bar. The Customize Layout row and the
@@ -14233,13 +14239,13 @@ impl App {
     /// edge opposite the primary side bar. Mirrors ⌥⌘B.
     fn toggle_secondary_side_bar(&mut self) {
         self.secondary_side_bar_visible = !self.secondary_side_bar_visible;
-        self.persist_layout();
         self.after_chrome_visibility_change();
         self.status = String::from(if self.secondary_side_bar_visible {
             "Secondary side bar shown"
         } else {
             "Secondary side bar hidden"
         });
+        self.persist_layout();
     }
 
     /// Toggle Zen Mode: hide the activity bar, both side bars, the panel, and
@@ -14466,7 +14472,6 @@ impl App {
     /// wiring is needed for the section to appear or vanish.
     fn toggle_explorer_view(&mut self, view: ExplorerView) {
         let now_visible = self.explorer_views.toggle(view);
-        let _ = crate::prefs::save_explorer_views(self.explorer_views.as_prefs());
         if now_visible {
             match view {
                 ExplorerView::Timeline => self.timeline_fetched = None,
@@ -14479,6 +14484,11 @@ impl App {
             if now_visible { "Showing" } else { "Hiding" },
             self.explorer_view_label(view)
         );
+        if !cfg!(test) {
+            self.report_unsaved_setting(crate::prefs::save_explorer_views(
+                self.explorer_views.as_prefs(),
+            ));
+        }
     }
 
     /// The AGENT LANE rows (#345): each agent that changed files, then those
@@ -14716,7 +14726,7 @@ impl App {
         // directly instead — a workspace-set theme must not be written back
         // into the user's own config.
         if !cfg!(test) {
-            let _ = crate::prefs::save_theme(theme);
+            self.report_unsaved_setting(crate::prefs::save_theme(theme));
         }
     }
 
@@ -18966,7 +18976,9 @@ impl App {
             "Secret redaction: off"
         });
         if !cfg!(test) {
-            let _ = crate::prefs::save_disable_secret_redaction(!self.secret_redaction);
+            self.report_unsaved_setting(crate::prefs::save_disable_secret_redaction(
+                !self.secret_redaction,
+            ));
         }
     }
 
@@ -19932,14 +19944,6 @@ impl App {
     /// set, what they report, or whether the choice survives a restart.
     fn toggle_sidebar_auto_hide(&mut self) {
         self.sidebar_auto_hide = !self.sidebar_auto_hide;
-        // Best-effort, like every other pref write: a read-only config must
-        // not break the in-session toggle. Skipped under test, mirroring the
-        // write-skip in `apply_theme` — `save_*` resolves the developer's real
-        // ~/.config/croft/config.json, and a test has no business rewriting
-        // it (nor leaving the next test to read what it wrote).
-        if !cfg!(test) {
-            let _ = crate::prefs::save_sidebar_auto_hide(self.sidebar_auto_hide);
-        }
         // Turning it ON with the sidebar open takes effect at the next focus
         // move rather than retroactively yanking it away here — which means
         // dropping any collapse already pending. A dwell armed before the
@@ -19961,6 +19965,16 @@ impl App {
             "Auto-hide side bar {}",
             if self.sidebar_auto_hide { "on" } else { "off" }
         );
+        // A read-only config must not break the in-session toggle; a failed
+        // write is only said. Skipped under test, mirroring the write-skip
+        // in `apply_theme` — `save_*` resolves the developer's real
+        // ~/.config/croft/config.json, and a test has no business rewriting
+        // it (nor leaving the next test to read what it wrote).
+        if !cfg!(test) {
+            self.report_unsaved_setting(crate::prefs::save_sidebar_auto_hide(
+                self.sidebar_auto_hide,
+            ));
+        }
     }
 
     /// Arm the grace delay before collapsing. Called on focus moves INTO the
@@ -26376,11 +26390,11 @@ impl App {
             return;
         }
         let now_enabled = self.disabled_extensions.contains(&id);
-        self.set_extension_enabled(&id, now_enabled);
         self.status = format!(
             "{} extension '{id}'",
             if now_enabled { "Enabled" } else { "Disabled" }
         );
+        self.set_extension_enabled(&id, now_enabled);
     }
 
     /// Uninstall the selected INSTALLED extension: delete its manifest from the
@@ -26419,21 +26433,22 @@ impl App {
         let command_ids = crate::mcp::registry::command_ids_of_in_dir(&self.config_dir, id);
         match crate::mcp::catalog::uninstall_in(&self.config_dir.join("extensions"), id) {
             Ok(()) => {
-                let _ =
+                let mut saved =
                     crate::prefs::forget_mcp_tool_fingerprints_in(&self.config_dir, &command_ids);
                 // Drop any stale disabled-state for the removed id so a later
                 // re-add starts enabled, matching a fresh install.
                 if self.disabled_extensions.remove(id) {
-                    let _ = crate::prefs::save_disabled_extensions_in(
+                    saved = saved.and(crate::prefs::save_disabled_extensions_in(
                         &self.config_dir,
                         &self.disabled_extensions,
-                    );
+                    ));
                 }
                 // And its consent: a re-add is a program the user has not
                 // approved this time, so the first-run gate asks again.
-                self.forget_extension_consent(id);
+                saved = saved.and(self.forget_extension_consent(id));
                 self.refresh_extensions();
                 self.status = format!("Uninstalled '{id}' — it's back under AVAILABLE to re-add");
+                self.report_unsaved_setting(saved);
             }
             Err(e) => self.status = format!("Could not uninstall '{id}': {e}"),
         }
@@ -26450,10 +26465,11 @@ impl App {
         }
     }
 
-    /// Forget `id`'s first-run consent in the session set and in prefs.
-    fn forget_extension_consent(&mut self, id: &str) {
+    /// Forget `id`'s first-run consent in the session set and in prefs,
+    /// returning whether prefs took it.
+    fn forget_extension_consent(&mut self, id: &str) -> anyhow::Result<()> {
         self.consented_extensions.remove(id);
-        let _ = crate::prefs::forget_mcp_consent_in(&self.config_dir, id);
+        crate::prefs::forget_mcp_consent_in(&self.config_dir, id)
     }
 
     /// Whether the extension `id` is currently enabled (not in the disabled set).
@@ -32977,14 +32993,18 @@ impl App {
         } else {
             self.disabled_extensions.insert(id.to_string());
         }
-        let _ =
+        let mut saved =
             crate::prefs::save_disabled_extensions_in(&self.config_dir, &self.disabled_extensions);
         // Turning an extension off forgets its tools' fingerprints, so
         // turning it back on re-approves a tool whose definition changed.
         if !enabled {
             let ids = crate::mcp::registry::command_ids_of_in_dir(&self.config_dir, id);
-            let _ = crate::prefs::forget_mcp_tool_fingerprints_in(&self.config_dir, &ids);
+            saved = saved.and(crate::prefs::forget_mcp_tool_fingerprints_in(
+                &self.config_dir,
+                &ids,
+            ));
         }
+        self.report_unsaved_setting(saved);
         self.refresh_extensions();
         if id == "codeql" {
             if !enabled && self.sidebar_view == SidebarView::CodeQL {
@@ -40335,7 +40355,9 @@ impl App {
             String::from("Navigator proactive comments: off")
         };
         if !cfg!(test) {
-            let _ = crate::prefs::save_proactive_navigator(self.proactive_navigator_enabled);
+            self.report_unsaved_setting(crate::prefs::save_proactive_navigator(
+                self.proactive_navigator_enabled,
+            ));
         }
     }
 
@@ -42748,7 +42770,7 @@ impl App {
     fn dismiss_terminal_warning(&mut self, dont_show_again: bool) {
         self.pending_terminal_warning = false;
         if dont_show_again {
-            let _ = crate::prefs::save_suppress_terminal_warning(true);
+            self.report_unsaved_setting(crate::prefs::save_suppress_terminal_warning(true));
         }
     }
 
@@ -43128,7 +43150,7 @@ impl App {
         };
         // Finished or skipped, the welcome panel stops offering it.
         self.tour_done = true;
-        let _ = crate::prefs::save_tour_done_in(&self.config_dir);
+        let saved = crate::prefs::save_tour_done_in(&self.config_dir);
         // The sample's tabs go with it, edited or not: left open they name
         // deleted files, and saving one would write a scratch file back.
         let mut sample: Vec<PathBuf> = self
@@ -43145,6 +43167,7 @@ impl App {
             Ok(()) => String::from("Tour finished"),
             Err(e) => format!("Tour finished, but its sample project was not removed: {e}"),
         };
+        self.report_unsaved_setting(saved);
     }
 
     fn perform_tour_action(&mut self, action: crate::tour::TourAction) {
@@ -46808,7 +46831,10 @@ impl App {
         // only into a config dir the test chose, never the developer's.
         self.vim_mode_pref = self.vim.enabled;
         if !cfg!(test) || self.config_dir != crate::prefs::config_dir() {
-            let _ = crate::prefs::save_vim_mode_in(&self.config_dir, self.vim.enabled);
+            self.report_unsaved_setting(crate::prefs::save_vim_mode_in(
+                &self.config_dir,
+                self.vim.enabled,
+            ));
         }
     }
 
@@ -56235,7 +56261,6 @@ impl App {
                     _ => "auto",
                 };
                 self.problems_project_scope = String::from(next);
-                let _ = crate::prefs::save_problems_project_scope(next);
                 // `on` and `off` are answers on their own. `auto` is the
                 // only mode whose effect depends on a count, and counting is
                 // a whole-workspace walk - which this repo runs on a
@@ -56251,6 +56276,9 @@ impl App {
                     _ => " (runs on its own unless the workspace is very large)",
                 };
                 self.status = format!("Whole-project check: {next}{effect}");
+                if !cfg!(test) {
+                    self.report_unsaved_setting(crate::prefs::save_problems_project_scope(next));
+                }
             }
             Cmd::ProblemsCheckProject => {
                 // An explicit ask always runs: the cap governs UNASKED runs
@@ -56345,12 +56373,16 @@ impl App {
             }
             Cmd::ProblemsToggleScope => {
                 self.problems.scope = self.problems.scope.next();
-                let _ = crate::prefs::save_problems_scope(self.problems.scope.to_config());
                 // Rebuild rather than filter in the panel: the badge counts
                 // the same list, so both follow the scope from one place.
                 self.rebuild_problems();
                 self.refresh_problems_badge();
                 self.status = format!("Problems: {}", self.problems.scope.label());
+                if !cfg!(test) {
+                    self.report_unsaved_setting(crate::prefs::save_problems_scope(
+                        self.problems.scope.to_config(),
+                    ));
+                }
             }
             Cmd::DiffToggleIgnoreWhitespace => self.diff_cycle_whitespace_mode(),
             Cmd::RunSelectedText => self.run_selected_text_in_terminal(),
@@ -59113,9 +59145,11 @@ impl App {
         // hits the new layer, not the stale one.
         let band = osk.last_area;
         osk.layout(band);
-        // The split choice outlives the session (best-effort, like themes).
+        // The split choice outlives the session (said when it cannot, like
+        // themes).
         if key == crate::widgets::osk::OskKey::SplitToggle {
-            let _ = crate::prefs::save_osk_split(osk.split);
+            let saved = crate::prefs::save_osk_split(osk.split);
+            self.report_unsaved_setting(saved);
         }
         // Mic is a tap, not push-to-talk: Termux turns any finger hold into its
         // own text-selection gesture (hardcoded in TerminalView, not
@@ -62986,7 +63020,7 @@ impl App {
             String::from("Auto Save: off")
         };
         if !cfg!(test) {
-            let _ = crate::prefs::save_auto_save(self.auto_save);
+            self.report_unsaved_setting(crate::prefs::save_auto_save(self.auto_save));
         }
     }
 
@@ -63000,7 +63034,9 @@ impl App {
             String::from("Auto Save on Focus Change: off")
         };
         if !cfg!(test) {
-            let _ = crate::prefs::save_auto_save_on_focus_change(self.auto_save_on_focus_change);
+            self.report_unsaved_setting(crate::prefs::save_auto_save_on_focus_change(
+                self.auto_save_on_focus_change,
+            ));
         }
     }
 
@@ -63031,7 +63067,7 @@ impl App {
             String::from("Inline Blame: off")
         };
         if !cfg!(test) {
-            let _ = crate::prefs::save_inline_blame(self.inline_blame_enabled);
+            self.report_unsaved_setting(crate::prefs::save_inline_blame(self.inline_blame_enabled));
         }
     }
 
@@ -63980,7 +64016,7 @@ impl App {
             "Screen reader mode: off"
         });
         if !cfg!(test) {
-            let _ = crate::prefs::save_screen_reader(self.screen_reader);
+            self.report_unsaved_setting(crate::prefs::save_screen_reader(self.screen_reader));
         }
     }
 
@@ -64682,10 +64718,12 @@ impl App {
     fn cycle_line_numbers(&mut self) {
         self.line_numbers = self.line_numbers.next();
         self.apply_line_numbers();
-        if !cfg!(test) {
-            let _ = crate::prefs::save_line_numbers(self.line_numbers.pref_id());
-        }
         self.status = format!("Line Numbers: {}", self.line_numbers.pref_id());
+        if !cfg!(test) {
+            self.report_unsaved_setting(crate::prefs::save_line_numbers(
+                self.line_numbers.pref_id(),
+            ));
+        }
     }
 
     /// Give every open editor, in every split group, the current line
@@ -64705,10 +64743,12 @@ impl App {
     fn toggle_render_whitespace(&mut self) {
         self.whitespace_mode = self.whitespace_mode.next();
         self.editor.whitespace_mode = self.whitespace_mode;
-        if !cfg!(test) {
-            let _ = crate::prefs::save_render_whitespace(self.whitespace_mode.pref_id());
-        }
         self.status = format!("Render Whitespace: {}", self.whitespace_mode.label());
+        if !cfg!(test) {
+            self.report_unsaved_setting(crate::prefs::save_render_whitespace(
+                self.whitespace_mode.pref_id(),
+            ));
+        }
     }
 
     /// Rebuild the inline-value trailers (#135) from the current stop's
@@ -64763,9 +64803,6 @@ impl App {
         } else {
             self.clear_inline_values();
         }
-        if !cfg!(test) {
-            let _ = crate::prefs::save_inline_values(self.inline_values_enabled);
-        }
         self.status = format!(
             "Debug Inline Values: {}",
             if self.inline_values_enabled {
@@ -64774,14 +64811,16 @@ impl App {
                 "off"
             }
         );
+        if !cfg!(test) {
+            self.report_unsaved_setting(crate::prefs::save_inline_values(
+                self.inline_values_enabled,
+            ));
+        }
     }
 
     fn toggle_bracket_colors(&mut self) {
         self.bracket_colors_enabled = !self.bracket_colors_enabled;
         self.editor.show_bracket_colors = self.bracket_colors_enabled;
-        if !cfg!(test) {
-            let _ = crate::prefs::save_bracket_colors(self.bracket_colors_enabled);
-        }
         self.status = format!(
             "Bracket Pair Colorization: {}",
             if self.bracket_colors_enabled {
@@ -64790,14 +64829,16 @@ impl App {
                 "off"
             }
         );
+        if !cfg!(test) {
+            self.report_unsaved_setting(crate::prefs::save_bracket_colors(
+                self.bracket_colors_enabled,
+            ));
+        }
     }
 
     fn toggle_indent_guides(&mut self) {
         self.indent_guides_enabled = !self.indent_guides_enabled;
         self.editor.show_indent_guides = self.indent_guides_enabled;
-        if !cfg!(test) {
-            let _ = crate::prefs::save_indent_guides(self.indent_guides_enabled);
-        }
         self.status = format!(
             "Indent Guides: {}",
             if self.indent_guides_enabled {
@@ -64806,18 +64847,23 @@ impl App {
                 "off"
             }
         );
+        if !cfg!(test) {
+            self.report_unsaved_setting(crate::prefs::save_indent_guides(
+                self.indent_guides_enabled,
+            ));
+        }
     }
 
     fn toggle_auto_close_pairs(&mut self) {
         self.auto_close_pairs = !self.auto_close_pairs;
         self.editor.auto_close_pairs = self.auto_close_pairs;
-        if !cfg!(test) {
-            let _ = crate::prefs::save_auto_close_pairs(self.auto_close_pairs);
-        }
         self.status = format!(
             "Auto Closing Pairs: {}",
             if self.auto_close_pairs { "on" } else { "off" }
         );
+        if !cfg!(test) {
+            self.report_unsaved_setting(crate::prefs::save_auto_close_pairs(self.auto_close_pairs));
+        }
     }
 
     /// VS Code's `editor.formatOnType` toggle (#254), persisted like the
@@ -64830,7 +64876,7 @@ impl App {
             String::from("Format on Type: off")
         };
         if !cfg!(test) {
-            let _ = crate::prefs::save_format_on_type(self.format_on_type);
+            self.report_unsaved_setting(crate::prefs::save_format_on_type(self.format_on_type));
         }
     }
 
@@ -64842,7 +64888,7 @@ impl App {
             String::from("Format on Save: off")
         };
         if !cfg!(test) {
-            let _ = crate::prefs::save_format_on_save(self.format_on_save);
+            self.report_unsaved_setting(crate::prefs::save_format_on_save(self.format_on_save));
         }
     }
 
@@ -64857,7 +64903,9 @@ impl App {
             String::from("Log highlighting (tailspin): off")
         };
         if !cfg!(test) {
-            let _ = crate::prefs::save_disable_log_highlight(!self.log_highlight);
+            self.report_unsaved_setting(crate::prefs::save_disable_log_highlight(
+                !self.log_highlight,
+            ));
         }
     }
 
@@ -64891,7 +64939,7 @@ impl App {
             String::from("Copy on Selection: off")
         };
         if !cfg!(test) {
-            let _ = crate::prefs::save_copy_on_select(self.copy_on_select);
+            self.report_unsaved_setting(crate::prefs::save_copy_on_select(self.copy_on_select));
         }
     }
 
@@ -65436,7 +65484,9 @@ impl App {
         self.config_watch.set_paths(paths);
         self.settings_provenance = merged.provenance;
         self.apply_merged_settings(&merged.prefs);
-        self.status = if merged.warnings.is_empty() {
+        self.status = if let Some(error) = &merged.user_config_error {
+            settings_not_loaded_status(error)
+        } else if merged.warnings.is_empty() {
             String::from("Settings reloaded")
         } else {
             format!(
@@ -65445,6 +65495,17 @@ impl App {
                 if merged.warnings.len() == 1 { "" } else { "s" }
             )
         };
+    }
+
+    /// Say on the status line that a setting change was not saved (#923),
+    /// most often because `config.json` does not parse and croft will not
+    /// write defaults over it. The change still holds for this session; a
+    /// confirmation such as "Inlay Hints: off" alone read as saved, and the
+    /// setting was back after a restart. Call it after the confirmation.
+    fn report_unsaved_setting(&mut self, saved: anyhow::Result<()>) {
+        if let Err(e) = saved {
+            self.status = format!("Setting not saved: {e:#}");
+        }
     }
 
     /// Apply a merged settings view to the live session. Mirrors what the
@@ -77954,6 +78015,13 @@ fn view_status(view_bind_error: Option<&str>) -> String {
         Some(e) => format!("croft view is unavailable: {e}"),
         None => String::from("Ready"),
     }
+}
+
+/// The status line when the user's `config.json` was skipped whole (#923),
+/// given the warning that says why: every setting is then at its default,
+/// which, said only in OUTPUT · Settings, looked like croft forgetting them.
+fn settings_not_loaded_status(error: &str) -> String {
+    format!("Settings not loaded: {error}")
 }
 
 /// What the startup status says when the agent hook socket could not be
