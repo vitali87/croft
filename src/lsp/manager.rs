@@ -7823,18 +7823,19 @@ async fn resolve_for_root(
     let known = RUSTUP_VERDICTS
         .lock()
         .ok()
-        .and_then(|verdicts| verdicts.get(&key).cloned());
+        .and_then(|verdicts| verdicts.get(&key).cloned())
+        .filter(|(asked, lacks)| lacks.is_none() || asked.elapsed() < RUSTUP_RECHECK);
     let lacks = match known {
-        Some(lacks) => lacks,
+        Some((_, lacks)) => lacks,
         None => {
             let lacks = rustup_lacks(&rustup, bin, root).await;
             if let Ok(mut verdicts) = RUSTUP_VERDICTS.lock() {
-                verdicts.insert(key, lacks.clone());
+                verdicts.insert(key, (std::time::Instant::now(), lacks.clone()));
             }
             lacks
         }
     };
-    let Some(why) = lacks else {
+    let Some(RustupLack { why, fix }) = lacks else {
         return Some(found);
     };
     if log_skip {
@@ -7849,19 +7850,32 @@ async fn resolve_for_root(
             &format!("{}: {msg}", config.name),
         );
     }
-    crate::lsp::install::resolve_managed_instead(
-        config,
-        provision,
-        &why,
-        &format!("rustup component add {bin}"),
-    )
+    crate::lsp::install::resolve_managed_instead(config, provision, &why, &fix)
 }
 
-/// What [`rustup_lacks`] answered per (server, project root), so the
-/// re-probe each request makes while croft's copy downloads does not ask
-/// rustup again. Kept until croft restarts.
-static RUSTUP_VERDICTS: StdMutex<std::collections::BTreeMap<(&str, PathBuf), Option<String>>> =
-    StdMutex::new(std::collections::BTreeMap::new());
+/// What [`rustup_lacks`] answered per (server, project root), and when, so
+/// the re-probe each request makes while croft's copy downloads does not ask
+/// rustup again. A toolchain that has the component keeps its verdict; one
+/// that lacks it is asked again after [`RUSTUP_RECHECK`].
+static RUSTUP_VERDICTS: StdMutex<RustupVerdicts> = StdMutex::new(std::collections::BTreeMap::new());
+
+/// [`RUSTUP_VERDICTS`]' map: (server, project root) to when rustup was
+/// asked and what it said.
+type RustupVerdicts =
+    std::collections::BTreeMap<(&'static str, PathBuf), (std::time::Instant, Option<RustupLack>)>;
+
+/// How long a "lacks the component" verdict holds before rustup is asked
+/// again: the status line names `rustup component add`, and once the user
+/// has run it, rustup's own server takes over without a restart (#927).
+const RUSTUP_RECHECK: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Why a rustup proxy cannot start its server for a project (#927), and the
+/// command that mends it for the toolchain that project selects.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RustupLack {
+    why: String,
+    fix: String,
+}
 
 /// How long rustup gets to answer before croft stops asking and keeps the
 /// proxy, as it did before it asked.
@@ -7903,13 +7917,15 @@ fn file_id(path: &Path) -> Option<PathBuf> {
 }
 
 /// Why the proxy `rustup` puts in front of `bin` cannot start it for the
-/// project at `root`, or `None` when it can or rustup cannot say. Asked from
+/// project at `root`, and the `rustup component add` that mends it, named
+/// with `--toolchain` so it holds from any directory; `None` when the proxy
+/// can start it or rustup cannot say. Asked from
 /// `root`, since that picks the toolchain (`rust-toolchain.toml`, a directory
 /// override). `RUSTUP_AUTO_INSTALL=0` stops the question from installing a
 /// toolchain. A toolchain that is not installed at all is left to the proxy,
 /// which installs it as before, and so is a rustup too old to honour that
 /// variable that is still busy at [`RUSTUP_DEADLINE`].
-async fn rustup_lacks(rustup: &Path, bin: &str, root: &Path) -> Option<String> {
+async fn rustup_lacks(rustup: &Path, bin: &str, root: &Path) -> Option<RustupLack> {
     if rustup_says(rustup, root, &["which", bin])
         .await?
         .status
@@ -7930,7 +7946,10 @@ async fn rustup_lacks(rustup: &Path, bin: &str, root: &Path) -> Option<String> {
     let channel = toolchain
         .split_once(&triple)
         .map_or(&*toolchain, |(c, _)| c);
-    Some(format!("rustup's '{channel}' toolchain has no {bin}"))
+    Some(RustupLack {
+        why: format!("rustup's '{channel}' toolchain has no {bin}"),
+        fix: format!("rustup component add {bin} --toolchain {channel}"),
+    })
 }
 
 /// `rustup` run with `args` from `root`, or `None` when it could not be run
@@ -9583,13 +9602,36 @@ esac
         );
         assert_eq!(
             crate::lsp::install::failure_status(name, "download failed".into()),
-            "download failed; run: rustup component add rust-analyzer",
-            "if croft's copy cannot be had either, the status line says how to get rustup's"
+            "download failed; run: rustup component add rust-analyzer --toolchain stable",
+            "if croft's copy cannot be had either, the status line says how to get rustup's, \
+             for the toolchain the project selects whatever directory it is typed in"
         );
         assert_eq!(
-            rt.block_on(rustup_lacks(&rustup, "rust-analyzer", &default))
-                .as_deref(),
-            Some("rustup's 'stable' toolchain has no rust-analyzer"),
+            rt.block_on(rustup_lacks(&rustup, "rust-analyzer", &default)),
+            Some(RustupLack {
+                why: String::from("rustup's 'stable' toolchain has no rust-analyzer"),
+                fix: String::from("rustup component add rust-analyzer --toolchain stable"),
+            }),
+        );
+        // The user runs that command. A fresh verdict still holds; once it is
+        // due a recheck, rustup's own server is the one croft starts, with no
+        // restart.
+        std::fs::write(default.join("rust-toolchain.toml"), "").unwrap();
+        assert!(
+            rt.block_on(resolve_for_root(&config, &default, false))
+                .is_none()
+        );
+        if let Ok(mut verdicts) = RUSTUP_VERDICTS.lock()
+            && let Some((asked, _)) = verdicts.get_mut(&(name, default.clone()))
+            && let Some(due) = asked.checked_sub(RUSTUP_RECHECK)
+        {
+            *asked = due;
+        }
+        assert_eq!(
+            rt.block_on(resolve_for_root(&config, &default, false))
+                .map(|(c, _)| c.command),
+            Some(config.command.clone()),
+            "the component added since is found when the verdict is asked again"
         );
         assert_eq!(
             rt.block_on(rustup_lacks(&rustup, "rust-analyzer", &uninstalled)),

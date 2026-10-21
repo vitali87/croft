@@ -1253,7 +1253,7 @@ Croft-managed server provisioning: lazy background installs into `~/.croft/serve
 
 **A Binary can carry a `termux_pkg`.** On Android the glibc release can't run on bionic, so such a backend reroutes to `pkg`, as rust-analyzer does.
 
-**A rustup proxy is only a copy if its toolchain has the component.** rustup puts a `rust-analyzer` proxy in `~/.cargo/bin` for every toolchain, but its default profile installs no rust-analyzer behind it. The manager asks `rustup which` from the project root; when the answer is no, `resolve_managed_instead` serves croft's download, and the status line names `rustup component add rust-analyzer`, also when that download fails (#927).
+**A rustup proxy is only a copy if its toolchain has the component.** rustup puts a `rust-analyzer` proxy in `~/.cargo/bin` for every toolchain, but its default profile installs no rust-analyzer behind it. The manager asks `rustup which` from the project root; when the answer is no, `resolve_managed_instead` serves croft's download, and the status line names `rustup component add rust-analyzer --toolchain <the project's>`, also when that download fails (#927). A "no" is asked again after 30 s, so once the component is added rustup's own server takes over without a restart.
 
 ### lsp/semantic_cache.rs
 
