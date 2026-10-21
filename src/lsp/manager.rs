@@ -1137,6 +1137,9 @@ pub struct LspManager {
     /// answer a linkedEditingRange request without a server.
     #[cfg(test)]
     linked_editing_test_tx: std_mpsc::Sender<LinkedEditingResult>,
+    /// Test hook: the text each document was last opened or changed with.
+    #[cfg(test)]
+    synced_texts: std::sync::Mutex<HashMap<PathBuf, String>>,
     selection_ranges_rx: std_mpsc::Receiver<SelectionRangesResult>,
     calls_rx: std_mpsc::Receiver<CallHierarchyResult>,
     ws_symbols_rx: std_mpsc::Receiver<WorkspaceSymbolsResult>,
@@ -1337,6 +1340,8 @@ impl LspManager {
             linked_editing_rx,
             #[cfg(test)]
             linked_editing_test_tx,
+            #[cfg(test)]
+            synced_texts: Default::default(),
             selection_ranges_rx,
             calls_rx,
             ws_symbols_rx,
@@ -1372,6 +1377,8 @@ impl LspManager {
     }
 
     pub fn open_doc(&self, path: PathBuf, text: String) {
+        #[cfg(test)]
+        self.record_synced_text(&path, &text);
         let _ = self.cmd_tx.send(Cmd::OpenDoc { path, text });
     }
 
@@ -1397,6 +1404,8 @@ impl LspManager {
     }
 
     pub fn change_doc(&self, path: PathBuf, text: String) {
+        #[cfg(test)]
+        self.record_synced_text(&path, &text);
         let _ = self.cmd_tx.send(Cmd::ChangeDoc { path, text });
     }
 
@@ -1983,6 +1992,20 @@ impl LspManager {
                 path.to_path_buf(),
                 names.iter().map(|n| n.to_string()).collect(),
             );
+        }
+    }
+
+    /// Test hook: the text the last open or change sent for `path`, as
+    /// every server on it would read it.
+    #[cfg(test)]
+    pub fn synced_text_for_test(&self, path: &Path) -> Option<String> {
+        self.synced_texts.lock().ok()?.get(path).cloned()
+    }
+
+    #[cfg(test)]
+    fn record_synced_text(&self, path: &Path, text: &str) {
+        if let Ok(mut texts) = self.synced_texts.lock() {
+            texts.insert(path.to_path_buf(), text.to_string());
         }
     }
 

@@ -3396,6 +3396,56 @@ fn a_format_on_save_reply_for_an_untouched_buffer_saves_the_formatted_text() {
     assert!(app.save_after_format.is_none());
 }
 
+// ---- The servers read the file's final newline (#911) ----
+
+const SHOP_PY: &str = "def total(prices):\n    return sum(prices)\n";
+
+/// #911: the servers get the file with its final newline, on open and on
+/// every change, so a formatter has none to add to a formatted file.
+#[test]
+fn the_language_servers_get_the_files_final_newline() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "shop.py", SHOP_PY);
+    let file = app.editor.path.clone().unwrap();
+    let synced = |app: &App| app.lsp.as_ref().unwrap().synced_text_for_test(&file);
+    app.sync_lsp();
+    assert_eq!(synced(&app).as_deref(), Some(SHOP_PY));
+    type_at_line_end(&mut app, 1, "  # all");
+    app.sync_lsp();
+    assert_eq!(
+        synced(&app).as_deref(),
+        Some("def total(prices):\n    return sum(prices)  # all\n")
+    );
+}
+
+/// #911: a formatter that rewrites the whole file replaces up to the start
+/// of the empty row after its final newline. The edit lands, and the save
+/// writes one newline, not a blank last line and a second one.
+#[test]
+fn a_whole_file_format_reply_saves_one_final_newline() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(
+        tmp.path(),
+        "shop.py",
+        "def total(prices):\n  return sum(prices)\n",
+    );
+    let file = app.editor.path.clone().unwrap();
+    send_format_request(&mut app, &file, true);
+    let whole_file = crate::widgets::editor::TextSpanEdit {
+        start: (0, 0),
+        end: (2, 0),
+        new_text: SHOP_PY.to_string(),
+        utf16: false,
+    };
+    app.land_format(Some(vec![whole_file]), false, Some(file.clone()), None);
+    assert_eq!(
+        app.editor.lines,
+        vec!["def total(prices):", "    return sum(prices)"]
+    );
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), SHOP_PY);
+    assert!(!app.editor.dirty);
+}
+
 /// #694 review: a format-on-save in flight when the servers stop is saved at
 /// once, unformatted, rather than left armed for an unrelated reply.
 #[test]
