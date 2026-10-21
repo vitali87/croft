@@ -81,7 +81,7 @@ src/
 ├── sheet.rs             CSV / TSV / XLSX / XLS / XLSB / ODS parsing via the csv and calamine crates
 ├── shell_integration.rs  OSC 133 / 7 / 9 shell integration: `OscSniffer` intercepts the marks alacritty drops, plus the per-shell rc shims that emit them
 ├── word_suggest.rs       word-based completion (#1566, VS Code's `editor.wordBasedSuggestions`): the words of the open documents, nearest the caret first, offered on Ctrl+Space when no language server reports on the file (at once) or a server answers with nothing; `word_based_suggestions` picks the documents (current, same language, all, or off), and a `.` typed never opens them
-├── snippets.rs           user snippets from `~/.config/croft/snippets.json` (VS Code format); `parse_body` turns tab-stop syntax into insert text plus ordered stops, and matches are injected into the completion popup; reloads on save
+├── snippets.rs           user snippets from `~/.config/croft/snippets.json` (VS Code format); `parse_body` turns tab-stop syntax and variables into insert text plus ordered stops, and matches are injected into the completion popup; reloads on save
 ├── sqlite_view.rs        read-only SQLite browser: each table becomes a worksheet in the existing sheet grid, rows capped at 500 with the true count in the name, opened `SQLITE_OPEN_READONLY` over bundled sqlite3 so a live database is never locked or mutated
 ├── svg.rs                SVG file-preview rasterisation: `usvg` parse plus resvg render into a PNG the standard image-overlay pipeline consumes; the vector render happens once per open, resizes refit the stored PNG, and a parse failure falls through to the XML source
 ├── symbol_range.rs       keeping a symbol view pointed at its symbol while the file changes: an edit above shifts the range, below moves nothing, inside grows or shrinks it
@@ -1320,6 +1320,8 @@ Durable user preferences — color theme, Customize Layout chrome, format-on-sav
 User snippets loaded from `~/.config/croft/snippets.json` in VS Code format: prefix as a string or array, body as a string or array, and an optional language scope. Entries load one by one, so a malformed one is skipped and reported instead of emptying the set. It reloads on save.
 
 **`parse_body` turns tab-stop syntax into stops the editor drives.** A body's `$1`/`$0`/`${1:placeholder}` syntax becomes insert text plus ordered stops that the editor walks on Tab.
+
+**Variables resolve at expansion, from whoever knows them.** `parse_body` takes a resolver: the editor answers for its buffer (`TM_FILENAME`, `TM_CURRENT_LINE`, `LINE_COMMENT`, …), the App for the workspace and clipboard (`RELATIVE_FILEPATH`, `CLIPBOARD`), and `clock_var` for the date, time and random ids. A known variable with no value inserts its default, and an unknown one becomes a placeholder numbered after the body's own stops, as in VS Code (#914).
 
 **Snippets also reach the completion popup.** Matching snippets are injected as `CompletionItem.is_snippet` and expanded on accept — the same path LSP snippet completions take.
 

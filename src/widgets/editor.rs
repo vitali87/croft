@@ -8898,12 +8898,48 @@ impl Editor {
         self.snippet = None;
     }
 
+    /// [`Self::expand_snippet_with`] knowing only this buffer's variables.
+    #[cfg(test)]
+    pub fn expand_snippet(&mut self, body: &str, prefix_len: usize) {
+        self.expand_snippet_with(body, prefix_len, &|_| None);
+    }
+
+    /// The value of snippet variable `name` this buffer can tell (#914): its
+    /// file, the caret's line, its comment syntax, or the clock's. `None`
+    /// for any other name.
+    fn snippet_var(&self, name: &str) -> Option<String> {
+        let path = self.path.as_deref();
+        let lossy =
+            |s: Option<&std::ffi::OsStr>| s.map_or(String::new(), |s| s.to_string_lossy().into());
+        let block = block_comment_tokens(self.lang);
+        Some(match name {
+            "TM_FILENAME" => lossy(path.and_then(Path::file_name)),
+            "TM_FILENAME_BASE" => lossy(path.and_then(Path::file_stem)),
+            "TM_DIRECTORY" => lossy(path.and_then(Path::parent).map(Path::as_os_str)),
+            "TM_FILEPATH" => lossy(path.map(Path::as_os_str)),
+            "TM_SELECTED_TEXT" | "SELECTION" => self.selection_text(),
+            "TM_CURRENT_LINE" => self.lines.get(self.cursor_row).cloned().unwrap_or_default(),
+            "TM_LINE_INDEX" => self.cursor_row.to_string(),
+            "TM_LINE_NUMBER" => (self.cursor_row + 1).to_string(),
+            "LINE_COMMENT" => self.line_comment_marker().unwrap_or_default().to_string(),
+            "BLOCK_COMMENT_START" => block.map_or("", |b| b.0).to_string(),
+            "BLOCK_COMMENT_END" => block.map_or("", |b| b.1).to_string(),
+            _ => return crate::snippets::clock_var(name),
+        })
+    }
+
     /// Expand snippet `body` at the caret. `prefix_len` chars of the already
     /// typed prefix are removed first, then the resolved text is inserted with
     /// continuation lines indented to the current line. The caret lands on the
     /// first tab stop (selecting its placeholder); when more stops remain a
-    /// session starts so Tab cycles through them.
-    pub fn expand_snippet(&mut self, body: &str, prefix_len: usize) {
+    /// session starts so Tab cycles through them. Variables resolve from this
+    /// buffer first, then from `vars`, the workspace's (#914).
+    pub fn expand_snippet_with(
+        &mut self,
+        body: &str,
+        prefix_len: usize,
+        vars: &dyn Fn(&str) -> Option<String>,
+    ) {
         self.snippet = None;
         for _ in 0..prefix_len {
             self.backspace();
@@ -8920,7 +8956,12 @@ impl Editor {
             })
             .unwrap_or_default();
         let indent_len = indent.chars().count();
-        let parsed = crate::snippets::parse_body(body);
+        // A value's line breaks are `\n`, as the body's: stops are counted in it.
+        let resolve = |name: &str| {
+            let value = self.snippet_var(name).or_else(|| vars(name));
+            value.map(|v| normalize_newlines(&v))
+        };
+        let parsed = crate::snippets::parse_body(body, &resolve);
         // A body's leading `\t` is one indent level, VS Code's convention
         // (#1554): it becomes this buffer's indent unit, so a space-indented
         // file gets no tab after its spaces. Tabs past the indentation are
