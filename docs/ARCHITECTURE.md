@@ -1067,7 +1067,7 @@ Which SEAT wrote each line: a `Seat` (you, navigator, agent-by-pane, or collab p
 
 Parses the last `grep`, `rg` or `git grep` command line into a pattern, Search toggles, and include/exclude glob lists (its paths, resolved from the pane's cwd, and rg types become `./`-anchored include globs via `scope_filters`; a scope it can't reproduce is refused), so "Terminal: Search & Replace from Last grep/rg" can seed and run the Search sidebar — reusing its multi-file replace-all — from a terminal search.
 
-**Flag handling.** `-g`/`--glob`s accumulate comma-separated. rg's `!`-negated globs and grep's `--exclude`/`--exclude-dir` land in files-to-exclude. rg and ag treat `-s` as forcing case sensitivity, while grep's `-s` stays the no-messages flag.
+**Flag handling.** `-g`/`--glob`s accumulate comma-separated. rg's `!`-negated globs and grep's `--exclude`/`--exclude-dir` land in files-to-exclude. rg and ag treat `-s` as forcing case sensitivity, while grep's `-s` stays the no-messages flag. Match Case starts from the tool's own default (case-sensitive, except ag's smart case) and `-i`/`-s`/`-S` overwrite it in order, as in rg. Smart case is resolved the way each tool reads the pattern: rg's on the literals of its regex-syntax AST (so `\W` isn't uppercase), ag's on every byte, and case-sensitive where unsure, since a narrower seed can't make Replace All touch a line the terminal never listed (#922).
 
 **The seed replaces wholesale.** `SearchPanel::seed` swaps the panel's query and both filter lists outright, and also resets field selections, because a stale byte range into shorter seeded text panicked. It then refocuses the query.
 
