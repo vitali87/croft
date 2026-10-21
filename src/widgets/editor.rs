@@ -1297,7 +1297,13 @@ fn render_merge_panes(
                 buf.set_stringn(rect.x, y, mark, 3, style.add_modifier(Modifier::BOLD));
                 mv.check_spans.push((y, rect.x..rect.x + 3, ci, side));
             }
-            buf.set_stringn(rect.x + gutter, y, &pane.lines[idx], text_w, style);
+            buf.set_stringn(
+                rect.x + gutter,
+                y,
+                blank_tabs(&pane.lines[idx]),
+                text_w,
+                style,
+            );
             idx += 1;
         }
     }
@@ -1313,16 +1319,20 @@ fn render_merge_panes(
 /// `text` from char `skip` on, cut and space-padded to exactly `width`
 /// screen cells for one side of the side-by-side diff. A double-width (CJK,
 /// emoji) char takes two cells, and one that would straddle the edge is left
-/// out, so the text never runs over the seam into the other column.
+/// out, so the text never runs over the seam into the other column. A tab
+/// takes its blank cell ([`blank_tabs`]).
 fn clip_pad_cells(text: &str, skip: usize, width: usize) -> String {
     let mut out = String::new();
     let mut used = 0;
     for c in text.chars().skip(skip) {
-        let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+        let w = char_cells(c);
         if used + w > width {
             break;
         }
-        out.push(c);
+        match c {
+            '\t' => out.extend(std::iter::repeat_n(' ', w)),
+            _ => out.push(c),
+        }
         used += w;
     }
     out.extend(std::iter::repeat_n(' ', width - used));
@@ -1357,7 +1367,7 @@ fn paint_intraline_range(
     let mut cell = 0u16;
     let mut painted = false;
     for (i, c) in text.chars().enumerate().skip(skip) {
-        let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0) as u16;
+        let w = char_cells(c) as u16;
         if cell + w > width {
             break;
         }
@@ -17775,6 +17785,18 @@ fn cells_of(chars: &[char]) -> usize {
     chars.iter().map(|&c| char_cells(c)).sum()
 }
 
+/// `text` as the editor paints it: each tab as the blank cells it takes
+/// ([`char_cells`]), which the caret, selection, clicks and every overlay
+/// count for it. ratatui drops control characters, so a raw tab took no
+/// cell and the text after it slid left under all of them (#891).
+fn blank_tabs(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.contains('\t') {
+        text.replace('\t', &" ".repeat(char_cells('\t'))).into()
+    } else {
+        text.into()
+    }
+}
+
 /// Soft-wrap a logical line into visual segments for word-wrap mode.
 ///
 /// Each segment is a half-open `(start_char, end_char)` range over `chars`;
@@ -18197,7 +18219,7 @@ fn merge_overlay(base: &[HiSpan], over: &[HiSpan]) -> Vec<HiSpan> {
 
 fn build_line_spans<'a>(line: &'a str, spans: &[HiSpan]) -> Vec<Span<'a>> {
     if spans.is_empty() {
-        return vec![Span::raw(line)];
+        return vec![Span::raw(blank_tabs(line))];
     }
     let mut out: Vec<Span> = Vec::with_capacity(spans.len() * 2);
     let mut cursor = 0usize;
@@ -18206,18 +18228,18 @@ fn build_line_spans<'a>(line: &'a str, spans: &[HiSpan]) -> Vec<Span<'a>> {
         if range.start > cursor && range.start <= line.len() {
             let slice = &line[cursor..range.start];
             if !slice.is_empty() {
-                out.push(Span::raw(slice));
+                out.push(Span::raw(blank_tabs(slice)));
             }
         }
         let s = range.start.min(line.len());
         let e = range.end.min(line.len());
         if e > s {
-            out.push(Span::styled(&line[s..e], sp.style));
+            out.push(Span::styled(blank_tabs(&line[s..e]), sp.style));
             cursor = e;
         }
     }
     if cursor < line.len() {
-        out.push(Span::raw(&line[cursor..]));
+        out.push(Span::raw(blank_tabs(&line[cursor..])));
     }
     out
 }
@@ -33456,6 +33478,37 @@ mod tests {
         );
     }
 
+    /// #891: a tab takes the cell the caret, selection and clicks count for
+    /// it. ratatui drops a raw `'\t'`, so `x\ty\tz` was drawn `xyz` while
+    /// the caret before `z` sat two cells right of it, on blank space.
+    #[test]
+    fn a_tab_takes_its_cell_so_text_caret_and_clicks_agree() {
+        for wrap in [false, true] {
+            let mut e = editor_with("x\ty\tz");
+            e.wrap_override = Some(wrap);
+            e.cursor_col = 4;
+            let buf = guide_buf(&mut e, 30, 5);
+            let text_x = e.last_inner.x + e.last_gutter_width + 1;
+            let y = e.last_inner.y;
+            assert_eq!(
+                row_text(&buf, y, text_x, text_x + 6),
+                "x y z ",
+                "wrap {wrap}"
+            );
+            let (cx, cy) = e.cursor_screen_pos().expect("the caret is on screen");
+            assert_eq!(
+                buf[(cx, cy)].symbol(),
+                "z",
+                "the caret sits on z, wrap {wrap}"
+            );
+            assert_eq!(
+                e.buffer_pos_at(text_x + 2, y),
+                Some((0, 2)),
+                "a click on y lands on y, wrap {wrap}"
+            );
+        }
+    }
+
     #[test]
     fn cursor_screen_pos_inside_viewport() {
         let mut e = editor_with("hello\nworld");
@@ -34296,6 +34349,19 @@ mod tests {
         assert_eq!(clip_pad_cells("日本語", 0, 5), "日本 ");
         assert_eq!(clip_pad_cells("日本語", 1, 6), "本語  ");
         assert_eq!(clip_pad_cells("ab日", 0, 3), "ab ");
+    }
+
+    /// #891: a tab takes one cell in the diff, as its selection, find
+    /// highlight and clicks count it, so a tab-indented line is not drawn
+    /// flush-left and its changed character is marked where it is drawn.
+    #[test]
+    fn a_tab_takes_its_cell_in_the_side_by_side_diff() {
+        use crate::widgets::diff::INTRALINE_REMOVED_BG;
+        assert_eq!(clip_pad_cells("\tx", 0, 4), " x  ");
+        let (buf, inner, _) = render_wide_diff("x\n\tn = 1\n", "x\n\tn = 2\n");
+        let (l_text_x, y) = left_text_at(&buf, inner, 2, " n = 1");
+        assert_eq!(buf[(l_text_x + 5, y)].symbol(), "1");
+        assert_eq!(buf[(l_text_x + 5, y)].bg, intraline(INTRALINE_REMOVED_BG));
     }
 
     /// Narrow text clips and pads exactly as before: by character, to the
@@ -40021,6 +40087,26 @@ mod tests {
             buf[(text_x, y0 + 1)].symbol(),
             "\u{2192}",
             "a tab renders as an arrow"
+        );
+    }
+
+    /// #891: a tab's arrow sits on the tab's own cell. While the tab was
+    /// drawn as no cell, the arrow covered the `r` of `return` and the dots
+    /// after a mid-line tab covered the letters that followed it.
+    #[test]
+    fn all_mode_glyphs_after_a_tab_leave_the_text_alone() {
+        let mut e = editor_with("\treturn 1\n  x = 2\t# tab");
+        e.whitespace_mode = WhitespaceMode::All;
+        let buf = guide_buf(&mut e, 40, 6);
+        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        let y0 = e.last_inner.y;
+        assert_eq!(
+            row_text(&buf, y0, text_x, text_x + 9),
+            "\u{2192}return\u{b7}1"
+        );
+        assert_eq!(
+            row_text(&buf, y0 + 1, text_x, text_x + 13),
+            "\u{b7}\u{b7}x\u{b7}=\u{b7}2\u{2192}#\u{b7}tab"
         );
     }
 
