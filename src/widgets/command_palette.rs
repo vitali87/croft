@@ -80,6 +80,8 @@ pub enum Command {
     GoToImplementations,
     SwitchHeaderSource,
     RenameSymbol,
+    /// Trigger Suggest (#929): the completion list at the caret, Ctrl+Space.
+    TriggerSuggest,
     MouseAddCursorAtClick,
     MouseGoToDefinitionAtClick,
     MouseOpenLinkAtClick,
@@ -656,6 +658,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::GoToImplementations,
     Command::SwitchHeaderSource,
     Command::RenameSymbol,
+    Command::TriggerSuggest,
     Command::MouseAddCursorAtClick,
     Command::MouseGoToDefinitionAtClick,
     Command::MouseOpenLinkAtClick,
@@ -1132,6 +1135,7 @@ impl Command {
             Command::GoToImplementations => "Go to Implementations",
             Command::SwitchHeaderSource => "C/C++: Switch Header/Source",
             Command::RenameSymbol => "Rename Symbol",
+            Command::TriggerSuggest => "Trigger Suggest",
             Command::MouseAddCursorAtClick => "Mouse: Add Cursor at Click",
             Command::MouseGoToDefinitionAtClick => "Mouse: Go to Definition at Click",
             Command::MouseOpenLinkAtClick => "Mouse: Open Link at Click",
@@ -1620,6 +1624,7 @@ impl Command {
             Command::GoToImplementations => "Cmd+F12",
             Command::SwitchHeaderSource => "Alt+O",
             Command::RenameSymbol => "F2",
+            Command::TriggerSuggest => "Ctrl+Space",
             Command::MouseAddCursorAtClick => "",
             Command::MouseGoToDefinitionAtClick => "",
             Command::MouseOpenLinkAtClick => "",
@@ -2089,6 +2094,7 @@ impl Command {
             Command::GoToImplementations => "go_to_implementations",
             Command::SwitchHeaderSource => "switch_header_source",
             Command::RenameSymbol => "rename_symbol",
+            Command::TriggerSuggest => "trigger_suggest",
             Command::MouseAddCursorAtClick => "mouse_add_cursor_at_click",
             Command::MouseGoToDefinitionAtClick => "mouse_go_to_definition_at_click",
             Command::MouseOpenLinkAtClick => "mouse_open_link_at_click",
@@ -3056,6 +3062,12 @@ mod tests {
                 "Cmd+F12",
             ),
             ("rename symbol", "Rename Symbol", "rename_symbol", "F2"),
+            (
+                "suggest",
+                "Trigger Suggest",
+                "trigger_suggest",
+                "Ctrl+Space",
+            ),
         ] {
             let mut palette = CommandPalette::new();
             palette.set_query(query);

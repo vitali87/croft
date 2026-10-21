@@ -45,6 +45,7 @@ use perf_hud::PerfHud;
 use sidebar_dwell::{AUTO_HIDE_DWELL, SidebarDwell};
 use welcome::WelcomeState;
 
+use crate::lsp::manager::CompletionTrigger;
 use crate::lsp::manager::{diagnostics_by_source, diagnostics_source, diagnostics_store_key};
 use crate::widgets::terminal::cwd_of_pid;
 
@@ -4569,6 +4570,14 @@ pub struct App {
     /// A word edit in an incomplete session is waiting to re-ask the server;
     /// sent after `sync_lsp` so the request follows the edit's `didChange`.
     completion_reask_due: bool,
+    /// A typed key that opens completion (#929) in the file it was typed
+    /// in, waiting like the re-ask: a trigger character or a word begun.
+    completion_ask_due: Option<(CompletionTrigger, PathBuf)>,
+    /// The pending completion was asked for, not opened by typing (#929):
+    /// only then does a reply with nothing matching the word say so.
+    completion_explicit: bool,
+    /// `disable_quick_suggestions` unset: a word begun opens completion.
+    quick_suggestions: bool,
     /// The pending completion was asked for (Ctrl+Space), so the words of
     /// the open documents fill in when no server offers anything (#1566).
     /// A `.` typed asks the server alone: a word list there would open on
@@ -6995,6 +7004,9 @@ impl App {
             completion_origin: None,
             completion_incomplete: false,
             completion_reask_due: false,
+            completion_ask_due: None,
+            completion_explicit: false,
+            quick_suggestions: !loaded_prefs.disable_quick_suggestions,
             completion_words: false,
             local_completion_seq: u64::MAX,
             word_suggestions: crate::word_suggest::WordSuggestions::from_pref(
@@ -9988,7 +10000,10 @@ impl App {
         ));
         if popup.visible_is_empty() {
             self.completion_popup = None;
-            self.status = format!("No completions match '{prefix}' ({server_count} from server)");
+            if self.completion_explicit {
+                self.status =
+                    format!("No completions match '{prefix}' ({server_count} from server)");
+            }
         } else {
             self.completion_popup = Some(popup);
         }
@@ -10056,7 +10071,7 @@ impl App {
     }
 
     pub fn trigger_completion(&mut self) {
-        self.request_completion_at_caret(true);
+        self.request_completion_at_caret(CompletionTrigger::Invoked, true);
     }
 
     /// Ask for completions at the caret. The server is asked when the file
@@ -10064,7 +10079,7 @@ impl App {
     /// (a Makefile, a `.env`, a plain-text note), an explicit ask (`words`)
     /// opens at once on the words of the open documents (#1566); a server
     /// that answers later still replaces them with its own list.
-    fn request_completion_at_caret(&mut self, words: bool) {
+    fn request_completion_at_caret(&mut self, trigger: CompletionTrigger, words: bool) {
         if self.editor.has_non_text_view() {
             return;
         }
@@ -10073,12 +10088,13 @@ impl App {
             .editor
             .pos_to_utf16(self.editor.cursor_row, self.editor.cursor_col);
         let asked = match (path.clone(), self.lsp.as_mut()) {
-            (Some(path), Some(lsp)) => Some(lsp.request_completion(path, line, character)),
+            (Some(path), Some(lsp)) => Some(lsp.request_completion(path, line, character, trigger)),
             _ => None,
         };
         let served = path
             .as_deref()
             .is_some_and(|p| self.lsp.as_ref().is_some_and(|l| l.document_has_server(p)));
+        self.completion_explicit = words;
         let words = words && self.word_suggestions != crate::word_suggest::WordSuggestions::Off;
         if asked.is_none() && !words {
             return;
@@ -10091,6 +10107,7 @@ impl App {
         self.completion_origin = Some((self.editor.cursor_row, self.editor.cursor_col));
         self.completion_incomplete = false;
         self.completion_reask_due = false;
+        self.completion_ask_due = None;
         self.completion_words = words;
         if words && !served {
             self.apply_completion_result(crate::lsp::manager::CompletionResult {
@@ -16714,6 +16731,8 @@ impl App {
                     self.completion_popup = None;
                     self.completion_request_id = None;
                 }
+                // `console.` with the list open for `console` asks anew.
+                self.note_completion_typed(c);
                 if is_signature_help_trigger(c) {
                     self.trigger_signature_help();
                 }
@@ -16782,8 +16801,63 @@ impl App {
         let Some(lsp) = self.lsp.as_mut() else {
             return;
         };
-        let id = lsp.request_completion_for_incomplete(path, line, character);
+        let id = lsp.request_completion(path, line, character, CompletionTrigger::Incomplete);
         self.completion_request_id = Some(id);
+    }
+
+    /// After `c` is typed, open completion as VS Code does (#929): a
+    /// character the file's server lists in `triggerCharacters` asks, and
+    /// so, with quick suggestions on, does the first letter of a word in
+    /// code. Its later letters only filter the list, even a closed one; a
+    /// number or a letter typed into a word asks nothing.
+    fn note_completion_typed(&mut self, c: char) {
+        let Some(path) = self.editor.path.as_deref() else {
+            return;
+        };
+        let lsp = self.lsp.as_ref();
+        let Some(triggers) = lsp.and_then(|l| l.completion_triggers(path)) else {
+            return;
+        };
+        let (row, col) = (self.editor.cursor_row, self.editor.cursor_col);
+        let line = self.editor.lines.get(row).map_or("", String::as_str);
+        let quick = self.quick_suggestions
+            && is_word_continuation(c)
+            && !line.chars().nth(col).is_some_and(is_word_continuation)
+            && !self
+                .editor
+                .word_before_cursor()
+                .starts_with(|s: char| s.is_ascii_digit())
+            && !self.completion_origin_covers_caret(path)
+            && self.editor.caret_in_code();
+        let trigger = if triggers.contains(c) {
+            CompletionTrigger::Character(c)
+        } else if quick {
+            CompletionTrigger::Invoked
+        } else {
+            return;
+        };
+        self.completion_ask_due = Some((trigger, path.to_path_buf()));
+        self.completion_origin = Some((self.editor.cursor_row, self.editor.cursor_col));
+        self.completion_request_id = None;
+    }
+
+    /// Send the ask a typed key left due (#929), after `sync_lsp` like the
+    /// re-ask, while the caret is still in what was typed: an Enter in the
+    /// same burst would open it on the next line, for the next Enter to
+    /// accept. Letters typed after a trigger character make it invoked.
+    fn send_due_completion_ask(&mut self) {
+        let Some((trigger, path)) = self.completion_ask_due.take() else {
+            return;
+        };
+        if !self.completion_origin_covers_caret(&path) {
+            return;
+        }
+        let caret = (self.editor.cursor_row, self.editor.cursor_col);
+        let trigger = match self.completion_origin {
+            Some(origin) if origin != caret => CompletionTrigger::Invoked,
+            _ => trigger,
+        };
+        self.request_completion_at_caret(trigger, false);
     }
 
     fn drain_fs_events(&mut self) -> bool {
@@ -47817,15 +47891,9 @@ impl App {
                 // With an incomplete list pending but none of it on screen,
                 // typing on still re-asks (#1529).
                 self.note_incomplete_completion_edit();
-                // `.` is the canonical LSP trigger character for member
-                // access in Python / TS / Rust. Fire a completion request
-                // immediately so the popup pops without a Ctrl+Space.
-                // The popup's fallthrough already dismissed any prior
-                // popup when this char arrived, so the new request just
-                // populates a fresh popup when the response lands.
-                if c == '.' {
-                    self.request_completion_at_caret(false);
-                }
+                // The server's trigger characters, and with quick
+                // suggestions a word begun, open the list (#929).
+                self.note_completion_typed(c);
                 // Parameter hints: `(` / `,` open or advance a call. Closing
                 // (typing `)`, moving away, deleting) is handled by the tick's
                 // re-query, which also covers nested calls.
@@ -55451,6 +55519,7 @@ impl App {
             | Cmd::GoToTypeDefinition
             | Cmd::GoToImplementations
             | Cmd::RenameSymbol
+            | Cmd::TriggerSuggest
                 if self.editor.has_non_text_view() =>
             {
                 self.status = format!("{} needs a text file", cmd.title());
@@ -55461,6 +55530,7 @@ impl App {
             Cmd::GoToTypeDefinition => self.request_type_definition_at_cursor(),
             Cmd::GoToImplementations => self.request_implementation_at_cursor(),
             Cmd::RenameSymbol => self.start_rename_symbol(),
+            Cmd::TriggerSuggest => self.trigger_completion(),
             // Position-carrying commands (#259). They read the click the
             // dispatcher set, and do nothing from the keyboard: invoked from
             // the palette there is no click to act on, and guessing the
@@ -65568,6 +65638,7 @@ impl App {
         self.apply_line_numbers();
         self.word_suggestions =
             crate::word_suggest::WordSuggestions::from_pref(&p.word_based_suggestions);
+        self.quick_suggestions = !p.disable_quick_suggestions;
         // A per-language `disable_inlay_hints` change (#1440) moves a file's
         // effective setting as surely as the global one does.
         let hint_overrides =
@@ -80001,6 +80072,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let http_changed = app.drain_http_responses();
         let reveal_changed = app.tick_redaction_reveal();
         app.sync_lsp();
+        app.send_due_completion_ask();
         app.send_due_completion_reask();
         let markdown_lint_changed = app.sync_markdown_lint();
         let sarif_diagnostics_changed = app.sync_sarif_diagnostics();

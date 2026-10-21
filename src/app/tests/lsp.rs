@@ -924,6 +924,106 @@ fn an_incomplete_re_ask_waits_until_the_edit_is_synced() {
     );
 }
 
+/// #929: [`word_completion_app`] on a Python file holding `text`, whose
+/// language's completion server lists `triggers`. No server runs.
+fn typing_completion_app(text: &str, triggers: &str) -> (tempfile::TempDir, App) {
+    let (tmp, app) = word_completion_app(&[("demo.py", text)]);
+    let lsp = app.lsp.as_ref().expect("a test-built App runs a manager");
+    lsp.set_completion_triggers_for_test(crate::lsp::Language::PYTHON, triggers);
+    (tmp, app)
+}
+
+/// What a typed key left due to ask, if anything (#929).
+fn due_ask(app: &App) -> Option<CompletionTrigger> {
+    app.completion_ask_due.as_ref().map(|(trigger, _)| *trigger)
+}
+
+/// #929: the first letter of a word asks for completions, as VS Code's
+/// quick suggestions do, once the edit is synced; the rest of the word
+/// only filters the list, and one closed with Esc stays closed. Before,
+/// nothing opened without Ctrl+Space.
+#[test]
+fn a_word_begun_in_code_opens_completion_as_it_is_typed() {
+    let (_tmp, mut app) = typing_completion_app("x = ", ".");
+    let path = app.editor.path.clone().unwrap();
+    type_into_editor(&mut app, "p");
+    assert_eq!(due_ask(&app), Some(CompletionTrigger::Invoked));
+    assert_eq!(app.completion_request_id, None, "asked after the sync");
+    type_into_editor(&mut app, "ri");
+    app.send_due_completion_ask();
+    let id = app.completion_request_id.expect("one ask for the word");
+    app.apply_completion_result(completion_reply(id, &path, &["print", "property"]));
+    assert_eq!(popup_labels(&app), ["print"]);
+    type_into_editor(&mut app, "n");
+    assert_eq!(due_ask(&app), None, "a later letter only filters");
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    type_into_editor(&mut app, "t");
+    assert_eq!(
+        (due_ask(&app), app.completion_popup.is_none()),
+        (None, true)
+    );
+}
+
+/// #929 negatives: a word begun in a comment, a string, a number or the
+/// middle of a word asks nothing, as VS Code's defaults have it, and
+/// `disable_quick_suggestions` leaves only the trigger characters.
+#[test]
+fn quick_suggestions_stay_out_of_comments_strings_and_numbers() {
+    for (text, typed) in [("x = 1  # ", "p"), ("x = '", "p"), ("x = ", "1")] {
+        let (_tmp, mut app) = typing_completion_app(text, ".");
+        type_into_editor(&mut app, typed);
+        assert_eq!(due_ask(&app), None, "{text}{typed}");
+    }
+    let (_tmp, mut app) = typing_completion_app("x = ab", ".");
+    app.editor.cursor_col = 4;
+    type_into_editor(&mut app, "p");
+    assert_eq!(due_ask(&app), None, "the middle of a word");
+    app.quick_suggestions = false;
+    app.editor.cursor_col = 7;
+    type_into_editor(&mut app, " os");
+    assert_eq!(due_ask(&app), None);
+    type_into_editor(&mut app, ".");
+    assert_eq!(due_ask(&app), Some(CompletionTrigger::Character('.')));
+}
+
+/// #929: a character the server lists in `triggerCharacters` asks it, the
+/// list open or not; one it does not list asks nothing (`.` was the only
+/// trigger, whatever the server said). A key that takes the caret off the
+/// typed character first drops the ask, and an ask that opened by itself
+/// says nothing when nothing matches.
+#[test]
+fn the_server_s_trigger_characters_open_completion() {
+    let (_tmp, mut app) = typing_completion_app("import os", ".");
+    let path = app.editor.path.clone().unwrap();
+    app.trigger_completion();
+    let id = app.completion_request_id.unwrap();
+    app.apply_completion_result(completion_reply(id, &path, &["os"]));
+    type_into_editor(&mut app, ".");
+    assert_eq!(due_ask(&app), Some(CompletionTrigger::Character('.')));
+    app.send_due_completion_ask();
+    let id = app.completion_request_id.expect("the trigger asked");
+    type_into_editor(&mut app, "zz");
+    app.apply_completion_result(completion_reply(id, &path, &["path"]));
+    assert!(app.completion_popup.is_none());
+    assert!(
+        !app.status.contains("No completions match"),
+        "{}",
+        app.status
+    );
+    type_into_editor(&mut app, ".");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    app.send_due_completion_ask();
+    assert_eq!(app.completion_request_id, None, "the caret left the line");
+
+    let (_tmp, mut app) = typing_completion_app("x = os", "/");
+    type_into_editor(&mut app, ".");
+    assert_eq!(due_ask(&app), None);
+    type_into_editor(&mut app, "/");
+    assert_eq!(due_ask(&app), Some(CompletionTrigger::Character('/')));
+}
+
 /// One completion reply for `path`, offering each of `labels`.
 fn completion_reply(
     request_id: u64,

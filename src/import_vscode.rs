@@ -552,6 +552,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("editor.action.goToTypeDefinition", "go_to_type_definition"),
     ("editor.action.goToImplementation", "go_to_implementations"),
     ("editor.action.rename", "rename_symbol"),
+    ("editor.action.triggerSuggest", "trigger_suggest"),
     ("editor.action.startFindReplaceAction", "replace_in_file"),
     ("toggleFindInSelection", "toggle_find_in_selection"),
     ("editor.action.moveLinesUpAction", "move_line_up"),
