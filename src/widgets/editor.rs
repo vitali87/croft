@@ -1297,7 +1297,13 @@ fn render_merge_panes(
                 buf.set_stringn(rect.x, y, mark, 3, style.add_modifier(Modifier::BOLD));
                 mv.check_spans.push((y, rect.x..rect.x + 3, ci, side));
             }
-            buf.set_stringn(rect.x + gutter, y, &pane.lines[idx], text_w, style);
+            buf.set_stringn(
+                rect.x + gutter,
+                y,
+                blank_tabs(&pane.lines[idx]),
+                text_w,
+                style,
+            );
             idx += 1;
         }
     }
@@ -1313,16 +1319,20 @@ fn render_merge_panes(
 /// `text` from char `skip` on, cut and space-padded to exactly `width`
 /// screen cells for one side of the side-by-side diff. A double-width (CJK,
 /// emoji) char takes two cells, and one that would straddle the edge is left
-/// out, so the text never runs over the seam into the other column.
+/// out, so the text never runs over the seam into the other column. A tab
+/// takes its blank cell ([`blank_tabs`]).
 fn clip_pad_cells(text: &str, skip: usize, width: usize) -> String {
     let mut out = String::new();
     let mut used = 0;
     for c in text.chars().skip(skip) {
-        let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+        let w = char_cells(c);
         if used + w > width {
             break;
         }
-        out.push(c);
+        match c {
+            '\t' => out.extend(std::iter::repeat_n(' ', w)),
+            _ => out.push(c),
+        }
         used += w;
     }
     out.extend(std::iter::repeat_n(' ', width - used));
@@ -1357,7 +1367,7 @@ fn paint_intraline_range(
     let mut cell = 0u16;
     let mut painted = false;
     for (i, c) in text.chars().enumerate().skip(skip) {
-        let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0) as u16;
+        let w = char_cells(c) as u16;
         if cell + w > width {
             break;
         }
@@ -2334,7 +2344,22 @@ fn shift_past_span(
 /// order the edits are applied in, so each edit's coordinates still name the
 /// text it was written against.
 pub fn map_through_span_edits(pos: (usize, usize), edits: &[TextSpanEdit]) -> (usize, usize) {
-    let mut order: Vec<&TextSpanEdit> = edits.iter().filter(|e| e.end >= e.start).collect();
+    map_through_edit_refs(pos, edits.iter().collect())
+}
+
+/// Where the viewport's top line lands once char-column `edits` are applied
+/// (#918): lines added or removed above the view, by a peer's typing or an Add
+/// import, move it with them, so the text on screen stays put. Only
+/// edits that start above the top line's start count: text inserted right at
+/// it shows at the top of the view, and the top of the file stays the top.
+fn view_top_after_span_edits(top: usize, edits: &[TextSpanEdit]) -> usize {
+    let start = (top, 0);
+    map_through_edit_refs(start, edits.iter().filter(|e| e.start < start).collect()).0
+}
+
+/// [`map_through_span_edits`] over borrowed edits.
+fn map_through_edit_refs(pos: (usize, usize), mut order: Vec<&TextSpanEdit>) -> (usize, usize) {
+    order.retain(|e| e.end >= e.start);
     order.sort_by_key(|e| std::cmp::Reverse(e.start));
     order.into_iter().fold(pos, |p, e| {
         if p < e.end && p <= e.start {
@@ -2401,11 +2426,15 @@ fn replace_span(lines: &mut Vec<String>, e: &TextSpanEdit) -> bool {
 }
 
 /// Coarse classification of the most recent edit, used so consecutive
-/// `InsertChar` ops coalesce into a single undo step (typing burst) but
-/// any other edit kind always opens a new step.
+/// `InsertChar` (or `MultiInsertChar`) ops coalesce into a single undo step
+/// (typing burst) but any other edit kind always opens a new step.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum EditKind {
     InsertChar,
+    /// A character typed at every multi-cursor caret. Coalesces like
+    /// `InsertChar` while the carets stay where the last keystroke left
+    /// them, so a multi-cursor rename undoes in one step (#913).
+    MultiInsertChar,
     Newline,
     Backspace,
     DeleteForward,
@@ -2419,8 +2448,8 @@ enum EditKind {
     /// Block indent / outdent (Tab / Shift+Tab over a line range). Never
     /// coalesces, so each Tab press is its own undo step like VS Code.
     Indent,
-    /// A single keystroke applied simultaneously across every multi-cursor
-    /// caret. Never coalesces, so each multi-edit is its own undo step.
+    /// A Backspace or Delete applied simultaneously across every
+    /// multi-cursor caret. Never coalesces, so each is its own undo step.
     MultiEdit,
     /// Move a line / block up or down (Alt+Up / Alt+Down). Its own step.
     MoveLines,
@@ -2502,6 +2531,9 @@ enum PairAction {
 struct Snapshot {
     /// Packed (#1707): a step held as a `Vec<String>` cost twice its text.
     lines: PackedLines,
+    /// Whether that text ended in a newline: a language server's edit can
+    /// add or remove it (#911), and an undo brings it back with the text.
+    final_newline: bool,
     cursor_row: usize,
     cursor_col: usize,
     selection: Option<EditorSelection>,
@@ -2524,6 +2556,51 @@ struct Snapshot {
     /// The bytes this step's text holds, measured once when it is taken
     /// (see [`UNDO_BYTES_LIMIT`]).
     bytes: usize,
+}
+
+impl Snapshot {
+    /// Take a collab peer's edit, given in this state's own text (#919):
+    /// the caret, selection and extra carets move with their text.
+    fn take_peer_splice(&mut self, s: &crate::undo_rebase::Splice) {
+        let edit = TextSpanEdit {
+            start: self.lines.position(s.at),
+            end: self.lines.position(s.at + s.deleted),
+            new_text: s.inserted.clone(),
+            utf16: false,
+        };
+        let map = |p| map_through_span_edits(p, std::slice::from_ref(&edit));
+        (self.cursor_row, self.cursor_col) = map((self.cursor_row, self.cursor_col));
+        for sel in self.selection.iter_mut().chain(self.carets.iter_mut()) {
+            sel.anchor = map(sel.anchor);
+            sel.head = map(sel.head);
+        }
+        self.lines
+            .replace_range(s.at..s.at + s.deleted, &s.inserted);
+        self.bytes = self.lines.heap_bytes();
+        // No save so far wrote the peer's edit, which arrives only now.
+        self.dirty = true;
+    }
+}
+
+/// Carry a peer's `edit`, written against the `live` text, into every state
+/// of an undo or redo `stack` (#919). Each state is one step from the one
+/// nearer the live text, so the edit is rebased state by state from the
+/// top, and stops at the first state it leaves alone.
+fn rebase_history(stack: &mut [Snapshot], live: &str, edit: crate::undo_rebase::Splice) {
+    let mut edits = Vec::new();
+    let mut source = live;
+    let mut edit = edit;
+    for snap in stack.iter().rev() {
+        let Some(next) = crate::undo_rebase::rebase(snap.lines.as_str(), source, &edit) else {
+            break;
+        };
+        edits.push(next.clone());
+        edit = next;
+        source = snap.lines.as_str();
+    }
+    for (snap, edit) in stack.iter_mut().rev().zip(&edits) {
+        snap.take_peer_splice(edit);
+    }
 }
 
 const UNDO_STACK_LIMIT: usize = 500;
@@ -2601,6 +2678,23 @@ pub enum ExternalChange {
     /// The buffer had unsaved edits, so the external change was flagged as a
     /// conflict instead of being applied.
     Conflict,
+    /// The file is gone from disk (#900). The buffer, dirty or not, stays
+    /// as it is and the next explicit save puts the file back.
+    Deleted,
+}
+
+/// What the FS sweep last reported about a tab whose file stopped matching
+/// it (#900): a failed reload or a deletion is announced once per change on
+/// disk, not on every sweep while disk stays put.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DiskReport {
+    /// The tab's `disk_stamp` when reported. A reload, save or reopen moves
+    /// that on, which retires the report.
+    synced: Option<(SystemTime, u64)>,
+    /// What disk held then: `None` when it could not be read.
+    found: Option<(SystemTime, u64)>,
+    /// Whether the file was gone, not merely unreadable.
+    deleted: bool,
 }
 
 /// Why a buffer is written. Only an auto-save, which fires mid-typing,
@@ -2693,11 +2787,17 @@ pub struct ExternalReloadReport {
     /// floor left the user staring at stale content with no indication
     /// the sweep even tried (#37).
     pub failed: Vec<PathBuf>,
+    /// Paths of tabs whose file was deleted on disk (#900). The tab keeps
+    /// its buffer and is marked `(deleted)` until a save puts the file back.
+    pub deleted: Vec<PathBuf>,
 }
 
 impl ExternalReloadReport {
     pub fn is_empty(&self) -> bool {
-        self.reloaded.is_empty() && self.conflicts.is_empty() && self.failed.is_empty()
+        self.reloaded.is_empty()
+            && self.conflicts.is_empty()
+            && self.failed.is_empty()
+            && self.deleted.is_empty()
     }
 }
 
@@ -3114,6 +3214,13 @@ pub struct Editor {
     /// pre-existing `()` keeps its closer, as with one caret (#122 review),
     /// even when another caret of the same keystroke paired.
     multi_auto_pair: Option<(u64, CaretPlaces, CaretPlaces)>,
+    /// The `edit_seq` and every caret's selection, the primary first, after
+    /// the last multi-cursor keystroke that typed a character and left no
+    /// selection (#913): the next one joins its undo step only while nothing
+    /// has edited or moved since, as one caret's typing burst does. Every
+    /// command that edits the caret set clears it, so the burst ends even
+    /// when the carets come back to the same places (collapse, then add).
+    multi_typing: Option<(u64, Vec<EditorSelection>)>,
     /// Merge-conflict blocks in the buffer, lazily recomputed whenever
     /// `edit_seq` moves (same pattern as the git-gutter marks).
     conflicts: Vec<crate::merge::ConflictBlock>,
@@ -3382,7 +3489,8 @@ pub struct Editor {
     last_edit_kind: Option<EditKind>,
     /// The group of the remote edit that opened the undo step on top of
     /// the stack (#1207): further remote spans of that group join the step
-    /// instead of opening their own. Any other edit, undo or redo ends it.
+    /// instead of opening their own. Any other step, undo or redo ends it; a
+    /// peer's edit, which opens no step (#919), does not.
     remote_undo_group: Option<u64>,
     lang: Option<LangKind>,
     /// The language came from "Change Language Mode" (#1574), not from the
@@ -3716,6 +3824,9 @@ pub struct Editor {
     /// the flag drives the conflict warning and makes `save_to_disk` refuse
     /// to overwrite until the user forces it.
     pub disk_conflict: bool,
+    /// The sweep's last report of a failed reload or a deletion (#900), so
+    /// it is not repeated while disk stays where it was reported.
+    disk_report: Option<DiskReport>,
     /// Set when a save was refused because `encoding` cannot represent the
     /// buffer. Latches like `disk_conflict` so auto save stops retrying (and
     /// stops re-reporting) a file only an explicit Cmd+S can resolve; cleared
@@ -3777,6 +3888,7 @@ impl Editor {
             auto_close_tags: true,
             auto_pair_at: None,
             multi_auto_pair: None,
+            multi_typing: None,
             conflicts: Vec::new(),
             merge_action_spans: Vec::new(),
             code_lenses: Vec::new(),
@@ -3926,6 +4038,7 @@ impl Editor {
             disk_stamp: None,
             disk_expect_absent: false,
             disk_conflict: false,
+            disk_report: None,
             encoding_loss: false,
             lossy_save_armed: false,
             write_protected: false,
@@ -5373,6 +5486,11 @@ impl Editor {
             self.stash_history();
         }
         let opened = self.open_file(path);
+        if opened.is_ok() {
+            // What the sweep said about the file this tab held is not about
+            // this one, even with the same stamp (#900).
+            self.disk_report = None;
+        }
         if changed_file {
             // On a failed open the tab may still hold the file it left, and
             // takes its history back the same way.
@@ -7769,7 +7887,7 @@ impl Editor {
     /// the wrong content. Returns the same normalised (`\n`-joined) text the
     /// app sends to the server, so the key matches on both store and load.
     pub fn clean_cache_text(&self) -> Option<String> {
-        (!self.dirty).then(|| self.lines.join("\n"))
+        (!self.dirty).then(|| self.document_text())
     }
 
     #[cfg(test)]
@@ -7830,6 +7948,18 @@ impl Editor {
         &self.diagnostic_spans
     }
 
+    /// A diagnostic position as a row of this buffer (#911): the final
+    /// newline the server is sent ends the document on an empty row past
+    /// the last one stored, so a position there (a missing token at the end
+    /// of the file) is drawn and found at the end of the last row.
+    fn diagnostic_row(&self, line: u32, ch: u32) -> (usize, u32) {
+        let line = line as usize;
+        match line == self.lines.len() && self.sends_final_newline() {
+            true => (line - 1, u32::MAX),
+            false => (line, ch),
+        }
+    }
+
     /// Re-decode the retained diagnostics into per-logical-line character runs
     /// against the current buffer. A no-op (clears the runs) unless the batch
     /// belongs to the loaded file, so stale squiggles never bleed across a tab
@@ -7855,8 +7985,8 @@ impl Editor {
             vec![Vec::new(); self.lines.len()];
         for d in &self.diagnostics {
             let hint = d.severity == DiagnosticSeverity::Hint;
-            let start_line = d.start_line as usize;
-            let end_line = d.end_line as usize;
+            let (start_line, start_char) = self.diagnostic_row(d.start_line, d.start_char);
+            let (end_line, end_char) = self.diagnostic_row(d.end_line, d.end_char);
             // Zip bounds the walk to the buffer, replacing the per-line
             // `lines.get` check a stale diagnostic range would otherwise need.
             for (line, ((text, line_spans), line_tags)) in self
@@ -7870,12 +8000,12 @@ impl Editor {
             {
                 let line_chars = text.chars().count();
                 let from = if line == start_line {
-                    utf16_to_char_col(text, d.start_char)
+                    utf16_to_char_col(text, start_char)
                 } else {
                     0
                 };
                 let to = if line == end_line {
-                    utf16_to_char_col(text, d.end_char)
+                    utf16_to_char_col(text, end_char)
                 } else {
                     line_chars
                 };
@@ -8371,8 +8501,7 @@ impl Editor {
         }
         self.pin_on_edit();
         self.push_undo(EditKind::Paste);
-        let edits = char_span_edits(&self.lines, edits);
-        let applied = apply_char_span_edits(&mut self.lines, edits);
+        let applied = self.apply_document_edits(edits);
         let n = applied.iter().map(|(_, count)| count).sum();
         if n > 0 {
             self.follow_span_edits(&applied);
@@ -8411,23 +8540,48 @@ impl Editor {
         self.apply_span_edits_grouped(edits, None)
     }
 
-    /// [`Self::apply_span_edits`] for text a collab peer wrote (#1207). Every
-    /// call with the same `group` lands in one undo step while nothing else
-    /// edits the buffer in between: the runs of one peer edit, which arrive
-    /// one span at a time, and the fragments of one AI stream. Undo then
-    /// restores the text from before the group, never a mix of halves.
+    /// [`Self::apply_span_edits`] for text an AI stream wrote over collab
+    /// (#1207). Every call with the same `group` lands in one undo step
+    /// while no other step opens in between: the fragments of one stream,
+    /// which arrive one span at a time. Undo then restores the text from
+    /// before the group, never a mix of halves.
     pub fn apply_remote_span_edits(&mut self, edits: &[TextSpanEdit], group: u64) -> usize {
         self.apply_span_edits_grouped(edits, Some(group))
     }
 
-    fn apply_span_edits_grouped(&mut self, edits: &[TextSpanEdit], group: Option<u64>) -> usize {
-        if edits.is_empty() {
+    /// Apply a collab peer's edit without an undo step of its own (#919):
+    /// every undo and redo state takes the edit instead, so Ctrl+Z reverts
+    /// only this user's steps and keeps the peer's text, as in Zed or Live
+    /// Share. Returns the number of edits applied.
+    pub fn apply_peer_span_edit(&mut self, edit: &TextSpanEdit) -> usize {
+        let edit = char_span_edits(&self.lines, std::slice::from_ref(edit)).remove(0);
+        let (start, end) = (edit.start, edit.end);
+        if end < start || end.0 >= self.lines.len() {
             return 0;
         }
+        if !self.undo_stack.is_empty() || !self.redo_stack.is_empty() {
+            let offset = |(row, col): (usize, usize)| {
+                let above: usize = self.lines[..row].iter().map(|l| l.len() + 1).sum();
+                above + char_byte(&self.lines[row], col)
+            };
+            let at = offset(start);
+            let splice = crate::undo_rebase::Splice {
+                at,
+                deleted: offset(end) - at,
+                inserted: edit.new_text.clone(),
+            };
+            let live = self.lines.join("\n");
+            rebase_history(&mut self.undo_stack, &live, splice.clone());
+            rebase_history(&mut self.redo_stack, &live, splice);
+            // The peer's text now sits in every state held: a large paste
+            // over a deep history must not lift it past the cap.
+            self.trim_undo_stack();
+            self.trim_redo_stack();
+        }
         self.pin_on_edit();
-        self.push_undo_step(EditKind::Paste, group);
-        let edits = char_span_edits(&self.lines, edits);
-        let applied = apply_char_span_edits(&mut self.lines, edits);
+        // The pre-edit text, for bookmarks to be diffed against afterwards.
+        self.seed_bookmark_shadow();
+        let applied = apply_char_span_edits(&mut self.lines, vec![edit]);
         let n = applied.iter().map(|(_, count)| count).sum();
         if n > 0 {
             self.follow_span_edits(&applied);
@@ -8437,15 +8591,58 @@ impl Editor {
         n
     }
 
+    fn apply_span_edits_grouped(&mut self, edits: &[TextSpanEdit], group: Option<u64>) -> usize {
+        if edits.is_empty() {
+            return 0;
+        }
+        self.pin_on_edit();
+        self.push_undo_step(EditKind::Paste, group);
+        let applied = self.apply_document_edits(edits);
+        let n = applied.iter().map(|(_, count)| count).sum();
+        if n > 0 {
+            self.follow_span_edits(&applied);
+            self.mark_buffer_changed();
+            self.recompute_highlights();
+        }
+        n
+    }
+
+    /// Apply `edits`, positioned in [`Self::document_text`], to the lines.
+    /// The final newline that text ends in opens an empty last row there,
+    /// which a language server's edit may reach (#911): a formatter that
+    /// rewrites the whole file replaces up to it. The row is added for the
+    /// edits and folded back into `final_newline` after, so a newline the
+    /// edits keep never stays as a blank row the save writes a second
+    /// newline after; edits that remove it clear `final_newline`.
+    fn apply_document_edits(&mut self, edits: &[TextSpanEdit]) -> Vec<(TextSpanEdit, usize)> {
+        let newline_row = self.sends_final_newline();
+        if newline_row {
+            self.lines.push(String::new());
+        }
+        let edits = char_span_edits(&self.lines, edits);
+        let applied = apply_char_span_edits(&mut self.lines, edits);
+        if newline_row {
+            if self.lines.len() > 1 && self.lines.last().is_some_and(String::is_empty) {
+                self.lines.pop();
+            } else {
+                self.final_newline = false;
+            }
+        }
+        applied
+    }
+
     /// Move the caret, the selection and every extra caret with the text
     /// they were on through char-column `edits` just applied (#1603): an
     /// Add import above the caret left it on its old line number, inside
-    /// the grown import block, where the next keystrokes landed.
+    /// the grown import block, where the next keystrokes landed. The view's
+    /// top line follows its text too (#918), or a peer's lines added above
+    /// it pushed the text being read down the pane.
     fn follow_span_edits(&mut self, applied: &[(TextSpanEdit, usize)]) {
         let edits: Vec<TextSpanEdit> = applied.iter().map(|(e, _)| e.clone()).collect();
         let map = |p: (usize, usize)| map_through_span_edits(p, &edits);
         (self.cursor_row, self.cursor_col) = map((self.cursor_row, self.cursor_col));
         let last = self.lines.len().saturating_sub(1);
+        self.scroll = view_top_after_span_edits(self.scroll, &edits).min(last);
         let lines = &self.lines;
         let clamp = |(r, c): (usize, usize)| {
             let r = r.min(last);
@@ -8807,12 +9004,48 @@ impl Editor {
         self.snippet = None;
     }
 
+    /// [`Self::expand_snippet_with`] knowing only this buffer's variables.
+    #[cfg(test)]
+    pub fn expand_snippet(&mut self, body: &str, prefix_len: usize) {
+        self.expand_snippet_with(body, prefix_len, &|_| None);
+    }
+
+    /// The value of snippet variable `name` this buffer can tell (#914): its
+    /// file, the caret's line, its comment syntax, or the clock's. `None`
+    /// for any other name.
+    fn snippet_var(&self, name: &str) -> Option<String> {
+        let path = self.path.as_deref();
+        let lossy =
+            |s: Option<&std::ffi::OsStr>| s.map_or(String::new(), |s| s.to_string_lossy().into());
+        let block = block_comment_tokens(self.lang);
+        Some(match name {
+            "TM_FILENAME" => lossy(path.and_then(Path::file_name)),
+            "TM_FILENAME_BASE" => lossy(path.and_then(Path::file_stem)),
+            "TM_DIRECTORY" => lossy(path.and_then(Path::parent).map(Path::as_os_str)),
+            "TM_FILEPATH" => lossy(path.map(Path::as_os_str)),
+            "TM_SELECTED_TEXT" | "SELECTION" => self.selection_text(),
+            "TM_CURRENT_LINE" => self.lines.get(self.cursor_row).cloned().unwrap_or_default(),
+            "TM_LINE_INDEX" => self.cursor_row.to_string(),
+            "TM_LINE_NUMBER" => (self.cursor_row + 1).to_string(),
+            "LINE_COMMENT" => self.line_comment_marker().unwrap_or_default().to_string(),
+            "BLOCK_COMMENT_START" => block.map_or("", |b| b.0).to_string(),
+            "BLOCK_COMMENT_END" => block.map_or("", |b| b.1).to_string(),
+            _ => return crate::snippets::clock_var(name),
+        })
+    }
+
     /// Expand snippet `body` at the caret. `prefix_len` chars of the already
     /// typed prefix are removed first, then the resolved text is inserted with
     /// continuation lines indented to the current line. The caret lands on the
     /// first tab stop (selecting its placeholder); when more stops remain a
-    /// session starts so Tab cycles through them.
-    pub fn expand_snippet(&mut self, body: &str, prefix_len: usize) {
+    /// session starts so Tab cycles through them. Variables resolve from this
+    /// buffer first, then from `vars`, the workspace's (#914).
+    pub fn expand_snippet_with(
+        &mut self,
+        body: &str,
+        prefix_len: usize,
+        vars: &dyn Fn(&str) -> Option<String>,
+    ) {
         self.snippet = None;
         for _ in 0..prefix_len {
             self.backspace();
@@ -8829,7 +9062,12 @@ impl Editor {
             })
             .unwrap_or_default();
         let indent_len = indent.chars().count();
-        let parsed = crate::snippets::parse_body(body);
+        // A value's line breaks are `\n`, as the body's: stops are counted in it.
+        let resolve = |name: &str| {
+            let value = self.snippet_var(name).or_else(|| vars(name));
+            value.map(|v| normalize_newlines(&v))
+        };
+        let parsed = crate::snippets::parse_body(body, &resolve);
         // A body's leading `\t` is one indent level, VS Code's convention
         // (#1554): it becomes this buffer's indent unit, so a space-indented
         // file gets no tab after its spaces. Tabs past the indentation are
@@ -9200,6 +9438,47 @@ impl Editor {
         }
     }
 
+    /// VS Code's Delete Word Left (`Ctrl+Backspace`, `Opt+Backspace` on
+    /// macOS): delete back to where `Ctrl+Left` stops on this line, or the
+    /// selection when there is one. At the line's start it joins the line
+    /// above, as Backspace does.
+    pub fn delete_word_left(&mut self) {
+        let col = self.cursor_col.min(self.line_char_len(self.cursor_row));
+        if col == 0 || self.selection.is_some_and(|s| s.has_area()) {
+            self.backspace();
+            return;
+        }
+        let start = word_start_before(&self.lines[self.cursor_row], col);
+        self.delete_cols_on_line(EditKind::Backspace, start, col);
+    }
+
+    /// VS Code's Delete Word Right (`Ctrl+Delete`, `Opt+Delete` on macOS):
+    /// delete forward to where `Ctrl+Right` stops on this line, or the
+    /// selection. At the line's end it joins the line below, as Delete does.
+    pub fn delete_word_right(&mut self) {
+        let len = self.line_char_len(self.cursor_row);
+        if self.cursor_col >= len || self.selection.is_some_and(|s| s.has_area()) {
+            self.delete_forward();
+            return;
+        }
+        let end = word_end_after(&self.lines[self.cursor_row], self.cursor_col);
+        self.delete_cols_on_line(EditKind::DeleteForward, self.cursor_col, end);
+    }
+
+    /// Remove chars `from..to` of the caret's line as one undo step, leaving
+    /// the caret at `from`.
+    fn delete_cols_on_line(&mut self, kind: EditKind, from: usize, to: usize) {
+        self.pin_on_edit();
+        self.push_undo(kind);
+        let row = self.cursor_row;
+        let (a, b) = (self.byte_index(row, from), self.byte_index(row, to));
+        self.lines[row].replace_range(a..b, "");
+        self.cursor_col = from;
+        self.selection = None;
+        self.mark_buffer_changed();
+        self.recompute_highlights();
+    }
+
     /// On a symbol tab, true when a bare Backspace (`forward` false) or
     /// Delete would join the symbol's first or last line with a line outside
     /// the tab: the caret sits on the clip's first character or after its
@@ -9227,6 +9506,7 @@ impl Editor {
     /// Drop every secondary caret, leaving just the primary cursor. Called on
     /// Esc, mouse clicks, and any movement that isn't a multi-cursor edit.
     pub fn collapse_carets(&mut self) {
+        self.multi_typing = None;
         self.carets.clear();
     }
 
@@ -9237,6 +9517,7 @@ impl Editor {
     /// the rest become secondary carets. Returns the number of occurrences
     /// selected (0 when the cursor isn't on a word, leaving state untouched).
     pub fn select_all_occurrences_of_word_at_cursor(&mut self) -> usize {
+        self.multi_typing = None;
         let Some((start, end)) = self.word_at(self.cursor_row, self.cursor_col) else {
             return 0;
         };
@@ -9313,6 +9594,7 @@ impl Editor {
     /// Occurrences). The selection the caret is in stays primary. Returns
     /// the number of selections, 0 when there is nothing to match.
     pub fn select_all_occurrences(&mut self) -> usize {
+        self.multi_typing = None;
         let Some(sel) = self.selection.filter(|s| s.anchor != s.head) else {
             return self.select_all_occurrences_of_word_at_cursor();
         };
@@ -9356,6 +9638,7 @@ impl Editor {
     /// VS Code does. The last line's caret is the primary. Returns the
     /// number of carets, 0 with no selection.
     pub fn add_cursors_to_line_ends(&mut self) -> usize {
+        self.multi_typing = None;
         let Some(sel) = self.selection.filter(|s| s.anchor != s.head) else {
             return 0;
         };
@@ -9389,6 +9672,7 @@ impl Editor {
     /// it so the view follows. Returns the number of cursors (0 when the first
     /// press lands off a word, leaving state untouched).
     pub fn select_next_occurrence(&mut self) -> usize {
+        self.multi_typing = None;
         // First press with no selection: select the word under the cursor.
         let Some(sel) = self.selection else {
             let Some((s, e)) = self.word_at(self.cursor_row, self.cursor_col) else {
@@ -9451,7 +9735,8 @@ impl Editor {
         self.carets.len() + 1
     }
 
-    /// Insert a character at every caret. One undo step.
+    /// Insert a character at every caret. Consecutive characters typed
+    /// with the carets left where they were form one undo step (#913).
     ///
     /// Deliberately does not set `last_typed`: an on-type formatting reply
     /// (#254) is computed at ONE position and would be wrong at the other
@@ -9471,7 +9756,8 @@ impl Editor {
     }
 
     /// Apply `edit` at the primary caret and every secondary caret as a
-    /// single undo step. Carets are processed bottom-to-top so an edit never
+    /// single undo step, which a typed character extends when it continues
+    /// a typing burst. Carets are processed bottom-to-top so an edit never
     /// shifts the coordinates of a caret still to be processed.
     fn multi_apply(&mut self, edit: CaretEdit) {
         // A Backspace right after a keystroke that paired at every caret
@@ -9487,6 +9773,9 @@ impl Editor {
             }
             _ => Vec::new(),
         };
+        // A typed character joins the open typing burst only while the
+        // carets sit where its last keystroke left them, with no edit since.
+        let burst = self.multi_typing.take() == Some((self.edit_seq, self.caret_selections()));
         // A closer or quote stepped over at every caret edits nothing, so it
         // records no undo step, as one caret's type-over does.
         if let CaretEdit::Insert(c) = edit
@@ -9500,10 +9789,20 @@ impl Editor {
                 s.anchor = s.head;
             }
             self.ensure_cursor_col_visible();
+            if burst {
+                self.multi_typing = Some((self.edit_seq, self.caret_selections()));
+            }
             return;
         }
         self.pin_on_edit();
-        self.push_undo(EditKind::MultiEdit);
+        let kind = match edit {
+            CaretEdit::Insert(_) => EditKind::MultiInsertChar,
+            CaretEdit::Backspace | CaretEdit::DeleteForward => EditKind::MultiEdit,
+        };
+        if !burst {
+            self.break_undo_coalescing();
+        }
+        self.push_undo(kind);
 
         let primary = self
             .selection
@@ -9598,6 +9897,12 @@ impl Editor {
         if !paired_places.is_empty() {
             self.multi_auto_pair = Some((self.edit_seq, self.caret_places(), paired_places));
         }
+        // A surround keeps its selections and is its own step, as one
+        // caret's is: the next keystroke opens a new one.
+        let carets = self.caret_selections();
+        if kind == EditKind::MultiInsertChar && !carets.iter().any(|s| s.has_area()) {
+            self.multi_typing = Some((self.edit_seq, carets));
+        }
     }
 
     /// True when `c` typed at every caret only steps over the same closer
@@ -9619,6 +9924,17 @@ impl Editor {
     fn caret_places(&self) -> Vec<(usize, usize)> {
         std::iter::once((self.cursor_row, self.cursor_col))
             .chain(self.carets.iter().map(|c| c.head))
+            .collect()
+    }
+
+    /// Every caret's selection, the primary first, the extra carets in
+    /// order; the primary's is empty at the cursor when it has none.
+    fn caret_selections(&self) -> Vec<EditorSelection> {
+        let primary = self
+            .selection
+            .unwrap_or_else(|| EditorSelection::new(self.cursor_row, self.cursor_col));
+        std::iter::once(primary)
+            .chain(self.carets.iter().copied())
             .collect()
     }
 
@@ -11040,6 +11356,7 @@ impl Editor {
         Snapshot {
             lines,
             bytes,
+            final_newline: self.final_newline,
             cursor_row: self.cursor_row,
             cursor_col: self.cursor_col,
             selection: self.selection,
@@ -11066,6 +11383,20 @@ impl Editor {
         self.undo_stack.drain(..drop);
     }
 
+    /// Drop the redo steps furthest from the live text while the history
+    /// holds more than [`UNDO_BYTES_LIMIT`] bytes, as a peer's edit carried
+    /// into every state can make it (#919).
+    fn trim_redo_stack(&mut self) {
+        let held = self.undo_stack.iter().chain(&self.redo_stack);
+        let mut total: usize = held.map(|s| s.bytes).sum();
+        let mut drop = 0;
+        while drop < self.redo_stack.len() && total > UNDO_BYTES_LIMIT {
+            total -= self.redo_stack[drop].bytes;
+            drop += 1;
+        }
+        self.redo_stack.drain(..drop);
+    }
+
     /// Undo and redo steps held, and the bytes of text they hold, for the
     /// memory report (#694).
     pub fn undo_history_size(&self) -> (usize, usize) {
@@ -11077,8 +11408,9 @@ impl Editor {
     }
 
     /// Push an undo entry tagged with the kind of edit about to happen.
-    /// Coalesces consecutive `InsertChar` ops into one step so a typing
-    /// burst is undone as one unit; everything else opens a new step.
+    /// Coalesces consecutive `InsertChar` (or `MultiInsertChar`) ops into
+    /// one step so a typing burst is undone as one unit; everything else
+    /// opens a new step.
     fn push_undo(&mut self, kind: EditKind) {
         self.push_undo_step(kind, None);
     }
@@ -11094,8 +11426,8 @@ impl Editor {
         // Where the edit about to happen begins — the merge editor's
         // region tracker reads this when it reconciles (#253).
         self.merge_edit_row = self.cursor_row;
-        let coalesce = (kind == EditKind::InsertChar
-            && self.last_edit_kind == Some(EditKind::InsertChar))
+        let typing = matches!(kind, EditKind::InsertChar | EditKind::MultiInsertChar);
+        let coalesce = (typing && self.last_edit_kind == Some(kind))
             || (group.is_some() && group == self.remote_undo_group && !self.undo_stack.is_empty());
         self.remote_undo_group = group;
         if !coalesce {
@@ -11142,6 +11474,7 @@ impl Editor {
     /// the caret into the restored buffer and refreshing highlights.
     fn restore_snapshot(&mut self, snap: Snapshot) {
         self.lines = snap.lines.iter().map(String::from).collect();
+        self.final_newline = snap.final_newline;
         // The map that described this text comes back with it (#349): an
         // undo re-credits the lines it restores to the seats that wrote
         // them, a redo re-credits the edit to its seat. Truncated below to
@@ -11548,10 +11881,56 @@ impl Editor {
     ///   * dirty buffer + external change -> flag a conflict so neither the
     ///     buffer nor the disk is clobbered,
     ///   * no change -> nothing.
+    ///
+    /// A failed reload or a deletion is reported once, then the sweep stays
+    /// quiet until disk changes again (#900).
     pub fn reload_or_flag_conflict(&mut self) -> ExternalChange {
         if !self.disk_changed_externally() {
+            self.disk_report = None;
             return ExternalChange::Unchanged;
         }
+        let found = self
+            .path
+            .as_deref()
+            .and_then(|p| self.current_disk_stamp(p));
+        // Only a file that is not there is deleted: a stat that fails any
+        // other way (an I/O error, a parent turned unreadable) is a failed
+        // reload, and its save keeps the conflict check.
+        let deleted = found.is_none() && self.path.as_deref().is_some_and(gone_from_disk);
+        let report = DiskReport {
+            synced: self.disk_stamp,
+            found,
+            deleted,
+        };
+        if self.disk_report == Some(report) {
+            if deleted || self.dirty {
+                return ExternalChange::Unchanged;
+            }
+            // Reported once, but a clean tab keeps trying: a read can start
+            // working again with nothing on disk moving, as when a
+            // permission is put back.
+            return match self.reload_from_disk() {
+                Ok(()) => {
+                    self.disk_report = None;
+                    ExternalChange::Reloaded
+                }
+                Err(_) => {
+                    self.disk_report = Some(DiskReport {
+                        synced: self.disk_stamp,
+                        ..report
+                    });
+                    ExternalChange::Unchanged
+                }
+            };
+        }
+        if deleted {
+            // Gone, not changed: there is nothing to reload, and no external
+            // edit for the buffer to conflict with or a save to clobber.
+            self.disk_report = Some(report);
+            self.disk_conflict = false;
+            return ExternalChange::Deleted;
+        }
+        self.disk_report = None;
         if self.dirty {
             // Announce the conflict only on the transition into it. A buffer
             // that stays dirty while disk keeps differing must not re-fire on
@@ -11566,8 +11945,24 @@ impl Editor {
         }
         match self.reload_from_disk() {
             Ok(()) => ExternalChange::Reloaded,
-            Err(_) => ExternalChange::ReloadFailed,
+            Err(_) => {
+                // Keyed on the stamp as the failed open left it, which is
+                // what the next sweep compares.
+                self.disk_report = Some(DiskReport {
+                    synced: self.disk_stamp,
+                    found,
+                    deleted: false,
+                });
+                ExternalChange::ReloadFailed
+            }
         }
+    }
+
+    /// True while this tab's file is known to be gone from disk (#900): the
+    /// sweep reported it deleted and nothing has synced the tab since.
+    pub fn deleted_on_disk(&self) -> bool {
+        self.disk_report
+            .is_some_and(|r| r.deleted && r.synced == self.disk_stamp)
     }
 
     /// Save, refusing to overwrite if the file changed on disk since we last
@@ -11586,6 +11981,15 @@ impl Editor {
 
     fn save_to_disk_for(&mut self, reason: SaveReason) -> Result<SaveOutcome> {
         if self.disk_changed_externally() {
+            // A file deleted on disk holds no external edit to clobber, so an
+            // explicit save puts it back, as VS Code does (#900). Auto save
+            // leaves it gone: a checkout or `git stash` may have meant that.
+            if self.path.as_deref().is_some_and(gone_from_disk) {
+                if reason == SaveReason::Auto {
+                    anyhow::bail!("Deleted on disk: only an explicit save recreates it");
+                }
+                return self.write_buffer_to_disk(reason);
+            }
             self.disk_conflict = true;
             return Ok(SaveOutcome::DiskConflict);
         }
@@ -11712,14 +12116,23 @@ impl Editor {
         out
     }
 
-    /// The buffer as `\n`-joined text with the final newline the file has,
-    /// for an external formatter that reads the whole file (#1255).
-    pub fn text_for_formatter(&self) -> String {
+    /// The buffer as `\n`-joined text with the final newline the file has:
+    /// what language servers are sent (#911), and an external formatter
+    /// that reads the whole file (#1255). Sent without it, every formatter
+    /// added a newline the save then wrote a second one after.
+    pub fn document_text(&self) -> String {
         let mut text = self.lines.join("\n");
-        if self.final_newline && !text.is_empty() {
+        if self.sends_final_newline() {
             text.push('\n');
         }
         text
+    }
+
+    /// Whether [`Self::document_text`] ends in a newline: the file has one
+    /// and the buffer is not empty, which a save writes as nothing.
+    fn sends_final_newline(&self) -> bool {
+        self.final_newline
+            && (self.lines.len() > 1 || self.lines.first().is_some_and(|l| !l.is_empty()))
     }
 
     /// Whether the buffer's last line ends in a line break on disk.
@@ -11940,6 +12353,22 @@ impl Editor {
         }
         self.cursor_row = self.lines.len() - 1;
         self.cursor_col = 0;
+        self.last_edit_kind = None;
+    }
+
+    /// `Ctrl+Home` (`Cmd+Home` on macOS), VS Code's `cursorTop`. Unlike
+    /// `goto_top` it keeps the selection, so `Shift` extends it.
+    pub fn cursor_top(&mut self) {
+        self.cursor_row = 0;
+        self.cursor_col = 0;
+        self.last_edit_kind = None;
+    }
+
+    /// `Ctrl+End`, VS Code's `cursorBottom`: after the last line's last
+    /// character, keeping the selection like `cursor_top`.
+    pub fn cursor_bottom(&mut self) {
+        self.cursor_row = self.lines.len().saturating_sub(1);
+        self.cursor_col = self.line_char_len(self.cursor_row);
         self.last_edit_kind = None;
     }
 
@@ -12342,7 +12771,7 @@ impl Editor {
     pub fn move_word_right(&mut self) {
         loop {
             let chars: Vec<char> = self.lines[self.cursor_row].chars().collect();
-            while self.cursor_col < chars.len() && !is_word_char(chars[self.cursor_col]) {
+            while self.cursor_col < chars.len() && !word_char_at(&chars, self.cursor_col) {
                 self.cursor_col += 1;
             }
             if self.cursor_col < chars.len() {
@@ -12358,7 +12787,7 @@ impl Editor {
             }
         }
         let chars: Vec<char> = self.lines[self.cursor_row].chars().collect();
-        while self.cursor_col < chars.len() && is_word_char(chars[self.cursor_col]) {
+        while self.cursor_col < chars.len() && word_char_at(&chars, self.cursor_col) {
             self.cursor_col += 1;
         }
         self.ensure_cursor_col_visible();
@@ -14345,6 +14774,7 @@ impl Editor {
     /// the row below the lowest current caret, at the same column (clamped to
     /// that line's length). No-op at the last row.
     pub fn add_cursor_below(&mut self) {
+        self.multi_typing = None;
         let max_row = self
             .carets
             .iter()
@@ -14369,6 +14799,7 @@ impl Editor {
     /// existing zero-width caret removes it (toggle). Returns false when the
     /// click misses the text area.
     pub fn add_caret_at_screen(&mut self, col: u16, row: u16) -> bool {
+        self.multi_typing = None;
         let Some((r, c)) = self.buffer_pos_at(col, row) else {
             return false;
         };
@@ -14403,6 +14834,7 @@ impl Editor {
     /// (VS Code's Shift+Alt+drag). Clears any existing selection/carets and
     /// parks the primary at the anchor. Returns false if the cell misses text.
     pub fn begin_box_select(&mut self, col: u16, row: u16) -> bool {
+        self.multi_typing = None;
         let Some((r, c)) = self.buffer_pos_at(col, row) else {
             return false;
         };
@@ -14435,6 +14867,7 @@ impl Editor {
     /// over the shared column span (clamped to that line's length); the head
     /// row is the primary. Zero-width columns become bare carets.
     fn box_select_to(&mut self, head_row: usize, head_col: usize) {
+        self.multi_typing = None;
         let Some((ar, ac)) = self.box_anchor else {
             return;
         };
@@ -14521,6 +14954,7 @@ impl Editor {
     /// VS Code "Add Cursor Above" (Cmd+Alt+Up): mirror of `add_cursor_below`.
     /// No-op at the first row.
     pub fn add_cursor_above(&mut self) {
+        self.multi_typing = None;
         let min_row = self
             .carets
             .iter()
@@ -14682,7 +15116,7 @@ impl Editor {
         loop {
             let chars: Vec<char> = self.lines[self.cursor_row].chars().collect();
             self.cursor_col = self.cursor_col.min(chars.len());
-            while self.cursor_col > 0 && !is_word_char(chars[self.cursor_col - 1]) {
+            while self.cursor_col > 0 && !word_char_at(&chars, self.cursor_col - 1) {
                 self.cursor_col -= 1;
             }
             if self.cursor_col > 0 {
@@ -14698,7 +15132,7 @@ impl Editor {
             }
         }
         let chars: Vec<char> = self.lines[self.cursor_row].chars().collect();
-        while self.cursor_col > 0 && is_word_char(chars[self.cursor_col - 1]) {
+        while self.cursor_col > 0 && word_char_at(&chars, self.cursor_col - 1) {
             self.cursor_col -= 1;
         }
         self.ensure_cursor_col_visible();
@@ -15563,8 +15997,8 @@ impl Editor {
         }
         let mut out = Vec::new();
         for d in &self.diagnostics {
-            let start_line = d.start_line as usize;
-            let end_line = d.end_line as usize;
+            let (start_line, start_char) = self.diagnostic_row(d.start_line, d.start_char);
+            let (end_line, end_char) = self.diagnostic_row(d.end_line, d.end_char);
             if line < start_line || line > end_line {
                 continue;
             }
@@ -15572,12 +16006,12 @@ impl Editor {
                 continue;
             };
             let from = if line == start_line {
-                utf16_to_char_col(text, d.start_char)
+                utf16_to_char_col(text, start_char)
             } else {
                 0
             };
             let to = if line == end_line {
-                utf16_to_char_col(text, d.end_char)
+                utf16_to_char_col(text, end_char)
             } else {
                 text.chars().count()
             };
@@ -15603,19 +16037,19 @@ impl Editor {
             return None;
         }
         for d in &self.diagnostics {
-            let start_line = d.start_line as usize;
-            let end_line = d.end_line as usize;
+            let (start_line, start_char) = self.diagnostic_row(d.start_line, d.start_char);
+            let (end_line, end_char) = self.diagnostic_row(d.end_line, d.end_char);
             if line < start_line || line > end_line {
                 continue;
             }
             let text = self.lines.get(line)?;
             let from = if line == start_line {
-                utf16_to_char_col(text, d.start_char)
+                utf16_to_char_col(text, start_char)
             } else {
                 0
             };
             let to = if line == end_line {
-                utf16_to_char_col(text, d.end_char)
+                utf16_to_char_col(text, end_char)
             } else {
                 text.chars().count()
             };
@@ -15712,6 +16146,52 @@ fn floor_grapheme_col(line: &str, col: usize) -> usize {
 
 pub(crate) fn is_word_char(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
+}
+
+/// Whether `chars[i]` belongs to a word for the word motions and deletes
+/// (#909): a word char, or a zero-width mark riding on one (a combining
+/// accent in decomposed text, a variation selector), so `Ctrl+Right` never
+/// stops between `e` and its accent for `Ctrl+Backspace` to split them.
+fn word_char_at(chars: &[char], i: usize) -> bool {
+    let joins = |c: char| !c.is_control() && unicode_width::UnicodeWidthChar::width(c) == Some(0);
+    let base = (0..=i)
+        .rev()
+        .find(|&j| j == 0 || !joins(chars[j]))
+        .unwrap_or(0);
+    is_word_char(chars[base])
+}
+
+/// Where Delete Word Left stops on `line`, going back from char `col`: over
+/// any non-word chars, then over the word before them (`move_word_left`'s
+/// stop within a line), moved back to a grapheme boundary.
+fn word_start_before(line: &str, col: usize) -> usize {
+    let chars: Vec<char> = line.chars().collect();
+    let mut i = col.min(chars.len());
+    while i > 0 && !word_char_at(&chars, i - 1) {
+        i -= 1;
+    }
+    while i > 0 && word_char_at(&chars, i - 1) {
+        i -= 1;
+    }
+    floor_grapheme_col(line, i)
+}
+
+/// Where Delete Word Right stops on `line`, going on from char `col`: over
+/// any non-word chars, then to the end of the word after them
+/// (`move_word_right`'s stop within a line), on to a grapheme boundary.
+fn word_end_after(line: &str, col: usize) -> usize {
+    let chars: Vec<char> = line.chars().collect();
+    let mut i = col.min(chars.len());
+    while i < chars.len() && !word_char_at(&chars, i) {
+        i += 1;
+    }
+    while i < chars.len() && word_char_at(&chars, i) {
+        i += 1;
+    }
+    match floor_grapheme_col(line, i) {
+        start if start < i => next_grapheme_col(line, start),
+        _ => i,
+    }
 }
 
 /// A `(row, char_col)` buffer position: a bracket character's in the
@@ -17775,6 +18255,18 @@ fn cells_of(chars: &[char]) -> usize {
     chars.iter().map(|&c| char_cells(c)).sum()
 }
 
+/// `text` as the editor paints it: each tab as the blank cells it takes
+/// ([`char_cells`]), which the caret, selection, clicks and every overlay
+/// count for it. ratatui drops control characters, so a raw tab took no
+/// cell and the text after it slid left under all of them (#891).
+fn blank_tabs(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.contains('\t') {
+        text.replace('\t', &" ".repeat(char_cells('\t'))).into()
+    } else {
+        text.into()
+    }
+}
+
 /// Soft-wrap a logical line into visual segments for word-wrap mode.
 ///
 /// Each segment is a half-open `(start_char, end_char)` range over `chars`;
@@ -18197,7 +18689,7 @@ fn merge_overlay(base: &[HiSpan], over: &[HiSpan]) -> Vec<HiSpan> {
 
 fn build_line_spans<'a>(line: &'a str, spans: &[HiSpan]) -> Vec<Span<'a>> {
     if spans.is_empty() {
-        return vec![Span::raw(line)];
+        return vec![Span::raw(blank_tabs(line))];
     }
     let mut out: Vec<Span> = Vec::with_capacity(spans.len() * 2);
     let mut cursor = 0usize;
@@ -18206,18 +18698,18 @@ fn build_line_spans<'a>(line: &'a str, spans: &[HiSpan]) -> Vec<Span<'a>> {
         if range.start > cursor && range.start <= line.len() {
             let slice = &line[cursor..range.start];
             if !slice.is_empty() {
-                out.push(Span::raw(slice));
+                out.push(Span::raw(blank_tabs(slice)));
             }
         }
         let s = range.start.min(line.len());
         let e = range.end.min(line.len());
         if e > s {
-            out.push(Span::styled(&line[s..e], sp.style));
+            out.push(Span::styled(blank_tabs(&line[s..e]), sp.style));
             cursor = e;
         }
     }
     if cursor < line.len() {
-        out.push(Span::raw(&line[cursor..]));
+        out.push(Span::raw(blank_tabs(&line[cursor..])));
     }
     out
 }
@@ -21312,6 +21804,11 @@ impl EditorTabs {
                         report.failed.push(p);
                     }
                 }
+                ExternalChange::Deleted => {
+                    if let Some(p) = path {
+                        report.deleted.push(p);
+                    }
+                }
                 ExternalChange::Unchanged => {}
             }
         }
@@ -22801,6 +23298,12 @@ fn comment_line(line: &str) -> bool {
         || t == "*"
 }
 
+/// Whether `path` is gone from disk (#900): not there at all, as opposed to
+/// there but unreadable, which a deleted tab's save must not treat alike.
+fn gone_from_disk(path: &Path) -> bool {
+    matches!(std::fs::metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+}
+
 fn tab_label(e: &Editor) -> String {
     if let Some(diff) = e.diff.as_ref() {
         let l = diff
@@ -22849,6 +23352,12 @@ fn tab_label(e: &Editor) -> String {
     // The lock VS Code shows on a file the user can't write (#1379).
     let name = if e.write_protected {
         format!("{name} \u{f023}")
+    } else {
+        name
+    };
+    // VS Code's mark on a tab whose file is gone from disk (#900).
+    let name = if e.deleted_on_disk() {
+        format!("{name} (deleted)")
     } else {
         name
     };
@@ -28198,6 +28707,69 @@ mod tests {
         assert_eq!(e.lines, vec!["foo bar foo".to_string(), "foo".to_string()]);
     }
 
+    /// #913: a word typed at several carets undoes in one step, as one
+    /// caret's typing burst does, and brings the selections back.
+    #[test]
+    fn multi_caret_typing_burst_undoes_in_one_step() {
+        let mut e = editor_with("total = 0\ntotal += 5\nprint(total)");
+        for _ in 0..3 {
+            e.select_next_occurrence();
+        }
+        let (selection, carets) = (e.selection, e.carets.clone());
+        assert_eq!(carets.len(), 2);
+        for c in "grand".chars() {
+            e.multi_insert_char(c);
+        }
+        assert_eq!(e.lines, ["grand = 0", "grand += 5", "print(grand)"]);
+        e.collapse_carets();
+        assert!(e.undo());
+        assert_eq!(e.lines, ["total = 0", "total += 5", "print(total)"]);
+        assert_eq!(e.selection, selection);
+        assert_eq!(e.carets, carets);
+        assert!(!e.undo(), "the rename was the only step");
+    }
+
+    /// #913: the burst ends at a Backspace and when the carets change, as
+    /// one caret's ends at a Backspace or a move.
+    #[test]
+    fn multi_caret_typing_burst_ends_at_backspace_or_caret_change() {
+        let mut e = editor_with("a\nb");
+        e.cursor_col = 1;
+        e.carets = vec![EditorSelection::new(1, 1)];
+        e.multi_insert_char('x');
+        e.multi_insert_char('y');
+        e.multi_backspace();
+        e.multi_insert_char('z');
+        assert_eq!(e.lines, ["axz", "bxz"]);
+        e.carets = vec![EditorSelection::new(1, 0)];
+        e.multi_insert_char('w');
+        assert_eq!(e.lines, ["axzw", "wbxz"]);
+        let mut undone = Vec::new();
+        while e.undo() {
+            undone.push(e.lines.join("|"));
+        }
+        assert_eq!(undone, ["axz|bxz", "ax|bx", "axy|bxy", "a|b"]);
+    }
+
+    /// #913: collapsing the carets and adding them back where they were
+    /// (Cmd+Alt+Down does both) ends the burst like any caret command, so
+    /// the typing either side of it undoes in two steps.
+    #[test]
+    fn multi_caret_typing_burst_ends_when_the_carets_are_rebuilt_in_place() {
+        let mut e = editor_with("a\nb");
+        e.cursor_col = 1;
+        e.add_cursor_below();
+        e.multi_insert_char('x');
+        e.collapse_carets();
+        e.add_cursor_below();
+        e.multi_insert_char('y');
+        assert_eq!(e.lines, ["axy", "bxy"]);
+        assert!(e.undo());
+        assert_eq!(e.lines, ["ax", "bx"]);
+        assert!(e.undo());
+        assert_eq!(e.lines, ["a", "b"]);
+    }
+
     #[test]
     fn carets_on_one_line_keep_their_places_across_keystrokes() {
         let mut e = editor_with("abcd");
@@ -28574,8 +29146,8 @@ mod tests {
         }
     }
 
-    /// #1207: every span of one remote group (the runs of a peer's edit,
-    /// the fragments of an AI stream) is one undo step.
+    /// #1207: every span of one remote group (the fragments of an AI
+    /// stream) is one undo step.
     #[test]
     fn remote_spans_of_one_group_undo_as_one_step() {
         let mut e = editor_with("def add(a, b):");
@@ -28653,6 +29225,71 @@ mod tests {
         assert_eq!(e.lines[0], "return a - b + c", "an ended group is closed");
         assert!(e.undo());
         assert_eq!(e.lines[0], "return a - b");
+    }
+
+    /// #919: a peer's edit opens no undo step. Undo reverts this user's own
+    /// typing and keeps the peer's lines, redo brings the typing back beside
+    /// them, and the restored caret sits where the typing was although the
+    /// peer added a line above it.
+    #[test]
+    fn undo_and_redo_keep_a_peers_edit() {
+        let mut e = editor_with("def f():\n    return 1\n\ndef g():\n    return 2");
+        e.cursor_row = 1;
+        e.cursor_col = 12;
+        e.insert_str("  # A-edit");
+        assert_eq!(
+            e.apply_peer_span_edit(&span((0, 0), (0, 0), "import os\n")),
+            1
+        );
+        e.apply_peer_span_edit(&span((5, 12), (5, 12), "  # B-edit"));
+        let typed = e.lines.clone();
+        assert!(e.undo());
+        assert_eq!(
+            e.lines,
+            [
+                "import os",
+                "def f():",
+                "    return 1",
+                "",
+                "def g():",
+                "    return 2  # B-edit"
+            ],
+            "only this user's typing is undone"
+        );
+        assert_eq!((e.cursor_row, e.cursor_col), (2, 12));
+        assert!(!e.undo(), "the peer's edits are not this user's steps");
+        assert!(e.redo());
+        assert_eq!(e.lines, typed);
+        // A peer edit while a step waits in redo lands in it too.
+        assert!(e.undo());
+        e.apply_peer_span_edit(&span((0, 0), (1, 0), ""));
+        assert!(e.redo());
+        assert_eq!(e.lines[0], "def f():");
+        assert_eq!(e.lines[1], "    return 1  # A-edit");
+    }
+
+    /// #919: a peer's edit lands in every held state, so a large paste over
+    /// a deep history is trimmed back under the cap, not kept many times.
+    #[test]
+    fn a_peers_large_edit_keeps_the_history_under_its_cap() {
+        let mut e = editor_with("x");
+        for _ in 0..40 {
+            e.insert_str("y");
+            e.break_undo_coalescing();
+        }
+        let paste = "z".repeat(50 * 1024);
+        e.apply_peer_span_edit(&span((0, 0), (0, 0), &paste));
+        let (steps, bytes) = e.undo_history_size();
+        assert!(
+            bytes <= UNDO_BYTES_LIMIT,
+            "{steps} steps hold {bytes} bytes"
+        );
+        assert!(e.undo_stack.len() >= UNDO_MIN_STEPS);
+        assert!(e.undo());
+        assert!(
+            e.lines[0].starts_with(&paste),
+            "the kept steps took the paste"
+        );
     }
 
     fn span(start: (usize, usize), end: (usize, usize), new_text: &str) -> TextSpanEdit {
@@ -28745,6 +29382,31 @@ mod tests {
         e.cursor_col = 2;
         e.apply_remote_span_edits(&[span((0, 0), (0, 0), "zero\n")], 3);
         assert_eq!((e.cursor_row, e.cursor_col), (2, 2));
+    }
+
+    /// #918: a peer's lines added or removed above the view move its top
+    /// line with them, so the text on screen stays where it was. Negative:
+    /// text inserted right at the top line, below it, or above a view at the
+    /// top of the file leaves the top where it is.
+    #[test]
+    fn a_remote_edit_above_the_view_keeps_the_text_on_screen() {
+        let text: Vec<String> = (0..40).map(|i| format!("line {i}")).collect();
+        let mut e = editor_with(&text.join("\n"));
+        e.scroll = 20;
+        e.cursor_row = 25;
+        e.apply_remote_span_edits(&[span((3, 0), (3, 0), "a\nb\n")], 1);
+        assert_eq!((e.scroll, e.cursor_row), (22, 27));
+        assert_eq!(e.lines[e.scroll], "line 20");
+        e.apply_remote_span_edits(&[span((2, 4), (5, 4), "")], 2);
+        assert_eq!(e.scroll, 19);
+        assert_eq!(e.lines[e.scroll], "line 20");
+        e.apply_remote_span_edits(&[span((19, 0), (19, 0), "new\n")], 3);
+        e.apply_remote_span_edits(&[span((30, 0), (30, 0), "x\ny\n")], 4);
+        assert_eq!(e.scroll, 19);
+        assert_eq!(e.lines[e.scroll], "new");
+        e.scroll = 0;
+        e.apply_remote_span_edits(&[span((0, 0), (0, 0), "import os\n")], 5);
+        assert_eq!(e.scroll, 0);
     }
 
     /// Negative (#1603): edits after the caret, later on its row or on rows
@@ -30001,6 +30663,111 @@ mod tests {
         assert_eq!(e.cursor_col, 5);
     }
 
+    // #909: Ctrl+Backspace / Ctrl+Delete delete to Ctrl+Left / Ctrl+Right's
+    // stop, never past the line, and each press is one undo step.
+    #[test]
+    fn delete_word_left_takes_the_word_and_the_gap_before_the_caret() {
+        let mut e = editor_with("alpha beta.gamma  ");
+        e.cursor_col = 18;
+        e.delete_word_left();
+        assert_eq!((e.lines[0].as_str(), e.cursor_col), ("alpha beta.", 11));
+        e.delete_word_left();
+        assert_eq!((e.lines[0].as_str(), e.cursor_col), ("alpha ", 6));
+        e.delete_word_left();
+        assert_eq!((e.lines[0].as_str(), e.cursor_col), ("", 0));
+        assert!(e.undo());
+        assert_eq!(e.lines[0], "alpha ");
+    }
+
+    /// #909: a combining accent in decomposed text stays with its letter:
+    /// Ctrl+Left / Ctrl+Right step over `e\u{301}x` whole, and Ctrl+Backspace
+    /// and Ctrl+Delete take the letter and its accent together.
+    #[test]
+    fn word_motion_and_deletes_keep_a_combining_accent_with_its_letter() {
+        let mut e = editor_with("e\u{301}x yz");
+        e.move_word_right();
+        assert_eq!(e.cursor_col, 3, "past the whole word");
+        e.delete_word_left();
+        assert_eq!((e.lines[0].as_str(), e.cursor_col), (" yz", 0));
+        assert!(e.undo());
+        e.cursor_col = 0;
+        e.delete_word_right();
+        assert_eq!(e.lines[0], " yz");
+        let mut e = editor_with("ab e\u{301}");
+        e.cursor_col = 5;
+        e.move_word_left();
+        assert_eq!(
+            e.cursor_col, 3,
+            "back to the letter, not between it and its accent"
+        );
+    }
+
+    #[test]
+    fn delete_word_left_at_line_start_only_joins_the_line_above() {
+        let mut e = editor_with("one two\nthree");
+        e.cursor_row = 1;
+        e.cursor_col = 0;
+        e.delete_word_left();
+        assert_eq!(e.lines, vec!["one twothree".to_string()]);
+        assert_eq!((e.cursor_row, e.cursor_col), (0, 7));
+    }
+
+    #[test]
+    fn delete_word_left_takes_an_accented_word_and_stays_on_its_line() {
+        let mut e = editor_with("x\n  cafe\u{301}");
+        e.cursor_row = 1;
+        e.cursor_col = 7;
+        e.delete_word_left();
+        assert_eq!((e.lines[1].as_str(), e.cursor_col), ("  ", 2));
+        e.delete_word_left();
+        assert_eq!(e.lines, vec!["x".to_string(), String::new()]);
+        assert_eq!((e.cursor_row, e.cursor_col), (1, 0));
+    }
+
+    #[test]
+    fn delete_word_right_takes_the_gap_and_the_word_after_the_caret() {
+        let mut e = editor_with("alpha  beta gamma\nnext");
+        e.cursor_col = 5;
+        e.delete_word_right();
+        assert_eq!((e.lines[0].as_str(), e.cursor_col), ("alpha gamma", 5));
+        e.cursor_col = 11;
+        e.delete_word_right();
+        assert_eq!(e.lines, vec!["alpha gammanext".to_string()]);
+        e.cursor_col = 1;
+        e.delete_word_right();
+        assert_eq!(e.lines[0], "a gammanext");
+    }
+
+    /// Decomposed `e\u{301}x` is the one word `éx` reads as, so the whole
+    /// word goes, as it does for the precomposed `éx`.
+    #[test]
+    fn delete_word_right_never_splits_a_letter_from_its_accent() {
+        for word in ["e\u{301}x", "\u{e9}x"] {
+            let mut e = editor_with(word);
+            e.delete_word_right();
+            assert_eq!(e.lines[0], "", "{word:?}");
+        }
+    }
+
+    #[test]
+    fn delete_word_with_a_selection_deletes_just_the_selection() {
+        let mut e = editor_with("alpha beta");
+        e.selection = Some(EditorSelection {
+            anchor: (0, 1),
+            head: (0, 3),
+        });
+        e.cursor_col = 3;
+        e.delete_word_left();
+        assert_eq!((e.lines[0].as_str(), e.cursor_col), ("aha beta", 1));
+        e.selection = Some(EditorSelection {
+            anchor: (0, 4),
+            head: (0, 5),
+        });
+        e.cursor_col = 5;
+        e.delete_word_right();
+        assert_eq!(e.lines[0], "aha eta");
+    }
+
     #[test]
     fn buffer_pos_at_maps_cells_to_line_and_char() {
         let mut e = editor_with("fn main() {}\nlet x = 1;");
@@ -30497,6 +31264,21 @@ mod tests {
         e.cursor_col = 3;
         e.goto_bottom();
         assert_eq!((e.cursor_row, e.cursor_col), (2, 0));
+    }
+
+    #[test]
+    fn cursor_top_and_bottom_keep_the_selection_anchor() {
+        let mut e = editor_with("alpha\nbeta\ngamma");
+        e.cursor_row = 1;
+        e.cursor_col = 2;
+        e.start_selection_at_cursor();
+        e.cursor_bottom();
+        e.extend_selection_to_cursor();
+        assert_eq!((e.cursor_row, e.cursor_col), (2, 5));
+        assert_eq!(e.selection_text(), "ta\ngamma");
+        e.cursor_top();
+        e.extend_selection_to_cursor();
+        assert_eq!(e.selection_text(), "alpha\nbe");
     }
 
     #[test]
@@ -31664,6 +32446,62 @@ mod tests {
         }
     }
 
+    /// #911: language servers read the text a save writes, final newline
+    /// included, so a formatter has no newline to add.
+    #[test]
+    fn the_document_text_is_what_a_save_writes() {
+        for disk in ["a\nb\n", "a\n\n", "a", ""] {
+            let tmp = NamedTempFile::new().unwrap();
+            std::fs::write(tmp.path(), disk).unwrap();
+            let mut e = Editor::new();
+            e.open(tmp.path()).unwrap();
+            assert_eq!(e.document_text(), disk);
+        }
+    }
+
+    /// #911: the text the server reads ends in the final newline, so its
+    /// last position is on an empty row past the buffer's last. A
+    /// diagnostic there (a missing token at the end of the file) is drawn
+    /// and hovered at the end of the last row instead of dropped.
+    #[test]
+    fn a_diagnostic_at_the_end_of_the_document_marks_the_last_row() {
+        use crate::lsp::manager::DiagnosticSeverity;
+        let tmp = NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "fn main() {\n").unwrap();
+        let mut e = Editor::new();
+        e.open(tmp.path()).unwrap();
+        assert_eq!(e.lines, vec!["fn main() {"]);
+        let path = tmp.path().to_path_buf();
+        e.apply_diagnostics(path, vec![diag(1, 0, 1, 0, DiagnosticSeverity::Error)]);
+        assert_eq!(
+            e.diagnostic_spans[0],
+            vec![(11, 12, DiagnosticSeverity::Error)]
+        );
+        assert_eq!(e.diagnostics_at(0, 11).len(), 1, "hovered at the row's end");
+    }
+
+    /// #911: a formatter's edit up to the end of that text keeps the final
+    /// newline in the flag, not as a blank row the save writes a second
+    /// newline after. An edit that removes it saves none, and undo brings
+    /// it back.
+    #[test]
+    fn an_edit_reaching_the_final_newline_keeps_one() {
+        let tmp = NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), "x=1\n").unwrap();
+        let mut e = Editor::new();
+        e.open(tmp.path()).unwrap();
+        assert_eq!(e.apply_span_edits(&[span((0, 0), (1, 0), "x = 1\n")]), 1);
+        assert_eq!(e.lines, vec!["x = 1"]);
+        e.save_to_disk().unwrap();
+        assert_eq!(std::fs::read_to_string(tmp.path()).unwrap(), "x = 1\n");
+
+        assert_eq!(e.apply_span_edits(&[span((0, 5), (1, 0), "")]), 1);
+        assert_eq!(e.lines, vec!["x = 1"]);
+        assert_eq!(e.document_text(), "x = 1");
+        assert!(e.undo());
+        assert_eq!(e.document_text(), "x = 1\n");
+    }
+
     #[test]
     fn saving_over_invalid_bytes_asks_first() {
         let tmp = NamedTempFile::new().unwrap();
@@ -32695,6 +33533,135 @@ mod tests {
         );
     }
 
+    /// #900: the failure re-fired on every FS sweep, pinning its status
+    /// over every other message. Once per change on disk; a later change is
+    /// tried afresh.
+    #[test]
+    fn a_failed_external_reload_is_reported_once_per_change_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.txt");
+        std::fs::write(&path, "one\n").unwrap();
+        let mut e = Editor::new();
+        e.open(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert_eq!(e.reload_or_flag_conflict(), ExternalChange::ReloadFailed);
+        assert_eq!(e.reload_or_flag_conflict(), ExternalChange::Unchanged);
+        std::fs::remove_dir(&path).unwrap();
+        std::fs::write(&path, "two, longer\n").unwrap();
+        assert_eq!(e.reload_or_flag_conflict(), ExternalChange::Reloaded);
+        assert_eq!(e.lines[0], "two, longer");
+    }
+
+    /// #900: a failed reload is announced once, but a clean tab keeps
+    /// trying it: a read can start working again with nothing on disk
+    /// moving (a permission put back), and the tab must not stay stale.
+    #[test]
+    fn a_failed_reload_is_retried_quietly_until_it_works() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.txt");
+        std::fs::write(&path, "one\n").unwrap();
+        let mut e = Editor::new();
+        e.open(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert_eq!(e.reload_or_flag_conflict(), ExternalChange::ReloadFailed);
+        // Readable again with the same (mtime, len) the failed read saw.
+        let meta = std::fs::metadata(&path).unwrap();
+        std::fs::remove_dir(&path).unwrap();
+        let body = "x".repeat(usize::try_from(meta.len()).unwrap());
+        std::fs::write(&path, &body).unwrap();
+        let file = std::fs::File::options().write(true).open(&path).unwrap();
+        file.set_modified(meta.modified().unwrap()).unwrap();
+        drop(file);
+        assert_eq!(e.reload_or_flag_conflict(), ExternalChange::Reloaded);
+        assert_eq!(e.lines.join("\n"), body);
+    }
+
+    /// #900: only a file that is not there is deleted. One that cannot be
+    /// stat'd for another reason (here a parent turned into a file) is a
+    /// failed reload: no `(deleted)` mark, and its save keeps the check.
+    #[test]
+    fn a_file_that_cannot_be_statd_is_not_reported_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let path = sub.join("f.txt");
+        std::fs::write(&path, "one\n").unwrap();
+        let mut e = Editor::new();
+        e.open(&path).unwrap();
+        std::fs::remove_dir_all(&sub).unwrap();
+        std::fs::write(&sub, "a file now").unwrap();
+        assert_eq!(e.reload_or_flag_conflict(), ExternalChange::ReloadFailed);
+        assert!(!e.deleted_on_disk());
+        assert_eq!(tab_label(&e), "f.txt");
+    }
+
+    /// #900: a preview tab reuses its editor, so what the sweep said about
+    /// the file it held must not stick to the next one, even one with the
+    /// same timestamp and length.
+    #[test]
+    fn opening_another_file_clears_the_deleted_mark() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.txt");
+        let b = dir.path().join("b.txt");
+        std::fs::write(&a, "same\n").unwrap();
+        std::fs::write(&b, "same\n").unwrap();
+        let stamp = std::fs::metadata(&a).unwrap().modified().unwrap();
+        let file = std::fs::File::options().write(true).open(&b).unwrap();
+        file.set_modified(stamp).unwrap();
+        drop(file);
+        let mut e = Editor::new();
+        e.open(&a).unwrap();
+        std::fs::remove_file(&a).unwrap();
+        assert_eq!(e.reload_or_flag_conflict(), ExternalChange::Deleted);
+        e.open(&b).unwrap();
+        assert!(!e.deleted_on_disk());
+        assert_eq!(tab_label(&e), "b.txt");
+    }
+
+    /// #900: a file deleted on disk is its own state, not a failed reload:
+    /// reported once, the buffer kept, the tab marked `(deleted)`.
+    #[test]
+    fn a_file_deleted_on_disk_is_reported_once_and_marks_its_tab() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.txt");
+        std::fs::write(&path, "alpha\n").unwrap();
+        let mut e = Editor::new();
+        e.open(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(e.reload_or_flag_conflict(), ExternalChange::Deleted);
+        assert_eq!(e.reload_or_flag_conflict(), ExternalChange::Unchanged);
+        assert_eq!(e.lines[0], "alpha", "the buffer is kept");
+        assert_eq!(tab_label(&e), "notes.txt (deleted)");
+        // Put back (`git stash pop`): the clean tab reloads it as usual.
+        std::fs::write(&path, "alpha, restored\n").unwrap();
+        assert_eq!(e.reload_or_flag_conflict(), ExternalChange::Reloaded);
+        assert_eq!(tab_label(&e), "notes.txt");
+    }
+
+    /// #900 (comment): unsaved edits to a file deleted on disk were treated
+    /// as a conflict with a disk copy that no longer exists. No conflict:
+    /// the first explicit save puts the file back, and auto save never does.
+    #[test]
+    fn a_dirty_tab_deleted_on_disk_is_no_conflict_and_its_save_recreates_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("b.txt");
+        std::fs::write(&path, "beta\n").unwrap();
+        let mut e = Editor::new();
+        e.open(&path).unwrap();
+        e.insert_str("my ");
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(e.reload_or_flag_conflict(), ExternalChange::Deleted);
+        assert!(!e.disk_conflict);
+        assert!(e.auto_save_to_disk().is_err());
+        assert!(!path.exists(), "auto save leaves the deletion alone");
+        assert_eq!(e.save_to_disk().unwrap(), SaveOutcome::Saved);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "my beta\n");
+        assert!(!e.deleted_on_disk());
+        assert_eq!(tab_label(&e), "b.txt");
+    }
+
     #[test]
     fn reload_externally_changed_tabs_reloads_background_tab() {
         let dir = tempfile::tempdir().unwrap();
@@ -33454,6 +34421,37 @@ mod tests {
             "l",
             "editor render must leave the underlying glyph alone"
         );
+    }
+
+    /// #891: a tab takes the cell the caret, selection and clicks count for
+    /// it. ratatui drops a raw `'\t'`, so `x\ty\tz` was drawn `xyz` while
+    /// the caret before `z` sat two cells right of it, on blank space.
+    #[test]
+    fn a_tab_takes_its_cell_so_text_caret_and_clicks_agree() {
+        for wrap in [false, true] {
+            let mut e = editor_with("x\ty\tz");
+            e.wrap_override = Some(wrap);
+            e.cursor_col = 4;
+            let buf = guide_buf(&mut e, 30, 5);
+            let text_x = e.last_inner.x + e.last_gutter_width + 1;
+            let y = e.last_inner.y;
+            assert_eq!(
+                row_text(&buf, y, text_x, text_x + 6),
+                "x y z ",
+                "wrap {wrap}"
+            );
+            let (cx, cy) = e.cursor_screen_pos().expect("the caret is on screen");
+            assert_eq!(
+                buf[(cx, cy)].symbol(),
+                "z",
+                "the caret sits on z, wrap {wrap}"
+            );
+            assert_eq!(
+                e.buffer_pos_at(text_x + 2, y),
+                Some((0, 2)),
+                "a click on y lands on y, wrap {wrap}"
+            );
+        }
     }
 
     #[test]
@@ -34296,6 +35294,19 @@ mod tests {
         assert_eq!(clip_pad_cells("日本語", 0, 5), "日本 ");
         assert_eq!(clip_pad_cells("日本語", 1, 6), "本語  ");
         assert_eq!(clip_pad_cells("ab日", 0, 3), "ab ");
+    }
+
+    /// #891: a tab takes one cell in the diff, as its selection, find
+    /// highlight and clicks count it, so a tab-indented line is not drawn
+    /// flush-left and its changed character is marked where it is drawn.
+    #[test]
+    fn a_tab_takes_its_cell_in_the_side_by_side_diff() {
+        use crate::widgets::diff::INTRALINE_REMOVED_BG;
+        assert_eq!(clip_pad_cells("\tx", 0, 4), " x  ");
+        let (buf, inner, _) = render_wide_diff("x\n\tn = 1\n", "x\n\tn = 2\n");
+        let (l_text_x, y) = left_text_at(&buf, inner, 2, " n = 1");
+        assert_eq!(buf[(l_text_x + 5, y)].symbol(), "1");
+        assert_eq!(buf[(l_text_x + 5, y)].bg, intraline(INTRALINE_REMOVED_BG));
     }
 
     /// Narrow text clips and pads exactly as before: by character, to the
@@ -40021,6 +41032,26 @@ mod tests {
             buf[(text_x, y0 + 1)].symbol(),
             "\u{2192}",
             "a tab renders as an arrow"
+        );
+    }
+
+    /// #891: a tab's arrow sits on the tab's own cell. While the tab was
+    /// drawn as no cell, the arrow covered the `r` of `return` and the dots
+    /// after a mid-line tab covered the letters that followed it.
+    #[test]
+    fn all_mode_glyphs_after_a_tab_leave_the_text_alone() {
+        let mut e = editor_with("\treturn 1\n  x = 2\t# tab");
+        e.whitespace_mode = WhitespaceMode::All;
+        let buf = guide_buf(&mut e, 40, 6);
+        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        let y0 = e.last_inner.y;
+        assert_eq!(
+            row_text(&buf, y0, text_x, text_x + 9),
+            "\u{2192}return\u{b7}1"
+        );
+        assert_eq!(
+            row_text(&buf, y0 + 1, text_x, text_x + 13),
+            "\u{b7}\u{b7}x\u{b7}=\u{b7}2\u{2192}#\u{b7}tab"
         );
     }
 

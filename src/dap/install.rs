@@ -259,7 +259,7 @@ pub fn ensure_js_debug() -> Result<PathBuf> {
 /// (the GitHub release URL 302s to a CDN).
 fn download_to_file(url: &str, dest: &Path) -> Result<()> {
     use std::io::Read;
-    let resp = ureq::get(url)
+    let resp = crate::net::get(url)
         .call()
         .context("downloading js-debug release")?;
     let mut bytes = Vec::new();

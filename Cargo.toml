@@ -1,6 +1,6 @@
 [package]
 name = "croft-software"
-version = "0.2.52"
+version = "0.2.58"
 edition = "2024"
 description = "VSCode-style TUI written in Rust"
 license = "MIT"
@@ -183,6 +183,13 @@ ureq = { version = "2", default-features = false, features = ["tls"] }
 # The rest of the tree stays on ureq 2 until those call sites migrate.
 # 3.3.0 verified current on crates.io 2026-07-31.
 ureq3 = { package = "ureq", version = "3", default-features = false, features = ["rustls"] }
+# The trust store every download uses (src/net.rs, #872): the OS's CA store
+# (where a TLS-inspecting proxy's CA lives) on top of the Mozilla roots ureq
+# compiles in, which stay as the fallback. webpki-roots is already in the tree
+# via ureq; rustls-native-certs reads the platform store (files on Linux and
+# Android, the keychain on macOS) and honours SSL_CERT_FILE / SSL_CERT_DIR.
+rustls-native-certs = "0.8"
+webpki-roots = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 # Text CRDT for multiplayer Phase D (independent viewports): tracks concurrent
@@ -197,6 +204,10 @@ cola = { version = "0.5", features = ["serde"] }
 # terminal command line (`rg -w "two words"`) into args when seeding Search
 # from the last grep/rg command (src/quickfix.rs).
 shlex = "1.3"
+# rg's own regex parser, already in the tree via regex and grep-regex. Its AST
+# tells which letters of a seeded `rg -S` pattern are literals, the test rg's
+# smart case applies (src/quickfix.rs), so `\W` doesn't count as uppercase.
+regex-syntax = "0.8"
 # URL parsing for the pair endpoint (--base-url validation, and the
 # loopback/https gate that keeps the gateway credential off cleartext remote
 # hops). Already in the tree transitively via ureq, so promoting it to a

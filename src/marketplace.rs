@@ -572,8 +572,8 @@ fn contained_scratch_path(scratch: &Path, rel: &str) -> Result<PathBuf> {
 
 /// The agent every request here goes through: one timeout, and redirects
 /// handled by the caller rather than by ureq.
-fn agent() -> ureq::Agent {
-    ureq::AgentBuilder::new()
+fn agent(url: &str) -> ureq::Agent {
+    crate::net::builder(url)
         .timeout(FETCH_TIMEOUT)
         .redirects(0)
         .build()
@@ -593,7 +593,7 @@ fn get_checked(url: &str) -> Result<ureq::Response> {
     let mut url = url.to_string();
     for _ in 0..MAX_HOPS {
         check_host(&url)?;
-        let resp = agent()
+        let resp = agent(&url)
             .get(&url)
             .call()
             .with_context(|| format!("fetching {url}"))?;
