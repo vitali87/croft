@@ -3931,12 +3931,24 @@ pub fn stash_oid(root: &Path, index: usize) -> Result<String, String> {
 /// stash pushed or dropped since it was picked shifts every index, and the
 /// old one would name a different stash. Refuses when it is gone.
 pub fn stash_drop_oid(root: &Path, oid: &str) -> Result<String, String> {
+    stash_drop(root, stash_index_of(root, oid)?)
+}
+
+/// Restore and drop the stash whose commit is `oid`, at whatever index it
+/// holds now, as [`stash_drop_oid`] drops one: a stash pushed since, by a
+/// checkout hook or another tool, would make a plain `git stash pop` restore
+/// that one instead. Refuses when it is gone.
+pub fn stash_pop_oid(root: &Path, oid: &str) -> Result<String, String> {
+    stash_pop_at(root, stash_index_of(root, oid)?)
+}
+
+/// The index the stash whose commit is `oid` holds now, or an error when it
+/// is no longer in the stash list.
+fn stash_index_of(root: &Path, oid: &str) -> Result<usize, String> {
     let list = run_git(root, &["stash", "list", "--format=%H"]).map_err(|e| e.to_string())?;
-    let index = list
-        .lines()
+    list.lines()
         .position(|hash| hash.trim() == oid)
-        .ok_or_else(|| String::from("that stash is no longer in the stash list"))?;
-    stash_drop(root, index)
+        .ok_or_else(|| String::from("that stash is no longer in the stash list"))
 }
 
 // --- Tags ----------------------------------------------------------------

@@ -6622,6 +6622,46 @@ fn migrate_changes_brings_the_blocked_edit_along() {
     assert_eq!(app.status, "Switched to main with your changes");
 }
 
+/// #925 negative: a `post-checkout` hook that pushes a stash of its own
+/// during the switch leaves that stash where it is. Migrate Changes pops
+/// the stash it made, which a plain `git stash pop` would have skipped for
+/// the hook's newer one, leaving the edit stashed.
+#[cfg(unix)]
+#[test]
+fn migrate_changes_pops_its_own_stash_when_a_checkout_hook_stashes_too() {
+    use crate::widgets::scm_menu::ScmAction;
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = blocked_switch_repo_925();
+    let hook = tmp.path().join(".git/hooks/post-checkout");
+    std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+    std::fs::write(
+        &hook,
+        "#!/bin/sh\necho hook > hook.txt\ngit stash push -q -u -m hook\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::SourceControl);
+    pick_branch_858(&mut app, ScmAction::CheckoutTo, "main");
+    app.handle_key(key(KeyCode::Down, KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(git_858(tmp.path(), &["branch", "--show-current"]), "main");
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("seed.txt")).unwrap(),
+        "ONE\ntwo\nthree\nfour\nFIVE\n"
+    );
+    assert!(
+        !tmp.path().join("hook.txt").exists(),
+        "the hook's stash stays put"
+    );
+    let stashes = git_858(tmp.path(), &["stash", "list"]);
+    assert_eq!(stashes.lines().count(), 1, "{stashes}");
+    assert!(stashes.contains("hook"), "{stashes}");
+    assert_eq!(app.status, "Switched to main with your changes");
+}
+
 /// #925 negative: changes that conflict with the new branch stop the
 /// migration on the conflict, which is named, and the stash is kept, as
 /// `git stash pop` keeps it.
