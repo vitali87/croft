@@ -10,7 +10,8 @@
 //! only tracks where each conflict region lives inside it and what state
 //! the region is in.
 
-use crate::widgets::diff::{DiffRow, build_diff_rows};
+use crate::merge::ConflictBlock;
+use crate::widgets::diff::{DIFF_DEADLINE, DiffRow, build_diff_rows, build_diff_rows_within};
 
 /// What the user decided for one conflict region.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -292,6 +293,146 @@ impl MergeView {
         self.theirs_scroll = apply(self.theirs_scroll, self.theirs.len());
         self.base_scroll = apply(self.base_scroll, self.base.len());
     }
+
+    /// Settle what a view built from the index stages opens on, given the
+    /// working file `current` as the user left it (#906); `result` is the
+    /// Result the stages give. A file with no markers left was resolved by
+    /// hand (or by rerere, or `git checkout --ours`), so it IS the Result
+    /// and each conflict takes the state its text there reads as. A file
+    /// still exactly as git marked it loses nothing to the stages' Result.
+    /// Anything else, such as resolved blocks or lines typed around them,
+    /// opens on the markers left in it, so none of that work is lost.
+    /// Returns the view plus the Result to put in the buffer, or None when
+    /// `current` already is it.
+    pub fn open_on_file(
+        mut self,
+        result: Vec<String>,
+        current: &[String],
+    ) -> (MergeView, Option<Vec<String>>) {
+        let blocks = crate::merge::find_conflicts(current);
+        if blocks.is_empty() {
+            self.adopt_result(&result, current);
+            return (self, None);
+        }
+        if self.marked_up_as(&result, current, &blocks) {
+            return (self, Some(result));
+        }
+        view_from_markers(current).map_or((self, Some(result)), |(view, r)| (view, Some(r)))
+    }
+
+    /// Take the marker-free `current` as the Result in place of `result`:
+    /// each conflict region is bounded by the nearest lines the two texts
+    /// share, and its state is the side (or both sides) the text there
+    /// matches, Unresolved while it still reads as base, else Manual.
+    fn adopt_result(&mut self, result: &[String], current: &[String]) {
+        self.adopt_result_within(result, current, DIFF_DEADLINE);
+    }
+
+    /// [`Self::adopt_result`] with the line diff bounded by `budget`. A
+    /// diff cut short by it (#1152) matches only the lines the two texts
+    /// open and close with, so a region's nearest shared line can lie past
+    /// the next conflict: a region not pinned on both sides by the lines
+    /// around it in `result` then takes no lines, and reads as Manual, so
+    /// an accept on it cannot replace hand-resolved text it does not own.
+    fn adopt_result_within(
+        &mut self,
+        result: &[String],
+        current: &[String],
+        budget: std::time::Duration,
+    ) {
+        let (rows, coarse) = build_diff_rows_within(result, current, budget);
+        let shared: Vec<(usize, usize)> = rows
+            .into_iter()
+            .filter_map(|row| match row {
+                DiffRow::Equal { left, right } => Some((left, right)),
+                _ => None,
+            })
+            .collect();
+        let mut floor = 0;
+        for c in &mut self.conflicts {
+            let before = shared.partition_point(|&(l, _)| l < c.result_start);
+            let after = shared.partition_point(|&(l, _)| l < c.result_start + c.result_len);
+            let start = before
+                .checked_sub(1)
+                .map_or(0, |i| shared[i].1 + 1)
+                .max(floor);
+            let end = shared
+                .get(after)
+                .map_or(current.len(), |&(_, r)| r)
+                .max(start);
+            let c_end = c.result_start + c.result_len;
+            let pinned = before
+                .checked_sub(1)
+                .map_or(c.result_start == 0, |i| shared[i].0 + 1 == c.result_start)
+                && shared
+                    .get(after)
+                    .map_or(c_end == result.len(), |&(l, _)| l == c_end);
+            if coarse && !pinned {
+                c.state = ConflictState::Manual;
+                c.result_start = start;
+                c.result_len = 0;
+                floor = start;
+                continue;
+            }
+            let text = &current[start..end];
+            c.state = if text == c.base.as_slice() {
+                ConflictState::Unresolved
+            } else {
+                [
+                    ConflictState::Current,
+                    ConflictState::Incoming,
+                    ConflictState::Both,
+                    ConflictState::BothReverse,
+                ]
+                .into_iter()
+                .find(|&s| c.replacement(s) == text)
+                .unwrap_or(ConflictState::Manual)
+            };
+            c.result_start = start;
+            c.result_len = end - start;
+            floor = end;
+        }
+    }
+
+    /// True when `current` is this merge as git writes it to the working
+    /// file: `result` with each conflict region shown as a marker block.
+    /// Both are read once as all-ours and once as all-theirs, so a block
+    /// git narrowed (its default and zdiff3 styles move the lines both
+    /// sides share outside the markers) still matches, while a resolved
+    /// block or any line the user typed does not.
+    fn marked_up_as(
+        &self,
+        result: &[String],
+        current: &[String],
+        blocks: &[ConflictBlock],
+    ) -> bool {
+        [true, false].into_iter().all(|ours| {
+            let regions: Vec<_> = self
+                .conflicts
+                .iter()
+                .map(|c| {
+                    let side = if ours { &c.ours } else { &c.theirs };
+                    (
+                        c.result_start,
+                        c.result_start + c.result_len,
+                        side.as_slice(),
+                    )
+                })
+                .collect();
+            let marked: Vec<_> = blocks
+                .iter()
+                .map(|b| {
+                    let side = if ours {
+                        &current[b.ours_start + 1..b.base_start.unwrap_or(b.sep)]
+                    } else {
+                        &current[b.sep + 1..b.theirs_end]
+                    };
+                    (b.ours_start, b.theirs_end + 1, side)
+                })
+                .collect();
+            splice_spans(result, &regions) == splice_spans(current, &marked)
+        })
+    }
 }
 
 /// One maximal changed run from a two-way diff: base rows
@@ -571,6 +712,22 @@ pub fn view_from_markers(lines: &[String]) -> Option<(MergeView, Vec<String>)> {
     Some((view, result))
 }
 
+/// `lines` with each `(start, end, text)` span, in order, replaced by `text`.
+fn splice_spans<'a>(
+    lines: &'a [String],
+    spans: &[(usize, usize, &'a [String])],
+) -> Vec<&'a String> {
+    let mut out = Vec::with_capacity(lines.len());
+    let mut pos = 0;
+    for &(start, end, text) in spans {
+        out.extend(&lines[pos..start]);
+        out.extend(text);
+        pos = end;
+    }
+    out.extend(&lines[pos..]);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -783,6 +940,133 @@ mod tests {
     #[test]
     fn a_marker_free_buffer_synthesizes_nothing() {
         assert!(view_from_markers(&lines(&["plain", "text"])).is_none());
+    }
+
+    /// #906: the repro's config.toml, where both branches changed `timeout`.
+    fn timeout_merge() -> (MergeView, Vec<String>) {
+        MergeView::new(
+            lines(&["retries = 3", "timeout = 10", "log = info"]),
+            lines(&["retries = 3", "timeout = 20", "log = info"]),
+            lines(&["retries = 3", "timeout = 30", "log = info"]),
+            false,
+        )
+    }
+
+    #[test]
+    fn a_hand_resolved_file_is_the_result_with_the_state_its_text_reads_as() {
+        for (region, state) in [
+            (&["timeout = 45"][..], ConflictState::Manual),
+            (&["timeout = 20"][..], ConflictState::Current),
+            (
+                &["timeout = 30", "timeout = 20"][..],
+                ConflictState::BothReverse,
+            ),
+            (&["timeout = 10"][..], ConflictState::Unresolved),
+        ] {
+            let mut file = lines(&["# added", "retries = 3"]);
+            file.extend(lines(region));
+            file.push("log = info".into());
+            let (view, result) = timeout_merge();
+            let (view, splice) = view.open_on_file(result, &file);
+            assert!(splice.is_none(), "{region:?}: the file stays as it is");
+            let c = &view.conflicts[0];
+            assert_eq!(
+                (c.state, c.result_start, c.result_len),
+                (state, 2, region.len())
+            );
+        }
+    }
+
+    /// #906: a diff cut short by its deadline matches only the shared
+    /// first and last lines, so the first conflict's nearest shared line
+    /// after it was the file's last, and its region swallowed the line
+    /// between the conflicts and the second conflict's hand resolution. A
+    /// region the cut-short diff cannot pin takes nothing instead.
+    #[test]
+    fn a_cut_short_diff_leaves_no_region_over_text_it_does_not_own() {
+        let (base, ours, theirs) = (
+            lines(&["a", "x = 1", "b", "y = 1", "c"]),
+            lines(&["a", "x = 2", "b", "y = 2", "c"]),
+            lines(&["a", "x = 3", "b", "y = 3", "c"]),
+        );
+        let file = lines(&["a", "x = 9", "b", "y = 9", "c"]);
+        let spans = |budget| {
+            let (mut view, result) =
+                MergeView::new(base.clone(), ours.clone(), theirs.clone(), false);
+            view.adopt_result_within(&result, &file, budget);
+            view.conflicts
+                .iter()
+                .map(|c| (c.result_start, c.result_len, c.state))
+                .collect::<Vec<_>>()
+        };
+        let manual = ConflictState::Manual;
+        assert_eq!(
+            spans(DIFF_DEADLINE),
+            vec![(1, 1, manual), (3, 1, manual)],
+            "the full diff pins each region on the lines around it"
+        );
+        let cut = spans(std::time::Duration::ZERO);
+        assert!(
+            cut.iter()
+                .all(|&(start, len, _)| !(start..start + len).contains(&2)),
+            "no region owns `b`: {cut:?}"
+        );
+        assert!(
+            cut.iter()
+                .all(|&(_, len, state)| len <= 1 && state == manual),
+            "{cut:?}"
+        );
+    }
+
+    #[test]
+    fn git_s_own_marker_file_still_opens_on_the_stages() {
+        let (view, result) = timeout_merge();
+        let file = lines(&[
+            "retries = 3",
+            "<<<<<<< HEAD",
+            "timeout = 20",
+            "=======",
+            "timeout = 30",
+            ">>>>>>> feature",
+            "log = info",
+        ]);
+        let (view, splice) = view.open_on_file(result.clone(), &file);
+        assert!(!view.from_markers);
+        assert_eq!(splice, Some(result));
+        // Git's default style moves the line both sides share out of the
+        // block; that is still git's untouched file.
+        let (view, result) = MergeView::new(
+            lines(&["a", "b"]),
+            lines(&["x", "mine"]),
+            lines(&["x", "yours"]),
+            false,
+        );
+        let file = lines(&["x", "<<<<<<< HEAD", "mine", "=======", "yours", ">>>>>>> f"]);
+        let (view, splice) = view.open_on_file(result.clone(), &file);
+        assert!(!view.from_markers);
+        assert_eq!(splice, Some(result));
+    }
+
+    #[test]
+    fn a_marker_file_with_edits_opens_on_its_markers() {
+        let (view, result) = timeout_merge();
+        let file = lines(&[
+            "# reviewed",
+            "retries = 3",
+            "<<<<<<< HEAD",
+            "timeout = 20",
+            "=======",
+            "timeout = 30",
+            ">>>>>>> feature",
+            "log = info",
+        ]);
+        let (view, splice) = view.open_on_file(result, &file);
+        assert!(view.from_markers);
+        assert_eq!(view.conflicts.len(), 1);
+        assert_eq!(
+            splice.unwrap(),
+            lines(&["# reviewed", "retries = 3", "log = info"])
+        );
     }
 
     #[test]

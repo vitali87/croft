@@ -128,6 +128,9 @@ pub enum ListPurpose {
     /// Notebook: Select Kernel (#1377): the installed kernelspecs, `id`
     /// the kernel's name.
     NotebookKernel,
+    /// HTTP: Switch Environment (#924): `id` the named environment of the
+    /// `.http` env files, or empty for none.
+    HttpEnvironment,
 }
 
 /// The Review Pull Request row that asks for a number or URL instead.

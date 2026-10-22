@@ -105,6 +105,43 @@ fn nonexistent_path_fails_cleanly() {
         .failure();
 }
 
+/// #917: `croft pr` without a usable GitHub CLI says so in the shell, in
+/// one line naming the fix, instead of opening an editor whose review tab
+/// can never load.
+#[test]
+fn pr_without_a_usable_gh_says_how_to_fix_it_before_starting() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let bin = tmp.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let pr = |expected: &str| {
+        let out = Command::cargo_bin("croft")
+            .unwrap()
+            .args(["pr", "42"])
+            .current_dir(tmp.path())
+            .env("PATH", &bin)
+            .env("HOME", tmp.path())
+            // A token in the environment would vouch for the stand-in.
+            .env_remove("GH_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .env_remove("GH_ENTERPRISE_TOKEN")
+            .env_remove("GITHUB_ENTERPRISE_TOKEN")
+            .timeout(std::time::Duration::from_secs(30))
+            .assert()
+            .failure()
+            .code(1);
+        let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+        assert!(stderr.starts_with("croft pr: "), "{stderr}");
+        assert!(stderr.contains(expected), "{stderr}");
+        assert_eq!(stderr.trim().lines().count(), 1, "{stderr}");
+    };
+    pr("install it from https://cli.github.com, then run gh auth login");
+    let gh = bin.join("gh");
+    std::fs::write(&gh, "#!/bin/sh\necho 'no oauth token found' >&2\nexit 1\n").unwrap();
+    std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    pr("not signed in; run gh auth login");
+}
+
 /// The persisted pair record is the baseline for every `croft pair`
 /// invocation: `--off` (with or without provider flags) and a plain
 /// re-activation must both keep a custom ollama endpoint. Resolving bare
