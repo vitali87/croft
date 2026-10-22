@@ -149,7 +149,7 @@ src/
 │   ├── client.rs             async-lsp client wrapper: routes diagnostics (pushed and pulled) and `$/progress` to the status bar, acknowledges refresh requests into shared re-pull flags, declares `workspace.workspaceFolders` and answers the server→client folder request from the same list initialize carried
 │   ├── config.rs             per-language LSP config (basedpyright, ruff, ty, vtsls, rust-analyzer, gopls); the ServerConfig factories are the executable spec the bundled manifests reproduce, and Language is an open newtype so extensions can add one
 │   ├── rust_analyzer.rs      rust-analyzer's non-LSP requests (expandMacro, parentModule, openCargoToml, rebuildProcMacros, reloadWorkspace) sent as raw JSON, their params and how their answers read
-│   ├── install.rs            croft-managed server provisioning: lazy background installs into `~/.croft/servers` via three backends — npm, uv (rerouted to Termux `pkg` on Android), and Binary (per-platform release download, PATH-first)
+│   ├── install.rs            croft-managed server provisioning: lazy background installs into `~/.croft/servers` via four backends — npm, uv (rerouted to Termux `pkg` on Android), Binary (per-platform release download, PATH-first), and Go (`go install` with the user's toolchain, PATH-first)
 │   ├── languages.rs     language table: file-extension -> language, root markers, and server family, all built from extension manifests' [[languages]] blocks (replaces the old hardcoded Language enum match arms)
 │   ├── log_file.rs      LSP stderr / debug log sink at ~/.croft/lsp.log
 │   ├── manager.rs            LSP lifecycle: workspace pre-warm at startup, spawn, did_open / did_change / did_save, completion, documentSymbol, inlay hints, documentHighlight and whole-project pull diagnostics
@@ -788,6 +788,8 @@ LSP lifecycle: pre-warm, spawn, `did_open`, `did_change`, `did_save`, completion
 
 **Call hierarchy.** `prepareCallHierarchy` plus `incomingCalls`/`outgoingCalls`, one level per `Cmd+K H` / `Cmd+K Shift+H` invocation into the shared location picker. Incoming rows jump to the call expression, outgoing to the callee's definition.
 
+**A language left with no server says so once (#930).** When every server a language registers is missing from PATH and none can be installed (no provision, or a Go provision with no `go`), `missing_servers_note` names the missing commands and `report_missing_servers_once` puts the note in the status bar and OUTPUT › Server Provisioning, once per language per session. A provisioned server that can still install stays quiet here, since its install reports its own progress.
+
 ### problem_matchers.rs
 
 User-defined problem matchers, read from `~/.config/croft/matchers.json` and workspace `.croft/matchers.json` (palette "Preferences: Open Problem Matchers (JSON)", reloaded on save). They compile into `CompiledMatcher`s: single or multi-line regex sequences with named groups (file/line/col/severity/message/code, VS Code-style `loop` tails), `applies_to` command globs, and `severity_map`.
@@ -1259,7 +1261,7 @@ Per-language LSP config for basedpyright, ruff, ty, vtsls, rust-analyzer and gop
 
 ### lsp/install.rs
 
-Croft-managed server provisioning: lazy background installs into `~/.croft/servers` through three backends. npm covers vtsls, JSON/HTML/CSS, yaml and bash; uv covers ty, ruff and rumdl, including the uv bootstrap, and is rerouted to Termux's `pkg` on Android, or, for a tool Termux does not package (`termux_pkg = false`, rumdl), left to a copy on PATH; Binary covers clangd, taplo, rust-analyzer and marksman, downloading a host-agnostic per-platform release asset and unzipping, gunzipping, untarring or (for marksman's bare executables) writing it as-is, PATH-first including `~/.cargo/bin`. A manifest that pins SHA-256 digests has each download checked before anything is written or marked executable.
+Croft-managed server provisioning: lazy background installs into `~/.croft/servers` through four backends. npm covers vtsls, JSON/HTML/CSS, yaml and bash; uv covers ty, ruff and rumdl, including the uv bootstrap, and is rerouted to Termux's `pkg` on Android, or, for a tool Termux does not package (`termux_pkg = false`, rumdl), left to a copy on PATH; Binary covers clangd, taplo, rust-analyzer and marksman, downloading a host-agnostic per-platform release asset and unzipping, gunzipping, untarring or (for marksman's bare executables) writing it as-is, PATH-first including `~/.cargo/bin`. A manifest that pins SHA-256 digests has each download checked before anything is written or marked executable. Go covers gopls: a copy on PATH or in `~/go/bin` wins, else croft runs the user's own `go install <module>@<pin>` with `GOBIN` at `~/.croft/servers/<name>/<pin>`, so the server is built by the toolchain it analyses and a bumped pin installs afresh. With no `go` on PATH no install is tried (`missing_installer`), and the manager reports the language as having no server.
 
 **A Binary can carry a `termux_pkg`.** On Android the glibc release can't run on bionic, so such a backend reroutes to `pkg`, as rust-analyzer does.
 
