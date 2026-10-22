@@ -69,6 +69,14 @@ folds in the notes, and publishes the release. You don't need a fragment for
 docs, CI or test-only changes. A diff confined to `#[cfg(test)]`,
 `src/app/tests/` or `tests/` counts as test-only.
 
+Releases to crates.io and GitHub go out every 50 versions. If users shouldn't
+wait that long for a merge, a maintainer labels its PR `release now`. The
+first version that includes the merge is then released as soon as it's cut.
+The label counts only if whoever applied it last is a repository admin or
+maintainer. From anyone else, a bot included, it's ignored, and the
+`publish crate` run's summary says so. Add the label before merging. Added
+later, it takes effect at the next push to `main`.
+
 ## Show it
 
 If a user can see the change (a view, modal, command, status message,
