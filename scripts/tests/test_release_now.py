@@ -140,15 +140,23 @@ SHA_OUT = "e" * 40
 
 
 def issue(number, merged=True, labels=(rn.LABEL,), pull=True):
+    """A listing entry. `merged` None leaves `merged_at` out: it is optional
+    in the listing."""
     item = {"number": number, "labels": [{"name": n} for n in labels]}
     if pull:
-        item["pull_request"] = {"merged_at": "2026-10-21T00:00:00Z" if merged else None}
+        item["pull_request"] = {"url": f"{API}pulls/{number}"}
+        if merged is not None:
+            item["pull_request"]["merged_at"] = "2026-10-21T00:00:00Z" if merged else None
     return item
 
 
-def labelled(*actors):
-    """Issue events, oldest first: each actor applied the label once."""
-    events = [{"event": "merged", "actor": {"type": "User", "login": "vitali87"}}]
+def labelled(*actors, merged=SHA_A):
+    """Issue events, oldest first: the merge, as API 2026-03-10 reports it
+    (its commit in the `merged` event), then each actor applying the label
+    once."""
+    events = []
+    if merged:
+        events.append({"event": "merged", "commit_id": merged, "actor": {"type": "User", "login": "vitali87"}})
     for kind, login in actors:
         events.append({"event": "labeled", "label": {"name": rn.LABEL}, "actor": {"type": kind, "login": login}})
     return events
@@ -180,11 +188,8 @@ def listing(*issues):
     return {f"{API}issues?labels=release%20now&state=closed&{SINCE}&per_page=100": list(issues)}
 
 
-def routes_for(number, merge_sha, events, roles=None):
-    routes = {
-        f"{API}pulls/{number}": {"number": number, "merge_commit_sha": merge_sha},
-        f"{API}issues/{number}/events?per_page=100": events,
-    }
+def routes_for(number, events, roles=None):
+    routes = {f"{API}issues/{number}/events?per_page=100": events}
     for login, role in (roles or {}).items():
         routes[f"{API}collaborators/{login}/permission"] = {"role_name": role}
     return routes
@@ -205,7 +210,7 @@ class Decide(unittest.TestCase):
         for role in ("admin", "maintain"):
             with self.subTest(role=role):
                 due, lines, _, _ = self.decide(
-                    {**listing(issue(12)), **routes_for(12, SHA_A, labelled(("User", "vitali87")), {"vitali87": role})}
+                    {**listing(issue(12)), **routes_for(12, labelled(("User", "vitali87")), {"vitali87": role})}
                 )
                 self.assertTrue(due)
                 self.assertEqual(lines, [f"- **Release now:** #12, labelled by @vitali87 ({role})"])
@@ -214,14 +219,14 @@ class Decide(unittest.TestCase):
         for role in ("write", "triage", "read", "none", ""):
             with self.subTest(role=role):
                 due, lines, _, err = self.decide(
-                    {**listing(issue(12)), **routes_for(12, SHA_A, labelled(("User", "someone")), {"someone": role})}
+                    {**listing(issue(12)), **routes_for(12, labelled(("User", "someone")), {"someone": role})}
                 )
                 self.assertFalse(due)
                 self.assertEqual(lines, ["- **Release now:** #12 ignored, labelled by 'User someone', not a maintainer"])
                 self.assertIn("::warning::#12 was labelled release now by 'User someone'", err)
 
     def test_a_bot_s_label_is_ignored_without_a_role_lookup(self):
-        due, _, calls, _ = self.decide({**listing(issue(12)), **routes_for(12, SHA_A, labelled(("Bot", "claude[bot]")))})
+        due, _, calls, _ = self.decide({**listing(issue(12)), **routes_for(12, labelled(("Bot", "claude[bot]")))})
         self.assertFalse(due)
         self.assertFalse([c for c in calls if "/collaborators/" in c])
 
@@ -230,28 +235,28 @@ class Decide(unittest.TestCase):
         due, _, _, _ = self.decide(
             {
                 **listing(issue(12)),
-                **routes_for(12, SHA_A, labelled(("User", "vitali87"), ("Bot", "claude[bot]")), {"vitali87": "admin"}),
+                **routes_for(12, labelled(("User", "vitali87"), ("Bot", "claude[bot]")), {"vitali87": "admin"}),
             }
         )
         self.assertFalse(due)
 
     def test_a_label_with_no_recorded_application_is_ignored(self):
-        due, lines, _, _ = self.decide({**listing(issue(12)), **routes_for(12, SHA_A, labelled())})
+        due, lines, _, _ = self.decide({**listing(issue(12)), **routes_for(12, labelled())})
         self.assertFalse(due)
         self.assertIn("'no recorded event'", lines[0])
 
     def test_a_login_that_is_not_one_reaches_no_url(self):
-        due, _, calls, _ = self.decide({**listing(issue(12)), **routes_for(12, SHA_A, labelled(("User", "../x")))})
+        due, _, calls, _ = self.decide({**listing(issue(12)), **routes_for(12, labelled(("User", "../x")))})
         self.assertFalse(due)
         self.assertFalse([c for c in calls if "/collaborators/" in c])
 
     def test_a_merge_outside_the_unreleased_versions_does_not_count(self):
         # Already published, or merged after head's version was cut.
         due, _, calls, _ = self.decide(
-            {**listing(issue(12)), **routes_for(12, SHA_OUT, labelled(("User", "vitali87")), {"vitali87": "admin"})}
+            {**listing(issue(12)), **routes_for(12, labelled(("User", "vitali87"), merged=SHA_OUT), {"vitali87": "admin"})}
         )
         self.assertFalse(due)
-        self.assertFalse([c for c in calls if "/events" in c])
+        self.assertFalse([c for c in calls if "/collaborators/" in c])
 
     def test_an_unmerged_pull_request_or_an_issue_is_not_looked_up(self):
         due, _, calls, _ = self.decide(listing(issue(12, merged=False), issue(13, pull=False)))
@@ -270,11 +275,12 @@ class Decide(unittest.TestCase):
 
     def test_every_page_of_the_listing_is_read(self):
         first = f"{API}issues?labels=release%20now&state=closed&{SINCE}&per_page=100"
-        second = f"{API}issues?labels=release%20now&state=closed&page=2"
+        # GitHub's next links name the repository by id, not by name.
+        second = "https://api.example/repositories/1315038955/issues?labels=release%20now&after=Y3Vy&page=2"
         routes = {
             first: ([issue(11, merged=False)], f'<{second}>; rel="next", <{second}>; rel="last"'),
             second: [issue(12)],
-            **routes_for(12, SHA_A, labelled(("User", "vitali87")), {"vitali87": "admin"}),
+            **routes_for(12, labelled(("User", "vitali87")), {"vitali87": "admin"}),
         }
         due, _, calls, _ = self.decide(routes)
         self.assertTrue(due)
@@ -283,11 +289,37 @@ class Decide(unittest.TestCase):
     def test_a_next_page_off_the_api_is_refused(self):
         first = f"{API}issues?labels=release%20now&state=closed&{SINCE}&per_page=100"
         routes = {first: ([], '<https://elsewhere.example/steal>; rel="next"')}
-        with self.assertRaisesRegex(rn.ReleaseNowError, "outside"):
+        with self.assertRaisesRegex(rn.ReleaseNowError, "off https://api.example"):
+            self.decide(routes)
+
+    def test_a_listing_without_merged_at_is_decided_by_the_events(self):
+        # `merged_at` is optional in the listing: its absence is not "unmerged".
+        due, _, _, _ = self.decide(
+            {**listing(issue(12, merged=None)), **routes_for(12, labelled(("User", "vitali87")), {"vitali87": "admin"})}
+        )
+        self.assertTrue(due)
+
+    def test_an_unmerged_pull_request_without_merged_at_is_skipped(self):
+        due, _, calls, _ = self.decide(
+            {**listing(issue(12, merged=None)), **routes_for(12, labelled(("User", "vitali87"), merged=None))}
+        )
+        self.assertFalse(due)
+        self.assertFalse([c for c in calls if "/collaborators/" in c])
+
+    def test_a_merge_whose_events_name_no_commit_fails_loudly(self):
+        # The API dropping a field (as 2026-03-10 dropped merge_commit_sha)
+        # must not pass for "not ours" and quietly ignore the label.
+        with self.assertRaisesRegex(rn.ReleaseNowError, "events name no merge commit"):
+            self.decide({**listing(issue(12)), **routes_for(12, labelled(("User", "vitali87"), merged=None))})
+
+    def test_a_permission_without_a_role_name_fails_loudly(self):
+        routes = {**listing(issue(12)), **routes_for(12, labelled(("User", "vitali87")))}
+        routes[f"{API}collaborators/vitali87/permission"] = {"permission": "admin"}
+        with self.assertRaisesRegex(rn.ReleaseNowError, "without a role_name"):
             self.decide(routes)
 
     def test_a_failed_lookup_raises_instead_of_guessing(self):
-        base = {**listing(issue(12)), **routes_for(12, SHA_A, labelled(("User", "vitali87")), {"vitali87": "admin"})}
+        base = {**listing(issue(12)), **routes_for(12, labelled(("User", "vitali87")), {"vitali87": "admin"})}
         for url in base:
             with self.subTest(url=url):
                 with self.assertRaisesRegex(rn.ReleaseNowError, "failed"):
@@ -327,7 +359,7 @@ class Cli(unittest.TestCase):
 
     def test_prints_the_verdict_and_writes_the_summary(self):
         code, out, err = self.run_main(
-            {**listing(issue(12)), **routes_for(12, self.merge, labelled(("User", "vitali87")), {"vitali87": "admin"})}
+            {**listing(issue(12)), **routes_for(12, labelled(("User", "vitali87"), merged=self.merge), {"vitali87": "admin"})}
         )
         self.assertEqual(code, 0, err)
         self.assertEqual(out, "release_now=true\n")

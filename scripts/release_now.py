@@ -154,9 +154,11 @@ class Api:
             pages.extend(data)
             found = NEXT.search(link)
             url = found.group(1) if found else ""
-            # The token goes with every page, so it never leaves this API.
-            if url and not url.startswith(self.root):
-                raise ReleaseNowError(f"refusing a next page outside {self.root}: {url}")
+            # The token goes with every page, so it never leaves this API's
+            # host. The host, not the repos/<owner>/<name>/ prefix: GitHub's
+            # next links name the repository by id (/repositories/<id>/...).
+            if url and urllib.parse.urlsplit(url)[:2] != urllib.parse.urlsplit(self.root)[:2]:
+                raise ReleaseNowError(f"refusing a next page off {self.root}: {url}")
         return pages
 
     def object(self, path: str) -> dict:
@@ -179,6 +181,19 @@ def labeller(events: list) -> tuple[str, str]:
     return last
 
 
+def merge_commit(events: list) -> str:
+    """The commit the `merged` event names: what the merge put on main.
+
+    From the events rather than pulls/<number>: API version 2026-03-10 no
+    longer returns a pull request's `merge_commit_sha`.
+    """
+    commit = ""
+    for event in events:
+        if isinstance(event, dict) and event.get("event") == "merged" and isinstance(event.get("commit_id"), str):
+            commit = event["commit_id"]
+    return commit
+
+
 def decide(api: Api, commits: list[str], set_at: dt.datetime | None) -> tuple[bool, list[str]]:
     """Whether a maintainer labelled a merge among `commits`, and the lines
     that say why for the job summary."""
@@ -195,15 +210,26 @@ def decide(api: Api, commits: list[str], set_at: dt.datetime | None) -> tuple[bo
         labels = [label.get("name") for label in issue.get("labels") or [] if isinstance(label, dict)]
         if type(number) is not int or number < 1 or LABEL not in labels:
             continue
-        # Closed without merging, or an issue: nothing of it ships.
-        if not isinstance(pull, dict) or not pull.get("merged_at"):
+        # An issue ships nothing, and neither does a pull request closed
+        # without merging. `merged_at` is optional in the listing, so only an
+        # explicit null says that; the events decide the rest.
+        if not isinstance(pull, dict) or ("merged_at" in pull and pull["merged_at"] is None):
             continue
-        if api.object(f"pulls/{number}").get("merge_commit_sha") not in shipped:
+        events = api.call(f"issues/{number}/events", per_page=100)
+        merged = merge_commit(events)
+        if not merged and pull.get("merged_at"):
+            # A field the API stopped returning must fail loudly, not read
+            # as "not ours" and silently ignore the label.
+            raise ReleaseNowError(f"#{number} is merged, but its events name no merge commit")
+        if merged not in shipped:
             continue
-        kind, login = labeller(api.call(f"issues/{number}/events", per_page=100))
+        kind, login = labeller(events)
         role = ""
         if kind == "User" and LOGIN.fullmatch(login):
-            role = str(api.object(f"collaborators/{login}/permission").get("role_name") or "")
+            permission = api.object(f"collaborators/{login}/permission")
+            if "role_name" not in permission:
+                raise ReleaseNowError(f"the permission of {login} came back without a role_name")
+            role = str(permission["role_name"] or "")
         if role in ROLES:
             return True, [f"- **Release now:** #{number}, labelled by @{login} ({role})"]
         who = f"{kind} {login}".strip() or "no recorded event"
