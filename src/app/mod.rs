@@ -2907,13 +2907,21 @@ enum ScmWrite {
     Stash,
     StashIncludeUntracked,
     StashStaged,
+    /// Stash & Checkout on a switch local changes blocked (#925).
+    StashAndSwitch,
+    /// Migrate Changes on a switch local changes blocked (#925).
+    MigrateAndSwitch,
 }
 
 impl ScmWrite {
     fn is_stash(self) -> bool {
         matches!(
             self,
-            Self::Stash | Self::StashIncludeUntracked | Self::StashStaged
+            Self::Stash
+                | Self::StashIncludeUntracked
+                | Self::StashStaged
+                | Self::StashAndSwitch
+                | Self::MigrateAndSwitch
         )
     }
 
@@ -5342,6 +5350,14 @@ pub struct App {
     /// Why the branch picker is open, so its Enter dispatches the right
     /// verb (checkout vs merge vs rebase vs delete vs create-from base).
     pub branch_purpose: BranchPurpose,
+    /// The switch local changes blocked (#925), with the repository it is
+    /// in and the branch it was refused on (None when detached), while the
+    /// Stash & Checkout picker offers a way through.
+    blocked_switch: Option<(
+        PathBuf,
+        Option<String>,
+        crate::widgets::branch_picker::BranchAction,
+    )>,
     /// The Source Control "⋯" title menu (open/expanded state + hit rects).
     pub scm_menu: crate::widgets::scm_menu::ScmMenuState,
     /// Single-line input modal for SCM ops that need a typed value
@@ -6976,6 +6992,7 @@ impl App {
             zoxide_add_folder: false,
             branch_picker: None,
             branch_purpose: BranchPurpose::Checkout,
+            blocked_switch: None,
             scm_menu: crate::widgets::scm_menu::ScmMenuState::default(),
             input_prompt: None,
             list_picker: None,
@@ -22391,11 +22408,11 @@ impl App {
         // clickable clusters around it.
         // Screen reader mode shows the announcement in the status slot, and
         // every status passes through the UI catalog (#621).
-        let status_text = if self.screen_reader && !self.announcer.line.is_empty() {
+        let status_text = one_line(if self.screen_reader && !self.announcer.line.is_empty() {
             self.announcer.line.clone()
         } else {
             crate::i18n::tr(&self.status).into_owned()
-        };
+        });
         // A message seen for the first time is kept, in full, in the Messages
         // output channel, and may take the whole bar until the next key or
         // click (#1609): elided to fit, its middle was gone for good.
@@ -38060,6 +38077,8 @@ impl App {
             ScmWrite::Stash => self.stash_source_control(),
             ScmWrite::StashIncludeUntracked => self.stash_include_untracked_source_control(),
             ScmWrite::StashStaged => self.stash_staged_source_control(),
+            ScmWrite::StashAndSwitch => self.stash_and_switch_picked(false),
+            ScmWrite::MigrateAndSwitch => self.stash_and_switch_picked(true),
         }
         // A write that stopped before its check (busy git, empty message)
         // must not carry the clearance to the next request.
@@ -41263,6 +41282,7 @@ impl App {
                 self.run_scm_op("stash pop", r, "Popped stash", "Pop stash");
             }
             ListPurpose::StashView => self.open_stash_patch(index),
+            ListPurpose::BlockedSwitch => self.stash_and_switch_picked(row.id == "migrate"),
             // Asked first: the drop cannot be undone (#1128).
             ListPurpose::StashDrop => {
                 let root = self.scm_root();
@@ -57381,8 +57401,10 @@ impl App {
     /// Run the action the highlighted picker row resolves to: switch to an
     /// existing branch, or create-and-switch a new one. The picker closes
     /// on success; on failure it stays open with the error in the SC
-    /// feedback line so the user can amend the name.
-    fn apply_branch_action(&mut self, action: crate::widgets::branch_picker::BranchAction) {
+    /// feedback line so the user can amend the name, unless local changes
+    /// blocked the switch: then Stash & Checkout is offered (#925). True
+    /// when the switch happened.
+    fn apply_branch_action(&mut self, action: crate::widgets::branch_picker::BranchAction) -> bool {
         use crate::widgets::branch_picker::BranchAction;
         let (result, verb, label, name) = match &action {
             BranchAction::Checkout(name) => (
@@ -57424,14 +57446,136 @@ impl App {
                 self.active_git_bypass_debounce();
                 self.refresh_git_status_debounced();
                 self.refresh_source_control();
+                true
             }
             Err(err) => {
+                if crate::git::local_changes_block_switch(&err) {
+                    self.offer_stash_and_switch(action);
+                }
                 let why = crate::git::error_line(&err);
                 self.source_control.commit_feedback = Some(format!("branch: {why}"));
                 self.source_control.commit_feedback_is_error = true;
                 self.status = format!("Branch: {why}");
+                false
             }
         }
+    }
+
+    /// A switch git refused because it would overwrite local changes
+    /// (#925): instead of a dead end, offer what VS Code does, Stash &
+    /// Checkout and Migrate Changes, in place of the branch picker.
+    fn offer_stash_and_switch(&mut self, action: crate::widgets::branch_picker::BranchAction) {
+        use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+        let name = action.branch_name().to_string();
+        let rows = vec![
+            ListRow {
+                id: String::from("stash"),
+                label: format!("Stash & Checkout: stash your changes, then switch to {name}"),
+            },
+            ListRow {
+                id: String::from("migrate"),
+                label: format!("Migrate Changes: switch to {name} and bring your changes"),
+            },
+        ];
+        self.close_branch_picker();
+        let root = self.scm_root();
+        let from = crate::git::current_branch(&root);
+        self.blocked_switch = Some((root, from, action));
+        let title = format!("Your changes block the switch to {name}");
+        self.open_list_picker(ListPicker::new(ListPurpose::BlockedSwitch, title, rows), "");
+    }
+
+    /// Stash & Checkout or Migrate Changes picked (#925), past the
+    /// unsaved-changes prompt as any stash is (#1438): git stashes the files
+    /// on disk, so an edit still only in a tab would be left out, and the
+    /// switch would change the file under it.
+    fn stash_and_switch_picked(&mut self, migrate: bool) {
+        let op = if migrate {
+            ScmWrite::MigrateAndSwitch
+        } else {
+            ScmWrite::StashAndSwitch
+        };
+        if self.hold_for_unsaved(op) {
+            return;
+        }
+        let Some((root, from, action)) = self.blocked_switch.take() else {
+            return;
+        };
+        // The prompt, or a formatter it waits on, leaves time to switch
+        // branches by hand: the changes to stash are then another branch's.
+        if crate::git::current_branch(&root) != from {
+            let what = if migrate {
+                "Migrate Changes"
+            } else {
+                "Stash & Checkout"
+            };
+            let line = format!("{what} cancelled: the branch changed since the switch was refused");
+            self.source_control.commit_feedback = Some(line.clone());
+            self.source_control.commit_feedback_is_error = true;
+            self.status = line;
+            return;
+        }
+        self.stash_and_switch(root, action, migrate);
+    }
+
+    /// Stash & Checkout, or with `migrate` Migrate Changes (#925): stash the
+    /// changes that blocked the switch, switch, and for a migration pop them
+    /// onto the new branch. A pop that stops on conflicts keeps the stash,
+    /// as git does; a switch that still fails leaves the changes stashed.
+    fn stash_and_switch(
+        &mut self,
+        root: PathBuf,
+        action: crate::widgets::branch_picker::BranchAction,
+        migrate: bool,
+    ) {
+        if self.repo_git_busy() || root != self.scm_root() {
+            return;
+        }
+        let name = action.branch_name().to_string();
+        // The stash this makes is the one to pop, not an older one left
+        // behind should there be nothing to stash by now.
+        let before = crate::git::stash_oid(&root, 0).ok();
+        let stash = crate::git::stash_push(&root, None);
+        self.log_git("stash push", &stash);
+        if let Err(err) = stash {
+            let line = crate::git::failure_line("Stash", &err);
+            self.source_control.commit_feedback = Some(line.clone());
+            self.source_control.commit_feedback_is_error = true;
+            self.status = line;
+            return;
+        }
+        let stashed = crate::git::stash_oid(&root, 0)
+            .ok()
+            .is_some_and(|oid| before != Some(oid));
+        let switched = self.apply_branch_action(action);
+        if !stashed {
+            return;
+        }
+        let (line, is_error) = match (switched, migrate) {
+            (false, _) => {
+                let line = format!("{} \u{b7} your changes are in the stash", self.status);
+                (line, true)
+            }
+            (true, false) => (
+                format!("Stashed your changes and switched to {name}"),
+                false,
+            ),
+            (true, true) => {
+                let pop = crate::git::stash_pop(&root);
+                self.log_git("stash pop", &pop);
+                match pop {
+                    Ok(_) => (format!("Switched to {name} with your changes"), false),
+                    Err(err) => {
+                        let why = crate::git::failure_line("Migrate changes", &err);
+                        (format!("Switched to {name} \u{b7} {why}"), true)
+                    }
+                }
+            }
+        };
+        self.source_control.commit_feedback = Some(line.clone());
+        self.source_control.commit_feedback_is_error = is_error;
+        self.status = line;
+        self.refresh_source_control();
     }
 
     fn handle_branch_picker_key(&mut self, key: KeyEvent) {
@@ -74422,6 +74566,21 @@ fn elide_middle(s: &str, max: usize) -> String {
         return out;
     }
     crate::widgets::process_picker::elide_middle_cols(s, max)
+}
+
+/// `text` on the status bar's one row (#925): each line break or tab, with
+/// the spaces around it, becomes one space. Drawn as is, the control
+/// characters were dropped and the words either side ran together
+/// ("…switch branches.Aborting"). The Messages channel keeps the lines.
+fn one_line(text: String) -> String {
+    if !text.contains(char::is_control) {
+        return text;
+    }
+    let pieces = text.split(char::is_control).map(str::trim);
+    pieces
+        .filter(|p| !p.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// The excerpt window for a Peek popup: up to `total` lines, at most
