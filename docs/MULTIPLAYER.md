@@ -458,13 +458,15 @@ cannot conjure over the mux — the affordance is the `--solo` flag on the
 guest's own launch command. Collab docs are keyed per workspace-relative path;
 files outside the workspace are never shared (enforced by `contained_path`).
 
-**Still deferred** (documented, not blockers): a shared undo timeline (undo
-stays per-process; undoing a peer's edit is just an edit and converges. A
-peer's edit is one undo step however many runs it changed, and an AI stream
-is one step from start to finish, so one undo rejects a navigator edit and a
-cancelled stream leaves none), a
-shared LSP (each croft syncs full text to its own servers), and per-file save
-handoff.
+**Still deferred** (documented, not blockers): a shared undo timeline. Undo
+stays per-process and holds only that participant's own steps (#919): a
+peer's edit opens no step, and every state on the undo and redo stacks takes
+it too (`undo_rebase.rs`), so Ctrl+Z takes back your last change and keeps
+your partner's; what the undo writes reaches peers as an ordinary edit. An
+AI stream is the exception, one step from start to finish, so one undo
+rejects a navigator edit and a cancelled stream leaves none. Also deferred:
+a shared LSP (each croft syncs full text to its own servers), and per-file
+save handoff.
 
 ## Named carets and the AI seat
 

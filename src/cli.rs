@@ -724,6 +724,13 @@ impl Cli {
                     eprintln!("croft pr: {number:?} is not a pull request number or URL");
                     std::process::exit(2);
                 };
+                // Before the editor takes the terminal (#917): without a
+                // usable gh the review can never load, and the fix is typed
+                // at this prompt.
+                if let Err(why) = crate::gh::check_ready("gh") {
+                    eprintln!("croft pr: {why}");
+                    std::process::exit(1);
+                }
                 crate::pr_review::set_startup_pr(selector);
                 let cwd = std::env::current_dir()?;
                 crate::app::run(cwd, None, None, None, false, Vec::new())
@@ -1621,7 +1628,11 @@ fn import_vscode(from: Option<PathBuf>, dry_run: bool) -> Result<()> {
                     dir.display()
                 );
             }
-            dir
+            let user = crate::import_vscode::user_dir_in(&dir);
+            if user != dir {
+                println!("Reading {}", user.display());
+            }
+            user
         }
         None => {
             let found = crate::import_vscode::discover_profiles();

@@ -9,6 +9,11 @@
 # it, tag that commit, and hand the tag to release.yml for the prebuilt
 # archives, the GitHub release and the Homebrew formula.
 #
+# A merge that should not wait for the count gets the `release now` label on
+# its pull request, as in code-graph-rag: the first version that includes it
+# publishes as soon as it is cut (scripts/release_now.py). It counts only
+# when whoever applied it last is a repository admin or maintainer.
+#
 # This is the only workflow that starts a release. tag.yml tags every
 # version but releases none, so crates.io and the GitHub releases hold the
 # same versions (#1579).
@@ -56,8 +61,15 @@ jobs:
     name: count bumps since the last publish
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    permissions:
+      contents: read
+      # Which merged pull requests carry the `release now` label, their merge
+      # commits, and who applied it (scripts/release_now.py).
+      issues: read
+      pull-requests: read
     outputs:
-      publish: ${{ steps.cadence.outputs.publish }}
+      # The label only brings a release forward: it never holds one back.
+      publish: ${{ steps.cadence.outputs.publish == 'true' || steps.label.outputs.release_now == 'true' }}
       version: ${{ steps.cadence.outputs.version }}
       already_published: ${{ steps.cadence.outputs.already_published }}
     steps:
@@ -103,6 +115,20 @@ jobs:
           # reaches GITHUB_OUTPUT; `set -e` then fails the job on its exit 2.
           python3 scripts/publish_cadence.py --every "$PUBLISH_EVERY" \
             --head "$head" --from-git --fetch "${flags[@]}" | tee -a "$GITHUB_OUTPUT"
+
+      - name: Release now if a maintainer labelled a merge in this version
+        # Asked only when the count says wait, so most pushes make no call. A
+        # failed lookup fails the run rather than reading as "nobody asked".
+        # The next push asks again; removing the label ends a lookup that
+        # keeps failing.
+        id: label
+        if: steps.cadence.outputs.publish == 'false'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          LATEST: ${{ steps.cadence.outputs.latest_published }}
+        run: |
+          set -euo pipefail
+          python3 scripts/release_now.py "$LATEST" | tee -a "$GITHUB_OUTPUT"
 
   publish:
     name: publish ${{ needs.decide.outputs.version }}

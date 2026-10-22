@@ -1108,6 +1108,59 @@ fn a_grep_whose_scope_cant_be_reproduced_refuses_to_seed() {
     }
 }
 
+/// #922: `rg -n color` listed three lines; rg (like grep, git grep and ack)
+/// matches case, so the seeded Search must too, or its Replace All also
+/// rewrites `COLOR_DEFAULT`, a line the terminal never showed.
+#[test]
+fn seeded_search_matches_case_the_way_the_grep_did() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::write(
+        root.join("style.py"),
+        "color = \"red\"\nborder_color = \"blue\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("notes.py"),
+        "# pick a color\nCOLOR_DEFAULT = \"colour\"\n",
+    )
+    .unwrap();
+    let mut app = App::new(root.to_path_buf()).unwrap();
+    let mut seeded_lines = |cmd: &str| {
+        assert!(seed_at_root(&mut app, cmd), "{cmd}");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !app.search.complete && std::time::Instant::now() < deadline {
+            app.drain_search_results();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(app.search.complete, "{cmd}: the search must finish");
+        let mut lines: Vec<String> = app
+            .search
+            .hits
+            .iter()
+            .map(|h| {
+                let name = h.path.file_name().unwrap_or_default().to_string_lossy();
+                format!("{name}:{}", h.line_no)
+            })
+            .collect();
+        lines.sort();
+        lines
+    };
+    assert_eq!(
+        seeded_lines("rg -n color"),
+        ["notes.py:1", "style.py:1", "style.py:2"]
+    );
+    assert_eq!(
+        seeded_lines("grep -rn color ."),
+        ["notes.py:1", "style.py:1", "style.py:2"]
+    );
+    // Negative: a grep that ignored case still seeds every case.
+    assert_eq!(
+        seeded_lines("rg -i color"),
+        ["notes.py:1", "notes.py:2", "style.py:1", "style.py:2"]
+    );
+}
+
 /// Negative: a search that covered the whole workspace still seeds the
 /// whole workspace, and an rg `-L` (follow symlinks) is not an inversion.
 #[test]
