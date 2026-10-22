@@ -722,7 +722,10 @@ fn running_a_console_fence_types_only_its_commands() {
     app.run_command(Command::RunCodeBlockAtCursor);
     let pending = app.pending_run_block.as_ref().expect("the fence runs");
     assert_eq!(pending.code, "echo installed-ok\nls -1 /tmp/rd\n");
-    assert_eq!(pending.command, "echo installed-ok\nls -1 /tmp/rd\r");
+    assert_eq!(
+        pending.command,
+        "eval \"$(printf '%b' 'echo installed-ok\\nls -1 /tmp/rd\\n')\"\r"
+    );
 }
 
 /// #353: the popup never shows a line as complete when it is not - a line
@@ -789,13 +792,16 @@ fn fence_command_shapes_the_typed_block() {
     let tmp = tempfile::tempdir().unwrap();
     let scripts = tmp.path().join("blocks");
     assert_eq!(
-        super::fence_command("sh", "echo a\necho b\n", &scripts),
-        "echo a\necho b\r"
+        super::fence_command("sh", "echo a\n", &scripts, "/bin/sh"),
+        "echo a\r"
+    );
+    assert!(
+        super::fence_command("sh", "echo a\necho b\n", &scripts, "/bin/sh").starts_with("eval ")
     );
     assert!(!scripts.exists(), "a shell block is typed, not written");
     // #1630: any other language is read from a private file on stdin, never
     // typed as a heredoc, which fish has no syntax for.
-    let cmd = super::fence_command("python3", "print(1)\n", &scripts);
+    let cmd = super::fence_command("python3", "print(1)\n", &scripts, "/bin/sh");
     assert!(cmd.starts_with("python3 - < '"), "{cmd:?}");
     assert!(!cmd.contains("<<") && !cmd.contains('\n'), "{cmd:?}");
     let file = staged_block_path(&cmd);
@@ -806,9 +812,9 @@ fn fence_command_shapes_the_typed_block() {
     assert_eq!(mode(&file), 0o600, "only the user reads the block");
     assert_eq!(mode(&scripts), 0o700);
     // Two runs of one block never share a file.
-    let again = super::fence_command("python3", "print(1)\n", &scripts);
+    let again = super::fence_command("python3", "print(1)\n", &scripts, "/bin/sh");
     assert_ne!(staged_block_path(&again), file);
-    let node = super::fence_command("node", "console.log(1)\n", &scripts);
+    let node = super::fence_command("node", "console.log(1)\n", &scripts, "/bin/sh");
     assert!(
         node.starts_with("node - < '") && node.contains(".js'"),
         "{node:?}"
@@ -825,7 +831,7 @@ fn a_python_block_runs_from_its_file_and_prints() {
     }
     let tmp = tempfile::tempdir().unwrap();
     let code = "print(\"hello from python\")\nprint(2 + 2)\n";
-    let cmd = super::fence_command("python3", code, &tmp.path().join("blocks"));
+    let cmd = super::fence_command("python3", code, &tmp.path().join("blocks"), "/bin/sh");
     assert_eq!(run_typed_line(&cmd, tmp.path()), "hello from python\n4\n");
 }
 
@@ -837,7 +843,7 @@ fn a_python_block_runs_from_its_file_and_prints() {
 fn fence_blocks_with_tabs_or_bangs_run_exactly_as_shown() {
     let tmp = tempfile::tempdir().unwrap();
     let code = "if True:\n\tprint(\"hi!\")\nx = 'a\\n'\n";
-    let cmd = super::fence_command("python3", code, &tmp.path().join("blocks"));
+    let cmd = super::fence_command("python3", code, &tmp.path().join("blocks"), "/bin/sh");
     assert!(!cmd.contains('\t') && !cmd.contains('!'), "{cmd:?}");
     assert_eq!(
         std::fs::read_to_string(staged_block_path(&cmd)).unwrap(),
@@ -848,10 +854,128 @@ fn fence_blocks_with_tabs_or_bangs_run_exactly_as_shown() {
     }
     // `sh` blocks run in the pane's own shell through eval: a `cd` in the
     // block persists after it.
-    let sh = super::fence_command("sh", "cd /\necho 'hi!'\n", &tmp.path().join("blocks"));
+    let sh = super::fence_command(
+        "sh",
+        "cd /\necho 'hi!'\n",
+        &tmp.path().join("blocks"),
+        "/bin/sh",
+    );
     assert!(sh.starts_with("eval \"$(printf '%b' "), "{sh}");
     let probe = format!("{}; pwd", sh.trim_end_matches('\r'));
     assert_eq!(run_typed_line(&probe, tmp.path()), "hi!\n/\n");
+}
+
+/// #920: a shell block of several lines reaches the shell as ONE command
+/// line, so the shell reports one outcome for it: every line's output and
+/// the status the block ends with, as `sh` running it as a script would.
+#[test]
+fn a_multi_line_shell_block_is_typed_as_one_command() {
+    let tmp = tempfile::tempdir().unwrap();
+    let scripts = tmp.path().join("blocks");
+    let code = "echo step-1\nls does-not-exist-920\necho step-3\n(exit 3)\n";
+    let cmd = super::fence_command("sh", code, &scripts, "/bin/sh");
+    assert_eq!(cmd.matches(['\r', '\n']).count(), 1, "{cmd:?}");
+    assert!(cmd.ends_with('\r'), "{cmd:?}");
+    let probe = format!("{}; echo exit=$?", cmd.trim_end_matches('\r'));
+    let out = run_typed_line(&probe, tmp.path());
+    assert!(out.starts_with("step-1\nstep-3\nexit=3\n"), "{out:?}");
+    assert!(out.contains("does-not-exist-920"), "{out:?}");
+    // A `\` continuation survives. The backslash travels as an octal
+    // escape, never as `\\`, which fish's single quotes would fold to one.
+    let cont = super::fence_command("sh", "echo one \\\n  two\n", &scripts, "/bin/sh");
+    assert!(!cont.contains("\\\\"), "{cont:?}");
+    assert_eq!(run_typed_line(&cont, tmp.path()), "one two\n");
+}
+
+/// #920: fish before 3.4 rejects `$(...)` as syntax, so a fish pane
+/// `source`s the block from a `psub` file, which runs it in the pane's own
+/// shell (a `cd` persists) on every fish, and leaves the block's stdin the
+/// pane's: a `read` in it still gets what the user types.
+#[test]
+fn a_multi_line_shell_block_in_a_fish_pane_is_sourced() {
+    let tmp = tempfile::tempdir().unwrap();
+    let code = "cd /\nread x; echo got $x\necho 'hi!'\t'back\\slash'\n";
+    let cmd = super::fence_command("sh", code, &tmp.path().join("blocks"), "/usr/bin/fish");
+    assert!(cmd.starts_with("source (printf '%b' '"), "{cmd:?}");
+    assert!(cmd.ends_with("' | psub)\r"), "{cmd:?}");
+    assert!(!cmd.contains("$("), "{cmd:?}");
+    // Not `--no-config`, which fish before 3.3 lacks: an empty config home.
+    let Ok(mut fish) = std::process::Command::new("fish")
+        .arg("-c")
+        .arg(format!("{}; pwd", cmd.trim_end_matches('\r')))
+        .env("XDG_CONFIG_HOME", tmp.path())
+        .current_dir(tmp.path())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+    else {
+        return;
+    };
+    use std::io::Write;
+    fish.stdin.take().unwrap().write_all(b"typed\n").unwrap();
+    let out = fish.wait_with_output().unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "got typed\nhi! back\\slash\n/\n"
+    );
+}
+
+/// #920: a block of several lines settles its capture on the WHOLE block.
+/// The pane reads typed lines as an interactive shell does, one command per
+/// line between OSC 133 marks. Typed line by line, the block finished three
+/// times, and its box and `{persist}` fence held only the first command's
+/// output and exit.
+#[test]
+fn a_multi_line_blocks_capture_holds_every_line_and_the_blocks_exit() {
+    let tmp = tempfile::tempdir().unwrap();
+    let doc = tmp.path().join("BUILD.md");
+    let code = "echo step-1\nprintf 'a\\nb\\nc\\n' | sort -r\n(exit 3)\n";
+    std::fs::write(&doc, format!("```sh {{persist}}\n{code}```\n")).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let shell = "while :; do printf '\\033]133;A\\007$ \\033]133;B\\007'; \
+                 IFS= read -r line || exit; printf '\\033]133;C\\007'; \
+                 eval \"$line\"; printf '\\033]133;D;%d\\007' $?; done";
+    let mut pane = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[String::from("-c"), shell.into()],
+        tmp.path(),
+    )
+    .unwrap();
+    pane.set_manual_name(Some(String::from("BUILD.md:1")));
+    app.insert_terminal(pane);
+    let idx = app.terminals.len() - 1;
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::SHELL_PAINT_BASE,
+        "the pane's first prompt",
+        || !app.terminals[idx].prompt_lines().is_empty(),
+    );
+    let panes = app.terminals.len();
+    app.run_block_in_pane(PendingRunBlock {
+        pane_name: String::from("BUILD.md:1"),
+        cwd: tmp.path().to_path_buf(),
+        command: super::fence_command("sh", code, &tmp.path().join("blocks"), "/bin/sh"),
+        code: code.to_string(),
+        destructive: false,
+        doc: Some(doc.clone()),
+        block_line: 0,
+        persist: true,
+        capture_timeout: None,
+    });
+    assert_eq!(app.terminals.len(), panes, "the idle pane ran the block");
+    let key = (String::from("BUILD.md:1"), 0);
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::SHELL_PAINT_BASE,
+        "the block's capture to settle",
+        || {
+            app.settle_block_captures();
+            app.block_outputs.contains_key(&key)
+        },
+    );
+    let out = &app.block_outputs[&key];
+    assert_eq!(out.text, "step-1\nc\nb\na", "every line's output");
+    assert_eq!(out.exit, Some(3), "the exit the block ended with");
+    let written = std::fs::read_to_string(&doc).unwrap();
+    assert!(written.contains("step-1\nc\nb\na\n"), "{written}");
 }
 
 /// Negative (#1630): when the file cannot be written the block is still
@@ -861,11 +985,11 @@ fn a_block_that_cannot_be_written_falls_back_to_the_heredoc() {
     let tmp = tempfile::tempdir().unwrap();
     let not_a_dir = tmp.path().join("blocks");
     std::fs::write(&not_a_dir, "").unwrap();
-    let cmd = super::fence_command("python3", "print(1)\n", &not_a_dir);
+    let cmd = super::fence_command("python3", "print(1)\n", &not_a_dir, "/bin/sh");
     assert_eq!(cmd, "python3 - <<'CROFT_BLOCK'\nprint(1)\nCROFT_BLOCK\r");
     // A block holding the terminator gets a different one.
     let tricky = "print(1)\nCROFT_BLOCK\n";
-    let cmd = super::fence_command("python3", tricky, &not_a_dir);
+    let cmd = super::fence_command("python3", tricky, &not_a_dir, "/bin/sh");
     assert!(cmd.starts_with("python3 - <<'CROFT_BLOCK_1'\n"), "{cmd}");
 }
 
@@ -1293,6 +1417,40 @@ fn a_finished_fenced_block_replaces_its_running_status_with_the_outcome() {
         .uid();
     finish_pane_command(&mut app, pane, Some(1), 300);
     assert_eq!(app.status, "README.md:1 failed (exit 1, 0.3 s)");
+}
+
+/// #912 (comment): a task typed into a shell that it then ends (`echo
+/// boom; exit 3`) kept "Running fail" for good: a shell that exits sends
+/// no command-finished mark. Its exit code is now the task's outcome, and
+/// the pane stays so the output can be read.
+#[test]
+fn a_task_that_exits_its_shell_reports_the_exit_code() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let mut task = long_task("fail");
+    task.command = String::from("echo out_$((40 + 2)); exit 3");
+    let pane = app.run_project_task(task).unwrap();
+    assert_eq!(app.status, "Running fail");
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(1500),
+        "the task's shell to exit",
+        || {
+            app.drain_terminal_bells();
+            app.status != "Running fail"
+        },
+    );
+    assert!(
+        app.status.starts_with("fail failed (exit 3, "),
+        "{}",
+        app.status
+    );
+    let t = app
+        .terminals
+        .iter()
+        .find(|t| t.uid() == pane)
+        .expect("the task's pane stays");
+    assert!(t.has_exited());
+    assert!(t.visible_text().contains("out_42"), "the output stays");
 }
 
 /// #856 guard: a task's finish settles only a status that still shows its
