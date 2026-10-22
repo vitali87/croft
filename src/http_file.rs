@@ -1,8 +1,9 @@
 //! `.http` / `.rest` request files (#370): the REST-Client format — requests
 //! separated by `###`, `Name: value` headers, a blank line before the body,
-//! `{{variables}}` from the file's own `@name = value` lines or a
-//! `.http.env.json` beside the file — parsed, sent, and rendered as a
-//! response document the editor opens as an ordinary tab.
+//! `{{variables}}` from the file's own `@name = value` lines or the env
+//! files beside it (flat, or REST Client's and JetBrains' named
+//! environments) — parsed, sent, and rendered as a response document the
+//! editor opens as an ordinary tab.
 //!
 //! One divergence from REST Client worth knowing: `ureq` replaces duplicate
 //! request headers, so two `Accept:` lines in a file send only the last.
@@ -24,9 +25,21 @@ pub const RESPONSE_CAP_BYTES: usize = 8 * 1024 * 1024;
 /// How long a request may take before the worker gives up.
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The env file read beside a request file: a flat JSON object whose values
-/// fill `{{name}}` holes.
+/// croft's env file beside a request file: a JSON object whose values fill
+/// `{{name}}` holes, flat or split into named environments (#924).
 pub const ENV_FILE: &str = ".http.env.json";
+
+/// Every env file read beside a request file, a later one winning a name:
+/// croft's own, then JetBrains' HTTP client's shared and private files.
+pub const ENV_FILES: [&str; 3] = [
+    ENV_FILE,
+    "http-client.env.json",
+    "http-client.private.env.json",
+];
+
+/// The environment whose values every environment shares, as REST Client
+/// and JetBrains' HTTP client name it.
+pub const SHARED_ENV: &str = "$shared";
 
 /// One request block in a `.http` file, with the rows it spans so the app
 /// can find the request under the caret.
@@ -207,27 +220,71 @@ pub fn request_at(requests: &[HttpRequest], row: usize) -> Option<&HttpRequest> 
     requests.iter().find(|r| r.start <= row && row < r.end)
 }
 
-/// Read the flat `{{name}} -> value` map from [`ENV_FILE`] in `dir`. String
-/// values verbatim; numbers and booleans stringified; anything nested is
-/// skipped (this is a variable file, not a config format).
-pub fn load_env(dir: &Path) -> BTreeMap<String, String> {
-    let mut out = BTreeMap::new();
-    let Ok(bytes) = std::fs::read(dir.join(ENV_FILE)) else {
-        return out;
-    };
-    let Ok(serde_json::Value::Object(map)) = serde_json::from_slice(&bytes) else {
-        return out;
-    };
-    for (k, v) in map {
-        let val = match v {
-            serde_json::Value::String(s) => s,
-            serde_json::Value::Number(n) => n.to_string(),
-            serde_json::Value::Bool(b) => b.to_string(),
-            _ => continue,
+/// What the env files beside a request file hold for it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EnvFiles {
+    /// The values a request resolves against: the files' flat top-level
+    /// values, under `$shared`, under the active environment's.
+    pub vars: BTreeMap<String, String>,
+    /// Every named environment the files define (not `$shared`), sorted.
+    pub environments: Vec<String>,
+}
+
+/// Read [`ENV_FILES`] in `dir` (#924). A top-level string, number or
+/// boolean is a variable, as in croft's flat format; a top-level object is
+/// an environment in REST Client's and JetBrains' shape, `$shared` applying
+/// to all of them and `active` (picked with HTTP: Switch Environment) on
+/// top. Numbers and booleans are stringified; deeper nesting is skipped.
+pub fn load_env(dir: &Path, active: Option<&str>) -> EnvFiles {
+    let (mut flat, mut shared, mut chosen) = (BTreeMap::new(), BTreeMap::new(), BTreeMap::new());
+    let mut environments = std::collections::BTreeSet::new();
+    for file in ENV_FILES {
+        let Ok(bytes) = std::fs::read(dir.join(file)) else {
+            continue;
         };
-        out.insert(k, val);
+        let Ok(serde_json::Value::Object(map)) = serde_json::from_slice(&bytes) else {
+            continue;
+        };
+        for (k, v) in map {
+            let serde_json::Value::Object(env) = v else {
+                if let Some(val) = scalar(v) {
+                    flat.insert(k, val);
+                }
+                continue;
+            };
+            let layer = if k == SHARED_ENV {
+                &mut shared
+            } else {
+                let on = active == Some(k.as_str());
+                environments.insert(k);
+                if !on {
+                    continue;
+                }
+                &mut chosen
+            };
+            for (name, val) in env {
+                if let Some(val) = scalar(val) {
+                    layer.insert(name, val);
+                }
+            }
+        }
     }
-    out
+    flat.extend(shared);
+    flat.extend(chosen);
+    EnvFiles {
+        vars: flat,
+        environments: environments.into_iter().collect(),
+    }
+}
+
+/// An env file value as the text it fills a hole with, if it is one.
+fn scalar(v: serde_json::Value) -> Option<String> {
+    match v {
+        serde_json::Value::String(s) => Some(s),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        serde_json::Value::Bool(b) => Some(b.to_string()),
+        _ => None,
+    }
 }
 
 /// Fill every `{{name}}` hole from `vars` (or the process environment for
@@ -718,8 +775,9 @@ DELETE {{host}}/users/1\n";
         assert!(!doc.contains("a --> <boom/>"), "no raw escape survives");
     }
 
-    /// The env file is a flat JSON object; strings verbatim, numbers and
-    /// booleans stringified, nesting skipped, absence empty.
+    /// The env file's top-level values: strings verbatim, numbers and
+    /// booleans stringified, an object an environment rather than a value,
+    /// absence empty.
     #[test]
     fn env_file_loads_flat_values_only() {
         let dir = tempfile::TempDir::new().unwrap();
@@ -728,12 +786,69 @@ DELETE {{host}}/users/1\n";
             "{\"host\": \"http://a\", \"port\": 8080, \"on\": true, \"nested\": {\"x\": 1}}",
         )
         .unwrap();
-        let vars = load_env(dir.path());
+        let EnvFiles { vars, environments } = load_env(dir.path(), None);
         assert_eq!(vars.get("host").map(String::as_str), Some("http://a"));
         assert_eq!(vars.get("port").map(String::as_str), Some("8080"));
         assert_eq!(vars.get("on").map(String::as_str), Some("true"));
-        assert!(!vars.contains_key("nested"));
-        assert!(load_env(&dir.path().join("missing")).is_empty());
+        assert!(!vars.contains_key("nested") && !vars.contains_key("x"));
+        assert_eq!(environments, ["nested"]);
+        assert_eq!(
+            load_env(&dir.path().join("missing"), None),
+            EnvFiles::default()
+        );
+    }
+
+    /// #924: REST Client's `$shared` + named environments in
+    /// `.http.env.json`, and JetBrains' `http-client.env.json` with its
+    /// private twin. With no environment active only `$shared` (and flat
+    /// values) apply; the active one wins over both, and the private file
+    /// wins over the public one.
+    #[test]
+    fn named_environments_layer_over_shared_values() {
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join(ENV_FILE),
+            r#"{"version": "v0", "$shared": {"version": "v1", "host": "http://shared"},
+                "dev": {"host": "http://dev", "port": 8080}, "prod": {"host": "http://prod"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("http-client.env.json"),
+            r#"{"staging": {"host": "http://staging", "token": "public"}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("http-client.private.env.json"),
+            r#"{"staging": {"token": "private"}}"#,
+        )
+        .unwrap();
+        let get = |env: &EnvFiles, k: &str| env.vars.get(k).cloned();
+
+        let none = load_env(dir.path(), None);
+        assert_eq!(none.environments, ["dev", "prod", "staging"]);
+        assert_eq!(get(&none, "host").as_deref(), Some("http://shared"));
+        assert_eq!(get(&none, "version").as_deref(), Some("v1"));
+        assert_eq!(
+            get(&none, "port"),
+            None,
+            "an inactive environment is unread"
+        );
+
+        let dev = load_env(dir.path(), Some("dev"));
+        assert_eq!(get(&dev, "host").as_deref(), Some("http://dev"));
+        assert_eq!(get(&dev, "port").as_deref(), Some("8080"));
+        assert_eq!(
+            get(&dev, "version").as_deref(),
+            Some("v1"),
+            "$shared fills in"
+        );
+
+        let staging = load_env(dir.path(), Some("staging"));
+        assert_eq!(get(&staging, "host").as_deref(), Some("http://staging"));
+        assert_eq!(get(&staging, "token").as_deref(), Some("private"));
+
+        let gone = load_env(dir.path(), Some("qa"));
+        assert_eq!(gone.vars, none.vars, "an unknown name is no environment");
     }
 
     /// Copy as curl single-quotes for a POSIX shell, apostrophes included.

@@ -928,6 +928,8 @@ An anchored popup with a 300 ms dwell. It serves the LSP hover (wide), the tab-p
 
 Support for `.http` and `.rest` request files. The REST-Client format is parsed — `###` blocks, headers, bodies, and `{{variables}}` from the file's own `@name = value` lines, a `.http.env.json` beside the file, or `{{$env.NAME}}` — and sent on a worker thread through `ureq`.
 
+**Env files and environments.** Beside the request file, `.http.env.json` and JetBrains' `http-client.env.json` / `http-client.private.env.json` are read in that order, a later file winning a name. A top-level scalar is a variable (croft's flat format); a top-level object is a named environment in REST Client's and JetBrains' shape. Values layer flat, then `$shared`, then the environment picked with HTTP: Switch Environment (held in the App, `None` meaning `$shared` only), and the file's own `@name` lines win over all of them. While environments exist and none is picked, a hole with no value refuses naming them and the command that picks one, rather than skipping them silently.
+
 **What counts as an error.** A non-2xx status is a response, not an error. Bodies are capped at 8 MiB.
 
 **The response is an ordinary tab.** The result renders as a response document the editor opens like any other tab: `.jsonc` with the status and headers as `//` comments and the body pretty-printed, or `.xml`, `.txt`, or the image bytes themselves.
