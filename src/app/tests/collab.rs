@@ -997,28 +997,104 @@ fn collab_stream_state_drives_the_badge_and_cancel_broadcasts() {
     }
 }
 
-/// #1207 (comment): a peer's edit that changes several separate runs
-/// arrives as one op per run and still undoes as one step. Negative: two
-/// separate peer edits stay two steps.
+/// #919: a peer's edit is no step of this user's undo. The owner types on
+/// line 1 and a peer on line 3; the owner's Ctrl+Z removes only the owner's
+/// text, the peer's stays, and the peer sees the undo as an ordinary edit.
 #[test]
-fn a_peer_edit_of_several_runs_undoes_in_one_step() {
+fn undo_reverts_only_your_own_edit_and_keeps_the_peers() {
+    use std::time::{Duration, Instant};
     let tmp = tempfile::tempdir().unwrap();
-    let (mut owner, mut pilot) = owner_and_pilot_on(&tmp, "let a = x;\nlet b = x;\nlet c = x;");
-    pilot_writes(&mut owner, &mut pilot, "let a = y;\nlet b = y;\nlet c = y;");
-    pilot_writes(&mut owner, &mut pilot, "let a = y;\nlet b = y;\nlet c = z;");
-    assert!(owner.editor.undo());
-    assert_eq!(
-        owner.editor.lines.join("\n"),
-        "let a = y;\nlet b = y;\nlet c = y;",
-        "the later edit undoes on its own"
+    let (mut owner, mut pilot) =
+        owner_and_pilot_on(&tmp, "def a():\n    return 1\ndef b():\n    return 2");
+    owner.editor.cursor_row = 0;
+    owner.editor.cursor_col = "def a():".len();
+    owner.editor.insert_str("  # A-edit");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !pilot
+        .doc_text("f.txt")
+        .is_some_and(|t| t.contains("A-edit"))
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the peer never saw the owner's edit"
+        );
+        owner.poll_collab();
+        pilot.poll(|_| None);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    pilot_writes(
+        &mut owner,
+        &mut pilot,
+        "def a():  # A-edit\n    return 1\ndef b():  # B-edit\n    return 2",
     );
     assert!(owner.editor.undo());
+    let undone = "def a():\n    return 1\ndef b():  # B-edit\n    return 2";
     assert_eq!(
         owner.editor.lines.join("\n"),
-        "let a = x;\nlet b = x;\nlet c = x;",
-        "the three-run Replace All undoes in one step"
+        undone,
+        "the owner's undo takes back the owner's edit, not the peer's"
     );
-    assert!(!owner.editor.undo());
+    assert!(
+        !owner.editor.undo(),
+        "the peer's edit is not the owner's step"
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while pilot.doc_text("f.txt") != Some(undone) {
+        assert!(Instant::now() < deadline, "the peer never saw the undo");
+        owner.poll_collab();
+        pilot.poll(|_| None);
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// #918: a peer's edit before the caret, earlier on its line or on a line
+/// above, carries the caret and the view with the text, so the next
+/// keystrokes land where they were aimed and the lines on screen stay put.
+#[test]
+fn a_peer_edit_before_the_caret_carries_it_and_the_view() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut text: Vec<String> = (0..60).map(|i| format!("# {i}")).collect();
+    text[40] = "    return f\"hi {name}\"".into();
+    let (mut owner, mut pilot) = owner_and_pilot_on(&tmp, &text.join("\n"));
+    owner.editor.scroll = 30;
+    owner.editor.cursor_row = 40;
+    owner.editor.cursor_col = text[40].len();
+    text[40] = "    result = return f\"hi {name}\"".into();
+    pilot_writes(&mut owner, &mut pilot, &text.join("\n"));
+    text.insert(0, "import os".into());
+    pilot_writes(&mut owner, &mut pilot, &text.join("\n"));
+    assert_eq!(owner.editor.scroll, 31, "the view still starts at # 30");
+    owner.editor.insert_str("  # A");
+    assert_eq!(
+        owner.editor.lines[41],
+        "    result = return f\"hi {name}\"  # A"
+    );
+}
+
+/// #918: two people typing in turns at the same spot each get their words
+/// in the order typed; a caret left at its old column wrote each word in
+/// front of the one before it.
+#[test]
+fn turns_typed_at_one_spot_keep_each_side_s_words_in_order() {
+    let (_tmp, _file, mut owner, mut guest) = collab_owner_and_guest_on_plan();
+    for app in [&mut owner, &mut guest] {
+        app.editor.cursor_row = 0;
+        app.editor.cursor_col = "Owner: alice".len();
+    }
+    for word in ["one", "two", "three"] {
+        for typist in [0, 1] {
+            let mut apps = [&mut owner, &mut guest];
+            let tag = ["A", "B"][typist];
+            apps[typist].editor.insert_str(&format!(" {tag}-{word}"));
+            pump_apps_until(&mut apps, "the word reaches the peer", |apps| {
+                apps[0].editor.lines == apps[1].editor.lines
+            });
+        }
+    }
+    assert_eq!(
+        owner.editor.lines[0],
+        "Owner: alice A-one B-one A-two B-two A-three B-three"
+    );
 }
 
 /// A caret name tag is visible while inside its 2s fade window and signals

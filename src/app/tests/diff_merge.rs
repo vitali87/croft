@@ -952,6 +952,48 @@ fn merge_editor_renders_source_panes_and_result_at_100_columns() {
     assert_eq!(app.editor.lines[1], "mine");
 }
 
+/// #891: a tab in a source pane takes its cell, so a Makefile recipe is
+/// drawn indented under its target rather than flush with it.
+#[test]
+fn merge_editor_source_panes_draw_a_tab_as_a_cell() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("Makefile"),
+        "all:\n<<<<<<< HEAD\n\tmine\n=======\n\tyours\n>>>>>>> other\n",
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor
+        .open_pinned(&tmp.path().join("Makefile"))
+        .unwrap();
+    app.focus_pane(Pane::Editor);
+    app.run_command(crate::widgets::command_palette::Command::MergeOpenEditor);
+    let backend = ratatui::backend::TestBackend::new(100, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let buf = term.backend().buffer().clone();
+    let a = buf.area;
+    // The first cell, top to bottom and left to right, where `word` starts:
+    // the Current pane comes first.
+    let x_of = |word: &str| {
+        (a.y..a.bottom())
+            .find_map(|y| {
+                (a.x..a.right()).find(|&x| {
+                    word.chars().enumerate().all(|(i, c)| {
+                        let x = x + i as u16;
+                        x < a.right() && buf[(x, y)].symbol() == c.to_string()
+                    })
+                })
+            })
+            .unwrap_or_else(|| panic!("{word} is drawn"))
+    };
+    assert_eq!(
+        x_of("mine"),
+        x_of("all:") + 1,
+        "the recipe sits one cell in"
+    );
+}
+
 /// #1169: the merge editor's side panes carry labelled accept buttons
 /// above each conflict, not only the `[ ]` checkboxes, and a click on one
 /// resolves the conflict that way and ticks the button.

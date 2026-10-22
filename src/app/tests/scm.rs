@@ -4692,6 +4692,58 @@ fn accept_all_incoming_then_complete_merge_stages_the_resolved_file() {
     );
 }
 
+/// #906: a file resolved by hand in the text flow is still unmerged in git,
+/// so its MERGE CONFLICTS row stays. Opening it keeps that resolution as the
+/// Result, reads each conflict's state off it, and Complete Merge stages it.
+#[test]
+fn a_hand_resolved_conflict_opens_as_its_own_result_and_completes() {
+    use crate::merge_editor::ConflictState;
+    let tmp = tempfile::tempdir().unwrap();
+    conflicted_repo(tmp.path());
+    let resolved = "alpha\nboth-one\nm1\nm2\nm3\nm4\nm5\nfeature-two\nomega\n";
+    std::fs::write(tmp.path().join("shared.txt"), resolved).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let idx = wait_for_conflicted_entry(&mut app);
+    app.open_source_control_entry(idx);
+    let mv = app.editor.merge.as_ref().expect("the merge editor is up");
+    let states: Vec<_> = mv.conflicts.iter().map(|c| c.state).collect();
+    assert_eq!(states, [ConflictState::Manual, ConflictState::Incoming]);
+    assert_eq!(app.editor.lines.join("\n") + "\n", resolved);
+    assert!(!app.editor.dirty, "nothing in the file was replaced");
+    app.complete_merge();
+    assert!(app.status.contains("staged shared.txt"), "{}", app.status);
+    assert_eq!(git_out(tmp.path(), &["show", ":shared.txt"]), resolved);
+}
+
+/// #906: with one block resolved and a line added beside it, the merge
+/// editor keeps both and asks only about the block still marked.
+#[test]
+fn a_partly_resolved_conflict_keeps_its_edits_in_the_merge_editor() {
+    let tmp = tempfile::tempdir().unwrap();
+    conflicted_repo(tmp.path());
+    let file = tmp.path().join("shared.txt");
+    let lines: Vec<String> = std::fs::read_to_string(&file)
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    let block = crate::merge::find_conflicts(&lines)[0];
+    let mut edited = lines[..block.ours_start].to_vec();
+    edited.extend(["feature-one".to_string(), "# reviewed".to_string()]);
+    edited.extend_from_slice(&lines[block.theirs_end + 1..]);
+    std::fs::write(&file, edited.join("\n") + "\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let idx = wait_for_conflicted_entry(&mut app);
+    app.open_source_control_entry(idx);
+    let mv = app.editor.merge.as_ref().expect("the merge editor is up");
+    assert_eq!(mv.conflicts.len(), 1, "only the marked block is left");
+    assert_eq!(mv.conflicts[0].ours, ["main-two"]);
+    assert_eq!(
+        app.editor.lines[..3],
+        ["alpha", "feature-one", "# reviewed"]
+    );
+}
+
 #[test]
 fn keeping_the_modified_side_of_a_modify_delete_stages_it() {
     // Negative: the side that kept the file still wins as before.
@@ -5914,7 +5966,7 @@ fn a_failed_scm_op_names_the_operation_and_git_s_error_line() {
     pick_branch_858(&mut app, ScmAction::Merge, "feature");
     assert_eq!(
         app.status,
-        "Merge failed: error: Your local changes to the following files would be overwritten by merge:"
+        "Merge failed: error: Your local changes to the following files would be overwritten by merge: pricing.py"
     );
     one_line(&app);
 
@@ -6491,9 +6543,173 @@ fn switching_branch_reports_one_line() {
     assert!(app.source_control.commit_feedback_is_error);
     assert_eq!(
         app.status,
-        "Branch: error: Your local changes to the following files would be overwritten by checkout:"
+        "Branch: error: Your local changes to the following files would be overwritten by checkout: seed.txt"
     );
     assert_one_line_858(&app);
+}
+
+/// A repo on `feature` with a local edit to line 5 of `seed.txt`, where
+/// `main` has since changed line 1: switching to `main` would overwrite
+/// the edit, so git refuses (#925).
+fn blocked_switch_repo_925() -> tempfile::TempDir {
+    let tmp = make_committed_repo();
+    configure_858(tmp.path(), "false");
+    commit_858(tmp.path(), "seed.txt", "one\ntwo\nthree\nfour\nfive\n");
+    git_858(tmp.path(), &["checkout", "-qb", "feature"]);
+    git_858(tmp.path(), &["checkout", "-q", "main"]);
+    commit_858(tmp.path(), "seed.txt", "ONE\ntwo\nthree\nfour\nfive\n");
+    git_858(tmp.path(), &["checkout", "-q", "feature"]);
+    std::fs::write(tmp.path().join("seed.txt"), "one\ntwo\nthree\nfour\nFIVE\n").unwrap();
+    tmp
+}
+
+/// #925: a switch refused over local changes was a dead end. It now offers
+/// Stash & Checkout in place of the branch picker: Esc leaves everything as
+/// it was, Enter stashes the edit and switches.
+#[test]
+fn a_switch_blocked_by_local_changes_offers_stash_and_checkout() {
+    use crate::widgets::scm_menu::ScmAction;
+    let tmp = blocked_switch_repo_925();
+    let seed = tmp.path().join("seed.txt");
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::SourceControl);
+    pick_branch_858(&mut app, ScmAction::CheckoutTo, "main");
+    assert!(app.branch_picker.is_none(), "the offer replaces the picker");
+    assert_eq!(
+        app.list_picker.as_ref().map(|p| p.purpose),
+        Some(crate::widgets::list_picker::ListPurpose::BlockedSwitch)
+    );
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        git_858(tmp.path(), &["branch", "--show-current"]),
+        "feature"
+    );
+    assert_eq!(git_858(tmp.path(), &["stash", "list"]), "");
+
+    pick_branch_858(&mut app, ScmAction::CheckoutTo, "main");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(git_858(tmp.path(), &["branch", "--show-current"]), "main");
+    assert_eq!(
+        std::fs::read_to_string(&seed).unwrap(),
+        "ONE\ntwo\nthree\nfour\nfive\n"
+    );
+    assert_eq!(git_858(tmp.path(), &["stash", "list"]).lines().count(), 1);
+    assert!(!app.source_control.commit_feedback_is_error);
+    assert_eq!(app.status, "Stashed your changes and switched to main");
+}
+
+/// #925: Migrate Changes stashes the edit, switches, and pops it onto the
+/// new branch, leaving no stash behind.
+#[test]
+fn migrate_changes_brings_the_blocked_edit_along() {
+    use crate::widgets::scm_menu::ScmAction;
+    let tmp = blocked_switch_repo_925();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::SourceControl);
+    pick_branch_858(&mut app, ScmAction::CheckoutTo, "main");
+    app.handle_key(key(KeyCode::Down, KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(git_858(tmp.path(), &["branch", "--show-current"]), "main");
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("seed.txt")).unwrap(),
+        "ONE\ntwo\nthree\nfour\nFIVE\n"
+    );
+    assert_eq!(git_858(tmp.path(), &["stash", "list"]), "");
+    assert_eq!(app.status, "Switched to main with your changes");
+}
+
+/// #925 negative: changes that conflict with the new branch stop the
+/// migration on the conflict, which is named, and the stash is kept, as
+/// `git stash pop` keeps it.
+#[test]
+fn migrating_changes_that_conflict_names_the_conflict_and_keeps_the_stash() {
+    use crate::widgets::scm_menu::ScmAction;
+    let tmp = blocked_switch_repo_925();
+    std::fs::write(tmp.path().join("seed.txt"), "uno\ntwo\nthree\nfour\nfive\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::SourceControl);
+    pick_branch_858(&mut app, ScmAction::CheckoutTo, "main");
+    app.handle_key(key(KeyCode::Down, KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(git_858(tmp.path(), &["branch", "--show-current"]), "main");
+    assert_eq!(
+        app.status,
+        "Switched to main \u{b7} Migrate changes: 1 conflict (seed.txt)"
+    );
+    assert!(app.source_control.commit_feedback_is_error);
+    assert_eq!(git_858(tmp.path(), &["stash", "list"]).lines().count(), 1);
+}
+
+/// #925: git stashes the files on disk, so with an edit still only in a
+/// tab, Stash & Checkout asks first, as any stash does (#1438): nothing is
+/// stashed or switched until Save All & Stash, and then the stash holds
+/// the tab's text.
+#[test]
+fn stash_and_checkout_asks_to_save_an_unsaved_tab_first() {
+    use crate::widgets::scm_menu::ScmAction;
+    let tmp = blocked_switch_repo_925();
+    let seed = tmp.path().join("seed.txt");
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::SourceControl);
+    app.editor.open_pinned(&seed).unwrap();
+    app.editor.insert_str("zero\n");
+    assert!(app.editor.dirty);
+    pick_branch_858(&mut app, ScmAction::CheckoutTo, "main");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    let pending = app.pending_unsaved_scm.as_ref().expect("the prompt opens");
+    assert_eq!(pending.op, ScmWrite::StashAndSwitch);
+    assert_eq!(
+        git_858(tmp.path(), &["branch", "--show-current"]),
+        "feature"
+    );
+    assert_eq!(git_858(tmp.path(), &["stash", "list"]), "");
+    app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.pending_unsaved_scm.is_none());
+    assert_eq!(git_858(tmp.path(), &["branch", "--show-current"]), "main");
+    assert_eq!(
+        git_858(tmp.path(), &["show", "stash@{0}:seed.txt"]),
+        "zero\none\ntwo\nthree\nfour\nFIVE"
+    );
+    assert_eq!(app.status, "Stashed your changes and switched to main");
+}
+
+/// #925 negative: a branch switched by hand while the unsaved-changes
+/// prompt waits makes the changes another branch's, so Stash & Checkout
+/// stops there, stashing nothing and switching nowhere.
+#[test]
+fn stash_and_checkout_stops_when_the_branch_changed_meanwhile() {
+    use crate::widgets::scm_menu::ScmAction;
+    let tmp = blocked_switch_repo_925();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::SourceControl);
+    app.editor
+        .open_pinned(&tmp.path().join("seed.txt"))
+        .unwrap();
+    app.editor.insert_str("zero\n");
+    pick_branch_858(&mut app, ScmAction::CheckoutTo, "main");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.pending_unsaved_scm.is_some(), "the prompt opens");
+    git_858(tmp.path(), &["switch", "-q", "-c", "elsewhere"]);
+    app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        git_858(tmp.path(), &["branch", "--show-current"]),
+        "elsewhere"
+    );
+    assert_eq!(git_858(tmp.path(), &["stash", "list"]), "");
+    assert_eq!(
+        app.status,
+        "Stash & Checkout cancelled: the branch changed since the switch was refused"
+    );
 }
 
 /// #858: popping the latest stash reported git's `git status` dump

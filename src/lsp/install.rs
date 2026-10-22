@@ -512,13 +512,19 @@ fn set_executable(_path: &Path) -> std::io::Result<()> {
 }
 
 /// Stream `url` into memory, capped at `max`. Follows redirects (release URLs
-/// 302 to a CDN). `None` on any transport error.
-fn download_capped(url: &str, max: u64) -> Option<Vec<u8>> {
+/// 302 to a CDN). On failure, the reason: the HTTP status or the transport
+/// error (DNS, refused, timeout, TLS), so the log and status bar can say it.
+fn download_capped(url: &str, max: u64) -> Result<Vec<u8>, String> {
     use std::io::Read;
-    let resp = ureq::get(url).call().ok()?;
+    let resp = crate::net::get(url)
+        .call()
+        .map_err(|e| crate::net::describe(&e))?;
     let mut bytes = Vec::new();
-    resp.into_reader().take(max).read_to_end(&mut bytes).ok()?;
-    Some(bytes)
+    resp.into_reader()
+        .take(max)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("reading the download: {e}"))?;
+    Ok(bytes)
 }
 
 /// Gunzip a single-file `.gz` payload (the decompressed bytes ARE the binary)
@@ -833,17 +839,20 @@ fn run_binary_install(name: &'static str, language: Language, spec: BinarySpec<'
         &format!("{name}: downloading {url}"),
     );
     set_status(format!("Installing {name}"));
-    let Some(bytes) = download_capped(url, MAX_BINARY_BYTES) else {
-        log_file::log(&format!("lsp[{name}] download failed: {url}"));
-        crate::output::push(
-            crate::output::CHANNEL_PROVISION,
-            crate::output::OutputLevel::Error,
-            &format!("{name}: download failed: {url}"),
-        );
-        set_status(format!(
-            "{name} install failed (download error, see ~/.croft/lsp.log)"
-        ));
-        return;
+    let bytes = match download_capped(url, MAX_BINARY_BYTES) {
+        Ok(bytes) => bytes,
+        Err(why) => {
+            log_file::log(&format!("lsp[{name}] download failed: {url}: {why}"));
+            crate::output::push(
+                crate::output::CHANNEL_PROVISION,
+                crate::output::OutputLevel::Error,
+                &format!("{name}: download failed: {url}: {why}"),
+            );
+            set_status(format!(
+                "{name} install failed: {why} (see ~/.croft/lsp.log)"
+            ));
+            return;
+        }
     };
 
     // A manifest that pins digests has its download verified before a byte
@@ -1591,6 +1600,15 @@ mod tests {
         let url = |os, arch| target_entry(&targets, os, arch).map(|(_, url)| url);
         assert_eq!(url("macos", "aarch64"), Some("ARM"));
         assert_eq!(url("macos", "x86_64"), Some("GENERIC"));
+    }
+
+    /// A failed download says why (#872): the transport error reaches the
+    /// install's log line and status message instead of being dropped.
+    #[test]
+    fn a_failed_download_carries_the_transport_error() {
+        let url = crate::net::tests::https_server();
+        let why = download_capped(&url, MAX_BINARY_BYTES).unwrap_err();
+        assert!(why.contains("invalid peer certificate"), "{why}");
     }
 
     /// End-to-end exercise of the real download + gunzip path against taplo's

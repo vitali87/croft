@@ -1,0 +1,2 @@
+feature: `.http` env files can hold REST Client's and JetBrains' named environments (`{"$shared": {…}, "dev": {…}}`), and HTTP: Switch Environment picks the one requests use. `http-client.env.json` and `http-client.private.env.json` beside the file are read too.
+fix: A `.http` request whose variable only an unpicked environment defines now says which environments exist and how to pick one, instead of reporting no value.

@@ -54,6 +54,37 @@ class WorkflowContract(unittest.TestCase):
         self.assertNotIn("contents: write", decide)
         self.assertIn("id-token: write", publish)
 
+    def test_a_release_now_label_only_brings_a_publish_forward(self):
+        # The verdict is the count's or the label's, and the label is asked
+        # only when the count says wait, so most pushes make no API call.
+        # scripts/tests/test_release_now.py runs the script itself.
+        _, rest = re.split(r"(?m)^jobs:$", self.text)
+        decide, _ = re.split(r"(?m)^  publish:$", rest)
+        self.assertIn(
+            "publish: ${{ steps.cadence.outputs.publish == 'true'"
+            " || steps.label.outputs.release_now == 'true' }}",
+            decide,
+        )
+        step = decide[decide.index("id: label") :]
+        self.assertLess(decide.index("id: cadence"), decide.index("id: label"))
+        self.assertIn("if: steps.cadence.outputs.publish == 'false'", step)
+        self.assertIn("LATEST: ${{ steps.cadence.outputs.latest_published }}", step)
+        # pipefail: without it tee hides the script's refusal, and a failed
+        # lookup reads as "nobody asked".
+        self.assertIn("set -euo pipefail", step)
+        self.assertIn('python3 scripts/release_now.py "$LATEST" | tee -a "$GITHUB_OUTPUT"', step)
+
+    def test_decide_reads_labels_and_writes_nothing(self):
+        _, rest = re.split(r"(?m)^jobs:$", self.text)
+        decide, _ = re.split(r"(?m)^  publish:$", rest)
+        permissions = re.search(r"(?m)^    permissions:\n((?:      .*\n)+)", decide)
+        self.assertIsNotNone(permissions)
+        granted = re.findall(r"(?m)^      ([a-z-]+): (\w+)$", permissions.group(1))
+        self.assertEqual(
+            sorted(granted),
+            [("contents", "read"), ("issues", "read"), ("pull-requests", "read")],
+        )
+
     def test_decide_refuses_a_ref_other_than_main(self):
         # A manual dispatch can name any branch; a forced run there would
         # publish that branch's code under the crate's identity.
