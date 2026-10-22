@@ -64,6 +64,19 @@ pub(crate) fn hook_socket_path(workspace: &Path) -> PathBuf {
     sessions_dir().join(format!("{}.hook.sock", socket_name(workspace)))
 }
 
+/// Whether a file in the sessions folder is a session's socket: the mux
+/// `<hash>.mux.sock` or the legacy dtach `<hash>.sock`, where `<hash>` is a
+/// [`socket_name`]. An allowlist, so the next socket that moves into the
+/// folder can't show up in `croft ls` as a phantom session.
+fn is_session_socket(file_name: &str) -> bool {
+    file_name
+        .strip_suffix(".mux.sock")
+        .or_else(|| file_name.strip_suffix(".sock"))
+        .is_some_and(|hash| {
+            hash.len() == 16 && hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        })
+}
+
 fn meta_path(socket: &Path) -> PathBuf {
     socket.with_extension("json")
 }
@@ -411,19 +424,16 @@ fn session_rows(dir: &Path) -> Vec<SessionRow> {
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let socket = entry.path();
-            if socket.extension().and_then(|e| e.to_str()) != Some("sock") {
-                continue;
-            }
-            // The workspace's collab relay lives in the same directory with
-            // the same hash keying (`<hash>.collab.sock`). It is not a
-            // session: listing it printed a phantom `(unknown)` row whose id
-            // collided with the real session's, and probing it cost the relay
-            // a connect-and-drop. Its lifecycle belongs to the relay's own
-            // bind path, not to `ls` pruning.
-            if socket
+            // The folder also holds other listeners: the collab relay and
+            // agent hook socket share the hash keying, and pane hosts live
+            // here too. None is a session: listing them printed phantom
+            // `(unknown)` rows whose ids collided with the real session's,
+            // and probing them cost each a connect-and-drop. Their
+            // lifecycles belong to their own bind paths, not to `ls` pruning.
+            if !socket
                 .file_name()
                 .and_then(|n| n.to_str())
-                .is_some_and(|n| n.ends_with(".collab.sock"))
+                .is_some_and(is_session_socket)
             {
                 continue;
             }
@@ -666,6 +676,59 @@ mod tests {
             collab.exists(),
             "ls must not prune the relay socket either — its lifecycle belongs to the relay"
         );
+    }
+
+    /// #881: every croft binds `<hash>.hook.sock` for agent approvals, and
+    /// hosted panes bind `pane-<id>.sock`, in the same folder as the
+    /// sessions. Only a session's own socket is a session: `ls` lists the
+    /// mux and legacy dtach sockets and neither lists, probes nor prunes
+    /// anything else, live or dead.
+    #[test]
+    fn ls_reports_only_session_sockets_and_leaves_the_rest_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let hash = "0db75869317a960b";
+        let mux = dir.path().join(format!("{hash}.mux.sock"));
+        let _mux_listener = bind_socket_0600(&mux).unwrap();
+        write_meta(
+            &mux,
+            &SessionMeta {
+                workspace: PathBuf::from("/tmp/ws"),
+                created_unix: now_unix(),
+            },
+        )
+        .unwrap();
+        let hook = dir.path().join(format!("{hash}.hook.sock"));
+        let _hook_listener = bind_socket_0600(&hook).unwrap();
+        let pane = dir.path().join("pane-42-1a2b-0.sock");
+        let _pane_listener = bind_socket_0600(&pane).unwrap();
+        // A hook socket whose croft is gone: still not ls's to remove.
+        let stale_hook = dir.path().join("1111222233334444.hook.sock");
+        drop(bind_socket_0600(&stale_hook).unwrap());
+        // A legacy dtach session is still a session.
+        let legacy = dir.path().join("aaaabbbbccccdddd.sock");
+        let _legacy_listener = bind_socket_0600(&legacy).unwrap();
+
+        let mut ids: Vec<String> = session_rows(dir.path()).into_iter().map(|r| r.id).collect();
+        ids.sort();
+        assert_eq!(ids, ["0db75869", "aaaabbbb"]);
+        for kept in [&hook, &pane, &stale_hook] {
+            assert!(kept.exists(), "ls must not prune {}", kept.display());
+        }
+    }
+
+    /// The `ls` filter accepts exactly what the session binders produce and
+    /// none of the other per-workspace sockets.
+    #[test]
+    fn only_the_session_socket_names_count_as_sessions() {
+        let ws = Path::new("/work/repo");
+        let name = |p: PathBuf| p.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(is_session_socket(&name(mux_socket_path(ws))));
+        assert!(is_session_socket(&name(socket_path(ws))));
+        assert!(!is_session_socket(&name(collab_socket_path(ws))));
+        assert!(!is_session_socket(&name(hook_socket_path(ws))));
+        assert!(!is_session_socket(&name(crate::pane_host::socket_for(
+            &crate::pane_host::new_pane_id()
+        ))));
     }
 
     /// Two attach-or-create racers for the SAME target must never both

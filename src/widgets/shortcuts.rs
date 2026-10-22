@@ -322,8 +322,18 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 handler: "",
             },
             ShortcutEntry {
-                keys: "Alt+Left / Right",
-                description: "Word-step left / right",
+                keys: "Ctrl/Alt+Left / Right",
+                description: "Word-step left / right; Ctrl+Shift selects by word",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Ctrl/Alt+Backspace / Delete",
+                description: "Delete the word left / right of the cursor",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+Home / End",
+                description: "Go to the start / end of the file (with Shift, select there)",
                 handler: "",
             },
             ShortcutEntry {

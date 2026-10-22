@@ -56,6 +56,94 @@ fn take_value(inline: Option<String>, tokens: &[String], idx: &mut usize) -> Opt
     v
 }
 
+/// How the command decides Match Case. Flags overwrite it in order, so the
+/// last of `-i`/`-s`/`-S` wins, as in rg; `Smart` is resolved against the
+/// pattern once parsing is done.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CaseRule {
+    Sensitive,
+    Insensitive,
+    /// Ignore case unless the pattern has an uppercase letter: rg, ag and
+    /// ack's `-S`/`--smart-case`, and ag's default.
+    Smart,
+}
+
+/// Whether `prog`'s smart case matches `pattern` case-sensitively, read the
+/// way that tool reads it; `rust_regex` says rg parsed it with its default
+/// engine (no `-F` or `-P`). Where unsure it says yes: a seed narrower than
+/// the terminal search can't make Replace All touch a line it never listed.
+fn smart_case_is_sensitive(prog: &str, pattern: &str, rust_regex: bool) -> bool {
+    let any_uppercase = || pattern.chars().any(char::is_uppercase);
+    match prog {
+        // rg's default engine looks for an uppercase literal in the parsed
+        // regex, so `\W` and `\pL` don't count, and a pattern with no literal
+        // keeps case. One it can't parse gets the check below.
+        "rg" | "ripgrep" if rust_regex => {
+            match regex_syntax::ast::parse::Parser::new().parse(pattern) {
+                Ok(ast) => {
+                    let Ok(lits) = regex_syntax::ast::visit(&ast, RgLiterals::default());
+                    !lits.any || lits.uppercase
+                }
+                Err(_) => any_uppercase(),
+            }
+        }
+        // ag checks every byte, escapes included, and a non-ASCII one counts.
+        "ag" => pattern
+            .chars()
+            .any(|c| !c.is_ascii() || c.is_ascii_uppercase()),
+        // rg -F checks every letter. rg -P skips the letter after a
+        // backslash and ack drops a few escapes (`\W`, `\x4A`) first, so both
+        // keep case only where this does too.
+        _ => any_uppercase(),
+    }
+}
+
+/// The literals of an rg regex, as its smart case counts them.
+#[derive(Default)]
+struct RgLiterals {
+    any: bool,
+    uppercase: bool,
+}
+
+impl RgLiterals {
+    fn see(&mut self, c: char) {
+        self.any = true;
+        self.uppercase |= c.is_uppercase();
+    }
+}
+
+impl regex_syntax::ast::Visitor for RgLiterals {
+    type Output = Self;
+    type Err = std::convert::Infallible;
+
+    fn finish(self) -> Result<Self, Self::Err> {
+        Ok(self)
+    }
+
+    fn visit_pre(&mut self, ast: &regex_syntax::ast::Ast) -> Result<(), Self::Err> {
+        if let regex_syntax::ast::Ast::Literal(lit) = ast {
+            self.see(lit.c);
+        }
+        Ok(())
+    }
+
+    fn visit_class_set_item_pre(
+        &mut self,
+        item: &regex_syntax::ast::ClassSetItem,
+    ) -> Result<(), Self::Err> {
+        use regex_syntax::ast::ClassSetItem;
+        match item {
+            ClassSetItem::Literal(lit) => self.see(lit.c),
+            ClassSetItem::Range(range) => {
+                self.see(range.start.c);
+                self.see(range.end.c);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
 /// Parse a terminal command line into a [`SearchCommand`], or `None` if it is
 /// not a recognised search (`rg`/`ripgrep`/`grep`/`egrep`/`fgrep`/`git grep`/
 /// `ag`/`ack`) or carries no pattern.
@@ -89,7 +177,16 @@ pub fn parse_search_command(cmdline: &str) -> Option<SearchCommand> {
     // `-s` means case-sensitive only in rg/ag; GNU grep and ack use it to
     // suppress error messages, and git grep has no such flag at all.
     let dash_s_is_case_sensitive = matches!(prog, "rg" | "ripgrep" | "ag");
-    let mut case_sensitive = false; // rg smart-case & our default: case-insensitive
+    // `-S` is smart case in rg/ag/ack; BSD grep follows symlinks with it.
+    let dash_s_upper_is_smart_case = matches!(prog, "rg" | "ripgrep" | "ag" | "ack");
+    // grep, git grep, rg and ack match case unless told otherwise; only ag
+    // defaults to smart case. Seeding ignore-case instead made Replace All
+    // rewrite `COLOR_DEFAULT` after an `rg color` that never listed it (#922).
+    let mut case = if prog == "ag" {
+        CaseRule::Smart
+    } else {
+        CaseRule::Sensitive
+    };
     let mut whole_word = false;
     let mut include: Option<String> = None;
     let mut exclude: Option<String> = None;
@@ -100,6 +197,8 @@ pub fn parse_search_command(cmdline: &str) -> Option<SearchCommand> {
     let mut types_not: Vec<String> = Vec::new();
     let mut inverted = false;
     let is_rg = matches!(prog, "rg" | "ripgrep");
+    // rg's `-P`/`--pcre2` engine reads smart case its own way.
+    let mut pcre2 = false;
     let mut recursive = !matches!(prog, "grep" | "egrep" | "fgrep");
 
     // Append a glob to one of the panel's comma-separated filter lists.
@@ -139,8 +238,9 @@ pub fn parse_search_command(cmdline: &str) -> Option<SearchCommand> {
                 None => (long, None),
             };
             match name {
-                "ignore-case" | "smart-case" => case_sensitive = false,
-                "case-sensitive" => case_sensitive = true,
+                "ignore-case" => case = CaseRule::Insensitive,
+                "case-sensitive" | "no-ignore-case" => case = CaseRule::Sensitive,
+                "smart-case" => case = CaseRule::Smart,
                 "word-regexp" => whole_word = true,
                 "invert-match" | "files-without-match" | "files-without-matches" => inverted = true,
                 "fixed-strings" => use_regex = false,
@@ -151,6 +251,10 @@ pub fn parse_search_command(cmdline: &str) -> Option<SearchCommand> {
                     }
                 }
                 "extended-regexp" | "perl-regexp" => use_regex = true,
+                "pcre2" => {
+                    use_regex = true;
+                    pcre2 = true;
+                }
                 "regexp" => {
                     let v = take_value(inline_val, &tokens, &mut idx);
                     if pattern.is_none() {
@@ -199,8 +303,9 @@ pub fn parse_search_command(cmdline: &str) -> Option<SearchCommand> {
             let mut ci = 0;
             while ci < chars.len() {
                 match chars[ci] {
-                    'i' | 'S' => case_sensitive = false,
-                    's' if dash_s_is_case_sensitive => case_sensitive = true,
+                    'i' => case = CaseRule::Insensitive,
+                    's' if dash_s_is_case_sensitive => case = CaseRule::Sensitive,
+                    'S' if dash_s_upper_is_smart_case => case = CaseRule::Smart,
                     'w' => whole_word = true,
                     'v' => inverted = true,
                     // rg's `-L` follows symlinks; elsewhere it lists the
@@ -220,7 +325,11 @@ pub fn parse_search_command(cmdline: &str) -> Option<SearchCommand> {
                         }
                         break;
                     }
-                    'E' | 'P' => use_regex = true,
+                    'E' => use_regex = true,
+                    'P' => {
+                        use_regex = true;
+                        pcre2 = true;
+                    }
                     'e' | 'g' => {
                         let rest: String = chars[ci + 1..].iter().collect();
                         let v = if rest.is_empty() {
@@ -280,6 +389,11 @@ pub fn parse_search_command(cmdline: &str) -> Option<SearchCommand> {
     if pattern.is_empty() {
         return None;
     }
+    let case_sensitive = match case {
+        CaseRule::Sensitive => true,
+        CaseRule::Insensitive => false,
+        CaseRule::Smart => smart_case_is_sensitive(prog, &pattern, use_regex && !pcre2),
+    };
     Some(SearchCommand {
         pattern,
         case_sensitive,
@@ -540,7 +654,7 @@ mod tests {
         let c = parse("rg foo").unwrap();
         assert_eq!(c.pattern, "foo");
         assert!(c.use_regex);
-        assert!(!c.case_sensitive);
+        assert!(c.case_sensitive, "rg matches case unless told otherwise");
         assert!(!c.whole_word);
         assert_eq!(c.include, None);
     }
@@ -640,11 +754,85 @@ mod tests {
     #[test]
     fn grep_dash_s_is_not_case_sensitivity() {
         // In GNU grep (and ack) `-s` suppresses error messages; reading it as
-        // rg's case-sensitive flag would seed a search that skips
+        // rg's case-sensitive flag after `-i` would seed a search that skips
         // differently-cased matches the terminal command actually found.
-        assert!(!parse("grep -s Error .").unwrap().case_sensitive);
-        assert!(!parse("grep -rs Error .").unwrap().case_sensitive);
-        assert!(!parse("git grep -s Error").unwrap().case_sensitive);
+        assert!(!parse("grep -is Error .").unwrap().case_sensitive);
+        assert!(!parse("grep -ris Error .").unwrap().case_sensitive);
+        assert!(!parse("git grep -i -s Error").unwrap().case_sensitive);
+        assert!(!parse("ack -is Error").unwrap().case_sensitive);
+    }
+
+    /// #922: grep, rg, git grep and ack match case unless told otherwise, so
+    /// a seed that ignored case listed (and Replace All rewrote)
+    /// `COLOR_DEFAULT` after `rg color`. Only ag defaults to smart case.
+    #[test]
+    fn each_tool_seeds_its_own_default_case() {
+        for cmd in [
+            "rg color",
+            "grep -rn color .",
+            "egrep -r color .",
+            "git grep color",
+            "ack color",
+            "ag Color",
+        ] {
+            assert!(parse(cmd).unwrap().case_sensitive, "{cmd}");
+        }
+        assert!(!parse("ag color").unwrap().case_sensitive);
+    }
+
+    /// `-i` ignores case and `-S` is smart case (ignore it only for an
+    /// all-lowercase pattern); the last of `-i`/`-s`/`-S` wins, as in rg.
+    #[test]
+    fn case_flags_override_the_default_and_the_last_one_wins() {
+        for cmd in [
+            "rg -i color",
+            "rg --ignore-case Color",
+            "grep -rni Color .",
+            "git grep --ignore-case Color",
+            "rg -S color",
+            "rg --smart-case color",
+            "ack -S color",
+            "rg -s -i Color",
+            "ag -i Color",
+        ] {
+            assert!(!parse(cmd).unwrap().case_sensitive, "{cmd}");
+        }
+        for cmd in [
+            "rg -S Color",
+            "rg -i -s color",
+            "rg -i -S Color",
+            "grep -i --no-ignore-case color .",
+            // Negative: grep has no smart case; BSD grep's -S follows links.
+            "grep -rS color .",
+        ] {
+            assert!(parse(cmd).unwrap().case_sensitive, "{cmd}");
+        }
+    }
+
+    /// rg's smart case looks for an uppercase literal in the parsed regex, so
+    /// `\W` and `\pL` don't count but `[A-Z]` and `\x52` do, and a pattern
+    /// with no literal keeps case. ag counts every byte, escapes included.
+    #[test]
+    fn smart_case_reads_the_pattern_the_way_the_tool_does() {
+        for cmd in [
+            r"rg -S '\bcolor\W'",
+            r"rg -S '\pL+color'",
+            r"rg -S '\S+_color'",
+        ] {
+            assert!(!parse(cmd).unwrap().case_sensitive, "{cmd}");
+        }
+        for cmd in [
+            r"rg -S 'colo[A-Z]'",
+            r"rg -S 'colo\x52'",
+            r"rg -S '[[:upper:]]+'",
+            r"rg -SF 'color\W'",
+            // rg -P skips only the letter after a backslash.
+            r"rg -SP '\pLcolor'",
+            r"ag 'color\W'",
+            r"ag 'café'",
+        ] {
+            assert!(parse(cmd).unwrap().case_sensitive, "{cmd}");
+        }
     }
 
     #[test]

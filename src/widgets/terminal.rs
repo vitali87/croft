@@ -337,14 +337,30 @@ struct WipeSniffer {
 /// shorter, and the bound stops a hostile unterminated CSI from growing.
 const WIPE_CARRY_MAX: usize = 64;
 
+/// One destructive clear [`WipeSniffer::scan`] found: the chunk offset just
+/// past its last byte, and whether it erased the primary screen (ED 2),
+/// the scrollback (ED 3) or both (RIS).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Wipe {
+    end: usize,
+    screen: bool,
+    hist: bool,
+}
+
 impl WipeSniffer {
     /// Scan one chunk. `alt` is the terminal's alt-screen state where the
-    /// chunk STARTS. Returns (primary screen wiped, scrollback wiped).
-    fn scan(&mut self, chunk: &[u8], mut alt: bool) -> (bool, bool) {
+    /// chunk STARTS. Returns the primary-screen wipes in it, in order.
+    fn scan(&mut self, chunk: &[u8], mut alt: bool) -> Vec<Wipe> {
         let mut data = std::mem::take(&mut self.carry);
+        // Offsets into `data` are reported against `chunk`: a sequence
+        // carried from the last read ends in this one, never before it.
+        let carried = data.len();
         data.extend_from_slice(chunk);
-        let mut screen = false;
-        let mut hist = false;
+        let mut wipes = Vec::new();
+        let mut wipe = |end: usize, screen: bool, hist: bool| {
+            let end = end.saturating_sub(carried);
+            wipes.push(Wipe { end, screen, hist });
+        };
         let mut i = 0;
         while i < data.len() {
             if data[i] != 0x1b {
@@ -353,13 +369,12 @@ impl WipeSniffer {
             }
             let Some(&next) = data.get(i + 1) else {
                 self.carry = data.split_off(i);
-                return (screen, hist);
+                return wipes;
             };
             match next {
                 // RIS: full reset — everything is gone, back on primary.
                 b'c' => {
-                    screen = true;
-                    hist = true;
+                    wipe(i + 2, true, true);
                     alt = false;
                     i += 2;
                 }
@@ -375,7 +390,7 @@ impl WipeSniffer {
                         if data.len() - i <= WIPE_CARRY_MAX {
                             self.carry = data.split_off(i);
                         }
-                        return (screen, hist);
+                        return wipes;
                     }
                     // CAN/SUB cancel the sequence and an ESC inside an
                     // incomplete CSI begins a NEW escape (VT100) — none may
@@ -387,8 +402,8 @@ impl WipeSniffer {
                     }
                     let params = &data[i + 2..j];
                     match data[j] {
-                        b'J' if params == b"2" && !alt => screen = true,
-                        b'J' if params == b"3" && !alt => hist = true,
+                        b'J' if params == b"2" && !alt => wipe(j + 1, true, false),
+                        b'J' if params == b"3" && !alt => wipe(j + 1, false, true),
                         fin @ (b'h' | b'l') if params.first() == Some(&b'?') => {
                             for p in params[1..].split(|&c| c == b';') {
                                 if p == b"47" || p == b"1047" || p == b"1049" {
@@ -403,7 +418,7 @@ impl WipeSniffer {
                 _ => i += 2,
             }
         }
-        (screen, hist)
+        wipes
     }
 }
 
@@ -508,6 +523,13 @@ pub struct PtyTerminal {
     /// prompt is its own foreground process-group leader, so this is the
     /// value `foreground_is_shell` compares `tcgetpgrp(master)` against.
     shell_pid: Option<i32>,
+    /// The shell's exit once [`Self::poll_exit`] has reported it (#912):
+    /// its exit code, or None when a pane host went away without one.
+    exit: Option<Option<i32>>,
+    /// When the shell was first found reaped with its output still open. A
+    /// background job it left running can hold the pty open for good, so
+    /// the exit is reported after [`EXIT_OUTPUT_GRACE`] all the same.
+    reaped_at: Option<std::time::Instant>,
     /// Process-wide stable identity for this pane, assigned at spawn. Vec
     /// positions shift on close/insert/reorder; anything keying long-lived
     /// state to a pane (the build-diagnostic ownership, #119) uses this.
@@ -805,9 +827,9 @@ struct StoredMark {
 
 /// A finished command as reported by the reader thread at its `133;D`
 /// mark: exit + duration (for the long-command notice) plus the typed
-/// command text (extracted from the B→C mark span while the term lock is
-/// held) and the pane's OSC 7 cwd at finish time — everything the durable
-/// command history records.
+/// command text (read off the B→C mark span at the C mark, before the
+/// command can clear it) and the pane's OSC 7 cwd at finish time —
+/// everything the durable command history records.
 #[derive(Clone, Debug)]
 pub struct FinishedCommand {
     pub exit: Option<i32>,
@@ -828,6 +850,48 @@ pub struct FinishedCommand {
 
 /// Tail cap on [`FinishedCommand::output`].
 pub const FINISHED_OUTPUT_CAP_LINES: usize = 5000;
+
+/// The command a pane is running, from its `133;C` mark to its `133;D`, as
+/// the reader thread follows it. What its [`FinishedCommand`] reports is
+/// pinned here when it starts rather than read back off the grid when it
+/// ends: a command that clears the screen (`clear; make`) has erased the
+/// rows its typed line and its first output sat on by then (#876).
+struct RunningCommand {
+    started: std::time::Instant,
+    /// The typed line, read off the `133;B`→`133;C` span at the C mark.
+    typed: String,
+    /// The first output row, as the grid line and scroll clock reading it
+    /// was recorded at, re-based through the clock when the command ends.
+    /// The C mark's own row to begin with (`133;C` comes right after the
+    /// command's newline, before the program prints anything), and the top
+    /// of the screen once a wipe erases that row.
+    out_line: i32,
+    out_clock: i64,
+}
+
+impl RunningCommand {
+    /// Follow a wipe that just landed, `now` being the clock read right
+    /// after it. Once the first output row is erased, the output that
+    /// survives starts at the top of the screen the wipe left: an ED 2
+    /// erases that row only when it sat blank below the screen's last text
+    /// (alacritty pushes the text into the scrollback), and an ED 3 only
+    /// when it sat in the scrollback it empties.
+    fn follow_wipe(&mut self, wipe: Wipe, now: i64) {
+        let line = self.out_line - (now - self.out_clock) as i32;
+        if (line >= 0 && wipe.screen) || (line < 0 && wipe.hist) {
+            self.out_line = 0;
+            self.out_clock = now;
+        }
+    }
+}
+
+/// Where the reader thread stops the parser inside one read: at a shell
+/// mark, to sample the cursor where it landed, or at a wipe, to move the
+/// running command's output start past it.
+enum ReadStop {
+    Mark(crate::shell_integration::OscEvent),
+    Wipe(Wipe),
+}
 
 /// A finished command derived from the OSC 133 marks: the grid line of the
 /// prompt it was typed at (current coords, negative = scrollback), its exit
@@ -2130,14 +2194,14 @@ impl PtyTerminal {
             // Per-pane monotonic id for captured inline images; the overlay
             // layout key uses it to tell a new picture from a moved one.
             let mut image_seq = 0u64;
-            // Command timing: armed by 133;C, consumed by the next 133;D.
             // Content id of the cursor row after the previous chunk: the
             // rows this chunk touched run from there to the cursor's new
             // id, and each takes the chunk's arrival time (last touch wins,
             // so a row is stamped when its content actually landed, not
             // when the cursor first parked on it).
             let mut prev_stamp_id: i64 = 0;
-            let mut cmd_start: Option<std::time::Instant> = None;
+            // Started by 133;C, finished by the next 133;D.
+            let mut running: Option<RunningCommand> = None;
             let mut buf = [0u8; 65536];
             loop {
                 // A dev-server URL that ended the last read is held back in
@@ -2205,8 +2269,20 @@ impl PtyTerminal {
                             })
                             .collect();
                         let mut t = term_for_thread.lock();
-                        let (screen_wiped, hist_wiped) =
+                        let wipes =
                             wipe_sniffer.scan(&buf[..n], t.mode().contains(TermMode::ALT_SCREEN));
+                        let screen_wiped = wipes.iter().any(|w| w.screen);
+                        let hist_wiped = wipes.iter().any(|w| w.hist);
+                        // The parser also stops at each wipe, so the running
+                        // command's output start is moved right where a
+                        // wipe erased its row, before the scroll clock
+                        // loses count of what scrolls after it (#876).
+                        let mut stops: Vec<(usize, ReadStop)> = osc_events
+                            .into_iter()
+                            .map(|(end, ev)| (end, ReadStop::Mark(ev)))
+                            .chain(wipes.into_iter().map(|w| (w.end, ReadStop::Wipe(w))))
+                            .collect();
+                        stops.sort_by_key(|(end, _)| *end);
                         // Record the WHOLE read, before the OSC split below.
                         // The loop advances the parser per segment and leaves
                         // `done` at the LAST mark, so recording `buf[done..n]`
@@ -2243,9 +2319,19 @@ impl PtyTerminal {
                             let _wants_keyframe = rb.push(at, &buf[..n]);
                         }
                         let mut done = 0usize;
-                        for (end, ev) in osc_events {
+                        for (end, stop) in stops {
                             processor.advance(&mut *t, &buf[done..end]);
                             done = end;
+                            let ev = match stop {
+                                ReadStop::Mark(ev) => ev,
+                                ReadStop::Wipe(w) => {
+                                    if let Some(run) = running.as_mut() {
+                                        let now = clock_for_thread.lock().unwrap().tick(&mut t);
+                                        run.follow_wipe(w, now);
+                                    }
+                                    continue;
+                                }
+                            };
                             use crate::shell_integration::OscEvent as E;
                             match ev {
                                 E::Cwd(p, host) => {
@@ -2285,51 +2371,42 @@ impl PtyTerminal {
                                 | E::CommandStart
                                 | E::CommandEnd(_)) => {
                                     let dur = match &kind {
-                                        E::CommandStart => {
-                                            cmd_start = Some(std::time::Instant::now());
-                                            None
-                                        }
                                         E::CommandEnd(exit) => {
                                             // A finished command's gauge is
                                             // stale even if the program never
                                             // sent the state-0 clear.
                                             *progress_for_thread.lock().unwrap() = None;
-                                            let dur = cmd_start.take().map(|s| s.elapsed());
-                                            if let Some(d) = dur {
+                                            running.take().map(|run| {
+                                                let dur = run.started.elapsed();
                                                 // The typed command text and the
                                                 // shell's cwd travel with the
                                                 // completion so the durable
                                                 // history records context.
-                                                let (cmd, output) = {
-                                                    let now = clock_for_thread
-                                                        .lock()
-                                                        .unwrap()
-                                                        .tick(&mut t);
-                                                    let ms = marks_for_thread.lock().unwrap();
-                                                    (
-                                                        last_command_input_text(&t, &ms, now),
-                                                        last_command_output_text(&t, &ms, now),
-                                                    )
-                                                };
+                                                let now =
+                                                    clock_for_thread.lock().unwrap().tick(&mut t);
+                                                let start =
+                                                    run.out_line - (now - run.out_clock) as i32;
+                                                let output = command_output_text(&t, start);
                                                 let cwd = osc7_for_thread.lock().unwrap().clone();
                                                 let host =
                                                     osc7_host_for_thread.lock().unwrap().clone();
                                                 let _ = finished_tx.send(FinishedCommand {
                                                     exit: *exit,
-                                                    dur: d,
-                                                    cmd,
+                                                    dur,
+                                                    cmd: run.typed,
                                                     cwd,
                                                     host,
                                                     output,
                                                 });
-                                            }
-                                            dur
+                                                dur
+                                            })
                                         }
                                         _ => None,
                                     };
                                     let line_rec = t.grid().cursor.point.line.0;
                                     let clock_rec = clock_for_thread.lock().unwrap().tick(&mut t);
                                     let col_rec = t.grid().cursor.point.column.0;
+                                    let started = matches!(kind, E::CommandStart);
                                     let mut ms = marks_for_thread.lock().unwrap();
                                     if ms.len() >= MARKS_MAX {
                                         let drop_n = ms.len() + 1 - MARKS_MAX;
@@ -2343,6 +2420,17 @@ impl PtyTerminal {
                                         col_rec,
                                         dur,
                                     });
+                                    // Read the typed line now, while it is
+                                    // still on screen: the command may clear
+                                    // it before its 133;D (#876).
+                                    if started {
+                                        running = Some(RunningCommand {
+                                            started: std::time::Instant::now(),
+                                            typed: last_command_input_text(&t, &ms, clock_rec),
+                                            out_line: line_rec,
+                                            out_clock: clock_rec,
+                                        });
+                                    }
                                 }
                             }
                         }
@@ -2491,6 +2579,8 @@ impl PtyTerminal {
             reader_thread: Some(reader_thread),
             reader_shutdown: Some(shutdown_w),
             shell_pid,
+            exit: None,
+            reaped_at: None,
             uid: {
                 static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
                 NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
@@ -3187,9 +3277,51 @@ impl PtyTerminal {
 
     /// Process ID of the shell running inside this terminal, when the
     /// platform exposes one. Used to look up the live cwd so a new split
-    /// inherits the directory the user has `cd`'d into.
+    /// inherits the directory the user has `cd`'d into. None once the shell
+    /// has exited: a reaped pid may already name another process.
     pub fn pid(&self) -> Option<u32> {
-        self.backend.pid()
+        self.backend.pid().filter(|_| self.exit.is_none())
+    }
+
+    /// Notice that the pane's shell has exited (#912): `exit`, Ctrl+D, a
+    /// task that ran `exit 3`. The shell is reaped (it stayed a zombie for
+    /// as long as the pane lived), and once the reader has painted all it
+    /// wrote, the exit goes under its output and the pane is marked
+    /// exited. Returns the exit code the first time only.
+    pub fn poll_exit(&mut self) -> Option<Option<i32>> {
+        if self.exit.is_some() {
+            return None;
+        }
+        let output_closed = self.reader_thread.as_ref().is_none_or(|h| h.is_finished());
+        let code = self.backend.try_exit(output_closed)?;
+        if !output_closed {
+            let since = *self.reaped_at.get_or_insert_with(std::time::Instant::now);
+            if since.elapsed() < EXIT_OUTPUT_GRACE {
+                return None;
+            }
+        }
+        self.exit = Some(code);
+        // A run pane's reader paints its own footer.
+        if !self.run_pane {
+            let footer = match code {
+                Some(c) => format!("\r\n\x1b[2m[Process exited with code {c}]\x1b[22m\r\n"),
+                None => String::from("\r\n\x1b[2m[Process exited]\x1b[22m\r\n"),
+            };
+            Processor::<StdSyncHandler>::new().advance(&mut *self.term.lock(), footer.as_bytes());
+            self.pty_dirty.store(true, Ordering::Release);
+        }
+        Some(code)
+    }
+
+    /// Whether [`Self::poll_exit`] has found the shell exited: the pane
+    /// then takes no input.
+    pub fn has_exited(&self) -> bool {
+        self.exit.is_some()
+    }
+
+    /// Whether this is a `new_running` program pane rather than a shell.
+    pub fn is_run_pane(&self) -> bool {
+        self.run_pane
     }
 
     /// The pane host holding this pane's shell, when one does (#694): what
@@ -4079,8 +4211,12 @@ impl PtyTerminal {
     /// because that is an app reading the tty in raw mode; a missing
     /// foreground group (the brief window after spawn, before the shell
     /// claims the tty) means nothing has grabbed input, so a `cd` is
-    /// still safe. `tcgetpgrp` is identical on macOS and Linux.
+    /// still safe. `tcgetpgrp` is identical on macOS and Linux. A shell
+    /// that has exited (#912) owns nothing.
     pub fn foreground_is_shell(&self) -> bool {
+        if self.exit.is_some() {
+            return false;
+        }
         match (self.backend.process_group_leader(), self.shell_pid) {
             (Some(fg), Some(pid)) => fg == pid,
             _ if self.input_seen => {
@@ -4284,11 +4420,13 @@ enum PaneBackend {
         child: Box<dyn portable_pty::Child + Send + Sync>,
     },
     /// A pane host (#694): the shell outlives croft. `conn` carries input,
-    /// resizes and the kill; the pid comes from the host's greeting.
+    /// resizes and the kill; the pid comes from the host's greeting, and
+    /// `exit` from its notice that the shell ended.
     Hosted {
         conn: Arc<std::sync::Mutex<std::os::unix::net::UnixStream>>,
         socket: std::path::PathBuf,
         pid: Option<u32>,
+        exit: Arc<std::sync::Mutex<Option<i32>>>,
     },
 }
 
@@ -4329,11 +4467,30 @@ impl PaneBackend {
         }
     }
 
+    /// The shell's exit code once it has ended, reaping it on a PTY croft
+    /// holds (#912). A pane host reaps its own shell and sends the code
+    /// before the pane's output closes, so it is read once
+    /// `output_closed`; a host gone without sending one gives `Some(None)`.
+    fn try_exit(&mut self, output_closed: bool) -> Option<Option<i32>> {
+        match self {
+            PaneBackend::Local { child, .. } => {
+                let status = child.try_wait().ok()??;
+                Some(Some(status.exit_code() as i32))
+            }
+            PaneBackend::Hosted { exit, .. } => output_closed.then(|| *exit.lock().unwrap()),
+        }
+    }
+
     /// End the shell: kill and reap it, or ask its host to (which ends the
     /// host too), then drop the connection so the demux thread ends.
     fn end(&mut self) {
         match self {
             PaneBackend::Local { child, .. } => {
+                // A shell already reaped is never signalled: its pid may
+                // name another process by now.
+                if matches!(child.try_wait(), Ok(Some(_))) {
+                    return;
+                }
                 let _ = child.kill();
                 let _ = child.wait();
             }
@@ -4509,6 +4666,10 @@ impl PaneLink {
         let mut frames = FrameReader::new();
         let mut pending: Vec<u8> = Vec::new();
         let mut pid = None;
+        // A shell that exits while it attaches can have its exit arrive in
+        // the same read as the greeting (#912): kept, not dropped with the
+        // frames the greeting has no use for.
+        let mut greeting_exit = None;
         let mut buf = [0u8; 65536];
         while pid.is_none() {
             let n = rd
@@ -4519,14 +4680,18 @@ impl PaneLink {
                 match frame {
                     Frame::Control(Control::PaneInfo { pid: p }) => pid = Some(p),
                     Frame::Bytes(b) => pending.extend_from_slice(&b),
+                    Frame::Control(Control::Exit { code }) => greeting_exit = Some(code),
                     _ => {}
                 }
             }
         }
         rd.set_read_timeout(None)?;
         let (pipe_r, mut pipe_w) = std::io::pipe().context("pane host pipe")?;
+        let exited = greeting_exit.is_some();
+        let exit = Arc::new(std::sync::Mutex::new(greeting_exit));
+        let exit_for_demux = exit.clone();
         std::thread::spawn(move || {
-            if pipe_w.write_all(&pending).is_err() {
+            if pipe_w.write_all(&pending).is_err() || exited {
                 return;
             }
             let mut buf = [0u8; 65536];
@@ -4542,7 +4707,10 @@ impl PaneLink {
                                 return;
                             }
                         }
-                        Frame::Control(Control::Exit { .. }) => return,
+                        Frame::Control(Control::Exit { code }) => {
+                            *exit_for_demux.lock().unwrap() = Some(code);
+                            return;
+                        }
                         _ => {}
                     }
                 }
@@ -4558,6 +4726,7 @@ impl PaneLink {
                 conn,
                 socket: socket.to_path_buf(),
                 pid,
+                exit,
             },
         })
     }
@@ -4594,6 +4763,11 @@ fn wait_pty_readable(
 /// How long the reader waits for more output before sending a held-back
 /// dev-server URL as it stands.
 const PORT_URL_SETTLE_MS: i32 = 150;
+
+/// How long a pane whose shell was reaped waits for its output to close
+/// before reporting the exit anyway: on Linux a background job the shell
+/// left running keeps the pty open (see [`wait_pty_readable`]).
+const EXIT_OUTPUT_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// What [`poll_pty`] saw.
 #[derive(Debug, PartialEq, Eq)]
@@ -4983,29 +5157,11 @@ fn without_continuation_prompts(text: &str) -> String {
     out
 }
 
-/// The finished command's OUTPUT: the rows between the newest `133;C` mark
-/// and the row the cursor sits on as its `133;D` arrives (exclusive — that
-/// row is the D mark's own). Escape-free (the grid never stores escapes),
-/// tail-capped at [`FINISHED_OUTPUT_CAP_LINES`].
-fn last_command_output_text(
-    term: &Term<VoidListener>,
-    marks: &[StoredMark],
-    clock_now: i64,
-) -> String {
-    use crate::shell_integration::OscEvent as E;
-    let Some(c) = marks
-        .iter()
-        .rev()
-        .find(|m| matches!(m.kind, E::CommandStart))
-    else {
-        return String::new();
-    };
-    // The C mark was recorded when the command STARTED: everything the
-    // command printed has scrolled the grid since, so its recorded line is
-    // re-based through the scroll clock exactly like the input extractor.
-    // The mark's own row is the FIRST output row — `133;C` is emitted right
-    // after the command's newline, before the program prints anything.
-    let start = c.line_rec - (clock_now - c.clock_rec) as i32;
+/// The finished command's OUTPUT: the rows from `start`, its first output
+/// row in current grid coordinates, to the row the cursor sits on as its
+/// `133;D` arrives. Escape-free (the grid never stores escapes), tail-capped
+/// at [`FINISHED_OUTPUT_CAP_LINES`].
+fn command_output_text(term: &Term<VoidListener>, start: i32) -> String {
     // The cursor row is INCLUDED: `133;D` moves no cursor, so a diagnostic
     // printed without a trailing newline leaves the mark ON that row — the
     // old `- 1` dropped exactly the line the matchers needed. With a
@@ -6928,6 +7084,65 @@ mod tests {
         assert!(
             r < 0,
             "the shell was left as an unreaped zombie (waitpid still found it: r={r})"
+        );
+    }
+
+    /// #912: a hosted shell that exits while croft attaches can have its
+    /// exit arrive in the same read as the greeting. Its code is kept, and
+    /// the output before it still reaches the pane.
+    #[test]
+    fn an_exit_in_the_pane_hosts_greeting_keeps_its_code() {
+        use crate::session_host::{Control, encode_bytes_frame, encode_control_frame};
+        use std::io::{Read, Write};
+        let tmp = tempfile::tempdir().unwrap();
+        let socket = tmp.path().join("pane.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let host = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut hello = [0u8; 512];
+            let _ = conn.read(&mut hello);
+            let mut greeting = encode_control_frame(&Control::PaneInfo { pid: 4242 });
+            greeting.extend(encode_bytes_frame(b"bye\r\n"));
+            greeting.extend(encode_control_frame(&Control::Exit { code: 7 }));
+            conn.write_all(&greeting).unwrap();
+        });
+        let mut link = PaneLink::attach(&socket, 80, 24).unwrap();
+        host.join().unwrap();
+        let mut out = Vec::new();
+        link.reader.read_to_end(&mut out).unwrap();
+        assert_eq!(out, b"bye\r\n");
+        assert_eq!(link.backend.try_exit(true), Some(Some(7)));
+    }
+
+    /// #912: a shell that exits while its pane lives is reaped then, not
+    /// left a zombie until the pane is dropped, and its exit code goes
+    /// under its output.
+    #[test]
+    fn a_shell_that_exits_is_reaped_and_its_exit_code_shown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut term = PtyTerminal::new(tmp.path()).unwrap();
+        let pid = term.pid().expect("spawned shell has a pid") as i32;
+        term.write_input(b"exit 3\n");
+        let mut code = None;
+        crate::test_budget::await_spawned(
+            std::time::Duration::from_millis(1500),
+            "the pane to notice its shell exited",
+            || {
+                code = term.poll_exit();
+                code.is_some()
+            },
+        );
+        assert_eq!(code, Some(Some(3)));
+        assert!(term.has_exited());
+        assert_eq!(term.poll_exit(), None, "the exit is reported once");
+        let mut status = 0i32;
+        let r = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+        assert!(r < 0, "the exited shell is still a zombie (r={r})");
+        assert_eq!(term.pid(), None, "a reaped pid may name another process");
+        let text = term.visible_text();
+        assert!(
+            text.contains("[Process exited with code 3]"),
+            "no exit footer:\n{text}"
         );
     }
 
@@ -10261,13 +10476,54 @@ mod tests {
     fn a_cancelled_csi_does_not_hide_a_wipe_from_the_sniffer() {
         let mut w = WipeSniffer::default();
         // ESC inside an incomplete CSI: the ED 3 after it must be seen.
-        let (_s, h) = w.scan(b"\x1b[12\x1b[3J", false);
-        assert!(h, "ESC-in-CSI swallowed the scrollback wipe");
+        let wipes = w.scan(b"\x1b[12\x1b[3J", false);
+        assert!(
+            wipes.iter().any(|w| w.hist),
+            "ESC-in-CSI swallowed the scrollback wipe"
+        );
         // CAN aborts; the alt entry after it must be seen, so the ED 2
         // inside the alt screen is correctly ignored.
         let mut w = WipeSniffer::default();
-        let (s, _h) = w.scan(b"\x1b[\x18\x1b[?1049h\x1b[2J", false);
-        assert!(!s, "CAN-cancelled CSI hid the alt entry from the sniffer");
+        let wipes = w.scan(b"\x1b[\x18\x1b[?1049h\x1b[2J", false);
+        assert!(
+            wipes.is_empty(),
+            "CAN-cancelled CSI hid the alt entry from the sniffer"
+        );
+    }
+
+    /// #876: each wipe is reported where it ends in the chunk, a sequence
+    /// split across reads included, so the reader can stop the parser
+    /// right there.
+    #[test]
+    fn the_wipe_sniffer_reports_where_each_wipe_ends() {
+        let mut w = WipeSniffer::default();
+        let wipes = w.scan(b"ab\x1b[2J\x1b[3", false);
+        assert_eq!(
+            wipes,
+            vec![Wipe {
+                end: 6,
+                screen: true,
+                hist: false
+            }]
+        );
+        let wipes = w.scan(b"Jx\x1b", false);
+        assert_eq!(
+            wipes,
+            vec![Wipe {
+                end: 1,
+                screen: false,
+                hist: true
+            }]
+        );
+        let wipes = w.scan(b"c", false);
+        assert_eq!(
+            wipes,
+            vec![Wipe {
+                end: 1,
+                screen: true,
+                hist: true
+            }]
+        );
     }
 
     /// `clear && vim`: the wipe and the alt-screen entry land in ONE PTY
@@ -11178,6 +11434,70 @@ mod tests {
             "the output block must ride the completion; got {:?}",
             f.output
         );
+    }
+
+    /// Run `script` under `/bin/sh` in a pane and return the first `n`
+    /// commands its marks finish.
+    fn finished_commands(script: &str, n: usize) -> Vec<FinishedCommand> {
+        let tmp = tempfile::tempdir().unwrap();
+        let term =
+            PtyTerminal::new_running("/bin/sh", &[String::from("-c"), script.into()], tmp.path())
+                .unwrap();
+        let mut finished = Vec::new();
+        crate::test_budget::await_spawned(
+            std::time::Duration::from_millis(1500),
+            "the script's 133;D marks",
+            || {
+                finished.extend(term.drain_finished_commands());
+                finished.len() >= n
+            },
+        );
+        finished
+    }
+
+    /// #876: `clear` erases the rows the typed command and its output were
+    /// read back from at `133;D`, so the history, the build matchers and
+    /// the run notices all got an empty command. A full reset (`reset`,
+    /// RIS) erases them in place, without scrolling, so the output start
+    /// has to move to the top of the screen.
+    #[test]
+    fn a_command_that_clears_the_screen_keeps_its_text_and_output() {
+        let script = "printf '\\033]133;A\\007$ \\033]133;B\\007clear; echo hi\\n\\033]133;C\\007\\033[H\\033[2J\\033[3Jhi\\n\\033]133;D;0\\007\\033]133;A\\007$ \\033]133;B\\007echo bye; clear\\n\\033]133;C\\007bye\\n\\033[H\\033[2J\\033[3J\\033]133;D;0\\007\\033]133;A\\007$ \\033]133;B\\007reset; echo again\\n\\033]133;C\\007\\033cagain\\n\\033]133;D;0\\007'";
+        let f = finished_commands(script, 3);
+        assert_eq!(f[0].cmd, "clear; echo hi");
+        assert_eq!(f[0].output, "hi");
+        assert_eq!(f[1].cmd, "echo bye; clear");
+        assert_eq!(f[1].output, "", "the clear erased the output");
+        assert_eq!(f[2].cmd, "reset; echo again");
+        assert_eq!(f[2].output, "again");
+    }
+
+    /// #876: a clear in its own read, after an earlier command whose marks
+    /// survive in the scrollback (ED 2 alone pushes the screen there), must
+    /// not hand the earlier command's text or output to this one.
+    #[test]
+    fn a_clear_in_its_own_read_does_not_pick_up_the_previous_command() {
+        let script = "printf '\\033]133;A\\007$ \\033]133;B\\007echo one\\n\\033]133;C\\007one\\n\\033]133;D;0\\007\\033]133;A\\007$ \\033]133;B\\007clear; echo two\\n\\033]133;C\\007'; sleep 0.3; printf '\\033[H\\033[2J'; sleep 0.3; printf 'two\\n\\033]133;D;0\\007'";
+        let f = finished_commands(script, 2);
+        assert_eq!(
+            (f[0].cmd.as_str(), f[0].output.as_str()),
+            ("echo one", "one")
+        );
+        assert_eq!(
+            (f[1].cmd.as_str(), f[1].output.as_str()),
+            ("clear; echo two", "two")
+        );
+    }
+
+    /// #876: output that scrolls past the screen right after a clear, in
+    /// the same read, is captured from its first line.
+    #[test]
+    fn output_scrolling_after_a_clear_is_captured_whole() {
+        let script = "printf '\\033]133;A\\007$ \\033]133;B\\007clear; seq 60\\n\\033]133;C\\007\\033[H\\033[2J\\033[3J%s\\n\\033]133;D;0\\007' \"$(seq 60)\"";
+        let f = finished_commands(script, 1);
+        assert_eq!(f[0].cmd, "clear; seq 60");
+        let want: Vec<String> = (1..=60).map(|i| i.to_string()).collect();
+        assert_eq!(f[0].output, want.join("\n"));
     }
 
     /// Run `typed` as the input between a `133;B` and `133;C` mark, and

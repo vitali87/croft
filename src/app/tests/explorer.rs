@@ -2534,6 +2534,40 @@ fn delete_filters_workspace_roots_out_of_a_mixed_selection() {
 }
 
 #[test]
+fn answering_no_to_the_trash_confirm_keeps_the_file() {
+    // #855: the confirm was a text field prefilled with `trash`. Clearing it
+    // and typing `no` read as an answer, yet Enter trashed the file anyway.
+    // It is a yes/no question now: typing and pasting go nowhere, and N
+    // keeps the file.
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("scratch.py");
+    std::fs::write(&file, "x\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Tree);
+
+    app.delete_paths(vec![file.clone()]);
+    for _ in 0..5 {
+        app.handle_key(key(KeyCode::Backspace, KeyModifiers::NONE))
+            .unwrap();
+    }
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
+        .unwrap();
+    app.handle_paste("no");
+    app.handle_key(key(KeyCode::Char('y'), KeyModifiers::CONTROL))
+        .unwrap();
+    let prompt = app
+        .input_prompt
+        .as_ref()
+        .expect("keys that do not answer leave the question up");
+    assert_eq!(prompt.value, "", "nothing typed or pasted lands in it");
+
+    app.handle_key(key(KeyCode::Char('n'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.input_prompt.is_none(), "N answers no");
+    assert!(file.exists(), "the file stays where it was");
+}
+
+#[test]
 fn a_markdown_file_opened_from_the_explorer_scrolls_its_preview() {
     let tmp = tempfile::tempdir().unwrap();
     let body: String = (0..200).map(|i| format!("line {i}\n")).collect();

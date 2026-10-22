@@ -867,6 +867,65 @@ fn an_external_write_reloads_a_tab_in_an_inactive_split_group() {
     }
 }
 
+/// #908: what the language servers hear for a directory renamed away, a
+/// file saved by renaming a temporary file over it, and a file moved into
+/// a new place. The watcher reports the directory alone, so the files it
+/// held come from the Quick Open index as it was; and the rename onto a
+/// file the index knew is a change, or a server watching changes only
+/// would never hear of the save.
+#[test]
+fn watched_file_events_cover_a_moved_directory_and_an_atomic_save() {
+    use crate::app::fs_watch::watched_file_changes;
+    use lsp_types::FileChangeType;
+    use notify::Event as NotifyEvent;
+    use notify::event::{EventKind, ModifyKind, RenameMode};
+    use notify_debouncer_full::DebouncedEvent;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("old/sub")).unwrap();
+    for f in ["old/a.rs", "old/sub/b.rs", "old2.rs", "lib.rs"] {
+        std::fs::write(root.join(f), "x").unwrap();
+    }
+    let index = crate::widgets::file_finder::build_file_index(root);
+    let mut app = App::new(root.to_path_buf()).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.fs_watch.set_test_events(rx);
+    std::fs::rename(root.join("old"), root.join("new")).unwrap();
+    std::fs::write(root.join("fresh.rs"), "y").unwrap();
+    let rename = |mode, paths: &[&str]| {
+        let mut ev = NotifyEvent::new(EventKind::Modify(ModifyKind::Name(mode)));
+        for p in paths {
+            ev = ev.add_path(root.join(p));
+        }
+        DebouncedEvent::new(ev, std::time::Instant::now())
+    };
+    tx.send(Ok(vec![
+        rename(RenameMode::Both, &["old", "new"]),
+        rename(RenameMode::To, &["lib.rs"]),
+        rename(RenameMode::To, &["fresh.rs"]),
+    ]))
+    .unwrap();
+    let drain = app.fs_watch.drain(&mut app.tree, &app.editor);
+    let got = watched_file_changes(&drain, &index);
+    let typ = |rel: &str| {
+        let path = root.join(rel);
+        got.iter().find(|(p, _)| *p == path).map(|(_, t)| *t)
+    };
+    assert_eq!(
+        typ("lib.rs"),
+        Some(FileChangeType::CHANGED),
+        "an atomic save"
+    );
+    assert_eq!(typ("fresh.rs"), Some(FileChangeType::CREATED));
+    assert_eq!(typ("old/a.rs"), Some(FileChangeType::DELETED));
+    assert_eq!(typ("old/sub/b.rs"), Some(FileChangeType::DELETED));
+    assert_eq!(
+        typ("old2.rs"),
+        None,
+        "a sibling sharing the prefix is not in it"
+    );
+}
+
 /// Watcher backends on Linux fire `Access(...)` events when croft (or any
 /// other process) reads the open file — the inotify subsystem does not
 /// distinguish a benign read from a real content change. Treating those
@@ -907,6 +966,63 @@ fn drain_fs_events_preserves_editor_selection_on_access_only_event() {
     assert!(
         app.editor.selection.is_some(),
         "Access(Read) on the open file must not clobber editor selection"
+    );
+}
+
+/// #898: inotify reports every open, so croft's own reads (the Explorer
+/// listing the root, `git status` opening the files in it) came back as
+/// events that re-listed the tree and re-ran git, about twice a second, for
+/// as long as croft sat idle. A read-only access must leave `drain` with
+/// nothing to do, while a close after writing still counts, since the file
+/// it closed may now hold new content.
+#[test]
+fn drain_ignores_read_only_access_events_from_croft_s_own_reads() {
+    use notify::Event as NotifyEvent;
+    use notify::event::{AccessKind, AccessMode, EventKind};
+    use notify_debouncer_full::DebouncedEvent;
+    use std::sync::mpsc;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    let file = root.join("x.txt");
+    std::fs::write(&file, "x\n").unwrap();
+    let mut app = App::new(root.clone()).unwrap();
+    let (tx, rx) = mpsc::channel();
+    app.fs_watch.set_test_events(rx);
+
+    let now = std::time::Instant::now();
+    let access = |kind: AccessKind, path: &std::path::Path| {
+        let event = NotifyEvent::new(EventKind::Access(kind)).add_path(path.to_path_buf());
+        DebouncedEvent::new(event, now)
+    };
+    tx.send(Ok(vec![
+        access(AccessKind::Open(AccessMode::Any), &root),
+        access(AccessKind::Close(AccessMode::Read), &root),
+        access(AccessKind::Open(AccessMode::Any), &file),
+        access(AccessKind::Read, &file),
+        access(AccessKind::Close(AccessMode::Read), &file),
+    ]))
+    .unwrap();
+    let drained = app.fs_watch.drain(&mut app.tree, &app.editor);
+    assert!(
+        !drained.got_any,
+        "reading the root and a file in it is not a change"
+    );
+    assert!(
+        !drained.dirs_changed,
+        "so it must not re-list the tree or re-run git status"
+    );
+    assert!(!drained.finder_relevant, "nor rebuild the Quick Open index");
+
+    tx.send(Ok(vec![access(
+        AccessKind::Close(AccessMode::Write),
+        &file,
+    )]))
+    .unwrap();
+    let drained = app.fs_watch.drain(&mut app.tree, &app.editor);
+    assert!(
+        drained.got_any && drained.dirs_changed,
+        "a close after writing may mean new content, so it still counts"
     );
 }
 
@@ -2390,6 +2506,60 @@ fn a_failed_external_reload_reports_in_the_status_line() {
         app.editor.lines[0], "one",
         "the last good buffer survives the failed reload"
     );
+    // #900: reported once, not re-posted over every later status.
+    app.status = String::from("Saved g.txt");
+    assert!(!app.reload_open_file_after_external_change());
+    assert_eq!(app.status, "Saved g.txt");
+}
+
+/// #900: a sweep that finds one tab's file deleted and another's reload
+/// failing says both. The failure is reported only once, so a status naming
+/// just the deletion would hide the stale tab for good.
+#[test]
+fn a_deletion_and_a_failed_reload_in_one_sweep_are_both_reported() {
+    let tmp = tempfile::tempdir().unwrap();
+    let gone = tmp.path().join("gone.txt");
+    let bad = tmp.path().join("bad.txt");
+    std::fs::write(&gone, "a\n").unwrap();
+    std::fs::write(&bad, "b\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&gone).unwrap();
+    app.editor.open_pinned(&bad).unwrap();
+    std::fs::remove_file(&gone).unwrap();
+    std::fs::remove_file(&bad).unwrap();
+    std::fs::create_dir(&bad).unwrap();
+    assert!(app.reload_open_file_after_external_change());
+    assert_eq!(
+        app.status,
+        "gone.txt was deleted on disk; save to recreate it; \
+         reload failed for bad.txt, keeping its last good view"
+    );
+}
+
+/// #900: a tab whose file was deleted on disk said "Reload failed" on every
+/// FS sweep, hiding every other status for the rest of the session, and
+/// with unsaved edits it opened the "changed on disk" modal and refused the
+/// first save. Now: said once, as a deletion, and one save recreates it.
+#[test]
+fn a_file_deleted_on_disk_is_reported_once_and_one_save_recreates_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "notes.txt", "alpha\n");
+    let f = tmp.path().join("notes.txt");
+    app.editor.insert_char('x');
+    std::fs::remove_file(&f).unwrap();
+    assert!(app.reload_open_file_after_external_change());
+    assert_eq!(
+        app.status,
+        "notes.txt was deleted on disk; save to recreate it"
+    );
+    assert!(app.input_prompt.is_none(), "nothing to reload: no modal");
+    app.status = String::from("Deleted 1 line");
+    assert!(!app.reload_open_file_after_external_change());
+    assert_eq!(app.status, "Deleted 1 line", "a later status stays visible");
+    app.save();
+    assert_eq!(std::fs::read_to_string(&f).unwrap(), "xalpha\n");
+    assert!(!app.editor.dirty);
+    assert!(app.status.starts_with("Saved"), "{}", app.status);
 }
 
 #[test]

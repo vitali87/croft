@@ -649,7 +649,7 @@ impl Prefs {
     pub fn load(path: &Path) -> Result<Self> {
         let json =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        Self::parse(&json).context("parsing prefs")
+        Self::parse(&json).with_context(|| format!("parsing {}", path.display()))
     }
 
     /// Parse a `config.json`, which is JSONC like every other settings file
@@ -744,7 +744,7 @@ impl Prefs {
 }
 
 /// Persist `theme` to the config file, preserving any other settings already
-/// stored. Best-effort: a write failure is swallowed by the caller.
+/// stored. The caller says on the status line when it fails.
 pub fn save_theme(theme: Theme) -> Result<()> {
     let path = config_path();
     let mut prefs = Prefs::load_for_update(&path)?;
@@ -753,7 +753,7 @@ pub fn save_theme(theme: Theme) -> Result<()> {
 }
 
 /// Persist the on-screen keyboard split choice, preserving other settings.
-/// Best-effort: a write failure is swallowed by the caller.
+/// The caller says on the status line when it fails.
 pub fn save_osk_split(split: bool) -> Result<()> {
     let path = config_path();
     let mut prefs = Prefs::load_for_update(&path)?;
@@ -762,7 +762,7 @@ pub fn save_osk_split(split: bool) -> Result<()> {
 }
 
 /// Persist the "don't warn about this terminal again" choice, preserving
-/// other settings. Best-effort: a write failure is swallowed by the caller.
+/// other settings. The caller says on the status line when it fails.
 pub fn save_suppress_terminal_warning(suppress: bool) -> Result<()> {
     let path = config_path();
     let mut prefs = Prefs::load_for_update(&path)?;
@@ -771,7 +771,7 @@ pub fn save_suppress_terminal_warning(suppress: bool) -> Result<()> {
 }
 
 /// Persist the Explorer sub-view visibility set, preserving other settings.
-/// Best-effort: a write failure is swallowed by the caller.
+/// The caller says on the status line when it fails.
 pub fn save_explorer_views(views: ExplorerViewsPrefs) -> Result<()> {
     let path = config_path();
     let mut prefs = Prefs::load_for_update(&path)?;
@@ -1161,7 +1161,7 @@ fn prefs_file_in(config_dir: &Path) -> PathBuf {
 }
 
 /// Persist the set of disabled extension ids, preserving other settings.
-/// Best-effort: a write failure is swallowed by the caller.
+/// The caller says on the status line when it fails.
 pub fn save_disabled_extensions_in(config_dir: &Path, disabled: &BTreeSet<String>) -> Result<()> {
     let path = prefs_file_in(config_dir);
     let mut prefs = Prefs::load_for_update(&path)?;
@@ -1241,7 +1241,7 @@ pub fn forget_mcp_tool_fingerprints_in(config_dir: &Path, command_ids: &[String]
 }
 
 /// Persist the Customize Layout chrome choices, preserving other settings.
-/// Best-effort: a write failure is swallowed by the caller.
+/// The caller says on the status line when it fails.
 pub fn save_layout(layout: LayoutPrefs) -> Result<()> {
     let path = config_path();
     let mut prefs = Prefs::load_for_update(&path)?;
@@ -1251,7 +1251,7 @@ pub fn save_layout(layout: LayoutPrefs) -> Result<()> {
 
 /// Persist the auto-close-pairs choice, preserving other settings. Stored
 /// negated (`disable_auto_close_pairs`) so an absent key means enabled.
-/// Best-effort: a write failure is swallowed by the caller.
+/// The caller says on the status line when it fails.
 pub fn save_auto_close_pairs(enabled: bool) -> Result<()> {
     let path = config_path();
     let mut prefs = Prefs::load_for_update(&path)?;
@@ -1268,7 +1268,7 @@ pub fn save_screen_reader(enabled: bool) -> Result<()> {
 }
 
 /// Persist the format-on-type choice, preserving other settings.
-/// Best-effort: a write failure is swallowed by the caller.
+/// The caller says on the status line when it fails.
 pub fn save_format_on_type(enabled: bool) -> Result<()> {
     let path = config_path();
     let mut prefs = Prefs::load_for_update(&path)?;
@@ -1276,8 +1276,8 @@ pub fn save_format_on_type(enabled: bool) -> Result<()> {
     prefs.save(&path)
 }
 
-/// Persist the format-on-save choice, preserving other settings. Best-effort:
-/// a write failure is swallowed by the caller.
+/// Persist the format-on-save choice, preserving other settings. The caller
+/// says on the status line when it fails.
 pub fn save_format_on_save(enabled: bool) -> Result<()> {
     let path = config_path();
     let mut prefs = Prefs::load_for_update(&path)?;
@@ -1325,8 +1325,8 @@ pub fn terminal_scrollback_lines(configured: usize, default: usize) -> usize {
     }
 }
 
-/// Persist the auto-save choice, preserving other settings. Best-effort:
-/// a write failure is swallowed by the caller.
+/// Persist the auto-save choice, preserving other settings. The caller
+/// says on the status line when it fails.
 pub fn save_auto_save(enabled: bool) -> Result<()> {
     let path = config_path();
     let mut prefs = Prefs::load_for_update(&path)?;

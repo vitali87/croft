@@ -1628,6 +1628,64 @@ esac
     });
 }
 
+/// #917: a PR review that cannot load because gh is missing or signed out
+/// says how to fix that, not "No such file or directory (os error 2)".
+#[test]
+fn a_pr_review_without_a_usable_gh_says_how_to_fix_it() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let signed_out = tmp.path().join("signed-out-gh");
+    std::fs::write(&signed_out, "#!/bin/sh\necho 'gh auth login' >&2\nexit 4\n").unwrap();
+    std::fs::set_permissions(&signed_out, std::fs::Permissions::from_mode(0o755)).unwrap();
+    for (gh, why) in [
+        (tmp.path().join("gh"), crate::gh::MISSING),
+        (signed_out, crate::gh::SIGNED_OUT),
+    ] {
+        app.review_gh = gh.display().to_string();
+        app.submit_pr_number("42");
+        crate::test_budget::await_spawned(std::time::Duration::from_secs(5), "gh pr view", || {
+            app.poll_pr_gh();
+            app.pr_gh.is_none()
+        });
+        assert_eq!(app.status, format!("Could not load PR 42: {why}"));
+    }
+}
+
+/// #917: Review: Add Comment and Submit Review look the PR up on the UI
+/// thread; a missing or signed-out gh says how to fix it there too, not
+/// that the branch has no PR.
+#[test]
+fn the_review_comment_pr_lookup_without_a_usable_gh_says_how_to_fix_it() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let signed_out = tmp.path().join("signed-out-gh");
+    std::fs::write(&signed_out, "#!/bin/sh\nexit 4\n").unwrap();
+    std::fs::set_permissions(&signed_out, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let no_pr = tmp.path().join("no-pr-gh");
+    std::fs::write(&no_pr, "#!/bin/sh\nexit 1\n").unwrap();
+    std::fs::set_permissions(&no_pr, std::fs::Permissions::from_mode(0o755)).unwrap();
+    for (gh, status) in [
+        (
+            tmp.path().join("gh"),
+            format!("Could not find this branch's PR: {}", crate::gh::MISSING),
+        ),
+        (
+            signed_out,
+            format!("Could not find this branch's PR: {}", crate::gh::SIGNED_OUT),
+        ),
+        (
+            no_pr,
+            String::from("No PR for this branch — check it out first"),
+        ),
+    ] {
+        app.review_gh = gh.display().to_string();
+        assert_eq!(app.review_pr_number(tmp.path()), None);
+        assert_eq!(app.status, status);
+    }
+}
+
 /// Load x/y#42 through `gh` and wait for its viewed-state read to settle.
 fn open_synced_pr(app: &mut App) {
     app.submit_pr_number("42");

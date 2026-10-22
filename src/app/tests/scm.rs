@@ -2661,6 +2661,134 @@ fn cmd_s_with_single_selection_stages_only_that_entry() {
     );
 }
 
+/// #871: `seed.txt` changed and `scratch.txt` untracked, Source Control
+/// open on them.
+fn scm_with_two_changes() -> (tempfile::TempDir, App) {
+    let tmp = make_committed_repo();
+    std::fs::write(tmp.path().join("seed.txt"), b"changed\n").unwrap();
+    std::fs::write(tmp.path().join("scratch.txt"), b"new\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    wait_for_changes(&mut app, |a| a.source_control.entries.len() >= 2);
+    app.set_sidebar_view(SidebarView::SourceControl);
+    (tmp, app)
+}
+
+fn scm_kind_of(app: &App, path: &str) -> Option<crate::git::ChangeKind> {
+    let entries = &app.source_control.entries;
+    entries.iter().find(|e| e.path == path).map(|e| e.kind)
+}
+
+/// #871: Down from the message box steps into the change list, arrows move
+/// the selection, and Enter opens that row's diff. Down used to scroll the
+/// panel and Enter to commit ("Empty commit message").
+#[test]
+fn arrows_and_enter_in_source_control_open_the_selected_changes_diff() {
+    let (_tmp, mut app) = scm_with_two_changes();
+    for code in [KeyCode::Down, KeyCode::Down, KeyCode::Up, KeyCode::Enter] {
+        app.handle_key(key(code, KeyModifiers::NONE)).unwrap();
+    }
+    let diff = app.editor.diff.as_ref().expect("Enter opens a diff");
+    assert!(
+        diff.right_path.ends_with("seed.txt"),
+        "{:?}",
+        diff.right_path
+    );
+    assert!(app.focus == Pane::Editor);
+}
+
+/// #871: in the list `s` stages the selected row, `u` unstages it and `d`
+/// asks before discarding it, each staying on the file it moved.
+#[test]
+fn list_keys_stage_unstage_and_discard_the_selected_change() {
+    use crate::git::ChangeKind;
+    let (tmp, mut app) = scm_with_two_changes();
+    for code in [KeyCode::Tab, KeyCode::Down, KeyCode::Char('s')] {
+        app.handle_key(key(code, KeyModifiers::NONE)).unwrap();
+    }
+    assert!(wait_for_changes(&mut app, |a| {
+        scm_kind_of(a, "scratch.txt") == Some(ChangeKind::StagedAdded)
+    }));
+    assert_eq!(scm_kind_of(&app, "seed.txt"), Some(ChangeKind::Modified));
+    app.handle_key(key(KeyCode::Char('u'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(wait_for_changes(&mut app, |a| {
+        scm_kind_of(a, "scratch.txt") == Some(ChangeKind::Untracked)
+    }));
+    app.handle_key(key(KeyCode::Char('d'), KeyModifiers::NONE))
+        .unwrap();
+    let pending = app.pending_discard.as_ref().expect("d asks first");
+    assert_eq!(pending.rel_path, "scratch.txt");
+    assert!(tmp.path().join("scratch.txt").exists());
+    assert!(app.source_control.message.is_empty(), "no key was typed");
+}
+
+/// #871: a partly staged file has a row in Staged and one in Changes; `s`
+/// on the Staged row and `u` on the Changes row leave both halves where
+/// they are, as the mouse's row actions do, instead of `git add` or `git
+/// reset` on the whole file.
+#[test]
+fn list_keys_keep_a_partly_staged_files_halves_apart() {
+    use crate::git::ChangeSection;
+    let tmp = make_committed_repo();
+    let git_ok = |args: &[&str]| {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(tmp.path())
+            .args(args)
+            .status()
+            .unwrap()
+            .success()
+    };
+    std::fs::write(tmp.path().join("seed.txt"), b"staged\n").unwrap();
+    assert!(git_ok(&["add", "seed.txt"]));
+    std::fs::write(tmp.path().join("seed.txt"), b"staged\nunstaged\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    wait_for_changes(&mut app, |a| a.source_control.entries.len() >= 2);
+    app.set_sidebar_view(SidebarView::SourceControl);
+    app.handle_key(key(KeyCode::Tab, KeyModifiers::NONE))
+        .unwrap();
+    let row = |app: &App, section| {
+        let entries = &app.source_control.entries;
+        entries.iter().position(|e| e.kind.section() == section)
+    };
+    app.source_control.selected_change = row(&app, ChangeSection::Staged);
+    app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(!git_ok(&["diff", "--quiet"]), "s staged the unstaged half");
+    app.source_control.selected_change = row(&app, ChangeSection::Changes);
+    app.handle_key(key(KeyCode::Char('u'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(
+        !git_ok(&["diff", "--cached", "--quiet"]),
+        "u unstaged the staged half"
+    );
+}
+
+/// #871: the Commit button's and menus' actions are on the palette, so
+/// they need no click: Git: Checkout to… opens the branch picker, Git:
+/// Stash asks for a name, and Git: Commit commits the message.
+#[test]
+fn git_checkout_stash_and_commit_run_from_the_palette() {
+    use crate::widgets::command_palette::Command;
+    let (tmp, mut app) = scm_ready_to_commit();
+    let run = |app: &mut App, id: &str| app.run_command(Command::from_id(id).unwrap());
+    run(&mut app, "git_checkout_to");
+    assert_eq!(app.branch_purpose, crate::app::BranchPurpose::Checkout);
+    assert!(
+        app.branch_picker.take().is_some(),
+        "the branch picker opens"
+    );
+    run(&mut app, "git_stash");
+    assert!(
+        app.input_prompt.take().is_some(),
+        "the stash name prompt opens"
+    );
+    app.source_control.message = String::from("from the palette");
+    run(&mut app, "git_commit");
+    wait_for_git_net(&mut app);
+    assert_eq!(last_commit_subject(tmp.path()), "from the palette");
+}
+
 #[test]
 fn cmd_enter_in_source_control_falls_back_to_plain_commit_without_pushing() {
     // iTerm2 swallows Cmd+Enter as Toggle Fullscreen so the chord never
@@ -4561,6 +4689,58 @@ fn accept_all_incoming_then_complete_merge_stages_the_resolved_file() {
     assert!(
         line.starts_with("M "),
         "after staging, shared.txt must be index-modified (M ), not unmerged; was {line:?}"
+    );
+}
+
+/// #906: a file resolved by hand in the text flow is still unmerged in git,
+/// so its MERGE CONFLICTS row stays. Opening it keeps that resolution as the
+/// Result, reads each conflict's state off it, and Complete Merge stages it.
+#[test]
+fn a_hand_resolved_conflict_opens_as_its_own_result_and_completes() {
+    use crate::merge_editor::ConflictState;
+    let tmp = tempfile::tempdir().unwrap();
+    conflicted_repo(tmp.path());
+    let resolved = "alpha\nboth-one\nm1\nm2\nm3\nm4\nm5\nfeature-two\nomega\n";
+    std::fs::write(tmp.path().join("shared.txt"), resolved).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let idx = wait_for_conflicted_entry(&mut app);
+    app.open_source_control_entry(idx);
+    let mv = app.editor.merge.as_ref().expect("the merge editor is up");
+    let states: Vec<_> = mv.conflicts.iter().map(|c| c.state).collect();
+    assert_eq!(states, [ConflictState::Manual, ConflictState::Incoming]);
+    assert_eq!(app.editor.lines.join("\n") + "\n", resolved);
+    assert!(!app.editor.dirty, "nothing in the file was replaced");
+    app.complete_merge();
+    assert!(app.status.contains("staged shared.txt"), "{}", app.status);
+    assert_eq!(git_out(tmp.path(), &["show", ":shared.txt"]), resolved);
+}
+
+/// #906: with one block resolved and a line added beside it, the merge
+/// editor keeps both and asks only about the block still marked.
+#[test]
+fn a_partly_resolved_conflict_keeps_its_edits_in_the_merge_editor() {
+    let tmp = tempfile::tempdir().unwrap();
+    conflicted_repo(tmp.path());
+    let file = tmp.path().join("shared.txt");
+    let lines: Vec<String> = std::fs::read_to_string(&file)
+        .unwrap()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    let block = crate::merge::find_conflicts(&lines)[0];
+    let mut edited = lines[..block.ours_start].to_vec();
+    edited.extend(["feature-one".to_string(), "# reviewed".to_string()]);
+    edited.extend_from_slice(&lines[block.theirs_end + 1..]);
+    std::fs::write(&file, edited.join("\n") + "\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let idx = wait_for_conflicted_entry(&mut app);
+    app.open_source_control_entry(idx);
+    let mv = app.editor.merge.as_ref().expect("the merge editor is up");
+    assert_eq!(mv.conflicts.len(), 1, "only the marked block is left");
+    assert_eq!(mv.conflicts[0].ours, ["main-two"]);
+    assert_eq!(
+        app.editor.lines[..3],
+        ["alpha", "feature-one", "# reviewed"]
     );
 }
 

@@ -22,6 +22,10 @@ pub enum Command {
     // --- Editor: line / selection ops (the new VS Code parity features) ---
     MoveLineUp,
     MoveLineDown,
+    /// Copy Line Up/Down (#916): VS Code's `copyLinesUpAction` /
+    /// `copyLinesDownAction`, by default Shift+Alt+Up/Down.
+    CopyLineUp,
+    CopyLineDown,
     ToggleLineComment,
     ToggleBlockComment,
     JoinLines,
@@ -80,6 +84,10 @@ pub enum Command {
     GoToImplementations,
     SwitchHeaderSource,
     RenameSymbol,
+    /// Trigger Suggest / Trigger Parameter Hints (#916): the completion
+    /// popup Ctrl+Space opens, and the parameter hints typing `(` asks for.
+    TriggerSuggest,
+    TriggerParameterHints,
     MouseAddCursorAtClick,
     MouseGoToDefinitionAtClick,
     MouseOpenLinkAtClick,
@@ -462,6 +470,14 @@ pub enum Command {
     GitCreateTag,
     GitPushTags,
     GitDeleteRemoteTag,
+    /// The Commit button's and menus' everyday actions on the palette
+    /// (#871), so each is reachable, and bindable, from the keyboard.
+    GitCommit,
+    GitPush,
+    GitPull,
+    GitSync,
+    GitCheckoutTo,
+    GitStash,
     ToggleTerminalSuggestions,
     ToggleScreenReader,
     OpenKeyboardShortcuts,
@@ -569,6 +585,9 @@ pub enum Command {
     SendHttpRequest,
     /// Copy the `.http` request under the caret as a curl command (#370).
     CopyHttpRequestAsCurl,
+    /// Pick the named environment of the `.http` env files whose values
+    /// fill requests (#924).
+    SwitchHttpEnvironment,
     /// Hand the navigator the floor on the active file: a comment-only
     /// review turn, its say anchored as comment boxes.
     YieldToNavigator,
@@ -592,6 +611,8 @@ pub enum Command {
 pub const ALL_COMMANDS: &[Command] = &[
     Command::MoveLineUp,
     Command::MoveLineDown,
+    Command::CopyLineUp,
+    Command::CopyLineDown,
     Command::ToggleLineComment,
     Command::ToggleBlockComment,
     Command::JoinLines,
@@ -648,6 +669,8 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::GoToImplementations,
     Command::SwitchHeaderSource,
     Command::RenameSymbol,
+    Command::TriggerSuggest,
+    Command::TriggerParameterHints,
     Command::MouseAddCursorAtClick,
     Command::MouseGoToDefinitionAtClick,
     Command::MouseOpenLinkAtClick,
@@ -956,6 +979,12 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::GitCreateTag,
     Command::GitPushTags,
     Command::GitDeleteRemoteTag,
+    Command::GitCommit,
+    Command::GitPush,
+    Command::GitPull,
+    Command::GitSync,
+    Command::GitCheckoutTo,
+    Command::GitStash,
     Command::ToggleTerminalSuggestions,
     Command::ToggleScreenReader,
     Command::OpenKeyboardShortcuts,
@@ -1027,6 +1056,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::FixProblemWithNavigator,
     Command::SendHttpRequest,
     Command::CopyHttpRequestAsCurl,
+    Command::SwitchHttpEnvironment,
     Command::YieldToNavigator,
     Command::ToggleNavigator,
     Command::ClearNavigatorNotes,
@@ -1062,6 +1092,8 @@ impl Command {
         match self {
             Command::MoveLineUp => "Move Line Up",
             Command::MoveLineDown => "Move Line Down",
+            Command::CopyLineUp => "Copy Line Up",
+            Command::CopyLineDown => "Copy Line Down",
             Command::ToggleLineComment => "Toggle Line Comment",
             Command::ToggleBlockComment => "Toggle Block Comment",
             Command::JoinLines => "Join Lines",
@@ -1118,6 +1150,8 @@ impl Command {
             Command::GoToImplementations => "Go to Implementations",
             Command::SwitchHeaderSource => "C/C++: Switch Header/Source",
             Command::RenameSymbol => "Rename Symbol",
+            Command::TriggerSuggest => "Trigger Suggest",
+            Command::TriggerParameterHints => "Trigger Parameter Hints",
             Command::MouseAddCursorAtClick => "Mouse: Add Cursor at Click",
             Command::MouseGoToDefinitionAtClick => "Mouse: Go to Definition at Click",
             Command::MouseOpenLinkAtClick => "Mouse: Open Link at Click",
@@ -1431,6 +1465,12 @@ impl Command {
             Command::GitCreateTag => "Git: Create Tag",
             Command::GitPushTags => "Git: Push Tags",
             Command::GitDeleteRemoteTag => "Git: Delete Remote Tag",
+            Command::GitCommit => "Git: Commit",
+            Command::GitPush => "Git: Push",
+            Command::GitPull => "Git: Pull",
+            Command::GitSync => "Git: Sync",
+            Command::GitCheckoutTo => "Git: Checkout to\u{2026}",
+            Command::GitStash => "Git: Stash",
             Command::ToggleTerminalSuggestions => "Terminal: Toggle Command Suggestions",
             Command::ToggleScreenReader => "Accessibility: Toggle Screen Reader Mode",
             Command::OpenKeyboardShortcuts => "Preferences: Open Keyboard Shortcuts",
@@ -1504,6 +1544,7 @@ impl Command {
             Command::FixProblemWithNavigator => "Problems: Fix With Navigator",
             Command::SendHttpRequest => "HTTP: Send Request Under Caret",
             Command::CopyHttpRequestAsCurl => "HTTP: Copy Request as curl",
+            Command::SwitchHttpEnvironment => "HTTP: Switch Environment",
             Command::YieldToNavigator => "Navigator: Yield the Turn",
             Command::ToggleNavigator => "Navigator: Activate or Deactivate",
             Command::ClearNavigatorNotes => "Navigator: Clear Comments",
@@ -1521,6 +1562,8 @@ impl Command {
         match self {
             Command::MoveLineUp => "Alt+↑",
             Command::MoveLineDown => "Alt+↓",
+            Command::CopyLineUp => "Shift+Alt+↑",
+            Command::CopyLineDown => "Shift+Alt+↓",
             Command::JoinLines => "Cmd+Opt+Shift+J",
             Command::InsertLineBelow => "Cmd+Enter",
             Command::InsertLineAbove => "Cmd+Shift+Enter",
@@ -1600,6 +1643,10 @@ impl Command {
             Command::GoToImplementations => "Cmd+F12",
             Command::SwitchHeaderSource => "Alt+O",
             Command::RenameSymbol => "F2",
+            Command::TriggerSuggest => "Ctrl+Space",
+            // No chord of its own: VS Code's Ctrl+Shift+Space is the
+            // terminal's Quick Select here. Typing `(` or `,` asks too.
+            Command::TriggerParameterHints => "",
             Command::MouseAddCursorAtClick => "",
             Command::MouseGoToDefinitionAtClick => "",
             Command::MouseOpenLinkAtClick => "",
@@ -1918,6 +1965,12 @@ impl Command {
             Command::GitCreateTag => "",
             Command::GitPushTags => "",
             Command::GitDeleteRemoteTag => "",
+            Command::GitCommit => "",
+            Command::GitPush => "",
+            Command::GitPull => "",
+            Command::GitSync => "",
+            Command::GitCheckoutTo => "",
+            Command::GitStash => "",
             Command::ToggleTerminalSuggestions => "",
             Command::ToggleScreenReader => "",
             Command::OpenKeyboardShortcuts => "Cmd+K Cmd+S",
@@ -1988,6 +2041,7 @@ impl Command {
             Command::FixProblemWithNavigator => "",
             Command::SendHttpRequest => "Cmd+Enter",
             Command::CopyHttpRequestAsCurl => "",
+            Command::SwitchHttpEnvironment => "",
             Command::YieldToNavigator => "Cmd+K Y",
             Command::ToggleNavigator => "",
             Command::ClearNavigatorNotes => "",
@@ -2007,6 +2061,8 @@ impl Command {
         match self {
             Command::MoveLineUp => "move_line_up",
             Command::MoveLineDown => "move_line_down",
+            Command::CopyLineUp => "copy_line_up",
+            Command::CopyLineDown => "copy_line_down",
             Command::ToggleLineComment => "toggle_line_comment",
             Command::ToggleBlockComment => "toggle_block_comment",
             Command::JoinLines => "join_lines",
@@ -2063,6 +2119,8 @@ impl Command {
             Command::GoToImplementations => "go_to_implementations",
             Command::SwitchHeaderSource => "switch_header_source",
             Command::RenameSymbol => "rename_symbol",
+            Command::TriggerSuggest => "trigger_suggest",
+            Command::TriggerParameterHints => "trigger_parameter_hints",
             Command::MouseAddCursorAtClick => "mouse_add_cursor_at_click",
             Command::MouseGoToDefinitionAtClick => "mouse_go_to_definition_at_click",
             Command::MouseOpenLinkAtClick => "mouse_open_link_at_click",
@@ -2372,6 +2430,12 @@ impl Command {
             Command::GitCreateTag => "git_create_tag",
             Command::GitPushTags => "git_push_tags",
             Command::GitDeleteRemoteTag => "git_delete_remote_tag",
+            Command::GitCommit => "git_commit",
+            Command::GitPush => "git_push",
+            Command::GitPull => "git_pull",
+            Command::GitSync => "git_sync",
+            Command::GitCheckoutTo => "git_checkout_to",
+            Command::GitStash => "git_stash",
             Command::ToggleTerminalSuggestions => "toggle_terminal_suggestions",
             Command::ToggleScreenReader => "toggle_screen_reader",
             Command::OpenKeyboardShortcuts => "open_keyboard_shortcuts",
@@ -2440,6 +2504,7 @@ impl Command {
             Command::FixProblemWithNavigator => "problems_fix_navigator",
             Command::SendHttpRequest => "http_send_request",
             Command::CopyHttpRequestAsCurl => "http_copy_curl",
+            Command::SwitchHttpEnvironment => "http_switch_environment",
             Command::YieldToNavigator => "navigator_yield",
             Command::ToggleNavigator => "navigator_toggle",
             Command::ClearNavigatorNotes => "navigator_clear_notes",
@@ -2513,6 +2578,10 @@ const HINTS_WITHOUT_A_CTRL_FORM: &[(&str, &str)] = &[
     ("Cmd+A", "Super+A"),
     ("Cmd+E", "Super+E"),
     ("Cmd+F12", "Super+F12"),
+    // A legacy terminal sends `Ctrl+\` as `Ctrl+4`; the leader's second key
+    // works without a modifier.
+    ("Cmd+K Cmd+\\", "Ctrl+K \\"),
+    ("Cmd+K Cmd+Shift+\\", "Ctrl+K Shift+\\"),
 ];
 
 /// `hint` spelled for the platform croft runs on: [`hint_for_platform`].
@@ -2538,6 +2607,34 @@ pub fn hint_for_platform(hint: &str, macos: bool) -> std::borrow::Cow<'_, str> {
         return Cow::Borrowed(there);
     }
     Cow::Owned(hint.replace("Cmd", "Ctrl").replace("Opt", "Alt"))
+}
+
+/// A shortcut written in the Mac's menu glyphs (`⌥⌘R`, `⌘K ⇧P`, as the
+/// context menus show them) as a Mac (`macos`) or anything else spells it
+/// (#885). Elsewhere each step is first written in the palette's names
+/// (`Cmd+Opt+R`) and then spelled by [`hint_for_platform`], so a menu and
+/// the palette agree on `Ctrl`, `Alt` and `Super` (`Ctrl+Alt+R`, `Super+\`).
+/// `⌫` reads `Delete`, as the key is named there.
+pub fn glyph_hint_for_platform(glyphs: &str, macos: bool) -> std::borrow::Cow<'_, str> {
+    if macos {
+        return std::borrow::Cow::Borrowed(glyphs);
+    }
+    let names = glyphs
+        .split(' ')
+        .map(|step| {
+            let key = step.trim_start_matches(['⌃', '⌘', '⌥', '⇧']);
+            let held = &step[..step.len() - key.len()];
+            let mut words: Vec<&str> = [('⌃', "Ctrl"), ('⌘', "Cmd"), ('⌥', "Opt"), ('⇧', "Shift")]
+                .into_iter()
+                .filter(|(glyph, _)| held.contains(*glyph))
+                .map(|(_, word)| word)
+                .collect();
+            words.push(if key == "⌫" { "Delete" } else { key });
+            words.join("+")
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    std::borrow::Cow::Owned(hint_for_platform(&names, false).into_owned())
 }
 
 /// A palette command contributed by an MCP sidecar extension. Carries its own
@@ -3377,6 +3474,46 @@ mod tests {
             ("Cmd+F12", "Super+F12"),
         ] {
             assert_eq!(hint_for_platform(mac, false), linux);
+        }
+    }
+
+    /// #885: a menu's glyph chord reads the palette's names off macOS, by
+    /// the same `Ctrl` / `Super` rules, and stays as drawn on a Mac.
+    #[test]
+    fn a_glyph_chord_reads_as_the_palette_names_it_off_macos() {
+        for (mac, linux) in [
+            ("⌘B", "Ctrl+B"),
+            ("⌥⌘M", "Ctrl+Alt+M"),
+            ("⌥⇧⌘C", "Ctrl+Alt+Shift+C"),
+            ("⌘⇧N", "Ctrl+Shift+N"),
+            ("⇧⌥F9", "Alt+Shift+F9"),
+            ("⌃⇧Space", "Ctrl+Shift+Space"),
+            ("⌘K Z", "Ctrl+K Z"),
+            ("⌘K ⇧P", "Ctrl+K Shift+P"),
+            ("⌘K ⌘T", "Ctrl+K Ctrl+T"),
+            ("⌘\\", "Super+\\"),
+            ("⌥⌘\u{2190}", "Super+Alt+\u{2190}"),
+            ("⌘T", "Ctrl+Shift+T"),
+            ("⌘F12", "Super+F12"),
+            ("⌘K ⌘\\", "Ctrl+K \\"),
+            ("⌘K ⇧⌘\\", "Ctrl+K Shift+\\"),
+            ("⌫", "Delete"),
+            ("F2", "F2"),
+            ("Enter", "Enter"),
+        ] {
+            assert_eq!(glyph_hint_for_platform(mac, false), linux);
+            assert_eq!(glyph_hint_for_platform(mac, true), mac);
+        }
+    }
+
+    /// #885: off macOS no palette or Keyboard Shortcuts row names a Mac key.
+    #[test]
+    fn off_macos_no_palette_hint_names_a_mac_key() {
+        for cmd in ALL_COMMANDS {
+            let hint = hint_for_platform(cmd.keybinding_hint(), false);
+            for mac in ["Cmd", "Opt", "⌘", "⌥"] {
+                assert!(!hint.contains(mac), "{cmd:?} reads {hint:?}");
+            }
         }
     }
 }
