@@ -11,6 +11,7 @@ pub mod runtime;
 pub mod rust_analyzer;
 pub mod semantic_cache;
 pub mod trace;
+pub mod watched_files;
 
 pub use config::Language;
 pub use manager::{CompletionItem, LspManager};

@@ -231,15 +231,16 @@ pub fn installable_release(
     Some(on_crates_io(&version)?.then_some(version))
 }
 
-fn http_agent() -> ureq::Agent {
-    ureq::AgentBuilder::new().timeout(REQUEST_TIMEOUT).build()
+fn http_agent(url: &str) -> ureq::Agent {
+    crate::net::builder(url).timeout(REQUEST_TIMEOUT).build()
 }
 
 /// `None` when crates.io could not be asked (a timeout, a 5xx, an
 /// unreadable body); `Some(false)` when it says the version is absent.
 fn crate_version_published(version: &str) -> Option<bool> {
-    let resp = http_agent()
-        .get(&format!("{CRATES_IO_VERSION_URL}/{version}"))
+    let url = format!("{CRATES_IO_VERSION_URL}/{version}");
+    let resp = http_agent(&url)
+        .get(&url)
         .set("User-Agent", concat!("croft/", env!("CARGO_PKG_VERSION")))
         .call();
     match resp {
@@ -259,7 +260,7 @@ fn fetch_latest() -> Option<Option<String>> {
 /// [`fetch_latest`] saying why it could not ask (#1844): the newest release
 /// this install can stage, `None` when there is none, or the reason.
 pub fn fetch_latest_checked() -> Result<Option<String>, String> {
-    let resp = http_agent()
+    let resp = http_agent(RELEASES_LATEST_URL)
         .get(RELEASES_LATEST_URL)
         .set("Accept", "application/vnd.github+json")
         .set("User-Agent", concat!("croft/", env!("CARGO_PKG_VERSION")))

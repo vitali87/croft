@@ -731,6 +731,112 @@ fn shortcut_for_returns_expected_shortcuts_for_each_explorer_action() {
     );
 }
 
+/// #885: off macOS no row of the Customize Layout popup, the tab and
+/// Explorer menus, or the editor and terminal menus names a Mac key; on a
+/// Mac every row keeps its glyphs.
+#[test]
+fn off_macos_no_menu_shortcut_names_a_mac_key() {
+    fn actions(entries: Vec<MenuEntry>) -> Vec<MenuAction> {
+        entries
+            .into_iter()
+            .flat_map(|e| match e {
+                MenuEntry::Item { action, .. } => vec![action],
+                MenuEntry::Submenu { items, .. } => actions(items),
+                _ => Vec::new(),
+            })
+            .collect()
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("a.rs");
+    std::fs::write(&f, "fn main() {}\n").unwrap();
+    let app = App::new(tmp.path().to_path_buf()).unwrap();
+    let mut all = actions(app.customize_layout_items());
+    all.extend(actions(build_tab_context_menu_items(
+        0,
+        3,
+        true,
+        Some(&f),
+        true,
+        true,
+        false,
+    )));
+    let tree = build_tree_context_menu_items(
+        Some(&file_node(&f)),
+        tmp.path(),
+        std::slice::from_ref(&f),
+        tmp.path(),
+        None,
+        None,
+    );
+    all.extend(tree.into_iter().map(|(_, a)| a));
+    let (row, col) = (0, 0);
+    all.extend([
+        MenuAction::ChangeAllOccurrencesAt { row, col },
+        MenuAction::GoToImplementationAt { row, col },
+        MenuAction::QuickFixAt { row, col },
+        MenuAction::EditLogpointAt { line: 0 },
+        MenuAction::EditorCut,
+        MenuAction::EditorCopy,
+        MenuAction::EditorPaste,
+        MenuAction::ShowCommandPalette,
+        MenuAction::TerminalCopySelection,
+        MenuAction::TerminalPaste,
+        MenuAction::SplitTerminal,
+        MenuAction::KillTerminal(0),
+        MenuAction::ClearTerminal(0),
+    ]);
+    let mut hinted = 0;
+    for action in &all {
+        let Some(glyphs) = shortcut_for(action) else {
+            continue;
+        };
+        hinted += 1;
+        let linux = platform_shortcut_for(action, false).unwrap();
+        for mac in ["Cmd", "Opt", "⌘", "⌥", "⇧", "⌃", "⌫"] {
+            assert!(!linux.contains(mac), "{action:?} reads {linux:?}");
+        }
+        assert_eq!(platform_shortcut_for(action, true).as_deref(), Some(glyphs));
+    }
+    assert!(hinted >= 30, "only {hinted} rows carry a shortcut");
+}
+
+/// #885: off macOS a menu row names the chord Linux takes: `Ctrl` for
+/// `Cmd`, `Super` where `Ctrl` does something else, and in the terminal the
+/// `Ctrl+Shift` chords that leave `Ctrl+C` / `Ctrl+W` to the shell.
+#[test]
+fn off_macos_menu_shortcuts_name_the_chord_linux_takes() {
+    let p = std::path::PathBuf::from("/x");
+    for (action, linux) in [
+        (MenuAction::ToggleSideBar, "Ctrl+B"),
+        (MenuAction::ToggleSecondarySideBar, "Ctrl+Alt+B"),
+        (MenuAction::ToggleMinimap, "Ctrl+Alt+M"),
+        (MenuAction::ToggleZenMode, "Ctrl+K Z"),
+        (MenuAction::Create(CreateKind::Folder), "Ctrl+Shift+N"),
+        (MenuAction::Cut(vec![p.clone()]), "Ctrl+X"),
+        (
+            MenuAction::CopyTabRelativePath(p.clone()),
+            "Ctrl+Alt+Shift+C",
+        ),
+        (MenuAction::KeepTabOpen(0), "Ctrl+K Shift+P"),
+        (MenuAction::Delete { paths: vec![p] }, "Delete"),
+        (MenuAction::SplitEditor, "Super+\\"),
+        (MenuAction::SplitEditorUp, "Ctrl+K \\"),
+        (MenuAction::FocusGroupLeft, "Super+Alt+\u{2190}"),
+        (MenuAction::EditorCopy, "Ctrl+C"),
+        (MenuAction::TerminalCopySelection, "Ctrl+Shift+C"),
+        (MenuAction::TerminalPaste, "Ctrl+Shift+V"),
+        (MenuAction::SplitTerminal, "Ctrl+Shift+T"),
+        (MenuAction::KillTerminal(0), "Ctrl+Shift+W"),
+        (MenuAction::CloseTab(0), "Ctrl+W"),
+    ] {
+        assert_eq!(
+            platform_shortcut_for(&action, false).as_deref(),
+            Some(linux),
+            "{action:?}"
+        );
+    }
+}
+
 #[test]
 fn cmd_k_arms_leader_then_unmatched_second_key_clears_it() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1264,6 +1370,7 @@ fn the_keyboard_shortcuts_view_spells_chords_for_linux() {
     assert_eq!(shown("toggle_vim_mode"), "Super+E");
     assert_eq!(shown("toggle_terminal"), "Ctrl+J");
     assert_eq!(shown("move_line_up"), "Alt+\u{2191}");
+    assert_eq!(shown("copy_line_down"), "Shift+Alt+\u{2193}");
 }
 
 /// #1562 negative: on a bottom-panel tab other than Terminal there is no
@@ -1392,6 +1499,52 @@ fn an_unscoped_chord_still_fires_from_the_editor_and_the_tree() {
         app.handle_key(ctrl_alt_j()).unwrap();
         assert!(app.file_finder.is_some(), "{name}");
     }
+}
+
+/// #916: Copy Line Up/Down have command ids, so a `keybindings.json` chord
+/// (what `import-vscode` writes for VS Code's `copyLinesUpAction` /
+/// `copyLinesDownAction`) runs them, and Shift+Alt+Up/Down still copy.
+#[test]
+fn copy_line_up_and_down_run_from_a_user_chord_and_their_default_one() {
+    let (mut app, _tmp) = tree_app_with_keymap(
+        r#"[{"key": "ctrl+alt+d", "command": "copy_line_down"},
+            {"key": "ctrl+alt+u", "command": "copy_line_up"}]"#,
+    );
+    app.focus_pane(Pane::Editor);
+    app.editor.cursor_row = 0;
+    app.handle_key(key(
+        KeyCode::Char('d'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    ))
+    .unwrap();
+    assert_eq!(
+        app.editor.lines[..3],
+        ["let name = value;", "let name = value;", "fn main() {}"]
+    );
+    assert_eq!(app.editor.cursor_row, 1, "the caret follows the copy down");
+
+    app.editor.cursor_row = 2;
+    app.handle_key(key(
+        KeyCode::Char('u'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    ))
+    .unwrap();
+    assert_eq!(app.editor.lines[2..4], ["fn main() {}", "fn main() {}"]);
+    assert_eq!(
+        app.editor.cursor_row, 2,
+        "the caret stays on the upper copy"
+    );
+
+    app.handle_key(key(KeyCode::Down, KeyModifiers::SHIFT | KeyModifiers::ALT))
+        .unwrap();
+    assert_eq!(
+        app.editor
+            .lines
+            .iter()
+            .filter(|l| *l == "fn main() {}")
+            .count(),
+        3
+    );
 }
 
 /// #1436 negative: a `file_tree` row fires from the Explorer, and not from

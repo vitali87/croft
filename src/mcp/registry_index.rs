@@ -154,7 +154,7 @@ fn write_cache(bytes: &[u8]) -> std::io::Result<()> {
 
 /// GET `url` into memory, capped at [`MAX_FETCH_BYTES`].
 fn http_get(url: &str) -> Result<Vec<u8>> {
-    let resp = ureq::get(url).timeout(FETCH_TIMEOUT).call()?;
+    let resp = crate::net::get(url).timeout(FETCH_TIMEOUT).call()?;
     let mut buf = Vec::new();
     resp.into_reader()
         .take(MAX_FETCH_BYTES)

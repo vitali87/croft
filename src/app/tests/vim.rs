@@ -432,6 +432,34 @@ fn toggling_vim_mode_saves_it_as_the_default() {
     assert!(!saved(), "turning it off is saved too");
 }
 
+/// #923: with a `config.json` that does not parse, the toggle still works
+/// for the session, but the status line says it was not saved and why,
+/// rather than a plain "vim mode on" that read as saved.
+#[test]
+fn a_setting_refused_by_a_malformed_config_says_it_was_not_saved() {
+    let (mut app, t) = vim_app("abc");
+    app.vim.enabled = false;
+    let croft = t.path().join("croft-config");
+    std::fs::create_dir_all(&croft).unwrap();
+    let broken = "{\n  \"auto_save\": true,\n  \"theme\": black\n}\n";
+    std::fs::write(croft.join("config.json"), broken).unwrap();
+    app.config_dir = croft.clone();
+    app.handle_key(key(KeyCode::Char('e'), KeyModifiers::SUPER))
+        .unwrap();
+    assert!(app.vim.enabled, "the toggle still applies to the session");
+    assert!(
+        app.status.starts_with("Setting not saved: "),
+        "{}",
+        app.status
+    );
+    assert!(app.status.contains("line 3"), "{}", app.status);
+    assert_eq!(
+        std::fs::read_to_string(croft.join("config.json")).unwrap(),
+        broken,
+        "the user's file is left for them to fix"
+    );
+}
+
 /// #1286 negative: with the vim extension disabled a saved `vim_mode`
 /// leaves modal editing off, as Toggle Vim Mode itself does.
 #[test]

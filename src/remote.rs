@@ -5486,6 +5486,7 @@ Host !blocked *.internal
             provenance: Default::default(),
             chain: Vec::new(),
             warnings: vec![String::from("config.json: expected value at line 1")],
+            user_config_error: Some(String::from("config.json: expected value at line 1")),
         };
         // No clean read yet: the exclusions are unknown, not empty.
         ex.update(broken.clone());
@@ -5501,6 +5502,7 @@ Host !blocked *.internal
             provenance: Default::default(),
             chain: Vec::new(),
             warnings: Vec::new(),
+            user_config_error: None,
         };
         ex.update(clean);
         let good = Some((
