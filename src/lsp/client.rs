@@ -1,9 +1,9 @@
 use std::ops::ControlFlow;
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc as std_mpsc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, anyhow};
 use async_lsp::concurrency::ConcurrencyLayer;
@@ -39,6 +39,7 @@ use crate::lsp::manager::{
     CompletionTrigger, Diagnostic, DiagnosticSeverity, DiagnosticsUpdate, ServerEvent,
     ServerUpdate, message_is_shown,
 };
+use crate::lsp::watched_files::WatchedFiles;
 use crate::output::{self, OutputLevel};
 
 /// Map an LSP `window/{show,log}Message` severity to an OUTPUT channel level so
@@ -104,6 +105,9 @@ struct ClientState {
     // with — the same list initialize carried. A server that saw the
     // workspaceFolders capability may re-query it at any time (LSP 3.6).
     workspace_folders: Vec<WorkspaceFolder>,
+    // The globs this server registered for `workspace/didChangeWatchedFiles`
+    // (#908), shared with the `LspClient` that forwards file events.
+    watched: Arc<Mutex<WatchedFiles>>,
 }
 
 /// Join a work-done progress title with its optional message and percentage
@@ -141,6 +145,7 @@ impl ClientState {
         diagnostics_tx: std_mpsc::Sender<DiagnosticsUpdate>,
         progress_tx: std_mpsc::Sender<ServerUpdate>,
         workspace_folders: Vec<WorkspaceFolder>,
+        watched: Arc<Mutex<WatchedFiles>>,
     ) -> Router<Self> {
         let mut router = Router::new(ClientState {
             name,
@@ -151,6 +156,7 @@ impl ClientState {
             progress_tx,
             progress_titles: std::collections::HashMap::new(),
             workspace_folders,
+            watched,
         });
         router
             .request::<SemanticTokensRefresh, _>(|this, _params| {
@@ -196,6 +202,32 @@ impl ClientState {
             // single-root behavior.
             .request::<lsp_types::request::WorkspaceFoldersRequest, _>(|this, _params| {
                 std::future::ready(Ok(Some(this.workspace_folders.clone())))
+            })
+            // Dynamic registration is declared for watched files alone
+            // (#908): the server's globs are kept for the file events croft
+            // forwards. Any other registration is declined, as before.
+            .request::<lsp_types::request::RegisterCapability, _>(|this, params| {
+                let stored = this
+                    .watched
+                    .lock()
+                    .is_ok_and(|mut w| w.register(&params.registrations));
+                log_file::log(&format!(
+                    "lsp[{}] registerCapability watched_files={stored}",
+                    this.name
+                ));
+                std::future::ready(match stored {
+                    true => Ok(()),
+                    false => Err(async_lsp::ResponseError::new(
+                        async_lsp::ErrorCode::METHOD_NOT_FOUND,
+                        "only workspace/didChangeWatchedFiles can be registered",
+                    )),
+                })
+            })
+            .request::<lsp_types::request::UnregisterCapability, _>(|this, params| {
+                if let Ok(mut w) = this.watched.lock() {
+                    w.unregister(&params.unregisterations);
+                }
+                std::future::ready(Ok(()))
             })
             // `window/showMessageRequest` (#1599): the question goes to the
             // app's picker and the pick comes back as the answer. Logged
@@ -468,6 +500,8 @@ pub struct LspClient {
     /// killed (the OOM killer picks language servers first, #694). The
     /// manager restarts the servers of a client that reports it.
     exited: Arc<AtomicBool>,
+    /// The server's registered watchers (#908), filled by the router.
+    watched: Arc<Mutex<WatchedFiles>>,
 }
 
 impl LspClient {
@@ -509,6 +543,8 @@ impl LspClient {
             name: workspace_name,
         }];
         let router_folders = workspace_folders.clone();
+        let watched = Arc::new(Mutex::new(WatchedFiles::default()));
+        let router_watched = watched.clone();
 
         let mut command = Command::new(&config.command);
         command.args(&config.args).current_dir(workspace_root);
@@ -558,6 +594,7 @@ impl LspClient {
                     diagnostics_tx,
                     progress_tx,
                     router_folders,
+                    router_watched,
                 ))
         });
 
@@ -630,6 +667,7 @@ impl LspClient {
             child,
             mainloop_task,
             exited,
+            watched,
         })
     }
 
@@ -703,6 +741,24 @@ impl LspClient {
                 text,
             })
             .context("did_save")
+    }
+
+    /// `workspace/didChangeWatchedFiles` (#908) for the `changes` this
+    /// server's watchers cover. Nothing is sent when none does.
+    pub fn did_change_watched_files(
+        &mut self,
+        changes: &[(std::path::PathBuf, lsp_types::FileChangeType)],
+    ) -> Result<()> {
+        let events = match self.watched.lock() {
+            Ok(w) => w.events_for(changes),
+            Err(_) => return Ok(()),
+        };
+        if events.is_empty() {
+            return Ok(());
+        }
+        self.server
+            .did_change_watched_files(lsp_types::DidChangeWatchedFilesParams { changes: events })
+            .context("did_change_watched_files")
     }
 
     pub fn did_close(&mut self, uri: Url) -> Result<()> {
@@ -1610,6 +1666,7 @@ mod tests {
             diag_tx,
             prog_tx,
             Vec::new(),
+            Default::default(),
         );
         let req: AnyRequest = serde_json::from_value(json!({
             "id": 1,
@@ -1643,6 +1700,7 @@ mod tests {
             diag_tx,
             prog_tx,
             Vec::new(),
+            Default::default(),
         );
         let req: AnyRequest = serde_json::from_value(json!({
             "id": 1,
@@ -1747,6 +1805,7 @@ mod tests {
             diag_tx,
             prog_tx,
             Vec::new(),
+            Default::default(),
         );
         let req: AnyRequest = serde_json::from_value(json!({
             "id": 1,
@@ -1914,6 +1973,7 @@ mod tests {
             diag_tx,
             prog_tx,
             Vec::new(),
+            Default::default(),
         );
         let notif: AnyNotification = serde_json::from_value(json!({
             "method": "pyright/beginProgress",
@@ -1942,6 +2002,7 @@ mod tests {
             diag_tx,
             prog_tx,
             Vec::new(),
+            Default::default(),
         );
         for method in ["foo/bar", "experimental/dap", "rust-analyzer/serverStatus"] {
             let notif: AnyNotification = serde_json::from_value(json!({
@@ -1968,6 +2029,7 @@ mod tests {
             diag_tx,
             prog_tx,
             Vec::new(),
+            Default::default(),
         );
         (router, prog_rx)
     }
@@ -2157,6 +2219,7 @@ mod tests {
                 uri: Url::from_file_path("/tmp/ws").unwrap(),
                 name: "ws".into(),
             }],
+            Default::default(),
         );
         let req: AnyRequest = serde_json::from_value(json!({
             "id": 1,

@@ -186,8 +186,8 @@ pub fn parse_pr_list(json: &str) -> Result<Vec<PrListItem>, String> {
 pub const GH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Run `gh` (`program`) with `args` in `cwd` and return its stdout, or its
-/// stderr (or why it could not run, or that it timed out) as the error.
-/// Blocking: the app calls it on a worker thread.
+/// stderr (or why it could not run, that it is not signed in, or that it
+/// timed out) as the error. Blocking: the app calls it on a worker thread.
 pub fn run_gh(
     program: &str,
     args: &[String],
@@ -195,14 +195,14 @@ pub fn run_gh(
     timeout: std::time::Duration,
 ) -> Result<String, String> {
     use std::io::Read;
-    let mut child = std::process::Command::new(program)
-        .args(args)
+    let mut cmd = std::process::Command::new(program);
+    cmd.args(args)
         .current_dir(cwd)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("could not run {program}: {e}"))?;
+        .stderr(std::process::Stdio::piped());
+    let mut child = crate::review_ops::spawn_retrying_busy(&mut cmd)
+        .map_err(|e| crate::gh::spawn_error(&e, Some(cwd)))?;
     // Drained while it runs: a log larger than a pipe buffer would
     // otherwise block gh on its write until the deadline.
     let drain = |pipe: Option<Box<dyn Read + Send>>| {
@@ -246,6 +246,8 @@ pub fn run_gh(
     };
     if status.success() {
         Ok(text(stdout))
+    } else if crate::gh::signed_out(status) {
+        Err(String::from(crate::gh::SIGNED_OUT))
     } else {
         Err(text(stderr).trim().to_string())
     }
@@ -778,10 +780,14 @@ mod tests {
             started.elapsed() < std::time::Duration::from_secs(3),
             "killed at the bound"
         );
-        assert!(
-            run_gh("/nonexistent/gh", &[], &dir, t)
-                .unwrap_err()
-                .contains("could not run")
+        assert_eq!(
+            run_gh("/nonexistent/gh", &[], &dir, t),
+            Err(String::from(crate::gh::MISSING)),
+            "#917: a missing gh says how to get it"
+        );
+        assert_eq!(
+            run_gh("/bin/sh", &sh("exit 4"), &dir, t),
+            Err(String::from(crate::gh::SIGNED_OUT))
         );
     }
 

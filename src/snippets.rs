@@ -19,12 +19,13 @@
 //! final caret, `${1:name}` a placeholder. [`parse_body`] turns it into the
 //! literal text to insert plus the ordered stop positions the editor drives.
 //!
-//! ponytail: supported tab-stop syntax is `$N`, `${N}`, nested
-//! `${N:placeholder}`, choices `${N|a,b|}` (the first option is inserted) and
-//! the `\$` / `\}` / `\\` escapes. Not supported (name the ceiling, add on
-//! demand): variables (`$TM_FILENAME`), transforms, and live mirroring of a
-//! repeated `$N` (the placeholder text is duplicated, but only the first
-//! occurrence is a navigable stop).
+//! ponytail: supported syntax is `$N`, `${N}`, nested `${N:placeholder}`,
+//! choices `${N|a,b|}` (the first option is inserted), the `\$` / `\}` /
+//! `\\` escapes, and variables `$NAME`, `${NAME}`, `${NAME:default}` (#914).
+//! Not supported (name the ceiling, add on demand): transforms
+//! (`${1/(.*)/$1/}`), a picker for choices, and live mirroring of a repeated
+//! `$N` (the placeholder text is duplicated, but only the first occurrence is
+//! a navigable stop).
 
 use std::path::{Path, PathBuf};
 
@@ -49,22 +50,34 @@ pub struct ParsedBody {
     pub stops: Vec<TabStop>,
 }
 
+/// Unknown variables number their placeholders from here while the body is
+/// read, and after the snippet's own stops once it has been (#914).
+const FIRST_UNKNOWN: u32 = 1 << 31;
+
 /// Parse a VS Code snippet body into the text to insert and its tab stops.
 ///
 /// Language servers send the same syntax for snippet completions, so it
 /// follows the LSP grammar: placeholders nest (`${1:foo(${2:x})}`), a choice
 /// inserts its first option (`${1|one,two|}`), and only `\$`, `\}` and `\\`
 /// are escapes - any other backslash is text, as in `printf("%d\n", $1)`.
-pub fn parse_body(body: &str) -> ParsedBody {
-    let mut p = Parser {
-        text: String::new(),
-        pos: 0,
-        stops: Vec::new(),
-        seen: Vec::new(),
-    };
+///
+/// `vars` resolves a variable such as `$TM_FILENAME` (#914): `Some` for one
+/// croft knows, empty when it has no value here, and `None` for one it does
+/// not. As in VS Code, an empty variable inserts its default, and an unknown
+/// one without a default becomes a placeholder holding its name.
+pub fn parse_body(body: &str, vars: &dyn Fn(&str) -> Option<String>) -> ParsedBody {
+    let mut p = Parser::new(vars);
     let mut chars = body.chars().peekable();
     p.seq(&mut chars, false);
     let mut stops = p.stops;
+    let top = stops
+        .iter()
+        .map(|s| s.num)
+        .filter(|&n| n < FIRST_UNKNOWN)
+        .max();
+    for s in stops.iter_mut().filter(|s| s.num >= FIRST_UNKNOWN) {
+        s.num = s.num - FIRST_UNKNOWN + top.unwrap_or(0) + 1;
+    }
     // Ascending by number, but `$0` (the final caret) always sorts last.
     stops.sort_by_key(|s| if s.num == 0 { u32::MAX } else { s.num });
     ParsedBody {
@@ -75,15 +88,30 @@ pub fn parse_body(body: &str) -> ParsedBody {
 
 type Chars<'a> = std::iter::Peekable<std::str::Chars<'a>>;
 
-struct Parser {
+struct Parser<'v> {
     text: String,
     /// Char offset into `text`.
     pos: usize,
     stops: Vec<TabStop>,
     seen: Vec<u32>,
+    /// The unknown variables met so far: the placeholder of the one at
+    /// index `i` is numbered `FIRST_UNKNOWN + i`.
+    unknown: Vec<String>,
+    vars: &'v dyn Fn(&str) -> Option<String>,
 }
 
-impl Parser {
+impl<'v> Parser<'v> {
+    fn new(vars: &'v dyn Fn(&str) -> Option<String>) -> Self {
+        Parser {
+            text: String::new(),
+            pos: 0,
+            stops: Vec::new(),
+            seen: Vec::new(),
+            unknown: Vec::new(),
+            vars,
+        }
+    }
+
     fn push(&mut self, c: char) {
         self.text.push(c);
         self.pos += 1;
@@ -117,19 +145,27 @@ impl Parser {
         }
     }
 
-    /// What follows a `$`: a stop, a placeholder, a choice, or a literal `$`.
+    /// What follows a `$`: a stop, a placeholder, a choice, a variable, or a
+    /// literal `$`.
     fn dollar(&mut self, chars: &mut Chars) {
         let mut look = chars.clone();
         let braced = look.peek() == Some(&'{');
         if braced {
             look.next();
         }
+        if look
+            .peek()
+            .is_some_and(|c| c.is_ascii_alphabetic() || *c == '_')
+        {
+            self.variable(chars, look, braced);
+            return;
+        }
         let mut digits = String::new();
         while let Some(&d) = look.peek().filter(|d| d.is_ascii_digit()) {
             digits.push(d);
             look.next();
         }
-        let Ok(num) = digits.parse::<u32>() else {
+        let Some(num) = digits.parse::<u32>().ok().filter(|&n| n < FIRST_UNKNOWN) else {
             self.push('$');
             return;
         };
@@ -165,6 +201,119 @@ impl Parser {
             _ => self.push('$'),
         }
     }
+
+    /// `$NAME`, `${NAME}` or `${NAME:default}`, with `look` just past the
+    /// `$` or `${` (#914). A transform (`${NAME/…/…/}`) is not read: its
+    /// `$` stays literal.
+    fn variable<'c>(&mut self, chars: &mut Chars<'c>, mut look: Chars<'c>, braced: bool) {
+        let mut name = String::new();
+        while let Some(&c) = look
+            .peek()
+            .filter(|c| c.is_ascii_alphanumeric() || **c == '_')
+        {
+            name.push(c);
+            look.next();
+        }
+        let default = braced && look.peek() == Some(&':');
+        if braced && !matches!(look.next(), Some('}' | ':')) {
+            self.push('$');
+            return;
+        }
+        *chars = look;
+        let (value, start) = ((self.vars)(&name), self.pos);
+        match value {
+            Some(value) if !value.is_empty() => {
+                if default {
+                    // Read past the default, keeping none of it and looking
+                    // up nothing in it: a variable there (`$CLIPBOARD`) can
+                    // be slow to read, and its value would go nowhere.
+                    Parser::new(&|_| Some(String::new())).seq(chars, true);
+                }
+                value.chars().for_each(|c| self.push(c));
+            }
+            _ if default => self.seq(chars, true),
+            Some(_) => {}
+            None => {
+                let index = self.unknown.iter().position(|n| *n == name);
+                let index = index.unwrap_or_else(|| {
+                    self.unknown.push(name.clone());
+                    self.unknown.len() - 1
+                });
+                name.chars().for_each(|c| self.push(c));
+                self.stop(FIRST_UNKNOWN + index as u32, start, self.pos - start);
+            }
+        }
+    }
+}
+
+/// The variables that depend only on the clock and chance (#914): the
+/// `CURRENT_*` date and time parts in local time, `RANDOM`, `RANDOM_HEX` and
+/// `UUID`, in VS Code's formats. `None` for any other name.
+pub fn clock_var(name: &str) -> Option<String> {
+    use ring::rand::SecureRandom;
+    let mut bytes = [0u8; 16];
+    if matches!(name, "RANDOM" | "RANDOM_HEX" | "UUID") {
+        // A failed RNG leaves zeros: an id in a snippet, not a secret.
+        let _ = ring::rand::SystemRandom::new().fill(&mut bytes);
+        bytes[6] = (bytes[6] & 0x0f) | 0x40;
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    }
+    let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let part = match name {
+        "RANDOM" => {
+            return Some(format!(
+                "{:06}",
+                u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) % 1_000_000
+            ));
+        }
+        "RANDOM_HEX" => return Some(hex[..6].to_string()),
+        "UUID" => {
+            let parts = [
+                &hex[..8],
+                &hex[8..12],
+                &hex[12..16],
+                &hex[16..20],
+                &hex[20..],
+            ];
+            return Some(parts.join("-"));
+        }
+        "CURRENT_SECONDS_UNIX" => return Some(secs.to_string()),
+        _ => name.strip_prefix("CURRENT_")?,
+    };
+    // libc's localtime, as the terminal's timestamps take it: no date crate.
+    // The alias is deprecated on musl; see `widgets::terminal::hhmmss`.
+    #[allow(deprecated)]
+    let secs = secs as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    // SAFETY: both pointers are to live locals of the types it takes.
+    if unsafe { libc::localtime_r(&secs, &mut tm) }.is_null() {
+        return None;
+    }
+    let month =
+        "January February March April May June July August September October November December";
+    let month = month.split(' ').nth(tm.tm_mon as usize).unwrap_or_default();
+    let day = "Sunday Monday Tuesday Wednesday Thursday Friday Saturday";
+    let day = day.split(' ').nth(tm.tm_wday as usize).unwrap_or_default();
+    let offset = tm.tm_gmtoff / 60;
+    let sign = if offset < 0 { '-' } else { '+' };
+    Some(match part {
+        "YEAR" => (tm.tm_year + 1900).to_string(),
+        "YEAR_SHORT" => format!("{:02}", (tm.tm_year + 1900) % 100),
+        "MONTH" => format!("{:02}", tm.tm_mon + 1),
+        "MONTH_NAME" => month.to_string(),
+        "MONTH_NAME_SHORT" => month.chars().take(3).collect(),
+        "DATE" => format!("{:02}", tm.tm_mday),
+        "DAY_NAME" => day.to_string(),
+        "DAY_NAME_SHORT" => day.chars().take(3).collect(),
+        "HOUR" => format!("{:02}", tm.tm_hour),
+        "MINUTE" => format!("{:02}", tm.tm_min),
+        "SECOND" => format!("{:02}", tm.tm_sec),
+        "TIMEZONE_OFFSET" => format!("{sign}{:02}:{:02}", offset.abs() / 60, offset.abs() % 60),
+        _ => return None,
+    })
 }
 
 /// The first option of a choice, reading past its closing `|}`. `\,`,
@@ -491,6 +640,11 @@ pub const TEMPLATE: &str = r#"// croft user snippets. Keyed by name; each has a 
 mod tests {
     use super::*;
 
+    /// `parse_body` with no variable known, the case most tests here pin.
+    fn parse_body(body: &str) -> ParsedBody {
+        super::parse_body(body, &|_| None)
+    }
+
     /// #1641: `javascriptreact` and `jsonc` snippets apply to their own
     /// language; snippets scoped to the base language still apply there,
     /// and not the other way round.
@@ -637,11 +791,64 @@ mod tests {
         assert_eq!(p.stops.len(), 1);
     }
 
+    /// #914: as in VS Code, an unknown variable becomes a placeholder
+    /// holding its name, numbered after the snippet's own stops. A
+    /// transform is not read: its `$` stays literal.
     #[test]
-    fn dollar_before_non_stop_is_literal() {
-        let p = parse_body("$foo and ${bar}");
-        assert_eq!(p.text, "$foo and ${bar}");
-        assert!(p.stops.is_empty());
+    fn an_unknown_variable_becomes_a_placeholder_after_the_stops() {
+        let p = parse_body("$foo and ${bar} $1 $foo$0");
+        assert_eq!(p.text, "foo and bar  foo");
+        let stops: Vec<_> = p.stops.iter().map(|s| (s.num, s.offset, s.len)).collect();
+        assert_eq!(stops, [(1, 12, 0), (2, 0, 3), (3, 8, 3), (0, 16, 0)]);
+        assert_eq!(parse_body("${foo/a/b/} $").text, "${foo/a/b/} $");
+    }
+
+    /// #914: a known variable inserts its value, dropping its default (and
+    /// the stops in it); an empty one inserts its default, stops and all.
+    #[test]
+    fn a_variable_inserts_its_value_or_else_its_default() {
+        let vars = |name: &str| match name {
+            "TM_FILENAME" => Some("t.py".to_string()),
+            "TM_SELECTED_TEXT" => Some(String::new()),
+            _ => None,
+        };
+        let body = "# $TM_FILENAME ${TM_FILENAME:x$1} ${TM_SELECTED_TEXT:pass$2}$TM_SELECTED_TEXT${NOPE:d}";
+        let p = super::parse_body(body, &vars);
+        assert_eq!(p.text, "# t.py t.py passd");
+        let stop = TabStop {
+            num: 2,
+            offset: 16,
+            len: 0,
+        };
+        assert_eq!(p.stops, [stop]);
+    }
+
+    /// #914: the default of a variable with a value is skipped unread: a
+    /// variable inside it is never looked up, so `${TM_FILENAME:$CLIPBOARD}`
+    /// does not wait on a clipboard read for a value it drops.
+    #[test]
+    fn a_skipped_default_looks_up_none_of_its_variables() {
+        let asked = std::cell::RefCell::new(Vec::new());
+        let vars = |name: &str| {
+            asked.borrow_mut().push(name.to_string());
+            (name == "TM_FILENAME").then(|| String::from("t.py"))
+        };
+        let p = super::parse_body("${TM_FILENAME:${CLIPBOARD:$UUID}}", &vars);
+        assert_eq!(p.text, "t.py");
+        assert_eq!(*asked.borrow(), ["TM_FILENAME"]);
+    }
+
+    #[test]
+    fn clock_variables_take_vs_code_s_formats() {
+        let year = clock_var("CURRENT_YEAR").unwrap();
+        assert!(year.len() == 4 && year.parse::<u32>().is_ok(), "{year}");
+        assert_eq!(clock_var("CURRENT_MONTH").unwrap().len(), 2);
+        assert_eq!(clock_var("CURRENT_TIMEZONE_OFFSET").unwrap().len(), 6);
+        let uuid = clock_var("UUID").unwrap();
+        assert_eq!((uuid.len(), &uuid[14..15], &uuid[8..9]), (36, "4", "-"));
+        assert_ne!(uuid, clock_var("UUID").unwrap());
+        assert_eq!(clock_var("RANDOM_HEX").unwrap().len(), 6);
+        assert!(clock_var("CURRENT_NOPE").is_none() && clock_var("TM_FILENAME").is_none());
     }
 
     #[test]
