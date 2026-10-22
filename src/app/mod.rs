@@ -57627,7 +57627,8 @@ impl App {
         }
         let name = action.branch_name().to_string();
         // The stash this makes is the one to pop, not an older one left
-        // behind should there be nothing to stash by now.
+        // behind should there be nothing to stash by now, nor a newer one a
+        // checkout hook pushes during the switch: it is popped by its commit.
         let before = crate::git::stash_oid(&root, 0).ok();
         let stash = crate::git::stash_push(&root, None);
         self.log_git("stash push", &stash);
@@ -57638,13 +57639,13 @@ impl App {
             self.status = line;
             return;
         }
-        let stashed = crate::git::stash_oid(&root, 0)
+        let created = crate::git::stash_oid(&root, 0)
             .ok()
-            .is_some_and(|oid| before != Some(oid));
+            .filter(|oid| before.as_ref() != Some(oid));
         let switched = self.apply_branch_action(action);
-        if !stashed {
+        let Some(created) = created else {
             return;
-        }
+        };
         let (line, is_error) = match (switched, migrate) {
             (false, _) => {
                 let line = format!("{} \u{b7} your changes are in the stash", self.status);
@@ -57655,7 +57656,7 @@ impl App {
                 false,
             ),
             (true, true) => {
-                let pop = crate::git::stash_pop(&root);
+                let pop = crate::git::stash_pop_oid(&root, &created);
                 self.log_git("stash pop", &pop);
                 match pop {
                     Ok(_) => (format!("Switched to {name} with your changes"), false),
