@@ -219,8 +219,7 @@ pub fn install_from_zip(zip: &Path, root: &Path, version: &str) -> Result<PathBu
 
 /// Fetch the newest release's version from [`RELEASES_LATEST_URL`].
 fn fetch_latest() -> Result<String, String> {
-    let resp = ureq::AgentBuilder::new()
-        .try_proxy_from_env(true)
+    let resp = crate::net::builder(RELEASES_LATEST_URL)
         .timeout(std::time::Duration::from_secs(15))
         .build()
         .get(RELEASES_LATEST_URL)
@@ -238,8 +237,7 @@ fn fetch_latest() -> Result<String, String> {
 /// link is still progress.
 fn download(url: &str, dest: &Path, progress: &mut dyn FnMut(u64)) -> Result<(), String> {
     use std::io::{Read, Write};
-    let resp = ureq::AgentBuilder::new()
-        .try_proxy_from_env(true)
+    let resp = crate::net::builder(url)
         .timeout_connect(std::time::Duration::from_secs(30))
         .timeout_read(std::time::Duration::from_secs(60))
         .build()

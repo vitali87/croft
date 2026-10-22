@@ -3011,6 +3011,96 @@ fn an_http_hole_no_file_variable_defines_still_refuses() {
     assert!(app.http_run.is_none(), "nothing was sent");
 }
 
+/// #924: an env file in REST Client's shape (`$shared` plus named
+/// environments) is read, not skipped. With none active, a hole only an
+/// environment fills refuses and names them; HTTP: Switch Environment
+/// lists them, and the one picked fills the request over `$shared`.
+#[test]
+fn an_http_named_environment_is_picked_from_the_palette() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let http = tmp.path().join("api.http");
+    std::fs::write(&http, "GET {{host}}/items?v={{version}}\n").unwrap();
+    std::fs::write(
+        tmp.path().join(crate::http_file::ENV_FILE),
+        r#"{"$shared": {"version": "1"}, "dev": {"host": "http://dev.test"}, "prod": {"host": "http://prod.test"}}"#,
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&http).unwrap();
+    app.send_http_request_under_caret();
+    assert!(
+        app.status.contains("no value for {{host}};")
+            && app.status.contains("(dev, prod)")
+            && app.status.contains("HTTP: Switch Environment"),
+        "{}",
+        app.status
+    );
+    assert!(app.http_run.is_none(), "nothing was sent");
+
+    app.run_command(Command::SwitchHttpEnvironment);
+    let picker = app.list_picker.as_ref().expect("the environment picker");
+    let labels: Vec<&str> = picker.rows.iter().map(|r| r.label.as_str()).collect();
+    assert_eq!(
+        labels,
+        ["No Environment ($shared only)  (current)", "dev", "prod"]
+    );
+    app.list_picker.as_mut().unwrap().selected = 2;
+    app.confirm_list_picker();
+    assert_eq!(app.status, "HTTP: environment prod");
+    let (_, resolved, _) = app.http_request_under_caret().expect("resolves");
+    assert_eq!(resolved.url, "http://prod.test/items?v=1");
+
+    // The picker reopens on the current one; No Environment goes back.
+    app.run_command(Command::SwitchHttpEnvironment);
+    let picker = app.list_picker.as_ref().unwrap();
+    assert_eq!(picker.selected_row().unwrap().label, "prod  (current)");
+    app.list_picker.as_mut().unwrap().selected = 0;
+    app.confirm_list_picker();
+    assert!(app.http_request_under_caret().is_none());
+    assert!(app.status.contains("pick an environment"), "{}", app.status);
+}
+
+/// Negative (#924): with only flat values beside the file there is no
+/// environment to switch to, and the picker says so instead of opening;
+/// JetBrains' `http-client.env.json` environments are offered too.
+#[test]
+fn an_http_environment_picker_needs_named_environments() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let http = tmp.path().join("api.http");
+    std::fs::write(&http, "GET {{host}}/a\n").unwrap();
+    std::fs::write(
+        tmp.path().join(crate::http_file::ENV_FILE),
+        r#"{"host": "http://flat.test"}"#,
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&http).unwrap();
+    app.run_command(Command::SwitchHttpEnvironment);
+    assert!(app.list_picker.is_none());
+    assert!(
+        app.status.starts_with("No named environments"),
+        "{}",
+        app.status
+    );
+    let (_, resolved, _) = app.http_request_under_caret().expect("flat still works");
+    assert_eq!(resolved.url, "http://flat.test/a");
+
+    std::fs::write(
+        tmp.path().join("http-client.env.json"),
+        r#"{"local": {"host": "http://local.test"}}"#,
+    )
+    .unwrap();
+    app.run_command(Command::SwitchHttpEnvironment);
+    let picker = app.list_picker.as_ref().expect("JetBrains' file is read");
+    assert_eq!(picker.rows[1].id, "local");
+    app.list_picker.as_mut().unwrap().selected = 1;
+    app.confirm_list_picker();
+    let (_, resolved, _) = app.http_request_under_caret().expect("resolves");
+    assert_eq!(resolved.url, "http://local.test/a");
+}
+
 /// #1537: "File: Reopen as Preview" on a plain text capture opens the
 /// rendered log view instead of refusing, keeps it through a reload, and
 /// "Reopen as Text" goes back to the editable buffer.

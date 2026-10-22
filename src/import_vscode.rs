@@ -74,6 +74,25 @@ pub fn discover_profiles() -> Vec<(String, PathBuf)> {
     found
 }
 
+/// The user directory a `--from` path names (#916): the path itself, or its
+/// `User` folder when the path is the product folder one level up
+/// (`~/.config/Code`), which holds none of a profile's files itself. Read
+/// as given, that folder imported nothing and said only "0 settings, 0
+/// keybindings".
+pub fn user_dir_in(dir: &Path) -> PathBuf {
+    let holds_a_profile = |d: &Path| {
+        ["settings.json", "keybindings.json", "snippets"]
+            .iter()
+            .any(|f| d.join(f).exists())
+    };
+    let user = dir.join("User");
+    if !holds_a_profile(dir) && holds_a_profile(&user) {
+        user
+    } else {
+        dir.to_path_buf()
+    }
+}
+
 /// One VS Code settings key croft understands, and how it lands.
 struct SettingMap {
     vscode: &'static str,
@@ -502,6 +521,8 @@ const COMMANDS: &[(&str, &str)] = &[
     ),
     ("workbench.actions.view.problems", "show_problems"),
     ("workbench.action.toggleZenMode", "toggle_zen_mode"),
+    ("editor.action.toggleWordWrap", "toggle_word_wrap"),
+    ("editor.action.toggleMinimap", "toggle_minimap"),
     (
         "workbench.action.toggleActivityBarVisibility",
         "toggle_activity_bar",
@@ -546,16 +567,24 @@ const COMMANDS: &[(&str, &str)] = &[
     ("editor.action.blockComment", "toggle_block_comment"),
     ("editor.action.quickFix", "quick_fix"),
     ("editor.action.peekDefinition", "peek_definition"),
+    ("editor.action.referenceSearch.trigger", "peek_references"),
     ("editor.action.revealDefinition", "go_to_definition"),
     ("editor.action.goToReferences", "go_to_references"),
     ("editor.action.revealDeclaration", "go_to_declaration"),
     ("editor.action.goToTypeDefinition", "go_to_type_definition"),
     ("editor.action.goToImplementation", "go_to_implementations"),
     ("editor.action.rename", "rename_symbol"),
+    ("editor.action.triggerSuggest", "trigger_suggest"),
+    (
+        "editor.action.triggerParameterHints",
+        "trigger_parameter_hints",
+    ),
     ("editor.action.startFindReplaceAction", "replace_in_file"),
     ("toggleFindInSelection", "toggle_find_in_selection"),
     ("editor.action.moveLinesUpAction", "move_line_up"),
     ("editor.action.moveLinesDownAction", "move_line_down"),
+    ("editor.action.copyLinesUpAction", "copy_line_up"),
+    ("editor.action.copyLinesDownAction", "copy_line_down"),
     ("editor.action.deleteLines", "delete_line"),
     ("deleteAllRight", "kill_to_end_of_line"),
     ("editor.action.joinLines", "join_lines"),
@@ -649,6 +678,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("undo", "undo"),
     ("redo", "redo"),
     ("references-view.showCallHierarchy", "show_incoming_calls"),
+    ("editor.showCallHierarchy", "show_incoming_calls"),
     ("workbench.action.navigateBack", "navigate_back"),
     ("workbench.action.navigateForward", "navigate_forward"),
 ];
@@ -2349,6 +2379,76 @@ mod tests {
         assert!(warnings.is_empty(), "{warnings:?}");
     }
 
+    /// #916: VS Code editor commands croft does the same thing for import,
+    /// rather than being reported as having no croft command: the view
+    /// toggles and Peek References / Call Hierarchy under the ids VS Code
+    /// binds them by, and the actions that once had no command id at all
+    /// (Copy Line Up/Down, Trigger Suggest, Trigger Parameter Hints).
+    #[test]
+    fn editor_commands_croft_has_import_under_every_vscode_id() {
+        let pairs = [
+            ("alt+w", "editor.action.toggleWordWrap", "toggle_word_wrap"),
+            (
+                "ctrl+alt+m",
+                "editor.action.toggleMinimap",
+                "toggle_minimap",
+            ),
+            ("ctrl+d", "editor.action.copyLinesUpAction", "copy_line_up"),
+            (
+                "ctrl+shift+d",
+                "editor.action.copyLinesDownAction",
+                "copy_line_down",
+            ),
+            (
+                "shift+f12",
+                "editor.action.referenceSearch.trigger",
+                "peek_references",
+            ),
+            (
+                "shift+alt+h",
+                "editor.showCallHierarchy",
+                "show_incoming_calls",
+            ),
+            (
+                "ctrl+space",
+                "editor.action.triggerSuggest",
+                "trigger_suggest",
+            ),
+            (
+                "ctrl+shift+space",
+                "editor.action.triggerParameterHints",
+                "trigger_parameter_hints",
+            ),
+        ];
+        let doc = Value::Array(
+            pairs
+                .iter()
+                .map(|(key, vscode, _)| json!({ "key": key, "command": vscode }))
+                .collect(),
+        );
+        let mut report = Report::default();
+        convert_keybindings(&doc, &mut report);
+        assert!(
+            report.dropped_keybindings.is_empty(),
+            "{:?}",
+            report.dropped_keybindings
+        );
+        let mut expected: Vec<(String, String, Option<String>)> = pairs
+            .iter()
+            .map(|(key, _, croft)| (key.to_string(), croft.to_string(), None))
+            .collect();
+        expected.sort();
+        assert_eq!(report.keybindings, expected);
+        let rows: Vec<Value> = report
+            .keybindings
+            .iter()
+            .map(|(key, command, _)| json!({ "key": key, "command": command }))
+            .collect();
+        let json = serde_json::to_string(&Value::Array(rows)).unwrap();
+        let (_keymap, warnings) = crate::keymap::Keymap::resolve(&json);
+        assert!(warnings.is_empty(), "{warnings:?}");
+    }
+
     /// Every croft command id in the table must actually exist. A typo here
     /// would produce a keybindings.json croft itself rejects at load.
     #[test]
@@ -3351,6 +3451,24 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         let report = scan_profile(dir.path()).expect("an empty profile is fine");
         assert!(report.is_empty());
+    }
+
+    /// #916: `--from` naming the product folder (`.../Code`) reads its
+    /// `User` folder, where the profile is, rather than importing nothing.
+    /// A folder holding a profile of its own is read as given.
+    #[test]
+    fn a_product_folder_is_read_through_its_user_folder() {
+        let code = tempfile::TempDir::new().unwrap();
+        let user = code.path().join("User");
+        std::fs::create_dir(&user).unwrap();
+        assert_eq!(user_dir_in(code.path()), code.path(), "User holds nothing");
+
+        std::fs::write(user.join("keybindings.json"), "[]").unwrap();
+        assert_eq!(user_dir_in(code.path()), user);
+        assert_eq!(user_dir_in(&user), user);
+
+        std::fs::write(code.path().join("settings.json"), "{}").unwrap();
+        assert_eq!(user_dir_in(code.path()), code.path());
     }
 
     /// #1499: the importer maps a language block's formatter and reports

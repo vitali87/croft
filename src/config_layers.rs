@@ -88,6 +88,12 @@ pub struct MergedConfig {
     /// order. A save to any of these should trigger a re-merge.
     pub chain: Vec<PathBuf>,
     pub warnings: Vec<String>,
+    /// The warning that says why the user's own `config.json` was skipped
+    /// whole (#923): it exists but could not be read or parsed, so every
+    /// setting in it is at its default. One of `warnings` too; kept apart
+    /// so the App can put it on the status line, where OUTPUT · Settings
+    /// alone went unseen and the settings seemed forgotten.
+    pub user_config_error: Option<String>,
 }
 
 /// The layer that set `key` per a provenance map, defaulting to
@@ -236,15 +242,23 @@ pub fn load_merged_from(
     let mut chain = Vec::new();
     let mut merged = Map::new();
     let mut provenance = BTreeMap::new();
+    let mut user_config_error = None;
 
     for (kind, path) in layers {
         chain.push(path.clone());
+        let warned = warnings.len();
         let doc = if kind == LayerKind::VsCodeWorkspace {
             load_vscode_subset(&path, &mut warnings)
         } else {
             let mut visited = Vec::new();
             load_layer_document(&path, platform, &mut visited, &mut chain, &mut warnings)
         };
+        // No document plus a new warning means the file was refused whole.
+        // A missing file adds no warning, and one that does not parse never
+        // reaches its `extends`, so the first new warning is the reason.
+        if kind == LayerKind::User && doc.is_none() {
+            user_config_error = warnings.get(warned).cloned();
+        }
         let Some(doc) = doc else { continue };
         for (key, value) in doc {
             if kind.is_allowlisted() && !WORKSPACE_ALLOWED_KEYS.contains(&key.as_str()) {
@@ -267,6 +281,7 @@ pub fn load_merged_from(
         provenance,
         chain,
         warnings,
+        user_config_error,
     }
 }
 
@@ -279,7 +294,26 @@ const LAYER_FILE_MAX: u64 = 1024 * 1024;
 /// startup, a device file would read forever) and oversized ones, both with
 /// a warning. A missing file stays silent — absent layers are normal.
 fn read_layer_file(path: &Path, warnings: &mut Vec<String>) -> Option<String> {
-    let meta = std::fs::metadata(path).ok()?;
+    let meta = match std::fs::metadata(path) {
+        Ok(meta) => meta,
+        Err(e)
+            if matches!(
+                e.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return None;
+        }
+        // A file croft cannot even stat (a parent it may not search, a
+        // symlink loop) is as unreadable as one it cannot open.
+        Err(e) => {
+            warnings.push(format!(
+                "{}: could not be read ({e}) — layer ignored",
+                path.display()
+            ));
+            return None;
+        }
+    };
     if !meta.is_file() {
         warnings.push(format!(
             "{}: not a regular file — layer ignored",
@@ -294,7 +328,16 @@ fn read_layer_file(path: &Path, warnings: &mut Vec<String>) -> Option<String> {
         ));
         return None;
     }
-    std::fs::read_to_string(path).ok()
+    // Unreadable (permissions, not UTF-8) is as broken as unparsable, and
+    // was just as silent.
+    std::fs::read_to_string(path)
+        .map_err(|e| {
+            warnings.push(format!(
+                "{}: could not be read ({e}) — layer ignored",
+                path.display()
+            ));
+        })
+        .ok()
 }
 
 /// Read one croft layer file: JSONC-tolerant parse, `extends` resolution
@@ -1202,6 +1245,59 @@ mod tests {
             "{:?}",
             m.warnings
         );
+        assert_eq!(
+            m.user_config_error, None,
+            "only the user's own config.json counts as not loaded"
+        );
+    }
+
+    /// #923: a user `config.json` with a syntax error leaves every setting
+    /// at its default, and the merge says so with the line to fix, for the
+    /// App to put on the status line.
+    #[test]
+    fn a_user_config_that_does_not_parse_is_named_with_its_line() {
+        let (_tmp, user, root) = setup();
+        write(
+            &user.join("config.json"),
+            "{\n  \"auto_save\": true,\n  \"theme\": black\n}\n",
+        );
+        let m = load_merged_from(&user, Some(&root), "linux");
+        assert!(!m.prefs.auto_save, "nothing from the file applies");
+        let error = m.user_config_error.expect("the broken file is named");
+        assert!(error.contains("config.json"), "{error}");
+        assert!(error.contains("line 3"), "{error}");
+        assert!(m.warnings.contains(&error), "{:?}", m.warnings);
+    }
+
+    /// #923 negative: no `config.json` yet is a first run, not an error.
+    #[test]
+    fn a_missing_user_config_is_not_an_error() {
+        let (_tmp, user, root) = setup();
+        let m = load_merged_from(&user, Some(&root), "linux");
+        assert_eq!(m.user_config_error, None);
+    }
+
+    /// #923: a `config.json` croft cannot read is as broken as one it
+    /// cannot parse, and used to be skipped without a word.
+    #[test]
+    fn an_unreadable_user_config_is_named() {
+        let (_tmp, user, root) = setup();
+        std::fs::write(user.join("config.json"), b"{\"theme\": \"\xff\"}").unwrap();
+        let m = load_merged_from(&user, Some(&root), "linux");
+        let error = m.user_config_error.expect("the unreadable file is named");
+        assert!(error.contains("could not be read"), "{error}");
+    }
+
+    /// #923: a `config.json` croft cannot even stat is named too, not
+    /// taken for a missing one. A symlink loop stands in for a parent
+    /// without search permission, which a test run as root would pass.
+    #[test]
+    fn a_user_config_that_cannot_be_statted_is_named() {
+        let (_tmp, user, root) = setup();
+        std::os::unix::fs::symlink("config.json", user.join("config.json")).unwrap();
+        let m = load_merged_from(&user, Some(&root), "linux");
+        let error = m.user_config_error.expect("the unreachable file is named");
+        assert!(error.contains("could not be read"), "{error}");
     }
 
     #[test]

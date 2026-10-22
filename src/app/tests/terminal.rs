@@ -2717,10 +2717,16 @@ fn terminal_modes_from_the_palette_bring_the_terminal_tab_forward() {
 /// command, and its built-in one otherwise.
 #[test]
 fn terminal_menu_rows_show_the_user_s_chord() {
+    // The built-in chords as this platform spells them (#885).
+    let (clear, rename) = if cfg!(target_os = "macos") {
+        ("⌘K K", "⌘K R")
+    } else {
+        ("Ctrl+K K", "Ctrl+K R")
+    };
     let none = crate::keymap::Keymap::from_json("[]");
     assert_eq!(
         menu_hint(&MenuAction::ClearTerminal(0), &none).as_deref(),
-        Some("⌘K K")
+        Some(clear)
     );
     let bound = crate::keymap::Keymap::from_json(
         r#"[{ "key": "ctrl+alt+k", "command": "terminal_clear" }]"#,
@@ -2731,7 +2737,7 @@ fn terminal_menu_rows_show_the_user_s_chord() {
     );
     assert_eq!(
         menu_hint(&MenuAction::RenameTerminal(0), &bound).as_deref(),
-        Some("⌘K R"),
+        Some(rename),
         "only the rebound row changes"
     );
 }
@@ -3240,6 +3246,7 @@ fn a_python_block_still_imports_from_the_pane_s_directory() {
         "python3",
         "import helper_1630\nprint(helper_1630.X)\n",
         scripts.path(),
+        "/bin/sh",
     );
     assert_eq!(run_typed_line(&cmd, tmp.path()), "local\n");
 }

@@ -45,7 +45,9 @@ scrolling and navigating freely, while edits to shared files replicate live betw
 participants and always converge (a CRDT under the hood, no central server). Peers' cursors
 appear as colored ghost carets wearing their owner's name while they move (VS Code Live Share
 style), and the session owner is the single writer to disk, so saves, history, and the file
-watcher see one author.
+watcher see one author. Undo is your own: Ctrl+Z takes back your last change and keeps what
+your partners typed since, and they see your undo as an ordinary edit. A navigator's edit is
+the exception: it undoes in one step, so you can reject it.
 
 ## An AI seat via MCP
 
