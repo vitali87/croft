@@ -334,8 +334,10 @@ pub fn builtin_redactions() -> Vec<Trigger> {
             // Google API keys.
             (r"\bAIza[0-9A-Za-z_-]{35,}", false),
             // The password in a URL's userinfo (`postgres://user:pw@host`);
-            // the user and host stay readable.
-            (r"://[^/\s:@]*:([^@\s/]+)@", false),
+            // the user and host stay readable. A raw `@` inside the password
+            // (`user:pa@ss@host`) is masked too: as URL parsers do, it runs
+            // to the last `@` before the path, query or fragment.
+            (r"://[^/\s:@]*:([^\s/?#]+)@", false),
             // JWTs: three base64url segments, the first a JSON header.
             (
                 r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b",
@@ -1044,6 +1046,11 @@ mod tests {
         assert_eq!(
             masked("redis://:s3cret@cache:6379"),
             "redis://:••••••@cache:6379"
+        );
+        assert_eq!(
+            masked("https://user:pa@ss@host/x?to=a@b"),
+            "https://user:•••••@host/x?to=a@b",
+            "a raw @ in the password is masked through the last @ before the path"
         );
         let clone_url = format!(
             "origin https://oauth2:glpat-{}@gitlab.com/x.git",
