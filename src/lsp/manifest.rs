@@ -410,12 +410,12 @@ pub struct LanguageServerDecl {
 }
 
 /// How croft provisions the server when it isn't on PATH (maps to [`Provision`]).
-/// `npm`/`uv` use `package`; `binary` uses `url` + `archive` + the OS/arch token
+/// `npm`/`uv`/`go` use `package`; `binary` uses `url` + `archive` + the OS/arch token
 /// maps. Unused fields for a given kind are simply absent.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ProvisionDecl {
     pub kind: ProvisionKind,
-    /// npm/uv package name (unused by `binary`).
+    /// npm/uv package name, or the Go module path (unused by `binary`).
     #[serde(default)]
     pub package: Option<String>,
     #[serde(default)]
@@ -455,6 +455,8 @@ pub enum ProvisionKind {
     Npm,
     Uv,
     Binary,
+    /// `go install <package>@<version>` with the user's `go` (gopls, #930).
+    Go,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -692,6 +694,11 @@ impl ProvisionDecl {
                     None | Some(TermuxPkgDecl::Flag(_)) => None,
                 },
                 sha256: intern_pairs(&self.sha256),
+            },
+            ProvisionKind::Go => Provision::Go {
+                package: package(),
+                version,
+                bin,
             },
         }
     }

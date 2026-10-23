@@ -85,6 +85,43 @@ pub fn write_string(text: &str) -> bool {
     }
 }
 
+/// What croft itself last copied, for a paste inside croft to fall back on
+/// where the host clipboard can't be read (#933). On a Linux host with no
+/// `wl-paste`, `xclip` or `xsel`, which is any SSH server, a copy reaches
+/// the user's own machine by OSC 52, and nothing can read that back, so
+/// Ctrl+V and vim's `p` came up empty after every copy and yank.
+///
+/// One for the whole process, as the host clipboard is: a copy is seen by
+/// every paste, whichever thread made it.
+#[cfg(not(test))]
+static LAST_COPY: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Keep `text` as croft's last copy, for [`last_copy`].
+pub fn remember_copy(text: &str) {
+    #[cfg(test)]
+    {
+        test_clip::remember_copy(text);
+    }
+    #[cfg(not(test))]
+    {
+        if let Ok(mut last) = LAST_COPY.lock() {
+            *last = Some(text.to_owned());
+        }
+    }
+}
+
+/// The text croft last copied, if it copied anything yet (#933).
+pub fn last_copy() -> Option<String> {
+    #[cfg(test)]
+    {
+        test_clip::last_copy()
+    }
+    #[cfg(not(test))]
+    {
+        LAST_COPY.lock().ok().and_then(|last| last.clone())
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
     use std::io::Write;
@@ -672,6 +709,20 @@ pub(crate) mod test_clip {
 
     pub(crate) fn mock_read() -> Option<String> {
         MOCK.with(|b| b.borrow().clone())
+    }
+
+    thread_local! {
+        /// `super::LAST_COPY` in tests: per thread like the mock, so one
+        /// test's copy is never another's paste.
+        static LAST_COPY: RefCell<Option<String>> = const { RefCell::new(None) };
+    }
+
+    pub(crate) fn remember_copy(text: &str) {
+        LAST_COPY.with(|b| *b.borrow_mut() = Some(text.to_string()));
+    }
+
+    pub(crate) fn last_copy() -> Option<String> {
+        LAST_COPY.with(|b| b.borrow().clone())
     }
 
     /// Read the host clipboard through the platform-native backend, bypassing
