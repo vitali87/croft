@@ -9,9 +9,11 @@
 //! `•` of the same width, the grid untouched; a click on the mask pops the
 //! real text; copies yield the real value unless the rule says
 //! `"copy": "masked"`; the scrollback-to-editor dump is always masked). A
-//! built-in redact set for the usual key shapes (AWS, OpenAI `sk-`, GitHub
-//! `ghp_`, Slack `xox`, JWTs, bearer tokens) is on by default and switched
-//! off in Settings. Auto-respond / run-command actions are deliberately absent:
+//! built-in redact set for the usual key shapes (AWS access key ids, secret
+//! access keys and session tokens, OpenAI-style `sk-`, GitHub `ghp_`,
+//! GitLab `glpat-`, Slack `xox`, Stripe `sk_live_`, Google `AIza`, JWTs,
+//! bearer tokens, URL passwords) is on by default and switched off in
+//! Settings. Auto-respond / run-command actions are deliberately absent:
 //! they are the classic security footgun (hostile output typing into your
 //! shell) and iTerm2 itself ships them behind warnings.
 //!
@@ -281,18 +283,35 @@ impl TriggerSet {
 }
 
 /// The key and token shapes masked out of the box (#360). Each pattern is
-/// anchored on a distinctive prefix (or, for bearer tokens, the
-/// `Authorization` header) so ordinary words never match; a bearer token
-/// masks only the token (group 1), leaving the header readable. PEM bodies
-/// are not covered: their base64 lines carry no prefix to anchor on, and
-/// masking every long base64 line would eat checksums and blobs. Compiled
-/// once; the set is cloned per trigger reload.
+/// anchored on a distinctive prefix so ordinary words never match. A secret
+/// with no prefix of its own (a bearer token, an AWS secret access key or
+/// session token, a URL password) is anchored on what names it instead
+/// (the `Authorization` header, the variable or field name, the `://user:`
+/// before it) and masks only the value (group 1), leaving the name
+/// readable (#921). PEM bodies are not covered: their base64 lines carry
+/// no prefix to anchor on, and masking every long base64 line would eat
+/// checksums and blobs. Compiled once; the set is cloned per trigger
+/// reload.
 pub fn builtin_redactions() -> Vec<Trigger> {
     static RULES: std::sync::LazyLock<Vec<Trigger>> = std::sync::LazyLock::new(|| {
         // (pattern, the span must carry a digit or an uppercase letter)
         const PATTERNS: &[(&str, bool)] = &[
             // AWS access key ids.
             (r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b", false),
+            // AWS secret access keys, the actual credential: 40 base64
+            // chars with no prefix, so anchored on the name in the
+            // credentials file, env vars, STS / IAM JSON and the
+            // `aws configure` prompt (`AWS Secret Access Key [None]: `).
+            (
+                r#"(?i:secret[_ ]?access[_ ]?key)(?: \[[^\]]*\])?["']?\s*[:=]\s*["']?([A-Za-z0-9/+=]{40,})"#,
+                false,
+            ),
+            // AWS session tokens (`aws_session_token`, STS `SessionToken`,
+            // boto's legacy `aws_security_token`).
+            (
+                r#"(?i:session_?token|security_?token)["']?\s*[:=]\s*["']?([A-Za-z0-9/+=]{100,})"#,
+                false,
+            ),
             // OpenAI / Anthropic / OpenRouter-style secret keys: `sk-`, up
             // to three short labels (`sk-proj-`, `sk-ant-api03-`, `sk-or-v1-`)
             // and a long body. Entropy-gated: `sk-` also opens hyphenated
@@ -306,6 +325,19 @@ pub fn builtin_redactions() -> Vec<Trigger> {
             ),
             // Slack tokens.
             (r"\bxox[abpors]-[A-Za-z0-9-]{10,}\b", false),
+            // GitLab tokens: personal (glpat-), deploy (gldt-), runner
+            // (glrt-), pipeline trigger (glptt-), OAuth app secret
+            // (gloas-), CI job (glcbt-).
+            (r"\bgl(?:pat|dt|rt|ptt|oas|cbt)-[A-Za-z0-9_-]{20,}", false),
+            // Stripe secret and restricted keys, live and test.
+            (r"\b[sr]k_(?:live|test)_[A-Za-z0-9]{16,}", false),
+            // Google API keys.
+            (r"\bAIza[0-9A-Za-z_-]{35,}", false),
+            // The password in a URL's userinfo (`postgres://user:pw@host`);
+            // the user and host stay readable. A raw `@` inside the password
+            // (`user:pa@ss@host`) is masked too: as URL parsers do, it runs
+            // to the last `@` before the path, query or fragment.
+            (r"://[^/\s:@]*:([^\s/?#]+)@", false),
             // JWTs: three base64url segments, the first a JSON header.
             (
                 r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b",
@@ -347,9 +379,10 @@ pub struct RedactSpan {
 
 /// Every redact-trigger match on `line`: capture group 1 when the regex
 /// has one (so a rule can name the secret inside a header), else the
-/// whole match. Empty matches are skipped.
+/// whole match. Empty matches are skipped, and a span several rules match
+/// is reported once.
 pub fn redact_spans(line: &str, set: &TriggerSet) -> Vec<RedactSpan> {
-    let mut out = Vec::new();
+    let mut out: Vec<RedactSpan> = Vec::new();
     for t in &set.triggers {
         if t.action != TriggerAction::Redact {
             continue;
@@ -378,9 +411,20 @@ pub fn redact_spans(line: &str, set: &TriggerSet) -> Vec<RedactSpan> {
             {
                 continue;
             }
+            let (start, len) = (
+                line[..m.start()].chars().count(),
+                m.as_str().chars().count(),
+            );
+            // Two rules naming the same secret (a `glpat-` token that is
+            // also a URL password, a JWT that is also a bearer token) give
+            // one span: the status chip counts secrets, not rules.
+            if let Some(dup) = out.iter_mut().find(|s| s.start == start && s.len == len) {
+                dup.copy_masked |= t.copy_masked;
+                continue;
+            }
             out.push(RedactSpan {
-                start: line[..m.start()].chars().count(),
-                len: m.as_str().chars().count(),
+                start,
+                len,
                 copy_masked: t.copy_masked,
             });
         }
@@ -951,6 +995,84 @@ mod tests {
         let both =
             set(r##"[{ "regex": "hunter2", "action": "redact" }]"##).with_builtin_redactions();
         assert_eq!(mask_text("pw hunter2", &both, false), "pw •••••••");
+    }
+
+    /// #921: the AWS secret access key is the credential (the `AKIA…` id
+    /// only names it), so it is masked wherever a variable, config key,
+    /// JSON field or `aws configure` prompt names it; GitLab, Stripe and
+    /// Google keys and URL passwords are masked by their own shapes.
+    #[test]
+    fn builtin_rules_mask_aws_secrets_and_other_credential_shapes() {
+        let s = TriggerSet::default().with_builtin_redactions();
+        let masked = |line: &str| mask_text(line, &s, false);
+        let dots = |v: &str| "•".repeat(v.chars().count());
+        // Samples are split so a secret scanner never takes them for keys.
+        let secret = concat!("wJalrXUtnFEMI/K7MDENG", "/bPxRfiCYEXAMPLEKEY");
+        let token = format!("IQoJb3JpZ2luX2Vj{}", "AbC0/+".repeat(20));
+        for (before, value, after) in [
+            ("aws_secret_access_key = ", secret, ""),
+            ("export AWS_SECRET_ACCESS_KEY=", secret, ""),
+            ("AWS_SECRET_ACCESS_KEY='", secret, "'"),
+            ("{'aws_secret_access_key': '", secret, "'}"),
+            ("        \"SecretAccessKey\": \"", secret, "\","),
+            ("AWS Secret Access Key [None]: ", secret, ""),
+            ("aws_session_token = ", &token, ""),
+            ("export AWS_SESSION_TOKEN=", &token, ""),
+            ("        \"SessionToken\": \"", &token, "\""),
+        ] {
+            assert_eq!(
+                masked(&format!("{before}{value}{after}")),
+                format!("{before}{}{after}", dots(value)),
+                "only the value goes, the name stays readable"
+            );
+        }
+        for key in [
+            format!("glpat-{}", "abcdefghijklmnopqrst"),
+            format!("glrt-{}", "t1_AbCdEfGhIjKlMnOpQrSt"),
+            format!("sk_{}_51H{}", "live", "abcdefGHIJKLmnop1234"),
+            format!("rk_{}_{}", "test", "abcdefGHIJKLmnop1234"),
+            format!("AIza{}", "SyA-1234567890abcdefghijklmnopqrstu"),
+        ] {
+            assert_eq!(
+                masked(&format!("key {key} end")),
+                format!("key {} end", dots(&key))
+            );
+        }
+        assert_eq!(
+            masked("DATABASE_URL=postgres://admin:hunter2secret@db.example.com:5432/app"),
+            "DATABASE_URL=postgres://admin:•••••••••••••@db.example.com:5432/app",
+            "only the password goes; user and host stay readable"
+        );
+        assert_eq!(
+            masked("redis://:s3cret@cache:6379"),
+            "redis://:••••••@cache:6379"
+        );
+        assert_eq!(
+            masked("https://user:pa@ss@host/x?to=a@b"),
+            "https://user:•••••@host/x?to=a@b",
+            "a raw @ in the password is masked through the last @ before the path"
+        );
+        let clone_url = format!(
+            "origin https://oauth2:glpat-{}@gitlab.com/x.git",
+            "a".repeat(20)
+        );
+        assert_eq!(
+            redact_spans(&clone_url, &s).len(),
+            1,
+            "a token that is also a URL password is one secret on the status chip"
+        );
+        for prose in [
+            "AWS_SECRET_ACCESS_KEY=test",
+            "aws_secret_access_key = ${AWS_SECRET}",
+            "AWS_SESSION_TOKEN=short",
+            "https://example.com:8080/path@v2",
+            "ssh://git@github.com:22/org/repo.git",
+            "git@github.com:org/repo.git",
+            "sk_live_short",
+            "glpat-short",
+        ] {
+            assert_eq!(masked(prose), prose, "not a credential");
+        }
     }
 
     #[test]

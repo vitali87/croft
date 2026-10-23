@@ -3247,6 +3247,13 @@ impl WorkerState {
             .into_iter()
             .flatten()
             .collect();
+            if first_attempt
+                && resolved.is_empty()
+                && let Some(note) =
+                    missing_servers_note(lang, &configs, crate::lsp::install::missing_installer)
+            {
+                report_missing_servers_once(lang, &note);
+            }
             let outcomes =
                 futures::future::join_all(resolved.into_iter().map(|(config, extra_path)| {
                     let caps = build_client_capabilities();
@@ -7779,14 +7786,16 @@ fn resolve_config(config: &ServerConfig, log_skip: bool) -> Option<(ServerConfig
         // binary is a rustup proxy with no component behind it). npm/uv servers
         // keep their own managed-first (vtsls) or PATH-first (ty/ruff) ordering
         // inside `resolve_managed`, so this preference is scoped to the Binary
-        // backend.
-        if matches!(provision, crate::lsp::install::Provision::Binary { .. })
-            && let Some(resolved) = resolve_path_only(
-                config,
-                is_on_path(&config.command),
-                &toolchain_fallback_dirs(),
-            )
-        {
+        // and Go backends (a gopls in ~/go/bin is the user's own, #930).
+        if matches!(
+            provision,
+            crate::lsp::install::Provision::Binary { .. }
+                | crate::lsp::install::Provision::Go { .. }
+        ) && let Some(resolved) = resolve_path_only(
+            config,
+            is_on_path(&config.command),
+            &toolchain_fallback_dirs(),
+        ) {
             return Some(resolved);
         }
         return crate::lsp::install::resolve_managed(config, provision, log_skip);
@@ -7805,6 +7814,63 @@ fn resolve_config(config: &ServerConfig, log_skip: bool) -> Option<(ServerConfig
         ));
     }
     None
+}
+
+/// What to tell the user when `lang` is left with no language server (#930):
+/// every server it registers is missing from PATH and croft cannot install
+/// any of them, because it has no provision or `installer_missing` names
+/// the tool its install needs. `None` when the language registers no server,
+/// or one of them can still be installed (that install reports its own
+/// progress and failures).
+fn missing_servers_note(
+    lang: Language,
+    configs: &[ServerConfig],
+    installer_missing: impl Fn(&crate::lsp::install::Provision) -> Option<&'static str>,
+) -> Option<String> {
+    if configs.is_empty() {
+        return None;
+    }
+    let mut why = Vec::with_capacity(configs.len());
+    for config in configs {
+        match config.provision.as_ref().map(&installer_missing) {
+            None => why.push(format!("{} isn't on PATH", config.command)),
+            Some(Some(tool)) => why.push(format!(
+                "{} isn't on PATH, and installing it needs {tool}",
+                config.command
+            )),
+            Some(None) => return None,
+        }
+    }
+    let label = crate::highlight::lang_for_language_id(lang.lsp_id())
+        .map_or(lang.lsp_id(), |kind| {
+            crate::widgets::editor::language_label(Some(kind))
+        });
+    Some(format!(
+        "{label}: no language server, so no diagnostics or completion ({})",
+        why.join("; ")
+    ))
+}
+
+/// Show `note` in the status bar and OUTPUT › Server Provisioning the first
+/// time `lang` is found without a server this session; later files of that
+/// language, and other project roots, stay quiet.
+fn report_missing_servers_once(lang: Language, note: &str) {
+    static REPORTED: StdMutex<std::collections::BTreeSet<&'static str>> =
+        StdMutex::new(std::collections::BTreeSet::new());
+    let first = REPORTED
+        .lock()
+        .map(|mut seen| seen.insert(lang.lsp_id()))
+        .unwrap_or(false);
+    if !first {
+        return;
+    }
+    log_file::log(&format!("lsp[{}] {note}", lang.lsp_id()));
+    crate::output::push(
+        crate::output::CHANNEL_PROVISION,
+        crate::output::OutputLevel::Warn,
+        note,
+    );
+    crate::lsp::install::set_status(note);
 }
 
 pub(crate) fn is_on_path(cmd: &str) -> bool {
@@ -9529,6 +9595,105 @@ while True:
         assert!(
             resolve_config(&present, false).is_some(),
             "a server whose command is on PATH must resolve"
+        );
+    }
+
+    /// #930: a language whose only servers are missing says why, naming the
+    /// command and, for one croft could build, the tool it would need.
+    #[test]
+    fn a_language_with_no_installable_server_gets_a_note_naming_the_missing_command() {
+        use crate::lsp::install::Provision;
+        let nothing_missing = |_: &Provision| None;
+        assert_eq!(
+            missing_servers_note(
+                Language::LUA,
+                &[ServerConfig::lua_language_server()],
+                nothing_missing
+            )
+            .as_deref(),
+            Some(
+                "Lua: no language server, so no diagnostics or completion (lua-language-server isn't on PATH)"
+            )
+        );
+        assert_eq!(
+            missing_servers_note(Language::GO, &[ServerConfig::gopls()], |_: &Provision| {
+                Some("go")
+            })
+            .as_deref(),
+            Some(
+                "Go: no language server, so no diagnostics or completion (gopls isn't on PATH, and installing it needs go)"
+            )
+        );
+        // An install that can run reports its own progress, so no note: gopls
+        // with `go` present, or Python's ty beside a PATH-only basedpyright.
+        assert_eq!(
+            missing_servers_note(Language::GO, &[ServerConfig::gopls()], nothing_missing),
+            None
+        );
+        let python = [ServerConfig::ty(), ServerConfig::basedpyright()];
+        assert_eq!(
+            missing_servers_note(Language::PYTHON, &python, nothing_missing),
+            None
+        );
+        assert_eq!(
+            missing_servers_note(Language::LUA, &[], nothing_missing),
+            None
+        );
+    }
+
+    /// #930: opening a file whose language has no server on PATH used to be
+    /// silent apart from lsp.log. It is now said once in OUTPUT › Server
+    /// Provisioning, not again for another file or another project root.
+    #[test]
+    fn a_language_left_without_a_server_is_reported_once() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonicalize");
+        let lang = Language("issue930-no-server");
+        let mut registry = ServerRegistry::new();
+        registry.register(
+            lang,
+            ServerConfig {
+                name: "issue930-server",
+                command: "issue930-not-a-real-server".into(),
+                args: vec![],
+                language: lang,
+                initialization_options: None,
+                provision: None,
+            },
+        );
+        let (diag_tx, _diag_rx) = std_mpsc::channel();
+        let (prog_tx, _prog_rx) = std_mpsc::channel();
+        let mut state = WorkerState {
+            workspace_root: root.clone(),
+            extra_roots: Vec::new(),
+            registry,
+            clients: HashMap::new(),
+            docs: HashMap::new(),
+            capability_support: Arc::new(StdMutex::new(LangCapabilitySupport::default())),
+            semantic_refresh: Arc::new(AtomicBool::new(false)),
+            inlay_refresh: Arc::new(AtomicBool::new(false)),
+            diagnostic_refresh: Arc::new(AtomicBool::new(false)),
+            diagnostics_tx: diag_tx,
+            progress_tx: prog_tx,
+            restarts: ServerRestarts::default(),
+        };
+        let runtime = LspRuntime::new().expect("runtime");
+        let handle = runtime.handle().clone();
+        handle.block_on(state.ensure_clients(lang, &root));
+        handle.block_on(state.ensure_clients(lang, &root));
+        handle.block_on(state.ensure_clients(lang, &root.join("other")));
+        let notes: Vec<String> = crate::output::snapshot(crate::output::CHANNEL_PROVISION)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|l| l.text.contains("issue930-not-a-real-server"))
+            .map(|l| l.text)
+            .collect();
+        assert_eq!(
+            notes,
+            [
+                "issue930-no-server: no language server, so no diagnostics or completion (issue930-not-a-real-server isn't on PATH)"
+            ],
+            "the missing server must be reported exactly once"
         );
     }
 

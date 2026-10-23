@@ -13,6 +13,8 @@
 //!   - [`Provision::Uv`] — Python's `ty` / `ruff`, installed with `uv tool
 //!     install` into a croft-owned tool dir. uv resolves the platform, Python
 //!     interpreter and version itself, so there is no tarball to unpack.
+//!   - [`Provision::Go`] — Go's `gopls`, built with the user's own `go install`
+//!     so it matches their toolchain.
 //!
 //! Every install is lazy and best-effort: it fires the first time a file whose
 //! server is missing is opened, runs on a detached thread so launch is never
@@ -102,6 +104,16 @@ pub enum Provision {
         /// skip the gate.
         sha256: &'static [(&'static str, &'static str)],
     },
+    /// A Go command built with the user's own `go install <package>@<version>`
+    /// into `~/.croft/servers/<name>/<version>/` (gopls, #930), so the server
+    /// is compiled by the toolchain it will analyse. The version is part of
+    /// the path, so a bumped pin installs afresh. Needs `go` on PATH; without
+    /// it no install is tried and the language reports that it has no server.
+    Go {
+        package: &'static str,
+        version: Option<&'static str>,
+        bin: &'static str,
+    },
 }
 
 /// Archive format of a [`Provision::Binary`] download.
@@ -126,7 +138,7 @@ pub enum ArchiveKind {
 /// which is all the status bar can show anyway.
 static STATUS: Mutex<Option<String>> = Mutex::new(None);
 
-fn set_status(msg: impl Into<String>) {
+pub(crate) fn set_status(msg: impl Into<String>) {
     if let Ok(mut g) = STATUS.lock() {
         *g = Some(msg.into());
     }
@@ -266,6 +278,24 @@ pub fn resolve_managed(
                 return Some((resolved, Vec::new()));
             }
         }
+        Provision::Go { bin, version, .. } => {
+            if let Some(command) = go_command(config.name, bin, *version) {
+                let mut resolved = config.clone();
+                resolved.command = command;
+                return Some((resolved, Vec::new()));
+            }
+        }
+    }
+    // Nothing to install with: the manager says so once for the language,
+    // rather than an install thread failing again on every re-probe.
+    if let Some(tool) = missing_installer(provision) {
+        if log_skip {
+            log_file::log(&format!(
+                "lsp[{}] skip: `{}` not on PATH and no `{tool}` to install it",
+                config.name, config.command
+            ));
+        }
+        return None;
     }
     // Not installed yet: start the one-shot managed install. This open skips the
     // server; a later request re-probes once the install lands.
@@ -333,6 +363,19 @@ pub fn provisioned_command(name: &str, provision: &Provision) -> Option<(String,
         Provision::Binary { bin, bin_path, .. } => {
             binary_command(name, bin, *bin_path).map(|c| (c, Vec::new()))
         }
+        Provision::Go { bin, version, .. } => {
+            go_command(name, bin, *version).map(|c| (c, Vec::new()))
+        }
+    }
+}
+
+/// The program croft needs before it can install `provision`, when the box
+/// lacks it. Only the Go backend builds with a toolchain croft never fetches:
+/// npm and uv report their own missing tools once an install is tried.
+pub(crate) fn missing_installer(provision: &Provision) -> Option<&'static str> {
+    match provision {
+        Provision::Go { .. } if !crate::lsp::manager::is_on_path("go") => Some("go"),
+        _ => None,
     }
 }
 
@@ -372,6 +415,17 @@ fn uv_command(bin: &str, package: &str, version: Option<&str>) -> Option<String>
     None
 }
 
+/// Resolve an invocable command for a Go-provisioned server: a copy on PATH
+/// (the user's own, built for their toolchain) wins, then croft's copy at the
+/// pinned version. `None` when neither exists yet.
+fn go_command(name: &str, bin: &str, version: Option<&str>) -> Option<String> {
+    if crate::lsp::manager::is_on_path(bin) {
+        return Some(bin.to_string());
+    }
+    let p = go_bin_dir(&servers_dir()?, name, version).join(bin);
+    p.is_file().then(|| p.to_string_lossy().into_owned())
+}
+
 // ---------------------------------------------------------------------------
 // Managed install locations.
 // ---------------------------------------------------------------------------
@@ -398,6 +452,12 @@ fn npm_bin_in(prefix: &Path, bin: &str) -> PathBuf {
 /// Absolute path to a managed npm-installed binary, whether or not it exists.
 fn managed_npm_binary(name: &str, bin: &str) -> Option<PathBuf> {
     Some(npm_bin_in(&npm_prefix(name)?, bin))
+}
+
+/// The `GOBIN` a Go-provisioned server is installed into:
+/// `<servers>/<name>/<version>`, or `latest` when unpinned.
+fn go_bin_dir(servers: &Path, name: &str, version: Option<&str>) -> PathBuf {
+    servers.join(name).join(version.unwrap_or("latest"))
 }
 
 /// croft's uv tool dir (`uv` installs each tool's venv here).
@@ -968,6 +1028,12 @@ fn uv_spec(package: &str, version: Option<&str>) -> String {
     }
 }
 
+/// Build the module path `go install` takes: `go install` outside a module
+/// needs a version, so an unpinned package installs `@latest`.
+fn go_spec(package: &str, version: Option<&str>) -> String {
+    format!("{package}@{}", version.unwrap_or("latest"))
+}
+
 // ---------------------------------------------------------------------------
 // Background installers.
 // ---------------------------------------------------------------------------
@@ -1024,8 +1090,47 @@ pub fn ensure_in_background(config: &ServerConfig, provision: &Provision) {
                     sha256,
                 },
             ),
+            Provision::Go {
+                package, version, ..
+            } => run_go_install(name, language, package, *version),
         }
     });
+}
+
+/// `GOBIN=~/.croft/servers/<name>/<version> go install <package>@<version>`,
+/// with the user's own `go`, which fetches a newer toolchain itself when the
+/// pinned release needs one (unless `GOTOOLCHAIN=local` forbids it, which
+/// fails here with go's own explanation in the log and OUTPUT).
+fn run_go_install(name: &'static str, language: Language, package: &str, version: Option<&str>) {
+    if !crate::lsp::manager::is_on_path("go") {
+        log_file::log(&format!("lsp[{name}] cannot auto-install: no `go` found"));
+        set_status(format!("{name} unavailable: install Go (go not found)"));
+        return;
+    }
+    let Some(gobin) = servers_dir().map(|d| go_bin_dir(&d, name, version)) else {
+        return;
+    };
+    if let Err(e) = std::fs::create_dir_all(&gobin) {
+        log_file::log(&format!("lsp[{name}] could not create {gobin:?}: {e}"));
+        set_status(format!(
+            "{name} install failed (could not create install dir)"
+        ));
+        return;
+    }
+    let spec = go_spec(package, version);
+    log_file::log(&format!("lsp[{name}] go install {spec} into {gobin:?}"));
+    crate::output::push(
+        crate::output::CHANNEL_PROVISION,
+        crate::output::OutputLevel::Info,
+        &format!("{name}: go install {spec}"),
+    );
+    set_status(format!("Installing {name} (go install)"));
+    let output = Command::new("go")
+        .arg("install")
+        .arg(&spec)
+        .env("GOBIN", &gobin)
+        .output();
+    finish_install(name, language, output);
 }
 
 /// `npm install --prefix ~/.croft/servers/<name> <pkg>`. Requires `npm` on PATH
@@ -1221,6 +1326,11 @@ fn finish_install(
         Ok(out) => {
             let err = String::from_utf8_lossy(&out.stderr);
             log_file::log(&format!("lsp[{name}] install failed: {}", err.trim()));
+            crate::output::push(
+                crate::output::CHANNEL_PROVISION,
+                crate::output::OutputLevel::Error,
+                &format!("{name}: install failed: {}", err.trim()),
+            );
             set_status(format!("{name} install failed (see ~/.croft/lsp.log)"));
         }
         Err(e) => {
@@ -2296,6 +2406,30 @@ mod tests {
         // PyPI version pinning is `pkg==X`, not npm's `pkg@X`.
         assert_eq!(uv_spec("ruff", Some("0.9.0")), "ruff==0.9.0");
         assert_eq!(uv_spec("ty", None), "ty", "no pin tracks latest");
+    }
+
+    /// #930: `go install` outside a module needs `@version`, and each pin
+    /// gets its own GOBIN, so bumping the pin installs afresh instead of
+    /// running the copy the old pin left behind.
+    #[test]
+    fn go_installs_pin_the_version_in_the_spec_and_the_install_dir() {
+        assert_eq!(
+            go_spec("golang.org/x/tools/gopls", Some("v0.23.0")),
+            "golang.org/x/tools/gopls@v0.23.0"
+        );
+        assert_eq!(
+            go_spec("golang.org/x/tools/gopls", None),
+            "golang.org/x/tools/gopls@latest"
+        );
+        let servers = Path::new("/home/u/.croft/servers");
+        assert_eq!(
+            go_bin_dir(servers, "gopls", Some("v0.23.0")),
+            servers.join("gopls").join("v0.23.0")
+        );
+        assert_eq!(
+            go_bin_dir(servers, "gopls", None),
+            servers.join("gopls").join("latest")
+        );
     }
 
     #[test]

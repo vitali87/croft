@@ -1367,6 +1367,25 @@ fn status_message_with_wide_chars_keeps_its_tail_beside_the_cluster() {
     );
 }
 
+/// #925: a message of several lines (git's text, a tool's error) is drawn
+/// with a space where each line break or tab was; drawn as is, they were
+/// dropped and the words either side ran together.
+#[test]
+fn a_multi_line_status_message_keeps_its_words_apart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let backend = ratatui::backend::TestBackend::new(140, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    app.status =
+        String::from("Branch: overwritten by checkout:\n\ta.txt\nswitch branches.\nAborting");
+    term.draw(|f| app.render(f)).unwrap();
+    let row = status_row(&term);
+    assert!(
+        row.contains("Branch: overwritten by checkout: a.txt switch branches. Aborting"),
+        "{row:?}"
+    );
+}
+
 /// The recorder's prompt from Preferences: Open Keyboard Shortcuts, which
 /// is longer than the room the right-hand cluster leaves at 140 columns.
 fn recorder_prompt() -> String {

@@ -18,7 +18,7 @@ Resizes call `master.resize(...)` and `term.resize(...)` so programs like `htop`
 src/
 ├── main.rs              entry point + module declarations
 ├── cli.rs               clap CLI: open path, setup-terminal / setup-iterm2 / setup-cross / remote / view / keys subcommands
-├── clipboard.rs         native macOS clipboard read/write (NSPasteboard) with pbpaste fallback
+├── clipboard.rs         native macOS clipboard read/write (NSPasteboard) with pbpaste fallback, wl-paste / xclip / xsel on Linux, and croft's own last copy, which a paste inside croft falls back to where the host clipboard can't be read (an SSH host with no clipboard tool)
 ├── command_history.rs    durable cross-session shell command history as JSONL under `~/.config/croft/command_history.jsonl` (cwd / exit / duration), read off OSC 133 marks with no shell hooks; Ctrl+Shift+H opens the search popup
 ├── fleet.rs              running one command across N ssh hosts and diffing the results, behind "Terminal: Fleet Run"; the fleet must be named (`hosts: command`, `*` for explicit broadcast)
 ├── gh.rs                what croft says when the GitHub CLI is missing or signed out: one shared message for every `gh` caller (`croft pr`, PR review, code scanning, CodeQL), plus the installed-and-signed-in check `croft pr` runs before taking the terminal (offline `gh auth token` first)
@@ -104,7 +104,7 @@ src/
 ├── view_ipc.rs           `croft view <file>` (#362): the channel a pane uses to ask the croft hosting it to open a file, so a shell prompt can reach the paged-PDF / sheet / SQLite viewers that only exist as editor tabs. The pane's shell is a child of that croft, so both ends share a host and uid and a 0600 socket suffices; the CLIENT resolves the path (croft's idea of a pane cwd is a scraped approximation) and it travels as raw BYTES in a JSON line, since `to_string_lossy` would open a different file. Croft binds `view-<pid>-<nonce>.sock` under the cache dir, accepts non-blocking from the frame loop, and sweeps stale sockets by `kill(pid, 0)` on the pid in the NAME rather than by connecting, which would race a concurrent bind. `croft view -` stages piped bytes under a sniffed extension in `~/.cache/croft/view-stdin/`, 0600 under 0700, swept after 24h
 ├── vim.rs               native modal (vim-style) editing: a pure key state machine (modes, counts, operators, text objects, f/t, search, ex-commands) that emits editing intents the app applies; toggled with Cmd+E
 ├── voice.rs              voice input for the Termux OSK mic key: delegates to `termux-dialog speech`, auto-installs `termux-api`, and injects the transcript via handle_key; a tap opens the dialog, a second tap cancels
-├── zoxide.rs            zoxide integration: strict query + typo-tolerant fuzzy fallback (Damerau-Levenshtein) + ensure-install (pkg on Termux, curl script elsewhere) with a logged outcome + InstallState surfaced to the Cmd+Z jump popup
+├── zoxide.rs            zoxide integration: strict query + typo-tolerant fuzzy fallback (Damerau-Levenshtein) + install only on the user's y to the popup's offer, never at launch (pkg on Termux, curl script elsewhere), its outcome and failure reason kept for the session + InstallState surfaced to the Cmd+Z jump popup
 ├── app/                 event loop, three-pane layout + activity bar, key dispatch, status bar, mouse, clipboard, splitters, preview overlays, Customize Layout (compute_chrome_layout / panel_band_rect pure geometry, secondary side bar, Zen Mode)
 │   ├── mod.rs           the main App: render, key / mouse dispatch, status bar, splitters
 │   ├── click.rs         double / triple click detection
@@ -149,7 +149,7 @@ src/
 │   ├── client.rs             async-lsp client wrapper: routes diagnostics (pushed and pulled) and `$/progress` to the status bar, acknowledges refresh requests into shared re-pull flags, declares `workspace.workspaceFolders` and answers the server→client folder request from the same list initialize carried
 │   ├── config.rs             per-language LSP config (basedpyright, ruff, ty, vtsls, rust-analyzer, gopls); the ServerConfig factories are the executable spec the bundled manifests reproduce, and Language is an open newtype so extensions can add one
 │   ├── rust_analyzer.rs      rust-analyzer's non-LSP requests (expandMacro, parentModule, openCargoToml, rebuildProcMacros, reloadWorkspace) sent as raw JSON, their params and how their answers read
-│   ├── install.rs            croft-managed server provisioning: lazy background installs into `~/.croft/servers` via three backends — npm, uv (rerouted to Termux `pkg` on Android), and Binary (per-platform release download, PATH-first)
+│   ├── install.rs            croft-managed server provisioning: lazy background installs into `~/.croft/servers` via four backends — npm, uv (rerouted to Termux `pkg` on Android), Binary (per-platform release download, PATH-first), and Go (`go install` with the user's toolchain, PATH-first)
 │   ├── languages.rs     language table: file-extension -> language, root markers, and server family, all built from extension manifests' [[languages]] blocks (replaces the old hardcoded Language enum match arms)
 │   ├── log_file.rs      LSP stderr / debug log sink at ~/.croft/lsp.log
 │   ├── manager.rs            LSP lifecycle: workspace pre-warm at startup, spawn, did_open / did_change / did_save, completion, documentSymbol, inlay hints, documentHighlight and whole-project pull diagnostics
@@ -670,6 +670,8 @@ Rendered Markdown preview (`Cmd/Ctrl+Shift+V`): a pulldown-cmark event stream tu
 
 **Remote URLs and missing files keep the labelled placeholder** — the preview never fetches.
 
+**Links can be followed (#931).** The build keeps each link's destination with the `(line, span)` of every span drawing it, and each heading's GitHub slug with its source line. `link_at` repaints the visible lines with each link's spans coloured by its index, so the paragraph's own wrap places them and the cell under the pointer names the link. The app follows a click or Ctrl+click on release: `#slug` scrolls through the scroll-sync map, a relative path opens through the file-reference path, `http(s)` goes to the browser, any other scheme is refused.
+
 **Chord forwarding.** `setup-iterm2` forwards the chord (and also relocates iTerm2's "Paste Selection" menu item off `Cmd+Shift+V`), as does `setup-ghostty`.
 
 ### testing.rs
@@ -788,6 +790,8 @@ LSP lifecycle: pre-warm, spawn, `did_open`, `did_change`, `did_save`, completion
 
 **Call hierarchy.** `prepareCallHierarchy` plus `incomingCalls`/`outgoingCalls`, one level per `Cmd+K H` / `Cmd+K Shift+H` invocation into the shared location picker. Incoming rows jump to the call expression, outgoing to the callee's definition.
 
+**A language left with no server says so once (#930).** When every server a language registers is missing from PATH and none can be installed (no provision, or a Go provision with no `go`), `missing_servers_note` names the missing commands and `report_missing_servers_once` puts the note in the status bar and OUTPUT › Server Provisioning, once per language per session. A provisioned server that can still install stays quiet here, since its install reports its own progress.
+
 ### problem_matchers.rs
 
 User-defined problem matchers, read from `~/.config/croft/matchers.json` and workspace `.croft/matchers.json` (palette "Preferences: Open Problem Matchers (JSON)", reloaded on save). They compile into `CompiledMatcher`s: single or multi-line regex sequences with named groups (file/line/col/severity/message/code, VS Code-style `loop` tails), `applies_to` command globs, and `severity_map`.
@@ -861,6 +865,8 @@ An SGR span parser for colour-bearing text. One pass turns a raw line into visib
 **Two entry points, one allocation.** `parse_into` writes into a caller-owned line so a bulk scan reuses one allocation instead of building a String and a span Vec per line. `parse_line` wraps it for one-shot callers.
 
 **One implementation on purpose.** There is a single copy of the stripping rules. A second "just strip the escapes" implementation would drift from this one, and everything that trusts the stripped text — find, copy, `path:line` scanning — must see the same characters the renderer painted.
+
+**A stream ends lines at newlines, not at chunks.** `AnsiStream` parses output that arrives in pieces, as a debug adapter's `output` events do, where one line can come in several events and an event can end mid-line or mid-escape (#1501, #932). It keeps the line it is in the middle of open until a newline ends it, blank lines included, and a carriage return rewrites the open line, so a progress bar redraws in place. The Debug Console keeps one stream per session and output category, shows each open line as it reads so far and redraws it where it stands.
 
 ### archive.rs
 
@@ -1094,7 +1100,7 @@ Hand-curated "IN THIS RELEASE" highlights (feature or fix, glyph plus summary) s
 
 ### run_debug.rs
 
-The Run and Debug sidebar widget: an empty-state Run [filename] button, and when a session is live the paused-state tree (call stack, expandable variables, WATCH), a debug console of program output (soft-wrapped to the panel width by display columns, #867, and coloured by the program's own SGR sequences, which `ansi_text` turns into spans; other escapes are dropped, #1501), and a `❯` REPL prompt. Every console line is also mirrored, as plain text, to the OUTPUT bus's "Debug Console" channel. The App builds the rows and maps clicks back to frames and variables.
+The Run and Debug sidebar widget: an empty-state Run [filename] button, and when a session is live the paused-state tree (call stack, expandable variables, WATCH), a debug console of program output (soft-wrapped to the panel width by display columns, #867, and coloured by the program's own SGR sequences, which `ansi_text` turns into spans; other escapes are dropped, #1501; a line per newline the program printed, however the adapter cut its output into events, #932), and a `❯` REPL prompt. Every console line is also mirrored, as plain text, to the OUTPUT bus's "Debug Console" channel. The App builds the rows and maps clicks back to frames and variables.
 
 **WATCH is frame-relative.** Session-scoped expressions are re-evaluated on every stop via DAP `evaluate` with context `watch`, against the SELECTED frame. The stop selects the top frame, and clicking a call-stack frame re-evaluates every watch against that frame.
 
@@ -1259,7 +1265,7 @@ Per-language LSP config for basedpyright, ruff, ty, vtsls, rust-analyzer and gop
 
 ### lsp/install.rs
 
-Croft-managed server provisioning: lazy background installs into `~/.croft/servers` through three backends. npm covers vtsls, JSON/HTML/CSS, yaml and bash; uv covers ty, ruff and rumdl, including the uv bootstrap, and is rerouted to Termux's `pkg` on Android, or, for a tool Termux does not package (`termux_pkg = false`, rumdl), left to a copy on PATH; Binary covers clangd, taplo, rust-analyzer and marksman, downloading a host-agnostic per-platform release asset and unzipping, gunzipping, untarring or (for marksman's bare executables) writing it as-is, PATH-first including `~/.cargo/bin`. A manifest that pins SHA-256 digests has each download checked before anything is written or marked executable.
+Croft-managed server provisioning: lazy background installs into `~/.croft/servers` through four backends. npm covers vtsls, JSON/HTML/CSS, yaml and bash; uv covers ty, ruff and rumdl, including the uv bootstrap, and is rerouted to Termux's `pkg` on Android, or, for a tool Termux does not package (`termux_pkg = false`, rumdl), left to a copy on PATH; Binary covers clangd, taplo, rust-analyzer and marksman, downloading a host-agnostic per-platform release asset and unzipping, gunzipping, untarring or (for marksman's bare executables) writing it as-is, PATH-first including `~/.cargo/bin`. A manifest that pins SHA-256 digests has each download checked before anything is written or marked executable. Go covers gopls: a copy on PATH or in `~/go/bin` wins, else croft runs the user's own `go install <module>@<pin>` with `GOBIN` at `~/.croft/servers/<name>/<pin>`, so the server is built by the toolchain it analyses and a bumped pin installs afresh. With no `go` on PATH no install is tried (`missing_installer`), and the manager reports the language as having no server.
 
 **A Binary can carry a `termux_pkg`.** On Android the glibc release can't run on bionic, so such a backend reroutes to `pkg`, as rust-analyzer does.
 

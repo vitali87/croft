@@ -254,7 +254,13 @@ impl ServerConfig {
             args: vec!["serve".into()],
             language: Language::GO,
             initialization_options: None,
-            provision: None,
+            // Built with the user's own `go install` when no gopls is on PATH
+            // (#930), so it matches the toolchain it analyses.
+            provision: Some(crate::lsp::install::Provision::Go {
+                package: "golang.org/x/tools/gopls",
+                version: Some("v0.23.0"),
+                bin: "gopls",
+            }),
         }
     }
 
@@ -403,10 +409,9 @@ mod tests {
 
     #[test]
     fn path_only_servers_have_no_provision() {
-        // gopls / basedpyright are expected on the user's toolchain PATH; croft
-        // doesn't install them. (rust-analyzer USED to be here too, but now
-        // carries a Binary provision — see `rust_analyzer_provisions_as_binary`.)
-        assert!(ServerConfig::gopls().provision.is_none());
+        // basedpyright is expected on the user's toolchain PATH; croft doesn't
+        // install it. (rust-analyzer and gopls USED to be here too, but now
+        // carry a Binary and a Go provision.)
         assert!(ServerConfig::basedpyright().provision.is_none());
     }
 
@@ -472,5 +477,14 @@ mod tests {
         assert_eq!(c.command, "gopls");
         assert_eq!(c.args, vec!["serve"]);
         assert_eq!(c.language, Language::GO);
+        // #930: without a gopls on PATH, croft builds a pinned one with `go`.
+        assert_eq!(
+            c.provision,
+            Some(crate::lsp::install::Provision::Go {
+                package: "golang.org/x/tools/gopls",
+                version: Some("v0.23.0"),
+                bin: "gopls",
+            })
+        );
     }
 }

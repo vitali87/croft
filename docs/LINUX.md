@@ -68,7 +68,7 @@ sudo pacman -S poppler              # Arch
 
 ## Language servers
 
-croft auto-provisions `rust-analyzer` on first use, downloading the official release binary into `~/.croft/servers`; a copy on your `PATH` or in `~/.cargo/bin` wins, so it matches your toolchain, unless it is rustup's proxy for a toolchain without the `rust-analyzer` component (rustup's default profile leaves it out; `rustup component add rust-analyzer` adds it). It picks up `gopls` from `PATH`, auto-installs `vtsls` for TypeScript / JavaScript on first use where `node` + `npm` are present, and provisions the Python servers (`ty`, `ruff`) via `uv`. You can still install distro packages — a PATH copy takes precedence:
+croft auto-provisions `rust-analyzer` on first use, downloading the official release binary into `~/.croft/servers`; a copy on your `PATH` or in `~/.cargo/bin` wins, so it matches your toolchain, unless it is rustup's proxy for a toolchain without the `rust-analyzer` component (rustup's default profile leaves it out; `rustup component add rust-analyzer` adds it). It picks up `gopls` from `PATH` (or `~/go/bin`), and without one builds a pinned gopls with your own `go install` when `go` is on `PATH`; it auto-installs `vtsls` for TypeScript / JavaScript on first use where `node` + `npm` are present, and provisions the Python servers (`ty`, `ruff`) via `uv`. You can still install distro packages — a PATH copy takes precedence:
 
 ```bash
 sudo apt install rust-analyzer gopls nodejs npm   # adjust per distro; rust-analyzer optional
