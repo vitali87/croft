@@ -21,6 +21,7 @@ src/
 ├── clipboard.rs         native macOS clipboard read/write (NSPasteboard) with pbpaste fallback, wl-paste / xclip / xsel on Linux, and croft's own last copy, which a paste inside croft falls back to where the host clipboard can't be read (an SSH host with no clipboard tool)
 ├── command_history.rs    durable cross-session shell command history as JSONL under `~/.config/croft/command_history.jsonl` (cwd / exit / duration), read off OSC 133 marks with no shell hooks; Ctrl+Shift+H opens the search popup
 ├── fleet.rs              running one command across N ssh hosts and diffing the results, behind "Terminal: Fleet Run"; the fleet must be named (`hosts: command`, `*` for explicit broadcast)
+├── gh.rs                what croft says when the GitHub CLI is missing or signed out: one shared message for every `gh` caller (`croft pr`, PR review, code scanning, CodeQL), plus the installed-and-signed-in check `croft pr` runs before taking the terminal (offline `gh auth token` first)
 ├── ghostty.rs           Ghostty config keybinds (setup-ghostty): re-emit every croft chord as its CSI-u sequence so Ghostty's own binds don't swallow them
 ├── docx.rs               docx/odt read-only preview: walks the zip+XML and emits markdown (headings, runs, lists, pipe tables, extracted images) for the markdown renderer; structure fidelity, not layout; 50MB source cap
 ├── file_ref.rs          `path:line[:col]` references detected in terminal text (rustc / grep / pytest / Python-traceback forms); backs Cmd/Ctrl+click-to-jump from any terminal pane with zero per-tool problem-matcher config
@@ -69,7 +70,7 @@ src/
 ├── review_ops.rs         the write side of review (#366): reply, resolve, submit a review, as `gh` jobs off the frame loop
 ├── review_threads.rs     GitHub review threads as the editor's comment boxes, behind "Review: Load PR Comments for This File"; distinguishes a thread's current `line` from `original_line`
 ├── scrubber.rs           moving through a branch's history, the cursor behind "Source Control: Scrub History"; the working tree is a `Position::Working` in the cursor, so leaving restores the live buffer exactly
-├── session.rs            local session persistence: `croft attach` / `croft ls` run croft under the session host so terminals/LSP/DAP survive closing the window; legacy dtach sessions keep reattaching, and `ls` skips the collab relay socket
+├── session.rs            local session persistence: `croft attach` / `croft ls` run croft under the session host so terminals/LSP/DAP survive closing the window; legacy dtach sessions keep reattaching, and `ls` lists only session sockets, never the relay, hook or pane-host sockets beside them
 ├── session_host.rs       the multiplayer session mux: a hidden `croft session-host` subcommand owning the inner croft's PTY and broadcasting it verbatim to N unix-socket clients, with write control and a presence roster
 ├── collab.rs             multiplayer Phase D, the collab layer below the app: `CollabDoc` over the `cola` text CRDT, `text_delta_ops` diffing, remote-op integration and `CollabMsg`
 ├── collab_agent.rs       a headless collab guest exposed as an MCP server on stdio (`croft collab-agent --workspace <path>`): joins the relay and serves five `collab_*` tools over JSON-RPC NDJSON so an external AI co-edits with a live named caret; croft itself contains no LLM code
@@ -81,7 +82,7 @@ src/
 ├── sheet.rs             CSV / TSV / XLSX / XLS / XLSB / ODS parsing via the csv and calamine crates
 ├── shell_integration.rs  OSC 133 / 7 / 9 shell integration: `OscSniffer` intercepts the marks alacritty drops, plus the per-shell rc shims that emit them
 ├── word_suggest.rs       word-based completion (#1566, VS Code's `editor.wordBasedSuggestions`): the words of the open documents, nearest the caret first, offered on Ctrl+Space when no language server reports on the file (at once) or a server answers with nothing; `word_based_suggestions` picks the documents (current, same language, all, or off), and a `.` typed never opens them
-├── snippets.rs           user snippets from `~/.config/croft/snippets.json` (VS Code format); `parse_body` turns tab-stop syntax into insert text plus ordered stops, and matches are injected into the completion popup; reloads on save
+├── snippets.rs           user snippets from `~/.config/croft/snippets.json` (VS Code format); `parse_body` turns tab-stop syntax and variables into insert text plus ordered stops, and matches are injected into the completion popup; reloads on save
 ├── sqlite_view.rs        read-only SQLite browser: each table becomes a worksheet in the existing sheet grid, rows capped at 500 with the true count in the name, opened `SQLITE_OPEN_READONLY` over bundled sqlite3 so a live database is never locked or mutated
 ├── svg.rs                SVG file-preview rasterisation: `usvg` parse plus resvg render into a PNG the standard image-overlay pipeline consumes; the vector render happens once per open, resizes refit the stored PNG, and a parse failure falls through to the XML source
 ├── symbol_range.rs       keeping a symbol view pointed at its symbol while the file changes: an edit above shifts the range, below moves nothing, inside grows or shrinks it
@@ -92,16 +93,18 @@ src/
 ├── triggers.rs           iTerm2-style terminal triggers from `~/.config/croft/triggers.json`: regex rules driving render-time `highlight`, plus `notify`/`bell` scanned in the PTY reader thread
 ├── agent_lane.rs         per-agent ledger of files an agent changed while you looked elsewhere; each row carries a review baseline content hash so it leaves the queue only once seen, and a write during two agents is flagged `shared` rather than guessed
 ├── agents.rs             agent lanes: which panes are running a coding agent (claude, codex, aider, gemini built in, extended by `~/.config/croft/agents.json`) and whether it is working, waiting or idle, judged from output stamps and prompt patterns rather than OSC 133 marks
+├── undo_rebase.rs        carries a collab peer's edit into this user's undo and redo states (#919), so Ctrl+Z reverts only your own steps: text a step left alone maps by offset, and an edit ending inside text the step wrote ends at its edge
 ├── update_check.rs       release-availability check plus staged upgrade: once a day it asks GitHub's latest-release endpoint off-thread and offers Update / Later, staging into `~/.cache/croft/staged` so the binary on PATH is untouched until Relaunch; never automatic
 ├── update_watch.rs      remote self-update: watch for a newer binary installed under a running remote croft
 ├── import_vscode.rs      one-shot VS Code profile import (`croft import-vscode`): settings, keybindings, snippets and the colour theme converted into croft's own files; merge never overwrite, and everything unmapped is REPORTED rather than dropped
 ├── marketplace.rs        fetching a theme from a marketplace: resolves an id or URL to an `ExtensionId`, downloads the `.vsix` and lifts one member out; nothing is installed or executed
+├── net.rs                the setup every ureq 2 request shares: the proxy from `https_proxy` / `http_proxy` / `all_proxy` unless `no_proxy` (or loopback) exempts the host, and a trust store of the platform CAs (or `SSL_CERT_FILE` / `SSL_CERT_DIR`) on top of the Mozilla roots, so downloads work behind a TLS-inspecting proxy; `describe` turns a failure into a reason fit for the status bar
 ├── vscode_theme.rs       VS Code colour theme import: converts a theme `.json` into a croft `[[themes]]` manifest under `~/.config/croft/extensions/`, behind `croft theme-import`
 ├── workspace.rs          the workspace's root-folder set: `WorkspaceRoots` (ordered, never empty) with `primary`/`owning_root`/`replace_primary`, persisted per primary root, plus `.code-workspace` parsing
 ├── view_ipc.rs           `croft view <file>` (#362): the channel a pane uses to ask the croft hosting it to open a file, so a shell prompt can reach the paged-PDF / sheet / SQLite viewers that only exist as editor tabs. The pane's shell is a child of that croft, so both ends share a host and uid and a 0600 socket suffices; the CLIENT resolves the path (croft's idea of a pane cwd is a scraped approximation) and it travels as raw BYTES in a JSON line, since `to_string_lossy` would open a different file. Croft binds `view-<pid>-<nonce>.sock` under the cache dir, accepts non-blocking from the frame loop, and sweeps stale sockets by `kill(pid, 0)` on the pid in the NAME rather than by connecting, which would race a concurrent bind. `croft view -` stages piped bytes under a sniffed extension in `~/.cache/croft/view-stdin/`, 0600 under 0700, swept after 24h
 ├── vim.rs               native modal (vim-style) editing: a pure key state machine (modes, counts, operators, text objects, f/t, search, ex-commands) that emits editing intents the app applies; toggled with Cmd+E
 ├── voice.rs              voice input for the Termux OSK mic key: delegates to `termux-dialog speech`, auto-installs `termux-api`, and injects the transcript via handle_key; a tap opens the dialog, a second tap cancels
-├── zoxide.rs            zoxide integration: strict query + typo-tolerant fuzzy fallback (Damerau-Levenshtein) + ensure-install (pkg on Termux, curl script elsewhere) with a logged outcome + InstallState surfaced to the Cmd+Z jump popup
+├── zoxide.rs            zoxide integration: strict query + typo-tolerant fuzzy fallback (Damerau-Levenshtein) + install only on the user's y to the popup's offer, never at launch (pkg on Termux, curl script elsewhere), its outcome and failure reason kept for the session + InstallState surfaced to the Cmd+Z jump popup
 ├── app/                 event loop, three-pane layout + activity bar, key dispatch, status bar, mouse, clipboard, splitters, preview overlays, Customize Layout (compute_chrome_layout / panel_band_rect pure geometry, secondary side bar, Zen Mode)
 │   ├── mod.rs           the main App: render, key / mouse dispatch, status bar, splitters
 │   ├── click.rs         double / triple click detection
@@ -146,7 +149,7 @@ src/
 │   ├── client.rs             async-lsp client wrapper: routes diagnostics (pushed and pulled) and `$/progress` to the status bar, acknowledges refresh requests into shared re-pull flags, declares `workspace.workspaceFolders` and answers the server→client folder request from the same list initialize carried
 │   ├── config.rs             per-language LSP config (basedpyright, ruff, ty, vtsls, rust-analyzer, gopls); the ServerConfig factories are the executable spec the bundled manifests reproduce, and Language is an open newtype so extensions can add one
 │   ├── rust_analyzer.rs      rust-analyzer's non-LSP requests (expandMacro, parentModule, openCargoToml, rebuildProcMacros, reloadWorkspace) sent as raw JSON, their params and how their answers read
-│   ├── install.rs            croft-managed server provisioning: lazy background installs into `~/.croft/servers` via three backends — npm, uv (rerouted to Termux `pkg` on Android), and Binary (per-platform release download, PATH-first)
+│   ├── install.rs            croft-managed server provisioning: lazy background installs into `~/.croft/servers` via four backends — npm, uv (rerouted to Termux `pkg` on Android), Binary (per-platform release download, PATH-first), and Go (`go install` with the user's toolchain, PATH-first)
 │   ├── languages.rs     language table: file-extension -> language, root markers, and server family, all built from extension manifests' [[languages]] blocks (replaces the old hardcoded Language enum match arms)
 │   ├── log_file.rs      LSP stderr / debug log sink at ~/.croft/lsp.log
 │   ├── manager.rs            LSP lifecycle: workspace pre-warm at startup, spawn, did_open / did_change / did_save, completion, documentSymbol, inlay hints, documentHighlight and whole-project pull diagnostics
@@ -154,7 +157,8 @@ src/
 │   ├── registry.rs      ServerRegistry (language -> ordered servers); built from the bundled manifests in assets/extensions/* plus user-installed extensions, instead of hardcoding configs
 │   ├── runtime.rs       Tokio runtime owned by the LSP manager
 │   ├── semantic_cache.rs content-keyed disk cache of semantic-token batches at `~/.croft/sem-cache`; a batch is applied or stored only while its `seq` still matches the live buffer, so a stale reply is never decoded over rewritten lines
-│   └── trace.rs         raw JSON-RPC trace tee (OUTPUT panel RPC toggle): TraceRead/TraceWrite wrap a server's stdio and, only while tracing is enabled, reassemble Content-Length frames each way into the server's "<name> (trace)" channel (Zed's RPC-messages equivalent)
+│   ├── trace.rs         raw JSON-RPC trace tee (OUTPUT panel RPC toggle): TraceRead/TraceWrite wrap a server's stdio and, only while tracing is enabled, reassemble Content-Length frames each way into the server's "<name> (trace)" channel (Zed's RPC-messages equivalent)
+│   └── watched_files.rs the globs each server registers for `workspace/didChangeWatchedFiles` (#908); the manager forwards the workspace watcher's file events to every server whose globs cover them, less the documents it has open
 └── widgets/
     ├── mod.rs
     ├── command_palette.rs   VS Code Command Palette (Cmd/Ctrl+Shift+P): a static command registry + fuzzy-filtered picker; the App's run_command dispatches each entry
@@ -212,6 +216,8 @@ The integrated terminal pane: `portable-pty` plus `alacritty_terminal` rendered 
 **Pane order and live drag-reorder.** Pane order lives in `App::terminals`. A pane can be dragged by its name pill side-by-side, or by its rail row in maximize mode. `App::move_terminal` keeps the active pane pinned to its terminal, and re-seats each pane's `last_area` in SLOT order. The rect is a slot's geometry but it lives on the terminal object, and the main loop drains the whole mouse burst before drawing. Without the re-seat, the next motion report over the same cell would resolve to the pane that just left it and swap the two back. In maximize mode neither positional rule holds: there is exactly ONE live rect, and it belongs to whichever pane was active at the last PAINT — the press and the drag are drained together, so that is not the dragged terminal. The drag leaves the dragged terminal active, so the live rect is found and seated on the pane the reorder leaves active. The session write is marked and flushed once per tick rather than run per motion report.
 
 **Shutdown.** `Drop` kills AND reaps the shell. `portable-pty`'s SIGKILL escalation never waits, so a HUP-trapping shell left a zombie per closed pane. It then wakes the reader through a shutdown pipe it polls beside the pty fd, and joins it. EOF alone is not a reliable wake: on Linux a background job keeps the pty slave open after the shell dies, and a bare blocked `read` would hang the join — and the UI — for as long as the job runs.
+
+**Shell exit (#912).** The tick calls `poll_exit` on every pane: it reaps the shell with `try_wait` (it stayed a zombie for the pane's whole life before), waits for the reader to finish so the footer lands under the last output, or 500 ms when a background job holds the pty open, and paints `[Process exited with code N]`. A pane host sends the code in its `Exit` frame instead. The app closes a shell pane that exited, as VS Code does, unless the pane was awaiting a task's or fenced block's outcome (the exit code becomes that outcome and the pane stays to be read) or it is the last pane. A kept pane takes no input: a key closes it, or starts a new shell in the last pane. `Drop` never signals a reaped shell, whose pid may have been reused.
 
 **Mouse-wheel forwarding.** `mouse_reporting()` reports whether the child enabled a tracking mode (`TermMode::MOUSE_MODE`). `report_mouse()` and the pure `encode_mouse_report()` emit an SGR (1006) or legacy X10 report. `App`'s wheel handler forwards the notch as a wheel report when the child tracks the mouse, so the child scrolls its own buffer — unless `Shift` is held, which scrolls croft's scrollback. A child that doesn't track the mouse still gets the arrow-key fallback.
 
@@ -664,6 +670,8 @@ Rendered Markdown preview (`Cmd/Ctrl+Shift+V`): a pulldown-cmark event stream tu
 
 **Remote URLs and missing files keep the labelled placeholder** — the preview never fetches.
 
+**Links can be followed (#931).** The build keeps each link's destination with the `(line, span)` of every span drawing it, and each heading's GitHub slug with its source line. `link_at` repaints the visible lines with each link's spans coloured by its index, so the paragraph's own wrap places them and the cell under the pointer names the link. The app follows a click or Ctrl+click on release: `#slug` scrolls through the scroll-sync map, a relative path opens through the file-reference path, `http(s)` goes to the browser, any other scheme is refused.
+
 **Chord forwarding.** `setup-iterm2` forwards the chord (and also relocates iTerm2's "Paste Selection" menu item off `Cmd+Shift+V`), as does `setup-ghostty`.
 
 ### testing.rs
@@ -782,6 +790,8 @@ LSP lifecycle: pre-warm, spawn, `did_open`, `did_change`, `did_save`, completion
 
 **Call hierarchy.** `prepareCallHierarchy` plus `incomingCalls`/`outgoingCalls`, one level per `Cmd+K H` / `Cmd+K Shift+H` invocation into the shared location picker. Incoming rows jump to the call expression, outgoing to the callee's definition.
 
+**A language left with no server says so once (#930).** When every server a language registers is missing from PATH and none can be installed (no provision, or a Go provision with no `go`), `missing_servers_note` names the missing commands and `report_missing_servers_once` puts the note in the status bar and OUTPUT › Server Provisioning, once per language per session. A provisioned server that can still install stays quiet here, since its install reports its own progress.
+
 ### problem_matchers.rs
 
 User-defined problem matchers, read from `~/.config/croft/matchers.json` and workspace `.croft/matchers.json` (palette "Preferences: Open Problem Matchers (JSON)", reloaded on save). They compile into `CompiledMatcher`s: single or multi-line regex sequences with named groups (file/line/col/severity/message/code, VS Code-style `loop` tails), `applies_to` command globs, and `severity_map`.
@@ -856,6 +866,8 @@ An SGR span parser for colour-bearing text. One pass turns a raw line into visib
 
 **One implementation on purpose.** There is a single copy of the stripping rules. A second "just strip the escapes" implementation would drift from this one, and everything that trusts the stripped text — find, copy, `path:line` scanning — must see the same characters the renderer painted.
 
+**A stream ends lines at newlines, not at chunks.** `AnsiStream` parses output that arrives in pieces, as a debug adapter's `output` events do, where one line can come in several events and an event can end mid-line or mid-escape (#1501, #932). It keeps the line it is in the middle of open until a newline ends it, blank lines included, and a carriage return rewrites the open line, so a progress bar redraws in place. The Debug Console keeps one stream per session and output category, shows each open line as it reads so far and redraws it where it stands.
+
 ### archive.rs
 
 The archive browser core. It lists members without reading payloads: zip-based packages (zip, jar, whl, apk, aar, war, ear, nupkg, vsix, epub) through the central directory, tar, tar.gz and tar.xz through a header walk.
@@ -922,6 +934,8 @@ An anchored popup with a 300 ms dwell. It serves the LSP hover (wide), the tab-p
 
 Support for `.http` and `.rest` request files. The REST-Client format is parsed — `###` blocks, headers, bodies, and `{{variables}}` from the file's own `@name = value` lines, a `.http.env.json` beside the file, or `{{$env.NAME}}` — and sent on a worker thread through `ureq`.
 
+**Env files and environments.** Beside the request file, `.http.env.json` and JetBrains' `http-client.env.json` / `http-client.private.env.json` are read in that order, a later file winning a name. A top-level scalar is a variable (croft's flat format); a top-level object is a named environment in REST Client's and JetBrains' shape. Values layer flat, then `$shared`, then the environment picked with HTTP: Switch Environment (held in the App, `None` meaning `$shared` only), and the file's own `@name` lines win over all of them. While environments exist and none is picked, a hole with no value refuses naming them and the command that picks one, rather than skipping them silently.
+
 **What counts as an error.** A non-2xx status is a response, not an error. Bodies are capped at 8 MiB.
 
 **The response is an ordinary tab.** The result renders as a response document the editor opens like any other tab: `.jsonc` with the status and headers as `//` comments and the body pretty-printed, or `.xml`, `.txt`, or the image bytes themselves.
@@ -987,6 +1001,8 @@ A three-way merge editor following VS Code's 2022 merge-editor model. `MergeView
 **The Result is the ordinary buffer.** The view only tracks each region's span. Accepts splice through one undo step, and manual edits reconcile per-frame off `merge_edit_row`/`edit_seq` and mark the region manually resolved. Because the Result is the host editor's own buffer, LSP, undo and save need nothing special, and the renderer just carves Current | (Base) | Incoming panes off the top of the editor rect — stacked when narrow, with checkbox gutters clickable per conflict and, in a pane with room for it, a row of Accept buttons above each conflict (#1169) that sets it outright.
 
 **Where the sides come from.** Inputs are `git show :1:/:2:/:3:` via `git::read_file_at_stage`, where missing stages are empty sides (AA/DU/UD), or synthesized from the marker scan for a plain conflicted file. SCM's MERGE CONFLICTS entries open this editor, and "Reopen as Text" reaches the unchanged in-buffer marker flow.
+
+**The working file's work is kept (#906).** Git lists a file as conflicted until it is staged, even after the user resolved it in the marker flow, so `open_on_file` checks the buffer before the stages' Result replaces it. A marker-free file becomes the Result as is: each region is bounded by the lines it shares with the stages' Result, and its state is read off its text (a side or combination, Unresolved while it is still base, else Manual), so Complete Merge stages it. A file that is still git's marker rendering of the merge (compared as all-ours and as all-theirs, which tolerates git's narrowed blocks) opens on the stages. Anything else opens on its remaining markers, so resolved blocks and typed lines survive. A modify/delete always opens on the stages, since its file carries no markers to tell.
 
 ### notebook.rs
 
@@ -1060,7 +1076,7 @@ Which SEAT wrote each line: a `Seat` (you, navigator, agent-by-pane, or collab p
 
 Parses the last `grep`, `rg` or `git grep` command line into a pattern, Search toggles, and include/exclude glob lists (its paths, resolved from the pane's cwd, and rg types become `./`-anchored include globs via `scope_filters`; a scope it can't reproduce is refused), so "Terminal: Search & Replace from Last grep/rg" can seed and run the Search sidebar — reusing its multi-file replace-all — from a terminal search.
 
-**Flag handling.** `-g`/`--glob`s accumulate comma-separated. rg's `!`-negated globs and grep's `--exclude`/`--exclude-dir` land in files-to-exclude. rg and ag treat `-s` as forcing case sensitivity, while grep's `-s` stays the no-messages flag.
+**Flag handling.** `-g`/`--glob`s accumulate comma-separated. rg's `!`-negated globs and grep's `--exclude`/`--exclude-dir` land in files-to-exclude. rg and ag treat `-s` as forcing case sensitivity, while grep's `-s` stays the no-messages flag. Match Case starts from the tool's own default (case-sensitive, except ag's smart case) and `-i`/`-s`/`-S` overwrite it in order, as in rg. Smart case is resolved the way each tool reads the pattern: rg's on the literals of its regex-syntax AST (so `\W` isn't uppercase), ag's on every byte, and case-sensitive where unsure, since a narrower seed can't make Replace All touch a line the terminal never listed (#922).
 
 **The seed replaces wholesale.** `SearchPanel::seed` swaps the panel's query and both filter lists outright, and also resets field selections, because a stale byte range into shorter seeded text panicked. It then refocuses the query.
 
@@ -1084,7 +1100,7 @@ Hand-curated "IN THIS RELEASE" highlights (feature or fix, glyph plus summary) s
 
 ### run_debug.rs
 
-The Run and Debug sidebar widget: an empty-state Run [filename] button, and when a session is live the paused-state tree (call stack, expandable variables, WATCH), a debug console of program output (soft-wrapped to the panel width by display columns, #867, and coloured by the program's own SGR sequences, which `ansi_text` turns into spans; other escapes are dropped, #1501), and a `❯` REPL prompt. Every console line is also mirrored, as plain text, to the OUTPUT bus's "Debug Console" channel. The App builds the rows and maps clicks back to frames and variables.
+The Run and Debug sidebar widget: an empty-state Run [filename] button, and when a session is live the paused-state tree (call stack, expandable variables, WATCH), a debug console of program output (soft-wrapped to the panel width by display columns, #867, and coloured by the program's own SGR sequences, which `ansi_text` turns into spans; other escapes are dropped, #1501; a line per newline the program printed, however the adapter cut its output into events, #932), and a `❯` REPL prompt. Every console line is also mirrored, as plain text, to the OUTPUT bus's "Debug Console" channel. The App builds the rows and maps clicks back to frames and variables.
 
 **WATCH is frame-relative.** Session-scoped expressions are re-evaluated on every stop via DAP `evaluate` with context `watch`, against the SELECTED frame. The stop selects the top frame, and clicking a call-stack frame re-evaluates every watch against that frame.
 
@@ -1104,7 +1120,7 @@ One launch session: the initialize -> setBreakpoints -> configurationDone -> sto
 
 Local session persistence. `croft attach` and `croft ls` run croft under the session host (`session_host.rs`) so terminals, LSP and DAP survive closing the window. Live legacy dtach sessions keep reattaching through dtach.
 
-**`ls` skips the collab relay socket.** The workspace's `<hash>.collab.sock` shares the directory and the keying but is not a session, so listing it printed a phantom row. Pruning it belongs to the relay's own bind path, not here.
+**`ls` lists only session sockets.** The sessions directory also holds the workspace's `<hash>.collab.sock` relay and `<hash>.hook.sock` agent-approval listener, which share the keying, and hosted panes' `pane-<id>.sock`. None is a session, and listing them printed phantom `(unknown)` rows. So `ls` uses an allowlist, `<hash>.mux.sock` and the legacy dtach `<hash>.sock`, rather than a denylist the next socket would slip past. Pruning the others belongs to their own bind paths, not here.
 
 ### svg.rs
 
@@ -1249,7 +1265,7 @@ Per-language LSP config for basedpyright, ruff, ty, vtsls, rust-analyzer and gop
 
 ### lsp/install.rs
 
-Croft-managed server provisioning: lazy background installs into `~/.croft/servers` through three backends. npm covers vtsls, JSON/HTML/CSS, yaml and bash; uv covers ty, ruff and rumdl, including the uv bootstrap, and is rerouted to Termux's `pkg` on Android, or, for a tool Termux does not package (`termux_pkg = false`, rumdl), left to a copy on PATH; Binary covers clangd, taplo, rust-analyzer and marksman, downloading a host-agnostic per-platform release asset and unzipping, gunzipping, untarring or (for marksman's bare executables) writing it as-is, PATH-first including `~/.cargo/bin`. A manifest that pins SHA-256 digests has each download checked before anything is written or marked executable.
+Croft-managed server provisioning: lazy background installs into `~/.croft/servers` through four backends. npm covers vtsls, JSON/HTML/CSS, yaml and bash; uv covers ty, ruff and rumdl, including the uv bootstrap, and is rerouted to Termux's `pkg` on Android, or, for a tool Termux does not package (`termux_pkg = false`, rumdl), left to a copy on PATH; Binary covers clangd, taplo, rust-analyzer and marksman, downloading a host-agnostic per-platform release asset and unzipping, gunzipping, untarring or (for marksman's bare executables) writing it as-is, PATH-first including `~/.cargo/bin`. A manifest that pins SHA-256 digests has each download checked before anything is written or marked executable. Go covers gopls: a copy on PATH or in `~/go/bin` wins, else croft runs the user's own `go install <module>@<pin>` with `GOBIN` at `~/.croft/servers/<name>/<pin>`, so the server is built by the toolchain it analyses and a bumped pin installs afresh. With no `go` on PATH no install is tried (`missing_installer`), and the manager reports the language as having no server.
 
 **A Binary can carry a `termux_pkg`.** On Android the glibc release can't run on bionic, so such a backend reroutes to `pkg`, as rust-analyzer does.
 
@@ -1314,6 +1330,8 @@ Durable user preferences — color theme, Customize Layout chrome, format-on-sav
 User snippets loaded from `~/.config/croft/snippets.json` in VS Code format: prefix as a string or array, body as a string or array, and an optional language scope. Entries load one by one, so a malformed one is skipped and reported instead of emptying the set. It reloads on save.
 
 **`parse_body` turns tab-stop syntax into stops the editor drives.** A body's `$1`/`$0`/`${1:placeholder}` syntax becomes insert text plus ordered stops that the editor walks on Tab.
+
+**Variables resolve at expansion, from whoever knows them.** `parse_body` takes a resolver: the editor answers for its buffer (`TM_FILENAME`, `TM_CURRENT_LINE`, `LINE_COMMENT`, …), the App for the workspace and clipboard (`RELATIVE_FILEPATH`, `CLIPBOARD`), and `clock_var` for the date, time and random ids. A known variable with no value inserts its default, and an unknown one becomes a placeholder numbered after the body's own stops, as in VS Code (#914).
 
 **Snippets also reach the completion popup.** Matching snippets are injected as `CompletionItem.is_snippet` and expanded on accept — the same path LSP snippet completions take.
 

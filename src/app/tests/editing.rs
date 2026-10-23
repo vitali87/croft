@@ -550,6 +550,89 @@ fn editor_cmd_g_multidigit_count_g_jumps_to_specific_line() {
     assert_eq!(app.editor.cursor_row, 11);
 }
 
+/// #902: VS Code's Go to Line, `Ctrl+G 25 Enter`, lands on line 25 as
+/// `Ctrl+G 25 g` does, instead of cancelling the chord and passing the Enter
+/// on as a newline.
+#[test]
+fn editor_ctrl_g_count_enter_jumps_to_the_line_without_a_newline() {
+    let lines: Vec<String> = (1..=30).map(|n| format!("line {n}")).collect();
+    let mut app = editor_app_with_lines(&lines.iter().map(String::as_str).collect::<Vec<_>>());
+    app.editor.cursor_row = 2;
+    app.handle_key(key(KeyCode::Char('g'), KeyModifiers::CONTROL))
+        .unwrap();
+    for d in ['2', '5'] {
+        app.handle_key(key(KeyCode::Char(d), KeyModifiers::NONE))
+            .unwrap();
+    }
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        app.editor.lines, lines,
+        "the Enter must not reach the buffer"
+    );
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (24, 0));
+    assert_eq!(app.status, "Line 25");
+}
+
+/// #902: a key that cancels a chord after its count was typed goes with the
+/// swallowed digits instead of editing the buffer on its own. Without a count
+/// the key keeps its meaning, except Esc, which only cancels.
+#[test]
+fn editor_key_cancelling_a_counted_chord_does_not_edit_the_buffer() {
+    let g = key(KeyCode::Char('g'), KeyModifiers::SUPER);
+    let y = key(KeyCode::Char('y'), KeyModifiers::SUPER);
+    let plain = |c| key(KeyCode::Char(c), KeyModifiers::NONE);
+    let leaders = [
+        vec![g, plain('1'), plain('2')],
+        vec![y, plain('2')],
+        vec![key(KeyCode::Char('3'), KeyModifiers::SUPER)],
+    ];
+    let cancels = [
+        key(KeyCode::Tab, KeyModifiers::NONE),
+        key(KeyCode::Backspace, KeyModifiers::NONE),
+        key(KeyCode::Enter, KeyModifiers::NONE),
+        plain('x'),
+        key(KeyCode::Esc, KeyModifiers::NONE),
+    ];
+    for leader in &leaders {
+        for &cancel in &cancels {
+            if leader[0] == g && cancel.code == KeyCode::Enter {
+                continue; // completes Go to Line, tested above
+            }
+            let mut app = editor_app_with_lines(&["alpha", "beta", "gamma"]);
+            app.editor.cursor_row = 1;
+            app.editor.cursor_col = 2;
+            for &k in leader.iter().chain([&cancel]) {
+                app.handle_key(k).unwrap();
+            }
+            let case = format!("{leader:?} then {cancel:?}");
+            assert_eq!(app.editor.lines, vec!["alpha", "beta", "gamma"], "{case}");
+            assert_eq!(
+                (app.editor.cursor_row, app.editor.cursor_col),
+                (1, 2),
+                "{case}"
+            );
+            assert_eq!(app.status, "Chord cancelled", "{case}");
+        }
+    }
+
+    let mut app = editor_app_with_lines(&["alpha"]);
+    app.handle_key(g).unwrap();
+    app.handle_key(plain('x')).unwrap();
+    assert_eq!(app.editor.lines, vec!["xalpha"], "no count: the key types");
+    app.editor.start_selection_at_cursor();
+    app.editor.move_right();
+    app.editor.extend_selection_to_cursor();
+    app.handle_key(g).unwrap();
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(
+        app.editor.selection.is_some(),
+        "Esc cancels the chord and nothing else"
+    );
+    assert_eq!(app.status, "Chord cancelled");
+}
+
 #[test]
 fn editor_cmd_shift_g_jumps_to_bottom_of_file() {
     let mut app = editor_app_with_lines(&["a", "b", "c", "d"]);
@@ -725,6 +808,76 @@ fn editor_alt_left_jumps_one_word_backward() {
     app.handle_key(key(KeyCode::Left, KeyModifiers::ALT))
         .unwrap();
     assert_eq!(app.editor.cursor_col, 6);
+}
+
+/// #909: Ctrl is the word modifier on Linux, as in VS Code there, so
+/// Ctrl+arrows step and select by word instead of by character.
+#[test]
+fn editor_ctrl_arrows_step_and_select_by_word() {
+    let mut app = editor_app_with_lines(&["alpha beta gamma delta"]);
+    for _ in 0..2 {
+        app.handle_key(key(KeyCode::Right, KeyModifiers::CONTROL))
+            .unwrap();
+    }
+    assert_eq!(app.editor.cursor_col, 10);
+    app.handle_key(key(
+        KeyCode::Left,
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    ))
+    .unwrap();
+    assert_eq!(app.editor.selection_text(), "beta");
+    app.handle_key(key(KeyCode::Left, KeyModifiers::CONTROL))
+        .unwrap();
+    assert_eq!((app.editor.cursor_col, app.editor.selection), (0, None));
+}
+
+/// #909: Ctrl+Backspace / Ctrl+Delete (and macOS's Opt+Backspace) delete a
+/// word, not one character.
+#[test]
+fn editor_ctrl_backspace_and_delete_delete_a_word() {
+    let mut app = editor_app_with_lines(&["alpha beta gamma delta"]);
+    app.editor.cursor_col = 22;
+    app.handle_key(key(KeyCode::Backspace, KeyModifiers::CONTROL))
+        .unwrap();
+    assert_eq!(app.editor.lines, vec!["alpha beta gamma "]);
+    app.handle_key(key(KeyCode::Backspace, KeyModifiers::ALT))
+        .unwrap();
+    assert_eq!(app.editor.lines, vec!["alpha beta "]);
+    app.editor.cursor_col = 0;
+    app.handle_key(key(KeyCode::Delete, KeyModifiers::CONTROL))
+        .unwrap();
+    assert_eq!(app.editor.lines, vec![" beta "]);
+    app.handle_key(key(KeyCode::Backspace, KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Delete, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.lines, vec!["beta "], "plain keys still take one");
+}
+
+/// #909: Ctrl+Home / Ctrl+End go to the start / end of the document, and
+/// with Shift select there, instead of acting like Home / End.
+#[test]
+fn editor_ctrl_home_and_end_go_to_the_ends_of_the_document() {
+    let mut app = editor_app_with_lines(&["alpha beta", "second line", "third"]);
+    app.editor.cursor_row = 2;
+    app.editor.cursor_col = 3;
+    app.handle_key(key(KeyCode::Home, KeyModifiers::CONTROL))
+        .unwrap();
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (0, 0));
+    app.handle_key(key(
+        KeyCode::End,
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    ))
+    .unwrap();
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (2, 5));
+    assert_eq!(
+        app.editor.selection_text(),
+        "alpha beta\nsecond line\nthird"
+    );
+    app.handle_key(key(KeyCode::Home, KeyModifiers::CONTROL))
+        .unwrap();
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (0, 0));
+    assert!(app.editor.selection.is_none());
 }
 
 #[test]
@@ -1892,6 +2045,30 @@ fn tab_expands_a_user_snippet_and_places_the_caret() {
         app.editor.cursor_col, 12,
         "caret lands inside the parentheses at $1"
     );
+}
+
+/// #914: variables expand to their values, from the buffer and from the
+/// workspace, instead of their names; an unknown one is a placeholder
+/// visited after the snippet's own stops, as in VS Code.
+#[test]
+fn tab_expands_snippet_variables_from_the_buffer_and_the_workspace() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("pkg")).unwrap();
+    let f = tmp.path().join("pkg/t.py");
+    std::fs::write(&f, "").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&f).unwrap();
+    app.snippets = crate::snippets::SnippetSet::from_json(
+        r#"{ "Mirror": { "prefix": "mirror", "scope": "python",
+             "body": "${1:x} = x + 1  $LINE_COMMENT $TM_FILENAME $RELATIVE_FILEPATH $CLIPBOARD $NOPE" } }"#,
+    );
+    crate::clipboard::test_clip::mock_write("clip");
+    app.editor.insert_str("mirror");
+    app.handle_editor_tab();
+    assert_eq!(app.editor.lines[0], "x = x + 1  # t.py pkg/t.py clip NOPE");
+    assert_eq!(app.editor.selection_text(), "x");
+    app.handle_editor_tab();
+    assert_eq!(app.editor.selection_text(), "NOPE");
 }
 
 // ── #1484: a repo's own snippets expand ──

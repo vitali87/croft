@@ -1609,6 +1609,7 @@ enum CommitAction {
 /// side of a context-menu row, when one exists. Mirrors the bindings in
 /// `handle_tree_key` / `handle_explorer_shortcut` so the menu is a
 /// discovery surface for the same accelerators the keyboard accepts.
+/// [`platform_shortcut_for`] spells it for the platform croft runs on.
 fn shortcut_for(action: &MenuAction) -> Option<&'static str> {
     match action {
         MenuAction::Create(CreateKind::File) => Some("⌘F"),
@@ -1723,12 +1724,39 @@ fn menu_action_command(action: &MenuAction) -> Option<crate::widgets::command_pa
     })
 }
 
+/// [`shortcut_for`] as a Mac (`macos`) or anything else spells it (#885):
+/// the glyphs on a Mac, elsewhere `Ctrl`, `Alt` and `Super` as
+/// [`glyph_hint_for_platform`](crate::widgets::command_palette::glyph_hint_for_platform)
+/// writes them. Off macOS the terminal pane gives `Ctrl+C`, `Ctrl+V` and
+/// `Ctrl+W` to the shell, so its Copy, Paste and Kill rows name the
+/// `Ctrl+Shift` chords it takes instead (docs/LINUX.md).
+fn platform_shortcut_for(
+    action: &MenuAction,
+    macos: bool,
+) -> Option<std::borrow::Cow<'static, str>> {
+    let glyphs = shortcut_for(action)?;
+    let in_the_terminal = match action {
+        MenuAction::TerminalCopySelection => Some("Ctrl+Shift+C"),
+        MenuAction::TerminalPaste => Some("Ctrl+Shift+V"),
+        MenuAction::KillTerminal(_) => Some("Ctrl+Shift+W"),
+        _ => None,
+    };
+    match in_the_terminal {
+        Some(chord) if !macos => Some(std::borrow::Cow::Borrowed(chord)),
+        _ => Some(crate::widgets::command_palette::glyph_hint_for_platform(
+            glyphs, macos,
+        )),
+    }
+}
+
 /// The hint on a menu row's right: the user's own chord for the command the
-/// row runs, else the built-in one.
+/// row runs, else the built-in one as this platform spells it.
 fn menu_hint(action: &MenuAction, keymap: &crate::keymap::Keymap) -> Option<String> {
     menu_action_command(action)
         .and_then(|cmd| keymap.chord_for(cmd))
-        .or_else(|| shortcut_for(action).map(str::to_string))
+        .or_else(|| {
+            platform_shortcut_for(action, cfg!(target_os = "macos")).map(|s| s.into_owned())
+        })
 }
 
 /// Display width (in cells) a menu entry needs: its label plus the right-aligned
@@ -1817,6 +1845,32 @@ enum LaunchSlot {
 /// down by one for each removal below it (#567).
 fn index_after_removals(index: usize, removed: &[usize]) -> Option<usize> {
     (!removed.contains(&index)).then(|| index - removed.iter().filter(|&&r| r < index).count())
+}
+
+/// A session is ending: mirror to OUTPUT's "Debug Console" channel each line
+/// its console streams leave open (#932), as `console` shows it, since no
+/// newline will come to finish it. `dropped` is how many lines have left the
+/// front of `console`, which the streams' positions count from.
+fn mirror_open_console_lines(
+    streams: &mut [crate::dap::session::ConsoleStream],
+    console: &[crate::ansi_text::AnsiLine],
+    dropped: usize,
+) {
+    for stream in streams {
+        let Some(line) = stream.ansi.finish() else {
+            continue;
+        };
+        let shown = stream
+            .shown_at
+            .take()
+            .and_then(|at| at.checked_sub(dropped))
+            .and_then(|i| console.get(i));
+        crate::output::push(
+            crate::output::CHANNEL_DEBUG_CONSOLE,
+            crate::output::OutputLevel::Info,
+            &shown.unwrap_or(&line).text,
+        );
+    }
 }
 
 /// What "open shell here" types for a fleet target (#363): nothing for
@@ -2879,13 +2933,21 @@ enum ScmWrite {
     Stash,
     StashIncludeUntracked,
     StashStaged,
+    /// Stash & Checkout on a switch local changes blocked (#925).
+    StashAndSwitch,
+    /// Migrate Changes on a switch local changes blocked (#925).
+    MigrateAndSwitch,
 }
 
 impl ScmWrite {
     fn is_stash(self) -> bool {
         matches!(
             self,
-            Self::Stash | Self::StashIncludeUntracked | Self::StashStaged
+            Self::Stash
+                | Self::StashIncludeUntracked
+                | Self::StashStaged
+                | Self::StashAndSwitch
+                | Self::MigrateAndSwitch
         )
     }
 
@@ -4923,6 +4985,10 @@ pub struct App {
     /// worker owns the socket, the drain owns the tab, and a second send
     /// while one runs is refused rather than queued.
     http_run: Option<std::sync::mpsc::Receiver<HttpRunOutcome>>,
+    /// The `.http` env files' named environment whose values requests use
+    /// (#924), picked with HTTP: Switch Environment; `None` uses only
+    /// `$shared` and flat values, as REST Client's "No Environment" does.
+    http_environment: Option<String>,
     /// The presentation edits behind the open Change Color Presentation
     /// picker (#254), indexed by row id; cleared after a pick.
     pending_color_presentations: Vec<(String, Vec<crate::widgets::editor::TextSpanEdit>)>,
@@ -5295,6 +5361,10 @@ pub struct App {
     /// Each line is escape-free text with the colour spans its SGR sequences
     /// set (#1501), so search and copy see `FAILED`, not `[31mFAILED[0m`.
     pub debug_console: Vec<crate::ansi_text::AnsiLine>,
+    /// How many lines have left the front of `debug_console`, to the cap or
+    /// to a new run's clear, so a stream's open line keeps its place by
+    /// counting from the first line the console ever held (#932).
+    debug_console_dropped: usize,
     /// True once the current/just-ended debug session stopped at least once
     /// (breakpoint / step / exception). Drives the "exited without hitting a
     /// breakpoint" end message. Reset when a new session starts.
@@ -5310,6 +5380,14 @@ pub struct App {
     /// Why the branch picker is open, so its Enter dispatches the right
     /// verb (checkout vs merge vs rebase vs delete vs create-from base).
     pub branch_purpose: BranchPurpose,
+    /// The switch local changes blocked (#925), with the repository it is
+    /// in and the branch it was refused on (None when detached), while the
+    /// Stash & Checkout picker offers a way through.
+    blocked_switch: Option<(
+        PathBuf,
+        Option<String>,
+        crate::widgets::branch_picker::BranchAction,
+    )>,
     /// The Source Control "⋯" title menu (open/expanded state + hit rects).
     pub scm_menu: crate::widgets::scm_menu::ScmMenuState,
     /// Single-line input modal for SCM ops that need a typed value
@@ -5846,6 +5924,13 @@ const ZEN_HINT_FOR: std::time::Duration = std::time::Duration::from_secs(4);
 /// the Explorer.
 const ZOXIDE_JUMP_MIN_WIDTH: u16 = 56;
 
+/// The status-bar line for a jump popup with no zoxide to run: the first
+/// line of what the popup body says.
+fn zoxide_jump_status(jump: &crate::widgets::zoxide_jump::ZoxideJump) -> String {
+    let msg = crate::widgets::zoxide_jump::unavailable_message(jump);
+    format!("Jump: {}", msg.lines().next().unwrap_or_default())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WelcomeLayout {
     cell_x: u16,
@@ -5915,7 +6000,7 @@ struct SarifDownload {
 /// GET `url`'s body, up to 64 MiB, for a SARIF location's source.
 fn fetch_sarif_source(url: &str) -> Result<Vec<u8>, String> {
     use std::io::Read;
-    let resp = ureq::AgentBuilder::new()
+    let resp = crate::net::builder(url)
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .get(url)
@@ -6499,8 +6584,12 @@ impl App {
             sidebar_dwell: SidebarDwell::default(),
             pre_zen: None,
             layout_icon_areas: LayoutIconAreas::default(),
-            status: match hook_bind_error {
-                Some(hook) if view_bind_error.is_none() => hook,
+            status: match (
+                merged_settings.user_config_error.as_deref(),
+                hook_bind_error,
+            ) {
+                (Some(error), _) => settings_not_loaded_status(error),
+                (None, Some(hook)) if view_bind_error.is_none() => hook,
                 _ => view_status(view_bind_error.as_deref()),
             },
             persistence_warning: remote_persistence_status(
@@ -6935,11 +7024,13 @@ impl App {
             watch_baseline_pending: false,
             debug_copy_pending: None,
             debug_console: Vec::new(),
+            debug_console_dropped: 0,
             debug_ever_stopped: false,
             zoxide_jump: None,
             zoxide_add_folder: false,
             branch_picker: None,
             branch_purpose: BranchPurpose::Checkout,
+            blocked_switch: None,
             scm_menu: crate::widgets::scm_menu::ScmMenuState::default(),
             input_prompt: None,
             list_picker: None,
@@ -7083,6 +7174,7 @@ impl App {
             pending_lane_picks: Vec::new(),
             problems_fix_started: None,
             http_run: None,
+            http_environment: None,
             pending_color_presentations: Vec::new(),
             pending_color_context: None,
             color_presentations_request: None,
@@ -8469,6 +8561,7 @@ impl App {
             report.reloaded.extend(extra.reloaded);
             report.conflicts.extend(extra.conflicts);
             report.failed.extend(extra.failed);
+            report.deleted.extend(extra.deleted);
         }
         if report.is_empty() {
             return settled;
@@ -8491,6 +8584,34 @@ impl App {
             // decision, so it gets the modal.
             (_, c, _) if c > 0 => {
                 self.prompt_disk_conflict(report.conflicts.clone());
+            }
+            // Gone is not a failed read (#900): the tab keeps its text, its
+            // label says `(deleted)`, and a save puts the file back.
+            // A failed reload in the same sweep is said too: it is reported
+            // once, so dropping it here would hide it for good.
+            _ if !report.deleted.is_empty() => {
+                let deleted = match report.deleted.as_slice() {
+                    [one] => format!(
+                        "{} was deleted on disk; save to recreate it",
+                        self.status_path(one)
+                    ),
+                    many => format!(
+                        "{} open files were deleted on disk; save to recreate them",
+                        many.len()
+                    ),
+                };
+                let failed = match report.failed.as_slice() {
+                    [] => String::new(),
+                    [one] => format!(
+                        "; reload failed for {}, keeping its last good view",
+                        self.status_path(one)
+                    ),
+                    many => format!(
+                        "; reload failed for {} files, keeping their last good view",
+                        many.len()
+                    ),
+                };
+                self.status = format!("{deleted}{failed}");
             }
             // A failed reload used to be silently discarded (#37): the tab
             // keeps its last good view, and the status must say so instead
@@ -9111,9 +9232,10 @@ impl App {
 
     /// Per-tick LSP doc sync. Diffs every text-buffer tab's edit_seq
     /// against `lsp_last_seen` and forwards did_open / did_change /
-    /// did_close to the LspManager. Building `lines.join("\n")` only
+    /// did_close to the LspManager. Building the document text only
     /// happens when a tab's edit_seq has actually moved, so the cost
-    /// scales with edits, not with frames.
+    /// scales with edits, not with frames. The text keeps the file's final
+    /// newline (#911), or every formatter adds one the save doubles.
     pub fn sync_lsp(&mut self) {
         let Some(lsp) = self.lsp.as_ref() else {
             return;
@@ -9186,7 +9308,7 @@ impl App {
                     // before the full-document reply lands.
                     let start = tab.scroll as u32;
                     let end = (tab.scroll + tab.page_size() + 16) as u32;
-                    let text = tab.lines.join("\n");
+                    let text = tab.document_text();
                     // Paint the last-known semantic colours instantly from the
                     // disk cache, so an import-heavy file does not flash grey
                     // then snap to the server's class/namespace colours seconds
@@ -9198,7 +9320,7 @@ impl App {
                     to_send.push((true, path.clone(), text, seq, Some((start, end))));
                 }
                 Some(p) if p != seq => {
-                    to_send.push((false, path.clone(), tab.lines.join("\n"), seq, None))
+                    to_send.push((false, path.clone(), tab.document_text(), seq, None))
                 }
                 _ => {}
             }
@@ -10051,8 +10173,32 @@ impl App {
         };
         self.completion_popup = None;
         self.completion_request_id = None;
-        self.editor.expand_snippet(&body, word.chars().count());
+        self.expand_snippet(&body, word.chars().count());
         true
+    }
+
+    /// Expand snippet `body` at the caret (see
+    /// [`Editor::expand_snippet_with`]), its variables resolving from the
+    /// buffer and from the workspace: `CLIPBOARD`, `RELATIVE_FILEPATH`,
+    /// `WORKSPACE_NAME` and `WORKSPACE_FOLDER` (#914).
+    fn expand_snippet(&mut self, body: &str, prefix_len: usize) {
+        let path = self.editor.path.clone();
+        let root = path.as_deref().and_then(|p| self.roots.owning_root(p));
+        let root = root.unwrap_or(self.workspace_root()).to_path_buf();
+        let vars = |name: &str| {
+            Some(match name {
+                "CLIPBOARD" => crate::clipboard::read_string().unwrap_or_default(),
+                "RELATIVE_FILEPATH" => path
+                    .as_deref()
+                    .map_or(String::new(), |p| relative_clipboard_text(p, &root)),
+                "WORKSPACE_NAME" => root
+                    .file_name()
+                    .map_or(String::new(), |n| n.to_string_lossy().into()),
+                "WORKSPACE_FOLDER" => root.display().to_string(),
+                _ => return None,
+            })
+        };
+        self.editor.expand_snippet_with(body, prefix_len, &vars);
     }
 
     pub fn trigger_completion(&mut self) {
@@ -12135,7 +12281,7 @@ impl App {
             self.status = String::from("Inlay Hints: off");
         }
         if !cfg!(test) {
-            let _ = crate::prefs::save_inlay_hints(self.inlay_hints_enabled);
+            self.report_unsaved_setting(crate::prefs::save_inlay_hints(self.inlay_hints_enabled));
         }
     }
 
@@ -14058,13 +14204,14 @@ impl App {
         self.open_customize_layout_menu_at(0);
     }
 
-    /// Persist the current Customize Layout chrome to `~/.config/croft`.
-    /// Best-effort and skipped under test (hermetic suite, like `apply_theme`).
-    fn persist_layout(&self) {
+    /// Persist the current Customize Layout chrome to `~/.config/croft`,
+    /// saying so when that fails. Skipped under test (hermetic suite, like
+    /// `apply_theme`).
+    fn persist_layout(&mut self) {
         if cfg!(test) {
             return;
         }
-        let _ = crate::prefs::save_layout(crate::prefs::LayoutPrefs {
+        let saved = crate::prefs::save_layout(crate::prefs::LayoutPrefs {
             activity_bar: self.activity_bar_visible,
             status_bar: self.status_bar_visible,
             side_bar_position: self.side_bar_position,
@@ -14075,6 +14222,7 @@ impl App {
             zen_center_layout: self.zen_center_layout,
             centered_layout_width: self.centered_layout_width,
         });
+        self.report_unsaved_setting(saved);
     }
 
     /// Show or hide the activity bar. The Customize Layout row and the
@@ -14233,13 +14381,13 @@ impl App {
     /// edge opposite the primary side bar. Mirrors ⌥⌘B.
     fn toggle_secondary_side_bar(&mut self) {
         self.secondary_side_bar_visible = !self.secondary_side_bar_visible;
-        self.persist_layout();
         self.after_chrome_visibility_change();
         self.status = String::from(if self.secondary_side_bar_visible {
             "Secondary side bar shown"
         } else {
             "Secondary side bar hidden"
         });
+        self.persist_layout();
     }
 
     /// Toggle Zen Mode: hide the activity bar, both side bars, the panel, and
@@ -14466,7 +14614,6 @@ impl App {
     /// wiring is needed for the section to appear or vanish.
     fn toggle_explorer_view(&mut self, view: ExplorerView) {
         let now_visible = self.explorer_views.toggle(view);
-        let _ = crate::prefs::save_explorer_views(self.explorer_views.as_prefs());
         if now_visible {
             match view {
                 ExplorerView::Timeline => self.timeline_fetched = None,
@@ -14479,6 +14626,11 @@ impl App {
             if now_visible { "Showing" } else { "Hiding" },
             self.explorer_view_label(view)
         );
+        if !cfg!(test) {
+            self.report_unsaved_setting(crate::prefs::save_explorer_views(
+                self.explorer_views.as_prefs(),
+            ));
+        }
     }
 
     /// The AGENT LANE rows (#345): each agent that changed files, then those
@@ -14716,7 +14868,7 @@ impl App {
         // directly instead — a workspace-set theme must not be written back
         // into the user's own config.
         if !cfg!(test) {
-            let _ = crate::prefs::save_theme(theme);
+            self.report_unsaved_setting(crate::prefs::save_theme(theme));
         }
     }
 
@@ -15493,14 +15645,16 @@ impl App {
     /// Apply an LSP rename `WorkspaceEdit` (already normalised to per-file
     /// char-indexed spans). Open tabs, in any split group, are edited
     /// in-memory as one undo step and left dirty; closed files are rewritten
-    /// on disk (the fs watcher refreshes the tree). Returns (files touched,
-    /// occurrences replaced).
+    /// on disk (the fs watcher refreshes the tree) and the servers are told
+    /// at once (#908), so the next Go to Definition sees the new name.
+    /// Returns (files touched, occurrences replaced).
     fn apply_rename_edits(
         &mut self,
         files: &[(PathBuf, Vec<crate::widgets::editor::TextSpanEdit>)],
     ) -> Result<(usize, usize)> {
         let mut file_count = 0;
         let mut occ_count = 0;
+        let mut written = std::collections::BTreeSet::new();
         for (path, edits) in files {
             if edits.is_empty() {
                 continue;
@@ -15517,9 +15671,14 @@ impl App {
                 let mut lines: Vec<String> = content.split('\n').map(str::to_string).collect();
                 occ_count += crate::widgets::editor::apply_span_edits_to_lines(&mut lines, edits);
                 std::fs::write(path, lines.join("\n"))?;
+                written.insert(path.clone());
             }
             file_count += 1;
         }
+        self.forward_disk_changes_to_lsp(&fs_watch::FsDrain {
+            changed_files: written,
+            ..Default::default()
+        });
         Ok((file_count, occ_count))
     }
 
@@ -15538,7 +15697,7 @@ impl App {
         // VS Code's Prettier extension does; tsserver's formatter knows
         // neither (#1255).
         if let Some(bin) = crate::prettier::for_file(&path) {
-            let sent = self.editor.text_for_formatter();
+            let sent = self.editor.document_text();
             self.prettier_job = Some(crate::prettier::Job::spawn(bin, path, sent));
             self.status = String::from("Formatting document with Prettier");
             return;
@@ -15629,13 +15788,9 @@ impl App {
             }
         };
         let tab = self.editor.find_buffer_tab(&job.path);
-        let buffer = tab.map(|i| &self.editor.editors[i]).map(|e| {
-            (
-                e.text_for_formatter(),
-                e.lines.clone(),
-                e.has_final_newline(),
-            )
-        });
+        let buffer = tab
+            .map(|i| &self.editor.editors[i])
+            .map(|e| (e.document_text(), e.lines.clone(), e.has_final_newline()));
         self.status = match buffer {
             Some((text, lines, final_newline)) if text == job.sent => {
                 if formatted == job.sent {
@@ -16064,7 +16219,10 @@ impl App {
     /// works on a plain marker file outside any merge. The tab is opened
     /// through the normal text route first (language, LSP, undo all
     /// attach), then the buffer is transformed into the initial Result
-    /// in one undo step — the marker text stays one Undo away.
+    /// in one undo step — the marker text stays one Undo away. Work the
+    /// user already did in the file is kept (#906): a file resolved by
+    /// hand is the Result as it stands, and a partly resolved one opens
+    /// on the markers it still has.
     fn open_merge_editor_for(&mut self, path: &Path) -> bool {
         // Stage specs are repo-toplevel-relative (#139): see `repo_rel`.
         let root = self.scm_root();
@@ -16117,13 +16275,27 @@ impl App {
             return false;
         }
         self.focus_pane(Pane::Editor);
-        let end = self.editor.lines.len();
-        self.editor.splice_result_rows(0, end, result);
+        // Git keeps listing a file the user resolved in the text flow as
+        // conflicted, and the stages alone would throw that work away. The
+        // buffer, not the disk, holds it, unsaved edits included. A
+        // modify/delete keeps the stages: its file is just the side that
+        // kept it, with no markers to tell a decision from git's copy.
+        let (mut mv, result) = if mv.from_markers || mv.deleted.is_some() {
+            (mv, Some(result))
+        } else {
+            mv.open_on_file(result, &self.editor.lines)
+        };
+        if let Some(result) = result {
+            let end = self.editor.lines.len();
+            self.editor.splice_result_rows(0, end, result);
+        }
         mv.synced_len = self.editor.lines.len();
         mv.synced_seq = self.editor.edit_seq;
         let n = mv.conflicts.len();
-        let first = mv.conflicts.first().map(|c| c.result_start);
-        mv.anchor_panes_on(0);
+        let left = mv.unresolved_count();
+        let idx = mv.conflicts.iter().position(|c| !c.state.resolved());
+        let first = mv.conflicts.get(idx.unwrap_or(0)).map(|c| c.result_start);
+        mv.anchor_panes_on(idx.unwrap_or(0));
         self.editor.merge = Some(mv);
         if let Some(row) = first {
             self.editor.clear_selection();
@@ -16131,8 +16303,12 @@ impl App {
             self.editor.cursor_col = 0;
             self.editor.ensure_cursor_col_visible();
         }
+        let done = match n - left {
+            0 => String::new(),
+            k => format!(", {k} already resolved in the file"),
+        };
         self.status = format!(
-            "Merge editor: {n} conflict{} — F7 jumps, checkboxes or Merge commands accept, \"Reopen as Text\" for the marker flow",
+            "Merge editor: {n} conflict{}{done} — F7 jumps, checkboxes or Merge commands accept, \"Reopen as Text\" for the marker flow",
             if n == 1 { "" } else { "s" }
         );
         true
@@ -16618,7 +16794,7 @@ impl App {
         self.editor.cursor_col = caret_col.max(0) as usize;
         self.editor.clamp_cursor();
         if item.is_snippet {
-            self.editor.expand_snippet(&te.new_text, 0);
+            self.expand_snippet(&te.new_text, 0);
         }
         true
     }
@@ -16675,7 +16851,7 @@ impl App {
                     if is_snippet {
                         // The body carries $1/$0 tab stops; expand_snippet
                         // removes the typed prefix itself and drives the caret.
-                        self.editor.expand_snippet(&t, prefix_len);
+                        self.expand_snippet(&t, prefix_len);
                     } else {
                         for _ in 0..prefix_len {
                             self.editor.backspace();
@@ -16694,7 +16870,13 @@ impl App {
                 self.completion_request_id = None;
                 true
             }
-            KeyCode::Backspace => {
+            // Ctrl/Alt+Backspace deletes a word (#909): it closes the popup
+            // and falls through below, like any other key.
+            KeyCode::Backspace
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
                 self.editor.backspace();
                 self.refresh_completion_prefix();
                 true
@@ -16799,8 +16981,12 @@ impl App {
             // them here would silently give a multi-root workspace an empty
             // review queue for every folder but the first (#345).
             drain.changed_files.extend(d.changed_files);
+            drain.created_files.extend(d.created_files);
+            drain.moved_in.extend(d.moved_in);
+            drain.vanished.extend(d.vanished);
             drain.rescan_dropped_events |= d.rescan_dropped_events;
         }
+        self.forward_disk_changes_to_lsp(&drain);
         if drain.dirs_changed {
             self.refresh_git_status_debounced();
             if drain.finder_relevant {
@@ -16847,6 +17033,21 @@ impl App {
         }
         let polled = self.poll_filesystem_changes();
         drain.got_any || init_changed || polled
+    }
+
+    /// Tell the language servers about files that changed on disk (#908):
+    /// a server like ty watches nothing itself, so a `git checkout` or an
+    /// agent's edit to a file no tab holds stayed stale in it.
+    fn forward_disk_changes_to_lsp(&mut self, drain: &fs_watch::FsDrain) {
+        if self.lsp.is_none() {
+            return;
+        }
+        let known = self.file_finder_index.clone();
+        let known = known.as_deref().map_or(&[][..], Vec::as_slice);
+        let changes = fs_watch::watched_file_changes(drain, known);
+        if let Some(lsp) = self.lsp.as_mut().filter(|_| !changes.is_empty()) {
+            lsp.did_change_watched_files(changes);
+        }
     }
 
     fn cycle_focus(&mut self) {
@@ -18191,7 +18392,7 @@ impl App {
                 Ok(()) => {
                     self.terminal_status(format!(
                         "Split terminal: {} active",
-                        self.terminals.len()
+                        self.live_terminal_count()
                     ));
                 }
                 Err(e) => {
@@ -18812,7 +19013,10 @@ impl App {
     fn split_terminal_reporting(&mut self) {
         match self.split_terminal() {
             Ok(()) => {
-                self.terminal_status(format!("Split terminal: {} active", self.terminals.len()));
+                self.terminal_status(format!(
+                    "Split terminal: {} active",
+                    self.live_terminal_count()
+                ));
             }
             Err(e) => {
                 self.status = format!("Split terminal failed: {e}");
@@ -18831,6 +19035,32 @@ impl App {
         } else {
             self.status = String::from("Cannot close the last terminal; press Ctrl+J to hide");
         }
+    }
+
+    /// A key typed in the active pane after its shell exited (#912): close
+    /// the pane, or start a new shell in its place when it is the last.
+    fn dismiss_exited_terminal(&mut self) {
+        let idx = self.active_terminal;
+        let last = self.terminals.len() == 1;
+        if last && let Err(e) = self.split_terminal() {
+            self.status = format!("Could not start a new shell: {e}");
+            return;
+        }
+        if self.close_terminal_at(idx) {
+            // Not parked for undo-close: there is no shell to bring back.
+            self.closed_terminals.pop();
+        }
+        self.terminal_status(if last {
+            String::from("Started a new shell")
+        } else {
+            format!("Closed terminal: {} remaining", self.terminals.len())
+        });
+    }
+
+    /// Panes whose shell is still running: one kept after its shell exited
+    /// (#912) is not an active terminal.
+    fn live_terminal_count(&self) -> usize {
+        self.terminals.iter().filter(|t| !t.has_exited()).count()
     }
 
     /// Cmd+K ⇧T: bring back the most recently closed terminal pane while it
@@ -18966,7 +19196,9 @@ impl App {
             "Secret redaction: off"
         });
         if !cfg!(test) {
-            let _ = crate::prefs::save_disable_secret_redaction(!self.secret_redaction);
+            self.report_unsaved_setting(crate::prefs::save_disable_secret_redaction(
+                !self.secret_redaction,
+            ));
         }
     }
 
@@ -19140,6 +19372,17 @@ impl App {
     ///
     /// A multi-line paste a pane would run line by line asks first (#1274).
     fn paste_terminal_input(&mut self, payload: &[u8]) {
+        // A paste is input, so on a pane whose shell exited it does what a
+        // typed key does (#912): close the pane, or start a new shell in the
+        // last one, instead of going to a shell that is gone.
+        if self
+            .terminals
+            .get(self.active_terminal)
+            .is_some_and(|t| t.has_exited())
+        {
+            self.dismiss_exited_terminal();
+            return;
+        }
         // A paste while the popup asks about another would replace the
         // held bytes, or (one line) slip into the shell behind the popup.
         if self.pending_terminal_paste.is_some() {
@@ -19932,14 +20175,6 @@ impl App {
     /// set, what they report, or whether the choice survives a restart.
     fn toggle_sidebar_auto_hide(&mut self) {
         self.sidebar_auto_hide = !self.sidebar_auto_hide;
-        // Best-effort, like every other pref write: a read-only config must
-        // not break the in-session toggle. Skipped under test, mirroring the
-        // write-skip in `apply_theme` — `save_*` resolves the developer's real
-        // ~/.config/croft/config.json, and a test has no business rewriting
-        // it (nor leaving the next test to read what it wrote).
-        if !cfg!(test) {
-            let _ = crate::prefs::save_sidebar_auto_hide(self.sidebar_auto_hide);
-        }
         // Turning it ON with the sidebar open takes effect at the next focus
         // move rather than retroactively yanking it away here — which means
         // dropping any collapse already pending. A dwell armed before the
@@ -19961,6 +20196,16 @@ impl App {
             "Auto-hide side bar {}",
             if self.sidebar_auto_hide { "on" } else { "off" }
         );
+        // A read-only config must not break the in-session toggle; a failed
+        // write is only said. Skipped under test, mirroring the write-skip
+        // in `apply_theme` — `save_*` resolves the developer's real
+        // ~/.config/croft/config.json, and a test has no business rewriting
+        // it (nor leaving the next test to read what it wrote).
+        if !cfg!(test) {
+            self.report_unsaved_setting(crate::prefs::save_sidebar_auto_hide(
+                self.sidebar_auto_hide,
+            ));
+        }
     }
 
     /// Arm the grace delay before collapsing. Called on focus moves INTO the
@@ -22201,11 +22446,11 @@ impl App {
         // clickable clusters around it.
         // Screen reader mode shows the announcement in the status slot, and
         // every status passes through the UI catalog (#621).
-        let status_text = if self.screen_reader && !self.announcer.line.is_empty() {
+        let status_text = one_line(if self.screen_reader && !self.announcer.line.is_empty() {
             self.announcer.line.clone()
         } else {
             crate::i18n::tr(&self.status).into_owned()
-        };
+        });
         // A message seen for the first time is kept, in full, in the Messages
         // output channel, and may take the whole bar until the next key or
         // click (#1609): elided to fit, its middle was gone for good.
@@ -25576,7 +25821,7 @@ impl App {
                 Ok(()) => {
                     self.terminal_status(format!(
                         "Split terminal: {} active",
-                        self.terminals.len()
+                        self.live_terminal_count()
                     ));
                 }
                 Err(e) => {
@@ -26376,11 +26621,11 @@ impl App {
             return;
         }
         let now_enabled = self.disabled_extensions.contains(&id);
-        self.set_extension_enabled(&id, now_enabled);
         self.status = format!(
             "{} extension '{id}'",
             if now_enabled { "Enabled" } else { "Disabled" }
         );
+        self.set_extension_enabled(&id, now_enabled);
     }
 
     /// Uninstall the selected INSTALLED extension: delete its manifest from the
@@ -26419,21 +26664,22 @@ impl App {
         let command_ids = crate::mcp::registry::command_ids_of_in_dir(&self.config_dir, id);
         match crate::mcp::catalog::uninstall_in(&self.config_dir.join("extensions"), id) {
             Ok(()) => {
-                let _ =
+                let mut saved =
                     crate::prefs::forget_mcp_tool_fingerprints_in(&self.config_dir, &command_ids);
                 // Drop any stale disabled-state for the removed id so a later
                 // re-add starts enabled, matching a fresh install.
                 if self.disabled_extensions.remove(id) {
-                    let _ = crate::prefs::save_disabled_extensions_in(
+                    saved = saved.and(crate::prefs::save_disabled_extensions_in(
                         &self.config_dir,
                         &self.disabled_extensions,
-                    );
+                    ));
                 }
                 // And its consent: a re-add is a program the user has not
                 // approved this time, so the first-run gate asks again.
-                self.forget_extension_consent(id);
+                saved = saved.and(self.forget_extension_consent(id));
                 self.refresh_extensions();
                 self.status = format!("Uninstalled '{id}' — it's back under AVAILABLE to re-add");
+                self.report_unsaved_setting(saved);
             }
             Err(e) => self.status = format!("Could not uninstall '{id}': {e}"),
         }
@@ -26450,10 +26696,11 @@ impl App {
         }
     }
 
-    /// Forget `id`'s first-run consent in the session set and in prefs.
-    fn forget_extension_consent(&mut self, id: &str) {
+    /// Forget `id`'s first-run consent in the session set and in prefs,
+    /// returning whether prefs took it.
+    fn forget_extension_consent(&mut self, id: &str) -> anyhow::Result<()> {
         self.consented_extensions.remove(id);
-        let _ = crate::prefs::forget_mcp_consent_in(&self.config_dir, id);
+        crate::prefs::forget_mcp_consent_in(&self.config_dir, id)
     }
 
     /// Whether the extension `id` is currently enabled (not in the disabled set).
@@ -30604,7 +30851,7 @@ impl App {
                     let _ = std::fs::remove_dir_all(&repo_dir);
                     std::fs::create_dir_all(&repo_dir)
                         .map_err(|e| format!("{}: {e}", repo_dir.display()))?;
-                    let resp = ureq::AgentBuilder::new()
+                    let resp = crate::net::builder(&url)
                         .timeout(std::time::Duration::from_secs(300))
                         .build()
                         .get(&url)
@@ -32870,7 +33117,7 @@ impl App {
         if !url.starts_with("https://") {
             return Err(String::from("A database URL must be https://"));
         }
-        let resp = ureq::get(url)
+        let resp = crate::net::get(url)
             .timeout(std::time::Duration::from_secs(300))
             .call()
             .map_err(|e| format!("Download failed: {e}"))?;
@@ -32918,8 +33165,18 @@ impl App {
                     "--jq",
                     ".[].language",
                 ]);
-                let out = crate::review_ops::output_retrying_busy(&mut cmd)
-                    .map_err(|e| format!("could not run gh: {e}"))?;
+                let out = crate::review_ops::output_retrying_busy(&mut cmd).map_err(|e| {
+                    format!(
+                        "Could not look up {repo}'s CodeQL databases: {}",
+                        crate::gh::spawn_error(&e, None)
+                    )
+                })?;
+                if crate::gh::signed_out(out.status) {
+                    return Err(format!(
+                        "Could not look up {repo}'s CodeQL databases: {}",
+                        crate::gh::SIGNED_OUT
+                    ));
+                }
                 if !out.status.success() {
                     return Err(format!(
                         "{repo} has no CodeQL databases on GitHub: {}",
@@ -32955,13 +33212,18 @@ impl App {
             .stderr(std::process::Stdio::piped());
         let out = crate::review_ops::spawn_retrying_busy(&mut cmd)
             .and_then(std::process::Child::wait_with_output)
-            .map_err(|e| format!("could not run gh: {e}"))?;
+            .map_err(|e| {
+                let _ = std::fs::remove_file(&tmp);
+                format!("Download failed: {}", crate::gh::spawn_error(&e, None))
+            })?;
         if !out.status.success() {
             let _ = std::fs::remove_file(&tmp);
-            return Err(format!(
-                "Download failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            ));
+            let why = if crate::gh::signed_out(out.status) {
+                std::borrow::Cow::Borrowed(crate::gh::SIGNED_OUT)
+            } else {
+                String::from_utf8_lossy(&out.stderr)
+            };
+            return Err(format!("Download failed: {}", why.trim()));
         }
         let result = Self::extract_codeql_zip(cache, &tmp, &name);
         let _ = std::fs::remove_file(&tmp);
@@ -32977,14 +33239,18 @@ impl App {
         } else {
             self.disabled_extensions.insert(id.to_string());
         }
-        let _ =
+        let mut saved =
             crate::prefs::save_disabled_extensions_in(&self.config_dir, &self.disabled_extensions);
         // Turning an extension off forgets its tools' fingerprints, so
         // turning it back on re-approves a tool whose definition changed.
         if !enabled {
             let ids = crate::mcp::registry::command_ids_of_in_dir(&self.config_dir, id);
-            let _ = crate::prefs::forget_mcp_tool_fingerprints_in(&self.config_dir, &ids);
+            saved = saved.and(crate::prefs::forget_mcp_tool_fingerprints_in(
+                &self.config_dir,
+                &ids,
+            ));
         }
+        self.report_unsaved_setting(saved);
         self.refresh_extensions();
         if id == "codeql" {
             if !enabled && self.sidebar_view == SidebarView::CodeQL {
@@ -33168,7 +33434,8 @@ impl App {
         // while in the background.
         let mut events = self.debug_sessions.take_focused_backlog();
         let mut background_ended: Vec<usize> = Vec::new();
-        let mut background_output: Vec<crate::ansi_text::AnsiLine> = Vec::new();
+        // (session index, category, text) of each background output event.
+        let mut background_output: Vec<(usize, String, String)> = Vec::new();
         // By index, not name: a compound can list one configuration twice,
         // so two members can share a name.
         let mut background_stopped: Option<usize> = None;
@@ -33192,15 +33459,7 @@ impl App {
                     DapEvent::Output { category, text }
                         if crate::dap::session::output_is_user_visible(&category) =>
                     {
-                        // Parsed with this member's own stream state, so a
-                        // sibling's colour or cut escape never runs into it.
-                        let prefix = format!("[{}] ", named.name);
-                        background_output.extend(named.console_ansi.feed(&text).into_iter().map(
-                            |mut line| {
-                                line.prefix(&prefix);
-                                line
-                            },
-                        ));
+                        background_output.push((index, category, text));
                     }
                     DapEvent::Output { .. } => {}
                     other => {
@@ -33216,8 +33475,8 @@ impl App {
                 }
             }
         }
-        for line in background_output {
-            self.debug_console_push_line(line);
+        for (index, category, text) in background_output {
+            self.debug_console_push_output(index, &category, &text, true);
         }
         // Highest index first, so removing one does not move the next.
         let mut ended_names = Vec::new();
@@ -33227,6 +33486,11 @@ impl App {
             background_stopped.and_then(|i| index_after_removals(i, &background_ended));
         for index in background_ended.into_iter().rev() {
             if let Some(mut gone) = self.debug_sessions.remove(index) {
+                mirror_open_console_lines(
+                    &mut gone.console,
+                    &self.debug_console,
+                    self.debug_console_dropped,
+                );
                 gone.session.disconnect();
                 ended_names.push(gone.name);
             }
@@ -33276,14 +33540,14 @@ impl App {
         let mut changed = !events.is_empty() || changed_background;
         for ev in events {
             match ev {
-                // Route program output to the debug console (each embedded
-                // newline becomes its own line), but drop debugpy's own
-                // `telemetry` banner (the `ptvsd` / `debugpy` noise).
+                // Route program output to the debug console (a line per
+                // newline, #932), but drop debugpy's own `telemetry` banner
+                // (the `ptvsd` / `debugpy` noise).
                 DapEvent::Output { category, text }
                     if crate::dap::session::output_is_user_visible(&category) =>
                 {
                     let focused = self.debug_sessions.focused_index();
-                    self.debug_console_push_output(&text, focused);
+                    self.debug_console_push_output(focused, &category, &text, false);
                 }
                 // REPL submissions echo "❯ expr" then the result; watch/hover
                 // results are consumed elsewhere.
@@ -33294,7 +33558,11 @@ impl App {
                     ..
                 } if context == "repl" => {
                     self.debug_console_push(format!("❯ {expression}"));
-                    self.debug_console_push(result);
+                    // A console line each (#932): a traceback is many lines,
+                    // and as one entry only its first was ever visible.
+                    for line in result.lines() {
+                        self.debug_console_push(line.to_string());
+                    }
                 }
                 DapEvent::Evaluated {
                     context,
@@ -33445,6 +33713,11 @@ impl App {
                     .focused()
                     .and_then(|s| s.launch_error.clone());
                 if let Some(mut gone) = self.debug_sessions.remove(ended) {
+                    mirror_open_console_lines(
+                        &mut gone.console,
+                        &self.debug_console,
+                        self.debug_console_dropped,
+                    );
                     gone.session.disconnect();
                 }
                 // `stopAll: true` (#567): the siblings go too, and the rest
@@ -33748,37 +34021,105 @@ impl App {
     }
 
     /// Append an output event of the session at `index` to the debug
-    /// console, one line per embedded newline, with its colour sequences
-    /// turned into spans and every other escape dropped (#1501). The parse
-    /// uses that session's own stream state: a sequence the event ends in the
-    /// middle of waits for that session's next event rather than leaking its
-    /// tail as text, and a colour it leaves on carries only into its own
-    /// lines, never a sibling's.
-    fn debug_console_push_output(&mut self, text: &str, index: usize) {
-        let lines = match self
+    /// console, with its colour sequences turned into spans and every other
+    /// escape dropped (#1501). The event is a chunk of that session's
+    /// `category` stream, not a line (#932), and is parsed with the stream's
+    /// own state: a sequence the event ends in the middle of waits for the
+    /// next event, a colour it leaves on carries only into its own lines, and
+    /// a line ends at its newline, blank ones included. The line a chunk
+    /// leaves open is shown as it reads so far and redrawn in place as later
+    /// chunks extend it, so `print: i =` and ` 0` read as one line and a
+    /// progress bar's `\r` redraws it rather than piling up copies. `tagged`
+    /// puts the session's name in front of each line, for a background member.
+    fn debug_console_push_output(
+        &mut self,
+        index: usize,
+        category: &str,
+        text: &str,
+        tagged: bool,
+    ) {
+        let Some((_, named)) = self
+            .debug_sessions
+            .iter_named_mut_indexed()
+            .find(|(i, _)| *i == index)
+        else {
+            let mut alone = crate::ansi_text::AnsiStream::default();
+            let mut lines = alone.feed(text);
+            lines.extend(alone.finish());
+            for line in lines {
+                self.debug_console_push_line(line);
+            }
+            return;
+        };
+        let prefix = tagged.then(|| format!("[{}] ", named.name));
+        let stream = named.console_stream(category);
+        let ended = stream.ansi.feed(text);
+        let open = stream.ansi.open_line().cloned();
+        let mut slot = stream
+            .shown_at
+            .take()
+            .and_then(|at| at.checked_sub(self.debug_console_dropped))
+            .filter(|&i| i < self.debug_console.len());
+        let tag = |mut line: crate::ansi_text::AnsiLine| {
+            if let Some(prefix) = &prefix {
+                line.prefix(prefix);
+            }
+            line
+        };
+        // The first line the chunk ends is the one shown open, if any:
+        // finish it where it stands.
+        for line in ended.into_iter().map(tag) {
+            match slot.take() {
+                Some(i) => {
+                    crate::output::push(
+                        crate::output::CHANNEL_DEBUG_CONSOLE,
+                        crate::output::OutputLevel::Info,
+                        &line.text,
+                    );
+                    self.debug_console[i] = line;
+                }
+                None => self.debug_console_push_line(line),
+            }
+        }
+        let shown_at = open.map(tag).map(|line| match slot {
+            Some(i) => {
+                self.debug_console[i] = line;
+                self.debug_console_dropped + i
+            }
+            None => {
+                self.debug_console_append(line);
+                self.debug_console_dropped + self.debug_console.len() - 1
+            }
+        });
+        if let Some((_, named)) = self
             .debug_sessions
             .iter_named_mut_indexed()
             .find(|(i, _)| *i == index)
         {
-            Some((_, named)) => named.console_ansi.feed(text),
-            None => crate::ansi_text::AnsiStream::default().feed(text),
-        };
-        for line in lines {
-            self.debug_console_push_line(line);
+            named.console_stream(category).shown_at = shown_at;
         }
     }
 
+    /// Append a finished line to the debug console and mirror it to
+    /// OUTPUT's "Debug Console" channel.
     fn debug_console_push_line(&mut self, line: crate::ansi_text::AnsiLine) {
-        const CAP: usize = 1000;
         crate::output::push(
             crate::output::CHANNEL_DEBUG_CONSOLE,
             crate::output::OutputLevel::Info,
             &line.text,
         );
+        self.debug_console_append(line);
+    }
+
+    /// Append a line to the debug console without mirroring it, capping the
+    /// backlog and counting the lines the cap drops off its front.
+    fn debug_console_append(&mut self, line: crate::ansi_text::AnsiLine) {
+        const CAP: usize = 1000;
         self.debug_console.push(line);
         if self.debug_console.len() > CAP {
             let overflow = self.debug_console.len() - CAP;
             self.debug_console.drain(..overflow);
+            self.debug_console_dropped += overflow;
         }
     }
 
@@ -34031,6 +34372,7 @@ impl App {
         // A fresh session: drop the previous run's retained console + stop
         // tracking so the "exited without hitting a breakpoint" hint and the
         // console reflect only this run.
+        self.debug_console_dropped += self.debug_console.len();
         self.debug_console.clear();
         self.debug_ever_stopped = false;
         self.run_debug.session_ended = false;
@@ -36493,7 +36835,7 @@ impl App {
                 DapEvent::Output { category, text }
                     if crate::dap::session::output_is_user_visible(&category) =>
                 {
-                    self.debug_console_push_output(&text, old);
+                    self.debug_console_push_output(old, &category, &text, false);
                 }
                 DapEvent::Output { .. } => {}
                 other => keep.push(other),
@@ -36744,8 +37086,13 @@ impl App {
         // several; disconnecting only the one the user happens to be looking
         // at would leave its siblings running with nothing on screen owning
         // them, which is the orphaning the issue names.
-        for session in self.debug_sessions.iter_mut() {
-            session.disconnect();
+        for (_, named) in self.debug_sessions.iter_named_mut_indexed() {
+            mirror_open_console_lines(
+                &mut named.console,
+                &self.debug_console,
+                self.debug_console_dropped,
+            );
+            named.session.disconnect();
         }
         self.debug_sessions.clear();
         // A `cargo` build still running for a launch (#1392) must not start
@@ -37849,6 +38196,8 @@ impl App {
             ScmWrite::Stash => self.stash_source_control(),
             ScmWrite::StashIncludeUntracked => self.stash_include_untracked_source_control(),
             ScmWrite::StashStaged => self.stash_staged_source_control(),
+            ScmWrite::StashAndSwitch => self.stash_and_switch_picked(false),
+            ScmWrite::MigrateAndSwitch => self.stash_and_switch_picked(true),
         }
         // A write that stopped before its check (busy git, empty message)
         // must not carry the clearance to the next request.
@@ -40335,7 +40684,9 @@ impl App {
             String::from("Navigator proactive comments: off")
         };
         if !cfg!(test) {
-            let _ = crate::prefs::save_proactive_navigator(self.proactive_navigator_enabled);
+            self.report_unsaved_setting(crate::prefs::save_proactive_navigator(
+                self.proactive_navigator_enabled,
+            ));
         }
     }
 
@@ -40509,24 +40860,20 @@ impl App {
         // land in a real buffer that saves, auto-saves, and reloads through
         // the one code path.
         let events = session.poll(|file| self.owner_buffer_text(&root, file));
-        // One undo step per author per file per tick (#1207): a peer's edit
-        // reaches us as one op per changed run, and undoing them run by run
-        // walked through texts nobody ever wrote.
-        let mut tick_groups: std::collections::HashMap<(String, u64), u64> =
-            std::collections::HashMap::new();
         for event in events {
             changed = true;
             match event {
                 CollabEvent::RemoteEdit { file, site, spans } => {
                     let doc_gen = session.doc_gen(&file).unwrap_or(0);
                     // An AI stream's fragments span many ticks; the whole
-                    // stream is one step, as its cancel already is.
-                    let group = match self.collab_stream.as_ref() {
-                        Some(st) if st.file == file && st.site == site => st.undo_group,
-                        _ => *tick_groups
-                            .entry((file.clone(), site))
-                            .or_insert_with(next_remote_undo_group),
-                    };
+                    // stream is one undo step, as its cancel already is, so
+                    // the driver can still reject it (#1207). Any other
+                    // peer's edit opens none (#919).
+                    let group = self
+                        .collab_stream
+                        .as_ref()
+                        .filter(|st| st.file == file && st.site == site)
+                        .map(|st| st.undo_group);
                     self.apply_collab_spans(&root, &file, &spans, doc_gen, group);
                 }
                 CollabEvent::Bootstrapped { file, text } => {
@@ -40886,8 +41233,9 @@ impl App {
     /// Replay resolved remote spans onto every open buffer for `file`,
     /// converting each byte span to the editor's char coordinates. Spans are
     /// sequential (each relative to the text with earlier ones applied), so
-    /// they go through `apply_remote_span_edits` one at a time, all in
-    /// `undo_group`'s one undo step (#1207). Every ATTACHED pane
+    /// they apply one at a time: an AI stream's all in `undo_group`'s one
+    /// undo step (#1207), a peer's (no group) in no step of their own but
+    /// carried into the undo history (#919). Every ATTACHED pane
     /// gets them (attached panes hold identical text, so the byte offsets
     /// are valid in each); a never-attached pane still holds stale disk
     /// text where the offsets would splice garbage — the attach pass seeds
@@ -40898,7 +41246,7 @@ impl App {
         file: &str,
         spans: &[crate::collab::ResolvedSpan],
         doc_gen: u64,
-        undo_group: u64,
+        undo_group: Option<u64>,
     ) {
         let Some(path) = crate::collab::contained_path(root, file) else {
             return;
@@ -40916,17 +41264,16 @@ impl App {
                 return;
             }
             for s in spans {
-                let (sr, sc) = crate::collab::position(&ed.lines, s.at);
-                let (er, ec) = crate::collab::position(&ed.lines, s.at + s.deleted);
-                ed.apply_remote_span_edits(
-                    &[crate::widgets::editor::TextSpanEdit {
-                        start: (sr, sc),
-                        end: (er, ec),
-                        new_text: s.inserted.clone(),
-                        utf16: false,
-                    }],
-                    undo_group,
-                );
+                let edit = crate::widgets::editor::TextSpanEdit {
+                    start: crate::collab::position(&ed.lines, s.at),
+                    end: crate::collab::position(&ed.lines, s.at + s.deleted),
+                    new_text: s.inserted.clone(),
+                    utf16: false,
+                };
+                match undo_group {
+                    Some(group) => ed.apply_remote_span_edits(&[edit], group),
+                    None => ed.apply_peer_span_edit(&edit),
+                };
             }
             // Echo suppression: apply_span_edits bumped edit_seq, which would
             // re-arm the tick diff and rebroadcast what was just applied.
@@ -41054,6 +41401,7 @@ impl App {
                 self.run_scm_op("stash pop", r, "Popped stash", "Pop stash");
             }
             ListPurpose::StashView => self.open_stash_patch(index),
+            ListPurpose::BlockedSwitch => self.stash_and_switch_picked(row.id == "migrate"),
             // Asked first: the drop cannot be undone (#1128).
             ListPurpose::StashDrop => {
                 let root = self.scm_root();
@@ -41400,6 +41748,14 @@ impl App {
                 }
             }
             ListPurpose::NotebookKernel => self.choose_notebook_kernel(&row.id),
+            ListPurpose::HttpEnvironment => {
+                self.status = if row.id.is_empty() {
+                    String::from("HTTP: no environment")
+                } else {
+                    format!("HTTP: environment {}", row.id)
+                };
+                self.http_environment = (!row.id.is_empty()).then_some(row.id);
+            }
             ListPurpose::QuickInputPosition => {
                 if let Some((pos, ..)) = QuickInputPosition::OPTIONS
                     .iter()
@@ -42748,7 +43104,7 @@ impl App {
     fn dismiss_terminal_warning(&mut self, dont_show_again: bool) {
         self.pending_terminal_warning = false;
         if dont_show_again {
-            let _ = crate::prefs::save_suppress_terminal_warning(true);
+            self.report_unsaved_setting(crate::prefs::save_suppress_terminal_warning(true));
         }
     }
 
@@ -43128,7 +43484,7 @@ impl App {
         };
         // Finished or skipped, the welcome panel stops offering it.
         self.tour_done = true;
-        let _ = crate::prefs::save_tour_done_in(&self.config_dir);
+        let saved = crate::prefs::save_tour_done_in(&self.config_dir);
         // The sample's tabs go with it, edited or not: left open they name
         // deleted files, and saving one would write a scratch file back.
         let mut sample: Vec<PathBuf> = self
@@ -43145,6 +43501,7 @@ impl App {
             Ok(()) => String::from("Tour finished"),
             Err(e) => format!("Tour finished, but its sample project was not removed: {e}"),
         };
+        self.report_unsaved_setting(saved);
     }
 
     fn perform_tour_action(&mut self, action: crate::tour::TourAction) {
@@ -43878,8 +44235,27 @@ impl App {
             Some((status, stdout)) if status.success() => {
                 String::from_utf8_lossy(&stdout).trim().to_string()
             }
-            _ => {
-                self.status = String::from("No PR for this branch — check it out first");
+            // A gh that is missing or signed out says how to fix it, as the
+            // review tab does (#917), not that the branch has no PR.
+            failed => {
+                let why = match failed {
+                    Some((status, _)) => {
+                        crate::gh::signed_out(status).then(|| String::from(crate::gh::SIGNED_OUT))
+                    }
+                    // No output: gh did not start, or ran past the budget.
+                    None => std::process::Command::new(&self.review_gh)
+                        .arg("--version")
+                        .stdin(std::process::Stdio::null())
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status()
+                        .err()
+                        .map(|e| crate::gh::spawn_error(&e, Some(root))),
+                };
+                self.status = match why {
+                    Some(why) => format!("Could not find this branch's PR: {why}"),
+                    None => String::from("No PR for this branch — check it out first"),
+                };
                 return None;
             }
         };
@@ -46808,7 +47184,10 @@ impl App {
         // only into a config dir the test chose, never the developer's.
         self.vim_mode_pref = self.vim.enabled;
         if !cfg!(test) || self.config_dir != crate::prefs::config_dir() {
-            let _ = crate::prefs::save_vim_mode_in(&self.config_dir, self.vim.enabled);
+            self.report_unsaved_setting(crate::prefs::save_vim_mode_in(
+                &self.config_dir,
+                self.vim.enabled,
+            ));
         }
     }
 
@@ -47717,6 +48096,12 @@ impl App {
         // The command modifier: Cmd (SUPER) on macOS, Ctrl on Linux / Termux.
         let cmd = key.modifiers.contains(KeyModifiers::SUPER)
             || key.modifiers.contains(KeyModifiers::CONTROL);
+        // The word modifier for ←/→, Backspace and Delete: Option (Alt) on
+        // macOS, Ctrl on Linux as in VS Code there (#909). Ctrl with Cmd
+        // held is not it: Cmd with these keys is no word chord on macOS.
+        let word = alt
+            || key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::SUPER);
         // VS Code "Add Cursor Above/Below" (Cmd+Opt+Up / Cmd+Opt+Down). Must
         // come before the plain-Alt move-line check so the cmd+alt combo is
         // routed here, not there.
@@ -47764,10 +48149,12 @@ impl App {
             match key.code {
                 KeyCode::Up => self.editor.arrow_up(),
                 KeyCode::Down => self.editor.arrow_down(),
-                KeyCode::Left if alt => self.editor.move_word_left(),
-                KeyCode::Right if alt => self.editor.move_word_right(),
+                KeyCode::Left if word => self.editor.move_word_left(),
+                KeyCode::Right if word => self.editor.move_word_right(),
                 KeyCode::Left => self.editor.move_left(),
                 KeyCode::Right => self.editor.move_right(),
+                KeyCode::Home if cmd => self.editor.cursor_top(),
+                KeyCode::End if cmd => self.editor.cursor_bottom(),
                 KeyCode::Home => self.editor.home_key(),
                 KeyCode::End => self.editor.end_key(),
                 KeyCode::PageUp => self.editor.page_up_one_screen(),
@@ -47787,18 +48174,25 @@ impl App {
         match key.code {
             KeyCode::Up => self.editor.arrow_up(),
             KeyCode::Down => self.editor.arrow_down(),
-            KeyCode::Left if alt => self.editor.move_word_left(),
-            KeyCode::Right if alt => self.editor.move_word_right(),
+            KeyCode::Left if word => self.editor.move_word_left(),
+            KeyCode::Right if word => self.editor.move_word_right(),
             KeyCode::Left => self.editor.move_left(),
             KeyCode::Right => self.editor.move_right(),
             KeyCode::PageUp => self.editor.page_up_one_screen(),
             KeyCode::PageDown => self.editor.page_down_one_screen(),
+            KeyCode::Home if cmd => self.editor.cursor_top(),
+            KeyCode::End if cmd => self.editor.cursor_bottom(),
             KeyCode::Home => self.editor.home_key(),
             KeyCode::End => self.editor.end_key(),
             KeyCode::Backspace => {
-                self.editor.backspace();
+                if word {
+                    self.editor.delete_word_left();
+                } else {
+                    self.editor.backspace();
+                }
                 self.note_incomplete_completion_edit();
             }
+            KeyCode::Delete if word => self.editor.delete_word_right(),
             KeyCode::Delete => self.editor.delete_forward(),
             KeyCode::Enter => self.editor.insert_newline(),
             // Tab advances a live snippet, else expands a snippet whose prefix
@@ -47843,9 +48237,11 @@ impl App {
 
     /// Vim-style chord layer for the editor: `cmd+gg` jumps to top, `cmd+G`
     /// jumps to bottom, `cmd+yy` yanks a line. Counts go between the chord
-    /// start and the completion key (`cmd+g 12 g` jumps to line 12). There is
-    /// no `cmd+dd`: `cmd+d` is Add Selection to Next Match, and Delete Line
-    /// moved to `cmd+shift+k`.
+    /// start and the completion key (`cmd+g 12 g` jumps to line 12), and
+    /// Enter completes a `cmd+g` holding one, so VS Code's Go to Line
+    /// (`ctrl+g 12 Enter`) lands there too (#902). There is no `cmd+dd`:
+    /// `cmd+d` is Add Selection to Next Match, and Delete Line moved to
+    /// `cmd+shift+k`.
     /// Returns true when the key was consumed; false means the caller
     /// should continue with normal editor handling.
     fn handle_editor_vim_chord(&mut self, key: KeyEvent) -> bool {
@@ -47901,13 +48297,15 @@ impl App {
                 }
                 return false;
             }
-            self.editor_vim_chord.reset();
-            self.status = String::from("Chord cancelled");
-            return false;
+            return self.cancel_editor_vim_chord(key);
         }
 
         let completes = match self.editor_vim_chord.op {
-            VimOp::G => is_plain_letter(key, 'g') || is_vim_chord_g(key),
+            VimOp::G => {
+                is_plain_letter(key, 'g')
+                    || is_vim_chord_g(key)
+                    || (count_pending && key.code == KeyCode::Enter && key.modifiers.is_empty())
+            }
             VimOp::Y => is_plain_letter(key, 'y') || is_vim_chord_y(key),
             VimOp::None => false,
         };
@@ -47938,9 +48336,19 @@ impl App {
             return true;
         }
 
+        self.cancel_editor_vim_chord(key)
+    }
+
+    /// Drop the pending chord on a key that completes none, returning whether
+    /// that key is consumed. It keeps its normal meaning only when nothing but
+    /// the leader was typed: after a count the digits were swallowed, so the
+    /// last key alone would edit the buffer with a fragment of what was typed
+    /// (`cmd+g 25 Tab` indenting the line). Esc only ever cancels (#902).
+    fn cancel_editor_vim_chord(&mut self, key: KeyEvent) -> bool {
+        let consumed = self.editor_vim_chord.count > 0 || key.code == KeyCode::Esc;
         self.editor_vim_chord.reset();
         self.status = String::from("Chord cancelled");
-        false
+        consumed
     }
 
     /// Apply one resolved vim intent to the editor. The vim state machine has
@@ -48936,19 +49344,83 @@ impl App {
             self.status = String::from("No request under the caret");
             return None;
         };
-        let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
-        let vars = crate::http_file::variables(&text, crate::http_file::load_env(&dir));
+        let dir = path.parent().unwrap_or(Path::new("."));
+        let env = crate::http_file::load_env(dir, self.http_environment.as_deref());
+        let vars = crate::http_file::variables(&text, env.vars);
         let (resolved, missing) = crate::http_file::resolve(&req, &vars);
         if !missing.is_empty() {
             let holes: Vec<String> = missing.iter().map(|m| format!("{{{{{m}}}}}")).collect();
-            self.status = format!(
-                "HTTP: no value for {} (set it with @name = … in the file, in {} beside it, or $env)",
-                holes.join(", "),
-                crate::http_file::ENV_FILE
-            );
+            let active = self
+                .http_environment
+                .as_ref()
+                .filter(|e| env.environments.contains(e));
+            // Named environments nobody picked are the likely gap (#924):
+            // say so rather than point at the files that hold the values.
+            self.status = match active {
+                None if !env.environments.is_empty() => format!(
+                    "HTTP: no value for {}; pick an environment ({}) with HTTP: Switch Environment",
+                    holes.join(", "),
+                    env.environments.join(", ")
+                ),
+                Some(e) => format!(
+                    "HTTP: no value for {} in environment {e} (or set it with @name = … in the file, or $env)",
+                    holes.join(", "),
+                ),
+                None => format!(
+                    "HTTP: no value for {} (set it with @name = … in the file, in {} beside it, or $env)",
+                    holes.join(", "),
+                    crate::http_file::ENV_FILE
+                ),
+            };
             return None;
         }
         Some((req, resolved, path))
+    }
+
+    /// HTTP: Switch Environment (#924): pick which named environment of the
+    /// env files beside the active `.http` file fills its requests, or none.
+    fn open_http_environment_picker(&mut self) {
+        use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+        let Some(path) = self.editor.path.clone() else {
+            self.status = String::from("No file open");
+            return;
+        };
+        if !crate::http_file::is_http_file(&path) {
+            self.status = String::from("Not a .http/.rest file");
+            return;
+        }
+        let dir = path.parent().unwrap_or(Path::new("."));
+        let envs = crate::http_file::load_env(dir, None).environments;
+        if envs.is_empty() {
+            self.status = format!(
+                "No named environments in {} beside this file",
+                crate::http_file::ENV_FILES.join(" or ")
+            );
+            return;
+        }
+        let current = self.http_environment.clone().unwrap_or_default();
+        let rows: Vec<ListRow> = std::iter::once(String::new())
+            .chain(envs)
+            .map(|id| {
+                let name = if id.is_empty() {
+                    format!("No Environment ({} only)", crate::http_file::SHARED_ENV)
+                } else {
+                    id.clone()
+                };
+                let mark = if id == current { "  (current)" } else { "" };
+                ListRow {
+                    label: format!("{name}{mark}"),
+                    id,
+                }
+            })
+            .collect();
+        let mut picker = ListPicker::new(ListPurpose::HttpEnvironment, "HTTP Environment", rows);
+        picker.selected = picker
+            .rows
+            .iter()
+            .position(|r| r.id == current)
+            .unwrap_or(0);
+        self.open_list_picker(picker, "");
     }
 
     /// Fold in a finished `.http` request (#370): record it in the durable
@@ -49301,6 +49773,14 @@ impl App {
             self.paste_clipboard_into_terminal();
             return;
         }
+        // A pane whose shell exited takes no input (#912): a key that would
+        // type closes it instead, or starts a new shell in the last pane.
+        if self.terminal().has_exited() {
+            if !key_to_bytes(key, false).is_empty() {
+                self.dismiss_exited_terminal();
+            }
+            return;
+        }
         // Any other keystroke clears the selection so the user's input is
         // sent without the previous highlight lingering on screen.
         if self.terminal().selection().is_some() {
@@ -49643,6 +50123,67 @@ impl App {
         md.run_rows.iter().position(|r| *r == visual)
     }
 
+    /// Follow link `idx` of the open preview (#931), as VS Code's preview
+    /// does: `#heading` scrolls to it, `http(s)` opens in the browser, and a
+    /// relative path opens in the editor (`#L3` at that line; a Markdown
+    /// file rendered, at its `#heading`). Any other scheme is refused.
+    fn follow_preview_link(&mut self, idx: usize) {
+        let Some(dest) = (self.editor.markdown_preview.as_ref())
+            .and_then(|md| Some(md.links.links.get(idx)?.dest.trim().to_string()))
+        else {
+            return;
+        };
+        if let Some(frag) = dest.strip_prefix('#') {
+            let md = self.editor.markdown_preview.as_mut();
+            self.status = if md.is_some_and(|md| md.scroll_to_heading(frag)) {
+                format!("Went to {dest}")
+            } else {
+                format!("No heading {dest} in this document")
+            };
+            return;
+        }
+        let lower = dest.to_ascii_lowercase();
+        if lower.starts_with("http://") || lower.starts_with("https://") {
+            return self.open_url_for_user(&dest);
+        }
+        if dest.contains(':') {
+            self.status = format!("Refused to open non-web link: {dest}");
+            return;
+        }
+        let (path, frag) = dest
+            .split_once('#')
+            .map_or((dest.as_str(), None), |(p, f)| (p, Some(f)));
+        // A query is no part of the file's name: GitHub READMEs link to
+        // `guide.md?plain=1` for its source, as images add `?raw=true`.
+        let path = path.split_once('?').map_or(path, |(p, _)| p);
+        let path = crate::shell_integration::percent_decode(path.as_bytes());
+        let path = String::from_utf8_lossy(&path);
+        // `/docs/x.md` is from the workspace root, as GitHub reads it.
+        let doc_dir = self.editor.path.as_ref().and_then(|p| p.parent());
+        let base = doc_dir
+            .filter(|_| !path.starts_with('/'))
+            .map_or_else(|| self.active_workspace_root(), Path::to_path_buf);
+        let abs = base.join(path.trim_start_matches('/'));
+        let lines = frag.and_then(|f| {
+            let mut n = f
+                .split('-')
+                .map(|n| n.strip_prefix('L')?.parse::<u32>().ok());
+            Some((n.next()??, n.next().flatten()))
+        });
+        let (line, end) = lines.unwrap_or((1, None));
+        if !self.open_resolved_file_ref(&abs, line, None, end) {
+            self.status = format!("No file at {dest}");
+            return;
+        }
+        if lines.is_none()
+            && (self.editor.markdown_preview.is_some() || self.editor.toggle_markdown_preview())
+            && let Some(frag) = frag
+            && let Some(md) = self.editor.markdown_preview.as_mut()
+        {
+            md.scroll_to_heading(frag);
+        }
+    }
+
     /// The confirm popup for runnable fence `idx` of the current document.
     /// EVERY block confirms (#353): a README from a cloned repo is untrusted
     /// input, and a substring matcher cannot tell a benign block from a
@@ -49679,7 +50220,14 @@ impl App {
         PendingRunBlock {
             pane_name: format!("{file}:{}", idx + 1),
             cwd,
-            command: fence_command(block.interpreter, &block.code, &block_script_dir()),
+            command: fence_command(
+                block.interpreter,
+                &block.code,
+                &block_script_dir(),
+                // The shell `run_block_in_pane` spawns, or spawned the pane
+                // it reuses.
+                &std::env::var("SHELL").unwrap_or_default(),
+            ),
             code: block.code.clone(),
             destructive: block.destructive,
             doc: doc.clone(),
@@ -50317,6 +50865,12 @@ impl App {
             }
             MouseEventKind::Up(MouseButton::Left) => {
                 md.dragging = false;
+                // A click or Ctrl+click (#1848) that did not drag follows
+                // the link under it (#931); a drag from a link selects.
+                if let Some(i) = md.link_at(m.column, m.row).filter(|_| !md.has_selection()) {
+                    self.follow_preview_link(i);
+                    return true;
+                }
                 // Mirror the editor's copy-on-select setting so a finished
                 // drag lands on the clipboard when the user asked for that.
                 if self.copy_on_select {
@@ -51519,6 +52073,8 @@ impl App {
                 }
             }
         }
+        // A shell that exited ends the run it was awaited for (#912).
+        run_settled |= self.settle_exited_terminals();
         // A pane that closed will never report its run's end.
         let terminals = &self.terminals;
         self.pane_run_statuses
@@ -51622,6 +52178,51 @@ impl App {
         };
         self.status = format!("Bell in terminal: {label}");
         true
+    }
+
+    /// Act on panes whose shell has exited (#912). A task or fenced block
+    /// typed into the shell ended with it (`make || exit 1`): the exit code
+    /// is the run's outcome, and the pane stays so its output can be read.
+    /// Any other shell pane closes, as VS Code closes a terminal whose shell
+    /// exits, except the last, which waits for a key to start a new shell.
+    /// A program pane keeps its `[Process exited]` footer, as before.
+    /// Whether any pane's shell exited.
+    fn settle_exited_terminals(&mut self) -> bool {
+        let exited: Vec<(u64, Option<i32>)> = self
+            .terminals
+            .iter_mut()
+            .filter_map(|t| Some((t.uid(), t.poll_exit()?)))
+            .collect();
+        for &(uid, code) in &exited {
+            if let Some(i) = self.pane_run_statuses.iter().position(|(u, _)| *u == uid) {
+                let (_, run) = self.pane_run_statuses.remove(i);
+                run.settle(&mut self.status, |label, dur| {
+                    pane_run_outcome(label, code, dur)
+                });
+                continue;
+            }
+            let Some(idx) = self.terminals.iter().position(|t| t.uid() == uid) else {
+                continue;
+            };
+            if self.terminals[idx].is_run_pane() {
+                continue;
+            }
+            let mut exited = match self.terminals[idx].label() {
+                "" => String::from("Terminal exited"),
+                label => format!("Terminal {label} exited"),
+            };
+            if let Some(c) = code.filter(|&c| c != 0) {
+                exited.push_str(&format!(" with code {c}"));
+            }
+            if self.close_terminal_at(idx) {
+                // Not parked for undo-close: there is no shell to bring back.
+                self.closed_terminals.pop();
+                self.terminal_status(exited);
+            } else {
+                self.status = format!("{exited}; press a key in it to start a new shell");
+            }
+        }
+        !exited.is_empty()
     }
 
     /// Cmd+Opt+Up / Cmd+Opt+Down in the terminal: scroll the previous / next
@@ -55174,7 +55775,7 @@ impl App {
             // Break coalescing so a new iteration's opening keystrokes never
             // merge into the previous iteration's typing run. This bounds
             // iterations apart; it does NOT make one iteration one undo step
-            // — `push_undo` coalesces only InsertChar→InsertChar, so a macro
+            // — `push_undo` coalesces only a typing run, so a macro
             // holding a delete plus an insert still undoes in two. A real
             // one-step-per-iteration guarantee needs an undo-group API the
             // editor does not have (its undo is whole-buffer snapshots).
@@ -55236,8 +55837,17 @@ impl App {
             .take()
             .unwrap_or_else(|| self.editor.active_index());
         match cmd {
+            // A preview's placeholder lines are not the file (#916): an edit
+            // to them leaves the tab dirty with nothing a save can write.
+            Cmd::MoveLineUp | Cmd::MoveLineDown | Cmd::CopyLineUp | Cmd::CopyLineDown
+                if self.editor.has_non_text_view() =>
+            {
+                self.status = format!("{} needs a text file", cmd.title());
+            }
             Cmd::MoveLineUp => self.editor.move_lines_up(),
             Cmd::MoveLineDown => self.editor.move_lines_down(),
+            Cmd::CopyLineUp => self.editor.duplicate_lines_up(),
+            Cmd::CopyLineDown => self.editor.duplicate_lines_down(),
             Cmd::ToggleLineComment => {
                 if !self.editor.toggle_line_comment() && !self.editor.has_line_comment_syntax() {
                     self.status = String::from("Toggle Line Comment: no comment for this language");
@@ -55466,6 +56076,8 @@ impl App {
             | Cmd::GoToTypeDefinition
             | Cmd::GoToImplementations
             | Cmd::RenameSymbol
+            | Cmd::TriggerSuggest
+            | Cmd::TriggerParameterHints
                 if self.editor.has_non_text_view() =>
             {
                 self.status = format!("{} needs a text file", cmd.title());
@@ -55476,6 +56088,8 @@ impl App {
             Cmd::GoToTypeDefinition => self.request_type_definition_at_cursor(),
             Cmd::GoToImplementations => self.request_implementation_at_cursor(),
             Cmd::RenameSymbol => self.start_rename_symbol(),
+            Cmd::TriggerSuggest => self.trigger_completion(),
+            Cmd::TriggerParameterHints => self.trigger_signature_help(),
             // Position-carrying commands (#259). They read the click the
             // dispatcher set, and do nothing from the keyboard: invoked from
             // the palette there is no click to act on, and guessing the
@@ -56250,7 +56864,6 @@ impl App {
                     _ => "auto",
                 };
                 self.problems_project_scope = String::from(next);
-                let _ = crate::prefs::save_problems_project_scope(next);
                 // `on` and `off` are answers on their own. `auto` is the
                 // only mode whose effect depends on a count, and counting is
                 // a whole-workspace walk - which this repo runs on a
@@ -56266,6 +56879,9 @@ impl App {
                     _ => " (runs on its own unless the workspace is very large)",
                 };
                 self.status = format!("Whole-project check: {next}{effect}");
+                if !cfg!(test) {
+                    self.report_unsaved_setting(crate::prefs::save_problems_project_scope(next));
+                }
             }
             Cmd::ProblemsCheckProject => {
                 // An explicit ask always runs: the cap governs UNASKED runs
@@ -56360,12 +56976,16 @@ impl App {
             }
             Cmd::ProblemsToggleScope => {
                 self.problems.scope = self.problems.scope.next();
-                let _ = crate::prefs::save_problems_scope(self.problems.scope.to_config());
                 // Rebuild rather than filter in the panel: the badge counts
                 // the same list, so both follow the scope from one place.
                 self.rebuild_problems();
                 self.refresh_problems_badge();
                 self.status = format!("Problems: {}", self.problems.scope.label());
+                if !cfg!(test) {
+                    self.report_unsaved_setting(crate::prefs::save_problems_scope(
+                        self.problems.scope.to_config(),
+                    ));
+                }
             }
             Cmd::DiffToggleIgnoreWhitespace => self.diff_cycle_whitespace_mode(),
             Cmd::RunSelectedText => self.run_selected_text_in_terminal(),
@@ -56394,7 +57014,7 @@ impl App {
                 Ok(()) => {
                     self.terminal_status(format!(
                         "Split terminal: {} active",
-                        self.terminals.len()
+                        self.live_terminal_count()
                     ));
                 }
                 Err(e) => {
@@ -56609,6 +57229,7 @@ impl App {
             },
             Cmd::SendHttpRequest => self.send_http_request_under_caret(),
             Cmd::CopyHttpRequestAsCurl => self.copy_http_request_as_curl(),
+            Cmd::SwitchHttpEnvironment => self.open_http_environment_picker(),
             Cmd::AskNavigator => {
                 let (range, selection) = match self.editor.selection_rows() {
                     Some(rows) => (rows, self.editor.selection_text()),
@@ -56725,24 +57346,32 @@ impl App {
         }
         let mut jump = crate::widgets::zoxide_jump::ZoxideJump::new();
         jump.install_state = crate::zoxide::install_state();
+        jump.install_note = crate::zoxide::install_outcome();
         jump.termux = crate::iterm2_inline::detect_termux();
+        jump.rc_hint = crate::zoxide::shell_rc_hint();
         jump.set_results(crate::zoxide::query(""));
         // Snapshot the full frecency list so the typo-tolerant fuzzy
         // fallback can rank against it without re-spawning zoxide on every
         // missed keystroke.
         jump.set_all_dirs(jump.results.clone());
-        let status = if jump.available {
+        if jump.available {
+            jump.hook_offer = crate::zoxide::shell_hook_missing();
+        }
+        let status = if let Some(rc) = jump
+            .hook_offer
+            .as_deref()
+            .filter(|_| jump.hook_offer_shown())
+        {
+            let offer = crate::widgets::zoxide_jump::hook_offer_message(rc);
+            format!("Jump: {}", offer.lines().next().unwrap_or_default())
+        } else if jump.available {
             format!(
                 "Jump: {} directories — type to filter, Esc to close",
                 jump.results.len()
             )
         } else {
-            // Same honest copy as the popup body (single source of truth).
-            format!(
-                "Jump: {}",
-                crate::widgets::zoxide_jump::unavailable_message(jump.install_state, jump.termux)
-                    .trim_start()
-            )
+            // The popup body's first line (single source of truth).
+            zoxide_jump_status(&jump)
         };
         self.zoxide_jump = Some(jump);
         self.overlays.zoxide_jump_clear.request();
@@ -56780,6 +57409,7 @@ impl App {
         // The background install may have advanced (Running -> Done/Failed)
         // since the popup opened; keep the unavailable message current.
         jump.install_state = crate::zoxide::install_state();
+        jump.install_note = crate::zoxide::install_outcome();
         match crate::zoxide::query(&needle) {
             Some(paths) if paths.is_empty() && !needle.trim().is_empty() => {
                 let ranked = crate::zoxide::fuzzy_rank(&needle, &jump.all_dirs);
@@ -56826,12 +57456,90 @@ impl App {
                 jump.delete_char();
                 self.refresh_zoxide_results();
             }
+            // The popup is asking "Install it? [y/N]" (zoxide is missing) or
+            // "Add its `j` hook there? [y/N]" (installed, but nothing feeds it).
+            (KeyCode::Char('y' | 'Y'), m)
+                if jump.asks_yes_no()
+                    && !m.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) =>
+            {
+                if jump.available {
+                    self.add_zoxide_hook();
+                } else {
+                    self.start_zoxide_install();
+                }
+            }
+            (KeyCode::Char('n' | 'N'), m)
+                if jump.asks_yes_no()
+                    && !m.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) =>
+            {
+                self.close_zoxide_jump();
+            }
             (KeyCode::Char(c), m) if !m.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) => {
                 jump.push_char(c);
                 self.refresh_zoxide_results();
             }
             _ => {}
         }
+    }
+
+    /// The user's `y` to the popup's install offer (#926): the only way croft
+    /// ever runs the zoxide installer. A second `y` while it runs is a no-op.
+    fn start_zoxide_install(&mut self) {
+        use crate::zoxide::InstallState;
+        let Some(jump) = self.zoxide_jump.as_mut() else {
+            return;
+        };
+        if jump.install_state == InstallState::Running {
+            return;
+        }
+        crate::zoxide::install_in_background();
+        jump.install_state = InstallState::Running;
+        self.status = zoxide_jump_status(jump);
+    }
+
+    /// The user's `y` to the popup's hook offer (#926): zoxide is installed
+    /// but no `zoxide init` line feeds its database, so the managed block
+    /// goes into the rc the offer named. Launching croft no longer does it.
+    fn add_zoxide_hook(&mut self) {
+        let Some(rc) = self.zoxide_jump.as_mut().and_then(|j| j.hook_offer.take()) else {
+            return;
+        };
+        self.status = match crate::zoxide::add_shell_hook() {
+            Some(rc) => {
+                format!("Jump: added zoxide's `j` hook to {rc}; new terminals feed this list")
+            }
+            None => format!("Jump: zoxide's hook was not added to {rc} (see croft's log)"),
+        };
+    }
+
+    /// Once the install the user asked for ends, bring the open popup up to
+    /// date without a keystroke: the directory list when it worked, the
+    /// reason when it did not, and what happened in the status bar. True
+    /// when something changed.
+    fn poll_zoxide_install(&mut self) -> bool {
+        use crate::zoxide::InstallState;
+        let Some(jump) = self.zoxide_jump.as_mut() else {
+            return false;
+        };
+        let state = crate::zoxide::install_state();
+        if jump.install_state != InstallState::Running
+            || !matches!(state, InstallState::Done | InstallState::Failed)
+        {
+            return false;
+        }
+        if state == InstallState::Done {
+            jump.set_all_dirs(crate::zoxide::query("").unwrap_or_default());
+        }
+        self.refresh_zoxide_results();
+        self.status = match (state, crate::zoxide::install_outcome()) {
+            (InstallState::Done, Some(outcome)) => format!("Jump: {outcome}"),
+            _ => self
+                .zoxide_jump
+                .as_ref()
+                .map(zoxide_jump_status)
+                .unwrap_or_default(),
+        };
+        true
     }
 
     /// Jump to (or add) the highlighted directory and dismiss the popup:
@@ -56981,8 +57689,10 @@ impl App {
     /// Run the action the highlighted picker row resolves to: switch to an
     /// existing branch, or create-and-switch a new one. The picker closes
     /// on success; on failure it stays open with the error in the SC
-    /// feedback line so the user can amend the name.
-    fn apply_branch_action(&mut self, action: crate::widgets::branch_picker::BranchAction) {
+    /// feedback line so the user can amend the name, unless local changes
+    /// blocked the switch: then Stash & Checkout is offered (#925). True
+    /// when the switch happened.
+    fn apply_branch_action(&mut self, action: crate::widgets::branch_picker::BranchAction) -> bool {
         use crate::widgets::branch_picker::BranchAction;
         let (result, verb, label, name) = match &action {
             BranchAction::Checkout(name) => (
@@ -57024,14 +57734,137 @@ impl App {
                 self.active_git_bypass_debounce();
                 self.refresh_git_status_debounced();
                 self.refresh_source_control();
+                true
             }
             Err(err) => {
+                if crate::git::local_changes_block_switch(&err) {
+                    self.offer_stash_and_switch(action);
+                }
                 let why = crate::git::error_line(&err);
                 self.source_control.commit_feedback = Some(format!("branch: {why}"));
                 self.source_control.commit_feedback_is_error = true;
                 self.status = format!("Branch: {why}");
+                false
             }
         }
+    }
+
+    /// A switch git refused because it would overwrite local changes
+    /// (#925): instead of a dead end, offer what VS Code does, Stash &
+    /// Checkout and Migrate Changes, in place of the branch picker.
+    fn offer_stash_and_switch(&mut self, action: crate::widgets::branch_picker::BranchAction) {
+        use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+        let name = action.branch_name().to_string();
+        let rows = vec![
+            ListRow {
+                id: String::from("stash"),
+                label: format!("Stash & Checkout: stash your changes, then switch to {name}"),
+            },
+            ListRow {
+                id: String::from("migrate"),
+                label: format!("Migrate Changes: switch to {name} and bring your changes"),
+            },
+        ];
+        self.close_branch_picker();
+        let root = self.scm_root();
+        let from = crate::git::current_branch(&root);
+        self.blocked_switch = Some((root, from, action));
+        let title = format!("Your changes block the switch to {name}");
+        self.open_list_picker(ListPicker::new(ListPurpose::BlockedSwitch, title, rows), "");
+    }
+
+    /// Stash & Checkout or Migrate Changes picked (#925), past the
+    /// unsaved-changes prompt as any stash is (#1438): git stashes the files
+    /// on disk, so an edit still only in a tab would be left out, and the
+    /// switch would change the file under it.
+    fn stash_and_switch_picked(&mut self, migrate: bool) {
+        let op = if migrate {
+            ScmWrite::MigrateAndSwitch
+        } else {
+            ScmWrite::StashAndSwitch
+        };
+        if self.hold_for_unsaved(op) {
+            return;
+        }
+        let Some((root, from, action)) = self.blocked_switch.take() else {
+            return;
+        };
+        // The prompt, or a formatter it waits on, leaves time to switch
+        // branches by hand: the changes to stash are then another branch's.
+        if crate::git::current_branch(&root) != from {
+            let what = if migrate {
+                "Migrate Changes"
+            } else {
+                "Stash & Checkout"
+            };
+            let line = format!("{what} cancelled: the branch changed since the switch was refused");
+            self.source_control.commit_feedback = Some(line.clone());
+            self.source_control.commit_feedback_is_error = true;
+            self.status = line;
+            return;
+        }
+        self.stash_and_switch(root, action, migrate);
+    }
+
+    /// Stash & Checkout, or with `migrate` Migrate Changes (#925): stash the
+    /// changes that blocked the switch, switch, and for a migration pop them
+    /// onto the new branch. A pop that stops on conflicts keeps the stash,
+    /// as git does; a switch that still fails leaves the changes stashed.
+    fn stash_and_switch(
+        &mut self,
+        root: PathBuf,
+        action: crate::widgets::branch_picker::BranchAction,
+        migrate: bool,
+    ) {
+        if self.repo_git_busy() || root != self.scm_root() {
+            return;
+        }
+        let name = action.branch_name().to_string();
+        // The stash this makes is the one to pop, not an older one left
+        // behind should there be nothing to stash by now, nor a newer one a
+        // checkout hook pushes during the switch: it is popped by its commit.
+        let before = crate::git::stash_oid(&root, 0).ok();
+        let stash = crate::git::stash_push(&root, None);
+        self.log_git("stash push", &stash);
+        if let Err(err) = stash {
+            let line = crate::git::failure_line("Stash", &err);
+            self.source_control.commit_feedback = Some(line.clone());
+            self.source_control.commit_feedback_is_error = true;
+            self.status = line;
+            return;
+        }
+        let created = crate::git::stash_oid(&root, 0)
+            .ok()
+            .filter(|oid| before.as_ref() != Some(oid));
+        let switched = self.apply_branch_action(action);
+        let Some(created) = created else {
+            return;
+        };
+        let (line, is_error) = match (switched, migrate) {
+            (false, _) => {
+                let line = format!("{} \u{b7} your changes are in the stash", self.status);
+                (line, true)
+            }
+            (true, false) => (
+                format!("Stashed your changes and switched to {name}"),
+                false,
+            ),
+            (true, true) => {
+                let pop = crate::git::stash_pop_oid(&root, &created);
+                self.log_git("stash pop", &pop);
+                match pop {
+                    Ok(_) => (format!("Switched to {name} with your changes"), false),
+                    Err(err) => {
+                        let why = crate::git::failure_line("Migrate changes", &err);
+                        (format!("Switched to {name} \u{b7} {why}"), true)
+                    }
+                }
+            }
+        };
+        self.source_control.commit_feedback = Some(line.clone());
+        self.source_control.commit_feedback_is_error = is_error;
+        self.status = line;
+        self.refresh_source_control();
     }
 
     fn handle_branch_picker_key(&mut self, key: KeyEvent) {
@@ -59128,9 +59961,11 @@ impl App {
         // hits the new layer, not the stale one.
         let band = osk.last_area;
         osk.layout(band);
-        // The split choice outlives the session (best-effort, like themes).
+        // The split choice outlives the session (said when it cannot, like
+        // themes).
         if key == crate::widgets::osk::OskKey::SplitToggle {
-            let _ = crate::prefs::save_osk_split(osk.split);
+            let saved = crate::prefs::save_osk_split(osk.split);
+            self.report_unsaved_setting(saved);
         }
         // Mic is a tap, not push-to-talk: Termux turns any finger hold into its
         // own text-selection gesture (hardcoded in TerminalView, not
@@ -59830,6 +60665,14 @@ impl App {
         }
         if matches!(m.kind, MouseEventKind::Moved) {
             self.pointer_cell = Some((m.column, m.row));
+            // Name the preview link under the pointer (#931), as a
+            // browser's status bar does.
+            if in_editor
+                && let Some(md) = self.editor.markdown_preview.as_ref()
+                && let Some(i) = md.link_at(m.column, m.row)
+            {
+                self.status = format!("{} (click to follow)", md.links.links[i].dest);
+            }
             self.on_mouse_moved(m.column, m.row, in_editor);
             return;
         }
@@ -60933,7 +61776,7 @@ impl App {
                     match self.split_terminal() {
                         Ok(()) => {
                             self.status =
-                                format!("Split terminal: {} active", self.terminals.len());
+                                format!("Split terminal: {} active", self.live_terminal_count());
                         }
                         Err(e) => {
                             self.status = format!("Split terminal failed: {e}");
@@ -62821,6 +63664,9 @@ impl App {
                 // an implicit exclusion structural - #191 review.)
                 && !e.has_non_text_view()
                 && !e.disk_conflict
+                // A file deleted on disk stays deleted until the user saves
+                // it (#900): a checkout or `git stash` may have meant it.
+                && !(automatic && e.deleted_on_disk())
                 // A latched encoding refusal: only an explicit Cmd+S can
                 // consent to the lossy write, so retrying here would just
                 // re-refuse every tick.
@@ -62875,7 +63721,7 @@ impl App {
                             // recorder can tell whether they are still the
                             // ones on disk when its worker reads (#349).
                             saved_paths.push((p, e.provenance_to_record(), e.bytes_for_disk()));
-                            saved_texts.push(e.lines.join("\n"));
+                            saved_texts.push(e.document_text());
                         }
                     }
                     // The latch also removes the tab from `due`, so this is
@@ -63001,7 +63847,7 @@ impl App {
             String::from("Auto Save: off")
         };
         if !cfg!(test) {
-            let _ = crate::prefs::save_auto_save(self.auto_save);
+            self.report_unsaved_setting(crate::prefs::save_auto_save(self.auto_save));
         }
     }
 
@@ -63015,7 +63861,9 @@ impl App {
             String::from("Auto Save on Focus Change: off")
         };
         if !cfg!(test) {
-            let _ = crate::prefs::save_auto_save_on_focus_change(self.auto_save_on_focus_change);
+            self.report_unsaved_setting(crate::prefs::save_auto_save_on_focus_change(
+                self.auto_save_on_focus_change,
+            ));
         }
     }
 
@@ -63046,7 +63894,7 @@ impl App {
             String::from("Inline Blame: off")
         };
         if !cfg!(test) {
-            let _ = crate::prefs::save_inline_blame(self.inline_blame_enabled);
+            self.report_unsaved_setting(crate::prefs::save_inline_blame(self.inline_blame_enabled));
         }
     }
 
@@ -63995,7 +64843,7 @@ impl App {
             "Screen reader mode: off"
         });
         if !cfg!(test) {
-            let _ = crate::prefs::save_screen_reader(self.screen_reader);
+            self.report_unsaved_setting(crate::prefs::save_screen_reader(self.screen_reader));
         }
     }
 
@@ -64697,10 +65545,12 @@ impl App {
     fn cycle_line_numbers(&mut self) {
         self.line_numbers = self.line_numbers.next();
         self.apply_line_numbers();
-        if !cfg!(test) {
-            let _ = crate::prefs::save_line_numbers(self.line_numbers.pref_id());
-        }
         self.status = format!("Line Numbers: {}", self.line_numbers.pref_id());
+        if !cfg!(test) {
+            self.report_unsaved_setting(crate::prefs::save_line_numbers(
+                self.line_numbers.pref_id(),
+            ));
+        }
     }
 
     /// Give every open editor, in every split group, the current line
@@ -64720,10 +65570,12 @@ impl App {
     fn toggle_render_whitespace(&mut self) {
         self.whitespace_mode = self.whitespace_mode.next();
         self.editor.whitespace_mode = self.whitespace_mode;
-        if !cfg!(test) {
-            let _ = crate::prefs::save_render_whitespace(self.whitespace_mode.pref_id());
-        }
         self.status = format!("Render Whitespace: {}", self.whitespace_mode.label());
+        if !cfg!(test) {
+            self.report_unsaved_setting(crate::prefs::save_render_whitespace(
+                self.whitespace_mode.pref_id(),
+            ));
+        }
     }
 
     /// Rebuild the inline-value trailers (#135) from the current stop's
@@ -64778,9 +65630,6 @@ impl App {
         } else {
             self.clear_inline_values();
         }
-        if !cfg!(test) {
-            let _ = crate::prefs::save_inline_values(self.inline_values_enabled);
-        }
         self.status = format!(
             "Debug Inline Values: {}",
             if self.inline_values_enabled {
@@ -64789,14 +65638,16 @@ impl App {
                 "off"
             }
         );
+        if !cfg!(test) {
+            self.report_unsaved_setting(crate::prefs::save_inline_values(
+                self.inline_values_enabled,
+            ));
+        }
     }
 
     fn toggle_bracket_colors(&mut self) {
         self.bracket_colors_enabled = !self.bracket_colors_enabled;
         self.editor.show_bracket_colors = self.bracket_colors_enabled;
-        if !cfg!(test) {
-            let _ = crate::prefs::save_bracket_colors(self.bracket_colors_enabled);
-        }
         self.status = format!(
             "Bracket Pair Colorization: {}",
             if self.bracket_colors_enabled {
@@ -64805,14 +65656,16 @@ impl App {
                 "off"
             }
         );
+        if !cfg!(test) {
+            self.report_unsaved_setting(crate::prefs::save_bracket_colors(
+                self.bracket_colors_enabled,
+            ));
+        }
     }
 
     fn toggle_indent_guides(&mut self) {
         self.indent_guides_enabled = !self.indent_guides_enabled;
         self.editor.show_indent_guides = self.indent_guides_enabled;
-        if !cfg!(test) {
-            let _ = crate::prefs::save_indent_guides(self.indent_guides_enabled);
-        }
         self.status = format!(
             "Indent Guides: {}",
             if self.indent_guides_enabled {
@@ -64821,18 +65674,23 @@ impl App {
                 "off"
             }
         );
+        if !cfg!(test) {
+            self.report_unsaved_setting(crate::prefs::save_indent_guides(
+                self.indent_guides_enabled,
+            ));
+        }
     }
 
     fn toggle_auto_close_pairs(&mut self) {
         self.auto_close_pairs = !self.auto_close_pairs;
         self.editor.auto_close_pairs = self.auto_close_pairs;
-        if !cfg!(test) {
-            let _ = crate::prefs::save_auto_close_pairs(self.auto_close_pairs);
-        }
         self.status = format!(
             "Auto Closing Pairs: {}",
             if self.auto_close_pairs { "on" } else { "off" }
         );
+        if !cfg!(test) {
+            self.report_unsaved_setting(crate::prefs::save_auto_close_pairs(self.auto_close_pairs));
+        }
     }
 
     /// VS Code's `editor.formatOnType` toggle (#254), persisted like the
@@ -64845,7 +65703,7 @@ impl App {
             String::from("Format on Type: off")
         };
         if !cfg!(test) {
-            let _ = crate::prefs::save_format_on_type(self.format_on_type);
+            self.report_unsaved_setting(crate::prefs::save_format_on_type(self.format_on_type));
         }
     }
 
@@ -64857,7 +65715,7 @@ impl App {
             String::from("Format on Save: off")
         };
         if !cfg!(test) {
-            let _ = crate::prefs::save_format_on_save(self.format_on_save);
+            self.report_unsaved_setting(crate::prefs::save_format_on_save(self.format_on_save));
         }
     }
 
@@ -64872,7 +65730,9 @@ impl App {
             String::from("Log highlighting (tailspin): off")
         };
         if !cfg!(test) {
-            let _ = crate::prefs::save_disable_log_highlight(!self.log_highlight);
+            self.report_unsaved_setting(crate::prefs::save_disable_log_highlight(
+                !self.log_highlight,
+            ));
         }
     }
 
@@ -64906,7 +65766,7 @@ impl App {
             String::from("Copy on Selection: off")
         };
         if !cfg!(test) {
-            let _ = crate::prefs::save_copy_on_select(self.copy_on_select);
+            self.report_unsaved_setting(crate::prefs::save_copy_on_select(self.copy_on_select));
         }
     }
 
@@ -65451,7 +66311,9 @@ impl App {
         self.config_watch.set_paths(paths);
         self.settings_provenance = merged.provenance;
         self.apply_merged_settings(&merged.prefs);
-        self.status = if merged.warnings.is_empty() {
+        self.status = if let Some(error) = &merged.user_config_error {
+            settings_not_loaded_status(error)
+        } else if merged.warnings.is_empty() {
             String::from("Settings reloaded")
         } else {
             format!(
@@ -65460,6 +66322,17 @@ impl App {
                 if merged.warnings.len() == 1 { "" } else { "s" }
             )
         };
+    }
+
+    /// Say on the status line that a setting change was not saved (#923),
+    /// most often because `config.json` does not parse and croft will not
+    /// write defaults over it. The change still holds for this session; a
+    /// confirmation such as "Inlay Hints: off" alone read as saved, and the
+    /// setting was back after a restart. Call it after the confirmation.
+    fn report_unsaved_setting(&mut self, saved: anyhow::Result<()>) {
+        if let Err(e) = saved {
+            self.status = format!("Setting not saved: {e:#}");
+        }
     }
 
     /// Apply a merged settings view to the live session. Mirrors what the
@@ -65626,7 +66499,7 @@ impl App {
     /// panel never refreshes after a save (issue #37).
     fn lsp_notify_saved(&mut self) {
         if let (Some(lsp), Some(path)) = (self.lsp.as_ref(), self.editor.path.clone()) {
-            lsp.save_doc(path, self.editor.lines.join("\n"));
+            lsp.save_doc(path, self.editor.document_text());
         }
     }
 
@@ -65869,7 +66742,7 @@ impl App {
             Ok(SaveOutcome::Saved) => {
                 let seats = editor.provenance_to_record();
                 let described = editor.bytes_for_disk();
-                let text = editor.lines.join("\n");
+                let text = editor.document_text();
                 self.status = editor.status.clone();
                 self.record_history_snapshot_of(path, seats, described);
                 if let Some(lsp) = self.lsp.as_ref() {
@@ -66113,7 +66986,7 @@ impl App {
                     settled = Some((
                         e.provenance_to_record(),
                         e.bytes_for_disk(),
-                        e.lines.join("\n"),
+                        e.document_text(),
                     ));
                 }
             }
@@ -68416,7 +69289,7 @@ impl App {
             let why = match outcome {
                 Ok(SaveOutcome::Saved) if !ed.dirty => {
                     saved.push((path, ed.provenance_to_record(), ed.bytes_for_disk()));
-                    saved_texts.push(ed.lines.join("\n"));
+                    saved_texts.push(ed.document_text());
                     return;
                 }
                 // A workbook save that held formula cells back names them.
@@ -71523,15 +72396,19 @@ impl App {
 
     /// Run `gh` with `args` in the active workspace root. Its stdout, or
     /// the first line of what it said went wrong: GitHub's own message when
-    /// the API sent one, else gh's.
+    /// the API sent one, else gh's; or that gh is missing or signed out.
     fn run_gh(&self, args: &[String]) -> Result<String, String> {
+        let root = self.active_workspace_root();
         let mut cmd = std::process::Command::new(&self.gh_program);
-        cmd.args(args).current_dir(self.active_workspace_root());
+        cmd.args(args).current_dir(&root);
         let out = crate::review_ops::output_retrying_busy(&mut cmd)
-            .map_err(|e| format!("could not run gh: {e}"))?;
+            .map_err(|e| crate::gh::spawn_error(&e, Some(root.as_path())))?;
         let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
         if out.status.success() {
             return Ok(stdout);
+        }
+        if crate::gh::signed_out(out.status) {
+            return Err(String::from(crate::gh::SIGNED_OUT));
         }
         let api_message = serde_json::from_str::<serde_json::Value>(&stdout)
             .ok()
@@ -71623,7 +72500,10 @@ impl App {
                     .current_dir(&root)
                     .stdin(std::process::Stdio::null());
                 let out = crate::review_ops::output_retrying_busy(&mut cmd)
-                    .map_err(|e| format!("could not run gh: {e}"))?;
+                    .map_err(|e| crate::gh::spawn_error(&e, Some(root.as_path())))?;
+                if crate::gh::signed_out(out.status) {
+                    return Err(String::from(crate::gh::SIGNED_OUT));
+                }
                 Ok(String::from_utf8_lossy(&out.stdout).into_owned())
             };
             let result = (|| {
@@ -71737,7 +72617,10 @@ impl App {
                         .current_dir(&root)
                         .stdin(std::process::Stdio::null());
                     let out = crate::review_ops::output_retrying_busy(&mut cmd)
-                        .map_err(|e| format!("could not run gh: {e}"))?;
+                        .map_err(|e| crate::gh::spawn_error(&e, Some(root.as_path())))?;
+                    if crate::gh::signed_out(out.status) {
+                        return Err(String::from(crate::gh::SIGNED_OUT));
+                    }
                     if !out.status.success() {
                         return Err(format!("analysis #{} could not be downloaded", a.id));
                     }
@@ -73982,6 +74865,21 @@ fn elide_middle(s: &str, max: usize) -> String {
     crate::widgets::process_picker::elide_middle_cols(s, max)
 }
 
+/// `text` on the status bar's one row (#925): each line break or tab, with
+/// the spaces around it, becomes one space. Drawn as is, the control
+/// characters were dropped and the words either side ran together
+/// ("…switch branches.Aborting"). The Messages channel keeps the lines.
+fn one_line(text: String) -> String {
+    if !text.contains(char::is_control) {
+        return text;
+    }
+    let pieces = text.split(char::is_control).map(str::trim);
+    pieces
+        .filter(|p| !p.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// The excerpt window for a Peek popup: up to `total` lines, at most
 /// `above` of them before `target`, clamped to the file. Returns the start
 /// line index and the excerpt slice (cloned).
@@ -74883,8 +75781,8 @@ fn is_run_fence_key(key: KeyEvent) -> bool {
             .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
 }
 
-/// The command typed into a pane for a fenced block (#353): a shell block
-/// as written (a trailing newline runs its last line). Any other language
+/// The command typed into a pane for a fenced block (#353): a one-line shell
+/// block as written (a trailing newline runs it). Any other language
 /// is written to a private file under `scripts` and read from it on stdin,
 /// `python3 - < 'file'` (#1630): the heredoc it used to be typed as is
 /// POSIX shell syntax, so with fish as the pane's shell every python or
@@ -74894,12 +75792,22 @@ fn is_run_fence_key(key: KeyEvent) -> bool {
 /// with the pane's directory on its import path, as before. Should the file
 /// not be written, the heredoc is the fallback.
 ///
-/// A shell block holding a tab or `!` goes as one single-quoted
-/// `printf '%b'` argument instead: typed into an interactive shell, a tab
-/// is completion and bash expands `!` as history, so what ran was not what
+/// A shell block of several lines, or holding a tab or `!`, goes as one
+/// single-quoted `printf '%b'` argument instead. Typed line by line, each
+/// line was a command of its own, so the capture under the fence and the
+/// pane's outcome described only the first one to finish (#920); as one
+/// command the shell reports the whole block: every line's output and the
+/// status it ends with. Typed into an interactive shell, a tab is
+/// completion and bash expands `!` as history, so what ran was not what
 /// the confirm popup showed. Inside single quotes neither happens, and the
-/// tab travels as `\t`.
-fn fence_command(interpreter: &str, code: &str, scripts: &Path) -> String {
+/// tab travels as `\t`. A backslash travels as `\0134`, since fish folds
+/// `\\` inside single quotes to one backslash where bash and zsh keep both.
+/// `shell` is the pane's shell: fish before 3.4 rejects `$(...)` as
+/// syntax, so a fish pane `source`s the decoded block from a `psub` file
+/// rather than `eval`ing it, which every fish reads alike. Not piped to
+/// `source`: the block's own stdin would be the pipe, and a `read` or an
+/// install's "continue? [Y/n]" would get nothing from the pane.
+fn fence_command(interpreter: &str, code: &str, scripts: &Path, shell: &str) -> String {
     let code = code.trim_end_matches('\n');
     if interpreter != "sh" {
         if let Ok(file) = stage_block(scripts, interpreter, code) {
@@ -74913,15 +75821,18 @@ fn fence_command(interpreter: &str, code: &str, scripts: &Path) -> String {
         }
         return format!("{interpreter} - <<'{end}'\n{code}\n{end}\r");
     }
-    if code.contains(['\t', '!']) {
+    if code.contains(['\n', '\t', '!']) {
         let escaped = format!("{code}\n")
-            .replace('\\', "\\\\")
+            .replace('\\', "\\0134")
             .replace('\n', "\\n")
             .replace('\t', "\\t")
             .replace('\'', "'\\''");
         // A shell block runs IN the pane's shell, as a typed one does (a
         // `cd` or `export` persists, bash-isms still work): `eval` of the
-        // decoded text.
+        // decoded text, or fish's `source` of it.
+        if Path::new(shell).file_name().is_some_and(|n| n == "fish") {
+            return format!("source (printf '%b' '{escaped}' | psub)\r");
+        }
         return format!("eval \"$(printf '%b' '{escaped}')\"\r");
     }
     format!("{code}\r")
@@ -77972,6 +78883,13 @@ fn view_status(view_bind_error: Option<&str>) -> String {
     }
 }
 
+/// The status line when the user's `config.json` was skipped whole (#923),
+/// given the warning that says why: every setting is then at its default,
+/// which, said only in OUTPUT · Settings, looked like croft forgetting them.
+fn settings_not_loaded_status(error: &str) -> String {
+    format!("Settings not loaded: {error}")
+}
+
 /// What the startup status says when the agent hook socket could not be
 /// bound (#1368), so a hook that is never answered is not a mystery.
 /// `None` when another croft already serves this workspace: that one
@@ -79162,12 +80080,6 @@ pub fn run(
     zen: bool,
     workspace_folders: Vec<PathBuf>,
 ) -> Result<()> {
-    // zoxide is a hard dependency of the Cmd+Z jump popup. Probe for it
-    // and install it in the background if missing, off the launch path so
-    // the first frame is never blocked. Runs on every host croft starts
-    // on — the local Mac and the remote Linux box both reach `run` — so
-    // the dependency is satisfied identically on both (GOLDEN RULE).
-    crate::zoxide::ensure_installed_in_background();
     // Termux ships no font with codicon glyphs, so the activity-bar glyph
     // fallback renders blank cells out of the box. Install the Meslo Nerd
     // Font Mono into ~/.termux/font.ttf in the background (no-op on every
@@ -80106,6 +81018,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             app.maybe_seat_navigator() | app.poll_pair() | app.tick_proactive_navigator();
         let voice_changed = app.drain_voice();
         let zen_hint_changed = app.expire_zen_hint(std::time::Instant::now());
+        let zoxide_changed = app.poll_zoxide_install();
         // Surface managed language-server install progress in the status bar so
         // the background work (which can take a few seconds) is visible.
         let install_status_changed = match crate::lsp::install::take_status() {
@@ -80127,6 +81040,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
 
         let non_pty_dirty = needs_redraw
             || zen_hint_changed
+            || zoxide_changed
             || fs_changed
             || mcp_changed
             || pair_changed

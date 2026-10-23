@@ -1659,6 +1659,87 @@ fn dragging_in_the_markdown_preview_selects_and_copies_rendered_text() {
     );
 }
 
+/// #931 / #1848: preview links follow as in VS Code's preview. Pointing at
+/// one names its target; a click on a relative `.md` opens it rendered, a
+/// Ctrl+click on `file#L3` opens the file at the line, a click on
+/// `#heading` scrolls to it, and a `?query` is no part of the file's name.
+#[test]
+fn preview_links_follow_on_click_and_ctrl_click() {
+    use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(tmp.path().join("docs")).unwrap();
+    std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+    std::fs::write(tmp.path().join("docs/SETUP.md"), "# Setup\n").unwrap();
+    std::fs::write(tmp.path().join("src/main.py"), "a\nb\nc\nd\n").unwrap();
+    let readme = tmp.path().join("README.md");
+    let filler: String = (0..40).map(|i| format!("Line {i}.\n\n")).collect();
+    let text = "See the [setup guide](docs/SETUP.md), jump to [Usage](#usage-notes), \
+                or open [the code](src/main.py#L3).";
+    let raw = "Or read [its source](docs/SETUP.md?plain=1).";
+    std::fs::write(
+        &readme,
+        format!("{text}\n\n{raw}\n\n{filler}## Usage notes\n"),
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let rendered = |app: &mut App| {
+        draw(app, 160, 40);
+        let md = app.editor.markdown_preview.as_ref();
+        md.map(|md| md.rows.concat().concat()).unwrap_or_default()
+    };
+    // Open the README's preview and send `kinds` over the link `text`.
+    let on_link = |app: &mut App, text: &str, kinds: &[MouseEventKind], modifiers| {
+        app.editor.open_pinned(&readme).unwrap();
+        app.focus_pane(Pane::Editor);
+        if app.editor.markdown_preview.is_none() {
+            app.toggle_markdown_preview();
+        }
+        rendered(app);
+        let md = app.editor.markdown_preview.as_ref().unwrap();
+        let (x, y) = (md.rows.iter().enumerate())
+            .find_map(|(y, cells)| Some((cells.concat().find(text)?, y)))
+            .expect("the link is on screen");
+        let (column, row) = (md.last_area.x + x as u16, md.last_area.y + y as u16);
+        for &kind in kinds {
+            app.handle_mouse(MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers,
+            });
+        }
+    };
+    let click = [
+        MouseEventKind::Down(MouseButton::Left),
+        MouseEventKind::Up(MouseButton::Left),
+    ];
+    let none = KeyModifiers::NONE;
+
+    on_link(&mut app, "setup", &[MouseEventKind::Moved], none);
+    assert_eq!(app.status, "docs/SETUP.md (click to follow)");
+    on_link(&mut app, "setup", &click, none);
+    assert_eq!(app.editor.path, Some(tmp.path().join("docs/SETUP.md")));
+    assert!(
+        rendered(&mut app).contains("Setup"),
+        "a Markdown file opens rendered"
+    );
+
+    on_link(&mut app, "the code", &click, KeyModifiers::CONTROL);
+    assert_eq!(app.editor.path, Some(tmp.path().join("src/main.py")));
+    assert_eq!(app.editor.cursor_row, 2, "#L3 is the third line");
+
+    on_link(&mut app, "its source", &click, none);
+    assert_eq!(app.editor.path, Some(tmp.path().join("docs/SETUP.md")));
+
+    on_link(&mut app, "Usage", &click, none);
+    assert_eq!(app.status, "Went to #usage-notes");
+    let shown = rendered(&mut app);
+    assert!(
+        shown.contains("Usage notes") && !shown.contains("See the"),
+        "{shown}"
+    );
+}
+
 #[test]
 fn image_eviction_wipes_the_screen_only_on_cell_buffer_protocols() {
     // The `terminal.clear()` the main loop fires when an image-clear latch is
@@ -3009,6 +3090,96 @@ fn an_http_hole_no_file_variable_defines_still_refuses() {
     assert!(!app.status.contains("{{base}}"), "{}", app.status);
     assert!(app.status.contains("@name"), "{}", app.status);
     assert!(app.http_run.is_none(), "nothing was sent");
+}
+
+/// #924: an env file in REST Client's shape (`$shared` plus named
+/// environments) is read, not skipped. With none active, a hole only an
+/// environment fills refuses and names them; HTTP: Switch Environment
+/// lists them, and the one picked fills the request over `$shared`.
+#[test]
+fn an_http_named_environment_is_picked_from_the_palette() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let http = tmp.path().join("api.http");
+    std::fs::write(&http, "GET {{host}}/items?v={{version}}\n").unwrap();
+    std::fs::write(
+        tmp.path().join(crate::http_file::ENV_FILE),
+        r#"{"$shared": {"version": "1"}, "dev": {"host": "http://dev.test"}, "prod": {"host": "http://prod.test"}}"#,
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&http).unwrap();
+    app.send_http_request_under_caret();
+    assert!(
+        app.status.contains("no value for {{host}};")
+            && app.status.contains("(dev, prod)")
+            && app.status.contains("HTTP: Switch Environment"),
+        "{}",
+        app.status
+    );
+    assert!(app.http_run.is_none(), "nothing was sent");
+
+    app.run_command(Command::SwitchHttpEnvironment);
+    let picker = app.list_picker.as_ref().expect("the environment picker");
+    let labels: Vec<&str> = picker.rows.iter().map(|r| r.label.as_str()).collect();
+    assert_eq!(
+        labels,
+        ["No Environment ($shared only)  (current)", "dev", "prod"]
+    );
+    app.list_picker.as_mut().unwrap().selected = 2;
+    app.confirm_list_picker();
+    assert_eq!(app.status, "HTTP: environment prod");
+    let (_, resolved, _) = app.http_request_under_caret().expect("resolves");
+    assert_eq!(resolved.url, "http://prod.test/items?v=1");
+
+    // The picker reopens on the current one; No Environment goes back.
+    app.run_command(Command::SwitchHttpEnvironment);
+    let picker = app.list_picker.as_ref().unwrap();
+    assert_eq!(picker.selected_row().unwrap().label, "prod  (current)");
+    app.list_picker.as_mut().unwrap().selected = 0;
+    app.confirm_list_picker();
+    assert!(app.http_request_under_caret().is_none());
+    assert!(app.status.contains("pick an environment"), "{}", app.status);
+}
+
+/// Negative (#924): with only flat values beside the file there is no
+/// environment to switch to, and the picker says so instead of opening;
+/// JetBrains' `http-client.env.json` environments are offered too.
+#[test]
+fn an_http_environment_picker_needs_named_environments() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let http = tmp.path().join("api.http");
+    std::fs::write(&http, "GET {{host}}/a\n").unwrap();
+    std::fs::write(
+        tmp.path().join(crate::http_file::ENV_FILE),
+        r#"{"host": "http://flat.test"}"#,
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&http).unwrap();
+    app.run_command(Command::SwitchHttpEnvironment);
+    assert!(app.list_picker.is_none());
+    assert!(
+        app.status.starts_with("No named environments"),
+        "{}",
+        app.status
+    );
+    let (_, resolved, _) = app.http_request_under_caret().expect("flat still works");
+    assert_eq!(resolved.url, "http://flat.test/a");
+
+    std::fs::write(
+        tmp.path().join("http-client.env.json"),
+        r#"{"local": {"host": "http://local.test"}}"#,
+    )
+    .unwrap();
+    app.run_command(Command::SwitchHttpEnvironment);
+    let picker = app.list_picker.as_ref().expect("JetBrains' file is read");
+    assert_eq!(picker.rows[1].id, "local");
+    app.list_picker.as_mut().unwrap().selected = 1;
+    app.confirm_list_picker();
+    let (_, resolved, _) = app.http_request_under_caret().expect("resolves");
+    assert_eq!(resolved.url, "http://local.test/a");
 }
 
 /// #1537: "File: Reopen as Preview" on a plain text capture opens the
