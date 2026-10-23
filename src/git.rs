@@ -1762,8 +1762,9 @@ pub fn conflict_summary(output: &str) -> Option<String> {
 /// Control panel report (#858); the Git Output log keeps the whole text.
 /// First the conflicts git stopped on ([`conflict_summary`]), then a
 /// rejected ref update (`[rejected] main -> main (fetch first)`), then
-/// git's first `error:` or `fatal:` line, then [`summary_line`]. Failing
-/// all of those, the first line, so a refusal always says something.
+/// git's first `error:` or `fatal:` line, with the files git listed under
+/// it ([`with_listed_files`]), then [`summary_line`]. Failing all of those,
+/// the first line, so a refusal always says something.
 pub fn error_line(err: &str) -> String {
     if let Some(conflicts) = conflict_summary(err) {
         return conflicts;
@@ -1773,8 +1774,9 @@ pub fn error_line(err: &str) -> String {
     {
         return squash(rejected);
     }
-    if let Some(line) = lines().find(|l| l.starts_with("error:") || l.starts_with("fatal:")) {
-        return squash(line);
+    if let Some(at) = lines().position(|l| l.starts_with("error:") || l.starts_with("fatal:")) {
+        let line = lines().nth(at).map(squash).unwrap_or_default();
+        return with_listed_files(line, err.lines().skip(at + 1));
     }
     let line = summary_line(err);
     if line.is_empty() {
@@ -1782,6 +1784,42 @@ pub fn error_line(err: &str) -> String {
     } else {
         line
     }
+}
+
+/// `line`, git's `error:` line, followed by the files git listed under it
+/// when it ends in a colon (#925): "…would be overwritten by checkout:
+/// a.txt" names what is in the way, where the line alone stopped at the
+/// colon. Git indents each file on a line of its own after it; three are
+/// named at most before "…".
+fn with_listed_files<'a>(mut line: String, after: impl Iterator<Item = &'a str>) -> String {
+    const NAMED: usize = 3;
+    if !line.ends_with(':') {
+        return line;
+    }
+    let files: Vec<&str> = after
+        .map(shown)
+        .take_while(|l| l.starts_with(char::is_whitespace) && !l.trim().is_empty())
+        .map(str::trim)
+        .collect();
+    if files.is_empty() {
+        return line;
+    }
+    line.push(' ');
+    line.push_str(&files[..files.len().min(NAMED)].join(", "));
+    if files.len() > NAMED {
+        line.push_str(", \u{2026}");
+    }
+    line
+}
+
+/// Whether git refused a branch switch because it would overwrite local
+/// changes (#925), the refusal a stash gets past. Git ends it with "Please
+/// commit your changes or stash them before you switch branches."; a switch
+/// blocked by untracked files asks to "move or remove them" instead, and
+/// when git names both a stash of the tracked changes still leaves the
+/// switch refused, so that is not one either.
+pub fn local_changes_block_switch(err: &str) -> bool {
+    err.contains("commit your changes or stash them") && !err.contains("move or remove them")
 }
 
 /// A failed git operation's one line (#858), `noun` naming the operation
@@ -3166,9 +3204,17 @@ pub fn list_branches(root: &Path) -> Result<Vec<BranchInfo>, String> {
     Ok(branches)
 }
 
+/// Git's messages in English, whatever the user's locale (#925): a
+/// refusal to switch is told apart by its text
+/// ([`local_changes_block_switch`]), which a translated git words otherwise.
+/// `LANGUAGE` picks gettext's catalog ahead of `LC_ALL` and `LANG` and
+/// leaves the character set alone; git has no `en` catalog, so its own
+/// text is what prints.
+const ENGLISH_MESSAGES: (&str, &str) = ("LANGUAGE", "en");
+
 /// Switch to an existing local branch (`git switch <name>`).
 pub fn checkout_branch(root: &Path, name: &str) -> Result<String, String> {
-    run_mutation(root, &["switch", name])
+    run_mutation_with_env(root, &["switch", name], &[ENGLISH_MESSAGES])
 }
 
 /// Check out a remote-tracking branch as local branch `name` tracking it
@@ -3177,7 +3223,11 @@ pub fn checkout_branch(root: &Path, name: &str) -> Result<String, String> {
 /// The name is spelled out because `--track` alone guesses it by cutting
 /// at the first `/`, which makes `my/fork/solo` a `fork/solo` branch.
 pub fn track_remote_branch(root: &Path, remote_ref: &str, name: &str) -> Result<String, String> {
-    run_mutation(root, &["switch", "-c", name, "--track", remote_ref])
+    run_mutation_with_env(
+        root,
+        &["switch", "-c", name, "--track", remote_ref],
+        &[ENGLISH_MESSAGES],
+    )
 }
 
 /// Create a new branch off the current HEAD and switch to it
@@ -3881,12 +3931,24 @@ pub fn stash_oid(root: &Path, index: usize) -> Result<String, String> {
 /// stash pushed or dropped since it was picked shifts every index, and the
 /// old one would name a different stash. Refuses when it is gone.
 pub fn stash_drop_oid(root: &Path, oid: &str) -> Result<String, String> {
+    stash_drop(root, stash_index_of(root, oid)?)
+}
+
+/// Restore and drop the stash whose commit is `oid`, at whatever index it
+/// holds now, as [`stash_drop_oid`] drops one: a stash pushed since, by a
+/// checkout hook or another tool, would make a plain `git stash pop` restore
+/// that one instead. Refuses when it is gone.
+pub fn stash_pop_oid(root: &Path, oid: &str) -> Result<String, String> {
+    stash_pop_at(root, stash_index_of(root, oid)?)
+}
+
+/// The index the stash whose commit is `oid` holds now, or an error when it
+/// is no longer in the stash list.
+fn stash_index_of(root: &Path, oid: &str) -> Result<usize, String> {
     let list = run_git(root, &["stash", "list", "--format=%H"]).map_err(|e| e.to_string())?;
-    let index = list
-        .lines()
+    list.lines()
         .position(|hash| hash.trim() == oid)
-        .ok_or_else(|| String::from("that stash is no longer in the stash list"))?;
-    stash_drop(root, index)
+        .ok_or_else(|| String::from("that stash is no longer in the stash list"))
 }
 
 // --- Tags ----------------------------------------------------------------
@@ -4321,6 +4383,36 @@ mod tests {
             "[main 5a6cd5c] fix: one line"
         );
     }
+
+    /// git 2.43's refusal to switch branches over a local edit.
+    const SWITCH_REFUSED_925: &str = "error: Your local changes to the following files would be overwritten by checkout:\n\ta.txt\nPlease commit your changes or stash them before you switch branches.\nAborting";
+
+    /// #925: a refusal that lists files under its `error:` line names them
+    /// (three at most) instead of stopping at the colon, and is the one a
+    /// stash gets past; a switch blocked by untracked files is not.
+    #[test]
+    fn error_line_names_the_files_git_listed_under_it() {
+        assert_eq!(
+            error_line(SWITCH_REFUSED_925),
+            "error: Your local changes to the following files would be overwritten by checkout: a.txt"
+        );
+        let many = SWITCH_REFUSED_925.replace("\ta.txt", "\ta.txt\n\tb.txt\n\tc.txt\n\td.txt");
+        assert_eq!(
+            error_line(&many),
+            "error: Your local changes to the following files would be overwritten by checkout: a.txt, b.txt, c.txt, \u{2026}"
+        );
+        assert!(local_changes_block_switch(SWITCH_REFUSED_925));
+        let untracked = "error: The following untracked working tree files would be overwritten by checkout:\n\tb.txt\nPlease move or remove them before you switch branches.\nAborting";
+        assert_eq!(
+            error_line(untracked),
+            "error: The following untracked working tree files would be overwritten by checkout: b.txt"
+        );
+        assert!(!local_changes_block_switch(untracked));
+        // Both at once, as git 2.43 words it: a stash would not clear it.
+        let both = SWITCH_REFUSED_925.replace("\nAborting", "\n") + untracked;
+        assert!(!local_changes_block_switch(&both));
+    }
+
     /// #858: the conflicts are counted per file and named, three at most;
     /// a lone conflict git words without a file is git's own line; a text
     /// with no `CONFLICT` line has no conflict summary.

@@ -6178,6 +6178,7 @@ impl Editor {
             source_map: Vec::new(),
             row_of_line: Vec::new(),
             scroll_to_source: None,
+            links: crate::markdown::MdLinks::default(),
         });
         self.status = format!("Opened media info {}", path.display());
         Ok(())
@@ -6258,6 +6259,7 @@ impl Editor {
             source_map: Vec::new(),
             row_of_line: Vec::new(),
             scroll_to_source: None,
+            links: crate::markdown::MdLinks::default(),
         });
         self.status = format!("Opened document {}", path.display());
         Ok(())
@@ -7336,7 +7338,7 @@ impl Editor {
             .path
             .as_ref()
             .and_then(|p| p.parent().map(|d| d.to_path_buf()));
-        let (lines, images, runnables, source_map) = crate::markdown::render_markdown_mapped(
+        let (lines, images, runnables, source_map, links) = crate::markdown::render_markdown_mapped(
             &text,
             self.theme,
             &mut self.registry,
@@ -7348,6 +7350,7 @@ impl Editor {
             md.source_map = source_map;
             md.images = images;
             md.runnables = runnables;
+            md.links = links;
             md.built_seq = self.edit_seq;
         }
     }
@@ -8103,7 +8106,7 @@ impl Editor {
             .path
             .as_ref()
             .and_then(|p| p.parent().map(|d| d.to_path_buf()));
-        let (lines, images, runnables, source_map) = crate::markdown::render_markdown_mapped(
+        let (lines, images, runnables, source_map, links) = crate::markdown::render_markdown_mapped(
             &text,
             self.theme,
             &mut self.registry,
@@ -8131,6 +8134,7 @@ impl Editor {
             source_map,
             row_of_line: Vec::new(),
             scroll_to_source,
+            links,
         });
         true
     }
@@ -8177,6 +8181,7 @@ impl Editor {
             source_map: Vec::new(),
             row_of_line: Vec::new(),
             scroll_to_source: None,
+            links: crate::markdown::MdLinks::default(),
         });
         true
     }
@@ -20326,7 +20331,7 @@ impl Editor {
                 .path
                 .as_ref()
                 .and_then(|p| p.parent().map(|d| d.to_path_buf()));
-            let (lines, images, runnables, source_map) = crate::markdown::render_markdown_mapped(
+            let (lines, images, runnables, map, links) = crate::markdown::render_markdown_mapped(
                 &text,
                 self.theme,
                 &mut self.registry,
@@ -20335,9 +20340,10 @@ impl Editor {
             );
             if let Some(md) = self.markdown_preview.as_mut() {
                 md.lines = lines;
-                md.source_map = source_map;
+                md.source_map = map;
                 md.images = images;
                 md.runnables = runnables;
+                md.links = links;
                 md.built_seq = self.edit_seq;
             }
         }

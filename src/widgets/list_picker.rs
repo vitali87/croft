@@ -30,6 +30,9 @@ pub enum ListPurpose {
     StashDrop,
     /// A stash whose changes to open (#1581).
     StashView,
+    /// A branch switch local changes blocked (#925): `id` is `stash`
+    /// (Stash & Checkout) or `migrate` (Migrate Changes).
+    BlockedSwitch,
     RemoveRemote,
     DeleteTag,
     /// A tag on the push remote to delete there (#1582); each row's id is

@@ -1,0 +1,1 @@
+fix: Rust files get rust-analyzer on a default rustup install: when the toolchain has no `rust-analyzer` component, croft uses its own copy instead of rustup's proxy, and the status bar says so, with the `rustup component add rust-analyzer` command that switches to the toolchain's.

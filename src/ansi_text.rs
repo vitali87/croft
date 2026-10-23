@@ -101,29 +101,110 @@ impl AnsiLine {
 }
 
 /// The parser state one output stream carries between its chunks: the SGR
-/// state left in force and an escape sequence cut off mid-chunk. Each debug
-/// session keeps its own (#1501), since two programs' output is two streams,
-/// not one terminal: a shared one let one session's cut `ESC[3` swallow the
-/// next session's first letter, and its unreset colour paint the other's text.
+/// state left in force, an escape sequence cut off mid-chunk, and the line
+/// the stream is in the middle of. Each debug session keeps its own, one per
+/// output category (#1501), since two programs' output is two streams, not
+/// one terminal: a shared one let one session's cut `ESC[3` swallow the next
+/// session's first letter, and its unreset colour paint the other's text.
+///
+/// A chunk is not a line (#932): `print("i =", i)` can reach a debug adapter
+/// as `i =` and ` 0\n`, and an empty `print()` as a lone `\n`. A line ends at
+/// its newline, blank or not, and the text after the last one stays open
+/// until a later chunk ends it.
 #[derive(Clone, Debug, Default)]
 pub struct AnsiStream {
     style: AnsiStyle,
     cut: String,
+    open: AnsiLine,
+    /// A carriage return came after the open line's text: the next visible
+    /// text replaces the line rather than extending it, as a progress bar's
+    /// redraw does in a terminal. `\r\n` still just ends the line.
+    rewind: bool,
 }
 
+/// How long an open line may grow before it is ended anyway: a program that
+/// prints a dot per step and never a newline must not grow one line, and
+/// the copy of it each chunk updates, without bound.
+const OPEN_LINE_CAP: usize = 64 * 1024;
+
+/// How long an escape sequence a chunk ends inside of may be held back
+/// waiting for its end: an OSC with no terminator (an `ESC ]` in binary
+/// output, say) would otherwise be kept, and rescanned on every chunk,
+/// without bound. Past it the held bytes are dropped, as a terminal
+/// swallows an escape it never sees the end of.
+const ESCAPE_CAP: usize = 64 * 1024;
+
 impl AnsiStream {
-    /// Parse the next chunk into its non-empty lines, holding back an
-    /// escape sequence the chunk ends in the middle of until the next one.
+    /// Parse the next chunk and return the lines it ends, blank ones
+    /// included. Text after its last newline joins the open line,
+    /// [`open_line`](Self::open_line), and an escape sequence the chunk ends
+    /// in the middle of waits for the next one.
     pub fn feed(&mut self, text: &str) -> Vec<AnsiLine> {
         let mut raw = std::mem::take(&mut self.cut);
         raw.push_str(text);
         let whole = raw.len() - unfinished_escape_len(&raw);
-        self.cut = raw[whole..].to_string();
-        raw[..whole]
-            .split('\n')
-            .map(|part| parse_line(part, &mut self.style))
-            .filter(|line| !line.text.is_empty())
-            .collect()
+        self.cut = if raw.len() - whole > ESCAPE_CAP {
+            String::new()
+        } else {
+            raw[whole..].to_string()
+        };
+        let mut ended = Vec::new();
+        let mut rest = &raw[..whole];
+        loop {
+            let stop = rest.find(['\n', '\r']);
+            self.append(&rest[..stop.unwrap_or(rest.len())]);
+            let Some(at) = stop else { break };
+            if rest.as_bytes()[at] == b'\n' {
+                ended.push(std::mem::take(&mut self.open));
+                self.rewind = false;
+            } else {
+                self.rewind = true;
+            }
+            rest = &rest[at + 1..];
+        }
+        if self.open.text.len() >= OPEN_LINE_CAP {
+            ended.push(std::mem::take(&mut self.open));
+            self.rewind = false;
+        }
+        ended
+    }
+
+    /// The line the stream is in the middle of, as it reads so far, or
+    /// `None` when the last chunk ended at a newline.
+    pub fn open_line(&self) -> Option<&AnsiLine> {
+        (!self.open.text.is_empty()).then_some(&self.open)
+    }
+
+    /// End the stream: its open line, if it has one, as a finished line.
+    pub fn finish(&mut self) -> Option<AnsiLine> {
+        self.rewind = false;
+        let line = std::mem::take(&mut self.open);
+        (!line.text.is_empty()).then_some(line)
+    }
+
+    /// Add one piece of text with no line break in it to the open line.
+    fn append(&mut self, raw: &str) {
+        let piece = parse_line(raw, &mut self.style);
+        if piece.text.is_empty() {
+            return;
+        }
+        if std::mem::take(&mut self.rewind) {
+            self.open = AnsiLine::default();
+        }
+        let offset = self.open.text.len();
+        self.open.text.push_str(&piece.text);
+        for span in piece.spans {
+            match self.open.spans.last_mut() {
+                Some(last) if last.end == offset + span.start && last.style == span.style => {
+                    last.end = offset + span.end;
+                }
+                _ => self.open.spans.push(AnsiSpan {
+                    start: offset + span.start,
+                    end: offset + span.end,
+                    style: span.style,
+                }),
+            }
+        }
     }
 }
 
@@ -613,6 +694,101 @@ mod tests {
         assert_eq!(unfinished_escape_len("\u{1b}]8;;x\u{1b}\\"), 0);
         // A newline ends the line the cut sequence was on.
         assert_eq!(unfinished_escape_len("\u{1b}[3\nnext"), 0);
+    }
+
+    fn texts(lines: &[AnsiLine]) -> Vec<&str> {
+        lines.iter().map(|l| l.text.as_str()).collect()
+    }
+
+    /// #932: a debug adapter's output event is a chunk, not a line. A line
+    /// cut between two chunks is one line, and an empty `print()` is a blank
+    /// line rather than nothing.
+    #[test]
+    fn a_stream_ends_lines_at_newlines_not_at_chunks() {
+        let mut stream = AnsiStream::default();
+        assert_eq!(texts(&stream.feed("print: i =")), Vec::<&str>::new());
+        assert_eq!(stream.open_line().unwrap().text, "print: i =");
+        let mut lines = stream.feed(" 0\n");
+        assert_eq!(stream.open_line(), None);
+        for chunk in ["\n", "Section 2\n"] {
+            lines.extend(stream.feed(chunk));
+        }
+        assert_eq!(texts(&lines), ["print: i = 0", "", "Section 2"]);
+        assert_eq!(texts(&stream.feed("a\n\nb\r\nc")), ["a", "", "b"]);
+        assert_eq!(stream.finish().unwrap().text, "c");
+        assert_eq!(stream.finish(), None);
+    }
+
+    /// #932: a carriage return rewrites the open line, so a progress bar
+    /// redraws in place, while `\r\n` only ends it.
+    #[test]
+    fn a_carriage_return_rewrites_the_open_line() {
+        let mut stream = AnsiStream::default();
+        stream.feed("\r 10%|#");
+        stream.feed("\r 50%|#####");
+        assert_eq!(stream.open_line().unwrap().text, " 50%|#####");
+        stream.feed("\r");
+        assert_eq!(
+            stream.open_line().unwrap().text,
+            " 50%|#####",
+            "a bare \\r keeps the line until new text replaces it"
+        );
+        assert_eq!(
+            texts(&stream.feed("100%|##########\n")),
+            ["100%|##########"]
+        );
+        assert_eq!(texts(&stream.feed("done\r")), Vec::<&str>::new());
+        assert_eq!(texts(&stream.feed("\n")), ["done"]);
+    }
+
+    /// A colour carries across the chunks of one line, its runs joined.
+    #[test]
+    fn an_open_line_keeps_its_colour_across_chunks() {
+        let mut stream = AnsiStream::default();
+        stream.feed("\u{1b}[31mred");
+        let line = stream.feed(" still\u{1b}[0m plain\n").remove(0);
+        assert_eq!(line.text, "red still plain");
+        assert_eq!(line.spans.len(), 2, "{:?}", line.spans);
+        assert_eq!(
+            (line.spans[0].end, line.spans[0].style.fg),
+            (9, Some(AnsiColor::Indexed(1)))
+        );
+        assert_eq!(line.spans[1].style.fg, None);
+    }
+
+    /// A line that never ends is ended at the cap, so it cannot grow
+    /// without bound.
+    #[test]
+    fn an_open_line_is_ended_at_the_cap() {
+        let mut stream = AnsiStream::default();
+        let mut ended = Vec::new();
+        for _ in 0..OPEN_LINE_CAP {
+            ended.extend(stream.feed("."));
+        }
+        assert_eq!(ended.len(), 1);
+        assert_eq!(ended[0].text.len(), OPEN_LINE_CAP);
+        assert_eq!(ended[0].spans.len(), 1, "one run, not one per dot");
+        assert_eq!(stream.open_line(), None);
+    }
+
+    /// An escape that never ends (an OSC with no terminator) is held back
+    /// only up to its cap and then dropped, so it cannot grow without bound,
+    /// and the output after it still comes through.
+    #[test]
+    fn an_unfinished_escape_is_dropped_at_its_cap() {
+        let mut stream = AnsiStream::default();
+        stream.feed("\u{1b}]0;");
+        let chunk = "x".repeat(1024);
+        for _ in 0..ESCAPE_CAP / chunk.len() + 2 {
+            stream.feed(&chunk);
+            assert!(
+                stream.cut.len() <= ESCAPE_CAP,
+                "{} held back",
+                stream.cut.len()
+            );
+        }
+        let ended = stream.feed("done\n");
+        assert!(ended.last().unwrap().text.ends_with("done"));
     }
 
     #[test]

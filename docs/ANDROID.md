@@ -22,7 +22,7 @@ Android has no `Cmd` key, so **`Ctrl` is the command modifier** (VS Code's Linux
 
 The curl-based installers croft uses on macOS and Linux cannot run on a stock Termux, which has no curl in the bootstrap, so croft installs dependencies with `pkg install` instead. It does this itself where it can:
 
-- **zoxide**, which backs the `Ctrl`+`Z` directory-jump popup.
+- **zoxide**, which backs the `Ctrl`+`Z` directory-jump popup. The popup offers `pkg install -y zoxide` when zoxide is missing and runs it only after you press `y`.
 - **ty** and **ruff** (the Python servers), because `uv` — croft's provisioning chain elsewhere — does not support Android.
 - **rust-analyzer**, whose cross-distro release binary is built against glibc and won't run on Android's bionic libc, so croft reroutes to the Termux package as it does for `ty`/`ruff`.
 - **marksman** (the Markdown server), for the same reason: none of its release binaries runs on bionic, so croft installs the Termux package instead.
