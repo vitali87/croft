@@ -138,18 +138,33 @@ jobs:
           tar -czf "dist/$name.tar.gz" -C dist "$name"
           echo "archive=dist/$name.tar.gz" >> "$GITHUB_OUTPUT"
 
+      - name: SBOM
+        # A CycloneDX SBOM of the crates compiled into THIS target's binary,
+        # named for the archive it describes. `--target` resolves the graph
+        # for the triple the Build step compiled, with the same default
+        # features, so the macOS SBOMs list core-foundation and the musl ones
+        # inotify, rather than every platform's entries in Cargo.lock.
+        run: |
+          cargo install cargo-cyclonedx --locked --version 0.5.9
+          cargo cyclonedx --format json --spec-version 1.5 \
+            --target ${{ matrix.target }} \
+            --override-filename "croft-${{ matrix.target }}.cdx"
+          mv "croft-${{ matrix.target }}.cdx.json" dist/
+
       - name: Checksum
-        # Per-target sums here, concatenated into one SHA256SUMS by the publish
+        # Per-file sums here, concatenated into one SHA256SUMS by the publish
         # job. Computing them on the runner that built the artifact means the
         # sum covers the bytes that were actually produced.
         run: |
           cd dist
-          if command -v sha256sum >/dev/null; then
-            sha256sum "croft-${{ matrix.target }}.tar.gz" > "croft-${{ matrix.target }}.tar.gz.sha256"
-          else
-            shasum -a 256 "croft-${{ matrix.target }}.tar.gz" > "croft-${{ matrix.target }}.tar.gz.sha256"
-          fi
-          cat "croft-${{ matrix.target }}.tar.gz.sha256"
+          for f in "croft-${{ matrix.target }}.tar.gz" "croft-${{ matrix.target }}.cdx.json"; do
+            if command -v sha256sum >/dev/null; then
+              sha256sum "$f" > "$f.sha256"
+            else
+              shasum -a 256 "$f" > "$f.sha256"
+            fi
+            cat "$f.sha256"
+          done
 
       - uses: actions/upload-artifact@v7
         with:
@@ -157,6 +172,8 @@ jobs:
           path: |
             dist/croft-${{ matrix.target }}.tar.gz
             dist/croft-${{ matrix.target }}.tar.gz.sha256
+            dist/croft-${{ matrix.target }}.cdx.json
+            dist/croft-${{ matrix.target }}.cdx.json.sha256
           if-no-files-found: error
 
   publish:
@@ -185,10 +202,10 @@ jobs:
         with:
           path: staged
 
-      - name: Collect the archives and build SHA256SUMS
+      - name: Collect the archives and SBOMs and build SHA256SUMS
         run: |
           mkdir -p dist
-          find staged -name 'croft-*.tar.gz' -exec cp {} dist/ \;
+          find staged \( -name 'croft-*.tar.gz' -o -name 'croft-*.cdx.json' \) -exec cp {} dist/ \;
           cd dist
           # Four archives, or the release is incomplete. Publishing three and
           # a checksum file that says three is worse than failing: binstall
@@ -199,22 +216,32 @@ jobs:
             ls -1
             exit 1
           fi
+          # Each archive ships with the SBOM its own build leg generated; an
+          # archive without one would be the one platform nobody can audit.
+          for a in croft-*.tar.gz; do
+            if [ ! -f "${a%.tar.gz}.cdx.json" ]; then
+              echo "::error::no SBOM for $a"
+              exit 1
+            fi
+          done
           # Build SHA256SUMS from the sums the BUILD runners computed, not
           # by re-hashing what arrived here. Re-hashing and then checking
           # compares the downloaded bytes against themselves: it passes on a
           # corrupted archive, which is the one thing it exists to catch.
           # The per-target .sha256 files are the only independent evidence,
           # so they are the input.
-          cat ../staged/*/croft-*.tar.gz.sha256 > SHA256SUMS
+          cat ../staged/*/croft-*.sha256 > SHA256SUMS
           cat SHA256SUMS
           # `sha256sum -c` verifies the lines that ARE there; it cannot report
           # one that is missing. A leg whose .sha256 never arrived would ship
           # its archive with no sum and this step would stay green (#557).
-          # So every archive must be named by exactly one line, and there
-          # must be no other lines. A bare line count is not enough: one
-          # duplicated sum plus one missing sum still counts to four.
+          # So every archive and SBOM must be named by exactly one line, and
+          # there must be no other lines. A bare line count is not enough: one
+          # duplicated sum plus one missing sum still counts to eight.
           fail=0
-          for a in croft-*.tar.gz; do
+          files=0
+          for a in croft-*.tar.gz croft-*.cdx.json; do
+            files=$((files + 1))
             n=$(awk -v f="$a" '$2 == f || $2 == "*" f' SHA256SUMS | wc -l | tr -d ' ')
             if [ "$n" -ne 1 ]; then
               echo "::error::SHA256SUMS names $a $n times, expected once"
@@ -222,8 +249,8 @@ jobs:
             fi
           done
           lines=$(wc -l < SHA256SUMS | tr -d ' ')
-          if [ "$lines" -ne "$count" ]; then
-            echo "::error::SHA256SUMS has $lines lines for $count archives"
+          if [ "$lines" -ne "$files" ]; then
+            echo "::error::SHA256SUMS has $lines lines for $files files"
             fail=1
           fi
           [ "$fail" -eq 0 ] || exit 1
@@ -234,10 +261,11 @@ jobs:
 
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
-      # Sign the checksum file, not each archive: every archive is bound to
-      # SHA256SUMS by its sum, so one signature covers the four. The bundle
-      # carries the signature, the certificate and the transparency-log
-      # proof, which is everything `cosign verify-blob` needs offline.
+      # Sign the checksum file, not each archive: every archive and SBOM is
+      # bound to SHA256SUMS by its sum, so one signature covers all eight.
+      # The bundle carries the signature, the certificate and the
+      # transparency-log proof, which is everything `cosign verify-blob`
+      # needs offline.
       - name: Sign SHA256SUMS
         run: |
           cosign sign-blob --yes --bundle dist/SHA256SUMS.sigstore.json dist/SHA256SUMS
@@ -268,7 +296,7 @@ jobs:
           python3 scripts/release.py notes "$version" < "$RUNNER_TEMP/released.txt" \
             > "$RUNNER_TEMP/notes.md"
           gh release create "$tag" --title "$tag" --notes-file "$RUNNER_TEMP/notes.md" \
-            dist/croft-*.tar.gz dist/SHA256SUMS dist/SHA256SUMS.sigstore.json
+            dist/croft-*.tar.gz dist/croft-*.cdx.json dist/SHA256SUMS dist/SHA256SUMS.sigstore.json
 
   crates:
     name: publish to crates.io
