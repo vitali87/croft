@@ -1531,6 +1531,83 @@ fn an_accepted_completion_resolves_its_auto_import() {
     assert_eq!(app.editor.lines, ["import lo"]);
 }
 
+/// #934: in a vim change, an accepted completion and the import its server
+/// resolves after it go in the change's undo step, as Vim takes back all an
+/// Insert added with one `u`. A lazily resolved item opened steps of its
+/// own, so the change took three: the item, the typing after it, the import.
+/// An import that lands after the `Esc` still joins its change, but never a
+/// newer one.
+#[test]
+fn a_completion_accepted_in_a_vim_change_undoes_with_it() {
+    let import = "from shelf import load";
+    let accept = || {
+        let (tmp, path, mut app, tx) = completion_reply_app();
+        app.vim.enabled = true;
+        vim_feed(&mut app, 'A');
+        app.trigger_completion();
+        let request_id = app.completion_request_id.unwrap();
+        draw(&mut app, 100, 30);
+        tx.send(completion_reply(request_id, &path, &["load"]))
+            .unwrap();
+        app.drain_lsp_completion();
+        let popup = app.completion_popup.as_mut().expect("the list opens");
+        popup.items[0].resolve = Some(std::sync::Arc::default());
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+        vim_feed(&mut app, ';');
+        let pending = app.completion_resolve.as_ref().expect("a resolve went out");
+        let mut reply = completion_reply(pending.request_id, &path, &["load"]);
+        reply.items[0].additional_edits = vec![crate::widgets::editor::TextSpanEdit {
+            start: (0, 0),
+            end: (0, 0),
+            new_text: format!("{import}\n"),
+            utf16: true,
+        }];
+        (tmp, app, tx, reply)
+    };
+    let esc = |app: &mut App| {
+        app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+            .unwrap();
+    };
+
+    let (_tmp, mut app, tx, reply) = accept();
+    tx.send(reply).unwrap();
+    assert!(app.drain_lsp_completion());
+    esc(&mut app);
+    assert_eq!(app.editor.lines, [import, "import load;"]);
+    vim_feed(&mut app, 'u');
+    assert_eq!(
+        app.editor.lines,
+        ["import lo"],
+        "one u takes the change back"
+    );
+
+    let (_tmp, mut app, tx, reply) = accept();
+    esc(&mut app);
+    tx.send(reply).unwrap();
+    assert!(app.drain_lsp_completion());
+    vim_feed(&mut app, 'u');
+    assert_eq!(
+        app.editor.lines,
+        ["import lo"],
+        "a late import joins its change"
+    );
+
+    let (_tmp, mut app, tx, reply) = accept();
+    esc(&mut app);
+    vim_feed_str(&mut app, "Ax");
+    tx.send(reply).unwrap();
+    assert!(app.drain_lsp_completion());
+    esc(&mut app);
+    assert_eq!(app.editor.lines, [import, "import load;x"]);
+    vim_feed(&mut app, 'u');
+    assert_eq!(
+        app.editor.lines,
+        ["import load;x"],
+        "an import after a newer change is a step of its own"
+    );
+}
+
 /// #928: rust-analyzer's completions are snippets, `load(${1:a}, ${2:b})`,
 /// with the import on resolve. An import landing above the live snippet
 /// moves its tab stops with their text, and one Undo takes the item, its

@@ -6149,7 +6149,16 @@ struct PendingCompletionResolve {
     /// The caret after the accept, and a hash of the text before it.
     upto: (usize, usize),
     text_hash: u64,
-    undo_group: u64,
+    undo: ImportUndo,
+}
+
+/// The undo step a completion's resolved import joins.
+enum ImportUndo {
+    /// The accept's remote group (#928).
+    Group(u64),
+    /// The vim change the accept went in (#934), joined only while its step
+    /// is still the newest.
+    Step(u64),
 }
 
 /// A hash of the text before `(row, col)`, `None` past the buffer's end:
@@ -10221,11 +10230,16 @@ impl App {
         if edits.is_empty() || !edits.iter().all(before_item) {
             return false;
         }
-        self.editor.apply_span_edits_as_in(
-            &edits,
-            crate::provenance::Seat::Generated,
-            Some(pending.undo_group),
-        );
+        let group = match pending.undo {
+            ImportUndo::Group(group) => group,
+            ImportUndo::Step(step) => {
+                let group = next_remote_undo_group();
+                self.editor.adopt_undo_step(step, group);
+                group
+            }
+        };
+        self.editor
+            .apply_span_edits_as_in(&edits, crate::provenance::Seat::Generated, Some(group));
         true
     }
 
@@ -16893,8 +16907,11 @@ impl App {
             }
         }
         // An accepted completion is the server's text, not the user's (#349),
-        // and an import its server resolves later joins its undo step.
-        let group = item.resolve.is_some().then(next_remote_undo_group);
+        // and an import its server resolves later joins its undo step. In a
+        // vim change both go in the change's own step, since Vim takes back
+        // all an Insert added with one `u` (#934).
+        let in_change = self.editor.undo_group_open();
+        let group = (item.resolve.is_some() && !in_change).then(next_remote_undo_group);
         self.editor
             .apply_span_edits_as_in(&edits, crate::provenance::Seat::Generated, group);
         self.editor.cursor_row = caret_row.max(0) as usize;
@@ -16903,8 +16920,12 @@ impl App {
         if item.is_snippet {
             self.expand_snippet_in(&te.new_text, 0, group);
         }
-        if let (Some(group), Some(listed)) = (group, item.resolve.clone()) {
-            self.request_completion_imports(listed, (row, start), group);
+        if let Some(listed) = item.resolve.clone() {
+            let undo = group.map_or(
+                ImportUndo::Step(self.editor.undo_step_id),
+                ImportUndo::Group,
+            );
+            self.request_completion_imports(listed, (row, start), undo);
         }
         true
     }
@@ -16935,7 +16956,7 @@ impl App {
         &mut self,
         item: std::sync::Arc<lsp_types::CompletionItem>,
         start: (usize, usize),
-        undo_group: u64,
+        undo: ImportUndo,
     ) -> Option<()> {
         let path = self.editor.path.clone()?;
         let upto = (self.editor.cursor_row, self.editor.cursor_col);
@@ -16947,7 +16968,7 @@ impl App {
             start,
             upto,
             text_hash,
-            undo_group,
+            undo,
         });
         Some(())
     }
@@ -47378,11 +47399,14 @@ impl App {
         if !self.is_extension_enabled("vim") {
             if self.vim.enabled {
                 self.vim.toggle();
+                self.end_vim_undo_groups();
             }
             self.status = String::from("Vim extension is disabled");
             return;
         }
         self.vim.toggle();
+        // A change left open in Insert mode ends with the mode (#934).
+        self.end_vim_undo_groups();
         if self.vim.enabled {
             self.status = String::from("vim mode on");
         } else {
@@ -47413,6 +47437,7 @@ impl App {
         let on = want && self.is_extension_enabled("vim");
         if on != self.vim.enabled {
             self.vim.toggle();
+            self.end_vim_undo_groups();
             if !on {
                 self.editor
                     .set_search_highlight(None, crate::widgets::search::SearchOpts::default());
@@ -48555,10 +48580,34 @@ impl App {
         consumed
     }
 
+    /// End the vim change's undo group (#934): on the active editor, which
+    /// also starts the next edit's own step, and on whichever other tab or
+    /// editor group the change was entered on.
+    fn end_vim_undo_groups(&mut self) {
+        self.editor.end_undo_group();
+        for group in
+            std::iter::once(&mut self.editor).chain(self.editor_layout.inactive_groups_mut())
+        {
+            group.end_open_undo_groups();
+        }
+    }
+
     /// Apply one resolved vim intent to the editor. The vim state machine has
     /// already advanced its own mode; this only mutates the buffer/cursor.
     fn apply_vim_action(&mut self, action: crate::vim::VimAction) {
-        use crate::vim::{Target, VimAction};
+        use crate::vim::{Op, Target, VimAction};
+        // A change runs from the command that enters Insert to the next vim
+        // command, the `Esc` that leaves it: the operator's delete, the line
+        // `o` opens and the typed text undo as one step, as in Vim (#934).
+        self.end_vim_undo_groups();
+        if matches!(
+            action,
+            VimAction::Insert(_)
+                | VimAction::Operate { op: Op::Change, .. }
+                | VimAction::VisualOperate(Op::Change)
+        ) {
+            self.editor.begin_undo_group();
+        }
         match action {
             VimAction::Move(motion, count) => {
                 self.vim_apply_motion(motion, count);
@@ -48578,6 +48627,9 @@ impl App {
                 } else {
                     String::from("Nothing to undo")
                 };
+                // The step an operator opened holds the selection it acted
+                // on; Normal mode shows none, and `x` must not delete it.
+                self.editor.clear_selection();
             }
             VimAction::Redo => {
                 self.status = if self.editor.redo() {
@@ -48585,6 +48637,7 @@ impl App {
                 } else {
                     String::from("Nothing to redo")
                 };
+                self.editor.clear_selection();
             }
             VimAction::EnterVisual { line } => {
                 self.editor.break_undo_coalescing();
@@ -48605,7 +48658,6 @@ impl App {
             }
             VimAction::VisualOperate(op) => self.vim_visual_operate(op),
             VimAction::ExitInsert => {
-                self.editor.break_undo_coalescing();
                 if self.editor.cursor_col > 0 {
                     self.editor.cursor_col -= 1;
                 }
@@ -48636,6 +48688,9 @@ impl App {
                 Some(r) => self.replay_macro_register(r, count),
                 None => self.replay_last_macro(count),
             },
+            VimAction::Unsupported(what) => {
+                self.status = format!("{what} is not supported in vim mode");
+            }
         }
     }
 
@@ -48880,6 +48935,17 @@ impl App {
         self.editor.cursor_col = col;
     }
 
+    /// Where `{count}cw` from a non-blank ends: `e` `count` times, except
+    /// that on a word's last char the first `e` stays put, so `cw` there
+    /// changes that char rather than running to the next word's end.
+    fn vim_change_word_end(&mut self, count: usize) {
+        let (row, col) = (self.editor.cursor_row, self.editor.cursor_col);
+        let at_word_end = self.vim_class_at(row, col + 1) != self.vim_class_at(row, col);
+        for _ in usize::from(at_word_end)..count.max(1) {
+            self.vim_word_end();
+        }
+    }
+
     fn vim_operate_lines(&mut self, op: crate::vim::Op, start_row: usize, count: usize) {
         use crate::vim::Op;
         // A symbol tab's operator stays inside its symbol (#369): `dgg`
@@ -48920,7 +48986,16 @@ impl App {
             return;
         }
         let start = (self.editor.cursor_row, self.editor.cursor_col);
-        self.vim_apply_motion(motion, count);
+        // `cw` on a word changes up to its end and keeps the blank after it
+        // (Vim's `:help cw`, #934); on a blank it is `dw`'s span.
+        let change_word = op == crate::vim::Op::Change
+            && motion == crate::vim::Motion::WordForward
+            && self.vim_class_at(start.0, start.1) != 0;
+        if change_word {
+            self.vim_change_word_end(count);
+        } else {
+            self.vim_apply_motion(motion, count);
+        }
         let end = (self.editor.cursor_row, self.editor.cursor_col);
         let (lo, hi) = if start <= end {
             (start, end)
@@ -48928,7 +49003,7 @@ impl App {
             (end, start)
         };
         // Forward-inclusive motions (f/t/e) cover the char they land on.
-        let head = if start <= end && vim_motion_is_forward_inclusive(motion) {
+        let head = if start <= end && (change_word || vim_motion_is_forward_inclusive(motion)) {
             let len = self.vim_line_len(hi.0);
             (hi.0, (hi.1 + 1).min(len))
         } else {
@@ -49061,7 +49136,6 @@ impl App {
             InsertAt::Below => self.editor.open_line_below(),
             InsertAt::Above => self.editor.open_line_above(),
         }
-        self.editor.break_undo_coalescing();
         self.status = String::from("-- INSERT --");
     }
 
@@ -55980,9 +56054,9 @@ impl App {
             // merge into the previous iteration's typing run. This bounds
             // iterations apart; it does NOT make one iteration one undo step
             // — `push_undo` coalesces only a typing run, so a macro
-            // holding a delete plus an insert still undoes in two. A real
-            // one-step-per-iteration guarantee needs an undo-group API the
-            // editor does not have (its undo is whole-buffer snapshots).
+            // holding a delete plus an insert still undoes in two. Wrapping
+            // the iteration in `Editor::begin_undo_group` would not do it
+            // either: every vim command the macro runs ends that group (#934).
             self.editor.break_undo_coalescing();
             for step in &keys {
                 match step {

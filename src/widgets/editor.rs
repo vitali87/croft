@@ -3492,6 +3492,10 @@ pub struct Editor {
     /// instead of opening their own. Any other step, undo or redo ends it; a
     /// peer's edit, which opens no step (#919), does not.
     remote_undo_group: Option<u64>,
+    /// Open from [`Self::begin_undo_group`] to [`Self::end_undo_group`]
+    /// (#934), holding the [`Self::undo_step_id`] of the step its edits are
+    /// filling (`None` before its first edit).
+    undo_group: Option<Option<u64>>,
     lang: Option<LangKind>,
     /// The language came from "Change Language Mode" (#1574), not from the
     /// file's name, so a `files_associations` change leaves it alone.
@@ -3955,6 +3959,7 @@ impl Editor {
             redo_stack: Vec::new(),
             last_edit_kind: None,
             remote_undo_group: None,
+            undo_group: None,
             lang: None,
             language_by_hand: false,
             indent_override: None,
@@ -11492,8 +11497,15 @@ impl Editor {
         // Where the edit about to happen begins — the merge editor's
         // region tracker reads this when it reconciles (#253).
         self.merge_edit_row = self.cursor_row;
+        // Inside an undo group a local edit joins the step the group's first
+        // edit opened, unless an undo, a redo or a remote edit has put
+        // another step on top since (#934).
+        let in_group = group.is_none()
+            && self.undo_group == Some(Some(self.undo_step_id))
+            && !self.undo_stack.is_empty();
         let typing = matches!(kind, EditKind::InsertChar | EditKind::MultiInsertChar);
-        let coalesce = (typing && self.last_edit_kind == Some(kind))
+        let coalesce = in_group
+            || (typing && self.last_edit_kind == Some(kind))
             || (group.is_some() && group == self.remote_undo_group && !self.undo_stack.is_empty());
         self.remote_undo_group = group;
         if !coalesce {
@@ -11501,6 +11513,11 @@ impl Editor {
             self.trim_undo_stack();
             self.undo_step_id = next_undo_step_id();
             self.mirrored_step = None;
+        }
+        if group.is_none()
+            && let Some(step) = self.undo_group.as_mut()
+        {
+            *step = Some(self.undo_step_id);
         }
         // A fresh edit branches history: whatever was undone can no longer be
         // redone (VS Code's model). Cleared even on a coalesced keystroke so a
@@ -11583,6 +11600,37 @@ impl Editor {
     /// merge with whatever comes after a movement / mouse / focus change).
     pub fn break_undo_coalescing(&mut self) {
         self.last_edit_kind = None;
+    }
+
+    /// Make every edit until [`Self::end_undo_group`] one undo step (#934):
+    /// vim's `cw` and the text typed after it, or `o` and the new line's
+    /// text, come back with one undo. The first edit opens a fresh step.
+    pub fn begin_undo_group(&mut self) {
+        self.undo_group = Some(None);
+        self.last_edit_kind = None;
+    }
+
+    /// Close the group [`Self::begin_undo_group`] opened, if any. The next
+    /// edit opens its own step.
+    pub fn end_undo_group(&mut self) {
+        self.undo_group = None;
+        self.last_edit_kind = None;
+    }
+
+    /// Whether a group [`Self::begin_undo_group`] opened is still open: a
+    /// vim change is under way (#934).
+    pub fn undo_group_open(&self) -> bool {
+        self.undo_group.is_some()
+    }
+
+    /// Let the remote edits of `group` join the newest undo step while it
+    /// is still `step` (#934): a completion's import resolved after its vim
+    /// change goes back into that change, but never into a step opened
+    /// since, where they open a step of their own.
+    pub fn adopt_undo_step(&mut self, step: u64, group: u64) {
+        if self.undo_step_id == step && !self.undo_stack.is_empty() {
+            self.remote_undo_group = Some(group);
+        }
     }
 
     /// Mouse-down: position the cursor at the click point and start a
@@ -21823,6 +21871,19 @@ impl EditorTabs {
         self.editors.iter()
     }
 
+    /// Close the undo group of every tab that still has one open (#934): a
+    /// vim change entered on one tab can be left with `Esc` on another, and
+    /// an edit back on its tab that skips vim, such as a paste, would
+    /// otherwise fold into the change. A tab with no group open is left as
+    /// it is.
+    pub fn end_open_undo_groups(&mut self) {
+        for editor in &mut self.editors {
+            if editor.undo_group.is_some() {
+                editor.end_undo_group();
+            }
+        }
+    }
+
     pub fn select(&mut self, idx: usize) -> bool {
         if idx >= self.editors.len() {
             return false;
@@ -29305,6 +29366,52 @@ mod tests {
         assert_eq!(e.lines[0], "return a - b + c", "an ended group is closed");
         assert!(e.undo());
         assert_eq!(e.lines[0], "return a - b");
+    }
+
+    /// #934: a delete, a new line and the typing after it, made inside an
+    /// undo group, undo as one step; the edit after the group is its own.
+    #[test]
+    fn an_undo_group_undoes_its_delete_newline_and_typing_at_once() {
+        let mut e = editor_with("one two");
+        e.begin_undo_group();
+        for _ in 0..3 {
+            e.delete_forward();
+        }
+        e.insert_char('A');
+        e.insert_newline();
+        e.insert_char('B');
+        e.end_undo_group();
+        e.insert_char('C');
+        assert_eq!(e.lines, vec!["A", "BC two"]);
+        assert!(e.undo());
+        assert_eq!(e.lines, vec!["A", "B two"], "the edit after the group");
+        assert!(e.undo());
+        assert_eq!(e.lines, vec!["one two"], "the whole group at once");
+        assert!(!e.undo());
+    }
+
+    /// Negative (#934): an undo inside a group, or a remote edit, ends the
+    /// step the group was filling; later edits open a new one.
+    #[test]
+    fn an_undo_or_a_peer_edit_inside_a_group_starts_a_new_step() {
+        let mut e = editor_with("x");
+        e.cursor_col = 1;
+        e.insert_char('a');
+        e.begin_undo_group();
+        e.insert_char('1');
+        e.insert_newline();
+        assert!(e.undo());
+        e.insert_char('2');
+        let span = append_span(&e, "3");
+        e.apply_remote_span_edits(&[span], 9);
+        e.cursor_col = e.lines[0].chars().count();
+        e.insert_char('4');
+        e.end_undo_group();
+        let mut seen = vec![e.lines.join("|")];
+        while e.undo() {
+            seen.push(e.lines.join("|"));
+        }
+        assert_eq!(seen, ["xa234", "xa23", "xa2", "xa", "x"]);
     }
 
     /// #919: a peer's edit opens no undo step. Undo reverts this user's own
