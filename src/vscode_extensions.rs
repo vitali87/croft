@@ -526,7 +526,7 @@ pub const TABLE: &[Mapping] = &[
         vscode: "humao.rest-client",
         croft: "http files",
         status: Status::Builtin,
-        note: ".http files: HTTP: Send Request Under Caret, or Copy Request as curl",
+        note: ".http files: HTTP: Send Request Under Caret, Copy Request as curl, or Switch Environment",
     },
     Mapping {
         vscode: "yzhang.markdown-all-in-one",

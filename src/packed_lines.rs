@@ -115,6 +115,40 @@ impl PackedLines {
             .extend(tail.into_iter().map(|end| end.wrapping_add_signed(shift)));
     }
 
+    /// The lines joined by `\n`.
+    pub fn as_str(&self) -> &str {
+        &self.text
+    }
+
+    /// Replace bytes `range` of the joined text with `with`, which may hold
+    /// line breaks, as `String::replace_range` would.
+    pub fn replace_range(&mut self, range: std::ops::Range<usize>, with: &str) {
+        if self.ends.is_empty() {
+            self.text.replace_range(range, with);
+            *self = Self::from_joined(std::mem::take(&mut self.text));
+            return;
+        }
+        let (a, b) = (range.start, range.end);
+        // The lines the range touches: from the first ending at or after its
+        // start to the first ending at or after its end, which keeps its end.
+        let first = self.ends.partition_point(|&e| e < a);
+        let last = self.ends.partition_point(|&e| e < b);
+        let shift = with.len() as isize - (b - a) as isize;
+        self.text.replace_range(a..b, with);
+        for end in &mut self.ends[last..] {
+            *end = end.wrapping_add_signed(shift);
+        }
+        let breaks = memchr::memchr_iter(b'\n', with.as_bytes()).map(|i| a + i);
+        self.ends.splice(first..last, breaks);
+    }
+
+    /// The line and char column of byte `at` of the joined text.
+    pub fn position(&self, at: usize) -> (usize, usize) {
+        let row = self.ends.partition_point(|&e| e < at);
+        let start = self.start(row);
+        (row, self.text[start..at.max(start)].chars().count())
+    }
+
     /// Where line `i` starts in `text`.
     fn start(&self, i: usize) -> usize {
         match i {
@@ -231,5 +265,36 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Every byte range of the joined text, replaced with or without line
+    /// breaks, leaves the lines a fresh split of the edited text would give,
+    /// and every byte maps to the line and column it sits on.
+    #[test]
+    fn replaces_bytes_as_the_joined_text_does() {
+        for base in ["", "a", "a\n", "ab\ncd", "\n\n", "a\n\nbc\n"] {
+            for from in 0..=base.len() {
+                for to in from..=base.len() {
+                    for with in ["", "x", "\n", "y\nzz", "\nq\n"] {
+                        let mut want = base.to_string();
+                        want.replace_range(from..to, with);
+                        let mut p = PackedLines::from_joined(base.to_string());
+                        p.replace_range(from..to, with);
+                        let case = format!("{base:?}[{from}..{to}] <- {with:?}");
+                        assert_eq!(p, PackedLines::from_joined(want.clone()), "{case}");
+                        assert_eq!(p.as_str(), want, "{case}");
+                    }
+                }
+            }
+        }
+        let p = PackedLines::from_joined("ab\nçd\n".to_string());
+        let got: Vec<_> = (0..=p.as_str().len())
+            .filter(|&at| p.as_str().is_char_boundary(at))
+            .map(|at| p.position(at))
+            .collect();
+        assert_eq!(
+            got,
+            [(0, 0), (0, 1), (0, 2), (1, 0), (1, 1), (1, 2), (2, 0)]
+        );
     }
 }

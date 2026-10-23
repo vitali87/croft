@@ -297,7 +297,7 @@ pub fn is_unreachable(err: &anyhow::Error) -> bool {
 
 /// Fetch `url` over HTTPS, capped at [`MAX_ARCHIVE_BYTES`].
 pub fn http_get(url: &str) -> Result<Vec<u8>> {
-    let resp = match ureq::get(url)
+    let resp = match crate::net::get(url)
         .timeout(std::time::Duration::from_secs(60))
         .call()
     {

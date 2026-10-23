@@ -607,6 +607,33 @@ fn a_failed_github_download_says_why_and_adds_nothing() {
     });
 }
 
+/// #917: adding a database from GitHub without gh says how to get it,
+/// both when looking up the repository's languages and when downloading.
+#[test]
+fn a_github_database_without_gh_says_how_to_get_it() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.gh_program = tmp.path().join("gh");
+        for (value, context) in [
+            (
+                "psf/requests",
+                "Could not look up psf/requests's CodeQL databases",
+            ),
+            ("psf/requests python", "Download failed"),
+        ] {
+            app.submit_codeql_database(crate::widgets::input_prompt::CodeqlDbSource::Github, value);
+            wait_for_codeql_db_job(&mut app);
+            assert_eq!(app.status, format!("{context}: {}", crate::gh::MISSING));
+        }
+        let cache = App::codeql_db_cache_dir();
+        let left = std::fs::read_dir(&cache).map(|d| d.count()).unwrap_or(0);
+        assert_eq!(left, 0, "no partial download left in {}", cache.display());
+    });
+}
+
 #[test]
 fn adding_a_codeql_database_from_an_archive_extracts_it_first() {
     // The cache-dir override is process-global; serialize with the

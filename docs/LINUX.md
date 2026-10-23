@@ -6,7 +6,7 @@ Linux is a first-class target: a session on a Linux box over SSH behaves identic
 
 ## The command modifier
 
-croft mirrors VS Code's Linux convention: the command modifier is `Ctrl`, and a `Cmd` chord from the [keybindings reference](KEYBINDINGS.md) works as the same chord with `Ctrl` (`Ctrl`+`P` for Quick Open, `Ctrl`+`Shift`+`E` for the Explorer) with zero setup. The Command Palette and the Keyboard Shortcuts view spell each chord that way (`Ctrl+/`, not `Cmd+/`), and `Super` for the few chords below that have no `Ctrl` form.
+croft mirrors VS Code's Linux convention: the command modifier is `Ctrl`, and a `Cmd` chord from the [keybindings reference](KEYBINDINGS.md) works as the same chord with `Ctrl` (`Ctrl`+`P` for Quick Open, `Ctrl`+`Shift`+`E` for the Explorer) with zero setup. The Command Palette, the Keyboard Shortcuts view, the right-click menus and the Customize Layout popup spell each chord that way (`Ctrl+/`, not `Cmd+/` or `⌘/`), and `Super` for the few chords below that have no `Ctrl` form.
 
 That includes the `Cmd+K` chords: `Ctrl`+`K` is the leader (`Ctrl`+`K` `B` opens Testing, `Ctrl`+`K` `Ctrl`+`S` the Keyboard Shortcuts editor) everywhere except two places that keep `Ctrl`+`K` for themselves:
 
@@ -68,7 +68,7 @@ sudo pacman -S poppler              # Arch
 
 ## Language servers
 
-croft auto-provisions `rust-analyzer` on first use, downloading the official release binary into `~/.croft/servers`; a copy on your `PATH` or in `~/.cargo/bin` wins, so it matches your toolchain. It picks up `gopls` from `PATH`, auto-installs `vtsls` for TypeScript / JavaScript on first use where `node` + `npm` are present, and provisions the Python servers (`ty`, `ruff`) via `uv`. You can still install distro packages — a PATH copy takes precedence:
+croft auto-provisions `rust-analyzer` on first use, downloading the official release binary into `~/.croft/servers`; a copy on your `PATH` or in `~/.cargo/bin` wins, so it matches your toolchain. It picks up `gopls` from `PATH` (or `~/go/bin`), and without one builds a pinned gopls with your own `go install` when `go` is on `PATH`; it auto-installs `vtsls` for TypeScript / JavaScript on first use where `node` + `npm` are present, and provisions the Python servers (`ty`, `ruff`) via `uv`. You can still install distro packages — a PATH copy takes precedence:
 
 ```bash
 sudo apt install rust-analyzer gopls nodejs npm   # adjust per distro; rust-analyzer optional

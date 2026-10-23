@@ -30,6 +30,9 @@ pub enum ListPurpose {
     StashDrop,
     /// A stash whose changes to open (#1581).
     StashView,
+    /// A branch switch local changes blocked (#925): `id` is `stash`
+    /// (Stash & Checkout) or `migrate` (Migrate Changes).
+    BlockedSwitch,
     RemoveRemote,
     DeleteTag,
     /// A tag on the push remote to delete there (#1582); each row's id is
@@ -128,6 +131,9 @@ pub enum ListPurpose {
     /// Notebook: Select Kernel (#1377): the installed kernelspecs, `id`
     /// the kernel's name.
     NotebookKernel,
+    /// HTTP: Switch Environment (#924): `id` the named environment of the
+    /// `.http` env files, or empty for none.
+    HttpEnvironment,
 }
 
 /// The Review Pull Request row that asks for a number or URL instead.

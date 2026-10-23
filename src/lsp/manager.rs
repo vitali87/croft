@@ -1016,6 +1016,9 @@ enum Cmd {
     DidRenameFiles {
         renames: Vec<FileRenameOp>,
     },
+    DidChangeWatchedFiles {
+        changes: Vec<(PathBuf, lsp_types::FileChangeType)>,
+    },
     RequestFormatting {
         request_id: u64,
         path: PathBuf,
@@ -1134,6 +1137,9 @@ pub struct LspManager {
     /// answer a linkedEditingRange request without a server.
     #[cfg(test)]
     linked_editing_test_tx: std_mpsc::Sender<LinkedEditingResult>,
+    /// Test hook: the text each document was last opened or changed with.
+    #[cfg(test)]
+    synced_texts: std::sync::Mutex<HashMap<PathBuf, String>>,
     selection_ranges_rx: std_mpsc::Receiver<SelectionRangesResult>,
     calls_rx: std_mpsc::Receiver<CallHierarchyResult>,
     ws_symbols_rx: std_mpsc::Receiver<WorkspaceSymbolsResult>,
@@ -1334,6 +1340,8 @@ impl LspManager {
             linked_editing_rx,
             #[cfg(test)]
             linked_editing_test_tx,
+            #[cfg(test)]
+            synced_texts: Default::default(),
             selection_ranges_rx,
             calls_rx,
             ws_symbols_rx,
@@ -1369,6 +1377,8 @@ impl LspManager {
     }
 
     pub fn open_doc(&self, path: PathBuf, text: String) {
+        #[cfg(test)]
+        self.record_synced_text(&path, &text);
         let _ = self.cmd_tx.send(Cmd::OpenDoc { path, text });
     }
 
@@ -1394,6 +1404,8 @@ impl LspManager {
     }
 
     pub fn change_doc(&self, path: PathBuf, text: String) {
+        #[cfg(test)]
+        self.record_synced_text(&path, &text);
         let _ = self.cmd_tx.send(Cmd::ChangeDoc { path, text });
     }
 
@@ -1983,6 +1995,20 @@ impl LspManager {
         }
     }
 
+    /// Test hook: the text the last open or change sent for `path`, as
+    /// every server on it would read it.
+    #[cfg(test)]
+    pub fn synced_text_for_test(&self, path: &Path) -> Option<String> {
+        self.synced_texts.lock().ok()?.get(path).cloned()
+    }
+
+    #[cfg(test)]
+    fn record_synced_text(&self, path: &Path, text: &str) {
+        if let Ok(mut texts) = self.synced_texts.lock() {
+            texts.insert(path.to_path_buf(), text.to_string());
+        }
+    }
+
     /// Whether the server for `lang` implements call hierarchy. `None` means
     /// no server has reported yet. Drives the right-click menu rows.
     pub fn language_supports_call_hierarchy(&self, lang: Language) -> Option<bool> {
@@ -2069,6 +2095,12 @@ impl LspManager {
     /// Tell interested servers that `renames` happened (#610).
     pub fn did_rename_files(&mut self, renames: Vec<FileRenameOp>) {
         let _ = self.cmd_tx.send(Cmd::DidRenameFiles { renames });
+    }
+
+    /// Tell the servers that watch them that files changed on disk (#908).
+    /// A file gone by the time this is sent goes out as deleted.
+    pub fn did_change_watched_files(&mut self, changes: Vec<(PathBuf, lsp_types::FileChangeType)>) {
+        let _ = self.cmd_tx.send(Cmd::DidChangeWatchedFiles { changes });
     }
 
     pub fn request_formatting(&mut self, path: PathBuf, tab_size: u32, insert_spaces: bool) -> u64 {
@@ -2844,6 +2876,7 @@ async fn worker_loop(
                 renames,
             } => state.request_will_rename_files(request_id, renames, &tx.will_rename_files),
             Cmd::DidRenameFiles { renames } => state.did_rename_files(renames),
+            Cmd::DidChangeWatchedFiles { changes } => state.did_change_watched_files(changes),
             Cmd::RequestPrepareRename {
                 request_id,
                 path,
@@ -3209,6 +3242,13 @@ impl WorkerState {
                 .iter()
                 .filter_map(|config| resolve_config(config, first_attempt))
                 .collect();
+            if first_attempt
+                && resolved.is_empty()
+                && let Some(note) =
+                    missing_servers_note(lang, &configs, crate::lsp::install::missing_installer)
+            {
+                report_missing_servers_once(lang, &note);
+            }
             let outcomes =
                 futures::future::join_all(resolved.into_iter().map(|(config, extra_path)| {
                     let caps = build_client_capabilities();
@@ -5497,6 +5537,45 @@ impl WorkerState {
         }
     }
 
+    /// `workspace/didChangeWatchedFiles` fan-out (#908): each server gets
+    /// the changes its watchers cover, less the documents it has open, which
+    /// reach it through didChange. Existence is read here, off the UI
+    /// thread, so a file that is gone by now goes out as deleted.
+    fn did_change_watched_files(&mut self, changes: Vec<(PathBuf, lsp_types::FileChangeType)>) {
+        let changes: Vec<_> = changes
+            .into_iter()
+            .map(|(path, typ)| match path.exists() {
+                true => (path, typ),
+                false => (path, lsp_types::FileChangeType::DELETED),
+            })
+            .collect();
+        for ((lang, root), clients) in &self.clients {
+            let closed: Arc<Vec<_>> = Arc::new(
+                changes
+                    .iter()
+                    .filter(|(path, _)| {
+                        !self
+                            .docs
+                            .get(path)
+                            .is_some_and(|d| d.language == *lang && d.project_root == *root)
+                    })
+                    .cloned()
+                    .collect(),
+            );
+            if closed.is_empty() {
+                continue;
+            }
+            for c in clients {
+                let (name, client, closed) = (c.name.clone(), c.client.clone(), closed.clone());
+                tokio::spawn(async move {
+                    if let Err(e) = client.lock().await.did_change_watched_files(&closed) {
+                        log_file::log(&format!("lsp[{name}] didChangeWatchedFiles error: {e}"));
+                    }
+                });
+            }
+        }
+    }
+
     /// Prepare-rename (#254): always answers, because the rename prompt
     /// is deferred on this verdict.
     async fn request_prepare_rename(
@@ -7327,9 +7406,10 @@ fn build_client_capabilities() -> ClientCapabilities {
             implementation: goto(),
 
             // croft sends didSave, and only to a server that advertised
-            // `save` (#854). No dynamic registration: croft answers no
-            // `client/registerCapability`, and rust-analyzer registers didSave
-            // dynamically when told it may, instead of advertising `save`.
+            // `save` (#854). No dynamic registration: croft accepts
+            // `client/registerCapability` for watched files alone (#908), and
+            // rust-analyzer registers didSave dynamically when told it may,
+            // instead of advertising `save`.
             synchronization: Some(lsp_types::TextDocumentSyncClientCapabilities {
                 dynamic_registration: Some(false),
                 will_save: Some(false),
@@ -7563,6 +7643,14 @@ fn build_client_capabilities() -> ClientCapabilities {
                 did_rename: Some(true),
                 ..Default::default()
             }),
+            // Servers that leave file watching to the client (ty, gopls,
+            // rust-analyzer) register the globs they want, and croft
+            // forwards its watcher's events (#908). Undeclared, a file
+            // changed on disk outside a tab stayed stale in the server.
+            did_change_watched_files: Some(lsp_types::DidChangeWatchedFilesClientCapabilities {
+                dynamic_registration: Some(true),
+                relative_pattern_support: Some(true),
+            }),
             ..Default::default()
         }),
         // Declare `window.workDoneProgress` so servers stream `$/progress`
@@ -7691,14 +7779,17 @@ fn resolve_config(config: &ServerConfig, log_skip: bool) -> Option<(ServerConfig
         // Only when no real binary exists anywhere do we fall back to a managed
         // download / Termux `pkg` install. npm/uv servers keep their own
         // managed-first (vtsls) or PATH-first (ty/ruff) ordering inside
-        // `resolve_managed`, so this preference is scoped to the Binary backend.
-        if matches!(provision, crate::lsp::install::Provision::Binary { .. })
-            && let Some(resolved) = resolve_path_only(
-                config,
-                is_on_path(&config.command),
-                &toolchain_fallback_dirs(),
-            )
-        {
+        // `resolve_managed`, so this preference is scoped to the Binary and Go
+        // backends (a gopls in ~/go/bin is the user's own, #930).
+        if matches!(
+            provision,
+            crate::lsp::install::Provision::Binary { .. }
+                | crate::lsp::install::Provision::Go { .. }
+        ) && let Some(resolved) = resolve_path_only(
+            config,
+            is_on_path(&config.command),
+            &toolchain_fallback_dirs(),
+        ) {
             return Some(resolved);
         }
         return crate::lsp::install::resolve_managed(config, provision, log_skip);
@@ -7717,6 +7808,63 @@ fn resolve_config(config: &ServerConfig, log_skip: bool) -> Option<(ServerConfig
         ));
     }
     None
+}
+
+/// What to tell the user when `lang` is left with no language server (#930):
+/// every server it registers is missing from PATH and croft cannot install
+/// any of them, because it has no provision or `installer_missing` names
+/// the tool its install needs. `None` when the language registers no server,
+/// or one of them can still be installed (that install reports its own
+/// progress and failures).
+fn missing_servers_note(
+    lang: Language,
+    configs: &[ServerConfig],
+    installer_missing: impl Fn(&crate::lsp::install::Provision) -> Option<&'static str>,
+) -> Option<String> {
+    if configs.is_empty() {
+        return None;
+    }
+    let mut why = Vec::with_capacity(configs.len());
+    for config in configs {
+        match config.provision.as_ref().map(&installer_missing) {
+            None => why.push(format!("{} isn't on PATH", config.command)),
+            Some(Some(tool)) => why.push(format!(
+                "{} isn't on PATH, and installing it needs {tool}",
+                config.command
+            )),
+            Some(None) => return None,
+        }
+    }
+    let label = crate::highlight::lang_for_language_id(lang.lsp_id())
+        .map_or(lang.lsp_id(), |kind| {
+            crate::widgets::editor::language_label(Some(kind))
+        });
+    Some(format!(
+        "{label}: no language server, so no diagnostics or completion ({})",
+        why.join("; ")
+    ))
+}
+
+/// Show `note` in the status bar and OUTPUT › Server Provisioning the first
+/// time `lang` is found without a server this session; later files of that
+/// language, and other project roots, stay quiet.
+fn report_missing_servers_once(lang: Language, note: &str) {
+    static REPORTED: StdMutex<std::collections::BTreeSet<&'static str>> =
+        StdMutex::new(std::collections::BTreeSet::new());
+    let first = REPORTED
+        .lock()
+        .map(|mut seen| seen.insert(lang.lsp_id()))
+        .unwrap_or(false);
+    if !first {
+        return;
+    }
+    log_file::log(&format!("lsp[{}] {note}", lang.lsp_id()));
+    crate::output::push(
+        crate::output::CHANNEL_PROVISION,
+        crate::output::OutputLevel::Warn,
+        note,
+    );
+    crate::lsp::install::set_status(note);
 }
 
 pub(crate) fn is_on_path(cmd: &str) -> bool {
@@ -9272,6 +9420,105 @@ while True:
         assert!(
             resolve_config(&present, false).is_some(),
             "a server whose command is on PATH must resolve"
+        );
+    }
+
+    /// #930: a language whose only servers are missing says why, naming the
+    /// command and, for one croft could build, the tool it would need.
+    #[test]
+    fn a_language_with_no_installable_server_gets_a_note_naming_the_missing_command() {
+        use crate::lsp::install::Provision;
+        let nothing_missing = |_: &Provision| None;
+        assert_eq!(
+            missing_servers_note(
+                Language::LUA,
+                &[ServerConfig::lua_language_server()],
+                nothing_missing
+            )
+            .as_deref(),
+            Some(
+                "Lua: no language server, so no diagnostics or completion (lua-language-server isn't on PATH)"
+            )
+        );
+        assert_eq!(
+            missing_servers_note(Language::GO, &[ServerConfig::gopls()], |_: &Provision| {
+                Some("go")
+            })
+            .as_deref(),
+            Some(
+                "Go: no language server, so no diagnostics or completion (gopls isn't on PATH, and installing it needs go)"
+            )
+        );
+        // An install that can run reports its own progress, so no note: gopls
+        // with `go` present, or Python's ty beside a PATH-only basedpyright.
+        assert_eq!(
+            missing_servers_note(Language::GO, &[ServerConfig::gopls()], nothing_missing),
+            None
+        );
+        let python = [ServerConfig::ty(), ServerConfig::basedpyright()];
+        assert_eq!(
+            missing_servers_note(Language::PYTHON, &python, nothing_missing),
+            None
+        );
+        assert_eq!(
+            missing_servers_note(Language::LUA, &[], nothing_missing),
+            None
+        );
+    }
+
+    /// #930: opening a file whose language has no server on PATH used to be
+    /// silent apart from lsp.log. It is now said once in OUTPUT › Server
+    /// Provisioning, not again for another file or another project root.
+    #[test]
+    fn a_language_left_without_a_server_is_reported_once() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonicalize");
+        let lang = Language("issue930-no-server");
+        let mut registry = ServerRegistry::new();
+        registry.register(
+            lang,
+            ServerConfig {
+                name: "issue930-server",
+                command: "issue930-not-a-real-server".into(),
+                args: vec![],
+                language: lang,
+                initialization_options: None,
+                provision: None,
+            },
+        );
+        let (diag_tx, _diag_rx) = std_mpsc::channel();
+        let (prog_tx, _prog_rx) = std_mpsc::channel();
+        let mut state = WorkerState {
+            workspace_root: root.clone(),
+            extra_roots: Vec::new(),
+            registry,
+            clients: HashMap::new(),
+            docs: HashMap::new(),
+            capability_support: Arc::new(StdMutex::new(LangCapabilitySupport::default())),
+            semantic_refresh: Arc::new(AtomicBool::new(false)),
+            inlay_refresh: Arc::new(AtomicBool::new(false)),
+            diagnostic_refresh: Arc::new(AtomicBool::new(false)),
+            diagnostics_tx: diag_tx,
+            progress_tx: prog_tx,
+            restarts: ServerRestarts::default(),
+        };
+        let runtime = LspRuntime::new().expect("runtime");
+        let handle = runtime.handle().clone();
+        handle.block_on(state.ensure_clients(lang, &root));
+        handle.block_on(state.ensure_clients(lang, &root));
+        handle.block_on(state.ensure_clients(lang, &root.join("other")));
+        let notes: Vec<String> = crate::output::snapshot(crate::output::CHANNEL_PROVISION)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|l| l.text.contains("issue930-not-a-real-server"))
+            .map(|l| l.text)
+            .collect();
+        assert_eq!(
+            notes,
+            [
+                "issue930-no-server: no language server, so no diagnostics or completion (issue930-not-a-real-server isn't on PATH)"
+            ],
+            "the missing server must be reported exactly once"
         );
     }
 
@@ -11018,8 +11265,19 @@ while True:
         name: &'static str,
         log: &Path,
     ) -> WorkerState {
+        worker_with_rust_stub(python, root, name, log, FAKE_RUST_ANALYZER)
+    }
+
+    /// [`worker_with_rust_server`] with the stub `source` as the server.
+    fn worker_with_rust_stub(
+        python: &Path,
+        root: &Path,
+        name: &'static str,
+        log: &Path,
+        source: &str,
+    ) -> WorkerState {
         let script = root.join("fake_ra.py");
-        std::fs::write(&script, FAKE_RUST_ANALYZER).expect("write fake server");
+        std::fs::write(&script, source).expect("write fake server");
         let mut registry = ServerRegistry::new();
         registry.register(
             Language::RUST,
@@ -11142,6 +11400,97 @@ while True:
         ));
         let got = rx.recv_timeout(Duration::from_secs(5)).expect("an answer");
         assert!(got.outcome.is_err());
+    }
+
+    /// A stub server that, once initialized, registers a `**/*.rs` watcher
+    /// (#908). It logs each method with its params, and each reply croft
+    /// sends it as `reply <error>`.
+    const FAKE_LSP_WATCHING: &str = r#"
+import json, sys
+
+log = open(sys.argv[1], "a")
+
+def read_msg():
+    length = None
+    while line := sys.stdin.buffer.readline().strip():
+        if line.lower().startswith(b"content-length:"):
+            length = int(line.split(b":")[1])
+    return None if length is None else json.loads(sys.stdin.buffer.read(length))
+
+def send(msg):
+    body = json.dumps(msg).encode()
+    sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n%s" % (len(body), body))
+    sys.stdout.buffer.flush()
+
+while (msg := read_msg()) is not None:
+    method = msg.get("method")
+    if method is None:
+        log.write("reply " + json.dumps(msg.get("error")) + "\n")
+    else:
+        log.write(method + " " + json.dumps(msg.get("params")) + "\n")
+    log.flush()
+    if method == "initialized":
+        watchers = [{"globPattern": "**/*.rs"}]
+        registration = {"id": "rs", "method": "workspace/didChangeWatchedFiles",
+                        "registerOptions": {"watchers": watchers}}
+        send({"jsonrpc": "2.0", "id": "watch", "method": "client/registerCapability",
+              "params": {"registrations": [registration]}})
+    elif method and "id" in msg:
+        result = {"capabilities": {}} if method == "initialize" else None
+        send({"jsonrpc": "2.0", "id": msg["id"], "result": result})
+    if method == "exit":
+        break
+"#;
+
+    /// #908: a server that registered watchers hears about the files changed
+    /// on disk that they cover, a file that is gone as deleted, and nothing
+    /// about a document it has open, which reaches it through didChange.
+    #[cfg(unix)]
+    #[test]
+    fn disk_changes_reach_the_servers_watching_them() {
+        let Some(python) = python_for_stub_server() else {
+            eprintln!("SKIPPED: python3 not on PATH");
+            return;
+        };
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonicalize");
+        let [open, lib, gone, notes] =
+            ["main.rs", "lib.rs", "gone.rs", "notes.md"].map(|f| root.join(f));
+        for f in [&open, &lib, &notes] {
+            std::fs::write(f, "\n").expect("write file");
+        }
+        let log = root.join("methods.log");
+        let mut state =
+            worker_with_rust_stub(&python, &root, "rust-analyzer", &log, FAKE_LSP_WATCHING);
+        let runtime = LspRuntime::new().expect("runtime");
+        let handle = runtime.handle().clone();
+        handle.block_on(state.open_doc(open.clone(), String::from("\n")));
+        let sent = || std::fs::read_to_string(&log).unwrap_or_default();
+        crate::test_budget::await_spawned(
+            Duration::from_millis(500),
+            "croft to accept the watcher registration",
+            || sent().contains("reply null"),
+        );
+        let _in_runtime = handle.enter();
+        let changed =
+            [&open, &lib, &gone, &notes].map(|p| (p.clone(), lsp_types::FileChangeType::CHANGED));
+        state.did_change_watched_files(changed.to_vec());
+        let method = "workspace/didChangeWatchedFiles ";
+        crate::test_budget::await_spawned(
+            Duration::from_millis(500),
+            "the watched-files notification",
+            || sent().contains(method),
+        );
+        let log = sent();
+        let line = log.lines().find_map(|l| l.strip_prefix(method));
+        let uri = |p: &Path| Url::from_file_path(p).expect("uri").to_string();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(line.expect("sent")).expect("params"),
+            serde_json::json!({ "changes": [
+                { "uri": uri(&lib), "type": 2 },
+                { "uri": uri(&gone), "type": 3 },
+            ]})
+        );
     }
 
     /// A worker whose python and go servers are fake recorders that log
@@ -12045,6 +12394,18 @@ while True:
             save_notify_of(&Some(Sync::Kind(TextDocumentSyncKind::NONE))),
             SaveNotify::Never
         );
+    }
+
+    /// #908: servers such as ty register the files they want to hear about
+    /// only when the client declares it can take the registration.
+    #[test]
+    fn client_capabilities_declare_watched_files_registration() {
+        let watched = build_client_capabilities()
+            .workspace
+            .and_then(|w| w.did_change_watched_files)
+            .expect("workspace.didChangeWatchedFiles must be declared");
+        assert_eq!(watched.dynamic_registration, Some(true));
+        assert_eq!(watched.relative_pattern_support, Some(true));
     }
 
     /// #854: rust-analyzer advertises `save` only while the client declares
