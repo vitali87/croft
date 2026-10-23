@@ -411,14 +411,16 @@ The toggle is global and app-wide: it works from any pane and with no file open,
 | `f`/`t`/`F`/`T` `{char}`, `;` `,` | Find char on the line, repeat / repeat-reversed |
 | `{n}` prefix | Count for the next motion or operator (`3j`, `2dw`, `5G`) |
 | `x` | Delete `{count}` chars under the cursor |
-| `d` `y` `c` + motion / text object | Delete / yank / change over a motion (`dw`, `d$`, `dfx`) or text object (`diw`, `ciw`, `daw`) |
+| `d` `y` `c` + motion / text object | Delete / yank / change over a motion (`dw`, `d$`, `dfx`) or text object (`diw`, `ciw`, `daw`). As in Vim, `cw` on a word changes it up to its end and keeps the space after it |
 | `dd` `yy` `cc` | Linewise delete / yank / change |
 | `p` `P` | Paste after / before |
-| `u` | Undo |
+| `u` | Undo. A change and everything typed before its `Esc` (`cw`…, `ciw`…, `cc`…, `o`…, `i`…) undo as one step |
 | `Ctrl`+`r` | Redo |
 | `v` `V` | Charwise / linewise Visual; a motion extends, `d` `y` `c` operate |
 | `/` `?` then `Enter`, `n` `N` | Search forward / back, jump to next / previous match |
 | `:w` `:q` `:wq` `:x` `:q!` `:qa`, `:{n}` | Write, close tab, write-and-close, quit-all, or jump to line n. `:q`, `:wq` whose write did not land, and `:qa` ask about unsaved changes as `Cmd+W` and `Ctrl+q` do; `:q!` and `:qa!` discard them without asking |
+
+Not supported: `.` (repeat the last change) and `>>` / `<<` (indent). Pressing them says so in the status bar.
 
 When vim mode is on it supersedes the always-on `Cmd`+`d` `d` / `Cmd`+`g` `g` chords; turn it off to get those back.
 
