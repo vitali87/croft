@@ -436,8 +436,8 @@ pub struct Prefs {
     /// mean "highlighted".
     #[serde(default)]
     pub disable_log_highlight: bool,
-    /// Opt-out for the built-in secret redaction rules (#360): AWS keys,
-    /// `sk-`/`ghp_`/`xox` tokens, JWTs and bearer tokens are masked in
+    /// Opt-out for the built-in secret redaction rules (#360): the shapes
+    /// listed in [`crate::triggers::builtin_redactions`] are masked in
     /// terminal panes by default. Stored as the disable flag so the
     /// derived `Default` and an older config both mean "masked".
     #[serde(default)]

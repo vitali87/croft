@@ -55,8 +55,15 @@ pub struct CompletionItem {
     /// The item's documentation, Markdown or plain text as the server sent
     /// it, for the popup's details pane (#1527).
     pub documentation: Option<String>,
+    /// The item as the server listed it, `data` and all, when the server
+    /// resolves items lazily and the list left its imports out (#928):
+    /// vtsls sends an auto-import only from `completionItem/resolve`, which
+    /// the accept sends this back for.
+    pub resolve: Option<Arc<lsp_types::CompletionItem>>,
 }
 
+/// A completion reply. A `completionItem/resolve` reply is one too, its
+/// single item the resolved one (#928).
 #[derive(Debug)]
 pub struct CompletionResult {
     pub request_id: u64,
@@ -919,6 +926,11 @@ enum Cmd {
         character: u32,
         trigger: CompletionTrigger,
     },
+    ResolveCompletion {
+        request_id: u64,
+        path: PathBuf,
+        item: Arc<lsp_types::CompletionItem>,
+    },
     RequestSignatureHelp {
         request_id: u64,
         path: PathBuf,
@@ -1471,6 +1483,21 @@ impl LspManager {
         self.next_request_id += 1;
         let _ = self.cmd_tx.send(make(id));
         id
+    }
+
+    /// Ask the completion server for the rest of an item it listed (#928).
+    /// The reply comes through [`Self::drain_completion`] with this id, its
+    /// one item the resolved one, or none when the server failed.
+    pub fn request_completion_resolve(
+        &mut self,
+        path: PathBuf,
+        item: Arc<lsp_types::CompletionItem>,
+    ) -> u64 {
+        self.send_request(|request_id| Cmd::ResolveCompletion {
+            request_id,
+            path,
+            item,
+        })
     }
 
     pub fn drain_completion(&self) -> Option<CompletionResult> {
@@ -2708,6 +2735,15 @@ async fn worker_loop(
                     .request_completion(request_id, path, line, character, trigger, &tx.completion)
                     .await
             }
+            Cmd::ResolveCompletion {
+                request_id,
+                path,
+                item,
+            } => {
+                state
+                    .resolve_completion(request_id, path, item, &tx.completion)
+                    .await
+            }
             Cmd::RequestSignatureHelp {
                 request_id,
                 path,
@@ -3254,10 +3290,22 @@ impl WorkerState {
             // semantic-token request queued right behind it) block on the SUM of
             // ty + basedpyright + ruff init handshakes. Concurrent spawn bounds
             // the cold-root stall to the SLOWEST single handshake instead.
-            let resolved: Vec<(ServerConfig, Vec<PathBuf>)> = configs
-                .iter()
-                .filter_map(|config| resolve_config(config, first_attempt))
-                .collect();
+            let resolved: Vec<(ServerConfig, Vec<PathBuf>)> = futures::future::join_all(
+                configs
+                    .iter()
+                    .map(|config| resolve_for_root(config, root, first_attempt)),
+            )
+            .await
+            .into_iter()
+            .flatten()
+            .collect();
+            if first_attempt
+                && resolved.is_empty()
+                && let Some(note) =
+                    missing_servers_note(lang, &configs, crate::lsp::install::missing_installer)
+            {
+                report_missing_servers_once(lang, &note);
+            }
             let outcomes =
                 futures::future::join_all(resolved.into_iter().map(|(config, extra_path)| {
                     let caps = build_client_capabilities();
@@ -3812,16 +3860,22 @@ impl WorkerState {
             path.display()
         ));
         tokio::spawn(async move {
-            let mut client = client_arc.lock().await.requests();
+            let (mut client, resolves) = {
+                let client = client_arc.lock().await;
+                let options = client.capabilities().completion_provider.as_ref();
+                let resolves = options.and_then(|o| o.resolve_provider) == Some(true);
+                (client.requests(), resolves)
+            };
             let resp = client.completion(uri, line, character, trigger).await;
             drop(client);
+            let convert = |item| listed_item(item, resolves);
             let (is_incomplete, items): (Option<bool>, Vec<CompletionItem>) = match resp {
                 Ok(Some(CompletionResponse::Array(items))) => {
-                    (None, items.into_iter().map(into_item).collect())
+                    (None, items.into_iter().map(convert).collect())
                 }
                 Ok(Some(CompletionResponse::List(list))) => (
                     Some(list.is_incomplete),
-                    list.items.into_iter().map(into_item).collect(),
+                    list.items.into_iter().map(convert).collect(),
                 ),
                 Ok(None) => (None, Vec::new()),
                 Err(e) => {
@@ -3855,6 +3909,42 @@ impl WorkerState {
                 path: path_clone,
                 items,
                 is_incomplete: is_incomplete == Some(true),
+            });
+        });
+    }
+
+    /// Send `completionItem/resolve` to the server `request_completion`
+    /// asks, the one that listed the item (#928), and its answer back as a
+    /// one-item completion reply, with no item when the server failed.
+    async fn resolve_completion(
+        &mut self,
+        request_id: u64,
+        path: PathBuf,
+        item: Arc<lsp_types::CompletionItem>,
+        tx: &std_mpsc::Sender<CompletionResult>,
+    ) {
+        let Ok((server_name, client_arc)) =
+            self.pick_server(&path, |c| c.supports_completion).await
+        else {
+            return;
+        };
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            let mut client = client_arc.lock().await.requests();
+            let items = match client.completion_resolve((*item).clone()).await {
+                Ok(item) => vec![into_item(item)],
+                Err(e) => {
+                    log_file::log(&format!(
+                        "lsp[{server_name}] completion_resolve error: {e:#}"
+                    ));
+                    Vec::new()
+                }
+            };
+            let _ = tx.send(CompletionResult {
+                request_id,
+                path,
+                items,
+                is_incomplete: false,
             });
         });
     }
@@ -6051,6 +6141,19 @@ fn into_item(item: lsp_types::CompletionItem) -> CompletionItem {
         is_snippet,
         text_edit,
         additional_edits,
+        resolve: None,
+    }
+}
+
+/// [`into_item`] for an item of a list, kept whole for
+/// `completionItem/resolve` when its server `resolves` items and the list
+/// left its imports out (#928).
+fn listed_item(item: lsp_types::CompletionItem, resolves: bool) -> CompletionItem {
+    let imports = item.additional_text_edits.as_ref();
+    let resolve = (resolves && imports.is_none_or(Vec::is_empty)).then(|| Arc::new(item.clone()));
+    CompletionItem {
+        resolve,
+        ..into_item(item)
     }
 }
 
@@ -7457,6 +7560,12 @@ fn build_client_capabilities() -> ClientCapabilities {
                     preselect_support: Some(true),
                     insert_replace_support: Some(false),
                     label_details_support: Some(true),
+                    // Auto-imports may come from resolve (#928). Not docs:
+                    // rust-analyzer would then leave them out of the list,
+                    // which the details pane shows.
+                    resolve_support: Some(lsp_types::CompletionItemCapabilityResolveSupport {
+                        properties: vec![String::from("additionalTextEdits")],
+                    }),
                     ..Default::default()
                 }),
                 completion_item_kind: Some(CompletionItemKindCapability {
@@ -7807,16 +7916,20 @@ fn resolve_config(config: &ServerConfig, log_skip: bool) -> Option<(ServerConfig
         // for rust-analyzer `resolve_path_only` prepends that dir to the child
         // PATH so the server can find cargo/rustc under a stripped GUI launch.
         // Only when no real binary exists anywhere do we fall back to a managed
-        // download / Termux `pkg` install. npm/uv servers keep their own
-        // managed-first (vtsls) or PATH-first (ty/ruff) ordering inside
-        // `resolve_managed`, so this preference is scoped to the Binary backend.
-        if matches!(provision, crate::lsp::install::Provision::Binary { .. })
-            && let Some(resolved) = resolve_path_only(
-                config,
-                is_on_path(&config.command),
-                &toolchain_fallback_dirs(),
-            )
-        {
+        // download / Termux `pkg` install (`resolve_for_root` also does when the
+        // binary is a rustup proxy with no component behind it). npm/uv servers
+        // keep their own managed-first (vtsls) or PATH-first (ty/ruff) ordering
+        // inside `resolve_managed`, so this preference is scoped to the Binary
+        // and Go backends (a gopls in ~/go/bin is the user's own, #930).
+        if matches!(
+            provision,
+            crate::lsp::install::Provision::Binary { .. }
+                | crate::lsp::install::Provision::Go { .. }
+        ) && let Some(resolved) = resolve_path_only(
+            config,
+            is_on_path(&config.command),
+            &toolchain_fallback_dirs(),
+        ) {
             return Some(resolved);
         }
         return crate::lsp::install::resolve_managed(config, provision, log_skip);
@@ -7835,6 +7948,63 @@ fn resolve_config(config: &ServerConfig, log_skip: bool) -> Option<(ServerConfig
         ));
     }
     None
+}
+
+/// What to tell the user when `lang` is left with no language server (#930):
+/// every server it registers is missing from PATH and croft cannot install
+/// any of them, because it has no provision or `installer_missing` names
+/// the tool its install needs. `None` when the language registers no server,
+/// or one of them can still be installed (that install reports its own
+/// progress and failures).
+fn missing_servers_note(
+    lang: Language,
+    configs: &[ServerConfig],
+    installer_missing: impl Fn(&crate::lsp::install::Provision) -> Option<&'static str>,
+) -> Option<String> {
+    if configs.is_empty() {
+        return None;
+    }
+    let mut why = Vec::with_capacity(configs.len());
+    for config in configs {
+        match config.provision.as_ref().map(&installer_missing) {
+            None => why.push(format!("{} isn't on PATH", config.command)),
+            Some(Some(tool)) => why.push(format!(
+                "{} isn't on PATH, and installing it needs {tool}",
+                config.command
+            )),
+            Some(None) => return None,
+        }
+    }
+    let label = crate::highlight::lang_for_language_id(lang.lsp_id())
+        .map_or(lang.lsp_id(), |kind| {
+            crate::widgets::editor::language_label(Some(kind))
+        });
+    Some(format!(
+        "{label}: no language server, so no diagnostics or completion ({})",
+        why.join("; ")
+    ))
+}
+
+/// Show `note` in the status bar and OUTPUT › Server Provisioning the first
+/// time `lang` is found without a server this session; later files of that
+/// language, and other project roots, stay quiet.
+fn report_missing_servers_once(lang: Language, note: &str) {
+    static REPORTED: StdMutex<std::collections::BTreeSet<&'static str>> =
+        StdMutex::new(std::collections::BTreeSet::new());
+    let first = REPORTED
+        .lock()
+        .map(|mut seen| seen.insert(lang.lsp_id()))
+        .unwrap_or(false);
+    if !first {
+        return;
+    }
+    log_file::log(&format!("lsp[{}] {note}", lang.lsp_id()));
+    crate::output::push(
+        crate::output::CHANNEL_PROVISION,
+        crate::output::OutputLevel::Warn,
+        note,
+    );
+    crate::lsp::install::set_status(note);
 }
 
 pub(crate) fn is_on_path(cmd: &str) -> bool {
@@ -7909,6 +8079,175 @@ fn resolve_path_only(
     let mut resolved = config.clone();
     resolved.command = abs.to_string_lossy().into_owned();
     Some((resolved, extra))
+}
+
+/// [`resolve_config`] for the servers of the project at `root` (#927). A
+/// native server found on PATH or in `~/.cargo/bin` that is a rustup proxy is
+/// only a server when the toolchain `root` selects has the component behind
+/// it. rustup puts a `rust-analyzer` proxy there for every toolchain, but its
+/// default profile installs no `rust-analyzer`, and that proxy only prints
+/// "Unknown binary" and exits, so croft's managed copy serves instead.
+async fn resolve_for_root(
+    config: &ServerConfig,
+    root: &Path,
+    log_skip: bool,
+) -> Option<(ServerConfig, Vec<PathBuf>)> {
+    let found = resolve_config(config, log_skip)?;
+    let Some(provision @ crate::lsp::install::Provision::Binary { bin, .. }) = &config.provision
+    else {
+        return Some(found);
+    };
+    let Some(rustup) = command_path(&found.0.command).and_then(|p| rustup_behind(&p)) else {
+        return Some(found);
+    };
+    let key = (config.name, root.to_path_buf());
+    let known = RUSTUP_VERDICTS
+        .lock()
+        .ok()
+        .and_then(|verdicts| verdicts.get(&key).cloned())
+        .filter(|(asked, _)| asked.elapsed() < RUSTUP_RECHECK);
+    let lacks = match known {
+        Some((_, lacks)) => lacks,
+        None => {
+            let lacks = rustup_lacks(&rustup, bin, root).await;
+            if let Ok(mut verdicts) = RUSTUP_VERDICTS.lock() {
+                verdicts.insert(key, (std::time::Instant::now(), lacks.clone()));
+            }
+            lacks
+        }
+    };
+    let Some(RustupLack { why, fix }) = lacks else {
+        return Some(found);
+    };
+    if log_skip {
+        let msg = format!(
+            "{why} (at {}); falling back to croft's managed copy",
+            root.display()
+        );
+        log_file::log(&format!("lsp[{}] {msg}", config.name));
+        crate::output::push(
+            crate::output::CHANNEL_PROVISION,
+            crate::output::OutputLevel::Info,
+            &format!("{}: {msg}", config.name),
+        );
+    }
+    crate::lsp::install::resolve_managed_instead(config, provision, &why, &fix)
+}
+
+/// What [`rustup_lacks`] answered per (server, project root), and when, so
+/// the re-probe each request makes while croft's copy downloads does not ask
+/// rustup again. Each verdict is asked again after [`RUSTUP_RECHECK`]: `None`
+/// also stands for a rustup that could not say in time, and a server that
+/// runs is never re-probed, so only a question still open is asked again.
+static RUSTUP_VERDICTS: StdMutex<RustupVerdicts> = StdMutex::new(std::collections::BTreeMap::new());
+
+/// [`RUSTUP_VERDICTS`]' map: (server, project root) to when rustup was
+/// asked and what it said.
+type RustupVerdicts =
+    std::collections::BTreeMap<(&'static str, PathBuf), (std::time::Instant, Option<RustupLack>)>;
+
+/// How long a verdict holds before rustup is asked again: the status line
+/// names `rustup component add`, and once the user has run it, rustup's own
+/// server takes over without a restart (#927); a rustup too slow to answer
+/// once is asked again rather than trusted for good.
+const RUSTUP_RECHECK: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Why a rustup proxy cannot start its server for a project (#927), and the
+/// command that mends it for the toolchain that project selects.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RustupLack {
+    why: String,
+    fix: String,
+}
+
+/// How long rustup gets to answer before croft stops asking and keeps the
+/// proxy, as it did before it asked.
+const RUSTUP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// The file a resolved server `command` runs: itself when absolute, else
+/// the first executable of that name on PATH.
+fn command_path(command: &str) -> Option<PathBuf> {
+    let path = Path::new(command);
+    if path.is_absolute() {
+        return Some(path.to_path_buf());
+    }
+    let dirs: Vec<PathBuf> = std::env::split_paths(&std::env::var_os("PATH")?).collect();
+    find_executable_in(command, &dirs)
+}
+
+/// The `rustup` that `candidate` is a proxy for, or `None` when it is a
+/// program of its own. rustup installs its proxies as hard links to itself,
+/// or symlinks where it cannot, so a proxy is the same file as the `rustup`
+/// beside it, or beside wherever its links lead.
+fn rustup_behind(candidate: &Path) -> Option<PathBuf> {
+    let id = file_id(candidate)?;
+    let rustup = format!("rustup{}", std::env::consts::EXE_SUFFIX);
+    std::iter::once(candidate.to_path_buf())
+        .chain(std::fs::canonicalize(candidate).ok())
+        .map(|p| p.with_file_name(&rustup))
+        .find(|p| file_id(p) == Some(id))
+}
+
+/// What identifies the file `path` leads to, links followed.
+#[cfg(unix)]
+fn file_id(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
+}
+#[cfg(not(unix))]
+fn file_id(path: &Path) -> Option<PathBuf> {
+    std::fs::canonicalize(path).ok()
+}
+
+/// Why the proxy `rustup` puts in front of `bin` cannot start it for the
+/// project at `root`, and the `rustup component add` that mends it, named
+/// with `--toolchain` so it holds from any directory; `None` when the proxy
+/// can start it or rustup cannot say. Asked from
+/// `root`, since that picks the toolchain (`rust-toolchain.toml`, a directory
+/// override). `RUSTUP_AUTO_INSTALL=0` stops the question from installing a
+/// toolchain. A toolchain that is not installed at all is left to the proxy,
+/// which installs it as before, and so is a rustup too old to honour that
+/// variable that is still busy at [`RUSTUP_DEADLINE`].
+async fn rustup_lacks(rustup: &Path, bin: &str, root: &Path) -> Option<RustupLack> {
+    if rustup_says(rustup, root, &["which", bin])
+        .await?
+        .status
+        .success()
+    {
+        return None;
+    }
+    let active = rustup_says(rustup, root, &["show", "active-toolchain"]).await?;
+    if !active.status.success() {
+        return None;
+    }
+    let toolchain = String::from_utf8_lossy(&active.stdout)
+        .split_whitespace()
+        .next()?
+        .to_owned();
+    // Named the way users name it: `stable`, not `stable-<host triple>`.
+    let triple = format!("-{}-", std::env::consts::ARCH);
+    let channel = toolchain
+        .split_once(&triple)
+        .map_or(&*toolchain, |(c, _)| c);
+    Some(RustupLack {
+        why: format!("rustup's '{channel}' toolchain has no {bin}"),
+        fix: format!("rustup component add {bin} --toolchain {channel}"),
+    })
+}
+
+/// `rustup` run with `args` from `root`, or `None` when it could not be run
+/// or did not finish within [`RUSTUP_DEADLINE`] (it is killed then).
+async fn rustup_says(rustup: &Path, root: &Path, args: &[&str]) -> Option<std::process::Output> {
+    let run = tokio::process::Command::new(rustup)
+        .args(args)
+        .current_dir(root)
+        .env("RUSTUP_AUTO_INSTALL", "0")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .output();
+    tokio::time::timeout(RUSTUP_DEADLINE, run).await.ok()?.ok()
 }
 
 #[cfg(test)]
@@ -8049,6 +8388,33 @@ mod tests {
         let ours = into_item(item);
         assert_eq!(ours.documentation, None);
         assert_eq!(ours.detail, None);
+    }
+
+    /// #928: an item from a server that resolves lazily is kept whole,
+    /// `data` and all, to send back on accept, and croft lets servers defer
+    /// imports to that resolve. An item that already carries its imports,
+    /// or one from a server that does not resolve, needs no round trip.
+    #[test]
+    fn a_lazily_resolved_completion_item_is_kept_for_resolve() {
+        let lazy = serde_json::json!({ "label": "total", "data": { "entryNames": ["total"] } });
+        let item = serde_json::from_value(lazy.clone()).unwrap();
+        let kept = listed_item(item, true).resolve.expect("kept for resolve");
+        assert_eq!(serde_json::to_value(&*kept).unwrap(), lazy);
+        let item = serde_json::from_value(lazy).unwrap();
+        assert!(into_item(item).resolve.is_none());
+        let at = serde_json::json!({ "line": 1, "character": 0 });
+        let edit = serde_json::json!({ "range": { "start": at, "end": at }, "newText": "x" });
+        let eager = serde_json::json!({ "label": "Session", "additionalTextEdits": [edit] });
+        let eager = serde_json::from_value(eager).unwrap();
+        assert!(listed_item(eager, true).resolve.is_none());
+        let resolvable = build_client_capabilities()
+            .text_document
+            .and_then(|td| td.completion)
+            .and_then(|c| c.completion_item)
+            .and_then(|i| i.resolve_support)
+            .expect("completionItem.resolveSupport is declared")
+            .properties;
+        assert_eq!(resolvable, ["additionalTextEdits"]);
     }
 
     #[test]
@@ -9394,6 +9760,105 @@ while True:
         );
     }
 
+    /// #930: a language whose only servers are missing says why, naming the
+    /// command and, for one croft could build, the tool it would need.
+    #[test]
+    fn a_language_with_no_installable_server_gets_a_note_naming_the_missing_command() {
+        use crate::lsp::install::Provision;
+        let nothing_missing = |_: &Provision| None;
+        assert_eq!(
+            missing_servers_note(
+                Language::LUA,
+                &[ServerConfig::lua_language_server()],
+                nothing_missing
+            )
+            .as_deref(),
+            Some(
+                "Lua: no language server, so no diagnostics or completion (lua-language-server isn't on PATH)"
+            )
+        );
+        assert_eq!(
+            missing_servers_note(Language::GO, &[ServerConfig::gopls()], |_: &Provision| {
+                Some("go")
+            })
+            .as_deref(),
+            Some(
+                "Go: no language server, so no diagnostics or completion (gopls isn't on PATH, and installing it needs go)"
+            )
+        );
+        // An install that can run reports its own progress, so no note: gopls
+        // with `go` present, or Python's ty beside a PATH-only basedpyright.
+        assert_eq!(
+            missing_servers_note(Language::GO, &[ServerConfig::gopls()], nothing_missing),
+            None
+        );
+        let python = [ServerConfig::ty(), ServerConfig::basedpyright()];
+        assert_eq!(
+            missing_servers_note(Language::PYTHON, &python, nothing_missing),
+            None
+        );
+        assert_eq!(
+            missing_servers_note(Language::LUA, &[], nothing_missing),
+            None
+        );
+    }
+
+    /// #930: opening a file whose language has no server on PATH used to be
+    /// silent apart from lsp.log. It is now said once in OUTPUT › Server
+    /// Provisioning, not again for another file or another project root.
+    #[test]
+    fn a_language_left_without_a_server_is_reported_once() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonicalize");
+        let lang = Language("issue930-no-server");
+        let mut registry = ServerRegistry::new();
+        registry.register(
+            lang,
+            ServerConfig {
+                name: "issue930-server",
+                command: "issue930-not-a-real-server".into(),
+                args: vec![],
+                language: lang,
+                initialization_options: None,
+                provision: None,
+            },
+        );
+        let (diag_tx, _diag_rx) = std_mpsc::channel();
+        let (prog_tx, _prog_rx) = std_mpsc::channel();
+        let mut state = WorkerState {
+            workspace_root: root.clone(),
+            extra_roots: Vec::new(),
+            registry,
+            clients: HashMap::new(),
+            docs: HashMap::new(),
+            capability_support: Arc::new(StdMutex::new(LangCapabilitySupport::default())),
+            semantic_refresh: Arc::new(AtomicBool::new(false)),
+            inlay_refresh: Arc::new(AtomicBool::new(false)),
+            diagnostic_refresh: Arc::new(AtomicBool::new(false)),
+            diagnostics_tx: diag_tx,
+            progress_tx: prog_tx,
+            restarts: ServerRestarts::default(),
+        };
+        let runtime = LspRuntime::new().expect("runtime");
+        let handle = runtime.handle().clone();
+        handle.block_on(state.ensure_clients(lang, &root));
+        handle.block_on(state.ensure_clients(lang, &root));
+        handle.block_on(state.ensure_clients(lang, &root.join("other")));
+        let notes: Vec<String> = crate::output::snapshot(crate::output::CHANNEL_PROVISION)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|l| l.text.contains("issue930-not-a-real-server"))
+            .map(|l| l.text)
+            .collect();
+        assert_eq!(
+            notes,
+            [
+                "issue930-no-server: no language server, so no diagnostics or completion (issue930-not-a-real-server isn't on PATH)"
+            ],
+            "the missing server must be reported exactly once"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn resolve_path_only_pins_a_fallback_dir_binary_to_its_absolute_path() {
@@ -9430,6 +9895,182 @@ while True:
         assert!(
             resolve_path_only(&cfg, false, &[]).is_none(),
             "a server missing everywhere must be skipped"
+        );
+    }
+
+    /// A stand-in rustup in `dir/bin` with a `rust-analyzer` proxy linked to
+    /// it, returned as (rustup, proxy). Like the real one, it finds
+    /// `rust-analyzer` only for a project whose `rust-toolchain.toml` pins a
+    /// toolchain carrying it, names `stable` the active toolchain elsewhere,
+    /// and cannot name one where the pinned toolchain is not installed.
+    #[cfg(unix)]
+    fn fake_rustup(dir: &Path) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let rustup = bin.join("rustup");
+        let script = r#"#!/bin/sh
+case "$1" in
+which)
+  [ "$RUSTUP_AUTO_INSTALL" = 0 ] || touch installed-a-toolchain
+  if [ -f rust-toolchain.toml ]; then echo "$PWD/$2"; exit 0; fi
+  echo "error: not a file" >&2
+  exit 1 ;;
+show)
+  [ -f not-installed ] && exit 1
+  echo "stable-ARCH-unknown-linux-gnu (default)" ;;
+esac
+"#;
+        std::fs::write(&rustup, script.replace("ARCH", std::env::consts::ARCH)).unwrap();
+        std::fs::set_permissions(&rustup, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let proxy = bin.join("rust-analyzer");
+        std::os::unix::fs::symlink("rustup", &proxy).unwrap();
+        // Wait out "Text file busy" once: a test forking while the script
+        // was open for writing holds it until that child execs.
+        crate::review_ops::output_retrying_busy(std::process::Command::new(&rustup).arg("-V"))
+            .expect("the stand-in rustup runs");
+        (rustup, proxy)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_rustup_proxy_is_told_apart_from_a_program_of_its_own() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (rustup, proxy) = fake_rustup(tmp.path());
+        let hard = tmp.path().join("bin/cargo-fmt");
+        std::fs::hard_link(&rustup, &hard).unwrap();
+        let elsewhere = tmp.path().join("rust-analyzer");
+        std::os::unix::fs::symlink(&proxy, &elsewhere).unwrap();
+        for (link, how) in [
+            (proxy, "symlink"),
+            (hard, "hard link"),
+            (elsewhere, "link to a proxy"),
+        ] {
+            let found =
+                rustup_behind(&link).unwrap_or_else(|| panic!("a {how} to rustup is a proxy"));
+            assert_eq!(
+                (found.file_name(), file_id(&found)),
+                (rustup.file_name(), file_id(&rustup))
+            );
+        }
+        let own = tmp.path().join("bin/clangd");
+        std::fs::copy(&rustup, &own).unwrap();
+        assert_eq!(
+            rustup_behind(&own),
+            None,
+            "a binary of its own is never questioned"
+        );
+    }
+
+    /// #927: rustup has a `rust-analyzer` proxy for every toolchain, so
+    /// whether it can start one is a question about the toolchain the project
+    /// selects, asked from its root. Where it cannot, croft must not spawn it.
+    #[cfg(unix)]
+    #[test]
+    fn a_rustup_proxy_without_the_component_is_not_the_server_croft_starts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (rustup, proxy) = fake_rustup(tmp.path());
+        let project = |name: &str, file: Option<&str>| {
+            let dir = tmp.path().join(name);
+            std::fs::create_dir(&dir).unwrap();
+            if let Some(file) = file {
+                std::fs::write(dir.join(file), "").unwrap();
+            }
+            dir
+        };
+        let default = project("default", None);
+        let pinned = project("pinned", Some("rust-toolchain.toml"));
+        let uninstalled = project("uninstalled", Some("not-installed"));
+        let name = "croft-test-927-rust-analyzer";
+        let config = ServerConfig {
+            name,
+            command: proxy.to_string_lossy().into_owned(),
+            args: vec![],
+            language: Language::RUST,
+            initialization_options: None,
+            // No download for any platform, so croft's copy never lands here.
+            provision: Some(crate::lsp::install::Provision::Binary {
+                targets: &[],
+                bin: "rust-analyzer",
+                archive: crate::lsp::install::ArchiveKind::Gz,
+                bin_path: None,
+                termux_pkg: None,
+                sha256: &[],
+            }),
+        };
+        let rt = stub_runtime();
+        let kept = rt.block_on(resolve_for_root(&config, &pinned, false));
+        assert_eq!(
+            kept.map(|(c, _)| c.command),
+            Some(config.command.clone()),
+            "a toolchain that has rust-analyzer keeps rustup's proxy, matching the user's compiler"
+        );
+        assert!(
+            rt.block_on(resolve_for_root(&config, &default, false))
+                .is_none(),
+            "a proxy that can only print 'Unknown binary' must give way to croft's copy"
+        );
+        assert_eq!(
+            crate::lsp::install::failure_status(name, "download failed".into()),
+            "download failed; run: rustup component add rust-analyzer --toolchain stable",
+            "if croft's copy cannot be had either, the status line says how to get rustup's, \
+             for the toolchain the project selects whatever directory it is typed in"
+        );
+        assert_eq!(
+            rt.block_on(rustup_lacks(&rustup, "rust-analyzer", &default)),
+            Some(RustupLack {
+                why: String::from("rustup's 'stable' toolchain has no rust-analyzer"),
+                fix: String::from("rustup component add rust-analyzer --toolchain stable"),
+            }),
+        );
+        // Ages a verdict past its recheck, as 30 s would.
+        let backdate = |dir: &Path| {
+            if let Ok(mut verdicts) = RUSTUP_VERDICTS.lock()
+                && let Some((asked, _)) = verdicts.get_mut(&(name, dir.to_path_buf()))
+                && let Some(due) = asked.checked_sub(RUSTUP_RECHECK)
+            {
+                *asked = due;
+            }
+        };
+        // The user runs that command. A fresh verdict still holds; once it is
+        // due a recheck, rustup's own server is the one croft starts, with no
+        // restart.
+        std::fs::write(default.join("rust-toolchain.toml"), "").unwrap();
+        assert!(
+            rt.block_on(resolve_for_root(&config, &default, false))
+                .is_none()
+        );
+        backdate(&default);
+        assert_eq!(
+            rt.block_on(resolve_for_root(&config, &default, false))
+                .map(|(c, _)| c.command),
+            Some(config.command.clone()),
+            "the component added since is found when the verdict is asked again"
+        );
+        assert_eq!(
+            rt.block_on(rustup_lacks(&rustup, "rust-analyzer", &uninstalled)),
+            None,
+            "a toolchain that is not installed yet is the proxy's to install"
+        );
+        // A rustup that could not say (here the toolchain was not installed
+        // yet) keeps the proxy, and is asked again too: the toolchain it
+        // installed has no rust-analyzer.
+        assert!(
+            rt.block_on(resolve_for_root(&config, &uninstalled, false))
+                .is_some()
+        );
+        std::fs::remove_file(uninstalled.join("not-installed")).unwrap();
+        backdate(&uninstalled);
+        assert!(
+            rt.block_on(resolve_for_root(&config, &uninstalled, false))
+                .is_none(),
+            "an open question is asked again, and the proxy gives way"
+        );
+        assert!(
+            [default, pinned, uninstalled]
+                .iter()
+                .all(|dir| !dir.join("installed-a-toolchain").exists()),
+            "asking must never install a toolchain"
         );
     }
 
