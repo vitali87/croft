@@ -74,6 +74,18 @@ pub struct CompletionResult {
     pub is_incomplete: bool,
 }
 
+/// Why a completion is asked for, sent as the request's `context`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionTrigger {
+    /// Ctrl+Space, or a word begun with quick suggestions on (#929).
+    Invoked,
+    /// A character the server lists in `triggerCharacters` was typed
+    /// (#929): TypeScript's `"` and `/` in an import path, `.` for members.
+    Character(char),
+    /// Re-asking because the last list was incomplete (#1529).
+    Incomplete,
+}
+
 /// The answer to one of rust-analyzer's own requests (#1626), raw; `Err`
 /// says why there is none (no rust-analyzer for the file, or its error).
 #[derive(Debug)]
@@ -912,8 +924,7 @@ enum Cmd {
         path: PathBuf,
         line: u32,
         character: u32,
-        /// Re-asking because the last list was incomplete (#1529).
-        incomplete: bool,
+        trigger: CompletionTrigger,
     },
     ResolveCompletion {
         request_id: u64,
@@ -1097,6 +1108,9 @@ struct LangCapabilitySupport {
     /// Concatenated on-type trigger characters per language (#254);
     /// a missing entry means "not probed yet".
     on_type_triggers: HashMap<Language, String>,
+    /// The `triggerCharacters` of each language's completion server (#929);
+    /// no entry while no running server for the language completes.
+    completion_triggers: HashMap<Language, String>,
     /// The servers reporting on each open document, by name (#851): the
     /// built-in Markdown lint stands down for a file only while rumdl
     /// reports on it. A document the app never opened here (one shown only
@@ -1443,35 +1457,22 @@ impl LspManager {
         let _ = self.cmd_tx.send(Cmd::RestartServersFor { path });
     }
 
-    pub fn request_completion(&mut self, path: PathBuf, line: u32, character: u32) -> u64 {
-        self.send_completion_request(path, line, character, false)
-    }
-
-    /// Ask again as the user types into a list the server marked
-    /// incomplete, with `triggerKind: TriggerForIncompleteCompletions`
-    /// (#1529).
-    pub fn request_completion_for_incomplete(
+    /// Ask for completions at a UTF-16 position, saying why: a re-ask as
+    /// the user types into a list the server marked incomplete (#1529), or
+    /// a typed trigger character (#929).
+    pub fn request_completion(
         &mut self,
         path: PathBuf,
         line: u32,
         character: u32,
-    ) -> u64 {
-        self.send_completion_request(path, line, character, true)
-    }
-
-    fn send_completion_request(
-        &mut self,
-        path: PathBuf,
-        line: u32,
-        character: u32,
-        incomplete: bool,
+        trigger: CompletionTrigger,
     ) -> u64 {
         self.send_request(|request_id| Cmd::RequestCompletion {
             request_id,
             path,
             line,
             character,
-            incomplete,
+            trigger,
         })
     }
 
@@ -2180,6 +2181,26 @@ impl LspManager {
             .cloned()
     }
 
+    /// The characters that ask for completions as they are typed in
+    /// `path` (#929): its completion server's `triggerCharacters`, empty
+    /// when it lists none. `None` while no running server completes the
+    /// file's language, where nothing typed asks.
+    pub fn completion_triggers(&self, path: &Path) -> Option<String> {
+        let lang = path_to_language(path)?;
+        let support = self.capability_support.lock().ok()?;
+        support.completion_triggers.get(&lang).cloned()
+    }
+
+    /// Test hook: `lang`'s completion server lists `triggers`, unstarted.
+    #[cfg(test)]
+    pub fn set_completion_triggers_for_test(&self, lang: crate::lsp::Language, triggers: &str) {
+        if let Ok(mut support) = self.capability_support.lock() {
+            support
+                .completion_triggers
+                .insert(lang, triggers.to_string());
+        }
+    }
+
     /// Format only a UTF-16 span ("Format Selection", #254). Same reply
     /// channel and unsupported contract as whole-document formatting;
     /// the app tells the two apart by the returned id.
@@ -2295,6 +2316,8 @@ struct ManagedClient {
     name: String,
     client: Arc<TokioMutex<LspClient>>,
     supports_completion: bool,
+    /// Its completion `triggerCharacters` (#929), as one string.
+    completion_triggers: String,
     supports_signature_help: bool,
     /// Whether the server answers `workspace/diagnostic` (#533), read from
     /// the capability's inner `workspaceDiagnostics` flag rather than the
@@ -2706,17 +2729,10 @@ async fn worker_loop(
                 path,
                 line,
                 character,
-                incomplete,
+                trigger,
             } => {
                 state
-                    .request_completion(
-                        request_id,
-                        path,
-                        line,
-                        character,
-                        incomplete,
-                        &tx.completion,
-                    )
+                    .request_completion(request_id, path, line, character, trigger, &tx.completion)
                     .await
             }
             Cmd::ResolveCompletion {
@@ -3327,6 +3343,7 @@ impl WorkerState {
                         // vtsls (which advertises `declarationProvider: false`)
                         // and get a -32601 "Unhandled method" back.
                         let supports = caps.completion_provider.is_some();
+                        let completion_triggers = completion_triggers_of(caps);
                         let supports_signature_help =
                             signature_help_supported(&caps.signature_help_provider);
                         let supports_workspace_diagnostics =
@@ -3416,6 +3433,7 @@ impl WorkerState {
                             name: config.name.to_string(),
                             client: Arc::new(TokioMutex::new(client)),
                             supports_completion: supports,
+                            completion_triggers,
                             supports_signature_help,
                             supports_workspace_diagnostics,
                             diagnostic_identifier,
@@ -3498,6 +3516,14 @@ impl WorkerState {
                 } else {
                     support.on_type_triggers.insert(lang, triggers);
                 }
+                // The server `request_completion` picks: the first that
+                // completes.
+                match spawned.iter().find(|c| c.supports_completion) {
+                    Some(c) => support
+                        .completion_triggers
+                        .insert(lang, c.completion_triggers.clone()),
+                    None => support.completion_triggers.remove(&lang),
+                };
                 support.code_action.insert(lang, supports_code_action);
                 support.call_hierarchy.insert(lang, supports_call_hierarchy);
                 support
@@ -3793,7 +3819,7 @@ impl WorkerState {
         path: PathBuf,
         line: u32,
         character: u32,
-        incomplete: bool,
+        trigger: CompletionTrigger,
         tx: &std_mpsc::Sender<CompletionResult>,
     ) {
         let Some(doc) = self.docs.get(&path) else {
@@ -3830,7 +3856,7 @@ impl WorkerState {
         let tx = tx.clone();
         let path_clone = path.clone();
         log_file::log(&format!(
-            "completion request id={request_id} server={server_name} path={} line={line} char={character} incomplete={incomplete}",
+            "completion request id={request_id} server={server_name} path={} line={line} char={character} trigger={trigger:?}",
             path.display()
         ));
         tokio::spawn(async move {
@@ -3840,7 +3866,7 @@ impl WorkerState {
                 let resolves = options.and_then(|o| o.resolve_provider) == Some(true);
                 (client.requests(), resolves)
             };
-            let resp = client.completion(uri, line, character, incomplete).await;
+            let resp = client.completion(uri, line, character, trigger).await;
             drop(client);
             let convert = |item| listed_item(item, resolves);
             let (is_incomplete, items): (Option<bool>, Vec<CompletionItem>) = match resp {
@@ -6406,6 +6432,17 @@ fn signature_help_supported(cap: &Option<lsp_types::SignatureHelpOptions>) -> bo
     cap.is_some()
 }
 
+/// The completion `triggerCharacters` a server lists (#929), as one string.
+/// The protocol allows a longer trigger, but one key types one character,
+/// so `->` is left out rather than read as `-` and `>`.
+fn completion_triggers_of(caps: &ServerCapabilities) -> String {
+    let options = caps.completion_provider.as_ref();
+    let triggers = options.and_then(|o| o.trigger_characters.as_deref());
+    let single = |t: &&String| t.chars().count() == 1;
+    let triggers = triggers.unwrap_or_default().iter().filter(single);
+    triggers.map(String::as_str).collect()
+}
+
 /// Whether a server asked for `textDocument/didSave`, and with the saved
 /// text or without it (#854).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8782,6 +8819,7 @@ while True:
             prepare_rename_stalled: Arc::new(AtomicBool::new(false)),
             document_pull_generations: Arc::new(StdMutex::new(HashMap::new())),
             supports_completion: false,
+            completion_triggers: String::new(),
             supports_signature_help: false,
             supports_hover: false,
             supports_definition: false,
@@ -10662,7 +10700,7 @@ esac
         manager.open_doc(file.clone(), text);
         std::thread::sleep(Duration::from_millis(2500));
 
-        let id = manager.request_completion(file.clone(), 2, 7);
+        let id = manager.request_completion(file.clone(), 2, 7, CompletionTrigger::Invoked);
         // 30s: basedpyright is a Node.js process that initialises slowly
         // under heavy parallel `cargo test` load (the suite spawns ~900
         // tests, many of which open PTYs). 10s was reliable in isolation
@@ -13292,13 +13330,15 @@ while True:
     method = msg.get("method", "")
     if "id" in msg:
         if method == "initialize":
-            send({"jsonrpc": "2.0", "id": msg["id"],
-                  "result": {"capabilities": {"completionProvider": {}}}})
+            send({"jsonrpc": "2.0", "id": msg["id"], "result": {"capabilities": {
+                "completionProvider": {"triggerCharacters": ["/", "->", "@"]}}}})
         elif method == "textDocument/completion":
-            kind = msg["params"].get("context", {}).get("triggerKind")
+            context = msg["params"].get("context", {})
+            kind = context.get("triggerKind")
+            typed = context.get("triggerCharacter") or ""
             send({"jsonrpc": "2.0", "id": msg["id"], "result": {
                 "isIncomplete": True,
-                "items": [{"label": "kind%s" % kind}]}})
+                "items": [{"label": "kind%s%s" % (kind, typed)}]}})
         else:
             send({"jsonrpc": "2.0", "id": msg["id"], "result": None})
     if method == "exit":
@@ -13307,7 +13347,8 @@ while True:
 
     /// #1529: an `isIncomplete` list reaches the app as such, and the
     /// re-ask goes out as `TriggerForIncompleteCompletions` (3); a first
-    /// ask stays `Invoked` (1).
+    /// ask stays `Invoked` (1). #929: a trigger character goes as one (2),
+    /// and the server's one-character `triggerCharacters` are recorded.
     #[test]
     fn an_incomplete_completion_list_is_reported_and_re_asked_with_kind_3() {
         if !is_on_path("python3") {
@@ -13353,7 +13394,7 @@ while True:
         runtime.handle().clone().block_on(async {
             state.open_doc(file.clone(), String::from("lo\n")).await;
             state
-                .request_completion(1, file.clone(), 0, 2, false, &tx)
+                .request_completion(1, file.clone(), 0, 2, CompletionTrigger::Invoked, &tx)
                 .await;
         });
         let first = rx
@@ -13361,12 +13402,24 @@ while True:
             .expect("first reply");
         runtime.handle().clone().block_on(async {
             state
-                .request_completion(2, file.clone(), 0, 2, true, &tx)
+                .request_completion(2, file.clone(), 0, 2, CompletionTrigger::Incomplete, &tx)
                 .await;
         });
         let again = rx
             .recv_timeout(Duration::from_secs(30))
             .expect("second reply");
+        runtime.handle().clone().block_on(async {
+            let typed = CompletionTrigger::Character('/');
+            state
+                .request_completion(3, file.clone(), 0, 2, typed, &tx)
+                .await;
+        });
+        let typed = rx.recv_timeout(Duration::from_secs(30)).expect("reply");
+        assert_eq!(typed.items[0].label, "kind2/", "a trigger character");
+        let support = state.capability_support.lock().unwrap();
+        let triggers = support.completion_triggers.get(&Language::PYTHON);
+        assert_eq!(triggers.map(String::as_str), Some("/@"), "not `->`");
+        drop(support);
         assert!(first.is_incomplete, "isIncomplete reaches the app");
         assert_eq!(first.items[0].label, "kind1", "a first ask is Invoked");
         assert_eq!(again.request_id, 2);

@@ -3121,6 +3121,12 @@ mod tests {
                 "Cmd+F12",
             ),
             ("rename symbol", "Rename Symbol", "rename_symbol", "F2"),
+            (
+                "suggest",
+                "Trigger Suggest",
+                "trigger_suggest",
+                "Ctrl+Space",
+            ),
         ] {
             let mut palette = CommandPalette::new();
             palette.set_query(query);

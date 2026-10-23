@@ -5477,6 +5477,20 @@ impl Editor {
         chars[start..end].iter().collect()
     }
 
+    /// Whether the caret is in code, where completion opens as a word is
+    /// typed (#929): not in a string literal or a comment, nor in Markdown,
+    /// all of which VS Code's `editor.quickSuggestions` leaves off too.
+    pub fn caret_in_code(&self) -> bool {
+        let Some(line) = self.lines.get(self.cursor_row) else {
+            return false;
+        };
+        let caret = char_byte(line, self.cursor_col);
+        self.lang != Some(LangKind::Markdown)
+            && self
+                .earlier_construct_end(self.cursor_row, caret)
+                .is_some_and(|from| !ends_in_string_or_comment(&line[from..caret], self.lang))
+    }
+
     /// Open `path` in this tab. Moving the tab to another file keeps the
     /// history of the one it leaves for when that file opens again, and the
     /// file it arrives at gets its own back if it has one (#1568).

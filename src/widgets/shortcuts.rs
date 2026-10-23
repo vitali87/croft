@@ -468,7 +468,7 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
             },
             ShortcutEntry {
                 keys: "Ctrl+Space",
-                description: "Trigger LSP completion",
+                description: "Trigger Suggest: the completion list at the caret (it also opens as you type a word or a trigger character)",
                 handler: "is_completion_trigger_key",
             },
             ShortcutEntry {
