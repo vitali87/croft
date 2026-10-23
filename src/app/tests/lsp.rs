@@ -925,11 +925,12 @@ fn an_incomplete_re_ask_waits_until_the_edit_is_synced() {
 }
 
 /// #929: [`word_completion_app`] on a Python file holding `text`, whose
-/// language's completion server lists `triggers`. No server runs.
+/// completion server lists `triggers`. No server runs.
 fn typing_completion_app(text: &str, triggers: &str) -> (tempfile::TempDir, App) {
     let (tmp, app) = word_completion_app(&[("demo.py", text)]);
+    let path = app.editor.path.clone().expect("demo.py is open");
     let lsp = app.lsp.as_ref().expect("a test-built App runs a manager");
-    lsp.set_completion_triggers_for_test(crate::lsp::Language::PYTHON, triggers);
+    lsp.set_completion_triggers_for_test(&path, triggers);
     (tmp, app)
 }
 
