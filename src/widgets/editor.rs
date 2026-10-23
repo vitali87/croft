@@ -9094,7 +9094,7 @@ impl Editor {
     ) {
         self.snippet = None;
         for _ in 0..prefix_len {
-            self.backspace();
+            self.backspace_in(group);
         }
         let start = (self.cursor_row, self.cursor_col);
         let indent: String = self
@@ -9401,11 +9401,17 @@ impl Editor {
     }
 
     pub fn backspace(&mut self) {
+        self.backspace_in(None);
+    }
+
+    /// [`Self::backspace`] in the undo step `group`: a grouped snippet's
+    /// typed prefix goes in the step its body joins (#928).
+    fn backspace_in(&mut self, group: Option<u64>) {
         if self.at_symbol_edge(false) {
             return;
         }
         self.pin_on_edit();
-        self.push_undo(EditKind::Backspace);
+        self.push_undo_step(EditKind::Backspace, group);
         // Between an empty auto-close pair, backspace eats both sides —
         // typing `(` then backspace must round-trip to nothing (#121).
         // ONLY for the pair the last auto-close inserted, still untouched
@@ -23726,6 +23732,19 @@ mod tests {
             e.collab_doc_gen, 7,
             "a same-path reload must keep its attachment so the reload broadcasts as edits"
         );
+    }
+
+    /// #928: a snippet expanded in an undo group removes its typed prefix
+    /// in that group too, so one Undo brings the prefix back with the body
+    /// gone, not an empty line.
+    #[test]
+    fn a_grouped_snippet_undoes_its_prefix_removal_with_its_body() {
+        let mut e = editor_with("");
+        e.insert_str("for");
+        e.expand_snippet_with_in("for ${1:i} in ${2:xs}:", 3, &|_| None, Some(9));
+        assert_eq!(e.lines[0], "for i in xs:");
+        assert!(e.undo());
+        assert_eq!(e.lines[0], "for", "one undo restores the typed prefix");
     }
 
     #[test]
