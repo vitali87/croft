@@ -115,6 +115,7 @@ src/
 │   ├── nav.rs           editor back / forward navigation history
 │   ├── overlay.rs       inline-image overlay state + clear-on-hide latches (iTerm2 cell eviction; the Kitty path adds a delete-all on the same clear frames)
 │   ├── perf_hud.rs      F8 performance HUD
+│   ├── screencast.rs    Screencast Mode (Shift+F8): the keys pressed, the command each ran and the cell a click hit, drawn over the frame for a recording
 │   ├── welcome.rs       welcome-screen state: the "IN THIS RELEASE" highlights, read synchronously from `release_notes::release_notes()` (no thread, no network)
 │   └── tests/           whole-app tests, one file per area; `mod.rs` holds the helpers more than one file uses
 ├── dap/                 debugger stack: Debug Adapter Protocol client. debugpy (Python: the adapter on a private 3.14+ venv, the program on the project's own interpreter, #864) is the verified mechanism; Rust/C/C++ route to lldb-dap; JS/TS route to vscode-js-debug; Go routes to delve (`dlv dap` over TCP, single-session, #264). Which file types each handles is a data-driven extension axis (see registry.rs)
@@ -586,6 +587,16 @@ On-screen keyboard for Termux, needed because mouse tracking blocks the native s
 **Sizing and theming.** Thumb-sized keys scale with frame height, and the non-focused pane folds away while the band is up. Key caps are drawn from the active theme's palette — brand-teal armed accent on Black, the historical navy on Dark.
 
 **Dictation.** A tap-to-dictate mic key sits immediately right of the left alt, eating into the space bar (and into the left space half when split). It drives `voice.rs`.
+
+### app/screencast.rs
+
+Developer: Toggle Screencast Mode, VS Code's keystroke overlay, on `Shift+F8`. A terminal recording shows what happened but not what was pressed: the palette closes before anyone reads it, and there is no mouse pointer in it. While the mode is on, `handle_key` hands each press to `Screencast::press` before dispatching it, and the keys show as key caps in a box at the bottom of the workspace for `LINGER` after the last one.
+
+**Chips.** A run of typed characters is one chip, a held key is one chip with a count (`↓ ×12`), and a `Cmd+K` chord's second key joins the leader's chip (`Ctrl+K Z`). A key that answers an armed `cmd_k_leader` is recorded after dispatch instead, as a chord step only when `handle_cmd_k_chord` consumed it (`note_chord_step`): one that matched nothing goes on to the prompt or shell, and is shown, or left out, like any key sent there. `run_command` names its command on the chip of the key being dispatched, so a palette Enter or a `keybindings.json` chord reads `Enter  View: Toggle Zen Mode`. The hard-wired chords call their methods directly, and the overlay does not guess a title for them from the keybinding hints: `Ctrl+C` is Copy in the editor and SIGINT in the terminal, and a guessed name would be wrong there.
+
+**Secrets stay off the screen.** The key is recorded before dispatch, while the prompt or pane it goes to is still the one open, so `screencast_hides_typing` knows where it lands. A key that would type a character there (a character with neither `Ctrl` nor `Cmd` held, `Alt` included, the test a masked prompt applies before it takes one) is left out in a masked input prompt, the connect dialog's password or passphrase phase, and the shell: a hosted pane's PTY lives in its pane host, so croft cannot read the termios that would say echo is off for a sudo password, and what the shell does echo is on screen anyway. Chords and named keys still show. A paste from the host terminal reaches croft as text, not as its `Cmd+V`, so `handle_paste` adds a `Paste` chip: never the text, which is as likely as anything to be a secret.
+
+**Placement.** The box sits in `main_area`, above the status bar and the on-screen keyboard, and above the Zen hint while that shows. It moves to the top of the workspace while the bottom box would cover the editor or shell caret, which in a terminal demo is usually on the last row. A press lights its cell in the accent for `CLICK_LIT_FOR`; a press with a modifier held is a chip too (`Ctrl+Click`). `expire` runs every loop tick and redraws only when the keys or the light go. The mode is off at every launch, as VS Code's is. An inline image (an editor, Markdown or terminal preview) is sent after the frame and draws over the box where they meet; on Kitty images sit above the text layer, so the box cannot be repainted over one there as the chrome tooltip is on iTerm2 and Sixel.
 
 ### scrubber.rs
 

@@ -446,6 +446,132 @@ fn keyboard_enhancement_flags_do_not_force_all_keys_as_escapes() {
     );
 }
 
+/// Screencast Mode: Shift+F8 shows each key pressed, typing as one run, and
+/// the command the palette ran beside its Enter, above the Zen hint, until
+/// the keys have lingered. Shift+F8 again stops it.
+#[test]
+fn screencast_mode_shows_the_keys_and_names_what_the_palette_ran() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.handle_key(key(KeyCode::F(8), KeyModifiers::SHIFT))
+        .unwrap();
+    assert!(app.screencast.is_on(), "{}", app.status);
+    assert!(run_from_palette(&mut app, "View: Toggle Zen Mode"));
+    let screen = screen_text_863(&mut app, 120, 30);
+    assert!(
+        screen.contains(" View: Toggle Zen Mode   Enter  View: Toggle Zen Mode"),
+        "the query typed, then Enter and what it ran:\n{screen}"
+    );
+    assert!(
+        screen.contains(zen_hint_text()),
+        "the keys sit above the Zen hint, not over it:\n{screen}"
+    );
+    let now = std::time::Instant::now();
+    assert!(!app.screencast.expire(now));
+    assert!(app.screencast.expire(now + screencast::LINGER));
+    assert!(!screen_text_863(&mut app, 120, 30).contains("Enter  View"));
+    app.handle_key(key(KeyCode::F(8), KeyModifiers::SHIFT))
+        .unwrap();
+    assert!(!app.screencast.is_on());
+    assert_eq!(app.status, "Screencast Mode off");
+    assert!(
+        app.perf.status_span().is_none(),
+        "Shift+F8 is not the F8 HUD"
+    );
+}
+
+/// Screencast Mode never puts a secret on screen: what is typed into a
+/// masked prompt, or into the shell (sudo reads a password with echo off),
+/// is left out, while the keys around it show.
+#[test]
+fn screencast_mode_leaves_out_typing_into_a_password_field_or_the_shell() {
+    use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.toggle_screencast_mode();
+    app.input_prompt = Some(InputPrompt::new(InputPurpose::NewWorktreeLane, "Token", "").masked());
+    for c in "hunter2".chars() {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+            .unwrap();
+    }
+    app.handle_key(key(KeyCode::Char('q'), KeyModifiers::ALT))
+        .unwrap();
+    assert_eq!(
+        app.input_prompt.as_ref().unwrap().value,
+        "hunter2q",
+        "the field took the Alt-held character as part of the secret"
+    );
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.input_prompt.is_none(), "Esc closed the prompt");
+    assert_eq!(app.screencast.row_text(200), " Esc ");
+
+    app.focus = Pane::Terminal;
+    for c in "s3cret".chars() {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+            .unwrap();
+    }
+    app.handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert_eq!(app.screencast.row_text(200), " Esc   Ctrl+C ");
+    // `Cmd+K` leads in the shell too. A second key that completes no chord
+    // goes on to the shell, so it is left out; one that does is shown.
+    let cmd = if cfg!(target_os = "macos") {
+        "Cmd"
+    } else {
+        "Super"
+    };
+    app.handle_key(key(KeyCode::Char('k'), KeyModifiers::SUPER))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('?'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        app.screencast.row_text(200),
+        format!(" Esc   Ctrl+C   {cmd}+K "),
+        "the ? went to the shell"
+    );
+    app.handle_key(key(KeyCode::Char('k'), KeyModifiers::SUPER))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('k'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        app.screencast.row_text(200),
+        format!(" Esc   Ctrl+C   {cmd}+K   {cmd}+K K "),
+        "Cmd+K K cleared the terminal"
+    );
+
+    app.focus = Pane::Editor;
+    for c in "ok".chars() {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+            .unwrap();
+    }
+    assert!(
+        app.screencast.row_text(200).ends_with(" ok "),
+        "typing in the editor shows"
+    );
+}
+
+/// Screencast Mode lights the cell a click lands on, for a recording that
+/// has no mouse pointer in it, and lets it fade.
+#[test]
+fn screencast_mode_lights_a_clicked_cell_until_it_fades() {
+    use crossterm::event::MouseButton;
+    let (mut app, _tmp, col, row) = app_with_open_file_and_editor_cell();
+    let lit = |app: &mut App| {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        term.backend().buffer()[(col, row)].bg == app.theme.accent()
+    };
+    press(&mut app, MouseButton::Left, (col, row));
+    assert!(!lit(&mut app), "only while Screencast Mode is on");
+    app.toggle_screencast_mode();
+    press(&mut app, MouseButton::Left, (col, row));
+    assert!(lit(&mut app));
+    let now = std::time::Instant::now();
+    assert!(app.screencast.expire(now + screencast::CLICK_LIT_FOR));
+    assert!(!lit(&mut app));
+}
+
 /// A click on the cell being edited keeps the edit open: nothing commits.
 #[test]
 fn a_click_on_the_cell_being_edited_keeps_editing() {

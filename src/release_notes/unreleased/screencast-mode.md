@@ -1,0 +1,1 @@
+feature: Screencast Mode (Shift+F8, or Developer: Toggle Screencast Mode) shows the keys you press, the command each ran and where you clicked, for recording demos; nothing typed into a password field or the shell is shown.
