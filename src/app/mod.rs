@@ -6149,9 +6149,16 @@ struct PendingCompletionResolve {
     /// The caret after the accept, and a hash of the text before it.
     upto: (usize, usize),
     text_hash: u64,
-    /// The accept's remote undo group; `None` when it went in an open vim
-    /// change's step, which the import then joins too (#934).
-    undo_group: Option<u64>,
+    undo: ImportUndo,
+}
+
+/// The undo step a completion's resolved import joins.
+enum ImportUndo {
+    /// The accept's remote group (#928).
+    Group(u64),
+    /// The vim change the accept went in (#934), joined only while its step
+    /// is still the newest.
+    Step(u64),
 }
 
 /// A hash of the text before `(row, col)`, `None` past the buffer's end:
@@ -10223,11 +10230,16 @@ impl App {
         if edits.is_empty() || !edits.iter().all(before_item) {
             return false;
         }
-        self.editor.apply_span_edits_as_in(
-            &edits,
-            crate::provenance::Seat::Generated,
-            pending.undo_group,
-        );
+        let group = match pending.undo {
+            ImportUndo::Group(group) => group,
+            ImportUndo::Step(step) => {
+                let group = next_remote_undo_group();
+                self.editor.adopt_undo_step(step, group);
+                group
+            }
+        };
+        self.editor
+            .apply_span_edits_as_in(&edits, crate::provenance::Seat::Generated, Some(group));
         true
     }
 
@@ -16909,7 +16921,11 @@ impl App {
             self.expand_snippet_in(&te.new_text, 0, group);
         }
         if let Some(listed) = item.resolve.clone() {
-            self.request_completion_imports(listed, (row, start), group);
+            let undo = group.map_or(
+                ImportUndo::Step(self.editor.undo_step_id),
+                ImportUndo::Group,
+            );
+            self.request_completion_imports(listed, (row, start), undo);
         }
         true
     }
@@ -16940,7 +16956,7 @@ impl App {
         &mut self,
         item: std::sync::Arc<lsp_types::CompletionItem>,
         start: (usize, usize),
-        undo_group: Option<u64>,
+        undo: ImportUndo,
     ) -> Option<()> {
         let path = self.editor.path.clone()?;
         let upto = (self.editor.cursor_row, self.editor.cursor_col);
@@ -16952,7 +16968,7 @@ impl App {
             start,
             upto,
             text_hash,
-            undo_group,
+            undo,
         });
         Some(())
     }

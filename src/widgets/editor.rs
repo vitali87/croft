@@ -11623,6 +11623,16 @@ impl Editor {
         self.undo_group.is_some()
     }
 
+    /// Let the remote edits of `group` join the newest undo step while it
+    /// is still `step` (#934): a completion's import resolved after its vim
+    /// change goes back into that change, but never into a step opened
+    /// since, where they open a step of their own.
+    pub fn adopt_undo_step(&mut self, step: u64, group: u64) {
+        if self.undo_step_id == step && !self.undo_stack.is_empty() {
+            self.remote_undo_group = Some(group);
+        }
+    }
+
     /// Mouse-down: position the cursor at the click point and start a
     /// fresh zero-area selection there. A subsequent drag widens it.
     pub fn mouse_down(&mut self, col: u16, row: u16) {
