@@ -47378,14 +47378,14 @@ impl App {
         if !self.is_extension_enabled("vim") {
             if self.vim.enabled {
                 self.vim.toggle();
-                self.editor.end_undo_group();
+                self.end_vim_undo_groups();
             }
             self.status = String::from("Vim extension is disabled");
             return;
         }
         self.vim.toggle();
         // A change left open in Insert mode ends with the mode (#934).
-        self.editor.end_undo_group();
+        self.end_vim_undo_groups();
         if self.vim.enabled {
             self.status = String::from("vim mode on");
         } else {
@@ -47416,7 +47416,7 @@ impl App {
         let on = want && self.is_extension_enabled("vim");
         if on != self.vim.enabled {
             self.vim.toggle();
-            self.editor.end_undo_group();
+            self.end_vim_undo_groups();
             if !on {
                 self.editor
                     .set_search_highlight(None, crate::widgets::search::SearchOpts::default());
@@ -48559,6 +48559,18 @@ impl App {
         consumed
     }
 
+    /// End the vim change's undo group (#934): on the active editor, which
+    /// also starts the next edit's own step, and on whichever other tab or
+    /// editor group the change was entered on.
+    fn end_vim_undo_groups(&mut self) {
+        self.editor.end_undo_group();
+        for group in
+            std::iter::once(&mut self.editor).chain(self.editor_layout.inactive_groups_mut())
+        {
+            group.end_open_undo_groups();
+        }
+    }
+
     /// Apply one resolved vim intent to the editor. The vim state machine has
     /// already advanced its own mode; this only mutates the buffer/cursor.
     fn apply_vim_action(&mut self, action: crate::vim::VimAction) {
@@ -48566,7 +48578,7 @@ impl App {
         // A change runs from the command that enters Insert to the next vim
         // command, the `Esc` that leaves it: the operator's delete, the line
         // `o` opens and the typed text undo as one step, as in Vim (#934).
-        self.editor.end_undo_group();
+        self.end_vim_undo_groups();
         if matches!(
             action,
             VimAction::Insert(_)

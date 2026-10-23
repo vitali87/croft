@@ -21855,6 +21855,19 @@ impl EditorTabs {
         self.editors.iter()
     }
 
+    /// Close the undo group of every tab that still has one open (#934): a
+    /// vim change entered on one tab can be left with `Esc` on another, and
+    /// an edit back on its tab that skips vim, such as a paste, would
+    /// otherwise fold into the change. A tab with no group open is left as
+    /// it is.
+    pub fn end_open_undo_groups(&mut self) {
+        for editor in &mut self.editors {
+            if editor.undo_group.is_some() {
+                editor.end_undo_group();
+            }
+        }
+    }
+
     pub fn select(&mut self, idx: usize) -> bool {
         if idx >= self.editors.len() {
             return false;

@@ -247,6 +247,26 @@ fn vim_u_undoes_a_change_and_its_typed_text_at_once() {
     }
 }
 
+/// #934: a change entered on one tab and left with `Esc` on another ends
+/// on both, so back on its tab an edit outside vim (a paste) is its own
+/// step, and `u` takes back only it.
+#[test]
+fn a_change_left_on_another_tab_does_not_swallow_the_next_edit() {
+    let (mut app, tmp) = vim_app("one two");
+    vim_feed_str(&mut app, "cwONE");
+    let other = tmp.path().join("other.txt");
+    std::fs::write(&other, "x").unwrap();
+    app.editor.open_pinned(&other).unwrap();
+    assert_eq!(app.editor.active_index(), 1);
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    app.editor.select(0);
+    app.editor.insert_str(" PASTE");
+    assert_eq!(app.editor.lines, vec!["ONE PASTE two"]);
+    vim_feed(&mut app, 'u');
+    assert_eq!(app.editor.lines, vec!["ONE two"], "only the paste");
+}
+
 /// Negative (#934): the edit after `Esc` is its own step, so `u` takes
 /// back only it and leaves the change.
 #[test]
