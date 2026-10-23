@@ -11617,6 +11617,12 @@ impl Editor {
         self.last_edit_kind = None;
     }
 
+    /// Whether a group [`Self::begin_undo_group`] opened is still open: a
+    /// vim change is under way (#934).
+    pub fn undo_group_open(&self) -> bool {
+        self.undo_group.is_some()
+    }
+
     /// Mouse-down: position the cursor at the click point and start a
     /// fresh zero-area selection there. A subsequent drag widens it.
     pub fn mouse_down(&mut self, col: u16, row: u16) {

@@ -1530,6 +1530,48 @@ fn an_accepted_completion_resolves_its_auto_import() {
     assert_eq!(app.editor.lines, ["import lo"]);
 }
 
+/// #934: in a vim change, an accepted completion and the import its server
+/// resolves after it go in the change's undo step, as Vim takes back all an
+/// Insert added with one `u`. A lazily resolved item opened steps of its
+/// own, so the change took three: the item, the typing after it, the import.
+#[test]
+fn a_completion_accepted_in_a_vim_change_undoes_with_it() {
+    let import = "from shelf import load";
+    let (_tmp, path, mut app, tx) = completion_reply_app();
+    app.vim.enabled = true;
+    vim_feed(&mut app, 'A');
+    app.trigger_completion();
+    let request_id = app.completion_request_id.unwrap();
+    draw(&mut app, 100, 30);
+    tx.send(completion_reply(request_id, &path, &["load"]))
+        .unwrap();
+    app.drain_lsp_completion();
+    let popup = app.completion_popup.as_mut().expect("the list opens");
+    popup.items[0].resolve = Some(std::sync::Arc::default());
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    vim_feed(&mut app, ';');
+    let pending = app.completion_resolve.as_ref().expect("a resolve went out");
+    let mut reply = completion_reply(pending.request_id, &path, &["load"]);
+    reply.items[0].additional_edits = vec![crate::widgets::editor::TextSpanEdit {
+        start: (0, 0),
+        end: (0, 0),
+        new_text: format!("{import}\n"),
+        utf16: true,
+    }];
+    tx.send(reply).unwrap();
+    assert!(app.drain_lsp_completion());
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.lines, [import, "import load;"]);
+    vim_feed(&mut app, 'u');
+    assert_eq!(
+        app.editor.lines,
+        ["import lo"],
+        "one u takes the change back"
+    );
+}
+
 /// #928: rust-analyzer's completions are snippets, `load(${1:a}, ${2:b})`,
 /// with the import on resolve. An import landing above the live snippet
 /// moves its tab stops with their text, and one Undo takes the item, its
