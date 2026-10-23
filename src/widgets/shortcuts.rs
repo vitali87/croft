@@ -197,6 +197,11 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 handler: "",
             },
             ShortcutEntry {
+                keys: "Shift+F8",
+                description: "Screencast Mode: show the keys you press and what they ran, for a recording",
+                handler: "",
+            },
+            ShortcutEntry {
                 keys: "Esc",
                 description: "Close this panel (or clear selection / dismiss menus)",
                 handler: "",

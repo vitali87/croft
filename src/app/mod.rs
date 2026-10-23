@@ -32,6 +32,7 @@ mod memory_report;
 mod nav;
 mod overlay;
 mod perf_hud;
+mod screencast;
 pub(crate) mod sidebar_dwell;
 mod welcome;
 use click::{ClickTracker, ModifiedClickTracker};
@@ -42,6 +43,7 @@ use hover::{HOVER_DELAY, HoverDwell};
 use nav::{NavHistory, NavLoc};
 use overlay::OverlayManager;
 use perf_hud::PerfHud;
+use screencast::Screencast;
 use sidebar_dwell::{AUTO_HIDE_DWELL, SidebarDwell};
 use welcome::WelcomeState;
 
@@ -3641,6 +3643,9 @@ pub struct App {
     pub terminals: Vec<PtyTerminal>,
     pub active_terminal: usize,
     perf: PerfHud,
+    /// Developer: Toggle Screencast Mode: the keys pressed, shown on screen
+    /// for a recording. Off at every launch, as VS Code's is.
+    screencast: Screencast,
     /// The workspace's root-folder set (#143). One entry today; the
     /// multi-root slices grow it. Read the primary via `workspace_root()`.
     roots: crate::workspace::WorkspaceRoots,
@@ -5929,6 +5934,8 @@ const RIGHT_PANE_MIN: u16 = 20;
 const ZEN_ESC_WINDOW: std::time::Duration = std::time::Duration::from_millis(500);
 /// How long the "how to leave Zen" hint shows after entering it (#1585).
 const ZEN_HINT_FOR: std::time::Duration = std::time::Duration::from_secs(4);
+/// How long an armed `Cmd+K` leader waits for its second key.
+const CMD_K_LEADER_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
 /// Minimum width of the zoxide jump popup. The Explorer column it anchors
 /// over is typically ~32 cells, too narrow to read frecency paths like
 /// `~/Documents/platform/app/...`, so the box widens rightward to at least
@@ -6586,6 +6593,7 @@ impl App {
             terminals: vec![term],
             active_terminal: 0,
             perf: PerfHud::default(),
+            screencast: Screencast::default(),
             roots: crate::workspace::WorkspaceRoots::single(root.clone()),
             sidebar_view: SidebarView::Explorer,
             sidebar_areas: SidebarAreas::default(),
@@ -14619,6 +14627,57 @@ impl App {
             return true;
         }
         false
+    }
+
+    /// Developer: Toggle Screencast Mode (VS Code's; Shift+F8 here): the
+    /// keys pressed show on screen for a recording until it is toggled off.
+    fn toggle_screencast_mode(&mut self) {
+        self.status = String::from(if self.screencast.toggle() {
+            "Screencast Mode on: the keys you press show at the bottom (Shift+F8 to stop)"
+        } else {
+            "Screencast Mode off"
+        });
+    }
+
+    /// Whether a character typed now may be a secret, which Screencast Mode
+    /// then leaves off the screen: a password or passphrase field, or the
+    /// shell, which reads a sudo password with echo off. What the shell
+    /// does echo is on screen already.
+    fn screencast_hides_typing(&self) -> bool {
+        self.input_prompt.as_ref().is_some_and(|p| p.masked)
+            || self
+                .connect_dialog
+                .as_ref()
+                .is_some_and(|d| d.input_is_secret())
+            || (self.focus == Pane::Terminal && !self.modal_overlay_open())
+    }
+
+    /// Screencast Mode's keys, over everything else, in the workspace above
+    /// the status bar and the on-screen keyboard, and above the Zen hint
+    /// while that shows; clear of the caret being typed at.
+    fn render_screencast(&self, frame: &mut ratatui::Frame, main_area: Rect) {
+        if !self.screencast.is_on() {
+            return;
+        }
+        let mut area = main_area;
+        if self.zen_mode
+            && self
+                .zen_hint_until
+                .is_some_and(|until| std::time::Instant::now() < until)
+        {
+            area.height = area.height.saturating_sub(4);
+        }
+        let caret = match self.focus {
+            Pane::Editor if self.editor.diff.is_some() => self.editor.diff_caret_screen_pos(),
+            Pane::Editor => self.editor.cursor_screen_pos(),
+            Pane::Terminal if self.show_terminal => self
+                .terminals
+                .get(self.active_terminal)
+                .and_then(|t| t.screen_cursor()),
+            _ => None,
+        };
+        self.screencast
+            .render(frame.buffer_mut(), area, self.theme, caret);
     }
 
     /// Replace the gear menu with the Color Theme picker: one row per theme,
@@ -23070,6 +23129,7 @@ impl App {
         self.ui_tooltip_area = tooltip_area;
 
         self.paint_terminal_suggestion(frame);
+        self.render_screencast(frame, main_area);
 
         // Show the host terminal's hardware caret only when the editor is
         // focused and has no modal overlay. The DECSCUSR style is set to
@@ -25365,6 +25425,18 @@ impl App {
         if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             self.status_wide = false;
         }
+        // Screencast Mode shows the key before it is dispatched, while the
+        // prompt or pane it goes to is still the one open: typing bound for
+        // a password field or the shell is then known to be that.
+        if self.screencast.is_on() && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+        {
+            let second_step = self
+                .cmd_k_leader
+                .is_some_and(|at| at.elapsed() <= CMD_K_LEADER_TIMEOUT);
+            let hide_typing = self.screencast_hides_typing();
+            self.screencast
+                .press(key, std::time::Instant::now(), second_step, hide_typing);
+        }
         // Esc dismisses an open ssh-pane offer (#364) without being consumed:
         // the offer is a status-bar hint, not a modal, so whatever Esc meant
         // to the focused pane still happens.
@@ -25385,6 +25457,7 @@ impl App {
             && key.kind == KeyEventKind::Press;
         let before = zen_esc.then(|| self.esc_fingerprint());
         let result = self.recording_file_switches(|app| app.handle_key_inner(key));
+        self.screencast.end_key();
         match before {
             Some(before) if before == self.esc_fingerprint() => {
                 self.note_idle_zen_esc(std::time::Instant::now());
@@ -25478,12 +25551,11 @@ impl App {
         // `Cmd+K`-prefixed chord. Consume the leader regardless; dispatch the
         // chord if it matches and the window has not lapsed, otherwise fall
         // through so the key keeps its normal meaning (e.g. Esc cancels).
-        if let Some(started) = self.cmd_k_leader.take() {
-            const CMD_K_LEADER_TIMEOUT: std::time::Duration =
-                std::time::Duration::from_millis(1500);
-            if started.elapsed() <= CMD_K_LEADER_TIMEOUT && self.handle_cmd_k_chord(key) {
-                return Ok(());
-            }
+        if let Some(started) = self.cmd_k_leader.take()
+            && started.elapsed() <= CMD_K_LEADER_TIMEOUT
+            && self.handle_cmd_k_chord(key)
+        {
+            return Ok(());
         }
         // Modal layer: the unsupported-terminal nudge sits on top of everything
         // at startup. Any key dismisses it for this session; D also persists the
@@ -25814,6 +25886,10 @@ impl App {
         }
         if matches!(key.code, KeyCode::F(1)) {
             self.open_shortcuts_modal();
+            return Ok(());
+        }
+        if key.code == KeyCode::F(8) && key.modifiers == KeyModifiers::SHIFT {
+            self.toggle_screencast_mode();
             return Ok(());
         }
         if matches!(key.code, KeyCode::F(8)) {
@@ -51218,6 +51294,9 @@ impl App {
     /// replaying, and only when the editor had focus before and after and
     /// the text went into it (#1464). Before, the replay silently left the pasted text out.
     fn handle_paste(&mut self, s: &str) {
+        if self.screencast.is_on() {
+            self.screencast.pasted(std::time::Instant::now());
+        }
         let capture =
             self.macro_recording.is_some() && !self.macro_replaying && self.focus == Pane::Editor;
         let into_editor = self.handle_paste_inner(s);
@@ -56040,6 +56119,8 @@ impl App {
             .tab_click_target
             .take()
             .unwrap_or_else(|| self.editor.active_index());
+        // The palette closes before a recording can show what it ran.
+        self.screencast.name_command(cmd.title());
         match cmd {
             // A preview's placeholder lines are not the file (#916): an edit
             // to them leaves the tab dirty with nothing a save can write.
@@ -56689,6 +56770,7 @@ impl App {
             Cmd::TestingInstallCoverageTool => self.install_coverage_tool(),
             Cmd::TestingShowCoverageReport => self.show_coverage_report(),
             Cmd::DeveloperShowMemoryUsage => self.show_memory_usage(),
+            Cmd::ToggleScreencastMode => self.toggle_screencast_mode(),
             Cmd::RunTestAtCursorWithCoverage => self.run_test_at_cursor_with_coverage(),
             Cmd::TestingToggleWatchAll => {
                 self.toggle_test_watch(crate::testing::watch::WatchScope::All)
@@ -60192,6 +60274,17 @@ impl App {
 
     fn handle_mouse(&mut self, m: MouseEvent) {
         self.editor.sync_occurrence_word_sel();
+        if self.screencast.is_on()
+            && let MouseEventKind::Down(button) = m.kind
+        {
+            self.screencast.click(
+                m.column,
+                m.row,
+                button,
+                m.modifiers,
+                std::time::Instant::now(),
+            );
+        }
         self.recording_file_switches(|app| app.handle_mouse_inner(m));
     }
 
@@ -81224,6 +81317,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             app.maybe_seat_navigator() | app.poll_pair() | app.tick_proactive_navigator();
         let voice_changed = app.drain_voice();
         let zen_hint_changed = app.expire_zen_hint(std::time::Instant::now());
+        let screencast_changed = app.screencast.expire(std::time::Instant::now());
         let zoxide_changed = app.poll_zoxide_install();
         // Surface managed language-server install progress in the status bar so
         // the background work (which can take a few seconds) is visible.
@@ -81246,6 +81340,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
 
         let non_pty_dirty = needs_redraw
             || zen_hint_changed
+            || screencast_changed
             || zoxide_changed
             || fs_changed
             || mcp_changed
