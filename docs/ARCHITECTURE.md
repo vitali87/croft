@@ -866,6 +866,8 @@ An SGR span parser for colour-bearing text. One pass turns a raw line into visib
 
 **One implementation on purpose.** There is a single copy of the stripping rules. A second "just strip the escapes" implementation would drift from this one, and everything that trusts the stripped text — find, copy, `path:line` scanning — must see the same characters the renderer painted.
 
+**A stream ends lines at newlines, not at chunks.** `AnsiStream` parses output that arrives in pieces, as a debug adapter's `output` events do, where one line can come in several events and an event can end mid-line or mid-escape (#1501, #932). It keeps the line it is in the middle of open until a newline ends it, blank lines included, and a carriage return rewrites the open line, so a progress bar redraws in place. The Debug Console keeps one stream per session and output category, shows each open line as it reads so far and redraws it where it stands.
+
 ### archive.rs
 
 The archive browser core. It lists members without reading payloads: zip-based packages (zip, jar, whl, apk, aar, war, ear, nupkg, vsix, epub) through the central directory, tar, tar.gz and tar.xz through a header walk.
@@ -1098,7 +1100,7 @@ Hand-curated "IN THIS RELEASE" highlights (feature or fix, glyph plus summary) s
 
 ### run_debug.rs
 
-The Run and Debug sidebar widget: an empty-state Run [filename] button, and when a session is live the paused-state tree (call stack, expandable variables, WATCH), a debug console of program output (soft-wrapped to the panel width by display columns, #867, and coloured by the program's own SGR sequences, which `ansi_text` turns into spans; other escapes are dropped, #1501), and a `❯` REPL prompt. Every console line is also mirrored, as plain text, to the OUTPUT bus's "Debug Console" channel. The App builds the rows and maps clicks back to frames and variables.
+The Run and Debug sidebar widget: an empty-state Run [filename] button, and when a session is live the paused-state tree (call stack, expandable variables, WATCH), a debug console of program output (soft-wrapped to the panel width by display columns, #867, and coloured by the program's own SGR sequences, which `ansi_text` turns into spans; other escapes are dropped, #1501; a line per newline the program printed, however the adapter cut its output into events, #932), and a `❯` REPL prompt. Every console line is also mirrored, as plain text, to the OUTPUT bus's "Debug Console" channel. The App builds the rows and maps clicks back to frames and variables.
 
 **WATCH is frame-relative.** Session-scoped expressions are re-evaluated on every stop via DAP `evaluate` with context `watch`, against the SELECTED frame. The stop selects the top frame, and clicking a call-stack frame re-evaluates every watch against that frame.
 
