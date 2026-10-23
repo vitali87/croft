@@ -36,7 +36,8 @@ use tower::ServiceBuilder;
 use crate::lsp::config::ServerConfig;
 use crate::lsp::log_file;
 use crate::lsp::manager::{
-    Diagnostic, DiagnosticSeverity, DiagnosticsUpdate, ServerEvent, ServerUpdate, message_is_shown,
+    CompletionTrigger, Diagnostic, DiagnosticSeverity, DiagnosticsUpdate, ServerEvent,
+    ServerUpdate, message_is_shown,
 };
 use crate::lsp::watched_files::WatchedFiles;
 use crate::output::{self, OutputLevel};
@@ -841,31 +842,48 @@ pub struct LspRequests {
 }
 
 impl LspRequests {
-    /// `incomplete` re-asks for a list the server marked `isIncomplete`
-    /// (#1529), as `TriggerForIncompleteCompletions`.
+    /// `trigger` says why it is asked: a typed trigger character goes with
+    /// the character (#929), so a server answers only where it means
+    /// something, and a re-ask for a list the server marked `isIncomplete`
+    /// (#1529) as `TriggerForIncompleteCompletions`.
     pub async fn completion(
         &mut self,
         uri: Url,
         line: u32,
         character: u32,
-        incomplete: bool,
+        trigger: CompletionTrigger,
     ) -> Result<Option<CompletionResponse>> {
+        use CompletionTriggerKind as Kind;
+        let (trigger_kind, trigger_character) = match trigger {
+            CompletionTrigger::Invoked => (Kind::INVOKED, None),
+            CompletionTrigger::Character(c) => (Kind::TRIGGER_CHARACTER, Some(c.to_string())),
+            CompletionTrigger::Incomplete => (Kind::TRIGGER_FOR_INCOMPLETE_COMPLETIONS, None),
+        };
         self.server
             .completion(CompletionParams {
                 text_document_position: position_params(uri, line, character),
                 work_done_progress_params: WorkDoneProgressParams::default(),
                 partial_result_params: PartialResultParams::default(),
                 context: Some(CompletionContext {
-                    trigger_kind: if incomplete {
-                        CompletionTriggerKind::TRIGGER_FOR_INCOMPLETE_COMPLETIONS
-                    } else {
-                        CompletionTriggerKind::INVOKED
-                    },
-                    trigger_character: None,
+                    trigger_kind,
+                    trigger_character,
                 }),
             })
             .await
             .context("completion")
+    }
+
+    /// `completionItem/resolve`: the rest of an item the server listed
+    /// lazily (#928). vtsls sends an auto-import's `additionalTextEdits`
+    /// only here.
+    pub async fn completion_resolve(
+        &mut self,
+        item: lsp_types::CompletionItem,
+    ) -> Result<lsp_types::CompletionItem> {
+        self.server
+            .completion_item_resolve(item)
+            .await
+            .context("completion_resolve")
     }
 
     pub async fn signature_help(

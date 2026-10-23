@@ -2570,6 +2570,31 @@ fn the_pane_menu_copies_a_selection_and_pastes_the_clipboard() {
     );
 }
 
+/// #933: with no host clipboard to read and no relay to fetch one over,
+/// the pane menu's Paste sends what croft itself last copied, as every
+/// other paste inside croft does.
+#[test]
+fn the_pane_menu_pastes_croft_s_own_copy_where_the_clipboard_cant_be_read() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[String::from("-c"), String::from("sleep 60")],
+        tmp.path(),
+    )
+    .unwrap();
+    app.show_terminal = true;
+    app.focus_pane(Pane::Terminal);
+    assert_eq!(crate::clipboard::read_string(), None, "precondition");
+    crate::clipboard::remember_copy("copied-933");
+    app.dispatch_menu_action(MenuAction::TerminalPaste, tmp.path().to_path_buf());
+    let sent = String::from_utf8_lossy(&app.terminals[0].written_bytes_for_test()).to_string();
+    assert!(
+        sent.contains("copied-933"),
+        "the menu's Paste must send croft's own copy, sent {sent:?}"
+    );
+}
+
 #[test]
 fn a_pane_named_in_wide_characters_still_marks_its_strip() {
     // Only single-width characters are painted, because a CJK glyph or an

@@ -5871,6 +5871,149 @@ fn debug_console_sessions_keep_their_own_colour_and_cut_escape() {
     );
 }
 
+/// The Debug Console lines from the first one containing `tag` on.
+fn console_from<'a>(app: &'a App, tag: &str) -> Vec<&'a str> {
+    let lines: Vec<&str> = app.debug_console.iter().map(|l| l.text.as_str()).collect();
+    let start = lines
+        .iter()
+        .position(|l| l.contains(tag))
+        .unwrap_or_else(|| panic!("no {tag:?} in {lines:?}"));
+    lines[start..].to_vec()
+}
+
+fn mirrored(text: &str) -> usize {
+    crate::output::snapshot(crate::output::CHANNEL_DEBUG_CONSOLE)
+        .unwrap_or_default()
+        .iter()
+        .filter(|l| l.text == text)
+        .count()
+}
+
+/// #932: an output event is a chunk, not a line. `print("print: i =", i)`
+/// came out as `print: i =` and ` 0` on two lines, and `print()` left no
+/// blank line. A line ends at its newline, and OUTPUT gets it whole.
+#[test]
+fn debug_console_joins_a_line_cut_across_events_and_keeps_blank_lines() {
+    let tag = format!("chunks-{}", std::process::id());
+    let app = debug_console_after(
+        &[
+            &format!("Loading {tag}..."),
+            r" ok\n",
+            r"\n",
+            r"Section 2\n",
+            "print: i =",
+            r" 0\n",
+        ],
+        |a| a.debug_console.iter().any(|l| l.text == "print: i = 0"),
+    );
+    let loaded = format!("Loading {tag}... ok");
+    assert_eq!(
+        console_from(&app, &tag),
+        [loaded.as_str(), "", "Section 2", "print: i = 0"]
+    );
+    assert_eq!(mirrored(&loaded), 1, "OUTPUT gets the whole line");
+    assert_eq!(mirrored(&format!("Loading {tag}...")), 0);
+}
+
+/// #932: the line a program is still printing shows as it reads so far, a
+/// carriage return redraws it in place, and the line a run ends without a
+/// newline still reaches OUTPUT.
+#[test]
+fn debug_console_redraws_a_progress_line_in_place() {
+    let tag = format!("progress-{}", std::process::id());
+    let app = debug_console_after(
+        &[
+            &format!(r"\r 10% {tag}"),
+            &format!(r"\r 60% {tag}"),
+            &format!(r"\r100% {tag}\n"),
+            &format!("waiting {tag}"),
+        ],
+        |a| {
+            a.debug_console
+                .iter()
+                .any(|l| l.text.starts_with("waiting"))
+        },
+    );
+    let done = format!("100% {tag}");
+    let waiting = format!("waiting {tag}");
+    assert_eq!(console_from(&app, &tag), [done.as_str(), waiting.as_str()]);
+    assert_eq!(
+        mirrored(&format!(" 60% {tag}")),
+        0,
+        "a redraw is not a line"
+    );
+    assert_eq!(mirrored(&waiting), 1, "the open line is flushed at the end");
+}
+
+/// #932: each output category is its own stream, so a `stderr` line does not
+/// land inside the `stdout` line being printed, and a background member's
+/// line is joined the same way under its name.
+#[test]
+fn debug_console_keeps_categories_apart_in_a_background_member() {
+    let tag = format!("categories-{}", std::process::id());
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let event = |seq: usize, category: &str, output: &str| {
+        format!(
+            r#"{{"seq":{seq},"type":"event","event":"output","body":{{"category":"{category}","output":"{output}"}}}}"#
+        )
+    };
+    let events = [
+        event(1, "stdout", &format!("Loading {tag}...")),
+        event(2, "stderr", &format!(r"warning {tag}\n")),
+        event(3, "stdout", r" ok\n"),
+    ];
+    let refs: Vec<&str> = events.iter().map(String::as_str).collect();
+    app.debug_sessions.push("A", stub_emitting(&refs));
+    app.debug_sessions.push("B", stub_emitting(&[]));
+    let loaded = format!("[A] Loading {tag}... ok");
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the background member's line to be finished",
+        || {
+            app.poll_dap();
+            app.debug_console.iter().any(|l| l.text == loaded)
+        },
+    );
+    app.debug_stop();
+    let warning = format!("[A] warning {tag}");
+    assert_eq!(
+        console_from(&app, &tag),
+        [loaded.as_str(), warning.as_str()]
+    );
+}
+
+/// #932: a REPL result with several lines, a traceback, is a console line
+/// each; as one entry only `Traceback (most recent call last):` showed.
+#[test]
+fn debug_console_shows_every_line_of_a_repl_result() {
+    use crate::dap::session::DapEvent;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.debug_sessions.push("P", stub_emitting(&[]));
+    let (_, p) = app.debug_sessions.iter_named_mut_indexed().next().unwrap();
+    p.backlog.push(DapEvent::Evaluated {
+        context: String::from("repl"),
+        expression: String::from("inventory['missing']"),
+        result: String::from(
+            "Traceback (most recent call last):\n  File \"<string>\", line 1, in <module>\n\nKeyError: 'missing'\n",
+        ),
+        success: false,
+    });
+    app.poll_dap();
+    app.debug_stop();
+    assert_eq!(
+        console_from(&app, "inventory"),
+        [
+            "❯ inventory['missing']",
+            "Traceback (most recent call last):",
+            "  File \"<string>\", line 1, in <module>",
+            "",
+            "KeyError: 'missing'",
+        ]
+    );
+}
+
 /// #1391: a node launch with nothing to run is refused naming every field
 /// that would have given it something.
 #[test]

@@ -329,6 +329,29 @@ fn vim_yank_line_then_paste_duplicates_it() {
     assert_eq!(app.editor.lines, vec!["dup", "dup", "tail"]);
 }
 
+/// #933: where the host clipboard can't be read (Linux with no wl-paste,
+/// xclip or xsel, as over SSH), `p` puts what croft itself last yanked or
+/// deleted, so `yyp` duplicates a line and `ddp` moves one.
+#[test]
+fn vim_put_works_where_the_host_clipboard_cant_be_read() {
+    let (mut app, _t) = vim_app("one\ntwo");
+    app.clipboard_reader = || None;
+    vim_feed_str(&mut app, "yyp");
+    assert_eq!(app.editor.lines, vec!["one", "one", "two"]);
+    vim_feed_str(&mut app, "Gddggp");
+    assert_eq!(app.editor.lines, vec!["one", "two", "one"]);
+}
+
+/// #933: a `p` with nothing to put says so rather than doing nothing.
+#[test]
+fn vim_put_with_nothing_to_put_says_so() {
+    let (mut app, _t) = vim_app("one");
+    app.clipboard_reader = || None;
+    vim_feed(&mut app, 'p');
+    assert_eq!(app.editor.lines, vec!["one"]);
+    assert_eq!(app.status, "Nothing to paste: the clipboard can't be read");
+}
+
 #[test]
 fn vim_visual_select_then_delete_removes_selection() {
     let (mut app, _t) = vim_app("abcdef");

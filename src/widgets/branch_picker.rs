@@ -32,6 +32,15 @@ pub enum BranchAction {
     Create(String),
 }
 
+impl BranchAction {
+    /// The local branch the action switches to.
+    pub fn branch_name(&self) -> &str {
+        match self {
+            Self::Checkout(name) | Self::Track { name, .. } | Self::Create(name) => name,
+        }
+    }
+}
+
 /// One visible row: an existing branch (index into `branches`) or the
 /// synthetic "create this branch" affordance carrying the typed name.
 #[derive(Clone, Debug, PartialEq, Eq)]

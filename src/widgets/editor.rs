@@ -5482,6 +5482,20 @@ impl Editor {
         chars[start..end].iter().collect()
     }
 
+    /// Whether the caret is in code, where completion opens as a word is
+    /// typed (#929): not in a string literal or a comment, nor in Markdown,
+    /// all of which VS Code's `editor.quickSuggestions` leaves off too.
+    pub fn caret_in_code(&self) -> bool {
+        let Some(line) = self.lines.get(self.cursor_row) else {
+            return false;
+        };
+        let caret = char_byte(line, self.cursor_col);
+        self.lang != Some(LangKind::Markdown)
+            && self
+                .earlier_construct_end(self.cursor_row, caret)
+                .is_some_and(|from| !ends_in_string_or_comment(&line[from..caret], self.lang))
+    }
+
     /// Open `path` in this tab. Moving the tab to another file keeps the
     /// history of the one it leaves for when that file opens again, and the
     /// file it arrives at gets its own back if it has one (#1568).
@@ -6183,6 +6197,7 @@ impl Editor {
             source_map: Vec::new(),
             row_of_line: Vec::new(),
             scroll_to_source: None,
+            links: crate::markdown::MdLinks::default(),
         });
         self.status = format!("Opened media info {}", path.display());
         Ok(())
@@ -6263,6 +6278,7 @@ impl Editor {
             source_map: Vec::new(),
             row_of_line: Vec::new(),
             scroll_to_source: None,
+            links: crate::markdown::MdLinks::default(),
         });
         self.status = format!("Opened document {}", path.display());
         Ok(())
@@ -7341,7 +7357,7 @@ impl Editor {
             .path
             .as_ref()
             .and_then(|p| p.parent().map(|d| d.to_path_buf()));
-        let (lines, images, runnables, source_map) = crate::markdown::render_markdown_mapped(
+        let (lines, images, runnables, source_map, links) = crate::markdown::render_markdown_mapped(
             &text,
             self.theme,
             &mut self.registry,
@@ -7353,6 +7369,7 @@ impl Editor {
             md.source_map = source_map;
             md.images = images;
             md.runnables = runnables;
+            md.links = links;
             md.built_seq = self.edit_seq;
         }
     }
@@ -8108,7 +8125,7 @@ impl Editor {
             .path
             .as_ref()
             .and_then(|p| p.parent().map(|d| d.to_path_buf()));
-        let (lines, images, runnables, source_map) = crate::markdown::render_markdown_mapped(
+        let (lines, images, runnables, source_map, links) = crate::markdown::render_markdown_mapped(
             &text,
             self.theme,
             &mut self.registry,
@@ -8136,6 +8153,7 @@ impl Editor {
             source_map,
             row_of_line: Vec::new(),
             scroll_to_source,
+            links,
         });
         true
     }
@@ -8182,6 +8200,7 @@ impl Editor {
             source_map: Vec::new(),
             row_of_line: Vec::new(),
             scroll_to_source: None,
+            links: crate::markdown::MdLinks::default(),
         });
         true
     }
@@ -8501,11 +8520,23 @@ impl Editor {
         edits: &[TextSpanEdit],
         seat: crate::provenance::Seat,
     ) -> usize {
+        self.apply_span_edits_as_in(edits, seat, None)
+    }
+
+    /// [`Self::apply_span_edits_as`] in the undo step `group`, joined as by
+    /// [`Self::apply_remote_span_edits`]: a completion and the auto-import
+    /// its server resolves after it went in undo as one (#928).
+    pub fn apply_span_edits_as_in(
+        &mut self,
+        edits: &[TextSpanEdit],
+        seat: crate::provenance::Seat,
+        group: Option<u64>,
+    ) -> usize {
         if edits.is_empty() {
             return 0;
         }
         self.pin_on_edit();
-        self.push_undo(EditKind::Paste);
+        self.push_undo_step(EditKind::Paste, group);
         let applied = self.apply_document_edits(edits);
         let n = applied.iter().map(|(_, count)| count).sum();
         if n > 0 {
@@ -8656,6 +8687,15 @@ impl Editor {
         for sel in self.selection.iter_mut().chain(self.carets.iter_mut()) {
             sel.anchor = clamp(map(sel.anchor));
             sel.head = clamp(map(sel.head));
+        }
+        // A live snippet's stops move with their text too: an import a
+        // completion's server resolved after it expanded (#928) would
+        // otherwise send the next Tab into the import block.
+        if let Some(session) = self.snippet.as_mut() {
+            session.anchor = map(session.anchor);
+            for stop in &mut session.stops {
+                (stop.0, stop.1) = map((stop.0, stop.1));
+            }
         }
         self.clamp_cursor();
     }
@@ -8915,8 +8955,15 @@ impl Editor {
     /// navigator's accepted stream, an agent's write — and which one is
     /// making THIS edit is known only at the call site.
     pub fn insert_str_as(&mut self, s: &str, seat: crate::provenance::Seat) {
+        self.insert_str_as_in(s, seat, None);
+    }
+
+    /// [`Self::insert_str_as`] in the undo step `group`, joined as by
+    /// [`Self::apply_span_edits_as_in`]: a snippet completion's body goes in
+    /// the step of the edit that accepted it (#928).
+    pub fn insert_str_as_in(&mut self, s: &str, seat: crate::provenance::Seat, group: Option<u64>) {
         self.pin_on_edit();
-        self.push_undo(EditKind::Paste);
+        self.push_undo_step(EditKind::Paste, group);
         // A selection is deleted FIRST, and the map has to learn about that
         // deletion separately: without this, the lines below a multi-line
         // selection keep their old indices while the buffer's lines shift up,
@@ -9051,9 +9098,22 @@ impl Editor {
         prefix_len: usize,
         vars: &dyn Fn(&str) -> Option<String>,
     ) {
+        self.expand_snippet_with_in(body, prefix_len, vars, None);
+    }
+
+    /// [`Self::expand_snippet_with`] in the undo step `group`: a completion
+    /// that is a snippet expands in the step of its accept, which the
+    /// auto-import its server resolves afterwards joins too (#928).
+    pub fn expand_snippet_with_in(
+        &mut self,
+        body: &str,
+        prefix_len: usize,
+        vars: &dyn Fn(&str) -> Option<String>,
+        group: Option<u64>,
+    ) {
         self.snippet = None;
         for _ in 0..prefix_len {
-            self.backspace();
+            self.backspace_in(group);
         }
         let start = (self.cursor_row, self.cursor_col);
         let indent: String = self
@@ -9101,7 +9161,7 @@ impl Editor {
             text.replace('\n', &format!("\n{indent}"))
         };
         // A snippet body is text the user chose, not text they wrote (#349).
-        self.insert_str_as(&inserted, crate::provenance::Seat::Generated);
+        self.insert_str_as_in(&inserted, crate::provenance::Seat::Generated, group);
 
         let mut abs: std::collections::VecDeque<(usize, usize, usize)> = parsed
             .stops
@@ -9360,11 +9420,17 @@ impl Editor {
     }
 
     pub fn backspace(&mut self) {
+        self.backspace_in(None);
+    }
+
+    /// [`Self::backspace`] in the undo step `group`: a grouped snippet's
+    /// typed prefix goes in the step its body joins (#928).
+    fn backspace_in(&mut self, group: Option<u64>) {
         if self.at_symbol_edge(false) {
             return;
         }
         self.pin_on_edit();
-        self.push_undo(EditKind::Backspace);
+        self.push_undo_step(EditKind::Backspace, group);
         // Between an empty auto-close pair, backspace eats both sides —
         // typing `(` then backspace must round-trip to nothing (#121).
         // ONLY for the pair the last auto-close inserted, still untouched
@@ -20317,7 +20383,7 @@ impl Editor {
                 .path
                 .as_ref()
                 .and_then(|p| p.parent().map(|d| d.to_path_buf()));
-            let (lines, images, runnables, source_map) = crate::markdown::render_markdown_mapped(
+            let (lines, images, runnables, map, links) = crate::markdown::render_markdown_mapped(
                 &text,
                 self.theme,
                 &mut self.registry,
@@ -20326,9 +20392,10 @@ impl Editor {
             );
             if let Some(md) = self.markdown_preview.as_mut() {
                 md.lines = lines;
-                md.source_map = source_map;
+                md.source_map = map;
                 md.images = images;
                 md.runnables = runnables;
+                md.links = links;
                 md.built_seq = self.edit_seq;
             }
         }
@@ -23711,6 +23778,19 @@ mod tests {
             e.collab_doc_gen, 7,
             "a same-path reload must keep its attachment so the reload broadcasts as edits"
         );
+    }
+
+    /// #928: a snippet expanded in an undo group removes its typed prefix
+    /// in that group too, so one Undo brings the prefix back with the body
+    /// gone, not an empty line.
+    #[test]
+    fn a_grouped_snippet_undoes_its_prefix_removal_with_its_body() {
+        let mut e = editor_with("");
+        e.insert_str("for");
+        e.expand_snippet_with_in("for ${1:i} in ${2:xs}:", 3, &|_| None, Some(9));
+        assert_eq!(e.lines[0], "for i in xs:");
+        assert!(e.undo());
+        assert_eq!(e.lines[0], "for", "one undo restores the typed prefix");
     }
 
     #[test]
