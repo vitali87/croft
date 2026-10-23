@@ -1108,9 +1108,13 @@ struct LangCapabilitySupport {
     /// Concatenated on-type trigger characters per language (#254);
     /// a missing entry means "not probed yet".
     on_type_triggers: HashMap<Language, String>,
-    /// The `triggerCharacters` of each language's completion server (#929);
-    /// no entry while no running server for the language completes.
-    completion_triggers: HashMap<Language, String>,
+    /// The `triggerCharacters` of each server instance's completion server
+    /// (#929), by (language, project root) as `request_completion` picks it;
+    /// no entry while none of that instance's running servers completes.
+    completion_triggers: HashMap<ClientKey, String>,
+    /// The project root each open document's servers run at (#929), so a
+    /// file's typed triggers are those of the server that answers it.
+    document_roots: HashMap<PathBuf, PathBuf>,
     /// The servers reporting on each open document, by name (#851): the
     /// built-in Markdown lint stands down for a file only while rumdl
     /// reports on it. A document the app never opened here (one shown only
@@ -2182,22 +2186,32 @@ impl LspManager {
     }
 
     /// The characters that ask for completions as they are typed in
-    /// `path` (#929): its completion server's `triggerCharacters`, empty
-    /// when it lists none. `None` while no running server completes the
-    /// file's language, where nothing typed asks.
+    /// `path` (#929): the `triggerCharacters` of the completion server at
+    /// the file's project root, empty when it lists none. `None` while the
+    /// file is open on no running server that completes, where nothing
+    /// typed asks.
     pub fn completion_triggers(&self, path: &Path) -> Option<String> {
         let lang = path_to_language(path)?;
         let support = self.capability_support.lock().ok()?;
-        support.completion_triggers.get(&lang).cloned()
+        let root = support.document_roots.get(path)?.clone();
+        support.completion_triggers.get(&(lang, root)).cloned()
     }
 
-    /// Test hook: `lang`'s completion server lists `triggers`, unstarted.
+    /// Test hook: `path` is open at its directory, whose completion server
+    /// lists `triggers`, unstarted.
     #[cfg(test)]
-    pub fn set_completion_triggers_for_test(&self, lang: crate::lsp::Language, triggers: &str) {
+    pub fn set_completion_triggers_for_test(&self, path: &Path, triggers: &str) {
+        let Some(lang) = path_to_language(path) else {
+            return;
+        };
+        let root = path.parent().unwrap_or(path).to_path_buf();
         if let Ok(mut support) = self.capability_support.lock() {
             support
+                .document_roots
+                .insert(path.to_path_buf(), root.clone());
+            support
                 .completion_triggers
-                .insert(lang, triggers.to_string());
+                .insert((lang, root), triggers.to_string());
         }
     }
 
@@ -3521,8 +3535,8 @@ impl WorkerState {
                 match spawned.iter().find(|c| c.supports_completion) {
                     Some(c) => support
                         .completion_triggers
-                        .insert(lang, c.completion_triggers.clone()),
-                    None => support.completion_triggers.remove(&lang),
+                        .insert(key.clone(), c.completion_triggers.clone()),
+                    None => support.completion_triggers.remove(&key),
                 };
                 support.code_action.insert(lang, supports_code_action);
                 support.call_hierarchy.insert(lang, supports_call_hierarchy);
@@ -3678,6 +3692,9 @@ impl WorkerState {
         if let Ok(mut support) = self.capability_support.lock() {
             support.document_servers.insert(path.clone(), reporting);
             support.document_clients.insert(path.clone(), open_on);
+            support
+                .document_roots
+                .insert(path.clone(), project_root.clone());
         }
         self.docs.insert(
             path,
@@ -3771,6 +3788,7 @@ impl WorkerState {
         if let Ok(mut support) = self.capability_support.lock() {
             support.document_servers.remove(&path);
             support.document_clients.remove(&path);
+            support.document_roots.remove(&path);
         }
         let Ok(uri) = Url::from_file_path(&path) else {
             return;
@@ -13348,7 +13366,8 @@ while True:
     /// #1529: an `isIncomplete` list reaches the app as such, and the
     /// re-ask goes out as `TriggerForIncompleteCompletions` (3); a first
     /// ask stays `Invoked` (1). #929: a trigger character goes as one (2),
-    /// and the server's one-character `triggerCharacters` are recorded.
+    /// and the server's one-character `triggerCharacters` are recorded for
+    /// its own project root, which another root's probe does not touch.
     #[test]
     fn an_incomplete_completion_list_is_reported_and_re_asked_with_kind_3() {
         if !is_on_path("python3") {
@@ -13417,7 +13436,10 @@ while True:
         let typed = rx.recv_timeout(Duration::from_secs(30)).expect("reply");
         assert_eq!(typed.items[0].label, "kind2/", "a trigger character");
         let support = state.capability_support.lock().unwrap();
-        let triggers = support.completion_triggers.get(&Language::PYTHON);
+        let doc_root = support.document_roots[&file].clone();
+        let triggers = support
+            .completion_triggers
+            .get(&(Language::PYTHON, doc_root.clone()));
         assert_eq!(triggers.map(String::as_str), Some("/@"), "not `->`");
         drop(support);
         assert!(first.is_incomplete, "isIncomplete reaches the app");
@@ -13427,6 +13449,24 @@ while True:
             again.items[0].label, "kind3",
             "the re-ask is TriggerForIncompleteCompletions"
         );
+        // Another project root of the language, whose probe finds no server
+        // that completes, leaves this root's triggers as they were.
+        state.registry = ServerRegistry::new();
+        let other = root.join("other");
+        runtime
+            .handle()
+            .clone()
+            .block_on(state.ensure_clients(Language::PYTHON, &other));
+        let support = state.capability_support.lock().unwrap();
+        let kept = support
+            .completion_triggers
+            .get(&(Language::PYTHON, doc_root));
+        assert_eq!(
+            kept.map(String::as_str),
+            Some("/@"),
+            "kept for its own root"
+        );
+        drop(support);
         runtime.handle().clone().block_on(state.shutdown_all());
     }
 

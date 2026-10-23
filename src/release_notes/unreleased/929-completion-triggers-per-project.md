@@ -1,0 +1,1 @@
+fix: In a workspace with several projects in one language, each file's completion opens on the trigger characters of its own project's language server, and a project with no server running no longer stops them in the others.
