@@ -18,7 +18,7 @@ Resizes call `master.resize(...)` and `term.resize(...)` so programs like `htop`
 src/
 ├── main.rs              entry point + module declarations
 ├── cli.rs               clap CLI: open path, setup-terminal / setup-iterm2 / setup-cross / remote / view / keys subcommands
-├── clipboard.rs         native macOS clipboard read/write (NSPasteboard) with pbpaste fallback
+├── clipboard.rs         native macOS clipboard read/write (NSPasteboard) with pbpaste fallback, wl-paste / xclip / xsel on Linux, and croft's own last copy, which a paste inside croft falls back to where the host clipboard can't be read (an SSH host with no clipboard tool)
 ├── command_history.rs    durable cross-session shell command history as JSONL under `~/.config/croft/command_history.jsonl` (cwd / exit / duration), read off OSC 133 marks with no shell hooks; Ctrl+Shift+H opens the search popup
 ├── fleet.rs              running one command across N ssh hosts and diffing the results, behind "Terminal: Fleet Run"; the fleet must be named (`hosts: command`, `*` for explicit broadcast)
 ├── gh.rs                what croft says when the GitHub CLI is missing or signed out: one shared message for every `gh` caller (`croft pr`, PR review, code scanning, CodeQL), plus the installed-and-signed-in check `croft pr` runs before taking the terminal (offline `gh auth token` first)
