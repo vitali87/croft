@@ -232,8 +232,9 @@ impl ServerConfig {
             // probes PATH + ~/.cargo/bin BEFORE this, so a toolchain
             // rust-analyzer matching the user's rustc always wins and cargo
             // stays reachable; croft downloads its own copy only when none
-            // exists anywhere — which is what makes "open a .rs → get LSP" hold
-            // on a fresh box. On Termux the linux-gnu build can't run on bionic
+            // exists anywhere, or the one there is a rustup proxy whose
+            // toolchain lacks the component (#927) — which is what makes
+            // "open a .rs → get LSP" hold on a fresh box. On Termux the linux-gnu build can't run on bionic
             // libc, so the install reroutes to `pkg install rust-analyzer`.
             provision: Some(crate::lsp::install::Provision::Binary {
                 targets: RUST_ANALYZER_TARGETS,

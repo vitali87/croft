@@ -21,7 +21,7 @@
 //! blocked, and a failure just leaves that language's LSP unavailable (with a
 //! status-bar note pointing at the cause).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -148,6 +148,29 @@ pub(crate) fn set_status(msg: impl Into<String>) {
 /// per tick; `Some` means "show this in the status bar and redraw".
 pub fn take_status() -> Option<String> {
     STATUS.lock().ok().and_then(|mut g| g.take())
+}
+
+/// The user's own way to get a server, keyed by server name, for the servers
+/// croft downloads only because their toolchain copy cannot run (#927). A
+/// failed download then names it on the status line instead of leaving the
+/// user with the log alone.
+static FAILURE_HINTS: Mutex<BTreeMap<&'static str, String>> = Mutex::new(BTreeMap::new());
+
+/// The status line for a failed install of `name`: `msg`, then the hint
+/// [`FAILURE_HINTS`] holds for it, if any.
+pub(crate) fn failure_status(name: &str, msg: String) -> String {
+    match FAILURE_HINTS.lock().ok().and_then(|h| h.get(name).cloned()) {
+        Some(hint) => format!("{msg}; {hint}"),
+        None => msg,
+    }
+}
+
+/// Show "`name` install failed (`detail`)" on the status line, with its hint.
+fn set_failed(name: &str, detail: &str) {
+    set_status(failure_status(
+        name,
+        format!("{name} install failed ({detail})"),
+    ));
 }
 
 /// Languages whose managed server finished installing since the last call. The
@@ -288,6 +311,36 @@ pub fn resolve_managed(
             config.name
         ));
     }
+    None
+}
+
+/// [`resolve_managed`] for a binary server whose copy on PATH cannot run
+/// here, such as a rustup proxy whose toolchain lacks the component (#927):
+/// croft's own download, never the PATH copy, started in the background when
+/// it is missing. `why` says what is wrong with the PATH copy and `fix` how
+/// the user can mend it. The status line carries both while croft's copy
+/// serves, and `fix` if its download fails.
+pub fn resolve_managed_instead(
+    config: &ServerConfig,
+    provision: &Provision,
+    why: &str,
+    fix: &str,
+) -> Option<(ServerConfig, Vec<PathBuf>)> {
+    let Provision::Binary { bin, bin_path, .. } = provision else {
+        return resolve_managed(config, provision, false);
+    };
+    if let Some(p) = managed_binary_path(config.name, bin, *bin_path)
+        && p.is_file()
+    {
+        set_status(format!("{why}; using croft's copy (or run: {fix})"));
+        let mut resolved = config.clone();
+        resolved.command = p.to_string_lossy().into_owned();
+        return Some((resolved, Vec::new()));
+    }
+    if let Ok(mut hints) = FAILURE_HINTS.lock() {
+        hints.insert(config.name, format!("run: {fix}"));
+    }
+    ensure_in_background(config, provision);
     None
 }
 
@@ -886,9 +939,7 @@ fn run_binary_install(name: &'static str, language: Language, spec: BinarySpec<'
     };
     if let Err(e) = std::fs::create_dir_all(&dir) {
         log_file::log(&format!("lsp[{name}] could not create {dir:?}: {e}"));
-        set_status(format!(
-            "{name} install failed (could not create install dir)"
-        ));
+        set_failed(name, "could not create install dir");
         return;
     }
 
@@ -908,9 +959,7 @@ fn run_binary_install(name: &'static str, language: Language, spec: BinarySpec<'
                 crate::output::OutputLevel::Error,
                 &format!("{name}: download failed: {url}: {why}"),
             );
-            set_status(format!(
-                "{name} install failed: {why} (see ~/.croft/lsp.log)"
-            ));
+            set_failed(name, &format!("{why}, see ~/.croft/lsp.log"));
             return;
         }
     };
@@ -943,16 +992,14 @@ fn run_binary_install(name: &'static str, language: Language, spec: BinarySpec<'
             crate::output::OutputLevel::Error,
             &format!("{name}: extract failed: {e}"),
         );
-        set_status(format!(
-            "{name} install failed (extract error, see ~/.croft/lsp.log)"
-        ));
+        set_failed(name, "extract error, see ~/.croft/lsp.log");
         return;
     }
     if !target.is_file() {
         log_file::log(&format!(
             "lsp[{name}] expected binary missing after extract: {target:?}"
         ));
-        set_status(format!("{name} install failed (unexpected archive layout)"));
+        set_failed(name, "unexpected archive layout");
         return;
     }
     log_file::log(&format!("lsp[{name}] managed binary install complete"));
