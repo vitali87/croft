@@ -127,6 +127,13 @@ pub struct AnsiStream {
 /// the copy of it each chunk updates, without bound.
 const OPEN_LINE_CAP: usize = 64 * 1024;
 
+/// How long an escape sequence a chunk ends inside of may be held back
+/// waiting for its end: an OSC with no terminator (an `ESC ]` in binary
+/// output, say) would otherwise be kept, and rescanned on every chunk,
+/// without bound. Past it the held bytes are dropped, as a terminal
+/// swallows an escape it never sees the end of.
+const ESCAPE_CAP: usize = 64 * 1024;
+
 impl AnsiStream {
     /// Parse the next chunk and return the lines it ends, blank ones
     /// included. Text after its last newline joins the open line,
@@ -136,7 +143,11 @@ impl AnsiStream {
         let mut raw = std::mem::take(&mut self.cut);
         raw.push_str(text);
         let whole = raw.len() - unfinished_escape_len(&raw);
-        self.cut = raw[whole..].to_string();
+        self.cut = if raw.len() - whole > ESCAPE_CAP {
+            String::new()
+        } else {
+            raw[whole..].to_string()
+        };
         let mut ended = Vec::new();
         let mut rest = &raw[..whole];
         loop {
@@ -758,6 +769,26 @@ mod tests {
         assert_eq!(ended[0].text.len(), OPEN_LINE_CAP);
         assert_eq!(ended[0].spans.len(), 1, "one run, not one per dot");
         assert_eq!(stream.open_line(), None);
+    }
+
+    /// An escape that never ends (an OSC with no terminator) is held back
+    /// only up to its cap and then dropped, so it cannot grow without bound,
+    /// and the output after it still comes through.
+    #[test]
+    fn an_unfinished_escape_is_dropped_at_its_cap() {
+        let mut stream = AnsiStream::default();
+        stream.feed("\u{1b}]0;");
+        let chunk = "x".repeat(1024);
+        for _ in 0..ESCAPE_CAP / chunk.len() + 2 {
+            stream.feed(&chunk);
+            assert!(
+                stream.cut.len() <= ESCAPE_CAP,
+                "{} held back",
+                stream.cut.len()
+            );
+        }
+        let ended = stream.feed("done\n");
+        assert!(ended.last().unwrap().text.ends_with("done"));
     }
 
     #[test]
