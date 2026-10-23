@@ -25425,17 +25425,22 @@ impl App {
         if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             self.status_wide = false;
         }
-        // Screencast Mode shows the key before it is dispatched, while the
-        // prompt or pane it goes to is still the one open: typing bound for
-        // a password field or the shell is then known to be that.
-        if self.screencast.is_on() && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat)
-        {
-            let second_step = self
+        // Screencast Mode reads where the key goes before it is dispatched,
+        // while the prompt or pane it goes to is still the one open: typing
+        // bound for a password field or the shell is then known to be that.
+        // A key answering an armed `Cmd+K` is shown once it is dispatched,
+        // as a chord step only if it completed one: one that matched nothing
+        // goes on to the prompt or shell like any other key.
+        let screencast_key = self.screencast.is_on()
+            && matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat);
+        let leader_armed = screencast_key
+            && self
                 .cmd_k_leader
                 .is_some_and(|at| at.elapsed() <= CMD_K_LEADER_TIMEOUT);
-            let hide_typing = self.screencast_hides_typing();
+        let hide_typing = screencast_key && self.screencast_hides_typing();
+        if screencast_key && !leader_armed {
             self.screencast
-                .press(key, std::time::Instant::now(), second_step, hide_typing);
+                .press(key, std::time::Instant::now(), false, hide_typing);
         }
         // Esc dismisses an open ssh-pane offer (#364) without being consumed:
         // the offer is a status-bar hint, not a modal, so whatever Esc meant
@@ -25457,6 +25462,11 @@ impl App {
             && key.kind == KeyEventKind::Press;
         let before = zen_esc.then(|| self.esc_fingerprint());
         let result = self.recording_file_switches(|app| app.handle_key_inner(key));
+        if leader_armed {
+            let chord = self.screencast.take_chord_step();
+            self.screencast
+                .press(key, std::time::Instant::now(), chord, hide_typing);
+        }
         self.screencast.end_key();
         match before {
             Some(before) if before == self.esc_fingerprint() => {
@@ -25555,6 +25565,7 @@ impl App {
             && started.elapsed() <= CMD_K_LEADER_TIMEOUT
             && self.handle_cmd_k_chord(key)
         {
+            self.screencast.note_chord_step();
             return Ok(());
         }
         // Modal layer: the unsupported-terminal nudge sits on top of everything

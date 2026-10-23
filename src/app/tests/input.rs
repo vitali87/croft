@@ -494,6 +494,13 @@ fn screencast_mode_leaves_out_typing_into_a_password_field_or_the_shell() {
         app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
             .unwrap();
     }
+    app.handle_key(key(KeyCode::Char('q'), KeyModifiers::ALT))
+        .unwrap();
+    assert_eq!(
+        app.input_prompt.as_ref().unwrap().value,
+        "hunter2q",
+        "the field took the Alt-held character as part of the secret"
+    );
     app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
         .unwrap();
     assert!(app.input_prompt.is_none(), "Esc closed the prompt");
@@ -507,15 +514,39 @@ fn screencast_mode_leaves_out_typing_into_a_password_field_or_the_shell() {
     app.handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL))
         .unwrap();
     assert_eq!(app.screencast.row_text(200), " Esc   Ctrl+C ");
+    // `Cmd+K` leads in the shell too. A second key that completes no chord
+    // goes on to the shell, so it is left out; one that does is shown.
+    let cmd = if cfg!(target_os = "macos") {
+        "Cmd"
+    } else {
+        "Super"
+    };
+    app.handle_key(key(KeyCode::Char('k'), KeyModifiers::SUPER))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('?'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        app.screencast.row_text(200),
+        format!(" Esc   Ctrl+C   {cmd}+K "),
+        "the ? went to the shell"
+    );
+    app.handle_key(key(KeyCode::Char('k'), KeyModifiers::SUPER))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('k'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        app.screencast.row_text(200),
+        format!(" Esc   Ctrl+C   {cmd}+K   {cmd}+K K "),
+        "Cmd+K K cleared the terminal"
+    );
 
     app.focus = Pane::Editor;
     for c in "ok".chars() {
         app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
             .unwrap();
     }
-    assert_eq!(
-        app.screencast.row_text(200),
-        " Esc   Ctrl+C   ok ",
+    assert!(
+        app.screencast.row_text(200).ends_with(" ok "),
         "typing in the editor shows"
     );
 }

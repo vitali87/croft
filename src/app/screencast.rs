@@ -67,6 +67,9 @@ pub(super) struct Screencast {
     /// The chip the key being dispatched made, so the command it runs is
     /// named on that chip and no other.
     current: Option<usize>,
+    /// The key being dispatched completed a `Cmd+K` chord: croft took it
+    /// as a command, so it reached no prompt or shell.
+    chord_step: bool,
 }
 
 impl Screencast {
@@ -84,11 +87,12 @@ impl Screencast {
         self.on
     }
 
-    /// Show a key press. `second_step`: the key answers an armed `Cmd+K`
-    /// leader, so it joins the leader's chip. `hide_typing`: what is typed
-    /// here may be secret (a password field, the shell, which may be
-    /// reading one with echo off), so a typed character is left out; chords
-    /// and named keys still show.
+    /// Show a key press. `second_step`: the key completed a `Cmd+K` chord,
+    /// so it joins the leader's chip. `hide_typing`: what is typed here may
+    /// be secret (a password field, the shell, which may be reading one with
+    /// echo off), so a key that would type a character there is left out,
+    /// `Alt` held or not, as a masked field types it either way; chords and
+    /// named keys still show.
     pub(super) fn press(
         &mut self,
         key: KeyEvent,
@@ -97,10 +101,10 @@ impl Screencast {
         hide_typing: bool,
     ) {
         self.current = None;
+        if !self.on || (!second_step && hide_typing && types_a_character(key)) {
+            return;
+        }
         if !second_step && let Some(c) = typed_char(key) {
-            if hide_typing {
-                return;
-            }
             match self.chips.last_mut() {
                 Some(run) if run.typed => {
                     run.text.push(c);
@@ -119,11 +123,17 @@ impl Screencast {
                 return;
             };
             match self.chips.last_mut() {
+                // A counted leader (`Ctrl+K ×2`, the first one's step left
+                // out) gives up only its last press to the chord.
                 Some(leader) if second_step && !leader.typed => {
-                    leader.text.push(' ');
-                    leader.text.push_str(&label);
-                    leader.count = 1;
-                    leader.command = None;
+                    let chord = format!("{} {label}", leader.text);
+                    if leader.count > 1 {
+                        leader.count -= 1;
+                        self.chips.push(Chip::keys(chord));
+                    } else {
+                        leader.text = chord;
+                        leader.command = None;
+                    }
                     self.merge_repeated_chord();
                 }
                 Some(last) if !second_step && !last.typed && last.text == label => {
@@ -156,11 +166,24 @@ impl Screencast {
         }
     }
 
+    /// The key being dispatched completed a `Cmd+K` chord.
+    pub(super) fn note_chord_step(&mut self) {
+        self.chord_step = self.on;
+    }
+
+    /// Whether the key just dispatched completed a `Cmd+K` chord.
+    pub(super) fn take_chord_step(&mut self) -> bool {
+        std::mem::take(&mut self.chord_step)
+    }
+
     /// A paste from the host terminal (its Cmd+V, or Ctrl+Shift+V), which
     /// reaches croft as text and never as a key. It shows as `Paste`, never
     /// the text: what is pasted is as likely as anything to be a secret.
     pub(super) fn pasted(&mut self, now: Instant) {
         self.current = None;
+        if !self.on {
+            return;
+        }
         match self.chips.last_mut() {
             Some(last) if !last.typed && last.text == "Paste" => last.count += 1,
             _ => self.chips.push(Chip::keys(String::from("Paste"))),
@@ -193,6 +216,9 @@ impl Screencast {
         modifiers: KeyModifiers,
         now: Instant,
     ) {
+        if !self.on {
+            return;
+        }
         self.click = Some((col, row, now));
         let mods = modifier_names(modifiers, false, cfg!(target_os = "macos"));
         if mods.is_empty() {
@@ -361,6 +387,16 @@ fn typed_char(key: KeyEvent) -> Option<char> {
         return c.to_uppercase().next();
     }
     Some(c)
+}
+
+/// Whether a key types a character into a text field or the shell: a
+/// character with neither `Ctrl` nor `Cmd` held, the test a masked input
+/// prompt applies before it takes one, `Alt` included.
+fn types_a_character(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char(_))
+        && !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
 }
 
 /// The modifiers held, in the order croft's shortcut hints name them and
@@ -559,10 +595,19 @@ mod tests {
         s.press(leader, now, false, false);
         s.press(z, now, true, false);
         assert_eq!(s.row_text(80), " Ctrl+K Z \u{d7}2 ");
-        // The second step of a chord is never typing, even in the shell.
+        // A chord step croft took as a command is never typing, even in
+        // the shell.
         s.press(leader, now, false, true);
         s.press(k(KeyCode::Char('k'), KeyModifiers::NONE), now, true, true);
         assert_eq!(s.row_text(80), " Ctrl+K Z \u{d7}2   Ctrl+K K ");
+        // A leader whose step went to the shell, then a whole chord: the
+        // first press keeps its chip.
+        let mut s = on();
+        s.press(leader, now, false, true);
+        s.press(k(KeyCode::Char('?'), KeyModifiers::NONE), now, false, true);
+        s.press(leader, now, false, true);
+        s.press(k(KeyCode::Char('k'), KeyModifiers::NONE), now, true, true);
+        assert_eq!(s.row_text(80), " Ctrl+K   Ctrl+K K ");
     }
 
     #[test]
@@ -572,10 +617,29 @@ mod tests {
         for c in "hunter2".chars() {
             s.press(k(KeyCode::Char(c), KeyModifiers::NONE), now, false, true);
         }
+        // A masked field types an Alt-held character too.
+        s.press(k(KeyCode::Char('q'), KeyModifiers::ALT), now, false, true);
         s.press(k(KeyCode::Enter, KeyModifiers::NONE), now, false, true);
         let row = s.row_text(80);
         assert_eq!(row, " Enter ");
         assert!(!row.contains("hunter"));
+        // Where nothing is secret, Alt+Q is a chord like any other.
+        s.press(k(KeyCode::Char('q'), KeyModifiers::ALT), now, false, false);
+        assert_eq!(s.row_text(80), " Enter   Alt+Q ");
+    }
+
+    #[test]
+    fn off_it_records_nothing() {
+        let now = Instant::now();
+        let mut s = Screencast::default();
+        s.press(k(KeyCode::Tab, KeyModifiers::NONE), now, false, false);
+        s.pasted(now);
+        s.click(1, 1, MouseButton::Left, KeyModifiers::CONTROL, now);
+        s.note_chord_step();
+        assert!(!s.take_chord_step());
+        assert!(s.toggle());
+        assert_eq!(s.row_text(80), "");
+        assert!(!s.expire(now + LINGER), "nothing was waiting to go");
     }
 
     #[test]
