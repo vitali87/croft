@@ -800,7 +800,7 @@ fn typing_with_images_on_does_not_stream_images_per_keystroke() {
     std::fs::write(&file, "fn main() {\n    println!(\"hi\");\n}\n".repeat(300)).unwrap();
 
     let (mut master, mut slave) = (0, 0);
-    let ws = libc::winsize {
+    let mut ws = libc::winsize {
         ws_row: 50,
         ws_col: 160,
         ws_xpixel: 160 * 9,
@@ -812,12 +812,21 @@ fn typing_with_images_on_does_not_stream_images_per_keystroke() {
                 &mut master,
                 &mut slave,
                 std::ptr::null_mut(),
-                std::ptr::null(),
-                &ws,
+                std::ptr::null_mut(),
+                &raw mut ws,
             )
         },
         0
     );
+    // Neither end may leak into croft or what it starts: a leaked master
+    // keeps the terminal open after the test closes it, and macOS then
+    // holds a killed croft in its exit until its output is read.
+    for fd in [master, slave] {
+        assert_ne!(
+            unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) },
+            -1
+        );
+    }
     let slave = unsafe { OwnedFd::from_raw_fd(slave) };
     let bin = assert_cmd::cargo::cargo_bin("croft");
     let mut cmd = std::process::Command::new(bin);
@@ -874,6 +883,9 @@ fn typing_with_images_on_does_not_stream_images_per_keystroke() {
     }
     typed += drain(Duration::from_secs(1));
     let _ = child.kill();
+    // macOS holds a killed process in its exit while output sits unread on
+    // its terminal, so the terminal closes before the wait.
+    drop((pty, tty));
     let _ = child.wait();
     assert!(
         typed < 30_000,
@@ -897,7 +909,7 @@ fn unsaved_edits_survive_a_kill_and_come_back_on_the_next_launch() {
     /// croft on a fresh pty in `dir` (also its HOME), and the pty's master.
     fn spawn(dir: &std::path::Path, args: &[&str]) -> (std::process::Child, std::fs::File) {
         let (mut master, mut slave) = (0, 0);
-        let ws = libc::winsize {
+        let mut ws = libc::winsize {
             ws_row: 40,
             ws_col: 140,
             ws_xpixel: 0,
@@ -908,11 +920,20 @@ fn unsaved_edits_survive_a_kill_and_come_back_on_the_next_launch() {
                 &mut master,
                 &mut slave,
                 std::ptr::null_mut(),
-                std::ptr::null(),
-                &ws,
+                std::ptr::null_mut(),
+                &raw mut ws,
             )
         };
         assert_eq!(opened, 0);
+        // Neither end may leak into croft or what it starts: a leaked master
+        // keeps the terminal open after the test closes it, and macOS then
+        // holds a killed croft in its exit until its output is read.
+        for fd in [master, slave] {
+            assert_ne!(
+                unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) },
+                -1
+            );
+        }
         let slave = unsafe { OwnedFd::from_raw_fd(slave) };
         let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin("croft"));
         cmd.args(args)
@@ -1011,6 +1032,9 @@ fn unsaved_edits_survive_a_kill_and_come_back_on_the_next_launch() {
         "a backup holds the edit"
     );
     child.kill().unwrap();
+    // macOS holds a killed process in its exit while output sits unread on
+    // its terminal, so the terminal closes before the wait.
+    drop(pty);
     child.wait().unwrap();
     assert_eq!(
         std::fs::read_to_string(&file).unwrap(),
@@ -1023,6 +1047,7 @@ fn unsaved_edits_survive_a_kill_and_come_back_on_the_next_launch() {
         out.contains("HOTEXITalpha") && out.contains("restored 1 unsaved tab")
     });
     let _ = child.kill();
+    drop(pty);
     let _ = child.wait();
     assert!(
         drawn.contains("HOTEXITalpha"),
@@ -1313,7 +1338,7 @@ fn locale_template_write_for_english_writes_nothing() {
 #[cfg(unix)]
 struct PtyCroft {
     child: std::process::Child,
-    pty: std::fs::File,
+    pty: std::mem::ManuallyDrop<std::fs::File>,
 }
 
 #[cfg(unix)]
@@ -1323,7 +1348,7 @@ impl PtyCroft {
         use std::os::unix::process::CommandExt;
 
         let (mut master, mut slave) = (0, 0);
-        let ws = libc::winsize {
+        let mut ws = libc::winsize {
             ws_row: 40,
             ws_col: 140,
             ws_xpixel: 0,
@@ -1335,12 +1360,21 @@ impl PtyCroft {
                     &mut master,
                     &mut slave,
                     std::ptr::null_mut(),
-                    std::ptr::null(),
-                    &ws,
+                    std::ptr::null_mut(),
+                    &raw mut ws,
                 )
             },
             0
         );
+        // Neither end may leak into croft or what it starts: a leaked master
+        // keeps the terminal open after the test closes it, and macOS then
+        // holds a killed croft in its exit until its output is read.
+        for fd in [master, slave] {
+            assert_ne!(
+                unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) },
+                -1
+            );
+        }
         let slave = unsafe { OwnedFd::from_raw_fd(slave) };
         let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin("croft"));
         cmd.args(args)
@@ -1369,7 +1403,10 @@ impl PtyCroft {
             libc::fcntl(master, libc::F_SETFL, flags | libc::O_NONBLOCK);
         }
         let pty = unsafe { std::fs::File::from_raw_fd(master) };
-        Self { child, pty }
+        Self {
+            child,
+            pty: std::mem::ManuallyDrop::new(pty),
+        }
     }
 
     /// What croft writes until `done` holds, checked on everything read so
@@ -1416,6 +1453,10 @@ const PTY_LIMIT: std::time::Duration = std::time::Duration::from_secs(20);
 impl Drop for PtyCroft {
     fn drop(&mut self) {
         let _ = self.child.kill();
+        // macOS holds a killed process in its exit while output it wrote
+        // sits unread on its terminal, so the terminal closes before the
+        // wait. The kill comes first, so croft never sees the hangup.
+        unsafe { std::mem::ManuallyDrop::drop(&mut self.pty) };
         let _ = self.child.wait();
     }
 }
