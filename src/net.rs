@@ -78,18 +78,23 @@ fn tls_config() -> Arc<rustls::ClientConfig> {
 /// the OS store holds. The Mozilla roots stay so a machine whose store is
 /// empty or unreadable still connects as it did before.
 fn client_config(platform: Vec<CertificateDer<'static>>) -> Arc<rustls::ClientConfig> {
-    let mut roots = rustls::RootCertStore {
-        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
-    };
-    roots.add_parsable_certificates(platform);
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     Arc::new(
         rustls::ClientConfig::builder_with_provider(provider)
             .with_safe_default_protocol_versions()
             .expect("ring supports TLS 1.2 and 1.3")
-            .with_root_certificates(roots)
+            .with_root_certificates(root_store(platform))
             .with_no_client_auth(),
     )
+}
+
+/// The Mozilla roots plus `platform`, the roots [`client_config`] trusts.
+fn root_store(platform: Vec<CertificateDer<'static>>) -> rustls::RootCertStore {
+    let mut roots = rustls::RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+    };
+    roots.add_parsable_certificates(platform);
+    roots
 }
 
 /// The proxy for `url`, read from `env` as curl reads it: `https_proxy` for
@@ -225,6 +230,80 @@ pub(crate) mod tests {
         assert!(why.contains("UnknownIssuer"), "{why}");
         assert!(why.contains("SSL_CERT_FILE"), "{why}");
         assert!(!why.contains("127.0.0.1"), "no URL in the reason: {why}");
+    }
+
+    /// A PEM file from `src/net/testdata`: the chains the eMudhra test hosts
+    /// served (leaf first, captured 20 October 2026), and the two roots those
+    /// chains end at, which macOS's store still carries (#1912).
+    fn testdata(name: &str) -> Vec<CertificateDer<'static>> {
+        use rustls::pki_types::pem::PemObject;
+        let pem = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src/net/testdata")
+            .join(name);
+        CertificateDer::pem_file_iter(pem)
+            .unwrap()
+            .map(Result::unwrap)
+            .collect()
+    }
+
+    /// Verify `host`'s chain against [`root_store`] at a time inside every
+    /// fixture leaf's validity, so only trust decides the outcome.
+    fn verify(platform: Vec<CertificateDer<'static>>, host: &str) -> Result<(), rustls::Error> {
+        use rustls::client::danger::ServerCertVerifier;
+        use rustls::pki_types::{ServerName, UnixTime};
+        let chain = testdata(&format!("{host}.pem"));
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
+            Arc::new(root_store(platform)),
+            provider,
+        )
+        .build()
+        .unwrap();
+        let now = UnixTime::since_unix_epoch(std::time::Duration::from_secs(1_792_800_000));
+        let name = ServerName::try_from(host.to_string()).unwrap();
+        verifier
+            .verify_server_cert(&chain[0], &chain[1..], &name, &[], now)
+            .map(|_| ())
+    }
+
+    #[test]
+    fn a_compromised_emudhra_chain_is_refused_though_the_platform_trusts_its_root() {
+        // One chain through emSign ECC Root CA - G3, one through the Sectigo
+        // cross-sign under AAA Certificate Services.
+        for host in [
+            "dv-g3b-emudhra.we-have-a-problem.com",
+            "dv-g3b-aaa-emudhra.we-have-a-problem.com",
+        ] {
+            let refused = verify(testdata("emudhra-roots.pem"), host);
+            assert!(
+                matches!(refused, Err(rustls::Error::InvalidCertificate(_))),
+                "{host}: {refused:?}"
+            );
+        }
+        // The same store and clock still accept an ordinary chain.
+        verify(
+            testdata("emudhra-roots.pem"),
+            "emudhra.we-have-a-problem.com",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn the_mozilla_roots_no_longer_carry_the_distrusted_emsign_roots() {
+        let subjects: Vec<String> = root_store(Vec::new())
+            .roots
+            .iter()
+            .map(|anchor| String::from_utf8_lossy(anchor.subject.as_ref()).into_owned())
+            .collect();
+        for gone in [
+            "emSign ECC Root CA - G3",
+            "emSign ECC Root CA - C3",
+            "emSign Root CA - C1",
+        ] {
+            assert!(!subjects.iter().any(|s| s.contains(gone)), "{gone}");
+        }
+        // A kept eMudhra root, so the match above can see these names at all.
+        assert!(subjects.iter().any(|s| s.contains("emSign Root CA - G1")));
     }
 
     #[test]
