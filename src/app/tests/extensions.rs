@@ -88,7 +88,7 @@ fn uninstalling_an_extension_forgets_its_consent() {
     crate::prefs::save_mcp_consent_in(&croft, "csvlens").unwrap();
     app.consented_extensions.insert("csvlens".into());
     app.disabled_extensions.insert("csvlens".into());
-    crate::prefs::save_disabled_extensions_in(&croft, &app.disabled_extensions).unwrap();
+    crate::prefs::save_extension_enabled_in(&croft, "csvlens", false).unwrap();
     app.perform_extension_uninstall("csvlens");
     let disabled_on_disk = crate::prefs::Prefs::load(&croft.join("config.json"))
         .unwrap_or_default()

@@ -44,7 +44,7 @@ fn codeql_icon_sits_below_testing_and_opens_the_codeql_side_bar() {
     let home = tempfile::tempdir().unwrap();
     with_relay_home(home.path(), || {
         let tmp = tempfile::tempdir().unwrap();
-        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let mut app = codeql_app(tmp.path());
         let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
         term.draw(|f| app.render(f)).unwrap();
         let ql = app.sidebar_areas.codeql_icon;
@@ -94,7 +94,7 @@ fn codeql_add_database_button_offers_the_four_sources_in_a_picker() {
     let home = tempfile::tempdir().unwrap();
     with_relay_home(home.path(), || {
         let tmp = tempfile::tempdir().unwrap();
-        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let mut app = codeql_app(tmp.path());
         app.open_codeql_view();
         app.focus = Pane::Tree;
         app.codeql.select_action(Action::AddDatabase);
@@ -158,7 +158,7 @@ fn codeql_database_card_picker_switches_the_current_database() {
     let home = tempfile::tempdir().unwrap();
     with_relay_home(home.path(), || {
         let tmp = tempfile::tempdir().unwrap();
-        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let mut app = codeql_app(tmp.path());
         for (name, lang) in [("flask-db", "python"), ("gin-db", "go")] {
             let db = make_codeql_db(tmp.path(), name, lang);
             app.submit_codeql_database(
@@ -261,7 +261,7 @@ fn codeql_history_export_chip_reaches_the_export_prompt() {
                 ("new.ql", 200, RunStatus::Succeeded, out("200-new")),
             ],
         );
-        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let mut app = codeql_app(tmp.path());
         // A database, so the first-run card leaves the history in view.
         let db = make_codeql_db(tmp.path(), "app", "python");
         app.submit_codeql_database(
@@ -338,7 +338,7 @@ fn codeql_focus_side_bar_and_open_results_directory_are_palette_commands() {
     let home = tempfile::tempdir().unwrap();
     with_relay_home(home.path(), || {
         let tmp = tempfile::tempdir().unwrap();
-        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let mut app = codeql_app(tmp.path());
         app.config_dir = tmp.path().join("config");
         assert_eq!(
             Command::from_id("codeql_focus_side_bar"),
@@ -389,7 +389,7 @@ fn disabling_codeql_hides_its_icon_and_leaves_its_view() {
     let home = tempfile::tempdir().unwrap();
     with_relay_home(home.path(), || {
         let tmp = tempfile::tempdir().unwrap();
-        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let mut app = codeql_app(tmp.path());
         // Never write the developer's real ~/.config/croft from a test.
         app.config_dir = tmp.path().join("config");
         app.open_codeql_view();
@@ -423,6 +423,55 @@ fn disabling_codeql_hides_its_icon_and_leaves_its_view() {
     });
 }
 
+/// #1905: CodeQL ships off. A fresh croft has no QL icon and no CodeQL
+/// commands in the palette, and View: Show CodeQL says how to turn it on;
+/// turning it on in the Extensions view brings both back and is saved.
+#[test]
+fn codeql_ships_off_until_turned_on_in_the_extensions_view() {
+    // Opening the CodeQL view reads croft's cache, whose test override is
+    // process-global: without the lock and a cache of its own, this test
+    // reads whatever another CodeQL test has there at the time.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        // Never write the developer's real ~/.config/croft from a test.
+        app.config_dir = tmp.path().join("config");
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        assert_eq!(app.sidebar_areas.codeql_icon.width, 0, "no QL icon");
+        assert!(
+            !run_from_palette(&mut app, "CodeQL: Focus Side Bar"),
+            "no CodeQL commands in the palette"
+        );
+        assert!(run_from_palette(&mut app, "View: Show CodeQL"));
+        assert_ne!(app.sidebar_view, SidebarView::CodeQL);
+        assert!(
+            app.status.contains("enable it in the Extensions view"),
+            "{}",
+            app.status
+        );
+
+        app.refresh_extensions();
+        let pos = app
+            .extensions
+            .visible_indices()
+            .iter()
+            .position(|&i| app.extensions.items()[i].id == "codeql")
+            .expect("the CodeQL row is listed");
+        app.extensions.select(pos);
+        app.toggle_selected_extension();
+        assert_eq!(app.status, "Enabled extension 'codeql'");
+        term.draw(|f| app.render(f)).unwrap();
+        assert!(app.sidebar_areas.codeql_icon.width > 0, "the icon is back");
+        assert!(run_from_palette(&mut app, "CodeQL: Focus Side Bar"));
+        assert_eq!(app.sidebar_view, SidebarView::CodeQL);
+        let saved = crate::prefs::Prefs::load(&app.config_dir.join("config.json")).unwrap();
+        assert!(saved.enabled_extensions.contains("codeql"));
+    });
+}
+
 fn make_codeql_db(root: &std::path::Path, name: &str, lang: &str) -> std::path::PathBuf {
     let dir = root.join(name);
     std::fs::create_dir_all(&dir).unwrap();
@@ -453,7 +502,7 @@ fn adding_a_codeql_database_from_a_folder_lists_and_persists_it() {
     with_relay_home(home.path(), || {
         let tmp = tempfile::tempdir().unwrap();
         let db = make_codeql_db(tmp.path(), "flask-db", "python");
-        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let mut app = codeql_app(tmp.path());
         app.submit_codeql_database(
             crate::widgets::input_prompt::CodeqlDbSource::Folder,
             &db.display().to_string(),
@@ -466,7 +515,7 @@ fn adding_a_codeql_database_from_a_folder_lists_and_persists_it() {
         assert_eq!(app.codeql.databases.len(), 1);
         assert_eq!(app.codeql.current_db, Some(0));
         // A new session lists it too.
-        let mut again = App::new(tmp.path().to_path_buf()).unwrap();
+        let mut again = codeql_app(tmp.path());
         again.open_codeql_view();
         assert_eq!(again.codeql.databases.len(), 1, "the list persists");
         assert_eq!(
@@ -675,7 +724,7 @@ fn a_folder_without_a_codeql_database_is_refused_and_selection_persists() {
     let home = tempfile::tempdir().unwrap();
     with_relay_home(home.path(), || {
         let tmp = tempfile::tempdir().unwrap();
-        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let mut app = codeql_app(tmp.path());
         app.submit_codeql_database(
             crate::widgets::input_prompt::CodeqlDbSource::Folder,
             &tmp.path().display().to_string(),
@@ -699,7 +748,7 @@ fn a_folder_without_a_codeql_database_is_refused_and_selection_persists() {
             crate::widgets::codeql::Action::SelectDatabase(0),
         ));
         assert_eq!(app.codeql.current_db, Some(0));
-        let mut again = App::new(tmp.path().to_path_buf()).unwrap();
+        let mut again = codeql_app(tmp.path());
         again.open_codeql_view();
         assert_eq!(again.codeql.current_db, Some(0), "the selection persists");
     });
@@ -718,7 +767,7 @@ fn codeql_databases_are_renamed_sorted_revealed_and_removed_from_the_side_bar() 
         let mine = make_codeql_db(tmp.path(), "flask-db", "python");
         let cached_root = App::codeql_db_cache_dir().join("kafka");
         let cached = make_codeql_db(&cached_root, "java", "java");
-        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let mut app = codeql_app(tmp.path());
         for db in [&mine, &cached] {
             app.submit_codeql_database(
                 crate::widgets::input_prompt::CodeqlDbSource::Folder,
@@ -923,7 +972,7 @@ fn codeql_query_history_is_renamed_sorted_opened_and_removed_from_the_side_bar()
                 ),
             ],
         );
-        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let mut app = codeql_app(tmp.path());
         app.open_codeql_view();
         app.focus = Pane::Tree;
         let press = |app: &mut App, code: KeyCode| {
@@ -5115,7 +5164,7 @@ fn creating_a_codeql_query_writes_opens_and_lists_it_in_the_selected_pack() {
         std::fs::create_dir_all(&pack).unwrap();
         std::fs::write(pack.join("qlpack.yml"), "name: acme/go\nextractor: go\n").unwrap();
         std::fs::write(pack.join("a.ql"), "select 1").unwrap();
-        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let mut app = codeql_app(tmp.path());
         app.open_codeql_view();
         wait_for_codeql_queries(&mut app);
         app.focus = Pane::Tree;
@@ -5164,7 +5213,7 @@ fn creating_a_codeql_query_writes_opens_and_lists_it_in_the_selected_pack() {
 
         // An empty workspace: the welcome row, in the chosen language.
         let empty = tempfile::tempdir().unwrap();
-        let mut app = App::new(empty.path().to_path_buf()).unwrap();
+        let mut app = codeql_app(empty.path());
         app.open_codeql_view();
         wait_for_codeql_queries(&mut app);
         app.focus = Pane::Tree;
@@ -5232,7 +5281,7 @@ fn opening_the_codeql_view_does_not_wait_for_the_query_walk() {
         std::fs::create_dir_all(&pack).unwrap();
         std::fs::write(pack.join("qlpack.yml"), "name: acme/go\nextractor: go\n").unwrap();
         std::fs::write(pack.join("a.ql"), "select 1").unwrap();
-        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let mut app = codeql_app(tmp.path());
         app.open_codeql_view();
         assert_eq!(app.sidebar_view, SidebarView::CodeQL);
         assert!(
@@ -5610,7 +5659,7 @@ fn codeql_variant_analysis_repositories_are_set_up_from_the_side_bar_and_palette
     let home = tempfile::tempdir().unwrap();
     with_relay_home(home.path(), || {
         let tmp = tempfile::tempdir().unwrap();
-        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let mut app = codeql_app(tmp.path());
         app.open_codeql_view();
         app.focus = Pane::Tree;
         let press = |app: &mut App, code: KeyCode| {
@@ -5701,7 +5750,7 @@ fn codeql_variant_analysis_repositories_are_set_up_from_the_side_bar_and_palette
         assert_eq!(app.status, "Open https://github.com/e/f");
 
         // It persists for the next session.
-        let mut again = App::new(tmp.path().to_path_buf()).unwrap();
+        let mut again = codeql_app(tmp.path());
         again.open_codeql_view();
         assert_eq!(again.codeql.variant, saved());
 
@@ -5849,7 +5898,7 @@ echo '{{"id": 4242, "actions_workflow_run_id": 99, "skipped_repositories": {{"no
             ),
         );
 
-        let mut app = App::new(ws.clone()).unwrap();
+        let mut app = codeql_app(&ws);
         app.gh_program = gh;
         app.set_codeql_program(codeql);
         let finish = |app: &mut App| {
@@ -6337,7 +6386,7 @@ esac
         .unwrap();
         std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let mut app = codeql_app(tmp.path());
         app.gh_program = gh.clone();
         app.open_codeql_view();
         app.focus = Pane::Tree;
@@ -6455,7 +6504,7 @@ fn opening_the_codeql_view_returns_before_the_query_walk_lands() {
         std::fs::create_dir_all(&pack).unwrap();
         std::fs::write(pack.join("qlpack.yml"), "name: acme/go\nextractor: go\n").unwrap();
         std::fs::write(pack.join("a.ql"), "select 1").unwrap();
-        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let mut app = codeql_app(tmp.path());
         app.open_codeql_view();
         assert_eq!(app.sidebar_view, SidebarView::CodeQL);
         let names: Vec<&str> = app.codeql.queries.iter().map(|p| p.name.as_str()).collect();
@@ -6541,7 +6590,7 @@ fn a_query_walk_of_a_root_the_workspace_left_never_lands() {
     with_relay_home(home.path(), || {
         let a = codeql_pack_workspace_840("acme/a");
         let b = codeql_pack_workspace_840("acme/b");
-        let mut app = App::new(a.path().to_path_buf()).unwrap();
+        let mut app = codeql_app(a.path());
         app.open_codeql_view();
         assert!(
             app.codeql_queries_job.is_some(),
@@ -6570,7 +6619,7 @@ fn reopening_codeql_after_a_workspace_switch_walks_the_new_root() {
     with_relay_home(home.path(), || {
         let a = codeql_pack_workspace_840("acme/a");
         let b = codeql_pack_workspace_840("acme/b");
-        let mut app = App::new(a.path().to_path_buf()).unwrap();
+        let mut app = codeql_app(a.path());
         app.open_codeql_view();
         app.change_workspace_root(b.path().to_path_buf());
         // Undrained, a's walk is still in flight here, landed or not.
@@ -6590,7 +6639,7 @@ fn a_query_walk_of_the_current_root_still_lands() {
     let home = tempfile::tempdir().unwrap();
     with_relay_home(home.path(), || {
         let a = codeql_pack_workspace_840("acme/a");
-        let mut app = App::new(a.path().to_path_buf()).unwrap();
+        let mut app = codeql_app(a.path());
         app.open_codeql_view();
         app.open_codeql_view();
         wait_for_codeql_queries(&mut app);

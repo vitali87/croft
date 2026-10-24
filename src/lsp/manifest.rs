@@ -90,6 +90,12 @@ pub struct ExtensionManifest {
     /// appear in the user-facing Extensions panel.
     #[serde(default)]
     pub hidden: bool,
+    /// A bundled extension croft ships switched off (#1905), such as CodeQL:
+    /// it stays off until the user turns it on in the Extensions panel. Read
+    /// from the bundled manifests only (see [`off_by_default`]); an extension
+    /// the user installed was added on purpose, so it starts on.
+    #[serde(default)]
+    pub off_by_default: bool,
     #[allow(dead_code)] // a required manifest key; croft never reads it back
     pub api_version: u32,
     #[serde(default)]
@@ -614,6 +620,21 @@ pub fn summaries(sources: &[&str]) -> Vec<ExtensionSummary> {
         .collect()
 }
 
+/// The ids of the bundled extensions that ship switched off
+/// ([`ExtensionManifest::off_by_default`]), parsed once.
+pub fn off_by_default() -> &'static std::collections::BTreeSet<String> {
+    static IDS: std::sync::OnceLock<std::collections::BTreeSet<String>> =
+        std::sync::OnceLock::new();
+    IDS.get_or_init(|| {
+        BUNDLED_MANIFESTS
+            .iter()
+            .filter_map(|s| parse(s).ok())
+            .filter(|m| m.off_by_default)
+            .map(|m| m.id)
+            .collect()
+    })
+}
+
 /// The strings handed out by [`intern`], so each distinct string is leaked
 /// once however often it is asked for.
 static INTERNED: std::sync::Mutex<std::collections::BTreeSet<&'static str>> =
@@ -1101,6 +1122,14 @@ provision = { kind = "binary", bin = "rbin", archive = "raw", targets = { "macos
         // ...and the hidden infrastructure manifest does not.
         assert!(!ids.contains(&"core-languages"));
         assert!(s.iter().all(|e| e.builtin));
+    }
+
+    /// #1905: CodeQL ships off; everything else ships on, its test runner
+    /// included, since that claims only a CodeQL test pack.
+    #[test]
+    fn only_codeql_ships_off() {
+        let off: Vec<&str> = off_by_default().iter().map(String::as_str).collect();
+        assert_eq!(off, ["codeql"]);
     }
 
     #[test]

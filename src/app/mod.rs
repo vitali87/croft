@@ -3382,10 +3382,11 @@ pub struct App {
     /// Which layer set each top-level settings key, for the hub's
     /// provenance suffix ("· workspace").
     settings_provenance: std::collections::BTreeMap<String, crate::config_layers::LayerKind>,
-    /// Extension ids the user has disabled in the Extensions panel. Loaded once
-    /// from prefs at startup and persisted on every toggle, mirroring how
-    /// `explorer_views` is held in memory rather than re-read each access. The
-    /// gates for the bundled features (PDF/CSV/Vim/LSPs) consult this set.
+    /// Extension ids that are off: disabled in the Extensions panel, or shipped
+    /// off and never turned on (#1905). Loaded once from prefs at startup and
+    /// persisted on every toggle, mirroring how `explorer_views` is held in
+    /// memory rather than re-read each access. The gates for the bundled
+    /// features (PDF/CSV/Vim/CodeQL/LSPs) consult this set.
     disabled_extensions: std::collections::BTreeSet<String>,
     /// User key bindings from `~/.config/croft/keybindings.json`, consulted
     /// ahead of the built-in chords so a rebind wins over the default.
@@ -6385,7 +6386,7 @@ impl App {
         }
         let watch_set = std::sync::Arc::new(matchers.watch_set());
         let explorer_views = ExplorerViewVisibility::from_prefs(loaded_prefs.explorer_views);
-        let disabled_extensions = loaded_prefs.disabled_extensions.clone();
+        let disabled_extensions = loaded_prefs.effective_disabled_extensions();
         let (timeline_tx, timeline_rx) = std::sync::mpsc::channel();
         let (codeql_size_tx, codeql_size_rx) = std::sync::mpsc::channel();
         let (history_done_tx, history_done_rx) = std::sync::mpsc::channel();
@@ -26987,9 +26988,10 @@ impl App {
                 // Drop any stale disabled-state for the removed id so a later
                 // re-add starts enabled, matching a fresh install.
                 if self.disabled_extensions.remove(id) {
-                    saved = saved.and(crate::prefs::save_disabled_extensions_in(
+                    saved = saved.and(crate::prefs::save_extension_enabled_in(
                         &self.config_dir,
-                        &self.disabled_extensions,
+                        id,
+                        true,
                     ));
                 }
                 // And its consent: a re-add is a program the user has not
@@ -33557,8 +33559,7 @@ impl App {
         } else {
             self.disabled_extensions.insert(id.to_string());
         }
-        let mut saved =
-            crate::prefs::save_disabled_extensions_in(&self.config_dir, &self.disabled_extensions);
+        let mut saved = crate::prefs::save_extension_enabled_in(&self.config_dir, id, enabled);
         // Turning an extension off forgets its tools' fingerprints, so
         // turning it back on re-approves a tool whose definition changed.
         if !enabled {
@@ -55074,6 +55075,16 @@ impl App {
                 C::RustRebuildProcMacros,
                 C::RustReloadWorkspace,
             ]);
+        }
+        // CodeQL's commands only while it is on (#1905): it ships off, and
+        // View: Show CodeQL stays listed to say how to turn it on.
+        if !self.is_extension_enabled("codeql") {
+            hidden.extend(
+                crate::widgets::command_palette::ALL_COMMANDS
+                    .iter()
+                    .copied()
+                    .filter(|c| c.title().starts_with("CodeQL: ")),
+            );
         }
         palette.set_hidden(hidden);
         // The chords as keybindings.json leaves them (#1482): a user's own

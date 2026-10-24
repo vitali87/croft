@@ -1299,7 +1299,7 @@ impl LspManager {
         // language. The set is read from prefs at construction; a live toggle
         // takes effect on the next manager rebuild (re-root / relaunch).
         crate::lsp::languages::init_with_user_sources(&user_refs);
-        let disabled = crate::prefs::Prefs::load_or_default().disabled_extensions;
+        let disabled = crate::prefs::Prefs::load_or_default().effective_disabled_extensions();
         let registry = ServerRegistry::with_user_extensions_filtered(&user_refs, &disabled);
         let registered_servers: HashMap<Language, Vec<&'static str>> = registry
             .languages()

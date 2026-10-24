@@ -114,7 +114,7 @@ fn all_sources() -> Vec<String> {
 /// on each call — detection runs on discover/run, never per keystroke, so a
 /// panel toggle takes effect on the next discovery.
 pub fn runner_for(root: &Path) -> Option<Runner> {
-    let disabled = crate::prefs::Prefs::load_or_default().disabled_extensions;
+    let disabled = crate::prefs::Prefs::load_or_default().effective_disabled_extensions();
     resolve(&all_sources(), &disabled, root)
 }
 
@@ -221,13 +221,13 @@ fn resolve_test_root(
 
 /// [`resolve_test_root`] over the enabled extensions.
 pub fn test_root_for(root: &Path, file: Option<&Path>) -> PathBuf {
-    let disabled = crate::prefs::Prefs::load_or_default().disabled_extensions;
+    let disabled = crate::prefs::Prefs::load_or_default().effective_disabled_extensions();
     resolve_test_root(&all_sources(), &disabled, root, file)
 }
 
 /// Every enabled runner that claims `root` (#1408), [`runner_for`]'s first.
 pub fn runners_for(root: &Path) -> Vec<Runner> {
-    let disabled = crate::prefs::Prefs::load_or_default().disabled_extensions;
+    let disabled = crate::prefs::Prefs::load_or_default().effective_disabled_extensions();
     resolve_all(&all_sources(), &disabled, root)
 }
 

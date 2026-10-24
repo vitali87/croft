@@ -87,7 +87,7 @@ fn all_sources_in_dir(config_dir: &Path) -> Vec<String> {
 fn disabled_in_dir(config_dir: &Path) -> BTreeSet<String> {
     crate::prefs::Prefs::load(&config_dir.join("config.json"))
         .unwrap_or_default()
-        .disabled_extensions
+        .effective_disabled_extensions()
 }
 
 /// Pure: every contributed command across `sources` whose extension is enabled,
@@ -281,7 +281,7 @@ pub fn contributed_viewer_commands_in_dir(config_dir: &Path) -> Vec<ContributedC
 /// extensions only). Reads prefs + manifests fresh; invoked when the palette is
 /// built, not on a hot path.
 pub fn contributed_commands() -> Vec<ContributedCommand> {
-    let disabled = crate::prefs::Prefs::load_or_default().disabled_extensions;
+    let disabled = crate::prefs::Prefs::load_or_default().effective_disabled_extensions();
     contributed_in(&all_sources(), &disabled)
 }
 

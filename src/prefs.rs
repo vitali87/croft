@@ -247,10 +247,16 @@ pub struct Prefs {
     #[serde(default)]
     pub diff_ignore_whitespace: String,
     /// Extension ids the user has disabled in the Extensions panel. Absent or
-    /// empty means every bundled and installed extension is enabled (the
-    /// default), so disabling is opt-in and an older config still parses.
+    /// empty means every bundled and installed extension is enabled except
+    /// the bundled ones that ship off, so disabling is opt-in and an older
+    /// config still parses. Gates read [`Prefs::effective_disabled_extensions`].
     #[serde(default)]
     pub disabled_extensions: BTreeSet<String>,
+    /// Bundled extensions that ship off (`off_by_default` in their manifest,
+    /// such as CodeQL) which the user has turned on (#1905). Absent or empty
+    /// leaves every one of them off.
+    #[serde(default)]
+    pub enabled_extensions: BTreeSet<String>,
     /// The first-launch tour was finished or skipped (#377): the welcome
     /// panel stops offering it.
     #[serde(default)]
@@ -746,6 +752,16 @@ impl Prefs {
     pub fn set_theme(&mut self, theme: Theme) {
         self.theme = theme.id().to_string();
     }
+
+    /// The extension ids that are off: those the user disabled, plus the
+    /// bundled ones that ship off (#1905) and were never turned on.
+    pub fn effective_disabled_extensions(&self) -> BTreeSet<String> {
+        crate::lsp::manifest::off_by_default()
+            .difference(&self.enabled_extensions)
+            .chain(&self.disabled_extensions)
+            .cloned()
+            .collect()
+    }
 }
 
 /// Persist `theme` to the config file, preserving any other settings already
@@ -1165,12 +1181,22 @@ fn prefs_file_in(config_dir: &Path) -> PathBuf {
     }
 }
 
-/// Persist the set of disabled extension ids, preserving other settings.
-/// The caller says on the status line when it fails.
-pub fn save_disabled_extensions_in(config_dir: &Path, disabled: &BTreeSet<String>) -> Result<()> {
+/// Persist turning extension `id` on or off, preserving other settings.
+/// Off is recorded in `disabled_extensions`; on clears that and, for a
+/// bundled extension that ships off (#1905), records it in
+/// `enabled_extensions`. The caller says on the status line when it fails.
+pub fn save_extension_enabled_in(config_dir: &Path, id: &str, enabled: bool) -> Result<()> {
     let path = prefs_file_in(config_dir);
     let mut prefs = Prefs::load_for_update(&path)?;
-    prefs.disabled_extensions = disabled.clone();
+    if enabled {
+        prefs.disabled_extensions.remove(id);
+        if crate::lsp::manifest::off_by_default().contains(id) {
+            prefs.enabled_extensions.insert(id.to_string());
+        }
+    } else {
+        prefs.disabled_extensions.insert(id.to_string());
+        prefs.enabled_extensions.remove(id);
+    }
     prefs.save(&path)
 }
 
@@ -1812,6 +1838,42 @@ mod tests {
     fn a_test_build_reads_no_saved_prefs() {
         assert_eq!(saved_prefs_path(), None);
         assert_eq!(Prefs::load_or_default(), Prefs::default());
+    }
+
+    /// #1905: CodeQL is off in a fresh or older config, turning it on is
+    /// remembered, and turning it off again sticks.
+    #[test]
+    fn codeql_ships_off_and_remembers_being_turned_on() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let off = |dir: &Path| {
+            Prefs::load(&dir.join("config.json"))
+                .unwrap()
+                .effective_disabled_extensions()
+        };
+        assert!(
+            Prefs::default()
+                .effective_disabled_extensions()
+                .contains("codeql")
+        );
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"disabled_extensions":["vim"]}"#,
+        )
+        .unwrap();
+        assert!(off(dir).contains("codeql") && off(dir).contains("vim"));
+
+        save_extension_enabled_in(dir, "codeql", true).unwrap();
+        save_extension_enabled_in(dir, "vim", true).unwrap();
+        assert!(!off(dir).contains("codeql") && !off(dir).contains("vim"));
+        let saved = Prefs::load(&dir.join("config.json")).unwrap();
+        assert_eq!(
+            saved.enabled_extensions,
+            BTreeSet::from(["codeql".to_string()])
+        );
+
+        save_extension_enabled_in(dir, "codeql", false).unwrap();
+        assert!(off(dir).contains("codeql"));
     }
 
     #[test]

@@ -188,7 +188,7 @@ impl Theme {
                 sources.extend(crate::lsp::manifest::read_extension_sources(
                     &crate::lsp::manifest::user_extensions_dir(),
                 ));
-                crate::prefs::Prefs::load_or_default().disabled_extensions
+                crate::prefs::Prefs::load_or_default().effective_disabled_extensions()
             };
             let themes: Vec<Theme> = sources
                 .iter()

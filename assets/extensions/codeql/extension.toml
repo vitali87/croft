@@ -1,10 +1,13 @@
 # Bundled croft extension: CodeQL.
 # The language server is the CodeQL CLI's own (`codeql execute language-server`),
 # expected on the user's PATH alongside the rest of the CLI.
+# Ships off (#1905): its view, commands and server appear once it is turned on
+# in the Extensions panel.
 id = "codeql"
 name = "CodeQL"
 description = "CodeQL databases, queries, query history, the AST viewer and the QL language server."
 builtin = true
+off_by_default = true
 api_version = 1
 
 [[languages]]

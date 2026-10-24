@@ -2292,6 +2292,14 @@ fn wait_for_codeql(app: &mut App) {
     }
 }
 
+/// An App over `root` with CodeQL turned on, as its users have it (#1905:
+/// it ships off). In memory only, so no config file is written.
+fn codeql_app(root: &std::path::Path) -> App {
+    let mut app = App::new(root.to_path_buf()).unwrap();
+    app.disabled_extensions.remove("codeql");
+    app
+}
+
 /// A workspace with `q.ql` open and database "app" current.
 fn codeql_query_fixture(tmp: &std::path::Path, source: &str) -> App {
     let db = tmp.join("dbs/app");
@@ -2310,7 +2318,7 @@ fn codeql_query_fixture(tmp: &std::path::Path, source: &str) -> App {
     store.save(&App::codeql_db_store_path()).unwrap();
     let q = tmp.join("q.ql");
     std::fs::write(&q, source).unwrap();
-    let mut app = App::new(tmp.to_path_buf()).unwrap();
+    let mut app = codeql_app(tmp);
     app.editor.open(&q).unwrap();
     app
 }

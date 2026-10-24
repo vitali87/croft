@@ -251,8 +251,8 @@ fn settings_gear_is_bottom_anchored_below_the_view_icons() {
     );
     assert_eq!(
         app.pending_activity_image_overlays().len(),
-        12,
-        "eight view icons + the settings gear + the three layout toolbar icons emit"
+        11,
+        "seven view icons (CodeQL ships off) + the settings gear + the three layout toolbar icons emit"
     );
 }
 

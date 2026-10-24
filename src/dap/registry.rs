@@ -81,7 +81,7 @@ fn all_sources() -> Vec<String> {
 /// prefs + manifests fresh on each call — launching a debugger is a rare user
 /// action, never a hot path, so a panel toggle takes effect on the next F5.
 pub fn adapter_for_extension(ext: &str) -> Option<AdapterKind> {
-    let disabled = crate::prefs::Prefs::load_or_default().disabled_extensions;
+    let disabled = crate::prefs::Prefs::load_or_default().effective_disabled_extensions();
     resolve(&all_sources(), &disabled, ext)
 }
 
@@ -90,7 +90,7 @@ pub fn adapter_for_extension(ext: &str) -> Option<AdapterKind> {
 /// Extensions" instead of the misleading "no debugger for this file type".
 /// `None` when an enabled adapter exists or nothing claims the extension.
 pub fn disabled_extension_for(ext: &str) -> Option<String> {
-    let disabled = crate::prefs::Prefs::load_or_default().disabled_extensions;
+    let disabled = crate::prefs::Prefs::load_or_default().effective_disabled_extensions();
     let sources = all_sources();
     let claims = matches(&sources, ext);
     if claims.iter().any(|m| !disabled.contains(&m.extension_id)) {

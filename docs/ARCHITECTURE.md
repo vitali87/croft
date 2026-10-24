@@ -154,7 +154,7 @@ src/
 │   ├── languages.rs     language table: file-extension -> language, root markers, and server family, all built from extension manifests' [[languages]] blocks (replaces the old hardcoded Language enum match arms)
 │   ├── log_file.rs      LSP stderr / debug log sink at ~/.croft/lsp.log
 │   ├── manager.rs            LSP lifecycle: workspace pre-warm at startup, spawn, did_open / did_change / did_save, completion, documentSymbol, inlay hints, documentHighlight and whole-project pull diagnostics
-│   ├── manifest.rs           declarative `extension.toml` loader for the extension system: parses a manifest's `[[languages]]`, `[[language_servers]]`, `[[themes]]`, `[[debug_adapters]]`, `[[test_runners]]`, `[[mcp_servers]]`, `[[commands]]` and `[[viewers]]` blocks
+│   ├── manifest.rs           declarative `extension.toml` loader for the extension system: parses a manifest's `[[languages]]`, `[[language_servers]]`, `[[themes]]`, `[[debug_adapters]]`, `[[test_runners]]`, `[[mcp_servers]]`, `[[commands]]` and `[[viewers]]` blocks, and the `off_by_default` flag a bundled extension ships off with
 │   ├── registry.rs      ServerRegistry (language -> ordered servers); built from the bundled manifests in assets/extensions/* plus user-installed extensions, instead of hardcoding configs
 │   ├── runtime.rs       Tokio runtime owned by the LSP manager
 │   ├── semantic_cache.rs content-keyed disk cache of semantic-token batches at `~/.croft/sem-cache`; a batch is applied or stored only while its `seq` still matches the live buffer, so a stale reply is never decoded over rewritten lines
@@ -1335,6 +1335,8 @@ The in-process OUTPUT bus behind the panel group's OUTPUT tab. It holds named ch
 ### prefs.rs
 
 Durable user preferences — color theme, Customize Layout chrome, format-on-save, auto-save — persisted at `~/.config/croft/config.json`. The searchable "Preferences: Open Settings" hub toggles these and links to the raw JSON.
+
+**Some bundled extensions ship off.** A bundled manifest with `off_by_default = true` (CodeQL, #1905) stays off until the user turns it on, which records its id in `enabled_extensions`; turning any extension off records it in `disabled_extensions`. `effective_disabled_extensions` combines the two with `lsp::manifest::off_by_default`, and every gate (the app, the LSP, debug, test, MCP and theme registries) reads that rather than the raw list.
 
 **`host_accents` dresses terminal panes per host.** Its rules ({pattern glob, accent hex, badge}) are compiled to globset matchers in the App and re-read whenever `config.json` is saved.
 

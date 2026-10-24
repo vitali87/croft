@@ -107,7 +107,7 @@ allowlist — appearance and editor/terminal behavior:
 `files_exclude`, `search_exclude`, `files_associations`, `languages` (only its
 per-language editor keys; see below), `files_encoding`.
 
-Everything else — `disabled_extensions`, `mcp_consented`, `disable_remote_offer`, `remote_offer_excluded_hosts`, `config_sync_excluded_hosts`, `config_sync_excluded_files`, `fleet_groups`, `code_scanning`, `lane_agent`,
+Everything else — `disabled_extensions`, `enabled_extensions`, `mcp_consented`, `disable_remote_offer`, `remote_offer_excluded_hosts`, `config_sync_excluded_hosts`, `config_sync_excluded_files`, `fleet_groups`, `code_scanning`, `lane_agent`,
 `mcp_tool_fingerprints`, `host_accents`, `notifications`, `screen_reader`, `screen_reader_command`, `codeql_cli_path`, `locale`, `terminal_multiline_paste_warning`, and any future key not explicitly
 allowlisted — is ignored from workspace layers with a visible warning.
 Extending the allowlist is a deliberate review decision, not a default.
@@ -333,6 +333,11 @@ whatever the setting. **SARIF: Open GitHub Code Scanning Analysis** picks any
 one analysis by hand.
 
 ## The CodeQL CLI
+
+CodeQL ships off. Turn on **CodeQL** in the Extensions view for its side bar,
+its palette commands and the QL language server; croft records that in
+`enabled_extensions`. Its test runner stays on, since it only claims a CodeQL
+test pack.
 
 `codeql_cli_path` names the CodeQL CLI croft runs, such as
 `"~/tools/codeql/codeql"`. When it is unset or not a file, croft uses
