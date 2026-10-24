@@ -813,7 +813,7 @@ fn typing_with_images_on_does_not_stream_images_per_keystroke() {
                 &mut slave,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                &mut ws,
+                &raw mut ws,
             )
         },
         0
@@ -921,7 +921,7 @@ fn unsaved_edits_survive_a_kill_and_come_back_on_the_next_launch() {
                 &mut slave,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
-                &mut ws,
+                &raw mut ws,
             )
         };
         assert_eq!(opened, 0);
@@ -1361,7 +1361,7 @@ impl PtyCroft {
                     &mut slave,
                     std::ptr::null_mut(),
                     std::ptr::null_mut(),
-                    &mut ws,
+                    &raw mut ws,
                 )
             },
             0
