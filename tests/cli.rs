@@ -800,7 +800,7 @@ fn typing_with_images_on_does_not_stream_images_per_keystroke() {
     std::fs::write(&file, "fn main() {\n    println!(\"hi\");\n}\n".repeat(300)).unwrap();
 
     let (mut master, mut slave) = (0, 0);
-    let ws = libc::winsize {
+    let mut ws = libc::winsize {
         ws_row: 50,
         ws_col: 160,
         ws_xpixel: 160 * 9,
@@ -812,8 +812,8 @@ fn typing_with_images_on_does_not_stream_images_per_keystroke() {
                 &mut master,
                 &mut slave,
                 std::ptr::null_mut(),
-                std::ptr::null(),
-                &ws,
+                std::ptr::null_mut(),
+                &mut ws,
             )
         },
         0
@@ -897,7 +897,7 @@ fn unsaved_edits_survive_a_kill_and_come_back_on_the_next_launch() {
     /// croft on a fresh pty in `dir` (also its HOME), and the pty's master.
     fn spawn(dir: &std::path::Path, args: &[&str]) -> (std::process::Child, std::fs::File) {
         let (mut master, mut slave) = (0, 0);
-        let ws = libc::winsize {
+        let mut ws = libc::winsize {
             ws_row: 40,
             ws_col: 140,
             ws_xpixel: 0,
@@ -908,8 +908,8 @@ fn unsaved_edits_survive_a_kill_and_come_back_on_the_next_launch() {
                 &mut master,
                 &mut slave,
                 std::ptr::null_mut(),
-                std::ptr::null(),
-                &ws,
+                std::ptr::null_mut(),
+                &mut ws,
             )
         };
         assert_eq!(opened, 0);
@@ -1323,7 +1323,7 @@ impl PtyCroft {
         use std::os::unix::process::CommandExt;
 
         let (mut master, mut slave) = (0, 0);
-        let ws = libc::winsize {
+        let mut ws = libc::winsize {
             ws_row: 40,
             ws_col: 140,
             ws_xpixel: 0,
@@ -1335,8 +1335,8 @@ impl PtyCroft {
                     &mut master,
                     &mut slave,
                     std::ptr::null_mut(),
-                    std::ptr::null(),
-                    &ws,
+                    std::ptr::null_mut(),
+                    &mut ws,
                 )
             },
             0
