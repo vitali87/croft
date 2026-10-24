@@ -3387,6 +3387,11 @@ pub struct App {
     /// `explorer_views` is held in memory rather than re-read each access. The
     /// gates for the bundled features (PDF/CSV/Vim/LSPs) consult this set.
     disabled_extensions: std::collections::BTreeSet<String>,
+    /// Ids of the installed extensions: the bundled ones plus those in the
+    /// user extensions dir at launch, kept current as the Extensions panel
+    /// adds and uninstalls. A catalog extension's feature, such as CodeQL's
+    /// side bar (#1842), stays off until it is added.
+    installed_extensions: std::collections::BTreeSet<String>,
     /// User key bindings from `~/.config/croft/keybindings.json`, consulted
     /// ahead of the built-in chords so a rebind wins over the default.
     keymap: crate::keymap::Keymap,
@@ -6386,6 +6391,13 @@ impl App {
         let watch_set = std::sync::Arc::new(matchers.watch_set());
         let explorer_views = ExplorerViewVisibility::from_prefs(loaded_prefs.explorer_views);
         let disabled_extensions = loaded_prefs.disabled_extensions.clone();
+        // Under test only the bundled set: an extension the developer added
+        // must never steer app tests; a test adds what it needs.
+        let installed_extensions = if cfg!(test) {
+            crate::mcp::catalog::bundled_ids()
+        } else {
+            crate::mcp::catalog::installed_ids(&crate::lsp::manifest::user_extensions_dir())
+        };
         let (timeline_tx, timeline_rx) = std::sync::mpsc::channel();
         let (codeql_size_tx, codeql_size_rx) = std::sync::mpsc::channel();
         let (history_done_tx, history_done_rx) = std::sync::mpsc::channel();
@@ -6483,6 +6495,7 @@ impl App {
             extensions,
             vscode_listed: Vec::new(),
             disabled_extensions,
+            installed_extensions,
             // Built from `loaded_keymap` above, which applies the same
             // cfg!(test) guard main landed here independently: the
             // developer's real keybindings.json must never steer app tests.
@@ -26927,12 +26940,29 @@ impl App {
                 .selected_install_target()
                 .map(str::to_string)
                 .unwrap_or(id);
-            match crate::mcp::catalog::install(&id) {
+            match crate::mcp::catalog::install_in(&self.config_dir.join("extensions"), &id) {
                 Ok(_) => {
+                    self.installed_extensions.insert(id.clone());
+                    // Adding is asking for it: a disabled state left from
+                    // when it was built in (CodeQL, #1842) must not hide it.
+                    if self.disabled_extensions.remove(&id) {
+                        let saved = crate::prefs::save_disabled_extensions_in(
+                            &self.config_dir,
+                            &self.disabled_extensions,
+                        );
+                        self.report_unsaved_setting(saved);
+                    }
                     self.refresh_extensions();
-                    self.status = format!(
-                        "Added '{id}' — invoke it from the Command Palette (its server installs on first use)"
-                    );
+                    if id == "codeql" {
+                        self.codeql_availability_changed();
+                        self.status = String::from(
+                            "Added 'codeql' — open it from the QL icon in the activity bar; its language server starts on the next launch",
+                        );
+                    } else {
+                        self.status = format!(
+                            "Added '{id}' — invoke it from the Command Palette (its server installs on first use)"
+                        );
+                    }
                 }
                 Err(e) => self.status = format!("Could not add '{id}': {e}"),
             }
@@ -26995,7 +27025,11 @@ impl App {
                 // And its consent: a re-add is a program the user has not
                 // approved this time, so the first-run gate asks again.
                 saved = saved.and(self.forget_extension_consent(id));
+                self.installed_extensions.remove(id);
                 self.refresh_extensions();
+                if id == "codeql" {
+                    self.codeql_availability_changed();
+                }
                 self.status = format!("Uninstalled '{id}' — it's back under AVAILABLE to re-add");
                 self.report_unsaved_setting(saved);
             }
@@ -27021,10 +27055,23 @@ impl App {
         crate::prefs::forget_mcp_consent_in(&self.config_dir, id)
     }
 
-    /// Whether the extension `id` is currently enabled (not in the disabled set).
-    /// The single gate the bundled features consult before activating.
+    /// Whether the extension `id` is installed and not in the disabled set.
+    /// The single gate the shipped features consult before activating.
     fn is_extension_enabled(&self, id: &str) -> bool {
-        !self.disabled_extensions.contains(id)
+        self.installed_extensions.contains(id) && !self.disabled_extensions.contains(id)
+    }
+
+    /// Why CodeQL's side bar and commands are unavailable, or `None` when
+    /// it is installed and enabled. It is not built in (#1842): it waits
+    /// under AVAILABLE in the Extensions view until the user adds it.
+    fn codeql_unavailable(&self) -> Option<&'static str> {
+        if !self.installed_extensions.contains("codeql") {
+            Some("CodeQL is not installed - add it from the Extensions view")
+        } else if self.disabled_extensions.contains("codeql") {
+            Some("CodeQL is disabled - enable it in the Extensions view")
+        } else {
+            None
+        }
     }
 
     fn handle_run_debug_key(&mut self, key: KeyEvent) {
@@ -28284,15 +28331,13 @@ impl App {
     }
 
     /// Reveal the CodeQL view (#578): the QL icon and the palette. Refused,
-    /// with the reason, while the built-in CodeQL extension is disabled.
+    /// with the reason, while the CodeQL extension is not added or disabled.
     /// The saved lists it shows are small files read here; the workspace's
     /// queries take a walk of the tree, which runs off the UI thread so the
     /// view opens at once (#840).
     fn open_codeql_view(&mut self) {
-        if !self.is_extension_enabled("codeql") {
-            self.status = String::from(
-                "CodeQL is disabled - enable it in the Extensions view to show its side bar",
-            );
+        if let Some(why) = self.codeql_unavailable() {
+            self.status = format!("{why} to show its side bar");
             return;
         }
         self.show_tree = true;
@@ -30990,7 +31035,7 @@ impl App {
             return true;
         }
         if self.codeql.variant_runs.is_empty()
-            || self.disabled_extensions.contains("codeql")
+            || !self.is_extension_enabled("codeql")
             || self
                 .codeql_variant_polled
                 .is_some_and(|t| t.elapsed() < CODEQL_VARIANT_POLL)
@@ -33571,12 +33616,18 @@ impl App {
         self.report_unsaved_setting(saved);
         self.refresh_extensions();
         if id == "codeql" {
-            if !enabled && self.sidebar_view == SidebarView::CodeQL {
-                self.set_sidebar_view(SidebarView::Explorer);
-            }
-            // The icon appears or disappears, so the baked bar redraws.
-            self.overlays.activity.mark_dirty();
+            self.codeql_availability_changed();
         }
+    }
+
+    /// Keep the chrome in step once CodeQL is added, uninstalled, enabled or
+    /// disabled: a CodeQL that is off takes its open side bar with it.
+    fn codeql_availability_changed(&mut self) {
+        if !self.is_extension_enabled("codeql") && self.sidebar_view == SidebarView::CodeQL {
+            self.set_sidebar_view(SidebarView::Explorer);
+        }
+        // The icon appears or disappears, so the baked bar redraws.
+        self.overlays.activity.mark_dirty();
     }
 
     /// Reveal the Testing view (the user-open gesture: activity icon, Cmd+K B,
@@ -55075,6 +55126,15 @@ impl App {
                 C::RustReloadWorkspace,
             ]);
         }
+        // CodeQL's commands (#1842) only once it is added and enabled.
+        if !self.is_extension_enabled("codeql") {
+            hidden.extend(
+                crate::widgets::command_palette::ALL_COMMANDS
+                    .iter()
+                    .copied()
+                    .filter(|c| c.is_codeql()),
+            );
+        }
         palette.set_hidden(hidden);
         // The chords as keybindings.json leaves them (#1482): a user's own
         // chord, and no built-in chord a user binding gave to another command.
@@ -56206,6 +56266,13 @@ impl App {
             .unwrap_or_else(|| self.editor.active_index());
         // The palette closes before a recording can show what it ran.
         self.screencast.name_command(cmd.title());
+        // A keybinding can still name a CodeQL command the palette hides.
+        if cmd.is_codeql()
+            && let Some(why) = self.codeql_unavailable()
+        {
+            self.status = String::from(why);
+            return;
+        }
         match cmd {
             // A preview's placeholder lines are not the file (#916): an edit
             // to them leaves the tab dirty with nothing a save can write.

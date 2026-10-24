@@ -334,6 +334,9 @@ one analysis by hand.
 
 ## The CodeQL CLI
 
+CodeQL is not built in: add it from the Extensions view, where it waits under
+AVAILABLE, to get its side bar and "CodeQL:" commands.
+
 `codeql_cli_path` names the CodeQL CLI croft runs, such as
 `"~/tools/codeql/codeql"`. When it is unset or not a file, croft uses
 `codeql` on `PATH`, then the newest CLI it downloaded itself into

@@ -26,13 +26,18 @@ fn find_source(id: &str) -> Option<&'static str> {
         .find(|s| manifest::parse(s).map(|m| m.id == id).unwrap_or(false))
 }
 
-/// Ids already installed: the bundled built-ins plus every manifest under the
-/// user extensions dir. A catalog entry whose id is here is no longer "available".
-fn installed_ids(user_dir: &Path) -> BTreeSet<String> {
-    let mut ids: BTreeSet<String> = manifest::summaries(manifest::BUNDLED_MANIFESTS)
+/// Ids of the bundled built-ins, which are installed everywhere.
+pub fn bundled_ids() -> BTreeSet<String> {
+    manifest::summaries(manifest::BUNDLED_MANIFESTS)
         .into_iter()
         .map(|s| s.id)
-        .collect();
+        .collect()
+}
+
+/// Ids already installed: the bundled built-ins plus every manifest under the
+/// user extensions dir. A catalog entry whose id is here is no longer "available".
+pub fn installed_ids(user_dir: &Path) -> BTreeSet<String> {
+    let mut ids = bundled_ids();
     for src in manifest::read_extension_sources(user_dir) {
         if let Ok(m) = manifest::parse(&src) {
             ids.insert(m.id);
@@ -76,12 +81,13 @@ fn write_into(dir: &Path, id: &str) -> Result<PathBuf> {
 }
 
 /// Add (install) an entry. A bundled catalog entry materializes from its
-/// embedded manifest; a remote (signed-index) entry is fetched and its sha256
-/// verified against the index before it is written. Either way it lands in the
-/// user extensions dir and loads like any installed extension on next refresh.
-pub fn install(id: &str) -> Result<PathBuf> {
+/// embedded manifest into `extensions_dir` (the app's own, as for
+/// [`uninstall_in`]); a remote (signed-index) entry is fetched and its sha256
+/// verified against the index before it is written to the user extensions
+/// dir. Either way it loads like any installed extension on next refresh.
+pub fn install_in(extensions_dir: &Path, id: &str) -> Result<PathBuf> {
     if find_source(id).is_some() {
-        write_into(&manifest::user_extensions_dir(), id)
+        write_into(extensions_dir, id)
     } else {
         crate::mcp::registry_index::install_remote(id)
     }
@@ -139,6 +145,24 @@ mod tests {
         );
         let installed: BTreeSet<String> = ["csvlens".to_string()].into_iter().collect();
         assert!(!available_from(&installed).iter().any(|s| s.id == "csvlens"));
+    }
+
+    /// #1842: CodeQL is not built in. It waits under AVAILABLE, an add
+    /// installs it, and croft may uninstall it again.
+    #[test]
+    fn codeql_is_a_catalog_entry_not_a_built_in() {
+        assert!(!bundled_ids().contains("codeql"));
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(
+            available_from(&installed_ids(tmp.path()))
+                .iter()
+                .any(|s| s.id == "codeql" && !s.builtin)
+        );
+        install_in(tmp.path(), "codeql").expect("adds the manifest");
+        let installed = installed_ids(tmp.path());
+        assert!(installed.contains("codeql"));
+        assert!(!available_from(&installed).iter().any(|s| s.id == "codeql"));
+        assert!(is_removable("codeql"));
     }
 
     #[test]

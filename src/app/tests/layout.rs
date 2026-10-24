@@ -470,8 +470,8 @@ fn activity_icons_stay_visible_beside_the_centered_shortcuts_modal() {
     term.draw(|f| app.render(f)).unwrap();
     let before = app.pending_activity_image_overlays().len();
     assert_eq!(
-        before, 12,
-        "precondition: eight view icons + the settings gear + the three layout toolbar icons emit"
+        before, 11,
+        "precondition: seven view icons (CodeQL's is added, not built in) + the settings gear + the three layout toolbar icons emit"
     );
     app.handle_key(key(KeyCode::F(1), KeyModifiers::NONE))
         .unwrap();

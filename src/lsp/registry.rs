@@ -567,11 +567,15 @@ priority = 0
         assert_eq!(mixed.for_language(Language::RUST)[0].name, "rust-analyzer");
     }
 
-    /// #578: `.ql`/`.qll` files get the CodeQL CLI's language server from
-    /// PATH, with errors checked as the buffer changes.
+    /// The CodeQL catalog entry, as adding it writes it to the user
+    /// extensions dir.
+    const CODEQL: &str = include_str!("../../assets/catalog/codeql/extension.toml");
+
+    /// #578: once CodeQL is added, `.ql`/`.qll` files get the CodeQL CLI's
+    /// language server from PATH, with errors checked as the buffer changes.
     #[test]
     fn codeql_sources_use_the_codeql_cli_language_server() {
-        let r = ServerRegistry::with_user_extensions(&[]);
+        let r = ServerRegistry::with_user_extensions(&[CODEQL]);
         let servers = r.for_language(Language("ql"));
         assert_eq!(servers.len(), 1, "exactly one server for ql");
         let s = &servers[0];
@@ -584,16 +588,23 @@ priority = 0
                 .to_vec()
         );
         assert!(s.provision.is_none(), "the CodeQL CLI is PATH-only");
-        assert_eq!(r.for_extension("ql")[0].name, "codeql");
-        assert_eq!(r.for_extension("qll")[0].name, "codeql");
     }
 
     #[test]
     fn disabling_the_codeql_extension_drops_its_language_server() {
         let mut disabled = std::collections::BTreeSet::new();
         disabled.insert("codeql".to_string());
-        let r = ServerRegistry::with_user_extensions_filtered(&[], &disabled);
+        let r = ServerRegistry::with_user_extensions_filtered(&[CODEQL], &disabled);
         assert!(r.for_language(Language("ql")).is_empty());
+    }
+
+    /// #1842: CodeQL is not built in, so until it is added no QL language
+    /// server registers.
+    #[test]
+    fn codeql_registers_no_language_server_until_it_is_added() {
+        let r = ServerRegistry::with_user_extensions(&[]);
+        assert!(r.for_language(Language("ql")).is_empty());
+        assert!(r.for_extension("ql").is_empty());
     }
 
     #[test]

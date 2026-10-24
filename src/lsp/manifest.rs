@@ -30,7 +30,6 @@ use crate::lsp::install::{ArchiveKind, Provision};
 pub const BUNDLED_MANIFESTS: &[&str] = &[
     include_str!("../../assets/extensions/core-languages/extension.toml"),
     include_str!("../../assets/extensions/pdf/extension.toml"),
-    include_str!("../../assets/extensions/codeql/extension.toml"),
     include_str!("../../assets/extensions/csv/extension.toml"),
     include_str!("../../assets/extensions/vim/extension.toml"),
     include_str!("../../assets/extensions/lsp-python/extension.toml"),
@@ -67,13 +66,16 @@ pub const BUNDLED_MANIFESTS: &[&str] = &[
 /// Extensions panel (Available → Add → Installed). Unlike [`BUNDLED_MANIFESTS`]
 /// these are NOT loaded as active extensions; adding one writes its manifest
 /// into the user extensions dir, after which it loads like any installed
-/// extension. Same `extension.toml` format. Each is a keyless (or opt-in)
-/// server croft can drive through its single-argument command model.
+/// extension. Same `extension.toml` format. Each sidecar is a keyless (or
+/// opt-in) server croft can drive through its single-argument command model.
+/// CodeQL is here too (#1842): its side bar and commands are native, but
+/// most users never need them, so they stay off until it is added.
 pub const CATALOG_MANIFESTS: &[&str] = &[
     include_str!("../../assets/catalog/mcp-fetch/extension.toml"),
     include_str!("../../assets/catalog/mcp-time/extension.toml"),
     include_str!("../../assets/catalog/mcp-markitdown/extension.toml"),
     include_str!("../../assets/catalog/csvlens/extension.toml"),
+    include_str!("../../assets/catalog/codeql/extension.toml"),
 ];
 
 /// A parsed `extension.toml`. Only the fields phase B1 consumes are modelled;

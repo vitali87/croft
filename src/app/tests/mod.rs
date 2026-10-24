@@ -2116,6 +2116,15 @@ fn scrub_repo() -> tempfile::TempDir {
     tmp
 }
 
+/// An app with CodeQL added, as Extensions › AVAILABLE › Add leaves it:
+/// it is not built in (#1842), and the CodeQL tests drive its side bar
+/// and commands.
+fn codeql_app(root: PathBuf) -> App {
+    let mut app = App::new(root).unwrap();
+    app.installed_extensions.insert(String::from("codeql"));
+    app
+}
+
 /// A workspace holding one CodeQL test, `test/Find/Find.qlref`, listed in
 /// the Testing tree, and an App whose `codeql` is a stand-in: each run
 /// prints what [`CodeqlStandIn::will`] last set (`@ROOT@` standing for the
@@ -2159,7 +2168,7 @@ impl CodeqlStandIn {
         )
         .unwrap();
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let mut app = App::new(root.clone()).unwrap();
+        let mut app = codeql_app(root.clone());
         app.set_codeql_program(program);
         app.testing.apply_case(TestCase {
             name: "test/Find::Find.qlref".into(),
@@ -2310,7 +2319,7 @@ fn codeql_query_fixture(tmp: &std::path::Path, source: &str) -> App {
     store.save(&App::codeql_db_store_path()).unwrap();
     let q = tmp.join("q.ql");
     std::fs::write(&q, source).unwrap();
-    let mut app = App::new(tmp.to_path_buf()).unwrap();
+    let mut app = codeql_app(tmp.to_path_buf());
     app.editor.open(&q).unwrap();
     app
 }

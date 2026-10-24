@@ -1,0 +1,1 @@
+feature: CodeQL is no longer built in. Add it from the Extensions view's AVAILABLE list to get its side bar, activity-bar icon and CodeQL commands; adding it turns it on even if you had disabled the built-in one.
