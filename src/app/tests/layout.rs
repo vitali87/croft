@@ -1264,6 +1264,45 @@ fn hovering_a_non_selected_activity_icon_emits_its_hovered_variant() {
     );
 }
 
+/// #1845: a collapsed side bar selects no view, as in VS Code, so its view's
+/// icon drops the pill, and the flip re-sends the baked icons whichever
+/// route made it.
+#[test]
+fn a_collapsed_side_bar_unpills_its_views_activity_icon() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.overlays.activity.set_images(ActivityBarImages {
+        explorer_active: "EA".into(),
+        explorer_inactive: "EI".into(),
+        explorer_hovered: "EH".into(),
+        ..Default::default()
+    });
+    let emitted = |app: &App| -> Vec<String> {
+        app.pending_activity_image_overlays()
+            .into_iter()
+            .map(|(_, s)| s.to_string())
+            .collect()
+    };
+    draw(&mut app, 120, 40);
+    assert!(emitted(&app).contains(&"EA".to_string()));
+    app.overlays.activity.mark_emitted();
+    draw(&mut app, 120, 40);
+    assert!(
+        !app.overlays.activity.dirty(),
+        "an unchanged frame re-sends nothing"
+    );
+    // Cmd+B's route, which marks no overlay dirty itself.
+    app.toggle_side_bar();
+    draw(&mut app, 120, 40);
+    assert!(
+        app.overlays.activity.dirty(),
+        "closing the side bar re-sends the icons"
+    );
+    let shown = emitted(&app);
+    assert!(shown.contains(&"EI".to_string()), "{shown:?}");
+    assert!(!shown.contains(&"EA".to_string()), "{shown:?}");
+}
+
 #[test]
 fn moving_over_an_activity_icon_marks_it_hovered_and_redirties_the_overlay() {
     use ratatui::layout::Rect;
@@ -2081,6 +2120,72 @@ fn clicking_the_side_bar_icon_toggles_the_primary_side_bar() {
         modifiers: KeyModifiers::NONE,
     });
     assert_eq!(app.show_tree, !before, "the side-bar icon flips show_tree");
+}
+
+/// #1845: as in VS Code, a click on the icon of the view the side bar is
+/// showing collapses the side bar, and the next click on it expands it again.
+#[test]
+fn clicking_the_open_views_activity_icon_collapses_then_reopens_the_side_bar() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    draw(&mut app, 120, 40);
+    let explorer = app.sidebar_areas.explorer_icon;
+    assert!(app.show_tree && app.sidebar_view == SidebarView::Explorer);
+    app.focus_pane(Pane::Tree);
+    left_click(&mut app, explorer.x, explorer.y);
+    assert!(
+        !app.show_tree,
+        "the open view's icon collapses the side bar"
+    );
+    assert!(
+        app.focus == Pane::Editor,
+        "focus leaves the hidden side bar"
+    );
+    draw(&mut app, 120, 40);
+    left_click(&mut app, explorer.x, explorer.y);
+    assert!(app.show_tree, "the next click expands it again");
+    assert_eq!(app.sidebar_view, SidebarView::Explorer);
+    assert!(app.focus == Pane::Tree);
+}
+
+#[test]
+fn clicking_another_views_activity_icon_switches_and_expands_a_collapsed_side_bar() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    draw(&mut app, 120, 40);
+    let explorer = app.sidebar_areas.explorer_icon;
+    let search = app.sidebar_areas.search_icon;
+    left_click(&mut app, search.x, search.y);
+    assert!(
+        app.show_tree,
+        "another view's icon switches, never collapses"
+    );
+    assert_eq!(app.sidebar_view, SidebarView::Search);
+    left_click(&mut app, search.x, search.y);
+    assert!(!app.show_tree);
+    left_click(&mut app, explorer.x, explorer.y);
+    assert!(
+        app.show_tree,
+        "any view's icon expands a collapsed side bar"
+    );
+    assert_eq!(app.sidebar_view, SidebarView::Explorer);
+}
+
+/// Collapsing from a maximized terminal's side bar hands focus to the
+/// terminal: the editor taking it would un-maximize the terminal.
+#[test]
+fn collapsing_the_side_bar_from_its_icon_keeps_a_maximized_terminal() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    draw(&mut app, 120, 40);
+    let explorer = app.sidebar_areas.explorer_icon;
+    app.show_terminal = true;
+    app.terminal_maximized = true;
+    app.focus_pane(Pane::Tree);
+    left_click(&mut app, explorer.x, explorer.y);
+    assert!(!app.show_tree);
+    assert!(app.focus == Pane::Terminal);
+    assert!(app.terminal_maximized, "the terminal stays maximized");
 }
 
 #[test]
