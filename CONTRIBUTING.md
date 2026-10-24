@@ -1,9 +1,9 @@
 # Contributing to croft
 
 Thanks for helping. This page covers what you need to land a change. For
-building and running croft see the [README](README.md); for how the code is laid
-out see [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). AI agents follow this page
-too.
+building and running croft see [docs/INSTALL.md](docs/INSTALL.md) and
+[docs/CLI.md](docs/CLI.md); for how the code is laid out see
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). AI agents follow this page too.
 
 Every change is weighed against the [tenets](README.md#tenets): speed and low
 latency first, the same behaviour locally and over SSH, a shortcut for every

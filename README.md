@@ -33,7 +33,7 @@ See **[LAYOUT.md](docs/LAYOUT.md)** for the pane-by-pane reference: every editor
 | Requirement | Why |
 |-------------|-----|
 | macOS, Linux, or Android (Termux) | The PTY layer is POSIX. On Windows, run the Linux build inside WSL2; see [WINDOWS.md](docs/WINDOWS.md). |
-| Rust 1.93+ stable and a C compiler | Only to build from source (edition 2024; the tree-sitter grammars compile C). See [Install Rust](#install-rust). |
+| Rust 1.93+ stable and a C compiler | Only to build from source (edition 2024; the tree-sitter grammars compile C). See [Install Rust](docs/INSTALL.md#install-rust). |
 | A Nerd Font as your terminal font | File and activity-bar icons are Nerd Font glyphs; without one they render as `[?]` boxes. |
 | A 256 color or truecolor terminal | Terminal.app, iTerm2, Alacritty, kitty, WezTerm, and Ghostty all qualify. |
 | iTerm2, WezTerm, Ghostty, kitty, or a sixel terminal (optional) | Inline image / PDF / spreadsheet previews. Elsewhere croft shows a metadata header line. |
@@ -42,139 +42,26 @@ See **[LAYOUT.md](docs/LAYOUT.md)** for the pane-by-pane reference: every editor
 
 Per-platform setup (Nerd Font, terminal keybindings, optional dependencies) lives in the [platform guides](#platform-setup).
 
-### Install Rust
-
-```bash
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-```
-
-Then open a new terminal — or run `. "$HOME/.cargo/env"` in the current one — so `cargo` is on `PATH`.
-
-rustup does not install the C compiler and linker the build needs. On macOS run
-`xcode-select --install`; on Debian or Ubuntu, `sudo apt install build-essential`
-(or your distribution's equivalent).
-
 ## Install
-
-With [Homebrew](https://brew.sh) on macOS or Linux, no toolchain and no compile:
 
 ```bash
 brew install vitali87/croft/croft
 ```
 
-Upgrade with `brew upgrade croft`; croft's own updater (`Ctrl+Shift+F9`) leaves a Homebrew
-install to brew. Each release updates the formula, and it installs the same
-prebuilt archives as below.
+Homebrew on macOS or Linux installs a prebuilt binary, with no toolchain and no compile.
+`cargo binstall croft-software` or a plain `curl | tar` of the release archive gets the same
+binary, and `cargo install croft-software --locked` builds it from source.
 
-Or prebuilt binaries through cargo:
-
-```bash
-cargo binstall croft-software
-```
-
-`cargo binstall` itself needs installing once (`cargo install cargo-binstall`,
-or a prebuilt from [its releases](https://github.com/cargo-bins/cargo-binstall#installation)).
-
-That downloads the tagged release for your platform (macOS arm64/x86_64, Linux
-musl arm64/x86_64) and puts `croft` on `PATH` in seconds.
-
-Or straight from the latest release, with nothing but `curl` and `tar`:
-
-```bash
-os=$([ "$(uname -s)" = Darwin ] && echo apple-darwin || echo unknown-linux-musl)
-arch=$(uname -m | sed 's/arm64/aarch64/')
-curl -fsSL "https://github.com/vitali87/croft/releases/latest/download/croft-$arch-$os.tar.gz" | tar xz
-sudo mkdir -p /usr/local/bin
-sudo mv "croft-$arch-$os/croft" /usr/local/bin/
-```
-
-`/usr/local/bin` is on the default `PATH` but may not exist yet on a fresh Mac,
-hence the `mkdir`. On Android in Termux there is no `sudo` and no
-`/usr/local/bin`: move it to `"$PREFIX/bin/"` instead.
-
-To verify the archive before installing it, download it to a file instead of
-piping it into `tar`, together with the release's `SHA256SUMS` and that file's
-signature. `SHA256SUMS` lists all four archives, so check only the one you
-fetched rather than running it whole:
-
-```bash
-os=$([ "$(uname -s)" = Darwin ] && echo apple-darwin || echo unknown-linux-musl)
-arch=$(uname -m | sed 's/arm64/aarch64/')
-tag=$(curl -fsSLo /dev/null -w '%{url_effective}' https://github.com/vitali87/croft/releases/latest | sed 's|.*/||')
-for f in "croft-$arch-$os.tar.gz" SHA256SUMS SHA256SUMS.sigstore.json; do
-  curl -fsSLO "https://github.com/vitali87/croft/releases/download/$tag/$f"
-done
-grep "croft-$arch-$os.tar.gz" SHA256SUMS | sha256sum -c -
-# macOS: grep "croft-$arch-$os.tar.gz" SHA256SUMS | shasum -a 256 -c -
-```
-
-`SHA256SUMS` is itself signed with [Sigstore](https://www.sigstore.dev/) by the
-release workflow, keyless, so the signature proves the file came from this
-repository's `release.yml` run for that tag. Check it with
-[cosign](https://docs.sigstore.dev/cosign/system_config/installation/) before
-trusting the sums, then install the archive you verified:
-
-```bash
-cosign verify-blob \
-  --bundle SHA256SUMS.sigstore.json \
-  --certificate-identity "https://github.com/vitali87/croft/.github/workflows/release.yml@refs/tags/$tag" \
-  --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-  SHA256SUMS
-tar xzf "croft-$arch-$os.tar.gz"
-sudo mkdir -p /usr/local/bin
-sudo mv "croft-$arch-$os/croft" /usr/local/bin/
-```
-
-To build from source instead:
-
-```bash
-cargo install croft-software --locked
-```
-
-This compiles the latest [crates.io](https://crates.io/crates/croft-software) release into `~/.cargo/bin/croft`. Re-run to upgrade. To track `main` instead:
-
-```bash
-cargo install --git https://github.com/vitali87/croft.git --locked
-```
-
-Or to build from a source checkout:
-
-```bash
-git clone https://github.com/vitali87/croft.git
-cd croft
-cargo install --path . --locked
-```
-
-**macOS:** the build directory churns the Spotlight index and can spike your CPU and fans. Before building, point Cargo at a `.noindex` directory Spotlight ignores; see [MACOS.md](docs/MACOS.md#spotlight-indexing-and-the-build-directory).
+See **[INSTALL.md](docs/INSTALL.md)** for every method, upgrading, and verifying a release's
+signature.
 
 ## Run
 
-```bash
-croft                            # opens the current directory
-croft ~/projects                 # opens a specific folder
-croft ~/proj --open-file a.rs    # opens a folder with a file already open
-croft ~/proj --open-file a.rs --zen  # ...focused on just the file (no sidebar/terminal)
-croft remote <host>              # launch croft over SSH on a Linux server (host from ~/.ssh/config)
-croft devcontainer [folder]      # open a folder inside its dev container (.devcontainer/devcontainer.json)
-croft open-link 'croft://attach?host=devbox&path=/srv/app'  # what a croft:// link runs (croft install-link-handler registers them)
-croft open-link 'croft://decide?host=devbox&path=/srv/app&token=…&decision=allow'  # a notification's Approve: answers the agent's edit without attaching
-croft attach                     # open the current folder as a persistent session (survives closing the window)
-croft attach ~/projects          # ...for a specific folder
-croft attach --solo ~/projects   # join a shared folder in your own viewport (live co-editing)
-croft ls                         # list running persistent sessions
-croft sync-config devbox         # push your keybindings, snippets, triggers to a host now (never over its own edits)
-croft demo                       # a guided tour in a throwaway sample project (--tour my.json runs your own steps)
-croft view report.pdf            # from any pane: open a file in the croft you are sitting in
-cat data.csv | croft view -      # ...or pipe it in (staged to ~/.cache/croft, 0600, swept at the next launch once a day old)
-croft theme-import theme.json    # use a VS Code colour theme in croft
-croft locale-template fr --write # start or update a translation of croft's UI (see docs/SETTINGS.md)
-croft theme-import dracula-theme.theme-dracula   # ...or fetch one from the marketplace
-croft --help
-```
+`croft` opens the current directory, and `croft <folder>` any other. `croft remote <host>` runs
+it on a Linux server over SSH, installing itself there on first connect, and `croft devcontainer`
+runs it inside a folder's dev container.
 
-`croft remote <host>` installs itself on the box on first connect with no manual prep, and a stock cloud image works as-is. See [LINUX.md](docs/LINUX.md#remote-croft-remote-host) for how the cross-compile and host provisioning work.
-
-`croft devcontainer` builds or pulls the image in `devcontainer.json`, starts the container with the folder mounted, runs `postCreateCommand` once, installs croft into it the same way, and runs it there. It supports `image`, `build`, `mounts`, `forwardPorts`, `postCreateCommand`, `workspaceFolder`, `containerEnv`, `remoteUser` and `runArgs`. The next run reuses the container, and an edited config (or `--rebuild`) replaces it.
+See **[CLI.md](docs/CLI.md)** for the commands you will reach for most; `croft --help` lists them all.
 
 ## Collaboration
 
