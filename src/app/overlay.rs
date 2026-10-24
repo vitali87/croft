@@ -283,6 +283,10 @@ pub struct ActivityOverlay {
     /// A dirty flush re-sends only slots that differ (a badge count or a
     /// hover swap), not the whole bar; empty means send everything (#682).
     sent: Vec<((u16, u16), u64)>,
+    /// Whether the side bar was open on the last frame drawn, `None` before
+    /// the first: the selected view's icon is pilled only while it is
+    /// (#1845), so a flip by any route re-sends the icons.
+    side_bar_shown: Option<bool>,
     clear: ClearLatch,
 }
 
@@ -348,6 +352,16 @@ impl ActivityOverlay {
     /// The screen was wiped or the icons evicted: send them all next time.
     pub fn forget_sent(&mut self) {
         self.sent.clear();
+    }
+
+    /// Record whether the side bar is open this frame, marking the icons
+    /// dirty when it opened or closed since the last one. The first frame
+    /// only records: nothing has been sent yet to go stale.
+    pub fn note_side_bar_shown(&mut self, shown: bool) {
+        let last = self.side_bar_shown.replace(shown);
+        if last.is_some_and(|was| was != shown) {
+            self.dirty = true;
+        }
     }
 
     /// Whether the dirty flag (a full re-send) is up.
