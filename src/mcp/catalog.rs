@@ -111,7 +111,7 @@ pub fn is_removable(id: &str) -> bool {
     is_catalog_entry(id) || crate::mcp::registry_index::is_index_entry(id)
 }
 
-/// Remove an added entry's manifest dir under `dir`, for hermetic testing.
+/// Remove an added entry's manifest under `dir`, for hermetic testing.
 /// Errors unless croft added `id`, from the catalog or the signed index
 /// ([`is_removable`]): an index entry such as CodeQL (#1842) uninstalls too.
 fn remove_from(dir: &Path, id: &str) -> Result<()> {
@@ -120,10 +120,14 @@ fn remove_from(dir: &Path, id: &str) -> Result<()> {
             "'{id}' is not from the catalog or the extension index; croft only uninstalls what it added"
         );
     }
+    // Only the manifest croft wrote: anything else in the dir is the user's,
+    // so the dir goes only once it is empty.
     let ext_dir = dir.join(id);
-    if ext_dir.exists() {
-        std::fs::remove_dir_all(&ext_dir).with_context(|| format!("removing {ext_dir:?}"))?;
+    let manifest = ext_dir.join("extension.toml");
+    if manifest.exists() {
+        std::fs::remove_file(&manifest).with_context(|| format!("removing {manifest:?}"))?;
     }
+    let _ = std::fs::remove_dir(&ext_dir);
     Ok(())
 }
 
@@ -228,6 +232,15 @@ mod tests {
         assert!(path.is_file());
         remove_from(&tmp, "mcp-time").expect("uninstalls the catalog entry");
         assert!(!tmp.join("mcp-time").exists(), "manifest dir must be gone");
+        // A file the user put beside the manifest stays, and so its dir.
+        write_into(&tmp, "mcp-time").unwrap();
+        std::fs::write(tmp.join("mcp-time/notes.md"), "mine").unwrap();
+        remove_from(&tmp, "mcp-time").expect("uninstalls the catalog entry");
+        assert!(!tmp.join("mcp-time/extension.toml").exists());
+        assert!(
+            tmp.join("mcp-time/notes.md").is_file(),
+            "the user's file stays"
+        );
         // A user-dropped (non-catalog) extension is the user's file: refuse it,
         // and leave any such dir untouched.
         let user_dir = tmp.join("my-own-ext");
