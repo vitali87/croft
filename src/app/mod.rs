@@ -18321,10 +18321,43 @@ impl App {
         // The gates follow the manifests on disk too, so CodeQL added or
         // removed by hand (#1842) comes and goes with its row here.
         let had_codeql = self.installed_extensions.contains("codeql");
-        self.installed_extensions = crate::mcp::catalog::installed_ids(&self.extensions_dir());
+        let installed = crate::mcp::catalog::installed_ids(&self.extensions_dir());
+        let changed = installed != self.installed_extensions;
+        self.installed_extensions = installed;
         if self.installed_extensions.contains("codeql") != had_codeql {
             self.codeql_availability_changed();
         }
+        if changed {
+            self.reload_lsp_extensions();
+        }
+    }
+
+    /// Hand the language servers the installed extensions and the disable
+    /// set as they are now (#1842): one added, removed or toggled serves its
+    /// files, or stops serving them, without a relaunch.
+    fn reload_lsp_extensions(&mut self) {
+        if self.lsp.is_none() {
+            return;
+        }
+        let sources = crate::lsp::manifest::read_extension_sources(&self.extensions_dir());
+        let sources: Vec<&str> = sources.iter().map(String::as_str).collect();
+        let gone = match self.lsp.as_mut() {
+            Some(lsp) => lsp.reload_extensions(&sources, &self.disabled_extensions),
+            None => return,
+        };
+        if gone.is_empty() {
+            return;
+        }
+        // The worker withdraws what a server it stops reported only on the
+        // documents it held open; what it reported on files never opened
+        // would stay in PROBLEMS with nothing left to clear it.
+        for by_source in self.lsp_diagnostics.values_mut() {
+            by_source
+                .retain(|key, _| !gone.contains(&crate::lsp::manager::diagnostics_source(key)));
+        }
+        self.lsp_diagnostics
+            .retain(|_, by_source| !by_source.is_empty());
+        self.rebuild_problems();
     }
 
     /// Extensions: Compare with VS Code (#352). Lists what VS Code has
@@ -26990,8 +27023,8 @@ impl App {
     /// Flip the enabled state of the Extensions panel's selected row: update the
     /// in-memory disabled set, persist it, rebuild the list (so the row's state
     /// label and dim styling refresh), and apply any immediate feature gating
-    /// (e.g. closing a now-disabled viewer). LSP extensions only re-evaluate on
-    /// the next launch; the others gate live.
+    /// (e.g. closing a now-disabled viewer). Language servers follow too: a
+    /// disabled one stops and an enabled or added one starts (#1842).
     fn toggle_selected_extension(&mut self) {
         let Some(id) = self.extensions.selected_id().map(str::to_string) else {
             return;
@@ -27030,7 +27063,7 @@ impl App {
                     self.refresh_extensions();
                     self.status = if id == "codeql" {
                         String::from(
-                            "Added 'codeql' — open it from the QL icon in the activity bar; its language server starts on the next launch",
+                            "Added 'codeql' — open it from the QL icon in the activity bar",
                         )
                     } else {
                         format!(
@@ -33696,6 +33729,7 @@ impl App {
         }
         self.report_unsaved_setting(saved);
         self.refresh_extensions();
+        self.reload_lsp_extensions();
         if id == "codeql" {
             self.codeql_availability_changed();
         }

@@ -853,6 +853,11 @@ enum Cmd {
     RestartServersFor {
         path: PathBuf,
     },
+    /// Serve from `registry` from now on: the installed extensions or the
+    /// disable set changed (#1842).
+    ReplaceRegistry {
+        registry: ServerRegistry,
+    },
     /// Spawn the servers for every language whose project-root marker sits
     /// in the workspace root, before any file of theirs is opened (#27):
     /// rust-analyzer's cold indexing then overlaps with the user browsing
@@ -1130,6 +1135,17 @@ struct LangCapabilitySupport {
 }
 type CapabilitySupport = Arc<StdMutex<LangCapabilitySupport>>;
 
+/// The names of the servers `registry` registers, per language.
+fn registered_servers_of(registry: &ServerRegistry) -> HashMap<Language, Vec<&'static str>> {
+    registry
+        .languages()
+        .map(|lang| {
+            let names = registry.for_language(lang).iter().map(|c| c.name).collect();
+            (lang, names)
+        })
+        .collect()
+}
+
 pub struct LspManager {
     /// The servers registered per language once the disable set is
     /// applied (#1511), so the app can tell whether a server is in play.
@@ -1296,18 +1312,13 @@ impl LspManager {
         // The language table keeps every language identity (so file detection and
         // highlighting stay intact); only server registration honors the disable
         // set, so a disabled LSP extension stops spawning without losing its
-        // language. The set is read from prefs at construction; a live toggle
-        // takes effect on the next manager rebuild (re-root / relaunch).
-        crate::lsp::languages::init_with_user_sources(&user_refs);
+        // language. The set is read from prefs at construction; a live add,
+        // removal or toggle reaches a running manager through
+        // `reload_extensions`.
+        crate::lsp::languages::reload_with_user_sources(&user_refs);
         let disabled = crate::prefs::Prefs::load_or_default().disabled_extensions;
         let registry = ServerRegistry::with_user_extensions_filtered(&user_refs, &disabled);
-        let registered_servers: HashMap<Language, Vec<&'static str>> = registry
-            .languages()
-            .map(|lang| {
-                let names = registry.for_language(lang).iter().map(|c| c.name).collect();
-                (lang, names)
-            })
-            .collect();
+        let registered_servers = registered_servers_of(&registry);
         runtime.handle().spawn(worker_loop(
             root,
             registry,
@@ -1459,6 +1470,41 @@ impl LspManager {
     /// are back, as after a crash restart.
     pub fn restart_servers_for(&self, path: PathBuf) {
         let _ = self.cmd_tx.send(Cmd::RestartServersFor { path });
+    }
+
+    /// Follow an extension added, removed, turned on or off (#1842):
+    /// `user_sources` are the installed manifests now and `disabled` the
+    /// disable set. Their languages resolve at once, and when that changes
+    /// which servers a language registers, the worker swaps the new set in:
+    /// that language's running servers stop, and the app re-opens its tabs,
+    /// so the next of its files starts what is registered now. Every other
+    /// language's servers keep running. Returns the servers no language
+    /// registers any more.
+    pub fn reload_extensions(
+        &mut self,
+        user_sources: &[&str],
+        disabled: &std::collections::BTreeSet<String>,
+    ) -> Vec<&'static str> {
+        crate::lsp::languages::reload_with_user_sources(user_sources);
+        let registry = ServerRegistry::with_user_extensions_filtered(user_sources, disabled);
+        let registered = registered_servers_of(&registry);
+        if registered == self.registered_servers {
+            return Vec::new();
+        }
+        let kept: std::collections::HashSet<&str> =
+            registered.values().flatten().copied().collect();
+        let mut gone: Vec<&'static str> = self
+            .registered_servers
+            .values()
+            .flatten()
+            .copied()
+            .filter(|name| !kept.contains(name))
+            .collect();
+        gone.sort_unstable();
+        gone.dedup();
+        self.registered_servers = registered;
+        let _ = self.cmd_tx.send(Cmd::ReplaceRegistry { registry });
+        gone
     }
 
     /// Ask for completions at a UTF-16 position, saying why: a re-ask as
@@ -2612,6 +2658,7 @@ async fn worker_loop(
             }
             Cmd::OpenDoc { path, text } => state.open_doc(path, text).await,
             Cmd::RestartServersFor { path } => state.restart_servers_for(&path).await,
+            Cmd::ReplaceRegistry { registry } => state.replace_registry(registry).await,
             Cmd::PrewarmWorkspace => state.prewarm_workspace().await,
             Cmd::SetExtraRoots { roots } => {
                 for root in &roots {
@@ -3208,14 +3255,33 @@ impl WorkerState {
     /// Shut the servers of `key` down and start them again, forgetting its
     /// documents, which the new servers never saw.
     async fn restart_key(&mut self, key: ClientKey) {
-        let clients = self.clients.remove(&key).unwrap_or_default();
+        let names = self.retire_key(&key).await;
+        let expected = self.restarts.incomplete.remove(&key).unwrap_or(names);
+        self.clients.insert(key.clone(), Vec::new());
+        if !expected.is_empty() {
+            self.restarts.respawn = Some(expected.clone());
+        }
+        self.ensure_clients(key.0, &key.1).await;
+        let msg = if expected.is_empty() {
+            format!("Started the language servers for {}", key.1.display())
+        } else {
+            format!("Restarted {} for {}", expected.join(", "), key.1.display())
+        };
+        log_file::log(&format!("lsp restart: {msg}"));
+        crate::output::push("Language Servers", crate::output::OutputLevel::Info, &msg);
+    }
+
+    /// Shut the servers of `key` down and forget them, its documents and
+    /// its restart budget, returning the names of the servers that ran.
+    async fn retire_key(&mut self, key: &ClientKey) -> Vec<String> {
+        let clients = self.clients.remove(key).unwrap_or_default();
         let names: Vec<String> = clients.iter().map(|c| c.name.clone()).collect();
         // Withdraw what the old servers published or answered to a pull
         // (#1102) for their documents: a server that does not come back
         // would never clear it, and one that does reports again once the
         // app re-opens the tabs.
         for (path, doc) in &self.docs {
-            if (doc.language, doc.project_root.clone()) != key {
+            if (doc.language, doc.project_root.clone()) != *key {
                 continue;
             }
             for name in &names {
@@ -3236,30 +3302,56 @@ impl WorkerState {
                     .await;
             }
         }
+        // Nothing serves its documents now, as after a crash; whatever
+        // starts next says what it serves.
         if let Ok(mut support) = self.capability_support.lock() {
             for (path, doc) in &self.docs {
-                if (doc.language, doc.project_root.clone()) == key {
+                if (doc.language, doc.project_root.clone()) == *key {
                     support.document_servers.remove(path);
+                    support.document_clients.remove(path);
                 }
             }
+            support.completion_triggers.remove(key);
         }
         self.docs
-            .retain(|_, doc| (doc.language, doc.project_root.clone()) != key);
-        self.restarts.gave_up.remove(&key);
-        self.restarts.attempts.remove(&key);
-        let expected = self.restarts.incomplete.remove(&key).unwrap_or(names);
-        self.clients.insert(key.clone(), Vec::new());
-        if !expected.is_empty() {
-            self.restarts.respawn = Some(expected.clone());
-        }
-        self.ensure_clients(key.0, &key.1).await;
-        let msg = if expected.is_empty() {
-            format!("Started the language servers for {}", key.1.display())
-        } else {
-            format!("Restarted {} for {}", expected.join(", "), key.1.display())
+            .retain(|_, doc| (doc.language, doc.project_root.clone()) != *key);
+        self.restarts.gave_up.remove(key);
+        self.restarts.attempts.remove(key);
+        names
+    }
+
+    /// Serve from `registry` from now on (#1842). A (language, root) whose
+    /// servers it changes has the running ones shut down and is forgotten,
+    /// so the next of its files starts what is registered now, as a first
+    /// open does; the app re-opens its tabs for that. Every other key's
+    /// servers keep running.
+    async fn replace_registry(&mut self, registry: ServerRegistry) {
+        let old = std::mem::replace(&mut self.registry, registry);
+        let names = |r: &ServerRegistry, lang: Language| -> Vec<&'static str> {
+            r.for_language(lang).iter().map(|c| c.name).collect()
         };
-        log_file::log(&format!("lsp restart: {msg}"));
-        crate::output::push("Language Servers", crate::output::OutputLevel::Info, &msg);
+        let changed: Vec<ClientKey> = self
+            .clients
+            .keys()
+            .filter(|(lang, _)| names(&old, *lang) != names(&self.registry, *lang))
+            .cloned()
+            .collect();
+        for key in changed {
+            let stopped = self.retire_key(&key).await;
+            self.restarts.incomplete.remove(&key);
+            if !stopped.is_empty() {
+                let msg = format!(
+                    "Stopped {} for {}: the extensions serving it changed",
+                    stopped.join(", "),
+                    key.1.display()
+                );
+                log_file::log(&format!("lsp registry: {msg}"));
+                crate::output::push("Language Servers", crate::output::OutputLevel::Info, &msg);
+            }
+        }
+        // Tabs the old registry served nothing for were never opened here,
+        // so every tab goes out again, as after a restart.
+        self.restarts.restarted.store(true, Ordering::Relaxed);
     }
 
     async fn ensure_clients(&mut self, lang: Language, root: &Path) -> &[ManagedClient] {
@@ -12238,6 +12330,78 @@ while (msg := read_msg()) is not None:
         assert_eq!(logged_pids(&root, "python", 1), first);
         assert!(!restarted.load(Ordering::Relaxed));
         assert!(state.docs.contains_key(&py));
+    }
+
+    /// #1842: an extension added, removed or toggled mid-session hands the
+    /// worker a new registry. The servers of a language it changes stop, and
+    /// that language's next open starts what is registered now; a language
+    /// it leaves alone keeps its servers running. Each time the app is told
+    /// to re-open its tabs, since one the old registry served nothing for
+    /// was never opened here.
+    #[cfg(unix)]
+    #[test]
+    fn a_new_registry_restarts_only_the_languages_it_changes() {
+        let Some(python) = python_for_stub_server() else {
+            eprintln!("SKIPPED: python3 not on PATH");
+            return;
+        };
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonicalize");
+        let py = root.join("demo.py");
+        let go = root.join("main.go");
+        std::fs::write(&py, "x = 1\n").unwrap();
+        std::fs::write(&go, "package main\n").unwrap();
+        let (mut state, restarted) = two_language_worker(&root, &python);
+        let (diag_tx, diag_rx) = std_mpsc::channel();
+        state.diagnostics_tx = diag_tx;
+        let python_server = state.registry.for_language(Language::PYTHON)[0].clone();
+        let go_server = state.registry.for_language(Language::GO)[0].clone();
+        let runtime = LspRuntime::new().expect("runtime");
+        let handle = runtime.handle().clone();
+        handle.block_on(state.open_doc(py.clone(), String::from("x = 1\n")));
+        handle.block_on(state.open_doc(go.clone(), String::from("package main\n")));
+        let first_py = logged_pids(&root, "python", 1);
+        let first_go = logged_pids(&root, "go", 1);
+        assert_eq!((first_py.len(), first_go.len()), (1, 1));
+
+        // Python's extension turned off: only go's server is registered.
+        let mut go_only = ServerRegistry::new();
+        go_only.register(Language::GO, go_server.clone());
+        handle.block_on(state.replace_registry(go_only));
+        assert!(process_exits(first_py[0]), "python's server stopped");
+        assert!(
+            restarted.swap(false, Ordering::Relaxed),
+            "tabs go out again"
+        );
+        assert!(!state.docs.contains_key(&py));
+        let withdrawn: Vec<DiagnosticsUpdate> = diag_rx.try_iter().collect();
+        assert!(
+            withdrawn
+                .iter()
+                .any(|u| u.path == py && u.server == "fake-python" && u.diagnostics.is_empty()),
+            "its diagnostics are withdrawn: {withdrawn:?}"
+        );
+        assert!(!withdrawn.iter().any(|u| u.path == go), "go keeps its own");
+        handle.block_on(state.open_doc(py.clone(), String::from("x = 1\n")));
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(logged_pids(&root, "python", 1), first_py, "none starts");
+        assert!(!state.docs.contains_key(&py));
+
+        // Turned back on: the next open starts it.
+        let mut both = ServerRegistry::new();
+        both.register(Language::PYTHON, python_server);
+        both.register(Language::GO, go_server);
+        handle.block_on(state.replace_registry(both));
+        assert!(restarted.load(Ordering::Relaxed), "tabs go out again");
+        handle.block_on(state.open_doc(py.clone(), String::from("x = 1\n")));
+        assert_eq!(logged_pids(&root, "python", 2).len(), 2, "python starts");
+        assert!(state.docs.contains_key(&py));
+
+        assert_eq!(logged_pids(&root, "go", 1), first_go, "go never restarted");
+        // SAFETY: signal 0 only asks whether the pid exists.
+        assert_eq!(unsafe { libc::kill(first_go[0], 0) }, 0, "go still runs");
+        assert!(state.docs.contains_key(&go), "go keeps its document");
+        handle.block_on(state.shutdown_all());
     }
 
     /// #694: a language server the kernel kills (croft makes them its first

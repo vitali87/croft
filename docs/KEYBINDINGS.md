@@ -592,7 +592,7 @@ A filter box at the top narrows all three sections by name, blurb, or id — a l
 | Click the `✕` in the filter box | Clear the filter |
 | Hover any row | Tooltip explaining the toggle / `+Add` / how to uninstall |
 
-Disabling takes effect immediately for the viewers and Vim (a disabled PDF/CSV viewer opens that file type as plain text; a disabled Vim makes `Cmd+E` inert); a disabled language server stops spawning on the next launch. The choice persists in `~/.config/croft/config.json`.
+Disabling takes effect immediately for the viewers and Vim (a disabled PDF/CSV viewer opens that file type as plain text; a disabled Vim makes `Cmd+E` inert); a disabled language server stops at once, and one turned back on or added starts at once for the files already open. The choice persists in `~/.config/croft/config.json`.
 
 ## Terminal
 

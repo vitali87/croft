@@ -393,6 +393,58 @@ fn codeql_is_added_from_the_index_and_uninstalled_back_to_it() {
     });
 }
 
+/// #1842: CodeQL's language server is registered as soon as CodeQL is added,
+/// not at the next launch, and its `.ql` files resolve to their language at
+/// once. Turning it off, or removing it, takes the server away the same way.
+#[test]
+fn adding_codeql_registers_its_language_server_without_a_relaunch() {
+    use crate::lsp::Language;
+    let (_scratch, croft) = scratch_config(&[]);
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.config_dir = croft.clone();
+    // The manager starts from the real config dir; hand it the scratch one.
+    app.reload_lsp_extensions();
+    let ql = Language("ql");
+    let registered = |app: &App| {
+        app.lsp
+            .as_ref()
+            .expect("a language-server manager")
+            .server_registered(ql, "codeql")
+    };
+    assert!(!registered(&app), "not added yet");
+    assert_eq!(Language::from_extension("ql"), None);
+
+    add_codeql_in(&croft);
+    app.refresh_extensions();
+    assert!(registered(&app), "added, its server is registered at once");
+    assert_eq!(Language::from_extension("ql"), Some(ql), "and .ql is QL");
+
+    // What it reported on a file never opened, beside a built-in lint's.
+    let unopened = tmp.path().join("Unopened.ql");
+    let error = || diag(0, 1, crate::lsp::manager::DiagnosticSeverity::Error);
+    let stored = app.lsp_diagnostics.entry(unopened.clone()).or_default();
+    stored.insert(String::from("codeql"), vec![error()]);
+    stored.insert(String::from("Markdown Lint"), vec![error()]);
+
+    app.set_extension_enabled("codeql", false);
+    assert!(!registered(&app), "turned off, its server goes");
+    let left: Vec<&String> = app.lsp_diagnostics[&unopened].keys().collect();
+    assert_eq!(left, ["Markdown Lint"], "and what it reported with it");
+    assert_eq!(
+        Language::from_extension("ql"),
+        Some(ql),
+        "a disabled extension keeps its language"
+    );
+    app.set_extension_enabled("codeql", true);
+    assert!(registered(&app), "turned back on, it returns");
+
+    std::fs::remove_dir_all(croft.join("extensions/codeql")).unwrap();
+    app.refresh_extensions();
+    assert!(!registered(&app), "removed, its server goes");
+    assert_eq!(Language::from_extension("ql"), None, "and so does QL");
+}
+
 #[test]
 fn codeql_focus_side_bar_and_open_results_directory_are_palette_commands() {
     // #578: VS Code's "CodeQL: Focus Side Bar", and the results directory
