@@ -7333,6 +7333,9 @@ impl App {
         } else {
             app.resolve_codeql_cli();
         }
+        // And finds runners among the extensions the app has added: CodeQL's
+        // comes with the CodeQL extension (#1842).
+        app.test_worker.set_extensions_dir(app.extensions_dir());
         app.sync_focus_flags();
         // Seed the highlighter with the persisted theme's code palette so a
         // file opened before the first theme switch already highlights in the
@@ -9863,7 +9866,11 @@ impl App {
         {
             return v.clone();
         }
-        let found = crate::testing::registry::test_root_for(&key.0, key.1.as_deref());
+        let found = crate::testing::registry::test_root_for(
+            &self.extensions_dir(),
+            &key.0,
+            key.1.as_deref(),
+        );
         self.test_root_follow = Some((key, found.clone()));
         found
     }
@@ -18314,8 +18321,7 @@ impl App {
         // The gates follow the manifests on disk too, so CodeQL added or
         // removed by hand (#1842) comes and goes with its row here.
         let had_codeql = self.installed_extensions.contains("codeql");
-        self.installed_extensions =
-            crate::mcp::catalog::installed_ids(&self.config_dir.join("extensions"));
+        self.installed_extensions = crate::mcp::catalog::installed_ids(&self.extensions_dir());
         if self.installed_extensions.contains("codeql") != had_codeql {
             self.codeql_availability_changed();
         }
@@ -27009,7 +27015,7 @@ impl App {
                 .selected_install_target()
                 .map(str::to_string)
                 .unwrap_or(id);
-            match crate::mcp::catalog::install_in(&self.config_dir.join("extensions"), &id) {
+            match crate::mcp::catalog::install_in(&self.extensions_dir(), &id) {
                 Ok(_) => {
                     // Adding is asking for it: a disabled state left from
                     // when it was built in (CodeQL, #1842) must not hide it.
@@ -27080,7 +27086,7 @@ impl App {
         // Read before the manifest goes: a re-add of a newer version must
         // approve its tools afresh, like its consent below.
         let command_ids = crate::mcp::registry::command_ids_of_in_dir(&self.config_dir, id);
-        match crate::mcp::catalog::uninstall_in(&self.config_dir.join("extensions"), id) {
+        match crate::mcp::catalog::uninstall_in(&self.extensions_dir(), id) {
             Ok(()) => {
                 let mut saved =
                     crate::prefs::forget_mcp_tool_fingerprints_in(&self.config_dir, &command_ids);
@@ -27119,6 +27125,11 @@ impl App {
     fn forget_extension_consent(&mut self, id: &str) -> anyhow::Result<()> {
         self.consented_extensions.remove(id);
         crate::prefs::forget_mcp_consent_in(&self.config_dir, id)
+    }
+
+    /// The user's added extensions, under the app's config dir.
+    fn extensions_dir(&self) -> PathBuf {
+        self.config_dir.join("extensions")
     }
 
     /// Whether the extension `id` is installed and not in the disabled set.
@@ -27234,11 +27245,14 @@ impl App {
     /// runner still ran (and rebuilt) the workspace, and a disabled Python
     /// runner ran cargo in a directory with no Cargo.toml.
     fn testing_runner_available(&mut self) -> bool {
-        if crate::testing::worker::runner_for(&self.active_test_root).is_some() {
+        if crate::testing::worker::runner_for(&self.extensions_dir(), &self.active_test_root)
+            .is_some()
+        {
             return true;
         }
         if self.refollow_test_root()
-            && crate::testing::worker::runner_for(&self.active_test_root).is_some()
+            && crate::testing::worker::runner_for(&self.extensions_dir(), &self.active_test_root)
+                .is_some()
         {
             return true;
         }
@@ -27574,7 +27588,8 @@ impl App {
             return changed;
         }
         let busy = self.testing.is_busy()
-            || crate::testing::worker::runner_for(&self.active_test_root).is_none();
+            || crate::testing::worker::runner_for(&self.extensions_dir(), &self.active_test_root)
+                .is_none();
         let Some(scope) = self.testing.watch.take_due(now, busy) else {
             return changed;
         };
@@ -27606,7 +27621,7 @@ impl App {
     /// with the reason, when the workspace's runner is not the CodeQL one.
     fn run_codeql_tests(&mut self) {
         use crate::testing::worker::{Runner, runner_for};
-        if runner_for(&self.active_test_root) != Some(Runner::Codeql) {
+        if runner_for(&self.extensions_dir(), &self.active_test_root) != Some(Runner::Codeql) {
             self.status = String::from(
                 "No CodeQL tests here: a test pack's qlpack.yml declares tests: or extractor:",
             );
@@ -27815,7 +27830,7 @@ impl App {
             return;
         };
         let root = self.active_test_root.clone();
-        let suite = crate::testing::worker::runner_for(&root)
+        let suite = crate::testing::worker::runner_for(&self.extensions_dir(), &root)
             .and_then(|runner| file_test_suite(runner, &root, &path));
         let Some(suite) = suite else {
             self.status = String::from(
@@ -28037,7 +28052,7 @@ impl App {
     /// one for the file's language, so a pytest test in a maturin crate
     /// debugs under debugpy, not as a cargo test binary.
     fn test_runner_for_focused_file(&self, root: &Path) -> Option<crate::testing::worker::Runner> {
-        let runners = crate::testing::worker::runners_for(root);
+        let runners = crate::testing::worker::runners_for(&self.extensions_dir(), root);
         crate::testing::worker::runner_for_file(&runners, self.editor.path.as_deref())
     }
 

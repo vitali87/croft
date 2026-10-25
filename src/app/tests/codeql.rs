@@ -4472,7 +4472,8 @@ fn codeql_run_tests_runs_the_test_pack_through_the_testing_view() {
         )
         .unwrap();
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let mut app = codeql_app(root.clone());
+        let mut app = App::new(root.clone()).unwrap();
+        let _config = add_codeql(&mut app);
         app.set_codeql_program(program.clone());
         app.run_command(Command::CodeqlRunTests);
         assert_eq!(app.status, "Running CodeQL tests");
@@ -4528,7 +4529,8 @@ fn a_codeql_test_clicked_in_the_tree_runs_with_the_configured_codeql() {
     )
     .unwrap();
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let mut app = codeql_app(root.clone());
+    let mut app = App::new(root.clone()).unwrap();
+    let _config = add_codeql(&mut app);
     app.set_codeql_program(program);
     app.run_test(String::from("test/Find::Find.qlref"));
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);

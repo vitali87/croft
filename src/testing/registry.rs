@@ -96,15 +96,17 @@ fn resolve_all(sources: &[String], disabled: &BTreeSet<String>, root: &Path) -> 
     found
 }
 
-/// Bundled + user manifest sources, in load order.
-fn all_sources() -> Vec<String> {
+/// Bundled + user manifest sources, in load order: the user's added
+/// extensions, under `extensions_dir`, come last. That puts CodeQL's runner,
+/// which comes with the CodeQL extension (#1842), after the bundled ones: a
+/// CodeQL repo often carries other projects' marker files too, and those
+/// runners should keep claiming them.
+fn all_sources(extensions_dir: &Path) -> Vec<String> {
     let mut sources: Vec<String> = manifest::BUNDLED_MANIFESTS
         .iter()
         .map(|s| s.to_string())
         .collect();
-    sources.extend(manifest::read_extension_sources(
-        &manifest::user_extensions_dir(),
-    ));
+    sources.extend(manifest::read_extension_sources(extensions_dir));
     sources
 }
 
@@ -113,9 +115,9 @@ fn all_sources() -> Vec<String> {
 /// instead of shelling a tool that would error). Reads prefs + manifests fresh
 /// on each call — detection runs on discover/run, never per keystroke, so a
 /// panel toggle takes effect on the next discovery.
-pub fn runner_for(root: &Path) -> Option<Runner> {
+pub fn runner_for(extensions_dir: &Path, root: &Path) -> Option<Runner> {
     let disabled = crate::prefs::Prefs::load_or_default().disabled_extensions;
-    resolve(&all_sources(), &disabled, root)
+    resolve(&all_sources(extensions_dir), &disabled, root)
 }
 
 /// The package folders a JS monorepo at `root` declares (#1520): the root
@@ -220,15 +222,15 @@ fn resolve_test_root(
 }
 
 /// [`resolve_test_root`] over the enabled extensions.
-pub fn test_root_for(root: &Path, file: Option<&Path>) -> PathBuf {
+pub fn test_root_for(extensions_dir: &Path, root: &Path, file: Option<&Path>) -> PathBuf {
     let disabled = crate::prefs::Prefs::load_or_default().disabled_extensions;
-    resolve_test_root(&all_sources(), &disabled, root, file)
+    resolve_test_root(&all_sources(extensions_dir), &disabled, root, file)
 }
 
 /// Every enabled runner that claims `root` (#1408), [`runner_for`]'s first.
-pub fn runners_for(root: &Path) -> Vec<Runner> {
+pub fn runners_for(extensions_dir: &Path, root: &Path) -> Vec<Runner> {
     let disabled = crate::prefs::Prefs::load_or_default().disabled_extensions;
-    resolve_all(&all_sources(), &disabled, root)
+    resolve_all(&all_sources(extensions_dir), &disabled, root)
 }
 
 #[cfg(test)]
@@ -372,7 +374,9 @@ mod tests {
 
     #[test]
     fn a_codeql_test_pack_routes_to_codeql_but_a_query_pack_does_not() {
-        let s = bundled();
+        // CodeQL's runner comes with the CodeQL extension (#1842).
+        let mut s = bundled();
+        s.push(crate::mcp::registry_index::CODEQL_MANIFEST.to_string());
         let tmp = tempfile::tempdir().unwrap();
         let write = |rel: &str, text: &str| {
             let p = tmp.path().join(rel);
@@ -392,7 +396,12 @@ mod tests {
             "name: acme/tests\nextractor: go\ntests: .\n",
         );
         assert_eq!(resolve(&s, &none(), tmp.path()), Some(Runner::Codeql));
-        let off: BTreeSet<String> = [String::from("test-codeql")].into();
+        assert_eq!(
+            resolve(&bundled(), &none(), tmp.path()),
+            None,
+            "not built in: only with CodeQL added"
+        );
+        let off: BTreeSet<String> = [String::from("codeql")].into();
         assert_eq!(resolve(&s, &off, tmp.path()), None);
         // Another project's marker at the root still wins.
         write("go.mod", "module example.com/m\n");

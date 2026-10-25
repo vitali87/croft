@@ -4,9 +4,13 @@
 # declares the `ql` language. The language server is the CodeQL CLI's own
 # (`codeql execute language-server`), expected on the user's PATH alongside the
 # rest of the CLI; it starts on croft's next launch. Nothing is provisioned.
+#
+# It also points croft's Testing view at CodeQL test packs (`codeql test run`).
+# A pack file counts only when it declares a test pack (`tests:`, or
+# `extractor:` with tests beside it), at the root or a few folders below it.
 id = "codeql"
 name = "CodeQL"
-description = "CodeQL databases, queries, query history, the AST viewer and the QL language server."
+description = "CodeQL databases, queries, query history, the AST viewer, the QL language server and CodeQL tests in the Testing view."
 builtin = false
 api_version = 1
 
@@ -21,3 +25,9 @@ command = "codeql"
 args = ["execute", "language-server", "--check-errors", "ON_CHANGE"]
 language = "ql"
 priority = 0
+
+[[test_runners]]
+id = "codeql"
+label = "codeql test run"
+kind = "codeql"
+markers = ["qlpack.yml", "codeql-pack.yml"]
