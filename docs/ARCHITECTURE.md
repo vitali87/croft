@@ -260,7 +260,7 @@ While a mouse drag is held (`drag_selecting`, ended by `end_drag` from the app's
 
 **Close undo and session persistence.** Closing a pane parks it in `App::closed_terminals` for a 10s undo window; Cmd+K ⇧T restores process plus scrollback. The tick reaps expired parks, whose `Drop` then kills the child. The panel layout persists across restarts via terminal_session.rs.
 
-**Progress gauge.** OSC 9;4 progress renders as a gauge over the bottom border's glyphs: heavy strokes in the state's colour (blue, red, yellow), with a wall-clock-phased sweeping segment for indeterminate. The name pill appends the percent when painted. It is held in a shared slot the reader thread writes and clears.
+**Progress gauge.** OSC 9;4 progress renders as a gauge over the bottom border's glyphs: heavy strokes in the state's colour (blue, red, yellow), with a wall-clock-phased sweeping segment for indeterminate. The fill is one heavy `━` stroke on a light `─` track whatever the focus: a focused pane's own bottom edge is heavy, so it drops to light while a gauge runs rather than the fill doubling to `═`, which read as two bars (#1852). The name pill appends the percent when painted. It is held in a shared slot the reader thread writes and clears.
 
 **Timestamps gutter.** The reader thread stamps rows by content id keyed on the shared scroll clock (clock reading plus cursor grid line — stable through scrollback saturation, frozen across alt-screen trips, never wiped by a cursor-up redraw), at chunk granularity, into a bounded BTreeMap. The "Terminal: Toggle Timestamps" palette command paints each stamped row's HH:MM:SS (libc `localtime`) down the right edge, amber with a warning mark when a row landed `STALL_GAP_MS` after its predecessor.
 

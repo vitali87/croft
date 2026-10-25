@@ -1,0 +1,1 @@
+fix: A focused terminal pane draws a program's progress (OSC 9;4) as one bar along its bottom border, the same as an unfocused pane, instead of a doubled `═` line that looked like two progress bars (#1852).
