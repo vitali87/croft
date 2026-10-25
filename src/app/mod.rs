@@ -179,6 +179,24 @@ pub enum ActivityIcon {
     Settings,
 }
 
+impl ActivityIcon {
+    /// The side bar view this icon opens; `None` for the settings gear,
+    /// which opens a menu instead.
+    fn view(self) -> Option<SidebarView> {
+        match self {
+            ActivityIcon::Explorer => Some(SidebarView::Explorer),
+            ActivityIcon::Search => Some(SidebarView::Search),
+            ActivityIcon::SourceControl => Some(SidebarView::SourceControl),
+            ActivityIcon::Remote => Some(SidebarView::Remote),
+            ActivityIcon::RunDebug => Some(SidebarView::RunDebug),
+            ActivityIcon::Extensions => Some(SidebarView::Extensions),
+            ActivityIcon::Testing => Some(SidebarView::Testing),
+            ActivityIcon::CodeQL => Some(SidebarView::CodeQL),
+            ActivityIcon::Settings => None,
+        }
+    }
+}
+
 /// How many commits the history scrubber loads up front (#371).
 ///
 /// A ceiling rather than the whole history: the issue's own criterion is
@@ -8132,56 +8150,56 @@ impl App {
         // variant; otherwise the pointer-hovered icon brightens (no pill); the
         // rest stay muted. Selected always wins over hovered.
         let hov = self.hovered_activity_icon;
-        let exp_state = if self.sidebar_view == SidebarView::Explorer {
+        let exp_state = if self.activity_view_active(SidebarView::Explorer) {
             &images.explorer_active
         } else if hov == Some(ActivityIcon::Explorer) {
             &images.explorer_hovered
         } else {
             &images.explorer_inactive
         };
-        let sea_state = if self.sidebar_view == SidebarView::Search {
+        let sea_state = if self.activity_view_active(SidebarView::Search) {
             &images.search_active
         } else if hov == Some(ActivityIcon::Search) {
             &images.search_hovered
         } else {
             &images.search_inactive
         };
-        let scm_state = if self.sidebar_view == SidebarView::SourceControl {
+        let scm_state = if self.activity_view_active(SidebarView::SourceControl) {
             &images.source_control_active
         } else if hov == Some(ActivityIcon::SourceControl) {
             &images.source_control_hovered
         } else {
             &images.source_control_inactive
         };
-        let rem_state = if self.sidebar_view == SidebarView::Remote {
+        let rem_state = if self.activity_view_active(SidebarView::Remote) {
             &images.remote_active
         } else if hov == Some(ActivityIcon::Remote) {
             &images.remote_hovered
         } else {
             &images.remote_inactive
         };
-        let rdb_state = if self.sidebar_view == SidebarView::RunDebug {
+        let rdb_state = if self.activity_view_active(SidebarView::RunDebug) {
             &images.run_debug_active
         } else if hov == Some(ActivityIcon::RunDebug) {
             &images.run_debug_hovered
         } else {
             &images.run_debug_inactive
         };
-        let ext_state = if self.sidebar_view == SidebarView::Extensions {
+        let ext_state = if self.activity_view_active(SidebarView::Extensions) {
             &images.extensions_active
         } else if hov == Some(ActivityIcon::Extensions) {
             &images.extensions_hovered
         } else {
             &images.extensions_inactive
         };
-        let tst_state = if self.sidebar_view == SidebarView::Testing {
+        let tst_state = if self.activity_view_active(SidebarView::Testing) {
             &images.testing_active
         } else if hov == Some(ActivityIcon::Testing) {
             &images.testing_hovered
         } else {
             &images.testing_inactive
         };
-        let cql_state = if self.sidebar_view == SidebarView::CodeQL {
+        let cql_state = if self.activity_view_active(SidebarView::CodeQL) {
             &images.codeql_active
         } else if hov == Some(ActivityIcon::CodeQL) {
             &images.codeql_hovered
@@ -17934,6 +17952,7 @@ impl App {
         self.refresh_remote_ports_badge();
         self.refresh_testing_badge();
         self.refresh_problems_badge();
+        self.overlays.activity.note_side_bar_shown(self.show_tree);
         // In images mode the activity bar inherits the iTerm session bg
         // (forced to sRGB(EDITOR_BG_RGB) via SetColors), matching the rest
         // of the panes. The glyph-fallback path keeps a solid bg for
@@ -17967,14 +17986,14 @@ impl App {
             Rect::default()
         };
         let settings_block = activity_settings_block(area, codeql_block.width > 0);
-        let explorer_active = self.sidebar_view == SidebarView::Explorer;
-        let search_active = self.sidebar_view == SidebarView::Search;
-        let source_control_active = self.sidebar_view == SidebarView::SourceControl;
-        let remote_active = self.sidebar_view == SidebarView::Remote;
-        let run_debug_active = self.sidebar_view == SidebarView::RunDebug;
-        let extensions_active = self.sidebar_view == SidebarView::Extensions;
-        let testing_active = self.sidebar_view == SidebarView::Testing;
-        let codeql_active = self.sidebar_view == SidebarView::CodeQL;
+        let explorer_active = self.activity_view_active(SidebarView::Explorer);
+        let search_active = self.activity_view_active(SidebarView::Search);
+        let source_control_active = self.activity_view_active(SidebarView::SourceControl);
+        let remote_active = self.activity_view_active(SidebarView::Remote);
+        let run_debug_active = self.activity_view_active(SidebarView::RunDebug);
+        let extensions_active = self.activity_view_active(SidebarView::Extensions);
+        let testing_active = self.activity_view_active(SidebarView::Testing);
+        let codeql_active = self.activity_view_active(SidebarView::CodeQL);
         let settings_active = self.settings_menu_active();
         // Hover brightens the glyph (like active) but draws no selection pill,
         // mirroring the image path's hovered variant. Selected wins over hover.
@@ -18238,6 +18257,41 @@ impl App {
                 self.focus_pane(Pane::Tree);
             }
         }
+    }
+
+    /// A click on an activity-bar view icon (#1845), with VS Code's default
+    /// `workbench.activityBar.iconClickBehavior` of `toggle`: the icon of the
+    /// view the side bar is already showing collapses it, and any other click
+    /// opens that view, expanding a collapsed side bar. The collapse goes
+    /// through `toggle_side_bar` like every other deliberate hide, then hands
+    /// focus on, as VS Code does, so keys never land in a pane no longer on
+    /// screen: to the editor, or to a maximized terminal, which the editor
+    /// would otherwise un-maximize by taking focus.
+    fn click_activity_view(&mut self, view: SidebarView) {
+        if self.activity_view_active(view) {
+            self.toggle_side_bar();
+            self.after_chrome_visibility_change();
+            if self.focus == Pane::Tree {
+                self.focus_pane(if self.terminal_maximized {
+                    Pane::Terminal
+                } else {
+                    Pane::Editor
+                });
+            }
+            return;
+        }
+        match view {
+            SidebarView::Testing => self.open_testing_view(),
+            SidebarView::CodeQL => self.open_codeql_view(),
+            _ => self.set_sidebar_view(view),
+        }
+    }
+
+    /// Whether `view`'s activity icon reads as selected: it is the side bar's
+    /// view and the side bar is open. A collapsed side bar selects nothing,
+    /// as in VS Code, so the pill never claims a view that is not on screen.
+    fn activity_view_active(&self, view: SidebarView) -> bool {
+        self.show_tree && self.sidebar_view == view
     }
 
     /// Rebuild the Extensions panel's row list from the bundled + user manifests,
@@ -62265,44 +62319,15 @@ impl App {
                     }
                 }
                 // Activity-bar hit-test takes precedence over the side panel.
-                if rect_contains(self.sidebar_areas.explorer_icon, m.column, m.row) {
-                    self.set_sidebar_view(SidebarView::Explorer);
-                    return;
-                }
-                if rect_contains(self.sidebar_areas.search_icon, m.column, m.row) {
-                    self.set_sidebar_view(SidebarView::Search);
-                    return;
-                }
-                if rect_contains(self.sidebar_areas.source_control_icon, m.column, m.row) {
-                    self.set_sidebar_view(SidebarView::SourceControl);
-                    return;
-                }
-                if rect_contains(self.sidebar_areas.remote_icon, m.column, m.row) {
-                    self.set_sidebar_view(SidebarView::Remote);
-                    return;
-                }
-                if rect_contains(self.sidebar_areas.run_debug_icon, m.column, m.row) {
-                    self.set_sidebar_view(SidebarView::RunDebug);
-                    return;
-                }
-                if rect_contains(self.sidebar_areas.extensions_icon, m.column, m.row) {
-                    self.set_sidebar_view(SidebarView::Extensions);
+                if let Some(icon) = self.activity_icon_at(m.column, m.row) {
+                    match icon.view() {
+                        Some(view) => self.click_activity_view(view),
+                        None => self.open_settings_menu(),
+                    }
                     return;
                 }
                 if rect_contains(self.welcome_tour_button, m.column, m.row) {
                     self.start_demo();
-                    return;
-                }
-                if rect_contains(self.sidebar_areas.testing_icon, m.column, m.row) {
-                    self.open_testing_view();
-                    return;
-                }
-                if rect_contains(self.sidebar_areas.codeql_icon, m.column, m.row) {
-                    self.open_codeql_view();
-                    return;
-                }
-                if rect_contains(self.sidebar_areas.settings_icon, m.column, m.row) {
-                    self.open_settings_menu();
                     return;
                 }
                 if in_tree_scrollbar {
