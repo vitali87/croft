@@ -1,0 +1,1 @@
+fix: Updating croft shows its progress once, in the status bar, which names the version being built, instead of a spinner in the update popup and another in the status bar. The popup comes back with Relaunch when the build lands, or with Retry if it fails (#1852).
