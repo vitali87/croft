@@ -429,8 +429,25 @@ fn adding_codeql_registers_its_language_server_without_a_relaunch() {
 
     app.set_extension_enabled("codeql", false);
     assert!(!registered(&app), "turned off, its server goes");
-    let left: Vec<&String> = app.lsp_diagnostics[&unopened].keys().collect();
-    assert_eq!(left, ["Markdown Lint"], "and what it reported with it");
+    let left = |app: &App| {
+        let mut keys: Vec<String> = app.lsp_diagnostics[&unopened].keys().cloned().collect();
+        keys.sort();
+        keys
+    };
+    assert_eq!(left(&app), ["Markdown Lint"], "and what it reported");
+    // A report it had queued before it stopped is dropped as it drains.
+    let report = || crate::lsp::manager::DiagnosticsUpdate {
+        path: unopened.clone(),
+        server: String::from("codeql"),
+        diagnostics: vec![error()],
+        pulled: false,
+    };
+    app.lsp
+        .as_ref()
+        .unwrap()
+        .push_diagnostics_for_test(report());
+    app.drain_lsp_diagnostics();
+    assert_eq!(left(&app), ["Markdown Lint"], "nothing would clear it");
     assert_eq!(
         Language::from_extension("ql"),
         Some(ql),
@@ -438,6 +455,12 @@ fn adding_codeql_registers_its_language_server_without_a_relaunch() {
     );
     app.set_extension_enabled("codeql", true);
     assert!(registered(&app), "turned back on, it returns");
+    app.lsp
+        .as_ref()
+        .unwrap()
+        .push_diagnostics_for_test(report());
+    app.drain_lsp_diagnostics();
+    assert_eq!(left(&app), ["Markdown Lint", "codeql"], "and reports again");
 
     std::fs::remove_dir_all(croft.join("extensions/codeql")).unwrap();
     app.refresh_extensions();

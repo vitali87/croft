@@ -1203,6 +1203,10 @@ pub struct LspManager {
     colors_rx: std_mpsc::Receiver<DocumentColorsUpdate>,
     color_presentations_rx: std_mpsc::Receiver<ColorPresentationsResult>,
     diagnostics_rx: std_mpsc::Receiver<DiagnosticsUpdate>,
+    /// Test hook: a sender into `diagnostics_rx`, so app tests can deliver
+    /// a server's report without a server.
+    #[cfg(test)]
+    diagnostics_test_tx: std_mpsc::Sender<DiagnosticsUpdate>,
     progress_rx: std_mpsc::Receiver<ServerUpdate>,
     capability_support: CapabilitySupport,
     semantic_refresh: Arc<AtomicBool>,
@@ -1293,6 +1297,8 @@ impl LspManager {
         let (colors_tx, colors_rx) = std_mpsc::channel();
         let (color_presentations_tx, color_presentations_rx) = std_mpsc::channel();
         let (diagnostics_tx, diagnostics_rx) = std_mpsc::channel();
+        #[cfg(test)]
+        let diagnostics_test_tx = diagnostics_tx.clone();
         let (progress_tx, progress_rx) = std_mpsc::channel();
         let capability_support: CapabilitySupport =
             Arc::new(StdMutex::new(LangCapabilitySupport::default()));
@@ -1400,6 +1406,8 @@ impl LspManager {
             colors_rx,
             color_presentations_rx,
             diagnostics_rx,
+            #[cfg(test)]
+            diagnostics_test_tx,
             progress_rx,
             capability_support,
             semantic_refresh,
@@ -1743,8 +1751,26 @@ impl LspManager {
     /// Pop the next server-pushed diagnostics batch, if any. Each batch is the
     /// complete set for one `(path, server)` pair; the app keeps a per-file,
     /// per-server store so layering and "all clear" (empty batch) both work.
+    /// A server no extension registers now (#1842) may still have reports
+    /// queued or in flight from before it stopped: only its withdrawals
+    /// come through, so nothing it says lands where nothing would clear it.
     pub fn drain_diagnostics(&self) -> Option<DiagnosticsUpdate> {
-        self.diagnostics_rx.try_recv().ok()
+        loop {
+            let u = self.diagnostics_rx.try_recv().ok()?;
+            let registered = self
+                .registered_servers
+                .values()
+                .any(|names| names.contains(&u.server.as_str()));
+            if registered || u.diagnostics.is_empty() {
+                return Some(u);
+            }
+        }
+    }
+
+    /// Test hook: deliver `update` as if a server had published it.
+    #[cfg(test)]
+    pub fn push_diagnostics_for_test(&self, update: DiagnosticsUpdate) {
+        let _ = self.diagnostics_test_tx.send(update);
     }
 
     /// Pop the next server progress update or `window/*` message, if any.
@@ -3327,6 +3353,24 @@ impl WorkerState {
     /// servers keep running.
     async fn replace_registry(&mut self, registry: ServerRegistry) {
         let old = std::mem::replace(&mut self.registry, registry);
+        // A file an added or removed extension maps to another language or
+        // project root now leaves the servers of its old one, so the app's
+        // re-open reaches the new one's as an open, not as a change.
+        let moved: Vec<PathBuf> = self
+            .docs
+            .iter()
+            .filter(|(path, doc)| {
+                path_to_language(path).map(|lang| {
+                    let root =
+                        project_root_for_roots(path, lang, &self.workspace_root, &self.extra_roots);
+                    (lang, root)
+                }) != Some((doc.language, doc.project_root.clone()))
+            })
+            .map(|(path, _)| path.clone())
+            .collect();
+        for path in moved {
+            self.close_doc(path).await;
+        }
         let names = |r: &ServerRegistry, lang: Language| -> Vec<&'static str> {
             r.for_language(lang).iter().map(|c| c.name).collect()
         };
@@ -12401,6 +12445,53 @@ while (msg := read_msg()) is not None:
         // SAFETY: signal 0 only asks whether the pid exists.
         assert_eq!(unsafe { libc::kill(first_go[0], 0) }, 0, "go still runs");
         assert!(state.docs.contains_key(&go), "go keeps its document");
+        handle.block_on(state.shutdown_all());
+    }
+
+    /// #1842: an added extension that maps an open file to a language of its
+    /// own takes the file off its old language's servers, though their set
+    /// did not change, so the app's re-open reaches the new language as an
+    /// open rather than as a change to the old one.
+    #[cfg(unix)]
+    #[test]
+    fn a_file_an_added_extension_claims_leaves_its_old_servers() {
+        let Some(python) = python_for_stub_server() else {
+            eprintln!("SKIPPED: python3 not on PATH");
+            return;
+        };
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonicalize");
+        let py = root.join("demo.py");
+        std::fs::write(&py, "x = 1\n").unwrap();
+        let (mut state, _restarted) = two_language_worker(&root, &python);
+        let same = |state: &WorkerState| {
+            let mut r = ServerRegistry::new();
+            for lang in [Language::PYTHON, Language::GO] {
+                r.register(lang, state.registry.for_language(lang)[0].clone());
+            }
+            r
+        };
+        let runtime = LspRuntime::new().expect("runtime");
+        let handle = runtime.handle().clone();
+        handle.block_on(state.open_doc(py.clone(), String::from("x = 1\n")));
+        let first = logged_pids(&root, "python", 1);
+        assert_eq!(first.len(), 1);
+
+        // The worker runs on this thread here, so it reads this table.
+        crate::lsp::languages::reload_with_user_sources(&[
+            "id = \"snake\"\nname = \"Snake\"\napi_version = 1\n\n[[languages]]\nid = \"snake\"\nextensions = [\"py\"]\n",
+        ]);
+        let registry = same(&state);
+        handle.block_on(state.replace_registry(registry));
+        assert!(!state.docs.contains_key(&py), "off python's servers");
+        let log = root.join("python.log");
+        crate::test_budget::await_spawned(Duration::from_secs(5), "the didClose", || {
+            std::fs::read_to_string(&log).is_ok_and(|l| l.contains("textDocument/didClose"))
+        });
+        // SAFETY: signal 0 only asks whether the pid exists.
+        assert_eq!(unsafe { libc::kill(first[0], 0) }, 0, "python still runs");
+        handle.block_on(state.open_doc(py.clone(), String::from("x = 1\n")));
+        assert!(!state.docs.contains_key(&py), "snake has no server");
         handle.block_on(state.shutdown_all());
     }
 
