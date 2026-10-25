@@ -38,14 +38,14 @@ pub enum Runner {
 /// Detect the workspace's test runner from the enabled extensions'
 /// `[[test_runners]]` declarations. `None` means no recognised test project,
 /// so the Testing view stays empty instead of shelling a tool that would error.
-pub fn runner_for(root: &Path) -> Option<Runner> {
-    super::registry::runner_for(root)
+pub fn runner_for(extensions_dir: &Path, root: &Path) -> Option<Runner> {
+    super::registry::runner_for(extensions_dir, root)
 }
 
 /// Every runner that claims `root` (#1408): a folder with two languages'
 /// tests has a runner for each, and the Testing view lists both.
-pub fn runners_for(root: &Path) -> Vec<Runner> {
-    super::registry::runners_for(root)
+pub fn runners_for(extensions_dir: &Path, root: &Path) -> Vec<Runner> {
+    super::registry::runners_for(extensions_dir, root)
 }
 
 /// The runners whose tests a file of this kind holds, by its extension.
@@ -171,6 +171,10 @@ pub enum TestRequest {
     /// the Testing view and the CodeQL side bar run the same CLI (and a test
     /// can stand a script in for it).
     SetCodeqlProgram(PathBuf),
+    /// Rebind the folder of the user's added extensions the runners are read
+    /// from: the app's own, so a test can add CodeQL, whose runner comes with
+    /// the CodeQL extension (#1842), without touching the real one.
+    SetExtensionsDir(PathBuf),
 }
 
 pub enum TestResponse {
@@ -410,6 +414,10 @@ impl TestWorker {
         self.send(TestRequest::SetCodeqlProgram(program));
     }
 
+    pub fn set_extensions_dir(&mut self, dir: PathBuf) {
+        self.send(TestRequest::SetExtensionsDir(dir));
+    }
+
     /// Stop the run or discovery in flight (#1534): its runner's process
     /// group is killed, and its end reaches the panel as cancelled. Also
     /// called on quit, so no runner outlives croft.
@@ -488,6 +496,9 @@ struct EpochTx<'a> {
     /// [`TestRequest::SetCodeqlProgram`]); carried here because every
     /// handler already takes the sender.
     codeql: &'a Path,
+    /// The user's added extensions, whose runners count alongside the
+    /// bundled ones (see [`TestRequest::SetExtensionsDir`]).
+    extensions: &'a Path,
     /// Where the streaming child is recorded for a cancel (#1534), and the
     /// number of the request being served.
     control: &'a RunControl,
@@ -542,6 +553,7 @@ fn worker_loop(
     // Found on PATH, as the CodeQL side bar finds it, until the app says
     // otherwise.
     let mut codeql = PathBuf::from("codeql");
+    let mut extensions = crate::lsp::manifest::user_extensions_dir();
     let mut request = 0u64;
     let owners = RefCell::new(BTreeMap::new());
     while let Ok(req) = rx.recv() {
@@ -550,6 +562,7 @@ fn worker_loop(
             tx: &tx,
             epoch,
             codeql: &codeql,
+            extensions: &extensions,
             control,
             request,
             owners: Some(&owners),
@@ -571,6 +584,7 @@ fn worker_loop(
                 owners.borrow_mut().clear();
             }
             TestRequest::SetCodeqlProgram(p) => codeql = p,
+            TestRequest::SetExtensionsDir(p) => extensions = p,
         }
     }
 }
@@ -1392,7 +1406,7 @@ fn run_all(root: &Path, tx: &EpochTx) {
     // discovered tree — a refusal keeps the panel exactly as it was.
     // Exhaustive matches below, no `_` arm, so a future Runner variant is a
     // compile error here instead of silently cargo.
-    let runners = runners_for(root);
+    let runners = runners_for(tx.extensions, root);
     if runners.is_empty() {
         tx.send(TestResponse::Refused);
         return;
@@ -1638,8 +1652,8 @@ fn run_coverage(root: &Path, tx: &EpochTx, scope: Option<&CoverageScope>) {
     // A scoped run goes to the runner that owns its test, as a plain run
     // of it does (#1408): a pytest case in a maturin crate is pytest-cov's.
     let runner = match scope {
-        Some(scope) => tx.choose(&runners_for(root), &scope.name, None),
-        None => runner_for(root),
+        Some(scope) => tx.choose(&runners_for(tx.extensions, root), &scope.name, None),
+        None => runner_for(tx.extensions, root),
     };
     let Some(runner) = runner else {
         tx.send(TestResponse::Refused);
@@ -1720,7 +1734,7 @@ fn run_coverage(root: &Path, tx: &EpochTx, scope: Option<&CoverageScope>) {
 fn run_one(root: &Path, tx: &EpochTx, name: &str) {
     // See run_all: `None` refuses instead of falling through to cargo, and
     // `Refused` (not a bare Finished) rolls back this case's Running mark.
-    let Some(runner) = tx.choose(&runners_for(root), name, None) else {
+    let Some(runner) = tx.choose(&runners_for(tx.extensions, root), name, None) else {
         tx.send(TestResponse::Refused);
         return;
     };
@@ -1733,7 +1747,7 @@ fn run_one(root: &Path, tx: &EpochTx, name: &str) {
 /// spans. All are run whatever an earlier one did, and the run fails if any
 /// of them did.
 fn run_many(root: &Path, tx: &EpochTx, names: &[String]) {
-    let runners = runners_for(root);
+    let runners = runners_for(tx.extensions, root);
     if runners.is_empty() {
         tx.send(TestResponse::Refused);
         return;
@@ -1769,6 +1783,7 @@ fn run_one_case_seen(root: &Path, tx: &EpochTx, runner: Runner, name: &str) -> b
                 tx: &case_tx,
                 epoch: tx.epoch,
                 codeql: tx.codeql,
+                extensions: tx.extensions,
                 control: tx.control,
                 request: tx.request,
                 owners: tx.owners,
@@ -1824,7 +1839,7 @@ fn run_filter(root: &Path, tx: &EpochTx, pattern: &str, suite: bool) {
 fn run_filter_in(root: &Path, tx: &EpochTx, pattern: &str, suite: bool, file: Option<&Path>) {
     // See run_all: `None` refuses instead of falling through to cargo, and
     // `Refused` (not a bare Finished) rolls back the filtered Running marks.
-    let Some(runner) = tx.choose(&runners_for(root), pattern, file) else {
+    let Some(runner) = tx.choose(&runners_for(tx.extensions, root), pattern, file) else {
         tx.send(TestResponse::Refused);
         return;
     };
@@ -1875,7 +1890,7 @@ fn discover(root: &Path, tx: &EpochTx, quiet: bool) {
         tx.send(TestResponse::QuietDiscovery);
     }
     // See run_all: refuse before `Started` so the panel keeps its tree.
-    let runners = runners_for(root);
+    let runners = runners_for(tx.extensions, root);
     if runners.is_empty() {
         if !quiet {
             tx.send(TestResponse::Refused);
@@ -1990,6 +2005,22 @@ fn discover_with(runner: Runner, root: &Path, tx: &EpochTx) -> bool {
 mod tests {
     use super::*;
 
+    /// A user extensions folder with nothing added: the bundled runners only.
+    const NO_EXTENSIONS: &str = "";
+
+    /// A user extensions folder with CodeQL added, whose runner comes with
+    /// it (#1842).
+    fn codeql_added() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("codeql")).unwrap();
+        std::fs::write(
+            dir.path().join("codeql/extension.toml"),
+            crate::mcp::registry_index::CODEQL_MANIFEST,
+        )
+        .unwrap();
+        dir
+    }
+
     /// A runner disabled between the app's entry-point check and the worker
     /// picking the queued request up must refuse WITHOUT wiping panel state:
     /// `Started(Running)` clears the discovered tree, and a bare
@@ -2003,6 +2034,7 @@ mod tests {
             tx: &tx,
             epoch: 0,
             codeql: Path::new("codeql"),
+            extensions: Path::new(NO_EXTENSIONS),
             control: &RunControl::default(),
             request: 1,
             owners: None,
@@ -2095,6 +2127,8 @@ mod tests {
 
         let mut worker = TestWorker::spawn(root.to_path_buf());
         let mut panel = TestingPanel::new();
+        let added = codeql_added();
+        worker.set_extensions_dir(added.path().to_path_buf());
         worker.set_codeql_program(hang);
         worker.run_all();
         wait_until("the hung run starts", || {
@@ -2201,12 +2235,19 @@ mod tests {
              --- expected\n+++ actual\n@@ -0,0 +1 @@\n+| 1 |\n\
              1 tests passed; 1 tests failed:\n  FAILED: @ROOT@/test/Bad/Bad.ql\n",
         );
-        assert_eq!(runner_for(root), Some(Runner::Codeql));
+        let added = codeql_added();
+        assert_eq!(
+            runner_for(Path::new(NO_EXTENSIONS), root),
+            None,
+            "not built in"
+        );
+        assert_eq!(runner_for(added.path(), root), Some(Runner::Codeql));
         let (tx, rx) = std::sync::mpsc::channel();
         let etx = EpochTx {
             tx: &tx,
             epoch: 0,
             codeql: &codeql,
+            extensions: added.path(),
             control: &RunControl::default(),
             request: 1,
             owners: None,
@@ -2304,6 +2345,7 @@ mod tests {
             tx: &tx,
             epoch: 0,
             codeql: Path::new("codeql"),
+            extensions: Path::new(NO_EXTENSIONS),
             control: &RunControl::default(),
             request: 1,
             owners: None,
@@ -2455,6 +2497,7 @@ mod tests {
             tx: &tx,
             epoch: 0,
             codeql: Path::new("codeql"),
+            extensions: Path::new(NO_EXTENSIONS),
             control: &RunControl::default(),
             request: 1,
             owners: None,
@@ -3178,6 +3221,7 @@ mod tests {
             tx: &tx,
             epoch: 0,
             codeql: Path::new("codeql"),
+            extensions: Path::new(NO_EXTENSIONS),
             control: &RunControl::default(),
             request: 1,
             owners: None,
@@ -3280,6 +3324,7 @@ exit 1"#
             tx: &tx,
             epoch: 0,
             codeql: Path::new("codeql"),
+            extensions: Path::new(NO_EXTENSIONS),
             control: &RunControl::default(),
             request: 1,
             owners: None,
@@ -3328,6 +3373,7 @@ exit 1"#
             tx: &tx,
             epoch: 0,
             codeql: Path::new("codeql"),
+            extensions: Path::new(NO_EXTENSIONS),
             control: &RunControl::default(),
             request: 1,
             owners: Some(owners),
@@ -3574,12 +3620,16 @@ exit 1"#
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         std::fs::write(root.join("pyproject.toml"), "[project]\nname = \"g\"\n").unwrap();
-        assert_eq!(runner_for(root), Some(Runner::Pytest));
+        assert_eq!(
+            runner_for(Path::new(NO_EXTENSIONS), root),
+            Some(Runner::Pytest)
+        );
         let (tx, rx) = std::sync::mpsc::channel();
         let etx = EpochTx {
             tx: &tx,
             epoch: 0,
             codeql: Path::new("codeql"),
+            extensions: Path::new(NO_EXTENSIONS),
             control: &RunControl::default(),
             request: 1,
             owners: None,
@@ -3653,6 +3703,7 @@ exit 1"#
             tx: &tx,
             epoch: 0,
             codeql: Path::new("codeql"),
+            extensions: Path::new(NO_EXTENSIONS),
             control: &RunControl::default(),
             request: 1,
             owners: None,
@@ -3731,6 +3782,7 @@ exit 1"#
             tx: &tx,
             epoch: 0,
             codeql: Path::new("codeql"),
+            extensions: Path::new(NO_EXTENSIONS),
             control: &RunControl::default(),
             request: 1,
             owners: None,
@@ -3902,6 +3954,7 @@ exit 1"#
             tx: &tx,
             epoch: 0,
             codeql: Path::new("codeql"),
+            extensions: Path::new(NO_EXTENSIONS),
             control: &RunControl::default(),
             request: 1,
             owners: None,
@@ -3954,6 +4007,7 @@ exit 1"#
             tx: &tx,
             epoch: 0,
             codeql: Path::new("codeql"),
+            extensions: Path::new(NO_EXTENSIONS),
             control: &RunControl::default(),
             request: 1,
             owners: None,
@@ -4010,12 +4064,18 @@ exit 1"#
             "case \" $* \" in *\" --passWithNoTests \"*) exit 0 ;; esac\n\
              echo 'No test files found, exiting with code 1' >&2\nexit 1",
         );
-        assert_eq!(runner_for(tmp.path()), Some(Runner::Vitest));
+        assert_eq!(
+            runner_for(Path::new(NO_EXTENSIONS), tmp.path()),
+            Some(Runner::Vitest)
+        );
         assert_eq!(discovery_of(tmp.path()), (Vec::new(), Some(Some(true))));
 
         let tmp = tempfile::tempdir().unwrap();
         fake_js_runner(tmp.path(), "jest", "exit 0");
-        assert_eq!(runner_for(tmp.path()), Some(Runner::Jest));
+        assert_eq!(
+            runner_for(Path::new(NO_EXTENSIONS), tmp.path()),
+            Some(Runner::Jest)
+        );
         assert_eq!(discovery_of(tmp.path()), (Vec::new(), Some(Some(true))));
     }
 
@@ -4026,6 +4086,7 @@ exit 1"#
             tx: &tx,
             epoch: 0,
             codeql: Path::new("codeql"),
+            extensions: Path::new(NO_EXTENSIONS),
             control: &RunControl::default(),
             request: 1,
             owners: None,

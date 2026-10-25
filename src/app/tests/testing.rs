@@ -1271,6 +1271,7 @@ fn a_finished_test_run_replaces_its_running_status_with_the_outcome() {
     .unwrap();
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
     let mut app = App::new(root.clone()).unwrap();
+    let _config = add_codeql(&mut app);
     app.set_codeql_program(program);
     app.testing.apply_case(TestCase {
         name: "test/Find::Find.qlref".into(),

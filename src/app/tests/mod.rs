@@ -2137,6 +2137,19 @@ fn add_codeql_in(config_dir: &Path) {
     .unwrap();
 }
 
+/// Add CodeQL in a scratch config dir and point `app` and its test worker at
+/// it, so CodeQL test packs find the runner that comes with CodeQL (#1842).
+/// The dir lives as long as the returned guard.
+fn add_codeql(app: &mut App) -> tempfile::TempDir {
+    let config = tempfile::tempdir().unwrap();
+    add_codeql_in(config.path());
+    app.config_dir = config.path().to_path_buf();
+    app.test_worker
+        .set_extensions_dir(config.path().join("extensions"));
+    app.installed_extensions.insert(String::from("codeql"));
+    config
+}
+
 /// A workspace holding one CodeQL test, `test/Find/Find.qlref`, listed in
 /// the Testing tree, and an App whose `codeql` is a stand-in: each run
 /// prints what [`CodeqlStandIn::will`] last set (`@ROOT@` standing for the
@@ -2147,7 +2160,7 @@ struct CodeqlStandIn {
     root: String,
     out: std::path::PathBuf,
     code: std::path::PathBuf,
-    _dirs: [tempfile::TempDir; 2],
+    _dirs: [tempfile::TempDir; 3],
 }
 
 /// The stand-in's report of `Find.qlref` passing.
@@ -2180,7 +2193,8 @@ impl CodeqlStandIn {
         )
         .unwrap();
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let mut app = codeql_app(root.clone());
+        let mut app = App::new(root.clone()).unwrap();
+        let config = add_codeql(&mut app);
         app.set_codeql_program(program);
         app.testing.apply_case(TestCase {
             name: "test/Find::Find.qlref".into(),
@@ -2191,7 +2205,7 @@ impl CodeqlStandIn {
             root: root.display().to_string(),
             out,
             code,
-            _dirs: [tmp, bin],
+            _dirs: [tmp, bin, config],
         }
     }
 
