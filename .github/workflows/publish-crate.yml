@@ -73,7 +73,7 @@ jobs:
       version: ${{ steps.cadence.outputs.version }}
       already_published: ${{ steps.cadence.outputs.already_published }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # Full history: the count walks main's first-parent chain back to
           # the newest published version, which can be hundreds of merges.
@@ -145,7 +145,7 @@ jobs:
       # Dispatching release.yml on that tag.
       actions: write
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # The token is not needed after the fetch; leaving it
           # in .git/config lets any later step push with it.

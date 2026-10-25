@@ -31,7 +31,7 @@ jobs:
       - name: Skip without a token
         if: env.SONAR_TOKEN == ''
         run: echo "::notice::SONAR_TOKEN is not available (fork PR, or the secret is not configured); skipping SonarQube Cloud analysis."
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         if: env.SONAR_TOKEN != ''
         with:
           # Full history: SonarQube Cloud needs blame data to attribute issues

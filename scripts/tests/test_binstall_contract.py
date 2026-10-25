@@ -275,15 +275,21 @@ class TarLayoutDrift(unittest.TestCase):
         self.assertEqual(r.returncode, 1)
         self.assertIn("does not wait for the publish job", r.stderr)
 
-    def test_the_publish_skips_cleanly_without_a_token(self):
-        """The negative: a missing CARGO_REGISTRY_TOKEN warns and leaves the
-        release green, the same contract as the Homebrew job, and a version
-        already on crates.io is not published twice."""
+    def test_the_publish_mints_its_token_and_skips_cleanly_without_one(self):
+        """The token is minted per run through trusted publishing, never a
+        stored secret. A mint that fails (no trusted publisher for
+        release.yml yet) warns and leaves the release green, the same
+        contract as the Homebrew job, and a version already on crates.io is
+        not published twice."""
         workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text()
         crates = workflow.split("\n  crates:\n", 1)[1].split("\n  homebrew:\n", 1)[0]
-        self.assertIn("secrets.CARGO_REGISTRY_TOKEN", crates)
+        self.assertNotIn("secrets.CARGO_REGISTRY_TOKEN", crates)
+        self.assertIn("id-token: write", crates)
+        self.assertIn("uses: rust-lang/crates-io-auth-action@", crates)
+        self.assertIn("continue-on-error: true", crates)
+        self.assertIn("CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}", crates)
         self.assertIn('if [ -z "$CARGO_REGISTRY_TOKEN" ]; then', crates)
-        self.assertIn("::warning::CARGO_REGISTRY_TOKEN is not set", crates)
+        self.assertIn("::warning::no crates.io token could be minted", crates)
         self.assertIn("is already on crates.io", crates)
         self.assertIn("needs: publish", crates)
 
