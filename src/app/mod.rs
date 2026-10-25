@@ -758,12 +758,18 @@ fn activity_codeql_block(bar: Rect) -> Rect {
 /// directly above the status bar, reading as lopsidedly low.
 const ACTIVITY_BOTTOM_INSET: u16 = 1;
 
-fn activity_settings_block(bar: Rect) -> Rect {
+fn activity_settings_block(bar: Rect, codeql_shown: bool) -> Rect {
     let y = bar
         .y
         .saturating_add(bar.height)
         .saturating_sub(ACTIVITY_ICON_HEIGHT + ACTIVITY_BOTTOM_INSET);
-    let last_view_bottom = activity_codeql_y(bar) + ACTIVITY_ICON_HEIGHT;
+    // The last view icon is CodeQL's only once it is added (#1842).
+    let last_view_y = if codeql_shown {
+        activity_codeql_y(bar)
+    } else {
+        activity_testing_y(bar)
+    };
+    let last_view_bottom = last_view_y + ACTIVITY_ICON_HEIGHT;
     if y < last_view_bottom {
         return Rect::default();
     }
@@ -3388,9 +3394,9 @@ pub struct App {
     /// gates for the bundled features (PDF/CSV/Vim/LSPs) consult this set.
     disabled_extensions: std::collections::BTreeSet<String>,
     /// Ids of the installed extensions: the bundled ones plus those in the
-    /// user extensions dir at launch, kept current as the Extensions panel
-    /// adds and uninstalls. A catalog extension's feature, such as CodeQL's
-    /// side bar (#1842), stays off until it is added.
+    /// user extensions dir, read at launch and again whenever the Extensions
+    /// panel refreshes. An add-on's feature, such as CodeQL's side bar
+    /// (#1842), stays off until it is added.
     installed_extensions: std::collections::BTreeSet<String>,
     /// User key bindings from `~/.config/croft/keybindings.json`, consulted
     /// ahead of the built-in chords so a rebind wins over the default.
@@ -17960,7 +17966,7 @@ impl App {
         } else {
             Rect::default()
         };
-        let settings_block = activity_settings_block(area);
+        let settings_block = activity_settings_block(area, codeql_block.width > 0);
         let explorer_active = self.sidebar_view == SidebarView::Explorer;
         let search_active = self.sidebar_view == SidebarView::Search;
         let source_control_active = self.sidebar_view == SidebarView::SourceControl;
@@ -18250,6 +18256,14 @@ impl App {
         let compared = crate::vscode_extensions::compare(vscode);
         let items = build_extension_items(&self.disabled_extensions, &compared);
         self.extensions.set_items(items);
+        // The gates follow the manifests on disk too, so CodeQL added or
+        // removed by hand (#1842) comes and goes with its row here.
+        let had_codeql = self.installed_extensions.contains("codeql");
+        self.installed_extensions =
+            crate::mcp::catalog::installed_ids(&self.config_dir.join("extensions"));
+        if self.installed_extensions.contains("codeql") != had_codeql {
+            self.codeql_availability_changed();
+        }
     }
 
     /// Extensions: Compare with VS Code (#352). Lists what VS Code has
@@ -26942,27 +26956,28 @@ impl App {
                 .unwrap_or(id);
             match crate::mcp::catalog::install_in(&self.config_dir.join("extensions"), &id) {
                 Ok(_) => {
-                    self.installed_extensions.insert(id.clone());
                     // Adding is asking for it: a disabled state left from
                     // when it was built in (CodeQL, #1842) must not hide it.
-                    if self.disabled_extensions.remove(&id) {
-                        let saved = crate::prefs::save_disabled_extensions_in(
+                    let saved = if self.disabled_extensions.remove(&id) {
+                        crate::prefs::save_disabled_extensions_in(
                             &self.config_dir,
                             &self.disabled_extensions,
-                        );
-                        self.report_unsaved_setting(saved);
-                    }
-                    self.refresh_extensions();
-                    if id == "codeql" {
-                        self.codeql_availability_changed();
-                        self.status = String::from(
-                            "Added 'codeql' — open it from the QL icon in the activity bar; its language server starts on the next launch",
-                        );
+                        )
                     } else {
-                        self.status = format!(
+                        Ok(())
+                    };
+                    self.refresh_extensions();
+                    self.status = if id == "codeql" {
+                        String::from(
+                            "Added 'codeql' — open it from the QL icon in the activity bar; its language server starts on the next launch",
+                        )
+                    } else {
+                        format!(
                             "Added '{id}' — invoke it from the Command Palette (its server installs on first use)"
-                        );
-                    }
+                        )
+                    };
+                    // After the confirmation, so a failed save is what shows.
+                    self.report_unsaved_setting(saved);
                 }
                 Err(e) => self.status = format!("Could not add '{id}': {e}"),
             }
@@ -27025,11 +27040,7 @@ impl App {
                 // And its consent: a re-add is a program the user has not
                 // approved this time, so the first-run gate asks again.
                 saved = saved.and(self.forget_extension_consent(id));
-                self.installed_extensions.remove(id);
                 self.refresh_extensions();
-                if id == "codeql" {
-                    self.codeql_availability_changed();
-                }
                 self.status = format!("Uninstalled '{id}' — it's back under AVAILABLE to re-add");
                 self.report_unsaved_setting(saved);
             }

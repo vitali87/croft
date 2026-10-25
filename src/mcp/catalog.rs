@@ -111,12 +111,14 @@ pub fn is_removable(id: &str) -> bool {
     is_catalog_entry(id) || crate::mcp::registry_index::is_index_entry(id)
 }
 
-/// Remove a catalog entry's manifest dir under `dir` — pure over the target
-/// dir, for hermetic testing. Errors if `id` is not a catalog entry (croft
-/// only removes what it installed).
+/// Remove an added entry's manifest dir under `dir`, for hermetic testing.
+/// Errors unless croft added `id`, from the catalog or the signed index
+/// ([`is_removable`]): an index entry such as CodeQL (#1842) uninstalls too.
 fn remove_from(dir: &Path, id: &str) -> Result<()> {
-    if find_source(id).is_none() {
-        anyhow::bail!("'{id}' is not a catalog entry; croft only uninstalls what it added");
+    if !is_removable(id) {
+        anyhow::bail!(
+            "'{id}' is not from the catalog or the extension index; croft only uninstalls what it added"
+        );
     }
     let ext_dir = dir.join(id);
     if ext_dir.exists() {
@@ -147,22 +149,31 @@ mod tests {
         assert!(!available_from(&installed).iter().any(|s| s.id == "csvlens"));
     }
 
-    /// #1842: CodeQL is not built in. It waits under AVAILABLE, an add
-    /// installs it, and croft may uninstall it again.
+    /// #1842: CodeQL is neither built in nor bundled in the catalog. It comes
+    /// from the signed index, under AVAILABLE until added, and croft can
+    /// uninstall it again: an index entry is croft's to remove too.
     #[test]
-    fn codeql_is_a_catalog_entry_not_a_built_in() {
+    fn codeql_comes_from_the_index_and_uninstalls() {
+        use crate::mcp::registry_index::{CODEQL_MANIFEST, available_summaries};
         assert!(!bundled_ids().contains("codeql"));
-        let tmp = tempfile::tempdir().unwrap();
-        assert!(
-            available_from(&installed_ids(tmp.path()))
+        assert!(!is_catalog_entry("codeql"));
+        let cache = tempfile::tempdir().unwrap();
+        let _cache = crate::session_state::CacheDirForThisTestThread::set(cache.path());
+        crate::mcp::registry_index::cache_index_for_test(&[CODEQL_MANIFEST]);
+        let dir = tempfile::tempdir().unwrap();
+        let offered = |dir: &Path| {
+            available_summaries(&BTreeSet::new(), &installed_ids(dir))
                 .iter()
                 .any(|s| s.id == "codeql" && !s.builtin)
-        );
-        install_in(tmp.path(), "codeql").expect("adds the manifest");
-        let installed = installed_ids(tmp.path());
-        assert!(installed.contains("codeql"));
-        assert!(!available_from(&installed).iter().any(|s| s.id == "codeql"));
-        assert!(is_removable("codeql"));
+        };
+        assert!(offered(dir.path()), "under AVAILABLE");
+        let added = dir.path().join("codeql");
+        std::fs::create_dir_all(&added).unwrap();
+        std::fs::write(added.join("extension.toml"), CODEQL_MANIFEST).unwrap();
+        assert!(!offered(dir.path()), "added, it leaves AVAILABLE");
+        uninstall_in(dir.path(), "codeql").expect("an index entry uninstalls");
+        assert!(!added.exists());
+        assert!(offered(dir.path()), "and is back under AVAILABLE");
     }
 
     #[test]

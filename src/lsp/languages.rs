@@ -208,7 +208,7 @@ mod tests {
     fn codeql_sources_map_to_the_ql_language_once_added() {
         assert_eq!(from_extension("ql"), None, "not built in");
         let mut sources = manifest::BUNDLED_MANIFESTS.to_vec();
-        sources.push(include_str!("../../assets/catalog/codeql/extension.toml"));
+        sources.push(crate::mcp::registry_index::CODEQL_MANIFEST);
         let added = LangTable::from_sources(&sources);
         assert_eq!(added.by_ext.get("ql"), Some(&Language("ql")));
         assert_eq!(added.by_ext.get("qll"), Some(&Language("ql")));

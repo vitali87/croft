@@ -310,10 +310,11 @@ fn codeql_view_label_round_trips_for_session_restore() {
 }
 
 /// #1842: CodeQL is not built in. Until it is added there is no QL icon,
-/// no side bar and no CodeQL command in the palette; adding it from
-/// AVAILABLE brings them, and uninstalling takes them away again.
+/// no side bar and no CodeQL command in the palette; the signed index offers
+/// it under AVAILABLE, adding it brings them, and uninstalling takes them
+/// away again.
 #[test]
-fn codeql_is_added_from_available_and_uninstalled_back_to_it() {
+fn codeql_is_added_from_the_index_and_uninstalled_back_to_it() {
     // Opening the CodeQL view reads croft's cache, whose test override is
     // process-global: without the lock and a cache of its own, this test
     // reads whatever another CodeQL test has there at the time.
@@ -358,27 +359,24 @@ fn codeql_is_added_from_available_and_uninstalled_back_to_it() {
             "CodeQL is not installed - add it from the Extensions view"
         );
 
-        // Disabled back when it was built in: adding it turns it on.
-        app.disabled_extensions.insert(String::from("codeql"));
-        // The panel lists the real user dir; seat the AVAILABLE row.
-        app.extensions
-            .set_items(crate::widgets::extensions::items_from_available(
-                crate::lsp::manifest::summaries(crate::lsp::manifest::CATALOG_MANIFESTS)
-                    .into_iter()
-                    .filter(|s| s.id == "codeql")
-                    .collect(),
-            ));
-        let pos = app
-            .extensions
-            .visible_indices()
+        // The verified index lists it, so AVAILABLE offers it.
+        let cache = tempfile::tempdir().unwrap();
+        let _cache = crate::session_state::CacheDirForThisTestThread::set(cache.path());
+        crate::mcp::registry_index::cache_index_for_test(&[
+            crate::mcp::registry_index::CODEQL_MANIFEST,
+        ]);
+        assert!(
+            crate::mcp::registry_index::available_summaries(
+                &Default::default(),
+                &crate::mcp::catalog::installed_ids(&croft.join("extensions")),
+            )
             .iter()
-            .position(|&i| app.extensions.items()[i].id == "codeql")
-            .expect("the CodeQL row is visible");
-        app.extensions.select(pos);
-        app.toggle_selected_extension();
-        assert!(app.status.starts_with("Added 'codeql'"), "{}", app.status);
-        assert!(croft.join("extensions/codeql/extension.toml").is_file());
-        assert!(!app.disabled_extensions.contains("codeql"));
+            .any(|s| s.id == "codeql")
+        );
+        // Added (the fetch from the index writes this manifest), the panel's
+        // refresh turns it on.
+        add_codeql_in(&croft);
+        app.set_sidebar_view(SidebarView::Extensions);
         term.draw(|f| app.render(f)).unwrap();
         assert!(app.sidebar_areas.codeql_icon.width > 0, "the QL icon");
         assert!(codeql_rows(&mut app) > 1, "the CodeQL commands");
@@ -457,8 +455,10 @@ fn disabling_codeql_hides_its_icon_and_leaves_its_view() {
     with_relay_home(home.path(), || {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = codeql_app(tmp.path().to_path_buf());
-        // Never write the developer's real ~/.config/croft from a test.
+        // Never write the developer's real ~/.config/croft from a test. A
+        // toggle refreshes the panel, which reads what is added from here.
         app.config_dir = tmp.path().join("config");
+        add_codeql_in(&app.config_dir);
         app.open_codeql_view();
         assert_eq!(app.sidebar_view, SidebarView::CodeQL);
         app.set_extension_enabled("codeql", false);

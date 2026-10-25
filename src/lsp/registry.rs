@@ -567,9 +567,7 @@ priority = 0
         assert_eq!(mixed.for_language(Language::RUST)[0].name, "rust-analyzer");
     }
 
-    /// The CodeQL catalog entry, as adding it writes it to the user
-    /// extensions dir.
-    const CODEQL: &str = include_str!("../../assets/catalog/codeql/extension.toml");
+    const CODEQL: &str = crate::mcp::registry_index::CODEQL_MANIFEST;
 
     /// #578: once CodeQL is added, `.ql`/`.qll` files get the CodeQL CLI's
     /// language server from PATH, with errors checked as the buffer changes.

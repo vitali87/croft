@@ -2125,6 +2125,18 @@ fn codeql_app(root: PathBuf) -> App {
     app
 }
 
+/// Add CodeQL under `config_dir`'s extensions, as installing it from the
+/// signed index leaves it (#1842).
+fn add_codeql_in(config_dir: &Path) {
+    let dir = config_dir.join("extensions").join("codeql");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("extension.toml"),
+        crate::mcp::registry_index::CODEQL_MANIFEST,
+    )
+    .unwrap();
+}
+
 /// A workspace holding one CodeQL test, `test/Find/Find.qlref`, listed in
 /// the Testing tree, and an App whose `codeql` is a stand-in: each run
 /// prints what [`CodeqlStandIn::will`] last set (`@ROOT@` standing for the

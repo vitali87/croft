@@ -105,6 +105,25 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+/// Points `dirs_cache_croft` at a dir on this test thread until dropped.
+#[cfg(test)]
+pub(crate) struct CacheDirForThisTestThread;
+
+#[cfg(test)]
+impl CacheDirForThisTestThread {
+    pub(crate) fn set(dir: &Path) -> Self {
+        CACHE_DIR_FOR_THIS_TEST_THREAD.with(|d| *d.borrow_mut() = Some(dir.to_path_buf()));
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for CacheDirForThisTestThread {
+    fn drop(&mut self) {
+        CACHE_DIR_FOR_THIS_TEST_THREAD.with(|d| *d.borrow_mut() = None);
+    }
+}
+
 pub(crate) fn dirs_cache_croft() -> PathBuf {
     // A test that redirects croft's cache must not reach the real one. The
     // redirect is per thread so tests running alongside keep their own.
