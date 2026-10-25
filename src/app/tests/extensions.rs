@@ -113,6 +113,55 @@ fn uninstalling_an_extension_forgets_its_consent() {
     );
 }
 
+/// Adding is asking for it: an add from AVAILABLE turns the extension on even
+/// when its id was left disabled (CodeQL, disabled back when it was built in,
+/// #1842). A config file that cannot take that shows in the status instead of
+/// the add's confirmation.
+#[test]
+fn adding_an_extension_clears_a_stale_disabled_state_and_says_when_that_cannot_save() {
+    let (_scratch, croft) = scratch_config(&[]);
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.config_dir = croft.clone();
+    let add_time = |app: &mut App| {
+        app.disabled_extensions.insert(String::from("mcp-time"));
+        // The panel lists the real user dir; seat the AVAILABLE row.
+        app.extensions
+            .set_items(crate::widgets::extensions::items_from_available(
+                crate::lsp::manifest::summaries(crate::lsp::manifest::CATALOG_MANIFESTS)
+                    .into_iter()
+                    .filter(|s| s.id == "mcp-time")
+                    .collect(),
+            ));
+        let pos = app
+            .extensions
+            .visible_indices()
+            .iter()
+            .position(|&i| app.extensions.items()[i].id == "mcp-time")
+            .expect("the Time row is visible");
+        app.extensions.select(pos);
+        app.toggle_selected_extension();
+    };
+    add_time(&mut app);
+    assert!(app.status.starts_with("Added 'mcp-time'"), "{}", app.status);
+    assert!(croft.join("extensions/mcp-time/extension.toml").is_file());
+    assert!(!app.disabled_extensions.contains("mcp-time"));
+    let saved = crate::prefs::Prefs::load(&croft.join("config.json"))
+        .unwrap_or_default()
+        .disabled_extensions;
+    assert!(!saved.contains("mcp-time"), "{saved:?}");
+    // Again with the config file unwritable: the failed save is what shows.
+    std::fs::remove_dir_all(croft.join("extensions/mcp-time")).unwrap();
+    std::fs::remove_file(croft.join("config.json")).unwrap();
+    std::fs::create_dir_all(croft.join("config.json")).unwrap();
+    add_time(&mut app);
+    assert!(
+        app.status.starts_with("Setting not saved"),
+        "{}",
+        app.status
+    );
+}
+
 #[test]
 fn an_edit_between_refusal_and_consent_forces_a_fresh_prompt() {
     // The first Cmd+S arms the second — but consent named the characters the

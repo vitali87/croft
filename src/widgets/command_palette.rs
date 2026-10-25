@@ -2565,6 +2565,13 @@ impl Command {
     pub fn skips_the_shell(self) -> bool {
         self.title().starts_with("Terminal: ")
     }
+
+    /// Whether this command belongs to the CodeQL extension: its side bar,
+    /// or one of its "CodeQL:" commands. CodeQL is not built in (#1842), so
+    /// these leave the palette until it is added and enabled.
+    pub fn is_codeql(self) -> bool {
+        self == Command::ShowCodeQL || self.title().starts_with("CodeQL: ")
+    }
 }
 
 /// The `Cmd` chords with no `Ctrl` form off macOS (the table in

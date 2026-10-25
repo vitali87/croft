@@ -26,13 +26,18 @@ fn find_source(id: &str) -> Option<&'static str> {
         .find(|s| manifest::parse(s).map(|m| m.id == id).unwrap_or(false))
 }
 
-/// Ids already installed: the bundled built-ins plus every manifest under the
-/// user extensions dir. A catalog entry whose id is here is no longer "available".
-fn installed_ids(user_dir: &Path) -> BTreeSet<String> {
-    let mut ids: BTreeSet<String> = manifest::summaries(manifest::BUNDLED_MANIFESTS)
+/// Ids of the bundled built-ins, which are installed everywhere.
+pub fn bundled_ids() -> BTreeSet<String> {
+    manifest::summaries(manifest::BUNDLED_MANIFESTS)
         .into_iter()
         .map(|s| s.id)
-        .collect();
+        .collect()
+}
+
+/// Ids already installed: the bundled built-ins plus every manifest under the
+/// user extensions dir. A catalog entry whose id is here is no longer "available".
+pub fn installed_ids(user_dir: &Path) -> BTreeSet<String> {
+    let mut ids = bundled_ids();
     for src in manifest::read_extension_sources(user_dir) {
         if let Ok(m) = manifest::parse(&src) {
             ids.insert(m.id);
@@ -76,12 +81,13 @@ fn write_into(dir: &Path, id: &str) -> Result<PathBuf> {
 }
 
 /// Add (install) an entry. A bundled catalog entry materializes from its
-/// embedded manifest; a remote (signed-index) entry is fetched and its sha256
-/// verified against the index before it is written. Either way it lands in the
-/// user extensions dir and loads like any installed extension on next refresh.
-pub fn install(id: &str) -> Result<PathBuf> {
+/// embedded manifest into `extensions_dir` (the app's own, as for
+/// [`uninstall_in`]); a remote (signed-index) entry is fetched and its sha256
+/// verified against the index before it is written to the user extensions
+/// dir. Either way it loads like any installed extension on next refresh.
+pub fn install_in(extensions_dir: &Path, id: &str) -> Result<PathBuf> {
     if find_source(id).is_some() {
-        write_into(&manifest::user_extensions_dir(), id)
+        write_into(extensions_dir, id)
     } else {
         crate::mcp::registry_index::install_remote(id)
     }
@@ -105,17 +111,23 @@ pub fn is_removable(id: &str) -> bool {
     is_catalog_entry(id) || crate::mcp::registry_index::is_index_entry(id)
 }
 
-/// Remove a catalog entry's manifest dir under `dir` — pure over the target
-/// dir, for hermetic testing. Errors if `id` is not a catalog entry (croft
-/// only removes what it installed).
+/// Remove an added entry's manifest under `dir`, for hermetic testing.
+/// Errors unless croft added `id`, from the catalog or the signed index
+/// ([`is_removable`]): an index entry such as CodeQL (#1842) uninstalls too.
 fn remove_from(dir: &Path, id: &str) -> Result<()> {
-    if find_source(id).is_none() {
-        anyhow::bail!("'{id}' is not a catalog entry; croft only uninstalls what it added");
+    if !is_removable(id) {
+        anyhow::bail!(
+            "'{id}' is not from the catalog or the extension index; croft only uninstalls what it added"
+        );
     }
+    // Only the manifest croft wrote: anything else in the dir is the user's,
+    // so the dir goes only once it is empty.
     let ext_dir = dir.join(id);
-    if ext_dir.exists() {
-        std::fs::remove_dir_all(&ext_dir).with_context(|| format!("removing {ext_dir:?}"))?;
+    let manifest = ext_dir.join("extension.toml");
+    if manifest.exists() {
+        std::fs::remove_file(&manifest).with_context(|| format!("removing {manifest:?}"))?;
     }
+    let _ = std::fs::remove_dir(&ext_dir);
     Ok(())
 }
 
@@ -139,6 +151,33 @@ mod tests {
         );
         let installed: BTreeSet<String> = ["csvlens".to_string()].into_iter().collect();
         assert!(!available_from(&installed).iter().any(|s| s.id == "csvlens"));
+    }
+
+    /// #1842: CodeQL is neither built in nor bundled in the catalog. It comes
+    /// from the signed index, under AVAILABLE until added, and croft can
+    /// uninstall it again: an index entry is croft's to remove too.
+    #[test]
+    fn codeql_comes_from_the_index_and_uninstalls() {
+        use crate::mcp::registry_index::{CODEQL_MANIFEST, available_summaries};
+        assert!(!bundled_ids().contains("codeql"));
+        assert!(!is_catalog_entry("codeql"));
+        let cache = tempfile::tempdir().unwrap();
+        let _cache = crate::session_state::CacheDirForThisTestThread::set(cache.path());
+        crate::mcp::registry_index::cache_index_for_test(&[CODEQL_MANIFEST]);
+        let dir = tempfile::tempdir().unwrap();
+        let offered = |dir: &Path| {
+            available_summaries(&BTreeSet::new(), &installed_ids(dir))
+                .iter()
+                .any(|s| s.id == "codeql" && !s.builtin)
+        };
+        assert!(offered(dir.path()), "under AVAILABLE");
+        let added = dir.path().join("codeql");
+        std::fs::create_dir_all(&added).unwrap();
+        std::fs::write(added.join("extension.toml"), CODEQL_MANIFEST).unwrap();
+        assert!(!offered(dir.path()), "added, it leaves AVAILABLE");
+        uninstall_in(dir.path(), "codeql").expect("an index entry uninstalls");
+        assert!(!added.exists());
+        assert!(offered(dir.path()), "and is back under AVAILABLE");
     }
 
     #[test]
@@ -193,6 +232,15 @@ mod tests {
         assert!(path.is_file());
         remove_from(&tmp, "mcp-time").expect("uninstalls the catalog entry");
         assert!(!tmp.join("mcp-time").exists(), "manifest dir must be gone");
+        // A file the user put beside the manifest stays, and so its dir.
+        write_into(&tmp, "mcp-time").unwrap();
+        std::fs::write(tmp.join("mcp-time/notes.md"), "mine").unwrap();
+        remove_from(&tmp, "mcp-time").expect("uninstalls the catalog entry");
+        assert!(!tmp.join("mcp-time/extension.toml").exists());
+        assert!(
+            tmp.join("mcp-time/notes.md").is_file(),
+            "the user's file stays"
+        );
         // A user-dropped (non-catalog) extension is the user's file: refuse it,
         // and leave any such dir untouched.
         let user_dir = tmp.join("my-own-ext");

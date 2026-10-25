@@ -201,14 +201,19 @@ mod tests {
         assert_eq!(from_extension("xyz"), None);
     }
 
-    /// #578: the bundled CodeQL extension maps `.ql` queries and `.qll`
-    /// libraries to the `ql` language, rooted at the nearest pack file.
+    /// #578: the CodeQL extension maps `.ql` queries and `.qll` libraries
+    /// to the `ql` language, rooted at the nearest pack file. It is not
+    /// built in (#1842), so only once it is added.
     #[test]
-    fn codeql_sources_map_to_the_ql_language() {
-        assert_eq!(from_extension("ql"), Some(Language("ql")));
-        assert_eq!(from_extension("qll"), Some(Language("ql")));
+    fn codeql_sources_map_to_the_ql_language_once_added() {
+        assert_eq!(from_extension("ql"), None, "not built in");
+        let mut sources = manifest::BUNDLED_MANIFESTS.to_vec();
+        sources.push(crate::mcp::registry_index::CODEQL_MANIFEST);
+        let added = LangTable::from_sources(&sources);
+        assert_eq!(added.by_ext.get("ql"), Some(&Language("ql")));
+        assert_eq!(added.by_ext.get("qll"), Some(&Language("ql")));
         assert_eq!(
-            root_markers(Language("ql")),
+            added.records["ql"].root_markers,
             &["qlpack.yml", "codeql-pack.yml"]
         );
     }

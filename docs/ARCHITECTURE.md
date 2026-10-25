@@ -901,7 +901,9 @@ The panel group's CAPTURES tab, modelled on iTerm2's Capture Output. It holds ou
 
 The curated MCP catalog, the AVAILABLE tier of the Extensions panel. Bundled `CATALOG_MANIFESTS` (Web Fetch, Time, MarkItDown and csvlens) are merged with the remote signed index. csvlens is a `[[viewers]]` entry: a terminal program run on a file in its own pane rather than an MCP sidecar.
 
-**Install and uninstall paths.** `install()` writes a bundled entry's manifest, or delegates a remote id to `registry_index::install_remote` (Available → Add → Installed). `uninstall_in()` removes it (Installed → Available).
+**CodeQL is an add-on from the signed index, not a built-in (#1842).** Its side bar, activity-bar icon and "CodeQL:" commands are native code, but most users never need them, so its manifest (the `ql` language and the CLI's language server) is published in croft-extensions and reaches AVAILABLE through the signed index; the tests carry a byte-identical copy, `registry_index::CODEQL_MANIFEST`. App keeps `installed_extensions`, the bundled ids plus the user extensions dir's, read at launch and again whenever the panel refreshes; `is_extension_enabled` requires installed and not disabled, so the icon, the side bar, session restore and variant-analysis polling stay off until CodeQL is added. The palette hides every `Command::is_codeql` command until then, and `run_command` refuses one a keybinding names, saying where to add it. Adding any extension clears a disabled state left for its id, as from when CodeQL was built in. The QL language server, like any added server, starts on the next launch.
+
+**Install and uninstall paths.** `install_in()` writes a bundled entry's manifest into the app's own extensions dir, or delegates a remote id to `registry_index::install_remote` (Available → Add → Installed). `uninstall_in()` removes it from that dir (Installed → Available), an index entry as well as a catalog one.
 
 **The provenance gate.** `is_removable()` is `is_catalog_entry() ‖ registry_index::is_index_entry()`, so croft removes only what it added — bundled or vetted-index — and never a hand-dropped user manifest.
 

@@ -251,8 +251,8 @@ fn settings_gear_is_bottom_anchored_below_the_view_icons() {
     );
     assert_eq!(
         app.pending_activity_image_overlays().len(),
-        12,
-        "eight view icons + the settings gear + the three layout toolbar icons emit"
+        11,
+        "seven view icons (CodeQL's is added, not built in) + the settings gear + the three layout toolbar icons emit"
     );
 }
 
@@ -278,6 +278,24 @@ fn settings_gear_bottom_inset_matches_the_view_icon_top_inset() {
     assert_eq!(
         bottom_inset, top_inset,
         "the gap below the gear must equal the gap above the first view icon"
+    );
+}
+
+/// #1842: the gear clears the last view icon on the bar. CodeQL's is there
+/// only once it is added, so without it the gear still fits on a bar one
+/// icon shorter instead of vanishing to make room for an absent icon.
+#[test]
+fn the_gear_clears_the_last_view_icon_shown() {
+    let bar = |height| Rect::new(0, 0, 3, height);
+    let shortest = |codeql| {
+        (1..80)
+            .find(|&h| activity_settings_block(bar(h), codeql).width > 0)
+            .expect("the gear fits on some bar")
+    };
+    assert_eq!(
+        shortest(true) - shortest(false),
+        activity_codeql_y(bar(80)) - activity_testing_y(bar(80)),
+        "one icon slot less without CodeQL"
     );
 }
 

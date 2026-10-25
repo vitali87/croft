@@ -1,0 +1,23 @@
+# Vetted extension: CodeQL (vitali87/croft#1842). Not built into croft: adding
+# it from croft's Extensions view (AVAILABLE) installs this manifest, which turns
+# on croft's native CodeQL side bar, activity-bar icon and "CodeQL:" commands and
+# declares the `ql` language. The language server is the CodeQL CLI's own
+# (`codeql execute language-server`), expected on the user's PATH alongside the
+# rest of the CLI; it starts on croft's next launch. Nothing is provisioned.
+id = "codeql"
+name = "CodeQL"
+description = "CodeQL databases, queries, query history, the AST viewer and the QL language server."
+builtin = false
+api_version = 1
+
+[[languages]]
+id = "ql"
+extensions = ["ql", "qll"]
+root_markers = ["qlpack.yml", "codeql-pack.yml"]
+
+[[language_servers]]
+name = "codeql"
+command = "codeql"
+args = ["execute", "language-server", "--check-errors", "ON_CHANGE"]
+language = "ql"
+priority = 0

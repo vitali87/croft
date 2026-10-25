@@ -274,6 +274,35 @@ pub fn install_remote(id: &str) -> Result<PathBuf> {
     write_remote_into(&manifest::user_extensions_dir(), &entry, &body)
 }
 
+/// The CodeQL manifest croft-extensions publishes (#1842), byte for byte.
+/// CodeQL is not built in, so this copy is how tests add it.
+#[cfg(test)]
+pub(crate) const CODEQL_MANIFEST: &str = include_str!("testdata/codeql/extension.toml");
+
+/// Cache an index listing `manifests` as a verified fetch leaves it, so they
+/// show under AVAILABLE and count as index entries. Point this test thread's
+/// cache at a scratch dir first (`session_state::CacheDirForThisTestThread`).
+#[cfg(test)]
+pub(crate) fn cache_index_for_test(manifests: &[&str]) {
+    let extensions: Vec<serde_json::Value> = manifests
+        .iter()
+        .map(|src| {
+            let m = manifest::parse(src).unwrap();
+            serde_json::json!({
+                "manifest_url": format!("{INDEX_BASE_URL}/extensions/{}/extension.toml", m.id),
+                "id": m.id,
+                "name": m.name,
+                "description": m.description,
+                "version": "1.0.0",
+                "api_version": SUPPORTED_API_VERSION,
+                "sha256": hex_encode(&Sha256::digest(src.as_bytes())),
+            })
+        })
+        .collect();
+    let index = serde_json::json!({ "schema": SUPPORTED_SCHEMA, "extensions": extensions });
+    write_cache(index.to_string().as_bytes()).unwrap();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -415,6 +444,27 @@ api_version = 1
         assert!(write_remote_into(&tmp, &entry, manifest_src).is_err());
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// #1842: CodeQL's published manifest installs through the same sha256 and
+    /// id checks as any index entry, and loads as an added extension.
+    #[test]
+    fn the_codeql_manifest_installs_from_the_index() {
+        let entry = IndexEntry {
+            id: "codeql".into(),
+            name: "CodeQL".into(),
+            description: String::new(),
+            version: "1.0.0".into(),
+            api_version: 1,
+            sha256: hex_encode(&Sha256::digest(CODEQL_MANIFEST.as_bytes())),
+            manifest_url: String::new(),
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_remote_into(tmp.path(), &entry, CODEQL_MANIFEST.as_bytes())
+            .expect("the published manifest installs");
+        let m = manifest::parse(&std::fs::read_to_string(path).unwrap()).unwrap();
+        assert!(!m.builtin);
+        assert_eq!(m.language_servers[0].command, "codeql");
     }
 
     #[test]
