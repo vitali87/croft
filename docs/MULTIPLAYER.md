@@ -555,7 +555,14 @@ unterminated fence at end of turn reverts the same way.
 The claude child is sandboxed to a read-only toolbox (`Read`/`Grep`/`Glob`
 plus a second, read-only `collab-agent` MCP seat named `<name>-reader` for
 live buffer queries, `--strict-mcp-config`); the ONLY write path is the fence
-through the pilot's seat. End-to-end tests drive the pilot against a scripted
+through the pilot's seat. Those three are its only built-in tools (`--tools`),
+and they carry no allow rule, so `dontAsk` runs them inside the workspace and
+denies a read outside it (`~/.ssh`, `~/.aws`). The child loads only the user's
+own Claude Code settings (`--setting-sources user`): a workspace's
+`.claude/settings.json`, and the hooks in it, never load, so starting pair in a
+cloned repository runs none of that repository's commands. This needs a Claude
+Code recent enough to accept `--tools` and `--setting-sources`; 2.1.310 is the
+version these flags were checked against. End-to-end tests drive the pilot against a scripted
 fake claude (python3, like the LSP fakes): streaming convergence, the
 StreamState lifecycle, and the cancel drill (revert plus the interrupt landing
 on the fake's stdin) all assert headlessly.

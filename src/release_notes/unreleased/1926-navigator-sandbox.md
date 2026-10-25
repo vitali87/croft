@@ -1,0 +1,1 @@
+fix: The pair navigator no longer loads a workspace's own Claude Code settings, so a cloned repository's `.claude/settings.json` hooks do not run when it starts, and its reads stay inside the workspace.
