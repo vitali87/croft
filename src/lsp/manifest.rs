@@ -627,8 +627,9 @@ type PairTable = BTreeMap<Vec<(String, String)>, &'static [(&'static str, &'stat
 /// lives for the whole process; bounded by the number of distinct strings
 /// the installed manifests carry, not by how often a provision is built,
 /// since a viewer's provision is rebuilt on every right-click and every
-/// palette open (#485 review).
-fn intern(s: &str) -> &'static str {
+/// palette open (#485 review). The language table interns through here too,
+/// so rebuilding it as extensions come and go leaks nothing new.
+pub(crate) fn intern(s: &str) -> &'static str {
     let mut set = INTERNED.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(existing) = set.get(s) {
         return existing;

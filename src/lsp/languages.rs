@@ -7,13 +7,13 @@
 //! methods read this table, so adding a language is pure data — a new
 //! `[[languages]]` block in some extension's manifest, no Rust change.
 //!
-//! Phase B1/B2a builds the table from the bundled manifests only (a fixed,
-//! hermetic const set). User-installed extensions are merged in by a later
-//! phase; until then resolution covers exactly the first-party languages.
+//! The table holds the bundled manifests plus the user-installed ones. It is
+//! rebuilt whenever the installed set changes, so an extension added
+//! mid-session resolves its files at once (#1842).
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 
 use crate::lsp::config::Language;
 use crate::lsp::manifest;
@@ -30,11 +30,25 @@ struct LangTable {
     records: HashMap<&'static str, LangRecord>,
 }
 
-/// Leak a parsed string to `&'static`. Sound because a language identity lives
-/// for the whole process; the count is bounded by the number of installed
-/// extensions, built once.
-fn intern(s: &str) -> &'static str {
-    Box::leak(s.to_string().into_boxed_str())
+/// The root-marker slices handed out by [`intern_markers`], so a rebuilt
+/// table reuses the slice each language got the first time.
+static INTERNED_MARKERS: Mutex<BTreeSet<&'static [&'static str]>> = Mutex::new(BTreeSet::new());
+
+/// A `&'static [&'static str]` for a language's root markers, leaked at most
+/// once per distinct list. Sound because a language identity lives for the
+/// whole process; bounded by the distinct lists the manifests carry, not by
+/// how often the table is rebuilt.
+fn intern_markers(markers: &[String]) -> &'static [&'static str] {
+    let markers: Vec<&'static str> = markers.iter().map(|m| manifest::intern(m)).collect();
+    let mut set = INTERNED_MARKERS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if let Some(existing) = set.get(markers.as_slice()) {
+        return existing;
+    }
+    let leaked: &'static [&'static str] = Box::leak(markers.into_boxed_slice());
+    set.insert(leaked);
+    leaked
 }
 
 impl LangTable {
@@ -47,7 +61,7 @@ impl LangTable {
                 continue;
             };
             for decl in &m.languages {
-                let id = intern(&decl.id);
+                let id = manifest::intern(&decl.id);
                 let lang = Language(id);
                 for ext in &decl.extensions {
                     by_ext.insert(ext.to_ascii_lowercase(), lang);
@@ -56,13 +70,11 @@ impl LangTable {
                     let parts = pattern.split('/').map(str::to_string).collect();
                     by_name.push((parts, lang));
                 }
-                let markers: Vec<&'static str> =
-                    decl.root_markers.iter().map(|s| intern(s)).collect();
                 records.insert(
                     id,
                     LangRecord {
-                        root_markers: Box::leak(markers.into_boxed_slice()),
-                        family: decl.family.as_deref().map(intern),
+                        root_markers: intern_markers(&decl.root_markers),
+                        family: decl.family.as_deref().map(manifest::intern),
                     },
                 );
             }
@@ -75,22 +87,55 @@ impl LangTable {
     }
 }
 
-static TABLE: OnceLock<LangTable> = OnceLock::new();
+/// The active table. Readers take a snapshot, so a rebuild never waits on
+/// a lookup in progress, and a lookup that calls another sees one table.
+static TABLE: RwLock<Option<Arc<LangTable>>> = RwLock::new(None);
 
-/// The active table. Lazily built from the bundled manifests only if
-/// [`init_with_user_sources`] was never called (the case in tests, which keeps
-/// resolution hermetic — no disk, no user state).
-fn table() -> &'static LangTable {
-    TABLE.get_or_init(|| LangTable::from_sources(manifest::BUNDLED_MANIFESTS))
+#[cfg(test)]
+thread_local! {
+    /// The table [`reload_with_user_sources`] built on this test thread.
+    static TABLE_FOR_THIS_TEST_THREAD: std::cell::RefCell<Option<Arc<LangTable>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
-/// Initialise the table from the bundled manifests plus user extension sources.
-/// Called once at LSP startup before any language is resolved; a no-op (and a
-/// dropped `user`) if the table was already built, so call it early.
-pub fn init_with_user_sources(user: &[&str]) {
+/// The active table. Lazily built from the bundled manifests only if
+/// [`reload_with_user_sources`] was never called (the case on a test's LSP
+/// worker, which keeps resolution there hermetic — no disk, no user state).
+fn table() -> Arc<LangTable> {
+    #[cfg(test)]
+    if let Some(table) = TABLE_FOR_THIS_TEST_THREAD.with(|t| t.borrow().clone()) {
+        return table;
+    }
+    if let Some(table) = TABLE
+        .read()
+        .unwrap_or_else(PoisonError::into_inner)
+        .as_ref()
+    {
+        return table.clone();
+    }
+    TABLE
+        .write()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get_or_insert_with(|| Arc::new(LangTable::from_sources(manifest::BUNDLED_MANIFESTS)))
+        .clone()
+}
+
+/// Rebuild the table from the bundled manifests plus `user`, the extensions
+/// installed now. Called when the LSP manager starts and again whenever an
+/// extension is added or removed (#1842), so the added one's files resolve
+/// from then on and the removed one's stop. Under test the table serves only
+/// the calling thread: a test that adds an extension must not change what
+/// the tests running beside it resolve.
+pub fn reload_with_user_sources(user: &[&str]) {
     let mut sources: Vec<&str> = manifest::BUNDLED_MANIFESTS.to_vec();
     sources.extend_from_slice(user);
-    let _ = TABLE.set(LangTable::from_sources(&sources));
+    let table = Arc::new(LangTable::from_sources(&sources));
+    #[cfg(test)]
+    TABLE_FOR_THIS_TEST_THREAD.with(|t| *t.borrow_mut() = Some(table));
+    #[cfg(not(test))]
+    {
+        *TABLE.write().unwrap_or_else(PoisonError::into_inner) = Some(table);
+    }
 }
 
 /// The language a file extension maps to, or `None` if no extension claims it.
@@ -203,19 +248,35 @@ mod tests {
 
     /// #578: the CodeQL extension maps `.ql` queries and `.qll` libraries
     /// to the `ql` language, rooted at the nearest pack file. It is not
-    /// built in (#1842), so only once it is added.
+    /// built in (#1842), so only once it is added, and from the moment it
+    /// is: the table is rebuilt, not fixed at the first lookup.
     #[test]
     fn codeql_sources_map_to_the_ql_language_once_added() {
         assert_eq!(from_extension("ql"), None, "not built in");
-        let mut sources = manifest::BUNDLED_MANIFESTS.to_vec();
-        sources.push(crate::mcp::registry_index::CODEQL_MANIFEST);
-        let added = LangTable::from_sources(&sources);
-        assert_eq!(added.by_ext.get("ql"), Some(&Language("ql")));
-        assert_eq!(added.by_ext.get("qll"), Some(&Language("ql")));
+        reload_with_user_sources(&[crate::mcp::registry_index::CODEQL_MANIFEST]);
+        assert_eq!(from_extension("ql"), Some(Language("ql")));
+        assert_eq!(from_extension("qll"), Some(Language("ql")));
+        assert_eq!(resolve("ql"), Some(Language("ql")));
         assert_eq!(
-            added.records["ql"].root_markers,
+            root_markers(Language("ql")),
             &["qlpack.yml", "codeql-pack.yml"]
         );
+        // Uninstalled, its files stop resolving.
+        reload_with_user_sources(&[]);
+        assert_eq!(from_extension("ql"), None);
+        assert_eq!(resolve("ql"), None);
+    }
+
+    /// Rebuilding the table as extensions come and go hands back what the
+    /// last build leaked rather than leaking it again.
+    #[test]
+    fn a_rebuilt_table_leaks_nothing_new() {
+        reload_with_user_sources(&[]);
+        let markers = root_markers(Language::LUA);
+        let id = resolve("lua").expect("bundled").lsp_id();
+        reload_with_user_sources(&[]);
+        assert!(std::ptr::eq(markers, root_markers(Language::LUA)));
+        assert!(std::ptr::eq(id, resolve("lua").expect("bundled").lsp_id()));
     }
 
     /// #27: the workspace-open scan behind server pre-warm. A marker at

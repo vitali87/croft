@@ -1,0 +1,1 @@
+fix: A language server added or turned on in the Extensions view starts at once, and one turned off or removed stops at once, without restarting croft. Adding CodeQL now gives `.ql` files that are already open its language server.

@@ -46,21 +46,29 @@ impl ServerRegistry {
     /// Only server *registration* is gated: the language table is built
     /// separately and keeps every language identity, so a disabled `lsp-rust`
     /// still recognises `.rs` (and its highlighting) while no rust-analyzer
-    /// spawns. An unparseable source is kept rather than silently dropped.
+    /// spawns. An unparseable bundled source is kept rather than silently
+    /// dropped, so it fails loudly; a user's serves nothing, as the language
+    /// table and the installed set already skip it, since the registry is
+    /// rebuilt mid-session whenever an extension changes (#1842).
     pub fn with_user_extensions_filtered(
         user_sources: &[&str],
         disabled: &std::collections::BTreeSet<String>,
     ) -> Self {
-        let mut sources: Vec<&str> = manifest::BUNDLED_MANIFESTS.to_vec();
-        sources.extend_from_slice(user_sources);
-        let enabled: Vec<&str> = sources
-            .into_iter()
+        let mut enabled: Vec<&str> = manifest::BUNDLED_MANIFESTS
+            .iter()
+            .copied()
             .filter(|s| {
                 manifest::parse(s)
                     .map(|m| !disabled.contains(&m.id))
                     .unwrap_or(true)
             })
             .collect();
+        enabled.extend(
+            user_sources
+                .iter()
+                .copied()
+                .filter(|s| manifest::parse(s).is_ok_and(|m| !disabled.contains(&m.id))),
+        );
         Self::from_manifest_sources(&enabled)
     }
 
@@ -603,6 +611,23 @@ priority = 0
         let r = ServerRegistry::with_user_extensions(&[]);
         assert!(r.for_language(Language("ql")).is_empty());
         assert!(r.for_extension("ql").is_empty());
+    }
+
+    /// A hand-written manifest that does not parse adds no server and takes
+    /// none away. The registry is rebuilt whenever an extension changes
+    /// (#1842), so it must not panic on one, mid-session or at launch.
+    #[test]
+    fn a_user_manifest_that_does_not_parse_serves_nothing() {
+        let r = ServerRegistry::with_user_extensions_filtered(
+            &["id = \"half-written\"\n[[language_servers]"],
+            &Default::default(),
+        );
+        let names: Vec<_> = r
+            .for_language(Language::PYTHON)
+            .iter()
+            .map(|s| s.name)
+            .collect();
+        assert_eq!(names, vec!["ty", "basedpyright", "ruff"]);
     }
 
     #[test]
