@@ -6074,27 +6074,19 @@ impl Widget for &mut PtyTerminal {
                 _ => self.theme.ui(Color::Rgb(0x1b, 0x81, 0xa8)),
             };
             let by = area.y + area.height - 1;
-            // One stroke whatever the focus (#1852): the fill is always `━`.
-            // A focused pane used to fill with `═`, whose two thin lines
-            // read as two progress bars stacked on each other. The fill
-            // still has to be HEAVIER than the line it sits on, or the gauge
-            // reads as full (#470): a focused pane's border is already `━`,
-            // on most themes in a blue close to the gauge's own, and the
-            // focused pane is the one most likely to be running the build
-            // being measured.
-            // So while a gauge runs, the focused pane's bottom edge drops to
-            // a light `─` track, which is what an unfocused pane's border
-            // already is: every pane draws the same bar. The track keeps
-            // the border's colour; only its weight changes.
-            let fill = fill_from..fill_from + fill_len.min(w);
-            for i in 0..w {
-                let cell = &mut buf[(inner.x + i as u16, by)];
-                if fill.contains(&i) {
-                    cell.set_symbol("━");
-                    cell.set_style(Style::default().fg(color));
-                } else if self.focused {
-                    cell.set_symbol("─");
-                }
+            // The fill glyph has to be HEAVIER than the border it sits on,
+            // or the gauge reads as full (#470): a focused pane's border is
+            // already `━`, so painting `━` over it leaves only colour to
+            // distinguish filled from unfilled -- and the focused pane is
+            // the one most likely to be running the build being measured.
+            // `═` against a heavy border is the same trick `━` plays
+            // against a light one.
+            let fill_glyph = if self.focused { "═" } else { "━" };
+            for i in 0..fill_len.min(w) {
+                let x = inner.x + (fill_from + i) as u16;
+                let cell = &mut buf[(x, by)];
+                cell.set_symbol(fill_glyph);
+                cell.set_style(Style::default().fg(color));
             }
         }
         // Timestamps gutter: the arrival clock of each stamped row hugs the

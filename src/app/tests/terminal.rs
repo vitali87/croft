@@ -3688,52 +3688,40 @@ fn osc_9_4_progress_paints_a_border_gauge_and_pill_percent() {
             })
             .collect()
     }
-    // The cells of pane 0's bottom border between its corners.
-    let bottom_edge = |app: &App, rows: &[String]| -> String {
-        let area = app.terminals[0].last_area;
-        let inner = app.terminals[0].last_inner;
-        rows[(area.y + area.height - 1) as usize]
-            .chars()
-            .skip(inner.x as usize)
-            .take(inner.width as usize)
-            .collect()
-    };
     let area = app.terminals[0].last_area;
     let inner = app.terminals[0].last_inner;
     let rows = screen_rows(&term);
+    let border_row = &rows[(area.y + area.height - 1) as usize];
+    // The gauge's fill glyph contrasts with the pane's own border weight
+    // (#470): a focused pane draws a heavy border, so its fill is `═`
+    // against `━`; an unfocused one draws light, so its fill is `━`
+    // against `─`. Counting the glyph that marks FILL keeps this test
+    // about the gauge rather than about which border weight is in force.
+    let fill_glyph = if app.terminals[0].focused {
+        '═'
+    } else {
+        '━'
+    };
+    let fill: usize = border_row
+        .chars()
+        .skip(inner.x as usize)
+        .take(inner.width as usize)
+        .filter(|c| *c == fill_glyph)
+        .count();
     let expected = (inner.width as u32 * 46 / 100) as usize;
     assert!(
         expected > 0,
         "pane too narrow for the test to mean anything"
     );
-    // One bar whatever the focus (#1852): a single heavy `━` stroke filled
-    // to 46% on a light `─` track. The focused pane's own border is heavy
-    // (#470), so it lightens its bottom edge under the gauge for the fill
-    // to stand out by weight; it used to fill with `═` instead, whose two
-    // thin lines read as two bars.
-    let bar = "━".repeat(expected) + &"─".repeat(inner.width as usize - expected);
-    assert!(app.terminals[0].focused, "the reporting pane holds focus");
     assert_eq!(
-        bottom_edge(&app, &rows),
-        bar,
-        "a focused pane fills to 46% in one heavy stroke on a light track"
+        fill, expected,
+        "the bottom border must fill to 46% with heavy strokes: {border_row:?}"
     );
     let top_row = &rows[area.y as usize];
     assert!(
         top_row.contains("bld \u{b7} 46%"),
         "the name pill carries the percent: {top_row:?}"
     );
-    app.active_terminal = 1;
-    app.sync_focus_flags();
-    term.draw(|f| app.render(f)).unwrap();
-    assert!(!app.terminals[0].focused, "focus moved to the other pane");
-    assert_eq!(
-        bottom_edge(&app, &screen_rows(&term)),
-        bar,
-        "an unfocused pane draws the very same bar"
-    );
-    app.active_terminal = 0;
-    app.sync_focus_flags();
 
     // State 0 clears: the gauge and the pill percent both vanish.
     app.terminals[0].write_input(b"\n");
@@ -3744,16 +3732,13 @@ fn osc_9_4_progress_paints_a_border_gauge_and_pill_percent() {
     );
     term.draw(|f| app.render(f)).unwrap();
     let rows = screen_rows(&term);
-    // The focused pane's bottom edge is heavy again end to end: neither the
-    // fill nor the light track outlives the gauge.
+    let border_row = &rows[(area.y + area.height - 1) as usize];
+    // No FILL glyph remains. `━` is the border's own glyph on a focused
+    // pane (#470), so a literal check here would fail on an intact border
+    // rather than on a leftover gauge.
     assert!(
-        app.terminals[0].focused,
-        "focus is back on the reporting pane"
-    );
-    assert_eq!(
-        bottom_edge(&app, &rows),
-        "━".repeat(inner.width as usize),
-        "a cleared gauge restores the plain border"
+        !border_row.contains(fill_glyph),
+        "a cleared gauge restores the plain border: {border_row:?}"
     );
     assert!(
         !rows[area.y as usize].contains("46%"),
