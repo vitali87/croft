@@ -1050,8 +1050,9 @@ enum PairLockDenial {
 
 /// The bottom-left "a newer croft is available" popup (#333). Click-only
 /// like the port toast: it never takes a keystroke from the editor or a
-/// terminal. `ready` flips it from Update/Later to Relaunch once the staged
-/// build has landed.
+/// terminal. It is down while the staged build runs (the status bar shows
+/// that, #1852) and comes back with `ready` set, offering Relaunch instead
+/// of Update/Later, once the build has landed.
 struct UpdateToast {
     version: String,
     ready: bool,
@@ -22559,10 +22560,18 @@ impl App {
             .then(|| (update_chip_x, update_chip_end - update_chip_x));
         if self.any_update_in_progress() {
             // Red + a spinning circular-arrow glyph to draw the eye to the
-            // in-progress background update.
+            // in-progress background update. It is the update's one progress
+            // indicator (#1852), so a staged release names the version the
+            // popup offered before it closed.
+            let target = self
+                .staged_install
+                .as_ref()
+                .filter(|_| self.staged_status == UpdateStatus::InProgress)
+                .map(|s| format!(" to v{}", s.version))
+                .unwrap_or_default();
             spans.push(Span::styled(
                 format!(
-                    " {} Updating croft in the background ",
+                    " {} Updating croft{target} in the background ",
                     self.update_spinner_glyph()
                 ),
                 Style::default()
@@ -24589,14 +24598,11 @@ impl App {
         let version = toast.version.clone();
         let ready = toast.ready;
         let failed = toast.failed;
-        let staging = self.staged_status == UpdateStatus::InProgress && !ready;
         let accent = self.theme.accent();
         let btn_bg = self.theme.button();
         let brew = self.install_source == crate::update_check::InstallSource::Homebrew;
         let actions: Vec<(String, UpdateToastAction)> = if ready {
             vec![(" Relaunch ".to_string(), UpdateToastAction::Relaunch)]
-        } else if staging {
-            Vec::new()
         } else if brew {
             // Homebrew upgrades it (#375); the popup can only name the
             // command and be dismissed.
@@ -24614,13 +24620,8 @@ impl App {
         };
         let title_line = if ready {
             format!("\u{27f3} croft v{version} is ready - relaunch to update")
-        } else if let (Some(reason), false) = (failed, staging) {
+        } else if let Some(reason) = failed {
             format!("\u{2717} croft v{version} was not installed: {reason}")
-        } else if staging {
-            format!(
-                "{} building croft v{version} in the background",
-                self.update_spinner_glyph()
-            )
         } else if brew {
             format!(
                 "\u{27f3} croft v{version} is available - run `{}`",
@@ -46526,8 +46527,8 @@ impl App {
     }
 
     /// Kick off the staged build the popup offered. The existing update
-    /// state machine takes it from here: spinner while cargo runs, then
-    /// the popup and the status bar both offer Relaunch.
+    /// state machine takes it from here: the status bar's spinner while
+    /// cargo runs, then the popup and the status bar both offer Relaunch.
     fn start_staged_update(&mut self, version: String) {
         // Homebrew owns a Cellar binary (#375): staging and swapping it
         // would leave brew's records describing a file croft replaced.
@@ -46539,9 +46540,11 @@ impl App {
             return;
         }
         self.staged_status = UpdateStatus::Idle;
-        if let Some(t) = self.update_toast.as_mut() {
-            t.failed = None;
-        }
+        // One progress indicator, not two (#1852): the status bar's spinner
+        // carries the build from here, as it does every other update, so
+        // the popup goes. It comes back by itself when the build ends: with
+        // Relaunch when it lands, with the reason and Retry when it fails.
+        self.update_toast = None;
         // Tests never download or build croft: they get a staging that has
         // only started.
         #[cfg(test)]
@@ -52880,8 +52883,9 @@ impl App {
     }
 
     /// A click on one of the update popup's buttons (#333). Update stages
-    /// the build and leaves the popup up as a progress line; Later and
-    /// Relaunch both take it down. A click elsewhere returns false.
+    /// the build, whose progress the status bar shows (#1852); it, Later
+    /// and Relaunch all take the popup down. A click elsewhere returns
+    /// false.
     fn handle_update_toast_click(&mut self, x: u16, y: u16) -> bool {
         let Some(toast) = self.update_toast.as_ref() else {
             return false;

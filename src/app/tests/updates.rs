@@ -114,7 +114,10 @@ fn a_failed_update_says_why_in_the_popup_and_offers_retry() {
     assert_eq!(buf[(retry.x + 1, retry.y)].symbol(), "R", "labelled Retry");
     left_click(&mut app, retry.x, retry.y);
     assert!(app.staged_install.is_some(), "Retry stages again");
-    assert_eq!(app.update_toast.as_ref().unwrap().failed, None);
+    assert!(
+        app.update_toast.is_none(),
+        "Retry takes the popup down: the status bar shows the build (#1852)"
+    );
 }
 
 /// #1844: with nothing on offer, Help: Update croft asks the network now
@@ -299,6 +302,80 @@ fn an_update_offer_raises_the_bottom_left_toast_and_later_dismisses_it() {
             "Later is remembered"
         );
     });
+}
+
+/// #1852: Update leaves one progress indicator. The popup used to stay up
+/// as "building croft v9.9.9 in the background" right above the status
+/// bar's own "Updating croft in the background", two spinners saying the
+/// same thing. Now the popup goes, the status bar names the version, and
+/// the popup comes back with Relaunch once the build lands.
+#[test]
+fn clicking_update_leaves_one_progress_indicator() {
+    use crate::update_watch::UpdateEvent;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.install_source = crate::update_check::InstallSource::SelfManaged;
+    app.update_toast = Some(super::UpdateToast {
+        version: String::from("9.9.9"),
+        ready: false,
+        failed: None,
+        buttons: Vec::new(),
+    });
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 40)).unwrap();
+    let rows = |term: &ratatui::Terminal<ratatui::backend::TestBackend>| -> Vec<String> {
+        let buf = term.backend().buffer();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect()
+            })
+            .collect()
+    };
+    term.draw(|f| app.render(f)).unwrap();
+    let update = app
+        .update_toast
+        .as_ref()
+        .unwrap()
+        .buttons
+        .iter()
+        .find(|(_, a)| *a == super::UpdateToastAction::Update)
+        .map(|(r, _)| *r)
+        .expect("an Update button");
+    left_click(&mut app, update.x, update.y);
+    assert!(app.staged_install.is_some(), "Update stages the version");
+    assert!(app.update_toast.is_none(), "Update takes the popup down");
+
+    // The staging thread reports the build under way.
+    app.staged_install = Some(crate::update_check::StagedInstall::preloaded(
+        &[UpdateEvent::InProgress],
+        PathBuf::new(),
+        "9.9.9",
+    ));
+    assert!(app.poll_update_watch());
+    term.draw(|f| app.render(f)).unwrap();
+    let screen = rows(&term);
+    let status_row = screen.last().unwrap();
+    assert!(
+        status_row.contains("Updating croft to v9.9.9 in the background"),
+        "the status bar carries the build and names the version: {status_row:?}"
+    );
+    let mentions: Vec<&String> = screen.iter().filter(|r| r.contains("9.9.9")).collect();
+    assert_eq!(
+        mentions,
+        vec![status_row],
+        "the build is shown once, in the status bar"
+    );
+
+    // The build lands: the popup comes back to offer Relaunch.
+    app.staged_install = Some(crate::update_check::StagedInstall::preloaded(
+        &[UpdateEvent::Ready],
+        tmp.path().join("staged-croft"),
+        "9.9.9",
+    ));
+    assert!(app.poll_update_watch());
+    let toast = app.update_toast.as_ref().expect("the ready popup");
+    assert!(toast.ready && toast.version == "9.9.9");
 }
 
 /// #333: the three update producers share one event type; a drift
