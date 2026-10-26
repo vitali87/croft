@@ -212,9 +212,13 @@ fn pair_off_and_reactivation_keep_the_recorded_backend() {
         "the ollama endpoint must not survive a provider switch: {r}"
     );
     assert!(!r.contains("qwen3-coder:30b"), "{r}");
-    // Activation detached a relay for the workspace; reap it so test runs
-    // do not accumulate idle processes.
-    let sessions = home.path().join(".cache/croft/sessions");
+    reap_pair_relays(home.path());
+}
+
+/// Activation detaches a relay for the workspace; reap the ones under
+/// `home` so test runs do not accumulate idle processes.
+fn reap_pair_relays(home: &std::path::Path) {
+    let sessions = home.join(".cache/croft/sessions");
     if let Ok(entries) = std::fs::read_dir(&sessions) {
         for e in entries.filter_map(|e| e.ok()) {
             let p = e.path();
@@ -225,6 +229,67 @@ fn pair_off_and_reactivation_keep_the_recorded_backend() {
             }
         }
     }
+}
+
+/// #1907: the navigator's name persists like its model. A plain `croft pair`
+/// or `croft pair --off` keeps the recorded name instead of renaming the
+/// seat back to `claude`; only an explicit `--name` changes it.
+#[test]
+fn pair_rerun_without_name_keeps_the_recorded_name() {
+    // A SHORT home, for the relay socket's AF_UNIX path limit (see above).
+    let home = tempfile::Builder::new()
+        .prefix("h")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let ws = tempfile::tempdir().unwrap();
+    let run = |args: &[&str]| {
+        let out = Command::cargo_bin("croft")
+            .unwrap()
+            .args(args)
+            .arg("--workspace")
+            .arg(ws.path())
+            .env("HOME", home.path())
+            .assert()
+            .success();
+        String::from_utf8(out.get_output().stdout.clone()).unwrap()
+    };
+    let read = || {
+        let dir = home.path().join(".cache/croft/sessions");
+        let path = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| p.to_string_lossy().ends_with(".pair.json"))
+            .expect("a pair record exists");
+        std::fs::read_to_string(path).unwrap()
+    };
+    run(&[
+        "pair",
+        "--name",
+        "navigator",
+        "--model",
+        "claude-haiku-4-5-20251001",
+    ]);
+    assert!(read().contains("\"name\":\"navigator\""));
+    run(&["pair", "--off"]);
+    let r = read();
+    assert!(r.contains("\"enabled\":false"), "{r}");
+    assert!(
+        r.contains("\"name\":\"navigator\""),
+        "--off keeps the name: {r}"
+    );
+    let out = run(&["pair"]);
+    let r = read();
+    assert!(r.contains("\"enabled\":true"), "{r}");
+    assert!(
+        r.contains("\"name\":\"navigator\""),
+        "re-activation keeps the name: {r}"
+    );
+    assert!(r.contains("claude-haiku-4-5-20251001"), "{r}");
+    assert!(out.contains("navigator 'navigator' active"), "{out}");
+    run(&["pair", "--name", "other"]);
+    assert!(read().contains("\"name\":\"other\""));
+    reap_pair_relays(home.path());
 }
 
 /// #362 acceptance criterion 3, against the real binary: outside croft the

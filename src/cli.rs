@@ -911,7 +911,6 @@ impl Cli {
                     .unwrap_or_else(|| std::env::current_dir().expect("cwd"))
                     .canonicalize()
                     .context("resolving workspace path")?;
-                let name = name.unwrap_or_else(|| "claude".into());
                 let record_path = crate::session::pair_record_path(&workspace);
                 if let Some(dir) = record_path.parent() {
                     std::fs::create_dir_all(dir)?;
@@ -923,6 +922,12 @@ impl Cli {
                 // silently converted a disabled ollama record into a cloud
                 // claude seat.
                 let current = crate::session::read_pair_record(&record_path);
+                // The caret name belongs to the seat, not to a backend, so
+                // it is inherited even across a provider switch; only an
+                // explicit --name changes it (#1907).
+                let name = name
+                    .or_else(|| current.as_ref().map(|r| r.name.clone()))
+                    .unwrap_or_else(|| "claude".into());
                 let recorded = current.as_ref().and_then(|r| r.provider.clone());
                 // An explicit provider SWITCH starts that backend fresh:
                 // inheriting the other backend's endpoint or model would
