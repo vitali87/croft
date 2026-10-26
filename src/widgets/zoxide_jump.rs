@@ -334,7 +334,7 @@ pub fn render_zoxide_jump(
     };
     Widget::render(block, rect, buf);
     // Black theme: gradient border over the solid one, then re-stamp the title.
-    if theme.gradient() {
+    if theme.framed_overlays() {
         crate::widgets::surface::paint_overlay_frame(buf, rect, theme);
         buf.set_span(rect.x + 1, rect.y, &title, title.width() as u16);
     }

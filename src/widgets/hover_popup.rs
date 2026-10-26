@@ -151,7 +151,7 @@ impl Widget for &HoverPopup {
             .scroll((scroll, 0));
         Widget::render(Clear, area, buf);
         para.render(area, buf);
-        if self.theme.gradient() {
+        if self.theme.framed_overlays() {
             crate::widgets::surface::paint_overlay_frame(buf, area, self.theme);
         }
         // Painted after the gradient, which redraws the border glyphs.

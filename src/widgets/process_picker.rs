@@ -189,7 +189,7 @@ pub fn render_process_picker(
         height: rect.height.saturating_sub(2),
     };
     Widget::render(block, rect, buf);
-    if theme.gradient() {
+    if theme.framed_overlays() {
         crate::widgets::surface::paint_overlay_frame(buf, rect, theme);
         buf.set_span(rect.x + 1, rect.y, &title, title.width() as u16);
     }

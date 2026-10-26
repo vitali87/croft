@@ -360,6 +360,14 @@ impl Theme {
         luma(self.bg) > 128.0
     }
 
+    /// Whether overlays (Command Palette, pickers, popups, dialogs) paint a
+    /// frame of their own over the line box: the gradient box on a brand
+    /// theme, the card edge and shadow on a `surfaces` theme, whether or not
+    /// that theme also has the gradient.
+    pub fn framed_overlays(self) -> bool {
+        self.gradient || self.surfaces.is_some()
+    }
+
     /// Whether this is a high contrast theme (VS Code's Dark / Light High
     /// Contrast, #1548). [`Theme::ui`] then resolves croft's hardcoded
     /// chrome greys to the theme's pure foreground or background and lifts
@@ -382,8 +390,9 @@ impl Theme {
     /// Adapt a hardcoded dark-chrome color to the active theme. On every
     /// dark theme but a high contrast or `surfaces` one this is the identity,
     /// so wrapping a legacy constant in `theme.ui(..)` is byte-for-byte
-    /// invisible there. A dark `surfaces` theme moves the navy-tinted
-    /// vocabulary onto its own surfaces (see `surfaces_ui`). On a light
+    /// invisible there. A `surfaces` theme moves the navy-tinted chrome
+    /// roles onto its own surfaces, light or dark (see `surfaces_role`). On
+    /// a light
     /// background the recurring chrome vocabulary (the historical dark
     /// constants that predate theme-driven popups) resolves to its VS Code
     /// Light Modern counterpart, and anything unmapped falls through to a
@@ -402,34 +411,47 @@ impl Theme {
                 None => dark,
             };
         }
+        // A light `surfaces` theme takes its declared tones for the chrome
+        // roles and VS Code Light Modern's for everything else.
+        if let (Some(s), Color::Rgb(r, g, b)) = (self.surfaces, dark)
+            && let Some(c) = self.surfaces_role((r, g, b), s)
+        {
+            return rgb(c);
+        }
         light_ui(dark)
     }
 
     /// [`Theme::ui`] for a dark `surfaces` theme. croft's hardcoded chrome is
-    /// a navy-tinted dark vocabulary that predates theme surfaces: popup
-    /// bodies land on the raised surface, borders on the hairline, the navy
-    /// selected row and the editor's blue selections on the theme's
-    /// selection, the legacy VS Code blue on the theme accent, and every
+    /// a navy-tinted dark vocabulary that predates theme surfaces: its
+    /// chrome roles take the theme's own tones (`surfaces_role`), and every
     /// other grey keeps its lightness but trades the navy cast for the
     /// theme's cool neutral. Status hues and named colors pass through.
     fn surfaces_ui(self, dark: Color, s: Surfaces) -> Color {
         let Color::Rgb(r, g, b) = dark else {
             return dark;
         };
-        rgb(match (r, g, b) {
-            // Popup and widget bodies -> the raised surface.
+        rgb(match self.surfaces_role((r, g, b), s) {
+            Some(c) => c,
+            None if r.max(g).max(b) - r.min(g).min(b) < 0x30 => cool_grey((r, g, b)),
+            None => (r, g, b),
+        })
+    }
+
+    /// The chrome roles in croft's legacy dark vocabulary that a `surfaces`
+    /// theme draws from its own palette, light or dark: popup bodies on the
+    /// raised surface, borders on the hairline, the navy selected row and
+    /// the editor's blue selections on the theme's selection, the navy hover
+    /// lifts toward its accent, and the legacy VS Code blue as its accent.
+    /// `None` for any other color.
+    fn surfaces_role(self, c: (u8, u8, u8), s: Surfaces) -> Option<(u8, u8, u8)> {
+        Some(match c {
             (0x16, 0x18, 0x1f) | (0x1e, 0x1e, 0x1e) => s.raised,
-            // Separators and borders -> the hairline.
             (0x3b, 0x42, 0x52) => s.hairline,
-            // The navy selected row and the editor's blue selections.
             (0x1e, 0x3a, 0x6e) | (0x26, 0x4f, 0x78) | (0x09, 0x4d, 0x77) => self.selection,
             (0x07, 0x33, 0x55) | (0x37, 0x61, 0x8e) => blend(self.selection, 0.7, self.bg),
-            // The navy hover lifts.
             (0x34, 0x50, 0x7f) | (0x2f, 0x5a, 0xa8) => blend(self.accent, 0.25, s.chrome),
-            // The legacy VS Code blue accents.
             (0x4e, 0x9a, 0xff) | (0x88, 0xc0, 0xd0) => self.accent,
-            c if c.0.max(c.1).max(c.2) - c.0.min(c.1).min(c.2) < 0x30 => cool_grey(c),
-            c => c,
+            _ => return None,
         })
     }
 
@@ -1754,11 +1776,50 @@ osk_armed = "#3355aa"
         let m = crate::lsp::manifest::parse(manifest).expect("parses");
         let t = Theme::from_decl(&m.themes[0]);
         let s = t.surfaces().expect("surfaces declared");
+        // No gradient, and its overlays still get the card frame.
+        assert!(!t.gradient());
+        assert!(t.framed_overlays());
         let bg = (0x10, 0x14, 0x18);
         // Each tone steps further from the background than the last.
         assert!(luma(bg) < luma(s.chrome));
         assert!(luma(s.chrome) < luma(s.raised));
         assert!(luma(s.raised) < luma(s.hairline));
         assert!(luma(s.hairline) < luma(s.muted));
+    }
+
+    #[test]
+    fn a_light_surfaces_theme_draws_its_chrome_roles_from_its_own_tones() {
+        let manifest = r##"
+id = "third-party-light"
+name = "Third Party Light"
+api_version = 1
+
+[[themes]]
+id = "paper"
+label = "Paper"
+background = "#fafafa"
+accent = "#3366cc"
+selection = "#cce0ff"
+search = "#f0f0f0"
+button = "#3366cc"
+surfaces = true
+raised = "#ffffff"
+hairline = "#d8d8d8"
+osk_key = "#e8e8e8"
+osk_special = "#d8d8d8"
+osk_armed = "#3366cc"
+"##;
+        let m = crate::lsp::manifest::parse(manifest).expect("parses");
+        let t = Theme::from_decl(&m.themes[0]);
+        assert!(t.is_light());
+        // The chrome roles take the theme's declared tones...
+        assert_eq!(t.ui(Color::Rgb(0x16, 0x18, 0x1f)), rgb((0xff, 0xff, 0xff)));
+        assert_eq!(t.ui(Color::Rgb(0x3b, 0x42, 0x52)), rgb((0xd8, 0xd8, 0xd8)));
+        assert_eq!(t.ui(Color::Rgb(0x1e, 0x3a, 0x6e)), t.selection());
+        assert_eq!(t.ui(Color::Rgb(0x4e, 0x9a, 0xff)), t.accent());
+        // ...and the rest lands where it does on any light theme.
+        for c in [Color::White, Color::Rgb(0x9d, 0xa5, 0xb4), Color::Reset] {
+            assert_eq!(t.ui(c), light_ui(c));
+        }
     }
 }

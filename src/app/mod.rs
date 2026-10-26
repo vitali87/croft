@@ -23586,7 +23586,7 @@ impl App {
             .style(Style::default().bg(self.theme.ui(Color::Rgb(0x1e, 0x1e, 0x1e))));
         frame.render_widget(ratatui::widgets::Clear, rect);
         frame.render_widget(block, rect);
-        if grad {
+        if self.theme.framed_overlays() {
             crate::widgets::surface::paint_overlay_frame(frame.buffer_mut(), rect, self.theme);
         }
         let sel_bg = if grad {
@@ -25017,7 +25017,7 @@ impl App {
         frame.render_widget(block, rect);
         // Black theme: overpaint the solid border with the gradient, then
         // re-stamp the title the gradient top edge just covered.
-        if grad {
+        if self.theme.framed_overlays() {
             crate::widgets::surface::paint_overlay_frame(frame.buffer_mut(), rect, self.theme);
             frame
                 .buffer_mut()

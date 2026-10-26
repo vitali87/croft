@@ -359,7 +359,7 @@ impl Widget for CompletionDetails<'_> {
             .block(block)
             .wrap(ratatui::widgets::Wrap { trim: false })
             .render(area, buf);
-        if theme.gradient() {
+        if theme.framed_overlays() {
             crate::widgets::surface::paint_overlay_frame(buf, area, theme);
         }
     }
@@ -420,7 +420,7 @@ impl Widget for &CompletionPopup {
         let mut state = ListState::default();
         state.select(Some(self.selected));
         StatefulWidget::render(list, area, buf, &mut state);
-        if self.theme.gradient() {
+        if self.theme.framed_overlays() {
             crate::widgets::surface::paint_overlay_frame(buf, area, self.theme);
         }
     }
