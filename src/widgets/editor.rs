@@ -6417,7 +6417,10 @@ impl Editor {
             format_label: String::from("SVG"),
             pixel_w,
             pixel_h,
-            natural_size: Some(css_px_size(natural)),
+            natural_size: Some(match natural {
+                crate::svg::NaturalSize::Px(w, h) => css_px_size((w, h)),
+                crate::svg::NaturalSize::Relative(w, h) => format!("{w}×{h}"),
+            }),
             byte_size: meta.len(),
             generation: next_image_generation(),
             pdf: None,
