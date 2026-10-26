@@ -38,8 +38,9 @@ pub(crate) fn auth_for(base_url: &str, token: Option<&str>) -> (String, Option<S
 /// only to a loopback host. A real URL parse, not a string scan - the
 /// authority's userinfo made `http://localhost:pass@evil.example` read as
 /// loopback under a colon-split check while the actual destination was the
-/// remote host.
-fn credential_allowed(base_url: &str) -> bool {
+/// remote host. Inline completions send their API key under the same rule
+/// (#1927).
+pub(crate) fn credential_allowed(base_url: &str) -> bool {
     let Ok(u) = url::Url::parse(base_url) else {
         return false;
     };

@@ -542,7 +542,7 @@ The AI pilot core (docs/MULTIPLAYER.md, "croft pair" / "resident navigator"). It
 
 **Comment-only turns.** Yielded turns are comment-only at the host: `PairState::comment_only` discards EDIT fences whatever the model says.
 
-**Sandboxing.** The claude child is sandboxed read-only — Read/Grep/Glob plus a read-only collab-agent MCP seat, `--strict-mcp-config`. The fence is the only write path.
+**Sandboxing.** The claude child is sandboxed read-only — Read/Grep/Glob plus a read-only collab-agent MCP seat, `--strict-mcp-config`. The fence is the only write path. `--tools Read,Grep,Glob` makes those three its only built-in tools, and they carry no allow rule, so `dontAsk` runs them inside the workspace and denies them outside it. `--setting-sources user` loads only the user's own Claude Code settings: the workspace's `.claude/settings.json`, and the hooks in it, would otherwise run as soon as the navigator starts (#1926).
 
 **Seats and drivers.** `seat_pilot` builds the claude seat (child plus reader, stderr and pump threads); `seat_local` builds the childless local-endpoint seat (pair/local.rs). Both return the transport-polymorphic `Pilot`: a shared `TurnSink` for turn injection plus a `Transport` enum for teardown. That serves both drivers, the hidden `croft pair --repl` terminal REPL and the in-process PairHost. `Provider` (claude or local `base_url`) rides `PairConfig` and dispatches the seat. It is e2e-tested against a scripted python3 fake claude.
 

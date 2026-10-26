@@ -82,18 +82,24 @@ pub fn resolve(
             model,
         });
     }
-    match env("ANTHROPIC_API_KEY").filter(|k| !k.is_empty()) {
-        Some(api_key) => Ok(Config {
-            backend: Backend::Claude {
-                base_url: url_override.unwrap_or_else(|| String::from("https://api.anthropic.com")),
-                api_key,
-            },
-            model: model_override.unwrap_or_else(|| String::from(DEFAULT_MODEL)),
-        }),
-        None => Err(String::from(
+    let Some(api_key) = env("ANTHROPIC_API_KEY").filter(|k| !k.is_empty()) else {
+        return Err(String::from(
             "set ANTHROPIC_API_KEY, or seat a local model with croft pair",
-        )),
+        ));
+    };
+    let base_url = url_override.unwrap_or_else(|| String::from("https://api.anthropic.com"));
+    // The key rides every request, so it goes only where pair's own token
+    // may: https anywhere, plain http only to this machine (#1927). The URL
+    // is not echoed back, since its userinfo can hold a credential too.
+    if !crate::pair::local::credential_allowed(&base_url) {
+        return Err(String::from(
+            "ANTHROPIC_API_KEY is sent only over https or to this machine, and CROFT_COMPLETE_URL is neither",
+        ));
     }
+    Ok(Config {
+        backend: Backend::Claude { base_url, api_key },
+        model: model_override.unwrap_or_else(|| String::from(DEFAULT_MODEL)),
+    })
 }
 
 /// The prompt: the window of lines around the caret with `<CURSOR>` at it.
@@ -368,6 +374,44 @@ mod tests {
             .map(|c| c.model),
             Ok(String::from("m"))
         );
+    }
+
+    /// #1927: the API key never rides plain http to another machine. An
+    /// https override and a loopback one still resolve.
+    #[test]
+    fn the_api_key_goes_only_to_https_or_this_machine() {
+        let with_url = |url: &str| {
+            resolve(
+                None,
+                env_of(&[("ANTHROPIC_API_KEY", "k"), ("CROFT_COMPLETE_URL", url)]),
+            )
+        };
+        for remote in [
+            "http://proxy.lan:8080",
+            "http://10.0.0.5",
+            "http://localhost:pass@evil.example",
+            "ftp://api.example",
+            "not a url",
+        ] {
+            let refused = with_url(remote);
+            assert!(refused.is_err(), "{remote} must not receive the key");
+            assert!(!refused.unwrap_err().contains(remote));
+        }
+        for allowed in [
+            "https://gateway.example",
+            "http://localhost:8080",
+            "http://127.0.0.1:9000",
+            "http://[::1]:9000",
+        ] {
+            assert_eq!(
+                with_url(allowed).map(|c| c.backend),
+                Ok(Backend::Claude {
+                    base_url: String::from(allowed),
+                    api_key: String::from("k"),
+                }),
+                "{allowed} may receive the key"
+            );
+        }
     }
 
     #[test]

@@ -388,12 +388,26 @@ pub fn shift_offset(x: usize, span: &ResolvedSpan) -> usize {
 // a control_request interrupt on claude's stdin.
 // ---------------------------------------------------------------------------
 
-/// The read-only toolbox the pilot's claude may use (approved product
+/// The tools the pilot's claude may call without a prompt (approved product
 /// decision: read-only plus the stream; the ONLY write path is the fence).
 /// The `croft-collab` MCP server here is a second, read-only seat riding
 /// along for live buffer queries; the pilot itself owns the writing seat.
+/// `Read`, `Grep` and `Glob` are deliberately not listed: a bare rule
+/// matches every path (`~/.ssh`, `~/.aws`), while with no rule `dontAsk`
+/// runs them inside the workspace and denies them outside it (#1926).
 const ALLOWED_TOOLS: &str = "mcp__croft-collab__collab_open,mcp__croft-collab__collab_read,\
-     mcp__croft-collab__collab_status,Read,Grep,Glob";
+     mcp__croft-collab__collab_status";
+
+/// The built-in tools the pilot's claude has at all: no settings file can
+/// allow a tool outside this set, so there is no shell and no write tool
+/// whatever the user's or the workspace's settings say (#1926).
+const BUILTIN_TOOLS: &str = "Read,Grep,Glob";
+
+/// The settings the pilot's claude loads: the user's own (sign-in, model,
+/// their own hooks). The workspace's `.claude/settings.json` belongs to
+/// whoever committed it, and its hooks would run the moment the navigator
+/// starts, before anyone asked it anything (#1926).
+const SETTING_SOURCES: &str = "user";
 
 /// How long an EditStart waits for its file to bootstrap, a hair past the
 /// session's own 3s deadline (same reasoning as the collab agent's).
@@ -975,6 +989,8 @@ pub(crate) fn claude_command(cfg: &PairConfig) -> Result<Command> {
         .arg("--verbose")
         .arg("--include-partial-messages")
         .args(["--permission-mode", "dontAsk"])
+        .args(["--setting-sources", SETTING_SOURCES])
+        .args(["--tools", BUILTIN_TOOLS])
         .args(["--allowedTools", ALLOWED_TOOLS])
         .arg("--strict-mcp-config")
         .args(["--mcp-config", &mcp_config.to_string()])
@@ -4526,6 +4542,46 @@ mod tests {
         assert!(PAIR_SYSTEM_PROMPT.contains("COMMENT-ONLY"));
         assert!(PAIR_SYSTEM_PROMPT.contains("N|"));
         assert!(PAIR_SYSTEM_PROMPT.contains("0-based row"));
+    }
+
+    /// #1926: the navigator's claude loads only the user's own settings, so
+    /// a workspace's `.claude/settings.json` hooks never run; its built-in
+    /// tools are exactly Read, Grep and Glob; and those carry no allow rule,
+    /// so `dontAsk` keeps them inside the workspace.
+    #[test]
+    fn the_navigator_claude_cannot_reach_past_the_workspace() {
+        let cfg = PairConfig {
+            socket: PathBuf::from("/nonexistent/relay.sock"),
+            workspace: std::env::temp_dir(),
+            name: String::from("claude"),
+            model: None,
+            task: None,
+            provider: Provider::Claude,
+        };
+        let cmd = claude_command(&cfg).expect("claude command");
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let value_of = |flag: &str| {
+            let at = args
+                .iter()
+                .position(|a| a == flag)
+                .unwrap_or_else(|| panic!("{flag} missing from {args:?}"));
+            args[at + 1].clone()
+        };
+        assert_eq!(value_of("--setting-sources"), "user");
+        assert_eq!(value_of("--tools"), "Read,Grep,Glob");
+        assert_eq!(value_of("--permission-mode"), "dontAsk");
+        let allowed: Vec<String> = value_of("--allowedTools")
+            .split(',')
+            .map(|t| t.trim().to_string())
+            .collect();
+        assert!(
+            allowed.iter().all(|t| t.starts_with("mcp__croft-collab__")),
+            "a bare built-in allow rule matches every path: {allowed:?}"
+        );
+        assert!(args.iter().any(|a| a == "--strict-mcp-config"));
     }
 
     /// The ask-turn composer: instruction, invoked range, selected text,
