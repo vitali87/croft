@@ -1398,6 +1398,84 @@ fn locale_template_write_for_english_writes_nothing() {
     assert!(!cfg.path().join("croft/locales").exists());
 }
 
+/// #1179: `croft import-vscode | head` closes croft's stdout before the
+/// report is out. The import is written anyway, and croft ends the way any
+/// Unix tool does on a closed pipe instead of panicking with exit code 101.
+#[cfg(unix)]
+#[test]
+fn import_vscode_writes_its_files_when_stdout_is_closed() {
+    use std::os::unix::process::ExitStatusExt;
+    let cfg = tempfile::tempdir().unwrap();
+    let from = tempfile::tempdir().unwrap();
+    std::fs::write(
+        from.path().join("settings.json"),
+        r#"{ "editor.formatOnSave": true }"#,
+    )
+    .unwrap();
+    std::fs::write(
+        from.path().join("keybindings.json"),
+        r#"[{ "key": "ctrl+s", "command": "workbench.action.files.save" }]"#,
+    )
+    .unwrap();
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("croft"))
+        .args(["import-vscode", "--from"])
+        .arg(from.path())
+        .env("XDG_CONFIG_HOME", cfg.path())
+        .current_dir(cfg.path())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // The reader is gone before croft has written a byte.
+    drop(child.stdout.take());
+    let out = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success() || out.status.signal() == Some(13),
+        "a closed pipe ends croft quietly, not with {:?}: {stderr}",
+        out.status
+    );
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    let config = std::fs::read_to_string(cfg.path().join("croft/config.json")).unwrap();
+    assert!(config.contains("format_on_save"), "{config}");
+    assert!(cfg.path().join("croft/keybindings.json").is_file());
+}
+
+/// #1179 review: an import that cannot be written says so on stderr even
+/// when stdout is already closed, instead of dying silently at the report's
+/// first line.
+#[cfg(unix)]
+#[test]
+fn import_vscode_reports_a_failed_write_when_stdout_is_closed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let from = tempfile::tempdir().unwrap();
+    std::fs::write(
+        from.path().join("settings.json"),
+        r#"{ "editor.formatOnSave": true }"#,
+    )
+    .unwrap();
+    // A file where the config directory should be: nothing can be written.
+    let blocked = tmp.path().join("not-a-dir");
+    std::fs::write(&blocked, "").unwrap();
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("croft"))
+        .args(["import-vscode", "--from"])
+        .arg(from.path())
+        .env("XDG_CONFIG_HOME", &blocked)
+        .current_dir(tmp.path())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(child.stdout.take());
+    let out = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{:?}", out.status);
+    assert!(
+        stderr.contains("not-a-dir"),
+        "the failure is said: {stderr}"
+    );
+}
+
 /// The real binary on a pty with `HOME` at `dir`, for tests that type raw
 /// terminal bytes at croft and read back what it did. Killed on drop.
 #[cfg(unix)]

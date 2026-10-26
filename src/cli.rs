@@ -1012,13 +1012,19 @@ impl Cli {
                 Ok(())
             }
             Some(CliCommand::SetupCross { yes }) => setup_cross(yes),
-            Some(CliCommand::ImportVscode { from, dry_run }) => import_vscode(from, dry_run),
+            Some(CliCommand::ImportVscode { from, dry_run }) => {
+                end_quietly_when_stdout_closes();
+                import_vscode(from, dry_run)
+            }
             Some(CliCommand::ThemeImport {
                 file,
                 theme,
                 id,
                 dry_run,
-            }) => theme_import(&file, theme.as_deref(), id.as_deref(), dry_run),
+            }) => {
+                end_quietly_when_stdout_closes();
+                theme_import(&file, theme.as_deref(), id.as_deref(), dry_run)
+            }
             Some(CliCommand::SetupGhostty { yes }) => setup_ghostty(yes),
             Some(CliCommand::OpenLink { url }) => {
                 // One line, like `croft view`: a link click deserves a
@@ -1631,7 +1637,7 @@ fn setup_iterm2(font: &str, nonascii: &str, size: u32, yes: bool) -> Result<()> 
 /// one it has no equivalent for, which is the difference between "my
 /// settings came across" and "my settings are gone".
 fn import_vscode(from: Option<PathBuf>, dry_run: bool) -> Result<()> {
-    let dir = match from {
+    let (dir, reading) = match from {
         Some(dir) => {
             // A mistyped path must not read as an empty profile. Every file
             // this scans is optional, so a wrong directory produces "0
@@ -1647,10 +1653,8 @@ fn import_vscode(from: Option<PathBuf>, dry_run: bool) -> Result<()> {
                 );
             }
             let user = crate::import_vscode::user_dir_in(&dir);
-            if user != dir {
-                println!("Reading {}", user.display());
-            }
-            user
+            let reading = (user != dir).then(|| format!("Reading {}", user.display()));
+            (user, reading)
         }
         None => {
             let found = crate::import_vscode::discover_profiles();
@@ -1660,11 +1664,22 @@ fn import_vscode(from: Option<PathBuf>, dry_run: bool) -> Result<()> {
                      (e.g. --from ~/.config/Code/User)"
                 );
             };
-            println!("Reading {label}: {}", dir.display());
-            dir
+            let reading = format!("Reading {label}: {}", dir.display());
+            (dir, Some(reading))
         }
     };
     let mut report = crate::import_vscode::scan_profile(&dir)?;
+    // Write first, report after (#1179): a reader that stops early (`| head`)
+    // closes stdout, and whether the import lands must not depend on anyone
+    // reading about it. A failed write is returned before the report too,
+    // since a closed stdout ends the process at its first line and the
+    // failure would go unsaid.
+    let applied = (!dry_run && !report.is_empty())
+        .then(|| crate::import_vscode::apply(&mut report))
+        .transpose()?;
+    if let Some(reading) = reading {
+        println!("{reading}");
+    }
 
     println!(
         "\n{} setting{} mapped, {} keybinding{} mapped, {} snippet{}",
@@ -1756,15 +1771,14 @@ fn import_vscode(from: Option<PathBuf>, dry_run: bool) -> Result<()> {
         println!("  Open the Extensions panel (Cmd+Shift+X) to add an installable one.");
     }
 
-    if dry_run {
-        println!("\nDry run: nothing was written.");
+    let Some(written) = applied else {
+        if dry_run {
+            println!("\nDry run: nothing was written.");
+        } else {
+            println!("\nNothing to import.");
+        }
         return Ok(());
-    }
-    if report.is_empty() {
-        println!("\nNothing to import.");
-        return Ok(());
-    }
-    let written = crate::import_vscode::apply(&mut report)?;
+    };
     if !report.conflicts.is_empty() {
         println!(
             "\n{} value{} croft already had, left alone:",
@@ -1808,6 +1822,18 @@ fn plural(n: usize) -> &'static str {
     if n == 1 { "" } else { "s" }
 }
 
+/// Let a closed stdout end this process the way it ends `ls | head`, for a
+/// command that only prints after doing its work (#1179). Rust ignores
+/// SIGPIPE, which turns the first `println!` after the reader has gone into
+/// a "Broken pipe" panic and exit code 101. Never for croft itself or its
+/// session processes: they write to sockets and ptys whose peer can vanish
+/// and rely on that write failing instead of killing them.
+fn end_quietly_when_stdout_closes() {
+    // SAFETY: setting SIGPIPE's disposition to its default installs no
+    // handler; the call has no memory-safety preconditions.
+    unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+}
+
 /// `croft theme-import <file>`: convert a VS Code theme and install it.
 ///
 /// The notes are printed rather than buried: a converted theme fills croft
@@ -1828,9 +1854,13 @@ fn theme_import(
     // otherwise be taken as the theme and fail deep inside the converter
     // with a read error, rather than being passed to the marketplace where
     // the user plainly meant it to go.
+    //
+    // Progress goes to stderr, so stdout carries only the result: the
+    // manifest alone under --dry-run, and nothing at all before the install,
+    // so a closed stdout cannot cost the user the theme (#1179).
     let local = Path::new(reference);
     let (source, _scratch) = if local.is_file() {
-        println!("Importing from {}", local.display());
+        eprintln!("Importing from {}", local.display());
         (local.to_path_buf(), None)
     } else {
         let (path, dir) = fetch_marketplace_theme(reference, theme)?;
@@ -1911,7 +1941,7 @@ fn fetch_marketplace_theme(
         scratch_nonce()
     )))?;
     let dir = scratch.path();
-    println!(
+    eprintln!(
         "Downloading {}.{} from the marketplace…",
         id.publisher, id.name
     );
@@ -1922,7 +1952,7 @@ fn fetch_marketplace_theme(
     let nls = marketplace::read_member(&vsix, "extension/package.nls.json", dir).ok();
     let themes = marketplace::contributed_themes(&pkg, nls.as_deref())?;
     let picked = marketplace::pick_theme(&themes, wanted)?;
-    println!("  taking \"{}\" ({})", picked.label, picked.path);
+    eprintln!("  taking \"{}\" ({})", picked.label, picked.path);
     let entry = marketplace::extract_theme_chain(&vsix, &picked.path, dir)?;
     Ok((entry, scratch))
 }
