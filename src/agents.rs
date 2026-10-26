@@ -31,10 +31,14 @@ pub fn is_script_runtime(process_name: &str) -> bool {
 
 /// The script a runtime's `argv` runs, by basename less a script extension:
 /// `node ~/.npm-global/bin/gemini` is `gemini`, `node …/codex/bin/codex.js`
-/// is `codex`, and `python -m aider` is `aider`. Runtime flags are skipped,
-/// with the value of those that take one; `None` for code passed with
-/// `-e`/`-c` or a bare REPL.
+/// is `codex`, `bun run ./gemini.ts` is `gemini`, and `python -m aider` is
+/// `aider`. Runtime flags are skipped, with the value of those that take one
+/// (`--require x`, Python's `-X dev`); `None` for code passed with `-e`/`-c`
+/// or a bare REPL.
 pub fn script_name(argv: &[String]) -> Option<String> {
+    // bun and deno run a file through their `run` subcommand.
+    let runtime = argv.first().map(|a| a.rsplit('/').next().unwrap_or(a));
+    let mut run_subcommand = runtime.is_some_and(|r| r == "bun" || r == "deno");
     let mut args = argv.iter().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -46,10 +50,14 @@ pub fn script_name(argv: &[String]) -> Option<String> {
             | "--loader"
             | "--experimental-loader"
             | "-C"
-            | "--conditions" => {
+            | "--conditions"
+            | "-X"
+            | "-W"
+            | "--cwd" => {
                 args.next();
             }
             a if a.starts_with('-') => {}
+            "run" if run_subcommand => run_subcommand = false,
             script => {
                 let base = Path::new(script).file_name()?.to_string_lossy();
                 let stem = [".js", ".mjs", ".cjs", ".ts", ".mts", ".py"]
@@ -523,6 +531,26 @@ mod tests {
             who("python3", &["python3", "-m", "aider"]).as_deref(),
             Some("aider")
         );
+        // The forms review found: a runtime's `run` subcommand, and Python
+        // options whose value is a separate word.
+        for (name, args, want) in [
+            ("bun", &["bun", "run", "./gemini.ts"][..], "gemini"),
+            (
+                "bun",
+                &["bun", "--cwd", "/w", "run", "/u/bin/codex"],
+                "codex",
+            ),
+            ("deno", &["deno", "run", "-A", "/u/gemini.ts"], "gemini"),
+            ("python3", &["python3", "-X", "dev", "-m", "aider"], "aider"),
+            (
+                "python3",
+                &["python3", "-W", "default", "/u/bin/aider"],
+                "aider",
+            ),
+        ] {
+            assert_eq!(who(name, args).as_deref(), Some(want), "{args:?}");
+        }
+        assert_eq!(who("bun", &["bun", "run", "dev"]), None, "a package script");
         for (name, args) in [
             ("node", &["node", "vite.js"][..]),
             ("node", &["node", "server.js"]),
