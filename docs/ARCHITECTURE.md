@@ -863,7 +863,7 @@ The Source Control sidebar widget, including the multi-root REPOSITORIES overvie
 
 Tracks agent lanes: which panes are running a coding agent, and whether that agent is working, waiting for the user, or idle. `claude`, `codex`, `aider` and `gemini` are built in, and `~/.config/croft/agents.json` extends or replaces those rows and is reloaded on save. A row's `launch` is the command a worktree lane starts the agent with.
 
-**How an agent is recognised.** By the pane's foreground process name against each row's `process` list. A script runtime (`node`, `bun`, `deno`, `python`) says nothing by its name, and Codex CLI and Gemini CLI installed with npm run as `node`, so for those alone the sampler also reads argv and the script's basename (`node …/bin/gemini` is `gemini`) is matched first. A script that names no agent leaves the runtime's own name, so a row listing `node` still matches.
+**How an agent is recognised.** By the pane's foreground process name against each row's `process` list. A script runtime (`node`, or `MainThread` on newer Node, `bun`, `deno`, `python`) says nothing by its name, and Codex CLI and Gemini CLI installed with npm run as `node`, so for those alone the sampler also reads argv and the script's basename (`node …/bin/gemini` is `gemini`) is matched first. A script that names no agent leaves the runtime's own name, so a row listing `node` still matches.
 
 **How the state is judged.** The status comes from the pane's last-output stamp and its last visible rows, matched against the agent's prompt patterns. An agent in the foreground never emits OSC 133 marks, so there is no shell-integration signal to read instead.
 

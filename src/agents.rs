@@ -20,13 +20,17 @@ use regex::Regex;
 /// Whether a foreground process is a script runtime (#1380), whose name
 /// says nothing about what it runs: Codex CLI and Gemini CLI installed with
 /// npm run as `node`. Only these pay the argv read [`script_name`] needs.
+/// Newer Node names its main thread `MainThread`, and on Linux the main
+/// thread's name is the process name, so that is Node too.
 pub fn is_script_runtime(process_name: &str) -> bool {
     let base = process_name.rsplit('/').next().unwrap_or(process_name);
     let base = base.trim().to_lowercase();
-    matches!(base.as_str(), "node" | "nodejs" | "bun" | "deno")
-        || base
-            .strip_prefix("python")
-            .is_some_and(|v| v.chars().all(|c| c.is_ascii_digit() || c == '.'))
+    matches!(
+        base.as_str(),
+        "node" | "nodejs" | "mainthread" | "bun" | "deno"
+    ) || base
+        .strip_prefix("python")
+        .is_some_and(|v| v.chars().all(|c| c.is_ascii_digit() || c == '.'))
 }
 
 /// The script a runtime's `argv` runs, by basename less a script extension:
@@ -560,6 +564,19 @@ mod tests {
         ] {
             assert_eq!(who(name, args), None, "{args:?} is not an agent");
         }
+        // Newer Node renames its main thread, and with it the process.
+        assert_eq!(
+            who("MainThread", &["node", "/u/.npm-global/bin/gemini"]).as_deref(),
+            Some("gemini")
+        );
+        assert_eq!(
+            who(
+                "MainThread",
+                &["/usr/bin/node", "/u/lib/codex/bin/codex.js"]
+            )
+            .as_deref(),
+            Some("codex")
+        );
         // A native binary never asks for argv.
         assert!(!is_script_runtime("claude") && !is_script_runtime("codex"));
         assert!(is_script_runtime("/usr/bin/node") && is_script_runtime("python3.12"));
