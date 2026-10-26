@@ -173,6 +173,24 @@ pub fn has_fonts() -> bool {
 /// image instead of a 1600px blur). Returns the PNG plus its pixel
 /// dimensions.
 pub fn rasterize(svg: &[u8]) -> Result<(Vec<u8>, u32, u32), String> {
+    render(svg).map(|r| (r.png, r.pixels.0, r.pixels.1))
+}
+
+/// A rendered SVG: the raster the image pipeline shows, and the size of the
+/// drawing it was rendered from.
+pub struct Raster {
+    pub png: Vec<u8>,
+    /// The PNG's pixel size, scaled toward [`RASTER_LONG_EDGE`]: a choice of
+    /// croft's rendering quality, not the drawing's size.
+    pub pixels: (u32, u32),
+    /// The SVG's own size in CSS pixels (#1008): its `width` and `height`,
+    /// or its viewBox's when it names none, with units such as `mm`
+    /// converted at 96 per inch. The size to show a user.
+    pub natural: (f32, f32),
+}
+
+/// [`rasterize`], keeping the SVG's own size beside the raster's.
+pub fn render(svg: &[u8]) -> Result<Raster, String> {
     if nesting_depth(svg, MAX_SVG_DEPTH) > MAX_SVG_DEPTH {
         return Err(format!(
             "SVG nested too deeply to render (over {MAX_SVG_DEPTH} levels)"
@@ -217,7 +235,11 @@ pub fn rasterize(svg: &[u8]) -> Result<(Vec<u8>, u32, u32), String> {
     let mut png = std::io::Cursor::new(Vec::new());
     img.write_to(&mut png, image::ImageFormat::Png)
         .map_err(|e| e.to_string())?;
-    Ok((png.into_inner(), w, h))
+    Ok(Raster {
+        png: png.into_inner(),
+        pixels: (w, h),
+        natural: (size.width(), size.height()),
+    })
 }
 
 #[cfg(test)]
@@ -235,6 +257,27 @@ mod tests {
         assert_eq!(img.dimensions(), (w, h));
         let px = img.get_pixel(w / 2, h / 2);
         assert_eq!((px[0], px[1], px[2], px[3]), (255, 0, 0, 255), "solid red");
+    }
+
+    /// #1008: the raster is scaled toward the long edge, so its size is not
+    /// the drawing's. A 200×100 SVG renders 1600×800 pixels and reports
+    /// 200×100 as its own size.
+    #[test]
+    fn the_natural_size_is_the_svgs_own_not_the_rasters() {
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="100">
+            <rect width="200" height="100" fill="#0000ff"/>
+        </svg>"##;
+        let r = render(svg).unwrap();
+        assert_eq!(r.pixels, (1600, 800));
+        assert_eq!(r.natural, (200.0, 100.0));
+        // No width or height: the viewBox gives the size.
+        let r =
+            render(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 50 25"/>"#).unwrap();
+        assert_eq!(r.natural, (50.0, 25.0));
+        // Physical units are CSS pixels at 96 per inch: one inch is 96.
+        let r = render(br#"<svg xmlns="http://www.w3.org/2000/svg" width="1in" height="0.5in"/>"#)
+            .unwrap();
+        assert_eq!(r.natural, (96.0, 48.0));
     }
 
     #[test]

@@ -1139,7 +1139,7 @@ Local session persistence. `croft attach` and `croft ls` run croft under the ses
 
 SVG file-preview rasterisation: `usvg` parse plus `resvg` render into a PNG that the standard image-overlay pipeline consumes unchanged.
 
-**Vector render once, bitmap refit after.** The vector render happens once per open at a fixed quality — longest edge `1600px`, with small icons capped at 8× natural so they stay crisp instead of blurring. A pane resize refits that stored PNG through `fit_image_auto` like any image tab: a bitmap rescale, never a fresh vector render.
+**Vector render once, bitmap refit after.** The vector render happens once per open at a fixed quality — longest edge `1600px`, with small icons capped at 8× natural so they stay crisp instead of blurring. A pane resize refits that stored PNG through `fit_image_auto` like any image tab: a bitmap rescale, never a fresh vector render. Because the raster's size is a quality choice, `render` also returns the SVG's own size in CSS pixels (`width` and `height`, or the viewBox's), and the preview header shows that rather than the raster's.
 
 **The `<text>` fontdb is lazy.** It is built on the FIRST preview, never at startup, because `init_graphics`' icon bake is the critical path and codicons carry no text. Generic families are remapped to a real face when the host lacks the fontdb defaults (Arial, Times) — imperfect typography beats invisible text.
 
