@@ -97,14 +97,16 @@ pub enum HookAction {
 
 #[derive(Subcommand, Debug)]
 pub enum CliCommand {
-    /// Take the guided tour (#377) in a throwaway sample project.
+    // Issue #377.
+    /// Take the guided tour in a throwaway sample project.
     Demo {
         /// Run this tour file (the same JSON shape as the built-in
         /// assets/tour/tour.json) instead of the built-in tour.
         #[arg(long)]
         tour: Option<PathBuf>,
     },
-    /// Review a pull request (#365): open croft on this repository with the
+    // Issue #365.
+    /// Review a pull request: open croft on this repository with the
     /// PR's changed files, checks and viewed marks in their own tab.
     Pr {
         /// The pull request number (`579`, `#579`, or its URL).
@@ -154,9 +156,10 @@ pub enum CliCommand {
         /// joining the shared screen (see `croft attach --solo`).
         #[arg(long, default_value_t = false)]
         solo: bool,
+        // Issue #261.
         /// Build croft for the remote from this source tree instead of
-        /// installing the matching release binary (#261): for a local tree
-        /// ahead of the latest release.
+        /// installing the matching release binary: for a local tree ahead of
+        /// the latest release.
         #[arg(long, default_value_t = false)]
         build: bool,
     },
@@ -221,8 +224,9 @@ pub enum CliCommand {
         #[arg(long, default_value_t = false)]
         text: bool,
     },
+    // Issue #694.
     /// Internal: hold one terminal pane's shell in a process of its own, so
-    /// it outlives croft (#694). croft starts it; not for manual use.
+    /// it outlives croft. croft starts it; not for manual use.
     #[command(hide = true)]
     PaneHost {
         /// The socket the pane attaches to.
@@ -341,21 +345,23 @@ pub enum CliCommand {
         #[arg(long, default_value_t = false, hide = true)]
         repl: bool,
     },
-    /// Open a file in the croft that hosts this pane (#362).
+    // Issue #362. `imgcat` works over SSH because escape sequences travel
+    // through the terminal, but croft's richer previews are editor tabs, so
+    // a shell prompt had no way to ask for one; this is that ask.
+    /// Open a file in the croft that hosts this pane.
     ///
-    /// `imgcat` works over SSH because escape sequences travel through the
-    /// terminal, but croft's richer previews (paged PDFs, spreadsheets,
-    /// SQLite) are editor tabs, so a shell prompt had no way to ask for
-    /// one. This is that ask: the path is resolved against the shell's own
-    /// cwd and handed to the running croft, which opens it exactly as an
-    /// Explorer click would.
+    /// Opens croft's richer previews (paged PDFs, spreadsheets, SQLite) from
+    /// a shell prompt, over SSH too: the path is resolved against the
+    /// shell's own cwd and handed to the running croft, which opens it
+    /// exactly as an Explorer click would.
     View {
         /// File to open, or `-` to read the content from stdin.
-        ///
-        /// `OsString`, not `String`: a filename is bytes on Unix, and the
-        /// wire format goes to some trouble to carry those bytes intact.
-        /// Taking the argument as a `String` would have thrown them away at
-        /// the entry point, one call before the encoding that preserves them.
+        // `OsString`, not `String`: a filename is bytes on Unix, and the
+        // wire format goes to some trouble to carry those bytes intact.
+        // Taking the argument as a `String` would have thrown them away at
+        // the entry point, one call before the encoding that preserves them.
+        // A plain comment, because clap prints a field's whole `///` as its
+        // long help and this note is for maintainers (#1172).
         path: std::ffi::OsString,
         /// Extension to stage piped bytes under, for content that has no
         /// magic bytes to sniff (`--as csv`, `--as json`). Only valid with
@@ -365,7 +371,8 @@ pub enum CliCommand {
         #[arg(long = "as")]
         as_ext: Option<String>,
     },
-    /// Serve this workspace's session to a browser over WebSocket (#341).
+    // Issue #341.
+    /// Serve this workspace's session to a browser over WebSocket.
     ///
     /// Each WebSocket connection is one participant of the running session
     /// (`croft attach` starts it). Every connection must present the
@@ -388,7 +395,8 @@ pub enum CliCommand {
         #[arg(long, default_value_t = false, conflicts_with_all = ["bind", "tls"])]
         off: bool,
     },
-    /// Open a file for editing in the croft that hosts this pane (#620).
+    // Issue #620.
+    /// Open a file for editing in the croft that hosts this pane.
     ///
     /// Like `croft view`, plus `--wait`: return only once the tab is
     /// closed. croft points `GIT_SEQUENCE_EDITOR` at `croft edit --wait`, so
@@ -407,7 +415,8 @@ pub enum CliCommand {
         #[arg(long, default_value_t = false, hide = true)]
         sequence_editor: bool,
     },
-    /// Print a JSON template for translating croft's UI into `lang` (#621).
+    // Issue #621.
+    /// Print a JSON template for translating croft's UI into `lang`.
     ///
     /// Every palette title and every other string croft translates, with
     /// your own or the built-in translation filled in where one exists.
@@ -416,12 +425,14 @@ pub enum CliCommand {
     LocaleTemplate {
         /// Language code, such as `de` or `fr`.
         lang: String,
+        // Issue #1148.
         /// Update `<config>/locales/<lang>.json` in place instead of printing,
-        /// keeping every translation already in it (#1148).
+        /// keeping every translation already in it.
         #[arg(long, default_value_t = false)]
         write: bool,
     },
-    /// Open a workspace inside its dev container (#617).
+    // Issue #617.
+    /// Open a workspace inside its dev container.
     ///
     /// Reads `.devcontainer/devcontainer.json`, builds or pulls the image,
     /// starts (or reuses) the container, runs `postCreateCommand` once,
@@ -433,7 +444,8 @@ pub enum CliCommand {
         #[arg(long, default_value_t = false)]
         rebuild: bool,
     },
-    /// Route a coding agent's file edits through croft for approval (#346).
+    // Issue #346.
+    /// Route a coding agent's file edits through croft for approval.
     Hook {
         #[command(subcommand)]
         action: HookAction,
@@ -448,8 +460,8 @@ pub enum CliCommand {
         #[arg(short, long, default_value_t = false)]
         yes: bool,
     },
-    /// Bring a VS Code profile across: settings, keybindings and snippets
-    /// (#351).
+    // Issue #351.
+    /// Bring a VS Code profile across: settings, keybindings and snippets.
     ///
     /// Finds your VS Code (or Cursor / VSCodium / Windsurf) user directory,
     /// converts what croft has an equivalent for, and MERGES the result into
@@ -464,7 +476,8 @@ pub enum CliCommand {
         #[arg(long, default_value_t = false)]
         dry_run: bool,
     },
-    /// Import a VS Code colour theme (.json) as a croft theme (#350).
+    // Issue #350.
+    /// Import a VS Code colour theme (.json) as a croft theme.
     ///
     /// Reads a theme file you already have (from a cloned theme repo, or an
     /// installed VS Code extension's `themes/` directory), converts its
@@ -500,12 +513,14 @@ pub enum CliCommand {
         #[arg(short, long, default_value_t = false)]
         yes: bool,
     },
-    /// Open a `croft://attach?host=…&path=…&focus=…` link (#359): attach to
-    /// the session it names. The host must be an alias in ~/.ssh/config.
+    // Issue #359.
+    /// Open a `croft://attach?host=…&path=…&focus=…` link: attach to the
+    /// session it names. The host must be an alias in ~/.ssh/config.
     /// A `croft://decide?…` link answers a pending agent edit instead.
     OpenLink { url: String },
+    // Issue #359.
     /// Approve or deny an agent's pending edit by the one-time token its
-    /// notification carried (#359), without attaching to the session.
+    /// notification carried, without attaching to the session.
     #[command(hide = true)]
     Decide {
         token: String,
@@ -516,8 +531,9 @@ pub enum CliCommand {
         #[arg(long)]
         path: Option<PathBuf>,
     },
+    // Issue #262.
     /// Push your keybindings, snippets, triggers, matchers and macros to a
-    /// remote now, as connecting does (#262). A file edited on the remote
+    /// remote now, as connecting does. A file edited on the remote
     /// since the last push is left alone: --diff compares it, and
     /// --take-local or --keep-remote settles it.
     SyncConfig {
@@ -2507,22 +2523,44 @@ mod tests {
     }
 
     /// #853 guard: moving the note did not just move the leak. No help page,
-    /// the top level or any subcommand's, talks about clap internals.
+    /// the top level or any subcommand's, talks about clap internals, and
+    /// (#1172) none carries a maintainer's note about Rust types or cites an
+    /// issue number, which reads as an unexplained footnote.
     #[test]
     fn no_help_page_carries_a_note_about_clap_internals() {
+        // A backticked `#579` is an example of input (`croft pr`), not a
+        // citation.
+        fn issue_ref(help: &str) -> Option<&str> {
+            help.match_indices('#').find_map(|(i, _)| {
+                let digits = help[i + 1..].bytes().take_while(u8::is_ascii_digit).count();
+                let quoted = help[..i].ends_with('`');
+                (digits >= 3 && !quoted).then(|| &help[i..i + 1 + digits])
+            })
+        }
         fn walk(cmd: &mut clap::Command, path: &str) {
             let help = cmd.render_long_help().to_string();
-            for leak in ["clap", "conflicts_with", "runtime assert"] {
+            for leak in [
+                "clap",
+                "conflicts_with",
+                "runtime assert",
+                "OsString",
+                "`String`",
+            ] {
                 assert!(
                     !help.contains(leak),
                     "{leak:?} leaked into `{path} --help`: {help}"
                 );
+            }
+            if let Some(cited) = issue_ref(&help) {
+                panic!("`{path} --help` cites issue {cited}: {help}");
             }
             for sub in cmd.get_subcommands_mut() {
                 let path = format!("{path} {}", sub.get_name());
                 walk(sub, &path);
             }
         }
+        assert_eq!(issue_ref("the tour (#377) in"), Some("#377"));
+        assert_eq!(issue_ref("PR `#579`, #57, #ab, #"), None);
         let mut cmd = <Cli as clap::CommandFactory>::command();
         cmd.build();
         walk(&mut cmd, "croft");
