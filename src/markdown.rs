@@ -1108,7 +1108,8 @@ struct Renderer<'r> {
     /// Set while inside a RESERVED image's tag pair: pulldown-cmark
     /// emits the alt content between Tag::Image and TagEnd::Image, and
     /// letting it through painted the alt text after the reserved rows
-    /// (#196 review). Placeholder images keep their alt.
+    /// (#196 review). Placeholder images keep their alt. Also set inside a
+    /// front matter block, whose text the preview hides (#1385).
     suppress_inline: bool,
     /// The links and heading anchors found so far (#931), the link whose
     /// text is being drawn, and the open heading's text for its slug.
@@ -1466,10 +1467,15 @@ pub fn render_markdown_mapped(
     let mut source_map: Vec<(usize, usize)> = Vec::new();
     // `$…$` and `$$…$$` math (#1564), as VS Code's preview and GitHub read
     // it; without the option a display block ran into one paragraph line.
+    // Front matter (#1385), YAML between `---` lines or TOML between `+++`
+    // lines at the very top, is a block of its own rather than a rule, a
+    // paragraph and a setext heading.
     let options = Options::ENABLE_TABLES
         | Options::ENABLE_STRIKETHROUGH
         | Options::ENABLE_TASKLISTS
-        | Options::ENABLE_MATH;
+        | Options::ENABLE_MATH
+        | Options::ENABLE_YAML_STYLE_METADATA_BLOCKS
+        | Options::ENABLE_PLUSES_DELIMITED_METADATA_BLOCKS;
     let mut r = Renderer {
         theme,
         registry,
@@ -1644,6 +1650,9 @@ pub fn render_markdown_mapped(
                     r.table = Some(Vec::new());
                     r.table_aligns = aligns;
                 }
+                // Metadata for the site generator, not the page: hidden, as
+                // VS Code's preview hides it.
+                Tag::MetadataBlock(_) => r.suppress_inline = true,
                 Tag::TableHead => {
                     if let Some(rows) = r.table.as_mut() {
                         rows.push(Vec::new());
@@ -1712,7 +1721,7 @@ pub fn render_markdown_mapped(
                         r.links.links.pop();
                     }
                 }
-                TagEnd::Image => r.suppress_inline = false,
+                TagEnd::Image | TagEnd::MetadataBlock(_) => r.suppress_inline = false,
                 TagEnd::Table => r.end_table(),
                 _ => {}
             },
@@ -3195,6 +3204,50 @@ mod tests {
             .expect("link text must render");
         assert!(link.style.add_modifier.contains(Modifier::UNDERLINED));
         assert!(all_text(&lines).contains(&"\u{2500}".repeat(RULE_COLS)));
+    }
+
+    /// #1385: YAML or TOML front matter is metadata for the site generator,
+    /// hidden as VS Code's preview hides it, not a rule, a run-on paragraph
+    /// and a setext heading. The body's lines still map to their source for
+    /// scroll sync.
+    #[test]
+    fn front_matter_is_hidden_and_the_body_keeps_its_source_lines() {
+        let rule = "\u{2500}".repeat(RULE_COLS);
+        let md = "---\ntitle: Release notes\ndate: 2026-10-01\ntags: [a, b]\n---\n\n\
+                  Body text.\n\n## What's new\n";
+        let mut reg = LangRegistry::new();
+        let (lines, _, _, map, _) =
+            render_markdown_mapped(md, Theme::default(), &mut reg, None, BlockOutputs::new());
+        let text = all_text(&lines);
+        assert_eq!(text_of(&lines[0]), "Body text.", "{text}");
+        assert!(text.contains("What's new"), "{text}");
+        for absent in ["title", "2026-10-01", "tags", rule.as_str()] {
+            assert!(!text.contains(absent), "{absent:?} rendered: {text}");
+        }
+        assert_eq!(built_line_for_source(&map, 6), Some(0), "{map:?}");
+
+        let text = all_text(&render(
+            "+++\ntitle = \"Hugo\"\ndraft = false\n+++\n\nBody.\n",
+        ));
+        assert_eq!(text.trim(), "Body.");
+    }
+
+    /// #1385 negative: only the first line opens front matter. A `---`
+    /// further down is still a rule, and text over one still a heading.
+    #[test]
+    fn a_later_rule_and_setext_heading_still_render() {
+        let rule = "\u{2500}".repeat(RULE_COLS);
+        let text = all_text(&render("Intro\n\n---\n\nkey: value\n---\n\nAfter\n"));
+        assert!(text.contains(&rule), "{text}");
+        assert!(text.contains("key: value"), "{text}");
+        assert!(text.contains("After"), "{text}");
+        let lines = render("Intro\n\nSetext\n---\n");
+        let heading = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .find(|s| s.content.as_ref() == "Setext")
+            .expect("the setext heading renders");
+        assert!(heading.style.add_modifier.contains(Modifier::BOLD));
     }
 
     #[test]
