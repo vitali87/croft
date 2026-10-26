@@ -1201,12 +1201,16 @@ pub fn resolve(cfg: &DebugConfig, ctx: &SubstCtx) -> Result<ResolvedConfig, Stri
     if cfg.type_name == "node-terminal" && cfg.request == RequestKind::Launch {
         node_terminal_command(&mut extra);
     }
+    let mut program = get_str("program");
+    if kind == AdapterKind::Delve && cfg.request == RequestKind::Launch {
+        resolve_go_auto_mode(&mut extra, &mut program, ctx.file.as_deref());
+    }
     Ok(ResolvedConfig {
         name: cfg.name.clone(),
         kind,
         type_name: cfg.type_name.clone(),
         request: cfg.request,
-        program: get_str("program"),
+        program,
         module: get_str("module"),
         args,
         env,
@@ -1256,6 +1260,35 @@ fn node_terminal_command(extra: &mut Map<String, Value>) {
         runtime_args.extend(more.iter().cloned());
     }
     extra.insert("runtimeArgs".into(), Value::Array(runtime_args));
+}
+
+/// The Go extension's `"mode": "auto"` (#1395), resolved the way the
+/// extension resolves it before starting delve, which rejects `auto`:
+/// `test` when the program is a `_test.go` file, or is a folder while the
+/// active file is a `_test.go` file; `debug` otherwise. Delve tests a whole
+/// package, so a test file's program becomes its folder.
+fn resolve_go_auto_mode(
+    extra: &mut Map<String, Value>,
+    program: &mut Option<String>,
+    active: Option<&Path>,
+) {
+    if extra.get("mode").and_then(Value::as_str) != Some("auto") {
+        return;
+    }
+    let decides = match program.as_deref() {
+        Some(p) if p.ends_with(".go") => Some(p.to_string()),
+        _ => active.map(|f| f.to_string_lossy().into_owned()),
+    };
+    let test = decides.is_some_and(|f| f.ends_with("_test.go"));
+    extra.insert("mode".into(), json!(if test { "test" } else { "debug" }));
+    if let Some(file) = program.as_deref().filter(|p| p.ends_with("_test.go")) {
+        let dir = Path::new(file)
+            .parent()
+            .map(|d| d.to_string_lossy().into_owned())
+            .filter(|d| !d.is_empty())
+            .unwrap_or_else(|| String::from("."));
+        *program = Some(dir);
+    }
 }
 
 /// Whether a shell word is a variable assignment (`NODE_ENV=production`),
@@ -1657,6 +1690,7 @@ pub fn delve_remote_address(rc: &ResolvedConfig) -> Option<(String, u16)> {
 /// Build the delve `launch`/`attach` request (#264). `mode` passes through
 /// from the config and defaults to delve's own defaults: `debug` to launch
 /// (build and run the package at `program`), `local` to attach to `processId`.
+/// The Go extension's `auto` never reaches here: [`resolve`] settles it.
 pub fn delve_request(rc: &ResolvedConfig) -> Value {
     let mut args = base_arguments(rc);
     if !rc.env.is_empty() {
@@ -2213,6 +2247,50 @@ mod tests {
         assert_eq!(req["arguments"]["mode"], "local");
         assert_eq!(req["arguments"]["processId"], 77);
         assert!(req["arguments"].get("stopOnEntry").is_none());
+    }
+
+    /// #1395: the Go extension's default "Launch Package" config says
+    /// `"mode": "auto"`, which delve rejects. It resolves as the extension
+    /// resolves it: `test` for a `_test.go` program (run on its package
+    /// folder) or a folder program while a `_test.go` file is active,
+    /// `debug` otherwise. An explicit delve mode passes through.
+    #[test]
+    fn a_go_auto_mode_resolves_to_test_or_debug_as_the_go_extension_does() {
+        let request = |cfg: &str, active: &str| {
+            let ctx = SubstCtx {
+                file: Some(PathBuf::from(active)),
+                ..ctx()
+            };
+            delve_request(&resolve(&config(cfg), &ctx).unwrap())
+        };
+        let launch = |mode: &str, program: &str| {
+            format!(
+                r#"[{{ "name": "L", "type": "go", "request": "launch",
+                       "mode": "{mode}", "program": "{program}" }}]"#
+            )
+        };
+        let req = request(&launch("auto", "/w/cmd/app"), "/w/cmd/app/main.go");
+        assert_eq!(req["arguments"]["mode"], "debug");
+        assert_eq!(req["arguments"]["program"], "/w/cmd/app");
+
+        let req = request(&launch("auto", "/w/pkg/foo_test.go"), "/w/cmd/app/main.go");
+        assert_eq!(req["arguments"]["mode"], "test");
+        assert_eq!(
+            req["arguments"]["program"], "/w/pkg",
+            "delve tests the package"
+        );
+
+        // The repro's `${fileDirname}`: the active file decides.
+        let req = request(&launch("auto", "${fileDirname}"), "/w/pkg/foo_test.go");
+        assert_eq!(req["arguments"]["mode"], "test");
+        assert_eq!(req["arguments"]["program"], "/w/pkg");
+        let req = request(&launch("auto", "${fileDirname}"), "/w/pkg/foo.go");
+        assert_eq!(req["arguments"]["mode"], "debug");
+        assert_eq!(req["arguments"]["program"], "/w/pkg");
+
+        let req = request(&launch("exec", "/w/bin/app"), "/w/pkg/foo_test.go");
+        assert_eq!(req["arguments"]["mode"], "exec");
+        assert_eq!(req["arguments"]["program"], "/w/bin/app");
     }
 
     /// #1418: the Go extension's "Connect to server" config (attach, mode
