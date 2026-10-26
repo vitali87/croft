@@ -691,13 +691,6 @@ mod tests {
         );
     }
 
-    /// #846: the list was sized one row per channel and the box's border was
-    /// painted on its outer rows, so the first and last names replaced the
-    /// border; and the fill set only a background, keeping each cell's
-    /// symbol, so the log under the popup showed through its gaps
-    /// (`│i│ruffracebac│:`). The border now has rows of its own around the
-    /// names, the box is blanked first, and each name's click target is the
-    /// row it is drawn on.
     #[test]
     fn croft_loch_lifts_the_channel_dropdown_onto_its_raised_surface() {
         let loch = crate::theme::Theme::from_id("loch");
@@ -713,6 +706,13 @@ mod tests {
         assert_eq!(buf[(row.x, row.y)].bg, loch.surfaces().unwrap().raised());
     }
 
+    /// #846: the list was sized one row per channel and the box's border was
+    /// painted on its outer rows, so the first and last names replaced the
+    /// border; and the fill set only a background, keeping each cell's
+    /// symbol, so the log under the popup showed through its gaps
+    /// (`│i│ruffracebac│:`). The border now has rows of its own around the
+    /// names, the box is blanked first, and each name's click target is the
+    /// row it is drawn on.
     #[test]
     fn the_channel_dropdown_draws_its_names_inside_a_blank_bordered_box() {
         let mut p = OutputPanel::new();
