@@ -1653,10 +1653,12 @@ fn import_vscode(from: Option<PathBuf>, dry_run: bool) -> Result<()> {
     let mut report = crate::import_vscode::scan_profile(&dir)?;
     // Write first, report after (#1179): a reader that stops early (`| head`)
     // closes stdout, and whether the import lands must not depend on anyone
-    // reading about it. A failed write is returned once the report is out,
-    // so the user still sees what was being imported.
-    let applied =
-        (!dry_run && !report.is_empty()).then(|| crate::import_vscode::apply(&mut report));
+    // reading about it. A failed write is returned before the report too,
+    // since a closed stdout ends the process at its first line and the
+    // failure would go unsaid.
+    let applied = (!dry_run && !report.is_empty())
+        .then(|| crate::import_vscode::apply(&mut report))
+        .transpose()?;
     if let Some(reading) = reading {
         println!("{reading}");
     }
@@ -1751,7 +1753,7 @@ fn import_vscode(from: Option<PathBuf>, dry_run: bool) -> Result<()> {
         println!("  Open the Extensions panel (Cmd+Shift+X) to add an installable one.");
     }
 
-    let Some(applied) = applied else {
+    let Some(written) = applied else {
         if dry_run {
             println!("\nDry run: nothing was written.");
         } else {
@@ -1759,7 +1761,6 @@ fn import_vscode(from: Option<PathBuf>, dry_run: bool) -> Result<()> {
         }
         return Ok(());
     };
-    let written = applied?;
     if !report.conflicts.is_empty() {
         println!(
             "\n{} value{} croft already had, left alone:",
