@@ -152,7 +152,7 @@ impl Widget for &HoverPopup {
         Widget::render(Clear, area, buf);
         para.render(area, buf);
         if self.theme.gradient() {
-            crate::gradient::paint_gradient_box(buf, area);
+            crate::widgets::surface::paint_overlay_frame(buf, area, self.theme);
         }
         // Painted after the gradient, which redraws the border glyphs.
         let marker = Style::default().fg(self.theme.ui(Color::Rgb(0xd0, 0xd6, 0xe0)));

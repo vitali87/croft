@@ -2914,6 +2914,45 @@ impl CommandPalette {
     }
 }
 
+/// A keybinding hint as VS Code's keycaps: each key in its own `cap` chip,
+/// `+` between the keys of a chord and a space between chords, both in `sep`.
+fn keycaps(hint: &str, cap: Style, sep: Style) -> Vec<Span<'static>> {
+    let mut out = Vec::new();
+    for (i, chord) in hint.split(' ').filter(|c| !c.is_empty()).enumerate() {
+        if i > 0 {
+            out.push(Span::styled(" ", sep));
+        }
+        for (j, key) in chord_keys(chord).into_iter().enumerate() {
+            if j > 0 {
+                out.push(Span::styled("+", sep));
+            }
+            out.push(Span::styled(format!(" {key} "), cap));
+        }
+    }
+    out
+}
+
+/// The keys of one chord: `Ctrl+Shift+P` is Ctrl, Shift and P, and a `+`
+/// that is itself the key (`Ctrl++`) stays a key.
+fn chord_keys(chord: &str) -> Vec<&str> {
+    let mut keys = Vec::new();
+    let mut rest = chord;
+    while let Some(first) = rest.chars().next() {
+        let skip = first.len_utf8();
+        match rest[skip..].find('+') {
+            Some(k) => {
+                keys.push(&rest[..skip + k]);
+                rest = &rest[skip + k + 1..];
+            }
+            None => {
+                keys.push(rest);
+                break;
+            }
+        }
+    }
+    keys
+}
+
 pub fn render_command_palette(
     palette: &mut CommandPalette,
     area: Rect,
@@ -2964,7 +3003,7 @@ pub fn render_command_palette(
     };
     Widget::render(block, rect, buf);
     if theme.gradient() {
-        crate::gradient::paint_gradient_box(buf, rect);
+        crate::widgets::surface::paint_overlay_frame(buf, rect, theme);
         buf.set_span(rect.x + 1, rect.y, &title, title.width() as u16);
     }
     let sel_bg = if theme.gradient() {
@@ -3068,17 +3107,37 @@ pub fn render_command_palette(
         let prefix = if is_selected { "> " } else { "  " };
         let title = crate::i18n::tr(cmd.title());
         let hint = palette.hint_for(cmd);
+        // Croft Loch draws the chord as VS Code's keycaps: a chip per key.
+        let hint_spans: Vec<Span<'static>> = match theme.surfaces() {
+            Some(s) => {
+                let cap_bg = if is_selected {
+                    crate::gradient::rgb_color(crate::gradient::lerp_rgb(
+                        crate::gradient::POPUP_SEL_BG,
+                        (0xff, 0xff, 0xff),
+                        0.14,
+                    ))
+                } else {
+                    s.hairline()
+                };
+                let cap = Style::default()
+                    .bg(cap_bg)
+                    .fg(theme.ui(Color::Rgb(0xec, 0xef, 0xf4)));
+                keycaps(&hint, cap, hint_style)
+            }
+            // Borrowed as written unless the platform respells it.
+            None => vec![Span::styled(hint, hint_style)],
+        };
         // Right-align the keybinding hint: pad between the title and the hint
         // so the chord sits at the row's right edge, like VS Code.
-        let used = 2 + title.chars().count() + hint.chars().count();
+        let hint_w: usize = hint_spans.iter().map(Span::width).sum();
+        let used = 2 + title.chars().count() + hint_w;
         let pad = (list_rect.width as usize).saturating_sub(used).max(1);
-        let spans: Vec<Span<'static>> = vec![
+        let mut spans: Vec<Span<'static>> = vec![
             Span::styled(prefix.to_string(), row_style),
             Span::styled(title.to_string(), row_style),
             Span::styled(" ".repeat(pad), row_style),
-            // Borrowed as written unless the platform respells it.
-            Span::styled(hint, hint_style),
         ];
+        spans.extend(hint_spans);
         lines.push(Line::from(spans));
     }
     Widget::render(Paragraph::new(lines), list_rect, buf);
@@ -3090,6 +3149,53 @@ mod tests {
 
     fn builtin(c: Command) -> PaletteItem {
         PaletteItem::Builtin(c)
+    }
+
+    #[test]
+    fn a_chord_splits_into_its_keys() {
+        assert_eq!(chord_keys("Ctrl+Shift+P"), ["Ctrl", "Shift", "P"]);
+        assert_eq!(chord_keys("F12"), ["F12"]);
+        assert_eq!(chord_keys("Ctrl++"), ["Ctrl", "+"]);
+        assert_eq!(chord_keys("\u{2318}+K"), ["\u{2318}", "K"]);
+    }
+
+    #[test]
+    fn keycaps_put_each_key_in_a_chip() {
+        let cap = Style::default().bg(Color::Rgb(1, 2, 3));
+        let sep = Style::default();
+        let spans = keycaps("Ctrl+K Z", cap, sep);
+        let text: Vec<&str> = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, [" Ctrl ", "+", " K ", " ", " Z "]);
+        assert_eq!(spans[0].style, cap);
+        assert_eq!(spans[1].style, sep);
+    }
+
+    /// Croft Loch frames the palette as a card and shows chords
+    /// as keycaps; every other theme keeps the plain hint text.
+    #[test]
+    fn croft_loch_draws_the_palette_hint_as_keycaps() {
+        let render = |theme: crate::theme::Theme| {
+            let mut palette = CommandPalette::new();
+            palette.set_query("toggle terminal");
+            let area = Rect::new(0, 0, 100, 30);
+            let mut buf = Buffer::empty(area);
+            render_command_palette(&mut palette, area, &mut buf, theme, false);
+            (palette.last_rect, buf)
+        };
+        let (rect, buf) = render(crate::theme::Theme::from_id("loch"));
+        let row: String = (rect.x..rect.right())
+            .map(|x| buf[(x, rect.y + 3)].symbol().to_string())
+            .collect();
+        assert!(
+            row.contains(" Ctrl + J "),
+            "keycaps on the first row: {row:?}"
+        );
+        assert_eq!(buf[(rect.x, rect.y)].symbol(), "\u{2594}", "card top edge");
+        let (rect, buf) = render(crate::theme::Theme::BLACK);
+        let row: String = (rect.x..rect.right())
+            .map(|x| buf[(x, rect.y + 3)].symbol().to_string())
+            .collect();
+        assert!(row.contains("Ctrl+J"), "plain hint on Croft Black: {row:?}");
     }
 
     #[test]

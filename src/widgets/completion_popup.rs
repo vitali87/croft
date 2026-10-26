@@ -360,7 +360,7 @@ impl Widget for CompletionDetails<'_> {
             .wrap(ratatui::widgets::Wrap { trim: false })
             .render(area, buf);
         if theme.gradient() {
-            crate::gradient::paint_gradient_box(buf, area);
+            crate::widgets::surface::paint_overlay_frame(buf, area, theme);
         }
     }
 }
@@ -421,7 +421,7 @@ impl Widget for &CompletionPopup {
         state.select(Some(self.selected));
         StatefulWidget::render(list, area, buf, &mut state);
         if self.theme.gradient() {
-            crate::gradient::paint_gradient_box(buf, area);
+            crate::widgets::surface::paint_overlay_frame(buf, area, self.theme);
         }
     }
 }

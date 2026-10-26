@@ -5,7 +5,7 @@ use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Widget},
+    widgets::Widget,
 };
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -1547,17 +1547,21 @@ impl Widget for &mut FileTree {
                     .add_modifier(Modifier::BOLD),
             )
         };
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(block_style)
-            .title(title.clone());
+        let block =
+            crate::widgets::surface::view_block(self.theme, true, block_style).title(title.clone());
         let inner = block.inner(area);
         block.render(area, buf);
         // Black theme: replace the solid focus border with the orange→green
         // gradient (matching the welcome activity box), then re-stamp the
-        // title the gradient top edge just overwrote.
-        if self.focused && self.focus_gradient {
-            crate::gradient::paint_gradient_box(buf, area);
+        // title the gradient top edge just overwrote. Croft Loch marks focus
+        // with a rule along the top edge that leaves the title alone.
+        if crate::widgets::surface::paint_view_focus(
+            buf,
+            area,
+            self.theme,
+            self.focused,
+            self.focus_gradient,
+        ) {
             buf.set_span(area.x + 1, area.y, &title, title.width() as u16);
         }
         // The New File / New Folder / Refresh / Collapse toolbar is painted
@@ -1748,7 +1752,14 @@ impl Widget for &mut FileTree {
             // dark-teal fill (identical to the right-click menu's selection),
             // replacing the legacy bright-blue accent. Croft Dark keeps the
             // historical blue. The drop target stays green either way.
-            let (sel_bg, mark_bg) = if self.focus_gradient {
+            // Croft Loch greys the selection while the tree is unfocused
+            // (VS Code's `list.inactiveSelectionBackground`), so only the
+            // focused pane wears the accent.
+            let (sel_bg, mark_bg) = if let Some(s) = self.theme.surfaces()
+                && !self.focused
+            {
+                (s.hairline(), self.theme.ui(Color::Rgb(0x18, 0x35, 0x32)))
+            } else if self.focus_gradient {
                 (
                     crate::gradient::rgb_color(crate::gradient::POPUP_SEL_BG),
                     self.theme.ui(Color::Rgb(0x18, 0x35, 0x32)),
@@ -2553,6 +2564,38 @@ mod tests {
         (&mut tree).render(area, &mut buf);
         assert_eq!(tree.header_new_file_btn.width, 0);
         assert_eq!(tree.header_collapse_btn.width, 0);
+    }
+
+    /// Croft Loch: no box, a chrome surface, and the selection follows
+    /// VS Code's focus model: the accent while the tree has focus, grey
+    /// while another pane does. The rows sit where the boxed themes put them.
+    #[test]
+    fn croft_loch_explorer_is_an_unboxed_surface_with_a_focus_aware_selection() {
+        let loch = crate::theme::Theme::from_id("loch");
+        let s = loch.surfaces().unwrap();
+        let area = Rect::new(0, 0, 30, 8);
+        let render = |focused: bool| {
+            let (_tmp, mut tree) = fixture();
+            tree.theme = loch;
+            tree.focus_gradient = loch.gradient();
+            tree.focused = focused;
+            tree.selected = 0;
+            let mut buf = Buffer::empty(area);
+            (&mut tree).render(area, &mut buf);
+            (tree.last_inner, buf)
+        };
+        let (inner, unfocused) = render(false);
+        assert_eq!(inner, Rect::new(1, 1, 28, 6), "the boxed inset is kept");
+        assert_eq!(unfocused[(0, 3)].symbol(), " ", "no box on the left edge");
+        assert_eq!(unfocused[(0, 3)].bg, s.chrome());
+        assert_eq!(unfocused[(1, 1)].bg, s.hairline(), "grey while unfocused");
+        let (_, focused) = render(true);
+        assert_eq!(
+            focused[(1, 1)].bg,
+            crate::gradient::rgb_color(crate::gradient::POPUP_SEL_BG),
+            "the accent while focused"
+        );
+        assert_eq!(focused[(0, 0)].symbol(), "\u{2594}", "the focus rule");
     }
 
     #[test]

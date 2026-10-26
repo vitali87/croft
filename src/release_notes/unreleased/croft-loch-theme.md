@@ -1,0 +1,1 @@
+feature: Croft Loch, a new color theme beside Croft Black: the same black canvas and teal, with panes told apart by tone and hairline seams instead of line boxes, the brand gradient along the focused pane's top edge, and a card-style Command Palette that shows shortcuts as keycaps. Panes, splitters and click targets sit exactly where they do in every other theme.

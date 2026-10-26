@@ -10,7 +10,7 @@ use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Widget},
+    widgets::{Borders, Paragraph, Widget},
 };
 
 use crate::git::GraphCommit;
@@ -316,9 +316,11 @@ fn badge_of(decoration: &str) -> (&str, bool, bool) {
 
 impl Widget for &mut CommitGraphPanel {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let block = Block::default()
-            .borders(Borders::TOP)
-            .border_style(Style::default().fg(self.theme.ui(COLOR_DIM)));
+        let block = crate::widgets::surface::section_block(
+            self.theme,
+            Borders::TOP,
+            Style::default().fg(self.theme.ui(COLOR_DIM)),
+        );
         let inner = block.inner(area);
         block.render(area, buf);
         self.last_area = area;

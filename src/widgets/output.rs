@@ -549,7 +549,7 @@ impl OutputPanel {
         Clear.render(area, buf);
         buf.set_style(area, Style::default().bg(self.theme.editor_bg()));
         if pad == 1 {
-            crate::gradient::paint_gradient_box(buf, area);
+            crate::widgets::surface::paint_overlay_frame(buf, area, self.theme);
         }
         if overflow {
             let track = Rect {

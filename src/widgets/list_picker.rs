@@ -300,7 +300,7 @@ pub fn render_list_picker(
     };
     Widget::render(block, rect, buf);
     if theme.gradient() {
-        crate::gradient::paint_gradient_box(buf, rect);
+        crate::widgets::surface::paint_overlay_frame(buf, rect, theme);
         buf.set_span(rect.x + 1, rect.y, &title, title.width() as u16);
     }
     let sel_bg = if theme.gradient() {
