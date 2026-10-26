@@ -1,0 +1,1 @@
+fix: Go launch configurations with `"mode": "auto"`, the Go extension's default "Launch Package", start the debugger instead of failing: `auto` runs a `_test.go` program as a test of its package and anything else as a program.
