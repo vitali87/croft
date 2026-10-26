@@ -7,6 +7,7 @@
 
 use std::collections::HashSet;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 /// Rows fetched per table: the grid shows the head of large tables,
 /// with the truth stated in the sheet name.
@@ -60,15 +61,47 @@ impl TablePage {
 /// What the grid shows for a SQL NULL.
 pub const NULL_LABEL: &str = "NULL";
 
-/// Fetch one page of a table or view (#201 review: real paging, not a
-/// permanent head snapshot).
-pub fn table_page(path: &Path, table: &str, page: usize) -> Result<TablePage, String> {
+/// How long one query over a view may run before it is stopped (#1002). A
+/// view is a query the database file defines, and `LIMIT` bounds the rows
+/// it returns, not the work behind them: an aggregate over a huge join, or
+/// a recursive CTE that never ends, would otherwise freeze croft on open,
+/// since every view's first page is fetched then, on the UI thread.
+pub const VIEW_BUDGET: Duration = Duration::from_secs(1);
+
+/// A read-only connection for querying `table`, and whether it is a view.
+/// A view's queries are stopped once they run past [`VIEW_BUDGET`].
+fn open_for(path: &Path, table: &str) -> Result<(rusqlite::Connection, bool), String> {
     let conn = rusqlite::Connection::open_with_flags(
         path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .map_err(|e| e.to_string())?;
     let view = is_view(&conn, table);
+    if view {
+        let start = Instant::now();
+        conn.progress_handler(10_000, Some(move || start.elapsed() > VIEW_BUDGET))
+            .map_err(|e| e.to_string())?;
+    }
+    Ok((conn, view))
+}
+
+/// A query error as the sheet or status bar says it: a view stopped by
+/// [`VIEW_BUDGET`] says so rather than SQLite's bare "interrupted".
+fn query_error(e: rusqlite::Error) -> String {
+    if e.sqlite_error_code() == Some(rusqlite::ErrorCode::OperationInterrupted) {
+        format!(
+            "stopped after {} s: the view takes too long to compute",
+            VIEW_BUDGET.as_secs()
+        )
+    } else {
+        e.to_string()
+    }
+}
+
+/// Fetch one page of a table or view (#201 review: real paging, not a
+/// permanent head snapshot).
+pub fn table_page(path: &Path, table: &str, page: usize) -> Result<TablePage, String> {
+    let (conn, view) = open_for(path, table)?;
     let quoted = format!("\"{}\"", table.replace('"', "\"\""));
     // One row past the page says whether more follow. `COUNT(*)` gave an
     // exact total, but SQLite keeps no row count: it scanned every table in
@@ -80,7 +113,7 @@ pub fn table_page(path: &Path, table: &str, page: usize) -> Result<TablePage, St
         .prepare(&format!(
             "SELECT * FROM {quoted} LIMIT {probe} OFFSET {offset}"
         ))
-        .map_err(|e| e.to_string())?;
+        .map_err(query_error)?;
     let headers: Vec<String> = stmt
         .column_names()
         .into_iter()
@@ -89,8 +122,8 @@ pub fn table_page(path: &Path, table: &str, page: usize) -> Result<TablePage, St
     let ncols = headers.len();
     let mut body: Vec<Vec<String>> = Vec::new();
     let mut nulls = HashSet::new();
-    let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
-    while let Some(row) = rows.next().map_err(|e| e.to_string())? {
+    let mut rows = stmt.query([]).map_err(query_error)?;
+    while let Some(row) = rows.next().map_err(query_error)? {
         let mut out = Vec::with_capacity(ncols);
         for i in 0..ncols {
             use rusqlite::types::ValueRef;
@@ -124,15 +157,11 @@ pub fn table_page(path: &Path, table: &str, page: usize) -> Result<TablePage, St
 /// scan, the same as the OFFSET fetch of that page does, so it runs only
 /// when asked for the end, never on open or on a page turn.
 pub fn last_page(path: &Path, table: &str) -> Result<usize, String> {
-    let conn = rusqlite::Connection::open_with_flags(
-        path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(|e| e.to_string())?;
+    let (conn, _) = open_for(path, table)?;
     let quoted = format!("\"{}\"", table.replace('"', "\"\""));
     let rows: i64 = conn
         .query_row(&format!("SELECT count(*) FROM {quoted}"), [], |r| r.get(0))
-        .map_err(|e| e.to_string())?;
+        .map_err(query_error)?;
     Ok((rows.max(1) as usize - 1) / ROW_CAP)
 }
 
@@ -314,6 +343,35 @@ mod tests {
             format!("t: rows {}-{}", ROW_CAP + 1, ROW_CAP + 7)
         );
         assert_eq!(data.row_base, ROW_CAP);
+    }
+
+    /// #1002 review: a view is a query the file defines, and one that never
+    /// returns a row must not freeze the open. It is stopped at
+    /// [`VIEW_BUDGET`] and its sheet says so; the tables still open.
+    #[test]
+    fn a_view_that_never_finishes_is_stopped_instead_of_freezing_the_open() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("forever.db");
+        rusqlite::Connection::open(&p)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE t (a INTEGER); INSERT INTO t VALUES (1);
+                 CREATE VIEW forever AS
+                   WITH RECURSIVE r(x) AS (VALUES(1) UNION ALL SELECT x FROM r)
+                   SELECT count(*) FROM r;",
+            )
+            .unwrap();
+        let start = Instant::now();
+        let view = open_database(&p).unwrap();
+        assert!(start.elapsed() < VIEW_BUDGET * 5, "{:?}", start.elapsed());
+        let names: Vec<&str> = view.sheets.iter().map(|s| s.name.as_str()).collect();
+        assert!(
+            names[0].starts_with("forever (view): stopped after"),
+            "{names:?}"
+        );
+        assert_eq!(names[1], "t: 1 rows");
+        let err = last_page(&p, "forever").unwrap_err();
+        assert!(err.starts_with("stopped after"), "{err}");
     }
 
     /// #1222: the last page's index, and 0 for an empty or one-page table.
