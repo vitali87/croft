@@ -83,7 +83,7 @@ src/
 ├── shell_integration.rs  OSC 133 / 7 / 9 shell integration: `OscSniffer` intercepts the marks alacritty drops, plus the per-shell rc shims that emit them
 ├── word_suggest.rs       word-based completion (#1566, VS Code's `editor.wordBasedSuggestions`): the words of the open documents, nearest the caret first, offered on Ctrl+Space when no language server reports on the file (at once) or a server answers with nothing; `word_based_suggestions` picks the documents (current, same language, all, or off), and a `.` typed never opens them
 ├── snippets.rs           user snippets from `~/.config/croft/snippets.json` (VS Code format); `parse_body` turns tab-stop syntax and variables into insert text plus ordered stops, and matches are injected into the completion popup; reloads on save
-├── sqlite_view.rs        read-only SQLite browser: each table becomes a worksheet in the existing sheet grid, rows capped at 500 with the true count in the name, opened `SQLITE_OPEN_READONLY` over bundled sqlite3 so a live database is never locked or mutated
+├── sqlite_view.rs        read-only SQLite browser: each table and view becomes a worksheet in the existing sheet grid, rows capped at 500 with the true count in the name, opened `SQLITE_OPEN_READONLY` over bundled sqlite3 so a live database is never locked or mutated
 ├── svg.rs                SVG file-preview rasterisation: `usvg` parse plus resvg render into a PNG the standard image-overlay pipeline consumes; the vector render happens once per open, resizes refit the stored PNG, and a parse failure falls through to the XML source
 ├── symbol_range.rs       keeping a symbol view pointed at its symbol while the file changes: an edit above shifts the range, below moves nothing, inside grows or shrinks it
 ├── tasks.rs              auto-detected project tasks read from the manifests the repo already has (tasks.json, Makefile, justfile, package.json, Cargo.toml, pyproject.toml, go.mod, CMakeLists.txt); backs "Tasks: Run Task" and the Cmd+Shift+B default build in a reused named terminal pane
@@ -1352,7 +1352,7 @@ User snippets loaded from `~/.config/croft/snippets.json` in VS Code format: pre
 
 ### sqlite_view.rs
 
-A read-only SQLite browser. Every table becomes a worksheet in the existing sheet grid, so navigation, the cell cursor and Tab table-switching are all reused. Rows are capped at 500 with the true count shown in the sheet name, and cells are typed (NULL empty, blobs summarised). Files are routed both by extension and by the magic-byte sniff.
+A read-only SQLite browser. Every table and view becomes a worksheet in the existing sheet grid, so navigation, the cell cursor and Tab table-switching are all reused; a view's sheet is labelled `(view)`, and one over a dropped table names its error instead of failing the open. Rows are capped at 500 with the true count shown in the sheet name, and cells are typed (blobs summarised). A NULL is stored as an empty cell and marked in `SheetData::null_cells`, so the grid draws it as a dimmed `NULL` apart from `''`; the grid also shows a cell's control characters as glyphs (`⏎`, `→`) rather than dropping them. Files are routed both by extension and by the magic-byte sniff.
 
 **Read-only over the bundled sqlite3.** It opens with `SQLITE_OPEN_READONLY` over the BUNDLED sqlite3, so there is no system dependency, and a live application database is never locked, mutated, or created. Locked or corrupt files surface their error.
 

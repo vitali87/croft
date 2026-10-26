@@ -1,10 +1,11 @@
-//! Read-only SQLite browser (#182): every table becomes a "worksheet"
-//! in the existing sheet grid, so navigation, the cell cursor, and
-//! Tab-switching between tables all reuse. Databases open with
+//! Read-only SQLite browser (#182): every table and view becomes a
+//! "worksheet" in the existing sheet grid, so navigation, the cell cursor,
+//! and Tab-switching between tables all reuse. Databases open with
 //! SQLITE_OPEN_READONLY: read-only, never mutated or created (readers
 //! still take sqlite's shared read locks while a query runs), rows are capped per table, and a locked or corrupt
 //! file surfaces its error instead of crashing.
 
+use std::collections::HashSet;
 use std::path::Path;
 
 /// Rows fetched per table: the grid shows the head of large tables,
@@ -19,10 +20,47 @@ pub fn extension_is_sqlite(ext: &str) -> bool {
     )
 }
 
-/// One fetched table page: headers, rows, and whether rows follow it.
-pub type TablePage = (Vec<String>, Vec<Vec<String>>, bool);
+/// One fetched page of a table or view.
+#[derive(Debug)]
+pub struct TablePage {
+    pub headers: Vec<String>,
+    pub rows: Vec<Vec<String>>,
+    /// `(row, col)` of the cells holding SQL NULL (#1002), which `rows`
+    /// carries as empty strings: the grid draws them as a dimmed `NULL`, so
+    /// they read apart from `''`.
+    pub nulls: HashSet<(usize, usize)>,
+    /// Whether rows follow this page.
+    pub more: bool,
+    /// Whether the name is a view rather than a table (#1002).
+    pub view: bool,
+}
 
-/// Fetch one page of a table (#201 review: real paging, not a
+impl TablePage {
+    /// The page as the sheet the grid shows: labelled by its place in the
+    /// table, numbered from there (#1222), its NULLs marked.
+    pub fn into_sheet(self, table: &str, page: usize) -> crate::sheet::SheetData {
+        let name = if self.view {
+            format!("{table} (view)")
+        } else {
+            table.to_string()
+        };
+        let label = page_label(&name, page, self.rows.len(), self.more);
+        let mut data = crate::sheet::sheet_data_from_parts(label, self.headers, self.rows);
+        data.row_base = page * ROW_CAP;
+        for &(_, col) in &self.nulls {
+            if let Some(w) = data.col_widths.get_mut(col) {
+                *w = (*w).max(NULL_LABEL.len() as u16);
+            }
+        }
+        data.null_cells = self.nulls;
+        data
+    }
+}
+
+/// What the grid shows for a SQL NULL.
+pub const NULL_LABEL: &str = "NULL";
+
+/// Fetch one page of a table or view (#201 review: real paging, not a
 /// permanent head snapshot).
 pub fn table_page(path: &Path, table: &str, page: usize) -> Result<TablePage, String> {
     let conn = rusqlite::Connection::open_with_flags(
@@ -30,6 +68,7 @@ pub fn table_page(path: &Path, table: &str, page: usize) -> Result<TablePage, St
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .map_err(|e| e.to_string())?;
+    let view = is_view(&conn, table);
     let quoted = format!("\"{}\"", table.replace('"', "\"\""));
     // One row past the page says whether more follow. `COUNT(*)` gave an
     // exact total, but SQLite keeps no row count: it scanned every table in
@@ -49,13 +88,17 @@ pub fn table_page(path: &Path, table: &str, page: usize) -> Result<TablePage, St
         .collect();
     let ncols = headers.len();
     let mut body: Vec<Vec<String>> = Vec::new();
+    let mut nulls = HashSet::new();
     let mut rows = stmt.query([]).map_err(|e| e.to_string())?;
     while let Some(row) = rows.next().map_err(|e| e.to_string())? {
         let mut out = Vec::with_capacity(ncols);
         for i in 0..ncols {
             use rusqlite::types::ValueRef;
             let cell = match row.get_ref(i).map_err(|e| e.to_string())? {
-                ValueRef::Null => String::new(),
+                ValueRef::Null => {
+                    nulls.insert((body.len(), i));
+                    String::new()
+                }
                 ValueRef::Integer(v) => v.to_string(),
                 ValueRef::Real(v) => v.to_string(),
                 ValueRef::Text(t) => String::from_utf8_lossy(t).into_owned(),
@@ -67,7 +110,14 @@ pub fn table_page(path: &Path, table: &str, page: usize) -> Result<TablePage, St
     }
     let more = body.len() > ROW_CAP;
     body.truncate(ROW_CAP);
-    Ok((headers, body, more))
+    nulls.retain(|&(row, _)| row < ROW_CAP);
+    Ok(TablePage {
+        headers,
+        rows: body,
+        nulls,
+        more,
+        view,
+    })
 }
 
 /// The index of a table's last page (#1222), for Ctrl+End. Counting costs a
@@ -98,8 +148,8 @@ pub fn page_label(table: &str, page: usize, got: usize, more: bool) -> String {
     format!("{table}: rows {first}-{last}{tail}")
 }
 
-/// Build a sheet view over the database: one SheetData per table with
-/// up to [`ROW_CAP`] rows, headers from the column names, and a name
+/// Build a sheet view over the database: one SheetData per table and view
+/// with up to [`ROW_CAP`] rows, headers from the column names, and a name
 /// that states row counts honestly.
 pub fn open_database(path: &Path) -> Result<crate::sheet::SheetView, String> {
     let meta = std::fs::metadata(path).map_err(|e| e.to_string())?;
@@ -111,7 +161,7 @@ pub fn open_database(path: &Path) -> Result<crate::sheet::SheetView, String> {
     let mut names: Vec<String> = Vec::new();
     {
         let mut stmt = conn
-            .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name")
+            .prepare("SELECT name FROM sqlite_master WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%' ORDER BY name")
             .map_err(|e| e.to_string())?;
         let rows = stmt
             .query_map([], |r| r.get::<_, String>(0))
@@ -125,18 +175,32 @@ pub fn open_database(path: &Path) -> Result<crate::sheet::SheetView, String> {
     }
     let mut sheets = Vec::new();
     for name in &names {
-        let (headers, body, more) = table_page(path, name, 0)?;
-        let got = body.len();
-        sheets.push(crate::sheet::sheet_data_from_parts(
-            page_label(name, 0, got, more),
-            headers,
-            body,
-        ));
+        match table_page(path, name, 0) {
+            Ok(page) => sheets.push(page.into_sheet(name, 0)),
+            // A view over a table that is gone fails only when queried; it
+            // is the one sheet that says so, not a database that won't open.
+            Err(e) if is_view(&conn, name) => sheets.push(crate::sheet::sheet_data_from_parts(
+                format!("{name} (view): {e}"),
+                Vec::new(),
+                Vec::new(),
+            )),
+            Err(e) => return Err(e),
+        }
     }
     let mut view =
         crate::sheet::view_from_sheets(crate::sheet::SheetKind::Sqlite, meta.len(), sheets);
     view.sqlite_pages = names.into_iter().map(|n| (n, 0usize)).collect();
     Ok(view)
+}
+
+/// Whether `name` is a view rather than a table.
+fn is_view(conn: &rusqlite::Connection, name: &str) -> bool {
+    conn.query_row(
+        "SELECT type FROM sqlite_master WHERE name = ?1",
+        [name],
+        |r| r.get::<_, String>(0),
+    )
+    .is_ok_and(|t| t == "view")
 }
 
 #[cfg(test)]
@@ -169,8 +233,61 @@ mod tests {
         assert_eq!(fruit.headers, vec!["id", "name", "price", "pic"]);
         assert_eq!(fruit.cell(0, 1), "apple");
         assert_eq!(fruit.cell(0, 3), "<blob 2 bytes>");
-        assert_eq!(fruit.cell(1, 2), "", "NULL renders empty");
+        assert_eq!(fruit.cell(1, 2), "", "NULL is stored empty");
+        assert!(fruit.null_cells.contains(&(1, 2)), "and marked as NULL");
+        assert!(!fruit.null_cells.contains(&(0, 2)));
         assert!(fruit.name.contains("2 rows"));
+    }
+
+    /// #1002: NULL reads apart from `''`, text keeps its newlines and tabs
+    /// (the grid shows them), and views are listed beside the tables,
+    /// labelled, and paged the same way. A view over a dropped table is a
+    /// sheet that says why, not a database that will not open.
+    #[test]
+    fn nulls_views_and_multiline_text_come_through() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("shop.db");
+        let conn = rusqlite::Connection::open(&p).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE customers (name TEXT, country TEXT, notes TEXT);
+             INSERT INTO customers VALUES ('Ann', NULL, ''), ('Bo', '', 'line1' || char(10) || 'line2' || char(9) || 'tabbed');
+             CREATE TABLE orders (id INTEGER, total REAL);
+             INSERT INTO orders VALUES (1, 5.0), (2, 250.0);
+             CREATE VIEW big_orders AS SELECT id FROM orders WHERE total > 100;
+             CREATE TABLE gone (a INTEGER);
+             CREATE VIEW stale AS SELECT a FROM gone;
+             DROP TABLE gone;",
+        )
+        .unwrap();
+        drop(conn);
+        let view = open_database(&p).unwrap();
+        let names: Vec<&str> = view.sheets.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names.len(), 4, "{names:?}");
+        assert_eq!(names[0], "big_orders (view): 1 rows", "{names:?}");
+        assert!(names[3].starts_with("stale (view): "), "{names:?}");
+        let pages: Vec<&str> = view.sqlite_pages.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(pages, ["big_orders", "customers", "orders", "stale"]);
+        assert_eq!(view.sheets[0].cell(0, 0), "2");
+
+        let customers = &view.sheets[1];
+        assert!(
+            customers.null_cells.contains(&(0, 1)),
+            "Ann's country is NULL"
+        );
+        assert!(!customers.null_cells.contains(&(1, 1)), "Bo's is ''");
+        assert!(
+            !customers.null_cells.contains(&(0, 2)),
+            "Ann's notes are ''"
+        );
+        assert_eq!(customers.cell(1, 2), "line1\nline2\ttabbed");
+
+        let page = table_page(&p, "big_orders", 0).unwrap();
+        assert!(page.view && !page.more);
+        assert_eq!(
+            page.into_sheet("big_orders", 0).name,
+            "big_orders (view): 1 rows"
+        );
+        assert_eq!(last_page(&p, "big_orders"), Ok(0));
     }
 
     #[test]
@@ -183,18 +300,20 @@ mod tests {
             ROW_CAP + 7
         ))
         .unwrap();
-        let (_, rows, more) = table_page(&p, "t", 0).unwrap();
-        assert_eq!((rows.len(), more), (ROW_CAP, true));
+        let page = table_page(&p, "t", 0).unwrap();
+        assert_eq!((page.rows.len(), page.more), (ROW_CAP, true));
         assert_eq!(
-            page_label("t", 0, rows.len(), more),
+            page_label("t", 0, page.rows.len(), page.more),
             format!("t: rows 1-{ROW_CAP}, more follow")
         );
-        let (_, rows, more) = table_page(&p, "t", 1).unwrap();
-        assert_eq!((rows.len(), more), (7, false));
+        let page = table_page(&p, "t", 1).unwrap();
+        assert_eq!((page.rows.len(), page.more), (7, false));
+        let data = page.into_sheet("t", 1);
         assert_eq!(
-            page_label("t", 1, rows.len(), more),
+            data.name,
             format!("t: rows {}-{}", ROW_CAP + 1, ROW_CAP + 7)
         );
+        assert_eq!(data.row_base, ROW_CAP);
     }
 
     /// #1222: the last page's index, and 0 for an empty or one-page table.

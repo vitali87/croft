@@ -132,6 +132,11 @@ pub struct SheetData {
     /// up only what changed since its last write, sees a grid change
     /// without comparing the cells.
     pub revision: u64,
+    /// `(row, col)` of the cells holding SQL NULL (#1002), drawn as a
+    /// dimmed `NULL` rather than as the empty string they store. Only a
+    /// SQLite page has any, and its rows never move: sorting and row edits
+    /// are CSV/TSV only.
+    pub null_cells: std::collections::HashSet<(usize, usize)>,
 }
 
 impl SheetData {
@@ -162,6 +167,7 @@ pub fn sheet_data_from_parts(
         origin: (0, 0),
         row_base: 0,
         revision: 0,
+        null_cells: Default::default(),
     }
 }
 
@@ -334,6 +340,7 @@ pub fn parse_delimited(bytes: &[u8], delim: u8, sheet_name: &str) -> Result<Shee
         origin: (0, 0),
         row_base: 0,
         revision: 0,
+        null_cells: Default::default(),
     })
 }
 
@@ -1082,6 +1089,7 @@ fn read_calamine_workbook(path: &Path, kind: SheetKind) -> Result<Vec<SheetData>
             origin,
             row_base: 0,
             revision: 0,
+            null_cells: Default::default(),
         });
     }
     let _ = Data::Empty; // keeps the import explicit even if unused above

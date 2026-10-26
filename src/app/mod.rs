@@ -74227,11 +74227,8 @@ impl App {
             return;
         };
         match crate::sqlite_view::table_page(&path, &table, next) {
-            Ok((headers, rows, more)) if !rows.is_empty() || next == 0 => {
-                let got = rows.len();
-                let label = crate::sqlite_view::page_label(&table, next, got, more);
-                let mut data = crate::sheet::sheet_data_from_parts(label, headers, rows);
-                data.row_base = next * crate::sqlite_view::ROW_CAP;
+            Ok(page) if !page.rows.is_empty() || next == 0 => {
+                let mut data = page.into_sheet(&table, next);
                 if at_end {
                     data.cur_row = data.row_count().saturating_sub(1);
                 }
