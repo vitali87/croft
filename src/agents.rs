@@ -17,6 +17,53 @@ use std::time::Duration;
 
 use regex::Regex;
 
+/// Whether a foreground process is a script runtime (#1380), whose name
+/// says nothing about what it runs: Codex CLI and Gemini CLI installed with
+/// npm run as `node`. Only these pay the argv read [`script_name`] needs.
+pub fn is_script_runtime(process_name: &str) -> bool {
+    let base = process_name.rsplit('/').next().unwrap_or(process_name);
+    let base = base.trim().to_lowercase();
+    matches!(base.as_str(), "node" | "nodejs" | "bun" | "deno")
+        || base
+            .strip_prefix("python")
+            .is_some_and(|v| v.chars().all(|c| c.is_ascii_digit() || c == '.'))
+}
+
+/// The script a runtime's `argv` runs, by basename less a script extension:
+/// `node ~/.npm-global/bin/gemini` is `gemini`, `node …/codex/bin/codex.js`
+/// is `codex`, and `python -m aider` is `aider`. Runtime flags are skipped,
+/// with the value of those that take one; `None` for code passed with
+/// `-e`/`-c` or a bare REPL.
+pub fn script_name(argv: &[String]) -> Option<String> {
+    let mut args = argv.iter().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-e" | "--eval" | "-p" | "--print" | "-c" => return None,
+            "-m" => return args.next().map(|m| m.trim().to_lowercase()),
+            "-r"
+            | "--require"
+            | "--import"
+            | "--loader"
+            | "--experimental-loader"
+            | "-C"
+            | "--conditions" => {
+                args.next();
+            }
+            a if a.starts_with('-') => {}
+            script => {
+                let base = Path::new(script).file_name()?.to_string_lossy();
+                let stem = [".js", ".mjs", ".cjs", ".ts", ".mts", ".py"]
+                    .iter()
+                    .find_map(|ext| base.strip_suffix(ext))
+                    .unwrap_or(&base);
+                let stem = stem.trim().to_lowercase();
+                return (!stem.is_empty()).then_some(stem);
+            }
+        }
+    }
+    None
+}
+
 /// One recognised agent: the badge it wears, the process names that mean
 /// it, and the prompt shapes that mean it is waiting on the user.
 #[derive(Debug, Clone)]
@@ -278,6 +325,16 @@ impl AgentTable {
             .find(|k| k.process.iter().any(|p| p.eq_ignore_ascii_case(&base)))
     }
 
+    /// The name a pane's foreground process is classified by (#1380): the
+    /// script a runtime runs ([`script_name`]) when that names an agent, so
+    /// `node …/bin/gemini` is gemini; else the process's own name, so a row
+    /// that names the runtime itself still matches.
+    pub fn sample_name<'a>(&self, process_name: &'a str, script: Option<&'a str>) -> &'a str {
+        script
+            .filter(|s| self.classify(s).is_some())
+            .unwrap_or(process_name)
+    }
+
     pub fn names(&self) -> Vec<&str> {
         self.kinds.iter().map(|k| k.name.as_str()).collect()
     }
@@ -413,6 +470,87 @@ mod tests {
         for not in ["zsh", "node", "cargo", "", "claudette", "/usr/bin/vim"] {
             assert!(t.classify(not).is_none(), "{not:?} is not an agent");
         }
+    }
+
+    fn argv(args: &[&str]) -> Vec<String> {
+        args.iter().map(|a| a.to_string()).collect()
+    }
+
+    /// #1380: Codex CLI and Gemini CLI installed with npm run as `node`. The
+    /// script node runs names them; other node programs stay unbadged, and
+    /// a native binary is classified by its own name without an argv read.
+    #[test]
+    fn an_agent_run_by_a_script_runtime_is_recognised_by_its_script() {
+        let t = AgentTable::builtin();
+        let who = |name: &str, args: &[&str]| {
+            let script = is_script_runtime(name)
+                .then(|| script_name(&argv(args)))
+                .flatten();
+            t.classify(t.sample_name(name, script.as_deref()))
+                .map(|k| k.name.clone())
+        };
+        assert_eq!(
+            who("node", &["node", "/home/u/.npm-global/bin/gemini"]).as_deref(),
+            Some("gemini")
+        );
+        assert_eq!(
+            who(
+                "node",
+                &[
+                    "/usr/bin/node",
+                    "/usr/lib/node_modules/@openai/codex/bin/codex.js"
+                ]
+            )
+            .as_deref(),
+            Some("codex")
+        );
+        assert_eq!(
+            who(
+                "node",
+                &[
+                    "node",
+                    "--no-warnings",
+                    "--require",
+                    "./hook.js",
+                    "/u/bin/gemini"
+                ]
+            )
+            .as_deref(),
+            Some("gemini"),
+            "flags, and a flag's value, are not the script"
+        );
+        assert_eq!(
+            who("python3", &["python3", "-m", "aider"]).as_deref(),
+            Some("aider")
+        );
+        for (name, args) in [
+            ("node", &["node", "vite.js"][..]),
+            ("node", &["node", "server.js"]),
+            ("node", &["node", "-e", "require('gemini')"]),
+            ("node", &["node"]),
+            ("python3.12", &["python3.12", "manage.py", "runserver"]),
+        ] {
+            assert_eq!(who(name, args), None, "{args:?} is not an agent");
+        }
+        // A native binary never asks for argv.
+        assert!(!is_script_runtime("claude") && !is_script_runtime("codex"));
+        assert!(is_script_runtime("/usr/bin/node") && is_script_runtime("python3.12"));
+        assert!(!is_script_runtime("pythonista"));
+        assert_eq!(who("claude", &[]).as_deref(), Some("claude"));
+    }
+
+    /// #1380: a row that names the runtime itself, the old workaround,
+    /// still badges its panes when the script names no agent.
+    #[test]
+    fn a_row_naming_the_runtime_still_matches_a_script_that_is_no_agent() {
+        let t = AgentTable::from_json(r#"[{ "name": "mybot", "process": ["node"] }]"#);
+        assert_eq!(t.sample_name("node", Some("vite")), "node");
+        assert_eq!(
+            t.classify(t.sample_name("node", Some("vite")))
+                .map(|k| k.name.as_str()),
+            Some("mybot")
+        );
+        assert_eq!(t.sample_name("node", Some("gemini")), "gemini");
     }
 
     #[test]
