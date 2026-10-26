@@ -582,8 +582,9 @@ each tick). Instructions come in-editor (`Cmd+K Q`), so a start task is not
 persisted: it would re-fire on every launch, and an `@file` task would freeze
 the tick thread on seat, since the owner that must serve the file *is* that
 thread. The hidden `--repl` flag still takes a one-shot task for the old
-terminal driver. `croft pair --off` or the "Navigator: Activate or Deactivate"
-palette entry unseats it.
+terminal driver; a task without `--repl` is a usage error, and the task
+argument is hidden with the flag. `croft pair --off` or the "Navigator:
+Activate or Deactivate" palette entry unseats it.
 
 **The owner-seat requirement.** The pilot's guest seat bootstraps files via
 SnapshotRequest, and only a collab OWNER answers. A plain `croft` launch has no

@@ -318,7 +318,11 @@ pub enum CliCommand {
         /// The name this collaborator's caret wears on peers' screens.
         #[arg(long)]
         name: Option<String>,
-        /// A first task to send once seated.
+        /// A first task for the --repl driver to send once seated.
+        // Hidden with --repl and refused without it: the resident navigator
+        // takes its instructions in-editor (Cmd+K Q), so a task accepted
+        // here would be dropped on the floor (#1908).
+        #[arg(requires = "repl", hide = true)]
         task: Option<String>,
         /// Backend that seats the pilot: "claude" (default, the claude CLI)
         /// or "ollama" (a direct Anthropic-compatible local endpoint —
@@ -984,13 +988,6 @@ impl Cli {
                      within a second (croft pair --off deactivates)",
                     workspace.display()
                 );
-                if task.is_some() {
-                    println!(
-                        "note: the resident navigator ignores a start task; \
-                         ask it in-editor with Cmd+K Q (use --repl for the \
-                         one-shot terminal driver)"
-                    );
-                }
                 Ok(())
             }
             Some(CliCommand::SetupCross { yes }) => setup_cross(yes),
@@ -3174,6 +3171,7 @@ mod tests {
             "claude-haiku-4-5-20251001",
             "--name",
             "navigator",
+            "--repl",
             "fix the loop in src/f.rs",
         ]);
         match cli.command {
@@ -3185,7 +3183,7 @@ mod tests {
                 provider: None,
                 base_url: None,
                 off: false,
-                repl: false,
+                repl: true,
             }) => {
                 assert_eq!(workspace, Some(PathBuf::from("/w")));
                 assert_eq!(model.as_deref(), Some("claude-haiku-4-5-20251001"));
@@ -3220,6 +3218,33 @@ mod tests {
             cli.command,
             Some(CliCommand::Pair { repl: true, .. })
         ));
+    }
+
+    /// #1908: only the --repl driver sends a start task, so a task without
+    /// --repl is a usage error instead of a note that it was ignored, and
+    /// `croft pair --help`, which hides --repl, does not offer one either.
+    #[test]
+    fn pair_task_is_refused_and_hidden_without_repl() {
+        let err = Cli::try_parse_from(["croft", "pair", "explain check_loop"])
+            .expect_err("a task without --repl is refused");
+        assert_eq!(err.kind(), clap::error::ErrorKind::MissingRequiredArgument);
+        let cli = Cli::try_parse_from(["croft", "pair", "--repl", "explain check_loop"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(CliCommand::Pair { repl: true, task: Some(ref t), .. }) if t == "explain check_loop"
+        ));
+        let mut cmd = <Cli as clap::CommandFactory>::command();
+        let help = cmd
+            .find_subcommand_mut("pair")
+            .expect("pair subcommand")
+            .render_long_help()
+            .to_string();
+        for absent in ["TASK", "first task"] {
+            assert!(
+                !help.contains(absent),
+                "{absent:?} is offered by `croft pair --help`: {help}"
+            );
+        }
     }
 
     /// `--provider ollama --base-url <url>` parses; anything but
