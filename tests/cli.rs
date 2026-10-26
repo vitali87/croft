@@ -212,9 +212,13 @@ fn pair_off_and_reactivation_keep_the_recorded_backend() {
         "the ollama endpoint must not survive a provider switch: {r}"
     );
     assert!(!r.contains("qwen3-coder:30b"), "{r}");
-    // Activation detached a relay for the workspace; reap it so test runs
-    // do not accumulate idle processes.
-    let sessions = home.path().join(".cache/croft/sessions");
+    reap_pair_relays(home.path());
+}
+
+/// Activation detaches a relay for the workspace; reap the ones under
+/// `home` so test runs do not accumulate idle processes.
+fn reap_pair_relays(home: &std::path::Path) {
+    let sessions = home.join(".cache/croft/sessions");
     if let Ok(entries) = std::fs::read_dir(&sessions) {
         for e in entries.filter_map(|e| e.ok()) {
             let p = e.path();
@@ -225,6 +229,67 @@ fn pair_off_and_reactivation_keep_the_recorded_backend() {
             }
         }
     }
+}
+
+/// #1907: the navigator's name persists like its model. A plain `croft pair`
+/// or `croft pair --off` keeps the recorded name instead of renaming the
+/// seat back to `claude`; only an explicit `--name` changes it.
+#[test]
+fn pair_rerun_without_name_keeps_the_recorded_name() {
+    // A SHORT home, for the relay socket's AF_UNIX path limit (see above).
+    let home = tempfile::Builder::new()
+        .prefix("h")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let ws = tempfile::tempdir().unwrap();
+    let run = |args: &[&str]| {
+        let out = Command::cargo_bin("croft")
+            .unwrap()
+            .args(args)
+            .arg("--workspace")
+            .arg(ws.path())
+            .env("HOME", home.path())
+            .assert()
+            .success();
+        String::from_utf8(out.get_output().stdout.clone()).unwrap()
+    };
+    let read = || {
+        let dir = home.path().join(".cache/croft/sessions");
+        let path = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| p.to_string_lossy().ends_with(".pair.json"))
+            .expect("a pair record exists");
+        std::fs::read_to_string(path).unwrap()
+    };
+    run(&[
+        "pair",
+        "--name",
+        "navigator",
+        "--model",
+        "claude-haiku-4-5-20251001",
+    ]);
+    assert!(read().contains("\"name\":\"navigator\""));
+    run(&["pair", "--off"]);
+    let r = read();
+    assert!(r.contains("\"enabled\":false"), "{r}");
+    assert!(
+        r.contains("\"name\":\"navigator\""),
+        "--off keeps the name: {r}"
+    );
+    let out = run(&["pair"]);
+    let r = read();
+    assert!(r.contains("\"enabled\":true"), "{r}");
+    assert!(
+        r.contains("\"name\":\"navigator\""),
+        "re-activation keeps the name: {r}"
+    );
+    assert!(r.contains("claude-haiku-4-5-20251001"), "{r}");
+    assert!(out.contains("navigator 'navigator' active"), "{out}");
+    run(&["pair", "--name", "other"]);
+    assert!(read().contains("\"name\":\"other\""));
+    reap_pair_relays(home.path());
 }
 
 /// #362 acceptance criterion 3, against the real binary: outside croft the
@@ -1331,6 +1396,84 @@ fn locale_template_write_for_english_writes_nothing() {
         .failure()
         .code(1);
     assert!(!cfg.path().join("croft/locales").exists());
+}
+
+/// #1179: `croft import-vscode | head` closes croft's stdout before the
+/// report is out. The import is written anyway, and croft ends the way any
+/// Unix tool does on a closed pipe instead of panicking with exit code 101.
+#[cfg(unix)]
+#[test]
+fn import_vscode_writes_its_files_when_stdout_is_closed() {
+    use std::os::unix::process::ExitStatusExt;
+    let cfg = tempfile::tempdir().unwrap();
+    let from = tempfile::tempdir().unwrap();
+    std::fs::write(
+        from.path().join("settings.json"),
+        r#"{ "editor.formatOnSave": true }"#,
+    )
+    .unwrap();
+    std::fs::write(
+        from.path().join("keybindings.json"),
+        r#"[{ "key": "ctrl+s", "command": "workbench.action.files.save" }]"#,
+    )
+    .unwrap();
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("croft"))
+        .args(["import-vscode", "--from"])
+        .arg(from.path())
+        .env("XDG_CONFIG_HOME", cfg.path())
+        .current_dir(cfg.path())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // The reader is gone before croft has written a byte.
+    drop(child.stdout.take());
+    let out = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        out.status.success() || out.status.signal() == Some(13),
+        "a closed pipe ends croft quietly, not with {:?}: {stderr}",
+        out.status
+    );
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    let config = std::fs::read_to_string(cfg.path().join("croft/config.json")).unwrap();
+    assert!(config.contains("format_on_save"), "{config}");
+    assert!(cfg.path().join("croft/keybindings.json").is_file());
+}
+
+/// #1179 review: an import that cannot be written says so on stderr even
+/// when stdout is already closed, instead of dying silently at the report's
+/// first line.
+#[cfg(unix)]
+#[test]
+fn import_vscode_reports_a_failed_write_when_stdout_is_closed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let from = tempfile::tempdir().unwrap();
+    std::fs::write(
+        from.path().join("settings.json"),
+        r#"{ "editor.formatOnSave": true }"#,
+    )
+    .unwrap();
+    // A file where the config directory should be: nothing can be written.
+    let blocked = tmp.path().join("not-a-dir");
+    std::fs::write(&blocked, "").unwrap();
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("croft"))
+        .args(["import-vscode", "--from"])
+        .arg(from.path())
+        .env("XDG_CONFIG_HOME", &blocked)
+        .current_dir(tmp.path())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(child.stdout.take());
+    let out = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{:?}", out.status);
+    assert!(
+        stderr.contains("not-a-dir"),
+        "the failure is said: {stderr}"
+    );
 }
 
 /// The real binary on a pty with `HOME` at `dir`, for tests that type raw
