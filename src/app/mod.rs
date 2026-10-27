@@ -4501,11 +4501,13 @@ pub struct App {
     /// True while a poll thread is in flight, so cadence ticks don't pile up
     /// overlapping `lsof` invocations.
     port_poll_inflight: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// Auto-label refresh for terminal panes: `(shell_pid, process_name)` pairs
-    /// resolved off the event loop, applied to the pane with that shell pid.
+    /// Auto-label refresh for terminal panes: `(shell_pid, process_name,
+    /// script)` resolved off the event loop, applied to the pane with that
+    /// shell pid. `script` is what a script runtime (`node`) runs, for agent
+    /// recognition (#1380); `None` for anything else.
     last_label_refresh: std::time::Instant,
-    label_rx: std::sync::mpsc::Receiver<Vec<(i32, String)>>,
-    label_tx: std::sync::mpsc::Sender<Vec<(i32, String)>>,
+    label_rx: std::sync::mpsc::Receiver<Vec<(i32, String, Option<String>)>>,
+    label_tx: std::sync::mpsc::Sender<Vec<(i32, String, Option<String>)>>,
     label_inflight: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Hit-test rect of the "PROBLEMS" tab in the panel tab strip. Empty when
     /// the panel is hidden.
@@ -53892,7 +53894,7 @@ impl App {
             self.apply_ssh_samples(samples);
         }
         if let Some(labels) = self.label_rx.try_iter().last() {
-            for (shell_pid, name) in &labels {
+            for (shell_pid, name, _) in &labels {
                 if let Some(t) = self
                     .terminals
                     .iter_mut()
@@ -53903,7 +53905,14 @@ impl App {
                     changed = true;
                 }
             }
-            changed |= self.apply_agent_samples(&labels, crate::agents::QUIET_AFTER);
+            let samples: Vec<(i32, String)> = labels
+                .iter()
+                .map(|(shell_pid, name, script)| {
+                    let who = self.agents.sample_name(name, script.as_deref());
+                    (*shell_pid, who.to_string())
+                })
+                .collect();
+            changed |= self.apply_agent_samples(&samples, crate::agents::QUIET_AFTER);
         }
         if self.last_label_refresh.elapsed() >= TERMINAL_LABEL_INTERVAL
             && !self
@@ -53951,8 +53960,18 @@ impl App {
                             crate::widgets::terminal::process_cmdline,
                         ));
                     }
-                    let resolved: Vec<(i32, String)> =
-                        named.into_iter().map(|(sp, _, n)| (sp, n)).collect();
+                    // Only a script runtime pays the argv read (#1380): its
+                    // name is `node` whatever agent it runs.
+                    let resolved: Vec<(i32, String, Option<String>)> = named
+                        .into_iter()
+                        .map(|(sp, fg, n)| {
+                            let script = crate::agents::is_script_runtime(&n)
+                                .then(|| crate::widgets::terminal::process_cmdline(fg))
+                                .flatten()
+                                .and_then(|argv| crate::agents::script_name(&argv));
+                            (sp, n, script)
+                        })
+                        .collect();
                     let _ = tx.send(resolved);
                     inflight.store(false, std::sync::atomic::Ordering::Relaxed);
                 });

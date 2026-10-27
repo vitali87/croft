@@ -1,0 +1,1 @@
+fix: Codex CLI and Gemini CLI installed with npm, which run as `node`, are recognised as agents: their panes get the agent chip and the "waiting for your input" alert, while other Node programs stay unbadged.
