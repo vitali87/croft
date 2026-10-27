@@ -1608,6 +1608,35 @@ mod tests {
         );
     }
 
+    /// #1940: the sponsor heart bakes, in its own ink. A heart that failed to
+    /// parse would drop every baked activity icon to the glyph fallback,
+    /// since the bar's bake is all or nothing.
+    #[test]
+    fn the_sponsor_heart_bakes_in_its_own_ink() {
+        let bg = Rgba([0, 0, 0, 0xff]);
+        let pink = (0xdb, 0x61, 0xa2);
+        let ink = IconInk::new(pink, (0xf7, 0x78, 0xba), (0x4e, 0x9a, 0xff));
+        let baked = compose_icon_svg(
+            SPONSOR_HEART_SRC_SVG,
+            40,
+            40,
+            IconState::Inactive,
+            ink,
+            bg,
+            0,
+        )
+        .expect("the heart codicon SVG must rasterise");
+        let decoded = image::load_from_memory_with_format(&baked, image::ImageFormat::Png)
+            .unwrap()
+            .to_rgba8();
+        assert!(
+            decoded
+                .pixels()
+                .any(|p| p.0 == [pink.0, pink.1, pink.2, 0xff]),
+            "the heart's stroke is painted in its pink"
+        );
+    }
+
     #[test]
     fn compose_icon_svg_active_paints_the_blue_pill() {
         let bg = Rgba([0x1e, 0x22, 0x2e, 0xff]);
