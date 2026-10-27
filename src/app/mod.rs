@@ -164,8 +164,8 @@ impl ExplorerViewVisibility {
 
 /// The clickable icons on the activity bar, used to track which one the
 /// pointer is hovering. Mirrors `SidebarView` plus the bottom-anchored
-/// settings gear, which is not a sidebar view but is still a hoverable
-/// button.
+/// sponsor heart and settings gear, which are not sidebar views but are
+/// still hoverable buttons.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ActivityIcon {
     Explorer,
@@ -176,12 +176,13 @@ pub enum ActivityIcon {
     Extensions,
     Testing,
     CodeQL,
+    Sponsor,
     Settings,
 }
 
 impl ActivityIcon {
-    /// The side bar view this icon opens; `None` for the settings gear,
-    /// which opens a menu instead.
+    /// The side bar view this icon opens; `None` for the sponsor heart,
+    /// which opens a web page, and the settings gear, which opens a menu.
     fn view(self) -> Option<SidebarView> {
         match self {
             ActivityIcon::Explorer => Some(SidebarView::Explorer),
@@ -192,10 +193,13 @@ impl ActivityIcon {
             ActivityIcon::Extensions => Some(SidebarView::Extensions),
             ActivityIcon::Testing => Some(SidebarView::Testing),
             ActivityIcon::CodeQL => Some(SidebarView::CodeQL),
-            ActivityIcon::Settings => None,
+            ActivityIcon::Sponsor | ActivityIcon::Settings => None,
         }
     }
 }
+
+/// Where the activity bar's sponsor heart leads (#1940).
+const SPONSOR_URL: &str = "https://github.com/sponsors/vitali87";
 
 /// How many commits the history scrubber loads up front (#371).
 ///
@@ -781,14 +785,7 @@ fn activity_settings_block(bar: Rect, codeql_shown: bool) -> Rect {
         .y
         .saturating_add(bar.height)
         .saturating_sub(ACTIVITY_ICON_HEIGHT + ACTIVITY_BOTTOM_INSET);
-    // The last view icon is CodeQL's only once it is added (#1842).
-    let last_view_y = if codeql_shown {
-        activity_codeql_y(bar)
-    } else {
-        activity_testing_y(bar)
-    };
-    let last_view_bottom = last_view_y + ACTIVITY_ICON_HEIGHT;
-    if y < last_view_bottom {
+    if y < activity_last_view_bottom(bar, codeql_shown) {
         return Rect::default();
     }
     Rect {
@@ -797,6 +794,33 @@ fn activity_settings_block(bar: Rect, codeql_shown: bool) -> Rect {
         width: bar.width,
         height: ACTIVITY_ICON_HEIGHT,
     }
+}
+
+/// The row just below the last view icon, which the bottom-anchored icons
+/// must not reach. The last view icon is CodeQL's only once it is added
+/// (#1842).
+fn activity_last_view_bottom(bar: Rect, codeql_shown: bool) -> u16 {
+    let last_view_y = if codeql_shown {
+        activity_codeql_y(bar)
+    } else {
+        activity_testing_y(bar)
+    };
+    last_view_y + ACTIVITY_ICON_HEIGHT
+}
+
+/// The sponsor heart (#1940), stacked directly above the gear as VS Code
+/// stacks Accounts above Manage. Empty when the gear is, or when the heart
+/// would overlap the last view icon, so a shrinking bar drops the heart a
+/// slot before it drops the gear.
+fn activity_sponsor_block(bar: Rect, codeql_shown: bool) -> Rect {
+    let gear = activity_settings_block(bar, codeql_shown);
+    let y = gear
+        .y
+        .saturating_sub(ACTIVITY_ICON_HEIGHT + ACTIVITY_ICON_GAP);
+    if gear.width == 0 || y < activity_last_view_bottom(bar, codeql_shown) {
+        return Rect::default();
+    }
+    Rect { y, ..gear }
 }
 
 #[derive(Default, Clone, Copy)]
@@ -820,6 +844,10 @@ struct SidebarAreas {
     /// Block occupied by the CodeQL (QL) activity-bar icon; empty while the
     /// built-in CodeQL extension is disabled.
     codeql_icon: Rect,
+    /// Block occupied by the sponsor heart directly above the settings gear;
+    /// empty when the bar is too short for it. Clicking it opens croft's
+    /// GitHub Sponsors page.
+    sponsor_icon: Rect,
     /// Block occupied by the settings gear, bottom-anchored on the activity
     /// bar (VS Code's "Manage" button). Asymmetric to the view icons up top;
     /// clicking it opens the settings menu (Color Theme picker).
@@ -856,6 +884,10 @@ pub struct ActivityBarImages {
     codeql_active: String,
     codeql_inactive: String,
     codeql_hovered: String,
+    /// The sponsor heart. It opens a web page rather than a view or a menu,
+    /// so it is never selected and has no active variant.
+    sponsor_inactive: String,
+    sponsor_hovered: String,
     /// The settings gear. `active` is shown while its menu is open so the
     /// button reads as pressed, mirroring the view icons' selected state;
     /// `hovered` brightens it while the pointer rests on it.
@@ -7465,11 +7497,12 @@ impl App {
         // the placement in place); ignored on the iTerm2 path.
         let encode = |src_svg: &[u8],
                       state: crate::iterm2_inline::IconState,
+                      ink: crate::iterm2_inline::IconInk,
                       off_y_bias: i64,
                       id: u32|
          -> Option<String> {
             let baked = crate::iterm2_inline::compose_icon_svg(
-                src_svg, canvas_w, canvas_h, state, icon_ink, icon_bg, off_y_bias,
+                src_svg, canvas_w, canvas_h, state, ink, icon_bg, off_y_bias,
             )?;
             // preserveAspectRatio=0: stretch to exactly fill 4×2 cells.
             // Since the canvas was composed at exactly that pixel size,
@@ -7494,11 +7527,34 @@ impl App {
         // — a hover never triggers a re-bake, just a different cached string.
         let bake = |src: &[u8], off_y_bias: i64, id: u32| -> Option<(String, String, String)> {
             Some((
-                encode(src, ki::IconState::Active, off_y_bias, id)?,
-                encode(src, ki::IconState::Inactive, off_y_bias, id)?,
-                encode(src, ki::IconState::Hovered, off_y_bias, id)?,
+                encode(src, ki::IconState::Active, icon_ink, off_y_bias, id)?,
+                encode(src, ki::IconState::Inactive, icon_ink, off_y_bias, id)?,
+                encode(src, ki::IconState::Hovered, icon_ink, off_y_bias, id)?,
             ))
         };
+        // The sponsor heart (#1940) wears its own pink, and is never selected,
+        // so it bakes only its resting and hovered states. It shares the gear's
+        // bias so the two keep the view icons' spacing between them.
+        let sponsor_ink = ki::IconInk::new(
+            self.theme.activity_sponsor_rgb(),
+            self.theme.activity_sponsor_hover_rgb(),
+            self.theme.activity_icon_pill_rgb(),
+        );
+        let sponsor_imgs = (|| {
+            let heart = |state| {
+                encode(
+                    ki::SPONSOR_HEART_SRC_SVG,
+                    state,
+                    sponsor_ink,
+                    gear_off_y_bias,
+                    ki::KITTY_ID_SPONSOR,
+                )
+            };
+            Some((
+                heart(ki::IconState::Inactive)?,
+                heart(ki::IconState::Hovered)?,
+            ))
+        })();
         // Customize Layout toolbar icons: baked OPAQUE on the editor bg at the
         // 4×2-cell box so they paint IN FRONT of the container's top line
         // (the line sits behind the icon's solid background). `Inactive` is the
@@ -7557,6 +7613,7 @@ impl App {
             Some((exta, exti, exth)),
             Some((tsta, tsti, tsth)),
             Some((cqa, cqi, cqh)),
+            Some((spi, sph)),
             Some((gea, gei, geh)),
             Some((lso, lsoh, lsf, lsfh, lpo, lpoh, lpf, lpfh, lcu, lcuh)),
         ) = (
@@ -7568,6 +7625,7 @@ impl App {
             bake(ki::EXTENSIONS_SRC_SVG, 0, ki::KITTY_ID_EXTENSIONS),
             bake(ki::TESTING_SRC_SVG, 0, ki::KITTY_ID_TESTING),
             bake(ki::CODEQL_SRC_SVG, 0, ki::KITTY_ID_CODEQL),
+            sponsor_imgs,
             bake(
                 ki::SETTINGS_GEAR_SRC_SVG,
                 gear_off_y_bias,
@@ -7600,6 +7658,8 @@ impl App {
                 codeql_active: cqa,
                 codeql_inactive: cqi,
                 codeql_hovered: cqh,
+                sponsor_inactive: spi,
+                sponsor_hovered: sph,
                 settings_active: gea,
                 settings_inactive: gei,
                 settings_hovered: geh,
@@ -8210,8 +8270,15 @@ impl App {
         } else {
             &images.codeql_inactive
         };
-        // The gear is bottom-anchored and may be absent on a short bar
-        // (empty block). It reads "active" while its menu/picker is open.
+        // The heart and the gear are bottom-anchored and may be absent on a
+        // short bar (empty block). The heart is never selected; the gear
+        // reads "active" while its menu/picker is open.
+        let spo_block = self.sidebar_areas.sponsor_icon;
+        let spo_state = if hov == Some(ActivityIcon::Sponsor) {
+            &images.sponsor_hovered
+        } else {
+            &images.sponsor_inactive
+        };
         let set_block = self.sidebar_areas.settings_icon;
         let set_state = if self.settings_menu_active() {
             &images.settings_active
@@ -8254,6 +8321,9 @@ impl App {
             ]);
             if cql_block.width > 0 {
                 blocks.push((cql_block, cql_state.as_str()));
+            }
+            if spo_block.width > 0 {
+                blocks.push((spo_block, spo_state.as_str()));
             }
             if set_block.width > 0 {
                 blocks.push((set_block, set_state.as_str()));
@@ -10572,6 +10642,8 @@ impl App {
             Some(ActivityIcon::Testing)
         } else if rect_contains(a.codeql_icon, col, row) {
             Some(ActivityIcon::CodeQL)
+        } else if rect_contains(a.sponsor_icon, col, row) {
+            Some(ActivityIcon::Sponsor)
         } else if rect_contains(a.settings_icon, col, row) {
             Some(ActivityIcon::Settings)
         } else {
@@ -10608,6 +10680,7 @@ impl App {
                 ActivityIcon::Extensions => "Extensions",
                 ActivityIcon::Testing => "Testing",
                 ActivityIcon::CodeQL => "CodeQL",
+                ActivityIcon::Sponsor => "Sponsor croft",
                 ActivityIcon::Settings => "Manage",
             });
         }
@@ -14206,6 +14279,12 @@ impl App {
         // The gear renders "active" while its menu is open; re-emit it so the
         // pressed-state PNG replaces the idle one.
         self.overlays.activity.mark_dirty();
+    }
+
+    /// The activity-bar heart and "Help: Sponsor croft" (#1940): open
+    /// croft's GitHub Sponsors page in the user's browser.
+    fn open_sponsor_page(&mut self) {
+        self.open_url_for_user(SPONSOR_URL);
     }
 
     /// Anchor for the Customize Layout popup: just under the Customize Layout
@@ -17994,6 +18073,7 @@ impl App {
             Rect::default()
         };
         let settings_block = activity_settings_block(area, codeql_block.width > 0);
+        let sponsor_block = activity_sponsor_block(area, codeql_block.width > 0);
         let explorer_active = self.activity_view_active(SidebarView::Explorer);
         let search_active = self.activity_view_active(SidebarView::Search);
         let source_control_active = self.activity_view_active(SidebarView::SourceControl);
@@ -18014,6 +18094,7 @@ impl App {
         let extensions_hovered = hov == Some(ActivityIcon::Extensions);
         let testing_hovered = hov == Some(ActivityIcon::Testing);
         let codeql_hovered = hov == Some(ActivityIcon::CodeQL);
+        let sponsor_hovered = hov == Some(ActivityIcon::Sponsor);
         let settings_hovered = hov == Some(ActivityIcon::Settings);
 
         // Same palette the baked icons use, so an image-less terminal renders
@@ -18163,6 +18244,29 @@ impl App {
                     codeql_hovered,
                 );
             }
+            if sponsor_block.width > 0 {
+                // The heart's own pink, not the bar's greys (see the bake).
+                let color = if sponsor_hovered {
+                    self.theme.activity_sponsor_hover()
+                } else {
+                    self.theme.activity_sponsor()
+                };
+                frame.render_widget(
+                    ratatui::widgets::Paragraph::new(crate::icons::ACTIVITY_SPONSOR.to_string())
+                        .style(
+                            Style::default()
+                                .fg(color)
+                                .bg(bg_color)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                    Rect {
+                        x: glyph_x,
+                        y: sponsor_block.y + sponsor_block.height.saturating_sub(1) / 2,
+                        width: 1,
+                        height: 1,
+                    },
+                );
+            }
             if settings_block.width > 0 {
                 render_glyph(
                     frame,
@@ -18182,6 +18286,7 @@ impl App {
         self.sidebar_areas.extensions_icon = extensions_block;
         self.sidebar_areas.testing_icon = testing_block;
         self.sidebar_areas.codeql_icon = codeql_block;
+        self.sidebar_areas.sponsor_icon = sponsor_block;
         self.sidebar_areas.settings_icon = settings_block;
     }
 
@@ -56900,6 +57005,7 @@ impl App {
             Cmd::FocusRightEditorGroup => self.focus_editor_group(false),
             Cmd::QuickOpen => self.open_file_finder(),
             Cmd::TakeTheTour => self.start_demo(),
+            Cmd::SponsorCroft => self.open_sponsor_page(),
             Cmd::SarifNextResult => self.step_sarif_result(true),
             Cmd::SarifPreviousResult => self.step_sarif_result(false),
             Cmd::SarifOpenCodeScanning => self.open_code_scanning_picker(),
@@ -62375,6 +62481,7 @@ impl App {
                 if let Some(icon) = self.activity_icon_at(m.column, m.row) {
                     match icon.view() {
                         Some(view) => self.click_activity_view(view),
+                        None if icon == ActivityIcon::Sponsor => self.open_sponsor_page(),
                         None => self.open_settings_menu(),
                     }
                     return;

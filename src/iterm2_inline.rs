@@ -22,6 +22,8 @@ pub const TESTING_SRC_SVG: &[u8] = include_bytes!("../assets/icons/beaker.svg");
 pub const CODEQL_SRC_SVG: &[u8] = include_bytes!("../assets/icons/ql.svg");
 /// Codicon `gear`, the bottom-anchored "Manage" button (Color Theme picker).
 pub const SETTINGS_GEAR_SRC_SVG: &[u8] = include_bytes!("../assets/icons/settings_gear.svg");
+/// Codicon `heart`, the sponsor button stacked above the gear (#1940).
+pub const SPONSOR_HEART_SRC_SVG: &[u8] = include_bytes!("../assets/icons/heart.svg");
 /// VS Code's title-bar layout codicons for the Customize Layout toolbar.
 /// `layout-sidebar-left` / `-off` toggle the primary side bar (filled vs.
 /// hollow left pane), `layout-panel` / `-off` toggle the bottom panel, and
@@ -1117,6 +1119,8 @@ pub const KITTY_ID_MARKDOWN: u32 = KITTY_ID_BASE + 26;
 pub const KITTY_ID_PLOT: u32 = KITTY_ID_BASE + 27;
 /// The CodeQL (QL) activity-bar icon (#578).
 pub const KITTY_ID_CODEQL: u32 = KITTY_ID_BASE + 28;
+/// The sponsor heart above the activity-bar gear (#1940).
+pub const KITTY_ID_SPONSOR: u32 = KITTY_ID_BASE + 29;
 
 /// Apply tmux DCS passthrough wrapping to an inline-image escape when needed.
 /// Sixel passes through tmux natively (tmux built with sixel support renders it
@@ -1281,6 +1285,7 @@ mod tests {
             ("REMOTE_BADGE", KITTY_ID_REMOTE_BADGE),
             ("TESTING", KITTY_ID_TESTING),
             ("CODEQL", KITTY_ID_CODEQL),
+            ("SPONSOR", KITTY_ID_SPONSOR),
             ("TESTING_BADGE", KITTY_ID_TESTING_BADGE),
             ("PROBLEMS_BADGE", KITTY_ID_PROBLEMS_BADGE),
         ];
@@ -1600,6 +1605,35 @@ mod tests {
         assert!(
             glyph_opaque,
             "the rasterised glyph must paint visible pixels"
+        );
+    }
+
+    /// #1940: the sponsor heart bakes, in its own ink. A heart that failed to
+    /// parse would drop every baked activity icon to the glyph fallback,
+    /// since the bar's bake is all or nothing.
+    #[test]
+    fn the_sponsor_heart_bakes_in_its_own_ink() {
+        let bg = Rgba([0, 0, 0, 0xff]);
+        let pink = (0xdb, 0x61, 0xa2);
+        let ink = IconInk::new(pink, (0xf7, 0x78, 0xba), (0x4e, 0x9a, 0xff));
+        let baked = compose_icon_svg(
+            SPONSOR_HEART_SRC_SVG,
+            40,
+            40,
+            IconState::Inactive,
+            ink,
+            bg,
+            0,
+        )
+        .expect("the heart codicon SVG must rasterise");
+        let decoded = image::load_from_memory_with_format(&baked, image::ImageFormat::Png)
+            .unwrap()
+            .to_rgba8();
+        assert!(
+            decoded
+                .pixels()
+                .any(|p| p.0 == [pink.0, pink.1, pink.2, 0xff]),
+            "the heart's stroke is painted in its pink"
         );
     }
 

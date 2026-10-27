@@ -251,8 +251,8 @@ fn settings_gear_is_bottom_anchored_below_the_view_icons() {
     );
     assert_eq!(
         app.pending_activity_image_overlays().len(),
-        11,
-        "seven view icons (CodeQL's is added, not built in) + the settings gear + the three layout toolbar icons emit"
+        12,
+        "seven view icons (CodeQL's is added, not built in) + the sponsor heart + the settings gear + the three layout toolbar icons emit"
     );
 }
 
@@ -343,6 +343,72 @@ fn clicking_the_gear_opens_the_color_theme_menu_then_the_picker() {
             .all(|e| matches!(e.action(), Some(MenuAction::SetTheme(_)))),
         "every picker row switches a theme"
     );
+}
+
+/// #1940: the sponsor heart sits in the slot directly above the gear, with
+/// no gap, as VS Code's Accounts icon sits above Manage.
+#[test]
+fn the_sponsor_heart_sits_directly_above_the_gear() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.overlays.activity.set_images(dummy_activity_images());
+    draw(&mut app, 120, 40);
+    let heart = app.sidebar_areas.sponsor_icon;
+    let gear = app.sidebar_areas.settings_icon;
+    assert!(heart.width > 0, "the heart lays out on a tall bar");
+    assert_eq!((heart.x, heart.width), (gear.x, gear.width));
+    assert_eq!(heart.y + heart.height, gear.y, "no gap above the gear");
+    assert_eq!(app.ui_tooltip_at(heart.x, heart.y), Some("Sponsor croft"));
+}
+
+/// #1940 negative: on a bar too short for both, the heart goes first and
+/// the gear keeps its place; one icon slot more brings the heart back.
+#[test]
+fn a_short_bar_drops_the_sponsor_heart_before_the_gear() {
+    let bar = |height| Rect::new(0, 0, 3, height);
+    for codeql in [false, true] {
+        let shortest = (1..80)
+            .find(|&h| activity_settings_block(bar(h), codeql).width > 0)
+            .expect("the gear fits on some bar");
+        assert_eq!(activity_sponsor_block(bar(shortest), codeql).width, 0);
+        let taller = shortest + ACTIVITY_ICON_HEIGHT - 1;
+        assert_eq!(activity_sponsor_block(bar(taller), codeql).width, 0);
+        assert!(activity_sponsor_block(bar(taller + 1), codeql).width > 0);
+    }
+}
+
+/// #1940: clicking the heart opens croft's GitHub Sponsors page (tests
+/// never start a browser; the status line names the page) and leaves the
+/// side bar and the gear's menu alone.
+#[test]
+fn clicking_the_sponsor_heart_opens_the_github_sponsors_page() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.overlays.activity.set_images(dummy_activity_images());
+    draw(&mut app, 120, 40);
+    let view = app.sidebar_view;
+    let heart = app.sidebar_areas.sponsor_icon;
+    left_click(&mut app, heart.x, heart.y);
+    assert_eq!(app.status, "Open https://github.com/sponsors/vitali87");
+    assert!(app.context_menu.is_none(), "the heart opens no menu");
+    assert_eq!(app.sidebar_view, view);
+    assert!(app.show_tree, "the side bar stays open");
+}
+
+/// #1940: the heart's palette command, so the page is reachable from the
+/// keyboard and `keybindings.json` can bind it.
+#[test]
+fn sponsor_croft_is_a_palette_command() {
+    use crate::widgets::command_palette::Command;
+    assert_eq!(
+        Command::from_id("help_sponsor_croft"),
+        Some(Command::SponsorCroft)
+    );
+    assert_eq!(Command::SponsorCroft.title(), "Help: Sponsor croft");
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.run_command(Command::SponsorCroft);
+    assert_eq!(app.status, "Open https://github.com/sponsors/vitali87");
 }
 
 #[test]
