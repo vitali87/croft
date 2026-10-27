@@ -22,6 +22,8 @@ pub const TESTING_SRC_SVG: &[u8] = include_bytes!("../assets/icons/beaker.svg");
 pub const CODEQL_SRC_SVG: &[u8] = include_bytes!("../assets/icons/ql.svg");
 /// Codicon `gear`, the bottom-anchored "Manage" button (Color Theme picker).
 pub const SETTINGS_GEAR_SRC_SVG: &[u8] = include_bytes!("../assets/icons/settings_gear.svg");
+/// Codicon `heart`, the sponsor button stacked above the gear (#1940).
+pub const SPONSOR_HEART_SRC_SVG: &[u8] = include_bytes!("../assets/icons/heart.svg");
 /// VS Code's title-bar layout codicons for the Customize Layout toolbar.
 /// `layout-sidebar-left` / `-off` toggle the primary side bar (filled vs.
 /// hollow left pane), `layout-panel` / `-off` toggle the bottom panel, and
@@ -1117,6 +1119,8 @@ pub const KITTY_ID_MARKDOWN: u32 = KITTY_ID_BASE + 26;
 pub const KITTY_ID_PLOT: u32 = KITTY_ID_BASE + 27;
 /// The CodeQL (QL) activity-bar icon (#578).
 pub const KITTY_ID_CODEQL: u32 = KITTY_ID_BASE + 28;
+/// The sponsor heart above the activity-bar gear (#1940).
+pub const KITTY_ID_SPONSOR: u32 = KITTY_ID_BASE + 29;
 
 /// Apply tmux DCS passthrough wrapping to an inline-image escape when needed.
 /// Sixel passes through tmux natively (tmux built with sixel support renders it
@@ -1281,6 +1285,7 @@ mod tests {
             ("REMOTE_BADGE", KITTY_ID_REMOTE_BADGE),
             ("TESTING", KITTY_ID_TESTING),
             ("CODEQL", KITTY_ID_CODEQL),
+            ("SPONSOR", KITTY_ID_SPONSOR),
             ("TESTING_BADGE", KITTY_ID_TESTING_BADGE),
             ("PROBLEMS_BADGE", KITTY_ID_PROBLEMS_BADGE),
         ];

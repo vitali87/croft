@@ -150,6 +150,8 @@ fn dummy_activity_images() -> ActivityBarImages {
         codeql_active: s(),
         codeql_inactive: s(),
         codeql_hovered: s(),
+        sponsor_inactive: s(),
+        sponsor_hovered: s(),
         settings_active: s(),
         settings_inactive: s(),
         settings_hovered: s(),

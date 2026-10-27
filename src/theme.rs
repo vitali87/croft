@@ -486,6 +486,10 @@ fn light_vocab((r, g, b): (u8, u8, u8)) -> Option<(u8, u8, u8)> {
         (0x8c, 0xc2, 0x65) => (0x10, 0x7c, 0x10),
         (0xe7, 0x70, 0x70) => (0xc4, 0x2b, 0x1f),
         (0xf1, 0x4c, 0x4c) => (0xcd, 0x31, 0x31),
+        // The sponsor heart's GitHub Sponsors pinks -> GitHub's light ones.
+        // The luminance flip would land both on one dull plum, losing hover.
+        (0xdb, 0x61, 0xa2) => (0xbf, 0x39, 0x89),
+        (0xf7, 0x78, 0xba) => (0x99, 0x28, 0x6e),
         // Fills that carry BLACK text (the editor block cursor, the
         // active search-match band): they must stay light so the black
         // glyph keeps its contrast, not be darkened as if they were
@@ -862,6 +866,29 @@ impl Theme {
     /// [`Theme::activity_icon_pill_rgb`] as a cell color.
     pub fn activity_icon_pill(self) -> Color {
         rgb(self.activity_icon_pill_rgb())
+    }
+
+    /// Resting ink of the activity bar's sponsor heart (#1940): GitHub
+    /// Sponsors' pink (`fgColor.sponsors`), the one icon on the bar that is
+    /// not grey, as on GitHub's own Sponsor button.
+    pub fn activity_sponsor_rgb(self) -> (u8, u8, u8) {
+        self.ui_rgb((0xdb, 0x61, 0xa2))
+    }
+
+    /// The sponsor heart under the pointer: the next step along GitHub's
+    /// pink scale, lighter on a dark bar and darker on a light one.
+    pub fn activity_sponsor_hover_rgb(self) -> (u8, u8, u8) {
+        self.ui_rgb((0xf7, 0x78, 0xba))
+    }
+
+    /// [`Theme::activity_sponsor_rgb`] as a cell color.
+    pub fn activity_sponsor(self) -> Color {
+        rgb(self.activity_sponsor_rgb())
+    }
+
+    /// [`Theme::activity_sponsor_hover_rgb`] as a cell color.
+    pub fn activity_sponsor_hover(self) -> Color {
+        rgb(self.activity_sponsor_hover_rgb())
     }
 }
 
@@ -1364,6 +1391,26 @@ mod tests {
             assert_eq!(t.activity_icon_active_rgb(), (0xff, 0xff, 0xff));
             assert_eq!(t.activity_icon_inactive_rgb(), (0x9d, 0xa5, 0xb4));
             assert_eq!(t.activity_icon_pill_rgb(), (0x4e, 0x9a, 0xff));
+        }
+    }
+
+    /// #1940: the sponsor heart is GitHub Sponsors' pink on a dark bar and
+    /// GitHub's light-mode pink on Croft Light. On every theme its hover is a
+    /// different ink, so the pointer still shows on it.
+    #[test]
+    fn the_sponsor_heart_wears_github_sponsors_pink_and_hover_shows() {
+        assert_eq!(Theme::BLACK.activity_sponsor_rgb(), (0xdb, 0x61, 0xa2));
+        assert_eq!(
+            Theme::from_id("light").activity_sponsor_rgb(),
+            (0xbf, 0x39, 0x89)
+        );
+        for t in Theme::all() {
+            assert_ne!(
+                t.activity_sponsor_rgb(),
+                t.activity_sponsor_hover_rgb(),
+                "{}",
+                t.label()
+            );
         }
     }
 

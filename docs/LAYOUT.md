@@ -26,7 +26,7 @@ Each section is individually collapsible, grows to at most half the region, and 
 
 ### Activity bar
 
-The icon strip down the far left: view icons (Explorer, Search, Source Control, Remote, Run and Debug, Extensions, Testing) at the top, a settings gear at the bottom.
+The icon strip down the far left: view icons (Explorer, Search, Source Control, Remote, Run and Debug, Extensions, Testing) at the top, and at the bottom a pink sponsor heart above a settings gear. The heart opens croft's [GitHub Sponsors page](https://github.com/sponsors/vitali87) in your browser, as does "Help: Sponsor croft" in the Command Palette; on a terminal too short for both, the heart gives way first.
 
 Clicking a view icon toggles the sidebar, as in VS Code: another view's icon switches the sidebar to that view, and the icon of the view already showing collapses the sidebar, handing focus to the editor. Click any view icon to expand it again. While the sidebar is collapsed no icon shows as selected.
 

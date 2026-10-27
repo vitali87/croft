@@ -89,6 +89,13 @@ pub const SEARCH_CLEAR_ALL: char = '\u{eabf}';
 /// image path rasterises `assets/icons/settings_gear.svg` instead.
 pub const ACTIVITY_SETTINGS: char = '\u{eb51}';
 
+/// Codicon `heart` — the sponsor button above the gear (#1940). Verified on
+/// 2026-10-26 against the upstream codicon `mapping.json` (`heart` is decimal
+/// 60165) and the Nerd Fonts `glyphnames.json` (`cod-heart`): both pin it to
+/// **U+EB05**. Not `heart-filled` (U+EC04), which older Nerd Fonts lack.
+/// Glyph-fallback only; the image path rasterises `assets/icons/heart.svg`.
+pub const ACTIVITY_SPONSOR: char = '\u{eb05}';
+
 /// The Customize Layout toolbar (top-right of the editor tab strip and the
 /// welcome screen) — croft's analog of VS Code's title-bar layout controls.
 /// These are the *actual* VS Code codicons (VS Code's own title-bar icons), so
