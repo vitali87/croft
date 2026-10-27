@@ -596,6 +596,45 @@ fn croft_loch_paints_surfaces_on_croft_blacks_layout() {
     assert_eq!(buf[(60, 39)].bg, s.chrome(), "the status bar is chrome");
 }
 
+/// Croft Loch fills the activity bar's rows between its baked icons with
+/// chrome, and must leave the sponsor heart's rows (#1940) to its image like
+/// every other icon's: a cell repainted under an inline image forces the
+/// image to be re-sent, and the fill shows through it.
+#[test]
+fn croft_loch_leaves_the_sponsor_hearts_rows_to_its_baked_image() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.apply_theme(crate::theme::Theme::from_id("loch"));
+    app.overlays
+        .activity
+        .set_images(ActivityBarImages::default());
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+    let buf = term.backend().buffer();
+    let chrome = crate::theme::Theme::from_id("loch")
+        .surfaces()
+        .unwrap()
+        .chrome();
+    let heart = app.sidebar_areas.sponsor_icon;
+    assert!(!heart.is_empty(), "a 40-row bar has room for the heart");
+    for y in heart.top()..heart.bottom() {
+        assert_ne!(
+            buf[(heart.x, y)].bg,
+            chrome,
+            "heart row {y} left to its image"
+        );
+    }
+    let above = heart.top() - 1;
+    let last_view = app.sidebar_areas.testing_icon.bottom();
+    assert!(above >= last_view.max(app.sidebar_areas.codeql_icon.bottom()));
+    assert_eq!(
+        buf[(heart.x, above)].bg,
+        chrome,
+        "the gap above the heart is chrome"
+    );
+}
+
 #[test]
 fn cmd_b_and_ctrl_b_toggle_the_primary_side_bar() {
     // VS Code's "Toggle Primary Side Bar" is Cmd+B on macOS (Ctrl+B on
