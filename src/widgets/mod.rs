@@ -38,6 +38,7 @@ pub mod settings_editor;
 pub mod shortcuts;
 pub mod signature_help_popup;
 pub mod source_control;
+pub mod surface;
 pub mod symbol_picker;
 pub mod terminal;
 pub mod testing;

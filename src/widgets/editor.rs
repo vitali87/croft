@@ -18836,15 +18836,23 @@ impl Widget for &mut Editor {
         } else {
             Style::default().fg(Color::DarkGray)
         };
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(block_style);
+        let surfaces = self.theme.surfaces().is_some();
+        let block = if surfaces {
+            crate::widgets::surface::pane_block(self.theme.editor_bg())
+        } else {
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(block_style)
+        };
         let mut inner = block.inner(area);
         block.render(area, buf);
         // Black theme: replace the solid focus border with the orange→green
         // gradient that matches the welcome activity box. The editor has no
         // title, so nothing needs re-stamping over the gradient top edge.
-        if self.focused && self.focus_gradient {
+        // Croft Loch marks focus with a rule along the top edge instead.
+        if self.focused && surfaces {
+            crate::widgets::surface::paint_focus_rule(buf, area, self.theme);
+        } else if self.focused && self.focus_gradient {
             crate::gradient::paint_gradient_box(buf, area);
         }
         self.last_area = area;

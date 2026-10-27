@@ -79,6 +79,44 @@ impl SyntaxPalette {
     };
 }
 
+/// The layered surfaces a `surfaces` theme paints in place of pane boxes
+/// (Croft Loch): the code canvas is the theme background, and these are the
+/// tones around it, VS Code's 2026 structure of editor, side bar and widget
+/// backgrounds with one border colour where they meet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Surfaces {
+    /// Side bar, activity bar, tab strip, panel title row and status bar.
+    pub chrome: (u8, u8, u8),
+    /// Command Palette, pickers, menus and popups.
+    pub raised: (u8, u8, u8),
+    /// The one-eighth-cell seam drawn where two surfaces meet.
+    pub hairline: (u8, u8, u8),
+    /// Labels, inactive titles and status items.
+    pub muted: (u8, u8, u8),
+}
+
+impl Surfaces {
+    /// [`Surfaces::chrome`] as a cell color.
+    pub fn chrome(self) -> Color {
+        rgb(self.chrome)
+    }
+
+    /// [`Surfaces::raised`] as a cell color.
+    pub fn raised(self) -> Color {
+        rgb(self.raised)
+    }
+
+    /// [`Surfaces::hairline`] as a cell color.
+    pub fn hairline(self) -> Color {
+        rgb(self.hairline)
+    }
+
+    /// [`Surfaces::muted`] as a cell color.
+    pub fn muted(self) -> Color {
+        rgb(self.muted)
+    }
+}
+
 /// A complete IDE color palette. `Copy` and cheap to pass by value: the strings
 /// are interned to `&'static` when loaded from a manifest, and the colors are
 /// plain bytes. Equality is by value, so a registry-loaded theme compares equal
@@ -110,6 +148,8 @@ pub struct Theme {
     tab_pill: (u8, u8, u8),
     /// A high contrast theme (#1548): see [`Theme::high_contrast`].
     high_contrast: bool,
+    /// Layered surfaces instead of boxed panes: see [`Theme::surfaces`].
+    surfaces: Option<Surfaces>,
 }
 
 impl Theme {
@@ -139,6 +179,7 @@ impl Theme {
         tab_hover: (0x2f, 0x35, 0x50),
         tab_pill: (0x3c, 0x8a, 0x7e),
         high_contrast: false,
+        surfaces: None,
     };
 
     /// Croft Dark (Blue) — the historical look. Const mirror of the manifest,
@@ -164,6 +205,7 @@ impl Theme {
         tab_hover: (0x34, 0x50, 0x7f),
         tab_pill: (0x4e, 0x9a, 0xff),
         high_contrast: false,
+        surfaces: None,
     };
 
     /// Every available theme in pick-list order, loaded once from the bundled +
@@ -242,6 +284,7 @@ impl Theme {
             tab_hover: hex_or(&d.tab_hover, blend(accent, 0.25, tab_strip)),
             tab_pill: hex_or(&d.tab_close_pill, accent),
             high_contrast: d.high_contrast,
+            surfaces: d.surfaces.then(|| surfaces_from_decl(d)),
             gradient: d.gradient,
             osk_key: parse_hex(&d.osk_key),
             osk_special: parse_hex(&d.osk_special),
@@ -317,6 +360,14 @@ impl Theme {
         luma(self.bg) > 128.0
     }
 
+    /// Whether overlays (Command Palette, pickers, popups, dialogs) paint a
+    /// frame of their own over the line box: the gradient box on a brand
+    /// theme, the card edge and shadow on a `surfaces` theme, whether or not
+    /// that theme also has the gradient.
+    pub fn framed_overlays(self) -> bool {
+        self.gradient || self.surfaces.is_some()
+    }
+
     /// Whether this is a high contrast theme (VS Code's Dark / Light High
     /// Contrast, #1548). [`Theme::ui`] then resolves croft's hardcoded
     /// chrome greys to the theme's pure foreground or background and lifts
@@ -326,9 +377,22 @@ impl Theme {
         self.high_contrast
     }
 
+    /// The layered surfaces this theme paints instead of boxed panes (Croft
+    /// Loch), or `None` for the boxed look every other theme keeps. With
+    /// them, pane widgets paint their one-cell frame as padding in their
+    /// surface's tone, the workbench draws a hairline seam where two surfaces
+    /// meet, and the focused pane shows a rule along its top edge. Every
+    /// rectangle, inset and hit target is the same either way.
+    pub fn surfaces(self) -> Option<Surfaces> {
+        self.surfaces
+    }
+
     /// Adapt a hardcoded dark-chrome color to the active theme. On every
-    /// dark theme but a high contrast one this is the identity, so wrapping a legacy constant in
-    /// `theme.ui(..)` is byte-for-byte invisible there. On a light
+    /// dark theme but a high contrast or `surfaces` one this is the identity,
+    /// so wrapping a legacy constant in `theme.ui(..)` is byte-for-byte
+    /// invisible there. A `surfaces` theme moves the navy-tinted chrome
+    /// roles onto its own surfaces, light or dark (see `surfaces_role`). On
+    /// a light
     /// background the recurring chrome vocabulary (the historical dark
     /// constants that predate theme-driven popups) resolves to its VS Code
     /// Light Modern counterpart, and anything unmapped falls through to a
@@ -342,9 +406,53 @@ impl Theme {
             return self.high_contrast_ui(dark);
         }
         if !self.is_light() {
-            return dark;
+            return match self.surfaces {
+                Some(surfaces) => self.surfaces_ui(dark, surfaces),
+                None => dark,
+            };
+        }
+        // A light `surfaces` theme takes its declared tones for the chrome
+        // roles and VS Code Light Modern's for everything else.
+        if let (Some(s), Color::Rgb(r, g, b)) = (self.surfaces, dark)
+            && let Some(c) = self.surfaces_role((r, g, b), s)
+        {
+            return rgb(c);
         }
         light_ui(dark)
+    }
+
+    /// [`Theme::ui`] for a dark `surfaces` theme. croft's hardcoded chrome is
+    /// a navy-tinted dark vocabulary that predates theme surfaces: its
+    /// chrome roles take the theme's own tones (`surfaces_role`), and every
+    /// other grey keeps its lightness but trades the navy cast for the
+    /// theme's cool neutral. Status hues and named colors pass through.
+    fn surfaces_ui(self, dark: Color, s: Surfaces) -> Color {
+        let Color::Rgb(r, g, b) = dark else {
+            return dark;
+        };
+        rgb(match self.surfaces_role((r, g, b), s) {
+            Some(c) => c,
+            None if r.max(g).max(b) - r.min(g).min(b) < 0x30 => cool_grey((r, g, b)),
+            None => (r, g, b),
+        })
+    }
+
+    /// The chrome roles in croft's legacy dark vocabulary that a `surfaces`
+    /// theme draws from its own palette, light or dark: popup bodies on the
+    /// raised surface, borders on the hairline, the navy selected row and
+    /// the editor's blue selections on the theme's selection, the navy hover
+    /// lifts toward its accent, and the legacy VS Code blue as its accent.
+    /// `None` for any other color.
+    fn surfaces_role(self, c: (u8, u8, u8), s: Surfaces) -> Option<(u8, u8, u8)> {
+        Some(match c {
+            (0x16, 0x18, 0x1f) | (0x1e, 0x1e, 0x1e) => s.raised,
+            (0x3b, 0x42, 0x52) => s.hairline,
+            (0x1e, 0x3a, 0x6e) | (0x26, 0x4f, 0x78) | (0x09, 0x4d, 0x77) => self.selection,
+            (0x07, 0x33, 0x55) | (0x37, 0x61, 0x8e) => blend(self.selection, 0.7, self.bg),
+            (0x34, 0x50, 0x7f) | (0x2f, 0x5a, 0xa8) => blend(self.accent, 0.25, s.chrome),
+            (0x4e, 0x9a, 0xff) | (0x88, 0xc0, 0xd0) => self.accent,
+            _ => return None,
+        })
     }
 
     /// [`Theme::ui`] for a high contrast theme (#1548). A fill (dark on a
@@ -1002,6 +1110,35 @@ fn parse_hex(s: &str) -> (u8, u8, u8) {
     (0, 0, 0)
 }
 
+/// A grey at `c`'s lightness with the cool, faintly teal cast of Croft
+/// Loch's surfaces instead of croft's legacy navy one. The cast fades out
+/// toward black so the darkest fills stay neutral.
+fn cool_grey(c: (u8, u8, u8)) -> (u8, u8, u8) {
+    let l = luma(c);
+    let k = (l / 48.0).min(1.0);
+    let ch = |v: f32| v.round().clamp(0.0, 255.0) as u8;
+    (ch(l - 3.0 * k), ch(l + k), ch(l + 2.0 * k))
+}
+
+/// A `surfaces` theme's tones, each omitted one derived from its background:
+/// chrome and raised step away from it the way VS Code 2026's side bar and
+/// widgets step away from its editor, the hairline a step further, and muted
+/// text halfway to the opposite extreme.
+fn surfaces_from_decl(d: &crate::lsp::manifest::ThemeDecl) -> Surfaces {
+    let bg = parse_hex(&d.background);
+    let lift = if luma(bg) > 128.0 {
+        (0x00, 0x00, 0x00)
+    } else {
+        (0xff, 0xff, 0xff)
+    };
+    Surfaces {
+        chrome: hex_or(&d.chrome, blend(lift, 0.05, bg)),
+        raised: hex_or(&d.raised, blend(lift, 0.08, bg)),
+        hairline: hex_or(&d.hairline, blend(lift, 0.14, bg)),
+        muted: hex_or(&d.fg_muted, blend(lift, 0.5, bg)),
+    }
+}
+
 /// Parse an optional `#rrggbb`, falling back to `default` when the string is
 /// empty (the field was omitted in the manifest) — lets a theme override only
 /// the syntax colors it cares about and inherit Base16 for the rest.
@@ -1117,8 +1254,9 @@ mod tests {
         }
         // These are imports of external editor palettes, not croft's own brand:
         // they must use the flat-accent look, never the teal gradient chrome.
+        // Croft Black and Croft Loch are the brand.
         for t in Theme::all() {
-            if t.id() != "black" {
+            if !matches!(t.id(), "black" | "loch") {
                 assert!(!t.gradient(), "`{}` must not use gradient chrome", t.id());
             }
         }
@@ -1226,9 +1364,10 @@ mod tests {
     fn the_ui_adapter_is_the_identity_on_every_dark_theme() {
         // The whole sweep's safety net: wrapping a hardcoded chrome color in
         // `theme.ui(..)` must be byte-for-byte invisible on dark themes.
-        // High contrast themes adapt on purpose (#1548).
+        // High contrast themes adapt on purpose (#1548), and so does a
+        // `surfaces` theme (Croft Loch).
         for t in Theme::all() {
-            if t.is_light() || t.high_contrast() {
+            if t.is_light() || t.high_contrast() || t.surfaces().is_some() {
                 continue;
             }
             for c in [
@@ -1386,12 +1525,15 @@ mod tests {
     fn dark_activity_icon_ink_keeps_the_historical_chrome() {
         for t in Theme::all()
             .iter()
-            .filter(|t| !t.is_light() && !t.high_contrast())
+            .filter(|t| !t.is_light() && !t.high_contrast() && t.surfaces().is_none())
         {
             assert_eq!(t.activity_icon_active_rgb(), (0xff, 0xff, 0xff));
             assert_eq!(t.activity_icon_inactive_rgb(), (0x9d, 0xa5, 0xb4));
             assert_eq!(t.activity_icon_pill_rgb(), (0x4e, 0x9a, 0xff));
         }
+        // Croft Loch's selection bar is its own teal, not the VS Code blue.
+        let loch = Theme::from_id("loch");
+        assert_eq!(loch.activity_icon_pill_rgb(), loch.accent_rgb());
     }
 
     /// #1940: the sponsor heart is GitHub Sponsors' pink on a dark bar and
@@ -1603,5 +1745,128 @@ mod tests {
             contrast_ratio((0x6c, 0x76, 0x86), (0, 0, 0)) < 7.0,
             "the grey HC lifts is dim"
         );
+    }
+
+    #[test]
+    fn croft_loch_draws_surfaces_on_croft_blacks_canvas() {
+        let loch = Theme::from_id("loch");
+        assert_eq!(loch.id(), "loch");
+        assert_eq!(loch.label(), "Croft Loch");
+        assert_eq!(loch.editor_bg_rgb(), (0x00, 0x00, 0x00));
+        assert_eq!(loch.accent_rgb(), Theme::BLACK.accent_rgb());
+        assert!(loch.gradient(), "the brand gradient marks focus");
+        let s = loch.surfaces().expect("Croft Loch draws surfaces");
+        assert_eq!(s.chrome, (0x0e, 0x10, 0x11));
+        assert_eq!(s.raised, (0x15, 0x18, 0x19));
+        assert_eq!(s.hairline, (0x23, 0x28, 0x2a));
+        assert_eq!(s.muted, (0x7d, 0x87, 0x86));
+        // The active tab wears the canvas so it joins the code beneath it.
+        assert_eq!(loch.tab_active_bg(), loch.editor_bg());
+        assert_eq!(loch.tab_strip_bg(), s.chrome());
+    }
+
+    #[test]
+    fn only_croft_loch_draws_surfaces() {
+        for t in Theme::all() {
+            assert_eq!(t.surfaces().is_some(), t.id() == "loch", "{}", t.id());
+        }
+        assert_eq!(Theme::BLACK.surfaces(), None);
+    }
+
+    #[test]
+    fn croft_loch_moves_the_navy_chrome_onto_its_surfaces() {
+        let loch = Theme::from_id("loch");
+        let s = loch.surfaces().unwrap();
+        // Popup bodies, the navy selected row and the legacy blue accent.
+        assert_eq!(loch.ui(Color::Rgb(0x16, 0x18, 0x1f)), s.raised());
+        assert_eq!(loch.ui(Color::Rgb(0x1e, 0x3a, 0x6e)), loch.selection());
+        assert_eq!(loch.ui(Color::Rgb(0x4e, 0x9a, 0xff)), loch.accent());
+        assert_eq!(loch.ui(Color::Rgb(0x3b, 0x42, 0x52)), s.hairline());
+        // A navy grey keeps its lightness and loses its blue cast.
+        let Color::Rgb(r, g, b) = loch.ui(Color::Rgb(0x2a, 0x2f, 0x3e)) else {
+            panic!("an RGB grey stays RGB");
+        };
+        assert!(b <= r + 6 && g <= r + 6, "no navy left: {r} {g} {b}");
+        assert!((luma((r, g, b)) - luma((0x2a, 0x2f, 0x3e))).abs() < 3.0);
+        // Status hues and named colors are left alone.
+        for c in [
+            Color::Rgb(0xf1, 0x4c, 0x4c),
+            Color::Rgb(0xcc, 0xa7, 0x00),
+            Color::Reset,
+            Color::White,
+            Color::DarkGray,
+        ] {
+            assert_eq!(loch.ui(c), c);
+        }
+    }
+
+    #[test]
+    fn a_surfaces_theme_that_names_no_tones_derives_them() {
+        let manifest = r##"
+id = "third-party"
+name = "Third Party"
+api_version = 1
+
+[[themes]]
+id = "slate"
+label = "Slate"
+background = "#101418"
+accent = "#88aaff"
+selection = "#223344"
+search = "#141820"
+button = "#3355aa"
+surfaces = true
+osk_key = "#202020"
+osk_special = "#181818"
+osk_armed = "#3355aa"
+"##;
+        let m = crate::lsp::manifest::parse(manifest).expect("parses");
+        let t = Theme::from_decl(&m.themes[0]);
+        let s = t.surfaces().expect("surfaces declared");
+        // No gradient, and its overlays still get the card frame.
+        assert!(!t.gradient());
+        assert!(t.framed_overlays());
+        let bg = (0x10, 0x14, 0x18);
+        // Each tone steps further from the background than the last.
+        assert!(luma(bg) < luma(s.chrome));
+        assert!(luma(s.chrome) < luma(s.raised));
+        assert!(luma(s.raised) < luma(s.hairline));
+        assert!(luma(s.hairline) < luma(s.muted));
+    }
+
+    #[test]
+    fn a_light_surfaces_theme_draws_its_chrome_roles_from_its_own_tones() {
+        let manifest = r##"
+id = "third-party-light"
+name = "Third Party Light"
+api_version = 1
+
+[[themes]]
+id = "paper"
+label = "Paper"
+background = "#fafafa"
+accent = "#3366cc"
+selection = "#cce0ff"
+search = "#f0f0f0"
+button = "#3366cc"
+surfaces = true
+raised = "#ffffff"
+hairline = "#d8d8d8"
+osk_key = "#e8e8e8"
+osk_special = "#d8d8d8"
+osk_armed = "#3366cc"
+"##;
+        let m = crate::lsp::manifest::parse(manifest).expect("parses");
+        let t = Theme::from_decl(&m.themes[0]);
+        assert!(t.is_light());
+        // The chrome roles take the theme's declared tones...
+        assert_eq!(t.ui(Color::Rgb(0x16, 0x18, 0x1f)), rgb((0xff, 0xff, 0xff)));
+        assert_eq!(t.ui(Color::Rgb(0x3b, 0x42, 0x52)), rgb((0xd8, 0xd8, 0xd8)));
+        assert_eq!(t.ui(Color::Rgb(0x1e, 0x3a, 0x6e)), t.selection());
+        assert_eq!(t.ui(Color::Rgb(0x4e, 0x9a, 0xff)), t.accent());
+        // ...and the rest lands where it does on any light theme.
+        for c in [Color::White, Color::Rgb(0x9d, 0xa5, 0xb4), Color::Reset] {
+            assert_eq!(t.ui(c), light_ui(c));
+        }
     }
 }

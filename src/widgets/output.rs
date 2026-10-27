@@ -547,9 +547,15 @@ impl OutputPanel {
         // Blank the cells first: a background style alone keeps each
         // cell's symbol, and the log under the popup showed through it.
         Clear.render(area, buf);
-        buf.set_style(area, Style::default().bg(self.theme.editor_bg()));
+        // Croft Loch lifts the dropdown onto its raised surface, like every
+        // other overlay card.
+        let fill = self
+            .theme
+            .surfaces()
+            .map_or(self.theme.editor_bg(), |s| s.raised());
+        buf.set_style(area, Style::default().bg(fill));
         if pad == 1 {
-            crate::gradient::paint_gradient_box(buf, area);
+            crate::widgets::surface::paint_overlay_frame(buf, area, self.theme);
         }
         if overflow {
             let track = Rect {
@@ -683,6 +689,21 @@ mod tests {
             visible.contains(&10),
             "the selected channel must be in the opening window; got {visible:?}"
         );
+    }
+
+    #[test]
+    fn croft_loch_lifts_the_channel_dropdown_onto_its_raised_surface() {
+        let loch = crate::theme::Theme::from_id("loch");
+        let mut p = OutputPanel::new();
+        p.theme = loch;
+        p.channels = vec!["Git".into(), "ruff".into()];
+        p.dropdown_open = true;
+        let area = Rect::new(0, 0, 40, 10);
+        let mut buf = Buffer::empty(area);
+        (&mut p).render(area, &mut buf);
+        // The second name: the first is the selected channel's row.
+        let row = p.dropdown_items[1].0;
+        assert_eq!(buf[(row.x, row.y)].bg, loch.surfaces().unwrap().raised());
     }
 
     /// #846: the list was sized one row per channel and the box's border was

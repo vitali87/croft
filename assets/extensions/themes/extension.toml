@@ -8,7 +8,7 @@
 # from src/gradient.rs: accent #4fb1a6, selection #264f4a, button #0e7e76).
 id = "themes"
 name = "Color Themes"
-description = "The Croft Black and Croft Dark (Blue) color themes."
+description = "Croft Black, Croft Loch, Croft Dark (Blue), Croft Light, High Contrast and editor-inspired color themes."
 builtin = true
 api_version = 1
 
@@ -50,6 +50,39 @@ tab_inactive = "#2a2f3e"
 tab_active = "#1e3a6e"
 tab_hover = "#34507f"
 tab_close_pill = "#4e9aff"
+
+# --- Croft Loch: Croft Black's OLED canvas and teal brand, drawn as layered
+# surfaces instead of boxed panes (`surfaces`). The editor and terminal sit
+# on the black canvas; the side bar, activity bar, tab strip, panel title row
+# and status bar on `chrome`; the Command Palette and popups on `raised`; and
+# a one-eighth-cell `hairline` seam marks where two surfaces meet, the way VS
+# Code's 2026 themes separate regions by tone. Focus shows as the brand
+# gradient along the focused pane's top edge. Pane sizes, positions and
+# click targets are the same as every other theme's.
+[[themes]]
+id = "loch"
+label = "Croft Loch"
+background = "#000000"
+accent = "#4fb1a6"
+selection = "#264f4a"
+search = "#0b0d0e"
+button = "#0e7e76"
+gradient = true
+surfaces = true
+chrome = "#0e1011"
+raised = "#151819"
+hairline = "#23282a"
+fg_muted = "#7d8786"
+osk_key = "#20242b"
+osk_special = "#14161b"
+osk_armed = "#0e7e76"
+# The active tab wears the canvas so it joins the code beneath it; the rest
+# of the strip is chrome.
+tab_strip = "#0e1011"
+tab_inactive = "#0e1011"
+tab_active = "#000000"
+tab_hover = "#162323"
+tab_close_pill = "#264f4a"
 
 # --- Ten dark themes inspired by popular editors (VS Code, Zed, Neovim,
 # PyCharm). Each carries its editor's real code palette via the `syn_*` fields

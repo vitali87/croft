@@ -332,8 +332,8 @@ impl Widget for &mut ConnectDialog {
         block.render(rect, buf);
         // Black theme: overpaint the solid border with the gradient, then
         // re-stamp the title the gradient top edge just covered.
-        if self.theme.gradient() {
-            crate::gradient::paint_gradient_box(buf, rect);
+        if self.theme.framed_overlays() {
+            crate::widgets::surface::paint_overlay_frame(buf, rect, self.theme);
             buf.set_span(rect.x + 1, rect.y, &title, title.width() as u16);
         }
         self.last_area = rect;

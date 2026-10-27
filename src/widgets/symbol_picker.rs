@@ -239,8 +239,8 @@ pub fn render_symbol_picker(
         height: rect.height.saturating_sub(2),
     };
     Widget::render(block, rect, buf);
-    if theme.gradient() {
-        crate::gradient::paint_gradient_box(buf, rect);
+    if theme.framed_overlays() {
+        crate::widgets::surface::paint_overlay_frame(buf, rect, theme);
         buf.set_span(rect.x + 1, rect.y, &title, title.width() as u16);
     }
     let sel_bg = if theme.gradient() {

@@ -9,7 +9,7 @@ use ratatui::{
     buffer::Buffer,
     layout::Rect,
     style::{Color, Modifier, Style},
-    widgets::{Block, Borders, Widget},
+    widgets::Widget,
 };
 
 use crate::testing::model::{Activity, TestCase, TestStatus};
@@ -794,14 +794,16 @@ impl Widget for &mut TestingPanel {
         } else {
             Style::default().fg(Color::DarkGray)
         };
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(border_style);
+        let block = crate::widgets::surface::view_block(self.theme, true, border_style);
         let inner = block.inner(area);
         block.render(area, buf);
-        if self.focused && self.focus_gradient {
-            crate::gradient::paint_gradient_box(buf, area);
-        }
+        crate::widgets::surface::paint_view_focus(
+            buf,
+            area,
+            self.theme,
+            self.focused,
+            self.focus_gradient,
+        );
         self.last_area = area;
         self.last_output_hint = Rect::default();
         self.last_stop = Rect::default();

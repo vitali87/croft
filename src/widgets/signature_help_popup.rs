@@ -136,8 +136,8 @@ impl Widget for &SignatureHelpPopup {
 
         Widget::render(Clear, area, buf);
         Widget::render(Paragraph::new(Line::from(spans)).block(block), area, buf);
-        if self.theme.gradient() {
-            crate::gradient::paint_gradient_box(buf, area);
+        if self.theme.framed_overlays() {
+            crate::widgets::surface::paint_overlay_frame(buf, area, self.theme);
         }
     }
 }
