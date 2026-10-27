@@ -173,6 +173,46 @@ pub fn has_fonts() -> bool {
 /// image instead of a 1600px blur). Returns the PNG plus its pixel
 /// dimensions.
 pub fn rasterize(svg: &[u8]) -> Result<(Vec<u8>, u32, u32), String> {
+    render(svg).map(|r| (r.png, r.pixels.0, r.pixels.1))
+}
+
+/// A rendered SVG: the raster the image pipeline shows, and the size of the
+/// drawing it was rendered from.
+pub struct Raster {
+    pub png: Vec<u8>,
+    /// The PNG's pixel size, scaled toward [`RASTER_LONG_EDGE`]: a choice of
+    /// croft's rendering quality, not the drawing's size.
+    pub pixels: (u32, u32),
+    /// The SVG's own size (#1008), the size to show a user.
+    pub natural: NaturalSize,
+}
+
+/// An SVG's own size, as opposed to the raster croft renders it at.
+#[derive(Debug, Clone, PartialEq)]
+pub enum NaturalSize {
+    /// CSS pixels: its `width` and `height`, or its viewBox's when it names
+    /// none, with units such as `mm` converted at 96 per inch.
+    Px(f32, f32),
+    /// Its root `width` and `height` as written, when they are relative
+    /// (`50%`, or absent, which means `100%`) and no viewBox gives them
+    /// something to be relative to. Such an SVG takes its size from where it
+    /// is placed; usvg's 100×100 fallback says nothing about the drawing.
+    Relative(String, String),
+}
+
+/// The root's [`NaturalSize::Relative`] size, if it has no size of its own.
+fn relative_size(root: resvg::usvg::roxmltree::Node) -> Option<NaturalSize> {
+    if root.has_attribute("viewBox") {
+        return None;
+    }
+    let w = root.attribute("width").map_or("100%", str::trim);
+    let h = root.attribute("height").map_or("100%", str::trim);
+    (w.ends_with('%') || h.ends_with('%'))
+        .then(|| NaturalSize::Relative(w.to_string(), h.to_string()))
+}
+
+/// [`rasterize`], keeping the SVG's own size beside the raster's.
+pub fn render(svg: &[u8]) -> Result<Raster, String> {
     if nesting_depth(svg, MAX_SVG_DEPTH) > MAX_SVG_DEPTH {
         return Err(format!(
             "SVG nested too deeply to render (over {MAX_SVG_DEPTH} levels)"
@@ -186,7 +226,23 @@ pub fn rasterize(svg: &[u8]) -> Result<(Vec<u8>, u32, u32), String> {
         font_family: String::from("sans-serif"),
         ..Default::default()
     };
-    let tree = resvg::usvg::Tree::from_data(svg, &opts).map_err(|e| e.to_string())?;
+    // Parsed once, as `Tree::from_data` would, so the root's own `width`
+    // and `height` can be read before usvg resolves them.
+    let decompressed;
+    let data = if svg.starts_with(&[0x1f, 0x8b]) {
+        decompressed = resvg::usvg::decompress_svgz(svg).map_err(|e| e.to_string())?;
+        &decompressed[..]
+    } else {
+        svg
+    };
+    let text = std::str::from_utf8(data).map_err(|_| String::from("SVG data is not UTF-8"))?;
+    let xml = resvg::usvg::roxmltree::ParsingOptions {
+        allow_dtd: true,
+        ..Default::default()
+    };
+    let doc = resvg::usvg::roxmltree::Document::parse_with_options(text, xml)
+        .map_err(|e| e.to_string())?;
+    let tree = resvg::usvg::Tree::from_xmltree(&doc, &opts).map_err(|e| e.to_string())?;
     let size = tree.size();
     let (nw, nh) = (size.width().max(1.0), size.height().max(1.0));
     let long = nw.max(nh);
@@ -217,7 +273,12 @@ pub fn rasterize(svg: &[u8]) -> Result<(Vec<u8>, u32, u32), String> {
     let mut png = std::io::Cursor::new(Vec::new());
     img.write_to(&mut png, image::ImageFormat::Png)
         .map_err(|e| e.to_string())?;
-    Ok((png.into_inner(), w, h))
+    Ok(Raster {
+        png: png.into_inner(),
+        pixels: (w, h),
+        natural: relative_size(doc.root_element())
+            .unwrap_or(NaturalSize::Px(size.width(), size.height())),
+    })
 }
 
 #[cfg(test)]
@@ -235,6 +296,53 @@ mod tests {
         assert_eq!(img.dimensions(), (w, h));
         let px = img.get_pixel(w / 2, h / 2);
         assert_eq!((px[0], px[1], px[2], px[3]), (255, 0, 0, 255), "solid red");
+    }
+
+    /// #1008: the raster is scaled toward the long edge, so its size is not
+    /// the drawing's. A 200×100 SVG renders 1600×800 pixels and reports
+    /// 200×100 as its own size.
+    #[test]
+    fn the_natural_size_is_the_svgs_own_not_the_rasters() {
+        let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="100">
+            <rect width="200" height="100" fill="#0000ff"/>
+        </svg>"##;
+        let r = render(svg).unwrap();
+        assert_eq!(r.pixels, (1600, 800));
+        assert_eq!(r.natural, NaturalSize::Px(200.0, 100.0));
+        // No width or height: the viewBox gives the size.
+        let r =
+            render(br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 50 25"/>"#).unwrap();
+        assert_eq!(r.natural, NaturalSize::Px(50.0, 25.0));
+        // Physical units are CSS pixels at 96 per inch: one inch is 96.
+        let r = render(br#"<svg xmlns="http://www.w3.org/2000/svg" width="1in" height="0.5in"/>"#)
+            .unwrap();
+        assert_eq!(r.natural, NaturalSize::Px(96.0, 48.0));
+    }
+
+    /// #1008 review: relative sizes with no viewBox to be relative to leave
+    /// an SVG without a size of its own, so it is reported as written, not
+    /// as usvg's 100×100 fallback. With a viewBox, they resolve against it.
+    #[test]
+    fn a_relative_size_without_a_viewbox_is_reported_as_written() {
+        let natural = |svg: &str| render(svg.as_bytes()).unwrap().natural;
+        let relative = |w: &str, h: &str| NaturalSize::Relative(w.into(), h.into());
+        assert_eq!(
+            natural(r#"<svg xmlns="http://www.w3.org/2000/svg" width="50%" height="50%"/>"#),
+            relative("50%", "50%")
+        );
+        assert_eq!(
+            natural(r#"<svg xmlns="http://www.w3.org/2000/svg"/>"#),
+            relative("100%", "100%"),
+            "no width or height is 100%"
+        );
+        assert_eq!(
+            natural(r#"<svg xmlns="http://www.w3.org/2000/svg" width="200"/>"#),
+            relative("200", "100%")
+        );
+        assert_eq!(
+            natural(r#"<svg xmlns="http://www.w3.org/2000/svg" width="50%" viewBox="0 0 80 40"/>"#),
+            NaturalSize::Px(40.0, 40.0)
+        );
     }
 
     #[test]

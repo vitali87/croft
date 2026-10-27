@@ -56,6 +56,11 @@ pub struct ImageView {
     pub format_label: String,
     pub pixel_w: u32,
     pub pixel_h: u32,
+    /// The drawing's own size, as the header shows it, when the raster is a
+    /// scaled rendering of it: an SVG's CSS-pixel width and height (#1008).
+    /// Shown rather than `pixel_w`×`pixel_h`, which is croft's render
+    /// quality. `None` for bitmaps, whose pixels are their size.
+    pub natural_size: Option<String>,
     pub byte_size: u64,
     /// Monotonic content stamp, fresh on every (re)load of the bytes. Part
     /// of the overlay's re-emit key: a PDF rebuilt on disk reloads to the
@@ -169,11 +174,14 @@ fn render_image_placeholder(
             format_bytes_human(pdf.source_byte_size),
         )
     } else {
+        let size = match &image.natural_size {
+            Some(size) => size.clone(),
+            None => format!("{}×{}", image.pixel_w, image.pixel_h),
+        };
         format!(
-            " {} · {}×{} · {} · {} ",
+            " {} · {} · {} · {} ",
             name,
-            image.pixel_w,
-            image.pixel_h,
+            size,
             format_bytes_human(image.byte_size),
             image.format_label,
         )
@@ -187,6 +195,21 @@ fn render_image_placeholder(
             .bg(theme.ui(Color::Rgb(0x09, 0x4d, 0x77)))
             .add_modifier(Modifier::BOLD),
     );
+}
+
+/// A CSS-pixel size for the image header: each length whole when it is
+/// (nearly) whole, else to one decimal, so `10mm` reads `37.8` rather than
+/// `37.795277`.
+fn css_px_size((w, h): (f32, f32)) -> String {
+    let px = |v: f32| {
+        let tenths = (v * 10.0).round();
+        if tenths % 10.0 == 0.0 {
+            format!("{}", tenths / 10.0)
+        } else {
+            format!("{:.1}", tenths / 10.0)
+        }
+    };
+    format!("{}×{}", px(w), px(h))
 }
 
 /// An image drawn with half blocks (#1591): `rows` × `cols` cells, each a
@@ -6099,6 +6122,7 @@ impl Editor {
             format_label,
             pixel_w,
             pixel_h,
+            natural_size: None,
             byte_size: meta.len(),
             generation: next_image_generation(),
             pdf: None,
@@ -6338,8 +6362,11 @@ impl Editor {
             anyhow::bail!("SVG too large ({} bytes)", meta.len());
         }
         let src = std::fs::read(path)?;
-        let (png, pixel_w, pixel_h) =
-            crate::svg::rasterize(&src).map_err(|e| anyhow::anyhow!("SVG render failed: {e}"))?;
+        let crate::svg::Raster {
+            png,
+            pixels: (pixel_w, pixel_h),
+            natural,
+        } = crate::svg::render(&src).map_err(|e| anyhow::anyhow!("SVG render failed: {e}"))?;
         self.path = Some(path.to_path_buf());
         self.disk_stamp = Self::disk_stamp_of(path);
         self.disk_expect_absent = false;
@@ -6390,6 +6417,10 @@ impl Editor {
             format_label: String::from("SVG"),
             pixel_w,
             pixel_h,
+            natural_size: Some(match natural {
+                crate::svg::NaturalSize::Px(w, h) => css_px_size((w, h)),
+                crate::svg::NaturalSize::Relative(w, h) => format!("{w}×{h}"),
+            }),
             byte_size: meta.len(),
             generation: next_image_generation(),
             pdf: None,
@@ -6501,6 +6532,7 @@ impl Editor {
             format_label: String::from("PDF"),
             pixel_w,
             pixel_h,
+            natural_size: None,
             byte_size: meta.len(),
             generation: next_image_generation(),
             pdf: Some(PdfState {
@@ -25955,6 +25987,42 @@ mod tests {
         assert!(e.image.is_some(), "a path change resets force_text");
     }
 
+    /// #1008: the header names the SVG's own size. croft rasterises toward
+    /// a fixed long edge, so the raster's 1600×800 says nothing about a
+    /// 200×100 drawing.
+    #[test]
+    fn the_svg_header_shows_the_drawings_size_not_the_rasters() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("diagram.svg");
+        std::fs::write(
+            &p,
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="200" height="100">
+<rect width="200" height="100" fill="#0000ff"/></svg>"##,
+        )
+        .unwrap();
+        let mut e = Editor::new();
+        e.open(&p).unwrap();
+        let img = e.image.as_ref().expect("svg opens rendered");
+        assert_eq!((img.pixel_w, img.pixel_h), (1600, 800), "the raster");
+        let area = Rect::new(0, 0, 60, 4);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        render_image_placeholder(
+            img,
+            Some(&p),
+            area,
+            &mut buf,
+            Color::Reset,
+            crate::theme::Theme::default(),
+        );
+        let header: String = (0..area.width)
+            .map(|x| buf[(x, 0)].symbol().to_string())
+            .collect();
+        assert!(header.contains("diagram.svg · 200×100 ·"), "{header}");
+        assert!(!header.contains("1600"), "{header}");
+        assert_eq!(css_px_size((37.795_277, 96.0)), "37.8×96");
+        assert_eq!(css_px_size((199.98, 0.25)), "200×0.3");
+    }
+
     /// #257: a colour-bearing log opens rendered, escapes never reach the
     /// text, and "Reopen as Text" round-trips back to the raw bytes.
     #[test]
@@ -32337,6 +32405,7 @@ mod tests {
             format_label: String::from("PDF"),
             pixel_w: 1,
             pixel_h: 1,
+            natural_size: None,
             byte_size: 0,
             generation: 0,
             pdf: Some(PdfState {
@@ -35959,6 +36028,7 @@ mod tests {
             format_label: String::from("png"),
             pixel_w: 4,
             pixel_h: 4,
+            natural_size: None,
             byte_size: 1,
             generation: 0,
             pdf: None,
@@ -36025,6 +36095,7 @@ mod tests {
             format_label: String::from("png"),
             pixel_w: 4,
             pixel_h: 4,
+            natural_size: None,
             byte_size: 1,
             generation: 0,
             pdf: None,
