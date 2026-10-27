@@ -326,6 +326,8 @@ fn resize_arms_a_one_shot_terminal_clear_to_evict_stale_activity_icons() {
         codeql_active: String::new(),
         codeql_inactive: String::new(),
         codeql_hovered: String::new(),
+        sponsor_inactive: String::new(),
+        sponsor_hovered: String::new(),
         settings_active: String::new(),
         settings_inactive: String::new(),
         settings_hovered: String::new(),
@@ -391,6 +393,8 @@ fn activity_bar_icons_moving_within_the_flush_arms_a_one_shot_terminal_clear() {
         codeql_active: String::new(),
         codeql_inactive: String::new(),
         codeql_hovered: String::new(),
+        sponsor_inactive: String::new(),
+        sponsor_hovered: String::new(),
         settings_active: String::new(),
         settings_inactive: String::new(),
         settings_hovered: String::new(),
@@ -470,8 +474,8 @@ fn activity_icons_stay_visible_beside_the_centered_shortcuts_modal() {
     term.draw(|f| app.render(f)).unwrap();
     let before = app.pending_activity_image_overlays().len();
     assert_eq!(
-        before, 11,
-        "precondition: seven view icons (CodeQL's is added, not built in) + the settings gear + the three layout toolbar icons emit"
+        before, 12,
+        "precondition: seven view icons (CodeQL's is added, not built in) + the sponsor heart + the settings gear + the three layout toolbar icons emit"
     );
     app.handle_key(key(KeyCode::F(1), KeyModifiers::NONE))
         .unwrap();
@@ -1267,6 +1271,8 @@ fn hovering_a_non_selected_activity_icon_emits_its_hovered_variant() {
         codeql_active: "CA".into(),
         codeql_inactive: "CI".into(),
         codeql_hovered: "CH".into(),
+        sponsor_inactive: "HI".into(),
+        sponsor_hovered: "HH".into(),
         settings_active: "GA".into(),
         settings_inactive: "GI".into(),
         settings_hovered: "GH".into(),
@@ -1309,6 +1315,38 @@ fn hovering_a_non_selected_activity_icon_emits_its_hovered_variant() {
         emitted.contains(&"EA"),
         "the selected explorer view still wins with its active variant"
     );
+}
+
+/// #1940: the sponsor heart emits its resting bake, and swaps to its
+/// hovered one while the pointer is on it.
+#[test]
+fn hovering_the_sponsor_heart_emits_its_hovered_variant() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.overlays.activity.set_images(ActivityBarImages {
+        sponsor_inactive: "HI".into(),
+        sponsor_hovered: "HH".into(),
+        ..Default::default()
+    });
+    let emitted = |app: &App| -> Vec<String> {
+        app.pending_activity_image_overlays()
+            .into_iter()
+            .map(|(_, s)| s.to_string())
+            .collect()
+    };
+    draw(&mut app, 120, 40);
+    assert!(emitted(&app).contains(&"HI".to_string()));
+    let heart = app.sidebar_areas.sponsor_icon;
+    app.handle_mouse(crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::Moved,
+        column: heart.x,
+        row: heart.y,
+        modifiers: KeyModifiers::NONE,
+    });
+    assert_eq!(app.hovered_activity_icon, Some(ActivityIcon::Sponsor));
+    let hovered = emitted(&app);
+    assert!(hovered.contains(&"HH".to_string()), "{hovered:?}");
+    assert!(!hovered.contains(&"HI".to_string()), "{hovered:?}");
 }
 
 /// #1845: a collapsed side bar selects no view, as in VS Code, so its view's
