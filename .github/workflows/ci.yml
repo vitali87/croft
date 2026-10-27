@@ -178,7 +178,7 @@ jobs:
       # installs exactly the pinned channel and its components.
       - name: Install the pinned toolchain
         run: rustup show
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Formatting (pinned rustfmt, zero diffs)
         run: cargo fmt --check
       - name: Clippy (zero warnings)
@@ -223,7 +223,7 @@ jobs:
         # Adding to the default toolchain instead is precisely the bug this
         # job exists to catch.
         run: rustup target add ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: ${{ matrix.target }}
       - name: Install zig and cargo-zigbuild
@@ -264,7 +264,7 @@ jobs:
         run: rustup show
       - name: Add the Android target to the PINNED toolchain
         run: rustup target add aarch64-linux-android
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: aarch64-linux-android
       - name: Install cargo-ndk
