@@ -6,7 +6,9 @@ itself: it runs on every push to main, publishes every 50 bumps, gates its
 publish job on the script's verdict, hands the one write-capable token only
 to that job, and dispatches release.yml on the tag, which release.yml must
 therefore accept. It is the only workflow that starts a release, so crates.io
-and the GitHub releases hold the same versions (#1579).
+and the GitHub releases hold the same versions (#1579), and it uploads to
+crates.io only once that release is out, because binstall takes the version
+from crates.io and the archive from the release.
 """
 
 from __future__ import annotations
@@ -101,11 +103,12 @@ class WorkflowContract(unittest.TestCase):
 
     def test_upload_is_skipped_on_a_fresh_index_check(self):
         # decide's already_published goes stale when only the publish job is
-        # re-run after an upload that landed, so the upload asks again.
+        # re-run after an upload that landed, so the upload asks again. The
+        # dry run, the token and the upload all hang on that answer.
         _, publish = re.split(r"(?m)^  publish:$", self.text)
         self.assertIn("pc.fetch_index(pc.CRATE)", publish)
         self.assertEqual(
-            publish.count("if: steps.index.outputs.uploaded != 'true'"), 2
+            publish.count("if: steps.index.outputs.uploaded != 'true'"), 3
         )
         self.assertNotIn("needs.decide.outputs.already_published", publish)
 
@@ -127,12 +130,48 @@ class WorkflowContract(unittest.TestCase):
         self.assertIn("fetch-depth: 0", publish)
         lookup = publish.index('python3 scripts/release.py commit "$VERSION"')
         checkout = publish.index('git checkout -q --detach "$commit"')
-        upload = publish.index("run: cargo publish --locked")
+        dry_run = publish.index("run: cargo publish --locked --dry-run")
+        upload = publish.index("cargo publish --locked --no-verify")
         self.assertLess(lookup, checkout)
+        self.assertLess(checkout, dry_run)
         self.assertLess(checkout, upload)
         self.assertIn("COMMIT: ${{ steps.source.outputs.commit }}", publish)
         self.assertIn('git tag -a "$tag" -m "croft $VERSION" "$commit"', publish)
         self.assertNotIn("GITHUB_SHA", publish)
+
+    def test_crates_io_goes_last(self):
+        # binstall asks crates.io for the newest version, then downloads that
+        # version's archive from its GitHub release. Uploading first left
+        # crates.io naming a version whose archives were still building (20
+        # minutes for 0.2.82, 97 for 0.2.32). The dry run still comes first,
+        # so a crate that cannot be uploaded stops the release.
+        _, publish = re.split(r"(?m)^  publish:$", self.text)
+        order = [
+            "run: cargo publish --locked --dry-run",
+            'git push origin "refs/tags/$tag"',
+            'gh workflow run release.yml --ref "$tag"',
+            'until [ "$(release)" = 200 ]; do',
+            "uses: rust-lang/crates-io-auth-action@",
+            "cargo publish --locked --no-verify",
+        ]
+        at = [publish.index(marker) for marker in order]
+        self.assertEqual(at, sorted(at), order)
+        self.assertEqual(publish.count("cargo publish"), 2)
+        # The wait fits a slow release: about twenty minutes of builds, and a
+        # publish job that has waited over an hour for a runner.
+        timeout = re.search(r"(?m)^    timeout-minutes: (\d+)$", publish)
+        self.assertGreaterEqual(int(timeout.group(1)), 120)
+
+    def test_a_dispatched_release_leaves_crates_io_to_this_workflow(self):
+        # release.yml's own upload is for a tag pushed by hand. On a dispatch
+        # from here it would race the upload that follows the release.
+        release = RELEASE.read_text()
+        crates = release[release.index("\n  crates:\n") :]
+        crates = crates[: crates.index("\n  homebrew:\n")]
+        self.assertIn(
+            "if: startsWith(github.ref, 'refs/tags/v') && github.event_name == 'push'",
+            crates,
+        )
 
     def test_tag_yml_tags_but_starts_no_release(self):
         # When tag.yml also dispatched release.yml, every version got a
@@ -218,8 +257,18 @@ TOML = '[package]\nname = "croft-software"\nversion = "{}"\n'
 
 def tag_step() -> str:
     """tag.yml's one `run:` block, dedented."""
-    lines = TAG.read_text().splitlines()
-    at = next(i for i, line in enumerate(lines) if line.strip() == "run: |")
+    return run_block(TAG.read_text().splitlines(), 0)
+
+
+def publish_step(name: str) -> str:
+    """The `run:` block of publish-crate.yml's step called `name`, dedented."""
+    lines = WORKFLOW.read_text().splitlines()
+    return run_block(lines, lines.index(f"      - name: {name}"))
+
+
+def run_block(lines: list[str], start: int) -> str:
+    """The first `run: |` block at or after line `start`, dedented."""
+    at = next(i for i in range(start, len(lines)) if lines[i].strip() == "run: |")
     indent = len(lines[at]) - len(lines[at].lstrip())
     body = []
     for line in lines[at + 1 :]:
@@ -307,6 +356,155 @@ class TagRun(unittest.TestCase):
         out = self.run_for("M")
         self.assertNotEqual(out.returncode, 0, out.stdout)
         self.assertEqual(self.tags(), {"v0.2.11": "B"})
+
+
+# Stand-ins for `gh` and `curl` in publish-crate.yml's release step, sharing
+# one JSON state file. `curl` answers the release lookup with `code` until a
+# dispatch, then with `code` `lands_after` more times and 200 from then on
+# (never, when it is null). `gh run view` reports the run in progress until
+# it has been asked `ends_after` times, and `gh run list` shows a dispatched
+# run only from its `delay`-th call after the dispatch, as the API is late to
+# list one. Each answers only the exact call the step makes, so a changed
+# call fails here rather than passing.
+FAKE_RELEASE_GH = """\
+import json, os, sys
+
+path = os.environ["FAKE_STATE"]
+with open(path) as f:
+    state = json.load(f)
+tag = "v" + os.environ["VERSION"]
+args = sys.argv[1:]
+if args == ["run", "list", "--workflow", "release.yml", "--event", "workflow_dispatch",
+            "--branch", tag, "--limit", "1", "--json", "databaseId",
+            "--jq", '.[0].databaseId // ""']:
+    shown = state["runs"][:-1] if state["hidden"] else state["runs"]
+    state["hidden"] = max(state["hidden"] - 1, 0)
+    print(shown[-1] if shown else "")
+elif args == ["workflow", "run", "release.yml", "--ref", tag]:
+    state["runs"].append((state["runs"][-1] if state["runs"] else 0) + 1)
+    state["hidden"] = state["delay"]
+    state["dispatches"] += 1
+elif args[:2] == ["run", "view"] and args[3:] == ["--json", "status", "--jq", ".status"]:
+    state["viewed"].append(int(args[2]))
+    ends = state["ends_after"]
+    print("completed" if ends is not None and len(state["viewed"]) >= ends else "in_progress")
+else:
+    sys.exit("unexpected gh call: " + repr(args))
+with open(path, "w") as f:
+    json.dump(state, f)
+"""
+
+FAKE_RELEASE_CURL = """\
+import json, os, sys
+
+path = os.environ["FAKE_STATE"]
+with open(path) as f:
+    state = json.load(f)
+url = "{}/repos/{}/releases/tags/v{}".format(
+    os.environ["GITHUB_API_URL"], os.environ["GITHUB_REPOSITORY"], os.environ["VERSION"])
+assert sys.argv[1:6] == ["-sS", "-o", "/dev/null", "-w", "%{http_code}"], sys.argv
+assert sys.argv[-1] == url, sys.argv
+code = state["code"]
+if state["dispatches"]:
+    lands = state["lands_after"]
+    if lands is not None and state["checks"] >= lands:
+        code = 200
+    state["checks"] += 1
+sys.stdout.write(str(code))
+with open(path, "w") as f:
+    json.dump(state, f)
+"""
+
+
+@unittest.skipUnless(shutil.which("bash"), "needs bash")
+class ReleaseFirstRun(unittest.TestCase):
+    """publish-crate.yml's release step, run against fake `gh` and `curl`.
+    The upload after it runs only when it succeeds, so it must return once
+    the release is published and fail when the run ends without one."""
+
+    STEP = "Release on GitHub and wait for it"
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        bin_dir = self.dir / "bin"
+        bin_dir.mkdir()
+        for name, body in (
+            ("gh", FAKE_RELEASE_GH),
+            ("curl", FAKE_RELEASE_CURL),
+            ("sleep", ""),
+        ):
+            tool = bin_dir / name
+            tool.write_text(f"#!{sys.executable}\n{body}")
+            tool.chmod(0o755)
+        self.path = f"{bin_dir}{os.pathsep}{os.environ['PATH']}"
+        self.state = self.dir / "state.json"
+        self.summary = self.dir / "summary.md"
+        self.summary.write_text("")
+
+    def run_step(self, code=404, lands_after=None, ends_after=None, runs=(), delay=0):
+        self.state.write_text(json.dumps({
+            "code": code, "lands_after": lands_after, "ends_after": ends_after,
+            "runs": list(runs), "delay": delay, "hidden": 0,
+            "dispatches": 0, "checks": 0, "viewed": [],
+        }))
+        return subprocess.run(
+            ["bash", "-c", publish_step(self.STEP)],
+            env={
+                **os.environ,
+                "PATH": self.path,
+                "FAKE_STATE": str(self.state),
+                "GITHUB_API_URL": "https://api.github.com",
+                "GITHUB_REPOSITORY": "vitali87/croft",
+                "GITHUB_STEP_SUMMARY": str(self.summary),
+                "GH_TOKEN": "unused",
+                "VERSION": "0.2.82",
+            },
+            capture_output=True,
+            text=True,
+            check=False,
+            # `sleep` is a no-op here, so a wait that never ends spins.
+            timeout=60,
+        )
+
+    def result(self):
+        return json.loads(self.state.read_text())
+
+    def test_waits_for_the_dispatched_release(self):
+        out = self.run_step(lands_after=3)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(self.result()["dispatches"], 1)
+        self.assertEqual(self.result()["viewed"], [1, 1, 1])
+        self.assertIn("released **0.2.82** on GitHub", self.summary.read_text())
+
+    def test_a_release_already_out_dispatches_nothing(self):
+        # A re-run after the release went out but the upload did not.
+        out = self.run_step(code=200)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(self.result()["dispatches"], 0)
+
+    def test_a_run_that_ends_without_the_release_fails(self):
+        out = self.run_step(ends_after=2)
+        self.assertNotEqual(out.returncode, 0, out.stdout)
+        self.assertIn("ended without publishing v0.2.82", out.stdout)
+        self.assertEqual(self.summary.read_text(), "")
+
+    def test_a_release_that_lands_as_the_run_ends_counts(self):
+        out = self.run_step(lands_after=1, ends_after=1)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+
+    def test_the_new_run_is_followed_not_an_earlier_one(self):
+        # An earlier dispatch on the tag, a failed release run, stays listed
+        # and is the newest one until the API lists the new run.
+        out = self.run_step(lands_after=2, runs=[41], delay=2)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertEqual(set(self.result()["viewed"]), {42})
+
+    def test_a_failed_release_lookup_dispatches_nothing(self):
+        out = self.run_step(code=502)
+        self.assertNotEqual(out.returncode, 0, out.stdout)
+        self.assertIn("HTTP 502", out.stdout)
+        self.assertEqual(self.result()["dispatches"], 0)
 
 
 if __name__ == "__main__":
