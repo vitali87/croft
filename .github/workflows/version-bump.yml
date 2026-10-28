@@ -26,9 +26,9 @@
 # starts.
 #
 # tag.yml then tags the pushed release commit `v<version>`. Every
-# PUBLISH_EVERY versions, publish-crate.yml sends that version to crates.io
-# and starts release.yml, whose GitHub release carries the notes of every
-# version since the previous release.
+# PUBLISH_EVERY versions, publish-crate.yml starts release.yml, whose GitHub
+# release carries the notes of every version since the previous release, and
+# sends that version to crates.io once that release is out.
 name: version bump
 
 on:

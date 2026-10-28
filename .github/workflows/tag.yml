@@ -9,7 +9,7 @@ name: tag
 #
 # It does not start release.yml. publish-crate.yml decides which versions are
 # released (every PUBLISH_EVERY bumps, as code-graph-rag does) and sends each
-# one to crates.io and to release.yml together, so crates.io and the GitHub
+# one to release.yml and then to crates.io, so crates.io and the GitHub
 # releases hold the same versions (#1579). When this job started release.yml
 # too, every version got a GitHub release and only every fiftieth reached
 # crates.io.
