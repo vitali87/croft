@@ -3367,6 +3367,7 @@ fn first_paths(paths: &[String]) -> String {
 /// the `<<<<<<<` lines and the next commit would ship them. A conflicted
 /// file whose markers have been edited away stages as usual. `scope` holds
 /// the `root`-relative paths about to be staged; `None` means everything.
+/// The markers are found by [`leftover_conflict_markers`].
 fn refuse_conflict_markers(root: &Path, scope: Option<&[String]>) -> Result<(), String> {
     let unmerged = unmerged_paths(root);
     if unmerged.is_empty() {
@@ -3387,10 +3388,7 @@ fn refuse_conflict_markers(root: &Path, scope: Option<&[String]>) -> Result<(), 
             scope
                 .as_ref()
                 .is_none_or(|scope| scope.iter().any(|s| abs.starts_with(s)))
-                && std::fs::read_to_string(&abs).is_ok_and(|text| {
-                    let lines: Vec<String> = text.lines().map(String::from).collect();
-                    !crate::merge::find_conflicts(&lines).is_empty()
-                })
+                && leftover_conflict_markers(&top, rel)
         })
         .collect();
     if marked.is_empty() {
@@ -3405,6 +3403,22 @@ fn refuse_conflict_markers(root: &Path, scope: Option<&[String]>) -> Result<(), 
         "{} still {has} conflict markers: resolve {them} before staging",
         first_paths(&marked)
     ))
+}
+
+/// Whether git's own `diff --check` finds conflict markers in the unmerged
+/// `rel` (a path from the top of the repository at `top`). Reading the
+/// file ourselves missed three cases git handles: a file in Latin-1 or
+/// Shift_JIS, markers of another length set by a `conflict-marker-size`
+/// attribute, and marker lines both sides already had, such as a doc
+/// showing what a conflict looks like, which would block staging forever.
+fn leftover_conflict_markers(top: &Path, rel: &str) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(top)
+        .args(["--literal-pathspecs", "diff", "--check", "--no-color", "--"])
+        .arg(rel)
+        .output()
+        .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).contains("leftover conflict marker"))
 }
 
 /// Commit only what is already staged (`git commit -m`), leaving unstaged
@@ -7867,6 +7881,66 @@ git checkout -q main && sed 's/python pricing.py/uv run pricing.py/' README.md >
             "{err}"
         );
         assert_eq!(unmerged_paths(p), vec![String::from("README.md")]);
+    }
+
+    #[test]
+    fn a_conflict_in_a_non_utf8_file_is_refused_too() {
+        // A Latin-1 file can't be read as UTF-8; its markers still count.
+        let tmp = repo_in_a_conflicted_merge();
+        let p = tmp.path();
+        std::fs::write(
+            p.join("README.md"),
+            b"# Caf\xe9\n<<<<<<< HEAD\nuv\n=======\npython -m\n>>>>>>> hotfix\n",
+        )
+        .unwrap();
+        assert!(stage_all(p).is_err());
+        assert_eq!(unmerged_paths(p), vec![String::from("README.md")]);
+    }
+
+    #[test]
+    fn markers_of_a_conflict_marker_size_attribute_are_refused_too() {
+        // git writes ten-character markers for this file, which a scan for
+        // seven-character ones read as resolved.
+        let tmp = repo_in_a_conflicted_merge();
+        let p = tmp.path();
+        std::fs::write(
+            p.join(".gitattributes"),
+            "README.md conflict-marker-size=10\n",
+        )
+        .unwrap();
+        run_mutation(p, &["checkout", "--conflict=merge", "--", "README.md"]).unwrap();
+        let text = std::fs::read_to_string(p.join("README.md")).unwrap();
+        assert!(text.contains("<<<<<<<<<< ours"), "{text}");
+        assert!(stage_path(p, "README.md").is_err());
+    }
+
+    #[test]
+    fn a_resolved_file_that_shows_a_marker_example_both_sides_had_stages() {
+        // Negative: a doc that shows what a conflict looks like keeps that
+        // block after its real conflict is resolved; it must not block
+        // staging forever.
+        let tmp = TempDir::new().unwrap();
+        let script = r#"set -e
+git init -q -b main && git config user.email a@b && git config user.name a
+printf 'Example:\n<<<<<<< HEAD\nmine\n=======\nyours\n>>>>>>> br\n\nRun `python pricing.py`.\n' > GUIDE.md && git add . && git commit -qm init
+git checkout -qb hotfix && sed 's/python pricing.py/python -m pricing/' GUIDE.md > g.tmp && mv g.tmp GUIDE.md && git commit -qam fix
+git checkout -q main && sed 's/python pricing.py/uv run pricing.py/' GUIDE.md > g.tmp && mv g.tmp GUIDE.md && git commit -qam uv
+! git merge -q hotfix >/dev/null 2>&1
+sed -n '1,7p' GUIDE.md > g.tmp && echo 'Run `uv run -m pricing`.' >> g.tmp && mv g.tmp GUIDE.md"#;
+        let out = Command::new("sh")
+            .args(["-c", script])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let p = tmp.path();
+        assert_eq!(unmerged_paths(p), vec![String::from("GUIDE.md")]);
+        stage_all(p).expect("the example both sides had is not a conflict");
+        assert!(unmerged_paths(p).is_empty());
     }
 
     #[test]
