@@ -292,13 +292,7 @@ pub fn parse_workspace_file(path: &Path) -> Result<Vec<PathBuf>, String> {
             .get("path")
             .and_then(|p| p.as_str())
             .ok_or_else(|| format!("{}: folder entry without a path", path.display()))?;
-        let p = Path::new(p);
-        let abs = if p.is_absolute() {
-            p.to_path_buf()
-        } else {
-            base.join(p)
-        };
-        out.push(abs.canonicalize().unwrap_or(abs));
+        out.push(resolve_folder(base, p));
     }
     if out.is_empty() {
         return Err(format!("{}: no folders", path.display()));
@@ -306,22 +300,93 @@ pub fn parse_workspace_file(path: &Path) -> Result<Vec<PathBuf>, String> {
     Ok(out)
 }
 
-/// Write the folder set as a `.code-workspace` (#163): paths relative to
-/// the file's directory where possible — VS Code's recommendation, so the
-/// file survives being moved with its folders — absolute otherwise.
+/// A `folders[].path` as it opens: against the workspace file's directory
+/// `base` unless absolute, canonicalised when it exists.
+fn resolve_folder(base: &Path, p: &str) -> PathBuf {
+    let p = Path::new(p);
+    let abs = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        base.join(p)
+    };
+    abs.canonicalize().unwrap_or(abs)
+}
+
+/// Write the folder set as a `.code-workspace` (#163), or update the one
+/// already at `path`, as [`workspace_file_update`] says. A file that
+/// already lists exactly these folders is not touched.
 pub fn write_workspace_file(path: &Path, folders: &[PathBuf]) -> Result<(), String> {
-    let base = path.parent().unwrap_or_else(|| Path::new("."));
-    let base_canon = base.canonicalize().unwrap_or_else(|_| base.to_path_buf());
-    let entries: Vec<serde_json::Value> = folders
-        .iter()
-        .map(|f| serde_json::json!({ "path": relative_to_base(base, &base_canon, f) }))
-        .collect();
-    let doc = serde_json::json!({ "folders": entries });
-    let json = serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?;
+    let Some(text) = workspace_file_update(path, folders)? else {
+        return Ok(());
+    };
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     }
-    std::fs::write(path, json).map_err(|e| format!("write {}: {e}", path.display()))
+    std::fs::write(path, text).map_err(|e| format!("write {}: {e}", path.display()))
+}
+
+/// The text that makes the `.code-workspace` at `path` list `folders`, or
+/// `None` when it already does.
+///
+/// A new file names each folder relative to the file's directory where
+/// possible (VS Code's recommendation, so the file survives being moved
+/// with its folders), absolute otherwise.
+///
+/// An existing file is usually a team's committed one (#1012), so only its
+/// `folders` array changes, edited in place by [`crate::jsonc_edit`]: its
+/// settings, launch and task configs, recommended extensions and comments
+/// stay as written, and a folder it already lists keeps its entry, `name`
+/// and path spelling included. Rebuilt from scratch, the file lost all of
+/// that. A file that is not a JSONC object, or cannot be edited in place,
+/// is an error rather than replaced.
+pub fn workspace_file_update(path: &Path, folders: &[PathBuf]) -> Result<Option<String>, String> {
+    use serde_json::Value;
+    let existing = match std::fs::read_to_string(path) {
+        Ok(text) => Some(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(format!("read {}: {e}", path.display())),
+    };
+    let left = |why: &str| format!("{} {why}; it was left as it is", path.display());
+    let mut doc = match &existing {
+        Some(text) => serde_json::from_str::<Value>(&crate::tasks::strip_jsonc(text))
+            .ok()
+            .filter(Value::is_object)
+            .ok_or_else(|| left("is not a workspace file"))?,
+        None => serde_json::json!({}),
+    };
+    let base = path.parent().unwrap_or_else(|| Path::new("."));
+    let base_canon = base.canonicalize().unwrap_or_else(|_| base.to_path_buf());
+    let listed = doc
+        .get("folders")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let entries = folders
+        .iter()
+        .map(|f| {
+            let want = f.canonicalize().unwrap_or_else(|_| f.clone());
+            listed
+                .iter()
+                .find(|e| {
+                    e.get("path")
+                        .and_then(Value::as_str)
+                        .is_some_and(|p| resolve_folder(base, p) == want)
+                })
+                .cloned()
+                .unwrap_or_else(
+                    || serde_json::json!({ "path": relative_to_base(base, &base_canon, f) }),
+                )
+        })
+        .collect();
+    doc["folders"] = Value::Array(entries);
+    let Some(text) = existing else {
+        return serde_json::to_string_pretty(&doc)
+            .map(Some)
+            .map_err(|e| e.to_string());
+    };
+    let updated =
+        crate::jsonc_edit::update(&text, &doc).ok_or_else(|| left("cannot be edited in place"))?;
+    Ok((updated != text).then_some(updated))
 }
 
 /// One folder's entry for the workspace file: relative to the file's own
@@ -723,6 +788,93 @@ mod tests {
         assert!(
             parse_workspace_file(&mixed).is_err(),
             "an entry without a path rejects the whole file"
+        );
+    }
+
+    /// The issue's committed team file, with the comments a team leaves.
+    const TEAM_FILE: &str = r#"{
+  // Opened by the whole team: keep folder names short.
+  "folders": [
+    { "path": "." },
+    // vendored helpers
+    { "path": "../wsx_lib", "name": "shared lib" }
+  ],
+  "settings": {
+    "python.defaultInterpreterPath": ".venv/bin/python", // the project venv
+    "editor.formatOnSave": true
+  },
+  /* F5 runs the app */
+  "launch": { "version": "0.2.0", "configurations": [ { "name": "Run app", "type": "debugpy", "request": "launch", "program": "${workspaceFolder}/app.py" } ] },
+  "extensions": { "recommendations": ["ms-python.python"] }
+}
+"#;
+
+    /// `wsx` holding the team file, beside `wsx_lib` and `extra`.
+    fn team_workspace() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().canonicalize().unwrap();
+        for d in ["wsx", "wsx_lib", "extra"] {
+            std::fs::create_dir(root.join(d)).unwrap();
+        }
+        let file = root.join("wsx/wsx.code-workspace");
+        std::fs::write(&file, TEAM_FILE).unwrap();
+        (tmp, root, file)
+    }
+
+    /// #1012: saving the folders a team file already lists leaves it byte
+    /// for byte; it was rewritten as `{"folders": [...]}` alone, deleting
+    /// the settings, launch configs, extensions, names and comments.
+    #[test]
+    fn saving_the_same_folders_leaves_a_team_workspace_file_as_it_is() {
+        let (_tmp, root, file) = team_workspace();
+        let folders = [root.join("wsx"), root.join("wsx_lib")];
+        assert_eq!(workspace_file_update(&file, &folders), Ok(None));
+        write_workspace_file(&file, &folders).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), TEAM_FILE);
+    }
+
+    /// #1012: an added folder changes only `folders`, and a removed one
+    /// takes only its own entry; the rest of the file, comments included,
+    /// stays as written.
+    #[test]
+    fn a_changed_folder_set_rewrites_only_the_folders_of_a_team_file() {
+        let (_tmp, root, file) = team_workspace();
+        let three = [root.join("wsx"), root.join("wsx_lib"), root.join("extra")];
+        write_workspace_file(&file, &three).unwrap();
+        let out = std::fs::read_to_string(&file).unwrap();
+        assert_eq!(
+            out,
+            TEAM_FILE.replace(
+                "\"shared lib\" }\n",
+                "\"shared lib\" },\n    {\n      \"path\": \"../extra\"\n    }\n"
+            )
+        );
+        assert_eq!(parse_workspace_file(&file).unwrap(), three);
+
+        write_workspace_file(&file, &[root.join("wsx"), root.join("extra")]).unwrap();
+        let out = std::fs::read_to_string(&file).unwrap();
+        assert!(!out.contains("wsx_lib"), "{out}");
+        assert!(out.contains("// the project venv"), "{out}");
+        let mut want: serde_json::Value =
+            serde_json::from_str(&crate::tasks::strip_jsonc(TEAM_FILE)).unwrap();
+        want["folders"] = serde_json::json!([{ "path": "." }, { "path": "../extra" }]);
+        let got: serde_json::Value =
+            serde_json::from_str(&crate::tasks::strip_jsonc(&out)).unwrap();
+        assert_eq!(got, want);
+    }
+
+    /// Negative (#1012): a file that is not a workspace is refused, never
+    /// replaced by one.
+    #[test]
+    fn a_file_that_is_not_a_workspace_is_not_saved_over() {
+        let (_tmp, root, _) = team_workspace();
+        let notes = root.join("notes.code-workspace");
+        std::fs::write(&notes, "my notes, not JSON").unwrap();
+        let err = write_workspace_file(&notes, &[root.join("wsx")]).unwrap_err();
+        assert!(err.contains("not a workspace file"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(&notes).unwrap(),
+            "my notes, not JSON"
         );
     }
 

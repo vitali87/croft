@@ -2235,6 +2235,63 @@ fn save_workspace_as_keeps_the_suggested_path() {
     assert!(!app.status.contains("created folder"), "{}", app.status);
 }
 
+/// #1012: Save Workspace As suggests the team's committed file. Listing the
+/// same folders, it is left alone; with another folder, saving asks first,
+/// and a yes changes only `folders`, keeping names, configs and comments.
+#[test]
+fn save_workspace_as_asks_before_changing_a_team_file_and_keeps_the_rest_of_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    for d in ["wsx", "wsx_lib", "extra"] {
+        std::fs::create_dir(root.join(d)).unwrap();
+    }
+    let file = root.join("wsx/wsx.code-workspace");
+    let team = "{\n  \"folders\": [ { \"path\": \".\" }, { \"path\": \"../wsx_lib\", \"name\": \"shared lib\" } ],\n  // F5 runs the app\n  \"launch\": { \"configurations\": [ { \"name\": \"Run app\" } ] }\n}\n";
+    std::fs::write(&file, team).unwrap();
+    let mut app = App::new(root.join("wsx")).unwrap();
+    app.open_workspace_file(&file);
+    let save = |app: &mut App| {
+        app.run_command(crate::widgets::command_palette::Command::SaveWorkspaceAs);
+        assert_eq!(
+            app.input_prompt.as_ref().unwrap().value,
+            file.display().to_string()
+        );
+        app.submit_input_prompt();
+    };
+    save(&mut app);
+    assert!(app.input_prompt.is_none(), "nothing to ask: {}", app.status);
+    assert!(app.status.contains("already up to date"), "{}", app.status);
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), team);
+
+    app.add_workspace_folder(root.join("extra"));
+    save(&mut app);
+    assert!(app.input_prompt.as_ref().is_some_and(|p| p.confirm));
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.input_prompt.is_none());
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        team,
+        "Esc keeps it"
+    );
+
+    save(&mut app);
+    app.submit_input_prompt();
+    let out = std::fs::read_to_string(&file).unwrap();
+    assert!(
+        app.status.starts_with("Saved workspace (3 folders)"),
+        "{}",
+        app.status
+    );
+    assert_eq!(
+        out,
+        team.replace(
+            "\"shared lib\" }",
+            "\"shared lib\" }, {\"path\":\"../extra\"}"
+        )
+    );
+}
+
 #[test]
 fn workspace_folder_set_persists_across_sessions_and_reroots() {
     // #153: the folder set lived only in memory — reopening the same
