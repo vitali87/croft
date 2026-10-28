@@ -3375,7 +3375,15 @@ fn has_staged_changes(root: &Path) -> Result<bool, String> {
         .env("GIT_OPTIONAL_LOCKS", "0")
         // `--no-relative`: with `diff.relative` set, a subdirectory root
         // would see only what is staged under it, and a commit takes it all.
-        .args(["diff", "--cached", "--quiet", "--no-relative"])
+        // `--ignore-submodules=none`: `diff.ignoreSubmodules` hides a staged
+        // submodule update from diff, but `git commit` still records it.
+        .args([
+            "diff",
+            "--cached",
+            "--quiet",
+            "--no-relative",
+            "--ignore-submodules=none",
+        ])
         .output()
         .map_err(|e| format!("failed to spawn git: {e}"))?;
     match output.status.code() {
@@ -7565,6 +7573,29 @@ filename seed.txt
         std::fs::create_dir(&sub).unwrap();
         assert_eq!(has_staged_changes(&sub), Ok(true));
         commit(&sub, "ready part").expect("commit");
+        assert_eq!(git_in(p, &["show", "HEAD:wip.txt"]), "draft");
+    }
+
+    #[test]
+    fn a_staged_submodule_update_counts_despite_diff_ignore_submodules() {
+        // `diff.ignoreSubmodules=all` hid the staged gitlink, so the commit
+        // took `-a` and swept the unstaged edit in with it.
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        repo_with_two_edits(p);
+        git_in(p, &["config", "diff.ignoreSubmodules", "all"]);
+        let head = git_in(p, &["rev-parse", "HEAD"]);
+        git_in(
+            p,
+            &[
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                &format!("160000,{head},lib"),
+            ],
+        );
+        assert_eq!(has_staged_changes(p), Ok(true));
+        commit(p, "bump lib").expect("commit");
         assert_eq!(git_in(p, &["show", "HEAD:wip.txt"]), "draft");
     }
 
