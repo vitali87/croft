@@ -968,8 +968,19 @@ fn render_sheet(
                         .fg(theme.accent_contrast_fg())
                         .bg(theme.accent())
                         .add_modifier(Modifier::BOLD);
-                    write_cell(buf, body_x + *x_off, y, w, cell_text, cursor_style);
+                    if sheet.null_cells.contains(&(row_idx, *c)) {
+                        let null_style = cursor_style.add_modifier(Modifier::ITALIC);
+                        let null = crate::sqlite_view::NULL_LABEL;
+                        write_cell(buf, body_x + *x_off, y, w, null, null_style);
+                    } else {
+                        write_cell(buf, body_x + *x_off, y, w, cell_text, cursor_style);
+                    }
                 }
+            } else if sheet.null_cells.contains(&(row_idx, *c)) {
+                // SQL NULL (#1002): dimmed, so it reads apart from `''`.
+                let null_style = style.fg(Color::DarkGray).add_modifier(Modifier::ITALIC);
+                let null = crate::sqlite_view::NULL_LABEL;
+                write_cell(buf, body_x + *x_off, y, w, null, null_style);
             } else {
                 write_cell(buf, body_x + *x_off, y, w, cell_text, style);
             }
@@ -2137,13 +2148,29 @@ fn write_cell(buf: &mut Buffer, x: u16, y: u16, w: u16, text: &str, style: Style
     let max_chars = w as usize;
     // Overflow is cut plainly with no trailing ellipsis marker (the user wants
     // no ellipsis anywhere in croft).
-    let content: String = text.chars().take(max_chars).collect();
+    let content: String = text.chars().take(max_chars).map(visible_control).collect();
     let mut padded = content;
     let pad_count = max_chars.saturating_sub(padded.chars().count());
     for _ in 0..pad_count {
         padded.push(' ');
     }
     buf.set_string(x, y, &padded, style);
+}
+
+/// A control character as a glyph a cell can show (#1002): the buffer drops
+/// control characters, so `line1\nline2\ttabbed` read `line1line2tabbed`.
+/// One glyph per character, so a cell's width and an edit's caret still count
+/// characters: `⏎` for a newline, `→` for a tab, a control picture (`␍`,
+/// `␀`, `␡`) for the rest.
+fn visible_control(c: char) -> char {
+    match c {
+        '\n' => '\u{23ce}',
+        '\t' => '\u{2192}',
+        '\u{0}'..='\u{1f}' => char::from_u32(0x2400 + c as u32).unwrap_or('\u{fffd}'),
+        '\u{7f}' => '\u{2421}',
+        c if c.is_control() => '\u{fffd}',
+        c => c,
+    }
 }
 
 fn format_bytes_human(n: u64) -> String {
@@ -11911,17 +11938,14 @@ impl Editor {
             // last page instead (counting only then, as Ctrl+End does).
             let fetch = |page| crate::sqlite_view::table_page(path, &table, page).ok();
             let found = match fetch(place.page) {
-                Some(got) if !got.1.is_empty() => Some((place.page, got)),
+                Some(got) if !got.rows.is_empty() => Some((place.page, got)),
                 _ => crate::sqlite_view::last_page(path, &table)
                     .ok()
                     .filter(|&l| l > 0 && l < place.page)
                     .and_then(|l| fetch(l).map(|got| (l, got))),
             };
-            if let Some((page, (headers, rows, more))) = found {
-                let label = crate::sqlite_view::page_label(&table, page, rows.len(), more);
-                let mut data = crate::sheet::sheet_data_from_parts(label, headers, rows);
-                data.row_base = page * crate::sqlite_view::ROW_CAP;
-                view.sheets[idx] = data;
+            if let Some((page, got)) = found {
+                view.sheets[idx] = got.into_sheet(&table, page);
                 view.sqlite_pages[idx].1 = page;
             }
         }
@@ -26658,6 +26682,48 @@ mod tests {
             .collect::<Vec<_>>()
             .join(",");
         assert!(all.contains("hello") && all.contains("42"), "cells: {all}");
+    }
+
+    /// #1002: the grid shows a SQL NULL as a dimmed `NULL`, apart from an
+    /// empty string, and a cell's newline and tab as `⏎` and `→` instead of
+    /// dropping them.
+    #[test]
+    fn the_sheet_grid_shows_null_and_control_characters() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("shop.db");
+        rusqlite::Connection::open(&p)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE c (country TEXT, notes TEXT);
+                 INSERT INTO c VALUES (NULL, 'a' || char(10) || 'b' || char(9) || 'c'), ('', 'x');",
+            )
+            .unwrap();
+        let mut view = crate::sqlite_view::open_database(&p).unwrap();
+        // The cursor sits on row 2's first cell, so row 1 draws plainly.
+        view.sheets[0].cur_row = 1;
+        let area = Rect::new(0, 0, 40, 6);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        render_sheet(
+            &mut view,
+            Some(&p),
+            area,
+            &mut buf,
+            Color::Reset,
+            crate::theme::Theme::default(),
+        );
+        let row = |y: u16| -> String { (0..area.width).map(|x| buf[(x, y)].symbol()).collect() };
+        // Header pill, column headers, then the body.
+        let first = row(2);
+        assert!(first.contains("NULL"), "{first}");
+        assert!(first.contains("a\u{23ce}b\u{2192}c"), "{first}");
+        let null_x = first.find("NULL").unwrap() as u16;
+        let cell = &buf[(null_x, 2)];
+        assert!(
+            cell.modifier.contains(Modifier::ITALIC),
+            "NULL is styled apart"
+        );
+        assert_eq!(cell.fg, Color::DarkGray);
+        assert!(!row(3).contains("NULL"), "'' stays empty: {}", row(3));
     }
 
     #[test]

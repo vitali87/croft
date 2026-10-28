@@ -242,8 +242,9 @@ quick-xml = "0.39"
 # `bundled` compiles sqlite3 in, so no system dependency on any target;
 # opened with SQLITE_OPEN_READONLY so a live application database is
 # never locked or mutated. 0.40.2 verified current on crates.io
-# 2026-08-19.
-rusqlite = { version = "0.40", features = ["bundled"] }
+# 2026-08-19. `hooks` (no extra crates) gives the progress handler that stops
+# a view's query past its time budget instead of freezing the open (#1002).
+rusqlite = { version = "0.40", features = ["bundled", "hooks"] }
 zip = { version = "7", default-features = false, features = ["deflate"] }
 # Read-only TOML parser for the Explorer DEPENDENCIES view: extracts the
 # dependency list from `pyproject.toml` (PEP 621 `[project].dependencies` or
