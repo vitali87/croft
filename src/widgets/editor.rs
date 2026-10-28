@@ -2173,7 +2173,7 @@ fn visible_control(c: char) -> char {
     }
 }
 
-fn format_bytes_human(n: u64) -> String {
+pub(crate) fn format_bytes_human(n: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = KB * 1024;
     if n >= MB {

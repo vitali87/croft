@@ -51,6 +51,12 @@ pub enum InstallSource {
 /// What a Homebrew user runs instead of croft's own updater.
 pub const BREW_UPGRADE: &str = "brew upgrade croft";
 
+/// The GitHub page of `version`'s release, whose notes cover every version
+/// since the release before it.
+pub fn release_notes_url(version: &str) -> String {
+    format!("https://github.com/vitali87/croft/releases/tag/v{version}")
+}
+
 /// Classify `exe`, the canonical path of the running binary (symlinks such
 /// as `/opt/homebrew/bin/croft` already resolved into the Cellar).
 pub fn install_source(exe: &Path) -> InstallSource {
@@ -81,6 +87,28 @@ pub fn current_install_source() -> InstallSource {
         .unwrap_or(InstallSource::SelfManaged)
 }
 
+/// A release croft can offer, with what the update popup says about it
+/// besides its version: the day it was published and how much this machine
+/// downloads to stage it. Either is `None` when the release does not say.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Release {
+    pub version: String,
+    /// `YYYY-MM-DD`, the date part of GitHub's `published_at`.
+    pub published: Option<String>,
+    /// Bytes of this machine's release archive, when staging fetches one
+    /// rather than building from crates.io.
+    pub size: Option<u64>,
+}
+
+impl From<&str> for Release {
+    fn from(version: &str) -> Self {
+        Release {
+            version: version.to_string(),
+            ..Release::default()
+        }
+    }
+}
+
 /// The on-disk memory of the check, one small JSON file in the cache dir.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct CheckCache {
@@ -90,12 +118,39 @@ pub struct CheckCache {
     /// The newest release tag seen (without the leading `v`).
     #[serde(default)]
     pub latest: Option<String>,
-    /// A version the user chose Later on: never offered again.
+    /// [`Release::published`] for `latest`.
+    #[serde(default)]
+    pub published: Option<String>,
+    /// [`Release::size`] for `latest`.
+    #[serde(default)]
+    pub size: Option<u64>,
+    /// A version the user chose Skip on: never offered again.
     #[serde(default)]
     pub dismissed: Option<String>,
 }
 
 impl CheckCache {
+    /// Remember `release` as the newest, its details with it: an answer
+    /// replaces all three, so details never outlive their version.
+    pub fn set_latest(&mut self, release: Option<Release>) {
+        let (latest, published, size) = match release {
+            Some(r) => (Some(r.version), r.published, r.size),
+            None => (None, None, None),
+        };
+        self.latest = latest;
+        self.published = published;
+        self.size = size;
+    }
+
+    /// `latest` with the details remembered about it.
+    pub fn latest_release(&self) -> Option<Release> {
+        Some(Release {
+            version: self.latest.clone()?,
+            published: self.published.clone(),
+            size: self.size,
+        })
+    }
+
     pub fn load(cache_dir: &Path) -> Self {
         std::fs::read_to_string(cache_dir.join(CACHE_FILE))
             .ok()
@@ -151,9 +206,9 @@ pub fn should_query(cache: &CheckCache, now_secs: u64) -> bool {
     now_secs < cache.checked_at || now_secs - cache.checked_at >= CHECK_INTERVAL.as_secs()
 }
 
-/// The version to offer, if the cache knows one newer than `current` that
+/// The release to offer, if the cache knows one newer than `current` that
 /// the user has not already declined.
-pub fn offer_from(cache: &CheckCache, current: &str) -> Option<String> {
+pub fn offer_from(cache: &CheckCache, current: &str) -> Option<Release> {
     let latest = cache.latest.as_deref()?;
     if !is_newer(latest, current) {
         return None;
@@ -161,7 +216,56 @@ pub fn offer_from(cache: &CheckCache, current: &str) -> Option<String> {
     if cache.dismissed.as_deref() == Some(latest) {
         return None;
     }
-    Some(latest.to_string())
+    cache.latest_release()
+}
+
+/// What the popup says about the release in `json` besides `version`: the
+/// day it was published and, when staging fetches this machine's archive
+/// (`triple`, see [`release_has_archive`]), that archive's size.
+pub fn release_details(json: &str, version: String, triple: Option<&str>) -> Release {
+    let v: serde_json::Value = serde_json::from_str(json).unwrap_or_default();
+    let published = v
+        .get("published_at")
+        .and_then(|p| p.as_str())
+        .and_then(|p| p.get(..10))
+        .filter(|d| date_label(d).is_some())
+        .map(str::to_string);
+    let size = triple
+        .filter(|t| release_has_archive(json, t))
+        .and_then(|t| {
+            let archive = format!("croft-{t}.tar.gz");
+            v.get("assets")?
+                .as_array()?
+                .iter()
+                .find(|a| a.get("name").and_then(|n| n.as_str()) == Some(archive.as_str()))?
+                .get("size")?
+                .as_u64()
+        });
+    Release {
+        version,
+        published,
+        size,
+    }
+}
+
+/// `2026-03-03` as the popup writes it, `Mar 3, 2026`; `None` for anything
+/// that is not a calendar date.
+pub fn date_label(date: &str) -> Option<String> {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let mut it = date.split('-');
+    let (y, m, d) = (it.next()?, it.next()?, it.next()?);
+    if it.next().is_some() || y.len() != 4 || m.len() != 2 || d.len() != 2 {
+        return None;
+    }
+    let year: u32 = y.parse().ok()?;
+    let month: usize = m.parse().ok()?;
+    let day: u32 = d.parse().ok()?;
+    let name = MONTHS.get(month.checked_sub(1)?)?;
+    (1..=31)
+        .contains(&day)
+        .then(|| format!("{name} {day}, {year}"))
 }
 
 fn now_secs() -> u64 {
@@ -253,13 +357,13 @@ fn crate_version_published(version: &str) -> Option<bool> {
 /// `None` when GitHub (or, when it is consulted, crates.io) could not be
 /// asked; `Some(None)` when it answered
 /// but the latest release is not one this install can stage.
-fn fetch_latest() -> Option<Option<String>> {
+fn fetch_latest() -> Option<Option<Release>> {
     fetch_latest_checked().ok()
 }
 
 /// [`fetch_latest`] saying why it could not ask (#1844): the newest release
 /// this install can stage, `None` when there is none, or the reason.
-pub fn fetch_latest_checked() -> Result<Option<String>, String> {
+pub fn fetch_latest_checked() -> Result<Option<Release>, String> {
     let resp = http_agent(RELEASES_LATEST_URL)
         .get(RELEASES_LATEST_URL)
         .set("Accept", "application/vnd.github+json")
@@ -274,15 +378,16 @@ pub fn fetch_latest_checked() -> Result<Option<String>, String> {
     latest_from_release_json(&body).ok_or_else(unreadable)?;
     let triple =
         prebuilt_triple().filter(|_| crate::remote_prebuilt::eligible(env!("CARGO_MANIFEST_DIR")));
-    installable_release(&body, triple, &crate_version_published)
-        .ok_or_else(|| String::from("crates.io could not be reached"))
+    let version = installable_release(&body, triple, &crate_version_published)
+        .ok_or_else(|| String::from("crates.io could not be reached"))?;
+    Ok(version.map(|v| release_details(&body, v, triple)))
 }
 
 /// A check the user asked for (#1844): unlike the daily one it always asks
 /// the network, offers a version they said Later to, and says what it
 /// found, failures included.
 pub struct ManualCheck {
-    rx: Receiver<Result<Option<String>, String>>,
+    rx: Receiver<Result<Option<Release>, String>>,
 }
 
 impl ManualCheck {
@@ -292,16 +397,16 @@ impl ManualCheck {
     pub fn start_with(
         cache_dir: PathBuf,
         current_version: String,
-        fetch: fn() -> Result<Option<String>, String>,
+        fetch: fn() -> Result<Option<Release>, String>,
     ) -> Self {
         let (tx, rx) = channel();
         std::thread::spawn(move || {
             let verdict = fetch().map(|latest| {
                 let mut cache = CheckCache::load(&cache_dir);
-                cache.latest = latest.clone();
+                cache.set_latest(latest.clone());
                 cache.checked_at = now_secs();
                 let _ = cache.save(&cache_dir);
-                latest.filter(|v| is_newer(v, &current_version))
+                latest.filter(|r| is_newer(&r.version, &current_version))
             });
             let _ = tx.send(verdict);
         });
@@ -309,16 +414,16 @@ impl ManualCheck {
     }
 
     /// The verdict once it lands; `None` while still checking.
-    pub fn take(&self) -> Option<Result<Option<String>, String>> {
+    pub fn take(&self) -> Option<Result<Option<Release>, String>> {
         self.rx.try_recv().ok()
     }
 }
 
-/// One background answer: `Some(version)` when a newer release is available
+/// One background answer: `Some(release)` when a newer release is available
 /// and not dismissed, `None` otherwise (including every failure - the
 /// editor never learns why, it just does not nag).
 pub struct UpdateCheck {
-    rx: Receiver<Option<String>>,
+    rx: Receiver<Option<Release>>,
 }
 
 impl UpdateCheck {
@@ -334,7 +439,7 @@ impl UpdateCheck {
     pub fn start_with(
         cache_dir: PathBuf,
         current_version: String,
-        fetch: impl FnOnce() -> Option<Option<String>> + Send + 'static,
+        fetch: impl FnOnce() -> Option<Option<Release>> + Send + 'static,
     ) -> Self {
         let (tx, rx) = channel();
         std::thread::spawn(move || {
@@ -344,7 +449,7 @@ impl UpdateCheck {
                 // version remembered before this check knew to ask whether
                 // it can be installed is not offered again (#1579).
                 if let Some(latest) = fetch() {
-                    cache.latest = latest;
+                    cache.set_latest(latest);
                 }
                 // Stamped on failure too: a blocked or rate-limited endpoint
                 // must not be asked again on every launch, and every launch
@@ -359,19 +464,19 @@ impl UpdateCheck {
 
     /// Block for the verdict (tests only; the app polls with [`Self::take`]).
     #[cfg(test)]
-    pub fn wait(&self) -> Option<String> {
+    pub fn wait(&self) -> Option<Release> {
         self.rx
             .recv_timeout(Duration::from_secs(10))
             .expect("the check answers")
     }
 
     /// The verdict once it lands; `None` while still checking.
-    pub fn take(&self) -> Option<Option<String>> {
+    pub fn take(&self) -> Option<Option<Release>> {
         self.rx.try_recv().ok()
     }
 
     #[cfg(test)]
-    pub fn preloaded(offer: Option<String>) -> Self {
+    pub fn preloaded(offer: Option<Release>) -> Self {
         let (tx, rx) = channel();
         let _ = tx.send(offer);
         Self { rx }
@@ -757,6 +862,7 @@ mod tests {
             checked_at: 1_000_000,
             latest: Some("0.1.5".into()),
             dismissed: None,
+            ..CheckCache::default()
         };
         assert!(!should_query(&fresh, 1_000_000 + 3600));
         assert!(should_query(&fresh, 1_000_000 + CHECK_INTERVAL.as_secs()));
@@ -776,15 +882,17 @@ mod tests {
             checked_at: 1,
             latest: Some("0.1.5".into()),
             dismissed: None,
+            ..CheckCache::default()
         };
-        assert_eq!(offer_from(&cache, "0.1.4").as_deref(), Some("0.1.5"));
+        let offered = |cache: &CheckCache| offer_from(cache, "0.1.4").map(|r| r.version);
+        assert_eq!(offered(&cache).as_deref(), Some("0.1.5"));
         assert_eq!(offer_from(&cache, "0.1.5"), None, "already current");
         assert_eq!(offer_from(&cache, "0.1.6"), None, "ahead of the release");
         cache.dismissed = Some("0.1.5".into());
-        assert_eq!(offer_from(&cache, "0.1.4"), None, "Later means not again");
+        assert_eq!(offered(&cache), None, "Skip means not again");
         cache.latest = Some("0.1.6".into());
         assert_eq!(
-            offer_from(&cache, "0.1.4").as_deref(),
+            offered(&cache).as_deref(),
             Some("0.1.6"),
             "a newer release than the dismissed one is offered"
         );
@@ -797,6 +905,7 @@ mod tests {
             checked_at: 7,
             latest: Some("0.1.5".into()),
             dismissed: None,
+            ..CheckCache::default()
         }
         .save(dir.path())
         .unwrap();
@@ -1050,14 +1159,18 @@ mod tests {
     /// not, offers a version they said Later to, and records what it found.
     #[test]
     fn a_manual_check_says_what_it_found() {
-        fn offline() -> Result<Option<String>, String> {
+        fn offline() -> Result<Option<Release>, String> {
             Err(String::from(OFFLINE_REASON))
         }
-        fn newer() -> Result<Option<String>, String> {
-            Ok(Some(String::from("9.0.0")))
+        fn newer() -> Result<Option<Release>, String> {
+            Ok(Some(Release {
+                version: String::from("9.0.0"),
+                published: Some(String::from("2026-03-03")),
+                size: Some(33_700_000),
+            }))
         }
-        fn same() -> Result<Option<String>, String> {
-            Ok(Some(String::from("1.0.0")))
+        fn same() -> Result<Option<Release>, String> {
+            Ok(Some(Release::from("1.0.0")))
         }
         let wait = |check: ManualCheck| loop {
             if let Some(v) = check.take() {
@@ -1073,14 +1186,19 @@ mod tests {
             checked_at: now_secs(),
             latest: None,
             dismissed: Some(String::from("9.0.0")),
+            ..CheckCache::default()
         }
         .save(&dir)
         .unwrap();
         let start = |fetch| ManualCheck::start_with(dir.clone(), String::from("1.0.0"), fetch);
         assert_eq!(wait(start(offline)), Err(String::from(OFFLINE_REASON)));
         assert_eq!(wait(start(same)), Ok(None));
-        assert_eq!(wait(start(newer)), Ok(Some(String::from("9.0.0"))));
-        assert_eq!(CheckCache::load(&dir).latest.as_deref(), Some("9.0.0"));
+        assert_eq!(wait(start(newer)), Ok(newer().unwrap()));
+        assert_eq!(
+            CheckCache::load(&dir).latest_release(),
+            newer().unwrap(),
+            "the details are remembered with the version"
+        );
     }
 
     /// #1579: GitHub's v0.2.28 release with its macOS and Linux archives.
@@ -1175,6 +1293,83 @@ mod tests {
         );
     }
 
+    /// The popup's Released and Size rows come from the release JSON the
+    /// check already fetched: the size only when staging downloads this
+    /// machine's archive, since a crates.io build downloads something else.
+    #[test]
+    fn release_details_read_the_date_and_this_machines_archive_size() {
+        let json = r#"{"tag_name":"v0.2.90","published_at":"2026-03-03T17:04:11Z","assets":[
+            {"name":"croft-x86_64-apple-darwin.tar.gz","size":33700000},
+            {"name":"croft-x86_64-unknown-linux-musl.tar.gz","size":21329278},
+            {"name":"SHA256SUMS","size":828},
+            {"name":"SHA256SUMS.sigstore.json","size":10119}]}"#;
+        let details = release_details(json, "0.2.90".into(), Some("x86_64-apple-darwin"));
+        assert_eq!(
+            details,
+            Release {
+                version: "0.2.90".into(),
+                published: Some("2026-03-03".into()),
+                size: Some(33_700_000),
+            }
+        );
+        let built = release_details(json, "0.2.90".into(), None);
+        assert_eq!(
+            (built.published.as_deref(), built.size),
+            (Some("2026-03-03"), None)
+        );
+        let elsewhere = release_details(json, "0.2.90".into(), Some("riscv64gc-unknown-linux-gnu"));
+        assert_eq!(elsewhere.size, None, "no archive for this machine");
+        let bare = release_details(r#"{"published_at":"soon"}"#, "1.0.0".into(), None);
+        assert_eq!(
+            bare,
+            Release::from("1.0.0"),
+            "an unreadable date is left out"
+        );
+    }
+
+    #[test]
+    fn dates_read_the_way_the_popup_writes_them() {
+        assert_eq!(date_label("2026-03-03").as_deref(), Some("Mar 3, 2026"));
+        assert_eq!(date_label("2026-12-31").as_deref(), Some("Dec 31, 2026"));
+        for bad in [
+            "2026-13-01",
+            "2026-00-10",
+            "2026-01-32",
+            "26-01-01",
+            "2026-1-1",
+            "soon",
+        ] {
+            assert_eq!(date_label(bad), None, "{bad}");
+        }
+    }
+
+    /// A new answer replaces the details with the version, so a size read
+    /// for one release is never shown beside another.
+    #[test]
+    fn the_cache_keeps_details_with_their_version() {
+        let mut cache = CheckCache::default();
+        cache.set_latest(Some(Release {
+            version: "0.2.90".into(),
+            published: Some("2026-03-03".into()),
+            size: Some(1),
+        }));
+        cache.set_latest(Some(Release::from("0.2.91")));
+        assert_eq!(cache.latest_release(), Some(Release::from("0.2.91")));
+        cache.set_latest(None);
+        assert_eq!(cache, CheckCache::default());
+        // A cache written before the details existed still loads.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(CACHE_FILE),
+            r#"{"checked_at":5,"latest":"0.2.90","dismissed":null}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            CheckCache::load(dir.path()).latest_release(),
+            Some(Release::from("0.2.90"))
+        );
+    }
+
     #[test]
     fn crates_io_says_which_versions_cargo_can_install() {
         let listed = r#"{"version":{"num":"0.2.28","yanked":false}}"#;
@@ -1226,6 +1421,7 @@ mod tests {
             checked_at: 1,
             latest: Some("0.2.28".into()),
             dismissed: None,
+            ..CheckCache::default()
         }
         .save(dir.path())
         .unwrap();
@@ -1244,10 +1440,11 @@ mod tests {
             checked_at: 1,
             latest: Some("0.2.28".into()),
             dismissed: None,
+            ..CheckCache::default()
         }
         .save(dir.path())
         .unwrap();
         let check = UpdateCheck::start_with(dir.path().to_path_buf(), "0.2.3".into(), || None);
-        assert_eq!(check.wait().as_deref(), Some("0.2.28"));
+        assert_eq!(check.wait().map(|r| r.version).as_deref(), Some("0.2.28"));
     }
 }

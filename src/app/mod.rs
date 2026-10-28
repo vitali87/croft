@@ -1051,6 +1051,10 @@ impl BottomPanelTab {
     }
 }
 
+/// Rows the port toast takes: its box, a title line and a button row. The
+/// update card stacks above it when both are up.
+const PORT_TOAST_HEIGHT: u16 = 4;
+
 /// A transient, click-only notification that a browsable port just appeared in
 /// the terminal. It never captures keystrokes — the terminal owns those — so
 /// the user clicks an action or lets it auto-dismiss. The forward actions only
@@ -1086,19 +1090,36 @@ enum PairLockDenial {
     Io,
 }
 
-/// The bottom-left "a newer croft is available" popup (#333). Click-only
-/// like the port toast: it never takes a keystroke from the editor or a
-/// terminal. It is down while the staged build runs (the status bar shows
-/// that, #1852) and comes back with `ready` set, offering Relaunch instead
-/// of Update/Later, once the build has landed.
+/// The bottom-left "a newer croft is available" popup (#333), a card in
+/// the manner of Ghostty's (`widgets/update_popup.rs`) over its status-bar
+/// pill. Click-only like the port toast: it never takes a keystroke from
+/// the editor or a terminal. It is down while the staged build runs (the
+/// status bar shows that, #1852) and comes back with `ready` set, offering
+/// Relaunch instead of Update, once the build has landed.
 struct UpdateToast {
-    version: String,
+    release: crate::update_check::Release,
     ready: bool,
     /// Why the last Update did not stage the version (#1844): said in the
     /// popup, which then offers Retry.
     failed: Option<&'static str>,
-    /// Action button hit rects, recomputed each render.
+    /// False once Later folded the card into its status-bar pill, which
+    /// opens it again.
+    open: bool,
+    /// Action hit rects, recomputed each render.
     buttons: Vec<(Rect, UpdateToastAction)>,
+}
+
+impl UpdateToast {
+    /// The open card offering `release`.
+    fn offer(release: crate::update_check::Release) -> Self {
+        UpdateToast {
+            release,
+            ready: false,
+            failed: None,
+            open: true,
+            buttons: Vec::new(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1106,10 +1127,19 @@ enum UpdateToastAction {
     /// Stage the new version in the background; nothing on PATH changes.
     /// Labelled Retry once an Update has failed.
     Update,
-    /// Dismiss, and never offer this version again.
+    /// Never offer this version again.
+    Skip,
+    /// Fold the card into its status-bar pill. Nothing is remembered, so
+    /// the next launch offers the version again.
     Later,
     /// Swap the staged binary in and re-exec - the only path that updates.
     Relaunch,
+    /// Copy `brew upgrade croft`, the one upgrade a Homebrew install takes.
+    CopyCommand,
+    /// Open the release's notes on GitHub.
+    ReleaseNotes,
+    /// Open a failed staging's log in an editor tab.
+    InstallLog,
 }
 
 /// Which producer an [`crate::update_watch::UpdateEvent`] came from: the
@@ -5125,6 +5155,9 @@ pub struct App {
     /// The croft update pills ("Update ready", the drift rebuild hint); a
     /// click does what the updater chord does (#865).
     status_update_rect: Rect,
+    /// The "Update Available" pill under the update card; a click opens or
+    /// folds the card.
+    status_offer_rect: Rect,
     status_indent_rect: Rect,
     status_encoding_rect: Rect,
     status_eol_rect: Rect,
@@ -5167,9 +5200,10 @@ pub struct App {
     /// A check the user asked for with Help: Update croft when nothing was
     /// on offer (#1844), and how it asks the network (stubbed in tests).
     manual_update_check: Option<crate::update_check::ManualCheck>,
-    update_fetch: fn() -> Result<Option<String>, String>,
+    update_fetch: fn() -> Result<Option<crate::update_check::Release>, String>,
     /// The "vX available" popup, present from the offer landing until the
-    /// user picks Update, Later, or (once staged) Relaunch.
+    /// user picks Update, Skip, or (once staged) Relaunch; Later only folds
+    /// it into its status-bar pill.
     update_toast: Option<UpdateToast>,
     /// Whether this binary may update itself, or belongs to a package
     /// manager that must do it (#375). Read once at startup.
@@ -7025,6 +7059,7 @@ impl App {
             status_wide: false,
             status_codeql_rect: Rect::default(),
             status_update_rect: Rect::default(),
+            status_offer_rect: Rect::default(),
             status_indent_rect: Rect::default(),
             status_encoding_rect: Rect::default(),
             status_eol_rect: Rect::default(),
@@ -22876,16 +22911,39 @@ impl App {
         if let Some(span) = self.perf.status_span() {
             spans.push(span);
         }
+        // The pill the update card rises from and Later folds it into; a
+        // click opens or folds the card. Recorded as (start column, width).
+        let offer_chip_x: u16 = spans.iter().map(|s| s.content.chars().count() as u16).sum();
+        if let Some(toast) = self.update_toast.as_ref().filter(|t| !t.ready) {
+            let hovered =
+                crate::widgets::hover::contains(self.status_offer_rect, self.pointer_cell);
+            spans.extend(crate::widgets::update_popup::pill_spans(
+                &format!(
+                    "{} Update Available: v{}",
+                    crate::widgets::update_popup::PACKAGE_GLYPH,
+                    toast.release.version
+                ),
+                crate::widgets::update_popup::pill_fill(self.theme, hovered),
+                Color::White,
+            ));
+        }
+        let offer_chip_end: u16 = spans.iter().map(|s| s.content.chars().count() as u16).sum();
+        let offer_chip =
+            (offer_chip_end > offer_chip_x).then(|| (offer_chip_x, offer_chip_end - offer_chip_x));
+        if offer_chip.is_some() {
+            spans.push(Span::raw(" "));
+        }
         // Both update pills are one click target, doing what the updater
         // chord does (#865); recorded as (start column, width).
         let update_chip_x: u16 = spans.iter().map(|s| s.content.chars().count() as u16).sum();
         if self.any_update_ready() {
-            spans.push(Span::styled(
-                format!(" ⟳ Update ready - {UPDATE_CROFT_CHORD} to relaunch "),
-                Style::default()
-                    .bg(self.theme.ui(Color::Rgb(0x1f, 0x7a, 0x33)))
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
+            spans.extend(crate::widgets::update_popup::pill_spans(
+                &format!(
+                    "{} Update ready - {UPDATE_CROFT_CHORD} to relaunch",
+                    crate::widgets::update_popup::READY_GLYPH
+                ),
+                self.theme.ui(Color::Rgb(0x1f, 0x7a, 0x33)),
+                Color::White,
             ));
         }
         if let Some(current) = self.local_drift.as_ref()
@@ -23231,6 +23289,15 @@ impl App {
             },
             _ => Rect::default(),
         };
+        self.status_offer_rect = match offer_chip {
+            Some((x, w)) if status_h > 0 && x < status_rect.width => Rect {
+                x: status_rect.x + x,
+                y: status_rect.y,
+                width: w.min(status_rect.width - x),
+                height: 1,
+            },
+            _ => Rect::default(),
+        };
         // Diagnostics hit rect (left group), for click-to-PROBLEMS.
         self.status_diag_rect = if status_h > 0 {
             Rect {
@@ -23420,6 +23487,11 @@ impl App {
                 self.status_update_rect = Rect::default();
             } else if self.status_update_rect.right() > rx {
                 self.status_update_rect.width = rx - self.status_update_rect.x;
+            }
+            if self.status_offer_rect.x >= rx {
+                self.status_offer_rect = Rect::default();
+            } else if self.status_offer_rect.right() > rx {
+                self.status_offer_rect.width = rx - self.status_offer_rect.x;
             }
             if self.status_diag_rect.x >= rx {
                 // Entirely behind the cluster: not on screen, so not a target.
@@ -24889,7 +24961,7 @@ impl App {
 
         let area = frame.area();
         let width = (inner_w + 4).min(area.width.saturating_sub(2));
-        let height: u16 = 4;
+        let height = PORT_TOAST_HEIGHT;
         let status_h: u16 = if self.status_bar_visible { 1 } else { 0 };
         if area.width < width + 2 || area.height < height + status_h + 1 {
             return;
@@ -24959,128 +25031,159 @@ impl App {
         }
     }
 
-    /// Paint the update-available popup in the bottom-LEFT corner (the
-    /// port toast owns the right) and record its button rects. Click-only,
-    /// like the port toast: it never captures keystrokes (#333).
+    /// Paint the update card in the bottom-LEFT corner (the port toast
+    /// owns the right), above the status-bar pill it folds into, and record
+    /// its controls' rects. Click-only, like the port toast: it never
+    /// captures keystrokes (#333). A screen too short for the whole card
+    /// gets it without the release-notes link, then without the rows past
+    /// Version.
     fn render_update_toast(&mut self, frame: &mut ratatui::Frame) {
-        let Some(toast) = self.update_toast.as_ref() else {
+        let Some(toast) = self.update_toast.as_ref().filter(|t| t.open) else {
+            if let Some(t) = self.update_toast.as_mut() {
+                t.buttons.clear();
+            }
             return;
         };
-        let version = toast.version.clone();
-        let ready = toast.ready;
-        let failed = toast.failed;
-        let accent = self.theme.accent();
-        let btn_bg = self.theme.button();
-        let brew = self.install_source == crate::update_check::InstallSource::Homebrew;
-        let actions: Vec<(String, UpdateToastAction)> = if ready {
-            vec![(" Relaunch ".to_string(), UpdateToastAction::Relaunch)]
-        } else if brew {
-            // Homebrew upgrades it (#375); the popup can only name the
-            // command and be dismissed.
-            vec![(" Later ".to_string(), UpdateToastAction::Later)]
-        } else {
-            let update = if failed.is_some() {
-                " Retry "
-            } else {
-                " Update "
-            };
-            vec![
-                (update.to_string(), UpdateToastAction::Update),
-                (" Later ".to_string(), UpdateToastAction::Later),
-            ]
-        };
-        let title_line = if ready {
-            format!("\u{27f3} croft v{version} is ready - relaunch to update")
-        } else if let Some(reason) = failed {
-            format!("\u{2717} croft v{version} was not installed: {reason}")
-        } else if brew {
-            format!(
-                "\u{27f3} croft v{version} is available - run `{}`",
-                crate::update_check::BREW_UPGRADE
-            )
-        } else {
-            format!(
-                "\u{27f3} croft v{version} is available (you have v{})",
-                env!("CARGO_PKG_VERSION")
-            )
-        };
-        let buttons_w: u16 = actions
-            .iter()
-            .map(|(l, _)| l.chars().count() as u16 + 1)
-            .sum::<u16>()
-            + 1;
-        let inner_w = buttons_w.max(title_line.chars().count() as u16);
+        let mut card = self.update_card(toast);
         let area = frame.area();
-        let width = (inner_w + 4).min(area.width.saturating_sub(2));
-        let height: u16 = 4;
+        let width = crate::widgets::update_popup::WIDTH.min(area.width.saturating_sub(2));
         let status_h: u16 = if self.status_bar_visible { 1 } else { 0 };
         // The port toast owns the bottom-right band; at ordinary widths
         // this popup's title reaches into it, so stack above it instead.
-        let stack: u16 = if self.port_toast.is_some() { height } else { 0 };
-        if area.width < width + 2 || area.height < height + status_h + 1 + stack {
+        let stack: u16 = if self.port_toast.is_some() {
+            PORT_TOAST_HEIGHT
+        } else {
+            0
+        };
+        let room = area.height.saturating_sub(status_h + 1 + stack);
+        if card.height(width) > room {
+            card.link = None;
+            card.rows.truncate(1);
+        }
+        let height = card.height(width);
+        if width < crate::widgets::update_popup::MIN_WIDTH || height > room {
+            if let Some(t) = self.update_toast.as_mut() {
+                t.buttons.clear();
+            }
             return;
         }
         let rect = Rect {
             x: area.x + 1,
-            y: area.y + area.height - height - status_h - 1 - stack,
+            y: area.y + room - height,
             width,
             height,
         };
-        let block = ratatui::widgets::Block::default()
-            .borders(ratatui::widgets::Borders::ALL)
-            .border_style(Style::default().fg(accent))
-            .style(Style::default().bg(self.theme.editor_bg()))
-            .title(ratatui::text::Span::styled(
-                " UPDATE ",
-                Style::default().fg(accent).add_modifier(Modifier::BOLD),
-            ));
-        frame.render_widget(ratatui::widgets::Clear, rect);
-        frame.render_widget(block, rect);
-        let inner = Rect {
-            x: rect.x + 2,
-            y: rect.y + 1,
-            width: rect.width.saturating_sub(4),
-            height: rect.height.saturating_sub(2),
-        };
-        let buf = frame.buffer_mut();
-        buf.set_stringn(
-            inner.x,
-            inner.y,
-            &title_line,
-            inner.width as usize,
-            Style::default().fg(self.theme.ui(Color::Rgb(0xCC, 0xCC, 0xCC))),
-        );
-        let mut bx = inner.x;
-        let by = inner.y + 1;
-        let mut rects: Vec<(Rect, UpdateToastAction)> = Vec::new();
-        for (label, action) in &actions {
-            let w = label.chars().count() as u16;
-            if bx + w > inner.x + inner.width {
-                break;
-            }
-            buf.set_stringn(
-                bx,
-                by,
-                label,
-                w as usize,
-                Style::default()
-                    .fg(Color::White)
-                    .bg(btn_bg)
-                    .add_modifier(Modifier::BOLD),
-            );
-            rects.push((
-                Rect {
-                    x: bx,
-                    y: by,
-                    width: w,
-                    height: 1,
-                },
-                *action,
-            ));
-            bx += w + 1;
-        }
+        let hits = card.render(frame.buffer_mut(), rect, self.theme, self.pointer_cell);
         if let Some(t) = self.update_toast.as_mut() {
-            t.buttons = rects;
+            t.buttons = hits;
+        }
+    }
+
+    /// What the update card says for `toast`: its state's glyph and title,
+    /// the release's details, a line of prose where the state needs one,
+    /// and Skip / Later / the primary action.
+    fn update_card(
+        &self,
+        toast: &UpdateToast,
+    ) -> crate::widgets::update_popup::Card<UpdateToastAction> {
+        use crate::widgets::update_popup::{
+            Card, ERROR_GLYPH, LOG_GLYPH, NOTES_GLYPH, PACKAGE_GLYPH, READY_GLYPH,
+        };
+        let release = &toast.release;
+        let brew = self.install_source == crate::update_check::InstallSource::Homebrew;
+        let installed = format!("v{}", env!("CARGO_PKG_VERSION"));
+        let mut rows = vec![
+            ("Version", format!("v{}", release.version)),
+            (
+                "Installed",
+                if brew {
+                    format!("{installed} (Homebrew)")
+                } else {
+                    installed
+                },
+            ),
+        ];
+        if let Some(date) = release
+            .published
+            .as_deref()
+            .and_then(crate::update_check::date_label)
+        {
+            rows.push(("Released", date));
+        }
+        if let Some(size) = release.size {
+            rows.push(("Size", crate::widgets::editor::format_bytes_human(size)));
+        }
+        let button = |label: &str, action| (String::from(label), action);
+        let skip = button("Skip", UpdateToastAction::Skip);
+        let later = button("Later", UpdateToastAction::Later);
+        let accent = self.theme.accent();
+        let (glyph, glyph_color, title, message, buttons) = if toast.ready {
+            (
+                READY_GLYPH,
+                self.theme.ui(Color::Rgb(0x89, 0xd1, 0x85)),
+                "Update Ready",
+                Some(String::from(
+                    "Relaunching keeps open files and unsaved edits; terminals restart.",
+                )),
+                vec![later, button("Relaunch", UpdateToastAction::Relaunch)],
+            )
+        } else if let Some(reason) = toast.failed {
+            (
+                ERROR_GLYPH,
+                self.theme.ui(Color::Rgb(0xf1, 0x4c, 0x4c)),
+                "Update Failed",
+                Some(format!("Not installed: {reason}.")),
+                vec![skip, later, button("Retry", UpdateToastAction::Update)],
+            )
+        } else if brew {
+            // Homebrew upgrades it (#375): the card names the command and
+            // copies it.
+            (
+                PACKAGE_GLYPH,
+                accent,
+                "Update Available",
+                Some(format!(
+                    "Homebrew manages this install. Update it with `{}`.",
+                    crate::update_check::BREW_UPGRADE
+                )),
+                vec![
+                    skip,
+                    later,
+                    button("Copy Command", UpdateToastAction::CopyCommand),
+                ],
+            )
+        } else {
+            (
+                PACKAGE_GLYPH,
+                accent,
+                "Update Available",
+                None,
+                vec![skip, later, button("Update", UpdateToastAction::Update)],
+            )
+        };
+        // A failure's own story is in its log; otherwise, what the release
+        // brings.
+        let link = if toast.failed.is_some() {
+            (
+                LOG_GLYPH,
+                String::from("View the Install Log"),
+                UpdateToastAction::InstallLog,
+            )
+        } else {
+            (
+                NOTES_GLYPH,
+                format!("What's New in v{}", release.version),
+                UpdateToastAction::ReleaseNotes,
+            )
+        };
+        Card {
+            glyph,
+            glyph_color,
+            title: String::from(title),
+            rows,
+            message,
+            buttons,
+            link: Some(link),
         }
     }
 
@@ -46930,15 +47033,10 @@ impl App {
             return false;
         };
         self.update_check = None;
-        let Some(version) = verdict else {
+        let Some(release) = verdict else {
             return false;
         };
-        self.update_toast = Some(UpdateToast {
-            version,
-            ready: false,
-            failed: None,
-            buttons: Vec::new(),
-        });
+        self.update_toast = Some(UpdateToast::offer(release));
         true
     }
 
@@ -47083,7 +47181,7 @@ impl App {
             .update_toast
             .as_ref()
             .filter(|t| !t.ready)
-            .map(|t| t.version.clone())
+            .map(|t| t.release.version.clone())
         {
             // The popup's Update, from the keyboard (#1844).
             self.start_staged_update(version);
@@ -47113,14 +47211,9 @@ impl App {
         };
         self.manual_update_check = None;
         self.status = match verdict {
-            Ok(Some(version)) => {
-                let status = format!("croft v{version} is available");
-                self.update_toast = Some(UpdateToast {
-                    version,
-                    ready: false,
-                    failed: None,
-                    buttons: Vec::new(),
-                });
+            Ok(Some(release)) => {
+                let status = format!("croft v{} is available", release.version);
+                self.update_toast = Some(UpdateToast::offer(release));
                 status
             }
             Ok(None) => format!("croft v{} is up to date", env!("CARGO_PKG_VERSION")),
@@ -47196,10 +47289,8 @@ impl App {
                             // popup comes back saying why it failed, with
                             // Retry and Later one click away (#1844).
                             self.update_toast = Some(UpdateToast {
-                                version: version.clone(),
-                                ready: false,
                                 failed: Some(reason),
-                                buttons: Vec::new(),
+                                ..UpdateToast::offer(version.as_str().into())
                             });
                             format!(
                                 "croft v{version} was not installed: {reason} - see {} (still on v{})",
@@ -47238,10 +47329,8 @@ impl App {
                     );
                     if staged && let Some(install) = self.staged_install.as_ref() {
                         self.update_toast = Some(UpdateToast {
-                            version: install.version.clone(),
                             ready: true,
-                            failed: None,
-                            buttons: Vec::new(),
+                            ..UpdateToast::offer(install.version.as_str().into())
                         });
                     }
                 }
@@ -53298,12 +53387,12 @@ impl App {
         changed
     }
 
-    /// A click on one of the update popup's buttons (#333). Update stages
-    /// the build, whose progress the status bar shows (#1852); it, Later
-    /// and Relaunch all take the popup down. A click elsewhere returns
-    /// false.
+    /// A click on one of the update popup's controls (#333). Update stages
+    /// the build, whose progress the status bar shows (#1852); it, Skip
+    /// and Relaunch take the popup down, Later folds it into its pill, and
+    /// the link opens the release notes. A click elsewhere returns false.
     fn handle_update_toast_click(&mut self, x: u16, y: u16) -> bool {
-        let Some(toast) = self.update_toast.as_ref() else {
+        let Some(toast) = self.update_toast.as_ref().filter(|t| t.open) else {
             return false;
         };
         let Some(action) = toast
@@ -53314,7 +53403,7 @@ impl App {
         else {
             return false;
         };
-        let version = toast.version.clone();
+        let version = toast.release.version.clone();
         match action {
             UpdateToastAction::Update => {
                 if self.staged_install.is_none() && self.self_install.is_none() {
@@ -53323,9 +53412,29 @@ impl App {
                     self.status = String::from("croft is already updating in the background");
                 }
             }
-            UpdateToastAction::Later => {
+            UpdateToastAction::Skip => {
                 self.update_toast = None;
                 self.dismiss_update_offer(&version);
+            }
+            UpdateToastAction::Later => {
+                if let Some(t) = self.update_toast.as_mut() {
+                    t.open = false;
+                }
+            }
+            UpdateToastAction::CopyCommand => {
+                let command = crate::update_check::BREW_UPGRADE;
+                self.status = self
+                    .copy_where_pasted(command)
+                    .status(&format!("`{command}`"));
+            }
+            UpdateToastAction::ReleaseNotes => {
+                self.open_url_for_user(&crate::update_check::release_notes_url(&version));
+            }
+            UpdateToastAction::InstallLog => {
+                let log = staged_install_log_path();
+                if let Err(e) = self.open_at(&log, 0, 0) {
+                    self.status = format!("Could not open {}: {e:#}", log.display());
+                }
             }
             UpdateToastAction::Relaunch => {
                 self.update_toast = None;
@@ -61062,6 +61171,12 @@ impl App {
             }
             if rect_contains(self.status_codeql_rect, m.column, m.row) {
                 self.cancel_codeql_run();
+                return;
+            }
+            if rect_contains(self.status_offer_rect, m.column, m.row) {
+                if let Some(t) = self.update_toast.as_mut() {
+                    t.open = !t.open;
+                }
                 return;
             }
             if rect_contains(self.status_update_rect, m.column, m.row) {
