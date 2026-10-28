@@ -1,0 +1,2 @@
+feature: Croft Loch is the default color theme: a fresh install, or a config that never picked a theme, opens on Croft Black's black canvas and teal drawn as layered surfaces. A theme you already picked, Croft Black included, stays as it is.
+fix: Under Croft Loch, the history scrubber on the editor's bottom edge keeps the spaces between its words (`2/5 · old.py`) instead of the seam to the panel drawing through them.

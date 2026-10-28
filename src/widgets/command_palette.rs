@@ -3540,11 +3540,12 @@ mod tests {
         );
         let area = Rect::new(0, 0, 100, 20);
         let mut buf = Buffer::empty(area);
+        // The plain hint; Croft Loch spells it as keycaps (`Ctrl + /`).
         render_command_palette(
             &mut palette,
             area,
             &mut buf,
-            crate::theme::Theme::default(),
+            crate::theme::Theme::BLACK,
             false,
         );
         let row = (0..area.height)

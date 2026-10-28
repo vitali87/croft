@@ -101,7 +101,7 @@ fn chrome_tooltip_paints_in_the_sidebar_not_clamped_into_the_editor() {
     // The popup's own background must appear in the far-left region near the
     // anchor. The regression: it rendered against the editor's focused_area,
     // which starts well to the right, so nothing painted over the sidebar.
-    let popup_bg = Color::Rgb(0x1e, 0x21, 0x2a);
+    let popup_bg = app.theme.ui(Color::Rgb(0x1e, 0x21, 0x2a));
     let painted = (0..20).any(|x| (0..12).any(|y| buf[(x, y)].bg == popup_bg));
     assert!(
         painted,

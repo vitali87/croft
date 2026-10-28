@@ -181,17 +181,13 @@ fn paint_edge_row(
 }
 
 /// Draw a seam along `edge` of every frame cell in `rect`, in `color` over
-/// each cell's own background.
+/// each cell's own background. A row of text on the seam's row (the
+/// scrubber on the editor's bottom edge) keeps its word gaps, as under the
+/// focus rule.
 pub fn paint_seam(buf: &mut Buffer, rect: Rect, edge: Edge, color: Color) {
     let rect = rect.intersection(buf.area);
     for y in rect.top()..rect.bottom() {
-        for x in rect.left()..rect.right() {
-            let cell = &mut buf[(x, y)];
-            if is_frame_cell(cell) {
-                cell.set_symbol(edge.glyph());
-                cell.set_fg(color);
-            }
-        }
+        paint_edge_row(buf, rect.x, y, rect.width, edge.glyph(), |_| color);
     }
 }
 
@@ -358,6 +354,23 @@ mod tests {
         assert_eq!(buf[(3, 0)].fg, hair);
         assert_eq!(buf[(3, 1)].symbol(), "x");
         assert_eq!(buf[(3, 2)].symbol(), "\u{2595}");
+    }
+
+    #[test]
+    fn a_seam_along_a_row_keeps_the_space_between_words() {
+        // The scrubber's label sits on the editor's bottom row, where the
+        // seam against the panel runs.
+        let mut buf = Buffer::empty(Rect::new(0, 0, 20, 1));
+        buf.set_string(1, 0, " 2/5 \u{b7} old.py ", Style::default());
+        let hair = Color::Rgb(0x23, 0x28, 0x2a);
+        let area = buf.area;
+        paint_seam(&mut buf, area, Edge::Bottom, hair);
+        let row: String = (0..20).map(|x| buf[(x, 0)].symbol()).collect();
+        let seam = Edge::Bottom.glyph();
+        assert_eq!(
+            row,
+            format!("{seam}{seam}2/5 \u{b7} old.py{}", seam.repeat(6))
+        );
     }
 
     #[test]

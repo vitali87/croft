@@ -2,8 +2,9 @@
 # Each [[themes]] entry is a complete IDE palette. These two are croft's
 # historical built-ins, now expressed as data so a third party can add a theme
 # by dropping a manifest with another [[themes]] block into
-# ~/.config/croft/extensions/<id>/ (no rebuild). Croft Black is the baked-in
-# default; src/theme.rs also keeps a const fallback so croft is never themeless.
+# ~/.config/croft/extensions/<id>/ (no rebuild). Croft Loch (below) is the
+# baked-in default; src/theme.rs also keeps it as a const fallback so croft is
+# never themeless.
 # Values are byte-for-byte the historical palette (gradient brand consts inlined
 # from src/gradient.rs: accent #4fb1a6, selection #264f4a, button #0e7e76).
 id = "themes"
