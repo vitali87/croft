@@ -5568,6 +5568,9 @@ impl Editor {
             // What the sweep said about the file this tab held is not about
             // this one, even with the same stamp (#900).
             self.disk_report = None;
+            // A real file now, not a scratch tab's label (#951): kept, the
+            // flag refused its saves and let it close without asking.
+            self.scratch = false;
         }
         if changed_file {
             // On a failed open the tab may still hold the file it left, and
@@ -25756,6 +25759,23 @@ mod tests {
         assert!(!tabs.scratch, "the tab is that file now");
         let written = std::fs::read_to_string(&kept).unwrap();
         assert!(written.starts_with("xdef mean(xs):"), "{written:?}");
+    }
+
+    #[test]
+    fn a_real_file_opened_into_a_scratch_tab_saves() {
+        // The tab stops being scratch once it holds a file: kept, the flag
+        // refused the file's saves and let its edits close unasked.
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("query.ql");
+        std::fs::write(&real, "select 1\n").unwrap();
+        let mut tabs = EditorTabs::default();
+        tabs.open_text_buffer(&tmp.path().join("Search: mean"), "hits\n")
+            .unwrap();
+        (*tabs).open(&real).unwrap();
+        assert!(!tabs.scratch);
+        tabs.insert_str("x");
+        tabs.save_to_disk().expect("the file saves");
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "xselect 1\n");
     }
     #[test]
     fn is_binary_detects_nul() {
