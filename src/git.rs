@@ -1547,19 +1547,31 @@ pub fn apply_patch(
     }
 }
 
-/// message verbatim so the user sees exactly what blocked them.
-pub fn commit_all_tracked(root: &Path, message: &str) -> Result<String, String> {
+/// Commit the way the Commit button, Enter in the message box, Commit &
+/// Push and Commit & Sync do, by VS Code's rule (#965): with anything
+/// staged, only the index (`git commit -m`), so hunks staged by hand go in
+/// and the rest stays in the working tree; with nothing staged, every
+/// tracked change (`git commit -am`, VS Code's smart commit). The index is
+/// read at commit time, not from the panel's last status poll. Refuses an
+/// empty message and an unresolved merge ([`refuse_unmerged`]); on failure
+/// returns git's message verbatim so the user sees exactly what blocked them.
+pub fn commit(root: &Path, message: &str) -> Result<String, String> {
     if message.trim().is_empty() {
         return Err("Commit message is empty".to_string());
     }
     refuse_unmerged(root)?;
+    let flags = if has_staged_changes(root)? {
+        "-m"
+    } else {
+        "-am"
+    };
     let path_str = root
         .to_str()
         .ok_or_else(|| "non-utf8 workspace path".to_string())?;
     // A hook or signing helper that wants a terminal fails fast with its
     // own message instead of fighting croft for the screen (#1153).
     let mut cmd = Command::new("git");
-    cmd.args(["-C", path_str, "commit", "-am", message]);
+    cmd.args(["-C", path_str, "commit", flags, message]);
     never_prompt(&mut cmd);
     let output = cmd
         .output()
@@ -3354,9 +3366,35 @@ pub fn refuse_unmerged(root: &Path) -> Result<(), String> {
     ))
 }
 
+/// Whether the index holds anything a plain `git commit` would record: a
+/// change against HEAD, or on an unborn branch any staged file.
+fn has_staged_changes(root: &Path) -> Result<bool, String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        // `--no-relative`: with `diff.relative` set, a subdirectory root
+        // would see only what is staged under it, and a commit takes it all.
+        .args(["diff", "--cached", "--quiet", "--no-relative"])
+        .output()
+        .map_err(|e| format!("failed to spawn git: {e}"))?;
+    match output.status.code() {
+        Some(0) => Ok(false),
+        Some(1) => Ok(true),
+        code => {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            Err(if stderr.is_empty() {
+                format!("git diff --cached failed with code {code:?}")
+            } else {
+                stderr
+            })
+        }
+    }
+}
+
 /// Commit only what is already staged (`git commit -m`), leaving unstaged
-/// changes in the working tree. The mirror of `commit_all_tracked`, which
-/// auto-stages tracked edits with `-am`.
+/// changes in the working tree. With nothing staged git refuses it, where
+/// [`commit`] would take every tracked change.
 pub fn commit_staged(root: &Path, message: &str) -> Result<String, String> {
     if message.trim().is_empty() {
         return Err("Commit message is empty".to_string());
@@ -5266,10 +5304,10 @@ mod tests {
     }
 
     #[test]
-    fn commit_all_tracked_rejects_empty_message() {
+    fn commit_rejects_empty_message() {
         let tmp = TempDir::new().unwrap();
-        assert!(commit_all_tracked(tmp.path(), "").is_err());
-        assert!(commit_all_tracked(tmp.path(), "   \n").is_err());
+        assert!(commit(tmp.path(), "").is_err());
+        assert!(commit(tmp.path(), "   \n").is_err());
     }
 
     /// GIT_TERMINAL_PROMPT and a null stdin are checked too, but the session
@@ -5278,7 +5316,7 @@ mod tests {
     /// can open croft's `/dev/tty`.
     #[cfg(target_os = "linux")]
     #[test]
-    fn commit_all_tracked_never_offers_its_hooks_the_terminal() {
+    fn commit_never_offers_its_hooks_the_terminal() {
         let tmp = tempfile::tempdir().unwrap();
         let p = tmp.path();
         let git = |args: &[&str]| {
@@ -5314,7 +5352,7 @@ mod tests {
             std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
         std::fs::write(p.join("f.txt"), "two\n").unwrap();
-        commit_all_tracked(p, "two").unwrap();
+        commit(p, "two").unwrap();
         assert_eq!(
             std::fs::read_to_string(p.join("seen")).unwrap(),
             "prompt=0\nstdin=none\nsession=own\n"
@@ -5322,7 +5360,7 @@ mod tests {
     }
 
     #[test]
-    fn commit_all_tracked_creates_a_commit_in_a_real_repo() {
+    fn commit_creates_a_commit_in_a_real_repo() {
         let tmp = TempDir::new().unwrap();
         let p = tmp.path();
         let _ = Command::new("git")
@@ -5352,7 +5390,7 @@ mod tests {
             .args(["commit", "-m", "init", "--quiet"])
             .status();
         std::fs::write(p.join("hello.txt"), "hi v2").unwrap();
-        let summary = commit_all_tracked(p, "second commit").expect("commit should succeed");
+        let summary = commit(p, "second commit").expect("commit should succeed");
         assert!(
             summary.contains("second commit") || summary.contains("main"),
             "summary was: {summary}"
@@ -7473,6 +7511,63 @@ filename seed.txt
         );
     }
 
+    /// A committed repo with `seed.txt` and `wip.txt` both edited.
+    fn repo_with_two_edits(p: &Path) {
+        init_repo_with_commit(p);
+        std::fs::write(p.join("wip.txt"), "draft\n").unwrap();
+        git_in(p, &["add", "wip.txt"]);
+        git_in(p, &["commit", "-qm", "add wip"]);
+        std::fs::write(p.join("seed.txt"), "one\ntwo\nready\n").unwrap();
+        std::fs::write(p.join("wip.txt"), "draft\nnot ready\n").unwrap();
+    }
+
+    #[test]
+    fn commit_takes_only_the_index_when_anything_is_staged() {
+        // #965: `git commit -am` swept the unstaged edit in with the staged one.
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        repo_with_two_edits(p);
+        stage(p, "seed.txt");
+        commit(p, "ready part").expect("commit");
+        assert_eq!(git_in(p, &["show", "HEAD:seed.txt"]), "one\ntwo\nready");
+        assert_eq!(git_in(p, &["show", "HEAD:wip.txt"]), "draft");
+        assert_eq!(
+            std::fs::read_to_string(p.join("wip.txt")).unwrap(),
+            "draft\nnot ready\n",
+            "the unstaged edit stays in the working tree"
+        );
+        assert_eq!(git_in(p, &["diff", "--name-only"]), "wip.txt");
+    }
+
+    #[test]
+    fn commit_takes_every_tracked_change_when_nothing_is_staged() {
+        // Negative: with an empty index it is still VS Code's smart commit.
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        repo_with_two_edits(p);
+        std::fs::write(p.join("new.txt"), "untracked\n").unwrap();
+        commit(p, "everything").expect("commit");
+        assert_eq!(git_in(p, &["show", "HEAD:seed.txt"]), "one\ntwo\nready");
+        assert_eq!(git_in(p, &["show", "HEAD:wip.txt"]), "draft\nnot ready");
+        assert_eq!(git_in(p, &["status", "--porcelain"]), "?? new.txt");
+    }
+
+    #[test]
+    fn a_subdirectory_root_with_diff_relative_still_sees_what_is_staged() {
+        // `diff.relative` would scope the check to the subdirectory, and
+        // `-a` would then sweep in the unstaged edit as well.
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        repo_with_two_edits(p);
+        git_in(p, &["config", "diff.relative", "true"]);
+        stage(p, "seed.txt");
+        let sub = p.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        assert_eq!(has_staged_changes(&sub), Ok(true));
+        commit(&sub, "ready part").expect("commit");
+        assert_eq!(git_in(p, &["show", "HEAD:wip.txt"]), "draft");
+    }
+
     #[test]
     fn rename_branch_changes_the_current_branch_name() {
         let tmp = TempDir::new().unwrap();
@@ -7722,13 +7817,13 @@ git checkout -q main && sed 's/python pricing.py/uv run pricing.py/' README.md >
     }
 
     #[test]
-    fn commit_all_tracked_refuses_while_a_merge_has_unresolved_conflicts() {
+    fn commit_refuses_while_a_merge_has_unresolved_conflicts() {
         // `git commit -a` stages an unmerged file as it is, so the merge
         // commit recorded the conflict markers.
         let tmp = repo_in_a_conflicted_merge();
         let p = tmp.path();
         let before = head_of(p);
-        let err = commit_all_tracked(p, "Merge hotfix").expect_err("the commit must be refused");
+        let err = commit(p, "Merge hotfix").expect_err("the commit must be refused");
         assert!(
             err.contains("Resolve 1 merge conflict (README.md)"),
             "{err}"
@@ -7753,7 +7848,7 @@ git checkout -q main && sed 's/python pricing.py/uv run pricing.py/' README.md >
         .unwrap();
         run_mutation(p, &["add", "README.md"]).unwrap();
         assert!(unmerged_paths(p).is_empty());
-        commit_all_tracked(p, "Merge hotfix").expect("a resolved merge commits");
+        commit(p, "Merge hotfix").expect("a resolved merge commits");
         let parents = Command::new("git")
             .arg("-C")
             .arg(p)
@@ -7803,7 +7898,7 @@ git checkout -q main && sed 's/python pricing.py/uv run pricing.py/' README.md >
         run_mutation(p, &["merge", "--abort"]).unwrap();
         std::fs::write(p.join("README.md"), "edited\n").unwrap();
         assert!(unmerged_paths(p).is_empty());
-        commit_all_tracked(p, "edit").expect("an ordinary commit goes through");
+        commit(p, "edit").expect("an ordinary commit goes through");
     }
 
     /// A repo whose `*.txt` files go through a rot13 clean/smudge filter: the

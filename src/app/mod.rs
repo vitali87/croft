@@ -39211,9 +39211,9 @@ impl App {
         let committed = message.clone();
         self.spawn_commit(
             message,
-            move || crate::git::commit_all_tracked(&root, &committed),
+            move || crate::git::commit(&root, &committed),
             |app, commit| {
-                app.log_git("commit -am", &commit);
+                app.log_git("commit", &commit);
                 if let Err(err) = commit {
                     app.report_commit_failure(&err);
                     return;
@@ -43260,9 +43260,9 @@ impl App {
         let committed = message.clone();
         self.spawn_commit(
             message,
-            move || crate::git::commit_all_tracked(&root, &committed),
+            move || crate::git::commit(&root, &committed),
             |app, r| {
-                app.log_git("commit -am", &r);
+                app.log_git("commit", &r);
                 let commit_summary = match r {
                     Ok(s) => crate::git::headline(&s).to_string(),
                     Err(err) => {
@@ -43914,9 +43914,9 @@ impl App {
         let committed = message.clone();
         self.spawn_commit(
             message,
-            move || crate::git::commit_all_tracked(&root, &committed),
+            move || crate::git::commit(&root, &committed),
             |app, r| {
-                app.log_git("commit -am", &r);
+                app.log_git("commit", &r);
                 match r {
                     Ok(summary) => {
                         let headline = crate::git::headline(&summary);
