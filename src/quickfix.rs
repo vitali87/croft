@@ -151,7 +151,8 @@ impl regex_syntax::ast::Visitor for RgLiterals {
 /// the line is cut at the unquoted `|`, `|&`, `||`, `&&`, `;`, `&` and line
 /// breaks, and redirections (`> out`, `2>/dev/null`, `<in`) are dropped. So
 /// `clear; grep -rn x src | head 2>&1` is `clear`, `grep -rn x src` and a
-/// piped-into `head`.
+/// piped-into `head`. An input redirection counts as a pipe: `rg x < f`
+/// searched `f` on stdin, not the directory it ran in.
 fn simple_commands(line: &str) -> Vec<(String, bool)> {
     // Push a quoted span, through its closing quote, onto `out`.
     fn quoted(open: char, chars: &mut std::iter::Peekable<std::str::Chars>, out: &mut String) {
@@ -181,6 +182,9 @@ fn simple_commands(line: &str) -> Vec<(String, bool)> {
             }
             '>' | '<' => {
                 // A redirection: its fd (`2>`), operator (`>>`, `>&`) and target.
+                if c == '<' {
+                    piped = true;
+                }
                 let before_fd = cur.trim_end_matches(|d: char| d.is_ascii_digit());
                 if before_fd.is_empty() || before_fd.ends_with(char::is_whitespace) {
                     cur.truncate(before_fd.len());
@@ -1117,6 +1121,9 @@ mod tests {
         // A search fed by a pipe reads it, not files; the last one wins.
         assert!(parse("cat f | grep x").unwrap().unseedable.is_some());
         assert!(parse("rg x src | rg y").unwrap().unseedable.is_some());
+        // So is one whose stdin is a redirected file, unless it names paths.
+        assert!(parse("rg timeout < one.txt").unwrap().unseedable.is_some());
+        assert!(parse("grep -rn x src <<< y").unwrap().unseedable.is_none());
         assert!(parse("rg x src | grep -v y").unwrap().inverted);
         assert!(parse("ls | wc -l").is_none());
     }
