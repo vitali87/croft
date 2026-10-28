@@ -181,7 +181,8 @@ impl<A: Copy> Card<A> {
 
     /// Paint the card over `rect` (sized by [`Card::height`]) and return
     /// where each button and the link landed. `pointer` lifts whichever
-    /// control it rests on.
+    /// control it rests on. A rect too small for the whole card, once
+    /// clipped to the buffer, paints nothing rather than half a card.
     pub fn render(
         &self,
         buf: &mut Buffer,
@@ -190,7 +191,7 @@ impl<A: Copy> Card<A> {
         pointer: Option<(u16, u16)>,
     ) -> Vec<(Rect, A)> {
         let rect = rect.intersection(buf.area);
-        if rect.width < 2 * INSET + 2 || rect.height < 4 {
+        if rect.width < 2 * INSET + 2 || rect.height < self.height(rect.width) {
             return Vec::new();
         }
         let p = Palette::of(theme);
@@ -289,9 +290,7 @@ impl<A: Copy> Card<A> {
         }
         y += 1;
 
-        if let Some((glyph, label, action)) = &self.link
-            && y + 2 <= rect.bottom()
-        {
+        if let Some((glyph, label, action)) = &self.link {
             // The divider runs the card's full width and joins a line
             // border with tees; a `surfaces` card edge has no line to join.
             for dx in rect.x + 1..rect.right() - 1 {
@@ -467,6 +466,15 @@ mod tests {
             assert!(r.right() < w, "{r:?} stays inside the border");
         }
         assert!(hits.iter().any(|(_, a)| *a == Act::Update));
+    }
+
+    #[test]
+    fn a_rect_too_short_for_the_card_paints_nothing() {
+        let c = card();
+        let area = Rect::new(0, 0, WIDTH, c.height(WIDTH) - 1);
+        let mut buf = Buffer::empty(area);
+        assert!(c.render(&mut buf, area, Theme::BLACK, None).is_empty());
+        assert_eq!(buf, Buffer::empty(area));
     }
 
     #[test]
