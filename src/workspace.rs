@@ -336,7 +336,8 @@ pub fn write_workspace_file(path: &Path, folders: &[PathBuf]) -> Result<(), Stri
 /// `folders` array changes, edited in place by [`crate::jsonc_edit`]: its
 /// settings, launch and task configs, recommended extensions and comments
 /// stay as written, and a folder it already lists keeps its entry, `name`
-/// and path spelling included. Rebuilt from scratch, the file lost all of
+/// and path spelling included, and its place: new folders go after the
+/// listed ones, whatever order `folders` has. Rebuilt from scratch, the file lost all of
 /// that. A file that is not a JSONC object, or cannot be edited in place,
 /// is an error rather than replaced.
 pub fn workspace_file_update(path: &Path, folders: &[PathBuf]) -> Result<Option<String>, String> {
@@ -361,23 +362,31 @@ pub fn workspace_file_update(path: &Path, folders: &[PathBuf]) -> Result<Option<
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let entries = folders
+    let want: Vec<PathBuf> = folders
         .iter()
-        .map(|f| {
-            let want = f.canonicalize().unwrap_or_else(|_| f.clone());
-            listed
-                .iter()
-                .find(|e| {
-                    e.get("path")
-                        .and_then(Value::as_str)
-                        .is_some_and(|p| resolve_folder(base, p) == want)
-                })
-                .cloned()
-                .unwrap_or_else(
-                    || serde_json::json!({ "path": relative_to_base(base, &base_canon, f) }),
-                )
-        })
+        .map(|f| f.canonicalize().unwrap_or_else(|_| f.clone()))
         .collect();
+    let names = |e: &Value, w: &Path| {
+        e.get("path")
+            .and_then(Value::as_str)
+            .is_some_and(|p| resolve_folder(base, p) == w)
+    };
+    // Entries the file already has keep its order, and new folders follow
+    // them: the array editor keeps the text only of entries left in place,
+    // so one moved would lose the comments inside it.
+    let mut placed = vec![false; want.len()];
+    let mut entries = Vec::new();
+    for e in &listed {
+        if let Some(i) = want.iter().position(|w| names(e, w))
+            && !placed[i]
+        {
+            placed[i] = true;
+            entries.push(e.clone());
+        }
+    }
+    for (f, _) in folders.iter().zip(&placed).filter(|(_, placed)| !**placed) {
+        entries.push(serde_json::json!({ "path": relative_to_base(base, &base_canon, f) }));
+    }
     doc["folders"] = Value::Array(entries);
     let Some(text) = existing else {
         return serde_json::to_string_pretty(&doc)
@@ -831,6 +840,23 @@ mod tests {
         assert_eq!(workspace_file_update(&file, &folders), Ok(None));
         write_workspace_file(&file, &folders).unwrap();
         assert_eq!(std::fs::read_to_string(&file).unwrap(), TEAM_FILE);
+    }
+
+    /// The folders in another order move no entry: a moved one was
+    /// rewritten from its parsed value, dropping the comments inside it.
+    #[test]
+    fn saving_the_folders_in_another_order_leaves_the_file_as_it_is() {
+        let (_tmp, root, file) = team_workspace();
+        let folders = [root.join("wsx_lib"), root.join("wsx")];
+        assert_eq!(workspace_file_update(&file, &folders), Ok(None));
+        let with_extra = [root.join("extra"), root.join("wsx_lib"), root.join("wsx")];
+        write_workspace_file(&file, &with_extra).unwrap();
+        let out = std::fs::read_to_string(&file).unwrap();
+        assert!(
+            out.starts_with(&TEAM_FILE[..TEAM_FILE.find("\"shared lib\" }").unwrap()]),
+            "{out}"
+        );
+        assert!(out.contains("\"path\": \"../extra\""), "{out}");
     }
 
     /// #1012: an added folder changes only `folders`, and a removed one
