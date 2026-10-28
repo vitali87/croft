@@ -975,8 +975,9 @@ fn typing_after_select_all_replaces_query() {
 #[test]
 fn scratch_buffer_saves_under_the_workspace_root_with_a_safe_name() {
     // A scratch buffer (MCP output / Git Output) must anchor under the open
-    // project, not write a bare filename to croft's cwd, and must sanitise path
-    // separators in the title so the name is a valid single file.
+    // project, where Save As offers to keep it, not at a bare filename in
+    // croft's cwd, and must sanitise path separators in the title so the name
+    // is a valid single file.
     let tmp = tempfile::tempdir().unwrap();
     let app = App::new(tmp.path().to_path_buf()).unwrap();
     let p = app.scratch_buffer_path("Web: a/b.md");

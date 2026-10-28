@@ -3096,9 +3096,10 @@ impl UnsavedExit {
 
 /// Whether closing `ed` would lose text only it holds (#862): unsaved
 /// changes to a file, or an untitled buffer that was typed into and still
-/// holds something.
+/// holds something. Never a scratch tab's edits (#951): croft made its text
+/// and no save can write it, so the close prompt would have nothing to offer.
 fn holds_unsaved(ed: &Editor) -> bool {
-    ed.dirty && (ed.path.is_some() || ed.lines.iter().any(|l| !l.is_empty()))
+    ed.dirty && !ed.scratch && (ed.path.is_some() || ed.lines.iter().any(|l| !l.is_empty()))
 }
 
 /// Why the branch picker is open, deciding what its Enter does. `Checkout`
@@ -9165,7 +9166,11 @@ impl App {
             std::collections::HashSet::new();
         let mut pathless = 0usize;
         let groups = std::iter::once(&self.editor).chain(self.editor_layout.inactive_groups());
-        for ed in groups.flat_map(|g| g.editors.iter()).filter(|e| e.dirty) {
+        // A scratch tab's edits are nothing a save writes (#951).
+        for ed in groups
+            .flat_map(|g| g.editors.iter())
+            .filter(|e| e.dirty && !e.scratch)
+        {
             match ed.path.as_deref() {
                 Some(p) => {
                     paths.insert(p);
@@ -38920,7 +38925,9 @@ impl App {
         let mut files: Vec<PathBuf> = Vec::new();
         let groups = std::iter::once(&self.editor).chain(self.editor_layout.inactive_groups());
         let unsaved = |e: &&crate::widgets::editor::Editor| {
-            e.dirty
+            // A scratch tab (#951) is no file of the repository's, though
+            // a Git Output tab's label sits under its root.
+            (e.dirty && !e.scratch)
                 || e.sheet
                     .as_ref()
                     .is_some_and(|s| s.editable() && s.editing.is_some())
@@ -47340,8 +47347,10 @@ impl App {
                 continue;
             }
             // An untitled buffer has no file to reopen, so it is carried only
-            // for its unsaved text; a blank one would reappear as clutter.
-            if ed.path.is_none() && !ed.dirty {
+            // for its unsaved text; a blank one would reappear as clutter. A
+            // scratch tab has no file either (#951): carried, it came back as
+            // a tab on its label, whose save wrote a file of that name.
+            if (ed.path.is_none() && !ed.dirty) || ed.scratch {
                 continue;
             }
             let path = ed.path.clone();
@@ -47403,6 +47412,7 @@ impl App {
                 }
                 if ed.has_non_text_view()
                     || !ed.dirty
+                    || ed.scratch
                     || (!keep_merge_results && ed.merge.is_some())
                 {
                     continue;
@@ -56483,10 +56493,10 @@ impl App {
             });
     }
 
-    /// On-disk path for a scratch buffer (MCP output, Git Output): anchored under
-    /// the workspace root with a filesystem-safe name, so Cmd+S saves it
-    /// predictably into the open project (and the Explorer tree shows it) instead
-    /// of writing a bare filename to croft's working directory.
+    /// Label for a scratch buffer (MCP output, Git Output): anchored under the
+    /// workspace root with a filesystem-safe name, so File: Save As… offers to
+    /// keep it in the open project rather than in croft's working directory.
+    /// Cmd+S never writes it (#951).
     fn scratch_buffer_path(&self, name: &str) -> PathBuf {
         let safe = name.replace(['/', '\\'], "-");
         self.workspace_root().join(safe)
@@ -64518,6 +64528,9 @@ impl App {
         let due = |e: &crate::widgets::editor::Editor| {
             e.dirty
                 && e.path.is_some()
+                // A scratch tab's path is its label (#951): one stray
+                // keystroke wrote a file named after the tab.
+                && !e.scratch
                 // Preview-kind edits (hex bytes, sheet cells) are
                 // EXPLICIT-save only: an automatic write mid-edit could
                 // land a half-updated byte sequence, and the serialising
@@ -64679,7 +64692,8 @@ impl App {
             self.status = String::from("Save All: nothing to save");
             return;
         }
-        if self.editor.dirty {
+        // A scratch tab (#951) has nothing to save, nor a refusal to report.
+        if self.editor.dirty && !self.editor.scratch {
             self.save();
         }
         let active_status = self.status.clone();
@@ -64693,7 +64707,7 @@ impl App {
         let left = self
             .unsaved_count()
             .saturating_sub(usize::from(pending.is_some()));
-        let active_refusal = if self.editor.dirty {
+        let active_refusal = if self.editor.dirty && !self.editor.scratch {
             active_status
         } else {
             String::new()
@@ -66757,6 +66771,13 @@ impl App {
             self.open_save_as_prompt();
             return;
         }
+        // A scratch tab's path is only its label (#951): writing it made a
+        // file named `stats.py @ 4affdca` or `Search: mean` in croft's
+        // working directory. Pressed from habit, so it says rather than asks.
+        if self.editor.scratch {
+            self.status = String::from(crate::widgets::editor::SCRATCH_SAVE_REFUSAL);
+            return;
+        }
         // Guests in a collab session never write shared files: the owner is
         // the single writer, so the FS watcher and history snapshots see one
         // author. The guest's edits already flowed to the owner as ops.
@@ -67740,7 +67761,8 @@ impl App {
             self.status = String::from("Save with Sudo works on text tabs");
             return;
         }
-        let Some(path) = self.editor.path.clone() else {
+        // A scratch tab's path is its label, not a file (#951).
+        let Some(path) = self.editor.path.clone().filter(|_| !self.editor.scratch) else {
             self.status = String::from("Save with Sudo needs a file: use File: Save As… first");
             return;
         };
