@@ -2914,6 +2914,31 @@ fn a_proposals_diagnostics_show_in_the_popup_not_the_buffer() {
     assert!(app.approval_check.is_none());
 }
 
+/// #915: the servers keep a file open while any split group holds it, so a
+/// checked proposal for a file held only in the other group hands the
+/// servers back that buffer's text when the check ends, not the proposal's.
+#[test]
+fn a_checked_proposal_hands_back_a_buffer_held_in_another_split_group() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("a.py");
+    std::fs::write(&file, "x = 1\n").unwrap();
+    let notes = tmp.path().join("notes.txt");
+    std::fs::write(&notes, "").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    app.split_editor_dir(editor_layout::SplitDir::Horizontal, true);
+    app.editor.open(&notes).unwrap();
+    app.sync_lsp();
+    let synced = |app: &App| app.lsp.as_ref().unwrap().synced_text_for_test(&file);
+    let _hook = queue_edit_proposal(&mut app, tmp.path(), &file, "1", "nope_undefined");
+    app.sync_approval_check();
+    assert_eq!(synced(&app).as_deref(), Some("x = nope_undefined\n"));
+    app.approvals.clear();
+    app.sync_approval_check();
+    app.sync_lsp();
+    assert_eq!(synced(&app).as_deref(), Some("x = 1\n"));
+}
+
 /// #347's criterion against a real server: a proposal that uses an
 /// undefined name shows the server's diagnostic in the popup before it is
 /// approved. Ignored by default: it needs a Python language server that
