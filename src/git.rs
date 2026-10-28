@@ -2933,6 +2933,7 @@ pub fn stage_paths(root: &Path, rel_paths: &[String]) -> Result<(), String> {
     if rel_paths.is_empty() {
         return Ok(());
     }
+    refuse_conflict_markers(root, Some(rel_paths))?;
     let path_str = root
         .to_str()
         .ok_or_else(|| "non-utf8 workspace path".to_string())?;
@@ -3341,16 +3342,68 @@ pub fn refuse_unmerged(root: &Path) -> Result<(), String> {
     if paths.is_empty() {
         return Ok(());
     }
-    let mut named = paths.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
-    if paths.len() > 3 {
-        named.push_str(", …");
-    }
+    let named = first_paths(&paths);
     let (n, them) = match paths.len() {
         1 => (String::from("1 merge conflict"), "it"),
         n => (format!("{n} merge conflicts"), "them"),
     };
     Err(format!(
         "Resolve {n} ({named}) and stage {them} before committing"
+    ))
+}
+
+/// Up to three of `paths`, comma-separated, with `…` when there are more.
+fn first_paths(paths: &[String]) -> String {
+    let mut named = paths.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
+    if paths.len() > 3 {
+        named.push_str(", …");
+    }
+    named
+}
+
+/// Refuse to stage a conflicted file that still holds its conflict markers
+/// (#989). `git add` is how git marks a conflict resolved, and it takes the
+/// file as it is, so Stage All, or staging the file itself, would record
+/// the `<<<<<<<` lines and the next commit would ship them. A conflicted
+/// file whose markers have been edited away stages as usual. `scope` holds
+/// the `root`-relative paths about to be staged; `None` means everything.
+fn refuse_conflict_markers(root: &Path, scope: Option<&[String]>) -> Result<(), String> {
+    let unmerged = unmerged_paths(root);
+    if unmerged.is_empty() {
+        return Ok(());
+    }
+    // `unmerged_paths` names paths from the top of the repository, which
+    // is not `root` when croft was opened on a subdirectory.
+    let Some(top) = repo_toplevel(root) else {
+        return Ok(());
+    };
+    let canon = |p: PathBuf| std::fs::canonicalize(&p).unwrap_or(p);
+    let scope: Option<Vec<PathBuf>> =
+        scope.map(|paths| paths.iter().map(|p| canon(root.join(p))).collect());
+    let marked: Vec<String> = unmerged
+        .into_iter()
+        .filter(|rel| {
+            let abs = canon(top.join(rel));
+            scope
+                .as_ref()
+                .is_none_or(|scope| scope.iter().any(|s| abs.starts_with(s)))
+                && std::fs::read_to_string(&abs).is_ok_and(|text| {
+                    let lines: Vec<String> = text.lines().map(String::from).collect();
+                    !crate::merge::find_conflicts(&lines).is_empty()
+                })
+        })
+        .collect();
+    if marked.is_empty() {
+        return Ok(());
+    }
+    let (has, them) = if marked.len() == 1 {
+        ("has", "it")
+    } else {
+        ("have", "them")
+    };
+    Err(format!(
+        "{} still {has} conflict markers: resolve {them} before staging",
+        first_paths(&marked)
     ))
 }
 
@@ -3469,8 +3522,10 @@ pub fn head_is_on_upstream(root: &Path) -> bool {
 
 // --- Bulk staging --------------------------------------------------------
 
-/// Stage every change, tracked and untracked (`git add -A`).
+/// Stage every change, tracked and untracked (`git add -A`). Refused while
+/// a conflicted file still holds its markers.
 pub fn stage_all(root: &Path) -> Result<String, String> {
+    refuse_conflict_markers(root, None)?;
     run_mutation(root, &["add", "-A"])
 }
 
@@ -7793,6 +7848,55 @@ git checkout -q main && sed 's/python pricing.py/uv run pricing.py/' README.md >
         std::fs::create_dir(&sub).unwrap();
         assert_eq!(unmerged_paths(&sub), vec![String::from("README.md")]);
         assert!(refuse_unmerged(&sub).is_err());
+    }
+
+    #[test]
+    fn staging_a_conflict_that_still_has_its_markers_is_refused() {
+        // `git add` marks the conflict resolved with the markers in it, so
+        // Stage All, then Commit, recorded them.
+        let tmp = repo_in_a_conflicted_merge();
+        let p = tmp.path();
+        let err = stage_all(p).expect_err("Stage All must refuse");
+        assert_eq!(
+            err,
+            "README.md still has conflict markers: resolve it before staging"
+        );
+        let err = stage_path(p, "README.md").expect_err("staging the file must refuse");
+        assert!(
+            err.contains("README.md still has conflict markers"),
+            "{err}"
+        );
+        assert_eq!(unmerged_paths(p), vec![String::from("README.md")]);
+    }
+
+    #[test]
+    fn a_conflict_resolved_in_the_file_stages_as_before() {
+        // Negative: once the markers are edited away, staging is how the
+        // conflict is marked resolved.
+        let tmp = repo_in_a_conflicted_merge();
+        let p = tmp.path();
+        std::fs::write(
+            p.join("README.md"),
+            "# Orders\n\nRun `uv run -m pricing`.\n",
+        )
+        .unwrap();
+        stage_all(p).expect("a resolved conflict stages");
+        assert!(unmerged_paths(p).is_empty());
+    }
+
+    #[test]
+    fn staging_from_a_subdirectory_checks_only_what_it_stages() {
+        // The conflict sits above the subdirectory root: Stage All covers
+        // the whole repository and refuses, staging a file beside it does
+        // not reach the conflict and goes ahead.
+        let tmp = repo_in_a_conflicted_merge();
+        let p = tmp.path();
+        let sub = p.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("notes.txt"), "todo\n").unwrap();
+        assert!(stage_all(&sub).is_err());
+        stage_path(&sub, "notes.txt").expect("an unrelated file stages");
+        assert_eq!(unmerged_paths(p), vec![String::from("README.md")]);
     }
 
     #[test]

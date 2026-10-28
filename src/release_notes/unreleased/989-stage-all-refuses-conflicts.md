@@ -1,0 +1,1 @@
+fix: Stage All, or staging a conflicted file, refuses while the file still holds its `<<<<<<<` conflict markers, so the next commit can no longer record them. A conflict resolved in the file stages as before.
