@@ -9452,14 +9452,22 @@ impl App {
         // when it holds that file (replies are applied where the seq
         // matches), else the first. Judging each against the one
         // `lsp_last_seen` entry made them take turns resending the whole
-        // text on every tick.
-        let active = self.editor.active_index();
-        let active_path = self
-            .editor
-            .path
-            .clone()
-            .filter(|_| !self.editor.has_non_text_view());
-        for (i, tab) in self.editor.iter_tabs().enumerate() {
+        // text on every tick. Every split group's tabs count, the active
+        // group's first: a file held only in another group stays open with
+        // its unsaved text, so a rename computed for it fits the buffer it
+        // lands in, not the disk (#915).
+        let tabs = std::iter::once(&self.editor)
+            .chain(self.editor_layout.inactive_groups())
+            .flat_map(|group| {
+                let active = group.active_index();
+                let active_path = group.path.as_ref().filter(|_| !group.has_non_text_view());
+                group
+                    .iter_tabs()
+                    .enumerate()
+                    .filter(move |&(i, tab)| i == active || tab.path.as_ref() != active_path)
+                    .map(|(_, tab)| tab)
+            });
+        for tab in tabs {
             if tab.has_non_text_view() {
                 continue;
             }
@@ -9469,9 +9477,6 @@ impl App {
             // `files_associations` count (#1574): a `.tpl` associated with
             // HTML goes to the HTML server though its extension has none.
             if crate::lsp::manager::path_to_language(path).is_none() {
-                continue;
-            }
-            if i != active && active_path.as_ref() == Some(path) {
                 continue;
             }
             if !current.insert(path.clone()) {
@@ -20250,10 +20255,8 @@ impl App {
         let Some(check) = self.approval_check.take() else {
             return;
         };
-        let tab_has_it = self
-            .editor
-            .iter_tabs()
-            .any(|t| t.path.as_deref() == Some(check.path.as_path()));
+        // `sync_lsp` keeps a file open for a tab in any split group (#915).
+        let tab_has_it = self.open_buffer_paths().contains(&check.path);
         if tab_has_it && (!check.opened || !self.lsp_last_seen.contains_key(&check.path)) {
             // A seq no tab has makes `sync_lsp` send the buffer's text next
             // tick, over the proposal's. (A tab opened during a check of a
