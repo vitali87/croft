@@ -767,8 +767,17 @@ gets control. It records the full-colour byte stream every participant is
 painted with. The size comes from the roster: the recorder recomputes the
 host's minimum over the other participants and writes an `r` event when it
 changes. The cast header therefore waits for at least one other participant.
-Lines are written and flushed one at a time, so `croft record --stop`
-(SIGTERM to the pid it left beside the socket) or Ctrl-C leaves a valid file.
+Lines are written and flushed one at a time, so the cast is valid whenever the
+recording ends. Ctrl-C and `croft record --stop` (SIGINT, SIGTERM) only set a
+flag the read loop checks, so the recorder removes its pidfile and exits 0.
+
+The pidfile beside the socket holds the recorder's pid, start time and cast
+path (#1058). A recorder killed outright leaves it behind, and its pid can be
+recycled to an unrelated process, so `--stop` signals the pid only while it
+holds a process that started at that time and is croft running `record`, then
+waits for it to exit. Otherwise it removes the pidfile and reports that no
+recording is running. A second `croft record` for the session is refused while
+the first runs: it would take over the pidfile, leaving the first unstoppable.
 
 ## Sticky notes
 
