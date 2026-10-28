@@ -131,7 +131,12 @@ fn a_failed_update_links_to_its_install_log() {
         term.draw(|f| app.render(f)).unwrap();
         let screen = screen_text(&term);
         assert!(screen.contains("View the Install Log"), "{screen}");
-        assert!(!screen.contains("What's New"), "one link: the log");
+        // The version's own link text: the welcome page's notes may say
+        // "What's New" too.
+        assert!(
+            !screen.contains("What's New in v9.9.9"),
+            "one link: the log"
+        );
         let link = app
             .update_toast
             .as_ref()
@@ -348,8 +353,12 @@ fn an_update_offer_raises_the_bottom_left_card_later_folds_it_and_skip_dismisses
         term.draw(|f| app.render(f)).unwrap();
         let screen = screen_text(&term);
         assert!(
-            !screen.contains("What's New"),
+            !screen.contains("What's New in v9.9.9"),
             "the card is down:\n{screen}"
+        );
+        assert!(
+            app.update_toast.as_ref().unwrap().buttons.is_empty(),
+            "and has no controls to click"
         );
         assert!(
             screen.contains("Update Available: v9.9.9"),
