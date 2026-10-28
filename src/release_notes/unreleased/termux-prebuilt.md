@@ -1,0 +1,1 @@
+feature: Releases include an Android build, so on Termux `cargo binstall croft-software` and croft's own updater download croft instead of compiling it, a build that runs a phone out of memory and aborts with SIGABRT.

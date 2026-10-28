@@ -269,11 +269,13 @@ jobs:
           key: aarch64-linux-android
       - name: Install cargo-ndk
         run: cargo install cargo-ndk --locked
-      # Termux builds croft natively on the phone, so nothing ships this
-      # artifact. Compiling it here is what catches code that cannot build on
-      # Android at all - otherwise the only way to find out is on the device,
+      # release.yml ships this target's release build as the Termux install,
+      # since a phone runs out of memory compiling croft itself. Compiling it
+      # here is what catches code that cannot build on Android at all before
+      # a release does - otherwise the only way to find out is on the device,
       # by hand, after the fact. cargo-ndk wires the runner's NDK into the C
-      # build scripts the tree-sitter grammars need.
+      # build scripts the tree-sitter grammars need; release.yml's Android leg
+      # is this same command with `--profile release`.
       - name: cargo ndk build
         # ANDROID_NDK_LATEST_HOME is exported by the runner image into the
         # process environment, which the `env` context does NOT see - so it

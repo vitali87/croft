@@ -409,8 +409,9 @@ pub fn stage_command(cargo: PathBuf, version: &str, stage_root: &Path) -> std::p
 }
 
 /// The release binary target this machine runs, when releases carry one:
-/// the static musl builds for Linux on x86_64 and aarch64 (#261), and the
-/// Apple silicon and Intel builds for macOS (#1579).
+/// the static musl builds for Linux on x86_64 and aarch64 (#261), the
+/// Apple silicon and Intel builds for macOS (#1579), and the aarch64 build
+/// for Termux on Android, where compiling croft runs the phone out of memory.
 pub fn prebuilt_triple() -> Option<&'static str> {
     prebuilt_triple_for(std::env::consts::OS, std::env::consts::ARCH)
 }
@@ -424,6 +425,7 @@ pub fn prebuilt_triple_for(os: &str, arch: &str) -> Option<&'static str> {
             "x86_64" => Some("x86_64-apple-darwin"),
             _ => None,
         },
+        "android" => (arch == "aarch64").then_some("aarch64-linux-android"),
         _ => None,
     }
 }
@@ -1214,6 +1216,19 @@ mod tests {
         assert_eq!(prebuilt_triple_for("macos", "powerpc"), None);
         assert_eq!(prebuilt_triple_for("windows", "x86_64"), None);
         assert_eq!(prebuilt_triple_for("freebsd", "x86_64"), None);
+    }
+
+    /// Termux stages the Android archive rather than compiling, which a
+    /// phone cannot finish: croft's own crate peaks near 4 GB in one rustc.
+    /// Releases build aarch64 only, so another Android arch has no archive.
+    #[test]
+    fn android_on_aarch64_has_a_release_target() {
+        assert_eq!(
+            prebuilt_triple_for("android", "aarch64"),
+            Some("aarch64-linux-android")
+        );
+        assert_eq!(prebuilt_triple_for("android", "x86_64"), None);
+        assert_eq!(prebuilt_triple_for("android", "arm"), None);
     }
 
     /// #1579: a version cached before croft asked whether it can be

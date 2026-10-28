@@ -1,16 +1,20 @@
 # Prebuilt release binaries (#376).
 #
 # `cargo install croft-software` compiles for ten minutes on a laptop and needs
-# a Rust toolchain first. This publishes four archives per tag so
+# a Rust toolchain first. This publishes five archives per tag so
 # `cargo binstall croft-software` is a download instead, and so the Homebrew
-# formula (#375) has something to point at.
+# formula (#375) has something to point at. On a phone the compile is not
+# merely slow: croft's own crate peaks at about 4 GB in one rustc process,
+# usually more than Android leaves Termux, so the build dies with SIGABRT at
+# its last step and the Android archive is the install that finishes there.
 #
 # The build recipe is deliberately the same one ci.yml's `ship-path build` job
 # proved for the musl targets, including its two non-obvious fixes: `rustup
 # target add` runs from the checkout so rust-toolchain.toml resolves the
 # channel (adding to the default toolchain instead is the bug that job exists
 # to catch), and cargo-zigbuild needs `pip install --break-system-packages`
-# because recent runner images mark the system Python externally managed.
+# because recent runner images mark the system Python externally managed. The
+# Android leg is ci.yml's `android` job, cargo-ndk at API level 24, likewise.
 #
 # The profile is `release`, NOT the `remote-fast` profile ci.yml builds.
 # remote-fast trades LTO and codegen-units for build speed because a user is
@@ -64,6 +68,15 @@ jobs:
           - target: aarch64-unknown-linux-musl
             os: ubuntu-latest
             cross: true
+          # Termux on Android. Not the musl build: croft compiled for Android
+          # takes its Android paths (its own trash, the `android` settings
+          # block), and `cargo binstall` on Termux asks for this triple before
+          # falling back to musl. The runner image ships the NDK cargo-ndk
+          # drives.
+          - target: aarch64-linux-android
+            os: ubuntu-latest
+            cross: false
+            ndk: true
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -90,9 +103,22 @@ jobs:
           python3 -m ziglang version
           cargo install cargo-zigbuild --locked
 
+      - name: Install cargo-ndk
+        if: matrix.ndk
+        run: cargo install cargo-ndk --locked
+
       - name: Build
+        # The Android leg's ANDROID_NDK_LATEST_HOME is exported by the runner
+        # image into the process environment, which the `env` context does
+        # not see, so the shell expands it. --platform 24: bionic exports
+        # openpty only from API 23, and 24 is what Termux itself targets.
         run: |
-          if [ "${{ matrix.cross }}" = "true" ]; then
+          if [ "${{ matrix.ndk }}" = "true" ]; then
+            export ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME"
+            test -d "$ANDROID_NDK_HOME"
+            cargo ndk --target arm64-v8a --platform 24 build --profile release \
+              --locked --bin croft
+          elif [ "${{ matrix.cross }}" = "true" ]; then
             cargo zigbuild --profile release --locked --bin croft \
               --target ${{ matrix.target }}
           else
@@ -119,6 +145,9 @@ jobs:
             aarch64-unknown-linux-musl) file "$bin" | grep -qE 'ELF 64-bit LSB.*aarch64' ;;
             x86_64-apple-darwin)        file "$bin" | grep -qE 'Mach-O 64-bit.*(x86_64|x86-64)' ;;
             aarch64-apple-darwin)       file "$bin" | grep -qE 'Mach-O 64-bit.*arm64e?' ;;
+            # The interpreter is what makes it an Android binary: a glibc
+            # or musl aarch64 build is ELF aarch64 too.
+            aarch64-linux-android)      file "$bin" | grep -qE 'ELF 64-bit LSB.*aarch64.*interpreter /system/bin/linker64' ;;
             # A `case` with no match exits 0, so without this arm the whole
             # assertion becomes a silent no-op for any target the list does
             # not name - green step, unchecked artifact (#551). Adding a
@@ -208,12 +237,12 @@ jobs:
           mkdir -p dist
           find staged \( -name 'croft-*.tar.gz' -o -name 'croft-*.cdx.json' \) -exec cp {} dist/ \;
           cd dist
-          # Four archives, or the release is incomplete. Publishing three and
-          # a checksum file that says three is worse than failing: binstall
+          # Five archives, or the release is incomplete. Publishing four and
+          # a checksum file that says four is worse than failing: binstall
           # would resolve for some users and 404 for others.
           count=$(ls -1 croft-*.tar.gz | wc -l | tr -d ' ')
-          if [ "$count" -ne 4 ]; then
-            echo "expected 4 archives, found $count:"
+          if [ "$count" -ne 5 ]; then
+            echo "expected 5 archives, found $count:"
             ls -1
             exit 1
           fi
@@ -238,7 +267,7 @@ jobs:
           # its archive with no sum and this step would stay green (#557).
           # So every archive and SBOM must be named by exactly one line, and
           # there must be no other lines. A bare line count is not enough: one
-          # duplicated sum plus one missing sum still counts to eight.
+          # duplicated sum plus one missing sum still counts to ten.
           fail=0
           files=0
           for a in croft-*.tar.gz croft-*.cdx.json; do
@@ -263,7 +292,7 @@ jobs:
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
       # Sign the checksum file, not each archive: every archive and SBOM is
-      # bound to SHA256SUMS by its sum, so one signature covers all eight.
+      # bound to SHA256SUMS by its sum, so one signature covers all ten.
       # The bundle carries the signature, the certificate and the
       # transparency-log proof, which is everything `cosign verify-blob`
       # needs offline.
@@ -382,7 +411,7 @@ jobs:
       - name: Render the formula from the published SHA256SUMS
         # The release's own SHA256SUMS, the file cosign signed, so the formula
         # cannot vouch for bytes the release does not. The generator refuses
-        # a SHA256SUMS missing any of the four archives (#375).
+        # a SHA256SUMS missing any of the four archives it installs (#375).
         env:
           GH_TOKEN: ${{ github.token }}
         run: |

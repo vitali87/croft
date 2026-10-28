@@ -71,8 +71,18 @@ class MatchesTheRelease(unittest.TestCase):
     def test_targets_are_the_release_matrix(self):
         workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text()
         self.assertEqual(
-            set(TARGETS), check_binstall_contract.matrix_targets(workflow)
+            set(TARGETS) | set(hf.NOT_ON_HOMEBREW),
+            check_binstall_contract.matrix_targets(workflow),
         )
+
+    def test_a_target_is_either_on_homebrew_or_named_as_not(self):
+        """Listing a target in both would hide a Homebrew platform the
+        release-matrix test above can no longer see go missing."""
+        self.assertFalse(set(TARGETS) & set(hf.NOT_ON_HOMEBREW))
+
+    def test_the_android_archive_in_sha256sums_is_left_alone(self):
+        formula = hf.render("1.2.3", sums(TARGETS + list(hf.NOT_ON_HOMEBREW)))
+        self.assertNotIn("android", formula)
 
     def test_archive_names_match_the_package_step(self):
         workflow = (ROOT / ".github" / "workflows" / "release.yml").read_text()

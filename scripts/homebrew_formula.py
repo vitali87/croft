@@ -10,8 +10,9 @@ checksums come from the release's own SHA256SUMS, the same file cosign signs,
 so the formula cannot point at bytes the release does not vouch for.
 
 Fails, printing why, when SHA256SUMS does not name each of the four archives
-exactly once with a well-formed sum: a formula with a missing platform would
-install on some machines and 404 on others, which is worse than no bump.
+it installs exactly once with a well-formed sum: a formula with a missing
+platform would install on some machines and 404 on others, which is worse
+than no bump.
 
 The archive holds `croft-<target>/croft`. Homebrew steps into an archive's
 single top-level directory before `install` runs, so `bin.install "croft"`
@@ -24,16 +25,20 @@ from pathlib import Path
 
 REPO = "https://github.com/vitali87/croft"
 
-# Each Homebrew platform block and the release target that serves it. The
-# targets must stay the four release.yml builds; the tests check that against
-# the workflow's matrix so a target added or renamed there cannot leave the
-# formula pointing at an archive no release carries.
+# Each Homebrew platform block and the release target that serves it. With
+# NOT_ON_HOMEBREW, the targets must stay the ones release.yml builds; the
+# tests check that against the workflow's matrix so a target added or renamed
+# there cannot leave the formula pointing at an archive no release carries.
 PLATFORMS = (
     ("on_macos", "on_arm", "aarch64-apple-darwin"),
     ("on_macos", "on_intel", "x86_64-apple-darwin"),
     ("on_linux", "on_arm", "aarch64-unknown-linux-musl"),
     ("on_linux", "on_intel", "x86_64-unknown-linux-musl"),
 )
+
+# Release targets no Homebrew platform runs: Termux on Android installs its
+# archive with cargo binstall or by hand (docs/ANDROID.md).
+NOT_ON_HOMEBREW = ("aarch64-linux-android",)
 
 VERSION = re.compile(r"\d+\.\d+\.\d+")
 SUM_LINE = re.compile(r"([0-9a-f]{64}) [ *](\S+)")

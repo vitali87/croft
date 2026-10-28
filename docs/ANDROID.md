@@ -2,33 +2,45 @@
 
 Setup notes for running croft as a native Android binary inside [Termux](https://termux.dev). For what croft does and the full keyboard surface see the [README](../README.md) and [KEYBINDINGS.md](KEYBINDINGS.md).
 
-croft compiles and runs natively on Android via the same `cargo install` as every other platform, given the free memory the build needs (see [Install](#install)). Two things differ: there is no `Cmd` key, and mainline Termux supports no inline-image protocol. croft handles both, plus the lack of a usable soft keyboard, in-process.
+croft runs natively on Android: releases carry an Android build, and it also compiles from source with the same `cargo install` as every other platform, given the memory the build needs (see [Install](#install)). Two things differ: there is no `Cmd` key, and mainline Termux supports no inline-image protocol. croft handles both, plus the lack of a usable soft keyboard, in-process.
 
 There is **no required setup command**: the activity-bar font, the `Ctrl` modifier, and the on-screen keyboard all come up on their own. The only manual steps are optional — `pkg install nodejs` for TypeScript / JavaScript and `pkg install gopls` for Go. croft provisions Python's `ty`/`ruff`, Rust's `rust-analyzer` and Markdown's `marksman` itself on first use.
 
 ## Install
 
+Install the prebuilt Android binary. Compiling croft on the phone needs more memory than most phones leave Termux ([below](#building-from-source)).
+
+```bash
+cargo binstall croft-software
+```
+
+This downloads the release's `aarch64-linux-android` build into `~/.cargo/bin/croft` in seconds. `cargo binstall` itself needs installing once (`cargo install cargo-binstall`). Re-run to upgrade, or let croft's updater (`Ctrl+Shift+F9`) do it: a croft installed this way updates by downloading the next release's Android build.
+
+Without cargo, `curl` and `tar` are enough:
+
+```bash
+pkg install curl
+curl -fsSL https://github.com/vitali87/croft/releases/latest/download/croft-aarch64-linux-android.tar.gz | tar xz
+mv croft-aarch64-linux-android/croft "$PREFIX/bin/"
+```
+
+Releases build for 64-bit ARM only, which covers current phones. On a 32-bit ARM or x86 device, build from source.
+
+### Building from source
+
 ```bash
 cargo install croft-software --locked
 ```
 
-This builds croft into `~/.cargo/bin/croft` inside Termux. Re-run to upgrade.
+This builds croft into `~/.cargo/bin/croft` inside Termux, given the memory the build needs. Its last step compiles croft's own crate in a single `rustc` process, which needs about 4 GB of memory at its peak (4.1 GiB measured on Linux for the release profile). A phone often has less than that free. When it runs out, every dependency compiles fine and then croft's own `rustc` command dies with `(signal: 6, SIGABRT: process abort signal)`.
 
-### If the build aborts with SIGABRT
+A different build profile won't get under that: the release profile already peaks lowest of the optimised builds. Splitting croft into more codegen units, as the `remote-fast` profile does, pushes the peak to about 4.5 GiB at `opt-level` 1 or 2, and even `opt-level = 0` needs 3.2 GiB. So either install the prebuilt binary above, or free memory and retry: close other apps until `grep MemAvailable /proc/meminfo` shows at least 5 GB (5000000 kB). The dependencies don't need compiling again: cargo's error names the directory holding them (`intermediate artifacts can be found at ...`), so run the same install command with that directory as the build directory:
 
-The build's last step compiles croft's own crate in a single `rustc` process, which needs about 4 GB of memory at its peak (4.1 GiB measured on Linux for the release profile). A phone often has less than that free. When it runs out, every dependency compiles fine and then croft's own `rustc` command dies with `(signal: 6, SIGABRT: process abort signal)`.
+```bash
+CARGO_BUILD_BUILD_DIR=$PREFIX/tmp/cargo-installXXXXXX cargo install croft-software --locked
+```
 
-A different build profile won't get under that: the release profile already peaks lowest of the optimised builds. Splitting croft into more codegen units, as the `remote-fast` profile does, pushes the peak to about 4.5 GiB at `opt-level` 1 or 2, and even `opt-level = 0` needs 3.2 GiB. Instead:
-
-- **Free memory and retry.** Close other apps until `grep MemAvailable /proc/meminfo` shows at least 5 GB (5000000 kB). The dependencies don't need compiling again: cargo's error names the directory holding them (`intermediate artifacts can be found at ...`), so run the same install command with that directory as the build directory:
-
-  ```bash
-  CARGO_BUILD_BUILD_DIR=$PREFIX/tmp/cargo-installXXXXXX cargo install croft-software --locked
-  ```
-
-- **Skip the build** with the prebuilt Linux arm64 binary from the latest release; [INSTALL.md](INSTALL.md#from-the-latest-release) covers putting it in `$PREFIX/bin`. It is the Linux build rather than an Android one, and the latest release trails `main`.
-
-croft's own updater (`Ctrl+Shift+F9`) also builds from source on Android, since releases carry no Android archive, so it needs the same free memory.
+A croft built from a git checkout or with `cargo install --git` updates by building from source again, so it needs that memory on every update. One installed from crates.io updates by downloading the release's Android build, as a binstalled one does.
 
 ## The command modifier
 

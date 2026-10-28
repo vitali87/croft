@@ -35,14 +35,17 @@ ROOT = Path(__file__).resolve().parent.parent
 MANIFEST = ROOT / "Cargo.toml"
 WORKFLOW = ROOT / ".github" / "workflows" / "release.yml"
 
-# The four triples the issue names. A target added to the workflow without
-# being added here is fine; a target here that the workflow does not build
-# means binstall promises a platform no release carries.
+# The four triples the issue names, plus Termux's: binstall there asks for
+# aarch64-linux-android first and only then falls back to musl. A target added
+# to the workflow without being added here is fine; a target here that the
+# workflow does not build means binstall promises a platform no release
+# carries.
 EXPECTED_TARGETS = {
     "aarch64-apple-darwin",
     "x86_64-apple-darwin",
     "x86_64-unknown-linux-musl",
     "aarch64-unknown-linux-musl",
+    "aarch64-linux-android",
 }
 
 

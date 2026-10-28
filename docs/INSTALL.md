@@ -26,7 +26,8 @@ cargo binstall croft-software
 or a prebuilt from [its releases](https://github.com/cargo-bins/cargo-binstall#installation)).
 
 That downloads the tagged release for your platform (macOS arm64/x86_64, Linux
-musl arm64/x86_64) and puts `croft` on `PATH` in seconds.
+musl arm64/x86_64, Android arm64 in Termux) and puts `croft` on `PATH` in
+seconds.
 
 ## From the latest release
 
@@ -41,14 +42,15 @@ sudo mv "croft-$arch-$os/croft" /usr/local/bin/
 ```
 
 `/usr/local/bin` is on the default `PATH` but may not exist yet on a fresh Mac,
-hence the `mkdir`. On Android in Termux there is no `sudo` and no
-`/usr/local/bin`: move it to `"$PREFIX/bin/"` instead.
+hence the `mkdir`. On Android in Termux, set `os=linux-android` for the
+Android build, and as there is no `sudo` and no `/usr/local/bin`, move it to
+`"$PREFIX/bin/"` instead ([ANDROID.md](ANDROID.md#install)).
 
 ### Verifying the archive
 
 To verify the archive before installing it, download it to a file instead of
 piping it into `tar`, together with the release's `SHA256SUMS` and that file's
-signature. `SHA256SUMS` lists all four archives, so check only the one you
+signature. `SHA256SUMS` lists all five archives, so check only the one you
 fetched rather than running it whole:
 
 ```bash
