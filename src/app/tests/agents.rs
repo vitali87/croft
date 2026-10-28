@@ -2333,6 +2333,45 @@ fn closing_a_lane_refuses_while_a_tab_in_it_has_unsaved_edits_in_any_group() {
 }
 
 #[test]
+fn closing_a_lane_refuses_while_a_sheet_cell_in_it_is_being_typed_into() {
+    // The typed cell isn't committed yet, so the tab isn't dirty; closing
+    // the lane must not drop it with the tab.
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    init_lane_repo(&repo);
+    std::fs::write(repo.join("stock.csv"), "item,qty\nbolt,4\n").unwrap();
+    let git = |args: &[&str]| {
+        let st = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(st.success(), "git {args:?}");
+    };
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "stock"]);
+    let mut app = App::new(repo.clone()).unwrap();
+    app.terminal_session_path = tmp.path().join("sessions.json");
+    app.lane_agent = None;
+    app.create_worktree_lane("fix login");
+    let lane = tmp.path().join("repo-fix-login").canonicalize().unwrap();
+    let csv = lane.join("stock.csv");
+    app.editor.open_pinned(&csv).unwrap();
+    app.handle_sheet_key(key(KeyCode::Right, KeyModifiers::NONE));
+    type_into_sheet(&mut app, "40");
+    assert!(app.editor.sheet_pending_cell().is_some());
+    app.active_scm_root = lane.clone();
+    app.close_worktree_lane();
+    assert_eq!(
+        app.status,
+        "Keeping the lane: stock.csv has unsaved changes \u{2014} save or revert first"
+    );
+    assert!(csv.exists(), "the worktree stays");
+    assert!(app.editor.sheet_pending_cell().is_some(), "with the cell");
+}
+
+#[test]
 fn closing_a_lane_closes_its_saved_tabs_in_every_group() {
     // A lane tab left open after the close shows a file that is gone, and
     // a group holding only lane tabs folds away like its pane.

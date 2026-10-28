@@ -45815,11 +45815,12 @@ impl App {
     /// The first file under `dir` open with unsaved edits in any editor
     /// group, named relative to `dir`, for a removal to refuse on: git
     /// sees only what is on disk, and the tab's edits are not there yet.
+    /// A sheet cell still being typed into is an unsaved edit too.
     fn unsaved_file_under(&self, dir: &Path) -> Option<String> {
         std::iter::once(&self.editor)
             .chain(self.editor_layout.inactive_groups())
             .flat_map(|g| g.editors.iter())
-            .filter(|e| e.dirty)
+            .filter(|e| e.dirty || e.sheet_pending_cell().is_some())
             .find_map(|e| e.path.as_deref().filter(|p| p.starts_with(dir)))
             .map(|p| p.strip_prefix(dir).unwrap_or(p).display().to_string())
     }
