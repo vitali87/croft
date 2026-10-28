@@ -347,6 +347,25 @@ pub struct ThemeDecl {
     /// at 7:1 against the background.
     #[serde(default)]
     pub high_contrast: bool,
+    /// Draw the workbench as layered surfaces instead of boxed panes (Croft
+    /// Loch): panes lose their line frames, regions are told apart by tone
+    /// with a one-eighth-cell seam where two meet, and focus shows as a rule
+    /// along the focused pane's top edge. See `Theme::surfaces`.
+    #[serde(default)]
+    pub surfaces: bool,
+    /// Optional surface colors (`#rrggbb`) for a `surfaces` theme: `chrome`
+    /// (side bar, activity bar, tab strip, panel title row, status bar),
+    /// `raised` (Command Palette, menus, popups), `hairline` (the seam
+    /// between two surfaces) and `fg_muted` (labels and status items). Each
+    /// omitted one is derived from `background`.
+    #[serde(default)]
+    pub chrome: String,
+    #[serde(default)]
+    pub raised: String,
+    #[serde(default)]
+    pub hairline: String,
+    #[serde(default)]
+    pub fg_muted: String,
 }
 
 /// One `[[languages]]` entry: a language identity contributed by an extension.

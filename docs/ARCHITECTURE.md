@@ -89,7 +89,7 @@ src/
 ├── tasks.rs              auto-detected project tasks read from the manifests the repo already has (tasks.json, Makefile, justfile, package.json, Cargo.toml, pyproject.toml, go.mod, CMakeLists.txt); backs "Tasks: Run Task" and the Cmd+Shift+B default build in a reused named terminal pane
 ├── terminal_session.rs   terminal session restore: pane order, per-pane cwd, names and active index persisted per workspace root in `~/.config/croft/terminal_sessions.json`
 ├── termux.rs            Termux font auto-install: downloads Meslo Nerd Font Mono into ~/.termux/font.ttf (background, no-clobber) so the activity-bar codicon glyphs render
-├── theme.rs              IDE color theme: a `Theme` palette plus `SyntaxPalette`, loaded as data from `[[themes]]` manifest blocks, with `Theme::BLACK` as a const fallback and light-theme chrome adaptation
+├── theme.rs              IDE color theme: a `Theme` palette plus `SyntaxPalette`, loaded as data from `[[themes]]` manifest blocks, with `Theme::BLACK` as a const fallback, light-theme chrome adaptation, and the `Surfaces` a `surfaces` theme (Croft Loch) paints instead of pane boxes
 ├── triggers.rs           iTerm2-style terminal triggers from `~/.config/croft/triggers.json`: regex rules driving render-time `highlight`, plus `notify`/`bell` scanned in the PTY reader thread
 ├── agent_lane.rs         per-agent ledger of files an agent changed while you looked elsewhere; each row carries a review baseline content hash so it leaves the queue only once seen, and a write during two agents is flagged `shared` rather than guessed
 ├── agents.rs             agent lanes: which panes are running a coding agent (claude, codex, aider, gemini built in, extended by `~/.config/croft/agents.json`) and whether it is working, waiting or idle, judged from output stamps and prompt patterns rather than OSC 133 marks
@@ -196,6 +196,7 @@ src/
     ├── input_prompt.rs  single-line text modal for SCM ops that need a typed value (clone URL, branch rename, remote name/URL, tag name), tagged by `InputPurpose`; `InputPrompt::confirm` is the same box with no field, a Y/N question (trash, uninstall, remove, consent) that nothing typed can answer
     ├── list_picker.rs   generic single-choice picker for SCM ops that act on one of a git-owned list (apply/pop/drop a stash, delete a tag, remove/push-to a remote), tagged by `ListPurpose`
     ├── scm_menu.rs      the Source Control "⋯" title menu: a static tree of leaves + one-level fly-out submenus (Commit/Changes/Pull-Push/Branch/Remote/Stash/Tags); every leaf is an `ScmAction` dispatched in `App::dispatch_scm_action`
+    ├── surface.rs            pane and overlay chrome for a `surfaces` theme (Croft Loch): padding frames on the bordered inset, hairline seams, section hairlines, the focused pane's rule and the overlay card with its shadow
     ├── source_control.rs     Source Control sidebar widget: multi-root REPOSITORIES overview, branch summary, commit input, change list, inline stage/unstage/discard actions, commit split-button and menu
     ├── symbol_picker.rs VS Code "Go to Symbol in Editor" (Cmd/Ctrl+Shift+O): a fuzzy picker over the active file's outline symbols (kind-iconed, depth-indented); a `:` prefix switches to Go to Line; the App jumps via go_to_definition
     ├── workspace_symbols.rs  Go to Symbol in Workspace picker: query fans out to every running server as `workspace/symbol`, rows show kind icon, name and workspace-relative path; Enter opens the definition
@@ -467,6 +468,8 @@ The IDE color theme. A `Theme` is a palette — background, accent, selection, b
 **Syntax palette.** It is pushed into `highlight::set_syntax_palette` on every theme switch and at startup, so tree-sitter and LSP semantic-token colors follow the active theme, with open editors re-highlighted on the switch. Omitted `syn_*` manifest fields fall back to the historical Base16-Ocean-Dark defaults.
 
 **Tab-strip chrome.** Strip background, inactive and active tab, hover lift and close pill are per-theme data too (`tab_*` manifest fields). The two built-ins pin their historical constants, and every other theme derives them from its palette — strip from `search`, active from `selection`, hover and pill from `accent` — so the tab bar follows the theme instead of staying navy.
+
+**Surfaces (Croft Loch).** A theme that declares `surfaces = true` draws the workbench as layered tones instead of boxed panes, VS Code 2026's structure: the editor and terminal on the theme background, the side bar, activity bar, tab strip, panel title row and status bar on `chrome`, overlays on `raised`, and a `hairline` where two meet (each derived from `background` when the manifest omits it). Panes keep `Borders::ALL`'s one-cell inset and paint it as padding through `widgets/surface.rs`, so every rect, hit target and content position is the same as under a boxed theme; only what the frame cells show changes. The workbench draws the seams in `App::paint_surface_seams`, because only the layout knows where two surfaces meet; the focused pane shows the brand gradient along its top edge instead of the gradient box; overlays get a one-eighth-block card edge and a one-cell shadow. `Theme::ui` moves croft's navy-tinted chrome vocabulary onto the theme's surfaces, the way it moves it onto VS Code Light Modern for a light theme.
 
 **Integrated terminal.** Each pane is prefilled with `theme.editor_bg()` before the grid paints, so default-bg cells show the theme background even on Ghostty and Kitty, which ignore the `SetColors` OSC that iTerm2 honors. Its 16-color ANSI palette comes from the theme's `ansi` array via `set_palette`.
 
@@ -863,6 +866,8 @@ The Source Control sidebar widget, including the multi-root REPOSITORIES overvie
 
 Tracks agent lanes: which panes are running a coding agent, and whether that agent is working, waiting for the user, or idle. `claude`, `codex`, `aider` and `gemini` are built in, and `~/.config/croft/agents.json` extends or replaces those rows and is reloaded on save. A row's `launch` is the command a worktree lane starts the agent with.
 
+**How an agent is recognised.** By the pane's foreground process name against each row's `process` list. A script runtime (`node`, or `MainThread` on newer Node, `bun`, `deno`, `python`) says nothing by its name, and Codex CLI and Gemini CLI installed with npm run as `node`, so for those alone the sampler also reads argv and the script's basename (`node …/bin/gemini` is `gemini`) is matched first. A script that names no agent leaves the runtime's own name, so a row listing `node` still matches.
+
 **How the state is judged.** The status comes from the pane's last-output stamp and its last visible rows, matched against the agent's prompt patterns. An agent in the foreground never emits OSC 133 marks, so there is no shell-integration signal to read instead.
 
 **What the UI shows.** The pill wears `◆ claude ◐`, and the status bar counts seated agents with a click that reveals the waiting pane. `AgentEvent::{Seated, Working, Waiting, Gone}` are queued for the tick, with `Waiting` fired once per prompt.
@@ -1139,7 +1144,7 @@ Local session persistence. `croft attach` and `croft ls` run croft under the ses
 
 SVG file-preview rasterisation: `usvg` parse plus `resvg` render into a PNG that the standard image-overlay pipeline consumes unchanged.
 
-**Vector render once, bitmap refit after.** The vector render happens once per open at a fixed quality — longest edge `1600px`, with small icons capped at 8× natural so they stay crisp instead of blurring. A pane resize refits that stored PNG through `fit_image_auto` like any image tab: a bitmap rescale, never a fresh vector render.
+**Vector render once, bitmap refit after.** The vector render happens once per open at a fixed quality — longest edge `1600px`, with small icons capped at 8× natural so they stay crisp instead of blurring. A pane resize refits that stored PNG through `fit_image_auto` like any image tab: a bitmap rescale, never a fresh vector render. Because the raster's size is a quality choice, `render` also returns the SVG's own size in CSS pixels (`width` and `height`, or the viewBox's), and the preview header shows that rather than the raster's.
 
 **The `<text>` fontdb is lazy.** It is built on the FIRST preview, never at startup, because `init_graphics`' icon bake is the critical path and codicons carry no text. Generic families are remapped to a real face when the host lacks the fontdb defaults (Arial, Times) — imperfect typography beats invisible text.
 

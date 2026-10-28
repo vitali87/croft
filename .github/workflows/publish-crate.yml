@@ -1,13 +1,22 @@
-# Release every PUBLISH_EVERY version bumps: crates.io and GitHub together.
+# Release every PUBLISH_EVERY version bumps: GitHub first, then crates.io.
 #
 # croft bumps its version on every shipped merge, which is far more often
 # than anyone needs a release. This mirrors code-graph-rag's cadence: on
 # each push to main, count the versions main has carried since the newest
 # one crates.io already holds (scripts/publish_cadence.py, anchored on the
 # crates.io index rather than on a counter kept in the repo), and when the
-# count reaches PUBLISH_EVERY, publish that version from the commit that set
-# it, tag that commit, and hand the tag to release.yml for the prebuilt
-# archives, the GitHub release and the Homebrew formula.
+# count reaches PUBLISH_EVERY, tag the commit that set that version, hand the
+# tag to release.yml for the prebuilt archives, the GitHub release and the
+# Homebrew formula, wait for that release, and only then publish the version
+# to crates.io from the same commit.
+#
+# crates.io goes last because `cargo binstall croft-software` asks crates.io
+# for the newest version and then downloads that version's archive from its
+# GitHub release. While crates.io went first, every release left a window in
+# which binstall resolved a version whose archives were still being built:
+# twenty minutes for 0.2.82, ninety-seven for 0.2.32. `cargo publish
+# --dry-run` still runs before the tag, so a crate that does not package or
+# build stops the release before anything is public.
 #
 # A merge that should not wait for the count gets the `release now` label on
 # its pull request, as in code-graph-rag: the first version that includes it
@@ -135,14 +144,17 @@ jobs:
     needs: decide
     if: needs.decide.outputs.publish == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    # Most of it is waiting for release.yml: its four builds take about
+    # twenty minutes, and its publish job has waited over an hour for a
+    # runner before.
+    timeout-minutes: 180
     environment: crates-io
     permissions:
       # The OIDC token crates.io exchanges for a publish token.
       id-token: write
       # Pushing the tag.
       contents: write
-      # Dispatching release.yml on that tag.
+      # Dispatching release.yml on that tag and following its run.
       actions: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -198,21 +210,15 @@ jobs:
               out.write(f"uploaded={str(uploaded).lower()}\n")
           PY
 
-      - name: Mint a crates.io token
-        # Skipped when the head is already on crates.io: a re-run after a
-        # publish that succeeded but failed to tag has nothing to upload.
+      - name: Check the crate packages and builds
+        # Before the tag and the release, so a crate that cannot go to
+        # crates.io stops everything while nothing is public yet. The upload
+        # at the end then skips this verify: it ships this same checkout.
         if: steps.index.outputs.uploaded != 'true'
-        id: auth
-        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
-
-      - name: Publish to crates.io
-        if: steps.index.outputs.uploaded != 'true'
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         # --locked: the lockfile is what CI tested, so it is what ships.
-        run: cargo publish --locked
+        run: cargo publish --locked --dry-run
 
-      - name: Tag and hand off to release.yml
+      - name: Tag the commit
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.decide.outputs.version }}
@@ -222,7 +228,7 @@ jobs:
           tag="v${VERSION}"
           commit="$COMMIT"
           # An existing tag is reused only if it names the commit this job
-          # published: release.yml builds whatever the tag points at. tag.yml
+          # publishes: release.yml builds whatever the tag points at. tag.yml
           # has normally tagged it already. An annotated tag's `^{}` line is
           # the commit it peels to.
           target="$(git ls-remote --tags origin "refs/tags/$tag" "refs/tags/$tag^{}" \
@@ -242,5 +248,85 @@ jobs:
             gh auth setup-git
             git push origin "refs/tags/$tag"
           fi
+
+      - name: Release on GitHub and wait for it
+        # Dispatches release.yml on the tag and returns once its GitHub
+        # release is published, which is when the archives binstall downloads
+        # exist. A re-run that finds the release already out dispatches
+        # nothing. A run that ends without the release fails this job, so
+        # crates.io never gets a version GitHub does not have.
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.decide.outputs.version }}
+        run: |
+          set -euo pipefail
+          tag="v${VERSION}"
+          # 404 until the release is published. `gh release create` uploads
+          # the archives to a draft and publishes it after, and a draft is
+          # not served by tag, so a 200 means the archives are up.
+          release() {
+            curl -sS -o /dev/null -w '%{http_code}' \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "X-GitHub-Api-Version: 2026-03-10" \
+              "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/releases/tags/$tag"
+          }
+          code="$(release)"
+          case "$code" in
+            200) echo "$tag is already released"; exit 0 ;;
+            404) ;;
+            *) echo "::error::asking for the $tag release answered HTTP $code"; exit 1 ;;
+          esac
+          # The dispatch does not name the run it starts, so the run is the
+          # newest dispatched one on the tag that was not there before.
+          newest() {
+            gh run list --workflow release.yml --event workflow_dispatch --branch "$tag" \
+              --limit 1 --json databaseId --jq '.[0].databaseId // ""'
+          }
+          before="$(newest)"
           gh workflow run release.yml --ref "$tag"
-          echo "- published **${VERSION}** to crates.io and dispatched release.yml on \`$tag\`" >> "$GITHUB_STEP_SUMMARY"
+          run=""
+          for _ in $(seq 30); do
+            sleep 10
+            # A failed lookup is asked again, not taken for the run.
+            run="$(newest || true)"
+            if [ -n "$run" ] && [ "$run" != "$before" ]; then
+              break
+            fi
+            run=""
+          done
+          if [ -z "$run" ]; then
+            echo "::error::the release.yml run dispatched on $tag never appeared"
+            exit 1
+          fi
+          echo "Waiting for release.yml run $run to publish $tag"
+          # Not for the whole run: the Homebrew job after the release has no
+          # bearing on crates.io, and a failure there must not hold it back.
+          until [ "$(release)" = 200 ]; do
+            if [ "$(gh run view "$run" --json status --jq .status)" = completed ]; then
+              # Its publish job can land the release just before the run ends.
+              if [ "$(release)" = 200 ]; then
+                break
+              fi
+              echo "::error::release.yml run $run ended without publishing $tag, so $VERSION does not go to crates.io"
+              exit 1
+            fi
+            sleep 30
+          done
+          echo "- released **${VERSION}** on GitHub as \`$tag\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Mint a crates.io token
+        # Skipped when the version is already on crates.io: a re-run after an
+        # upload that landed has nothing to upload.
+        if: steps.index.outputs.uploaded != 'true'
+        id: auth
+        uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
+
+      - name: Publish to crates.io
+        if: steps.index.outputs.uploaded != 'true'
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+          VERSION: ${{ needs.decide.outputs.version }}
+        # --no-verify: the dry run above built this same checkout.
+        run: |
+          cargo publish --locked --no-verify
+          echo "- published **${VERSION}** to crates.io" >> "$GITHUB_STEP_SUMMARY"

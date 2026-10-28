@@ -26,7 +26,8 @@ on:
   # prove a tag would work before cutting one. Dispatched on a tag ref, what
   # publish-crate.yml does every PUBLISH_EVERY versions because a tag pushed
   # with github.token never fires the `push: tags` trigger above, github.ref
-  # is that tag and the release publishes as if the tag push had triggered it.
+  # is that tag and the release publishes as if the tag push had triggered it,
+  # except for crates.io, which publish-crate.yml uploads once it is out.
   workflow_dispatch:
 
 # Read at the top level; only the publish job needs write, and only to
@@ -300,9 +301,10 @@ jobs:
 
   crates:
     name: publish to crates.io
-    # A release started by publish-crate.yml finds its version on crates.io
-    # already and skips; this publishes only for a `v*` tag pushed by hand,
-    # so that release still reaches crates.io too (#1579).
+    # Only for a `v*` tag pushed by hand, so that release still reaches
+    # crates.io too (#1579). A release publish-crate.yml dispatches leaves
+    # crates.io to it: that workflow waits for this release and uploads the
+    # version after it, and uploading here as well would race it.
     #
     # `cargo binstall croft-software` asks crates.io for the newest version
     # and then downloads that version's release archive. With no publish
@@ -311,7 +313,7 @@ jobs:
     # version points at already exist.
     needs: publish
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') && github.event_name == 'push'
     permissions:
       contents: read
       # The OIDC token crates.io exchanges for a short-lived publish token,

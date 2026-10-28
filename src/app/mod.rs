@@ -4501,11 +4501,13 @@ pub struct App {
     /// True while a poll thread is in flight, so cadence ticks don't pile up
     /// overlapping `lsof` invocations.
     port_poll_inflight: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// Auto-label refresh for terminal panes: `(shell_pid, process_name)` pairs
-    /// resolved off the event loop, applied to the pane with that shell pid.
+    /// Auto-label refresh for terminal panes: `(shell_pid, process_name,
+    /// script)` resolved off the event loop, applied to the pane with that
+    /// shell pid. `script` is what a script runtime (`node`) runs, for agent
+    /// recognition (#1380); `None` for anything else.
     last_label_refresh: std::time::Instant,
-    label_rx: std::sync::mpsc::Receiver<Vec<(i32, String)>>,
-    label_tx: std::sync::mpsc::Sender<Vec<(i32, String)>>,
+    label_rx: std::sync::mpsc::Receiver<Vec<(i32, String, Option<String>)>>,
+    label_tx: std::sync::mpsc::Sender<Vec<(i32, String, Option<String>)>>,
     label_inflight: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Hit-test rect of the "PROBLEMS" tab in the panel tab strip. Empty when
     /// the panel is hidden.
@@ -7406,6 +7408,17 @@ impl App {
         image::Rgba([r, g, b, 0xff])
     }
 
+    /// The canvas fill for images that sit on chrome (the activity-bar icons
+    /// and every count badge): Croft Loch's chrome tone, the theme
+    /// background everywhere else.
+    fn chrome_bg_pixel(&self) -> image::Rgba<u8> {
+        let (r, g, b) = self
+            .theme
+            .surfaces()
+            .map_or(self.theme.editor_bg_rgb(), |s| s.chrome);
+        image::Rgba([r, g, b, 0xff])
+    }
+
     /// True when the host terminal can render inline images via either
     /// protocol. Gates the bake/emit path; the iTerm2-only `SetColors` /
     /// `Color::Reset` tricks stay behind `detect_iterm2_inline_support`.
@@ -7479,7 +7492,7 @@ impl App {
         let is_tmux = crate::iterm2_inline::detect_tmux();
         let w_cells = ACTIVITY_BAR_WIDTH;
         let h_cells = ACTIVITY_ICON_HEIGHT;
-        let icon_bg = self.theme_bg_pixel();
+        let icon_bg = self.chrome_bg_pixel();
         // The bar background above is the theme's; so is the ink painted on
         // it. A baked icon can't route its colors through `Theme::ui` the way
         // a styled cell does, so the palette is resolved once here and rides
@@ -9119,8 +9132,13 @@ impl App {
         color: (u8, u8, u8),
     ) -> Option<String> {
         let (cw, ch) = self.cell_pixel?;
-        let png =
-            crate::iterm2_inline::compose_count_badge(count, cw, ch, color, self.theme_bg_pixel())?;
+        let png = crate::iterm2_inline::compose_count_badge(
+            count,
+            cw,
+            ch,
+            color,
+            self.chrome_bg_pixel(),
+        )?;
         let raw = crate::iterm2_inline::build_inline_image_z(
             self.inline_protocol,
             &png,
@@ -17908,10 +17926,17 @@ impl App {
         };
         // A left border + bg fill so the panel reads as a distinct column,
         // like the primary side bar's seam against the editor.
-        let block = ratatui::widgets::Block::default()
-            .borders(ratatui::widgets::Borders::LEFT)
-            .border_style(Style::default().fg(self.theme.ui(Color::Rgb(0x2b, 0x2b, 0x2b))))
-            .style(Style::default().bg(self.theme.editor_bg()));
+        let block = match self.theme.surfaces() {
+            Some(s) => ratatui::widgets::Block::default()
+                .borders(ratatui::widgets::Borders::LEFT)
+                .border_set(crate::widgets::surface::HAIRLINE)
+                .border_style(Style::default().fg(s.hairline()))
+                .style(Style::default().bg(s.chrome())),
+            None => ratatui::widgets::Block::default()
+                .borders(ratatui::widgets::Borders::LEFT)
+                .border_style(Style::default().fg(self.theme.ui(Color::Rgb(0x2b, 0x2b, 0x2b))))
+                .style(Style::default().bg(self.theme.editor_bg())),
+        };
         let inner = block.inner(area);
         frame.render_widget(block, area);
         self.outline.theme = self.theme;
@@ -18044,10 +18069,16 @@ impl App {
         // (forced to sRGB(EDITOR_BG_RGB) via SetColors), matching the rest
         // of the panes. The glyph-fallback path keeps a solid bg for
         // terminals that can't render OSC-1337.
+        // Croft Loch's bar is chrome, and its baked icons carry the same
+        // tone (see `chrome_bg_pixel`).
+        let bar_bg = self
+            .theme
+            .surfaces()
+            .map_or(self.theme.editor_bg(), |s| s.chrome());
         let bg = if self.overlays.activity.has_images() {
             Style::default().bg(Color::Reset)
         } else {
-            Style::default().bg(self.theme.editor_bg())
+            Style::default().bg(bar_bg)
         };
         // In images mode the icon PNG owns the entire activity-bar block —
         // background, codicon, and active pill are baked in. Rendering a bg
@@ -18074,6 +18105,38 @@ impl App {
         };
         let settings_block = activity_settings_block(area, codeql_block.width > 0);
         let sponsor_block = activity_sponsor_block(area, codeql_block.width > 0);
+        // The baked icons cover their own rows in the chrome tone; Croft
+        // Loch paints only the rows between them, so no icon cell is ever
+        // rewritten under its image.
+        if self.overlays.activity.has_images()
+            && let Some(s) = self.theme.surfaces()
+        {
+            let icons = [
+                explorer_block,
+                search_block,
+                source_control_block,
+                remote_block,
+                run_debug_block,
+                extensions_block,
+                testing_block,
+                codeql_block,
+                sponsor_block,
+                settings_block,
+            ];
+            for y in area.top()..area.bottom() {
+                if !icons.iter().any(|b| y >= b.top() && y < b.bottom()) {
+                    frame.render_widget(
+                        ratatui::widgets::Block::default().style(Style::default().bg(s.chrome())),
+                        Rect {
+                            x: area.x,
+                            y,
+                            width: area.width,
+                            height: 1,
+                        },
+                    );
+                }
+            }
+        }
         let explorer_active = self.activity_view_active(SidebarView::Explorer);
         let search_active = self.activity_view_active(SidebarView::Search);
         let source_control_active = self.activity_view_active(SidebarView::SourceControl);
@@ -21139,6 +21202,97 @@ impl App {
         self.theme.gradient()
     }
 
+    /// Croft Loch's seams: a hairline on each boundary between two surfaces,
+    /// drawn over the frame cells the panes left as padding. The layout
+    /// knows where its boundaries are; the panes do not.
+    fn paint_surface_seams(
+        &self,
+        frame: &mut ratatui::Frame,
+        s: crate::theme::Surfaces,
+        activity_bar: Option<Rect>,
+        side_bars: [Option<Rect>; 2],
+        panel: Option<Rect>,
+        status_bar: Option<Rect>,
+    ) {
+        use crate::widgets::surface::{Edge, paint_seam};
+        let full = frame.area();
+        let hair = s.hairline();
+        let buf = frame.buffer_mut();
+        let column = |x: u16, r: Rect| Rect {
+            x,
+            y: r.y,
+            width: 1,
+            height: r.height,
+        };
+        let row = |y: u16, r: Rect| Rect {
+            x: r.x,
+            y,
+            width: r.width,
+            height: 1,
+        };
+        // A side bar against the activity bar on one side and the editor
+        // column on the other; nothing at the frame's own edge.
+        for bar in side_bars.into_iter().flatten().filter(|r| !r.is_empty()) {
+            if bar.x > full.x {
+                paint_seam(buf, column(bar.x, bar), Edge::Left, hair);
+            }
+            if bar.right() < full.right() {
+                paint_seam(buf, column(bar.right() - 1, bar), Edge::Right, hair);
+            }
+        }
+        // Editor groups side by side or stacked: the seam the user drags.
+        for seam in &self.editor_seams {
+            let span = seam.cross_end.saturating_sub(seam.cross_start);
+            let rect = match seam.dir {
+                editor_layout::SplitDir::Horizontal => Rect {
+                    x: seam.pos,
+                    y: seam.cross_start,
+                    width: 1,
+                    height: span,
+                },
+                editor_layout::SplitDir::Vertical => Rect {
+                    x: seam.cross_start,
+                    y: seam.pos,
+                    width: span,
+                    height: 1,
+                },
+            };
+            let edge = match seam.dir {
+                editor_layout::SplitDir::Horizontal => Edge::Left,
+                editor_layout::SplitDir::Vertical => Edge::Top,
+            };
+            paint_seam(buf, rect, edge, hair);
+        }
+        if let Some(p) = panel.filter(|p| !p.is_empty()) {
+            // The panel against the editor above it.
+            if p.y > full.y {
+                paint_seam(buf, row(p.y - 1, p), Edge::Bottom, hair);
+            }
+            // Split terminal panes against each other and the terminal rail.
+            for t in &self.terminals {
+                let r = t.last_area;
+                if !r.is_empty() && r.right() < p.right() {
+                    paint_seam(buf, column(r.right() - 1, r), Edge::Right, hair);
+                }
+            }
+        }
+        // Everything above the status bar against it, except the activity
+        // bar, which is chrome like the status bar and whose cells an icon
+        // image may own.
+        if let Some(bar) = status_bar.filter(|b| b.y > full.y) {
+            let y = bar.y - 1;
+            match activity_bar.filter(|a| !a.is_empty()) {
+                Some(a) => {
+                    let left = Rect::new(full.x, y, a.x - full.x, 1);
+                    let right = Rect::new(a.right(), y, full.right() - a.right(), 1);
+                    paint_seam(buf, left, Edge::Bottom, hair);
+                    paint_seam(buf, right, Edge::Bottom, hair);
+                }
+                None => paint_seam(buf, row(y, full), Edge::Bottom, hair),
+            }
+        }
+    }
+
     /// Paint the bottom panel group's tab strip (PROBLEMS / TERMINAL) across
     /// `strip` (its top row) and record each tab's hit rect. The active tab is
     /// bright/bold; the inactive one is dim, mirroring VS Code's panel tabs. A
@@ -21151,7 +21305,10 @@ impl App {
         if strip.is_empty() {
             return;
         }
-        let strip_bg = self.theme.editor_bg();
+        // Croft Loch's title row is a chrome band over the canvas the views
+        // paint on, with muted inactive titles.
+        let surfaces = self.theme.surfaces();
+        let strip_bg = surfaces.map_or(self.theme.editor_bg(), |s| s.chrome());
         frame.render_widget(Block::default().style(Style::default().bg(strip_bg)), strip);
         let brand = self.theme.gradient();
         let active_fg = if brand {
@@ -21159,7 +21316,8 @@ impl App {
         } else {
             self.theme.ui(Color::White)
         };
-        let inactive_fg = self.theme.ui(Color::Rgb(0x80, 0x88, 0x98));
+        let inactive_fg =
+            surfaces.map_or(self.theme.ui(Color::Rgb(0x80, 0x88, 0x98)), |s| s.muted());
         let right = strip.x + strip.width;
         let count = self.problems.total_count();
         let pointer = self.pointer_cell;
@@ -21285,7 +21443,12 @@ impl App {
                 let word_len = unicode_width::UnicodeWidthStr::width(label.trim()) as u16;
                 let start = rect.x + leading;
                 for ux in start..(start + word_len).min(right) {
-                    buf[(ux, rect.y)].modifier.insert(Modifier::UNDERLINED);
+                    let cell = &mut buf[(ux, rect.y)];
+                    cell.modifier.insert(Modifier::UNDERLINED);
+                    // VS Code's `panelTitle.activeBorder`: the accent.
+                    if surfaces.is_some() {
+                        cell.underline_color = self.theme.accent();
+                    }
                 }
             }
         }
@@ -21861,6 +22024,14 @@ impl App {
         self.render_secondary_side_bar(frame, secondary_area);
 
         if let Some(area) = side_area {
+            // Croft Loch's side bar is one chrome surface: the views and the
+            // Explorer's stacked sections paint on it.
+            if let Some(s) = self.theme.surfaces() {
+                frame.render_widget(
+                    ratatui::widgets::Block::default().style(Style::default().bg(s.chrome())),
+                    area,
+                );
+            }
             let usable_area = area;
             // Feed the render-time pointer cell to every side panel so the row
             // under the cursor (and the remote header pills) can light up,
@@ -22661,6 +22832,18 @@ impl App {
             }
         }
 
+        if let Some(s) = self.theme.surfaces() {
+            let status_bar = (status_h > 0 && osk_h == 0).then_some(outer[2]);
+            self.paint_surface_seams(
+                frame,
+                s,
+                activity_area,
+                [side_area, secondary_area],
+                terminal_area,
+                status_bar,
+            );
+        }
+
         // Owned snapshot: the spans borrow the status, and borrowing it
         // through scm_worker() would pin all of &self for the whole render.
         let scm_status = self.scm_worker().status().clone();
@@ -22882,13 +23065,24 @@ impl App {
         // so the bar reads as segments instead of one run of text. Quiet on
         // both the navy and near-black bars.
         let zone_div = Style::default().fg(self.theme.ui(Color::Rgb(0x3a, 0x41, 0x50)));
+        // Croft Loch spaces its zones apart the way VS Code's status bar
+        // does; the divider keeps its cell so no click target moves.
+        let div = if self.theme.surfaces().is_some() {
+            " "
+        } else {
+            "\u{2502}"
+        };
         let scm_spans = git_status_spans(&scm_status);
         // The wordmark already ends in a space; the git spans don't, so buy
         // the divider one cell of air only when the branch segment painted.
         let scm_present = !scm_spans.is_empty();
         spans.extend(scm_spans);
         spans.push(Span::styled(
-            if scm_present { " \u{2502}" } else { "\u{2502}" },
+            if scm_present {
+                format!(" {div}")
+            } else {
+                div.to_string()
+            },
             zone_div,
         ));
         // Persistent orange badge for a remote session with no dtach: it can't
@@ -22994,7 +23188,7 @@ impl App {
         self.status_message_rect = Rect::default();
         let mut status_x: u16 = 0;
         if !status_text.is_empty() {
-            spans.push(Span::styled("\u{2502} ", zone_div));
+            spans.push(Span::styled(format!("{div} "), zone_div));
             let x: u16 = spans.iter().map(|s| s.content.chars().count() as u16).sum();
             status_x = x;
             if status_h > 0 && x < outer[2].width {
@@ -23187,7 +23381,10 @@ impl App {
         // Black theme: drop the navy status strip to a near-black seam (a hair
         // lighter than the #000000 editor so the bar still reads as distinct),
         // matching VS Code's OLED themes. Croft Dark keeps the navy band.
-        let status_bg = if self.popup_gradient() {
+        // Croft Loch's bar is chrome, like the side bar and the tab strip.
+        let status_bg = if let Some(s) = self.theme.surfaces() {
+            s.chrome()
+        } else if self.popup_gradient() {
             self.theme.ui(Color::Rgb(0x18, 0x18, 0x18))
         } else {
             self.theme.ui(Color::Rgb(0x1e, 0x3a, 0x6e))
@@ -23236,7 +23433,10 @@ impl App {
             // pointer rests on them — same affordance as the activity bar.
             // Ln/Col (index 0) is a readout, not a control, so it never
             // hovers. Hit rects recorded in the same pass.
-            let seg_style = Style::default().fg(self.theme.ui(Color::Rgb(0xc9, 0xd2, 0xe3)));
+            let seg_style = Style::default().fg(match self.theme.surfaces() {
+                Some(s) => s.muted(),
+                None => self.theme.ui(Color::Rgb(0xc9, 0xd2, 0xe3)),
+            });
             let hover_style = Style::default()
                 .bg(self.theme.ui(Color::Rgb(0x2a, 0x31, 0x40)))
                 .fg(self.theme.ui(Color::White));
@@ -23244,7 +23444,7 @@ impl App {
             let mut cx = rx;
             for (i, text) in seg_texts.iter().enumerate() {
                 if i > 0 {
-                    right.push(Span::styled("\u{2502}", zone_div));
+                    right.push(Span::styled(div, zone_div));
                     cx = cx.saturating_add(1);
                 }
                 let r = Rect {
@@ -23494,8 +23694,8 @@ impl App {
             .style(Style::default().bg(self.theme.ui(Color::Rgb(0x1e, 0x1e, 0x1e))));
         frame.render_widget(ratatui::widgets::Clear, rect);
         frame.render_widget(block, rect);
-        if grad {
-            paint_gradient_box(frame.buffer_mut(), rect);
+        if self.theme.framed_overlays() {
+            crate::widgets::surface::paint_overlay_frame(frame.buffer_mut(), rect, self.theme);
         }
         let sel_bg = if grad {
             rgb_color(POPUP_SEL_BG)
@@ -24925,8 +25125,8 @@ impl App {
         frame.render_widget(block, rect);
         // Black theme: overpaint the solid border with the gradient, then
         // re-stamp the title the gradient top edge just covered.
-        if grad {
-            paint_gradient_box(frame.buffer_mut(), rect);
+        if self.theme.framed_overlays() {
+            crate::widgets::surface::paint_overlay_frame(frame.buffer_mut(), rect, self.theme);
             frame
                 .buffer_mut()
                 .set_span(rect.x + 1, rect.y, &title, title.width() as u16);
@@ -53694,7 +53894,7 @@ impl App {
             self.apply_ssh_samples(samples);
         }
         if let Some(labels) = self.label_rx.try_iter().last() {
-            for (shell_pid, name) in &labels {
+            for (shell_pid, name, _) in &labels {
                 if let Some(t) = self
                     .terminals
                     .iter_mut()
@@ -53705,7 +53905,14 @@ impl App {
                     changed = true;
                 }
             }
-            changed |= self.apply_agent_samples(&labels, crate::agents::QUIET_AFTER);
+            let samples: Vec<(i32, String)> = labels
+                .iter()
+                .map(|(shell_pid, name, script)| {
+                    let who = self.agents.sample_name(name, script.as_deref());
+                    (*shell_pid, who.to_string())
+                })
+                .collect();
+            changed |= self.apply_agent_samples(&samples, crate::agents::QUIET_AFTER);
         }
         if self.last_label_refresh.elapsed() >= TERMINAL_LABEL_INTERVAL
             && !self
@@ -53753,8 +53960,18 @@ impl App {
                             crate::widgets::terminal::process_cmdline,
                         ));
                     }
-                    let resolved: Vec<(i32, String)> =
-                        named.into_iter().map(|(sp, _, n)| (sp, n)).collect();
+                    // Only a script runtime pays the argv read (#1380): its
+                    // name is `node` whatever agent it runs.
+                    let resolved: Vec<(i32, String, Option<String>)> = named
+                        .into_iter()
+                        .map(|(sp, fg, n)| {
+                            let script = crate::agents::is_script_runtime(&n)
+                                .then(|| crate::widgets::terminal::process_cmdline(fg))
+                                .flatten()
+                                .and_then(|argv| crate::agents::script_name(&argv));
+                            (sp, n, script)
+                        })
+                        .collect();
                     let _ = tx.send(resolved);
                     inflight.store(false, std::sync::atomic::Ordering::Relaxed);
                 });

@@ -1343,31 +1343,149 @@ pub fn absolute_in(path: &str, workspace_folder: &Path) -> PathBuf {
     }
 }
 
-/// Parse a dotenv-style file: `KEY=VALUE` lines, `#` comments, blank lines,
-/// an optional `export ` prefix, and single/double quotes around the value.
+/// Parse a dotenv-style file as python-dotenv and VS Code read it (#1389):
+/// `KEY=VALUE` lines, `#` comment lines, blank lines and an optional
+/// `export ` prefix. An unquoted value ends at a `#` that follows whitespace,
+/// an inline comment. A double-quoted value may span lines and takes the
+/// `\n`, `\t`, `\r`, `\"` and `\\` escapes; a single-quoted one is literal.
+/// `${NAME}` in an unquoted or double-quoted value expands to NAME from an
+/// earlier line, else from croft's environment, else to nothing, and
+/// `${NAME:-default}` to `default` when NAME is set nowhere.
 pub fn parse_env_file(text: &str) -> BTreeMap<String, String> {
+    parse_env_file_in(text, |name| std::env::var(name).ok())
+}
+
+/// [`parse_env_file`] with `process_env` standing in for croft's
+/// environment.
+fn parse_env_file_in(
+    text: &str,
+    process_env: impl Fn(&str) -> Option<String>,
+) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
+    let mut pos = 0;
+    while pos < text.len() {
+        let line_end = text[pos..].find('\n').map_or(text.len(), |i| pos + i);
+        let line = &text[pos..line_end];
+        pos = line_end + 1;
+        let trimmed = line.trim_start();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
-        let line = line.strip_prefix("export ").unwrap_or(line).trim_start();
-        let Some((key, value)) = line.split_once('=') else {
+        let entry = trimmed.strip_prefix("export ").unwrap_or(trimmed);
+        let Some((key, raw)) = entry.split_once('=') else {
             continue;
         };
         let key = key.trim();
         if key.is_empty() || key.contains(char::is_whitespace) {
             continue;
         }
-        let value = value.trim();
-        let value = value
-            .strip_prefix('"')
-            .and_then(|v| v.strip_suffix('"'))
-            .or_else(|| value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')))
-            .unwrap_or(value);
-        out.insert(key.to_string(), value.to_string());
+        let value = raw.trim_start();
+        // Where `value` starts in `text`, for a quoted value that runs on
+        // past this line.
+        let start = line_end - line.len() + (line.len() - value.len());
+        let quoted = match value.chars().next() {
+            Some(q @ ('"' | '\'')) => closing_quote(text, start + 1, q).map(|end| (q, end)),
+            _ => None,
+        };
+        let value = match quoted {
+            Some(('\'', end)) => {
+                pos = pos.max(next_line(text, end));
+                text[start + 1..end].to_string()
+            }
+            Some((_, end)) => {
+                pos = pos.max(next_line(text, end));
+                let unescaped = unescape_double_quoted(&text[start + 1..end]);
+                expand_env_refs(&unescaped, &out, &process_env)
+            }
+            None => {
+                let comment = raw
+                    .char_indices()
+                    .find(|&(i, c)| c == '#' && raw[..i].ends_with(char::is_whitespace))
+                    .map_or(raw.len(), |(i, _)| i);
+                expand_env_refs(raw[..comment].trim(), &out, &process_env)
+            }
+        };
+        out.insert(key.to_string(), value);
     }
+    out
+}
+
+/// The index of the quote closing a value whose body starts at `from`, which
+/// may be on a later line; `None` when it never closes. A double-quoted body
+/// skips `\"` and any other backslash pair.
+fn closing_quote(text: &str, from: usize, quote: char) -> Option<usize> {
+    let mut chars = text[from..].char_indices();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '\\' if quote == '"' => {
+                chars.next();
+            }
+            c if c == quote => return Some(from + i),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Where the line holding `at` ends, past its newline: what follows a
+/// closing quote on its line, a comment, is no part of the next entry.
+fn next_line(text: &str, at: usize) -> usize {
+    text[at..].find('\n').map_or(text.len(), |i| at + i + 1)
+}
+
+/// A double-quoted dotenv value's escapes, decoded; an unknown escape keeps
+/// its backslash.
+fn unescape_double_quoted(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut chars = body.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('r') => out.push('\r'),
+            Some(c @ ('"' | '\\')) => out.push(c),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+/// `${NAME}` and `${NAME:-default}` in a dotenv value, expanded from the
+/// file's earlier entries, then `process_env`. An unterminated `${` is kept
+/// as written.
+fn expand_env_refs(
+    value: &str,
+    file: &BTreeMap<String, String>,
+    process_env: &impl Fn(&str) -> Option<String>,
+) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut rest = value;
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 2..];
+        let Some(end) = after.find('}') else {
+            out.push_str(&rest[start..]);
+            return out;
+        };
+        let (name, default) = match after[..end].split_once(":-") {
+            Some((name, default)) => (name, Some(default)),
+            None => (&after[..end], None),
+        };
+        match file.get(name).cloned().or_else(|| process_env(name)) {
+            Some(found) => out.push_str(&found),
+            None => out.push_str(default.unwrap_or("")),
+        }
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
     out
 }
 
@@ -3035,6 +3153,50 @@ mod tests {
         assert_eq!(env["C"], "sq");
         assert!(!env.contains_key("not a pair"));
         assert!(!env.contains_key("BAD KEY"));
+    }
+
+    /// #1389: `${VAR}` expands as VS Code and python-dotenv expand it, from
+    /// the file's earlier lines, then croft's environment, else to nothing.
+    #[test]
+    fn an_env_file_expands_variable_references() {
+        let process = |name: &str| (name == "HOME").then(|| String::from("/home/u"));
+        let env = parse_env_file_in(
+            "A=/x\nB=${A}/src\nP=${HOME}/data\nC=${MISSING}x\nD=${MISSING:-fallback}\n\
+             E=\"${A}:\\t\"\nF='${A}'\nG=${A\n",
+            process,
+        );
+        assert_eq!(env["B"], "/x/src");
+        assert_eq!(env["P"], "/home/u/data");
+        assert_eq!(env["C"], "x");
+        assert_eq!(env["D"], "fallback");
+        assert_eq!(env["E"], "/x:\t", "double quotes expand and unescape");
+        assert_eq!(env["F"], "${A}", "single quotes are literal");
+        assert_eq!(env["G"], "${A", "an unterminated reference stays");
+    }
+
+    /// #1389: an inline comment is dropped from an unquoted value, double
+    /// quotes take escapes and may span lines, and single quotes keep
+    /// everything as written.
+    #[test]
+    fn an_env_file_reads_inline_comments_escapes_and_multiline_values() {
+        let env = parse_env_file_in(
+            "PORT=8000 # dev port\nHASH=a#b\nBLANK= # nothing\n\
+             GREETING=\"hello\\nworld\" # greeting\n\
+             QUOTE=\"say \\\"hi\\\"\"\n\
+             KEY=\"-----BEGIN-----\nabc\n-----END-----\"\nAFTER=1\n\
+             LITERAL='a # b'\nRAW='a\\nb'\nOPEN=\"never closed\n",
+            |_| None,
+        );
+        assert_eq!(env["PORT"], "8000");
+        assert_eq!(env["HASH"], "a#b", "a # inside a word is no comment");
+        assert_eq!(env["BLANK"], "");
+        assert_eq!(env["GREETING"], "hello\nworld");
+        assert_eq!(env["QUOTE"], "say \"hi\"");
+        assert_eq!(env["KEY"], "-----BEGIN-----\nabc\n-----END-----");
+        assert_eq!(env["AFTER"], "1", "the line after a multi-line value");
+        assert_eq!(env["LITERAL"], "a # b");
+        assert_eq!(env["RAW"], "a\\nb");
+        assert_eq!(env["OPEN"], "\"never closed", "an unclosed quote is kept");
     }
 
     /// #250 phase 2: `compounds` names several configurations to launch

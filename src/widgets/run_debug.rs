@@ -3,7 +3,7 @@ use ratatui::{
     layout::{Alignment, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Widget, Wrap},
+    widgets::{Paragraph, Widget, Wrap},
 };
 use std::path::PathBuf;
 
@@ -1115,16 +1115,18 @@ impl Widget for &mut RunDebugPanel {
         } else {
             Style::default().fg(Color::DarkGray)
         };
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(border_style);
+        let block = crate::widgets::surface::view_block(self.theme, true, border_style);
         let inner = block.inner(area);
         block.render(area, buf);
         // Black theme: replace the solid focus border with the brand gradient.
         // This panel has no border title, so nothing needs re-stamping.
-        if self.focused && self.focus_gradient {
-            crate::gradient::paint_gradient_box(buf, area);
-        }
+        crate::widgets::surface::paint_view_focus(
+            buf,
+            area,
+            self.theme,
+            self.focused,
+            self.focus_gradient,
+        );
         self.last_area = area;
         self.last_button_area = Rect::default();
         self.last_config_area = Rect::default();

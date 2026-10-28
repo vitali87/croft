@@ -549,6 +549,92 @@ fn the_selected_activity_icon_is_visible_on_the_light_theme() {
     );
 }
 
+/// Croft Loch paints the workbench as surfaces on exactly the layout every
+/// other theme gets: the same side bar and tree rects as Croft Black, no
+/// line box in the side bar or the panel, the side bar and status bar on
+/// chrome, and a hairline seam where the side bar meets the editor column.
+#[test]
+fn croft_loch_paints_surfaces_on_croft_blacks_layout() {
+    let render = |id: &str| {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.apply_theme(crate::theme::Theme::from_id(id));
+        let backend = ratatui::backend::TestBackend::new(120, 40);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        term.draw(|frame| app.render(frame)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let side = app.last_sidebar_area.expect("the side bar is shown");
+        let panel = app.terminals[0].last_area;
+        (side, app.tree.last_inner, panel, buf)
+    };
+    let (side, tree, panel, black) = render("black");
+    let (loch_side, loch_tree, loch_panel, buf) = render("loch");
+    assert_eq!((loch_side, loch_tree, loch_panel), (side, tree, panel));
+    assert!(!panel.is_empty(), "the terminal panel is painted");
+    let boxed = |r: ratatui::layout::Rect, b: &ratatui::buffer::Buffer| {
+        (r.top()..r.bottom())
+            .flat_map(|y| (r.left()..r.right()).map(move |x| (x, y)))
+            .filter(|&(x, y)| {
+                "\u{250c}\u{2510}\u{2500}\u{2502}\u{2501}\u{2503}\u{256d}\u{256e}\u{2570}\u{256f}"
+                    .contains(b[(x, y)].symbol())
+            })
+            .count()
+    };
+    assert!(boxed(side, &black) > 0 && boxed(panel, &black) > 0);
+    assert_eq!(boxed(side, &buf), 0, "no box in Croft Loch's side bar");
+    assert_eq!(boxed(panel, &buf), 0, "no box around Croft Loch's terminal");
+    let s = crate::theme::Theme::from_id("loch").surfaces().unwrap();
+    let seam = (side.top()..side.bottom())
+        .map(|y| &buf[(side.right() - 1, y)])
+        .filter(|c| c.symbol() == "\u{2595}" && c.fg == s.hairline())
+        .count();
+    assert!(
+        seam > side.height as usize / 2,
+        "a hairline down the side bar's edge"
+    );
+    assert_eq!(buf[(side.x + 2, side.bottom() - 2)].bg, s.chrome());
+    assert_eq!(buf[(60, 39)].bg, s.chrome(), "the status bar is chrome");
+}
+
+/// Croft Loch fills the activity bar's rows between its baked icons with
+/// chrome, and must leave the sponsor heart's rows (#1940) to its image like
+/// every other icon's: a cell repainted under an inline image forces the
+/// image to be re-sent, and the fill shows through it.
+#[test]
+fn croft_loch_leaves_the_sponsor_hearts_rows_to_its_baked_image() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.apply_theme(crate::theme::Theme::from_id("loch"));
+    app.overlays
+        .activity
+        .set_images(ActivityBarImages::default());
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+    let buf = term.backend().buffer();
+    let chrome = crate::theme::Theme::from_id("loch")
+        .surfaces()
+        .unwrap()
+        .chrome();
+    let heart = app.sidebar_areas.sponsor_icon;
+    assert!(!heart.is_empty(), "a 40-row bar has room for the heart");
+    for y in heart.top()..heart.bottom() {
+        assert_ne!(
+            buf[(heart.x, y)].bg,
+            chrome,
+            "heart row {y} left to its image"
+        );
+    }
+    let above = heart.top() - 1;
+    let last_view = app.sidebar_areas.testing_icon.bottom();
+    assert!(above >= last_view.max(app.sidebar_areas.codeql_icon.bottom()));
+    assert_eq!(
+        buf[(heart.x, above)].bg,
+        chrome,
+        "the gap above the heart is chrome"
+    );
+}
+
 #[test]
 fn cmd_b_and_ctrl_b_toggle_the_primary_side_bar() {
     // VS Code's "Toggle Primary Side Bar" is Cmd+B on macOS (Ctrl+B on

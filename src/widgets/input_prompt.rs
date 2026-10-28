@@ -553,8 +553,8 @@ pub fn render_input_prompt(
         height: rect.height.saturating_sub(2),
     };
     Widget::render(block, rect, buf);
-    if theme.gradient() {
-        crate::gradient::paint_gradient_box(buf, rect);
+    if theme.framed_overlays() {
+        crate::widgets::surface::paint_overlay_frame(buf, rect, theme);
         // Clipped to the box like the block's own title: at full width it
         // ran past the border and the screen edge (#910).
         buf.set_span(rect.x + 1, rect.y, &title, rect.width.saturating_sub(2));

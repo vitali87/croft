@@ -22,7 +22,7 @@ use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Widget},
+    widgets::{Borders, Paragraph, Widget},
 };
 use serde::Deserialize;
 
@@ -556,9 +556,11 @@ impl Default for DependenciesPanel {
 
 impl Widget for &mut DependenciesPanel {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let block = Block::default()
-            .borders(Borders::BOTTOM)
-            .border_style(Style::default().fg(self.theme.ui(COLOR_DIM)));
+        let block = crate::widgets::surface::section_block(
+            self.theme,
+            Borders::BOTTOM,
+            Style::default().fg(self.theme.ui(COLOR_DIM)),
+        );
         let inner = block.inner(area);
         block.render(area, buf);
         self.last_area = area;

@@ -1,0 +1,2 @@
+fix: A launch configuration's `envFile` expands `${VAR}` references as VS Code does, from earlier lines and then croft's environment, so `PYTHONPATH=${PROJECT_ROOT}/src` reaches the program as a real path.
+fix: `envFile` drops inline comments (`PORT=8000 # dev port` is `8000`), decodes `\n` and other escapes in double quotes, reads double-quoted values that span lines, and keeps single-quoted values exactly as written.

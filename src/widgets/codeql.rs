@@ -9,7 +9,7 @@ use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
     text::Span,
-    widgets::{Block, Borders, Widget},
+    widgets::Widget,
 };
 
 /// VS Code's `ql-container` views, in its order. The Evaluator Log Viewer is
@@ -2190,14 +2190,17 @@ impl Widget for &mut CodeqlPanel {
                     .add_modifier(Modifier::BOLD),
             )
         };
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(block_style)
-            .title(title.clone());
+        let block =
+            crate::widgets::surface::view_block(theme, true, block_style).title(title.clone());
         let inner = block.inner(area);
         block.render(area, buf);
-        if self.focused && self.focus_gradient {
-            crate::gradient::paint_gradient_box(buf, area);
+        if crate::widgets::surface::paint_view_focus(
+            buf,
+            area,
+            theme,
+            self.focused,
+            self.focus_gradient,
+        ) {
             buf.set_span(area.x + 1, area.y, &title, title.width() as u16);
         }
         self.last_inner = inner;

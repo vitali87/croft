@@ -8,7 +8,7 @@ use ratatui::{
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Widget},
+    widgets::Widget,
 };
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -2450,17 +2450,19 @@ impl Widget for &mut SearchPanel {
         } else {
             Style::default().fg(Color::DarkGray)
         };
-        let outer = Block::default()
-            .borders(Borders::ALL)
-            .border_style(outer_style);
+        let outer = crate::widgets::surface::view_block(self.theme, true, outer_style);
         let inner = outer.inner(area);
         outer.render(area, buf);
         // Black theme: replace the solid focus border with the brand gradient.
         // No title sits on this border (the SEARCH header is inside), so there
         // is nothing to re-stamp.
-        if self.focused && self.focus_gradient {
-            crate::gradient::paint_gradient_box(buf, area);
-        }
+        crate::widgets::surface::paint_view_focus(
+            buf,
+            area,
+            self.theme,
+            self.focused,
+            self.focus_gradient,
+        );
         self.last_area = area;
         self.last_inner = inner;
         // Clear last frame's caret up front so an early return (too small to

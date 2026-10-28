@@ -5687,19 +5687,31 @@ impl Widget for &mut PtyTerminal {
         // first -- costing the shell a row and a column on every side of
         // every pane. Heavy glyphs give the emphasis for free, which is
         // what iTerm2 and WezTerm do for the same reason.
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(if self.focused {
-                ratatui::widgets::BorderType::Thick
-            } else {
-                ratatui::widgets::BorderType::Plain
-            })
-            .border_style(block_style);
+        //
+        // Croft Loch draws no box: the frame is padding on the canvas and the
+        // focused pane carries the brand rule along its top edge. A host
+        // accent keeps a full box there too, because a production pane must
+        // read as dangerous at a glance.
+        let surfaces = self.theme.surfaces().is_some() && self.accent.is_none();
+        let block = if surfaces {
+            crate::widgets::surface::pane_block(self.theme.editor_bg())
+        } else {
+            Block::default()
+                .borders(Borders::ALL)
+                .border_type(if self.focused {
+                    ratatui::widgets::BorderType::Thick
+                } else {
+                    ratatui::widgets::BorderType::Plain
+                })
+                .border_style(block_style)
+        };
         let inner = block.inner(area);
         block.render(area, buf);
         // Black theme: replace the solid focus border with the orange→green
         // gradient (matching the welcome activity box).
-        if self.focused && self.focus_gradient && self.accent.is_none() {
+        if self.focused && surfaces {
+            crate::widgets::surface::paint_focus_rule(buf, area, self.theme);
+        } else if self.focused && self.focus_gradient && self.accent.is_none() {
             crate::gradient::paint_gradient_box_heavy(buf, area);
         }
         self.last_area = area;
@@ -6081,7 +6093,15 @@ impl Widget for &mut PtyTerminal {
             // the one most likely to be running the build being measured.
             // `═` against a heavy border is the same trick `━` plays
             // against a light one.
-            let fill_glyph = if self.focused { "═" } else { "━" };
+            // Croft Loch has no border to outweigh: a quarter block sits on
+            // the frame row's floor, heavier than the hairline seam there.
+            let fill_glyph = if surfaces {
+                "\u{2582}"
+            } else if self.focused {
+                "═"
+            } else {
+                "━"
+            };
             for i in 0..fill_len.min(w) {
                 let x = inner.x + (fill_from + i) as u16;
                 let cell = &mut buf[(x, by)];
