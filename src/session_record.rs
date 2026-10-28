@@ -274,7 +274,23 @@ fn running_owner(pidfile: &Path) -> Option<Owner> {
 /// Write `me` to `pidfile`, refusing while another recorder of the same
 /// session runs: the second would take over the pidfile, and `--stop` could
 /// no longer reach the first. A pidfile whose recorder is gone is replaced.
+/// An exclusive lock beside it makes that check and replacement one step:
+/// two recorders starting together each saw the stale file as theirs, and
+/// the second removed the first's new claim.
 fn claim(pidfile: &Path, me: &Owner, workspace: &Path) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    let lock_path = pidfile.with_extension("lock");
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("creating {}", lock_path.display()))?;
+    // Released when `lock` closes, at the end of this function.
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("locking {}", lock_path.display()));
+    }
     let create = || {
         std::fs::OpenOptions::new()
             .write(true)
