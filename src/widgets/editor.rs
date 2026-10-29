@@ -2776,6 +2776,9 @@ pub enum SaveOutcome {
     WriteProtected,
 }
 
+/// What a save of a scratch tab (#951) says instead of writing.
+pub const SCRATCH_SAVE_REFUSAL: &str = "This tab isn't a file: use File: Save As… to keep a copy";
+
 /// Why a file refuses this user's writes (#1379).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WriteProtection {
@@ -3503,6 +3506,11 @@ pub struct Editor {
     /// `Some(n)` for a tab made by File: New Untitled Text File (#1580),
     /// shown as `Untitled-n` until Save As gives it a path.
     pub untitled: Option<usize>,
+    /// Set on a scratch tab (`open_text_buffer`): text croft made, such as
+    /// a past version, a Search Editor or a commit, whose `path` is only
+    /// its label (#951). No save writes it: written, the label became a
+    /// junk file in croft's working directory. Save As gives it a path.
+    pub scratch: bool,
     /// The selection Add Selection to Next Find Match last made from the
     /// word at the caret (#1558). While the primary selection is that one,
     /// further matches are whole words, as in VS Code; a selection made by
@@ -4003,6 +4011,7 @@ impl Editor {
             fallback_folds_seq: None,
             preview: false,
             untitled: None,
+            scratch: false,
             occurrence_word_sel: None,
             pinned: false,
             undo_stack: Vec::new(),
@@ -5559,6 +5568,9 @@ impl Editor {
             // What the sweep said about the file this tab held is not about
             // this one, even with the same stamp (#900).
             self.disk_report = None;
+            // A real file now, not a scratch tab's label (#951): kept, the
+            // flag refused its saves and let it close without asking.
+            self.scratch = false;
         }
         if changed_file {
             // On a failed open the tab may still hold the file it left, and
@@ -12179,12 +12191,14 @@ impl Editor {
 
     /// File: Save As… (#1203): write the buffer to `path` and make this tab
     /// that file, with the grammar its name calls for. The tab stays on its
-    /// own path, untouched, unless the bytes land.
+    /// own path, untouched, unless the bytes land. A scratch tab (#951)
+    /// becomes that file too.
     pub fn save_as(&mut self, path: &Path) -> Result<SaveOutcome> {
         let kept = (
             self.path.replace(path.to_path_buf()),
             self.disk_stamp,
             self.disk_conflict,
+            std::mem::take(&mut self.scratch),
         );
         self.disk_stamp = Self::disk_stamp_of(path);
         self.disk_conflict = false;
@@ -12197,7 +12211,7 @@ impl Editor {
                 self.set_language(lang);
             }
         } else {
-            (self.path, self.disk_stamp, self.disk_conflict) = kept;
+            (self.path, self.disk_stamp, self.disk_conflict, self.scratch) = kept;
         }
         outcome
     }
@@ -12328,6 +12342,10 @@ impl Editor {
         // path (explicit, force, auto, format-on-save) can route around.
         if self.has_non_text_view() {
             anyhow::bail!("This tab is a read-only preview; nothing to save");
+        }
+        // Same choke point for a scratch tab (#951): its path is a label.
+        if self.scratch {
+            anyhow::bail!(SCRATCH_SAVE_REFUSAL);
         }
         self.apply_editorconfig_on_save(reason);
         let path = self
@@ -22931,12 +22949,13 @@ impl EditorTabs {
     /// Open arbitrary text in a scratch tab labelled `label` (no file on
     /// disk). Used by "Show Git Output" to surface the git command log. The
     /// tab has no `disk_stamp`, so the FS-sync layer never tries to reload
-    /// or overwrite it.
+    /// or overwrite it, and is `scratch`, so no save writes it (#951).
     pub fn open_text_buffer(&mut self, label: &Path, text: &str) -> Result<()> {
         let mut e = Editor::new();
         e.focused = self.editors[self.active].focused;
         e.preview = false;
         e.path = Some(label.to_path_buf());
+        e.scratch = true;
         e.lines = split_into_lines(text);
         if e.lines.is_empty() {
             e.lines.push(String::new());
@@ -25726,6 +25745,46 @@ mod tests {
         assert!(e.sheet.is_some());
         assert!(e.save_to_disk().is_err(), "sheet tab save must refuse");
         assert_eq!(std::fs::read(&csv).unwrap(), b"a,b\n1,2\n");
+    }
+
+    #[test]
+    fn save_on_a_scratch_tab_writes_nothing_until_save_as() {
+        // #951: a scratch tab's path is its label, so the choke point
+        // refuses it for every caller, force save included. The label is
+        // absolute here so a regression writes into the tempdir, not into
+        // the test's working directory.
+        let tmp = tempfile::tempdir().unwrap();
+        let label = tmp.path().join("stats.py @ 4affdca");
+        let mut tabs = EditorTabs::default();
+        tabs.open_text_buffer(&label, "def mean(xs):\n").unwrap();
+        tabs.insert_str("x");
+        assert!(tabs.scratch && tabs.dirty);
+        assert!(tabs.save_to_disk().is_err(), "explicit save refuses");
+        assert!(tabs.auto_save_to_disk().is_err(), "auto save too");
+        assert!(tabs.save_to_disk_force().is_err(), "and force save");
+        assert!(!label.exists(), "nothing was written");
+        let kept = tmp.path().join("stats.py");
+        assert_eq!(tabs.save_as(&kept).unwrap(), SaveOutcome::Saved);
+        assert!(!tabs.scratch, "the tab is that file now");
+        let written = std::fs::read_to_string(&kept).unwrap();
+        assert!(written.starts_with("xdef mean(xs):"), "{written:?}");
+    }
+
+    #[test]
+    fn a_real_file_opened_into_a_scratch_tab_saves() {
+        // The tab stops being scratch once it holds a file: kept, the flag
+        // refused the file's saves and let its edits close unasked.
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("query.ql");
+        std::fs::write(&real, "select 1\n").unwrap();
+        let mut tabs = EditorTabs::default();
+        tabs.open_text_buffer(&tmp.path().join("Search: mean"), "hits\n")
+            .unwrap();
+        (*tabs).open(&real).unwrap();
+        assert!(!tabs.scratch);
+        tabs.insert_str("x");
+        tabs.save_to_disk().expect("the file saves");
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "xselect 1\n");
     }
     #[test]
     fn is_binary_detects_nul() {
