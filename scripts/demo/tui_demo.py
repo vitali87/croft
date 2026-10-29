@@ -113,7 +113,10 @@ class Demo:
     def snap(self, hold_ms: int) -> None:
         """Capture the screen as the next frame, held for `hold_ms`."""
         time.sleep(0.35)
-        text = self._tmux("capture-pane", "-p", "-e", "-t", "demo")
+        # -N keeps each row's trailing blanks: a pane painted to its right
+        # edge with no border glyph there (Croft Loch's padding) otherwise
+        # loses its background and replays on the terminal default.
+        text = self._tmux("capture-pane", "-p", "-e", "-N", "-t", "demo")
         self.frames.append((text, hold_ms))
 
     def save(self, gif: str | Path, still: str | Path | None = None, still_frame: int = -1) -> None:

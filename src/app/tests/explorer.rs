@@ -4,18 +4,19 @@
 use super::*;
 
 #[test]
-fn explorer_boots_with_gradient_focus_under_black_theme() {
-    // Regression: the explorer auto-focuses at startup, but the Black-theme
-    // gradient border used to arm only on the first focus change because
+fn explorer_boots_with_gradient_focus_under_the_default_theme() {
+    // Regression: the explorer auto-focuses at startup, but the brand-theme
+    // gradient focus used to arm only on the first focus change because
     // `sync_focus_flags` never ran during construction. `App::new` now syncs
     // once before returning, so the initial focus already carries the gradient.
     let tmp = tempfile::tempdir().unwrap();
     let app = App::new(tmp.path().to_path_buf()).unwrap();
-    assert_eq!(app.theme, crate::theme::Theme::BLACK);
+    assert_eq!(app.theme, crate::theme::Theme::LOCH);
+    assert!(app.theme.gradient(), "the default is a brand theme");
     assert!(app.tree.focused, "explorer should boot focused");
     assert!(
         app.tree.focus_gradient,
-        "Black-theme gradient border must arm at startup, not just after a focus change"
+        "the gradient focus must arm at startup, not just after a focus change"
     );
 }
 
