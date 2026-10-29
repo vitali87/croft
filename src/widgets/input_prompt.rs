@@ -276,6 +276,9 @@ pub enum InputPurpose {
     /// A `${input:…}` a launch or task asks for (#1424); the question
     /// itself is the App's.
     LaunchInput,
+    /// Go to Line, opened by clicking the status bar's `Ln X, Col Y`
+    /// readout: the typed value is a one-based line number.
+    GoToLine,
 }
 
 pub struct InputPrompt {

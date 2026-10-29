@@ -1559,6 +1559,17 @@ enum MenuAction {
     EditLogpointAt {
         line: usize,
     },
+    /// Editor gutter: toggle a bookmark on 1-based `line`. The gutter menu has
+    /// no cursor to act on, so the line rides the action; the label reads
+    /// "Toggle Bookmark" either way, as the Bookmarks extension's does.
+    ToggleBookmarkAt {
+        line: usize,
+    },
+    /// Editor gutter: jump to the next bookmark in the open file, wrapping at
+    /// the end. Not line-scoped, so it rides the menu as a command.
+    NextBookmark,
+    /// Editor gutter: mirror of [`MenuAction::NextBookmark`] walking upwards.
+    PreviousBookmark,
     /// Editor gutter: ask the resident navigator about 0-based `line`
     /// (opens the ask box scoped to that line).
     AskNavigatorAt {
@@ -1793,6 +1804,9 @@ fn shortcut_for(action: &MenuAction) -> Option<&'static str> {
         MenuAction::ToggleBreakpointAt { .. } => Some("F9"),
         MenuAction::EditBreakpointConditionAt { .. } => Some("⇧F9"),
         MenuAction::EditLogpointAt { .. } => Some("⇧⌥F9"),
+        MenuAction::ToggleBookmarkAt { .. } => Some("⌃⌥⇧K"),
+        MenuAction::NextBookmark => Some("⌃⌥."),
+        MenuAction::PreviousBookmark => Some("⌃⌥,"),
         MenuAction::AskNavigatorAt { .. } => Some("⌘K Q"),
         MenuAction::AskNavigatorSelection { .. } => Some("⌘K Q"),
         MenuAction::AskNavigatorAboutCapture => Some("n"),
@@ -5420,6 +5434,9 @@ pub struct App {
     agent_events: std::collections::VecDeque<crate::agents::AgentEvent>,
     /// Hit rect of the status bar's agents chip; empty when no agent is seated.
     status_agents_rect: Rect,
+    /// Hit rect of the status bar's `Ln X, Col Y` readout. A click opens the
+    /// Go to Line prompt: a readout becomes a control, as in VS Code.
+    status_position_rect: Rect,
     /// User-defined problem matchers (#252): `matchers.json` (user config
     /// dir + workspace `.croft/`), batch-scanned at the FinishedCommand
     /// boundary alongside the built-in table. Swapped wholesale on reload.
@@ -7279,6 +7296,7 @@ impl App {
             agents: crate::agents::AgentTable::load(&crate::agents::agents_path()),
             agent_events: std::collections::VecDeque::new(),
             status_agents_rect: Rect::default(),
+            status_position_rect: Rect::default(),
             matchers,
             watch_set,
             task_matcher_by_pane: std::collections::HashMap::new(),
@@ -23792,6 +23810,7 @@ impl App {
         self.status_eol_rect = Rect::default();
         self.status_language_rect = Rect::default();
         self.status_agents_rect = Rect::default();
+        self.status_position_rect = Rect::default();
         if status_h > 0 && right_total > 0 && right_total <= status_rect.width {
             let rx = status_rect.right() - right_total;
             if self.status_message_rect.right() > rx {
@@ -23827,8 +23846,8 @@ impl App {
             // shade up from the transient's dim gray, │ dividers between, and
             // a hover fill on the clickable segments (indices 1..=5) when the
             // pointer rests on them — same affordance as the activity bar.
-            // Ln/Col (index 0) is a readout, not a control, so it never
-            // hovers. Hit rects recorded in the same pass.
+            // Ln/Col (index 0) opens Go to Line, so it hovers like the rest.
+            // Hit rects recorded in the same pass.
             let seg_style = Style::default().fg(match self.theme.surfaces() {
                 Some(s) => s.muted(),
                 None => self.theme.ui(Color::Rgb(0xc9, 0xd2, 0xe3)),
@@ -23849,15 +23868,15 @@ impl App {
                     width: widths[i],
                     height: 1,
                 };
-                let hovered = i > 0
-                    && self
-                        .pointer_cell
-                        .is_some_and(|(pc, pr)| rect_contains(r, pc, pr));
+                let hovered = self
+                    .pointer_cell
+                    .is_some_and(|(pc, pr)| rect_contains(r, pc, pr));
                 right.push(Span::styled(
                     text.clone(),
                     if hovered { hover_style } else { seg_style },
                 ));
                 match i {
+                    0 => self.status_position_rect = r,
                     1 => self.status_indent_rect = r,
                     2 => self.status_encoding_rect = r,
                     3 => self.status_eol_rect = r,
@@ -40086,6 +40105,18 @@ impl App {
         };
         let purpose = prompt.purpose.clone();
         match purpose {
+            InputPurpose::GoToLine => {
+                self.close_input_prompt();
+                match value.trim().parse::<usize>() {
+                    Ok(n) if n > 0 => {
+                        // The typed line is 1-based (what the status bar shows);
+                        // goto_line_centered takes a 0-based row index.
+                        self.editor.goto_line_centered(n - 1);
+                        self.status = format!("Line {n}");
+                    }
+                    _ => self.status = format!("Not a line number: {}", value.trim()),
+                }
+            }
             InputPurpose::AddWatch => {
                 self.close_input_prompt();
                 self.add_watch_expression(value);
@@ -61628,6 +61659,10 @@ impl App {
                 );
                 return;
             }
+            if rect_contains(self.status_position_rect, m.column, m.row) {
+                self.open_go_to_line_prompt();
+                return;
+            }
             if rect_contains(self.status_indent_rect, m.column, m.row) {
                 self.open_status_indent_menu(self.status_indent_rect.x, self.status_indent_rect.y);
                 return;
@@ -62614,6 +62649,18 @@ impl App {
                         (toggle_label, MenuAction::ToggleBreakpointAt { line }),
                         (cond_label, MenuAction::EditBreakpointConditionAt { line }),
                         (log_label, MenuAction::EditLogpointAt { line }),
+                        // Bookmarks sit below the breakpoint group: same gutter,
+                        // different tool, and the Bookmarks extension's own
+                        // labels so the chords read the same as in VS Code.
+                        (
+                            String::from("Toggle Bookmark"),
+                            MenuAction::ToggleBookmarkAt { line },
+                        ),
+                        (String::from("Next Bookmark"), MenuAction::NextBookmark),
+                        (
+                            String::from("Previous Bookmark"),
+                            MenuAction::PreviousBookmark,
+                        ),
                     ];
                     // The resident navigator's line-scoped ask, only while
                     // one is seated (`line` here is 1-based, the box 0-based).
@@ -64728,6 +64775,14 @@ impl App {
                     } else {
                         self.editor.scroll_down(3);
                     }
+                } else if let Some(dfs) = self.editor_layout.inactive_dfs_index_at(m.column, m.row) {
+                    // A split group that is not focused still owns its own
+                    // scroll position: the wheel over its tab scrolls that
+                    // group (dfs and inactive_groups_mut agree on order),
+                    // without stealing focus from the active one.
+                    if let Some(group) = self.editor_layout.inactive_groups_mut().get_mut(dfs) {
+                        group.wheel_scroll_active(3);
+                    }
                 } else if rect_contains(self.terminal_rail_area, m.column, m.row) {
                     // The rail is its own scrollable list, like VS Code's
                     // terminal tabs. Paint clamps the offset.
@@ -64802,6 +64857,10 @@ impl App {
                         view.scroll_by(-3, rows);
                     } else {
                         self.editor.scroll_up(3);
+                    }
+                } else if let Some(dfs) = self.editor_layout.inactive_dfs_index_at(m.column, m.row) {
+                    if let Some(group) = self.editor_layout.inactive_groups_mut().get_mut(dfs) {
+                        group.wheel_scroll_active(-3);
                     }
                 } else if rect_contains(self.terminal_rail_area, m.column, m.row) {
                     self.terminal_rail_scroll = self.terminal_rail_scroll.saturating_sub(1);
@@ -69535,6 +69594,21 @@ impl App {
                 self.focus_pane(Pane::Editor);
                 self.debug_edit_logpoint_line(line);
             }
+            MenuAction::ToggleBookmarkAt { line } => {
+                self.focus_pane(Pane::Editor);
+                // `toggle_bookmark` acts on the cursor, so seat it on the
+                // clicked line first; `line` is 1-based, the editor 0-based.
+                self.editor.goto_line_centered(line.saturating_sub(1));
+                self.toggle_bookmark();
+            }
+            MenuAction::NextBookmark => {
+                self.focus_pane(Pane::Editor);
+                self.goto_bookmark(true);
+            }
+            MenuAction::PreviousBookmark => {
+                self.focus_pane(Pane::Editor);
+                self.goto_bookmark(false);
+            }
             MenuAction::AskNavigatorAt { line } => {
                 self.focus_pane(Pane::Editor);
                 self.open_ask_navigator((line, line), String::new());
@@ -72082,6 +72156,18 @@ impl App {
             })
             .collect();
         self.open_status_menu(col, row, items);
+    }
+
+    /// Go to Line, opened by clicking the status bar's `Ln X, Col Y` readout.
+    /// The field is prefilled with the caret's current line, selected, so the
+    /// user can type over it or press Enter to stay put.
+    fn open_go_to_line_prompt(&mut self) {
+        use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+        let line = self.editor.cursor_row + 1;
+        self.open_input_prompt(
+            InputPrompt::new(InputPurpose::GoToLine, "Go to Line", "line number")
+                .with_value(line.to_string()),
+        );
     }
 
     /// Status-bar indentation picker, mirroring VS Code's "Select Indentation"

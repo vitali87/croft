@@ -22024,6 +22024,51 @@ impl EditorTabs {
         self.active
     }
 
+    /// The group's active tab, for callers that must act on the group without
+    /// hoisting it into App::editor (e.g. a wheel scroll over an inactive
+    /// split pane). editors is never empty, so this cannot fail.
+    pub fn active_editor_mut(&mut self) -> &mut Editor {
+        let active = self.active.min(self.editors.len().saturating_sub(1));
+        &mut self.editors[active]
+    }
+
+    /// Wheel-scroll this group's active tab by notches (positive = down),
+    /// mirroring what App does for the focused tab: a diff scrolls its own
+    /// pane, a PDF preview steps pages (clamped to the document), a hex view
+    /// scrolls by data rows, anything else scrolls text by notches lines.
+    /// Keeping the modes here means a background split group behaves like the
+    /// focused one instead of scrolling a buffer that isn't on screen.
+    pub fn wheel_scroll_active(&mut self, notches: i32) {
+        let ed = self.active_editor_mut();
+        if let Some(diff) = ed.diff.as_mut() {
+            if notches >= 0 {
+                diff.scroll_down_by(notches.unsigned_abs() as usize);
+            } else {
+                diff.scroll_up_by(notches.unsigned_abs() as usize);
+            }
+            return;
+        }
+        if let Some(page) = ed.pdf_page() {
+            let target = if notches >= 0 {
+                page.saturating_add(notches as u32)
+            } else {
+                page.saturating_sub(notches.unsigned_abs()).max(1)
+            };
+            ed.set_pdf_page(target);
+            return;
+        }
+        if let Some(view) = ed.hex.as_mut() {
+            let rows = (view.layout.data_rows as usize).max(1);
+            view.scroll_by(notches as i64, rows);
+            return;
+        }
+        if notches >= 0 {
+            ed.scroll_down(notches.unsigned_abs() as usize);
+        } else {
+            ed.scroll_up(notches.unsigned_abs() as usize);
+        }
+    }
+
     /// The tab strip label for the tab at `idx` (file name, diff pair, or
     /// "untitled"), for status messages. Empty string for an out-of-range idx.
     pub fn tab_display_label(&self, idx: usize) -> String {
