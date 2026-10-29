@@ -55,7 +55,16 @@ fn codeql_icon_sits_below_testing_and_opens_the_codeql_side_bar() {
         assert_eq!(app.sidebar_view, SidebarView::CodeQL);
         term.draw(|f| app.render(f)).unwrap();
         let screen = screen_lower(&term);
-        assert!(screen.contains(" codeql "), "the pane's frame:\n{screen}");
+        // The title sits on the side bar's top row, between the box's
+        // dashes or, under a `surfaces` theme, on the focus rule.
+        let side = app.last_sidebar_area.expect("the side bar is shown");
+        let title_row: String = (side.left()..side.right())
+            .map(|x| term.backend().buffer()[(x, side.y)].symbol())
+            .collect();
+        assert!(
+            title_row.to_lowercase().contains("codeql"),
+            "the pane's frame:\n{screen}"
+        );
         for section in [
             "language",
             "queries",

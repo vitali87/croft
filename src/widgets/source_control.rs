@@ -2625,7 +2625,7 @@ mod tests {
         }
         let x = hit.expect("branch row must carry the cod-source-control (U+EA68) Y-fork glyph");
         let style = buf[(x, row_y)].style();
-        let expected = ratatui::style::Color::Rgb(0x88, 0xc0, 0xd0);
+        let expected = p.theme.ui(ratatui::style::Color::Rgb(0x88, 0xc0, 0xd0));
         assert_eq!(
             style.fg,
             Some(expected),

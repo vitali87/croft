@@ -5642,7 +5642,8 @@ fn the_scrubber_slider_seeks_on_click_and_drag() {
     let row: String = (0..120)
         .map(|x| term.backend().buffer()[(x, track.y)].symbol().to_string())
         .collect();
-    assert!(row.contains(" 1/3 "), "{row}");
+    // The seam under a `surfaces` theme takes the gap after the label.
+    assert!(row.contains(" 1/3"), "{row}");
     // The drag keeps seeking off the row too.
     mouse(
         &mut app,

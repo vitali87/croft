@@ -3459,6 +3459,8 @@ mod tests {
         use ratatui::buffer::Buffer;
         let tmp = TempDir::new().unwrap();
         let mut panel = SearchPanel::new(tmp.path().to_path_buf());
+        // The boxed input; Croft Loch draws it as an underlined field.
+        panel.theme = crate::theme::Theme::BLACK;
         panel.focused = true;
         let area = Rect {
             x: 0,
@@ -3537,6 +3539,8 @@ mod tests {
         use ratatui::buffer::Buffer;
         let tmp = TempDir::new().unwrap();
         let mut panel = SearchPanel::new(tmp.path().to_path_buf());
+        // The boxed input; Croft Loch draws it as an underlined field.
+        panel.theme = crate::theme::Theme::BLACK;
         let area = Rect {
             x: 0,
             y: 0,

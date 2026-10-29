@@ -17594,19 +17594,23 @@ impl App {
         } else {
             Style::default().bg(self.theme.editor_bg())
         };
-        // Paint a full bordered box around the welcome area so the editor
-        // pane has the same visible envelope as when a file is open
-        // (Borders::ALL on the editor widget). Without this, the welcome
-        // bg bleeds into the tree, the terminal, and the window edge with
-        // no perceptible seam — and the sidebar splitter looks
-        // unreachable. The bg style is applied to the same block so the
-        // inside is filled in one pass. The welcome content then renders
-        // into `block.inner(outer_area)` so a tall recents list can never
-        // paint over the border rows.
-        let outer_block = ratatui::widgets::Block::default()
-            .borders(ratatui::widgets::Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray))
-            .style(bg);
+        // Give the welcome area the same visible envelope as the editor
+        // pane when a file is open: a full bordered box on a boxed theme
+        // (Borders::ALL on the editor widget), padding on the canvas under
+        // a `surfaces` theme, whose seams then mark where the side bar and
+        // the panel meet it. Without the box, a boxed theme's welcome bg
+        // bleeds into the tree, the terminal, and the window edge with no
+        // perceptible seam — and the sidebar splitter looks unreachable.
+        // The bg style is applied to the same block so the inside is filled
+        // in one pass. The welcome content then renders into
+        // `block.inner(outer_area)`, the same inset either way, so a tall
+        // recents list can never paint over the frame rows.
+        let outer_block = crate::widgets::surface::view_block(
+            self.theme,
+            false,
+            Style::default().fg(Color::DarkGray),
+        )
+        .style(bg);
         let area = outer_block.inner(outer_area);
         frame.render_widget(outer_block, outer_area);
         if area.width == 0 || area.height == 0 {

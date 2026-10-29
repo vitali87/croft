@@ -936,6 +936,7 @@ mod tests {
     #[test]
     fn croft_dark_selected_host_keeps_solid_blue_highlight() {
         let mut p = populated_panel(&["a", "b"]);
+        p.theme = crate::theme::Theme::DARK_BLUE;
         p.focus_gradient = false;
         let area = Rect {
             x: 0,

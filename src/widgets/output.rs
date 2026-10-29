@@ -716,6 +716,8 @@ mod tests {
     #[test]
     fn the_channel_dropdown_draws_its_names_inside_a_blank_bordered_box() {
         let mut p = OutputPanel::new();
+        // The boxed dropdown, which Croft Loch draws as a card instead.
+        p.theme = Theme::BLACK;
         p.channels = vec!["Git".into(), "ruff".into(), "Test Runner".into()];
         p.selected = 2;
         p.lines = (0..8)
@@ -810,6 +812,8 @@ mod tests {
     #[test]
     fn an_overflowing_list_keeps_the_border_and_its_scrollbar_inside() {
         let mut p = OutputPanel::new();
+        // The boxed dropdown, which Croft Loch draws as a card instead.
+        p.theme = Theme::BLACK;
         p.channels = (0..12).map(|i| format!("chan-{i:02}")).collect();
         p.dropdown_open = true;
         // 1 toolbar + 6 body rows: the border takes two, four names fit.
@@ -897,6 +901,8 @@ mod tests {
     #[test]
     fn a_long_channel_name_is_cut_inside_the_right_border() {
         let mut p = OutputPanel::new();
+        // The boxed dropdown, which Croft Loch draws as a card instead.
+        p.theme = Theme::BLACK;
         p.channels = vec!["Git".into(), "a-very-long-channel-name-for-the-box".into()];
         p.dropdown_open = true;
         let buf = render_buf(&mut p, 20, 8);

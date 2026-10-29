@@ -7847,6 +7847,8 @@ mod tests {
         term.set_triggers(std::sync::Arc::new(
             crate::triggers::TriggerSet::default().with_builtin_redactions(),
         ));
+        // Boxed, so a row reads from the border (`│key `).
+        term.theme = crate::theme::Theme::BLACK;
         let area = Rect::new(0, 0, 60, 10);
         term.last_inner = Rect::new(1, 1, 58, 8);
         let mut buf = Buffer::empty(area);
@@ -8658,6 +8660,8 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(40));
             waited += 40;
         }
+        // The dot sits on a boxed pane's border line.
+        term.theme = crate::theme::Theme::BLACK;
         let area = Rect::new(0, 0, 40, 12);
         let mut buf = Buffer::empty(area);
         (&mut term).render(area, &mut buf);

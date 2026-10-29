@@ -351,9 +351,10 @@ fn welcome_paints_a_full_bordered_box_around_the_editor_area() {
     // perceive that the explorer is resizable and can't see where the
     // editor pane ends. Regression guard: the welcome render must
     // paint a full Borders::ALL frame around `area` so all four edges
-    // are perceptible.
+    // are perceptible. On a boxed theme: Croft Loch's seams do that job.
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.apply_theme(crate::theme::Theme::BLACK);
     let backend = ratatui::backend::TestBackend::new(120, 40);
     let mut term = ratatui::Terminal::new(backend).unwrap();
     let area = ratatui::layout::Rect::new(40, 0, 80, 40);
@@ -407,6 +408,49 @@ fn welcome_paints_a_full_bordered_box_around_the_editor_area() {
     assert_eq!(buf[(right, top)].symbol(), "┐");
     assert_eq!(buf[(left, bot)].symbol(), "└");
     assert_eq!(buf[(right, bot)].symbol(), "┘");
+}
+
+/// Croft Loch draws the welcome page the way it draws an open editor: its
+/// frame is padding on the canvas, not a line box, and the page's content
+/// lands on exactly the cells it does under a boxed theme.
+#[test]
+fn croft_loch_welcome_is_padding_on_the_canvas_with_the_boxed_inset() {
+    let tmp = tempfile::tempdir().unwrap();
+    let area = Rect::new(40, 0, 80, 40);
+    let render = |theme: crate::theme::Theme| {
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.apply_theme(theme);
+        let backend = ratatui::backend::TestBackend::new(120, 40);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        term.draw(|f| app.render_welcome(f, area)).unwrap();
+        term.backend().buffer().clone()
+    };
+    let black = render(crate::theme::Theme::BLACK);
+    let loch = render(crate::theme::Theme::LOCH);
+    let cells = |r: Rect| {
+        (r.top()..r.bottom()).flat_map(move |y| (r.left()..r.right()).map(move |x| (x, y)))
+    };
+    let inner = Rect::new(area.x + 1, area.y + 1, area.width - 2, area.height - 2);
+    let frame: Vec<(u16, u16)> = cells(area).filter(|&p| !inner.contains(p.into())).collect();
+    let lines = |b: &ratatui::buffer::Buffer| {
+        frame
+            .iter()
+            .filter(|&&p| "─│┌┐└┘".contains(b[p].symbol()))
+            .count()
+    };
+    assert!(lines(&black) > 0, "Croft Black keeps its box");
+    assert_eq!(lines(&loch), 0, "no line box around Croft Loch's welcome");
+    // Below the top row, which carries the layout icons, the frame is blank.
+    for &(x, y) in frame.iter().filter(|p| p.1 > area.y) {
+        assert_eq!(loch[(x, y)].symbol(), " ", "padding at ({x}, {y})");
+    }
+    for (x, y) in cells(inner) {
+        assert_eq!(
+            loch[(x, y)].symbol(),
+            black[(x, y)].symbol(),
+            "the content at ({x}, {y}) moved"
+        );
+    }
 }
 
 /// A long fixed note for the welcome-card tests: the live notes change with

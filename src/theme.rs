@@ -1,11 +1,12 @@
 //! Color theme for the IDE chrome.
 //!
 //! croft mimics VS Code, where the user picks a "Color Theme". The first-party
-//! themes (Croft Black `#000000` and Croft Dark `#1e222e`) ship as data in a
-//! bundled extension manifest (`assets/extensions/themes/extension.toml`, baked
-//! into the binary), and a third party adds a theme by dropping another
-//! `[[themes]]` block into `~/.config/croft/extensions/`. A `Theme` is just the
-//! parsed palette; [`Theme::BLACK`] is a const fallback so croft is never
+//! themes (Croft Loch and Croft Black on `#000000`, Croft Dark `#1e222e`) ship
+//! as data in a bundled extension manifest
+//! (`assets/extensions/themes/extension.toml`, baked into the binary), and a
+//! third party adds a theme by dropping another `[[themes]]` block into
+//! `~/.config/croft/extensions/`. A `Theme` is just the parsed palette;
+//! [`Theme::LOCH`] is the default and a const fallback so croft is never
 //! themeless even if every manifest is missing or unparseable.
 //!
 //! The active theme drives every surface that paints an explicit background
@@ -120,7 +121,7 @@ impl Surfaces {
 /// A complete IDE color palette. `Copy` and cheap to pass by value: the strings
 /// are interned to `&'static` when loaded from a manifest, and the colors are
 /// plain bytes. Equality is by value, so a registry-loaded theme compares equal
-/// to the matching [`Theme::BLACK`]/[`Theme::DARK_BLUE`] const.
+/// to the matching [`Theme::LOCH`]/[`Theme::BLACK`]/[`Theme::DARK_BLUE`] const.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Theme {
     id: &'static str,
@@ -153,9 +154,8 @@ pub struct Theme {
 }
 
 impl Theme {
-    /// Croft Black — the OLED-friendly default, and the const fallback used when
-    /// no manifest theme is available. Values mirror the bundled manifest (the
-    /// gradient brand consts from `src/gradient.rs` inlined).
+    /// Croft Black — the OLED-friendly boxed look. Values mirror the bundled
+    /// manifest (the gradient brand consts from `src/gradient.rs` inlined).
     pub const BLACK: Theme = Theme {
         id: "black",
         label: "Croft Black",
@@ -180,6 +180,37 @@ impl Theme {
         tab_pill: (0x3c, 0x8a, 0x7e),
         high_contrast: false,
         surfaces: None,
+    };
+
+    /// Croft Loch — the default: Croft Black's canvas and teal drawn as
+    /// layered surfaces, and the const fallback used when no manifest theme
+    /// is available. Values mirror the bundled manifest.
+    pub const LOCH: Theme = Theme {
+        id: "loch",
+        label: "Croft Loch",
+        bg: (0x00, 0x00, 0x00),
+        accent: (0x4f, 0xb1, 0xa6),
+        selection: (0x26, 0x4f, 0x4a),
+        search: (0x0b, 0x0d, 0x0e),
+        button: (0x0e, 0x7e, 0x76),
+        gradient: true,
+        osk_key: (0x20, 0x24, 0x2b),
+        osk_special: (0x14, 0x16, 0x1b),
+        osk_armed: (0x0e, 0x7e, 0x76),
+        ansi: VSCODE_ANSI,
+        syntax: SyntaxPalette::BASE16,
+        tab_strip: (0x0e, 0x10, 0x11),
+        tab_inactive: (0x0e, 0x10, 0x11),
+        tab_active: (0x00, 0x00, 0x00),
+        tab_hover: (0x16, 0x23, 0x23),
+        tab_pill: (0x26, 0x4f, 0x4a),
+        high_contrast: false,
+        surfaces: Some(Surfaces {
+            chrome: (0x0e, 0x10, 0x11),
+            raised: (0x15, 0x18, 0x19),
+            hairline: (0x23, 0x28, 0x2a),
+            muted: (0x7d, 0x87, 0x86),
+        }),
     };
 
     /// Croft Dark (Blue) — the historical look. Const mirror of the manifest,
@@ -243,7 +274,7 @@ impl Theme {
             // `default`/`from_id` always have something even if the themes
             // extension is disabled.
             if themes.is_empty() {
-                vec![Theme::BLACK]
+                vec![Theme::LOCH]
             } else {
                 themes
             }
@@ -313,16 +344,16 @@ impl Theme {
         }
     }
 
-    /// The default theme: Croft Black when present, else the first registered,
+    /// The default theme: Croft Loch when present, else the first registered,
     /// else the const fallback. Used for a fresh install and as the revert
     /// target when the active theme's extension is disabled/removed.
     pub fn default_theme() -> Theme {
         let all = Theme::all();
         all.iter()
-            .find(|t| t.id == "black")
+            .find(|t| t.id == Theme::LOCH.id)
             .copied()
             .or_else(|| all.first().copied())
-            .unwrap_or(Theme::BLACK)
+            .unwrap_or(Theme::LOCH)
     }
 
     /// Resolve a persisted `id` to a theme, falling back to the default for
@@ -1002,7 +1033,7 @@ impl Theme {
 
 impl Default for Theme {
     fn default() -> Self {
-        Theme::BLACK
+        Theme::LOCH
     }
 }
 
@@ -1187,6 +1218,11 @@ mod tests {
             Theme::DARK_BLUE,
             "manifest == const DARK_BLUE"
         );
+        assert_eq!(
+            Theme::from_id("loch"),
+            Theme::LOCH,
+            "manifest == const LOCH"
+        );
     }
 
     #[test]
@@ -1314,9 +1350,11 @@ mod tests {
     }
 
     #[test]
-    fn default_is_black() {
-        assert_eq!(Theme::default_theme(), Theme::BLACK);
-        assert_eq!(Theme::default(), Theme::BLACK);
+    fn default_is_croft_loch() {
+        assert_eq!(Theme::default_theme(), Theme::LOCH);
+        assert_eq!(Theme::default(), Theme::LOCH);
+        // A config that never picked a theme gets it too.
+        assert_eq!(Theme::from_id(""), Theme::LOCH);
     }
 
     #[test]
