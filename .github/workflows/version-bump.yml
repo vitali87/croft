@@ -20,10 +20,12 @@
 # push that loses a race with a merge is redone on the new main rather than
 # dropped.
 #
-# A merge that shipped nothing leaves no fragment, and the job then commits
-# nothing. Merges that land while a run is still going are released together
-# by the next run: each run folds every fragment pending on main when it
-# starts.
+# A dependency bump merges with no fragment: Dependabot cannot write one. The
+# cut compares Cargo.lock with the last release's and adds a line naming the
+# crates that moved. A merge that shipped nothing leaves no fragment and moves
+# no dependency, and the job then commits nothing. Merges that land while a
+# run is still going are released together by the next run: each run folds
+# every fragment pending on main when it starts.
 #
 # tag.yml then tags the pushed release commit `v<version>`. Every
 # PUBLISH_EVERY versions, publish-crate.yml starts release.yml, whose GitHub
@@ -82,6 +84,10 @@ jobs:
           # The newest main, not the triggering commit: a queued run may start
           # after more merges have landed.
           ref: main
+          # Back to the last release's commit: `cut` compares Cargo.lock
+          # with what it held there to find the dependency updates merged
+          # since, which no fragment describes.
+          fetch-depth: 0
           ssh-key: ${{ secrets.VERSION_BUMP_SSH_KEY }}
 
       - name: Fold the notes, bump the version and push

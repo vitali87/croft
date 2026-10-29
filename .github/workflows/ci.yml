@@ -41,6 +41,8 @@ jobs:
     # merge put all the others in conflict.
     # Docs / CI / test-only changes ship nothing and are exempt, including a
     # diff confined to a `#[cfg(test)]` module inside a shipped file (#461).
+    # So is a change to dependency versions alone, a Dependabot PR's shape:
+    # version-bump.yml notes the crates that moved itself.
     name: release notes
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
