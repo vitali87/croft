@@ -985,6 +985,7 @@ fn open_tab_menu_on_split_and_move(app: &mut App) {
     app.context_menu = Some(ContextMenu {
         crumb: None,
         scroll: Default::default(),
+        submenu_scroll: Default::default(),
         origin: (0, 0),
         items,
         selected: sub_idx,
