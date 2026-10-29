@@ -71964,7 +71964,9 @@ impl App {
                 sheet.current_sheet = (current + total_sheets - 1) % total_sheets;
                 return;
             }
-            KeyCode::Char(c) if plain && (' '..='~').contains(&c) => {
+            // Any printable character starts the edit, not just ASCII:
+            // `Ö`, `東` or an emoji typed first must not be dropped (#963).
+            KeyCode::Char(c) if plain && !c.is_control() => {
                 if editable {
                     if row_count > 0 {
                         // Spreadsheet convention: typing REPLACES the cell.
