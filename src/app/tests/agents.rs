@@ -2293,6 +2293,120 @@ fn closing_a_lane_closes_its_pane_through_the_undoable_path() {
 }
 
 #[test]
+fn closing_a_lane_refuses_while_a_tab_in_it_has_unsaved_edits_in_any_group() {
+    // #1050: git saw a clean tree, removed it, and the dirty tab was left
+    // saving into a deleted folder. The edit sits in the group that is NOT
+    // focused, where a check of the focused group alone would miss it.
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    init_lane_repo(&repo);
+    let mut app = App::new(repo.clone()).unwrap();
+    app.terminal_session_path = tmp.path().join("sessions.json");
+    app.lane_agent = None;
+    app.create_worktree_lane("fix login");
+    let lane = tmp.path().join("repo-fix-login").canonicalize().unwrap();
+    let lane_file = lane.join("seed.txt");
+    app.editor.open_pinned(&lane_file).unwrap();
+    app.editor.insert_str("edited ");
+    app.split_editor();
+    app.editor.open_pinned(&repo.join("seed.txt")).unwrap();
+    assert!(
+        !app.editor.editors.iter().any(|e| e.dirty),
+        "the focused group holds nothing unsaved"
+    );
+    app.active_scm_root = lane.clone();
+    app.close_worktree_lane();
+    assert_eq!(
+        app.status,
+        "Keeping the lane: seed.txt has unsaved changes \u{2014} save or revert first"
+    );
+    assert!(lane_file.exists(), "the worktree stays");
+    assert!(app.roots.iter().any(|r| r == lane), "and its folder");
+    assert_eq!(app.terminals.len(), 2, "and its pane");
+    let tab = app.editor_layout.inactive_groups()[0]
+        .editors
+        .iter()
+        .find(|e| e.path.as_deref() == Some(lane_file.as_path()))
+        .unwrap();
+    assert!(tab.dirty, "the edit is still unsaved");
+    assert_eq!(tab.lines[0], "edited one", "and intact");
+}
+
+#[test]
+fn closing_a_lane_refuses_while_a_sheet_cell_in_it_is_being_typed_into() {
+    // The typed cell isn't committed yet, so the tab isn't dirty; closing
+    // the lane must not drop it with the tab.
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    init_lane_repo(&repo);
+    std::fs::write(repo.join("stock.csv"), "item,qty\nbolt,4\n").unwrap();
+    let git = |args: &[&str]| {
+        let st = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&repo)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(st.success(), "git {args:?}");
+    };
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "stock"]);
+    let mut app = App::new(repo.clone()).unwrap();
+    app.terminal_session_path = tmp.path().join("sessions.json");
+    app.lane_agent = None;
+    app.create_worktree_lane("fix login");
+    let lane = tmp.path().join("repo-fix-login").canonicalize().unwrap();
+    let csv = lane.join("stock.csv");
+    app.editor.open_pinned(&csv).unwrap();
+    app.handle_sheet_key(key(KeyCode::Right, KeyModifiers::NONE));
+    type_into_sheet(&mut app, "40");
+    assert!(app.editor.sheet_pending_cell().is_some());
+    app.active_scm_root = lane.clone();
+    app.close_worktree_lane();
+    assert_eq!(
+        app.status,
+        "Keeping the lane: stock.csv has unsaved changes \u{2014} save or revert first"
+    );
+    assert!(csv.exists(), "the worktree stays");
+    assert!(app.editor.sheet_pending_cell().is_some(), "with the cell");
+}
+
+#[test]
+fn closing_a_lane_closes_its_saved_tabs_in_every_group() {
+    // A lane tab left open after the close shows a file that is gone, and
+    // a group holding only lane tabs folds away like its pane.
+    let tmp = tempfile::tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    init_lane_repo(&repo);
+    let mut app = App::new(repo.clone()).unwrap();
+    app.terminal_session_path = tmp.path().join("sessions.json");
+    app.lane_agent = None;
+    app.create_worktree_lane("fix login");
+    let lane = tmp.path().join("repo-fix-login").canonicalize().unwrap();
+    let main_file = repo.canonicalize().unwrap().join("seed.txt");
+    // The unfocused group holds only the lane's file; the focused one
+    // holds it beside the main repo's.
+    app.editor.open_pinned(&lane.join("seed.txt")).unwrap();
+    app.split_editor();
+    app.editor.open_pinned(&main_file).unwrap();
+    assert_eq!(app.editor_layout.inactive_groups().len(), 1);
+    app.active_scm_root = lane.clone();
+    app.close_worktree_lane();
+    assert!(!lane.exists(), "the worktree is gone: {}", app.status);
+    assert!(
+        app.editor_layout.inactive_groups().is_empty(),
+        "the group that showed only the lane folded away"
+    );
+    let open: Vec<PathBuf> = app
+        .editor
+        .editors
+        .iter()
+        .filter_map(|e| e.path.clone())
+        .collect();
+    assert_eq!(open, vec![main_file], "only the main repo's tab stays");
+}
+
+#[test]
 fn cmd_k_shift_l_asks_for_a_new_lane_and_plain_l_still_folds() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();

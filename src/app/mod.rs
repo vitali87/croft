@@ -45819,6 +45819,19 @@ impl App {
         (closed, kept)
     }
 
+    /// The first file under `dir` open with unsaved edits in any editor
+    /// group, named relative to `dir`, for a removal to refuse on: git
+    /// sees only what is on disk, and the tab's edits are not there yet.
+    /// A sheet cell still being typed into is an unsaved edit too.
+    fn unsaved_file_under(&self, dir: &Path) -> Option<String> {
+        std::iter::once(&self.editor)
+            .chain(self.editor_layout.inactive_groups())
+            .flat_map(|g| g.editors.iter())
+            .filter(|e| e.dirty || e.sheet_pending_cell().is_some())
+            .find_map(|e| e.path.as_deref().filter(|p| p.starts_with(dir)))
+            .map(|p| p.strip_prefix(dir).unwrap_or(p).display().to_string())
+    }
+
     /// Point the COMMITS graph at `base..lane` for the active lane (#348).
     ///
     /// Uses `active_scm_root` like `close_worktree_lane` beside it, rather
@@ -45861,7 +45874,8 @@ impl App {
     }
 
     /// Remove the active root's worktree lane, refusing when it is dirty
-    /// (#348).
+    /// (#348) or a tab in it has unsaved edits (#1050), and closing its
+    /// panes and tabs.
     ///
     /// The refusal is the point. `git worktree remove` DISCARDS uncommitted
     /// work, so this is the one place in the lane flow where being wrong
@@ -45893,6 +45907,16 @@ impl App {
         // correct - they are still this lane's commits, and the lane is
         // still here.
         self.graph_revspec = None;
+        // Unsaved tabs before git: git answers for the disk only, and once
+        // the lane is gone such a tab's save recreates its folder as a
+        // stray directory, off the lane's branch. First, too, because
+        // saving one is what makes the tree dirty for the refusal below.
+        if let Some(file) = self.unsaved_file_under(&lane) {
+            self.status = format!(
+                "Keeping the lane: {file} has unsaved changes \u{2014} save or revert first"
+            );
+            return;
+        }
         if let Some(why) = crate::git::lane_removal_block(&lane) {
             self.status = format!("Keeping the lane: {why}");
             return;
@@ -45911,6 +45935,9 @@ impl App {
                 // left, or a refusal there would be overwritten by a message
                 // saying the whole thing worked.
                 let (closed, kept) = self.close_lane_panes(&lane);
+                // Its tabs go with its panes: every one is saved (the check
+                // above), and each now shows a file that no longer exists.
+                self.close_clean_tabs_under_everywhere(&lane);
                 if self.roots.iter().any(|r| r == lane) {
                     self.status = format!(
                         "Removed {} on disk, but it is still in this workspace",
@@ -50114,6 +50141,34 @@ impl App {
         if !doomed.is_empty() {
             self.editor_layout.prune_inactive_at(&doomed);
         }
+    }
+
+    /// Close the tabs showing a file under `dir` in every group, except
+    /// ones with unsaved edits, for a folder that has left the disk. A
+    /// group this empties is pruned like `close_tabs_with_path_everywhere`
+    /// prunes one: it held a tab under `dir`, so it was not blank before.
+    fn close_clean_tabs_under_everywhere(&mut self, dir: &Path) {
+        self.editor.close_clean_tabs_under(dir);
+        let mut doomed = Vec::new();
+        for (i, group) in self
+            .editor_layout
+            .inactive_groups_mut()
+            .into_iter()
+            .enumerate()
+        {
+            let touched = group
+                .editors
+                .iter()
+                .any(|e| e.path.as_deref().is_some_and(|p| p.starts_with(dir)));
+            group.close_clean_tabs_under(dir);
+            if touched && group.is_blank_initial() {
+                doomed.push(i);
+            }
+        }
+        if !doomed.is_empty() {
+            self.editor_layout.prune_inactive_at(&doomed);
+        }
+        self.sync_open_file_poll_mtime();
     }
 
     /// `.http`/`.rest` (#370): send the request under the caret. The env
@@ -72581,13 +72636,7 @@ impl App {
         if !created {
             return kept("it existed before review");
         }
-        let groups = std::iter::once(&self.editor).chain(self.editor_layout.inactive_groups());
-        let unsaved = groups
-            .flat_map(|g| g.editors.iter())
-            .filter(|e| e.dirty)
-            .find_map(|e| e.path.as_deref().filter(|p| p.starts_with(&path)))
-            .map(|p| p.strip_prefix(&path).unwrap_or(p).display().to_string());
-        if let Some(file) = unsaved {
+        if let Some(file) = self.unsaved_file_under(&path) {
             return kept(&format!("{file} has unsaved changes"));
         }
         if let Some(why) = crate::git::pr_worktree_keep_reason(&path, &oid) {

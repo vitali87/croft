@@ -22103,7 +22103,8 @@ impl EditorTabs {
 
     /// Close every tab showing `path` or a file under it (a deleted file or
     /// folder), except tabs with unsaved edits: those stay open, dirty, so
-    /// the edits can still be saved (recreating the file) or discarded.
+    /// the edits can still be saved (recreating the file) or discarded. A
+    /// sheet cell still being typed into counts as an unsaved edit.
     /// Returns how many dirty tabs were kept.
     pub fn close_clean_tabs_under(&mut self, path: &Path) -> usize {
         let mut kept = 0;
@@ -22114,7 +22115,7 @@ impl EditorTabs {
             if !e.path.as_deref().is_some_and(|p| p.starts_with(path)) {
                 continue;
             }
-            if e.dirty {
+            if e.dirty || e.sheet_pending_cell().is_some() {
                 kept += 1;
             } else {
                 self.close_tab(i);
