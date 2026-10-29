@@ -155,6 +155,8 @@ impl regex_syntax::ast::Visitor for RgLiterals {
 /// searched `f` on stdin, not the directory it ran in.
 fn simple_commands(line: &str) -> Vec<(String, bool)> {
     // Push a quoted span, through its closing quote, onto `out`.
+    /// Copy a quoted run through its closing `open` quote, honouring `\`
+    /// escapes inside double quotes, so operators in it stay part of the word.
     fn quoted(open: char, chars: &mut std::iter::Peekable<std::str::Chars>, out: &mut String) {
         while let Some(c) = chars.next() {
             out.push(c);
@@ -1083,6 +1085,8 @@ mod tests {
         assert!(!c.use_regex);
     }
 
+    /// Patterns read from a file, NUL-split input and git grep's pattern
+    /// algebra can't be one Search query, so they're refused with a reason.
     #[test]
     fn patterns_from_a_file_or_nul_split_input_are_unseedable() {
         let c = parse("grep -rn -f words.txt src").unwrap();
@@ -1102,6 +1106,8 @@ mod tests {
         assert_eq!(parse("rg -z color").unwrap().unseedable, None);
     }
 
+    /// The search read is the last one of a pipeline or list, redirections
+    /// dropped, and one fed by a pipe or a redirected file is refused.
     #[test]
     fn the_last_search_of_a_pipeline_or_list_is_read() {
         for cmd in [
