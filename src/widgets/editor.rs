@@ -22223,27 +22223,35 @@ impl EditorTabs {
     /// Close every tab, resetting the editor pane to the single blank
     /// just-launched state — mirrors `close_tab` on the last remaining
     /// tab. Returns how many tabs were collapsed away (always ≥ 1 when
-    /// the editor had any content). Matches VS Code's "Close All", except
-    /// that tabs with unsaved changes stay open (#862): VS Code asks about
-    /// each, croft leaves them for a Cmd+W that asks. That makes it the
-    /// same sweep as [`Self::close_saved`], pinned tabs going in both.
+    /// the editor had any content). Matches VS Code's "Close All": pinned
+    /// tabs stay open (#941). Tabs with unsaved changes stay open too
+    /// (#862): VS Code asks about each, croft leaves them for a Cmd+W that
+    /// asks. That makes it the same sweep as [`Self::close_saved`].
     pub fn close_all(&mut self) -> usize {
         self.close_saved()
     }
 
-    /// Close every saved (non-dirty) tab, keeping any with unsaved changes.
-    /// When no dirty tab remains the pane resets to a single blank buffer,
-    /// mirroring `close_all`; otherwise the surviving dirty tabs are kept in
-    /// order and the first becomes active. Returns how many tabs were removed
-    /// (0 when every open tab is dirty). Matches VS Code's "Close Saved"
-    /// (`workbench.action.closeUnmodifiedEditors`).
+    /// Close every saved (non-dirty) tab, keeping any with unsaved changes
+    /// and every pinned tab (#941). When nothing is kept the pane resets to
+    /// a single blank buffer, mirroring `close_all`; otherwise the kept tabs
+    /// stay in order, the active one staying active when it is among them
+    /// and the first becoming active when not. Returns how many tabs were
+    /// removed (0 when every open tab is dirty or pinned). Matches VS
+    /// Code's "Close Saved" (`workbench.action.closeUnmodifiedEditors`).
     pub fn close_saved(&mut self) -> usize {
         let before = self.editors.len();
-        let was_focused = self.editors[self.active].focused;
-        let mut kept: Vec<Editor> = std::mem::take(&mut self.editors)
-            .into_iter()
-            .filter(|e| e.dirty)
-            .collect();
+        let old_active = self.active;
+        let was_focused = self.editors[old_active].focused;
+        let mut new_active = 0;
+        let mut kept: Vec<Editor> = Vec::with_capacity(before);
+        for (i, ed) in std::mem::take(&mut self.editors).into_iter().enumerate() {
+            if ed.dirty || ed.pinned {
+                if i == old_active {
+                    new_active = kept.len();
+                }
+                kept.push(ed);
+            }
+        }
         let removed = before - kept.len();
         if kept.is_empty() {
             let mut fresh = Editor::new();
@@ -22251,9 +22259,9 @@ impl EditorTabs {
             kept.push(fresh);
         }
         self.editors = kept;
-        self.active = 0;
+        self.active = new_active;
         for (i, ed) in self.editors.iter_mut().enumerate() {
-            ed.focused = i == 0;
+            ed.focused = i == self.active;
         }
         removed
     }
@@ -37002,31 +37010,46 @@ mod tests {
         assert_eq!(t.tab_count(), before, "no panic, no mutation");
     }
 
+    /// #941: Close All leaves pinned tabs open, as Close Others and Close
+    /// to the Right do (and VS Code's Close All), and the active pinned tab
+    /// stays active.
     #[test]
-    fn close_all_closes_pinned_tabs_too() {
-        // VS Code parity: Close All does not spare pinned tabs.
+    fn close_all_keeps_pinned_tabs() {
         let mut t = EditorTabs::new();
         t.editors[0].path = Some(std::path::PathBuf::from("/a"));
         t.add_tab_with_path(std::path::PathBuf::from("/b"));
-        t.toggle_pin(0);
+        t.add_tab_with_path(std::path::PathBuf::from("/c"));
+        t.toggle_pin(0); // pin /a
+        t.toggle_pin(1); // pin /b; order [/a*, /b*, /c]
+        t.select(1);
         let removed = t.close_all();
-        assert_eq!(removed, 2);
-        assert_eq!(t.tab_count(), 1, "collapses to a single blank tab");
-        assert!(!t.is_pinned(0));
+        assert_eq!(removed, 1, "only the unpinned /c closes");
+        assert_eq!(t.tab_path(0).as_deref(), Some(std::path::Path::new("/a")));
+        assert_eq!(t.tab_path(1).as_deref(), Some(std::path::Path::new("/b")));
+        assert!(t.is_pinned(0) && t.is_pinned(1));
+        assert_eq!(t.active_index(), 1, "the active /b stays active");
+        assert!(t.editors[1].focused && !t.editors[0].focused);
     }
 
+    /// #941: Close Saved leaves a clean pinned tab open beside the dirty
+    /// one; only the clean unpinned tab closes.
     #[test]
-    fn close_saved_closes_clean_pinned_tabs() {
-        // VS Code parity: Close Saved closes a clean tab even when pinned;
-        // only the dirty tab survives.
+    fn close_saved_keeps_clean_pinned_tabs() {
         let mut t = EditorTabs::new();
         t.editors[0].path = Some(std::path::PathBuf::from("/a"));
         t.add_tab_with_path(std::path::PathBuf::from("/b"));
+        t.add_tab_with_path(std::path::PathBuf::from("/c"));
         t.editors[1].dirty = true;
         t.toggle_pin(0); // pin the clean /a
         let removed = t.close_saved();
-        assert_eq!(removed, 1, "the clean pinned tab is still closed");
-        assert_eq!(t.tab_path(0).as_deref(), Some(std::path::Path::new("/b")));
+        assert_eq!(removed, 1, "only the clean unpinned /c closes");
+        assert_eq!(t.tab_path(0).as_deref(), Some(std::path::Path::new("/a")));
+        assert_eq!(t.tab_path(1).as_deref(), Some(std::path::Path::new("/b")));
+        assert_eq!(
+            t.active_index(),
+            0,
+            "the closed /c hands active to the first"
+        );
     }
 
     #[test]

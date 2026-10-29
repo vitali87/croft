@@ -80,8 +80,8 @@ Per platform:
 | `Cmd+K` `→` | Close the editor tabs to the right of the active one; tabs with unsaved changes stay open (also the palette's "View: Close Editors to the Right in Group") |
 | `Cmd+K` `S` | Select the active file as the compare anchor |
 | `Cmd+K` `C` | Diff the active file against the compare anchor |
-| `Cmd+K` `W` | Close all editor tabs, in every split, keeping tabs with unsaved changes open (close one with `Cmd+W` to be asked about it; also the palette's "View: Close All Editors") |
-| `Cmd+K` `U` | Close all saved (non-dirty) editor tabs of the focused group, keeping unsaved ones (also the palette's "View: Close Saved Editors in Group") |
+| `Cmd+K` `W` | Close all editor tabs, in every split, keeping pinned tabs and tabs with unsaved changes open (close one with `Cmd+W` to be asked about it; also the palette's "View: Close All Editors"). `Cmd+K` `Shift+W` reopens the closed tabs |
+| `Cmd+K` `U` | Close all saved (non-dirty) editor tabs of the focused group, keeping unsaved and pinned ones (also the palette's "View: Close Saved Editors in Group") |
 | `Cmd+K` `E` | Reveal the active file in the Explorer tree (expand parents, select, focus) |
 | `Cmd+K` `O` | Copy into New Window: open the active file in a new window of your terminal, focused on just the file (Explorer + terminal hidden; the current window is untouched; Ghostty / iTerm2 / Terminal; macOS only) |
 | `Cmd+K` `Shift+O` | Move into New Window: same, and close the file's tab here (macOS only; save a tab with unsaved changes first) |
@@ -170,7 +170,7 @@ Every choice except the side-bar / panel visibility persists across launches in 
 | View: Show Ports / View: Show Captures | palette only | Show the PORTS / CAPTURES tab of the bottom panel and focus it, so its keys (`↑`/`↓`, `⏎`, …) work at once |
 | Output: Select Channel… | palette only | Pick an OUTPUT channel (the toolbar dropdown's list) and show it |
 | View: Close Other Editors in Group | palette only | The tab menu's **Close Others** on the active tab: every other tab of the focused group closes, pinned tabs excepted; other splits are untouched. Bind it in `keybindings.json` for a key (the menu's `⌥⌘T` is iTerm2's New Tab, which croft leaves alone) |
-| View: Close Editors to the Right in Group / View: Close Saved Editors in Group / View: Close All Editors | `Cmd`+`K` `→` / `Cmd`+`K` `U` / `Cmd`+`K` `W` | The tab menu's **Close to the Right**, **Close Saved** and **Close All**, on the active tab, exactly as the menu does them (Close All empties every split) |
+| View: Close Editors to the Right in Group / View: Close Saved Editors in Group / View: Close All Editors | `Cmd`+`K` `→` / `Cmd`+`K` `U` / `Cmd`+`K` `W` | The tab menu's **Close to the Right**, **Close Saved** and **Close All**, on the active tab, exactly as the menu does them (Close All covers every split) |
 | View: Pin Editor / View: Unpin Editor | `Cmd`+`K` `P` | The tab menu's **Pin** / **Unpin** on the active tab. As in VS Code, the palette lists only the one that applies; bound in `keybindings.json`, each leaves a tab already in its state alone |
 | View: Keep Editor | `Cmd`+`K` `Shift`+`P` | The tab menu's **Keep Open**: the italic preview tab stays when the next file opens (the palette also finds it as "keep open") |
 
@@ -394,7 +394,7 @@ Variables expand as in VS Code: `$TM_FILENAME`, `$TM_FILENAME_BASE`, `$TM_DIRECT
 | Hover a chrome control (300 ms dwell) | Button hint naming the control under the pointer: activity-bar icons (Explorer, Search, …), the EXPLORER header toolbar (New File, New Folder, Refresh Explorer, Collapse Folders, Views and More Actions), the Remote / Source Control header actions, and the SEARCH panel's actions and toggles (Refresh, Clear Search Results, Match Case, Use Regular Expression, …) |
 | Right-click | Editor symbol menu: the Go to / Rename / Change All actions above |
 | `Cmd`+`E` | Toggle native modal (vim) editing (see below). On Linux `Ctrl`+`E` stays end of line, so it is `Super`+`E` or the Command Palette's "Toggle Vim Mode" |
-| `Ctrl`+`W` / `Cmd`+`W` | Close the active editor tab (no-op on the last tab). A tab with unsaved changes asks first: `S` / `Enter` saves and closes, `D` closes without saving, `Esc` / `N` cancels; the tab's `✕`, its context menu's Close and View: Close Editor ask the same way. Close Others and Close to the Right keep unsaved tabs open |
+| `Ctrl`+`W` / `Cmd`+`W` | Close the active editor tab (no-op on the last tab). A tab with unsaved changes asks first: `S` / `Enter` saves and closes, `D` closes without saving, `Esc` / `N` cancels; the tab's `✕`, its context menu's Close and View: Close Editor ask the same way. Close Others, Close to the Right and Close All keep unsaved tabs open and say how many they kept |
 
 ## Editor: vim mode (modal editing)
 

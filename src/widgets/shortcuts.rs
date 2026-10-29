@@ -458,7 +458,7 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
             },
             ShortcutEntry {
                 keys: "Cmd+K U / Cmd+K W",
-                description: "Close the saved tabs, keeping unsaved ones / every tab in every split (palette: View: Close Saved Editors in Group / View: Close All Editors)",
+                description: "Close the saved tabs / every tab in every split, keeping pinned and unsaved ones (palette: View: Close Saved Editors in Group / View: Close All Editors)",
                 handler: "",
             },
             ShortcutEntry {

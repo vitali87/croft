@@ -3254,6 +3254,52 @@ pub struct ClosedTab {
     pub scroll: usize,
 }
 
+impl ClosedTab {
+    /// The reopen record of `ed`, or `None` for a scratch buffer with no
+    /// backing file, which has nothing to reopen.
+    fn of(ed: &Editor) -> Option<Self> {
+        Some(Self {
+            path: ed.path.clone()?,
+            pinned: ed.pinned,
+            cursor: (ed.cursor_row, ed.cursor_col),
+            scroll: ed.scroll,
+        })
+    }
+}
+
+/// What a bulk tab close (Close Others, Close to the Right, Close Saved,
+/// Close All) does to the tabs in its `reach`: the reopen records of those
+/// it drops, in tab order so the reopen stack pops most-recent-first, and
+/// how many it keeps open instead for their unsaved changes (#862). Pinned
+/// tabs are never in reach (#941). A file open in several groups is
+/// recorded once, at its last tab, so one reopen brings it back.
+fn bulk_close_records<'a>(reach: impl IntoIterator<Item = &'a Editor>) -> (Vec<ClosedTab>, usize) {
+    let mut records: Vec<ClosedTab> = Vec::new();
+    let mut unsaved = 0;
+    for ed in reach.into_iter().filter(|ed| !ed.pinned) {
+        if ed.dirty {
+            unsaved += 1;
+        } else if let Some(t) = ClosedTab::of(ed) {
+            records.retain(|r| r.path != t.path);
+            records.push(t);
+        }
+    }
+    (records, unsaved)
+}
+
+/// The status line of a bulk tab close that closed `removed` tabs, which
+/// `closed` describes ("Closed 2 other tabs"). One that kept tabs in its
+/// reach open for their unsaved changes says so (#941), rather than leaving
+/// them looking forgotten.
+fn bulk_close_status(closed: String, removed: usize, unsaved: usize) -> String {
+    match (removed, unsaved) {
+        (_, 0) => closed,
+        (0, 1) => String::from("Kept 1 tab with unsaved changes open"),
+        (0, n) => format!("Kept {n} tabs with unsaved changes open"),
+        (_, n) => format!("{closed}; kept {n} with unsaved changes open"),
+    }
+}
+
 /// A terminal pane parked by close for the undo-close grace window: the
 /// live pane, the slot it occupied (so restore puts it back where it was),
 /// and when it was closed (for expiry).
@@ -19690,39 +19736,28 @@ impl App {
     /// new window) or whose file was just trashed are deliberately never
     /// recorded by their callers.
     fn record_closed_tab_at(&mut self, idx: usize) {
-        let Some(ed) = self.editor.editors.get(idx) else {
-            return;
-        };
-        let Some(path) = ed.path.clone() else {
-            return;
-        };
-        self.closed_tabs.push(ClosedTab {
-            path,
-            pinned: ed.pinned,
-            cursor: (ed.cursor_row, ed.cursor_col),
-            scroll: ed.scroll,
-        });
-        if self.closed_tabs.len() > CLOSED_TAB_STACK_CAP {
-            self.closed_tabs.remove(0);
-        }
+        let record = self.editor.editors.get(idx).and_then(ClosedTab::of);
+        self.push_closed_tabs(record);
     }
 
-    /// Record every tab the bulk closes (Close Others / Close to the Right)
-    /// are about to drop: the unpinned, file-backed ones `pred` selects, in
-    /// tab order so the reopen stack pops most-recent-first. A tab with
-    /// unsaved changes is never one: the bulk closes keep those open (#862).
-    fn record_closed_tabs_where(&mut self, pred: impl Fn(usize, &Editor) -> bool) {
-        let picks: Vec<usize> = self
-            .editor
-            .editors
-            .iter()
-            .enumerate()
-            .filter(|(i, ed)| !ed.dirty && pred(*i, ed))
-            .map(|(i, _)| i)
-            .collect();
-        for i in picks {
-            self.record_closed_tab_at(i);
-        }
+    /// Push `records` onto the reopen stack, dropping the oldest past
+    /// [`CLOSED_TAB_STACK_CAP`].
+    fn push_closed_tabs(&mut self, records: impl IntoIterator<Item = ClosedTab>) {
+        self.closed_tabs.extend(records);
+        let over = self.closed_tabs.len().saturating_sub(CLOSED_TAB_STACK_CAP);
+        self.closed_tabs.drain(..over);
+    }
+
+    /// Record every tab of the focused group that a bulk close is about to
+    /// drop, its reach being the tabs `pred` selects (see
+    /// [`bulk_close_records`]). Returns how many in reach it keeps open for
+    /// their unsaved changes.
+    fn record_closed_tabs_where(&mut self, pred: impl Fn(usize, &Editor) -> bool) -> usize {
+        let reach = self.editor.editors.iter().enumerate();
+        let (records, unsaved) =
+            bulk_close_records(reach.filter(|(i, ed)| pred(*i, ed)).map(|(_, ed)| ed));
+        self.push_closed_tabs(records);
+        unsaved
     }
 
     /// Cmd+K ⇧W: reopen the most recently closed editor tab (VS Code
@@ -69346,39 +69381,43 @@ impl App {
 
     /// Tab context "Close Others" and View: Close Other Editors in Group
     /// (#852): close every tab of the focused group but `keep_idx` and the
-    /// pinned ones, recording each for Reopen Closed Editor.
+    /// pinned ones, recording each for Reopen Closed Editor. Unsaved tabs
+    /// stay open, and the status line counts them.
     fn close_other_tabs(&mut self, keep_idx: usize) {
-        self.record_closed_tabs_where(|i, ed| i != keep_idx && !ed.pinned);
+        let unsaved = self.record_closed_tabs_where(|i, _| i != keep_idx);
         let removed = self.editor.close_others(keep_idx);
-        if removed == 0 {
+        if removed == 0 && unsaved == 0 {
             self.status = String::from("No other tabs to close");
             return;
         }
         self.sync_open_file_poll_mtime();
-        self.status = if removed == 1 {
+        let closed = if removed == 1 {
             String::from("Closed 1 other tab")
         } else {
             format!("Closed {removed} other tabs")
         };
+        self.status = bulk_close_status(closed, removed, unsaved);
         self.poke_cursor();
     }
 
     /// Cmd+K →, tab context "Close to the Right" and View: Close Editors to
     /// the Right in Group (#852): close the focused group's unpinned tabs
-    /// right of `from_idx`, recording each for Reopen Closed Editor.
+    /// right of `from_idx`, recording each for Reopen Closed Editor. Unsaved
+    /// tabs stay open, and the status line counts them.
     fn close_tabs_to_right(&mut self, from_idx: usize) {
-        self.record_closed_tabs_where(|i, ed| i > from_idx && !ed.pinned);
+        let unsaved = self.record_closed_tabs_where(|i, _| i > from_idx);
         let removed = self.editor.close_to_right(from_idx);
-        if removed == 0 {
+        if removed == 0 && unsaved == 0 {
             self.status = String::from("No tabs to the right to close");
             return;
         }
         self.sync_open_file_poll_mtime();
-        self.status = if removed == 1 {
+        let closed = if removed == 1 {
             String::from("Closed 1 tab to the right")
         } else {
             format!("Closed {removed} tabs to the right")
         };
+        self.status = bulk_close_status(closed, removed, unsaved);
         self.poke_cursor();
     }
 
@@ -69433,12 +69472,19 @@ impl App {
     ///
     /// Tabs with unsaved changes stay open, in whichever group holds them
     /// (#862): a sweep must not decide to throw edits away, and Cmd+W on one
-    /// of them asks. Only the groups left with nothing fold away then.
+    /// of them asks. Pinned tabs stay open too (#941), as Close Others and
+    /// Close to the Right leave them. Only the groups left with nothing fold
+    /// away then. The closed tabs are recorded for Reopen Closed Editor, the
+    /// focused group's last so they are the first to come back.
     fn close_all_tabs(&mut self) {
+        let groups = self.editor_layout.inactive_groups().into_iter();
+        let (records, unsaved) =
+            bulk_close_records(groups.flat_map(|g| &g.editors).chain(&self.editor.editors));
+        self.push_closed_tabs(records);
         let mut removed = self.editor.close_all();
-        let mut kept = self.editor.editors.iter().filter(|e| e.dirty).count();
         if self.editor_layout.is_split() {
             let mut emptied = Vec::new();
+            let mut any_kept = !self.editor.is_blank_initial();
             for (g, group) in self
                 .editor_layout
                 .inactive_groups_mut()
@@ -69446,13 +69492,13 @@ impl App {
                 .enumerate()
             {
                 removed += group.close_all();
-                let dirty = group.editors.iter().filter(|e| e.dirty).count();
-                if dirty == 0 {
+                if group.is_blank_initial() {
                     emptied.push(g);
+                } else {
+                    any_kept = true;
                 }
-                kept += dirty;
             }
-            if kept == 0 {
+            if !any_kept {
                 self.editor_layout = editor_layout::EditorLayout::single();
             } else {
                 self.editor_layout.prune_inactive_at(&emptied);
@@ -69463,23 +69509,22 @@ impl App {
             self.sync_focus_flags();
         }
         self.sync_open_file_poll_mtime();
-        self.status = if removed == 1 {
+        let closed = if removed == 1 {
             String::from("Closed 1 tab")
         } else {
             format!("Closed {removed} tabs")
         };
-        if kept > 0 {
-            self.status
-                .push_str(&format!("; kept {kept} with unsaved changes open"));
-        }
+        self.status = bulk_close_status(closed, removed, unsaved);
         self.poke_cursor();
     }
 
     /// Close every saved (non-dirty) editor tab, keeping any with unsaved
-    /// changes. Shared by the tab context menu, the `Cmd+K U` chord and View:
-    /// Close Saved Editors in Group (#852) so every surface produces the same
-    /// status line and split-collapse behavior.
+    /// changes and every pinned one (#941), and record the closed tabs for
+    /// Reopen Closed Editor. Shared by the tab context menu, the `Cmd+K U`
+    /// chord and View: Close Saved Editors in Group (#852) so every surface
+    /// produces the same status line and split-collapse behavior.
     fn close_saved_tabs(&mut self) {
+        self.record_closed_tabs_where(|_, _| true);
         let removed = self.editor.close_saved();
         if removed == 0 {
             self.status = String::from("No saved tabs to close");
