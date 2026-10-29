@@ -2199,6 +2199,7 @@ mod tests {
     fn focused_gradient_border_draws_rounded_corner_and_keeps_title() {
         use crate::gradient::{GRAD_TL, rgb_color};
         let (_tmp, mut tree) = fixture();
+        tree.theme = crate::theme::Theme::BLACK;
         tree.focused = true;
         tree.focus_gradient = true;
         let area = Rect {
@@ -2429,6 +2430,8 @@ mod tests {
         // From the narrowest pane whose top border holds the whole title.
         for width in 14..30u16 {
             let (_tmp, mut tree) = fixture();
+            // A boxed title keeps its padding; Croft Loch's focus rule takes it.
+            tree.theme = crate::theme::Theme::BLACK;
             tree.focus_gradient = false;
             let area = Rect {
                 x: 0,
@@ -2647,7 +2650,7 @@ mod tests {
         (&mut tree).render(area, &mut buf);
         assert_eq!(
             buf[(area.x + 1, inner_y)].bg,
-            Color::Rgb(0x09, 0x4d, 0x77),
+            tree.theme.ui(Color::Rgb(0x09, 0x4d, 0x77)),
             "selection outranks hover so the row never dims to the hover lift"
         );
     }
@@ -2655,6 +2658,7 @@ mod tests {
     #[test]
     fn croft_dark_keeps_solid_blue_focus_border() {
         let (_tmp, mut tree) = fixture();
+        tree.theme = crate::theme::Theme::DARK_BLUE;
         tree.focused = true;
         tree.focus_gradient = false;
         let area = Rect {

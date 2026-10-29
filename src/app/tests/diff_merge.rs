@@ -203,7 +203,7 @@ fn diff_word_selection_highlights_every_other_occurrence() {
     }
 
     let buf = render_buf(&mut app);
-    let occurrence = Color::Rgb(0x37, 0x61, 0x8e);
+    let occurrence = app.theme.ui(Color::Rgb(0x37, 0x61, 0x8e));
     let occ_cells = count_bg(&buf, occurrence);
     // The selected word itself is overpainted by the brighter selection band,
     // so every occurrence we count here is a *different* one. Two equal rows

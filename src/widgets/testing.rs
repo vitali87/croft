@@ -1613,6 +1613,8 @@ mod tests {
     #[test]
     fn wide_characters_never_bleed_past_the_scrollbar_lane() {
         let mut p = TestingPanel::new();
+        // Boxed, so the right border is there to survive.
+        p.theme = Theme::BLACK;
         p.on_busy_started(Activity::Running);
         p.apply_case(TestCase {
             name: "套件::测试用例的名字很长很长很长很长很长".into(),

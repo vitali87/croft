@@ -22103,7 +22103,8 @@ impl EditorTabs {
 
     /// Close every tab showing `path` or a file under it (a deleted file or
     /// folder), except tabs with unsaved edits: those stay open, dirty, so
-    /// the edits can still be saved (recreating the file) or discarded.
+    /// the edits can still be saved (recreating the file) or discarded. A
+    /// sheet cell still being typed into counts as an unsaved edit.
     /// Returns how many dirty tabs were kept.
     pub fn close_clean_tabs_under(&mut self, path: &Path) -> usize {
         let mut kept = 0;
@@ -22114,7 +22115,7 @@ impl EditorTabs {
             if !e.path.as_deref().is_some_and(|p| p.starts_with(path)) {
                 continue;
             }
-            if e.dirty {
+            if e.dirty || e.sheet_pending_cell().is_some() {
                 kept += 1;
             } else {
                 self.close_tab(i);
@@ -27809,7 +27810,8 @@ mod tests {
             looks
                 .iter()
                 .filter(|(_, added, _)| added.contains(Modifier::UNDERLINED))
-                .all(|(_, _, colour)| *colour == Color::Rgb(0x80, 0x80, 0x80)),
+                .all(|(_, _, colour)| *colour
+                    == crate::theme::Theme::default().ui(Color::Rgb(0x80, 0x80, 0x80))),
             "a hint's marker is grey, not the information blue: {looks:?}"
         );
         assert_eq!(
@@ -27907,6 +27909,8 @@ mod tests {
     fn focused_editor_gradient_border_is_gated_on_focus_gradient() {
         use crate::gradient::{GRAD_TL, rgb_color};
         let mut e = editor_with("hi");
+        // A boxed theme: Croft Loch marks focus with a rule instead.
+        e.theme = crate::theme::Theme::BLACK;
         e.focused = true;
         let area = Rect {
             x: 0,
@@ -35085,8 +35089,8 @@ mod tests {
         (&mut e).render(area, &mut buf);
         let text_x = e.last_inner.x + e.last_gutter_width + 1;
         let y = e.last_inner.y;
-        let occurrence = Color::Rgb(0x37, 0x61, 0x8e);
-        let selection = Color::Rgb(0x26, 0x4f, 0x78);
+        let occurrence = e.theme.ui(Color::Rgb(0x37, 0x61, 0x8e));
+        let selection = e.theme.ui(Color::Rgb(0x26, 0x4f, 0x78));
         // The selected occurrence wears the brighter selection band, not the
         // dimmer occurrence blue.
         for col in 6..12u16 {
@@ -35684,7 +35688,7 @@ mod tests {
         let l_gutter = (diff.left_lines.len() + 1).to_string().len() as u16 + 1;
         let l_text_x = ed.last_inner.x + l_gutter + 2;
         let y = ed.last_inner.y + 2;
-        let band_bg = Color::Rgb(0x26, 0x4f, 0x78);
+        let band_bg = ed.theme.ui(Color::Rgb(0x26, 0x4f, 0x78));
         for col in 0..5u16 {
             assert_eq!(
                 buf[(l_text_x + col, y)].bg,
@@ -36371,7 +36375,7 @@ mod tests {
 
         // gutter for 1 line: "1 ".len() = 2 → text_x = 0+1+2+1 = 4
         let text_x = e.last_inner.x + e.last_gutter_width + 1;
-        let selected_bg = Color::Rgb(0x26, 0x4f, 0x78);
+        let selected_bg = e.theme.ui(Color::Rgb(0x26, 0x4f, 0x78));
         // chars 0..5 should be highlighted
         for col in 0..5u16 {
             let bg = buf[(text_x + col, e.last_inner.y)].bg;
@@ -36407,7 +36411,7 @@ mod tests {
         (&mut e).render(area, &mut buf);
 
         let text_x = e.last_inner.x + e.last_gutter_width + 1;
-        let selected_bg = Color::Rgb(0x26, 0x4f, 0x78);
+        let selected_bg = e.theme.ui(Color::Rgb(0x26, 0x4f, 0x78));
 
         // Row 0: cols 2..end (all the way past the end of "first")
         let row0_y = e.last_inner.y;
@@ -36729,6 +36733,7 @@ mod tests {
         use ratatui::buffer::Buffer;
         let mut t = EditorTabs::new();
         t.editors[0].path = Some(std::path::PathBuf::from("/foo.rs"));
+        t.editors[0].theme = crate::theme::Theme::BLACK;
         t.editors[0].focus_gradient = true; // turn on the Black theme
         t.add_tab_with_path(std::path::PathBuf::from("/bar.rs"));
         let area = Rect {
@@ -41310,7 +41315,7 @@ mod tests {
             head: (0, 18),
         });
         let buf = guide_buf(&mut e, 60, 5);
-        let band = Color::Rgb(0x26, 0x4f, 0x78);
+        let band = e.theme.ui(Color::Rgb(0x26, 0x4f, 0x78));
         assert_eq!(glyphs_where(&e, &buf, |c| c.bg == band), "#\u{b7}fo");
     }
 

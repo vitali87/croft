@@ -15,6 +15,7 @@
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result};
 
@@ -134,12 +135,14 @@ fn take_utf8(buf: &mut Vec<u8>) -> String {
 
 /// Connect to the session host at `socket` as a pure observer and write the
 /// session to `out` as asciicast lines until the session exits, the host
-/// goes away, or `until` passes (a test's bound; `None` in the CLI).
+/// goes away, `stop` is set, or `until` passes (a test's bound; `None` in
+/// the CLI).
 pub(crate) fn record_to(
     socket: &Path,
     out: &mut impl Write,
     title: &str,
     until: Option<std::time::Instant>,
+    stop: &AtomicBool,
 ) -> Result<()> {
     let mut stream = std::os::unix::net::UnixStream::connect(socket)
         .with_context(|| format!("connecting to {}", socket.display()))?;
@@ -151,15 +154,15 @@ pub(crate) fn record_to(
         client_id: format!("recorder-{}", std::process::id()),
     };
     stream.write_all(&crate::session_host::encode_control_frame(&hello))?;
-    if until.is_some() {
-        stream.set_read_timeout(Some(std::time::Duration::from_millis(50)))?;
-    }
+    // Ctrl-C and `--stop` only set `stop`, from a signal handler, so a read
+    // must not block for longer than it takes to look again.
+    stream.set_read_timeout(Some(std::time::Duration::from_millis(100)))?;
     let mut state = CastState::new(title);
     let mut reader = crate::session_host::FrameReader::default();
     let started = std::time::Instant::now();
     let mut buf = [0u8; 64 * 1024];
     loop {
-        if until.is_some_and(|u| std::time::Instant::now() >= u) {
+        if stop.load(Ordering::SeqCst) || until.is_some_and(|u| std::time::Instant::now() >= u) {
             return Ok(());
         }
         let n = match stream.read(&mut buf) {
@@ -168,7 +171,9 @@ pub(crate) fn record_to(
             Err(e)
                 if matches!(
                     e.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::Interrupted
                 ) =>
             {
                 continue;
@@ -189,9 +194,190 @@ pub(crate) fn record_to(
     }
 }
 
-/// Where a recorder for `socket` leaves its pid, for `croft record --stop`.
+/// Where a recorder for `socket` leaves its pidfile, for `croft record
+/// --stop` and for a second `croft record` to find.
 fn pid_path(socket: &Path) -> PathBuf {
     socket.with_extension("rec.pid")
+}
+
+/// The recorder a pidfile names (#1058). A pid alone is not enough to
+/// signal: a recorder killed before it could remove its pidfile leaves the
+/// pid to be recycled, and `--stop` would then terminate whatever unrelated
+/// process holds it now.
+#[derive(Debug, PartialEq)]
+struct Owner {
+    pid: u32,
+    /// When the recorder started, in seconds since the epoch: with the pid,
+    /// one process.
+    started: u64,
+    /// The cast it writes, named when a second recorder is refused.
+    out: PathBuf,
+}
+
+impl Owner {
+    /// This process, recording to `out`.
+    fn me(out: &Path) -> Self {
+        let pid = std::process::id();
+        Self {
+            pid,
+            started: crate::hot_exit::start_time_of(pid).unwrap_or(0),
+            out: std::path::absolute(out).unwrap_or_else(|_| out.to_path_buf()),
+        }
+    }
+
+    /// The pidfile's text: the pid, the start time and the cast, a line each.
+    fn to_text(&self) -> String {
+        format!("{}\n{}\n{}\n", self.pid, self.started, self.out.display())
+    }
+
+    /// `None` for anything [`Owner::to_text`] did not write, such as the
+    /// bare pid an older croft left.
+    fn parse(text: &str) -> Option<Self> {
+        let mut lines = text.splitn(3, '\n');
+        Some(Self {
+            pid: lines.next()?.parse().ok()?,
+            started: lines.next()?.parse().ok()?,
+            out: PathBuf::from(lines.next()?.strip_suffix('\n')?),
+        })
+    }
+
+    /// Whether this recorder still runs: its pid holds a process that
+    /// started when it did and is croft running `record`. A recycled pid
+    /// fails the start time; the command line catches one recycled within
+    /// the same second.
+    fn runs(&self) -> bool {
+        crate::hot_exit::start_time_of(self.pid) == Some(self.started)
+            && i32::try_from(self.pid)
+                .ok()
+                .and_then(crate::widgets::terminal::process_cmdline)
+                .is_some_and(|cmd| is_recorder(&cmd))
+    }
+}
+
+/// Whether `cmd`, a process's argv, is croft running `record`.
+fn is_recorder(cmd: &[String]) -> bool {
+    let Some((program, args)) = cmd.split_first() else {
+        return false;
+    };
+    Path::new(program)
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().starts_with("croft"))
+        && args.iter().any(|a| a == "record")
+}
+
+/// The recorder `pidfile` names, while it still runs.
+fn running_owner(pidfile: &Path) -> Option<Owner> {
+    let text = std::fs::read_to_string(pidfile).ok()?;
+    Owner::parse(&text).filter(Owner::runs)
+}
+
+/// Write `me` to `pidfile`, refusing while another recorder of the same
+/// session runs: the second would take over the pidfile, and `--stop` could
+/// no longer reach the first. A pidfile whose recorder is gone is replaced.
+/// An exclusive lock beside it makes that check and replacement one step:
+/// two recorders starting together each saw the stale file as theirs, and
+/// the second removed the first's new claim.
+fn claim(pidfile: &Path, me: &Owner, workspace: &Path) -> Result<()> {
+    use std::os::fd::AsRawFd;
+    let lock_path = pidfile.with_extension("lock");
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("creating {}", lock_path.display()))?;
+    // Released when `lock` closes, at the end of this function.
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("locking {}", lock_path.display()));
+    }
+    let create = || {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(pidfile)
+    };
+    let mut file = match create() {
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            if let Some(other) = running_owner(pidfile) {
+                anyhow::bail!(
+                    "already recording {} to {}; stop it with `croft record --stop`",
+                    workspace.display(),
+                    other.out.display()
+                );
+            }
+            let _ = std::fs::remove_file(pidfile);
+            create()
+        }
+        other => other,
+    }
+    .with_context(|| format!("creating {}", pidfile.display()))?;
+    file.write_all(me.to_text().as_bytes())?;
+    Ok(())
+}
+
+/// Remove `pidfile` if it still names this process.
+fn release(pidfile: &Path) {
+    let text = std::fs::read_to_string(pidfile).unwrap_or_default();
+    if Owner::parse(&text).is_some_and(|o| o.pid == std::process::id()) {
+        let _ = std::fs::remove_file(pidfile);
+    }
+}
+
+/// `croft record --stop`: SIGTERM the recorder `pidfile` names, only while
+/// it still runs, then wait for it to finish its cast and exit. A pidfile
+/// whose recorder is gone is removed, and nothing is signalled.
+fn stop_recorder(pidfile: &Path, workspace: &Path) -> Result<()> {
+    let Some(owner) = running_owner(pidfile) else {
+        let _ = std::fs::remove_file(pidfile);
+        anyhow::bail!("no recording is running for {}", workspace.display());
+    };
+    // The recorder catches it and finishes; the default action would make
+    // `croft record` exit 143 (#1058).
+    unsafe { libc::kill(owner.pid as libc::pid_t, libc::SIGTERM) };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while owner.runs() {
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "the recorder (pid {}) did not stop",
+            owner.pid
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    println!("Stopped the recording of {}", workspace.display());
+    Ok(())
+}
+
+/// Set by SIGINT or SIGTERM in `croft record`: the recording ends.
+static STOP: AtomicBool = AtomicBool::new(false);
+
+/// End the recording on Ctrl-C (SIGINT) and `croft record --stop` (SIGTERM)
+/// by setting [`STOP`], rather than by the default action killing the
+/// process: the pidfile is then removed and `croft record` exits 0. A
+/// SIGINT the launching shell ignores (a script's background job) stays
+/// ignored.
+fn stop_on_signals() {
+    extern "C" fn on_signal(_: libc::c_int) {
+        STOP.store(true, Ordering::SeqCst);
+    }
+    for sig in [libc::SIGINT, libc::SIGTERM] {
+        // SAFETY: sigaction(2) on zeroed structs; the handler only stores
+        // to an atomic, which is async-signal-safe.
+        unsafe {
+            let mut old: libc::sigaction = std::mem::zeroed();
+            if sig == libc::SIGINT
+                && libc::sigaction(sig, std::ptr::null(), &mut old) == 0
+                && old.sa_sigaction == libc::SIG_IGN
+            {
+                continue;
+            }
+            // No SA_RESTART: a read blocked when the signal lands returns
+            // at once, and the loop sees `STOP`.
+            let mut action: libc::sigaction = std::mem::zeroed();
+            action.sa_sigaction = on_signal as *const () as libc::sighandler_t;
+            libc::sigaction(sig, &action, std::ptr::null_mut());
+        }
+    }
 }
 
 /// `croft record`: record the session running for `workspace` to `out`, or
@@ -206,18 +392,7 @@ pub fn record(workspace: Option<PathBuf>, out: Option<PathBuf>, stop: bool) -> R
     let socket = crate::session::mux_socket_path(&workspace);
     let pidfile = pid_path(&socket);
     if stop {
-        let pid = std::fs::read_to_string(&pidfile)
-            .ok()
-            .and_then(|s| s.trim().parse::<u32>().ok())
-            .with_context(|| format!("no recording is running for {}", workspace.display()))?;
-        let status = std::process::Command::new("kill")
-            .args(["-TERM", &pid.to_string()])
-            .status()
-            .context("signalling the recorder")?;
-        let _ = std::fs::remove_file(&pidfile);
-        anyhow::ensure!(status.success(), "the recorder (pid {pid}) is not running");
-        println!("Stopped the recording of {}", workspace.display());
-        return Ok(());
+        return stop_recorder(&pidfile, &workspace);
     }
     if !socket.exists() {
         anyhow::bail!(
@@ -232,20 +407,26 @@ pub fn record(workspace: Option<PathBuf>, out: Option<PathBuf>, stop: bool) -> R
             .unwrap_or(0);
         workspace.join(format!("croft-session-{secs}.cast"))
     });
-    let mut file =
-        std::fs::File::create(&out).with_context(|| format!("creating {}", out.display()))?;
-    std::fs::write(&pidfile, std::process::id().to_string())?;
-    eprintln!(
-        "Recording {} to {} (stop with `croft record --stop` or Ctrl-C)",
-        workspace.display(),
-        out.display()
-    );
+    // Before the pidfile exists, so no Ctrl-C can leave it behind.
+    stop_on_signals();
+    // Before the cast is created: a refused second recorder must not
+    // truncate the first one's file.
+    claim(&pidfile, &Owner::me(&out), &workspace)?;
     let title = workspace
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let result = record_to(&socket, &mut file, &title, None);
-    let _ = std::fs::remove_file(&pidfile);
+    let result = std::fs::File::create(&out)
+        .with_context(|| format!("creating {}", out.display()))
+        .and_then(|mut file| {
+            eprintln!(
+                "Recording {} to {} (stop with `croft record --stop` or Ctrl-C)",
+                workspace.display(),
+                out.display()
+            );
+            record_to(&socket, &mut file, &title, None, &STOP)
+        });
+    release(&pidfile);
     result
 }
 
@@ -337,5 +518,147 @@ mod tests {
         let mut buf = vec![b'x', 0xff, b'y'];
         assert_eq!(take_utf8(&mut buf), "x\u{fffd}y");
         assert!(buf.is_empty());
+    }
+
+    /// #1058: Ctrl-C and `--stop` only set the flag. The loop sees it while
+    /// the session is quiet and returns, the cast written so far intact.
+    #[test]
+    fn record_to_returns_once_stop_is_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("s.mux.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        // A host that paints once, then goes quiet with the connection open.
+        let host = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let Frame::Control(presence) = roster(&[(80, 24)]) else {
+                unreachable!()
+            };
+            conn.write_all(&crate::session_host::encode_control_frame(&presence))
+                .unwrap();
+            conn.write_all(&crate::session_host::encode_bytes_frame(b"hi"))
+                .unwrap();
+            conn
+        });
+        let stop = AtomicBool::new(false);
+        let mut cast = Vec::new();
+        let began = std::time::Instant::now();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                stop.store(true, Ordering::SeqCst);
+            });
+            let bound = began + std::time::Duration::from_secs(30);
+            record_to(&socket, &mut cast, "ws", Some(bound), &stop).expect("record_to");
+        });
+        assert!(
+            began.elapsed() < std::time::Duration::from_secs(5),
+            "returned on the flag, not at the test's bound"
+        );
+        let text = String::from_utf8(cast).unwrap();
+        assert_eq!(text.lines().count(), 2, "{text}");
+        assert!(
+            text.contains("\"width\":80") && text.contains("hi"),
+            "{text}"
+        );
+        drop(host.join().unwrap());
+    }
+
+    /// A stand-in for a running `croft record`: a shell whose argv reads
+    /// `croft -c "read x" sh record`, waiting on the stdin the caller holds.
+    fn fake_recorder() -> (std::process::Child, Owner) {
+        use std::os::unix::process::CommandExt;
+        let child = std::process::Command::new("sh")
+            .arg0("croft")
+            .args(["-c", "read x", "sh", "record"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let owner = Owner {
+            pid,
+            started: crate::hot_exit::start_time_of(pid).expect("a child's start time"),
+            out: PathBuf::from("/tmp/first.cast"),
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !owner.runs() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the stand-in never ran"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        (child, owner)
+    }
+
+    /// #1058: a pidfile left behind names a pid that may since belong to
+    /// any process. `--stop` signals none of these, and removes the file.
+    #[test]
+    fn stop_never_signals_a_pid_that_is_not_the_recorder() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("s.mux.rec.pid");
+        let mut sleep = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = sleep.id();
+        let started = crate::hot_exit::start_time_of(pid).expect("a child's start time");
+        for text in [
+            // An older croft's bare pid.
+            pid.to_string(),
+            // The pid recycled after the recorder died.
+            format!("{pid}\n{}\n/tmp/x.cast\n", started - 1),
+            // The right start time, but `sleep` is not croft recording.
+            format!("{pid}\n{started}\n/tmp/x.cast\n"),
+        ] {
+            std::fs::write(&pidfile, &text).unwrap();
+            let err = stop_recorder(&pidfile, dir.path()).unwrap_err();
+            assert!(err.to_string().contains("no recording is running"), "{err}");
+            assert!(!pidfile.exists(), "the stale pidfile stays: {text:?}");
+            assert!(sleep.try_wait().unwrap().is_none(), "{text:?} killed it");
+        }
+        sleep.kill().unwrap();
+        sleep.wait().unwrap();
+    }
+
+    #[test]
+    fn stop_removes_the_pidfile_of_a_recorder_that_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("s.mux.rec.pid");
+        // 999999999 never exists.
+        std::fs::write(&pidfile, "999999999\n1700000000\n/tmp/x.cast\n").unwrap();
+        let err = stop_recorder(&pidfile, dir.path()).unwrap_err();
+        assert!(err.to_string().contains("no recording is running"), "{err}");
+        assert!(!pidfile.exists());
+    }
+
+    /// #1058: a second recorder for the session is refused while the first
+    /// runs, rather than taking the pidfile over and leaving the first
+    /// unstoppable. `--stop` ends the first, and then a new one may start.
+    #[test]
+    fn a_second_recorder_is_refused_until_stop_ends_the_first() {
+        use std::os::unix::process::ExitStatusExt;
+        let dir = tempfile::tempdir().unwrap();
+        let pidfile = dir.path().join("s.mux.rec.pid");
+        let (mut first, owner) = fake_recorder();
+        // Held here: `wait` would close it, and `read` would end the shell.
+        let _stdin = first.stdin.take();
+        std::fs::write(&pidfile, owner.to_text()).unwrap();
+        let me = Owner::me(&dir.path().join("second.cast"));
+        let err = claim(&pidfile, &me, dir.path()).unwrap_err().to_string();
+        assert!(
+            err.contains("already recording") && err.contains("/tmp/first.cast"),
+            "{err}"
+        );
+        assert_eq!(std::fs::read_to_string(&pidfile).unwrap(), owner.to_text());
+
+        let reaper = std::thread::spawn(move || first.wait().unwrap());
+        stop_recorder(&pidfile, dir.path()).expect("the running recorder stops");
+        assert_eq!(reaper.join().unwrap().signal(), Some(libc::SIGTERM));
+
+        claim(&pidfile, &me, dir.path()).expect("the stale pidfile is replaced");
+        let text = std::fs::read_to_string(&pidfile).unwrap();
+        assert_eq!(Owner::parse(&text), Some(me));
+        release(&pidfile);
+        assert!(!pidfile.exists());
     }
 }

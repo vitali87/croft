@@ -1126,38 +1126,71 @@ fn seeded_search_matches_case_the_way_the_grep_did() {
     )
     .unwrap();
     let mut app = App::new(root.to_path_buf()).unwrap();
-    let mut seeded_lines = |cmd: &str| {
-        assert!(seed_at_root(&mut app, cmd), "{cmd}");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while !app.search.complete && std::time::Instant::now() < deadline {
-            app.drain_search_results();
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        assert!(app.search.complete, "{cmd}: the search must finish");
-        let mut lines: Vec<String> = app
-            .search
-            .hits
-            .iter()
-            .map(|h| {
-                let name = h.path.file_name().unwrap_or_default().to_string_lossy();
-                format!("{name}:{}", h.line_no)
-            })
-            .collect();
-        lines.sort();
-        lines
-    };
     assert_eq!(
-        seeded_lines("rg -n color"),
+        seeded_lines(&mut app, "rg -n color"),
         ["notes.py:1", "style.py:1", "style.py:2"]
     );
     assert_eq!(
-        seeded_lines("grep -rn color ."),
+        seeded_lines(&mut app, "grep -rn color ."),
         ["notes.py:1", "style.py:1", "style.py:2"]
     );
     // Negative: a grep that ignored case still seeds every case.
     assert_eq!(
-        seeded_lines("rg -i color"),
+        seeded_lines(&mut app, "rg -i color"),
         ["notes.py:1", "notes.py:2", "style.py:1", "style.py:2"]
+    );
+}
+
+/// The `file:line` of each hit of the Search seeded from `cmd`, run at the
+/// workspace root, once it finishes.
+fn seeded_lines(app: &mut App, cmd: &str) -> Vec<String> {
+    assert!(seed_at_root(app, cmd), "{cmd}");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !app.search.complete && std::time::Instant::now() < deadline {
+        app.drain_search_results();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(app.search.complete, "{cmd}: the search must finish");
+    let mut lines: Vec<String> = app
+        .search
+        .hits
+        .iter()
+        .map(|h| {
+            let name = h.path.file_name().unwrap_or_default().to_string_lossy();
+            format!("{name}:{}", h.line_no)
+        })
+        .collect();
+    lines.sort();
+    lines
+}
+
+/// #1201: `grep -x` lists whole lines only and several `-e` list a line
+/// holding any of them, so the seed must match those lines and no others,
+/// or Replace All renames `retry_timeout`; a grep piped into `head` or run
+/// after `clear;` still seeds, and `-f FILE` refuses.
+#[test]
+fn seeded_search_matches_the_lines_the_grep_listed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir(root.join("src")).unwrap();
+    let a = "timeout\nretry_timeout = 30\ntimeout\n";
+    std::fs::write(root.join("src/a.cfg"), a).unwrap();
+    std::fs::write(root.join("src/b.cfg"), "connect_timeout = 5\n").unwrap();
+    std::fs::write(root.join("words.txt"), "timeout\n").unwrap();
+    let mut app = App::new(root.to_path_buf()).unwrap();
+    let mut seeded = |cmd: &str| seeded_lines(&mut app, cmd);
+    assert_eq!(seeded("grep -rnx timeout src"), ["a.cfg:1", "a.cfg:3"]);
+    assert_eq!(
+        seeded("grep -rn -e connect_timeout -e retry_timeout src"),
+        ["a.cfg:2", "b.cfg:1"]
+    );
+    assert_eq!(seeded("grep -rn retry_timeout src | head -5"), ["a.cfg:2"]);
+    assert_eq!(seeded("clear; grep -rn connect_timeout src"), ["b.cfg:1"]);
+    assert!(seed_at_root(&mut app, "grep -rn -f words.txt src"));
+    assert!(app.status.contains("from a file"), "{}", app.status);
+    assert_eq!(
+        app.search.query, "connect_timeout",
+        "the panel is left alone"
     );
 }
 

@@ -3695,9 +3695,13 @@ fn osc_9_4_progress_paints_a_border_gauge_and_pill_percent() {
     // The gauge's fill glyph contrasts with the pane's own border weight
     // (#470): a focused pane draws a heavy border, so its fill is `═`
     // against `━`; an unfocused one draws light, so its fill is `━`
-    // against `─`. Counting the glyph that marks FILL keeps this test
-    // about the gauge rather than about which border weight is in force.
-    let fill_glyph = if app.terminals[0].focused {
+    // against `─`; under a `surfaces` theme, with no border to outweigh, a
+    // quarter block sits on the frame row. Counting the glyph that marks FILL
+    // keeps this test about the gauge rather than about which border is in
+    // force.
+    let fill_glyph = if app.theme.surfaces().is_some() {
+        '\u{2582}'
+    } else if app.terminals[0].focused {
         '═'
     } else {
         '━'
@@ -7914,10 +7918,13 @@ fn a_click_while_asking_cannot_move_the_paste_to_another_pane() {
     assert_eq!(pasted(&app), TWO_LINES, "the checked pane gets the paste");
 }
 
-/// A quiet 30-column pane holding `text`, with the find bar open on it.
+/// A quiet 30-column pane holding `text`, with the find bar open on it. On
+/// Croft Black, which leaves an unmatched cell on the host's own background
+/// (`Color::Reset`) where Croft Loch fills it with its canvas.
 fn wrapped_find_app(text: &str) -> (tempfile::TempDir, App) {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.apply_theme(crate::theme::Theme::BLACK);
     app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
         "/bin/sleep",
         &[String::from("60")],

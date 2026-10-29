@@ -4715,6 +4715,43 @@ fn accept_all_incoming_then_complete_merge_stages_the_resolved_file() {
     );
 }
 
+/// #989: Stage All, or staging the conflicted row, while its markers are
+/// still in the file says so and leaves it unmerged, so the next Commit
+/// can't record the markers. Resolved by hand, it stages.
+#[test]
+fn staging_a_conflict_with_its_markers_still_in_it_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    conflicted_repo(tmp.path());
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let idx = wait_for_conflicted_entry(&mut app);
+    app.stage_source_control_entry(idx);
+    assert!(
+        app.status
+            .contains("shared.txt still has conflict markers: resolve it before staging"),
+        "{}",
+        app.status
+    );
+    app.stage_all_source_control();
+    assert!(
+        app.status.contains("shared.txt still has conflict markers"),
+        "{}",
+        app.status
+    );
+    assert_eq!(
+        crate::git::unmerged_paths(tmp.path()),
+        vec![String::from("shared.txt")]
+    );
+
+    std::fs::write(
+        tmp.path().join("shared.txt"),
+        "alpha\nfeature-one\nm1\nm2\nm3\nm4\nm5\nfeature-two\nomega\n",
+    )
+    .unwrap();
+    app.stage_all_source_control();
+    assert!(app.status.starts_with("Staged all"), "{}", app.status);
+    assert!(crate::git::unmerged_paths(tmp.path()).is_empty());
+}
+
 /// #906: a file resolved by hand in the text flow is still unmerged in git,
 /// so its MERGE CONFLICTS row stays. Opening it keeps that resolution as the
 /// Result, reads each conflict's state off it, and Complete Merge stages it.
@@ -5665,7 +5702,8 @@ fn the_scrubber_slider_seeks_on_click_and_drag() {
     let row: String = (0..120)
         .map(|x| term.backend().buffer()[(x, track.y)].symbol().to_string())
         .collect();
-    assert!(row.contains(" 1/3 "), "{row}");
+    // The seam under a `surfaces` theme takes the gap after the label.
+    assert!(row.contains(" 1/3"), "{row}");
     // The drag keeps seeking off the row too.
     mouse(
         &mut app,

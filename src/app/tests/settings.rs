@@ -417,8 +417,8 @@ fn applying_a_theme_switches_the_active_theme_and_arms_a_repaint() {
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     assert_eq!(
         app.theme,
-        crate::theme::Theme::BLACK,
-        "fresh install defaults to the black theme"
+        crate::theme::Theme::LOCH,
+        "fresh install defaults to Croft Loch"
     );
     app.apply_theme(crate::theme::Theme::DARK_BLUE);
     assert_eq!(app.theme, crate::theme::Theme::DARK_BLUE);
@@ -721,8 +721,11 @@ const CHROME_DE: &str = r#"{
     "This will overwrite your local changes from HEAD.": "Lokale Änderungen werden überschrieben."
 }"#;
 
-/// Render `app` at 140x50 with `catalog` active and return the screen.
+/// Render `app` at 140x50 with `catalog` active and return the screen. On
+/// Croft Black, so a focused pane's title keeps the padding the assertions
+/// match on: Croft Loch's focus rule draws over it.
 fn screen_with_catalog(app: &mut App, catalog: &str) -> String {
+    app.apply_theme(crate::theme::Theme::BLACK);
     let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 50)).unwrap();
     crate::i18n::with_test_catalog(catalog, || term.draw(|f| app.render(f)).unwrap());
     screen_text(&term)

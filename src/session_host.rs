@@ -3646,7 +3646,13 @@ mod tests {
         let recorder = std::thread::spawn(move || {
             let mut file = std::fs::File::create(&rec_cast).unwrap();
             let until = std::time::Instant::now() + Duration::from_millis(1500);
-            crate::session_record::record_to(&rec_socket, &mut file, "ws", Some(until))
+            crate::session_record::record_to(
+                &rec_socket,
+                &mut file,
+                "ws",
+                Some(until),
+                &std::sync::atomic::AtomicBool::new(false),
+            )
         });
         // Let the recorder attach before typing, then give the echo time.
         std::thread::sleep(Duration::from_millis(300));

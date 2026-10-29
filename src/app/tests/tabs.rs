@@ -1684,6 +1684,85 @@ fn a_rename_reaches_the_files_tab_in_another_split_group() {
     );
 }
 
+/// #915: a file held unsaved only in the other split group stays open on
+/// the language server with its unsaved text, so a rename computed from that
+/// text lands on the buffer's own lines, beside the unsaved edit, as one
+/// undo step there, and the disk keeps the saved file.
+#[test]
+fn a_rename_keeps_the_unsaved_edits_of_a_file_open_in_the_other_split_group() {
+    const SAVED: &str = "import json\n\n\ndef load_items(path):\n    return json.load(path)\n";
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let store = root.join("store.py");
+    std::fs::write(&store, SAVED).unwrap();
+    let mut app = app_with_open_file(
+        &root,
+        "app.py",
+        "from store import load_items\n\nload_items(\"a\")\n",
+    );
+    let main_py = app.editor.path.clone().unwrap();
+    app.split_editor_dir(editor_layout::SplitDir::Horizontal, true);
+    app.editor.open(&store).unwrap();
+    for c in "import os".chars() {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+            .unwrap();
+    }
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    let unsaved = format!("import os\n{SAVED}");
+    assert_eq!(app.editor.document_text(), unsaved);
+    app.sync_lsp();
+    app.focus_editor_group(true);
+    app.sync_lsp();
+
+    assert_eq!(app.editor.path.as_deref(), Some(main_py.as_path()));
+    let seq = app.editor_layout.inactive_groups()[0].edit_seq;
+    assert_eq!(
+        app.lsp_last_seen.get(&store),
+        Some(&seq),
+        "the other group's file stays open on the server"
+    );
+    let held = app.lsp.as_ref().unwrap().synced_text_for_test(&store);
+    assert_eq!(
+        held.as_deref(),
+        Some(unsaved.as_str()),
+        "with its unsaved text"
+    );
+
+    let span = |row, col| crate::widgets::editor::TextSpanEdit {
+        start: (row, col),
+        end: (row, col + 10),
+        new_text: String::from("read_items"),
+        utf16: false,
+    };
+    app.rename_baseline = app.edit_seqs_in_every_group();
+    app.land_rename(Some(vec![
+        (main_py.clone(), vec![span(0, 18), span(2, 0)]),
+        (store.clone(), vec![span(4, 4)]),
+    ]));
+
+    assert_eq!(app.status, "Renamed 3 occurrence(s) across 2 file(s)");
+    assert_eq!(app.editor.lines[0], "from store import read_items");
+    let other = app.editor_layout.inactive_groups()[0];
+    assert_eq!(
+        other.document_text(),
+        unsaved.replace("load_items", "read_items"),
+        "the rename and the unsaved line, both"
+    );
+    assert!(other.dirty);
+    assert_eq!(std::fs::read_to_string(&store).unwrap(), SAVED);
+
+    app.focus_editor_group(false);
+    app.handle_key(key(KeyCode::Char('z'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert_eq!(
+        app.editor.document_text(),
+        unsaved,
+        "undo takes back the rename alone"
+    );
+    assert_eq!(std::fs::read_to_string(&store).unwrap(), SAVED);
+}
+
 /// #369: saving the file's tab leaves no disk conflict on its symbol tab.
 ///
 /// The symbol tab holds the same text that was just written, so the next
