@@ -1,0 +1,1 @@
+fix: Search & Replace from Last grep/rg seeds what the grep listed for `-x` (whole lines) and several `-e` patterns, reads the grep out of a pipeline or list such as `clear; grep -rn x src | head` (listing every match in the scope it searched, not only the lines `head` let through), and refuses `-f FILE`, `-z` and piped input with the reason instead of seeding a wider search.

@@ -9,10 +9,10 @@
 //! "replace across every match" for free.
 //
 // ponytail: a heuristic arg parser, not a full clap model of every grep/rg
-// flag. It covers the common invocations (pattern, `-i`/`-w`/`-F`/`-E`, `-e`,
-// `-g`, value flags like `-C 3`); exotic combinations may misparse, but the
-// seeded query is shown in the panel for the user to correct, never applied
-// blindly. Upgrade to per-tool flag tables if that proves too coarse.
+// flag. It covers the common invocations (pattern, `-i`/`-w`/`-x`/`-F`/`-E`,
+// `-e`, `-g`, value flags like `-C 3`); exotic combinations may misparse, but
+// the seeded query is shown in the panel for the user to correct, never
+// applied blindly. Upgrade to per-tool flag tables if that proves too coarse.
 
 use std::path::{Path, PathBuf};
 
@@ -41,6 +41,9 @@ pub struct SearchCommand {
     /// grep always do; grep only with `-r`/`-R`/`--recursive`/`-d recurse`,
     /// and with no path at all it reads stdin.
     pub recursive: bool,
+    /// Why the lines the command listed can't be matched by one Search
+    /// query (patterns read from a file, NUL-split input, piped input).
+    pub unseedable: Option<&'static str>,
 }
 
 /// Consume `idx`'s token as a flag value (or take the inline `--flag=value`
@@ -144,36 +147,112 @@ impl regex_syntax::ast::Visitor for RgLiterals {
     }
 }
 
-/// Parse a terminal command line into a [`SearchCommand`], or `None` if it is
-/// not a recognised search (`rg`/`ripgrep`/`grep`/`egrep`/`fgrep`/`git grep`/
-/// `ag`/`ack`) or carries no pattern.
-pub fn parse_search_command(cmdline: &str) -> Option<SearchCommand> {
-    let tokens = shlex::split(cmdline)?;
-    if tokens.is_empty() {
-        return None;
+/// The simple commands of a shell line, each with whether a pipe feeds it:
+/// the line is cut at the unquoted `|`, `|&`, `||`, `&&`, `;`, `&` and line
+/// breaks, and redirections (`> out`, `2>/dev/null`, `<in`) are dropped. So
+/// `clear; grep -rn x src | head 2>&1` is `clear`, `grep -rn x src` and a
+/// piped-into `head`. An input redirection counts as a pipe: `rg x < f`
+/// searched `f` on stdin, not the directory it ran in.
+fn simple_commands(line: &str) -> Vec<(String, bool)> {
+    // Push a quoted span, through its closing quote, onto `out`.
+    /// Copy a quoted run through its closing `open` quote, honouring `\`
+    /// escapes inside double quotes, so operators in it stay part of the word.
+    fn quoted(open: char, chars: &mut std::iter::Peekable<std::str::Chars>, out: &mut String) {
+        while let Some(c) = chars.next() {
+            out.push(c);
+            if c == open {
+                return;
+            }
+            if c == '\\' && open == '"' {
+                out.extend(chars.next());
+            }
+        }
     }
-    let mut idx = 0;
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut piped = false;
+    let mut chars = line.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => {
+                cur.push(c);
+                cur.extend(chars.next());
+            }
+            '\'' | '"' => {
+                cur.push(c);
+                quoted(c, &mut chars, &mut cur);
+            }
+            '>' | '<' => {
+                // A redirection: its fd (`2>`), operator (`>>`, `>&`) and target.
+                if c == '<' {
+                    piped = true;
+                }
+                let before_fd = cur.trim_end_matches(|d: char| d.is_ascii_digit());
+                if before_fd.is_empty() || before_fd.ends_with(char::is_whitespace) {
+                    cur.truncate(before_fd.len());
+                }
+                while chars.next_if(|n| matches!(n, '>' | '<' | '&')).is_some() {}
+                while chars.next_if(|n| *n == ' ' || *n == '\t').is_some() {}
+                let mut target = String::new();
+                while let Some(n) = chars.next_if(|n| !n.is_whitespace() && !"|&;<>".contains(*n)) {
+                    match n {
+                        '\'' | '"' => quoted(n, &mut chars, &mut target),
+                        '\\' => target.extend(chars.next()),
+                        _ => {}
+                    }
+                }
+                cur.push(' ');
+            }
+            // `&>` redirects both streams; the `>` arm drops it.
+            '&' if chars.peek() == Some(&'>') => {}
+            '|' | '&' | ';' | '\n' => {
+                let pipe = c == '|' && chars.next_if_eq(&'|').is_none();
+                if c != ';' && c != '\n' {
+                    chars.next_if_eq(&'&');
+                }
+                out.push((std::mem::take(&mut cur), piped));
+                piped = pipe;
+            }
+            _ => cur.push(c),
+        }
+    }
+    out.push((cur, piped));
+    out
+}
 
-    // Program name, path stripped (`/usr/bin/rg` -> `rg`). Sets the regex/case
-    // defaults; flags below refine them.
-    let prog_full = tokens[idx].as_str();
-    let prog = prog_full.rsplit('/').next().unwrap_or(prog_full);
-    idx += 1;
+/// The search program `tokens` runs, path stripped (`/usr/bin/rg` -> `rg`,
+/// `git grep` -> `git`), and the index of its first argument.
+fn search_program(tokens: &[String]) -> Option<(&str, usize)> {
+    let first = tokens.first()?;
+    let prog = first.rsplit('/').next().unwrap_or(first);
+    match prog {
+        "rg" | "ripgrep" | "grep" | "egrep" | "fgrep" | "ag" | "ack" => Some((prog, 1)),
+        "git" if tokens.get(1).is_some_and(|t| t == "grep") => Some((prog, 2)),
+        _ => None,
+    }
+}
+
+/// Why a grep over NUL-separated records can't seed: Search reads lines.
+const NUL_DATA: &str = "the grep split its input at NUL bytes, not lines (-z)";
+
+/// Parse a terminal command line into a [`SearchCommand`], or `None` if it
+/// runs no recognised search (`rg`/`ripgrep`/`grep`/`egrep`/`fgrep`/`git
+/// grep`/`ag`/`ack`) or that search carries no pattern. In a pipeline or a
+/// list (`clear; rg x | head`) the last search is the one read.
+pub fn parse_search_command(cmdline: &str) -> Option<SearchCommand> {
+    let (tokens, piped) = simple_commands(cmdline)
+        .into_iter()
+        .rev()
+        .find_map(|(cmd, piped)| {
+            let tokens = shlex::split(&cmd)?;
+            search_program(&tokens).is_some().then_some((tokens, piped))
+        })?;
+    // Program name; sets the regex/case defaults, flags below refine them.
+    let (prog, mut idx) = search_program(&tokens)?;
     // rg/ag/ack/egrep default to regex; plain grep's BRE is not Rust-regex, so
     // treat its pattern as literal (correct for the common "grep a string"),
-    // upgraded by -E/-P. fgrep is always literal.
-    let mut use_regex = match prog {
-        "rg" | "ripgrep" | "ag" | "ack" | "egrep" => true,
-        "grep" | "fgrep" => false,
-        "git" => {
-            if tokens.get(idx).map(|s| s.as_str()) != Some("grep") {
-                return None;
-            }
-            idx += 1;
-            false
-        }
-        _ => return None,
-    };
+    // upgraded by -E/-P. fgrep and git grep are literal too.
+    let mut use_regex = matches!(prog, "rg" | "ripgrep" | "ag" | "ack" | "egrep");
     // `-s` means case-sensitive only in rg/ag; GNU grep and ack use it to
     // suppress error messages, and git grep has no such flag at all.
     let dash_s_is_case_sensitive = matches!(prog, "rg" | "ripgrep" | "ag");
@@ -190,16 +269,22 @@ pub fn parse_search_command(cmdline: &str) -> Option<SearchCommand> {
     let mut whole_word = false;
     let mut include: Option<String> = None;
     let mut exclude: Option<String> = None;
-    let mut pattern: Option<String> = None;
-    // A pattern given by `-e`/`--regexp` makes every positional a path.
+    // Patterns given by `-e`/`--regexp` (or `-f`) make every positional a
+    // path.
+    let mut patterns: Vec<String> = Vec::new();
+    let mut patterns_from_file = false;
     let mut positionals: Vec<String> = Vec::new();
     let mut types: Vec<String> = Vec::new();
     let mut types_not: Vec<String> = Vec::new();
     let mut inverted = false;
+    // `-x`/`--line-regexp`: the pattern must match the whole line.
+    let mut line_regexp = false;
+    let mut unseedable: Option<&'static str> = None;
     let is_rg = matches!(prog, "rg" | "ripgrep");
+    let is_grep = matches!(prog, "grep" | "egrep" | "fgrep");
     // rg's `-P`/`--pcre2` engine reads smart case its own way.
     let mut pcre2 = false;
-    let mut recursive = !matches!(prog, "grep" | "egrep" | "fgrep");
+    let mut recursive = !is_grep;
 
     // Append a glob to one of the panel's comma-separated filter lists.
     fn push_glob(list: &mut Option<String>, glob: String) {
@@ -242,6 +327,7 @@ pub fn parse_search_command(cmdline: &str) -> Option<SearchCommand> {
                 "case-sensitive" | "no-ignore-case" => case = CaseRule::Sensitive,
                 "smart-case" => case = CaseRule::Smart,
                 "word-regexp" => whole_word = true,
+                "line-regexp" => line_regexp = true,
                 "invert-match" | "files-without-match" | "files-without-matches" => inverted = true,
                 "fixed-strings" => use_regex = false,
                 "recursive" | "dereference-recursive" => recursive = true,
@@ -255,11 +341,15 @@ pub fn parse_search_command(cmdline: &str) -> Option<SearchCommand> {
                     use_regex = true;
                     pcre2 = true;
                 }
-                "regexp" => {
-                    let v = take_value(inline_val, &tokens, &mut idx);
-                    if pattern.is_none() {
-                        pattern = v;
-                    }
+                "regexp" => patterns.extend(take_value(inline_val, &tokens, &mut idx)),
+                "file" => {
+                    let _ = take_value(inline_val, &tokens, &mut idx);
+                    patterns_from_file = true;
+                }
+                "null-data" => unseedable = Some(NUL_DATA),
+                // git grep's pattern algebra; `--or` is the default.
+                "and" | "not" | "all-match" => {
+                    unseedable = Some("git grep combined its patterns with --and / --not")
                 }
                 "glob" | "iglob" => {
                     if let Some(v) = take_value(inline_val, &tokens, &mut idx) {
@@ -289,7 +379,7 @@ pub fn parse_search_command(cmdline: &str) -> Option<SearchCommand> {
                 }
                 // Long flags that take a value we don't use; drop the value so
                 // it isn't mistaken for the pattern.
-                "file" | "max-count" | "type" | "type-not" | "context" | "after-context"
+                "max-count" | "type" | "type-not" | "context" | "after-context"
                 | "before-context" | "max-depth" | "threads" | "replace"
                     if inline_val.is_none() =>
                 {
@@ -307,7 +397,11 @@ pub fn parse_search_command(cmdline: &str) -> Option<SearchCommand> {
                     's' if dash_s_is_case_sensitive => case = CaseRule::Sensitive,
                     'S' if dash_s_upper_is_smart_case => case = CaseRule::Smart,
                     'w' => whole_word = true,
+                    'x' => line_regexp = true,
                     'v' => inverted = true,
+                    // rg's `-z` searches compressed files; grep's splits
+                    // the input at NUL bytes instead of line breaks.
+                    'z' if is_grep => unseedable = Some(NUL_DATA),
                     // rg's `-L` follows symlinks; elsewhere it lists the
                     // files without a match.
                     'L' if !is_rg => inverted = true,
@@ -338,9 +432,7 @@ pub fn parse_search_command(cmdline: &str) -> Option<SearchCommand> {
                             Some(rest)
                         };
                         if chars[ci] == 'e' {
-                            if pattern.is_none() {
-                                pattern = v;
-                            }
+                            patterns.extend(v);
                         } else if let Some(v) = v {
                             route_glob(&mut include, &mut exclude, v);
                         }
@@ -362,8 +454,17 @@ pub fn parse_search_command(cmdline: &str) -> Option<SearchCommand> {
                         }
                         break;
                     }
+                    // ag's `-f` follows symlinks; elsewhere it names a
+                    // file of patterns.
+                    'f' if prog != "ag" => {
+                        if chars[ci + 1..].is_empty() {
+                            let _ = take_value(None, &tokens, &mut idx);
+                        }
+                        patterns_from_file = true;
+                        break;
+                    }
                     // Short flags that take a value we don't use.
-                    'f' | 'm' | 'A' | 'B' | 'C' | 't' | 'T' => {
+                    'm' | 'A' | 'B' | 'C' | 't' | 'T' => {
                         if chars[ci + 1..].is_empty() {
                             let _ = take_value(None, &tokens, &mut idx);
                         }
@@ -378,21 +479,61 @@ pub fn parse_search_command(cmdline: &str) -> Option<SearchCommand> {
         }
     }
 
-    // Without `-e`, the first positional is the pattern; the rest are the
-    // files and directories searched.
+    // Without `-e` or `-f`, the first positional is the pattern; the rest
+    // are the files and directories searched.
     let mut positionals = positionals.into_iter();
-    let pattern = match pattern {
-        Some(p) => p,
-        None => positionals.next()?,
-    };
+    if patterns.is_empty() && !patterns_from_file {
+        patterns.push(positionals.next()?);
+    }
     let paths: Vec<String> = positionals.collect();
-    if pattern.is_empty() {
+    if patterns.iter().any(String::is_empty) {
         return None;
     }
+    if patterns_from_file {
+        unseedable = Some("the grep's patterns come from a file (-f); search for them by hand");
+    }
+    // A search fed by a pipe and given no path reads the pipe (git grep
+    // ignores it).
+    if piped && paths.is_empty() && prog != "git" {
+        unseedable.get_or_insert("the grep searched what was piped into it, not files");
+    }
+    // Each pattern is read on its own: where one keeps case the seed does
+    // too, which can only list fewer lines.
     let case_sensitive = match case {
         CaseRule::Sensitive => true,
         CaseRule::Insensitive => false,
-        CaseRule::Smart => smart_case_is_sensitive(prog, &pattern, use_regex && !pcre2),
+        CaseRule::Smart => patterns
+            .iter()
+            .any(|p| smart_case_is_sensitive(prog, p, use_regex && !pcre2)),
+    };
+    // Several patterns list a line holding any of them, and `-x` only a line
+    // that is all pattern: both need a regex, literal patterns escaped. `-x`
+    // overrides `-w`, as in grep and rg.
+    let pattern = if patterns.len() > 1 || line_regexp {
+        let as_regex = |p: &String| {
+            if use_regex {
+                p.clone()
+            } else {
+                regex_syntax::escape(p)
+            }
+        };
+        let body = match patterns.as_slice() {
+            [one] => as_regex(one),
+            many => many
+                .iter()
+                .map(|p| format!("(?:{})", as_regex(p)))
+                .collect::<Vec<_>>()
+                .join("|"),
+        };
+        use_regex = true;
+        if line_regexp {
+            whole_word = false;
+            format!("^(?:{body})$")
+        } else {
+            body
+        }
+    } else {
+        patterns.pop().unwrap_or_default()
     };
     Some(SearchCommand {
         pattern,
@@ -406,6 +547,7 @@ pub fn parse_search_command(cmdline: &str) -> Option<SearchCommand> {
         types_not,
         inverted,
         recursive,
+        unseedable,
     })
 }
 
@@ -513,6 +655,9 @@ pub fn scope_filters(
 ) -> Result<(String, String), String> {
     if sc.inverted {
         return Err(String::from("the grep lists what does not match (-v / -L)"));
+    }
+    if let Some(why) = sc.unseedable {
+        return Err(why.to_string());
     }
     if !sc.recursive && sc.paths.is_empty() {
         return Err(String::from("the grep read stdin, not files (no -r)"));
@@ -913,6 +1058,80 @@ mod tests {
         assert!(parse("rg --files-without-match color").unwrap().inverted);
         assert!(!parse("rg -L color").unwrap().inverted);
         assert!(!parse("rg -l color").unwrap().inverted);
+    }
+
+    /// The three greps of #1201's follow-up: `-x` matches whole lines, every
+    /// `-e` is a pattern, and `-f` reads them from a file croft can't seed.
+    #[test]
+    fn line_regexp_and_several_patterns_seed_one_regex() {
+        let c = parse("grep -rnx timeout src").unwrap();
+        assert_eq!(c.pattern, "^(?:timeout)$");
+        assert!(c.use_regex);
+        assert_eq!(c.paths, ["src"]);
+        let c = parse("grep -rn -e connect_timeout -e retry_timeout src").unwrap();
+        assert_eq!(c.pattern, "(?:connect_timeout)|(?:retry_timeout)");
+        assert!(c.use_regex);
+        assert_eq!(c.paths, ["src"]);
+        // Literal patterns are escaped; `-x` overrides `-w`.
+        let c = parse("rg -xwF -e 'a.b' --regexp=c").unwrap();
+        assert_eq!(c.pattern, r"^(?:(?:a\.b)|(?:c))$");
+        assert!(!c.whole_word);
+        // One pattern with an uppercase letter keeps case for all of them.
+        assert!(parse("rg -S -e color -e Hue").unwrap().case_sensitive);
+        assert!(!parse("rg -S -e color -e hue").unwrap().case_sensitive);
+        // Negative: one pattern without -x is seeded as typed.
+        let c = parse("grep -rn -e 'a.b' src").unwrap();
+        assert_eq!(c.pattern, "a.b");
+        assert!(!c.use_regex);
+    }
+
+    /// Patterns read from a file, NUL-split input and git grep's pattern
+    /// algebra can't be one Search query, so they're refused with a reason.
+    #[test]
+    fn patterns_from_a_file_or_nul_split_input_are_unseedable() {
+        let c = parse("grep -rn -f words.txt src").unwrap();
+        assert!(c.unseedable.unwrap().contains("from a file"));
+        assert_eq!(c.paths, ["src"]);
+        for cmd in [
+            "rg --file=words.txt src",
+            "grep -rnz color src",
+            "rg --null-data color",
+            "git grep -e a --and -e b",
+        ] {
+            assert!(parse(cmd).unwrap().unseedable.is_some(), "{cmd}");
+        }
+        // Negative: ag's -f follows links and rg's -z reads compressed files.
+        let c = parse("ag -f color src").unwrap();
+        assert_eq!((c.pattern.as_str(), c.unseedable), ("color", None));
+        assert_eq!(parse("rg -z color").unwrap().unseedable, None);
+    }
+
+    /// The search read is the last one of a pipeline or list, redirections
+    /// dropped, and one fed by a pipe or a redirected file is refused.
+    #[test]
+    fn the_last_search_of_a_pipeline_or_list_is_read() {
+        for cmd in [
+            "grep -rn x src | head -5",
+            "clear; grep -rn x src",
+            "cd . && grep -rn x src 2>/dev/null >out.txt",
+            "grep -rn x src 2>&1 |& less",
+            "true || grep -rn x src &",
+        ] {
+            let c = parse(cmd).unwrap();
+            assert_eq!((c.pattern.as_str(), c.unseedable), ("x", None), "{cmd}");
+            assert_eq!(c.paths, ["src"], "{cmd}");
+        }
+        // Quoted or escaped operators are part of the pattern.
+        assert_eq!(parse("rg 'a|b; c>d' src").unwrap().pattern, "a|b; c>d");
+        assert_eq!(parse(r"grep -rE a\|b src").unwrap().pattern, "a|b");
+        // A search fed by a pipe reads it, not files; the last one wins.
+        assert!(parse("cat f | grep x").unwrap().unseedable.is_some());
+        assert!(parse("rg x src | rg y").unwrap().unseedable.is_some());
+        // So is one whose stdin is a redirected file, unless it names paths.
+        assert!(parse("rg timeout < one.txt").unwrap().unseedable.is_some());
+        assert!(parse("grep -rn x src <<< y").unwrap().unseedable.is_none());
+        assert!(parse("rg x src | grep -v y").unwrap().inverted);
+        assert!(parse("ls | wc -l").is_none());
     }
 
     #[test]
