@@ -1,2 +1,0 @@
-fix: Ctrl+S, auto save and Save All no longer write a tab with no file behind it (a past version, a Search Editor, a commit, Coverage Report, Git Output) as a junk file named after the tab: Ctrl+S says to use File: Save As… to keep a copy.
-fix: Closing an edited Search Editor or other such tab no longer offers to save it, and a crash or update relaunch no longer brings it back as a tab whose save writes that file.
