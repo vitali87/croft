@@ -39874,22 +39874,36 @@ impl App {
                 if dest.extension().is_none() {
                     dest.set_extension("code-workspace");
                 }
-                let new_folder = dest.parent().filter(|p| !p.exists()).map(Path::to_path_buf);
+                if !dest.exists() {
+                    self.save_workspace_file(&dest);
+                    return;
+                }
+                // The suggested path is where a team's committed file lives
+                // (#1012): changing its folder list waits for a yes, and
+                // one that already lists these folders is left alone.
                 let folders: Vec<PathBuf> = self.roots.iter().map(Path::to_path_buf).collect();
-                match crate::workspace::write_workspace_file(&dest, &folders) {
-                    Ok(()) => {
-                        self.status = format!(
-                            "Saved workspace ({} folder{}): {}{}",
-                            folders.len(),
-                            if folders.len() == 1 { "" } else { "s" },
-                            dest.display(),
-                            new_folder
-                                .map(|f| format!(" (created folder {})", f.display()))
-                                .unwrap_or_default()
-                        );
+                match crate::workspace::workspace_file_update(&dest, &folders) {
+                    Ok(Some(_)) => {
+                        let name = dest
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| dest.display().to_string());
+                        self.open_input_prompt(InputPrompt::confirm(
+                            InputPurpose::UpdateWorkspaceFile { dest },
+                            format!("Change the folders listed in '{name}'?"),
+                            "The rest of it stays · Enter or Y to save · Esc or N to cancel",
+                        ));
+                    }
+                    Ok(None) => {
+                        self.status =
+                            format!("Workspace file already up to date: {}", dest.display());
                     }
                     Err(e) => self.status = format!("Save workspace: {e}"),
                 }
+            }
+            InputPurpose::UpdateWorkspaceFile { dest } => {
+                self.close_input_prompt();
+                self.save_workspace_file(&dest);
             }
             InputPurpose::CloneUrl => {
                 self.close_input_prompt();
@@ -68382,6 +68396,27 @@ impl App {
                 self.change_workspace_root(primary);
             }
             Err(e) => self.status = format!("Workspace file: {e}"),
+        }
+    }
+
+    /// Save the folder set to the `.code-workspace` at `dest`: a new file,
+    /// or the `folders` of an existing one (#1012), and say where.
+    fn save_workspace_file(&mut self, dest: &Path) {
+        let new_folder = dest.parent().filter(|p| !p.exists()).map(Path::to_path_buf);
+        let folders: Vec<PathBuf> = self.roots.iter().map(Path::to_path_buf).collect();
+        match crate::workspace::write_workspace_file(dest, &folders) {
+            Ok(()) => {
+                self.status = format!(
+                    "Saved workspace ({} folder{}): {}{}",
+                    folders.len(),
+                    if folders.len() == 1 { "" } else { "s" },
+                    dest.display(),
+                    new_folder
+                        .map(|f| format!(" (created folder {})", f.display()))
+                        .unwrap_or_default()
+                );
+            }
+            Err(e) => self.status = format!("Save workspace: {e}"),
         }
     }
 

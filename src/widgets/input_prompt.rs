@@ -175,6 +175,12 @@ pub enum InputPurpose {
     /// Save the current folder set as a VS Code-compatible workspace
     /// file (#163): the typed value is the destination path.
     SaveWorkspaceAs,
+    /// Confirm changing the folder list of the workspace file that exists
+    /// at `dest` (#1012). Submitting (Enter) rewrites its `folders` and
+    /// nothing else; Esc leaves it. A Y/N confirm, with no value.
+    UpdateWorkspaceFile {
+        dest: PathBuf,
+    },
     CloneUrl,
     RenameBranch,
     CreateBranchFrom {
