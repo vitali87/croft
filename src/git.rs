@@ -2933,6 +2933,7 @@ pub fn stage_paths(root: &Path, rel_paths: &[String]) -> Result<(), String> {
     if rel_paths.is_empty() {
         return Ok(());
     }
+    refuse_conflict_markers(root, Some(rel_paths))?;
     let path_str = root
         .to_str()
         .ok_or_else(|| "non-utf8 workspace path".to_string())?;
@@ -3341,10 +3342,7 @@ pub fn refuse_unmerged(root: &Path) -> Result<(), String> {
     if paths.is_empty() {
         return Ok(());
     }
-    let mut named = paths.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
-    if paths.len() > 3 {
-        named.push_str(", …");
-    }
+    let named = first_paths(&paths);
     let (n, them) = match paths.len() {
         1 => (String::from("1 merge conflict"), "it"),
         n => (format!("{n} merge conflicts"), "them"),
@@ -3352,6 +3350,75 @@ pub fn refuse_unmerged(root: &Path) -> Result<(), String> {
     Err(format!(
         "Resolve {n} ({named}) and stage {them} before committing"
     ))
+}
+
+/// Up to three of `paths`, comma-separated, with `…` when there are more.
+fn first_paths(paths: &[String]) -> String {
+    let mut named = paths.iter().take(3).cloned().collect::<Vec<_>>().join(", ");
+    if paths.len() > 3 {
+        named.push_str(", …");
+    }
+    named
+}
+
+/// Refuse to stage a conflicted file that still holds its conflict markers
+/// (#989). `git add` is how git marks a conflict resolved, and it takes the
+/// file as it is, so Stage All, or staging the file itself, would record
+/// the `<<<<<<<` lines and the next commit would ship them. A conflicted
+/// file whose markers have been edited away stages as usual. `scope` holds
+/// the `root`-relative paths about to be staged; `None` means everything.
+/// The markers are found by [`leftover_conflict_markers`].
+fn refuse_conflict_markers(root: &Path, scope: Option<&[String]>) -> Result<(), String> {
+    let unmerged = unmerged_paths(root);
+    if unmerged.is_empty() {
+        return Ok(());
+    }
+    // `unmerged_paths` names paths from the top of the repository, which
+    // is not `root` when croft was opened on a subdirectory.
+    let Some(top) = repo_toplevel(root) else {
+        return Ok(());
+    };
+    let canon = |p: PathBuf| std::fs::canonicalize(&p).unwrap_or(p);
+    let scope: Option<Vec<PathBuf>> =
+        scope.map(|paths| paths.iter().map(|p| canon(root.join(p))).collect());
+    let marked: Vec<String> = unmerged
+        .into_iter()
+        .filter(|rel| {
+            let abs = canon(top.join(rel));
+            scope
+                .as_ref()
+                .is_none_or(|scope| scope.iter().any(|s| abs.starts_with(s)))
+                && leftover_conflict_markers(&top, rel)
+        })
+        .collect();
+    if marked.is_empty() {
+        return Ok(());
+    }
+    let (has, them) = if marked.len() == 1 {
+        ("has", "it")
+    } else {
+        ("have", "them")
+    };
+    Err(format!(
+        "{} still {has} conflict markers: resolve {them} before staging",
+        first_paths(&marked)
+    ))
+}
+
+/// Whether git's own `diff --check` finds conflict markers in the unmerged
+/// `rel` (a path from the top of the repository at `top`). Reading the
+/// file ourselves missed three cases git handles: a file in Latin-1 or
+/// Shift_JIS, markers of another length set by a `conflict-marker-size`
+/// attribute, and marker lines both sides already had, such as a doc
+/// showing what a conflict looks like, which would block staging forever.
+fn leftover_conflict_markers(top: &Path, rel: &str) -> bool {
+    Command::new("git")
+        .arg("-C")
+        .arg(top)
+        .args(["--literal-pathspecs", "diff", "--check", "--no-color", "--"])
+        .arg(rel)
+        .output()
+        .is_ok_and(|out| String::from_utf8_lossy(&out.stdout).contains("leftover conflict marker"))
 }
 
 /// Commit only what is already staged (`git commit -m`), leaving unstaged
@@ -3469,8 +3536,10 @@ pub fn head_is_on_upstream(root: &Path) -> bool {
 
 // --- Bulk staging --------------------------------------------------------
 
-/// Stage every change, tracked and untracked (`git add -A`).
+/// Stage every change, tracked and untracked (`git add -A`). Refused while
+/// a conflicted file still holds its markers.
 pub fn stage_all(root: &Path) -> Result<String, String> {
+    refuse_conflict_markers(root, None)?;
     run_mutation(root, &["add", "-A"])
 }
 
@@ -7793,6 +7862,115 @@ git checkout -q main && sed 's/python pricing.py/uv run pricing.py/' README.md >
         std::fs::create_dir(&sub).unwrap();
         assert_eq!(unmerged_paths(&sub), vec![String::from("README.md")]);
         assert!(refuse_unmerged(&sub).is_err());
+    }
+
+    #[test]
+    fn staging_a_conflict_that_still_has_its_markers_is_refused() {
+        // `git add` marks the conflict resolved with the markers in it, so
+        // Stage All, then Commit, recorded them.
+        let tmp = repo_in_a_conflicted_merge();
+        let p = tmp.path();
+        let err = stage_all(p).expect_err("Stage All must refuse");
+        assert_eq!(
+            err,
+            "README.md still has conflict markers: resolve it before staging"
+        );
+        let err = stage_path(p, "README.md").expect_err("staging the file must refuse");
+        assert!(
+            err.contains("README.md still has conflict markers"),
+            "{err}"
+        );
+        assert_eq!(unmerged_paths(p), vec![String::from("README.md")]);
+    }
+
+    #[test]
+    fn a_conflict_in_a_non_utf8_file_is_refused_too() {
+        // A Latin-1 file can't be read as UTF-8; its markers still count.
+        let tmp = repo_in_a_conflicted_merge();
+        let p = tmp.path();
+        std::fs::write(
+            p.join("README.md"),
+            b"# Caf\xe9\n<<<<<<< HEAD\nuv\n=======\npython -m\n>>>>>>> hotfix\n",
+        )
+        .unwrap();
+        assert!(stage_all(p).is_err());
+        assert_eq!(unmerged_paths(p), vec![String::from("README.md")]);
+    }
+
+    #[test]
+    fn markers_of_a_conflict_marker_size_attribute_are_refused_too() {
+        // git writes ten-character markers for this file, which a scan for
+        // seven-character ones read as resolved.
+        let tmp = repo_in_a_conflicted_merge();
+        let p = tmp.path();
+        std::fs::write(
+            p.join(".gitattributes"),
+            "README.md conflict-marker-size=10\n",
+        )
+        .unwrap();
+        run_mutation(p, &["checkout", "--conflict=merge", "--", "README.md"]).unwrap();
+        let text = std::fs::read_to_string(p.join("README.md")).unwrap();
+        assert!(text.contains("<<<<<<<<<< ours"), "{text}");
+        assert!(stage_path(p, "README.md").is_err());
+    }
+
+    #[test]
+    fn a_resolved_file_that_shows_a_marker_example_both_sides_had_stages() {
+        // Negative: a doc that shows what a conflict looks like keeps that
+        // block after its real conflict is resolved; it must not block
+        // staging forever.
+        let tmp = TempDir::new().unwrap();
+        let script = r#"set -e
+git init -q -b main && git config user.email a@b && git config user.name a
+printf 'Example:\n<<<<<<< HEAD\nmine\n=======\nyours\n>>>>>>> br\n\nRun `python pricing.py`.\n' > GUIDE.md && git add . && git commit -qm init
+git checkout -qb hotfix && sed 's/python pricing.py/python -m pricing/' GUIDE.md > g.tmp && mv g.tmp GUIDE.md && git commit -qam fix
+git checkout -q main && sed 's/python pricing.py/uv run pricing.py/' GUIDE.md > g.tmp && mv g.tmp GUIDE.md && git commit -qam uv
+! git merge -q hotfix >/dev/null 2>&1
+sed -n '1,7p' GUIDE.md > g.tmp && echo 'Run `uv run -m pricing`.' >> g.tmp && mv g.tmp GUIDE.md"#;
+        let out = Command::new("sh")
+            .args(["-c", script])
+            .current_dir(tmp.path())
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let p = tmp.path();
+        assert_eq!(unmerged_paths(p), vec![String::from("GUIDE.md")]);
+        stage_all(p).expect("the example both sides had is not a conflict");
+        assert!(unmerged_paths(p).is_empty());
+    }
+
+    #[test]
+    fn a_conflict_resolved_in_the_file_stages_as_before() {
+        // Negative: once the markers are edited away, staging is how the
+        // conflict is marked resolved.
+        let tmp = repo_in_a_conflicted_merge();
+        let p = tmp.path();
+        std::fs::write(
+            p.join("README.md"),
+            "# Orders\n\nRun `uv run -m pricing`.\n",
+        )
+        .unwrap();
+        stage_all(p).expect("a resolved conflict stages");
+        assert!(unmerged_paths(p).is_empty());
+    }
+
+    #[test]
+    fn staging_from_a_subdirectory_checks_only_what_it_stages() {
+        // The conflict sits above the subdirectory root: Stage All covers
+        // the whole repository and refuses, staging a file beside it does
+        // not reach the conflict and goes ahead.
+        let tmp = repo_in_a_conflicted_merge();
+        let p = tmp.path();
+        let sub = p.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("notes.txt"), "todo\n").unwrap();
+        assert!(stage_all(&sub).is_err());
+        stage_path(&sub, "notes.txt").expect("an unrelated file stages");
+        assert_eq!(unmerged_paths(p), vec![String::from("README.md")]);
     }
 
     #[test]
