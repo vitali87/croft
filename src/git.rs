@@ -3375,12 +3375,15 @@ fn has_staged_changes(root: &Path) -> Result<bool, String> {
         // would see only what is staged under it, and a commit takes it all.
         // `--ignore-submodules=none`: `diff.ignoreSubmodules` hides a staged
         // submodule update from diff, but `git commit` still records it.
+        // `--no-ext-diff`: an external diff helper whose exit code is trusted
+        // (`diff.trustExitCode`, git 2.46+) could call a staged change equal.
         .args([
             "diff",
             "--cached",
             "--quiet",
             "--no-relative",
             "--ignore-submodules=none",
+            "--no-ext-diff",
         ])
         .output()
         .map_err(|e| format!("failed to spawn git: {e}"))?;
@@ -7665,6 +7668,22 @@ filename seed.txt
         );
         assert_eq!(has_staged_changes(p), Ok(true));
         commit(p, "bump lib").expect("commit");
+        assert_eq!(git_in(p, &["show", "HEAD:wip.txt"]), "draft");
+    }
+
+    #[test]
+    fn a_staged_change_counts_despite_a_trusted_external_diff() {
+        // From git 2.46 a `diff.external` whose exit code is trusted decides
+        // what `--quiet` reports; one answering "equal" hid the staged edit,
+        // so the commit took `-a` and swept the unstaged one in with it.
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        repo_with_two_edits(p);
+        stage(p, "seed.txt");
+        git_in(p, &["config", "diff.external", "true"]);
+        git_in(p, &["config", "diff.trustExitCode", "true"]);
+        assert_eq!(has_staged_changes(p), Ok(true));
+        commit(p, "ready part").expect("commit");
         assert_eq!(git_in(p, &["show", "HEAD:wip.txt"]), "draft");
     }
 
