@@ -1072,6 +1072,10 @@ Loopback-port detection behind the PORTS panel. A stateful output-stream scraper
 
 **Probes own no tty.** Every `ps`/`lsof`/`ss` the poll spawns goes through `probe`, which `setsid`s the child. The kernel prints a hung-NFS notice ("nfs server X: not responding") on the controlling tty of the process waiting on the mount, and a probe that inherited croft's tty put that text on top of the UI every few seconds. `lsof` also runs with `-b -w`, which skips the `stat` of every mounted file system that stalls on an unreachable server.
 
+**Probes run at a 1024 open-file limit.** lsof before 4.95 (Ubuntu 20.04 and 22.04 ship 4.93.2) closes every descriptor up to its soft limit at startup, and a probe inherits croft's. Under a raised limit of 1,048,576 each run made a million `close` calls, about 0.15 s of CPU, with two runs every poll. `probe` lowers the soft limit in the child only, so croft keeps its own.
+
+**lsof's silent exit 1 means no listeners.** lsof exits 1 and prints nothing on either stream when nothing matched, which is the idle state of a shell running no server. The scoped scan takes that as an empty answer and asks `ss` only when lsof could not be spawned, was killed, or printed an error. Read as a failure, it ran `ss` on nearly every poll. `poll_all_listening` keeps its fallback on that exit: run as a normal user, lsof sees only that user's sockets, and `ss -tlnH` is the evidence for a root-owned listener such as a container's published port.
+
 ### ports.rs
 
 The panel group's PORTS tab: a registry of detected loopback ports (port, address, process, origin) fed by `port_detect.rs`, with an orange `⇄ host` marker for a forwarded remote port. It is a pure widget handling selection and click hit-testing; the App runs the open, forward, copy and stop actions.

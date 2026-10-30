@@ -360,6 +360,12 @@ fn scan_with_pos(text: &str) -> Vec<(usize, usize, PortHit)> {
 /// listener row needs none of them. `-w` drops the warnings `-b` then prints.
 const LSOF_LISTEN_ARGS: &[&str] = &["-b", "-w", "-nP", "-iTCP", "-sTCP:LISTEN"];
 
+/// The open-file soft limit a probe runs under. lsof before 4.95 closes every
+/// descriptor up to its soft limit at startup, and a probe inherits croft's:
+/// under a raised limit of 1,048,576 that is a million `close` calls, about
+/// 0.15 s of CPU per run, two runs every poll. A scan holds a handful of files.
+const PROBE_NOFILE: libc::rlim_t = 1024;
+
 /// A socket-poll helper command, detached into its own session. The poll runs
 /// every few seconds, and the kernel prints a hung-NFS notice ("nfs server
 /// X: not responding") on the controlling tty of the process waiting on the
@@ -369,17 +375,31 @@ const LSOF_LISTEN_ARGS: &[&str] = &["-b", "-w", "-nP", "-iTCP", "-sTCP:LISTEN"];
 /// The null stdin only states intent (`.output()` already gives one); the
 /// session is the fix. A pre-exec hook takes std off `posix_spawn` and onto a
 /// full `fork`, a cost paid per probe on the poll thread, never the UI thread.
+/// The same hook lowers the child's soft open-file limit to [`PROBE_NOFILE`],
+/// leaving croft's own alone.
 fn probe(program: &str) -> Command {
     let mut cmd = Command::new(program);
     cmd.stdin(std::process::Stdio::null());
-    // SAFETY: `setsid` is async-signal-safe and the only call in the
-    // pre-exec hook. The forked child is never a process-group leader, so
-    // it cannot fail today; if it ever does, the spawn fails rather than
-    // silently keeping the tty.
+    // SAFETY: `setsid` is async-signal-safe, and `getrlimit`/`setrlimit` are
+    // bare system calls that take no lock and allocate nothing; they are the
+    // only calls in the pre-exec hook. The forked child is never a
+    // process-group leader, so `setsid` cannot fail today; if it ever does,
+    // the spawn fails rather than silently keeping the tty. Lowering a soft
+    // limit cannot fail, and a probe still works at the inherited one.
     unsafe {
         std::os::unix::process::CommandExt::pre_exec(&mut cmd, || {
             if libc::setsid() == -1 {
                 return Err(std::io::Error::last_os_error());
+            }
+            let mut limit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) == 0
+                && limit.rlim_cur > PROBE_NOFILE
+            {
+                limit.rlim_cur = PROBE_NOFILE;
+                libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
             }
             Ok(())
         });
@@ -478,10 +498,21 @@ fn poll_via_lsof(pids: &HashSet<i32>) -> Option<Vec<PortHit>> {
         .args(["-a", "-p", &pid_arg])
         .output()
         .ok()?;
-    if !out.status.success() && out.stdout.is_empty() {
+    Some(parse_lsof(&lsof_rows(&out)?))
+}
+
+/// The rows a scoped lsof scan printed, or `None` when it could not answer
+/// (killed, or it printed an error) and `ss` should be asked instead. lsof
+/// exits 1 and prints nothing on either stream when nothing matched, the
+/// normal state of a shell running no server: that is an answer, no
+/// listeners, and reading it as a failure ran `ss` on nearly every poll.
+fn lsof_rows(out: &std::process::Output) -> Option<String> {
+    let nothing_matched =
+        out.status.code() == Some(1) && out.stdout.is_empty() && out.stderr.is_empty();
+    if !out.status.success() && out.stdout.is_empty() && !nothing_matched {
         return None;
     }
-    Some(parse_lsof(&String::from_utf8_lossy(&out.stdout)))
+    Some(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// Parse `lsof` rows from a [`LSOF_LISTEN_ARGS`] scan. Field 0 is the
@@ -596,6 +627,21 @@ mod tests {
         assert_ne!(sid, ours, "the probe shares croft's session");
     }
 
+    /// lsof before 4.95 closes every descriptor up to its soft limit at
+    /// startup, so a probe runs at a small one whatever croft's own is.
+    #[test]
+    fn a_socket_probe_runs_at_a_small_open_file_limit() {
+        let out = probe("sh").args(["-c", "ulimit -Sn"]).output().unwrap();
+        let soft: libc::rlim_t = String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse()
+            .expect("a finite soft limit");
+        assert!(
+            soft <= PROBE_NOFILE,
+            "the probe kept a soft limit of {soft}"
+        );
+    }
+
     /// The scoped `-b -w` scan still finds a listener: bind one and look
     /// for it through the real call site. Skipped where lsof is not
     /// installed.
@@ -611,6 +657,38 @@ mod tests {
             hits.iter().any(|h| h.port == port),
             "port {port} missing from {hits:?}"
         );
+    }
+
+    /// A subtree with no listener, the normal state of a shell running no
+    /// server, makes lsof exit 1 with no output. That is an answer, not a
+    /// missing lsof: reading it as one ran `ss` on nearly every poll.
+    /// Skipped where lsof is not installed.
+    #[test]
+    fn an_idle_subtree_has_no_listeners_rather_than_no_lsof() {
+        if probe("lsof").arg("-v").output().is_err() {
+            return;
+        }
+        let mut idle = probe("sleep").arg("5").spawn().unwrap();
+        let hits = poll_via_lsof(&HashSet::from([idle.id() as i32]));
+        let _ = idle.kill();
+        let _ = idle.wait();
+        assert_eq!(hits, Some(Vec::new()));
+    }
+
+    /// A non-zero exit that is not lsof's silent "nothing matched" is still
+    /// a failed scan, so `ss` gets its turn.
+    #[test]
+    fn an_lsof_error_or_kill_is_not_an_answer() {
+        use std::os::unix::process::ExitStatusExt;
+        let run = |raw: i32, stderr: &str| std::process::Output {
+            status: std::process::ExitStatus::from_raw(raw),
+            stdout: Vec::new(),
+            stderr: stderr.as_bytes().to_vec(),
+        };
+        assert_eq!(lsof_rows(&run(1 << 8, "")).as_deref(), Some(""));
+        assert_eq!(lsof_rows(&run(1 << 8, "lsof: unsupported option\n")), None);
+        assert_eq!(lsof_rows(&run(libc::SIGKILL, "")), None);
+        assert_eq!(lsof_rows(&run(2 << 8, "")), None);
     }
 
     /// Every poll helper is spawned through `probe`, so none can bring the
