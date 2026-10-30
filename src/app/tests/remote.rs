@@ -597,6 +597,44 @@ fn clicking_the_port_toast_dismiss_button_clears_it() {
     );
 }
 
+/// The port toast's clicks are taken before a menu's or a prompt's, so a
+/// button that some later overlay painted over must stop answering: the
+/// click is on what covers it.
+#[test]
+fn a_menu_over_the_port_toast_takes_the_clicks_on_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.show_port_toast(3000, Some("node".into()));
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 50)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let dismiss = |app: &App| {
+        app.port_toast
+            .as_ref()
+            .unwrap()
+            .buttons
+            .iter()
+            .find(|(_, a)| matches!(a, super::PortToastAction::Dismiss))
+            .map(|(r, _)| *r)
+    };
+    let at = dismiss(&app).expect("Dismiss, while nothing covers it");
+    let painted = term.backend().buffer()[(at.x + 1, at.y)].clone();
+
+    app.open_status_indent_menu(at.x.saturating_sub(20), at.y - 1);
+    term.draw(|f| app.render(f)).unwrap();
+    assert_ne!(
+        term.backend().buffer()[(at.x + 1, at.y)],
+        painted,
+        "the menu covers Dismiss"
+    );
+    assert_eq!(dismiss(&app), None, "a covered button is no target");
+    left_click(&mut app, at.x + 1, at.y);
+    assert!(app.port_toast.is_some(), "the click was the menu's");
+
+    app.context_menu = None;
+    term.draw(|f| app.render(f)).unwrap();
+    assert_eq!(dismiss(&app), Some(at), "uncovered, it answers again");
+}
+
 #[test]
 fn relay_request_ids_are_unique_per_request() {
     // `Instant::now().elapsed()` measures the gap between an instant and

@@ -1066,6 +1066,9 @@ struct PortToast {
     shown_at: std::time::Instant,
     /// Action button hit rects, recomputed each render.
     buttons: Vec<(Rect, PortToastAction)>,
+    /// What the toast painted in each of `buttons`, to tell whether a later
+    /// overlay covered it before the frame went out.
+    painted: Vec<Vec<ratatui::buffer::Cell>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -23675,7 +23678,7 @@ impl App {
         // every other overlay until the user dismisses it.
         self.render_approval_popup(frame);
         self.render_terminal_warning(frame);
-        self.drop_covered_update_controls(frame.buffer_mut());
+        self.drop_covered_toast_controls(frame.buffer_mut());
 
         // Chrome button-hint tooltip. Rendered at the top level against the
         // whole frame (not the editor's `focused_area`) because the controls it
@@ -25078,8 +25081,10 @@ impl App {
             ));
             bx += w + 1;
         }
+        let painted = rects.iter().map(|(r, _)| cells_in(buf, *r)).collect();
         if let Some(t) = self.port_toast.as_mut() {
             t.buttons = rects;
+            t.painted = painted;
         }
     }
 
@@ -25136,22 +25141,26 @@ impl App {
         }
     }
 
-    /// Drop the update card's controls that a later overlay painted over: a
-    /// context menu, a prompt, a confirm or a picker. The card's clicks are
-    /// taken before theirs, so a covered button would answer a click on what
-    /// covers it; what is still on screen is what can be clicked.
-    fn drop_covered_update_controls(&mut self, buf: &ratatui::buffer::Buffer) {
-        let Some(t) = self.update_toast.as_mut() else {
-            return;
-        };
-        let painted = std::mem::take(&mut t.painted);
-        let buttons = std::mem::take(&mut t.buttons);
-        t.buttons = buttons
-            .into_iter()
-            .zip(painted)
-            .filter(|((r, _), cells)| cells_in(buf, *r) == *cells)
-            .map(|(hit, _)| hit)
-            .collect();
+    /// Drop the corner toasts' controls that a later overlay painted over: a
+    /// context menu, a prompt, a confirm, a picker, or the update card over
+    /// the port toast. The toasts' clicks are taken before every overlay's,
+    /// so a covered button would answer a click on what covers it; what is
+    /// still on screen is what can be clicked.
+    fn drop_covered_toast_controls(&mut self, buf: &ratatui::buffer::Buffer) {
+        if let Some(t) = self.port_toast.as_mut() {
+            t.buttons = uncovered(
+                std::mem::take(&mut t.buttons),
+                std::mem::take(&mut t.painted),
+                buf,
+            );
+        }
+        if let Some(t) = self.update_toast.as_mut() {
+            t.buttons = uncovered(
+                std::mem::take(&mut t.buttons),
+                std::mem::take(&mut t.painted),
+                buf,
+            );
+        }
     }
 
     /// What the update card says for `toast`: its state's glyph and title,
@@ -53604,6 +53613,7 @@ impl App {
             origin_remote: self.is_remote,
             shown_at: std::time::Instant::now(),
             buttons: Vec::new(),
+            painted: Vec::new(),
         });
     }
 
@@ -78346,6 +78356,20 @@ fn cwd_matches(cwd: Option<&Path>, root: &Path, observable: bool) -> bool {
 fn cells_in(buf: &ratatui::buffer::Buffer, r: Rect) -> Vec<ratatui::buffer::Cell> {
     let r = r.intersection(buf.area);
     r.positions().map(|p| buf[p].clone()).collect()
+}
+
+/// The controls in `hits` whose cells in `buf` are still the `painted` ones
+/// their owner drew: those nothing painted over since.
+fn uncovered<A>(
+    hits: Vec<(Rect, A)>,
+    painted: Vec<Vec<ratatui::buffer::Cell>>,
+    buf: &ratatui::buffer::Buffer,
+) -> Vec<(Rect, A)> {
+    hits.into_iter()
+        .zip(painted)
+        .filter(|((r, _), cells)| cells_in(buf, *r) == *cells)
+        .map(|(hit, _)| hit)
+        .collect()
 }
 
 fn copy_to_clipboard(text: &str) -> bool {
