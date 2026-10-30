@@ -336,6 +336,15 @@ struct PendingSelectionRanges {
     positions: Vec<(u32, u32)>,
 }
 
+/// An inline suggestion a language server supplied (LSP 3.18): where it was
+/// painted, as `(edit seq, row, col)` in `path`, and the command it asks to
+/// run once taken whole. Its text is the server's, not the navigator's.
+struct ServerGhost {
+    path: PathBuf,
+    at: (u64, usize, usize),
+    command: Option<(String, Vec<serde_json::Value>)>,
+}
+
 /// Pre-Zen visibility snapshot, restored verbatim when Zen Mode is toggled
 /// off so the workspace returns to exactly the chrome it had before.
 #[derive(Clone, Copy, Debug)]
@@ -4733,6 +4742,11 @@ pub struct App {
     inline_job: Option<(u64, PathBuf, u64, usize, usize)>,
     inline_asked: Option<(PathBuf, u64, usize, usize)>,
     inline_next_id: u64,
+    /// A language server's inline completion (LSP 3.18) in flight, keyed
+    /// like `inline_job` by the LSP request id.
+    inline_server_job: Option<(u64, PathBuf, u64, usize, usize)>,
+    /// The live ghost, when a language server supplied it.
+    inline_server_ghost: Option<ServerGhost>,
     /// Where recorded shortcuts are written: the user's keybindings.json,
     /// or under test a scratch file, so a test run never edits the real one.
     keybindings_file: PathBuf,
@@ -7076,6 +7090,8 @@ impl App {
             inline_job: None,
             inline_asked: None,
             inline_next_id: 0,
+            inline_server_job: None,
+            inline_server_ghost: None,
             keybindings_file: if cfg!(test) {
                 std::env::temp_dir().join(format!(
                     "croft-test-keybindings-{}-{}.json",
@@ -65242,13 +65258,14 @@ impl App {
     }
 
     /// Ask for a suggestion once typing has paused with the caret at the end
-    /// of a non-blank line, and land answers that still apply (#607).
+    /// of a non-blank line, and land answers that still apply (#607): from
+    /// the file's language server when one answers inline completions (LSP
+    /// 3.18), otherwise from the model while suggestions are on.
     pub fn tick_inline_complete(&mut self) -> bool {
-        if !self.inline_enabled {
-            return false;
-        }
-        let mut changed = false;
-        if let Some(worker) = &self.inline_worker {
+        let mut changed = self.drain_server_inline_completion();
+        if self.inline_enabled
+            && let Some(worker) = &self.inline_worker
+        {
             while let Some(done) = worker.try_recv() {
                 let Some((id, path, seq, row, col)) = self.inline_job.clone() else {
                     continue;
@@ -65296,10 +65313,10 @@ impl App {
                 .inline_asked
                 .as_ref()
                 .is_some_and(|a| a.0 == path && (a.1, a.2, a.3) == (seq, row, col))
-            || self
-                .inline_job
-                .as_ref()
-                .is_some_and(|j| j.1 == path && (j.2, j.3, j.4) == (seq, row, col));
+            || [&self.inline_job, &self.inline_server_job]
+                .into_iter()
+                .flatten()
+                .any(|j| j.1 == path && (j.2, j.3, j.4) == (seq, row, col));
         if self.focus != Pane::Editor
             || !at_line_end
             || !settled
@@ -65308,6 +65325,18 @@ impl App {
             || ed.has_non_text_view()
             || self.completion_popup.is_some()
         {
+            return changed;
+        }
+        if let Some(lsp) = self.lsp.as_mut()
+            && lsp.inline_completion_supported(&path)
+        {
+            let (line, character) = ed.pos_to_utf16(row, col);
+            let id = lsp.request_inline_completion(path.clone(), line, character);
+            self.inline_asked = Some((path.clone(), seq, row, col));
+            self.inline_server_job = Some((id, path, seq, row, col));
+            return changed;
+        }
+        if !self.inline_enabled {
             return changed;
         }
         let (Some(worker), Some(config)) = (&self.inline_worker, &self.inline_config) else {
@@ -65325,9 +65354,66 @@ impl App {
         changed
     }
 
+    /// Land a language server's inline completion (LSP 3.18) as the ghost
+    /// while the file, the buffer and the caret are those it answered for:
+    /// the first item that reads as text after the caret.
+    fn drain_server_inline_completion(&mut self) -> bool {
+        let Some(lsp) = self.lsp.as_ref() else {
+            return false;
+        };
+        let mut changed = false;
+        while let Some(result) = lsp.drain_inline_completion() {
+            let Some((id, path, seq, row, col)) = self.inline_server_job.clone() else {
+                continue;
+            };
+            if result.request_id != id {
+                continue;
+            }
+            self.inline_server_job = None;
+            let ed = &*self.editor;
+            let still = ed.path.as_ref() == Some(&path)
+                && ed.edit_seq == seq
+                && ed.cursor_row == row
+                && ed.cursor_col == col;
+            let Some(line) = ed.lines.get(row).filter(|_| still) else {
+                continue;
+            };
+            let char_col = |c| crate::widgets::editor::utf16_to_char_col(line, c);
+            let found = result.items.into_iter().find_map(|item| {
+                let range = match item.range {
+                    None => None,
+                    Some((sl, sc, el, ec)) if sl as usize == row && el as usize == row => {
+                        Some((char_col(sc), char_col(ec)))
+                    }
+                    Some(_) => return None,
+                };
+                let text = crate::inline_complete::server_ghost(
+                    line,
+                    col,
+                    range,
+                    &item.insert_text,
+                    item.filter_text.as_deref(),
+                )?;
+                Some((text, item.command))
+            });
+            if let Some((text, command)) = found {
+                self.editor.ghost = Some((row, col, seq, text));
+                self.inline_server_ghost = Some(ServerGhost {
+                    path,
+                    at: (seq, row, col),
+                    command,
+                });
+                changed = true;
+            }
+        }
+        changed
+    }
+
     /// Tab takes a live suggestion (#607), recorded as the navigator's
-    /// writing; Esc drops it. Ctrl+Right takes its next word and Ctrl+Down
-    /// its next line (#1625), leaving the rest live at the new caret.
+    /// writing, or as generated text when a language server supplied it;
+    /// Esc drops it. Ctrl+Right takes its next word and Ctrl+Down its next
+    /// line (#1625), leaving the rest live at the new caret. A server's
+    /// item taken whole runs the command it carries.
     /// Returns whether the key was used.
     fn inline_suggestion_key(&mut self, key: KeyEvent) -> bool {
         if self.completion_popup.is_some() || self.editor.snippet_active() {
@@ -65342,13 +65428,28 @@ impl App {
             (KeyCode::Down, KeyModifiers::CONTROL) => crate::inline_complete::next_line_len(&text),
             (KeyCode::Esc, KeyModifiers::NONE) => {
                 self.editor.ghost = None;
+                self.inline_server_ghost = None;
                 return true;
             }
             _ => return false,
         };
+        let here = (
+            self.editor.edit_seq,
+            self.editor.cursor_row,
+            self.editor.cursor_col,
+        );
+        let server = self
+            .inline_server_ghost
+            .take()
+            .filter(|g| self.editor.path.as_ref() == Some(&g.path) && g.at == here);
+        let seat = if server.is_some() {
+            crate::provenance::Seat::Generated
+        } else {
+            crate::provenance::Seat::Navigator
+        };
+        let command = server.and_then(|g| g.command);
         self.editor.ghost = None;
-        self.editor
-            .insert_str_as(&text[..take], crate::provenance::Seat::Navigator);
+        self.editor.insert_str_as(&text[..take], seat.clone());
         let rest = &text[take..];
         // The remainder stays live where the caret now is; its position
         // also counts as asked, so the next tick does not replace it.
@@ -65362,8 +65463,20 @@ impl App {
             // Recorded as asked too: once the ghost is Esc'd the tick
             // would otherwise send a fresh (paid) request at this caret.
             if let Some(path) = self.editor.path.clone() {
-                self.inline_asked = Some((path, at.2, at.0, at.1));
+                self.inline_asked = Some((path.clone(), at.2, at.0, at.1));
+                if seat == crate::provenance::Seat::Generated {
+                    self.inline_server_ghost = Some(ServerGhost {
+                        path,
+                        at: (at.2, at.0, at.1),
+                        command,
+                    });
+                }
             }
+        } else if let Some((command, arguments)) = command
+            && let Some(path) = self.editor.path.clone()
+            && let Some(lsp) = self.lsp.as_mut()
+        {
+            lsp.execute_inline_completion_command(path, command, arguments);
         }
         true
     }

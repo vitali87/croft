@@ -119,6 +119,26 @@ pub struct SignatureHelpResult {
     pub active_signature: usize,
 }
 
+/// One inline completion (LSP 3.18 `textDocument/inlineCompletion`),
+/// normalised off the wire: `insert_text` is plain text (a snippet's tab
+/// stops resolved to their placeholders), `range` the UTF-16 span it
+/// replaces as `(start line, start char, end line, end char)`, `None` for
+/// the caret alone. `command` is what the server asks to run once the
+/// item is taken, kept only when the server runs it itself.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InlineSuggestion {
+    pub insert_text: String,
+    pub filter_text: Option<String>,
+    pub range: Option<(u32, u32, u32, u32)>,
+    pub command: Option<(String, Vec<serde_json::Value>)>,
+}
+
+#[derive(Debug)]
+pub struct InlineCompletionResult {
+    pub request_id: u64,
+    pub items: Vec<InlineSuggestion>,
+}
+
 #[derive(Debug)]
 pub struct DefinitionResult {
     pub request_id: u64,
@@ -942,6 +962,12 @@ enum Cmd {
         line: u32,
         character: u32,
     },
+    RequestInlineCompletion {
+        request_id: u64,
+        path: PathBuf,
+        line: u32,
+        character: u32,
+    },
     RequestHover {
         request_id: u64,
         path: PathBuf,
@@ -1090,6 +1116,8 @@ enum Cmd {
         path: PathBuf,
         command: String,
         arguments: Vec<serde_json::Value>,
+        /// Which of the file's servers runs it: the first this accepts.
+        on: fn(&ManagedClient) -> bool,
     },
 }
 
@@ -1117,6 +1145,9 @@ struct LangCapabilitySupport {
     /// (#929), by (language, project root) as `request_completion` picks it;
     /// no entry while none of that instance's running servers completes.
     completion_triggers: HashMap<ClientKey, String>,
+    /// The server instances, by (language, project root), at least one of
+    /// whose running servers answers `textDocument/inlineCompletion`.
+    inline_completion: std::collections::HashSet<ClientKey>,
     /// The project root each open document's servers run at (#929), so a
     /// file's typed triggers are those of the server that answers it.
     document_roots: HashMap<PathBuf, PathBuf>,
@@ -1160,6 +1191,11 @@ pub struct LspManager {
     cmd_tx: tokio_mpsc::UnboundedSender<Cmd>,
     completion_rx: std_mpsc::Receiver<CompletionResult>,
     signature_help_rx: std_mpsc::Receiver<SignatureHelpResult>,
+    inline_completion_rx: std_mpsc::Receiver<InlineCompletionResult>,
+    /// Test hook: a sender into `inline_completion_rx`, so app tests can
+    /// answer an inlineCompletion request without a server.
+    #[cfg(test)]
+    inline_completion_test_tx: std_mpsc::Sender<InlineCompletionResult>,
     hover_rx: std_mpsc::Receiver<HoverResult>,
     rust_analyzer_rx: std_mpsc::Receiver<RustAnalyzerResult>,
     def_rx: std_mpsc::Receiver<DefinitionResult>,
@@ -1266,6 +1302,9 @@ impl LspManager {
         let (cmd_tx, cmd_rx) = tokio_mpsc::unbounded_channel();
         let (completion_tx, completion_rx) = std_mpsc::channel();
         let (signature_help_tx, signature_help_rx) = std_mpsc::channel();
+        let (inline_completion_tx, inline_completion_rx) = std_mpsc::channel();
+        #[cfg(test)]
+        let inline_completion_test_tx = inline_completion_tx.clone();
         let (hover_tx, hover_rx) = std_mpsc::channel();
         let (rust_analyzer_tx, rust_analyzer_rx) = std_mpsc::channel();
         let (def_tx, def_rx) = std_mpsc::channel();
@@ -1332,6 +1371,7 @@ impl LspManager {
             ResultSenders {
                 completion: completion_tx,
                 signature_help: signature_help_tx,
+                inline_completion: inline_completion_tx,
                 hover: hover_tx,
                 rust_analyzer: rust_analyzer_tx,
                 definition: def_tx,
@@ -1373,6 +1413,9 @@ impl LspManager {
             cmd_tx,
             completion_rx,
             signature_help_rx,
+            inline_completion_rx,
+            #[cfg(test)]
+            inline_completion_test_tx,
             hover_rx,
             rust_analyzer_rx,
             def_rx,
@@ -1573,6 +1616,77 @@ impl LspManager {
 
     pub fn drain_signature_help(&self) -> Option<SignatureHelpResult> {
         self.signature_help_rx.try_recv().ok()
+    }
+
+    /// Ask the file's servers for an inline completion at the caret (LSP
+    /// 3.18). The reply comes through [`Self::drain_inline_completion`]
+    /// with this id.
+    pub fn request_inline_completion(&mut self, path: PathBuf, line: u32, character: u32) -> u64 {
+        self.send_request(|request_id| Cmd::RequestInlineCompletion {
+            request_id,
+            path,
+            line,
+            character,
+        })
+    }
+
+    pub fn drain_inline_completion(&self) -> Option<InlineCompletionResult> {
+        self.inline_completion_rx.try_recv().ok()
+    }
+
+    /// Test hook: deliver `result` as if a server had answered.
+    #[cfg(test)]
+    pub fn inject_inline_completion_for_test(&self, result: InlineCompletionResult) {
+        let _ = self.inline_completion_test_tx.send(result);
+    }
+
+    /// Whether a running server for `path` answers inline completions: the
+    /// server instance at the file's project root, as `completion_triggers`
+    /// reads it. `false` until the file is open on one.
+    pub fn inline_completion_supported(&self, path: &Path) -> bool {
+        let Some(lang) = path_to_language(path) else {
+            return false;
+        };
+        let Ok(support) = self.capability_support.lock() else {
+            return false;
+        };
+        support
+            .document_roots
+            .get(path)
+            .is_some_and(|root| support.inline_completion.contains(&(lang, root.clone())))
+    }
+
+    /// Test hook: `path` is open at its directory on a server that answers
+    /// inline completions, unstarted.
+    #[cfg(test)]
+    pub fn set_inline_completion_for_test(&self, path: &Path) {
+        let Some(lang) = path_to_language(path) else {
+            return;
+        };
+        let root = path.parent().unwrap_or(path).to_path_buf();
+        if let Ok(mut support) = self.capability_support.lock() {
+            support
+                .document_roots
+                .insert(path.to_path_buf(), root.clone());
+            support.inline_completion.insert((lang, root));
+        }
+    }
+
+    /// Run the command an accepted inline completion carries, on the
+    /// file's first server that answers them: the one that sent it, unless
+    /// more than one server offers inline completions for the file.
+    pub fn execute_inline_completion_command(
+        &mut self,
+        path: PathBuf,
+        command: String,
+        arguments: Vec<serde_json::Value>,
+    ) {
+        let _ = self.cmd_tx.send(Cmd::ExecuteCommand {
+            path,
+            command,
+            arguments,
+            on: |c| c.supports_inline_completion,
+        });
     }
 
     pub fn request_hover(&mut self, path: PathBuf, line: u32, character: u32) -> u64 {
@@ -2372,6 +2486,7 @@ impl LspManager {
             path,
             command,
             arguments,
+            on: |c| c.supports_code_action,
         });
     }
 
@@ -2405,6 +2520,8 @@ struct ManagedClient {
     /// Its completion `triggerCharacters` (#929), as one string.
     completion_triggers: String,
     supports_signature_help: bool,
+    /// `inlineCompletionProvider` (LSP 3.18): ghost text at the caret.
+    supports_inline_completion: bool,
     /// Whether the server answers `workspace/diagnostic` (#533), read from
     /// the capability's inner `workspaceDiagnostics` flag rather than the
     /// outer `Option` - see `workspace_diagnostics_supported`.
@@ -2609,6 +2726,7 @@ struct DocState {
 struct ResultSenders {
     completion: std_mpsc::Sender<CompletionResult>,
     signature_help: std_mpsc::Sender<SignatureHelpResult>,
+    inline_completion: std_mpsc::Sender<InlineCompletionResult>,
     hover: std_mpsc::Sender<HoverResult>,
     rust_analyzer: std_mpsc::Sender<RustAnalyzerResult>,
     definition: std_mpsc::Sender<DefinitionResult>,
@@ -2839,6 +2957,21 @@ async fn worker_loop(
             } => {
                 state
                     .request_signature_help(request_id, path, line, character, &tx.signature_help)
+                    .await
+            }
+            Cmd::RequestInlineCompletion {
+                request_id,
+                path,
+                line,
+                character,
+            } => {
+                state
+                    .request_inline_completion(
+                        request_id,
+                        path,
+                        (line, character),
+                        &tx.inline_completion,
+                    )
                     .await
             }
             Cmd::RequestHover {
@@ -3114,7 +3247,8 @@ async fn worker_loop(
                 path,
                 command,
                 arguments,
-            } => state.execute_command(path, command, arguments).await,
+                on,
+            } => state.execute_command(path, command, arguments, on).await,
         }
     }
 }
@@ -3338,6 +3472,7 @@ impl WorkerState {
                 }
             }
             support.completion_triggers.remove(key);
+            support.inline_completion.remove(key);
         }
         self.docs
             .retain(|_, doc| (doc.language, doc.project_root.clone()) != *key);
@@ -3496,6 +3631,8 @@ impl WorkerState {
                         let completion_triggers = completion_triggers_of(caps);
                         let supports_signature_help =
                             signature_help_supported(&caps.signature_help_provider);
+                        let supports_inline_completion =
+                            one_of_supported(&caps.inline_completion_provider);
                         let supports_workspace_diagnostics =
                             workspace_diagnostics_supported(&caps.diagnostic_provider);
                         let supports_document_diagnostics = caps.diagnostic_provider.is_some();
@@ -3585,6 +3722,7 @@ impl WorkerState {
                             supports_completion: supports,
                             completion_triggers,
                             supports_signature_help,
+                            supports_inline_completion,
                             supports_workspace_diagnostics,
                             diagnostic_identifier,
                             diagnostic_result_ids: Arc::new(TokioMutex::new(
@@ -3674,6 +3812,11 @@ impl WorkerState {
                         .insert(key.clone(), c.completion_triggers.clone()),
                     None => support.completion_triggers.remove(&key),
                 };
+                if spawned.iter().any(|c| c.supports_inline_completion) {
+                    support.inline_completion.insert(key.clone());
+                } else {
+                    support.inline_completion.remove(&key);
+                }
                 support.code_action.insert(lang, supports_code_action);
                 support.call_hierarchy.insert(lang, supports_call_hierarchy);
                 support
@@ -4184,6 +4327,63 @@ impl WorkerState {
                 signatures,
                 active_signature,
             });
+        });
+    }
+
+    /// Ask the servers of `path` that answer `textDocument/inlineCompletion`
+    /// (LSP 3.18) for ghost text at `(line, character)`, in registration
+    /// order, keeping the first non-empty answer. Like signature help, a
+    /// file no server has open gets no reply and one whose servers offer
+    /// no inline completions an empty one; the app asks afresh at the next
+    /// caret either way.
+    async fn request_inline_completion(
+        &mut self,
+        request_id: u64,
+        path: PathBuf,
+        (line, character): (u32, u32),
+        tx: &std_mpsc::Sender<InlineCompletionResult>,
+    ) {
+        let Some(doc) = self.docs.get(&path) else {
+            return;
+        };
+        let lang = doc.language;
+        let root = doc.project_root.clone();
+        self.ensure_clients(lang, &root).await;
+        let candidates: Vec<_> = self
+            .clients
+            .get(&(lang, root))
+            .into_iter()
+            .flatten()
+            .filter(|c| c.supports_inline_completion)
+            .map(|c| (c.name.clone(), c.client.clone(), c.server_commands.clone()))
+            .collect();
+        let Ok(uri) = Url::from_file_path(&path) else {
+            return;
+        };
+        let mut answer = InlineCompletionResult {
+            request_id,
+            items: Vec::new(),
+        };
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            for (name, client_arc, commands) in &candidates {
+                let mut client = client_arc.lock().await.requests();
+                let resp = client.inline_completion(uri.clone(), line, character).await;
+                drop(client);
+                let items = match resp {
+                    Ok(Some(resp)) => normalise_inline_completion(resp, commands),
+                    Ok(None) => Vec::new(),
+                    Err(e) => {
+                        log_file::log(&format!("lsp[{name}] inlineCompletion error: {e}"));
+                        Vec::new()
+                    }
+                };
+                if !items.is_empty() {
+                    answer.items = items;
+                    break;
+                }
+            }
+            let _ = tx.send(answer);
         });
     }
 
@@ -5661,10 +5861,9 @@ impl WorkerState {
         path: PathBuf,
         command: String,
         arguments: Vec<serde_json::Value>,
+        on: fn(&ManagedClient) -> bool,
     ) {
-        let Ok((server_name, client_arc)) =
-            self.pick_server(&path, |c| c.supports_code_action).await
-        else {
+        let Ok((server_name, client_arc)) = self.pick_server(&path, on).await else {
             return;
         };
         tokio::spawn(async move {
@@ -7303,6 +7502,44 @@ fn workspace_diagnostics_supported(cap: &Option<DiagnosticServerCapabilities>) -
     }
 }
 
+/// Flatten an inline completion answer (LSP 3.18) into [`InlineSuggestion`]s:
+/// either response shape, a snippet's tab stops resolved to their
+/// placeholder text (the ghost shows, and Tab inserts, plain text), CRLF
+/// folded to `\n`, and the item's command kept only when the server lists
+/// it in `server_commands`, since croft can run no other.
+fn normalise_inline_completion(
+    resp: lsp_types::InlineCompletionResponse,
+    server_commands: &[String],
+) -> Vec<InlineSuggestion> {
+    let items = match resp {
+        lsp_types::InlineCompletionResponse::Array(items) => items,
+        lsp_types::InlineCompletionResponse::List(list) => list.items,
+    };
+    items
+        .into_iter()
+        .map(|item| {
+            let text = item.insert_text.replace("\r\n", "\n");
+            let insert_text =
+                if item.insert_text_format == Some(lsp_types::InsertTextFormat::SNIPPET) {
+                    crate::snippets::parse_body(&text, &|_| None).text
+                } else {
+                    text
+                };
+            InlineSuggestion {
+                insert_text,
+                filter_text: item.filter_text.filter(|f| !f.is_empty()),
+                range: item
+                    .range
+                    .map(|r| (r.start.line, r.start.character, r.end.line, r.end.character)),
+                command: item
+                    .command
+                    .filter(|c| server_commands.contains(&c.command))
+                    .map(|c| (c.command, c.arguments.unwrap_or_default())),
+            }
+        })
+        .collect()
+}
+
 /// Flatten an LSP `SignatureHelp` into the widget-facing [`SignatureInfo`]
 /// list, resolving each parameter label to a (start, end) char range within
 /// the signature label so the popup can bold the active parameter. The active
@@ -7799,6 +8036,12 @@ fn build_client_capabilities() -> ClientCapabilities {
             inlay_hint: Some(lsp_types::InlayHintClientCapabilities {
                 dynamic_registration: Some(false),
                 resolve_support: None,
+            }),
+            // LSP 3.18 inline completions, shown as ghost text at the caret.
+            // Servers such as Copilot's publish `inlineCompletionProvider`
+            // only to a client that declares this.
+            inline_completion: Some(lsp_types::InlineCompletionClientCapabilities {
+                dynamic_registration: Some(false),
             }),
             // Advertise call-hierarchy and documentHighlight support so
             // servers that gate their providers on the client declaring
@@ -8778,6 +9021,66 @@ mod tests {
         assert_eq!(sigs[0].active_param, Some((4, 5)));
     }
 
+    /// LSP 3.18 inline completions: both response shapes flatten to plain
+    /// text (a snippet's stops resolved, CRLF folded), an empty filter text
+    /// counts as none, and a command survives only when the server runs it.
+    #[test]
+    fn normalise_inline_completion_flattens_both_shapes_to_plain_text() {
+        let wire = serde_json::json!({"items": [
+            {"insertText": "foo(${1:a}, $2)$0\r\nbar", "insertTextFormat": 2,
+             "filterText": "",
+             "range": {"start": {"line": 3, "character": 0},
+                       "end": {"line": 3, "character": 2}},
+             "command": {"title": "", "command": "accepted", "arguments": [7]}},
+            {"insertText": "plain $1", "filterText": "pl",
+             "command": {"title": "", "command": "client.only"}}
+        ]});
+        let list: lsp_types::InlineCompletionResponse =
+            serde_json::from_value(wire).expect("a list parses");
+        let items = normalise_inline_completion(list, &[String::from("accepted")]);
+        assert_eq!(
+            items,
+            vec![
+                InlineSuggestion {
+                    insert_text: String::from("foo(a, )\nbar"),
+                    filter_text: None,
+                    range: Some((3, 0, 3, 2)),
+                    command: Some((String::from("accepted"), vec![serde_json::json!(7)])),
+                },
+                InlineSuggestion {
+                    insert_text: String::from("plain $1"),
+                    filter_text: Some(String::from("pl")),
+                    range: None,
+                    command: None,
+                },
+            ]
+        );
+        let array: lsp_types::InlineCompletionResponse =
+            serde_json::from_value(serde_json::json!([{"insertText": "x"}]))
+                .expect("a bare array parses");
+        assert_eq!(normalise_inline_completion(array, &[])[0].insert_text, "x");
+    }
+
+    /// Servers such as Copilot's publish `inlineCompletionProvider` only to a
+    /// client that declares the capability.
+    #[test]
+    fn client_capabilities_declare_inline_completion() {
+        let text_document = build_client_capabilities()
+            .text_document
+            .expect("text document capabilities");
+        assert_eq!(
+            text_document.inline_completion,
+            Some(lsp_types::InlineCompletionClientCapabilities {
+                dynamic_registration: Some(false),
+            })
+        );
+        let wire = serde_json::to_value(build_client_capabilities()).unwrap();
+        assert!(
+            wire.pointer("/textDocument/inlineCompletion").is_some(),
+            "the wire name is the spec's: {wire}"
+        );
+    }
+
     #[test]
     fn client_capabilities_advertise_work_done_progress() {
         // Servers only emit `$/progress` (rust-analyzer's "Indexing…") when the
@@ -8975,6 +9278,7 @@ while True:
             supports_completion: false,
             completion_triggers: String::new(),
             supports_signature_help: false,
+            supports_inline_completion: false,
             supports_hover: false,
             supports_definition: false,
             supports_document_symbol: false,
@@ -13568,6 +13872,143 @@ while True:
             ],
             "WRITE maps to write=true; an absent kind defaults to a read tint"
         );
+    }
+
+    /// A fake server that offers LSP 3.18 inline completions and runs one
+    /// command: its item spells back the position and trigger kind it was
+    /// asked with, and carries both a command it runs and one it does not.
+    const FAKE_LSP_INLINE: &str = r#"
+import json, sys
+
+def read_msg():
+    length = None
+    while True:
+        line = sys.stdin.buffer.readline()
+        if not line:
+            return None
+        line = line.strip()
+        if not line:
+            break
+        if line.lower().startswith(b"content-length:"):
+            length = int(line.split(b":")[1])
+    if length is None:
+        return None
+    return json.loads(sys.stdin.buffer.read(length))
+
+def send(msg):
+    body = json.dumps(msg).encode()
+    sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(body))
+    sys.stdout.buffer.write(body)
+    sys.stdout.buffer.flush()
+
+while True:
+    msg = read_msg()
+    if msg is None:
+        break
+    method = msg.get("method", "")
+    if "id" in msg:
+        if method == "initialize":
+            send({"jsonrpc": "2.0", "id": msg["id"], "result": {"capabilities": {
+                "inlineCompletionProvider": True,
+                "executeCommandProvider": {"commands": ["fake.accepted"]}}}})
+        elif method == "textDocument/inlineCompletion":
+            p = msg["params"]
+            pos = p["position"]
+            kind = p["context"]["triggerKind"]
+            line = pos["line"]
+            send({"jsonrpc": "2.0", "id": msg["id"], "result": {"items": [
+                {"insertText": "x = %d:%d:%d" % (line, pos["character"], kind),
+                 "range": {"start": {"line": line, "character": 0},
+                           "end": {"line": line, "character": pos["character"]}},
+                 "command": {"title": "", "command": "fake.accepted"}},
+                {"insertText": "y", "command": {"title": "", "command": "client.side"}}]}})
+        else:
+            send({"jsonrpc": "2.0", "id": msg["id"], "result": None})
+    if method == "exit":
+        break
+"#;
+
+    /// LSP 3.18 end to end: a server advertising `inlineCompletionProvider`
+    /// is recorded as serving the document's inline completions, is asked
+    /// with the caret and an `Automatic` trigger (2), and its items come
+    /// back with only the command it runs kept.
+    #[test]
+    fn an_inline_completion_server_is_recorded_and_answers_at_the_caret() {
+        if !is_on_path("python3") {
+            eprintln!("SKIPPED: python3 not on PATH");
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().canonicalize().expect("canonicalize");
+        let file = root.join("demo.py");
+        std::fs::write(&file, "x = \n").expect("write demo");
+        let script = root.join("fake_inline_lsp.py");
+        std::fs::write(&script, FAKE_LSP_INLINE).expect("write fake server");
+        let mut registry = ServerRegistry::new();
+        registry.register(
+            Language::PYTHON,
+            ServerConfig {
+                name: "fake-inline",
+                command: "python3".into(),
+                args: vec![script.display().to_string()],
+                language: Language::PYTHON,
+                initialization_options: None,
+                provision: None,
+            },
+        );
+        let (diag_tx, _diag_rx) = std_mpsc::channel();
+        let (prog_tx, _prog_rx) = std_mpsc::channel();
+        let mut state = WorkerState {
+            workspace_root: root.clone(),
+            extra_roots: Vec::new(),
+            registry,
+            clients: HashMap::new(),
+            docs: HashMap::new(),
+            capability_support: Arc::new(StdMutex::new(LangCapabilitySupport::default())),
+            semantic_refresh: Arc::new(AtomicBool::new(false)),
+            inlay_refresh: Arc::new(AtomicBool::new(false)),
+            diagnostic_refresh: Arc::new(AtomicBool::new(false)),
+            diagnostics_tx: diag_tx,
+            progress_tx: prog_tx,
+            restarts: ServerRestarts::default(),
+        };
+        let (tx, rx) = std_mpsc::channel();
+        let runtime = LspRuntime::new().expect("runtime");
+        runtime.handle().clone().block_on(async {
+            state.open_doc(file.clone(), String::from("x = \n")).await;
+            state
+                .request_inline_completion(1, file.clone(), (0, 4), &tx)
+                .await;
+        });
+        let reply = rx.recv_timeout(Duration::from_secs(30)).expect("reply");
+        assert_eq!(reply.request_id, 1);
+        assert_eq!(
+            reply.items,
+            vec![
+                InlineSuggestion {
+                    insert_text: String::from("x = 0:4:2"),
+                    filter_text: None,
+                    range: Some((0, 0, 0, 4)),
+                    command: Some((String::from("fake.accepted"), Vec::new())),
+                },
+                InlineSuggestion {
+                    insert_text: String::from("y"),
+                    filter_text: None,
+                    range: None,
+                    command: None,
+                },
+            ]
+        );
+        let support = state.capability_support.lock().unwrap();
+        let doc_root = support.document_roots[&file].clone();
+        assert!(
+            support
+                .inline_completion
+                .contains(&(Language::PYTHON, doc_root)),
+            "the document's server instance is recorded as answering"
+        );
+        drop(support);
+        runtime.handle().clone().block_on(state.shutdown_all());
     }
 
     /// A fake server whose completion list is marked `isIncomplete` and

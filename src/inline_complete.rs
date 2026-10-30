@@ -14,6 +14,15 @@
 //! overridden with `CROFT_COMPLETE_URL` / `CROFT_COMPLETE_MODEL`. Nothing is
 //! sent until the user turns suggestions on: this ships code off the machine.
 //!
+//! # Language servers
+//!
+//! A language server that answers LSP 3.18's `textDocument/inlineCompletion`
+//! (Copilot's, for one) supplies the ghost text instead, at the same pause
+//! and without the toggle: the user chose that server. Its answer is cut
+//! down to what it adds past the caret ([`server_ghost`]) and painted and
+//! accepted exactly like the model's; while it serves the file the model is
+//! not asked.
+//!
 //! # Why one blocking request per pause, on its own thread
 //!
 //! A suggestion is a few dozen tokens, so a non-streaming request is simplest
@@ -160,6 +169,39 @@ pub fn parse_response(body: &Value) -> Option<String> {
         .collect();
     let cleaned = strip_fence(&text);
     (!cleaned.trim().is_empty()).then(|| cleaned.to_string())
+}
+
+/// The ghost text a language server's inline completion (LSP 3.18) shows at
+/// the caret: what the item adds past the text already typed. `line` is the
+/// caret's line, `col` the caret, and `range` the span of that line the item
+/// replaces, all in characters; `None` is the caret alone. `None` when the
+/// item cannot read as text after the caret: its span starts past the caret
+/// or ends before it, reaches past it over more than blanks, what it
+/// replaces before the caret does not begin both its filter text and its
+/// insert text (the spec shows an item only when the replaced text is a
+/// prefix of its filter text), or it adds nothing.
+pub fn server_ghost(
+    line: &str,
+    col: usize,
+    range: Option<(usize, usize)>,
+    insert: &str,
+    filter: Option<&str>,
+) -> Option<String> {
+    let (start, end) = range.unwrap_or((col, col));
+    if start > col || end < col {
+        return None;
+    }
+    let chars: Vec<char> = line.chars().collect();
+    let after = chars.get(col..end.min(chars.len()))?;
+    if !after.iter().all(|c| c.is_whitespace()) {
+        return None;
+    }
+    let typed: String = chars.get(start..col)?.iter().collect();
+    if !insert.starts_with(&typed) || !filter.unwrap_or(insert).starts_with(&typed) {
+        return None;
+    }
+    let ghost = insert[typed.len()..].trim_end_matches('\n');
+    (!ghost.trim().is_empty()).then(|| ghost.to_string())
 }
 
 /// How much of a suggestion Ctrl+Right takes (#1625), as a byte length:
@@ -332,6 +374,63 @@ mod tests {
     }
 
     use super::*;
+
+    /// A server's item that replaces the typed start of the line shows only
+    /// what it adds; one with no range adds at the caret; a range reaching
+    /// over trailing blanks still reads as text after the caret.
+    #[test]
+    fn a_server_item_shows_what_it_adds_past_the_typed_text() {
+        let line = "    let total = a";
+        assert_eq!(
+            server_ghost(line, 17, Some((0, 17)), "    let total = a + b;", None).as_deref(),
+            Some(" + b;")
+        );
+        assert_eq!(
+            server_ghost(line, 17, Some((16, 17)), "b.sum();", None).as_deref(),
+            None,
+            "the insert text must begin with what it replaces"
+        );
+        assert_eq!(
+            server_ghost(line, 17, None, " + b;\n", None).as_deref(),
+            Some(" + b;"),
+            "a trailing line break is not ghost text"
+        );
+        assert_eq!(
+            server_ghost("x =   ", 3, Some((0, 6)), "x = 1", None).as_deref(),
+            Some(" 1")
+        );
+        assert_eq!(
+            server_ghost("π = ", 4, Some((0, 4)), "π = 3.14", None).as_deref(),
+            Some("3.14"),
+            "columns are characters, not bytes"
+        );
+    }
+
+    /// Negative: an item whose span starts past the caret, ends before it,
+    /// reaches over real text after it, whose filter text the typed text
+    /// does not begin, or that adds only blanks, shows nothing.
+    #[test]
+    fn a_server_item_that_cannot_read_after_the_caret_shows_nothing() {
+        let line = "foo(bar)";
+        assert_eq!(server_ghost(line, 4, Some((5, 5)), "x", None), None);
+        assert_eq!(server_ghost(line, 4, Some((0, 3)), "foo", None), None);
+        assert_eq!(server_ghost(line, 4, Some((0, 8)), "foo(baz)", None), None);
+        assert_eq!(
+            server_ghost("fo", 2, Some((0, 2)), "fo()", Some("bar")),
+            None,
+            "the replaced text must begin the filter text"
+        );
+        assert_eq!(
+            server_ghost("fo", 2, Some((0, 2)), "fo()", Some("foo")).as_deref(),
+            Some("()")
+        );
+        assert_eq!(server_ghost("fo", 2, None, "  \n", None), None);
+        assert_eq!(
+            server_ghost("fo", 2, Some((0, 9)), "fo()", None).as_deref(),
+            Some("()")
+        );
+        assert_eq!(server_ghost("fo", 2, Some((3, 3)), "x", None), None);
+    }
 
     fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
         let owned: Vec<(String, String)> = pairs

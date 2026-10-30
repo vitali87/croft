@@ -126,7 +126,11 @@ futures = "0.3"
 # is not "linux", so waitpid-any has no backend module). Dropping it lets
 # croft build under Termux while changing nothing on macOS/Linux.
 async-lsp = { version = "0.2", default-features = false, features = ["omni-trait", "stdio", "tracing", "tokio"] }
-lsp-types = "0.95"
+# `proposed` carries LSP 3.18's `textDocument/inlineCompletion` types
+# (`InlineCompletionRequest`, the client capability and the server's
+# `inlineCompletionProvider`), which servers such as Copilot's language
+# server answer with ghost text.
+lsp-types = { version = "0.95", features = ["proposed"] }
 tower = "0.5"
 tui-input = "0.15"
 plist = "1.9"

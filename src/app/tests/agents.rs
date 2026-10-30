@@ -2765,6 +2765,159 @@ fn an_inline_suggestion_appears_after_a_pause_and_tab_takes_it() {
     assert!(app.editor.live_ghost().is_none());
 }
 
+/// A Python file reading `let x = ` (it need only open as a language that
+/// has servers) whose language server answers inline completions (LSP
+/// 3.18), unstarted, with the caret idle at the line's end.
+fn app_with_inline_server(tmp: &std::path::Path) -> App {
+    let mut app = app_with_open_file(tmp, "m.py", "let x = \n");
+    let path = app.editor.path.clone().unwrap();
+    app.lsp
+        .as_ref()
+        .expect("a test-built App runs a manager")
+        .set_inline_completion_for_test(&path);
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 8;
+    app.editor.last_edit_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(2));
+    app
+}
+
+/// Answer the inline completion request in flight with `items`.
+fn answer_inline(app: &App, items: Vec<crate::lsp::manager::InlineSuggestion>) {
+    let id = app
+        .inline_server_job
+        .as_ref()
+        .expect("a request in flight")
+        .0;
+    app.lsp.as_ref().unwrap().inject_inline_completion_for_test(
+        crate::lsp::manager::InlineCompletionResult {
+            request_id: id,
+            items,
+        },
+    );
+}
+
+fn server_item(
+    text: &str,
+    range: Option<(u32, u32, u32, u32)>,
+) -> crate::lsp::manager::InlineSuggestion {
+    crate::lsp::manager::InlineSuggestion {
+        insert_text: String::from(text),
+        filter_text: None,
+        range,
+        command: None,
+    }
+}
+
+/// A language server's inline completion (LSP 3.18) lands as the ghost
+/// without the model toggle: the item that rewrites the typed line shows
+/// only what it adds, and Tab takes it as generated text, not the
+/// navigator's.
+#[test]
+fn a_language_servers_inline_completion_is_ghost_text_tab_takes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_inline_server(tmp.path());
+    assert!(!app.inline_enabled, "the model toggle stays off");
+    app.tick_inline_complete();
+    answer_inline(
+        &app,
+        vec![
+            server_item("y = 2", Some((0, 0, 0, 8))),
+            server_item("let x = 1 + 1;", Some((0, 0, 0, 8))),
+        ],
+    );
+    assert!(app.tick_inline_complete(), "the answer repaints");
+    assert_eq!(
+        app.editor.live_ghost(),
+        Some("1 + 1;"),
+        "the first item that continues the line wins"
+    );
+    app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.lines[0], "let x = 1 + 1;");
+    assert!(app.editor.live_ghost().is_none());
+    assert_eq!(
+        app.editor.provenance.seat(0),
+        Some(&crate::provenance::Seat::Generated)
+    );
+}
+
+/// While a language server serves the file's inline completions the model
+/// is not asked, even with the toggle on, and the server is asked once
+/// per caret.
+#[test]
+fn a_language_server_answers_instead_of_the_model() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_inline_server(tmp.path());
+    app.inline_config = Some(crate::inline_complete::Config {
+        backend: crate::inline_complete::Backend::Claude {
+            base_url: String::from("http://127.0.0.1:1"),
+            api_key: String::from("test-key"),
+        },
+        model: String::from("claude-opus-5"),
+    });
+    app.inline_worker = Some(crate::inline_complete::Worker::spawn());
+    app.inline_enabled = true;
+    let first = app.inline_next_id;
+    app.tick_inline_complete();
+    let asked = app.inline_server_job.as_ref().map(|j| j.0);
+    assert!(asked.is_some(), "the server is asked");
+    answer_inline(&app, Vec::new());
+    for _ in 0..5 {
+        app.tick_inline_complete();
+    }
+    assert_eq!(app.inline_next_id, first, "the model is never asked");
+    assert!(
+        app.inline_server_job.is_none(),
+        "an empty answer is not re-asked"
+    );
+    assert!(app.editor.live_ghost().is_none());
+}
+
+/// Negative: an answer for a caret the user has since left is dropped,
+/// and a file no inline-completion server serves sends nothing while the
+/// model toggle is off.
+#[test]
+fn a_stale_server_answer_is_dropped_and_no_server_asks_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_inline_server(tmp.path());
+    app.tick_inline_complete();
+    app.editor.cursor_col = 3;
+    answer_inline(&app, vec![server_item("let x = 1;", Some((0, 0, 0, 8)))]);
+    app.tick_inline_complete();
+    assert!(app.editor.ghost.is_none(), "answered for another caret");
+
+    let other = tempfile::tempdir().unwrap();
+    let mut plain = app_with_open_file(other.path(), "m.py", "let x = \n");
+    plain.editor.cursor_col = 8;
+    plain.editor.last_edit_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(2));
+    plain.tick_inline_complete();
+    assert!(plain.inline_server_job.is_none());
+    assert!(plain.inline_asked.is_none(), "nothing is asked");
+}
+
+/// Ctrl+Right on a server's ghost leaves the rest the server's, so the
+/// remainder taken with Tab is generated text too.
+#[test]
+fn a_partly_taken_server_ghost_stays_the_servers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_inline_server(tmp.path());
+    app.tick_inline_complete();
+    answer_inline(&app, vec![server_item("compute(a)\nprint(x)", None)]);
+    app.tick_inline_complete();
+    app.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL))
+        .unwrap();
+    assert_eq!(app.editor.lines[0], "let x = compute");
+    assert_eq!(app.editor.live_ghost(), Some("(a)\nprint(x)"));
+    app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.lines[0], "let x = compute(a)");
+    assert_eq!(app.editor.lines[1], "print(x)");
+    assert_eq!(
+        app.editor.provenance.seat(1),
+        Some(&crate::provenance::Seat::Generated)
+    );
+}
+
 /// The issue's file (#1625) with the caret at the end of `def add(a, b):`
 /// and the stub's suggestion live there.
 fn app_with_body_suggestion(tmp: &std::path::Path) -> App {

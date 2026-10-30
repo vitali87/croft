@@ -902,6 +902,31 @@ impl LspRequests {
             .context("signature_help")
     }
 
+    /// `textDocument/inlineCompletion` (LSP 3.18): the ghost text the server
+    /// would put at the caret. Asked after a pause in typing, so the trigger
+    /// is always `Automatic`, and never while the completion list is open,
+    /// so there is no selected item to extend.
+    pub async fn inline_completion(
+        &mut self,
+        uri: Url,
+        line: u32,
+        character: u32,
+    ) -> Result<Option<lsp_types::InlineCompletionResponse>> {
+        self.server
+            .request::<lsp_types::request::InlineCompletionRequest>(
+                lsp_types::InlineCompletionParams {
+                    work_done_progress_params: WorkDoneProgressParams::default(),
+                    text_document_position: position_params(uri, line, character),
+                    context: lsp_types::InlineCompletionContext {
+                        trigger_kind: lsp_types::InlineCompletionTriggerKind::Automatic,
+                        selected_completion_info: None,
+                    },
+                },
+            )
+            .await
+            .context("inline_completion")
+    }
+
     pub async fn hover(&mut self, uri: Url, line: u32, character: u32) -> Result<Option<Hover>> {
         self.server
             .hover(HoverParams {
