@@ -360,11 +360,21 @@ fn scan_with_pos(text: &str) -> Vec<(usize, usize, PortHit)> {
 /// listener row needs none of them. `-w` drops the warnings `-b` then prints.
 const LSOF_LISTEN_ARGS: &[&str] = &["-b", "-w", "-nP", "-iTCP", "-sTCP:LISTEN"];
 
+/// The soft descriptor limit a poll helper runs under. lsof before 4.95
+/// (Ubuntu 20.04 and 22.04 ship 4.93) closes every descriptor up to the
+/// soft limit at startup, so under a raised limit, 1,048,576 on some
+/// desktops, each run spent ~0.15 s of CPU on a million `close` calls.
+/// None of the helpers holds more than a handful open (#1903).
+const PROBE_FD_LIMIT: libc::rlim_t = 1024;
+
 /// A socket-poll helper command, detached into its own session. The poll runs
 /// every few seconds, and the kernel prints a hung-NFS notice ("nfs server
 /// X: not responding") on the controlling tty of the process waiting on the
 /// mount: with croft's tty inherited, that text lands on top of the UI. With
 /// no controlling tty the notice goes to the system log only.
+///
+/// The helper also runs under [`PROBE_FD_LIMIT`] descriptors; croft's own
+/// limit is left alone.
 ///
 /// The null stdin only states intent (`.output()` already gives one); the
 /// session is the fix. A pre-exec hook takes std off `posix_spawn` and onto a
@@ -372,19 +382,41 @@ const LSOF_LISTEN_ARGS: &[&str] = &["-b", "-w", "-nP", "-iTCP", "-sTCP:LISTEN"];
 fn probe(program: &str) -> Command {
     let mut cmd = Command::new(program);
     cmd.stdin(std::process::Stdio::null());
-    // SAFETY: `setsid` is async-signal-safe and the only call in the
-    // pre-exec hook. The forked child is never a process-group leader, so
-    // it cannot fail today; if it ever does, the spawn fails rather than
-    // silently keeping the tty.
+    let fd_limit = probe_fd_limit();
+    // SAFETY: `setsid` and `setrlimit` are single system calls that neither
+    // allocate nor lock, and the limit was read before the fork. The forked
+    // child is never a process-group leader, so `setsid` cannot fail today;
+    // if it ever does, the spawn fails rather than silently keeping the tty.
+    // Lowering a soft limit cannot fail, and the helper works either way.
     unsafe {
-        std::os::unix::process::CommandExt::pre_exec(&mut cmd, || {
+        std::os::unix::process::CommandExt::pre_exec(&mut cmd, move || {
             if libc::setsid() == -1 {
                 return Err(std::io::Error::last_os_error());
+            }
+            if let Some(lim) = fd_limit {
+                libc::setrlimit(libc::RLIMIT_NOFILE, &lim);
             }
             Ok(())
         });
     }
     cmd
+}
+
+/// croft's descriptor limit with its soft value lowered to
+/// [`PROBE_FD_LIMIT`], or `None` when it is already that low or unreadable.
+fn probe_fd_limit() -> Option<libc::rlimit> {
+    let mut lim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit only writes the struct it is handed.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0
+        || lim.rlim_cur <= PROBE_FD_LIMIT
+    {
+        return None;
+    }
+    lim.rlim_cur = PROBE_FD_LIMIT;
+    Some(lim)
 }
 
 /// PIDs in `root`'s process subtree (inclusive), from one `ps` snapshot. Used
@@ -442,15 +474,8 @@ pub fn poll_listeners(shell_pid: i32) -> Vec<PortHit> {
 /// evidence" and leave the registry alone rather than retiring live rows.
 pub fn poll_all_listening() -> Option<HashSet<u16>> {
     let out = probe("lsof").args(LSOF_LISTEN_ARGS).output().ok();
-    if let Some(out) = out
-        && (out.status.success() || !out.stdout.is_empty())
-    {
-        return Some(
-            parse_lsof(&String::from_utf8_lossy(&out.stdout))
-                .into_iter()
-                .map(|h| h.port)
-                .collect(),
-        );
+    if let Some(rows) = out.as_ref().and_then(lsof_rows) {
+        return Some(parse_lsof(&rows).into_iter().map(|h| h.port).collect());
     }
     let out = probe("ss").args(["-tlnH"]).output().ok()?;
     if !out.status.success() {
@@ -478,10 +503,19 @@ fn poll_via_lsof(pids: &HashSet<i32>) -> Option<Vec<PortHit>> {
         .args(["-a", "-p", &pid_arg])
         .output()
         .ok()?;
-    if !out.status.success() && out.stdout.is_empty() {
-        return None;
-    }
-    Some(parse_lsof(&String::from_utf8_lossy(&out.stdout)))
+    Some(parse_lsof(&lsof_rows(&out)?))
+}
+
+/// What a finished `lsof` scan printed, or `None` when lsof failed. lsof
+/// exits 1 with nothing on either stream when no socket matches, which is
+/// the usual answer while no dev server runs: that is an empty scan, and
+/// reading it as a failure sent every poll on to `ss` as well (#1903). A
+/// real failure, a bad option or a denied read, says why on stderr, which
+/// `-w` keeps free of warnings.
+fn lsof_rows(out: &std::process::Output) -> Option<String> {
+    let no_match = out.status.code() == Some(1) && out.stderr.is_empty();
+    (out.status.success() || !out.stdout.is_empty() || no_match)
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 /// Parse `lsof` rows from a [`LSOF_LISTEN_ARGS`] scan. Field 0 is the
@@ -611,6 +645,50 @@ mod tests {
             hits.iter().any(|h| h.port == port),
             "port {port} missing from {hits:?}"
         );
+    }
+
+    /// A helper runs under at most [`PROBE_FD_LIMIT`] descriptors, so an
+    /// lsof that closes every one up to the limit stays cheap (#1903).
+    #[test]
+    fn a_socket_probe_runs_under_a_low_descriptor_limit() {
+        let out = probe("sh").args(["-c", "ulimit -n"]).output().unwrap();
+        let limit: libc::rlim_t = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap();
+        assert!(limit <= PROBE_FD_LIMIT, "the helper ran under {limit}");
+        let lowered = probe_fd_limit();
+        assert!(lowered.is_none_or(|l| l.rlim_cur == PROBE_FD_LIMIT));
+    }
+
+    /// lsof's "nothing matched" is exit 1 with both streams empty: an
+    /// answer of no listeners, so `ss` is not run after it (#1903).
+    #[test]
+    fn an_lsof_that_matched_nothing_is_an_empty_scan_not_a_failure() {
+        use std::os::unix::process::ExitStatusExt;
+        let out = |code: i32, stdout: &str, stderr: &str| std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+        };
+        assert_eq!(lsof_rows(&out(1, "", "")).as_deref(), Some(""));
+        assert_eq!(lsof_rows(&out(0, "", "")).as_deref(), Some(""));
+        let row = "COMMAND PID\nnode 7 u IPv4 TCP 127.0.0.1:3000 (LISTEN)\n";
+        assert_eq!(lsof_rows(&out(1, row, "")).as_deref(), Some(row));
+        assert_eq!(lsof_rows(&out(1, "", "lsof: illegal option")), None);
+        assert_eq!(lsof_rows(&out(2, "", "")), None);
+    }
+
+    /// The real lsof on a process with no listener: an empty scan rather
+    /// than `None`, which is what sent the poll on to `ss`. Skipped where
+    /// lsof is not installed.
+    #[test]
+    fn the_lsof_scan_of_a_process_without_listeners_is_empty() {
+        if probe("lsof").arg("-v").output().is_err() {
+            return;
+        }
+        let mut child = probe("sleep").arg("5").spawn().unwrap();
+        let hits = poll_via_lsof(&HashSet::from([child.id() as i32]));
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(hits, Some(Vec::new()));
     }
 
     /// Every poll helper is spawned through `probe`, so none can bring the

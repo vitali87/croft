@@ -1,0 +1,1 @@
+fix: The PORTS poll no longer runs `ss` every few seconds on top of `lsof` when nothing is listening, and an older `lsof` (Ubuntu 20.04 and 22.04) no longer spends a tenth of a core closing descriptors under a raised file limit.
