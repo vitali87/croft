@@ -1,0 +1,1 @@
+fix: Format Document and Format on Save work in HTML, CSS, SCSS, LESS and JSON files: the bundled VS Code language servers are now asked for their formatter, where croft used to say "No formatter available for this file".

@@ -287,6 +287,13 @@ mod tests {
                 "{ext} server installs from @t1ckbase/vscode-langservers-extracted"
             );
             assert_eq!(r.for_extension(ext)[0].name, server_bin);
+            // #1083: without it the server has no formatter, and Format
+            // Document says "No formatter available for this file".
+            assert_eq!(
+                s.initialization_options,
+                Some(serde_json::json!({ "provideFormatter": true })),
+                "{ext} server is asked for its formatter"
+            );
         }
     }
 
