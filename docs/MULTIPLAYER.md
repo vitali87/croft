@@ -487,8 +487,10 @@ mux identity (`user@host`), overridable via `CROFT_COLLAB_NAME`.
 **`croft collab-agent`: an AI participant with a visible caret.** A hidden
 headless subcommand (`src/collab_agent.rs`) joins the workspace's relay as a
 regular guest and exposes the session as an MCP server on stdio (JSON-RPC 2.0
-over NDJSON, the shapes croft's own MCP client speaks). Register it once and
-any MCP-speaking agent gets a seat:
+over NDJSON, the shapes croft's own MCP client speaks). It is dual-era: it
+answers `server/discover` and stateless 2026-07-28 requests as well as the
+2025-11-25 `initialize` handshake. Register it once and any MCP-speaking agent
+gets a seat:
 
     claude mcp add croft-collab -- croft collab-agent --workspace <abs path>
 

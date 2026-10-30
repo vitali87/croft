@@ -1,10 +1,15 @@
 //! MCP client: JSON-RPC 2.0 envelope + the MCP lifecycle over a [`McpTransport`].
 //!
-//! The handshake is `initialize` (request) -> server result ->
-//! `notifications/initialized` (notification), after which `tools/list` and
-//! `tools/call` are available. Requests carry a monotonic integer `id`; the
-//! client matches a response to its request by that id, discarding interleaved
-//! server-initiated notifications (e.g. `notifications/message` logging).
+//! The client is dual-era. It first probes with `server/discover` at the
+//! stateless 2026-07-28 revision: a server that answers is modern, and every
+//! later request names that revision, croft's identity and its capabilities in
+//! `_meta`, with no handshake. A server that rejects the probe, or stays silent
+//! past [`PROBE_TIMEOUT`], predates it and gets the 2025-11-25 handshake:
+//! `initialize` (request) -> server result -> `notifications/initialized`
+//! (notification). Either way `tools/list` and `tools/call` follow. Requests
+//! carry a monotonic integer `id`; the client matches a response to its request
+//! by that id, discarding interleaved server-initiated notifications (e.g.
+//! `notifications/message` logging).
 //!
 //! The client is synchronous: one outstanding request at a time, which is all a
 //! deterministic palette-invoked host needs (a human triggers one tool call and
@@ -15,17 +20,59 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
 use crate::mcp::transport::McpTransport;
 
-/// The MCP protocol revision croft speaks. The server echoes a (possibly older)
-/// `protocolVersion` in its `initialize` result; croft accepts whatever the
-/// server negotiates rather than hard-failing on an exact match.
-pub const PROTOCOL_VERSION: &str = "2025-11-25";
+/// The stateless MCP revision croft prefers: a server that answers
+/// `server/discover` with it gets it named in every request's `_meta`.
+pub const PROTOCOL_VERSION: &str = "2026-07-28";
+
+/// The handshake-era revision croft sends in `initialize` to a server that
+/// predates [`PROTOCOL_VERSION`]. The server echoes a (possibly older)
+/// `protocolVersion` in its result; croft accepts whatever the server
+/// negotiates rather than hard-failing on an exact match.
+pub const LEGACY_PROTOCOL_VERSION: &str = "2025-11-25";
+
+/// Every handshake-era revision. A stateless server that refuses
+/// [`PROTOCOL_VERSION`] but lists one of these still answers `initialize`.
+const HANDSHAKE_VERSIONS: [&str; 4] = [
+    "2024-11-05",
+    "2025-03-26",
+    "2025-06-18",
+    LEGACY_PROTOCOL_VERSION,
+];
+
+/// The `_meta` key a stateless request names its revision under.
+pub const META_PROTOCOL_VERSION: &str = "io.modelcontextprotocol/protocolVersion";
+
+/// The `_meta` key a stateless request names its client under.
+pub const META_CLIENT_INFO: &str = "io.modelcontextprotocol/clientInfo";
+
+/// The `_meta` key a stateless request declares its client capabilities under.
+pub const META_CLIENT_CAPABILITIES: &str = "io.modelcontextprotocol/clientCapabilities";
+
+/// The `_meta` key a stateless result names its server under.
+pub const META_SERVER_INFO: &str = "io.modelcontextprotocol/serverInfo";
+
+/// `UnsupportedProtocolVersion`: the request's revision is one the server does
+/// not speak, and `data.supported` lists the ones it does.
+pub const UNSUPPORTED_PROTOCOL_VERSION: i64 = -32022;
+
+/// The stateless revision's own error codes (`HeaderMismatch`,
+/// `MissingRequiredClientCapability`, `UnsupportedProtocolVersion`). Any of
+/// them in reply to the probe marks a modern server, which `initialize` would
+/// not reach.
+const STATELESS_ERROR_CODES: [i64; 3] = [-32020, -32021, UNSUPPORTED_PROTOCOL_VERSION];
+
+/// How long the `server/discover` probe waits before taking silence for a
+/// handshake-era server (some drop any request sent before `initialize`). It
+/// is the C# SDK's default. A modern server slower than this is not lost: its
+/// late answer still counts while croft awaits `initialize`.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long a single request waits for its matching response before erroring,
 /// so a wedged server can't hang croft's invocation forever.
@@ -48,9 +95,20 @@ pub fn notification(method: &str, params: Value) -> Value {
 /// capabilities, and its identity.
 pub fn initialize_params(client_name: &str, client_version: &str) -> Value {
     json!({
-        "protocolVersion": PROTOCOL_VERSION,
+        "protocolVersion": LEGACY_PROTOCOL_VERSION,
         "capabilities": {},
         "clientInfo": { "name": client_name, "version": client_version },
+    })
+}
+
+/// The `_meta` every stateless request carries in place of a handshake: the
+/// revision, croft's identity, and its client capabilities (none, so a server
+/// never asks croft for input mid-request).
+pub fn request_meta(client_name: &str, client_version: &str) -> Value {
+    json!({
+        META_PROTOCOL_VERSION: PROTOCOL_VERSION,
+        META_CLIENT_INFO: { "name": client_name, "version": client_version },
+        META_CLIENT_CAPABILITIES: {},
     })
 }
 
@@ -61,20 +119,82 @@ pub fn tools_call_params(name: &str, arguments: Value) -> Value {
 
 /// Extract the `result` from a JSON-RPC response, turning a JSON-RPC `error`
 /// object into an `Err` carrying its message. A response missing both is
-/// malformed.
+/// malformed. So is a result whose `resultType` is not `complete`: croft
+/// declares no capabilities, so it cannot answer an `input_required` round
+/// trip. A handshake-era result carries no `resultType`, which means complete.
 pub fn response_result(message: &Value) -> Result<Value> {
     if let Some(err) = message.get("error") {
-        let msg = err
-            .get("message")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown error");
-        let code = err.get("code").and_then(Value::as_i64).unwrap_or(0);
-        bail!("MCP error {code}: {msg}");
+        return Err(rpc_error(err));
     }
-    message
+    let result = message
         .get("result")
         .cloned()
-        .context("JSON-RPC response has neither result nor error")
+        .context("JSON-RPC response has neither result nor error")?;
+    match result.get("resultType") {
+        None => Ok(result),
+        Some(kind) if kind == "complete" => Ok(result),
+        Some(kind) => {
+            bail!("the server answered with resultType {kind}, which croft cannot act on")
+        }
+    }
+}
+
+/// A JSON-RPC `error` object as an error carrying its code and message.
+fn rpc_error(err: &Value) -> anyhow::Error {
+    let msg = err
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown error");
+    let code = err.get("code").and_then(Value::as_i64).unwrap_or(0);
+    anyhow::anyhow!("MCP error {code}: {msg}")
+}
+
+/// What a `server/discover` reply says about the server: `true` for a
+/// stateless server that speaks [`PROTOCOL_VERSION`], `false` for anything
+/// that is no evidence of one, which falls back to `initialize`. That covers
+/// any error outside the stateless codes (handshake-era servers answer an
+/// unknown method with whatever code they like, or a mangled result), and a
+/// server whose versions include a handshake-era one. A stateless server that
+/// shares no revision with croft is an error, since `initialize` cannot reach
+/// it either.
+fn probe_says_modern(reply: &Value) -> Result<bool> {
+    let supported = match reply.get("error") {
+        None => {
+            let supported = string_list(reply.pointer("/result/supportedVersions"));
+            if supported.contains(&PROTOCOL_VERSION) {
+                return Ok(true);
+            }
+            supported
+        }
+        Some(err) => {
+            let code = err.get("code").and_then(Value::as_i64).unwrap_or(0);
+            if !STATELESS_ERROR_CODES.contains(&code) {
+                return Ok(false);
+            }
+            let supported = string_list(err.pointer("/data/supported"));
+            if supported.is_empty() {
+                return Err(rpc_error(err));
+            }
+            supported
+        }
+    };
+    if supported.is_empty() || supported.iter().any(|v| HANDSHAKE_VERSIONS.contains(v)) {
+        return Ok(false);
+    }
+    bail!(
+        "the server speaks MCP {} only, and croft speaks {PROTOCOL_VERSION} or {LEGACY_PROTOCOL_VERSION}",
+        supported.join(", ")
+    )
+}
+
+/// The strings in a JSON array, such as a list of protocol versions.
+fn string_list(value: Option<&Value>) -> Vec<&str> {
+    value
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect()
 }
 
 /// Whether `message` is the response to request `id` (a JSON-RPC response echoes
@@ -157,15 +277,30 @@ pub fn tool_fingerprint(tools_list_result: &Value, name: &str) -> String {
     .to_string()
 }
 
-/// A live MCP session: an initialized server plus the id counter for requests.
+/// Which revision a connected server speaks, settled once per process by the
+/// probe in [`McpClient::connect`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Era {
+    /// Stateless: every request names [`PROTOCOL_VERSION`] in its `_meta`.
+    Modern,
+    /// Handshake: `initialize` ran, and requests carry no protocol `_meta`.
+    Legacy,
+}
+
+/// A live MCP session: a connected server, its era, and the id counter for
+/// requests.
 pub struct McpClient {
     transport: McpTransport,
     next_id: AtomicI64,
+    era: Era,
+    /// What a stateless request carries in `_meta` ([`request_meta`]).
+    meta: Value,
 }
 
 impl McpClient {
-    /// Spawn and initialize an MCP server: handshake then return the ready
-    /// client. `env` is the least-privilege environment for the server.
+    /// Spawn an MCP server and settle its era (probe, then `initialize` for a
+    /// handshake-era server), returning the ready client. `env` is the
+    /// least-privilege environment for the server.
     pub fn connect(
         program: &str,
         args: &[String],
@@ -174,12 +309,35 @@ impl McpClient {
         client_name: &str,
         client_version: &str,
     ) -> Result<McpClient> {
+        Self::connect_probing_for(
+            program,
+            args,
+            cwd,
+            env,
+            client_name,
+            client_version,
+            PROBE_TIMEOUT,
+        )
+    }
+
+    /// [`McpClient::connect`] with the probe waiting `probe_timeout`.
+    fn connect_probing_for(
+        program: &str,
+        args: &[String],
+        cwd: &Path,
+        env: &BTreeMap<String, String>,
+        client_name: &str,
+        client_version: &str,
+        probe_timeout: Duration,
+    ) -> Result<McpClient> {
         let transport = McpTransport::spawn(program, args, cwd, env)?;
-        let client = McpClient {
+        let mut client = McpClient {
             transport,
             next_id: AtomicI64::new(0),
+            era: Era::Legacy,
+            meta: request_meta(client_name, client_version),
         };
-        client.initialize(client_name, client_version)?;
+        client.era = client.negotiate(client_name, client_version, probe_timeout)?;
         Ok(client)
     }
 
@@ -187,9 +345,21 @@ impl McpClient {
         self.next_id.fetch_add(1, Ordering::SeqCst) + 1
     }
 
-    /// Send a request and block until its matching response arrives (discarding
-    /// interleaved server notifications), returning the `result` or an error.
-    pub fn call(&self, method: &str, params: Value) -> Result<Value> {
+    /// Send a request in the negotiated era and block until its matching
+    /// response arrives, returning the `result` or an error.
+    pub fn call(&self, method: &str, mut params: Value) -> Result<Value> {
+        if self.era == Era::Modern {
+            params["_meta"] = self.meta.clone();
+        }
+        let id = self.send_request(method, params)?;
+        let (_, reply) = self
+            .await_response(&[id], REQUEST_TIMEOUT)?
+            .context("MCP server timed out before responding")?;
+        response_result(&reply)
+    }
+
+    /// Send a request under a fresh id, returning that id.
+    fn send_request(&self, method: &str, params: Value) -> Result<i64> {
         let id = self.next_id();
         if let Err(e) = self.transport.send(&request(id, method, params)) {
             // A server that already died closed its stdin: say why it died.
@@ -202,21 +372,28 @@ impl McpClient {
             }
             return Err(e);
         }
-        let deadline = std::time::Instant::now() + REQUEST_TIMEOUT;
+        Ok(id)
+    }
+
+    /// Block until the response to one of `ids` arrives (discarding interleaved
+    /// server notifications), returning which id it answers, or `None` once
+    /// `timeout` passes without one.
+    fn await_response(&self, ids: &[i64], timeout: Duration) -> Result<Option<(i64, Value)>> {
+        let deadline = Instant::now() + timeout;
         loop {
-            let remaining = deadline
-                .checked_duration_since(std::time::Instant::now())
-                .context("MCP request timed out")?;
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return Ok(None);
+            };
             let msg = match self.transport.incoming.recv_timeout(remaining) {
                 Ok(msg) => msg,
-                Err(RecvTimeoutError::Timeout) => bail!("MCP server timed out before responding"),
+                Err(RecvTimeoutError::Timeout) => return Ok(None),
                 // stdout closed: the server died, and its stderr says why.
                 Err(RecvTimeoutError::Disconnected) => {
                     bail!("{}", self.transport.exit_reason(EXIT_REASON_WAIT))
                 }
             };
-            if is_response_to(&msg, id) {
-                return response_result(&msg);
+            if let Some(&id) = ids.iter().find(|&&id| is_response_to(&msg, id)) {
+                return Ok(Some((id, msg)));
             }
             // Otherwise a server notification/request: ignore and keep waiting.
         }
@@ -227,12 +404,40 @@ impl McpClient {
         self.transport.send(&notification(method, params))
     }
 
-    /// Run the MCP handshake: `initialize`, then the `notifications/initialized`
-    /// acknowledgement the spec requires before normal operation.
-    fn initialize(&self, client_name: &str, client_version: &str) -> Result<Value> {
-        let result = self.call("initialize", initialize_params(client_name, client_version))?;
-        self.notify("notifications/initialized", json!({}))?;
-        Ok(result)
+    /// Settle the server's era the way the stdio binding prescribes: probe with
+    /// `server/discover`, and when the reply is no evidence of a stateless
+    /// server ([`probe_says_modern`]) or none comes within `probe_timeout`, run
+    /// the handshake: `initialize`, then the `notifications/initialized`
+    /// acknowledgement. The probe's answer still counts while `initialize` is
+    /// pending, so a modern server that took longer than the probe to start is
+    /// not misread as handshake-era.
+    fn negotiate(
+        &self,
+        client_name: &str,
+        client_version: &str,
+        probe_timeout: Duration,
+    ) -> Result<Era> {
+        let probe = self.send_request("server/discover", json!({ "_meta": self.meta }))?;
+        if let Some((_, reply)) = self.await_response(&[probe], probe_timeout)?
+            && probe_says_modern(&reply)?
+        {
+            return Ok(Era::Modern);
+        }
+        let init =
+            self.send_request("initialize", initialize_params(client_name, client_version))?;
+        loop {
+            let (id, reply) = self
+                .await_response(&[probe, init], REQUEST_TIMEOUT)?
+                .context("MCP server timed out before responding")?;
+            if id == init {
+                response_result(&reply)?;
+                self.notify("notifications/initialized", json!({}))?;
+                return Ok(Era::Legacy);
+            }
+            if probe_says_modern(&reply)? {
+                return Ok(Era::Modern);
+            }
+        }
     }
 
     /// Call a tool by name with an arguments object; returns the raw result.
@@ -260,9 +465,24 @@ mod tests {
     #[test]
     fn initialize_params_advertise_the_protocol_version_and_client() {
         let p = initialize_params("croft", "0.1.0");
-        assert_eq!(p["protocolVersion"], PROTOCOL_VERSION);
+        assert_eq!(p["protocolVersion"], LEGACY_PROTOCOL_VERSION);
         assert_eq!(p["clientInfo"]["name"], "croft");
         assert_eq!(p["clientInfo"]["version"], "0.1.0");
+    }
+
+    /// A stateless request carries in `_meta` what the handshake used to
+    /// establish, under the spec's reserved keys.
+    #[test]
+    fn request_meta_names_the_revision_client_and_capabilities() {
+        let meta = request_meta("croft", "0.1.0");
+        assert_eq!(
+            meta,
+            json!({
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientInfo": {"name": "croft", "version": "0.1.0"},
+                "io.modelcontextprotocol/clientCapabilities": {},
+            })
+        );
     }
 
     #[test]
@@ -277,6 +497,77 @@ mod tests {
 
         let malformed = json!({"jsonrpc": "2.0", "id": 1});
         assert!(response_result(&malformed).is_err());
+    }
+
+    /// A stateless result says it is complete; one asking for input croft
+    /// never declared it could give, or of a type croft does not know, is an
+    /// error rather than an empty answer.
+    #[test]
+    fn response_result_accepts_only_complete_results() {
+        let complete = json!({"id": 1, "result": {"resultType": "complete", "tools": []}});
+        assert_eq!(response_result(&complete).unwrap()["tools"], json!([]));
+
+        let input =
+            json!({"id": 1, "result": {"resultType": "input_required", "inputRequests": {}}});
+        let e = response_result(&input).unwrap_err().to_string();
+        assert!(e.contains("\"input_required\""), "{e}");
+
+        let unknown = json!({"id": 1, "result": {"resultType": "someday"}});
+        assert!(response_result(&unknown).is_err());
+    }
+
+    /// The probe's verdict on each reply the stdio binding names: a discover
+    /// result is modern, any non-stateless error or unreadable result is a
+    /// handshake-era server, and a stateless refusal falls back only when the
+    /// server lists a handshake revision.
+    #[test]
+    fn the_probe_falls_back_only_without_evidence_of_a_stateless_server() {
+        let result = |r: Value| json!({"jsonrpc": "2.0", "id": 1, "result": r});
+        let error = |e: Value| json!({"jsonrpc": "2.0", "id": 1, "error": e});
+
+        let discovered = result(json!({
+            "resultType": "complete",
+            "supportedVersions": ["2026-07-28", "2025-11-25"],
+            "capabilities": {"tools": {}},
+            "ttlMs": 0,
+            "cacheScope": "public",
+        }));
+        assert!(probe_says_modern(&discovered).unwrap());
+
+        // Handshake-era servers: no fallback is keyed to one code.
+        for code in [-32601, -32602, -32600, -32000] {
+            let rejected = error(json!({"code": code, "message": "nope"}));
+            assert!(!probe_says_modern(&rejected).unwrap(), "{code}");
+        }
+        assert!(!probe_says_modern(&result(json!({}))).unwrap());
+        // Answers discover but advertises handshake revisions only.
+        let handshake_only = result(json!({"supportedVersions": ["2025-06-18"]}));
+        assert!(!probe_says_modern(&handshake_only).unwrap());
+
+        // Dual-era but refusing the stateless revision: `initialize` works.
+        let refused = error(json!({
+            "code": -32022,
+            "message": "Unsupported protocol version",
+            "data": {"supported": ["2025-11-25"], "requested": "2026-07-28"},
+        }));
+        assert!(!probe_says_modern(&refused).unwrap());
+
+        // Stateless only, and not a revision croft speaks: say so.
+        let disjoint = error(json!({
+            "code": -32022,
+            "message": "Unsupported protocol version",
+            "data": {"supported": ["2027-03-01"], "requested": "2026-07-28"},
+        }));
+        let e = probe_says_modern(&disjoint).unwrap_err().to_string();
+        assert_eq!(
+            e,
+            "the server speaks MCP 2027-03-01 only, and croft speaks 2026-07-28 or 2025-11-25"
+        );
+        let future_only = result(json!({"supportedVersions": ["2027-03-01"]}));
+        assert!(probe_says_modern(&future_only).is_err());
+        let capability = error(json!({"code": -32021, "message": "needs roots"}));
+        let e = probe_says_modern(&capability).unwrap_err().to_string();
+        assert_eq!(e, "MCP error -32021: needs roots");
     }
 
     #[test]
@@ -400,7 +691,8 @@ mod tests {
     #[test]
     fn a_server_logging_past_the_pipe_buffer_still_answers() {
         let script = "head -c 300000 /dev/zero | tr '\\000' x >&2; read l; \
-             printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}'; cat >/dev/null";
+             printf '%s\\n' '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"supportedVersions\":[\"2026-07-28\"]}}'; \
+             cat >/dev/null";
         McpClient::connect(
             "/bin/sh",
             &[String::from("-c"), script.to_string()],
@@ -410,6 +702,87 @@ mod tests {
             "test",
         )
         .expect("a chatty server still completes the handshake");
+    }
+
+    /// A `/bin/sh` MCP server for the era tests. `@DISCOVER@` and
+    /// `@INITIALIZE@` are replaced with shell run on those requests, where
+    /// `reply` answers the request's `$id`. `tools/list` answers one tool
+    /// named for the era the request arrived in: `modern` when it carries
+    /// croft's stateless `_meta`, `legacy` after a completed handshake, and
+    /// `unnegotiated` otherwise.
+    const ERA_SERVER: &str = r#"
+reply() { printf '{"jsonrpc":"2.0","id":%s,%s}\n' "$id" "$1"; }
+while IFS= read -r l; do
+  id=$(printf '%s' "$l" | sed -n 's/.*"id":\([0-9]*\).*/\1/p')
+  case "$l" in
+    *'"server/discover"'*) @DISCOVER@ ;;
+    *'"initialize"'*) @INITIALIZE@ ;;
+    *'"notifications/initialized"'*) inited=1 ;;
+    *'"tools/list"'*)
+      case "$l" in
+        *'"io.modelcontextprotocol/protocolVersion":"2026-07-28"'*) era=modern ;;
+        *) era=${inited:+legacy} ;;
+      esac
+      reply "\"result\":{\"tools\":[{\"name\":\"${era:-unnegotiated}\"}]}" ;;
+  esac
+done
+"#;
+
+    const DISCOVERED: &str = r#"reply '"result":{"resultType":"complete","supportedVersions":["2026-07-28"],"capabilities":{"tools":{}},"ttlMs":0,"cacheScope":"public"}'"#;
+    const NO_SUCH_METHOD: &str = r#"reply '"error":{"code":-32601,"message":"Method not found"}'"#;
+    const INITIALIZED: &str = r#"reply '"result":{"protocolVersion":"2025-11-25","capabilities":{},"serverInfo":{"name":"mock","version":"0"}}'"#;
+
+    /// Connect to an [`ERA_SERVER`] and name the era its `tools/list` saw.
+    fn era_after_connect(on_discover: &str, on_initialize: &str, probe: Duration) -> String {
+        let script = ERA_SERVER
+            .replace("@DISCOVER@", on_discover)
+            .replace("@INITIALIZE@", on_initialize);
+        let client = McpClient::connect_probing_for(
+            "/bin/sh",
+            &[String::from("-c"), script],
+            &std::env::temp_dir(),
+            &path_env(),
+            "croft",
+            "test",
+            probe,
+        )
+        .expect("the client settles the server's era");
+        let list = client.call("tools/list", json!({})).expect("tools/list");
+        parse_tools(&list)[0].name.clone()
+    }
+
+    /// A stateless server answers the probe, and croft then speaks to it with
+    /// per-request `_meta` and no handshake, which it would reject.
+    #[test]
+    fn a_server_answering_discover_is_spoken_to_statelessly() {
+        let era = era_after_connect(DISCOVERED, NO_SUCH_METHOD, PROBE_TIMEOUT);
+        assert_eq!(era, "modern");
+    }
+
+    /// A handshake-era server rejects the unknown probe method, so croft runs
+    /// `initialize` and `notifications/initialized`, then sends plain requests.
+    #[test]
+    fn a_server_rejecting_discover_gets_the_initialize_handshake() {
+        let era = era_after_connect(NO_SUCH_METHOD, INITIALIZED, PROBE_TIMEOUT);
+        assert_eq!(era, "legacy");
+    }
+
+    /// A handshake-era server that ignores requests sent before `initialize`
+    /// leaves the probe unanswered, and croft falls back once it times out.
+    #[test]
+    fn a_silent_probe_falls_back_to_the_handshake() {
+        let era = era_after_connect(":", INITIALIZED, Duration::from_millis(100));
+        assert_eq!(era, "legacy");
+    }
+
+    /// A stateless server that answers the probe only after it timed out is
+    /// still stateless: its late answer wins over the `initialize` croft sent
+    /// meanwhile, which such a server rejects.
+    #[test]
+    fn a_slow_stateless_server_is_not_misread_as_handshake_era() {
+        let slow = format!("sleep 0.5; {DISCOVERED}");
+        let era = era_after_connect(&slow, NO_SUCH_METHOD, Duration::from_millis(100));
+        assert_eq!(era, "modern");
     }
 
     /// End-to-end against a real MCP server process: a tiny hermetic Python

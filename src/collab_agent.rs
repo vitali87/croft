@@ -22,11 +22,24 @@ use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
 use crate::collab::{CollabChannel, CollabEvent, CollabRole, CollabSession};
+use crate::mcp::client::{
+    LEGACY_PROTOCOL_VERSION, META_CLIENT_CAPABILITIES, META_PROTOCOL_VERSION, META_SERVER_INFO,
+    PROTOCOL_VERSION, UNSUPPORTED_PROTOCOL_VERSION,
+};
 
 /// How long `collab_open` waits for the owner's snapshot before reporting
 /// that nobody serves this workspace: a hair past the session's own 3s
 /// bootstrap deadline, so the session's verdict always lands first.
 const OPEN_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// The revisions the seat speaks: the stateless one on requests that name it
+/// in `_meta`, and the handshake one through `initialize`. Being dual-era
+/// gives a seat to MCP clients on either side of 2026-07-28.
+const SUPPORTED_VERSIONS: [&str; 2] = [PROTOCOL_VERSION, LEGACY_PROTOCOL_VERSION];
+
+/// How long a stateless client may cache the tool list and discover result:
+/// both are fixed for the life of the binary.
+const CACHE_TTL_MS: u64 = 3_600_000;
 
 /// The guest session plus peers' last-seen carets (for `collab_status`).
 struct AgentState {
@@ -95,50 +108,117 @@ fn pump(state: &Mutex<AgentState>) {
 }
 
 /// Answer one inbound JSON-RPC message; `None` for notifications (and for
-/// malformed lines with no `id` to answer to).
+/// malformed lines with no `id` to answer to). The seat is dual-era: a request
+/// naming its revision in `_meta` is served statelessly, and one without is
+/// handshake-era, as `initialize` opened it.
 fn handle(state: &Mutex<AgentState>, msg: &Value) -> Option<Value> {
     let method = msg
         .get("method")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    let result = match method {
-        "initialize" => Ok(json!({
-            "protocolVersion": crate::mcp::client::PROTOCOL_VERSION,
-            "capabilities": { "tools": {} },
-            "serverInfo": {
-                "name": "croft-collab",
-                "version": env!("CARGO_PKG_VERSION"),
-            },
-        })),
-        "notifications/initialized" | "notifications/cancelled" => return None,
-        "ping" => Ok(json!({})),
-        "tools/list" => Ok(json!({ "tools": tool_definitions() })),
-        "tools/call" => {
-            let name = msg
-                .pointer("/params/name")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            let args = msg
-                .pointer("/params/arguments")
-                .cloned()
-                .unwrap_or_else(|| json!({}));
-            match call_tool(state, &name, &args) {
-                Some(result) => Ok(result),
-                None => Err((-32602, format!("unknown tool: {name}"))),
+    // A stateless request names its revision in `_meta`.
+    let meta = msg
+        .pointer("/params/_meta")
+        .filter(|m| m.get(META_PROTOCOL_VERSION).is_some());
+    let refusal = match meta {
+        Some(meta) => stateless_refusal(meta),
+        // Only the stateless revision has `server/discover`, and it requires
+        // the version.
+        None if method == "server/discover" => Some(rpc_error(
+            -32602,
+            format!("missing _meta {META_PROTOCOL_VERSION}"),
+        )),
+        None => None,
+    };
+    let result = match refusal {
+        Some(refusal) => Err(refusal),
+        None => match method {
+            "initialize" => Ok(json!({
+                "protocolVersion": LEGACY_PROTOCOL_VERSION,
+                "capabilities": { "tools": {} },
+                "serverInfo": server_info(),
+            })),
+            "server/discover" => Ok(json!({
+                "supportedVersions": SUPPORTED_VERSIONS,
+                "capabilities": { "tools": {} },
+            })),
+            "notifications/initialized" | "notifications/cancelled" => return None,
+            "ping" => Ok(json!({})),
+            "tools/list" => Ok(json!({ "tools": tool_definitions() })),
+            "tools/call" => {
+                let name = msg
+                    .pointer("/params/name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let args = msg
+                    .pointer("/params/arguments")
+                    .cloned()
+                    .unwrap_or_else(|| json!({}));
+                match call_tool(state, &name, &args) {
+                    Some(result) => Ok(result),
+                    None => Err(rpc_error(-32602, format!("unknown tool: {name}"))),
+                }
             }
-        }
-        _ => Err((-32601, format!("method not found: {method}"))),
+            _ => Err(rpc_error(-32601, format!("method not found: {method}"))),
+        },
     };
     let id = msg.get("id").cloned()?;
     Some(match result {
-        Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
-        Err((code, message)) => json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "error": { "code": code, "message": message },
-        }),
+        Ok(mut result) => {
+            if meta.is_some() {
+                stamp_stateless(method, &mut result);
+            }
+            json!({ "jsonrpc": "2.0", "id": id, "result": result })
+        }
+        Err(error) => json!({ "jsonrpc": "2.0", "id": id, "error": error }),
     })
+}
+
+/// A JSON-RPC error object.
+fn rpc_error(code: i64, message: impl Into<String>) -> Value {
+    json!({ "code": code, "message": message.into() })
+}
+
+/// Why a stateless request can't be served, if it can't. A revision the seat
+/// doesn't speak gets `UnsupportedProtocolVersion` listing the ones it does,
+/// so the client retries with one (or runs `initialize`), and a request
+/// missing its required capabilities is malformed.
+fn stateless_refusal(meta: &Value) -> Option<Value> {
+    let requested = &meta[META_PROTOCOL_VERSION];
+    if requested != PROTOCOL_VERSION {
+        let requested = requested
+            .as_str()
+            .map_or_else(|| requested.to_string(), str::to_string);
+        return Some(json!({
+            "code": UNSUPPORTED_PROTOCOL_VERSION,
+            "message": "Unsupported protocol version",
+            "data": { "supported": SUPPORTED_VERSIONS, "requested": requested },
+        }));
+    }
+    if meta.get(META_CLIENT_CAPABILITIES).is_none() {
+        return Some(rpc_error(
+            -32602,
+            format!("missing _meta {META_CLIENT_CAPABILITIES}"),
+        ));
+    }
+    None
+}
+
+/// What the stateless revision requires of every result: its type and the
+/// seat's identity, plus a freshness hint on the cacheable ones.
+fn stamp_stateless(method: &str, result: &mut Value) {
+    result["resultType"] = json!("complete");
+    result["_meta"] = json!({ META_SERVER_INFO: server_info() });
+    if matches!(method, "tools/list" | "server/discover") {
+        result["ttlMs"] = json!(CACHE_TTL_MS);
+        result["cacheScope"] = json!("public");
+    }
+}
+
+/// The seat's identity, in `initialize` and on every stateless result.
+fn server_info() -> Value {
+    json!({ "name": "croft-collab", "version": env!("CARGO_PKG_VERSION") })
 }
 
 /// A successful `tools/call` result: one text content block.
@@ -399,9 +479,10 @@ mod tests {
         let (_dir, _socket, state) = agent_over_relay();
 
         let init = handle(&state, &rpc(1, "initialize", json!({}))).unwrap();
-        assert_eq!(
-            init["result"]["protocolVersion"],
-            crate::mcp::client::PROTOCOL_VERSION
+        assert_eq!(init["result"]["protocolVersion"], LEGACY_PROTOCOL_VERSION);
+        assert!(
+            init["result"].get("resultType").is_none(),
+            "a handshake-era result stays as that revision shaped it"
         );
         assert_eq!(init["result"]["serverInfo"]["name"], "croft-collab");
         assert!(
@@ -441,6 +522,70 @@ mod tests {
             "the error teaches the fix: {}",
             text_of(&read)
         );
+    }
+
+    /// The stateless surface: `server/discover` advertises both revisions, a
+    /// request naming 2026-07-28 in `_meta` is served with no `initialize` and
+    /// its result stamped as that revision requires, and a revision the seat
+    /// doesn't speak, or a request missing required `_meta`, is refused with
+    /// the spec's codes.
+    #[test]
+    fn collab_agent_serves_stateless_requests_without_a_handshake() {
+        let (_dir, _socket, state) = agent_over_relay();
+        let meta = crate::mcp::client::request_meta("claude-code", "9.9.9");
+        let with_meta = |id: i64, method: &str, mut params: Value, meta: &Value| {
+            params["_meta"] = meta.clone();
+            handle(&state, &rpc(id, method, params)).unwrap()
+        };
+
+        let discovered = with_meta(1, "server/discover", json!({}), &meta);
+        let result = &discovered["result"];
+        assert_eq!(
+            result["supportedVersions"],
+            json!(["2026-07-28", "2025-11-25"])
+        );
+        assert_eq!(result["capabilities"], json!({ "tools": {} }));
+        assert_eq!(result["resultType"], "complete");
+        assert_eq!(result["cacheScope"], "public");
+        assert!(result["ttlMs"].as_u64().is_some());
+        assert_eq!(
+            result["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+            "croft-collab"
+        );
+
+        let tools = with_meta(2, "tools/list", json!({}), &meta);
+        assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 5);
+        assert_eq!(tools["result"]["resultType"], "complete");
+        assert!(tools["result"]["ttlMs"].as_u64().is_some());
+
+        let call = json!({ "name": "collab_read", "arguments": { "file": "src/f.rs" } });
+        let read = with_meta(3, "tools/call", call, &meta);
+        assert_eq!(read["result"]["resultType"], "complete");
+        assert_eq!(read["result"]["isError"], true);
+        assert!(
+            read["result"].get("ttlMs").is_none(),
+            "a tool call is not cacheable"
+        );
+
+        let mut future = meta.clone();
+        future["io.modelcontextprotocol/protocolVersion"] = json!("2099-01-01");
+        let refused = with_meta(4, "tools/list", json!({}), &future);
+        assert_eq!(refused["error"]["code"], -32022);
+        assert_eq!(
+            refused["error"]["data"],
+            json!({ "supported": ["2026-07-28", "2025-11-25"], "requested": "2099-01-01" })
+        );
+
+        let mut no_capabilities = meta.clone();
+        no_capabilities
+            .as_object_mut()
+            .unwrap()
+            .remove("io.modelcontextprotocol/clientCapabilities");
+        let malformed = with_meta(5, "tools/list", json!({}), &no_capabilities);
+        assert_eq!(malformed["error"]["code"], -32602);
+
+        let bare_discover = handle(&state, &rpc(6, "server/discover", json!({}))).unwrap();
+        assert_eq!(bare_discover["error"]["code"], -32602);
     }
 
     /// No owner on the relay: `collab_open` fails with what the user has to

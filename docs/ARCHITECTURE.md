@@ -142,7 +142,7 @@ src/
 ├── mcp/                 MCP sidecar host (Tier-1 extensions): croft is a DETERMINISTIC MCP host — a human invokes a contributed palette command and croft calls one pre-known tool on one vetted local server (no LLM picks tools), which removes MCP's whole prompt-injection/tool-poisoning attack family
 │   ├── mod.rs           module overview + McpOutcome (the off-thread worker's result)
 │   ├── transport.rs     JSON-RPC 2.0 over newline-delimited JSON on the server's stdio (the MCP stdio framing; simpler than DAP's Content-Length); setsid-detached child, reader thread -> mpsc, stderr drained into an 8 KiB tail whose last line names why a server exited before answering, least-privilege env_clear()+envs()
-│   ├── client.rs        the MCP lifecycle: initialize -> notifications/initialized -> tools/list -> tools/call, synchronous id-correlated calls; tool_fingerprint for trust-on-first-use rug-pull detection
+│   ├── client.rs        the dual-era MCP lifecycle: a server/discover probe at the stateless 2026-07-28 revision (per-request `_meta`, no handshake), falling back to initialize -> notifications/initialized for a server that rejects it or stays silent past 5s, then tools/list -> tools/call, synchronous id-correlated calls; tool_fingerprint for trust-on-first-use rug-pull detection
 │   ├── registry.rs           data-driven command registry: `contributed_commands()` for eager palette registration and `resolve_command_in_dir()` for lazy tool/server resolution from `[[commands]]`/`[[mcp_servers]]`, plus the `[[viewers]]` lookups
 │   ├── catalog.rs            the curated MCP catalog (AVAILABLE tier of the Extensions panel): bundled CATALOG_MANIFESTS merged with the remote signed index, with install/uninstall gated by provenance so croft removes only what it added, never a hand-dropped user manifest
 │   └── registry_index.rs the remote vetted index (extensions.croft.software): fetches index.json plus its signature and verifies ed25519 against a baked `INDEX_PUBLIC_KEY` BEFORE caching; stale-while-revalidate, disarmed when the key is all-zero
@@ -1182,6 +1182,8 @@ A headless collab guest exposed as an MCP server on stdio, behind the hidden `cr
 **Keeping the replica fresh.** A `30ms` pump thread runs between tool calls, so the agent's replica does not go stale while it is thinking.
 
 **It is an ordinary guest.** The agent inherits every guest property: owner-only disk writes, per-file site ids, CRDT convergence, and the 0600-socket trust boundary. croft itself contains no LLM code.
+
+**Dual-era.** A request that names the stateless 2026-07-28 revision in its `_meta` is served with no handshake. Its result carries `resultType` and the seat's `serverInfo`, plus `ttlMs`/`cacheScope` on `tools/list` and `server/discover`. Any other revision is refused with `UnsupportedProtocolVersion`, which lists both revisions the seat speaks. A request without that `_meta` is served as `initialize` (2025-11-25) opened it, so clients on either side of the revision get a seat.
 
 ### pair/local.rs
 
