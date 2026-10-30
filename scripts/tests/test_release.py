@@ -79,6 +79,26 @@ SHIPPED = "pub fn width(cols: u16) -> u16 {\n    cols / 2\n}\n"
 README = "Unreleased notes: one file per change. See CONTRIBUTING.md.\n"
 
 
+def with_anstyle(version: str) -> str:
+    """CARGO_LOCK with its one dependency, anstyle, and only that, at `version`."""
+    old = 'name = "anstyle"\nversion = "0.2.11"'
+    new = f'name = "anstyle"\nversion = "{version}"'
+    if old not in CARGO_LOCK:
+        raise AssertionError("fixture anchor is stale")
+    return CARGO_LOCK.replace(old, new)
+
+
+def lockfile(*pinned: tuple[str, str]) -> str:
+    """A lockfile pinning croft at 0.2.11 and each (name, version) given."""
+    stanzas = [
+        f'[[package]]\nname = "{name}"\nversion = "{version}"\n'
+        'source = "registry+https://github.com/rust-lang/crates.io-index"\n'
+        for name, version in pinned
+    ]
+    stanzas.append('[[package]]\nname = "croft-software"\nversion = "0.2.11"\n')
+    return "version = 4\n\n" + "\n".join(stanzas)
+
+
 def run(cwd, *args):
     return subprocess.run(args, cwd=cwd, check=True, capture_output=True, text=True).stdout
 
@@ -127,8 +147,8 @@ class Repo:
             errors = release.check("main", "HEAD", cwd=self.path)
         return errors, out.getvalue()
 
-    def cut(self, kind="patch"):
-        return release.cut(self.path, kind)
+    def cut(self, kind="patch", released_lock=None):
+        return release.cut(self.path, kind, released_lock)
 
 
 def joined(errors):
@@ -356,6 +376,110 @@ class Check(unittest.TestCase):
             errors, _ = repo.check()
             self.assertEqual(errors, [])
 
+    def test_a_dependency_bump_alone_needs_no_fragment(self):
+        """What a Dependabot PR is: Cargo.lock moves a dependency to a new
+        version and nothing else changes. Dependabot cannot write a fragment,
+        and the PR needs none: the release after merge notes the update."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            repo.branch()
+            repo.write("Cargo.lock", with_anstyle("0.2.12"))
+            repo.commit()
+            errors, out = repo.check()
+            self.assertEqual(errors, [])
+            self.assertIn("anstyle 0.2.12", out)
+
+    def test_a_raised_requirement_with_its_lock_needs_no_fragment(self):
+        """When the new version is outside the requirement, Cargo.toml moves
+        too, in whichever of its three shapes the dependency is written."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            manifest = CARGO_TOML.replace("[dependencies]\n", '[dependencies]\nanstyle = "0.2.11"\n')
+            repo.write("Cargo.toml", manifest)
+            repo.commit()
+            repo.branch()
+            raised = (
+                manifest.replace('anstyle = "0.2.11"', 'anstyle = "0.2.12"')
+                .replace('serde = { version = "0.2.11" }', 'serde = { version = "0.2.12" }')
+                .replace('[dependencies.toml]\nversion = "0.2.11"', '[dependencies.toml]\nversion = "0.2.12"')
+            )
+            self.assertEqual(raised.count('"0.2.12"'), 3, "fixture anchor is stale")
+            repo.write("Cargo.toml", raised)
+            repo.write("Cargo.lock", with_anstyle("0.2.12"))
+            repo.commit()
+            errors, _ = repo.check()
+            self.assertEqual(errors, [])
+
+    def test_a_dependency_change_beyond_its_version_needs_a_fragment(self):
+        """A feature turned on changes what is compiled in, and no version
+        the release could note says so."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            repo.branch()
+            old = 'serde = { version = "0.2.11" }'
+            self.assertIn(old, CARGO_TOML, "fixture anchor is stale")
+            repo.write("Cargo.toml", CARGO_TOML.replace(old, 'serde = { version = "0.2.12", features = ["derive"] }'))
+            repo.write("Cargo.lock", with_anstyle("0.2.12"))
+            repo.commit()
+            errors, _ = repo.check()
+            self.assertIn("adds no release notes", joined(errors))
+
+    def test_a_dependency_tables_other_strings_are_not_requirements(self):
+        """In a `[dependencies.<name>]` table only `version` is one:
+        `package`, `path` and `git` choose a different crate."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            table = '[dependencies.toml]\nversion = "0.2.11"\n'
+            self.assertIn(table, CARGO_TOML, "fixture anchor is stale")
+            repo.write("Cargo.toml", CARGO_TOML.replace(table, table + 'package = "toml"\n'))
+            repo.commit()
+            repo.branch()
+            repo.write("Cargo.toml", CARGO_TOML.replace(table, table + 'package = "toml-fork"\n'))
+            repo.write("Cargo.lock", with_anstyle("0.2.12"))
+            repo.commit()
+            errors, _ = repo.check()
+            self.assertIn("adds no release notes", joined(errors))
+
+    def test_a_dependency_bump_alongside_shipped_code_needs_a_fragment(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            repo.branch()
+            repo.write("src/lib.rs", SHIPPED.replace("/ 2", "/ 3"))
+            repo.write("Cargo.lock", with_anstyle("0.2.12"))
+            repo.commit()
+            errors, _ = repo.check()
+            self.assertIn("adds no release notes", joined(errors))
+
+    def test_a_lockfile_change_that_moves_no_version_needs_a_fragment(self):
+        """The release notes an update from the versions that moved. A
+        lockfile change that moves none would ship with nothing saying so."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            repo.branch()
+            added = '\n[[package]]\nname = "anstream"\nversion = "0.6.0"\n'
+            repo.write("Cargo.lock", CARGO_LOCK + added)
+            repo.commit()
+            errors, _ = repo.check()
+            self.assertIn("adds no release notes", joined(errors))
+
+    def test_a_crate_merged_onto_a_version_it_was_already_locked_at_needs_no_fragment(self):
+        """Raising croft's requirement on syn 1 to the syn 2 another
+        dependency already pulled in leaves one entry where there were two.
+        No entry is new, but syn moved."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            manifest = CARGO_TOML.replace("[dependencies]\n", '[dependencies]\nsyn = "1"\n')
+            repo.write("Cargo.toml", manifest)
+            repo.write("Cargo.lock", lockfile(("syn", "1.0.109"), ("syn", "2.0.51")))
+            repo.commit()
+            repo.branch()
+            repo.write("Cargo.toml", manifest.replace('syn = "1"', 'syn = "2"'))
+            repo.write("Cargo.lock", lockfile(("syn", "2.0.51")))
+            repo.commit()
+            errors, out = repo.check()
+            self.assertEqual(errors, [])
+            self.assertIn("syn 2.0.51", out)
+
 
 class Cut(unittest.TestCase):
     """After a merge: fold the fragments into the next version's notes, bump once."""
@@ -466,6 +590,86 @@ class Cut(unittest.TestCase):
                 repo.cut()
             self.assertEqual(repo.read("Cargo.toml"), CARGO_TOML)
             self.assertTrue(repo.exists("src/release_notes/unreleased/847-plot.md"))
+
+    def test_a_dependency_update_since_the_release_is_released_without_a_fragment(self):
+        """The merge of a dependency bump leaves no fragment, but the binary
+        it builds is not the released one, so it is released, saying so."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            repo.write("Cargo.lock", with_anstyle("0.2.12"))
+            repo.commit()
+            self.assertEqual(repo.cut(released_lock=CARGO_LOCK), "0.2.12")
+            self.assertEqual(repo.read("src/release_notes/0.2.12.md"), "fix: Updated anstyle to 0.2.12.\n")
+            self.assertIn('name = "anstyle"\nversion = "0.2.12"', repo.read("Cargo.lock"))
+            self.assertIn('version = "0.2.12"\nedition', repo.read("Cargo.toml"))
+
+    def test_dependency_updates_follow_the_fragments(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            repo.write("src/release_notes/unreleased/847-plot.md", "fix: Plot.\n")
+            repo.write("Cargo.lock", with_anstyle("0.2.12"))
+            repo.commit()
+            self.assertEqual(repo.cut(released_lock=CARGO_LOCK), "0.2.12")
+            self.assertEqual(
+                repo.read("src/release_notes/0.2.12.md"),
+                "fix: Plot.\nfix: Updated anstyle to 0.2.12.\n",
+            )
+
+    def test_croft_s_own_entry_is_not_a_dependency(self):
+        """croft's entry names the package being released. A lock from before
+        an earlier release has it at an older version, which is no update."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            ours = 'source = "path+file:///work"\nversion = "0.2.1'
+            older = CARGO_LOCK.replace(ours + '1"', ours + '0"')
+            self.assertNotEqual(older, CARGO_LOCK, "fixture anchor is stale")
+            self.assertIsNone(repo.cut(released_lock=older))
+            self.assertEqual(repo.read("Cargo.toml"), CARGO_TOML)
+            self.assertFalse(repo.exists("src/release_notes/0.2.12.md"))
+            # The same cut does release a dependency that moved.
+            theirs = '"anstyle"\nversion = "0.2.1'
+            self.assertEqual(repo.cut(released_lock=older.replace(theirs + '1"', theirs + '0"')), "0.2.12")
+
+    def test_a_crate_locked_at_two_versions_notes_each_that_moved(self):
+        """Cargo locks a crate at several versions when its dependents
+        disagree (syn 1 and syn 2). Read as one version per name, the
+        lockfile loses all but one of them."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            released = lockfile(("anstyle", "1.0.0"), ("syn", "1.0.108"), ("syn", "2.0.50"))
+            repo.write("Cargo.lock", lockfile(("anstyle", "1.0.0"), ("syn", "1.0.109"), ("syn", "2.0.51")))
+            repo.commit()
+            self.assertEqual(repo.cut(released_lock=released), "0.2.12")
+            self.assertEqual(
+                repo.read("src/release_notes/0.2.12.md"),
+                "fix: Updated syn to 1.0.109 and syn to 2.0.51.\n",
+            )
+
+    def test_a_crate_merged_onto_a_version_it_was_already_locked_at_is_released(self):
+        """syn 1 and syn 2 becoming syn 2 adds no entry the release lacked,
+        but the binary no longer builds syn 1."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            released = lockfile(("anstyle", "1.0.0"), ("syn", "1.0.109"), ("syn", "2.0.51"))
+            repo.write("Cargo.lock", lockfile(("anstyle", "1.0.0"), ("syn", "2.0.51")))
+            repo.commit()
+            self.assertEqual(repo.cut(released_lock=released), "0.2.12")
+            self.assertEqual(repo.read("src/release_notes/0.2.12.md"), "fix: Updated syn to 2.0.51.\n")
+
+    def test_five_updates_are_named_and_six_are_counted(self):
+        """The welcome card shows the notes one line each; a `cargo update`
+        that moves dozens of crates would fill it with their names."""
+        for moved, expected in [
+            (5, "fix: Updated dep0 to 1.0.1, dep1 to 1.1.1, dep2 to 1.2.1, dep3 to 1.3.1 and dep4 to 1.4.1.\n"),
+            (6, "fix: Updated 6 dependencies.\n"),
+        ]:
+            with tempfile.TemporaryDirectory() as tmp:
+                repo = Repo(Path(tmp))
+                released = lockfile(*[(f"dep{i}", f"1.{i}.0") for i in range(moved)])
+                repo.write("Cargo.lock", lockfile(*[(f"dep{i}", f"1.{i}.1") for i in range(moved)]))
+                repo.commit()
+                self.assertEqual(repo.cut(released_lock=released), "0.2.12", moved)
+                self.assertEqual(repo.read("src/release_notes/0.2.12.md"), expected, moved)
 
 
 class Notes(unittest.TestCase):
@@ -733,6 +937,14 @@ class VersionBumpShape(unittest.TestCase):
         `test_the_version_bump_step_with_nothing_pending_pushes_nothing`)."""
         self.assertNotIn("head_commit", VERSION_BUMP.read_text())
 
+    def test_the_checkout_reaches_back_to_the_release(self):
+        """`cut` reads Cargo.lock as the last release left it, at the commit
+        that set the version, which a depth-1 checkout does not have."""
+        text = VERSION_BUMP.read_text()
+        checkout = text[text.index("- uses: actions/checkout@") :]
+        checkout = checkout[: checkout.index("\n      - name:")]
+        self.assertIn("fetch-depth: 0", checkout)
+
 
 @unittest.skipUnless(shutil.which("bash") and shutil.which("git"), "needs bash and git")
 class Workflows(unittest.TestCase):
@@ -778,18 +990,41 @@ class Workflows(unittest.TestCase):
             out = self.gate(repo)
             self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
 
-    def bump(self, tmp: Path, pending: dict[str, str], racing: dict[str, str] | None = None):
+    def test_the_ci_step_passes_a_dependency_bump_alone(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            with_scripts(repo)
+            repo.commit()
+            repo.branch()
+            repo.write("Cargo.lock", with_anstyle("0.2.12"))
+            repo.commit()
+            out = self.gate(repo)
+            self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+            self.assertIn("anstyle 0.2.12", out.stdout)
+
+    def bump(
+        self,
+        tmp: Path,
+        pending: dict[str, str],
+        racing: dict[str, str] | None = None,
+        lock: str | None = None,
+        shallow: bool = False,
+    ):
         """Run the version-bump step in a clone of a bare `origin` whose main
         holds `pending` fragments. Returns the result and origin's path.
 
         With `racing`, another merge adding those fragments lands on origin's
         main after the step has cut and committed: origin refuses the step's
-        first push, as GitHub refuses a push that is not a fast-forward."""
+        first push, as GitHub refuses a push that is not a fast-forward.
+        With `lock`, the merge also moved Cargo.lock to it since the release.
+        With `shallow`, the step runs in a depth-1 clone."""
         (tmp / "seed").mkdir()
         seed = Repo(tmp / "seed")
         with_scripts(seed)
         for name, text in pending.items():
             seed.write(f"src/release_notes/unreleased/{name}", text)
+        if lock is not None:
+            seed.write("Cargo.lock", lock)
         seed.commit()
         origin = tmp / "origin.git"
         run(tmp, "git", "clone", "-q", "--bare", str(seed.path), str(origin))
@@ -814,7 +1049,10 @@ class Workflows(unittest.TestCase):
             )
             hook.chmod(0o755)
         work = tmp / "work"
-        run(tmp, "git", "clone", "-q", str(origin), str(work))
+        if shallow:
+            run(tmp, "git", "clone", "-q", "--depth", "1", f"file://{origin}", str(work))
+        else:
+            run(tmp, "git", "clone", "-q", str(origin), str(work))
         summary = tmp / "summary.md"
         out = subprocess.run(
             ["bash", "-c", step_script(VERSION_BUMP, BUMP_STEP)],
@@ -873,6 +1111,28 @@ class Workflows(unittest.TestCase):
             out, origin = self.bump(Path(tmp), {"848-edit.md": "# Edit\n"})
             self.assertNotEqual(out.returncode, 0)
             self.assertIn("848-edit.md", out.stderr)
+            self.assertEqual(run(origin, "git", "log", "--format=%s", "-1", "main").strip(), "c")
+
+    def test_the_version_bump_step_releases_a_dependency_update_without_a_fragment(self):
+        """The merge of a Dependabot PR: nothing is pending, but Cargo.lock
+        moved a dependency since the release."""
+        with tempfile.TemporaryDirectory() as tmp:
+            out, origin = self.bump(Path(tmp), {}, lock=with_anstyle("0.2.12"))
+            self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+            log = run(origin, "git", "log", "--format=%an|%s", "-1", "main").strip()
+            self.assertEqual(log, "github-actions[bot]|chore: release 0.2.12")
+            self.assertEqual(
+                run(origin, "git", "show", "main:src/release_notes/0.2.12.md"),
+                "fix: Updated anstyle to 0.2.12.\n",
+            )
+
+    def test_the_version_bump_step_stops_in_a_clone_without_the_release(self):
+        """Without the release's commit there is no telling what moved, and
+        "nothing" would leave a dependency update unreleased."""
+        with tempfile.TemporaryDirectory() as tmp:
+            out, origin = self.bump(Path(tmp), {}, lock=with_anstyle("0.2.12"), shallow=True)
+            self.assertNotEqual(out.returncode, 0, out.stdout)
+            self.assertIn("shallow", out.stderr)
             self.assertEqual(run(origin, "git", "log", "--format=%s", "-1", "main").strip(), "c")
 
     def publish_source(self, repo: Repo, version: str, out: Path) -> subprocess.CompletedProcess[str]:

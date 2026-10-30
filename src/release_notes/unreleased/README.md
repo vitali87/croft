@@ -14,8 +14,9 @@ Pull requests never change `version` in `Cargo.toml` and never write
 `src/release_notes/<version>.md`. After each merge, the version-bump workflow
 (`.github/workflows/version-bump.yml`, running `scripts/release.py cut`) folds
 every file here into the next version's notes, removes them, and bumps the
-version. A build made while notes are pending shows them on its welcome card
-under "IN THIS BUILD".
+version. A change that only moves dependency versions needs no file here: the
+cut adds a line naming the crates that moved. A build made while notes are
+pending shows them on its welcome card under "IN THIS BUILD".
 
 This README is never a note. See CONTRIBUTING.md, "Every shipped change carries
 release notes".

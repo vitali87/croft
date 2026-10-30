@@ -15,6 +15,11 @@ the fragments, and bumps Cargo.toml and croft's entry in Cargo.lock. The next
 version follows next_version.py's odometer, so MINOR and PATCH stay below
 1000.
 
+A change that moves dependency versions and nothing else, which is what a
+Dependabot PR is, needs no fragment: Dependabot cannot write one. `cut`
+compares Cargo.lock with what it held at the last release and adds a line for
+the crates that moved, so their release says so whoever merged them.
+
 Usage:
   release.py check <base> <head>         the PR gate: a shipped change carries
                                          a fragment and leaves the version alone
@@ -60,6 +65,18 @@ RELEASED_NOTES = re.compile(r"^src/release_notes/[0-9]+\.[0-9]+\.[0-9]+\.md$")
 # A dot-file (an editor's `.#name.md` lock file) is never a note, here, in
 # `fragment_paths` or in the build's `select::fragments`.
 FRAGMENT = re.compile(r"^src/release_notes/unreleased/[^/.][^/]*\.md$")
+
+# Cargo.toml's dependency tables, also under `[target.<cfg>]` or
+# `[workspace]`: one listing dependencies by name, where a dependency's value
+# is its requirement or an inline table holding one, and `[dependencies.<name>]`,
+# a table for one dependency, where only `version` is its requirement.
+DEPENDENCY_TABLE = re.compile(r"^\[(?:target\.[^\]]+\.|workspace\.)?(?:dev-|build-)?dependencies\]$")
+DEPENDENCY_SUBTABLE = re.compile(r"^\[(?:target\.[^\]]+\.|workspace\.)?(?:dev-|build-)?dependencies\.[^\]]+\]$")
+BARE_REQUIREMENT = re.compile(r'^(\s*[A-Za-z0-9_-]+\s*=\s*)"[^"]*"')
+INLINE_REQUIREMENT = re.compile(r'(\{.*\bversion\s*=\s*)"[^"]*"')
+TABLE_REQUIREMENT = re.compile(r'^(\s*version\s*=\s*)"[^"]*"')
+# Past this many dependency updates a release's note counts them instead.
+NAMED_UPDATES = 5
 
 
 class ReleaseError(Exception):
@@ -132,6 +149,98 @@ def set_lock_version(lock_text: str, new: str) -> str:
     return "[[package]]".join(stanzas)
 
 
+def locked(lock_text: str) -> dict[str, set[tuple[str, str]]]:
+    """Every (version, source) Cargo.lock pins each of croft's dependencies at.
+
+    A set per name, not one version: cargo locks a crate at several versions
+    at once (syn 1 and syn 2) when its dependents disagree. croft's own entry
+    is the package being released, not a dependency.
+    """
+    pins = {}
+    for stanza in lock_text.split("[[package]]")[1:]:
+        fields = dict(re.findall(r'^(name|version|source) = "([^"]*)"$', stanza, re.M))
+        if fields.get("name") != PACKAGE:
+            pin = (fields.get("version", ""), fields.get("source", ""))
+            pins.setdefault(fields.get("name", ""), set()).add(pin)
+    return pins
+
+
+def dependency_updates(old_lock: str, new_lock: str) -> list[tuple[str, str]]:
+    """(name, version) for each crate whose pins differ between the two
+    lockfiles, where the old one pinned that crate at all. A crate new to the
+    lockfile comes with a change to Cargo.toml, whose notes say why.
+
+    A crate is noted at each version the new lockfile pins it at that the old
+    one did not. One whose pins merged onto a version it already had, syn 1
+    and syn 2 becoming syn 2, gained none but moved all the same, so it is
+    noted at the versions it is left at.
+    """
+    old, new = locked(old_lock), locked(new_lock)
+    updates = set()
+    for name, pins in new.items():
+        if name in old and pins != old[name]:
+            updates |= {(name, version) for version, _ in (pins - old[name]) or pins}
+    return sorted(updates)
+
+
+def update_note(updates: list[tuple[str, str]]) -> str:
+    """The highlight a release carries for its dependency updates. The
+    welcome card shows the notes one line each, so a `cargo update` that
+    moves dozens of crates is counted rather than named."""
+    if len(updates) > NAMED_UPDATES:
+        return f"fix: Updated {len(updates)} dependencies.\n"
+    named = [f"{name} to {version}" for name, version in updates]
+    listed = named[0] if len(named) == 1 else ", ".join(named[:-1]) + " and " + named[-1]
+    return f"fix: Updated {listed}.\n"
+
+
+def without_requirements(toml_text: str) -> str:
+    """Cargo.toml with every dependency's version requirement blanked.
+
+    Two manifests equal under this differ only in the versions they ask for,
+    and Cargo.lock says which version each got. Everything else about a
+    dependency stays: a feature, a `path`, or a `package` rename picks
+    different code, so a change to it still reads as a change.
+    """
+    out, section = [], None
+    for line in toml_text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("["):
+            section = stripped
+        elif section and DEPENDENCY_TABLE.match(section):
+            line = INLINE_REQUIREMENT.sub(r'\1""', BARE_REQUIREMENT.sub(r'\1""', line))
+        elif section and DEPENDENCY_SUBTABLE.match(section):
+            line = TABLE_REQUIREMENT.sub(r'\1""', line)
+        out.append(line)
+    return "\n".join(out)
+
+
+def dependency_only(base: str, head: str, shipped: list[str], cwd=None) -> list[tuple[str, str]]:
+    """The dependency updates this change is made of, when it is nothing else.
+
+    What a Dependabot PR changes: Cargo.lock pins a crate at a new version,
+    and Cargo.toml raises the requirement when the new version is outside
+    it. Dependabot cannot write a fragment, and the change needs none: `cut`
+    notes every update since the last release. Empty when anything else
+    ships, or when no version moved for `cut` to note.
+    """
+    if not set(shipped) <= {"Cargo.toml", "Cargo.lock"}:
+        return []
+    if "Cargo.toml" in shipped:
+        manifests = [without_requirements(git("show", f"{rev}:Cargo.toml", cwd=cwd)) for rev in (base, head)]
+        if manifests[0] != manifests[1]:
+            return []
+    lock = [git("show", f"{rev}:Cargo.lock", cwd=cwd) for rev in (base, head)]
+    return dependency_updates(*lock)
+
+
+def lock_at_release(cwd=None) -> str:
+    """Cargo.lock as the last release left it: at the commit that set HEAD's
+    version, which is what `cut` compares the lockfile with."""
+    version = package_version(git("show", "HEAD:Cargo.toml", cwd=cwd))
+    return git("show", f"{setting_commit(version, cwd=cwd)}:Cargo.lock", cwd=cwd)
+
+
 def fragment_paths(root: Path) -> list[Path]:
     """Pending fragments, in file-name order so a cut is reproducible.
 
@@ -148,17 +257,23 @@ def fragment_paths(root: Path) -> list[Path]:
     )
 
 
-def cut(root, kind: str = "patch") -> str | None:
+def cut(root, kind: str = "patch", released_lock: str | None = None) -> str | None:
     """Fold the pending fragments into the next version's notes and bump.
 
-    Returns the new version, or None when no fragment is pending: a merge that
-    shipped nothing leaves none, and an empty release would paint an empty
+    `released_lock` is Cargo.lock as the last release left it: a dependency
+    the lockfile now pins at another version gets a line after the
+    fragments' highlights, since a dependency bump merges with no fragment.
+    Returns the new version, or None when neither is pending: a merge that
+    shipped nothing leaves neither, and an empty release would paint an empty
     card. Every check runs before the first write, so a refused cut leaves
     the tree as it found it.
     """
     root = Path(root)
     fragments = fragment_paths(root)
-    if not fragments:
+    toml_path, lock_path = root / "Cargo.toml", root / "Cargo.lock"
+    lock_text = lock_path.read_text(encoding="utf-8")
+    updates = [] if released_lock is None else dependency_updates(released_lock, lock_text)
+    if not fragments and not updates:
         return None
     texts = []
     for path in fragments:
@@ -169,10 +284,10 @@ def cut(root, kind: str = "patch") -> str | None:
                 "headings). Write one per line, each prefixed 'feature:' or 'fix:'."
             )
         texts.append(text)
+    if updates:
+        texts.append(update_note(updates))
 
-    toml_path, lock_path = root / "Cargo.toml", root / "Cargo.lock"
     toml_text = toml_path.read_text(encoding="utf-8")
-    lock_text = lock_path.read_text(encoding="utf-8")
     try:
         new = bump(package_version(toml_text), kind)
     except ValueError as err:
@@ -276,7 +391,8 @@ def setting_commit(version: str, cwd=None) -> str:
 def check(base: str, head: str, cwd=None) -> list[str]:
     """The PR gate. Returns its errors, each in GitHub's `::error` form.
 
-    A change that ships must add at least one fragment that says something.
+    A change that ships must add at least one fragment that says something,
+    unless all it ships is dependency versions, which `cut` notes itself.
     Whether or not anything ships, the version and every released version's
     notes stay as they are (`cut` writes both after merge), and a note
     pending on main stays, saying something.
@@ -343,7 +459,14 @@ def check(base: str, head: str, cwd=None) -> list[str]:
     for path in shipped:
         print(f"  {path}")
 
-    if not added:
+    updates = dependency_only(base, head, shipped, cwd=cwd)
+    if updates:
+        listed = ", ".join(f"{name} {version}" for name, version in updates)
+        print(
+            f"Only dependency versions changed ({listed}). The release after merge "
+            "notes them, so no fragment is needed."
+        )
+    elif not added:
         errors.append(
             f"::error::This PR changes shipped files but adds no release notes. Add "
             f"{UNRELEASED_DIR}/<name>.md, named for this change (for example its issue "
@@ -380,7 +503,7 @@ def run_command(argv: list[str]) -> int:
         return 1 if errors else 0
     if 1 <= len(argv) <= 2 and argv[0] == "cut":
         try:
-            new = cut(Path.cwd(), argv[1] if len(argv) == 2 else "patch")
+            new = cut(Path.cwd(), argv[1] if len(argv) == 2 else "patch", lock_at_release())
         except ReleaseError as err:
             print(f"::error::{err}", file=sys.stderr)
             return 1

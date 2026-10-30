@@ -67,7 +67,10 @@ fix: Ctrl+Q asks before throwing away unsaved edits.
 `src/release_notes/<version>.md`. After your PR merges, CI assigns the version,
 folds in the notes, and publishes the release. You don't need a fragment for
 docs, CI or test-only changes. A diff confined to `#[cfg(test)]`,
-`src/app/tests/` or `tests/` counts as test-only.
+`src/app/tests/` or `tests/` counts as test-only. Nor do you need one for a
+change that only moves dependency versions in `Cargo.lock` (and their
+requirements in `Cargo.toml`), like a Dependabot PR: the release adds a line
+naming the crates that moved.
 
 Releases to crates.io and GitHub go out every 50 versions. If users shouldn't
 wait that long for a merge, a maintainer labels its PR `release now`. The
