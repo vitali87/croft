@@ -5062,6 +5062,9 @@ pub(crate) fn resize_term(term: &mut Term<VoidListener>, size: TermSize) {
     }
     let grid = term.grid_mut();
     let cursor = grid.cursor.point.line.0;
+    // A shorter pane drops the screen rows from here down (alacritty keeps
+    // the cursor's row on it); a tail queued for one would go on another.
+    let kept = (size.screen_lines() as i32).max(cursor + 1);
     let mut tails = Vec::new();
     let mut wrapped_into = false;
     for l in grid.topmost_line().0..=grid.bottommost_line().0 {
@@ -5069,7 +5072,7 @@ pub(crate) fn resize_term(term: &mut Term<VoidListener>, size: TermSize) {
         let restored = unclip_row(row, old);
         let wraps = !restored && row[Column(old - 1)].flags.contains(Flags::WRAPLINE);
         let overflows = row[..].iter().skip(new).any(|c| !c.is_empty());
-        if overflows && !wrapped_into && !wraps && (new > old || l != cursor) {
+        if overflows && l < kept && !wrapped_into && !wraps && (new > old || l != cursor) {
             let mut tail = clip_row(row, new);
             if new > old {
                 // alacritty only grows a row narrower than the pane.
@@ -6822,6 +6825,32 @@ mod tests {
         assert_eq!(all_rows(&term)[..2], ["123456789", ""]);
         resize_to(&mut term, 30);
         assert_eq!(all_rows(&term)[0], row);
+    }
+
+    /// A pane losing lines as it narrows drops the rows below the cursor's,
+    /// and what was cut off them goes too, not onto the panel above.
+    #[test]
+    fn rows_a_shorter_pane_drops_take_their_cut_cells_with_them() {
+        let mut term = fresh_term(30, 6);
+        let bytes = format!(
+            "1\r\n{}\r\n$ \r\na row below the cursor\x1b[5;3H",
+            PANEL.join("\r\n")
+        );
+        feed(&mut term, bytes.as_bytes());
+        resize_term(&mut term, TermSize::new(12, 3));
+        let rows = all_rows(&term);
+        assert_eq!(
+            rows,
+            ["1", PANEL_AT_12[0], PANEL_AT_12[1], PANEL_AT_12[2], "$"]
+        );
+        resize_to(&mut term, 30);
+        let rows = all_rows(&term);
+        assert_eq!(
+            rows[..5],
+            ["1", PANEL[0], PANEL[1], PANEL[2], "$"],
+            "{rows:?}"
+        );
+        assert!(rows[5..].iter().all(String::is_empty), "{rows:?}");
     }
 
     #[test]
