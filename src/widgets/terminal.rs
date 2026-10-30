@@ -8908,7 +8908,8 @@ mod tests {
     /// `&` or a `# comment`, or starting with `;`, joined to croft's hooks
     /// with `;`, made bash reject the whole string at every prompt, so no
     /// mark was ever sent. Each shape must still mark a failed command, and
-    /// an empty Enter must still fabricate none.
+    /// empty Enters must still fabricate none: `_croft_precmd` runs first
+    /// and is what the DEBUG trap compares, never the user's entry.
     #[test]
     fn a_prompt_command_ending_in_a_separator_keeps_the_marks() {
         let Some(bash) = modern_bash() else {
@@ -8950,11 +8951,15 @@ mod tests {
             wait(&term, "bash's first prompt mark", &|t| {
                 !t.prompt_lines().is_empty()
             });
-            let prompts = term.prompt_lines().len();
-            term.write_input(b"\n");
-            wait(&term, "the prompt after an empty Enter", &|t| {
-                t.prompt_lines().len() > prompts
-            });
+            // Two: a start mark fabricated by the first would be closed
+            // by the second as a finished command.
+            for _ in 0..2 {
+                let prompts = term.prompt_lines().len();
+                term.write_input(b"\n");
+                wait(&term, "the prompt after an empty Enter", &|t| {
+                    t.prompt_lines().len() > prompts
+                });
+            }
             assert!(
                 pair_decorations(&term.marks_snapshot()).is_empty(),
                 "{user:?}: an empty Enter fabricated a command"
