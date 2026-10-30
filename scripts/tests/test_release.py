@@ -462,6 +462,24 @@ class Check(unittest.TestCase):
             errors, _ = repo.check()
             self.assertIn("adds no release notes", joined(errors))
 
+    def test_a_crate_merged_onto_a_version_it_was_already_locked_at_needs_no_fragment(self):
+        """Raising croft's requirement on syn 1 to the syn 2 another
+        dependency already pulled in leaves one entry where there were two.
+        No entry is new, but syn moved."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            manifest = CARGO_TOML.replace("[dependencies]\n", '[dependencies]\nsyn = "1"\n')
+            repo.write("Cargo.toml", manifest)
+            repo.write("Cargo.lock", lockfile(("syn", "1.0.109"), ("syn", "2.0.51")))
+            repo.commit()
+            repo.branch()
+            repo.write("Cargo.toml", manifest.replace('syn = "1"', 'syn = "2"'))
+            repo.write("Cargo.lock", lockfile(("syn", "2.0.51")))
+            repo.commit()
+            errors, out = repo.check()
+            self.assertEqual(errors, [])
+            self.assertIn("syn 2.0.51", out)
+
 
 class Cut(unittest.TestCase):
     """After a merge: fold the fragments into the next version's notes, bump once."""
@@ -626,6 +644,17 @@ class Cut(unittest.TestCase):
                 repo.read("src/release_notes/0.2.12.md"),
                 "fix: Updated syn to 1.0.109 and syn to 2.0.51.\n",
             )
+
+    def test_a_crate_merged_onto_a_version_it_was_already_locked_at_is_released(self):
+        """syn 1 and syn 2 becoming syn 2 adds no entry the release lacked,
+        but the binary no longer builds syn 1."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            released = lockfile(("anstyle", "1.0.0"), ("syn", "1.0.109"), ("syn", "2.0.51"))
+            repo.write("Cargo.lock", lockfile(("anstyle", "1.0.0"), ("syn", "2.0.51")))
+            repo.commit()
+            self.assertEqual(repo.cut(released_lock=released), "0.2.12")
+            self.assertEqual(repo.read("src/release_notes/0.2.12.md"), "fix: Updated syn to 2.0.51.\n")
 
     def test_five_updates_are_named_and_six_are_counted(self):
         """The welcome card shows the notes one line each; a `cargo update`

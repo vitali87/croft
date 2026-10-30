@@ -149,28 +149,38 @@ def set_lock_version(lock_text: str, new: str) -> str:
     return "[[package]]".join(stanzas)
 
 
-def locked(lock_text: str) -> set[tuple[str, str, str]]:
-    """Every (name, version, source) Cargo.lock pins for croft's dependencies.
+def locked(lock_text: str) -> dict[str, set[tuple[str, str]]]:
+    """Every (version, source) Cargo.lock pins each of croft's dependencies at.
 
-    A set of entries, not a map from name to version: cargo locks a crate at
-    several versions at once (syn 1 and syn 2) when its dependents disagree.
-    croft's own entry is the package being released, not a dependency.
+    A set per name, not one version: cargo locks a crate at several versions
+    at once (syn 1 and syn 2) when its dependents disagree. croft's own entry
+    is the package being released, not a dependency.
     """
-    entries = set()
+    pins = {}
     for stanza in lock_text.split("[[package]]")[1:]:
         fields = dict(re.findall(r'^(name|version|source) = "([^"]*)"$', stanza, re.M))
         if fields.get("name") != PACKAGE:
-            entries.add((fields.get("name", ""), fields.get("version", ""), fields.get("source", "")))
-    return entries
+            pin = (fields.get("version", ""), fields.get("source", ""))
+            pins.setdefault(fields.get("name", ""), set()).add(pin)
+    return pins
 
 
 def dependency_updates(old_lock: str, new_lock: str) -> list[tuple[str, str]]:
-    """(name, version) for each crate the new lockfile pins at a version the
-    old one did not, where the old one pinned that crate at all. A crate new
-    to the lockfile comes with a change to Cargo.toml, whose notes say why."""
-    old = locked(old_lock)
-    names = {name for name, _, _ in old}
-    return sorted((name, version) for name, version, _ in locked(new_lock) - old if name in names)
+    """(name, version) for each crate whose pins differ between the two
+    lockfiles, where the old one pinned that crate at all. A crate new to the
+    lockfile comes with a change to Cargo.toml, whose notes say why.
+
+    A crate is noted at each version the new lockfile pins it at that the old
+    one did not. One whose pins merged onto a version it already had, syn 1
+    and syn 2 becoming syn 2, gained none but moved all the same, so it is
+    noted at the versions it is left at.
+    """
+    old, new = locked(old_lock), locked(new_lock)
+    updates = set()
+    for name, pins in new.items():
+        if name in old and pins != old[name]:
+            updates |= {(name, version) for version, _ in (pins - old[name]) or pins}
+    return sorted(updates)
 
 
 def update_note(updates: list[tuple[str, str]]) -> str:
