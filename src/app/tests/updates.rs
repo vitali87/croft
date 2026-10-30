@@ -447,6 +447,71 @@ fn an_overlay_over_the_card_takes_the_clicks_on_it() {
     });
 }
 
+/// The card works without a mouse: each of its controls has a Command
+/// Palette entry, which runs only what the card offers now and says so
+/// when there is no card or no such control.
+#[test]
+fn the_palette_runs_the_update_cards_controls() {
+    use crate::widgets::command_palette::Command;
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        for cmd in [Command::ShowCroftUpdate, Command::SkipCroftUpdate] {
+            app.run_command(cmd);
+            assert_eq!(app.status, super::NO_UPDATE_ON_OFFER, "{cmd:?}");
+        }
+
+        app.update_toast = Some(super::UpdateToast::offer("9.9.9".into()));
+        app.run_command(Command::HideCroftUpdate);
+        assert!(!app.update_toast.as_ref().unwrap().open, "Later folds");
+        app.run_command(Command::ShowCroftUpdate);
+        assert!(app.update_toast.as_ref().unwrap().open, "Show opens it");
+        app.run_command(Command::CroftUpdateNotes);
+        assert_eq!(
+            app.status,
+            "Open https://github.com/vitali87/croft/releases/tag/v9.9.9"
+        );
+        app.run_command(Command::CroftUpdateLog);
+        assert_eq!(
+            app.status, "The croft update card has no install log now",
+            "an update that did not fail has no log link"
+        );
+
+        // A failed staging's card opens its log.
+        let log = super::staged_install_log_path();
+        std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+        std::fs::write(&log, "error: the build failed\n").unwrap();
+        app.update_toast = Some(super::UpdateToast {
+            failed: Some("the build failed"),
+            ..super::UpdateToast::offer("9.9.9".into())
+        });
+        app.run_command(Command::CroftUpdateLog);
+        assert_eq!(app.editor.path.as_deref(), Some(log.as_path()));
+
+        // A build waiting for Relaunch offers no Skip.
+        app.update_toast = Some(super::UpdateToast {
+            ready: true,
+            ..super::UpdateToast::offer("9.9.9".into())
+        });
+        app.run_command(Command::SkipCroftUpdate);
+        assert_eq!(app.status, "The croft update card has no Skip now");
+        assert!(app.update_toast.is_some());
+
+        // On the offer, Skip takes the card down and remembers the version.
+        app.update_toast = Some(super::UpdateToast::offer("9.9.9".into()));
+        app.run_command(Command::SkipCroftUpdate);
+        assert!(app.update_toast.is_none());
+        assert_eq!(
+            crate::update_check::CheckCache::load(&home.path().join(".cache").join("croft"))
+                .dismissed
+                .as_deref(),
+            Some("9.9.9")
+        );
+    });
+}
+
 /// The card's link opens the release's notes on GitHub, which list every
 /// version since the release before it.
 #[test]

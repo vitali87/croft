@@ -1055,6 +1055,9 @@ impl BottomPanelTab {
 /// update card stacks above it when both are up.
 const PORT_TOAST_HEIGHT: u16 = 4;
 
+/// What an update card command says when there is no card to act on.
+const NO_UPDATE_ON_OFFER: &str = "No croft update is on offer; Help: Update croft checks for one";
+
 /// A transient, click-only notification that a browsable port just appeared in
 /// the terminal. It never captures keystrokes — the terminal owns those — so
 /// the user clicks an action or lets it auto-dismiss. The forward actions only
@@ -53545,23 +53548,35 @@ impl App {
         changed
     }
 
-    /// A click on one of the update popup's controls (#333). Update stages
-    /// the build, whose progress the status bar shows (#1852); it, Skip
-    /// and Relaunch take the popup down, Later folds it into its pill, and
-    /// the link opens the release notes. A click elsewhere returns false.
+    /// A click on one of the update popup's controls (#333) does what that
+    /// control does. A click elsewhere returns false.
     fn handle_update_toast_click(&mut self, x: u16, y: u16) -> bool {
-        let Some(toast) = self.update_toast.as_ref().filter(|t| t.open) else {
-            return false;
-        };
-        let Some(action) = toast
-            .buttons
-            .iter()
-            .find(|(r, _)| rect_contains(*r, x, y))
+        let Some(action) = self
+            .update_toast
+            .as_ref()
+            .filter(|t| t.open)
+            .and_then(|t| t.buttons.iter().find(|(r, _)| rect_contains(*r, x, y)))
             .map(|(_, a)| *a)
         else {
             return false;
         };
-        let version = toast.release.version.clone();
+        self.run_update_action(action);
+        true
+    }
+
+    /// Do what one of the update card's controls does, clicked or run from
+    /// the Command Palette. Update stages the build, whose progress the
+    /// status bar shows (#1852); it, Skip and Relaunch take the card down,
+    /// Later folds it into its pill, and the links open the release notes
+    /// or a failed staging's log.
+    fn run_update_action(&mut self, action: UpdateToastAction) {
+        let Some(version) = self
+            .update_toast
+            .as_ref()
+            .map(|t| t.release.version.clone())
+        else {
+            return;
+        };
         match action {
             UpdateToastAction::Update => {
                 if self.staged_install.is_none() && self.self_install.is_none() {
@@ -53603,7 +53618,38 @@ impl App {
                 }
             }
         }
-        true
+    }
+
+    /// One of the update card's controls from the Command Palette, so the
+    /// card works without a mouse. It runs only what the card offers now
+    /// (a build waiting for Relaunch has no Skip, a card whose update did
+    /// not fail no install log), and says so otherwise.
+    fn run_update_action_from_palette(&mut self, action: UpdateToastAction, name: &str) {
+        let Some(toast) = self.update_toast.as_ref() else {
+            self.status = String::from(NO_UPDATE_ON_OFFER);
+            return;
+        };
+        let card = self.update_card(toast);
+        let offered = card
+            .buttons
+            .iter()
+            .map(|(_, a)| *a)
+            .chain(card.link.iter().map(|(_, _, a)| *a))
+            .any(|a| a == action);
+        if offered {
+            self.run_update_action(action);
+        } else {
+            self.status = format!("The croft update card has no {name} now");
+        }
+    }
+
+    /// Help: Show croft Update, the status-bar pill's click from the
+    /// keyboard: the card Later folded comes back.
+    fn show_update_card(&mut self) {
+        match self.update_toast.as_mut() {
+            Some(t) => t.open = true,
+            None => self.status = String::from(NO_UPDATE_ON_OFFER),
+        }
     }
 
     fn show_port_toast(&mut self, port: u16, process: Option<String>) {
@@ -58398,6 +58444,18 @@ impl App {
             Cmd::RerunLastTask => self.rerun_last_task(),
             Cmd::KeyboardShortcuts => self.open_shortcuts_modal(),
             Cmd::UpdateCroft => self.update_croft(),
+            Cmd::ShowCroftUpdate => self.show_update_card(),
+            Cmd::HideCroftUpdate => {
+                self.run_update_action_from_palette(UpdateToastAction::Later, "Later");
+            }
+            Cmd::SkipCroftUpdate => {
+                self.run_update_action_from_palette(UpdateToastAction::Skip, "Skip");
+            }
+            Cmd::CroftUpdateNotes => self
+                .run_update_action_from_palette(UpdateToastAction::ReleaseNotes, "What's New link"),
+            Cmd::CroftUpdateLog => {
+                self.run_update_action_from_palette(UpdateToastAction::InstallLog, "install log");
+            }
             Cmd::OpenSettings => self.open_settings_view(),
             Cmd::OpenSettingsEditor => self.open_settings_editor(),
             Cmd::OpenSettingsJson => self

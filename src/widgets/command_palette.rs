@@ -504,6 +504,14 @@ pub enum Command {
     ColorTheme,
     KeyboardShortcuts,
     UpdateCroft,
+    /// The update card's controls, so it works without a mouse: open the
+    /// card its status-bar pill stands for, Later, Skip, What's New, and a
+    /// failed staging's install log.
+    ShowCroftUpdate,
+    HideCroftUpdate,
+    SkipCroftUpdate,
+    CroftUpdateNotes,
+    CroftUpdateLog,
     OpenSettings,
     OpenSettingsEditor,
     OpenSettingsJson,
@@ -1011,6 +1019,11 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::ColorTheme,
     Command::KeyboardShortcuts,
     Command::UpdateCroft,
+    Command::ShowCroftUpdate,
+    Command::HideCroftUpdate,
+    Command::SkipCroftUpdate,
+    Command::CroftUpdateNotes,
+    Command::CroftUpdateLog,
     Command::OpenSettings,
     Command::OpenSettingsEditor,
     Command::OpenSettingsJson,
@@ -1499,6 +1512,11 @@ impl Command {
             Command::ColorTheme => "Preferences: Color Theme",
             Command::KeyboardShortcuts => "Help: Keyboard Shortcuts Reference",
             Command::UpdateCroft => "Help: Update croft (Relaunch or Rebuild)",
+            Command::ShowCroftUpdate => "Help: Show croft Update",
+            Command::HideCroftUpdate => "Help: Hide croft Update (Later)",
+            Command::SkipCroftUpdate => "Help: Skip This croft Update",
+            Command::CroftUpdateNotes => "Help: What's New in the croft Update",
+            Command::CroftUpdateLog => "Help: Open the croft Update Install Log",
             Command::OpenSettings => "Preferences: Open Settings",
             Command::OpenSettingsEditor => "Preferences: Open Settings (UI)",
             Command::OpenSettingsJson => "Preferences: Open Settings (JSON)",
@@ -1941,6 +1959,11 @@ impl Command {
             Command::TerminalOpenScrollback => "Cmd+K D",
             Command::KeyboardShortcuts => "F1",
             Command::UpdateCroft => "Cmd+Shift+F9",
+            Command::ShowCroftUpdate
+            | Command::HideCroftUpdate
+            | Command::SkipCroftUpdate
+            | Command::CroftUpdateNotes
+            | Command::CroftUpdateLog => "",
             Command::StartDebugging => "F5",
             Command::SelectDebugConfig => "",
             Command::AddDebugConfig => "",
@@ -2465,6 +2488,11 @@ impl Command {
             Command::ColorTheme => "color_theme",
             Command::KeyboardShortcuts => "keyboard_shortcuts",
             Command::UpdateCroft => "update_croft",
+            Command::ShowCroftUpdate => "show_croft_update",
+            Command::HideCroftUpdate => "hide_croft_update",
+            Command::SkipCroftUpdate => "skip_croft_update",
+            Command::CroftUpdateNotes => "croft_update_whats_new",
+            Command::CroftUpdateLog => "croft_update_install_log",
             Command::OpenSettings => "open_settings",
             Command::OpenSettingsEditor => "open_settings_editor",
             Command::OpenSettingsJson => "open_settings_json",

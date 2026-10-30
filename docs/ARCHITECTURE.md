@@ -1168,7 +1168,7 @@ A release-availability check plus a staged upgrade. Once a day, tracked by the c
 
 **Never automatic.** Skip remembers the version so it is not offered again, and `CROFT_NO_UPDATE_CHECK` disables the check entirely.
 
-**Later is not Skip.** Later folds the card into an "Update Available" pill on the status bar and remembers nothing, so the offer is one click away for the rest of the session and comes back on the next launch; a click on the pill opens or folds the card. Skip is the one that declines the version for good, as Ghostty's Skip does. A Homebrew install's card names `brew upgrade croft` and copies it, since croft must not stage over a binary Homebrew owns (#375).
+**Later is not Skip.** Later folds the card into an "Update Available" pill on the status bar and remembers nothing, so the offer is one click away for the rest of the session and comes back on the next launch; a click on the pill opens or folds the card. Skip is the one that declines the version for good, as Ghostty's Skip does. Every control also has a Command Palette entry (`App::run_update_action_from_palette`), which asks the same `update_card` builder that draws the card whether it offers that control now, so the keyboard can never do what the card would not. A Homebrew install's card names `brew upgrade croft` and copies it, since croft must not stage over a binary Homebrew owns (#375).
 
 ### voice.rs
 

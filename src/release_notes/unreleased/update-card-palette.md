@@ -1,0 +1,1 @@
+feature: The update card works without a mouse: Help: Show croft Update, Hide croft Update (Later), Skip This croft Update, What's New in the croft Update and Open the croft Update Install Log are in the Command Palette, and each can be bound in `keybindings.json`.
