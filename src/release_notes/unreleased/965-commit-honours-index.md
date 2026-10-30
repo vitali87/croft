@@ -1,0 +1,1 @@
+fix: Commit (Enter or ✓ Commit), Commit & Push and Commit & Sync commit only the staged changes when anything is staged, as VS Code does, so a hunk staged with `S` no longer takes the unstaged work with it; with nothing staged they still commit every tracked change.

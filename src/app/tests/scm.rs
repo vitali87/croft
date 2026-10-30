@@ -347,6 +347,29 @@ fn pressing_s_with_no_caret_stages_the_first_visible_hunk() {
     );
 }
 
+/// #965: Enter in the commit box commits the hunk staged with `S` and
+/// leaves the other in the working tree; `git commit -am` took both.
+#[test]
+fn enter_commits_only_the_hunk_staged_with_s() {
+    let (tmp, mut app) = scm_two_hunk_app();
+    app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE))
+        .unwrap();
+    app.source_control.message = String::from("Ship line 2");
+    app.source_control.message_cursor = 11;
+    app.handle_source_control_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    wait_for_git_net(&mut app);
+    let committed = git_stdout_in(tmp.path(), &["show", "HEAD:f.txt"]);
+    assert!(
+        committed.contains("LINE2") && !committed.contains("LINE18"),
+        "only the staged hunk is committed: {committed}"
+    );
+    let unstaged = git_stdout_in(tmp.path(), &["diff"]);
+    assert!(
+        unstaged.contains("+LINE18"),
+        "the unstaged hunk stays a working-tree change: {unstaged}"
+    );
+}
+
 #[test]
 fn pressing_u_in_a_scm_diff_unstages_only_the_hunk_under_the_caret() {
     let (tmp, mut app) = scm_two_hunk_app();
