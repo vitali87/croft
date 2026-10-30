@@ -603,7 +603,7 @@ pub enum Command {
     /// Drop every navigator comment box.
     ClearNavigatorNotes,
     /// Toggle the navigator's proactive comment-only looks (a completed
-    /// construct plus a typing pause hands it the floor on its own).
+    /// construct hands it the floor at the next workflow boundary).
     ToggleProactiveNavigator,
     /// Focus the active file's next navigator comment box (F4).
     NextComment,

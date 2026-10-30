@@ -392,11 +392,18 @@ pub struct Prefs {
     #[serde(default)]
     pub disable_inlay_hints: bool,
     /// Opt-out for the navigator's proactive comment-only looks (a newly
-    /// completed construct plus a typing pause hands it the floor). On by
+    /// completed construct hands it the floor at the next workflow boundary:
+    /// a commit, a test run or a task run ending). On by
     /// default while a navigator is seated; stored as the disable flag so
     /// the derived `Default` and an older config both mean "proactive".
     #[serde(default)]
     pub disable_proactive_navigator: bool,
+    /// Opt-out for the Git AI note croft attaches to a commit it makes when
+    /// the navigator or an agent wrote some of its lines (`refs/notes/ai`,
+    /// see `git_ai_notes.rs`). Stored as the disable flag so the derived
+    /// `Default` and an older config both mean "noted".
+    #[serde(default)]
+    pub disable_git_ai_notes: bool,
     /// Copy a finished terminal mouse selection straight to the clipboard
     /// (VS Code's `terminal.integrated.copyOnSelection`). Off by default,
     /// matching VS Code.

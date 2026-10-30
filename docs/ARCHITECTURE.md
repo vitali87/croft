@@ -27,6 +27,7 @@ src/
 ├── file_ref.rs          `path:line[:col]` references detected in terminal text (rustc / grep / pytest / Python-traceback forms); backs Cmd/Ctrl+click-to-jump from any terminal pane with zero per-tool problem-matcher config
 ├── quickfix.rs           parses the last `grep`/`rg`/`git grep` command line into a pattern plus Search toggles and include/exclude globs, so "Search & Replace from Last grep/rg" seeds and runs the Search sidebar via `SearchPanel::seed`
 ├── git.rs                branch / dirty / ahead-behind status plus the working-tree operations the Source Control panel drives; multi-root, one `GitWorker` per workspace root
+├── git_ai_notes.rs       seat provenance exported as a Git AI authorship log (authorship/3.0.0) on `refs/notes/ai` after each commit croft makes, carried from local history's saved seats onto the committed blob's added lines; never over an existing note
 ├── magic.rs              content-based format detection: a magic-byte signature table (images, PDF, zip family, gzip, tar, SQLite) used as the SECOND routing hint in `Editor::open` — extension first, sniffing decides when it gave no answer or lied
 ├── markdown.rs           rendered Markdown preview (Cmd/Ctrl+Shift+V): pulldown-cmark events to styled ratatui lines, tree-sitter fenced code, inline local images; pure, the editor holds the state
 ├── media.rs              audio/video info view for `.mp3`/`.wav`/`.flac`/`.m4a`/`.mp4`/`.m4v`/`.mov`: pure-Rust header parsers over a bounded head read, never decoding streams, rendered as a markdown card with an optional ffmpeg poster frame
@@ -77,7 +78,7 @@ src/
 ├── collab_agent.rs       a headless collab guest exposed as an MCP server on stdio (`croft collab-agent --workspace <path>`): joins the relay and serves five `collab_*` tools over JSON-RPC NDJSON so an external AI co-edits with a live named caret; croft itself contains no LLM code
 ├── pair.rs               the AI pilot core ("croft pair" / resident navigator): spawns the `claude` CLI as a persistent stream-json conversation and parses its fenced `<<<EDIT>>>` / `<<<NOTE>>>` protocol
 ├── pair/local.rs         the navigator's local-model transport: one Anthropic-compatible `/v1/messages` streaming call per turn (Ollama, LM Studio, llama.cpp, vLLM), deliberately not the claude CLI; selected by `croft pair --provider ollama [--base-url <url>] --model <m>`
-├── pair/proactive.rs     the proactive-look detector (pure text-in/row-out): tree-sitter judges that the driver completed a new construct since the navigator's last look; `App::tick_proactive_navigator` owns the gates and hands the seat a comment-only yield turn
+├── pair/proactive.rs     the proactive-look detector (pure text-in/row-out): tree-sitter judges that the driver completed a new construct since the navigator's last look; `App::tick_proactive_navigator` owns the gates (a workflow boundary: commit, test run, task run) and hands the seat a comment-only yield turn
 ├── pair_host.rs          the resident navigator's in-process host: the App spawns the pilot from the workspace's `<hash>.pair.json` record, drains `PairEvent`s per tick, and drives ask / yield turns
 ├── session_state.rs     captures open tabs / layout so a self-update re-exec can restore them
 ├── sheet.rs             CSV / TSV / XLSX / XLS / XLSB / ODS parsing via the csv and calamine crates
@@ -1050,7 +1051,9 @@ The proactive-look detector, pure text-in and row-out. Tree-sitter judges whethe
 
 **Language-specific completion tests.** Code languages multiset-compare outline symbols via `outline_syntax::symbols_for`; half-typed code parses as an `ERROR` node and never fires. Markdown walks its block grammar for a new heading or an ADDED paragraph, keyed on count growth, so prose edits never re-fire.
 
-**Gates live in the App.** `App::tick_proactive_navigator` owns them: seated, idle, a 2s typing pause, the file previously yielded, and one scan per buffer state. It then hands the seat the same comment-only yield turn Cmd+K Y would, anchored at the new construct.
+**Gates live in the App.** `App::tick_proactive_navigator` owns them: seated, idle, the file previously yielded, and a pending workflow boundary (`WorkflowBoundary`: a commit croft made, a driver-started test run ending, an awaited task run ending), scanned once. It then hands the seat the same comment-only yield turn Cmd+K Y would, anchored at the new construct.
+
+**Delivered at a boundary, never on a pause.** A typing pause is mid-task, and a field study of proactive IDE assistance (Kuo et al., IUI '26) found mid-task suggestions dismissed 62% of the time against 52% engagement right after a commit. So a completed construct waits for the next boundary. The boundary waits out a busy seat, a focused reply field and an open prompt, but lapses the moment the active buffer is edited after it: the driver is back at work. A watch rerun is not a boundary, since a save started it.
 
 **Opt-out.** The `disable_proactive_navigator` pref and the palette command "Navigator: Toggle Proactive Comments".
 
@@ -1082,6 +1085,16 @@ The panel group's PORTS tab: a registry of detected loopback ports (port, addres
 
 **Scrolling.** The body scrolls to keep the selection visible, since `f` and `x` act on it.
 
+### git_ai_notes.rs
+
+Seat provenance written into git as a Git AI authorship log, so `git-ai blame` and anything else reading the standard (authorship/3.0.0) on `refs/notes/ai` sees which lines the navigator wrote. `App::spawn_commit` captures an `Export` on the UI thread and runs it on the commit's worker right after `git commit` returns, before a rebase continuation or a push can move HEAD. The outcome goes to the Git Output log; the commit's own result is untouched.
+
+**The seats come from local history, not from the open buffers.** Every save records its snapshot with a seats sidecar, so the newest snapshot of a committed file is the text croft last wrote to disk and the seats on exactly those lines. That covers files closed before the commit and needs nothing from the UI thread. History is keyed on the path a tab holds, so both git's canonical toplevel and the workspace's own spelling of it are tried (`history_bases`).
+
+**A seat crosses to a committed line only on an EQUAL alignment, and only onto a line the commit added.** The commit is the index, not the snapshot: part of a file may be unstaged, or a tool outside croft may have touched it. A line diff of the snapshot against the committed blob carries each seat onto the line it aligns with as equal. Lines that changed since the save align with nothing and stay out, which Git AI reads as untracked, croft's Unknown. A line the commit did not add belongs to an older commit's note, since that is the commit git blame names for it. Lines compare without their endings, so CRLF checkouts align. Each diff has a 250 ms deadline; a coarser alignment finds fewer equal runs and so drops seats rather than moving them.
+
+**What the note names.** The navigator and agent panes become `s_…::t_…` AI sessions (`agent_id.tool` is `croft`; the model is the pair record's, since seats do not record which model sat in the seat), you become an `h_…` known human under the commit's committer identity, and peers and generated text stay out because croft cannot say truthfully who they are. A commit with no AI line gets no note, and a commit already noted (git-ai's own hook) keeps its note: the standard allows one, and git-ai's carries the conversations. Merges list no changes, so they get no note. `disable_git_ai_notes` turns the export off.
+
 ### provenance.rs
 
 Which SEAT wrote each line: a `Seat` (you, navigator, agent-by-pane, or collab peer) plus a per-buffer line map, feeding the gutter overlay and the inline blame annotation. Git blame answers "which commit", which cannot answer "did I write this or did the model?" — a commit records the author of the SAVE, not of the keystrokes.
@@ -1091,6 +1104,8 @@ Which SEAT wrote each line: a `Seat` (you, navigator, agent-by-pane, or collab p
 **Splicing drops rather than carries.** `splice` drops the attribution of every line an edit replaced instead of carrying it onto the replacement, and the caller records the new lines against the seat that made the edit. A caller that forgets leaves them unknown, which is the safe direction.
 
 **The seat is a call-site parameter.** It is a parameter on `insert_str_as` rather than editor state, because the same buffer takes text from several seats and which one is making THIS edit is known only at the call site.
+
+**It outlives the commit.** `git_ai_notes.rs` exports the saved seats as a Git AI note on each commit croft makes, under the same invariant.
 
 ### quickfix.rs
 

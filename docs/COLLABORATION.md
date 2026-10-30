@@ -171,12 +171,35 @@ it leaves, and riding its edits as they stream. Inside the editor:
 - **Cancel a stream mid-run**: click the orange `■` stop button in the gutter or press
   `Cmd+K X` — the streamed text is reverted and the conversation stays alive for your next
   instruction.
-- **It re-engages on its own**: once it has seen a file, finishing a new function, struct, or
-  markdown section and pausing hands it another comment-only look — a pair partner glancing
-  over, never able to edit uninvited. Turn it off with "Navigator: Toggle Proactive Comments".
+- **It re-engages on its own**: once it has seen a file, a new function, struct, or markdown
+  section you finished gets another comment-only look at the next workflow boundary — when you
+  commit, when a test run you started ends, or when a task run ends — never while you are still
+  typing. That is when developers welcome a second pair of eyes: a field study of proactive IDE
+  assistance (IUI '26) saw 52% of post-commit suggestions taken up, while 62% of mid-task ones
+  were dismissed. It can never edit uninvited. Turn it off with "Navigator: Toggle Proactive
+  Comments".
 
 The model's toolbox is read-only (`Read`/`Grep`/`Glob` plus a read-only collab seat); the only
-way it can change a buffer is the visible, cancellable stream. `croft pair --off` (or the
+way it can change a buffer is the visible, cancellable stream.
+
+### Who wrote it, after the commit
+
+croft tracks which seat wrote each line (the gutter's provenance overlay), and a commit would
+forget that: git records who committed, not who typed. So when you commit from croft and the
+navigator wrote some of the committed lines, croft attaches a [Git AI](https://usegitai.com)
+authorship note to the commit under `refs/notes/ai` (the open authorship/3.0.0 standard). The
+navigator's lines are named as an AI session, the lines croft saw you type as you, and every
+line croft did not watch being written is left out rather than guessed. `git-ai blame` reads the
+note, and so does plain git:
+
+```sh
+git notes --ref=ai show HEAD
+```
+
+A commit nobody but you wrote gets no note, and a commit that already has one (git-ai's own
+hook writes a fuller one) keeps it. Notes stay local until you push them
+(`git push origin refs/notes/ai`). Set `"disable_git_ai_notes": true` in your config to turn
+this off. `croft pair --off` (or the
 "Navigator: Activate or Deactivate" palette entry) unseats it.
 
 ### Local models

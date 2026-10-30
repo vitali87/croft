@@ -3740,6 +3740,63 @@ fn restoring_a_snapshot_carries_its_seats_onto_the_restore() {
     assert_eq!(again.editor.provenance, seats_v1);
 }
 
+/// A commit from Source Control carries the saved seats into git: the
+/// navigator's committed line lands in a Git AI note on refs/notes/ai, the
+/// Git Output log says so, and `disable_git_ai_notes` stops it.
+#[test]
+fn committing_navigator_lines_attaches_a_git_ai_note() {
+    use crate::provenance::Seat;
+    let (tmp, mut app) = scm_ready_to_commit();
+    let hist = tempfile::tempdir().unwrap();
+    app.history_root = hist.path().to_path_buf();
+    let f = tmp.path().join("seed.txt");
+    let text = b"changed\nfrom the navigator\n";
+    std::fs::write(&f, text).unwrap();
+    let mut seats = crate::provenance::Provenance::new();
+    seats.record(1..2, Seat::Navigator);
+    crate::history::record_with_seats_in(hist.path(), &f, text, now_millis(), &seats).unwrap();
+
+    app.source_control.message = String::from("navigator line");
+    app.commit_source_control();
+    wait_for_git_net(&mut app);
+    let note = git_stdout_in(tmp.path(), &["notes", "--ref=ai", "show", "HEAD"]);
+    assert!(
+        note.starts_with("seed.txt\n  s_") && note.contains(" 2\n---\n"),
+        "line 2 is the navigator's: {note}"
+    );
+    assert!(
+        app.git_output_log
+            .iter()
+            .any(|l| l.contains("1 AI-written line in 1 file noted on refs/notes/ai")),
+        "{:?}",
+        app.git_output_log
+    );
+
+    // Off: the next navigator commit gets no note.
+    app.git_ai_notes_enabled = false;
+    let text = b"changed\nfrom the navigator\nagain\n";
+    std::fs::write(&f, text).unwrap();
+    let mut seats = crate::provenance::Provenance::new();
+    seats.record(1..3, Seat::Navigator);
+    crate::history::record_with_seats_in(hist.path(), &f, text, now_millis() + 20_000, &seats)
+        .unwrap();
+    app.source_control.message = String::from("unnoted");
+    app.commit_source_control();
+    wait_for_git_net(&mut app);
+    assert_eq!(
+        last_commit_message(tmp.path()).trim(),
+        "unnoted",
+        "staging: the commit landed"
+    );
+    assert_eq!(
+        git_stdout_in(tmp.path(), &["notes", "--ref=ai", "list"])
+            .lines()
+            .count(),
+        1,
+        "only the first commit is noted"
+    );
+}
+
 #[test]
 fn cmd_shift_s_jumps_to_source_control_even_when_editor_is_focused() {
     let mut app = editor_app_with_lines(&["x"]);

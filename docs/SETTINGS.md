@@ -108,7 +108,7 @@ allowlist — appearance and editor/terminal behavior:
 per-language editor keys; see below), `files_encoding`.
 
 Everything else — `disabled_extensions`, `mcp_consented`, `disable_remote_offer`, `remote_offer_excluded_hosts`, `config_sync_excluded_hosts`, `config_sync_excluded_files`, `fleet_groups`, `code_scanning`, `lane_agent`,
-`mcp_tool_fingerprints`, `host_accents`, `notifications`, `screen_reader`, `screen_reader_command`, `codeql_cli_path`, `locale`, `terminal_multiline_paste_warning`, and any future key not explicitly
+`mcp_tool_fingerprints`, `host_accents`, `notifications`, `disable_git_ai_notes`, `screen_reader`, `screen_reader_command`, `codeql_cli_path`, `locale`, `terminal_multiline_paste_warning`, and any future key not explicitly
 allowlisted — is ignored from workspace layers with a visible warning.
 Extending the allowlist is a deliberate review decision, not a default.
 

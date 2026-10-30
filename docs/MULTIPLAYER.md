@@ -662,18 +662,23 @@ length-stable — so a human who picks the same name keeps the palette.
 Unseating (deactivate, death, or a workspace re-root) removes exactly the
 seat's carets.
 
-**Proactive looks.** The navigator re-engages on its own as the driver works.
-When tree-sitter sees a NEW completed construct in the active file and typing
-pauses for 2s, the App hands it the same comment-only yield turn `Cmd+K Y`
-would, anchored at the new construct. A construct is an outline symbol for code
+**Proactive looks.** The navigator re-engages on its own as the driver works,
+but only at a workflow boundary: a commit croft made, a Test Explorer run the
+driver started (a watch rerun is a save's echo, not one), or an awaited task or
+code-block run ending. When tree-sitter sees a NEW completed construct in the
+active file at that moment, the App hands it the same comment-only yield turn
+`Cmd+K Y` would, anchored at the new construct. Timing is the point: in a field
+study of proactive IDE assistance (Kuo et al., IUI '26), suggestions offered
+right after a commit drew 52% engagement while mid-task ones were dismissed 62%
+of the time, and a typing pause is mid-task. A boundary waits out a busy seat or
+an open prompt, lapses the moment the driver edits again, and is scanned once. A construct is an outline symbol for code
 — a half-typed `fn foo(` parses as an error and never fires, and member-level
 symbols like a struct field or enum variant count as edits inside their
 construct, not constructs — or a new heading / purely added top-level paragraph
 in markdown, where list bullets and block quotes are not paragraphs and a
 paragraph split in two is a reshape (`src/pair/proactive.rs`). Only files the
-navigator has already looked at re-engage it (re-engagement, not ambush); one
-buffer state is scanned at most once; edits inside existing constructs never
-fire. Opt out with "Navigator: Toggle Proactive Comments" (persisted as
+navigator has already looked at re-engage it (re-engagement, not ambush); edits
+inside existing constructs never fire. Opt out with "Navigator: Toggle Proactive Comments" (persisted as
 `disable_proactive_navigator`).
 
 **Presence and failure.** Seated and idle, the status bar wears a quiet

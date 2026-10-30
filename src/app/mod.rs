@@ -3710,6 +3710,9 @@ pub struct App {
     /// Local-history root (`~/.config/croft/history`), cached so tests can
     /// redirect snapshots to a tempdir.
     history_root: PathBuf,
+    /// Attach a Git AI note (`refs/notes/ai`) to each commit croft makes
+    /// that carries lines an AI seat wrote; off with `disable_git_ai_notes`.
+    git_ai_notes_enabled: bool,
     /// The snapshot currently shown in a local-history diff, `(live file,
     /// snapshot millis, snapshot contents)`, so "Local History: Restore
     /// Snapshot" can write it back and carry its seats (#349). Cleared when a
@@ -5679,14 +5682,17 @@ pub struct App {
     /// open failure whose errno changes keeps the first announcement.
     pair_lock_denied: Option<PairLockDenial>,
     /// Proactive navigator looks (docs/MULTIPLAYER.md): a completed new
-    /// construct plus a typing pause hands the seated navigator a
-    /// comment-only turn on its own. Opt-out via
+    /// construct, delivered at the next workflow boundary, hands the seated
+    /// navigator a comment-only turn on its own. Opt-out via
     /// `Prefs::disable_proactive_navigator` / the palette toggle.
     proactive_navigator_enabled: bool,
-    /// Per file, the edit_seq the proactive trigger last scanned: one
-    /// buffer state is parsed at most once, however long the pause lasts
-    /// and however often the driver switches tabs across visited files.
-    proactive_scanned: std::collections::HashMap<PathBuf, u64>,
+    /// The workflow boundary the driver last reached (a commit, a test run
+    /// or a task run ending) and when, until the proactive trigger consumes
+    /// it or the driver edits again. One boundary scans at most once.
+    workflow_boundary: Option<(WorkflowBoundary, std::time::Instant)>,
+    /// The Test Explorer run in flight was started by the watch, not by the
+    /// driver: its end is a save's echo, not a workflow boundary.
+    watch_run_in_flight: bool,
     /// Test seam: builds the PairHost from the config (the real path spawns
     /// the claude CLI, which a test must never do).
     #[cfg(test)]
@@ -6743,6 +6749,7 @@ impl App {
             } else {
                 crate::history::history_dir()
             },
+            git_ai_notes_enabled: !loaded_prefs.disable_git_ai_notes,
             history_restore: None,
             deps_rx,
             deps_tx,
@@ -7277,7 +7284,8 @@ impl App {
             pair_lock_denied: None,
             pair_noted_files: std::collections::BTreeSet::new(),
             proactive_navigator_enabled: !loaded_prefs.disable_proactive_navigator,
-            proactive_scanned: std::collections::HashMap::new(),
+            workflow_boundary: None,
+            watch_run_in_flight: false,
             #[cfg(test)]
             pair_spawn_override: None,
             #[cfg(test)]
@@ -28080,6 +28088,14 @@ impl App {
         // The one reader of the run-ended latch also settles a run's
         // "Running …" status (#856).
         let finished = self.testing.take_finished();
+        // A run with a verdict that the driver started is a workflow
+        // boundary; a discovery has none, and a watch rerun is a save's echo.
+        if finished.is_some() {
+            let by_watch = std::mem::take(&mut self.watch_run_in_flight);
+            if matches!(finished, Some(Some(_))) && !by_watch {
+                self.mark_workflow_boundary(WorkflowBoundary::TestRun);
+            }
+        }
         let mut changed = self.announce_test_run_end(finished);
         self.speak_test_run_end(finished, changed);
         if let Some(ok) = finished
@@ -28109,6 +28125,7 @@ impl App {
         let Some(scope) = self.testing.watch.take_due(now, busy) else {
             return changed;
         };
+        self.watch_run_in_flight = true;
         match scope {
             WatchScope::All => self.test_worker.run_all(),
             WatchScope::Suite(suite) => {
@@ -41596,44 +41613,46 @@ impl App {
         }
     }
 
-    /// Proactive navigator look (docs/MULTIPLAYER.md): when the driver
-    /// completes a NEW construct in the active file (tree-sitter judged —
-    /// half-typed code never parses as one) and pauses typing, the seated
-    /// navigator takes the same comment-only turn Cmd+K Y hands it, anchored
-    /// at the new construct. Only files the navigator has already looked at
-    /// re-engage it (this is RE-engagement, not ambush), and a buffer state
-    /// is scanned at most once. Runs once per frame tick; true = turn sent.
+    /// The driver reached a workflow boundary: the moment a proactive look
+    /// is welcome (see [`WorkflowBoundary`]).
+    fn mark_workflow_boundary(&mut self, kind: WorkflowBoundary) {
+        self.workflow_boundary = Some((kind, std::time::Instant::now()));
+    }
+
+    /// Proactive navigator look (docs/MULTIPLAYER.md): when the driver has
+    /// completed a NEW construct in the active file (tree-sitter judged —
+    /// half-typed code never parses as one) and then reaches a workflow
+    /// boundary, the seated navigator takes the same comment-only turn
+    /// Cmd+K Y hands it, anchored at the new construct. Only files the
+    /// navigator has already looked at re-engage it (this is RE-engagement,
+    /// not ambush), and a boundary is scanned at most once. Runs once per
+    /// frame tick; true = turn sent.
     fn tick_proactive_navigator(&mut self) -> bool {
-        if !self.proactive_navigator_enabled {
-            return false;
-        }
-        let Some(host) = &self.pair_host else {
+        let Some((boundary, at)) = self.workflow_boundary else {
             return false;
         };
-        if host.is_busy() || self.editor.comment_focus.is_some() {
-            return false;
-        }
-        // The user is mid-typing in a prompt (the ask box included):
-        // stealing the seat now would make their Enter land on a busy host
-        // and fail. Suppress WITHOUT consuming the scan latch below, so the
-        // look fires once the prompt closes.
-        if self.input_prompt.is_some() {
-            return false;
-        }
-        let Some(edited) = self.editor.last_edit_at else {
-            return false;
+        let lapsed = self.editor.last_edit_at.is_some_and(|edited| edited > at);
+        let host = match &self.pair_host {
+            Some(host) if self.proactive_navigator_enabled && !lapsed => host,
+            // No seat or no consent: nothing to deliver, and a boundary must
+            // not wait for a navigator seated minutes later. Lapsed: the
+            // driver went back to work, and a look now would land mid-task.
+            _ => {
+                self.workflow_boundary = None;
+                return false;
+            }
         };
-        if edited.elapsed() < PROACTIVE_PAUSE {
+        // Busy with a turn, a reply being typed, or the user mid-typing in a
+        // prompt (the ask box included): stealing the seat now would make
+        // their Enter land on a busy host and fail. Hold the boundary, so the
+        // look comes once the way is clear.
+        if host.is_busy() || self.editor.comment_focus.is_some() || self.input_prompt.is_some() {
             return false;
         }
+        self.workflow_boundary = None;
         let Some(path) = self.editor.path.clone() else {
             return false;
         };
-        let seq = self.editor.edit_seq;
-        if self.proactive_scanned.get(&path) == Some(&seq) {
-            return false;
-        }
-        self.proactive_scanned.insert(path.clone(), seq);
         let Some(file) = collab_file_key(&self.tree.root, &path) else {
             return false;
         };
@@ -41649,7 +41668,12 @@ impl App {
         };
         match host.send_yield_turn(&file, &content) {
             Ok(()) => {
-                self.status = format!("{} is taking a look at {file}:{}", host.name(), row + 1);
+                self.status = format!(
+                    "{} is taking a look at {file}:{} after the {}",
+                    host.name(),
+                    row + 1,
+                    boundary.label()
+                );
                 self.pair_turn_origin = Some((file, row));
                 true
             }
@@ -44143,11 +44167,31 @@ impl App {
         if self.git_net_busy() {
             return;
         }
+        // The seats go into git on the same worker, right after the commit
+        // and before anything else can move HEAD (see `git_ai_notes.rs`).
+        let ai_notes = self
+            .git_ai_notes_enabled
+            .then(|| crate::git_ai_notes::Export {
+                repo_root: self.scm_root(),
+                workspace: self.active_scm_root.clone(),
+                history_root: self.history_root.clone(),
+                pair_record: self.pair_record_path.clone(),
+            });
         self.spawn_git_net("commit", move || {
             let r = commit();
+            let noted = match (&r, ai_notes) {
+                (Ok(_), Some(export)) => Some(export.run()),
+                _ => None,
+            };
             Box::new(move |app: &mut App| {
                 if r.is_ok() && app.source_control.message.trim() == message.trim() {
                     app.source_control.clear_after_commit();
+                }
+                if r.is_ok() {
+                    app.mark_workflow_boundary(WorkflowBoundary::Commit);
+                }
+                if let Some(noted) = noted {
+                    app.log_git("notes --ref=ai add", &noted.map(|o| o.summary()));
                 }
                 done(app, r)
             })
@@ -53140,6 +53184,7 @@ impl App {
                 continue; // a second command the same sweep saw end
             };
             let (_, run) = self.pane_run_statuses.remove(i);
+            self.mark_workflow_boundary(WorkflowBoundary::TaskRun);
             if run.settle(&mut self.status, |label, _| {
                 pane_run_outcome(label, exit, dur)
             }) {
@@ -67561,6 +67606,7 @@ impl App {
         self.auto_close_pairs = !p.disable_auto_close_pairs;
         self.editor.auto_close_pairs = self.auto_close_pairs;
         self.paste_reindent = !p.disable_paste_reindent;
+        self.git_ai_notes_enabled = !p.disable_git_ai_notes;
 
         self.save_cleanup = crate::widgets::editor::SaveCleanup::from_prefs(p);
         self.follow_vim_mode_pref(p.vim_mode);
@@ -81036,10 +81082,32 @@ struct SessionCaret {
 /// bare colored cell).
 const CARET_LABEL_FADE: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// The typing pause that arms a proactive navigator look: long enough that
-/// mid-thought keystrokes never fire it, short enough to feel like a pair
-/// partner glancing over (double the 1s auto-save delay).
-const PROACTIVE_PAUSE: std::time::Duration = std::time::Duration::from_secs(2);
+/// The moments a proactive navigator look is delivered: the driver has just
+/// finished a unit of work and turned to judging it. A field study of
+/// proactive IDE assistance (Kuo et al., IUI '26) saw 52% engagement for
+/// suggestions offered right after a commit, while ones offered mid-task
+/// were dismissed 62% of the time; a typing pause is mid-task.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WorkflowBoundary {
+    /// A commit croft made succeeded.
+    Commit,
+    /// A Test Explorer run the driver started ended (a watch rerun that a
+    /// save kicked off is not one).
+    TestRun,
+    /// A task or code-block run whose end croft awaited ended.
+    TaskRun,
+}
+
+impl WorkflowBoundary {
+    /// How the status line names the moment ("after the commit").
+    fn label(self) -> &'static str {
+        match self {
+            WorkflowBoundary::Commit => "commit",
+            WorkflowBoundary::TestRun => "test run",
+            WorkflowBoundary::TaskRun => "run",
+        }
+    }
+}
 
 /// A collab peer's last-known caret: where it is, whose it is, and when it
 /// last moved (the name tag shows while `last_moved` is inside

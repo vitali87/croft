@@ -1076,11 +1076,12 @@ fn reroot_rebinds_the_navigator_activation_watch() {
 }
 
 /// The proactive trigger: after the navigator's first look at a file, a
-/// newly COMPLETED construct plus a typing pause makes it take a
-/// comment-only look on its own. A pause alone never fires, the pref kills
-/// the behavior, and one buffer state never fires twice.
+/// newly COMPLETED construct is delivered as a comment-only look at the next
+/// workflow boundary. A construct alone never fires however long the pause
+/// (that is mid-task), a boundary with nothing new never fires, the pref
+/// kills the behavior, and one boundary never fires twice.
 #[test]
-fn a_completed_construct_plus_pause_triggers_a_proactive_look() {
+fn a_completed_construct_is_looked_at_on_the_next_workflow_boundary() {
     use std::time::{Duration, Instant};
     if !crate::lsp::manager::is_on_path("python3") {
         eprintln!("SKIPPED: python3 not on PATH");
@@ -1130,16 +1131,38 @@ fn a_completed_construct_plus_pause_triggers_a_proactive_look() {
         std::thread::sleep(Duration::from_millis(10));
     }
 
-    // A pause with no new construct never fires.
+    // A boundary with no new construct never fires, and is spent.
     app.editor.last_edit_at = Some(Instant::now() - Duration::from_secs(3));
     app.editor.edit_seq += 1;
+    app.mark_workflow_boundary(WorkflowBoundary::Commit);
     assert!(!app.tick_proactive_navigator(), "no new construct: no look");
+    assert!(app.workflow_boundary.is_none(), "the boundary was scanned");
 
-    // Complete a new function, pause — but the pref is off: no fire.
+    // Complete a new function and pause: mid-task, so no look.
     let beta_row = app.editor.lines.len(); // where the new fn will sit
     app.editor.lines.push("fn beta() {}".into());
     app.editor.edit_seq += 1;
-    app.editor.last_edit_at = Some(Instant::now() - Duration::from_secs(3));
+    app.editor.last_edit_at = Some(Instant::now() - Duration::from_secs(60));
+    assert!(
+        !app.tick_proactive_navigator(),
+        "a pause is not a workflow boundary"
+    );
+
+    // A boundary the driver typed past has lapsed.
+    app.mark_workflow_boundary(WorkflowBoundary::TestRun);
+    app.editor.last_edit_at = Some(Instant::now() + Duration::from_millis(5));
+    assert!(
+        !app.tick_proactive_navigator(),
+        "an edit after the boundary means the driver is mid-task again"
+    );
+    assert!(
+        app.workflow_boundary.is_none(),
+        "the lapsed boundary is gone"
+    );
+    app.editor.last_edit_at = Some(Instant::now() - Duration::from_secs(60));
+
+    // A boundary, but the pref is off: no fire.
+    app.mark_workflow_boundary(WorkflowBoundary::Commit);
     app.proactive_navigator_enabled = false;
     assert!(
         !app.tick_proactive_navigator(),
@@ -1149,8 +1172,9 @@ fn a_completed_construct_plus_pause_triggers_a_proactive_look() {
     // Pref back on but the user is mid-typing in a prompt (the ask box):
     // stealing the seat now would make their Enter fail against a busy
     // host and lose the typed draft. An open prompt suppresses the look
-    // without consuming the scan.
+    // without spending the boundary.
     app.proactive_navigator_enabled = true;
+    app.mark_workflow_boundary(WorkflowBoundary::Commit);
     app.open_ask_navigator((0, 0), String::new());
     assert!(app.input_prompt.is_some(), "the ask box must open");
     assert!(
@@ -1161,7 +1185,10 @@ fn a_completed_construct_plus_pause_triggers_a_proactive_look() {
 
     // Prompt closed: the completed construct fires a comment-only look
     // anchored at the new function's row.
-    assert!(app.tick_proactive_navigator(), "new fn + pause must fire");
+    assert!(
+        app.tick_proactive_navigator(),
+        "new fn + boundary must fire"
+    );
     assert_eq!(
         app.pair_turn_origin,
         Some((String::from("f.rs"), beta_row)),
@@ -1171,9 +1198,72 @@ fn a_completed_construct_plus_pause_triggers_a_proactive_look() {
         app.pair_host.as_ref().unwrap().is_busy(),
         "the proactive look is a real turn"
     );
+    assert!(
+        app.status.ends_with("after the commit"),
+        "the status names the boundary: {}",
+        app.status
+    );
 
-    // The same buffer state never fires twice (latch + busy host).
+    // One boundary never fires twice.
+    assert!(app.workflow_boundary.is_none());
     assert!(!app.tick_proactive_navigator());
+}
+
+/// A commit croft makes is a workflow boundary; a refused one is not.
+#[test]
+fn a_commit_marks_a_workflow_boundary() {
+    let (_tmp, mut app) = scm_ready_to_commit();
+    app.source_control.message = String::from("bump seed");
+    app.commit_source_control();
+    wait_for_git_net(&mut app);
+    assert!(
+        matches!(app.workflow_boundary, Some((WorkflowBoundary::Commit, _))),
+        "a commit marks the boundary: {}",
+        app.status
+    );
+
+    // Nothing is left to commit, so git refuses the next one.
+    app.workflow_boundary = None;
+    app.source_control.message = String::from("again");
+    app.commit_source_control();
+    wait_for_git_net(&mut app);
+    assert!(
+        app.workflow_boundary.is_none(),
+        "a refused commit is no boundary: {}",
+        app.status
+    );
+}
+
+/// A test run the driver started is a workflow boundary when it ends; a
+/// watch rerun, which a save started, and a discovery are not.
+#[test]
+fn a_finished_test_run_marks_a_workflow_boundary_unless_the_watch_ran_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.watch_run_in_flight = true;
+    app.testing.on_finished(Some(true));
+    app.tick_test_watch();
+    assert!(
+        app.workflow_boundary.is_none(),
+        "a watch rerun is no boundary"
+    );
+    assert!(!app.watch_run_in_flight, "its end clears the mark");
+
+    app.testing
+        .on_busy_started(crate::testing::model::Activity::Discovering);
+    app.testing.on_finished(Some(true));
+    app.tick_test_watch();
+    assert!(
+        app.workflow_boundary.is_none(),
+        "a discovery is no boundary"
+    );
+
+    app.testing.on_finished(Some(false));
+    app.tick_test_watch();
+    assert!(
+        matches!(app.workflow_boundary, Some((WorkflowBoundary::TestRun, _))),
+        "a red run the driver started is a boundary"
+    );
 }
 
 fn set_stream(owner: &mut App, pilot: &mut crate::collab::CollabSession, active: bool) {
