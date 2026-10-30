@@ -3215,6 +3215,9 @@ pub struct Editor {
     /// only, keyed by `(edit_seq, wrap width)`. Comment-box rows are few and
     /// change without an edit, so they are added at mapping time instead.
     ruler_starts_cache: Option<(u64, usize, Vec<usize>)>,
+    /// The caret's bracket-match highlight, keyed by `(edit_seq, caret,
+    /// protected_current)`: see `cached_bracket_match_pair`.
+    bracket_pair_cache: Option<BracketPairCache>,
     /// The `edit_seq` the collab session last synced this buffer at (Phase D
     /// independent viewports, docs/MULTIPLAYER.md). The tick diff extracts
     /// ops only when `edit_seq` has moved past this, and it is re-pinned
@@ -3939,6 +3942,7 @@ impl Editor {
             mirror_caret: None,
             ruler_search_cache: None,
             ruler_starts_cache: None,
+            bracket_pair_cache: None,
             collab_synced_seq: 0,
             collab_doc_gen: 0,
             git_head_lines: None,
@@ -14101,31 +14105,26 @@ impl Editor {
             return None;
         }
         let mut depth = 0i32;
-        let (mut row, mut col) = open;
-        loop {
-            match self.char_at(row, col) {
-                Some(ch) => {
-                    let counts = (ch == oc || ch == cc)
-                        && zones.is_none_or(|z| z.zone((row, col)).is_none());
-                    if counts && ch == oc {
-                        depth += 1;
-                    } else if counts && ch == cc {
-                        depth -= 1;
-                        if depth == 0 {
-                            return Some((row, col));
-                        }
-                    }
-                    col += 1;
+        // One pass along each line. `char_at` walks a line from its start,
+        // so stepping a scan with it was quadratic in the line's length: a
+        // minified line's opening bracket froze the first frame (#959).
+        for (row, line) in self.lines.iter().enumerate().skip(open.0) {
+            let from = if row == open.0 { open.1 } else { 0 };
+            for (col, (byte, ch)) in line.char_indices().enumerate().skip(from) {
+                if (ch != oc && ch != cc) || zones.is_some_and(|z| z.zone_at(row, byte).is_some()) {
+                    continue;
                 }
-                None => {
-                    row += 1;
-                    col = 0;
-                    if row >= self.lines.len() {
-                        return None;
+                if ch == oc {
+                    depth += 1;
+                } else {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some((row, col));
                     }
                 }
             }
         }
+        None
     }
 
     /// Backward-scan from the closing bracket at `close` to its matching open,
@@ -14138,30 +14137,23 @@ impl Editor {
             return None;
         }
         let mut depth = 0i32;
-        let mut row = close.0;
-        let mut col = close.1 as isize;
-        loop {
-            if col < 0 {
-                if row == 0 {
-                    return None;
+        for row in (0..=close.0).rev() {
+            let end = (row == close.0).then_some(close.1 + 1);
+            for (col, byte, ch) in chars_back(&self.lines[row], end) {
+                if (ch != oc && ch != cc) || zones.is_some_and(|z| z.zone_at(row, byte).is_some()) {
+                    continue;
                 }
-                row -= 1;
-                col = self.line_char_len(row) as isize - 1;
-                continue;
-            }
-            let ch = self.char_at(row, col as usize)?;
-            let counts = (ch == oc || ch == cc)
-                && zones.is_none_or(|z| z.zone((row, col as usize)).is_none());
-            if counts && ch == cc {
-                depth += 1;
-            } else if counts && ch == oc {
-                depth -= 1;
-                if depth == 0 {
-                    return Some((row, col as usize));
+                if ch == cc {
+                    depth += 1;
+                } else {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some((row, col));
+                    }
                 }
             }
-            col -= 1;
         }
+        None
     }
 
     /// The innermost bracket pair enclosing the cursor, found by walking
@@ -14170,66 +14162,54 @@ impl Editor {
     /// strings and comments are passed over, so from inside a string this
     /// finds the pair in code around it.
     fn enclosing_brackets(&self, zones: Option<&BracketZones>) -> Option<(BPos, BPos)> {
-        let mut row = self.cursor_row;
-        let mut col = self.cursor_col as isize - 1;
         let mut expected: Vec<char> = Vec::new();
-        loop {
-            if col < 0 {
-                if row == 0 {
-                    return None;
-                }
-                row -= 1;
-                col = self.line_char_len(row) as isize - 1;
-                continue;
-            }
-            let ch = self.char_at(row, col as usize)?;
-            let pos = (row, col as usize);
-            let in_code = || zones.is_none_or(|z| z.zone(pos).is_none());
-            if is_close_bracket(ch) && in_code() {
-                expected.push(matching_open(ch)?);
-            } else if is_open_bracket(ch) && in_code() {
-                match expected.last() {
-                    Some(&want) if want == ch => {
-                        expected.pop();
-                    }
-                    _ => {
-                        let close = self.match_bracket_forward(pos, zones)?;
-                        return Some((pos, close));
+        for row in (0..=self.cursor_row).rev() {
+            let end = (row == self.cursor_row).then_some(self.cursor_col);
+            for (col, byte, ch) in chars_back(self.lines.get(row)?, end) {
+                let pos = (row, col);
+                let in_code = || zones.is_none_or(|z| z.zone_at(row, byte).is_none());
+                if is_close_bracket(ch) && in_code() {
+                    expected.push(matching_open(ch)?);
+                } else if is_open_bracket(ch) && in_code() {
+                    match expected.last() {
+                        Some(&want) if want == ch => {
+                            expected.pop();
+                        }
+                        _ => {
+                            let close = self.match_bracket_forward(pos, zones)?;
+                            return Some((pos, close));
+                        }
                     }
                 }
             }
-            col -= 1;
         }
+        None
     }
 
     /// The first bracket pair at or after the cursor (`findNextBracket`),
     /// passing over brackets in strings and comments.
     fn next_bracket_pair(&self, zones: Option<&BracketZones>) -> Option<(BPos, BPos)> {
-        let mut row = self.cursor_row;
-        let mut col = self.cursor_col;
-        loop {
-            let in_code = zones.is_none_or(|z| z.zone((row, col)).is_none());
-            match self.char_at(row, col) {
-                Some(ch) if is_open_bracket(ch) && in_code => {
+        for (row, line) in self.lines.iter().enumerate().skip(self.cursor_row) {
+            let from = if row == self.cursor_row {
+                self.cursor_col
+            } else {
+                0
+            };
+            for (col, (byte, ch)) in line.char_indices().enumerate().skip(from) {
+                let in_code = zones.is_none_or(|z| z.zone_at(row, byte).is_none());
+                if is_open_bracket(ch) && in_code {
                     let open = (row, col);
                     return self.match_bracket_forward(open, zones).map(|c| (open, c));
                 }
-                Some(ch) if is_close_bracket(ch) && in_code => {
+                if is_close_bracket(ch) && in_code {
                     let close = (row, col);
                     return self
                         .match_bracket_backward(close, zones)
                         .map(|o| (o, close));
                 }
-                Some(_) => col += 1,
-                None => {
-                    row += 1;
-                    col = 0;
-                    if row >= self.lines.len() {
-                        return None;
-                    }
-                }
             }
         }
+        None
     }
 
     /// Resolve the bracket pair relevant to the cursor, returning
@@ -14297,6 +14277,26 @@ impl Editor {
         let zones = self.bracket_zones();
         self.adjacent_bracket_pair(zones.as_ref())
             .map(|(o, c, _)| (o, c))
+    }
+
+    /// [`Self::bracket_match_pair`], worked out once per edit and caret
+    /// place. Every frame asks, and a partner far along a long line costs a
+    /// scan of that line, which kept a core busy while croft sat idle on a
+    /// minified file (#959).
+    fn cached_bracket_match_pair(&mut self) -> Option<(BPos, BPos)> {
+        let key = (
+            self.edit_seq,
+            (self.cursor_row, self.cursor_col),
+            self.protected_current,
+        );
+        if let Some((at, pair)) = self.bracket_pair_cache
+            && at == key
+        {
+            return pair;
+        }
+        let pair = self.bracket_match_pair();
+        self.bracket_pair_cache = Some((key, pair));
+        pair
     }
 
     /// VS Code "Go to Bracket" (`editor.action.jumpToBracket`, Cmd+Shift+\):
@@ -16262,13 +16262,31 @@ impl BracketZones<'_> {
     /// The string or comment `(row, char col)` lies in, as an index into
     /// the ranges; `None` in code.
     fn zone(&self, (row, col): BPos) -> Option<usize> {
-        let byte = self.starts.get(row)? + char_byte(self.lines.get(row)?, col);
+        self.zone_at(row, char_byte(self.lines.get(row)?, col))
+    }
+
+    /// [`Self::zone`] of the char at `byte` on `row`, for a scan that
+    /// already has the byte offset.
+    fn zone_at(&self, row: usize, byte: usize) -> Option<usize> {
+        let byte = self.starts.get(row)? + byte;
         let i = self.ranges.partition_point(|&(_, end)| end <= byte);
         self.ranges
             .get(i)
             .filter(|&&(start, _)| start <= byte)
             .map(|_| i)
     }
+}
+
+/// `(char col, byte, char)` for `line`'s chars before char column `end`
+/// (all of them when `None`), the last first: one pass for a backward
+/// bracket scan, however long the line (#959).
+fn chars_back(line: &str, end: Option<usize>) -> impl Iterator<Item = (usize, usize, char)> + '_ {
+    let head = &line[..end.map_or(line.len(), |end| char_byte(line, end))];
+    let count = head.chars().count();
+    head.char_indices()
+        .rev()
+        .zip((0..count).rev())
+        .map(|((byte, ch), col)| (col, byte, ch))
 }
 
 /// Convert a char index within `s` to a byte index, saturating at `s.len()`.
@@ -16385,6 +16403,9 @@ fn word_end_after(line: &str, col: usize) -> usize {
 /// A `(row, char_col)` buffer position: a bracket character's in the
 /// bracket matching helpers, a selection end's in the line commands.
 type BPos = (usize, usize);
+
+/// `Editor::bracket_pair_cache`: the key it was worked out at, and the pair.
+type BracketPairCache = ((u64, BPos, bool), Option<(BPos, BPos)>);
 
 /// The bracket pairs croft matches, mirroring VS Code's default language
 /// brackets `()`, `[]`, `{}`.
@@ -19390,7 +19411,7 @@ impl Widget for &mut Editor {
         // Bracket-match highlight (VS Code `editorBracketMatch`): only in the
         // focused editor, and only when the caret is beside a bracket.
         let bracket_pair = if self.focused {
-            self.bracket_match_pair()
+            self.cached_bracket_match_pair()
         } else {
             None
         };
@@ -40310,6 +40331,65 @@ mod tests {
         let mut e = editor_with("foo(bar)baz");
         e.cursor_col = 5; // inside the pair but not adjacent to a bracket
         assert_eq!(e.bracket_match_pair(), None);
+    }
+
+    /// #959: a minified line's opening bracket, its partner a whole line
+    /// away. Each step of the scan used to walk the line from its start, so
+    /// this took hours; one pass takes milliseconds.
+    #[test]
+    fn a_bracket_far_along_a_long_line_matches_in_one_pass() {
+        let body = "{\"id\":1,\"tags\":[\"a\",\"b\"]}, ".repeat(15_000);
+        let mut e = editor_with(&format!("[{body}]"));
+        let close = (0, e.lines[0].chars().count() - 1);
+        let started = std::time::Instant::now();
+        assert_eq!(e.bracket_match_pair(), Some(((0, 0), close)));
+        e.cursor_col = close.1 + 1;
+        assert_eq!(e.bracket_match_pair(), Some(((0, 0), close)));
+        // Between the last `,` and ` `: no bracket beside the caret, so Go
+        // to Bracket walks back to the enclosing `[` and on to its `]`.
+        e.cursor_col = close.1 - 1;
+        assert!(e.jump_to_matching_bracket(), "the enclosing `[`");
+        assert_eq!((e.cursor_row, e.cursor_col), close);
+        assert!(
+            started.elapsed() < crate::test_budget::spawn_budget(std::time::Duration::from_secs(2)),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Backward and forward scans count columns in chars, not bytes, after
+    /// multi-byte text, across lines.
+    #[test]
+    fn bracket_scans_count_chars_after_multibyte_text() {
+        let mut e = editor_with("é(ü\n日本)x");
+        e.cursor_col = 1;
+        assert_eq!(e.bracket_match_pair(), Some(((0, 1), (1, 2))));
+        (e.cursor_row, e.cursor_col) = (1, 3);
+        assert_eq!(e.bracket_match_pair(), Some(((0, 1), (1, 2))));
+        (e.cursor_row, e.cursor_col) = (1, 1);
+        assert!(e.jump_to_matching_bracket(), "from inside the pair");
+        assert_eq!((e.cursor_row, e.cursor_col), (1, 2));
+    }
+
+    /// The highlight is worked out once per edit and caret place, and
+    /// follows both (#959).
+    #[test]
+    fn the_cached_bracket_highlight_follows_the_caret_and_edits() {
+        let mut e = editor_with("f(x) g[y]");
+        e.cursor_col = 1;
+        assert_eq!(e.cached_bracket_match_pair(), Some(((0, 1), (0, 3))));
+        assert_eq!(e.cached_bracket_match_pair(), Some(((0, 1), (0, 3))));
+        e.cursor_col = 6;
+        assert_eq!(e.cached_bracket_match_pair(), Some(((0, 6), (0, 8))));
+        e.cursor_col = 1;
+        assert_eq!(e.cached_bracket_match_pair(), Some(((0, 1), (0, 3))));
+        // An edit that leaves the caret where it was still counts.
+        e.cursor_col = 2;
+        e.insert_char('(');
+        e.cursor_col = 1;
+        let pair = e.cached_bracket_match_pair();
+        assert_ne!(pair, Some(((0, 1), (0, 3))), "{:?}", e.lines);
+        assert_eq!(pair, e.bracket_match_pair());
     }
 
     #[test]

@@ -1,0 +1,1 @@
+fix: Opening a file with one long minified line (a source map, a JSON dump) no longer freezes croft on a blank screen, and the caret beside a bracket on such a line no longer keeps a core busy while idle.
