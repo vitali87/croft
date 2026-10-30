@@ -2944,6 +2944,20 @@ impl LineEnding {
             Self::Crlf => "\r\n",
         }
     }
+
+    /// The ending most of `text`'s line breaks use: CRLF only when more than
+    /// half of them are `\r\n`, as VS Code picks it. Any `\r\n` used to mark
+    /// the file CRLF, so one line pasted from Windows into an LF file made
+    /// the next save rewrite every line of it (#936).
+    pub fn detect(text: &str) -> Self {
+        let breaks = text.matches('\n').count();
+        let crlf = text.matches("\r\n").count();
+        if crlf * 2 > breaks {
+            Self::Crlf
+        } else {
+            Self::Lf
+        }
+    }
 }
 
 /// The buffer's indentation preference for newly typed indentation: the tab
@@ -5967,13 +5981,8 @@ impl Editor {
         self.decode_lossy = decode_lossy;
         self.final_newline = text.ends_with(['\n', '\r']);
         // Detect the file's line-ending style before normalisation so a save
-        // preserves it (and the status bar reports it). A single `\r\n` marks
-        // the file CRLF, matching VS Code's "files.eol auto" heuristic.
-        self.eol = if text.contains("\r\n") {
-            LineEnding::Crlf
-        } else {
-            LineEnding::Lf
-        };
+        // preserves it (and the status bar reports it).
+        self.eol = LineEnding::detect(&text);
         self.lines = split_into_lines(&text);
         // The map described the text that was just replaced (#349). Clearing
         // is the safe direction: an unknown line is correct, a line credited
@@ -8908,11 +8917,7 @@ impl Editor {
         // new encoding must not carry the previous one's BOM answer over.
         self.bom = encoding_rs::Encoding::for_bom(&bytes).is_some();
         self.final_newline = text.ends_with(['\n', '\r']);
-        self.eol = if text.contains("\r\n") {
-            LineEnding::Crlf
-        } else {
-            LineEnding::Lf
-        };
+        self.eol = LineEnding::detect(&text);
         self.lines = split_into_lines(&text);
         // The map described the text that was just replaced (#349). Clearing
         // is the safe direction: an unknown line is correct, a line credited
@@ -32028,6 +32033,43 @@ mod tests {
             raw, b"alpha\r\nbeta\r\n",
             "save re-applies CRLF, final newline included"
         );
+    }
+
+    /// #936: one CRLF line pasted into an LF file. The file stays LF, so a
+    /// one-character edit saves as that edit plus the stray line brought
+    /// into line, not every line rewritten.
+    #[test]
+    fn one_crlf_line_in_an_lf_file_keeps_it_lf() {
+        let mut text: Vec<String> = (0..200).map(|i| format!("setting_{i} = {i}\n")).collect();
+        text[57] = "pasted_from_windows = True\r\n".into();
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(text.concat().as_bytes()).unwrap();
+        let mut e = Editor::new();
+        e.open(tmp.path()).unwrap();
+        assert_eq!(e.eol, LineEnding::Lf);
+        e.cursor_col = e.lines[0].chars().count();
+        e.insert_char('0');
+        e.save_to_disk().unwrap();
+        let saved = std::fs::read_to_string(tmp.path()).unwrap();
+        assert!(!saved.contains('\r'), "no CRLF left");
+        let changed: Vec<usize> = saved
+            .lines()
+            .zip(text.iter())
+            .enumerate()
+            .filter(|(_, (now, was))| *now != was.trim_end_matches(['\r', '\n']))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(changed, vec![0], "only the edited line's text changed");
+    }
+
+    /// The majority decides both ways, and a tie stays LF.
+    #[test]
+    fn the_line_ending_is_the_one_most_lines_use() {
+        assert_eq!(LineEnding::detect("a\r\nb\r\nc\n"), LineEnding::Crlf);
+        assert_eq!(LineEnding::detect("a\r\nb\nc\n"), LineEnding::Lf);
+        assert_eq!(LineEnding::detect("a\r\nb\n"), LineEnding::Lf);
+        assert_eq!(LineEnding::detect("a\r\n"), LineEnding::Crlf);
+        assert_eq!(LineEnding::detect("no break"), LineEnding::Lf);
     }
 
     #[test]
