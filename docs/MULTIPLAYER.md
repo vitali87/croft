@@ -603,9 +603,12 @@ documented follow-up; `croft attach` is the shared path for that today.
 
 **Ask turns (may edit).** Right-click the gutter ("Ask Navigator"), a selection
 ("Ask Navigator About Selection"), or `Cmd+K Q`: an input box takes the
-instruction, and the turn carries the 0-based line/range, the selected text,
-and the buffer numbered `N|` per line (the prompt teaches that the prefix is a
-label, not content). Fence edits stream with the full cancel machinery. Only
+instruction, and the turn carries the 0-based line/range with the 1-based
+gutter number beside it, the selected text, and the buffer numbered `N|` per
+line (the prompt teaches that the prefix is a label, not content). Fence
+headers and `N|` are 0-based; line numbers the model writes in note bodies and
+commentary are the gutter's 1-based ones. Fence edits stream with the full
+cancel machinery. Only
 one turn runs at a time: an ask or yield fired mid-stream is refused
 ("mid-turn; wait for it to finish"), so the shared `comment_only` flag is never
 clobbered mid-stream.
