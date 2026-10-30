@@ -2776,6 +2776,9 @@ pub enum SaveOutcome {
     WriteProtected,
 }
 
+/// What a save of a scratch tab (#951) says instead of writing.
+pub const SCRATCH_SAVE_REFUSAL: &str = "This tab isn't a file: use File: Save As… to keep a copy";
+
 /// Why a file refuses this user's writes (#1379).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WriteProtection {
@@ -3503,6 +3506,11 @@ pub struct Editor {
     /// `Some(n)` for a tab made by File: New Untitled Text File (#1580),
     /// shown as `Untitled-n` until Save As gives it a path.
     pub untitled: Option<usize>,
+    /// Set on a scratch tab (`open_text_buffer`): text croft made, such as
+    /// a past version, a Search Editor or a commit, whose `path` is only
+    /// its label (#951). No save writes it: written, the label became a
+    /// junk file in croft's working directory. Save As gives it a path.
+    pub scratch: bool,
     /// The selection Add Selection to Next Find Match last made from the
     /// word at the caret (#1558). While the primary selection is that one,
     /// further matches are whole words, as in VS Code; a selection made by
@@ -4003,6 +4011,7 @@ impl Editor {
             fallback_folds_seq: None,
             preview: false,
             untitled: None,
+            scratch: false,
             occurrence_word_sel: None,
             pinned: false,
             undo_stack: Vec::new(),
@@ -5559,6 +5568,9 @@ impl Editor {
             // What the sweep said about the file this tab held is not about
             // this one, even with the same stamp (#900).
             self.disk_report = None;
+            // A real file now, not a scratch tab's label (#951): kept, the
+            // flag refused its saves and let it close without asking.
+            self.scratch = false;
         }
         if changed_file {
             // On a failed open the tab may still hold the file it left, and
@@ -12179,12 +12191,14 @@ impl Editor {
 
     /// File: Save As… (#1203): write the buffer to `path` and make this tab
     /// that file, with the grammar its name calls for. The tab stays on its
-    /// own path, untouched, unless the bytes land.
+    /// own path, untouched, unless the bytes land. A scratch tab (#951)
+    /// becomes that file too.
     pub fn save_as(&mut self, path: &Path) -> Result<SaveOutcome> {
         let kept = (
             self.path.replace(path.to_path_buf()),
             self.disk_stamp,
             self.disk_conflict,
+            std::mem::take(&mut self.scratch),
         );
         self.disk_stamp = Self::disk_stamp_of(path);
         self.disk_conflict = false;
@@ -12197,7 +12211,7 @@ impl Editor {
                 self.set_language(lang);
             }
         } else {
-            (self.path, self.disk_stamp, self.disk_conflict) = kept;
+            (self.path, self.disk_stamp, self.disk_conflict, self.scratch) = kept;
         }
         outcome
     }
@@ -12328,6 +12342,10 @@ impl Editor {
         // path (explicit, force, auto, format-on-save) can route around.
         if self.has_non_text_view() {
             anyhow::bail!("This tab is a read-only preview; nothing to save");
+        }
+        // Same choke point for a scratch tab (#951): its path is a label.
+        if self.scratch {
+            anyhow::bail!(SCRATCH_SAVE_REFUSAL);
         }
         self.apply_editorconfig_on_save(reason);
         let path = self
@@ -22103,7 +22121,8 @@ impl EditorTabs {
 
     /// Close every tab showing `path` or a file under it (a deleted file or
     /// folder), except tabs with unsaved edits: those stay open, dirty, so
-    /// the edits can still be saved (recreating the file) or discarded.
+    /// the edits can still be saved (recreating the file) or discarded. A
+    /// sheet cell still being typed into counts as an unsaved edit.
     /// Returns how many dirty tabs were kept.
     pub fn close_clean_tabs_under(&mut self, path: &Path) -> usize {
         let mut kept = 0;
@@ -22114,7 +22133,7 @@ impl EditorTabs {
             if !e.path.as_deref().is_some_and(|p| p.starts_with(path)) {
                 continue;
             }
-            if e.dirty {
+            if e.dirty || e.sheet_pending_cell().is_some() {
                 kept += 1;
             } else {
                 self.close_tab(i);
@@ -22222,27 +22241,35 @@ impl EditorTabs {
     /// Close every tab, resetting the editor pane to the single blank
     /// just-launched state — mirrors `close_tab` on the last remaining
     /// tab. Returns how many tabs were collapsed away (always ≥ 1 when
-    /// the editor had any content). Matches VS Code's "Close All", except
-    /// that tabs with unsaved changes stay open (#862): VS Code asks about
-    /// each, croft leaves them for a Cmd+W that asks. That makes it the
-    /// same sweep as [`Self::close_saved`], pinned tabs going in both.
+    /// the editor had any content). Matches VS Code's "Close All": pinned
+    /// tabs stay open (#941). Tabs with unsaved changes stay open too
+    /// (#862): VS Code asks about each, croft leaves them for a Cmd+W that
+    /// asks. That makes it the same sweep as [`Self::close_saved`].
     pub fn close_all(&mut self) -> usize {
         self.close_saved()
     }
 
-    /// Close every saved (non-dirty) tab, keeping any with unsaved changes.
-    /// When no dirty tab remains the pane resets to a single blank buffer,
-    /// mirroring `close_all`; otherwise the surviving dirty tabs are kept in
-    /// order and the first becomes active. Returns how many tabs were removed
-    /// (0 when every open tab is dirty). Matches VS Code's "Close Saved"
-    /// (`workbench.action.closeUnmodifiedEditors`).
+    /// Close every saved (non-dirty) tab, keeping any with unsaved changes
+    /// and every pinned tab (#941). When nothing is kept the pane resets to
+    /// a single blank buffer, mirroring `close_all`; otherwise the kept tabs
+    /// stay in order, the active one staying active when it is among them
+    /// and the first becoming active when not. Returns how many tabs were
+    /// removed (0 when every open tab is dirty or pinned). Matches VS
+    /// Code's "Close Saved" (`workbench.action.closeUnmodifiedEditors`).
     pub fn close_saved(&mut self) -> usize {
         let before = self.editors.len();
-        let was_focused = self.editors[self.active].focused;
-        let mut kept: Vec<Editor> = std::mem::take(&mut self.editors)
-            .into_iter()
-            .filter(|e| e.dirty)
-            .collect();
+        let old_active = self.active;
+        let was_focused = self.editors[old_active].focused;
+        let mut new_active = 0;
+        let mut kept: Vec<Editor> = Vec::with_capacity(before);
+        for (i, ed) in std::mem::take(&mut self.editors).into_iter().enumerate() {
+            if ed.dirty || ed.pinned {
+                if i == old_active {
+                    new_active = kept.len();
+                }
+                kept.push(ed);
+            }
+        }
         let removed = before - kept.len();
         if kept.is_empty() {
             let mut fresh = Editor::new();
@@ -22250,9 +22277,9 @@ impl EditorTabs {
             kept.push(fresh);
         }
         self.editors = kept;
-        self.active = 0;
+        self.active = new_active;
         for (i, ed) in self.editors.iter_mut().enumerate() {
-            ed.focused = i == 0;
+            ed.focused = i == self.active;
         }
         removed
     }
@@ -22922,12 +22949,13 @@ impl EditorTabs {
     /// Open arbitrary text in a scratch tab labelled `label` (no file on
     /// disk). Used by "Show Git Output" to surface the git command log. The
     /// tab has no `disk_stamp`, so the FS-sync layer never tries to reload
-    /// or overwrite it.
+    /// or overwrite it, and is `scratch`, so no save writes it (#951).
     pub fn open_text_buffer(&mut self, label: &Path, text: &str) -> Result<()> {
         let mut e = Editor::new();
         e.focused = self.editors[self.active].focused;
         e.preview = false;
         e.path = Some(label.to_path_buf());
+        e.scratch = true;
         e.lines = split_into_lines(text);
         if e.lines.is_empty() {
             e.lines.push(String::new());
@@ -25717,6 +25745,46 @@ mod tests {
         assert!(e.sheet.is_some());
         assert!(e.save_to_disk().is_err(), "sheet tab save must refuse");
         assert_eq!(std::fs::read(&csv).unwrap(), b"a,b\n1,2\n");
+    }
+
+    #[test]
+    fn save_on_a_scratch_tab_writes_nothing_until_save_as() {
+        // #951: a scratch tab's path is its label, so the choke point
+        // refuses it for every caller, force save included. The label is
+        // absolute here so a regression writes into the tempdir, not into
+        // the test's working directory.
+        let tmp = tempfile::tempdir().unwrap();
+        let label = tmp.path().join("stats.py @ 4affdca");
+        let mut tabs = EditorTabs::default();
+        tabs.open_text_buffer(&label, "def mean(xs):\n").unwrap();
+        tabs.insert_str("x");
+        assert!(tabs.scratch && tabs.dirty);
+        assert!(tabs.save_to_disk().is_err(), "explicit save refuses");
+        assert!(tabs.auto_save_to_disk().is_err(), "auto save too");
+        assert!(tabs.save_to_disk_force().is_err(), "and force save");
+        assert!(!label.exists(), "nothing was written");
+        let kept = tmp.path().join("stats.py");
+        assert_eq!(tabs.save_as(&kept).unwrap(), SaveOutcome::Saved);
+        assert!(!tabs.scratch, "the tab is that file now");
+        let written = std::fs::read_to_string(&kept).unwrap();
+        assert!(written.starts_with("xdef mean(xs):"), "{written:?}");
+    }
+
+    #[test]
+    fn a_real_file_opened_into_a_scratch_tab_saves() {
+        // The tab stops being scratch once it holds a file: kept, the flag
+        // refused the file's saves and let its edits close unasked.
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("query.ql");
+        std::fs::write(&real, "select 1\n").unwrap();
+        let mut tabs = EditorTabs::default();
+        tabs.open_text_buffer(&tmp.path().join("Search: mean"), "hits\n")
+            .unwrap();
+        (*tabs).open(&real).unwrap();
+        assert!(!tabs.scratch);
+        tabs.insert_str("x");
+        tabs.save_to_disk().expect("the file saves");
+        assert_eq!(std::fs::read_to_string(&real).unwrap(), "xselect 1\n");
     }
     #[test]
     fn is_binary_detects_nul() {
@@ -37001,31 +37069,46 @@ mod tests {
         assert_eq!(t.tab_count(), before, "no panic, no mutation");
     }
 
+    /// #941: Close All leaves pinned tabs open, as Close Others and Close
+    /// to the Right do (and VS Code's Close All), and the active pinned tab
+    /// stays active.
     #[test]
-    fn close_all_closes_pinned_tabs_too() {
-        // VS Code parity: Close All does not spare pinned tabs.
+    fn close_all_keeps_pinned_tabs() {
         let mut t = EditorTabs::new();
         t.editors[0].path = Some(std::path::PathBuf::from("/a"));
         t.add_tab_with_path(std::path::PathBuf::from("/b"));
-        t.toggle_pin(0);
+        t.add_tab_with_path(std::path::PathBuf::from("/c"));
+        t.toggle_pin(0); // pin /a
+        t.toggle_pin(1); // pin /b; order [/a*, /b*, /c]
+        t.select(1);
         let removed = t.close_all();
-        assert_eq!(removed, 2);
-        assert_eq!(t.tab_count(), 1, "collapses to a single blank tab");
-        assert!(!t.is_pinned(0));
+        assert_eq!(removed, 1, "only the unpinned /c closes");
+        assert_eq!(t.tab_path(0).as_deref(), Some(std::path::Path::new("/a")));
+        assert_eq!(t.tab_path(1).as_deref(), Some(std::path::Path::new("/b")));
+        assert!(t.is_pinned(0) && t.is_pinned(1));
+        assert_eq!(t.active_index(), 1, "the active /b stays active");
+        assert!(t.editors[1].focused && !t.editors[0].focused);
     }
 
+    /// #941: Close Saved leaves a clean pinned tab open beside the dirty
+    /// one; only the clean unpinned tab closes.
     #[test]
-    fn close_saved_closes_clean_pinned_tabs() {
-        // VS Code parity: Close Saved closes a clean tab even when pinned;
-        // only the dirty tab survives.
+    fn close_saved_keeps_clean_pinned_tabs() {
         let mut t = EditorTabs::new();
         t.editors[0].path = Some(std::path::PathBuf::from("/a"));
         t.add_tab_with_path(std::path::PathBuf::from("/b"));
+        t.add_tab_with_path(std::path::PathBuf::from("/c"));
         t.editors[1].dirty = true;
         t.toggle_pin(0); // pin the clean /a
         let removed = t.close_saved();
-        assert_eq!(removed, 1, "the clean pinned tab is still closed");
-        assert_eq!(t.tab_path(0).as_deref(), Some(std::path::Path::new("/b")));
+        assert_eq!(removed, 1, "only the clean unpinned /c closes");
+        assert_eq!(t.tab_path(0).as_deref(), Some(std::path::Path::new("/a")));
+        assert_eq!(t.tab_path(1).as_deref(), Some(std::path::Path::new("/b")));
+        assert_eq!(
+            t.active_index(),
+            0,
+            "the closed /c hands active to the first"
+        );
     }
 
     #[test]

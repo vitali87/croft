@@ -354,6 +354,47 @@ fn close_all_closes_every_split_group() {
     assert_eq!(app.status, format!("Closed {total} tabs"));
 }
 
+/// #941: Close All leaves a pinned tab open and records the tabs it closes
+/// in every group, so Reopen Closed Editor brings them back; a file open in
+/// both groups is recorded once. Close Saved keeps the pinned tab and
+/// records what it closes too.
+#[test]
+fn close_all_keeps_pinned_tabs_and_records_the_closed_ones_for_reopen() {
+    let tmp = tempfile::tempdir().unwrap();
+    let [a, b, c] = ["a.rs", "b.rs", "c.rs"].map(|f| tmp.path().join(f));
+    for f in [&a, &b, &c] {
+        std::fs::write(f, "x\n").unwrap();
+    }
+    let root = tmp.path().to_path_buf();
+    let mut app = App::new(root.clone()).unwrap();
+    app.editor.open_pinned(&a).unwrap();
+    app.split_editor(); // the right group (focused) duplicates a.rs
+    app.editor.open_pinned(&b).unwrap();
+    app.editor.open_pinned(&c).unwrap();
+    app.dispatch_menu_action(MenuAction::ToggleTabPin(2), root.clone());
+    let reopen =
+        |app: &App| -> Vec<PathBuf> { app.closed_tabs.iter().map(|t| t.path.clone()).collect() };
+
+    app.dispatch_menu_action(MenuAction::CloseAllTabs, root.clone());
+    assert!(
+        !app.editor_layout.is_split(),
+        "the emptied left group folded away"
+    );
+    assert_eq!(app.editor.tab_count(), 1);
+    assert_eq!(app.editor.path.as_deref(), Some(c.as_path()));
+    assert!(app.editor.pinned, "the pinned c.rs stays open");
+    assert_eq!(app.status, "Closed 3 tabs");
+    assert_eq!(reopen(&app), [a.clone(), b.clone()]);
+    app.reopen_closed_tab();
+    assert_eq!(app.editor.path.as_deref(), Some(b.as_path()));
+
+    app.closed_tabs.clear();
+    app.dispatch_menu_action(MenuAction::CloseSavedTabs, root);
+    assert_eq!(app.editor.tab_count(), 1);
+    assert_eq!(app.editor.path.as_deref(), Some(c.as_path()));
+    assert_eq!(reopen(&app), [b]);
+}
+
 /// #862: a clean tab closes at once, exactly as before.
 #[test]
 fn closing_a_clean_tab_does_not_ask() {
@@ -391,12 +432,41 @@ fn tab_menu_closes_keep_unsaved_tabs() {
         2,
         "Close Others keeps the unsaved a.txt"
     );
+    // #941: and says why it closed nothing, recording nothing to reopen.
+    assert_eq!(app.status, "Kept 1 tab with unsaved changes open");
+    assert!(app.closed_tabs.is_empty());
 
     app.dispatch_menu_action(MenuAction::CloseAllTabs, root);
     assert_eq!(app.editor.tab_count(), 1);
     assert_eq!(app.editor.path.as_deref(), Some(a.as_path()));
     assert!(app.editor.dirty);
     assert_eq!(app.status, "Closed 1 tab; kept 1 with unsaved changes open");
+}
+
+/// #941: Close to the Right keeps an unsaved tab right of the pivot open,
+/// unwritten and not recorded for reopen, and its status line counts it.
+#[test]
+fn close_to_the_right_counts_the_unsaved_tabs_it_keeps() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "alpha\n");
+    let [b, c] = ["b.txt", "c.txt"].map(|f| tmp.path().join(f));
+    for f in [&b, &c] {
+        std::fs::write(f, "x\n").unwrap();
+    }
+    app.editor.open_pinned(&b).unwrap();
+    type_into_editor(&mut app, "y");
+    app.editor.open_pinned(&c).unwrap();
+    app.dispatch_menu_action(MenuAction::CloseTabsToRight(0), tmp.path().to_path_buf());
+    let open: Vec<_> = app.editor.editors.iter().map(|e| e.path.clone()).collect();
+    assert_eq!(open, [Some(tmp.path().join("a.txt")), Some(b.clone())]);
+    assert!(app.editor.editors[1].dirty, "b.txt keeps its edit");
+    assert_eq!(std::fs::read_to_string(&b).unwrap(), "x\n", "unwritten");
+    let reopen: Vec<_> = app.closed_tabs.iter().map(|t| t.path.clone()).collect();
+    assert_eq!(reopen, [c]);
+    assert_eq!(
+        app.status,
+        "Closed 1 tab to the right; kept 1 with unsaved changes open"
+    );
 }
 
 /// #862: Close All keeps a split whose other group holds unsaved edits, and

@@ -347,6 +347,29 @@ fn pressing_s_with_no_caret_stages_the_first_visible_hunk() {
     );
 }
 
+/// #965: Enter in the commit box commits the hunk staged with `S` and
+/// leaves the other in the working tree; `git commit -am` took both.
+#[test]
+fn enter_commits_only_the_hunk_staged_with_s() {
+    let (tmp, mut app) = scm_two_hunk_app();
+    app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE))
+        .unwrap();
+    app.source_control.message = String::from("Ship line 2");
+    app.source_control.message_cursor = 11;
+    app.handle_source_control_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    wait_for_git_net(&mut app);
+    let committed = git_stdout_in(tmp.path(), &["show", "HEAD:f.txt"]);
+    assert!(
+        committed.contains("LINE2") && !committed.contains("LINE18"),
+        "only the staged hunk is committed: {committed}"
+    );
+    let unstaged = git_stdout_in(tmp.path(), &["diff"]);
+    assert!(
+        unstaged.contains("+LINE18"),
+        "the unstaged hunk stays a working-tree change: {unstaged}"
+    );
+}
+
 #[test]
 fn pressing_u_in_a_scm_diff_unstages_only_the_hunk_under_the_caret() {
     let (tmp, mut app) = scm_two_hunk_app();
@@ -4690,6 +4713,43 @@ fn accept_all_incoming_then_complete_merge_stages_the_resolved_file() {
         line.starts_with("M "),
         "after staging, shared.txt must be index-modified (M ), not unmerged; was {line:?}"
     );
+}
+
+/// #989: Stage All, or staging the conflicted row, while its markers are
+/// still in the file says so and leaves it unmerged, so the next Commit
+/// can't record the markers. Resolved by hand, it stages.
+#[test]
+fn staging_a_conflict_with_its_markers_still_in_it_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    conflicted_repo(tmp.path());
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let idx = wait_for_conflicted_entry(&mut app);
+    app.stage_source_control_entry(idx);
+    assert!(
+        app.status
+            .contains("shared.txt still has conflict markers: resolve it before staging"),
+        "{}",
+        app.status
+    );
+    app.stage_all_source_control();
+    assert!(
+        app.status.contains("shared.txt still has conflict markers"),
+        "{}",
+        app.status
+    );
+    assert_eq!(
+        crate::git::unmerged_paths(tmp.path()),
+        vec![String::from("shared.txt")]
+    );
+
+    std::fs::write(
+        tmp.path().join("shared.txt"),
+        "alpha\nfeature-one\nm1\nm2\nm3\nm4\nm5\nfeature-two\nomega\n",
+    )
+    .unwrap();
+    app.stage_all_source_control();
+    assert!(app.status.starts_with("Staged all"), "{}", app.status);
+    assert!(crate::git::unmerged_paths(tmp.path()).is_empty());
 }
 
 /// #906: a file resolved by hand in the text flow is still unmerged in git,

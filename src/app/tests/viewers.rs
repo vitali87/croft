@@ -653,6 +653,30 @@ fn sheet_grid_editing_types_commits_and_saves_with_the_delimiter() {
     );
 }
 
+/// #963: a non-ASCII first key starts the edit instead of being dropped,
+/// so `Ölberg` is saved whole and an all-CJK word is typed at all.
+#[test]
+fn typing_a_non_ascii_first_letter_over_a_sheet_cell_keeps_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("sales.csv");
+    std::fs::write(&p, "id,name,city\n1,Frank,Oslo\n2,Bob,New York\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&p).unwrap();
+    app.handle_sheet_key(key(KeyCode::Right, KeyModifiers::NONE));
+    app.handle_sheet_key(key(KeyCode::Right, KeyModifiers::NONE));
+    type_into_sheet(&mut app, "Ölberg");
+    app.handle_sheet_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    type_into_sheet(&mut app, "東京");
+    app.handle_sheet_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    app.save();
+    assert_eq!(
+        std::fs::read_to_string(&p).unwrap(),
+        "id,name,city\n1,Frank,Ölberg\n2,Bob,東京\n",
+        "{}",
+        app.status
+    );
+}
+
 /// `stock.csv` open in the grid, as #1140 repros it.
 fn stock_sheet_app() -> (tempfile::TempDir, std::path::PathBuf, App) {
     let tmp = tempfile::tempdir().unwrap();

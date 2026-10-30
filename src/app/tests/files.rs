@@ -1419,6 +1419,104 @@ fn d_at_the_close_prompt_closes_without_saving() {
     assert_eq!(app.editor.lines[0], "alpha", "reopened from disk");
 }
 
+/// #951: a Search Editor for `query`, typed into, and its label.
+fn app_with_edited_search_editor(tmp: &std::path::Path, query: &str) -> (App, String) {
+    let mut app = App::new(tmp.to_path_buf()).unwrap();
+    app.search.query = query.to_string();
+    app.run_command(crate::widgets::command_palette::Command::OpenSearchEditor);
+    app.focus_pane(Pane::Editor);
+    type_into_editor(&mut app, "x");
+    assert!(app.editor.scratch && app.editor.dirty, "setup");
+    (app, format!("Search: {query}"))
+}
+
+/// #951: whether a file named after the scratch tab `label` was written,
+/// in the workspace or in croft's working directory, where the relative
+/// label landed. It is removed, so a failing run leaves no junk behind.
+fn scratch_label_written(workspace: &std::path::Path, label: &str) -> bool {
+    let mut written = false;
+    for p in [workspace.join(label), PathBuf::from(label)] {
+        written |= std::fs::remove_file(&p).is_ok();
+    }
+    written
+}
+
+/// #951: Ctrl+S on a Search Editor wrote a file named `Search: …` into
+/// croft's working directory. It writes nothing and says to use Save As,
+/// which still keeps a copy and makes the tab that file, saved as any other.
+#[test]
+fn ctrl_s_on_a_scratch_tab_writes_no_file_and_points_to_save_as() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, label) = app_with_edited_search_editor(tmp.path(), "issue951 ctrl-s");
+    let ctrl_s = key(KeyCode::Char('s'), KeyModifiers::CONTROL);
+    app.handle_key(ctrl_s).unwrap();
+    assert!(!scratch_label_written(tmp.path(), &label));
+    assert_eq!(app.status, crate::widgets::editor::SCRATCH_SAVE_REFUSAL);
+    assert!(app.editor.dirty, "the edits stay in the tab");
+    save_as(&mut app, "results.txt");
+    let kept = tmp.path().join("results.txt");
+    assert!(
+        std::fs::read_to_string(&kept)
+            .unwrap()
+            .contains("Query: issue951 ctrl-s"),
+        "{}",
+        app.status
+    );
+    assert_eq!(app.editor.path.as_deref(), Some(kept.as_path()));
+    type_into_editor(&mut app, "y");
+    app.handle_key(ctrl_s).unwrap();
+    assert!(!app.editor.dirty, "the file now saves: {}", app.status);
+}
+
+/// #951: auto save wrote a scratch tab a second after one stray keystroke,
+/// as a file named `commit 335f25e`. It skips the tab, and still writes a
+/// real file edited alongside it in the same sweep.
+#[test]
+fn auto_save_writes_the_files_but_never_a_scratch_tab() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "hello");
+    app.auto_save = true;
+    type_into_editor(&mut app, "x");
+    let label = "commit 951a5e7";
+    app.editor
+        .open_text_buffer(std::path::Path::new(label), "commit 951a5e7\n")
+        .unwrap();
+    type_into_editor(&mut app, "y");
+    assert!(app.editor.scratch && app.editor.dirty, "setup");
+    app.editor.editors.iter_mut().for_each(age_last_edit);
+    assert!(app.tick_auto_save(), "a.txt is due");
+    assert!(!scratch_label_written(tmp.path(), label));
+    assert!(app.editor.dirty, "the scratch tab keeps its edits");
+    let on_disk = std::fs::read_to_string(tmp.path().join("a.txt")).unwrap();
+    assert!(on_disk.contains('x'), "a.txt is written: {on_disk:?}");
+}
+
+/// #951: closing an edited Search Editor asked to save it, and S wrote a
+/// file named after the tab. Nothing in it can be saved, so it is no
+/// unsaved work: Cmd+W closes it without asking, and neither a quit, Save
+/// All nor hot exit (whose copy came back as a tab on the label) counts it.
+#[test]
+fn an_edited_scratch_tab_closes_without_offering_to_save() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, label) = app_with_edited_search_editor(tmp.path(), "issue951 close");
+    assert!(app.unsaved_files().is_empty(), "a quit has nothing to ask");
+    assert!(
+        app.capture_hot_exit().buffers.is_empty(),
+        "nor hot exit to keep"
+    );
+    app.run_command(crate::widgets::command_palette::Command::SaveAll);
+    assert_eq!(app.status, "Save All: nothing to save");
+    app.handle_key(key(KeyCode::Char('w'), KeyModifiers::SUPER))
+        .unwrap();
+    assert!(app.pending_unsaved.is_none(), "no prompt offers to save it");
+    assert_ne!(
+        app.editor.path.as_deref(),
+        Some(std::path::Path::new(&label)),
+        "the tab closed"
+    );
+    assert!(!scratch_label_written(tmp.path(), &label));
+}
+
 /// #1438: Save All & Commit writes the tab, then commits the editor text.
 #[test]
 fn save_all_and_commit_commits_the_text_in_the_tab() {
