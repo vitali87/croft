@@ -1107,6 +1107,9 @@ struct UpdateToast {
     open: bool,
     /// Action hit rects, recomputed each render.
     buttons: Vec<(Rect, UpdateToastAction)>,
+    /// What the card painted in each of `buttons`, to tell whether a later
+    /// overlay covered it before the frame went out.
+    painted: Vec<Vec<ratatui::buffer::Cell>>,
 }
 
 impl UpdateToast {
@@ -1118,6 +1121,7 @@ impl UpdateToast {
             failed: None,
             open: true,
             buttons: Vec::new(),
+            painted: Vec::new(),
         }
     }
 }
@@ -23631,6 +23635,7 @@ impl App {
         // every other overlay until the user dismisses it.
         self.render_approval_popup(frame);
         self.render_terminal_warning(frame);
+        self.drop_covered_update_controls(frame.buffer_mut());
 
         // Chrome button-hint tooltip. Rendered at the top level against the
         // whole frame (not the editor's `focused_area`) because the controls it
@@ -25081,9 +25086,32 @@ impl App {
             height,
         };
         let hits = card.render(frame.buffer_mut(), rect, self.theme, self.pointer_cell);
+        let painted = hits
+            .iter()
+            .map(|(r, _)| cells_in(frame.buffer_mut(), *r))
+            .collect();
         if let Some(t) = self.update_toast.as_mut() {
             t.buttons = hits;
+            t.painted = painted;
         }
+    }
+
+    /// Drop the update card's controls that a later overlay painted over: a
+    /// context menu, a prompt, a confirm or a picker. The card's clicks are
+    /// taken before theirs, so a covered button would answer a click on what
+    /// covers it; what is still on screen is what can be clicked.
+    fn drop_covered_update_controls(&mut self, buf: &ratatui::buffer::Buffer) {
+        let Some(t) = self.update_toast.as_mut() else {
+            return;
+        };
+        let painted = std::mem::take(&mut t.painted);
+        let buttons = std::mem::take(&mut t.buttons);
+        t.buttons = buttons
+            .into_iter()
+            .zip(painted)
+            .filter(|((r, _), cells)| cells_in(buf, *r) == *cells)
+            .map(|(hit, _)| hit)
+            .collect();
     }
 
     /// What the update card says for `toast`: its state's glyph and title,
@@ -78159,6 +78187,12 @@ fn cwd_matches(cwd: Option<&Path>, root: &Path, observable: bool) -> bool {
         Some(c) => c == root,
         None => !observable,
     }
+}
+
+/// The cells of `r` that lie inside `buf`, row by row.
+fn cells_in(buf: &ratatui::buffer::Buffer, r: Rect) -> Vec<ratatui::buffer::Cell> {
+    let r = r.intersection(buf.area);
+    r.positions().map(|p| buf[p].clone()).collect()
 }
 
 fn copy_to_clipboard(text: &str) -> bool {

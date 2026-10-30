@@ -402,6 +402,51 @@ fn an_update_offer_raises_the_bottom_left_card_later_folds_it_and_skip_dismisses
     });
 }
 
+/// The card's clicks are taken before a menu's or a prompt's, so a button
+/// some later overlay painted over must stop answering: the click is on
+/// what covers it.
+#[test]
+fn an_overlay_over_the_card_takes_the_clicks_on_it() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.update_toast = Some(super::UpdateToast::offer("9.9.9".into()));
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 40)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        let skip = |app: &App| {
+            app.update_toast
+                .as_ref()
+                .unwrap()
+                .buttons
+                .iter()
+                .find(|(_, a)| *a == super::UpdateToastAction::Skip)
+                .map(|(r, _)| *r)
+        };
+        let at = skip(&app).expect("Skip, while nothing covers it");
+
+        // A menu opened over the card's button row.
+        app.open_status_indent_menu(at.x, at.y - 2);
+        term.draw(|f| app.render(f)).unwrap();
+        let cap = term.backend().buffer()[(at.x, at.y)].symbol().to_string();
+        assert_ne!(cap, "\u{e0b6}", "the menu covers Skip's cap");
+        assert_eq!(skip(&app), None, "a covered button is no target");
+        left_click(&mut app, at.x + 1, at.y);
+        assert!(app.update_toast.is_some(), "the click was the menu's");
+        let cache_dir = home.path().join(".cache").join("croft");
+        assert_eq!(
+            crate::update_check::CheckCache::load(&cache_dir).dismissed,
+            None
+        );
+
+        // With the menu gone the button answers again.
+        app.context_menu = None;
+        term.draw(|f| app.render(f)).unwrap();
+        assert_eq!(skip(&app), Some(at));
+    });
+}
+
 /// The card's link opens the release's notes on GitHub, which list every
 /// version since the release before it.
 #[test]
