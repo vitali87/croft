@@ -166,8 +166,10 @@ it leaves, and riding its edits as they stream. Inside the editor:
   it says appears as **comment boxes** in the file, unnumbered blocks between the lines they
   belong to (never part of the buffer, never saved). Each box carries a reply field and an
   **Ignore** button: type back and press `Enter` to continue the conversation in place, or
-  dismiss it and keep working. `F4` hops to the next box, `Shift+F4` ignores one. Any edit it
-  attempts on a yielded turn is discarded by the host, not just discouraged.
+  dismiss it and keep working. A reply is your turn: ask for the change a box proposes
+  ("correct this") and the edit streams in, exactly as for `Cmd+K Q`. `F4` hops to the next
+  box, `Shift+F4` ignores one. Any edit it attempts on a yielded turn is discarded by the
+  host, not just discouraged.
 - **Cancel a stream mid-run**: click the orange `■` stop button in the gutter or press
   `Cmd+K X` — the streamed text is reverted and the conversation stays alive for your next
   instruction.

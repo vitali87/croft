@@ -629,10 +629,11 @@ each carries a stable id (`Note::id`) so Ignore removes exactly one and a reply
 appends to exactly one.
 
 Clicking a box (or `F4`, which hops to the next box by row, wrapping) focuses
-its reply field: typing edits the draft, `Enter` sends it as a comment-only
-reply turn (the note's body, the reply, and the numbered buffer —
-`compose_reply_turn`), `Esc` releases the keyboard, and the box keeps the
-running conversation as `you:` lines. `✕ Ignore` (or `Shift+F4`) dismisses one
+its reply field: typing edits the draft, `Enter` sends it as a reply turn (the
+note's body, the reply, and the numbered buffer — `compose_reply_turn`). A reply
+is the driver's own turn, not a yield, so it may edit like an ask when it asks
+for a change. `Esc` releases the keyboard, and the box keeps the running
+conversation as `you:` lines. `✕ Ignore` (or `Shift+F4`) dismisses one
 box; "Navigator: Clear Comments" drops them all. Boxes persist across turns —
 only the driver closes a box.
 

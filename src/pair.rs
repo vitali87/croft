@@ -453,6 +453,7 @@ Some user messages number the buffer: each line arrives prefixed with `N|` where
 Turn kinds:
 - An ask turn names a task and where you were invoked: you may edit with EDIT fences and remark with NOTE fences.
 - A yielded turn says it is COMMENT-ONLY: your partner handed you the floor to review, not to type. EDIT fences on such a turn are DISCARDED by the editor. Speak in NOTE fences anchored to the lines you mean, propose changes there, and wait to be asked before editing.
+- A reply turn answers one of your notes with your partner's own words. If the reply asks for a change ("correct this", "do it"), that is the ask: make the change with EDIT fences. If it asks a question or disagrees, answer with NOTE fences.
 
 A participant can cancel your stream mid-edit; the streamed text is then reverted and your next user message starts with a note saying so. When that happens, stop that approach and ask what they want instead."#;
 
@@ -1875,9 +1876,9 @@ pub(crate) fn compose_yield_turn(file: &str, content: &str, diff: Option<&str>) 
 }
 
 /// Compose a reply turn: the driver answered one of the navigator's notes
-/// inside its comment box. Names the note, carries the reply, stays
-/// comment-only (writes are granted elsewhere), and grounds the model with
-/// the numbered buffer.
+/// inside its comment box. Names the note, carries the reply, lets the
+/// model edit when the reply asks for a change (#1965), and grounds the
+/// model with the numbered buffer.
 pub(crate) fn compose_reply_turn(
     file: &str,
     row: usize,
@@ -1889,9 +1890,9 @@ pub(crate) fn compose_reply_turn(
         "Your partner replied to your note on {file} at line {row} (0-based).\n\
          --- YOUR NOTE ---\n{note_body}\n--- END NOTE ---\n\
          --- THEIR REPLY ---\n{reply}\n--- END REPLY ---\n\
-         Answer with NOTE fences (anchor follow-ups to the lines you mean; \
-         re-anchoring to line {row} continues this box). This turn is \
-         COMMENT-ONLY: any EDIT fence will be discarded by the host.\n\
+         If their reply asks you to make a change, make it with EDIT fences. \
+         Otherwise answer with NOTE fences (anchor follow-ups to the lines \
+         you mean; re-anchoring to line {row} continues this box).\n\
          \n--- CURRENT BUFFER ({file}, each line prefixed with its 0-based \
          number and '|') ---\n{}\n--- END BUFFER ---",
         numbered(content)
@@ -2034,7 +2035,9 @@ fn with_pending_note(note: Option<String>, body: String) -> String {
 /// across deltas (header split mid-marker on purpose); "cancel" mode stops
 /// mid-body and BLOCKS on stdin — only the pilot's interrupt line unblocks
 /// it — then streams more body the pilot must drop; "notes" pins one NOTE
-/// fence; "linger" refuses to exit on stdin EOF. Crate-visible so the App's
+/// fence; "repeat" stays seated and inserts the turn's number (1, 2, ...) at
+/// 0:0 on EVERY turn;
+/// "linger" refuses to exit on stdin EOF. Crate-visible so the App's
 /// navigator tests drive the same fake.
 #[cfg(test)]
 pub(crate) const FAKE_CLAUDE: &str = r#"
@@ -2082,6 +2085,20 @@ if mode == "notes":
           "is_error": False, "result": "ok"})
     # Stay seated like the real CLI: wait for the next turn (or EOF).
     sys.stdin.readline()
+    sys.exit(0)
+
+if mode == "repeat":
+    # An edit on every turn, numbered so a test can tell which turn's edit
+    # reached the owner and watch the host gate decide turn by turn.
+    turn = 0
+    while line:
+        turn += 1
+        delta("<<<EDIT demo.txt:0:0-0:0>>>\n%d\n<<<END>>>\n" % turn)
+        emit({"type": "result", "subtype": "success",
+              "is_error": False, "result": "ok"})
+        line = sys.stdin.readline()
+        log.write(line)
+        log.flush()
     sys.exit(0)
 
 delta("Let me fix that.\n")
@@ -4430,8 +4447,9 @@ mod tests {
     }
 
     /// The reply composer: the driver answered a note's box. The turn names
-    /// the note (file, 0-based row, its body), carries the reply, stays
-    /// comment-only, and grounds the model with the numbered buffer.
+    /// the note (file, 0-based row, its body), carries the reply, lets the
+    /// model edit when the reply asks for a change (#1965), and grounds the
+    /// model with the numbered buffer.
     #[test]
     fn compose_reply_turn_carries_note_context_and_buffer() {
         let text = compose_reply_turn(
@@ -4454,8 +4472,12 @@ mod tests {
             "carries the reply: {text}"
         );
         assert!(
-            text.contains("COMMENT-ONLY"),
-            "reply turns stay comment-only: {text}"
+            text.contains("If their reply asks you to make a change, make it with EDIT fences"),
+            "a reply asking for the change may edit: {text}"
+        );
+        assert!(
+            !text.contains("COMMENT-ONLY") && !text.contains("will be discarded"),
+            "a reply is not a comment-only turn: {text}"
         );
         assert!(
             text.contains("0|a\n1|b"),
@@ -4540,6 +4562,10 @@ mod tests {
         assert!(PAIR_SYSTEM_PROMPT.contains("<<<NOTE <file>:<row>>>>"));
         assert!(PAIR_SYSTEM_PROMPT.contains("<<<NOTE demo.txt:4>>>"));
         assert!(PAIR_SYSTEM_PROMPT.contains("COMMENT-ONLY"));
+        assert!(
+            PAIR_SYSTEM_PROMPT.contains("- A reply turn answers one of your notes"),
+            "the reply turn kind is taught (#1965)"
+        );
         assert!(PAIR_SYSTEM_PROMPT.contains("N|"));
         assert!(PAIR_SYSTEM_PROMPT.contains("0-based row"));
     }
@@ -4693,6 +4719,98 @@ mod tests {
         };
         wait_output("suppressed");
         wait_output("[claude] mcp server starting");
+        drop(host);
+    }
+
+    /// Poll `host` until a turn ends, returning every event seen on the way.
+    fn wait_turn_done(host: &mut crate::pair_host::PairHost) -> Vec<crate::pair_host::PairEvent> {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let mut events = Vec::new();
+        while !events
+            .iter()
+            .any(|e| matches!(e, crate::pair_host::PairEvent::TurnDone { .. }))
+        {
+            assert!(Instant::now() < deadline, "no TurnDone; saw {events:?}");
+            events.extend(host.poll());
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        events
+    }
+
+    /// #1965: a reply in a comment box is the driver's own words, so it is
+    /// an invited turn like an ask. "correct this" under a note proposing a
+    /// fix must be able to land that fix in the buffer.
+    #[test]
+    fn a_reply_turn_can_edit_the_buffer() {
+        if !is_on_path("python3") {
+            eprintln!("SKIPPED: python3 not on PATH");
+            return;
+        }
+        let harness = OwnerHarness::start("hello world");
+        let script = harness._dir.path().join("fake_claude.py");
+        std::fs::write(&script, FAKE_CLAUDE).unwrap();
+        let log = harness._dir.path().join("stdin.log");
+
+        let mut cmd = Command::new("python3");
+        cmd.arg(&script).arg(&log).arg("stream"); // streams an EDIT fence
+        let mut host =
+            crate::pair_host::PairHost::spawn_cmd(&harness.socket, "navigator", None, cmd).unwrap();
+        host.send_reply_turn("demo.txt", 0, "rename world", "correct this", "hello world")
+            .unwrap();
+        wait_turn_done(&mut host);
+        harness.wait_until("the reply's edit on the owner", |h| {
+            h.doc().as_deref() == Some("hello streamed edit")
+        });
+        drop(host);
+    }
+
+    /// #1965, the gate that must survive it: an edit-capable reply must not
+    /// leave the next yielded turn able to edit. One seated model edits on
+    /// every turn: reply 1 lands, yield 2 is discarded, reply 3 lands.
+    #[test]
+    fn a_yield_after_a_reply_still_discards_edits() {
+        if !is_on_path("python3") {
+            eprintln!("SKIPPED: python3 not on PATH");
+            return;
+        }
+        let harness = OwnerHarness::start("hello world");
+        let script = harness._dir.path().join("fake_claude.py");
+        std::fs::write(&script, FAKE_CLAUDE).unwrap();
+        let log = harness._dir.path().join("stdin.log");
+
+        let mut cmd = Command::new("python3");
+        cmd.arg(&script).arg(&log).arg("repeat"); // inserts the turn number
+        let mut host =
+            crate::pair_host::PairHost::spawn_cmd(&harness.socket, "navigator", None, cmd).unwrap();
+        host.send_reply_turn("demo.txt", 0, "a note", "correct this", "hello world")
+            .unwrap();
+        wait_turn_done(&mut host);
+        harness.wait_until("reply 1's edit on the owner", |h| {
+            h.doc().as_deref() == Some("1hello world")
+        });
+
+        host.send_yield_turn("demo.txt", "1hello world").unwrap();
+        wait_turn_done(&mut host);
+        // Presence: the yield reached the model, which streamed edit 2.
+        let seen = std::fs::read_to_string(&log).unwrap();
+        assert!(
+            seen.contains("yielded the turn"),
+            "the yield turn never reached the model: {seen}"
+        );
+
+        // Barrier: one pilot's edits reach the owner in order, so once
+        // edit 3 has landed, a leaked edit 2 would already be in the doc.
+        host.send_reply_turn("demo.txt", 0, "a note", "and again", "1hello world")
+            .unwrap();
+        wait_turn_done(&mut host);
+        harness.wait_until("reply 3's edit on the owner", |h| {
+            h.doc().is_some_and(|d| d.starts_with('3'))
+        });
+        assert_eq!(
+            harness.doc().as_deref(),
+            Some("31hello world"),
+            "the yield's edit must be suppressed"
+        );
         drop(host);
     }
 
