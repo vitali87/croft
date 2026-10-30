@@ -410,7 +410,7 @@ pub enum InlineImageProtocol {
     Kitty,
     /// DEC sixel graphics. Unlike iTerm2/Kitty there is no env var that
     /// advertises it, so it is detected at runtime via a DA1 probe
-    /// (`probe_sixel_support`) rather than by `inline_image_protocol_for`.
+    /// (`probe_host`) rather than by `inline_image_protocol_for`.
     /// Painted as explicit truecolor like Kitty (it is not iTerm2, so no
     /// `SetColors`), but its cells live in the normal cell buffer like the
     /// iTerm2 path: a `\x1b[2J` evicts them and writing spaces erases them, so
@@ -495,6 +495,44 @@ pub fn detect_inline_image_protocol() -> InlineImageProtocol {
     InlineImageProtocol::None
 }
 
+/// What the host terminal answered to [`probe_host`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HostProbe {
+    /// It answered DA1, so a missing kitty keyboard reply means it has no
+    /// such protocol rather than that nothing answered.
+    pub answered: bool,
+    /// DA1 lists sixel (attribute `4`).
+    pub sixel: bool,
+    /// It answered the kitty keyboard query (`\x1b[?<flags>u`). With the
+    /// protocol pushed it reports Ctrl+/ and Ctrl+7 apart; without it both
+    /// are the byte 0x1F (#1007).
+    pub kitty_keyboard: bool,
+}
+
+impl HostProbe {
+    /// Read the replies in `reply`, ignoring bytes around them.
+    pub fn parse(reply: &[u8]) -> Self {
+        let text = String::from_utf8_lossy(reply);
+        let mut probe = HostProbe::default();
+        for (at, _) in text.match_indices("\x1b[?") {
+            let tail = &text[at + 3..];
+            let params = tail
+                .find(|c: char| !c.is_ascii_digit() && c != ';')
+                .unwrap_or(tail.len());
+            let params_text = &tail[..params];
+            match tail[params..].chars().next() {
+                Some('u') if !params_text.contains(';') => probe.kitty_keyboard = true,
+                Some('c') => {
+                    probe.answered = true;
+                    probe.sixel = da1_advertises_sixel(text[at..].as_bytes());
+                }
+                _ => {}
+            }
+        }
+        probe
+    }
+}
+
 /// True when a Primary Device Attributes (DA1) reply advertises sixel support.
 /// A DA1 reply looks like `\x1b[?62;1;4;6c`; sixel is attribute `4`, declared as
 /// a standalone `;`-separated token (so it must not match the `4` inside `14`,
@@ -512,11 +550,11 @@ pub fn da1_advertises_sixel(reply: &[u8]) -> bool {
     tail[..end].split(';').any(|tok| tok.trim() == "4")
 }
 
-/// Probe the host terminal for sixel support by issuing Primary Device
-/// Attributes (`\x1b[c`) and parsing the reply for attribute `4`. Returns
-/// `false` on any timeout, read error, or absent attribute, so a terminal that
-/// stays silent (or replies without sixel, like Apple Terminal) falls back
-/// cleanly to the text glyphs.
+/// Probe the host terminal: the kitty keyboard query (`\x1b[?u`), then
+/// Primary Device Attributes (`\x1b[c`), which every terminal answers, so
+/// its reply ends the read. A terminal that stays silent, or answers
+/// without sixel like Apple Terminal, falls back cleanly to the text
+/// glyphs.
 ///
 /// MUST be called after raw mode is enabled and BEFORE the main loop starts
 /// reading stdin (crossterm's event source initialises lazily on first poll, so
@@ -524,16 +562,15 @@ pub fn da1_advertises_sixel(reply: &[u8]) -> bool {
 /// answers DA1 promptly, so the timeout is only a safety net for a
 /// non-responding host and does not slow normal startup.
 #[cfg(unix)]
-pub fn probe_sixel_support() -> bool {
-    use std::io::{Read, Write};
+pub fn probe_host() -> HostProbe {
+    use std::io::Write;
     use std::os::fd::AsRawFd;
 
     let mut out = std::io::stdout();
-    if out.write_all(b"\x1b[c").is_err() || out.flush().is_err() {
-        return false;
+    if out.write_all(b"\x1b[?u\x1b[c").is_err() || out.flush().is_err() {
+        return HostProbe::default();
     }
-    let stdin = std::io::stdin();
-    let fd = stdin.as_raw_fd();
+    let fd = std::io::stdin().as_raw_fd();
     let mut buf = Vec::with_capacity(32);
     let mut byte = [0u8; 1];
     // ~250ms total budget: comfortably covers an SSH round-trip while staying
@@ -554,17 +591,21 @@ pub fn probe_sixel_support() -> bool {
         if n <= 0 {
             break; // timeout or poll error
         }
-        match stdin.lock().read(&mut byte) {
-            Ok(1) => {
-                buf.push(byte[0]);
-                if byte[0] == b'c' || buf.len() >= 64 {
-                    break; // DA1 terminator (or runaway guard)
-                }
-            }
-            _ => break,
+        // Straight from the fd, a byte at a time: std's `Stdin` buffers,
+        // so its first read took the whole reply into that buffer, the
+        // next `poll` found the fd empty and waited out the budget, and
+        // only the reply's ESC was ever parsed (#1007). A byte at a time
+        // leaves anything typed after the reply to the event reader.
+        // SAFETY: reads at most one byte into a one-byte buffer.
+        if unsafe { libc::read(fd, byte.as_mut_ptr().cast(), 1) } != 1 {
+            break;
+        }
+        buf.push(byte[0]);
+        if byte[0] == b'c' || buf.len() >= 64 {
+            break; // DA1 terminator (or runaway guard)
         }
     }
-    da1_advertises_sixel(&buf)
+    HostProbe::parse(&buf)
 }
 
 /// True when running inside Termux's terminal on Android. Termux does not set
@@ -2088,6 +2129,30 @@ mod tests {
         // Garbage / no envelope.
         assert!(!da1_advertises_sixel(b""));
         assert!(!da1_advertises_sixel(b"hello"));
+    }
+
+    /// #1007: the kitty keyboard reply comes before DA1's. Its absence
+    /// beside an answered DA1 is what marks a terminal that sends Ctrl+/
+    /// as the legacy byte 0x1F.
+    #[test]
+    fn the_host_probe_reads_the_kitty_keyboard_and_da1_replies() {
+        let kitty = HostProbe::parse(b"\x1b[?0u\x1b[?62;22c");
+        assert_eq!(
+            kitty,
+            HostProbe {
+                answered: true,
+                sixel: false,
+                kitty_keyboard: true,
+            }
+        );
+        let xterm = HostProbe::parse(b"\x1b[?63;1;2;4;6;9;15;22c");
+        assert!(xterm.answered && xterm.sixel && !xterm.kitty_keyboard);
+        // Flags already pushed by an earlier program, and a stray key.
+        let flagged = HostProbe::parse(b"x\x1b[?15u\x1b[?4;6c");
+        assert!(flagged.kitty_keyboard && flagged.sixel);
+        assert_eq!(HostProbe::parse(b""), HostProbe::default());
+        // A lone kitty reply without DA1 is not "answered".
+        assert!(!HostProbe::parse(b"\x1b[?1u").answered);
     }
 
     #[test]
