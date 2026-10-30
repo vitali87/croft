@@ -183,6 +183,7 @@ fn hovering_a_diagnostic_on_punctuation_shows_its_message_synchronously() {
             message: String::from("unexpected token"),
             tags: Default::default(),
             code: None,
+            origin: None,
         }],
     );
     // text_x = x(0) + gutter(2) + 1 = 3, so cell col 4 is char 1 (the `.`).
@@ -4791,6 +4792,7 @@ fn diag_on_line(line: u32, message: &str) -> crate::lsp::manager::Diagnostic {
         message: String::from(message),
         tags: Default::default(),
         code: None,
+        origin: None,
     }
 }
 

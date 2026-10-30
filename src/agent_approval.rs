@@ -1040,6 +1040,7 @@ mod tests {
             message: message.into(),
             tags: Default::default(),
             code: None,
+            origin: None,
         };
         let now = Instant::now();
         let mut check = ProposalCheck {
@@ -1094,6 +1095,7 @@ mod tests {
             message: "mismatched types".into(),
             tags: Default::default(),
             code: None,
+            origin: None,
         };
         let key = |server: &str, pulled| {
             diagnostics_store_key(&DiagnosticsUpdate {

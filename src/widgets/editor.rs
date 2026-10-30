@@ -27190,6 +27190,7 @@ mod tests {
             message: String::from("test diagnostic"),
             tags: Default::default(),
             code: None,
+            origin: None,
         }
     }
 
@@ -27596,6 +27597,7 @@ mod tests {
                 message: String::from("Type 'number' is not assignable to type 'string'."),
                 tags: Default::default(),
                 code: None,
+                origin: None,
             }],
         );
         assert_eq!(
@@ -27627,6 +27629,7 @@ mod tests {
             message: message.into(),
             tags: Default::default(),
             code,
+            origin: None,
         };
         e.apply_diagnostics(
             PathBuf::from("/tmp/app.py"),
@@ -27681,6 +27684,7 @@ mod tests {
                 message: String::from("missing semicolon"),
                 tags: Default::default(),
                 code: None,
+                origin: None,
             }],
         );
         assert_eq!(
@@ -27711,6 +27715,7 @@ mod tests {
                 message: String::from("unexpected token"),
                 tags: Default::default(),
                 code: None,
+                origin: None,
             }],
         );
         assert_eq!(

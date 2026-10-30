@@ -677,6 +677,19 @@ pub struct Diagnostic {
     /// The rule the diagnostic reports (#1540): ruff's `F401`, ty's
     /// `invalid-argument-type`, TypeScript's `2322`.
     pub code: Option<DiagnosticCode>,
+    /// The server that published it and its diagnostic as sent, `None` for
+    /// one croft made itself.
+    pub origin: Option<std::sync::Arc<DiagnosticOrigin>>,
+}
+
+/// A diagnostic exactly as a language server published it. A code-action
+/// request hands it back to that server untouched: tsserver picks its fixes
+/// by the error `code` and ruff reads its fix from `data`, so a diagnostic
+/// rebuilt from croft's display fields got no quick fix at all (#1030).
+#[derive(Debug, PartialEq)]
+pub struct DiagnosticOrigin {
+    pub server: String,
+    pub wire: lsp_types::Diagnostic,
 }
 
 /// A diagnostic's rule code with the server's `source` and the rule's
@@ -5547,7 +5560,6 @@ impl WorkerState {
                 character: end_char,
             },
         };
-        let diags: Vec<lsp_types::Diagnostic> = diagnostics.iter().map(to_lsp_diagnostic).collect();
         let tx = tx.clone();
         log_file::log(&format!(
             "code_action request id={request_id} servers={} path={} line={start_line}",
@@ -5558,8 +5570,9 @@ impl WorkerState {
             let mut combined: Vec<CodeActionItem> = Vec::new();
             let mut any_ran = false;
             for (server_name, client_arc) in servers {
+                let diags = code_action_diagnostics(&diagnostics, &server_name);
                 let mut client = client_arc.lock().await.requests();
-                let resp = client.code_action(uri.clone(), range, diags.clone()).await;
+                let resp = client.code_action(uri.clone(), range, diags).await;
                 drop(client);
                 match resp {
                     Ok(Some(r)) => {
@@ -6204,8 +6217,9 @@ fn code_action_items(resp: &CodeActionResponse, server: &str) -> Vec<CodeActionI
 
 /// Re-materialise one of croft's normalised diagnostics into the LSP wire type
 /// so it can ride along as `codeAction` context. We carry range, severity,
-/// message and tags (the fields croft keeps); the server matches its fixes by
-/// range.
+/// message and tags (the fields croft keeps). A server's own diagnostics go
+/// back as it sent them instead (`code_action_diagnostics`): its fixes key
+/// on `code` and `data`, which this leaves out.
 fn to_lsp_diagnostic(d: &Diagnostic) -> lsp_types::Diagnostic {
     let severity = match d.severity {
         DiagnosticSeverity::Error => lsp_types::DiagnosticSeverity::ERROR,
@@ -6238,6 +6252,19 @@ fn to_lsp_diagnostic(d: &Diagnostic) -> lsp_types::Diagnostic {
         }),
         ..Default::default()
     }
+}
+
+/// The diagnostics `server` is asked for code actions on: its own, as it
+/// published them, and the ones croft made itself, rebuilt. Another server's
+/// diagnostics are not its to fix, as in VS Code (#1030).
+fn code_action_diagnostics(diagnostics: &[Diagnostic], server: &str) -> Vec<lsp_types::Diagnostic> {
+    diagnostics
+        .iter()
+        .filter_map(|d| match d.origin.as_deref() {
+            Some(origin) => (origin.server == server).then(|| origin.wire.clone()),
+            None => Some(to_lsp_diagnostic(d)),
+        })
+        .collect()
 }
 
 fn text_edit_to_span(te: &TextEdit) -> TextSpanEdit {
@@ -7029,7 +7056,7 @@ fn apply_workspace_report(
                 let diagnostics = report
                     .items
                     .iter()
-                    .map(crate::lsp::client::convert_diagnostic)
+                    .map(|d| crate::lsp::client::convert_diagnostic(server, d))
                     .collect();
                 // An EMPTY list is the server saying this file is clear now,
                 // which is how a fixed file loses its rows - the app's store
@@ -7241,7 +7268,7 @@ fn spawn_document_pulls_within(
                 server: target.name.clone(),
                 diagnostics: items
                     .iter()
-                    .map(crate::lsp::client::convert_diagnostic)
+                    .map(|d| crate::lsp::client::convert_diagnostic(&target.name, d))
                     .collect(),
                 pulled: true,
             });
@@ -9861,6 +9888,7 @@ while True:
             message: "`tmp` is declared but its value is never read.".into(),
             tags,
             code: None,
+            origin: None,
         };
         let unused = to_lsp_diagnostic(&d(DiagnosticTags {
             unnecessary: true,
@@ -9875,6 +9903,41 @@ while True:
             to_lsp_diagnostic(&d(DiagnosticTags::default())).tags,
             None,
             "an untagged diagnostic sends no tags field"
+        );
+    }
+
+    /// #1030: tsserver picks its quick fixes by the error `code`, ruff
+    /// reads its fix from `data`. Each server gets back its own diagnostics
+    /// exactly as it published them, and never another server's; one croft
+    /// made itself still goes to every server, as before.
+    #[test]
+    fn a_code_action_hands_each_server_its_own_diagnostics_unchanged() {
+        let wire = |source: &str, code: &str| lsp_types::Diagnostic {
+            range: def_range(0, 7),
+            message: format!("{source} says {code}"),
+            code: Some(lsp_types::NumberOrString::String(code.into())),
+            source: Some(source.into()),
+            data: Some(serde_json::json!({ "fix": code })),
+            ..Default::default()
+        };
+        let ruff = crate::lsp::client::convert_diagnostic("ruff", &wire("Ruff", "F401"));
+        let ty = crate::lsp::client::convert_diagnostic("ty", &wire("ty", "unresolved-import"));
+        let ours = Diagnostic {
+            origin: None,
+            ..ruff.clone()
+        };
+        let all = [ruff, ty, ours.clone()];
+        assert_eq!(
+            code_action_diagnostics(&all, "ruff"),
+            vec![wire("Ruff", "F401"), to_lsp_diagnostic(&ours)]
+        );
+        assert_eq!(
+            code_action_diagnostics(&all, "ty"),
+            vec![wire("ty", "unresolved-import"), to_lsp_diagnostic(&ours)]
+        );
+        assert_eq!(
+            code_action_diagnostics(&all, "basedpyright"),
+            vec![to_lsp_diagnostic(&ours)]
         );
     }
 
