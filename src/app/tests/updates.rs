@@ -42,12 +42,7 @@ fn the_update_command_stages_the_offered_version() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.install_source = crate::update_check::InstallSource::SelfManaged;
-    app.update_toast = Some(super::UpdateToast {
-        version: String::from("9.9.9"),
-        ready: false,
-        failed: None,
-        buttons: Vec::new(),
-    });
+    app.update_toast = Some(super::UpdateToast::offer("9.9.9".into()));
     app.run_command(crate::widgets::command_palette::Command::UpdateCroft);
     assert_eq!(
         app.staged_install.as_ref().map(|s| s.version.as_str()),
@@ -65,12 +60,7 @@ fn a_failed_update_says_why_in_the_popup_and_offers_retry() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.install_source = crate::update_check::InstallSource::SelfManaged;
-    app.update_toast = Some(super::UpdateToast {
-        version: String::from("9.9.9"),
-        ready: false,
-        failed: None,
-        buttons: Vec::new(),
-    });
+    app.update_toast = Some(super::UpdateToast::offer("9.9.9".into()));
     // A failure that lands with its start, as an offline one does.
     app.staged_install = Some(
         crate::update_check::StagedInstall::preloaded(
@@ -98,8 +88,9 @@ fn a_failed_update_says_why_in_the_popup_and_offers_retry() {
         })
         .collect::<Vec<_>>()
         .join("\n");
+    assert!(text.contains("Update Failed"), "{text}");
     assert!(
-        text.contains("croft v9.9.9 was not installed: no internet connection"),
+        text.contains("Not installed: no internet connection."),
         "{text}"
     );
     let retry = app
@@ -111,13 +102,53 @@ fn a_failed_update_says_why_in_the_popup_and_offers_retry() {
         .find(|(_, a)| *a == super::UpdateToastAction::Update)
         .map(|(r, _)| *r)
         .expect("a Retry button");
-    assert_eq!(buf[(retry.x + 1, retry.y)].symbol(), "R", "labelled Retry");
+    assert_eq!(buf[(retry.x + 2, retry.y)].symbol(), "R", "labelled Retry");
     left_click(&mut app, retry.x, retry.y);
     assert!(app.staged_install.is_some(), "Retry stages again");
     assert!(
         app.update_toast.is_none(),
         "Retry takes the popup down: the status bar shows the build (#1852)"
     );
+}
+
+/// A failed staging's card links to its log, which opens in an editor tab:
+/// the status line can only name the file, cut short at that.
+#[test]
+fn a_failed_update_links_to_its_install_log() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let log = super::staged_install_log_path();
+        std::fs::create_dir_all(log.parent().unwrap()).unwrap();
+        std::fs::write(&log, "error: could not find `croft-software`\n").unwrap();
+        app.update_toast = Some(super::UpdateToast {
+            failed: Some("the build failed"),
+            ..super::UpdateToast::offer("9.9.9".into())
+        });
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 50)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        let screen = screen_text(&term);
+        assert!(screen.contains("View the Install Log"), "{screen}");
+        // The version's own link text: the welcome page's notes may say
+        // "What's New" too.
+        assert!(
+            !screen.contains("What's New in v9.9.9"),
+            "one link: the log"
+        );
+        let link = app
+            .update_toast
+            .as_ref()
+            .unwrap()
+            .buttons
+            .iter()
+            .find(|(_, a)| *a == super::UpdateToastAction::InstallLog)
+            .map(|(r, _)| *r)
+            .expect("a log link");
+        left_click(&mut app, link.x + 6, link.y);
+        assert_eq!(app.editor.path.as_deref(), Some(log.as_path()));
+    });
 }
 
 /// #1844: with nothing on offer, Help: Update croft asks the network now
@@ -130,17 +161,18 @@ fn the_update_command_checks_now_and_reports_the_answer() {
     with_relay_home(home.path(), || {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-        let ask = |app: &mut App, fetch: fn() -> Result<Option<String>, String>| {
-            app.update_fetch = fetch;
-            app.update_croft();
-            assert_eq!(app.status, "Checking for croft updates\u{2026}");
-            crate::test_budget::await_spawned(
-                std::time::Duration::from_millis(500),
-                "the update check to answer",
-                || app.poll_update_watch(),
-            );
-            app.status.clone()
-        };
+        let ask =
+            |app: &mut App, fetch: fn() -> Result<Option<crate::update_check::Release>, String>| {
+                app.update_fetch = fetch;
+                app.update_croft();
+                assert_eq!(app.status, "Checking for croft updates\u{2026}");
+                crate::test_budget::await_spawned(
+                    std::time::Duration::from_millis(500),
+                    "the update check to answer",
+                    || app.poll_update_watch(),
+                );
+                app.status.clone()
+            };
         assert_eq!(
             ask(&mut app, || Err(String::from(
                 crate::update_check::OFFLINE_REASON
@@ -153,11 +185,13 @@ fn the_update_command_checks_now_and_reports_the_answer() {
         );
         assert!(app.update_toast.is_none());
         assert_eq!(
-            ask(&mut app, || Ok(Some(String::from("999.0.0")))),
+            ask(&mut app, || Ok(Some("999.0.0".into()))),
             "croft v999.0.0 is available"
         );
         assert_eq!(
-            app.update_toast.as_ref().map(|t| t.version.as_str()),
+            app.update_toast
+                .as_ref()
+                .map(|t| t.release.version.as_str()),
             Some("999.0.0")
         );
     });
@@ -253,55 +287,193 @@ fn update_spinner_frame_cycles_through_all_frames_and_wraps() {
     );
 }
 
-/// #333: a newer release raises a bottom-LEFT popup that never captures
-/// keys; Later dismisses it and remembers the version, so the same release
-/// is not offered on the next launch.
+/// #333: a newer release raises a bottom-LEFT card that never captures
+/// keys. Later folds it into its status-bar pill and remembers nothing, so
+/// the next launch offers the release again; the pill opens it again; Skip
+/// takes it down and remembers the version, so it is not offered again.
 #[test]
-fn an_update_offer_raises_the_bottom_left_toast_and_later_dismisses_it() {
+fn an_update_offer_raises_the_bottom_left_card_later_folds_it_and_skip_dismisses_it() {
     let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
     let home = tempfile::tempdir().unwrap();
     with_relay_home(home.path(), || {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.install_source = crate::update_check::InstallSource::SelfManaged;
         app.update_check = Some(crate::update_check::UpdateCheck::preloaded(Some(
-            "9.9.9".into(),
+            crate::update_check::Release {
+                version: "9.9.9".into(),
+                published: Some("2026-03-03".into()),
+                size: Some(20_803_574),
+            },
         )));
         assert!(app.poll_update_watch(), "the offer landing is a redraw");
         let toast = app
             .update_toast
             .as_ref()
             .expect("the offer raises the toast");
-        assert_eq!(toast.version, "9.9.9");
+        assert_eq!(toast.release.version, "9.9.9");
         let backend = ratatui::backend::TestBackend::new(140, 50);
         let mut term = ratatui::Terminal::new(backend).unwrap();
         term.draw(|f| app.render(f)).unwrap();
-        let buttons = app.update_toast.as_ref().unwrap().buttons.clone();
-        let update = buttons
-            .iter()
-            .find(|(_, a)| matches!(a, super::UpdateToastAction::Update))
-            .map(|(r, _)| *r)
-            .expect("an Update button");
+        let screen = screen_text(&term);
+        for shown in [
+            "Update Available",
+            "Version:  v9.9.9",
+            "Released:  Mar 3, 2026",
+            "Size:  19.8 MB",
+            "What's New in v9.9.9",
+        ] {
+            assert!(screen.contains(shown), "{shown:?} in\n{screen}");
+        }
+        let status_row = screen.lines().last().unwrap().to_string();
+        assert!(
+            status_row.contains("Update Available: v9.9.9"),
+            "the pill under the card: {status_row:?}"
+        );
+        let button = |app: &App, action| {
+            app.update_toast
+                .as_ref()
+                .unwrap()
+                .buttons
+                .iter()
+                .find(|(_, a)| *a == action)
+                .map(|(r, _)| *r)
+        };
+        let update = button(&app, super::UpdateToastAction::Update).expect("an Update button");
         assert!(update.x < 70, "the popup sits bottom-left: {update:?}");
         assert!(update.y > 40, "the popup sits bottom-left: {update:?}");
-        let later = buttons
-            .iter()
-            .find(|(_, a)| matches!(a, super::UpdateToastAction::Later))
-            .map(|(r, _)| *r)
-            .expect("a Later button");
+
+        // Later: folded, not forgotten and not remembered.
+        let later = button(&app, super::UpdateToastAction::Later).expect("a Later button");
         left_click(&mut app, later.x, later.y);
-        assert!(app.update_toast.is_none(), "Later clears the toast");
+        assert!(
+            app.update_toast.as_ref().is_some_and(|t| !t.open),
+            "Later folds the card into its pill"
+        );
+        term.draw(|f| app.render(f)).unwrap();
+        let screen = screen_text(&term);
+        assert!(
+            !screen.contains("What's New in v9.9.9"),
+            "the card is down:\n{screen}"
+        );
+        assert!(
+            app.update_toast.as_ref().unwrap().buttons.is_empty(),
+            "and has no controls to click"
+        );
+        assert!(
+            screen.contains("Update Available: v9.9.9"),
+            "the pill stays"
+        );
+        let cache_dir = home.path().join(".cache").join("croft");
+        assert_eq!(
+            crate::update_check::CheckCache::load(&cache_dir).dismissed,
+            None,
+            "Later remembers nothing"
+        );
+        assert!(app.staged_install.is_none(), "Later stages nothing");
+
+        // The pill opens the card again.
+        let pill = app.status_offer_rect;
+        assert!(pill.width > 0, "the pill is a click target");
+        left_click(&mut app, pill.x + 2, pill.y);
+        assert!(app.update_toast.as_ref().is_some_and(|t| t.open));
+        term.draw(|f| app.render(f)).unwrap();
+
+        // Skip: down, and remembered.
+        let skip = button(&app, super::UpdateToastAction::Skip).expect("a Skip button");
+        left_click(&mut app, skip.x, skip.y);
+        assert!(
+            app.update_toast.is_none(),
+            "Skip clears the card and its pill"
+        );
         assert!(
             app.staged_install.is_none(),
-            "Later stages nothing: the installed binary is untouched"
+            "Skip stages nothing: the installed binary is untouched"
         );
-        let cache =
-            crate::update_check::CheckCache::load(&home.path().join(".cache").join("croft"));
         assert_eq!(
-            cache.dismissed.as_deref(),
+            crate::update_check::CheckCache::load(&cache_dir)
+                .dismissed
+                .as_deref(),
             Some("9.9.9"),
-            "Later is remembered"
+            "Skip is remembered"
         );
+        term.draw(|f| app.render(f)).unwrap();
+        assert!(!screen_text(&term).contains("9.9.9"));
     });
+}
+
+/// The card's clicks are taken before a menu's or a prompt's, so a button
+/// some later overlay painted over must stop answering: the click is on
+/// what covers it.
+#[test]
+fn an_overlay_over_the_card_takes_the_clicks_on_it() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.update_toast = Some(super::UpdateToast::offer("9.9.9".into()));
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 40)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        let skip = |app: &App| {
+            app.update_toast
+                .as_ref()
+                .unwrap()
+                .buttons
+                .iter()
+                .find(|(_, a)| *a == super::UpdateToastAction::Skip)
+                .map(|(r, _)| *r)
+        };
+        let at = skip(&app).expect("Skip, while nothing covers it");
+
+        // A menu opened over the card's button row.
+        app.open_status_indent_menu(at.x, at.y - 2);
+        term.draw(|f| app.render(f)).unwrap();
+        let cap = term.backend().buffer()[(at.x, at.y)].symbol().to_string();
+        assert_ne!(cap, "\u{e0b6}", "the menu covers Skip's cap");
+        assert_eq!(skip(&app), None, "a covered button is no target");
+        left_click(&mut app, at.x + 1, at.y);
+        assert!(app.update_toast.is_some(), "the click was the menu's");
+        let cache_dir = home.path().join(".cache").join("croft");
+        assert_eq!(
+            crate::update_check::CheckCache::load(&cache_dir).dismissed,
+            None
+        );
+
+        // With the menu gone the button answers again.
+        app.context_menu = None;
+        term.draw(|f| app.render(f)).unwrap();
+        assert_eq!(skip(&app), Some(at));
+    });
+}
+
+/// The card's link opens the release's notes on GitHub, which list every
+/// version since the release before it.
+#[test]
+fn the_card_links_to_the_release_notes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.update_toast = Some(super::UpdateToast::offer("9.9.9".into()));
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 50)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let link = app
+        .update_toast
+        .as_ref()
+        .unwrap()
+        .buttons
+        .iter()
+        .find(|(_, a)| *a == super::UpdateToastAction::ReleaseNotes)
+        .map(|(r, _)| *r)
+        .expect("a release-notes link");
+    left_click(&mut app, link.x + 10, link.y);
+    assert_eq!(
+        app.status,
+        "Open https://github.com/vitali87/croft/releases/tag/v9.9.9"
+    );
+    assert!(
+        app.update_toast.as_ref().is_some_and(|t| t.open),
+        "reading the notes leaves the offer up"
+    );
 }
 
 /// #1852: Update leaves one progress indicator. The popup used to stay up
@@ -315,12 +487,7 @@ fn clicking_update_leaves_one_progress_indicator() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.install_source = crate::update_check::InstallSource::SelfManaged;
-    app.update_toast = Some(super::UpdateToast {
-        version: String::from("9.9.9"),
-        ready: false,
-        failed: None,
-        buttons: Vec::new(),
-    });
+    app.update_toast = Some(super::UpdateToast::offer("9.9.9".into()));
     let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 40)).unwrap();
     let rows = |term: &ratatui::Terminal<ratatui::backend::TestBackend>| -> Vec<String> {
         let buf = term.backend().buffer();
@@ -375,7 +542,7 @@ fn clicking_update_leaves_one_progress_indicator() {
     ));
     assert!(app.poll_update_watch());
     let toast = app.update_toast.as_ref().expect("the ready popup");
-    assert!(toast.ready && toast.version == "9.9.9");
+    assert!(toast.ready && toast.release.version == "9.9.9");
 }
 
 /// #333: the three update producers share one event type; a drift
@@ -534,10 +701,8 @@ fn update_events_are_charged_to_their_own_producer_body() {
     // Relaunch on the popup fires only for the STAGED readiness: with a
     // drift Ready and no staged one, the click does nothing.
     app.update_toast = Some(super::UpdateToast {
-        version: String::from("9.9.9"),
         ready: true,
-        failed: None,
-        buttons: Vec::new(),
+        ..super::UpdateToast::offer("9.9.9".into())
     });
     term.draw(|f| app.render(f)).unwrap();
     let relaunch = app
@@ -561,12 +726,7 @@ fn update_events_are_charged_to_their_own_producer_body() {
 fn the_update_toast_stacks_above_the_port_toast() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.update_toast = Some(super::UpdateToast {
-        version: String::from("9.9.9"),
-        ready: false,
-        failed: None,
-        buttons: Vec::new(),
-    });
+    app.update_toast = Some(super::UpdateToast::offer("9.9.9".into()));
     app.show_port_toast(3000, Some("node".into()));
     let backend = ratatui::backend::TestBackend::new(60, 40);
     let mut term = ratatui::Terminal::new(backend).unwrap();
@@ -833,6 +993,13 @@ fn a_homebrew_install_is_offered_brew_upgrade_not_a_self_update() {
             screen.contains("brew upgrade croft"),
             "the popup names the command to run"
         );
+        let copy = buttons
+            .iter()
+            .find(|(_, a)| matches!(a, super::UpdateToastAction::CopyCommand))
+            .map(|(r, _)| *r)
+            .expect("its primary action copies the command");
+        left_click(&mut app, copy.x, copy.y);
+        assert_eq!(app.status, "Copied `brew upgrade croft` to clipboard");
         // Even a direct request cannot stage a build over the Cellar.
         app.start_staged_update("9.9.9".into());
         assert!(app.staged_install.is_none(), "nothing staged");

@@ -43,5 +43,6 @@ pub mod symbol_picker;
 pub mod terminal;
 pub mod testing;
 pub mod timeline;
+pub mod update_popup;
 pub mod workspace_symbols;
 pub mod zoxide_jump;

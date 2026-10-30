@@ -1,0 +1,3 @@
+feature: The update popup is a card now: the new version beside the one you have, its release date and download size, rounded Skip, Later and Update buttons, and a What's New link to the release notes.
+feature: Later folds the update card into an "Update Available" pill on the status bar for the rest of the session, and a click on the pill opens it again; Skip is what stops that version being offered.
+feature: A failed update's card opens its install log in a tab, and on a Homebrew install the card copies `brew upgrade croft` for you.
