@@ -8904,6 +8904,75 @@ mod tests {
         );
     }
 
+    /// #1101: a string PROMPT_COMMAND ending in `;` (zoxide's init), in
+    /// `&` or a `# comment`, or starting with `;`, joined to croft's hooks
+    /// with `;`, made bash reject the whole string at every prompt, so no
+    /// mark was ever sent. Each shape must still mark a failed command, and
+    /// an empty Enter must still fabricate none.
+    #[test]
+    fn a_prompt_command_ending_in_a_separator_keeps_the_marks() {
+        let Some(bash) = modern_bash() else {
+            return;
+        };
+        for user in [
+            "hook;",
+            "hook; ",
+            "hook\n",
+            ";hook",
+            "hook # note",
+            "hook &",
+        ] {
+            let home = tempfile::tempdir().unwrap();
+            std::fs::write(
+                home.path().join(".bashrc"),
+                format!(
+                    "hook() {{ :; }}\nPROMPT_COMMAND=$'{}'\n",
+                    user.replace('\n', "\\n")
+                ),
+            )
+            .unwrap();
+            let cfg = tempfile::tempdir().unwrap();
+            let mut cmd = CommandBuilder::new(bash);
+            cmd.cwd(home.path());
+            cmd.env("HOME", home.path());
+            for a in apply_shell_integration_env(&mut cmd, bash, cfg.path(), Vec::new()) {
+                cmd.arg(a);
+            }
+            cmd.arg("-i");
+            let mut term = PtyTerminal::spawn_with(cmd, None).unwrap();
+            let wait = |term: &PtyTerminal, what: &str, done: &dyn Fn(&PtyTerminal) -> bool| {
+                crate::test_budget::await_spawned(
+                    std::time::Duration::from_millis(500),
+                    what,
+                    || done(term),
+                );
+            };
+            wait(&term, "bash's first prompt mark", &|t| {
+                !t.prompt_lines().is_empty()
+            });
+            let prompts = term.prompt_lines().len();
+            term.write_input(b"\n");
+            wait(&term, "the prompt after an empty Enter", &|t| {
+                t.prompt_lines().len() > prompts
+            });
+            assert!(
+                pair_decorations(&term.marks_snapshot()).is_empty(),
+                "{user:?}: an empty Enter fabricated a command"
+            );
+            term.write_input(b"false\r");
+            wait(&term, "the failed command's end mark", &|t| {
+                t.command_marks()
+                    .iter()
+                    .any(|(k, _)| *k == crate::shell_integration::OscEvent::CommandEnd(Some(1)))
+            });
+            let (lines, _) = term.grid_lines();
+            assert!(
+                !lines.iter().any(|l| l.contains("syntax error")),
+                "{user:?}: {lines:?}"
+            );
+        }
+    }
+
     #[test]
     fn shell_integration_env_prepends_posix_for_modern_bash_only() {
         // bash is injected by inserting `--posix` before `-l` and pointing

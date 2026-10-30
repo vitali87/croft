@@ -700,8 +700,11 @@ if [[ -z "$_croft_si_installed" ]]; then
     # `[*]` joins with the first char of IFS: scope it to `;` here or an
     # ARRAY PROMPT_COMMAND joins with spaces and its own entries never
     # match, fabricating a command on every empty Enter.
+    # A string PROMPT_COMMAND is joined with newlines below: those part
+    # entries too.
     local IFS=';'
-    case ";${PROMPT_COMMAND[*]};" in
+    local _croft_pc=";${PROMPT_COMMAND[*]};"
+    case ${_croft_pc//$'\n'/;} in
       *";$BASH_COMMAND;"*) builtin return ;;
     esac
     _croft_preexec
@@ -726,7 +729,15 @@ if [[ -z "$_croft_si_installed" ]]; then
     if [[ "$(declare -p PROMPT_COMMAND 2>/dev/null)" == "declare -a"* ]]; then
       PROMPT_COMMAND=(_croft_precmd "${PROMPT_COMMAND[@]}" _croft_arm)
     else
-      PROMPT_COMMAND="_croft_precmd${PROMPT_COMMAND:+;$PROMPT_COMMAND};_croft_arm"
+      # Joined with newlines, not `;`: a user value ending in `;` (zoxide's
+      # init leaves `__zoxide_hook;`) or `&`, or a trailing `# comment`,
+      # made the joined string a syntax error or commented the arm out,
+      # and bash then ran none of it (#1101). A line still cannot start
+      # with `;`, so leading separators are dropped.
+      _croft_nl=$'\n'
+      _croft_pc="${PROMPT_COMMAND#"${PROMPT_COMMAND%%[^[:space:];]*}"}"
+      PROMPT_COMMAND="_croft_precmd$_croft_nl${_croft_pc:+$_croft_pc$_croft_nl}_croft_arm"
+      builtin unset _croft_nl _croft_pc
     fi
   fi
 fi
