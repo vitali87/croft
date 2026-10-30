@@ -2945,14 +2945,27 @@ impl LineEnding {
         }
     }
 
-    /// The ending most of `text`'s line breaks use: CRLF only when more than
-    /// half of them are `\r\n`, as VS Code picks it. Any `\r\n` used to mark
-    /// the file CRLF, so one line pasted from Windows into an LF file made
-    /// the next save rewrite every line of it (#936).
+    /// The ending most of `text`'s line breaks use, as VS Code picks it:
+    /// CRLF when more than half of the breaks hold a `\r`. A lone `\r` is a
+    /// break too, and counts toward CRLF. Any `\r\n` used to mark the file
+    /// CRLF, so one line pasted from Windows into an LF file made the next
+    /// save rewrite every line of it (#936).
     pub fn detect(text: &str) -> Self {
-        let breaks = text.matches('\n').count();
-        let crlf = text.matches("\r\n").count();
-        if crlf * 2 > breaks {
+        let bytes = text.as_bytes();
+        let (mut breaks, mut crs) = (0usize, 0usize);
+        for (i, b) in bytes.iter().enumerate() {
+            match b {
+                b'\n' => breaks += 1,
+                b'\r' => {
+                    crs += 1;
+                    if bytes.get(i + 1) != Some(&b'\n') {
+                        breaks += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if crs * 2 > breaks {
             Self::Crlf
         } else {
             Self::Lf
@@ -32070,6 +32083,9 @@ mod tests {
         assert_eq!(LineEnding::detect("a\r\nb\n"), LineEnding::Lf);
         assert_eq!(LineEnding::detect("a\r\n"), LineEnding::Crlf);
         assert_eq!(LineEnding::detect("no break"), LineEnding::Lf);
+        // A lone CR is a break that counts toward CRLF, as in VS Code.
+        assert_eq!(LineEnding::detect("a\n\rb\r\nc"), LineEnding::Crlf);
+        assert_eq!(LineEnding::detect("a\rb\nc\n"), LineEnding::Lf);
     }
 
     #[test]
