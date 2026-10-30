@@ -8584,14 +8584,16 @@ impl App {
             return;
         }
         let mut overlays = self.pending_activity_image_overlays();
-        if overlays.is_empty() {
-            return;
-        }
         let positions: Vec<(u16, u16)> = overlays.iter().map(|(cell, _)| *cell).collect();
+        // Checked before the empty return below: an update card over every
+        // icon left nothing to send, and Kitty kept the old ones over it.
         if self.overlays.activity.positions_moved(&positions) {
             self.overlays.activity.request_clear();
             self.overlays.activity.forget_positions();
             self.overlays.activity.forget_sent();
+            return;
+        }
+        if overlays.is_empty() {
             return;
         }
         let hashes: Vec<u64> = overlays

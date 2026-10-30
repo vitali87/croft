@@ -793,6 +793,27 @@ fn the_update_card_holds_back_the_activity_icons_it_covers() {
     }
 }
 
+/// #1958: with every icon covered there is nothing left to send, and the
+/// icons already on screen must still be cleared, or Kitty keeps drawing
+/// them over the card.
+#[test]
+fn icons_are_cleared_when_none_is_left_to_send() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.overlays.activity.set_images(dummy_activity_images());
+    // No laid-out block: the bar has nothing to send.
+    assert!(app.pending_activity_image_overlays().is_empty());
+    app.overlays
+        .activity
+        .store_positions(vec![(1, 30), (1, 32)]);
+    app.overlays.activity.mark_dirty();
+    app.flush_activity_image_overlays(&[]);
+    assert!(app.overlays.activity.consume_clear(), "the old icons go");
+    assert!(app.overlays.activity.last_positions().is_empty());
+    app.flush_activity_image_overlays(&[]);
+    assert!(!app.overlays.activity.consume_clear(), "and only once");
+}
+
 /// #333: a staged build that lands turns the popup into a Relaunch offer,
 /// and Relaunch is the same re-exec the updater chord arms - never automatic.
 #[test]
