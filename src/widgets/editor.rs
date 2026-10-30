@@ -3215,8 +3215,9 @@ pub struct Editor {
     /// only, keyed by `(edit_seq, wrap width)`. Comment-box rows are few and
     /// change without an edit, so they are added at mapping time instead.
     ruler_starts_cache: Option<(u64, usize, Vec<usize>)>,
-    /// The caret's bracket-match highlight, keyed by `(edit_seq, caret,
-    /// protected_current)`: see `cached_bracket_match_pair`.
+    /// The caret's bracket-match highlight, keyed by `(edit_seq,
+    /// highlight_generation, caret, protected_current)`: see
+    /// `cached_bracket_match_pair`.
     bracket_pair_cache: Option<BracketPairCache>,
     /// The `edit_seq` the collab session last synced this buffer at (Phase D
     /// independent viewports, docs/MULTIPLAYER.md). The tick diff extracts
@@ -14279,13 +14280,15 @@ impl Editor {
             .map(|(o, c, _)| (o, c))
     }
 
-    /// [`Self::bracket_match_pair`], worked out once per edit and caret
-    /// place. Every frame asks, and a partner far along a long line costs a
-    /// scan of that line, which kept a core busy while croft sat idle on a
-    /// minified file (#959).
+    /// [`Self::bracket_match_pair`], worked out once per edit, highlight
+    /// pass and caret place. Every frame asks, and a partner far along a
+    /// long line costs a scan of that line, which kept a core busy while
+    /// croft sat idle on a minified file (#959). A pass can move the strings
+    /// and comments without an edit (Change Language Mode), so it counts.
     fn cached_bracket_match_pair(&mut self) -> Option<(BPos, BPos)> {
         let key = (
             self.edit_seq,
+            self.highlight_generation,
             (self.cursor_row, self.cursor_col),
             self.protected_current,
         );
@@ -16405,7 +16408,7 @@ fn word_end_after(line: &str, col: usize) -> usize {
 type BPos = (usize, usize);
 
 /// `Editor::bracket_pair_cache`: the key it was worked out at, and the pair.
-type BracketPairCache = ((u64, BPos, bool), Option<(BPos, BPos)>);
+type BracketPairCache = ((u64, u64, BPos, bool), Option<(BPos, BPos)>);
 
 /// The bracket pairs croft matches, mirroring VS Code's default language
 /// brackets `()`, `[]`, `{}`.
@@ -40390,6 +40393,20 @@ mod tests {
         let pair = e.cached_bracket_match_pair();
         assert_ne!(pair, Some(((0, 1), (0, 3))), "{:?}", e.lines);
         assert_eq!(pair, e.bracket_match_pair());
+    }
+
+    /// A language switch re-highlights without an edit, and can put the
+    /// pair beside the caret into a comment or take it out of one.
+    #[test]
+    fn the_cached_bracket_highlight_follows_a_language_switch() {
+        let mut e = editor_with("// (x)");
+        e.set_language(Some(LangKind::Python));
+        e.cursor_col = 3;
+        assert_eq!(e.cached_bracket_match_pair(), Some(((0, 3), (0, 5))));
+        e.set_language(Some(LangKind::Rust));
+        assert_eq!(e.cached_bracket_match_pair(), None, "a Rust comment");
+        e.set_language(Some(LangKind::Python));
+        assert_eq!(e.cached_bracket_match_pair(), Some(((0, 3), (0, 5))));
     }
 
     #[test]
