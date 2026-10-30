@@ -4847,6 +4847,11 @@ pub struct App {
     /// re-painted on top of any sidebar illustration it overlaps, since
     /// OSC-1337 images composite above ratatui's text layer.
     ui_tooltip_area: Option<Rect>,
+    /// Where the update card sat on the last frame, `None` while it is
+    /// folded, gone or too big for the screen. The activity bar's gear and
+    /// heart and the side bar's illustrations are inline images, which land
+    /// above text, so they hold back wherever the card is (#1958).
+    update_card_rect: Option<Rect>,
     definition_request_id: Option<u64>,
     /// In-flight Peek Definition request (#115): same LSP request as the
     /// jump, different consumer — the response opens the peek popup at the
@@ -7408,6 +7413,7 @@ impl App {
             ui_tooltip: None,
             ui_tooltip_label: None,
             ui_tooltip_area: None,
+            update_card_rect: None,
             definition_request_id: None,
             peek_definition_request_id: None,
             peek_popup: None,
@@ -8022,7 +8028,7 @@ impl App {
             return;
         }
         let hero = self.source_control.last_hero_area;
-        if hero.width == 0 || hero.height == 0 {
+        if hero.width == 0 || hero.height == 0 || self.update_card_covers(hero) {
             return;
         }
         // The hero asset carries its own opaque dark backdrop; on a light
@@ -8122,7 +8128,7 @@ impl App {
             width: crate::widgets::remote::SSH_EMPTY_STATE_CELLS_W,
             height: crate::widgets::remote::SSH_EMPTY_STATE_CELLS_H,
         };
-        if !self.chrome_image_due("ssh", &osc, at) {
+        if self.update_card_covers(at) || !self.chrome_image_due("ssh", &osc, at) {
             return;
         }
         let mut out = stdout();
@@ -8402,10 +8408,11 @@ impl App {
             self.process_picker.as_ref().map(|p| p.last_rect),
         ];
         let visible = |block: Rect| {
-            occluders
-                .iter()
-                .flatten()
-                .all(|panel| !block.intersects(*panel))
+            !self.update_card_covers(block)
+                && occluders
+                    .iter()
+                    .flatten()
+                    .all(|panel| !block.intersects(*panel))
         };
         let mut blocks: Vec<(Rect, &str)> = Vec::new();
         if activity_ready {
@@ -25090,11 +25097,23 @@ impl App {
     /// gets it without the release-notes link, then without the rows past
     /// Version.
     fn render_update_toast(&mut self, frame: &mut ratatui::Frame) {
+        let rect = self.paint_update_toast(frame);
+        if rect != self.update_card_rect {
+            // An icon it now covers must stop being sent, and one it left
+            // must come back.
+            self.update_card_rect = rect;
+            self.overlays.activity.mark_dirty();
+        }
+    }
+
+    /// `render_update_toast`'s painting: the card's rect, or `None` when
+    /// nothing was painted.
+    fn paint_update_toast(&mut self, frame: &mut ratatui::Frame) -> Option<Rect> {
         let Some(toast) = self.update_toast.as_ref().filter(|t| t.open) else {
             if let Some(t) = self.update_toast.as_mut() {
                 t.buttons.clear();
             }
-            return;
+            return None;
         };
         let mut card = self.update_card(toast);
         let area = frame.area();
@@ -25117,7 +25136,7 @@ impl App {
             if let Some(t) = self.update_toast.as_mut() {
                 t.buttons.clear();
             }
-            return;
+            return None;
         }
         let rect = Rect {
             x: area.x + 1,
@@ -25134,6 +25153,14 @@ impl App {
             t.buttons = hits;
             t.painted = painted;
         }
+        Some(rect)
+    }
+
+    /// Whether the update card covers any of `at`: an inline image there
+    /// would be drawn over it, so it is held back while the card is open.
+    fn update_card_covers(&self, at: Rect) -> bool {
+        self.update_card_rect
+            .is_some_and(|card| card.intersects(at))
     }
 
     /// Drop the update card's controls that a later overlay painted over: a

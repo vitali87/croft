@@ -739,6 +739,60 @@ fn the_update_toast_stacks_above_the_port_toast() {
     );
 }
 
+/// #1958: the activity bar's gear and heart are inline images, which the
+/// terminal draws over text, so the card sat behind them. While the card is
+/// open the icons it covers are not sent, and Later brings them back.
+#[test]
+fn the_update_card_holds_back_the_activity_icons_it_covers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.overlays.activity.set_images(dummy_activity_images());
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let sent = |app: &App| -> Vec<(u16, u16)> {
+        app.pending_activity_image_overlays()
+            .iter()
+            .map(|(cell, _)| *cell)
+            .collect()
+    };
+    let gear = app.sidebar_areas.settings_icon;
+    let heart = app.sidebar_areas.sponsor_icon;
+    assert!(sent(&app).contains(&(gear.x, gear.y)), "precondition");
+    app.overlays.activity.mark_emitted();
+    term.draw(|f| app.render(f)).unwrap();
+    assert!(
+        !app.overlays.activity.dirty(),
+        "precondition: a still frame"
+    );
+
+    app.update_toast = Some(super::UpdateToast::offer("9.9.9".into()));
+    term.draw(|f| app.render(f)).unwrap();
+    let card = app.update_card_rect.expect("the card is painted");
+    assert!(card.intersects(gear), "{card:?} over {gear:?}");
+    assert!(app.overlays.activity.dirty(), "the card opening re-sends");
+    let during = sent(&app);
+    for icon in [gear, heart] {
+        assert!(
+            !during.contains(&(icon.x, icon.y)),
+            "{icon:?} under {card:?}"
+        );
+    }
+    assert!(
+        during.len() > 2,
+        "the icons it does not cover are still sent: {during:?}"
+    );
+
+    app.overlays.activity.mark_emitted();
+    app.update_toast.as_mut().unwrap().open = false;
+    term.draw(|f| app.render(f)).unwrap();
+    assert_eq!(app.update_card_rect, None);
+    assert!(app.overlays.activity.dirty(), "the card folding re-sends");
+    let after = sent(&app);
+    for icon in [gear, heart] {
+        assert!(after.contains(&(icon.x, icon.y)), "{icon:?} back");
+    }
+}
+
 /// #333: a staged build that lands turns the popup into a Relaunch offer,
 /// and Relaunch is the same re-exec the updater chord arms - never automatic.
 #[test]
