@@ -112,20 +112,20 @@ type RpcError = (i64, String, Option<Value>);
 fn check_modern_meta(meta: Option<&Value>) -> Result<(), RpcError> {
     let field = |key| meta.and_then(|m| m.get(key));
     let (Some(version), Some(_)) = (
-        field(mcp::PROTOCOL_VERSION_KEY),
-        field(mcp::CLIENT_CAPABILITIES_KEY),
+        field(mcp::PROTOCOL_VERSION_KEY).and_then(Value::as_str),
+        field(mcp::CLIENT_CAPABILITIES_KEY).filter(|caps| caps.is_object()),
     ) else {
         return Err((
             -32602,
             format!(
-                "missing {} or {} in _meta",
+                "_meta needs {} as a string and {} as an object",
                 mcp::PROTOCOL_VERSION_KEY,
                 mcp::CLIENT_CAPABILITIES_KEY
             ),
             None,
         ));
     };
-    if version.as_str() != Some(mcp::MODERN_VERSION) {
+    if version != mcp::MODERN_VERSION {
         return Err((
             mcp::UNSUPPORTED_PROTOCOL_VERSION,
             String::from("Unsupported protocol version"),
@@ -582,6 +582,12 @@ mod tests {
 
         let bare = json!({ "_meta": { mcp::PROTOCOL_VERSION_KEY: mcp::MODERN_VERSION } });
         let invalid = handle(&state, &rpc(2, "tools/list", bare)).unwrap();
+        assert_eq!(invalid["error"]["code"], -32602);
+        let not_an_object = json!({ "_meta": {
+            mcp::PROTOCOL_VERSION_KEY: mcp::MODERN_VERSION,
+            mcp::CLIENT_CAPABILITIES_KEY: null,
+        } });
+        let invalid = handle(&state, &rpc(3, "tools/list", not_an_object)).unwrap();
         assert_eq!(invalid["error"]["code"], -32602);
     }
 

@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Map, Value, json};
 
 use crate::mcp::transport::McpTransport;
@@ -394,8 +394,9 @@ impl McpClient {
     /// the legacy `initialize` handshake unless the server proves modern.
     fn handshake(&mut self, probe_timeout: Duration) -> Result<()> {
         let probe = self.send("server/discover", json!({ "_meta": self.meta() }))?;
-        if let Some(reply) = self.wait(&[probe], probe_timeout)? {
-            self.era = classify_probe(&reply)?;
+        let mut probe_reply = self.wait(&[probe], probe_timeout)?;
+        if let Some(reply) = &probe_reply {
+            self.era = classify_probe(reply)?;
             if self.era == Era::Modern {
                 return Ok(());
             }
@@ -404,30 +405,45 @@ impl McpClient {
             "initialize",
             initialize_params(&self.client_name, &self.client_version),
         )?;
-        let mut late_probe = None;
+        let deadline = Instant::now() + REQUEST_TIMEOUT;
+        let mut rejected = None;
         loop {
-            let reply = self
-                .wait(&[probe, init], REQUEST_TIMEOUT)?
-                .context("MCP server timed out before responding")?;
-            if is_response_to(&reply, probe) {
-                late_probe = Some(reply);
-                continue;
-            }
-            return match response_result(&reply) {
-                Ok(_) => {
-                    self.era = Era::Legacy;
-                    self.notify("notifications/initialized", json!({}))
-                }
-                // A modern server only slow to answer the probe rejects
-                // `initialize`, and its late discover reply says it is modern.
-                Err(e) => match late_probe.as_ref().map(classify_probe) {
-                    Some(Ok(Era::Modern)) => {
-                        self.era = Era::Modern;
-                        Ok(())
+            // Once `initialize` is rejected, only the probe's outstanding
+            // reply can still change the verdict.
+            let ids: &[i64] = if rejected.is_some() {
+                &[probe]
+            } else {
+                &[probe, init]
+            };
+            match self.wait(ids, deadline.saturating_duration_since(Instant::now()))? {
+                Some(reply) if is_response_to(&reply, probe) => probe_reply = Some(reply),
+                Some(reply) => match response_result(&reply) {
+                    Ok(_) => {
+                        self.era = Era::Legacy;
+                        return self.notify("notifications/initialized", json!({}));
                     }
-                    Some(Err(why)) => Err(why),
-                    _ => Err(e),
+                    Err(e) => rejected = Some(e),
                 },
+                None => {
+                    return Err(rejected
+                        .unwrap_or_else(|| anyhow!("MCP server timed out before responding")));
+                }
+            }
+            // A modern server only slow to answer the probe rejects
+            // `initialize`, and its discover reply, before or after that
+            // rejection, says it is modern.
+            rejected = match (rejected, &probe_reply) {
+                (Some(rejection), Some(reply)) => {
+                    return match classify_probe(reply) {
+                        Ok(Era::Modern) => {
+                            self.era = Era::Modern;
+                            Ok(())
+                        }
+                        Ok(Era::Legacy) => Err(rejection),
+                        Err(why) => Err(why),
+                    };
+                }
+                (rejected, _) => rejected,
             };
         }
     }
@@ -733,17 +749,21 @@ mod tests {
         assert_eq!(client.era, Era::Legacy);
     }
 
-    /// A modern server too slow for the probe window answers it late, then
-    /// rejects the fallback `initialize`: croft still ends up modern.
+    /// A modern server too slow for the probe window answers it late and
+    /// rejects the fallback `initialize`, in either order: croft still ends
+    /// up modern.
     #[test]
     fn a_modern_server_slow_to_answer_the_probe_is_still_modern() {
-        let script = format!(
-            r#"read l; sleep 1; echo '{DISCOVERED}'; read l
-            echo '{{"jsonrpc":"2.0","id":2,"error":{{"code":-32601,"message":"Method not found"}}}}'
-            cat >/dev/null"#
-        );
-        let client = connect_sh(&script, Duration::from_millis(100)).expect("recovers modern");
-        assert_eq!(client.era, Era::Modern);
+        let reject =
+            r#"{"jsonrpc":"2.0","id":2,"error":{"code":-32601,"message":"Method not found"}}"#;
+        for replies in [
+            format!("echo '{DISCOVERED}'; echo '{reject}'"),
+            format!("echo '{reject}'; echo '{DISCOVERED}'"),
+        ] {
+            let script = format!("read l; sleep 1; read l; {replies}; cat >/dev/null");
+            let client = connect_sh(&script, Duration::from_millis(100)).expect("recovers modern");
+            assert_eq!(client.era, Era::Modern, "{replies}");
+        }
     }
 
     /// End-to-end against a real MCP server process: a tiny hermetic Python
