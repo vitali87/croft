@@ -924,6 +924,22 @@ struct ChromeBakeInput {
     sponsor_ink: crate::iterm2_inline::IconInk,
 }
 
+impl ChromeBakeInput {
+    /// Whether pictures baked for `shown` must come down while this bake
+    /// runs, rather than stay up until it lands: across a theme switch they
+    /// carry the old theme's ink and background, and on sixel, where a
+    /// picture is sized in pixels, across a cell-size change they outgrow
+    /// their cells (#1843). A font zoom on Kitty or iTerm2 only rescales them.
+    fn outdates(&self, shown: &ChromeBakeInput) -> bool {
+        self.protocol != shown.protocol
+            || self.icon_bg != shown.icon_bg
+            || self.icon_ink != shown.icon_ink
+            || self.sponsor_ink != shown.sponsor_ink
+            || (self.protocol == crate::iterm2_inline::InlineImageProtocol::Sixel
+                && self.cell != shown.cell)
+    }
+}
+
 /// The pictures [`App::init_graphics`] bakes off the UI thread; `None` for
 /// any that failed to bake.
 struct ChromeImages {
@@ -4115,7 +4131,10 @@ pub struct App {
     cell_pixel: Option<(u32, u32)>,
     /// The activity-bar icons and panel illustrations `init_graphics` is
     /// baking off the UI thread (#1973); `None` once they are up.
-    chrome_bake: Option<std::sync::mpsc::Receiver<ChromeImages>>,
+    chrome_bake: Option<std::sync::mpsc::Receiver<(ChromeBakeInput, ChromeImages)>>,
+    /// What the activity-bar icons and panel illustrations on screen were
+    /// baked for; `None` while none are up.
+    chrome_shown: Option<ChromeBakeInput>,
     /// The bake asked for while `chrome_bake` was still running: it runs
     /// when that one lands, in its place.
     chrome_bake_next: Option<ChromeBakeInput>,
@@ -6924,6 +6943,7 @@ impl App {
             search_results_rx,
             cell_pixel: None,
             chrome_bake: None,
+            chrome_shown: None,
             chrome_bake_next: None,
             welcome_bake: None,
             last_pdf_wheel: None,
@@ -7616,18 +7636,6 @@ impl App {
         }
         let (cell_w, cell_h) =
             cell_pixel_of(ws.columns, ws.rows, ws.width, ws.height).unwrap_or(FALLBACK_CELL_PIXEL);
-        // A sixel picture is sized in pixels, so pictures baked for another
-        // cell size would outgrow their cells until the new bake lands
-        // (#1843): they go now, and the bar draws its glyphs meanwhile.
-        if self.inline_protocol == crate::iterm2_inline::InlineImageProtocol::Sixel
-            && self.cell_pixel.is_some_and(|cell| cell != (cell_w, cell_h))
-        {
-            self.overlays.activity.clear_images();
-            self.overlays.activity.request_clear();
-            self.clear_run_debug_icon_if_emitted();
-            self.overlays.run_debug.clear_image();
-            self.overlays.ssh.disable();
-        }
         self.cell_pixel = Some((cell_w, cell_h));
         // OSC-1337 hero will own the no-repo illustration cells; the
         // widget skips its ASCII fallback so resize doesn't flash old
@@ -7664,17 +7672,36 @@ impl App {
     /// glyphs. One bake runs at a time: asked again while one runs (arrowing
     /// through the theme picker's previews), the newest ask waits for it and
     /// runs in its place when it lands, so an older one's pictures never go
-    /// up.
+    /// up. Pictures on screen that `input` outdates come down at once, and
+    /// the bar draws its glyphs, in the new theme, meanwhile.
     fn start_chrome_bake(&mut self, input: ChromeBakeInput) {
+        if self
+            .chrome_shown
+            .is_some_and(|shown| input.outdates(&shown))
+        {
+            self.drop_chrome_images();
+        }
         if self.chrome_bake.is_some() {
             self.chrome_bake_next = Some(input);
             return;
         }
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = tx.send(Self::bake_chrome_images(&input));
+            let _ = tx.send((input, Self::bake_chrome_images(&input)));
         });
         self.chrome_bake = Some(rx);
+    }
+
+    /// Take down the activity-bar icons and panel illustrations, evicting
+    /// whatever of them was sent, so the bar falls back to its glyphs.
+    fn drop_chrome_images(&mut self) {
+        self.overlays.activity.clear_images();
+        self.overlays.activity.request_clear();
+        self.overlays.activity.mark_dirty();
+        self.clear_run_debug_icon_if_emitted();
+        self.overlays.run_debug.clear_image();
+        self.overlays.ssh.disable();
+        self.chrome_shown = None;
     }
 
     /// Put up the activity-bar icons and the panel illustrations once the
@@ -7694,10 +7721,11 @@ impl App {
             self.start_chrome_bake(next);
             return false;
         }
-        let Some(baked) = baked else {
+        let Some((input, baked)) = baked else {
             return false;
         };
         self.apply_chrome_images(baked);
+        self.chrome_shown = Some(input);
         true
     }
 
