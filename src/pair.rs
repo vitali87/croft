@@ -449,6 +449,7 @@ Note rules:
 - Notes never change any buffer. Use them for review remarks, questions, and change proposals.
 
 Some user messages number the buffer: each line arrives prefixed with `N|` where N is its 0-based row. The prefix is a label, not content — character columns still count from the first character AFTER the first `|`, and NOTE/EDIT rows use exactly those N values.
+Your partner's gutter numbers lines from 1, so row N is line N+1 to them. Whenever you mention a line in words they read (a note body or your commentary), use that 1-based gutter number. Fence headers and `N|` prefixes stay 0-based.
 
 Turn kinds:
 - An ask turn names a task and where you were invoked: you may edit with EDIT fences and remark with NOTE fences.
@@ -1817,8 +1818,8 @@ fn numbered(content: &str) -> String {
 }
 
 /// Compose an ask turn: the instruction, where it was invoked (a 0-based
-/// line or line range), the selected text when there is one, and the
-/// numbered buffer.
+/// line or line range, with the gutter's 1-based number beside it), the
+/// selected text when there is one, and the numbered buffer.
 pub(crate) fn compose_ask_turn(
     file: &str,
     range: (usize, usize),
@@ -1830,11 +1831,16 @@ pub(crate) fn compose_ask_turn(
     let (s, e) = range;
     if s == e {
         text.push_str(&format!(
-            "Your partner invoked you on {file} at line {s} (0-based).\n"
+            "Your partner invoked you on {file} at line {s} (0-based; line {} in \
+             your partner's gutter).\n",
+            s + 1
         ));
     } else {
         text.push_str(&format!(
-            "Your partner invoked you on {file} at lines {s}-{e} (0-based).\n"
+            "Your partner invoked you on {file} at lines {s}-{e} (0-based; lines \
+             {}-{} in your partner's gutter).\n",
+            s + 1,
+            e + 1
         ));
     }
     if !selection.is_empty() {
@@ -1886,7 +1892,8 @@ pub(crate) fn compose_reply_turn(
     content: &str,
 ) -> String {
     format!(
-        "Your partner replied to your note on {file} at line {row} (0-based).\n\
+        "Your partner replied to your note on {file} at line {row} (0-based; \
+         line {gutter} in your partner's gutter).\n\
          --- YOUR NOTE ---\n{note_body}\n--- END NOTE ---\n\
          --- THEIR REPLY ---\n{reply}\n--- END REPLY ---\n\
          Answer with NOTE fences (anchor follow-ups to the lines you mean; \
@@ -1894,7 +1901,8 @@ pub(crate) fn compose_reply_turn(
          COMMENT-ONLY: any EDIT fence will be discarded by the host.\n\
          \n--- CURRENT BUFFER ({file}, each line prefixed with its 0-based \
          number and '|') ---\n{}\n--- END BUFFER ---",
-        numbered(content)
+        numbered(content),
+        gutter = row + 1,
     )
 }
 
@@ -4442,7 +4450,7 @@ mod tests {
             "a\nb",
         );
         assert!(
-            text.contains("replied to your note on demo.txt at line 3 (0-based)"),
+            text.contains("replied to your note on demo.txt at line 3 (0-based"),
             "names the note's anchor: {text}"
         );
         assert!(
@@ -4609,6 +4617,48 @@ mod tests {
         assert!(one.contains("line 2"));
         assert!(!one.contains("--- SELECTED LINES ---"));
         assert!(one.contains("2|c"));
+    }
+
+    /// #1966: the gutter numbers lines from 1, so every line a turn names
+    /// carries that number beside its 0-based row, and the bare 0-based row
+    /// never stands alone where the model would quote it to its partner.
+    #[test]
+    fn turns_name_the_gutter_line_beside_the_row() {
+        let one = compose_ask_turn("src/a.rs", (4, 4), "", "fix this", "a\nb\nc\nd\ne");
+        assert!(
+            one.contains("at line 4 (0-based; line 5 in your partner's gutter)"),
+            "{one}"
+        );
+        assert!(
+            !one.contains("line 4 (0-based)."),
+            "bare 0-based row: {one}"
+        );
+
+        let range = compose_ask_turn("src/a.rs", (0, 2), "a\nb\nc", "tidy", "a\nb\nc");
+        assert!(
+            range.contains("at lines 0-2 (0-based; lines 1-3 in your partner's gutter)"),
+            "{range}"
+        );
+        assert!(
+            !range.contains("lines 0-2 (0-based)."),
+            "bare 0-based rows: {range}"
+        );
+
+        let reply = compose_reply_turn("main.py", 4, "a note", "correct this", "a\nb\nc\nd\ne");
+        assert!(
+            reply.contains("at line 4 (0-based; line 5 in your partner's gutter)"),
+            "{reply}"
+        );
+        assert!(
+            !reply.contains("line 4 (0-based)."),
+            "bare 0-based row: {reply}"
+        );
+
+        // The prose rule the model follows when it writes a line number.
+        assert!(
+            PAIR_SYSTEM_PROMPT.contains("row N is line N+1"),
+            "the system prompt teaches gutter numbers for prose"
+        );
     }
 
     /// The yield-turn composer: comment-only rule, the diff since the
