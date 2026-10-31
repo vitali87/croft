@@ -10,13 +10,14 @@ A VS Code style three pane workspace that runs entirely inside your terminal. Wr
 
 The non-negotiables behind every decision in croft:
 
-1. **Speed is a must.** Every feature is weighed against its cost on the hot path before it lands.
-2. **Low latency is non-negotiable.** Keystrokes and clicks register instantly; rendering is coalesced so a noisy shell can never starve input.
-3. **Local and remote parity always binds.** Behaviour on your Mac and on a Linux box over SSH is identical. There is no second-class remote mode.
-4. **The gap between terminal and GUI stays minimal.** croft should look and feel like VS Code, down to the icons and motion.
-5. **Everything has a shortcut.** Every action is reachable from the keyboard, and no menu item ships without an accelerator.
-6. **Correctness beats workarounds.** Bugs are fixed at the root, never papered over with a fallback or a downgrade.
-7. **One binary, no ceremony.** Features are emulated in process rather than bolted on, so there is nothing to wire up after you install.
+1. **croft starts in milliseconds. No exceptions.** From any terminal, any launcher, on any workspace, the first frame is up in milliseconds. Nothing the first frame does not need runs before it: shell probes, image baking, indexing, and network checks all happen after it, off the UI thread.
+2. **Speed is a must.** Every feature is weighed against its cost on the hot path before it lands.
+3. **Low latency is non-negotiable.** Keystrokes and clicks register instantly; rendering is coalesced so a noisy shell can never starve input.
+4. **Local and remote parity always binds.** Behaviour on your Mac and on a Linux box over SSH is identical. There is no second-class remote mode.
+5. **The gap between terminal and GUI stays minimal.** croft should look and feel like VS Code, down to the icons and motion.
+6. **Everything has a shortcut.** Every action is reachable from the keyboard, and no menu item ships without an accelerator.
+7. **Correctness beats workarounds.** Bugs are fixed at the root, never papered over with a fallback or a downgrade.
+8. **One binary, no ceremony.** Features are emulated in process rather than bolted on, so there is nothing to wire up after you install.
 
 ## Layout
 

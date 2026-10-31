@@ -570,12 +570,27 @@ pub fn probe_host() -> HostProbe {
     if out.write_all(b"\x1b[?u\x1b[c").is_err() || out.flush().is_err() {
         return HostProbe::default();
     }
-    let fd = std::io::stdin().as_raw_fd();
-    let mut buf = Vec::with_capacity(32);
-    let mut byte = [0u8; 1];
     // ~250ms total budget: comfortably covers an SSH round-trip while staying
     // imperceptible. DA1 normally returns in a few ms regardless.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+    let reply = read_da1_reply(
+        std::io::stdin().as_raw_fd(),
+        std::time::Duration::from_millis(250),
+    );
+    HostProbe::parse(&reply)
+}
+
+/// The replies waiting on `fd`, read straight from the descriptor a byte at a
+/// time up to DA1's `c` terminator, giving up after `timeout`. Unbuffered on
+/// purpose (#1007, #1973): read through `std::io::Stdin`, the first byte
+/// pulled the whole reply into Stdin's own buffer, the next `poll` on the
+/// descriptor found nothing left to read, and every launch on a terminal
+/// without inline images waited out the full timeout, then parsed only the
+/// reply's ESC. Stopping at the terminator also leaves a key typed right
+/// after the reply for the event reader.
+#[cfg(unix)]
+fn read_da1_reply(fd: std::os::fd::RawFd, timeout: std::time::Duration) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(32);
+    let deadline = std::time::Instant::now() + timeout;
     loop {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
@@ -586,26 +601,20 @@ pub fn probe_host() -> HostProbe {
             events: libc::POLLIN,
             revents: 0,
         };
-        let ms = remaining.as_millis().min(i32::MAX as u128) as libc::c_int;
-        let n = unsafe { libc::poll(&mut pfd, 1, ms) };
-        if n <= 0 {
+        let ms = remaining.as_millis().clamp(1, i32::MAX as u128) as libc::c_int;
+        if unsafe { libc::poll(&mut pfd, 1, ms) } <= 0 {
             break; // timeout or poll error
         }
-        // Straight from the fd, a byte at a time: std's `Stdin` buffers,
-        // so its first read took the whole reply into that buffer, the
-        // next `poll` found the fd empty and waited out the budget, and
-        // only the reply's ESC was ever parsed (#1007). A byte at a time
-        // leaves anything typed after the reply to the event reader.
-        // SAFETY: reads at most one byte into a one-byte buffer.
-        if unsafe { libc::read(fd, byte.as_mut_ptr().cast(), 1) } != 1 {
+        let mut byte = 0u8;
+        if unsafe { libc::read(fd, (&raw mut byte).cast(), 1) } != 1 {
             break;
         }
-        buf.push(byte[0]);
-        if byte[0] == b'c' || buf.len() >= 64 {
+        buf.push(byte);
+        if byte == b'c' || buf.len() >= 64 {
             break; // DA1 terminator (or runaway guard)
         }
     }
-    HostProbe::parse(&buf)
+    buf
 }
 
 /// True when running inside Termux's terminal on Android. Termux does not set
@@ -2129,6 +2138,35 @@ mod tests {
         // Garbage / no envelope.
         assert!(!da1_advertises_sixel(b""));
         assert!(!da1_advertises_sixel(b"hello"));
+    }
+
+    /// #1973: a terminal writes its whole DA1 reply at once. The probe must
+    /// read all of it at once too, not wait out its timeout after the first
+    /// byte, and must leave a key typed straight after it unread.
+    #[cfg(unix)]
+    #[test]
+    fn a_da1_reply_sent_in_one_write_is_read_without_waiting() {
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let sent = b"\x1b[?62;4;22cx";
+        let n = unsafe { libc::write(fds[1], sent.as_ptr().cast(), sent.len()) };
+        assert_eq!(n, sent.len() as isize);
+        let start = std::time::Instant::now();
+        let reply = read_da1_reply(fds[0], std::time::Duration::from_secs(5));
+        let waited = start.elapsed();
+        let mut next = 0u8;
+        let left = unsafe { libc::read(fds[0], (&raw mut next).cast(), 1) };
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
+        assert!(
+            waited < std::time::Duration::from_secs(2),
+            "the probe waited {waited:?} on a reply it already had"
+        );
+        assert_eq!(reply, b"\x1b[?62;4;22c");
+        assert!(da1_advertises_sixel(&reply));
+        assert_eq!((left, next), (1, b'x'), "the key after the reply was eaten");
     }
 
     /// #1007: the kitty keyboard reply comes before DA1's. Its absence

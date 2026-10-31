@@ -3830,6 +3830,56 @@ fn cmd_shift_g_no_longer_jumps_to_source_control() {
     );
 }
 
+/// #1973: the default branch the commit menu names is resolved off the UI
+/// thread. The drain that learns the folder is a repository only asks; the
+/// name is filed by a later drain, once the resolver's `git` runs answer.
+#[test]
+fn the_default_branch_is_resolved_off_the_ui_thread() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().canonicalize().unwrap();
+    let git = |args: &[&str]| {
+        let o = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&p)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            o.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+    };
+    git(&["init", "-q", "-b", "trunk"]);
+    git(&["config", "user.email", "a@b"]);
+    git(&["config", "user.name", "a"]);
+    std::fs::write(p.join("app.py"), "x = 1\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-qm", "init"]);
+    let mut app = App::new(p.clone()).unwrap();
+    let mut asked = false;
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(2),
+        "the git status that asks for the default branch",
+        || {
+            app.drain_git_responses();
+            asked = app.default_branch_ask.is_some();
+            asked || app.default_branch_label.is_some()
+        },
+    );
+    assert!(asked, "the default branch was resolved on the UI thread");
+    assert!(app.default_branch_label.is_none());
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(2),
+        "the default branch to be filed",
+        || {
+            app.drain_git_responses();
+            app.default_branch_label.is_some()
+        },
+    );
+    assert_eq!(app.default_branch_label.as_deref(), Some("trunk"));
+}
+
 /// #1444: View Changes vs main on a branch behind a moved main shows the
 /// branch's own work and names the merge base it starts from.
 #[test]

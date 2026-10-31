@@ -5,9 +5,11 @@ building and running croft see [docs/INSTALL.md](docs/INSTALL.md) and
 [docs/CLI.md](docs/CLI.md); for how the code is laid out see
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). AI agents follow this page too.
 
-Every change is weighed against the [tenets](README.md#tenets): speed and low
-latency first, the same behaviour locally and over SSH, a shortcut for every
-action, and bugs fixed at the root rather than worked around.
+Every change is weighed against the [tenets](README.md#tenets): croft starts in
+milliseconds with no exceptions, speed and low latency come first, the same
+behaviour locally and over SSH, a shortcut for every action, and bugs fixed at
+the root rather than worked around. A change that adds blocking work before the
+first frame does not land: run it after the first frame, off the UI thread.
 
 ## Set up
 
