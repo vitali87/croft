@@ -33,7 +33,12 @@ impl Gate {
         }
     }
 
+    /// Closed again first: returning from a remote workspace runs a second
+    /// launch in the same process, after the first one opened the gate.
     fn arm(&self) {
+        if let Ok(mut open) = self.open.lock() {
+            *open = false;
+        }
         self.armed.store(true, Ordering::Release);
     }
 
@@ -58,8 +63,9 @@ impl Gate {
 static GATE: Gate = Gate::new();
 
 /// Hold background work back from now until [`open`]. `app::run` calls this
-/// before it starts any; nothing else does, so outside a launch, and under
-/// test, [`wait`] never waits.
+/// before it starts any, on every launch, a return from a remote workspace's
+/// included; nothing else does, so outside a launch, and under test, [`wait`]
+/// never waits.
 pub fn arm() {
     GATE.arm();
 }
@@ -118,10 +124,23 @@ mod tests {
         );
         gate.open();
         assert!(rx.recv_timeout(Duration::from_secs(10)).is_ok());
-        // Opened once, it never holds a job again.
+        // Opened, it holds no job until the next launch arms it.
         let started = Instant::now();
         gate.wait(Duration::from_secs(5));
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    /// Back from a remote workspace, `run` launches again in the same
+    /// process: the gate holds that launch's jobs as it did the first's.
+    #[test]
+    fn a_second_launch_in_the_same_process_is_held_again() {
+        let gate = Gate::new();
+        gate.arm();
+        gate.open();
+        gate.arm();
+        let started = Instant::now();
+        gate.wait(Duration::from_millis(50));
+        assert!(started.elapsed() >= Duration::from_millis(50));
     }
 
     /// A first frame that never comes does not strand the work.
