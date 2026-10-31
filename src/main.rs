@@ -117,6 +117,8 @@ mod sheet;
 mod shell_integration;
 mod snippets;
 mod sqlite_view;
+mod startup_gate;
+mod startup_trace;
 mod sticky_notes;
 mod svg;
 mod symbol_range;
@@ -149,6 +151,7 @@ use clap::Parser;
 use cli::Cli;
 
 fn main() -> Result<()> {
+    startup_trace::init();
     let args: Vec<std::ffi::OsString> = std::env::args_os().collect();
     if let Ok(cwd) = std::env::current_dir()
         && let Some(err) = cli::misspelled_subcommand(&args, &cwd)

@@ -6605,6 +6605,7 @@ impl App {
             crate::output::push("Matchers", crate::output::OutputLevel::Warn, w);
         }
         let watch_set = std::sync::Arc::new(matchers.watch_set());
+        crate::startup_trace::mark("settings, keymap and matchers loaded");
         let explorer_views = ExplorerViewVisibility::from_prefs(loaded_prefs.explorer_views);
         let disabled_extensions = loaded_prefs.disabled_extensions.clone();
         // Under test only the bundled set: an extension the developer added
@@ -6641,7 +6642,9 @@ impl App {
             }
         };
         let view_bind_error = VIEW_BIND_ERROR.lock().unwrap().take();
+        crate::startup_trace::mark("sockets bound");
         let term = PtyTerminal::new(&root).context("spawning terminal")?;
+        crate::startup_trace::mark("terminal shell spawned");
 
         // Background git worker: every `git status` / `git status
         // --porcelain` shell-out goes through this channel instead of
@@ -6678,10 +6681,13 @@ impl App {
             std::sync::mpsc::channel::<Vec<crate::widgets::file_finder::FileEntry>>();
         let index_root = root.clone();
         std::thread::spawn(move || {
+            // A walk of the whole workspace, a home folder's included.
+            crate::startup_gate::wait();
             let entries = crate::widgets::file_finder::build_file_index(&index_root);
             let _ = file_finder_index_tx.send(entries);
         });
         let fs_watch = FsWatch::spawn(&root, &tree);
+        crate::startup_trace::mark("file watcher started");
         // Persisted layout preferences (Customize Layout popup). Skipped under
         // test so the suite never reads/writes the developer's ~/.config,
         // mirroring the theme load above.
@@ -7512,6 +7518,7 @@ impl App {
             occ_observed_at: std::time::Instant::now(),
             nav: NavHistory::default(),
         };
+        crate::startup_trace::mark("editor state built");
         // Initialise the per-pane focus/gradient flags to match the starting
         // pane (Tree) and persisted theme. Without this, the explorer boots
         // focused-but-not-gradient: the Black-theme gradient border only
@@ -7540,14 +7547,6 @@ impl App {
         // file opened before the first theme switch already highlights in the
         // active theme's colors (not the Base16 default).
         crate::highlight::set_syntax_palette(app.theme.syntax());
-        // Pre-warm the workspace's evident language servers (Cargo.toml →
-        // rust-analyzer, and so on), VS Code's `workspaceContains`
-        // activation: the cold indexing overlaps with the user browsing
-        // the tree instead of starting only at the first file open (#27).
-        // The send is one channel post; the spawns run on the LSP worker.
-        if let Some(lsp) = app.lsp.as_ref() {
-            lsp.prewarm_workspace();
-        }
         // The agent review queue as this workspace last left it (#345).
         let root = app.workspace_root().to_path_buf();
         app.apply_project_excludes(&loaded_prefs);
@@ -7698,6 +7697,8 @@ impl App {
         }
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
+            // The bar draws its glyphs until the icons land.
+            crate::startup_gate::wait();
             let _ = tx.send((input, Self::bake_chrome_images(&input)));
         });
         self.chrome_bake = Some(rx);
@@ -72137,6 +72138,8 @@ impl App {
         let ink = key.light.then_some((0x3b_u8, 0x3b_u8, 0x3b_u8));
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
+            // The logo's cells stay blank until it lands.
+            crate::startup_gate::wait();
             let osc = crate::iterm2_inline::fit_image_with_ink(
                 crate::iterm2_inline::WELCOME_LOGO_PNG,
                 cell_w as u32 * cw,
@@ -81553,24 +81556,52 @@ fn participant_row(p: &crate::session_host::Participant) -> crate::widgets::list
     }
 }
 
-/// surface the per-frame payload size in the F8 perf HUD.
+/// ratatui's writer. It counts the bytes each frame ships, to surface the
+/// per-frame payload size in the F8 perf HUD, and holds them until the frame
+/// flushes, so the whole frame reaches the terminal in one write. Straight
+/// through to stdout, a full repaint went out a kilobyte at a time,
+/// tens of writes the terminal could draw between, so a launch's first frame
+/// visibly painted in; and every few-byte cursor move or colour change took
+/// stdout's lock on its way.
 struct CountingWriter {
     inner: Stdout,
+    pending: Vec<u8>,
     bytes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl CountingWriter {
+    fn new(inner: Stdout, bytes: std::sync::Arc<std::sync::atomic::AtomicUsize>) -> Self {
+        Self {
+            inner,
+            pending: Vec::with_capacity(64 * 1024),
+            bytes,
+        }
+    }
 }
 
 impl std::io::Write for CountingWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let n = self.inner.write(buf)?;
+        self.pending.extend_from_slice(buf);
         self.bytes
-            .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
-        Ok(n)
+            .fetch_add(buf.len(), std::sync::atomic::Ordering::Relaxed);
+        Ok(buf.len())
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
+        if !self.pending.is_empty() {
+            let sent = self.inner.write_all(&self.pending);
+            self.pending.clear();
+            sent?;
+        }
         self.inner.flush()
     }
 }
+
+/// DEC private mode 2026, synchronized output: the terminal shows nothing a
+/// frame draws until the frame ends, then all of it at once, so a repaint
+/// never appears half done. Terminals without it ignore the mode.
+const BEGIN_SYNCHRONIZED_UPDATE: &[u8] = b"\x1b[?2026h";
+const END_SYNCHRONIZED_UPDATE: &[u8] = b"\x1b[?2026l";
 
 type CroftTerminal = Terminal<CrosstermBackend<CountingWriter>>;
 
@@ -81585,9 +81616,19 @@ pub fn run(
     zen: bool,
     workspace_folders: Vec<PathBuf>,
 ) -> Result<()> {
-    // A GUI launch asks the login shell for its PATH again now, off the
-    // startup path, for the next launch (#1973).
-    crate::gui_path::refresh_in_background();
+    // What building the editor reads that takes real work to make: the
+    // bundled extension manifests (one TOML parse each) and the built-in
+    // secret and agent-prompt regexes. Together they were most of what a
+    // launch did before its first frame, all on this thread. Each starts on
+    // a thread of its own now, while this one binds sockets and spawns the
+    // shell, and whatever reaches one before it is done waits only for the
+    // rest of it.
+    std::thread::spawn(crate::lsp::manifest::prewarm_bundled);
+    std::thread::spawn(crate::triggers::prewarm_builtin_redactions);
+    // Every job from here on that the first frame never shows waits for it
+    // (see `startup_gate`), so the UI thread has the CPU to itself.
+    crate::startup_gate::arm();
+    crate::startup_gate::spawn_after_first_frame(crate::agents::prewarm_builtin);
     // Termux ships no font with codicon glyphs, so the activity-bar glyph
     // fallback renders blank cells out of the box. Install the Meslo Nerd
     // Font Mono into ~/.termux/font.ttf in the background (no-op on every
@@ -81595,17 +81636,26 @@ pub fn run(
     crate::termux::ensure_codicon_font_in_background();
     // Build the tree-sitter highlight configurations on a background thread so
     // the first file open paints its syntax (keywords, strings, comments)
-    // instantly without the per-tab query-compilation snap, yet the ~80ms of
-    // query compilation never blocks the cold-start path before the first
-    // frame. The configs land in a process-wide cache, so the UI thread reads
-    // the finished build straight out of it on first open (or builds on demand
-    // if the user opens a file before the prewarm finishes).
-    std::thread::spawn(crate::highlight::prewarm_configs);
+    // instantly without the per-tab query-compilation snap. That compile is
+    // hundreds of milliseconds of CPU, so it starts once the first frame is
+    // up rather than competing with it. The configs land in a process-wide
+    // cache, so the UI thread reads the finished build straight out of it on
+    // first open (or builds on demand if the user opens a file before the
+    // prewarm finishes).
+    crate::startup_gate::spawn_after_first_frame(crate::highlight::prewarm_configs);
     // Hand the heap a large file's parse passes freed back to the OS
     // (#1707), so croft doesn't stay resident at the parse's peak.
     crate::mem_relief::start();
     let title = build_title(&root);
+    crate::startup_trace::mark("background work started");
+    // Raw mode, and the host terminal's capability questions sent, before
+    // the editor is built: the answers travel while App::new runs instead of
+    // after it, which over SSH is a network round trip off the first frame.
+    enable_raw_mode().context("enable raw mode")?;
+    #[cfg(unix)]
+    let host_probe = StartupProbe(Some(crate::iterm2_inline::ask_host()));
     let mut app = App::new(root.clone())?;
+    crate::startup_trace::mark("editor built");
     // Resurrect this workspace's terminal panel from the last session
     // (pane layout, cwds, names, focus) before the first frame paints.
     app.restore_terminal_session();
@@ -81655,6 +81705,7 @@ pub fn run(
         // when croft last ended without a clean quit (#862).
         app.restore_hot_exit();
     }
+    crate::startup_trace::mark("session restored");
     // `--zen`: hide the Explorer sidebar and terminal so the editor fills the
     // window. "Move/Copy into New Window" launches the new window this way so it
     // opens focused on just the handed-off file. Toggle back with Cmd+B / Cmd+J.
@@ -81699,7 +81750,6 @@ pub fn run(
         app.start_demo();
     }
 
-    enable_raw_mode().context("enable raw mode")?;
     // Sixel has no env var, and whether the terminal speaks the kitty
     // keyboard protocol has none either, so probe the host: the kitty query,
     // then DA1. This runs in raw mode but before the alt-screen switch and
@@ -81712,7 +81762,7 @@ pub fn run(
     // it can draw, so there the reply says nothing about the screen.
     #[cfg(unix)]
     {
-        let host = crate::iterm2_inline::probe_host();
+        let host = host_probe.answer();
         if app.inline_protocol == crate::iterm2_inline::InlineImageProtocol::None {
             app.sixel_supported = host.sixel && !crate::iterm2_inline::detect_tmux();
             crate::widgets::terminal::SIXEL_HOST
@@ -81720,6 +81770,7 @@ pub fn run(
         }
         app.legacy_ctrl_punct = host.answered && !host.kitty_keyboard;
     }
+    crate::startup_trace::mark("host terminal answered");
     let mut out = stdout();
     // Alt screen + mouse + bracketed paste + SteadyBar cursor (thin vertical
     // line, no hardware blink: the blink is done in software so it works even
@@ -81778,11 +81829,9 @@ pub fn run(
     // remote CPU. Toggled on screen with F8.
     let perf_bytes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     app.perf.attach_counter(perf_bytes.clone());
-    let backend = CrosstermBackend::new(CountingWriter {
-        inner: out,
-        bytes: perf_bytes,
-    });
+    let backend = CrosstermBackend::new(CountingWriter::new(out, perf_bytes));
     let mut terminal: CroftTerminal = Terminal::new(backend).context("create terminal")?;
+    crate::startup_trace::mark("screen set up");
 
     let result = main_loop(&mut app, &mut terminal);
     // An owner's goodbye goes out now (#1147): the drop-to-local and
@@ -81819,6 +81868,14 @@ pub fn run(
             out.write_all(reset_session_bg_seq().as_bytes()).ok();
         }
         out.flush().ok();
+    }
+    // A frame cut short by an error never sent its end; the shell must not
+    // inherit a terminal still holding its updates back.
+    {
+        use std::io::Write;
+        let backend = terminal.backend_mut();
+        let _ = backend.write_all(END_SYNCHRONIZED_UPDATE);
+        let _ = backend.flush();
     }
     if kbd_enhanced {
         execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags).ok();
@@ -81910,6 +81967,32 @@ pub fn run(
     Ok(())
 }
 
+/// The host probe `run` sent before building the editor. Should building it
+/// fail, the replies are still read off the tty, so they never land at the
+/// shell's prompt, and raw mode is undone before the error prints.
+#[cfg(unix)]
+struct StartupProbe(Option<crate::iterm2_inline::PendingHostProbe>);
+
+#[cfg(unix)]
+impl StartupProbe {
+    fn answer(mut self) -> crate::iterm2_inline::HostProbe {
+        self.0
+            .take()
+            .map(crate::iterm2_inline::PendingHostProbe::answer)
+            .unwrap_or_default()
+    }
+}
+
+#[cfg(unix)]
+impl Drop for StartupProbe {
+    fn drop(&mut self) {
+        if let Some(pending) = self.0.take() {
+            let _ = pending.answer();
+            disable_raw_mode().ok();
+        }
+    }
+}
+
 /// Re-send the terminal-restore escape sequences after a remote ssh
 /// session ends. The remote croft enables alt-screen, mouse tracking,
 /// and bracketed paste on the local tty; if it crashed or exited
@@ -81933,7 +82016,7 @@ fn restore_host_terminal_state() {
 // tty (a return from remote re-enters `run`, which re-applies the theme's
 // host colors), so the color reset can't strand a live session.
 const TERMINAL_RESTORE_SEQ: &[u8] =
-    b"\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l\x1b[?2004l\x1b[?1004l\x1b[?1049l\x1b[ q\x1b]110\x07\x1b]111\x07";
+    b"\x1b[?2026l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l\x1b[?2004l\x1b[?1004l\x1b[?1049l\x1b[ q\x1b]110\x07\x1b]111\x07";
 
 fn install_terminal_restore_panic_hook() {
     static HOOK: std::sync::Once = std::sync::Once::new();
@@ -82300,6 +82383,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
     // Force the very first frame to render so the user sees the UI even
     // before the first event arrives or any timer fires.
     let mut needs_redraw = true;
+    let mut first_frame = true;
     let mut last_blink_visible = app.cursor_visible_phase();
     // Advances every UPDATE_SPINNER_FRAME_MS while a background update runs;
     // forces a status-bar redraw so the spinner animates. Constant otherwise.
@@ -82652,6 +82736,12 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             if pty_changed {
                 last_pty_redraw = std::time::Instant::now();
             }
+            // Everything this frame sends, the diff and the pictures after
+            // it, goes up as one update.
+            {
+                use std::io::Write;
+                let _ = terminal.backend_mut().write_all(BEGIN_SYNCHRONIZED_UPDATE);
+            }
             // If the welcome OSC-1337 image was painted earlier and the
             // user has just opened a file, wipe the screen so iTerm drops
             // its cached image cells AND ratatui repaints every cell on
@@ -82877,6 +82967,33 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             // illustration it overlaps. Must run after every inline-image flush
             // above so the box wins those cells (last writer per cell wins).
             app.flush_tooltip_over_image();
+            {
+                use std::io::Write;
+                let backend = terminal.backend_mut();
+                let _ = backend.write_all(END_SYNCHRONIZED_UPDATE);
+                let _ = backend.flush();
+            }
+            if std::mem::take(&mut first_frame) {
+                crate::startup_trace::mark("first frame on screen");
+                // The work held back for the frame starts now.
+                crate::startup_gate::open();
+                // Pre-warm the workspace's evident language servers
+                // (Cargo.toml -> rust-analyzer, and so on), VS Code's
+                // `workspaceContains` activation: the cold indexing overlaps
+                // with the user browsing the tree instead of starting only at
+                // the first file open (#27). Asked now rather than while the
+                // editor was built, so a server's start never competes with
+                // the first frame.
+                if let Some(lsp) = app.lsp.as_ref() {
+                    lsp.prewarm_workspace();
+                }
+                crate::startup_trace::finish();
+                // A GUI launch asks the login shell for its PATH again, for
+                // the next launch (#1973), only now that the frame is up:
+                // the shell runs the user's whole rc, which would otherwise
+                // compete for the CPU with the frame and the pane's shell.
+                crate::gui_path::refresh_in_background();
+            }
             needs_redraw = false;
             last_blink_visible = blink_visible;
             last_spinner_phase = spinner_phase;

@@ -610,6 +610,7 @@ impl Cli {
         // so every tool croft shells out to (pdftoppm, git, ripgrep, the
         // language servers) would be invisible. Children inherit the repair.
         crate::gui_path::repair();
+        crate::startup_trace::mark("PATH ready");
         match self.command {
             Some(CliCommand::SetupTerminal { font, size, yes }) => setup_terminal(&font, size, yes),
             Some(CliCommand::Keys { mouse }) => keys_diagnostic(mouse),

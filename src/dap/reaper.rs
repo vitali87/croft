@@ -77,6 +77,7 @@ pub fn reap_orphaned_js_debug_async(delay: std::time::Duration) {
     let _ = std::thread::Builder::new()
         .name("js-debug-reaper".into())
         .spawn(move || {
+            crate::startup_gate::wait();
             if !delay.is_zero() {
                 std::thread::sleep(delay);
             }
