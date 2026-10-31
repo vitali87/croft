@@ -1,0 +1,2 @@
+fix: In terminals without the kitty keyboard protocol (xterm, GNOME Terminal, Konsole, Terminal.app, tmux), Ctrl+/ toggles the line comment instead of switching to tab 7, and Ctrl+\ and Ctrl+] no longer switch to tabs 4 and 5.
+fix: Sixel terminals such as foot and mlterm are recognised at startup and show croft's images, as they were meant to, and terminals without the iTerm2 or kitty image protocols no longer wait a quarter second at launch for that check. Under tmux croft keeps its text icons.
