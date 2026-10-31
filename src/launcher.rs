@@ -60,6 +60,31 @@ end open
     )
 }
 
+/// The croft path the launcher should run, given `canonical`, the running
+/// binary with every symlink resolved. A Homebrew install resolves into
+/// `<prefix>/Cellar/croft/<version>/bin/croft`, a folder `brew upgrade`
+/// leaves behind: a launcher pinned to it kept starting the version it was
+/// built from after every upgrade, and failed once `brew cleanup` removed it.
+/// Homebrew's `opt` link follows the installed version, so that is the path
+/// to keep, with the `bin` link on PATH as the fallback; anything else
+/// (cargo, a release archive, a source build) is already a stable path.
+pub fn stable_croft_path(canonical: &Path) -> PathBuf {
+    if crate::update_check::install_source(canonical)
+        != crate::update_check::InstallSource::Homebrew
+    {
+        return canonical.to_path_buf();
+    }
+    // `<prefix>/Cellar/croft/<version>/bin/croft`: five components up is the
+    // prefix, as `install_source` already checked.
+    let Some(prefix) = canonical.ancestors().nth(5) else {
+        return canonical.to_path_buf();
+    };
+    [prefix.join("opt/croft/bin/croft"), prefix.join("bin/croft")]
+        .into_iter()
+        .find(|link| link.exists())
+        .unwrap_or_else(|| canonical.to_path_buf())
+}
+
 /// A string as an AppleScript literal: backslashes and quotes escaped, so an
 /// arbitrary path can never break out of (or fail to compile) the script.
 fn applescript_lit(s: &str) -> String {
@@ -357,6 +382,32 @@ mod tests {
         assert!(e.contains("LSItemContentTypes:0 string public.item"));
         assert!(e.contains("CFBundleTypeRole string Editor"));
         assert!(e.contains("Set :CFBundleIconFile croft"));
+    }
+
+    /// A Homebrew croft resolves into a versioned Cellar folder; the launcher
+    /// keeps Homebrew's `opt` link instead, so a `brew upgrade` reaches it.
+    #[test]
+    fn a_homebrew_croft_is_launched_through_the_link_that_follows_upgrades() {
+        let prefix = tempfile::tempdir().unwrap();
+        let cellar = prefix.path().join("Cellar/croft/0.2.82/bin/croft");
+        std::fs::create_dir_all(cellar.parent().unwrap()).unwrap();
+        std::fs::write(&cellar, b"").unwrap();
+        // With no link at all, the Cellar path is all there is.
+        assert_eq!(stable_croft_path(&cellar), cellar);
+        let bin = prefix.path().join("bin/croft");
+        std::fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        std::fs::write(&bin, b"").unwrap();
+        assert_eq!(stable_croft_path(&cellar), bin);
+        let opt = prefix.path().join("opt/croft/bin/croft");
+        std::fs::create_dir_all(opt.parent().unwrap()).unwrap();
+        std::fs::write(&opt, b"").unwrap();
+        assert_eq!(stable_croft_path(&cellar), opt);
+    }
+
+    #[test]
+    fn a_croft_outside_homebrew_keeps_its_own_path() {
+        let path = Path::new("/Users/v/.cargo/bin/croft");
+        assert_eq!(stable_croft_path(path), path);
     }
 
     #[test]

@@ -988,6 +988,8 @@ The macOS `croft install-launcher` command. It builds a clickable Croft.app via 
 
 **Why the deletes are separate best-effort calls.** PlistBuddy exits non-zero on deleting an absent key, and the cleanup deletes target keys `osacompile` never emits: `CFBundleIconName` is always absent, and `CFBundleDocumentTypes` is cleared before the rebuild. One shared exit status failed every install before signing and registration, so the deletes now run as separate best-effort invocations while the required Add/Set batch stays fatal.
 
+**A Homebrew croft is launched through its `opt` link.** `install-launcher` resolves the running binary, and a Homebrew one resolves into `<prefix>/Cellar/croft/<version>/bin/croft`, which `brew upgrade` leaves behind: the launcher kept starting the version it was built from after every upgrade. `stable_croft_path` swaps a Cellar path for `<prefix>/opt/croft/bin/croft`, which follows the installed version, or the `bin` link on PATH.
+
 **Signing and registration.** It finishes with an ad-hoc `codesign`, because editing `Info.plist` invalidates `osacompile`'s signature, plus an `lsregister` nudge so Spotlight sees the bundle.
 
 ### locate.rs
