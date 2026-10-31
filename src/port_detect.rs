@@ -22,6 +22,7 @@
 use std::collections::HashSet;
 use std::process::Command;
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use regex::Regex;
 
@@ -472,21 +473,54 @@ pub fn poll_listeners(shell_pid: i32) -> Vec<PortHit> {
 /// port, or a server started before croft, is nobody's descendant. `None` when
 /// neither tool ran, so the caller can tell "nothing is listening" from "no
 /// evidence" and leave the registry alone rather than retiring live rows.
+///
+/// `ss` answers first where it is installed: it reads the kernel's socket
+/// table, so it lists a listener whoever owns it. An unprivileged `lsof` sees
+/// only the caller's own processes and misses, say, a root-owned
+/// `docker-proxy` publishing a container's port, so it answers only where
+/// `ss` is missing, as on macOS.
 pub fn poll_all_listening() -> Option<HashSet<u16>> {
-    let out = probe("lsof").args(LSOF_LISTEN_ARGS).output().ok();
-    if let Some(rows) = out.as_ref().and_then(lsof_rows) {
-        return Some(parse_lsof(&rows).into_iter().map(|h| h.port).collect());
+    listening_snapshot(run_ss(&["-tlnH"]), || {
+        probe("lsof").args(LSOF_LISTEN_ARGS).output().ok()
+    })
+}
+
+/// The [`poll_all_listening`] decision over its scans: a successful `ss`
+/// table wins, and `lsof` is only run without one.
+fn listening_snapshot(
+    ss: Option<std::process::Output>,
+    lsof: impl FnOnce() -> Option<std::process::Output>,
+) -> Option<HashSet<u16>> {
+    if let Some(out) = ss.filter(|o| o.status.success()) {
+        return Some(
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .filter_map(|l| l.split_whitespace().nth(3).and_then(loopback_port))
+                .collect(),
+        );
     }
-    let out = probe("ss").args(["-tlnH"]).output().ok()?;
-    if !out.status.success() {
+    let rows = lsof_rows(&lsof()?)?;
+    Some(parse_lsof(&rows).into_iter().map(|h| h.port).collect())
+}
+
+/// Set once `ss` turns out not to be installed, so a box without it doesn't
+/// pay a failed spawn on every poll.
+static SS_MISSING: AtomicBool = AtomicBool::new(false);
+
+/// `ss` run with `args`, or `None` when it isn't installed or didn't start.
+fn run_ss(args: &[&str]) -> Option<std::process::Output> {
+    if SS_MISSING.load(Ordering::Relaxed) {
         return None;
     }
-    Some(
-        String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .filter_map(|l| l.split_whitespace().nth(3).and_then(loopback_port))
-            .collect(),
-    )
+    match probe("ss").args(args).output() {
+        Ok(out) => Some(out),
+        Err(e) => {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                SS_MISSING.store(true, Ordering::Relaxed);
+            }
+            None
+        }
+    }
 }
 
 fn poll_via_lsof(pids: &HashSet<i32>) -> Option<Vec<PortHit>> {
@@ -541,7 +575,7 @@ fn parse_lsof(text: &str) -> Vec<PortHit> {
 }
 
 fn poll_via_ss(pids: &HashSet<i32>) -> Option<Vec<PortHit>> {
-    let out = probe("ss").args(["-tlnpH"]).output().ok()?;
+    let out = run_ss(&["-tlnpH"])?;
     if !out.status.success() {
         return None;
     }
@@ -674,6 +708,42 @@ mod tests {
         assert_eq!(lsof_rows(&out(1, row, "")).as_deref(), Some(row));
         assert_eq!(lsof_rows(&out(1, "", "lsof: illegal option")), None);
         assert_eq!(lsof_rows(&out(2, "", "")), None);
+    }
+
+    /// The still-up snapshot trusts `ss` over `lsof`. An unprivileged lsof
+    /// can't see another user's sockets, such as a root-owned `docker-proxy`
+    /// publishing a container's port, and with none of the user's own
+    /// listening it answers with an empty scan. ss reads the kernel's table
+    /// and lists the port, so lsof is only asked when ss didn't run.
+    #[test]
+    fn the_still_up_snapshot_asks_ss_before_lsof() {
+        use std::os::unix::process::ExitStatusExt;
+        let out = |code: i32, stdout: &str| std::process::Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: stdout.into(),
+            stderr: Vec::new(),
+        };
+        let ss = "LISTEN 0 4096 0.0.0.0:8080 0.0.0.0:*\n";
+        let lsof = "COMMAND PID\nnode 7 u IPv4 TCP 127.0.0.1:3000 (LISTEN)\n";
+        let unasked =
+            || -> Option<std::process::Output> { panic!("lsof ran although ss answered") };
+        assert_eq!(
+            listening_snapshot(Some(out(0, ss)), unasked),
+            Some(HashSet::from([8080]))
+        );
+        assert_eq!(
+            listening_snapshot(None, || Some(out(0, lsof))),
+            Some(HashSet::from([3000]))
+        );
+        assert_eq!(
+            listening_snapshot(Some(out(1, "")), || Some(out(0, lsof))),
+            Some(HashSet::from([3000]))
+        );
+        assert_eq!(
+            listening_snapshot(None, || Some(out(1, ""))),
+            Some(HashSet::new())
+        );
+        assert_eq!(listening_snapshot(None, || None), None);
     }
 
     /// The real lsof on a process with no listener: an empty scan rather
