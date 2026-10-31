@@ -2944,6 +2944,33 @@ impl LineEnding {
             Self::Crlf => "\r\n",
         }
     }
+
+    /// The ending most of `text`'s line breaks use, as VS Code picks it:
+    /// CRLF when more than half of the breaks hold a `\r`. A lone `\r` is a
+    /// break too, and counts toward CRLF. Any `\r\n` used to mark the file
+    /// CRLF, so one line pasted from Windows into an LF file made the next
+    /// save rewrite every line of it (#936).
+    pub fn detect(text: &str) -> Self {
+        let bytes = text.as_bytes();
+        let (mut breaks, mut crs) = (0usize, 0usize);
+        for (i, b) in bytes.iter().enumerate() {
+            match b {
+                b'\n' => breaks += 1,
+                b'\r' => {
+                    crs += 1;
+                    if bytes.get(i + 1) != Some(&b'\n') {
+                        breaks += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if crs * 2 > breaks {
+            Self::Crlf
+        } else {
+            Self::Lf
+        }
+    }
 }
 
 /// The buffer's indentation preference for newly typed indentation: the tab
@@ -5967,13 +5994,8 @@ impl Editor {
         self.decode_lossy = decode_lossy;
         self.final_newline = text.ends_with(['\n', '\r']);
         // Detect the file's line-ending style before normalisation so a save
-        // preserves it (and the status bar reports it). A single `\r\n` marks
-        // the file CRLF, matching VS Code's "files.eol auto" heuristic.
-        self.eol = if text.contains("\r\n") {
-            LineEnding::Crlf
-        } else {
-            LineEnding::Lf
-        };
+        // preserves it (and the status bar reports it).
+        self.eol = LineEnding::detect(&text);
         self.lines = split_into_lines(&text);
         // The map described the text that was just replaced (#349). Clearing
         // is the safe direction: an unknown line is correct, a line credited
@@ -8908,11 +8930,7 @@ impl Editor {
         // new encoding must not carry the previous one's BOM answer over.
         self.bom = encoding_rs::Encoding::for_bom(&bytes).is_some();
         self.final_newline = text.ends_with(['\n', '\r']);
-        self.eol = if text.contains("\r\n") {
-            LineEnding::Crlf
-        } else {
-            LineEnding::Lf
-        };
+        self.eol = LineEnding::detect(&text);
         self.lines = split_into_lines(&text);
         // The map described the text that was just replaced (#349). Clearing
         // is the safe direction: an unknown line is correct, a line credited
@@ -15423,7 +15441,7 @@ impl Editor {
         self.last_edit_kind = None;
     }
 
-    /// Start of the logical line (`Ctrl+A`, and Home's second step).
+    /// Start of the logical line (`Ctrl+A`), before any indentation.
     pub fn home_line(&mut self) {
         self.cursor_col = 0;
         self.last_edit_kind = None;
@@ -15435,18 +15453,26 @@ impl Editor {
         self.last_edit_kind = None;
     }
 
-    /// The Home key. With wrap on (#1569) it first goes to the start of the
-    /// wrapped row the caret is on, as VS Code does, and to the line's start
-    /// from there.
+    /// The Home key, VS Code's `cursorHome`: to the line's first
+    /// non-whitespace character, or to its start when the caret is already
+    /// there, so a second press toggles (#987). It used to always go to the
+    /// start, before the indentation. With wrap on (#1569) it first goes to
+    /// the start of the wrapped row the caret is on.
     pub fn home_key(&mut self) {
+        let line = &self.lines[self.cursor_row];
+        let first = line
+            .chars()
+            .position(|c| c != ' ' && c != '\t')
+            .unwrap_or_else(|| line.chars().count());
+        let smart = if self.cursor_col == first { 0 } else { first };
         self.cursor_col = match self.wrapped_row_of_cursor() {
             // A row can start on a combining mark (the wrap breaks after the
             // space it sits on), so step back to its cluster's start.
-            Some((start, _)) => match floor_grapheme_col(&self.lines[self.cursor_row], start) {
-                row_start if self.cursor_col > row_start => row_start,
-                _ => 0,
+            Some((start, _)) => match floor_grapheme_col(line, start) {
+                row_start if self.cursor_col > row_start && row_start > first => row_start,
+                _ => smart,
             },
-            None => 0,
+            None => smart,
         };
         self.last_edit_kind = None;
     }
@@ -31927,6 +31953,41 @@ mod tests {
         assert_eq!(e.cursor_col, len);
     }
 
+    /// #987: Home goes to the first non-whitespace character, then toggles
+    /// with the line's start; Shift+Home selects the same way.
+    #[test]
+    fn home_goes_past_the_indentation_then_toggles_with_the_line_start() {
+        let mut e = editor_with("    x = 1\ny = 2\n   \n");
+        e.cursor_col = 9;
+        e.home_key();
+        assert_eq!(e.cursor_col, 4, "the first non-whitespace character");
+        e.home_key();
+        assert_eq!(e.cursor_col, 0, "then the line's start");
+        e.home_key();
+        assert_eq!(e.cursor_col, 4, "and back");
+        e.cursor_col = 2;
+        e.home_key();
+        assert_eq!(e.cursor_col, 4, "from inside the indentation too");
+        (e.cursor_row, e.cursor_col) = (1, 5);
+        e.home_key();
+        assert_eq!(e.cursor_col, 0, "no indentation: the start");
+        e.home_key();
+        assert_eq!(e.cursor_col, 0);
+        (e.cursor_row, e.cursor_col) = (2, 3);
+        e.home_key();
+        assert_eq!(e.cursor_col, 0, "a blank line toggles end and start");
+        e.home_key();
+        assert_eq!(e.cursor_col, 3);
+        e.cursor_row = 0;
+        e.cursor_col = 9;
+        e.start_selection_at_cursor();
+        e.home_key();
+        e.extend_selection_to_cursor();
+        assert_eq!(e.selection_text(), "x = 1");
+        e.home_line();
+        assert_eq!(e.cursor_col, 0, "Ctrl+A stays a hard line start");
+    }
+
     /// #1569: Home from inside a wrapped row stops at that row's start first.
     #[test]
     fn home_in_a_wrapped_line_stops_at_the_start_of_the_row_first() {
@@ -32028,6 +32089,46 @@ mod tests {
             raw, b"alpha\r\nbeta\r\n",
             "save re-applies CRLF, final newline included"
         );
+    }
+
+    /// #936: one CRLF line pasted into an LF file. The file stays LF, so a
+    /// one-character edit saves as that edit plus the stray line brought
+    /// into line, not every line rewritten.
+    #[test]
+    fn one_crlf_line_in_an_lf_file_keeps_it_lf() {
+        let mut text: Vec<String> = (0..200).map(|i| format!("setting_{i} = {i}\n")).collect();
+        text[57] = "pasted_from_windows = True\r\n".into();
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(text.concat().as_bytes()).unwrap();
+        let mut e = Editor::new();
+        e.open(tmp.path()).unwrap();
+        assert_eq!(e.eol, LineEnding::Lf);
+        e.cursor_col = e.lines[0].chars().count();
+        e.insert_char('0');
+        e.save_to_disk().unwrap();
+        let saved = std::fs::read_to_string(tmp.path()).unwrap();
+        assert!(!saved.contains('\r'), "no CRLF left");
+        let changed: Vec<usize> = saved
+            .lines()
+            .zip(text.iter())
+            .enumerate()
+            .filter(|(_, (now, was))| *now != was.trim_end_matches(['\r', '\n']))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(changed, vec![0], "only the edited line's text changed");
+    }
+
+    /// The majority decides both ways, and a tie stays LF.
+    #[test]
+    fn the_line_ending_is_the_one_most_lines_use() {
+        assert_eq!(LineEnding::detect("a\r\nb\r\nc\n"), LineEnding::Crlf);
+        assert_eq!(LineEnding::detect("a\r\nb\nc\n"), LineEnding::Lf);
+        assert_eq!(LineEnding::detect("a\r\nb\n"), LineEnding::Lf);
+        assert_eq!(LineEnding::detect("a\r\n"), LineEnding::Crlf);
+        assert_eq!(LineEnding::detect("no break"), LineEnding::Lf);
+        // A lone CR is a break that counts toward CRLF, as in VS Code.
+        assert_eq!(LineEnding::detect("a\n\rb\r\nc"), LineEnding::Crlf);
+        assert_eq!(LineEnding::detect("a\rb\nc\n"), LineEnding::Lf);
     }
 
     #[test]

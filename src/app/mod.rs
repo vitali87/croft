@@ -5237,6 +5237,10 @@ pub struct App {
     /// sends the same control byte for both, never a `Shift`. False until
     /// `run` asks.
     kitty_keys: bool,
+    /// The terminal answered the startup probe but not its kitty keyboard
+    /// query, so Ctrl+\, Ctrl+] and Ctrl+/ arrive as the bytes crossterm
+    /// reads as Ctrl+4, Ctrl+5 and Ctrl+7 (#1007): see `legacy_ctrl_punct`.
+    legacy_ctrl_punct: bool,
     /// Native modal (vim-style) editing for the editor pane. When enabled it
     /// supersedes the always-on `editor_vim_chord` convenience layer.
     vim: crate::vim::VimState,
@@ -7166,6 +7170,7 @@ impl App {
             editor_vim_chord: EditorVimChord::default(),
             cmd_k_leader: None,
             kitty_keys: false,
+            legacy_ctrl_punct: false,
             vim: crate::vim::VimState::new(),
             vim_last_find: None,
             vim_visual_line: false,
@@ -26236,6 +26241,11 @@ impl App {
     /// built-in defaults call their app methods directly, so a command-level
     /// recorder would miss most of what a user does.
     fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
+        let key = if self.legacy_ctrl_punct {
+            legacy_ctrl_punct(key)
+        } else {
+            key
+        };
         self.editor.sync_occurrence_word_sel();
 
         // A key press means the status message has been seen: the right-hand
@@ -68029,7 +68039,11 @@ impl App {
         let tx = self.history_done_tx.clone();
         let millis = now_millis();
         std::thread::spawn(move || {
-            if let Ok(bytes) = std::fs::read(&path) {
+            // A save too large to snapshot is not read at all (#1011).
+            let skip = !keep
+                && std::fs::metadata(&path)
+                    .is_ok_and(|m| crate::history::too_large_to_snapshot(m.len()));
+            if !skip && let Ok(bytes) = std::fs::read(&path) {
                 // Someone else's bytes are on disk now: record the snapshot
                 // alone, every line unknown, which is the safe direction.
                 let seats = match described {
@@ -77647,8 +77661,9 @@ fn is_select_to_bracket_key(key: KeyEvent) -> bool {
 }
 
 /// VS Code "Go Back" (Ctrl+-). The kitty keyboard protocol delivers the
-/// chord as `-` + CONTROL; the legacy encoding folds Ctrl+- into 0x1F,
-/// which decodes as `_` + CONTROL, so both spellings are accepted.
+/// chord as `-` + CONTROL, and `_` + CONTROL is accepted too. The legacy
+/// encoding folds Ctrl+- into 0x1F, Ctrl+/'s byte, which croft reads as
+/// Toggle Line Comment there (`legacy_ctrl_punct`, #1007).
 fn is_navigate_back_key(key: KeyEvent) -> bool {
     let KeyCode::Char(c) = key.code else {
         return false;
@@ -79227,6 +79242,26 @@ fn jump_to_tab_index(key: KeyEvent) -> Option<usize> {
         return None;
     }
     Some((d - 1) as usize)
+}
+
+/// `key` as VS Code means it on a terminal without the kitty keyboard
+/// protocol. There Ctrl+\, Ctrl+] and Ctrl+/ (and Ctrl+-) send the bytes
+/// 0x1C, 0x1D and 0x1F, which crossterm reads as Ctrl+4, Ctrl+5 and
+/// Ctrl+7, so Toggle Line Comment switched to tab 7 instead (#1007).
+/// Ctrl+4, Ctrl+5 and Ctrl+7 send the same bytes, so those tabs give way:
+/// the punctuation chords are the ones used every few minutes. Ctrl+6's
+/// 0x1E stays tab 6, as nothing else claims Ctrl+^.
+fn legacy_ctrl_punct(key: KeyEvent) -> KeyEvent {
+    if key.modifiers != KeyModifiers::CONTROL {
+        return key;
+    }
+    let code = match key.code {
+        KeyCode::Char('4') => KeyCode::Char('\\'),
+        KeyCode::Char('5') => KeyCode::Char(']'),
+        KeyCode::Char('7') => KeyCode::Char('/'),
+        _ => return key,
+    };
+    KeyEvent { code, ..key }
 }
 
 /// Map a screen row to the tree row that should be highlighted as a drop
@@ -81635,18 +81670,25 @@ pub fn run(
     }
 
     enable_raw_mode().context("enable raw mode")?;
-    // Sixel has no env var, so when neither iTerm2 nor Kitty was detected from
-    // the environment, probe the host with a DA1 query. This runs in raw mode
-    // but before the alt-screen switch and long before the event loop's first
-    // poll, so crossterm's (lazily-started) event reader can't swallow the
-    // reply. A non-sixel terminal (e.g. Apple Terminal) answers DA1 without
-    // attribute 4 and the probe returns instantly; init_graphics then promotes
-    // the protocol to Sixel only when this is true.
+    // Sixel has no env var, and whether the terminal speaks the kitty
+    // keyboard protocol has none either, so probe the host: the kitty query,
+    // then DA1. This runs in raw mode but before the alt-screen switch and
+    // long before the event loop's first poll, so crossterm's (lazily-started)
+    // event reader can't swallow the reply. A non-sixel terminal (e.g. Apple
+    // Terminal) answers DA1 without attribute 4; init_graphics then promotes
+    // the protocol to Sixel only when neither iTerm2 nor Kitty was detected
+    // from the environment and the reply lists it. tmux answers DA1 itself,
+    // listing sixel when it was built with it whatever the terminal around
+    // it can draw, so there the reply says nothing about the screen.
     #[cfg(unix)]
-    if app.inline_protocol == crate::iterm2_inline::InlineImageProtocol::None {
-        app.sixel_supported = crate::iterm2_inline::probe_sixel_support();
-        crate::widgets::terminal::SIXEL_HOST
-            .store(app.sixel_supported, std::sync::atomic::Ordering::Relaxed);
+    {
+        let host = crate::iterm2_inline::probe_host();
+        if app.inline_protocol == crate::iterm2_inline::InlineImageProtocol::None {
+            app.sixel_supported = host.sixel && !crate::iterm2_inline::detect_tmux();
+            crate::widgets::terminal::SIXEL_HOST
+                .store(app.sixel_supported, std::sync::atomic::Ordering::Relaxed);
+        }
+        app.legacy_ctrl_punct = host.answered && !host.kitty_keyboard;
     }
     let mut out = stdout();
     // Alt screen + mouse + bracketed paste + SteadyBar cursor (thin vertical

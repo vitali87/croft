@@ -1,11 +1,11 @@
 use alacritty_terminal::Term;
 use alacritty_terminal::event::{Event as AlacEvent, EventListener};
-use alacritty_terminal::grid::{Dimensions, Scroll};
+use alacritty_terminal::grid::{Dimensions, GridCell, Row, Scroll};
 use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection as TracerSelection, SelectionType};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::ClipboardType;
-use alacritty_terminal::term::cell::Flags;
+use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::{Config, TermMode};
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor, Processor, StdSyncHandler};
@@ -4397,7 +4397,7 @@ impl PtyTerminal {
         // size.
         let mut term = self.term.lock();
         let size = TermSize::new(cols as usize, rows as usize);
-        term.resize(size);
+        resize_term(&mut term, size);
         self.backend.resize(cols, rows);
         drop(term);
         self.pty_dirty.store(true, Ordering::Release);
@@ -5031,6 +5031,135 @@ fn ansi_rows(term: &Term<VoidListener>, top: i32) -> Vec<(String, String, bool)>
 /// [`ansi_rows`] for another module's model of a pane (#694's pane host).
 pub(crate) fn ansi_rows_from(term: &Term<VoidListener>, top: i32) -> Vec<(String, String, bool)> {
     ansi_rows(term, top)
+}
+
+/// A `Flags` bit alacritty leaves unused (its own stop at bit 14), set on
+/// every cell of a row [`resize_term`] clipped. Writing a cell replaces its
+/// flags, so a row whose shown cells all still carry it is one no program
+/// has written to since: the cells kept past its edge still belong to it.
+const CLIPPED: Flags = Flags::from_bits_retain(0x8000);
+
+/// Resize a pane's model, clipping rows rather than re-wrapping them (#1857).
+///
+/// alacritty reflows every row wider than a narrowed pane onto the row
+/// below. Anything a program laid out to the old width falls apart: each
+/// row of a Rich panel or a table splits in two, its right border lands
+/// halfway along the next row, and a program that redraws by counting rows
+/// up from the cursor misses the extra ones. So a row the program ended
+/// itself (no soft wrap into it or out of it) is cut at the new width
+/// instead. The cells cut off are kept past the row's last shown column,
+/// where nothing draws or writes, and widening shows them again. A row a
+/// program wrote to while cut drops them, since they no longer belong to
+/// what it shows. Soft-wrapped lines still reflow, and so does the cursor's
+/// row, as the shell redrawing a prompt expects. The primary screen is out
+/// of reach while a full-screen program holds the alternate one, so a
+/// resize then reflows it as before.
+pub(crate) fn resize_term(term: &mut Term<VoidListener>, size: TermSize) {
+    let (old, new) = (term.columns(), size.columns());
+    if old == new || term.mode().contains(TermMode::ALT_SCREEN) {
+        term.resize(size);
+        return;
+    }
+    let grid = term.grid_mut();
+    let cursor = grid.cursor.point.line.0;
+    // A shorter pane drops the screen rows from here down (alacritty keeps
+    // the cursor's row on it); a tail queued for one would go on another.
+    let kept = (size.screen_lines() as i32).max(cursor + 1);
+    let mut tails = Vec::new();
+    let mut wrapped_into = false;
+    for l in grid.topmost_line().0..=grid.bottommost_line().0 {
+        let row = &mut grid[Line(l)];
+        let restored = unclip_row(row, old);
+        let wraps = !restored && row[Column(old - 1)].flags.contains(Flags::WRAPLINE);
+        let overflows = row[..].iter().skip(new).any(|c| !c.is_empty());
+        if overflows && l < kept && !wrapped_into && !wraps && (new > old || l != cursor) {
+            let mut tail = clip_row(row, new);
+            if new > old {
+                // alacritty only grows a row narrower than the pane.
+                row.append(&mut tail);
+            } else {
+                // Narrowing would reflow the tail; it goes back on after.
+                tails.push(tail);
+            }
+        }
+        wrapped_into = wraps;
+    }
+    term.resize(size);
+    // The rows just clipped are the only marked ones, still in order, and
+    // the oldest are the ones a full scrollback drops: match from the bottom.
+    let grid = term.grid_mut();
+    let mut tails = tails.into_iter().rev();
+    for l in (grid.topmost_line().0..=grid.bottommost_line().0).rev() {
+        let row = &mut grid[Line(l)];
+        if row[Column(0)].flags.contains(CLIPPED)
+            && let Some(mut tail) = tails.next()
+        {
+            row.append(&mut tail);
+        }
+    }
+}
+
+/// Cut `row` to show `cols` cells, marking them and returning the rest
+/// (trailing blanks dropped), marked too. A wide char the edge would split
+/// goes whole into the rest, leaving alacritty's placeholder for a wide
+/// char moved on to the next row.
+fn clip_row(row: &mut Row<Cell>, cols: usize) -> Vec<Cell> {
+    let mut cells = row[..].to_vec();
+    let end = cells
+        .iter()
+        .rposition(|c| !c.is_empty())
+        .map_or(0, |i| i + 1);
+    cells.truncate(end);
+    let cut = if cells[cols - 1].flags.contains(Flags::WIDE_CHAR) {
+        cols - 1
+    } else {
+        cols
+    };
+    let mut tail = cells.split_off(cut);
+    if cut < cols {
+        cells.push(Cell {
+            flags: Flags::LEADING_WIDE_CHAR_SPACER,
+            ..Cell::default()
+        });
+    }
+    for cell in cells.iter_mut().chain(&mut tail) {
+        cell.flags.insert(CLIPPED);
+    }
+    *row = Row::from_vec(cells, cols);
+    tail
+}
+
+/// Undo [`clip_row`] on a row showing `cols` cells: put back what it kept
+/// past its edge, or drop that when a program has written to the row since.
+/// Whether the row came back whole.
+fn unclip_row(row: &mut Row<Cell>, cols: usize) -> bool {
+    if row.len() <= cols {
+        // A clipped row alacritty reflowed under a full-screen program.
+        if row[Column(0)].flags.contains(CLIPPED) {
+            for cell in &mut row[..] {
+                cell.flags.remove(CLIPPED);
+            }
+        }
+        return false;
+    }
+    let intact = row[..Column(cols)]
+        .iter()
+        .all(|c| c.flags.contains(CLIPPED));
+    let mut cells = row[..].to_vec();
+    if !intact {
+        cells.truncate(cols);
+    } else if cells[cols - 1]
+        .flags
+        .contains(Flags::LEADING_WIDE_CHAR_SPACER)
+    {
+        cells.remove(cols - 1);
+    }
+    for cell in &mut cells {
+        cell.flags.remove(CLIPPED);
+    }
+    let len = cells.len();
+    *row = Row::from_vec(cells, len);
+    intact
 }
 
 /// Whether grid row `line_idx` soft-wraps into the next (WRAPLINE on its
@@ -6615,6 +6744,133 @@ mod tests {
                 .any(|r| r.contains("abcdefghijklmnopqrstuvwxyz1234")),
             "widening must re-join the reflowed rows: {joined:?}"
         );
+    }
+
+    /// Every row of the model, scrollback first, trailing blanks trimmed.
+    fn all_rows(term: &Term<VoidListener>) -> Vec<String> {
+        (term.grid().topmost_line().0..term.screen_lines() as i32)
+            .map(|l| row_text_and_cols(term, l).0.trim_end().to_string())
+            .collect()
+    }
+
+    fn resize_to(term: &mut Term<VoidListener>, cols: usize) {
+        resize_term(term, TermSize::new(cols, 6));
+    }
+
+    const PANEL: [&str; 3] = [
+        "╭──────────── Assistant ─────╮",
+        "│ a reply laid out to fit 30 │",
+        "╰────────────────────────────╯",
+    ];
+
+    /// [`PANEL`] clipped to 12 columns.
+    const PANEL_AT_12: [&str; 3] = ["╭───────────", "│ a reply la", "╰───────────"];
+
+    /// A 30-column pane showing [`PANEL`], then `after`.
+    fn panel_then(after: &str) -> Term<VoidListener> {
+        let mut term = fresh_term(30, 6);
+        let bytes = format!("{}\r\n{after}", PANEL.join("\r\n"));
+        feed(&mut term, bytes.as_bytes());
+        term
+    }
+
+    /// A panel printed to the pane's width keeps one row per row when the
+    /// pane narrows, and comes back whole when it widens (#1857).
+    #[test]
+    fn narrowing_clips_a_panel_and_widening_brings_it_back() {
+        let mut term = panel_then("$ ");
+        resize_to(&mut term, 12);
+        let rows = all_rows(&term);
+        assert_eq!(rows[..3], PANEL_AT_12, "{rows:?}");
+        assert_eq!(rows[3], "$");
+        // Through a narrower step and a wider one that still cuts it.
+        for cols in [8, 20, 30] {
+            resize_to(&mut term, cols);
+        }
+        assert_eq!(all_rows(&term)[..3], PANEL, "{:?}", all_rows(&term));
+    }
+
+    /// The cut cells ride the row into scrollback as output scrolls it off.
+    #[test]
+    fn a_clipped_row_keeps_its_cells_in_scrollback() {
+        let mut term = panel_then("");
+        resize_to(&mut term, 12);
+        feed(&mut term, b"1\r\n2\r\n3\r\n4\r\n5\r\n6\r\n$ ");
+        let rows = all_rows(&term);
+        assert_eq!(
+            rows[..4],
+            [PANEL_AT_12[0], PANEL_AT_12[1], PANEL_AT_12[2], "1"]
+        );
+        resize_to(&mut term, 30);
+        let rows = all_rows(&term);
+        assert_eq!(rows[..3], PANEL, "{rows:?}");
+    }
+
+    /// A row a program rewrote while clipped is its new content alone:
+    /// widening must not bring the old row's cut-off end back after it.
+    #[test]
+    fn a_row_rewritten_while_clipped_drops_what_was_cut() {
+        let mut term = panel_then("$ ");
+        resize_to(&mut term, 12);
+        feed(&mut term, b"\x1b[2;1H\x1b[2Knew\x1b[4;3H");
+        resize_to(&mut term, 30);
+        let rows = all_rows(&term);
+        assert_eq!(rows[..3], [PANEL[0], "new", PANEL[2]], "{rows:?}");
+    }
+
+    /// Lines the pane soft-wrapped, and the row the cursor is on, reflow
+    /// as before: they are text, not a layout.
+    #[test]
+    fn soft_wrapped_lines_and_the_cursor_row_still_reflow() {
+        let (long, typed) = (
+            "abcdefghijklmnopqrstuvwxyz0123456789",
+            "$ echo 0123456789abc",
+        );
+        let mut term = fresh_term(30, 6);
+        feed(&mut term, format!("{long}\r\n{typed}").as_bytes());
+        resize_to(&mut term, 10);
+        assert_eq!(all_rows(&term).concat(), format!("{long}{typed}"));
+        resize_to(&mut term, 40);
+        let rows = all_rows(&term);
+        assert_eq!(rows[..2], [long, typed], "{rows:?}");
+    }
+
+    /// A wide char the new edge would split is cut whole, and comes back.
+    #[test]
+    fn a_wide_char_at_the_cut_comes_back_whole() {
+        let row = "123456789日本 and the rest";
+        let mut term = fresh_term(30, 6);
+        feed(&mut term, format!("{row}\r\n").as_bytes());
+        resize_to(&mut term, 10);
+        assert_eq!(all_rows(&term)[..2], ["123456789", ""]);
+        resize_to(&mut term, 30);
+        assert_eq!(all_rows(&term)[0], row);
+    }
+
+    /// A pane losing lines as it narrows drops the rows below the cursor's,
+    /// and what was cut off them goes too, not onto the panel above.
+    #[test]
+    fn rows_a_shorter_pane_drops_take_their_cut_cells_with_them() {
+        let mut term = fresh_term(30, 6);
+        let bytes = format!(
+            "1\r\n{}\r\n$ \r\na row below the cursor\x1b[5;3H",
+            PANEL.join("\r\n")
+        );
+        feed(&mut term, bytes.as_bytes());
+        resize_term(&mut term, TermSize::new(12, 3));
+        let rows = all_rows(&term);
+        assert_eq!(
+            rows,
+            ["1", PANEL_AT_12[0], PANEL_AT_12[1], PANEL_AT_12[2], "$"]
+        );
+        resize_to(&mut term, 30);
+        let rows = all_rows(&term);
+        assert_eq!(
+            rows[..5],
+            ["1", PANEL[0], PANEL[1], PANEL[2], "$"],
+            "{rows:?}"
+        );
+        assert!(rows[5..].iter().all(String::is_empty), "{rows:?}");
     }
 
     #[test]

@@ -1116,6 +1116,46 @@ fn open_line_above_relocated_from_cmd_shift_o_to_cmd_shift_enter() {
     )));
 }
 
+/// #1007: without the kitty keyboard protocol Ctrl+/ arrives as 0x1F,
+/// which crossterm reads as Ctrl+7: it comments the line instead of
+/// switching to tab 7, and Ctrl+\ and Ctrl+] (Ctrl+4, Ctrl+5) switch no
+/// tab either. A terminal that does speak the protocol keeps Ctrl+7 as
+/// tab 7.
+#[test]
+fn legacy_ctrl_slash_comments_the_line_instead_of_switching_tabs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let files: Vec<PathBuf> = (0..7)
+        .map(|i| {
+            let p = tmp.path().join(format!("f{i}.py"));
+            std::fs::write(&p, "x = 1\n").unwrap();
+            p
+        })
+        .collect();
+    for f in &files {
+        app.editor.open_pinned(f).unwrap();
+    }
+    app.editor.select(0);
+    app.focus_pane(Pane::Editor);
+    let shown = |app: &App| app.editor.path.clone();
+
+    app.legacy_ctrl_punct = true;
+    for digit in ['4', '5'] {
+        app.handle_key(key(KeyCode::Char(digit), KeyModifiers::CONTROL))
+            .unwrap();
+        assert_eq!(shown(&app).as_ref(), Some(&files[0]), "Ctrl+{digit}");
+    }
+    app.handle_key(key(KeyCode::Char('7'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert_eq!(shown(&app).as_ref(), Some(&files[0]));
+    assert_eq!(app.editor.lines[0], "# x = 1");
+
+    app.legacy_ctrl_punct = false;
+    app.handle_key(key(KeyCode::Char('7'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert_eq!(shown(&app).as_ref(), Some(&files[6]), "a real Ctrl+7");
+}
+
 /// #1181: Ctrl+/ in a file with no comment syntax says so, as the palette
 /// command does, instead of doing nothing silently; in a file croft has no
 /// grammar for but knows the comment of, it comments.
