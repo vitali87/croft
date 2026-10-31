@@ -10,12 +10,20 @@
 //! disappears and the page count with it, and the same goes for git, ripgrep,
 //! language servers and the pair-programming CLIs.
 //!
-//! The fix is to ask the user's login shell what the PATH actually is, once,
-//! before croft spawns anything. This is what VS Code and Zed both do for the
-//! same reason. Only a launch that arrives with launchd's exact PATH pays for
-//! the probe, so a terminal launch costs nothing.
+//! The fix is to ask the user's login shell what the PATH actually is. This is
+//! what VS Code and Zed both do for the same reason. But an interactive login
+//! shell takes as long as the user's rc files do, often a second or more, and
+//! croft starts in milliseconds with no exceptions (#1973), so startup never
+//! waits for it. The answer is remembered in croft's cache directory instead:
+//! a launch puts the remembered PATH back at once, before croft spawns
+//! anything, and asks the shell again in the background so the next launch
+//! sees whatever the rc files have added since. `croft install-launcher` and
+//! `croft setup-ghostty`, which a user runs before their first GUI launch,
+//! remember it up front. Only a launch that arrives with launchd's exact PATH
+//! does any of this, so a terminal launch costs nothing.
 
 use std::ffi::OsStr;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
@@ -24,7 +32,7 @@ use std::time::Duration;
 const LAUNCHD_DIRS: [&str; 4] = ["/usr/bin", "/bin", "/usr/sbin", "/sbin"];
 
 /// How long the login shell gets to answer. A shell that hangs on its own rc
-/// file must not hang croft's startup; we keep the stripped PATH instead.
+/// file must not leave a probe (and the process it runs in) hanging.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Markers around the value so an interactive rc file's own chatter (banners,
@@ -67,7 +75,7 @@ fn merge(current: Option<&str>, probed: &str) -> String {
     out.join(":")
 }
 
-/// Ask `shell` for its PATH. `-l -i` so both the login files (`.zprofile`,
+/// Ask `shell`, started under the `inherited` PATH, for its PATH. `-l -i` so both the login files (`.zprofile`,
 /// `.bash_profile`) and the interactive ones (`.zshrc`) get a say, since
 /// either may be where the user builds their PATH (csh/tcsh accept `-l` only
 /// as the sole argument, so that family runs `-i` alone). The value is
@@ -75,9 +83,15 @@ fn merge(current: Option<&str>, probed: &str) -> String {
 /// own quoted `$PATH` list space-joined, while the exported variable is
 /// colon-joined in every shell. stdin is closed so a shell that prompts gets
 /// EOF instead of blocking, and the whole thing is bounded by
-/// [`PROBE_TIMEOUT`].
-fn probe(shell: &str) -> Option<String> {
-    run_probe(probe_cmd(shell), PROBE_TIMEOUT)
+/// [`PROBE_TIMEOUT`]. `inherited` is what a GUI launch hands the shell, never
+/// a PATH already repaired from memory (see [`probe_and_remember`]).
+fn probe(shell: &str, inherited: Option<&str>) -> Option<String> {
+    let mut cmd = probe_cmd(shell);
+    match inherited {
+        Some(path) => cmd.env("PATH", path),
+        None => cmd.env_remove("PATH"),
+    };
+    run_probe(cmd, PROBE_TIMEOUT)
 }
 
 /// The probe invocation for `shell`, before it is spawned. Split from
@@ -167,14 +181,68 @@ fn extract(out: &str) -> Option<String> {
     (!path.is_empty()).then(|| path.to_string())
 }
 
-/// The PATH to run under, or `None` to keep what we inherited.
-fn repaired(current: Option<&str>, probe: impl FnOnce() -> Option<String>) -> Option<String> {
+/// The PATH to run under, or `None` to keep what we inherited. `known` is the
+/// login shell's PATH as last remembered; it is only asked for when the
+/// inherited PATH needs repairing.
+fn repaired(current: Option<&str>, known: impl FnOnce() -> Option<String>) -> Option<String> {
     if !is_stripped(current) {
         return None;
     }
-    let probed = probe()?;
-    let merged = merge(current, &probed);
+    let known = known()?;
+    let merged = merge(current, &known);
     (merged != current.unwrap_or_default()).then_some(merged)
+}
+
+/// Where the login shell's PATH is remembered between launches. A cache: it
+/// is rebuilt by the next probe if it goes.
+fn memory_path() -> PathBuf {
+    crate::app::croft_cache_dir().join("login-path")
+}
+
+/// The PATH remembered in `file` for `shell`. A PATH another shell reported
+/// does not count: switching shells must not run croft under the old one's.
+fn recall(file: &Path, shell: &str) -> Option<String> {
+    let text = std::fs::read_to_string(file).ok()?;
+    let (who, path) = text.split_once('\n')?;
+    let path = path.trim();
+    (who == shell && !path.is_empty()).then(|| path.to_string())
+}
+
+/// Remember `path` as `shell`'s PATH in `file`. Written beside and renamed
+/// over, so a launch reading it never sees half of one.
+fn remember(file: &Path, shell: &str, path: &str) -> std::io::Result<()> {
+    if recall(file, shell).as_deref() == Some(path) {
+        return Ok(());
+    }
+    if let Some(dir) = file.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let tmp = file.with_extension(format!("tmp{}", std::process::id()));
+    std::fs::write(&tmp, format!("{shell}\n{path}\n"))?;
+    std::fs::rename(&tmp, file).inspect_err(|_| {
+        let _ = std::fs::remove_file(&tmp);
+    })
+}
+
+/// Ask `shell` for its PATH, starting it under `inherited` as a GUI launch
+/// would, and remember the answer in `file` for the next launch. Nothing is
+/// remembered when the shell does not answer. The shell must not inherit a
+/// PATH already repaired from memory: whatever it remembered would come back
+/// in its answer, and a directory taken out of an rc file would never leave.
+fn probe_and_remember(shell: &str, inherited: Option<&str>, file: &Path) {
+    if let Some(path) = probe(shell, inherited) {
+        let _ = remember(file, shell, &path);
+    }
+}
+
+/// Ask the user's login shell for its PATH now and remember it, so the first
+/// GUI launch already has it. For the setup commands a user runs from a
+/// terminal before that launch; they may wait for the shell, startup never
+/// does. The shell starts under launchd's PATH, not this terminal's, so it
+/// answers exactly what it would for a GUI launch.
+pub fn remember_login_path() {
+    let launchd = LAUNCHD_DIRS.join(":");
+    probe_and_remember(&login_shell(), Some(&launchd), &memory_path());
 }
 
 /// The user's login shell. launchd sets `SHELL` from the user record for GUI
@@ -186,17 +254,37 @@ fn login_shell() -> String {
         .unwrap_or_else(|| String::from("/bin/zsh"))
 }
 
-/// Put the user's real PATH back when croft was started by the GUI. Call once
-/// at startup, before anything spawns a child or a thread.
+/// Put the user's real PATH back when croft was started by the GUI, without
+/// waiting for their shell. Call once at startup, before anything spawns a
+/// child or a thread.
 pub fn repair() {
     let current = std::env::var("PATH").ok();
-    let Some(fixed) = repaired(current.as_deref(), || probe(&login_shell())) else {
+    if !is_stripped(current.as_deref()) {
         return;
-    };
-    // SAFETY: `set_var` is only unsafe because another thread may be reading
-    // the environment concurrently. This runs at the top of `Cli::run`, before
-    // croft starts the tokio runtime, any watcher, or any child process.
-    unsafe { std::env::set_var("PATH", OsStr::new(&fixed)) };
+    }
+    let shell = login_shell();
+    let file = memory_path();
+    if let Some(fixed) = repaired(current.as_deref(), || recall(&file, &shell)) {
+        // SAFETY: `set_var` is only unsafe because another thread may be
+        // reading the environment concurrently. This runs at the top of
+        // `Cli::run`, before croft starts the tokio runtime, any watcher, or
+        // any child process, and before the probe thread below.
+        unsafe { std::env::set_var("PATH", OsStr::new(&fixed)) };
+    }
+    // The shell is asked again on every GUI launch, as it always was, but
+    // off the startup path: its answer is for the next launch. This launch
+    // never changes its environment again once threads exist.
+    refresh_in_background(shell, current, file);
+}
+
+/// Ask `shell` again on a thread of its own, under the `inherited` PATH, and
+/// remember its answer in `file`, for the next launch.
+fn refresh_in_background(
+    shell: String,
+    inherited: Option<String>,
+    file: PathBuf,
+) -> std::thread::JoinHandle<()> {
+    std::thread::spawn(move || probe_and_remember(&shell, inherited.as_deref(), &file))
 }
 
 #[cfg(test)]
@@ -278,9 +366,119 @@ mod tests {
     #[test]
     fn a_terminal_launch_never_probes_or_changes_anything() {
         let fixed = repaired(Some("/opt/homebrew/bin:/usr/bin"), || {
-            panic!("a shell-built PATH must not be probed")
+            panic!("a shell-built PATH must not be looked up")
         });
         assert!(fixed.is_none());
+    }
+
+    #[test]
+    fn a_remembered_path_comes_back_for_the_same_shell() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("cache").join("login-path");
+        remember(&file, "/bin/zsh", "/opt/homebrew/bin:/usr/bin").unwrap();
+        assert_eq!(
+            recall(&file, "/bin/zsh").as_deref(),
+            Some("/opt/homebrew/bin:/usr/bin")
+        );
+        remember(&file, "/bin/zsh", "/opt/x:/usr/bin").unwrap();
+        assert_eq!(
+            recall(&file, "/bin/zsh").as_deref(),
+            Some("/opt/x:/usr/bin")
+        );
+    }
+
+    /// A user who switched their login shell must not run croft under the
+    /// PATH the old one built.
+    #[test]
+    fn a_path_another_shell_reported_is_not_used() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("login-path");
+        remember(&file, "/bin/zsh", "/opt/homebrew/bin:/usr/bin").unwrap();
+        assert!(recall(&file, "/opt/homebrew/bin/fish").is_none());
+    }
+
+    #[test]
+    fn a_missing_or_garbled_memory_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("login-path");
+        assert!(recall(&file, "/bin/zsh").is_none());
+        std::fs::write(&file, "/bin/zsh").unwrap();
+        assert!(recall(&file, "/bin/zsh").is_none());
+        std::fs::write(&file, "/bin/zsh\n\n").unwrap();
+        assert!(recall(&file, "/bin/zsh").is_none());
+    }
+
+    /// #1973: a GUI launch puts the PATH back from memory, at once, however
+    /// long the login shell takes; the slow shell's answer is for the next
+    /// launch, and lands there.
+    #[test]
+    fn a_gui_launch_never_waits_for_the_login_shell() {
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("slow-shell");
+        std::fs::write(
+            &stub,
+            format!("#!/bin/sh\nsleep 1\nprintf '{BEGIN}/new/tools/bin:/usr/bin{END}'\n"),
+        )
+        .unwrap();
+        let mut perm = std::fs::metadata(&stub).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o755);
+        std::fs::set_permissions(&stub, perm).unwrap();
+        let shell = stub.display().to_string();
+        let file = dir.path().join("login-path");
+        remember(&file, &shell, "/old/tools/bin:/usr/bin").unwrap();
+        let dock = "/usr/bin:/bin:/usr/sbin:/sbin";
+        let start = std::time::Instant::now();
+        let fixed = repaired(Some(dock), || recall(&file, &shell));
+        let refresh = refresh_in_background(shell.clone(), Some(dock.into()), file.clone());
+        assert!(
+            start.elapsed() < Duration::from_millis(500),
+            "startup waited {:?} for the login shell",
+            start.elapsed()
+        );
+        assert_eq!(
+            fixed.as_deref(),
+            Some("/old/tools/bin:/usr/bin:/bin:/usr/sbin:/sbin")
+        );
+        refresh.join().unwrap();
+        assert_eq!(
+            recall(&file, &shell).as_deref(),
+            Some("/new/tools/bin:/usr/bin")
+        );
+    }
+
+    /// The refresh asks the shell under the PATH the launch inherited, not
+    /// the one repaired from memory: otherwise a directory once remembered
+    /// comes back in every answer, and taking it out of an rc file never
+    /// takes it off croft's PATH.
+    #[test]
+    fn a_directory_taken_out_of_the_rc_files_leaves_the_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let stub = dir.path().join("stub-shell");
+        std::fs::write(
+            &stub,
+            format!("#!/bin/sh\nprintf '{BEGIN}/now/bin:%s{END}' \"$PATH\"\n"),
+        )
+        .unwrap();
+        let mut perm = std::fs::metadata(&stub).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o755);
+        std::fs::set_permissions(&stub, perm).unwrap();
+        let shell = stub.display().to_string();
+        let file = dir.path().join("login-path");
+        remember(&file, &shell, "/gone/bin:/usr/bin:/bin").unwrap();
+        probe_and_remember(&shell, Some("/usr/bin:/bin"), &file);
+        assert_eq!(
+            recall(&file, &shell).as_deref(),
+            Some("/now/bin:/usr/bin:/bin")
+        );
+    }
+
+    /// The very first GUI launch, before anything was remembered, starts
+    /// under the inherited PATH rather than waiting for the shell.
+    #[test]
+    fn a_first_gui_launch_starts_under_the_inherited_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("login-path");
+        assert!(repaired(Some("/usr/bin:/bin"), || recall(&file, "/bin/zsh")).is_none());
     }
 
     #[test]
@@ -348,7 +546,11 @@ mod tests {
         std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o755);
         std::fs::set_permissions(&stub, perm).unwrap();
         let dock = "/usr/bin:/bin:/usr/sbin:/sbin:/Applications/Ghostty.app/Contents/MacOS";
-        let fixed = repaired(Some(dock), || probe(&stub.display().to_string()))
+        // One launch asks the shell and remembers; the next one runs under it.
+        let shell = stub.display().to_string();
+        let file = dir.path().join("login-path");
+        probe_and_remember(&shell, Some(dock), &file);
+        let fixed = repaired(Some(dock), || recall(&file, &shell))
             .expect("a Dock launch must have its PATH repaired");
         assert!(
             fixed.starts_with("/stub/tools/bin:"),
@@ -391,7 +593,7 @@ mod tests {
             eprintln!("skipping: tcsh not installed");
             return;
         }
-        let path = probe("/bin/tcsh").expect("tcsh must report a PATH");
+        let path = probe("/bin/tcsh", Some("/usr/bin:/bin")).expect("tcsh must report a PATH");
         assert!(path.contains("/bin"), "got {path:?}");
     }
 

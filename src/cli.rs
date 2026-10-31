@@ -1999,6 +1999,9 @@ fn setup_ghostty(yes: bool) -> Result<()> {
     }
     crate::ghostty::install_keybinds(&config_path)
         .with_context(|| "applying Ghostty Croft keybindings")?;
+    // A Ghostty `command = croft` starts croft with launchd's bare PATH; the
+    // shell's is remembered now so even its first launch never waits for it.
+    crate::gui_path::remember_login_path();
     println!("Wrote Croft keybindings to {}.", config_path.display());
     println!(
         "Reload Ghostty's config (Cmd+Shift+,) or restart Ghostty for the change to take effect."
@@ -2277,6 +2280,9 @@ fn install_launcher(path: Option<PathBuf>, user: bool, yes: bool) -> Result<()> 
         &open_dir.to_string_lossy(),
     )
     .with_context(|| "creating the Croft.app launcher")?;
+    // The launcher starts croft with launchd's bare PATH; the shell's is
+    // remembered now so even its first launch never waits for the shell.
+    crate::gui_path::remember_login_path();
     println!("Created {}.", app.display());
     println!("Find it in Spotlight (Cmd+Space, type 'Croft') or drag it to your Dock.");
     Ok(())
