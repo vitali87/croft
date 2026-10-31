@@ -4455,6 +4455,10 @@ pub struct App {
     /// "View Changes vs <name>" label so users know which branch the
     /// diff compares against. `None` until the resolver succeeds.
     default_branch_label: Option<String>,
+    /// The resolver running off the UI thread for the repository at the
+    /// path (#1973): it runs up to five `git` processes, and on macOS each
+    /// goes through the Xcode shim.
+    default_branch_ask: Option<(PathBuf, std::sync::mpsc::Receiver<Option<String>>)>,
     /// Last HEAD oid the git-gutter baselines were synced against. When the
     /// git worker reports a different oid (commit, checkout, pull), the cached
     /// per-tab HEAD snapshots are invalidated so the gutter refetches.
@@ -7023,6 +7027,7 @@ impl App {
             pending_terminal_warning: false,
             commit_menu_open: false,
             default_branch_label: None,
+            default_branch_ask: None,
             trust_local_browser: false,
             sidebar_width: SIDEBAR_WIDTH_DEFAULT,
             terminal_height: None,
@@ -9181,6 +9186,7 @@ impl App {
         // Ship any refresh the debounce window coalesced once the gap clears,
         // so the trailing edge of an edit burst lands without another FS event.
         let mut changed = false;
+        self.take_default_branch();
         // Roots whose HEAD oid moved in this drain: the open Source Control
         // diffs for THESE re-read their HEAD blob (#471); the rest are
         // stamp-gated like any filesystem tick.
@@ -9213,7 +9219,7 @@ impl App {
             changed = true;
             let status = w.status().clone();
             if is_active && status.in_repo && self.default_branch_label.is_none() {
-                self.default_branch_label = crate::git::default_branch(&self.active_scm_root).ok();
+                self.ask_default_branch();
             }
             // HEAD moved in THIS repo (commit, checkout, pull): the cached
             // gutter baselines for ITS files are stale, as is blame; the
@@ -9284,6 +9290,43 @@ impl App {
         let diffs_refreshed = (changed || status_arrived)
             && self.refresh_open_diff_views(true, &heads_moved, &std::collections::BTreeSet::new());
         changed || diffs_refreshed
+    }
+
+    /// Resolve the active repository's default branch on a thread of its
+    /// own, unless that is already under way; [`Self::take_default_branch`]
+    /// files the answer.
+    fn ask_default_branch(&mut self) {
+        let root = self.active_scm_root.clone();
+        if self
+            .default_branch_ask
+            .as_ref()
+            .is_some_and(|(r, _)| *r == root)
+        {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let asked = root.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::git::default_branch(&asked).ok());
+        });
+        self.default_branch_ask = Some((root, rx));
+    }
+
+    /// File the default branch [`Self::ask_default_branch`] resolved, if it
+    /// is in and is for the repository still active.
+    fn take_default_branch(&mut self) {
+        let Some((root, rx)) = self.default_branch_ask.as_ref() else {
+            return;
+        };
+        let branch = match rx.try_recv() {
+            Ok(branch) => branch,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => None,
+        };
+        if *root == self.active_scm_root && self.default_branch_label.is_none() {
+            self.default_branch_label = branch;
+        }
+        self.default_branch_ask = None;
     }
 
     /// Point the SCM surfaces at `active`'s repository: seed the panel
