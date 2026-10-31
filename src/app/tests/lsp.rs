@@ -4287,6 +4287,32 @@ fn a_pull_answer_keeps_what_the_same_server_pushed() {
 
 /// #1102: each kind of report still clears its own findings, and a path
 /// leaves the store once neither has any.
+#[test]
+fn an_empty_pull_or_push_still_clears_its_own_findings() {
+    use crate::lsp::manager::{DiagnosticSeverity, DiagnosticsUpdate};
+    let mut store = std::collections::HashMap::new();
+    let path = PathBuf::from("/w/names.rs");
+    let update = |pulled, diagnostics| DiagnosticsUpdate {
+        path: path.clone(),
+        server: "rust-analyzer".into(),
+        diagnostics,
+        pulled,
+    };
+    let pushed = diag(0, 1, DiagnosticSeverity::Error);
+    let pulled = diag(2, 3, DiagnosticSeverity::Warning);
+    store_diagnostics_update(&mut store, update(false, vec![pushed.clone()]));
+    store_diagnostics_update(&mut store, update(true, vec![pulled.clone()]));
+    store_diagnostics_update(&mut store, update(true, Vec::new()));
+    let left: Vec<_> = diagnostics_by_source(&store[&path]).collect();
+    assert_eq!(left, vec![("rust-analyzer", &pushed)]);
+    store_diagnostics_update(&mut store, update(true, vec![pulled.clone()]));
+    store_diagnostics_update(&mut store, update(false, Vec::new()));
+    let left: Vec<_> = diagnostics_by_source(&store[&path]).collect();
+    assert_eq!(left, vec![("rust-analyzer", &pulled)]);
+    store_diagnostics_update(&mut store, update(true, Vec::new()));
+    assert!(store.is_empty(), "{store:?}");
+}
+
 /// #1030: a finding pushed and pulled by one server is one row, even when
 /// the server gave each copy different `data`, which croft now keeps.
 #[test]
@@ -4313,32 +4339,6 @@ fn a_pushed_and_pulled_finding_with_different_data_is_one_row() {
     store_diagnostics_update(&mut store, update(false, vec![copy(1)]));
     store_diagnostics_update(&mut store, update(true, vec![copy(2)]));
     assert_eq!(diagnostics_by_source(&store[&path]).count(), 1);
-}
-
-#[test]
-fn an_empty_pull_or_push_still_clears_its_own_findings() {
-    use crate::lsp::manager::{DiagnosticSeverity, DiagnosticsUpdate};
-    let mut store = std::collections::HashMap::new();
-    let path = PathBuf::from("/w/names.rs");
-    let update = |pulled, diagnostics| DiagnosticsUpdate {
-        path: path.clone(),
-        server: "rust-analyzer".into(),
-        diagnostics,
-        pulled,
-    };
-    let pushed = diag(0, 1, DiagnosticSeverity::Error);
-    let pulled = diag(2, 3, DiagnosticSeverity::Warning);
-    store_diagnostics_update(&mut store, update(false, vec![pushed.clone()]));
-    store_diagnostics_update(&mut store, update(true, vec![pulled.clone()]));
-    store_diagnostics_update(&mut store, update(true, Vec::new()));
-    let left: Vec<_> = diagnostics_by_source(&store[&path]).collect();
-    assert_eq!(left, vec![("rust-analyzer", &pushed)]);
-    store_diagnostics_update(&mut store, update(true, vec![pulled.clone()]));
-    store_diagnostics_update(&mut store, update(false, Vec::new()));
-    let left: Vec<_> = diagnostics_by_source(&store[&path]).collect();
-    assert_eq!(left, vec![("rust-analyzer", &pulled)]);
-    store_diagnostics_update(&mut store, update(true, Vec::new()));
-    assert!(store.is_empty(), "{store:?}");
 }
 
 /// #1102: a server that pushes a finding and also returns it to a pull
