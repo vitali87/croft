@@ -505,11 +505,49 @@ pub struct ServerEntry {
     pub config: ServerConfig,
 }
 
-/// Parse an `extension.toml` source. Ids are checked here because they name
-/// directories (`~/.croft/servers/<id>/`, the user extensions dir) and
-/// dispatch keys (`viewer:<extension>/<viewer>`): a separator, a parent
-/// reference or whitespace in one would reach a path join or split a key.
+/// Parse an `extension.toml` source, once per process per source text.
+///
+/// The language table, the server, debugger and test-runner registries, the
+/// theme list and the Extensions panel each read every manifest, and a
+/// launch reached five of them before its first frame: five TOML parses of
+/// the same bundled files, a quarter of startup's work. Each text is parsed
+/// once now and handed out as a copy; a bundled one in its own slot, so a
+/// caller that arrives while [`prewarm_bundled`] is parsing it waits for that
+/// parse instead of repeating it. Parsing is pure, so a text always gets the
+/// answer its first parse gave.
 pub fn parse(src: &str) -> Result<ExtensionManifest, toml::de::Error> {
+    type Parsed = Result<ExtensionManifest, toml::de::Error>;
+    static BUNDLED: [std::sync::OnceLock<Parsed>; BUNDLED_MANIFESTS.len()] =
+        [const { std::sync::OnceLock::new() }; BUNDLED_MANIFESTS.len()];
+    static OTHERS: std::sync::Mutex<BTreeMap<String, Parsed>> =
+        std::sync::Mutex::new(BTreeMap::new());
+    if let Some(i) = BUNDLED_MANIFESTS.iter().position(|b| *b == src) {
+        return BUNDLED[i].get_or_init(|| parse_uncached(src)).clone();
+    }
+    if let Some(hit) = OTHERS.lock().ok().and_then(|m| m.get(src).cloned()) {
+        return hit;
+    }
+    let parsed = parse_uncached(src);
+    if let Ok(mut m) = OTHERS.lock() {
+        m.insert(src.to_string(), parsed.clone());
+    }
+    parsed
+}
+
+/// Parse the bundled manifests into [`parse`]'s slots. Startup runs this on
+/// a thread of its own the moment the editor launches, so the registries
+/// built before the first frame find them parsed.
+pub fn prewarm_bundled() {
+    for src in BUNDLED_MANIFESTS {
+        let _ = parse(src);
+    }
+}
+
+/// [`parse`] without the per-process memory. Ids are checked here because
+/// they name directories (`~/.croft/servers/<id>/`, the user extensions dir)
+/// and dispatch keys (`viewer:<extension>/<viewer>`): a separator, a parent
+/// reference or whitespace in one would reach a path join or split a key.
+fn parse_uncached(src: &str) -> Result<ExtensionManifest, toml::de::Error> {
     let m: ExtensionManifest = toml::from_str(src)?;
     for (what, id) in std::iter::once(("extension", m.id.as_str()))
         .chain(m.viewers.iter().map(|v| ("viewer", v.id.as_str())))
@@ -791,6 +829,23 @@ pub fn read_extension_sources(dir: &Path) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A text parsed once is handed out from memory after that, with the
+    /// answer a fresh parse gives, a refusal included; a bundled text the
+    /// same whether it was copied into a `String` or not.
+    #[test]
+    fn a_remembered_parse_answers_like_a_fresh_one() {
+        for src in BUNDLED_MANIFESTS {
+            let fresh = parse_uncached(src).expect("bundled manifest parses");
+            let owned = src.to_string();
+            for remembered in [parse(src), parse(src), parse(&owned)] {
+                assert_eq!(remembered.expect("parses").id, fresh.id);
+            }
+        }
+        let bad = "id = 'a/b'\nname = \"x\"\napi_version = 1\n";
+        assert!(parse(bad).is_err());
+        assert!(parse(bad).is_err(), "a refusal is remembered too");
+    }
 
     /// Ids name directories and dispatch keys, so a separator or a parent
     /// reference in one is refused at parse time rather than reaching a
