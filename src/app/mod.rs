@@ -67836,7 +67836,11 @@ impl App {
         let tx = self.history_done_tx.clone();
         let millis = now_millis();
         std::thread::spawn(move || {
-            if let Ok(bytes) = std::fs::read(&path) {
+            // A save too large to snapshot is not read at all (#1011).
+            let skip = !keep
+                && std::fs::metadata(&path)
+                    .is_ok_and(|m| crate::history::too_large_to_snapshot(m.len()));
+            if !skip && let Ok(bytes) = std::fs::read(&path) {
                 // Someone else's bytes are on disk now: record the snapshot
                 // alone, every line unknown, which is the safe direction.
                 let seats = match described {
