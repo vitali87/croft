@@ -1429,6 +1429,65 @@ fn an_agent_pane_is_badged_and_a_prompt_fires_waiting_once() {
     );
 }
 
+/// OSC 7501: an agent that reports its own status is taken at its word, not
+/// its screen. The fake agent says it is working with a Y/n prompt on screen,
+/// then blocked on a screen with no prompt; once it leaves, the next agent
+/// in the pane is judged without its reports.
+#[test]
+fn a_reporting_agent_is_read_by_its_report_not_its_screen() {
+    use crate::agents::AgentStatus;
+    use crate::program_status::State;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let script = r#"printf 'Do you want to proceed? (y/n)\n\033]7501;state=working\033\\'; read x; printf '\033[2J\033[H\033]7501;state=blocked:kind=permission\033\\all quiet\n'; sleep 30"#;
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[String::from("-c"), String::from(script)],
+        tmp.path(),
+    )
+    .unwrap();
+    let shell_pid = app.terminals[0]
+        .shell_pid()
+        .expect("a running pane has a pid");
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::SHELL_PAINT_BASE,
+        "the fake agent to report working",
+        || app.terminals[0].reported_status() == Some(State::Working),
+    );
+    let zero = std::time::Duration::ZERO;
+    let claude = vec![(shell_pid, String::from("claude"))];
+
+    assert!(app.apply_agent_samples(&claude, zero));
+    let status = |app: &App| app.terminals[0].agent().map(|a| a.status);
+    assert_eq!(
+        status(&app),
+        Some(AgentStatus::Working),
+        "the report, though the screen shows a prompt"
+    );
+
+    app.terminals[0].write_input(b"\r");
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::SHELL_PAINT_BASE,
+        "the fake agent to report blocked",
+        || app.terminals[0].reported_status() == Some(State::Blocked),
+    );
+    assert!(app.apply_agent_samples(&claude, zero));
+    assert_eq!(
+        status(&app),
+        Some(AgentStatus::Waiting),
+        "blocked, though no prompt is on screen"
+    );
+    assert!(app.drain_agent_events());
+    assert!(app.status.contains("waiting"), "{}", app.status);
+
+    // The agent leaves and another sits down: its status is its screen's.
+    let shell = vec![(shell_pid, String::from("zsh"))];
+    assert!(app.apply_agent_samples(&shell, zero));
+    assert!(app.apply_agent_samples(&claude, zero));
+    assert_eq!(app.terminals[0].reported_status(), None);
+    assert_eq!(status(&app), Some(AgentStatus::Idle));
+}
+
 /// #374: Fix with Navigator from PROBLEMS. With no navigator seated the
 /// action lands on the diagnostic and says the navigator is not active
 /// rather than doing nothing; the caret-side entry points resolve the
