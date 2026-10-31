@@ -3717,6 +3717,9 @@ pub struct Editor {
     /// after a tab switch, exactly as `semantic_path` does for tokens.
     diagnostics: Vec<crate::lsp::manager::Diagnostic>,
     diagnostics_path: Option<PathBuf>,
+    /// `edit_seq` when `diagnostics` were applied. After a later edit their
+    /// positions and `data` describe text that has changed (#1030).
+    diagnostics_seq: u64,
     /// Decoded per-logical-line underline runs `(start_char, end_char,
     /// severity)`, recomputed from `diagnostics` whenever they or the buffer
     /// change. The render loop paints a coloured underline over each run.
@@ -4060,6 +4063,7 @@ impl Editor {
             semantic_is_full: false,
             diagnostics: Vec::new(),
             diagnostics_path: None,
+            diagnostics_seq: 0,
             diagnostic_spans: Vec::new(),
             diagnostic_tag_spans: Vec::new(),
             inlay_hints: Vec::new(),
@@ -8009,6 +8013,7 @@ impl Editor {
     ) {
         self.diagnostics_path = Some(path);
         self.diagnostics = diagnostics;
+        self.diagnostics_seq = self.edit_seq;
         self.recompute_diagnostic_spans();
     }
 
@@ -8022,15 +8027,22 @@ impl Editor {
     /// Clones of the diagnostics whose range intersects the inclusive logical
     /// line span `[start_line, end_line]`. Passed as `codeAction` context so the
     /// language server can attach quick fixes to the errors under the cursor.
+    /// Once the buffer has changed since they arrived, they go without their
+    /// origin: a fix in a server's `data` would land where the text used to
+    /// be, so the server is asked about them as croft shows them (#1030).
     pub fn diagnostics_in_line_range(
         &self,
         start_line: u32,
         end_line: u32,
     ) -> Vec<crate::lsp::manager::Diagnostic> {
+        let edited = self.diagnostics_seq != self.edit_seq;
         self.diagnostics
             .iter()
             .filter(|d| d.start_line <= end_line && d.end_line >= start_line)
-            .cloned()
+            .map(|d| crate::lsp::manager::Diagnostic {
+                origin: if edited { None } else { d.origin.clone() },
+                ..d.clone()
+            })
             .collect()
     }
 
@@ -27223,6 +27235,27 @@ mod tests {
         let mut e = Editor::new();
         e.lines.clear();
         assert_eq!(e.overview_ruler_rows(10).len(), 10);
+    }
+
+    /// #1030: a quick-fix request hands a server its diagnostic as sent, but
+    /// not once the buffer has changed since: the fix in its `data` would
+    /// land where the text used to be.
+    #[test]
+    fn a_diagnostic_loses_its_origin_once_the_buffer_changes() {
+        let mut e = editor_with("import os\n");
+        let wire = lsp_types::Diagnostic {
+            message: "`os` imported but unused".into(),
+            data: Some(serde_json::json!({ "fix": "remove" })),
+            ..Default::default()
+        };
+        let d = crate::lsp::client::convert_diagnostic("ruff", &wire);
+        e.apply_diagnostics(PathBuf::from("/w/a.py"), vec![d]);
+        let sent = e.diagnostics_in_line_range(0, 0);
+        assert!(sent[0].origin.is_some(), "unchanged: sent as published");
+        e.insert_char('x');
+        let sent = e.diagnostics_in_line_range(0, 0);
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].origin.is_none(), "edited: rebuilt, without `data`");
     }
 
     #[test]
