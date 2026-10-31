@@ -15423,7 +15423,7 @@ impl Editor {
         self.last_edit_kind = None;
     }
 
-    /// Start of the logical line (`Ctrl+A`, and Home's second step).
+    /// Start of the logical line (`Ctrl+A`), before any indentation.
     pub fn home_line(&mut self) {
         self.cursor_col = 0;
         self.last_edit_kind = None;
@@ -15435,18 +15435,26 @@ impl Editor {
         self.last_edit_kind = None;
     }
 
-    /// The Home key. With wrap on (#1569) it first goes to the start of the
-    /// wrapped row the caret is on, as VS Code does, and to the line's start
-    /// from there.
+    /// The Home key, VS Code's `cursorHome`: to the line's first
+    /// non-whitespace character, or to its start when the caret is already
+    /// there, so a second press toggles (#987). It used to always go to the
+    /// start, before the indentation. With wrap on (#1569) it first goes to
+    /// the start of the wrapped row the caret is on.
     pub fn home_key(&mut self) {
+        let line = &self.lines[self.cursor_row];
+        let first = line
+            .chars()
+            .position(|c| c != ' ' && c != '\t')
+            .unwrap_or_else(|| line.chars().count());
+        let smart = if self.cursor_col == first { 0 } else { first };
         self.cursor_col = match self.wrapped_row_of_cursor() {
             // A row can start on a combining mark (the wrap breaks after the
             // space it sits on), so step back to its cluster's start.
-            Some((start, _)) => match floor_grapheme_col(&self.lines[self.cursor_row], start) {
-                row_start if self.cursor_col > row_start => row_start,
-                _ => 0,
+            Some((start, _)) => match floor_grapheme_col(line, start) {
+                row_start if self.cursor_col > row_start && row_start > first => row_start,
+                _ => smart,
             },
-            None => 0,
+            None => smart,
         };
         self.last_edit_kind = None;
     }
@@ -31925,6 +31933,41 @@ mod tests {
         );
         e.end_key();
         assert_eq!(e.cursor_col, len);
+    }
+
+    /// #987: Home goes to the first non-whitespace character, then toggles
+    /// with the line's start; Shift+Home selects the same way.
+    #[test]
+    fn home_goes_past_the_indentation_then_toggles_with_the_line_start() {
+        let mut e = editor_with("    x = 1\ny = 2\n   \n");
+        e.cursor_col = 9;
+        e.home_key();
+        assert_eq!(e.cursor_col, 4, "the first non-whitespace character");
+        e.home_key();
+        assert_eq!(e.cursor_col, 0, "then the line's start");
+        e.home_key();
+        assert_eq!(e.cursor_col, 4, "and back");
+        e.cursor_col = 2;
+        e.home_key();
+        assert_eq!(e.cursor_col, 4, "from inside the indentation too");
+        (e.cursor_row, e.cursor_col) = (1, 5);
+        e.home_key();
+        assert_eq!(e.cursor_col, 0, "no indentation: the start");
+        e.home_key();
+        assert_eq!(e.cursor_col, 0);
+        (e.cursor_row, e.cursor_col) = (2, 3);
+        e.home_key();
+        assert_eq!(e.cursor_col, 0, "a blank line toggles end and start");
+        e.home_key();
+        assert_eq!(e.cursor_col, 3);
+        e.cursor_row = 0;
+        e.cursor_col = 9;
+        e.start_selection_at_cursor();
+        e.home_key();
+        e.extend_selection_to_cursor();
+        assert_eq!(e.selection_text(), "x = 1");
+        e.home_line();
+        assert_eq!(e.cursor_col, 0, "Ctrl+A stays a hard line start");
     }
 
     /// #1569: Home from inside a wrapped row stops at that row's start first.

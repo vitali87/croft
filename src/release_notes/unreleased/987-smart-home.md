@@ -1,0 +1,1 @@
+fix: Home goes to the first non-whitespace character of the line, and a second Home to the start of the line, as in VS Code; Shift+Home selects the same way. It used to always land before the indentation.
