@@ -305,6 +305,10 @@ impl ActivityOverlay {
         self.images.is_some()
     }
 
+    pub fn clear_images(&mut self) {
+        self.images = None;
+    }
+
     pub fn mark_dirty(&mut self) {
         self.dirty = true;
     }

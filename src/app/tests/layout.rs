@@ -289,6 +289,71 @@ fn ctrl_k_leads_from_the_panel_while_it_shows_problems() {
     assert!(app.cmd_k_leader.is_some());
 }
 
+/// A bake input for an 8x16-pixel cell on a Kitty-protocol terminal.
+fn kitty_chrome_bake_input() -> ChromeBakeInput {
+    ChromeBakeInput {
+        protocol: crate::iterm2_inline::InlineImageProtocol::Kitty,
+        cell: (8, 16),
+        is_tmux: false,
+        icon_bg: ::image::Rgba([0x1e, 0x1e, 0x1e, 0xff]),
+        icon_ink: crate::iterm2_inline::IconInk::default(),
+        sponsor_ink: crate::iterm2_inline::IconInk::default(),
+    }
+}
+
+/// #1973: the activity-bar icons and panel illustrations bake on a thread of
+/// their own, so startup and a theme switch never wait for some fifty
+/// rasterisations. The bar draws its codicon glyphs until they land, then
+/// the pictures go up, the badges with them.
+#[test]
+fn the_activity_bar_icons_bake_off_the_ui_thread() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.inline_protocol = crate::iterm2_inline::InlineImageProtocol::Kitty;
+    app.cell_pixel = Some((8, 16));
+    app.start_chrome_bake(kitty_chrome_bake_input());
+    assert!(
+        !app.overlays.activity.has_images(),
+        "the caller waited for the icon bake"
+    );
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 40)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let bar: String = (0..40)
+        .flat_map(|y| (0..ACTIVITY_BAR_WIDTH).map(move |x| (x, y)))
+        .map(|(x, y)| term.backend().buffer()[(x, y)].symbol().to_string())
+        .collect();
+    assert!(
+        bar.contains(crate::icons::ACTIVITY_EXPLORER),
+        "the bar must draw its glyphs while the icons bake: {bar:?}"
+    );
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(3),
+        "the activity-bar icon bake to land",
+        || app.poll_chrome_bake(),
+    );
+    assert!(app.overlays.activity.has_images());
+    assert!(app.overlays.activity.dirty(), "the icons are due on screen");
+    assert!(app.overlays.run_debug.has_image());
+    assert!(app.overlays.ssh.has_image());
+}
+
+/// A newer bake (a theme switch, a font zoom) replaces one still running:
+/// only one set of icons ever goes up.
+#[test]
+fn a_newer_icon_bake_replaces_one_still_running() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.start_chrome_bake(kitty_chrome_bake_input());
+    app.start_chrome_bake(kitty_chrome_bake_input());
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(3),
+        "the activity-bar icon bake to land",
+        || app.poll_chrome_bake(),
+    );
+    assert!(app.overlays.activity.has_images());
+    assert!(!app.poll_chrome_bake(), "a second set of icons went up");
+}
+
 #[test]
 fn resize_arms_a_one_shot_terminal_clear_to_evict_stale_activity_icons() {
     // Regression for the activity-bar icon ghosting after a pane reshape.
