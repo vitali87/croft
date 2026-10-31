@@ -16,8 +16,8 @@
 //! croft starts in milliseconds with no exceptions (#1973), so startup never
 //! waits for it. The answer is remembered in croft's cache directory instead:
 //! a launch puts the remembered PATH back at once, before croft spawns
-//! anything, and asks the shell again in the background so the next launch
-//! sees whatever the rc files have added since. `croft install-launcher` and
+//! anything, and once the editor is up asks the shell again in the background
+//! so the next launch sees whatever the rc files have added since. `croft install-launcher` and
 //! `croft setup-ghostty`, which a user runs before their first GUI launch,
 //! remember it up front. Only a launch that arrives with launchd's exact PATH
 //! does any of this, so a terminal launch costs nothing.
@@ -254,6 +254,10 @@ fn login_shell() -> String {
         .unwrap_or_else(|| String::from("/bin/zsh"))
 }
 
+/// The PATH a GUI launch inherited, kept by [`repair`] for
+/// [`refresh_in_background`]. Never set on a terminal launch.
+static INHERITED: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
 /// Put the user's real PATH back when croft was started by the GUI, without
 /// waiting for their shell. Call once at startup, before anything spawns a
 /// child or a thread.
@@ -268,18 +272,33 @@ pub fn repair() {
         // SAFETY: `set_var` is only unsafe because another thread may be
         // reading the environment concurrently. This runs at the top of
         // `Cli::run`, before croft starts the tokio runtime, any watcher, or
-        // any child process, and before the probe thread below.
+        // any child process.
         unsafe { std::env::set_var("PATH", OsStr::new(&fixed)) };
     }
-    // The shell is asked again on every GUI launch, as it always was, but
-    // off the startup path: its answer is for the next launch. This launch
-    // never changes its environment again once threads exist.
-    refresh_in_background(shell, current, file);
+    let _ = INHERITED.set(current);
+}
+
+/// Ask the login shell again, off the startup path, and remember its answer
+/// for the next GUI launch. A no-op unless [`repair`] saw a GUI launch, and
+/// it asks once per process however often it is called. The editor calls it
+/// once it is up, and nothing else does: a short-lived command (`croft
+/// open-link` from the URL handler) would exit with the probe's login shell
+/// still running, and one wedged in its rc files would be left behind, while
+/// an editor session normally runs past the probe's timeout, which kills such
+/// a shell.
+pub fn refresh_in_background() {
+    static ASKED: std::sync::Once = std::sync::Once::new();
+    let Some(inherited) = INHERITED.get() else {
+        return;
+    };
+    ASKED.call_once(|| {
+        spawn_refresh(login_shell(), inherited.clone(), memory_path());
+    });
 }
 
 /// Ask `shell` again on a thread of its own, under the `inherited` PATH, and
 /// remember its answer in `file`, for the next launch.
-fn refresh_in_background(
+fn spawn_refresh(
     shell: String,
     inherited: Option<String>,
     file: PathBuf,
@@ -429,7 +448,7 @@ mod tests {
         let dock = "/usr/bin:/bin:/usr/sbin:/sbin";
         let start = std::time::Instant::now();
         let fixed = repaired(Some(dock), || recall(&file, &shell));
-        let refresh = refresh_in_background(shell.clone(), Some(dock.into()), file.clone());
+        let refresh = spawn_refresh(shell.clone(), Some(dock.into()), file.clone());
         assert!(
             start.elapsed() < Duration::from_millis(500),
             "startup waited {:?} for the login shell",

@@ -81492,6 +81492,9 @@ pub fn run(
     zen: bool,
     workspace_folders: Vec<PathBuf>,
 ) -> Result<()> {
+    // A GUI launch asks the login shell for its PATH again now, off the
+    // startup path, for the next launch (#1973).
+    crate::gui_path::refresh_in_background();
     // Termux ships no font with codicon glyphs, so the activity-bar glyph
     // fallback renders blank cells out of the box. Install the Meslo Nerd
     // Font Mono into ~/.termux/font.ttf in the background (no-op on every
