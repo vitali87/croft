@@ -41114,8 +41114,9 @@ impl App {
     }
 
     /// Enter in the focused box: append the reply to the box (the running
-    /// conversation stays visible) and send it to the navigator as a
-    /// comment-only turn carrying the note's context.
+    /// conversation stays visible) and send it to the navigator as a reply
+    /// turn carrying the note's context, which may edit when it asks for a
+    /// change (#1965).
     fn submit_comment_reply(&mut self) {
         let Some(focus) = self.editor.comment_focus.clone() else {
             return;
