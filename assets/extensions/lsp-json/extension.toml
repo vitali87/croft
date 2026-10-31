@@ -55,3 +55,6 @@ args = ["--stdio"]
 languages = ["json", "jsonc"]
 priority = 0
 provision = { kind = "npm", package = "@t1ckbase/vscode-langservers-extracted", version = "2.0.1", bin = "vscode-json-language-server" }
+# The server only offers Format Document when asked to, as VS Code's own
+# extension does (#1083).
+initialization_options = { provideFormatter = true }
