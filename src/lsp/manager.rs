@@ -665,7 +665,7 @@ pub enum DiagnosticSeverity {
 /// converts them to character columns against its own buffer, exactly as it
 /// does for semantic tokens. A diagnostic can span several lines
 /// (`start_line..=end_line`).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct Diagnostic {
     pub start_line: u32,
     pub start_char: u32,
@@ -680,6 +680,35 @@ pub struct Diagnostic {
     /// The server that published it and its diagnostic as sent, `None` for
     /// one croft made itself.
     pub origin: Option<std::sync::Arc<DiagnosticOrigin>>,
+}
+
+/// Two diagnostics are the same finding when everything croft shows of them
+/// matches. `origin` is left out: a server that reports one finding both
+/// pushed and pulled may give each copy different `data`, and the copies
+/// must still collapse into one row (`diagnostics_by_source`).
+impl PartialEq for Diagnostic {
+    fn eq(&self, other: &Self) -> bool {
+        let Diagnostic {
+            start_line,
+            start_char,
+            end_line,
+            end_char,
+            severity,
+            message,
+            tags,
+            code,
+            origin: _,
+        } = self;
+        (start_line, start_char, end_line, end_char)
+            == (
+                &other.start_line,
+                &other.start_char,
+                &other.end_line,
+                &other.end_char,
+            )
+            && (severity, message, tags, code)
+                == (&other.severity, &other.message, &other.tags, &other.code)
+    }
 }
 
 /// A diagnostic exactly as a language server published it. A code-action

@@ -4287,6 +4287,34 @@ fn a_pull_answer_keeps_what_the_same_server_pushed() {
 
 /// #1102: each kind of report still clears its own findings, and a path
 /// leaves the store once neither has any.
+/// #1030: a finding pushed and pulled by one server is one row, even when
+/// the server gave each copy different `data`, which croft now keeps.
+#[test]
+fn a_pushed_and_pulled_finding_with_different_data_is_one_row() {
+    use crate::lsp::manager::DiagnosticsUpdate;
+    let mut store = std::collections::HashMap::new();
+    let path = PathBuf::from("/w/names.rs");
+    let copy = |data: u32| {
+        crate::lsp::client::convert_diagnostic(
+            "rust-analyzer",
+            &lsp_types::Diagnostic {
+                message: "unused variable".into(),
+                data: Some(serde_json::json!(data)),
+                ..Default::default()
+            },
+        )
+    };
+    let update = |pulled, diagnostics| DiagnosticsUpdate {
+        path: path.clone(),
+        server: "rust-analyzer".into(),
+        diagnostics,
+        pulled,
+    };
+    store_diagnostics_update(&mut store, update(false, vec![copy(1)]));
+    store_diagnostics_update(&mut store, update(true, vec![copy(2)]));
+    assert_eq!(diagnostics_by_source(&store[&path]).count(), 1);
+}
+
 #[test]
 fn an_empty_pull_or_push_still_clears_its_own_findings() {
     use crate::lsp::manager::{DiagnosticSeverity, DiagnosticsUpdate};
