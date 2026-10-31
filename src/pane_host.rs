@@ -231,12 +231,12 @@ impl Pane {
             return;
         }
         // The model first, so output drawn for the new size lands on a
-        // model of that size.
-        self.model
-            .lock()
-            .unwrap()
-            .term
-            .resize(TermSize::new(cols as usize, rows as usize));
+        // model of that size. Resized as the pane's own model is, so a
+        // reattach redraws the rows it shows.
+        crate::widgets::terminal::resize_term(
+            &mut self.model.lock().unwrap().term,
+            TermSize::new(cols as usize, rows as usize),
+        );
         let _ = self.master.lock().unwrap().resize(PtySize {
             rows,
             cols,
