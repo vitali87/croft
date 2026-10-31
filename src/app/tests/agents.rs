@@ -1455,6 +1455,7 @@ fn fix_with_navigator_lands_on_the_diagnostic_and_refuses_without_a_seat() {
             message: String::from("unused import: `std::io`"),
             tags: Default::default(),
             code: None,
+            origin: None,
         }],
     );
     app.lsp_diagnostics.insert(file.clone(), by_server);
@@ -3001,6 +3002,7 @@ fn a_proposals_diagnostics_show_in_the_popup_not_the_buffer() {
             message: "Undefined name `nope_undefined`".into(),
             tags: Default::default(),
             code: None,
+            origin: None,
         }],
         pulled: false,
     }]);

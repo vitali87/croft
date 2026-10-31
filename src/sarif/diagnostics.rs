@@ -98,6 +98,7 @@ pub fn diagnostic_for(
             message,
             tags: Default::default(),
             code: None,
+            origin: None,
         },
     ))
 }

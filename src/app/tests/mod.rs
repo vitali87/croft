@@ -1010,6 +1010,7 @@ fn diag(
         message: String::from("test"),
         tags: Default::default(),
         code: None,
+        origin: None,
     }
 }
 

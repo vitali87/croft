@@ -183,6 +183,7 @@ fn hovering_a_diagnostic_on_punctuation_shows_its_message_synchronously() {
             message: String::from("unexpected token"),
             tags: Default::default(),
             code: None,
+            origin: None,
         }],
     );
     // text_x = x(0) + gutter(2) + 1 = 3, so cell col 4 is char 1 (the `.`).
@@ -4312,6 +4313,34 @@ fn an_empty_pull_or_push_still_clears_its_own_findings() {
     assert!(store.is_empty(), "{store:?}");
 }
 
+/// #1030: a finding pushed and pulled by one server is one row, even when
+/// the server gave each copy different `data`, which croft now keeps.
+#[test]
+fn a_pushed_and_pulled_finding_with_different_data_is_one_row() {
+    use crate::lsp::manager::DiagnosticsUpdate;
+    let mut store = std::collections::HashMap::new();
+    let path = PathBuf::from("/w/names.rs");
+    let copy = |data: u32| {
+        crate::lsp::client::convert_diagnostic(
+            "rust-analyzer",
+            &lsp_types::Diagnostic {
+                message: "unused variable".into(),
+                data: Some(serde_json::json!(data)),
+                ..Default::default()
+            },
+        )
+    };
+    let update = |pulled, diagnostics| DiagnosticsUpdate {
+        path: path.clone(),
+        server: "rust-analyzer".into(),
+        diagnostics,
+        pulled,
+    };
+    store_diagnostics_update(&mut store, update(false, vec![copy(1)]));
+    store_diagnostics_update(&mut store, update(true, vec![copy(2)]));
+    assert_eq!(diagnostics_by_source(&store[&path]).count(), 1);
+}
+
 /// #1102: a server that pushes a finding and also returns it to a pull
 /// lists it once, under the server's own name.
 #[test]
@@ -4791,6 +4820,7 @@ fn diag_on_line(line: u32, message: &str) -> crate::lsp::manager::Diagnostic {
         message: String::from(message),
         tags: Default::default(),
         code: None,
+        origin: None,
     }
 }
 
