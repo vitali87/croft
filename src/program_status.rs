@@ -164,20 +164,30 @@ fn id_ok(id: &[u8]) -> Option<&str> {
 /// One pane's records, one per id, as the reports left them.
 #[derive(Debug, Default)]
 pub struct Records {
-    /// `(id, state, the report count when it was last set)`.
+    /// `(id, state, the event count when it was last set)`.
     entries: Vec<(String, State, u64)>,
-    /// Reports taken so far, clears included.
+    /// Events taken so far, in stream order: reports, probes, shell
+    /// prompts and resets.
     seq: u64,
+    /// The event count at the last report.
+    reported: u64,
+    /// The event count at the last sign that a new program has the pane:
+    /// a probe (a program asks as it starts), a shell prompt (the last
+    /// one has ended) or a full reset. Reports before it are not the
+    /// current program's.
+    fresh: u64,
 }
 
 impl Records {
-    /// Take one report. A query changes nothing.
+    /// Take one report. A query changes no record; it marks a program
+    /// starting.
     pub fn apply(&mut self, report: Report) {
+        self.seq += 1;
+        let seq = self.seq;
         match report {
-            Report::Query => {}
+            Report::Query => self.fresh = seq,
             Report::Set { id, state } => {
-                self.seq += 1;
-                let seq = self.seq;
+                self.reported = seq;
                 if let Some(e) = self.entries.iter_mut().find(|e| e.0 == id) {
                     *e = (id, state, seq);
                     return;
@@ -190,7 +200,7 @@ impl Records {
                 self.entries.push((id, state, seq));
             }
             Report::Clear { id } => {
-                self.seq += 1;
+                self.reported = seq;
                 match id {
                     None => self.entries.clear(),
                     Some(id) => self.entries.retain(|(e, ..)| {
@@ -209,29 +219,39 @@ impl Records {
     pub fn shell_prompt(&mut self) {
         self.entries
             .retain(|(_, s, _)| matches!(s, State::Done | State::Error));
+        self.seq += 1;
+        self.fresh = self.seq;
     }
 
     /// A full reset (RIS) removes every record.
     pub fn reset(&mut self) {
         self.entries.clear();
+        self.seq += 1;
+        self.fresh = self.seq;
     }
 
-    /// How many reports have been taken: a mark to read
+    /// How many events have been taken: a mark to read
     /// [`Self::reported_since`] from.
     pub fn seq(&self) -> u64 {
         self.seq
     }
 
-    /// The program's own status from the reports after `mark`, the most
-    /// pressing state among the records they set. `None` when it has said
-    /// nothing since, so its status has to come from somewhere else. One
-    /// that reported and then cleared its records (or a prompt dropped
-    /// them) is at rest: [`State::Idle`].
+    /// Whether a new program has had the pane since `mark`.
+    pub fn fresh_since(&self, mark: u64) -> bool {
+        self.fresh > mark
+    }
+
+    /// The current program's own status from its reports after `mark`, the
+    /// most pressing state among the records they set. `None` when it has
+    /// said nothing since, so its status has to come from somewhere else.
+    /// One that reported and then cleared its records is at rest:
+    /// [`State::Idle`].
     pub fn reported_since(&self, mark: u64) -> Option<State> {
-        (self.seq > mark).then(|| {
+        let from = mark.max(self.fresh);
+        (self.reported > from).then(|| {
             self.entries
                 .iter()
-                .filter(|(_, _, seq)| *seq > mark)
+                .filter(|(_, _, seq)| *seq > from)
                 .map(|(_, s, _)| *s)
                 .max_by_key(|s| s.urgency())
                 .unwrap_or(State::Idle)
@@ -349,8 +369,6 @@ mod tests {
         r.apply(Report::Clear { id: None });
         assert!(r.entries.is_empty());
         assert_eq!(r.reported_since(0), Some(State::Idle), "said, then cleared");
-        r.apply(Report::Query);
-        assert_eq!(r.seq(), 7, "a query is not a report");
     }
 
     #[test]
@@ -390,6 +408,35 @@ mod tests {
             state: State::Working,
         });
         assert_eq!(r.reported_since(mark), Some(State::Working));
+    }
+
+    /// A probe, a shell prompt and a reset each mean a new program has the
+    /// pane: what came before is not its own, whatever the mark says.
+    #[test]
+    fn a_probe_a_prompt_or_a_reset_starts_a_new_program() {
+        let done = Report::Set {
+            id: "sub".into(),
+            state: State::Done,
+        };
+        let starts: [fn(&mut Records); 3] = [
+            |r| r.apply(Report::Query),
+            Records::shell_prompt,
+            Records::reset,
+        ];
+        for start in starts {
+            let mut r = Records::default();
+            r.apply(done.clone());
+            let before = r.seq();
+            start(&mut r);
+            assert!(r.fresh_since(before));
+            assert!(!r.fresh_since(r.seq()));
+            assert_eq!(r.reported_since(0), None, "the old program's done");
+            r.apply(Report::Set {
+                id: String::new(),
+                state: State::Idle,
+            });
+            assert_eq!(r.reported_since(0), Some(State::Idle));
+        }
     }
 
     #[test]

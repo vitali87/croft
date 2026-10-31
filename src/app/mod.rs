@@ -53864,14 +53864,12 @@ impl App {
                 .and_then(|pid| by_pid.get(&pid))
                 .and_then(|name| self.agents.classify(name));
             let prev = t.agent().cloned();
-            // An agent leaving takes its OSC 7501 reports with it, so the
-            // next one in the pane is not judged by them.
-            if prev
-                .as_ref()
-                .is_some_and(|p| kind.is_none_or(|k| k.name != p.name))
-            {
-                t.forget_reported_status();
-            }
+            // Only the seated agent's own OSC 7501 reports judge it: not a
+            // departed agent's, nor another program's.
+            t.sample_reporter(
+                prev.as_ref().map(|p| p.name.as_str()),
+                kind.map(|k| k.name.as_str()),
+            );
             let next = kind.map(|kind| crate::agents::AgentLane {
                 name: kind.name.clone(),
                 // The agent's own report when it gave one; the screen only
