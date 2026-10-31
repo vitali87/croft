@@ -730,6 +730,8 @@ iTerm2-style terminal triggers read from `~/.config/croft/triggers.json` — tol
 
 **Distribution to panes.** Panes get the set via `set_triggers`, a ptr-eq no-op re-pushed every drain tick, so panes are covered wherever they were created; the inner Arc swaps on config reload.
 
+**The built-in secret rules are a flag, compiled once.** `with_builtin_redactions` only turns them on; the rules live in one process-wide `BUILTIN_REDACTIONS`, which `app::run` compiles on a thread of its own at launch (it was a fifth of the work before the first frame). `redact_spans` reads them only for a row with text, since every built-in shape carries text, so a blank pane never waits for the compile, and a row with text that arrives first waits only for the rest of it.
+
 ### terminal_session.rs
 
 Terminal session restore. The panel's layout — pane order, per-pane cwd and manual name, active index — persists per workspace root in `~/.config/croft/terminal_sessions.json`.
@@ -881,6 +883,8 @@ Tracks agent lanes: which panes are running a coding agent, and whether that age
 **How the state is judged.** The status comes from the pane's last-output stamp and its last visible rows, matched against the agent's prompt patterns. An agent in the foreground never emits OSC 133 marks, so there is no shell-integration signal to read instead.
 
 **What the UI shows.** The pill wears `◆ claude ◐`, and the status bar counts seated agents with a click that reveals the waiting pane. `AgentEvent::{Seated, Working, Waiting, Gone}` are queued for the tick, with `Waiting` fired once per prompt.
+
+**The built-in prompt regexes compile once, off the startup path.** `Prompts` holds an agent's patterns and compiles them the first time a screen is read for that agent; every copy of the built-in table shares the one compile, which `app::run` starts on a thread of its own at launch (it was a sixth of the work before the first frame). Rows from `agents.json` compile when they load, so a broken pattern is still counted.
 
 ### ansi_text.rs
 
