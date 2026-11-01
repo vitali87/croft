@@ -83,15 +83,33 @@ pub const MAX_DOC_LISTING_BYTES: u64 = crate::archive::ZIP_LIST_CAP;
 /// past every viewer to hex with nothing said, which is the silent dump
 /// #504 added `route_note` to prevent.
 pub fn is_past_listing_cap(path: &Path) -> bool {
-    extension_is_doc(
-        path.extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or_default(),
-    ) && std::fs::metadata(path).is_ok_and(|m| m.len() > MAX_DOC_LISTING_BYTES)
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default();
+    // The cap is the one the route reading these bytes applies, and the bytes
+    // pick the route, not the name: a Word 97 compound file is no zip, while
+    // a docx named `.doc` is one (#1979).
+    let cap = if is_word97(path) {
+        MAX_DOC_BYTES
+    } else {
+        MAX_DOC_LISTING_BYTES
+    };
+    extension_is_doc(ext) && std::fs::metadata(path).is_ok_and(|m| m.len() > cap)
+}
+
+/// Whether `path` is a compound file, the container of a Word 97-2003
+/// `.doc`, which [`crate::word97`] reads instead of the zip walker.
+fn is_word97(path: &Path) -> bool {
+    let mut head = [0u8; 8];
+    std::fs::File::open(path)
+        .and_then(|mut f| f.read_exact(&mut head))
+        .is_ok()
+        && crate::word97::is_compound_file(&head)
 }
 
 pub fn extension_is_doc(ext: &str) -> bool {
-    matches!(ext.to_ascii_lowercase().as_str(), "docx" | "odt")
+    matches!(ext.to_ascii_lowercase().as_str(), "docx" | "odt" | "doc")
 }
 
 /// Escape markdown metacharacters in document text (#200 review): the
@@ -100,15 +118,20 @@ pub fn extension_is_doc(ext: &str) -> bool {
 pub(crate) fn md_escape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
-        if matches!(
-            c,
-            '\\' | '`' | '*' | '_' | '#' | '|' | '[' | ']' | '<' | '>' | '~'
-        ) {
+        if is_md_meta(c) {
             out.push('\\');
         }
         out.push(c);
     }
     out
+}
+
+/// Whether `c` is markdown structure, which [`md_escape`] escapes.
+pub(crate) fn is_md_meta(c: char) -> bool {
+    matches!(
+        c,
+        '\\' | '`' | '*' | '_' | '#' | '|' | '[' | ']' | '<' | '>' | '~'
+    )
 }
 
 fn read_member(z: &mut zip::ZipArchive<std::fs::File>, name: &str) -> Option<String> {
@@ -153,8 +176,14 @@ fn extract_image(
 
 /// Convert the document into markdown text plus the scratch dir images
 /// resolve against. `None` when the file is not a recognisable
-/// docx/odt.
+/// docx/odt/doc.
 pub fn to_markdown(path: &Path, scratch: &Path) -> Option<String> {
+    // A Word 97-2003 `.doc` is a compound file, read by its own walker
+    // (#1979). Decided by the bytes, not the name: a `.doc` that is really
+    // a docx goes on to the zip route below.
+    if is_word97(path) {
+        return crate::word97::to_markdown(path);
+    }
     let meta = std::fs::metadata(path).ok()?;
     // Before the open, not after: the constructor below is where the
     // per-member central-directory cost is paid (#506).
@@ -239,10 +268,20 @@ fn repeat_last<T: Clone>(items: &mut Vec<T>, n: usize) {
     }
 }
 
+/// The most cells a previewed table is written with, rows times columns.
+///
+/// Every row is padded to the widest one, so the cells written are not the
+/// cells the document holds: one wide row and many empty ones multiply. A
+/// real table sits far below this; a crafted one of a few megabytes could
+/// otherwise ask for trillions of cells (#1979 review).
+pub(crate) const MAX_TABLE_CELLS: usize = 100_000;
+
 /// Write `rows` as a pipe table, header first. Trailing columns and rows
 /// with nothing in them are dropped, so padding never widens the table.
-fn push_table(md: &mut String, mut rows: Vec<Vec<String>>) {
-    let cols = rows
+/// Past [`MAX_TABLE_CELLS`], or when the caller already dropped some of the
+/// table (`cut`), the rest is left out and a note under the table says so.
+pub(crate) fn push_table(md: &mut String, mut rows: Vec<Vec<String>>, mut cut: bool) {
+    let mut cols = rows
         .iter()
         .filter_map(|r| r.iter().rposition(|c| !c.is_empty()))
         .max()
@@ -252,6 +291,15 @@ fn push_table(md: &mut String, mut rows: Vec<Vec<String>>) {
     }
     if cols == 0 || rows.is_empty() {
         return;
+    }
+    if cols > MAX_TABLE_CELLS {
+        cols = MAX_TABLE_CELLS;
+        cut = true;
+    }
+    let max_rows = MAX_TABLE_CELLS / cols;
+    if rows.len() > max_rows {
+        rows.truncate(max_rows);
+        cut = true;
     }
     for (i, row) in rows.iter().enumerate() {
         md.push('|');
@@ -269,6 +317,9 @@ fn push_table(md: &mut String, mut rows: Vec<Vec<String>>) {
         }
     }
     md.push('\n');
+    if cut {
+        md.push_str("*The rest of this table is too large to preview.*\n\n");
+    }
 }
 
 fn docx_to_md(
@@ -379,7 +430,7 @@ fn docx_to_md(
                 }
                 b"tbl" => {
                     if let Some(rows) = table.take() {
-                        push_table(&mut md, rows);
+                        push_table(&mut md, rows, false);
                     }
                 }
                 _ => {}
@@ -471,7 +522,7 @@ fn odt_to_md(xml: &str, z: &mut zip::ZipArchive<std::fs::File>, scratch: &Path) 
             Event::End(e) => match e.local_name().as_ref() {
                 b"table" => {
                     if let Some(rows) = table.take() {
-                        push_table(&mut md, rows);
+                        push_table(&mut md, rows, false);
                     }
                 }
                 b"table-row" => {
@@ -546,6 +597,29 @@ fn odt_to_md(xml: &str, z: &mut zip::ZipArchive<std::fs::File>, scratch: &Path) 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #1979 review: one wide row and many empty ones would be padded into
+    /// rows times columns cells. The table stops at the cell budget and says
+    /// so, rather than growing with that product.
+    #[test]
+    fn a_table_past_the_cell_budget_is_cut_with_a_note() {
+        let wide = vec![String::from("x"); 2_000];
+        let mut rows = vec![wide];
+        rows.extend(std::iter::repeat_n(vec![String::from("y")], 5_000));
+        let mut md = String::new();
+        push_table(&mut md, rows, false);
+        let written = md.lines().filter(|l| l.starts_with('|')).count();
+        assert_eq!(
+            written,
+            MAX_TABLE_CELLS / 2_000 + 1,
+            "rows plus the --- rule"
+        );
+        assert!(md.ends_with("*The rest of this table is too large to preview.*\n\n"));
+
+        let mut small = String::new();
+        push_table(&mut small, vec![vec!["a".into(), "b".into()]], false);
+        assert_eq!(small, "|a|b|\n|---|---|\n\n", "a small table has no note");
+    }
     use std::io::Write as _;
 
     fn docx_fixture(p: &Path) {

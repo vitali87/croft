@@ -238,6 +238,10 @@ tar = "0.4"
 # word/document.xml / content.xml paragraph runs. Already in the tree
 # transitively (calamine, umya-spreadsheet), so no new lock version.
 quick-xml = "0.39"
+# OLE compound files for the Word 97-2003 `.doc` preview (#1979): a `.doc`
+# keeps its text in the WordDocument and table streams of one. Already in
+# the tree through calamine's `.xls` reader, so no new lock version.
+cfb = "0.14"
 # Read-only SQLite browser (#182): tables page through the sheet grid.
 # `bundled` compiles sqlite3 in, so no system dependency on any target;
 # opened with SQLITE_OPEN_READONLY so a live application database is
