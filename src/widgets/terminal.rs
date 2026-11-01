@@ -5650,13 +5650,17 @@ pub fn encode_mouse_report(
 
 /// What croft types ahead of a command it puts into a pane's shell, so a
 /// half-typed command at the prompt cannot concatenate with it: Ctrl-E to
-/// the end of the line, a space, then Ctrl-U to kill the line backward. The
-/// space keeps the line from being empty when Ctrl-U runs: bash's line
+/// the end of the line, a letter, then Ctrl-U to kill the line backward.
+/// The letter keeps the line from being empty when Ctrl-U runs: bash's line
 /// editor rings the bell for Ctrl-U on an empty line, and croft reported
-/// that bell over the "Running …" status of the task it had just typed.
-/// Before the shell's line editor is up, the terminal's own line discipline
-/// takes Ctrl-U as its kill character, to the same effect.
-pub const CLEAR_TYPED_LINE: &str = "\x05 \x15";
+/// that bell over the "Running …" status of the task it had just typed. A
+/// letter, not a space: a space expands a fish abbreviation, and one set up
+/// with `--set-cursor` leaves the cursor before its own suffix, which
+/// Ctrl-U then keeps and croft's command runs into. No shell expands
+/// anything on a letter. Before the shell's line editor is up, the
+/// terminal's own line discipline takes Ctrl-U as its kill character, to
+/// the same effect.
+pub const CLEAR_TYPED_LINE: &str = "\x05x\x15";
 
 /// Build the byte sequence that retargets a POSIX shell's working
 /// directory to `path`. Prefixed with [`CLEAR_TYPED_LINE`] so a
@@ -7552,8 +7556,8 @@ mod tests {
         let bytes = format_cd_command(std::path::Path::new("/tmp/foo"));
         assert_eq!(
             bytes,
-            b"\x05 \x15cd '/tmp/foo'\n".to_vec(),
-            "Ctrl-E, space, Ctrl-U must precede the cd so a half-typed prompt line is cleared first, then the path is single-quoted and newline-terminated to fire immediately"
+            b"\x05x\x15cd '/tmp/foo'\n".to_vec(),
+            "Ctrl-E, a letter, Ctrl-U must precede the cd so a half-typed prompt line is cleared first, then the path is single-quoted and newline-terminated to fire immediately"
         );
     }
 
@@ -7562,7 +7566,7 @@ mod tests {
         let bytes = format_cd_command(std::path::Path::new("/tmp/it's a dir"));
         assert_eq!(
             bytes,
-            b"\x05 \x15cd '/tmp/it'\\''s a dir'\n".to_vec(),
+            b"\x05x\x15cd '/tmp/it'\\''s a dir'\n".to_vec(),
             "embedded ' must be escaped as '\\'' so the cd does not break out of single quotes when the path contains an apostrophe (POSIX-standard quoting)"
         );
     }
@@ -7572,7 +7576,7 @@ mod tests {
         let bytes = format_cd_command(std::path::Path::new("/tmp/a b/c d"));
         assert_eq!(
             bytes,
-            b"\x05 \x15cd '/tmp/a b/c d'\n".to_vec(),
+            b"\x05x\x15cd '/tmp/a b/c d'\n".to_vec(),
             "single-quoting must preserve spaces verbatim so cd lands at the right directory"
         );
     }
