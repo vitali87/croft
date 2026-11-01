@@ -83,15 +83,21 @@ pub const MAX_DOC_LISTING_BYTES: u64 = crate::archive::ZIP_LIST_CAP;
 /// past every viewer to hex with nothing said, which is the silent dump
 /// #504 added `route_note` to prevent.
 pub fn is_past_listing_cap(path: &Path) -> bool {
-    extension_is_doc(
-        path.extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or_default(),
-    ) && std::fs::metadata(path).is_ok_and(|m| m.len() > MAX_DOC_LISTING_BYTES)
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or_default();
+    // A `.doc` is no zip, so the listing cap is not its limit (#1979).
+    let cap = if ext.eq_ignore_ascii_case("doc") {
+        MAX_DOC_BYTES
+    } else {
+        MAX_DOC_LISTING_BYTES
+    };
+    extension_is_doc(ext) && std::fs::metadata(path).is_ok_and(|m| m.len() > cap)
 }
 
 pub fn extension_is_doc(ext: &str) -> bool {
-    matches!(ext.to_ascii_lowercase().as_str(), "docx" | "odt")
+    matches!(ext.to_ascii_lowercase().as_str(), "docx" | "odt" | "doc")
 }
 
 /// Escape markdown metacharacters in document text (#200 review): the
@@ -100,15 +106,20 @@ pub fn extension_is_doc(ext: &str) -> bool {
 pub(crate) fn md_escape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
-        if matches!(
-            c,
-            '\\' | '`' | '*' | '_' | '#' | '|' | '[' | ']' | '<' | '>' | '~'
-        ) {
+        if is_md_meta(c) {
             out.push('\\');
         }
         out.push(c);
     }
     out
+}
+
+/// Whether `c` is markdown structure, which [`md_escape`] escapes.
+pub(crate) fn is_md_meta(c: char) -> bool {
+    matches!(
+        c,
+        '\\' | '`' | '*' | '_' | '#' | '|' | '[' | ']' | '<' | '>' | '~'
+    )
 }
 
 fn read_member(z: &mut zip::ZipArchive<std::fs::File>, name: &str) -> Option<String> {
@@ -153,8 +164,19 @@ fn extract_image(
 
 /// Convert the document into markdown text plus the scratch dir images
 /// resolve against. `None` when the file is not a recognisable
-/// docx/odt.
+/// docx/odt/doc.
 pub fn to_markdown(path: &Path, scratch: &Path) -> Option<String> {
+    // A Word 97-2003 `.doc` is a compound file, read by its own walker
+    // (#1979). Decided by the bytes, not the name: a `.doc` that is really
+    // a docx goes on to the zip route below.
+    let mut head = [0u8; 8];
+    if std::fs::File::open(path)
+        .and_then(|mut f| f.read_exact(&mut head))
+        .is_ok()
+        && crate::word97::is_compound_file(&head)
+    {
+        return crate::word97::to_markdown(path);
+    }
     let meta = std::fs::metadata(path).ok()?;
     // Before the open, not after: the constructor below is where the
     // per-member central-directory cost is paid (#506).
@@ -241,7 +263,7 @@ fn repeat_last<T: Clone>(items: &mut Vec<T>, n: usize) {
 
 /// Write `rows` as a pipe table, header first. Trailing columns and rows
 /// with nothing in them are dropped, so padding never widens the table.
-fn push_table(md: &mut String, mut rows: Vec<Vec<String>>) {
+pub(crate) fn push_table(md: &mut String, mut rows: Vec<Vec<String>>) {
     let cols = rows
         .iter()
         .filter_map(|r| r.iter().rposition(|c| !c.is_empty()))

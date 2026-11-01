@@ -625,6 +625,7 @@ dependencies = [
  "async-lsp",
  "base64",
  "calamine",
+ "cfb",
  "clap",
  "cola",
  "color_quant",
