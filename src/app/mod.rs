@@ -21604,6 +21604,18 @@ impl App {
     /// non-zero problem count rides the PROBLEMS label as a badge.
     fn paint_panel_tabs(&mut self, frame: &mut ratatui::Frame, strip: Rect) {
         use ratatui::widgets::Block;
+        // Every target on this row is cleared before anything can return: a
+        // row that is not painted must not keep the last frame's, whose cells
+        // now belong to whatever is drawn there (the status bar, in a one-row
+        // window).
+        self.problems_tab_rect = Rect::default();
+        self.output_tab_rect = Rect::default();
+        self.ports_tab_rect = Rect::default();
+        self.captures_tab_rect = Rect::default();
+        self.terminal_tab_rect = Rect::default();
+        self.problems_badge_cell = None;
+        self.panel_maximize_button = Rect::default();
+        self.terminal_focus_button = Rect::default();
         // The labels go through `set_stringn`, which indexes the buffer
         // directly, so a strip with no row inside the frame paints nothing.
         let strip = strip.intersection(frame.area());
@@ -21630,16 +21642,10 @@ impl App {
         let badge_fg = self.theme.ui(Color::Rgb(0x1a, 0x12, 0x0a));
         let active = self.bottom_panel_tab;
 
-        self.problems_tab_rect = Rect::default();
-        self.output_tab_rect = Rect::default();
-        self.ports_tab_rect = Rect::default();
-        self.captures_tab_rect = Rect::default();
-        self.terminal_tab_rect = Rect::default();
         // In images mode the count rides as an orange circle (the same raster
         // badge as the activity bar), emitted post-frame; recompute its anchor
         // each paint. Glyph-fallback terminals keep the powerline-cap pill.
         let images = self.overlays.activity.has_images();
-        self.problems_badge_cell = None;
 
         // VS Code panel-group order: PROBLEMS, OUTPUT, TERMINAL, PORTS. PROBLEMS
         // alone carries the orange count badge after its label.
@@ -21771,8 +21777,6 @@ impl App {
         strip: Rect,
         tabs_end: u16,
     ) {
-        self.panel_maximize_button = Rect::default();
-        self.terminal_focus_button = Rect::default();
         let (theme, pointer) = (self.theme, self.pointer_cell);
         // One blank column at the edge, as the pane header buttons keep.
         let mut x = strip.right().saturating_sub(1);
@@ -22832,14 +22836,17 @@ impl App {
             // The panel group's tab strip (PROBLEMS / TERMINAL) takes the top
             // row; the active tab's view fills the rest. Mirrors VS Code's
             // bottom-panel tab bar.
-            // `min(1)`: at a one-row window the band is zero rows high just
-            // below the frame, and a one-row strip there writes outside the
-            // buffer (#1133).
+            // At a one-row window the band is zero rows high just below the
+            // frame, and a one-row strip there writes outside the buffer
+            // (#1133). A panel of one row gives that row to its view below, so
+            // it has no tab row either: one painted there is drawn over, and
+            // its tabs and buttons would stay clickable under the panes'
+            // cells (#1980 review).
             let strip = Rect {
                 x: area.x,
                 y: area.y,
                 width: area.width,
-                height: area.height.min(1),
+                height: u16::from(area.height > 1),
             };
             let content = if area.height > 1 {
                 Rect {

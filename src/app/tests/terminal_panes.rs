@@ -686,6 +686,30 @@ fn the_focus_button_needs_two_terminals_and_the_terminal_tab() {
     assert_eq!(app.panel_maximize_button, Rect::default(), "hidden panel");
 }
 
+/// Negative (#1980 review): a window shrunk to one row gives the panel's one
+/// row to the terminals, so there is no tab row, and none of its click
+/// targets may stay behind. They sat under the panes' own header cells, where
+/// a click would silently restore the panel or toggle focus mode.
+#[test]
+fn a_one_row_window_keeps_no_panel_row_targets() {
+    let (_tmp, mut app, mut term) = app_with_terminal_panes(2);
+    app.toggle_terminal_maximize();
+    term.draw(|f| app.render(f)).unwrap();
+    assert!(app.panel_maximize_button.width > 0, "precondition");
+    assert!(app.terminal_focus_button.width > 0, "precondition");
+    assert!(app.terminal_tab_rect.width > 0, "precondition");
+
+    let mut one = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 1)).unwrap();
+    one.draw(|f| app.render(f)).unwrap();
+    assert!(
+        !painted(&one, Rect::new(0, 0, 160, 1)).contains("TERMINAL"),
+        "setup: no tab row is on screen"
+    );
+    assert_eq!(app.panel_maximize_button, Rect::default());
+    assert_eq!(app.terminal_focus_button, Rect::default());
+    assert_eq!(app.terminal_tab_rect, Rect::default());
+}
+
 /// Negative (#1980): on a panel too narrow for the tabs and the controls, the
 /// controls give way rather than painting over a tab, and clicking a tab
 /// still selects it.
