@@ -424,14 +424,14 @@ To edit a file, emit an edit fence directly in your text output:
 <<<END>>>
 
 Rules:
-- The header carries the file plus EXACTLY FOUR integers: START_ROW:START_COL-END_ROW:END_COL. Never omit the rows — for a single-line edit on line N the header reads <file>:N:C1-N:C2 (e.g. replacing columns 15..19 of line 0 of demo.txt is `<<<EDIT demo.txt:0:15-0:19>>>`, NOT `demo.txt:15:19`). A header without all four numbers is ignored as plain text and your edit does not happen.
+- The header carries the file plus EXACTLY FOUR integers: START_ROW:START_COL-END_ROW:END_COL. Never omit the rows — for a single-line edit on row N the header reads <file>:N:C1-N:C2 (e.g. replacing columns 15..19 of row 0 of demo.txt, your partner's gutter line 1, is `<<<EDIT demo.txt:0:15-0:19>>>`, NOT `demo.txt:15:19`). A header without all four numbers is ignored as plain text and your edit does not happen.
 - <file> is the workspace-relative path. Coordinates are 0-based CHARACTER positions (not bytes) into the file's CURRENT text: the range start..end (start inclusive, end exclusive) is deleted and the fence body replaces it. To insert without deleting, use a zero-width range (start == end).
 - Compute coordinates against the buffer text in the latest user message (the --- CURRENT BUFFER --- block) or from the mcp__croft-collab__collab_read tool. If you emit several fences in one reply, later fences must use coordinates that account for your earlier fences' changes.
 - The header and <<<END>>> each sit alone on their own line. The body between them is applied verbatim: real code only, no markdown fences, no commentary.
 - Everything outside a fence is commentary shown to your partner in the terminal; it is never applied to any buffer.
 - Start the fence as soon as you know the edit; stream the body naturally rather than planning silently.
 
-Example (replace lines 3-4 of src/lib.rs, where line 4 is 12 chars long):
+Example (replace rows 3-4 of src/lib.rs, gutter lines 4-5, where row 4 is 12 chars long):
 <<<EDIT src/lib.rs:3:0-4:12>>>
 fn renamed() -> u32 {
     41 + 1
@@ -445,7 +445,7 @@ To pin a remark to a specific line WITHOUT editing anything, emit a note fence:
 <<<END>>>
 
 Note rules:
-- The header carries the file plus EXACTLY ONE integer, the 0-based row the note speaks about (e.g. `<<<NOTE demo.txt:4>>>` pins a remark to line 4 of demo.txt). Your partner sees it attached to that line in their editor.
+- The header carries the file plus EXACTLY ONE integer, the 0-based row the note speaks about (e.g. `<<<NOTE demo.txt:4>>>` pins a remark to row 4 of demo.txt, gutter line 5). Your partner sees it attached to that line in their editor.
 - Notes never change any buffer. Use them for review remarks, questions, and change proposals.
 
 Some user messages number the buffer: each line arrives prefixed with `N|` where N is its 0-based row. The prefix is a label, not content — character columns still count from the first character AFTER the first `|`, and NOTE/EDIT rows use exactly those N values.
@@ -461,7 +461,7 @@ A participant can cancel your stream mid-edit; the streamed text is then reverte
 /// columns trip weaker models (the spike's under-covered range), so they are
 /// steered to the whole-line header form instead.
 const LOCAL_MODEL_PROMPT_SUFFIX: &str = r#"Local-model addendum:
-- PREFER the whole-line EDIT header form: <<<EDIT <file>:<start_row>-<end_row>>>> with exactly TWO integers. It replaces those entire lines — both rows 0-based, both INCLUSIVE — with the fence body, so you never count characters. Replacing line 1 whole is `<<<EDIT greet.py:1-1>>>`.
+- PREFER the whole-line EDIT header form: <<<EDIT <file>:<start_row>-<end_row>>>> with exactly TWO integers. It replaces those entire lines — both rows 0-based, both INCLUSIVE — with the fence body, so you never count characters. Replacing row 1 (gutter line 2) whole is `<<<EDIT greet.py:1-1>>>`.
 - Rewrite whole lines instead of splicing inside a line; use the four-integer form only when you must keep part of a line.
 - You have no tools: everything you need is in the message. Keep replies short — the fences plus at most a couple of commentary lines."#;
 
@@ -1897,7 +1897,7 @@ pub(crate) fn compose_reply_turn(
          --- YOUR NOTE ---\n{note_body}\n--- END NOTE ---\n\
          --- THEIR REPLY ---\n{reply}\n--- END REPLY ---\n\
          Answer with NOTE fences (anchor follow-ups to the lines you mean; \
-         re-anchoring to line {row} continues this box). This turn is \
+         a NOTE re-anchored to row {row} continues this box). This turn is \
          COMMENT-ONLY: any EDIT fence will be discarded by the host.\n\
          \n--- CURRENT BUFFER ({file}, each line prefixed with its 0-based \
          number and '|') ---\n{}\n--- END BUFFER ---",
@@ -4653,12 +4653,51 @@ mod tests {
             !reply.contains("line 4 (0-based)."),
             "bare 0-based row: {reply}"
         );
+        assert!(
+            reply.contains("a NOTE re-anchored to row 4 continues this box"),
+            "the re-anchor target is a row: {reply}"
+        );
+        assert!(
+            !reply.contains("re-anchoring to line 4"),
+            "the re-anchor row called a line: {reply}"
+        );
 
         // The prose rule the model follows when it writes a line number.
         assert!(
             PAIR_SYSTEM_PROMPT.contains("row N is line N+1"),
             "the system prompt teaches gutter numbers for prose"
         );
+    }
+
+    /// #1966: every numbered "line" the prompt shows is a gutter line. Fence
+    /// coordinates are rows, so an example such as "pins a remark to line 4"
+    /// for `<<<NOTE demo.txt:4>>>` cannot teach the model to quote the
+    /// 0-based row to its partner. The local prompt carries the shared one.
+    #[test]
+    fn system_prompt_numbers_lines_only_by_the_gutter() {
+        let prompt = system_prompt(&Provider::Local {
+            base_url: String::new(),
+        });
+        for text in prompt.lines() {
+            for (at, _) in text.match_indices("line") {
+                let after = &text[at + "line".len()..];
+                let after = after.strip_prefix('s').unwrap_or(after);
+                let numbered = after
+                    .strip_prefix(' ')
+                    .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()));
+                if numbered {
+                    assert!(
+                        text[..at].ends_with("gutter "),
+                        "a 0-based row called a line: {text}"
+                    );
+                }
+            }
+        }
+        // The examples still pair each row with its gutter line.
+        assert!(prompt.contains("row 0 of demo.txt, your partner's gutter line 1"));
+        assert!(prompt.contains("rows 3-4 of src/lib.rs, gutter lines 4-5"));
+        assert!(prompt.contains("row 4 of demo.txt, gutter line 5"));
+        assert!(prompt.contains("row 1 (gutter line 2)"));
     }
 
     /// The yield-turn composer: comment-only rule, the diff since the
