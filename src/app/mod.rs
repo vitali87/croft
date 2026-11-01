@@ -43432,7 +43432,7 @@ impl App {
             .as_ref()
             .and_then(crate::problem_matchers::from_tasks_json)
             .map(std::sync::Arc::new);
-        // Ctrl-E + Ctrl-U first: the idle shell's line editor may hold a
+        // The line cleared first: the idle shell's line editor may hold a
         // half-typed command that would otherwise concatenate and run
         // (same rule `format_cd_command` pins for the cd seed).
         let line = match self.task_command_line_in(&task, folder.clone()) {
@@ -43442,7 +43442,7 @@ impl App {
                 return None;
             }
         };
-        let command = format!("\x05\x15{line}\r");
+        let command = format!("{}{line}\r", crate::widgets::terminal::CLEAR_TYPED_LINE);
         self.last_task = Some(task.clone());
         // Reuse only a pane whose shell is standing exactly where this
         // task will run: after a re-root the old pane's label still
@@ -51935,9 +51935,13 @@ impl App {
     /// directory, else a fresh one there. The block is typed, not spawned,
     /// so the user sees it and shell history records it.
     fn run_block_in_pane(&mut self, block: PendingRunBlock) {
-        // Ctrl-E + Ctrl-U first, as tasks do: an idle shell's line editor
+        // The line cleared first, as tasks do: an idle shell's line editor
         // may hold a half-typed command.
-        let bytes = format!("\x05\x15{}", block.command);
+        let bytes = format!(
+            "{}{}",
+            crate::widgets::terminal::CLEAR_TYPED_LINE,
+            block.command
+        );
         // Same guard as `run_project_task`, and the SAME predicate rather
         // than a second copy: `README.md:1` is a likely name across two
         // repos opened in sequence, and a pane whose shell still sits in
@@ -78660,11 +78664,11 @@ fn lane_root_badge(
     }
 }
 
-/// What a lane pane's fresh shell is fed to start its agent (#348):
-/// Ctrl-E + Ctrl-U first, as `run_project_task` does, so a half-typed line
+/// What a lane pane's fresh shell is fed to start its agent (#348): the
+/// line cleared first, as `run_project_task` does, so a half-typed line
 /// cannot concatenate with the command.
 fn lane_launch_input(cmd: &str) -> String {
-    format!("\x05\x15{cmd}\r")
+    format!("{}{cmd}\r", crate::widgets::terminal::CLEAR_TYPED_LINE)
 }
 
 /// Whether `t` is the idle pane named `pane_name` whose shell is standing
