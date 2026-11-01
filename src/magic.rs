@@ -16,6 +16,8 @@ pub enum Magic {
     Bmp,
     /// A Windows icon (`.ico`, a favicon), which wraps PNG or BMP images.
     Ico,
+    /// A TIFF image (`.tif` / `.tiff`), in either byte order.
+    Tiff,
     Pdf,
     /// Any zip container — an Office document, a jar, or a plain
     /// archive; the caller decides what to try (xlsx via the sheet
@@ -33,7 +35,13 @@ impl Magic {
     pub fn is_image(self) -> bool {
         matches!(
             self,
-            Magic::Png | Magic::Jpeg | Magic::Gif | Magic::WebP | Magic::Bmp | Magic::Ico
+            Magic::Png
+                | Magic::Jpeg
+                | Magic::Gif
+                | Magic::WebP
+                | Magic::Bmp
+                | Magic::Ico
+                | Magic::Tiff
         )
     }
 }
@@ -56,6 +64,11 @@ pub fn sniff(bytes: &[u8]) -> Option<Magic> {
     }
     if bytes.starts_with(b"%PDF-") {
         return Some(Magic::Pdf);
+    }
+    // TIFF's byte-order mark and the magic 42 in that order (#1652). The
+    // BigTIFF form (43) is left out: the bundled decoder cannot read it.
+    if bytes.starts_with(b"II*\0") || bytes.starts_with(b"MM\0*") {
+        return Some(Magic::Tiff);
     }
     // Zip local-file header, plus the empty-archive and spanned markers.
     if bytes.starts_with(b"PK\x03\x04")
@@ -117,6 +130,12 @@ mod tests {
         assert_eq!(sniff(b"RIFF\x10\x00\x00\x00WEBPVP8 "), Some(Magic::WebP));
         assert_eq!(sniff(b"BM\x36\x00\x00\x00"), Some(Magic::Bmp));
         assert_eq!(sniff(b"%PDF-1.7\n%\xe2\xe3"), Some(Magic::Pdf));
+        assert_eq!(
+            sniff(b"II*\0\x08\0\0\0"),
+            Some(Magic::Tiff),
+            "little-endian"
+        );
+        assert_eq!(sniff(b"MM\0*\0\0\0\x08"), Some(Magic::Tiff), "big-endian");
         assert_eq!(sniff(b"PK\x03\x04\x14\x00"), Some(Magic::Zip));
         assert_eq!(sniff(b"PK\x05\x06\x00\x00"), Some(Magic::Zip), "empty zip");
         assert_eq!(sniff(b"\x1f\x8b\x08\x00"), Some(Magic::Gzip));
@@ -140,6 +159,8 @@ mod tests {
         assert_eq!(sniff(b"PK\x01\x02"), None, "central-dir record alone");
         assert_eq!(sniff(b"plain text here"), None);
         assert_eq!(sniff(b"SQLite format 4\0"), None);
+        assert_eq!(sniff(b"II+\0\x08\0"), None, "BigTIFF: no decoder for it");
+        assert_eq!(sniff(b"IM*\0"), None, "mixed byte-order mark");
         let mut not_tar = vec![0u8; 512];
         not_tar[257..262].copy_from_slice(b"nope!");
         assert_eq!(sniff(&not_tar), None);
@@ -195,6 +216,7 @@ mod tests {
             (Magic::WebP, true),
             (Magic::Bmp, true),
             (Magic::Ico, true),
+            (Magic::Tiff, true),
             (Magic::Pdf, false),
             (Magic::Zip, false),
             (Magic::Gzip, false),
