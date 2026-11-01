@@ -3156,8 +3156,8 @@ fn clicking_restore_button_returns_to_split_layout() {
     let backend = ratatui::backend::TestBackend::new(180, 40);
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|f| app.render(f)).unwrap();
-    let r = app.terminal_max_buttons[app.active_terminal];
-    assert!(r.width > 0, "the maximized pane paints a restore button");
+    let r = app.terminal_focus_button;
+    assert!(r.width > 0, "the panel row paints a restore button");
     app.handle_mouse(crossterm::event::MouseEvent {
         kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
         column: r.x + 1,

@@ -4518,10 +4518,17 @@ pub struct App {
     /// is open (closing the last one would leave the pane empty, which we
     /// explicitly forbid) or the pane is hidden.
     terminal_close_buttons: Vec<Rect>,
-    /// Hit-test rectangles of the maximize / restore (`⛶`) buttons - one per
-    /// pane, in lock-step with `terminals`. Hidden panes hold an empty rect
-    /// so a button's position still names its terminal index.
-    terminal_max_buttons: Vec<Rect>,
+    /// Hit rect of the focus-mode (`⛶`) button at the right of the panel's
+    /// tab row (#1980): it maximizes the ACTIVE terminal across the panel, or
+    /// restores the split. One button for the panel rather than one per pane,
+    /// because the mode rearranges every pane at once. Empty with fewer than
+    /// two terminals, off the TERMINAL tab, or while the panel is hidden.
+    terminal_focus_button: Rect,
+    /// Hit rect of the panel's maximize / restore button (#1980), the click
+    /// form of `Ctrl+Shift+J`: grow the panel over the editor, or give the
+    /// editor its rows back. Rightmost on the panel's tab row, on every tab,
+    /// since it sizes the whole panel. Empty while the panel is hidden.
+    panel_maximize_button: Rect,
     /// Hit-test rectangles of the maximize-mode rail rows down the panel's
     /// right edge, in lock-step with `terminals`. Clicking one hands that
     /// terminal the maximized pane. Empty outside maximize mode.
@@ -7077,7 +7084,8 @@ impl App {
             },
             scrollback_dir: crate::session_state::dirs_cache_croft().join("scrollback"),
             terminal_strip_rects: Vec::new(),
-            terminal_max_buttons: Vec::new(),
+            terminal_focus_button: Rect::default(),
+            panel_maximize_button: Rect::default(),
             terminal_rail_rects: Vec::new(),
             terminal_rail_area: Rect::default(),
             terminal_rail_scroll: 0,
@@ -17836,6 +17844,10 @@ impl App {
     }
 
     fn render_welcome(&mut self, frame: &mut ratatui::Frame, outer_area: Rect) {
+        // A welcome screen with no rows (the panel maximized over it) paints
+        // no layout icons, so it must not keep the last frame's: their cells
+        // now belong to the panel's tab row and its buttons (#1980).
+        self.layout_icon_areas = LayoutIconAreas::default();
         if outer_area.width == 0 || outer_area.height == 0 {
             return;
         }
@@ -21592,6 +21604,18 @@ impl App {
     /// non-zero problem count rides the PROBLEMS label as a badge.
     fn paint_panel_tabs(&mut self, frame: &mut ratatui::Frame, strip: Rect) {
         use ratatui::widgets::Block;
+        // Every target on this row is cleared before anything can return: a
+        // row that is not painted must not keep the last frame's, whose cells
+        // now belong to whatever is drawn there (the status bar, in a one-row
+        // window).
+        self.problems_tab_rect = Rect::default();
+        self.output_tab_rect = Rect::default();
+        self.ports_tab_rect = Rect::default();
+        self.captures_tab_rect = Rect::default();
+        self.terminal_tab_rect = Rect::default();
+        self.problems_badge_cell = None;
+        self.panel_maximize_button = Rect::default();
+        self.terminal_focus_button = Rect::default();
         // The labels go through `set_stringn`, which indexes the buffer
         // directly, so a strip with no row inside the frame paints nothing.
         let strip = strip.intersection(frame.area());
@@ -21618,16 +21642,10 @@ impl App {
         let badge_fg = self.theme.ui(Color::Rgb(0x1a, 0x12, 0x0a));
         let active = self.bottom_panel_tab;
 
-        self.problems_tab_rect = Rect::default();
-        self.output_tab_rect = Rect::default();
-        self.ports_tab_rect = Rect::default();
-        self.captures_tab_rect = Rect::default();
-        self.terminal_tab_rect = Rect::default();
         // In images mode the count rides as an orange circle (the same raster
         // badge as the activity bar), emitted post-frame; recompute its anchor
         // each paint. Glyph-fallback terminals keep the powerline-cap pill.
         let images = self.overlays.activity.has_images();
-        self.problems_badge_cell = None;
 
         // VS Code panel-group order: PROBLEMS, OUTPUT, TERMINAL, PORTS. PROBLEMS
         // alone carries the orange count badge after its label.
@@ -21744,6 +21762,52 @@ impl App {
                     }
                 }
             }
+        }
+        self.paint_panel_actions(buf, strip, placed.last().map_or(strip.x, |p| p.2.right()));
+    }
+
+    /// The panel's own controls at the right end of its tab row (#1980), right
+    /// to left: grow / restore the panel (`Ctrl+Shift+J`), then terminal focus
+    /// mode (`Cmd+K M`). Both act on every pane at once, so they sit above the
+    /// panes rather than in each pane's header. Neither is painted over a tab:
+    /// on a row too narrow for both, focus mode goes first.
+    fn paint_panel_actions(
+        &mut self,
+        buf: &mut ratatui::buffer::Buffer,
+        strip: Rect,
+        tabs_end: u16,
+    ) {
+        let (theme, pointer) = (self.theme, self.pointer_cell);
+        // One blank column at the edge, as the pane header buttons keep.
+        let mut x = strip.right().saturating_sub(1);
+        let mut place = |label: &str| -> Rect {
+            let w = label.chars().count() as u16;
+            // And one between the controls and the last tab.
+            let Some(bx) = x.checked_sub(w).filter(|bx| *bx > tabs_end) else {
+                return Rect::default();
+            };
+            x = bx;
+            let rect = Rect::new(bx, strip.y, w, 1);
+            let hovered = pointer.is_some_and(|(px, py)| rect_contains(rect, px, py));
+            let style = crate::widgets::header_pill::action_style(theme, hovered);
+            buf.set_string(bx, strip.y, label, style);
+            rect
+        };
+        self.panel_maximize_button = place(if self.terminal_maximized {
+            PANEL_RESTORE_LABEL
+        } else {
+            PANEL_MAXIMIZE_LABEL
+        });
+        // With one terminal there is nothing to focus against.
+        if self.bottom_panel_tab == BottomPanelTab::Terminal
+            && self.terminals.len() > 1
+            && !self.panel_maximize_button.is_empty()
+        {
+            self.terminal_focus_button = place(if self.terminal_pane_maximized {
+                TERMINAL_RESTORE_LABEL
+            } else {
+                TERMINAL_MAX_LABEL
+            });
         }
     }
 
@@ -22745,11 +22809,14 @@ impl App {
                 }
             }
             // Layout-control icons at the top-right of the editor tab strip.
+            // A collapsed editor (the panel maximized over it) has no strip,
+            // and its row is the panel's tab row: a one-row strip there would
+            // leave the icons' hit rects over the panel's buttons (#1980).
             let strip_row = Rect {
                 x: editor_area.x,
                 y: editor_area.y,
                 width: editor_area.width,
-                height: 1,
+                height: editor_area.height.min(1),
             };
             self.paint_layout_icons(frame, strip_row);
         }
@@ -22769,14 +22836,17 @@ impl App {
             // The panel group's tab strip (PROBLEMS / TERMINAL) takes the top
             // row; the active tab's view fills the rest. Mirrors VS Code's
             // bottom-panel tab bar.
-            // `min(1)`: at a one-row window the band is zero rows high just
-            // below the frame, and a one-row strip there writes outside the
-            // buffer (#1133).
+            // At a one-row window the band is zero rows high just below the
+            // frame, and a one-row strip there writes outside the buffer
+            // (#1133). A panel of one row gives that row to its view below, so
+            // it has no tab row either: one painted there is drawn over, and
+            // its tabs and buttons would stay clickable under the panes'
+            // cells (#1980 review).
             let strip = Rect {
                 x: area.x,
                 y: area.y,
                 width: area.width,
-                height: area.height.min(1),
+                height: u16::from(area.height > 1),
             };
             let content = if area.height > 1 {
                 Rect {
@@ -22884,7 +22954,6 @@ impl App {
                     self.terminal_add_buttons.clear();
                     self.terminal_profile_buttons.clear();
                     self.terminal_close_buttons.clear();
-                    self.terminal_max_buttons.clear();
                     self.terminal_label_rects.clear();
                     self.terminal_collapse_buttons.clear();
                     self.terminal_strip_rects.clear();
@@ -22895,7 +22964,6 @@ impl App {
                             self.terminal_add_buttons.push(Rect::default());
                             self.terminal_profile_buttons.push(Rect::default());
                             self.terminal_close_buttons.push(Rect::default());
-                            self.terminal_max_buttons.push(Rect::default());
                             self.terminal_label_rects.push(Rect::default());
                             self.terminal_collapse_buttons.push(Rect::default());
                             self.terminal_strip_rects.push(Rect::default());
@@ -22909,7 +22977,6 @@ impl App {
                             self.terminal_add_buttons.push(Rect::default());
                             self.terminal_profile_buttons.push(Rect::default());
                             self.terminal_close_buttons.push(Rect::default());
-                            self.terminal_max_buttons.push(Rect::default());
                             self.terminal_label_rects.push(Rect::default());
                             self.terminal_collapse_buttons.push(Rect::default());
                             self.terminal_strip_rects.push(strip);
@@ -22930,8 +22997,6 @@ impl App {
                             .push(buttons.profile.unwrap_or_default());
                         self.terminal_close_buttons
                             .push(buttons.close.unwrap_or_default());
-                        self.terminal_max_buttons
-                            .push(buttons.max.unwrap_or_default());
                         self.terminal_collapse_buttons
                             .push(buttons.collapse.unwrap_or_default());
                         // Auto/manual pane label at top-left, only with 2+ panes
@@ -23039,7 +23104,6 @@ impl App {
                     self.terminal_add_buttons.clear();
                     self.terminal_profile_buttons.clear();
                     self.terminal_close_buttons.clear();
-                    self.terminal_max_buttons.clear();
                     self.terminal_label_rects.clear();
                     self.terminal_collapse_buttons.clear();
                     self.terminal_strip_rects.clear();
@@ -23056,7 +23120,6 @@ impl App {
                     self.terminal_add_buttons.clear();
                     self.terminal_profile_buttons.clear();
                     self.terminal_close_buttons.clear();
-                    self.terminal_max_buttons.clear();
                     self.terminal_label_rects.clear();
                     self.terminal_collapse_buttons.clear();
                     self.terminal_strip_rects.clear();
@@ -23073,7 +23136,6 @@ impl App {
                     self.terminal_add_buttons.clear();
                     self.terminal_profile_buttons.clear();
                     self.terminal_close_buttons.clear();
-                    self.terminal_max_buttons.clear();
                     self.terminal_label_rects.clear();
                     self.terminal_collapse_buttons.clear();
                     self.terminal_strip_rects.clear();
@@ -23089,7 +23151,6 @@ impl App {
                     self.terminal_add_buttons.clear();
                     self.terminal_profile_buttons.clear();
                     self.terminal_close_buttons.clear();
-                    self.terminal_max_buttons.clear();
                     self.terminal_label_rects.clear();
                     self.terminal_collapse_buttons.clear();
                     self.terminal_strip_rects.clear();
@@ -23105,7 +23166,8 @@ impl App {
             self.terminal_add_buttons.clear();
             self.terminal_profile_buttons.clear();
             self.terminal_close_buttons.clear();
-            self.terminal_max_buttons.clear();
+            self.terminal_focus_button = Rect::default();
+            self.panel_maximize_button = Rect::default();
             self.terminal_label_rects.clear();
             self.terminal_collapse_buttons.clear();
             self.terminal_strip_rects.clear();
@@ -62977,6 +63039,16 @@ impl App {
                 // The panel group's tabs sit on the splitter row, so they must
                 // win the hit-test before the splitter-drag handler claims the
                 // click (same precedence as the "[+]" / "[-]" buttons below).
+                // The panel's own controls share that row (#1980).
+                if rect_contains(self.panel_maximize_button, m.column, m.row) {
+                    self.toggle_terminal_maximize();
+                    return;
+                }
+                if rect_contains(self.terminal_focus_button, m.column, m.row) {
+                    self.focus_pane(Pane::Terminal);
+                    self.toggle_terminal_pane_maximize();
+                    return;
+                }
                 if rect_contains(self.problems_tab_rect, m.column, m.row) {
                     self.set_bottom_panel_tab(BottomPanelTab::Problems);
                     return;
@@ -63124,20 +63196,6 @@ impl App {
                     .position(|r| rect_contains(*r, m.column, m.row))
                 {
                     self.toggle_terminal_collapse(idx);
-                    return;
-                }
-                if let Some(idx) = self
-                    .terminal_max_buttons
-                    .iter()
-                    .position(|r| rect_contains(*r, m.column, m.row))
-                {
-                    // Entering maximize mode hands the clicked pane the
-                    // panel; the button on the maximized pane restores.
-                    if !self.terminal_pane_maximized {
-                        self.active_terminal = idx;
-                        self.focus_pane(Pane::Terminal);
-                    }
-                    self.toggle_terminal_pane_maximize();
                     return;
                 }
                 if let Some(idx) = self
@@ -80194,12 +80252,19 @@ const TERMINAL_CLOSE_LABEL: &str = " - ";
 /// Codicon chevron-down, matching the OUTPUT dropdown caret. Opens the terminal
 /// profile picker (VS Code's `∨` beside `+`).
 const TERMINAL_PROFILE_LABEL: &str = " \u{eab4} ";
-/// Codicon screen-full (Nerd Fonts `cod-screen_full` = U+EB4C): maximize this
-/// terminal pane across the panel, parking the other panes in the right rail.
+/// Codicon screen-full (Nerd Fonts `cod-screen_full` = U+EB4C), on the panel's
+/// tab row: maximize the active terminal across the panel, parking the other
+/// panes in the right rail.
 const TERMINAL_MAX_LABEL: &str = " \u{eb4c} ";
 /// Codicon screen-normal (Nerd Fonts `cod-screen_normal` = U+EB4D): restore
 /// the even split. Swapped in for the `⛶` while a pane is maximized.
 const TERMINAL_RESTORE_LABEL: &str = " \u{eb4d} ";
+/// Codicon chevron-up (U+EAB7), VS Code's "Maximize Panel Size": grow the
+/// panel over the editor, as `Ctrl+Shift+J` does (#1980).
+const PANEL_MAXIMIZE_LABEL: &str = " \u{eab7} ";
+/// Codicon chevron-down (U+EAB4), VS Code's "Restore Panel Size". Swapped in
+/// while the panel is maximized.
+const PANEL_RESTORE_LABEL: &str = " \u{eab4} ";
 /// Codicon chevron-left (Nerd Fonts `cod-chevron_left` = U+EAB5): fold this
 /// pane to a strip and hand its width to the panes still expanded (#313).
 ///
@@ -80222,14 +80287,14 @@ const TERMINAL_STRIP_W: u16 = 1;
 /// Codicon terminal (Nerd Fonts `cod-terminal` = U+EA85), leading each
 /// maximize-rail row the way VS Code's terminal tabs list does.
 /// Cells the pane's header buttons occupy, measured in from its right edge:
-/// `‹`, `⛶`, `-`, `∨` and `+` at three each, plus the one blank column right
-/// of `+`. The name pill paints after the buttons and would win the shared
+/// `‹`, `-`, `∨` and `+` at three each, plus the one blank column right of
+/// `+`. The `⛶` that sat left of `-` moved to the panel's tab row (#1980). The name pill paints after the buttons and would win the shared
 /// cells, so it is clipped to the width left of this strip.
-/// `a_long_pane_label_never_overpaints_the_maximize_button` pins it, so adding
-/// a SIXTH button fails a test rather than quietly erasing a glyph again -
+/// `a_long_pane_label_never_overpaints_the_header_buttons` pins it, so adding
+/// another button fails a test rather than quietly erasing a glyph again -
 /// which is how the collapse button (#313) was caught needing this widened
 /// from 13 instead of silently sharing the pill's cells.
-const TERMINAL_BUTTON_STRIP_W: u16 = 16;
+const TERMINAL_BUTTON_STRIP_W: u16 = 13;
 /// Width constraints for the terminal row, given which panes are collapsed
 /// (#313).
 ///
@@ -81097,7 +81162,6 @@ fn paint_terminal_pane_buttons(
     let add_w = TERMINAL_ADD_LABEL.chars().count() as u16;
     let caret_w = TERMINAL_PROFILE_LABEL.chars().count() as u16;
     let close_w = TERMINAL_CLOSE_LABEL.chars().count() as u16;
-    let max_w = TERMINAL_MAX_LABEL.chars().count() as u16;
     let fold_w = TERMINAL_COLLAPSE_LABEL.chars().count() as u16;
     let mut out = TerminalPaneButtons::default();
     if area.height == 0 {
@@ -81149,35 +81213,12 @@ fn paint_terminal_pane_buttons(
             height: 1,
         });
     }
-    // The maximize / restore button sits left of `-` and shares its
-    // visibility: with a single terminal there is nothing to maximize
-    // against, just as there is nothing to close.
-    if show_close_button && area.width >= add_w + caret_w + close_w + max_w + 2 {
-        let x = area.x + area.width - add_w - caret_w - close_w - max_w - 1;
-        let label = if pane_maximized {
-            TERMINAL_RESTORE_LABEL
-        } else {
-            TERMINAL_MAX_LABEL
-        };
-        frame
-            .buffer_mut()
-            .set_string(x, y, label, style_at(x, max_w));
-        out.max = Some(Rect {
-            x,
-            y,
-            width: max_w,
-            height: 1,
-        });
-    }
-    // Collapse sits left of `⛶`, putting the two layout gestures beside each
-    // other and leaving the destructive `-` where it was. Maximize already
+    // Collapse sits left of `-`, which stays where it was. Maximize already
     // owns the whole panel and ignores the collapse flags, so while it is on
     // the button would be a control that does nothing: it is not painted.
-    if show_close_button
-        && !pane_maximized
-        && area.width >= add_w + caret_w + close_w + max_w + fold_w + 2
+    if show_close_button && !pane_maximized && area.width >= add_w + caret_w + close_w + fold_w + 2
     {
-        let x = area.x + area.width - add_w - caret_w - close_w - max_w - fold_w - 1;
+        let x = area.x + area.width - add_w - caret_w - close_w - fold_w - 1;
         frame
             .buffer_mut()
             .set_string(x, y, TERMINAL_COLLAPSE_LABEL, style_at(x, fold_w));
@@ -81198,7 +81239,6 @@ struct TerminalPaneButtons {
     add: Option<Rect>,
     profile: Option<Rect>,
     close: Option<Rect>,
-    max: Option<Rect>,
     collapse: Option<Rect>,
 }
 
