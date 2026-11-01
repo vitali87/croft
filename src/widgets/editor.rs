@@ -8882,6 +8882,11 @@ impl Editor {
         self.indent_style().unit()
     }
 
+    /// Make `\t` measure and paint as this buffer's Tab Size from here on.
+    fn sync_tab_cells(&self) {
+        set_tab_cells(self.indent_style().width as usize);
+    }
+
     /// The editor's indentation preference as the LSP `FormattingOptions`
     /// fields (`tab_size`, `insert_spaces`).
     pub fn indent_preference(&self) -> (u32, bool) {
@@ -11173,20 +11178,36 @@ impl Editor {
     /// neighbour scans are capped: past a 200-blank-line gap guides simply
     /// stop, which keeps the per-row render cost bounded.
     fn guide_indent_width(&self, line: usize) -> usize {
+        self.guide_indent(line).0
+    }
+
+    /// [`Self::guide_indent_width`] plus the line whose leading whitespace
+    /// that width counts: the line itself, or for a blank line the neighbour
+    /// it borrowed from. The width is in characters, so where its guides sit
+    /// on screen has to be measured on that line (a tab is several cells; a
+    /// blank line has none of its own to measure).
+    fn guide_indent(&self, line: usize) -> (usize, usize) {
         const BLANK_SCAN_CAP: usize = 200;
         if let Some(w) = self.indent_width(line) {
-            return w;
+            return (w, line);
         }
         let above = (0..line)
             .rev()
             .take(BLANK_SCAN_CAP)
-            .find_map(|i| self.indent_width(i))
-            .unwrap_or(0);
+            .find_map(|i| self.indent_width(i).map(|w| (w, i)));
         let below = (line + 1..self.lines.len())
             .take(BLANK_SCAN_CAP)
-            .find_map(|i| self.indent_width(i))
-            .unwrap_or(0);
-        above.min(below)
+            .find_map(|i| self.indent_width(i).map(|w| (w, i)));
+        match (above, below) {
+            (Some(a), Some(b)) => {
+                if b.0 < a.0 {
+                    b
+                } else {
+                    a
+                }
+            }
+            _ => (0, line),
+        }
     }
 
     /// The active indentation guide (VS Code
@@ -15418,12 +15439,24 @@ impl Editor {
             // viewport width too. Scrolling right drops leading hints out of
             // the row, so re-measure until the caret fits (the loop is
             // bounded: `scroll_col` only grows, capped at `cursor_col`).
+            self.sync_tab_cells();
             loop {
                 let extra = self.inlay_cells_before_cursor(self.cursor_row, self.scroll_col);
-                if self.cursor_col + extra < self.scroll_col + width {
+                let row = RowCells::of_line(
+                    self.lines.get(self.cursor_row).map_or("", String::as_str),
+                    self.scroll_col,
+                );
+                let cells = row.text_before(self.cursor_col) + extra;
+                if cells < width {
                     break;
                 }
-                let target = (self.cursor_col + extra + 1).saturating_sub(width);
+                // Scroll right by the cells the caret overflows by (a tab or
+                // wide character is several), measured in columns.
+                let overflow = cells + 1 - width;
+                let mut target = self.scroll_col;
+                while target < self.cursor_col && row.text_before(target) < overflow {
+                    target += 1;
+                }
                 if target <= self.scroll_col {
                     break;
                 }
@@ -16083,14 +16116,14 @@ impl Editor {
                 let cap = if self.wrap_enabled() { end } else { usize::MAX };
                 (
                     line,
-                    self.buffer_col_at_display(line, start + visible).min(cap),
+                    self.buffer_col_at_display(line, start, visible).min(cap),
                 )
             }
             None => {
                 let line = (self.scroll + row_idx).min(self.lines.len().saturating_sub(1));
                 (
                     line,
-                    self.buffer_col_at_display(line, visible + self.scroll_col),
+                    self.buffer_col_at_display(line, self.scroll_col, visible),
                 )
             }
         };
@@ -16105,6 +16138,7 @@ impl Editor {
         if self.last_inner.height == 0 || self.lines.is_empty() || row < self.last_inner.y {
             return None;
         }
+        self.sync_tab_cells();
         let text_x = self.last_inner.x + self.last_gutter_width + 1;
         if self.wrap_enabled() {
             // Map the screen row through the last render's visual-row layout so
@@ -16116,7 +16150,10 @@ impl Editor {
                 return None;
             }
             let visible_col = (col - text_x) as usize;
-            let char_col = (start + visible_col).min(end).min(self.line_char_len(line));
+            let char_col = self
+                .buffer_col_at_display(line, start, visible_col)
+                .min(end)
+                .min(self.line_char_len(line));
             return Some((line, char_col));
         }
         // Non-wrap: map through the painted layout (comment boxes shift the
@@ -16142,34 +16179,35 @@ impl Editor {
         }
         Some((
             line,
-            self.buffer_col_at_display(line, self.scroll_col + visible_col),
+            self.buffer_col_at_display(line, self.scroll_col, visible_col),
         ))
     }
 
-    /// Invert the hint-splice display map: the first buffer column of `line`
-    /// whose display cell reaches absolute display column `display_col`. A
-    /// point landing inside a hint's own cells resolves to its anchor column,
-    /// so the caret snaps beside the code the hint annotates. Without hints
-    /// this is the identity (clamped to the line length).
-    fn buffer_col_at_display(&self, line: usize, display_col: usize) -> usize {
+    /// Invert the row's display map: the first buffer column of `line`
+    /// (counting from `base`, the column the row starts at) whose first cell
+    /// reaches `visible_cells` cells right of the row's left edge. Cells are
+    /// as painted: a tab takes its Tab Size, a wide character two, and a
+    /// point landing inside an inlay hint's own cells resolves to its anchor
+    /// column, so the caret snaps beside the code the hint annotates.
+    fn buffer_col_at_display(&self, line: usize, base: usize, visible_cells: usize) -> usize {
+        self.sync_tab_cells();
         let line_len = self.line_char_len(line);
-        let hints = self.row_inlay_spans(line);
-        if hints.is_empty() {
-            return display_col.min(line_len);
-        }
-        let mut c = self.scroll_col;
-        while c < line_len {
-            let extra: usize = hints
+        let base = base.min(line_len);
+        let text = self.lines.get(line).map_or("", String::as_str);
+        let mut row = RowCells::default();
+        row.fill(
+            &text[byte_index_of_char(text, base)..],
+            base,
+            self.row_inlay_spans(line)
                 .iter()
-                .filter(|(hc, _, _)| *hc >= self.scroll_col && *hc <= c)
-                .map(|(_, l, _)| l.chars().count())
-                .sum();
-            if c + extra >= display_col {
-                break;
-            }
+                .filter(|(hc, _, _)| *hc >= base)
+                .map(|(hc, l, _)| (*hc, l.chars().count())),
+        );
+        let mut c = base;
+        while c < line_len && row.cell(c) < visible_cells {
             c += 1;
         }
-        c.min(line_len)
+        c
     }
 
     pub fn word_at(&self, line: usize, col: usize) -> Option<(usize, usize)> {
@@ -18510,11 +18548,21 @@ fn is_wrap_break_after(c: char) -> bool {
         )
 }
 
+thread_local! {
+    /// Cells one `\t` is drawn as: the buffer's "Tab Size" (status bar), set
+    /// by [`Editor::sync_tab_cells`] before anything measures or paints text.
+    static TAB_CELLS: std::cell::Cell<usize> = const { std::cell::Cell::new(1) };
+}
+
+fn set_tab_cells(n: usize) {
+    TAB_CELLS.with(|t| t.set(n.max(1)));
+}
+
 /// Screen cells a char takes in the editor: its display width, with a tab
-/// drawn as one cell (the editor paints tabs as a single glyph).
+/// drawn as the buffer's Tab Size blank cells.
 fn char_cells(c: char) -> usize {
     if c == '\t' {
-        1
+        TAB_CELLS.with(std::cell::Cell::get)
     } else {
         unicode_width::UnicodeWidthChar::width(c).unwrap_or(0)
     }
@@ -18986,6 +19034,7 @@ fn build_line_spans<'a>(line: &'a str, spans: &[HiSpan]) -> Vec<Span<'a>> {
 impl Widget for &mut Editor {
     fn render(self, area: Rect, buf: &mut Buffer) {
         self.clamp_to_symbol_view();
+        self.sync_tab_cells();
         let block_style = if self.focused {
             Style::default().fg(self.theme.ui(Color::Rgb(0x4e, 0x9a, 0xff)))
         } else {
@@ -19771,11 +19820,9 @@ impl Widget for &mut Editor {
             let byte_end = byte_index_of_char(raw, row_end);
             // A wrapped row's width in CELLS, which is what the painters clip
             // by: its char count cut a row of wide characters in half.
-            let row_width = if wrap {
+            let row_width = {
                 let cells: usize = raw[byte_start..byte_end].chars().map(char_cells).sum();
                 cells.max(row_end - row_start).min(text_width as usize) as u16
-            } else {
-                (row_end - row_start) as u16
             };
             let visible_raw = &raw[byte_start..byte_end];
             let seg_bytes = byte_end - byte_start;
@@ -19907,11 +19954,21 @@ impl Widget for &mut Editor {
             // in the flat path `row_start` is the horizontal scroll and
             // translates the columns like every other painter here.
             if self.show_indent_guides && (!wrap || row_start == 0) {
-                for c in (0..self.guide_indent_width(line_idx)).step_by(guide_step) {
+                let (guide_width, guide_src) = self.guide_indent(line_idx);
+                // A blank line's guides sit where its neighbour's indentation
+                // is drawn, tabs and all, not one cell per level.
+                let src_cells;
+                let geometry = if guide_src == line_idx {
+                    &row_cells
+                } else {
+                    src_cells = RowCells::of_line(&self.lines[guide_src], row_start);
+                    &src_cells
+                };
+                for c in (0..guide_width).step_by(guide_step) {
                     if c < row_start {
                         continue;
                     }
-                    let col = row_cells.cell(c);
+                    let col = geometry.cell(c);
                     if col >= usize::from(row_width) {
                         break;
                     }
@@ -19926,7 +19983,9 @@ impl Widget for &mut Editor {
                         _ => guide_fg,
                     };
                     cell.set_symbol("\u{2502}");
-                    let style = cell.style().fg(fg);
+                    // Not italic even over a comment: a slanted guide looks
+                    // broken, and the text's modifier is not the guide's.
+                    let style = cell.style().fg(fg).remove_modifier(Modifier::ITALIC);
                     cell.set_style(style);
                 }
             }
@@ -19985,7 +20044,8 @@ impl Widget for &mut Editor {
                         }
                         let cell = &mut buf[(text_x + col as u16, y)];
                         cell.set_symbol(glyph);
-                        let style = cell.style().fg(ws_fg);
+                        // The glyph marks whitespace, not comment text.
+                        let style = cell.style().fg(ws_fg).remove_modifier(Modifier::ITALIC);
                         cell.set_style(style);
                     }
                 }
@@ -20393,7 +20453,7 @@ impl Widget for &mut Editor {
                         continue;
                     }
                     cell.set_symbol("\u{2502}");
-                    let style = cell.style().fg(ruler_fg);
+                    let style = cell.style().fg(ruler_fg).remove_modifier(Modifier::ITALIC);
                     cell.set_style(style);
                 }
             }
@@ -20729,6 +20789,7 @@ impl Editor {
         if self.last_inner.height == 0 {
             return None;
         }
+        self.sync_tab_cells();
         let text_x = self.last_inner.x + self.last_gutter_width + 1;
         if self.wrap_enabled() {
             // Find the visual row holding the cursor in the layout the last
@@ -20787,8 +20848,14 @@ impl Editor {
         // (`hc < cursor_col`, not `<=`): a caret AT a hint's anchor sits left
         // of the hint, like VS Code, so typing there pushes the hint along.
         let extra = self.inlay_cells_before_cursor(self.cursor_row, self.scroll_col);
-        let visible_col = self.cursor_col - self.scroll_col + extra;
-        if (visible_col as u16) >= text_width {
+        let visible_col = self
+            .lines
+            .get(self.cursor_row)
+            .map_or(self.cursor_col - self.scroll_col, |l| {
+                RowCells::of_line(l, self.scroll_col).text_before(self.cursor_col)
+            })
+            + extra;
+        if visible_col >= text_width as usize {
             return None;
         }
         Some((
@@ -35164,8 +35231,8 @@ mod tests {
             let text_x = e.last_inner.x + e.last_gutter_width + 1;
             let y = e.last_inner.y;
             assert_eq!(
-                row_text(&buf, y, text_x, text_x + 6),
-                "x y z ",
+                row_text(&buf, y, text_x, text_x + 11),
+                "x    y    z",
                 "wrap {wrap}"
             );
             let (cx, cy) = e.cursor_screen_pos().expect("the caret is on screen");
@@ -35175,10 +35242,32 @@ mod tests {
                 "the caret sits on z, wrap {wrap}"
             );
             assert_eq!(
-                e.buffer_pos_at(text_x + 2, y),
+                e.buffer_pos_at(text_x + 5, y),
                 Some((0, 2)),
                 "a click on y lands on y, wrap {wrap}"
             );
+        }
+    }
+
+    /// A tab is drawn as the buffer's Tab Size, and the caret, clicks and
+    /// horizontal scroll follow it.
+    #[test]
+    fn a_tab_is_as_wide_as_the_tab_size() {
+        for width in [2u32, 4, 8] {
+            let mut e = editor_with("\t\tz");
+            e.set_indent_style(IndentStyle {
+                width,
+                use_spaces: false,
+            });
+            e.wrap_override = Some(false);
+            e.cursor_col = 2;
+            let buf = guide_buf(&mut e, 40, 5);
+            let text_x = e.last_inner.x + e.last_gutter_width + 1;
+            let y = e.last_inner.y;
+            let z_cell = text_x + 2 * width as u16;
+            assert_eq!(buf[(z_cell, y)].symbol(), "z", "tab size {width}");
+            assert_eq!(e.cursor_screen_pos(), Some((z_cell, y)), "tab size {width}");
+            assert_eq!(e.buffer_pos_at(z_cell, y), Some((0, 2)), "tab size {width}");
         }
     }
 
@@ -36030,11 +36119,13 @@ mod tests {
     #[test]
     fn a_tab_takes_its_cell_in_the_side_by_side_diff() {
         use crate::widgets::diff::INTRALINE_REMOVED_BG;
+        set_tab_cells(1);
         assert_eq!(clip_pad_cells("\tx", 0, 4), " x  ");
+        // The diff draws a tab as the Tab Size of the buffer (4 by default).
         let (buf, inner, _) = render_wide_diff("x\n\tn = 1\n", "x\n\tn = 2\n");
-        let (l_text_x, y) = left_text_at(&buf, inner, 2, " n = 1");
-        assert_eq!(buf[(l_text_x + 5, y)].symbol(), "1");
-        assert_eq!(buf[(l_text_x + 5, y)].bg, intraline(INTRALINE_REMOVED_BG));
+        let (l_text_x, y) = left_text_at(&buf, inner, 2, "    n = 1");
+        assert_eq!(buf[(l_text_x + 8, y)].symbol(), "1");
+        assert_eq!(buf[(l_text_x + 8, y)].bg, intraline(INTRALINE_REMOVED_BG));
     }
 
     /// Narrow text clips and pads exactly as before: by character, to the
@@ -40950,6 +41041,24 @@ mod tests {
     }
 
     #[test]
+    fn blank_line_guides_follow_the_neighbours_tab_cells() {
+        let mut e = editor_with("\t\tfoo\n\n\t\tbar");
+        e.set_indent_style(IndentStyle {
+            width: 4,
+            use_spaces: false,
+        });
+        e.show_indent_guides = true;
+        let buf = guide_buf(&mut e, 40, 6);
+        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        let y = e.last_inner.y + 1;
+        let width = e.indent_style().width as u16;
+        let at = |dx: u16| buf[(text_x + dx, y)].symbol().to_string();
+        assert_eq!(at(0), "\u{2502}", "first level");
+        assert_eq!(at(width), "\u{2502}", "second level, one tab further");
+        assert_eq!(at(1), " ", "no guide inside the tab");
+    }
+
+    #[test]
     fn guide_indent_width_resolves_blank_lines_from_neighbours() {
         let e = editor_with("def f():\n    a = 1\n\n    b = 2\n\ndef g():\n    pass");
         assert_eq!(e.guide_indent_width(2), 4, "blank inside a block");
@@ -41865,12 +41974,12 @@ mod tests {
         let text_x = e.last_inner.x + e.last_gutter_width + 1;
         let y0 = e.last_inner.y;
         assert_eq!(
-            row_text(&buf, y0, text_x, text_x + 9),
-            "\u{2192}return\u{b7}1"
+            row_text(&buf, y0, text_x, text_x + 12),
+            "\u{2192}   return\u{b7}1"
         );
         assert_eq!(
-            row_text(&buf, y0 + 1, text_x, text_x + 13),
-            "\u{b7}\u{b7}x\u{b7}=\u{b7}2\u{2192}#\u{b7}tab"
+            row_text(&buf, y0 + 1, text_x, text_x + 16),
+            "\u{b7}\u{b7}x\u{b7}=\u{b7}2\u{2192}   #\u{b7}tab"
         );
     }
 
