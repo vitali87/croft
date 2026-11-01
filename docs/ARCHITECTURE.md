@@ -143,7 +143,7 @@ src/
 ├── mcp/                 MCP sidecar host (Tier-1 extensions): croft is a DETERMINISTIC MCP host — a human invokes a contributed palette command and croft calls one pre-known tool on one vetted local server (no LLM picks tools), which removes MCP's whole prompt-injection/tool-poisoning attack family
 │   ├── mod.rs           module overview + McpOutcome (the off-thread worker's result)
 │   ├── transport.rs     JSON-RPC 2.0 over newline-delimited JSON on the server's stdio (the MCP stdio framing; simpler than DAP's Content-Length); setsid-detached child, reader thread -> mpsc, stderr drained into an 8 KiB tail whose last line names why a server exited before answering, least-privilege env_clear()+envs()
-│   ├── client.rs        the MCP lifecycle: initialize -> notifications/initialized -> tools/list -> tools/call, synchronous id-correlated calls; tool_fingerprint for trust-on-first-use rug-pull detection
+│   ├── client.rs        the MCP lifecycle, dual-era: a server/discover probe settles each server's era once, then 2026-07-28 per-request _meta with no handshake, or the legacy initialize -> notifications/initialized fallback, before tools/list -> tools/call; synchronous id-correlated calls; tool_fingerprint for trust-on-first-use rug-pull detection
 │   ├── registry.rs           data-driven command registry: `contributed_commands()` for eager palette registration and `resolve_command_in_dir()` for lazy tool/server resolution from `[[commands]]`/`[[mcp_servers]]`, plus the `[[viewers]]` lookups
 │   ├── catalog.rs            the curated MCP catalog (AVAILABLE tier of the Extensions panel): bundled CATALOG_MANIFESTS merged with the remote signed index, with install/uninstall gated by provenance so croft removes only what it added, never a hand-dropped user manifest
 │   └── registry_index.rs the remote vetted index (extensions.croft.software): fetches index.json plus its signature and verifies ed25519 against a baked `INDEX_PUBLIC_KEY` BEFORE caching; stale-while-revalidate, disarmed when the key is all-zero
@@ -1200,6 +1200,8 @@ Voice input for the Termux OSK mic key. It delegates to `termux-dialog speech` (
 ### collab_agent.rs
 
 A headless collab guest exposed as an MCP server on stdio, behind the hidden `croft collab-agent --workspace <path>` subcommand. It joins the workspace's relay and serves five `collab_*` tools (open/read/replace/caret/status) over JSON-RPC 2.0 NDJSON, so an external AI co-edits with a live named caret — for example Claude Code via `claude mcp add croft-collab -- croft collab-agent --workspace <path>`.
+
+**Both MCP eras.** Claude Code opens a stdio server with a 2026-07-28 `server/discover` probe, so the seat answers it with both revisions it serves, and serves any request whose `_meta` carries a protocol version statelessly: the version and client capabilities are checked on every such request, and its result names its type and this server. An `initialize` handshake still gets the legacy answer, so older clients keep working.
 
 **Keeping the replica fresh.** A `30ms` pump thread runs between tool calls, so the agent's replica does not go stale while it is thinking.
 
