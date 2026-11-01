@@ -53859,15 +53859,26 @@ impl App {
             .collect();
         let mut changed = false;
         for t in &mut self.terminals {
-            let next = t
+            let kind = t
                 .shell_pid()
                 .and_then(|pid| by_pid.get(&pid))
-                .and_then(|name| self.agents.classify(name))
-                .map(|kind| crate::agents::AgentLane {
-                    name: kind.name.clone(),
-                    status: crate::agents::judge(kind, t.quiet_for(), &t.tail_rows(6), quiet_after),
-                });
+                .and_then(|name| self.agents.classify(name));
             let prev = t.agent().cloned();
+            // Only the seated agent's own OSC 7501 reports judge it: not a
+            // departed agent's, nor another program's.
+            t.sample_reporter(
+                prev.as_ref().map(|p| p.name.as_str()),
+                kind.map(|k| k.name.as_str()),
+            );
+            let next = kind.map(|kind| crate::agents::AgentLane {
+                name: kind.name.clone(),
+                // The agent's own report when it gave one; the screen only
+                // for an agent that has not.
+                status: match t.reported_status() {
+                    Some(state) => crate::agents::reported(state),
+                    None => crate::agents::judge(kind, t.quiet_for(), &t.tail_rows(6), quiet_after),
+                },
+            });
             if prev == next {
                 continue;
             }
