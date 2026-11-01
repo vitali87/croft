@@ -87,13 +87,25 @@ pub fn is_past_listing_cap(path: &Path) -> bool {
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or_default();
-    // A `.doc` is no zip, so the listing cap is not its limit (#1979).
-    let cap = if ext.eq_ignore_ascii_case("doc") {
+    // The cap is the one the route reading these bytes applies, and the bytes
+    // pick the route, not the name: a Word 97 compound file is no zip, while
+    // a docx named `.doc` is one (#1979).
+    let cap = if is_word97(path) {
         MAX_DOC_BYTES
     } else {
         MAX_DOC_LISTING_BYTES
     };
     extension_is_doc(ext) && std::fs::metadata(path).is_ok_and(|m| m.len() > cap)
+}
+
+/// Whether `path` is a compound file, the container of a Word 97-2003
+/// `.doc`, which [`crate::word97`] reads instead of the zip walker.
+fn is_word97(path: &Path) -> bool {
+    let mut head = [0u8; 8];
+    std::fs::File::open(path)
+        .and_then(|mut f| f.read_exact(&mut head))
+        .is_ok()
+        && crate::word97::is_compound_file(&head)
 }
 
 pub fn extension_is_doc(ext: &str) -> bool {
@@ -169,12 +181,7 @@ pub fn to_markdown(path: &Path, scratch: &Path) -> Option<String> {
     // A Word 97-2003 `.doc` is a compound file, read by its own walker
     // (#1979). Decided by the bytes, not the name: a `.doc` that is really
     // a docx goes on to the zip route below.
-    let mut head = [0u8; 8];
-    if std::fs::File::open(path)
-        .and_then(|mut f| f.read_exact(&mut head))
-        .is_ok()
-        && crate::word97::is_compound_file(&head)
-    {
+    if is_word97(path) {
         return crate::word97::to_markdown(path);
     }
     let meta = std::fs::metadata(path).ok()?;

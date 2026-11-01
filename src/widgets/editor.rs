@@ -23714,6 +23714,41 @@ mod tests {
         );
     }
 
+    /// #1979 review: a docx saved under a `.doc` name takes the zip route and
+    /// its listing cap, so past that cap it says why too. The cap follows the
+    /// bytes, as the route does, not the name.
+    #[test]
+    fn an_over_cap_docx_named_doc_says_why_it_landed_in_hex() {
+        use std::io::Write as _;
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("huge.doc");
+        {
+            let f = std::fs::File::create(&p).unwrap();
+            let mut z = zip::ZipWriter::new(f);
+            let o = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            z.start_file("word/document.xml", o).unwrap();
+            z.write_all(b"<?xml version=\"1.0\"?><w:document/>")
+                .unwrap();
+            z.finish().unwrap();
+        }
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&p)
+            .unwrap()
+            .set_len(crate::docx::MAX_DOC_LISTING_BYTES + 1)
+            .unwrap();
+        assert!(crate::docx::is_past_listing_cap(&p));
+
+        let mut ed = Editor::new();
+        ed.open(&p).expect("it still opens, as hex");
+        assert!(
+            crate::archive::is_list_cap_refusal(&ed.status),
+            "the open says it was refused for its size: {:?}",
+            ed.status
+        );
+    }
+
     use super::*;
     use std::io::Write;
     use tempfile::NamedTempFile;
