@@ -5648,17 +5648,31 @@ pub fn encode_mouse_report(
     }
 }
 
+/// What croft types ahead of a command it puts into a pane's shell, so a
+/// half-typed command at the prompt cannot concatenate with it: Ctrl-E to
+/// the end of the line, a letter, then Ctrl-U to kill the line backward.
+/// The letter keeps the line from being empty when Ctrl-U runs: bash's line
+/// editor rings the bell for Ctrl-U on an empty line, and croft reported
+/// that bell over the "Running …" status of the task it had just typed. A
+/// letter, not a space: a space expands a fish abbreviation, and one set up
+/// with `--set-cursor` leaves the cursor before its own suffix, which
+/// Ctrl-U then keeps and croft's command runs into. No shell expands
+/// anything on a letter. Before the shell's line editor is up, the
+/// terminal's own line discipline takes Ctrl-U as its kill character, to
+/// the same effect.
+pub const CLEAR_TYPED_LINE: &str = "\x05x\x15";
+
 /// Build the byte sequence that retargets a POSIX shell's working
-/// directory to `path`. Prefixed with `\x05\x15` so cursor moves to end
-/// of line and the existing line is killed backward before the `cd` is
-/// typed - that way a half-typed command at the prompt does not
-/// concatenate with our `cd`. Path is single-quoted with embedded
+/// directory to `path`. Prefixed with [`CLEAR_TYPED_LINE`] so a
+/// half-typed command at the prompt does not concatenate with our `cd`.
+/// Path is single-quoted with embedded
 /// quotes escaped via the standard `'\''` sleight-of-hand so paths
 /// containing spaces or apostrophes round-trip safely.
 pub fn format_cd_command(path: &std::path::Path) -> Vec<u8> {
     let s = path.to_string_lossy();
     let mut out = Vec::with_capacity(s.len() + 8);
-    out.extend_from_slice(b"\x05\x15cd '");
+    out.extend_from_slice(CLEAR_TYPED_LINE.as_bytes());
+    out.extend_from_slice(b"cd '");
     for c in s.chars() {
         if c == '\'' {
             out.extend_from_slice(b"'\\''");
@@ -7542,8 +7556,8 @@ mod tests {
         let bytes = format_cd_command(std::path::Path::new("/tmp/foo"));
         assert_eq!(
             bytes,
-            b"\x05\x15cd '/tmp/foo'\n".to_vec(),
-            "Ctrl-E + Ctrl-U must precede the cd so a half-typed prompt line is cleared first, then the path is single-quoted and newline-terminated to fire immediately"
+            b"\x05x\x15cd '/tmp/foo'\n".to_vec(),
+            "Ctrl-E, a letter, Ctrl-U must precede the cd so a half-typed prompt line is cleared first, then the path is single-quoted and newline-terminated to fire immediately"
         );
     }
 
@@ -7552,7 +7566,7 @@ mod tests {
         let bytes = format_cd_command(std::path::Path::new("/tmp/it's a dir"));
         assert_eq!(
             bytes,
-            b"\x05\x15cd '/tmp/it'\\''s a dir'\n".to_vec(),
+            b"\x05x\x15cd '/tmp/it'\\''s a dir'\n".to_vec(),
             "embedded ' must be escaped as '\\'' so the cd does not break out of single quotes when the path contains an apostrophe (POSIX-standard quoting)"
         );
     }
@@ -7562,7 +7576,7 @@ mod tests {
         let bytes = format_cd_command(std::path::Path::new("/tmp/a b/c d"));
         assert_eq!(
             bytes,
-            b"\x05\x15cd '/tmp/a b/c d'\n".to_vec(),
+            b"\x05x\x15cd '/tmp/a b/c d'\n".to_vec(),
             "single-quoting must preserve spaces verbatim so cd lands at the right directory"
         );
     }
@@ -8120,6 +8134,40 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(20));
             waited_ms += 20;
         }
+    }
+
+    /// bash's line editor rings the bell for Ctrl-U on an empty line, and
+    /// croft reported that bell over the "Running …" status of the task it
+    /// had just typed into an idle pane. What croft types ahead of a command
+    /// never rings, and still clears a half-typed line.
+    #[test]
+    fn clearing_the_line_ahead_of_a_command_never_rings_the_bell() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut term = PtyTerminal::new_running(
+            "bash",
+            &[
+                String::from("--norc"),
+                String::from("--noprofile"),
+                String::from("-i"),
+            ],
+            tmp.path(),
+        )
+        .unwrap();
+        // The line editor is up once it has drawn this prompt.
+        term.write_input(b"PS1='ready> '\r");
+        wait_for_grid(&term, |l| l.iter().any(|l| l.starts_with("ready>")));
+        let _ = term.take_bell();
+
+        term.write_input(format!("{CLEAR_TYPED_LINE}echo cleared-$((40+2))\r").as_bytes());
+        wait_for_grid(&term, |l| l.iter().any(|l| l.trim() == "cleared-42"));
+        term.write_input(format!("echo stale{CLEAR_TYPED_LINE}echo fresh-$((40+2))\r").as_bytes());
+        let lines = wait_for_grid(&term, |l| l.iter().any(|l| l.trim() == "fresh-42"));
+
+        assert!(
+            !lines.iter().any(|l| l.contains("stale")),
+            "the half-typed line ran: {lines:?}"
+        );
+        assert!(!term.take_bell(), "clearing the line rang the bell");
     }
 
     #[test]

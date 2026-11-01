@@ -437,9 +437,9 @@ pub struct Prefs {
     #[serde(default)]
     pub disable_log_highlight: bool,
     /// Opt-out for the built-in secret redaction rules (#360): the shapes
-    /// listed in [`crate::triggers::builtin_redactions`] are masked in
-    /// terminal panes by default. Stored as the disable flag so the
-    /// derived `Default` and an older config both mean "masked".
+    /// [`crate::triggers::TriggerSet::with_builtin_redactions`] turns on are
+    /// masked in terminal panes by default. Stored as the disable flag so
+    /// the derived `Default` and an older config both mean "masked".
     #[serde(default)]
     pub disable_secret_redaction: bool,
     /// Per-host pane accent rules; see [`HostAccentRule`].

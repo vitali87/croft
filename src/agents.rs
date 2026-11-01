@@ -80,6 +80,49 @@ pub fn script_name(argv: &[String]) -> Option<String> {
     None
 }
 
+/// An agent's prompt regexes. The built-in agents' are compiled the first
+/// time a screen is read for them, or by [`prewarm_builtin`] at launch,
+/// whichever comes first, and every copy of the table shares that one
+/// compile: building them was a sixth of what a launch did before its first
+/// frame, for a check that runs only once an agent is in a pane. Rows from
+/// `agents.json` compile when they load, so a broken pattern is counted.
+#[derive(Debug, Clone)]
+pub struct Prompts(std::sync::Arc<PromptsInner>);
+
+#[derive(Debug)]
+struct PromptsInner {
+    patterns: Vec<String>,
+    compiled: std::sync::OnceLock<Vec<Regex>>,
+}
+
+impl Prompts {
+    /// Patterns compiled when first read; one that does not compile is left
+    /// out.
+    fn lazy(patterns: &[&str]) -> Self {
+        Self(std::sync::Arc::new(PromptsInner {
+            patterns: patterns.iter().map(|p| (*p).to_string()).collect(),
+            compiled: std::sync::OnceLock::new(),
+        }))
+    }
+
+    fn compiled(regexes: Vec<Regex>) -> Self {
+        Self(std::sync::Arc::new(PromptsInner {
+            patterns: Vec::new(),
+            compiled: std::sync::OnceLock::from(regexes),
+        }))
+    }
+
+    pub fn regexes(&self) -> &[Regex] {
+        self.0.compiled.get_or_init(|| {
+            self.0
+                .patterns
+                .iter()
+                .filter_map(|p| Regex::new(p).ok())
+                .collect()
+        })
+    }
+}
+
 /// One recognised agent: the badge it wears, the process names that mean
 /// it, and the prompt shapes that mean it is waiting on the user.
 #[derive(Debug, Clone)]
@@ -91,7 +134,7 @@ pub struct AgentKind {
     pub process: Vec<String>,
     /// Regexes a recent screen row matches when the agent is waiting for
     /// input: a permission question, a `>` prompt, a Y/n.
-    pub prompt: Vec<Regex>,
+    pub prompt: Prompts,
     /// The command line a new worktree lane starts this agent with (#348):
     /// typed into the lane's fresh shell. The built-ins launch as their own
     /// name; a row may set its own (`claude --model opus`). A NEW row
@@ -194,19 +237,34 @@ pub struct AgentTable {
     dropped_patterns: usize,
 }
 
+static BUILTIN: std::sync::LazyLock<AgentTable> = std::sync::LazyLock::new(AgentTable::new_builtin);
+
+/// Compile the built-in agents' prompt regexes now, so the first agent a
+/// pane runs finds them ready. Startup calls this on a thread of its own.
+pub fn prewarm_builtin() {
+    for kind in &BUILTIN.kinds {
+        kind.prompt.regexes();
+    }
+}
+
 fn kind(name: &str, process: &[&str], prompt: &[&str]) -> AgentKind {
     AgentKind {
         name: name.to_string(),
         process: process.iter().map(|p| p.to_string()).collect(),
-        prompt: prompt.iter().filter_map(|p| Regex::new(p).ok()).collect(),
+        prompt: Prompts::lazy(prompt),
         // Each built-in is started by the command that is also its name.
         launch: Some(name.to_string()),
     }
 }
 
 impl AgentTable {
-    /// The agents croft knows without any configuration.
+    /// The agents croft knows without any configuration; every copy shares
+    /// one compile of their prompt regexes (see [`Prompts`]).
     pub fn builtin() -> Self {
+        BUILTIN.clone()
+    }
+
+    fn new_builtin() -> Self {
         // The prompt shapes are what each agent prints when it stops for the
         // user, anchored to the affordance rather than to a word: a bare
         // `Allow` or a trailing `?` matched ordinary output ("Allowed
@@ -312,14 +370,14 @@ impl AgentTable {
                     *existing = AgentKind {
                         name: name.clone(),
                         process,
-                        prompt,
+                        prompt: Prompts::compiled(prompt),
                         launch,
                     };
                 }
                 None => table.kinds.push(AgentKind {
                     name: name.clone(),
                     process,
-                    prompt,
+                    prompt: Prompts::compiled(prompt),
                     launch,
                 }),
             }
@@ -402,7 +460,7 @@ pub fn judge(
         .rev()
         .filter(|r| !r.trim().is_empty())
         .take(6)
-        .any(|row| kind.prompt.iter().any(|re| re.is_match(row)));
+        .any(|row| kind.prompt.regexes().iter().any(|re| re.is_match(row)));
     if asks {
         AgentStatus::Waiting
     } else {
@@ -635,7 +693,7 @@ mod tests {
             .expect("the replaced row matches its new process");
         assert_eq!(claude.name, "claude");
         assert_eq!(
-            claude.prompt.len(),
+            claude.prompt.regexes().len(),
             1,
             "the row replaced the built-in prompts"
         );
@@ -647,7 +705,7 @@ mod tests {
             1,
             "a pattern that does not compile is counted"
         );
-        assert_eq!(bad.classify("x").unwrap().prompt.len(), 1);
+        assert_eq!(bad.classify("x").unwrap().prompt.regexes().len(), 1);
         // A broken file is the built-in table, not a failed start.
         assert_eq!(AgentTable::from_json("{ not json").names().len(), 5);
         assert_eq!(

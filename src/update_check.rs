@@ -401,6 +401,8 @@ impl ManualCheck {
     ) -> Self {
         let (tx, rx) = channel();
         std::thread::spawn(move || {
+            // A download the first frame never shows.
+            crate::startup_gate::wait();
             let verdict = fetch().map(|latest| {
                 let mut cache = CheckCache::load(&cache_dir);
                 cache.set_latest(latest.clone());

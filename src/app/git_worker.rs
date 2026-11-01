@@ -31,6 +31,8 @@ impl GitWorker {
         let (request_tx, request_rx) = std::sync::mpsc::channel::<GitRequest>();
         let (response_tx, response_rx) = std::sync::mpsc::channel::<GitResponse>();
         std::thread::spawn(move || {
+            // The first frame shows no git state; its git processes wait.
+            crate::startup_gate::wait();
             git_worker_loop(git_root, request_rx, response_tx);
         });
         let _ = request_tx.send(GitRequest::Status);

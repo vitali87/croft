@@ -480,6 +480,8 @@ impl FsWatch {
         let (init_tx, init_rx) = std::sync::mpsc::channel();
         let root = root.to_path_buf();
         std::thread::spawn(move || {
+            // Until it is installed, the adaptive poll covers the tree.
+            crate::startup_gate::wait();
             if let Ok(pair) = Self::spawn_watcher_sharing(&root, shares) {
                 let _ = init_tx.send(pair);
             }

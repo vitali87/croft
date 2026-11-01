@@ -171,6 +171,8 @@ impl DriftProbe {
     pub fn start(manifest_dir: String, baked_full: String) -> Self {
         let (tx, rx) = channel();
         std::thread::spawn(move || {
+            // git in the source checkout, which the first frame never shows.
+            crate::startup_gate::wait();
             let _ = tx.send(probe_drift(&manifest_dir, &baked_full));
         });
         Self { rx }
