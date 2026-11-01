@@ -81,7 +81,7 @@ src/
 ├── pair_host.rs          the resident navigator's in-process host: the App spawns the pilot from the workspace's `<hash>.pair.json` record, drains `PairEvent`s per tick, and drives ask / yield turns
 ├── session_state.rs     captures open tabs / layout so a self-update re-exec can restore them
 ├── sheet.rs             CSV / TSV / XLSX / XLS / XLSB / ODS parsing via the csv and calamine crates
-├── shell_integration.rs  OSC 133 / 7 / 9 shell integration: `OscSniffer` intercepts the marks alacritty drops, plus the per-shell rc shims that emit them
+├── shell_integration.rs  OSC 133 / 7 / 9 shell integration: `OscSniffer` intercepts the marks alacritty drops (and OSC 7501 status reports), plus the per-shell rc shims that emit them
 ├── word_suggest.rs       word-based completion (#1566, VS Code's `editor.wordBasedSuggestions`): the words of the open documents, nearest the caret first, offered on Ctrl+Space when no language server reports on the file (at once) or a server answers with nothing; `word_based_suggestions` picks the documents (current, same language, all, or off), and a `.` typed never opens them
 ├── snippets.rs           user snippets from `~/.config/croft/snippets.json` (VS Code format); `parse_body` turns tab-stop syntax and variables into insert text plus ordered stops, and matches are injected into the completion popup; reloads on save
 ├── sqlite_view.rs        read-only SQLite browser: each table and view becomes a worksheet in the existing sheet grid, rows capped at 500 with the true count in the name, opened `SQLITE_OPEN_READONLY` over bundled sqlite3 so a live database is never locked or mutated
@@ -95,7 +95,8 @@ src/
 ├── theme.rs              IDE color theme: a `Theme` palette plus `SyntaxPalette`, loaded as data from `[[themes]]` manifest blocks, with `Theme::LOCH` (Croft Loch, the default) as a const fallback, light-theme chrome adaptation, and the `Surfaces` a `surfaces` theme (Croft Loch) paints instead of pane boxes
 ├── triggers.rs           iTerm2-style terminal triggers from `~/.config/croft/triggers.json`: regex rules driving render-time `highlight`, plus `notify`/`bell` scanned in the PTY reader thread
 ├── agent_lane.rs         per-agent ledger of files an agent changed while you looked elsewhere; each row carries a review baseline content hash so it leaves the queue only once seen, and a write during two agents is flagged `shared` rather than guessed
-├── agents.rs             agent lanes: which panes are running a coding agent (claude, codex, aider, gemini built in, extended by `~/.config/croft/agents.json`) and whether it is working, waiting or idle, judged from output stamps and prompt patterns rather than OSC 133 marks
+├── agents.rs             agent lanes: which panes are running a coding agent (claude, codex, aider, gemini, crush built in, extended by `~/.config/croft/agents.json`) and whether it is working, waiting or idle, taken from the agent's own OSC 7501 report when it gives one, else judged from output stamps and prompt patterns rather than OSC 133 marks
+├── program_status.rs     OSC 7501, the program status protocol: parses a program's idle / working / blocked / done / error reports per spec revision 0.4, keeps one record per id per pane with the spec's lifetimes, and holds the probe answer the pane reader sends back
 ├── undo_rebase.rs        carries a collab peer's edit into this user's undo and redo states (#919), so Ctrl+Z reverts only your own steps: text a step left alone maps by offset, and an edit ending inside text the step wrote ends at its edge
 ├── update_check.rs       release-availability check plus staged upgrade: once a day it asks GitHub's latest-release endpoint off-thread, keeps the release's date and this machine's download size from the same answer, and offers Update / Skip / Later, staging into `~/.cache/croft/staged` so the binary on PATH is untouched until Relaunch; never automatic
 ├── update_watch.rs      remote self-update: watch for a newer binary installed under a running remote croft
@@ -144,7 +145,7 @@ src/
 ├── mcp/                 MCP sidecar host (Tier-1 extensions): croft is a DETERMINISTIC MCP host — a human invokes a contributed palette command and croft calls one pre-known tool on one vetted local server (no LLM picks tools), which removes MCP's whole prompt-injection/tool-poisoning attack family
 │   ├── mod.rs           module overview + McpOutcome (the off-thread worker's result)
 │   ├── transport.rs     JSON-RPC 2.0 over newline-delimited JSON on the server's stdio (the MCP stdio framing; simpler than DAP's Content-Length); setsid-detached child, reader thread -> mpsc, stderr drained into an 8 KiB tail whose last line names why a server exited before answering, least-privilege env_clear()+envs()
-│   ├── client.rs        the MCP lifecycle: initialize -> notifications/initialized -> tools/list -> tools/call, synchronous id-correlated calls; tool_fingerprint for trust-on-first-use rug-pull detection
+│   ├── client.rs        the MCP lifecycle, dual-era: a server/discover probe settles each server's era once, then 2026-07-28 per-request _meta with no handshake, or the legacy initialize -> notifications/initialized fallback, before tools/list -> tools/call; synchronous id-correlated calls; tool_fingerprint for trust-on-first-use rug-pull detection
 │   ├── registry.rs           data-driven command registry: `contributed_commands()` for eager palette registration and `resolve_command_in_dir()` for lazy tool/server resolution from `[[commands]]`/`[[mcp_servers]]`, plus the `[[viewers]]` lookups
 │   ├── catalog.rs            the curated MCP catalog (AVAILABLE tier of the Extensions panel): bundled CATALOG_MANIFESTS merged with the remote signed index, with install/uninstall gated by provenance so croft removes only what it added, never a hand-dropped user manifest
 │   └── registry_index.rs the remote vetted index (extensions.croft.software): fetches index.json plus its signature and verifies ed25519 against a baked `INDEX_PUBLIC_KEY` BEFORE caching; stale-while-revalidate, disarmed when the key is all-zero
@@ -882,15 +883,25 @@ The Source Control sidebar widget, including the multi-root REPOSITORIES overvie
 **The repositories overview.** One row per workspace folder that is a repo, each with a disambiguated label, its branch, and a porcelain change count from `GitStatus.changed_count`. The active row is highlighted, and the overview paints in the no-repo state too so other folders' repos stay reachable. Clicking a row PINS the panel via `App::scm_pin`, released when the focus-derived folder changes. The activity badge sums `changed_count` across all workers.
 ### agents.rs
 
-Tracks agent lanes: which panes are running a coding agent, and whether that agent is working, waiting for the user, or idle. `claude`, `codex`, `aider` and `gemini` are built in, and `~/.config/croft/agents.json` extends or replaces those rows and is reloaded on save. A row's `launch` is the command a worktree lane starts the agent with.
+Tracks agent lanes: which panes are running a coding agent, and whether that agent is working, waiting for the user, or idle. `claude`, `codex`, `aider`, `gemini` and `crush` are built in, and `~/.config/croft/agents.json` extends or replaces those rows and is reloaded on save. A row's `launch` is the command a worktree lane starts the agent with.
 
 **How an agent is recognised.** By the pane's foreground process name against each row's `process` list. A script runtime (`node`, or `MainThread` on newer Node, `bun`, `deno`, `python`) says nothing by its name, and Codex CLI and Gemini CLI installed with npm run as `node`, so for those alone the sampler also reads argv and the script's basename (`node …/bin/gemini` is `gemini`) is matched first. A script that names no agent leaves the runtime's own name, so a row listing `node` still matches.
 
-**How the state is judged.** The status comes from the pane's last-output stamp and its last visible rows, matched against the agent's prompt patterns. An agent in the foreground never emits OSC 133 marks, so there is no shell-integration signal to read instead.
+**How the state is judged.** An agent that reports its own status over OSC 7501 (Claude Code 2.1.295+, Crush 0.98+) is taken at its word, with no screen reading: `working` is Working; `blocked`, `done` and `error` hand the turn back to the user, as a prompt on screen did, so they are Waiting; `idle` is Idle. Only the seated agent's own reports count, so one agent's leftover `done` never speaks for the next: reports made while no agent held the foreground are dropped at the next sample, and a probe, shell prompt or reset in the stream marks a new program, which is what tells two agents apart when one replaces the other between samples (with no such mark, the newcomer's reports so far cannot be told from the old one's and go too). An agent that has not reported is judged from the pane's last-output stamp and its last visible rows, matched against its prompt patterns. An agent in the foreground never emits OSC 133 marks, so there is no shell-integration signal to read instead. `crush` has no prompt patterns: before 0.98 it reads only as working or idle.
 
 **What the UI shows.** The pill wears `◆ claude ◐`, and the status bar counts seated agents with a click that reveals the waiting pane. `AgentEvent::{Seated, Working, Waiting, Gone}` are queued for the tick, with `Waiting` fired once per prompt.
 
 **The built-in prompt regexes compile once, off the startup path.** `Prompts` holds an agent's patterns and compiles them the first time a screen is read for that agent; every copy of the built-in table shares the one compile, which `app::run` starts on a thread of its own at launch (it was a sixth of the work before the first frame). Rows from `agents.json` compile when they load, so a broken pattern is still counted.
+
+### program_status.rs
+
+OSC 7501, the program status protocol (spec revision 0.4): a program reports for itself whether it is idle, working, blocked on the user, done or failed.
+
+**The probe is answered in stream order.** Claude Code sends `ESC ] 7501 ; ? ST` and reports nothing until the terminal answers. It sends a device-attributes query right behind the probe, which every terminal answers, to tell "unsupported" without a timeout. So the pane reader answers on the same channel alacritty's own replies use, after advancing the parser only up to the probe: the answer is queued before the device-attributes reply the next bytes produce.
+
+**Parsing follows the spec's ignore rules.** A malformed pair or unknown key is skipped; a missing or unknown state, a bad `id` (never falling back to the root record), or `msg`/`title` text that is too long, not base64 or holds a control character ignores the report whole, as does a sequence over 4096 bytes. `kind`, `progress` and `app` are read for nothing yet, and their bad values are harmless by the spec.
+
+**Lifetimes.** One record per id, at most 256, the least recently updated evicted first. `clear` removes an id and everything under it, or every record. A new shell prompt (`133;A`) drops all but `done` and `error`; a full reset (RIS) drops everything. Both, and a probe, also mark a new program having the pane: `reported_since` reads only reports after the latest such mark.
 
 ### ansi_text.rs
 
@@ -1201,6 +1212,8 @@ Voice input for the Termux OSK mic key. It delegates to `termux-dialog speech` (
 ### collab_agent.rs
 
 A headless collab guest exposed as an MCP server on stdio, behind the hidden `croft collab-agent --workspace <path>` subcommand. It joins the workspace's relay and serves five `collab_*` tools (open/read/replace/caret/status) over JSON-RPC 2.0 NDJSON, so an external AI co-edits with a live named caret — for example Claude Code via `claude mcp add croft-collab -- croft collab-agent --workspace <path>`.
+
+**Both MCP eras.** Claude Code opens a stdio server with a 2026-07-28 `server/discover` probe, so the seat answers it with both revisions it serves, and serves any request whose `_meta` carries a protocol version statelessly: the version and client capabilities are checked on every such request, and its result names its type and this server. An `initialize` handshake still gets the legacy answer, so older clients keep working.
 
 **Keeping the replica fresh.** A `30ms` pump thread runs between tool calls, so the agent's replica does not go stale while it is thinking.
 

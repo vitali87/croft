@@ -578,47 +578,168 @@ fn clicking_close_button_on_non_active_terminal_drops_that_specific_terminal() {
     );
 }
 
+/// The text a frame painted across `r`, one cell per character.
+fn painted(term: &ratatui::Terminal<ratatui::backend::TestBackend>, r: Rect) -> String {
+    let buf = term.backend().buffer();
+    (r.x..r.right())
+        .map(|x| buf[(x, r.y)].symbol().to_string())
+        .collect()
+}
+
+/// #1980: terminal focus mode is one `⛶` at the right of the panel's tab row,
+/// above every pane, and it maximizes the ACTIVE terminal. Clicking it again
+/// restores the split.
 #[test]
-fn clicking_terminal_maximize_button_maximizes_that_pane() {
+fn the_focus_button_on_the_panel_row_maximizes_the_active_pane() {
+    let (_tmp, mut app, mut term) = app_with_terminal_panes(3);
+    app.active_terminal = 1;
+    term.draw(|f| app.render(f)).unwrap();
+    let b = app.terminal_focus_button;
+    assert!(b.width > 0, "two or more terminals paint the focus button");
+    assert_eq!(
+        b.y, app.terminal_tab_rect.y,
+        "it sits on the panel's tab row"
+    );
+    assert!(b.x > app.terminal_tab_rect.right(), "right of the tabs");
+    assert!(painted(&term, b).contains('\u{eb4c}'), "the ⛶ glyph");
+    left_click(&mut app, b.x + 1, b.y);
+    assert!(app.terminal_pane_maximized, "the click enters focus mode");
+    assert_eq!(app.active_terminal, 1, "on the pane that was active");
+
+    term.draw(|f| app.render(f)).unwrap();
+    let b = app.terminal_focus_button;
+    assert!(
+        painted(&term, b).contains('\u{eb4d}'),
+        "the button turns into restore"
+    );
+    left_click(&mut app, b.x + 1, b.y);
+    assert!(!app.terminal_pane_maximized, "and restores the split");
+}
+
+/// #1980: the panel row's chevron grows the panel over the editor, as
+/// `Ctrl+Shift+J` does, and the same button brings the editor back. Over the
+/// welcome screen and over an open file alike: the editor's layout icons sat
+/// on that row's cells, and a collapsed editor once kept their hit rects
+/// there, so the restore click opened the layout menu instead.
+#[test]
+fn the_panel_row_chevron_maximizes_and_restores_the_whole_panel() {
+    for open_file in [false, true] {
+        let (tmp, mut app, mut term) = app_with_terminal_panes(2);
+        if open_file {
+            let f = tmp.path().join("notes.txt");
+            std::fs::write(&f, "alpha\n").unwrap();
+            app.editor.open_pinned(&f).unwrap();
+            term.draw(|f| app.render(f)).unwrap();
+        }
+        chevron_round_trip(&mut app, &mut term);
+    }
+}
+
+fn chevron_round_trip(app: &mut App, term: &mut ratatui::Terminal<ratatui::backend::TestBackend>) {
+    let panel_rows = |app: &App| app.terminals[0].last_area.height;
+    let split_rows = panel_rows(app);
+    let b = app.panel_maximize_button;
+    assert!(b.width > 0, "the panel paints its maximize button");
+    assert_eq!(b.y, app.terminal_tab_rect.y, "on the panel's tab row");
+    let focus = app.terminal_focus_button;
+    assert!(focus.width > 0 && b.x >= focus.right(), "rightmost, past ⛶");
+    assert!(painted(term, b).contains('\u{eab7}'), "chevron-up");
+
+    left_click(app, b.x + 1, b.y);
+    assert!(app.terminal_maximized, "the click maximizes the panel");
+    term.draw(|f| app.render(f)).unwrap();
+    assert!(
+        panel_rows(app) > split_rows,
+        "the panes grow over the editor"
+    );
+    let b = app.panel_maximize_button;
+    assert!(
+        painted(term, b).contains('\u{eab4}'),
+        "chevron-down restores"
+    );
+
+    left_click(app, b.x + 1, b.y);
+    assert!(!app.terminal_maximized, "the second click restores");
+    assert!(app.context_menu.is_none(), "and opens no layout menu");
+    term.draw(|f| app.render(f)).unwrap();
+    assert_eq!(panel_rows(app), split_rows, "back to the split height");
+}
+
+/// Negative (#1980): a lone terminal has nothing to focus against, and a tab
+/// other than TERMINAL shows no panes to focus, so neither paints the focus
+/// button. The panel's own chevron stays on every tab: it sizes the panel,
+/// whatever the panel is showing.
+#[test]
+fn the_focus_button_needs_two_terminals_and_the_terminal_tab() {
+    let (_tmp, mut app, mut term) = app_with_terminal_panes(1);
+    assert_eq!(app.terminal_focus_button, Rect::default(), "one terminal");
+    assert!(app.panel_maximize_button.width > 0);
+
+    app.split_terminal().unwrap();
+    app.bottom_panel_tab = BottomPanelTab::Problems;
+    term.draw(|f| app.render(f)).unwrap();
+    assert_eq!(app.terminal_focus_button, Rect::default(), "PROBLEMS tab");
+    assert!(app.panel_maximize_button.width > 0, "the chevron stays");
+
+    app.show_terminal = false;
+    term.draw(|f| app.render(f)).unwrap();
+    assert_eq!(app.panel_maximize_button, Rect::default(), "hidden panel");
+}
+
+/// Negative (#1980 review): a window shrunk to one row gives the panel's one
+/// row to the terminals, so there is no tab row, and none of its click
+/// targets may stay behind. They sat under the panes' own header cells, where
+/// a click would silently restore the panel or toggle focus mode.
+#[test]
+fn a_one_row_window_keeps_no_panel_row_targets() {
+    let (_tmp, mut app, mut term) = app_with_terminal_panes(2);
+    app.toggle_terminal_maximize();
+    term.draw(|f| app.render(f)).unwrap();
+    assert!(app.panel_maximize_button.width > 0, "precondition");
+    assert!(app.terminal_focus_button.width > 0, "precondition");
+    assert!(app.terminal_tab_rect.width > 0, "precondition");
+
+    let mut one = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 1)).unwrap();
+    one.draw(|f| app.render(f)).unwrap();
+    assert!(
+        !painted(&one, Rect::new(0, 0, 160, 1)).contains("TERMINAL"),
+        "setup: no tab row is on screen"
+    );
+    assert_eq!(app.panel_maximize_button, Rect::default());
+    assert_eq!(app.terminal_focus_button, Rect::default());
+    assert_eq!(app.terminal_tab_rect, Rect::default());
+}
+
+/// Negative (#1980): on a panel too narrow for the tabs and the controls, the
+/// controls give way rather than painting over a tab, and clicking a tab
+/// still selects it.
+#[test]
+fn the_panel_row_controls_never_cover_a_tab() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.split_terminal().unwrap();
-    app.split_terminal().unwrap();
-    assert_eq!(app.active_terminal, 2);
-    app.terminal_max_buttons = vec![
-        Rect {
-            x: 10,
-            y: 30,
-            width: 3,
-            height: 1,
-        },
-        Rect {
-            x: 30,
-            y: 30,
-            width: 3,
-            height: 1,
-        },
-        Rect {
-            x: 50,
-            y: 30,
-            width: 3,
-            height: 1,
-        },
-    ];
-    app.handle_mouse(crossterm::event::MouseEvent {
-        kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
-        column: 11,
-        row: 30,
-        modifiers: KeyModifiers::NONE,
-    });
-    assert!(
-        app.terminal_pane_maximized,
-        "the ⛶ click enters maximize mode"
-    );
-    assert_eq!(
-        app.active_terminal, 0,
-        "the pane whose ⛶ was clicked becomes the maximized one"
-    );
+    app.show_tree = false;
+    for w in (30..=70).step_by(4) {
+        draw(&mut app, w, 30);
+        let tabs = [
+            app.problems_tab_rect,
+            app.output_tab_rect,
+            app.terminal_tab_rect,
+            app.ports_tab_rect,
+            app.captures_tab_rect,
+        ];
+        let last_tab = tabs.iter().map(|r| r.right()).max().unwrap();
+        for b in [app.panel_maximize_button, app.terminal_focus_button] {
+            assert!(
+                b.is_empty() || b.x > last_tab,
+                "width {w}: control {b:?} overlaps a tab ending at {last_tab}"
+            );
+        }
+        if w == 30 {
+            assert_eq!(app.panel_maximize_button, Rect::default(), "no room");
+        }
+    }
+    assert!(app.terminal_focus_button.width > 0, "room for both at 70");
 }
 
 /// #510: a pane the frame does not paint must drop `last_inner` as well as
@@ -721,22 +842,10 @@ fn maximized_terminal_fills_width_and_lists_others_in_rail() {
     assert_eq!(xs.len(), 1, "rail rows stack vertically in one column");
     let ys: std::collections::HashSet<u16> = app.terminal_rail_rects.iter().map(|r| r.y).collect();
     assert_eq!(ys.len(), 3, "each rail row sits on its own line");
-    // Index alignment: in maximize mode only the visible pane carries live
-    // button rects; the hidden panes hold empty placeholders so a button's
-    // position in the vec still names its terminal index.
-    assert_eq!(app.terminal_max_buttons.len(), 3);
-    let live: Vec<usize> = app
-        .terminal_max_buttons
-        .iter()
-        .enumerate()
-        .filter(|(_, r)| r.width > 0)
-        .map(|(i, _)| i)
-        .collect();
-    assert_eq!(
-        live,
-        vec![active],
-        "only the maximized pane paints a restore button"
-    );
+    // One restore control for the panel, on its tab row, rather than one on
+    // the maximized pane (#1980).
+    assert!(app.terminal_focus_button.width > 0);
+    assert_eq!(app.terminal_focus_button.y, app.terminal_tab_rect.y);
 }
 
 #[test]
@@ -870,9 +979,10 @@ fn clicking_rail_row_switches_terminal_and_stays_maximized() {
 }
 
 #[test]
-fn a_long_pane_label_never_overpaints_the_maximize_button() {
-    // The header buttons lay out right-to-left, and the `⛶` added by this span
-    // is the leftmost of four, at `col.width - 13`. The pane pill's width
+fn a_long_pane_label_never_overpaints_the_header_buttons() {
+    // The header buttons lay out right-to-left, and the `⛶` that once sat in
+    // the header (it moved to the panel's tab row in #1980) was the leftmost
+    // of four, at `col.width - 13`. The pane pill's width
     // budget still reserved room for three buttons, so a label that fills its
     // budget painted straight over the glyph — worst with the broadcast `⇶`
     // or a host accent, whose prefixes widen the pill by two more cells and
@@ -918,10 +1028,8 @@ fn assert_pane_pill_clears_its_buttons(name: &str) {
     // `‹` collapse button, and checking the old leftmost alone would leave the
     // new one free to be overpainted - the same bug this test exists for,
     // three columns over.
-    let families: [(&str, &Vec<Rect>, char); 2] = [
-        ("collapse", &app.terminal_collapse_buttons, '\u{eab5}'),
-        ("maximize", &app.terminal_max_buttons, '\u{eb4c}'),
-    ];
+    let families: [(&str, &Vec<Rect>, char); 1] =
+        [("collapse", &app.terminal_collapse_buttons, '\u{eab5}')];
     for (i, pill) in app.terminal_label_rects.iter().enumerate() {
         let painted: Vec<(&str, Rect, char)> = families
             .iter()
@@ -963,7 +1071,7 @@ fn assert_pane_pill_clears_its_buttons(name: &str) {
     }
     assert!(
         checked >= 4,
-        "this layout must paint both button families to test"
+        "this layout must paint the collapse button on every pane to test"
     );
 }
 

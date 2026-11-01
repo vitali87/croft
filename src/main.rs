@@ -93,6 +93,7 @@ mod prefs;
 mod prettier;
 mod problem_matchers;
 mod profiles;
+mod program_status;
 mod provenance;
 mod quick_select;
 mod quickfix;

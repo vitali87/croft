@@ -494,6 +494,14 @@ pub struct PtyTerminal {
     /// The coding agent seated in this pane, when the foreground process is
     /// one (#344), carried between samples so a transition can be told.
     agent: Option<crate::agents::AgentLane>,
+    /// What programs in the pane said about themselves over OSC 7501,
+    /// updated by the reader thread in stream order.
+    program_status: Arc<std::sync::Mutex<crate::program_status::Records>>,
+    /// The event count reports are read from: what came before it was not
+    /// the seated agent's ([`Self::sample_reporter`]).
+    status_mark: u64,
+    /// The event count when the seated agent was found.
+    status_seated: u64,
     /// Listening loopback ports the reader thread scraped out of the output
     /// stream (`http://localhost:PORT` banners, `listening on :PORT` lines).
     /// The app drains this each tick to feed the PORTS panel and the toast.
@@ -2053,6 +2061,11 @@ impl PtyTerminal {
         };
         let size_shared = Arc::new(std::sync::Mutex::new((cols, rows)));
         let (response_tx, response_rx) = std::sync::mpsc::channel::<String>();
+        // The reader answers the OSC 7501 probe on the same channel as the
+        // parser's replies, so the answer lands ahead of the reply to a
+        // device-attributes query sent after it, which is how a program
+        // tells "supported" from "not" without a timeout.
+        let status_reply_tx = response_tx.clone();
         let bell = Arc::new(AtomicBool::new(false));
         let clipboard_store = Arc::new(std::sync::Mutex::new(None));
         let listener = VoidListener {
@@ -2146,6 +2159,10 @@ impl PtyTerminal {
         let notifications_for_thread = notifications.clone();
         let progress = Arc::new(std::sync::Mutex::new(None::<(u8, u8)>));
         let progress_for_thread = progress.clone();
+        let program_status = Arc::new(std::sync::Mutex::new(
+            crate::program_status::Records::default(),
+        ));
+        let program_status_for_thread = program_status.clone();
         let line_times = Arc::new(std::sync::Mutex::new(
             std::collections::BTreeMap::<i64, u64>::new(),
         ));
@@ -2325,6 +2342,11 @@ impl PtyTerminal {
                             let ev = match stop {
                                 ReadStop::Mark(ev) => ev,
                                 ReadStop::Wipe(w) => {
+                                    // Only RIS wipes both, and a full reset
+                                    // removes every OSC 7501 record.
+                                    if w.screen && w.hist {
+                                        program_status_for_thread.lock().unwrap().reset();
+                                    }
                                     if let Some(run) = running.as_mut() {
                                         let now = clock_for_thread.lock().unwrap().tick(&mut t);
                                         run.follow_wipe(w, now);
@@ -2346,6 +2368,13 @@ impl PtyTerminal {
                                     // (state, percent) for the border gauge.
                                     *progress_for_thread.lock().unwrap() =
                                         (state != 0).then_some((state, pct));
+                                }
+                                E::ProgramStatus(report) => {
+                                    if report == crate::program_status::Report::Query {
+                                        let reply = crate::program_status::PROBE_REPLY;
+                                        let _ = status_reply_tx.send(reply.to_string());
+                                    }
+                                    program_status_for_thread.lock().unwrap().apply(report);
                                 }
                                 E::InlineImage(data) => {
                                     // Anchor the picture at the cursor's grid
@@ -2370,6 +2399,11 @@ impl PtyTerminal {
                                 | E::PromptEnd
                                 | E::CommandStart
                                 | E::CommandEnd(_)) => {
+                                    // The program that reported is gone once
+                                    // the shell draws its prompt again.
+                                    if kind == E::PromptStart {
+                                        program_status_for_thread.lock().unwrap().shell_prompt();
+                                    }
                                     let dur = match &kind {
                                         E::CommandEnd(exit) => {
                                             // A finished command's gauge is
@@ -2573,6 +2607,9 @@ impl PtyTerminal {
             pty_pending_bytes,
             last_output_ms,
             agent: None,
+            program_status,
+            status_mark: 0,
+            status_seated: 0,
             port_rx,
             backend,
             input_tx,
@@ -2867,6 +2904,36 @@ impl PtyTerminal {
 
     pub fn set_agent(&mut self, lane: Option<crate::agents::AgentLane>) {
         self.agent = lane;
+    }
+
+    /// The status the pane's agent reported itself over OSC 7501, `None`
+    /// when it has reported nothing.
+    pub fn reported_status(&self) -> Option<crate::program_status::State> {
+        self.program_status
+            .lock()
+            .unwrap()
+            .reported_since(self.status_mark)
+    }
+
+    /// Keep the pane's OSC 7501 reports to the agent a sample found, given
+    /// the agent the last sample found. Reports made while no agent had the
+    /// foreground are no agent's. When one agent replaces another between
+    /// two samples, a probe or shell prompt in the stream since the first
+    /// was found divides their reports; with neither, the second's so far
+    /// cannot be told from the first's and go too.
+    pub fn sample_reporter(&mut self, prev: Option<&str>, next: Option<&str>) {
+        let records = self.program_status.lock().unwrap();
+        match (prev, next) {
+            (_, None) => self.status_mark = records.seq(),
+            (None, Some(_)) => self.status_seated = records.seq(),
+            (Some(p), Some(n)) if p != n => {
+                if !records.fresh_since(self.status_seated) {
+                    self.status_mark = records.seq();
+                }
+                self.status_seated = records.seq();
+            }
+            _ => {}
+        }
     }
 
     /// The last `n` non-empty VISIBLE rows, oldest first, for prompt
@@ -6980,6 +7047,33 @@ mod tests {
         assert_eq!(
             response, "\x1b[1;1R",
             "a fresh terminal's cursor is at row 1, column 1 (1-based), so the reply must be ESC[1;1R"
+        );
+    }
+
+    /// OSC 7501: Claude Code reports its status only once the terminal
+    /// answers the probe. It sends a device-attributes query right behind
+    /// it, which every terminal answers, so the probe's answer must reach
+    /// the program FIRST: the first ten bytes it reads back are the answer.
+    #[test]
+    fn the_osc_7501_probe_is_answered_ahead_of_the_device_attributes_reply() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = r#"stty raw -echo; printf '\033]7501;?\033\\\033[c'; r=$(head -c 10 | od -An -tx1 | tr -d ' \n'); stty sane; printf 'got:%s\n' "$r"; sleep 30"#;
+        let term = PtyTerminal::new_running(
+            "/bin/sh",
+            &[String::from("-c"), String::from(script)],
+            tmp.path(),
+        )
+        .unwrap();
+        crate::test_budget::await_spawned(
+            crate::test_budget::tests::SHELL_PAINT_BASE,
+            "the probe's answer to be read back",
+            // Not bare `got:`: the pane's header line echoes the script.
+            || term.visible_text().contains("got:1b"),
+        );
+        assert!(
+            term.visible_text().contains("got:1b5d373530313b3f1b5c"),
+            "{}",
+            term.visible_text()
         );
     }
 

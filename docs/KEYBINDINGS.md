@@ -26,7 +26,7 @@ Per platform:
 | `Ctrl+b` / `Cmd+b` | Toggle the primary side bar (left pane) |
 | `Opt+Ctrl+b` / `Opt+Cmd+b` | Toggle the secondary side bar (the active file's Outline, on the edge opposite the primary side bar) |
 | `Ctrl+j` | Toggle the terminal pane |
-| `Ctrl+Shift+j` | Maximize the terminal pane (press again to restore the split) |
+| `Ctrl+Shift+j` | Maximize the terminal pane (press again to restore the split). The up chevron at the right end of the panel's tab row does the same with a click |
 | `Cmd+\` | Split the editor into two side-by-side columns; each keeps its own tabs, scroll, and cursor. Closing the last tab in a column collapses the split |
 | `Ctrl+Shift+PageUp` / `Ctrl+Shift+PageDown` | Move the active editor tab one place left / right along its group's tab bar (the palette's "View: Move Editor Left" / "View: Move Editor Right"). Pinned tabs stay ahead of the others, so a tab moves only within its own block |
 | Drag an editor tab along the tab bar | Reorder it: the tab moves the moment the pointer crosses another tab, and stays active |
@@ -647,8 +647,9 @@ Disabling takes effect immediately for the viewers and Vim (a disabled PDF/CSV v
 | `Cmd+K` `R` | Rename the active terminal pane (a blank name clears it, restoring the auto label) |
 | `Cmd+K` `K` | Clear the active terminal's screen and scrollback (VS Code clears with `Cmd+K`) |
 | `Cmd+K` `M` | Maximize the active terminal across the panel; press again to restore the even split |
-| Click the `⛶` button (beside `-`) | Maximize that pane: it takes the panel's full width and the other terminals move to a rail down the right edge; the button becomes a restore glyph while maximized |
-| Click the `‹` button (left of `⛶`) | Collapse that pane to a one-column strip and hand its width to the panes still open. The pane keeps running: nothing is suspended, no output is lost, and `-` still closes |
+| Click the up chevron (right end of the panel's tab row) | Grow the whole panel over the editor, as `Ctrl+Shift+j` does. It turns into a down chevron that gives the editor its rows back. Shown on every panel tab |
+| Click the `⛶` button (right end of the panel's tab row, left of the chevron) | Maximize the active pane: it takes the panel's full width and the other terminals move to a rail down the right edge; the button becomes a restore glyph while maximized. Shown with two or more terminals |
+| Click the `‹` button (left of `-`) | Collapse that pane to a one-column strip and hand its width to the panes still open. The pane keeps running: nothing is suspended, no output is lost, and `-` still closes |
 | Click a collapsed strip | Give that pane its width back. Anywhere down the strip works, not only the `›` chevron at the top |
 | Right-click a collapsed strip | Open the pane menu on the folded pane, where **Expand Terminal** is the other way back |
 | `Cmd+K` `[` | Collapse the active terminal pane (VS Code folds with `Cmd+K` `[` too). Distinct from `Cmd+[`, which cycles to the previous pane. Collapsing the last expanded pane is refused: `Ctrl+J` is how you put the whole panel away |
