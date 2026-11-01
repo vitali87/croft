@@ -467,6 +467,10 @@ struct Markdown<'a> {
     /// How many of `fields` are still in their code, so whether text shows
     /// is one comparison however deep the fields nest.
     in_code: usize,
+    /// Cell and row marks the table being read has stored, empty ones too,
+    /// and whether it stopped storing them at the cell budget.
+    table_marks: usize,
+    table_cut: bool,
 }
 
 impl<'a> Markdown<'a> {
@@ -482,6 +486,8 @@ impl<'a> Markdown<'a> {
             rows: Vec::new(),
             fields: Vec::new(),
             in_code: 0,
+            table_marks: 0,
+            table_cut: false,
         }
     }
 
@@ -536,9 +542,20 @@ impl<'a> Markdown<'a> {
                 }
                 self.cell.push_str(&line.replace(BREAK_MARK, " "));
             }
-            if mark == CELL_END && para.row_end {
+            if mark != CELL_END {
+                return;
+            }
+            // Counted before anything is stored: a mark is one byte of the
+            // file, and the empty row or cell it would store is far more.
+            if self.table_marks >= crate::docx::MAX_TABLE_CELLS {
+                self.cell.clear();
+                self.table_cut = true;
+                return;
+            }
+            self.table_marks += 1;
+            if para.row_end {
                 self.rows.push(std::mem::take(&mut self.row));
-            } else if mark == CELL_END {
+            } else {
                 self.row.push(std::mem::take(&mut self.cell));
             }
             return;
@@ -573,8 +590,11 @@ impl<'a> Markdown<'a> {
             self.rows.push(std::mem::take(&mut self.row));
         }
         if !self.rows.is_empty() {
-            crate::docx::push_table(&mut self.md, std::mem::take(&mut self.rows));
+            let rows = std::mem::take(&mut self.rows);
+            crate::docx::push_table(&mut self.md, rows, self.table_cut);
         }
+        self.table_marks = 0;
+        self.table_cut = false;
     }
 
     /// The markdown, with a last paragraph whose mark never came.
@@ -752,6 +772,32 @@ mod tests {
         let md = to_markdown(&path).unwrap();
         assert_eq!(md.len(), depth + 2, "every result character shows");
         assert!(t.elapsed().as_secs() < 5, "took {:?}", t.elapsed());
+    }
+
+    /// #1979 review: row-end marks are one byte each, and a table of one wide
+    /// row and a million empty ones would store and pad them all. Storing
+    /// stops at the cell budget, and the preview says the table was cut.
+    #[test]
+    fn a_table_of_endless_empty_rows_stops_at_the_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let row_end: &[u8] = &[0x17, 0x24, 0x01];
+        let cells = b"x\x07".repeat(1_000);
+        let ends = b"\x07".repeat(1_000_000);
+        let after: &[u8] = b"After\r";
+        let total = (cells.len() + ends.len() + after.len()) as u32;
+        let pieces = [
+            (&cells[..], true, 0),
+            (&ends[..], true, 1),
+            (after, true, 0),
+        ];
+        let path = synthetic_with_prms(dir.path(), &pieces, &[row_end], total);
+        let md = to_markdown(&path).unwrap();
+        assert!(md.len() < 1_000_000, "{} bytes", md.len());
+        assert!(md.contains("*The rest of this table is too large to preview.*"));
+        assert!(
+            md.ends_with("After\n\n"),
+            "the text after the table still shows"
+        );
     }
 
     /// #1979 review: a bin table naming one PAPX page many times yields that
