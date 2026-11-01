@@ -228,6 +228,13 @@ struct CellImage {
 /// Half-block cells as `(columns, rows, (upper, lower) colours)`.
 type HalfBlocks = (u16, u16, Vec<(Color, Color)>);
 
+// Decodes `halfblock_cells` has started, so a test can see that a refusal
+// came before one. Per thread, as `FIT_IMAGE_BAKES` is.
+#[cfg(test)]
+thread_local! {
+    static HALFBLOCK_DECODES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Decode `bytes` and shrink the picture to fit `cols` × `rows` cells, two
 /// pixels a cell, keeping its shape (a cell is about twice as tall as it is
 /// wide, so a half cell is square) and never enlarging it. Transparency is
@@ -237,6 +244,15 @@ fn halfblock_cells(bytes: &[u8], cols: u16, rows: u16, bg: Color) -> Option<Half
     if cols == 0 || rows == 0 {
         return None;
     }
+    // The header is cheap and the decode is not: a small compressed file can
+    // declare a canvas that decodes to gigabytes. The same budget the
+    // inline-image bake enforces (#1160), checked before the decode.
+    let (dw, dh) = image_dimensions_of(bytes)?;
+    if u64::from(dw) * u64::from(dh) > crate::iterm2_inline::MAX_DECODE_PIXELS {
+        return None;
+    }
+    #[cfg(test)]
+    HALFBLOCK_DECODES.with(|c| c.set(c.get() + 1));
     let img = image::load_from_memory(bytes).ok()?.to_rgba8();
     let (iw, ih) = img.dimensions();
     if iw == 0 || ih == 0 {
@@ -32658,6 +32674,54 @@ mod tests {
         e.open(&path).unwrap();
         let img = e.image.as_ref().expect("image-mode tab");
         assert_eq!((img.pixel_w, img.pixel_h), (24, 10));
+    }
+
+    /// A TIFF whose header declares a `w`x`h` grayscale canvas with no pixels
+    /// behind it: a few dozen bytes a decoder would size its buffer from.
+    fn declared_tiff(w: u32, h: u32) -> Vec<u8> {
+        // (tag, type, value): width, height, bits, no compression,
+        // black-is-zero, strip offset, rows per strip, strip bytes.
+        let entries: [(u16, u16, u32); 8] = [
+            (256, 4, w),
+            (257, 4, h),
+            (258, 3, 8),
+            (259, 3, 1),
+            (262, 3, 1),
+            (273, 4, 0),
+            (278, 4, h),
+            (279, 4, w.saturating_mul(h)),
+        ];
+        let mut tiff = b"II*\0\x08\0\0\0".to_vec();
+        tiff.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        for (tag, kind, value) in entries {
+            tiff.extend_from_slice(&tag.to_le_bytes());
+            tiff.extend_from_slice(&kind.to_le_bytes());
+            tiff.extend_from_slice(&1u32.to_le_bytes());
+            tiff.extend_from_slice(&value.to_le_bytes());
+        }
+        tiff.extend_from_slice(&0u32.to_le_bytes());
+        tiff
+    }
+
+    /// #1652 review: on a terminal without inline images the picture is drawn
+    /// in half blocks, and that decode is held to the same pixel budget as
+    /// the inline bake (#1160). A tiny file declaring 529 megapixels is
+    /// refused by its header, before any decode; an ordinary TIFF still draws.
+    #[test]
+    fn halfblocks_refuse_a_canvas_over_the_decode_budget_before_decoding() {
+        let bomb = declared_tiff(23_000, 23_000);
+        assert!(bomb.len() < 128, "the bomb is tiny: {} bytes", bomb.len());
+        assert_eq!(
+            image_dimensions_of(&bomb),
+            Some((23_000, 23_000)),
+            "setup: the header parses, so the refusal is the budget's"
+        );
+        let decodes = || HALFBLOCK_DECODES.with(std::cell::Cell::get);
+        let before = decodes();
+        assert!(halfblock_cells(&bomb, 80, 24, Color::Rgb(0, 0, 0)).is_none());
+        assert_eq!(decodes(), before, "refused before any decode");
+        assert!(halfblock_cells(&tiff_bytes(), 80, 24, Color::Rgb(0, 0, 0)).is_some());
+        assert_eq!(decodes(), before + 1, "an ordinary picture is decoded");
     }
 
     /// Negative (#1652): a truncated `.tiff` that does not decode falls back
