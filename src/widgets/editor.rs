@@ -2944,6 +2944,33 @@ impl LineEnding {
             Self::Crlf => "\r\n",
         }
     }
+
+    /// The ending most of `text`'s line breaks use, as VS Code picks it:
+    /// CRLF when more than half of the breaks hold a `\r`. A lone `\r` is a
+    /// break too, and counts toward CRLF. Any `\r\n` used to mark the file
+    /// CRLF, so one line pasted from Windows into an LF file made the next
+    /// save rewrite every line of it (#936).
+    pub fn detect(text: &str) -> Self {
+        let bytes = text.as_bytes();
+        let (mut breaks, mut crs) = (0usize, 0usize);
+        for (i, b) in bytes.iter().enumerate() {
+            match b {
+                b'\n' => breaks += 1,
+                b'\r' => {
+                    crs += 1;
+                    if bytes.get(i + 1) != Some(&b'\n') {
+                        breaks += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if crs * 2 > breaks {
+            Self::Crlf
+        } else {
+            Self::Lf
+        }
+    }
 }
 
 /// The buffer's indentation preference for newly typed indentation: the tab
@@ -3215,6 +3242,10 @@ pub struct Editor {
     /// only, keyed by `(edit_seq, wrap width)`. Comment-box rows are few and
     /// change without an edit, so they are added at mapping time instead.
     ruler_starts_cache: Option<(u64, usize, Vec<usize>)>,
+    /// The caret's bracket-match highlight, keyed by `(edit_seq,
+    /// highlight_generation, caret, protected_current)`: see
+    /// `cached_bracket_match_pair`.
+    bracket_pair_cache: Option<BracketPairCache>,
     /// The `edit_seq` the collab session last synced this buffer at (Phase D
     /// independent viewports, docs/MULTIPLAYER.md). The tick diff extracts
     /// ops only when `edit_seq` has moved past this, and it is re-pinned
@@ -3717,6 +3748,9 @@ pub struct Editor {
     /// after a tab switch, exactly as `semantic_path` does for tokens.
     diagnostics: Vec<crate::lsp::manager::Diagnostic>,
     diagnostics_path: Option<PathBuf>,
+    /// `edit_seq` when `diagnostics` were applied. After a later edit their
+    /// positions and `data` describe text that has changed (#1030).
+    diagnostics_seq: u64,
     /// Decoded per-logical-line underline runs `(start_char, end_char,
     /// severity)`, recomputed from `diagnostics` whenever they or the buffer
     /// change. The render loop paints a coloured underline over each run.
@@ -3939,6 +3973,7 @@ impl Editor {
             mirror_caret: None,
             ruler_search_cache: None,
             ruler_starts_cache: None,
+            bracket_pair_cache: None,
             collab_synced_seq: 0,
             collab_doc_gen: 0,
             git_head_lines: None,
@@ -4060,6 +4095,7 @@ impl Editor {
             semantic_is_full: false,
             diagnostics: Vec::new(),
             diagnostics_path: None,
+            diagnostics_seq: 0,
             diagnostic_spans: Vec::new(),
             diagnostic_tag_spans: Vec::new(),
             inlay_hints: Vec::new(),
@@ -5967,13 +6003,8 @@ impl Editor {
         self.decode_lossy = decode_lossy;
         self.final_newline = text.ends_with(['\n', '\r']);
         // Detect the file's line-ending style before normalisation so a save
-        // preserves it (and the status bar reports it). A single `\r\n` marks
-        // the file CRLF, matching VS Code's "files.eol auto" heuristic.
-        self.eol = if text.contains("\r\n") {
-            LineEnding::Crlf
-        } else {
-            LineEnding::Lf
-        };
+        // preserves it (and the status bar reports it).
+        self.eol = LineEnding::detect(&text);
         self.lines = split_into_lines(&text);
         // The map described the text that was just replaced (#349). Clearing
         // is the safe direction: an unknown line is correct, a line credited
@@ -8009,6 +8040,7 @@ impl Editor {
     ) {
         self.diagnostics_path = Some(path);
         self.diagnostics = diagnostics;
+        self.diagnostics_seq = self.edit_seq;
         self.recompute_diagnostic_spans();
     }
 
@@ -8022,15 +8054,22 @@ impl Editor {
     /// Clones of the diagnostics whose range intersects the inclusive logical
     /// line span `[start_line, end_line]`. Passed as `codeAction` context so the
     /// language server can attach quick fixes to the errors under the cursor.
+    /// Once the buffer has changed since they arrived, they go without their
+    /// origin: a fix in a server's `data` would land where the text used to
+    /// be, so the server is asked about them as croft shows them (#1030).
     pub fn diagnostics_in_line_range(
         &self,
         start_line: u32,
         end_line: u32,
     ) -> Vec<crate::lsp::manager::Diagnostic> {
+        let edited = self.diagnostics_seq != self.edit_seq;
         self.diagnostics
             .iter()
             .filter(|d| d.start_line <= end_line && d.end_line >= start_line)
-            .cloned()
+            .map(|d| crate::lsp::manager::Diagnostic {
+                origin: if edited { None } else { d.origin.clone() },
+                ..d.clone()
+            })
             .collect()
     }
 
@@ -8908,11 +8947,7 @@ impl Editor {
         // new encoding must not carry the previous one's BOM answer over.
         self.bom = encoding_rs::Encoding::for_bom(&bytes).is_some();
         self.final_newline = text.ends_with(['\n', '\r']);
-        self.eol = if text.contains("\r\n") {
-            LineEnding::Crlf
-        } else {
-            LineEnding::Lf
-        };
+        self.eol = LineEnding::detect(&text);
         self.lines = split_into_lines(&text);
         // The map described the text that was just replaced (#349). Clearing
         // is the safe direction: an unknown line is correct, a line credited
@@ -14101,31 +14136,26 @@ impl Editor {
             return None;
         }
         let mut depth = 0i32;
-        let (mut row, mut col) = open;
-        loop {
-            match self.char_at(row, col) {
-                Some(ch) => {
-                    let counts = (ch == oc || ch == cc)
-                        && zones.is_none_or(|z| z.zone((row, col)).is_none());
-                    if counts && ch == oc {
-                        depth += 1;
-                    } else if counts && ch == cc {
-                        depth -= 1;
-                        if depth == 0 {
-                            return Some((row, col));
-                        }
-                    }
-                    col += 1;
+        // One pass along each line. `char_at` walks a line from its start,
+        // so stepping a scan with it was quadratic in the line's length: a
+        // minified line's opening bracket froze the first frame (#959).
+        for (row, line) in self.lines.iter().enumerate().skip(open.0) {
+            let from = if row == open.0 { open.1 } else { 0 };
+            for (col, (byte, ch)) in line.char_indices().enumerate().skip(from) {
+                if (ch != oc && ch != cc) || zones.is_some_and(|z| z.zone_at(row, byte).is_some()) {
+                    continue;
                 }
-                None => {
-                    row += 1;
-                    col = 0;
-                    if row >= self.lines.len() {
-                        return None;
+                if ch == oc {
+                    depth += 1;
+                } else {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some((row, col));
                     }
                 }
             }
         }
+        None
     }
 
     /// Backward-scan from the closing bracket at `close` to its matching open,
@@ -14138,30 +14168,23 @@ impl Editor {
             return None;
         }
         let mut depth = 0i32;
-        let mut row = close.0;
-        let mut col = close.1 as isize;
-        loop {
-            if col < 0 {
-                if row == 0 {
-                    return None;
+        for row in (0..=close.0).rev() {
+            let end = (row == close.0).then_some(close.1 + 1);
+            for (col, byte, ch) in chars_back(&self.lines[row], end) {
+                if (ch != oc && ch != cc) || zones.is_some_and(|z| z.zone_at(row, byte).is_some()) {
+                    continue;
                 }
-                row -= 1;
-                col = self.line_char_len(row) as isize - 1;
-                continue;
-            }
-            let ch = self.char_at(row, col as usize)?;
-            let counts = (ch == oc || ch == cc)
-                && zones.is_none_or(|z| z.zone((row, col as usize)).is_none());
-            if counts && ch == cc {
-                depth += 1;
-            } else if counts && ch == oc {
-                depth -= 1;
-                if depth == 0 {
-                    return Some((row, col as usize));
+                if ch == cc {
+                    depth += 1;
+                } else {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some((row, col));
+                    }
                 }
             }
-            col -= 1;
         }
+        None
     }
 
     /// The innermost bracket pair enclosing the cursor, found by walking
@@ -14170,66 +14193,54 @@ impl Editor {
     /// strings and comments are passed over, so from inside a string this
     /// finds the pair in code around it.
     fn enclosing_brackets(&self, zones: Option<&BracketZones>) -> Option<(BPos, BPos)> {
-        let mut row = self.cursor_row;
-        let mut col = self.cursor_col as isize - 1;
         let mut expected: Vec<char> = Vec::new();
-        loop {
-            if col < 0 {
-                if row == 0 {
-                    return None;
-                }
-                row -= 1;
-                col = self.line_char_len(row) as isize - 1;
-                continue;
-            }
-            let ch = self.char_at(row, col as usize)?;
-            let pos = (row, col as usize);
-            let in_code = || zones.is_none_or(|z| z.zone(pos).is_none());
-            if is_close_bracket(ch) && in_code() {
-                expected.push(matching_open(ch)?);
-            } else if is_open_bracket(ch) && in_code() {
-                match expected.last() {
-                    Some(&want) if want == ch => {
-                        expected.pop();
-                    }
-                    _ => {
-                        let close = self.match_bracket_forward(pos, zones)?;
-                        return Some((pos, close));
+        for row in (0..=self.cursor_row).rev() {
+            let end = (row == self.cursor_row).then_some(self.cursor_col);
+            for (col, byte, ch) in chars_back(self.lines.get(row)?, end) {
+                let pos = (row, col);
+                let in_code = || zones.is_none_or(|z| z.zone_at(row, byte).is_none());
+                if is_close_bracket(ch) && in_code() {
+                    expected.push(matching_open(ch)?);
+                } else if is_open_bracket(ch) && in_code() {
+                    match expected.last() {
+                        Some(&want) if want == ch => {
+                            expected.pop();
+                        }
+                        _ => {
+                            let close = self.match_bracket_forward(pos, zones)?;
+                            return Some((pos, close));
+                        }
                     }
                 }
             }
-            col -= 1;
         }
+        None
     }
 
     /// The first bracket pair at or after the cursor (`findNextBracket`),
     /// passing over brackets in strings and comments.
     fn next_bracket_pair(&self, zones: Option<&BracketZones>) -> Option<(BPos, BPos)> {
-        let mut row = self.cursor_row;
-        let mut col = self.cursor_col;
-        loop {
-            let in_code = zones.is_none_or(|z| z.zone((row, col)).is_none());
-            match self.char_at(row, col) {
-                Some(ch) if is_open_bracket(ch) && in_code => {
+        for (row, line) in self.lines.iter().enumerate().skip(self.cursor_row) {
+            let from = if row == self.cursor_row {
+                self.cursor_col
+            } else {
+                0
+            };
+            for (col, (byte, ch)) in line.char_indices().enumerate().skip(from) {
+                let in_code = zones.is_none_or(|z| z.zone_at(row, byte).is_none());
+                if is_open_bracket(ch) && in_code {
                     let open = (row, col);
                     return self.match_bracket_forward(open, zones).map(|c| (open, c));
                 }
-                Some(ch) if is_close_bracket(ch) && in_code => {
+                if is_close_bracket(ch) && in_code {
                     let close = (row, col);
                     return self
                         .match_bracket_backward(close, zones)
                         .map(|o| (o, close));
                 }
-                Some(_) => col += 1,
-                None => {
-                    row += 1;
-                    col = 0;
-                    if row >= self.lines.len() {
-                        return None;
-                    }
-                }
             }
         }
+        None
     }
 
     /// Resolve the bracket pair relevant to the cursor, returning
@@ -14297,6 +14308,28 @@ impl Editor {
         let zones = self.bracket_zones();
         self.adjacent_bracket_pair(zones.as_ref())
             .map(|(o, c, _)| (o, c))
+    }
+
+    /// [`Self::bracket_match_pair`], worked out once per edit, highlight
+    /// pass and caret place. Every frame asks, and a partner far along a
+    /// long line costs a scan of that line, which kept a core busy while
+    /// croft sat idle on a minified file (#959). A pass can move the strings
+    /// and comments without an edit (Change Language Mode), so it counts.
+    fn cached_bracket_match_pair(&mut self) -> Option<(BPos, BPos)> {
+        let key = (
+            self.edit_seq,
+            self.highlight_generation,
+            (self.cursor_row, self.cursor_col),
+            self.protected_current,
+        );
+        if let Some((at, pair)) = self.bracket_pair_cache
+            && at == key
+        {
+            return pair;
+        }
+        let pair = self.bracket_match_pair();
+        self.bracket_pair_cache = Some((key, pair));
+        pair
     }
 
     /// VS Code "Go to Bracket" (`editor.action.jumpToBracket`, Cmd+Shift+\):
@@ -15423,7 +15456,7 @@ impl Editor {
         self.last_edit_kind = None;
     }
 
-    /// Start of the logical line (`Ctrl+A`, and Home's second step).
+    /// Start of the logical line (`Ctrl+A`), before any indentation.
     pub fn home_line(&mut self) {
         self.cursor_col = 0;
         self.last_edit_kind = None;
@@ -15435,18 +15468,26 @@ impl Editor {
         self.last_edit_kind = None;
     }
 
-    /// The Home key. With wrap on (#1569) it first goes to the start of the
-    /// wrapped row the caret is on, as VS Code does, and to the line's start
-    /// from there.
+    /// The Home key, VS Code's `cursorHome`: to the line's first
+    /// non-whitespace character, or to its start when the caret is already
+    /// there, so a second press toggles (#987). It used to always go to the
+    /// start, before the indentation. With wrap on (#1569) it first goes to
+    /// the start of the wrapped row the caret is on.
     pub fn home_key(&mut self) {
+        let line = &self.lines[self.cursor_row];
+        let first = line
+            .chars()
+            .position(|c| c != ' ' && c != '\t')
+            .unwrap_or_else(|| line.chars().count());
+        let smart = if self.cursor_col == first { 0 } else { first };
         self.cursor_col = match self.wrapped_row_of_cursor() {
             // A row can start on a combining mark (the wrap breaks after the
             // space it sits on), so step back to its cluster's start.
-            Some((start, _)) => match floor_grapheme_col(&self.lines[self.cursor_row], start) {
-                row_start if self.cursor_col > row_start => row_start,
-                _ => 0,
+            Some((start, _)) => match floor_grapheme_col(line, start) {
+                row_start if self.cursor_col > row_start && row_start > first => row_start,
+                _ => smart,
             },
-            None => 0,
+            None => smart,
         };
         self.last_edit_kind = None;
     }
@@ -16262,13 +16303,31 @@ impl BracketZones<'_> {
     /// The string or comment `(row, char col)` lies in, as an index into
     /// the ranges; `None` in code.
     fn zone(&self, (row, col): BPos) -> Option<usize> {
-        let byte = self.starts.get(row)? + char_byte(self.lines.get(row)?, col);
+        self.zone_at(row, char_byte(self.lines.get(row)?, col))
+    }
+
+    /// [`Self::zone`] of the char at `byte` on `row`, for a scan that
+    /// already has the byte offset.
+    fn zone_at(&self, row: usize, byte: usize) -> Option<usize> {
+        let byte = self.starts.get(row)? + byte;
         let i = self.ranges.partition_point(|&(_, end)| end <= byte);
         self.ranges
             .get(i)
             .filter(|&&(start, _)| start <= byte)
             .map(|_| i)
     }
+}
+
+/// `(char col, byte, char)` for `line`'s chars before char column `end`
+/// (all of them when `None`), the last first: one pass for a backward
+/// bracket scan, however long the line (#959).
+fn chars_back(line: &str, end: Option<usize>) -> impl Iterator<Item = (usize, usize, char)> + '_ {
+    let head = &line[..end.map_or(line.len(), |end| char_byte(line, end))];
+    let count = head.chars().count();
+    head.char_indices()
+        .rev()
+        .zip((0..count).rev())
+        .map(|((byte, ch), col)| (col, byte, ch))
 }
 
 /// Convert a char index within `s` to a byte index, saturating at `s.len()`.
@@ -16385,6 +16444,9 @@ fn word_end_after(line: &str, col: usize) -> usize {
 /// A `(row, char_col)` buffer position: a bracket character's in the
 /// bracket matching helpers, a selection end's in the line commands.
 type BPos = (usize, usize);
+
+/// `Editor::bracket_pair_cache`: the key it was worked out at, and the pair.
+type BracketPairCache = ((u64, u64, BPos, bool), Option<(BPos, BPos)>);
 
 /// The bracket pairs croft matches, mirroring VS Code's default language
 /// brackets `()`, `[]`, `{}`.
@@ -19390,7 +19452,7 @@ impl Widget for &mut Editor {
         // Bracket-match highlight (VS Code `editorBracketMatch`): only in the
         // focused editor, and only when the caret is beside a bracket.
         let bracket_pair = if self.focused {
-            self.bracket_match_pair()
+            self.cached_bracket_match_pair()
         } else {
             None
         };
@@ -27190,6 +27252,7 @@ mod tests {
             message: String::from("test diagnostic"),
             tags: Default::default(),
             code: None,
+            origin: None,
         }
     }
 
@@ -27222,6 +27285,27 @@ mod tests {
         let mut e = Editor::new();
         e.lines.clear();
         assert_eq!(e.overview_ruler_rows(10).len(), 10);
+    }
+
+    /// #1030: a quick-fix request hands a server its diagnostic as sent, but
+    /// not once the buffer has changed since: the fix in its `data` would
+    /// land where the text used to be.
+    #[test]
+    fn a_diagnostic_loses_its_origin_once_the_buffer_changes() {
+        let mut e = editor_with("import os\n");
+        let wire = lsp_types::Diagnostic {
+            message: "`os` imported but unused".into(),
+            data: Some(serde_json::json!({ "fix": "remove" })),
+            ..Default::default()
+        };
+        let d = crate::lsp::client::convert_diagnostic("ruff", &wire);
+        e.apply_diagnostics(PathBuf::from("/w/a.py"), vec![d]);
+        let sent = e.diagnostics_in_line_range(0, 0);
+        assert!(sent[0].origin.is_some(), "unchanged: sent as published");
+        e.insert_char('x');
+        let sent = e.diagnostics_in_line_range(0, 0);
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].origin.is_none(), "edited: rebuilt, without `data`");
     }
 
     #[test]
@@ -27596,6 +27680,7 @@ mod tests {
                 message: String::from("Type 'number' is not assignable to type 'string'."),
                 tags: Default::default(),
                 code: None,
+                origin: None,
             }],
         );
         assert_eq!(
@@ -27627,6 +27712,7 @@ mod tests {
             message: message.into(),
             tags: Default::default(),
             code,
+            origin: None,
         };
         e.apply_diagnostics(
             PathBuf::from("/tmp/app.py"),
@@ -27681,6 +27767,7 @@ mod tests {
                 message: String::from("missing semicolon"),
                 tags: Default::default(),
                 code: None,
+                origin: None,
             }],
         );
         assert_eq!(
@@ -27711,6 +27798,7 @@ mod tests {
                 message: String::from("unexpected token"),
                 tags: Default::default(),
                 code: None,
+                origin: None,
             }],
         );
         assert_eq!(
@@ -31927,6 +32015,41 @@ mod tests {
         assert_eq!(e.cursor_col, len);
     }
 
+    /// #987: Home goes to the first non-whitespace character, then toggles
+    /// with the line's start; Shift+Home selects the same way.
+    #[test]
+    fn home_goes_past_the_indentation_then_toggles_with_the_line_start() {
+        let mut e = editor_with("    x = 1\ny = 2\n   \n");
+        e.cursor_col = 9;
+        e.home_key();
+        assert_eq!(e.cursor_col, 4, "the first non-whitespace character");
+        e.home_key();
+        assert_eq!(e.cursor_col, 0, "then the line's start");
+        e.home_key();
+        assert_eq!(e.cursor_col, 4, "and back");
+        e.cursor_col = 2;
+        e.home_key();
+        assert_eq!(e.cursor_col, 4, "from inside the indentation too");
+        (e.cursor_row, e.cursor_col) = (1, 5);
+        e.home_key();
+        assert_eq!(e.cursor_col, 0, "no indentation: the start");
+        e.home_key();
+        assert_eq!(e.cursor_col, 0);
+        (e.cursor_row, e.cursor_col) = (2, 3);
+        e.home_key();
+        assert_eq!(e.cursor_col, 0, "a blank line toggles end and start");
+        e.home_key();
+        assert_eq!(e.cursor_col, 3);
+        e.cursor_row = 0;
+        e.cursor_col = 9;
+        e.start_selection_at_cursor();
+        e.home_key();
+        e.extend_selection_to_cursor();
+        assert_eq!(e.selection_text(), "x = 1");
+        e.home_line();
+        assert_eq!(e.cursor_col, 0, "Ctrl+A stays a hard line start");
+    }
+
     /// #1569: Home from inside a wrapped row stops at that row's start first.
     #[test]
     fn home_in_a_wrapped_line_stops_at_the_start_of_the_row_first() {
@@ -32028,6 +32151,46 @@ mod tests {
             raw, b"alpha\r\nbeta\r\n",
             "save re-applies CRLF, final newline included"
         );
+    }
+
+    /// #936: one CRLF line pasted into an LF file. The file stays LF, so a
+    /// one-character edit saves as that edit plus the stray line brought
+    /// into line, not every line rewritten.
+    #[test]
+    fn one_crlf_line_in_an_lf_file_keeps_it_lf() {
+        let mut text: Vec<String> = (0..200).map(|i| format!("setting_{i} = {i}\n")).collect();
+        text[57] = "pasted_from_windows = True\r\n".into();
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(text.concat().as_bytes()).unwrap();
+        let mut e = Editor::new();
+        e.open(tmp.path()).unwrap();
+        assert_eq!(e.eol, LineEnding::Lf);
+        e.cursor_col = e.lines[0].chars().count();
+        e.insert_char('0');
+        e.save_to_disk().unwrap();
+        let saved = std::fs::read_to_string(tmp.path()).unwrap();
+        assert!(!saved.contains('\r'), "no CRLF left");
+        let changed: Vec<usize> = saved
+            .lines()
+            .zip(text.iter())
+            .enumerate()
+            .filter(|(_, (now, was))| *now != was.trim_end_matches(['\r', '\n']))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(changed, vec![0], "only the edited line's text changed");
+    }
+
+    /// The majority decides both ways, and a tie stays LF.
+    #[test]
+    fn the_line_ending_is_the_one_most_lines_use() {
+        assert_eq!(LineEnding::detect("a\r\nb\r\nc\n"), LineEnding::Crlf);
+        assert_eq!(LineEnding::detect("a\r\nb\nc\n"), LineEnding::Lf);
+        assert_eq!(LineEnding::detect("a\r\nb\n"), LineEnding::Lf);
+        assert_eq!(LineEnding::detect("a\r\n"), LineEnding::Crlf);
+        assert_eq!(LineEnding::detect("no break"), LineEnding::Lf);
+        // A lone CR is a break that counts toward CRLF, as in VS Code.
+        assert_eq!(LineEnding::detect("a\n\rb\r\nc"), LineEnding::Crlf);
+        assert_eq!(LineEnding::detect("a\rb\nc\n"), LineEnding::Lf);
     }
 
     #[test]
@@ -40310,6 +40473,79 @@ mod tests {
         let mut e = editor_with("foo(bar)baz");
         e.cursor_col = 5; // inside the pair but not adjacent to a bracket
         assert_eq!(e.bracket_match_pair(), None);
+    }
+
+    /// #959: a minified line's opening bracket, its partner a whole line
+    /// away. Each step of the scan used to walk the line from its start, so
+    /// this took hours; one pass takes milliseconds.
+    #[test]
+    fn a_bracket_far_along_a_long_line_matches_in_one_pass() {
+        let body = "{\"id\":1,\"tags\":[\"a\",\"b\"]}, ".repeat(15_000);
+        let mut e = editor_with(&format!("[{body}]"));
+        let close = (0, e.lines[0].chars().count() - 1);
+        let started = std::time::Instant::now();
+        assert_eq!(e.bracket_match_pair(), Some(((0, 0), close)));
+        e.cursor_col = close.1 + 1;
+        assert_eq!(e.bracket_match_pair(), Some(((0, 0), close)));
+        // Between the last `,` and ` `: no bracket beside the caret, so Go
+        // to Bracket walks back to the enclosing `[` and on to its `]`.
+        e.cursor_col = close.1 - 1;
+        assert!(e.jump_to_matching_bracket(), "the enclosing `[`");
+        assert_eq!((e.cursor_row, e.cursor_col), close);
+        assert!(
+            started.elapsed() < crate::test_budget::spawn_budget(std::time::Duration::from_secs(2)),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Backward and forward scans count columns in chars, not bytes, after
+    /// multi-byte text, across lines.
+    #[test]
+    fn bracket_scans_count_chars_after_multibyte_text() {
+        let mut e = editor_with("é(ü\n日本)x");
+        e.cursor_col = 1;
+        assert_eq!(e.bracket_match_pair(), Some(((0, 1), (1, 2))));
+        (e.cursor_row, e.cursor_col) = (1, 3);
+        assert_eq!(e.bracket_match_pair(), Some(((0, 1), (1, 2))));
+        (e.cursor_row, e.cursor_col) = (1, 1);
+        assert!(e.jump_to_matching_bracket(), "from inside the pair");
+        assert_eq!((e.cursor_row, e.cursor_col), (1, 2));
+    }
+
+    /// The highlight is worked out once per edit and caret place, and
+    /// follows both (#959).
+    #[test]
+    fn the_cached_bracket_highlight_follows_the_caret_and_edits() {
+        let mut e = editor_with("f(x) g[y]");
+        e.cursor_col = 1;
+        assert_eq!(e.cached_bracket_match_pair(), Some(((0, 1), (0, 3))));
+        assert_eq!(e.cached_bracket_match_pair(), Some(((0, 1), (0, 3))));
+        e.cursor_col = 6;
+        assert_eq!(e.cached_bracket_match_pair(), Some(((0, 6), (0, 8))));
+        e.cursor_col = 1;
+        assert_eq!(e.cached_bracket_match_pair(), Some(((0, 1), (0, 3))));
+        // An edit that leaves the caret where it was still counts.
+        e.cursor_col = 2;
+        e.insert_char('(');
+        e.cursor_col = 1;
+        let pair = e.cached_bracket_match_pair();
+        assert_ne!(pair, Some(((0, 1), (0, 3))), "{:?}", e.lines);
+        assert_eq!(pair, e.bracket_match_pair());
+    }
+
+    /// A language switch re-highlights without an edit, and can put the
+    /// pair beside the caret into a comment or take it out of one.
+    #[test]
+    fn the_cached_bracket_highlight_follows_a_language_switch() {
+        let mut e = editor_with("// (x)");
+        e.set_language(Some(LangKind::Python));
+        e.cursor_col = 3;
+        assert_eq!(e.cached_bracket_match_pair(), Some(((0, 3), (0, 5))));
+        e.set_language(Some(LangKind::Rust));
+        assert_eq!(e.cached_bracket_match_pair(), None, "a Rust comment");
+        e.set_language(Some(LangKind::Python));
+        assert_eq!(e.cached_bracket_match_pair(), Some(((0, 3), (0, 5))));
     }
 
     #[test]

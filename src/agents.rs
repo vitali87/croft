@@ -1,16 +1,20 @@
 //! Agent lanes (#344): which terminal panes are running a coding agent,
 //! which one, and whether it is working, waiting for the user, or idle.
 //!
-//! Claude Code, Codex CLI, aider and gemini-cli all run in a pane, so croft
-//! is already where the agents live; everything in the agent-cockpit series
-//! starts from knowing that. The foreground process of every pane is
+//! Claude Code, Codex CLI, aider, gemini-cli and Crush all run in a pane, so
+//! croft is already where the agents live; everything in the agent-cockpit
+//! series starts from knowing that. The foreground process of every pane is
 //! already sampled for the name pill, so an agent is recognised from that
 //! name against a small table — built in, extended by `agents.json` in the
-//! config directory without a rebuild — and its status is judged from two
-//! things the pane already has: how long since it last produced output, and
-//! what its last screen rows say. An agent that stays in the foreground
-//! never emits OSC 133 marks, which is why "waiting" cannot come from the
-//! shell integration and has to be read off the screen.
+//! config directory without a rebuild.
+//!
+//! Its status is the agent's own word when it gives one: Claude Code and
+//! Crush report idle, working, blocked or done over OSC 7501
+//! ([`crate::program_status`]), read by [`reported`]. An agent that has not
+//! reported is judged by [`judge`] from two things the pane already has: how
+//! long since it last produced output, and what its last screen rows say. An
+//! agent that stays in the foreground never emits OSC 133 marks, which is
+//! why "waiting" cannot come from the shell integration.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -153,7 +157,7 @@ pub fn agents_path() -> PathBuf {
 pub const TEMPLATE: &str = r##"// croft agent lanes: which foreground processes are coding agents, and what
 // their screen looks like when they are waiting for you (#344).
 //
-// Built in: claude, codex, aider, gemini. Add a row to teach croft another
+// Built in: claude, codex, aider, gemini, crush. Add a row to teach croft another
 // agent without a rebuild; a row named like a built-in replaces it.
 //   name:    the badge shown on the pane pill
 //   process: foreground process names that mean this agent
@@ -233,6 +237,9 @@ impl AgentTable {
                 kind("codex", &["codex"], &with(&codex, &yes_no)),
                 kind("aider", &["aider"], &with(&aider, &yes_no)),
                 kind("gemini", &["gemini"], &with(&gemini, &yes_no)),
+                // Crush reports its status over OSC 7501 (0.98 and later),
+                // so it has no screen shapes to fall back on.
+                kind("crush", &["crush"], &[]),
             ],
             dropped_patterns: 0,
         }
@@ -367,8 +374,19 @@ impl AgentTable {
     }
 }
 
-/// What an agent is doing, from how long its pane has been quiet and what
-/// its last screen rows say. `quiet_after` is the threshold ([`QUIET_AFTER`]
+/// What an agent is doing, by its own OSC 7501 report. Blocked, done and
+/// error all hand the turn back to the user, as a prompt on screen does.
+pub fn reported(state: crate::program_status::State) -> AgentStatus {
+    use crate::program_status::State;
+    match state {
+        State::Working => AgentStatus::Working,
+        State::Blocked | State::Done | State::Error => AgentStatus::Waiting,
+        State::Idle => AgentStatus::Idle,
+    }
+}
+
+/// What an agent that has not reported is doing, from how long its pane has
+/// been quiet and what its last screen rows say. `quiet_after` is the threshold ([`QUIET_AFTER`]
 /// in the app; tests pass 0 to judge the screen alone).
 pub fn judge(
     kind: &AgentKind,
@@ -463,15 +481,16 @@ mod tests {
     }
 
     #[test]
-    fn the_builtin_table_recognises_the_four_agents_by_name_or_path() {
+    fn the_builtin_table_recognises_the_five_agents_by_name_or_path() {
         let t = AgentTable::builtin();
-        assert_eq!(t.names(), ["claude", "codex", "aider", "gemini"]);
+        assert_eq!(t.names(), ["claude", "codex", "aider", "gemini", "crush"]);
         for (proc_name, want) in [
             ("claude", "claude"),
             ("/opt/homebrew/bin/claude", "claude"),
             ("Codex", "codex"),
             ("aider", "aider"),
             ("gemini", "gemini"),
+            ("/usr/local/bin/crush", "crush"),
         ] {
             assert_eq!(
                 t.classify(proc_name).map(|k| k.name.as_str()),
@@ -620,7 +639,7 @@ mod tests {
             1,
             "the row replaced the built-in prompts"
         );
-        assert_eq!(t.names().len(), 5);
+        assert_eq!(t.names().len(), 6);
         assert_eq!(t.dropped_patterns(), 0);
         let bad = AgentTable::from_json(r#"[{ "name": "x", "prompt": ["(unclosed", "ok"] }]"#);
         assert_eq!(
@@ -630,15 +649,15 @@ mod tests {
         );
         assert_eq!(bad.classify("x").unwrap().prompt.len(), 1);
         // A broken file is the built-in table, not a failed start.
-        assert_eq!(AgentTable::from_json("{ not json").names().len(), 4);
+        assert_eq!(AgentTable::from_json("{ not json").names().len(), 5);
         assert_eq!(
             AgentTable::load(Path::new("/definitely/missing.json"))
                 .names()
                 .len(),
-            4
+            5
         );
         // TEMPLATE parses (comments stripped) to zero rows.
-        assert_eq!(AgentTable::from_json(TEMPLATE).names().len(), 4);
+        assert_eq!(AgentTable::from_json(TEMPLATE).names().len(), 5);
     }
 
     #[test]
@@ -736,6 +755,20 @@ mod tests {
         let mut buried = vec!["Allow this? (y/n)".to_string()];
         buried.extend((0..8).map(|i| format!("log line {i}")));
         assert_eq!(judge(claude, after, &buried, after), AgentStatus::Idle);
+    }
+
+    #[test]
+    fn a_reported_state_maps_to_the_lane_status() {
+        use crate::program_status::State;
+        for (state, want) in [
+            (State::Working, AgentStatus::Working),
+            (State::Blocked, AgentStatus::Waiting),
+            (State::Done, AgentStatus::Waiting),
+            (State::Error, AgentStatus::Waiting),
+            (State::Idle, AgentStatus::Idle),
+        ] {
+            assert_eq!(reported(state), want, "{state:?}");
+        }
     }
 
     #[test]

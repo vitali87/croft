@@ -386,8 +386,9 @@ impl PairHost {
         }
     }
 
-    /// Reply turn: the driver answered a note inside its comment box.
-    /// Comment-only, host-enforced, like a yield.
+    /// Reply turn: the driver answered a note inside its comment box. The
+    /// driver's own words invite the navigator like an ask does, so it may
+    /// edit when the reply asks for a change (#1965).
     pub fn send_reply_turn(
         &self,
         file: &str,
@@ -415,7 +416,7 @@ impl PairHost {
                 // turn's staging (origin, counters, target).
                 anyhow::bail!("the navigator is mid-turn; wait for it to finish");
             }
-            let staged = st.stage_turn(file, content, true);
+            let staged = st.stage_turn(file, content, false);
             st.park_caret(file, row); // visible presence at the answered note
             staged
         };

@@ -1,11 +1,11 @@
 use alacritty_terminal::Term;
 use alacritty_terminal::event::{Event as AlacEvent, EventListener};
-use alacritty_terminal::grid::{Dimensions, Scroll};
+use alacritty_terminal::grid::{Dimensions, GridCell, Row, Scroll};
 use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::{Selection as TracerSelection, SelectionType};
 use alacritty_terminal::sync::FairMutex;
 use alacritty_terminal::term::ClipboardType;
-use alacritty_terminal::term::cell::Flags;
+use alacritty_terminal::term::cell::{Cell, Flags};
 use alacritty_terminal::term::test::TermSize;
 use alacritty_terminal::term::{Config, TermMode};
 use alacritty_terminal::vte::ansi::{Color as AnsiColor, NamedColor, Processor, StdSyncHandler};
@@ -494,6 +494,14 @@ pub struct PtyTerminal {
     /// The coding agent seated in this pane, when the foreground process is
     /// one (#344), carried between samples so a transition can be told.
     agent: Option<crate::agents::AgentLane>,
+    /// What programs in the pane said about themselves over OSC 7501,
+    /// updated by the reader thread in stream order.
+    program_status: Arc<std::sync::Mutex<crate::program_status::Records>>,
+    /// The event count reports are read from: what came before it was not
+    /// the seated agent's ([`Self::sample_reporter`]).
+    status_mark: u64,
+    /// The event count when the seated agent was found.
+    status_seated: u64,
     /// Listening loopback ports the reader thread scraped out of the output
     /// stream (`http://localhost:PORT` banners, `listening on :PORT` lines).
     /// The app drains this each tick to feed the PORTS panel and the toast.
@@ -2053,6 +2061,11 @@ impl PtyTerminal {
         };
         let size_shared = Arc::new(std::sync::Mutex::new((cols, rows)));
         let (response_tx, response_rx) = std::sync::mpsc::channel::<String>();
+        // The reader answers the OSC 7501 probe on the same channel as the
+        // parser's replies, so the answer lands ahead of the reply to a
+        // device-attributes query sent after it, which is how a program
+        // tells "supported" from "not" without a timeout.
+        let status_reply_tx = response_tx.clone();
         let bell = Arc::new(AtomicBool::new(false));
         let clipboard_store = Arc::new(std::sync::Mutex::new(None));
         let listener = VoidListener {
@@ -2146,6 +2159,10 @@ impl PtyTerminal {
         let notifications_for_thread = notifications.clone();
         let progress = Arc::new(std::sync::Mutex::new(None::<(u8, u8)>));
         let progress_for_thread = progress.clone();
+        let program_status = Arc::new(std::sync::Mutex::new(
+            crate::program_status::Records::default(),
+        ));
+        let program_status_for_thread = program_status.clone();
         let line_times = Arc::new(std::sync::Mutex::new(
             std::collections::BTreeMap::<i64, u64>::new(),
         ));
@@ -2325,6 +2342,11 @@ impl PtyTerminal {
                             let ev = match stop {
                                 ReadStop::Mark(ev) => ev,
                                 ReadStop::Wipe(w) => {
+                                    // Only RIS wipes both, and a full reset
+                                    // removes every OSC 7501 record.
+                                    if w.screen && w.hist {
+                                        program_status_for_thread.lock().unwrap().reset();
+                                    }
                                     if let Some(run) = running.as_mut() {
                                         let now = clock_for_thread.lock().unwrap().tick(&mut t);
                                         run.follow_wipe(w, now);
@@ -2346,6 +2368,13 @@ impl PtyTerminal {
                                     // (state, percent) for the border gauge.
                                     *progress_for_thread.lock().unwrap() =
                                         (state != 0).then_some((state, pct));
+                                }
+                                E::ProgramStatus(report) => {
+                                    if report == crate::program_status::Report::Query {
+                                        let reply = crate::program_status::PROBE_REPLY;
+                                        let _ = status_reply_tx.send(reply.to_string());
+                                    }
+                                    program_status_for_thread.lock().unwrap().apply(report);
                                 }
                                 E::InlineImage(data) => {
                                     // Anchor the picture at the cursor's grid
@@ -2370,6 +2399,11 @@ impl PtyTerminal {
                                 | E::PromptEnd
                                 | E::CommandStart
                                 | E::CommandEnd(_)) => {
+                                    // The program that reported is gone once
+                                    // the shell draws its prompt again.
+                                    if kind == E::PromptStart {
+                                        program_status_for_thread.lock().unwrap().shell_prompt();
+                                    }
                                     let dur = match &kind {
                                         E::CommandEnd(exit) => {
                                             // A finished command's gauge is
@@ -2573,6 +2607,9 @@ impl PtyTerminal {
             pty_pending_bytes,
             last_output_ms,
             agent: None,
+            program_status,
+            status_mark: 0,
+            status_seated: 0,
             port_rx,
             backend,
             input_tx,
@@ -2867,6 +2904,36 @@ impl PtyTerminal {
 
     pub fn set_agent(&mut self, lane: Option<crate::agents::AgentLane>) {
         self.agent = lane;
+    }
+
+    /// The status the pane's agent reported itself over OSC 7501, `None`
+    /// when it has reported nothing.
+    pub fn reported_status(&self) -> Option<crate::program_status::State> {
+        self.program_status
+            .lock()
+            .unwrap()
+            .reported_since(self.status_mark)
+    }
+
+    /// Keep the pane's OSC 7501 reports to the agent a sample found, given
+    /// the agent the last sample found. Reports made while no agent had the
+    /// foreground are no agent's. When one agent replaces another between
+    /// two samples, a probe or shell prompt in the stream since the first
+    /// was found divides their reports; with neither, the second's so far
+    /// cannot be told from the first's and go too.
+    pub fn sample_reporter(&mut self, prev: Option<&str>, next: Option<&str>) {
+        let records = self.program_status.lock().unwrap();
+        match (prev, next) {
+            (_, None) => self.status_mark = records.seq(),
+            (None, Some(_)) => self.status_seated = records.seq(),
+            (Some(p), Some(n)) if p != n => {
+                if !records.fresh_since(self.status_seated) {
+                    self.status_mark = records.seq();
+                }
+                self.status_seated = records.seq();
+            }
+            _ => {}
+        }
     }
 
     /// The last `n` non-empty VISIBLE rows, oldest first, for prompt
@@ -4397,7 +4464,7 @@ impl PtyTerminal {
         // size.
         let mut term = self.term.lock();
         let size = TermSize::new(cols as usize, rows as usize);
-        term.resize(size);
+        resize_term(&mut term, size);
         self.backend.resize(cols, rows);
         drop(term);
         self.pty_dirty.store(true, Ordering::Release);
@@ -5031,6 +5098,135 @@ fn ansi_rows(term: &Term<VoidListener>, top: i32) -> Vec<(String, String, bool)>
 /// [`ansi_rows`] for another module's model of a pane (#694's pane host).
 pub(crate) fn ansi_rows_from(term: &Term<VoidListener>, top: i32) -> Vec<(String, String, bool)> {
     ansi_rows(term, top)
+}
+
+/// A `Flags` bit alacritty leaves unused (its own stop at bit 14), set on
+/// every cell of a row [`resize_term`] clipped. Writing a cell replaces its
+/// flags, so a row whose shown cells all still carry it is one no program
+/// has written to since: the cells kept past its edge still belong to it.
+const CLIPPED: Flags = Flags::from_bits_retain(0x8000);
+
+/// Resize a pane's model, clipping rows rather than re-wrapping them (#1857).
+///
+/// alacritty reflows every row wider than a narrowed pane onto the row
+/// below. Anything a program laid out to the old width falls apart: each
+/// row of a Rich panel or a table splits in two, its right border lands
+/// halfway along the next row, and a program that redraws by counting rows
+/// up from the cursor misses the extra ones. So a row the program ended
+/// itself (no soft wrap into it or out of it) is cut at the new width
+/// instead. The cells cut off are kept past the row's last shown column,
+/// where nothing draws or writes, and widening shows them again. A row a
+/// program wrote to while cut drops them, since they no longer belong to
+/// what it shows. Soft-wrapped lines still reflow, and so does the cursor's
+/// row, as the shell redrawing a prompt expects. The primary screen is out
+/// of reach while a full-screen program holds the alternate one, so a
+/// resize then reflows it as before.
+pub(crate) fn resize_term(term: &mut Term<VoidListener>, size: TermSize) {
+    let (old, new) = (term.columns(), size.columns());
+    if old == new || term.mode().contains(TermMode::ALT_SCREEN) {
+        term.resize(size);
+        return;
+    }
+    let grid = term.grid_mut();
+    let cursor = grid.cursor.point.line.0;
+    // A shorter pane drops the screen rows from here down (alacritty keeps
+    // the cursor's row on it); a tail queued for one would go on another.
+    let kept = (size.screen_lines() as i32).max(cursor + 1);
+    let mut tails = Vec::new();
+    let mut wrapped_into = false;
+    for l in grid.topmost_line().0..=grid.bottommost_line().0 {
+        let row = &mut grid[Line(l)];
+        let restored = unclip_row(row, old);
+        let wraps = !restored && row[Column(old - 1)].flags.contains(Flags::WRAPLINE);
+        let overflows = row[..].iter().skip(new).any(|c| !c.is_empty());
+        if overflows && l < kept && !wrapped_into && !wraps && (new > old || l != cursor) {
+            let mut tail = clip_row(row, new);
+            if new > old {
+                // alacritty only grows a row narrower than the pane.
+                row.append(&mut tail);
+            } else {
+                // Narrowing would reflow the tail; it goes back on after.
+                tails.push(tail);
+            }
+        }
+        wrapped_into = wraps;
+    }
+    term.resize(size);
+    // The rows just clipped are the only marked ones, still in order, and
+    // the oldest are the ones a full scrollback drops: match from the bottom.
+    let grid = term.grid_mut();
+    let mut tails = tails.into_iter().rev();
+    for l in (grid.topmost_line().0..=grid.bottommost_line().0).rev() {
+        let row = &mut grid[Line(l)];
+        if row[Column(0)].flags.contains(CLIPPED)
+            && let Some(mut tail) = tails.next()
+        {
+            row.append(&mut tail);
+        }
+    }
+}
+
+/// Cut `row` to show `cols` cells, marking them and returning the rest
+/// (trailing blanks dropped), marked too. A wide char the edge would split
+/// goes whole into the rest, leaving alacritty's placeholder for a wide
+/// char moved on to the next row.
+fn clip_row(row: &mut Row<Cell>, cols: usize) -> Vec<Cell> {
+    let mut cells = row[..].to_vec();
+    let end = cells
+        .iter()
+        .rposition(|c| !c.is_empty())
+        .map_or(0, |i| i + 1);
+    cells.truncate(end);
+    let cut = if cells[cols - 1].flags.contains(Flags::WIDE_CHAR) {
+        cols - 1
+    } else {
+        cols
+    };
+    let mut tail = cells.split_off(cut);
+    if cut < cols {
+        cells.push(Cell {
+            flags: Flags::LEADING_WIDE_CHAR_SPACER,
+            ..Cell::default()
+        });
+    }
+    for cell in cells.iter_mut().chain(&mut tail) {
+        cell.flags.insert(CLIPPED);
+    }
+    *row = Row::from_vec(cells, cols);
+    tail
+}
+
+/// Undo [`clip_row`] on a row showing `cols` cells: put back what it kept
+/// past its edge, or drop that when a program has written to the row since.
+/// Whether the row came back whole.
+fn unclip_row(row: &mut Row<Cell>, cols: usize) -> bool {
+    if row.len() <= cols {
+        // A clipped row alacritty reflowed under a full-screen program.
+        if row[Column(0)].flags.contains(CLIPPED) {
+            for cell in &mut row[..] {
+                cell.flags.remove(CLIPPED);
+            }
+        }
+        return false;
+    }
+    let intact = row[..Column(cols)]
+        .iter()
+        .all(|c| c.flags.contains(CLIPPED));
+    let mut cells = row[..].to_vec();
+    if !intact {
+        cells.truncate(cols);
+    } else if cells[cols - 1]
+        .flags
+        .contains(Flags::LEADING_WIDE_CHAR_SPACER)
+    {
+        cells.remove(cols - 1);
+    }
+    for cell in &mut cells {
+        cell.flags.remove(CLIPPED);
+    }
+    let len = cells.len();
+    *row = Row::from_vec(cells, len);
+    intact
 }
 
 /// Whether grid row `line_idx` soft-wraps into the next (WRAPLINE on its
@@ -6617,6 +6813,133 @@ mod tests {
         );
     }
 
+    /// Every row of the model, scrollback first, trailing blanks trimmed.
+    fn all_rows(term: &Term<VoidListener>) -> Vec<String> {
+        (term.grid().topmost_line().0..term.screen_lines() as i32)
+            .map(|l| row_text_and_cols(term, l).0.trim_end().to_string())
+            .collect()
+    }
+
+    fn resize_to(term: &mut Term<VoidListener>, cols: usize) {
+        resize_term(term, TermSize::new(cols, 6));
+    }
+
+    const PANEL: [&str; 3] = [
+        "╭──────────── Assistant ─────╮",
+        "│ a reply laid out to fit 30 │",
+        "╰────────────────────────────╯",
+    ];
+
+    /// [`PANEL`] clipped to 12 columns.
+    const PANEL_AT_12: [&str; 3] = ["╭───────────", "│ a reply la", "╰───────────"];
+
+    /// A 30-column pane showing [`PANEL`], then `after`.
+    fn panel_then(after: &str) -> Term<VoidListener> {
+        let mut term = fresh_term(30, 6);
+        let bytes = format!("{}\r\n{after}", PANEL.join("\r\n"));
+        feed(&mut term, bytes.as_bytes());
+        term
+    }
+
+    /// A panel printed to the pane's width keeps one row per row when the
+    /// pane narrows, and comes back whole when it widens (#1857).
+    #[test]
+    fn narrowing_clips_a_panel_and_widening_brings_it_back() {
+        let mut term = panel_then("$ ");
+        resize_to(&mut term, 12);
+        let rows = all_rows(&term);
+        assert_eq!(rows[..3], PANEL_AT_12, "{rows:?}");
+        assert_eq!(rows[3], "$");
+        // Through a narrower step and a wider one that still cuts it.
+        for cols in [8, 20, 30] {
+            resize_to(&mut term, cols);
+        }
+        assert_eq!(all_rows(&term)[..3], PANEL, "{:?}", all_rows(&term));
+    }
+
+    /// The cut cells ride the row into scrollback as output scrolls it off.
+    #[test]
+    fn a_clipped_row_keeps_its_cells_in_scrollback() {
+        let mut term = panel_then("");
+        resize_to(&mut term, 12);
+        feed(&mut term, b"1\r\n2\r\n3\r\n4\r\n5\r\n6\r\n$ ");
+        let rows = all_rows(&term);
+        assert_eq!(
+            rows[..4],
+            [PANEL_AT_12[0], PANEL_AT_12[1], PANEL_AT_12[2], "1"]
+        );
+        resize_to(&mut term, 30);
+        let rows = all_rows(&term);
+        assert_eq!(rows[..3], PANEL, "{rows:?}");
+    }
+
+    /// A row a program rewrote while clipped is its new content alone:
+    /// widening must not bring the old row's cut-off end back after it.
+    #[test]
+    fn a_row_rewritten_while_clipped_drops_what_was_cut() {
+        let mut term = panel_then("$ ");
+        resize_to(&mut term, 12);
+        feed(&mut term, b"\x1b[2;1H\x1b[2Knew\x1b[4;3H");
+        resize_to(&mut term, 30);
+        let rows = all_rows(&term);
+        assert_eq!(rows[..3], [PANEL[0], "new", PANEL[2]], "{rows:?}");
+    }
+
+    /// Lines the pane soft-wrapped, and the row the cursor is on, reflow
+    /// as before: they are text, not a layout.
+    #[test]
+    fn soft_wrapped_lines_and_the_cursor_row_still_reflow() {
+        let (long, typed) = (
+            "abcdefghijklmnopqrstuvwxyz0123456789",
+            "$ echo 0123456789abc",
+        );
+        let mut term = fresh_term(30, 6);
+        feed(&mut term, format!("{long}\r\n{typed}").as_bytes());
+        resize_to(&mut term, 10);
+        assert_eq!(all_rows(&term).concat(), format!("{long}{typed}"));
+        resize_to(&mut term, 40);
+        let rows = all_rows(&term);
+        assert_eq!(rows[..2], [long, typed], "{rows:?}");
+    }
+
+    /// A wide char the new edge would split is cut whole, and comes back.
+    #[test]
+    fn a_wide_char_at_the_cut_comes_back_whole() {
+        let row = "123456789日本 and the rest";
+        let mut term = fresh_term(30, 6);
+        feed(&mut term, format!("{row}\r\n").as_bytes());
+        resize_to(&mut term, 10);
+        assert_eq!(all_rows(&term)[..2], ["123456789", ""]);
+        resize_to(&mut term, 30);
+        assert_eq!(all_rows(&term)[0], row);
+    }
+
+    /// A pane losing lines as it narrows drops the rows below the cursor's,
+    /// and what was cut off them goes too, not onto the panel above.
+    #[test]
+    fn rows_a_shorter_pane_drops_take_their_cut_cells_with_them() {
+        let mut term = fresh_term(30, 6);
+        let bytes = format!(
+            "1\r\n{}\r\n$ \r\na row below the cursor\x1b[5;3H",
+            PANEL.join("\r\n")
+        );
+        feed(&mut term, bytes.as_bytes());
+        resize_term(&mut term, TermSize::new(12, 3));
+        let rows = all_rows(&term);
+        assert_eq!(
+            rows,
+            ["1", PANEL_AT_12[0], PANEL_AT_12[1], PANEL_AT_12[2], "$"]
+        );
+        resize_to(&mut term, 30);
+        let rows = all_rows(&term);
+        assert_eq!(
+            rows[..5],
+            ["1", PANEL[0], PANEL[1], PANEL[2], "$"],
+            "{rows:?}"
+        );
+        assert!(rows[5..].iter().all(String::is_empty), "{rows:?}");
+    }
+
     #[test]
     fn scroll_offset_centers_a_scrollback_match_and_clamps_to_the_range() {
         // 24-row pane, 100 lines of scrollback (max_off 100). A match on an
@@ -6724,6 +7047,33 @@ mod tests {
         assert_eq!(
             response, "\x1b[1;1R",
             "a fresh terminal's cursor is at row 1, column 1 (1-based), so the reply must be ESC[1;1R"
+        );
+    }
+
+    /// OSC 7501: Claude Code reports its status only once the terminal
+    /// answers the probe. It sends a device-attributes query right behind
+    /// it, which every terminal answers, so the probe's answer must reach
+    /// the program FIRST: the first ten bytes it reads back are the answer.
+    #[test]
+    fn the_osc_7501_probe_is_answered_ahead_of_the_device_attributes_reply() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = r#"stty raw -echo; printf '\033]7501;?\033\\\033[c'; r=$(head -c 10 | od -An -tx1 | tr -d ' \n'); stty sane; printf 'got:%s\n' "$r"; sleep 30"#;
+        let term = PtyTerminal::new_running(
+            "/bin/sh",
+            &[String::from("-c"), String::from(script)],
+            tmp.path(),
+        )
+        .unwrap();
+        crate::test_budget::await_spawned(
+            crate::test_budget::tests::SHELL_PAINT_BASE,
+            "the probe's answer to be read back",
+            // Not bare `got:`: the pane's header line echoes the script.
+            || term.visible_text().contains("got:1b"),
+        );
+        assert!(
+            term.visible_text().contains("got:1b5d373530313b3f1b5c"),
+            "{}",
+            term.visible_text()
         );
     }
 
@@ -8902,6 +9252,80 @@ mod tests {
             pair_decorations(&term.marks_snapshot()).is_empty(),
             "an empty Enter must not fabricate a finished command"
         );
+    }
+
+    /// #1101: a string PROMPT_COMMAND ending in `;` (zoxide's init), in
+    /// `&` or a `# comment`, or starting with `;`, joined to croft's hooks
+    /// with `;`, made bash reject the whole string at every prompt, so no
+    /// mark was ever sent. Each shape must still mark a failed command, and
+    /// empty Enters must still fabricate none: `_croft_precmd` runs first
+    /// and is what the DEBUG trap compares, never the user's entry.
+    #[test]
+    fn a_prompt_command_ending_in_a_separator_keeps_the_marks() {
+        let Some(bash) = modern_bash() else {
+            return;
+        };
+        for user in [
+            "hook;",
+            "hook; ",
+            "hook\n",
+            ";hook",
+            "hook # note",
+            "hook &",
+        ] {
+            let home = tempfile::tempdir().unwrap();
+            std::fs::write(
+                home.path().join(".bashrc"),
+                format!(
+                    "hook() {{ :; }}\nPROMPT_COMMAND=$'{}'\n",
+                    user.replace('\n', "\\n")
+                ),
+            )
+            .unwrap();
+            let cfg = tempfile::tempdir().unwrap();
+            let mut cmd = CommandBuilder::new(bash);
+            cmd.cwd(home.path());
+            cmd.env("HOME", home.path());
+            for a in apply_shell_integration_env(&mut cmd, bash, cfg.path(), Vec::new()) {
+                cmd.arg(a);
+            }
+            cmd.arg("-i");
+            let mut term = PtyTerminal::spawn_with(cmd, None).unwrap();
+            let wait = |term: &PtyTerminal, what: &str, done: &dyn Fn(&PtyTerminal) -> bool| {
+                crate::test_budget::await_spawned(
+                    std::time::Duration::from_millis(500),
+                    what,
+                    || done(term),
+                );
+            };
+            wait(&term, "bash's first prompt mark", &|t| {
+                !t.prompt_lines().is_empty()
+            });
+            // Two: a start mark fabricated by the first would be closed
+            // by the second as a finished command.
+            for _ in 0..2 {
+                let prompts = term.prompt_lines().len();
+                term.write_input(b"\n");
+                wait(&term, "the prompt after an empty Enter", &|t| {
+                    t.prompt_lines().len() > prompts
+                });
+            }
+            assert!(
+                pair_decorations(&term.marks_snapshot()).is_empty(),
+                "{user:?}: an empty Enter fabricated a command"
+            );
+            term.write_input(b"false\r");
+            wait(&term, "the failed command's end mark", &|t| {
+                t.command_marks()
+                    .iter()
+                    .any(|(k, _)| *k == crate::shell_integration::OscEvent::CommandEnd(Some(1)))
+            });
+            let (lines, _) = term.grid_lines();
+            assert!(
+                !lines.iter().any(|l| l.contains("syntax error")),
+                "{user:?}: {lines:?}"
+            );
+        }
     }
 
     #[test]

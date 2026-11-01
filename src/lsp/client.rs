@@ -312,7 +312,11 @@ impl ClientState {
                 // Forward the normalised batch to the app. A non-file URI
                 // (e.g. an untitled buffer) has no editor to paint, so skip it.
                 if let Ok(path) = params.uri.to_file_path() {
-                    let diagnostics = params.diagnostics.iter().map(convert_diagnostic).collect();
+                    let diagnostics = params
+                        .diagnostics
+                        .iter()
+                        .map(|d| convert_diagnostic(&this.name, d))
+                        .collect();
                     let _ = this.diagnostics_tx.send(DiagnosticsUpdate {
                         path,
                         server: this.name.clone(),
@@ -374,7 +378,7 @@ impl ClientState {
 /// Normalise one LSP wire diagnostic into croft's `Diagnostic`. Severity
 /// defaults to `Error` when the server omits it (the LSP spec says the client
 /// may pick, and an unclassified problem is most safely shown as an error).
-pub(crate) fn convert_diagnostic(d: &lsp_types::Diagnostic) -> Diagnostic {
+pub(crate) fn convert_diagnostic(server: &str, d: &lsp_types::Diagnostic) -> Diagnostic {
     let severity = match d.severity {
         Some(LspDiagnosticSeverity::WARNING) => DiagnosticSeverity::Warning,
         Some(LspDiagnosticSeverity::INFORMATION) => DiagnosticSeverity::Information,
@@ -404,6 +408,10 @@ pub(crate) fn convert_diagnostic(d: &lsp_types::Diagnostic) -> Diagnostic {
                 source: d.source.clone().filter(|s| !s.is_empty()),
                 href: d.code_description.as_ref().map(|c| c.href.to_string()),
             }),
+        origin: Some(std::sync::Arc::new(crate::lsp::manager::DiagnosticOrigin {
+            server: server.to_string(),
+            wire: d.clone(),
+        })),
     }
 }
 
@@ -1837,6 +1845,22 @@ mod tests {
         );
     }
 
+    /// #1030: the converted diagnostic keeps the server that sent it and
+    /// the diagnostic as sent, for a code-action request to hand back.
+    #[test]
+    fn a_converted_diagnostic_keeps_its_server_and_wire_form() {
+        let wire = lsp_types::Diagnostic {
+            message: "unused".into(),
+            data: Some(serde_json::json!({ "edits": [] })),
+            ..Default::default()
+        };
+        let origin = convert_diagnostic("ruff", &wire)
+            .origin
+            .expect("a published diagnostic has an origin");
+        assert_eq!(origin.server, "ruff");
+        assert_eq!(origin.wire, wire);
+    }
+
     #[test]
     fn convert_diagnostic_maps_severity_and_utf16_range() {
         use lsp_types::{Position, Range};
@@ -1855,7 +1879,7 @@ mod tests {
             message: "Property 'capitol' does not exist".into(),
             ..Default::default()
         };
-        let d = convert_diagnostic(&wire);
+        let d = convert_diagnostic("srv", &wire);
         assert_eq!(d.start_line, 6);
         assert_eq!(d.start_char, 25);
         assert_eq!(d.end_line, 6);
@@ -1877,7 +1901,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            convert_diagnostic(&wire).severity,
+            convert_diagnostic("srv", &wire).severity,
             DiagnosticSeverity::Error,
             "an unclassified problem is shown as an error, not silently dropped"
         );
@@ -1891,15 +1915,24 @@ mod tests {
             tags,
             ..Default::default()
         };
-        let unused = convert_diagnostic(&wire(Some(vec![lsp_types::DiagnosticTag::UNNECESSARY])));
+        let unused = convert_diagnostic(
+            "srv",
+            &wire(Some(vec![lsp_types::DiagnosticTag::UNNECESSARY])),
+        );
         assert_eq!(unused.severity, DiagnosticSeverity::Hint);
         assert!(unused.tags.unnecessary && !unused.tags.deprecated);
-        let old = convert_diagnostic(&wire(Some(vec![lsp_types::DiagnosticTag::DEPRECATED])));
+        let old = convert_diagnostic(
+            "srv",
+            &wire(Some(vec![lsp_types::DiagnosticTag::DEPRECATED])),
+        );
         assert!(old.tags.deprecated && !old.tags.unnecessary);
-        let both = convert_diagnostic(&wire(Some(vec![
-            lsp_types::DiagnosticTag::DEPRECATED,
-            lsp_types::DiagnosticTag::UNNECESSARY,
-        ])));
+        let both = convert_diagnostic(
+            "srv",
+            &wire(Some(vec![
+                lsp_types::DiagnosticTag::DEPRECATED,
+                lsp_types::DiagnosticTag::UNNECESSARY,
+            ])),
+        );
         assert!(both.tags.deprecated && both.tags.unnecessary);
     }
 
@@ -1911,11 +1944,19 @@ mod tests {
             tags,
             ..Default::default()
         };
-        assert!(!convert_diagnostic(&wire(None)).tags.any());
-        assert!(!convert_diagnostic(&wire(Some(Vec::new()))).tags.any());
+        assert!(!convert_diagnostic("srv", &wire(None)).tags.any());
+        assert!(
+            !convert_diagnostic("srv", &wire(Some(Vec::new())))
+                .tags
+                .any()
+        );
         let unknown: lsp_types::DiagnosticTag =
             serde_json::from_value(serde_json::json!(7)).unwrap();
-        assert!(!convert_diagnostic(&wire(Some(vec![unknown]))).tags.any());
+        assert!(
+            !convert_diagnostic("srv", &wire(Some(vec![unknown])))
+                .tags
+                .any()
+        );
     }
 
     /// #1540: the rule code survives the conversion, a string (ruff, ty)
@@ -1931,7 +1972,9 @@ mod tests {
             "message": "`os` imported but unused"
         }))
         .unwrap();
-        let code = convert_diagnostic(&wire).code.expect("the code is kept");
+        let code = convert_diagnostic("srv", &wire)
+            .code
+            .expect("the code is kept");
         assert_eq!(code.value, "F401");
         assert_eq!(code.source.as_deref(), Some("Ruff"));
         assert_eq!(
@@ -1946,13 +1989,16 @@ mod tests {
             "message": "Type 'string' is not assignable to type 'number'."
         }))
         .unwrap();
-        let code = convert_diagnostic(&ts).code.unwrap();
+        let code = convert_diagnostic("srv", &ts).code.unwrap();
         assert_eq!(
             (code.value.as_str(), code.source, code.href),
             ("2322", None, None)
         );
         assert_eq!(
-            convert_diagnostic(&ts).code.unwrap().label("typescript"),
+            convert_diagnostic("srv", &ts)
+                .code
+                .unwrap()
+                .label("typescript"),
             "typescript(2322)"
         );
     }
@@ -1965,13 +2011,16 @@ mod tests {
             source: Some(String::from("rustc")),
             ..Default::default()
         };
-        assert_eq!(convert_diagnostic(&wire).code, None);
+        assert_eq!(convert_diagnostic("srv", &wire).code, None);
         let blank: lsp_types::Diagnostic = serde_json::from_value(json!({
             "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 0 } },
             "code": "E1", "source": "", "message": "m"
         }))
         .unwrap();
-        assert_eq!(convert_diagnostic(&blank).code.unwrap().label(""), "E1");
+        assert_eq!(
+            convert_diagnostic("srv", &blank).code.unwrap().label(""),
+            "E1"
+        );
     }
 
     #[test]

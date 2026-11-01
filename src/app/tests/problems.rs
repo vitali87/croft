@@ -382,6 +382,7 @@ fn typing_in_the_problems_panel_filters_and_esc_clears_before_leaving() {
                 message: String::from("mismatched types"),
                 tags: Default::default(),
                 code: None,
+                origin: None,
             },
             Diagnostic {
                 start_line: 2,
@@ -392,6 +393,7 @@ fn typing_in_the_problems_panel_filters_and_esc_clears_before_leaving() {
                 message: String::from("function `run` is never used"),
                 tags: Default::default(),
                 code: None,
+                origin: None,
             },
         ],
     );
@@ -444,6 +446,7 @@ fn clicking_a_problem_row_opens_that_file_at_the_line() {
             message: String::from("function `run` is never used"),
             tags: Default::default(),
             code: None,
+            origin: None,
         }],
     );
     app.lsp_diagnostics.insert(file.clone(), by_server);

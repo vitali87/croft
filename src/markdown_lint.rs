@@ -226,6 +226,7 @@ fn diag(
         message: message.to_string(),
         tags: Default::default(),
         code: None,
+        origin: None,
     }
 }
 

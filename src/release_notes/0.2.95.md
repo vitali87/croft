@@ -1,0 +1,1 @@
+fix: Quick fixes for a diagnostic show up again (Add import, Remove unused import, Disable for this line): croft hands each language server back its own diagnostics as it sent them, code and data included, instead of a rebuilt copy without them.

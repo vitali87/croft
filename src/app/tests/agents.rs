@@ -1429,6 +1429,118 @@ fn an_agent_pane_is_badged_and_a_prompt_fires_waiting_once() {
     );
 }
 
+/// OSC 7501: an agent that reports its own status is taken at its word, not
+/// its screen. The fake agent says it is working with a Y/n prompt on screen,
+/// then blocked on a screen with no prompt. Only the seated agent's own
+/// reports count: not a departed agent's, not those of a program that is no
+/// agent, and when one agent replaces another between two samples, a probe
+/// between them is what keeps the second's.
+#[test]
+fn a_reporting_agent_is_read_by_its_report_not_its_screen() {
+    use crate::agents::AgentStatus;
+    use crate::program_status::State;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // One step per Enter: working, blocked, a non-agent's done, a probe and
+    // working, then blocked with no probe.
+    let script = [
+        r#"printf 'Do you want to proceed? (y/n)\n\033]7501;state=working\033\\'"#,
+        r#"printf '\033[2J\033[H\033]7501;state=blocked:kind=permission\033\\all quiet\n'"#,
+        r#"printf '\033]7501;state=done:id=job\033\\'"#,
+        r#"printf '\033]7501;?\033\\\033]7501;state=working\033\\'"#,
+        r#"printf '\033]7501;state=blocked\033\\'; sleep 30"#,
+    ]
+    // `-r`: the probe's answer, echoed in the input, ends in a backslash.
+    .join("; read -r x; ");
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[String::from("-c"), script],
+        tmp.path(),
+    )
+    .unwrap();
+    let shell_pid = app.terminals[0]
+        .shell_pid()
+        .expect("a running pane has a pid");
+    let step = |app: &mut App, enter: bool, want: State, what: &str| {
+        if enter {
+            app.terminals[0].write_input(b"\r");
+        }
+        crate::test_budget::await_spawned(
+            crate::test_budget::tests::SHELL_PAINT_BASE,
+            what,
+            || app.terminals[0].reported_status() == Some(want),
+        );
+    };
+    let zero = std::time::Duration::ZERO;
+    let sample = |name: &str| vec![(shell_pid, String::from(name))];
+    let status = |app: &App| app.terminals[0].agent().map(|a| a.status);
+
+    step(
+        &mut app,
+        false,
+        State::Working,
+        "the fake agent to report working",
+    );
+    assert!(app.apply_agent_samples(&sample("claude"), zero));
+    assert_eq!(
+        status(&app),
+        Some(AgentStatus::Working),
+        "the report, though the screen shows a prompt"
+    );
+
+    step(
+        &mut app,
+        true,
+        State::Blocked,
+        "the fake agent to report blocked",
+    );
+    assert!(app.apply_agent_samples(&sample("claude"), zero));
+    assert_eq!(
+        status(&app),
+        Some(AgentStatus::Waiting),
+        "blocked, though no prompt is on screen"
+    );
+    assert!(app.drain_agent_events());
+    assert!(app.status.contains("waiting"), "{}", app.status);
+
+    // The agent leaves; a program that is no agent reports while the shell
+    // has the pane. The next agent is judged by its screen, by neither.
+    assert!(app.apply_agent_samples(&sample("zsh"), zero));
+    step(
+        &mut app,
+        true,
+        State::Done,
+        "a non-agent program to report done",
+    );
+    app.apply_agent_samples(&sample("make"), zero);
+    assert!(app.apply_agent_samples(&sample("claude"), zero));
+    assert_eq!(app.terminals[0].reported_status(), None);
+    assert_eq!(status(&app), Some(AgentStatus::Idle));
+
+    // Another agent replaces it between two samples. Its probe divides the
+    // two, so its first report counts.
+    step(
+        &mut app,
+        true,
+        State::Working,
+        "the next agent to probe and report",
+    );
+    assert!(app.apply_agent_samples(&sample("crush"), zero));
+    assert_eq!(status(&app), Some(AgentStatus::Working));
+
+    // A replacement with no probe or prompt between: whose report it is
+    // cannot be told, so the screen judges.
+    step(
+        &mut app,
+        true,
+        State::Blocked,
+        "a report with no probe before it",
+    );
+    assert!(app.apply_agent_samples(&sample("codex"), zero));
+    assert_eq!(app.terminals[0].reported_status(), None);
+    assert_eq!(status(&app), Some(AgentStatus::Idle));
+}
+
 /// #374: Fix with Navigator from PROBLEMS. With no navigator seated the
 /// action lands on the diagnostic and says the navigator is not active
 /// rather than doing nothing; the caret-side entry points resolve the
@@ -1455,6 +1567,7 @@ fn fix_with_navigator_lands_on_the_diagnostic_and_refuses_without_a_seat() {
             message: String::from("unused import: `std::io`"),
             tags: Default::default(),
             code: None,
+            origin: None,
         }],
     );
     app.lsp_diagnostics.insert(file.clone(), by_server);
@@ -3001,6 +3114,7 @@ fn a_proposals_diagnostics_show_in_the_popup_not_the_buffer() {
             message: "Undefined name `nope_undefined`".into(),
             tags: Default::default(),
             code: None,
+            origin: None,
         }],
         pulled: false,
     }]);

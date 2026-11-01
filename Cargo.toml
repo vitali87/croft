@@ -1,6 +1,6 @@
 [package]
 name = "croft-software"
-version = "0.2.90"
+version = "0.2.101"
 edition = "2024"
 description = "VSCode-style TUI written in Rust"
 license = "MIT"
@@ -245,7 +245,7 @@ quick-xml = "0.39"
 # 2026-08-19. `hooks` (no extra crates) gives the progress handler that stops
 # a view's query past its time budget instead of freezing the open (#1002).
 rusqlite = { version = "0.40", features = ["bundled", "hooks"] }
-zip = { version = "7", default-features = false, features = ["deflate"] }
+zip = { version = "8", default-features = false, features = ["deflate"] }
 # Read-only TOML parser for the Explorer DEPENDENCIES view: extracts the
 # dependency list from `pyproject.toml` (PEP 621 `[project].dependencies` or
 # `[tool.poetry.dependencies]`). `parse` + `serde` give `toml::Table`/`Value`

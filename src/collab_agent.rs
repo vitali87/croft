@@ -2,10 +2,14 @@
 //! Phase D). `croft collab-agent --workspace <path>` joins the workspace's
 //! collab relay as a regular guest and serves five `collab_*` tools over
 //! JSON-RPC 2.0 on stdio, so an external agent (e.g. Claude Code, registered
-//! with `claude mcp add`) co-edits with a live named caret. Croft stays free
-//! of LLM code: the intelligence is whatever drives the tools; this module is
-//! just a seat at the table, and it inherits every guest property for free —
-//! owner-only disk writes, per-file site ids, convergence via the CRDT.
+//! with `claude mcp add`) co-edits with a live named caret. It speaks both MCP
+//! eras: `server/discover` and per-request `_meta` (2026-07-28, what Claude
+//! Code now opens with on stdio) and the legacy `initialize` handshake.
+//!
+//! Croft stays free of LLM code: the intelligence is whatever drives the
+//! tools; this module is just a seat at the table, and it inherits every
+//! guest property for free — owner-only disk writes, per-file site ids,
+//! convergence via the CRDT.
 //!
 //! Concurrency: one background thread pumps the session (drains the socket,
 //! integrates remote ops, tracks peer carets) so the replica is always fresh
@@ -22,6 +26,7 @@ use anyhow::{Context, Result};
 use serde_json::{Value, json};
 
 use crate::collab::{CollabChannel, CollabEvent, CollabRole, CollabSession};
+use crate::mcp::client as mcp;
 
 /// How long `collab_open` waits for the owner's snapshot before reporting
 /// that nobody serves this workspace: a hair past the session's own 3s
@@ -94,23 +99,79 @@ fn pump(state: &Mutex<AgentState>) {
     }
 }
 
+/// This seat's name and version, as MCP `Implementation`.
+fn server_info() -> Value {
+    json!({ "name": "croft-collab", "version": env!("CARGO_PKG_VERSION") })
+}
+
+/// A JSON-RPC error: code, message, and optional `data`.
+type RpcError = (i64, String, Option<Value>);
+
+/// Check a modern request's `_meta`: the version and capabilities are
+/// required, and the version must be one this seat serves statelessly.
+fn check_modern_meta(meta: Option<&Value>) -> Result<(), RpcError> {
+    let field = |key| meta.and_then(|m| m.get(key));
+    let (Some(version), Some(_)) = (
+        field(mcp::PROTOCOL_VERSION_KEY).and_then(Value::as_str),
+        field(mcp::CLIENT_CAPABILITIES_KEY).filter(|caps| caps.is_object()),
+    ) else {
+        return Err((
+            -32602,
+            format!(
+                "_meta needs {} as a string and {} as an object",
+                mcp::PROTOCOL_VERSION_KEY,
+                mcp::CLIENT_CAPABILITIES_KEY
+            ),
+            None,
+        ));
+    };
+    if version != mcp::MODERN_VERSION {
+        return Err((
+            mcp::UNSUPPORTED_PROTOCOL_VERSION,
+            String::from("Unsupported protocol version"),
+            Some(json!({ "supported": mcp::SUPPORTED_VERSIONS, "requested": version })),
+        ));
+    }
+    Ok(())
+}
+
 /// Answer one inbound JSON-RPC message; `None` for notifications (and for
 /// malformed lines with no `id` to answer to).
+///
+/// The seat is dual-era. A request carrying a protocol version in its
+/// `_meta`, and the `server/discover` probe, are modern: served statelessly,
+/// and the result names its type and this server. Anything else (an
+/// `initialize` handshake and the plain requests after it) is legacy and
+/// answered as before.
 fn handle(state: &Mutex<AgentState>, msg: &Value) -> Option<Value> {
     let method = msg
         .get("method")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    let result = match method {
-        "initialize" => Ok(json!({
-            "protocolVersion": crate::mcp::client::PROTOCOL_VERSION,
+    if matches!(
+        method,
+        "notifications/initialized" | "notifications/cancelled"
+    ) {
+        return None;
+    }
+    let meta = msg.pointer("/params/_meta");
+    let modern = method == "server/discover"
+        || meta.is_some_and(|m| m.get(mcp::PROTOCOL_VERSION_KEY).is_some());
+    let checked = if modern {
+        check_modern_meta(meta)
+    } else {
+        Ok(())
+    };
+    let result = checked.and_then(|()| match method {
+        "server/discover" => Ok(json!({
+            "supportedVersions": mcp::SUPPORTED_VERSIONS,
             "capabilities": { "tools": {} },
-            "serverInfo": {
-                "name": "croft-collab",
-                "version": env!("CARGO_PKG_VERSION"),
-            },
         })),
-        "notifications/initialized" | "notifications/cancelled" => return None,
+        "initialize" => Ok(json!({
+            "protocolVersion": mcp::LEGACY_VERSION,
+            "capabilities": { "tools": {} },
+            "serverInfo": server_info(),
+        })),
         "ping" => Ok(json!({})),
         "tools/list" => Ok(json!({ "tools": tool_definitions() })),
         "tools/call" => {
@@ -125,19 +186,30 @@ fn handle(state: &Mutex<AgentState>, msg: &Value) -> Option<Value> {
                 .unwrap_or_else(|| json!({}));
             match call_tool(state, &name, &args) {
                 Some(result) => Ok(result),
-                None => Err((-32602, format!("unknown tool: {name}"))),
+                None => Err((-32602, format!("unknown tool: {name}"), None)),
             }
         }
-        _ => Err((-32601, format!("method not found: {method}"))),
-    };
+        _ => Err((-32601, format!("method not found: {method}"), None)),
+    });
     let id = msg.get("id").cloned()?;
     Some(match result {
-        Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
-        Err((code, message)) => json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "error": { "code": code, "message": message },
-        }),
+        Ok(mut result) => {
+            if let (true, Some(fields)) = (modern, result.as_object_mut()) {
+                fields.insert("resultType".into(), json!("complete"));
+                fields.insert(
+                    "_meta".into(),
+                    json!({ mcp::SERVER_INFO_KEY: server_info() }),
+                );
+            }
+            json!({ "jsonrpc": "2.0", "id": id, "result": result })
+        }
+        Err((code, message, data)) => {
+            let mut error = json!({ "code": code, "message": message });
+            if let Some(data) = data {
+                error["data"] = data;
+            }
+            json!({ "jsonrpc": "2.0", "id": id, "error": error })
+        }
     })
 }
 
@@ -399,11 +471,12 @@ mod tests {
         let (_dir, _socket, state) = agent_over_relay();
 
         let init = handle(&state, &rpc(1, "initialize", json!({}))).unwrap();
-        assert_eq!(
-            init["result"]["protocolVersion"],
-            crate::mcp::client::PROTOCOL_VERSION
-        );
+        assert_eq!(init["result"]["protocolVersion"], mcp::LEGACY_VERSION);
         assert_eq!(init["result"]["serverInfo"]["name"], "croft-collab");
+        assert!(
+            init["result"].get("resultType").is_none(),
+            "a legacy answer stays legacy"
+        );
         assert!(
             handle(
                 &state,
@@ -441,6 +514,81 @@ mod tests {
             "the error teaches the fix: {}",
             text_of(&read)
         );
+    }
+
+    /// A modern request: `params` with croft's own client `_meta` at `version`.
+    fn modern(id: i64, method: &str, params: Value, version: &str) -> Value {
+        let mut meta = mcp::request_meta("claude-code", "test");
+        meta.insert(mcp::PROTOCOL_VERSION_KEY.into(), json!(version));
+        rpc(id, method, mcp::with_meta(params, &meta))
+    }
+
+    /// The 2026-07-28 surface, as Claude Code now opens it on stdio: the
+    /// discover probe answers with both eras' versions (and croft's own
+    /// client reads it as modern), and a request carrying `_meta` is served
+    /// with no `initialize`, its result typed and naming this server.
+    #[test]
+    fn collab_agent_answers_a_modern_client_without_a_handshake() {
+        let (_dir, _socket, state) = agent_over_relay();
+
+        let probe = modern(1, "server/discover", json!({}), mcp::MODERN_VERSION);
+        let discovered = handle(&state, &probe).unwrap();
+        let result = &discovered["result"];
+        assert_eq!(result["supportedVersions"], json!(mcp::SUPPORTED_VERSIONS));
+        assert_eq!(result["capabilities"]["tools"], json!({}));
+        assert_eq!(result["resultType"], "complete");
+        assert_eq!(
+            result["_meta"][mcp::SERVER_INFO_KEY]["name"],
+            "croft-collab"
+        );
+        assert_eq!(mcp::classify_probe(&discovered).unwrap(), mcp::Era::Modern);
+
+        let list = modern(2, "tools/list", json!({}), mcp::MODERN_VERSION);
+        let tools = handle(&state, &list).unwrap();
+        assert_eq!(tools["result"]["tools"].as_array().unwrap().len(), 5);
+        assert_eq!(tools["result"]["resultType"], "complete");
+
+        let read = modern(
+            3,
+            "tools/call",
+            json!({ "name": "collab_read", "arguments": { "file": "src/f.rs" } }),
+            mcp::MODERN_VERSION,
+        );
+        let read = handle(&state, &read).unwrap();
+        assert_eq!(read["result"]["isError"], true);
+        assert_eq!(read["result"]["resultType"], "complete");
+    }
+
+    /// A modern request at a version the seat does not serve gets the
+    /// versions it does, and one missing the required `_meta` fields is
+    /// invalid params rather than a silent legacy answer.
+    #[test]
+    fn collab_agent_rejects_unservable_modern_requests() {
+        let (_dir, _socket, state) = agent_over_relay();
+
+        let probe = modern(1, "server/discover", json!({}), "1900-01-01");
+        let unsupported = handle(&state, &probe).unwrap();
+        assert_eq!(
+            unsupported["error"]["code"],
+            mcp::UNSUPPORTED_PROTOCOL_VERSION
+        );
+        assert_eq!(
+            unsupported["error"]["data"]["supported"],
+            json!(mcp::SUPPORTED_VERSIONS)
+        );
+        assert_eq!(unsupported["error"]["data"]["requested"], "1900-01-01");
+        // A dual-era client retries at a version from that list.
+        assert_eq!(mcp::classify_probe(&unsupported).unwrap(), mcp::Era::Modern);
+
+        let bare = json!({ "_meta": { mcp::PROTOCOL_VERSION_KEY: mcp::MODERN_VERSION } });
+        let invalid = handle(&state, &rpc(2, "tools/list", bare)).unwrap();
+        assert_eq!(invalid["error"]["code"], -32602);
+        let not_an_object = json!({ "_meta": {
+            mcp::PROTOCOL_VERSION_KEY: mcp::MODERN_VERSION,
+            mcp::CLIENT_CAPABILITIES_KEY: null,
+        } });
+        let invalid = handle(&state, &rpc(3, "tools/list", not_an_object)).unwrap();
+        assert_eq!(invalid["error"]["code"], -32602);
     }
 
     /// No owner on the relay: `collab_open` fails with what the user has to

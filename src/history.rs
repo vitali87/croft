@@ -6,9 +6,10 @@
 //! working file or restored.
 //!
 //! The store is keyed by a hash of the file's absolute path (no index file to
-//! keep in sync), consecutive identical saves are de-duplicated, and each
-//! file keeps at most [`MAX_SNAPSHOTS_PER_FILE`] snapshots so the directory
-//! can't grow without bound.
+//! keep in sync), consecutive identical saves are de-duplicated, each file
+//! keeps at most [`MAX_SNAPSHOTS_PER_FILE`] snapshots, and a save over
+//! [`MAX_SNAPSHOT_BYTES`] takes none, so the directory can't grow without
+//! bound.
 
 use std::path::{Path, PathBuf};
 
@@ -21,6 +22,18 @@ const MAX_SNAPSHOTS_PER_FILE: usize = 50;
 const MERGE_WINDOW_MILLIS: u64 = 10_000;
 
 const SNAP_EXT: &str = "snap";
+
+/// Files bigger than this get no snapshot on save (VS Code's
+/// `workbench.localHistory.maxFileSize`, 256 KB). Each snapshot is a full
+/// copy, so saving a 20 MB dump grew the store by 20 MB a time, about 1 GB
+/// per file at the 50-snapshot cap (#1011). Kept records (a restore, a
+/// review baseline) are not saves and are still taken.
+pub const MAX_SNAPSHOT_BYTES: u64 = 256 * 1024;
+
+/// Whether a save of `len` bytes is past [`MAX_SNAPSHOT_BYTES`].
+pub fn too_large_to_snapshot(len: u64) -> bool {
+    len > MAX_SNAPSHOT_BYTES
+}
 
 /// One recorded version of a file.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -171,6 +184,9 @@ fn record_impl(
     millis: u64,
     keep: bool,
 ) -> std::io::Result<()> {
+    if !keep && too_large_to_snapshot(content.len() as u64) {
+        return Ok(());
+    }
     let dir = dir_for(root_dir, abs_path);
     // First, so the merge path below and a directory an older build made
     // (or a migrated legacy one) are owner-only too.
@@ -448,6 +464,9 @@ fn record_seated(
     seats: &crate::provenance::Provenance,
     keep: bool,
 ) -> std::io::Result<()> {
+    if !keep && too_large_to_snapshot(content.len() as u64) {
+        return Ok(());
+    }
     record_impl(root_dir, abs_path, content, millis, keep)?;
     // Nothing attributed writes nothing (see `record_seats_in`), so skip the
     // listing and the snapshot read that would find its holder.
@@ -853,6 +872,26 @@ mod tests {
             e.last().unwrap().millis > 10 * 60_000,
             "the oldest snapshots were pruned, not the newest"
         );
+    }
+
+    /// #1011: a save past the size cap is not copied into the store, while
+    /// one at the cap is, and a kept record (a restore, a review baseline)
+    /// is taken whatever its size.
+    #[test]
+    fn a_save_past_the_size_cap_takes_no_snapshot() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let cap = MAX_SNAPSHOT_BYTES as usize;
+        let big = Path::new("/work/dump.sql");
+        record_in(root, big, &vec![b'x'; cap + 1], 60_000).unwrap();
+        let seats = crate::provenance::Provenance::new();
+        record_with_seats_in(root, big, &vec![b'y'; cap + 1], 120_000, &seats).unwrap();
+        assert!(entries_in(root, big).is_empty());
+        record_kept_in(root, big, &vec![b'z'; cap + 1], 180_000).unwrap();
+        assert_eq!(entries_in(root, big).len(), 1, "a kept record is taken");
+        let edge = Path::new("/work/edge.txt");
+        record_in(root, edge, &vec![b'x'; cap], 60_000).unwrap();
+        assert_eq!(entries_in(root, edge).len(), 1, "the cap itself is allowed");
     }
 
     #[test]

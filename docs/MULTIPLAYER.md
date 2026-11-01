@@ -487,8 +487,11 @@ mux identity (`user@host`), overridable via `CROFT_COLLAB_NAME`.
 **`croft collab-agent`: an AI participant with a visible caret.** A hidden
 headless subcommand (`src/collab_agent.rs`) joins the workspace's relay as a
 regular guest and exposes the session as an MCP server on stdio (JSON-RPC 2.0
-over NDJSON, the shapes croft's own MCP client speaks). Register it once and
-any MCP-speaking agent gets a seat:
+over NDJSON, the shapes croft's own MCP client speaks). It is dual-era: a
+client on the 2026-07-28 revision, as Claude Code now is, probes with
+`server/discover` and sends its version in every request's `_meta`, and an
+older client still gets the `initialize` handshake. Register it once and any
+MCP-speaking agent gets a seat:
 
     claude mcp add croft-collab -- croft collab-agent --workspace <abs path>
 
@@ -632,10 +635,11 @@ each carries a stable id (`Note::id`) so Ignore removes exactly one and a reply
 appends to exactly one.
 
 Clicking a box (or `F4`, which hops to the next box by row, wrapping) focuses
-its reply field: typing edits the draft, `Enter` sends it as a comment-only
-reply turn (the note's body, the reply, and the numbered buffer —
-`compose_reply_turn`), `Esc` releases the keyboard, and the box keeps the
-running conversation as `you:` lines. `✕ Ignore` (or `Shift+F4`) dismisses one
+its reply field: typing edits the draft, `Enter` sends it as a reply turn (the
+note's body, the reply, and the numbered buffer — `compose_reply_turn`). A reply
+is the driver's own turn, not a yield, so it may edit like an ask when it asks
+for a change. `Esc` releases the keyboard, and the box keeps the running
+conversation as `you:` lines. `✕ Ignore` (or `Shift+F4`) dismisses one
 box; "Navigator: Clear Comments" drops them all. Boxes persist across turns —
 only the driver closes a box.
 

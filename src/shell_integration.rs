@@ -7,7 +7,8 @@
 //! `133;D;<exit>` command finished. OSC 7 reports the shell's cwd, OSC 9
 //! carries a desktop-notification payload, and so do the urxvt form
 //! (`777;notify;title;body`, also Ghostty's, foot's and WezTerm's) and
-//! kitty's (`99;metadata;payload`).
+//! kitty's (`99;metadata;payload`). OSC 7501 is a program reporting its own
+//! status ([`crate::program_status`]), which agent panes read.
 //!
 //! `alacritty_terminal` drops unknown OSC sequences before they reach any
 //! handler (they are parsed and logged internally), so croft cannot observe
@@ -55,6 +56,9 @@ pub enum OscEvent {
     /// the sequence as unknown OSC, so this tee is the only way the picture
     /// survives to be drawn as an overlay.
     InlineImage(Vec<u8>),
+    /// OSC 7501 — a program reporting its own status, or probing whether
+    /// the terminal takes such reports ([`crate::program_status`]).
+    ProgramStatus(crate::program_status::Report),
 }
 
 /// Incremental scanner for the OSC sequences croft cares about. Feed it
@@ -171,6 +175,7 @@ enum OscKind {
     UrxvtNotify,    // 777;notify
     KittyNotify,    // 99
     ITerm2File,     // 1337 File= (inline images)
+    ProgramStatus,  // 7501
 }
 
 /// What the bytes starting at an ESC look like.
@@ -199,6 +204,7 @@ const OSC_PREFIXES: &[(&[u8], OscKind)] = &[
     (b"]1337;", OscKind::ITerm2File),
     (b"]133;", OscKind::SemanticPrompt),
     (b"]777;", OscKind::UrxvtNotify),
+    (b"]7501;", OscKind::ProgramStatus),
     (b"]7;", OscKind::Cwd),
     (b"]99;", OscKind::KittyNotify),
     (b"]9;", OscKind::Notify),
@@ -337,6 +343,7 @@ fn parse_event(kind: OscKind, body: &[u8]) -> Option<OscEvent> {
         }
         // Chunked across sequences: `OscSniffer::kitty_chunk` keeps the state.
         OscKind::KittyNotify => None,
+        OscKind::ProgramStatus => crate::program_status::parse(body).map(OscEvent::ProgramStatus),
         OscKind::ITerm2File => {
             let rest = body.strip_prefix(b"File=")?;
             let colon = rest.iter().position(|&b| b == b':')?;
@@ -393,10 +400,17 @@ impl OscSniffer {
                     match find_terminator(&buf[esc..], body_start) {
                         Terminator::Done(body_end, seq_end) => {
                             let body = &buf[esc + body_start..esc + body_end];
-                            let ev = if kind == OscKind::KittyNotify {
-                                self.kitty_chunk(body)
-                            } else {
-                                parse_event(kind, body)
+                            let ev = match kind {
+                                OscKind::KittyNotify => self.kitty_chunk(body),
+                                // Past the spec's limit the report is
+                                // ignored whole. One split across reads
+                                // is bounded by the carry, of that size.
+                                OscKind::ProgramStatus
+                                    if seq_end > crate::program_status::SEQUENCE_MAX =>
+                                {
+                                    None
+                                }
+                                _ => parse_event(kind, body),
                             };
                             if let Some(ev) = ev {
                                 out.push((esc + seq_end - base, ev));
@@ -700,8 +714,11 @@ if [[ -z "$_croft_si_installed" ]]; then
     # `[*]` joins with the first char of IFS: scope it to `;` here or an
     # ARRAY PROMPT_COMMAND joins with spaces and its own entries never
     # match, fabricating a command on every empty Enter.
+    # A string PROMPT_COMMAND is joined with newlines below: those part
+    # entries too.
     local IFS=';'
-    case ";${PROMPT_COMMAND[*]};" in
+    local _croft_pc=";${PROMPT_COMMAND[*]};"
+    case ${_croft_pc//$'\n'/;} in
       *";$BASH_COMMAND;"*) builtin return ;;
     esac
     _croft_preexec
@@ -726,7 +743,15 @@ if [[ -z "$_croft_si_installed" ]]; then
     if [[ "$(declare -p PROMPT_COMMAND 2>/dev/null)" == "declare -a"* ]]; then
       PROMPT_COMMAND=(_croft_precmd "${PROMPT_COMMAND[@]}" _croft_arm)
     else
-      PROMPT_COMMAND="_croft_precmd${PROMPT_COMMAND:+;$PROMPT_COMMAND};_croft_arm"
+      # Joined with newlines, not `;`: a user value ending in `;` (zoxide's
+      # init leaves `__zoxide_hook;`) or `&`, or a trailing `# comment`,
+      # made the joined string a syntax error or commented the arm out,
+      # and bash then ran none of it (#1101). A line still cannot start
+      # with `;`, so leading separators are dropped.
+      _croft_nl=$'\n'
+      _croft_pc="${PROMPT_COMMAND#"${PROMPT_COMMAND%%[^[:space:];]*}"}"
+      PROMPT_COMMAND="_croft_precmd$_croft_nl${_croft_pc:+$_croft_pc$_croft_nl}_croft_arm"
+      builtin unset _croft_nl _croft_pc
     fi
   fi
 fi
@@ -1240,6 +1265,52 @@ mod tests {
         assert_eq!(
             scan_all(&mut s, &[b"\x1b]9;4 done\x07"]),
             vec![OscEvent::Notify(String::from("4 done"))]
+        );
+    }
+
+    #[test]
+    fn osc_7501_reports_and_the_probe_are_read_with_either_terminator() {
+        use crate::program_status::{Report, State};
+        let mut s = OscSniffer::default();
+        assert_eq!(
+            scan_all(
+                &mut s,
+                &[b"\x1b]7501;?\x1b\\\x1b[c\x1b]7501;state=blocked:kind=permission\x07"]
+            ),
+            vec![
+                OscEvent::ProgramStatus(Report::Query),
+                OscEvent::ProgramStatus(Report::Set {
+                    id: String::new(),
+                    state: State::Blocked
+                }),
+            ]
+        );
+        // Split across reads, and beside OSC 7, whose prefix it shares.
+        assert_eq!(
+            scan_all(
+                &mut s,
+                &[b"\x1b]7", b"501;state=work", b"ing\x1b\\\x1b]7;/tmp\x07"]
+            ),
+            vec![
+                OscEvent::ProgramStatus(Report::Set {
+                    id: String::new(),
+                    state: State::Working
+                }),
+                OscEvent::Cwd(PathBuf::from("/tmp"), None),
+            ]
+        );
+        // Over the spec's 4096 bytes the report is ignored, in one read or
+        // split over two; the stream goes on.
+        let pad = "x".repeat(4096);
+        let long = format!("\x1b]7501;state=done:pad={pad}\x07");
+        assert_eq!(scan_all(&mut s, &[long.as_bytes()]), vec![]);
+        let (a, b) = long.as_bytes().split_at(2000);
+        assert_eq!(
+            scan_all(&mut s, &[a, b, b"\x1b]7501;state=idle\x07"]),
+            vec![OscEvent::ProgramStatus(Report::Set {
+                id: String::new(),
+                state: State::Idle
+            })]
         );
     }
 

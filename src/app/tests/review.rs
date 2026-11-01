@@ -464,8 +464,8 @@ fn a_failed_ask_submit_keeps_the_typed_draft() {
 }
 
 /// Enter in a focused comment box sends the reply turn: the composed
-/// message (note context, the reply, COMMENT-ONLY, numbered buffer) reaches
-/// the pilot's claude stdin, and the focus releases.
+/// message (note context, the reply, the edit-on-request rule, numbered
+/// buffer) reaches the pilot's claude stdin, and the focus releases.
 #[test]
 fn enter_in_a_focused_comment_box_sends_the_reply_turn() {
     use std::time::{Duration, Instant};
@@ -518,7 +518,7 @@ fn enter_in_a_focused_comment_box_sends_the_reply_turn() {
         if sent.contains("replied to your note on f.txt at line 1")
             && sent.contains("seed note")
             && sent.contains("is this hot?")
-            && sent.contains("COMMENT-ONLY")
+            && sent.contains("make it with EDIT fences")
         {
             break;
         }

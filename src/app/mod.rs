@@ -912,6 +912,53 @@ pub struct ActivityBarImages {
     layout_customize_hover: String,
 }
 
+/// Everything [`App::bake_chrome_images`] needs, resolved on the UI thread so
+/// the bake can run on one of its own.
+#[derive(Clone, Copy)]
+struct ChromeBakeInput {
+    protocol: crate::iterm2_inline::InlineImageProtocol,
+    cell: (u32, u32),
+    is_tmux: bool,
+    icon_bg: ::image::Rgba<u8>,
+    icon_ink: crate::iterm2_inline::IconInk,
+    sponsor_ink: crate::iterm2_inline::IconInk,
+}
+
+impl ChromeBakeInput {
+    /// Whether pictures baked for `shown` must come down while this bake
+    /// runs, rather than stay up until it lands: across a theme switch they
+    /// carry the old theme's ink and background, and on sixel, where a
+    /// picture is sized in pixels, across a cell-size change they outgrow
+    /// their cells (#1843). A font zoom on Kitty or iTerm2 only rescales them.
+    fn outdates(&self, shown: &ChromeBakeInput) -> bool {
+        self.protocol != shown.protocol
+            || self.icon_bg != shown.icon_bg
+            || self.icon_ink != shown.icon_ink
+            || self.sponsor_ink != shown.sponsor_ink
+            || (self.protocol == crate::iterm2_inline::InlineImageProtocol::Sixel
+                && self.cell != shown.cell)
+    }
+}
+
+/// The pictures [`App::init_graphics`] bakes off the UI thread; `None` for
+/// any that failed to bake.
+struct ChromeImages {
+    activity: Option<ActivityBarImages>,
+    run_debug: Option<String>,
+    ssh: Option<String>,
+}
+
+/// What the welcome wordmark is baked for. A picture baked for any other (a
+/// relayout, a theme switch, a font zoom since) is stale.
+#[derive(Clone, Copy, PartialEq)]
+struct WelcomeBakeKey {
+    layout: WelcomeLayout,
+    cell: (u32, u32),
+    bg: ::image::Rgba<u8>,
+    light: bool,
+    protocol: crate::iterm2_inline::InlineImageProtocol,
+}
+
 /// Single source of truth for the application's user-facing name.
 pub const APP_NAME: &str = "croft";
 
@@ -4082,6 +4129,18 @@ pub struct App {
     /// Required to bake OSC-1337 images at exact viewport pixel size so
     /// iTerm draws them with no stretching or letterboxing.
     cell_pixel: Option<(u32, u32)>,
+    /// The activity-bar icons and panel illustrations `init_graphics` is
+    /// baking off the UI thread (#1973); `None` once they are up.
+    chrome_bake: Option<std::sync::mpsc::Receiver<(ChromeBakeInput, ChromeImages)>>,
+    /// What the activity-bar icons and panel illustrations on screen were
+    /// baked for; `None` while none are up.
+    chrome_shown: Option<ChromeBakeInput>,
+    /// The bake asked for while `chrome_bake` was still running: it runs
+    /// when that one lands, in its place.
+    chrome_bake_next: Option<ChromeBakeInput>,
+    /// The welcome wordmark being baked off the UI thread (#1973), and what
+    /// for; `None` once it is up.
+    welcome_bake: Option<(WelcomeBakeKey, std::sync::mpsc::Receiver<Option<String>>)>,
     /// Last wheel step applied to a PDF preview (when, in which direction,
     /// and on which document), so a momentum flick's same-direction burst
     /// coalesces instead of queueing one blocking rasteriser run per event.
@@ -4415,6 +4474,10 @@ pub struct App {
     /// "View Changes vs <name>" label so users know which branch the
     /// diff compares against. `None` until the resolver succeeds.
     default_branch_label: Option<String>,
+    /// The resolver running off the UI thread for the repository at the
+    /// path (#1973): it runs up to five `git` processes, and on macOS each
+    /// goes through the Xcode shim.
+    default_branch_ask: Option<(PathBuf, std::sync::mpsc::Receiver<Option<String>>)>,
     /// Last HEAD oid the git-gutter baselines were synced against. When the
     /// git worker reports a different oid (commit, checkout, pull), the cached
     /// per-tab HEAD snapshots are invalidated so the gutter refetches.
@@ -4847,6 +4910,11 @@ pub struct App {
     /// re-painted on top of any sidebar illustration it overlaps, since
     /// OSC-1337 images composite above ratatui's text layer.
     ui_tooltip_area: Option<Rect>,
+    /// Where the update card sat on the last frame, `None` while it is
+    /// folded, gone or too big for the screen. The activity bar's gear and
+    /// heart and the side bar's illustrations are inline images, which land
+    /// above text, so they hold back wherever the card is (#1958).
+    update_card_rect: Option<Rect>,
     definition_request_id: Option<u64>,
     /// In-flight Peek Definition request (#115): same LSP request as the
     /// jump, different consumer — the response opens the peek popup at the
@@ -5174,6 +5242,10 @@ pub struct App {
     /// sends the same control byte for both, never a `Shift`. False until
     /// `run` asks.
     kitty_keys: bool,
+    /// The terminal answered the startup probe but not its kitty keyboard
+    /// query, so Ctrl+\, Ctrl+] and Ctrl+/ arrive as the bytes crossterm
+    /// reads as Ctrl+4, Ctrl+5 and Ctrl+7 (#1007): see `legacy_ctrl_punct`.
+    legacy_ctrl_punct: bool,
     /// Native modal (vim-style) editing for the editor pane. When enabled it
     /// supersedes the always-on `editor_vim_chord` convenience layer.
     vim: crate::vim::VimState,
@@ -6879,6 +6951,10 @@ impl App {
             search_query_tx,
             search_results_rx,
             cell_pixel: None,
+            chrome_bake: None,
+            chrome_shown: None,
+            chrome_bake_next: None,
+            welcome_bake: None,
             last_pdf_wheel: None,
             formula_overwrite_armed: false,
             scm_change_badge: None,
@@ -6980,6 +7056,7 @@ impl App {
             pending_terminal_warning: false,
             commit_menu_open: false,
             default_branch_label: None,
+            default_branch_ask: None,
             trust_local_browser: false,
             sidebar_width: SIDEBAR_WIDTH_DEFAULT,
             terminal_height: None,
@@ -7098,6 +7175,7 @@ impl App {
             editor_vim_chord: EditorVimChord::default(),
             cmd_k_leader: None,
             kitty_keys: false,
+            legacy_ctrl_punct: false,
             vim: crate::vim::VimState::new(),
             vim_last_find: None,
             vim_visual_line: false,
@@ -7408,6 +7486,7 @@ impl App {
             ui_tooltip: None,
             ui_tooltip_label: None,
             ui_tooltip_area: None,
+            update_card_rect: None,
             definition_request_id: None,
             peek_definition_request_id: None,
             peek_popup: None,
@@ -7573,22 +7652,142 @@ impl App {
         // widget skips its ASCII fallback so resize doesn't flash old
         // text through the image.
         self.source_control.inline_hero_image_active = true;
-        let canvas_w = cell_w * ACTIVITY_BAR_WIDTH as u32;
-        let canvas_h = cell_h * ACTIVITY_ICON_HEIGHT as u32;
-        let is_tmux = crate::iterm2_inline::detect_tmux();
-        let w_cells = ACTIVITY_BAR_WIDTH;
-        let h_cells = ACTIVITY_ICON_HEIGHT;
-        let icon_bg = self.chrome_bg_pixel();
         // The bar background above is the theme's; so is the ink painted on
         // it. A baked icon can't route its colors through `Theme::ui` the way
         // a styled cell does, so the palette is resolved once here and rides
         // into every compose call (issue #225).
-        let icon_ink = crate::iterm2_inline::IconInk::new(
-            self.theme.activity_icon_inactive_rgb(),
-            self.theme.activity_icon_active_rgb(),
-            self.theme.activity_icon_pill_rgb(),
-        );
-        let protocol = self.inline_protocol;
+        let input = ChromeBakeInput {
+            protocol: self.inline_protocol,
+            cell: (cell_w, cell_h),
+            is_tmux: crate::iterm2_inline::detect_tmux(),
+            icon_bg: self.chrome_bg_pixel(),
+            icon_ink: crate::iterm2_inline::IconInk::new(
+                self.theme.activity_icon_inactive_rgb(),
+                self.theme.activity_icon_active_rgb(),
+                self.theme.activity_icon_pill_rgb(),
+            ),
+            sponsor_ink: crate::iterm2_inline::IconInk::new(
+                self.theme.activity_sponsor_rgb(),
+                self.theme.activity_sponsor_hover_rgb(),
+                self.theme.activity_icon_pill_rgb(),
+            ),
+        };
+        self.start_chrome_bake(input);
+    }
+
+    /// Bake the activity-bar icons and panel illustrations for `input` on a
+    /// thread of its own. Rasterising some fifty icons and two illustrations
+    /// is tens of milliseconds, four times that on a Retina canvas, and croft
+    /// starts in milliseconds (#1973): `poll_chrome_bake` puts the pictures
+    /// up when they land, and until then the activity bar draws its codicon
+    /// glyphs. One bake runs at a time: asked again while one runs (arrowing
+    /// through the theme picker's previews), the newest ask waits for it and
+    /// runs in its place when it lands, so an older one's pictures never go
+    /// up. Pictures on screen that `input` outdates come down at once, and
+    /// the bar draws its glyphs, in the new theme, meanwhile.
+    fn start_chrome_bake(&mut self, input: ChromeBakeInput) {
+        if self
+            .chrome_shown
+            .is_some_and(|shown| input.outdates(&shown))
+        {
+            self.drop_chrome_images();
+        }
+        if self.chrome_bake.is_some() {
+            self.chrome_bake_next = Some(input);
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send((input, Self::bake_chrome_images(&input)));
+        });
+        self.chrome_bake = Some(rx);
+    }
+
+    /// Take down the activity-bar icons and panel illustrations, evicting
+    /// whatever of them was sent, so the bar falls back to its glyphs.
+    fn drop_chrome_images(&mut self) {
+        self.overlays.activity.clear_images();
+        self.overlays.activity.request_clear();
+        self.overlays.activity.mark_dirty();
+        self.clear_run_debug_icon_if_emitted();
+        self.overlays.run_debug.clear_image();
+        self.overlays.ssh.disable();
+        self.chrome_shown = None;
+    }
+
+    /// Put up the activity-bar icons and the panel illustrations once the
+    /// bake [`Self::init_graphics`] started lands, or start the one asked for
+    /// since. `true` when they went up.
+    fn poll_chrome_bake(&mut self) -> bool {
+        let Some(rx) = self.chrome_bake.as_ref() else {
+            return false;
+        };
+        let baked = match rx.try_recv() {
+            Ok(baked) => Some(baked),
+            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => None,
+        };
+        self.chrome_bake = None;
+        if let Some(next) = self.chrome_bake_next.take() {
+            self.start_chrome_bake(next);
+            return false;
+        }
+        let Some((input, baked)) = baked else {
+            return false;
+        };
+        self.apply_chrome_images(baked);
+        self.chrome_shown = Some(input);
+        true
+    }
+
+    /// Install a finished [`Self::bake_chrome_images`]: the activity-bar icons,
+    /// the Run and Debug headline icon and the SSH empty state.
+    fn apply_chrome_images(&mut self, baked: ChromeImages) {
+        if let Some(images) = baked.activity {
+            // New icons over old ones (a theme switch, a font zoom): the old
+            // layer is evicted first, as the switch itself does.
+            if self.overlays.activity.has_images() {
+                self.overlays.activity.request_clear();
+            }
+            self.overlays.activity.set_images(images);
+            self.overlays.activity.mark_dirty();
+        }
+        if let Some(icon) = baked.run_debug {
+            self.overlays.run_debug.set_image(icon);
+        }
+        if let Some(card) = baked.ssh {
+            self.overlays.ssh.set_image(card);
+        }
+        // The activity-bar count badges ride the same overlay machinery; rebuild
+        // them against the freshly-baked icons / new background or cell size. The
+        // Explorer badge's per-frame refresh is count-gated, so force a rebuild
+        // here by invalidating its cached count first.
+        self.refresh_scm_change_badge();
+        self.explorer_unsaved_count = usize::MAX;
+        self.refresh_explorer_unsaved_badge();
+        self.remote_ports_count = usize::MAX;
+        self.refresh_remote_ports_badge();
+        self.testing_badge_count = usize::MAX;
+        self.refresh_testing_badge();
+        self.problems_badge_count = usize::MAX;
+        self.refresh_problems_badge();
+    }
+
+    /// Bake the activity-bar icons (every state of every icon), the Run and
+    /// Debug headline icon and the SSH empty state for `input`'s terminal.
+    fn bake_chrome_images(input: &ChromeBakeInput) -> ChromeImages {
+        let ChromeBakeInput {
+            protocol,
+            cell: (cell_w, cell_h),
+            is_tmux,
+            icon_bg,
+            icon_ink,
+            sponsor_ink,
+        } = *input;
+        let canvas_w = cell_w * ACTIVITY_BAR_WIDTH as u32;
+        let canvas_h = cell_h * ACTIVITY_ICON_HEIGHT as u32;
+        let w_cells = ACTIVITY_BAR_WIDTH;
+        let h_cells = ACTIVITY_ICON_HEIGHT;
         // The activity-bar icons are codicon SVGs, rasterised at the exact icon
         // pixel size (no multi-MB raster decode, crisp at any cell size). `id`
         // is the icon's stable per-slot Kitty image/placement id (shared by its
@@ -7634,11 +7833,6 @@ impl App {
         // The sponsor heart (#1940) wears its own pink, and is never selected,
         // so it bakes only its resting and hovered states. It shares the gear's
         // bias so the two keep the view icons' spacing between them.
-        let sponsor_ink = ki::IconInk::new(
-            self.theme.activity_sponsor_rgb(),
-            self.theme.activity_sponsor_hover_rgb(),
-            self.theme.activity_icon_pill_rgb(),
-        );
         let sponsor_imgs = (|| {
             let heart = |state| {
                 encode(
@@ -7703,7 +7897,7 @@ impl App {
                 bake_layout_pair(ki::LAYOUT_CUSTOMIZE_SRC_SVG, ki::KITTY_ID_LAYOUT_CUSTOMIZE)?;
             Some((so, soh, sf, sfh, po, poh, pf, pfh, cu, cuh))
         })();
-        if let (
+        let activity = if let (
             Some((ea, ei, eh)),
             Some((sa, si, sh)),
             Some((sca, sci, sch)),
@@ -7732,7 +7926,7 @@ impl App {
             ),
             layout_imgs,
         ) {
-            self.overlays.activity.set_images(ActivityBarImages {
+            Some(ActivityBarImages {
                 explorer_active: ea,
                 explorer_inactive: ei,
                 explorer_hovered: eh,
@@ -7772,21 +7966,10 @@ impl App {
                 layout_panel_off_hover: lpfh,
                 layout_customize: lcu,
                 layout_customize_hover: lcuh,
-            });
-        }
-        // The activity-bar count badges ride the same overlay machinery; rebuild
-        // them against the freshly-baked icons / new background or cell size. The
-        // Explorer badge's per-frame refresh is count-gated, so force a rebuild
-        // here by invalidating its cached count first.
-        self.refresh_scm_change_badge();
-        self.explorer_unsaved_count = usize::MAX;
-        self.refresh_explorer_unsaved_badge();
-        self.remote_ports_count = usize::MAX;
-        self.refresh_remote_ports_badge();
-        self.testing_badge_count = usize::MAX;
-        self.refresh_testing_badge();
-        self.problems_badge_count = usize::MAX;
-        self.refresh_problems_badge();
+            })
+        } else {
+            None
+        };
         // Run-and-Debug headline icon: the same debug-alt PNG used in the
         // activity bar, fitted to the panel's icon block (RUN_DEBUG_ICON_CELLS_W
         // cells wide × RUN_DEBUG_ICON_CELLS_H cells tall) and tinted at icon-
@@ -7797,7 +7980,7 @@ impl App {
         let rd_icon_h_cells = crate::widgets::run_debug::RUN_DEBUG_ICON_CELLS_H as u32;
         let rd_icon_w_px = cell_w * rd_icon_w_cells;
         let rd_icon_h_px = cell_h * rd_icon_h_cells;
-        if let Ok(baked) = crate::iterm2_inline::compose_icon(
+        let run_debug = if let Ok(baked) = crate::iterm2_inline::compose_icon(
             crate::iterm2_inline::RUN_DEBUG_SRC_PNG,
             rd_icon_w_px,
             rd_icon_h_px,
@@ -7813,12 +7996,12 @@ impl App {
             false,
             crate::iterm2_inline::KITTY_ID_RUN_DEBUG_PANEL,
         ) {
-            self.overlays
-                .run_debug
-                .set_image(crate::iterm2_inline::maybe_tmux_wrap(
-                    protocol, is_tmux, raw,
-                ));
-        }
+            Some(crate::iterm2_inline::maybe_tmux_wrap(
+                protocol, is_tmux, raw,
+            ))
+        } else {
+            None
+        };
         // SSH empty-state illustration baked to a fixed cell box (18 × 8
         // cells). Letterboxed onto the card's dark bg so iTerm2 has no
         // transparent edge to ghost the underlying buffer. Emitted post-
@@ -7833,7 +8016,7 @@ impl App {
         // fill here would render as a visible darker rectangle behind the
         // PNG, which is exactly what the user told us to remove.
         let card_bg = ::image::Rgba([0x00, 0x00, 0x00, 0x00]);
-        if let Ok(baked) = crate::iterm2_inline::fit_image_auto(
+        let ssh = if let Ok(baked) = crate::iterm2_inline::fit_image_auto(
             crate::iterm2_inline::SSH_EMPTY_STATE_PNG,
             ssh_w_px,
             ssh_h_px,
@@ -7847,11 +8030,16 @@ impl App {
             crate::iterm2_inline::KITTY_ID_SSH,
             crate::iterm2_inline::KITTY_Z_BELOW_TEXT_AND_BG,
         ) {
-            self.overlays
-                .ssh
-                .set_image(crate::iterm2_inline::maybe_tmux_wrap(
-                    protocol, is_tmux, raw,
-                ));
+            Some(crate::iterm2_inline::maybe_tmux_wrap(
+                protocol, is_tmux, raw,
+            ))
+        } else {
+            None
+        };
+        ChromeImages {
+            activity,
+            run_debug,
+            ssh,
         }
     }
 
@@ -8022,7 +8210,7 @@ impl App {
             return;
         }
         let hero = self.source_control.last_hero_area;
-        if hero.width == 0 || hero.height == 0 {
+        if hero.width == 0 || hero.height == 0 || self.update_card_covers(hero) {
             return;
         }
         // The hero asset carries its own opaque dark backdrop; on a light
@@ -8122,7 +8310,7 @@ impl App {
             width: crate::widgets::remote::SSH_EMPTY_STATE_CELLS_W,
             height: crate::widgets::remote::SSH_EMPTY_STATE_CELLS_H,
         };
-        if !self.chrome_image_due("ssh", &osc, at) {
+        if self.update_card_covers(at) || !self.chrome_image_due("ssh", &osc, at) {
             return;
         }
         let mut out = stdout();
@@ -8402,10 +8590,11 @@ impl App {
             self.process_picker.as_ref().map(|p| p.last_rect),
         ];
         let visible = |block: Rect| {
-            occluders
-                .iter()
-                .flatten()
-                .all(|panel| !block.intersects(*panel))
+            !self.update_card_covers(block)
+                && occluders
+                    .iter()
+                    .flatten()
+                    .all(|panel| !block.intersects(*panel))
         };
         let mut blocks: Vec<(Rect, &str)> = Vec::new();
         if activity_ready {
@@ -8577,14 +8766,16 @@ impl App {
             return;
         }
         let mut overlays = self.pending_activity_image_overlays();
-        if overlays.is_empty() {
-            return;
-        }
         let positions: Vec<(u16, u16)> = overlays.iter().map(|(cell, _)| *cell).collect();
+        // Checked before the empty return below: an update card over every
+        // icon left nothing to send, and Kitty kept the old ones over it.
         if self.overlays.activity.positions_moved(&positions) {
             self.overlays.activity.request_clear();
             self.overlays.activity.forget_positions();
             self.overlays.activity.forget_sent();
+            return;
+        }
+        if overlays.is_empty() {
             return;
         }
         let hashes: Vec<u64> = overlays
@@ -9037,6 +9228,7 @@ impl App {
         // Ship any refresh the debounce window coalesced once the gap clears,
         // so the trailing edge of an edit burst lands without another FS event.
         let mut changed = false;
+        self.take_default_branch();
         // Roots whose HEAD oid moved in this drain: the open Source Control
         // diffs for THESE re-read their HEAD blob (#471); the rest are
         // stamp-gated like any filesystem tick.
@@ -9069,7 +9261,7 @@ impl App {
             changed = true;
             let status = w.status().clone();
             if is_active && status.in_repo && self.default_branch_label.is_none() {
-                self.default_branch_label = crate::git::default_branch(&self.active_scm_root).ok();
+                self.ask_default_branch();
             }
             // HEAD moved in THIS repo (commit, checkout, pull): the cached
             // gutter baselines for ITS files are stale, as is blame; the
@@ -9140,6 +9332,43 @@ impl App {
         let diffs_refreshed = (changed || status_arrived)
             && self.refresh_open_diff_views(true, &heads_moved, &std::collections::BTreeSet::new());
         changed || diffs_refreshed
+    }
+
+    /// Resolve the active repository's default branch on a thread of its
+    /// own, unless that is already under way; [`Self::take_default_branch`]
+    /// files the answer.
+    fn ask_default_branch(&mut self) {
+        let root = self.active_scm_root.clone();
+        if self
+            .default_branch_ask
+            .as_ref()
+            .is_some_and(|(r, _)| *r == root)
+        {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        let asked = root.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::git::default_branch(&asked).ok());
+        });
+        self.default_branch_ask = Some((root, rx));
+    }
+
+    /// File the default branch [`Self::ask_default_branch`] resolved, if it
+    /// is in and is for the repository still active.
+    fn take_default_branch(&mut self) {
+        let Some((root, rx)) = self.default_branch_ask.as_ref() else {
+            return;
+        };
+        let branch = match rx.try_recv() {
+            Ok(branch) => branch,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => None,
+        };
+        if *root == self.active_scm_root && self.default_branch_label.is_none() {
+            self.default_branch_label = branch;
+        }
+        self.default_branch_ask = None;
     }
 
     /// Point the SCM surfaces at `active`'s repository: seed the panel
@@ -17748,43 +17977,21 @@ impl App {
         // startup. Both surfaces therefore display the same physical
         // pixel pair-for-pair.
         if !self.overlays.welcome.layout_matches(&desired) {
-            self.overlays.welcome.request_clear_if_displayed();
-            if let Some((cw, ch)) = self.cell_pixel {
-                let canvas_w = (logo_w_cells as u32) * cw;
-                let canvas_h = (logo_h_cells as u32) * ch;
-                let bg = self.theme_bg_pixel();
-                let protocol = self.inline_protocol;
-                // On a light background the asset's white "cr"/"ft"
-                // letters would vanish; the ink recolor turns just those
-                // pixels dark while the orange/teal strokes pass through.
-                let ink = self.theme.is_light().then_some((0x3b_u8, 0x3b_u8, 0x3b_u8));
-                if let Ok(baked) = crate::iterm2_inline::fit_image_with_ink(
-                    crate::iterm2_inline::WELCOME_LOGO_PNG,
-                    canvas_w,
-                    canvas_h,
-                    bg,
-                    ink,
-                ) && let Some(raw) = crate::iterm2_inline::build_inline_image(
-                    protocol,
-                    &baked,
-                    logo_w_cells,
-                    logo_h_cells,
-                    false,
-                    crate::iterm2_inline::KITTY_ID_WELCOME,
-                ) {
-                    let osc = crate::iterm2_inline::maybe_tmux_wrap(
-                        protocol,
-                        crate::iterm2_inline::detect_tmux(),
-                        raw,
-                    );
-                    self.overlays.welcome.set_image(osc);
-                }
-            }
+            // The picture baked for the old layout is the wrong size for
+            // this one. Its replacement bakes off the UI thread (#1973), and
+            // the logo's cells stay blank until it lands; one still baking
+            // for an older layout is followed up when it lands.
+            self.overlays.welcome.disable();
             self.overlays.welcome.set_layout(desired);
             self.overlays.welcome.mark_dirty();
+            if self.welcome_bake.is_none()
+                && let Some(key) = self.welcome_bake_key()
+            {
+                self.start_welcome_bake(key);
+            }
         }
 
-        if !self.overlays.welcome.has_image() {
+        if !self.overlays.welcome.has_image() && self.welcome_bake.is_none() {
             // Text fallback for non-iTerm2 terminals.
             let label = " croft ";
             let lx = logo_x
@@ -25090,11 +25297,23 @@ impl App {
     /// gets it without the release-notes link, then without the rows past
     /// Version.
     fn render_update_toast(&mut self, frame: &mut ratatui::Frame) {
+        let rect = self.paint_update_toast(frame);
+        if rect != self.update_card_rect {
+            // An icon it now covers must stop being sent, and one it left
+            // must come back.
+            self.update_card_rect = rect;
+            self.overlays.activity.mark_dirty();
+        }
+    }
+
+    /// `render_update_toast`'s painting: the card's rect, or `None` when
+    /// nothing was painted.
+    fn paint_update_toast(&mut self, frame: &mut ratatui::Frame) -> Option<Rect> {
         let Some(toast) = self.update_toast.as_ref().filter(|t| t.open) else {
             if let Some(t) = self.update_toast.as_mut() {
                 t.buttons.clear();
             }
-            return;
+            return None;
         };
         let mut card = self.update_card(toast);
         let area = frame.area();
@@ -25117,7 +25336,7 @@ impl App {
             if let Some(t) = self.update_toast.as_mut() {
                 t.buttons.clear();
             }
-            return;
+            return None;
         }
         let rect = Rect {
             x: area.x + 1,
@@ -25134,6 +25353,14 @@ impl App {
             t.buttons = hits;
             t.painted = painted;
         }
+        Some(rect)
+    }
+
+    /// Whether the update card covers any of `at`: an inline image there
+    /// would be drawn over it, so it is held back while the card is open.
+    fn update_card_covers(&self, at: Rect) -> bool {
+        self.update_card_rect
+            .is_some_and(|card| card.intersects(at))
     }
 
     /// Drop the update card's controls that a later overlay painted over: a
@@ -26043,6 +26270,11 @@ impl App {
     /// built-in defaults call their app methods directly, so a command-level
     /// recorder would miss most of what a user does.
     fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
+        let key = if self.legacy_ctrl_punct {
+            legacy_ctrl_punct(key)
+        } else {
+            key
+        };
         self.editor.sync_occurrence_word_sel();
 
         // A key press means the status message has been seen: the right-hand
@@ -40911,8 +41143,9 @@ impl App {
     }
 
     /// Enter in the focused box: append the reply to the box (the running
-    /// conversation stays visible) and send it to the navigator as a
-    /// comment-only turn carrying the note's context.
+    /// conversation stays visible) and send it to the navigator as a reply
+    /// turn carrying the note's context, which may edit when it asks for a
+    /// change (#1965).
     fn submit_comment_reply(&mut self) {
         let Some(focus) = self.editor.comment_focus.clone() else {
             return;
@@ -53626,15 +53859,26 @@ impl App {
             .collect();
         let mut changed = false;
         for t in &mut self.terminals {
-            let next = t
+            let kind = t
                 .shell_pid()
                 .and_then(|pid| by_pid.get(&pid))
-                .and_then(|name| self.agents.classify(name))
-                .map(|kind| crate::agents::AgentLane {
-                    name: kind.name.clone(),
-                    status: crate::agents::judge(kind, t.quiet_for(), &t.tail_rows(6), quiet_after),
-                });
+                .and_then(|name| self.agents.classify(name));
             let prev = t.agent().cloned();
+            // Only the seated agent's own OSC 7501 reports judge it: not a
+            // departed agent's, nor another program's.
+            t.sample_reporter(
+                prev.as_ref().map(|p| p.name.as_str()),
+                kind.map(|k| k.name.as_str()),
+            );
+            let next = kind.map(|kind| crate::agents::AgentLane {
+                name: kind.name.clone(),
+                // The agent's own report when it gave one; the screen only
+                // for an agent that has not.
+                status: match t.reported_status() {
+                    Some(state) => crate::agents::reported(state),
+                    None => crate::agents::judge(kind, t.quiet_for(), &t.tail_rows(6), quiet_after),
+                },
+            });
             if prev == next {
                 continue;
             }
@@ -67836,7 +68080,11 @@ impl App {
         let tx = self.history_done_tx.clone();
         let millis = now_millis();
         std::thread::spawn(move || {
-            if let Ok(bytes) = std::fs::read(&path) {
+            // A save too large to snapshot is not read at all (#1011).
+            let skip = !keep
+                && std::fs::metadata(&path)
+                    .is_ok_and(|m| crate::history::too_large_to_snapshot(m.len()));
+            if !skip && let Ok(bytes) = std::fs::read(&path) {
                 // Someone else's bytes are on disk now: record the snapshot
                 // alone, every line unknown, which is the safe direction.
                 let seats = match described {
@@ -71872,6 +72120,84 @@ impl App {
 
     pub fn mark_welcome_image_emitted(&mut self) {
         self.overlays.welcome.mark_emitted();
+    }
+
+    /// What the welcome wordmark would be baked for now: its layout, the
+    /// cell size and the theme. `None` while it is not laid out, or on a
+    /// terminal whose cell size is unknown.
+    fn welcome_bake_key(&self) -> Option<WelcomeBakeKey> {
+        Some(WelcomeBakeKey {
+            layout: *self.overlays.welcome.layout()?,
+            cell: self.cell_pixel?,
+            bg: self.theme_bg_pixel(),
+            light: self.theme.is_light(),
+            protocol: self.inline_protocol,
+        })
+    }
+
+    /// Bake the welcome wordmark for `key` on a thread of its own: decoding,
+    /// scaling and re-encoding the logo is tens of milliseconds, more on a
+    /// Retina canvas, and the frame laying it out must not wait (#1973).
+    fn start_welcome_bake(&mut self, key: WelcomeBakeKey) {
+        let WelcomeLayout { cell_w, cell_h, .. } = key.layout;
+        let (cw, ch) = key.cell;
+        let is_tmux = crate::iterm2_inline::detect_tmux();
+        // On a light background the asset's white "cr"/"ft" letters would
+        // vanish; the ink recolor turns just those pixels dark while the
+        // orange/teal strokes pass through.
+        let ink = key.light.then_some((0x3b_u8, 0x3b_u8, 0x3b_u8));
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let osc = crate::iterm2_inline::fit_image_with_ink(
+                crate::iterm2_inline::WELCOME_LOGO_PNG,
+                cell_w as u32 * cw,
+                cell_h as u32 * ch,
+                key.bg,
+                ink,
+            )
+            .ok()
+            .and_then(|baked| {
+                crate::iterm2_inline::build_inline_image(
+                    key.protocol,
+                    &baked,
+                    cell_w,
+                    cell_h,
+                    false,
+                    crate::iterm2_inline::KITTY_ID_WELCOME,
+                )
+            })
+            .map(|raw| crate::iterm2_inline::maybe_tmux_wrap(key.protocol, is_tmux, raw));
+            let _ = tx.send(osc);
+        });
+        self.welcome_bake = Some((key, rx));
+    }
+
+    /// Put up the welcome wordmark once the bake `render_welcome` started
+    /// lands (#1973), or bake again when the screen has moved on from what it
+    /// was baked for. `true` when the screen changes: the picture is due, or
+    /// the bake failed and the text label takes its place.
+    fn poll_welcome_bake(&mut self) -> bool {
+        let Some((key, rx)) = self.welcome_bake.as_ref() else {
+            return false;
+        };
+        let osc = match rx.try_recv() {
+            Ok(osc) => osc,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => None,
+        };
+        let key = *key;
+        self.welcome_bake = None;
+        if let Some(now) = self.welcome_bake_key()
+            && now != key
+        {
+            self.start_welcome_bake(now);
+            return false;
+        }
+        if let Some(osc) = osc {
+            self.overlays.welcome.set_image(osc);
+        }
+        self.overlays.welcome.mark_dirty();
+        true
     }
 
     /// Keyboard navigation for spreadsheet preview tabs. All gestures are
@@ -77376,8 +77702,9 @@ fn is_select_to_bracket_key(key: KeyEvent) -> bool {
 }
 
 /// VS Code "Go Back" (Ctrl+-). The kitty keyboard protocol delivers the
-/// chord as `-` + CONTROL; the legacy encoding folds Ctrl+- into 0x1F,
-/// which decodes as `_` + CONTROL, so both spellings are accepted.
+/// chord as `-` + CONTROL, and `_` + CONTROL is accepted too. The legacy
+/// encoding folds Ctrl+- into 0x1F, Ctrl+/'s byte, which croft reads as
+/// Toggle Line Comment there (`legacy_ctrl_punct`, #1007).
 fn is_navigate_back_key(key: KeyEvent) -> bool {
     let KeyCode::Char(c) = key.code else {
         return false;
@@ -78956,6 +79283,26 @@ fn jump_to_tab_index(key: KeyEvent) -> Option<usize> {
         return None;
     }
     Some((d - 1) as usize)
+}
+
+/// `key` as VS Code means it on a terminal without the kitty keyboard
+/// protocol. There Ctrl+\, Ctrl+] and Ctrl+/ (and Ctrl+-) send the bytes
+/// 0x1C, 0x1D and 0x1F, which crossterm reads as Ctrl+4, Ctrl+5 and
+/// Ctrl+7, so Toggle Line Comment switched to tab 7 instead (#1007).
+/// Ctrl+4, Ctrl+5 and Ctrl+7 send the same bytes, so those tabs give way:
+/// the punctuation chords are the ones used every few minutes. Ctrl+6's
+/// 0x1E stays tab 6, as nothing else claims Ctrl+^.
+fn legacy_ctrl_punct(key: KeyEvent) -> KeyEvent {
+    if key.modifiers != KeyModifiers::CONTROL {
+        return key;
+    }
+    let code = match key.code {
+        KeyCode::Char('4') => KeyCode::Char('\\'),
+        KeyCode::Char('5') => KeyCode::Char(']'),
+        KeyCode::Char('7') => KeyCode::Char('/'),
+        _ => return key,
+    };
+    KeyEvent { code, ..key }
 }
 
 /// Map a screen row to the tree row that should be highlighted as a drop
@@ -81249,6 +81596,9 @@ pub fn run(
     zen: bool,
     workspace_folders: Vec<PathBuf>,
 ) -> Result<()> {
+    // A GUI launch asks the login shell for its PATH again now, off the
+    // startup path, for the next launch (#1973).
+    crate::gui_path::refresh_in_background();
     // Termux ships no font with codicon glyphs, so the activity-bar glyph
     // fallback renders blank cells out of the box. Install the Meslo Nerd
     // Font Mono into ~/.termux/font.ttf in the background (no-op on every
@@ -81361,18 +81711,25 @@ pub fn run(
     }
 
     enable_raw_mode().context("enable raw mode")?;
-    // Sixel has no env var, so when neither iTerm2 nor Kitty was detected from
-    // the environment, probe the host with a DA1 query. This runs in raw mode
-    // but before the alt-screen switch and long before the event loop's first
-    // poll, so crossterm's (lazily-started) event reader can't swallow the
-    // reply. A non-sixel terminal (e.g. Apple Terminal) answers DA1 without
-    // attribute 4 and the probe returns instantly; init_graphics then promotes
-    // the protocol to Sixel only when this is true.
+    // Sixel has no env var, and whether the terminal speaks the kitty
+    // keyboard protocol has none either, so probe the host: the kitty query,
+    // then DA1. This runs in raw mode but before the alt-screen switch and
+    // long before the event loop's first poll, so crossterm's (lazily-started)
+    // event reader can't swallow the reply. A non-sixel terminal (e.g. Apple
+    // Terminal) answers DA1 without attribute 4; init_graphics then promotes
+    // the protocol to Sixel only when neither iTerm2 nor Kitty was detected
+    // from the environment and the reply lists it. tmux answers DA1 itself,
+    // listing sixel when it was built with it whatever the terminal around
+    // it can draw, so there the reply says nothing about the screen.
     #[cfg(unix)]
-    if app.inline_protocol == crate::iterm2_inline::InlineImageProtocol::None {
-        app.sixel_supported = crate::iterm2_inline::probe_sixel_support();
-        crate::widgets::terminal::SIXEL_HOST
-            .store(app.sixel_supported, std::sync::atomic::Ordering::Relaxed);
+    {
+        let host = crate::iterm2_inline::probe_host();
+        if app.inline_protocol == crate::iterm2_inline::InlineImageProtocol::None {
+            app.sixel_supported = host.sixel && !crate::iterm2_inline::detect_tmux();
+            crate::widgets::terminal::SIXEL_HOST
+                .store(app.sixel_supported, std::sync::atomic::Ordering::Relaxed);
+        }
+        app.legacy_ctrl_punct = host.answered && !host.kitty_keyboard;
     }
     let mut out = stdout();
     // Alt screen + mouse + bracketed paste + SteadyBar cursor (thin vertical
@@ -82084,6 +82441,8 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let auto_save_changed = app.tick_auto_save();
         app.tick_hot_exit(std::time::Instant::now());
         let highlights_changed = app.poll_highlights();
+        // Pictures baked off the UI thread (#1973) go up as they land.
+        let images_changed = app.poll_chrome_bake() | app.poll_welcome_bake();
         let live_run_changed =
             app.tick_live_run() | app.sync_markdown_scroll() | app.tick_minimap();
         app.tick_code_lens();
@@ -82240,6 +82599,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || labels_changed
             || auto_save_changed
             || highlights_changed
+            || images_changed
             || live_run_changed
             || code_lens_changed
             || ws_symbols_changed

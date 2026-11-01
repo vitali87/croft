@@ -285,6 +285,99 @@ fn welcome_image_bake_produces_osc1337_carrying_logo_pixels() {
     }
 }
 
+/// The cells of `area` in `buf`, as text.
+fn cells_text(buf: &ratatui::buffer::Buffer, area: crate::app::WelcomeLayout) -> String {
+    let mut text = String::new();
+    for y in area.cell_y..area.cell_y + area.cell_h {
+        for x in area.cell_x..area.cell_x + area.cell_w {
+            text.push_str(buf[(x, y)].symbol());
+        }
+    }
+    text
+}
+
+/// #1973: the frame that lays the welcome screen out never waits for its
+/// logo. The bake runs on a thread of its own, the logo's cells stay blank
+/// rather than flashing the text label, and the picture goes up once it
+/// lands.
+#[test]
+fn the_welcome_logo_bakes_off_the_ui_thread() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.inline_protocol = crate::iterm2_inline::InlineImageProtocol::Kitty;
+    app.cell_pixel = Some((8, 16));
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+    term.draw(|f| app.render_welcome(f, f.area())).unwrap();
+    let logo = *app.overlays.welcome.layout().expect("laid out");
+    assert!(
+        app.overlays.welcome.image_is_none(),
+        "the frame waited for the logo bake"
+    );
+    assert!(
+        !cells_text(term.backend().buffer(), logo).contains("croft"),
+        "the text label flashed where the logo is about to go"
+    );
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the welcome logo bake to land",
+        || app.poll_welcome_bake(),
+    );
+    let osc = app.overlays.welcome.image().expect("the logo is up");
+    assert!(
+        osc.contains(&format!("c={},r={}", logo.cell_w, logo.cell_h)),
+        "the logo was baked for another layout"
+    );
+    assert!(app.overlays.welcome.is_dirty(), "the logo is due on screen");
+}
+
+/// A bake for a layout the welcome screen has since left is dropped: only
+/// the picture for the layout on screen ever goes up.
+#[test]
+fn a_welcome_logo_baked_for_an_old_layout_never_goes_up() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.inline_protocol = crate::iterm2_inline::InlineImageProtocol::Kitty;
+    app.cell_pixel = Some((8, 16));
+    let mut wide = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 50)).unwrap();
+    wide.draw(|f| app.render_welcome(f, f.area())).unwrap();
+    let old = *app.overlays.welcome.layout().expect("laid out");
+    let mut narrow = ratatui::Terminal::new(ratatui::backend::TestBackend::new(70, 30)).unwrap();
+    narrow.draw(|f| app.render_welcome(f, f.area())).unwrap();
+    let new = *app.overlays.welcome.layout().expect("laid out");
+    assert_ne!(old, new, "the two sizes must lay the logo out apart");
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the welcome logo bake to land",
+        || app.poll_welcome_bake(),
+    );
+    let osc = app.overlays.welcome.image().expect("the logo is up");
+    assert!(
+        osc.contains(&format!("c={},r={}", new.cell_w, new.cell_h)),
+        "a logo baked for the old layout went up"
+    );
+}
+
+/// A logo that cannot be baked at all (no image protocol to send it with)
+/// falls back to the text label, as before.
+#[test]
+fn a_welcome_logo_that_fails_to_bake_falls_back_to_the_label() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.inline_protocol = crate::iterm2_inline::InlineImageProtocol::None;
+    app.cell_pixel = Some((8, 16));
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+    term.draw(|f| app.render_welcome(f, f.area())).unwrap();
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the welcome logo bake to land",
+        || app.poll_welcome_bake(),
+    );
+    assert!(app.overlays.welcome.image_is_none());
+    term.draw(|f| app.render_welcome(f, f.area())).unwrap();
+    let logo = *app.overlays.welcome.layout().expect("laid out");
+    assert!(cells_text(term.backend().buffer(), logo).contains("croft"));
+}
+
 #[test]
 fn consume_welcome_image_clear_fires_once_when_editor_opens_a_file() {
     // Repro for the "logo bleeds through under an open file" bug:

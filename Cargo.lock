@@ -333,7 +333,7 @@ dependencies = [
  "log",
  "quick-xml 0.39.2",
  "serde",
- "zip 7.2.0",
+ "zip 7.4.0",
 ]
 
 [[package]]
@@ -617,7 +617,7 @@ dependencies = [
 
 [[package]]
 name = "croft-software"
-version = "0.2.90"
+version = "0.2.101"
 dependencies = [
  "alacritty_terminal",
  "anyhow",
@@ -711,7 +711,7 @@ dependencies = [
  "ureq 3.3.0",
  "url",
  "webpki-roots 1.0.11",
- "zip 7.2.0",
+ "zip 8.6.0",
 ]
 
 [[package]]
@@ -5297,9 +5297,9 @@ dependencies = [
 
 [[package]]
 name = "zip"
-version = "7.2.0"
+version = "7.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c42e33efc22a0650c311c2ef19115ce232583abbe80850bc8b66509ebef02de0"
+checksum = "cc12baa6db2b15a140161ce53d72209dacea594230798c24774139b54ecaa980"
 dependencies = [
  "crc32fast",
  "flate2",
