@@ -428,7 +428,7 @@ When vim mode is on it supersedes the always-on `Cmd`+`d` `d` / `Cmd`+`g` `g` ch
 
 ## Editor: previews
 
-Image tabs (`.png`, `.jpg`, `.jpeg`, `.gif`, `.bmp`, `.webp`) are read-only; every keystroke is swallowed.
+Image tabs (`.png`, `.jpg`, `.jpeg`, `.gif`, `.bmp`, `.webp`, `.ico`, `.tif`, `.tiff`) are read-only; every keystroke is swallowed.
 
 **Rendered log (`.log` / `.ansi` / `.out` / `.txt` / extension-less files whose first 8 KiB carry ANSI colour)**
 

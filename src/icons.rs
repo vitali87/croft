@@ -223,7 +223,7 @@ fn ext_icon(s: &str) -> Option<Icon> {
         ".xml" => i('\u{eabe}', 0xe3, 0x79, 0x33),
         ".svg" => i('\u{eabe}', 0xff, 0xb1, 0x3b),
         // cod-file_media (NOT cod-mail U+EB1C, which is an envelope)
-        ".png" | ".jpg" | ".jpeg" | ".gif" | ".webp" | ".bmp" | ".ico" => {
+        ".png" | ".jpg" | ".jpeg" | ".gif" | ".webp" | ".bmp" | ".ico" | ".tif" | ".tiff" => {
             i('\u{eaea}', 0xa0, 0x74, 0xc4)
         }
         ".pdf" => i('\u{eaeb}', 0xb3, 0x0b, 0x00),

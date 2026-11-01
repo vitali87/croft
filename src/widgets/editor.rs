@@ -44,7 +44,9 @@ fn image_dimensions_of(bytes: &[u8]) -> Option<(u32, u32)> {
         .into_dimensions()
         .ok()
 }
-const IMAGE_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "gif", "bmp", "webp", "ico"];
+const IMAGE_EXTENSIONS: &[&str] = &[
+    "png", "jpg", "jpeg", "gif", "bmp", "webp", "ico", "tif", "tiff",
+];
 
 /// Read-only image preview attached to a tab. Holds the raw file bytes so
 /// the OSC-1337 inline-image bake can re-fit on resize without rereading
@@ -2197,6 +2199,7 @@ pub fn extension_is_pdf(ext: &str) -> bool {
 pub fn image_format_label_from_ext(ext: &str) -> String {
     match ext.to_ascii_lowercase().as_str() {
         "jpg" | "jpeg" => "JPEG".to_string(),
+        "tif" | "tiff" => "TIFF".to_string(),
         other => other.to_ascii_uppercase(),
     }
 }
@@ -32609,6 +32612,67 @@ mod tests {
         assert!(e.hex.is_some(), "an undecodable icon opens as bytes");
     }
 
+    /// A 24x10 TIFF, as a scanner or a print workflow writes one (#1652).
+    fn tiff_bytes() -> Vec<u8> {
+        let img: image::RgbImage =
+            image::ImageBuffer::from_pixel(24, 10, image::Rgb([200, 40, 90]));
+        let mut buf: Vec<u8> = Vec::new();
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut buf),
+                image::ImageFormat::Tiff,
+            )
+            .unwrap();
+        assert!(
+            buf.starts_with(b"II*\0") || buf.starts_with(b"MM\0*"),
+            "setup: a TIFF header"
+        );
+        buf
+    }
+
+    /// #1652: `.tif` and `.tiff` open in the image viewer with their size,
+    /// not as hex.
+    #[test]
+    fn a_tiff_opens_as_an_image() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["scan.tif", "scan.tiff", "SCAN.TIFF"] {
+            let path = dir.path().join(name);
+            std::fs::write(&path, tiff_bytes()).unwrap();
+            let mut e = Editor::new();
+            e.open(&path).unwrap();
+            assert!(e.hex.is_none(), "{name}: not the hex viewer");
+            let img = e.image.as_ref().expect("image-mode tab");
+            assert_eq!((img.pixel_w, img.pixel_h), (24, 10), "{name}");
+            assert_eq!(img.format_label, "TIFF", "{name}");
+        }
+    }
+
+    /// #1652: a TIFF with no extension routes to the image viewer by its
+    /// bytes.
+    #[test]
+    fn an_extensionless_tiff_routes_to_the_image_viewer_by_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scan");
+        std::fs::write(&path, tiff_bytes()).unwrap();
+        let mut e = Editor::new();
+        e.open(&path).unwrap();
+        let img = e.image.as_ref().expect("image-mode tab");
+        assert_eq!((img.pixel_w, img.pixel_h), (24, 10));
+    }
+
+    /// Negative (#1652): a truncated `.tiff` that does not decode falls back
+    /// to the hex viewer, without a panic.
+    #[test]
+    fn a_broken_tiff_falls_back_to_hex() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broken.tiff");
+        std::fs::write(&path, &tiff_bytes()[..12]).unwrap();
+        let mut e = Editor::new();
+        e.open(&path).unwrap();
+        assert!(e.image.is_none());
+        assert!(e.hex.is_some(), "an undecodable TIFF opens as bytes");
+    }
+
     #[test]
     fn open_png_populates_image_view_and_skips_text_buffer() {
         // 1×1 transparent PNG, hand-crafted via the image crate.
@@ -32872,7 +32936,8 @@ mod tests {
     #[test]
     fn extension_is_image_recognises_common_formats() {
         for ext in [
-            "png", "PNG", "jpg", "jpeg", "JPEG", "gif", "bmp", "webp", "ico", "ICO",
+            "png", "PNG", "jpg", "jpeg", "JPEG", "gif", "bmp", "webp", "ico", "ICO", "tif", "tiff",
+            "TIFF",
         ] {
             assert!(extension_is_image(ext), "should recognise: {ext}");
         }
