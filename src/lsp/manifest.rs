@@ -511,10 +511,11 @@ pub struct ServerEntry {
 /// theme list and the Extensions panel each read every manifest, and a
 /// launch reached five of them before its first frame: five TOML parses of
 /// the same bundled files, a quarter of startup's work. Each text is parsed
-/// once now and handed out as a copy; a bundled one in its own slot, so a
-/// caller that arrives while [`prewarm_bundled`] is parsing it waits for that
-/// parse instead of repeating it. Parsing is pure, so a text always gets the
-/// answer its first parse gave.
+/// once now and handed out as a copy; a bundled one in its own slot, which
+/// [`prewarm_bundled`] fills at launch. A caller that finds a slot still
+/// empty parses the text itself rather than waiting on that thread, so the
+/// editor never waits for another thread to be scheduled. Parsing is pure,
+/// so every parse of a text gives the same answer.
 pub fn parse(src: &str) -> Result<ExtensionManifest, toml::de::Error> {
     type Parsed = Result<ExtensionManifest, toml::de::Error>;
     static BUNDLED: [std::sync::OnceLock<Parsed>; BUNDLED_MANIFESTS.len()] =
@@ -522,7 +523,12 @@ pub fn parse(src: &str) -> Result<ExtensionManifest, toml::de::Error> {
     static OTHERS: std::sync::Mutex<BTreeMap<String, Parsed>> =
         std::sync::Mutex::new(BTreeMap::new());
     if let Some(i) = BUNDLED_MANIFESTS.iter().position(|b| *b == src) {
-        return BUNDLED[i].get_or_init(|| parse_uncached(src)).clone();
+        if let Some(parsed) = BUNDLED[i].get() {
+            return parsed.clone();
+        }
+        let parsed = parse_uncached(src);
+        let _ = BUNDLED[i].set(parsed.clone());
+        return parsed;
     }
     if let Some(hit) = OTHERS.lock().ok().and_then(|m| m.get(src).cloned()) {
         return hit;

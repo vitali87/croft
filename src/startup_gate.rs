@@ -82,6 +82,15 @@ pub fn wait() {
     GATE.wait(CAP);
 }
 
+/// [`wait`] for async code. The wait itself runs on the runtime's blocking
+/// pool, so no worker thread is held while the first frame is drawn.
+pub async fn wait_async() {
+    if !GATE.armed.load(Ordering::Acquire) {
+        return;
+    }
+    let _ = tokio::task::spawn_blocking(wait).await;
+}
+
 /// `job` on a thread of its own, once the first frame is up.
 pub fn spawn_after_first_frame<F>(job: F) -> std::thread::JoinHandle<()>
 where

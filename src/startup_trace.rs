@@ -80,7 +80,11 @@ pub fn mark(label: &'static str) {
     }
 }
 
-/// The first frame is on screen: write the trace and stop recording.
+/// The first frame is on screen: stop recording, and write the trace on a
+/// thread of its own. Off the UI thread because a home folder on a stalled
+/// network mount, or a FIFO no one reads named by `CROFT_STARTUP_TRACE`,
+/// would otherwise hold the editor, input and quit included, at its first
+/// frame.
 pub fn finish() {
     if !ON.swap(false, Ordering::Relaxed) {
         return;
@@ -88,6 +92,10 @@ pub fn finish() {
     let Some(trace) = TRACE.lock().ok().and_then(|mut slot| slot.take()) else {
         return;
     };
+    std::thread::spawn(move || write(&trace));
+}
+
+fn write(trace: &Trace) {
     let since_main = trace.start.elapsed();
     let lineage = lineage()
         .into_iter()
@@ -100,7 +108,7 @@ pub fn finish() {
     if let Some(dir) = trace.path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let _ = std::fs::write(&trace.path, render(&trace, &lineage));
+    let _ = std::fs::write(&trace.path, render(trace, &lineage));
 }
 
 fn ms(d: Duration) -> f64 {

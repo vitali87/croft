@@ -3475,6 +3475,11 @@ impl WorkerState {
             should_try = false;
         }
         if should_try {
+            // A launch's first frame comes first (see `startup_gate`): a file
+            // restored at launch, or a restored extra root, otherwise starts
+            // its servers, and the `rustup` that resolves rust-analyzer,
+            // while that frame is still being drawn.
+            crate::startup_gate::wait_async().await;
             let configs: Vec<ServerConfig> = self.registry.for_language(lang).to_vec();
             // Spawn every server for this root concurrently rather than awaiting
             // each in turn. The worker loop processes commands one at a time, so

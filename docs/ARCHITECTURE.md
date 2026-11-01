@@ -1404,6 +1404,8 @@ Holds a launch's background work until its first frame is up. Started all at onc
 
 **One call at the top of each job.** `startup_gate::wait()` returns at once unless `app::run` has `arm`ed the gate and `main_loop` has not yet `open`ed it after flushing the first frame. Nothing else arms it, so outside a launch, and under test, no job ever waits. A first frame that never comes releases the jobs after a second.
 
+**Async jobs wait without holding a thread.** The LSP worker's `ensure_clients` calls `startup_gate::wait_async` before it resolves and spawns a language's servers, so a file restored at launch, or a restored extra root, starts its servers (and the `rustup` that finds rust-analyzer) after the first frame; the wait runs on tokio's blocking pool, never on a runtime worker or the UI thread.
+
 **What does not wait.** Whatever the first frame reads: the bundled manifests (the language table and server registry are built from them in `App::new`), the built-in secret rules (a restored pane with text is masked in the first frame), and the pane's own shell and reader.
 
 ### startup_trace.rs
