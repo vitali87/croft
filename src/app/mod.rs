@@ -47953,7 +47953,31 @@ impl App {
             sidebar_width: self.sidebar_width,
             terminal_height: self.terminal_height,
             focus_editor: self.focus == Pane::Editor,
+            bookmarks: self.all_bookmarks(),
         }
+    }
+
+    /// The bookmarks of every open tab, keyed by file. Each tab is an editor
+    /// with its own marks, so the active one's map alone would miss the rest.
+    fn all_bookmarks(
+        &self,
+    ) -> std::collections::HashMap<PathBuf, std::collections::BTreeSet<usize>> {
+        let mut all = std::collections::HashMap::new();
+        // A tab's own file first: its marks are the live ones.
+        for ed in &self.editor.editors {
+            if let Some(path) = &ed.path
+                && let Some(set) = ed.bookmarks.get(path)
+            {
+                all.insert(path.clone(), set.clone());
+            }
+        }
+        // Then files the tab showed earlier, whose marks it still holds.
+        for ed in &self.editor.editors {
+            for (path, set) in &ed.bookmarks {
+                all.entry(path.clone()).or_insert_with(|| set.clone());
+            }
+        }
+        all
     }
 
     /// Returns the xlsx cells (#1593) it could not put back, as the tabs
@@ -47976,6 +48000,11 @@ impl App {
                 kept.sheet_cells = unapplied;
                 left.push(kept);
             }
+        }
+        // Every tab is its own editor with its own marks: hand each the saved
+        // set once its file is open, trimmed to the lines the file still has.
+        for ed in self.editor.editors.iter_mut() {
+            ed.restore_bookmarks(&state.bookmarks);
         }
         if state.active_tab < self.editor.tab_count() {
             self.editor.select(state.active_tab);

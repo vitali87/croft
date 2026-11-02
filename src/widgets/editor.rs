@@ -4414,6 +4414,19 @@ impl Editor {
             .unwrap_or_default()
     }
 
+    /// Take over a saved set of bookmarks (a restored session) for the open
+    /// file, trimmed to the lines it still has.
+    pub fn restore_bookmarks(
+        &mut self,
+        marks: &std::collections::HashMap<PathBuf, std::collections::BTreeSet<usize>>,
+    ) {
+        if marks.is_empty() {
+            return;
+        }
+        self.bookmarks = marks.clone();
+        self.sync_bookmarks_to_buffer();
+    }
+
     /// Whether 0-based `line` carries a bookmark in the open file.
     pub fn is_bookmarked(&self, line: usize) -> bool {
         self.path
