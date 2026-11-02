@@ -1922,7 +1922,7 @@ fn auto_save_surfaces_a_disk_conflict_instead_of_latching_silently() {
 }
 
 #[test]
-fn explicit_save_prompts_before_a_lossy_encoding_write_then_second_press_consents() {
+fn explicit_save_asks_before_a_lossy_encoding_write_and_only_s_consents() {
     // Issue #41: encoding_rs substitutes HTML numeric character references
     // (not `?`) for unmappable characters, so an unguarded save silently
     // rewrites 日本語 as `&#26085;…` on disk while the buffer looks fine.
@@ -1939,22 +1939,96 @@ fn explicit_save_prompts_before_a_lossy_encoding_write_then_second_press_consent
         "plain",
         "the first Cmd+S must refuse, leaving the file untouched"
     );
+    let [what, ..] = app.pending_lossy_save.as_ref().expect("it asks").text();
+    assert_eq!(what, "windows-1252 cannot represent 日 本 語 in a.txt.");
     assert!(
-        app.status.contains("windows-1252") && app.status.contains('日'),
-        "the refusal must name the encoding and the doomed characters; status: {:?}",
-        app.status
+        !app.editor.lossy_save_armed,
+        "nothing is consented to until the prompt is answered"
     );
-    assert!(
-        app.editor.lossy_save_armed,
-        "the refusal arms the second press"
-    );
-    app.save();
+    app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE))
+        .unwrap();
     assert_eq!(
         std::fs::read(tmp.path().join("a.txt")).unwrap(),
         b"&#26085;&#26412;&#35486; costs 5\x80",
-        "the second Cmd+S is explicit consent to the lossy write"
+        "S in the prompt is explicit consent to the lossy write"
     );
     assert!(!app.editor.dirty, "the consented save completes normally");
+    assert!(app.pending_lossy_save.is_none());
+}
+
+/// #1053: the consent to write U+FFFD over bytes that were not valid UTF-8
+/// was a second Cmd+S, warned about only in the status bar, which trimmed
+/// the warning out of the middle of the message below ~230 columns. It is
+/// a modal now, whole at 160 columns. A second Cmd+S, Enter or Esc writes
+/// nothing; only S does.
+#[test]
+fn saving_over_invalid_utf8_asks_in_a_modal_a_second_cmd_s_cannot_answer() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("latin1.txt");
+    std::fs::write(&file, b"caf\xe9 alpha_beta\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.cursor_col = app.editor.lines[0].chars().count();
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
+        .unwrap();
+    let ctrl_s = key(KeyCode::Char('s'), KeyModifiers::CONTROL);
+    app.handle_key(ctrl_s).unwrap();
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 30)).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+    let screen = screen_text(&term);
+    for part in [
+        "SAVE WOULD LOSE DATA",
+        "latin1.txt has bytes that are not valid UTF-8, shown as \u{fffd}.",
+        "Saving writes \u{fffd} in their place: the original bytes are lost for good.",
+        "[S] save anyway   [Esc] keep the file as it is",
+    ] {
+        assert!(screen.contains(part), "{part:?} missing:\n{screen}");
+    }
+    for answer in [ctrl_s, key(KeyCode::Char('d'), KeyModifiers::NONE)] {
+        app.handle_key(answer).unwrap();
+        assert!(app.pending_lossy_save.is_some(), "{answer:?} is no answer");
+    }
+    for cancel in [KeyCode::Enter, KeyCode::Esc] {
+        app.handle_key(key(cancel, KeyModifiers::NONE)).unwrap();
+        assert!(app.pending_lossy_save.is_none());
+        assert_eq!(app.status, "Not saved: the file on disk is unchanged");
+        assert_eq!(std::fs::read(&file).unwrap(), b"caf\xe9 alpha_beta\n");
+        app.handle_key(ctrl_s).unwrap();
+    }
+    app.handle_key(key(KeyCode::Char('S'), KeyModifiers::SHIFT))
+        .unwrap();
+    assert_eq!(
+        std::fs::read(&file).unwrap(),
+        "caf\u{fffd} alpha_betax\n".as_bytes()
+    );
+}
+
+/// #1053: a save that overwrites an external change and also loses
+/// characters asks about each. S in the lossy prompt writes, keeping the
+/// overwrite consent given before it; Esc drops both.
+#[test]
+fn the_lossy_prompt_after_a_disk_conflict_answers_for_the_overwrite_too() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("a.txt");
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "plain");
+    app.editor
+        .reopen_with_encoding(encoding_rs::WINDOWS_1252)
+        .unwrap();
+    app.editor.lines = vec![String::from("日")];
+    app.editor.dirty = true;
+    std::fs::write(&file, "changed elsewhere").unwrap();
+    for (answer, on_disk) in [
+        (KeyCode::Esc, &b"changed elsewhere"[..]),
+        (KeyCode::Char('s'), b"&#26085;"),
+    ] {
+        app.save();
+        assert!(app.status.contains("changed on disk"), "{}", app.status);
+        app.save();
+        assert!(app.pending_lossy_save.is_some(), "{}", app.status);
+        app.handle_key(key(answer, KeyModifiers::NONE)).unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), on_disk, "{}", app.status);
+    }
 }
 
 /// #1379: a file its owner `chmod 444`ed, open in the editor.
