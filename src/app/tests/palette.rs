@@ -2284,3 +2284,39 @@ fn the_palette_offers_the_move_editor_commands() {
     );
     assert_eq!(tab_names_852(&app.editor), ["a.py", "c.py", "b.py"]);
 }
+
+/// Bookmarks: Go to Bookmark… lists the marks of every open tab, and picking
+/// a row opens that file at the marked line.
+#[test]
+fn the_bookmark_picker_lists_every_tabs_marks_and_jumps_to_one() {
+    use crate::widgets::command_palette::Command;
+    use crate::widgets::list_picker::ListPurpose;
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&a, "alpha\nbeta\ngamma\n").unwrap();
+    std::fs::write(&b, "one\ntwo\nthree\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.run_command(Command::GoToBookmark);
+    assert!(app.list_picker.is_none(), "no bookmarks, no picker");
+    assert!(app.status.contains("No bookmarks"), "was {:?}", app.status);
+
+    app.editor.open(&a).unwrap();
+    app.editor.cursor_row = 1;
+    app.editor.toggle_bookmark();
+    app.editor.open_in_new_tab(&b).unwrap();
+    app.editor.cursor_row = 2;
+    app.editor.toggle_bookmark();
+    app.run_command(Command::GoToBookmark);
+    let picker = app.list_picker.as_ref().expect("the picker opens");
+    assert_eq!(picker.purpose, ListPurpose::Bookmark);
+    let labels: Vec<&str> = picker.rows.iter().map(|r| r.label.as_str()).collect();
+    assert_eq!(labels, ["a.txt:2  beta", "b.txt:3  three"]);
+
+    // Enter on the first row goes to a.txt line 2.
+    app.list_picker.as_mut().unwrap().selected = 0;
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.path.as_deref(), Some(a.as_path()));
+    assert_eq!(app.editor.cursor_row, 1);
+}

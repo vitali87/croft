@@ -43016,6 +43016,17 @@ impl App {
                     );
                 }
             }
+            ListPurpose::Bookmark => {
+                if let Some((line, path)) = row.id.split_once('\t')
+                    && let Ok(line) = line.parse::<usize>()
+                {
+                    let path = PathBuf::from(path);
+                    match self.open_at(&path, line.saturating_sub(1), 0) {
+                        Ok(()) => self.status = format!("Bookmark at line {line}"),
+                        Err(e) => self.status = format!("Cannot open bookmark: {e}"),
+                    }
+                }
+            }
             ListPurpose::OutputChannel => {
                 self.output.sync();
                 self.output.select_by_name(&row.id);
@@ -48599,6 +48610,48 @@ impl App {
             }
             None => String::from("No bookmarks in this file (Cmd+Opt+Shift+K sets one)"),
         };
+    }
+
+    /// Bookmarks: Go to Bookmark…: a filterable list of every bookmark in
+    /// the open tabs (`file:line  text of the line`), Enter jumps to it.
+    fn open_bookmark_picker(&mut self) {
+        use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+        let root = self.tree.root.clone();
+        let all = self.all_bookmarks();
+        let mut paths: Vec<&PathBuf> = all.keys().collect();
+        paths.sort();
+        let mut rows = Vec::new();
+        for path in paths {
+            let open = self
+                .editor
+                .editors
+                .iter()
+                .find(|e| e.path.as_ref() == Some(path));
+            let on_disk: Vec<String>;
+            let lines: &[String] = match open {
+                Some(e) => &e.lines,
+                None => {
+                    on_disk = std::fs::read_to_string(path)
+                        .map(|t| t.lines().map(str::to_string).collect())
+                        .unwrap_or_default();
+                    &on_disk
+                }
+            };
+            let shown = path.strip_prefix(&root).unwrap_or(path).display();
+            // A mark past the last line is no target (see `bookmarked_lines`).
+            for &line in all[path]
+                .iter()
+                .filter(|&&l| (1..=lines.len()).contains(&l))
+            {
+                let text: String = lines[line - 1].trim().chars().take(80).collect();
+                rows.push(ListRow {
+                    id: format!("{line}\t{}", path.display()),
+                    label: format!("{shown}:{line}  {text}"),
+                });
+            }
+        }
+        let picker = ListPicker::new(ListPurpose::Bookmark, "Go to Bookmark", rows);
+        self.open_list_picker(picker, "No bookmarks (Cmd+Opt+Shift+K sets one)");
     }
 
     /// Clear every bookmark in the open file, reporting how many went.
@@ -57761,6 +57814,7 @@ impl App {
             Cmd::NextBookmark => self.goto_bookmark(true),
             Cmd::PreviousBookmark => self.goto_bookmark(false),
             Cmd::ClearBookmarks => self.clear_bookmarks(),
+            Cmd::GoToBookmark => self.open_bookmark_picker(),
             Cmd::SaveFile => self.save(),
             Cmd::SaveAs => self.open_save_as_prompt(),
             Cmd::SaveWithSudo => self.save_with_sudo(),
