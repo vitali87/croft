@@ -6,12 +6,15 @@ Agents implement an issue only if it is owner-authored or carries `ready`
 everything else; the workflow around it (issue-vetting.yml) fetches the issue
 and calls the model with curl, so this file never touches the network.
 
-Two subcommands:
+Three subcommands:
 
-  prepare  Deterministic screening, then either a verdict with no model call
-           (hidden content, brand-new account, empty body) or a chat request
-           whose message wraps the issue as untrusted data.
-  decide   Turn the model's raw chat-completion response into a verdict.
+  prepare    Deterministic screening, then either a verdict with no model call
+             (hidden content, brand-new account, empty body) or a chat request
+             whose message wraps the issue as untrusted data.
+  decide     Turn the model's raw chat-completion response into a verdict.
+  dismissed  List the verdict labels a person took off the issue, from its
+             event log. The workflow never puts one of those back, and the
+             daily sweep leaves the issue alone.
 
 Every path that cannot be positively verified lands on `needs-human`: a missing
 or malformed response, low confidence, suspected injection, an empty restated
@@ -39,6 +42,11 @@ STATUS_READY = "ready"
 STATUS_NEEDS_HUMAN = "needs-human"
 STATUS_REJECTED = "rejected"
 VETTING_LABELS = (STATUS_READY, STATUS_NEEDS_HUMAN, STATUS_REJECTED)
+
+# The identity the workflow's GITHUB_TOKEN acts as. Its own label changes
+# (dropping a stale `ready`, swapping one verdict for another) are not a
+# maintainer's decision, so they never count as a dismissal.
+WORKFLOW_ACTOR = "github-actions[bot]"
 
 COMMENT_MARKER = "<!-- issue-vetting -->"
 DATA_START = "<<<UNTRUSTED ISSUE DATA"
@@ -293,6 +301,33 @@ def decide(response: dict | None) -> Decision:
     return Decision(STATUS_NEEDS_HUMAN, flags, _needs_human_comment(flags, reasons))
 
 
+def _event_order(event: dict) -> tuple[str, int]:
+    event_id = event.get("id")
+    return (str(event.get("created_at") or ""), event_id if isinstance(event_id, int) else 0)
+
+
+def dismissed_labels(events: list[dict]) -> list[str]:
+    """Verdict labels whose last word from a person was taking them off.
+
+    Only events by someone other than the workflow count, so the workflow
+    re-adding a label after a maintainer removed it (as it used to) does not
+    undo the removal. A person adding the label back clears the dismissal.
+    """
+    last_by_person: dict[str, str] = {}
+    for event in sorted((e for e in events if isinstance(e, dict)), key=_event_order):
+        action = event.get("event")
+        label = event.get("label")
+        actor = event.get("actor")
+        if action not in ("labeled", "unlabeled") or not isinstance(label, dict):
+            continue
+        if label.get("name") not in VETTING_LABELS:
+            continue
+        if not isinstance(actor, dict) or actor.get("login") == WORKFLOW_ACTOR:
+            continue
+        last_by_person[label["name"]] = action
+    return [name for name in VETTING_LABELS if last_by_person.get(name) == "unlabeled"]
+
+
 def _load(path: str | None) -> object:
     if not path:
         return None
@@ -321,7 +356,18 @@ def main(argv: list[str]) -> int:
     d.add_argument("--response", required=True)
     d.add_argument("--out-decision", required=True)
 
+    x = sub.add_parser("dismissed")
+    x.add_argument("--events", required=True)
+
     args = parser.parse_args(argv)
+
+    if args.command == "dismissed":
+        # An unreadable event log dismisses nothing: the verdict is still
+        # applied, as it was before dismissals were honoured.
+        loaded = _load(args.events)
+        for name in dismissed_labels(loaded if isinstance(loaded, list) else []):
+            print(name)
+        return 0
 
     if args.command == "prepare":
         issue = _load(args.issue)

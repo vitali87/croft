@@ -7,8 +7,11 @@ path that cannot be positively verified must land on needs-human.
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import sys
+import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 
@@ -195,6 +198,77 @@ class Decide(unittest.TestCase):
 
     def test_comment_carries_marker_for_upsert(self):
         self.assertTrue(self.decide(verdict()).comment.startswith(vet_issue.COMMENT_MARKER))
+
+
+BOT = vet_issue.WORKFLOW_ACTOR
+
+
+def label_event(event_id: int, action: str, name: str, who: str = "vitali87") -> dict:
+    return {
+        "id": event_id,
+        "event": action,
+        "label": {"name": name},
+        "actor": {"login": who},
+        "created_at": f"2026-10-2{event_id}T00:00:00Z",
+    }
+
+
+def run_dismissed(events_path: str) -> tuple[int, str]:
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        code = vet_issue.main(["dismissed", "--events", events_path])
+    return code, out.getvalue()
+
+
+class Dismissed(unittest.TestCase):
+    """#1984: a verdict label the maintainer removed must not come back."""
+
+    def test_a_label_the_maintainer_removed_is_dismissed(self):
+        events = [label_event(1, "labeled", "needs-human", BOT), label_event(2, "unlabeled", "needs-human")]
+        self.assertEqual(vet_issue.dismissed_labels(events), ["needs-human"])
+
+    def test_the_workflow_swapping_its_own_verdict_is_not_a_dismissal(self):
+        events = [label_event(1, "labeled", "ready", BOT), label_event(2, "unlabeled", "ready", BOT)]
+        self.assertEqual(vet_issue.dismissed_labels(events), [])
+
+    def test_the_workflow_re_adding_a_removed_label_does_not_undo_the_removal(self):
+        # What happened on #1904: removed by the maintainer, put back by the sweep.
+        events = [
+            label_event(1, "labeled", "needs-human", BOT),
+            label_event(2, "unlabeled", "needs-human"),
+            label_event(3, "labeled", "needs-human", BOT),
+        ]
+        self.assertEqual(vet_issue.dismissed_labels(events), ["needs-human"])
+
+    def test_the_maintainer_adding_it_back_clears_the_dismissal(self):
+        events = [label_event(1, "unlabeled", "rejected"), label_event(2, "labeled", "rejected")]
+        self.assertEqual(vet_issue.dismissed_labels(events), [])
+
+    def test_events_are_read_in_time_order(self):
+        events = [label_event(2, "labeled", "ready"), label_event(1, "unlabeled", "ready")]
+        self.assertEqual(vet_issue.dismissed_labels(events), [])
+
+    def test_other_labels_and_malformed_events_are_ignored(self):
+        events = [
+            label_event(1, "unlabeled", "bug"),
+            {"id": 2, "event": "unlabeled", "label": None, "actor": {"login": "vitali87"}},
+            {"id": 3, "event": "unlabeled", "label": {"name": "ready"}, "actor": None},
+            {"id": 4, "event": "closed", "actor": {"login": "vitali87"}},
+            "not an event",
+        ]
+        self.assertEqual(vet_issue.dismissed_labels(events), [])
+
+    def test_cli_prints_one_dismissed_label_per_line(self):
+        events = [label_event(1, "unlabeled", "ready"), label_event(2, "unlabeled", "needs-human")]
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "events.json"
+            path.write_text(json.dumps(events), encoding="utf-8")
+            code, out = run_dismissed(str(path))
+        self.assertEqual(code, 0)
+        self.assertEqual(out.split(), ["ready", "needs-human"])
+
+    def test_cli_dismisses_nothing_when_the_event_log_is_unreadable(self):
+        self.assertEqual(run_dismissed("/nonexistent/events.json"), (0, ""))
 
 
 if __name__ == "__main__":
