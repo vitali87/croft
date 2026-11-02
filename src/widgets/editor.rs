@@ -20250,11 +20250,6 @@ impl Widget for &mut Editor {
                 }
             }
 
-            // Inline suggestion (#607): the first line as ghost text right at
-            // the caret (suggestions are only asked for at a line's end); the
-            // rest hang below as `VisRow::Ghost` rows (#1625), and only lines
-            // that found no row are counted here. It owns the line's tail, so
-            // the trailers below stand aside.
             // A language server's replacement strikes through the columns it
             // takes the place of, and its text stands one cell clear of them.
             let replaces = self
@@ -20271,6 +20266,12 @@ impl Widget for &mut Editor {
                     paint_diagnostic_tags(buf, text_x, y, row_width, vs, ve, struck);
                 }
             }
+
+            // Inline suggestion (#607): the first line as ghost text right at
+            // the caret (suggestions are only asked for at a line's end); the
+            // rest hang below as `VisRow::Ghost` rows (#1625), and only lines
+            // that found no row are counted here. It owns the line's tail, so
+            // the trailers below stand aside.
             let ghost_here = self.focused
                 && line_idx == self.cursor_row
                 && row_end >= line_len
