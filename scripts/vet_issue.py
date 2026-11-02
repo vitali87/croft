@@ -45,7 +45,8 @@ VETTING_LABELS = (STATUS_READY, STATUS_NEEDS_HUMAN, STATUS_REJECTED)
 
 # The identity the workflow's GITHUB_TOKEN acts as. Its own label changes
 # (dropping a stale `ready`, swapping one verdict for another) are not a
-# maintainer's decision, so they never count as a dismissal.
+# maintainer's decision, so they never count as a dismissal; nor does any
+# other bot's or app's, whose account type is not "User".
 WORKFLOW_ACTOR = "github-actions[bot]"
 
 COMMENT_MARKER = "<!-- issue-vetting -->"
@@ -306,12 +307,17 @@ def _event_order(event: dict) -> tuple[str, int]:
     return (str(event.get("created_at") or ""), event_id if isinstance(event_id, int) else 0)
 
 
+def _is_person(actor: object) -> bool:
+    return isinstance(actor, dict) and actor.get("type") == "User" and actor.get("login") != WORKFLOW_ACTOR
+
+
 def dismissed_labels(events: list[dict]) -> list[str]:
     """Verdict labels whose last word from a person was taking them off.
 
-    Only events by someone other than the workflow count, so the workflow
-    re-adding a label after a maintainer removed it (as it used to) does not
-    undo the removal. A person adding the label back clears the dismissal.
+    Only events by a person count: not the workflow, not another bot or
+    app. So the workflow re-adding a label after a maintainer removed it (as
+    it used to) does not undo the removal. A person adding the label back
+    clears the dismissal.
     """
     last_by_person: dict[str, str] = {}
     for event in sorted((e for e in events if isinstance(e, dict)), key=_event_order):
@@ -322,7 +328,7 @@ def dismissed_labels(events: list[dict]) -> list[str]:
             continue
         if label.get("name") not in VETTING_LABELS:
             continue
-        if not isinstance(actor, dict) or actor.get("login") == WORKFLOW_ACTOR:
+        if not _is_person(actor):
             continue
         last_by_person[label["name"]] = action
     return [name for name in VETTING_LABELS if last_by_person.get(name) == "unlabeled"]

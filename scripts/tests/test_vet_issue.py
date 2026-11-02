@@ -204,11 +204,12 @@ BOT = vet_issue.WORKFLOW_ACTOR
 
 
 def label_event(event_id: int, action: str, name: str, who: str = "vitali87") -> dict:
+    kind = "Bot" if who.endswith("[bot]") else "User"
     return {
         "id": event_id,
         "event": action,
         "label": {"name": name},
-        "actor": {"login": who},
+        "actor": {"login": who, "type": kind},
         "created_at": f"2026-10-2{event_id}T00:00:00Z",
     }
 
@@ -239,6 +240,13 @@ class Dismissed(unittest.TestCase):
             label_event(3, "labeled", "needs-human", BOT),
         ]
         self.assertEqual(vet_issue.dismissed_labels(events), ["needs-human"])
+
+    def test_another_bot_or_app_removing_a_label_is_not_a_dismissal(self):
+        events = [
+            label_event(1, "unlabeled", "needs-human", "some-app[bot]"),
+            {**label_event(2, "unlabeled", "ready"), "actor": {"login": "vitali87"}},
+        ]
+        self.assertEqual(vet_issue.dismissed_labels(events), [])
 
     def test_the_maintainer_adding_it_back_clears_the_dismissal(self):
         events = [label_event(1, "unlabeled", "rejected"), label_event(2, "labeled", "rejected")]
