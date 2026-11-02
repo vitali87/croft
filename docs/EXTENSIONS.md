@@ -104,6 +104,17 @@ Why a separate process, rather than loading code into croft:
 * **Versions.** The manifest's `api_version` names the protocol version the
   program speaks. The index offers only payloads this croft can talk to, as it
   already hides manifests it cannot read.
+* **The manifest names the exact payload it runs.** `api_version` is the
+  protocol, not the payload's identity, so the manifest also carries the
+  extension's `version` (the same version the signed index entry lists) and the
+  program's path inside the payload. Install writes the manifest only after
+  that version is unpacked and the named program exists in it. Launch runs only
+  `~/.croft/extensions/<id>/<version>/<path>` for the version the manifest
+  names, and reports a missing or incomplete payload instead of starting
+  anything else.
+* **Upgrades** unpack the new version beside the old one and replace the
+  manifest last, so a failed upgrade leaves the old version installed and
+  working. The old version's folder is removed once nothing runs from it.
 * **Start-up.** No extension starts before the first frame (tenet 1). A program
   starts when its feature is first used: opening a SQLite file, clicking the
   CodeQL icon.
