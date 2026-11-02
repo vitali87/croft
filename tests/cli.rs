@@ -240,7 +240,12 @@ fn devcontainer_rebuild_waits_for_the_croft_running_in_it() {
         "{stderr}"
     );
     let log = tmp.path().join("docker.log");
-    run_devcontainer(tmp.path(), &["--rebuild"], "fail").failure();
+    let out = run_devcontainer(tmp.path(), &["--rebuild"], "fail").failure();
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains("can't tell whether croft is running in the container"),
+        "{stderr}"
+    );
     assert!(!std::fs::read_to_string(&log).unwrap().contains("rm "));
     run_devcontainer(tmp.path(), &["--rebuild"], "root 7 0 0 10:01 ? 00:00:00 sh").success();
     let calls = std::fs::read_to_string(&log).unwrap();

@@ -356,8 +356,15 @@ pub fn run_args(dc: &DevContainer, root: &Path, config_hash: &str) -> Vec<String
 /// text (#1110), so a comment or a reformat is no change. Keys used only at
 /// attach time, such as `remoteUser`, need no new container and are left out.
 fn config_hash(dc: &DevContainer, root: &Path) -> String {
-    let mut parts = run_args(dc, root, "");
-    parts.extend(build_args(dc, root).unwrap_or_default());
+    // `containerEnv` and `build.args` keep the file's key order, which
+    // means nothing to the container.
+    let mut dc = dc.clone();
+    dc.env.sort();
+    if let Source::Build { args, .. } = &mut dc.source {
+        args.sort();
+    }
+    let mut parts = run_args(&dc, root, "");
+    parts.extend(build_args(&dc, root).unwrap_or_default());
     for argv in &dc.post_create {
         parts.push(String::from("postCreateCommand"));
         parts.extend(argv.iter().cloned());
@@ -474,8 +481,12 @@ pub fn up_and_attach(root: &Path, rebuild: bool) -> Result<()> {
         if rebuild {
             // Fail closed: a check that can't be made is no evidence that
             // nothing would be lost.
-            let running = docker_out(&["inspect", "-f", "{{.State.Running}}", &id])? == "true";
-            if running && croft_attached(&docker_out(&["top", &id])?) {
+            let unsure = "can't tell whether croft is running in the container, so --rebuild \
+                          leaves it in place";
+            let running = docker_out(&["inspect", "-f", "{{.State.Running}}", &id])
+                .context(unsure)?
+                == "true";
+            if running && croft_attached(&docker_out(&["top", &id]).context(unsure)?) {
                 bail!(
                     "croft is still running in this container, in another terminal; quit it \
                      there first so its unsaved edits are not lost, or remove the container \
@@ -716,6 +727,25 @@ mod tests {
         ] {
             assert_eq!(of(same), base, "{same}");
         }
+        let env = of(r#"{ "image": "u", "containerEnv": { "A": "1", "B": "2" } }"#);
+        assert_eq!(
+            of(r#"{ "image": "u", "containerEnv": { "B": "2", "A": "1" } }"#),
+            env,
+            "key order"
+        );
+        assert_ne!(
+            of(r#"{ "image": "u", "containerEnv": { "A": "1", "B": "3" } }"#),
+            env
+        );
+        let build = |args: &str| {
+            of(&format!(
+                r#"{{ "build": {{ "dockerfile": "Dockerfile", "args": {args} }} }}"#
+            ))
+        };
+        assert_eq!(
+            build(r#"{ "X": "1", "Y": "2" }"#),
+            build(r#"{ "Y": "2", "X": "1" }"#)
+        );
         for changed in [
             r#"{ "image": "ubuntu:26.04", "postCreateCommand": "make" }"#,
             r#"{ "image": "ubuntu:24.04", "postCreateCommand": "make test" }"#,
