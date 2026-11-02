@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
@@ -1173,8 +1173,10 @@ struct LangCapabilitySupport {
     formatting: HashMap<Language, bool>,
     code_action: HashMap<Language, bool>,
     call_hierarchy: HashMap<Language, bool>,
-    /// Whether a server for the language offers inline completions (#607).
-    inline_completion: HashMap<Language, bool>,
+    /// The server instances, by (language, project root) as
+    /// `request_inline_completion` picks them, one of whose running servers
+    /// offers inline completions (#607).
+    inline_completion: HashSet<ClientKey>,
     /// Whether a server for the language wants `willRenameFiles` (#610).
     will_rename: HashMap<Language, bool>,
     /// Concatenated on-type trigger characters per language (#254);
@@ -2220,18 +2222,33 @@ impl LspManager {
         self.language_supports(lang, |s| &s.call_hierarchy)
     }
 
-    /// Whether a server for `lang` offers inline completions (#607), so the
-    /// app asks it rather than a model. `None` means no server has reported.
-    pub fn language_supports_inline_completion(&self, lang: Language) -> Option<bool> {
-        self.language_supports(lang, |s| &s.inline_completion)
+    /// Whether a running server at `path`'s project root offers inline
+    /// completions (#607), so the app asks it rather than a model.
+    pub fn document_offers_inline_completion(&self, path: &Path) -> bool {
+        let Some(lang) = path_to_language(path) else {
+            return false;
+        };
+        self.capability_support.lock().is_ok_and(|support| {
+            support
+                .document_roots
+                .get(path)
+                .is_some_and(|root| support.inline_completion.contains(&(lang, root.clone())))
+        })
     }
 
-    /// Test hook: record whether `lang`'s servers offer inline completions,
-    /// as a spawn would.
+    /// Test hook: `path` is open at its directory, whose servers offer
+    /// inline completions, unstarted.
     #[cfg(test)]
-    pub fn set_inline_completion_support_for_test(&self, lang: Language, offered: bool) {
+    pub fn set_inline_completion_for_test(&self, path: &Path) {
+        let Some(lang) = path_to_language(path) else {
+            return;
+        };
+        let root = path.parent().unwrap_or(path).to_path_buf();
         if let Ok(mut support) = self.capability_support.lock() {
-            support.inline_completion.insert(lang, offered);
+            support
+                .document_roots
+                .insert(path.to_path_buf(), root.clone());
+            support.inline_completion.insert((lang, root));
         }
     }
 
@@ -3473,6 +3490,7 @@ impl WorkerState {
                 }
             }
             support.completion_triggers.remove(key);
+            support.inline_completion.remove(key);
         }
         self.docs
             .retain(|_, doc| (doc.language, doc.project_root.clone()) != *key);
@@ -3819,9 +3837,11 @@ impl WorkerState {
                 };
                 support.code_action.insert(lang, supports_code_action);
                 support.call_hierarchy.insert(lang, supports_call_hierarchy);
-                support
-                    .inline_completion
-                    .insert(lang, spawned.iter().any(|c| c.supports_inline_completion));
+                if spawned.iter().any(|c| c.supports_inline_completion) {
+                    support.inline_completion.insert(key.clone());
+                } else {
+                    support.inline_completion.remove(&key);
+                }
                 support
                     .will_rename
                     .insert(lang, spawned.iter().any(|c| c.will_rename.is_some()));

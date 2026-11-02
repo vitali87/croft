@@ -19,7 +19,8 @@
 //! files instead, and needs no model. Its answer may replace part of the
 //! caret's line rather than add at the caret: [`Ghost::replacing`] turns
 //! the common "finish the word you typed" kind back into plain ghost text,
-//! and keeps the rest as a replacement Tab applies whole.
+//! and keeps the rest as a replacement Tab applies whole, so taking it
+//! always leaves the line as the server's edit would.
 //!
 //! # Why one blocking request per pause, on its own thread
 //!
@@ -226,10 +227,11 @@ impl Ghost {
 
     /// A language server's answer that replaces columns `range` of the
     /// caret's `line` with `text`. When `text` starts with what the range
-    /// already holds before the caret, and keeps what it holds after it (or
-    /// that is only blanks), only the new middle is ghost text at the caret,
-    /// as for a model. `None` when the answer changes nothing, or its range
-    /// does not hold the caret or runs past the line.
+    /// already holds before the caret and ends with what it holds after it,
+    /// only the new middle is ghost text at the caret, as for a model. Even
+    /// blanks after the caret count: dropping them is the server's edit too.
+    /// `None` when the answer changes nothing, or its range does not hold
+    /// the caret or runs past the line.
     pub fn replacing(
         row: usize,
         col: usize,
@@ -243,10 +245,9 @@ impl Ghost {
         }
         let typed: String = line.chars().take(col).skip(range.start).collect();
         let after: String = line.chars().take(range.end).skip(col).collect();
-        let ahead = text.strip_prefix(typed.as_str()).and_then(|rest| {
-            rest.strip_suffix(after.as_str())
-                .or_else(|| after.trim().is_empty().then_some(rest))
-        });
+        let ahead = text
+            .strip_prefix(typed.as_str())
+            .and_then(|rest| rest.strip_suffix(after.as_str()));
         let (text, replaces) = match ahead {
             Some(middle) => (middle.to_string(), None),
             None => (text, Some(range)),
@@ -405,12 +406,12 @@ mod tests {
 
     use super::*;
 
-    /// A server's answer that re-sends the word typed so far, and the
-    /// blanks after the caret, is plain ghost text for the rest.
+    /// A server's answer that re-sends the word typed so far, and what
+    /// its range holds after the caret, is plain ghost text for the rest.
     #[test]
     fn a_replacement_that_types_ahead_is_ghost_text_at_the_caret() {
-        let line = "    let x = pri  ";
-        let g = Ghost::replacing(0, 15, 7, line, 12..17, String::from("println!()")).unwrap();
+        let line = "    let x = pri";
+        let g = Ghost::replacing(0, 15, 7, line, 12..15, String::from("println!()")).unwrap();
         assert_eq!(g, Ghost::insert(0, 15, 7, String::from("ntln!()")));
         let closing = Ghost::replacing(0, 4, 1, "foo()", 0..5, String::from("foo(bar)"));
         assert_eq!(closing.map(|g| g.text).as_deref(), Some("bar"));
@@ -429,6 +430,12 @@ mod tests {
             dropped.and_then(|g| g.replaces),
             Some(0..5),
             "the `)` after the caret is not kept, so it is replaced"
+        );
+        let blanks = Ghost::replacing(0, 7, 1, "x = \"ab  ", 4..9, String::from("\"abc\""));
+        assert_eq!(
+            blanks.and_then(|g| g.replaces),
+            Some(4..9),
+            "blanks the answer drops are replaced, not left after it"
         );
     }
 

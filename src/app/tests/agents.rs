@@ -3057,10 +3057,11 @@ fn an_edit_makes_a_suggestion_stale_and_esc_dismisses_one() {
 /// paused at the end of `line`.
 fn app_with_server_suggestions(tmp: &std::path::Path, line: &str) -> App {
     let mut app = app_with_open_file(tmp, "a.rs", &format!("{line}\n"));
+    let path = app.editor.path.clone().unwrap();
     app.lsp
         .as_ref()
         .unwrap()
-        .set_inline_completion_support_for_test(crate::lsp::Language::RUST, true);
+        .set_inline_completion_for_test(&path);
     app.inline_config = Some(crate::inline_complete::Config {
         backend: crate::inline_complete::Backend::Claude {
             base_url: String::from("http://127.0.0.1:1"),

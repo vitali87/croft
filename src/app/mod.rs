@@ -65564,7 +65564,9 @@ impl App {
     /// Whether the current file's language server offers inline completions
     /// (LSP 3.18): it then answers instead of the model (#607).
     fn editor_offers_inline_completion(&self) -> bool {
-        self.editor_language_supports(crate::lsp::LspManager::language_supports_inline_completion)
+        let path = self.editor.path.as_deref();
+        path.zip(self.lsp.as_ref())
+            .is_some_and(|(p, lsp)| lsp.document_offers_inline_completion(p))
     }
 
     /// Land the language server's inline completion (#607) when it still
