@@ -6983,7 +6983,7 @@ impl App {
             inline_protocol: crate::iterm2_inline::detect_inline_image_protocol(),
             sixel_supported: false,
             resize_repaint_needed: false,
-            minimap_visible: true,
+            minimap_visible: layout_prefs.minimap,
             minimap_side: MinimapSide::Right,
             minimap_base: None,
             minimap_img_rect: Rect::default(),
@@ -14811,6 +14811,7 @@ impl App {
         let saved = crate::prefs::save_layout(crate::prefs::LayoutPrefs {
             activity_bar: self.activity_bar_visible,
             status_bar: self.status_bar_visible,
+            minimap: self.minimap_visible,
             side_bar_position: self.side_bar_position,
             secondary_side_bar: self.secondary_side_bar_visible,
             panel_alignment: self.panel_alignment,
@@ -71875,6 +71876,7 @@ impl App {
         if !self.minimap_visible {
             self.disable_minimap_image();
         }
+        self.persist_layout();
         self.status = if self.minimap_visible && !self.minimap_room {
             format!(
                 "Minimap on: it shows once the editor is {} columns wide",
