@@ -11,6 +11,11 @@ name: Issue vetting
 #
 # Every failure mode is closed: no endpoint, no answer, an unparseable answer,
 # low confidence, suspected injection all land on needs-human.
+#
+# A verdict label the maintainer takes off stays off (#1984): the vet never
+# adds back a label whose last change by a person was its removal, and the
+# daily sweep skips issues that have one. Adding the label back by hand
+# undoes that.
 
 on:
   issues:
@@ -141,7 +146,18 @@ jobs:
           for other in ready needs-human rejected; do
             [ "$other" = "$status" ] || gh issue edit "$ISSUE" --remove-label "$other" >/dev/null 2>&1 || true
           done
-          gh issue edit "$ISSUE" --add-label "$status" >/dev/null
+
+          # Read the event log now, not before the model call, so a removal
+          # made while the model was thinking still counts. A log that can't
+          # be read dismisses nothing, so the verdict is still applied.
+          gh api --paginate "repos/${GITHUB_REPOSITORY}/issues/${ISSUE}/events" --jq '.[]' | jq -s . > events.json \
+            || { echo "::warning::could not read the event log of #${ISSUE}"; echo '[]' > events.json; }
+          dismissed="$(python3 scripts/vet_issue.py dismissed --events events.json)"
+          if grep -qxF "$status" <<<"$dismissed"; then
+            echo "the maintainer removed ${status} from #${ISSUE}; not adding it back"
+          else
+            gh issue edit "$ISSUE" --add-label "$status" >/dev/null
+          fi
 
           # One vetting comment per issue, edited in place on every re-vet.
           jq -r .comment decision.json > comment.md
@@ -160,21 +176,38 @@ jobs:
     timeout-minutes: 10
     permissions:
       actions: write
+      contents: read
       issues: read
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: scripts
+          sparse-checkout-cone-mode: false
+
       - name: Find open external issues with no verdict and dispatch each
         run: |
           set -euo pipefail
           # gh's built-in --jq takes no --arg, so the owner is bound in standalone jq.
-          # No checkout in this job, so gh needs the repository spelled out.
+          # gh is given the repository explicitly rather than reading it from the checkout.
           gh issue list --repo "$GITHUB_REPOSITORY" --state open --limit 500 --json number,author,labels \
           | jq -r --arg owner "$GITHUB_REPOSITORY_OWNER" '
               .[] | select((.author.login // "") != "" and .author.login != $owner)
                   | select(any(.labels[].name; . == "ready" or . == "needs-human" or . == "rejected") | not)
                   | .number' \
           | while read -r n; do
+              # No verdict label because the maintainer took it off is a
+              # ruling, not a missed event: leave the issue alone.
+              if ! gh api --paginate "repos/${GITHUB_REPOSITORY}/issues/${n}/events" --jq '.[]' | jq -s . > events.json; then
+                echo "::warning::could not read the event log of #${n}; not dispatching"
+                continue
+              fi
+              dismissed="$(python3 scripts/vet_issue.py dismissed --events events.json | paste -sd, -)"
+              if [ -n "$dismissed" ]; then
+                echo "skipping #${n}: the maintainer removed ${dismissed}"
+                continue
+              fi
               echo "dispatching vet for #${n}"
               # One failed dispatch (a 5xx, an issue closed since the list)
               # must not strand the rest of the sweep under set -e.
