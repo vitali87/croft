@@ -1,0 +1,1 @@
+feature: The find bar, its Replace field, the terminal find bar and the global search fields have a real caret: Left/Right, Home/End, Delete, Ctrl-word moves and a click place it, and long text scrolls with it.
