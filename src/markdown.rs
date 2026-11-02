@@ -129,6 +129,19 @@ impl MarkdownPreview {
         link_of(cells[(col, row)].fg)
     }
 
+    /// The built lines with link `i` lifted to `bg` (#1939): what the preview
+    /// paints while the pointer rests on that link. Only styles change, so
+    /// the lines wrap exactly as the unlifted ones do.
+    pub fn lines_with_hovered_link(&self, i: usize, bg: Color) -> Vec<Line<'static>> {
+        let mut lines = self.lines.clone();
+        for &(line, span) in self.links.links.get(i).map_or(&[][..], |l| &l.spans) {
+            if let Some(s) = lines.get_mut(line).and_then(|l| l.spans.get_mut(span)) {
+                s.style = s.style.bg(bg);
+            }
+        }
+        lines
+    }
+
     /// Built lines `range` painted into `area` as the preview paints them,
     /// each link's spans coloured with its index: the paragraph's own wrap
     /// places the text, so a cell names the link drawn there exactly.

@@ -1822,6 +1822,64 @@ fn preview_links_follow_on_click_and_ctrl_click() {
     );
 }
 
+/// #1939: the preview link under the pointer lifts to the hover background,
+/// the whole link and nothing else, and drops it once the pointer moves off.
+#[test]
+fn preview_link_under_the_pointer_lifts_to_the_hover_background() {
+    use crossterm::event::{MouseEvent, MouseEventKind};
+    let tmp = tempfile::tempdir().unwrap();
+    let readme = tmp.path().join("README.md");
+    std::fs::write(&readme, "Read the [setup guide](docs/SETUP.md) first.\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&readme).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.toggle_markdown_preview();
+    render_buf(&mut app);
+    let md = app
+        .editor
+        .markdown_preview
+        .as_ref()
+        .expect("the preview is open");
+    let (x, y) = (md.rows.iter().enumerate())
+        .find_map(|(y, cells)| Some((cells.concat().find("setup guide")?, y)))
+        .expect("the link is on screen");
+    let (left, row) = (md.last_area.x + x as u16, md.last_area.y + y as u16);
+    let link = left..left + "setup guide".len() as u16;
+    let lift = crate::widgets::hover::hover_bg(app.theme);
+    let move_to = |app: &mut App, column: u16| {
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Moved,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        });
+        render_buf(app)
+    };
+    let lifted = |buf: &ratatui::buffer::Buffer, cols: std::ops::Range<u16>| {
+        cols.filter(|&c| buf[(c, row)].bg == lift).count()
+    };
+
+    let buf = move_to(&mut app, left + 3);
+    assert_eq!(
+        lifted(&buf, link.clone()),
+        link.len(),
+        "every cell of the link lifts"
+    );
+    assert_eq!(lifted(&buf, 0..left), 0, "text before the link stays flat");
+    assert_eq!(
+        lifted(&buf, link.end..140),
+        0,
+        "text after the link stays flat"
+    );
+
+    let buf = move_to(&mut app, link.end + 2);
+    assert_eq!(
+        lifted(&buf, link),
+        0,
+        "the lift drops once the pointer leaves the link"
+    );
+}
+
 #[test]
 fn image_eviction_wipes_the_screen_only_on_cell_buffer_protocols() {
     // The `terminal.clear()` the main loop fires when an image-clear latch is
