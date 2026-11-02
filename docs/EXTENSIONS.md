@@ -21,7 +21,7 @@ lands only if the existing tests pass unchanged.
 
 Measured on 2026-10-31 on a 4-core Linux machine at v0.2.99:
 
-| | Time | Binary share (63.5 MB) |
+| Part | Time | Binary share (63.5 MB) |
 |---|---|---|
 | Release build, from scratch | 14 min | |
 | ... croft's own code, one crate | 11 min 52 s | most of it |
@@ -124,9 +124,9 @@ Why a separate process, rather than loading code into croft:
 Extension programs live in this repository as workspace members marked
 `publish = false`, so they share CI, tests and review with the core. The release
 workflow builds each one for every target and attaches them to the GitHub
-release. The index build in croft-extensions
-(`codeberg.org/vitali87/croft-extensions`) reads their URLs and hashes and signs
-them with the rest of the index.
+release. The index build in
+[croft-extensions](https://codeberg.org/vitali87/croft-extensions) reads their
+URLs and hashes and signs them with the rest of the index.
 
 ### The protocol, in outline
 
