@@ -708,3 +708,30 @@ fn show_memory_usage_opens_a_per_subsystem_report() {
     );
     assert!(!app.editor.dirty, "nothing was edited");
 }
+
+/// #694: the rendered report wears the active theme from its first frame.
+/// Its tab is created with the default theme, and the preview bakes its
+/// colours when it is built.
+#[test]
+fn show_memory_usage_renders_in_the_active_theme() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let light = crate::theme::Theme::from_id("light");
+    assert_ne!(light.accent(), crate::theme::Theme::default().accent());
+    app.apply_theme(light);
+    app.run_command(Command::DeveloperShowMemoryUsage);
+    let md = app
+        .editor
+        .markdown_preview
+        .as_ref()
+        .expect("opens rendered");
+    let title = (md.lines.iter().flat_map(|l| &l.spans))
+        .find(|s| s.content.contains("croft memory usage"))
+        .expect("the title is built");
+    assert_eq!(
+        title.style.fg,
+        Some(light.accent()),
+        "the title is in the theme's accent"
+    );
+}

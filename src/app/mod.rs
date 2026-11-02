@@ -28267,6 +28267,9 @@ impl App {
                 // Rendered rather than raw (#694): the preview ignores typing,
                 // so keys meant for another tab can't land in the report.
                 // Highlighting only; no language server hears about the tab.
+                // The fresh tab carries the default theme until the next
+                // frame's sync, and the preview bakes its colours in now.
+                self.editor.theme = self.theme;
                 self.editor
                     .set_language(Some(crate::highlight::LangKind::Markdown));
                 if self.editor.markdown_preview.is_none() {
