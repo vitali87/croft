@@ -1325,3 +1325,97 @@ fn go_and_lint_rows_reach_problems_only_for_real_files() {
         ]
     );
 }
+
+/// Seed the build-diagnostic store the way a finished build does.
+fn seed_build_rows(app: &mut App, rows: &[(&std::path::Path, u32, u32, &str)]) {
+    use crate::lsp::manager::DiagnosticSeverity;
+    for (path, line, col, msg) in rows {
+        app.build_diagnostics
+            .entry(path.to_path_buf())
+            .or_default()
+            .push((
+                1,
+                crate::widgets::problems::ProblemItem {
+                    line: *line,
+                    col: *col,
+                    col_utf16: false,
+                    severity: DiagnosticSeverity::Warning,
+                    message: (*msg).to_string(),
+                    source: String::from("build"),
+                    code: None,
+                },
+            ));
+    }
+    app.rebuild_problems();
+}
+
+#[test]
+fn go_to_next_and_previous_problem_walk_the_build_messages_across_files_and_wrap() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.c");
+    let b = tmp.path().join("b.c");
+    std::fs::write(&a, "int a;\nint b;\nint c;\n").unwrap();
+    std::fs::write(&b, "int d;\nint e;\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    seed_build_rows(
+        &mut app,
+        &[(&a, 0, 4, "one"), (&a, 2, 1, "two"), (&b, 1, 2, "three")],
+    );
+    let next = Command::from_id("next_problem").expect("next_problem id");
+    let prev = Command::from_id("previous_problem").expect("previous_problem id");
+
+    // Nothing open: the first entry.
+    app.run_command(next);
+    assert_eq!(app.editor.path.as_deref(), Some(a.as_path()));
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (0, 4));
+    assert!(app.status.contains("Problem 1/3"), "{}", app.status);
+    assert!(app.status.contains("one"), "{}", app.status);
+    // On an entry: the next one, then across the file boundary, then wrap.
+    app.run_command(next);
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (2, 1));
+    app.run_command(next);
+    assert_eq!(app.editor.path.as_deref(), Some(b.as_path()));
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (1, 2));
+    app.run_command(next);
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(a.as_path()),
+        "wraps to the first"
+    );
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (0, 4));
+    // And back, wrapping to the last.
+    app.run_command(prev);
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(b.as_path()),
+        "wraps to the last"
+    );
+    app.run_command(prev);
+    assert_eq!(app.editor.path.as_deref(), Some(a.as_path()));
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (2, 1));
+}
+
+#[test]
+fn go_to_next_problem_between_entries_and_with_none() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.c");
+    std::fs::write(&a, "int a;\nint b;\nint c;\nint d;\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let next = Command::from_id("next_problem").unwrap();
+    app.run_command(next);
+    assert_eq!(app.status, "No problems");
+    seed_build_rows(&mut app, &[(&a, 1, 0, "x"), (&a, 3, 0, "y")]);
+    app.editor.open_pinned(&a).unwrap();
+    app.editor.cursor_row = 2;
+    app.editor.cursor_col = 0;
+    app.run_command(next);
+    assert_eq!(app.editor.cursor_row, 3, "the first entry after the caret");
+    app.editor.cursor_row = 0;
+    app.run_command(Command::from_id("previous_problem").unwrap());
+    assert_eq!(
+        app.editor.cursor_row, 3,
+        "before the first wraps to the last"
+    );
+}
