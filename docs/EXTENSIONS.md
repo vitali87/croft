@@ -44,9 +44,9 @@ modules that reach nothing else in the crate. The rest form one cycle through
 `app`, `widgets`, `lsp` and `prefs`. Splitting the crate therefore starts with
 untangling, not with moving files.
 
-The features that are natural extensions (CodeQL, SARIF, the file viewers,
-collaboration and pair, VS Code import, voice and a few others) add up to about
-38,000 lines in their own modules, and more once their side bars and app wiring
+The features that are natural extensions (CodeQL, SARIF, the file viewers, the
+AI seats and agent hooks, VS Code import, voice and a few others) add up to about
+37,000 lines in their own modules, and more once their side bars and app wiring
 are counted. Moving them out shrinks the core by a sixth to a fifth. Build speed needs both moves: extensions out
 **and** the remaining core split into crates that compile in parallel.
 
@@ -95,8 +95,12 @@ Why a separate process, rather than loading code into croft:
   `src/lsp/install.rs`) and is reused.
 * **Remote parity.** `croft remote` installs the payload for the server's own
   target through the same path, so an extension works the same over SSH.
-* **Offline machines** install from a file: `croft extension install <file>`,
-  checked against the same signed index entry.
+* **Offline machines** install from a bundle: `croft extension install
+  <bundle>`. A fresh offline machine has no cached index, so the bundle carries
+  the payload together with `index.json` and its signature. croft verifies the
+  signature against the baked key and the payload against the signed sha256,
+  exactly as an online install does, and refuses a bundle that fails either
+  check.
 * **Versions.** The manifest's `api_version` names the protocol version the
   program speaks. The index offers only payloads this croft can talk to, as it
   already hides manifests it cannot read.
@@ -175,15 +179,19 @@ time to first frame and keystroke latency before and after.
 4. **File viewers out:** SQLite, spreadsheets (calamine and umya-spreadsheet),
    Word and OpenDocument, archives, log colouring, notebooks.
 5. **Grammars out,** behind the latency check above.
-6. **Features with their own screens out:** CodeQL and SARIF, collaboration and
-   pair, VS Code import, voice, `croft web`, and the rest that most sessions
-   never open.
+6. **Features with their own screens out:** CodeQL and SARIF, the AI seats (the
+   MCP collab agent and the `croft pair` navigator) and agent edit approvals,
+   VS Code import, voice, `croft web`, and the rest that most sessions never
+   open. Shared sessions and `--solo` viewports are not on this list: they are
+   how `croft attach` works (see COLLABORATION.md), so they stay with the
+   session host in the core, and the AI seats keep joining them as guests.
 
 ## What stays in the core
 
 The editor, the terminal, the Explorer, Search, Source Control, the LSP and DAP
 clients, tasks, the Testing view's runner host, settings and themes,
-`croft remote` and `croft attach`, and the extension host itself.
+`croft remote`, `croft attach` with its shared sessions and `--solo` viewports,
+and the extension host itself.
 
 ## Open questions
 
