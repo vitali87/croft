@@ -59,11 +59,14 @@ pub fn apply_fix(
             };
             let range = text_range(&rep.deleted_region, &lines, kind)
                 .ok_or_else(|| format!("{uri}: a replacement's region does not resolve"))?;
+            // A snippet's line endings may be the analyzer's, not the
+            // file's (or the buffer's, which joins lines with `\n`).
+            let unix = |s: &str| s.replace("\r\n", "\n");
             let snippet = rep.deleted_region.snippet.as_ref();
             if range.clamped
                 || snippet
                     .and_then(|s| s.text.as_deref())
-                    .is_some_and(|s| slice(&lines, &range) != s)
+                    .is_some_and(|s| unix(slice(&lines, &range)) != unix(s))
             {
                 return Err(changed_since_analysis(&path));
             }
@@ -614,6 +617,17 @@ mod tests {
         let (run, fix) = run_with_fix(&fix_json("return 1"));
         let edits = apply_fix(&run, &fix, &resolver(tmp.path()), read).unwrap();
         assert_eq!(edits[0].after, "    x is None\n");
+        // A CRLF snippet still matches a buffer, whose lines join with `\n`.
+        let (run, fix) = run_with_fix(
+            r#"{"artifactChanges":[{"artifactLocation":{"uri":"f.py"},"replacements":[
+                {"deletedRegion":{"startLine":1,"startColumn":1,"endLine":2,"endColumn":2,"snippet":{"text":"a\r\nb"}},
+                  "insertedContent":{"text":"c"}}]}]}"#,
+        );
+        let edits = apply_fix(&run, &fix, &resolver(tmp.path()), &mut |_| {
+            Some(String::from("a\nb\n"))
+        })
+        .unwrap();
+        assert_eq!(edits[0].after, "c\n");
     }
 
     /// #1094: a fix is refused, changing nothing, for a file the caller says
