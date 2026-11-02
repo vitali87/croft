@@ -74613,9 +74613,22 @@ impl App {
                     s
                 })
         };
-        let edits = match crate::sarif::fixes::fix_for(&run, &result, index, &resolver, &mut |p| {
-            open_text(p).or_else(|| std::fs::read_to_string(p).ok())
-        }) {
+        // A file with unsaved edits, such as one an earlier fix from this
+        // log went into, or saved since the log, is not what it describes.
+        let changed = |p: &std::path::Path| {
+            self.editor
+                .iter_tabs()
+                .any(|t| t.path.as_deref() == Some(p) && t.dirty)
+                || crate::sarif::fixes::saved_after(p, &log_path)
+        };
+        let edits = match crate::sarif::fixes::fix_for(
+            &run,
+            &result,
+            index,
+            &resolver,
+            &mut |p| open_text(p).or_else(|| std::fs::read_to_string(p).ok()),
+            &changed,
+        ) {
             Ok(e) => e,
             Err(why) => {
                 self.status = format!("Fix not applied: {why}");

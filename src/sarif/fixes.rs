@@ -6,7 +6,7 @@
 //! in the editor rather than a silent write to disk.
 
 use super::model::{Fix, Run, SarifResult};
-use super::region::{Lines, byte_span, column_kind, newline_sequences, text_range};
+use super::region::{Lines, byte_span, column_kind, newline_sequences, slice, text_range};
 use super::resolve::Resolver;
 use std::path::{Path, PathBuf};
 
@@ -20,7 +20,9 @@ pub struct FileEdit {
 
 /// Compute every file a fix changes. Fails, changing nothing, when a file
 /// cannot be found or read, a region does not resolve, replacements overlap,
-/// or a replacement inserts binary content.
+/// or a replacement inserts binary content. It also fails when a region
+/// shows the file is not the text the analyzer saw (#1094): it points past
+/// the end of the text, or its `snippet` is not what sits there now.
 pub fn apply_fix(
     run: &Run,
     fix: &Fix,
@@ -57,6 +59,14 @@ pub fn apply_fix(
             };
             let range = text_range(&rep.deleted_region, &lines, kind)
                 .ok_or_else(|| format!("{uri}: a replacement's region does not resolve"))?;
+            let snippet = rep.deleted_region.snippet.as_ref();
+            if range.clamped
+                || snippet
+                    .and_then(|s| s.text.as_deref())
+                    .is_some_and(|s| slice(&lines, &range) != s)
+            {
+                return Err(changed_since_analysis(&path));
+            }
             let (a, b) = byte_span(&lines, &range);
             spans.push((a, b, inserted));
         }
@@ -108,20 +118,49 @@ fn property_diff(result: &SarifResult) -> Option<&str> {
 }
 
 /// Compute fix `index` of `result` ([`fix_count`] orders them).
+///
+/// `changed` says a file changed since the log was written: it has unsaved
+/// edits, or it was saved after the log ([`saved_after`]). A `fixes[]` fix
+/// for such a file is refused (#1094), since its regions are line and
+/// column numbers into the text the analyzer saw, and on other text they
+/// replace the wrong code. A `properties.diff` fix needs no such guard: it
+/// lands only where its context and removed lines still match.
 pub fn fix_for(
     run: &Run,
     result: &SarifResult,
     index: usize,
     resolver: &Resolver,
     read: &mut dyn FnMut(&Path) -> Option<String>,
+    changed: &dyn Fn(&Path) -> bool,
 ) -> Result<Vec<FileEdit>, String> {
     if let Some(fix) = result.fixes.get(index) {
-        return apply_fix(run, fix, resolver, read);
+        let edits = apply_fix(run, fix, resolver, read)?;
+        if let Some(stale) = edits.iter().find(|e| changed(&e.path)) {
+            return Err(changed_since_analysis(&stale.path));
+        }
+        return Ok(edits);
     }
     match property_diff(result) {
         Some(diff) if index == result.fixes.len() => apply_diff(run, diff, resolver, read),
         _ => Err(String::from("no such fix")),
     }
+}
+
+/// Whether `path` was saved after the log at `log` was written, so the log's
+/// line and column numbers for it may no longer point at what the analyzer
+/// saw (#1094). `false` when either time can't be read.
+pub fn saved_after(path: &Path, log: &Path) -> bool {
+    let mtime = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+    matches!((mtime(path), mtime(log)), (Some(file), Some(log)) if file > log)
+}
+
+/// Why a fix for a file that moved on since the analysis is refused.
+fn changed_since_analysis(path: &Path) -> String {
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+    format!("{name} changed since the analysis; re-run the analyzer")
 }
 
 /// One file's part of a unified diff.
@@ -357,9 +396,16 @@ mod tests {
             fix_description(&result, 0).as_deref(),
             Some("the patch in properties.diff")
         );
-        let edits = fix_for(&run, &result, 0, &resolver(tmp.path()), &mut |p| {
-            std::fs::read_to_string(p).ok()
-        })
+        // The file changed since the scan, but a diff checks its own context,
+        // so it is not refused for that (#1094).
+        let edits = fix_for(
+            &run,
+            &result,
+            0,
+            &resolver(tmp.path()),
+            &mut |p| std::fs::read_to_string(p).ok(),
+            &|_| true,
+        )
         .unwrap();
         assert_eq!(edits.len(), 1);
         assert_eq!(edits[0].path, file);
@@ -367,13 +413,28 @@ mod tests {
             edits[0].after,
             "// new\n// new\nfn main() {\n    let id = read();\n    let q = escape(&id);\n    run(q);\n}\n"
         );
-        assert!(fix_for(&run, &result, 1, &resolver(tmp.path()), &mut |_| None).is_err());
+        assert!(
+            fix_for(
+                &run,
+                &result,
+                1,
+                &resolver(tmp.path()),
+                &mut |_| None,
+                &|_| false
+            )
+            .is_err()
+        );
 
         // A file that no longer matches is refused, changing nothing.
         std::fs::write(&file, "fn main() {\n    let q = other();\n}\n").unwrap();
-        let err = fix_for(&run, &result, 0, &resolver(tmp.path()), &mut |p| {
-            std::fs::read_to_string(p).ok()
-        })
+        let err = fix_for(
+            &run,
+            &result,
+            0,
+            &resolver(tmp.path()),
+            &mut |p| std::fs::read_to_string(p).ok(),
+            &|_| false,
+        )
         .unwrap_err();
         assert!(
             err.contains("no longer matches the file near line 2"),
@@ -463,6 +524,101 @@ mod tests {
         })
         .unwrap();
         assert_eq!(edits[0].after, "IN buffer\n");
+    }
+
+    /// #1094: a region past the end of its line is the file having changed
+    /// since the scan. Pulling it back would land the fix on other code
+    /// (`    y = 1` became `    y = 1x is None`), so it is refused.
+    #[test]
+    fn a_region_past_the_end_of_the_text_is_refused_not_clamped() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("util.py"),
+            "def unused(x):\n    y = 1\n    return x == None\n",
+        )
+        .unwrap();
+        let (run, fix) = run_with_fix(
+            r#"{"artifactChanges":[{"artifactLocation":{"uri":"util.py"},"replacements":[
+                {"deletedRegion":{"startLine":2,"startColumn":12,"endColumn":21},"insertedContent":{"text":"x is None"}}]}]}"#,
+        );
+        let err = apply_fix(&run, &fix, &resolver(tmp.path()), &mut |p| {
+            std::fs::read_to_string(p).ok()
+        })
+        .unwrap_err();
+        assert_eq!(
+            err,
+            "util.py changed since the analysis; re-run the analyzer"
+        );
+    }
+
+    /// #1094: a region that fits but no longer holds the snippet the log
+    /// recorded for it is refused too.
+    #[test]
+    fn a_region_whose_snippet_is_not_there_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("f.py"), "    return 1\n").unwrap();
+        let fix_json = |snippet: &str| {
+            format!(
+                r#"{{"artifactChanges":[{{"artifactLocation":{{"uri":"f.py"}},"replacements":[
+                {{"deletedRegion":{{"startLine":1,"startColumn":5,"endColumn":13,"snippet":{{"text":"{snippet}"}}}},
+                  "insertedContent":{{"text":"x is None"}}}}]}}]}}"#
+            )
+        };
+        let read = &mut |p: &Path| std::fs::read_to_string(p).ok();
+        let (run, fix) = run_with_fix(&fix_json("x == None"));
+        let err = apply_fix(&run, &fix, &resolver(tmp.path()), read).unwrap_err();
+        assert!(err.contains("changed since the analysis"), "{err}");
+        // The same region with the snippet that is there applies.
+        let (run, fix) = run_with_fix(&fix_json("return 1"));
+        let edits = apply_fix(&run, &fix, &resolver(tmp.path()), read).unwrap();
+        assert_eq!(edits[0].after, "    x is None\n");
+    }
+
+    /// #1094: a fix is refused, changing nothing, for a file the caller says
+    /// changed since the log was written (unsaved edits, or a later save).
+    #[test]
+    fn a_fix_for_a_file_changed_since_the_log_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("g.py"), "a = 1\n").unwrap();
+        let log = parse_log(
+            r#"{"version":"2.1.0","runs":[{"tool":{"driver":{"name":"t"}},"results":[{"message":{"text":"m"},
+                "fixes":[{"artifactChanges":[{"artifactLocation":{"uri":"g.py"},"replacements":[
+                {"deletedRegion":{"startLine":1,"startColumn":1,"endColumn":2},"insertedContent":{"text":"b"}}]}]}]}]}]}"#,
+        )
+        .unwrap();
+        let run = log.runs.into_iter().next().unwrap();
+        let result = run.results.as_ref().unwrap()[0].clone();
+        let read = &mut |p: &Path| std::fs::read_to_string(p).ok();
+        let err = fix_for(&run, &result, 0, &resolver(tmp.path()), read, &|p| {
+            p.ends_with("g.py")
+        })
+        .unwrap_err();
+        assert_eq!(err, "g.py changed since the analysis; re-run the analyzer");
+        let edits = fix_for(&run, &result, 0, &resolver(tmp.path()), read, &|_| false).unwrap();
+        assert_eq!(edits[0].after, "b = 1\n");
+    }
+
+    #[test]
+    fn saved_after_compares_the_file_with_the_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (file, log) = (tmp.path().join("a.py"), tmp.path().join("r.sarif"));
+        std::fs::write(&file, "x\n").unwrap();
+        std::fs::write(&log, "{}").unwrap();
+        let at = |p: &Path, secs: u64| {
+            let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+            std::fs::File::options()
+                .write(true)
+                .open(p)
+                .unwrap()
+                .set_modified(t)
+                .unwrap();
+        };
+        at(&file, 1_000);
+        at(&log, 2_000);
+        assert!(!saved_after(&file, &log), "scanned, then logged");
+        at(&file, 3_000);
+        assert!(saved_after(&file, &log), "saved after the log");
+        assert!(!saved_after(&tmp.path().join("gone.py"), &log));
     }
 
     #[test]
