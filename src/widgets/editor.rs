@@ -3683,6 +3683,10 @@ pub struct Editor {
     /// The last half-block rendering, kept until the image, the area or
     /// the background changes, so a redraw does not decode the file again.
     cell_image: Option<CellImage>,
+    /// The pointer's screen cell, handed in by [`EditorTabs`] each frame so
+    /// the Markdown preview can lift the link under it (#1939). `None` when
+    /// the pointer is off-screen or unknown.
+    pub pointer: Option<(u16, u16)>,
     /// Whether the overview ruler paints its whole-file ticks over the
     /// vertical scrollbar track. On by default, like VS Code's; the palette's
     /// `View: Toggle Overview Ruler` turns it off for a plain bar.
@@ -4093,6 +4097,7 @@ impl Editor {
             color_swatches: Vec::new(),
             cell_images: false,
             cell_image: None,
+            pointer: None,
             whitespace_mode: WhitespaceMode::default(),
             line_numbers: LineNumbers::default(),
             diff_ws_default: crate::widgets::diff::DiffWhitespace::default(),
@@ -20640,7 +20645,20 @@ impl Editor {
             md.scroll = row.min(usize::from(max_scroll)) as u16;
         }
         md.last_area = text_area;
-        para.scroll((md.scroll, 0)).render(text_area, buf);
+        // The link under the pointer lifts like a hovered row (#1939), so it
+        // reads as clickable before the click. Asked after the frame's
+        // scroll, area and wrap are settled, so the hit-test sees this frame.
+        match self.pointer.and_then(|(col, row)| md.link_at(col, row)) {
+            Some(i) => {
+                let bg = crate::widgets::hover::hover_bg(self.theme);
+                let (lines, skip) = md.view_with_hovered_link(i, bg, text_area.height);
+                Paragraph::new(Text::from(lines))
+                    .wrap(Wrap { trim: false })
+                    .scroll((skip, 0))
+                    .render(text_area, buf);
+            }
+            None => para.scroll((md.scroll, 0)).render(text_area, buf),
+        }
         // Frame truth for selection (#215): the rendered view is a wrapped
         // Paragraph, so the only faithful record of what the user sees is
         // the cells we just painted. Read them back per row, then tint the
@@ -23431,6 +23449,7 @@ impl Widget for &mut EditorTabs {
         self.last_body = body;
         let active_editor = &mut self.editors[active];
         active_editor.cell_images = self.cell_images;
+        active_editor.pointer = self.hover_pointer;
         Widget::render(active_editor, body, buf);
     }
 }

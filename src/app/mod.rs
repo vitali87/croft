@@ -22497,8 +22497,11 @@ impl App {
             // half blocks (#1591).
             let cell_images = !self.inline_images_enabled();
             self.editor.cell_images = cell_images;
+            // Every group gets the pointer, not only the focused one, so a
+            // preview beside the source lifts its links too (#1939).
             for group in self.editor_layout.inactive_groups_mut() {
                 group.cell_images = cell_images;
+                group.hover_pointer = pointer;
             }
             // Breadcrumb bar: recompute the path + symbol trail for the active
             // file each frame so it tracks caret moves and outline updates.
