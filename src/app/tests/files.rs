@@ -2031,6 +2031,52 @@ fn the_lossy_prompt_after_a_disk_conflict_answers_for_the_overwrite_too() {
     }
 }
 
+/// #1053: a screen reader hears the whole lossy-save prompt, the way to
+/// keep the bytes and the keys included, within the announcement's cap.
+#[test]
+fn the_lossy_prompt_is_read_out_whole() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("latin1.txt");
+    std::fs::write(&file, b"caf\xe9\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('s'), KeyModifiers::CONTROL))
+        .unwrap();
+    let snap = app.a11y_snapshot();
+    assert_eq!(snap.focus, "Save would lose data");
+    assert_eq!(
+        snap.item.as_deref(),
+        Some(
+            "latin1.txt has invalid UTF-8 bytes. Saving turns them into \u{fffd} for good. \
+             To keep them, undo, then Reopen with Encoding. S, save anyway. Escape, cancel"
+        )
+    );
+}
+
+/// #1053: the lossy-save prompt is drawn over an unsaved-changes prompt
+/// that a deferred format-on-save write can leave beneath it, so the keys
+/// answer the prompt the user sees.
+#[test]
+fn the_lossy_prompt_answers_before_an_unsaved_prompt_beneath_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", "plain");
+    app.editor
+        .reopen_with_encoding(encoding_rs::WINDOWS_1252)
+        .unwrap();
+    app.editor.lines = vec![String::from("日")];
+    app.editor.dirty = true;
+    app.pending_unsaved = Some(UnsavedExit::Quit);
+    app.save();
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.pending_lossy_save.is_none(), "Esc answered the top one");
+    assert_eq!(app.pending_unsaved, Some(UnsavedExit::Quit));
+    assert_eq!(app.a11y_snapshot().focus, "Unsaved changes");
+}
+
 /// #1379: a file its owner `chmod 444`ed, open in the editor.
 #[cfg(unix)]
 fn app_with_protected_file(tmp: &std::path::Path, body: &str) -> (App, PathBuf) {

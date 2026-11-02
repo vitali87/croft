@@ -3198,13 +3198,18 @@ struct LossySave {
 }
 
 impl LossySave {
+    /// The file's name, as the prompt calls it.
+    fn name(&self) -> String {
+        self.path.as_deref().and_then(Path::file_name).map_or_else(
+            || String::from("This file"),
+            |n| n.to_string_lossy().into_owned(),
+        )
+    }
+
     /// The prompt's lines: what is wrong, what saving does about it, and
     /// how to keep what would be lost.
     fn text(&self) -> [String; 3] {
-        let name = self.path.as_deref().and_then(Path::file_name).map_or_else(
-            || String::from("This file"),
-            |n| n.to_string_lossy().into_owned(),
-        );
+        let name = self.name();
         let enc = self.encoding;
         if self.chars.is_empty() {
             return [
@@ -3224,6 +3229,26 @@ impl LossySave {
                 "Saving writes them as &#\u{2026}; references: the characters are lost for good.",
             ),
             String::from("To keep them, take them out, or undo the edits that added them (Cmd+Z)."),
+        ]
+    }
+
+    /// [`Self::text`] short enough to be read out whole with the keys, under
+    /// `a11y::MAX_LINE`, the recovery hint included.
+    fn spoken(&self) -> [String; 3] {
+        let name = self.name();
+        let enc = self.encoding;
+        if self.chars.is_empty() {
+            return [
+                format!("{name} has invalid {enc} bytes"),
+                String::from("Saving turns them into \u{fffd} for good"),
+                String::from("To keep them, undo, then Reopen with Encoding"),
+            ];
+        }
+        let shown: Vec<String> = self.chars.iter().map(char::to_string).collect();
+        [
+            format!("{enc} cannot represent {} in {name}", shown.join(" ")),
+            String::from("Saving writes &#\u{2026}; references for good"),
+            String::from("To keep them, remove them or undo"),
         ]
     }
 }
@@ -26705,6 +26730,21 @@ impl App {
             self.handle_list_picker_key(key);
             return Ok(());
         }
+        // The lossy-save prompt (#1053): only a plain S writes. Enter, N and
+        // Esc keep the file as it is, and every other key, the Cmd+S that
+        // used to be the consent included, does nothing. It is painted over
+        // the unsaved-changes prompt, which a deferred format-on-save write
+        // can leave up beneath it, so it answers first.
+        if self.pending_lossy_save.is_some() {
+            let plain = key.modifiers.difference(KeyModifiers::SHIFT).is_empty();
+            match key.code {
+                KeyCode::Char('s' | 'S') if plain => self.confirm_lossy_save(),
+                KeyCode::Char('n' | 'N') if plain => self.cancel_lossy_save(),
+                KeyCode::Enter | KeyCode::Esc => self.cancel_lossy_save(),
+                _ => {}
+            }
+            return Ok(());
+        }
         // The unsaved-changes prompt (#862): S or Enter saves, D goes on
         // without saving, N or Esc cancels. N is a cancel, not "don't save":
         // every other croft confirm reads N as "stop", and a reflex N must
@@ -26718,19 +26758,6 @@ impl App {
                 KeyCode::Char('d' | 'D') if plain => self.answer_unsaved(false),
                 KeyCode::Char('n' | 'N') if plain => self.cancel_unsaved(),
                 KeyCode::Esc => self.cancel_unsaved(),
-                _ => {}
-            }
-            return Ok(());
-        }
-        // The lossy-save prompt (#1053): only a plain S writes. Enter, N and
-        // Esc keep the file as it is, and every other key, the Cmd+S that
-        // used to be the consent included, does nothing.
-        if self.pending_lossy_save.is_some() {
-            let plain = key.modifiers.difference(KeyModifiers::SHIFT).is_empty();
-            match key.code {
-                KeyCode::Char('s' | 'S') if plain => self.confirm_lossy_save(),
-                KeyCode::Char('n' | 'N') if plain => self.cancel_lossy_save(),
-                KeyCode::Enter | KeyCode::Esc => self.cancel_lossy_save(),
                 _ => {}
             }
             return Ok(());
@@ -66052,6 +66079,14 @@ impl App {
             );
             return Some((target, row));
         }
+        // Over the unsaved-changes prompt when both are up, as it is drawn.
+        if let Some(asked) = &self.pending_lossy_save {
+            return Some(said(
+                "Save would lose data",
+                &asked.spoken(),
+                &[tr("S, save anyway"), tr("Escape, cancel")],
+            ));
+        }
         if let Some(exit) = &self.pending_unsaved {
             let (headline, names, save, discard) = self.unsaved_confirm_text(exit);
             // The tab label carries the dirty dot, which a reader would read
@@ -66065,14 +66100,6 @@ impl App {
                     format!("D, {}", tr(&format!("D{discard}"))),
                     tr("Escape, cancel"),
                 ],
-            ));
-        }
-        if let Some(asked) = &self.pending_lossy_save {
-            let [what, consequence, _] = asked.text();
-            return Some(said(
-                "Save would lose data",
-                &[what, consequence],
-                &[tr("S, save anyway"), tr("Escape, keep the file as it is")],
             ));
         }
         if let Some(block) = &self.pending_run_block {
