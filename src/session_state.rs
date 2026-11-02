@@ -41,6 +41,8 @@ pub struct SessionState {
     pub sidebar_width: u16,
     pub terminal_height: Option<u16>,
     pub focus_editor: bool,
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub bookmarks: std::collections::HashMap<PathBuf, std::collections::BTreeSet<usize>>,
 }
 
 impl SessionState {
@@ -174,6 +176,7 @@ mod tests {
             sidebar_width: 32,
             terminal_height: Some(14),
             focus_editor: true,
+            bookmarks: Default::default(),
         };
         state.save(&path).expect("save");
         let loaded = SessionState::load(&path).expect("load");
@@ -211,6 +214,7 @@ mod tests {
             sidebar_width: 32,
             terminal_height: None,
             focus_editor: true,
+            bookmarks: Default::default(),
         };
         let json = serde_json::to_string(&state).expect("serialize");
         assert!(
