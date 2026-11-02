@@ -20650,11 +20650,11 @@ impl Editor {
         // scroll, area and wrap are settled, so the hit-test sees this frame.
         match self.pointer.and_then(|(col, row)| md.link_at(col, row)) {
             Some(i) => {
-                let lines =
-                    md.lines_with_hovered_link(i, crate::widgets::hover::hover_bg(self.theme));
+                let bg = crate::widgets::hover::hover_bg(self.theme);
+                let (lines, skip) = md.view_with_hovered_link(i, bg, text_area.height);
                 Paragraph::new(Text::from(lines))
                     .wrap(Wrap { trim: false })
-                    .scroll((md.scroll, 0))
+                    .scroll((skip, 0))
                     .render(text_area, buf);
             }
             None => para.scroll((md.scroll, 0)).render(text_area, buf),

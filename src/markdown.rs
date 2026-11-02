@@ -114,14 +114,7 @@ impl MarkdownPreview {
         if self.links.links.is_empty() || !area.contains((col, row).into()) {
             return None;
         }
-        // The paragraph wraps line by line, so painting from the built line
-        // at the top of the view lays the rows out exactly as the frame did.
-        let top = usize::from(self.scroll);
-        let first = self
-            .row_of_line
-            .partition_point(|&r| r <= top)
-            .saturating_sub(1);
-        let skip = top - self.row_of_line.get(first).copied().unwrap_or(0);
+        let (first, skip) = self.view_top();
         let rows = row - area.y + 1;
         let to = (first + skip + usize::from(rows)).min(self.lines.len());
         let area = Rect::new(area.x, area.y, area.width, rows);
@@ -129,17 +122,45 @@ impl MarkdownPreview {
         link_of(cells[(col, row)].fg)
     }
 
-    /// The built lines with link `i` lifted to `bg` (#1939): what the preview
-    /// paints while the pointer rests on that link. Only styles change, so
-    /// the lines wrap exactly as the unlifted ones do.
-    pub fn lines_with_hovered_link(&self, i: usize, bg: Color) -> Vec<Line<'static>> {
-        let mut lines = self.lines.clone();
+    /// The built line at the top of the view, and how many of its wrapped
+    /// rows are scrolled off above it. The paragraph wraps line by line, so
+    /// painting from that line, skipping those rows, lays the view out
+    /// exactly as painting every line with the preview's scroll does.
+    fn view_top(&self) -> (usize, usize) {
+        let top = usize::from(self.scroll);
+        let first = self
+            .row_of_line
+            .partition_point(|&r| r <= top)
+            .saturating_sub(1);
+        (
+            first,
+            top - self.row_of_line.get(first).copied().unwrap_or(0),
+        )
+    }
+
+    /// The view as the preview paints it while the pointer rests on link `i`
+    /// (#1939): the built lines that fill `height` rows from the top of the
+    /// view, with that link lifted to `bg`, and the rows to scroll past.
+    /// Only the lines on screen are copied, however long the document, and
+    /// only styles change, so they wrap exactly as the unlifted ones do.
+    pub fn view_with_hovered_link(
+        &self,
+        i: usize,
+        bg: Color,
+        height: u16,
+    ) -> (Vec<Line<'static>>, u16) {
+        let (first, skip) = self.view_top();
+        let to = (first + skip + usize::from(height)).min(self.lines.len());
+        let mut lines = self.lines.get(first..to).unwrap_or_default().to_vec();
         for &(line, span) in self.links.links.get(i).map_or(&[][..], |l| &l.spans) {
-            if let Some(s) = lines.get_mut(line).and_then(|l| l.spans.get_mut(span)) {
+            let s = line
+                .checked_sub(first)
+                .and_then(|l| lines.get_mut(l)?.spans.get_mut(span));
+            if let Some(s) = s {
                 s.style = s.style.bg(bg);
             }
         }
-        lines
+        (lines, skip as u16)
     }
 
     /// Built lines `range` painted into `area` as the preview paints them,
