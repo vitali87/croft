@@ -648,7 +648,8 @@ fn a_recorded_frame_masks_secrets_even_while_revealed() {
 }
 
 /// #694: Developer: Show Memory Usage opens a tab attributing memory to
-/// each subsystem, with the stored diagnostics counted per server.
+/// each subsystem, with the stored diagnostics counted per server. The tab
+/// is the rendered report, so typing into it changes nothing.
 #[test]
 fn show_memory_usage_opens_a_per_subsystem_report() {
     use crate::lsp::manager::DiagnosticSeverity;
@@ -671,5 +672,39 @@ fn show_memory_usage_opens_a_per_subsystem_report() {
     for section in ["Terminal panes", "Undo history", "OUTPUT channels"] {
         assert!(text.contains(section), "{text}");
     }
-    assert!(text.contains("ruff: 2 diagnostics in 1 files"), "{text}");
+    assert!(text.contains("`ruff`: 2 diagnostics in 1 files"), "{text}");
+
+    assert!(
+        app.editor.markdown_preview.is_some(),
+        "the report opens rendered"
+    );
+    draw(&mut app, 120, 40);
+    // The server section is last: End scrolls the rendered report to it.
+    app.handle_key(key(KeyCode::End, KeyModifiers::NONE))
+        .unwrap();
+    draw(&mut app, 120, 40);
+    let shown = |app: &App| {
+        let md = app.editor.markdown_preview.as_ref().unwrap();
+        md.rows
+            .iter()
+            .map(|r| r.concat())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    assert!(
+        shown(&app).contains("ruff: 2 diagnostics in 1 files"),
+        "{}",
+        shown(&app)
+    );
+    type_str(&mut app, "zz");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Backspace, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        app.editor.lines.join("\n"),
+        text,
+        "typing leaves the report alone"
+    );
+    assert!(!app.editor.dirty, "nothing was edited");
 }
