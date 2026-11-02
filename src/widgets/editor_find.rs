@@ -39,6 +39,13 @@ pub struct EditorFind {
     /// Ctrl+A. The next typed character or paste replaces it and Backspace
     /// clears it, as in VS Code; a caret key just drops the selection.
     pub query_selected: bool,
+    /// Char index of the caret in `query` (#1729). The bar is a real input
+    /// line: Left/Right/Home/End/Delete edit where the caret sits instead of
+    /// only at the end. Reads go through [`EditorFind::caret`], which clamps
+    /// to the query's char count.
+    pub caret: usize,
+    /// Char index of the caret in `replace`, the same model as `caret`.
+    pub replace_caret: usize,
     /// Find in Selection (#1577): the `(start, end)` positions, row and
     /// char column, the matches are limited to. `Alt+L` sets it from the
     /// selection and clears it again.
@@ -87,9 +94,11 @@ impl EditorFind {
     /// truncation flag stay unreachable from outside: they are one fact,
     /// written only through [`EditorFind::set_match_count`].
     pub fn new(query: String, opts: SearchOpts) -> Self {
+        let caret = query.chars().count();
         Self {
             query,
             opts,
+            caret,
             ..Default::default()
         }
     }
@@ -109,7 +118,30 @@ impl EditorFind {
     pub fn count_truncated(&self) -> bool {
         self.count_truncated
     }
+
+    /// The caret's char index, clamped to the query.
+    pub fn caret(&self) -> usize {
+        self.caret.min(self.query.chars().count())
+    }
+
+    /// Put the caret at char index `at`, clamped to the query.
+    pub fn set_caret(&mut self, at: usize) {
+        self.caret = at.min(self.query.chars().count());
+    }
+
+    /// The replace field's caret, clamped to its text.
+    pub fn replace_caret(&self) -> usize {
+        self.replace_caret.min(self.replace.chars().count())
+    }
+
+    /// Put the replace field's caret at char index `at`, clamped.
+    pub fn set_replace_caret(&mut self, at: usize) {
+        self.replace_caret = at.min(self.replace.chars().count());
+    }
 }
+
+// The caret editing the find bars share with every other input row.
+pub use crate::widgets::line_edit::{caret_left, caret_right, delete_at, delete_before, insert_at};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MatchPos {
@@ -610,7 +642,11 @@ pub fn render_editor_find(
         return;
     }
     let query_selected = state.query_selected && state.focus == FindField::Query;
-    let input_row = |marker: &str, text: &str, focused: bool, selected: bool| {
+    // One input row: the marker, then the text with the caret drawn where it
+    // sits (#1729) rather than always after the last character. A query wider
+    // than the row scrolls so the caret stays in view; two cells stay free at
+    // the right for the selection chip.
+    let input_row = |marker: &str, text: &str, focused: bool, selected: bool, caret: usize| {
         let text_style = if selected {
             Style::default()
                 .fg(theme.ui(Color::Rgb(0xff, 0xff, 0xff)))
@@ -621,20 +657,38 @@ pub fn render_editor_find(
                 .fg(theme.ui(Color::Rgb(0xec, 0xef, 0xf4)))
                 .add_modifier(Modifier::BOLD)
         };
-        let mut spans = vec![
-            Span::styled(
-                marker.to_string(),
-                Style::default().fg(theme.ui(Color::Rgb(0x88, 0xc0, 0xd0))),
-            ),
-            Span::styled(text.to_string(), text_style),
-        ];
-        if focused {
-            spans.push(Span::styled(
-                "_",
-                Style::default()
-                    .fg(theme.ui(Color::Rgb(0xec, 0xef, 0xf4)))
-                    .add_modifier(Modifier::SLOW_BLINK),
-            ));
+        let cursor_style = Style::default()
+            .fg(theme.ui(Color::Rgb(0x16, 0x18, 0x1f)))
+            .bg(theme.ui(Color::Rgb(0xec, 0xef, 0xf4)))
+            .add_modifier(Modifier::SLOW_BLINK);
+        let mut spans = vec![Span::styled(
+            marker.to_string(),
+            Style::default().fg(theme.ui(Color::Rgb(0x88, 0xc0, 0xd0))),
+        )];
+        let chars: Vec<char> = text.chars().collect();
+        let avail = inner
+            .width
+            .saturating_sub(marker.chars().count() as u16 + 3)
+            .max(1) as usize;
+        let win = crate::widgets::line_edit::window(text, caret, avail);
+        let caret = crate::widgets::line_edit::clamp(text, caret);
+        let before: String = chars[win.start..caret].iter().collect();
+        if !before.is_empty() {
+            spans.push(Span::styled(before, text_style));
+        }
+        let mut drawn = caret;
+        // A selected query paints as one band, so its caret is not drawn.
+        if focused && !selected {
+            if caret < win.end {
+                spans.push(Span::styled(chars[caret].to_string(), cursor_style));
+                drawn = caret + 1;
+            } else if caret >= chars.len() {
+                spans.push(Span::styled("_", cursor_style));
+            }
+        }
+        let tail: String = chars[drawn.min(win.end)..win.end].iter().collect();
+        if !tail.is_empty() {
+            spans.push(Span::styled(tail, text_style));
         }
         Line::from(spans)
     };
@@ -655,23 +709,34 @@ pub fn render_editor_find(
         buf.set_string(inner.x + inner.width - 2, inner.y, "≡", style);
     };
     if state.replace_visible && inner.height >= 2 {
+        let query_caret = state.caret();
+        let replace_caret = state.replace_caret();
         let rows = vec![
             input_row(
                 "> ",
                 &state.query,
                 state.focus == FindField::Query,
                 query_selected,
+                query_caret,
             ),
             input_row(
                 "⤷ ",
                 &state.replace,
                 state.focus == FindField::Replace,
                 false,
+                replace_caret,
             ),
         ];
         Widget::render(Paragraph::new(rows), inner, buf);
     } else {
-        let prompt = input_row("> ", &state.query, true, query_selected);
+        let query_caret = state.caret();
+        let prompt = input_row(
+            "> ",
+            &state.query,
+            state.focus == FindField::Query,
+            query_selected,
+            query_caret,
+        );
         Widget::render(Paragraph::new(prompt), inner, buf);
     }
     paint_chip(buf);
