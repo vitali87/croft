@@ -380,6 +380,13 @@ pub struct Prefs {
     /// the derived `Default` and an older config both mean "guides shown".
     #[serde(default)]
     pub disable_indent_guides: bool,
+    /// Home on a wrapped line (#1569): with this on, pressing Home on the
+    /// start of a continuation row goes to the start of the row above, one
+    /// visual row per press, before the line's own stops. Off (the default)
+    /// is VS Code's `cursorHome`: from a row's start straight to the line's
+    /// first non-blank character and column 0.
+    #[serde(default)]
+    pub home_walks_wrapped_rows: bool,
     /// Gutter line numbers (#1576, VS Code's `editor.lineNumbers`): "on"
     /// (also what the empty string an older config deserializes to means),
     /// "relative", "interval" or "off". Parsed by `LineNumbers::from_pref`.
