@@ -144,7 +144,8 @@ fn pr_without_a_usable_gh_says_how_to_fix_it_before_starting() {
 
 /// A workspace with a devcontainer.json, and a stand-in `docker` that logs
 /// each call to `docker.log` and knows one container for it, made from an
-/// older config. `docker top` lists `$DOCKER_TOP` as its processes.
+/// older config with its workspace at `/workspaces/before-the-edit`.
+/// `docker top` lists `$DOCKER_TOP` as its processes, or fails for `fail`.
 #[cfg(unix)]
 fn devcontainer_with_a_stale_container() -> tempfile::TempDir {
     use std::os::unix::fs::PermissionsExt;
@@ -165,8 +166,13 @@ fn devcontainer_with_a_stale_container() -> tempfile::TempDir {
 echo "$*" >> "$DOCKER_LOG"
 case "$1" in
   ps) echo c0ffee000001 ;;
-  inspect) case "$3" in *Running*) echo true ;; *Labels*) echo older-config ;; esac ;;
-  top) echo 'UID PID PPID C STIME TTY TIME CMD'; echo "$DOCKER_TOP" ;;
+  inspect) case "$3" in
+    *Running*) echo true ;;
+    *Labels*) echo older-config ;;
+    *WorkingDir*) echo /workspaces/before-the-edit ;;
+  esac ;;
+  top) [ "$DOCKER_TOP" = fail ] && exit 1
+    echo 'UID PID PPID C STIME TTY TIME CMD'; echo "$DOCKER_TOP" ;;
   exec) case "$*" in *uname*) echo x86_64 ;; esac ;;
 esac
 "#,
@@ -195,7 +201,8 @@ fn run_devcontainer(tmp: &std::path::Path, args: &[&str], top: &str) -> assert_c
 /// #1110: an edited devcontainer.json used to `docker rm -f` the container
 /// on the next run, killing a croft still running in it with its unsaved
 /// edits and everything made inside it. The container is kept, and the run
-/// says how to replace it.
+/// says how to replace it. Until then, croft opens in the workspace folder
+/// the container was made with.
 #[cfg(unix)]
 #[test]
 fn devcontainer_keeps_a_container_whose_config_changed() {
@@ -211,11 +218,16 @@ fn devcontainer_keeps_a_container_whose_config_changed() {
     );
     let calls = std::fs::read_to_string(tmp.path().join("docker.log")).unwrap();
     assert!(!calls.contains("rm "), "{calls}");
-    assert!(calls.contains("exec -it"), "attached to it: {calls}");
+    let attach = calls.lines().find(|l| l.starts_with("exec -it")).unwrap();
+    assert!(
+        attach.ends_with("-w /workspaces/before-the-edit c0ffee000001 /usr/local/bin/croft /workspaces/before-the-edit"),
+        "{attach}"
+    );
 }
 
 /// #1110: `--rebuild` refuses while a croft runs in the container from
-/// another terminal, and replaces it once none does.
+/// another terminal, or when docker can't say whether one does, and
+/// replaces it once none does.
 #[cfg(unix)]
 #[test]
 fn devcontainer_rebuild_waits_for_the_croft_running_in_it() {
@@ -228,6 +240,7 @@ fn devcontainer_rebuild_waits_for_the_croft_running_in_it() {
         "{stderr}"
     );
     let log = tmp.path().join("docker.log");
+    run_devcontainer(tmp.path(), &["--rebuild"], "fail").failure();
     assert!(!std::fs::read_to_string(&log).unwrap().contains("rm "));
     run_devcontainer(tmp.path(), &["--rebuild"], "root 7 0 0 10:01 ? 00:00:00 sh").success();
     let calls = std::fs::read_to_string(&log).unwrap();

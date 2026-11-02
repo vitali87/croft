@@ -462,7 +462,7 @@ pub fn up_and_attach(root: &Path, rebuild: bool) -> Result<()> {
     };
     let text = std::fs::read_to_string(&config)
         .with_context(|| format!("reading {}", config.display()))?;
-    let dc = parse(&text, &config, &root, &|k| std::env::var(k).ok())?;
+    let mut dc = parse(&text, &config, &root, &|k| std::env::var(k).ok())?;
     let config_hash = config_hash(&dc, &root);
 
     let label = format!("label={WORKSPACE_LABEL}={}", root.display());
@@ -472,9 +472,10 @@ pub fn up_and_attach(root: &Path, rebuild: bool) -> Result<()> {
         .map(str::to_string);
     if let Some(id) = container.clone() {
         if rebuild {
-            let running = docker_out(&["inspect", "-f", "{{.State.Running}}", &id])
-                .is_ok_and(|r| r == "true");
-            if running && docker_out(&["top", &id]).is_ok_and(|top| croft_attached(&top)) {
+            // Fail closed: a check that can't be made is no evidence that
+            // nothing would be lost.
+            let running = docker_out(&["inspect", "-f", "{{.State.Running}}", &id])? == "true";
+            if running && croft_attached(&docker_out(&["top", &id])?) {
                 bail!(
                     "croft is still running in this container, in another terminal; quit it \
                      there first so its unsaved edits are not lost, or remove the container \
@@ -500,6 +501,12 @@ pub fn up_and_attach(root: &Path, rebuild: bool) -> Result<()> {
                      `croft devcontainer --rebuild` to recreate it (this discards changes \
                      made inside the container)",
                 );
+                // Until it is rebuilt, the workspace sits where the container
+                // was made to mount it, not where the edited config says.
+                let made_in = docker_out(&["inspect", "-f", "{{.Config.WorkingDir}}", &id])?;
+                if !made_in.is_empty() {
+                    dc.workspace_folder = made_in;
+                }
             }
         }
     }
