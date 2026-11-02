@@ -834,7 +834,7 @@ impl SarifView {
                         i,
                         &resolver,
                         &mut |p| std::fs::read_to_string(p).ok(),
-                        &|p| super::fixes::saved_after(p, &loaded.path),
+                        &|p| super::fixes::saved_after(p, &loaded.path, run),
                     ) {
                         Ok(edits) => out.extend(super::fixes::preview(&edits)),
                         Err(why) => out.push(format!("cannot apply: {why}")),

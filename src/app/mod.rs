@@ -74619,7 +74619,7 @@ impl App {
             self.editor
                 .iter_tabs()
                 .any(|t| t.path.as_deref() == Some(p) && t.dirty)
-                || crate::sarif::fixes::saved_after(p, &log_path)
+                || crate::sarif::fixes::saved_after(p, &log_path, &run)
         };
         let edits = match crate::sarif::fixes::fix_for(
             &run,

@@ -119,8 +119,8 @@ fn property_diff(result: &SarifResult) -> Option<&str> {
 
 /// Compute fix `index` of `result` ([`fix_count`] orders them).
 ///
-/// `changed` says a file changed since the log was written: it has unsaved
-/// edits, or it was saved after the log ([`saved_after`]). A `fixes[]` fix
+/// `changed` says a file changed since the analysis: it has unsaved edits,
+/// or it was saved since ([`saved_after`]). A `fixes[]` fix
 /// for such a file is refused (#1094), since its regions are line and
 /// column numbers into the text the analyzer saw, and on other text they
 /// replace the wrong code. A `properties.diff` fix needs no such guard: it
@@ -146,12 +146,54 @@ pub fn fix_for(
     }
 }
 
-/// Whether `path` was saved after the log at `log` was written, so the log's
-/// line and column numbers for it may no longer point at what the analyzer
-/// saw (#1094). `false` when either time can't be read.
-pub fn saved_after(path: &Path, log: &Path) -> bool {
+/// Whether `path` was saved since the analysis behind `run` read it, so the
+/// log's line and column numbers for it may no longer point at what the
+/// analyzer saw (#1094): after the log at `log` was written, or after the
+/// run started when its invocations say when (`startTimeUtc`), since a slow
+/// analysis reads a file long before it writes the log. `false` when no time
+/// can be read.
+pub fn saved_after(path: &Path, log: &Path, run: &Run) -> bool {
     let mtime = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
-    matches!((mtime(path), mtime(log)), (Some(file), Some(log)) if file > log)
+    let started = run
+        .invocations
+        .iter()
+        .filter_map(|i| i.start_time_utc.as_deref().and_then(parse_utc))
+        .min();
+    let since = [mtime(log), started].into_iter().flatten().min();
+    matches!((mtime(path), since), (Some(file), Some(since)) if file > since)
+}
+
+/// A SARIF date-time (§3.9: RFC 3339 in UTC, `2026-10-08T16:53:58.123Z`).
+fn parse_utc(s: &str) -> Option<std::time::SystemTime> {
+    let digits = |p: &str| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit());
+    let num = |p: &str| p.parse::<u64>().ok().filter(|_| digits(p));
+    let (date, time) = s.strip_suffix(['Z', 'z'])?.split_once(['T', 't'])?;
+    let (hms, frac) = time.split_once('.').unwrap_or((time, "0"));
+    let date: Vec<u64> = date.split('-').map(num).collect::<Option<_>>()?;
+    let hms: Vec<u64> = hms.split(':').map(num).collect::<Option<_>>()?;
+    let (&[y, m, d], &[h, min, sec]) = (date.as_slice(), hms.as_slice()) else {
+        return None;
+    };
+    if y < 1970
+        || !(1..=12).contains(&m)
+        || !(1..=31).contains(&d)
+        || h > 23
+        || min > 59
+        || sec > 60
+    {
+        return None;
+    }
+    // Days since 1970-01-01, by Howard Hinnant's days_from_civil.
+    let y = if m <= 2 { y - 1 } else { y };
+    let (era, yoe) = (y / 400, y % 400);
+    let doy = (153 * ((m + 9) % 12) + 2) / 5 + d - 1;
+    let days = era * 146_097 + yoe * 365 + yoe / 4 - yoe / 100 + doy - 719_468;
+    if !digits(frac) {
+        return None;
+    }
+    let nanos: u32 = format!("{frac:0<9}").get(..9)?.parse().ok()?;
+    let secs = days * 86_400 + h * 3_600 + min * 60 + sec.min(59);
+    Some(std::time::UNIX_EPOCH + std::time::Duration::new(secs, nanos))
 }
 
 /// Why a fix for a file that moved on since the analysis is refused.
@@ -613,12 +655,55 @@ mod tests {
                 .set_modified(t)
                 .unwrap();
         };
+        let run = |invocations: &str| {
+            let log = parse_log(&format!(
+                r#"{{"version":"2.1.0","runs":[{{"tool":{{"driver":{{"name":"t"}}}},"invocations":[{invocations}]}}]}}"#
+            ))
+            .unwrap();
+            log.runs.into_iter().next().unwrap()
+        };
+        let untimed = run("");
         at(&file, 1_000);
         at(&log, 2_000);
-        assert!(!saved_after(&file, &log), "scanned, then logged");
+        assert!(!saved_after(&file, &log, &untimed), "scanned, then logged");
         at(&file, 3_000);
-        assert!(saved_after(&file, &log), "saved after the log");
-        assert!(!saved_after(&tmp.path().join("gone.py"), &log));
+        assert!(saved_after(&file, &log, &untimed), "saved after the log");
+        assert!(!saved_after(&tmp.path().join("gone.py"), &log, &untimed));
+        // Saved while a run that started at 1500 s was still going: the log
+        // came later, but the file is not what the analyzer read.
+        at(&file, 1_800);
+        assert!(!saved_after(&file, &log, &untimed));
+        let started = run(
+            r#"{"executionSuccessful":true,"startTimeUtc":"1970-01-01T00:25:00Z"},
+               {"executionSuccessful":true,"startTimeUtc":"1970-01-01T00:30:00.250Z"}"#,
+        );
+        assert!(saved_after(&file, &log, &started));
+        at(&file, 1_400);
+        assert!(!saved_after(&file, &log, &started), "saved before it began");
+    }
+
+    #[test]
+    fn sarif_times_are_read_as_utc() {
+        let at = |secs: u64, nanos: u32| {
+            Some(std::time::UNIX_EPOCH + std::time::Duration::new(secs, nanos))
+        };
+        assert_eq!(parse_utc("1970-01-01T00:00:00Z"), at(0, 0));
+        assert_eq!(parse_utc("2000-03-01T00:00:00Z"), at(951_868_800, 0));
+        assert_eq!(parse_utc("2024-02-29T23:59:59Z"), at(1_709_251_199, 0));
+        assert_eq!(
+            parse_utc("2026-10-08T16:53:58.123Z"),
+            at(1_791_478_438, 123_000_000)
+        );
+        for bad in [
+            "2026-10-08T16:53:58",
+            "2026-10-08T16:53:58+04:00",
+            "2026-13-08T16:53:58Z",
+            "2026-10-08T16:53Z",
+            "2026-10-08T16:53:58.Z",
+            "yesterday",
+        ] {
+            assert_eq!(parse_utc(bad), None, "{bad}");
+        }
     }
 
     #[test]
