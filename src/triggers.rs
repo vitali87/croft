@@ -87,9 +87,12 @@ pub struct Trigger {
 /// loop, and every pane's reader thread.
 #[derive(Clone, Debug, Default)]
 pub struct TriggerSet {
+    /// The user's own rules, from `triggers.json`.
     pub triggers: Vec<Trigger>,
-    /// The rules that came from the user's file (the built-in redactions
-    /// come first in `triggers` when they are on), for the reload status.
+    /// Whether the built-in secret rules run in front of the user's (see
+    /// [`TriggerSet::with_builtin_redactions`]).
+    builtin_redactions: bool,
+    /// The rules that came from the user's file, for the reload status.
     pub user_rules: usize,
     /// What was wrong with the user's file: it did not parse at all, or
     /// some rows were skipped. None when every row loaded.
@@ -236,6 +239,7 @@ impl TriggerSet {
         Self {
             user_rules: triggers.len(),
             triggers,
+            builtin_redactions: false,
             problem: (skipped > 0).then(|| {
                 format!(
                     "{skipped} row{} of triggers.json skipped",
@@ -246,35 +250,58 @@ impl TriggerSet {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.triggers.is_empty()
+        !self.builtin_redactions && self.triggers.is_empty()
     }
 
     /// The built-in secret rules in front of the user's own, so a key
     /// shape the user never thought to list is still masked. Off in
     /// Settings ("Terminal: Redact Secrets") means this is never called.
+    ///
+    /// Only a flag: the rules themselves are compiled once per process, on
+    /// the thread startup gives them, and are first needed when a row with
+    /// text is masked, so building the editor never waits for them.
     pub fn with_builtin_redactions(mut self) -> Self {
-        let mut all = builtin_redactions();
-        all.append(&mut self.triggers);
-        self.triggers = all;
+        self.builtin_redactions = true;
         self
+    }
+
+    /// Every redact rule for `line`: the built-in ones first, when they are
+    /// on and the line has text they could match (every built-in shape
+    /// carries non-blank text; a blank row must not wait for their compile),
+    /// then the user's.
+    fn redact_rules<'a>(&'a self, line: &str) -> impl Iterator<Item = &'a Trigger> {
+        let builtin: &[Trigger] = if self.builtin_redactions && !line.trim().is_empty() {
+            &BUILTIN_REDACTIONS
+        } else {
+            &[]
+        };
+        builtin
+            .iter()
+            .chain(&self.triggers)
+            .filter(|t| t.action == TriggerAction::Redact)
     }
 
     /// Whether any trigger paints (drives the render pass): highlight and
     /// redact both act on the visible rows.
     pub fn has_highlights(&self) -> bool {
-        self.triggers
-            .iter()
-            .any(|t| matches!(t.action, TriggerAction::Highlight | TriggerAction::Redact))
+        self.builtin_redactions
+            || self
+                .triggers
+                .iter()
+                .any(|t| matches!(t.action, TriggerAction::Highlight | TriggerAction::Redact))
     }
 
     /// Whether any trigger redacts (drives the copy / dump masking).
     pub fn has_redactions(&self) -> bool {
-        self.triggers
-            .iter()
-            .any(|t| t.action == TriggerAction::Redact)
+        self.builtin_redactions
+            || self
+                .triggers
+                .iter()
+                .any(|t| t.action == TriggerAction::Redact)
     }
 
-    /// Whether any trigger fires events (drives the reader-thread scan).
+    /// Whether any trigger fires events (drives the reader-thread scan). The
+    /// built-in rules only redact.
     pub fn has_events(&self) -> bool {
         self.triggers
             .iter()
@@ -290,82 +317,87 @@ impl TriggerSet {
 /// before it) and masks only the value (group 1), leaving the name
 /// readable (#921). PEM bodies are not covered: their base64 lines carry
 /// no prefix to anchor on, and masking every long base64 line would eat
-/// checksums and blobs. Compiled once; the set is cloned per trigger
-/// reload.
-pub fn builtin_redactions() -> Vec<Trigger> {
-    static RULES: std::sync::LazyLock<Vec<Trigger>> = std::sync::LazyLock::new(|| {
-        // (pattern, the span must carry a digit or an uppercase letter)
-        const PATTERNS: &[(&str, bool)] = &[
-            // AWS access key ids.
-            (r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b", false),
-            // AWS secret access keys, the actual credential: 40 base64
-            // chars with no prefix, so anchored on the name in the
-            // credentials file, env vars, STS / IAM JSON and the
-            // `aws configure` prompt (`AWS Secret Access Key [None]: `).
-            (
-                r#"(?i:secret[_ ]?access[_ ]?key)(?: \[[^\]]*\])?["']?\s*[:=]\s*["']?([A-Za-z0-9/+=]{40,})"#,
-                false,
-            ),
-            // AWS session tokens (`aws_session_token`, STS `SessionToken`,
-            // boto's legacy `aws_security_token`).
-            (
-                r#"(?i:session_?token|security_?token)["']?\s*[:=]\s*["']?([A-Za-z0-9/+=]{100,})"#,
-                false,
-            ),
-            // OpenAI / Anthropic / OpenRouter-style secret keys: `sk-`, up
-            // to three short labels (`sk-proj-`, `sk-ant-api03-`, `sk-or-v1-`)
-            // and a long body. Entropy-gated: `sk-` also opens hyphenated
-            // prose ("sk-learn-preprocessingpipeline"), whose body is all
-            // lowercase letters.
-            (r"\bsk-(?:[A-Za-z0-9]{1,10}-){0,3}[A-Za-z0-9_]{16,}\b", true),
-            // GitHub tokens: classic (ghp_), OAuth (gho_), app (ghu_/ghs_/ghr_), fine-grained.
-            (
-                r"\b(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,})\b",
-                false,
-            ),
-            // Slack tokens.
-            (r"\bxox[abpors]-[A-Za-z0-9-]{10,}\b", false),
-            // GitLab tokens: personal (glpat-), deploy (gldt-), runner
-            // (glrt-), pipeline trigger (glptt-), OAuth app secret
-            // (gloas-), CI job (glcbt-).
-            (r"\bgl(?:pat|dt|rt|ptt|oas|cbt)-[A-Za-z0-9_-]{20,}", false),
-            // Stripe secret and restricted keys, live and test.
-            (r"\b[sr]k_(?:live|test)_[A-Za-z0-9]{16,}", false),
-            // Google API keys.
-            (r"\bAIza[0-9A-Za-z_-]{35,}", false),
-            // The password in a URL's userinfo (`postgres://user:pw@host`);
-            // the user and host stay readable. A raw `@` inside the password
-            // (`user:pa@ss@host`) is masked too: as URL parsers do, it runs
-            // to the last `@` before the path, query or fragment.
-            (r"://[^/\s:@]*:([^\s/?#]+)@", false),
-            // JWTs: three base64url segments, the first a JSON header.
-            (
-                r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b",
-                false,
-            ),
-            // `Authorization: Bearer <token>` in header or JSON form
-            // (`"Authorization": "Bearer …"`) - only the token is masked.
-            // Anchored on the header so "Bearer" as an English word never
-            // matches; a closing quote, comma or semicolon stays outside.
-            (
-                r#"(?i)\bauthorization"? *: *"?bearer +([^\s'",;]{16,})"#,
-                false,
-            ),
-        ];
-        PATTERNS
-            .iter()
-            .map(|(r, needs_entropy)| Trigger {
-                regex: Regex::new(r).expect("built-in redaction regex compiles"),
-                action: TriggerAction::Redact,
-                fg: None,
-                bg: None,
-                message: None,
-                copy_masked: false,
-                needs_entropy: *needs_entropy,
-            })
-            .collect()
-    });
-    RULES.clone()
+/// checksums and blobs. Compiled once per process, and shared by every
+/// trigger set that turns them on.
+static BUILTIN_REDACTIONS: std::sync::LazyLock<Vec<Trigger>> = std::sync::LazyLock::new(|| {
+    // (pattern, the span must carry a digit or an uppercase letter)
+    const PATTERNS: &[(&str, bool)] = &[
+        // AWS access key ids.
+        (r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b", false),
+        // AWS secret access keys, the actual credential: 40 base64
+        // chars with no prefix, so anchored on the name in the
+        // credentials file, env vars, STS / IAM JSON and the
+        // `aws configure` prompt (`AWS Secret Access Key [None]: `).
+        (
+            r#"(?i:secret[_ ]?access[_ ]?key)(?: \[[^\]]*\])?["']?\s*[:=]\s*["']?([A-Za-z0-9/+=]{40,})"#,
+            false,
+        ),
+        // AWS session tokens (`aws_session_token`, STS `SessionToken`,
+        // boto's legacy `aws_security_token`).
+        (
+            r#"(?i:session_?token|security_?token)["']?\s*[:=]\s*["']?([A-Za-z0-9/+=]{100,})"#,
+            false,
+        ),
+        // OpenAI / Anthropic / OpenRouter-style secret keys: `sk-`, up
+        // to three short labels (`sk-proj-`, `sk-ant-api03-`, `sk-or-v1-`)
+        // and a long body. Entropy-gated: `sk-` also opens hyphenated
+        // prose ("sk-learn-preprocessingpipeline"), whose body is all
+        // lowercase letters.
+        (r"\bsk-(?:[A-Za-z0-9]{1,10}-){0,3}[A-Za-z0-9_]{16,}\b", true),
+        // GitHub tokens: classic (ghp_), OAuth (gho_), app (ghu_/ghs_/ghr_), fine-grained.
+        (
+            r"\b(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,})\b",
+            false,
+        ),
+        // Slack tokens.
+        (r"\bxox[abpors]-[A-Za-z0-9-]{10,}\b", false),
+        // GitLab tokens: personal (glpat-), deploy (gldt-), runner
+        // (glrt-), pipeline trigger (glptt-), OAuth app secret
+        // (gloas-), CI job (glcbt-).
+        (r"\bgl(?:pat|dt|rt|ptt|oas|cbt)-[A-Za-z0-9_-]{20,}", false),
+        // Stripe secret and restricted keys, live and test.
+        (r"\b[sr]k_(?:live|test)_[A-Za-z0-9]{16,}", false),
+        // Google API keys.
+        (r"\bAIza[0-9A-Za-z_-]{35,}", false),
+        // The password in a URL's userinfo (`postgres://user:pw@host`);
+        // the user and host stay readable. A raw `@` inside the password
+        // (`user:pa@ss@host`) is masked too: as URL parsers do, it runs
+        // to the last `@` before the path, query or fragment.
+        (r"://[^/\s:@]*:([^\s/?#]+)@", false),
+        // JWTs: three base64url segments, the first a JSON header.
+        (
+            r"\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b",
+            false,
+        ),
+        // `Authorization: Bearer <token>` in header or JSON form
+        // (`"Authorization": "Bearer …"`) - only the token is masked.
+        // Anchored on the header so "Bearer" as an English word never
+        // matches; a closing quote, comma or semicolon stays outside.
+        (
+            r#"(?i)\bauthorization"? *: *"?bearer +([^\s'",;]{16,})"#,
+            false,
+        ),
+    ];
+    PATTERNS
+        .iter()
+        .map(|(r, needs_entropy)| Trigger {
+            regex: Regex::new(r).expect("built-in redaction regex compiles"),
+            action: TriggerAction::Redact,
+            fg: None,
+            bg: None,
+            message: None,
+            copy_masked: false,
+            needs_entropy: *needs_entropy,
+        })
+        .collect()
+});
+
+/// Compile the built-in secret rules now, so the first row with text finds
+/// them ready. Startup calls this on a thread of its own: compiling them was
+/// a fifth of the work every launch did before its first frame. A row that
+/// needs them sooner waits for that compile to finish.
+pub fn prewarm_builtin_redactions() {
+    std::sync::LazyLock::force(&BUILTIN_REDACTIONS);
 }
 
 /// One masked span on a row, in char indices.
@@ -383,10 +415,7 @@ pub struct RedactSpan {
 /// is reported once.
 pub fn redact_spans(line: &str, set: &TriggerSet) -> Vec<RedactSpan> {
     let mut out: Vec<RedactSpan> = Vec::new();
-    for t in &set.triggers {
-        if t.action != TriggerAction::Redact {
-            continue;
-        }
+    for t in set.redact_rules(line) {
         for caps in t.regex.captures_iter(line) {
             let m = match caps.get(1) {
                 Some(g) => g,

@@ -610,6 +610,7 @@ impl Cli {
         // so every tool croft shells out to (pdftoppm, git, ripgrep, the
         // language servers) would be invisible. Children inherit the repair.
         crate::gui_path::repair();
+        crate::startup_trace::mark("PATH ready");
         match self.command {
             Some(CliCommand::SetupTerminal { font, size, yes }) => setup_terminal(&font, size, yes),
             Some(CliCommand::Keys { mouse }) => keys_diagnostic(mouse),
@@ -2235,11 +2236,14 @@ fn install_launcher(path: Option<PathBuf>, user: bool, yes: bool) -> Result<()> 
     if !cfg!(target_os = "macos") {
         anyhow::bail!("install-launcher is macOS-only");
     }
-    // The croft that runs inside Ghostty is this very executable.
-    let croft_bin = std::env::current_exe()
-        .context("resolving croft binary path")?
-        .canonicalize()
-        .context("canonicalizing croft binary path")?;
+    // The croft that runs inside Ghostty is this very executable, through
+    // the link Homebrew moves on upgrade when Homebrew installed it.
+    let croft_bin = crate::launcher::stable_croft_path(
+        &std::env::current_exe()
+            .context("resolving croft binary path")?
+            .canonicalize()
+            .context("canonicalizing croft binary path")?,
+    );
     let open_dir = match path {
         Some(p) => p,
         None => PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?),

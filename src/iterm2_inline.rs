@@ -410,7 +410,7 @@ pub enum InlineImageProtocol {
     Kitty,
     /// DEC sixel graphics. Unlike iTerm2/Kitty there is no env var that
     /// advertises it, so it is detected at runtime via a DA1 probe
-    /// (`probe_host`) rather than by `inline_image_protocol_for`.
+    /// (`ask_host`) rather than by `inline_image_protocol_for`.
     /// Painted as explicit truecolor like Kitty (it is not iTerm2, so no
     /// `SetColors`), but its cells live in the normal cell buffer like the
     /// iTerm2 path: a `\x1b[2J` evicts them and writing spaces erases them, so
@@ -495,7 +495,7 @@ pub fn detect_inline_image_protocol() -> InlineImageProtocol {
     InlineImageProtocol::None
 }
 
-/// What the host terminal answered to [`probe_host`].
+/// What the host terminal answered to [`ask_host`].
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct HostProbe {
     /// It answered DA1, so a missing kitty keyboard reply means it has no
@@ -561,22 +561,42 @@ pub fn da1_advertises_sixel(reply: &[u8]) -> bool {
 /// probing first keeps it from swallowing the reply). Virtually every terminal
 /// answers DA1 promptly, so the timeout is only a safety net for a
 /// non-responding host and does not slow normal startup.
+///
+/// Asked and answered in two steps: [`ask_host`] sends the queries and
+/// [`PendingHostProbe::answer`] reads the replies, so startup does its own
+/// work while they travel instead of waiting out the round trip, which over
+/// SSH is the network's.
 #[cfg(unix)]
-pub fn probe_host() -> HostProbe {
+pub fn ask_host() -> PendingHostProbe {
     use std::io::Write;
-    use std::os::fd::AsRawFd;
-
     let mut out = std::io::stdout();
-    if out.write_all(b"\x1b[?u\x1b[c").is_err() || out.flush().is_err() {
-        return HostProbe::default();
+    PendingHostProbe {
+        sent: out.write_all(b"\x1b[?u\x1b[c").is_ok() && out.flush().is_ok(),
     }
-    // ~250ms total budget: comfortably covers an SSH round-trip while staying
-    // imperceptible. DA1 normally returns in a few ms regardless.
-    let reply = read_da1_reply(
-        std::io::stdin().as_raw_fd(),
-        std::time::Duration::from_millis(250),
-    );
-    HostProbe::parse(&reply)
+}
+
+/// The host probe, asked and not yet answered.
+#[cfg(unix)]
+pub struct PendingHostProbe {
+    sent: bool,
+}
+
+#[cfg(unix)]
+impl PendingHostProbe {
+    /// Read the replies, waiting at most the probe's budget for them.
+    pub fn answer(self) -> HostProbe {
+        use std::os::fd::AsRawFd;
+        if !self.sent {
+            return HostProbe::default();
+        }
+        // ~250ms total budget: comfortably covers an SSH round-trip while staying
+        // imperceptible. DA1 normally returns in a few ms regardless.
+        let reply = read_da1_reply(
+            std::io::stdin().as_raw_fd(),
+            std::time::Duration::from_millis(250),
+        );
+        HostProbe::parse(&reply)
+    }
 }
 
 /// The replies waiting on `fd`, read straight from the descriptor a byte at a

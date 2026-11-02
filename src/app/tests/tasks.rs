@@ -108,10 +108,10 @@ fn a_reused_task_pane_clears_a_half_typed_prompt_line_first() {
     );
     app.handle_key(chord).unwrap();
     let bytes = app.terminals[app.active_terminal].written_bytes_for_test();
-    let needle = b"\x05\x15make build\r";
+    let needle = b"\x05x\x15make build\r";
     assert!(
         bytes.windows(needle.len()).any(|w| w == needle),
-        "the reused-pane write must clear the line editor first (Ctrl-E Ctrl-U)"
+        "the reused-pane write must clear the line editor first (Ctrl-E, a letter, Ctrl-U)"
     );
 }
 

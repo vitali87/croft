@@ -199,6 +199,8 @@ fn refresh_blocking() -> bool {
 pub fn spawn_refresh() -> Receiver<bool> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
+        // A download and a signature check the first frame never shows.
+        crate::startup_gate::wait();
         let _ = tx.send(refresh_blocking());
     });
     rx

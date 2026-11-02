@@ -1,4 +1,3 @@
-use std::sync::mpsc;
 use std::thread::{Builder, JoinHandle};
 
 use anyhow::{Context, Result};
@@ -13,28 +12,27 @@ pub struct LspRuntime {
 
 impl LspRuntime {
     pub fn new() -> Result<Self> {
-        let (handle_tx, handle_rx) = mpsc::sync_channel::<Handle>(1);
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
-
+        // Built here rather than on the croft-lsp thread, which used to hand
+        // the handle back over a channel: the editor then waited for a brand
+        // new thread to be scheduled, milliseconds on a launch whose other
+        // threads already filled every core, before its first frame. The
+        // workers start on their own threads either way.
+        let rt = RtBuilder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .thread_name("croft-lsp-worker")
+            .build()
+            .context("build croft-lsp tokio runtime")?;
+        let handle = rt.handle().clone();
         let thread = Builder::new()
             .name("croft-lsp".into())
             .spawn(move || {
-                let rt = RtBuilder::new_multi_thread()
-                    .worker_threads(2)
-                    .enable_all()
-                    .thread_name("croft-lsp-worker")
-                    .build()
-                    .expect("build croft-lsp tokio runtime");
-                let _ = handle_tx.send(rt.handle().clone());
                 rt.block_on(async {
                     let _ = shutdown_rx.await;
                 });
             })
             .context("spawn croft-lsp thread")?;
-
-        let handle = handle_rx
-            .recv()
-            .context("receive croft-lsp runtime handle")?;
 
         Ok(Self {
             handle,

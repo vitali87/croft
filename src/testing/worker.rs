@@ -314,6 +314,7 @@ impl TestWorker {
         let control = RunControl::default();
         let worker_control = control.clone();
         std::thread::spawn(move || {
+            crate::startup_gate::wait();
             worker_loop(workspace_root, request_rx, response_tx, &worker_control)
         });
         Self {
