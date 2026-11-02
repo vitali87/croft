@@ -500,9 +500,9 @@ Binary files open here automatically instead of erroring; the file is read in wi
 
 Open as a read-only info card: format, codec, duration, dimensions, sample rate, channels, bitrate, and tags from the file's own headers, plus a poster frame for video when `ffmpeg` is installed. Playback stays with the system player: `Media: Open in System Player` (palette) hands the file over.
 
-**Word documents (`.docx`, `.odt`)**
+**Word documents (`.docx`, `.odt`, `.doc`)**
 
-Open as a rendered read-only document: headings, emphasis, lists, tables, and embedded pictures. `File: Reopen as Text` moves on to the underlying container (archive browser / hex).
+Open as a rendered read-only document: headings, emphasis, lists, tables, and embedded pictures. `File: Reopen as Text` moves on to the underlying container (archive browser / hex). A Word 97-2003 `.doc` shows its text with its headings, lists and tables; its emphasis and pictures are not shown, and a password-protected or Word 95 document says so instead.
 
 **Jupyter notebooks (`.ipynb`)**
 

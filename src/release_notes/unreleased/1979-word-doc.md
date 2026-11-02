@@ -1,0 +1,1 @@
+feature: Word 97-2003 `.doc` files open as a read-only document, with their headings, lists and tables, instead of as a hex dump. A password-protected or Word 95 document says why it can't be shown (#1979).

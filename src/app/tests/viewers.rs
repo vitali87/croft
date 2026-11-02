@@ -232,6 +232,64 @@ fn docx_opens_as_a_rendered_document() {
     assert_eq!(std::fs::read(&p).unwrap(), before, "document intact");
 }
 
+/// #1979: a Word 97-2003 `.doc` opens in the same read-only preview as a
+/// docx, not as a hex dump, and a save still refuses.
+#[test]
+fn a_word_97_doc_opens_as_a_rendered_document() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("report.doc");
+    let fixture =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/word97/testdata/report.doc");
+    std::fs::copy(fixture, &p).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&p).unwrap();
+    assert!(app.editor.hex.is_none(), "not the hex viewer");
+    let md = app
+        .editor
+        .markdown_preview
+        .as_ref()
+        .expect(".doc opens rendered");
+    let all: String = md
+        .lines
+        .iter()
+        .flat_map(|l| l.spans.iter())
+        .map(|s| s.content.as_ref())
+        .collect();
+    for text in ["Quarterly report", "North", "1,200", "日本語"] {
+        assert!(all.contains(text), "{text:?} missing from {all}");
+    }
+    assert!(!all.contains("HYPERLINK"), "field codes stay hidden");
+    let before = std::fs::read(&p).unwrap();
+    assert!(
+        app.editor.save_to_disk().is_err(),
+        "the preview never saves"
+    );
+    assert_eq!(std::fs::read(&p).unwrap(), before, "document intact");
+}
+
+/// Negative (#1979): a `.doc` that is not a Word document opens the way it
+/// did before: an HTML page saved under that name as text, and a broken
+/// compound file as hex.
+#[test]
+fn a_doc_that_is_not_a_word_document_falls_back() {
+    let tmp = tempfile::tempdir().unwrap();
+    let page = tmp.path().join("page.doc");
+    std::fs::write(&page, "<html><body>Hello</body></html>\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&page).unwrap();
+    assert!(app.editor.markdown_preview.is_none());
+    assert!(app.editor.hex.is_none());
+    assert_eq!(app.editor.lines[0], "<html><body>Hello</body></html>");
+
+    let fixture =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/word97/testdata/report.doc");
+    let broken = tmp.path().join("broken.doc");
+    std::fs::write(&broken, &std::fs::read(fixture).unwrap()[..3000]).unwrap();
+    app.editor.open(&broken).unwrap();
+    assert!(app.editor.markdown_preview.is_none());
+    assert!(app.editor.hex.is_some(), "a broken .doc opens as bytes");
+}
+
 #[test]
 fn archive_tab_lists_members_and_enter_opens_an_extracted_copy() {
     // #179 end-to-end: a zip opens as the member browser, Enter on a
