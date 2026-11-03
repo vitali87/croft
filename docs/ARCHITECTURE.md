@@ -977,7 +977,7 @@ The Extensions sidebar widget. It projects the bundled and user extension manife
 
 ### hover_popup.rs
 
-An anchored popup with a 300 ms dwell. It serves the LSP hover (wide), the tab-path tooltip, and `new_compact` button hints (shrink-to-fit) for chrome controls, all driven off one `ui_tooltip_at` dispatch in `app/mod.rs`. `ui_tooltip_text_at` wraps that dispatch for the hints whose text is the data under the pointer rather than a control's name: a Search result row's full path (#2008), since the row itself names only the file.
+An anchored popup with a 300 ms dwell. It serves the LSP hover (wide), the tab-path tooltip, and `new_compact` button hints (shrink-to-fit) for chrome controls, all driven off one `ui_tooltip_at` dispatch in `app/mod.rs`. `ui_tooltip_text_at` wraps that dispatch for the hints whose text is the data under the pointer rather than a control's name: a Search result row's full path (#2008), since the row itself names only the file. Rows move under a resting pointer as hits stream in or the list scrolls, so `reread_ui_tooltip` reads the hint again at the pointer whenever the list's scroll, hit count or visibility changes.
 
 **Peek Definition.** It also renders Peek Definition (Alt+F12 or the palette). The same LSP definition request, tagged with `peek_definition_request_id`, opens a caret-anchored excerpt popup: a `status_path(path):line` header, a `peek_excerpt` window (4 above, 12 total, clamped), and the definition row marked `▶`. Text comes from the buffer when the target file is the open one, so unsaved edits are visible, and from disk otherwise. Enter converts to the real jump, Esc closes, and any other key closes and keeps its meaning.
 

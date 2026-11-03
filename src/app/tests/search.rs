@@ -992,34 +992,106 @@ fn resting_on_a_search_result_arms_a_hint_with_its_full_path() {
     };
     let (one, two) = (canon("one"), canon("two"));
 
-    app.on_mouse_moved(rows[0].0, rows[0].1, false);
+    point_at(&mut app, rows[0]);
     assert_eq!(app.ui_tooltip_label.as_deref(), Some(one.as_str()));
-    app.on_mouse_moved(rows[1].0, rows[1].1, false);
+    point_at(&mut app, rows[1]);
     assert_eq!(app.ui_tooltip_label.as_deref(), Some(two.as_str()));
-
-    // A file that sorts first streams in under the resting pointer: the row
-    // now holds one/mod.rs, and the hint follows it.
-    let (tx, rx) = std::sync::mpsc::channel();
-    app.search_results_rx = rx;
-    let early = tmp.path().join("a").join("mod.rs");
-    tx.send(crate::widgets::search::SearchEvent::Hits(
-        app.search.query.clone(),
-        app.search.opts,
-        vec![crate::widgets::search::SearchHit {
-            path: early,
-            line_no: 1,
-            line_text: String::from("needle"),
-            matches: 1,
-        }],
-    ))
-    .unwrap();
-    assert!(app.drain_search_results());
-    assert_eq!(app.ui_tooltip_label.as_deref(), Some(one.as_str()));
 
     // Hidden behind a closed side bar, the rows it last drew have no hint.
     app.show_tree = false;
-    app.on_mouse_moved(rows[0].0, rows[0].1, false);
+    point_at(&mut app, rows[0]);
     assert_eq!(app.ui_tooltip_label, None);
+}
+
+fn point_at(app: &mut App, (column, row): (u16, u16)) {
+    app.handle_mouse(crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::Moved,
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    });
+}
+
+/// #2008: the rows move under a pointer that rests on one, as hits stream in
+/// or the list scrolls, and empty when the search is cleared. The hint
+/// follows the row under the pointer, not the file that was there.
+#[test]
+fn a_search_result_hint_follows_the_rows_that_move_under_a_resting_pointer() {
+    use crate::widgets::search::{SearchEvent, SearchHit};
+    let tmp = tempfile::tempdir().unwrap();
+    let hit = |name: &str| SearchHit {
+        path: tmp.path().join(name).join("mod.rs"),
+        line_no: 1,
+        line_text: String::from("needle"),
+        matches: 1,
+    };
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::Search);
+    app.search.query = String::from("needle");
+    app.search
+        .add_hits((0..60).map(|i| hit(&format!("f{i:02}"))).collect());
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let inner = app.search.last_inner;
+    let cell = (inner.x + 3, inner.y + app.search.results_start_offset + 2);
+    let row_path = |app: &App| {
+        app.search.hits[app.search.scroll + 2]
+            .path
+            .display()
+            .to_string()
+    };
+    point_at(&mut app, cell);
+    assert_eq!(
+        app.ui_tooltip_label.as_deref(),
+        Some(row_path(&app).as_str())
+    );
+
+    // The wheel scrolls another file under the pointer.
+    app.handle_mouse(crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::ScrollDown,
+        column: cell.0,
+        row: cell.1,
+        modifiers: KeyModifiers::NONE,
+    });
+    assert!(app.search.scroll > 0, "precondition: the list scrolled");
+    app.poll_ui_tooltip();
+    assert_eq!(
+        app.ui_tooltip_label.as_deref(),
+        Some(row_path(&app).as_str())
+    );
+
+    // A file that sorts first streams in and shifts every row down one.
+    let before = row_path(&app);
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.search_results_rx = rx;
+    tx.send(SearchEvent::Hits(
+        app.search.query.clone(),
+        app.search.opts,
+        vec![hit("a")],
+    ))
+    .unwrap();
+    assert!(app.drain_search_results());
+    app.poll_ui_tooltip();
+    assert_ne!(row_path(&app), before);
+    assert_eq!(
+        app.ui_tooltip_label.as_deref(),
+        Some(row_path(&app).as_str())
+    );
+
+    // Cleared, as a new workspace root clears it: nothing is under it.
+    app.search.hits.clear();
+    app.search.scroll = 0;
+    app.poll_ui_tooltip();
+    assert_eq!(app.ui_tooltip_label, None);
+
+    // A hit that fills the empty row under the pointer gets its hint.
+    app.search
+        .add_hits((0..5).map(|i| hit(&format!("g{i}"))).collect());
+    app.poll_ui_tooltip();
+    assert_eq!(
+        app.ui_tooltip_label.as_deref(),
+        Some(row_path(&app).as_str())
+    );
 }
 
 // --- Split editor (side-by-side panes) -----------------------------------
