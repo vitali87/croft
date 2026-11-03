@@ -810,7 +810,7 @@ pub fn entries(manifest: &ExtensionManifest) -> Vec<ServerEntry> {
 /// (e.g. `~/.config/croft/extensions`). Each extension is a subdirectory
 /// holding an `extension.toml`.
 pub fn user_extensions_dir() -> PathBuf {
-    crate::prefs::config_dir().join("extensions")
+    crate::paths::config_dir().join("extensions")
 }
 
 /// Read every `<dir>/<id>/extension.toml` into a source string, sorted by path

@@ -10684,7 +10684,7 @@ esac
             assert_eq!(lang, Some(jsonc), "{path}");
             assert_eq!(lang.unwrap().lsp_id(), "jsonc");
         }
-        let keybindings = crate::prefs::config_dir().join("keybindings.json");
+        let keybindings = crate::paths::config_dir().join("keybindings.json");
         assert_eq!(path_to_language(&keybindings), Some(jsonc));
         assert_eq!(
             path_to_language(Path::new("/repo/package.json")),

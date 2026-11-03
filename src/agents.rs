@@ -192,7 +192,7 @@ pub const QUIET_AFTER: Duration = Duration::from_secs(3);
 
 /// The user-editable table beside the other config files.
 pub fn agents_path() -> PathBuf {
-    crate::prefs::config_dir().join("agents.json")
+    crate::paths::config_dir().join("agents.json")
 }
 
 /// Starter `agents.json`, seeded on first open. Rows here EXTEND the

@@ -6566,7 +6566,7 @@ impl App {
         let loaded_prefs = merged_settings.prefs.clone();
         let (review_tx, review_rx) = std::sync::mpsc::channel();
         let data_dir =
-            (!cfg!(test)).then(|| user_data_dir(&croft_cache_dir(), &crate::prefs::state_dir()));
+            (!cfg!(test)).then(|| user_data_dir(&croft_cache_dir(), &crate::paths::state_dir()));
         let notes_path = data_dir
             .as_deref()
             .map(|dir| crate::sticky_notes::Notes::store_path(dir, &root));
@@ -7085,7 +7085,7 @@ impl App {
             terminal_close_buttons: Vec::new(),
             terminal_collapse_buttons: Vec::new(),
             consented_extensions: crate::prefs::Prefs::load_or_default().mcp_consented,
-            config_dir: crate::prefs::config_dir(),
+            config_dir: crate::paths::config_dir(),
             settings_profile: if cfg!(test) {
                 None
             } else {
@@ -48490,7 +48490,7 @@ impl App {
         // Saved as the mode the next launch starts in (#1286). Under test
         // only into a config dir the test chose, never the developer's.
         self.vim_mode_pref = self.vim.enabled;
-        if !cfg!(test) || self.config_dir != crate::prefs::config_dir() {
+        if !cfg!(test) || self.config_dir != crate::paths::config_dir() {
             self.report_unsaved_setting(crate::prefs::save_vim_mode_in(
                 &self.config_dir,
                 self.vim.enabled,
