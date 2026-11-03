@@ -1898,11 +1898,13 @@ impl SearchPanel {
     /// scrollbar.
     pub fn result_path_at(&self, col: u16, row: u16) -> Option<&Path> {
         let inner = self.last_inner;
-        if col < inner.x || col >= inner.x + inner.width {
-            return None;
-        }
-        let bar = self.last_scrollbar;
-        if bar.width > 0 && col >= bar.x && col < bar.x + bar.width {
+        // The scrollbar takes the right column once the hits overflow, as the
+        // render draws it. Judged by the hits listed now, not the last
+        // frame's bar: hits that stream in under a resting pointer can make
+        // the list overflow before the next render.
+        let overflows = self.hits.len() > self.results_viewport_height();
+        let right = inner.x + inner.width - u16::from(overflows && inner.width > 0);
+        if col < inner.x || col >= right {
             return None;
         }
         self.hit_at_y(row).map(|i| self.hits[i].path.as_path())
@@ -6098,6 +6100,38 @@ mod tests {
             .unwrap_or_else(|| panic!("no row for {path_line}"))
             .trim_matches(|c| c == '│' || c == ' ')
             .to_string()
+    }
+
+    /// #2008: the right column becomes the scrollbar once the list
+    /// overflows, and a hit that streams in can do that before the next
+    /// render draws the bar: that column then has no path hint.
+    #[test]
+    fn the_column_the_scrollbar_takes_has_no_path_hint() {
+        let tmp = TempDir::new().unwrap();
+        let mut panel = make_panel_with_hits(&tmp, 1);
+        render_panel(&mut panel, 40);
+        let fits = panel.results_viewport_height();
+        panel.hits.clear();
+        panel.add_hits(
+            (0..fits)
+                .map(|i| hit(&tmp.path().join("a.txt"), i + 1))
+                .collect(),
+        );
+        render_panel(&mut panel, 40);
+        let inner = panel.last_inner;
+        let (row, right) = (
+            inner.y + panel.results_start_offset,
+            inner.x + inner.width - 1,
+        );
+        assert_eq!(
+            panel.last_scrollbar,
+            Rect::default(),
+            "precondition: no overflow yet"
+        );
+        assert!(panel.result_path_at(right, row).is_some());
+        panel.add_hits(vec![hit(&tmp.path().join("b.txt"), 1)]);
+        assert_eq!(panel.result_path_at(right, row), None);
+        assert!(panel.result_path_at(right - 1, row).is_some());
     }
 
     fn render_panel(panel: &mut SearchPanel, width: u16) -> Buffer {
