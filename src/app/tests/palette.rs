@@ -2313,6 +2313,14 @@ fn the_bookmark_picker_lists_every_tabs_marks_and_jumps_to_one() {
     let labels: Vec<&str> = picker.rows.iter().map(|r| r.label.as_str()).collect();
     assert_eq!(labels, ["a.txt:2  beta", "b.txt:3  three"]);
 
+    // Home and End jump to the first and last row, like PgUp and PgDn.
+    app.handle_key(key(KeyCode::End, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.list_picker.as_ref().unwrap().selected, 1);
+    app.handle_key(key(KeyCode::Home, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.list_picker.as_ref().unwrap().selected, 0);
+
     // Enter on the first row goes to a.txt line 2.
     app.list_picker.as_mut().unwrap().selected = 0;
     app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))

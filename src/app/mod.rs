@@ -59593,6 +59593,8 @@ impl App {
                     picker.select_next();
                 }
             }
+            (KeyCode::Home, _) => picker.select_first(),
+            (KeyCode::End, _) => picker.select_last(),
             (KeyCode::Left, _) => picker.move_cursor_left(),
             (KeyCode::Right, _) => picker.move_cursor_right(),
             (KeyCode::Backspace, _) => picker.pop_char(),

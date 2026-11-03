@@ -246,6 +246,16 @@ impl ListPicker {
         self.selected = self.selected.saturating_sub(1);
     }
 
+    /// Home: the first matched row.
+    pub fn select_first(&mut self) {
+        self.selected = 0;
+    }
+
+    /// End: the last matched row.
+    pub fn select_last(&mut self) {
+        self.selected = self.visible_count().saturating_sub(1);
+    }
+
     /// The matched-row index at screen row `y`, if `y` lands on a visible row.
     /// The list body starts two rows below `last_rect.y` (the top border, then
     /// the prompt row) and ends above the bottom border, so the renderer and
