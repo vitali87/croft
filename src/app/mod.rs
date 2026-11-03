@@ -4801,6 +4801,9 @@ pub struct App {
     inline_worker: Option<crate::inline_complete::Worker>,
     inline_config: Option<crate::inline_complete::Config>,
     inline_job: Option<(u64, PathBuf, u64, usize, usize)>,
+    /// The language server's inline completion in flight, keyed like
+    /// `inline_job`: a server that offers them answers for its files.
+    inline_lsp: Option<(u64, PathBuf, u64, usize, usize)>,
     inline_asked: Option<(PathBuf, u64, usize, usize)>,
     inline_next_id: u64,
     /// Where recorded shortcuts are written: the user's keybindings.json,
@@ -7165,6 +7168,7 @@ impl App {
             inline_worker: None,
             inline_config: None,
             inline_job: None,
+            inline_lsp: None,
             inline_asked: None,
             inline_next_id: 0,
             keybindings_file: if cfg!(test) {
@@ -65516,12 +65520,14 @@ impl App {
     }
 
     /// Editor: Toggle Inline Suggestions (#607, Cmd+K Shift+G). Turning it on
-    /// resolves the backend first and says plainly when there is none.
+    /// resolves the backend first and says plainly when there is none; a
+    /// file whose language server offers suggestions needs no model.
     fn toggle_inline_suggestions(&mut self) {
         if self.inline_enabled {
             self.inline_enabled = false;
             self.editor.ghost = None;
             self.inline_job = None;
+            self.inline_lsp = None;
             self.inline_asked = None;
             self.status = String::from("Inline suggestions: off");
             return;
@@ -65547,8 +65553,69 @@ impl App {
                     .get_or_insert_with(crate::inline_complete::Worker::spawn);
                 self.inline_enabled = true;
             }
+            Err(why) if self.editor_offers_inline_completion() => {
+                self.inline_config = None;
+                self.inline_enabled = true;
+                self.status = format!(
+                    "Inline suggestions: on from the language server (no model: {why}); Tab accepts, Esc dismisses"
+                );
+            }
             Err(why) => self.status = format!("Inline suggestions need a model: {why}"),
         }
+    }
+
+    /// Whether the current file's language server offers inline completions
+    /// (LSP 3.18): it then answers instead of the model (#607).
+    fn editor_offers_inline_completion(&self) -> bool {
+        let path = self.editor.path.as_deref();
+        path.zip(self.lsp.as_ref())
+            .is_some_and(|(p, lsp)| lsp.document_offers_inline_completion(p))
+    }
+
+    /// Land the language server's inline completion (#607) when it still
+    /// answers for the caret and the text it was asked about.
+    fn land_inline_lsp(&mut self) -> bool {
+        let mut results = Vec::new();
+        if let Some(lsp) = self.lsp.as_ref() {
+            while let Some(r) = lsp.drain_inline_completion() {
+                results.push(r);
+            }
+        }
+        let mut changed = false;
+        for result in results {
+            let Some((id, path, seq, row, col)) = self.inline_lsp.clone() else {
+                continue;
+            };
+            if result.request_id != id {
+                continue;
+            }
+            self.inline_lsp = None;
+            let ed = &*self.editor;
+            let still = ed.path.as_ref() == Some(&path)
+                && ed.edit_seq == seq
+                && ed.cursor_row == row
+                && ed.cursor_col == col;
+            let (Some(crate::lsp::manager::InlineItem { text, range }), true) =
+                (result.item, still)
+            else {
+                continue;
+            };
+            let line = ed.lines.get(row).map_or("", String::as_str);
+            let to_col = |c| crate::widgets::editor::utf16_to_char_col(line, c);
+            let ghost = match range {
+                None => Some(crate::inline_complete::Ghost::insert(row, col, seq, text)),
+                Some((sl, sc, el, ec)) if sl as usize == row && el as usize == row => {
+                    let range = to_col(sc)..to_col(ec);
+                    crate::inline_complete::Ghost::replacing(row, col, seq, line, range, text)
+                }
+                Some(_) => None,
+            };
+            if ghost.is_some() {
+                self.editor.ghost = ghost;
+                changed = true;
+            }
+        }
+        changed
     }
 
     /// Ask for a suggestion once typing has paused with the caret at the end
@@ -65573,7 +65640,8 @@ impl App {
                     && self.editor.cursor_col == col;
                 match done.result {
                     Ok(Some(text)) if still => {
-                        self.editor.ghost = Some((row, col, seq, text));
+                        self.editor.ghost =
+                            Some(crate::inline_complete::Ghost::insert(row, col, seq, text));
                         changed = true;
                     }
                     Ok(_) => {}
@@ -65581,6 +65649,7 @@ impl App {
                 }
             }
         }
+        changed |= self.land_inline_lsp();
         let ed = &*self.editor;
         let Some(path) = ed.path.clone() else {
             return changed;
@@ -65598,7 +65667,7 @@ impl App {
         let already = ed
             .ghost
             .as_ref()
-            .is_some_and(|g| (g.0, g.1, g.2) == (row, col, seq))
+            .is_some_and(|g| (g.row, g.col, g.seq) == (row, col, seq))
             // Asked already at this caret and edit: an empty answer, an
             // error or an Esc'd ghost must not send the request again on
             // the next tick, which looped hundreds of paid calls a second.
@@ -65606,10 +65675,10 @@ impl App {
                 .inline_asked
                 .as_ref()
                 .is_some_and(|a| a.0 == path && (a.1, a.2, a.3) == (seq, row, col))
-            || self
-                .inline_job
-                .as_ref()
-                .is_some_and(|j| j.1 == path && (j.2, j.3, j.4) == (seq, row, col));
+            || [&self.inline_job, &self.inline_lsp]
+                .into_iter()
+                .flatten()
+                .any(|j| j.1 == path && (j.2, j.3, j.4) == (seq, row, col));
         if self.focus != Pane::Editor
             || !at_line_end
             || !settled
@@ -65618,6 +65687,15 @@ impl App {
             || ed.has_non_text_view()
             || self.completion_popup.is_some()
         {
+            return changed;
+        }
+        if self.editor_offers_inline_completion() {
+            let (line, character) = self.editor.cursor_position_utf16();
+            if let Some(lsp) = self.lsp.as_mut() {
+                let id = lsp.request_inline_completion(path.clone(), line, character);
+                self.inline_asked = Some((path.clone(), seq, row, col));
+                self.inline_lsp = Some((id, path, seq, row, col));
+            }
             return changed;
         }
         let (Some(worker), Some(config)) = (&self.inline_worker, &self.inline_config) else {
@@ -65637,15 +65715,33 @@ impl App {
 
     /// Tab takes a live suggestion (#607), recorded as the navigator's
     /// writing; Esc drops it. Ctrl+Right takes its next word and Ctrl+Down
-    /// its next line (#1625), leaving the rest live at the new caret.
+    /// its next line (#1625), leaving the rest live at the new caret. A
+    /// language server's replacement is taken whole by Tab only.
     /// Returns whether the key was used.
     fn inline_suggestion_key(&mut self, key: KeyEvent) -> bool {
         if self.completion_popup.is_some() || self.editor.snippet_active() {
             return false;
         }
-        let Some(text) = self.editor.live_ghost().map(str::to_string) else {
+        let Some(ghost) = self.editor.live_ghost_full().cloned() else {
             return false;
         };
+        if let Some(r) = ghost.replaces {
+            match (key.code, key.modifiers) {
+                (KeyCode::Tab, KeyModifiers::NONE) => {
+                    self.editor.selection = Some(crate::widgets::editor::EditorSelection {
+                        anchor: (ghost.row, r.start),
+                        head: (ghost.row, r.end),
+                    });
+                    self.editor
+                        .insert_str_as(&ghost.text, crate::provenance::Seat::Navigator);
+                }
+                (KeyCode::Esc, KeyModifiers::NONE) => {}
+                _ => return false,
+            }
+            self.editor.ghost = None;
+            return true;
+        }
+        let text = ghost.text;
         let take = match (key.code, key.modifiers) {
             (KeyCode::Tab, KeyModifiers::NONE) => text.len(),
             (KeyCode::Right, KeyModifiers::CONTROL) => crate::inline_complete::next_word_len(&text),
@@ -65668,7 +65764,12 @@ impl App {
                 self.editor.cursor_col,
                 self.editor.edit_seq,
             );
-            self.editor.ghost = Some((at.0, at.1, at.2, rest.to_string()));
+            self.editor.ghost = Some(crate::inline_complete::Ghost::insert(
+                at.0,
+                at.1,
+                at.2,
+                rest.to_string(),
+            ));
             // Recorded as asked too: once the ghost is Esc'd the tick
             // would otherwise send a fresh (paid) request at this caret.
             if let Some(path) = self.editor.path.clone() {
