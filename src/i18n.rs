@@ -323,6 +323,7 @@ pub const TRANSLATABLE: &[&str] = &[
     "Reveal in Finder",
     "Revert",
     "Run and Debug",
+    "S, save anyway",
     "Search",
     "Select for Compare",
     "Show Incoming Calls",

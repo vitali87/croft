@@ -3183,6 +3183,76 @@ fn holds_unsaved(ed: &Editor) -> bool {
     ed.dirty && !ed.scratch && (ed.path.is_some() || ed.lines.iter().any(|l| !l.is_empty()))
 }
 
+/// A save refused because the file's encoding cannot hold the buffer
+/// (#1053), waiting on the user's answer: what the write would destroy.
+/// Asked in a modal, not the status bar, which trims a long message from the
+/// middle and used to cut exactly the warning out of it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LossySave {
+    /// The tab's file when asked, so the answer never writes another tab.
+    path: Option<PathBuf>,
+    encoding: &'static str,
+    /// The characters `encoding` cannot represent. Empty when the loss is
+    /// bytes that were not valid when the file was read, shown as U+FFFD.
+    chars: Vec<char>,
+}
+
+impl LossySave {
+    /// The file's name, as the prompt calls it.
+    fn name(&self) -> String {
+        self.path.as_deref().and_then(Path::file_name).map_or_else(
+            || String::from("This file"),
+            |n| n.to_string_lossy().into_owned(),
+        )
+    }
+
+    /// The prompt's lines: what is wrong, what saving does about it, and
+    /// how to keep what would be lost.
+    fn text(&self) -> [String; 3] {
+        let name = self.name();
+        let enc = self.encoding;
+        if self.chars.is_empty() {
+            return [
+                format!("{name} has bytes that are not valid {enc}, shown as \u{fffd}."),
+                String::from(
+                    "Saving writes \u{fffd} in their place: the original bytes are lost for good.",
+                ),
+                String::from(
+                    "To keep them, undo your edits (Cmd+Z), then Reopen with Encoding from the status bar.",
+                ),
+            ];
+        }
+        let shown: Vec<String> = self.chars.iter().map(char::to_string).collect();
+        [
+            format!("{enc} cannot represent {} in {name}.", shown.join(" ")),
+            String::from(
+                "Saving writes them as &#\u{2026}; references: the characters are lost for good.",
+            ),
+            String::from("To keep them, take them out, or undo the edits that added them (Cmd+Z)."),
+        ]
+    }
+
+    /// [`Self::text`] short enough to be read out whole with the keys, under
+    /// `a11y::MAX_LINE`, the recovery hint included.
+    fn spoken(&self) -> [String; 3] {
+        let name = self.name();
+        let enc = self.encoding;
+        if self.chars.is_empty() {
+            return [
+                format!("{name} has invalid {enc} bytes"),
+                String::from("Saving turns them into \u{fffd} for good"),
+                String::from("To keep them, undo, then Reopen with Encoding"),
+            ];
+        }
+        let shown: Vec<String> = self.chars.iter().map(char::to_string).collect();
+        [
+            format!("{enc} cannot represent {} in {name}", shown.join(" ")),
+            String::from("Saving writes &#\u{2026}; references for good"),
+            String::from("To keep them, remove them or undo"),
+        ]
+    }
+}
+
 /// Why the branch picker is open, deciding what its Enter does. `Checkout`
 /// is the default (click the branch name / "Checkout to"); the others are
 /// reached from the Branch submenu and act on the highlighted *existing*
@@ -4425,6 +4495,10 @@ pub struct App {
     /// An unsaved-changes prompt (#862) waiting on S / D / Esc, holding what
     /// it goes on to do. While `Some`, the modal eats every key and click.
     pending_unsaved: Option<UnsavedExit>,
+    /// A save that would lose characters or bytes to the file's encoding
+    /// (#1053), waiting on S / Esc. While `Some`, the modal eats every key
+    /// and click, so a second Cmd+S can no longer write it.
+    pending_lossy_save: Option<LossySave>,
     /// The unsaved state (see [`App::unsaved_stamp`]) the user chose to
     /// leave behind when asked about a remote connect (#862): the handoff
     /// that ends this croft later goes without asking again only while
@@ -7060,6 +7134,7 @@ impl App {
             scm_after_format_save: None,
             pending_revert_hunk: None,
             pending_unsaved: None,
+            pending_lossy_save: None,
             remote_handoff_ok: None,
             hot_exit_dir: data_dir.as_deref().map(|dir| dir.join("hot-exit")),
             hot_exit_written: None,
@@ -23922,6 +23997,7 @@ impl App {
         self.render_terminal_paste_confirm(frame);
         self.render_run_block_confirm(frame);
         self.render_unsaved_confirm(frame);
+        self.render_lossy_save_confirm(frame);
         // Terminal-pane inline image: sync after the panes have painted so
         // last_inner and the scroll offset are this frame's (all gating —
         // hidden panel, alt screen, off-screen anchor — is inside).
@@ -24516,6 +24592,76 @@ impl App {
             ]),
         ]);
         frame.render_widget(ratatui::widgets::Paragraph::new(body), inner);
+    }
+
+    /// The lossy-save prompt (#1053): what the file's encoding would destroy,
+    /// and the two answers. Red, since its one action is irreversible, and
+    /// tall enough for every wrapped line, so no part of the warning is ever
+    /// cut.
+    fn render_lossy_save_confirm(&self, frame: &mut ratatui::Frame) {
+        let Some(asked) = self.pending_lossy_save.as_ref() else {
+            return;
+        };
+        let [what, consequence, keep] = asked.text();
+        let area = frame.area();
+        let width = area.width.saturating_sub(8).clamp(50, 96).min(area.width);
+        let inner_w = width.saturating_sub(4);
+        let rows = |s: &str| wrap_cells_variable_width(s, inner_w, inner_w).len() as u16;
+        // Three texts, a blank line after each, and the keys.
+        let height = 2 + rows(&what) + rows(&consequence) + rows(&keep) + 4;
+        let rect = Rect {
+            x: (area.width.saturating_sub(width)) / 2 + area.x,
+            y: (area.height.saturating_sub(height)) / 2 + area.y,
+            width,
+            height,
+        };
+        let rect = rect.intersection(area);
+        let danger = self.theme.ui(Color::Rgb(0xe7, 0x70, 0x70));
+        let block = ratatui::widgets::Block::default()
+            .borders(ratatui::widgets::Borders::ALL)
+            .border_style(Style::default().fg(danger))
+            .style(Style::default().bg(self.theme.ui(Color::Rgb(0x1e, 0x1e, 0x1e))))
+            .title(ratatui::text::Span::styled(
+                " SAVE WOULD LOSE DATA ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(danger)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        frame.render_widget(ratatui::widgets::Clear, rect);
+        frame.render_widget(block, rect);
+        let inner = Rect {
+            x: rect.x + 2,
+            y: rect.y + 1,
+            width: rect.width.saturating_sub(4),
+            height: rect.height.saturating_sub(2),
+        };
+        let key = |k: &'static str, color: Color| {
+            Span::styled(k, Style::default().fg(color).add_modifier(Modifier::BOLD))
+        };
+        let text = self.theme.ui(Color::White);
+        let dim = self.theme.ui(Color::Rgb(0x9a, 0xa4, 0xb8));
+        let body = ratatui::text::Text::from(vec![
+            Line::from(Span::styled(what, Style::default().fg(text))),
+            Line::from(""),
+            Line::from(Span::styled(
+                consequence,
+                Style::default().fg(danger).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(keep, Style::default().fg(dim))),
+            Line::from(""),
+            Line::from(vec![
+                key("[S]", Color::Red),
+                Span::raw(" save anyway   "),
+                key("[Esc]", text),
+                Span::raw(" keep the file as it is"),
+            ]),
+        ]);
+        frame.render_widget(
+            Paragraph::new(body).wrap(ratatui::widgets::Wrap { trim: false }),
+            inner,
+        );
     }
 
     /// The Replace All confirmation modal (#123): counts up front, commits
@@ -26586,6 +26732,21 @@ impl App {
         }
         if self.list_picker.is_some() {
             self.handle_list_picker_key(key);
+            return Ok(());
+        }
+        // The lossy-save prompt (#1053): only a plain S writes. Enter, N and
+        // Esc keep the file as it is, and every other key, the Cmd+S that
+        // used to be the consent included, does nothing. It is painted over
+        // the unsaved-changes prompt, which a deferred format-on-save write
+        // can leave up beneath it, so it answers first.
+        if self.pending_lossy_save.is_some() {
+            let plain = key.modifiers.difference(KeyModifiers::SHIFT).is_empty();
+            match key.code {
+                KeyCode::Char('s' | 'S') if plain => self.confirm_lossy_save(),
+                KeyCode::Char('n' | 'N') if plain => self.cancel_lossy_save(),
+                KeyCode::Enter | KeyCode::Esc => self.cancel_lossy_save(),
+                _ => {}
+            }
             return Ok(());
         }
         // The unsaved-changes prompt (#862): S or Enter saves, D goes on
@@ -61520,6 +61681,10 @@ impl App {
         if self.pending_unsaved.is_some() {
             return;
         }
+        // Nor the lossy-save prompt (#1053), for the tab it asks about.
+        if self.pending_lossy_save.is_some() {
+            return;
+        }
         // The history scrubber's slider (#371): a press on the track seeks
         // there, and a drag that started on it keeps seeking wherever the
         // pointer goes, so the handle can be dragged off the row and back.
@@ -66028,6 +66193,14 @@ impl App {
             );
             return Some((target, row));
         }
+        // Over the unsaved-changes prompt when both are up, as it is drawn.
+        if let Some(asked) = &self.pending_lossy_save {
+            return Some(said(
+                "Save would lose data",
+                &asked.spoken(),
+                &[tr("S, save anyway"), tr("Escape, cancel")],
+            ));
+        }
         if let Some(exit) = &self.pending_unsaved {
             let (headline, names, save, discard) = self.unsaved_confirm_text(exit);
             // The tab label carries the dirty dot, which a reader would read
@@ -68581,28 +68754,44 @@ impl App {
     }
 
     /// An explicit save was refused because the encoding cannot represent the
-    /// buffer (`SaveOutcome::EncodingLoss`). Arm the one-shot lossy consent
-    /// and spell out exactly what the next Cmd+S will destroy, mirroring the
-    /// press-again flow of a disk conflict. The alternative exits are the
-    /// same two the refusal preserved: reopen the status-bar encoding picker
-    /// (a clean buffer switches encodings losslessly) or edit the characters
-    /// out.
+    /// buffer (`SaveOutcome::EncodingLoss`). Ask in a modal what to do,
+    /// naming exactly what the write would destroy (#1053). Only S there
+    /// arms the one-shot lossy consent and saves; the default, Esc, keeps the
+    /// file as it is. It used to arm the next Cmd+S and say so in the status
+    /// bar, which cut the warning out of the middle of the message at most
+    /// widths, so the natural retry destroyed the data unwarned.
     fn prompt_encoding_loss(&mut self) {
-        self.editor.lossy_save_armed = true;
-        let chars = self.editor.unmappable_chars();
-        if chars.is_empty() && self.editor.decode_lossy {
-            self.status = format!(
-                "Not saved: this file has bytes that are not valid {}, shown as \u{fffd} - press Cmd+S again to write them as \u{fffd} (irreversible), or Reopen with Encoding via the status bar",
-                self.editor.encoding.name()
-            );
+        let encoding = self.editor.encoding.name();
+        self.pending_lossy_save = Some(LossySave {
+            path: self.editor.path.clone(),
+            encoding,
+            chars: self.editor.unmappable_chars(),
+        });
+        self.status = format!("Not saved: {encoding} cannot hold this file as it is");
+    }
+
+    /// S in the lossy-save modal (#1053): consent to the write it named, for
+    /// the tab it asked about, and save.
+    fn confirm_lossy_save(&mut self) {
+        let Some(asked) = self.pending_lossy_save.take() else {
+            return;
+        };
+        if self.editor.path != asked.path {
+            self.force_save_armed = false;
+            self.status = String::from("Not saved: the file asked about is no longer in front");
             return;
         }
-        let shown: String = chars.iter().map(|c| format!("{c} ")).collect();
-        self.status = format!(
-            "Not saved: {} cannot represent {}- press Cmd+S again to replace them with &#…; references (irreversible), or switch encoding via the status bar",
-            self.editor.encoding.name(),
-            shown
-        );
+        self.editor.lossy_save_armed = true;
+        self.save();
+    }
+
+    /// Esc in the lossy-save modal (#1053): nothing is written. A disk
+    /// conflict overwrite consented to on the way here is dropped too, so the
+    /// next Cmd+S starts over rather than half-answered.
+    fn cancel_lossy_save(&mut self) {
+        self.pending_lossy_save = None;
+        self.force_save_armed = false;
+        self.status = String::from("Not saved: the file on disk is unchanged");
     }
 
     /// Whether an open context menu (or its submenu panel) overlaps `rect`
