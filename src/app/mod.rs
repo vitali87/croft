@@ -4910,7 +4910,7 @@ pub struct App {
     /// in `ui_tooltip_at`.
     ui_hover: HoverDwell,
     ui_tooltip: Option<crate::widgets::hover_popup::HoverPopup>,
-    ui_tooltip_label: Option<&'static str>,
+    ui_tooltip_label: Option<std::borrow::Cow<'static, str>>,
     /// The chrome tooltip's final on-screen rect from the most recent render
     /// (after the activity-bar shift / viewport clamp), or `None` when no
     /// tooltip is showing. Read by the post-draw flush so the box can be
@@ -9700,6 +9700,9 @@ impl App {
             }
         }
         self.search.add_hits(arrived);
+        if applied {
+            self.reread_ui_tooltip();
+        }
         applied
     }
 
@@ -11002,6 +11005,20 @@ impl App {
         }
     }
 
+    /// [`Self::ui_tooltip_at`], plus the hints whose text is what sits under
+    /// the pointer rather than a control's name: a Search result row shows
+    /// its file's full path (#2008).
+    fn ui_tooltip_text_at(&self, col: u16, row: u16) -> Option<std::borrow::Cow<'static, str>> {
+        if self.show_tree
+            && self.sidebar_view == SidebarView::Search
+            && rect_contains(self.search.last_area, col, row)
+            && let Some(path) = self.search.result_path_at(col, row)
+        {
+            return Some(path.display().to_string().into());
+        }
+        self.ui_tooltip_at(col, row).map(Into::into)
+    }
+
     /// The hover-tooltip label for whatever chrome control sits under the
     /// pointer, or `None` over inert space. The single dispatch point for
     /// button hints: each surface contributes one branch that reuses that
@@ -11129,6 +11146,26 @@ impl App {
         })
     }
 
+    /// Read the armed hint again after the Search list changed under a
+    /// resting pointer (#2008): streamed hits shift the rows, and a hint
+    /// naming the file that was there would mislabel the one there now.
+    /// A changed hint waits out its own dwell, as one the pointer moved to.
+    fn reread_ui_tooltip(&mut self) {
+        let Some((col, row)) = self.ui_hover.cell() else {
+            return;
+        };
+        let label = self.ui_tooltip_text_at(col, row);
+        if label == self.ui_tooltip_label {
+            return;
+        }
+        self.ui_tooltip = None;
+        self.ui_hover.clear();
+        if label.is_some() {
+            self.ui_hover.on_move(std::time::Instant::now(), col, row);
+        }
+        self.ui_tooltip_label = label;
+    }
+
     /// Fire the chrome button-hint tooltip once its dwell crosses
     /// `HOVER_DELAY`. Returns `true` when a tooltip was created so the frame
     /// loop redraws. Suppressed while a context menu is open so the two never
@@ -11141,7 +11178,7 @@ impl App {
         if self.context_menu.is_some() {
             return false;
         }
-        let Some(label) = self.ui_tooltip_label else {
+        let Some(label) = self.ui_tooltip_label.as_deref() else {
             return false;
         };
         let Some((col, row)) = self.ui_hover.cell() else {
@@ -11196,7 +11233,7 @@ impl App {
         // different control, and is left running while it drifts within one.
         // Computed before the tab/editor early-returns so it tracks the
         // pointer everywhere, including over the sidebar.
-        match self.ui_tooltip_at(col, row) {
+        match self.ui_tooltip_text_at(col, row) {
             // Same label AND still on the same row: keep the dwell running so the
             // tooltip persists while the pointer drifts within one control. The
             // row check matters because adjacent controls can share a label (e.g.
@@ -11205,7 +11242,7 @@ impl App {
             // the box would appear detached from the one actually under the
             // pointer.
             Some(label)
-                if self.ui_tooltip_label == Some(label)
+                if self.ui_tooltip_label.as_ref() == Some(&label)
                     && self.ui_hover.cell().map(|(_, r)| r) == Some(row) => {}
             Some(label) => {
                 self.ui_hover.on_move(std::time::Instant::now(), col, row);

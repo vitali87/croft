@@ -956,6 +956,72 @@ fn double_clicking_a_search_hit_pins_the_tab_so_the_next_hit_opens_beside_it() {
     );
 }
 
+/// #2008: a result row names only the file, so hits in same-named files read
+/// the same. Resting the pointer on a row arms a hint with that hit's full
+/// path, and moving to the next row re-arms it with the other file's.
+#[test]
+fn resting_on_a_search_result_arms_a_hint_with_its_full_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    for dir in ["one", "two"] {
+        std::fs::create_dir_all(tmp.path().join(dir)).unwrap();
+        std::fs::write(tmp.path().join(dir).join("mod.rs"), "needle\n").unwrap();
+    }
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::Search);
+    app.search.query = String::from("needle");
+    app.search.run_query();
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let rows: Vec<(u16, u16)> = {
+        let buf = term.backend().buffer();
+        (0..buf.area.height)
+            .filter_map(|y| {
+                let line: String = (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect();
+                line.find(" mod.rs:1:")
+                    .map(|at| (line[..at].chars().count() as u16 + 2, y))
+            })
+            .collect()
+    };
+    assert_eq!(rows.len(), 2, "precondition: one row per mod.rs");
+    let canon = |dir: &str| {
+        let path = &app.search.hits[usize::from(dir == "two")].path;
+        assert!(path.ends_with(format!("{dir}/mod.rs")));
+        path.display().to_string()
+    };
+    let (one, two) = (canon("one"), canon("two"));
+
+    app.on_mouse_moved(rows[0].0, rows[0].1, false);
+    assert_eq!(app.ui_tooltip_label.as_deref(), Some(one.as_str()));
+    app.on_mouse_moved(rows[1].0, rows[1].1, false);
+    assert_eq!(app.ui_tooltip_label.as_deref(), Some(two.as_str()));
+
+    // A file that sorts first streams in under the resting pointer: the row
+    // now holds one/mod.rs, and the hint follows it.
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.search_results_rx = rx;
+    let early = tmp.path().join("a").join("mod.rs");
+    tx.send(crate::widgets::search::SearchEvent::Hits(
+        app.search.query.clone(),
+        app.search.opts,
+        vec![crate::widgets::search::SearchHit {
+            path: early,
+            line_no: 1,
+            line_text: String::from("needle"),
+            matches: 1,
+        }],
+    ))
+    .unwrap();
+    assert!(app.drain_search_results());
+    assert_eq!(app.ui_tooltip_label.as_deref(), Some(one.as_str()));
+
+    // Hidden behind a closed side bar, the rows it last drew have no hint.
+    app.show_tree = false;
+    app.on_mouse_moved(rows[0].0, rows[0].1, false);
+    assert_eq!(app.ui_tooltip_label, None);
+}
+
 // --- Split editor (side-by-side panes) -----------------------------------
 
 /// Seeding the Search panel from a terminal command must describe THAT

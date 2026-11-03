@@ -1892,6 +1892,22 @@ impl SearchPanel {
         None
     }
 
+    /// The full path of the result row under `(col, row)`, for its hover hint
+    /// (#2008): a row names only the file, so hits in same-named files
+    /// (`mod.rs`, `index.ts`) read the same. `None` off the rows and on the
+    /// scrollbar.
+    pub fn result_path_at(&self, col: u16, row: u16) -> Option<&Path> {
+        let inner = self.last_inner;
+        if col < inner.x || col >= inner.x + inner.width {
+            return None;
+        }
+        let bar = self.last_scrollbar;
+        if bar.width > 0 && col >= bar.x && col < bar.x + bar.width {
+            return None;
+        }
+        self.hit_at_y(row).map(|i| self.hits[i].path.as_path())
+    }
+
     /// Clear the search like VS Code's "Clear Search Results": empty the query
     /// (and the replace text typed against it) and drop every hit, resetting
     /// selection and scroll. The include/exclude glob filters are intentionally
