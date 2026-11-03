@@ -1,1 +1,0 @@
-feature: Inline suggestions come from the file's language server when it offers them (LSP 3.18 inline completions, such as Copilot's), with no model needed. A suggestion that rewrites what you typed shows the old text struck through and the new text beside it; Tab replaces it.

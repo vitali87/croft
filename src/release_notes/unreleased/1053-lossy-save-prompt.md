@@ -1,1 +1,0 @@
-fix: Saving a file whose encoding cannot hold your edits now asks in a dialog what would be lost; only S writes, so a second Cmd+S no longer replaces the bytes with � behind a warning the status bar had cut off.
