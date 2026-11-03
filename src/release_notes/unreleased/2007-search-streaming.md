@@ -1,0 +1,1 @@
+fix: Search (Cmd+Shift+F) results stream in as fast as files are searched again: a query with many matches no longer arrives in slow lumps that froze croft while each one was sorted into the list (#2007).
