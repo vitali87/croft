@@ -12,9 +12,10 @@ use std::time::SystemTime;
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::highlight::{
-    HiSpan, LangKind, LangRegistry, compute_line_starts, decode_semantic_tokens,
+    HiSpan, LangKind, LangRegistry, compute_line_starts, decode_semantic_tokens, language_label,
 };
 use crate::packed_lines::PackedLines;
+pub use crate::text_edit::TextSpanEdit;
 use crate::widgets::scrollbar;
 
 /// Hard cap on the size of a single text file the editor will load.
@@ -2297,21 +2298,6 @@ type ColumnBoxCarets = (
 /// a workbook keeps unique, so a reorder since the backup does not put the
 /// value on another worksheet.
 pub type SheetCellEdit = (String, usize, usize, String);
-
-/// A single text replacement in char-indexed `(row, col)` coordinates, as
-/// produced by an LSP rename `WorkspaceEdit`. Applied by
-/// [`apply_span_edits_to_lines`] and [`Editor::apply_span_edits`].
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TextSpanEdit {
-    pub start: (usize, usize),
-    pub end: (usize, usize),
-    pub new_text: String,
-    /// The columns are UTF-16 code units, as a language server sends them,
-    /// not chars. Converted against the lines at apply time: read as char
-    /// columns, every edit after an emoji on its line landed off by one per
-    /// astral character, and a rename wrote `xrenamed+ 1` over `x + 1`.
-    pub utf16: bool,
-}
 
 /// Apply `edits` to `lines` (char-indexed coords), bottom-to-top so an
 /// earlier replacement never shifts the coordinates of a later one. Returns
@@ -17903,41 +17889,6 @@ fn emmet_profile_for(
             Some(Profile::Jsx)
         }
         _ => None,
-    }
-}
-
-/// Display name for a language mode, matching VS Code's status-bar labels.
-/// `None` is a buffer with no recognised grammar.
-pub fn language_label(lang: Option<LangKind>) -> &'static str {
-    match lang {
-        None => "Plain Text",
-        Some(LangKind::Rust) => "Rust",
-        Some(LangKind::Python) => "Python",
-        Some(LangKind::JavaScript) => "JavaScript",
-        Some(LangKind::TypeScript) => "TypeScript",
-        Some(LangKind::Tsx) => "TypeScript JSX",
-        Some(LangKind::Json) => "JSON",
-        Some(LangKind::Xml) => "XML",
-        Some(LangKind::Toml) => "TOML",
-        Some(LangKind::Yaml) => "YAML",
-        Some(LangKind::Markdown) => "Markdown",
-        Some(LangKind::Go) => "Go",
-        Some(LangKind::Html) => "HTML",
-        Some(LangKind::Css) => "CSS",
-        Some(LangKind::Bash) => "Shell Script",
-        Some(LangKind::C) => "C",
-        Some(LangKind::Cpp) => "C++",
-        Some(LangKind::Lua) => "Lua",
-        Some(LangKind::Ql) => "CodeQL",
-        Some(LangKind::Dbscheme) => "CodeQL Database Scheme",
-        Some(LangKind::Java) => "Java",
-        Some(LangKind::Ruby) => "Ruby",
-        Some(LangKind::CSharp) => "C#",
-        Some(LangKind::Sql) => "SQL",
-        Some(LangKind::Make) => "Makefile",
-        Some(LangKind::Dockerfile) => "Dockerfile",
-        Some(LangKind::Vue) => "Vue",
-        Some(LangKind::Svelte) => "Svelte",
     }
 }
 

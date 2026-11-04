@@ -72391,7 +72391,7 @@ impl App {
                 label: format!(
                     "{}{}",
                     check(current == Some(lang)),
-                    crate::widgets::editor::language_label(Some(lang))
+                    crate::highlight::language_label(Some(lang))
                 ),
                 action: MenuAction::SetLanguage(Some(lang)),
             });

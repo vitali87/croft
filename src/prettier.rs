@@ -176,14 +176,14 @@ fn run(bin: &Path, file: &Path, text: &str) -> Result<String, String> {
 /// The edit that turns `old` (the buffer's lines) into `new`: only the rows
 /// between the unchanged head and tail, so the caret and folds above and
 /// below the change stay put.
-pub fn edits_for(old: &[String], new: &str) -> Vec<crate::widgets::editor::TextSpanEdit> {
+pub fn edits_for(old: &[String], new: &str) -> Vec<crate::text_edit::TextSpanEdit> {
     let new: Vec<&str> = new.split('\n').collect();
     let max = old.len().min(new.len());
     let head = (0..max).take_while(|&i| old[i] == new[i]).count();
     let tail = (0..max - head)
         .take_while(|&i| old[old.len() - 1 - i] == new[new.len() - 1 - i])
         .count();
-    let edit = |start, end, new_text| crate::widgets::editor::TextSpanEdit {
+    let edit = |start, end, new_text| crate::text_edit::TextSpanEdit {
         start,
         end,
         new_text,

@@ -30,7 +30,7 @@ use crate::lsp::config::{Language, ServerConfig};
 use crate::lsp::log_file;
 use crate::lsp::registry::ServerRegistry;
 use crate::lsp::runtime::LspRuntime;
-use crate::widgets::editor::TextSpanEdit;
+use crate::text_edit::TextSpanEdit;
 
 #[derive(Debug, Clone, Default)]
 pub struct CompletionItem {
@@ -8376,7 +8376,7 @@ fn missing_servers_note(
     }
     let label = crate::highlight::lang_for_language_id(lang.lsp_id())
         .map_or(lang.lsp_id(), |kind| {
-            crate::widgets::editor::language_label(Some(kind))
+            crate::highlight::language_label(Some(kind))
         });
     Some(format!(
         "{label}: no language server, so no diagnostics or completion ({})",
