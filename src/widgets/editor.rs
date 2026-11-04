@@ -16423,7 +16423,7 @@ pub(crate) fn is_word_char(c: char) -> bool {
 /// (#909): a word char, or a zero-width mark riding on one (a combining
 /// accent in decomposed text, a variation selector), so `Ctrl+Right` never
 /// stops between `e` and its accent for `Ctrl+Backspace` to split them.
-fn word_char_at(chars: &[char], i: usize) -> bool {
+pub(crate) fn word_char_at(chars: &[char], i: usize) -> bool {
     let joins = |c: char| !c.is_control() && unicode_width::UnicodeWidthChar::width(c) == Some(0);
     let base = (0..=i)
         .rev()

@@ -2725,3 +2725,45 @@ fn find_bar_replace_field_edits_at_its_caret() {
     assert_eq!(st.replace_caret(), 2);
     assert_eq!(st.query, "f", "the query row was left alone");
 }
+
+#[test]
+fn bracketed_paste_goes_into_the_focused_search_field_at_its_caret() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::Search);
+    app.search.query = String::from("query");
+    app.search.replace = String::from("ac");
+    app.search
+        .focus_field(crate::widgets::search::SearchField::Replace);
+    app.search.move_caret(|_, _| 1);
+    app.handle_paste("b");
+    assert_eq!(
+        app.search.replace, "abc",
+        "the paste lands in Replace, at its caret"
+    );
+    assert_eq!(app.search.query, "query", "and never in the Query field");
+}
+
+#[test]
+fn a_click_on_the_find_bar_puts_the_caret_under_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let mut find = crate::widgets::editor_find::EditorFind::new(
+        String::from("needle"),
+        crate::widgets::search::SearchOpts::default(),
+    );
+    find.last_rect = ratatui::layout::Rect {
+        x: 10,
+        y: 2,
+        width: 48,
+        height: 3,
+    };
+    app.editor_find = Some(find);
+    // The text starts after the border and the two-cell marker: column 13.
+    app.handle_mouse(mouse(
+        crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        15,
+        3,
+    ));
+    assert_eq!(app.editor_find.as_ref().unwrap().caret(), 2);
+}

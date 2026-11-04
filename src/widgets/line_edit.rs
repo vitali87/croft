@@ -28,9 +28,10 @@ pub fn char_len(text: &str) -> usize {
     text.chars().count()
 }
 
-/// `caret` limited to the text.
+/// `caret` limited to the text and moved back to the start of the grapheme
+/// cluster it falls inside, so a stale or clicked caret never splits one.
 pub fn clamp(text: &str, caret: usize) -> usize {
-    caret.min(char_len(text))
+    cluster_floor(text, caret.min(char_len(text)))
 }
 
 /// Byte offset of char index `at` (the text's length for an index past it).
@@ -93,8 +94,11 @@ fn cluster_floor(text: &str, at: usize) -> usize {
     start
 }
 
-fn is_word(c: char) -> bool {
-    crate::widgets::editor::is_word_char(c)
+/// Whether the char at `i` is part of a word. A combining mark or variation
+/// selector takes the class of the char it follows, as in the editor, so a
+/// word walk never stops between `e` and its accent.
+fn is_word(chars: &[char], i: usize) -> bool {
+    crate::widgets::editor::word_char_at(chars, i)
 }
 
 /// Where a word walk ends when moving left from `at`: back over a run of
@@ -102,10 +106,10 @@ fn is_word(c: char) -> bool {
 fn word_start_before(text: &str, at: usize) -> usize {
     let chars: Vec<char> = text.chars().collect();
     let mut i = at.min(chars.len());
-    while i > 0 && !is_word(chars[i - 1]) {
+    while i > 0 && !is_word(&chars, i - 1) {
         i -= 1;
     }
-    while i > 0 && is_word(chars[i - 1]) {
+    while i > 0 && is_word(&chars, i - 1) {
         i -= 1;
     }
     cluster_floor(text, i)
@@ -115,10 +119,10 @@ fn word_start_before(text: &str, at: usize) -> usize {
 fn word_end_after(text: &str, at: usize) -> usize {
     let chars: Vec<char> = text.chars().collect();
     let mut i = at.min(chars.len());
-    while i < chars.len() && !is_word(chars[i]) {
+    while i < chars.len() && !is_word(&chars, i) {
         i += 1;
     }
-    while i < chars.len() && is_word(chars[i]) {
+    while i < chars.len() && is_word(&chars, i) {
         i += 1;
     }
     cluster_floor(text, i).max(at.min(chars.len()))
@@ -192,9 +196,28 @@ fn cut(text: &str, from: usize, to: usize) -> String {
     out
 }
 
-/// Display cells of one char, 0 for a control character or a combining mark.
-pub fn cells(c: char) -> usize {
-    unicode_width::UnicodeWidthChar::width(c).unwrap_or(0)
+/// One grapheme cluster of a text: where it starts (a char index) and how
+/// many cells the terminal draws it in. A cluster is
+/// one glyph, so 👍🏽, a flag or a ZWJ emoji is one width, not the sum of its
+/// code points'.
+struct Cluster {
+    start: usize,
+    width: usize,
+}
+
+fn clusters(text: &str) -> Vec<Cluster> {
+    let mut start = 0;
+    text.graphemes(true)
+        .map(|g| {
+            let len = g.chars().count();
+            let c = Cluster {
+                start,
+                width: unicode_width::UnicodeWidthStr::width(g),
+            };
+            start += len;
+            c
+        })
+        .collect()
 }
 
 /// Which part of a row's text is on screen.
@@ -215,39 +238,41 @@ pub struct Window {
 /// rest fills what is left. A wide character that would straddle the right
 /// edge is left out, as it is in the editor.
 pub fn window(text: &str, caret: usize, avail: usize) -> Window {
-    let chars: Vec<char> = text.chars().collect();
-    let caret = caret.min(chars.len());
+    let cl = clusters(text);
+    let total = char_len(text);
+    let caret = clamp(text, caret);
     let avail = avail.max(1);
-    let before_w: usize = chars[..caret].iter().map(|&c| cells(c)).sum();
-    let mut start = 0;
+    let at = cl.iter().position(|c| c.start >= caret).unwrap_or(cl.len());
+    let before_w: usize = cl[..at].iter().map(|c| c.width).sum();
+    let mut first = 0;
     let mut dropped = 0;
-    while start < caret && before_w - dropped >= avail {
-        dropped += cells(chars[start]);
-        start += 1;
+    while first < at && before_w - dropped >= avail {
+        dropped += cl[first].width;
+        first += 1;
     }
     let caret_cell = before_w - dropped;
-    // The char under the caret takes its own cell (an end-of-text caret gets
-    // one too), then whatever of the rest still fits.
+    // The cluster under the caret takes its own cell (an end-of-text caret
+    // gets one too), then whatever of the rest still fits.
     let mut used = caret_cell;
-    let mut end = caret;
-    if end < chars.len() {
-        let w = cells(chars[end]).max(1);
+    let mut last = at;
+    if last < cl.len() {
+        let w = cl[last].width.max(1);
         if used + w <= avail {
             used += w;
-            end += 1;
-            while end < chars.len() {
-                let w = cells(chars[end]);
+            last += 1;
+            while last < cl.len() {
+                let w = cl[last].width;
                 if used + w > avail {
                     break;
                 }
                 used += w;
-                end += 1;
+                last += 1;
             }
         }
     }
     Window {
-        start,
-        end,
+        start: cl.get(first).map_or(total, |c| c.start),
+        end: cl.get(last).map_or(total, |c| c.start),
         caret_cell,
     }
 }
@@ -255,18 +280,15 @@ pub fn window(text: &str, caret: usize, avail: usize) -> Window {
 /// The char of `text` under screen cell `cell`, counting from the row's left
 /// edge when the row shows the text from char `start`: a click's caret. A
 /// cell past the visible text is the end of the text; one on the second half
-/// of a wide character is that character.
+/// of a wide character is that character, and a click inside a cluster lands
+/// on its start.
 pub fn char_at_cell(text: &str, start: usize, cell: usize) -> usize {
     let mut at = 0;
-    for (i, c) in text.chars().enumerate().skip(start) {
-        let w = cells(c);
-        if cell < at + w {
-            return i;
+    for c in clusters(text).iter().filter(|c| c.start >= start) {
+        if cell < at + c.width {
+            return c.start;
         }
-        at += w;
-        if cell < at {
-            return i;
-        }
+        at += c.width;
     }
     char_len(text)
 }
@@ -368,5 +390,28 @@ mod tests {
         let w = window("日本語", 3, 5);
         assert!(w.caret_cell < 5);
         assert_eq!(w.start, 1, "one char scrolled off to fit the caret");
+    }
+
+    #[test]
+    fn a_word_walk_keeps_a_combining_mark_with_its_base() {
+        // "e" + U+0301 is one letter: Ctrl+Right from the start goes to the
+        // end of "e\u{301}x", not to the middle of the first cluster.
+        let t = "e\u{301}x y";
+        assert_eq!(caret_right(t, 0, true), 3);
+        assert_eq!(caret_left(t, 3, true), 0);
+    }
+
+    #[test]
+    fn an_emoji_cluster_is_one_glyph_for_width_and_clicks() {
+        // 👍🏽 is two code points drawn in two cells, not four.
+        let t = "a\u{1F44D}\u{1F3FD}b";
+        let w = window(t, 3, 4);
+        assert_eq!((w.start, w.end, w.caret_cell), (0, 4, 3));
+        // Cells: a=0, thumbs=1-2, b=3. A click on the second cell of the
+        // emoji lands on its start, never on the modifier.
+        assert_eq!(char_at_cell(t, 0, 2), 1);
+        assert_eq!(char_at_cell(t, 0, 3), 3);
+        // A caret inside the cluster snaps to its start.
+        assert_eq!(clamp(t, 2), 1);
     }
 }
