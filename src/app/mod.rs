@@ -48501,7 +48501,9 @@ impl App {
                     .line_no
                     .saturating_sub(1)
                     .min(self.editor.lines.len().saturating_sub(1));
-                self.editor.cursor_row = row;
+                // Centre the hit's line, as Go to Line does, instead of
+                // leaving it wherever the preview's scroll happened to be.
+                self.editor.goto_line_centered(row);
                 // Drop the cursor at the first match column on this line so
                 // long lines (HTML with base64 blobs, minified JS) auto-scroll
                 // horizontally and the user lands on the match instead of the

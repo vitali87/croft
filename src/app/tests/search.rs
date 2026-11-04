@@ -50,6 +50,35 @@ fn opening_a_search_hit_marks_the_active_match_so_the_renderer_paints_it_orange(
 }
 
 #[test]
+fn opening_a_search_hit_scrolls_the_hit_line_into_view() {
+    // The hit's line is seated with the Go to Line scroll, not left wherever
+    // the preview's scroll was: a hit far down a file must move the view.
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("long.rs");
+    let mut body = String::new();
+    for i in 0..120 {
+        if i == 99 {
+            body.push_str("let needle_here = 1;\n");
+        } else {
+            body.push_str("let filler = 0;\n");
+        }
+    }
+    std::fs::write(&f, body).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::Search);
+    app.search.query = String::from("needle_here");
+    app.search.run_query();
+    let hit = app.search.selected_hit().cloned().expect("a hit");
+    app.open_search_hit(&hit);
+    assert_eq!(app.editor.cursor_row, 99);
+    assert!(
+        app.editor.scroll > 0,
+        "a hit on line 100 must scroll the editor, got scroll {}",
+        app.editor.scroll
+    );
+}
+
+#[test]
 fn typing_after_reactivating_search_replaces_instead_of_appending() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
