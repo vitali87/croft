@@ -1,0 +1,1 @@
+feature: New File, New Folder, Rename and the other single-line prompts keep a caret: Left, Right, Home and End move it (a word at a time with Ctrl, Cmd or Alt), Backspace and Delete edit at it, and a paste lands there.

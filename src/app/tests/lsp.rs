@@ -2486,6 +2486,7 @@ fn a_cancelled_rename_disarms_the_in_flight_prepare_request() {
     app.prompt = Some(Prompt {
         label: String::from("Rename Symbol 'value'"),
         buffer: String::from("value"),
+        caret: usize::MAX,
         kind: PromptKind::RenameSymbol {
             path: path.clone(),
             row: 1,

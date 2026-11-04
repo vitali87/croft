@@ -3054,9 +3054,33 @@ enum PromptKind {
 struct Prompt {
     label: String,
     buffer: String,
+    /// Caret as a char index into `buffer`; `usize::MAX` is the end, which is
+    /// where every prompt opens (read it through [`Prompt::caret`]).
+    caret: usize,
     kind: PromptKind,
     target_dir: PathBuf,
     error: Option<String>,
+}
+
+impl Prompt {
+    /// The caret, clamped into `buffer`.
+    fn caret(&self) -> usize {
+        crate::widgets::line_edit::clamp(&self.buffer, self.caret)
+    }
+
+    /// Run one edit (`insert_at`, `delete_before`, ...) at the caret and keep
+    /// what it returns.
+    fn edit(&mut self, edit: impl FnOnce(&str, usize) -> (String, usize)) {
+        let (text, caret) = edit(&self.buffer, self.caret());
+        self.buffer = text;
+        self.caret = caret;
+        self.error = None;
+    }
+
+    /// Move the caret with one of `line_edit`'s walkers.
+    fn walk(&mut self, to: impl FnOnce(&str, usize) -> usize) {
+        self.caret = to(&self.buffer, self.caret());
+    }
 }
 
 /// A Source Control write that records the files on disk (#1438): a commit
@@ -16085,6 +16109,7 @@ impl App {
         self.prompt = Some(Prompt {
             label: format!("Rename Symbol '{word}'"),
             buffer: word,
+            caret: usize::MAX,
             kind: PromptKind::RenameSymbol { path, row, col },
             target_dir: PathBuf::new(),
             error: None,
@@ -16179,6 +16204,7 @@ impl App {
         self.prompt = Some(Prompt {
             label: format!("Rename Symbol '{word}'"),
             buffer: word,
+            caret: usize::MAX,
             kind: PromptKind::RenameSymbol { path, row, col },
             target_dir: PathBuf::new(),
             error: None,
@@ -19353,6 +19379,7 @@ impl App {
         self.prompt = Some(Prompt {
             label: String::from("Rename Terminal"),
             buffer: current,
+            caret: usize::MAX,
             kind: PromptKind::RenameTerminal(idx),
             target_dir: PathBuf::new(),
             error: None,
@@ -19389,6 +19416,7 @@ impl App {
         self.prompt = Some(Prompt {
             label: String::from("Annotate Selection"),
             buffer,
+            caret: usize::MAX,
             kind: PromptKind::AnnotateTerminal {
                 pane,
                 line: sr,
@@ -25555,6 +25583,42 @@ impl App {
         }
     }
 
+    /// The `> ` field line of a prompt: the buffer scrolled to keep the caret
+    /// in `width` cells, and the caret drawn as a block over the char under it.
+    fn prompt_field_line(
+        &self,
+        p: &Prompt,
+        width: usize,
+        cursor_fg: Color,
+    ) -> ratatui::text::Line<'static> {
+        use ratatui::text::Span;
+        let text_style = Style::default().fg(self.theme.ui(Color::White));
+        let caret_style = Style::default().fg(cursor_fg);
+        let chars: Vec<char> = p.buffer.chars().collect();
+        let caret = p.caret();
+        let win = crate::widgets::line_edit::window(&p.buffer, caret, width.saturating_sub(2));
+        let mut spans = vec![Span::raw("> ")];
+        let before: String = chars[win.start..caret].iter().collect();
+        if !before.is_empty() {
+            spans.push(Span::styled(before, text_style));
+        }
+        let mut drawn = caret;
+        if caret < win.end {
+            spans.push(Span::styled(
+                chars[caret].to_string(),
+                caret_style.add_modifier(Modifier::REVERSED),
+            ));
+            drawn = caret + 1;
+        } else {
+            spans.push(Span::styled("█", caret_style));
+        }
+        let tail: String = chars[drawn.min(win.end)..win.end].iter().collect();
+        if !tail.is_empty() {
+            spans.push(Span::styled(tail, text_style));
+        }
+        ratatui::text::Line::from(spans)
+    }
+
     fn render_prompt(&self, frame: &mut ratatui::Frame) {
         let Some(p) = &self.prompt else { return };
         let area = frame.area();
@@ -25610,69 +25674,27 @@ impl App {
         };
         let (top_line, hint_text) = match &p.kind {
             PromptKind::Create(_) => (
-                ratatui::text::Line::from(vec![
-                    ratatui::text::Span::raw("> "),
-                    ratatui::text::Span::styled(
-                        p.buffer.as_str(),
-                        Style::default().fg(self.theme.ui(Color::White)),
-                    ),
-                    ratatui::text::Span::styled("█", Style::default().fg(cursor_fg)),
-                ]),
+                self.prompt_field_line(p, usize::from(inner.width), cursor_fg),
                 "Enter to create, Esc to cancel",
             ),
             PromptKind::Rename(_) => (
-                ratatui::text::Line::from(vec![
-                    ratatui::text::Span::raw("> "),
-                    ratatui::text::Span::styled(
-                        p.buffer.as_str(),
-                        Style::default().fg(self.theme.ui(Color::White)),
-                    ),
-                    ratatui::text::Span::styled("█", Style::default().fg(cursor_fg)),
-                ]),
+                self.prompt_field_line(p, usize::from(inner.width), cursor_fg),
                 "Enter to rename, Esc to cancel",
             ),
             PromptKind::SaveAs => (
-                ratatui::text::Line::from(vec![
-                    ratatui::text::Span::raw("> "),
-                    ratatui::text::Span::styled(
-                        p.buffer.as_str(),
-                        Style::default().fg(self.theme.ui(Color::White)),
-                    ),
-                    ratatui::text::Span::styled("█", Style::default().fg(cursor_fg)),
-                ]),
+                self.prompt_field_line(p, usize::from(inner.width), cursor_fg),
                 "Enter to save, Esc to cancel (missing folders are created)",
             ),
             PromptKind::RenameSymbol { .. } => (
-                ratatui::text::Line::from(vec![
-                    ratatui::text::Span::raw("> "),
-                    ratatui::text::Span::styled(
-                        p.buffer.as_str(),
-                        Style::default().fg(self.theme.ui(Color::White)),
-                    ),
-                    ratatui::text::Span::styled("█", Style::default().fg(cursor_fg)),
-                ]),
+                self.prompt_field_line(p, usize::from(inner.width), cursor_fg),
                 "Enter to rename symbol, Esc to cancel",
             ),
             PromptKind::RenameTerminal(_) => (
-                ratatui::text::Line::from(vec![
-                    ratatui::text::Span::raw("> "),
-                    ratatui::text::Span::styled(
-                        p.buffer.as_str(),
-                        Style::default().fg(self.theme.ui(Color::White)),
-                    ),
-                    ratatui::text::Span::styled("█", Style::default().fg(cursor_fg)),
-                ]),
+                self.prompt_field_line(p, usize::from(inner.width), cursor_fg),
                 "Enter to rename, Esc to cancel (blank clears the name)",
             ),
             PromptKind::AnnotateTerminal { existing, .. } => (
-                ratatui::text::Line::from(vec![
-                    ratatui::text::Span::raw("> "),
-                    ratatui::text::Span::styled(
-                        p.buffer.as_str(),
-                        Style::default().fg(self.theme.ui(Color::White)),
-                    ),
-                    ratatui::text::Span::styled("█", Style::default().fg(cursor_fg)),
-                ]),
+                self.prompt_field_line(p, usize::from(inner.width), cursor_fg),
                 if existing.is_some() {
                     "Enter to update the note, Esc to cancel (blank deletes it)"
                 } else {
@@ -25680,102 +25702,39 @@ impl App {
                 },
             ),
             PromptKind::BreakpointCondition { .. } => (
-                ratatui::text::Line::from(vec![
-                    ratatui::text::Span::raw("> "),
-                    ratatui::text::Span::styled(
-                        p.buffer.as_str(),
-                        Style::default().fg(self.theme.ui(Color::White)),
-                    ),
-                    ratatui::text::Span::styled("█", Style::default().fg(cursor_fg)),
-                ]),
+                self.prompt_field_line(p, usize::from(inner.width), cursor_fg),
                 "Enter to set condition (blank for a plain breakpoint), Esc to cancel",
             ),
             PromptKind::Logpoint { .. } => (
-                ratatui::text::Line::from(vec![
-                    ratatui::text::Span::raw("> "),
-                    ratatui::text::Span::styled(
-                        p.buffer.as_str(),
-                        Style::default().fg(self.theme.ui(Color::White)),
-                    ),
-                    ratatui::text::Span::styled("█", Style::default().fg(cursor_fg)),
-                ]),
+                self.prompt_field_line(p, usize::from(inner.width), cursor_fg),
                 "Enter to set the log message, {expr} interpolates (blank for a plain breakpoint), Esc to cancel",
             ),
             PromptKind::HitCondition { .. } => (
-                ratatui::text::Line::from(vec![
-                    ratatui::text::Span::raw("> "),
-                    ratatui::text::Span::styled(
-                        p.buffer.as_str(),
-                        Style::default().fg(self.theme.ui(Color::White)),
-                    ),
-                    ratatui::text::Span::styled("█", Style::default().fg(cursor_fg)),
-                ]),
+                self.prompt_field_line(p, usize::from(inner.width), cursor_fg),
                 "Enter to set the hit count, e.g. 5 (blank for a plain breakpoint), Esc to cancel",
             ),
             PromptKind::FunctionBreakpoint => (
-                ratatui::text::Line::from(vec![
-                    ratatui::text::Span::raw("> "),
-                    ratatui::text::Span::styled(
-                        p.buffer.as_str(),
-                        Style::default().fg(self.theme.ui(Color::White)),
-                    ),
-                    ratatui::text::Span::styled("█", Style::default().fg(cursor_fg)),
-                ]),
+                self.prompt_field_line(p, usize::from(inner.width), cursor_fg),
                 "Enter to break on entry to this function, Esc to cancel",
             ),
             PromptKind::DataBreakpoint => (
-                ratatui::text::Line::from(vec![
-                    ratatui::text::Span::raw("> "),
-                    ratatui::text::Span::styled(
-                        p.buffer.as_str(),
-                        Style::default().fg(self.theme.ui(Color::White)),
-                    ),
-                    ratatui::text::Span::styled("█", Style::default().fg(cursor_fg)),
-                ]),
+                self.prompt_field_line(p, usize::from(inner.width), cursor_fg),
                 "Enter to pause when this variable is written, Esc to cancel",
             ),
             PromptKind::NewProfile => (
-                ratatui::text::Line::from(vec![
-                    ratatui::text::Span::raw("> "),
-                    ratatui::text::Span::styled(
-                        p.buffer.as_str(),
-                        Style::default().fg(self.theme.ui(Color::White)),
-                    ),
-                    ratatui::text::Span::styled("█", Style::default().fg(cursor_fg)),
-                ]),
+                self.prompt_field_line(p, usize::from(inner.width), cursor_fg),
                 "Enter to create it from your current settings, keybindings and snippets, Esc to cancel",
             ),
             PromptKind::ReviewComment => (
-                ratatui::text::Line::from(vec![
-                    ratatui::text::Span::raw("> "),
-                    ratatui::text::Span::styled(
-                        p.buffer.as_str(),
-                        Style::default().fg(self.theme.ui(Color::White)),
-                    ),
-                    ratatui::text::Span::styled("█", Style::default().fg(cursor_fg)),
-                ]),
+                self.prompt_field_line(p, usize::from(inner.width), cursor_fg),
                 "Enter to add it to your pending review, Esc to cancel",
             ),
             PromptKind::ReviewSummary => (
-                ratatui::text::Line::from(vec![
-                    ratatui::text::Span::raw("> "),
-                    ratatui::text::Span::styled(
-                        p.buffer.as_str(),
-                        Style::default().fg(self.theme.ui(Color::White)),
-                    ),
-                    ratatui::text::Span::styled("█", Style::default().fg(cursor_fg)),
-                ]),
+                self.prompt_field_line(p, usize::from(inner.width), cursor_fg),
                 "Enter to submit the review (the summary may be empty), Esc to cancel",
             ),
             PromptKind::StickyNote => (
-                ratatui::text::Line::from(vec![
-                    ratatui::text::Span::raw("> "),
-                    ratatui::text::Span::styled(
-                        p.buffer.as_str(),
-                        Style::default().fg(self.theme.ui(Color::White)),
-                    ),
-                    ratatui::text::Span::styled("█", Style::default().fg(cursor_fg)),
-                ]),
+                self.prompt_field_line(p, usize::from(inner.width), cursor_fg),
                 "Enter to leave the note on this line (shared with everyone in the session), Esc to cancel",
             ),
         };
@@ -37634,6 +37593,7 @@ impl App {
         self.prompt = Some(Prompt {
             label,
             buffer: existing,
+            caret: usize::MAX,
             kind: PromptKind::BreakpointCondition { path, line },
             target_dir,
             error: None,
@@ -37681,6 +37641,7 @@ impl App {
         self.prompt = Some(Prompt {
             label,
             buffer,
+            caret: usize::MAX,
             kind,
             target_dir,
             error: None,
@@ -37877,6 +37838,7 @@ impl App {
         self.prompt = Some(Prompt {
             label,
             buffer: existing,
+            caret: usize::MAX,
             kind: PromptKind::Logpoint { path, line },
             target_dir,
             error: None,
@@ -41313,6 +41275,7 @@ impl App {
         self.prompt = Some(Prompt {
             label: format!("Note on line {}", self.editor.cursor_row + 1),
             buffer: String::new(),
+            caret: usize::MAX,
             kind: PromptKind::StickyNote,
             target_dir: self.tree.root.clone(),
             error: None,
@@ -41438,6 +41401,7 @@ impl App {
         self.prompt = Some(Prompt {
             label: format!("Comment on {rel}:{}", self.editor.cursor_row + 1),
             buffer: String::new(),
+            caret: usize::MAX,
             kind: PromptKind::ReviewComment,
             // Carries the repo-relative path, so the comment lands on the
             // file it was asked about.
@@ -42975,6 +42939,7 @@ impl App {
                 self.prompt = Some(Prompt {
                     label: String::from("Review summary"),
                     buffer: String::new(),
+                    caret: usize::MAX,
                     kind: PromptKind::ReviewSummary,
                     target_dir: self.tree.root.clone(),
                     error: None,
@@ -42986,6 +42951,7 @@ impl App {
                     self.prompt = Some(Prompt {
                         label: String::from("New profile name"),
                         buffer: String::new(),
+                        caret: usize::MAX,
                         kind: PromptKind::NewProfile,
                         target_dir,
                         error: None,
@@ -52453,6 +52419,13 @@ impl App {
                     prompt.push_char(c);
                 }
             }
+            return false;
+        }
+        // New File, Rename and the other single-line prompts take a paste at
+        // the caret, as the find bar does.
+        if let Some(prompt) = self.prompt.as_mut() {
+            let text: String = s.chars().filter(|c| !c.is_control()).collect();
+            prompt.edit(|t, at| crate::widgets::line_edit::insert_at(t, at, &text));
             return false;
         }
         if let Some(palette) = self.command_palette.as_mut() {
@@ -75979,6 +75952,7 @@ impl App {
         self.prompt = Some(Prompt {
             label,
             buffer: String::new(),
+            caret: usize::MAX,
             kind: PromptKind::Create(kind),
             target_dir,
             error: None,
@@ -76058,6 +76032,7 @@ impl App {
         self.prompt = Some(Prompt {
             label: String::from("Save As"),
             buffer,
+            caret: usize::MAX,
             kind: PromptKind::SaveAs,
             target_dir: self.tree.root.clone(),
             error: None,
@@ -76107,6 +76082,7 @@ impl App {
         self.prompt = Some(Prompt {
             label,
             buffer: current,
+            caret: usize::MAX,
             kind: PromptKind::Rename(path),
             target_dir: parent,
             error: None,
@@ -76124,10 +76100,34 @@ impl App {
                 self.status = String::from("Cancelled");
             }
             KeyCode::Enter => self.commit_prompt(),
-            KeyCode::Backspace => {
+            // The caret walks and deletes the way the find bar's does
+            // (#1729): Left/Right/Home/End, a word at a time with Ctrl, Cmd
+            // or Alt, and Delete forward.
+            KeyCode::Left | KeyCode::Right | KeyCode::Home | KeyCode::End => {
+                let word = key_walks_by_word(key);
                 if let Some(p) = self.prompt.as_mut() {
-                    p.buffer.pop();
-                    p.error = None;
+                    match key.code {
+                        KeyCode::Left => {
+                            p.walk(|t, c| crate::widgets::line_edit::caret_left(t, c, word))
+                        }
+                        KeyCode::Right => {
+                            p.walk(|t, c| crate::widgets::line_edit::caret_right(t, c, word))
+                        }
+                        KeyCode::Home => p.caret = 0,
+                        _ => p.caret = usize::MAX,
+                    }
+                }
+            }
+            KeyCode::Backspace => {
+                let word = key_walks_by_word(key);
+                if let Some(p) = self.prompt.as_mut() {
+                    p.edit(|t, c| crate::widgets::line_edit::delete_before(t, c, word));
+                }
+            }
+            KeyCode::Delete => {
+                let word = key_walks_by_word(key);
+                if let Some(p) = self.prompt.as_mut() {
+                    p.edit(|t, c| crate::widgets::line_edit::delete_at(t, c, word));
                 }
             }
             KeyCode::Char(c) => {
@@ -76136,8 +76136,7 @@ impl App {
                     && !key.modifiers.contains(KeyModifiers::SUPER)
                     && let Some(p) = self.prompt.as_mut()
                 {
-                    p.buffer.push(c);
-                    p.error = None;
+                    p.edit(|t, at| crate::widgets::line_edit::insert_at(t, at, &c.to_string()));
                 }
             }
             _ => {}

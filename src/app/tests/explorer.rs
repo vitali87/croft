@@ -3254,3 +3254,65 @@ fn a_click_on_the_explorer_outline_still_jumps_with_the_secondary_bar_up() {
         "the caret moves to sym_004's line"
     );
 }
+
+fn new_file_prompt(app: &mut App, tmp: &std::path::Path) {
+    app.open_create_prompt(CreateKind::File, tmp.to_path_buf());
+}
+
+fn type_into_prompt(app: &mut App, text: &str) {
+    for c in text.chars() {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+            .unwrap();
+    }
+}
+
+#[test]
+fn the_new_file_prompt_edits_at_a_caret() {
+    // New File, New Folder and Rename used to append and pop at the end only:
+    // a typo in the middle of a name meant retyping the tail.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    new_file_prompt(&mut app, tmp.path());
+    type_into_prompt(&mut app, "mian.rs");
+    // Six Lefts put the caret after the "m"; drop the "i", step over the "a"
+    // and put the "i" back where it belongs.
+    for _ in 0..6 {
+        app.handle_key(key(KeyCode::Left, KeyModifiers::NONE))
+            .unwrap();
+    }
+    app.handle_key(key(KeyCode::Delete, KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Right, KeyModifiers::NONE))
+        .unwrap();
+    type_into_prompt(&mut app, "i");
+    let p = app.prompt.as_ref().expect("prompt stays open");
+    assert_eq!(p.buffer, "main.rs");
+    app.handle_key(key(KeyCode::Home, KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Delete, KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::End, KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Backspace, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.prompt.as_ref().unwrap().buffer, "ain.r");
+}
+
+#[test]
+fn the_new_file_prompt_walks_and_deletes_by_word_and_takes_a_paste_at_the_caret() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    new_file_prompt(&mut app, tmp.path());
+    type_into_prompt(&mut app, "docs/old name.md");
+    app.handle_key(key(KeyCode::Backspace, KeyModifiers::CONTROL))
+        .unwrap();
+    assert_eq!(app.prompt.as_ref().unwrap().buffer, "docs/old name.");
+    app.handle_key(key(KeyCode::Left, KeyModifiers::CONTROL))
+        .unwrap();
+    app.handle_paste("X\nY");
+    let p = app.prompt.as_ref().unwrap();
+    assert_eq!(
+        p.buffer, "docs/old XYname.",
+        "paste drops the newline and lands at the caret"
+    );
+}

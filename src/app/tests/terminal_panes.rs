@@ -2747,6 +2747,7 @@ fn a_new_profile_prompt_refuses_an_unsafe_name_in_place() {
     app.prompt = Some(Prompt {
         label: String::from("New profile name"),
         buffer: String::from("../escape"),
+        caret: usize::MAX,
         kind: PromptKind::NewProfile,
         target_dir: tmp.path().to_path_buf(),
         error: None,
