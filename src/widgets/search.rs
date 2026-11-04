@@ -16,6 +16,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use unicode_width::UnicodeWidthStr;
 
+use crate::glob_list::split_globs;
+
 const MAX_LINE_LEN: usize = 200;
 
 /// Per-channel lift applied to the theme background to fill an idle input row,
@@ -350,28 +352,6 @@ fn build_searcher() -> Searcher {
 pub struct PathFilter {
     include: Option<GlobSet>,
     exclude: Option<GlobSet>,
-}
-
-/// The entries of a comma-separated glob list. Commas inside `{...}`
-/// belong to a brace alternate, so `*.{ts,tsx}, docs/**` is two entries
-/// (#1251).
-pub(crate) fn split_globs(raw: &str) -> impl Iterator<Item = &str> {
-    let mut depth = 0usize;
-    let mut start = 0;
-    let mut parts = Vec::new();
-    for (i, c) in raw.char_indices() {
-        match c {
-            '{' => depth += 1,
-            '}' => depth = depth.saturating_sub(1),
-            ',' if depth == 0 => {
-                parts.push(&raw[start..i]);
-                start = i + 1;
-            }
-            _ => {}
-        }
-    }
-    parts.push(&raw[start..]);
-    parts.into_iter().map(str::trim).filter(|p| !p.is_empty())
 }
 
 fn compile_glob(pat: &str) -> Option<Glob> {

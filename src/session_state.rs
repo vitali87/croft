@@ -21,7 +21,7 @@ pub struct OpenTabState {
     /// column, value), applied over the workbook as it opens. A CSV/TSV grid keeps
     /// its edits as `unsaved_text` instead, the text its save would write.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub sheet_cells: Vec<crate::widgets::editor::SheetCellEdit>,
+    pub sheet_cells: Vec<crate::sheet::SheetCellEdit>,
 }
 
 /// The slice of running-croft state worth carrying across a self-re-exec.

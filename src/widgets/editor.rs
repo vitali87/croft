@@ -15,6 +15,7 @@ use crate::highlight::{
     HiSpan, LangKind, LangRegistry, compute_line_starts, decode_semantic_tokens, language_label,
 };
 use crate::packed_lines::PackedLines;
+pub use crate::sheet::SheetCellEdit;
 pub use crate::text_edit::TextSpanEdit;
 use crate::widgets::scrollbar;
 
@@ -2292,12 +2293,6 @@ type ColumnBoxCarets = (
     Option<EditorSelection>,
     Vec<EditorSelection>,
 );
-
-/// An xlsx grid's edited cell as hot exit keeps it (#1593):
-/// `(sheet name, row, col, value)`. The worksheet goes by its name, which
-/// a workbook keeps unique, so a reorder since the backup does not put the
-/// value on another worksheet.
-pub type SheetCellEdit = (String, usize, usize, String);
 
 /// Apply `edits` to `lines` (char-indexed coords), bottom-to-top so an
 /// earlier replacement never shifts the coordinates of a later one. Returns
