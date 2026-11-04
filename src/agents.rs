@@ -319,7 +319,7 @@ impl AgentTable {
         // Row by row, so one malformed row (or a trailing comma) no longer
         // drops every agent the user added.
         let rows: Vec<AgentRow> =
-            serde_json::from_str::<Vec<serde_json::Value>>(&crate::tasks::strip_jsonc(json))
+            serde_json::from_str::<Vec<serde_json::Value>>(&crate::jsonc::strip_jsonc(json))
                 .unwrap_or_default()
                 .into_iter()
                 .filter_map(|r| serde_json::from_value(r).ok())

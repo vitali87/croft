@@ -194,7 +194,7 @@ impl TriggerSet {
         // dropped EVERY rule the user wrote, redact rules included, while
         // the reload status still counted the built-ins as active.
         let rows: Vec<serde_json::Value> =
-            match serde_json::from_str(&crate::tasks::strip_jsonc(json)) {
+            match serde_json::from_str(&crate::jsonc::strip_jsonc(json)) {
                 Ok(rows) => rows,
                 Err(e) => {
                     return Self {

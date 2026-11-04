@@ -10,7 +10,7 @@ use serde_json::{Map, Value};
 /// and layout. `None` when `text` is not a JSONC object or an edit cannot
 /// be placed; the caller then writes `new` as plain JSON.
 pub fn update(text: &str, new: &Value) -> Option<String> {
-    let old: Value = serde_json::from_str(&crate::tasks::strip_jsonc(text)).ok()?;
+    let old: Value = serde_json::from_str(&crate::jsonc::strip_jsonc(text)).ok()?;
     let (Value::Object(old), Value::Object(new_obj)) = (&old, new) else {
         return None;
     };
@@ -21,7 +21,7 @@ pub fn update(text: &str, new: &Value) -> Option<String> {
         out = apply(&out, path, value.as_ref())?;
     }
     // Whatever the edits did, the file must say exactly `new`.
-    let check: Value = serde_json::from_str(&crate::tasks::strip_jsonc(&out)).ok()?;
+    let check: Value = serde_json::from_str(&crate::jsonc::strip_jsonc(&out)).ok()?;
     (check == *new).then_some(out)
 }
 
@@ -297,7 +297,7 @@ fn edit_array(text: &str, at: usize, new: &[Value]) -> Option<String> {
         .members
         .iter()
         .map(|m| {
-            serde_json::from_str(&crate::tasks::strip_jsonc(
+            serde_json::from_str(&crate::jsonc::strip_jsonc(
                 &text[m.value_start..m.value_end],
             ))
             .ok()
@@ -486,7 +486,7 @@ mod tests {
 "#;
 
     fn parsed(text: &str) -> Value {
-        serde_json::from_str(&crate::tasks::strip_jsonc(text)).unwrap()
+        serde_json::from_str(&crate::jsonc::strip_jsonc(text)).unwrap()
     }
 
     fn with(text: &str, edit: impl FnOnce(&mut Map<String, Value>)) -> Value {

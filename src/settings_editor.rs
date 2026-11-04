@@ -269,7 +269,7 @@ pub fn remove_key(text: &str, key: &str, platform: &str) -> Result<Option<String
     if text.trim().is_empty() {
         return Ok(None);
     }
-    let mut map = match serde_json::from_str::<Value>(&crate::tasks::strip_jsonc(text)) {
+    let mut map = match serde_json::from_str::<Value>(&crate::jsonc::strip_jsonc(text)) {
         Ok(Value::Object(m)) => m,
         Ok(_) => return Err(String::from("the settings file is not a JSON object")),
         Err(e) => return Err(format!("the settings file does not parse: {e}")),
