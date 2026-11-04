@@ -48584,11 +48584,16 @@ impl App {
     /// status bar. A buffer with no path on disk cannot hold marks, and says so
     /// rather than silently doing nothing.
     fn toggle_bookmark(&mut self) {
+        self.toggle_bookmark_at(self.editor.cursor_row + 1);
+    }
+
+    /// [`Self::toggle_bookmark`] for a given 1-based `line`, leaving the
+    /// cursor and scroll where they are (the gutter Ctrl+click).
+    fn toggle_bookmark_at(&mut self, line: usize) {
         if !self.editor_is_text() {
             return;
         }
-        let line = self.editor.cursor_row + 1;
-        self.status = match self.editor.toggle_bookmark() {
+        self.status = match self.editor.toggle_bookmark_at(line) {
             Some(true) => format!("Bookmark set on line {line}"),
             Some(false) => format!("Bookmark cleared on line {line}"),
             None => String::from("Save the file before bookmarking a line"),
@@ -62896,8 +62901,7 @@ impl App {
                     } else if let Some(line0) = self.editor.gutter_line_at(m.column, m.row) {
                         // Ctrl+click on the gutter toggles a bookmark on that
                         // line (a plain click there still toggles a breakpoint).
-                        self.editor.goto_line_centered(line0);
-                        self.toggle_bookmark();
+                        self.toggle_bookmark_at(line0 + 1);
                         self.poke_cursor();
                     } else {
                         self.trigger_definition_at(m.column, m.row);
