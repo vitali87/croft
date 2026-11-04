@@ -1721,17 +1721,6 @@ impl SearchPanel {
         }
     }
 
-    /// Insert `s` at the end of the query, replacing the current selection
-    /// (if any) first. Newlines and carriage returns are stripped — search
-    /// queries are single-line.
-    pub fn insert_str_into_query(&mut self, s: &str) {
-        self.delete_selection();
-        let at = self.field_caret(SearchField::Query);
-        let (text, caret) = crate::widgets::line_edit::insert_at(&self.query, at, s);
-        self.query = text;
-        self.store_caret(SearchField::Query, caret);
-    }
-
     /// Mutable handle to the text of whichever field is focused. The Query
     /// field keeps its own `selection`; the other fields share
     /// `field_selection`, so selecting text in one input clears it elsewhere.

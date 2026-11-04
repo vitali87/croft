@@ -52337,16 +52337,22 @@ impl App {
             self.status = String::from("Cmd+V: clipboard is empty");
             return;
         }
+        self.paste_str_into_search(s);
+        self.status = format!(
+            "Cmd+V: pasted into {} field",
+            search_field_name(self.search.field)
+        );
+    }
+
+    /// Paste `s` at the caret of the focused Search field, whichever it is,
+    /// for the clipboard key and the bracketed-paste event alike.
+    fn paste_str_into_search(&mut self, s: &str) {
         self.search.insert_str(s);
         // Replace text doesn't change which files match, so only re-run the
         // scan when the paste landed in a search-affecting field.
         if self.search.field != crate::widgets::search::SearchField::Replace {
             self.submit_search_query();
         }
-        self.status = format!(
-            "Cmd+V: pasted into {} field",
-            search_field_name(self.search.field)
-        );
     }
 
     fn paste_clipboard_into_editor(&mut self, text: Option<&str>) {
@@ -52551,8 +52557,7 @@ impl App {
             }
         }
         if self.sidebar_view == SidebarView::Search && self.focus == Pane::Tree {
-            self.search.insert_str_into_query(s);
-            self.submit_search_query();
+            self.paste_str_into_search(s);
             self.status = format!("Pasted {} chars", s.chars().count());
             return false;
         }
@@ -52579,17 +52584,10 @@ impl App {
             }
             Pane::Terminal => {
                 if self.terminal_find.is_some() {
-                    let mut q = self
-                        .terminal_find
-                        .as_ref()
-                        .map(|st| st.query.clone())
-                        .unwrap_or_default();
-                    for c in s.chars() {
-                        if !c.is_control() {
-                            q.push(c);
-                        }
-                    }
-                    self.terminal_find_set_query(q);
+                    // At the caret, like the clipboard key (#1729).
+                    self.terminal_find_edit_at_caret(|t, at| {
+                        crate::widgets::line_edit::insert_at(t, at, s)
+                    });
                 } else {
                     self.paste_terminal_input(s.as_bytes());
                 }
@@ -61529,6 +61527,22 @@ impl App {
         // broadcast set; a click that switched panes would send it to one
         // that was never checked. Only the popup's keys answer it.
         if self.pending_terminal_paste.is_some() {
+            return;
+        }
+        // A click on a find bar (in the editor or over a terminal) puts the
+        // caret of the row it lands on, before the pane under it sees it.
+        if matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
+            && !self.modal_overlay_open()
+            && self.context_menu.is_none()
+            && (self
+                .editor_find
+                .as_mut()
+                .is_some_and(|f| f.click_at(m.column, m.row))
+                || self
+                    .terminal_find
+                    .as_mut()
+                    .is_some_and(|f| f.click_at(m.column, m.row)))
+        {
             return;
         }
         // A click on the port-detection toast's action buttons is consumed

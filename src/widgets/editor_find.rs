@@ -121,22 +121,64 @@ impl EditorFind {
 
     /// The caret's char index, clamped to the query.
     pub fn caret(&self) -> usize {
-        self.caret.min(self.query.chars().count())
+        crate::widgets::line_edit::clamp(&self.query, self.caret)
+    }
+
+    /// A left click at `(col, row)`. True when it landed on the bar, which
+    /// then owns it: a click on an input row focuses that row and puts its
+    /// caret under the pointer, the way the row was last drawn (the origin
+    /// and scroll come from the same geometry the renderer uses).
+    pub fn click_at(&mut self, col: u16, row: u16) -> bool {
+        let r = self.last_rect;
+        if r.width < 3
+            || r.height < 3
+            || col < r.x
+            || col >= r.x + r.width
+            || row < r.y
+            || row >= r.y + r.height
+        {
+            return false;
+        }
+        let inner_y = r.y + 1;
+        let field = match row.checked_sub(inner_y) {
+            Some(0) => FindField::Query,
+            Some(1) if self.replace_visible => FindField::Replace,
+            _ => return true,
+        };
+        let text_x = r.x + 1 + FIND_MARKER_CELLS;
+        let avail = find_row_avail(r.width.saturating_sub(2));
+        let cell = usize::from(col.saturating_sub(text_x));
+        self.focus = field;
+        match field {
+            FindField::Query => {
+                self.query_selected = false;
+                let win = crate::widgets::line_edit::window(&self.query, self.caret(), avail);
+                let at = crate::widgets::line_edit::char_at_cell(&self.query, win.start, cell);
+                self.set_caret(at);
+            }
+            FindField::Replace => {
+                let win =
+                    crate::widgets::line_edit::window(&self.replace, self.replace_caret(), avail);
+                let at = crate::widgets::line_edit::char_at_cell(&self.replace, win.start, cell);
+                self.set_replace_caret(at);
+            }
+        }
+        true
     }
 
     /// Put the caret at char index `at`, clamped to the query.
     pub fn set_caret(&mut self, at: usize) {
-        self.caret = at.min(self.query.chars().count());
+        self.caret = crate::widgets::line_edit::clamp(&self.query, at);
     }
 
     /// The replace field's caret, clamped to its text.
     pub fn replace_caret(&self) -> usize {
-        self.replace_caret.min(self.replace.chars().count())
+        crate::widgets::line_edit::clamp(&self.replace, self.replace_caret)
     }
 
     /// Put the replace field's caret at char index `at`, clamped.
     pub fn set_replace_caret(&mut self, at: usize) {
-        self.replace_caret = at.min(self.replace.chars().count());
+        self.replace_caret = crate::widgets::line_edit::clamp(&self.replace, at);
     }
 }
 
@@ -563,6 +605,15 @@ pub fn match_index_at_in(
     None
 }
 
+/// Cells the marker (`> ` or `⤷ `) takes at the left of an input row.
+const FIND_MARKER_CELLS: u16 = 2;
+
+/// Cells an input row's text may use in a bar whose inner width is
+/// `inner_width`: the marker and the selection chip's two cells stay free.
+fn find_row_avail(inner_width: u16) -> usize {
+    inner_width.saturating_sub(FIND_MARKER_CELLS + 3).max(1) as usize
+}
+
 pub fn render_editor_find(
     state: &mut EditorFind,
     editor_area: Rect,
@@ -666,10 +717,7 @@ pub fn render_editor_find(
             Style::default().fg(theme.ui(Color::Rgb(0x88, 0xc0, 0xd0))),
         )];
         let chars: Vec<char> = text.chars().collect();
-        let avail = inner
-            .width
-            .saturating_sub(marker.chars().count() as u16 + 3)
-            .max(1) as usize;
+        let avail = find_row_avail(inner.width);
         let win = crate::widgets::line_edit::window(text, caret, avail);
         let caret = crate::widgets::line_edit::clamp(text, caret);
         let before: String = chars[win.start..caret].iter().collect();
