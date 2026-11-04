@@ -1892,6 +1892,24 @@ impl SearchPanel {
         None
     }
 
+    /// The full path of the result row under `(col, row)`, for its hover hint
+    /// (#2008): a row names only the file, so hits in same-named files
+    /// (`mod.rs`, `index.ts`) read the same. `None` off the rows and on the
+    /// scrollbar.
+    pub fn result_path_at(&self, col: u16, row: u16) -> Option<&Path> {
+        let inner = self.last_inner;
+        // The scrollbar takes the right column once the hits overflow, as the
+        // render draws it. Judged by the hits listed now, not the last
+        // frame's bar: hits that stream in under a resting pointer can make
+        // the list overflow before the next render.
+        let overflows = self.hits.len() > self.results_viewport_height();
+        let right = inner.x + inner.width - u16::from(overflows && inner.width > 0);
+        if col < inner.x || col >= right {
+            return None;
+        }
+        self.hit_at_y(row).map(|i| self.hits[i].path.as_path())
+    }
+
     /// Clear the search like VS Code's "Clear Search Results": empty the query
     /// (and the replace text typed against it) and drop every hit, resetting
     /// selection and scroll. The include/exclude glob filters are intentionally
@@ -2048,28 +2066,61 @@ impl SearchPanel {
 
     /// Take in streamed hits, each landing in its final place
     /// ([`Self::hit_order`]) so the list reads the same however the walk
-    /// went. One merge pass over the list, not an insert per hit: a broad
-    /// query streams thousands of files. The selection stays on its hit.
+    /// went. The selection stays on its hit.
+    ///
+    /// This runs on the UI thread for every drain while a scan streams
+    /// (#2007), so its cost must not grow with the hits already listed: each
+    /// arriving file finds its place by binary search, and the listed hits
+    /// are only moved, never compared one by one. Comparing every listed hit
+    /// on each drain made a broad query's results crawl in, the UI busier
+    /// with each file that arrived.
     pub fn add_hits(&mut self, mut batch: Vec<SearchHit>) {
         if batch.is_empty() {
             return;
         }
-        batch.sort_by(|a, b| self.hit_order(a).cmp(&self.hit_order(b)));
+        batch.sort_by_cached_key(|h| {
+            let (root, rel, line) = self.hit_order(h);
+            (root, rel.to_path_buf(), line)
+        });
         let old = std::mem::take(&mut self.hits);
         let selected = (self.selected < old.len()).then_some(self.selected);
         let mut merged = Vec::with_capacity(old.len() + batch.len());
-        let mut new = batch.into_iter().peekable();
-        for (i, hit) in old.into_iter().enumerate() {
-            let key = self.hit_order(&hit);
-            while new.peek().is_some_and(|n| self.hit_order(n) < key) {
-                merged.extend(new.next());
+        let mut rest = old.into_iter();
+        // How many of the listed hits are already in `merged`.
+        let mut moved = 0usize;
+        let mut prev_path: Option<PathBuf> = None;
+        for hit in batch {
+            let pending = rest.as_slice();
+            // The batch is sorted, so every pending hit sorts after the
+            // previous arrival. When that was this same file, a pending hit
+            // of another file is past this whole file: only one of this file
+            // can still go first, and the search is skipped without it.
+            let same_file = prev_path.as_deref() == Some(hit.path.as_path());
+            let n = if same_file && pending.first().is_none_or(|o| o.path != hit.path) {
+                0
+            } else {
+                // A listed hit stays ahead of an equal one arriving.
+                let key = self.hit_order(&hit);
+                pending.partition_point(|o| self.hit_order(o) <= key)
+            };
+            if let Some(s) = selected
+                && (moved..moved + n).contains(&s)
+            {
+                self.selected = merged.len() + (s - moved);
             }
-            if selected == Some(i) {
-                self.selected = merged.len();
+            merged.extend(rest.by_ref().take(n));
+            moved += n;
+            if !same_file {
+                prev_path = Some(hit.path.clone());
             }
             merged.push(hit);
         }
-        merged.extend(new);
+        if let Some(s) = selected
+            && s >= moved
+        {
+            self.selected = merged.len() + (s - moved);
+        }
+        merged.extend(rest);
         self.hits = merged;
     }
 
@@ -4578,6 +4629,59 @@ mod tests {
         assert_eq!((sel.path.clone(), sel.line_no), (root.join("m.rs"), 5));
     }
 
+    /// #2007: hits now find their place by binary search instead of being
+    /// compared against every listed hit, so the list must still come out as
+    /// one full sort would put it, whatever the arrival order, with the
+    /// selection on its hit. One file's hits arriving in two drains, and two
+    /// roots that both hold a file, are the cases the shortcut must not skip.
+    #[test]
+    fn hits_arriving_in_any_order_and_drain_size_list_as_one_sort_would() {
+        let tmp = TempDir::new().unwrap();
+        let outer = tmp.path().to_path_buf();
+        let inner = outer.join("pkg");
+        let mut all: Vec<SearchHit> = Vec::new();
+        for f in 0..60 {
+            let dir = if f % 3 == 0 { &inner } else { &outer };
+            let path = dir.join(format!("d{}/f{f}.rs", f % 7));
+            all.extend((0..f % 5 + 1).map(|l| hit(&path, l * 4 + 1)));
+        }
+        let mut want = SearchPanel::new(outer.clone());
+        want.roots = vec![outer.clone(), inner.clone()];
+        want.add_hits(all.clone());
+        let mut x = 0x9e37_79b9u64;
+        let mut next = move |n: usize| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x as usize) % n.max(1)
+        };
+        for _round in 0..20 {
+            let mut shuffled = all.clone();
+            for i in (1..shuffled.len()).rev() {
+                shuffled.swap(i, next(i + 1));
+            }
+            let mut panel = SearchPanel::new(outer.clone());
+            panel.roots = vec![outer.clone(), inner.clone()];
+            let mut picked: Option<SearchHit> = None;
+            let mut rest = shuffled.as_slice();
+            while !rest.is_empty() {
+                let (drain, after) = rest.split_at(next(8).min(rest.len() - 1) + 1);
+                // A drain holds files in walk order, each file's hits by line.
+                let mut drain = drain.to_vec();
+                drain.sort_by_key(|h| (h.path.clone(), h.line_no));
+                panel.add_hits(drain);
+                rest = after;
+                if let Some(p) = &picked {
+                    assert_eq!(panel.selected_hit(), Some(p), "the selection moved");
+                } else if panel.hits.len() > 3 {
+                    panel.selected = panel.hits.len() / 2;
+                    picked = panel.selected_hit().cloned();
+                }
+            }
+            assert_eq!(panel.hits, want.hits);
+        }
+    }
+
     fn make_panel_with_hits(tmp: &TempDir, n: usize) -> SearchPanel {
         let mut panel = SearchPanel::new(tmp.path().to_path_buf());
         panel.query = "needle".into();
@@ -5996,6 +6100,38 @@ mod tests {
             .unwrap_or_else(|| panic!("no row for {path_line}"))
             .trim_matches(|c| c == '│' || c == ' ')
             .to_string()
+    }
+
+    /// #2008: the right column becomes the scrollbar once the list
+    /// overflows, and a hit that streams in can do that before the next
+    /// render draws the bar: that column then has no path hint.
+    #[test]
+    fn the_column_the_scrollbar_takes_has_no_path_hint() {
+        let tmp = TempDir::new().unwrap();
+        let mut panel = make_panel_with_hits(&tmp, 1);
+        render_panel(&mut panel, 40);
+        let fits = panel.results_viewport_height();
+        panel.hits.clear();
+        panel.add_hits(
+            (0..fits)
+                .map(|i| hit(&tmp.path().join("a.txt"), i + 1))
+                .collect(),
+        );
+        render_panel(&mut panel, 40);
+        let inner = panel.last_inner;
+        let (row, right) = (
+            inner.y + panel.results_start_offset,
+            inner.x + inner.width - 1,
+        );
+        assert_eq!(
+            panel.last_scrollbar,
+            Rect::default(),
+            "precondition: no overflow yet"
+        );
+        assert!(panel.result_path_at(right, row).is_some());
+        panel.add_hits(vec![hit(&tmp.path().join("b.txt"), 1)]);
+        assert_eq!(panel.result_path_at(right, row), None);
+        assert!(panel.result_path_at(right - 1, row).is_some());
     }
 
     fn render_panel(panel: &mut SearchPanel, width: u16) -> Buffer {

@@ -4987,7 +4987,10 @@ pub struct App {
     /// in `ui_tooltip_at`.
     ui_hover: HoverDwell,
     ui_tooltip: Option<crate::widgets::hover_popup::HoverPopup>,
-    ui_tooltip_label: Option<&'static str>,
+    ui_tooltip_label: Option<std::borrow::Cow<'static, str>>,
+    /// The Search list's `(scroll, hits, shown)` when the hint was last read
+    /// against it: [`Self::reread_ui_tooltip`] reads it again on a change.
+    search_hint_view: (usize, usize, bool),
     /// The chrome tooltip's final on-screen rect from the most recent render
     /// (after the activity-bar shift / viewport clamp), or `None` when no
     /// tooltip is showing. Read by the post-draw flush so the box can be
@@ -7578,6 +7581,7 @@ impl App {
             ui_hover: HoverDwell::default(),
             ui_tooltip: None,
             ui_tooltip_label: None,
+            search_hint_view: (0, 0, false),
             ui_tooltip_area: None,
             update_card_rect: None,
             definition_request_id: None,
@@ -11081,6 +11085,28 @@ impl App {
         }
     }
 
+    /// [`Self::ui_tooltip_at`], plus the hints whose text is what sits under
+    /// the pointer rather than a control's name: a Search result row shows
+    /// its file's full path (#2008).
+    fn ui_tooltip_text_at(&self, col: u16, row: u16) -> Option<std::borrow::Cow<'static, str>> {
+        self.search_result_hint_at(col, row)
+            .map(Into::into)
+            .or_else(|| self.ui_tooltip_at(col, row).map(Into::into))
+    }
+
+    /// The full path of the Search result row under `(col, row)` (#2008):
+    /// a row names only the file.
+    fn search_result_hint_at(&self, col: u16, row: u16) -> Option<String> {
+        if !(self.show_tree
+            && self.sidebar_view == SidebarView::Search
+            && rect_contains(self.search.last_area, col, row))
+        {
+            return None;
+        }
+        let path = self.search.result_path_at(col, row)?;
+        Some(path.display().to_string())
+    }
+
     /// The hover-tooltip label for whatever chrome control sits under the
     /// pointer, or `None` over inert space. The single dispatch point for
     /// button hints: each surface contributes one branch that reuses that
@@ -11208,19 +11234,56 @@ impl App {
         })
     }
 
+    /// Read the hint again when the Search list changed under a resting
+    /// pointer (#2008): rows move as hits stream in or the list scrolls by
+    /// wheel, key or scrollbar, and empty when the search is cleared, so a
+    /// hint naming the file that was there would mislabel the row there now.
+    /// A changed hint waits out its own dwell, as one the pointer moved to.
+    /// An empty row a hit fills under the pointer gets its hint too, but a
+    /// control's hint that a click dismissed stays dismissed. Returns whether
+    /// a showing hint was taken down.
+    fn reread_ui_tooltip(&mut self) -> bool {
+        let shown = (
+            self.search.scroll,
+            self.search.hits.len(),
+            self.show_tree && self.sidebar_view == SidebarView::Search,
+        );
+        if std::mem::replace(&mut self.search_hint_view, shown) == shown {
+            return false;
+        }
+        let Some((col, row)) = self.pointer_cell else {
+            return false;
+        };
+        let result = self.search_result_hint_at(col, row);
+        let on_result = result.is_some();
+        let label = result
+            .map(Into::into)
+            .or_else(|| self.ui_tooltip_at(col, row).map(Into::into));
+        if label == self.ui_tooltip_label || (self.ui_tooltip_label.is_none() && !on_result) {
+            return false;
+        }
+        self.ui_hover.clear();
+        if label.is_some() {
+            self.ui_hover.on_move(std::time::Instant::now(), col, row);
+        }
+        self.ui_tooltip_label = label;
+        self.ui_tooltip.take().is_some()
+    }
+
     /// Fire the chrome button-hint tooltip once its dwell crosses
     /// `HOVER_DELAY`. Returns `true` when a tooltip was created so the frame
     /// loop redraws. Suppressed while a context menu is open so the two never
     /// overlap.
     fn poll_ui_tooltip(&mut self) -> bool {
+        let taken_down = self.reread_ui_tooltip();
         if !self.ui_hover.due(std::time::Instant::now(), HOVER_DELAY) {
-            return false;
+            return taken_down;
         }
         self.ui_hover.mark_fired();
         if self.context_menu.is_some() {
             return false;
         }
-        let Some(label) = self.ui_tooltip_label else {
+        let Some(label) = self.ui_tooltip_label.as_deref() else {
             return false;
         };
         let Some((col, row)) = self.ui_hover.cell() else {
@@ -11275,7 +11338,7 @@ impl App {
         // different control, and is left running while it drifts within one.
         // Computed before the tab/editor early-returns so it tracks the
         // pointer everywhere, including over the sidebar.
-        match self.ui_tooltip_at(col, row) {
+        match self.ui_tooltip_text_at(col, row) {
             // Same label AND still on the same row: keep the dwell running so the
             // tooltip persists while the pointer drifts within one control. The
             // row check matters because adjacent controls can share a label (e.g.
@@ -11284,7 +11347,7 @@ impl App {
             // the box would appear detached from the one actually under the
             // pointer.
             Some(label)
-                if self.ui_tooltip_label == Some(label)
+                if self.ui_tooltip_label.as_ref() == Some(&label)
                     && self.ui_hover.cell().map(|(_, r)| r) == Some(row) => {}
             Some(label) => {
                 self.ui_hover.on_move(std::time::Instant::now(), col, row);
