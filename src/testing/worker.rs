@@ -259,19 +259,26 @@ impl RunControl {
     /// recorded under the lock, so a cancel either sees the pid or the
     /// spawn sees the cancel. A runner that is "Text file busy" for a
     /// moment, just installed or a test's freshly written stand-in, is
-    /// waited out rather than reported as a failed run.
+    /// waited out rather than reported as a failed run. The lock is let go
+    /// between tries, so a cancel from the UI never waits on that, and the
+    /// next try sees it.
     fn spawn(&self, request: u64, cmd: &mut Command) -> Option<std::io::Result<Child>> {
         use std::os::unix::process::CommandExt;
-        let mut running = self.running.lock().unwrap();
-        if self.is_cancelled(request) {
-            return None;
-        }
         cmd.process_group(0);
-        let child = crate::review_ops::spawn_retrying_busy(cmd);
-        if let Ok(c) = &child {
-            *running = i32::try_from(c.id()).ok();
-        }
-        Some(child)
+        crate::review_ops::retry_while_busy(
+            || {
+                let mut running = self.running.lock().unwrap();
+                if self.is_cancelled(request) {
+                    return None;
+                }
+                let child = cmd.spawn();
+                if let Ok(c) = &child {
+                    *running = i32::try_from(c.id()).ok();
+                }
+                Some(child)
+            },
+            |r| matches!(r, Some(Err(e)) if crate::review_ops::text_file_busy(e)),
+        )
     }
 
     fn finished(&self) {
@@ -2195,18 +2202,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_runner_busy_for_a_moment_after_writing_still_starts() {
-        use std::io::Write as _;
-        use std::os::unix::fs::OpenOptionsExt;
         let tmp = tempfile::tempdir().unwrap();
-        let bin = tmp.path().join("runner");
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o755)
-            .open(&bin)
-            .unwrap();
-        f.write_all(b"#!/bin/sh\nexit 0\n").unwrap();
-        f.flush().unwrap();
+        let (bin, f) = busy_runner(tmp.path());
         let writer = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(100));
             drop(f);
@@ -2219,6 +2216,43 @@ mod tests {
             .expect("the busy runner starts once its writer lets go");
         assert!(child.wait().unwrap().success());
         writer.join().unwrap();
+    }
+
+    /// A stand-in runner in `dir` and the handle that keeps it open for
+    /// writing, so exec says "Text file busy" until the handle is dropped.
+    #[cfg(unix)]
+    fn busy_runner(dir: &Path) -> (PathBuf, std::fs::File) {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt;
+        let bin = dir.join("runner");
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o755)
+            .open(&bin)
+            .unwrap();
+        f.write_all(b"#!/bin/sh\nexit 0\n").unwrap();
+        f.flush().unwrap();
+        (bin, f)
+    }
+
+    /// A cancel while a busy runner is being waited out lands at once
+    /// rather than after the wait, and the run starts nothing.
+    #[cfg(unix)]
+    #[test]
+    fn a_cancel_stops_the_wait_for_a_busy_runner() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (bin, writer) = busy_runner(tmp.path());
+        let control = RunControl::default();
+        let spawner = {
+            let control = control.clone();
+            std::thread::spawn(move || control.spawn(1, &mut Command::new(&bin)))
+        };
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        control.cancel(1);
+        let spawned = spawner.join().unwrap();
+        assert!(spawned.is_none(), "the cancel ends the wait: {spawned:?}");
+        drop(writer);
     }
 
     /// A stand-in `codeql` in `dir` that logs its arguments and prints
