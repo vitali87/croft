@@ -111,7 +111,7 @@ pub enum ListPurpose {
     /// Output: Select Channel… (#852): the OUTPUT channels, `id` the
     /// channel's name.
     OutputChannel,
-    /// Bookmarks: Go to Bookmark…: every bookmark in the open files; `id` is
+    /// Bookmarks: View Bookmarks: every bookmark in the open files; `id` is
     /// `<line>\t<path>` (1-based line), a tab being no part of a line number.
     Bookmark,
     /// Where to add a CodeQL database from (#578): `id` is an index into

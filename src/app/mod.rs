@@ -25923,6 +25923,12 @@ impl App {
                 self.undo_close_terminal();
                 true
             }
+            // Cmd+K Cmd+W (Ctrl+K Ctrl+W off macOS): View Bookmarks. Needs the
+            // trailing Cmd, so plain `Cmd+K W` below still closes every tab.
+            KeyCode::Char(c) if plain && cmd_held && c.eq_ignore_ascii_case(&'w') => {
+                self.open_bookmark_picker();
+                true
+            }
             // Cmd+K Shift+W: reopen the most recently closed editor tab
             // (VS Code "Reopen Closed Editor"; ⇧W pairs with Cmd+W the way
             // ⇧T pairs with the terminal close). Matched case-insensitively
@@ -48612,7 +48618,7 @@ impl App {
         };
     }
 
-    /// Bookmarks: Go to Bookmark…: a filterable list of every bookmark in
+    /// Bookmarks: View Bookmarks: a filterable list of every bookmark in
     /// the open tabs (`file:line  text of the line`), Enter jumps to it.
     fn open_bookmark_picker(&mut self) {
         use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
@@ -48650,7 +48656,7 @@ impl App {
                 });
             }
         }
-        let picker = ListPicker::new(ListPurpose::Bookmark, "Go to Bookmark", rows);
+        let picker = ListPicker::new(ListPurpose::Bookmark, "Bookmarks", rows);
         self.open_list_picker(picker, "No bookmarks (Cmd+Opt+Shift+K sets one)");
     }
 
@@ -57814,7 +57820,7 @@ impl App {
             Cmd::NextBookmark => self.goto_bookmark(true),
             Cmd::PreviousBookmark => self.goto_bookmark(false),
             Cmd::ClearBookmarks => self.clear_bookmarks(),
-            Cmd::GoToBookmark => self.open_bookmark_picker(),
+            Cmd::ViewBookmarks => self.open_bookmark_picker(),
             Cmd::SaveFile => self.save(),
             Cmd::SaveAs => self.open_save_as_prompt(),
             Cmd::SaveWithSudo => self.save_with_sudo(),
@@ -62886,6 +62892,12 @@ impl App {
                 if in_editor && m.modifiers.contains(KeyModifiers::CONTROL) {
                     if m.modifiers.contains(KeyModifiers::SHIFT) {
                         self.nav_back();
+                    } else if let Some(line0) = self.editor.gutter_line_at(m.column, m.row) {
+                        // Ctrl+click on the gutter toggles a bookmark on that
+                        // line (a plain click there still toggles a breakpoint).
+                        self.editor.goto_line_centered(line0);
+                        self.toggle_bookmark();
+                        self.poke_cursor();
                     } else {
                         self.trigger_definition_at(m.column, m.row);
                     }

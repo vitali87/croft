@@ -2285,7 +2285,7 @@ fn the_palette_offers_the_move_editor_commands() {
     assert_eq!(tab_names_852(&app.editor), ["a.py", "c.py", "b.py"]);
 }
 
-/// Bookmarks: Go to Bookmark… lists the marks of every open tab, and picking
+/// Bookmarks: View Bookmarks lists the marks of every open tab, and picking
 /// a row opens that file at the marked line.
 #[test]
 fn the_bookmark_picker_lists_every_tabs_marks_and_jumps_to_one() {
@@ -2297,7 +2297,7 @@ fn the_bookmark_picker_lists_every_tabs_marks_and_jumps_to_one() {
     std::fs::write(&a, "alpha\nbeta\ngamma\n").unwrap();
     std::fs::write(&b, "one\ntwo\nthree\n").unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.run_command(Command::GoToBookmark);
+    app.run_command(Command::ViewBookmarks);
     assert!(app.list_picker.is_none(), "no bookmarks, no picker");
     assert!(app.status.contains("No bookmarks"), "was {:?}", app.status);
 
@@ -2307,7 +2307,7 @@ fn the_bookmark_picker_lists_every_tabs_marks_and_jumps_to_one() {
     app.editor.open_in_new_tab(&b).unwrap();
     app.editor.cursor_row = 2;
     app.editor.toggle_bookmark();
-    app.run_command(Command::GoToBookmark);
+    app.run_command(Command::ViewBookmarks);
     let picker = app.list_picker.as_ref().expect("the picker opens");
     assert_eq!(picker.purpose, ListPurpose::Bookmark);
     let labels: Vec<&str> = picker.rows.iter().map(|r| r.label.as_str()).collect();
