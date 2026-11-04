@@ -25923,9 +25923,10 @@ impl App {
                 self.undo_close_terminal();
                 true
             }
-            // Cmd+K Cmd+W (Ctrl+K Ctrl+W off macOS): View Bookmarks. Needs the
-            // trailing Cmd, so plain `Cmd+K W` below still closes every tab.
-            KeyCode::Char(c) if plain && cmd_held && c.eq_ignore_ascii_case(&'w') => {
+            // Cmd+K Cmd+M (Ctrl+K Ctrl+M off macOS): View Bookmarks. Needs the
+            // trailing Cmd, so plain `Cmd+K M` below still maximizes the
+            // terminal pane.
+            KeyCode::Char(c) if plain && cmd_held && c.eq_ignore_ascii_case(&'m') => {
                 self.open_bookmark_picker();
                 true
             }

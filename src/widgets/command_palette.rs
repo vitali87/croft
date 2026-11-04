@@ -1699,7 +1699,7 @@ impl Command {
             Command::NextBookmark => "Cmd+Opt+.",
             Command::PreviousBookmark => "Cmd+Opt+,",
             Command::ClearBookmarks => "Cmd+Opt+Shift+B",
-            Command::ViewBookmarks => "Cmd+K Cmd+W",
+            Command::ViewBookmarks => "Cmd+K Cmd+M",
             Command::FormatDocument => "Cmd+Opt+Shift+F",
             Command::FormatSelection => "Cmd+K Cmd+F",
             Command::ChangeColorPresentation => "",
