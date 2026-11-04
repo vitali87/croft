@@ -440,7 +440,8 @@ pub enum CliCommand {
     Devcontainer {
         /// Workspace folder (default: the current directory).
         path: Option<std::path::PathBuf>,
-        /// Replace the existing container even if the config is unchanged.
+        /// Replace the existing container, discarding changes made inside
+        /// it. Without it, an edited config keeps the container and says so.
         #[arg(long, default_value_t = false)]
         rebuild: bool,
     },
@@ -864,7 +865,7 @@ impl Cli {
                     );
                     std::process::exit(1);
                 };
-                let path = crate::prefs::config_dir()
+                let path = crate::paths::config_dir()
                     .join("locales")
                     .join(format!("{code}.json"));
                 if write {

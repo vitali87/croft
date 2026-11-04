@@ -23,7 +23,7 @@ croft devcontainer [folder]  # open a folder inside its dev container (.devconta
 
 `croft remote <host>` installs itself on the box on first connect with no manual prep, and a stock cloud image works as-is. See [LINUX.md](LINUX.md#remote-croft-remote-host) for how the cross-compile and host provisioning work.
 
-`croft devcontainer` builds or pulls the image in `devcontainer.json`, starts the container with the folder mounted, runs `postCreateCommand` once, installs croft into it the same way, and runs it there. It supports `image`, `build`, `mounts`, `forwardPorts`, `postCreateCommand`, `workspaceFolder`, `containerEnv`, `remoteUser` and `runArgs`. The next run reuses the container, and an edited config (or `--rebuild`) replaces it.
+`croft devcontainer` builds or pulls the image in `devcontainer.json`, starts the container with the folder mounted, runs `postCreateCommand` once, installs croft into it the same way, and runs it there. It supports `image`, `build`, `mounts`, `forwardPorts`, `postCreateCommand`, `workspaceFolder`, `containerEnv`, `remoteUser` and `runArgs`. The next run reuses the container. When `devcontainer.json` has changed since (comments and formatting don't count), it keeps the container and says so, since replacing it discards everything made inside it. `--rebuild` replaces it, and refuses while croft is still running in it from another terminal.
 
 ## Persistent sessions
 

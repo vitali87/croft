@@ -47,7 +47,7 @@ pub struct Snapshot {
 /// The real history root, `~/.config/croft/history`. The App caches this in a
 /// field so tests can point it at a tempdir.
 pub fn history_dir() -> PathBuf {
-    crate::prefs::config_dir().join("history")
+    crate::paths::config_dir().join("history")
 }
 
 /// The `short_hash` sentinel prefix marking a TIMELINE row as a local

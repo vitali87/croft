@@ -1,6 +1,6 @@
 [package]
 name = "croft-software"
-version = "0.2.106"
+version = "0.2.109"
 edition = "2024"
 description = "VSCode-style TUI written in Rust"
 license = "MIT"
@@ -126,7 +126,7 @@ futures = "0.3"
 # is not "linux", so waitpid-any has no backend module). Dropping it lets
 # croft build under Termux while changing nothing on macOS/Linux.
 async-lsp = { version = "0.2", default-features = false, features = ["omni-trait", "stdio", "tracing", "tokio"] }
-lsp-types = "0.95"
+lsp-types = { version = "0.95", features = ["proposed"] }
 tower = "0.5"
 tui-input = "0.15"
 plist = "1.9"

@@ -1453,7 +1453,7 @@ fn read_or_refuse(path: &Path, report: &mut Report) -> (Option<Value>, bool) {
 /// leaving it alone is also what makes a second run a no-op.
 pub fn apply(report: &mut Report) -> Result<Vec<PathBuf>> {
     apply_into_dirs(
-        &crate::prefs::config_dir(),
+        &crate::paths::config_dir(),
         &crate::lsp::manifest::user_extensions_dir(),
         report,
     )
