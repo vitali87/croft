@@ -82,7 +82,7 @@ pub struct FixedStore {
 
 impl FixedStore {
     pub fn path() -> PathBuf {
-        crate::app::croft_cache_dir().join("sarif-fixed.json")
+        crate::paths::croft_cache_dir().join("sarif-fixed.json")
     }
 
     pub fn load() -> FixedStore {
@@ -333,7 +333,7 @@ pub fn columns_text(cols: &[ExtraColumn]) -> String {
 
 /// Where the column choice is kept, so every viewer opens with it.
 fn columns_path() -> PathBuf {
-    crate::app::croft_cache_dir().join("sarif-columns")
+    crate::paths::croft_cache_dir().join("sarif-columns")
 }
 
 /// The saved column choice; none when unset or unreadable.

@@ -279,7 +279,7 @@ pub fn local_files() -> Vec<(Syncable, PathBuf)> {
 
 /// Where the synced settings projection is written before it is pushed.
 fn projection_dir() -> PathBuf {
-    crate::app::croft_cache_dir().join("config-sync")
+    crate::paths::croft_cache_dir().join("config-sync")
 }
 
 /// The local file to push for `s`, if there is one. A whole-file syncable
@@ -437,7 +437,7 @@ pub struct SyncState {
 
 impl SyncState {
     pub fn path() -> PathBuf {
-        crate::app::croft_cache_dir().join("config-sync.json")
+        crate::paths::croft_cache_dir().join("config-sync.json")
     }
 
     /// Unreadable or absent state is empty state, which is the careful one.

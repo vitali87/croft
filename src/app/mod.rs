@@ -49,6 +49,8 @@ use welcome::WelcomeState;
 
 use crate::lsp::manager::CompletionTrigger;
 use crate::lsp::manager::{diagnostics_by_source, diagnostics_source, diagnostics_store_key};
+use crate::paths::croft_cache_dir;
+use crate::theme::BRAND_ORANGE;
 use crate::widgets::terminal::cwd_of_pid;
 
 use crate::widgets::{
@@ -1014,11 +1016,6 @@ fn git_status_spans<'a>(status: &'a crate::git::GitStatus) -> Vec<Span<'a>> {
     }
     spans
 }
-
-/// Logo orange (#e97c41), sampled from `assets/logo.png`: the colour of the
-/// `<>` angle brackets in the "cr<>ft" wordmark. Also the Extensions panel's
-/// trash button — the warm complement to the teal brand gradient.
-pub(crate) const BRAND_ORANGE: Color = Color::Rgb(0xe9, 0x7c, 0x41);
 
 /// Spans for the "cr<>ft" wordmark at the left of the status bar, styled to
 /// mirror the app logo: white letters with the `<>` (the stylised "o") in the
@@ -80751,15 +80748,6 @@ fn remote_persistence_status(is_remote: bool, persistent: bool) -> Option<&'stat
     }
 }
 
-/// Test-only redirect for [`croft_cache_dir`], so the relay tests steer the
-/// relay rendezvous without repointing the process-global `$HOME` (#37):
-/// every concurrent test thread resolves `$HOME` at call time (the PDF
-/// rasteriser's scratch dir, the session paths), and a substituted value
-/// leaking across threads made unrelated tests fail inside the fake home.
-#[cfg(test)]
-pub static CACHE_DIR_OVERRIDE_FOR_TEST: std::sync::Mutex<Option<PathBuf>> =
-    std::sync::Mutex::new(None);
-
 /// Run `cmd` for at most `budget`, collecting stdout; None when it could not
 /// start or ran out of time (it is then killed and reaped). For the few
 /// short commands that still run on the UI thread.
@@ -81221,17 +81209,6 @@ fn utf16_col_to_char_in(line: &str, units: i64) -> usize {
             seen <= units
         })
         .count()
-}
-
-pub(crate) fn croft_cache_dir() -> PathBuf {
-    #[cfg(test)]
-    if let Some(dir) = CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap().clone() {
-        return dir;
-    }
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    home.join(".cache").join("croft")
 }
 
 /// The per-process self-install log: two drift-armed croft instances on one

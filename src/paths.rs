@@ -1,6 +1,7 @@
 //! Where croft keeps its files on disk: the config directory (settings,
-//! keybindings, user extensions) and the state directory (data that is the
-//! user's own and must outlive a cache clean).
+//! keybindings, user extensions), the state directory (data that is the
+//! user's own and must outlive a cache clean) and the cache directory (what
+//! can be rebuilt).
 //!
 //! These are leaf helpers with no dependency on the rest of croft, so any
 //! module can find its files without reaching into `prefs` (and through it,
@@ -47,6 +48,28 @@ fn state_dir_from(
         .join(".local")
         .join("state")
         .join("croft")
+}
+
+/// Test-only redirect for [`croft_cache_dir`], so the relay tests steer the
+/// relay rendezvous without repointing the process-global `$HOME` (#37):
+/// every concurrent test thread resolves `$HOME` at call time (the PDF
+/// rasteriser's scratch dir, the session paths), and a substituted value
+/// leaking across threads made unrelated tests fail inside the fake home.
+#[cfg(test)]
+pub static CACHE_DIR_OVERRIDE_FOR_TEST: std::sync::Mutex<Option<PathBuf>> =
+    std::sync::Mutex::new(None);
+
+/// croft's cache directory, `~/.cache/croft`: downloads, scratch files and
+/// anything else that can be rebuilt, so a cache clean costs nothing but time.
+pub(crate) fn croft_cache_dir() -> PathBuf {
+    #[cfg(test)]
+    if let Some(dir) = CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap().clone() {
+        return dir;
+    }
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    home.join(".cache").join("croft")
 }
 
 #[cfg(test)]

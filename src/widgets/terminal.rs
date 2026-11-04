@@ -1630,7 +1630,7 @@ pub(crate) fn apply_pane_bin(cmd: &mut CommandBuilder, bin: Option<&std::path::P
 /// written; the pane then finds `croft` on the user's PATH, as before.
 fn pane_bin_dir() -> Option<std::path::PathBuf> {
     let exe = live_exe(std::env::current_exe().ok()?)?;
-    crate::shell_integration::ensure_pane_bin(&crate::app::croft_cache_dir(), &exe).ok()
+    crate::shell_integration::ensure_pane_bin(&crate::paths::croft_cache_dir(), &exe).ok()
 }
 
 impl PtyTerminal {
