@@ -3,7 +3,7 @@
 //! A leaf module, so every reader can share it without depending on `tasks`.
 
 /// Strip `//` and `/* */` comments (outside strings) plus trailing commas
-/// so VS Code's JSONC tasks.json parses with strict serde_json. Two
+/// so VS Code style JSONC parses with strict serde_json. Two
 /// passes: comments first, then trailing commas, so a comma followed by
 /// a comment followed by `}` still counts as trailing. Every JSONC
 /// reader in croft (tasks.json, launch.json, settings layers, keybindings,
