@@ -132,6 +132,7 @@ mod termux;
 mod test_budget;
 mod testing;
 mod tex_text;
+mod text_edit;
 mod theme;
 mod tour;
 mod triggers;
