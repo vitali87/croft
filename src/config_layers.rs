@@ -181,7 +181,7 @@ pub fn workspace_local_config_path(root: &Path) -> PathBuf {
 /// Path of the machine-local user layer. Test builds read the user layers
 /// from [`user_layers_dir`] instead, so this path is not in their chain.
 pub fn user_local_config_path() -> PathBuf {
-    crate::prefs::config_dir().join("config.local.json")
+    crate::paths::config_dir().join("config.local.json")
 }
 
 /// Load the full merged view for a workspace (or just the user layers when
@@ -202,7 +202,7 @@ fn user_layers_dir() -> PathBuf {
         // change is saved; reading the bare config dir dropped them all.
         crate::profiles::file("config.json")
             .parent()
-            .map_or_else(crate::prefs::config_dir, Path::to_path_buf)
+            .map_or_else(crate::paths::config_dir, Path::to_path_buf)
     }
 }
 
@@ -795,7 +795,7 @@ mod tests {
     fn a_test_build_reads_the_user_layers_outside_the_config_dir() {
         let dir = user_layers_dir();
         assert!(
-            !dir.starts_with(crate::prefs::config_dir()),
+            !dir.starts_with(crate::paths::config_dir()),
             "user layers read from the real config dir: {}",
             dir.display()
         );

@@ -146,7 +146,7 @@ pub fn root_display_labels(roots: &[PathBuf]) -> Vec<String> {
 /// empty list prunes its key, so plain single-folder workspaces never
 /// grow the file.
 pub fn folders_store_path() -> PathBuf {
-    crate::prefs::config_dir().join("workspace_folders.json")
+    crate::paths::config_dir().join("workspace_folders.json")
 }
 
 /// Load the whole map for READING: a missing file is an empty map (the

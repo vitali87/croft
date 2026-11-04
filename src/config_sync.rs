@@ -269,7 +269,7 @@ fn is_own_write(path: &std::path::Path, seen: Option<Stamp>, current: Option<Sta
 /// is the common case, not a fault, and pushing a zero-byte file would
 /// blank whatever the remote had.
 pub fn local_files() -> Vec<(Syncable, PathBuf)> {
-    let dir = crate::prefs::config_dir();
+    let dir = crate::paths::config_dir();
     let out = projection_dir();
     SYNCABLE
         .iter()
@@ -332,7 +332,7 @@ pub fn apply_exclusions(
 /// Every syncable file's local path, present or not: what a live re-push
 /// watches, so a file created mid-session is sent too.
 pub fn watched_local_paths() -> Vec<PathBuf> {
-    let dir = crate::prefs::config_dir();
+    let dir = crate::paths::config_dir();
     SYNCABLE.iter().map(|s| dir.join(s.source)).collect()
 }
 

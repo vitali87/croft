@@ -828,9 +828,14 @@ impl SarifView {
                 for i in 0..super::fixes::fix_count(result) {
                     let what = super::fixes::fix_description(result, i).unwrap_or_default();
                     out.push(format!("Fix {}: {what}", i + 1));
-                    match super::fixes::fix_for(run, result, i, &resolver, &mut |p| {
-                        std::fs::read_to_string(p).ok()
-                    }) {
+                    match super::fixes::fix_for(
+                        run,
+                        result,
+                        i,
+                        &resolver,
+                        &mut |p| std::fs::read_to_string(p).ok(),
+                        &|p| super::fixes::saved_after(p, &loaded.path, run),
+                    ) {
                         Ok(edits) => out.extend(super::fixes::preview(&edits)),
                         Err(why) => out.push(format!("cannot apply: {why}")),
                     }

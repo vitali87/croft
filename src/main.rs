@@ -84,6 +84,7 @@ mod packed_lines;
 mod pair;
 mod pair_host;
 mod pane_host;
+mod paths;
 mod pdf;
 mod permalink;
 mod plot;

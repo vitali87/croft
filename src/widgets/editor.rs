@@ -3340,10 +3340,10 @@ pub struct Editor {
     /// Clickable lens spans painted this frame: `(screen y, x range, index
     /// into code_lenses)`. Cleared at render start, like the merge spans.
     pub code_lens_spans: Vec<(u16, std::ops::Range<u16>, usize)>,
-    /// An inline AI suggestion (#607): `(row, col, edit_seq, text)`, painted
-    /// as ghost text at the caret while the caret, the buffer and the row
-    /// are all still where the suggestion was asked for.
-    pub ghost: Option<(usize, usize, u64, String)>,
+    /// An inline suggestion (#607), painted as ghost text at the caret while
+    /// the caret, the buffer and the row are all still where it was asked
+    /// for. One that replaces part of the line strikes that part through.
+    pub ghost: Option<crate::inline_complete::Ghost>,
     /// Per-source-line git blame for the current file, index 0 = line 1. Set
     /// by the app off-thread once per (file, HEAD); `None` until fetched or
     /// when blame is disabled. Drives the GitLens-style current-line inline
@@ -11129,9 +11129,15 @@ impl Editor {
     /// The inline suggestion (#607) when it still applies: the caret where it
     /// was asked for and no edit since.
     pub fn live_ghost(&self) -> Option<&str> {
-        let (row, col, seq, text) = self.ghost.as_ref()?;
-        (*row == self.cursor_row && *col == self.cursor_col && *seq == self.edit_seq)
-            .then_some(text.as_str())
+        self.live_ghost_full().map(|g| g.text.as_str())
+    }
+
+    /// [`Self::live_ghost`] with the columns of the caret's line it replaces,
+    /// when it is a language server's replacement.
+    pub fn live_ghost_full(&self) -> Option<&crate::inline_complete::Ghost> {
+        let g = self.ghost.as_ref()?;
+        (g.row == self.cursor_row && g.col == self.cursor_col && g.seq == self.edit_seq)
+            .then_some(g)
     }
 
     /// Indices of the code lenses on 0-based `line` whose line still reads
@@ -20270,6 +20276,23 @@ impl Widget for &mut Editor {
                 }
             }
 
+            // A language server's replacement strikes through the columns it
+            // takes the place of, and its text stands one cell clear of them.
+            let replaces = self
+                .live_ghost_full()
+                .and_then(|g| g.replaces.clone())
+                .filter(|_| self.focused && line_idx == self.cursor_row);
+            if let Some(r) = &replaces {
+                let (vs, ve) = (row_cells.cell(r.start), row_cells.end(r.end));
+                if ve > vs {
+                    let struck = crate::lsp::manager::DiagnosticTags {
+                        unnecessary: true,
+                        deprecated: true,
+                    };
+                    paint_diagnostic_tags(buf, text_x, y, row_width, vs, ve, struck);
+                }
+            }
+
             // Inline suggestion (#607): the first line as ghost text right at
             // the caret (suggestions are only asked for at a line's end); the
             // rest hang below as `VisRow::Ghost` rows (#1625), and only lines
@@ -20280,7 +20303,7 @@ impl Widget for &mut Editor {
                 && row_end >= line_len
                 && self.live_ghost().is_some();
             if ghost_here && let Some(text) = self.live_ghost() {
-                let text_cols = row_cells.cell(line_len);
+                let text_cols = row_cells.cell(line_len) + usize::from(replaces.is_some());
                 let x = text_x + text_cols as u16;
                 let right = inner.x + inner.width;
                 if x < right {
@@ -25234,7 +25257,12 @@ mod tests {
         e.cursor_row = 0;
         e.cursor_col = 5;
         let wide: String = "\u{4e2d}".repeat(60);
-        e.ghost = Some((0, 5, e.edit_seq, format!("\n{wide}")));
+        e.ghost = Some(crate::inline_complete::Ghost::insert(
+            0,
+            5,
+            e.edit_seq,
+            format!("\n{wide}"),
+        ));
         let area = Rect {
             x: 0,
             y: 0,

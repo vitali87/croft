@@ -65,10 +65,32 @@ fn human(n: usize) -> String {
     }
 }
 
+/// `name` as a Markdown code span, so a pane or file name shows exactly as
+/// it is spelled: no `*`, `_` or `[` in it can start emphasis or a link.
+fn code(name: &str) -> String {
+    let name = name.replace(['\n', '\r'], " ");
+    if name.trim().is_empty() {
+        return String::from("(unnamed)");
+    }
+    // A span closes at a backtick run as long as its opener, so the fence is
+    // one longer than any run inside; a space keeps a backtick at either end
+    // off the fence, and CommonMark strips it again.
+    let longest = name.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+    let fence = "`".repeat(longest + 1);
+    let pad = if name.starts_with('`') || name.ends_with('`') {
+        " "
+    } else {
+        ""
+    };
+    format!("{fence}{pad}{name}{pad}{fence}")
+}
+
 impl MemoryReport {
-    /// The report as plain text, one section per subsystem.
+    /// The report as Markdown, one section per subsystem. The app opens it
+    /// as a rendered preview, which ignores typing, so a keystroke meant for
+    /// another tab can never edit the figures (#694).
     pub fn format(&self) -> String {
-        let mut out = String::from("croft memory usage\n\n");
+        let mut out = String::from("# croft memory usage\n\n");
         match self.rss_kb {
             Some(kb) => {
                 let _ = writeln!(out, "Process RSS: {}", human(kb as usize * 1024));
@@ -76,7 +98,7 @@ impl MemoryReport {
             None => out.push_str("Process RSS: unavailable (no /proc on this platform)\n"),
         }
 
-        let _ = writeln!(out, "\nTerminal panes ({})", self.terminals.len());
+        let _ = writeln!(out, "\n## Terminal panes ({})\n", self.terminals.len());
         let mut rewind_total = 0;
         let mut grid_total = 0;
         for t in &self.terminals {
@@ -90,45 +112,57 @@ impl MemoryReport {
             };
             let _ = writeln!(
                 out,
-                "  {}{closed}: rewind {}, scrollback {} lines (~{} est.)",
-                t.name,
+                "- {}{closed}: rewind {}, scrollback {} lines (about {})",
+                code(&t.name),
                 human(t.rewind_bytes),
                 t.scrollback_lines,
                 human(grid)
             );
         }
         if self.rewind_budget == 0 && rewind_total == 0 {
-            out.push_str("  Rewind: off (set terminal_rewind_mb in config.json to record)\n");
+            out.push_str("\nRewind: off (set `terminal_rewind_mb` in config.json to record)\n");
         } else {
             let _ = writeln!(
                 out,
-                "  Rewind total: {} of {} shared budget",
+                "\nRewind total: {} of {} shared budget",
                 human(rewind_total),
                 human(self.rewind_budget)
             );
         }
         let _ = writeln!(
             out,
-            "  Grid total: ~{} est. (rows × columns × {} B per cell)",
+            "\nGrid total: about {} (rows × columns × {} B per cell)",
             human(grid_total),
             self.cell_bytes
         );
 
-        let _ = writeln!(out, "\nUndo history ({} buffers)", self.buffers.len());
+        let _ = writeln!(out, "\n## Undo history ({} buffers)\n", self.buffers.len());
         let mut buffers: Vec<&BufferMem> = self.buffers.iter().collect();
         buffers.sort_by_key(|b| std::cmp::Reverse(b.bytes));
         for b in &buffers {
-            let _ = writeln!(out, "  {}: {} in {} steps", b.name, human(b.bytes), b.steps);
+            let _ = writeln!(
+                out,
+                "- {}: {} in {} steps",
+                code(&b.name),
+                human(b.bytes),
+                b.steps
+            );
         }
         let undo_total: usize = buffers.iter().map(|b| b.bytes).sum();
-        let _ = writeln!(out, "  Total: {} (text only)", human(undo_total));
+        let _ = writeln!(out, "\nTotal: {} (text only)", human(undo_total));
 
-        let _ = writeln!(out, "\nOUTPUT channels ({})", self.channels.len());
+        let _ = writeln!(out, "\n## OUTPUT channels ({})\n", self.channels.len());
         for c in &self.channels {
-            let _ = writeln!(out, "  {}: {} lines, {}", c.name, c.lines, human(c.bytes));
+            let _ = writeln!(
+                out,
+                "- {}: {} lines, {}",
+                code(&c.name),
+                c.lines,
+                human(c.bytes)
+            );
         }
         let output_total: usize = self.channels.iter().map(|c| c.bytes).sum();
-        let _ = writeln!(out, "  Total: {} (text only)", human(output_total));
+        let _ = writeln!(out, "\nTotal: {} (text only)", human(output_total));
 
         // Only diagnostics are stored per server, so a running server that
         // has published none has nothing here: say so rather than print a
@@ -137,15 +171,17 @@ impl MemoryReport {
             1 => String::from("1 server"),
             n => format!("{n} servers"),
         };
-        let _ = writeln!(out, "\nLanguage server diagnostics ({count})");
+        let _ = writeln!(out, "\n## Language server diagnostics ({count})\n");
         if self.servers.is_empty() {
-            out.push_str("  none held\n");
+            out.push_str("None held.\n");
         }
         for s in &self.servers {
             let _ = writeln!(
                 out,
-                "  {}: {} diagnostics in {} files",
-                s.name, s.diagnostics, s.files
+                "- {}: {} diagnostics in {} files",
+                code(&s.name),
+                s.diagnostics,
+                s.files
             );
         }
         out.push_str(
@@ -227,20 +263,20 @@ mod tests {
         assert!(text.contains("Process RSS: 300.0 MiB"), "{text}");
         // (10_000 + 40) × 100 × 24 B.
         assert!(
-            text.contains("zsh: rewind 3.0 MiB, scrollback 10000 lines (~23.0 MiB est.)"),
+            text.contains("`zsh`: rewind 3.0 MiB, scrollback 10000 lines (about 23.0 MiB)"),
             "{text}"
         );
         assert!(
-            text.contains("cargo (closed, reopenable): rewind 0 B"),
+            text.contains("`cargo` (closed, reopenable): rewind 0 B"),
             "{text}"
         );
         assert!(
             text.contains("Rewind total: 3.0 MiB of 256.0 MiB shared budget"),
             "{text}"
         );
-        assert!(text.contains("Git: 12 lines, 2.0 KiB"), "{text}");
+        assert!(text.contains("`Git`: 12 lines, 2.0 KiB"), "{text}");
         assert!(
-            text.contains("rust-analyzer: 17 diagnostics in 3 files"),
+            text.contains("`rust-analyzer`: 17 diagnostics in 3 files"),
             "{text}"
         );
         assert!(text.contains("Total: 40.0 MiB (text only)"), "{text}");
@@ -257,7 +293,7 @@ mod tests {
         }
         let text = off.format();
         assert!(
-            text.contains("Rewind: off (set terminal_rewind_mb in config.json to record)"),
+            text.contains("Rewind: off (set `terminal_rewind_mb` in config.json to record)"),
             "{text}"
         );
         assert!(!text.contains("shared budget"), "{text}");
@@ -287,9 +323,38 @@ mod tests {
         }
         .format();
         assert!(
-            text.contains("Language server diagnostics (0 servers)\n  none held\n"),
+            text.contains("Language server diagnostics (0 servers)\n\nNone held.\n"),
             "{text}"
         );
+    }
+
+    /// Each subsystem is a heading and each pane, buffer, channel or server
+    /// a list item, so the rendered report keeps one entry per line.
+    #[test]
+    fn the_report_is_markdown_with_a_heading_per_subsystem() {
+        let text = report().format();
+        assert!(text.starts_with("# croft memory usage\n"), "{text}");
+        for heading in [
+            "## Terminal panes (2)",
+            "## Undo history (2 buffers)",
+            "## OUTPUT channels (1)",
+            "## Language server diagnostics (1 server)",
+        ] {
+            assert!(
+                text.contains(&format!("\n{heading}\n\n- ")),
+                "{heading}:\n{text}"
+            );
+        }
+    }
+
+    /// A name is a code span, so Markdown in it shows as typed.
+    #[test]
+    fn names_are_code_spans_whatever_they_contain() {
+        assert_eq!(code("*draft*_[1].md"), "`*draft*_[1].md`");
+        assert_eq!(code("a`b"), "``a`b``");
+        assert_eq!(code("``x"), "``` ``x ```");
+        assert_eq!(code("two\nlines"), "`two lines`");
+        assert_eq!(code(" "), "(unnamed)");
     }
 
     #[test]
