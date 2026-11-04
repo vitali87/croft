@@ -1,0 +1,1 @@
+fix: Groundwork for on-demand extensions: croft's panels and views no longer reach into the main app module, now that the cache folder and the brand orange live with the other shared paths and colours. Nothing changes in use.
