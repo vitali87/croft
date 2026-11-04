@@ -257,7 +257,9 @@ impl RunControl {
     /// Spawn `cmd` as the leader of a new process group and record it, or
     /// refuse with `None` when `request` was cancelled. Checked and
     /// recorded under the lock, so a cancel either sees the pid or the
-    /// spawn sees the cancel.
+    /// spawn sees the cancel. A runner that is "Text file busy" for a
+    /// moment, just installed or a test's freshly written stand-in, is
+    /// waited out rather than reported as a failed run.
     fn spawn(&self, request: u64, cmd: &mut Command) -> Option<std::io::Result<Child>> {
         use std::os::unix::process::CommandExt;
         let mut running = self.running.lock().unwrap();
@@ -265,7 +267,7 @@ impl RunControl {
             return None;
         }
         cmd.process_group(0);
-        let child = cmd.spawn();
+        let child = crate::review_ops::spawn_retrying_busy(cmd);
         if let Ok(c) = &child {
             *running = i32::try_from(c.id()).ok();
         }
@@ -2184,6 +2186,39 @@ mod tests {
         child.wait().unwrap();
         control.finished();
         assert!(control.running.lock().unwrap().is_none());
+    }
+
+    /// CI on `main` failed `a_single_vitest_project_still_streams_tap_flat`
+    /// with no tests run: another test forked while its stand-in vitest was
+    /// still open for writing, so exec said "Text file busy". A runner busy
+    /// for a moment, held open here, still starts.
+    #[cfg(unix)]
+    #[test]
+    fn a_runner_busy_for_a_moment_after_writing_still_starts() {
+        use std::io::Write as _;
+        use std::os::unix::fs::OpenOptionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("runner");
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o755)
+            .open(&bin)
+            .unwrap();
+        f.write_all(b"#!/bin/sh\nexit 0\n").unwrap();
+        f.flush().unwrap();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            drop(f);
+        });
+        let control = RunControl::default();
+        let mut cmd = Command::new(&bin);
+        let mut child = control
+            .spawn(1, &mut cmd)
+            .expect("not cancelled")
+            .expect("the busy runner starts once its writer lets go");
+        assert!(child.wait().unwrap().success());
+        writer.join().unwrap();
     }
 
     /// A stand-in `codeql` in `dir` that logs its arguments and prints
