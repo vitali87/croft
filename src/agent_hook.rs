@@ -301,7 +301,7 @@ fn record_path(record_dir: &Path, settings: &Path) -> PathBuf {
 
 /// Where install records live.
 pub fn default_record_dir() -> PathBuf {
-    crate::prefs::config_dir().join("hook-install")
+    crate::paths::config_dir().join("hook-install")
 }
 
 /// A settings change: the unified diff shown before it is written, or

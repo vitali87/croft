@@ -121,7 +121,7 @@ pub struct TriggerHit {
 }
 
 pub fn triggers_path() -> PathBuf {
-    crate::prefs::config_dir().join("triggers.json")
+    crate::paths::config_dir().join("triggers.json")
 }
 
 /// One raw `triggers.json` row before compilation. Unknown actions, bad

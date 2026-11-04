@@ -47,7 +47,7 @@ pub fn choices(key: &str) -> Option<Vec<String>> {
         // An enum: free text such as `enabled` was saved and then ignored.
         "code_scanning" => &["off", "on", "prompt"],
         "locale" => {
-            let langs = crate::i18n::languages(&crate::prefs::config_dir());
+            let langs = crate::i18n::languages(&crate::paths::config_dir());
             return Some(std::iter::once(String::new()).chain(langs).collect());
         }
         "problems_project_scope" => &["auto", "on", "off"],

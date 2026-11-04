@@ -313,7 +313,7 @@ pub struct WatchSet {
 }
 
 pub fn matchers_path() -> PathBuf {
-    crate::prefs::config_dir().join("matchers.json")
+    crate::paths::config_dir().join("matchers.json")
 }
 
 pub fn workspace_matchers_path(root: &Path) -> PathBuf {

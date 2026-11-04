@@ -864,7 +864,7 @@ impl Cli {
                     );
                     std::process::exit(1);
                 };
-                let path = crate::prefs::config_dir()
+                let path = crate::paths::config_dir()
                     .join("locales")
                     .join(format!("{code}.json"));
                 if write {
