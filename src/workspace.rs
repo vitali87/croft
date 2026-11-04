@@ -268,14 +268,14 @@ where
 /// workspace names at least one folder.
 pub fn parse_workspace_file(path: &Path) -> Result<Vec<PathBuf>, String> {
     let raw = std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    // `crate::tasks::strip_jsonc` walks CHARS. The copy that used to live
+    // `crate::jsonc::strip_jsonc` walks CHARS. The copy that used to live
     // here walked BYTES and rebuilt every multi-byte character as mojibake,
     // so a workspace folder named "Caf\u{e9} Noir" arrived as "CafÃ© Noir"
     // with no error anywhere: the JSON still parsed (#396).
     //
     // The two treat comments, trailing commas and string literals alike, so
     // the swap changes what happens to non-ASCII input and nothing else.
-    let stripped = crate::tasks::strip_jsonc(&raw);
+    let stripped = crate::jsonc::strip_jsonc(&raw);
     let v: serde_json::Value =
         serde_json::from_str(&stripped).map_err(|e| format!("parse {}: {e}", path.display()))?;
     let base = path.parent().unwrap_or_else(|| Path::new("."));
@@ -349,7 +349,7 @@ pub fn workspace_file_update(path: &Path, folders: &[PathBuf]) -> Result<Option<
     };
     let left = |why: &str| format!("{} {why}; it was left as it is", path.display());
     let mut doc = match &existing {
-        Some(text) => serde_json::from_str::<Value>(&crate::tasks::strip_jsonc(text))
+        Some(text) => serde_json::from_str::<Value>(&crate::jsonc::strip_jsonc(text))
             .ok()
             .filter(Value::is_object)
             .ok_or_else(|| left("is not a workspace file"))?,
@@ -882,10 +882,10 @@ mod tests {
         assert!(!out.contains("wsx_lib"), "{out}");
         assert!(out.contains("// the project venv"), "{out}");
         let mut want: serde_json::Value =
-            serde_json::from_str(&crate::tasks::strip_jsonc(TEAM_FILE)).unwrap();
+            serde_json::from_str(&crate::jsonc::strip_jsonc(TEAM_FILE)).unwrap();
         want["folders"] = serde_json::json!([{ "path": "." }, { "path": "../extra" }]);
         let got: serde_json::Value =
-            serde_json::from_str(&crate::tasks::strip_jsonc(&out)).unwrap();
+            serde_json::from_str(&crate::jsonc::strip_jsonc(&out)).unwrap();
         assert_eq!(got, want);
     }
 

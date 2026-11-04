@@ -134,7 +134,7 @@ pub fn parse(
     root: &Path,
     env: &dyn Fn(&str) -> Option<String>,
 ) -> Result<DevContainer> {
-    let v: Value = serde_json::from_str(&crate::tasks::strip_jsonc(text))
+    let v: Value = serde_json::from_str(&crate::jsonc::strip_jsonc(text))
         .with_context(|| format!("parsing {}", config.display()))?;
     let dir = config.parent().unwrap_or(root);
     let str_of = |key: &str| v.get(key).and_then(Value::as_str);

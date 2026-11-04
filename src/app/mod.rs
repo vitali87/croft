@@ -12332,7 +12332,7 @@ impl App {
         runs: &mut Vec<Vec<String>>,
     ) {
         let config: serde_json::Value =
-            serde_json::from_str(&crate::tasks::strip_jsonc(text)).unwrap_or_default();
+            serde_json::from_str(&crate::jsonc::strip_jsonc(text)).unwrap_or_default();
         let names_no_files = config
             .get("files")
             .and_then(|f| f.as_array())

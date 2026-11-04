@@ -378,7 +378,7 @@ fn load_layer_document_inner(
     warnings: &mut Vec<String>,
 ) -> Option<Map<String, Value>> {
     let text = read_layer_file(path, warnings)?;
-    let parsed: Value = match serde_json::from_str(&crate::tasks::strip_jsonc(&text)) {
+    let parsed: Value = match serde_json::from_str(&crate::jsonc::strip_jsonc(&text)) {
         Ok(v) => v,
         Err(e) => {
             warnings.push(format!(
@@ -569,7 +569,7 @@ fn deep_merge(base: &mut Value, over: &Value) {
 /// indistinguishable from an absent one.
 fn load_vscode_subset(path: &Path, warnings: &mut Vec<String>) -> Option<Map<String, Value>> {
     let text = read_layer_file(path, warnings)?;
-    let parsed: Value = match serde_json::from_str(&crate::tasks::strip_jsonc(&text)) {
+    let parsed: Value = match serde_json::from_str(&crate::jsonc::strip_jsonc(&text)) {
         Ok(v) => v,
         Err(e) => {
             warnings.push(format!(
