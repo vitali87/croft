@@ -138,17 +138,7 @@ fn gh_error(out: &std::process::Output) -> String {
 /// which takes microseconds. A freshly installed or updated `gh` can hit it,
 /// and a test's stand-in script hits it whenever another test forks.
 pub(crate) fn spawn_retrying_busy(cmd: &mut Command) -> std::io::Result<std::process::Child> {
-    const ETXTBSY: i32 = 26;
-    let mut tries = 0;
-    loop {
-        match cmd.spawn() {
-            Err(e) if e.raw_os_error() == Some(ETXTBSY) && tries < 50 => {
-                tries += 1;
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-            other => return other,
-        }
-    }
+    retry_while_busy(|| cmd.spawn(), |r| r.as_ref().is_err_and(text_file_busy))
 }
 
 /// [`Command::output`] through [`spawn_retrying_busy`]: stdin closed, stdout
@@ -158,6 +148,28 @@ pub(crate) fn output_retrying_busy(cmd: &mut Command) -> std::io::Result<std::pr
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     spawn_retrying_busy(cmd)?.wait_with_output()
+}
+
+/// Whether a spawn failed because its program is "Text file busy" (ETXTBSY).
+pub(crate) fn text_file_busy(e: &std::io::Error) -> bool {
+    const ETXTBSY: i32 = 26;
+    e.raw_os_error() == Some(ETXTBSY)
+}
+
+/// Call `attempt` again, 10 ms apart and at most 50 more times, while `busy`
+/// says its result is a moment of "Text file busy". Nothing `attempt` takes
+/// is held across the pause, so a caller that spawns under a lock lets
+/// others in between tries.
+pub(crate) fn retry_while_busy<R>(mut attempt: impl FnMut() -> R, busy: impl Fn(&R) -> bool) -> R {
+    let mut tries = 0;
+    loop {
+        let result = attempt();
+        if tries >= 50 || !busy(&result) {
+            return result;
+        }
+        tries += 1;
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
 }
 
 fn gh(program: &str, root: &Path, args: &[&str], stdin: Option<&str>) -> Result<String, String> {
