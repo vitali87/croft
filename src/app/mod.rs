@@ -43290,10 +43290,29 @@ impl App {
                 if let Some((path, line)) = target {
                     match self.open_at(&path, line.saturating_sub(1), 0) {
                         Ok(()) => {
+                            // The row's line is on the text of the tab whose
+                            // marks were listed; a copy opened here from disk
+                            // can differ from it by that tab's unsaved edits.
+                            let here = self
+                                .bookmark_source(&path)
+                                .filter(|e| e.path.as_deref() == Some(path.as_path()))
+                                .and_then(|source| {
+                                    crate::widgets::editor::carry_marks(
+                                        &std::collections::BTreeSet::from([line]),
+                                        &source.lines,
+                                        &self.editor.lines,
+                                    )
+                                    .into_iter()
+                                    .next()
+                                })
+                                .unwrap_or(line);
+                            if here != line {
+                                self.place_caret_at(here - 1, 0);
+                            }
                             // A tab opened here for a file another group
                             // shows gets that file's marks too.
                             self.adopt_shared_bookmarks();
-                            self.status = format!("Bookmark at line {line}");
+                            self.status = format!("Bookmark at line {here}");
                         }
                         Err(e) => self.status = format!("Cannot open bookmark: {e}"),
                     }

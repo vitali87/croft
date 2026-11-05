@@ -1474,6 +1474,36 @@ fn the_bookmark_picker_lists_the_marks_of_another_split() {
     assert_eq!(app.editor.bookmarked_lines(), vec![3], "with its mark");
 }
 
+/// A row's line is on the text of the tab it was listed from. When Enter
+/// opens the file from disk in the focused split, and that tab has unsaved
+/// lines above the mark, the caret lands on the marked text, not the number.
+#[test]
+fn the_bookmark_picker_lands_on_the_marked_text_in_a_copy_opened_from_disk() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&a, "one\ntwo\nthree\nfour\n").unwrap();
+    std::fs::write(&b, "x\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&a).unwrap();
+    app.editor.cursor_row = 2;
+    app.toggle_bookmark();
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 0;
+    app.editor.insert_str("zero\n");
+    app.split_editor();
+    app.editor.open_preview(&b).unwrap();
+    app.run_command(Command::ViewBookmarks);
+    let picker = app.list_picker.as_ref().expect("the picker opens");
+    let labels: Vec<&str> = picker.rows.iter().map(|r| r.label.as_str()).collect();
+    assert_eq!(labels, ["a.txt:4  three"]);
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.path.as_deref(), Some(a.as_path()));
+    assert_eq!(app.editor.lines[app.editor.cursor_row], "three");
+}
+
 /// A row keeps its file's path as it is: a name that is not UTF-8 survives
 /// the trip through the picker.
 #[cfg(unix)]

@@ -18633,7 +18633,9 @@ fn line_mapper<'a>(
 /// `marks` (1-based lines of `old`) carried to the lines they sit on in
 /// `new`, another copy of the same file: a second tab of it whose unsaved
 /// edits differ, or the file on disk under a buffer whose edits are being
-/// discarded. A mark on a line `new` does not have is dropped.
+/// discarded. Each mark moves as an edit from `old` to `new` would move it
+/// (see [`line_mapper`]): one on a line deleted outright is dropped, and one
+/// on a line edited in place stays on that line, as it does while typing.
 pub fn carry_marks(
     marks: &std::collections::BTreeSet<usize>,
     old: &[String],
