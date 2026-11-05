@@ -42,6 +42,7 @@ mod fleet;
 mod gh;
 mod ghostty;
 mod git;
+mod glob_list;
 mod gradient;
 mod gui_path;
 mod header_source;

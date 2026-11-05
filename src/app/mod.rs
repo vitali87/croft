@@ -48270,7 +48270,7 @@ impl App {
     fn restore_open_tab(
         &mut self,
         tab: &crate::session_state::OpenTabState,
-    ) -> Option<(&mut Editor, Vec<crate::widgets::editor::SheetCellEdit>)> {
+    ) -> Option<(&mut Editor, Vec<crate::sheet::SheetCellEdit>)> {
         let unsaved = tab.unsaved_text.as_deref().filter(|_| tab.dirty);
         let opened = tab
             .path
