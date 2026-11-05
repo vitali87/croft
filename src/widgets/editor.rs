@@ -1928,8 +1928,22 @@ fn paint_diff_selection_band(
         } else {
             (0, usize::MAX)
         };
-        let cs_screen = cs.saturating_sub(diff.scroll_x);
-        let ce_screen = ce.saturating_sub(diff.scroll_x);
+        // The band is in cells: a tab inside the selection is Tab Size wide.
+        let line = diff_side_line(diff, row_idx, sel.side);
+        let to_cell = |col: usize| {
+            if col == usize::MAX {
+                return usize::MAX;
+            }
+            let drawn: usize = line
+                .chars()
+                .skip(diff.scroll_x)
+                .take(col.saturating_sub(diff.scroll_x))
+                .map(char_cells)
+                .sum();
+            drawn + col.saturating_sub(line.chars().count().max(diff.scroll_x))
+        };
+        let cs_screen = to_cell(cs);
+        let ce_screen = to_cell(ce);
         paint_selection_band(buf, text_x, y, text_w, cs_screen, ce_screen, theme);
     }
 }
@@ -1996,8 +2010,54 @@ pub fn diff_hit_test(
     } else {
         0
     };
-    let char_col = screen_col + diff.scroll_x;
+    // The text is drawn with each tab as its Tab Size cells, so a cell maps to
+    // the char drawn on it, not to `cell + scroll_x`.
+    let line = diff_side_line(diff, row_idx, side);
+    let char_col = char_at_cell_from(line, diff.scroll_x, screen_col);
     Some((side, row_idx, char_col))
+}
+
+/// The text a diff row draws in `side`'s column, `""` when that side has no
+/// line on the row (an added or removed line's other half).
+fn diff_side_line(
+    diff: &crate::widgets::diff::DiffData,
+    row_idx: usize,
+    side: crate::widgets::diff::DiffSide,
+) -> &str {
+    use crate::widgets::diff::{DiffRow, DiffSide};
+    let (left, right) = match diff.rows.get(row_idx) {
+        Some(DiffRow::Equal { left, right } | DiffRow::Replaced { left, right }) => {
+            (Some(*left), Some(*right))
+        }
+        Some(DiffRow::Removed { left }) => (Some(*left), None),
+        Some(DiffRow::Added { right }) => (None, Some(*right)),
+        None => (None, None),
+    };
+    let (lines, idx) = match side {
+        DiffSide::Left => (&diff.left_lines, left),
+        DiffSide::Right => (&diff.right_lines, right),
+    };
+    idx.and_then(|i| lines.get(i)).map_or("", String::as_str)
+}
+
+/// The char index of `text` drawn on screen cell `cell` when the row starts
+/// at char `skip` (tabs as [`char_cells`]). A cell past the end of the text
+/// counts on from its length, one char per cell, as before tabs had width.
+fn char_at_cell_from(text: &str, skip: usize, cell: usize) -> usize {
+    let mut at = 0;
+    let mut len = 0;
+    for (i, c) in text.chars().enumerate() {
+        len = i + 1;
+        if i < skip {
+            continue;
+        }
+        let w = char_cells(c);
+        if cell < at + w {
+            return i;
+        }
+        at += w;
+    }
+    len.max(skip) + cell.saturating_sub(at)
 }
 
 /// Paint `‹` and `›` glyphs at the right edge of a diff header so the
@@ -3418,7 +3478,7 @@ pub struct Editor {
     /// Cached longest-line width in CHARACTERS. Recomputing it every frame is
     /// O(total chars), so it is invalidated (set `None`) only when the buffer
     /// content changes (`open`/`mark_buffer_changed`) and recomputed lazily.
-    hscroll_content_cols: Option<usize>,
+    hscroll_content_cols: Option<(usize, usize, usize)>,
     /// Visual-row layout captured by the most recent render: one entry per
     /// painted screen row, each `(logical_line, char_start, char_end)`. In
     /// soft-wrap mode a logical line spans several entries; otherwise there is
@@ -5071,7 +5131,6 @@ impl Editor {
     fn warm_render_caches(&mut self) {
         self.refresh_fold_tables();
         self.conflicts();
-        self.content_cols();
     }
 
     /// Go to Next / Previous Change in an editor tab (#1352): the first
@@ -5132,11 +5191,17 @@ impl Editor {
             .unwrap_or(matches!(self.lang, Some(LangKind::Markdown)))
     }
 
-    /// Longest line width in characters, cached until the buffer changes.
-    /// Drives the horizontal scrollbar's content extent and the `scroll_col`
-    /// clamp. `&mut self` so the lazy recompute can populate the cache.
-    fn content_cols(&mut self) -> usize {
-        if let Some(cols) = self.hscroll_content_cols {
+    /// Widest line as a horizontal extent in char columns for a text column
+    /// `width` cells wide (tabs are Tab Size cells, see below), cached until the
+    /// buffer, the width or the Tab Size changes. Drives the horizontal
+    /// scrollbar's content extent and the `scroll_col` clamp. `&mut self` so the lazy recompute can populate the cache.
+    fn content_cols(&mut self, width: usize) -> usize {
+        self.sync_tab_cells();
+        let tab = char_cells('\t');
+        if let Some((w, t, cols)) = self.hscroll_content_cols
+            && w == width
+            && t == tab
+        {
             return cols;
         }
         let cols = self
@@ -5152,11 +5217,27 @@ impl Editor {
                     .get(i)
                     .map(|hs| hs.iter().map(|(_, label, _)| label.chars().count()).sum())
                     .unwrap_or(0);
-                l.chars().count() + extra
+                if !l.contains('\t') {
+                    return l.chars().count() + extra;
+                }
+                // A tab is Tab Size cells, but `scroll_col` counts chars. The
+                // extent is in the same char columns: how far the line must
+                // scroll for its tail to fit `width` cells, plus `width`, so
+                // that `extent - width` is exactly that scroll.
+                let chars: Vec<char> = l.chars().collect();
+                if cells_of(&chars) + extra <= width {
+                    return chars.len() + extra;
+                }
+                let (mut first, mut tail) = (chars.len(), extra);
+                while first > 0 && tail + char_cells(chars[first - 1]) <= width {
+                    first -= 1;
+                    tail += char_cells(chars[first]);
+                }
+                first + width
             })
             .max()
             .unwrap_or(0);
-        self.hscroll_content_cols = Some(cols);
+        self.hscroll_content_cols = Some((width, tab, cols));
         cols
     }
 
@@ -8875,6 +8956,7 @@ impl Editor {
     /// [`Editor::convert_indentation`] to rewrite existing lines.
     pub fn set_indent_style(&mut self, style: IndentStyle) {
         self.indent_override = Some(style);
+        self.hscroll_content_cols = None;
     }
 
     /// The indentation unit as text for the active style: N spaces or one tab.
@@ -8883,7 +8965,7 @@ impl Editor {
     }
 
     /// Make `\t` measure and paint as this buffer's Tab Size from here on.
-    fn sync_tab_cells(&self) {
+    pub(crate) fn sync_tab_cells(&self) {
         set_tab_cells(self.indent_style().width as usize);
     }
 
@@ -15776,7 +15858,7 @@ impl Editor {
         let width = self.visible_text_width();
         let Some(metrics) = scrollbar::horizontal_metrics(
             self.last_hscrollbar,
-            self.content_cols(),
+            self.content_cols(width),
             width,
             self.scroll_col,
         ) else {
@@ -19236,7 +19318,6 @@ impl Widget for &mut Editor {
             self.scroll_col = 0;
         }
         let text_x = inner.x + gutter_width + 1;
-        let content_cols = self.content_cols();
 
         // Layout has a small cycle: the horizontal bar takes the bottom row
         // only when a line overflows the text column, but the text column's
@@ -19252,6 +19333,7 @@ impl Widget for &mut Editor {
             .width
             .saturating_sub(gutter_width + 2 + u16::from(self.lines.len() > height))
             as usize;
+        let content_cols = self.content_cols(provisional_text_width);
         let hbar_present =
             !wrap && provisional_text_width > 0 && content_cols > provisional_text_width;
         let text_height = height - usize::from(hbar_present);
@@ -19383,6 +19465,9 @@ impl Widget for &mut Editor {
 
         // Clamp horizontal scroll (non-wrap only) so a wheel swipe can't
         // strand the buffer off-screen, then lay out the horizontal bar.
+        // The extent depends on the width it is measured against, and the
+        // final text column may be narrower than the provisional one.
+        let content_cols = self.content_cols(text_width as usize);
         let max_scroll_col = content_cols.saturating_sub(text_width as usize);
         self.scroll_col = self.scroll_col.min(max_scroll_col);
         let hbar_metrics = scrollbar::horizontal_metrics(
@@ -20918,8 +21003,18 @@ impl Editor {
         if text_w == 0 || char_col < diff.scroll_x {
             return None;
         }
-        let vis_col = char_col - diff.scroll_x;
-        if vis_col as u16 >= text_w {
+        // Cells, not chars: a tab before the caret is Tab Size cells wide.
+        self.sync_tab_cells();
+        let line = diff_side_line(diff, row_idx, side);
+        let before = line
+            .chars()
+            .skip(diff.scroll_x)
+            .take(char_col - diff.scroll_x);
+        let drawn = before.map(char_cells).sum::<usize>();
+        let line_len = line.chars().count();
+        // Past the end of the text the caret counts one cell per char.
+        let vis_col = drawn + char_col.saturating_sub(line_len.max(diff.scroll_x));
+        if vis_col >= usize::from(text_w) {
             return None;
         }
         Some((text_x + vis_col as u16, body_top + vis_row as u16))
@@ -35269,6 +35364,79 @@ mod tests {
             assert_eq!(e.cursor_screen_pos(), Some((z_cell, y)), "tab size {width}");
             assert_eq!(e.buffer_pos_at(z_cell, y), Some((0, 2)), "tab size {width}");
         }
+    }
+
+    #[test]
+    fn the_diff_maps_clicks_and_the_caret_through_the_cells_a_tab_takes() {
+        use crate::widgets::diff::DiffSide;
+        let f1 = NamedTempFile::new().unwrap();
+        let f2 = NamedTempFile::new().unwrap();
+        std::fs::write(f1.path(), "\tx\n").unwrap();
+        std::fs::write(f2.path(), "\ty\n").unwrap();
+        let mut t = EditorTabs::new();
+        t.open_diff(f1.path(), f2.path()).unwrap();
+        let i = t.active_index();
+        t.editors[i].focused = true;
+        t.editors[i].set_indent_style(IndentStyle {
+            width: 4,
+            use_spaces: false,
+        });
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 10,
+        };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut t.editors[i], area, &mut buf);
+        let ed = &t.editors[i];
+        let diff = ed.diff.as_ref().unwrap();
+        let body_top = ed.last_inner.y + 1;
+        let l_gutter = (diff.left_lines.len() + 1).to_string().len() as u16 + 1;
+        let l_text_x = ed.last_inner.x + l_gutter + 2;
+        // Cells 0-3 are the tab, cell 4 the "x": a click on it is char 1, and
+        // one on the tab is char 0.
+        let hit = |dx: u16| {
+            crate::widgets::editor::diff_hit_test(diff, ed.last_inner, l_text_x + dx, body_top)
+        };
+        assert_eq!(hit(4), Some((DiffSide::Left, 0, 1)));
+        assert_eq!(hit(2), Some((DiffSide::Left, 0, 0)));
+        // And the caret on char 1 is drawn on cell 4.
+        t.editors[i]
+            .diff
+            .as_mut()
+            .unwrap()
+            .start_selection(DiffSide::Left, 0, 1);
+        assert_eq!(
+            t.editors[i].diff_caret_screen_pos(),
+            Some((l_text_x + 4, body_top))
+        );
+    }
+
+    #[test]
+    fn a_line_of_tabs_wider_than_the_pane_can_scroll_to_its_tail() {
+        let mut e = editor_with(&"\t".repeat(10));
+        e.set_indent_style(IndentStyle {
+            width: 8,
+            use_spaces: false,
+        });
+        e.wrap_override = Some(false);
+        // Ten tabs are 80 cells: in a 30-cell column the bar must appear and
+        // reach the scroll that shows the last of them, in char columns.
+        let cols = e.content_cols(30);
+        assert!(cols > 30, "the line overflows, got extent {cols}");
+        let max_scroll = cols - 30;
+        let tail: usize = 10 - max_scroll;
+        assert!(
+            tail * 8 <= 30 && (tail + 1) * 8 > 30,
+            "{max_scroll} chars scroll off"
+        );
+        // A different Tab Size is a different extent, not a stale cache hit.
+        e.set_indent_style(IndentStyle {
+            width: 2,
+            use_spaces: false,
+        });
+        assert_eq!(e.content_cols(30), 10, "20 cells fit in 30");
     }
 
     #[test]
