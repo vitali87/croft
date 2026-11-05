@@ -5214,6 +5214,9 @@ pub struct App {
     agent_ledger_saved: (u64, std::time::Instant),
     /// The (agent, file) behind each row of the lane-file picker.
     pending_lane_picks: Vec<(String, PathBuf)>,
+    /// The (editor group, file, 1-based line) behind each row of Bookmarks:
+    /// View Bookmarks; the group is its depth-first index in the layout.
+    pending_bookmarks: Vec<(usize, PathBuf, usize)>,
     /// When the running Fix with Navigator turn started (#374): the clock
     /// its PROBLEMS-row spinner runs on, and the flag that keeps the main
     /// loop repainting while it runs. `None` when no fix is streaming.
@@ -7480,6 +7483,7 @@ impl App {
             agent_ledger_store: (!cfg!(test)).then(agent_ledger_store_path),
             agent_ledger_saved: (0, std::time::Instant::now()),
             pending_lane_picks: Vec::new(),
+            pending_bookmarks: Vec::new(),
             problems_fix_started: None,
             http_run: None,
             http_environment: None,
@@ -43024,15 +43028,12 @@ impl App {
                 }
             }
             ListPurpose::Bookmark => {
-                if let Some((line, path)) = row.id.split_once('\t')
-                    && let Ok(line) = line.parse::<usize>()
-                {
-                    let path = PathBuf::from(path);
-                    match self.open_at(&path, line.saturating_sub(1), 0) {
-                        Ok(()) => self.status = format!("Bookmark at line {line}"),
-                        Err(e) => self.status = format!("Cannot open bookmark: {e}"),
-                    }
+                // The row's own path, not one parsed back from text: a
+                // file name that is not UTF-8 would not survive the trip.
+                if let Some((group, path, line)) = self.pending_bookmarks.get(index).cloned() {
+                    self.jump_to_bookmark(group, &path, line);
                 }
+                self.pending_bookmarks.clear();
             }
             ListPurpose::OutputChannel => {
                 self.output.sync();
@@ -48625,45 +48626,65 @@ impl App {
     }
 
     /// Bookmarks: View Bookmarks: a filterable list of every bookmark in
-    /// the open tabs (`file:line  text of the line`), Enter jumps to it.
+    /// the open tabs of every editor group (`file:line  text of the line`),
+    /// Enter jumps to it. Only the file a tab shows counts: the marks a tab
+    /// still holds for a file it showed earlier are not of an open file.
     fn open_bookmark_picker(&mut self) {
         use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
         let root = self.tree.root.clone();
-        let all = self.all_bookmarks();
-        let mut paths: Vec<&PathBuf> = all.keys().collect();
-        paths.sort();
-        let mut rows = Vec::new();
-        for path in paths {
-            let open = self
-                .editor
-                .editors
-                .iter()
-                .find(|e| e.path.as_ref() == Some(path));
-            let on_disk: Vec<String>;
-            let lines: &[String] = match open {
-                Some(e) => &e.lines,
-                None => {
-                    on_disk = std::fs::read_to_string(path)
-                        .map(|t| t.lines().map(str::to_string).collect())
-                        .unwrap_or_default();
-                    &on_disk
+        // The focused group first, so a mark it shares with another group
+        // jumps to the tab already in front of the user.
+        let active = self.editor_layout.active_dfs_index();
+        let groups = std::iter::once((active, &self.editor)).chain(
+            (0..self.editor_layout.leaf_count())
+                .filter_map(|g| Some((g, self.editor_layout.group_ref_at_dfs(g)?))),
+        );
+        // Two tabs on one file (a split, a symbol tab) list a shared mark once.
+        let mut seen = std::collections::HashSet::new();
+        let mut found: Vec<(PathBuf, usize, usize, String)> = Vec::new();
+        for (group, tabs) in groups {
+            // A diff, image or sheet tab's rows are not the file's lines.
+            for ed in tabs.editors.iter().filter(|e| !e.has_non_text_view()) {
+                let Some(path) = &ed.path else {
+                    continue;
+                };
+                // Only lines the buffer has (see `bookmarked_lines`).
+                for line in ed.bookmarked_lines() {
+                    if seen.insert((path.clone(), line)) {
+                        let text = ed.lines[line - 1].trim().chars().take(80).collect();
+                        found.push((path.clone(), line, group, text));
+                    }
                 }
-            };
-            let shown = path.strip_prefix(&root).unwrap_or(path).display();
-            // A mark past the last line is no target (see `bookmarked_lines`).
-            for &line in all[path]
-                .iter()
-                .filter(|&&l| (1..=lines.len()).contains(&l))
-            {
-                let text: String = lines[line - 1].trim().chars().take(80).collect();
-                rows.push(ListRow {
-                    id: format!("{line}\t{}", path.display()),
-                    label: format!("{shown}:{line}  {text}"),
-                });
             }
+        }
+        found.sort_by(|a, b| (&a.0, a.1).cmp(&(&b.0, b.1)));
+        self.pending_bookmarks.clear();
+        let mut rows = Vec::with_capacity(found.len());
+        for (path, line, group, text) in found {
+            let shown = path.strip_prefix(&root).unwrap_or(&path).display();
+            rows.push(ListRow {
+                id: self.pending_bookmarks.len().to_string(),
+                label: format!("{shown}:{line}  {text}"),
+            });
+            self.pending_bookmarks.push((group, path, line));
         }
         let picker = ListPicker::new(ListPurpose::Bookmark, "Bookmarks", rows);
         self.open_list_picker(picker, "No bookmarks (Cmd+Opt+Shift+K sets one)");
+    }
+
+    /// Enter on a View Bookmarks row: focus the editor group whose tab holds
+    /// the mark, then open the file at the marked 1-based `line` there.
+    fn jump_to_bookmark(&mut self, group: usize, path: &Path, line: usize) {
+        if group != self.editor_layout.active_dfs_index()
+            && self.editor_layout.group_ref_at_dfs(group).is_some()
+        {
+            let current = std::mem::take(&mut self.editor);
+            self.editor = self.editor_layout.refocus_to_dfs(current, group);
+        }
+        self.status = match self.open_at(path, line.saturating_sub(1), 0) {
+            Ok(()) => format!("Bookmark at line {line}"),
+            Err(e) => format!("Cannot open bookmark: {e}"),
+        };
     }
 
     /// Clear every bookmark in the open file, reporting how many went.
