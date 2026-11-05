@@ -2568,3 +2568,36 @@ fn a_bookmark_jump_drops_the_destination_tabs_extra_carets() {
         "no extra caret left to type at"
     );
 }
+
+/// The editor's caret hides behind a list picker and comes back with it closed.
+#[test]
+fn the_editor_caret_is_hidden_while_a_list_picker_is_open() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    std::fs::write(&a, "alpha\nbeta\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_in_new_tab(&a).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.toggle_bookmark();
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    // The blink may be in its dark half; the steady (screen reader) phase
+    // keeps the test off the clock.
+    app.screen_reader = true;
+    assert!(
+        app.cursor_should_be_visible(),
+        "the caret shows in the editor"
+    );
+    app.run_command(Command::ViewBookmarks);
+    assert!(app.list_picker.is_some());
+    assert!(
+        !app.cursor_should_be_visible(),
+        "the caret stays hidden behind View Bookmarks"
+    );
+    app.dismiss_list_picker();
+    assert!(
+        app.cursor_should_be_visible(),
+        "and returns with the picker closed"
+    );
+}
