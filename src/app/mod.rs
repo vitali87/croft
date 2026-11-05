@@ -8914,7 +8914,14 @@ impl App {
     /// it can re-Show the caret after the OSC-1337 image emit only when the
     /// editor would have shown it this frame.
     fn cursor_should_be_visible(&self) -> bool {
-        if self.context_menu.is_some() || self.prompt.is_some() || !self.cursor_visible_phase() {
+        // A list picker (View Bookmarks, Quick Fix, ...) is the thing being
+        // typed into; the editor's caret behind it would only point at text it
+        // is not about to edit.
+        if self.context_menu.is_some()
+            || self.prompt.is_some()
+            || self.list_picker.is_some()
+            || !self.cursor_visible_phase()
+        {
             return false;
         }
         let editor_caret = if self.editor.diff.is_some() {
@@ -23990,6 +23997,7 @@ impl App {
         if self.focus == Pane::Editor
             && self.context_menu.is_none()
             && self.prompt.is_none()
+            && self.list_picker.is_none()
             && self.cursor_visible_phase()
         {
             let pos = if self.editor.diff.is_some() {
