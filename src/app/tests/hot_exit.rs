@@ -2296,6 +2296,67 @@ fn a_clean_exit_saves_a_mark_on_its_line_on_disk() {
     assert_eq!(marks, vec![3], "on \"three\" as the file has it");
 }
 
+/// The file on disk is read as its tab decoded it, so a UTF-16 file's mark
+/// is saved on its line too.
+#[test]
+fn a_clean_exit_saves_a_utf16_file_s_mark_on_its_line_on_disk() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    let mut bytes = vec![0xFF, 0xFE];
+    for unit in "one\ntwo\nthree\n".encode_utf16() {
+        bytes.extend(unit.to_le_bytes());
+    }
+    std::fs::write(&a, bytes).unwrap();
+    let sessions = tmp.path().join("sessions");
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.session_dir = Some(sessions.clone());
+    app.editor.open_pinned(&a).unwrap();
+    assert_eq!(app.editor.lines[2], "three", "read as UTF-16");
+    app.editor.cursor_row = 2;
+    app.toggle_bookmark();
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 0;
+    app.editor.insert_str("zero\n");
+    app.save_session_for_next_launch().unwrap();
+    let saved = crate::session_state::saved_path(&sessions, tmp.path());
+    let state = crate::session_state::SessionState::load(&saved).unwrap();
+    let marks: Vec<usize> = state.bookmarks[&a].iter().copied().collect();
+    assert_eq!(marks, vec![3]);
+}
+
+/// A file whose name is not UTF-8 cannot be written as JSON: its tab and
+/// its marks are left out, and the rest of the session is still saved.
+#[cfg(unix)]
+#[test]
+fn a_file_whose_name_is_not_utf8_does_not_stop_the_session_save() {
+    use std::os::unix::ffi::OsStrExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let odd = tmp.path().join(std::ffi::OsStr::from_bytes(b"caf\xe9.txt"));
+    if std::fs::write(&odd, "one\ntwo\n").is_err() {
+        return; // a filesystem that takes UTF-8 names only
+    }
+    let a = tmp.path().join("a.txt");
+    std::fs::write(&a, "one\ntwo\n").unwrap();
+    let sessions = tmp.path().join("sessions");
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.session_dir = Some(sessions.clone());
+    app.editor.open_pinned(&odd).unwrap();
+    app.toggle_bookmark();
+    app.editor.open_in_new_tab(&a).unwrap();
+    app.toggle_bookmark();
+    app.save_session_for_next_launch().unwrap();
+    let saved = crate::session_state::saved_path(&sessions, tmp.path());
+    let state = crate::session_state::SessionState::load(&saved).unwrap();
+    assert!(state.bookmarks.contains_key(&a));
+    assert!(!state.bookmarks.contains_key(&odd));
+    assert!(
+        state
+            .tabs
+            .iter()
+            .all(|t| t.path.as_deref() != Some(odd.as_path()))
+    );
+}
+
 #[test]
 fn unsaved_count_tracks_dirty_editors() {
     // The Explorer activity badge mirrors VS Code: the count of open editors

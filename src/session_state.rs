@@ -70,7 +70,10 @@ impl SessionState {
     /// a later save, or a later discard, after a crash.
     pub fn without_unsaved_text(mut self) -> Self {
         let active = self.tabs.get(self.active_tab).and_then(|t| t.path.clone());
-        self.tabs.retain(|t| t.path.is_some());
+        // A tab with no file has nothing to reopen, and a path that is not
+        // UTF-8 cannot be written as JSON: one would fail the whole save.
+        self.tabs
+            .retain(|t| t.path.as_deref().and_then(Path::to_str).is_some());
         for tab in &mut self.tabs {
             tab.dirty = false;
             tab.unsaved_text = None;

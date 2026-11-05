@@ -48236,7 +48236,13 @@ impl App {
             sidebar_width: self.sidebar_width,
             terminal_height: self.terminal_height,
             focus_editor: self.focus == Pane::Editor,
-            bookmarks: self.all_bookmarks(),
+            // A path that is not UTF-8 cannot be a JSON key, and one such
+            // mark would fail the whole save.
+            bookmarks: self
+                .all_bookmarks()
+                .into_iter()
+                .filter(|(path, _)| path.to_str().is_some())
+                .collect(),
         }
     }
 
@@ -48372,8 +48378,10 @@ impl App {
                 && source.path.as_deref() == Some(path.as_path())
                 && let Ok(bytes) = std::fs::read(path)
             {
-                let disk =
-                    crate::widgets::editor::split_into_lines(&String::from_utf8_lossy(&bytes));
+                // Decoded as the tab decoded it, or a UTF-16 file matches no
+                // line of its buffer.
+                let (text, _, _) = source.encoding.decode(&bytes);
+                let disk = crate::widgets::editor::split_into_lines(&text);
                 *set = crate::widgets::editor::carry_marks(set, &source.lines, &disk);
             }
         }
