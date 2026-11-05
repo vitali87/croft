@@ -42907,6 +42907,26 @@ impl App {
     }
 
     /// Act on the row chosen in the list picker.
+    /// The "all open tabs" list: every tab of the active group by its strip
+    /// label, the current one selected. Picking one activates it, scrolling the
+    /// strip to it.
+    fn open_tab_picker(&mut self) {
+        use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+        let rows: Vec<ListRow> = self
+            .editor
+            .tab_display_labels()
+            .into_iter()
+            .enumerate()
+            .map(|(i, label)| ListRow {
+                id: i.to_string(),
+                label,
+            })
+            .collect();
+        let mut picker = ListPicker::new(ListPurpose::OpenTab, "Open Tabs", rows);
+        picker.selected = self.editor.active_index();
+        self.open_list_picker(picker, "No open tabs");
+    }
+
     fn confirm_list_picker(&mut self) {
         use crate::widgets::list_picker::ListPurpose;
         let Some(picker) = self.list_picker.as_ref() else {
@@ -43290,6 +43310,13 @@ impl App {
                 }
             }
             ListPurpose::NotebookKernel => self.choose_notebook_kernel(&row.id),
+            ListPurpose::OpenTab => {
+                if self.editor.select(index) {
+                    self.sync_open_file_poll_mtime();
+                }
+                self.focus_pane(Pane::Editor);
+                self.poke_cursor();
+            }
             ListPurpose::HttpEnvironment => {
                 self.status = if row.id.is_empty() {
                     String::from("HTTP: no environment")
@@ -61758,7 +61785,7 @@ impl App {
                 std::iter::once(&mut self.editor).chain(self.editor_layout.inactive_groups_mut())
             {
                 if g.tab_strip_contains(m.column, m.row) {
-                    g.scroll_tabs(delta);
+                    g.scroll_tabs_wheel(delta);
                     scrolled = true;
                     break;
                 }
@@ -64093,6 +64120,9 @@ impl App {
                             self.go_to_definition(path, line, col);
                         }
                         self.poke_cursor();
+                    } else if self.editor.tab_list_button_at(m.column, m.row) {
+                        self.focus_pane(Pane::Editor);
+                        self.open_tab_picker();
                     } else if let Some(idx) = self.editor.close_at(m.column, m.row) {
                         // The close cell of a pinned tab is an unpin button (it
                         // shows a thumb-tack, not the close cross), matching VS

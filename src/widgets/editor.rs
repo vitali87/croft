@@ -21928,6 +21928,12 @@ pub struct EditorTabs {
     /// Cells at the strip's right end the app paints over (the Customize
     /// Layout icons); tabs stop short of them. Set before each render.
     pub tab_reserved_right: u16,
+    /// The "all open tabs" button at the right end of the tab area, drawn only
+    /// when the tabs do not all fit (otherwise empty).
+    tab_list_button: Rect,
+    /// When and which way the wheel last moved the strip, so a touchpad's
+    /// flood of events moves it a tab at a time rather than all at once.
+    tab_wheel_at: Option<(std::time::Instant, isize)>,
     /// The full pane area (tab strip + body) from the most recent render.
     /// Used by `App::handle_mouse` for hit-testing — the active editor's
     /// own `last_area` only covers the body below the strip.
@@ -21967,6 +21973,8 @@ impl EditorTabs {
             tab_scroll: 0,
             tab_revealed: None,
             tab_reserved_right: 0,
+            tab_list_button: Rect::default(),
+            tab_wheel_at: None,
             last_full_area: Rect::default(),
             search_highlight_term: None,
             search_highlight_opts: crate::widgets::search::SearchOpts::default(),
@@ -22385,6 +22393,27 @@ impl EditorTabs {
     pub fn tab_strip_contains(&self, col: u16, row: u16) -> bool {
         let r = self.last_full_area;
         row == self.tab_strip_y && col >= r.x && col < r.x + r.width
+    }
+
+    /// Whether `(col, row)` is on the "all open tabs" button.
+    pub fn tab_list_button_at(&self, col: u16, row: u16) -> bool {
+        let r = self.tab_list_button;
+        r.width > 0 && row == r.y && col >= r.x && col < r.x + r.width
+    }
+
+    /// A wheel notch over the strip: [`Self::scroll_tabs`], but at most one tab
+    /// per [`TAB_WHEEL_GAP`] in a direction. A touchpad sends dozens of events
+    /// per swipe, which would otherwise fling the strip to its end.
+    pub fn scroll_tabs_wheel(&mut self, delta: isize) {
+        let now = std::time::Instant::now();
+        if let Some((at, dir)) = self.tab_wheel_at
+            && dir == delta
+            && now.duration_since(at) < TAB_WHEEL_GAP
+        {
+            return;
+        }
+        self.tab_wheel_at = Some((now, delta));
+        self.scroll_tabs(delta);
     }
 
     /// Scroll the tab strip by `delta` tabs (the wheel over it). The render
@@ -23206,6 +23235,10 @@ impl DerefMut for EditorTabs {
 // derives colors for every manifest theme, so the strip follows the selected
 // theme instead of staying VS-Code navy. Only the label foregrounds stay
 // fixed: this muted grey and white are legible on all dark themes.
+/// Cells the "all open tabs" button takes at the right end of a crowded strip.
+const TAB_LIST_W: u16 = 3;
+/// The least time between two tabs of wheel scrolling in one direction.
+const TAB_WHEEL_GAP: std::time::Duration = std::time::Duration::from_millis(90);
 const TAB_INACTIVE_FG: Color = Color::Rgb(0x9d, 0xa5, 0xb4);
 const TAB_ACTIVE_FG: Color = Color::White;
 
@@ -23306,11 +23339,11 @@ impl Widget for &mut EditorTabs {
         let display_labels = disambiguated_tab_labels(&self.editors);
         // Tabs never run under what the app paints at the strip's right end,
         // and the strip scrolls by tab when they do not all fit.
-        let strip_right = strip.x
+        let mut strip_right = strip.x
             + strip
                 .width
                 .saturating_sub(self.tab_reserved_right.min(strip.width));
-        let avail = usize::from(strip_right.saturating_sub(strip.x));
+        let avail_full = usize::from(strip_right.saturating_sub(strip.x));
         let widths: Vec<usize> = display_labels
             .iter()
             .map(|l| {
@@ -23321,6 +23354,34 @@ impl Widget for &mut EditorTabs {
             })
             .collect();
         let n = widths.len();
+        // Tabs that do not all fit get an "all open tabs" button in the last
+        // cells of the tab area, so the hidden ones stay reachable.
+        self.tab_list_button = Rect::default();
+        if widths.iter().sum::<usize>() > avail_full && avail_full > usize::from(TAB_LIST_W) {
+            strip_right -= TAB_LIST_W;
+            self.tab_list_button = Rect {
+                x: strip_right,
+                y: strip.y,
+                width: TAB_LIST_W,
+                height: 1,
+            };
+            let hovered = self.hover_pointer.is_some_and(|(px, py)| {
+                py == strip.y && px >= strip_right && px < strip_right + TAB_LIST_W
+            });
+            let style = Style::default()
+                .fg(if hovered {
+                    TAB_ACTIVE_FG
+                } else {
+                    TAB_INACTIVE_FG
+                })
+                .bg(if hovered {
+                    theme.tab_hover_bg()
+                } else {
+                    theme.tab_strip_bg()
+                });
+            buf.set_string(strip_right, strip.y, " \u{eab4} ", style);
+        }
+        let avail = usize::from(strip_right.saturating_sub(strip.x));
         // Last scroll that still fills the strip: past it the tail would leave
         // blank room on the right while earlier tabs stay hidden.
         let max_scroll = {
