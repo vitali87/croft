@@ -112,7 +112,8 @@ pub enum ListPurpose {
     /// channel's name.
     OutputChannel,
     /// Bookmarks: View Bookmarks: every bookmark in the open files; `id` is
-    /// `<line>\t<path>` (1-based line), a tab being no part of a line number.
+    /// an index into the App's bookmark targets (file and 1-based line), so
+    /// a path that is not UTF-8 is never put through text.
     Bookmark,
     /// Where to add a CodeQL database from (#578): `id` is an index into
     /// the App's database sources.

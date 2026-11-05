@@ -4538,6 +4538,9 @@ pub struct App {
         std::sync::mpsc::Receiver<crate::session_state::SessionState>,
         bool,
     )>,
+    /// The targets behind the open View Bookmarks picker (file, 1-based
+    /// line); the picker row `id` indexes into this list.
+    bookmark_targets: Vec<(PathBuf, usize)>,
     /// The tasks backing the open Run Task picker; the picker row `id`
     /// indexes into this list.
     run_tasks: Vec<crate::tasks::Task>,
@@ -7156,6 +7159,7 @@ impl App {
             exit_notes: Vec::new(),
             session_dir: data_dir.as_deref().map(|dir| dir.join("sessions")),
             saved_session: None,
+            bookmark_targets: Vec::new(),
             run_tasks: Vec::new(),
             last_task: None,
             pending_terminal_warning: false,
@@ -43277,12 +43281,20 @@ impl App {
                 }
             }
             ListPurpose::Bookmark => {
-                if let Some((line, path)) = row.id.split_once('\t')
-                    && let Ok(line) = line.parse::<usize>()
-                {
-                    let path = PathBuf::from(path);
+                let target = row
+                    .id
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|i| self.bookmark_targets.get(i).cloned());
+                self.bookmark_targets.clear();
+                if let Some((path, line)) = target {
                     match self.open_at(&path, line.saturating_sub(1), 0) {
-                        Ok(()) => self.status = format!("Bookmark at line {line}"),
+                        Ok(()) => {
+                            // A tab opened here for a file another group
+                            // shows gets that file's marks too.
+                            self.adopt_shared_bookmarks();
+                            self.status = format!("Bookmark at line {line}");
+                        }
                         Err(e) => self.status = format!("Cannot open bookmark: {e}"),
                     }
                 }
@@ -49061,7 +49073,9 @@ impl App {
     }
 
     /// Bookmarks: View Bookmarks: a filterable list of every bookmark in
-    /// the open tabs (`file:line  text of the line`), Enter jumps to it.
+    /// the files open in a tab, in any group (`file:line  text of the
+    /// line`); Enter jumps to it. A file no tab shows is left out, though
+    /// a tab may still hold its marks for when it is opened again.
     fn open_bookmark_picker(&mut self) {
         use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
         let root = self.tree.root.clone();
@@ -49069,22 +49083,21 @@ impl App {
         let mut paths: Vec<&PathBuf> = all.keys().collect();
         paths.sort();
         let mut rows = Vec::new();
+        let mut targets = Vec::new();
         for path in paths {
-            let open = self
-                .editor
-                .editors
-                .iter()
-                .find(|e| e.path.as_ref() == Some(path));
-            let on_disk: Vec<String>;
-            let lines: &[String] = match open {
-                Some(e) => &e.lines,
-                None => {
-                    on_disk = std::fs::read_to_string(path)
-                        .map(|t| t.lines().map(str::to_string).collect())
-                        .unwrap_or_default();
-                    &on_disk
-                }
+            // The text the marks sit on: their own tab's, else the first
+            // tab showing the file.
+            let Some(open) = self
+                .bookmark_source(path)
+                .filter(|e| e.path.as_ref() == Some(path))
+                .or_else(|| {
+                    self.editors_in_bookmark_order()
+                        .find(|e| e.path.as_ref() == Some(path))
+                })
+            else {
+                continue;
             };
+            let lines = &open.lines;
             let shown = path.strip_prefix(&root).unwrap_or(path).display();
             // A mark past the last line is no target (see `bookmarked_lines`).
             for &line in all[path]
@@ -49092,12 +49105,16 @@ impl App {
                 .filter(|&&l| (1..=lines.len()).contains(&l))
             {
                 let text: String = lines[line - 1].trim().chars().take(80).collect();
+                // The row names its target by index: a path shown as text
+                // loses the bytes of a name that is not UTF-8.
                 rows.push(ListRow {
-                    id: format!("{line}\t{}", path.display()),
+                    id: targets.len().to_string(),
                     label: format!("{shown}:{line}  {text}"),
                 });
+                targets.push((path.clone(), line));
             }
         }
+        self.bookmark_targets = targets;
         let picker = ListPicker::new(ListPurpose::Bookmark, "Bookmarks", rows);
         self.open_list_picker(picker, "No bookmarks (Cmd+Opt+Shift+K sets one)");
     }
