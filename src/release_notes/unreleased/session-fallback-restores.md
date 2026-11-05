@@ -1,1 +1,1 @@
-fix: The .session file saved at the last clean exit is restored at launch again when there is no hot-exit state to restore.
+feature: A launch reopens the files the workspace had open when croft last quit, at their carets, whenever hot exit has no unsaved edits to bring back. Each workspace keeps its own saved session, and it is read after the first frame, so startup never waits for it.

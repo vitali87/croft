@@ -4526,6 +4526,18 @@ pub struct App {
     /// the user must still hear after croft has gone: a hot-exit backup a
     /// quit could not remove (#862).
     exit_notes: Vec<String>,
+    /// Where each clean exit saves the session for the next launch, one
+    /// file per workspace (`~/.local/state/croft/sessions`, see
+    /// [`crate::session_state::saved_path`]). `None` saves none, as under
+    /// test unless a test points it at a tempdir.
+    pub session_dir: Option<PathBuf>,
+    /// The saved session being read off the UI thread once the first frame
+    /// is up, and whether its tabs may come back (hot exit brought none) or
+    /// only its bookmarks.
+    saved_session: Option<(
+        std::sync::mpsc::Receiver<crate::session_state::SessionState>,
+        bool,
+    )>,
     /// The tasks backing the open Run Task picker; the picker row `id`
     /// indexes into this list.
     run_tasks: Vec<crate::tasks::Task>,
@@ -7142,6 +7154,8 @@ impl App {
             hot_exit_consumed: Vec::new(),
             hot_exit_unremoved: Vec::new(),
             exit_notes: Vec::new(),
+            session_dir: data_dir.as_deref().map(|dir| dir.join("sessions")),
+            saved_session: None,
             run_tasks: Vec::new(),
             last_task: None,
             pending_terminal_warning: false,
@@ -48322,6 +48336,90 @@ impl App {
         left
     }
 
+    /// This workspace's session file, saved at each clean exit.
+    fn saved_session_path(&self) -> Option<PathBuf> {
+        let dir = self.session_dir.as_deref()?;
+        Some(crate::session_state::saved_path(dir, self.workspace_root()))
+    }
+
+    /// Save the session for the next launch of this workspace (a clean
+    /// exit): its tabs, layout and bookmarks, without unsaved text.
+    fn save_session_for_next_launch(&self) -> Result<()> {
+        let Some(file) = self.saved_session_path() else {
+            return Ok(());
+        };
+        let mut state = self
+            .capture_session_state_with(false)
+            .without_unsaved_text();
+        // A clean exit throws unsaved edits away (the prompt asked first),
+        // and the next launch opens the file as it is on disk: a mark that
+        // moved with those edits goes back to its line there.
+        for (path, set) in state.bookmarks.iter_mut() {
+            if let Some(source) = self.bookmark_source(path)
+                && source.dirty
+                && source.path.as_deref() == Some(path.as_path())
+                && let Ok(bytes) = std::fs::read(path)
+            {
+                let disk =
+                    crate::widgets::editor::split_into_lines(&String::from_utf8_lossy(&bytes));
+                *set = crate::widgets::editor::carry_marks(set, &source.lines, &disk);
+            }
+        }
+        state.bookmarks.retain(|_, set| !set.is_empty());
+        state.save(&file)
+    }
+
+    /// Read the session the last clean exit saved on a thread of its own,
+    /// once the first frame is up, for [`Self::poll_saved_session`] to
+    /// apply. `tabs` false brings back only its bookmarks (hot exit
+    /// restored the tabs). A file saved for another workspace is ignored,
+    /// and so is a missing one: the first launch has none. The file stays,
+    /// so a crash before the next clean exit still has it.
+    fn read_saved_session(&mut self, tabs: bool) {
+        let Some(path) = self.saved_session_path() else {
+            return;
+        };
+        let root = self.workspace_root().to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        crate::startup_gate::spawn_after_first_frame(move || {
+            if let Ok(state) = crate::session_state::SessionState::load(&path)
+                && state.is_of(&root)
+            {
+                let _ = tx.send(state);
+            }
+        });
+        self.saved_session = Some((rx, tabs));
+    }
+
+    /// Apply the saved session once it is read (see
+    /// [`Self::read_saved_session`]). Its tabs come back only into an
+    /// editor still showing its blank first tab: a file the launch opened,
+    /// or one the user opened first, is not covered over. Returns whether
+    /// anything changed, for a redraw.
+    fn poll_saved_session(&mut self) -> bool {
+        let Some((rx, tabs)) = self.saved_session.as_ref() else {
+            return false;
+        };
+        let state = match rx.try_recv() {
+            Ok(state) => state,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.saved_session = None;
+                return false;
+            }
+        };
+        let tabs = *tabs;
+        self.saved_session = None;
+        if tabs && self.editor.is_blank_initial() && !state.tabs.is_empty() {
+            // No unsaved text, so nothing is left over to keep.
+            let _ = self.apply_session_state(&state);
+            self.sync_open_file_poll_mtime();
+        } else {
+            self.restore_bookmarks_everywhere(&state.bookmarks);
+        }
+        true
+    }
+
     /// Keep the xlsx cells an update relaunch could not put back (#1593)
     /// in a hot-exit backup of their own, which the next launch restores
     /// from as it would a killed croft's. Returns whether they are on disk.
@@ -82296,24 +82394,14 @@ pub fn run(
             app.add_workspace_folder(folder);
         }
     }
-    // Determine which session file to restore from, if any:
-    //   * a self-update re-exec names one explicitly;
-    //   * otherwise hot exit is tried first, and ".session" (saved at the
-    //     previous clean exit) is the fallback when hot exit had nothing.
-    let session_path: Option<std::path::PathBuf> = if let Some(path) = restore_session {
-        Some(path.clone())
-    } else if !app.restore_hot_exit() {
-        Some(std::path::PathBuf::from(".session"))
-    } else {
-        None
-    };
-    // Restore the tabs / layout
-    if let Some(session_path) = session_path {
-        match crate::session_state::SessionState::load(&session_path) {
+    // Restore the tabs / layout carried across a self-update re-exec, then
+    // delete the handoff file so a later normal launch starts clean.
+    if let Some(session_path) = restore_session.as_ref() {
+        match crate::session_state::SessionState::load(session_path) {
             Ok(state) => {
                 let left = app.apply_session_state(&state);
                 if app.hold_unrestored_tabs(left) {
-                    let _ = std::fs::remove_file(&session_path);
+                    let _ = std::fs::remove_file(session_path);
                 } else {
                     // Kept: it holds the only copy of cells not put back.
                     app.status = format!(
@@ -82333,6 +82421,14 @@ pub fn run(
                 );
             }
         }
+    } else {
+        // A normal launch brings back what hot exit kept of this workspace
+        // when croft last ended without a clean quit (#862). The session
+        // the last clean exit saved brings back its tabs when hot exit had
+        // none, and its bookmarks either way; it is read once the first
+        // frame is up, off this thread.
+        let restored = app.restore_hot_exit();
+        app.read_saved_session(!restored);
     }
     crate::startup_trace::mark("session restored");
     // `--zen`: hide the Explorer sidebar and terminal so the editor fills the
@@ -82593,15 +82689,10 @@ pub fn run(
             crate::remote::RemoteOutcome::Exited => return Ok(()),
         }
     }
-
-    let state = app.capture_session_state();
-    let file_name = ".session";
-    // let state_path = crate::session_state::persistent_session_path(&root);
-    let state_path = std::path::Path::new(&file_name);
-    if let Err(e) = state.save(state_path) {
-        eprintln!("croft: failed to save session: {e}");
+    // A clean exit: what the next launch of this workspace opens with.
+    if let Err(e) = app.save_session_for_next_launch() {
+        eprintln!("croft: could not save the session: {e:#}");
     }
-
     Ok(())
 }
 
@@ -83153,7 +83244,8 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         app.tick_hot_exit(std::time::Instant::now());
         let highlights_changed = app.poll_highlights();
         // Pictures baked off the UI thread (#1973) go up as they land.
-        let images_changed = app.poll_chrome_bake() | app.poll_welcome_bake();
+        let images_changed =
+            app.poll_chrome_bake() | app.poll_welcome_bake() | app.poll_saved_session();
         let live_run_changed =
             app.tick_live_run() | app.sync_markdown_scroll() | app.tick_minimap();
         app.tick_code_lens();

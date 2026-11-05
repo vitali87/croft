@@ -41,6 +41,8 @@ pub struct SessionState {
     pub sidebar_width: u16,
     pub terminal_height: Option<u16>,
     pub focus_editor: bool,
+    /// Every file's bookmarks (1-based lines), the closed files' included,
+    /// so a file's marks come back when it is opened again.
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub bookmarks: std::collections::HashMap<PathBuf, std::collections::BTreeSet<usize>>,
 }
@@ -55,6 +57,29 @@ impl SessionState {
         let json =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         serde_json::from_str(&json).context("parsing session state")
+    }
+
+    /// Whether this session was saved for the workspace at `root`.
+    pub fn is_of(&self, root: &Path) -> bool {
+        crate::hot_exit::canonical(&self.workspace_root) == crate::hot_exit::canonical(root)
+    }
+
+    /// What a clean exit keeps for the next launch: the files open, where
+    /// their carets were, the layout and the bookmarks, but no unsaved text.
+    /// That is hot exit's to keep (#862): a copy here would come back over
+    /// a later save, or a later discard, after a crash.
+    pub fn without_unsaved_text(mut self) -> Self {
+        let active = self.tabs.get(self.active_tab).and_then(|t| t.path.clone());
+        self.tabs.retain(|t| t.path.is_some());
+        for tab in &mut self.tabs {
+            tab.dirty = false;
+            tab.unsaved_text = None;
+            tab.sheet_cells.clear();
+        }
+        self.active_tab = active
+            .and_then(|p| self.tabs.iter().position(|t| t.path.as_ref() == Some(&p)))
+            .unwrap_or(0);
+        self
     }
 }
 
@@ -90,6 +115,14 @@ pub(crate) fn write_private_atomically(path: &Path, bytes: &[u8]) -> Result<()> 
         let _ = std::fs::remove_file(&tmp);
         anyhow::Error::new(e).context(format!("writing {}", path.display()))
     })
+}
+
+/// Where the session saved at a clean exit is kept for the workspace at
+/// `root`: one file per workspace under `dir`, named like its hot-exit
+/// folder (a digest of the canonical root), so a launch from any directory
+/// finds its own and two workspaces never share one.
+pub fn saved_path(dir: &Path, root: &Path) -> PathBuf {
+    crate::hot_exit::workspace_dir(dir, root).with_extension("json")
 }
 
 /// Per-pid scratch path for the session handoff file. Pid-scoping keeps
