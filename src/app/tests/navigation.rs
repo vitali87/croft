@@ -1662,6 +1662,93 @@ fn bookmark_status_counts_marks_and_names_the_line_separately() {
     assert_eq!(app.status, "Bookmark 2 of 2 (line 5)");
 }
 
+/// A file open in two splits keeps one set of bookmarks: a mark set in
+/// either shows in both, and clearing them in one clears them in the
+/// other, so the saved session cannot bring a cleared mark back.
+#[test]
+fn a_file_open_in_two_splits_keeps_one_set_of_bookmarks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    std::fs::write(&a, "one\ntwo\nthree\nfour\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&a).unwrap();
+    app.toggle_bookmark();
+    app.split_editor();
+    app.editor.cursor_row = 2;
+    app.toggle_bookmark();
+    assert_eq!(
+        app.editor.bookmarked_lines(),
+        vec![1, 3],
+        "the new split starts from the file's marks"
+    );
+    let other = |app: &App| {
+        app.editor_layout.inactive_groups()[0]
+            .editors
+            .iter()
+            .find(|e| e.path.as_deref() == Some(a.as_path()))
+            .expect("the first split still shows a.txt")
+            .bookmarked_lines()
+    };
+    assert_eq!(other(&app), vec![1, 3], "the other split has the new mark");
+    assert_eq!(
+        app.all_bookmarks().get(&a).map(|s| s.len()),
+        Some(2),
+        "one set of two, from either split"
+    );
+
+    app.clear_bookmarks();
+    assert!(other(&app).is_empty(), "cleared in both splits");
+    let state = app.capture_session_state();
+    assert!(state.bookmarks.is_empty(), "nothing to bring back");
+}
+
+/// A tab opened on a file after its marks were set starts without them;
+/// a mark set there adds to the file's set rather than replacing it.
+#[test]
+fn a_mark_set_in_a_second_tab_of_a_file_keeps_the_first_tab_s() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    std::fs::write(&a, "one\ntwo\nthree\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&a).unwrap();
+    app.toggle_bookmark();
+    app.editor.open_in_new_tab(&a).unwrap();
+    app.editor.cursor_row = 2;
+    app.toggle_bookmark();
+    for ed in &app.editor.editors {
+        assert_eq!(ed.bookmarked_lines(), vec![1, 3]);
+    }
+}
+
+/// Two splits of one file each keep their own text, and unsaved edits in
+/// one move its marks only. A mark set there reaches the other on the line
+/// it is on in that split's text, not on the same number.
+#[test]
+fn a_mark_shared_between_two_splits_lands_on_its_line_in_each() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    std::fs::write(&a, "one\ntwo\nthree\nfour\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&a).unwrap();
+    app.toggle_bookmark();
+    app.split_editor();
+    // An unsaved line on top of the new split's copy only.
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 0;
+    app.editor.insert_str("zero\n");
+    // "two" is line 3 here and line 2 in the first split.
+    app.editor.cursor_row = 2;
+    app.toggle_bookmark();
+    assert_eq!(app.editor.bookmarked_lines(), vec![2, 3]);
+    let first = app.editor_layout.inactive_groups()[0]
+        .editors
+        .iter()
+        .find(|e| e.path.as_deref() == Some(a.as_path()))
+        .expect("the first split still shows a.txt")
+        .bookmarked_lines();
+    assert_eq!(first, vec![1, 2], "\"one\" and \"two\" in its own text");
+}
+
 #[test]
 fn navigating_an_unmarked_file_explains_itself_rather_than_doing_nothing() {
     let tmp = tempfile::tempdir().unwrap();

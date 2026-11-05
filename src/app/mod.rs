@@ -48214,27 +48214,68 @@ impl App {
         }
     }
 
-    /// The bookmarks of every open tab, keyed by file. Each tab is an editor
-    /// with its own marks, so the active one's map alone would miss the rest.
+    /// Every tab of every editor group: the focused tab first, then the
+    /// focused group's tabs and the other groups' in order. The order in
+    /// which a tab's copy of a file's marks counts.
+    fn editors_in_bookmark_order(&self) -> impl Iterator<Item = &Editor> + '_ {
+        std::iter::once(&*self.editor).chain(
+            std::iter::once(&self.editor)
+                .chain(self.editor_layout.inactive_groups())
+                .flat_map(|g| g.editors.iter()),
+        )
+    }
+
+    /// The tab whose copy of `path`'s marks counts: the first, in
+    /// [`Self::editors_in_bookmark_order`], that shows the file and holds
+    /// marks for it, since those follow its text; else the first that
+    /// still holds marks from showing it earlier.
+    fn bookmark_source(&self, path: &Path) -> Option<&Editor> {
+        self.editors_in_bookmark_order()
+            .find(|e| e.path.as_deref() == Some(path) && e.bookmarks.contains_key(path))
+            .or_else(|| {
+                self.editors_in_bookmark_order()
+                    .find(|e| e.bookmarks.contains_key(path))
+            })
+    }
+
+    /// The bookmarks of every tab of every editor group, keyed by file, one
+    /// set per file: each file's from [`Self::bookmark_source`]. The tabs of
+    /// a file hold the same marks (see [`Self::share_bookmarks`]), each on
+    /// its own text, so the set is never a union of their copies, which
+    /// would bring back a mark a tab cleared.
     fn all_bookmarks(
         &self,
     ) -> std::collections::HashMap<PathBuf, std::collections::BTreeSet<usize>> {
         let mut all = std::collections::HashMap::new();
-        // A tab's own file first: its marks are the live ones.
-        for ed in &self.editor.editors {
-            if let Some(path) = &ed.path
-                && let Some(set) = ed.bookmarks.get(path)
-            {
-                all.insert(path.clone(), set.clone());
-            }
-        }
-        // Then files the tab showed earlier, whose marks it still holds.
-        for ed in &self.editor.editors {
-            for (path, set) in &ed.bookmarks {
-                all.entry(path.clone()).or_insert_with(|| set.clone());
+        for ed in self.editors_in_bookmark_order() {
+            for path in ed.bookmarks.keys() {
+                if !all.contains_key(path)
+                    && let Some(source) = self.bookmark_source(path)
+                {
+                    all.insert(path.clone(), source.bookmarks[path].clone());
+                }
             }
         }
         all
+    }
+
+    /// Hand saved bookmarks to every tab of every group, each taking its
+    /// file's set trimmed to the lines the file still has.
+    fn restore_bookmarks_everywhere(
+        &mut self,
+        marks: &std::collections::HashMap<PathBuf, std::collections::BTreeSet<usize>>,
+    ) {
+        if marks.is_empty() {
+            return;
+        }
+        for ed in self.editor.editors.iter_mut() {
+            ed.restore_bookmarks(marks);
+        }
+        for group in self.editor_layout.inactive_groups_mut() {
+            for ed in group.editors.iter_mut() {
+                ed.restore_bookmarks(marks);
+            }
+        }
     }
 
     /// Returns the xlsx cells (#1593) it could not put back, as the tabs
@@ -48260,9 +48301,7 @@ impl App {
         }
         // Every tab is its own editor with its own marks: hand each the saved
         // set once its file is open, trimmed to the lines the file still has.
-        for ed in self.editor.editors.iter_mut() {
-            ed.restore_bookmarks(&state.bookmarks);
-        }
+        self.restore_bookmarks_everywhere(&state.bookmarks);
         if state.active_tab < self.editor.tab_count() {
             self.editor.select(state.active_tab);
         }
@@ -48832,11 +48871,71 @@ impl App {
         if !self.editor_is_text() {
             return;
         }
+        // Start from the marks the file's other tabs hold, or toggling here
+        // would hand every tab this tab's set alone.
+        self.adopt_shared_bookmarks();
         self.status = match self.editor.toggle_bookmark_at(line) {
             Some(true) => format!("Bookmark set on line {line}"),
             Some(false) => format!("Bookmark cleared on line {line}"),
             None => String::from("Save the file before bookmarking a line"),
         };
+        if let Some(path) = self.editor.path.clone() {
+            self.share_bookmarks(&path);
+        }
+    }
+
+    /// Give the focused tab its file's marks from another tab, in any
+    /// group, when it holds none of its own: a tab opened on a file after
+    /// its marks were set starts without them.
+    fn adopt_shared_bookmarks(&mut self) {
+        let Some(path) = self.editor.path.clone() else {
+            return;
+        };
+        if self.editor.bookmarks.contains_key(&path) {
+            return;
+        }
+        let Some(source) = self.bookmark_source(&path) else {
+            return;
+        };
+        let set = &source.bookmarks[&path];
+        // A tab showing the file may hold unsaved edits this one lacks:
+        // each mark goes to the line it is on here.
+        let marks = if source.path.as_deref() == Some(path.as_path()) {
+            crate::widgets::editor::carry_marks(set, &source.lines, &self.editor.lines)
+        } else {
+            set.clone()
+        };
+        self.editor.adopt_bookmarks(&path, Some(&marks));
+    }
+
+    /// Hand `path`'s marks, as the focused tab now holds them, to every
+    /// other tab of every group that shows the file or still holds marks
+    /// for it, so a file has one set of marks: one set or cleared in a tab
+    /// is set or cleared in all of them.
+    fn share_bookmarks(&mut self, path: &Path) {
+        let active = self.editor.active_index();
+        let (before, rest) = self.editor.editors.split_at_mut(active);
+        let Some((source, after)) = rest.split_first_mut() else {
+            return;
+        };
+        let source: &Editor = source;
+        let marks = source.bookmarks.get(path);
+        let in_splits = self
+            .editor_layout
+            .inactive_groups_mut()
+            .into_iter()
+            .flat_map(|g| g.editors.iter_mut());
+        for ed in before.iter_mut().chain(after.iter_mut()).chain(in_splits) {
+            if ed.path.as_deref() == Some(path) {
+                // Another copy of the file, whose unsaved edits may differ
+                // from this one's: each mark goes to the line it is on there.
+                let carried =
+                    marks.map(|m| crate::widgets::editor::carry_marks(m, &source.lines, &ed.lines));
+                ed.adopt_bookmarks(path, carried.as_ref());
+            } else if ed.bookmarks.contains_key(path) {
+                ed.adopt_bookmarks(path, marks);
+            }
+        }
     }
 
     /// Jump to the next (`forward`) or previous bookmark in the open file,
@@ -48914,6 +49013,11 @@ impl App {
             return;
         }
         let gone = self.editor.clear_bookmarks();
+        // From every tab of the file, or a copy left in another would bring
+        // the marks back with the next session.
+        if let Some(path) = self.editor.path.clone() {
+            self.share_bookmarks(&path);
+        }
         self.status = if gone == 0 {
             String::from("No bookmarks in this file")
         } else if gone == 1 {

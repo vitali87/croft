@@ -4414,6 +4414,27 @@ impl Editor {
         self.sync_bookmarks_to_buffer();
     }
 
+    /// Take `path`'s marks as another tab holds them (`None`: it has none),
+    /// so every tab keeps one set per file. Trimmed to the buffer when
+    /// `path` is the open file, whose later edits then carry them.
+    pub fn adopt_bookmarks(
+        &mut self,
+        path: &Path,
+        marks: Option<&std::collections::BTreeSet<usize>>,
+    ) {
+        match marks {
+            Some(set) if !set.is_empty() => {
+                self.bookmarks.insert(path.to_path_buf(), set.clone());
+            }
+            _ => {
+                self.bookmarks.remove(path);
+            }
+        }
+        if self.path.as_deref() == Some(path) {
+            self.sync_bookmarks_to_buffer();
+        }
+    }
+
     /// Whether 0-based `line` carries a bookmark in the open file.
     pub fn is_bookmarked(&self, line: usize) -> bool {
         self.path
@@ -18607,6 +18628,22 @@ fn line_mapper<'a>(
                 .next()
         })
     }
+}
+
+/// `marks` (1-based lines of `old`) carried to the lines they sit on in
+/// `new`, another copy of the same file: a second tab of it whose unsaved
+/// edits differ, or the file on disk under a buffer whose edits are being
+/// discarded. A mark on a line `new` does not have is dropped.
+pub fn carry_marks(
+    marks: &std::collections::BTreeSet<usize>,
+    old: &[String],
+    new: &[String],
+) -> std::collections::BTreeSet<usize> {
+    if old == new {
+        return marks.clone();
+    }
+    let map = line_mapper(old, new);
+    marks.iter().filter_map(|&line| map(line)).collect()
 }
 
 /// The line mapping behind [`shift_bookmark_lines`].
