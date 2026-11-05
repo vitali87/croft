@@ -637,11 +637,11 @@ impl Cli {
                     crate::remote::RemoteOutcome::Exited => Ok(()),
                 }
             }
-            Some(CliCommand::Attach { path, solo }) => crate::session::attach(path, solo),
+            Some(CliCommand::Attach { path, solo }) => crate::session_cli::attach(path, solo),
             Some(CliCommand::Record { path, out, stop }) => {
                 crate::session_record::record(path, out, stop)
             }
-            Some(CliCommand::Ls) => crate::session::list(),
+            Some(CliCommand::Ls) => crate::session_cli::list(),
             Some(CliCommand::Plot {
                 kind,
                 x,
