@@ -21918,6 +21918,16 @@ pub struct EditorTabs {
     /// tab is the only one — closing it isn't allowed so we hide the X).
     tab_close_x: Vec<u16>,
     tab_strip_y: u16,
+    /// Index of the first tab drawn in the strip: the strip scrolls by tab
+    /// when there are more of them than fit (wheel over the strip, or the
+    /// active tab changing).
+    tab_scroll: usize,
+    /// The `(active, tab count)` the strip last scrolled itself to reveal, so
+    /// a wheel scroll away from the active tab is not undone on the next frame.
+    tab_revealed: Option<(usize, usize)>,
+    /// Cells at the strip's right end the app paints over (the Customize
+    /// Layout icons); tabs stop short of them. Set before each render.
+    pub tab_reserved_right: u16,
     /// The full pane area (tab strip + body) from the most recent render.
     /// Used by `App::handle_mouse` for hit-testing — the active editor's
     /// own `last_area` only covers the body below the strip.
@@ -21954,6 +21964,9 @@ impl EditorTabs {
             tab_screen_ranges: Vec::new(),
             tab_close_x: Vec::new(),
             tab_strip_y: 0,
+            tab_scroll: 0,
+            tab_revealed: None,
+            tab_reserved_right: 0,
             last_full_area: Rect::default(),
             search_highlight_term: None,
             search_highlight_opts: crate::widgets::search::SearchOpts::default(),
@@ -22365,6 +22378,21 @@ impl EditorTabs {
             }
         }
         None
+    }
+
+    /// Whether `(col, row)` is on the tab strip row of this group, tabs or the
+    /// gap after them.
+    pub fn tab_strip_contains(&self, col: u16, row: u16) -> bool {
+        let r = self.last_full_area;
+        row == self.tab_strip_y && col >= r.x && col < r.x + r.width
+    }
+
+    /// Scroll the tab strip by `delta` tabs (the wheel over it). The render
+    /// clamps the result to what still fills the strip.
+    pub fn scroll_tabs(&mut self, delta: isize) {
+        let last = self.editors.len().saturating_sub(1);
+        self.tab_scroll = self.tab_scroll.saturating_add_signed(delta).min(last);
+        self.tab_revealed = Some((self.active, self.editors.len()));
     }
 
     /// Full filesystem path for a tab, used as the hover tooltip that
@@ -23260,7 +23288,6 @@ impl Widget for &mut EditorTabs {
         self.tab_strip_y = strip.y;
         self.tab_screen_ranges.clear();
         self.tab_close_x.clear();
-        let mut cursor_x = strip.x;
         let active = self.active;
         // Black theme (`focus_gradient` doubles as the theme flag): the
         // active tab wears the muted teal selection fill instead of the
@@ -23277,18 +23304,60 @@ impl Widget for &mut EditorTabs {
         let active_tab_bg = theme.tab_active_bg();
         let pointer = self.hover_pointer;
         let display_labels = disambiguated_tab_labels(&self.editors);
+        // Tabs never run under what the app paints at the strip's right end,
+        // and the strip scrolls by tab when they do not all fit.
+        let strip_right = strip.x
+            + strip
+                .width
+                .saturating_sub(self.tab_reserved_right.min(strip.width));
+        let avail = usize::from(strip_right.saturating_sub(strip.x));
+        let widths: Vec<usize> = display_labels
+            .iter()
+            .map(|l| {
+                // Display CELLS, not chars (#168 review): a CJK file or
+                // directory name is double-width, and a char count shifted
+                // the close button and hit ranges left of the painted text.
+                usize::from(Span::raw(l.as_str()).width() as u16) + 4 // a pad either side, the close cell and a gap
+            })
+            .collect();
+        let n = widths.len();
+        // Last scroll that still fills the strip: past it the tail would leave
+        // blank room on the right while earlier tabs stay hidden.
+        let max_scroll = {
+            let mut first = n.saturating_sub(1);
+            let mut used = widths.get(first).copied().unwrap_or(0);
+            while first > 0 && used + widths[first - 1] <= avail {
+                first -= 1;
+                used += widths[first];
+            }
+            first
+        };
+        if self.tab_revealed != Some((active, n)) {
+            self.tab_revealed = Some((active, n));
+            if active < self.tab_scroll {
+                self.tab_scroll = active;
+            } else {
+                // Scroll right just far enough that the active tab fits whole.
+                while self.tab_scroll < active
+                    && widths[self.tab_scroll..=active].iter().sum::<usize>() > avail
+                {
+                    self.tab_scroll += 1;
+                }
+            }
+        }
+        self.tab_scroll = self.tab_scroll.min(max_scroll);
+        let mut cursor_x = strip.x;
+        let mut hidden_rest = false;
         for (i, ed) in self.editors.iter().enumerate() {
             let label_text = display_labels[i].clone();
-            // Display CELLS, not chars (#168 review): a CJK file or
-            // directory name is double-width, and a char count shifted
-            // the close button and hit ranges left of the painted text.
             let label_chars = Span::raw(label_text.as_str()).width() as u16;
-            let pad: u16 = 1;
-            let close_pad: u16 = 2;
-            let width = label_chars
-                .saturating_add(pad * 2)
-                .saturating_add(close_pad);
-            if cursor_x.saturating_add(width) > strip.x + strip.width {
+            let width = widths[i] as u16;
+            if i < self.tab_scroll
+                || hidden_rest
+                || usize::from(cursor_x.saturating_add(width)) > usize::from(strip_right)
+            {
+                // Scrolled off, or past the room: no cells, no hit range.
+                hidden_rest |= i >= self.tab_scroll;
                 self.tab_screen_ranges.push((cursor_x, 0));
                 self.tab_close_x.push(0);
                 continue;
@@ -35173,6 +35242,58 @@ mod tests {
                 "a click on y lands on y, wrap {wrap}"
             );
         }
+    }
+
+    #[test]
+    fn a_crowded_tab_strip_scrolls_and_stops_short_of_the_layout_icons() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut tabs = EditorTabs::new();
+        for i in 0..12 {
+            let f = tmp.path().join(format!("file_{i:02}.txt"));
+            std::fs::write(&f, "x\n").unwrap();
+            tabs.open_pinned(&f).unwrap();
+        }
+        let area = Rect::new(0, 0, 60, 10);
+        let strip_right = 60 - 9;
+        let draw = |tabs: &mut EditorTabs| {
+            tabs.tab_reserved_right = 9;
+            let mut buf = ratatui::buffer::Buffer::empty(area);
+            ratatui::widgets::Widget::render(&mut *tabs, area, &mut buf);
+        };
+        let visible = |tabs: &EditorTabs| -> Vec<usize> {
+            (0..12)
+                .filter(|&i| tabs.tab_screen_x(i).is_some_and(|(_, w)| w > 0))
+                .collect()
+        };
+        draw(&mut tabs);
+        // The last tab is active, so the strip has scrolled to show it whole,
+        // and nothing reaches the cells the layout icons own.
+        let vis = visible(&tabs);
+        assert!(vis.contains(&11), "the active tab is on screen: {vis:?}");
+        assert!(vis.len() < 12, "not every tab fits");
+        for &i in &vis {
+            let (x, w) = tabs.tab_screen_x(i).unwrap();
+            assert!(x + w <= strip_right, "tab {i} runs under the icons");
+        }
+        // The wheel brings earlier tabs back without activating anything.
+        for _ in 0..12 {
+            tabs.scroll_tabs(-1);
+        }
+        draw(&mut tabs);
+        let vis = visible(&tabs);
+        assert_eq!(vis.first(), Some(&0), "scrolled back to the first tab");
+        assert!(
+            !vis.contains(&11),
+            "the scroll is not snapped back: {vis:?}"
+        );
+        assert_eq!(tabs.active_index(), 11);
+        // Picking another tab reveals it again.
+        tabs.select(0);
+        draw(&mut tabs);
+        assert!(visible(&tabs).contains(&0));
+        tabs.select(11);
+        draw(&mut tabs);
+        assert!(visible(&tabs).contains(&11));
     }
 
     #[test]

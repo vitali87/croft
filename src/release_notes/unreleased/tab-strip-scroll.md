@@ -1,0 +1,1 @@
+fix: With more editor tabs open than fit, the tab strip scrolls (mouse wheel over it, and it follows the active tab) and the last visible tab no longer runs under the Toggle Side Bar, Toggle Panel and Customize Layout icons.
