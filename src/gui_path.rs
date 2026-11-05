@@ -196,7 +196,7 @@ fn repaired(current: Option<&str>, known: impl FnOnce() -> Option<String>) -> Op
 /// Where the login shell's PATH is remembered between launches. A cache: it
 /// is rebuilt by the next probe if it goes.
 fn memory_path() -> PathBuf {
-    crate::app::croft_cache_dir().join("login-path")
+    crate::paths::croft_cache_dir().join("login-path")
 }
 
 /// The PATH remembered in `file` for `shell`. A PATH another shell reported

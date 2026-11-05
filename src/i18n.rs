@@ -210,7 +210,7 @@ pub fn startup_catalog(
 pub fn init(setting: Option<&str>) {
     let user_file_for = |lang: &str| {
         std::fs::read_to_string(
-            crate::prefs::config_dir()
+            crate::paths::config_dir()
                 .join("locales")
                 .join(format!("{lang}.json")),
         )
@@ -323,6 +323,7 @@ pub const TRANSLATABLE: &[&str] = &[
     "Reveal in Finder",
     "Revert",
     "Run and Debug",
+    "S, save anyway",
     "Search",
     "Select for Compare",
     "Show Incoming Calls",

@@ -118,7 +118,7 @@ fn same_dir(a: &str, b: &str) -> bool {
 /// The real store path. The App caches it in a field so tests can point
 /// saves and restores at a tempdir.
 pub fn path() -> PathBuf {
-    crate::prefs::config_dir().join("terminal_sessions.json")
+    crate::paths::config_dir().join("terminal_sessions.json")
 }
 
 /// Load the whole map for READING: a missing file is an empty map (the

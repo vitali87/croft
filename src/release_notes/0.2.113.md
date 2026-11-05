@@ -1,0 +1,1 @@
+fix: Groundwork for on-demand extensions: the language-server layer no longer reaches into the editor, now that text edits and language names live in small shared places of their own. Nothing changes in use.

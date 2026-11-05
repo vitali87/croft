@@ -76,7 +76,7 @@ fn resting_on_an_activity_icon_arms_its_button_hint() {
     let (cx, cy) = (icon.x + icon.width / 2, icon.y);
     app.on_mouse_moved(cx, cy, false);
     assert_eq!(
-        app.ui_tooltip_label,
+        app.ui_tooltip_label.as_deref(),
         Some("Search"),
         "hovering the Search activity-bar icon arms its hint label"
     );

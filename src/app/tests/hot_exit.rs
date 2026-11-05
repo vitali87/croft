@@ -897,7 +897,7 @@ fn hot_exit_keeps_a_cell_still_being_typed_into() {
 fn backed_up_sheet_cells(
     cache: &std::path::Path,
     root: &std::path::Path,
-) -> Vec<crate::widgets::editor::SheetCellEdit> {
+) -> Vec<crate::sheet::SheetCellEdit> {
     hot_exit_files(cache, root)
         .iter()
         .filter_map(|f| crate::hot_exit::Backup::load(f).ok())

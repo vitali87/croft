@@ -440,7 +440,8 @@ pub enum CliCommand {
     Devcontainer {
         /// Workspace folder (default: the current directory).
         path: Option<std::path::PathBuf>,
-        /// Replace the existing container even if the config is unchanged.
+        /// Replace the existing container, discarding changes made inside
+        /// it. Without it, an edited config keeps the container and says so.
         #[arg(long, default_value_t = false)]
         rebuild: bool,
     },
@@ -781,7 +782,7 @@ impl Cli {
                     crate::view_ipc::Verb::View,
                     &path,
                     as_ext.as_deref(),
-                    &crate::app::croft_cache_dir(),
+                    &crate::paths::croft_cache_dir(),
                 ) {
                     eprintln!("{e}");
                     std::process::exit(1);
@@ -822,7 +823,7 @@ impl Cli {
                 if sequence_editor && let Some(configured) = configured_sequence_editor() {
                     std::process::exit(run_git_editor(&configured, &path));
                 }
-                match crate::view_ipc::edit(&path, wait, &crate::app::croft_cache_dir()) {
+                match crate::view_ipc::edit(&path, wait, &crate::paths::croft_cache_dir()) {
                     Ok(()) => Ok(()),
                     // A shell that outlived its croft (a tmux server started
                     // from a pane) keeps GIT_SEQUENCE_EDITOR: git's rebase
@@ -864,7 +865,7 @@ impl Cli {
                     );
                     std::process::exit(1);
                 };
-                let path = crate::prefs::config_dir()
+                let path = crate::paths::config_dir()
                     .join("locales")
                     .join(format!("{code}.json"));
                 if write {

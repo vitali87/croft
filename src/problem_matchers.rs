@@ -313,7 +313,7 @@ pub struct WatchSet {
 }
 
 pub fn matchers_path() -> PathBuf {
-    crate::prefs::config_dir().join("matchers.json")
+    crate::paths::config_dir().join("matchers.json")
 }
 
 pub fn workspace_matchers_path(root: &Path) -> PathBuf {
@@ -423,7 +423,7 @@ impl MatcherSet {
     }
 
     fn extend_from_json(&mut self, json: &str, origin: &str) {
-        let stripped = crate::tasks::strip_jsonc(json);
+        let stripped = crate::jsonc::strip_jsonc(json);
         let rows: Vec<serde_json::Value> = match serde_json::from_str(&stripped) {
             Ok(rows) => rows,
             Err(e) => {
