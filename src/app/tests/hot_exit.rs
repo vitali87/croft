@@ -2357,6 +2357,36 @@ fn a_file_whose_name_is_not_utf8_does_not_stop_the_session_save() {
     );
 }
 
+/// The saved marks sit on the file's lines on disk. A tab hot exit brought
+/// back with unsaved lines above a mark gets it on the same text, not the
+/// same number.
+#[test]
+fn saved_marks_follow_the_unsaved_edits_hot_exit_brought_back() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    std::fs::write(&a, "one\ntwo\nthree\n").unwrap();
+    let sessions = tmp.path().join("sessions");
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.session_dir = Some(sessions.clone());
+    app.editor.open_pinned(&a).unwrap();
+    app.editor.cursor_row = 2;
+    app.toggle_bookmark();
+    app.save_session_for_next_launch().unwrap();
+
+    let mut next = App::new(tmp.path().to_path_buf()).unwrap();
+    next.session_dir = Some(sessions.clone());
+    // As hot exit leaves it: the file's tab with an unsaved line on top.
+    next.editor.open_pinned(&a).unwrap();
+    next.editor.insert_str("zero\n");
+    next.read_saved_session(false);
+    assert!(poll_saved_session_until_done(&mut next));
+    assert_eq!(
+        next.editor.bookmarked_lines(),
+        vec![4],
+        "still on \"three\""
+    );
+}
+
 #[test]
 fn unsaved_count_tracks_dirty_editors() {
     // The Explorer activity badge mirrors VS Code: the count of open editors

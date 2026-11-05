@@ -48436,8 +48436,38 @@ impl App {
             self.sync_open_file_poll_mtime();
         } else {
             self.restore_bookmarks_everywhere(&state.bookmarks);
+            self.carry_saved_marks_onto_unsaved_tabs(&state.bookmarks);
         }
         true
+    }
+
+    /// The saved marks sit on each file's lines on disk (a clean exit saves
+    /// them there), but a tab hot exit brought back holds unsaved edits:
+    /// carry its file's marks from the file on disk onto its own lines.
+    fn carry_saved_marks_onto_unsaved_tabs(
+        &mut self,
+        marks: &std::collections::HashMap<PathBuf, std::collections::BTreeSet<usize>>,
+    ) {
+        let in_splits = self
+            .editor_layout
+            .inactive_groups_mut()
+            .into_iter()
+            .flat_map(|g| g.editors.iter_mut());
+        for ed in self.editor.editors.iter_mut().chain(in_splits) {
+            let Some(path) = ed.path.clone().filter(|_| ed.dirty) else {
+                continue;
+            };
+            let Some(set) = marks.get(&path) else {
+                continue;
+            };
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            let (text, _, _) = ed.encoding.decode(&bytes);
+            let disk = crate::widgets::editor::split_into_lines(&text);
+            let carried = crate::widgets::editor::carry_marks(set, &disk, &ed.lines);
+            ed.adopt_bookmarks(&path, Some(&carried));
+        }
     }
 
     /// Keep the xlsx cells an update relaunch could not put back (#1593)
