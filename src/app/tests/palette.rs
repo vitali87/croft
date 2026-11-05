@@ -2514,3 +2514,28 @@ fn a_bookmark_jump_drops_the_destination_tabs_selection() {
         "no selection left to type over"
     );
 }
+
+/// Secondary carets in the destination tab go too: typing after the jump
+/// must not also edit the lines those carets sat on.
+#[test]
+fn a_bookmark_jump_drops_the_destination_tabs_extra_carets() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    std::fs::write(&a, "alpha\nbeta\ngamma\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&a).unwrap();
+    app.editor.cursor_row = 1;
+    app.editor.toggle_bookmark();
+    app.editor.cursor_row = 0;
+    app.editor.add_cursor_below();
+    assert!(!app.editor.carets.is_empty(), "a second caret is set");
+    app.run_command(Command::ViewBookmarks);
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.cursor_row, 1);
+    assert!(
+        app.editor.carets.is_empty(),
+        "no extra caret left to type at"
+    );
+}

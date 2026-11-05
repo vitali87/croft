@@ -4636,12 +4636,14 @@ impl Editor {
 
     /// Put the cursor on 1-based `line`, clamped to the buffer, unfolding
     /// anything hiding it and centring it in the viewport — a bookmark
-    /// inside a collapsed region must still be reachable.
+    /// inside a collapsed region must still be reachable. The selection and
+    /// any secondary carets go, so the next keystroke edits only that line.
     pub fn jump_to_bookmark(&mut self, line: usize) {
         if self.lines.is_empty() {
             return;
         }
         self.selection = None;
+        self.collapse_carets();
         self.goto_line_centered(line.saturating_sub(1));
         self.reveal_cursor_fold();
         self.ensure_cursor_col_visible();
