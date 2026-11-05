@@ -4637,7 +4637,7 @@ impl Editor {
     /// Put the cursor on 1-based `line`, clamped to the buffer, unfolding
     /// anything hiding it and centring it in the viewport — a bookmark
     /// inside a collapsed region must still be reachable.
-    fn jump_to_bookmark(&mut self, line: usize) {
+    pub fn jump_to_bookmark(&mut self, line: usize) {
         if self.lines.is_empty() {
             return;
         }

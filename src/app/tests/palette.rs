@@ -2450,3 +2450,67 @@ fn the_bookmark_picker_opens_a_file_whose_name_is_not_utf8() {
     assert_eq!(app.editor.path.as_deref(), Some(odd.as_path()));
     assert_eq!(app.editor.cursor_row, 1);
 }
+
+/// The tab the mark came from is the one Enter brings up: a symbol tab
+/// beside the file's own tab holds a mark the file's tab does not, and
+/// the jump lands in the symbol tab rather than the first tab on the file.
+#[test]
+fn the_bookmark_picker_jumps_into_the_tab_that_holds_the_mark() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.py");
+    std::fs::write(&a, "def f():\n    return 1\n\ndef g():\n    return 2\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&a).unwrap();
+    app.open_symbol_tab_for("g".into(), 3, 4);
+    assert!(
+        app.editor.symbol_view.is_some(),
+        "the symbol tab is in front"
+    );
+    let symbol_tab = app.editor.active_index();
+    app.editor.cursor_row = 4;
+    app.editor.toggle_bookmark();
+    let file_tab = app
+        .editor
+        .editors
+        .iter()
+        .position(|e| e.symbol_view.is_none() && e.path.as_deref() == Some(a.as_path()))
+        .expect("the file's own tab");
+    app.editor.select(file_tab);
+    assert!(!app.editor.is_bookmarked(4), "the file's tab has no mark");
+
+    app.run_command(Command::ViewBookmarks);
+    let picker = app.list_picker.as_ref().expect("the picker opens");
+    let labels: Vec<&str> = picker.rows.iter().map(|r| r.label.as_str()).collect();
+    assert_eq!(labels, ["a.py:5  return 2"]);
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.active_index(), symbol_tab);
+    assert_eq!(app.editor.cursor_row, 4);
+    assert!(app.editor.is_bookmarked(4));
+}
+
+/// A selection in the destination tab is gone after the jump, so the next
+/// keystroke edits the bookmarked line instead of typing over the old
+/// selection.
+#[test]
+fn a_bookmark_jump_drops_the_destination_tabs_selection() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    std::fs::write(&a, "alpha\nbeta\ngamma\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&a).unwrap();
+    app.editor.cursor_row = 1;
+    app.editor.toggle_bookmark();
+    app.editor.select_all();
+    assert!(app.editor.selection.is_some());
+    app.run_command(Command::ViewBookmarks);
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.cursor_row, 1);
+    assert!(
+        app.editor.selection.is_none(),
+        "no selection left to type over"
+    );
+}
