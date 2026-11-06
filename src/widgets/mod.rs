@@ -20,6 +20,7 @@ pub mod history_popup;
 pub mod hover;
 pub mod hover_popup;
 pub mod input_prompt;
+pub mod line_edit;
 pub mod list_picker;
 pub mod open_editors;
 pub mod osk;

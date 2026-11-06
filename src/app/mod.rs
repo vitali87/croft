@@ -27579,7 +27579,23 @@ impl App {
                     self.open_search_hit(&hit);
                 }
             }
-            KeyCode::Backspace if self.search.backspace() => {
+            // The caret keys (#1729), as in every input row: Left/Right/
+            // Home/End move inside the focused field, Delete removes ahead,
+            // and Ctrl/Cmd/Alt makes Left/Right/Backspace/Delete walk by a word.
+            KeyCode::Left => self.search.move_caret(|t, c| {
+                crate::widgets::line_edit::caret_left(t, c, key_walks_by_word(key))
+            }),
+            KeyCode::Right => self.search.move_caret(|t, c| {
+                crate::widgets::line_edit::caret_right(t, c, key_walks_by_word(key))
+            }),
+            KeyCode::Home => self.search.move_caret(|_, _| 0),
+            KeyCode::End => self
+                .search
+                .move_caret(|t, _| crate::widgets::line_edit::char_len(t)),
+            KeyCode::Delete if self.search.delete_forward(key_walks_by_word(key)) => {
+                self.refresh_search_if_filtering();
+            }
+            KeyCode::Backspace if self.search.backspace_by(key_walks_by_word(key)) => {
                 self.refresh_search_if_filtering();
             }
             KeyCode::Up => self.search.move_up(),
@@ -52752,16 +52768,22 @@ impl App {
             self.status = String::from("Cmd+V: clipboard is empty");
             return;
         }
+        self.paste_str_into_search(s);
+        self.status = format!(
+            "Cmd+V: pasted into {} field",
+            search_field_name(self.search.field)
+        );
+    }
+
+    /// Paste `s` at the caret of the focused Search field, whichever it is,
+    /// for the clipboard key and the bracketed-paste event alike.
+    fn paste_str_into_search(&mut self, s: &str) {
         self.search.insert_str(s);
         // Replace text doesn't change which files match, so only re-run the
         // scan when the paste landed in a search-affecting field.
         if self.search.field != crate::widgets::search::SearchField::Replace {
             self.submit_search_query();
         }
-        self.status = format!(
-            "Cmd+V: pasted into {} field",
-            search_field_name(self.search.field)
-        );
     }
 
     fn paste_clipboard_into_editor(&mut self, text: Option<&str>) {
@@ -52876,17 +52898,12 @@ impl App {
         // (or tree) the user has since clicked into — the keystroke path is
         // already focus-gated via `match self.focus`, so paste must match it.
         if self.focus == Pane::Editor && self.editor_find.is_some() {
-            let mut new_q = self
-                .editor_find
-                .as_ref()
-                .map(|st| st.query.clone())
-                .unwrap_or_default();
-            for c in s.chars() {
-                if !c.is_control() {
-                    new_q.push(c);
-                }
-            }
-            self.editor_find_set_query(new_q);
+            // Pasted at the caret (#1729), like typing: the bar is an input
+            // line, and a middle-of-query paste must not jump to the end.
+            let text = s.to_string();
+            self.editor_find_edit_at_caret(|t, c| {
+                crate::widgets::editor_find::insert_at(t, c, &text)
+            });
             return false;
         }
         // Finder drag-and-drop into croft arrives via the host terminal as
@@ -52964,8 +52981,7 @@ impl App {
             }
         }
         if self.sidebar_view == SidebarView::Search && self.focus == Pane::Tree {
-            self.search.insert_str_into_query(s);
-            self.submit_search_query();
+            self.paste_str_into_search(s);
             self.status = format!("Pasted {} chars", s.chars().count());
             return false;
         }
@@ -52992,17 +53008,10 @@ impl App {
             }
             Pane::Terminal => {
                 if self.terminal_find.is_some() {
-                    let mut q = self
-                        .terminal_find
-                        .as_ref()
-                        .map(|st| st.query.clone())
-                        .unwrap_or_default();
-                    for c in s.chars() {
-                        if !c.is_control() {
-                            q.push(c);
-                        }
-                    }
-                    self.terminal_find_set_query(q);
+                    // At the caret, like the clipboard key (#1729).
+                    self.terminal_find_edit_at_caret(|t, at| {
+                        crate::widgets::line_edit::insert_at(t, at, s)
+                    });
                 } else {
                     self.paste_terminal_input(s.as_bytes());
                 }
@@ -60123,6 +60132,7 @@ impl App {
         let count = crate::widgets::editor_find::count_matches(&lines, &new_query, opts);
         if let Some(state) = self.terminal_find.as_mut() {
             state.query = new_query.clone();
+            state.set_caret(new_query.chars().count());
             state.set_match_count(count, false);
             state.match_index = None;
         }
@@ -60206,47 +60216,68 @@ impl App {
         }
     }
 
+    /// Edit the terminal find query around its caret (#1729).
+    fn terminal_find_edit_at_caret(&mut self, edit: impl FnOnce(&str, usize) -> (String, usize)) {
+        let Some((text, caret)) = self.terminal_find.as_ref().map(|s| {
+            let (text, caret) = edit(&s.query, s.caret());
+            (text, caret)
+        }) else {
+            return;
+        };
+        self.terminal_find_set_query(text);
+        if let Some(s) = self.terminal_find.as_mut() {
+            s.set_caret(caret);
+        }
+    }
+
+    /// Move the terminal find caret without touching the query.
+    fn terminal_find_move_caret(&mut self, step: impl FnOnce(&str, usize) -> usize) {
+        if let Some(s) = self.terminal_find.as_mut() {
+            let at = step(&s.query, s.caret());
+            s.set_caret(at);
+        }
+    }
+
     fn handle_terminal_find_key(&mut self, key: KeyEvent) {
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        let by_word = key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER | KeyModifiers::ALT);
         match (key.code, key.modifiers) {
             (KeyCode::Esc, _) => self.close_terminal_find(),
             (KeyCode::Enter, _) | (KeyCode::F(3), _) => {
                 self.terminal_find_jump(!shift);
             }
-            (KeyCode::Backspace, _) => {
-                let mut q = self
-                    .terminal_find
-                    .as_ref()
-                    .map(|s| s.query.clone())
-                    .unwrap_or_default();
-                q.pop();
-                self.terminal_find_set_query(q);
-            }
+            // The caret keys (#1729), the same as the editor's find bar:
+            // the terminal's query is a real input line too.
+            (KeyCode::Left, _) => self.terminal_find_move_caret(|t, c| {
+                crate::widgets::editor_find::caret_left(t, c, by_word)
+            }),
+            (KeyCode::Right, _) => self.terminal_find_move_caret(|t, c| {
+                crate::widgets::editor_find::caret_right(t, c, by_word)
+            }),
+            (KeyCode::Home, _) => self.terminal_find_move_caret(|_, _| 0),
+            (KeyCode::End, _) => self.terminal_find_move_caret(|t, _| t.chars().count()),
+            (KeyCode::Delete, _) => self.terminal_find_edit_at_caret(|t, c| {
+                crate::widgets::editor_find::delete_at(t, c, by_word)
+            }),
+            (KeyCode::Backspace, _) => self.terminal_find_edit_at_caret(|t, c| {
+                crate::widgets::editor_find::delete_before(t, c, by_word)
+            }),
             (KeyCode::Char('v'), m)
                 if m.contains(KeyModifiers::CONTROL) || m.contains(KeyModifiers::SUPER) =>
             {
                 if let Some(text) = self.clipboard_text() {
-                    let mut q = self
-                        .terminal_find
-                        .as_ref()
-                        .map(|s| s.query.clone())
-                        .unwrap_or_default();
-                    for c in text.chars() {
-                        if !c.is_control() {
-                            q.push(c);
-                        }
-                    }
-                    self.terminal_find_set_query(q);
+                    self.terminal_find_edit_at_caret(|t, c| {
+                        crate::widgets::editor_find::insert_at(t, c, &text)
+                    });
                 }
             }
             (KeyCode::Char(c), m) if !m.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) => {
-                let mut q = self
-                    .terminal_find
-                    .as_ref()
-                    .map(|s| s.query.clone())
-                    .unwrap_or_default();
-                q.push(c);
-                self.terminal_find_set_query(q);
+                let typed = c.to_string();
+                self.terminal_find_edit_at_caret(|t, caret| {
+                    crate::widgets::editor_find::insert_at(t, caret, &typed)
+                });
             }
             _ => {}
         }
@@ -60848,6 +60879,11 @@ impl App {
     }
 
     fn editor_find_set_query(&mut self, new_query: String) {
+        // A whole-query replacement puts the caret after it; the caret
+        // editors below then move it where the edit left it.
+        if let Some(s) = self.editor_find.as_mut() {
+            s.set_caret(new_query.chars().count());
+        }
         let unchanged = self
             .editor_find
             .as_ref()
@@ -61249,22 +61285,45 @@ impl App {
             .unwrap_or(false)
     }
 
-    /// Append / edit the focused find-bar field: the replace row edits in
-    /// place, the query row re-runs the search via `editor_find_set_query`.
-    fn editor_find_edit_focused(&mut self, edit: impl FnOnce(&mut String)) {
+    /// Edit the focused find field around the caret (#1729): the query row
+    /// passes its caret through `edit`, the replace row — which has none —
+    /// always edits at its end.
+    fn editor_find_edit_at_caret(&mut self, edit: impl FnOnce(&str, usize) -> (String, usize)) {
         if self.editor_find_replace_focused() {
             if let Some(s) = self.editor_find.as_mut() {
-                edit(&mut s.replace);
+                let (text, caret) = edit(&s.replace, s.replace_caret());
+                s.replace = text;
+                s.set_replace_caret(caret);
             }
             return;
         }
-        let mut new_q = self
-            .editor_find
-            .as_ref()
-            .map(|s| s.query.clone())
-            .unwrap_or_default();
-        edit(&mut new_q);
-        self.editor_find_set_query(new_q);
+        let Some((text, caret)) = self.editor_find.as_ref().map(|s| {
+            let (text, caret) = edit(&s.query, s.caret());
+            (text, caret)
+        }) else {
+            return;
+        };
+        self.editor_find_set_query(text);
+        if let Some(s) = self.editor_find.as_mut() {
+            s.set_caret(caret);
+        }
+    }
+
+    /// Move the focused find bar's caret without touching the text. The
+    /// selection a seed put on the query is dropped, as any caret key does.
+    fn editor_find_move_caret(&mut self, step: impl FnOnce(&str, usize) -> usize) {
+        if self.editor_find_replace_focused() {
+            if let Some(s) = self.editor_find.as_mut() {
+                let at = step(&s.replace, s.replace_caret());
+                s.set_replace_caret(at);
+            }
+            return;
+        }
+        if let Some(s) = self.editor_find.as_mut() {
+            let at = step(&s.query, s.caret());
+            s.set_caret(at);
+            s.query_selected = false;
+        }
     }
 
     /// What Ctrl+F puts in the find bar: a one-line selection, else the
@@ -61352,21 +61411,10 @@ impl App {
                 .modifiers
                 .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
         if word_delete {
-            // The word before the end, with any spaces after it, as in a
-            // text field; a lone punctuation mark goes on its own.
-            self.editor_find_edit_focused(|s| {
-                let kept = s.trim_end().len();
-                let word_start = s[..kept]
-                    .char_indices()
-                    .rev()
-                    .find(|&(_, c)| !crate::widgets::editor::is_word_char(c))
-                    .map_or(0, |(i, c)| i + c.len_utf8());
-                let cut = if word_start == kept {
-                    s[..kept].char_indices().next_back().map_or(0, |(i, _)| i)
-                } else {
-                    word_start
-                };
-                s.truncate(cut);
+            // The word before the caret, as in a text field; a lone
+            // punctuation mark goes on its own.
+            self.editor_find_edit_at_caret(|text, caret| {
+                crate::widgets::editor_find::delete_before(text, caret, true)
             });
             return;
         }
@@ -61386,6 +61434,9 @@ impl App {
         let cmd_like = key
             .modifiers
             .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER);
+        let by_word = key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER | KeyModifiers::ALT);
         match (key.code, key.modifiers) {
             (KeyCode::Esc, _) => self.close_editor_find(),
             // `Cmd+Opt+Enter` (Linux: `Ctrl+Alt+Enter`) = Replace All,
@@ -61420,26 +61471,46 @@ impl App {
                     self.editor_find_jump_next();
                 }
             }
+            // The caret keys (#1729): the query is a real input line, so
+            // Left/Right/Home/End move inside it and Delete removes what
+            // lies ahead. Ctrl/Cmd/Alt with Left/Right/Delete walks by a
+            // word, as a text field does.
+            (KeyCode::Left, _) => {
+                self.editor_find_move_caret(|t, c| {
+                    crate::widgets::editor_find::caret_left(t, c, by_word)
+                });
+            }
+            (KeyCode::Right, _) => {
+                self.editor_find_move_caret(|t, c| {
+                    crate::widgets::editor_find::caret_right(t, c, by_word)
+                });
+            }
+            (KeyCode::Home, _) => self.editor_find_move_caret(|_, _| 0),
+            (KeyCode::End, _) => self.editor_find_move_caret(|t, _| t.chars().count()),
+            (KeyCode::Delete, _) => {
+                self.editor_find_edit_at_caret(|t, c| {
+                    crate::widgets::editor_find::delete_at(t, c, by_word)
+                });
+            }
             (KeyCode::Backspace, _) => {
-                self.editor_find_edit_focused(|s| {
-                    s.pop();
+                self.editor_find_edit_at_caret(|t, c| {
+                    crate::widgets::editor_find::delete_before(t, c, false)
                 });
             }
             (KeyCode::Char('v'), m)
                 if m.contains(KeyModifiers::CONTROL) || m.contains(KeyModifiers::SUPER) =>
             {
                 if let Some(text) = self.clipboard_text() {
-                    self.editor_find_edit_focused(|s| {
-                        for c in text.chars() {
-                            if !c.is_control() {
-                                s.push(c);
-                            }
-                        }
+                    self.editor_find_edit_at_caret(|t, c| {
+                        crate::widgets::editor_find::insert_at(t, c, &text)
                     });
                 }
             }
             (KeyCode::Char(c), m) if !m.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) => {
-                self.editor_find_edit_focused(|s| s.push(c));
+                let typed = c.to_string();
+                self.editor_find_edit_at_caret(|t, caret| {
+                    crate::widgets::editor_find::insert_at(t, caret, &typed)
+                });
             }
             _ => {}
         }
@@ -61883,6 +61954,22 @@ impl App {
         // broadcast set; a click that switched panes would send it to one
         // that was never checked. Only the popup's keys answer it.
         if self.pending_terminal_paste.is_some() {
+            return;
+        }
+        // A click on a find bar (in the editor or over a terminal) puts the
+        // caret of the row it lands on, before the pane under it sees it.
+        if matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
+            && !self.modal_overlay_open()
+            && self.context_menu.is_none()
+            && (self
+                .editor_find
+                .as_mut()
+                .is_some_and(|f| f.click_at(m.column, m.row))
+                || self
+                    .terminal_find
+                    .as_mut()
+                    .is_some_and(|f| f.click_at(m.column, m.row)))
+        {
             return;
         }
         // A click on the port-detection toast's action buttons is consumed
@@ -63773,6 +63860,8 @@ impl App {
                     // Click inside one of the input boxes focuses that field.
                     if let Some(field) = self.search.field_at(m.column, m.row) {
                         self.search.focus_field(field);
+                        // A click in the text puts the caret under it.
+                        self.search.click_caret(m.column);
                         return;
                     }
                     if let Some(t) = self.search.toggle_at(m.column, m.row) {
@@ -77705,6 +77794,13 @@ fn is_remote_jump_key(key: KeyEvent) -> bool {
 /// GlobalKeyMap forwarder (no menu relocation) to deliver it here.
 fn is_extensions_jump_key(key: KeyEvent) -> bool {
     is_cmd_shift_letter(key, 'x')
+}
+
+/// Whether a caret or delete key walks by a word rather than a character:
+/// Ctrl, Cmd or Alt held (#1729).
+fn key_walks_by_word(key: KeyEvent) -> bool {
+    key.modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER | KeyModifiers::ALT)
 }
 
 /// `Ctrl/Cmd+Shift+M`: show the PROBLEMS tab from any pane, VS Code's

@@ -2761,3 +2761,147 @@ fn search_announces_every_match_on_a_line() {
     }];
     assert_eq!(app.a11y_snapshot().focus, "Search, 2 matches in 1 file");
 }
+
+/// #1729: the global search inputs are real input lines: Left/Right/Home/End
+/// move inside the field, typing and Backspace/Delete act at the caret, and
+/// Ctrl walks by a word.
+#[test]
+fn search_input_edits_at_the_caret() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::Search);
+    app.search.query = String::from("helo world");
+    let k = |c, m| key(c, m);
+    // The caret follows the end of a text set from outside; Left x7 reaches
+    // the gap between `l` and `o`, and the typed `l` lands there.
+    for _ in 0..7 {
+        app.handle_search_key(k(KeyCode::Left, KeyModifiers::NONE));
+    }
+    app.handle_search_key(k(KeyCode::Char('l'), KeyModifiers::NONE));
+    assert_eq!(app.search.query, "hello world");
+    assert_eq!(app.search.caret(), 4);
+    // Delete removes ahead, Backspace behind.
+    app.handle_search_key(k(KeyCode::Delete, KeyModifiers::NONE));
+    assert_eq!(app.search.query, "hell world");
+    app.handle_search_key(k(KeyCode::Backspace, KeyModifiers::NONE));
+    assert_eq!(app.search.query, "hel world");
+    // Home / End.
+    app.handle_search_key(k(KeyCode::Home, KeyModifiers::NONE));
+    app.handle_search_key(k(KeyCode::Char('>'), KeyModifiers::NONE));
+    assert_eq!(app.search.query, ">hel world");
+    app.handle_search_key(k(KeyCode::End, KeyModifiers::NONE));
+    app.handle_search_key(k(KeyCode::Char('!'), KeyModifiers::NONE));
+    assert_eq!(app.search.query, ">hel world!");
+    // Ctrl+Left walks a word, Ctrl+Backspace cuts one.
+    app.handle_search_key(k(KeyCode::Left, KeyModifiers::CONTROL));
+    assert_eq!(app.search.caret(), 5, "before `world`");
+    app.handle_search_key(k(KeyCode::Backspace, KeyModifiers::CONTROL));
+    assert_eq!(app.search.query, ">world!");
+    assert_eq!(app.search.caret(), 1);
+}
+
+#[test]
+fn search_fields_keep_their_own_carets_and_paste_at_the_caret() {
+    use crate::widgets::search::SearchField;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::Search);
+    app.search.query = String::from("ac");
+    app.handle_search_key(key(KeyCode::Left, KeyModifiers::NONE));
+    // Pasting goes in at the caret, not at the end.
+    app.paste_clipboard_into_search(Some("b"));
+    assert_eq!(app.search.query, "abc");
+    assert_eq!(app.search.caret(), 2);
+    // Another field has a caret of its own, and the query keeps its.
+    app.search.open_replace();
+    app.search.focus_field(SearchField::Replace);
+    app.handle_search_key(key(KeyCode::Char('x'), KeyModifiers::NONE));
+    app.handle_search_key(key(KeyCode::Char('z'), KeyModifiers::NONE));
+    app.handle_search_key(key(KeyCode::Left, KeyModifiers::NONE));
+    app.handle_search_key(key(KeyCode::Char('y'), KeyModifiers::NONE));
+    assert_eq!(app.search.replace, "xyz");
+    app.search.focus_field(SearchField::Query);
+    assert_eq!(app.search.caret(), 2, "the query's caret did not move");
+}
+
+#[test]
+fn a_selected_search_query_is_replaced_by_typing_and_leaves_the_caret_there() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::Search);
+    app.search.query = String::from("alpha");
+    app.handle_search_key(key(KeyCode::Char('a'), KeyModifiers::SUPER));
+    app.handle_search_key(key(KeyCode::Char('b'), KeyModifiers::NONE));
+    assert_eq!(app.search.query, "b");
+    assert_eq!(app.search.caret(), 1);
+    // Left drops a selection and moves from its end.
+    app.handle_search_key(key(KeyCode::Char('a'), KeyModifiers::SUPER));
+    app.handle_search_key(key(KeyCode::Left, KeyModifiers::NONE));
+    assert_eq!(app.search.selection_range(), None);
+}
+
+/// #1729: the find bar's Replace row has a caret of its own, and a long
+/// query scrolls so the caret stays on screen.
+#[test]
+fn find_bar_replace_field_edits_at_its_caret() {
+    let tmp = tempfile::tempdir().unwrap();
+    let file = tmp.path().join("a.txt");
+    std::fs::write(&file, "foo\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&file).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.open_editor_replace();
+    app.handle_editor_find_key(key(KeyCode::Char('f'), KeyModifiers::NONE));
+    app.handle_editor_find_key(key(KeyCode::Tab, KeyModifiers::NONE));
+    for c in "ac".chars() {
+        app.handle_editor_find_key(key(KeyCode::Char(c), KeyModifiers::NONE));
+    }
+    app.handle_editor_find_key(key(KeyCode::Left, KeyModifiers::NONE));
+    app.handle_editor_find_key(key(KeyCode::Char('b'), KeyModifiers::NONE));
+    let st = app.editor_find.as_ref().unwrap();
+    assert_eq!(st.replace, "abc");
+    assert_eq!(st.replace_caret(), 2);
+    assert_eq!(st.query, "f", "the query row was left alone");
+}
+
+#[test]
+fn bracketed_paste_goes_into_the_focused_search_field_at_its_caret() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::Search);
+    app.search.query = String::from("query");
+    app.search.replace = String::from("ac");
+    app.search
+        .focus_field(crate::widgets::search::SearchField::Replace);
+    app.search.move_caret(|_, _| 1);
+    app.handle_paste("b");
+    assert_eq!(
+        app.search.replace, "abc",
+        "the paste lands in Replace, at its caret"
+    );
+    assert_eq!(app.search.query, "query", "and never in the Query field");
+}
+
+#[test]
+fn a_click_on_the_find_bar_puts_the_caret_under_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let mut find = crate::widgets::editor_find::EditorFind::new(
+        String::from("needle"),
+        crate::widgets::search::SearchOpts::default(),
+    );
+    find.last_rect = ratatui::layout::Rect {
+        x: 10,
+        y: 2,
+        width: 48,
+        height: 3,
+    };
+    app.editor_find = Some(find);
+    // The text starts after the border and the two-cell marker: column 13.
+    app.handle_mouse(mouse(
+        crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        15,
+        3,
+    ));
+    assert_eq!(app.editor_find.as_ref().unwrap().caret(), 2);
+}
