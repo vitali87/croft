@@ -2387,6 +2387,64 @@ fn saved_marks_follow_the_unsaved_edits_hot_exit_brought_back() {
     );
 }
 
+/// The file was saved over after the session was (lines added above a
+/// mark, then a crash before the next clean exit): the next launch puts
+/// the mark back on its text, not on its old number in the newer file.
+#[test]
+fn saved_marks_find_their_text_in_a_file_changed_since() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    std::fs::write(&a, "one\ntwo\nthree\n").unwrap();
+    let sessions = tmp.path().join("sessions");
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.session_dir = Some(sessions.clone());
+    app.editor.open_pinned(&a).unwrap();
+    app.editor.cursor_row = 2;
+    app.toggle_bookmark();
+    app.save_session_for_next_launch().unwrap();
+    std::fs::write(&a, "zero\none\ntwo\nthree\n").unwrap();
+
+    let mut next = App::new(tmp.path().to_path_buf()).unwrap();
+    next.session_dir = Some(sessions);
+    next.read_saved_session(true);
+    assert!(poll_saved_session_until_done(&mut next));
+    assert_eq!(next.editor.path.as_deref(), Some(a.as_path()));
+    assert_eq!(
+        next.editor.bookmarked_lines(),
+        vec![4],
+        "still on \"three\""
+    );
+}
+
+/// The same, with hot exit bringing the file back with unsaved lines of
+/// its own: the mark finds its text on disk, then follows those lines.
+#[test]
+fn saved_marks_find_their_text_under_the_unsaved_edits_hot_exit_brought_back() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    std::fs::write(&a, "one\ntwo\nthree\n").unwrap();
+    let sessions = tmp.path().join("sessions");
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.session_dir = Some(sessions.clone());
+    app.editor.open_pinned(&a).unwrap();
+    app.editor.cursor_row = 2;
+    app.toggle_bookmark();
+    app.save_session_for_next_launch().unwrap();
+    std::fs::write(&a, "zero\none\ntwo\nthree\n").unwrap();
+
+    let mut next = App::new(tmp.path().to_path_buf()).unwrap();
+    next.session_dir = Some(sessions);
+    next.editor.open_pinned(&a).unwrap();
+    next.editor.insert_str("new\n");
+    next.read_saved_session(false);
+    assert!(poll_saved_session_until_done(&mut next));
+    assert_eq!(
+        next.editor.bookmarked_lines(),
+        vec![5],
+        "still on \"three\""
+    );
+}
+
 #[test]
 fn unsaved_count_tracks_dirty_editors() {
     // The Explorer activity badge mirrors VS Code: the count of open editors

@@ -48257,6 +48257,9 @@ impl App {
                 .into_iter()
                 .filter(|(path, _)| path.to_str().is_some())
                 .collect(),
+            // Filled by the clean-exit save, the one a later launch may
+            // find the files changed since.
+            bookmark_text: std::collections::HashMap::new(),
         }
     }
 
@@ -48437,21 +48440,41 @@ impl App {
             .without_unsaved_text();
         // A clean exit throws unsaved edits away (the prompt asked first),
         // and the next launch opens the file as it is on disk: a mark that
-        // moved with those edits goes back to its line there.
+        // moved with those edits goes back to its line there. Each mark on
+        // an open file also keeps what its line reads there, for a launch
+        // that finds the file changed since (see
+        // `SessionState::relocate_bookmarks_on_disk`).
         for (path, set) in state.bookmarks.iter_mut() {
-            if let Some(source) = self.bookmark_source(path)
-                && source.dirty
-                && source.path.as_deref() == Some(path.as_path())
-                && let Ok(bytes) = std::fs::read(path)
-            {
+            let Some(source) = self
+                .bookmark_source(path)
+                .filter(|s| s.path.as_deref() == Some(path.as_path()))
+            else {
+                continue;
+            };
+            let disk;
+            let lines: &[String] = if source.dirty {
+                let Ok(bytes) = std::fs::read(path) else {
+                    continue;
+                };
                 // Decoded as the tab decoded it, or a UTF-16 file matches no
                 // line of its buffer.
                 let (text, _, _) = source.encoding.decode(&bytes);
-                let disk = crate::widgets::editor::split_into_lines(&text);
+                disk = crate::widgets::editor::split_into_lines(&text);
                 *set = crate::widgets::editor::carry_marks(set, &source.lines, &disk);
-            }
+                &disk
+            } else {
+                &source.lines
+            };
+            let text = set
+                .iter()
+                .filter_map(|&line| Some((line, lines.get(line.checked_sub(1)?)?.clone())))
+                .collect();
+            state.bookmark_text.insert(path.clone(), text);
         }
         state.bookmarks.retain(|_, set| !set.is_empty());
+        state
+            .bookmark_text
+            .retain(|path, _| state.bookmarks.contains_key(path));
         state.save(&file)
     }
 
@@ -48468,9 +48491,10 @@ impl App {
         let root = self.workspace_root().to_path_buf();
         let (tx, rx) = std::sync::mpsc::channel();
         crate::startup_gate::spawn_after_first_frame(move || {
-            if let Ok(state) = crate::session_state::SessionState::load(&path)
+            if let Ok(mut state) = crate::session_state::SessionState::load(&path)
                 && state.is_of(&root)
             {
+                state.relocate_bookmarks_on_disk();
                 let _ = tx.send(state);
             }
         });
