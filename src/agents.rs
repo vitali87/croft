@@ -192,7 +192,7 @@ pub const QUIET_AFTER: Duration = Duration::from_secs(3);
 
 /// The user-editable table beside the other config files.
 pub fn agents_path() -> PathBuf {
-    crate::prefs::config_dir().join("agents.json")
+    crate::paths::config_dir().join("agents.json")
 }
 
 /// Starter `agents.json`, seeded on first open. Rows here EXTEND the
@@ -319,7 +319,7 @@ impl AgentTable {
         // Row by row, so one malformed row (or a trailing comma) no longer
         // drops every agent the user added.
         let rows: Vec<AgentRow> =
-            serde_json::from_str::<Vec<serde_json::Value>>(&crate::tasks::strip_jsonc(json))
+            serde_json::from_str::<Vec<serde_json::Value>>(&crate::jsonc::strip_jsonc(json))
                 .unwrap_or_default()
                 .into_iter()
                 .filter_map(|r| serde_json::from_value(r).ok())

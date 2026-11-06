@@ -191,7 +191,7 @@ pub(crate) fn percent_decode(s: &str) -> String {
 }
 
 fn prefixes_path() -> PathBuf {
-    crate::app::croft_cache_dir().join("sarif-locations.json")
+    crate::paths::croft_cache_dir().join("sarif-locations.json")
 }
 
 /// Path prefixes learned for `workspace` (from Locate… and earlier matches),
@@ -460,7 +460,7 @@ pub fn provenance_source(run: &Run, loc: &ArtifactLocation) -> Option<RemoteSour
 }
 
 fn trusted_hosts_path() -> PathBuf {
-    crate::app::croft_cache_dir().join("sarif-trusted-hosts")
+    crate::paths::croft_cache_dir().join("sarif-trusted-hosts")
 }
 
 /// The hosts the user allowed croft to download SARIF source from.

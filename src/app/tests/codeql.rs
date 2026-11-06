@@ -4833,7 +4833,8 @@ fn codeql_cli_download_keeps_the_settings_cli_and_reports_failures() {
         // Cleared from settings, the managed copy is found at the next
         // resolution (PATH aside).
         app.codeql_cli_setting = None;
-        let resolved = crate::codeql_cli::resolve(None, None, None, &crate::app::croft_cache_dir());
+        let resolved =
+            crate::codeql_cli::resolve(None, None, None, &crate::paths::croft_cache_dir());
         assert_eq!(
             resolved.source,
             crate::codeql_cli::Source::Managed(crate::codeql_cli::PINNED_VERSION.into())

@@ -210,7 +210,7 @@ fn open_settings_json_seeds_a_config_with_no_settings() {
     assert_eq!(app.editor.path.as_deref(), Some(path.as_path()));
     let written = std::fs::read_to_string(&path).unwrap();
     let doc: serde_json::Value =
-        serde_json::from_str(&crate::tasks::strip_jsonc(&written)).unwrap();
+        serde_json::from_str(&crate::jsonc::strip_jsonc(&written)).unwrap();
     assert_eq!(doc, serde_json::json!({}), "{written}");
     assert!(written.contains("docs/SETTINGS.md"), "{written}");
     assert_eq!(

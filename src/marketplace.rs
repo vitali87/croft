@@ -538,7 +538,7 @@ fn sibling_of(rel: &str, name: &str) -> String {
 /// stricter parse here would skip files the converter then goes on to read
 /// successfully.
 fn referenced_files(text: &str) -> (Option<String>, Option<String>) {
-    let stripped = crate::tasks::strip_jsonc(text);
+    let stripped = crate::jsonc::strip_jsonc(text);
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&stripped) else {
         return (None, None);
     };
