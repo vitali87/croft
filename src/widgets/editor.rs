@@ -4348,22 +4348,22 @@ impl Editor {
             .map(|idx| self.last_inner.y.saturating_add(idx as u16))
     }
 
-    /// Toggle a bookmark on the cursor's line in the open file. Returns
+    /// Toggle a bookmark on `line` (1-based, like breakpoints) in the open
+    /// file. Returns
     /// `Some(true)` when a bookmark was added, `Some(false)` when one was
     /// removed, and `None` when no file is open (a scratch buffer has no
     /// path to key the set by).
-    pub fn toggle_bookmark(&mut self) -> Option<bool> {
+    pub fn toggle_bookmark_at(&mut self, line: usize) -> Option<bool> {
         let path = self.path.clone()?;
         // Settle the existing marks against the buffer before adding one, so
         // the shadow seeded below describes every mark in the set.
         self.sync_bookmarks_to_buffer();
-        let here = self.cursor_row + 1; // bookmarks are 1-based, like breakpoints
         let set = self.bookmarks.entry(path.clone()).or_default();
-        let added = if set.contains(&here) {
-            set.remove(&here);
+        let added = if set.contains(&line) {
+            set.remove(&line);
             false
         } else {
-            set.insert(here);
+            set.insert(line);
             true
         };
         // Drop the empty set so `bookmarked_lines` and the gutter never walk
@@ -4373,6 +4373,12 @@ impl Editor {
         }
         self.seed_bookmark_shadow();
         Some(added)
+    }
+
+    /// Toggle a bookmark on the cursor's line in the open file; see
+    /// [`Self::toggle_bookmark_at`].
+    pub fn toggle_bookmark(&mut self) -> Option<bool> {
+        self.toggle_bookmark_at(self.cursor_row + 1)
     }
 
     /// 1-based bookmark lines for the open file, ascending. Empty when no
@@ -4393,6 +4399,19 @@ impl Editor {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Take over a saved set of bookmarks (a restored session) for the open
+    /// file, trimmed to the lines it still has.
+    pub fn restore_bookmarks(
+        &mut self,
+        marks: &std::collections::HashMap<PathBuf, std::collections::BTreeSet<usize>>,
+    ) {
+        if marks.is_empty() {
+            return;
+        }
+        self.bookmarks = marks.clone();
+        self.sync_bookmarks_to_buffer();
     }
 
     /// Whether 0-based `line` carries a bookmark in the open file.
@@ -4598,12 +4617,14 @@ impl Editor {
 
     /// Put the cursor on 1-based `line`, clamped to the buffer, unfolding
     /// anything hiding it and centring it in the viewport — a bookmark
-    /// inside a collapsed region must still be reachable.
-    fn jump_to_bookmark(&mut self, line: usize) {
+    /// inside a collapsed region must still be reachable. The selection and
+    /// any secondary carets go, so the next keystroke edits only that line.
+    pub fn jump_to_bookmark(&mut self, line: usize) {
         if self.lines.is_empty() {
             return;
         }
         self.selection = None;
+        self.collapse_carets();
         self.goto_line_centered(line.saturating_sub(1));
         self.reveal_cursor_fold();
         self.ensure_cursor_col_visible();

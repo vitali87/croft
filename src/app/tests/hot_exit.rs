@@ -2343,3 +2343,61 @@ fn an_unsaved_edit_after_reopen_as_text_is_still_backed_up() {
             .starts_with("xtop")
     );
 }
+
+/// Bookmarks ride along in the saved session state and come back with the
+/// tabs, trimmed to the lines the reopened file still has.
+#[test]
+fn a_relaunch_restores_the_bookmarks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("b.txt");
+    std::fs::write(&p, "one\ntwo\nthree\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&p).unwrap();
+    app.editor.toggle_bookmark();
+    app.editor.cursor_row = 2;
+    app.editor.toggle_bookmark();
+    let key_path = app
+        .editor
+        .bookmarks
+        .keys()
+        .next()
+        .cloned()
+        .expect("a bookmark");
+    let state = app.capture_session_state();
+    assert_eq!(state.bookmarks.get(&key_path).map(|s| s.len()), Some(2));
+
+    let mut next = App::new(tmp.path().to_path_buf()).unwrap();
+    next.apply_session_state(&state);
+    let marks = next.editor.bookmarks.get(&key_path).expect("bookmarks");
+    assert_eq!(marks.iter().copied().collect::<Vec<_>>(), vec![1, 3]);
+}
+
+/// Every tab is its own editor with its own bookmarks: the session keeps them
+/// all, not just the active tab's, and each file gets its marks back.
+#[test]
+fn a_relaunch_restores_the_bookmarks_of_every_tab() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&a, "one\ntwo\nthree\n").unwrap();
+    std::fs::write(&b, "one\ntwo\nthree\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&a).unwrap();
+    app.editor.toggle_bookmark();
+    app.editor.open_in_new_tab(&b).unwrap();
+    app.editor.cursor_row = 2;
+    app.editor.toggle_bookmark();
+    let state = app.capture_session_state();
+    assert_eq!(state.bookmarks.len(), 2, "both files' marks are saved");
+
+    let mut next = App::new(tmp.path().to_path_buf()).unwrap();
+    next.apply_session_state(&state);
+    let marks = |app: &App, p: &std::path::Path| {
+        tab_for(app, p)
+            .bookmarks
+            .get(p)
+            .map(|s| s.iter().copied().collect::<Vec<_>>())
+    };
+    assert_eq!(marks(&next, &a), Some(vec![1]));
+    assert_eq!(marks(&next, &b), Some(vec![3]));
+}
