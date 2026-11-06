@@ -4040,6 +4040,12 @@ pub struct App {
     git_head_oids: std::collections::BTreeMap<PathBuf, Option<String>>,
     git: GitWorker,
     cursor_blink: CursorBlink,
+    /// Overwrite (Replace) mode, toggled by the Insert key. One switch for the
+    /// whole app, as in VS Code: it follows you from tab to tab.
+    overwrite_mode: bool,
+    /// Whether the terminal's caret was last set to the overwrite block, so
+    /// the style escape is sent only when the wanted shape changes.
+    caret_block_sent: bool,
     editor_click: ClickTracker,
     tree_click: ClickTracker,
     terminal_click: ClickTracker,
@@ -6999,6 +7005,8 @@ impl App {
             git_head_oids: std::collections::BTreeMap::new(),
             git,
             cursor_blink: CursorBlink::new(),
+            overwrite_mode: false,
+            caret_block_sent: false,
             editor_click: ClickTracker::default(),
             tree_click: ClickTracker::default(),
             terminal_click: ClickTracker::default(),
@@ -10595,6 +10603,7 @@ impl App {
         self.editor.blame_enabled = self.inline_blame_enabled;
         self.editor.provenance_overlay = self.provenance_overlay;
         self.editor.auto_close_pairs = self.auto_close_pairs_for(editor_scope_id(&self.editor));
+        self.editor.overwrite = self.overwrite_mode;
         self.editor.whitespace_mode = whitespace_mode_in(
             &self.language_prefs,
             self.whitespace_mode,
@@ -23812,9 +23821,15 @@ impl App {
         } else {
             ""
         };
+        // Overwrite mode rides it too, VS Code's "OVR".
+        let overwrite_mode = if self.overwrite_mode {
+            " \u{b7} OVR"
+        } else {
+            ""
+        };
         let mut seg_texts: Vec<String> = vec![
             format!(
-                " Ln {}, Col {}{coverage}{}{column_mode} ",
+                " Ln {}, Col {}{coverage}{}{column_mode}{overwrite_mode} ",
                 self.editor.cursor_row + 1,
                 self.editor.cursor_col + 1,
                 // The file refuses this user's writes (#1379).
@@ -49895,6 +49910,8 @@ impl App {
             }
             KeyCode::Delete if word => self.editor.delete_word_right(),
             KeyCode::Delete => self.editor.delete_forward(),
+            // Insert flips between insert and overwrite (Replace) typing.
+            KeyCode::Insert if !shift && !cmd && !alt && !word => self.toggle_overwrite_mode(),
             KeyCode::Enter => self.editor.insert_newline(),
             // Tab advances a live snippet, else expands a snippet whose prefix
             // was just typed, else indents (whole block for a multi-line
@@ -49908,6 +49925,7 @@ impl App {
                     && !key.modifiers.contains(KeyModifiers::ALT)
                     && !key.modifiers.contains(KeyModifiers::SUPER) =>
             {
+                self.editor.overwrite = self.overwrite_mode;
                 self.editor.insert_char(c);
                 // With an incomplete list pending but none of it on screen,
                 // typing on still re-asks (#1529).
@@ -67494,6 +67512,38 @@ impl App {
         );
     }
 
+    /// Flip Insert/Overwrite typing (the Insert key).
+    fn toggle_overwrite_mode(&mut self) {
+        self.overwrite_mode = !self.overwrite_mode;
+        self.editor.overwrite = self.overwrite_mode;
+        self.status = format!(
+            "{} mode",
+            if self.overwrite_mode {
+                "Overwrite"
+            } else {
+                "Insert"
+            }
+        );
+    }
+
+    /// Make the terminal's caret match the typing mode: a block while the
+    /// editor has focus in overwrite mode, the steady bar croft runs with
+    /// otherwise. Emitted only when the wanted shape changes.
+    fn sync_caret_style(&mut self) {
+        let want_block = self.overwrite_mode && self.focus == Pane::Editor;
+        if want_block == self.caret_block_sent {
+            return;
+        }
+        self.caret_block_sent = want_block;
+        let style = if want_block {
+            crossterm::cursor::SetCursorStyle::SteadyBlock
+        } else {
+            crossterm::cursor::SetCursorStyle::SteadyBar
+        };
+        let mut out = stdout();
+        let _ = crossterm::execute!(out, style);
+    }
+
     /// Step the gutter's line numbers through on, relative, interval and
     /// off (#1576), on every editor, and save the choice.
     fn cycle_line_numbers(&mut self) {
@@ -83380,6 +83430,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             }
             let draw_start = std::time::Instant::now();
             let drawn = terminal.draw(|f| app.render_for_terminal(f))?;
+            app.sync_caret_style();
             let mut underlays = app.image_underlays(drawn.buffer);
             app.drawn_buffer = Some(drawn.buffer.clone());
             // Record render+flush time and the bytes ratatui shipped this

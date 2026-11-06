@@ -309,6 +309,7 @@ Variables expand as in VS Code: `$TM_FILENAME`, `$TM_FILENAME_BASE`, `$TM_DIRECT
 | `Cmd`/`Ctrl`+`Opt`+`↑` / `↓` | Add a cursor above / below the current one (multi-cursor) |
 | `Cmd`/`Ctrl`+`Shift`+`Opt`+arrows / `PageUp` / `PageDown` | Column (box) selection from the keyboard, like `Shift`+`Opt`+drag: grow the box one row, one column or one screen, with one selection per row, so typing edits the same columns of every line. The box starts at the caret and keeps growing while the carets are the ones it made |
 | View: Toggle Column Selection Mode (palette) | While on, plain `Shift`+arrows and `Shift`+`PageUp` / `PageDown` grow a column selection; the status bar shows "Column Selection" beside Ln/Col |
+| `Insert` | Switch between Insert and Overwrite (Replace) typing: in Overwrite a typed character replaces the one under the caret (at the end of a line it appends, a selection is replaced as usual). One setting for all tabs; the status bar shows "OVR" beside Ln/Col and the terminal caret becomes a block |
 | `Cmd`+`/` / `Ctrl`+`/` | Toggle line comment for the current line or every line the selection touches (language-aware; comments at the block's common indent) |
 | `Shift`+`Alt`+`A` | Toggle block comment around the selection (languages with a block comment) |
 | `Alt`+`Z` | Toggle soft word wrap for this file (overrides the per-language default until the file is reopened) |
