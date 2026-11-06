@@ -1346,50 +1346,6 @@ fn the_palette_clear_bookmarks_command_leaves_a_preview_alone() {
     assert!(app.editor.bookmarked_lines().is_empty());
 }
 
-/// Bookmarks: View Bookmarks lists the marks of every open tab, and picking
-/// a row opens that file at the marked line.
-#[test]
-fn the_bookmark_picker_lists_every_tabs_marks_and_jumps_to_one() {
-    use crate::widgets::command_palette::Command;
-    use crate::widgets::list_picker::ListPurpose;
-    let tmp = tempfile::tempdir().unwrap();
-    let a = tmp.path().join("a.txt");
-    let b = tmp.path().join("b.txt");
-    std::fs::write(&a, "alpha\nbeta\ngamma\n").unwrap();
-    std::fs::write(&b, "one\ntwo\nthree\n").unwrap();
-    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.run_command(Command::ViewBookmarks);
-    assert!(app.list_picker.is_none(), "no bookmarks, no picker");
-    assert!(app.status.contains("No bookmarks"), "was {:?}", app.status);
-
-    app.editor.open(&a).unwrap();
-    app.editor.cursor_row = 1;
-    app.editor.toggle_bookmark();
-    app.editor.open_in_new_tab(&b).unwrap();
-    app.editor.cursor_row = 2;
-    app.editor.toggle_bookmark();
-    app.run_command(Command::ViewBookmarks);
-    let picker = app.list_picker.as_ref().expect("the picker opens");
-    assert_eq!(picker.purpose, ListPurpose::Bookmark);
-    let labels: Vec<&str> = picker.rows.iter().map(|r| r.label.as_str()).collect();
-    assert_eq!(labels, ["a.txt:2  beta", "b.txt:3  three"]);
-
-    // Home and End jump to the first and last row, like PgUp and PgDn.
-    app.handle_key(key(KeyCode::End, KeyModifiers::NONE))
-        .unwrap();
-    assert_eq!(app.list_picker.as_ref().unwrap().selected, 1);
-    app.handle_key(key(KeyCode::Home, KeyModifiers::NONE))
-        .unwrap();
-    assert_eq!(app.list_picker.as_ref().unwrap().selected, 0);
-
-    // Enter on the first row goes to a.txt line 2.
-    app.list_picker.as_mut().unwrap().selected = 0;
-    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
-        .unwrap();
-    assert_eq!(app.editor.path.as_deref(), Some(a.as_path()));
-    assert_eq!(app.editor.cursor_row, 1);
-}
-
 /// Typing in the bookmark picker narrows it to the matching rows.
 #[test]
 fn the_bookmark_picker_filters_as_you_type() {
@@ -1416,122 +1372,6 @@ fn the_bookmark_picker_filters_as_you_type() {
     assert_eq!(
         picker.selected_row().map(|r| r.label.as_str()),
         Some("b.txt:3  three")
-    );
-}
-
-/// The picker lists the files open in a tab only. A tab that showed a file
-/// earlier still holds its marks, for when the file is opened again, but
-/// the closed file is no row.
-#[test]
-fn the_bookmark_picker_leaves_out_a_file_no_tab_shows() {
-    use crate::widgets::command_palette::Command;
-    let tmp = tempfile::tempdir().unwrap();
-    let a = tmp.path().join("a.txt");
-    let b = tmp.path().join("b.txt");
-    std::fs::write(&a, "alpha\nbeta\ngamma\n").unwrap();
-    std::fs::write(&b, "one\ntwo\nthree\n").unwrap();
-    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.editor.open(&a).unwrap();
-    app.toggle_bookmark();
-    // The same tab moves on to b.txt: a.txt is open nowhere now.
-    app.editor.open(&b).unwrap();
-    assert!(
-        app.editor.bookmarks.contains_key(&a),
-        "the tab keeps a's marks"
-    );
-    app.run_command(Command::ViewBookmarks);
-    assert!(app.list_picker.is_none(), "a closed file lists nothing");
-    assert!(app.status.contains("No bookmarks"), "was {:?}", app.status);
-}
-
-/// A file open only in another split is listed, and Enter brings it into
-/// the focused group with its marks.
-#[test]
-fn the_bookmark_picker_lists_the_marks_of_another_split() {
-    use crate::widgets::command_palette::Command;
-    let tmp = tempfile::tempdir().unwrap();
-    let a = tmp.path().join("a.txt");
-    let b = tmp.path().join("b.txt");
-    std::fs::write(&a, "alpha\nbeta\ngamma\n").unwrap();
-    std::fs::write(&b, "one\ntwo\nthree\n").unwrap();
-    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.editor.open(&a).unwrap();
-    app.editor.cursor_row = 2;
-    app.toggle_bookmark();
-    app.split_editor();
-    // The new split's preview tab moves on to b.txt, so a.txt is open only
-    // in the split that lost focus.
-    app.editor.open_preview(&b).unwrap();
-    assert_ne!(app.editor.path.as_deref(), Some(a.as_path()));
-    app.run_command(Command::ViewBookmarks);
-    let picker = app.list_picker.as_ref().expect("the picker opens");
-    let labels: Vec<&str> = picker.rows.iter().map(|r| r.label.as_str()).collect();
-    assert_eq!(labels, ["a.txt:3  gamma"]);
-    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
-        .unwrap();
-    assert_eq!(app.editor.path.as_deref(), Some(a.as_path()));
-    assert_eq!(app.editor.cursor_row, 2);
-    assert_eq!(app.editor.bookmarked_lines(), vec![3], "with its mark");
-}
-
-/// A row's line is on the text of the tab it was listed from. When Enter
-/// opens the file from disk in the focused split, and that tab has unsaved
-/// lines above the mark, the caret lands on the marked text, not the number.
-#[test]
-fn the_bookmark_picker_lands_on_the_marked_text_in_a_copy_opened_from_disk() {
-    use crate::widgets::command_palette::Command;
-    let tmp = tempfile::tempdir().unwrap();
-    let a = tmp.path().join("a.txt");
-    let b = tmp.path().join("b.txt");
-    std::fs::write(&a, "one\ntwo\nthree\nfour\n").unwrap();
-    std::fs::write(&b, "x\n").unwrap();
-    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.editor.open(&a).unwrap();
-    app.editor.cursor_row = 2;
-    app.toggle_bookmark();
-    app.editor.cursor_row = 0;
-    app.editor.cursor_col = 0;
-    app.editor.insert_str("zero\n");
-    app.split_editor();
-    app.editor.open_preview(&b).unwrap();
-    app.run_command(Command::ViewBookmarks);
-    let picker = app.list_picker.as_ref().expect("the picker opens");
-    let labels: Vec<&str> = picker.rows.iter().map(|r| r.label.as_str()).collect();
-    assert_eq!(labels, ["a.txt:4  three"]);
-    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
-        .unwrap();
-    assert_eq!(app.editor.path.as_deref(), Some(a.as_path()));
-    assert_eq!(app.editor.lines[app.editor.cursor_row], "three");
-}
-
-/// A row keeps its file's path as it is: a name that is not UTF-8 survives
-/// the trip through the picker.
-#[cfg(unix)]
-#[test]
-fn the_bookmark_picker_opens_a_file_whose_name_is_not_utf8() {
-    use crate::widgets::command_palette::Command;
-    use std::os::unix::ffi::OsStrExt;
-    let tmp = tempfile::tempdir().unwrap();
-    let odd = tmp.path().join(std::ffi::OsStr::from_bytes(b"caf\xe9.txt"));
-    let other = tmp.path().join("other.txt");
-    if std::fs::write(&odd, "one\ntwo\n").is_err() {
-        return; // a filesystem that takes UTF-8 names only
-    }
-    std::fs::write(&other, "x\n").unwrap();
-    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.editor.open(&odd).unwrap();
-    app.editor.cursor_row = 1;
-    app.toggle_bookmark();
-    app.editor.open_in_new_tab(&other).unwrap();
-    app.run_command(Command::ViewBookmarks);
-    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
-        .unwrap();
-    assert_eq!(app.editor.path.as_deref(), Some(odd.as_path()));
-    assert_eq!(app.editor.cursor_row, 1);
-    assert!(
-        app.status.starts_with("Bookmark at line 2"),
-        "was {:?}",
-        app.status
     );
 }
 
@@ -2472,4 +2312,259 @@ fn the_palette_offers_the_move_editor_commands() {
         Some("View: Move Editor Left")
     );
     assert_eq!(tab_names_852(&app.editor), ["a.py", "c.py", "b.py"]);
+}
+
+/// Bookmarks: View Bookmarks lists the marks of every open tab, and picking
+/// a row opens that file at the marked line.
+#[test]
+fn the_bookmark_picker_lists_every_tabs_marks_and_jumps_to_one() {
+    use crate::widgets::command_palette::Command;
+    use crate::widgets::list_picker::ListPurpose;
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&a, "alpha\nbeta\ngamma\n").unwrap();
+    std::fs::write(&b, "one\ntwo\nthree\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.run_command(Command::ViewBookmarks);
+    assert!(app.list_picker.is_none(), "no bookmarks, no picker");
+    assert!(app.status.contains("No bookmarks"), "was {:?}", app.status);
+
+    app.editor.open(&a).unwrap();
+    app.editor.cursor_row = 1;
+    app.editor.toggle_bookmark();
+    app.editor.open_in_new_tab(&b).unwrap();
+    app.editor.cursor_row = 2;
+    app.editor.toggle_bookmark();
+    app.run_command(Command::ViewBookmarks);
+    let picker = app.list_picker.as_ref().expect("the picker opens");
+    assert_eq!(picker.purpose, ListPurpose::Bookmark);
+    let labels: Vec<&str> = picker.rows.iter().map(|r| r.label.as_str()).collect();
+    assert_eq!(labels, ["a.txt:2  beta", "b.txt:3  three"]);
+
+    // Home and End jump to the first and last row, like PgUp and PgDn.
+    app.handle_key(key(KeyCode::End, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.list_picker.as_ref().unwrap().selected, 1);
+    app.handle_key(key(KeyCode::Home, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.list_picker.as_ref().unwrap().selected, 0);
+
+    // Enter on the first row goes to a.txt line 2.
+    app.list_picker.as_mut().unwrap().selected = 0;
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.path.as_deref(), Some(a.as_path()));
+    assert_eq!(app.editor.cursor_row, 1);
+}
+
+/// View Bookmarks lists open files only: a preview tab that moved on from a
+/// file still holds that file's marks, but the file is no longer open, so
+/// neither it nor its text on disk shows up.
+#[test]
+fn the_bookmark_picker_leaves_out_a_file_no_tab_shows() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&a, "alpha\nbeta\n").unwrap();
+    std::fs::write(&b, "one\ntwo\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_preview(&a).unwrap();
+    app.editor.cursor_row = 1;
+    app.editor.toggle_bookmark();
+    app.editor.open_preview(&b).unwrap();
+    assert!(
+        !app.editor
+            .editors
+            .iter()
+            .any(|e| e.path.as_deref() == Some(a.as_path())),
+        "the preview slot moved on to b.txt"
+    );
+    assert!(
+        app.editor
+            .editors
+            .iter()
+            .any(|e| e.bookmarks.contains_key(&a)),
+        "a tab still holds a.txt's mark"
+    );
+    app.run_command(Command::ViewBookmarks);
+    assert!(app.list_picker.is_none(), "a.txt is not open");
+    assert!(app.status.contains("No bookmarks"), "was {:?}", app.status);
+}
+
+/// The marks of a tab in another editor group are listed too, and Enter on
+/// one moves focus to that group rather than opening the file again here.
+#[test]
+fn the_bookmark_picker_lists_another_groups_marks_and_jumps_into_it() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&a, "alpha\nbeta\ngamma\n").unwrap();
+    std::fs::write(&b, "one\ntwo\nthree\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&a).unwrap();
+    app.editor.cursor_row = 1;
+    app.editor.toggle_bookmark();
+    app.split_editor();
+    app.editor.open_preview(&b).unwrap();
+    app.editor.cursor_row = 2;
+    app.editor.toggle_bookmark();
+    let focused = app.editor_layout.active_dfs_index();
+    app.run_command(Command::ViewBookmarks);
+    let picker = app.list_picker.as_ref().expect("the picker opens");
+    let labels: Vec<&str> = picker.rows.iter().map(|r| r.label.as_str()).collect();
+    assert_eq!(labels, ["a.txt:2  beta", "b.txt:3  three"]);
+
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_ne!(
+        app.editor_layout.active_dfs_index(),
+        focused,
+        "focus moved to the group holding a.txt's mark"
+    );
+    assert_eq!(app.editor.path.as_deref(), Some(a.as_path()));
+    assert_eq!(app.editor.cursor_row, 1);
+    assert!(
+        app.editor.is_bookmarked(1),
+        "the tab with the mark is in front"
+    );
+    assert_eq!(app.status, "Bookmark at line 2");
+}
+
+/// A file open in two groups with the same line marked in both is one row.
+#[test]
+fn the_bookmark_picker_lists_a_mark_two_groups_share_once() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    std::fs::write(&a, "alpha\nbeta\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&a).unwrap();
+    app.editor.cursor_row = 1;
+    app.editor.toggle_bookmark();
+    app.split_editor();
+    app.editor.cursor_row = 1;
+    app.editor.toggle_bookmark();
+    assert!(app.editor.is_bookmarked(1));
+    app.run_command(Command::ViewBookmarks);
+    let picker = app.list_picker.as_ref().expect("the picker opens");
+    let labels: Vec<&str> = picker.rows.iter().map(|r| r.label.as_str()).collect();
+    assert_eq!(labels, ["a.txt:2  beta"]);
+}
+
+/// Enter opens the row's own path: a file name that is not UTF-8 used to
+/// turn into replacement characters on the way and fail to open.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_bookmark_picker_opens_a_file_whose_name_is_not_utf8() {
+    use crate::widgets::command_palette::Command;
+    use std::os::unix::ffi::OsStrExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let odd = tmp.path().join(std::ffi::OsStr::from_bytes(b"caf\xe9.txt"));
+    let other = tmp.path().join("other.txt");
+    std::fs::write(&odd, "one\ntwo\n").unwrap();
+    std::fs::write(&other, "x\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&odd).unwrap();
+    app.editor.cursor_row = 1;
+    app.editor.toggle_bookmark();
+    app.editor.open_in_new_tab(&other).unwrap();
+    app.run_command(Command::ViewBookmarks);
+    assert!(app.list_picker.is_some(), "the picker opens");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.status, "Bookmark at line 2");
+    assert_eq!(app.editor.path.as_deref(), Some(odd.as_path()));
+    assert_eq!(app.editor.cursor_row, 1);
+}
+
+/// The tab the mark came from is the one Enter brings up: a symbol tab
+/// beside the file's own tab holds a mark the file's tab does not, and
+/// the jump lands in the symbol tab rather than the first tab on the file.
+#[test]
+fn the_bookmark_picker_jumps_into_the_tab_that_holds_the_mark() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.py");
+    std::fs::write(&a, "def f():\n    return 1\n\ndef g():\n    return 2\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&a).unwrap();
+    app.open_symbol_tab_for("g".into(), 3, 4);
+    assert!(
+        app.editor.symbol_view.is_some(),
+        "the symbol tab is in front"
+    );
+    let symbol_tab = app.editor.active_index();
+    app.editor.cursor_row = 4;
+    app.editor.toggle_bookmark();
+    let file_tab = app
+        .editor
+        .editors
+        .iter()
+        .position(|e| e.symbol_view.is_none() && e.path.as_deref() == Some(a.as_path()))
+        .expect("the file's own tab");
+    app.editor.select(file_tab);
+    assert!(!app.editor.is_bookmarked(4), "the file's tab has no mark");
+
+    app.run_command(Command::ViewBookmarks);
+    let picker = app.list_picker.as_ref().expect("the picker opens");
+    let labels: Vec<&str> = picker.rows.iter().map(|r| r.label.as_str()).collect();
+    assert_eq!(labels, ["a.py:5  return 2"]);
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.active_index(), symbol_tab);
+    assert_eq!(app.editor.cursor_row, 4);
+    assert!(app.editor.is_bookmarked(4));
+}
+
+/// A selection in the destination tab is gone after the jump, so the next
+/// keystroke edits the bookmarked line instead of typing over the old
+/// selection.
+#[test]
+fn a_bookmark_jump_drops_the_destination_tabs_selection() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    std::fs::write(&a, "alpha\nbeta\ngamma\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&a).unwrap();
+    app.editor.cursor_row = 1;
+    app.editor.toggle_bookmark();
+    app.editor.select_all();
+    assert!(app.editor.selection.is_some());
+    app.run_command(Command::ViewBookmarks);
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.cursor_row, 1);
+    assert!(
+        app.editor.selection.is_none(),
+        "no selection left to type over"
+    );
+}
+
+/// Secondary carets in the destination tab go too: typing after the jump
+/// must not also edit the lines those carets sat on.
+#[test]
+fn a_bookmark_jump_drops_the_destination_tabs_extra_carets() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    std::fs::write(&a, "alpha\nbeta\ngamma\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&a).unwrap();
+    app.editor.cursor_row = 1;
+    app.editor.toggle_bookmark();
+    app.editor.cursor_row = 0;
+    app.editor.add_cursor_below();
+    assert!(!app.editor.carets.is_empty(), "a second caret is set");
+    app.run_command(Command::ViewBookmarks);
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.cursor_row, 1);
+    assert!(
+        app.editor.carets.is_empty(),
+        "no extra caret left to type at"
+    );
 }

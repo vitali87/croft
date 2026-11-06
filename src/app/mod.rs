@@ -338,6 +338,17 @@ struct PendingSelectionRanges {
     positions: Vec<(u32, u32)>,
 }
 
+/// Where a row of Bookmarks: View Bookmarks points: the tab holding the
+/// mark (its editor group by depth-first index, then its index in that
+/// group), the file it shows and the 1-based line.
+#[derive(Clone, Debug)]
+struct BookmarkTarget {
+    group: usize,
+    tab: usize,
+    path: PathBuf,
+    line: usize,
+}
+
 /// Pre-Zen visibility snapshot, restored verbatim when Zen Mode is toggled
 /// off so the workspace returns to exactly the chrome it had before.
 #[derive(Clone, Copy, Debug)]
@@ -4538,9 +4549,6 @@ pub struct App {
         std::sync::mpsc::Receiver<crate::session_state::SessionState>,
         bool,
     )>,
-    /// The targets behind the open View Bookmarks picker (file, 1-based
-    /// line); the picker row `id` indexes into this list.
-    bookmark_targets: Vec<(PathBuf, usize)>,
     /// The tasks backing the open Run Task picker; the picker row `id`
     /// indexes into this list.
     run_tasks: Vec<crate::tasks::Task>,
@@ -5306,6 +5314,8 @@ pub struct App {
     agent_ledger_saved: (u64, std::time::Instant),
     /// The (agent, file) behind each row of the lane-file picker.
     pending_lane_picks: Vec<(String, PathBuf)>,
+    /// The tab and line behind each row of Bookmarks: View Bookmarks.
+    pending_bookmarks: Vec<BookmarkTarget>,
     /// When the running Fix with Navigator turn started (#374): the clock
     /// its PROBLEMS-row spinner runs on, and the flag that keeps the main
     /// loop repainting while it runs. `None` when no fix is streaming.
@@ -7159,7 +7169,6 @@ impl App {
             exit_notes: Vec::new(),
             session_dir: data_dir.as_deref().map(|dir| dir.join("sessions")),
             saved_session: None,
-            bookmark_targets: Vec::new(),
             run_tasks: Vec::new(),
             last_task: None,
             pending_terminal_warning: false,
@@ -7577,6 +7586,7 @@ impl App {
             agent_ledger_store: (!cfg!(test)).then(agent_ledger_store_path),
             agent_ledger_saved: (0, std::time::Instant::now()),
             pending_lane_picks: Vec::new(),
+            pending_bookmarks: Vec::new(),
             problems_fix_started: None,
             http_run: None,
             http_environment: None,
@@ -43281,42 +43291,12 @@ impl App {
                 }
             }
             ListPurpose::Bookmark => {
-                let target = row
-                    .id
-                    .parse::<usize>()
-                    .ok()
-                    .and_then(|i| self.bookmark_targets.get(i).cloned());
-                self.bookmark_targets.clear();
-                if let Some((path, line)) = target {
-                    match self.open_at(&path, line.saturating_sub(1), 0) {
-                        Ok(()) => {
-                            // The row's line is on the text of the tab whose
-                            // marks were listed; a copy opened here from disk
-                            // can differ from it by that tab's unsaved edits.
-                            let here = self
-                                .bookmark_source(&path)
-                                .filter(|e| e.path.as_deref() == Some(path.as_path()))
-                                .and_then(|source| {
-                                    crate::widgets::editor::carry_marks(
-                                        &std::collections::BTreeSet::from([line]),
-                                        &source.lines,
-                                        &self.editor.lines,
-                                    )
-                                    .into_iter()
-                                    .next()
-                                })
-                                .unwrap_or(line);
-                            if here != line {
-                                self.place_caret_at(here - 1, 0);
-                            }
-                            // A tab opened here for a file another group
-                            // shows gets that file's marks too.
-                            self.adopt_shared_bookmarks();
-                            self.status = format!("Bookmark at line {here}");
-                        }
-                        Err(e) => self.status = format!("Cannot open bookmark: {e}"),
-                    }
+                // The row's own path, not one parsed back from text: a
+                // file name that is not UTF-8 would not survive the trip.
+                if let Some(target) = self.pending_bookmarks.get(index).cloned() {
+                    self.jump_to_bookmark(target);
                 }
+                self.pending_bookmarks.clear();
             }
             ListPurpose::OutputChannel => {
                 self.output.sync();
@@ -49130,50 +49110,102 @@ impl App {
     }
 
     /// Bookmarks: View Bookmarks: a filterable list of every bookmark in
-    /// the files open in a tab, in any group (`file:line  text of the
-    /// line`); Enter jumps to it. A file no tab shows is left out, though
-    /// a tab may still hold its marks for when it is opened again.
+    /// the open tabs of every editor group (`file:line  text of the line`),
+    /// Enter jumps to it. Only the file a tab shows counts: the marks a tab
+    /// still holds for a file it showed earlier are not of an open file.
     fn open_bookmark_picker(&mut self) {
         use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
         let root = self.tree.root.clone();
-        let all = self.all_bookmarks();
-        let mut paths: Vec<&PathBuf> = all.keys().collect();
-        paths.sort();
-        let mut rows = Vec::new();
-        let mut targets = Vec::new();
-        for path in paths {
-            // The text the marks sit on: their own tab's, else the first
-            // tab showing the file.
-            let Some(open) = self
-                .bookmark_source(path)
-                .filter(|e| e.path.as_ref() == Some(path))
-                .or_else(|| {
-                    self.editors_in_bookmark_order()
-                        .find(|e| e.path.as_ref() == Some(path))
-                })
-            else {
-                continue;
-            };
-            let lines = &open.lines;
-            let shown = path.strip_prefix(&root).unwrap_or(path).display();
-            // A mark past the last line is no target (see `bookmarked_lines`).
-            for &line in all[path]
-                .iter()
-                .filter(|&&l| (1..=lines.len()).contains(&l))
-            {
-                let text: String = lines[line - 1].trim().chars().take(80).collect();
-                // The row names its target by index: a path shown as text
-                // loses the bytes of a name that is not UTF-8.
-                rows.push(ListRow {
-                    id: targets.len().to_string(),
-                    label: format!("{shown}:{line}  {text}"),
-                });
-                targets.push((path.clone(), line));
+        // The focused group first, so a mark it shares with another group
+        // jumps to the tab already in front of the user.
+        let active = self.editor_layout.active_dfs_index();
+        let groups = std::iter::once((active, &self.editor)).chain(
+            (0..self.editor_layout.leaf_count())
+                .filter_map(|g| Some((g, self.editor_layout.group_ref_at_dfs(g)?))),
+        );
+        // Two tabs on one file (a split, a symbol tab) list a shared mark once.
+        let mut seen = std::collections::HashSet::new();
+        let mut found: Vec<(BookmarkTarget, String)> = Vec::new();
+        for (group, tabs) in groups {
+            // A diff, image or sheet tab's rows are not the file's lines.
+            for (tab, ed) in tabs.editors.iter().enumerate() {
+                let Some(path) = ed.path.as_ref().filter(|_| !ed.has_non_text_view()) else {
+                    continue;
+                };
+                // Only lines the buffer has (see `bookmarked_lines`), and on
+                // a symbol tab only the lines of its symbol, the ones it shows.
+                for line in ed.bookmarked_lines() {
+                    if bookmark_line_shown(ed, line) && seen.insert((path.clone(), line)) {
+                        let text = ed.lines[line - 1].trim().chars().take(80).collect();
+                        let path = path.clone();
+                        found.push((
+                            BookmarkTarget {
+                                group,
+                                tab,
+                                path,
+                                line,
+                            },
+                            text,
+                        ));
+                    }
+                }
             }
         }
-        self.bookmark_targets = targets;
+        found.sort_by(|(a, _), (b, _)| (&a.path, a.line).cmp(&(&b.path, b.line)));
+        self.pending_bookmarks.clear();
+        let mut rows = Vec::with_capacity(found.len());
+        for (target, text) in found {
+            let shown = target.path.strip_prefix(&root).unwrap_or(&target.path);
+            rows.push(ListRow {
+                id: self.pending_bookmarks.len().to_string(),
+                label: format!("{}:{}  {text}", shown.display(), target.line),
+            });
+            self.pending_bookmarks.push(target);
+        }
         let picker = ListPicker::new(ListPurpose::Bookmark, "Bookmarks", rows);
         self.open_list_picker(picker, "No bookmarks (Cmd+Opt+Shift+K sets one)");
+    }
+
+    /// Enter on a View Bookmarks row: focus the editor group and the tab
+    /// that hold the mark, and put the caret on its line there, with no
+    /// selection left over for the next keystroke to type over. A tab that
+    /// closed or moved on since the list opened leaves the file to open in
+    /// that group as any jump would.
+    fn jump_to_bookmark(&mut self, target: BookmarkTarget) {
+        let BookmarkTarget {
+            group,
+            tab,
+            path,
+            line,
+        } = target;
+        if group != self.editor_layout.active_dfs_index()
+            && self.editor_layout.group_ref_at_dfs(group).is_some()
+        {
+            let current = std::mem::take(&mut self.editor);
+            self.editor = self.editor_layout.refocus_to_dfs(current, group);
+        }
+        self.hover_popup = None;
+        self.hover_diagnostic = None;
+        let same_tab = self.editor.editors.get(tab).is_some_and(|ed| {
+            ed.path.as_deref() == Some(path.as_path())
+                && !ed.has_non_text_view()
+                && bookmark_line_shown(ed, line)
+        });
+        if same_tab {
+            self.editor.select(tab);
+        } else if let Err(e) = self.editor.open_preview(&path) {
+            self.status = format!("Cannot open bookmark: {e}");
+            return;
+        } else {
+            // A tab opened here for a file another tab still shows gets
+            // that file's marks too.
+            self.adopt_shared_bookmarks();
+        }
+        self.sync_open_file_poll_mtime();
+        self.editor.jump_to_bookmark(line);
+        self.focus_pane(Pane::Editor);
+        self.poke_cursor();
+        self.status = format!("Bookmark at line {line}");
     }
 
     /// Clear every bookmark in the open file, reporting how many went.
@@ -78590,6 +78622,14 @@ fn is_indentation_to_tabs_key(key: KeyEvent) -> bool {
 /// surfaced as a command).
 fn is_trim_final_newlines_key(key: KeyEvent) -> bool {
     is_cmd_alt_shift_letter(key, 'n')
+}
+
+/// Whether `ed` shows 1-based `line`: every line of an ordinary tab, only
+/// its symbol's lines on a symbol tab (#369), where a caret elsewhere would
+/// be snapped back to the symbol's edge.
+fn bookmark_line_shown(ed: &Editor, line: usize) -> bool {
+    ed.symbol_clip()
+        .is_none_or(|(first, end)| (first..end).contains(&line.saturating_sub(1)))
 }
 
 /// `Cmd+Opt+Shift+K`: toggle a bookmark on the cursor's line (VS Code's
