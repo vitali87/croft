@@ -244,6 +244,14 @@ pub struct Prefs {
     /// read as `auto`, so a typo cannot start a compile on a huge root.
     #[serde(default)]
     pub problems_project_scope: String,
+    /// What a gcc/clang-shaped build message counts its column in:
+    /// `display` (screen cells, a tab running to the next multiple of 8;
+    /// gcc 11 and newer), `byte` (clang, older gcc) or `char`. Unrecognised
+    /// or empty reads as `display`. It decides where "Go to Problem" and a
+    /// click in PROBLEMS put the caret on a line with a tab or a non-ASCII
+    /// character.
+    #[serde(default)]
+    pub build_column_unit: String,
     /// Default whitespace handling for new diff views: `off` (every byte
     /// counts), `leading` (ignore indentation changes), or `all` (ignore every
     /// whitespace-only difference). Unrecognised values read as `off`, so a

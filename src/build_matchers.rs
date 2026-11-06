@@ -27,6 +27,130 @@ use regex::Regex;
 
 use crate::lsp::manager::DiagnosticSeverity;
 
+/// What a gcc/clang-shaped `file:line:col` counts its column in. Compilers
+/// disagree, and a line with a tab or a non-ASCII character shows it:
+///
+/// - `Display`: screen cells, a tab running to the next multiple of the
+///   tab stop (8). gcc 11 and newer, by default.
+/// - `Byte`: UTF-8 bytes, a tab one byte. clang, and gcc before 11 or with
+///   `-fdiagnostics-column-unit=byte`.
+/// - `Char`: characters, as rustc and most other tools count.
+///
+/// A setting rather than a guess from the output: `make` can run either
+/// compiler and print nothing that tells them apart.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ColumnUnit {
+    #[default]
+    Display,
+    Byte,
+    Char,
+}
+
+impl ColumnUnit {
+    /// Read a `build_column_unit` value. Anything unrecognised is `Display`,
+    /// the default, so a typo behaves like no setting.
+    pub fn from_pref(raw: &str) -> Self {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "byte" | "bytes" => Self::Byte,
+            "char" | "chars" | "character" | "characters" => Self::Char,
+            _ => Self::Display,
+        }
+    }
+}
+
+/// gcc's `-ftabstop` default.
+pub const DEFAULT_TABSTOP: usize = 8;
+
+/// The tab stop a command line asks for with `-ftabstop=N`, else 8.
+pub fn tabstop_from_command(cmd: &str) -> usize {
+    cmd.split_whitespace()
+        .find_map(|w| w.strip_prefix("-ftabstop="))
+        .and_then(|n| n.parse::<usize>().ok())
+        .filter(|n| (1..=100).contains(n))
+        .unwrap_or(DEFAULT_TABSTOP)
+}
+
+/// The 0-based character index in `line` of the 0-based column `col` counted
+/// in `unit`. A column past the end of the line lands on its character count,
+/// and one inside a wide character or a tab on that character.
+pub fn char_col(line: &str, col: usize, unit: ColumnUnit, tabstop: usize) -> usize {
+    use unicode_width::UnicodeWidthChar;
+    let tabstop = tabstop.max(1);
+    match unit {
+        ColumnUnit::Char => col,
+        ColumnUnit::Byte => {
+            for (i, (at, c)) in line.char_indices().enumerate() {
+                if col < at + c.len_utf8() {
+                    return i;
+                }
+            }
+            line.chars().count()
+        }
+        ColumnUnit::Display => {
+            let mut cell = 0usize;
+            for (i, c) in line.chars().enumerate() {
+                let w = if c == '\t' {
+                    tabstop - cell % tabstop
+                } else {
+                    c.width().unwrap_or(0)
+                };
+                if col < cell + w {
+                    return i;
+                }
+                cell += w;
+            }
+            line.chars().count()
+        }
+    }
+}
+
+/// Rewrite the columns of the gcc/clang-shaped rows (source `build`) in
+/// `diags` from `unit` to characters, reading each row's line from its file
+/// under `base`: the file the compiler just read, so its line is the one the
+/// column counts. A row whose file cannot be read, or whose line is plain
+/// ASCII without a tab, keeps its column, which is the same in every unit.
+pub fn convert_columns(
+    diags: &mut [BuildDiag],
+    base: &std::path::Path,
+    unit: ColumnUnit,
+    tabstop: usize,
+) {
+    /// A file bigger than this is not read just to place a caret.
+    const MAX_BYTES: u64 = 8 * 1024 * 1024;
+    if unit == ColumnUnit::Char {
+        return;
+    }
+    let mut files: std::collections::HashMap<std::path::PathBuf, Option<Vec<String>>> =
+        std::collections::HashMap::new();
+    for d in diags
+        .iter_mut()
+        .filter(|d| d.source == "build" && d.col > 0)
+    {
+        let path = {
+            let p = std::path::Path::new(&d.file);
+            if p.is_absolute() {
+                p.to_path_buf()
+            } else {
+                base.join(p)
+            }
+        };
+        let lines = files.entry(path).or_insert_with_key(|p| {
+            let small = std::fs::metadata(p).is_ok_and(|m| m.len() <= MAX_BYTES);
+            small
+                .then(|| std::fs::read_to_string(p).ok())
+                .flatten()
+                .map(|t| t.lines().map(str::to_string).collect())
+        });
+        let Some(line) = lines.as_ref().and_then(|l| l.get(d.line as usize)) else {
+            continue;
+        };
+        if line.is_ascii() && !line.contains('\t') {
+            continue;
+        }
+        d.col = char_col(line, d.col as usize, unit, tabstop) as u32;
+    }
+}
+
 /// One matched problem, file still as the tool printed it (resolution
 /// against the command's cwd is the caller's job).
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -482,5 +606,74 @@ csrc/c.c:1:20: error: 'y' undeclared (first use in this function)\n";
              E501 line too long\n",
         );
         assert!(out.is_empty(), "{out:?}");
+    }
+
+    #[test]
+    fn display_columns_run_a_tab_to_the_next_stop() {
+        // gcc 13: three tabs then `return u;` reports column 32 (1-based).
+        let line = "\t\t\treturn u;";
+        assert_eq!(char_col(line, 31, ColumnUnit::Display, 8), 10);
+        assert_eq!(char_col(line, 0, ColumnUnit::Display, 8), 0);
+        // Inside a tab: that tab. Past the end: the character count.
+        assert_eq!(char_col(line, 5, ColumnUnit::Display, 8), 0);
+        assert_eq!(char_col(line, 200, ColumnUnit::Display, 8), 12);
+        // A tab stop of 4.
+        assert_eq!(char_col("\tx", 4, ColumnUnit::Display, 4), 1);
+        // A wide character takes two cells.
+        assert_eq!(char_col("日本x", 4, ColumnUnit::Display, 8), 2);
+    }
+
+    #[test]
+    fn byte_columns_count_utf8_bytes() {
+        // clang: `\t\t\treturn u;` reports 11, `u` being byte 10.
+        assert_eq!(char_col("\t\t\treturn u;", 10, ColumnUnit::Byte, 8), 10);
+        // `é` is two bytes: byte 3 is the `x` after `aé`.
+        assert_eq!(char_col("aéx", 3, ColumnUnit::Byte, 8), 2);
+        assert_eq!(char_col("aéx", 2, ColumnUnit::Byte, 8), 1, "inside é");
+    }
+
+    #[test]
+    fn column_unit_pref_and_tabstop_flag_parse() {
+        assert_eq!(ColumnUnit::from_pref(" Byte "), ColumnUnit::Byte);
+        assert_eq!(ColumnUnit::from_pref("chars"), ColumnUnit::Char);
+        assert_eq!(ColumnUnit::from_pref(""), ColumnUnit::Display);
+        assert_eq!(ColumnUnit::from_pref("nonsense"), ColumnUnit::Display);
+        assert_eq!(tabstop_from_command("make CFLAGS=-ftabstop=4"), 8);
+        assert_eq!(tabstop_from_command("gcc -ftabstop=4 -c x.c"), 4);
+        assert_eq!(tabstop_from_command("gcc -ftabstop=0 -c x.c"), 8);
+        assert_eq!(tabstop_from_command("make"), 8);
+    }
+
+    #[test]
+    fn convert_columns_rewrites_only_build_rows_with_tabs_or_non_ascii() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("t.c"),
+            "int main(void)\n{\n\t\t\tint u;\n\t\t\treturn u;\n}\nplain u;\n",
+        )
+        .unwrap();
+        let row = |line: u32, col: u32, source: &str| BuildDiag {
+            file: "t.c".into(),
+            line,
+            col,
+            severity: DiagnosticSeverity::Warning,
+            message: String::new(),
+            source: source.into(),
+            needs_file: false,
+        };
+        let mut d = vec![
+            row(3, 31, "build"),
+            row(5, 6, "build"),
+            row(3, 31, "rustc"),
+            row(99, 5, "build"),
+        ];
+        convert_columns(&mut d, dir.path(), ColumnUnit::Display, 8);
+        assert_eq!(d[0].col, 10, "tabbed line: display column to character");
+        assert_eq!(d[1].col, 6, "plain ASCII line is untouched");
+        assert_eq!(d[2].col, 31, "another tool's row is untouched");
+        assert_eq!(d[3].col, 5, "a line past the file is untouched");
+        let mut same = vec![row(3, 31, "build")];
+        convert_columns(&mut same, dir.path(), ColumnUnit::Char, 8);
+        assert_eq!(same[0].col, 31, "Char leaves the column alone");
     }
 }

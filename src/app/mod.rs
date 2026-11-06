@@ -3860,6 +3860,9 @@ pub struct App {
     /// Whether the sweep may run unasked (#256): `auto`, `on` or `off`.
     /// Read at startup; an unrecognised value behaves as `auto`.
     problems_project_scope: String,
+    /// What gcc/clang-shaped build messages count their column in
+    /// (`build_column_unit`), applied when a scan installs its rows.
+    build_column_unit: crate::build_matchers::ColumnUnit,
     /// Signals that this workspace is too large for `auto` to run the sweep
     /// unasked (#256). Sent from the sweep's worker, since deciding it is a
     /// whole-workspace walk.
@@ -6881,6 +6884,9 @@ impl App {
             } else {
                 loaded_prefs.problems_project_scope.clone()
             },
+            build_column_unit: crate::build_matchers::ColumnUnit::from_pref(
+                &loaded_prefs.build_column_unit,
+            ),
             test_jump_rx,
             test_jump_tx,
             timeline_fetched: None,
@@ -12447,6 +12453,14 @@ impl App {
             Some(m) => m.scan_batch(output),
             None => self.matchers.scan_batch(output, cmd),
         };
+        let mut diags = diags;
+        let base = cwd.unwrap_or(self.workspace_root());
+        crate::build_matchers::convert_columns(
+            &mut diags,
+            base,
+            self.build_column_unit,
+            crate::build_matchers::tabstop_from_command(cmd),
+        );
         self.install_build_diags(pane, cwd, diags)
     }
 
@@ -15748,6 +15762,90 @@ impl App {
         self.editor.cursor_col = col.min(max_col);
         self.editor.ensure_cursor_col_visible();
         Ok(())
+    }
+
+    /// Go to the next (or previous) entry of the PROBLEMS list from the
+    /// caret: build messages and diagnostics together, files in the panel's
+    /// order and each file's entries by position, wrapping at the ends. The
+    /// entry under the caret is skipped, so repeating the command walks the
+    /// list. Works from the terminal pane too, which is the point after a
+    /// build: the caret jumps into the editor at the message's position.
+    fn go_to_problem(&mut self, forward: bool) {
+        use crate::lsp::manager::DiagnosticSeverity;
+        let here = self.editor.path.clone();
+        let cur = (self.editor.cursor_row as u32, self.editor.cursor_col as u32);
+        let mut list: Vec<(PathBuf, crate::widgets::problems::ProblemItem, u32)> = Vec::new();
+        for g in self.problems.groups() {
+            for item in &g.items {
+                // Compare in characters, as the caret counts: an LSP column
+                // is UTF-16, and only the open file's text is at hand.
+                let ccol = if item.col_utf16 && here.as_ref() == Some(&g.path) {
+                    self.editor
+                        .utf16_col_to_char_pub(item.line as usize, item.col)
+                        as u32
+                } else {
+                    item.col
+                };
+                list.push((g.path.clone(), item.clone(), ccol));
+            }
+        }
+        if list.is_empty() {
+            self.status = String::from("No problems");
+            return;
+        }
+        let key = |e: &(PathBuf, crate::widgets::problems::ProblemItem, u32)| {
+            (e.0.clone(), e.1.line, e.2)
+        };
+        let idx = match here {
+            None => {
+                if forward {
+                    0
+                } else {
+                    list.len() - 1
+                }
+            }
+            Some(p) => {
+                let at = (p, cur.0, cur.1);
+                if forward {
+                    list.iter().position(|e| key(e) > at).unwrap_or(0)
+                } else {
+                    list.iter()
+                        .rposition(|e| key(e) < at)
+                        .unwrap_or(list.len() - 1)
+                }
+            }
+        };
+        let (path, item, _) = list[idx].clone();
+        let opened = if item.col_utf16 {
+            self.open_at_utf16(&path, item.line, item.col)
+        } else {
+            self.open_at(&path, item.line as usize, item.col as usize)
+        };
+        if let Err(e) = opened {
+            self.status = format!("Open failed: {e}");
+            return;
+        }
+        let kind = match item.severity {
+            DiagnosticSeverity::Error => "error",
+            DiagnosticSeverity::Warning => "warning",
+            _ => "info",
+        };
+        let msg: String = item
+            .message
+            .lines()
+            .next()
+            .unwrap_or("")
+            .chars()
+            .take(120)
+            .collect();
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
+        self.status = format!(
+            "Problem {}/{} ({}{}): {kind}: {msg}",
+            idx + 1,
+            list.len(),
+            name.unwrap_or_default(),
+            format_args!(":{}", item.line + 1),
+        );
     }
 
     fn open_at(&mut self, path: &Path, row: usize, col: usize) -> Result<()> {
@@ -57884,6 +57982,8 @@ impl App {
                 }
             }
             Cmd::GoToNextChange => self.jump_editor_change(true),
+            Cmd::GoToNextProblem => self.go_to_problem(true),
+            Cmd::GoToPrevProblem => self.go_to_problem(false),
             Cmd::GoToPrevChange => self.jump_editor_change(false),
             Cmd::MergePrevConflict => {
                 if self.editor.merge.is_some() {
@@ -68382,6 +68482,7 @@ impl App {
         if want_highlight != self.log_highlight {
             self.set_log_highlight(want_highlight);
         }
+        self.build_column_unit = crate::build_matchers::ColumnUnit::from_pref(&p.build_column_unit);
         self.auto_close_pairs = !p.disable_auto_close_pairs;
         self.editor.auto_close_pairs = self.auto_close_pairs;
         self.paste_reindent = !p.disable_paste_reindent;
