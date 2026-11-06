@@ -22360,6 +22360,8 @@ impl EditorTabs {
                 kept.push(ed);
             } else if ed.pinned || ed.dirty {
                 kept.push(ed);
+            } else {
+                self.release_bookmarks(&ed);
             }
         }
         let removed = before - kept.len();
@@ -22394,6 +22396,8 @@ impl EditorTabs {
                     new_active = Some(kept.len());
                 }
                 kept.push(ed);
+            } else {
+                self.release_bookmarks(&ed);
             }
         }
         let removed = before - kept.len();
@@ -22437,6 +22441,8 @@ impl EditorTabs {
                     new_active = kept.len();
                 }
                 kept.push(ed);
+            } else {
+                self.release_bookmarks(&ed);
             }
         }
         let removed = before - kept.len();

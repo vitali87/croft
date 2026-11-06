@@ -1843,6 +1843,52 @@ fn bookmarks_cleared_after_a_file_reopens_stay_cleared() {
     assert!(app.capture_session_state().bookmarks.is_empty());
 }
 
+/// Close Others, Close to the Right and Close Saved keep the marks of
+/// the tabs they close, as closing one tab does.
+#[test]
+fn closing_tabs_in_bulk_keeps_their_files_bookmarks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&a, "one\ntwo\nthree\n").unwrap();
+    std::fs::write(&b, "x\n").unwrap();
+    type Close = fn(&mut App);
+    let closes: [(&str, Close); 3] = [
+        ("Close Others", |app| {
+            app.editor.close_others(0);
+        }),
+        ("Close to the Right", |app| {
+            app.editor.close_to_right(0);
+        }),
+        ("Close Saved", |app| {
+            app.editor.close_saved();
+        }),
+    ];
+    for (name, close) in closes {
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        // b.txt first, so a.txt is the tab right of it.
+        app.editor.open(&b).unwrap();
+        app.editor.open_in_new_tab(&a).unwrap();
+        app.editor.cursor_row = 1;
+        app.toggle_bookmark();
+        close(&mut app);
+        assert!(
+            !app.editor
+                .editors
+                .iter()
+                .any(|e| e.path.as_deref() == Some(a.as_path())),
+            "{name} closed a.txt"
+        );
+        app.settle_bookmarks();
+        let saved = app.capture_session_state().bookmarks;
+        assert_eq!(
+            saved.get(&a).map(|s| s.iter().copied().collect::<Vec<_>>()),
+            Some(vec![2]),
+            "{name} kept a.txt's mark"
+        );
+    }
+}
+
 /// Closing the last tab of a split takes the split away, but not the
 /// marks that tab held.
 #[test]
