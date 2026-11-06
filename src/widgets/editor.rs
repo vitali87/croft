@@ -21918,22 +21918,9 @@ pub struct EditorTabs {
     /// tab is the only one — closing it isn't allowed so we hide the X).
     tab_close_x: Vec<u16>,
     tab_strip_y: u16,
-    /// Index of the first tab drawn in the strip: the strip scrolls by tab
-    /// when there are more of them than fit (wheel over the strip, or the
-    /// active tab changing).
-    tab_scroll: usize,
-    /// The `(active, tab count)` the strip last scrolled itself to reveal, so
-    /// a wheel scroll away from the active tab is not undone on the next frame.
-    tab_revealed: Option<(usize, usize)>,
-    /// Cells at the strip's right end the app paints over (the Customize
-    /// Layout icons); tabs stop short of them. Set before each render.
-    pub tab_reserved_right: u16,
-    /// The "all open tabs" button at the right end of the tab area, drawn only
-    /// when the tabs do not all fit (otherwise empty).
-    tab_list_button: Rect,
-    /// When and which way the wheel last moved the strip, so a touchpad's
-    /// flood of events moves it a tab at a time rather than all at once.
-    tab_wheel_at: Option<(std::time::Instant, isize)>,
+    /// Scroll and button state of the tab strip, boxed to keep this large
+    /// struct (a layout-tree leaf) under clippy's size-difference limit.
+    tab_strip: Box<TabStripState>,
     /// The full pane area (tab strip + body) from the most recent render.
     /// Used by `App::handle_mouse` for hit-testing — the active editor's
     /// own `last_area` only covers the body below the strip.
@@ -21970,11 +21957,7 @@ impl EditorTabs {
             tab_screen_ranges: Vec::new(),
             tab_close_x: Vec::new(),
             tab_strip_y: 0,
-            tab_scroll: 0,
-            tab_revealed: None,
-            tab_reserved_right: 0,
-            tab_list_button: Rect::default(),
-            tab_wheel_at: None,
+            tab_strip: Box::default(),
             last_full_area: Rect::default(),
             search_highlight_term: None,
             search_highlight_opts: crate::widgets::search::SearchOpts::default(),
@@ -22395,9 +22378,14 @@ impl EditorTabs {
         row == self.tab_strip_y && col >= r.x && col < r.x + r.width
     }
 
+    /// Reserve `cells` at the strip's right end for what the app paints there.
+    pub fn set_tab_reserved_right(&mut self, cells: u16) {
+        self.tab_strip.reserved_right = cells;
+    }
+
     /// Whether `(col, row)` is on the "all open tabs" button.
     pub fn tab_list_button_at(&self, col: u16, row: u16) -> bool {
-        let r = self.tab_list_button;
+        let r = self.tab_strip.list_button;
         r.width > 0 && row == r.y && col >= r.x && col < r.x + r.width
     }
 
@@ -22406,13 +22394,13 @@ impl EditorTabs {
     /// per swipe, which would otherwise fling the strip to its end.
     pub fn scroll_tabs_wheel(&mut self, delta: isize) {
         let now = std::time::Instant::now();
-        if let Some((at, dir)) = self.tab_wheel_at
+        if let Some((at, dir)) = self.tab_strip.wheel_at
             && dir == delta
             && now.duration_since(at) < TAB_WHEEL_GAP
         {
             return;
         }
-        self.tab_wheel_at = Some((now, delta));
+        self.tab_strip.wheel_at = Some((now, delta));
         self.scroll_tabs(delta);
     }
 
@@ -22420,8 +22408,8 @@ impl EditorTabs {
     /// clamps the result to what still fills the strip.
     pub fn scroll_tabs(&mut self, delta: isize) {
         let last = self.editors.len().saturating_sub(1);
-        self.tab_scroll = self.tab_scroll.saturating_add_signed(delta).min(last);
-        self.tab_revealed = Some((self.active, self.editors.len()));
+        self.tab_strip.scroll = self.tab_strip.scroll.saturating_add_signed(delta).min(last);
+        self.tab_strip.revealed = Some((self.active, self.editors.len()));
     }
 
     /// Full filesystem path for a tab, used as the hover tooltip that
@@ -23235,6 +23223,28 @@ impl DerefMut for EditorTabs {
 // derives colors for every manifest theme, so the strip follows the selected
 // theme instead of staying VS-Code navy. Only the label foregrounds stay
 // fixed: this muted grey and white are legible on all dark themes.
+/// The tab strip's scroll position and button, see `EditorTabs::tab_strip`.
+#[derive(Default)]
+struct TabStripState {
+    /// Index of the first tab drawn in the strip: it scrolls by tab when
+    /// there are more of them than fit (wheel over the strip, or the active
+    /// tab changing).
+    scroll: usize,
+    /// The `(active, tab count)` the strip last scrolled itself to reveal, so
+    /// a wheel scroll away from the active tab is not undone on the next
+    /// frame.
+    revealed: Option<(usize, usize)>,
+    /// Cells at the strip's right end the app paints over (the Customize
+    /// Layout icons); tabs stop short of them. Set before each render.
+    reserved_right: u16,
+    /// The "all open tabs" button at the right end of the tab area, drawn
+    /// only when the tabs do not all fit (otherwise empty).
+    list_button: Rect,
+    /// When and which way the wheel last moved the strip, so a touchpad's
+    /// flood of events moves it a tab at a time rather than all at once.
+    wheel_at: Option<(std::time::Instant, isize)>,
+}
+
 /// Cells the "all open tabs" button takes at the right end of a crowded strip.
 const TAB_LIST_W: u16 = 3;
 /// The least time between two tabs of wheel scrolling in one direction.
@@ -23342,7 +23352,7 @@ impl Widget for &mut EditorTabs {
         let mut strip_right = strip.x
             + strip
                 .width
-                .saturating_sub(self.tab_reserved_right.min(strip.width));
+                .saturating_sub(self.tab_strip.reserved_right.min(strip.width));
         let avail_full = usize::from(strip_right.saturating_sub(strip.x));
         let widths: Vec<usize> = display_labels
             .iter()
@@ -23356,10 +23366,10 @@ impl Widget for &mut EditorTabs {
         let n = widths.len();
         // Tabs that do not all fit get an "all open tabs" button in the last
         // cells of the tab area, so the hidden ones stay reachable.
-        self.tab_list_button = Rect::default();
+        self.tab_strip.list_button = Rect::default();
         if widths.iter().sum::<usize>() > avail_full && avail_full > usize::from(TAB_LIST_W) {
             strip_right -= TAB_LIST_W;
-            self.tab_list_button = Rect {
+            self.tab_strip.list_button = Rect {
                 x: strip_right,
                 y: strip.y,
                 width: TAB_LIST_W,
@@ -23393,32 +23403,32 @@ impl Widget for &mut EditorTabs {
             }
             first
         };
-        if self.tab_revealed != Some((active, n)) {
-            self.tab_revealed = Some((active, n));
-            if active < self.tab_scroll {
-                self.tab_scroll = active;
+        if self.tab_strip.revealed != Some((active, n)) {
+            self.tab_strip.revealed = Some((active, n));
+            if active < self.tab_strip.scroll {
+                self.tab_strip.scroll = active;
             } else {
                 // Scroll right just far enough that the active tab fits whole.
-                while self.tab_scroll < active
-                    && widths[self.tab_scroll..=active].iter().sum::<usize>() > avail
+                while self.tab_strip.scroll < active
+                    && widths[self.tab_strip.scroll..=active].iter().sum::<usize>() > avail
                 {
-                    self.tab_scroll += 1;
+                    self.tab_strip.scroll += 1;
                 }
             }
         }
-        self.tab_scroll = self.tab_scroll.min(max_scroll);
+        self.tab_strip.scroll = self.tab_strip.scroll.min(max_scroll);
         let mut cursor_x = strip.x;
         let mut hidden_rest = false;
         for (i, ed) in self.editors.iter().enumerate() {
             let label_text = display_labels[i].clone();
             let label_chars = Span::raw(label_text.as_str()).width() as u16;
             let width = widths[i] as u16;
-            if i < self.tab_scroll
+            if i < self.tab_strip.scroll
                 || hidden_rest
                 || usize::from(cursor_x.saturating_add(width)) > usize::from(strip_right)
             {
                 // Scrolled off, or past the room: no cells, no hit range.
-                hidden_rest |= i >= self.tab_scroll;
+                hidden_rest |= i >= self.tab_strip.scroll;
                 self.tab_screen_ranges.push((cursor_x, 0));
                 self.tab_close_x.push(0);
                 continue;
@@ -35317,7 +35327,7 @@ mod tests {
         let area = Rect::new(0, 0, 60, 10);
         let strip_right = 60 - 9;
         let draw = |tabs: &mut EditorTabs| {
-            tabs.tab_reserved_right = 9;
+            tabs.set_tab_reserved_right(9);
             let mut buf = ratatui::buffer::Buffer::empty(area);
             ratatui::widgets::Widget::render(&mut *tabs, area, &mut buf);
         };

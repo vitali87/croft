@@ -22851,7 +22851,7 @@ impl App {
                     rects[active_idx] = ed_rect;
                 }
                 let active_area = rects[active_idx];
-                self.editor.tab_reserved_right = reserve(active_area);
+                self.editor.set_tab_reserved_right(reserve(active_area));
                 frame.render_widget(&mut self.editor, active_area);
                 let inactive_rects: Vec<Rect> = rects
                     .iter()
@@ -22866,7 +22866,7 @@ impl App {
                     .zip(inactive_rects)
                 {
                     group.hover_pointer = pointer;
-                    group.tab_reserved_right = reserve(rect);
+                    group.set_tab_reserved_right(reserve(rect));
                     frame.render_widget(group, rect);
                 }
                 // Every boundary in the grid is a draggable seam (one per
@@ -22894,7 +22894,7 @@ impl App {
                         .style(Style::default().bg(self.theme.editor_bg())),
                     full_strip,
                 );
-                self.editor.tab_reserved_right = reserve(ed_rect);
+                self.editor.set_tab_reserved_right(reserve(ed_rect));
                 frame.render_widget(&mut self.editor, ed_rect);
                 self.editor_seams.clear();
                 self.update_editor_image_overlay(0, ed_rect);
@@ -22902,7 +22902,7 @@ impl App {
                 self.paint_minimap(frame, img_rect);
                 ed_rect
             } else {
-                self.editor.tab_reserved_right = reserve(editor_area);
+                self.editor.set_tab_reserved_right(reserve(editor_area));
                 frame.render_widget(&mut self.editor, editor_area);
                 self.editor_seams.clear();
                 self.update_editor_image_overlay(0, editor_area);
@@ -42906,7 +42906,6 @@ impl App {
         )
     }
 
-    /// Act on the row chosen in the list picker.
     /// The "all open tabs" list: every tab of the active group by its strip
     /// label, the current one selected. Picking one activates it, scrolling the
     /// strip to it.
@@ -42927,6 +42926,7 @@ impl App {
         self.open_list_picker(picker, "No open tabs");
     }
 
+    /// Act on the row chosen in the list picker.
     fn confirm_list_picker(&mut self) {
         use crate::widgets::list_picker::ListPurpose;
         let Some(picker) = self.list_picker.as_ref() else {
