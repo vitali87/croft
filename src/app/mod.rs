@@ -11124,6 +11124,9 @@ impl App {
         if rect_contains(icons.customize, col, row) {
             return Some("Customize Layout");
         }
+        if self.editor.tab_list_button_at(col, row) {
+            return Some("Show All Open Tabs");
+        }
         // Activity bar: always visible, so it is checked regardless of which
         // sidebar view is open.
         if let Some(icon) = self.activity_icon_at(col, row) {

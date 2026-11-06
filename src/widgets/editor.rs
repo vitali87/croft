@@ -23378,18 +23378,15 @@ impl Widget for &mut EditorTabs {
             let hovered = self.hover_pointer.is_some_and(|(px, py)| {
                 py == strip.y && px >= strip_right && px < strip_right + TAB_LIST_W
             });
-            let style = Style::default()
-                .fg(if hovered {
-                    TAB_ACTIVE_FG
-                } else {
-                    TAB_INACTIVE_FG
-                })
-                .bg(if hovered {
-                    theme.tab_hover_bg()
-                } else {
-                    theme.tab_strip_bg()
-                });
-            buf.set_string(strip_right, strip.y, " \u{eab4} ", style);
+            // As the layout icons beside it: the glyph goes from grey to the
+            // accent on hover, the cell keeps the strip's own background.
+            let fg = if hovered {
+                theme.ui(Color::Rgb(0x4e, 0x9a, 0xff))
+            } else {
+                theme.ui(Color::Rgb(0xcc, 0xcc, 0xcc))
+            };
+            let style = Style::default().fg(fg).bg(theme.tab_strip_bg());
+            buf.set_string(strip_right, strip.y, " \u{2261} ", style);
         }
         let avail = usize::from(strip_right.saturating_sub(strip.x));
         // Last scroll that still fills the strip: past it the tail would leave

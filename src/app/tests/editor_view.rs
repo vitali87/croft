@@ -2309,6 +2309,7 @@ fn a_crowded_tab_strip_offers_a_list_of_all_open_tabs() {
     let col = (0..100)
         .find(|&c| app.editor.tab_list_button_at(c, y))
         .expect("the tabs overflow, so the strip draws the list button");
+    assert_eq!(app.ui_tooltip_at(col, y), Some("Show All Open Tabs"));
     app.handle_mouse(mouse(
         crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
         col,
