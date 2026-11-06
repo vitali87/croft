@@ -4549,6 +4549,10 @@ pub struct App {
         std::sync::mpsc::Receiver<crate::session_state::SessionState>,
         bool,
     )>,
+    /// The bookmarks of files no tab holds marks for any more, on their
+    /// saved lines: what the last tab holding them left when it closed
+    /// (see [`Self::settle_bookmarks`]).
+    closed_bookmarks: std::collections::HashMap<PathBuf, std::collections::BTreeSet<usize>>,
     /// The tasks backing the open Run Task picker; the picker row `id`
     /// indexes into this list.
     run_tasks: Vec<crate::tasks::Task>,
@@ -7169,6 +7173,7 @@ impl App {
             exit_notes: Vec::new(),
             session_dir: data_dir.as_deref().map(|dir| dir.join("sessions")),
             saved_session: None,
+            closed_bookmarks: std::collections::HashMap::new(),
             run_tasks: Vec::new(),
             last_task: None,
             pending_terminal_warning: false,
@@ -22220,6 +22225,8 @@ impl App {
         if !self.editor_layout.is_split() || !self.editor.is_blank_initial() {
             return;
         }
+        // The marks its last tab left go before the group does.
+        self.settle_bookmarks();
         // The focused group is empty; drop it and promote a surviving group to
         // become the new active editor. Evict the right slot's image so it
         // can't ghost after the column disappears.
@@ -48281,7 +48288,8 @@ impl App {
     /// set per file: each file's from [`Self::bookmark_source`]. The tabs of
     /// a file hold the same marks (see [`Self::share_bookmarks`]), each on
     /// its own text, so the set is never a union of their copies, which
-    /// would bring back a mark a tab cleared.
+    /// would bring back a mark a tab cleared. A file whose tabs all closed
+    /// adds the marks they left.
     fn all_bookmarks(
         &self,
     ) -> std::collections::HashMap<PathBuf, std::collections::BTreeSet<usize>> {
@@ -48295,7 +48303,53 @@ impl App {
                 }
             }
         }
+        for (path, set) in &self.closed_bookmarks {
+            all.entry(path.clone()).or_insert_with(|| set.clone());
+        }
         all
+    }
+
+    /// Keep the marks the tabs closed since the last call left, for each
+    /// file no open tab holds marks for, and hand a file's kept marks back
+    /// to the tabs that show it again. Run every tick, before anything
+    /// reads the marks. Returns whether a tab took marks back.
+    pub(crate) fn settle_bookmarks(&mut self) -> bool {
+        let mut released = self.editor.take_released_bookmarks();
+        for group in self.editor_layout.inactive_groups_mut() {
+            released.extend(group.take_released_bookmarks());
+        }
+        for marks in released {
+            for (path, set) in marks {
+                if !self
+                    .editors_in_bookmark_order()
+                    .any(|e| e.bookmarks.contains_key(&path))
+                {
+                    self.closed_bookmarks.insert(path, set);
+                }
+            }
+        }
+        if self.closed_bookmarks.is_empty() {
+            return false;
+        }
+        let mut taken = Vec::new();
+        let groups =
+            std::iter::once(&mut self.editor).chain(self.editor_layout.inactive_groups_mut());
+        for group in groups {
+            // A diff, image or sheet tab's rows are not the file's lines.
+            for ed in group.editors.iter_mut().filter(|e| !e.has_non_text_view()) {
+                if let Some(path) = ed.path.clone()
+                    && !ed.bookmarks.contains_key(&path)
+                    && let Some(set) = self.closed_bookmarks.get(&path)
+                {
+                    ed.adopt_bookmarks(&path, Some(set));
+                    taken.push(path);
+                }
+            }
+        }
+        for path in &taken {
+            self.closed_bookmarks.remove(path);
+        }
+        !taken.is_empty()
     }
 
     /// Hand saved bookmarks to every tab of every group, each taking its
@@ -48307,6 +48361,8 @@ impl App {
         if marks.is_empty() {
             return;
         }
+        self.closed_bookmarks
+            .retain(|path, _| !marks.contains_key(path));
         for ed in self.editor.editors.iter_mut() {
             ed.restore_bookmarks(marks);
         }
@@ -48369,10 +48425,13 @@ impl App {
 
     /// Save the session for the next launch of this workspace (a clean
     /// exit): its tabs, layout and bookmarks, without unsaved text.
-    fn save_session_for_next_launch(&self) -> Result<()> {
+    fn save_session_for_next_launch(&mut self) -> Result<()> {
         let Some(file) = self.saved_session_path() else {
             return Ok(());
         };
+        // A tab closed since the last tick still holds the only copy of
+        // its file's marks.
+        self.settle_bookmarks();
         let mut state = self
             .capture_session_state_with(false)
             .without_unsaved_text();
@@ -49043,6 +49102,8 @@ impl App {
     /// group, when it holds none of its own: a tab opened on a file after
     /// its marks were set starts without them.
     fn adopt_shared_bookmarks(&mut self) {
+        // The marks a file's last tab left when it closed come back first.
+        self.settle_bookmarks();
         let Some(path) = self.editor.path.clone() else {
             return;
         };
@@ -49068,6 +49129,9 @@ impl App {
     /// for it, so a file has one set of marks: one set or cleared in a tab
     /// is set or cleared in all of them.
     fn share_bookmarks(&mut self, path: &Path) {
+        // The focused tab's set is the file's now; marks a closed tab left
+        // would bring back one it cleared.
+        self.closed_bookmarks.remove(path);
         let active = self.editor.active_index();
         let (before, rest) = self.editor.editors.split_at_mut(active);
         let Some((source, after)) = rest.split_first_mut() else {
@@ -83368,6 +83432,8 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         // Pictures baked off the UI thread (#1973) go up as they land.
         let images_changed =
             app.poll_chrome_bake() | app.poll_welcome_bake() | app.poll_saved_session();
+        // A closed tab's bookmarks are kept, and come back with its file.
+        let bookmarks_changed = app.settle_bookmarks();
         let live_run_changed =
             app.tick_live_run() | app.sync_markdown_scroll() | app.tick_minimap();
         app.tick_code_lens();
@@ -83525,6 +83591,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || auto_save_changed
             || highlights_changed
             || images_changed
+            || bookmarks_changed
             || live_run_changed
             || code_lens_changed
             || ws_symbols_changed
