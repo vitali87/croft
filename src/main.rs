@@ -113,6 +113,7 @@ mod sarif;
 mod scrubber;
 mod search_editor;
 mod session;
+mod session_cli;
 mod session_host;
 mod session_record;
 mod session_state;
