@@ -258,7 +258,7 @@ pub fn discover_configs(root: &Path) -> Vec<DebugConfig> {
 /// (`{"configurations": [...]}`) or a bare array. Entries without a `name`
 /// or `type` are skipped (VS Code refuses to run those too). Pure.
 pub fn parse_launch_json(text: &str, source: &'static str) -> Vec<DebugConfig> {
-    let Ok(v) = serde_json::from_str::<Value>(&crate::tasks::strip_jsonc(text)) else {
+    let Ok(v) = serde_json::from_str::<Value>(&crate::jsonc::strip_jsonc(text)) else {
         return Vec::new();
     };
     let list = match (&v, v.get("configurations")) {
@@ -563,7 +563,7 @@ impl DebugConfig {
 /// VS Code refuses to run those too, and an empty compound would present as a
 /// picker row that does nothing.
 pub fn parse_compounds(text: &str, source: &'static str) -> Vec<Compound> {
-    let Ok(v) = serde_json::from_str::<Value>(&crate::tasks::strip_jsonc(text)) else {
+    let Ok(v) = serde_json::from_str::<Value>(&crate::jsonc::strip_jsonc(text)) else {
         return Vec::new();
     };
     let Some(Value::Array(list)) = v.get("compounds") else {

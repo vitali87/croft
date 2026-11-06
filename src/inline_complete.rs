@@ -14,6 +14,14 @@
 //! overridden with `CROFT_COMPLETE_URL` / `CROFT_COMPLETE_MODEL`. Nothing is
 //! sent until the user turns suggestions on: this ships code off the machine.
 //!
+//! A language server that offers inline completions (LSP 3.18
+//! `textDocument/inlineCompletion`, e.g. Copilot's) answers for its own
+//! files instead, and needs no model. Its answer may replace part of the
+//! caret's line rather than add at the caret: [`Ghost::replacing`] turns
+//! the common "finish the word you typed" kind back into plain ghost text,
+//! and keeps the rest as a replacement Tab applies whole, so taking it
+//! always leaves the line as the server's edit would.
+//!
 //! # Why one blocking request per pause, on its own thread
 //!
 //! A suggestion is a few dozen tokens, so a non-streaming request is simplest
@@ -21,6 +29,7 @@
 //! typing outpaces the network, and an answer for text the user has since
 //! changed is thrown away on arrival anyway.
 
+use std::ops::Range;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
 
@@ -189,6 +198,70 @@ pub fn next_line_len(text: &str) -> usize {
     text[skip..].find('\n').map_or(text.len(), |i| skip + i)
 }
 
+/// A suggestion where it was asked for: the caret's `row` and `col` (chars)
+/// and the buffer's `edit_seq` then. It is live while all three still hold.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ghost {
+    pub row: usize,
+    pub col: usize,
+    pub seq: u64,
+    pub text: String,
+    /// The columns of `row` that `text` takes the place of when accepted:
+    /// a language server's replacement that is not plain typing ahead, such
+    /// as a typo fixed with the rest of the line. `None` adds `text` at the
+    /// caret, the only kind a model gives.
+    pub replaces: Option<Range<usize>>,
+}
+
+impl Ghost {
+    /// Ghost text added at the caret.
+    pub fn insert(row: usize, col: usize, seq: u64, text: String) -> Self {
+        Ghost {
+            row,
+            col,
+            seq,
+            text,
+            replaces: None,
+        }
+    }
+
+    /// A language server's answer that replaces columns `range` of the
+    /// caret's `line` with `text`. When `text` starts with what the range
+    /// already holds before the caret and ends with what it holds after it,
+    /// only the new middle is ghost text at the caret, as for a model. Even
+    /// blanks after the caret count: dropping them is the server's edit too.
+    /// `None` when the answer changes nothing, or its range does not hold
+    /// the caret or runs past the line.
+    pub fn replacing(
+        row: usize,
+        col: usize,
+        seq: u64,
+        line: &str,
+        range: Range<usize>,
+        text: String,
+    ) -> Option<Self> {
+        if range.start > col || col > range.end || range.end > line.chars().count() {
+            return None;
+        }
+        let typed: String = line.chars().take(col).skip(range.start).collect();
+        let after: String = line.chars().take(range.end).skip(col).collect();
+        let ahead = text
+            .strip_prefix(typed.as_str())
+            .and_then(|rest| rest.strip_suffix(after.as_str()));
+        let (text, replaces) = match ahead {
+            Some(middle) => (middle.to_string(), None),
+            None => (text, Some(range)),
+        };
+        (!text.trim().is_empty()).then_some(Ghost {
+            row,
+            col,
+            seq,
+            text,
+            replaces,
+        })
+    }
+}
+
 fn strip_fence(text: &str) -> &str {
     let t = text.trim_end();
     let Some(rest) = t.strip_prefix("```") else {
@@ -332,6 +405,56 @@ mod tests {
     }
 
     use super::*;
+
+    /// A server's answer that re-sends the word typed so far, and what
+    /// its range holds after the caret, is plain ghost text for the rest.
+    #[test]
+    fn a_replacement_that_types_ahead_is_ghost_text_at_the_caret() {
+        let line = "    let x = pri";
+        let g = Ghost::replacing(0, 15, 7, line, 12..15, String::from("println!()")).unwrap();
+        assert_eq!(g, Ghost::insert(0, 15, 7, String::from("ntln!()")));
+        let closing = Ghost::replacing(0, 4, 1, "foo()", 0..5, String::from("foo(bar)"));
+        assert_eq!(closing.map(|g| g.text).as_deref(), Some("bar"));
+    }
+
+    /// An answer that rewrites what was typed keeps its range, so Tab
+    /// replaces those columns.
+    #[test]
+    fn a_replacement_that_rewrites_the_typed_text_keeps_its_range() {
+        let line = "let x = pritn";
+        let g = Ghost::replacing(0, 13, 2, line, 8..13, String::from("println!()")).unwrap();
+        assert_eq!(g.text, "println!()");
+        assert_eq!(g.replaces, Some(8..13));
+        let dropped = Ghost::replacing(0, 4, 1, "foo()", 0..5, String::from("foo(x, y"));
+        assert_eq!(
+            dropped.and_then(|g| g.replaces),
+            Some(0..5),
+            "the `)` after the caret is not kept, so it is replaced"
+        );
+        let blanks = Ghost::replacing(0, 7, 1, "x = \"ab  ", 4..9, String::from("\"abc\""));
+        assert_eq!(
+            blanks.and_then(|g| g.replaces),
+            Some(4..9),
+            "blanks the answer drops are replaced, not left after it"
+        );
+    }
+
+    /// Negative: a range away from the caret or past the line, and an
+    /// answer that changes nothing, give no suggestion.
+    #[test]
+    fn a_replacement_off_the_caret_or_changing_nothing_is_dropped() {
+        let line = "let x = 1";
+        let text = || String::from("let y = 2");
+        assert_eq!(Ghost::replacing(0, 9, 0, line, 0..3, text()), None);
+        assert_eq!(Ghost::replacing(0, 9, 0, line, 0..12, text()), None);
+        assert_eq!(
+            Ghost::replacing(0, 9, 0, line, 8..9, String::from("1")),
+            None
+        );
+        let wide = "é = ";
+        let g = Ghost::replacing(0, 4, 0, wide, 0..4, String::from("é = 1")).unwrap();
+        assert_eq!(g.text, "1", "columns are chars, not bytes");
+    }
 
     fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
         let owned: Vec<(String, String)> = pairs

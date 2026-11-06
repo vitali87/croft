@@ -52,7 +52,7 @@ impl Language {
     /// JSON with comments.
     pub fn from_path(path: &std::path::Path) -> Option<Self> {
         let lang = crate::lsp::languages::from_path(path)?;
-        if lang.lsp_id() == "json" && path.starts_with(crate::prefs::config_dir()) {
+        if lang.lsp_id() == "json" && path.starts_with(crate::paths::config_dir()) {
             return crate::lsp::languages::resolve("jsonc").or(Some(lang));
         }
         Some(lang)
@@ -303,7 +303,7 @@ mod tests {
     #[test]
     fn croft_config_files_are_json_with_comments() {
         let jsonc = Language::from_lsp_id("jsonc");
-        let dir = crate::prefs::config_dir();
+        let dir = crate::paths::config_dir();
         for name in ["config.json", "keybindings.json", "snippets.json"] {
             assert_eq!(Language::from_path(&dir.join(name)), jsonc, "{name}");
         }

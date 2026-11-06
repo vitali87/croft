@@ -9,7 +9,9 @@
 //!
 //! The container is labelled with the workspace path and a hash of the
 //! config, so the next run reattaches to it (starting it if stopped) instead
-//! of creating another, and an edited config gets a fresh one.
+//! of creating another. An edited config is only reported (#1110): replacing
+//! the container is `--rebuild`'s job, since it throws away everything made
+//! inside it, and kills a croft still running there with its unsaved edits.
 //!
 //! Supported keys: `image`, `build` (`dockerfile`, `context`, `args`),
 //! `mounts`, `forwardPorts`, `postCreateCommand`, plus `workspaceFolder`,
@@ -132,7 +134,7 @@ pub fn parse(
     root: &Path,
     env: &dyn Fn(&str) -> Option<String>,
 ) -> Result<DevContainer> {
-    let v: Value = serde_json::from_str(&crate::tasks::strip_jsonc(text))
+    let v: Value = serde_json::from_str(&crate::jsonc::strip_jsonc(text))
         .with_context(|| format!("parsing {}", config.display()))?;
     let dir = config.parent().unwrap_or(root);
     let str_of = |key: &str| v.get(key).and_then(Value::as_str);
@@ -349,6 +351,36 @@ pub fn run_args(dc: &DevContainer, root: &Path, config_hash: &str) -> Vec<String
     out
 }
 
+/// The hash a container is labelled with: of what `docker build` and
+/// `docker run` are given and the `postCreateCommand`s, not of the file's
+/// text (#1110), so a comment or a reformat is no change. Keys used only at
+/// attach time, such as `remoteUser`, need no new container and are left out.
+fn config_hash(dc: &DevContainer, root: &Path) -> String {
+    // `containerEnv` and `build.args` keep the file's key order, which
+    // means nothing to the container.
+    let mut dc = dc.clone();
+    dc.env.sort();
+    if let Source::Build { args, .. } = &mut dc.source {
+        args.sort();
+    }
+    let mut parts = run_args(&dc, root, "");
+    parts.extend(build_args(&dc, root).unwrap_or_default());
+    for argv in &dc.post_create {
+        parts.push(String::from("postCreateCommand"));
+        parts.extend(argv.iter().cloned());
+    }
+    hash(&parts.join("\0"))
+}
+
+/// Whether `docker top` output lists a croft running in the container: a
+/// session attached from another terminal, which removing the container
+/// would kill with its unsaved edits (#1110).
+fn croft_attached(top: &str) -> bool {
+    top.lines()
+        .skip(1)
+        .any(|l| l.split_whitespace().any(|w| w == CONTAINER_BINARY))
+}
+
 /// `docker exec` arguments running `argv` in the container.
 pub fn exec_args(dc: &DevContainer, container: &str, argv: &[String], tty: bool) -> Vec<String> {
     let mut out = vec!["exec".to_string()];
@@ -437,8 +469,8 @@ pub fn up_and_attach(root: &Path, rebuild: bool) -> Result<()> {
     };
     let text = std::fs::read_to_string(&config)
         .with_context(|| format!("reading {}", config.display()))?;
-    let dc = parse(&text, &config, &root, &|k| std::env::var(k).ok())?;
-    let config_hash = hash(&text);
+    let mut dc = parse(&text, &config, &root, &|k| std::env::var(k).ok())?;
+    let config_hash = config_hash(&dc, &root);
 
     let label = format!("label={WORKSPACE_LABEL}={}", root.display());
     let mut container = docker_out(&["ps", "-aq", "--filter", &label])?
@@ -446,17 +478,47 @@ pub fn up_and_attach(root: &Path, rebuild: bool) -> Result<()> {
         .next()
         .map(str::to_string);
     if let Some(id) = container.clone() {
-        let made_from = docker_out(&[
-            "inspect",
-            "-f",
-            &format!("{{{{index .Config.Labels \"{CONFIG_LABEL}\"}}}}"),
-            &id,
-        ])
-        .unwrap_or_default();
-        if rebuild || made_from != config_hash {
-            step("config changed; replacing the container");
+        if rebuild {
+            // Fail closed: a check that can't be made is no evidence that
+            // nothing would be lost.
+            let unsure = "can't tell whether croft is running in the container, so --rebuild \
+                          leaves it in place";
+            let running = docker_out(&["inspect", "-f", "{{.State.Running}}", &id])
+                .context(unsure)?
+                == "true";
+            if running && croft_attached(&docker_out(&["top", &id]).context(unsure)?) {
+                bail!(
+                    "croft is still running in this container, in another terminal; quit it \
+                     there first so its unsaved edits are not lost, or remove the container \
+                     yourself with `docker rm -f {}`",
+                    &id[..id.len().min(12)]
+                );
+            }
+            step("replacing the container (--rebuild)");
             docker_out(&["rm", "-f", &id])?;
             container = None;
+        } else {
+            let made_from = docker_out(&[
+                "inspect",
+                "-f",
+                &format!("{{{{index .Config.Labels \"{CONFIG_LABEL}\"}}}}"),
+                &id,
+            ])
+            .unwrap_or_default();
+            // A croft before #1110 labelled the hash of the file's text.
+            if made_from != config_hash && made_from != hash(&text) {
+                step(
+                    "devcontainer.json changed since this container was created; run \
+                     `croft devcontainer --rebuild` to recreate it (this discards changes \
+                     made inside the container)",
+                );
+                // Until it is rebuilt, the workspace sits where the container
+                // was made to mount it, not where the edited config says.
+                let made_in = docker_out(&["inspect", "-f", "{{.Config.WorkingDir}}", &id])?;
+                if !made_in.is_empty() {
+                    dc.workspace_folder = made_in;
+                }
+            }
         }
     }
 
@@ -648,6 +710,64 @@ mod tests {
 
         let exec = exec_args(&dc, "c1", &["ls".into()], false);
         assert_eq!(exec, vec!["exec", "-w", "/workspaces/proj", "c1", "ls"]);
+    }
+
+    /// #1110: the label's hash is of the container the config makes, so a
+    /// comment, a reformat or an attach-time key is no change, and what
+    /// `docker run` or setup would do differently is.
+    #[test]
+    fn the_config_hash_ignores_comments_and_formatting() {
+        let root = Path::new("/home/me/proj");
+        let of = |text: &str| config_hash(&parse_str(text), root);
+        let base = of(r#"{ "image": "ubuntu:24.04", "postCreateCommand": "make" }"#);
+        for same in [
+            "// Set up.\n{\n  \"image\": \"ubuntu:24.04\",\n  \"postCreateCommand\": \"make\", // why\n}\n",
+            r#"{ "postCreateCommand": "make", "image": "ubuntu:24.04" }"#,
+            r#"{ "image": "ubuntu:24.04", "postCreateCommand": "make", "remoteUser": "me" }"#,
+        ] {
+            assert_eq!(of(same), base, "{same}");
+        }
+        let env = of(r#"{ "image": "u", "containerEnv": { "A": "1", "B": "2" } }"#);
+        assert_eq!(
+            of(r#"{ "image": "u", "containerEnv": { "B": "2", "A": "1" } }"#),
+            env,
+            "key order"
+        );
+        assert_ne!(
+            of(r#"{ "image": "u", "containerEnv": { "A": "1", "B": "3" } }"#),
+            env
+        );
+        let build = |args: &str| {
+            of(&format!(
+                r#"{{ "build": {{ "dockerfile": "Dockerfile", "args": {args} }} }}"#
+            ))
+        };
+        assert_eq!(
+            build(r#"{ "X": "1", "Y": "2" }"#),
+            build(r#"{ "Y": "2", "X": "1" }"#)
+        );
+        for changed in [
+            r#"{ "image": "ubuntu:26.04", "postCreateCommand": "make" }"#,
+            r#"{ "image": "ubuntu:24.04", "postCreateCommand": "make test" }"#,
+            r#"{ "image": "ubuntu:24.04", "postCreateCommand": "make", "forwardPorts": [8000] }"#,
+        ] {
+            assert_ne!(of(changed), base, "{changed}");
+        }
+    }
+
+    #[test]
+    fn a_croft_running_in_the_container_is_found_in_docker_top() {
+        let top = |cmd: &str| {
+            format!("UID PID PPID C STIME TTY TIME CMD\nroot 1 0 0 10:00 ? 00:00:00 {cmd}\n")
+        };
+        assert!(croft_attached(&top(
+            "/usr/local/bin/croft /workspaces/proj"
+        )));
+        assert!(!croft_attached(&top(
+            "sh -c trap 'exit 0' TERM; while :; do sleep 3600 & wait $!; done"
+        )));
+        assert!(!croft_attached(&top("/home/me/bin/croft-helper")));
+        assert!(!croft_attached(""));
     }
 
     #[test]

@@ -1,0 +1,1 @@
+fix: Groundwork for on-demand extensions: session restore, the PDF viewer, hot exit and quickfix no longer reach into croft's panels, now that the spreadsheet cell-edit type lives with the spreadsheet code and glob lists have a small shared helper. Nothing changes in use.
