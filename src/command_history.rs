@@ -116,7 +116,7 @@ impl HistoryScope {
 /// The real store path, `~/.config/croft/command_history.jsonl`. The App
 /// caches a loaded store in a field so tests can point it at a tempdir.
 pub fn history_path() -> PathBuf {
-    crate::prefs::config_dir().join("command_history.jsonl")
+    crate::paths::config_dir().join("command_history.jsonl")
 }
 
 pub struct CommandHistory {

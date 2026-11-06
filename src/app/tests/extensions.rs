@@ -164,10 +164,9 @@ fn adding_an_extension_clears_a_stale_disabled_state_and_says_when_that_cannot_s
 
 #[test]
 fn an_edit_between_refusal_and_consent_forces_a_fresh_prompt() {
-    // The first Cmd+S arms the second — but consent named the characters the
-    // buffer held at prompt time. Typing in between changes what the write
-    // would destroy, so the next Cmd+S must refuse and re-prompt (now naming
-    // the new character too), and only the press after that writes.
+    // The lossy-save prompt names the characters the buffer held when it
+    // asked (#1053). Cancelled, then typed into, the next Cmd+S asks again,
+    // now naming the new character too, and only S there writes.
     let tmp = tempfile::tempdir().unwrap();
     let mut app = app_with_open_file(tmp.path(), "a.txt", "plain");
     app.editor
@@ -176,23 +175,23 @@ fn an_edit_between_refusal_and_consent_forces_a_fresh_prompt() {
     app.editor.lines = vec![String::from("日")];
     app.editor.dirty = true;
     app.save();
-    assert!(
-        app.editor.lossy_save_armed,
-        "the refusal arms the second press"
-    );
+    assert_eq!(app.pending_lossy_save.as_ref().unwrap().chars, ['日']);
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
     app.editor.insert_char('語');
     app.save();
     assert_eq!(
         std::fs::read_to_string(tmp.path().join("a.txt")).unwrap(),
         "plain",
-        "the edit revoked the consent, so this press must refuse again"
+        "nothing was consented to, so this press asks again"
     );
-    assert!(
-        app.status.contains('語'),
-        "the fresh prompt must name the newly typed character; status: {:?}",
-        app.status
+    assert_eq!(
+        app.pending_lossy_save.as_ref().unwrap().chars,
+        ['語', '日'],
+        "the fresh prompt names the newly typed character"
     );
-    app.save();
+    app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE))
+        .unwrap();
     assert_eq!(
         std::fs::read(tmp.path().join("a.txt")).unwrap(),
         b"&#35486;&#26085;",

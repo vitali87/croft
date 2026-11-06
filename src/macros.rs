@@ -355,7 +355,7 @@ pub struct Recording {
 /// The store: `~/.config/croft/macros.json`, a register name → macro map,
 /// which is exactly the shape [`crate::workspace::update_json_store`] takes.
 pub fn macros_path() -> PathBuf {
-    crate::prefs::config_dir().join("macros.json")
+    crate::paths::config_dir().join("macros.json")
 }
 
 /// Load for READING: any failure reads empty, since a read-only consumer can

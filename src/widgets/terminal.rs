@@ -1630,7 +1630,7 @@ pub(crate) fn apply_pane_bin(cmd: &mut CommandBuilder, bin: Option<&std::path::P
 /// written; the pane then finds `croft` on the user's PATH, as before.
 fn pane_bin_dir() -> Option<std::path::PathBuf> {
     let exe = live_exe(std::env::current_exe().ok()?)?;
-    crate::shell_integration::ensure_pane_bin(&crate::app::croft_cache_dir(), &exe).ok()
+    crate::shell_integration::ensure_pane_bin(&crate::paths::croft_cache_dir(), &exe).ok()
 }
 
 impl PtyTerminal {
@@ -1649,7 +1649,7 @@ impl PtyTerminal {
     /// below or through the prompt instead of above it.
     pub fn new_with_transcript(cwd: &std::path::Path, transcript: &[String]) -> Result<Self> {
         let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".to_string());
-        let mut cmd = interactive_shell_command(&shell, &crate::prefs::config_dir());
+        let mut cmd = interactive_shell_command(&shell, &crate::paths::config_dir());
         cmd.cwd(cwd);
         Self::spawn_with_preamble(cmd, None, &transcript_bytes(transcript))
     }
@@ -1657,7 +1657,7 @@ impl PtyTerminal {
     /// Spawn an interactive login session for a specific shell (a terminal
     /// profile), rather than `$SHELL`. The same login-flag handling as [`new`].
     pub fn new_shell(shell_path: &str, cwd: &std::path::Path) -> Result<Self> {
-        let mut cmd = interactive_shell_command(shell_path, &crate::prefs::config_dir());
+        let mut cmd = interactive_shell_command(shell_path, &crate::paths::config_dir());
         cmd.cwd(cwd);
         Self::spawn_with(cmd, None)
     }

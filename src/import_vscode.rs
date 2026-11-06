@@ -855,11 +855,11 @@ fn read_jsonc(path: &Path) -> Result<Option<Value>> {
     }
     let raw =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    // `crate::tasks::strip_jsonc` walks CHARS. The copy that used to live in
+    // `crate::jsonc::strip_jsonc` walks CHARS. The copy that used to live in
     // `workspace.rs` walked bytes and mangled any non-ASCII value (#396),
     // which a settings file carries routinely in paths and snippet bodies;
     // it was deleted in favour of this one rather than repaired.
-    let stripped = crate::tasks::strip_jsonc(&raw);
+    let stripped = crate::jsonc::strip_jsonc(&raw);
     if stripped.trim().is_empty() {
         return Ok(None);
     }
@@ -1416,7 +1416,7 @@ fn carries_jsonc_extras(path: &Path) -> bool {
     let Ok(raw) = std::fs::read_to_string(path) else {
         return false;
     };
-    raw != crate::tasks::strip_jsonc(&raw)
+    raw != crate::jsonc::strip_jsonc(&raw)
 }
 
 /// Read a config file for merging, turning a PARSE failure into a per-file
@@ -1457,7 +1457,7 @@ fn read_or_refuse(path: &Path, report: &mut Report) -> (Option<Value>, bool) {
 /// leaving it alone is also what makes a second run a no-op.
 pub fn apply(report: &mut Report) -> Result<Vec<PathBuf>> {
     apply_into_dirs(
-        &crate::prefs::config_dir(),
+        &crate::paths::config_dir(),
         &crate::lsp::manifest::user_extensions_dir(),
         report,
     )

@@ -41,16 +41,19 @@ pub fn row_hover_bg(
     pointer: Option<(u16, u16)>,
     theme: crate::theme::Theme,
 ) -> Option<Color> {
-    if !contains(rect, pointer) {
-        return None;
-    }
-    Some(if theme.is_light() {
+    contains(rect, pointer).then(|| hover_bg(theme))
+}
+
+/// The hover lift itself, for a hovered element that is not a whole row,
+/// such as a link in the Markdown preview (#1939).
+pub fn hover_bg(theme: crate::theme::Theme) -> Color {
+    if theme.is_light() {
         ROW_HOVER_BG_LIGHT
     } else if theme.gradient() {
         ROW_HOVER_BG_BLACK
     } else {
         ROW_HOVER_BG_DARK
-    })
+    }
 }
 
 #[cfg(test)]

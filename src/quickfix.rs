@@ -666,7 +666,7 @@ pub fn scope_filters(
         .exclude
         .as_deref()
         .map(|e| {
-            crate::widgets::search::split_globs(e)
+            crate::glob_list::split_globs(e)
                 .map(str::to_string)
                 .collect()
         })
@@ -680,7 +680,7 @@ pub fn scope_filters(
         .include
         .as_deref()
         .map(|i| {
-            crate::widgets::search::split_globs(i)
+            crate::glob_list::split_globs(i)
                 .map(str::to_string)
                 .collect()
         })

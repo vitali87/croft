@@ -902,7 +902,7 @@ fn the_failure_site_survives_a_whole_cargo_test_run() {
 fn a_test_built_app_reads_no_user_settings_layer() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    let user_dir = crate::prefs::config_dir();
+    let user_dir = crate::paths::config_dir();
     // At startup and again on a live settings reload.
     for when in ["startup", "reload"] {
         if when == "reload" {

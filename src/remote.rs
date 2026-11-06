@@ -2663,7 +2663,7 @@ impl ConfigRepush {
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let (t, s) = (target.clone(), stop.clone());
         let worker = std::thread::spawn(move || {
-            let dir = crate::prefs::config_dir();
+            let dir = crate::paths::config_dir();
             let mut state = RepushState::new(watch);
             let mut exclusions = SyncExclusions::load();
             let mut log = config_sync_log();
@@ -2712,7 +2712,7 @@ impl ConfigRepush {
 /// Print a unified diff of the remote's copy of `name` against the local
 /// one, remote first, so `+` lines are what a push would bring.
 fn print_config_diff(ssh: &SshControl, name: &str) -> Result<()> {
-    let local = crate::prefs::config_dir().join(name);
+    let local = crate::paths::config_dir().join(name);
     let out = ssh_socket_read(
         &ssh.socket_path,
         &ssh.host,

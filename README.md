@@ -17,7 +17,7 @@ The non-negotiables behind every decision in croft:
 5. **The gap between terminal and GUI stays minimal.** croft should look and feel like VS Code, down to the icons and motion.
 6. **Everything has a shortcut.** Every action is reachable from the keyboard, and no menu item ships without an accelerator.
 7. **Correctness beats workarounds.** Bugs are fixed at the root, never papered over with a fallback or a downgrade.
-8. **One binary, no ceremony.** Features are emulated in process rather than bolted on, so there is nothing to wire up after you install.
+8. **One binary for the core; extensions arrive in one click.** The binary carries only what every session needs. Everything else is an extension, fetched and verified when you add it from the Extensions view, so there is still nothing to wire up by hand. See [EXTENSIONS.md](docs/EXTENSIONS.md).
 
 ## Layout
 

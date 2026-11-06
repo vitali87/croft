@@ -49,6 +49,8 @@ use welcome::WelcomeState;
 
 use crate::lsp::manager::CompletionTrigger;
 use crate::lsp::manager::{diagnostics_by_source, diagnostics_source, diagnostics_store_key};
+use crate::paths::croft_cache_dir;
+use crate::theme::BRAND_ORANGE;
 use crate::widgets::terminal::cwd_of_pid;
 
 use crate::widgets::{
@@ -334,6 +336,17 @@ struct PendingSelectionRanges {
     seq: u64,
     presses: usize,
     positions: Vec<(u32, u32)>,
+}
+
+/// Where a row of Bookmarks: View Bookmarks points: the tab holding the
+/// mark (its editor group by depth-first index, then its index in that
+/// group), the file it shows and the 1-based line.
+#[derive(Clone, Debug)]
+struct BookmarkTarget {
+    group: usize,
+    tab: usize,
+    path: PathBuf,
+    line: usize,
 }
 
 /// Pre-Zen visibility snapshot, restored verbatim when Zen Mode is toggled
@@ -1014,11 +1027,6 @@ fn git_status_spans<'a>(status: &'a crate::git::GitStatus) -> Vec<Span<'a>> {
     }
     spans
 }
-
-/// Logo orange (#e97c41), sampled from `assets/logo.png`: the colour of the
-/// `<>` angle brackets in the "cr<>ft" wordmark. Also the Extensions panel's
-/// trash button — the warm complement to the teal brand gradient.
-pub(crate) const BRAND_ORANGE: Color = Color::Rgb(0xe9, 0x7c, 0x41);
 
 /// Spans for the "cr<>ft" wordmark at the left of the status bar, styled to
 /// mirror the app logo: white letters with the `<>` (the stylised "o") in the
@@ -3183,6 +3191,76 @@ fn holds_unsaved(ed: &Editor) -> bool {
     ed.dirty && !ed.scratch && (ed.path.is_some() || ed.lines.iter().any(|l| !l.is_empty()))
 }
 
+/// A save refused because the file's encoding cannot hold the buffer
+/// (#1053), waiting on the user's answer: what the write would destroy.
+/// Asked in a modal, not the status bar, which trims a long message from the
+/// middle and used to cut exactly the warning out of it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LossySave {
+    /// The tab's file when asked, so the answer never writes another tab.
+    path: Option<PathBuf>,
+    encoding: &'static str,
+    /// The characters `encoding` cannot represent. Empty when the loss is
+    /// bytes that were not valid when the file was read, shown as U+FFFD.
+    chars: Vec<char>,
+}
+
+impl LossySave {
+    /// The file's name, as the prompt calls it.
+    fn name(&self) -> String {
+        self.path.as_deref().and_then(Path::file_name).map_or_else(
+            || String::from("This file"),
+            |n| n.to_string_lossy().into_owned(),
+        )
+    }
+
+    /// The prompt's lines: what is wrong, what saving does about it, and
+    /// how to keep what would be lost.
+    fn text(&self) -> [String; 3] {
+        let name = self.name();
+        let enc = self.encoding;
+        if self.chars.is_empty() {
+            return [
+                format!("{name} has bytes that are not valid {enc}, shown as \u{fffd}."),
+                String::from(
+                    "Saving writes \u{fffd} in their place: the original bytes are lost for good.",
+                ),
+                String::from(
+                    "To keep them, undo your edits (Cmd+Z), then Reopen with Encoding from the status bar.",
+                ),
+            ];
+        }
+        let shown: Vec<String> = self.chars.iter().map(char::to_string).collect();
+        [
+            format!("{enc} cannot represent {} in {name}.", shown.join(" ")),
+            String::from(
+                "Saving writes them as &#\u{2026}; references: the characters are lost for good.",
+            ),
+            String::from("To keep them, take them out, or undo the edits that added them (Cmd+Z)."),
+        ]
+    }
+
+    /// [`Self::text`] short enough to be read out whole with the keys, under
+    /// `a11y::MAX_LINE`, the recovery hint included.
+    fn spoken(&self) -> [String; 3] {
+        let name = self.name();
+        let enc = self.encoding;
+        if self.chars.is_empty() {
+            return [
+                format!("{name} has invalid {enc} bytes"),
+                String::from("Saving turns them into \u{fffd} for good"),
+                String::from("To keep them, undo, then Reopen with Encoding"),
+            ];
+        }
+        let shown: Vec<String> = self.chars.iter().map(char::to_string).collect();
+        [
+            format!("{enc} cannot represent {} in {name}", shown.join(" ")),
+            String::from("Saving writes &#\u{2026}; references for good"),
+            String::from("To keep them, remove them or undo"),
+        ]
+    }
+}
+
 /// Why the branch picker is open, deciding what its Enter does. `Checkout`
 /// is the default (click the branch name / "Checkout to"); the others are
 /// reached from the Branch submenu and act on the highlighted *existing*
@@ -4428,6 +4506,10 @@ pub struct App {
     /// An unsaved-changes prompt (#862) waiting on S / D / Esc, holding what
     /// it goes on to do. While `Some`, the modal eats every key and click.
     pending_unsaved: Option<UnsavedExit>,
+    /// A save that would lose characters or bytes to the file's encoding
+    /// (#1053), waiting on S / Esc. While `Some`, the modal eats every key
+    /// and click, so a second Cmd+S can no longer write it.
+    pending_lossy_save: Option<LossySave>,
     /// The unsaved state (see [`App::unsaved_stamp`]) the user chose to
     /// leave behind when asked about a remote connect (#862): the handoff
     /// that ends this croft later goes without asking again only while
@@ -4804,6 +4886,9 @@ pub struct App {
     inline_worker: Option<crate::inline_complete::Worker>,
     inline_config: Option<crate::inline_complete::Config>,
     inline_job: Option<(u64, PathBuf, u64, usize, usize)>,
+    /// The language server's inline completion in flight, keyed like
+    /// `inline_job`: a server that offers them answers for its files.
+    inline_lsp: Option<(u64, PathBuf, u64, usize, usize)>,
     inline_asked: Option<(PathBuf, u64, usize, usize)>,
     inline_next_id: u64,
     /// Where recorded shortcuts are written: the user's keybindings.json,
@@ -4913,7 +4998,10 @@ pub struct App {
     /// in `ui_tooltip_at`.
     ui_hover: HoverDwell,
     ui_tooltip: Option<crate::widgets::hover_popup::HoverPopup>,
-    ui_tooltip_label: Option<&'static str>,
+    ui_tooltip_label: Option<std::borrow::Cow<'static, str>>,
+    /// The Search list's `(scroll, hits, shown)` when the hint was last read
+    /// against it: [`Self::reread_ui_tooltip`] reads it again on a change.
+    search_hint_view: (usize, usize, bool),
     /// The chrome tooltip's final on-screen rect from the most recent render
     /// (after the activity-bar shift / viewport clamp), or `None` when no
     /// tooltip is showing. Read by the post-draw flush so the box can be
@@ -5217,6 +5305,8 @@ pub struct App {
     agent_ledger_saved: (u64, std::time::Instant),
     /// The (agent, file) behind each row of the lane-file picker.
     pending_lane_picks: Vec<(String, PathBuf)>,
+    /// The tab and line behind each row of Bookmarks: View Bookmarks.
+    pending_bookmarks: Vec<BookmarkTarget>,
     /// When the running Fix with Navigator turn started (#374): the clock
     /// its PROBLEMS-row spinner runs on, and the flag that keeps the main
     /// loop repainting while it runs. `None` when no fix is streaming.
@@ -6566,7 +6656,7 @@ impl App {
         let loaded_prefs = merged_settings.prefs.clone();
         let (review_tx, review_rx) = std::sync::mpsc::channel();
         let data_dir =
-            (!cfg!(test)).then(|| user_data_dir(&croft_cache_dir(), &crate::prefs::state_dir()));
+            (!cfg!(test)).then(|| user_data_dir(&croft_cache_dir(), &crate::paths::state_dir()));
         let notes_path = data_dir
             .as_deref()
             .map(|dir| crate::sticky_notes::Notes::store_path(dir, &root));
@@ -6989,7 +7079,7 @@ impl App {
             inline_protocol: crate::iterm2_inline::detect_inline_image_protocol(),
             sixel_supported: false,
             resize_repaint_needed: false,
-            minimap_visible: true,
+            minimap_visible: layout_prefs.minimap,
             minimap_side: MinimapSide::Right,
             minimap_base: None,
             minimap_img_rect: Rect::default(),
@@ -7063,6 +7153,7 @@ impl App {
             scm_after_format_save: None,
             pending_revert_hunk: None,
             pending_unsaved: None,
+            pending_lossy_save: None,
             remote_handoff_ok: None,
             hot_exit_dir: data_dir.as_deref().map(|dir| dir.join("hot-exit")),
             hot_exit_written: None,
@@ -7088,7 +7179,7 @@ impl App {
             terminal_close_buttons: Vec::new(),
             terminal_collapse_buttons: Vec::new(),
             consented_extensions: crate::prefs::Prefs::load_or_default().mcp_consented,
-            config_dir: crate::prefs::config_dir(),
+            config_dir: crate::paths::config_dir(),
             settings_profile: if cfg!(test) {
                 None
             } else {
@@ -7171,6 +7262,7 @@ impl App {
             inline_worker: None,
             inline_config: None,
             inline_job: None,
+            inline_lsp: None,
             inline_asked: None,
             inline_next_id: 0,
             keybindings_file: if cfg!(test) {
@@ -7486,6 +7578,7 @@ impl App {
             agent_ledger_store: (!cfg!(test)).then(agent_ledger_store_path),
             agent_ledger_saved: (0, std::time::Instant::now()),
             pending_lane_picks: Vec::new(),
+            pending_bookmarks: Vec::new(),
             problems_fix_started: None,
             http_run: None,
             http_environment: None,
@@ -7505,6 +7598,7 @@ impl App {
             ui_hover: HoverDwell::default(),
             ui_tooltip: None,
             ui_tooltip_label: None,
+            search_hint_view: (0, 0, false),
             ui_tooltip_area: None,
             update_card_rect: None,
             definition_request_id: None,
@@ -11008,6 +11102,28 @@ impl App {
         }
     }
 
+    /// [`Self::ui_tooltip_at`], plus the hints whose text is what sits under
+    /// the pointer rather than a control's name: a Search result row shows
+    /// its file's full path (#2008).
+    fn ui_tooltip_text_at(&self, col: u16, row: u16) -> Option<std::borrow::Cow<'static, str>> {
+        self.search_result_hint_at(col, row)
+            .map(Into::into)
+            .or_else(|| self.ui_tooltip_at(col, row).map(Into::into))
+    }
+
+    /// The full path of the Search result row under `(col, row)` (#2008):
+    /// a row names only the file.
+    fn search_result_hint_at(&self, col: u16, row: u16) -> Option<String> {
+        if !(self.show_tree
+            && self.sidebar_view == SidebarView::Search
+            && rect_contains(self.search.last_area, col, row))
+        {
+            return None;
+        }
+        let path = self.search.result_path_at(col, row)?;
+        Some(path.display().to_string())
+    }
+
     /// The hover-tooltip label for whatever chrome control sits under the
     /// pointer, or `None` over inert space. The single dispatch point for
     /// button hints: each surface contributes one branch that reuses that
@@ -11135,19 +11251,56 @@ impl App {
         })
     }
 
+    /// Read the hint again when the Search list changed under a resting
+    /// pointer (#2008): rows move as hits stream in or the list scrolls by
+    /// wheel, key or scrollbar, and empty when the search is cleared, so a
+    /// hint naming the file that was there would mislabel the row there now.
+    /// A changed hint waits out its own dwell, as one the pointer moved to.
+    /// An empty row a hit fills under the pointer gets its hint too, but a
+    /// control's hint that a click dismissed stays dismissed. Returns whether
+    /// a showing hint was taken down.
+    fn reread_ui_tooltip(&mut self) -> bool {
+        let shown = (
+            self.search.scroll,
+            self.search.hits.len(),
+            self.show_tree && self.sidebar_view == SidebarView::Search,
+        );
+        if std::mem::replace(&mut self.search_hint_view, shown) == shown {
+            return false;
+        }
+        let Some((col, row)) = self.pointer_cell else {
+            return false;
+        };
+        let result = self.search_result_hint_at(col, row);
+        let on_result = result.is_some();
+        let label = result
+            .map(Into::into)
+            .or_else(|| self.ui_tooltip_at(col, row).map(Into::into));
+        if label == self.ui_tooltip_label || (self.ui_tooltip_label.is_none() && !on_result) {
+            return false;
+        }
+        self.ui_hover.clear();
+        if label.is_some() {
+            self.ui_hover.on_move(std::time::Instant::now(), col, row);
+        }
+        self.ui_tooltip_label = label;
+        self.ui_tooltip.take().is_some()
+    }
+
     /// Fire the chrome button-hint tooltip once its dwell crosses
     /// `HOVER_DELAY`. Returns `true` when a tooltip was created so the frame
     /// loop redraws. Suppressed while a context menu is open so the two never
     /// overlap.
     fn poll_ui_tooltip(&mut self) -> bool {
+        let taken_down = self.reread_ui_tooltip();
         if !self.ui_hover.due(std::time::Instant::now(), HOVER_DELAY) {
-            return false;
+            return taken_down;
         }
         self.ui_hover.mark_fired();
         if self.context_menu.is_some() {
             return false;
         }
-        let Some(label) = self.ui_tooltip_label else {
+        let Some(label) = self.ui_tooltip_label.as_deref() else {
             return false;
         };
         let Some((col, row)) = self.ui_hover.cell() else {
@@ -11202,7 +11355,7 @@ impl App {
         // different control, and is left running while it drifts within one.
         // Computed before the tab/editor early-returns so it tracks the
         // pointer everywhere, including over the sidebar.
-        match self.ui_tooltip_at(col, row) {
+        match self.ui_tooltip_text_at(col, row) {
             // Same label AND still on the same row: keep the dwell running so the
             // tooltip persists while the pointer drifts within one control. The
             // row check matters because adjacent controls can share a label (e.g.
@@ -11211,7 +11364,7 @@ impl App {
             // the box would appear detached from the one actually under the
             // pointer.
             Some(label)
-                if self.ui_tooltip_label == Some(label)
+                if self.ui_tooltip_label.as_ref() == Some(&label)
                     && self.ui_hover.cell().map(|(_, r)| r) == Some(row) => {}
             Some(label) => {
                 self.ui_hover.on_move(std::time::Instant::now(), col, row);
@@ -12196,7 +12349,7 @@ impl App {
         runs: &mut Vec<Vec<String>>,
     ) {
         let config: serde_json::Value =
-            serde_json::from_str(&crate::tasks::strip_jsonc(text)).unwrap_or_default();
+            serde_json::from_str(&crate::jsonc::strip_jsonc(text)).unwrap_or_default();
         let names_no_files = config
             .get("files")
             .and_then(|f| f.as_array())
@@ -14825,6 +14978,7 @@ impl App {
         let saved = crate::prefs::save_layout(crate::prefs::LayoutPrefs {
             activity_bar: self.activity_bar_visible,
             status_bar: self.status_bar_visible,
+            minimap: self.minimap_visible,
             side_bar_position: self.side_bar_position,
             secondary_side_bar: self.secondary_side_bar_visible,
             panel_alignment: self.panel_alignment,
@@ -22595,8 +22749,11 @@ impl App {
             // half blocks (#1591).
             let cell_images = !self.inline_images_enabled();
             self.editor.cell_images = cell_images;
+            // Every group gets the pointer, not only the focused one, so a
+            // preview beside the source lifts its links too (#1939).
             for group in self.editor_layout.inactive_groups_mut() {
                 group.cell_images = cell_images;
+                group.hover_pointer = pointer;
             }
             // Breadcrumb bar: recompute the path + symbol trail for the active
             // file each frame so it tracks caret moves and outline updates.
@@ -24013,6 +24170,7 @@ impl App {
         self.render_terminal_paste_confirm(frame);
         self.render_run_block_confirm(frame);
         self.render_unsaved_confirm(frame);
+        self.render_lossy_save_confirm(frame);
         // Terminal-pane inline image: sync after the panes have painted so
         // last_inner and the scroll offset are this frame's (all gating —
         // hidden panel, alt screen, off-screen anchor — is inside).
@@ -24607,6 +24765,76 @@ impl App {
             ]),
         ]);
         frame.render_widget(ratatui::widgets::Paragraph::new(body), inner);
+    }
+
+    /// The lossy-save prompt (#1053): what the file's encoding would destroy,
+    /// and the two answers. Red, since its one action is irreversible, and
+    /// tall enough for every wrapped line, so no part of the warning is ever
+    /// cut.
+    fn render_lossy_save_confirm(&self, frame: &mut ratatui::Frame) {
+        let Some(asked) = self.pending_lossy_save.as_ref() else {
+            return;
+        };
+        let [what, consequence, keep] = asked.text();
+        let area = frame.area();
+        let width = area.width.saturating_sub(8).clamp(50, 96).min(area.width);
+        let inner_w = width.saturating_sub(4);
+        let rows = |s: &str| wrap_cells_variable_width(s, inner_w, inner_w).len() as u16;
+        // Three texts, a blank line after each, and the keys.
+        let height = 2 + rows(&what) + rows(&consequence) + rows(&keep) + 4;
+        let rect = Rect {
+            x: (area.width.saturating_sub(width)) / 2 + area.x,
+            y: (area.height.saturating_sub(height)) / 2 + area.y,
+            width,
+            height,
+        };
+        let rect = rect.intersection(area);
+        let danger = self.theme.ui(Color::Rgb(0xe7, 0x70, 0x70));
+        let block = ratatui::widgets::Block::default()
+            .borders(ratatui::widgets::Borders::ALL)
+            .border_style(Style::default().fg(danger))
+            .style(Style::default().bg(self.theme.ui(Color::Rgb(0x1e, 0x1e, 0x1e))))
+            .title(ratatui::text::Span::styled(
+                " SAVE WOULD LOSE DATA ",
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(danger)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        frame.render_widget(ratatui::widgets::Clear, rect);
+        frame.render_widget(block, rect);
+        let inner = Rect {
+            x: rect.x + 2,
+            y: rect.y + 1,
+            width: rect.width.saturating_sub(4),
+            height: rect.height.saturating_sub(2),
+        };
+        let key = |k: &'static str, color: Color| {
+            Span::styled(k, Style::default().fg(color).add_modifier(Modifier::BOLD))
+        };
+        let text = self.theme.ui(Color::White);
+        let dim = self.theme.ui(Color::Rgb(0x9a, 0xa4, 0xb8));
+        let body = ratatui::text::Text::from(vec![
+            Line::from(Span::styled(what, Style::default().fg(text))),
+            Line::from(""),
+            Line::from(Span::styled(
+                consequence,
+                Style::default().fg(danger).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(""),
+            Line::from(Span::styled(keep, Style::default().fg(dim))),
+            Line::from(""),
+            Line::from(vec![
+                key("[S]", Color::Red),
+                Span::raw(" save anyway   "),
+                key("[Esc]", text),
+                Span::raw(" keep the file as it is"),
+            ]),
+        ]);
+        frame.render_widget(
+            Paragraph::new(body).wrap(ratatui::widgets::Wrap { trim: false }),
+            inner,
+        );
     }
 
     /// The Replace All confirmation modal (#123): counts up front, commits
@@ -26018,6 +26246,13 @@ impl App {
                 self.undo_close_terminal();
                 true
             }
+            // Cmd+K Cmd+M (Ctrl+K Ctrl+M off macOS): View Bookmarks. Needs the
+            // trailing Cmd, so plain `Cmd+K M` below still maximizes the
+            // terminal pane.
+            KeyCode::Char(c) if plain && cmd_held && c.eq_ignore_ascii_case(&'m') => {
+                self.open_bookmark_picker();
+                true
+            }
             // Cmd+K Shift+W: reopen the most recently closed editor tab
             // (VS Code "Reopen Closed Editor"; ⇧W pairs with Cmd+W the way
             // ⇧T pairs with the terminal close). Matched case-insensitively
@@ -26677,6 +26912,21 @@ impl App {
         }
         if self.list_picker.is_some() {
             self.handle_list_picker_key(key);
+            return Ok(());
+        }
+        // The lossy-save prompt (#1053): only a plain S writes. Enter, N and
+        // Esc keep the file as it is, and every other key, the Cmd+S that
+        // used to be the consent included, does nothing. It is painted over
+        // the unsaved-changes prompt, which a deferred format-on-save write
+        // can leave up beneath it, so it answers first.
+        if self.pending_lossy_save.is_some() {
+            let plain = key.modifiers.difference(KeyModifiers::SHIFT).is_empty();
+            match key.code {
+                KeyCode::Char('s' | 'S') if plain => self.confirm_lossy_save(),
+                KeyCode::Char('n' | 'N') if plain => self.cancel_lossy_save(),
+                KeyCode::Enter | KeyCode::Esc => self.cancel_lossy_save(),
+                _ => {}
+            }
             return Ok(());
         }
         // The unsaved-changes prompt (#862): S or Enter saves, D goes on
@@ -28361,7 +28611,20 @@ impl App {
             .editor
             .open_text_buffer(Path::new("Memory Usage"), &report)
         {
-            Ok(()) => self.focus_pane(Pane::Editor),
+            Ok(()) => {
+                // Rendered rather than raw (#694): the preview ignores typing,
+                // so keys meant for another tab can't land in the report.
+                // Highlighting only; no language server hears about the tab.
+                // The fresh tab carries the default theme until the next
+                // frame's sync, and the preview bakes its colours in now.
+                self.editor.theme = self.theme;
+                self.editor
+                    .set_language(Some(crate::highlight::LangKind::Markdown));
+                if self.editor.markdown_preview.is_none() {
+                    self.editor.toggle_markdown_preview();
+                }
+                self.focus_pane(Pane::Editor);
+            }
             Err(e) => self.status = format!("Could not open the report: {e}"),
         }
     }
@@ -43111,6 +43374,14 @@ impl App {
                     );
                 }
             }
+            ListPurpose::Bookmark => {
+                // The row's own path, not one parsed back from text: a
+                // file name that is not UTF-8 would not survive the trip.
+                if let Some(target) = self.pending_bookmarks.get(index).cloned() {
+                    self.jump_to_bookmark(target);
+                }
+                self.pending_bookmarks.clear();
+            }
             ListPurpose::OutputChannel => {
                 self.output.sync();
                 self.output.select_by_name(&row.id);
@@ -48048,7 +48319,31 @@ impl App {
             sidebar_width: self.sidebar_width,
             terminal_height: self.terminal_height,
             focus_editor: self.focus == Pane::Editor,
+            bookmarks: self.all_bookmarks(),
         }
+    }
+
+    /// The bookmarks of every open tab, keyed by file. Each tab is an editor
+    /// with its own marks, so the active one's map alone would miss the rest.
+    fn all_bookmarks(
+        &self,
+    ) -> std::collections::HashMap<PathBuf, std::collections::BTreeSet<usize>> {
+        let mut all = std::collections::HashMap::new();
+        // A tab's own file first: its marks are the live ones.
+        for ed in &self.editor.editors {
+            if let Some(path) = &ed.path
+                && let Some(set) = ed.bookmarks.get(path)
+            {
+                all.insert(path.clone(), set.clone());
+            }
+        }
+        // Then files the tab showed earlier, whose marks it still holds.
+        for ed in &self.editor.editors {
+            for (path, set) in &ed.bookmarks {
+                all.entry(path.clone()).or_insert_with(|| set.clone());
+            }
+        }
+        all
     }
 
     /// Returns the xlsx cells (#1593) it could not put back, as the tabs
@@ -48071,6 +48366,11 @@ impl App {
                 kept.sheet_cells = unapplied;
                 left.push(kept);
             }
+        }
+        // Every tab is its own editor with its own marks: hand each the saved
+        // set once its file is open, trimmed to the lines the file still has.
+        for ed in self.editor.editors.iter_mut() {
+            ed.restore_bookmarks(&state.bookmarks);
         }
         if state.active_tab < self.editor.tab_count() {
             self.editor.select(state.active_tab);
@@ -48126,7 +48426,7 @@ impl App {
     fn restore_open_tab(
         &mut self,
         tab: &crate::session_state::OpenTabState,
-    ) -> Option<(&mut Editor, Vec<crate::widgets::editor::SheetCellEdit>)> {
+    ) -> Option<(&mut Editor, Vec<crate::sheet::SheetCellEdit>)> {
         let unsaved = tab.unsaved_text.as_deref().filter(|_| tab.dirty);
         let opened = tab
             .path
@@ -48581,7 +48881,7 @@ impl App {
         // Saved as the mode the next launch starts in (#1286). Under test
         // only into a config dir the test chose, never the developer's.
         self.vim_mode_pref = self.vim.enabled;
-        if !cfg!(test) || self.config_dir != crate::prefs::config_dir() {
+        if !cfg!(test) || self.config_dir != crate::paths::config_dir() {
             self.report_unsaved_setting(crate::prefs::save_vim_mode_in(
                 &self.config_dir,
                 self.vim.enabled,
@@ -48632,11 +48932,16 @@ impl App {
     /// status bar. A buffer with no path on disk cannot hold marks, and says so
     /// rather than silently doing nothing.
     fn toggle_bookmark(&mut self) {
+        self.toggle_bookmark_at(self.editor.cursor_row + 1);
+    }
+
+    /// [`Self::toggle_bookmark`] for a given 1-based `line`, leaving the
+    /// cursor and scroll where they are (the gutter Ctrl+click).
+    fn toggle_bookmark_at(&mut self, line: usize) {
         if !self.editor_is_text() {
             return;
         }
-        let line = self.editor.cursor_row + 1;
-        self.status = match self.editor.toggle_bookmark() {
+        self.status = match self.editor.toggle_bookmark_at(line) {
             Some(true) => format!("Bookmark set on line {line}"),
             Some(false) => format!("Bookmark cleared on line {line}"),
             None => String::from("Save the file before bookmarking a line"),
@@ -48665,6 +48970,101 @@ impl App {
             }
             None => String::from("No bookmarks in this file (Cmd+Opt+Shift+K sets one)"),
         };
+    }
+
+    /// Bookmarks: View Bookmarks: a filterable list of every bookmark in
+    /// the open tabs of every editor group (`file:line  text of the line`),
+    /// Enter jumps to it. Only the file a tab shows counts: the marks a tab
+    /// still holds for a file it showed earlier are not of an open file.
+    fn open_bookmark_picker(&mut self) {
+        use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+        let root = self.tree.root.clone();
+        // The focused group first, so a mark it shares with another group
+        // jumps to the tab already in front of the user.
+        let active = self.editor_layout.active_dfs_index();
+        let groups = std::iter::once((active, &self.editor)).chain(
+            (0..self.editor_layout.leaf_count())
+                .filter_map(|g| Some((g, self.editor_layout.group_ref_at_dfs(g)?))),
+        );
+        // Two tabs on one file (a split, a symbol tab) list a shared mark once.
+        let mut seen = std::collections::HashSet::new();
+        let mut found: Vec<(BookmarkTarget, String)> = Vec::new();
+        for (group, tabs) in groups {
+            // A diff, image or sheet tab's rows are not the file's lines.
+            for (tab, ed) in tabs.editors.iter().enumerate() {
+                let Some(path) = ed.path.as_ref().filter(|_| !ed.has_non_text_view()) else {
+                    continue;
+                };
+                // Only lines the buffer has (see `bookmarked_lines`), and on
+                // a symbol tab only the lines of its symbol, the ones it shows.
+                for line in ed.bookmarked_lines() {
+                    if bookmark_line_shown(ed, line) && seen.insert((path.clone(), line)) {
+                        let text = ed.lines[line - 1].trim().chars().take(80).collect();
+                        let path = path.clone();
+                        found.push((
+                            BookmarkTarget {
+                                group,
+                                tab,
+                                path,
+                                line,
+                            },
+                            text,
+                        ));
+                    }
+                }
+            }
+        }
+        found.sort_by(|(a, _), (b, _)| (&a.path, a.line).cmp(&(&b.path, b.line)));
+        self.pending_bookmarks.clear();
+        let mut rows = Vec::with_capacity(found.len());
+        for (target, text) in found {
+            let shown = target.path.strip_prefix(&root).unwrap_or(&target.path);
+            rows.push(ListRow {
+                id: self.pending_bookmarks.len().to_string(),
+                label: format!("{}:{}  {text}", shown.display(), target.line),
+            });
+            self.pending_bookmarks.push(target);
+        }
+        let picker = ListPicker::new(ListPurpose::Bookmark, "Bookmarks", rows);
+        self.open_list_picker(picker, "No bookmarks (Cmd+Opt+Shift+K sets one)");
+    }
+
+    /// Enter on a View Bookmarks row: focus the editor group and the tab
+    /// that hold the mark, and put the caret on its line there, with no
+    /// selection left over for the next keystroke to type over. A tab that
+    /// closed or moved on since the list opened leaves the file to open in
+    /// that group as any jump would.
+    fn jump_to_bookmark(&mut self, target: BookmarkTarget) {
+        let BookmarkTarget {
+            group,
+            tab,
+            path,
+            line,
+        } = target;
+        if group != self.editor_layout.active_dfs_index()
+            && self.editor_layout.group_ref_at_dfs(group).is_some()
+        {
+            let current = std::mem::take(&mut self.editor);
+            self.editor = self.editor_layout.refocus_to_dfs(current, group);
+        }
+        self.hover_popup = None;
+        self.hover_diagnostic = None;
+        let same_tab = self.editor.editors.get(tab).is_some_and(|ed| {
+            ed.path.as_deref() == Some(path.as_path())
+                && !ed.has_non_text_view()
+                && bookmark_line_shown(ed, line)
+        });
+        if same_tab {
+            self.editor.select(tab);
+        } else if let Err(e) = self.editor.open_preview(&path) {
+            self.status = format!("Cannot open bookmark: {e}");
+            return;
+        }
+        self.sync_open_file_poll_mtime();
+        self.editor.jump_to_bookmark(line);
+        self.focus_pane(Pane::Editor);
+        self.poke_cursor();
+        self.status = format!("Bookmark at line {line}");
     }
 
     /// Clear every bookmark in the open file, reporting how many went.
@@ -57829,6 +58229,7 @@ impl App {
             Cmd::NextBookmark => self.goto_bookmark(true),
             Cmd::PreviousBookmark => self.goto_bookmark(false),
             Cmd::ClearBookmarks => self.clear_bookmarks(),
+            Cmd::ViewBookmarks => self.open_bookmark_picker(),
             Cmd::SaveFile => self.save(),
             Cmd::SaveAs => self.open_save_as_prompt(),
             Cmd::SaveWithSudo => self.save_with_sudo(),
@@ -59607,6 +60008,8 @@ impl App {
                     picker.select_next();
                 }
             }
+            (KeyCode::Home, _) => picker.select_first(),
+            (KeyCode::End, _) => picker.select_last(),
             (KeyCode::Left, _) => picker.move_cursor_left(),
             (KeyCode::Right, _) => picker.move_cursor_right(),
             (KeyCode::Backspace, _) => picker.pop_char(),
@@ -61600,6 +62003,10 @@ impl App {
         if self.pending_unsaved.is_some() {
             return;
         }
+        // Nor the lossy-save prompt (#1053), for the tab it asks about.
+        if self.pending_lossy_save.is_some() {
+            return;
+        }
         // The history scrubber's slider (#371): a press on the track seeks
         // there, and a drag that started on it keeps seeking wherever the
         // pointer goes, so the handle can be dragged off the row and back.
@@ -62898,6 +63305,11 @@ impl App {
                 if in_editor && m.modifiers.contains(KeyModifiers::CONTROL) {
                     if m.modifiers.contains(KeyModifiers::SHIFT) {
                         self.nav_back();
+                    } else if let Some(line0) = self.editor.gutter_line_at(m.column, m.row) {
+                        // Ctrl+click on the gutter toggles a bookmark on that
+                        // line (a plain click there still toggles a breakpoint).
+                        self.toggle_bookmark_at(line0 + 1);
+                        self.poke_cursor();
                     } else {
                         self.trigger_definition_at(m.column, m.row);
                     }
@@ -65613,12 +66025,14 @@ impl App {
     }
 
     /// Editor: Toggle Inline Suggestions (#607, Cmd+K Shift+G). Turning it on
-    /// resolves the backend first and says plainly when there is none.
+    /// resolves the backend first and says plainly when there is none; a
+    /// file whose language server offers suggestions needs no model.
     fn toggle_inline_suggestions(&mut self) {
         if self.inline_enabled {
             self.inline_enabled = false;
             self.editor.ghost = None;
             self.inline_job = None;
+            self.inline_lsp = None;
             self.inline_asked = None;
             self.status = String::from("Inline suggestions: off");
             return;
@@ -65644,8 +66058,69 @@ impl App {
                     .get_or_insert_with(crate::inline_complete::Worker::spawn);
                 self.inline_enabled = true;
             }
+            Err(why) if self.editor_offers_inline_completion() => {
+                self.inline_config = None;
+                self.inline_enabled = true;
+                self.status = format!(
+                    "Inline suggestions: on from the language server (no model: {why}); Tab accepts, Esc dismisses"
+                );
+            }
             Err(why) => self.status = format!("Inline suggestions need a model: {why}"),
         }
+    }
+
+    /// Whether the current file's language server offers inline completions
+    /// (LSP 3.18): it then answers instead of the model (#607).
+    fn editor_offers_inline_completion(&self) -> bool {
+        let path = self.editor.path.as_deref();
+        path.zip(self.lsp.as_ref())
+            .is_some_and(|(p, lsp)| lsp.document_offers_inline_completion(p))
+    }
+
+    /// Land the language server's inline completion (#607) when it still
+    /// answers for the caret and the text it was asked about.
+    fn land_inline_lsp(&mut self) -> bool {
+        let mut results = Vec::new();
+        if let Some(lsp) = self.lsp.as_ref() {
+            while let Some(r) = lsp.drain_inline_completion() {
+                results.push(r);
+            }
+        }
+        let mut changed = false;
+        for result in results {
+            let Some((id, path, seq, row, col)) = self.inline_lsp.clone() else {
+                continue;
+            };
+            if result.request_id != id {
+                continue;
+            }
+            self.inline_lsp = None;
+            let ed = &*self.editor;
+            let still = ed.path.as_ref() == Some(&path)
+                && ed.edit_seq == seq
+                && ed.cursor_row == row
+                && ed.cursor_col == col;
+            let (Some(crate::lsp::manager::InlineItem { text, range }), true) =
+                (result.item, still)
+            else {
+                continue;
+            };
+            let line = ed.lines.get(row).map_or("", String::as_str);
+            let to_col = |c| crate::widgets::editor::utf16_to_char_col(line, c);
+            let ghost = match range {
+                None => Some(crate::inline_complete::Ghost::insert(row, col, seq, text)),
+                Some((sl, sc, el, ec)) if sl as usize == row && el as usize == row => {
+                    let range = to_col(sc)..to_col(ec);
+                    crate::inline_complete::Ghost::replacing(row, col, seq, line, range, text)
+                }
+                Some(_) => None,
+            };
+            if ghost.is_some() {
+                self.editor.ghost = ghost;
+                changed = true;
+            }
+        }
+        changed
     }
 
     /// Ask for a suggestion once typing has paused with the caret at the end
@@ -65670,7 +66145,8 @@ impl App {
                     && self.editor.cursor_col == col;
                 match done.result {
                     Ok(Some(text)) if still => {
-                        self.editor.ghost = Some((row, col, seq, text));
+                        self.editor.ghost =
+                            Some(crate::inline_complete::Ghost::insert(row, col, seq, text));
                         changed = true;
                     }
                     Ok(_) => {}
@@ -65678,6 +66154,7 @@ impl App {
                 }
             }
         }
+        changed |= self.land_inline_lsp();
         let ed = &*self.editor;
         let Some(path) = ed.path.clone() else {
             return changed;
@@ -65695,7 +66172,7 @@ impl App {
         let already = ed
             .ghost
             .as_ref()
-            .is_some_and(|g| (g.0, g.1, g.2) == (row, col, seq))
+            .is_some_and(|g| (g.row, g.col, g.seq) == (row, col, seq))
             // Asked already at this caret and edit: an empty answer, an
             // error or an Esc'd ghost must not send the request again on
             // the next tick, which looped hundreds of paid calls a second.
@@ -65703,10 +66180,10 @@ impl App {
                 .inline_asked
                 .as_ref()
                 .is_some_and(|a| a.0 == path && (a.1, a.2, a.3) == (seq, row, col))
-            || self
-                .inline_job
-                .as_ref()
-                .is_some_and(|j| j.1 == path && (j.2, j.3, j.4) == (seq, row, col));
+            || [&self.inline_job, &self.inline_lsp]
+                .into_iter()
+                .flatten()
+                .any(|j| j.1 == path && (j.2, j.3, j.4) == (seq, row, col));
         if self.focus != Pane::Editor
             || !at_line_end
             || !settled
@@ -65715,6 +66192,15 @@ impl App {
             || ed.has_non_text_view()
             || self.completion_popup.is_some()
         {
+            return changed;
+        }
+        if self.editor_offers_inline_completion() {
+            let (line, character) = self.editor.cursor_position_utf16();
+            if let Some(lsp) = self.lsp.as_mut() {
+                let id = lsp.request_inline_completion(path.clone(), line, character);
+                self.inline_asked = Some((path.clone(), seq, row, col));
+                self.inline_lsp = Some((id, path, seq, row, col));
+            }
             return changed;
         }
         let (Some(worker), Some(config)) = (&self.inline_worker, &self.inline_config) else {
@@ -65734,15 +66220,33 @@ impl App {
 
     /// Tab takes a live suggestion (#607), recorded as the navigator's
     /// writing; Esc drops it. Ctrl+Right takes its next word and Ctrl+Down
-    /// its next line (#1625), leaving the rest live at the new caret.
+    /// its next line (#1625), leaving the rest live at the new caret. A
+    /// language server's replacement is taken whole by Tab only.
     /// Returns whether the key was used.
     fn inline_suggestion_key(&mut self, key: KeyEvent) -> bool {
         if self.completion_popup.is_some() || self.editor.snippet_active() {
             return false;
         }
-        let Some(text) = self.editor.live_ghost().map(str::to_string) else {
+        let Some(ghost) = self.editor.live_ghost_full().cloned() else {
             return false;
         };
+        if let Some(r) = ghost.replaces {
+            match (key.code, key.modifiers) {
+                (KeyCode::Tab, KeyModifiers::NONE) => {
+                    self.editor.selection = Some(crate::widgets::editor::EditorSelection {
+                        anchor: (ghost.row, r.start),
+                        head: (ghost.row, r.end),
+                    });
+                    self.editor
+                        .insert_str_as(&ghost.text, crate::provenance::Seat::Navigator);
+                }
+                (KeyCode::Esc, KeyModifiers::NONE) => {}
+                _ => return false,
+            }
+            self.editor.ghost = None;
+            return true;
+        }
+        let text = ghost.text;
         let take = match (key.code, key.modifiers) {
             (KeyCode::Tab, KeyModifiers::NONE) => text.len(),
             (KeyCode::Right, KeyModifiers::CONTROL) => crate::inline_complete::next_word_len(&text),
@@ -65765,7 +66269,12 @@ impl App {
                 self.editor.cursor_col,
                 self.editor.edit_seq,
             );
-            self.editor.ghost = Some((at.0, at.1, at.2, rest.to_string()));
+            self.editor.ghost = Some(crate::inline_complete::Ghost::insert(
+                at.0,
+                at.1,
+                at.2,
+                rest.to_string(),
+            ));
             // Recorded as asked too: once the ghost is Esc'd the tick
             // would otherwise send a fresh (paid) request at this caret.
             if let Some(path) = self.editor.path.clone() {
@@ -66010,6 +66519,14 @@ impl App {
                 },
             );
             return Some((target, row));
+        }
+        // Over the unsaved-changes prompt when both are up, as it is drawn.
+        if let Some(asked) = &self.pending_lossy_save {
+            return Some(said(
+                "Save would lose data",
+                &asked.spoken(),
+                &[tr("S, save anyway"), tr("Escape, cancel")],
+            ));
         }
         if let Some(exit) = &self.pending_unsaved {
             let (headline, names, save, discard) = self.unsaved_confirm_text(exit);
@@ -68565,28 +69082,44 @@ impl App {
     }
 
     /// An explicit save was refused because the encoding cannot represent the
-    /// buffer (`SaveOutcome::EncodingLoss`). Arm the one-shot lossy consent
-    /// and spell out exactly what the next Cmd+S will destroy, mirroring the
-    /// press-again flow of a disk conflict. The alternative exits are the
-    /// same two the refusal preserved: reopen the status-bar encoding picker
-    /// (a clean buffer switches encodings losslessly) or edit the characters
-    /// out.
+    /// buffer (`SaveOutcome::EncodingLoss`). Ask in a modal what to do,
+    /// naming exactly what the write would destroy (#1053). Only S there
+    /// arms the one-shot lossy consent and saves; the default, Esc, keeps the
+    /// file as it is. It used to arm the next Cmd+S and say so in the status
+    /// bar, which cut the warning out of the middle of the message at most
+    /// widths, so the natural retry destroyed the data unwarned.
     fn prompt_encoding_loss(&mut self) {
-        self.editor.lossy_save_armed = true;
-        let chars = self.editor.unmappable_chars();
-        if chars.is_empty() && self.editor.decode_lossy {
-            self.status = format!(
-                "Not saved: this file has bytes that are not valid {}, shown as \u{fffd} - press Cmd+S again to write them as \u{fffd} (irreversible), or Reopen with Encoding via the status bar",
-                self.editor.encoding.name()
-            );
+        let encoding = self.editor.encoding.name();
+        self.pending_lossy_save = Some(LossySave {
+            path: self.editor.path.clone(),
+            encoding,
+            chars: self.editor.unmappable_chars(),
+        });
+        self.status = format!("Not saved: {encoding} cannot hold this file as it is");
+    }
+
+    /// S in the lossy-save modal (#1053): consent to the write it named, for
+    /// the tab it asked about, and save.
+    fn confirm_lossy_save(&mut self) {
+        let Some(asked) = self.pending_lossy_save.take() else {
+            return;
+        };
+        if self.editor.path != asked.path {
+            self.force_save_armed = false;
+            self.status = String::from("Not saved: the file asked about is no longer in front");
             return;
         }
-        let shown: String = chars.iter().map(|c| format!("{c} ")).collect();
-        self.status = format!(
-            "Not saved: {} cannot represent {}- press Cmd+S again to replace them with &#…; references (irreversible), or switch encoding via the status bar",
-            self.editor.encoding.name(),
-            shown
-        );
+        self.editor.lossy_save_armed = true;
+        self.save();
+    }
+
+    /// Esc in the lossy-save modal (#1053): nothing is written. A disk
+    /// conflict overwrite consented to on the way here is dropped too, so the
+    /// next Cmd+S starts over rather than half-answered.
+    fn cancel_lossy_save(&mut self) {
+        self.pending_lossy_save = None;
+        self.force_save_armed = false;
+        self.status = String::from("Not saved: the file on disk is unchanged");
     }
 
     /// Whether an open context menu (or its submenu panel) overlaps `rect`
@@ -70559,9 +71092,9 @@ impl App {
     /// than
     /// [`crate::hot_exit::UNREADABLE_KEPT_FOR`]. Called once, at a normal
     /// launch.
-    pub fn restore_hot_exit(&mut self) {
+    pub fn restore_hot_exit(&mut self) -> bool {
         let Some(dir) = self.hot_exit_dir.clone() else {
-            return;
+            return false;
         };
         let root = self.workspace_root().to_path_buf();
         let mut restored = 0usize;
@@ -70599,7 +71132,7 @@ impl App {
                         "Hot exit is off for this session: a backup is at its own path, {}, and could not be moved aside",
                         own.display()
                     );
-                    return;
+                    return false;
                 }
             }
         }
@@ -70755,6 +71288,7 @@ impl App {
         if !notes.is_empty() {
             self.status = notes.join("; ");
         }
+        restored > 0
     }
 
     /// Write what an unsaved-changes prompt (#862) asked about: the focused
@@ -71973,6 +72507,7 @@ impl App {
         if !self.minimap_visible {
             self.disable_minimap_image();
         }
+        self.persist_layout();
         self.status = if self.minimap_visible && !self.minimap_room {
             format!(
                 "Minimap on: it shows once the editor is {} columns wide",
@@ -72124,7 +72659,7 @@ impl App {
                 label: format!(
                     "{}{}",
                     check(current == Some(lang)),
-                    crate::widgets::editor::language_label(Some(lang))
+                    crate::highlight::language_label(Some(lang))
                 ),
                 action: MenuAction::SetLanguage(Some(lang)),
             });
@@ -74711,9 +75246,22 @@ impl App {
                     s
                 })
         };
-        let edits = match crate::sarif::fixes::fix_for(&run, &result, index, &resolver, &mut |p| {
-            open_text(p).or_else(|| std::fs::read_to_string(p).ok())
-        }) {
+        // A file with unsaved edits, such as one an earlier fix from this
+        // log went into, or saved since the log, is not what it describes.
+        let changed = |p: &std::path::Path| {
+            self.editor
+                .iter_tabs()
+                .any(|t| t.path.as_deref() == Some(p) && t.dirty)
+                || crate::sarif::fixes::saved_after(p, &log_path, &run)
+        };
+        let edits = match crate::sarif::fixes::fix_for(
+            &run,
+            &result,
+            index,
+            &resolver,
+            &mut |p| open_text(p).or_else(|| std::fs::read_to_string(p).ok()),
+            &changed,
+        ) {
             Ok(e) => e,
             Err(why) => {
                 self.status = format!("Fix not applied: {why}");
@@ -77933,6 +78481,14 @@ fn is_trim_final_newlines_key(key: KeyEvent) -> bool {
     is_cmd_alt_shift_letter(key, 'n')
 }
 
+/// Whether `ed` shows 1-based `line`: every line of an ordinary tab, only
+/// its symbol's lines on a symbol tab (#369), where a caret elsewhere would
+/// be snapped back to the symbol's edge.
+fn bookmark_line_shown(ed: &Editor, line: usize) -> bool {
+    ed.symbol_clip()
+        .is_none_or(|(first, end)| (first..end).contains(&line.saturating_sub(1)))
+}
+
 /// `Cmd+Opt+Shift+K`: toggle a bookmark on the cursor's line (VS Code's
 /// Bookmarks extension binds `Ctrl+Alt+K`; nvim spells it `m<letter>`).
 fn is_toggle_bookmark_key(key: KeyEvent) -> bool {
@@ -80468,15 +81024,6 @@ fn remote_persistence_status(is_remote: bool, persistent: bool) -> Option<&'stat
     }
 }
 
-/// Test-only redirect for [`croft_cache_dir`], so the relay tests steer the
-/// relay rendezvous without repointing the process-global `$HOME` (#37):
-/// every concurrent test thread resolves `$HOME` at call time (the PDF
-/// rasteriser's scratch dir, the session paths), and a substituted value
-/// leaking across threads made unrelated tests fail inside the fake home.
-#[cfg(test)]
-pub static CACHE_DIR_OVERRIDE_FOR_TEST: std::sync::Mutex<Option<PathBuf>> =
-    std::sync::Mutex::new(None);
-
 /// Run `cmd` for at most `budget`, collecting stdout; None when it could not
 /// start or ran out of time (it is then killed and reaped). For the few
 /// short commands that still run on the UI thread.
@@ -80938,17 +81485,6 @@ fn utf16_col_to_char_in(line: &str, units: i64) -> usize {
             seen <= units
         })
         .count()
-}
-
-pub(crate) fn croft_cache_dir() -> PathBuf {
-    #[cfg(test)]
-    if let Some(dir) = CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap().clone() {
-        return dir;
-    }
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    home.join(".cache").join("croft")
 }
 
 /// The per-process self-install log: two drift-armed croft instances on one
@@ -81829,14 +82365,24 @@ pub fn run(
             app.add_workspace_folder(folder);
         }
     }
-    // Restore the tabs / layout carried across a self-update re-exec, then
-    // delete the handoff file so a later normal launch starts clean.
-    if let Some(session_path) = restore_session.as_ref() {
-        match crate::session_state::SessionState::load(session_path) {
+    // Determine which session file to restore from, if any:
+    //   * a self-update re-exec names one explicitly;
+    //   * otherwise hot exit is tried first, and ".session" (saved at the
+    //     previous clean exit) is the fallback when hot exit had nothing.
+    let session_path: Option<std::path::PathBuf> = if let Some(path) = restore_session {
+        Some(path.clone())
+    } else if !app.restore_hot_exit() {
+        Some(std::path::PathBuf::from(".session"))
+    } else {
+        None
+    };
+    // Restore the tabs / layout
+    if let Some(session_path) = session_path {
+        match crate::session_state::SessionState::load(&session_path) {
             Ok(state) => {
                 let left = app.apply_session_state(&state);
                 if app.hold_unrestored_tabs(left) {
-                    let _ = std::fs::remove_file(session_path);
+                    let _ = std::fs::remove_file(&session_path);
                 } else {
                     // Kept: it holds the only copy of cells not put back.
                     app.status = format!(
@@ -81856,10 +82402,6 @@ pub fn run(
                 );
             }
         }
-    } else {
-        // A normal launch brings back what hot exit kept of this workspace
-        // when croft last ended without a clean quit (#862).
-        app.restore_hot_exit();
     }
     crate::startup_trace::mark("session restored");
     // `--zen`: hide the Explorer sidebar and terminal so the editor fills the
@@ -82120,6 +82662,15 @@ pub fn run(
             crate::remote::RemoteOutcome::Exited => return Ok(()),
         }
     }
+
+    let state = app.capture_session_state();
+    let file_name = ".session";
+    // let state_path = crate::session_state::persistent_session_path(&root);
+    let state_path = std::path::Path::new(&file_name);
+    if let Err(e) = state.save(state_path) {
+        eprintln!("croft: failed to save session: {e}");
+    }
+
     Ok(())
 }
 

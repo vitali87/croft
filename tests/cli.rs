@@ -142,6 +142,116 @@ fn pr_without_a_usable_gh_says_how_to_fix_it_before_starting() {
     pr("not signed in; run gh auth login");
 }
 
+/// A workspace with a devcontainer.json, and a stand-in `docker` that logs
+/// each call to `docker.log` and knows one container for it, made from an
+/// older config with its workspace at `/workspaces/before-the-edit`.
+/// `docker top` lists `$DOCKER_TOP` as its processes, or fails for `fail`.
+#[cfg(unix)]
+fn devcontainer_with_a_stale_container() -> tempfile::TempDir {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("ws/.devcontainer");
+    std::fs::create_dir_all(&ws).unwrap();
+    std::fs::write(
+        ws.join("devcontainer.json"),
+        "// A comment added since.\n{ \"image\": \"ubuntu:24.04\" }\n",
+    )
+    .unwrap();
+    let bin = tmp.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let docker = bin.join("docker");
+    std::fs::write(
+        &docker,
+        r#"#!/bin/sh
+echo "$*" >> "$DOCKER_LOG"
+case "$1" in
+  ps) echo c0ffee000001 ;;
+  inspect) case "$3" in
+    *Running*) echo true ;;
+    *Labels*) echo older-config ;;
+    *WorkingDir*) echo /workspaces/before-the-edit ;;
+  esac ;;
+  top) [ "$DOCKER_TOP" = fail ] && exit 1
+    echo 'UID PID PPID C STIME TTY TIME CMD'; echo "$DOCKER_TOP" ;;
+  exec) case "$*" in *uname*) echo x86_64 ;; esac ;;
+esac
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+    tmp
+}
+
+#[cfg(unix)]
+fn run_devcontainer(tmp: &std::path::Path, args: &[&str], top: &str) -> assert_cmd::assert::Assert {
+    Command::cargo_bin("croft")
+        .unwrap()
+        .arg("devcontainer")
+        .arg(tmp.join("ws"))
+        .args(args)
+        .env("PATH", tmp.join("bin"))
+        .env("HOME", tmp)
+        .env("DOCKER_LOG", tmp.join("docker.log"))
+        .env("DOCKER_TOP", top)
+        .env("CROFT_DEVCONTAINER_BINARY", "/bin/true")
+        .timeout(std::time::Duration::from_secs(30))
+        .assert()
+}
+
+/// #1110: an edited devcontainer.json used to `docker rm -f` the container
+/// on the next run, killing a croft still running in it with its unsaved
+/// edits and everything made inside it. The container is kept, and the run
+/// says how to replace it. Until then, croft opens in the workspace folder
+/// the container was made with.
+#[cfg(unix)]
+#[test]
+fn devcontainer_keeps_a_container_whose_config_changed() {
+    let tmp = devcontainer_with_a_stale_container();
+    let out = run_devcontainer(tmp.path(), &[], "root 42 0 0 10:01 pts/0 00:00:01 sh").success();
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains(
+            "devcontainer.json changed since this container was created; run \
+             `croft devcontainer --rebuild` to recreate it"
+        ),
+        "{stderr}"
+    );
+    let calls = std::fs::read_to_string(tmp.path().join("docker.log")).unwrap();
+    assert!(!calls.contains("rm "), "{calls}");
+    let attach = calls.lines().find(|l| l.starts_with("exec -it")).unwrap();
+    assert!(
+        attach.ends_with("-w /workspaces/before-the-edit c0ffee000001 /usr/local/bin/croft /workspaces/before-the-edit"),
+        "{attach}"
+    );
+}
+
+/// #1110: `--rebuild` refuses while a croft runs in the container from
+/// another terminal, or when docker can't say whether one does, and
+/// replaces it once none does.
+#[cfg(unix)]
+#[test]
+fn devcontainer_rebuild_waits_for_the_croft_running_in_it() {
+    let tmp = devcontainer_with_a_stale_container();
+    let attached = "root 42 0 0 10:01 pts/0 00:00:01 /usr/local/bin/croft /workspaces/ws";
+    let out = run_devcontainer(tmp.path(), &["--rebuild"], attached).failure();
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains("croft is still running in this container, in another terminal"),
+        "{stderr}"
+    );
+    let log = tmp.path().join("docker.log");
+    let out = run_devcontainer(tmp.path(), &["--rebuild"], "fail").failure();
+    let stderr = String::from_utf8(out.get_output().stderr.clone()).unwrap();
+    assert!(
+        stderr.contains("can't tell whether croft is running in the container"),
+        "{stderr}"
+    );
+    assert!(!std::fs::read_to_string(&log).unwrap().contains("rm "));
+    run_devcontainer(tmp.path(), &["--rebuild"], "root 7 0 0 10:01 ? 00:00:00 sh").success();
+    let calls = std::fs::read_to_string(&log).unwrap();
+    assert!(calls.contains("rm -f c0ffee000001"), "{calls}");
+}
+
 /// The persisted pair record is the baseline for every `croft pair`
 /// invocation: `--off` (with or without provider flags) and a plain
 /// re-activation must both keep a custom ollama endpoint. Resolving bare
