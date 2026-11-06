@@ -44,6 +44,11 @@ pub const VSCODE_ANSI: [(u8, u8, u8); 16] = [
     (0xe5, 0xe5, 0xe5),
 ];
 
+/// Logo orange (#e97c41), sampled from `assets/logo.png`: the colour of the
+/// `<>` angle brackets in the "cr<>ft" wordmark. Also the Extensions panel's
+/// trash button — the warm complement to the teal brand gradient.
+pub(crate) const BRAND_ORANGE: Color = Color::Rgb(0xe9, 0x7c, 0x41);
+
 /// The eight syntax-highlight colors a theme paints code with, shared by the
 /// tree-sitter highlighter and the LSP semantic-token overlay (both funnel
 /// through `highlight::style_for_name`). Grouped by role the way editor themes

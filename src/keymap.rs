@@ -647,7 +647,7 @@ impl Keymap {
         // rather than swallowed - an empty file legitimately means no
         // bindings, but a broken one means bindings the user wrote that
         // vanished, and the two must not look alike.
-        let rows: Vec<Binding> = match serde_json::from_str(&crate::tasks::strip_jsonc(json)) {
+        let rows: Vec<Binding> = match serde_json::from_str(&crate::jsonc::strip_jsonc(json)) {
             Ok(rows) => rows,
             Err(e) => {
                 warnings.push(format!(
@@ -915,13 +915,13 @@ pub fn rebind_text(src: Option<&str>, command: &str, chord: &str) -> Option<Stri
     let kept: Vec<&str> = src.lines().filter(|l| !names_command(l)).collect();
     let mut text = kept.join("\n");
     let parsed_ok = |t: &str| {
-        serde_json::from_str::<serde_json::Value>(&crate::tasks::strip_jsonc(t))
+        serde_json::from_str::<serde_json::Value>(&crate::jsonc::strip_jsonc(t))
             .is_ok_and(|v| v.is_array())
     };
     if let Some(close) = text.rfind(']') {
         // What precedes the new entry decides the comma: an element needs
         // one, an opening bracket or a trailing comma does not.
-        let before = crate::tasks::strip_jsonc(&text[..close]);
+        let before = crate::jsonc::strip_jsonc(&text[..close]);
         let needs_comma = before.trim_end().ends_with('}');
         let insert = format!("{}  {entry}\n", if needs_comma { ",\n" } else { "\n" });
         let head = text[..close].trim_end().to_string();
@@ -935,7 +935,7 @@ pub fn rebind_text(src: Option<&str>, command: &str, chord: &str) -> Option<Stri
     }
     // Structured fallback: comments are lost, the bindings are not.
     let mut rows: Vec<serde_json::Value> =
-        serde_json::from_str(&crate::tasks::strip_jsonc(src)).ok()?;
+        serde_json::from_str(&crate::jsonc::strip_jsonc(src)).ok()?;
     rows.retain(|r| r.get("command").and_then(|c| c.as_str()) != Some(command));
     rows.push(serde_json::json!({ "key": chord, "command": command }));
     Some(serde_json::to_string_pretty(&rows).ok()? + "\n")
@@ -1449,7 +1449,7 @@ mod tests {
 
     #[test]
     fn strips_line_comments_but_keeps_slashes_in_strings() {
-        let stripped = crate::tasks::strip_jsonc(
+        let stripped = crate::jsonc::strip_jsonc(
             "// lead\n[{ \"key\": \"a//b\", \"command\": \"x\" }] // trailing",
         );
         assert!(!stripped.contains("lead"));

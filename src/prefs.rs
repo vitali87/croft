@@ -674,7 +674,7 @@ impl Prefs {
     /// so a strict parse here threw away every setting in a file that
     /// merely had a comment, re-enabling disabled extensions among others.
     fn parse(json: &str) -> serde_json::Result<Self> {
-        let value: serde_json::Value = serde_json::from_str(&crate::tasks::strip_jsonc(json))?;
+        let value: serde_json::Value = serde_json::from_str(&crate::jsonc::strip_jsonc(json))?;
         let mut prefs: Self = serde_json::from_value(value.clone())?;
         if let serde_json::Value::Object(map) = value {
             prefs.source = SourceDoc(Some(map));
@@ -1656,7 +1656,7 @@ mod tests {
         // The comment survives the saves (#1129).
         assert!(text.contains("// shared base"), "{text}");
         let doc: serde_json::Value =
-            serde_json::from_str(&crate::tasks::strip_jsonc(&text)).unwrap();
+            serde_json::from_str(&crate::jsonc::strip_jsonc(&text)).unwrap();
         assert_eq!(doc["extends"], "base.json");
         assert_eq!(doc["macos"]["theme"], "light");
         assert_eq!(doc["future_setting"], 7);

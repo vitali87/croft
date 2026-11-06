@@ -257,7 +257,7 @@ fn read_token_colors_file(path: &Path) -> Result<(Vec<TokenColor>, usize)> {
         .and_then(|e| e.to_str())
         .is_some_and(|e| e.eq_ignore_ascii_case("json"));
     let doc: Value = if is_json {
-        serde_json::from_str(&crate::tasks::strip_jsonc(&String::from_utf8_lossy(&bytes)))?
+        serde_json::from_str(&crate::jsonc::strip_jsonc(&String::from_utf8_lossy(&bytes)))?
     } else {
         plist::from_bytes(&bytes)?
     };
@@ -292,11 +292,11 @@ fn read_rules(tokens: Value) -> (Vec<TokenColor>, usize) {
 
 /// Parse one theme document, tolerating VS Code's JSONC extras.
 fn parse_theme(raw: &str) -> Result<RawTheme> {
-    // `crate::tasks::strip_jsonc` walks CHARS. The copy that used to live in
+    // `crate::jsonc::strip_jsonc` walks CHARS. The copy that used to live in
     // `workspace.rs` walked bytes and turned a non-ASCII theme name
     // ("Caf\u{e9} Noir") into mojibake (#396); it was deleted in favour of
     // this one, which is why there is only ever one of these.
-    let stripped = crate::tasks::strip_jsonc(raw);
+    let stripped = crate::jsonc::strip_jsonc(raw);
     let value: serde_json::Value = serde_json::from_str(&stripped)?;
     // `tokenColors` is camelCase in the file; take it by hand rather than
     // renaming through serde so a theme using the TextMate `settings` array

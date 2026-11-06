@@ -49,6 +49,8 @@ use welcome::WelcomeState;
 
 use crate::lsp::manager::CompletionTrigger;
 use crate::lsp::manager::{diagnostics_by_source, diagnostics_source, diagnostics_store_key};
+use crate::paths::croft_cache_dir;
+use crate::theme::BRAND_ORANGE;
 use crate::widgets::terminal::cwd_of_pid;
 
 use crate::widgets::{
@@ -334,6 +336,17 @@ struct PendingSelectionRanges {
     seq: u64,
     presses: usize,
     positions: Vec<(u32, u32)>,
+}
+
+/// Where a row of Bookmarks: View Bookmarks points: the tab holding the
+/// mark (its editor group by depth-first index, then its index in that
+/// group), the file it shows and the 1-based line.
+#[derive(Clone, Debug)]
+struct BookmarkTarget {
+    group: usize,
+    tab: usize,
+    path: PathBuf,
+    line: usize,
 }
 
 /// Pre-Zen visibility snapshot, restored verbatim when Zen Mode is toggled
@@ -1014,11 +1027,6 @@ fn git_status_spans<'a>(status: &'a crate::git::GitStatus) -> Vec<Span<'a>> {
     }
     spans
 }
-
-/// Logo orange (#e97c41), sampled from `assets/logo.png`: the colour of the
-/// `<>` angle brackets in the "cr<>ft" wordmark. Also the Extensions panel's
-/// trash button — the warm complement to the teal brand gradient.
-pub(crate) const BRAND_ORANGE: Color = Color::Rgb(0xe9, 0x7c, 0x41);
 
 /// Spans for the "cr<>ft" wordmark at the left of the status bar, styled to
 /// mirror the app logo: white letters with the `<>` (the stylised "o") in the
@@ -5296,6 +5304,8 @@ pub struct App {
     agent_ledger_saved: (u64, std::time::Instant),
     /// The (agent, file) behind each row of the lane-file picker.
     pending_lane_picks: Vec<(String, PathBuf)>,
+    /// The tab and line behind each row of Bookmarks: View Bookmarks.
+    pending_bookmarks: Vec<BookmarkTarget>,
     /// When the running Fix with Navigator turn started (#374): the clock
     /// its PROBLEMS-row spinner runs on, and the flag that keeps the main
     /// loop repainting while it runs. `None` when no fix is streaming.
@@ -7565,6 +7575,7 @@ impl App {
             agent_ledger_store: (!cfg!(test)).then(agent_ledger_store_path),
             agent_ledger_saved: (0, std::time::Instant::now()),
             pending_lane_picks: Vec::new(),
+            pending_bookmarks: Vec::new(),
             problems_fix_started: None,
             http_run: None,
             http_environment: None,
@@ -12335,7 +12346,7 @@ impl App {
         runs: &mut Vec<Vec<String>>,
     ) {
         let config: serde_json::Value =
-            serde_json::from_str(&crate::tasks::strip_jsonc(text)).unwrap_or_default();
+            serde_json::from_str(&crate::jsonc::strip_jsonc(text)).unwrap_or_default();
         let names_no_files = config
             .get("files")
             .and_then(|f| f.as_array())
@@ -26140,6 +26151,13 @@ impl App {
             // Must precede the case-insensitive T theme arm below.
             KeyCode::Char('T') if shifted && plain => {
                 self.undo_close_terminal();
+                true
+            }
+            // Cmd+K Cmd+M (Ctrl+K Ctrl+M off macOS): View Bookmarks. Needs the
+            // trailing Cmd, so plain `Cmd+K M` below still maximizes the
+            // terminal pane.
+            KeyCode::Char(c) if plain && cmd_held && c.eq_ignore_ascii_case(&'m') => {
+                self.open_bookmark_picker();
                 true
             }
             // Cmd+K Shift+W: reopen the most recently closed editor tab
@@ -43263,6 +43281,14 @@ impl App {
                     );
                 }
             }
+            ListPurpose::Bookmark => {
+                // The row's own path, not one parsed back from text: a
+                // file name that is not UTF-8 would not survive the trip.
+                if let Some(target) = self.pending_bookmarks.get(index).cloned() {
+                    self.jump_to_bookmark(target);
+                }
+                self.pending_bookmarks.clear();
+            }
             ListPurpose::OutputChannel => {
                 self.output.sync();
                 self.output.select_by_name(&row.id);
@@ -48200,7 +48226,31 @@ impl App {
             sidebar_width: self.sidebar_width,
             terminal_height: self.terminal_height,
             focus_editor: self.focus == Pane::Editor,
+            bookmarks: self.all_bookmarks(),
         }
+    }
+
+    /// The bookmarks of every open tab, keyed by file. Each tab is an editor
+    /// with its own marks, so the active one's map alone would miss the rest.
+    fn all_bookmarks(
+        &self,
+    ) -> std::collections::HashMap<PathBuf, std::collections::BTreeSet<usize>> {
+        let mut all = std::collections::HashMap::new();
+        // A tab's own file first: its marks are the live ones.
+        for ed in &self.editor.editors {
+            if let Some(path) = &ed.path
+                && let Some(set) = ed.bookmarks.get(path)
+            {
+                all.insert(path.clone(), set.clone());
+            }
+        }
+        // Then files the tab showed earlier, whose marks it still holds.
+        for ed in &self.editor.editors {
+            for (path, set) in &ed.bookmarks {
+                all.entry(path.clone()).or_insert_with(|| set.clone());
+            }
+        }
+        all
     }
 
     /// Returns the xlsx cells (#1593) it could not put back, as the tabs
@@ -48223,6 +48273,11 @@ impl App {
                 kept.sheet_cells = unapplied;
                 left.push(kept);
             }
+        }
+        // Every tab is its own editor with its own marks: hand each the saved
+        // set once its file is open, trimmed to the lines the file still has.
+        for ed in self.editor.editors.iter_mut() {
+            ed.restore_bookmarks(&state.bookmarks);
         }
         if state.active_tab < self.editor.tab_count() {
             self.editor.select(state.active_tab);
@@ -48278,7 +48333,7 @@ impl App {
     fn restore_open_tab(
         &mut self,
         tab: &crate::session_state::OpenTabState,
-    ) -> Option<(&mut Editor, Vec<crate::widgets::editor::SheetCellEdit>)> {
+    ) -> Option<(&mut Editor, Vec<crate::sheet::SheetCellEdit>)> {
         let unsaved = tab.unsaved_text.as_deref().filter(|_| tab.dirty);
         let opened = tab
             .path
@@ -48784,11 +48839,16 @@ impl App {
     /// status bar. A buffer with no path on disk cannot hold marks, and says so
     /// rather than silently doing nothing.
     fn toggle_bookmark(&mut self) {
+        self.toggle_bookmark_at(self.editor.cursor_row + 1);
+    }
+
+    /// [`Self::toggle_bookmark`] for a given 1-based `line`, leaving the
+    /// cursor and scroll where they are (the gutter Ctrl+click).
+    fn toggle_bookmark_at(&mut self, line: usize) {
         if !self.editor_is_text() {
             return;
         }
-        let line = self.editor.cursor_row + 1;
-        self.status = match self.editor.toggle_bookmark() {
+        self.status = match self.editor.toggle_bookmark_at(line) {
             Some(true) => format!("Bookmark set on line {line}"),
             Some(false) => format!("Bookmark cleared on line {line}"),
             None => String::from("Save the file before bookmarking a line"),
@@ -48817,6 +48877,101 @@ impl App {
             }
             None => String::from("No bookmarks in this file (Cmd+Opt+Shift+K sets one)"),
         };
+    }
+
+    /// Bookmarks: View Bookmarks: a filterable list of every bookmark in
+    /// the open tabs of every editor group (`file:line  text of the line`),
+    /// Enter jumps to it. Only the file a tab shows counts: the marks a tab
+    /// still holds for a file it showed earlier are not of an open file.
+    fn open_bookmark_picker(&mut self) {
+        use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+        let root = self.tree.root.clone();
+        // The focused group first, so a mark it shares with another group
+        // jumps to the tab already in front of the user.
+        let active = self.editor_layout.active_dfs_index();
+        let groups = std::iter::once((active, &self.editor)).chain(
+            (0..self.editor_layout.leaf_count())
+                .filter_map(|g| Some((g, self.editor_layout.group_ref_at_dfs(g)?))),
+        );
+        // Two tabs on one file (a split, a symbol tab) list a shared mark once.
+        let mut seen = std::collections::HashSet::new();
+        let mut found: Vec<(BookmarkTarget, String)> = Vec::new();
+        for (group, tabs) in groups {
+            // A diff, image or sheet tab's rows are not the file's lines.
+            for (tab, ed) in tabs.editors.iter().enumerate() {
+                let Some(path) = ed.path.as_ref().filter(|_| !ed.has_non_text_view()) else {
+                    continue;
+                };
+                // Only lines the buffer has (see `bookmarked_lines`), and on
+                // a symbol tab only the lines of its symbol, the ones it shows.
+                for line in ed.bookmarked_lines() {
+                    if bookmark_line_shown(ed, line) && seen.insert((path.clone(), line)) {
+                        let text = ed.lines[line - 1].trim().chars().take(80).collect();
+                        let path = path.clone();
+                        found.push((
+                            BookmarkTarget {
+                                group,
+                                tab,
+                                path,
+                                line,
+                            },
+                            text,
+                        ));
+                    }
+                }
+            }
+        }
+        found.sort_by(|(a, _), (b, _)| (&a.path, a.line).cmp(&(&b.path, b.line)));
+        self.pending_bookmarks.clear();
+        let mut rows = Vec::with_capacity(found.len());
+        for (target, text) in found {
+            let shown = target.path.strip_prefix(&root).unwrap_or(&target.path);
+            rows.push(ListRow {
+                id: self.pending_bookmarks.len().to_string(),
+                label: format!("{}:{}  {text}", shown.display(), target.line),
+            });
+            self.pending_bookmarks.push(target);
+        }
+        let picker = ListPicker::new(ListPurpose::Bookmark, "Bookmarks", rows);
+        self.open_list_picker(picker, "No bookmarks (Cmd+Opt+Shift+K sets one)");
+    }
+
+    /// Enter on a View Bookmarks row: focus the editor group and the tab
+    /// that hold the mark, and put the caret on its line there, with no
+    /// selection left over for the next keystroke to type over. A tab that
+    /// closed or moved on since the list opened leaves the file to open in
+    /// that group as any jump would.
+    fn jump_to_bookmark(&mut self, target: BookmarkTarget) {
+        let BookmarkTarget {
+            group,
+            tab,
+            path,
+            line,
+        } = target;
+        if group != self.editor_layout.active_dfs_index()
+            && self.editor_layout.group_ref_at_dfs(group).is_some()
+        {
+            let current = std::mem::take(&mut self.editor);
+            self.editor = self.editor_layout.refocus_to_dfs(current, group);
+        }
+        self.hover_popup = None;
+        self.hover_diagnostic = None;
+        let same_tab = self.editor.editors.get(tab).is_some_and(|ed| {
+            ed.path.as_deref() == Some(path.as_path())
+                && !ed.has_non_text_view()
+                && bookmark_line_shown(ed, line)
+        });
+        if same_tab {
+            self.editor.select(tab);
+        } else if let Err(e) = self.editor.open_preview(&path) {
+            self.status = format!("Cannot open bookmark: {e}");
+            return;
+        }
+        self.sync_open_file_poll_mtime();
+        self.editor.jump_to_bookmark(line);
+        self.focus_pane(Pane::Editor);
+        self.poke_cursor();
+        self.status = format!("Bookmark at line {line}");
     }
 
     /// Clear every bookmark in the open file, reporting how many went.
@@ -57979,6 +58134,7 @@ impl App {
             Cmd::NextBookmark => self.goto_bookmark(true),
             Cmd::PreviousBookmark => self.goto_bookmark(false),
             Cmd::ClearBookmarks => self.clear_bookmarks(),
+            Cmd::ViewBookmarks => self.open_bookmark_picker(),
             Cmd::SaveFile => self.save(),
             Cmd::SaveAs => self.open_save_as_prompt(),
             Cmd::SaveWithSudo => self.save_with_sudo(),
@@ -59757,6 +59913,8 @@ impl App {
                     picker.select_next();
                 }
             }
+            (KeyCode::Home, _) => picker.select_first(),
+            (KeyCode::End, _) => picker.select_last(),
             (KeyCode::Left, _) => picker.move_cursor_left(),
             (KeyCode::Right, _) => picker.move_cursor_right(),
             (KeyCode::Backspace, _) => picker.pop_char(),
@@ -63052,6 +63210,11 @@ impl App {
                 if in_editor && m.modifiers.contains(KeyModifiers::CONTROL) {
                     if m.modifiers.contains(KeyModifiers::SHIFT) {
                         self.nav_back();
+                    } else if let Some(line0) = self.editor.gutter_line_at(m.column, m.row) {
+                        // Ctrl+click on the gutter toggles a bookmark on that
+                        // line (a plain click there still toggles a breakpoint).
+                        self.toggle_bookmark_at(line0 + 1);
+                        self.poke_cursor();
                     } else {
                         self.trigger_definition_at(m.column, m.row);
                     }
@@ -70835,9 +70998,9 @@ impl App {
     /// than
     /// [`crate::hot_exit::UNREADABLE_KEPT_FOR`]. Called once, at a normal
     /// launch.
-    pub fn restore_hot_exit(&mut self) {
+    pub fn restore_hot_exit(&mut self) -> bool {
         let Some(dir) = self.hot_exit_dir.clone() else {
-            return;
+            return false;
         };
         let root = self.workspace_root().to_path_buf();
         let mut restored = 0usize;
@@ -70875,7 +71038,7 @@ impl App {
                         "Hot exit is off for this session: a backup is at its own path, {}, and could not be moved aside",
                         own.display()
                     );
-                    return;
+                    return false;
                 }
             }
         }
@@ -71031,6 +71194,7 @@ impl App {
         if !notes.is_empty() {
             self.status = notes.join("; ");
         }
+        restored > 0
     }
 
     /// Write what an unsaved-changes prompt (#862) asked about: the focused
@@ -72401,7 +72565,7 @@ impl App {
                 label: format!(
                     "{}{}",
                     check(current == Some(lang)),
-                    crate::widgets::editor::language_label(Some(lang))
+                    crate::highlight::language_label(Some(lang))
                 ),
                 action: MenuAction::SetLanguage(Some(lang)),
             });
@@ -78223,6 +78387,14 @@ fn is_trim_final_newlines_key(key: KeyEvent) -> bool {
     is_cmd_alt_shift_letter(key, 'n')
 }
 
+/// Whether `ed` shows 1-based `line`: every line of an ordinary tab, only
+/// its symbol's lines on a symbol tab (#369), where a caret elsewhere would
+/// be snapped back to the symbol's edge.
+fn bookmark_line_shown(ed: &Editor, line: usize) -> bool {
+    ed.symbol_clip()
+        .is_none_or(|(first, end)| (first..end).contains(&line.saturating_sub(1)))
+}
+
 /// `Cmd+Opt+Shift+K`: toggle a bookmark on the cursor's line (VS Code's
 /// Bookmarks extension binds `Ctrl+Alt+K`; nvim spells it `m<letter>`).
 fn is_toggle_bookmark_key(key: KeyEvent) -> bool {
@@ -80758,15 +80930,6 @@ fn remote_persistence_status(is_remote: bool, persistent: bool) -> Option<&'stat
     }
 }
 
-/// Test-only redirect for [`croft_cache_dir`], so the relay tests steer the
-/// relay rendezvous without repointing the process-global `$HOME` (#37):
-/// every concurrent test thread resolves `$HOME` at call time (the PDF
-/// rasteriser's scratch dir, the session paths), and a substituted value
-/// leaking across threads made unrelated tests fail inside the fake home.
-#[cfg(test)]
-pub static CACHE_DIR_OVERRIDE_FOR_TEST: std::sync::Mutex<Option<PathBuf>> =
-    std::sync::Mutex::new(None);
-
 /// Run `cmd` for at most `budget`, collecting stdout; None when it could not
 /// start or ran out of time (it is then killed and reaped). For the few
 /// short commands that still run on the UI thread.
@@ -81228,17 +81391,6 @@ fn utf16_col_to_char_in(line: &str, units: i64) -> usize {
             seen <= units
         })
         .count()
-}
-
-pub(crate) fn croft_cache_dir() -> PathBuf {
-    #[cfg(test)]
-    if let Some(dir) = CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap().clone() {
-        return dir;
-    }
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    home.join(".cache").join("croft")
 }
 
 /// The per-process self-install log: two drift-armed croft instances on one
@@ -82119,14 +82271,24 @@ pub fn run(
             app.add_workspace_folder(folder);
         }
     }
-    // Restore the tabs / layout carried across a self-update re-exec, then
-    // delete the handoff file so a later normal launch starts clean.
-    if let Some(session_path) = restore_session.as_ref() {
-        match crate::session_state::SessionState::load(session_path) {
+    // Determine which session file to restore from, if any:
+    //   * a self-update re-exec names one explicitly;
+    //   * otherwise hot exit is tried first, and ".session" (saved at the
+    //     previous clean exit) is the fallback when hot exit had nothing.
+    let session_path: Option<std::path::PathBuf> = if let Some(path) = restore_session {
+        Some(path.clone())
+    } else if !app.restore_hot_exit() {
+        Some(std::path::PathBuf::from(".session"))
+    } else {
+        None
+    };
+    // Restore the tabs / layout
+    if let Some(session_path) = session_path {
+        match crate::session_state::SessionState::load(&session_path) {
             Ok(state) => {
                 let left = app.apply_session_state(&state);
                 if app.hold_unrestored_tabs(left) {
-                    let _ = std::fs::remove_file(session_path);
+                    let _ = std::fs::remove_file(&session_path);
                 } else {
                     // Kept: it holds the only copy of cells not put back.
                     app.status = format!(
@@ -82146,10 +82308,6 @@ pub fn run(
                 );
             }
         }
-    } else {
-        // A normal launch brings back what hot exit kept of this workspace
-        // when croft last ended without a clean quit (#862).
-        app.restore_hot_exit();
     }
     crate::startup_trace::mark("session restored");
     // `--zen`: hide the Explorer sidebar and terminal so the editor fills the
@@ -82410,6 +82568,15 @@ pub fn run(
             crate::remote::RemoteOutcome::Exited => return Ok(()),
         }
     }
+
+    let state = app.capture_session_state();
+    let file_name = ".session";
+    // let state_path = crate::session_state::persistent_session_path(&root);
+    let state_path = std::path::Path::new(&file_name);
+    if let Err(e) = state.save(state_path) {
+        eprintln!("croft: failed to save session: {e}");
+    }
+
     Ok(())
 }
 

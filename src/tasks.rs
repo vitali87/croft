@@ -457,7 +457,9 @@ fn tsconfig_tasks(root: &Path) -> Vec<Task> {
 fn has_references(path: &Path) -> bool {
     std::fs::read_to_string(path)
         .ok()
-        .and_then(|text| serde_json::from_str::<serde_json::Value>(&strip_jsonc(&text)).ok())
+        .and_then(|text| {
+            serde_json::from_str::<serde_json::Value>(&crate::jsonc::strip_jsonc(&text)).ok()
+        })
         .and_then(|v| v.get("references")?.as_array().map(|a| !a.is_empty()))
         .unwrap_or(false)
 }
@@ -482,7 +484,7 @@ fn vscode_tasks(root: &Path) -> Vec<Task> {
     let Some(text) = read_first(root, &[".vscode/tasks.json"]) else {
         return Vec::new();
     };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&strip_jsonc(&text)) else {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&crate::jsonc::strip_jsonc(&text)) else {
         return Vec::new();
     };
     let Some(tasks) = v.get("tasks").and_then(|t| t.as_array()) else {
@@ -1425,93 +1427,6 @@ fn pyproject_tasks_on(root: &Path, on_path: &dyn Fn(&str) -> bool) -> Vec<Task> 
         .collect();
     if text.contains("pytest") {
         out.push(task(pytest));
-    }
-    out
-}
-
-/// Strip `//` and `/* */` comments (outside strings) plus trailing commas
-/// so VS Code's JSONC tasks.json parses with strict serde_json. Two
-/// passes: comments first, then trailing commas, so a comma followed by
-/// a comment followed by `}` still counts as trailing. Shared with
-/// `dap::configs` (launch.json) and `config_layers` (settings layers),
-/// which read their files under the same tolerance.
-pub(crate) fn strip_jsonc(text: &str) -> String {
-    let mut no_comments = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
-    let mut in_string = false;
-    while let Some(c) = chars.next() {
-        if in_string {
-            no_comments.push(c);
-            match c {
-                '\\' => {
-                    if let Some(next) = chars.next() {
-                        no_comments.push(next);
-                    }
-                }
-                '"' => in_string = false,
-                _ => {}
-            }
-            continue;
-        }
-        match c {
-            '"' => {
-                in_string = true;
-                no_comments.push(c);
-            }
-            '/' if chars.peek() == Some(&'/') => {
-                for n in chars.by_ref() {
-                    if n == '\n' {
-                        no_comments.push('\n');
-                        break;
-                    }
-                }
-            }
-            '/' if chars.peek() == Some(&'*') => {
-                chars.next();
-                let mut prev = ' ';
-                for n in chars.by_ref() {
-                    if prev == '*' && n == '/' {
-                        break;
-                    }
-                    prev = n;
-                }
-            }
-            _ => no_comments.push(c),
-        }
-    }
-    let mut out = String::with_capacity(no_comments.len());
-    let mut chars = no_comments.chars().peekable();
-    let mut in_string = false;
-    while let Some(c) = chars.next() {
-        if in_string {
-            out.push(c);
-            match c {
-                '\\' => {
-                    if let Some(next) = chars.next() {
-                        out.push(next);
-                    }
-                }
-                '"' => in_string = false,
-                _ => {}
-            }
-            continue;
-        }
-        match c {
-            '"' => {
-                in_string = true;
-                out.push(c);
-            }
-            ',' => {
-                let closes = chars
-                    .clone()
-                    .find(|n| !n.is_whitespace())
-                    .is_some_and(|n| matches!(n, '}' | ']'));
-                if !closes {
-                    out.push(',');
-                }
-            }
-            _ => out.push(c),
-        }
     }
     out
 }
@@ -2892,42 +2807,6 @@ mod tests {
             default_build_task(&tasks).unwrap().label,
             "full build",
             "the explicit VS Code default build outranks the Makefile target"
-        );
-    }
-
-    #[test]
-    fn strip_jsonc_leaves_strings_intact() {
-        let cleaned = strip_jsonc(
-            r#"{"a": "http://x // not a comment", // real
-"b": 1, /* gone */ }"#,
-        );
-        let v: serde_json::Value = serde_json::from_str(&cleaned).expect("valid strict JSON");
-        assert_eq!(v["a"], "http://x // not a comment");
-        assert_eq!(v["b"], 1);
-    }
-
-    /// The non-ASCII guarantee belongs on the function that carries it.
-    ///
-    /// Seven modules route their JSONC through here, and #396 was a second
-    /// copy in `workspace.rs` that walked BYTES: it rebuilt every multi-byte
-    /// character one byte at a time, so `caf\u{e9}` came back as `caf\u{c3}\u{a9}`
-    /// and the JSON still parsed. That copy is gone, but the only tests that
-    /// covered this were in the CALLERS, and each of those reaches this
-    /// function through file IO and a JSON parse. A future rewrite of this
-    /// stripper could reintroduce the defect for every module whose own
-    /// tests happen to be ASCII, which was all of them.
-    ///
-    /// Non-ASCII in a key as well as a value: a mangled key does not merely
-    /// arrive wrong, it makes the document fail to parse outright.
-    #[test]
-    fn strip_jsonc_preserves_non_ascii() {
-        let cleaned = strip_jsonc(
-            "{\n  // a comment, so the comment path actually runs\n  \"caf\u{e9}\": \"\u{4e2d}\u{6587} \u{444}\u{430}\u{439}\u{43b}\",\n}",
-        );
-        let v: serde_json::Value = serde_json::from_str(&cleaned).expect("valid strict JSON");
-        assert_eq!(
-            v["caf\u{e9}"],
-            "\u{4e2d}\u{6587} \u{444}\u{430}\u{439}\u{43b}"
         );
     }
 
