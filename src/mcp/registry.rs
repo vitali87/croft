@@ -65,7 +65,7 @@ fn server_spawn(decl: &McpServerDecl) -> ServerSpawn {
 
 /// Bundled + user manifest sources, in load order.
 fn all_sources() -> Vec<String> {
-    all_sources_in_dir(&crate::prefs::config_dir())
+    all_sources_in_dir(&crate::paths::config_dir())
 }
 
 /// Every manifest source, with the user extensions read from under an

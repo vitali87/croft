@@ -629,7 +629,7 @@ pub fn workspace_recommendations(root: &Path) -> Vec<String> {
     let Ok(raw) = std::fs::read_to_string(&path) else {
         return Vec::new();
     };
-    let Ok(doc) = serde_json::from_str::<serde_json::Value>(&crate::tasks::strip_jsonc(&raw))
+    let Ok(doc) = serde_json::from_str::<serde_json::Value>(&crate::jsonc::strip_jsonc(&raw))
     else {
         return Vec::new();
     };

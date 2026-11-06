@@ -831,7 +831,7 @@ fn with_relay_home<T>(home: &std::path::Path, body: impl FnOnce() -> T) -> T {
     }
     impl Drop for RestoreRelayGlobals {
         fn drop(&mut self) {
-            *crate::app::CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap() = None;
+            *crate::paths::CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap() = None;
             // SAFETY: relay tests hold relay_test_lock, serializing this
             // mutation.
             unsafe {
@@ -845,7 +845,7 @@ fn with_relay_home<T>(home: &std::path::Path, body: impl FnOnce() -> T) -> T {
     let _restore = RestoreRelayGlobals {
         prev_key: std::env::var_os("CROFT_RELAY_KEY"),
     };
-    *crate::app::CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap() =
+    *crate::paths::CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap() =
         Some(home.join(".cache").join("croft"));
     // SAFETY: relay tests hold relay_test_lock, serializing this mutation.
     unsafe {

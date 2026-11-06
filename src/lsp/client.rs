@@ -1214,6 +1214,30 @@ impl LspRequests {
             .context("linked_editing_range")
     }
 
+    /// `textDocument/inlineCompletion` (LSP 3.18, #607): ghost text for the
+    /// caret. croft asks after a pause in typing, so the trigger is
+    /// automatic, and never while the completion list is open.
+    pub async fn inline_completion(
+        &mut self,
+        uri: Url,
+        line: u32,
+        character: u32,
+    ) -> Result<Option<lsp_types::InlineCompletionResponse>> {
+        self.server
+            .request::<lsp_types::request::InlineCompletionRequest>(
+                lsp_types::InlineCompletionParams {
+                    work_done_progress_params: WorkDoneProgressParams::default(),
+                    text_document_position: position_params(uri, line, character),
+                    context: lsp_types::InlineCompletionContext {
+                        trigger_kind: lsp_types::InlineCompletionTriggerKind::Automatic,
+                        selected_completion_info: None,
+                    },
+                },
+            )
+            .await
+            .context("inline_completion")
+    }
+
     /// `textDocument/selectionRange`: per-position parent-linked chains of
     /// semantically meaningful ranges — the whole Expand Selection ancestry
     /// in one round trip, one chain per cursor (#254).

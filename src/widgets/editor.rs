@@ -12,9 +12,11 @@ use std::time::SystemTime;
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::highlight::{
-    HiSpan, LangKind, LangRegistry, compute_line_starts, decode_semantic_tokens,
+    HiSpan, LangKind, LangRegistry, compute_line_starts, decode_semantic_tokens, language_label,
 };
 use crate::packed_lines::PackedLines;
+pub use crate::sheet::SheetCellEdit;
+pub use crate::text_edit::TextSpanEdit;
 use crate::widgets::scrollbar;
 
 /// Hard cap on the size of a single text file the editor will load.
@@ -2292,27 +2294,6 @@ type ColumnBoxCarets = (
     Vec<EditorSelection>,
 );
 
-/// An xlsx grid's edited cell as hot exit keeps it (#1593):
-/// `(sheet name, row, col, value)`. The worksheet goes by its name, which
-/// a workbook keeps unique, so a reorder since the backup does not put the
-/// value on another worksheet.
-pub type SheetCellEdit = (String, usize, usize, String);
-
-/// A single text replacement in char-indexed `(row, col)` coordinates, as
-/// produced by an LSP rename `WorkspaceEdit`. Applied by
-/// [`apply_span_edits_to_lines`] and [`Editor::apply_span_edits`].
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct TextSpanEdit {
-    pub start: (usize, usize),
-    pub end: (usize, usize),
-    pub new_text: String,
-    /// The columns are UTF-16 code units, as a language server sends them,
-    /// not chars. Converted against the lines at apply time: read as char
-    /// columns, every edit after an emoji on its line landed off by one per
-    /// astral character, and a rename wrote `xrenamed+ 1` over `x + 1`.
-    pub utf16: bool,
-}
-
 /// Apply `edits` to `lines` (char-indexed coords), bottom-to-top so an
 /// earlier replacement never shifts the coordinates of a later one. Returns
 /// the number of edits applied. Out-of-range edits are skipped.
@@ -3340,10 +3321,10 @@ pub struct Editor {
     /// Clickable lens spans painted this frame: `(screen y, x range, index
     /// into code_lenses)`. Cleared at render start, like the merge spans.
     pub code_lens_spans: Vec<(u16, std::ops::Range<u16>, usize)>,
-    /// An inline AI suggestion (#607): `(row, col, edit_seq, text)`, painted
-    /// as ghost text at the caret while the caret, the buffer and the row
-    /// are all still where the suggestion was asked for.
-    pub ghost: Option<(usize, usize, u64, String)>,
+    /// An inline suggestion (#607), painted as ghost text at the caret while
+    /// the caret, the buffer and the row are all still where it was asked
+    /// for. One that replaces part of the line strikes that part through.
+    pub ghost: Option<crate::inline_complete::Ghost>,
     /// Per-source-line git blame for the current file, index 0 = line 1. Set
     /// by the app off-thread once per (file, HEAD); `None` until fetched or
     /// when blame is disabled. Drives the GitLens-style current-line inline
@@ -4367,22 +4348,22 @@ impl Editor {
             .map(|idx| self.last_inner.y.saturating_add(idx as u16))
     }
 
-    /// Toggle a bookmark on the cursor's line in the open file. Returns
+    /// Toggle a bookmark on `line` (1-based, like breakpoints) in the open
+    /// file. Returns
     /// `Some(true)` when a bookmark was added, `Some(false)` when one was
     /// removed, and `None` when no file is open (a scratch buffer has no
     /// path to key the set by).
-    pub fn toggle_bookmark(&mut self) -> Option<bool> {
+    pub fn toggle_bookmark_at(&mut self, line: usize) -> Option<bool> {
         let path = self.path.clone()?;
         // Settle the existing marks against the buffer before adding one, so
         // the shadow seeded below describes every mark in the set.
         self.sync_bookmarks_to_buffer();
-        let here = self.cursor_row + 1; // bookmarks are 1-based, like breakpoints
         let set = self.bookmarks.entry(path.clone()).or_default();
-        let added = if set.contains(&here) {
-            set.remove(&here);
+        let added = if set.contains(&line) {
+            set.remove(&line);
             false
         } else {
-            set.insert(here);
+            set.insert(line);
             true
         };
         // Drop the empty set so `bookmarked_lines` and the gutter never walk
@@ -4392,6 +4373,12 @@ impl Editor {
         }
         self.seed_bookmark_shadow();
         Some(added)
+    }
+
+    /// Toggle a bookmark on the cursor's line in the open file; see
+    /// [`Self::toggle_bookmark_at`].
+    pub fn toggle_bookmark(&mut self) -> Option<bool> {
+        self.toggle_bookmark_at(self.cursor_row + 1)
     }
 
     /// 1-based bookmark lines for the open file, ascending. Empty when no
@@ -4412,6 +4399,19 @@ impl Editor {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// Take over a saved set of bookmarks (a restored session) for the open
+    /// file, trimmed to the lines it still has.
+    pub fn restore_bookmarks(
+        &mut self,
+        marks: &std::collections::HashMap<PathBuf, std::collections::BTreeSet<usize>>,
+    ) {
+        if marks.is_empty() {
+            return;
+        }
+        self.bookmarks = marks.clone();
+        self.sync_bookmarks_to_buffer();
     }
 
     /// Whether 0-based `line` carries a bookmark in the open file.
@@ -4617,12 +4617,14 @@ impl Editor {
 
     /// Put the cursor on 1-based `line`, clamped to the buffer, unfolding
     /// anything hiding it and centring it in the viewport — a bookmark
-    /// inside a collapsed region must still be reachable.
-    fn jump_to_bookmark(&mut self, line: usize) {
+    /// inside a collapsed region must still be reachable. The selection and
+    /// any secondary carets go, so the next keystroke edits only that line.
+    pub fn jump_to_bookmark(&mut self, line: usize) {
         if self.lines.is_empty() {
             return;
         }
         self.selection = None;
+        self.collapse_carets();
         self.goto_line_centered(line.saturating_sub(1));
         self.reveal_cursor_fold();
         self.ensure_cursor_col_visible();
@@ -11125,9 +11127,15 @@ impl Editor {
     /// The inline suggestion (#607) when it still applies: the caret where it
     /// was asked for and no edit since.
     pub fn live_ghost(&self) -> Option<&str> {
-        let (row, col, seq, text) = self.ghost.as_ref()?;
-        (*row == self.cursor_row && *col == self.cursor_col && *seq == self.edit_seq)
-            .then_some(text.as_str())
+        self.live_ghost_full().map(|g| g.text.as_str())
+    }
+
+    /// [`Self::live_ghost`] with the columns of the caret's line it replaces,
+    /// when it is a language server's replacement.
+    pub fn live_ghost_full(&self) -> Option<&crate::inline_complete::Ghost> {
+        let g = self.ghost.as_ref()?;
+        (g.row == self.cursor_row && g.col == self.cursor_col && g.seq == self.edit_seq)
+            .then_some(g)
     }
 
     /// Indices of the code lenses on 0-based `line` whose line still reads
@@ -17900,41 +17908,6 @@ fn emmet_profile_for(
     }
 }
 
-/// Display name for a language mode, matching VS Code's status-bar labels.
-/// `None` is a buffer with no recognised grammar.
-pub fn language_label(lang: Option<LangKind>) -> &'static str {
-    match lang {
-        None => "Plain Text",
-        Some(LangKind::Rust) => "Rust",
-        Some(LangKind::Python) => "Python",
-        Some(LangKind::JavaScript) => "JavaScript",
-        Some(LangKind::TypeScript) => "TypeScript",
-        Some(LangKind::Tsx) => "TypeScript JSX",
-        Some(LangKind::Json) => "JSON",
-        Some(LangKind::Xml) => "XML",
-        Some(LangKind::Toml) => "TOML",
-        Some(LangKind::Yaml) => "YAML",
-        Some(LangKind::Markdown) => "Markdown",
-        Some(LangKind::Go) => "Go",
-        Some(LangKind::Html) => "HTML",
-        Some(LangKind::Css) => "CSS",
-        Some(LangKind::Bash) => "Shell Script",
-        Some(LangKind::C) => "C",
-        Some(LangKind::Cpp) => "C++",
-        Some(LangKind::Lua) => "Lua",
-        Some(LangKind::Ql) => "CodeQL",
-        Some(LangKind::Dbscheme) => "CodeQL Database Scheme",
-        Some(LangKind::Java) => "Java",
-        Some(LangKind::Ruby) => "Ruby",
-        Some(LangKind::CSharp) => "C#",
-        Some(LangKind::Sql) => "SQL",
-        Some(LangKind::Make) => "Makefile",
-        Some(LangKind::Dockerfile) => "Dockerfile",
-        Some(LangKind::Vue) => "Vue",
-        Some(LangKind::Svelte) => "Svelte",
-    }
-}
-
 /// The VS Code language id for `lang`, used to scope user snippets (their
 /// `scope` field names these). Lowercase, matching VS Code's identifiers so a
 /// config copied from there just works.
@@ -20249,6 +20222,23 @@ impl Widget for &mut Editor {
                 }
             }
 
+            // A language server's replacement strikes through the columns it
+            // takes the place of, and its text stands one cell clear of them.
+            let replaces = self
+                .live_ghost_full()
+                .and_then(|g| g.replaces.clone())
+                .filter(|_| self.focused && line_idx == self.cursor_row);
+            if let Some(r) = &replaces {
+                let (vs, ve) = (row_cells.cell(r.start), row_cells.end(r.end));
+                if ve > vs {
+                    let struck = crate::lsp::manager::DiagnosticTags {
+                        unnecessary: true,
+                        deprecated: true,
+                    };
+                    paint_diagnostic_tags(buf, text_x, y, row_width, vs, ve, struck);
+                }
+            }
+
             // Inline suggestion (#607): the first line as ghost text right at
             // the caret (suggestions are only asked for at a line's end); the
             // rest hang below as `VisRow::Ghost` rows (#1625), and only lines
@@ -20259,7 +20249,7 @@ impl Widget for &mut Editor {
                 && row_end >= line_len
                 && self.live_ghost().is_some();
             if ghost_here && let Some(text) = self.live_ghost() {
-                let text_cols = row_cells.cell(line_len);
+                let text_cols = row_cells.cell(line_len) + usize::from(replaces.is_some());
                 let x = text_x + text_cols as u16;
                 let right = inner.x + inner.width;
                 if x < right {
@@ -25258,7 +25248,12 @@ mod tests {
         e.cursor_row = 0;
         e.cursor_col = 5;
         let wide: String = "\u{4e2d}".repeat(60);
-        e.ghost = Some((0, 5, e.edit_seq, format!("\n{wide}")));
+        e.ghost = Some(crate::inline_complete::Ghost::insert(
+            0,
+            5,
+            e.edit_seq,
+            format!("\n{wide}"),
+        ));
         let area = Rect {
             x: 0,
             y: 0,

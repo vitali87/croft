@@ -49,7 +49,7 @@ struct Lineage {
 pub fn init() {
     let path = match std::env::var_os("CROFT_STARTUP_TRACE").filter(|p| !p.is_empty()) {
         Some(path) => path.into(),
-        None => crate::app::croft_cache_dir().join("startup-trace.txt"),
+        None => crate::paths::croft_cache_dir().join("startup-trace.txt"),
     };
     let start = Instant::now();
     if let Ok(mut slot) = TRACE.lock() {

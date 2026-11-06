@@ -82,7 +82,7 @@ pub struct FixedStore {
 
 impl FixedStore {
     pub fn path() -> PathBuf {
-        crate::app::croft_cache_dir().join("sarif-fixed.json")
+        crate::paths::croft_cache_dir().join("sarif-fixed.json")
     }
 
     pub fn load() -> FixedStore {
@@ -333,7 +333,7 @@ pub fn columns_text(cols: &[ExtraColumn]) -> String {
 
 /// Where the column choice is kept, so every viewer opens with it.
 fn columns_path() -> PathBuf {
-    crate::app::croft_cache_dir().join("sarif-columns")
+    crate::paths::croft_cache_dir().join("sarif-columns")
 }
 
 /// The saved column choice; none when unset or unreadable.
@@ -828,9 +828,14 @@ impl SarifView {
                 for i in 0..super::fixes::fix_count(result) {
                     let what = super::fixes::fix_description(result, i).unwrap_or_default();
                     out.push(format!("Fix {}: {what}", i + 1));
-                    match super::fixes::fix_for(run, result, i, &resolver, &mut |p| {
-                        std::fs::read_to_string(p).ok()
-                    }) {
+                    match super::fixes::fix_for(
+                        run,
+                        result,
+                        i,
+                        &resolver,
+                        &mut |p| std::fs::read_to_string(p).ok(),
+                        &|p| super::fixes::saved_after(p, &loaded.path, run),
+                    ) {
                         Ok(edits) => out.extend(super::fixes::preview(&edits)),
                         Err(why) => out.push(format!("cannot apply: {why}")),
                     }

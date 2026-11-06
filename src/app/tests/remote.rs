@@ -956,11 +956,11 @@ fn a_failed_provisioning_is_remembered_and_a_later_success_forgets_it() {
     struct Restore;
     impl Drop for Restore {
         fn drop(&mut self) {
-            *crate::app::CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap() = None;
+            *crate::paths::CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap() = None;
         }
     }
     let _restore = Restore;
-    *crate::app::CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap() = Some(tmp.path().join("cache"));
+    *crate::paths::CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap() = Some(tmp.path().join("cache"));
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     assert!(
         app.remote_offer_refused.is_empty(),
@@ -1002,12 +1002,12 @@ fn a_success_forgets_a_refusal_another_croft_recorded() {
     struct Restore;
     impl Drop for Restore {
         fn drop(&mut self) {
-            *crate::app::CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap() = None;
+            *crate::paths::CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap() = None;
         }
     }
     let _restore = Restore;
     let cache = tmp.path().join("cache");
-    *crate::app::CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap() = Some(cache.clone());
+    *crate::paths::CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap() = Some(cache.clone());
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.remote_offer_refused.clear();
     let refused_path = crate::remote::refused_hosts_path(&cache);
