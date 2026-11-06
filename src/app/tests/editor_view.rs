@@ -2292,3 +2292,18 @@ fn line_numbers_reach_every_split_group() {
     app.apply_merged_settings(&prefs);
     assert_eq!(modes(&app), [LineNumbers::Off, LineNumbers::Off]);
 }
+
+#[test]
+fn centring_a_line_before_the_first_render_leaves_context_above() {
+    // A file opened for the first time has no viewport yet (zero text rows),
+    // so there is no middle to centre on: the target must still be brought
+    // near the top instead of staying at scroll 0 (a Global Search hit).
+    let mut e = crate::widgets::editor::Editor::new();
+    e.lines = (0..200).map(|i| format!("line {i}")).collect();
+    assert_eq!(e.text_rows(), 0, "precondition: not rendered yet");
+    e.goto_line_centered(100);
+    assert_eq!(e.cursor_row, 100);
+    assert_eq!(e.scroll, 95, "five lines of context above the target");
+    e.goto_line_centered(2);
+    assert_eq!(e.scroll, 0, "near the top it saturates at 0");
+}
