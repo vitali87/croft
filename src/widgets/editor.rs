@@ -3626,6 +3626,9 @@ pub struct Editor {
     /// lines at each indent level in a line's leading whitespace, with the
     /// cursor's block highlighted. App-synced from prefs; on by default.
     pub show_indent_guides: bool,
+    /// Home walks back one wrapped row per press on a continuation row's
+    /// start (`home_walks_wrapped_rows`, #1569). Off is VS Code's behaviour.
+    pub home_walks_rows: bool,
     /// Ruler columns (#1524, VS Code `editor.rulers`). App-synced from
     /// prefs; empty by default.
     pub rulers: Vec<u16>,
@@ -4069,6 +4072,7 @@ impl Editor {
             final_newline: false,
             decode_lossy: false,
             show_indent_guides: true,
+            home_walks_rows: false,
             rulers: Vec::new(),
             show_bracket_colors: true,
             bracket_colors: Vec::new(),
@@ -15504,7 +15508,10 @@ impl Editor {
     /// non-whitespace character, or to its start when the caret is already
     /// there, so a second press toggles (#987). It used to always go to the
     /// start, before the indentation. With wrap on (#1569) it first goes to
-    /// the start of the wrapped row the caret is on.
+    /// the start of the wrapped row the caret is on. With
+    /// `home_walks_rows`, a caret already on a continuation row's start goes
+    /// to the start of the row above, one row per press, down to the line's
+    /// own stops.
     pub fn home_key(&mut self) {
         let line = &self.lines[self.cursor_row];
         let first = line
@@ -15517,11 +15524,25 @@ impl Editor {
             // space it sits on), so step back to its cluster's start.
             Some((start, _)) => match floor_grapheme_col(line, start) {
                 row_start if self.cursor_col > row_start && row_start > first => row_start,
+                _ if self.home_walks_rows && start > 0 && self.cursor_col == start => {
+                    self.wrapped_row_above(start).unwrap_or(smart)
+                }
                 _ => smart,
             },
             None => smart,
         };
         self.last_edit_kind = None;
+    }
+
+    /// Start of the wrapped row above the one that starts at `row_start`
+    /// (a char column of the caret's line), on a grapheme boundary. `None`
+    /// on the line's top row.
+    fn wrapped_row_above(&self, row_start: usize) -> Option<usize> {
+        let width = self.visible_text_width().max(1);
+        let segs = self.line_segments(self.cursor_row, width);
+        let idx = segs.iter().position(|&(s, _)| s == row_start)?;
+        let above = segs.get(idx.checked_sub(1)?)?.0;
+        Some(floor_grapheme_col(&self.lines[self.cursor_row], above))
     }
 
     /// The End key. With wrap on (#1569) it first goes to the end of the
@@ -32130,6 +32151,65 @@ mod tests {
             e.cursor_col, 0,
             "a second Home goes to the start of the line"
         );
+    }
+
+    /// #1569: with `home_walks_rows`, Home on a continuation row's start goes
+    /// to the start of the row above, one row per press, and off it keeps
+    /// VS Code's jump to the line's own stops.
+    #[test]
+    fn home_walks_back_one_wrapped_row_per_press_when_asked() {
+        let (mut e, segs) = wrapped_paragraph(true);
+        e.home_walks_rows = true;
+        e.cursor_col = segs[2].0 + 5;
+        e.home_key();
+        assert_eq!(e.cursor_col, segs[2].0, "the start of row 3: {segs:?}");
+        e.home_key();
+        assert_eq!(e.cursor_col, segs[1].0, "the start of row 2: {segs:?}");
+        e.home_key();
+        assert_eq!(e.cursor_col, segs[0].0, "the start of row 1: {segs:?}");
+        e.home_key();
+        assert_eq!(e.cursor_col, 0, "the line starts at column 0, so it stays");
+        // Off: from a row's start straight to the line's start.
+        let (mut e, segs) = wrapped_paragraph(true);
+        e.cursor_col = segs[2].0;
+        e.home_key();
+        assert_eq!(e.cursor_col, 0, "not the row above: {segs:?}");
+    }
+
+    /// #1569: on an indented line the walk ends at the line's own stops: the
+    /// first non-blank, then column 0, then back.
+    #[test]
+    fn home_walk_ends_at_the_indentation_stops() {
+        let text = format!("    {}", "word ".repeat(40));
+        let mut e = editor_with(&text);
+        e.wrap_override = Some(true);
+        e.home_walks_rows = true;
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 20,
+        };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        (&mut e as &mut Editor).render(area, &mut buf);
+        let segs = e.line_segments(0, e.visible_text_width().max(1));
+        assert!(segs.len() > 2, "the line wraps: {segs:?}");
+        let (row_start, row_end) = segs[1];
+        let chars: Vec<char> = e.lines[0].chars().collect();
+        let word = (row_start + 1..row_end)
+            .rfind(|&i| !chars[i].is_whitespace() && chars[i - 1].is_whitespace())
+            .expect("a word starts inside row 2");
+        e.cursor_col = word + 2;
+        e.home_key();
+        assert_eq!(e.cursor_col, row_start, "the start of row 2: {segs:?}");
+        e.home_key();
+        assert_eq!(e.cursor_col, segs[0].0, "the start of row 1: {segs:?}");
+        e.home_key();
+        assert_eq!(e.cursor_col, 4, "the line's first non-blank");
+        e.home_key();
+        assert_eq!(e.cursor_col, 0, "column 0");
+        e.home_key();
+        assert_eq!(e.cursor_col, 4);
     }
 
     /// #1569: a wrapped row can begin on a combining mark (the row before

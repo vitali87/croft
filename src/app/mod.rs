@@ -3799,6 +3799,8 @@ pub struct App {
     /// Indentation guides (#129), VS Code `editor.guides.indentation`: on by
     /// default, pushed to every editor by the per-frame focus sync.
     indent_guides_enabled: bool,
+    /// Home walks back one wrapped row per press (`home_walks_wrapped_rows`).
+    home_walks_rows: bool,
     /// Bracket-pair colorization (#131): on by default, pushed to every
     /// editor by the per-frame focus sync like the indent guides.
     bracket_colors_enabled: bool,
@@ -6894,6 +6896,7 @@ impl App {
             inline_blame_enabled: !loaded_prefs.disable_inline_blame,
             provenance_overlay: false,
             indent_guides_enabled: !loaded_prefs.disable_indent_guides,
+            home_walks_rows: loaded_prefs.home_walks_wrapped_rows,
             bracket_colors_enabled: !loaded_prefs.disable_bracket_colors,
             whitespace_mode: crate::widgets::editor::WhitespaceMode::from_pref(
                 &loaded_prefs.render_whitespace,
@@ -21539,6 +21542,7 @@ impl App {
             ed.pdf_viewer_enabled = pdf_on;
             ed.csv_viewer_enabled = csv_on;
             ed.show_indent_guides = self.indent_guides_enabled;
+            ed.home_walks_rows = self.home_walks_rows;
             ed.show_bracket_colors = self.bracket_colors_enabled;
             ed.provenance_overlay = self.provenance_overlay;
             ed.whitespace_mode = whitespace_mode_in(langs, ws_global, editor_scope_id(ed));
@@ -21553,6 +21557,7 @@ impl App {
                 ed.pdf_viewer_enabled = pdf_on;
                 ed.csv_viewer_enabled = csv_on;
                 ed.show_indent_guides = self.indent_guides_enabled;
+                ed.home_walks_rows = self.home_walks_rows;
                 ed.show_bracket_colors = self.bracket_colors_enabled;
                 ed.provenance_overlay = self.provenance_overlay;
                 ed.whitespace_mode = whitespace_mode_in(langs, ws_global, editor_scope_id(ed));
@@ -68396,6 +68401,8 @@ impl App {
         self.editor.blame_enabled = self.inline_blame_enabled;
         self.indent_guides_enabled = !p.disable_indent_guides;
         self.editor.show_indent_guides = self.indent_guides_enabled;
+        self.home_walks_rows = p.home_walks_wrapped_rows;
+        self.editor.home_walks_rows = self.home_walks_rows;
         self.bracket_colors_enabled = !p.disable_bracket_colors;
         self.editor.show_bracket_colors = self.bracket_colors_enabled;
         self.whitespace_mode =
