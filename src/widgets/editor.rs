@@ -4414,6 +4414,46 @@ impl Editor {
         self.sync_bookmarks_to_buffer();
     }
 
+    /// Take `path`'s marks as another tab holds them (`None`: it has none),
+    /// so every tab keeps one set per file. Trimmed to the buffer when
+    /// `path` is the open file, whose later edits then carry them.
+    pub fn adopt_bookmarks(
+        &mut self,
+        path: &Path,
+        marks: Option<&std::collections::BTreeSet<usize>>,
+    ) {
+        match marks {
+            Some(set) if !set.is_empty() => {
+                self.bookmarks.insert(path.to_path_buf(), set.clone());
+            }
+            _ => {
+                self.bookmarks.remove(path);
+            }
+        }
+        if self.path.as_deref() == Some(path) {
+            self.sync_bookmarks_to_buffer();
+        }
+    }
+
+    /// This tab's bookmarks on the files as saved: the open file's marks
+    /// follow its unsaved edits, so with the tab closing on those edits
+    /// each goes back to its line on disk, decoded as the tab decoded it.
+    pub fn bookmarks_on_disk(
+        &self,
+    ) -> std::collections::HashMap<PathBuf, std::collections::BTreeSet<usize>> {
+        let mut marks = self.bookmarks.clone();
+        if self.dirty
+            && let Some(path) = self.path.as_deref()
+            && let Some(set) = marks.get_mut(path)
+            && let Ok(bytes) = std::fs::read(path)
+        {
+            let (text, _, _) = self.encoding.decode(&bytes);
+            *set = carry_marks(set, &self.lines, &split_into_lines(&text));
+        }
+        marks.retain(|_, set| !set.is_empty());
+        marks
+    }
+
     /// Whether 0-based `line` carries a bookmark in the open file.
     pub fn is_bookmarked(&self, line: usize) -> bool {
         self.path
@@ -18611,6 +18651,24 @@ fn line_mapper<'a>(
     }
 }
 
+/// `marks` (1-based lines of `old`) carried to the lines they sit on in
+/// `new`, another copy of the same file: a second tab of it whose unsaved
+/// edits differ, or the file on disk under a buffer whose edits are being
+/// discarded. Each mark moves as an edit from `old` to `new` would move it
+/// (see [`line_mapper`]): one on a line deleted outright is dropped, and one
+/// on a line edited in place stays on that line, as it does while typing.
+pub fn carry_marks(
+    marks: &std::collections::BTreeSet<usize>,
+    old: &[String],
+    new: &[String],
+) -> std::collections::BTreeSet<usize> {
+    if old == new {
+        return marks.clone();
+    }
+    let map = line_mapper(old, new);
+    marks.iter().filter_map(|&line| map(line)).collect()
+}
+
 /// The line mapping behind [`shift_bookmark_lines`].
 fn shift_line_mapper<'a>(
     old: &'a [String],
@@ -21960,6 +22018,10 @@ pub struct EditorTabs {
     pub hover_pointer: Option<(u16, u16)>,
     /// Handed to the active editor each frame: see [`Editor::cell_images`].
     pub cell_images: bool,
+    /// The bookmarks of the tabs closed since the App last took them
+    /// ([`Self::take_released_bookmarks`]), on the files' saved lines, so a
+    /// file's marks outlive the last tab that held them.
+    released_bookmarks: Vec<std::collections::HashMap<PathBuf, std::collections::BTreeSet<usize>>>,
 }
 
 impl EditorTabs {
@@ -21979,6 +22041,7 @@ impl EditorTabs {
             search_highlight_term: None,
             search_highlight_opts: crate::widgets::search::SearchOpts::default(),
             hover_pointer: None,
+            released_bookmarks: Vec::new(),
         }
     }
 
@@ -22245,11 +22308,13 @@ impl EditorTabs {
             let was_focused = self.editors[0].focused;
             let mut fresh = Editor::new();
             fresh.focused = was_focused;
-            self.editors[0] = fresh;
+            let closed = std::mem::replace(&mut self.editors[0], fresh);
+            self.release_bookmarks(&closed);
             self.active = 0;
             return true;
         }
-        self.editors.remove(idx);
+        let closed = self.editors.remove(idx);
+        self.release_bookmarks(&closed);
         if self.active > idx {
             self.active -= 1;
         } else if self.active >= self.editors.len() {
@@ -22259,6 +22324,21 @@ impl EditorTabs {
             ed.focused = i == self.active;
         }
         true
+    }
+
+    /// Keep a closing tab's bookmarks for the App, which holds a file's
+    /// marks once no tab does.
+    fn release_bookmarks(&mut self, closed: &Editor) {
+        if !closed.bookmarks.is_empty() {
+            self.released_bookmarks.push(closed.bookmarks_on_disk());
+        }
+    }
+
+    /// The bookmarks of the tabs closed since the last call, oldest first.
+    pub fn take_released_bookmarks(
+        &mut self,
+    ) -> Vec<std::collections::HashMap<PathBuf, std::collections::BTreeSet<usize>>> {
+        std::mem::take(&mut self.released_bookmarks)
     }
 
     /// Close every tab whose index ≠ `keep_idx`, except pinned tabs, which
@@ -22280,6 +22360,8 @@ impl EditorTabs {
                 kept.push(ed);
             } else if ed.pinned || ed.dirty {
                 kept.push(ed);
+            } else {
+                self.release_bookmarks(&ed);
             }
         }
         let removed = before - kept.len();
@@ -22314,6 +22396,8 @@ impl EditorTabs {
                     new_active = Some(kept.len());
                 }
                 kept.push(ed);
+            } else {
+                self.release_bookmarks(&ed);
             }
         }
         let removed = before - kept.len();
@@ -22357,6 +22441,8 @@ impl EditorTabs {
                     new_active = kept.len();
                 }
                 kept.push(ed);
+            } else {
+                self.release_bookmarks(&ed);
             }
         }
         let removed = before - kept.len();
@@ -22685,7 +22771,8 @@ impl EditorTabs {
             if let Some(prev) = self.preview_index()
                 && prev != idx
             {
-                self.editors.remove(prev);
+                let dropped = self.editors.remove(prev);
+                self.release_bookmarks(&dropped);
                 let new_idx = if idx > prev { idx - 1 } else { idx };
                 // Bypass `select` here because the removal may have left
                 // `self.active` pointing past the end (when the active
