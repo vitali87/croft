@@ -61272,8 +61272,11 @@ impl App {
     fn editor_find_set_query(&mut self, new_query: String) {
         // A whole-query replacement puts the caret after it; the caret
         // editors below then move it where the edit left it.
+        // Assigned, not `set_caret`: that clamps to the query still in place,
+        // so a longer replacement would leave the caret inside it. Reads
+        // clamp through `caret()` once the new query is in.
         if let Some(s) = self.editor_find.as_mut() {
-            s.set_caret(new_query.chars().count());
+            s.caret = new_query.chars().count();
         }
         let unchanged = self
             .editor_find
@@ -62352,16 +62355,29 @@ impl App {
         if matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
             && !self.modal_overlay_open()
             && self.context_menu.is_none()
-            && (self
+        {
+            if self
                 .editor_find
                 .as_mut()
                 .is_some_and(|f| f.click_at(m.column, m.row))
-                || self
-                    .terminal_find
-                    .as_mut()
-                    .is_some_and(|f| f.click_at(m.column, m.row)))
-        {
-            return;
+            {
+                // The bar takes the keys only while the editor has focus, so
+                // a click on it from the terminal or the side bar moves focus
+                // there too, or the typing after it would land elsewhere.
+                if self.focus != Pane::Editor {
+                    self.focus_pane(Pane::Editor);
+                }
+                return;
+            }
+            // The terminal find bar closes whenever the terminal loses
+            // focus, so a click on it always comes with focus already there.
+            if self
+                .terminal_find
+                .as_mut()
+                .is_some_and(|f| f.click_at(m.column, m.row))
+            {
+                return;
+            }
         }
         // The wheel over an editor group's tab strip scrolls its tabs.
         if let Some(delta) = match m.kind {

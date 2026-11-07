@@ -2905,3 +2905,50 @@ fn a_click_on_the_find_bar_puts_the_caret_under_it() {
     ));
     assert_eq!(app.editor_find.as_ref().unwrap().caret(), 2);
 }
+
+/// #1729: the find bar takes the keys only while the editor has focus, so a
+/// click on it from another pane moves focus to the editor as well, or what
+/// is typed next would go to the pane that kept it.
+#[test]
+fn a_click_on_the_find_bar_from_another_pane_focuses_the_editor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let mut find = crate::widgets::editor_find::EditorFind::new(
+        String::from("needle"),
+        crate::widgets::search::SearchOpts::default(),
+    );
+    find.last_rect = ratatui::layout::Rect {
+        x: 10,
+        y: 2,
+        width: 48,
+        height: 3,
+    };
+    app.editor_find = Some(find);
+    app.focus = Pane::Tree;
+    app.handle_mouse(mouse(
+        crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        15,
+        3,
+    ));
+    assert!(
+        app.focus == Pane::Editor,
+        "the click moved focus to the editor"
+    );
+    assert_eq!(app.editor_find.as_ref().unwrap().caret(), 2);
+}
+
+/// #1729: a whole-query replacement longer than the query it replaces puts
+/// the caret at its end, not where the old query ended.
+#[test]
+fn a_longer_whole_query_puts_the_find_caret_at_its_end() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor_find = Some(crate::widgets::editor_find::EditorFind::new(
+        String::from("ab"),
+        crate::widgets::search::SearchOpts::default(),
+    ));
+    app.editor_find_set_query(String::from("abcdef"));
+    let st = app.editor_find.as_ref().unwrap();
+    assert_eq!(st.query, "abcdef");
+    assert_eq!(st.caret(), 6);
+}
