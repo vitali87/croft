@@ -204,8 +204,9 @@ impl DiffSyntax {
         match rx.recv_timeout(wait) {
             Ok((left, right)) => self.land(left, right),
             Err(RecvTimeoutError::Timeout) => {}
-            // The worker died without a result: paint the plain colours.
-            Err(RecvTimeoutError::Disconnected) => self.job = Job::Done,
+            // The worker died without a result: paint the plain colours,
+            // not spans left from an older theme or text.
+            Err(RecvTimeoutError::Disconnected) => self.land(Vec::new(), Vec::new()),
         }
     }
 
@@ -227,9 +228,10 @@ impl DiffSyntax {
                 true
             }
             Err(TryRecvError::Empty) => false,
+            // The worker died without a result: plain colours, as above.
             Err(TryRecvError::Disconnected) => {
-                self.job = Job::Done;
-                false
+                self.land(Vec::new(), Vec::new());
+                true
             }
         }
     }
@@ -339,8 +341,13 @@ fn side_texts(lines: &[String], runs: &[CodeRun]) -> Vec<(CodeRun, String)> {
         .collect()
 }
 
-/// The spans for a side of `len` lines whose code is `texts`.
+/// The spans for a side of `len` lines whose code is `texts`. A side with no
+/// code holds no per-line list at all: [`DiffSyntax::left`] and
+/// [`DiffSyntax::right`] read a missing line as one with no spans.
 fn colour(len: usize, texts: Vec<(CodeRun, String)>) -> Spans {
+    if texts.is_empty() {
+        return Vec::new();
+    }
     let mut out: Spans = vec![Vec::new(); len];
     let mut registry = LangRegistry::new();
     for (run, text) in texts {
@@ -448,6 +455,7 @@ mod tests {
         let mut syntax = DiffSyntax::default();
         syntax.ensure(&big, &small, || RUST, None);
         assert!(syntax.left(0).is_empty(), "the oversized side is skipped");
+        assert!(syntax.left.is_empty(), "and holds no per-line lists");
         assert!(!syntax.right(0).is_empty(), "the other side still colours");
     }
 
@@ -478,6 +486,22 @@ mod tests {
         syntax.ensure(&text, &text, || RUST, None);
         assert!(!syntax.waiting());
         assert!(!syntax.left(0).is_empty(), "asked again, it runs");
+    }
+
+    #[test]
+    fn a_pass_that_dies_leaves_plain_colours_not_stale_ones() {
+        let text = lines(&["fn a() {}"]);
+        let mut syntax = DiffSyntax::default();
+        syntax.ensure(&text, &text, || RUST, None);
+        assert!(!syntax.left(0).is_empty());
+        // A theme switch, then a worker that ends without a result.
+        syntax.restart();
+        let (tx, rx) = std::sync::mpsc::channel();
+        drop(tx);
+        syntax.job = Job::Running(rx);
+        assert!(syntax.poll(), "the view repaints");
+        assert!(syntax.left(0).is_empty(), "in plain colours");
+        assert!(!syntax.waiting() && matches!(syntax.job, Job::Done));
     }
 
     #[test]
