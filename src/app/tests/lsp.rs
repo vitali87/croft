@@ -5182,3 +5182,93 @@ fn format_on_save_still_formats_when_croft_runs_the_named_formatter() {
         );
     }
 }
+
+/// clangd caps its list (`isIncomplete`), so every letter typed re-asks, and
+/// the reply to a re-ask has ranges for the line as it was at THAT ask. The
+/// accept shifted them from the session's first anchor instead, counting the
+/// letters typed before the re-ask twice: `if (x != PR) {` with the caret
+/// after `PR` came out as `if (x != PRESS {`, the `)` swallowed, and one more
+/// character per further letter.
+#[test]
+fn accepting_a_reasked_completion_does_not_swallow_what_follows_the_word() {
+    use crate::lsp::manager::CompletionResult;
+    use crate::widgets::editor::TextSpanEdit;
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("main.c");
+    std::fs::write(&path, "f(PRE) {").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&path).unwrap();
+    app.focus_pane(Pane::Editor);
+    draw(&mut app, 100, 30);
+    // The session began at `f(P|`; the last re-ask went out at `f(PRE|`.
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 5;
+    app.completion_origin = Some((0, 3));
+    app.completion_ask_pos = Some((0, 5));
+    app.completion_request_id = Some(7);
+    let item = crate::lsp::CompletionItem {
+        label: String::from("PRESS"),
+        text_edit: Some(TextSpanEdit {
+            start: (0, 2),
+            end: (0, 5),
+            new_text: String::from("PRESS"),
+            utf16: true,
+        }),
+        ..Default::default()
+    };
+    assert!(app.apply_completion_result(CompletionResult {
+        request_id: 7,
+        is_incomplete: true,
+        path: path.clone(),
+        items: vec![item],
+    }));
+    app.handle_completion_popup_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(app.editor.lines[0], "f(PRESS) {", "the `)` stays");
+    assert_eq!(app.editor.cursor_col, 7);
+}
+
+/// The popup of an earlier reply stays open while a re-ask is in flight; its
+/// ranges end at ITS request point, and a Backspace since must not leave
+/// them reaching past the word.
+#[test]
+fn an_older_reply_shown_during_a_reask_still_shifts_from_its_own_request() {
+    use crate::lsp::manager::CompletionResult;
+    use crate::widgets::editor::TextSpanEdit;
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("main.c");
+    std::fs::write(&path, "f(PR) {").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&path).unwrap();
+    app.focus_pane(Pane::Editor);
+    draw(&mut app, 100, 30);
+    // The reply was for `f(PR|`; the session anchor sits at the first letter
+    // and a re-ask for the word as it is now is still in flight.
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 4;
+    app.completion_origin = Some((0, 3));
+    app.completion_ask_pos = Some((0, 4));
+    app.completion_request_id = Some(3);
+    app.completion_items_pos = Some((0, 4));
+    let item = crate::lsp::CompletionItem {
+        label: String::from("PRESS"),
+        text_edit: Some(TextSpanEdit {
+            start: (0, 2),
+            end: (0, 4),
+            new_text: String::from("PRESS"),
+            utf16: true,
+        }),
+        ..Default::default()
+    };
+    assert!(app.apply_completion_result(CompletionResult {
+        request_id: 3,
+        is_incomplete: true,
+        path: path.clone(),
+        items: vec![item],
+    }));
+    // The Backspace itself: the buffer is `f(P) {` with the caret at col 3,
+    // one left of the reply's request point.
+    app.editor.lines[0] = String::from("f(P) {");
+    app.editor.cursor_col = 3;
+    app.handle_completion_popup_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(app.editor.lines[0], "f(PRESS) {");
+}
