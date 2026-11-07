@@ -1,0 +1,2 @@
+fix: With more editor tabs open than fit, the tab strip scrolls (mouse wheel or touchpad over it, one tab at a time, and it follows the active tab) and the last visible tab no longer runs under the Toggle Side Bar, Toggle Panel and Customize Layout icons.
+feature: A crowded tab strip shows an "all open tabs" button at the end of the tabs: it lists every tab of the group and activates the one you pick.
