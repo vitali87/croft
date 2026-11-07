@@ -64731,6 +64731,7 @@ impl App {
                             self.editor_click
                                 .is_double(now, m.column, m.row, m.modifiers);
                         let last_inner = self.editor.last_inner;
+                        self.editor.sync_tab_cells();
                         if let Some(diff) = self.editor.diff.as_mut() {
                             if let Some((side, row_idx, char_col)) =
                                 crate::widgets::editor::diff_hit_test(
@@ -65150,6 +65151,7 @@ impl App {
                 if in_editor {
                     if self.editor.diff.is_some() {
                         let last_inner = self.editor.last_inner;
+                        self.editor.sync_tab_cells();
                         if let Some(diff) = self.editor.diff.as_mut()
                             && let Some((_, row_idx, char_col)) =
                                 crate::widgets::editor::diff_hit_test(
