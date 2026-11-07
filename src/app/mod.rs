@@ -1549,6 +1549,17 @@ enum MenuAction {
         line: u32,
         col: u32,
     },
+    /// Editor gutter: toggle a bookmark on 1-based `line`. The gutter menu has
+    /// no cursor to act on, so the line rides the action; the label reads
+    /// "Toggle Bookmark" either way, as the Bookmarks extension's does.
+    ToggleBookmarkAt {
+        line: usize,
+    },
+    /// Editor gutter: jump to the next bookmark in the open file, wrapping at
+    /// the end. Not line-scoped, so it rides the menu as a command.
+    NextBookmark,
+    /// Editor gutter: mirror of [`MenuAction::NextBookmark`] walking upwards.
+    PreviousBookmark,
     /// Editor gutter: toggle a breakpoint on 1-based `line`. Built from a
     /// glyph-margin right-click; the label reads "Add Breakpoint" or "Remove
     /// Breakpoint" depending on whether one already sits on that line, but both
@@ -1801,6 +1812,9 @@ fn shortcut_for(action: &MenuAction) -> Option<&'static str> {
         MenuAction::ToggleBreakpointAt { .. } => Some("F9"),
         MenuAction::EditBreakpointConditionAt { .. } => Some("⇧F9"),
         MenuAction::EditLogpointAt { .. } => Some("⇧⌥F9"),
+        MenuAction::ToggleBookmarkAt { .. } => Some("⌃⌥⇧K"),
+        MenuAction::NextBookmark => Some("⌃⌥."),
+        MenuAction::PreviousBookmark => Some("⌃⌥,"),
         MenuAction::AskNavigatorAt { .. } => Some("⌘K Q"),
         MenuAction::AskNavigatorSelection { .. } => Some("⌘K Q"),
         MenuAction::AskNavigatorAboutCapture => Some("n"),
@@ -2832,8 +2846,12 @@ struct ContextMenu {
     crumb: Option<usize>,
     /// The first top-level row on screen: a menu taller than the terminal
     /// (a big folder's breadcrumb picker) scrolls to keep the highlight in
-    /// view. Kept by [`scroll_for`](Self::scroll_for).
+    /// view. Kept by `scroll_for`.
     scroll: std::cell::Cell<usize>,
+    /// The first child row on screen inside the open submenu, driven by the
+    /// wheel (`wheel_active`) and kept in range by
+    /// render_context_menu.
+    submenu_scroll: std::cell::Cell<usize>,
 }
 
 impl ContextMenu {
@@ -2848,6 +2866,7 @@ impl ContextMenu {
             target_dir,
             crumb: None,
             scroll: Default::default(),
+            submenu_scroll: Default::default(),
         }
     }
 
@@ -2877,8 +2896,199 @@ impl ContextMenu {
         }
     }
 
-    /// The first top-level row shown when `visible` rows fit: the previous
-    /// offset, moved only as far as keeps `selected` on screen.
+    /// Move the cursor one selectable row up/down within the active level and
+    /// report whether it actually moved. Unlike [`move_cursor`](Self::move_cursor)
+    /// the caller learns the difference between a real step and hitting an end
+    /// (or a run of non-selectable rows), so a wheel notch that cannot move
+    /// the highlight can pan the view instead of dragging it.
+    fn step_cursor(&mut self, down: bool) -> bool {
+        let n = self.level_entries().len();
+        let mut i = self.level_selected();
+        while let Some(next) = if down {
+            (i + 1 < n).then_some(i + 1)
+        } else {
+            i.checked_sub(1)
+        } {
+            i = next;
+            if self.level_entries()[i].is_selectable() {
+                self.set_level_selected(i);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The rows the open submenu's panel can paint, given its height.
+    fn submenu_visible(&self, height: u16) -> usize {
+        height.saturating_sub(2) as usize
+    }
+
+    /// Scroll the open submenu's panel by `notches` rows (positive = down),
+    /// clamped so its last page is not scrolled past. The submenu paints from
+    /// its own top offset, so it pans independently of the parent panel.
+    fn scroll_submenu(&mut self, notches: i32, visible: usize) -> bool {
+        let Some(parent) = self.open_submenu else {
+            return false;
+        };
+        let len = match self.items.get(parent) {
+            Some(MenuEntry::Submenu { items, .. }) => items.len(),
+            _ => return false,
+        };
+        let max = len.saturating_sub(visible.max(1));
+        let cur = self.submenu_scroll.get().min(max);
+        let next = if notches >= 0 {
+            cur.saturating_add(notches.unsigned_abs() as usize)
+        } else {
+            cur.saturating_sub(notches.unsigned_abs() as usize)
+        }
+        .min(max);
+        if next == cur {
+            return false;
+        }
+        self.submenu_scroll.set(next);
+        true
+    }
+
+    /// Keep the submenu's view offset in range and the highlighted child on
+    /// screen, given the rows the panel can paint. Mirrors
+    /// `scroll_for` for the top-level panel.
+    fn submenu_scroll_for(&self, visible: usize) -> usize {
+        let mut top = self.submenu_scroll.get();
+        if visible > 0 {
+            if self.submenu_selected < top {
+                top = self.submenu_selected;
+            } else if self.submenu_selected >= top + visible {
+                top = self.submenu_selected + 1 - visible;
+            }
+            let len = self
+                .open_submenu
+                .and_then(|p| match self.items.get(p) {
+                    Some(MenuEntry::Submenu { items, .. }) => Some(items.len()),
+                    _ => None,
+                })
+                .unwrap_or(0);
+            top = top.min(len.saturating_sub(visible));
+        }
+        self.submenu_scroll.set(top);
+        top
+    }
+
+    /// Scroll the active level with the wheel.
+    ///
+    /// The wheel walks the highlight through the level exactly like Up/Down
+    /// do, so the selection always stays visible and Enter still fires what
+    /// the user sees. When the highlight cannot step any further (both ends,
+    /// or nothing selectable below), the view offset itself moves — so a
+    /// clipped panel still pans instead of swallowing the notch. visible is
+    /// the row count the caller can paint at the active level.
+    fn wheel_active(&mut self, notches: i32, visible: usize) {
+        if notches == 0 {
+            return;
+        }
+        let down = notches > 0;
+        let steps = notches.unsigned_abs() as usize;
+        for _ in 0..steps {
+            if self.step_cursor(down) {
+                continue;
+            }
+            if self.open_submenu.is_some() {
+                self.scroll_submenu(if down { 1 } else { -1 }, visible);
+            } else {
+                let max = self.items.len().saturating_sub(visible.max(1));
+                let cur = self.scroll.get().min(max);
+                let next = if down {
+                    cur.saturating_add(1)
+                } else {
+                    cur.saturating_sub(1)
+                }
+                .min(max);
+                self.scroll.set(next);
+            }
+        }
+    }
+
+    /// Page the active level by pages screens (positive = down), one
+    /// PgDn/PgUp. The highlight jumps a whole visible page at a time — as in
+    /// VS Code's menus — skipping non-selectable rows, and the panel offset
+    /// follows it via scroll_for / submenu_scroll_for. A page of a level
+    /// that fits entirely just puts the cursor on the first / last entry.
+    fn page_active(&mut self, pages: i32, visible: usize) {
+        if pages == 0 {
+            return;
+        }
+        let down = pages > 0;
+        let entries = self.level_entries();
+        let n = entries.len();
+        if n == 0 {
+            return;
+        }
+        // A page is at least one row even in a one-row-tall panel.
+        let step = visible.max(1);
+        let cur = self.level_selected().min(n - 1);
+        // Walk step selectable rows in the requested direction; if the
+        // level runs out first, land on its last / first selectable row.
+        let mut idx = cur;
+        let mut moved = 0;
+        let mut scan = cur;
+        while moved < step {
+            let next = if down {
+                if scan + 1 >= n {
+                    break;
+                }
+                scan + 1
+            } else {
+                match scan.checked_sub(1) {
+                    Some(v) => v,
+                    None => break,
+                }
+            };
+            scan = next;
+            if entries[next].is_selectable() {
+                idx = next;
+                moved += 1;
+            }
+        }
+        if moved == 0 {
+            return;
+        }
+        self.set_level_selected(idx);
+        // Keep the view offset in step with the highlight so the panel pages
+        // with it rather than leaving the cursor off screen.
+        if self.open_submenu.is_some() {
+            self.submenu_scroll_for(visible);
+        } else {
+            self.scroll_for(visible);
+        }
+    }
+
+    /// Jump the active level's highlight to its first / last selectable row
+    /// (Home / End), skipping headers and dividers. The panel offset follows
+    /// through scroll_for / submenu_scroll_for.
+    fn jump_active(&mut self, to_end: bool, visible: usize) {
+        let n = self.level_entries().len();
+        if n == 0 {
+            return;
+        }
+        let found = if to_end {
+            (0..n)
+                .rev()
+                .find(|&i| self.level_entries()[i].is_selectable())
+        } else {
+            (0..n).find(|&i| self.level_entries()[i].is_selectable())
+        };
+        let Some(idx) = found else {
+            return;
+        };
+        self.set_level_selected(idx);
+        if self.open_submenu.is_some() {
+            self.submenu_scroll_for(visible);
+        } else {
+            self.scroll_for(visible);
+        }
+    }
+
+    /// The first top-level row shown when visible rows fit: the previous
+    /// offset, moved only as far as keeps selected on screen.
     fn scroll_for(&self, visible: usize) -> usize {
         let mut top = self.scroll.get();
         if visible > 0 {
@@ -5526,6 +5736,9 @@ pub struct App {
     agent_events: std::collections::VecDeque<crate::agents::AgentEvent>,
     /// Hit rect of the status bar's agents chip; empty when no agent is seated.
     status_agents_rect: Rect,
+    /// Hit rect of the status bar's `Ln X, Col Y` readout. A click opens the
+    /// Go to Line prompt: a readout becomes a control, as in VS Code.
+    status_position_rect: Rect,
     /// User-defined problem matchers (#252): `matchers.json` (user config
     /// dir + workspace `.croft/`), batch-scanned at the FinishedCommand
     /// boundary alongside the built-in table. Swapped wholesale on reload.
@@ -7390,6 +7603,7 @@ impl App {
             agents: crate::agents::AgentTable::load(&crate::agents::agents_path()),
             agent_events: std::collections::VecDeque::new(),
             status_agents_rect: Rect::default(),
+            status_position_rect: Rect::default(),
             matchers,
             watch_set,
             task_matcher_by_pane: std::collections::HashMap::new(),
@@ -14965,6 +15179,7 @@ impl App {
         self.context_menu = Some(ContextMenu {
             crumb: None,
             scroll: Default::default(),
+            submenu_scroll: Default::default(),
             origin,
             items: self.customize_layout_items(),
             selected,
@@ -15368,6 +15583,7 @@ impl App {
         self.context_menu = Some(ContextMenu {
             crumb: None,
             scroll: Default::default(),
+            submenu_scroll: Default::default(),
             origin,
             items: items.into_iter().map(MenuEntry::from).collect(),
             selected,
@@ -19432,6 +19648,7 @@ impl App {
         self.context_menu = Some(ContextMenu {
             crumb: None,
             scroll: Default::default(),
+            submenu_scroll: Default::default(),
             origin,
             items,
             selected: 0,
@@ -22166,6 +22383,55 @@ impl App {
         self.split_editor_dir(editor_layout::SplitDir::Horizontal, true);
     }
 
+    /// Wheel-scroll the inactive split group under the pointer, if any.
+    ///
+    /// inactive_dfs_index_at hit-tests EditorTabs::last_full_area — the rect
+    /// a group recorded during its last render. That is stale for one frame
+    /// after focus moves, and worse, a group that has never painted since the
+    /// split was created has Rect::default(), so the wheel misses it
+    /// entirely (focused left → right pane never scrolled). So: use the
+    /// recorded rect when it actually contains the cell, and otherwise fall
+    /// back to the geometric layout (leaf_rects), excluding the active leaf,
+    /// which is the authority for where each group sits on screen right now.
+    ///
+    /// Returns true when a group was found and scrolled. Focus is never moved.
+    fn scroll_inactive_group_at(&mut self, col: u16, row: u16, notches: i32) -> bool {
+        if !self.editor_layout.is_split() {
+            return false;
+        }
+        let target = self
+            .editor_layout
+            .inactive_dfs_index_at(col, row)
+            .or_else(|| {
+                let area = self.editor.last_full_area;
+                if area.width == 0 || area.height == 0 {
+                    return None;
+                }
+                let active = self.editor_layout.active_dfs_index();
+                self.editor_layout
+                    .leaf_rects(area, EDITOR_SPLIT_MIN)
+                    .iter()
+                    .enumerate()
+                    .position(|(i, r)| i != active && rect_contains(*r, col, row))
+            });
+        let Some(dfs) = target else {
+            return false;
+        };
+        // Same depth-first order as inactive_groups_mut, minus the active
+        // leaf — see collect_inactive_mut.
+        let active = self.editor_layout.active_dfs_index();
+        let inactive_idx = if dfs > active { dfs - 1 } else { dfs };
+        if let Some(group) = self
+            .editor_layout
+            .inactive_groups_mut()
+            .get_mut(inactive_idx)
+        {
+            group.wheel_scroll_active(notches);
+            return true;
+        }
+        false
+    }
+
     /// Move keyboard focus to the editor group in the given physical
     /// column (`true` = left, `false` = right). Hoists the active group
     /// through `editor_layout` so the focused group is always `editor`, keeping
@@ -23974,6 +24240,7 @@ impl App {
         self.status_eol_rect = Rect::default();
         self.status_language_rect = Rect::default();
         self.status_agents_rect = Rect::default();
+        self.status_position_rect = Rect::default();
         if status_h > 0 && right_total > 0 && right_total <= status_rect.width {
             let rx = status_rect.right() - right_total;
             if self.status_message_rect.right() > rx {
@@ -24009,8 +24276,8 @@ impl App {
             // shade up from the transient's dim gray, │ dividers between, and
             // a hover fill on the clickable segments (indices 1..=5) when the
             // pointer rests on them — same affordance as the activity bar.
-            // Ln/Col (index 0) is a readout, not a control, so it never
-            // hovers. Hit rects recorded in the same pass.
+            // Ln/Col (index 0) opens Go to Line, so it hovers like the rest.
+            // Hit rects recorded in the same pass.
             let seg_style = Style::default().fg(match self.theme.surfaces() {
                 Some(s) => s.muted(),
                 None => self.theme.ui(Color::Rgb(0xc9, 0xd2, 0xe3)),
@@ -24031,15 +24298,15 @@ impl App {
                     width: widths[i],
                     height: 1,
                 };
-                let hovered = i > 0
-                    && self
-                        .pointer_cell
-                        .is_some_and(|(pc, pr)| rect_contains(r, pc, pr));
+                let hovered = self
+                    .pointer_cell
+                    .is_some_and(|(pc, pr)| rect_contains(r, pc, pr));
                 right.push(Span::styled(
                     text.clone(),
                     if hovered { hover_style } else { seg_style },
                 ));
                 match i {
+                    0 => self.status_position_rect = r,
                     1 => self.status_indent_rect = r,
                     2 => self.status_encoding_rect = r,
                     3 => self.status_eol_rect = r,
@@ -24245,7 +24512,8 @@ impl App {
             && let Some(MenuEntry::Submenu { items, .. }) =
                 menu.open_submenu.and_then(|p| menu.items.get(p))
         {
-            self.render_menu_panel(frame, sub_rect, items, menu.submenu_selected, 0, grad);
+            let sub_top = menu.submenu_scroll_for(menu.submenu_visible(sub_rect.height));
+            self.render_menu_panel(frame, sub_rect, items, menu.submenu_selected, sub_top, grad);
         }
     }
 
@@ -40375,6 +40643,18 @@ impl App {
         };
         let purpose = prompt.purpose.clone();
         match purpose {
+            InputPurpose::GoToLine => {
+                self.close_input_prompt();
+                match value.trim().parse::<usize>() {
+                    Ok(n) if n > 0 => {
+                        // The typed line is 1-based (what the status bar shows);
+                        // goto_line_centered takes a 0-based row index.
+                        self.editor.goto_line_centered(n - 1);
+                        self.status = format!("Line {n}");
+                    }
+                    _ => self.status = format!("Not a line number: {}", value.trim()),
+                }
+            }
             InputPurpose::AddWatch => {
                 self.close_input_prompt();
                 self.add_watch_expression(value);
@@ -54454,6 +54734,7 @@ impl App {
         self.context_menu = Some(ContextMenu {
             crumb: None,
             scroll: Default::default(),
+            submenu_scroll: Default::default(),
             origin,
             items: vec![
                 MenuEntry::header(header),
@@ -62372,6 +62653,10 @@ impl App {
                 );
                 return;
             }
+            if rect_contains(self.status_position_rect, m.column, m.row) {
+                self.open_go_to_line_prompt();
+                return;
+            }
             if rect_contains(self.status_indent_rect, m.column, m.row) {
                 self.open_status_indent_menu(self.status_indent_rect.x, self.status_indent_rect.y);
                 return;
@@ -62487,6 +62772,30 @@ impl App {
                 MouseEventKind::Down(MouseButton::Right) => {
                     self.context_menu = None;
                     // fall through so the right-click below can re-open if applicable
+                }
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                    // The wheel walks the highlighted row through the level
+                    // (same as Up/Down), and pans the panel once the
+                    // highlight can move no further. Which level it drives
+                    // depends on the pointer: over the floating submenu it is
+                    // the submenu, anywhere else the top-level panel.
+                    let down = m.kind == MouseEventKind::ScrollDown;
+                    let over_submenu = self
+                        .submenu_rect()
+                        .is_some_and(|r| rect_contains(r, m.column, m.row));
+                    let visible = if over_submenu {
+                        self.submenu_rect()
+                            .map(|r| r.height.saturating_sub(2) as usize)
+                            .unwrap_or(0)
+                    } else {
+                        self.menu_rect()
+                            .map(|r| r.height.saturating_sub(2) as usize)
+                            .unwrap_or(0)
+                    };
+                    if let Some(menu) = self.context_menu.as_mut() {
+                        menu.wheel_active(if down { 3 } else { -3 }, visible);
+                    }
+                    return;
                 }
                 _ => return,
             }
@@ -63087,6 +63396,7 @@ impl App {
                     self.context_menu = Some(ContextMenu {
                         crumb: None,
                         scroll: Default::default(),
+                        submenu_scroll: Default::default(),
                         origin: (m.column, m.row),
                         items,
                         selected: 0,
@@ -63251,6 +63561,7 @@ impl App {
                     self.context_menu = Some(ContextMenu {
                         crumb: None,
                         scroll: Default::default(),
+                        submenu_scroll: Default::default(),
                         origin: (m.column, m.row),
                         items,
                         selected: 0,
@@ -63355,6 +63666,18 @@ impl App {
                         String::from("Add Logpoint")
                     };
                     let mut items = vec![
+                        // Bookmarks sit above the breakpoint group: same gutter,
+                        // different tool, and the Bookmarks extension's own
+                        // labels so the chords read the same as in VS Code.
+                        (
+                            String::from("Toggle Bookmark"),
+                            MenuAction::ToggleBookmarkAt { line },
+                        ),
+                        (String::from("Next Bookmark"), MenuAction::NextBookmark),
+                        (
+                            String::from("Previous Bookmark"),
+                            MenuAction::PreviousBookmark,
+                        ),
                         (toggle_label, MenuAction::ToggleBreakpointAt { line }),
                         (cond_label, MenuAction::EditBreakpointConditionAt { line }),
                         (log_label, MenuAction::EditLogpointAt { line }),
@@ -65479,6 +65802,7 @@ impl App {
                     } else {
                         self.editor.scroll_down(3);
                     }
+                } else if self.scroll_inactive_group_at(m.column, m.row, 3) {
                 } else if rect_contains(self.terminal_rail_area, m.column, m.row) {
                     // The rail is its own scrollable list, like VS Code's
                     // terminal tabs. Paint clamps the offset.
@@ -65554,6 +65878,7 @@ impl App {
                     } else {
                         self.editor.scroll_up(3);
                     }
+                } else if self.scroll_inactive_group_at(m.column, m.row, -3) {
                 } else if rect_contains(self.terminal_rail_area, m.column, m.row) {
                     self.terminal_rail_scroll = self.terminal_rail_scroll.saturating_sub(1);
                 } else if let Some(idx) = terminal_hit {
@@ -69461,6 +69786,23 @@ impl App {
         })
     }
 
+    /// Rows the active menu level can paint: the open submenu's panel when
+    /// one is open, else the top-level panel. Shared by the wheel, PgUp/PgDn
+    /// and Home/End so every one of them pages against what is on screen.
+    fn menu_visible_rows(&self) -> usize {
+        let rect = if self
+            .context_menu
+            .as_ref()
+            .is_some_and(|m| m.open_submenu.is_some())
+        {
+            self.submenu_rect()
+        } else {
+            self.menu_rect()
+        };
+        rect.map(|r| r.height.saturating_sub(2) as usize)
+            .unwrap_or(0)
+    }
+
     /// If (x, y) hits a top-level menu row, return its index.
     fn menu_item_at(&self, x: u16, y: u16) -> Option<usize> {
         let r = self.menu_rect()?;
@@ -69487,7 +69829,10 @@ impl App {
         let MenuEntry::Submenu { items, .. } = menu.items.get(parent)? else {
             return None;
         };
-        let idx = inner_y as usize;
+        // The panel may be scrolled: the visible row maps to an entry offset
+        // by the same view offset the renderer painted from.
+        let top = menu.submenu_scroll_for(menu.submenu_visible(r.height));
+        let idx = top + inner_y as usize;
         (idx < items.len()).then_some(idx)
     }
 
@@ -69512,6 +69857,22 @@ impl App {
             KeyCode::Down => {
                 if let Some(menu) = self.context_menu.as_mut() {
                     menu.move_cursor(true);
+                }
+            }
+            KeyCode::Home | KeyCode::End => {
+                let to_end = key.code == KeyCode::End;
+                let visible = self.menu_visible_rows();
+                if let Some(menu) = self.context_menu.as_mut() {
+                    menu.jump_active(to_end, visible);
+                }
+            }
+            KeyCode::PageUp | KeyCode::PageDown => {
+                // Page through the active level (the open submenu when the
+                // cursor is in it, else the top-level panel).
+                let down = key.code == KeyCode::PageDown;
+                let visible = self.menu_visible_rows();
+                if let Some(menu) = self.context_menu.as_mut() {
+                    menu.page_active(if down { 1 } else { -1 }, visible);
                 }
             }
             KeyCode::Left | KeyCode::Right
@@ -70407,6 +70768,21 @@ impl App {
                 self.focus_pane(Pane::Editor);
                 self.debug_edit_logpoint_line(line);
             }
+            MenuAction::ToggleBookmarkAt { line } => {
+                self.focus_pane(Pane::Editor);
+                // `toggle_bookmark` acts on the cursor, so seat it on the
+                // clicked line first; `line` is 1-based, the editor 0-based.
+                self.editor.goto_line_centered(line.saturating_sub(1));
+                self.toggle_bookmark();
+            }
+            MenuAction::NextBookmark => {
+                self.focus_pane(Pane::Editor);
+                self.goto_bookmark(true);
+            }
+            MenuAction::PreviousBookmark => {
+                self.focus_pane(Pane::Editor);
+                self.goto_bookmark(false);
+            }
             MenuAction::AskNavigatorAt { line } => {
                 self.focus_pane(Pane::Editor);
                 self.open_ask_navigator((line, line), String::new());
@@ -70663,6 +71039,7 @@ impl App {
             target_dir: self.tree.root.clone(),
             crumb: None,
             scroll: Default::default(),
+            submenu_scroll: Default::default(),
         }
     }
 
@@ -72876,6 +73253,7 @@ impl App {
         self.context_menu = Some(ContextMenu {
             crumb: None,
             scroll: Default::default(),
+            submenu_scroll: Default::default(),
             origin: (col, row),
             items,
             selected: 0,
@@ -72958,6 +73336,18 @@ impl App {
         self.open_status_menu(col, row, items);
     }
 
+    /// Go to Line, opened by clicking the status bar's `Ln X, Col Y` readout.
+    /// The field is prefilled with the caret's current line, selected, so the
+    /// user can type over it or press Enter to stay put.
+    fn open_go_to_line_prompt(&mut self) {
+        use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+        let line = self.editor.cursor_row + 1;
+        self.open_input_prompt(
+            InputPrompt::new(InputPurpose::GoToLine, "Go to Line", "line number")
+                .with_value(line.to_string()),
+        );
+    }
+
     /// Status-bar indentation picker, mirroring VS Code's "Select Indentation"
     /// quick pick: switch spaces-vs-tabs for future typing, change the width,
     /// and convert the buffer's existing indentation.
@@ -73027,6 +73417,7 @@ impl App {
         self.context_menu = Some(ContextMenu {
             crumb: None,
             scroll: Default::default(),
+            submenu_scroll: Default::default(),
             origin: (col, row),
             items,
             selected: 0,
