@@ -571,8 +571,13 @@ impl DiffData {
                 lang = None;
             }
             if line.starts_with("diff --git") {
+                // `diff.noprefix`, `diff.mnemonicPrefix` and custom prefixes
+                // write the paths without `a/` and `b/`; the header's last
+                // word still ends in the new file's name.
+                let last_word = line.rsplit(' ').next().map(|w| w.trim_matches('"'));
                 lang = parse_diff_git_new_path(line)
-                    .and_then(|p| crate::highlight::lang_for_path(Path::new(&p)));
+                    .and_then(|p| crate::highlight::lang_for_path(Path::new(&p)))
+                    .or_else(|| crate::highlight::lang_for_path(Path::new(last_word?)));
             }
             let code = if in_header { None } else { lang };
             if line.starts_with("diff --git") || line.starts_with("@@") {
@@ -1204,15 +1209,27 @@ impl DiffData {
 
     /// Colour each side's code by its language (#2020), starting the pass if
     /// none has run for this text and theme and waiting up to `wait` (`None`:
-    /// however long it takes) for it. A side takes its own path's language,
-    /// else the other side's: the left of a Source Control diff is a
-    /// `foo.rs (HEAD)` label, and a deleted file's right is `/dev/null`.
+    /// however long it takes) for it. A side takes its own path's language.
+    /// A side whose path is only a label takes the other side's: the left of
+    /// a Source Control diff is `foo.rs (HEAD)`, and a deleted file's right
+    /// is `/dev/null`. A real file with no grammar stays plain, even beside
+    /// one that has one.
     pub fn colour_syntax(&mut self, wait: Option<std::time::Duration>) {
         let (left_path, right_path) = (&self.left_path, &self.right_path);
+        let left_is_label = !self.left_is_real_file;
+        let right_is_label =
+            right_path.as_os_str().is_empty() || right_path == Path::new("/dev/null");
         let langs = || {
             let left = crate::highlight::lang_for_path(left_path);
             let right = crate::highlight::lang_for_path(right_path);
-            (left.or(right), right.or(left))
+            (
+                if left_is_label { left.or(right) } else { left },
+                if right_is_label {
+                    right.or(left)
+                } else {
+                    right
+                },
+            )
         };
         self.syntax
             .ensure(&self.left_lines, &self.right_lines, langs, wait);
@@ -3366,6 +3383,39 @@ mod tests {
         assert!(d.syntax.left(txt).is_empty(), "a .txt file stays plain");
         let txt = at(&d.right_lines, "fn still not code");
         assert!(d.syntax.right(txt).is_empty());
+    }
+
+    /// #2020: headers written under `diff.noprefix` or `diff.mnemonicPrefix`
+    /// still name the file's language.
+    #[test]
+    fn a_git_diff_without_the_usual_prefixes_is_still_coloured() {
+        for header in [
+            "diff --git a.rs a.rs",
+            "diff --git i/src/a.rs w/src/a.rs",
+            "diff --git c/a.rs i/a.rs",
+        ] {
+            let raw = format!("{header}\n@@ -1 +1 @@\n-fn a() {{}}\n+fn b() {{}}\n");
+            let mut d = DiffData::build_side_by_side_from_git_text(PathBuf::from("staged"), &raw);
+            d.colour_syntax(None);
+            let removed = d.left_lines.iter().position(|l| l == "fn a() {}").unwrap();
+            assert!(!d.syntax.left(removed).is_empty(), "{header}: coloured");
+        }
+    }
+
+    /// #2020: comparing two real files of different kinds colours each by
+    /// its own language: a text file beside a Rust one stays plain.
+    #[test]
+    fn a_real_file_with_no_grammar_stays_plain_beside_one_with_a_grammar() {
+        let mut d = DiffData::build(
+            PathBuf::from("old.rs"),
+            PathBuf::from("notes.txt"),
+            vec![String::from("fn a() {}")],
+            vec![String::from("fn a() {}")],
+        );
+        d.left_is_real_file = true;
+        d.colour_syntax(None);
+        assert!(!d.syntax.left(0).is_empty(), "the Rust file is coloured");
+        assert!(d.syntax.right(0).is_empty(), "the text file is not");
     }
 
     /// #2020: the left of a Source Control diff is a `foo.rs (HEAD)` label,
