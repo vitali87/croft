@@ -1438,6 +1438,50 @@ fn paint_intraline_range(
     }
 }
 
+/// Recolour one diff line drawn at `text_x` from char `skip`, `width` cells
+/// wide, in its syntax colours (#2020): each character takes its span's
+/// foreground and weight, and keeps the row's background, which is what
+/// marks it removed, added or unchanged. Cells follow display width, as
+/// [`clip_pad_cells`] lays them down.
+fn paint_diff_syntax(
+    buf: &mut Buffer,
+    text_x: u16,
+    y: u16,
+    width: u16,
+    text: &str,
+    skip: usize,
+    spans: &[HiSpan],
+) {
+    if spans.is_empty() || width == 0 {
+        return;
+    }
+    let mut cell = 0u16;
+    let mut next = 0;
+    for (i, (byte, c)) in text.char_indices().enumerate() {
+        // Spans arrive in order and do not overlap.
+        while spans.get(next).is_some_and(|s| s.range().end <= byte) {
+            next += 1;
+        }
+        if i < skip {
+            continue;
+        }
+        let w = char_cells(c) as u16;
+        if cell + w > width {
+            break;
+        }
+        if let Some(span) = spans.get(next).filter(|s| s.range().contains(&byte)) {
+            let style = Style {
+                bg: None,
+                ..span.style
+            };
+            for dx in 0..w {
+                buf[(text_x + cell + dx, y)].set_style(style);
+            }
+        }
+        cell += w;
+    }
+}
+
 /// Returns the hit-test rects of the prev / next change arrows painted
 /// in the diff header (in that order). Both are `Rect::default()` when
 /// the header was too narrow to allocate them.
@@ -1460,6 +1504,9 @@ fn render_diff(
     if inner.height < 3 || inner.width < 16 {
         return (Rect::default(), Rect::default());
     }
+    // A small diff colours in this frame; a large one paints plain now and
+    // takes its colours when `poll_highlights` lands them.
+    diff.colour_syntax(Some(HIGHLIGHT_INLINE_BUDGET));
     if diff.unified {
         return render_unified_deletion(diff, inner, buf, bg, theme);
     }
@@ -1664,6 +1711,17 @@ fn render_diff(
                 })
                 .bg(l_cell_bg),
         );
+        if let Some(i) = l_left_idx {
+            paint_diff_syntax(
+                buf,
+                l_text_x,
+                y,
+                l_text_w,
+                &l_text,
+                diff.scroll_x,
+                diff.syntax.left(i),
+            );
+        }
         // The changed characters of a replaced line (#1351), on both sides.
         let intraline = match row {
             DiffRow::Replaced { .. } => crate::widgets::diff::changed_char_ranges(&l_text, &r_text),
@@ -1750,6 +1808,17 @@ fn render_diff(
                 })
                 .bg(r_cell_bg),
         );
+        if let Some(i) = r_right_idx {
+            paint_diff_syntax(
+                buf,
+                r_text_x,
+                y,
+                r_text_w,
+                &r_text,
+                diff.scroll_x,
+                diff.syntax.right(i),
+            );
+        }
         if let Some((_, range)) = intraline {
             let (r, g, b) = crate::widgets::diff::INTRALINE_ADDED_BG;
             paint_intraline_range(
@@ -2206,6 +2275,17 @@ fn render_unified_deletion(
                 })
                 .bg(cell_bg),
         );
+        if let Some(i) = left_idx {
+            paint_diff_syntax(
+                buf,
+                text_x,
+                y,
+                text_w,
+                &text,
+                diff.scroll_x,
+                diff.syntax.left(i),
+            );
+        }
     }
 
     let visible_first = diff.scroll + 1;
@@ -7555,6 +7635,10 @@ impl Editor {
         // A pass already running bakes the old palette's colors.
         self.highlight_job = None;
         self.recompute_highlights();
+        // A diff view's colours are baked the same way (#2020).
+        if let Some(diff) = self.diff.as_mut() {
+            diff.syntax.restart();
+        }
         // The markdown preview bakes the theme into its lines at build time
         // and rebuilds only when the buffer edits (`built_seq`), so a theme
         // switch must rebuild it here or it keeps the old colors until the
@@ -7817,6 +7901,16 @@ impl Editor {
     /// calls this every tick for every tab; true when the colors changed.
     pub fn poll_highlights(&mut self) -> bool {
         use std::sync::mpsc::TryRecvError;
+        // A diff view's colours land the same way (#2020). One whose pass
+        // waited for a free slot starts it once one frees.
+        if let Some(diff) = self.diff.as_mut() {
+            if diff.syntax.waiting() {
+                diff.colour_syntax(Some(std::time::Duration::ZERO));
+            }
+            if diff.syntax.poll() {
+                return true;
+            }
+        }
         let Some(job) = &self.highlight_job else {
             return false;
         };
@@ -36600,6 +36694,78 @@ mod tests {
         assert_eq!(
             buf[(inner.x + inner.width / 2, changed)].symbol(),
             "\u{2502}"
+        );
+    }
+
+    /// #2020: the diff view paints code in its language's colours, on the
+    /// rows' red, green and plain backgrounds, as the editor does.
+    #[test]
+    fn the_diff_view_paints_code_in_its_syntax_colours() {
+        let file = |text: &str| {
+            let f = tempfile::Builder::new().suffix(".rs").tempfile().unwrap();
+            std::fs::write(f.path(), text).unwrap();
+            f
+        };
+        let f1 = file("fn main() {\n    let x = 1;\n}\n");
+        let f2 = file("fn main() {\n    let x = 2;\n}\n");
+        let mut t = EditorTabs::new();
+        t.open_diff(f1.path(), f2.path()).unwrap();
+        let idx = t.active_index();
+        t.editors[idx].diff.as_mut().unwrap().colour_syntax(None);
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 10,
+        };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut t.editors[idx], area, &mut buf);
+        let ed = &t.editors[idx];
+        let inner = ed.last_inner;
+        let (l_text_x, unchanged) = left_text_at(&buf, inner, 3, "fn main() {");
+        assert_ne!(
+            buf[(l_text_x, unchanged)].fg,
+            buf[(l_text_x + 3, unchanged)].fg,
+            "the keyword `fn` and the name `main` read in different colours"
+        );
+        let (_, changed) = left_text_at(&buf, inner, 3, "    let x = 1;");
+        let r_text_x = inner.x + inner.width / 2 + 1 + 2 + 2;
+        assert_eq!(
+            row_text(&buf, changed, r_text_x, r_text_x + 14),
+            "    let x = 2;"
+        );
+        let removed_bg = ed.theme.ui(Color::Rgb(0x4a, 0x1f, 0x1f));
+        let added_bg = ed.theme.ui(Color::Rgb(0x1f, 0x42, 0x2a));
+        for (x, bg, side) in [
+            (l_text_x, removed_bg, "removed"),
+            (r_text_x, added_bg, "added"),
+        ] {
+            let keyword = &buf[(x + 4, changed)];
+            let name = &buf[(x + 8, changed)];
+            assert_eq!(keyword.symbol(), "l");
+            assert_ne!(
+                keyword.fg, name.fg,
+                "`let` and `x` differ on the {side} side"
+            );
+            assert_eq!(keyword.bg, bg, "the {side} row keeps its background");
+            assert_eq!(name.bg, bg);
+        }
+    }
+
+    /// A file with no grammar keeps the diff's own tints: red text on the
+    /// removed side, green on the added.
+    #[test]
+    fn a_diff_with_no_grammar_keeps_its_red_and_green_text() {
+        let (buf, inner, r_text_x) = render_wide_diff("x\nold line\n", "x\nnew line\n");
+        let (l_text_x, y) = left_text_at(&buf, inner, 2, "old line");
+        let theme = crate::theme::Theme::default();
+        assert_eq!(
+            buf[(l_text_x, y)].fg,
+            theme.ui(Color::Rgb(0xff, 0xb3, 0xb3))
+        );
+        assert_eq!(
+            buf[(r_text_x, y)].fg,
+            theme.ui(Color::Rgb(0xb6, 0xee, 0xc4))
         );
     }
 
