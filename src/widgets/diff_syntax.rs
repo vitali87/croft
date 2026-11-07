@@ -6,6 +6,7 @@
 //! is painted: a small diff colours in the same frame, a large one opens at
 //! once and colours a tick later, when [`DiffSyntax::poll`] takes the result.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, TryRecvError};
 use std::time::Duration;
 
@@ -14,6 +15,38 @@ use crate::highlight::{HiSpan, LangKind, LangRegistry, compute_line_starts, high
 /// A side larger than this is left in the diff's plain colours: a grammar
 /// pass over it costs more memory and time than colouring a review is worth.
 const MAX_SIDE_BYTES: usize = 4_000_000;
+
+/// How many diff colouring passes may run at once, across every diff view.
+/// A large file rewritten again and again (an agent saving it) rebuilds its
+/// view each time, and a pass already running for the old text cannot be
+/// stopped. Past this many, a view waits for one to finish instead of
+/// starting another, so passes for text nobody shows any more never pile up.
+const MAX_PASSES: usize = 2;
+
+/// The passes running now; see [`MAX_PASSES`].
+static PASSES: AtomicUsize = AtomicUsize::new(0);
+
+/// One of the [`MAX_PASSES`] slots, given back when its pass ends, however it
+/// ends.
+struct PassSlot;
+
+impl PassSlot {
+    /// A free slot, or `None` while every one is taken.
+    fn take() -> Option<Self> {
+        PASSES
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                (n < MAX_PASSES).then_some(n + 1)
+            })
+            .ok()
+            .map(|_| PassSlot)
+    }
+}
+
+impl Drop for PassSlot {
+    fn drop(&mut self) {
+        PASSES.fetch_sub(1, Ordering::SeqCst);
+    }
+}
 
 /// One stretch of a side's lines, `start..end`, that is one piece of code in
 /// one language: a whole file, or one hunk of a `git diff`.
@@ -49,6 +82,8 @@ type Spans = Vec<Vec<HiSpan>>;
 enum Job {
     /// No pass has run for the current text and theme.
     NotStarted,
+    /// A pass is due, but every slot was taken; the next tick tries again.
+    Waiting,
     Running(Receiver<(Spans, Spans)>),
     Done,
 }
@@ -86,7 +121,7 @@ impl Clone for DiffSyntax {
             right: self.right.clone(),
             job: match self.job {
                 Job::Done => Job::Done,
-                Job::NotStarted | Job::Running(_) => Job::NotStarted,
+                Job::NotStarted | Job::Waiting | Job::Running(_) => Job::NotStarted,
             },
         }
     }
@@ -131,11 +166,13 @@ impl DiffSyntax {
     }
 
     /// Start the pass if none has run for this text and theme, and wait up to
-    /// `wait` (`None`: however long it takes) for it to land. `langs` gives
-    /// each side's language when the view has no runs of its own; it is asked
-    /// only when a pass starts, not on every frame. Only the
+    /// `wait` for it to land; `None` colours here, on the calling thread.
+    /// `langs` gives each side's language when the view has no runs of its
+    /// own; it is asked only when a pass starts, not on every frame. Only the
     /// call that starts a pass waits: one already running is left to
     /// [`Self::poll`], so a slow pass never holds back the frames after it.
+    /// With every slot taken the view waits for one (see [`MAX_PASSES`]), and
+    /// [`Self::waiting`] says so.
     pub fn ensure(
         &mut self,
         left_lines: &[String],
@@ -143,27 +180,39 @@ impl DiffSyntax {
         langs: impl FnOnce() -> (Option<LangKind>, Option<LangKind>),
         wait: Option<Duration>,
     ) {
-        if !matches!(self.job, Job::NotStarted) {
+        if !matches!(self.job, Job::NotStarted | Job::Waiting) {
             return;
         }
+        let slot = match wait {
+            None => None,
+            Some(_) => match PassSlot::take() {
+                Some(slot) => Some(slot),
+                None => {
+                    self.job = Job::Waiting;
+                    return;
+                }
+            },
+        };
         let langs = match self.runs {
             Some(_) => (None, None),
             None => langs(),
         };
-        self.start(left_lines, right_lines, langs);
-        let Job::Running(rx) = &self.job else {
+        self.start(left_lines, right_lines, langs, slot);
+        let (Job::Running(rx), Some(wait)) = (&self.job, wait) else {
             return;
         };
-        let landed = match wait {
-            None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
-            Some(wait) => rx.recv_timeout(wait),
-        };
-        match landed {
+        match rx.recv_timeout(wait) {
             Ok((left, right)) => self.land(left, right),
             Err(RecvTimeoutError::Timeout) => {}
             // The worker died without a result: paint the plain colours.
             Err(RecvTimeoutError::Disconnected) => self.job = Job::Done,
         }
+    }
+
+    /// True while a pass is due but waits for a free slot: the tick calls
+    /// [`Self::ensure`] again until it starts.
+    pub fn waiting(&self) -> bool {
+        matches!(self.job, Job::Waiting)
     }
 
     /// Take a pass that finished since the last tick. True when the colours
@@ -215,11 +264,14 @@ impl DiffSyntax {
         self.job = Job::Done;
     }
 
+    /// Start the pass on a worker holding `slot`, or colour here when there
+    /// is no slot (the caller asked to wait however long it takes).
     fn start(
         &mut self,
         left_lines: &[String],
         right_lines: &[String],
         (left_lang, right_lang): (Option<LangKind>, Option<LangKind>),
+        slot: Option<PassSlot>,
     ) {
         let whole = |lines: &[String], lang: Option<LangKind>| -> Vec<CodeRun> {
             lang.filter(|_| !lines.is_empty())
@@ -242,17 +294,23 @@ impl DiffSyntax {
             return;
         }
         let (left_len, right_len) = (left_lines.len(), right_lines.len());
+        let Some(slot) = slot else {
+            self.land(colour(left_len, left), colour(right_len, right));
+            return;
+        };
         let (tx, rx) = std::sync::mpsc::channel();
         let spawned = std::thread::Builder::new()
             .name(String::from("croft-diff-highlight"))
             .spawn(move || {
+                let _slot = slot;
                 // Nobody listening (the tab closed, or the view was rebuilt)
                 // is fine: the result is simply dropped.
                 let _ = tx.send((colour(left_len, left), colour(right_len, right)));
             });
         match spawned {
             Ok(_) => self.job = Job::Running(rx),
-            // No thread to be had: colour here.
+            // No thread to be had (the slot went with the closure): colour
+            // here.
             Err(_) => self.land(
                 colour(left_len, side_texts(left_lines, &left_runs)),
                 colour(right_len, side_texts(right_lines, &right_runs)),
@@ -403,6 +461,23 @@ mod tests {
         assert_eq!(syntax.left(0).len(), before, "no flash to plain");
         syntax.ensure(&text, &text, || RUST, None);
         assert!(!syntax.left(0).is_empty());
+    }
+
+    #[test]
+    fn a_pass_waits_for_a_free_slot_instead_of_piling_up() {
+        let text = lines(&["fn a() {}"]);
+        let mut syntax = DiffSyntax::default();
+        // Every slot taken, counted relative to whatever other tests run.
+        PASSES.fetch_add(MAX_PASSES, Ordering::SeqCst);
+        syntax.ensure(&text, &text, || RUST, Some(Duration::ZERO));
+        let waited = syntax.waiting();
+        PASSES.fetch_sub(MAX_PASSES, Ordering::SeqCst);
+        assert!(waited, "with no slot free the pass waits");
+        assert!(syntax.left(0).is_empty(), "and nothing is coloured yet");
+        assert!(!syntax.poll(), "nothing is running to land");
+        syntax.ensure(&text, &text, || RUST, None);
+        assert!(!syntax.waiting());
+        assert!(!syntax.left(0).is_empty(), "asked again, it runs");
     }
 
     #[test]

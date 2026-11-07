@@ -7820,9 +7820,15 @@ impl Editor {
     /// calls this every tick for every tab; true when the colors changed.
     pub fn poll_highlights(&mut self) -> bool {
         use std::sync::mpsc::TryRecvError;
-        // A diff view's colours land the same way (#2020).
-        if self.diff.as_mut().is_some_and(|diff| diff.syntax.poll()) {
-            return true;
+        // A diff view's colours land the same way (#2020). One whose pass
+        // waited for a free slot starts it once one frees.
+        if let Some(diff) = self.diff.as_mut() {
+            if diff.syntax.waiting() {
+                diff.colour_syntax(Some(std::time::Duration::ZERO));
+            }
+            if diff.syntax.poll() {
+                return true;
+            }
         }
         let Some(job) = &self.highlight_job else {
             return false;
