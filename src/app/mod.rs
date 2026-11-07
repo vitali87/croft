@@ -4006,6 +4006,10 @@ pub struct App {
     drop_to_local: bool,
     is_remote: bool,
     context_menu: Option<ContextMenu>,
+    /// The type-to-filter state of an open breadcrumb picker: the typed text
+    /// and the picker's full, unfiltered rows. Reset whenever a picker opens
+    /// (`show_crumb_picker`) and read only while `context_menu.crumb` is set.
+    crumb_filter: (String, Vec<MenuEntry>),
     prompt: Option<Prompt>,
     fs_watch: FsWatch,
     /// One extra watcher per SECONDARY workspace root (#147), sharing the
@@ -7008,6 +7012,7 @@ impl App {
             drop_to_local: false,
             is_remote: is_remote_session(),
             context_menu: None,
+            crumb_filter: (String::new(), Vec::new()),
             prompt: None,
             fs_watch,
             fs_watch_extra: Vec::new(),
@@ -13295,7 +13300,41 @@ impl App {
         let mut menu = ContextMenu::flat(origin, items, self.tree.root.clone());
         menu.selected = selected;
         menu.crumb = Some(i);
+        self.crumb_filter = (String::new(), menu.items.clone());
         self.context_menu = Some(menu);
+    }
+
+    /// Re-derive a breadcrumb picker's rows from `crumb_filter`: the rows
+    /// whose label contains the typed text (case-insensitive), keeping the
+    /// highlighted row when it survives and otherwise starting from the top.
+    fn apply_crumb_filter(&mut self) {
+        let Some(menu) = self.context_menu.as_mut() else {
+            return;
+        };
+        let (text, all) = &self.crumb_filter;
+        let kept = menu.items.get(menu.selected).and_then(|e| match e {
+            MenuEntry::Item { label, .. } => Some(label.clone()),
+            _ => None,
+        });
+        let needle = text.trim().to_lowercase();
+        menu.items = all
+            .iter()
+            .filter(|e| match e {
+                MenuEntry::Item { label, .. } => {
+                    needle.is_empty() || label.to_lowercase().contains(&needle)
+                }
+                _ => needle.is_empty(),
+            })
+            .cloned()
+            .collect();
+        menu.selected = kept
+            .and_then(|k| {
+                menu.items
+                    .iter()
+                    .position(|e| matches!(e, MenuEntry::Item { label, .. } if *label == k))
+            })
+            .unwrap_or(0);
+        menu.scroll.set(0);
     }
 
     /// A file picked from a breadcrumb picker opens as a Quick Open pick does.
@@ -24269,6 +24308,25 @@ impl App {
         // The top-level panel; the open submenu's parent row stays highlighted.
         let top = menu.scroll_for(clipped.height.saturating_sub(2) as usize);
         self.render_menu_panel(frame, clipped, &menu.items, menu.selected, top, grad);
+        // A breadcrumb picker shows what has been typed on its top border.
+        if menu.crumb.is_some() && !self.crumb_filter.0.is_empty() {
+            let text = if menu.items.is_empty() {
+                format!(" No match: {} ", self.crumb_filter.0)
+            } else {
+                format!(" Filter: {} ", self.crumb_filter.0)
+            };
+            let room = clipped.width.saturating_sub(4) as usize;
+            let shown: String = text.chars().take(room).collect();
+            frame.buffer_mut().set_string(
+                clipped.x + 2,
+                clipped.y,
+                shown,
+                Style::default()
+                    .fg(self.theme.ui(Color::White))
+                    .bg(self.theme.ui(Color::Rgb(0x1e, 0x1e, 0x1e)))
+                    .add_modifier(Modifier::BOLD),
+            );
+        }
         // Float the open submenu's panel beside its parent.
         if let Some(sub_rect) = self.submenu_rect()
             && let Some(MenuEntry::Submenu { items, .. }) =
@@ -69682,6 +69740,37 @@ impl App {
     }
 
     fn handle_menu_key(&mut self, key: KeyEvent) {
+        // A breadcrumb picker filters as you type (the rows are a long list
+        // of symbols, files or folders): characters narrow it, Backspace
+        // widens it, Esc clears the text before it dismisses the picker.
+        if self
+            .context_menu
+            .as_ref()
+            .is_some_and(|m| m.crumb.is_some() && m.open_submenu.is_none())
+        {
+            match key.code {
+                KeyCode::Char(c)
+                    if !key.modifiers.intersects(
+                        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                    ) =>
+                {
+                    self.crumb_filter.0.push(c);
+                    self.apply_crumb_filter();
+                    return;
+                }
+                KeyCode::Backspace if !self.crumb_filter.0.is_empty() => {
+                    self.crumb_filter.0.pop();
+                    self.apply_crumb_filter();
+                    return;
+                }
+                KeyCode::Esc if !self.crumb_filter.0.is_empty() => {
+                    self.crumb_filter.0.clear();
+                    self.apply_crumb_filter();
+                    return;
+                }
+                _ => {}
+            }
+        }
         match key.code {
             KeyCode::Esc => {
                 // Esc backs out of an open submenu first; at the top level it
