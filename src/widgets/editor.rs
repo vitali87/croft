@@ -1438,6 +1438,50 @@ fn paint_intraline_range(
     }
 }
 
+/// Recolour one diff line drawn at `text_x` from char `skip`, `width` cells
+/// wide, in its syntax colours (#2020): each character takes its span's
+/// foreground and weight, and keeps the row's background, which is what
+/// marks it removed, added or unchanged. Cells follow display width, as
+/// [`clip_pad_cells`] lays them down.
+fn paint_diff_syntax(
+    buf: &mut Buffer,
+    text_x: u16,
+    y: u16,
+    width: u16,
+    text: &str,
+    skip: usize,
+    spans: &[HiSpan],
+) {
+    if spans.is_empty() || width == 0 {
+        return;
+    }
+    let mut cell = 0u16;
+    let mut next = 0;
+    for (i, (byte, c)) in text.char_indices().enumerate() {
+        // Spans arrive in order and do not overlap.
+        while spans.get(next).is_some_and(|s| s.range().end <= byte) {
+            next += 1;
+        }
+        if i < skip {
+            continue;
+        }
+        let w = char_cells(c) as u16;
+        if cell + w > width {
+            break;
+        }
+        if let Some(span) = spans.get(next).filter(|s| s.range().contains(&byte)) {
+            let style = Style {
+                bg: None,
+                ..span.style
+            };
+            for dx in 0..w {
+                buf[(text_x + cell + dx, y)].set_style(style);
+            }
+        }
+        cell += w;
+    }
+}
+
 /// Returns the hit-test rects of the prev / next change arrows painted
 /// in the diff header (in that order). Both are `Rect::default()` when
 /// the header was too narrow to allocate them.
@@ -1460,6 +1504,9 @@ fn render_diff(
     if inner.height < 3 || inner.width < 16 {
         return (Rect::default(), Rect::default());
     }
+    // A small diff colours in this frame; a large one paints plain now and
+    // takes its colours when `poll_highlights` lands them.
+    diff.colour_syntax(Some(HIGHLIGHT_INLINE_BUDGET));
     if diff.unified {
         return render_unified_deletion(diff, inner, buf, bg, theme);
     }
@@ -1664,6 +1711,17 @@ fn render_diff(
                 })
                 .bg(l_cell_bg),
         );
+        if let Some(i) = l_left_idx {
+            paint_diff_syntax(
+                buf,
+                l_text_x,
+                y,
+                l_text_w,
+                &l_text,
+                diff.scroll_x,
+                diff.syntax.left(i),
+            );
+        }
         // The changed characters of a replaced line (#1351), on both sides.
         let intraline = match row {
             DiffRow::Replaced { .. } => crate::widgets::diff::changed_char_ranges(&l_text, &r_text),
@@ -1750,6 +1808,17 @@ fn render_diff(
                 })
                 .bg(r_cell_bg),
         );
+        if let Some(i) = r_right_idx {
+            paint_diff_syntax(
+                buf,
+                r_text_x,
+                y,
+                r_text_w,
+                &r_text,
+                diff.scroll_x,
+                diff.syntax.right(i),
+            );
+        }
         if let Some((_, range)) = intraline {
             let (r, g, b) = crate::widgets::diff::INTRALINE_ADDED_BG;
             paint_intraline_range(
@@ -2206,6 +2275,17 @@ fn render_unified_deletion(
                 })
                 .bg(cell_bg),
         );
+        if let Some(i) = left_idx {
+            paint_diff_syntax(
+                buf,
+                text_x,
+                y,
+                text_w,
+                &text,
+                diff.scroll_x,
+                diff.syntax.left(i),
+            );
+        }
     }
 
     let visible_first = diff.scroll + 1;
@@ -3686,6 +3766,9 @@ pub struct Editor {
     /// lines at each indent level in a line's leading whitespace, with the
     /// cursor's block highlighted. App-synced from prefs; on by default.
     pub show_indent_guides: bool,
+    /// Home walks back one wrapped row per press on a continuation row's
+    /// start (`home_walks_wrapped_rows`, #1569). Off is VS Code's behaviour.
+    pub home_walks_rows: bool,
     /// Ruler columns (#1524, VS Code `editor.rulers`). App-synced from
     /// prefs; empty by default.
     pub rulers: Vec<u16>,
@@ -4129,6 +4212,7 @@ impl Editor {
             final_newline: false,
             decode_lossy: false,
             show_indent_guides: true,
+            home_walks_rows: false,
             rulers: Vec::new(),
             show_bracket_colors: true,
             bracket_colors: Vec::new(),
@@ -7555,6 +7639,10 @@ impl Editor {
         // A pass already running bakes the old palette's colors.
         self.highlight_job = None;
         self.recompute_highlights();
+        // A diff view's colours are baked the same way (#2020).
+        if let Some(diff) = self.diff.as_mut() {
+            diff.syntax.restart();
+        }
         // The markdown preview bakes the theme into its lines at build time
         // and rebuilds only when the buffer edits (`built_seq`), so a theme
         // switch must rebuild it here or it keeps the old colors until the
@@ -7817,6 +7905,16 @@ impl Editor {
     /// calls this every tick for every tab; true when the colors changed.
     pub fn poll_highlights(&mut self) -> bool {
         use std::sync::mpsc::TryRecvError;
+        // A diff view's colours land the same way (#2020). One whose pass
+        // waited for a free slot starts it once one frees.
+        if let Some(diff) = self.diff.as_mut() {
+            if diff.syntax.waiting() {
+                diff.colour_syntax(Some(std::time::Duration::ZERO));
+            }
+            if diff.syntax.poll() {
+                return true;
+            }
+        }
         let Some(job) = &self.highlight_job else {
             return false;
         };
@@ -15659,7 +15757,10 @@ impl Editor {
     /// non-whitespace character, or to its start when the caret is already
     /// there, so a second press toggles (#987). It used to always go to the
     /// start, before the indentation. With wrap on (#1569) it first goes to
-    /// the start of the wrapped row the caret is on.
+    /// the start of the wrapped row the caret is on. With
+    /// `home_walks_rows`, a caret already on a continuation row's start goes
+    /// to the start of the row above, one row per press, down to the line's
+    /// own stops.
     pub fn home_key(&mut self) {
         let line = &self.lines[self.cursor_row];
         let first = line
@@ -15672,11 +15773,25 @@ impl Editor {
             // space it sits on), so step back to its cluster's start.
             Some((start, _)) => match floor_grapheme_col(line, start) {
                 row_start if self.cursor_col > row_start && row_start > first => row_start,
+                _ if self.home_walks_rows && start > 0 && self.cursor_col == start => {
+                    self.wrapped_row_above(start).unwrap_or(smart)
+                }
                 _ => smart,
             },
             None => smart,
         };
         self.last_edit_kind = None;
+    }
+
+    /// Start of the wrapped row above the one that starts at `row_start`
+    /// (a char column of the caret's line), on a grapheme boundary. `None`
+    /// on the line's top row.
+    fn wrapped_row_above(&self, row_start: usize) -> Option<usize> {
+        let width = self.visible_text_width().max(1);
+        let segs = self.line_segments(self.cursor_row, width);
+        let idx = segs.iter().position(|&(s, _)| s == row_start)?;
+        let above = segs.get(idx.checked_sub(1)?)?.0;
+        Some(floor_grapheme_col(&self.lines[self.cursor_row], above))
     }
 
     /// The End key. With wrap on (#1569) it first goes to the end of the
@@ -22159,6 +22274,9 @@ pub struct EditorTabs {
     /// tab is the only one — closing it isn't allowed so we hide the X).
     tab_close_x: Vec<u16>,
     tab_strip_y: u16,
+    /// Scroll and button state of the tab strip, boxed to keep this large
+    /// struct (a layout-tree leaf) under clippy's size-difference limit.
+    tab_strip: Box<TabStripState>,
     /// The full pane area (tab strip + body) from the most recent render.
     /// Used by `App::handle_mouse` for hit-testing — the active editor's
     /// own `last_area` only covers the body below the strip.
@@ -22199,6 +22317,7 @@ impl EditorTabs {
             tab_screen_ranges: Vec::new(),
             tab_close_x: Vec::new(),
             tab_strip_y: 0,
+            tab_strip: Box::default(),
             last_full_area: Rect::default(),
             search_highlight_term: None,
             search_highlight_opts: crate::widgets::search::SearchOpts::default(),
@@ -22634,6 +22753,47 @@ impl EditorTabs {
             }
         }
         None
+    }
+
+    /// Whether `(col, row)` is on the tab strip row of this group, tabs or the
+    /// gap after them.
+    pub fn tab_strip_contains(&self, col: u16, row: u16) -> bool {
+        let r = self.last_full_area;
+        row == self.tab_strip_y && col >= r.x && col < r.x + r.width
+    }
+
+    /// Reserve `cells` at the strip's right end for what the app paints there.
+    pub fn set_tab_reserved_right(&mut self, cells: u16) {
+        self.tab_strip.reserved_right = cells;
+    }
+
+    /// Whether `(col, row)` is on the "all open tabs" button.
+    pub fn tab_list_button_at(&self, col: u16, row: u16) -> bool {
+        let r = self.tab_strip.list_button;
+        r.width > 0 && row == r.y && col >= r.x && col < r.x + r.width
+    }
+
+    /// A wheel notch over the strip: [`Self::scroll_tabs`], but at most one tab
+    /// per [`TAB_WHEEL_GAP`] in a direction. A touchpad sends dozens of events
+    /// per swipe, which would otherwise fling the strip to its end.
+    pub fn scroll_tabs_wheel(&mut self, delta: isize) {
+        let now = std::time::Instant::now();
+        if let Some((at, dir)) = self.tab_strip.wheel_at
+            && dir == delta
+            && now.duration_since(at) < TAB_WHEEL_GAP
+        {
+            return;
+        }
+        self.tab_strip.wheel_at = Some((now, delta));
+        self.scroll_tabs(delta);
+    }
+
+    /// Scroll the tab strip by `delta` tabs (the wheel over it). The render
+    /// clamps the result to what still fills the strip.
+    pub fn scroll_tabs(&mut self, delta: isize) {
+        let last = self.editors.len().saturating_sub(1);
+        self.tab_strip.scroll = self.tab_strip.scroll.saturating_add_signed(delta).min(last);
+        self.tab_strip.revealed = Some((self.active, self.editors.len()));
     }
 
     /// Full filesystem path for a tab, used as the hover tooltip that
@@ -23448,6 +23608,32 @@ impl DerefMut for EditorTabs {
 // derives colors for every manifest theme, so the strip follows the selected
 // theme instead of staying VS-Code navy. Only the label foregrounds stay
 // fixed: this muted grey and white are legible on all dark themes.
+/// The tab strip's scroll position and button, see `EditorTabs::tab_strip`.
+#[derive(Default)]
+struct TabStripState {
+    /// Index of the first tab drawn in the strip: it scrolls by tab when
+    /// there are more of them than fit (wheel over the strip, or the active
+    /// tab changing).
+    scroll: usize,
+    /// The `(active, tab count)` the strip last scrolled itself to reveal, so
+    /// a wheel scroll away from the active tab is not undone on the next
+    /// frame.
+    revealed: Option<(usize, usize)>,
+    /// Cells at the strip's right end the app paints over (the Customize
+    /// Layout icons); tabs stop short of them. Set before each render.
+    reserved_right: u16,
+    /// The "all open tabs" button at the right end of the tab area, drawn
+    /// only when the tabs do not all fit (otherwise empty).
+    list_button: Rect,
+    /// When and which way the wheel last moved the strip, so a touchpad's
+    /// flood of events moves it a tab at a time rather than all at once.
+    wheel_at: Option<(std::time::Instant, isize)>,
+}
+
+/// Cells the "all open tabs" button takes at the right end of a crowded strip.
+const TAB_LIST_W: u16 = 3;
+/// The least time between two tabs of wheel scrolling in one direction.
+const TAB_WHEEL_GAP: std::time::Duration = std::time::Duration::from_millis(90);
 const TAB_INACTIVE_FG: Color = Color::Rgb(0x9d, 0xa5, 0xb4);
 const TAB_ACTIVE_FG: Color = Color::White;
 
@@ -23530,7 +23716,6 @@ impl Widget for &mut EditorTabs {
         self.tab_strip_y = strip.y;
         self.tab_screen_ranges.clear();
         self.tab_close_x.clear();
-        let mut cursor_x = strip.x;
         let active = self.active;
         // Black theme (`focus_gradient` doubles as the theme flag): the
         // active tab wears the muted teal selection fill instead of the
@@ -23547,18 +23732,85 @@ impl Widget for &mut EditorTabs {
         let active_tab_bg = theme.tab_active_bg();
         let pointer = self.hover_pointer;
         let display_labels = disambiguated_tab_labels(&self.editors);
+        // Tabs never run under what the app paints at the strip's right end,
+        // and the strip scrolls by tab when they do not all fit.
+        let mut strip_right = strip.x
+            + strip
+                .width
+                .saturating_sub(self.tab_strip.reserved_right.min(strip.width));
+        let avail_full = usize::from(strip_right.saturating_sub(strip.x));
+        let widths: Vec<usize> = display_labels
+            .iter()
+            .map(|l| {
+                // Display CELLS, not chars (#168 review): a CJK file or
+                // directory name is double-width, and a char count shifted
+                // the close button and hit ranges left of the painted text.
+                usize::from(Span::raw(l.as_str()).width() as u16) + 4 // a pad either side, the close cell and a gap
+            })
+            .collect();
+        let n = widths.len();
+        // Tabs that do not all fit get an "all open tabs" button in the last
+        // cells of the tab area, so the hidden ones stay reachable.
+        self.tab_strip.list_button = Rect::default();
+        if widths.iter().sum::<usize>() > avail_full && avail_full > usize::from(TAB_LIST_W) {
+            strip_right -= TAB_LIST_W;
+            self.tab_strip.list_button = Rect {
+                x: strip_right,
+                y: strip.y,
+                width: TAB_LIST_W,
+                height: 1,
+            };
+            let hovered = self.hover_pointer.is_some_and(|(px, py)| {
+                py == strip.y && px >= strip_right && px < strip_right + TAB_LIST_W
+            });
+            // As the layout icons beside it: the glyph goes from grey to the
+            // accent on hover, the cell keeps the strip's own background.
+            let fg = if hovered {
+                theme.ui(Color::Rgb(0x4e, 0x9a, 0xff))
+            } else {
+                theme.ui(Color::Rgb(0xcc, 0xcc, 0xcc))
+            };
+            let style = Style::default().fg(fg).bg(theme.tab_strip_bg());
+            buf.set_string(strip_right, strip.y, " \u{2261} ", style);
+        }
+        let avail = usize::from(strip_right.saturating_sub(strip.x));
+        // Last scroll that still fills the strip: past it the tail would leave
+        // blank room on the right while earlier tabs stay hidden.
+        let max_scroll = {
+            let mut first = n.saturating_sub(1);
+            let mut used = widths.get(first).copied().unwrap_or(0);
+            while first > 0 && used + widths[first - 1] <= avail {
+                first -= 1;
+                used += widths[first];
+            }
+            first
+        };
+        if self.tab_strip.revealed != Some((active, n)) {
+            self.tab_strip.revealed = Some((active, n));
+            if active < self.tab_strip.scroll {
+                self.tab_strip.scroll = active;
+            } else {
+                // Scroll right just far enough that the active tab fits whole.
+                while self.tab_strip.scroll < active
+                    && widths[self.tab_strip.scroll..=active].iter().sum::<usize>() > avail
+                {
+                    self.tab_strip.scroll += 1;
+                }
+            }
+        }
+        self.tab_strip.scroll = self.tab_strip.scroll.min(max_scroll);
+        let mut cursor_x = strip.x;
+        let mut hidden_rest = false;
         for (i, ed) in self.editors.iter().enumerate() {
             let label_text = display_labels[i].clone();
-            // Display CELLS, not chars (#168 review): a CJK file or
-            // directory name is double-width, and a char count shifted
-            // the close button and hit ranges left of the painted text.
             let label_chars = Span::raw(label_text.as_str()).width() as u16;
-            let pad: u16 = 1;
-            let close_pad: u16 = 2;
-            let width = label_chars
-                .saturating_add(pad * 2)
-                .saturating_add(close_pad);
-            if cursor_x.saturating_add(width) > strip.x + strip.width {
+            let width = widths[i] as u16;
+            if i < self.tab_strip.scroll
+                || hidden_rest
+                || usize::from(cursor_x.saturating_add(width)) > usize::from(strip_right)
+            {
+                // Scrolled off, or past the room: no cells, no hit range.
+                hidden_rest |= i >= self.tab_strip.scroll;
                 self.tab_screen_ranges.push((cursor_x, 0));
                 self.tab_close_x.push(0);
                 continue;
@@ -32381,6 +32633,65 @@ mod tests {
         );
     }
 
+    /// #1569: with `home_walks_rows`, Home on a continuation row's start goes
+    /// to the start of the row above, one row per press, and off it keeps
+    /// VS Code's jump to the line's own stops.
+    #[test]
+    fn home_walks_back_one_wrapped_row_per_press_when_asked() {
+        let (mut e, segs) = wrapped_paragraph(true);
+        e.home_walks_rows = true;
+        e.cursor_col = segs[2].0 + 5;
+        e.home_key();
+        assert_eq!(e.cursor_col, segs[2].0, "the start of row 3: {segs:?}");
+        e.home_key();
+        assert_eq!(e.cursor_col, segs[1].0, "the start of row 2: {segs:?}");
+        e.home_key();
+        assert_eq!(e.cursor_col, segs[0].0, "the start of row 1: {segs:?}");
+        e.home_key();
+        assert_eq!(e.cursor_col, 0, "the line starts at column 0, so it stays");
+        // Off: from a row's start straight to the line's start.
+        let (mut e, segs) = wrapped_paragraph(true);
+        e.cursor_col = segs[2].0;
+        e.home_key();
+        assert_eq!(e.cursor_col, 0, "not the row above: {segs:?}");
+    }
+
+    /// #1569: on an indented line the walk ends at the line's own stops: the
+    /// first non-blank, then column 0, then back.
+    #[test]
+    fn home_walk_ends_at_the_indentation_stops() {
+        let text = format!("    {}", "word ".repeat(40));
+        let mut e = editor_with(&text);
+        e.wrap_override = Some(true);
+        e.home_walks_rows = true;
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 60,
+            height: 20,
+        };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        (&mut e as &mut Editor).render(area, &mut buf);
+        let segs = e.line_segments(0, e.visible_text_width().max(1));
+        assert!(segs.len() > 2, "the line wraps: {segs:?}");
+        let (row_start, row_end) = segs[1];
+        let chars: Vec<char> = e.lines[0].chars().collect();
+        let word = (row_start + 1..row_end)
+            .rfind(|&i| !chars[i].is_whitespace() && chars[i - 1].is_whitespace())
+            .expect("a word starts inside row 2");
+        e.cursor_col = word + 2;
+        e.home_key();
+        assert_eq!(e.cursor_col, row_start, "the start of row 2: {segs:?}");
+        e.home_key();
+        assert_eq!(e.cursor_col, segs[0].0, "the start of row 1: {segs:?}");
+        e.home_key();
+        assert_eq!(e.cursor_col, 4, "the line's first non-blank");
+        e.home_key();
+        assert_eq!(e.cursor_col, 0, "column 0");
+        e.home_key();
+        assert_eq!(e.cursor_col, 4);
+    }
+
     /// #1569: a wrapped row can begin on a combining mark (the row before
     /// broke after the space it combines with); Home must not leave the caret
     /// inside that cluster.
@@ -35541,6 +35852,58 @@ mod tests {
     }
 
     #[test]
+    fn a_crowded_tab_strip_scrolls_and_stops_short_of_the_layout_icons() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut tabs = EditorTabs::new();
+        for i in 0..12 {
+            let f = tmp.path().join(format!("file_{i:02}.txt"));
+            std::fs::write(&f, "x\n").unwrap();
+            tabs.open_pinned(&f).unwrap();
+        }
+        let area = Rect::new(0, 0, 60, 10);
+        let strip_right = 60 - 9;
+        let draw = |tabs: &mut EditorTabs| {
+            tabs.set_tab_reserved_right(9);
+            let mut buf = ratatui::buffer::Buffer::empty(area);
+            ratatui::widgets::Widget::render(&mut *tabs, area, &mut buf);
+        };
+        let visible = |tabs: &EditorTabs| -> Vec<usize> {
+            (0..12)
+                .filter(|&i| tabs.tab_screen_x(i).is_some_and(|(_, w)| w > 0))
+                .collect()
+        };
+        draw(&mut tabs);
+        // The last tab is active, so the strip has scrolled to show it whole,
+        // and nothing reaches the cells the layout icons own.
+        let vis = visible(&tabs);
+        assert!(vis.contains(&11), "the active tab is on screen: {vis:?}");
+        assert!(vis.len() < 12, "not every tab fits");
+        for &i in &vis {
+            let (x, w) = tabs.tab_screen_x(i).unwrap();
+            assert!(x + w <= strip_right, "tab {i} runs under the icons");
+        }
+        // The wheel brings earlier tabs back without activating anything.
+        for _ in 0..12 {
+            tabs.scroll_tabs(-1);
+        }
+        draw(&mut tabs);
+        let vis = visible(&tabs);
+        assert_eq!(vis.first(), Some(&0), "scrolled back to the first tab");
+        assert!(
+            !vis.contains(&11),
+            "the scroll is not snapped back: {vis:?}"
+        );
+        assert_eq!(tabs.active_index(), 11);
+        // Picking another tab reveals it again.
+        tabs.select(0);
+        draw(&mut tabs);
+        assert!(visible(&tabs).contains(&0));
+        tabs.select(11);
+        draw(&mut tabs);
+        assert!(visible(&tabs).contains(&11));
+    }
+
+    #[test]
     fn cursor_screen_pos_inside_viewport() {
         let mut e = editor_with("hello\nworld");
         e.last_inner = Rect {
@@ -36411,6 +36774,78 @@ mod tests {
         assert_eq!(
             buf[(inner.x + inner.width / 2, changed)].symbol(),
             "\u{2502}"
+        );
+    }
+
+    /// #2020: the diff view paints code in its language's colours, on the
+    /// rows' red, green and plain backgrounds, as the editor does.
+    #[test]
+    fn the_diff_view_paints_code_in_its_syntax_colours() {
+        let file = |text: &str| {
+            let f = tempfile::Builder::new().suffix(".rs").tempfile().unwrap();
+            std::fs::write(f.path(), text).unwrap();
+            f
+        };
+        let f1 = file("fn main() {\n    let x = 1;\n}\n");
+        let f2 = file("fn main() {\n    let x = 2;\n}\n");
+        let mut t = EditorTabs::new();
+        t.open_diff(f1.path(), f2.path()).unwrap();
+        let idx = t.active_index();
+        t.editors[idx].diff.as_mut().unwrap().colour_syntax(None);
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 10,
+        };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut t.editors[idx], area, &mut buf);
+        let ed = &t.editors[idx];
+        let inner = ed.last_inner;
+        let (l_text_x, unchanged) = left_text_at(&buf, inner, 3, "fn main() {");
+        assert_ne!(
+            buf[(l_text_x, unchanged)].fg,
+            buf[(l_text_x + 3, unchanged)].fg,
+            "the keyword `fn` and the name `main` read in different colours"
+        );
+        let (_, changed) = left_text_at(&buf, inner, 3, "    let x = 1;");
+        let r_text_x = inner.x + inner.width / 2 + 1 + 2 + 2;
+        assert_eq!(
+            row_text(&buf, changed, r_text_x, r_text_x + 14),
+            "    let x = 2;"
+        );
+        let removed_bg = ed.theme.ui(Color::Rgb(0x4a, 0x1f, 0x1f));
+        let added_bg = ed.theme.ui(Color::Rgb(0x1f, 0x42, 0x2a));
+        for (x, bg, side) in [
+            (l_text_x, removed_bg, "removed"),
+            (r_text_x, added_bg, "added"),
+        ] {
+            let keyword = &buf[(x + 4, changed)];
+            let name = &buf[(x + 8, changed)];
+            assert_eq!(keyword.symbol(), "l");
+            assert_ne!(
+                keyword.fg, name.fg,
+                "`let` and `x` differ on the {side} side"
+            );
+            assert_eq!(keyword.bg, bg, "the {side} row keeps its background");
+            assert_eq!(name.bg, bg);
+        }
+    }
+
+    /// A file with no grammar keeps the diff's own tints: red text on the
+    /// removed side, green on the added.
+    #[test]
+    fn a_diff_with_no_grammar_keeps_its_red_and_green_text() {
+        let (buf, inner, r_text_x) = render_wide_diff("x\nold line\n", "x\nnew line\n");
+        let (l_text_x, y) = left_text_at(&buf, inner, 2, "old line");
+        let theme = crate::theme::Theme::default();
+        assert_eq!(
+            buf[(l_text_x, y)].fg,
+            theme.ui(Color::Rgb(0xff, 0xb3, 0xb3))
+        );
+        assert_eq!(
+            buf[(r_text_x, y)].fg,
+            theme.ui(Color::Rgb(0xb6, 0xee, 0xc4))
         );
     }
 

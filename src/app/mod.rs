@@ -270,6 +270,9 @@ const SECONDARY_SIDEBAR_WIDTH: u16 = 30;
 /// it), and stays within the single top row (no overlap with editor content).
 const LAYOUT_ICON_CELLS_W: u16 = 2;
 const LAYOUT_ICON_CELLS_H: u16 = 1;
+/// Cells the three layout icons take at the right end of the top row: three
+/// icons, a one-column gap after the first two and a one-column right pad.
+const LAYOUT_ICONS_W: u16 = (LAYOUT_ICON_CELLS_W + 1) * 3;
 
 /// Which edge the primary side bar (and the activity bar that flanks it) dock
 /// to. VS Code's "Primary Side Bar Position". Persisted via `crate::prefs`.
@@ -3799,6 +3802,8 @@ pub struct App {
     /// Indentation guides (#129), VS Code `editor.guides.indentation`: on by
     /// default, pushed to every editor by the per-frame focus sync.
     indent_guides_enabled: bool,
+    /// Home walks back one wrapped row per press (`home_walks_wrapped_rows`).
+    home_walks_rows: bool,
     /// Bracket-pair colorization (#131): on by default, pushed to every
     /// editor by the per-frame focus sync like the indent guides.
     bracket_colors_enabled: bool,
@@ -6918,6 +6923,7 @@ impl App {
             inline_blame_enabled: !loaded_prefs.disable_inline_blame,
             provenance_overlay: false,
             indent_guides_enabled: !loaded_prefs.disable_indent_guides,
+            home_walks_rows: loaded_prefs.home_walks_wrapped_rows,
             bracket_colors_enabled: !loaded_prefs.disable_bracket_colors,
             whitespace_mode: crate::widgets::editor::WhitespaceMode::from_pref(
                 &loaded_prefs.render_whitespace,
@@ -11172,6 +11178,9 @@ impl App {
         }
         if rect_contains(icons.customize, col, row) {
             return Some("Customize Layout");
+        }
+        if self.editor.tab_list_button_at(col, row) {
+            return Some("Show All Open Tabs");
         }
         // Activity bar: always visible, so it is checked regardless of which
         // sidebar view is open.
@@ -18513,7 +18522,7 @@ impl App {
         let w = LAYOUT_ICON_CELLS_W;
         let stride = w + 1; // one-column gap between icons
         // Three icons + a one-column right pad.
-        let needed = stride * 3;
+        let needed = LAYOUT_ICONS_W;
         if row.height == 0 || row.width < needed {
             return;
         }
@@ -21586,6 +21595,7 @@ impl App {
             ed.pdf_viewer_enabled = pdf_on;
             ed.csv_viewer_enabled = csv_on;
             ed.show_indent_guides = self.indent_guides_enabled;
+            ed.home_walks_rows = self.home_walks_rows;
             ed.show_bracket_colors = self.bracket_colors_enabled;
             ed.provenance_overlay = self.provenance_overlay;
             ed.whitespace_mode = whitespace_mode_in(langs, ws_global, editor_scope_id(ed));
@@ -21600,6 +21610,7 @@ impl App {
                 ed.pdf_viewer_enabled = pdf_on;
                 ed.csv_viewer_enabled = csv_on;
                 ed.show_indent_guides = self.indent_guides_enabled;
+                ed.home_walks_rows = self.home_walks_rows;
                 ed.show_bracket_colors = self.bracket_colors_enabled;
                 ed.provenance_overlay = self.provenance_overlay;
                 ed.whitespace_mode = whitespace_mode_in(langs, ws_global, editor_scope_id(ed));
@@ -22879,6 +22890,20 @@ impl App {
             // Lay the leaves out and paint each at its rect (depth-first order),
             // reporting the active group's rect so popups anchor there.
             let rects = self.editor_layout.leaf_rects(editor_area, EDITOR_SPLIT_MIN);
+            // The layout icons sit over the right end of the editor area's top
+            // row; any group's tab strip that reaches it stops short of them.
+            let icons_left = if editor_area.width >= LAYOUT_ICONS_W {
+                editor_area.x + editor_area.width - LAYOUT_ICONS_W
+            } else {
+                u16::MAX
+            };
+            let reserve = |r: Rect| -> u16 {
+                if r.y == editor_area.y {
+                    (r.x + r.width).saturating_sub(icons_left).min(r.width)
+                } else {
+                    0
+                }
+            };
             if self.scrubber.is_some() && self.scrub_for != self.editor.path {
                 self.rebuild_scrub_view();
             }
@@ -22897,6 +22922,7 @@ impl App {
                     rects[active_idx] = ed_rect;
                 }
                 let active_area = rects[active_idx];
+                self.editor.set_tab_reserved_right(reserve(active_area));
                 frame.render_widget(&mut self.editor, active_area);
                 let inactive_rects: Vec<Rect> = rects
                     .iter()
@@ -22911,6 +22937,7 @@ impl App {
                     .zip(inactive_rects)
                 {
                     group.hover_pointer = pointer;
+                    group.set_tab_reserved_right(reserve(rect));
                     frame.render_widget(group, rect);
                 }
                 // Every boundary in the grid is a draggable seam (one per
@@ -22938,6 +22965,7 @@ impl App {
                         .style(Style::default().bg(self.theme.editor_bg())),
                     full_strip,
                 );
+                self.editor.set_tab_reserved_right(reserve(ed_rect));
                 frame.render_widget(&mut self.editor, ed_rect);
                 self.editor_seams.clear();
                 self.update_editor_image_overlay(0, ed_rect);
@@ -22945,6 +22973,7 @@ impl App {
                 self.paint_minimap(frame, img_rect);
                 ed_rect
             } else {
+                self.editor.set_tab_reserved_right(reserve(editor_area));
                 frame.render_widget(&mut self.editor, editor_area);
                 self.editor_seams.clear();
                 self.update_editor_image_overlay(0, editor_area);
@@ -42956,6 +42985,26 @@ impl App {
         )
     }
 
+    /// The "all open tabs" list: every tab of the active group by its strip
+    /// label, the current one selected. Picking one activates it, scrolling the
+    /// strip to it.
+    fn open_tab_picker(&mut self) {
+        use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+        let rows: Vec<ListRow> = self
+            .editor
+            .tab_display_labels()
+            .into_iter()
+            .enumerate()
+            .map(|(i, label)| ListRow {
+                id: i.to_string(),
+                label,
+            })
+            .collect();
+        let mut picker = ListPicker::new(ListPurpose::OpenTab, "Open Tabs", rows);
+        picker.selected = self.editor.active_index();
+        self.open_list_picker(picker, "No open tabs");
+    }
+
     /// Act on the row chosen in the list picker.
     fn confirm_list_picker(&mut self) {
         use crate::widgets::list_picker::ListPurpose;
@@ -43348,6 +43397,13 @@ impl App {
                 }
             }
             ListPurpose::NotebookKernel => self.choose_notebook_kernel(&row.id),
+            ListPurpose::OpenTab => {
+                if self.editor.select(index) {
+                    self.sync_open_file_poll_mtime();
+                }
+                self.focus_pane(Pane::Editor);
+                self.poke_cursor();
+            }
             ListPurpose::HttpEnvironment => {
                 self.status = if row.id.is_empty() {
                     String::from("HTTP: no environment")
@@ -62246,6 +62302,28 @@ impl App {
         if self.pending_terminal_paste.is_some() {
             return;
         }
+        // The wheel over an editor group's tab strip scrolls its tabs.
+        if let Some(delta) = match m.kind {
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollLeft => Some(-1),
+            MouseEventKind::ScrollDown | MouseEventKind::ScrollRight => Some(1),
+            _ => None,
+        } && !self.modal_overlay_open()
+            && self.context_menu.is_none()
+        {
+            let mut scrolled = false;
+            for g in
+                std::iter::once(&mut self.editor).chain(self.editor_layout.inactive_groups_mut())
+            {
+                if g.tab_strip_contains(m.column, m.row) {
+                    g.scroll_tabs_wheel(delta);
+                    scrolled = true;
+                    break;
+                }
+            }
+            if scrolled {
+                return;
+            }
+        }
         // A click on the port-detection toast's action buttons is consumed
         // before anything else; clicks elsewhere fall through to normal
         // handling, so the toast never blocks the rest of the UI.
@@ -64577,6 +64655,9 @@ impl App {
                             self.go_to_definition(path, line, col);
                         }
                         self.poke_cursor();
+                    } else if self.editor.tab_list_button_at(m.column, m.row) {
+                        self.focus_pane(Pane::Editor);
+                        self.open_tab_picker();
                     } else if let Some(idx) = self.editor.close_at(m.column, m.row) {
                         // The close cell of a pinned tab is an unpin button (it
                         // shows a thumb-tack, not the close cross), matching VS
@@ -68759,6 +68840,7 @@ impl App {
         self.editor.blame_enabled = self.inline_blame_enabled;
         self.indent_guides_enabled = !p.disable_indent_guides;
         self.editor.show_indent_guides = self.indent_guides_enabled;
+        self.home_walks_rows = p.home_walks_wrapped_rows;
         self.bracket_colors_enabled = !p.disable_bracket_colors;
         self.editor.show_bracket_colors = self.bracket_colors_enabled;
         self.whitespace_mode =
@@ -68766,14 +68848,17 @@ impl App {
         self.editor.whitespace_mode = self.whitespace_mode;
         self.rulers = crate::widgets::editor::normalize_rulers(&p.rulers);
         // Straight onto every open editor: the focus sync that otherwise
-        // carries it does not run per frame, so a reload would leave open
-        // tabs on the old rulers until an unrelated focus change.
+        // carries them does not run per frame, so a reload would leave open
+        // tabs on the old rulers and Home walk until an unrelated focus
+        // change.
         for ed in self.editor.editors.iter_mut() {
             ed.rulers.clone_from(&self.rulers);
+            ed.home_walks_rows = self.home_walks_rows;
         }
         for group in self.editor_layout.inactive_groups_mut() {
             for ed in group.editors.iter_mut() {
                 ed.rulers.clone_from(&self.rulers);
+                ed.home_walks_rows = self.home_walks_rows;
             }
         }
         self.line_numbers = crate::widgets::editor::LineNumbers::from_pref(&p.line_numbers);
