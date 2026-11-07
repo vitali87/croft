@@ -41,8 +41,16 @@ pub struct SessionState {
     pub sidebar_width: u16,
     pub terminal_height: Option<u16>,
     pub focus_editor: bool,
+    /// Every file's bookmarks (1-based lines), the closed files' included,
+    /// so a file's marks come back when it is opened again.
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub bookmarks: std::collections::HashMap<PathBuf, std::collections::BTreeSet<usize>>,
+    /// What each bookmarked line read when the session was saved, by file
+    /// and line, so marks on a file changed since come back on their text
+    /// (see [`SessionState::relocate_bookmarks_on_disk`]).
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub bookmark_text:
+        std::collections::HashMap<PathBuf, std::collections::BTreeMap<usize, String>>,
 }
 
 impl SessionState {
@@ -56,6 +64,94 @@ impl SessionState {
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         serde_json::from_str(&json).context("parsing session state")
     }
+
+    /// Put each bookmark back on its line's text in the file as it is on
+    /// disk now. A file saved over since the session was (before a crash,
+    /// or by another tool) has moved its lines, and its old numbers would
+    /// mark other text. A mark whose line still reads the same stays; one
+    /// whose line changed goes to the nearest line that reads what it did,
+    /// and stays on its number when no line does. Reads the marked files,
+    /// so it runs off the UI thread.
+    pub fn relocate_bookmarks_on_disk(&mut self) {
+        for (path, text) in &self.bookmark_text {
+            let Some(set) = self.bookmarks.get_mut(path) else {
+                continue;
+            };
+            let Ok(bytes) = std::fs::read(path) else {
+                continue;
+            };
+            // A byte-order mark names a UTF-16 file's encoding; anything
+            // else reads as UTF-8, and a line that does not decode the same
+            // simply matches nothing.
+            let encoding = encoding_rs::Encoding::for_bom(&bytes)
+                .map_or(encoding_rs::UTF_8, |(encoding, _)| encoding);
+            let (decoded, _, _) = encoding.decode(&bytes);
+            let lines: Vec<&str> = decoded.lines().collect();
+            *set = relocate_marks(set, text, &lines);
+        }
+    }
+
+    /// Whether this session was saved for the workspace at `root`.
+    pub fn is_of(&self, root: &Path) -> bool {
+        crate::hot_exit::canonical(&self.workspace_root) == crate::hot_exit::canonical(root)
+    }
+
+    /// What a clean exit keeps for the next launch: the files open, where
+    /// their carets were, the layout and the bookmarks, but no unsaved text.
+    /// That is hot exit's to keep (#862): a copy here would come back over
+    /// a later save, or a later discard, after a crash.
+    pub fn without_unsaved_text(mut self) -> Self {
+        let active = self.tabs.get(self.active_tab).and_then(|t| t.path.clone());
+        // A tab with no file has nothing to reopen, and a path that is not
+        // UTF-8 cannot be written as JSON: one would fail the whole save.
+        self.tabs
+            .retain(|t| t.path.as_deref().and_then(Path::to_str).is_some());
+        for tab in &mut self.tabs {
+            tab.dirty = false;
+            tab.unsaved_text = None;
+            tab.sheet_cells.clear();
+        }
+        self.active_tab = active
+            .and_then(|p| self.tabs.iter().position(|t| t.path.as_ref() == Some(&p)))
+            .unwrap_or(0);
+        self
+    }
+}
+
+/// `marks` (1-based lines) moved onto `lines` by the text each read when
+/// it was set (`text`): kept where its line still reads the same, else on
+/// the nearest line that does, else on its number. A blank line is no
+/// anchor, since any blank line would match it.
+fn relocate_marks(
+    marks: &std::collections::BTreeSet<usize>,
+    text: &std::collections::BTreeMap<usize, String>,
+    lines: &[&str],
+) -> std::collections::BTreeSet<usize> {
+    let reads = |line: usize, want: &str| {
+        line.checked_sub(1)
+            .and_then(|i| lines.get(i))
+            .is_some_and(|l| l.trim_end() == want)
+    };
+    marks
+        .iter()
+        .map(|&mark| {
+            let Some(want) = text
+                .get(&mark)
+                .map(|t| t.trim_end())
+                .filter(|t| !t.trim().is_empty())
+            else {
+                return mark;
+            };
+            if reads(mark, want) {
+                return mark;
+            }
+            (1..=lines.len().max(mark))
+                .flat_map(|d| [mark.checked_sub(d), Some(mark + d)])
+                .flatten()
+                .find(|&line| reads(line, want))
+                .unwrap_or(mark)
+        })
+        .collect()
 }
 
 /// Write `bytes` to `path` owner-only and written aside, then renamed over:
@@ -90,6 +186,14 @@ pub(crate) fn write_private_atomically(path: &Path, bytes: &[u8]) -> Result<()> 
         let _ = std::fs::remove_file(&tmp);
         anyhow::Error::new(e).context(format!("writing {}", path.display()))
     })
+}
+
+/// Where the session saved at a clean exit is kept for the workspace at
+/// `root`: one file per workspace under `dir`, named like its hot-exit
+/// folder (a digest of the canonical root), so a launch from any directory
+/// finds its own and two workspaces never share one.
+pub fn saved_path(dir: &Path, root: &Path) -> PathBuf {
+    crate::hot_exit::workspace_dir(dir, root).with_extension("json")
 }
 
 /// Per-pid scratch path for the session handoff file. Pid-scoping keeps
@@ -143,6 +247,59 @@ pub(crate) fn dirs_cache_croft() -> PathBuf {
 mod tests {
     use super::*;
 
+    fn marks(lines: &[usize]) -> std::collections::BTreeSet<usize> {
+        lines.iter().copied().collect()
+    }
+
+    fn text(pairs: &[(usize, &str)]) -> std::collections::BTreeMap<usize, String> {
+        pairs.iter().map(|&(l, t)| (l, t.to_string())).collect()
+    }
+
+    #[test]
+    fn a_mark_whose_line_reads_the_same_stays() {
+        let lines = ["a", "b", "c"];
+        assert_eq!(
+            relocate_marks(&marks(&[2]), &text(&[(2, "b")]), &lines),
+            marks(&[2])
+        );
+    }
+
+    #[test]
+    fn a_mark_moves_to_the_nearest_line_that_reads_what_its_did() {
+        // "b" moved down two lines, and another "b" sits further away.
+        let lines = ["x", "y", "a", "b", "c", "d", "e", "b"];
+        assert_eq!(
+            relocate_marks(&marks(&[2]), &text(&[(2, "b")]), &lines),
+            marks(&[4])
+        );
+        // Moved up, past the end of the file it now has.
+        let lines = ["b"];
+        assert_eq!(
+            relocate_marks(&marks(&[3]), &text(&[(3, "b")]), &lines),
+            marks(&[1])
+        );
+    }
+
+    #[test]
+    fn a_mark_with_no_line_reading_its_text_or_a_blank_one_keeps_its_number() {
+        let lines = ["a", "", "c"];
+        assert_eq!(
+            relocate_marks(&marks(&[2]), &text(&[(2, "gone")]), &lines),
+            marks(&[2])
+        );
+        let lines = ["", "a", ""];
+        assert_eq!(
+            relocate_marks(&marks(&[2]), &text(&[(2, "  ")]), &lines),
+            marks(&[2]),
+            "a blank line is no anchor"
+        );
+        assert_eq!(
+            relocate_marks(&marks(&[2]), &text(&[]), &lines),
+            marks(&[2]),
+            "a mark saved without its text"
+        );
+    }
+
     #[test]
     fn round_trips_through_disk() {
         let dir = std::env::temp_dir().join(format!("croft-session-test-{}", std::process::id()));
@@ -177,6 +334,7 @@ mod tests {
             terminal_height: Some(14),
             focus_editor: true,
             bookmarks: Default::default(),
+            bookmark_text: Default::default(),
         };
         state.save(&path).expect("save");
         let loaded = SessionState::load(&path).expect("load");
@@ -215,6 +373,7 @@ mod tests {
             terminal_height: None,
             focus_editor: true,
             bookmarks: Default::default(),
+            bookmark_text: Default::default(),
         };
         let json = serde_json::to_string(&state).expect("serialize");
         assert!(

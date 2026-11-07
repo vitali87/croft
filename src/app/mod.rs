@@ -4747,6 +4747,22 @@ pub struct App {
     /// the user must still hear after croft has gone: a hot-exit backup a
     /// quit could not remove (#862).
     exit_notes: Vec<String>,
+    /// Where each clean exit saves the session for the next launch, one
+    /// file per workspace (`~/.local/state/croft/sessions`, see
+    /// [`crate::session_state::saved_path`]). `None` saves none, as under
+    /// test unless a test points it at a tempdir.
+    pub session_dir: Option<PathBuf>,
+    /// The saved session being read off the UI thread once the first frame
+    /// is up, and whether its tabs may come back (hot exit brought none) or
+    /// only its bookmarks.
+    saved_session: Option<(
+        std::sync::mpsc::Receiver<crate::session_state::SessionState>,
+        bool,
+    )>,
+    /// The bookmarks of files no tab holds marks for any more, on their
+    /// saved lines: what the last tab holding them left when it closed
+    /// (see [`Self::settle_bookmarks`]).
+    closed_bookmarks: std::collections::HashMap<PathBuf, std::collections::BTreeSet<usize>>,
     /// The tasks backing the open Run Task picker; the picker row `id`
     /// indexes into this list.
     run_tasks: Vec<crate::tasks::Task>,
@@ -7368,6 +7384,9 @@ impl App {
             hot_exit_consumed: Vec::new(),
             hot_exit_unremoved: Vec::new(),
             exit_notes: Vec::new(),
+            session_dir: data_dir.as_deref().map(|dir| dir.join("sessions")),
+            saved_session: None,
+            closed_bookmarks: std::collections::HashMap::new(),
             run_tasks: Vec::new(),
             last_task: None,
             pending_terminal_warning: false,
@@ -9222,7 +9241,14 @@ impl App {
     /// it can re-Show the caret after the OSC-1337 image emit only when the
     /// editor would have shown it this frame.
     fn cursor_should_be_visible(&self) -> bool {
-        if self.context_menu.is_some() || self.prompt.is_some() || !self.cursor_visible_phase() {
+        // A list picker (View Bookmarks, Quick Fix, ...) is the thing being
+        // typed into; the editor's caret behind it would only point at text it
+        // is not about to edit.
+        if self.context_menu.is_some()
+            || self.prompt.is_some()
+            || self.list_picker.is_some()
+            || !self.cursor_visible_phase()
+        {
             return false;
         }
         let editor_caret = if self.editor.diff.is_some() {
@@ -22465,6 +22491,8 @@ impl App {
         if !self.editor_layout.is_split() || !self.editor.is_blank_initial() {
             return;
         }
+        // The marks its last tab left go before the group does.
+        self.settle_bookmarks();
         // The focused group is empty; drop it and promote a surviving group to
         // become the new active editor. Evict the right slot's image so it
         // can't ghost after the column disappears.
@@ -24412,6 +24440,7 @@ impl App {
         if self.focus == Pane::Editor
             && self.context_menu.is_none()
             && self.prompt.is_none()
+            && self.list_picker.is_none()
             && self.cursor_visible_phase()
         {
             let pos = if self.editor.diff.is_some() {
@@ -48501,31 +48530,130 @@ impl App {
             sidebar_width: self.sidebar_width,
             terminal_height: self.terminal_height,
             focus_editor: self.focus == Pane::Editor,
-            bookmarks: self.all_bookmarks(),
+            // A path that is not UTF-8 cannot be a JSON key, and one such
+            // mark would fail the whole save.
+            bookmarks: self
+                .all_bookmarks()
+                .into_iter()
+                .filter(|(path, _)| path.to_str().is_some())
+                .collect(),
+            // Filled by the clean-exit save, the one a later launch may
+            // find the files changed since.
+            bookmark_text: std::collections::HashMap::new(),
         }
     }
 
-    /// The bookmarks of every open tab, keyed by file. Each tab is an editor
-    /// with its own marks, so the active one's map alone would miss the rest.
+    /// Every tab of every editor group: the focused tab first, then the
+    /// focused group's tabs and the other groups' in order. The order in
+    /// which a tab's copy of a file's marks counts.
+    fn editors_in_bookmark_order(&self) -> impl Iterator<Item = &Editor> + '_ {
+        std::iter::once(&*self.editor).chain(
+            std::iter::once(&self.editor)
+                .chain(self.editor_layout.inactive_groups())
+                .flat_map(|g| g.editors.iter()),
+        )
+    }
+
+    /// The tab whose copy of `path`'s marks counts: the first, in
+    /// [`Self::editors_in_bookmark_order`], that shows the file and holds
+    /// marks for it, since those follow its text; else the first that
+    /// still holds marks from showing it earlier.
+    fn bookmark_source(&self, path: &Path) -> Option<&Editor> {
+        self.editors_in_bookmark_order()
+            .find(|e| e.path.as_deref() == Some(path) && e.bookmarks.contains_key(path))
+            .or_else(|| {
+                self.editors_in_bookmark_order()
+                    .find(|e| e.bookmarks.contains_key(path))
+            })
+    }
+
+    /// The bookmarks of every tab of every editor group, keyed by file, one
+    /// set per file: each file's from [`Self::bookmark_source`]. The tabs of
+    /// a file hold the same marks (see [`Self::share_bookmarks`]), each on
+    /// its own text, so the set is never a union of their copies, which
+    /// would bring back a mark a tab cleared. A file whose tabs all closed
+    /// adds the marks they left.
     fn all_bookmarks(
         &self,
     ) -> std::collections::HashMap<PathBuf, std::collections::BTreeSet<usize>> {
         let mut all = std::collections::HashMap::new();
-        // A tab's own file first: its marks are the live ones.
-        for ed in &self.editor.editors {
-            if let Some(path) = &ed.path
-                && let Some(set) = ed.bookmarks.get(path)
-            {
-                all.insert(path.clone(), set.clone());
+        for ed in self.editors_in_bookmark_order() {
+            for path in ed.bookmarks.keys() {
+                if !all.contains_key(path)
+                    && let Some(source) = self.bookmark_source(path)
+                {
+                    all.insert(path.clone(), source.bookmarks[path].clone());
+                }
             }
         }
-        // Then files the tab showed earlier, whose marks it still holds.
-        for ed in &self.editor.editors {
-            for (path, set) in &ed.bookmarks {
-                all.entry(path.clone()).or_insert_with(|| set.clone());
-            }
+        for (path, set) in &self.closed_bookmarks {
+            all.entry(path.clone()).or_insert_with(|| set.clone());
         }
         all
+    }
+
+    /// Keep the marks the tabs closed since the last call left, for each
+    /// file no open tab holds marks for, and hand a file's kept marks back
+    /// to the tabs that show it again. Run every tick, before anything
+    /// reads the marks. Returns whether a tab took marks back.
+    pub(crate) fn settle_bookmarks(&mut self) -> bool {
+        let mut released = self.editor.take_released_bookmarks();
+        for group in self.editor_layout.inactive_groups_mut() {
+            released.extend(group.take_released_bookmarks());
+        }
+        for marks in released {
+            for (path, set) in marks {
+                if !self
+                    .editors_in_bookmark_order()
+                    .any(|e| e.bookmarks.contains_key(&path))
+                {
+                    self.closed_bookmarks.insert(path, set);
+                }
+            }
+        }
+        if self.closed_bookmarks.is_empty() {
+            return false;
+        }
+        let mut taken = Vec::new();
+        let groups =
+            std::iter::once(&mut self.editor).chain(self.editor_layout.inactive_groups_mut());
+        for group in groups {
+            // A diff, image or sheet tab's rows are not the file's lines.
+            for ed in group.editors.iter_mut().filter(|e| !e.has_non_text_view()) {
+                if let Some(path) = ed.path.clone()
+                    && !ed.bookmarks.contains_key(&path)
+                    && let Some(set) = self.closed_bookmarks.get(&path)
+                {
+                    ed.adopt_bookmarks(&path, Some(set));
+                    taken.push(path);
+                }
+            }
+        }
+        for path in &taken {
+            self.closed_bookmarks.remove(path);
+        }
+        !taken.is_empty()
+    }
+
+    /// Hand saved bookmarks to every tab of every group, each taking its
+    /// file's set trimmed to the lines the file still has.
+    fn restore_bookmarks_everywhere(
+        &mut self,
+        marks: &std::collections::HashMap<PathBuf, std::collections::BTreeSet<usize>>,
+    ) {
+        if marks.is_empty() {
+            return;
+        }
+        self.closed_bookmarks
+            .retain(|path, _| !marks.contains_key(path));
+        for ed in self.editor.editors.iter_mut() {
+            ed.restore_bookmarks(marks);
+        }
+        for group in self.editor_layout.inactive_groups_mut() {
+            for ed in group.editors.iter_mut() {
+                ed.restore_bookmarks(marks);
+            }
+        }
     }
 
     /// Returns the xlsx cells (#1593) it could not put back, as the tabs
@@ -48551,9 +48679,7 @@ impl App {
         }
         // Every tab is its own editor with its own marks: hand each the saved
         // set once its file is open, trimmed to the lines the file still has.
-        for ed in self.editor.editors.iter_mut() {
-            ed.restore_bookmarks(&state.bookmarks);
-        }
+        self.restore_bookmarks_everywhere(&state.bookmarks);
         if state.active_tab < self.editor.tab_count() {
             self.editor.select(state.active_tab);
         }
@@ -48572,6 +48698,146 @@ impl App {
             Pane::Tree
         };
         left
+    }
+
+    /// This workspace's session file, saved at each clean exit.
+    fn saved_session_path(&self) -> Option<PathBuf> {
+        let dir = self.session_dir.as_deref()?;
+        Some(crate::session_state::saved_path(dir, self.workspace_root()))
+    }
+
+    /// Save the session for the next launch of this workspace (a clean
+    /// exit): its tabs, layout and bookmarks, without unsaved text.
+    fn save_session_for_next_launch(&mut self) -> Result<()> {
+        let Some(file) = self.saved_session_path() else {
+            return Ok(());
+        };
+        // A tab closed since the last tick still holds the only copy of
+        // its file's marks.
+        self.settle_bookmarks();
+        let mut state = self
+            .capture_session_state_with(false)
+            .without_unsaved_text();
+        // A clean exit throws unsaved edits away (the prompt asked first),
+        // and the next launch opens the file as it is on disk: a mark that
+        // moved with those edits goes back to its line there. Each mark on
+        // an open file also keeps what its line reads there, for a launch
+        // that finds the file changed since (see
+        // `SessionState::relocate_bookmarks_on_disk`).
+        for (path, set) in state.bookmarks.iter_mut() {
+            let Some(source) = self
+                .bookmark_source(path)
+                .filter(|s| s.path.as_deref() == Some(path.as_path()))
+            else {
+                continue;
+            };
+            let disk;
+            let lines: &[String] = if source.dirty {
+                let Ok(bytes) = std::fs::read(path) else {
+                    continue;
+                };
+                // Decoded as the tab decoded it, or a UTF-16 file matches no
+                // line of its buffer.
+                let (text, _, _) = source.encoding.decode(&bytes);
+                disk = crate::widgets::editor::split_into_lines(&text);
+                *set = crate::widgets::editor::carry_marks(set, &source.lines, &disk);
+                &disk
+            } else {
+                &source.lines
+            };
+            let text = set
+                .iter()
+                .filter_map(|&line| Some((line, lines.get(line.checked_sub(1)?)?.clone())))
+                .collect();
+            state.bookmark_text.insert(path.clone(), text);
+        }
+        state.bookmarks.retain(|_, set| !set.is_empty());
+        state
+            .bookmark_text
+            .retain(|path, _| state.bookmarks.contains_key(path));
+        state.save(&file)
+    }
+
+    /// Read the session the last clean exit saved on a thread of its own,
+    /// once the first frame is up, for [`Self::poll_saved_session`] to
+    /// apply. `tabs` false brings back only its bookmarks (hot exit
+    /// restored the tabs). A file saved for another workspace is ignored,
+    /// and so is a missing one: the first launch has none. The file stays,
+    /// so a crash before the next clean exit still has it.
+    fn read_saved_session(&mut self, tabs: bool) {
+        let Some(path) = self.saved_session_path() else {
+            return;
+        };
+        let root = self.workspace_root().to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        crate::startup_gate::spawn_after_first_frame(move || {
+            if let Ok(mut state) = crate::session_state::SessionState::load(&path)
+                && state.is_of(&root)
+            {
+                state.relocate_bookmarks_on_disk();
+                let _ = tx.send(state);
+            }
+        });
+        self.saved_session = Some((rx, tabs));
+    }
+
+    /// Apply the saved session once it is read (see
+    /// [`Self::read_saved_session`]). Its tabs come back only into an
+    /// editor still showing its blank first tab: a file the launch opened,
+    /// or one the user opened first, is not covered over. Returns whether
+    /// anything changed, for a redraw.
+    fn poll_saved_session(&mut self) -> bool {
+        let Some((rx, tabs)) = self.saved_session.as_ref() else {
+            return false;
+        };
+        let state = match rx.try_recv() {
+            Ok(state) => state,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.saved_session = None;
+                return false;
+            }
+        };
+        let tabs = *tabs;
+        self.saved_session = None;
+        if tabs && self.editor.is_blank_initial() && !state.tabs.is_empty() {
+            // No unsaved text, so nothing is left over to keep.
+            let _ = self.apply_session_state(&state);
+            self.sync_open_file_poll_mtime();
+        } else {
+            self.restore_bookmarks_everywhere(&state.bookmarks);
+            self.carry_saved_marks_onto_unsaved_tabs(&state.bookmarks);
+        }
+        true
+    }
+
+    /// The saved marks sit on each file's lines on disk (a clean exit saves
+    /// them there), but a tab hot exit brought back holds unsaved edits:
+    /// carry its file's marks from the file on disk onto its own lines.
+    fn carry_saved_marks_onto_unsaved_tabs(
+        &mut self,
+        marks: &std::collections::HashMap<PathBuf, std::collections::BTreeSet<usize>>,
+    ) {
+        let in_splits = self
+            .editor_layout
+            .inactive_groups_mut()
+            .into_iter()
+            .flat_map(|g| g.editors.iter_mut());
+        for ed in self.editor.editors.iter_mut().chain(in_splits) {
+            let Some(path) = ed.path.clone().filter(|_| ed.dirty) else {
+                continue;
+            };
+            let Some(set) = marks.get(&path) else {
+                continue;
+            };
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            let (text, _, _) = ed.encoding.decode(&bytes);
+            let disk = crate::widgets::editor::split_into_lines(&text);
+            let carried = crate::widgets::editor::carry_marks(set, &disk, &ed.lines);
+            ed.adopt_bookmarks(&path, Some(&carried));
+        }
     }
 
     /// Keep the xlsx cells an update relaunch could not put back (#1593)
@@ -49123,11 +49389,76 @@ impl App {
         if !self.editor_is_text() {
             return;
         }
+        // Start from the marks the file's other tabs hold, or toggling here
+        // would hand every tab this tab's set alone.
+        self.adopt_shared_bookmarks();
         self.status = match self.editor.toggle_bookmark_at(line) {
             Some(true) => format!("Bookmark set on line {line}"),
             Some(false) => format!("Bookmark cleared on line {line}"),
             None => String::from("Save the file before bookmarking a line"),
         };
+        if let Some(path) = self.editor.path.clone() {
+            self.share_bookmarks(&path);
+        }
+    }
+
+    /// Give the focused tab its file's marks from another tab, in any
+    /// group, when it holds none of its own: a tab opened on a file after
+    /// its marks were set starts without them.
+    fn adopt_shared_bookmarks(&mut self) {
+        // The marks a file's last tab left when it closed come back first.
+        self.settle_bookmarks();
+        let Some(path) = self.editor.path.clone() else {
+            return;
+        };
+        if self.editor.bookmarks.contains_key(&path) {
+            return;
+        }
+        let Some(source) = self.bookmark_source(&path) else {
+            return;
+        };
+        let set = &source.bookmarks[&path];
+        // A tab showing the file may hold unsaved edits this one lacks:
+        // each mark goes to the line it is on here.
+        let marks = if source.path.as_deref() == Some(path.as_path()) {
+            crate::widgets::editor::carry_marks(set, &source.lines, &self.editor.lines)
+        } else {
+            set.clone()
+        };
+        self.editor.adopt_bookmarks(&path, Some(&marks));
+    }
+
+    /// Hand `path`'s marks, as the focused tab now holds them, to every
+    /// other tab of every group that shows the file or still holds marks
+    /// for it, so a file has one set of marks: one set or cleared in a tab
+    /// is set or cleared in all of them.
+    fn share_bookmarks(&mut self, path: &Path) {
+        // The focused tab's set is the file's now; marks a closed tab left
+        // would bring back one it cleared.
+        self.closed_bookmarks.remove(path);
+        let active = self.editor.active_index();
+        let (before, rest) = self.editor.editors.split_at_mut(active);
+        let Some((source, after)) = rest.split_first_mut() else {
+            return;
+        };
+        let source: &Editor = source;
+        let marks = source.bookmarks.get(path);
+        let in_splits = self
+            .editor_layout
+            .inactive_groups_mut()
+            .into_iter()
+            .flat_map(|g| g.editors.iter_mut());
+        for ed in before.iter_mut().chain(after.iter_mut()).chain(in_splits) {
+            if ed.path.as_deref() == Some(path) {
+                // Another copy of the file, whose unsaved edits may differ
+                // from this one's: each mark goes to the line it is on there.
+                let carried =
+                    marks.map(|m| crate::widgets::editor::carry_marks(m, &source.lines, &ed.lines));
+                ed.adopt_bookmarks(path, carried.as_ref());
+            } else if ed.bookmarks.contains_key(path) {
+                ed.adopt_bookmarks(path, marks);
+            }
+        }
     }
 
     /// Jump to the next (`forward`) or previous bookmark in the open file,
@@ -49241,6 +49572,10 @@ impl App {
         } else if let Err(e) = self.editor.open_preview(&path) {
             self.status = format!("Cannot open bookmark: {e}");
             return;
+        } else {
+            // A tab opened here for a file another tab still shows gets
+            // that file's marks too.
+            self.adopt_shared_bookmarks();
         }
         self.sync_open_file_poll_mtime();
         self.editor.jump_to_bookmark(line);
@@ -49258,6 +49593,11 @@ impl App {
             return;
         }
         let gone = self.editor.clear_bookmarks();
+        // From every tab of the file, or a copy left in another would bring
+        // the marks back with the next session.
+        if let Some(path) = self.editor.path.clone() {
+            self.share_bookmarks(&path);
+        }
         self.status = if gone == 0 {
             String::from("No bookmarks in this file")
         } else if gone == 1 {
@@ -64714,6 +65054,7 @@ impl App {
                             self.editor_click
                                 .is_double(now, m.column, m.row, m.modifiers);
                         let last_inner = self.editor.last_inner;
+                        self.editor.sync_tab_cells();
                         if let Some(diff) = self.editor.diff.as_mut() {
                             if let Some((side, row_idx, char_col)) =
                                 crate::widgets::editor::diff_hit_test(
@@ -65133,6 +65474,7 @@ impl App {
                 if in_editor {
                     if self.editor.diff.is_some() {
                         let last_inner = self.editor.last_inner;
+                        self.editor.sync_tab_cells();
                         if let Some(diff) = self.editor.diff.as_mut()
                             && let Some((_, row_idx, char_col)) =
                                 crate::widgets::editor::diff_hit_test(
@@ -82655,24 +82997,14 @@ pub fn run(
             app.add_workspace_folder(folder);
         }
     }
-    // Determine which session file to restore from, if any:
-    //   * a self-update re-exec names one explicitly;
-    //   * otherwise hot exit is tried first, and ".session" (saved at the
-    //     previous clean exit) is the fallback when hot exit had nothing.
-    let session_path: Option<std::path::PathBuf> = if let Some(path) = restore_session {
-        Some(path.clone())
-    } else if !app.restore_hot_exit() {
-        Some(std::path::PathBuf::from(".session"))
-    } else {
-        None
-    };
-    // Restore the tabs / layout
-    if let Some(session_path) = session_path {
-        match crate::session_state::SessionState::load(&session_path) {
+    // Restore the tabs / layout carried across a self-update re-exec, then
+    // delete the handoff file so a later normal launch starts clean.
+    if let Some(session_path) = restore_session.as_ref() {
+        match crate::session_state::SessionState::load(session_path) {
             Ok(state) => {
                 let left = app.apply_session_state(&state);
                 if app.hold_unrestored_tabs(left) {
-                    let _ = std::fs::remove_file(&session_path);
+                    let _ = std::fs::remove_file(session_path);
                 } else {
                     // Kept: it holds the only copy of cells not put back.
                     app.status = format!(
@@ -82692,6 +83024,14 @@ pub fn run(
                 );
             }
         }
+    } else {
+        // A normal launch brings back what hot exit kept of this workspace
+        // when croft last ended without a clean quit (#862). The session
+        // the last clean exit saved brings back its tabs when hot exit had
+        // none, and its bookmarks either way; it is read once the first
+        // frame is up, off this thread.
+        let restored = app.restore_hot_exit();
+        app.read_saved_session(!restored);
     }
     crate::startup_trace::mark("session restored");
     // `--zen`: hide the Explorer sidebar and terminal so the editor fills the
@@ -82952,15 +83292,10 @@ pub fn run(
             crate::remote::RemoteOutcome::Exited => return Ok(()),
         }
     }
-
-    let state = app.capture_session_state();
-    let file_name = ".session";
-    // let state_path = crate::session_state::persistent_session_path(&root);
-    let state_path = std::path::Path::new(&file_name);
-    if let Err(e) = state.save(state_path) {
-        eprintln!("croft: failed to save session: {e}");
+    // A clean exit: what the next launch of this workspace opens with.
+    if let Err(e) = app.save_session_for_next_launch() {
+        eprintln!("croft: could not save the session: {e:#}");
     }
-
     Ok(())
 }
 
@@ -83512,7 +83847,10 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         app.tick_hot_exit(std::time::Instant::now());
         let highlights_changed = app.poll_highlights();
         // Pictures baked off the UI thread (#1973) go up as they land.
-        let images_changed = app.poll_chrome_bake() | app.poll_welcome_bake();
+        let images_changed =
+            app.poll_chrome_bake() | app.poll_welcome_bake() | app.poll_saved_session();
+        // A closed tab's bookmarks are kept, and come back with its file.
+        let bookmarks_changed = app.settle_bookmarks();
         let live_run_changed =
             app.tick_live_run() | app.sync_markdown_scroll() | app.tick_minimap();
         app.tick_code_lens();
@@ -83670,6 +84008,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || auto_save_changed
             || highlights_changed
             || images_changed
+            || bookmarks_changed
             || live_run_changed
             || code_lens_changed
             || ws_symbols_changed

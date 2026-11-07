@@ -989,8 +989,8 @@ fn merge_editor_source_panes_draw_a_tab_as_a_cell() {
     };
     assert_eq!(
         x_of("mine"),
-        x_of("all:") + 1,
-        "the recipe sits one cell in"
+        x_of("all:") + 4,
+        "the recipe sits one Tab Size (4) in"
     );
 }
 
