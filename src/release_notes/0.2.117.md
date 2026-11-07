@@ -1,0 +1,1 @@
+fix: Groundwork for on-demand extensions: the session host, collaboration, the web view and agent hooks no longer depend on the main app, now that `croft attach` and `croft ls` live apart from the session files they share. Nothing changes in use.

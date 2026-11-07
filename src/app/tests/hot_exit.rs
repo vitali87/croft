@@ -2072,6 +2072,379 @@ fn session_state_keeps_unsaved_untitled_and_unreadable_buffers() {
     assert!(blank.capture_session_state().tabs.is_empty());
 }
 
+/// Bookmarks ride along in the saved session state and come back with the
+/// tabs, trimmed to the lines the reopened file still has.
+#[test]
+fn a_relaunch_restores_the_bookmarks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("b.txt");
+    std::fs::write(&p, "one\ntwo\nthree\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&p).unwrap();
+    app.editor.toggle_bookmark();
+    app.editor.cursor_row = 2;
+    app.editor.toggle_bookmark();
+    let key_path = app
+        .editor
+        .bookmarks
+        .keys()
+        .next()
+        .cloned()
+        .expect("a bookmark");
+    let state = app.capture_session_state();
+    assert_eq!(state.bookmarks.get(&key_path).map(|s| s.len()), Some(2));
+
+    let mut next = App::new(tmp.path().to_path_buf()).unwrap();
+    next.apply_session_state(&state);
+    let marks = next.editor.bookmarks.get(&key_path).expect("bookmarks");
+    assert_eq!(marks.iter().copied().collect::<Vec<_>>(), vec![1, 3]);
+}
+
+/// Every tab is its own editor with its own bookmarks: the session keeps them
+/// all, not just the active tab's, and each file gets its marks back.
+#[test]
+fn a_relaunch_restores_the_bookmarks_of_every_tab() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&a, "one\ntwo\nthree\n").unwrap();
+    std::fs::write(&b, "one\ntwo\nthree\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&a).unwrap();
+    app.editor.toggle_bookmark();
+    app.editor.open_in_new_tab(&b).unwrap();
+    app.editor.cursor_row = 2;
+    app.editor.toggle_bookmark();
+    let state = app.capture_session_state();
+    assert_eq!(state.bookmarks.len(), 2, "both files' marks are saved");
+
+    let mut next = App::new(tmp.path().to_path_buf()).unwrap();
+    next.apply_session_state(&state);
+    let marks = |app: &App, p: &std::path::Path| {
+        tab_for(app, p)
+            .bookmarks
+            .get(p)
+            .map(|s| s.iter().copied().collect::<Vec<_>>())
+    };
+    assert_eq!(marks(&next, &a), Some(vec![1]));
+    assert_eq!(marks(&next, &b), Some(vec![3]));
+}
+
+/// Bookmarks saved for a file shown in another split come back in that
+/// split's tab too.
+#[test]
+fn saved_bookmarks_reach_the_tabs_of_every_split() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&a, "one\ntwo\nthree\n").unwrap();
+    std::fs::write(&b, "one\ntwo\nthree\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&a).unwrap();
+    app.split_editor();
+    app.editor.open_preview(&b).unwrap();
+    let mut marks = std::collections::HashMap::new();
+    marks.insert(a.clone(), std::collections::BTreeSet::from([2]));
+    app.restore_bookmarks_everywhere(&marks);
+    let split = app.editor_layout.inactive_groups()[0]
+        .editors
+        .iter()
+        .find(|e| e.path.as_deref() == Some(a.as_path()))
+        .expect("a.txt in the first split");
+    assert_eq!(split.bookmarked_lines(), vec![2]);
+}
+
+/// Wait for the saved session read by `read_saved_session` to land.
+fn poll_saved_session_until_done(app: &mut App) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if app.poll_saved_session() {
+            return true;
+        }
+        if app.saved_session.is_none() || std::time::Instant::now() > deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// A clean exit saves the session under the workspace's own name, without
+/// unsaved text; the next launch of that workspace reopens its tabs with
+/// their bookmarks and keeps the file for a crash before the next exit.
+#[test]
+fn the_saved_session_reopens_the_workspace_s_tabs_and_stays() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("ws");
+    std::fs::create_dir(&ws).unwrap();
+    let a = ws.join("a.txt");
+    std::fs::write(&a, "one\ntwo\nthree\n").unwrap();
+    let sessions = tmp.path().join("sessions");
+    let mut app = App::new(ws.clone()).unwrap();
+    app.session_dir = Some(sessions.clone());
+    app.editor.open_pinned(&a).unwrap();
+    app.editor.cursor_row = 2;
+    app.toggle_bookmark();
+    app.editor.insert_char('x');
+    app.save_session_for_next_launch().unwrap();
+    let saved = crate::session_state::saved_path(&sessions, &ws);
+    let state = crate::session_state::SessionState::load(&saved).unwrap();
+    assert!(
+        state
+            .tabs
+            .iter()
+            .all(|t| !t.dirty && t.unsaved_text.is_none()),
+        "unsaved text is hot exit's to keep"
+    );
+
+    let mut next = App::new(ws.clone()).unwrap();
+    next.session_dir = Some(sessions.clone());
+    next.read_saved_session(true);
+    assert!(poll_saved_session_until_done(&mut next));
+    assert_eq!(next.editor.path.as_deref(), Some(a.as_path()));
+    assert!(!next.editor.dirty);
+    assert_eq!(next.editor.bookmarked_lines(), vec![3]);
+    assert!(saved.exists(), "kept until the next clean exit");
+}
+
+/// Another workspace launched with the same state directory finds no
+/// session of its own, and a file saved for another root is not applied.
+#[test]
+fn the_saved_session_belongs_to_its_workspace() {
+    let tmp = tempfile::tempdir().unwrap();
+    let ws = tmp.path().join("ws");
+    let elsewhere = tmp.path().join("elsewhere");
+    std::fs::create_dir(&ws).unwrap();
+    std::fs::create_dir(&elsewhere).unwrap();
+    let a = ws.join("a.txt");
+    std::fs::write(&a, "one\n").unwrap();
+    let sessions = tmp.path().join("sessions");
+    let mut app = App::new(ws.clone()).unwrap();
+    app.session_dir = Some(sessions.clone());
+    app.editor.open_pinned(&a).unwrap();
+    app.save_session_for_next_launch().unwrap();
+
+    let mut other = App::new(elsewhere.clone()).unwrap();
+    other.session_dir = Some(sessions.clone());
+    other.read_saved_session(true);
+    assert!(!poll_saved_session_until_done(&mut other));
+    assert!(other.editor.is_blank_initial(), "nothing of ws's opens");
+
+    // Even a file under this workspace's name is applied only when it was
+    // saved for this workspace.
+    let mine = crate::session_state::saved_path(&sessions, &elsewhere);
+    std::fs::copy(crate::session_state::saved_path(&sessions, &ws), &mine).unwrap();
+    other.read_saved_session(true);
+    assert!(!poll_saved_session_until_done(&mut other));
+    assert!(other.editor.is_blank_initial());
+}
+
+/// Only the bookmarks come back when hot exit restored the tabs, or when
+/// the editor already shows a file (one the launch opened): the saved tabs
+/// never cover it.
+#[test]
+fn the_saved_session_brings_back_only_bookmarks_over_open_tabs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&a, "one\ntwo\nthree\n").unwrap();
+    std::fs::write(&b, "one\ntwo\nthree\n").unwrap();
+    let sessions = tmp.path().join("sessions");
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.session_dir = Some(sessions.clone());
+    app.editor.open_pinned(&a).unwrap();
+    app.editor.cursor_row = 1;
+    app.toggle_bookmark();
+    app.editor.open_in_new_tab(&b).unwrap();
+    app.save_session_for_next_launch().unwrap();
+
+    for tabs in [false, true] {
+        let mut next = App::new(tmp.path().to_path_buf()).unwrap();
+        next.session_dir = Some(sessions.clone());
+        next.editor.open_pinned(&a).unwrap();
+        next.read_saved_session(tabs);
+        assert!(poll_saved_session_until_done(&mut next));
+        assert_eq!(next.editor.tab_count(), 1, "b.txt stays closed");
+        assert_eq!(next.editor.bookmarked_lines(), vec![2], "a's mark is back");
+    }
+}
+
+/// A clean exit throws unsaved edits away, so a mark that moved with them
+/// is saved on its line in the file on disk, which the next launch opens.
+#[test]
+fn a_clean_exit_saves_a_mark_on_its_line_on_disk() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    std::fs::write(&a, "one\ntwo\nthree\n").unwrap();
+    let sessions = tmp.path().join("sessions");
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.session_dir = Some(sessions.clone());
+    app.editor.open_pinned(&a).unwrap();
+    app.editor.cursor_row = 2;
+    app.toggle_bookmark();
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 0;
+    app.editor.insert_str("zero\n");
+    assert_eq!(
+        app.editor.bookmarked_lines(),
+        vec![4],
+        "it moved with the edit"
+    );
+    app.save_session_for_next_launch().unwrap();
+    let saved = crate::session_state::saved_path(&sessions, tmp.path());
+    let state = crate::session_state::SessionState::load(&saved).unwrap();
+    let marks: Vec<usize> = state.bookmarks[&a].iter().copied().collect();
+    assert_eq!(marks, vec![3], "on \"three\" as the file has it");
+}
+
+/// The file on disk is read as its tab decoded it, so a UTF-16 file's mark
+/// is saved on its line too.
+#[test]
+fn a_clean_exit_saves_a_utf16_file_s_mark_on_its_line_on_disk() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    let mut bytes = vec![0xFF, 0xFE];
+    for unit in "one\ntwo\nthree\n".encode_utf16() {
+        bytes.extend(unit.to_le_bytes());
+    }
+    std::fs::write(&a, bytes).unwrap();
+    let sessions = tmp.path().join("sessions");
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.session_dir = Some(sessions.clone());
+    app.editor.open_pinned(&a).unwrap();
+    assert_eq!(app.editor.lines[2], "three", "read as UTF-16");
+    app.editor.cursor_row = 2;
+    app.toggle_bookmark();
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 0;
+    app.editor.insert_str("zero\n");
+    app.save_session_for_next_launch().unwrap();
+    let saved = crate::session_state::saved_path(&sessions, tmp.path());
+    let state = crate::session_state::SessionState::load(&saved).unwrap();
+    let marks: Vec<usize> = state.bookmarks[&a].iter().copied().collect();
+    assert_eq!(marks, vec![3]);
+}
+
+/// A file whose name is not UTF-8 cannot be written as JSON: its tab and
+/// its marks are left out, and the rest of the session is still saved.
+#[cfg(unix)]
+#[test]
+fn a_file_whose_name_is_not_utf8_does_not_stop_the_session_save() {
+    use std::os::unix::ffi::OsStrExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let odd = tmp.path().join(std::ffi::OsStr::from_bytes(b"caf\xe9.txt"));
+    if std::fs::write(&odd, "one\ntwo\n").is_err() {
+        return; // a filesystem that takes UTF-8 names only
+    }
+    let a = tmp.path().join("a.txt");
+    std::fs::write(&a, "one\ntwo\n").unwrap();
+    let sessions = tmp.path().join("sessions");
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.session_dir = Some(sessions.clone());
+    app.editor.open_pinned(&odd).unwrap();
+    app.toggle_bookmark();
+    app.editor.open_in_new_tab(&a).unwrap();
+    app.toggle_bookmark();
+    app.save_session_for_next_launch().unwrap();
+    let saved = crate::session_state::saved_path(&sessions, tmp.path());
+    let state = crate::session_state::SessionState::load(&saved).unwrap();
+    assert!(state.bookmarks.contains_key(&a));
+    assert!(!state.bookmarks.contains_key(&odd));
+    assert!(
+        state
+            .tabs
+            .iter()
+            .all(|t| t.path.as_deref() != Some(odd.as_path()))
+    );
+}
+
+/// The saved marks sit on the file's lines on disk. A tab hot exit brought
+/// back with unsaved lines above a mark gets it on the same text, not the
+/// same number.
+#[test]
+fn saved_marks_follow_the_unsaved_edits_hot_exit_brought_back() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    std::fs::write(&a, "one\ntwo\nthree\n").unwrap();
+    let sessions = tmp.path().join("sessions");
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.session_dir = Some(sessions.clone());
+    app.editor.open_pinned(&a).unwrap();
+    app.editor.cursor_row = 2;
+    app.toggle_bookmark();
+    app.save_session_for_next_launch().unwrap();
+
+    let mut next = App::new(tmp.path().to_path_buf()).unwrap();
+    next.session_dir = Some(sessions.clone());
+    // As hot exit leaves it: the file's tab with an unsaved line on top.
+    next.editor.open_pinned(&a).unwrap();
+    next.editor.insert_str("zero\n");
+    next.read_saved_session(false);
+    assert!(poll_saved_session_until_done(&mut next));
+    assert_eq!(
+        next.editor.bookmarked_lines(),
+        vec![4],
+        "still on \"three\""
+    );
+}
+
+/// The file was saved over after the session was (lines added above a
+/// mark, then a crash before the next clean exit): the next launch puts
+/// the mark back on its text, not on its old number in the newer file.
+#[test]
+fn saved_marks_find_their_text_in_a_file_changed_since() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    std::fs::write(&a, "one\ntwo\nthree\n").unwrap();
+    let sessions = tmp.path().join("sessions");
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.session_dir = Some(sessions.clone());
+    app.editor.open_pinned(&a).unwrap();
+    app.editor.cursor_row = 2;
+    app.toggle_bookmark();
+    app.save_session_for_next_launch().unwrap();
+    std::fs::write(&a, "zero\none\ntwo\nthree\n").unwrap();
+
+    let mut next = App::new(tmp.path().to_path_buf()).unwrap();
+    next.session_dir = Some(sessions);
+    next.read_saved_session(true);
+    assert!(poll_saved_session_until_done(&mut next));
+    assert_eq!(next.editor.path.as_deref(), Some(a.as_path()));
+    assert_eq!(
+        next.editor.bookmarked_lines(),
+        vec![4],
+        "still on \"three\""
+    );
+}
+
+/// The same, with hot exit bringing the file back with unsaved lines of
+/// its own: the mark finds its text on disk, then follows those lines.
+#[test]
+fn saved_marks_find_their_text_under_the_unsaved_edits_hot_exit_brought_back() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    std::fs::write(&a, "one\ntwo\nthree\n").unwrap();
+    let sessions = tmp.path().join("sessions");
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.session_dir = Some(sessions.clone());
+    app.editor.open_pinned(&a).unwrap();
+    app.editor.cursor_row = 2;
+    app.toggle_bookmark();
+    app.save_session_for_next_launch().unwrap();
+    std::fs::write(&a, "zero\none\ntwo\nthree\n").unwrap();
+
+    let mut next = App::new(tmp.path().to_path_buf()).unwrap();
+    next.session_dir = Some(sessions);
+    next.editor.open_pinned(&a).unwrap();
+    next.editor.insert_str("new\n");
+    next.read_saved_session(false);
+    assert!(poll_saved_session_until_done(&mut next));
+    assert_eq!(
+        next.editor.bookmarked_lines(),
+        vec![5],
+        "still on \"three\""
+    );
+}
+
 #[test]
 fn unsaved_count_tracks_dirty_editors() {
     // The Explorer activity badge mirrors VS Code: the count of open editors
@@ -2342,62 +2715,4 @@ fn an_unsaved_edit_after_reopen_as_text_is_still_backed_up() {
             .unwrap()
             .starts_with("xtop")
     );
-}
-
-/// Bookmarks ride along in the saved session state and come back with the
-/// tabs, trimmed to the lines the reopened file still has.
-#[test]
-fn a_relaunch_restores_the_bookmarks() {
-    let tmp = tempfile::tempdir().unwrap();
-    let p = tmp.path().join("b.txt");
-    std::fs::write(&p, "one\ntwo\nthree\n").unwrap();
-    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.editor.open(&p).unwrap();
-    app.editor.toggle_bookmark();
-    app.editor.cursor_row = 2;
-    app.editor.toggle_bookmark();
-    let key_path = app
-        .editor
-        .bookmarks
-        .keys()
-        .next()
-        .cloned()
-        .expect("a bookmark");
-    let state = app.capture_session_state();
-    assert_eq!(state.bookmarks.get(&key_path).map(|s| s.len()), Some(2));
-
-    let mut next = App::new(tmp.path().to_path_buf()).unwrap();
-    next.apply_session_state(&state);
-    let marks = next.editor.bookmarks.get(&key_path).expect("bookmarks");
-    assert_eq!(marks.iter().copied().collect::<Vec<_>>(), vec![1, 3]);
-}
-
-/// Every tab is its own editor with its own bookmarks: the session keeps them
-/// all, not just the active tab's, and each file gets its marks back.
-#[test]
-fn a_relaunch_restores_the_bookmarks_of_every_tab() {
-    let tmp = tempfile::tempdir().unwrap();
-    let a = tmp.path().join("a.txt");
-    let b = tmp.path().join("b.txt");
-    std::fs::write(&a, "one\ntwo\nthree\n").unwrap();
-    std::fs::write(&b, "one\ntwo\nthree\n").unwrap();
-    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.editor.open(&a).unwrap();
-    app.editor.toggle_bookmark();
-    app.editor.open_in_new_tab(&b).unwrap();
-    app.editor.cursor_row = 2;
-    app.editor.toggle_bookmark();
-    let state = app.capture_session_state();
-    assert_eq!(state.bookmarks.len(), 2, "both files' marks are saved");
-
-    let mut next = App::new(tmp.path().to_path_buf()).unwrap();
-    next.apply_session_state(&state);
-    let marks = |app: &App, p: &std::path::Path| {
-        tab_for(app, p)
-            .bookmarks
-            .get(p)
-            .map(|s| s.iter().copied().collect::<Vec<_>>())
-    };
-    assert_eq!(marks(&next, &a), Some(vec![1]));
-    assert_eq!(marks(&next, &b), Some(vec![3]));
 }
