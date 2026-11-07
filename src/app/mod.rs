@@ -68820,7 +68820,6 @@ impl App {
         self.indent_guides_enabled = !p.disable_indent_guides;
         self.editor.show_indent_guides = self.indent_guides_enabled;
         self.home_walks_rows = p.home_walks_wrapped_rows;
-        self.editor.home_walks_rows = self.home_walks_rows;
         self.bracket_colors_enabled = !p.disable_bracket_colors;
         self.editor.show_bracket_colors = self.bracket_colors_enabled;
         self.whitespace_mode =
@@ -68828,14 +68827,17 @@ impl App {
         self.editor.whitespace_mode = self.whitespace_mode;
         self.rulers = crate::widgets::editor::normalize_rulers(&p.rulers);
         // Straight onto every open editor: the focus sync that otherwise
-        // carries it does not run per frame, so a reload would leave open
-        // tabs on the old rulers until an unrelated focus change.
+        // carries them does not run per frame, so a reload would leave open
+        // tabs on the old rulers and Home walk until an unrelated focus
+        // change.
         for ed in self.editor.editors.iter_mut() {
             ed.rulers.clone_from(&self.rulers);
+            ed.home_walks_rows = self.home_walks_rows;
         }
         for group in self.editor_layout.inactive_groups_mut() {
             for ed in group.editors.iter_mut() {
                 ed.rulers.clone_from(&self.rulers);
+                ed.home_walks_rows = self.home_walks_rows;
             }
         }
         self.line_numbers = crate::widgets::editor::LineNumbers::from_pref(&p.line_numbers);
