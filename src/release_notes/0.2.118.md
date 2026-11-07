@@ -1,0 +1,1 @@
+fix: A Tab is drawn as wide as the Tab Size, and the caret, mouse clicks, horizontal scrolling and wrapping agree with it; indent guides, whitespace marks and rulers no longer turn italic inside comments, and guides on blank lines follow the neighbouring indentation.

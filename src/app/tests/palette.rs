@@ -1346,6 +1346,35 @@ fn the_palette_clear_bookmarks_command_leaves_a_preview_alone() {
     assert!(app.editor.bookmarked_lines().is_empty());
 }
 
+/// Typing in the bookmark picker narrows it to the matching rows.
+#[test]
+fn the_bookmark_picker_filters_as_you_type() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&a, "alpha\nbeta\ngamma\n").unwrap();
+    std::fs::write(&b, "one\ntwo\nthree\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&a).unwrap();
+    app.editor.cursor_row = 1;
+    app.toggle_bookmark();
+    app.editor.open_in_new_tab(&b).unwrap();
+    app.editor.cursor_row = 2;
+    app.toggle_bookmark();
+    app.run_command(Command::ViewBookmarks);
+    for c in "b.txt".chars() {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+            .unwrap();
+    }
+    let picker = app.list_picker.as_ref().expect("the picker stays open");
+    assert_eq!(picker.visible_count(), 1);
+    assert_eq!(
+        picker.selected_row().map(|r| r.label.as_str()),
+        Some("b.txt:3  three")
+    );
+}
+
 #[test]
 fn palette_merge_accept_incoming_resolves_at_cursor() {
     let tmp = tempfile::tempdir().unwrap();
@@ -2537,5 +2566,38 @@ fn a_bookmark_jump_drops_the_destination_tabs_extra_carets() {
     assert!(
         app.editor.carets.is_empty(),
         "no extra caret left to type at"
+    );
+}
+
+/// The editor's caret hides behind a list picker and comes back with it closed.
+#[test]
+fn the_editor_caret_is_hidden_while_a_list_picker_is_open() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    std::fs::write(&a, "alpha\nbeta\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_in_new_tab(&a).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.toggle_bookmark();
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    // The blink may be in its dark half; the steady (screen reader) phase
+    // keeps the test off the clock.
+    app.screen_reader = true;
+    assert!(
+        app.cursor_should_be_visible(),
+        "the caret shows in the editor"
+    );
+    app.run_command(Command::ViewBookmarks);
+    assert!(app.list_picker.is_some());
+    assert!(
+        !app.cursor_should_be_visible(),
+        "the caret stays hidden behind View Bookmarks"
+    );
+    app.dismiss_list_picker();
+    assert!(
+        app.cursor_should_be_visible(),
+        "and returns with the picker closed"
     );
 }
