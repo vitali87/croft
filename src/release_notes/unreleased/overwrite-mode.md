@@ -1,1 +1,1 @@
-feature: The Insert key switches the editor between Insert and Overwrite (Replace) typing. In Overwrite a typed character replaces the one under the caret; the status bar shows OVR and the caret turns into a block.
+feature: The Insert key switches the editor between Insert and Overwrite (Replace) typing. In Overwrite a typed character replaces the one under the caret; the status bar shows ⎁ after the wordmark (⎀ while inserting) and the caret turns into a block.

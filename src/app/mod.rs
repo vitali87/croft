@@ -1047,6 +1047,24 @@ fn brand_spans(theme: crate::theme::Theme) -> Vec<Span<'static>> {
     ]
 }
 
+/// The typing-mode glyph that follows the wordmark in the status bar: the
+/// insertion symbol (⎀) while typing inserts, the continuous-underline symbol
+/// (⎁) in overwrite mode, lit in the brand orange so a switched mode is hard
+/// to miss. It sits on the left, away from the clickable position, encoding
+/// and language segments on the right.
+fn typing_mode_span(overwrite: bool) -> Span<'static> {
+    if overwrite {
+        Span::styled(
+            "\u{2381}",
+            Style::default()
+                .fg(BRAND_ORANGE)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::styled("\u{2380}", Style::default().fg(Color::Gray))
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Pane {
     Tree,
@@ -23371,6 +23389,7 @@ impl App {
         let scm_status = self.scm_worker().status().clone();
         let mut spans: Vec<Span> = Vec::with_capacity(20);
         spans.extend(brand_spans(self.theme));
+        spans.push(typing_mode_span(self.overwrite_mode));
         let redacted = self.redacted_on_screen();
         if redacted > 0 || self.redactions_revealed() {
             // How much of what is on screen is masked right now (#360): a
@@ -23821,15 +23840,9 @@ impl App {
         } else {
             ""
         };
-        // Overwrite mode rides it too, VS Code's "OVR".
-        let overwrite_mode = if self.overwrite_mode {
-            " \u{b7} OVR"
-        } else {
-            ""
-        };
         let mut seg_texts: Vec<String> = vec![
             format!(
-                " Ln {}, Col {}{coverage}{}{column_mode}{overwrite_mode} ",
+                " Ln {}, Col {}{coverage}{}{column_mode} ",
                 self.editor.cursor_row + 1,
                 self.editor.cursor_col + 1,
                 // The file refuses this user's writes (#1379).

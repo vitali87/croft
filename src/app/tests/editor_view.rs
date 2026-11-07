@@ -2368,20 +2368,26 @@ fn overwrite_typing_undoes_in_one_step_and_a_selection_is_replaced_as_usual() {
 }
 
 #[test]
-fn overwrite_mode_is_shown_in_the_status_bar_and_as_a_block_caret_flag() {
+fn overwrite_mode_is_shown_by_a_glyph_after_the_wordmark_not_in_the_position() {
     let (_t, mut app) = overwrite_app("abc");
     let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
-    term.draw(|f| app.render(f)).unwrap();
-    let rows = |t: &ratatui::Terminal<ratatui::backend::TestBackend>| -> String {
+    let bar = |t: &ratatui::Terminal<ratatui::backend::TestBackend>| -> String {
         let b = t.backend().buffer();
-        (0..b.area.height)
-            .flat_map(|y| (0..b.area.width).map(move |x| (x, y)))
-            .map(|(x, y)| b[(x, y)].symbol().to_string())
+        let y = b.area.height - 1;
+        (0..b.area.width)
+            .map(|x| b[(x, y)].symbol().to_string())
             .collect()
     };
-    assert!(!rows(&term).contains("OVR"));
+    term.draw(|f| app.render(f)).unwrap();
+    let insert = bar(&term);
+    assert!(
+        insert.contains("ft \u{2380}"),
+        "insert glyph after cr<>ft: {insert}"
+    );
     app.handle_key(key(KeyCode::Insert, KeyModifiers::NONE))
         .unwrap();
     term.draw(|f| app.render(f)).unwrap();
-    assert!(rows(&term).contains("OVR"), "the status bar says OVR");
+    let over = bar(&term);
+    assert!(over.contains("ft \u{2381}"), "overwrite glyph: {over}");
+    assert!(!over.contains("OVR"), "the Ln/Col segment stays unchanged");
 }
