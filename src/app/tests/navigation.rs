@@ -1662,6 +1662,258 @@ fn bookmark_status_counts_marks_and_names_the_line_separately() {
     assert_eq!(app.status, "Bookmark 2 of 2 (line 5)");
 }
 
+/// A file open in two splits keeps one set of bookmarks: a mark set in
+/// either shows in both, and clearing them in one clears them in the
+/// other, so the saved session cannot bring a cleared mark back.
+#[test]
+fn a_file_open_in_two_splits_keeps_one_set_of_bookmarks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    std::fs::write(&a, "one\ntwo\nthree\nfour\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&a).unwrap();
+    app.toggle_bookmark();
+    app.split_editor();
+    app.editor.cursor_row = 2;
+    app.toggle_bookmark();
+    assert_eq!(
+        app.editor.bookmarked_lines(),
+        vec![1, 3],
+        "the new split starts from the file's marks"
+    );
+    let other = |app: &App| {
+        app.editor_layout.inactive_groups()[0]
+            .editors
+            .iter()
+            .find(|e| e.path.as_deref() == Some(a.as_path()))
+            .expect("the first split still shows a.txt")
+            .bookmarked_lines()
+    };
+    assert_eq!(other(&app), vec![1, 3], "the other split has the new mark");
+    assert_eq!(
+        app.all_bookmarks().get(&a).map(|s| s.len()),
+        Some(2),
+        "one set of two, from either split"
+    );
+
+    app.clear_bookmarks();
+    assert!(other(&app).is_empty(), "cleared in both splits");
+    let state = app.capture_session_state();
+    assert!(state.bookmarks.is_empty(), "nothing to bring back");
+}
+
+/// A tab opened on a file after its marks were set starts without them;
+/// a mark set there adds to the file's set rather than replacing it.
+#[test]
+fn a_mark_set_in_a_second_tab_of_a_file_keeps_the_first_tab_s() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    std::fs::write(&a, "one\ntwo\nthree\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&a).unwrap();
+    app.toggle_bookmark();
+    app.editor.open_in_new_tab(&a).unwrap();
+    app.editor.cursor_row = 2;
+    app.toggle_bookmark();
+    for ed in &app.editor.editors {
+        assert_eq!(ed.bookmarked_lines(), vec![1, 3]);
+    }
+}
+
+/// Two splits of one file each keep their own text, and unsaved edits in
+/// one move its marks only. A mark set there reaches the other on the line
+/// it is on in that split's text, not on the same number.
+#[test]
+fn a_mark_shared_between_two_splits_lands_on_its_line_in_each() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    std::fs::write(&a, "one\ntwo\nthree\nfour\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&a).unwrap();
+    app.toggle_bookmark();
+    app.split_editor();
+    // An unsaved line on top of the new split's copy only.
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 0;
+    app.editor.insert_str("zero\n");
+    // "two" is line 3 here and line 2 in the first split.
+    app.editor.cursor_row = 2;
+    app.toggle_bookmark();
+    assert_eq!(app.editor.bookmarked_lines(), vec![2, 3]);
+    let first = app.editor_layout.inactive_groups()[0]
+        .editors
+        .iter()
+        .find(|e| e.path.as_deref() == Some(a.as_path()))
+        .expect("the first split still shows a.txt")
+        .bookmarked_lines();
+    assert_eq!(first, vec![1, 2], "\"one\" and \"two\" in its own text");
+}
+
+/// Closing the last tab that holds a file's bookmarks keeps them: the
+/// saved session carries them while the file is closed, and the file
+/// opened again shows them.
+#[test]
+fn a_files_bookmarks_outlive_its_last_tab() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&a, "one\ntwo\nthree\n").unwrap();
+    std::fs::write(&b, "x\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&a).unwrap();
+    app.editor.cursor_row = 1;
+    app.toggle_bookmark();
+    app.editor.open_in_new_tab(&b).unwrap();
+    let a_tab = app
+        .editor
+        .editors
+        .iter()
+        .position(|e| e.path.as_deref() == Some(a.as_path()))
+        .unwrap();
+    assert!(app.editor.close_tab(a_tab));
+    app.settle_bookmarks();
+    let saved = app.capture_session_state().bookmarks;
+    assert_eq!(
+        saved.get(&a).map(|s| s.iter().copied().collect::<Vec<_>>()),
+        Some(vec![2]),
+        "the session keeps a.txt's mark"
+    );
+
+    app.editor.open_in_new_tab(&a).unwrap();
+    assert!(app.settle_bookmarks(), "the new tab takes the mark back");
+    assert_eq!(app.editor.bookmarked_lines(), vec![2]);
+}
+
+/// A tab closed on unsaved edits leaves its marks on their lines as saved,
+/// which is how the file opens next.
+#[test]
+fn a_tab_closed_on_unsaved_edits_leaves_its_marks_on_their_saved_lines() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&a, "one\ntwo\nthree\n").unwrap();
+    std::fs::write(&b, "x\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&a).unwrap();
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 0;
+    app.editor.insert_str("zero\n");
+    // "two" is line 3 in the buffer and line 2 on disk.
+    app.editor.cursor_row = 2;
+    app.toggle_bookmark();
+    assert_eq!(app.editor.bookmarked_lines(), vec![3]);
+    app.editor.open_in_new_tab(&b).unwrap();
+    let a_tab = app
+        .editor
+        .editors
+        .iter()
+        .position(|e| e.path.as_deref() == Some(a.as_path()))
+        .unwrap();
+    assert!(app.editor.editors[a_tab].dirty);
+    assert!(app.editor.close_tab(a_tab));
+    app.settle_bookmarks();
+    let saved = app.capture_session_state().bookmarks;
+    assert_eq!(
+        saved.get(&a).map(|s| s.iter().copied().collect::<Vec<_>>()),
+        Some(vec![2])
+    );
+}
+
+/// Marks cleared in a file opened again stay cleared: the ones its last
+/// tab left do not come back when it closes again.
+#[test]
+fn bookmarks_cleared_after_a_file_reopens_stay_cleared() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&a, "one\ntwo\n").unwrap();
+    std::fs::write(&b, "x\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&a).unwrap();
+    app.toggle_bookmark();
+    app.editor.open_in_new_tab(&b).unwrap();
+    assert!(app.editor.close_tab(0));
+    app.settle_bookmarks();
+    app.editor.open_in_new_tab(&a).unwrap();
+    app.settle_bookmarks();
+    app.clear_bookmarks();
+    let a_tab = app.editor.active_index();
+    assert!(app.editor.close_tab(a_tab));
+    app.settle_bookmarks();
+    assert!(app.capture_session_state().bookmarks.is_empty());
+}
+
+/// Close Others, Close to the Right and Close Saved keep the marks of
+/// the tabs they close, as closing one tab does.
+#[test]
+fn closing_tabs_in_bulk_keeps_their_files_bookmarks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&a, "one\ntwo\nthree\n").unwrap();
+    std::fs::write(&b, "x\n").unwrap();
+    type Close = fn(&mut App);
+    let closes: [(&str, Close); 3] = [
+        ("Close Others", |app| {
+            app.editor.close_others(0);
+        }),
+        ("Close to the Right", |app| {
+            app.editor.close_to_right(0);
+        }),
+        ("Close Saved", |app| {
+            app.editor.close_saved();
+        }),
+    ];
+    for (name, close) in closes {
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        // b.txt first, so a.txt is the tab right of it.
+        app.editor.open(&b).unwrap();
+        app.editor.open_in_new_tab(&a).unwrap();
+        app.editor.cursor_row = 1;
+        app.toggle_bookmark();
+        close(&mut app);
+        assert!(
+            !app.editor
+                .editors
+                .iter()
+                .any(|e| e.path.as_deref() == Some(a.as_path())),
+            "{name} closed a.txt"
+        );
+        app.settle_bookmarks();
+        let saved = app.capture_session_state().bookmarks;
+        assert_eq!(
+            saved.get(&a).map(|s| s.iter().copied().collect::<Vec<_>>()),
+            Some(vec![2]),
+            "{name} kept a.txt's mark"
+        );
+    }
+}
+
+/// Closing the last tab of a split takes the split away, but not the
+/// marks that tab held.
+#[test]
+fn closing_a_splits_last_tab_keeps_its_files_bookmarks() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&a, "one\ntwo\nthree\n").unwrap();
+    std::fs::write(&b, "x\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&b).unwrap();
+    app.split_editor();
+    app.editor.open(&a).unwrap();
+    app.editor.cursor_row = 2;
+    app.toggle_bookmark();
+    app.run_command(Command::CloseEditor);
+    assert!(!app.editor_layout.is_split(), "the emptied split went");
+    let saved = app.capture_session_state().bookmarks;
+    assert_eq!(
+        saved.get(&a).map(|s| s.iter().copied().collect::<Vec<_>>()),
+        Some(vec![3])
+    );
+}
+
 #[test]
 fn navigating_an_unmarked_file_explains_itself_rather_than_doing_nothing() {
     let tmp = tempfile::tempdir().unwrap();
