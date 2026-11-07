@@ -9,6 +9,7 @@ pub mod completion_popup;
 pub mod connect_dialog;
 pub mod dependencies;
 pub mod diff;
+pub mod diff_syntax;
 pub mod editor;
 pub mod editor_find;
 pub mod extensions;
