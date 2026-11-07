@@ -1419,3 +1419,32 @@ fn go_to_next_problem_between_entries_and_with_none() {
         "before the first wraps to the last"
     );
 }
+
+/// A watch task's batch is installed without a finished command's scan, and
+/// still gets the `build_column_unit` conversion: a gcc display column on a
+/// tabbed line lands on the character it names.
+#[test]
+fn a_watch_batch_gets_the_build_column_conversion() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("t.c"), "{\n\t\t\tint u;\n}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let row = crate::build_matchers::BuildDiag {
+        file: String::from("t.c"),
+        line: 1,
+        // Three tabs at stop 8 put `u` on display column 28.
+        col: 28,
+        severity: crate::lsp::manager::DiagnosticSeverity::Warning,
+        message: String::from("unused"),
+        source: String::from("build"),
+        needs_file: false,
+    };
+    app.install_build_diags(
+        7,
+        Some(tmp.path()),
+        vec![row],
+        crate::build_matchers::DEFAULT_TABSTOP,
+    );
+    let rows = &app.build_diagnostics[&tmp.path().join("t.c")];
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].1.col, 7, "display column 28 is the `u`, char 7");
+}

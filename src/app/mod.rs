@@ -12485,24 +12485,27 @@ impl App {
             Some(m) => m.scan_batch(output),
             None => self.matchers.scan_batch(output, cmd),
         };
-        let mut diags = diags;
-        let base = cwd.unwrap_or(self.workspace_root());
-        crate::build_matchers::convert_columns(
-            &mut diags,
-            base,
-            self.build_column_unit,
-            crate::build_matchers::tabstop_from_command(cmd),
-        );
-        self.install_build_diags(pane, cwd, diags)
+        let tabstop = crate::build_matchers::tabstop_from_command(cmd);
+        self.install_build_diags(pane, cwd, diags, tabstop)
     }
 
     /// Install `diags` as pane `pane`'s PROBLEMS contribution (#119/#252).
+    /// The gcc/clang columns are converted here (`build_column_unit`, with
+    /// `tabstop` for a tab), so a watch task's batches get the same
+    /// conversion as a finished command's scan, and each row gets it once.
     fn install_build_diags(
         &mut self,
         pane: u64,
         cwd: Option<&Path>,
-        diags: Vec<crate::build_matchers::BuildDiag>,
+        mut diags: Vec<crate::build_matchers::BuildDiag>,
+        tabstop: usize,
     ) -> bool {
+        crate::build_matchers::convert_columns(
+            &mut diags,
+            cwd.unwrap_or(self.workspace_root()),
+            self.build_column_unit,
+            tabstop,
+        );
         let had_old = self
             .build_diag_files_by_pane
             .get(&pane)
@@ -54389,9 +54392,16 @@ impl App {
         // Watch publishes first: a batch replaces the pane's entries
         // wholesale, and marks the pane so the watcher's own eventual
         // FinishedCommand rescan cannot resurrect stale cycles.
+        // A batch has no command line to read `-ftabstop=` from, so its
+        // tabs count at the default stop.
         for (pane, cwd, diags) in watch_installs {
             self.watch_published_panes.insert(pane);
-            build_changed |= self.install_build_diags(pane, cwd.as_deref(), diags);
+            build_changed |= self.install_build_diags(
+                pane,
+                cwd.as_deref(),
+                diags,
+                crate::build_matchers::DEFAULT_TABSTOP,
+            );
         }
         for (pane, cwd, cmd, output) in build_scans {
             // A command that printed nothing (`cd`, `clear`) says nothing
