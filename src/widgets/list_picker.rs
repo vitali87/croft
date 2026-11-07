@@ -137,6 +137,9 @@ pub enum ListPurpose {
     /// HTTP: Switch Environment (#924): `id` the named environment of the
     /// `.http` env files, or empty for none.
     HttpEnvironment,
+    /// The tab strip's "all open tabs" button: every tab of the group, `id`
+    /// its index.
+    OpenTab,
 }
 
 /// The Review Pull Request row that asks for a number or URL instead.
