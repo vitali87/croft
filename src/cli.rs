@@ -1450,6 +1450,16 @@ fn hook_command(action: HookAction) -> std::result::Result<(), String> {
     }
 }
 
+/// How `croft keys` names a key event's kind.
+fn key_kind_label(kind: crossterm::event::KeyEventKind) -> &'static str {
+    use crossterm::event::KeyEventKind;
+    match kind {
+        KeyEventKind::Press => "Press",
+        KeyEventKind::Repeat => "Repeat",
+        KeyEventKind::Release => "Release",
+    }
+}
+
 fn keys_diagnostic(mouse: bool) -> Result<()> {
     use crossterm::event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers,
@@ -1462,6 +1472,8 @@ fn keys_diagnostic(mouse: bool) -> Result<()> {
     println!("croft keys: press any key to inspect; Ctrl+C to quit.");
     println!("If the kitty keyboard protocol is negotiated, modifier keys");
     println!("(including Cmd/Super on macOS) will appear in the modifier list.");
+    println!("kind= is Press, Repeat or Release; the last two arrive only when the");
+    println!("terminal honours the protocol's event-type reporting.");
     if mouse {
         println!("Mouse capture is on: click and drag to inspect mouse events.");
     }
@@ -1484,9 +1496,10 @@ fn keys_diagnostic(mouse: bool) -> Result<()> {
             if event::poll(Duration::from_millis(500))? {
                 match event::read()? {
                     Event::Key(k) => {
-                        if k.kind != KeyEventKind::Press && k.kind != KeyEventKind::Repeat {
-                            continue;
-                        }
+                        // Every kind is shown: what a terminal sends for
+                        // Repeat and Release is exactly what this tool is for.
+                        let kind = key_kind_label(k.kind);
+                        let released = k.kind == KeyEventKind::Release;
                         let mut mods: Vec<&str> = Vec::new();
                         if k.modifiers.contains(KeyModifiers::CONTROL) {
                             mods.push("CONTROL");
@@ -1512,28 +1525,30 @@ fn keys_diagnostic(mouse: bool) -> Result<()> {
                             mods.join(" + ")
                         };
                         // Quit on Ctrl+C.
-                        if matches!(k.code, KeyCode::Char('c'))
+                        if !released
+                            && matches!(k.code, KeyCode::Char('c'))
                             && k.modifiers.contains(KeyModifiers::CONTROL)
                         {
                             print!("\r\nQuitting (Ctrl+C).\r\n");
                             break;
                         }
-                        let clipboard_probe = if is_paste_probe_key(k.code, k.modifiers) {
-                            match crate::clipboard::read_string() {
-                                Some(s) if s.is_empty() => String::from("  clipboard=empty"),
-                                Some(s) => format!(
-                                    "  clipboard=ok chars={} bytes={}",
-                                    s.chars().count(),
-                                    s.len()
-                                ),
-                                None => String::from("  clipboard=read_failed"),
-                            }
-                        } else {
-                            String::new()
-                        };
+                        let clipboard_probe =
+                            if !released && is_paste_probe_key(k.code, k.modifiers) {
+                                match crate::clipboard::read_string() {
+                                    Some(s) if s.is_empty() => String::from("  clipboard=empty"),
+                                    Some(s) => format!(
+                                        "  clipboard=ok chars={} bytes={}",
+                                        s.chars().count(),
+                                        s.len()
+                                    ),
+                                    None => String::from("  clipboard=read_failed"),
+                                }
+                            } else {
+                                String::new()
+                            };
                         print!(
-                            "\r  key={:?}  code={:?}  modifiers=[{}]  kitty={}{}\r\n",
-                            k, k.code, mods_s, kbd_enhanced, clipboard_probe
+                            "\r  kind={:<7}  key={:?}  code={:?}  modifiers=[{}]  kitty={}{}\r\n",
+                            kind, k, k.code, mods_s, kbd_enhanced, clipboard_probe
                         );
                         use std::io::Write;
                         std::io::stdout().flush().ok();
@@ -3060,6 +3075,14 @@ mod tests {
             Some(CliCommand::SetupTerminal { yes, .. }) => assert!(yes),
             _ => panic!("expected SetupTerminal"),
         }
+    }
+
+    #[test]
+    fn keys_labels_every_event_kind() {
+        use crossterm::event::KeyEventKind;
+        assert_eq!(key_kind_label(KeyEventKind::Press), "Press");
+        assert_eq!(key_kind_label(KeyEventKind::Repeat), "Repeat");
+        assert_eq!(key_kind_label(KeyEventKind::Release), "Release");
     }
 
     #[test]
