@@ -212,6 +212,9 @@ pub struct DiffData {
     /// file (a HEAD blob, a snapshot, a git command's output).
     pub left_stamp: Option<(std::time::SystemTime, u64)>,
     pub right_stamp: Option<(std::time::SystemTime, u64)>,
+    /// Each side's syntax colours (#2020), worked out on a worker thread the
+    /// first time the view is painted. See [`Self::colour_syntax`].
+    pub syntax: crate::widgets::diff_syntax::DiffSyntax,
 }
 
 /// A single occurrence of the find needle inside a diff, located by the
@@ -419,6 +422,7 @@ impl DiffData {
             right_crlf,
             left_no_final_nl,
             right_no_final_nl,
+            syntax: Default::default(),
         }
     }
 
@@ -461,6 +465,7 @@ impl DiffData {
             right_crlf: Vec::new(),
             left_no_final_nl: false,
             right_no_final_nl: false,
+            syntax: Default::default(),
         }
     }
 
@@ -522,6 +527,8 @@ impl DiffData {
                 right_crlf: Vec::new(),
                 left_no_final_nl: false,
                 right_no_final_nl: false,
+                // The placeholder is not code.
+                syntax: crate::widgets::diff_syntax::DiffSyntax::with_runs(Vec::new(), Vec::new()),
             };
         }
         let mut pending_remove: Vec<usize> = Vec::new();
@@ -549,12 +556,30 @@ impl DiffData {
         // first hunk. Inside one, `--- x` is a removed `-- x` (an SQL, Lua
         // or Haskell comment) and must be shown, not skipped as noise.
         let mut in_header = true;
+        // The language of the file whose hunks follow (#2020), and each
+        // side's line's language: `None` for a header, a commit message or
+        // a file with no grammar, so each hunk is coloured on its own.
+        let mut lang: Option<crate::highlight::LangKind> = None;
+        let mut left_langs: Vec<Option<crate::highlight::LangKind>> = Vec::new();
+        let mut right_langs: Vec<Option<crate::highlight::LangKind>> = Vec::new();
         for line in raw.split('\n') {
             // A merge commit's combined diff (`git show <merge>`) starts each
             // file with `diff --cc` / `diff --combined`: headers follow it too.
+            // Its lines carry a sign per parent, so they are not coloured.
             if line.starts_with("diff --cc ") || line.starts_with("diff --combined ") {
                 in_header = true;
+                lang = None;
             }
+            if line.starts_with("diff --git") {
+                // `diff.noprefix`, `diff.mnemonicPrefix` and custom prefixes
+                // write the paths without `a/` and `b/`; the header's last
+                // word still ends in the new file's name.
+                let last_word = line.rsplit(' ').next().map(|w| w.trim_matches('"'));
+                lang = parse_diff_git_new_path(line)
+                    .and_then(|p| crate::highlight::lang_for_path(Path::new(&p)))
+                    .or_else(|| crate::highlight::lang_for_path(Path::new(last_word?)));
+            }
+            let code = if in_header { None } else { lang };
             if line.starts_with("diff --git") || line.starts_with("@@") {
                 in_header = line.starts_with("diff --git");
                 flush(&mut pending_remove, &mut pending_add, &mut rows);
@@ -562,6 +587,8 @@ impl DiffData {
                 let j = right_lines.len();
                 left_lines.push(line.to_string());
                 right_lines.push(line.to_string());
+                left_langs.push(None);
+                right_langs.push(None);
                 rows.push(DiffRow::Equal { left: i, right: j });
             } else if line.starts_with("\\ No newline")
                 || (in_header
@@ -582,10 +609,12 @@ impl DiffData {
             } else if let Some(rest) = line.strip_prefix('-') {
                 let i = left_lines.len();
                 left_lines.push(rest.to_string());
+                left_langs.push(code);
                 pending_remove.push(i);
             } else if let Some(rest) = line.strip_prefix('+') {
                 let j = right_lines.len();
                 right_lines.push(rest.to_string());
+                right_langs.push(code);
                 pending_add.push(j);
             } else {
                 flush(&mut pending_remove, &mut pending_add, &mut rows);
@@ -594,6 +623,8 @@ impl DiffData {
                 let j = right_lines.len();
                 left_lines.push(body.to_string());
                 right_lines.push(body.to_string());
+                left_langs.push(code);
+                right_langs.push(code);
                 rows.push(DiffRow::Equal { left: i, right: j });
             }
         }
@@ -628,6 +659,10 @@ impl DiffData {
             right_crlf: Vec::new(),
             left_no_final_nl: false,
             right_no_final_nl: false,
+            syntax: crate::widgets::diff_syntax::DiffSyntax::with_runs(
+                crate::widgets::diff_syntax::runs_of(&left_langs),
+                crate::widgets::diff_syntax::runs_of(&right_langs),
+            ),
         }
     }
 
@@ -1172,6 +1207,34 @@ impl DiffData {
         self.display_rows.as_deref().unwrap_or(&self.rows)
     }
 
+    /// Colour each side's code by its language (#2020), starting the pass if
+    /// none has run for this text and theme and waiting up to `wait` (`None`:
+    /// however long it takes) for it. A side takes its own path's language.
+    /// A side whose path is only a label takes the other side's: the left of
+    /// a Source Control diff is `foo.rs (HEAD)`, and a deleted file's right
+    /// is `/dev/null`. A real file with no grammar stays plain, even beside
+    /// one that has one.
+    pub fn colour_syntax(&mut self, wait: Option<std::time::Duration>) {
+        let (left_path, right_path) = (&self.left_path, &self.right_path);
+        let left_is_label = !self.left_is_real_file;
+        let right_is_label =
+            right_path.as_os_str().is_empty() || right_path == Path::new("/dev/null");
+        let langs = || {
+            let left = crate::highlight::lang_for_path(left_path);
+            let right = crate::highlight::lang_for_path(right_path);
+            (
+                if left_is_label { left.or(right) } else { left },
+                if right_is_label {
+                    right.or(left)
+                } else {
+                    right
+                },
+            )
+        };
+        self.syntax
+            .ensure(&self.left_lines, &self.right_lines, langs, wait);
+    }
+
     /// Take over the reader's view state from the version of this diff being
     /// replaced (#471): the whitespace mode, the viewport (clamped to the new
     /// row count), the horizontal pan, the hunk-navigation anchor (only while
@@ -1215,6 +1278,13 @@ impl DiffData {
         // against the new right side; until it does, the lens is on with
         // nothing claimed, which reads as unrecorded rather than as wrong.
         self.group_by_seat = old.group_by_seat;
+        // A side whose lines did not change keeps its colours while the
+        // pass for the other side runs, rather than flashing plain.
+        self.syntax.carry_from(
+            &old.syntax,
+            self.left_lines == old.left_lines,
+            self.right_lines == old.right_lines,
+        );
         // `source` is not carried here: the rebuild set it before stamping
         // the sides, since which sides are files depends on it.
     }
@@ -3268,6 +3338,99 @@ mod tests {
             vec!["rep", "rm", "rm"],
             "unequal runs pair what they can then overflow with the longer side"
         );
+    }
+
+    /// #2020: a `git diff` over several files colours each file's hunks
+    /// by that file's language, and leaves its header lines and a file with
+    /// no grammar in the plain diff colours.
+    #[test]
+    fn a_git_diff_colours_each_files_hunks_by_its_own_language() {
+        let raw = "diff --git a/src/a.rs b/src/a.rs\n\
+                   index 1..2 100644\n\
+                   --- a/src/a.rs\n\
+                   +++ b/src/a.rs\n\
+                   @@ -1,2 +1,2 @@\n\
+                   \x20fn main() {\n\
+                   -    let x = 1;\n\
+                   +    let x = 2;\n\
+                   diff --git a/notes.txt b/notes.txt\n\
+                   @@ -1 +1 @@\n\
+                   -fn not code\n\
+                   +fn still not code\n";
+        let mut d = DiffData::build_side_by_side_from_git_text(PathBuf::from("staged"), raw);
+        d.colour_syntax(None);
+        let at = |lines: &[String], text: &str| lines.iter().position(|l| l == text).unwrap();
+        let header = at(&d.left_lines, "diff --git a/src/a.rs b/src/a.rs");
+        assert!(
+            d.syntax.left(header).is_empty(),
+            "a file header is not code"
+        );
+        let hunk = at(&d.left_lines, "@@ -1,2 +1,2 @@");
+        assert!(d.syntax.left(hunk).is_empty(), "a hunk header is not code");
+        let context = at(&d.left_lines, "fn main() {");
+        assert!(
+            !d.syntax.left(context).is_empty(),
+            "Rust context is coloured"
+        );
+        let removed = at(&d.left_lines, "    let x = 1;");
+        assert!(
+            !d.syntax.left(removed).is_empty(),
+            "a removed Rust line too"
+        );
+        let added = at(&d.right_lines, "    let x = 2;");
+        assert!(!d.syntax.right(added).is_empty(), "and an added one");
+        let txt = at(&d.left_lines, "fn not code");
+        assert!(d.syntax.left(txt).is_empty(), "a .txt file stays plain");
+        let txt = at(&d.right_lines, "fn still not code");
+        assert!(d.syntax.right(txt).is_empty());
+    }
+
+    /// #2020: headers written under `diff.noprefix` or `diff.mnemonicPrefix`
+    /// still name the file's language.
+    #[test]
+    fn a_git_diff_without_the_usual_prefixes_is_still_coloured() {
+        for header in [
+            "diff --git a.rs a.rs",
+            "diff --git i/src/a.rs w/src/a.rs",
+            "diff --git c/a.rs i/a.rs",
+        ] {
+            let raw = format!("{header}\n@@ -1 +1 @@\n-fn a() {{}}\n+fn b() {{}}\n");
+            let mut d = DiffData::build_side_by_side_from_git_text(PathBuf::from("staged"), &raw);
+            d.colour_syntax(None);
+            let removed = d.left_lines.iter().position(|l| l == "fn a() {}").unwrap();
+            assert!(!d.syntax.left(removed).is_empty(), "{header}: coloured");
+        }
+    }
+
+    /// #2020: comparing two real files of different kinds colours each by
+    /// its own language: a text file beside a Rust one stays plain.
+    #[test]
+    fn a_real_file_with_no_grammar_stays_plain_beside_one_with_a_grammar() {
+        let mut d = DiffData::build(
+            PathBuf::from("old.rs"),
+            PathBuf::from("notes.txt"),
+            vec![String::from("fn a() {}")],
+            vec![String::from("fn a() {}")],
+        );
+        d.left_is_real_file = true;
+        d.colour_syntax(None);
+        assert!(!d.syntax.left(0).is_empty(), "the Rust file is coloured");
+        assert!(d.syntax.right(0).is_empty(), "the text file is not");
+    }
+
+    /// #2020: the left of a Source Control diff is a `foo.rs (HEAD)` label,
+    /// which names no language of its own, so it takes the working file's.
+    #[test]
+    fn the_head_side_takes_the_working_files_language() {
+        let mut d = DiffData::build(
+            PathBuf::from("src/a.rs (HEAD)"),
+            PathBuf::from("src/a.rs"),
+            vec![String::from("fn a() {}")],
+            vec![String::from("fn b() {}")],
+        );
+        d.colour_syntax(None);
+        assert!(!d.syntax.left(0).is_empty(), "HEAD reads as Rust");
+        assert!(!d.syntax.right(0).is_empty());
     }
 
     #[test]

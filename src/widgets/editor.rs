@@ -1438,6 +1438,50 @@ fn paint_intraline_range(
     }
 }
 
+/// Recolour one diff line drawn at `text_x` from char `skip`, `width` cells
+/// wide, in its syntax colours (#2020): each character takes its span's
+/// foreground and weight, and keeps the row's background, which is what
+/// marks it removed, added or unchanged. Cells follow display width, as
+/// [`clip_pad_cells`] lays them down.
+fn paint_diff_syntax(
+    buf: &mut Buffer,
+    text_x: u16,
+    y: u16,
+    width: u16,
+    text: &str,
+    skip: usize,
+    spans: &[HiSpan],
+) {
+    if spans.is_empty() || width == 0 {
+        return;
+    }
+    let mut cell = 0u16;
+    let mut next = 0;
+    for (i, (byte, c)) in text.char_indices().enumerate() {
+        // Spans arrive in order and do not overlap.
+        while spans.get(next).is_some_and(|s| s.range().end <= byte) {
+            next += 1;
+        }
+        if i < skip {
+            continue;
+        }
+        let w = char_cells(c) as u16;
+        if cell + w > width {
+            break;
+        }
+        if let Some(span) = spans.get(next).filter(|s| s.range().contains(&byte)) {
+            let style = Style {
+                bg: None,
+                ..span.style
+            };
+            for dx in 0..w {
+                buf[(text_x + cell + dx, y)].set_style(style);
+            }
+        }
+        cell += w;
+    }
+}
+
 /// Returns the hit-test rects of the prev / next change arrows painted
 /// in the diff header (in that order). Both are `Rect::default()` when
 /// the header was too narrow to allocate them.
@@ -1460,6 +1504,9 @@ fn render_diff(
     if inner.height < 3 || inner.width < 16 {
         return (Rect::default(), Rect::default());
     }
+    // A small diff colours in this frame; a large one paints plain now and
+    // takes its colours when `poll_highlights` lands them.
+    diff.colour_syntax(Some(HIGHLIGHT_INLINE_BUDGET));
     if diff.unified {
         return render_unified_deletion(diff, inner, buf, bg, theme);
     }
@@ -1664,6 +1711,17 @@ fn render_diff(
                 })
                 .bg(l_cell_bg),
         );
+        if let Some(i) = l_left_idx {
+            paint_diff_syntax(
+                buf,
+                l_text_x,
+                y,
+                l_text_w,
+                &l_text,
+                diff.scroll_x,
+                diff.syntax.left(i),
+            );
+        }
         // The changed characters of a replaced line (#1351), on both sides.
         let intraline = match row {
             DiffRow::Replaced { .. } => crate::widgets::diff::changed_char_ranges(&l_text, &r_text),
@@ -1750,6 +1808,17 @@ fn render_diff(
                 })
                 .bg(r_cell_bg),
         );
+        if let Some(i) = r_right_idx {
+            paint_diff_syntax(
+                buf,
+                r_text_x,
+                y,
+                r_text_w,
+                &r_text,
+                diff.scroll_x,
+                diff.syntax.right(i),
+            );
+        }
         if let Some((_, range)) = intraline {
             let (r, g, b) = crate::widgets::diff::INTRALINE_ADDED_BG;
             paint_intraline_range(
@@ -1930,8 +1999,22 @@ fn paint_diff_selection_band(
         } else {
             (0, usize::MAX)
         };
-        let cs_screen = cs.saturating_sub(diff.scroll_x);
-        let ce_screen = ce.saturating_sub(diff.scroll_x);
+        // The band is in cells: a tab inside the selection is Tab Size wide.
+        let line = diff_side_line(diff, row_idx, sel.side);
+        let to_cell = |col: usize| {
+            if col == usize::MAX {
+                return usize::MAX;
+            }
+            let drawn: usize = line
+                .chars()
+                .skip(diff.scroll_x)
+                .take(col.saturating_sub(diff.scroll_x))
+                .map(char_cells)
+                .sum();
+            drawn + col.saturating_sub(line.chars().count().max(diff.scroll_x))
+        };
+        let cs_screen = to_cell(cs);
+        let ce_screen = to_cell(ce);
         paint_selection_band(buf, text_x, y, text_w, cs_screen, ce_screen, theme);
     }
 }
@@ -1998,8 +2081,54 @@ pub fn diff_hit_test(
     } else {
         0
     };
-    let char_col = screen_col + diff.scroll_x;
+    // The text is drawn with each tab as its Tab Size cells, so a cell maps to
+    // the char drawn on it, not to `cell + scroll_x`.
+    let line = diff_side_line(diff, row_idx, side);
+    let char_col = char_at_cell_from(line, diff.scroll_x, screen_col);
     Some((side, row_idx, char_col))
+}
+
+/// The text a diff row draws in `side`'s column, `""` when that side has no
+/// line on the row (an added or removed line's other half).
+fn diff_side_line(
+    diff: &crate::widgets::diff::DiffData,
+    row_idx: usize,
+    side: crate::widgets::diff::DiffSide,
+) -> &str {
+    use crate::widgets::diff::{DiffRow, DiffSide};
+    let (left, right) = match diff.rows.get(row_idx) {
+        Some(DiffRow::Equal { left, right } | DiffRow::Replaced { left, right }) => {
+            (Some(*left), Some(*right))
+        }
+        Some(DiffRow::Removed { left }) => (Some(*left), None),
+        Some(DiffRow::Added { right }) => (None, Some(*right)),
+        None => (None, None),
+    };
+    let (lines, idx) = match side {
+        DiffSide::Left => (&diff.left_lines, left),
+        DiffSide::Right => (&diff.right_lines, right),
+    };
+    idx.and_then(|i| lines.get(i)).map_or("", String::as_str)
+}
+
+/// The char index of `text` drawn on screen cell `cell` when the row starts
+/// at char `skip` (tabs as [`char_cells`]). A cell past the end of the text
+/// counts on from its length, one char per cell, as before tabs had width.
+fn char_at_cell_from(text: &str, skip: usize, cell: usize) -> usize {
+    let mut at = 0;
+    let mut len = 0;
+    for (i, c) in text.chars().enumerate() {
+        len = i + 1;
+        if i < skip {
+            continue;
+        }
+        let w = char_cells(c);
+        if cell < at + w {
+            return i;
+        }
+        at += w;
+    }
+    len.max(skip) + cell.saturating_sub(at)
 }
 
 /// Paint `‹` and `›` glyphs at the right edge of a diff header so the
@@ -2146,6 +2275,17 @@ fn render_unified_deletion(
                 })
                 .bg(cell_bg),
         );
+        if let Some(i) = left_idx {
+            paint_diff_syntax(
+                buf,
+                text_x,
+                y,
+                text_w,
+                &text,
+                diff.scroll_x,
+                diff.syntax.left(i),
+            );
+        }
     }
 
     let visible_first = diff.scroll + 1;
@@ -3399,7 +3539,7 @@ pub struct Editor {
     /// Cached longest-line width in CHARACTERS. Recomputing it every frame is
     /// O(total chars), so it is invalidated (set `None`) only when the buffer
     /// content changes (`open`/`mark_buffer_changed`) and recomputed lazily.
-    hscroll_content_cols: Option<usize>,
+    hscroll_content_cols: Option<(usize, usize, usize)>,
     /// Visual-row layout captured by the most recent render: one entry per
     /// painted screen row, each `(logical_line, char_start, char_end)`. In
     /// soft-wrap mode a logical line spans several entries; otherwise there is
@@ -4418,6 +4558,46 @@ impl Editor {
         self.sync_bookmarks_to_buffer();
     }
 
+    /// Take `path`'s marks as another tab holds them (`None`: it has none),
+    /// so every tab keeps one set per file. Trimmed to the buffer when
+    /// `path` is the open file, whose later edits then carry them.
+    pub fn adopt_bookmarks(
+        &mut self,
+        path: &Path,
+        marks: Option<&std::collections::BTreeSet<usize>>,
+    ) {
+        match marks {
+            Some(set) if !set.is_empty() => {
+                self.bookmarks.insert(path.to_path_buf(), set.clone());
+            }
+            _ => {
+                self.bookmarks.remove(path);
+            }
+        }
+        if self.path.as_deref() == Some(path) {
+            self.sync_bookmarks_to_buffer();
+        }
+    }
+
+    /// This tab's bookmarks on the files as saved: the open file's marks
+    /// follow its unsaved edits, so with the tab closing on those edits
+    /// each goes back to its line on disk, decoded as the tab decoded it.
+    pub fn bookmarks_on_disk(
+        &self,
+    ) -> std::collections::HashMap<PathBuf, std::collections::BTreeSet<usize>> {
+        let mut marks = self.bookmarks.clone();
+        if self.dirty
+            && let Some(path) = self.path.as_deref()
+            && let Some(set) = marks.get_mut(path)
+            && let Ok(bytes) = std::fs::read(path)
+        {
+            let (text, _, _) = self.encoding.decode(&bytes);
+            *set = carry_marks(set, &self.lines, &split_into_lines(&text));
+        }
+        marks.retain(|_, set| !set.is_empty());
+        marks
+    }
+
     /// Whether 0-based `line` carries a bookmark in the open file.
     pub fn is_bookmarked(&self, line: usize) -> bool {
         self.path
@@ -5082,7 +5262,6 @@ impl Editor {
     fn warm_render_caches(&mut self) {
         self.refresh_fold_tables();
         self.conflicts();
-        self.content_cols();
     }
 
     /// Go to Next / Previous Change in an editor tab (#1352): the first
@@ -5143,11 +5322,17 @@ impl Editor {
             .unwrap_or(matches!(self.lang, Some(LangKind::Markdown)))
     }
 
-    /// Longest line width in characters, cached until the buffer changes.
-    /// Drives the horizontal scrollbar's content extent and the `scroll_col`
-    /// clamp. `&mut self` so the lazy recompute can populate the cache.
-    fn content_cols(&mut self) -> usize {
-        if let Some(cols) = self.hscroll_content_cols {
+    /// Widest line as a horizontal extent in char columns for a text column
+    /// `width` cells wide (tabs are Tab Size cells, see below), cached until the
+    /// buffer, the width or the Tab Size changes. Drives the horizontal
+    /// scrollbar's content extent and the `scroll_col` clamp. `&mut self` so the lazy recompute can populate the cache.
+    fn content_cols(&mut self, width: usize) -> usize {
+        self.sync_tab_cells();
+        let tab = char_cells('\t');
+        if let Some((w, t, cols)) = self.hscroll_content_cols
+            && w == width
+            && t == tab
+        {
             return cols;
         }
         let cols = self
@@ -5163,11 +5348,27 @@ impl Editor {
                     .get(i)
                     .map(|hs| hs.iter().map(|(_, label, _)| label.chars().count()).sum())
                     .unwrap_or(0);
-                l.chars().count() + extra
+                if !l.contains('\t') {
+                    return l.chars().count() + extra;
+                }
+                // A tab is Tab Size cells, but `scroll_col` counts chars. The
+                // extent is in the same char columns: how far the line must
+                // scroll for its tail to fit `width` cells, plus `width`, so
+                // that `extent - width` is exactly that scroll.
+                let chars: Vec<char> = l.chars().collect();
+                if cells_of(&chars) + extra <= width {
+                    return chars.len() + extra;
+                }
+                let (mut first, mut tail) = (chars.len(), extra);
+                while first > 0 && tail + char_cells(chars[first - 1]) <= width {
+                    first -= 1;
+                    tail += char_cells(chars[first]);
+                }
+                first + width
             })
             .max()
             .unwrap_or(0);
-        self.hscroll_content_cols = Some(cols);
+        self.hscroll_content_cols = Some((width, tab, cols));
         cols
     }
 
@@ -7438,6 +7639,10 @@ impl Editor {
         // A pass already running bakes the old palette's colors.
         self.highlight_job = None;
         self.recompute_highlights();
+        // A diff view's colours are baked the same way (#2020).
+        if let Some(diff) = self.diff.as_mut() {
+            diff.syntax.restart();
+        }
         // The markdown preview bakes the theme into its lines at build time
         // and rebuilds only when the buffer edits (`built_seq`), so a theme
         // switch must rebuild it here or it keeps the old colors until the
@@ -7700,6 +7905,16 @@ impl Editor {
     /// calls this every tick for every tab; true when the colors changed.
     pub fn poll_highlights(&mut self) -> bool {
         use std::sync::mpsc::TryRecvError;
+        // A diff view's colours land the same way (#2020). One whose pass
+        // waited for a free slot starts it once one frees.
+        if let Some(diff) = self.diff.as_mut() {
+            if diff.syntax.waiting() {
+                diff.colour_syntax(Some(std::time::Duration::ZERO));
+            }
+            if diff.syntax.poll() {
+                return true;
+            }
+        }
         let Some(job) = &self.highlight_job else {
             return false;
         };
@@ -8886,11 +9101,17 @@ impl Editor {
     /// [`Editor::convert_indentation`] to rewrite existing lines.
     pub fn set_indent_style(&mut self, style: IndentStyle) {
         self.indent_override = Some(style);
+        self.hscroll_content_cols = None;
     }
 
     /// The indentation unit as text for the active style: N spaces or one tab.
     fn indent_unit(&self) -> String {
         self.indent_style().unit()
+    }
+
+    /// Make `\t` measure and paint as this buffer's Tab Size from here on.
+    pub(crate) fn sync_tab_cells(&self) {
+        set_tab_cells(self.indent_style().width as usize);
     }
 
     /// The editor's indentation preference as the LSP `FormattingOptions`
@@ -11190,20 +11411,36 @@ impl Editor {
     /// neighbour scans are capped: past a 200-blank-line gap guides simply
     /// stop, which keeps the per-row render cost bounded.
     fn guide_indent_width(&self, line: usize) -> usize {
+        self.guide_indent(line).0
+    }
+
+    /// [`Self::guide_indent_width`] plus the line whose leading whitespace
+    /// that width counts: the line itself, or for a blank line the neighbour
+    /// it borrowed from. The width is in characters, so where its guides sit
+    /// on screen has to be measured on that line (a tab is several cells; a
+    /// blank line has none of its own to measure).
+    fn guide_indent(&self, line: usize) -> (usize, usize) {
         const BLANK_SCAN_CAP: usize = 200;
         if let Some(w) = self.indent_width(line) {
-            return w;
+            return (w, line);
         }
         let above = (0..line)
             .rev()
             .take(BLANK_SCAN_CAP)
-            .find_map(|i| self.indent_width(i))
-            .unwrap_or(0);
+            .find_map(|i| self.indent_width(i).map(|w| (w, i)));
         let below = (line + 1..self.lines.len())
             .take(BLANK_SCAN_CAP)
-            .find_map(|i| self.indent_width(i))
-            .unwrap_or(0);
-        above.min(below)
+            .find_map(|i| self.indent_width(i).map(|w| (w, i)));
+        match (above, below) {
+            (Some(a), Some(b)) => {
+                if b.0 < a.0 {
+                    b
+                } else {
+                    a
+                }
+            }
+            _ => (0, line),
+        }
     }
 
     /// The active indentation guide (VS Code
@@ -15435,12 +15672,24 @@ impl Editor {
             // viewport width too. Scrolling right drops leading hints out of
             // the row, so re-measure until the caret fits (the loop is
             // bounded: `scroll_col` only grows, capped at `cursor_col`).
+            self.sync_tab_cells();
             loop {
                 let extra = self.inlay_cells_before_cursor(self.cursor_row, self.scroll_col);
-                if self.cursor_col + extra < self.scroll_col + width {
+                let row = RowCells::of_line(
+                    self.lines.get(self.cursor_row).map_or("", String::as_str),
+                    self.scroll_col,
+                );
+                let cells = row.text_before(self.cursor_col) + extra;
+                if cells < width {
                     break;
                 }
-                let target = (self.cursor_col + extra + 1).saturating_sub(width);
+                // Scroll right by the cells the caret overflows by (a tab or
+                // wide character is several), measured in columns.
+                let overflow = cells + 1 - width;
+                let mut target = self.scroll_col;
+                while target < self.cursor_col && row.text_before(target) < overflow {
+                    target += 1;
+                }
                 if target <= self.scroll_col {
                     break;
                 }
@@ -15777,7 +16026,7 @@ impl Editor {
         let width = self.visible_text_width();
         let Some(metrics) = scrollbar::horizontal_metrics(
             self.last_hscrollbar,
-            self.content_cols(),
+            self.content_cols(width),
             width,
             self.scroll_col,
         ) else {
@@ -16117,14 +16366,14 @@ impl Editor {
                 let cap = if self.wrap_enabled() { end } else { usize::MAX };
                 (
                     line,
-                    self.buffer_col_at_display(line, start + visible).min(cap),
+                    self.buffer_col_at_display(line, start, visible).min(cap),
                 )
             }
             None => {
                 let line = (self.scroll + row_idx).min(self.lines.len().saturating_sub(1));
                 (
                     line,
-                    self.buffer_col_at_display(line, visible + self.scroll_col),
+                    self.buffer_col_at_display(line, self.scroll_col, visible),
                 )
             }
         };
@@ -16139,6 +16388,7 @@ impl Editor {
         if self.last_inner.height == 0 || self.lines.is_empty() || row < self.last_inner.y {
             return None;
         }
+        self.sync_tab_cells();
         let text_x = self.last_inner.x + self.last_gutter_width + 1;
         if self.wrap_enabled() {
             // Map the screen row through the last render's visual-row layout so
@@ -16150,7 +16400,10 @@ impl Editor {
                 return None;
             }
             let visible_col = (col - text_x) as usize;
-            let char_col = (start + visible_col).min(end).min(self.line_char_len(line));
+            let char_col = self
+                .buffer_col_at_display(line, start, visible_col)
+                .min(end)
+                .min(self.line_char_len(line));
             return Some((line, char_col));
         }
         // Non-wrap: map through the painted layout (comment boxes shift the
@@ -16176,34 +16429,35 @@ impl Editor {
         }
         Some((
             line,
-            self.buffer_col_at_display(line, self.scroll_col + visible_col),
+            self.buffer_col_at_display(line, self.scroll_col, visible_col),
         ))
     }
 
-    /// Invert the hint-splice display map: the first buffer column of `line`
-    /// whose display cell reaches absolute display column `display_col`. A
-    /// point landing inside a hint's own cells resolves to its anchor column,
-    /// so the caret snaps beside the code the hint annotates. Without hints
-    /// this is the identity (clamped to the line length).
-    fn buffer_col_at_display(&self, line: usize, display_col: usize) -> usize {
+    /// Invert the row's display map: the first buffer column of `line`
+    /// (counting from `base`, the column the row starts at) whose first cell
+    /// reaches `visible_cells` cells right of the row's left edge. Cells are
+    /// as painted: a tab takes its Tab Size, a wide character two, and a
+    /// point landing inside an inlay hint's own cells resolves to its anchor
+    /// column, so the caret snaps beside the code the hint annotates.
+    fn buffer_col_at_display(&self, line: usize, base: usize, visible_cells: usize) -> usize {
+        self.sync_tab_cells();
         let line_len = self.line_char_len(line);
-        let hints = self.row_inlay_spans(line);
-        if hints.is_empty() {
-            return display_col.min(line_len);
-        }
-        let mut c = self.scroll_col;
-        while c < line_len {
-            let extra: usize = hints
+        let base = base.min(line_len);
+        let text = self.lines.get(line).map_or("", String::as_str);
+        let mut row = RowCells::default();
+        row.fill(
+            &text[byte_index_of_char(text, base)..],
+            base,
+            self.row_inlay_spans(line)
                 .iter()
-                .filter(|(hc, _, _)| *hc >= self.scroll_col && *hc <= c)
-                .map(|(_, l, _)| l.chars().count())
-                .sum();
-            if c + extra >= display_col {
-                break;
-            }
+                .filter(|(hc, _, _)| *hc >= base)
+                .map(|(hc, l, _)| (*hc, l.chars().count())),
+        );
+        let mut c = base;
+        while c < line_len && row.cell(c) < visible_cells {
             c += 1;
         }
-        c.min(line_len)
+        c
     }
 
     pub fn word_at(&self, line: usize, col: usize) -> Option<(usize, usize)> {
@@ -18509,11 +18763,21 @@ fn is_wrap_break_after(c: char) -> bool {
         )
 }
 
+thread_local! {
+    /// Cells one `\t` is drawn as: the buffer's "Tab Size" (status bar), set
+    /// by [`Editor::sync_tab_cells`] before anything measures or paints text.
+    static TAB_CELLS: std::cell::Cell<usize> = const { std::cell::Cell::new(1) };
+}
+
+fn set_tab_cells(n: usize) {
+    TAB_CELLS.with(|t| t.set(n.max(1)));
+}
+
 /// Screen cells a char takes in the editor: its display width, with a tab
-/// drawn as one cell (the editor paints tabs as a single glyph).
+/// drawn as the buffer's Tab Size blank cells.
 fn char_cells(c: char) -> usize {
     if c == '\t' {
-        1
+        TAB_CELLS.with(std::cell::Cell::get)
     } else {
         unicode_width::UnicodeWidthChar::width(c).unwrap_or(0)
     }
@@ -18630,6 +18894,24 @@ fn line_mapper<'a>(
                 .next()
         })
     }
+}
+
+/// `marks` (1-based lines of `old`) carried to the lines they sit on in
+/// `new`, another copy of the same file: a second tab of it whose unsaved
+/// edits differ, or the file on disk under a buffer whose edits are being
+/// discarded. Each mark moves as an edit from `old` to `new` would move it
+/// (see [`line_mapper`]): one on a line deleted outright is dropped, and one
+/// on a line edited in place stays on that line, as it does while typing.
+pub fn carry_marks(
+    marks: &std::collections::BTreeSet<usize>,
+    old: &[String],
+    new: &[String],
+) -> std::collections::BTreeSet<usize> {
+    if old == new {
+        return marks.clone();
+    }
+    let map = line_mapper(old, new);
+    marks.iter().filter_map(|&line| map(line)).collect()
 }
 
 /// The line mapping behind [`shift_bookmark_lines`].
@@ -18985,6 +19267,7 @@ fn build_line_spans<'a>(line: &'a str, spans: &[HiSpan]) -> Vec<Span<'a>> {
 impl Widget for &mut Editor {
     fn render(self, area: Rect, buf: &mut Buffer) {
         self.clamp_to_symbol_view();
+        self.sync_tab_cells();
         let block_style = if self.focused {
             Style::default().fg(self.theme.ui(Color::Rgb(0x4e, 0x9a, 0xff)))
         } else {
@@ -19186,7 +19469,6 @@ impl Widget for &mut Editor {
             self.scroll_col = 0;
         }
         let text_x = inner.x + gutter_width + 1;
-        let content_cols = self.content_cols();
 
         // Layout has a small cycle: the horizontal bar takes the bottom row
         // only when a line overflows the text column, but the text column's
@@ -19202,6 +19484,7 @@ impl Widget for &mut Editor {
             .width
             .saturating_sub(gutter_width + 2 + u16::from(self.lines.len() > height))
             as usize;
+        let content_cols = self.content_cols(provisional_text_width);
         let hbar_present =
             !wrap && provisional_text_width > 0 && content_cols > provisional_text_width;
         let text_height = height - usize::from(hbar_present);
@@ -19333,6 +19616,9 @@ impl Widget for &mut Editor {
 
         // Clamp horizontal scroll (non-wrap only) so a wheel swipe can't
         // strand the buffer off-screen, then lay out the horizontal bar.
+        // The extent depends on the width it is measured against, and the
+        // final text column may be narrower than the provisional one.
+        let content_cols = self.content_cols(text_width as usize);
         let max_scroll_col = content_cols.saturating_sub(text_width as usize);
         self.scroll_col = self.scroll_col.min(max_scroll_col);
         let hbar_metrics = scrollbar::horizontal_metrics(
@@ -19770,11 +20056,9 @@ impl Widget for &mut Editor {
             let byte_end = byte_index_of_char(raw, row_end);
             // A wrapped row's width in CELLS, which is what the painters clip
             // by: its char count cut a row of wide characters in half.
-            let row_width = if wrap {
+            let row_width = {
                 let cells: usize = raw[byte_start..byte_end].chars().map(char_cells).sum();
                 cells.max(row_end - row_start).min(text_width as usize) as u16
-            } else {
-                (row_end - row_start) as u16
             };
             let visible_raw = &raw[byte_start..byte_end];
             let seg_bytes = byte_end - byte_start;
@@ -19906,11 +20190,21 @@ impl Widget for &mut Editor {
             // in the flat path `row_start` is the horizontal scroll and
             // translates the columns like every other painter here.
             if self.show_indent_guides && (!wrap || row_start == 0) {
-                for c in (0..self.guide_indent_width(line_idx)).step_by(guide_step) {
+                let (guide_width, guide_src) = self.guide_indent(line_idx);
+                // A blank line's guides sit where its neighbour's indentation
+                // is drawn, tabs and all, not one cell per level.
+                let src_cells;
+                let geometry = if guide_src == line_idx {
+                    &row_cells
+                } else {
+                    src_cells = RowCells::of_line(&self.lines[guide_src], row_start);
+                    &src_cells
+                };
+                for c in (0..guide_width).step_by(guide_step) {
                     if c < row_start {
                         continue;
                     }
-                    let col = row_cells.cell(c);
+                    let col = geometry.cell(c);
                     if col >= usize::from(row_width) {
                         break;
                     }
@@ -19925,7 +20219,9 @@ impl Widget for &mut Editor {
                         _ => guide_fg,
                     };
                     cell.set_symbol("\u{2502}");
-                    let style = cell.style().fg(fg);
+                    // Not italic even over a comment: a slanted guide looks
+                    // broken, and the text's modifier is not the guide's.
+                    let style = cell.style().fg(fg).remove_modifier(Modifier::ITALIC);
                     cell.set_style(style);
                 }
             }
@@ -19984,7 +20280,8 @@ impl Widget for &mut Editor {
                         }
                         let cell = &mut buf[(text_x + col as u16, y)];
                         cell.set_symbol(glyph);
-                        let style = cell.style().fg(ws_fg);
+                        // The glyph marks whitespace, not comment text.
+                        let style = cell.style().fg(ws_fg).remove_modifier(Modifier::ITALIC);
                         cell.set_style(style);
                     }
                 }
@@ -20409,7 +20706,7 @@ impl Widget for &mut Editor {
                         continue;
                     }
                     cell.set_symbol("\u{2502}");
-                    let style = cell.style().fg(ruler_fg);
+                    let style = cell.style().fg(ruler_fg).remove_modifier(Modifier::ITALIC);
                     cell.set_style(style);
                 }
             }
@@ -20758,6 +21055,7 @@ impl Editor {
         if self.last_inner.height == 0 {
             return None;
         }
+        self.sync_tab_cells();
         let text_x = self.last_inner.x + self.last_gutter_width + 1;
         if self.wrap_enabled() {
             // Find the visual row holding the cursor in the layout the last
@@ -20816,8 +21114,14 @@ impl Editor {
         // (`hc < cursor_col`, not `<=`): a caret AT a hint's anchor sits left
         // of the hint, like VS Code, so typing there pushes the hint along.
         let extra = self.inlay_cells_before_cursor(self.cursor_row, self.scroll_col);
-        let visible_col = self.cursor_col - self.scroll_col + extra;
-        if (visible_col as u16) >= text_width {
+        let visible_col = self
+            .lines
+            .get(self.cursor_row)
+            .map_or(self.cursor_col - self.scroll_col, |l| {
+                RowCells::of_line(l, self.scroll_col).text_before(self.cursor_col)
+            })
+            + extra;
+        if visible_col >= text_width as usize {
             return None;
         }
         Some((
@@ -20880,8 +21184,18 @@ impl Editor {
         if text_w == 0 || char_col < diff.scroll_x {
             return None;
         }
-        let vis_col = char_col - diff.scroll_x;
-        if vis_col as u16 >= text_w {
+        // Cells, not chars: a tab before the caret is Tab Size cells wide.
+        self.sync_tab_cells();
+        let line = diff_side_line(diff, row_idx, side);
+        let before = line
+            .chars()
+            .skip(diff.scroll_x)
+            .take(char_col - diff.scroll_x);
+        let drawn = before.map(char_cells).sum::<usize>();
+        let line_len = line.chars().count();
+        // Past the end of the text the caret counts one cell per char.
+        let vis_col = drawn + char_col.saturating_sub(line_len.max(diff.scroll_x));
+        if vis_col >= usize::from(text_w) {
             return None;
         }
         Some((text_x + vis_col as u16, body_top + vis_row as u16))
@@ -21960,6 +22274,9 @@ pub struct EditorTabs {
     /// tab is the only one — closing it isn't allowed so we hide the X).
     tab_close_x: Vec<u16>,
     tab_strip_y: u16,
+    /// Scroll and button state of the tab strip, boxed to keep this large
+    /// struct (a layout-tree leaf) under clippy's size-difference limit.
+    tab_strip: Box<TabStripState>,
     /// The full pane area (tab strip + body) from the most recent render.
     /// Used by `App::handle_mouse` for hit-testing — the active editor's
     /// own `last_area` only covers the body below the strip.
@@ -21981,6 +22298,10 @@ pub struct EditorTabs {
     pub hover_pointer: Option<(u16, u16)>,
     /// Handed to the active editor each frame: see [`Editor::cell_images`].
     pub cell_images: bool,
+    /// The bookmarks of the tabs closed since the App last took them
+    /// ([`Self::take_released_bookmarks`]), on the files' saved lines, so a
+    /// file's marks outlive the last tab that held them.
+    released_bookmarks: Vec<std::collections::HashMap<PathBuf, std::collections::BTreeSet<usize>>>,
 }
 
 impl EditorTabs {
@@ -21996,10 +22317,12 @@ impl EditorTabs {
             tab_screen_ranges: Vec::new(),
             tab_close_x: Vec::new(),
             tab_strip_y: 0,
+            tab_strip: Box::default(),
             last_full_area: Rect::default(),
             search_highlight_term: None,
             search_highlight_opts: crate::widgets::search::SearchOpts::default(),
             hover_pointer: None,
+            released_bookmarks: Vec::new(),
         }
     }
 
@@ -22266,11 +22589,13 @@ impl EditorTabs {
             let was_focused = self.editors[0].focused;
             let mut fresh = Editor::new();
             fresh.focused = was_focused;
-            self.editors[0] = fresh;
+            let closed = std::mem::replace(&mut self.editors[0], fresh);
+            self.release_bookmarks(&closed);
             self.active = 0;
             return true;
         }
-        self.editors.remove(idx);
+        let closed = self.editors.remove(idx);
+        self.release_bookmarks(&closed);
         if self.active > idx {
             self.active -= 1;
         } else if self.active >= self.editors.len() {
@@ -22280,6 +22605,21 @@ impl EditorTabs {
             ed.focused = i == self.active;
         }
         true
+    }
+
+    /// Keep a closing tab's bookmarks for the App, which holds a file's
+    /// marks once no tab does.
+    fn release_bookmarks(&mut self, closed: &Editor) {
+        if !closed.bookmarks.is_empty() {
+            self.released_bookmarks.push(closed.bookmarks_on_disk());
+        }
+    }
+
+    /// The bookmarks of the tabs closed since the last call, oldest first.
+    pub fn take_released_bookmarks(
+        &mut self,
+    ) -> Vec<std::collections::HashMap<PathBuf, std::collections::BTreeSet<usize>>> {
+        std::mem::take(&mut self.released_bookmarks)
     }
 
     /// Close every tab whose index ≠ `keep_idx`, except pinned tabs, which
@@ -22301,6 +22641,8 @@ impl EditorTabs {
                 kept.push(ed);
             } else if ed.pinned || ed.dirty {
                 kept.push(ed);
+            } else {
+                self.release_bookmarks(&ed);
             }
         }
         let removed = before - kept.len();
@@ -22335,6 +22677,8 @@ impl EditorTabs {
                     new_active = Some(kept.len());
                 }
                 kept.push(ed);
+            } else {
+                self.release_bookmarks(&ed);
             }
         }
         let removed = before - kept.len();
@@ -22378,6 +22722,8 @@ impl EditorTabs {
                     new_active = kept.len();
                 }
                 kept.push(ed);
+            } else {
+                self.release_bookmarks(&ed);
             }
         }
         let removed = before - kept.len();
@@ -22407,6 +22753,47 @@ impl EditorTabs {
             }
         }
         None
+    }
+
+    /// Whether `(col, row)` is on the tab strip row of this group, tabs or the
+    /// gap after them.
+    pub fn tab_strip_contains(&self, col: u16, row: u16) -> bool {
+        let r = self.last_full_area;
+        row == self.tab_strip_y && col >= r.x && col < r.x + r.width
+    }
+
+    /// Reserve `cells` at the strip's right end for what the app paints there.
+    pub fn set_tab_reserved_right(&mut self, cells: u16) {
+        self.tab_strip.reserved_right = cells;
+    }
+
+    /// Whether `(col, row)` is on the "all open tabs" button.
+    pub fn tab_list_button_at(&self, col: u16, row: u16) -> bool {
+        let r = self.tab_strip.list_button;
+        r.width > 0 && row == r.y && col >= r.x && col < r.x + r.width
+    }
+
+    /// A wheel notch over the strip: [`Self::scroll_tabs`], but at most one tab
+    /// per [`TAB_WHEEL_GAP`] in a direction. A touchpad sends dozens of events
+    /// per swipe, which would otherwise fling the strip to its end.
+    pub fn scroll_tabs_wheel(&mut self, delta: isize) {
+        let now = std::time::Instant::now();
+        if let Some((at, dir)) = self.tab_strip.wheel_at
+            && dir == delta
+            && now.duration_since(at) < TAB_WHEEL_GAP
+        {
+            return;
+        }
+        self.tab_strip.wheel_at = Some((now, delta));
+        self.scroll_tabs(delta);
+    }
+
+    /// Scroll the tab strip by `delta` tabs (the wheel over it). The render
+    /// clamps the result to what still fills the strip.
+    pub fn scroll_tabs(&mut self, delta: isize) {
+        let last = self.editors.len().saturating_sub(1);
+        self.tab_strip.scroll = self.tab_strip.scroll.saturating_add_signed(delta).min(last);
+        self.tab_strip.revealed = Some((self.active, self.editors.len()));
     }
 
     /// Full filesystem path for a tab, used as the hover tooltip that
@@ -22706,7 +23093,8 @@ impl EditorTabs {
             if let Some(prev) = self.preview_index()
                 && prev != idx
             {
-                self.editors.remove(prev);
+                let dropped = self.editors.remove(prev);
+                self.release_bookmarks(&dropped);
                 let new_idx = if idx > prev { idx - 1 } else { idx };
                 // Bypass `select` here because the removal may have left
                 // `self.active` pointing past the end (when the active
@@ -23220,6 +23608,32 @@ impl DerefMut for EditorTabs {
 // derives colors for every manifest theme, so the strip follows the selected
 // theme instead of staying VS-Code navy. Only the label foregrounds stay
 // fixed: this muted grey and white are legible on all dark themes.
+/// The tab strip's scroll position and button, see `EditorTabs::tab_strip`.
+#[derive(Default)]
+struct TabStripState {
+    /// Index of the first tab drawn in the strip: it scrolls by tab when
+    /// there are more of them than fit (wheel over the strip, or the active
+    /// tab changing).
+    scroll: usize,
+    /// The `(active, tab count)` the strip last scrolled itself to reveal, so
+    /// a wheel scroll away from the active tab is not undone on the next
+    /// frame.
+    revealed: Option<(usize, usize)>,
+    /// Cells at the strip's right end the app paints over (the Customize
+    /// Layout icons); tabs stop short of them. Set before each render.
+    reserved_right: u16,
+    /// The "all open tabs" button at the right end of the tab area, drawn
+    /// only when the tabs do not all fit (otherwise empty).
+    list_button: Rect,
+    /// When and which way the wheel last moved the strip, so a touchpad's
+    /// flood of events moves it a tab at a time rather than all at once.
+    wheel_at: Option<(std::time::Instant, isize)>,
+}
+
+/// Cells the "all open tabs" button takes at the right end of a crowded strip.
+const TAB_LIST_W: u16 = 3;
+/// The least time between two tabs of wheel scrolling in one direction.
+const TAB_WHEEL_GAP: std::time::Duration = std::time::Duration::from_millis(90);
 const TAB_INACTIVE_FG: Color = Color::Rgb(0x9d, 0xa5, 0xb4);
 const TAB_ACTIVE_FG: Color = Color::White;
 
@@ -23302,7 +23716,6 @@ impl Widget for &mut EditorTabs {
         self.tab_strip_y = strip.y;
         self.tab_screen_ranges.clear();
         self.tab_close_x.clear();
-        let mut cursor_x = strip.x;
         let active = self.active;
         // Black theme (`focus_gradient` doubles as the theme flag): the
         // active tab wears the muted teal selection fill instead of the
@@ -23319,18 +23732,85 @@ impl Widget for &mut EditorTabs {
         let active_tab_bg = theme.tab_active_bg();
         let pointer = self.hover_pointer;
         let display_labels = disambiguated_tab_labels(&self.editors);
+        // Tabs never run under what the app paints at the strip's right end,
+        // and the strip scrolls by tab when they do not all fit.
+        let mut strip_right = strip.x
+            + strip
+                .width
+                .saturating_sub(self.tab_strip.reserved_right.min(strip.width));
+        let avail_full = usize::from(strip_right.saturating_sub(strip.x));
+        let widths: Vec<usize> = display_labels
+            .iter()
+            .map(|l| {
+                // Display CELLS, not chars (#168 review): a CJK file or
+                // directory name is double-width, and a char count shifted
+                // the close button and hit ranges left of the painted text.
+                usize::from(Span::raw(l.as_str()).width() as u16) + 4 // a pad either side, the close cell and a gap
+            })
+            .collect();
+        let n = widths.len();
+        // Tabs that do not all fit get an "all open tabs" button in the last
+        // cells of the tab area, so the hidden ones stay reachable.
+        self.tab_strip.list_button = Rect::default();
+        if widths.iter().sum::<usize>() > avail_full && avail_full > usize::from(TAB_LIST_W) {
+            strip_right -= TAB_LIST_W;
+            self.tab_strip.list_button = Rect {
+                x: strip_right,
+                y: strip.y,
+                width: TAB_LIST_W,
+                height: 1,
+            };
+            let hovered = self.hover_pointer.is_some_and(|(px, py)| {
+                py == strip.y && px >= strip_right && px < strip_right + TAB_LIST_W
+            });
+            // As the layout icons beside it: the glyph goes from grey to the
+            // accent on hover, the cell keeps the strip's own background.
+            let fg = if hovered {
+                theme.ui(Color::Rgb(0x4e, 0x9a, 0xff))
+            } else {
+                theme.ui(Color::Rgb(0xcc, 0xcc, 0xcc))
+            };
+            let style = Style::default().fg(fg).bg(theme.tab_strip_bg());
+            buf.set_string(strip_right, strip.y, " \u{2261} ", style);
+        }
+        let avail = usize::from(strip_right.saturating_sub(strip.x));
+        // Last scroll that still fills the strip: past it the tail would leave
+        // blank room on the right while earlier tabs stay hidden.
+        let max_scroll = {
+            let mut first = n.saturating_sub(1);
+            let mut used = widths.get(first).copied().unwrap_or(0);
+            while first > 0 && used + widths[first - 1] <= avail {
+                first -= 1;
+                used += widths[first];
+            }
+            first
+        };
+        if self.tab_strip.revealed != Some((active, n)) {
+            self.tab_strip.revealed = Some((active, n));
+            if active < self.tab_strip.scroll {
+                self.tab_strip.scroll = active;
+            } else {
+                // Scroll right just far enough that the active tab fits whole.
+                while self.tab_strip.scroll < active
+                    && widths[self.tab_strip.scroll..=active].iter().sum::<usize>() > avail
+                {
+                    self.tab_strip.scroll += 1;
+                }
+            }
+        }
+        self.tab_strip.scroll = self.tab_strip.scroll.min(max_scroll);
+        let mut cursor_x = strip.x;
+        let mut hidden_rest = false;
         for (i, ed) in self.editors.iter().enumerate() {
             let label_text = display_labels[i].clone();
-            // Display CELLS, not chars (#168 review): a CJK file or
-            // directory name is double-width, and a char count shifted
-            // the close button and hit ranges left of the painted text.
             let label_chars = Span::raw(label_text.as_str()).width() as u16;
-            let pad: u16 = 1;
-            let close_pad: u16 = 2;
-            let width = label_chars
-                .saturating_add(pad * 2)
-                .saturating_add(close_pad);
-            if cursor_x.saturating_add(width) > strip.x + strip.width {
+            let width = widths[i] as u16;
+            if i < self.tab_strip.scroll
+                || hidden_rest
+                || usize::from(cursor_x.saturating_add(width)) > usize::from(strip_right)
+            {
+                // Scrolled off, or past the room: no cells, no hit range.
+                hidden_rest |= i >= self.tab_strip.scroll;
                 self.tab_screen_ranges.push((cursor_x, 0));
                 self.tab_close_x.push(0);
                 continue;
@@ -35258,8 +35738,8 @@ mod tests {
             let text_x = e.last_inner.x + e.last_gutter_width + 1;
             let y = e.last_inner.y;
             assert_eq!(
-                row_text(&buf, y, text_x, text_x + 6),
-                "x y z ",
+                row_text(&buf, y, text_x, text_x + 11),
+                "x    y    z",
                 "wrap {wrap}"
             );
             let (cx, cy) = e.cursor_screen_pos().expect("the caret is on screen");
@@ -35269,11 +35749,158 @@ mod tests {
                 "the caret sits on z, wrap {wrap}"
             );
             assert_eq!(
-                e.buffer_pos_at(text_x + 2, y),
+                e.buffer_pos_at(text_x + 5, y),
                 Some((0, 2)),
                 "a click on y lands on y, wrap {wrap}"
             );
         }
+    }
+
+    /// A tab is drawn as the buffer's Tab Size, and the caret, clicks and
+    /// horizontal scroll follow it.
+    #[test]
+    fn a_tab_is_as_wide_as_the_tab_size() {
+        for width in [2u32, 4, 8] {
+            let mut e = editor_with("\t\tz");
+            e.set_indent_style(IndentStyle {
+                width,
+                use_spaces: false,
+            });
+            e.wrap_override = Some(false);
+            e.cursor_col = 2;
+            let buf = guide_buf(&mut e, 40, 5);
+            let text_x = e.last_inner.x + e.last_gutter_width + 1;
+            let y = e.last_inner.y;
+            let z_cell = text_x + 2 * width as u16;
+            assert_eq!(buf[(z_cell, y)].symbol(), "z", "tab size {width}");
+            assert_eq!(e.cursor_screen_pos(), Some((z_cell, y)), "tab size {width}");
+            assert_eq!(e.buffer_pos_at(z_cell, y), Some((0, 2)), "tab size {width}");
+        }
+    }
+
+    #[test]
+    fn the_diff_maps_clicks_and_the_caret_through_the_cells_a_tab_takes() {
+        use crate::widgets::diff::DiffSide;
+        let f1 = NamedTempFile::new().unwrap();
+        let f2 = NamedTempFile::new().unwrap();
+        std::fs::write(f1.path(), "\tx\n").unwrap();
+        std::fs::write(f2.path(), "\ty\n").unwrap();
+        let mut t = EditorTabs::new();
+        t.open_diff(f1.path(), f2.path()).unwrap();
+        let i = t.active_index();
+        t.editors[i].focused = true;
+        t.editors[i].set_indent_style(IndentStyle {
+            width: 4,
+            use_spaces: false,
+        });
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 10,
+        };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut t.editors[i], area, &mut buf);
+        let ed = &t.editors[i];
+        let diff = ed.diff.as_ref().unwrap();
+        let body_top = ed.last_inner.y + 1;
+        let l_gutter = (diff.left_lines.len() + 1).to_string().len() as u16 + 1;
+        let l_text_x = ed.last_inner.x + l_gutter + 2;
+        // Cells 0-3 are the tab, cell 4 the "x": a click on it is char 1, and
+        // one on the tab is char 0.
+        let hit = |dx: u16| {
+            crate::widgets::editor::diff_hit_test(diff, ed.last_inner, l_text_x + dx, body_top)
+        };
+        assert_eq!(hit(4), Some((DiffSide::Left, 0, 1)));
+        assert_eq!(hit(2), Some((DiffSide::Left, 0, 0)));
+        // And the caret on char 1 is drawn on cell 4.
+        t.editors[i]
+            .diff
+            .as_mut()
+            .unwrap()
+            .start_selection(DiffSide::Left, 0, 1);
+        assert_eq!(
+            t.editors[i].diff_caret_screen_pos(),
+            Some((l_text_x + 4, body_top))
+        );
+    }
+
+    #[test]
+    fn a_line_of_tabs_wider_than_the_pane_can_scroll_to_its_tail() {
+        let mut e = editor_with(&"\t".repeat(10));
+        e.set_indent_style(IndentStyle {
+            width: 8,
+            use_spaces: false,
+        });
+        e.wrap_override = Some(false);
+        // Ten tabs are 80 cells: in a 30-cell column the bar must appear and
+        // reach the scroll that shows the last of them, in char columns.
+        let cols = e.content_cols(30);
+        assert!(cols > 30, "the line overflows, got extent {cols}");
+        let max_scroll = cols - 30;
+        let tail: usize = 10 - max_scroll;
+        assert!(
+            tail * 8 <= 30 && (tail + 1) * 8 > 30,
+            "{max_scroll} chars scroll off"
+        );
+        // A different Tab Size is a different extent, not a stale cache hit.
+        e.set_indent_style(IndentStyle {
+            width: 2,
+            use_spaces: false,
+        });
+        assert_eq!(e.content_cols(30), 10, "20 cells fit in 30");
+    }
+
+    #[test]
+    fn a_crowded_tab_strip_scrolls_and_stops_short_of_the_layout_icons() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut tabs = EditorTabs::new();
+        for i in 0..12 {
+            let f = tmp.path().join(format!("file_{i:02}.txt"));
+            std::fs::write(&f, "x\n").unwrap();
+            tabs.open_pinned(&f).unwrap();
+        }
+        let area = Rect::new(0, 0, 60, 10);
+        let strip_right = 60 - 9;
+        let draw = |tabs: &mut EditorTabs| {
+            tabs.set_tab_reserved_right(9);
+            let mut buf = ratatui::buffer::Buffer::empty(area);
+            ratatui::widgets::Widget::render(&mut *tabs, area, &mut buf);
+        };
+        let visible = |tabs: &EditorTabs| -> Vec<usize> {
+            (0..12)
+                .filter(|&i| tabs.tab_screen_x(i).is_some_and(|(_, w)| w > 0))
+                .collect()
+        };
+        draw(&mut tabs);
+        // The last tab is active, so the strip has scrolled to show it whole,
+        // and nothing reaches the cells the layout icons own.
+        let vis = visible(&tabs);
+        assert!(vis.contains(&11), "the active tab is on screen: {vis:?}");
+        assert!(vis.len() < 12, "not every tab fits");
+        for &i in &vis {
+            let (x, w) = tabs.tab_screen_x(i).unwrap();
+            assert!(x + w <= strip_right, "tab {i} runs under the icons");
+        }
+        // The wheel brings earlier tabs back without activating anything.
+        for _ in 0..12 {
+            tabs.scroll_tabs(-1);
+        }
+        draw(&mut tabs);
+        let vis = visible(&tabs);
+        assert_eq!(vis.first(), Some(&0), "scrolled back to the first tab");
+        assert!(
+            !vis.contains(&11),
+            "the scroll is not snapped back: {vis:?}"
+        );
+        assert_eq!(tabs.active_index(), 11);
+        // Picking another tab reveals it again.
+        tabs.select(0);
+        draw(&mut tabs);
+        assert!(visible(&tabs).contains(&0));
+        tabs.select(11);
+        draw(&mut tabs);
+        assert!(visible(&tabs).contains(&11));
     }
 
     #[test]
@@ -36124,11 +36751,13 @@ mod tests {
     #[test]
     fn a_tab_takes_its_cell_in_the_side_by_side_diff() {
         use crate::widgets::diff::INTRALINE_REMOVED_BG;
+        set_tab_cells(1);
         assert_eq!(clip_pad_cells("\tx", 0, 4), " x  ");
+        // The diff draws a tab as the Tab Size of the buffer (4 by default).
         let (buf, inner, _) = render_wide_diff("x\n\tn = 1\n", "x\n\tn = 2\n");
-        let (l_text_x, y) = left_text_at(&buf, inner, 2, " n = 1");
-        assert_eq!(buf[(l_text_x + 5, y)].symbol(), "1");
-        assert_eq!(buf[(l_text_x + 5, y)].bg, intraline(INTRALINE_REMOVED_BG));
+        let (l_text_x, y) = left_text_at(&buf, inner, 2, "    n = 1");
+        assert_eq!(buf[(l_text_x + 8, y)].symbol(), "1");
+        assert_eq!(buf[(l_text_x + 8, y)].bg, intraline(INTRALINE_REMOVED_BG));
     }
 
     /// Narrow text clips and pads exactly as before: by character, to the
@@ -36145,6 +36774,78 @@ mod tests {
         assert_eq!(
             buf[(inner.x + inner.width / 2, changed)].symbol(),
             "\u{2502}"
+        );
+    }
+
+    /// #2020: the diff view paints code in its language's colours, on the
+    /// rows' red, green and plain backgrounds, as the editor does.
+    #[test]
+    fn the_diff_view_paints_code_in_its_syntax_colours() {
+        let file = |text: &str| {
+            let f = tempfile::Builder::new().suffix(".rs").tempfile().unwrap();
+            std::fs::write(f.path(), text).unwrap();
+            f
+        };
+        let f1 = file("fn main() {\n    let x = 1;\n}\n");
+        let f2 = file("fn main() {\n    let x = 2;\n}\n");
+        let mut t = EditorTabs::new();
+        t.open_diff(f1.path(), f2.path()).unwrap();
+        let idx = t.active_index();
+        t.editors[idx].diff.as_mut().unwrap().colour_syntax(None);
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 10,
+        };
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut t.editors[idx], area, &mut buf);
+        let ed = &t.editors[idx];
+        let inner = ed.last_inner;
+        let (l_text_x, unchanged) = left_text_at(&buf, inner, 3, "fn main() {");
+        assert_ne!(
+            buf[(l_text_x, unchanged)].fg,
+            buf[(l_text_x + 3, unchanged)].fg,
+            "the keyword `fn` and the name `main` read in different colours"
+        );
+        let (_, changed) = left_text_at(&buf, inner, 3, "    let x = 1;");
+        let r_text_x = inner.x + inner.width / 2 + 1 + 2 + 2;
+        assert_eq!(
+            row_text(&buf, changed, r_text_x, r_text_x + 14),
+            "    let x = 2;"
+        );
+        let removed_bg = ed.theme.ui(Color::Rgb(0x4a, 0x1f, 0x1f));
+        let added_bg = ed.theme.ui(Color::Rgb(0x1f, 0x42, 0x2a));
+        for (x, bg, side) in [
+            (l_text_x, removed_bg, "removed"),
+            (r_text_x, added_bg, "added"),
+        ] {
+            let keyword = &buf[(x + 4, changed)];
+            let name = &buf[(x + 8, changed)];
+            assert_eq!(keyword.symbol(), "l");
+            assert_ne!(
+                keyword.fg, name.fg,
+                "`let` and `x` differ on the {side} side"
+            );
+            assert_eq!(keyword.bg, bg, "the {side} row keeps its background");
+            assert_eq!(name.bg, bg);
+        }
+    }
+
+    /// A file with no grammar keeps the diff's own tints: red text on the
+    /// removed side, green on the added.
+    #[test]
+    fn a_diff_with_no_grammar_keeps_its_red_and_green_text() {
+        let (buf, inner, r_text_x) = render_wide_diff("x\nold line\n", "x\nnew line\n");
+        let (l_text_x, y) = left_text_at(&buf, inner, 2, "old line");
+        let theme = crate::theme::Theme::default();
+        assert_eq!(
+            buf[(l_text_x, y)].fg,
+            theme.ui(Color::Rgb(0xff, 0xb3, 0xb3))
+        );
+        assert_eq!(
+            buf[(r_text_x, y)].fg,
+            theme.ui(Color::Rgb(0xb6, 0xee, 0xc4))
         );
     }
 
@@ -41044,6 +41745,24 @@ mod tests {
     }
 
     #[test]
+    fn blank_line_guides_follow_the_neighbours_tab_cells() {
+        let mut e = editor_with("\t\tfoo\n\n\t\tbar");
+        e.set_indent_style(IndentStyle {
+            width: 4,
+            use_spaces: false,
+        });
+        e.show_indent_guides = true;
+        let buf = guide_buf(&mut e, 40, 6);
+        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        let y = e.last_inner.y + 1;
+        let width = e.indent_style().width as u16;
+        let at = |dx: u16| buf[(text_x + dx, y)].symbol().to_string();
+        assert_eq!(at(0), "\u{2502}", "first level");
+        assert_eq!(at(width), "\u{2502}", "second level, one tab further");
+        assert_eq!(at(1), " ", "no guide inside the tab");
+    }
+
+    #[test]
     fn guide_indent_width_resolves_blank_lines_from_neighbours() {
         let e = editor_with("def f():\n    a = 1\n\n    b = 2\n\ndef g():\n    pass");
         assert_eq!(e.guide_indent_width(2), 4, "blank inside a block");
@@ -41959,12 +42678,12 @@ mod tests {
         let text_x = e.last_inner.x + e.last_gutter_width + 1;
         let y0 = e.last_inner.y;
         assert_eq!(
-            row_text(&buf, y0, text_x, text_x + 9),
-            "\u{2192}return\u{b7}1"
+            row_text(&buf, y0, text_x, text_x + 12),
+            "\u{2192}   return\u{b7}1"
         );
         assert_eq!(
-            row_text(&buf, y0 + 1, text_x, text_x + 13),
-            "\u{b7}\u{b7}x\u{b7}=\u{b7}2\u{2192}#\u{b7}tab"
+            row_text(&buf, y0 + 1, text_x, text_x + 16),
+            "\u{b7}\u{b7}x\u{b7}=\u{b7}2\u{2192}   #\u{b7}tab"
         );
     }
 
