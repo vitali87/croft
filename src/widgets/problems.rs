@@ -205,6 +205,10 @@ pub enum ProblemHit {
     },
 }
 
+/// What a related row starts with: two cells deeper than its diagnostic's
+/// message (`   {glyph} `), so it reads as that row's child (#1523).
+const RELATED_INDENT: &str = "       ";
+
 /// How many trailing characters of the free-text filter the toolbar
 /// chip shows. The filter itself is unbounded; only its display is.
 const FILTER_CHIP_CHARS: usize = 24;
@@ -927,7 +931,7 @@ impl ProblemsPanel {
         vec![
             Span::styled(
                 format!(
-                    "       {} [Ln {}, Col {}]: ",
+                    "{RELATED_INDENT}{} [Ln {}, Col {}]: ",
                     related.rel_path,
                     related.line + 1,
                     related.col + 1
@@ -935,7 +939,7 @@ impl ProblemsPanel {
                 Style::default().fg(self.theme.ui(COLOR_DIM)),
             ),
             Span::styled(
-                related.message.replace('\n', " "),
+                crate::lsp::manager::one_line(&related.message),
                 Style::default().fg(self.theme.ui(COLOR_MSG)),
             ),
         ]
@@ -1297,7 +1301,7 @@ mod tests {
             rel_path: String::from("src/lib.rs"),
             line: 2,
             col: 17,
-            message: String::from("immutable borrow occurs here"),
+            message: String::from("immutable borrow\r\noccurs here"),
         }];
         let mut p = ProblemsPanel::new();
         p.set_groups(vec![group(
@@ -1308,8 +1312,9 @@ mod tests {
         let screen = render(&mut p, 80, 6);
         assert!(row(&screen, 2).contains("cannot borrow `v`"), "{screen}");
         assert!(
-            row(&screen, 3)
-                .starts_with("       src/lib.rs [Ln 3, Col 18]: immutable borrow occurs here"),
+            row(&screen, 3).starts_with(&format!(
+                "{RELATED_INDENT}src/lib.rs [Ln 3, Col 18]: immutable borrow occurs here"
+            )),
             "{screen}"
         );
         assert!(

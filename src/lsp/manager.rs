@@ -744,8 +744,9 @@ pub struct DiagnosticOrigin {
 impl Diagnostic {
     /// The places the server points at to explain this diagnostic (#1523):
     /// rustc's "immutable borrow occurs here", TypeScript's "'foo' is
-    /// declared here". Read off the diagnostic as the server sent it rather
-    /// than copied out of it; one croft made itself has none.
+    /// declared here". Not stored on croft's diagnostic: built on demand
+    /// from the server's own, kept in `origin`; one croft made itself has
+    /// none.
     pub fn related(&self) -> Vec<RelatedLocation> {
         let Some(origin) = self.origin.as_deref() else {
             return Vec::new();
@@ -787,9 +788,16 @@ impl RelatedLocation {
             file.display(),
             self.line + 1,
             self.character + 1,
-            self.message
+            one_line(&self.message)
         )
     }
+}
+
+/// `text` on one line, each line break (`\r\n`, `\n` or `\r`) a space: a
+/// related location's message, which the hover and PROBLEMS show one
+/// location to a line (#1523).
+pub fn one_line(text: &str) -> String {
+    text.replace("\r\n", " ").replace(['\r', '\n'], " ")
 }
 
 /// A diagnostic's rule code with the server's `source` and the rule's
@@ -10147,6 +10155,22 @@ while True:
             publish.code_description_support,
             Some(true),
             "#1540: a server may leave a rule's link out otherwise"
+        );
+    }
+
+    /// #1523: a related location takes one line of the hover, whatever
+    /// line breaks its message holds.
+    #[test]
+    fn a_related_location_label_is_one_line() {
+        let related = RelatedLocation {
+            path: PathBuf::from("/w/src/a.ts"),
+            line: 1,
+            character: 2,
+            message: "'foo'\ris\r\ndeclared\nhere.".into(),
+        };
+        assert_eq!(
+            related.label(Path::new("/w")),
+            "src/a.ts(2, 3): 'foo' is declared here."
         );
     }
 
