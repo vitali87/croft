@@ -1185,7 +1185,12 @@ fn a_task_problem_matcher_owns_its_pane_and_watch_publishes_win() {
     // A watch publish replaces the pane's batch wholesale — and the
     // watcher's own exit (a FinishedCommand rescan over its whole
     // history) must not resurrect old cycles: that one scan is skipped.
-    assert!(app.install_build_diags(7, Some(&cwd), Vec::new()));
+    assert!(app.install_build_diags(
+        7,
+        Some(&cwd),
+        Vec::new(),
+        crate::build_matchers::DEFAULT_TABSTOP
+    ));
     assert!(app.problems.groups().is_empty(), "empty batch clears");
     app.watch_published_panes.insert(7);
     assert!(
