@@ -48955,6 +48955,14 @@ impl App {
         let proceed = matches!(payload.trim().to_ascii_lowercase().as_str(), "y" | "yes");
         if proceed {
             if let Some(dialog) = self.connect_dialog.as_mut() {
+                // What a yes installs must have been on screen (#950): a
+                // window too short to show it all keeps the question open.
+                if !dialog.notes.is_empty() && !dialog.notes_shown {
+                    dialog.error = Some(String::from(
+                        "Make the window taller to read what a remote compile installs, then answer",
+                    ));
+                    return;
+                }
                 dialog.set_installing();
             }
             if let Some(session) = self.install_session.as_ref() {

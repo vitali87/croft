@@ -68,6 +68,10 @@ pub struct ConnectDialog {
     /// is seen before the answer at any terminal size: the log panel that
     /// could hold it is the first thing a short terminal drops.
     pub notes: Vec<String>,
+    /// Whether the last frame drew every row of `notes` and the answer box
+    /// under them. A yes is only taken once it has (#950 review): on a
+    /// window too short to show it all, the question is not yet asked.
+    pub notes_shown: bool,
     /// The active theme: drives the gradient border on Black and every
     /// chrome color. Set by the app before render.
     pub theme: crate::theme::Theme,
@@ -103,6 +107,7 @@ impl ConnectDialog {
             submitted: false,
             install_started_at: None,
             notes: Vec::new(),
+            notes_shown: false,
             theme: crate::theme::Theme::default(),
         }
     }
@@ -178,6 +183,7 @@ impl ConnectDialog {
         self.phase = DialogPhase::AwaitingFallbackConfirmation;
         self.prompt_text = format!("Fast install unavailable: {reason}");
         self.notes = notes.iter().map(|n| n.to_string()).collect();
+        self.notes_shown = false;
         self.status_line = default_status_for(&self.phase, &self.host);
         self.input.clear();
         self.submitted = false;
@@ -470,6 +476,7 @@ impl Widget for &mut ConnectDialog {
 
         // What a yes installs, above the answer box: drawn before it, so
         // whenever the box is on screen the notes above it are too.
+        let mut notes_drawn = 0;
         if !notes.is_empty() {
             let style = Style::default()
                 .fg(self.theme.ui(Color::Rgb(0xe6, 0xed, 0xf5)))
@@ -480,6 +487,7 @@ impl Widget for &mut ConnectDialog {
                 }
                 buf.set_stringn(inner.x, cy, row, inner.width as usize, style);
                 cy = cy.saturating_add(1);
+                notes_drawn += 1;
             }
             cy = cy.saturating_add(1);
         }
@@ -575,6 +583,7 @@ impl Widget for &mut ConnectDialog {
             cy = cy.saturating_add(2);
         }
 
+        self.notes_shown = notes_drawn == notes.len() && self.field_rect.height > 0;
         let body_end = cy;
         let footer_y = inner.y + inner.height.saturating_sub(2);
         if footer_y >= cy {
@@ -779,6 +788,7 @@ mod tests {
             let field = d.field_rect;
             let inner = d.last_inner;
             assert!(field.height > 0, "{w}x{h}: the answer box is drawn");
+            assert!(d.notes_shown, "{w}x{h}");
             let above: String = (inner.y..field.y)
                 .map(|y| {
                     (inner.x..inner.right())
@@ -794,6 +804,20 @@ mod tests {
                     "{w}x{h}: {word:?} is shown above the box"
                 );
             }
+        }
+    }
+
+    /// #950 review: a window too short for the notes and the answer box
+    /// says so, so the app can hold a yes until they have been seen.
+    #[test]
+    fn a_window_too_short_for_the_fallback_notes_reports_them_unseen() {
+        let mut d = ConnectDialog::new("devbox".to_string());
+        d.set_fallback_prompt("no cross toolchain", &["one note", "another note"]);
+        for (h, seen) in [(12u16, false), (24, true)] {
+            let area = Rect::new(0, 0, 80, h);
+            let mut buf = Buffer::empty(area);
+            Widget::render(&mut d, area, &mut buf);
+            assert_eq!(d.notes_shown, seen, "80x{h}");
         }
     }
 
