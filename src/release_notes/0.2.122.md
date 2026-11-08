@@ -1,0 +1,1 @@
+feature: The breadcrumb pickers (the lists of a folder's entries, a file's neighbours or a symbol's siblings) filter as you type; Backspace widens the list and Esc clears the text before it closes the picker.
