@@ -7755,6 +7755,13 @@ impl Editor {
             md.links = links;
             md.built_seq = self.edit_seq;
             md.follows = follows;
+            // The visual-row caches (images, play glyphs, scroll sync) are
+            // keyed on `(built_seq, width)`, and a preview following another
+            // pane rebuilds with its own `built_seq` unchanged (#1605
+            // review): without this they kept the first build's rows, so
+            // clicks and scrolling landed on stale lines. `(0, 0)` never
+            // matches a drawn width.
+            md.wrap_key = (0, 0);
         }
     }
 
@@ -29958,6 +29965,27 @@ mod tests {
         std::fs::write(&other, "# Other\n").unwrap();
         e.open(&other).unwrap();
         assert!(e.markdown_preview.is_none(), "another file opens as source");
+    }
+
+    /// #1605 review: a preview rebuilt from another pane's text keeps its own
+    /// `built_seq`, so its row caches must still be rebuilt, or scroll sync,
+    /// link and play-glyph clicks use the first build's rows.
+    #[test]
+    fn a_preview_rebuilt_from_another_pane_refreshes_its_row_caches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("doc.md");
+        std::fs::write(&path, "# Title\n").unwrap();
+        let mut e = Editor::new();
+        e.open(&path).unwrap();
+        assert!(e.toggle_markdown_preview());
+        first_row_screen(&mut e, 60, 20);
+        let typed = "# Title\n\nA new paragraph.\n\n```sh\necho hi\n```\n";
+        e.rebuild_markdown_preview_from(typed, Some((7, 7)));
+        first_row_screen(&mut e, 60, 20);
+        let md = e.markdown_preview.as_ref().unwrap();
+        assert_eq!(md.row_of_line.len(), md.lines.len(), "scroll-sync rows");
+        assert_eq!(md.runnables.len(), 1);
+        assert_eq!(md.run_rows.len(), 1, "the new block's play glyph has a row");
     }
 
     /// Render into a fresh buffer and return the whole screen as one string.
