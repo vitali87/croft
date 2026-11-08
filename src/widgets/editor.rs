@@ -957,25 +957,29 @@ fn render_sheet(
             if is_cursor {
                 if let Some(edit) = editing.as_ref() {
                     // In-grid editor (#177): show the tail that keeps the
-                    // caret visible, caret cell reversed.
-                    // Window in CHARACTERS (#193 review: the cursor is
-                    // a byte offset, and byte math shortened the tail
-                    // for multi-byte text), then convert to a byte start.
+                    // caret visible, caret cell reversed. The window is
+                    // measured in screen columns (#1138), whole graphemes
+                    // dropped from the left until what is before the caret
+                    // fits with a column left for the caret itself.
+                    use unicode_segmentation::UnicodeSegmentation;
                     let avail = w as usize;
-                    let chars_before = edit.value[..edit.cursor].chars().count();
-                    let skip = chars_before.saturating_sub(avail.saturating_sub(1));
-                    let start = edit
-                        .value
-                        .char_indices()
-                        .nth(skip)
-                        .map(|(i, _)| i)
-                        .unwrap_or(0);
+                    let before = &edit.value[..edit.cursor];
+                    let mut caret_cells = crate::sheet::text_width(before);
+                    let mut start = 0;
+                    let mut dropped = before.grapheme_indices(true);
+                    while caret_cells + 1 > avail {
+                        let Some((i, g)) = dropped.next() else {
+                            break;
+                        };
+                        caret_cells -= crate::sheet::grapheme_width(g);
+                        start = i + g.len();
+                    }
                     let shown = &edit.value[start..];
                     let edit_style = Style::default()
                         .fg(theme.accent_contrast_fg())
                         .bg(theme.accent());
                     write_cell(buf, body_x + *x_off, y, w, shown, edit_style);
-                    let caret_cells = shown[..edit.cursor - start].chars().count() as u16;
+                    let caret_cells = caret_cells.min(u16::MAX as usize) as u16;
                     let cx = body_x + *x_off + caret_cells.min(w.saturating_sub(1));
                     buf[(cx, y)].set_style(
                         Style::default()
@@ -2305,16 +2309,32 @@ fn render_unified_deletion(
 }
 
 fn write_cell(buf: &mut Buffer, x: u16, y: u16, w: u16, text: &str, style: Style) {
-    let max_chars = w as usize;
-    // Overflow is cut plainly with no trailing ellipsis marker (the user wants
-    // no ellipsis anywhere in croft).
-    let content: String = text.chars().take(max_chars).map(visible_control).collect();
-    let mut padded = content;
-    let pad_count = max_chars.saturating_sub(padded.chars().count());
-    for _ in 0..pad_count {
-        padded.push(' ');
+    use unicode_segmentation::UnicodeSegmentation;
+    // Fill the slot in screen columns, not chars (#1138): a CJK or emoji
+    // glyph is two columns, so `w` chars drew up to twice the slot and ran
+    // into the next column. Blank it first; then a wide glyph that would
+    // straddle the edge is left out and its column stays blank. Overflow is
+    // cut plainly with no trailing ellipsis marker (the user wants no
+    // ellipsis anywhere in croft).
+    let width = w as usize;
+    buf.set_stringn(x, y, " ".repeat(width), width, style);
+    let mut col = 0;
+    for g in text.graphemes(true) {
+        let gw = crate::sheet::grapheme_width(g);
+        if gw == 0 {
+            continue;
+        }
+        if col + gw > width {
+            break;
+        }
+        if g.contains(char::is_control) {
+            let shown: String = g.chars().map(visible_control).collect();
+            buf.set_stringn(x + col as u16, y, &shown, gw, style);
+        } else {
+            buf.set_stringn(x + col as u16, y, g, gw, style);
+        }
+        col += gw;
     }
-    buf.set_string(x, y, &padded, style);
 }
 
 /// A control character as a glyph a cell can show (#1002): the buffer drops
@@ -27521,6 +27541,133 @@ mod tests {
         );
         assert_eq!(cell.fg, Color::DarkGray);
         assert!(!row(3).contains("NULL"), "'' stays empty: {}", row(3));
+    }
+
+    /// #1138: CJK, Hangul and emoji take two columns each. The grid sized
+    /// and filled cells in chars, so `서울특별시` showed as `서울특` and ran
+    /// into the next column (`大阪府2750000`).
+    #[test]
+    fn wide_characters_fit_their_column_and_keep_the_gap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("cities.csv");
+        std::fs::write(
+            &p,
+            "city,pref,pop\n東京都,東京,13960000\n大阪市,大阪府,2750000\n\
+             Seoul,서울특별시,9500000\nemoji 🎉🎉🎉,x,1\n",
+        )
+        .unwrap();
+        let mut e = Editor::new();
+        e.open(&p).unwrap();
+        let view = e.sheet.as_mut().unwrap();
+        // The caret sits on the header-less last row, so the rows above
+        // draw plainly.
+        view.sheets[0].cur_row = 3;
+        let area = Rect::new(0, 0, 60, 8);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        render_sheet(
+            view,
+            Some(&p),
+            area,
+            &mut buf,
+            Color::Reset,
+            crate::theme::Theme::default(),
+        );
+        // What a terminal shows on row `y`: a wide glyph's covered cell is
+        // skipped, as the terminal draws the glyph over it.
+        let row = |y: u16| -> String {
+            let mut out = String::new();
+            let mut x = 0;
+            while x < area.width {
+                let sym = buf[(x, y)].symbol();
+                out.push_str(sym);
+                x += unicode_width::UnicodeWidthStr::width(sym).max(1) as u16;
+            }
+            out
+        };
+        let screen: Vec<String> = (0..area.height).map(row).collect();
+        let body = screen.join("\n");
+        for whole in ["東京都", "大阪府", "서울특별시", "emoji 🎉🎉🎉"] {
+            assert!(body.contains(whole), "{whole} is drawn whole:\n{body}");
+        }
+        assert!(
+            !body.contains("大阪府2750000"),
+            "a gap between columns:\n{body}"
+        );
+        assert!(
+            !body.contains("시9500000"),
+            "a gap between columns:\n{body}"
+        );
+        // Every value of a column starts at the same screen column.
+        let col_of = |needle: &str| -> usize {
+            let line = screen.iter().find(|l| l.contains(needle)).unwrap();
+            let byte = line.find(needle).unwrap();
+            unicode_width::UnicodeWidthStr::width(&line[..byte])
+        };
+        assert_eq!(col_of("13960000"), col_of("2750000"));
+        assert_eq!(col_of("2750000"), col_of("9500000"));
+        assert_eq!(col_of("大阪府"), col_of("서울특별시"));
+    }
+
+    /// #1138: the in-grid editor windows its text in screen columns too. A
+    /// value of wide characters longer than the column shows its tail with
+    /// the caret inside the slot, not twice the slot running over the next
+    /// column.
+    #[test]
+    fn the_in_grid_editor_keeps_wide_text_inside_its_column() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("cities.csv");
+        std::fs::write(&p, "city,pref,pop\nSeoul,서울특별시,9500000\nx,y,1\n").unwrap();
+        let mut e = Editor::new();
+        e.open(&p).unwrap();
+        let view = e.sheet.as_mut().unwrap();
+        let value = "서울특별시서울특별시".to_string();
+        view.sheets[0].cur_row = 0;
+        view.sheets[0].cur_col = 1;
+        view.editing = Some(crate::sheet::CellEdit {
+            cursor: value.len(),
+            value,
+        });
+        let area = Rect::new(0, 0, 50, 6);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        render_sheet(
+            view,
+            Some(&p),
+            area,
+            &mut buf,
+            Color::Reset,
+            crate::theme::Theme::default(),
+        );
+        let line = (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .find(|l| l.contains("Seoul"))
+            .unwrap();
+        assert!(
+            line.contains("9500000"),
+            "the next column is intact: {line:?}"
+        );
+        // The tail that fits: 4 of the 10 glyphs (8 columns), then the caret.
+        assert!(line.contains("울 특 별 시"), "{line:?}");
+        assert!(!line.contains("서 울 특 별 시 서"), "{line:?}");
+    }
+
+    #[test]
+    fn a_wide_glyph_that_would_straddle_the_cell_edge_is_left_out() {
+        let area = Rect::new(0, 0, 6, 1);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        buf.set_string(0, 0, "zzzzzz", Style::default());
+        // Three columns hold one wide glyph; the second would need 4.
+        write_cell(&mut buf, 0, 0, 3, "表表", Style::default());
+        assert_eq!(buf[(0, 0)].symbol(), "表");
+        assert_eq!(buf[(2, 0)].symbol(), " ", "the edge column is blank");
+        assert_eq!(
+            buf[(3, 0)].symbol(),
+            "z",
+            "nothing past the slot is touched"
+        );
     }
 
     #[test]

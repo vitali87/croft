@@ -838,10 +838,37 @@ fn compute_col_widths(headers: Option<&Vec<String>>, rows: &[Vec<String>]) -> Ve
     widths
 }
 
+/// Screen columns a cell's text needs, capped at the widest a column gets.
+/// Counted the way the grid draws it (#1138): CJK, Hangul and emoji take
+/// two columns, so a count of chars gave `서울특별시` half its width and the
+/// next column painted over it.
 fn display_width(s: &str) -> u16 {
-    // unicode-width is a separate dep; chars().count() is good enough for
-    // ASCII and single-codepoint scripts that croft usually deals with.
-    s.chars().count().min(u16::MAX as usize) as u16
+    use unicode_segmentation::UnicodeSegmentation;
+    let mut w = 0;
+    for g in s.graphemes(true) {
+        w += grapheme_width(g);
+        if w >= MAX_COL_DISPLAY_W as usize {
+            break;
+        }
+    }
+    w as u16
+}
+
+/// Columns one grapheme of a cell takes in the grid. A control character
+/// is drawn as one visible glyph (`⏎`, `→`, `␀`), so it is one column each;
+/// anything else is as wide as the terminal draws it.
+pub(crate) fn grapheme_width(g: &str) -> usize {
+    if g.contains(char::is_control) {
+        g.chars().count()
+    } else {
+        unicode_width::UnicodeWidthStr::width(g)
+    }
+}
+
+/// Columns `s` takes in the grid: [`grapheme_width`] summed.
+pub(crate) fn text_width(s: &str) -> usize {
+    use unicode_segmentation::UnicodeSegmentation;
+    s.graphemes(true).map(grapheme_width).sum()
 }
 
 /// Refuse a sheet whose dense extent is over [`MAX_SHEET_CELLS`]. The
