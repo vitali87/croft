@@ -3802,6 +3802,8 @@ pub struct App {
     /// Indentation guides (#129), VS Code `editor.guides.indentation`: on by
     /// default, pushed to every editor by the per-frame focus sync.
     indent_guides_enabled: bool,
+    /// Home walks back one wrapped row per press (`home_walks_wrapped_rows`).
+    home_walks_rows: bool,
     /// Bracket-pair colorization (#131): on by default, pushed to every
     /// editor by the per-frame focus sync like the indent guides.
     bracket_colors_enabled: bool,
@@ -4007,6 +4009,10 @@ pub struct App {
     drop_to_local: bool,
     is_remote: bool,
     context_menu: Option<ContextMenu>,
+    /// The type-to-filter state of an open breadcrumb picker: the typed text
+    /// and the picker's full, unfiltered rows. Reset whenever a picker opens
+    /// (`show_crumb_picker`) and read only while `context_menu.crumb` is set.
+    crumb_filter: (String, Vec<MenuEntry>),
     prompt: Option<Prompt>,
     fs_watch: FsWatch,
     /// One extra watcher per SECONDARY workspace root (#147), sharing the
@@ -6919,6 +6925,7 @@ impl App {
             inline_blame_enabled: !loaded_prefs.disable_inline_blame,
             provenance_overlay: false,
             indent_guides_enabled: !loaded_prefs.disable_indent_guides,
+            home_walks_rows: loaded_prefs.home_walks_wrapped_rows,
             bracket_colors_enabled: !loaded_prefs.disable_bracket_colors,
             whitespace_mode: crate::widgets::editor::WhitespaceMode::from_pref(
                 &loaded_prefs.render_whitespace,
@@ -7011,6 +7018,7 @@ impl App {
             drop_to_local: false,
             is_remote: is_remote_session(),
             context_menu: None,
+            crumb_filter: (String::new(), Vec::new()),
             prompt: None,
             fs_watch,
             fs_watch_extra: Vec::new(),
@@ -13309,7 +13317,41 @@ impl App {
         let mut menu = ContextMenu::flat(origin, items, self.tree.root.clone());
         menu.selected = selected;
         menu.crumb = Some(i);
+        self.crumb_filter = (String::new(), menu.items.clone());
         self.context_menu = Some(menu);
+    }
+
+    /// Re-derive a breadcrumb picker's rows from `crumb_filter`: the rows
+    /// whose label contains the typed text (case-insensitive), keeping the
+    /// highlighted row when it survives and otherwise starting from the top.
+    fn apply_crumb_filter(&mut self) {
+        let Some(menu) = self.context_menu.as_mut() else {
+            return;
+        };
+        let (text, all) = &self.crumb_filter;
+        let kept = menu.items.get(menu.selected).and_then(|e| match e {
+            MenuEntry::Item { label, .. } => Some(label.clone()),
+            _ => None,
+        });
+        let needle = text.trim().to_lowercase();
+        menu.items = all
+            .iter()
+            .filter(|e| match e {
+                MenuEntry::Item { label, .. } => {
+                    needle.is_empty() || label.to_lowercase().contains(&needle)
+                }
+                _ => needle.is_empty(),
+            })
+            .cloned()
+            .collect();
+        menu.selected = kept
+            .and_then(|k| {
+                menu.items
+                    .iter()
+                    .position(|e| matches!(e, MenuEntry::Item { label, .. } if *label == k))
+            })
+            .unwrap_or(0);
+        menu.scroll.set(0);
     }
 
     /// A file picked from a breadcrumb picker opens as a Quick Open pick does.
@@ -21672,6 +21714,7 @@ impl App {
             ed.pdf_viewer_enabled = pdf_on;
             ed.csv_viewer_enabled = csv_on;
             ed.show_indent_guides = self.indent_guides_enabled;
+            ed.home_walks_rows = self.home_walks_rows;
             ed.show_bracket_colors = self.bracket_colors_enabled;
             ed.provenance_overlay = self.provenance_overlay;
             ed.whitespace_mode = whitespace_mode_in(langs, ws_global, editor_scope_id(ed));
@@ -21686,6 +21729,7 @@ impl App {
                 ed.pdf_viewer_enabled = pdf_on;
                 ed.csv_viewer_enabled = csv_on;
                 ed.show_indent_guides = self.indent_guides_enabled;
+                ed.home_walks_rows = self.home_walks_rows;
                 ed.show_bracket_colors = self.bracket_colors_enabled;
                 ed.provenance_overlay = self.provenance_overlay;
                 ed.whitespace_mode = whitespace_mode_in(langs, ws_global, editor_scope_id(ed));
@@ -24365,6 +24409,25 @@ impl App {
         // The top-level panel; the open submenu's parent row stays highlighted.
         let top = menu.scroll_for(clipped.height.saturating_sub(2) as usize);
         self.render_menu_panel(frame, clipped, &menu.items, menu.selected, top, grad);
+        // A breadcrumb picker shows what has been typed on its top border.
+        if menu.crumb.is_some() && !self.crumb_filter.0.is_empty() {
+            let text = if menu.items.is_empty() {
+                format!(" No match: {} ", self.crumb_filter.0)
+            } else {
+                format!(" Filter: {} ", self.crumb_filter.0)
+            };
+            let room = clipped.width.saturating_sub(4) as usize;
+            let shown: String = text.chars().take(room).collect();
+            frame.buffer_mut().set_string(
+                clipped.x + 2,
+                clipped.y,
+                shown,
+                Style::default()
+                    .fg(self.theme.ui(Color::White))
+                    .bg(self.theme.ui(Color::Rgb(0x1e, 0x1e, 0x1e)))
+                    .add_modifier(Modifier::BOLD),
+            );
+        }
         // Float the open submenu's panel beside its parent.
         if let Some(sub_rect) = self.submenu_rect()
             && let Some(MenuEntry::Submenu { items, .. }) =
@@ -27733,7 +27796,23 @@ impl App {
                     self.open_search_hit(&hit);
                 }
             }
-            KeyCode::Backspace if self.search.backspace() => {
+            // The caret keys (#1729), as in every input row: Left/Right/
+            // Home/End move inside the focused field, Delete removes ahead,
+            // and Ctrl/Cmd/Alt makes Left/Right/Backspace/Delete walk by a word.
+            KeyCode::Left => self.search.move_caret(|t, c| {
+                crate::widgets::line_edit::caret_left(t, c, key_walks_by_word(key))
+            }),
+            KeyCode::Right => self.search.move_caret(|t, c| {
+                crate::widgets::line_edit::caret_right(t, c, key_walks_by_word(key))
+            }),
+            KeyCode::Home => self.search.move_caret(|_, _| 0),
+            KeyCode::End => self
+                .search
+                .move_caret(|t, _| crate::widgets::line_edit::char_len(t)),
+            KeyCode::Delete if self.search.delete_forward(key_walks_by_word(key)) => {
+                self.refresh_search_if_filtering();
+            }
+            KeyCode::Backspace if self.search.backspace_by(key_walks_by_word(key)) => {
                 self.refresh_search_if_filtering();
             }
             KeyCode::Up => self.search.move_up(),
@@ -53244,16 +53323,22 @@ impl App {
             self.status = String::from("Cmd+V: clipboard is empty");
             return;
         }
+        self.paste_str_into_search(s);
+        self.status = format!(
+            "Cmd+V: pasted into {} field",
+            search_field_name(self.search.field)
+        );
+    }
+
+    /// Paste `s` at the caret of the focused Search field, whichever it is,
+    /// for the clipboard key and the bracketed-paste event alike.
+    fn paste_str_into_search(&mut self, s: &str) {
         self.search.insert_str(s);
         // Replace text doesn't change which files match, so only re-run the
         // scan when the paste landed in a search-affecting field.
         if self.search.field != crate::widgets::search::SearchField::Replace {
             self.submit_search_query();
         }
-        self.status = format!(
-            "Cmd+V: pasted into {} field",
-            search_field_name(self.search.field)
-        );
     }
 
     fn paste_clipboard_into_editor(&mut self, text: Option<&str>) {
@@ -53368,17 +53453,12 @@ impl App {
         // (or tree) the user has since clicked into — the keystroke path is
         // already focus-gated via `match self.focus`, so paste must match it.
         if self.focus == Pane::Editor && self.editor_find.is_some() {
-            let mut new_q = self
-                .editor_find
-                .as_ref()
-                .map(|st| st.query.clone())
-                .unwrap_or_default();
-            for c in s.chars() {
-                if !c.is_control() {
-                    new_q.push(c);
-                }
-            }
-            self.editor_find_set_query(new_q);
+            // Pasted at the caret (#1729), like typing: the bar is an input
+            // line, and a middle-of-query paste must not jump to the end.
+            let text = s.to_string();
+            self.editor_find_edit_at_caret(|t, c| {
+                crate::widgets::editor_find::insert_at(t, c, &text)
+            });
             return false;
         }
         // Finder drag-and-drop into croft arrives via the host terminal as
@@ -53456,8 +53536,7 @@ impl App {
             }
         }
         if self.sidebar_view == SidebarView::Search && self.focus == Pane::Tree {
-            self.search.insert_str_into_query(s);
-            self.submit_search_query();
+            self.paste_str_into_search(s);
             self.status = format!("Pasted {} chars", s.chars().count());
             return false;
         }
@@ -53484,17 +53563,10 @@ impl App {
             }
             Pane::Terminal => {
                 if self.terminal_find.is_some() {
-                    let mut q = self
-                        .terminal_find
-                        .as_ref()
-                        .map(|st| st.query.clone())
-                        .unwrap_or_default();
-                    for c in s.chars() {
-                        if !c.is_control() {
-                            q.push(c);
-                        }
-                    }
-                    self.terminal_find_set_query(q);
+                    // At the caret, like the clipboard key (#1729).
+                    self.terminal_find_edit_at_caret(|t, at| {
+                        crate::widgets::line_edit::insert_at(t, at, s)
+                    });
                 } else {
                     self.paste_terminal_input(s.as_bytes());
                 }
@@ -60624,6 +60696,7 @@ impl App {
         let count = crate::widgets::editor_find::count_matches(&lines, &new_query, opts);
         if let Some(state) = self.terminal_find.as_mut() {
             state.query = new_query.clone();
+            state.set_caret(new_query.chars().count());
             state.set_match_count(count, false);
             state.match_index = None;
         }
@@ -60707,47 +60780,68 @@ impl App {
         }
     }
 
+    /// Edit the terminal find query around its caret (#1729).
+    fn terminal_find_edit_at_caret(&mut self, edit: impl FnOnce(&str, usize) -> (String, usize)) {
+        let Some((text, caret)) = self.terminal_find.as_ref().map(|s| {
+            let (text, caret) = edit(&s.query, s.caret());
+            (text, caret)
+        }) else {
+            return;
+        };
+        self.terminal_find_set_query(text);
+        if let Some(s) = self.terminal_find.as_mut() {
+            s.set_caret(caret);
+        }
+    }
+
+    /// Move the terminal find caret without touching the query.
+    fn terminal_find_move_caret(&mut self, step: impl FnOnce(&str, usize) -> usize) {
+        if let Some(s) = self.terminal_find.as_mut() {
+            let at = step(&s.query, s.caret());
+            s.set_caret(at);
+        }
+    }
+
     fn handle_terminal_find_key(&mut self, key: KeyEvent) {
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        let by_word = key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER | KeyModifiers::ALT);
         match (key.code, key.modifiers) {
             (KeyCode::Esc, _) => self.close_terminal_find(),
             (KeyCode::Enter, _) | (KeyCode::F(3), _) => {
                 self.terminal_find_jump(!shift);
             }
-            (KeyCode::Backspace, _) => {
-                let mut q = self
-                    .terminal_find
-                    .as_ref()
-                    .map(|s| s.query.clone())
-                    .unwrap_or_default();
-                q.pop();
-                self.terminal_find_set_query(q);
-            }
+            // The caret keys (#1729), the same as the editor's find bar:
+            // the terminal's query is a real input line too.
+            (KeyCode::Left, _) => self.terminal_find_move_caret(|t, c| {
+                crate::widgets::editor_find::caret_left(t, c, by_word)
+            }),
+            (KeyCode::Right, _) => self.terminal_find_move_caret(|t, c| {
+                crate::widgets::editor_find::caret_right(t, c, by_word)
+            }),
+            (KeyCode::Home, _) => self.terminal_find_move_caret(|_, _| 0),
+            (KeyCode::End, _) => self.terminal_find_move_caret(|t, _| t.chars().count()),
+            (KeyCode::Delete, _) => self.terminal_find_edit_at_caret(|t, c| {
+                crate::widgets::editor_find::delete_at(t, c, by_word)
+            }),
+            (KeyCode::Backspace, _) => self.terminal_find_edit_at_caret(|t, c| {
+                crate::widgets::editor_find::delete_before(t, c, by_word)
+            }),
             (KeyCode::Char('v'), m)
                 if m.contains(KeyModifiers::CONTROL) || m.contains(KeyModifiers::SUPER) =>
             {
                 if let Some(text) = self.clipboard_text() {
-                    let mut q = self
-                        .terminal_find
-                        .as_ref()
-                        .map(|s| s.query.clone())
-                        .unwrap_or_default();
-                    for c in text.chars() {
-                        if !c.is_control() {
-                            q.push(c);
-                        }
-                    }
-                    self.terminal_find_set_query(q);
+                    self.terminal_find_edit_at_caret(|t, c| {
+                        crate::widgets::editor_find::insert_at(t, c, &text)
+                    });
                 }
             }
             (KeyCode::Char(c), m) if !m.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) => {
-                let mut q = self
-                    .terminal_find
-                    .as_ref()
-                    .map(|s| s.query.clone())
-                    .unwrap_or_default();
-                q.push(c);
-                self.terminal_find_set_query(q);
+                let typed = c.to_string();
+                self.terminal_find_edit_at_caret(|t, caret| {
+                    crate::widgets::editor_find::insert_at(t, caret, &typed)
+                });
             }
             _ => {}
         }
@@ -61349,6 +61443,14 @@ impl App {
     }
 
     fn editor_find_set_query(&mut self, new_query: String) {
+        // A whole-query replacement puts the caret after it; the caret
+        // editors below then move it where the edit left it.
+        // Assigned, not `set_caret`: that clamps to the query still in place,
+        // so a longer replacement would leave the caret inside it. Reads
+        // clamp through `caret()` once the new query is in.
+        if let Some(s) = self.editor_find.as_mut() {
+            s.caret = new_query.chars().count();
+        }
         let unchanged = self
             .editor_find
             .as_ref()
@@ -61750,22 +61852,45 @@ impl App {
             .unwrap_or(false)
     }
 
-    /// Append / edit the focused find-bar field: the replace row edits in
-    /// place, the query row re-runs the search via `editor_find_set_query`.
-    fn editor_find_edit_focused(&mut self, edit: impl FnOnce(&mut String)) {
+    /// Edit the focused find field around the caret (#1729): the query row
+    /// passes its caret through `edit`, the replace row — which has none —
+    /// always edits at its end.
+    fn editor_find_edit_at_caret(&mut self, edit: impl FnOnce(&str, usize) -> (String, usize)) {
         if self.editor_find_replace_focused() {
             if let Some(s) = self.editor_find.as_mut() {
-                edit(&mut s.replace);
+                let (text, caret) = edit(&s.replace, s.replace_caret());
+                s.replace = text;
+                s.set_replace_caret(caret);
             }
             return;
         }
-        let mut new_q = self
-            .editor_find
-            .as_ref()
-            .map(|s| s.query.clone())
-            .unwrap_or_default();
-        edit(&mut new_q);
-        self.editor_find_set_query(new_q);
+        let Some((text, caret)) = self.editor_find.as_ref().map(|s| {
+            let (text, caret) = edit(&s.query, s.caret());
+            (text, caret)
+        }) else {
+            return;
+        };
+        self.editor_find_set_query(text);
+        if let Some(s) = self.editor_find.as_mut() {
+            s.set_caret(caret);
+        }
+    }
+
+    /// Move the focused find bar's caret without touching the text. The
+    /// selection a seed put on the query is dropped, as any caret key does.
+    fn editor_find_move_caret(&mut self, step: impl FnOnce(&str, usize) -> usize) {
+        if self.editor_find_replace_focused() {
+            if let Some(s) = self.editor_find.as_mut() {
+                let at = step(&s.replace, s.replace_caret());
+                s.set_replace_caret(at);
+            }
+            return;
+        }
+        if let Some(s) = self.editor_find.as_mut() {
+            let at = step(&s.query, s.caret());
+            s.set_caret(at);
+            s.query_selected = false;
+        }
     }
 
     /// What Ctrl+F puts in the find bar: a one-line selection, else the
@@ -61853,21 +61978,10 @@ impl App {
                 .modifiers
                 .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
         if word_delete {
-            // The word before the end, with any spaces after it, as in a
-            // text field; a lone punctuation mark goes on its own.
-            self.editor_find_edit_focused(|s| {
-                let kept = s.trim_end().len();
-                let word_start = s[..kept]
-                    .char_indices()
-                    .rev()
-                    .find(|&(_, c)| !crate::widgets::editor::is_word_char(c))
-                    .map_or(0, |(i, c)| i + c.len_utf8());
-                let cut = if word_start == kept {
-                    s[..kept].char_indices().next_back().map_or(0, |(i, _)| i)
-                } else {
-                    word_start
-                };
-                s.truncate(cut);
+            // The word before the caret, as in a text field; a lone
+            // punctuation mark goes on its own.
+            self.editor_find_edit_at_caret(|text, caret| {
+                crate::widgets::editor_find::delete_before(text, caret, true)
             });
             return;
         }
@@ -61887,6 +62001,9 @@ impl App {
         let cmd_like = key
             .modifiers
             .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER);
+        let by_word = key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER | KeyModifiers::ALT);
         match (key.code, key.modifiers) {
             (KeyCode::Esc, _) => self.close_editor_find(),
             // `Cmd+Opt+Enter` (Linux: `Ctrl+Alt+Enter`) = Replace All,
@@ -61921,26 +62038,46 @@ impl App {
                     self.editor_find_jump_next();
                 }
             }
+            // The caret keys (#1729): the query is a real input line, so
+            // Left/Right/Home/End move inside it and Delete removes what
+            // lies ahead. Ctrl/Cmd/Alt with Left/Right/Delete walks by a
+            // word, as a text field does.
+            (KeyCode::Left, _) => {
+                self.editor_find_move_caret(|t, c| {
+                    crate::widgets::editor_find::caret_left(t, c, by_word)
+                });
+            }
+            (KeyCode::Right, _) => {
+                self.editor_find_move_caret(|t, c| {
+                    crate::widgets::editor_find::caret_right(t, c, by_word)
+                });
+            }
+            (KeyCode::Home, _) => self.editor_find_move_caret(|_, _| 0),
+            (KeyCode::End, _) => self.editor_find_move_caret(|t, _| t.chars().count()),
+            (KeyCode::Delete, _) => {
+                self.editor_find_edit_at_caret(|t, c| {
+                    crate::widgets::editor_find::delete_at(t, c, by_word)
+                });
+            }
             (KeyCode::Backspace, _) => {
-                self.editor_find_edit_focused(|s| {
-                    s.pop();
+                self.editor_find_edit_at_caret(|t, c| {
+                    crate::widgets::editor_find::delete_before(t, c, false)
                 });
             }
             (KeyCode::Char('v'), m)
                 if m.contains(KeyModifiers::CONTROL) || m.contains(KeyModifiers::SUPER) =>
             {
                 if let Some(text) = self.clipboard_text() {
-                    self.editor_find_edit_focused(|s| {
-                        for c in text.chars() {
-                            if !c.is_control() {
-                                s.push(c);
-                            }
-                        }
+                    self.editor_find_edit_at_caret(|t, c| {
+                        crate::widgets::editor_find::insert_at(t, c, &text)
                     });
                 }
             }
             (KeyCode::Char(c), m) if !m.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) => {
-                self.editor_find_edit_focused(|s| s.push(c));
+                let typed = c.to_string();
+                self.editor_find_edit_at_caret(|t, caret| {
+                    crate::widgets::editor_find::insert_at(t, caret, &typed)
+                });
             }
             _ => {}
         }
@@ -62385,6 +62522,35 @@ impl App {
         // that was never checked. Only the popup's keys answer it.
         if self.pending_terminal_paste.is_some() {
             return;
+        }
+        // A click on a find bar (in the editor or over a terminal) puts the
+        // caret of the row it lands on, before the pane under it sees it.
+        if matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
+            && !self.modal_overlay_open()
+            && self.context_menu.is_none()
+        {
+            if self
+                .editor_find
+                .as_mut()
+                .is_some_and(|f| f.click_at(m.column, m.row))
+            {
+                // The bar takes the keys only while the editor has focus, so
+                // a click on it from the terminal or the side bar moves focus
+                // there too, or the typing after it would land elsewhere.
+                if self.focus != Pane::Editor {
+                    self.focus_pane(Pane::Editor);
+                }
+                return;
+            }
+            // The terminal find bar closes whenever the terminal loses
+            // focus, so a click on it always comes with focus already there.
+            if self
+                .terminal_find
+                .as_mut()
+                .is_some_and(|f| f.click_at(m.column, m.row))
+            {
+                return;
+            }
         }
         // The wheel over an editor group's tab strip scrolls its tabs.
         if let Some(delta) = match m.kind {
@@ -64296,6 +64462,8 @@ impl App {
                     // Click inside one of the input boxes focuses that field.
                     if let Some(field) = self.search.field_at(m.column, m.row) {
                         self.search.focus_field(field);
+                        // A click in the text puts the caret under it.
+                        self.search.click_caret(m.column);
                         return;
                     }
                     if let Some(t) = self.search.toggle_at(m.column, m.row) {
@@ -68925,6 +69093,7 @@ impl App {
         self.editor.blame_enabled = self.inline_blame_enabled;
         self.indent_guides_enabled = !p.disable_indent_guides;
         self.editor.show_indent_guides = self.indent_guides_enabled;
+        self.home_walks_rows = p.home_walks_wrapped_rows;
         self.bracket_colors_enabled = !p.disable_bracket_colors;
         self.editor.show_bracket_colors = self.bracket_colors_enabled;
         self.whitespace_mode =
@@ -68932,14 +69101,17 @@ impl App {
         self.editor.whitespace_mode = self.whitespace_mode;
         self.rulers = crate::widgets::editor::normalize_rulers(&p.rulers);
         // Straight onto every open editor: the focus sync that otherwise
-        // carries it does not run per frame, so a reload would leave open
-        // tabs on the old rulers until an unrelated focus change.
+        // carries them does not run per frame, so a reload would leave open
+        // tabs on the old rulers and Home walk until an unrelated focus
+        // change.
         for ed in self.editor.editors.iter_mut() {
             ed.rulers.clone_from(&self.rulers);
+            ed.home_walks_rows = self.home_walks_rows;
         }
         for group in self.editor_layout.inactive_groups_mut() {
             for ed in group.editors.iter_mut() {
                 ed.rulers.clone_from(&self.rulers);
+                ed.home_walks_rows = self.home_walks_rows;
             }
         }
         self.line_numbers = crate::widgets::editor::LineNumbers::from_pref(&p.line_numbers);
@@ -69679,6 +69851,37 @@ impl App {
     }
 
     fn handle_menu_key(&mut self, key: KeyEvent) {
+        // A breadcrumb picker filters as you type (the rows are a long list
+        // of symbols, files or folders): characters narrow it, Backspace
+        // widens it, Esc clears the text before it dismisses the picker.
+        if self
+            .context_menu
+            .as_ref()
+            .is_some_and(|m| m.crumb.is_some() && m.open_submenu.is_none())
+        {
+            match key.code {
+                KeyCode::Char(c)
+                    if !key.modifiers.intersects(
+                        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                    ) =>
+                {
+                    self.crumb_filter.0.push(c);
+                    self.apply_crumb_filter();
+                    return;
+                }
+                KeyCode::Backspace if !self.crumb_filter.0.is_empty() => {
+                    self.crumb_filter.0.pop();
+                    self.apply_crumb_filter();
+                    return;
+                }
+                KeyCode::Esc if !self.crumb_filter.0.is_empty() => {
+                    self.crumb_filter.0.clear();
+                    self.apply_crumb_filter();
+                    return;
+                }
+                _ => {}
+            }
+        }
         match key.code {
             KeyCode::Esc => {
                 // Esc backs out of an open submenu first; at the top level it
@@ -78234,6 +78437,13 @@ fn is_remote_jump_key(key: KeyEvent) -> bool {
 /// GlobalKeyMap forwarder (no menu relocation) to deliver it here.
 fn is_extensions_jump_key(key: KeyEvent) -> bool {
     is_cmd_shift_letter(key, 'x')
+}
+
+/// Whether a caret or delete key walks by a word rather than a character:
+/// Ctrl, Cmd or Alt held (#1729).
+fn key_walks_by_word(key: KeyEvent) -> bool {
+    key.modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER | KeyModifiers::ALT)
 }
 
 /// `Ctrl/Cmd+Shift+M`: show the PROBLEMS tab from any pane, VS Code's

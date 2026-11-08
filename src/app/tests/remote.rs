@@ -488,6 +488,11 @@ fn opening_a_local_port_opens_directly_not_via_relay() {
 #[test]
 fn double_clicking_a_port_row_opens_it() {
     use crate::widgets::ports::PortOrigin;
+    // Opening a remote port forwards it through the drop relay whenever the
+    // process-wide relay key is set, so a relay test running at the same
+    // moment would receive this test's forward in its request log. Hold the
+    // relay lock: no relay test runs alongside, and the relay stays off here.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.bottom_panel_tab = BottomPanelTab::Ports;
@@ -522,6 +527,11 @@ fn double_clicking_a_port_row_opens_it() {
 #[test]
 fn a_modified_click_does_not_pair_with_a_plain_one_in_the_ports_table() {
     use crate::widgets::ports::PortOrigin;
+    // Opening a remote port forwards it through the drop relay whenever the
+    // process-wide relay key is set, so a relay test running at the same
+    // moment would receive this test's forward in its request log. Hold the
+    // relay lock: no relay test runs alongside, and the relay stays off here.
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.bottom_panel_tab = BottomPanelTab::Ports;

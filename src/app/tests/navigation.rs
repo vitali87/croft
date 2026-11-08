@@ -3481,3 +3481,111 @@ fn a_stale_jump_reply_changes_nothing_and_a_found_target_still_jumps() {
     assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (0, 0));
     assert_ne!(app.status, "No definition found");
 }
+
+fn crumb_picker_labels(app: &App) -> Vec<String> {
+    app.context_menu
+        .as_ref()
+        .map(|m| {
+            m.items
+                .iter()
+                .filter_map(|e| match e {
+                    MenuEntry::Item { label, .. } => Some(label.clone()),
+                    _ => None,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[test]
+fn a_breadcrumb_picker_filters_as_you_type() {
+    let tmp = tempfile::tempdir().unwrap();
+    for f in ["alpha.rs", "beta.rs", "gamma.txt"] {
+        std::fs::write(tmp.path().join(f), "x\n").unwrap();
+    }
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor
+        .open_preview(&tmp.path().join("alpha.rs"))
+        .unwrap();
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    app.open_breadcrumb_picker(0);
+    assert_eq!(crumb_picker_labels(&app).len(), 3, "all rows to begin with");
+
+    for c in "RS".chars() {
+        app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::SHIFT))
+            .unwrap();
+    }
+    assert_eq!(
+        crumb_picker_labels(&app),
+        vec!["alpha.rs", "beta.rs"],
+        "case-insensitive substring"
+    );
+    app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(crumb_picker_labels(&app).is_empty(), "nothing matches");
+    // Enter on an empty list does nothing and the picker stays.
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.context_menu.is_some());
+    app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(crumb_picker_labels(&app).len(), 2);
+    // Esc clears the text first, and only the next Esc dismisses.
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(crumb_picker_labels(&app).len(), 3);
+    assert!(app.context_menu.is_some());
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.context_menu.is_none());
+}
+
+#[test]
+fn a_filtered_breadcrumb_picker_opens_the_row_you_land_on() {
+    let tmp = tempfile::tempdir().unwrap();
+    for f in ["alpha.rs", "beta.rs", "gamma.txt"] {
+        std::fs::write(tmp.path().join(f), "x\n").unwrap();
+    }
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor
+        .open_preview(&tmp.path().join("alpha.rs"))
+        .unwrap();
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    app.open_breadcrumb_picker(0);
+    for c in "gam".chars() {
+        app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
+            .unwrap();
+    }
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.context_menu.is_none());
+    assert!(
+        app.editor
+            .path
+            .as_ref()
+            .is_some_and(|p| p.ends_with("gamma.txt")),
+        "the filtered row opened, not the first of the unfiltered list"
+    );
+}
+
+#[test]
+fn a_new_breadcrumb_picker_starts_unfiltered() {
+    let tmp = tempfile::tempdir().unwrap();
+    for f in ["alpha.rs", "beta.rs"] {
+        std::fs::write(tmp.path().join(f), "x\n").unwrap();
+    }
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor
+        .open_preview(&tmp.path().join("alpha.rs"))
+        .unwrap();
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    app.open_breadcrumb_picker(0);
+    app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(crumb_picker_labels(&app).len(), 1);
+    app.open_breadcrumb_picker(0);
+    assert_eq!(crumb_picker_labels(&app).len(), 2, "the old text is gone");
+}
