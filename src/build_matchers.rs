@@ -109,45 +109,77 @@ pub fn char_col(line: &str, col: usize, unit: ColumnUnit, tabstop: usize) -> usi
 /// under `base`: the file the compiler just read, so its line is the one the
 /// column counts. A row whose file cannot be read, or whose line is plain
 /// ASCII without a tab, keeps its column, which is the same in every unit.
+///
+/// This runs on the UI thread as a batch is installed, so it is bounded: one
+/// file is read at a time and dropped before the next, a file over 8 MiB is
+/// skipped, and once the batch has read 32 MiB the remaining files' rows keep
+/// their columns rather than stall the editor on the reads.
 pub fn convert_columns(
     diags: &mut [BuildDiag],
     base: &std::path::Path,
     unit: ColumnUnit,
     tabstop: usize,
 ) {
+    convert_columns_within(diags, base, unit, tabstop, 32 * 1024 * 1024);
+}
+
+/// [`convert_columns`] with the batch's read budget, `budget` bytes, given.
+fn convert_columns_within(
+    diags: &mut [BuildDiag],
+    base: &std::path::Path,
+    unit: ColumnUnit,
+    tabstop: usize,
+    mut budget: u64,
+) {
     /// A file bigger than this is not read just to place a caret.
     const MAX_BYTES: u64 = 8 * 1024 * 1024;
     if unit == ColumnUnit::Char {
         return;
     }
-    let mut files: std::collections::HashMap<std::path::PathBuf, Option<Vec<String>>> =
+    // Each file's rows in first-seen order, so a file is read once and its
+    // text dropped before the next file is read.
+    let mut by_file: Vec<(std::path::PathBuf, Vec<usize>)> = Vec::new();
+    let mut slot_of: std::collections::HashMap<std::path::PathBuf, usize> =
         std::collections::HashMap::new();
-    for d in diags
-        .iter_mut()
-        .filter(|d| d.source == "build" && d.col > 0)
-    {
-        let path = {
-            let p = std::path::Path::new(&d.file);
-            if p.is_absolute() {
-                p.to_path_buf()
-            } else {
-                base.join(p)
-            }
-        };
-        let lines = files.entry(path).or_insert_with_key(|p| {
-            let small = std::fs::metadata(p).is_ok_and(|m| m.len() <= MAX_BYTES);
-            small
-                .then(|| std::fs::read_to_string(p).ok())
-                .flatten()
-                .map(|t| t.lines().map(str::to_string).collect())
-        });
-        let Some(line) = lines.as_ref().and_then(|l| l.get(d.line as usize)) else {
-            continue;
-        };
-        if line.is_ascii() && !line.contains('\t') {
+    for (i, d) in diags.iter().enumerate() {
+        if d.source != "build" || d.col == 0 {
             continue;
         }
-        d.col = char_col(line, d.col as usize, unit, tabstop) as u32;
+        let p = std::path::Path::new(&d.file);
+        let path = if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            base.join(p)
+        };
+        let slot = *slot_of.entry(path.clone()).or_insert_with(|| {
+            by_file.push((path, Vec::new()));
+            by_file.len() - 1
+        });
+        by_file[slot].1.push(i);
+    }
+    for (path, rows) in by_file {
+        let Some(len) = std::fs::metadata(&path)
+            .ok()
+            .map(|m| m.len())
+            .filter(|&n| n <= MAX_BYTES.min(budget))
+        else {
+            continue;
+        };
+        budget -= len;
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let lines: Vec<&str> = text.lines().collect();
+        for i in rows {
+            let d = &mut diags[i];
+            let Some(line) = lines.get(d.line as usize) else {
+                continue;
+            };
+            if line.is_ascii() && !line.contains('\t') {
+                continue;
+            }
+            d.col = char_col(line, d.col as usize, unit, tabstop) as u32;
+        }
     }
 }
 
@@ -675,5 +707,38 @@ csrc/c.c:1:20: error: 'y' undeclared (first use in this function)\n";
         let mut same = vec![row(3, 31, "build")];
         convert_columns(&mut same, dir.path(), ColumnUnit::Char, 8);
         assert_eq!(same[0].col, 31, "Char leaves the column alone");
+    }
+
+    /// The conversion's reads are bounded per batch: once the budget is
+    /// spent, the remaining files' rows keep their columns instead of being
+    /// read, and rows of one file are all converted from its single read.
+    #[test]
+    fn convert_columns_stops_reading_once_the_batch_budget_is_spent() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = "\tint u;\n";
+        for name in ["a.c", "b.c"] {
+            std::fs::write(dir.path().join(name), body).unwrap();
+        }
+        let row = |file: &str| BuildDiag {
+            file: file.into(),
+            line: 0,
+            col: 10,
+            severity: DiagnosticSeverity::Warning,
+            message: String::new(),
+            source: "build".into(),
+            needs_file: false,
+        };
+        let mut d = vec![row("a.c"), row("b.c"), row("a.c")];
+        // Room for one file only.
+        convert_columns_within(
+            &mut d,
+            dir.path(),
+            ColumnUnit::Display,
+            8,
+            body.len() as u64,
+        );
+        assert_eq!(d[0].col, 3, "the first file is read and converted");
+        assert_eq!(d[2].col, 3, "its second row comes from the same read");
+        assert_eq!(d[1].col, 10, "the file past the budget is not read");
     }
 }
