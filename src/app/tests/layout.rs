@@ -584,7 +584,7 @@ fn the_status_bar_names_the_operation_in_progress() {
     let p = tmp.path();
     assert!(!git_succeeds(p, &["merge", "feat"]));
     let status = crate::git::query(p);
-    let text: String = git_status_spans(&status)
+    let text: String = git_status_spans(&status, crate::theme::Theme::default())
         .iter()
         .map(|s| s.content.to_string())
         .collect();
@@ -593,7 +593,7 @@ fn the_status_bar_names_the_operation_in_progress() {
     assert!(git_succeeds(p, &["checkout", "-q", "feat"]));
     assert!(!git_succeeds(p, &["rebase", "main"]));
     let status = crate::git::query(p);
-    let text: String = git_status_spans(&status)
+    let text: String = git_status_spans(&status, crate::theme::Theme::default())
         .iter()
         .map(|s| s.content.to_string())
         .collect();
