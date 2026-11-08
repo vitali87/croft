@@ -80989,17 +80989,10 @@ fn sheet_cell_at(view: &crate::sheet::SheetView, col: u16, row: u16) -> Option<(
     if col < g.body_x {
         return None;
     }
-    let mut x_off = 0u16;
-    for (c, w) in data.col_widths.iter().enumerate().skip(data.scroll_col) {
-        if x_off + w + 1 > g.body_w {
-            break;
-        }
-        if col >= g.body_x + x_off && col < g.body_x + x_off + w {
-            return Some((r, c));
-        }
-        x_off += w + 1;
-    }
-    None
+    crate::sheet::visible_columns(&data.col_widths, data.scroll_col, g.body_w)
+        .into_iter()
+        .find(|&(_, x_off, w)| col >= g.body_x + x_off && col < g.body_x + x_off + w)
+        .map(|(c, _, _)| (r, c))
 }
 
 /// Char-boundary helpers for the in-grid cell editor (#177): byte

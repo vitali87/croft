@@ -897,22 +897,13 @@ fn render_sheet(
     }
 
     // Lay out visible columns from `scroll_col` rightwards until we run
-    // out of horizontal space.
-    let mut visible: Vec<(usize, u16)> = Vec::new(); // (col_idx, x_offset)
-    let mut x_off = 0u16;
-    for (c, w) in sheet.col_widths.iter().enumerate().skip(sheet.scroll_col) {
-        if x_off + w + 1 > body_w {
-            break;
-        }
-        visible.push((c, x_off));
-        x_off += w + 1; // +1 for inter-column gap
-    }
+    // out of horizontal space: (col_idx, x_offset, drawn width).
+    let visible = crate::sheet::visible_columns(&sheet.col_widths, sheet.scroll_col, body_w);
 
     // Header text.
-    for (c, x_off) in &visible {
-        let label = sheet.headers.get(*c).map(|s| s.as_str()).unwrap_or("");
-        let cell_x = body_x + *x_off;
-        let w = sheet.col_widths[*c];
+    for &(c, x_off, w) in &visible {
+        let label = sheet.headers.get(c).map(|s| s.as_str()).unwrap_or("");
+        let cell_x = body_x + x_off;
         write_cell(buf, cell_x, header_y, w, label, head_style);
     }
 
@@ -950,9 +941,9 @@ fn render_sheet(
             gutter_style.bg(style.bg.unwrap_or(Color::Reset)),
         );
         let row = &sheet.rows[row_idx];
-        for (c, x_off) in &visible {
+        for (c, x_off, w) in &visible {
+            let w = *w;
             let cell_text = row.get(*c).map(|s| s.as_str()).unwrap_or("");
-            let w = sheet.col_widths[*c];
             let is_cursor = row_idx == sheet.cur_row && *c == sheet.cur_col;
             if is_cursor {
                 if let Some(edit) = editing.as_ref() {
@@ -1024,7 +1015,7 @@ fn render_sheet(
     let visible_col_first = sheet.scroll_col + 1;
     let visible_col_last = visible
         .last()
-        .map(|(c, _)| *c + 1)
+        .map(|(c, _, _)| *c + 1)
         .unwrap_or(visible_col_first);
     // A SQLite page names its rows by place in the table, with no total:
     // nobody counted the table (#1222), and the sheet name says whether
@@ -27652,6 +27643,44 @@ mod tests {
         // The tail that fits: 4 of the 10 glyphs (8 columns), then the caret.
         assert!(line.contains("울 특 별 시"), "{line:?}");
         assert!(!line.contains("서 울 특 별 시 서"), "{line:?}");
+    }
+
+    /// #1138 review: 20 CJK characters make a 40-column-wide column. In a
+    /// pane narrower than that, the grid drew no column at all; it now
+    /// draws that one clipped to the pane.
+    #[test]
+    fn a_column_wider_than_a_narrow_pane_is_drawn_clipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("long.csv");
+        let long = "東京都".repeat(7);
+        std::fs::write(&p, format!("name,n\n{long},1\nx,2\n")).unwrap();
+        let mut e = Editor::new();
+        e.open(&p).unwrap();
+        let view = e.sheet.as_mut().unwrap();
+        view.sheets[0].cur_row = 1;
+        let area = Rect::new(0, 0, 30, 6);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        render_sheet(
+            view,
+            Some(&p),
+            area,
+            &mut buf,
+            Color::Reset,
+            crate::theme::Theme::default(),
+        );
+        let body = (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(body.contains("name"), "the header is drawn:\n{body}");
+        assert!(
+            body.contains("東 京 都 東 京 都"),
+            "the value, clipped:\n{body}"
+        );
     }
 
     #[test]
