@@ -77,6 +77,12 @@ fn the_poll_splits_a_compact_row_and_the_setting_unfolds_it() {
     app.tree.select(row);
     app.tree.expand_selected();
     assert_eq!(app.tree.nodes[row].label(), "src/main/java/com/acme");
+    app.focus_pane(Pane::Tree);
+    assert_eq!(
+        app.a11y_snapshot().item.as_deref(),
+        Some("src/main/java/com/acme"),
+        "a screen reader hears the row as shown"
+    );
     app.fs_watch.force_poll_due();
     let _ = app.fs_watch.poll(&mut app.tree, &[]);
 

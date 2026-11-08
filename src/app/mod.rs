@@ -67616,10 +67616,12 @@ impl App {
                 let (focus, item) = match self.sidebar_view {
                     SidebarView::Explorer => (
                         tr("Explorer"),
+                        // The row's label, so a compact row (#1486) reads
+                        // as shown, `src/main/java`, not its last folder.
                         self.tree
-                            .selected_path()
-                            .and_then(|p| p.file_name())
-                            .map(|n| n.to_string_lossy().into_owned()),
+                            .nodes
+                            .get(self.tree.selected)
+                            .map(crate::widgets::file_tree::Node::label),
                     ),
                     SidebarView::Search => self.search_a11y(),
                     SidebarView::SourceControl => self.source_control_a11y(),
