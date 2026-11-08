@@ -47565,6 +47565,11 @@ impl App {
                 crate::install_session::InstallEvent::FallbackPrompt { reason } => {
                     if let Some(dialog) = self.connect_dialog.as_mut() {
                         dialog.set_fallback_prompt(&reason);
+                        // What a yes installs, in the log panel the prompt
+                        // opens, before the answer (#950).
+                        for line in crate::remote::REMOTE_COMPILE_SIDE_EFFECTS {
+                            dialog.push_log(&format!("A remote compile: {line}"));
+                        }
                     } else if let Some(session) = self.install_session.as_ref() {
                         // No dialog to ask through: decline so the installer
                         // errors out with the `croft setup-cross` guidance
