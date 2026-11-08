@@ -66,6 +66,72 @@ pub struct ReleaseNote {
     pub summary: &'static str,
 }
 
+/// How one character of a summary is drawn (#954). Notes are written in
+/// Markdown, so the card resolves the inline forms they use rather than
+/// printing `**Add Database**` with its asterisks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Inline {
+    Plain,
+    Bold,
+    Code,
+}
+
+/// A summary with its inline Markdown resolved: the text to show, with the
+/// `**` and backtick markers gone, and the style of each of its characters.
+/// A marker with no partner is ordinary text, so a stray `*` or backtick is
+/// shown, not swallowed.
+pub fn inline_markup(summary: &str) -> (String, Vec<Inline>) {
+    let chars: Vec<char> = summary.chars().collect();
+    let mut text = String::with_capacity(summary.len());
+    let mut styles = Vec::with_capacity(chars.len());
+    let mut bold = false;
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '`'
+            && let Some(len) = chars[i + 1..].iter().position(|&d| d == '`')
+        {
+            for &d in &chars[i + 1..i + 1 + len] {
+                text.push(d);
+                styles.push(Inline::Code);
+            }
+            i += len + 2;
+            continue;
+        }
+        if c == '*'
+            && chars.get(i + 1) == Some(&'*')
+            && (bold || bold_closes_later(&chars[i + 2..]))
+        {
+            bold = !bold;
+            i += 2;
+            continue;
+        }
+        text.push(c);
+        styles.push(if bold { Inline::Bold } else { Inline::Plain });
+        i += 1;
+    }
+    (text, styles)
+}
+
+/// Whether `rest` holds a `**` that closes a bold run: one outside a code
+/// span, since a `**` written inside backticks is code, not a marker.
+fn bold_closes_later(rest: &[char]) -> bool {
+    let mut i = 0;
+    while i < rest.len() {
+        if rest[i] == '`'
+            && let Some(len) = rest[i + 1..].iter().position(|&d| d == '`')
+        {
+            i += len + 2;
+            continue;
+        }
+        if rest[i] == '*' && rest.get(i + 1) == Some(&'*') {
+            return true;
+        }
+        i += 1;
+    }
+    false
+}
+
 #[cfg(test)]
 mod select;
 
@@ -150,6 +216,51 @@ mod tests {
             let notes = parse(Box::leak(line.to_string().into_boxed_str()));
             assert_eq!(notes[0].kind, NoteKind::Feature, "{line:?}");
             assert_eq!(notes[0].summary, "One.", "{line:?}");
+        }
+    }
+
+    /// #954: `**bold**` and `` `code` `` lose their markers and style their
+    /// text; an unpaired marker stays as text.
+    #[test]
+    fn inline_markdown_in_a_summary_is_styled_not_printed() {
+        let (text, styles) = inline_markup("**Add Database** and `Cmd+K V` now");
+        assert_eq!(text, "Add Database and Cmd+K V now");
+        assert_eq!(styles.len(), text.chars().count());
+        assert!(styles[..12].iter().all(|&s| s == Inline::Bold));
+        assert_eq!(styles[12], Inline::Plain);
+        let code_at = text.find("Cmd").unwrap();
+        assert!(
+            styles[code_at..code_at + 7]
+                .iter()
+                .all(|&s| s == Inline::Code)
+        );
+        assert_eq!(*styles.last().unwrap(), Inline::Plain);
+        let (text, styles) = inline_markup("a ** b and a ` tick");
+        assert_eq!(text, "a ** b and a ` tick", "unpaired markers are text");
+        assert!(styles.iter().all(|&s| s == Inline::Plain));
+        // A `**` inside code doesn't close an unpaired one before it.
+        let (text, styles) = inline_markup("a ** b `x**y` c");
+        assert_eq!(text, "a ** b x**y c");
+        assert_eq!(styles[0], Inline::Plain);
+        assert_eq!(*styles.last().unwrap(), Inline::Plain);
+    }
+
+    /// #954: no note this build shows reaches the card with raw markers, so
+    /// a future note can't ship `**` or a backtick pair on the welcome card.
+    #[test]
+    fn no_baked_note_shows_raw_markdown() {
+        for note in release_notes() {
+            let (text, _) = inline_markup(note.summary);
+            assert!(
+                !text.contains("**"),
+                "raw bold in {:?}: {text}",
+                note.summary
+            );
+            assert!(
+                text.matches('`').count() < 2,
+                "raw code in {:?}: {text}",
+                note.summary
+            );
         }
     }
 

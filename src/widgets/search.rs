@@ -351,6 +351,11 @@ fn build_searcher() -> Searcher {
 #[derive(Clone, Debug, Default)]
 pub struct PathFilter {
     include: Option<GlobSet>,
+    /// The include globs that name a folder (#958): those whose last part
+    /// has no wildcard, such as `tests` or `src/widgets`. They also admit
+    /// what is inside the folder; `*.rs` does not admit a folder named
+    /// `generated.rs`.
+    include_dirs: Option<GlobSet>,
     exclude: Option<GlobSet>,
 }
 
@@ -390,10 +395,15 @@ pub fn invalid_globs(raw: &str) -> Vec<&str> {
 /// include list (`fail_closed`) yields an empty set that matches nothing, so
 /// a broken filter never widens a search or Replace All to every file.
 fn build_glob_set(raw: &str, fail_closed: bool) -> Option<GlobSet> {
+    build_glob_set_of(raw, fail_closed, |_| true)
+}
+
+/// [`build_glob_set`] over the entries `keep` accepts.
+fn build_glob_set_of(raw: &str, fail_closed: bool, keep: impl Fn(&str) -> bool) -> Option<GlobSet> {
     let mut builder = GlobSetBuilder::new();
     let mut any = false;
     let mut typed = false;
-    for pat in split_globs(raw) {
+    for pat in split_globs(raw).filter(|p| keep(p)) {
         typed = true;
         if let Some(g) = compile_glob(pat) {
             builder.add(g);
@@ -406,12 +416,28 @@ fn build_glob_set(raw: &str, fail_closed: bool) -> Option<GlobSet> {
     builder.build().ok()
 }
 
+/// Whether a glob names a folder rather than a kind of file: its last part
+/// is a plain name, as in `tests`, `src/widgets` or `./src`, not a pattern
+/// such as `*.rs` (#958).
+fn names_a_folder(pat: &str) -> bool {
+    let last = pat.trim_end_matches('/').rsplit('/').next().unwrap_or(pat);
+    !last.is_empty() && !last.contains(['*', '?', '[', '{'])
+}
+
+/// True when `rel` or one of the folders above it matches `set`: a glob that
+/// names a folder stands for everything inside it.
+fn matches_self_or_parent(set: &GlobSet, rel: &Path) -> bool {
+    rel.ancestors()
+        .any(|p| !p.as_os_str().is_empty() && set.is_match(p))
+}
+
 impl PathFilter {
     /// Compile a filter from the raw include/exclude input strings. An empty
     /// (or all-whitespace) string disables that side of the filter.
     pub fn new(include: &str, exclude: &str) -> Self {
         Self {
             include: build_glob_set(include, true),
+            include_dirs: build_glob_set_of(include, false, names_a_folder),
             exclude: build_glob_set(exclude, false),
         }
     }
@@ -426,17 +452,26 @@ impl PathFilter {
     /// done against the path relative to `root` (falling back to the full path
     /// when it isn't under `root`). Include wins first: if an include set is
     /// present, the path must match it; then any exclude match drops the path.
+    /// On both sides a glob that names a folder covers what is inside it, as
+    /// in VS Code, so include `tests` or `src/widgets` searches those folders
+    /// (#958) and exclude `dist` hides everything under it (#1345). A folder
+    /// is only looked for inside the workspace: a file outside it (an open
+    /// buffer elsewhere) is not let in by a folder above the workspace.
     pub fn allows(&self, root: &Path, path: &Path) -> bool {
-        let rel = path.strip_prefix(root).unwrap_or(path);
+        let inside = path.strip_prefix(root).ok();
+        let rel = inside.unwrap_or(path);
         if let Some(inc) = &self.include
             && !inc.is_match(rel)
+            && !inside.is_some_and(|rel| {
+                self.include_dirs
+                    .as_ref()
+                    .is_some_and(|dirs| matches_self_or_parent(dirs, rel))
+            })
         {
             return false;
         }
         if let Some(exc) = &self.exclude
-            && rel
-                .ancestors()
-                .any(|p| !p.as_os_str().is_empty() && exc.is_match(p))
+            && matches_self_or_parent(exc, rel)
         {
             return false;
         }
@@ -448,10 +483,9 @@ impl PathFilter {
     /// Code's exclude settings do (#1345).
     pub fn excludes(&self, root: &Path, path: &Path) -> bool {
         let rel = path.strip_prefix(root).unwrap_or(path);
-        self.exclude.as_ref().is_some_and(|exc| {
-            rel.ancestors()
-                .any(|p| !p.as_os_str().is_empty() && exc.is_match(p))
-        })
+        self.exclude
+            .as_ref()
+            .is_some_and(|exc| matches_self_or_parent(exc, rel))
     }
 
     /// An exclude-only filter from a list of globs (the project's exclude
@@ -5044,6 +5078,37 @@ mod tests {
         // Negative: a name that only starts like the folder stays.
         assert!(f.allows(root, Path::new("/proj/generated_stub.py")));
         assert!(f.allows(root, Path::new("/proj/src/targets/x.rs")));
+    }
+
+    /// #958: an include glob that names a folder searches what is inside
+    /// it: a bare `tests` at any depth, `src/widgets` and `./src` from the
+    /// workspace root.
+    #[test]
+    fn an_included_folder_searches_the_files_inside_it() {
+        let root = Path::new("/proj");
+        let f = PathFilter::new("tests", "");
+        assert!(f.allows(root, Path::new("/proj/tests/cli.rs")));
+        assert!(f.allows(root, Path::new("/proj/crate/tests/deep/x.rs")));
+        assert!(!f.allows(root, Path::new("/proj/src/main.rs")));
+        // Negative: a name that only starts like the folder is left out.
+        assert!(!f.allows(root, Path::new("/proj/tests_old/x.rs")));
+        let f = PathFilter::new("src/widgets", "");
+        assert!(f.allows(root, Path::new("/proj/src/widgets/search.rs")));
+        assert!(!f.allows(root, Path::new("/proj/src/app/mod.rs")));
+        let f = PathFilter::new("./src", "");
+        assert!(f.allows(root, Path::new("/proj/src/app/mod.rs")));
+        assert!(!f.allows(root, Path::new("/proj/vendor/src/x.rs")));
+        // A file glob names files, not a folder that happens to match it,
+        // and a folder above the workspace lets nothing in.
+        let f = PathFilter::new("*.rs, src", "");
+        assert!(f.allows(root, Path::new("/proj/a/main.rs")));
+        assert!(!f.allows(root, Path::new("/proj/generated.rs/notes.txt")));
+        assert!(!f.allows(root, Path::new("/home/me/src/elsewhere.txt")));
+        // The same folder names on the exclude side drop their contents.
+        let f = PathFilter::new("", "src/widgets, dist");
+        assert!(!f.allows(root, Path::new("/proj/src/widgets/search.rs")));
+        assert!(!f.allows(root, Path::new("/proj/dist/bundle.js")));
+        assert!(f.allows(root, Path::new("/proj/src/app/mod.rs")));
     }
 
     #[test]

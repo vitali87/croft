@@ -1340,6 +1340,31 @@ fn build_sticky_lines_pins_enclosing_headers_scrolled_above_the_viewport() {
     assert!(app.build_sticky_lines().is_empty());
 }
 
+/// #940: a decorated definition's range starts at its decorator, but the
+/// sticky header is its `def`/`class` line, which names it. With that line
+/// itself at the top, nothing is pinned over it.
+#[test]
+fn sticky_scroll_pins_the_name_line_of_a_decorated_definition() {
+    use crate::lsp::manager::OutlineKind;
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("api.py");
+    std::fs::write(&f, "x\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&f).unwrap();
+    // `@dataclass` on line 3 above `class Order:` on 4; inside it,
+    // `@staticmethod` on 6 above `def validate` on 7.
+    let mut order = sym("Order", OutlineKind::Class, 0, 3, 40);
+    order.line = 4;
+    let mut validate = sym("validate", OutlineKind::Method, 1, 6, 30);
+    validate.line = 7;
+    app.outline.set_symbols(f.clone(), vec![order, validate]);
+    app.editor.scroll = 20;
+    assert_eq!(app.build_sticky_lines(), vec![4, 7], "the name lines");
+    // Negative: the class line at the top is shown, not covered by a pin.
+    app.editor.scroll = 4;
+    assert!(app.build_sticky_lines().is_empty());
+}
+
 #[test]
 fn minimap_edit_rebakes_in_place_but_a_moved_strip_arms_the_clear() {
     // Issue: every keystroke bumped `edit_seq`, the minimap layout signature

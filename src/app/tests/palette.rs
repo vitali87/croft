@@ -1246,6 +1246,106 @@ fn the_palette_and_vim_recorders_are_one_recording_not_two() {
     );
 }
 
+/// #952: a recording started and stopped from the Command Palette leaves
+/// the stopping palette session out of the macro, so Replay N Times repeats
+/// the edits and never types into a palette. A palette command run in the
+/// middle (here Transform to Uppercase) joins the macro whole and replays.
+#[test]
+fn a_macro_stopped_from_the_palette_replays_only_what_was_recorded() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "names.txt", "alice\nbob\ncarol\ndave\neve\n");
+    app.macros_path = tmp.path().join("macros.json");
+    let palette = key(
+        KeyCode::Char('p'),
+        KeyModifiers::SUPER | KeyModifiers::SHIFT,
+    );
+    let none = |code| key(code, KeyModifiers::NONE);
+    let run_from_palette = |app: &mut App, query: &str| {
+        app.handle_key(palette).unwrap();
+        type_str(app, query);
+        app.handle_key(none(KeyCode::Enter)).unwrap();
+    };
+    run_from_palette(&mut app, "Macro: Start/Stop Recording");
+    assert!(app.macro_recording.is_some(), "the palette started it");
+    app.handle_key(none(KeyCode::Home)).unwrap();
+    type_str(&mut app, "- ");
+    run_from_palette(&mut app, "Transform to Uppercase");
+    app.handle_key(none(KeyCode::Down)).unwrap();
+    run_from_palette(&mut app, "Macro: Start/Stop Recording");
+    assert!(app.macro_recording.is_none(), "the palette stopped it");
+    assert_eq!(app.editor.lines[0], "- ALICE");
+    app.replay_last_macro(4);
+    assert!(
+        app.command_palette.is_none(),
+        "replay ends with no palette open"
+    );
+    assert_eq!(
+        app.editor.lines[..5],
+        ["- ALICE", "- BOB", "- CAROL", "- DAVE", "- EVE"]
+    );
+}
+
+/// #952 review: a palette command that takes focus out of the editor is
+/// left out of the macro. The click that brings focus back is not recorded,
+/// so replaying the command would send the keys after it to the shell.
+#[test]
+fn a_palette_command_that_leaves_the_editor_is_not_recorded() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "names.txt", "alice\nbob\n");
+    app.macros_path = tmp.path().join("macros.json");
+    let palette = key(
+        KeyCode::Char('p'),
+        KeyModifiers::SUPER | KeyModifiers::SHIFT,
+    );
+    let run_from_palette = |app: &mut App, query: &str| {
+        app.handle_key(palette).unwrap();
+        type_str(app, query);
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+    };
+    run_from_palette(&mut app, "Macro: Start/Stop Recording");
+    type_str(&mut app, "x");
+    run_from_palette(&mut app, "Terminal: Focus Terminal");
+    assert!(app.focus != Pane::Editor, "the command left the editor");
+    app.focus_pane(Pane::Editor);
+    type_str(&mut app, "y");
+    run_from_palette(&mut app, "Macro: Start/Stop Recording");
+    app.replay_last_macro(1);
+    assert!(app.focus == Pane::Editor, "replay stays in the editor");
+    assert!(
+        app.editor.lines[0].starts_with("xyxy"),
+        "{:?}",
+        app.editor.lines
+    );
+}
+
+/// #952 review: a palette session closed by a click held keys that nothing
+/// replays; they are dropped, not picked up by the next palette session.
+#[test]
+fn a_palette_closed_by_a_click_leaves_nothing_for_the_macro() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "names.txt", "alice\n");
+    app.run_command(crate::widgets::command_palette::Command::MacroStartStopRecording);
+    app.handle_key(key(
+        KeyCode::Char('p'),
+        KeyModifiers::SUPER | KeyModifiers::SHIFT,
+    ))
+    .unwrap();
+    type_str(&mut app, "delete line");
+    let held = |app: &App| app.macro_recording.as_ref().unwrap().palette_keys.len();
+    assert!(held(&app) > 0, "an open palette session is held");
+    // A click outside closes the palette; any mouse event then lets go.
+    app.command_palette = None;
+    app.handle_mouse(crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::Moved,
+        column: 0,
+        row: 0,
+        modifiers: KeyModifiers::NONE,
+    });
+    assert_eq!(held(&app), 0);
+    assert!(app.macro_recording.as_ref().unwrap().recorded.is_empty());
+}
+
 /// #1345: Go to File skips excluded files, as VS Code's file search does
 /// for both settings, and still finds the rest.
 #[test]
