@@ -410,9 +410,10 @@ const SETTINGS: &[SettingMap] = &[
 /// does the same thing; a VS Code command with no true counterpart is left
 /// out so the import reports it rather than binding the user's chord to
 /// something that merely sounds similar.
-/// `editor.action.showHover` is deliberately ABSENT, having been mapped and
-/// then removed: it is not `peek_definition`, which opens a different thing
-/// entirely. `editor.action.revealDefinition` was once mapped to
+/// `editor.action.showHover` was once mapped to `peek_definition`, which
+/// opens a different thing entirely, then left out until croft had a hover
+/// command of its own: it maps to `show_hover` (#1518).
+/// `editor.action.revealDefinition` was once mapped to
 /// `mouse_go_to_definition_at_click`, which reads the last POINTER position;
 /// it now maps to the caret-driven `go_to_definition` (#1212).
 const COMMANDS: &[(&str, &str)] = &[
@@ -579,6 +580,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("editor.action.goToImplementation", "go_to_implementations"),
     ("editor.action.rename", "rename_symbol"),
     ("editor.action.triggerSuggest", "trigger_suggest"),
+    ("editor.action.showHover", "show_hover"),
     (
         "editor.action.triggerParameterHints",
         "trigger_parameter_hints",
@@ -2248,10 +2250,10 @@ mod tests {
         assert!(warnings.is_empty(), "{warnings:?}");
     }
 
-    /// The hover and peek commands still import as they did: `showHover` has
-    /// no croft counterpart and is reported, `peekDefinition` stays peek.
+    /// `showHover` imports onto croft's own Show or Focus Hover (#1518), not
+    /// onto peek, and `peekDefinition` still imports as peek.
     #[test]
-    fn hover_is_still_dropped_and_peek_still_imports_as_peek() {
+    fn hover_imports_as_show_hover_and_peek_still_imports_as_peek() {
         let doc = json!([
             { "key": "ctrl+alt+h", "command": "editor.action.showHover" },
             { "key": "ctrl+alt+p", "command": "editor.action.peekDefinition" }
@@ -2260,14 +2262,20 @@ mod tests {
         convert_keybindings(&doc, &mut report);
         assert_eq!(
             report.keybindings,
-            vec![(
-                String::from("ctrl+alt+p"),
-                String::from("peek_definition"),
-                None
-            )]
+            vec![
+                (String::from("ctrl+alt+h"), String::from("show_hover"), None),
+                (
+                    String::from("ctrl+alt+p"),
+                    String::from("peek_definition"),
+                    None
+                ),
+            ]
         );
-        assert_eq!(report.dropped_keybindings.len(), 1);
-        assert!(report.dropped_keybindings[0].contains("editor.action.showHover"));
+        assert!(
+            report.dropped_keybindings.is_empty(),
+            "{:?}",
+            report.dropped_keybindings
+        );
     }
 
     /// #852 (comment 3): VS Code's editor-tab commands import onto croft's

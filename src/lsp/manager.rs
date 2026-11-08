@@ -1230,6 +1230,10 @@ pub struct LspManager {
     completion_rx: std_mpsc::Receiver<CompletionResult>,
     signature_help_rx: std_mpsc::Receiver<SignatureHelpResult>,
     hover_rx: std_mpsc::Receiver<HoverResult>,
+    /// Test hook: a sender into `hover_rx`, so app tests can answer a
+    /// hover request without a server.
+    #[cfg(test)]
+    hover_test_tx: std_mpsc::Sender<HoverResult>,
     rust_analyzer_rx: std_mpsc::Receiver<RustAnalyzerResult>,
     def_rx: std_mpsc::Receiver<DefinitionResult>,
     /// Test hooks: senders into the three jump channels, so app tests can
@@ -1341,6 +1345,8 @@ impl LspManager {
         let (completion_tx, completion_rx) = std_mpsc::channel();
         let (signature_help_tx, signature_help_rx) = std_mpsc::channel();
         let (hover_tx, hover_rx) = std_mpsc::channel();
+        #[cfg(test)]
+        let hover_test_tx = hover_tx.clone();
         let (rust_analyzer_tx, rust_analyzer_rx) = std_mpsc::channel();
         let (def_tx, def_rx) = std_mpsc::channel();
         let (doc_symbols_tx, doc_symbols_rx) = std_mpsc::channel();
@@ -1452,6 +1458,8 @@ impl LspManager {
             completion_rx,
             signature_help_rx,
             hover_rx,
+            #[cfg(test)]
+            hover_test_tx,
             rust_analyzer_rx,
             def_rx,
             #[cfg(test)]
@@ -1667,6 +1675,12 @@ impl LspManager {
 
     pub fn drain_hover(&self) -> Option<HoverResult> {
         self.hover_rx.try_recv().ok()
+    }
+
+    /// Test hook: deliver a hover reply as if a server had answered.
+    #[cfg(test)]
+    pub fn push_hover_for_test(&self, result: HoverResult) {
+        let _ = self.hover_test_tx.send(result);
     }
 
     /// Send one of rust-analyzer's own requests (#1626) for the caret at

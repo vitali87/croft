@@ -199,6 +199,132 @@ fn hovering_a_diagnostic_on_punctuation_shows_its_message_synchronously() {
     );
 }
 
+/// `let n = compute(1);` in an editor stood up by hand, the caret at `col`.
+/// No language server has the file open, so the only hover reply is the
+/// one a test pushes.
+fn caret_hover_app(col: usize) -> (App, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("main.rs");
+    std::fs::write(&f, "let n = compute(1);\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.path = Some(f);
+    app.editor.lines = vec![String::from("let n = compute(1);")];
+    app.editor.last_inner = ratatui::layout::Rect::new(0, 0, 80, 25);
+    app.editor.last_gutter_width = 2;
+    app.editor.cursor_col = col;
+    app.focus_pane(Pane::Editor);
+    (app, tmp)
+}
+
+fn answer_hover(app: &App, request_id: u64, text: Option<&str>) {
+    app.lsp
+        .as_ref()
+        .unwrap()
+        .push_hover_for_test(crate::lsp::manager::HoverResult {
+            request_id,
+            text: text.map(String::from),
+        });
+}
+
+#[test]
+fn show_hover_asks_about_the_caret_and_opens_the_popup_there() {
+    // #1518: hover had no keyboard route. The command asks about the word
+    // at the caret, and the reply opens at the caret's cell with the
+    // pointer nowhere near it.
+    let (mut app, _tmp) = caret_hover_app(10);
+    let caret = app
+        .editor
+        .cursor_screen_pos()
+        .expect("the caret is on screen");
+    app.run_command(crate::widgets::command_palette::Command::ShowHover);
+    let id = app
+        .hover_request_id
+        .expect("a word at the caret asks the server");
+    assert_eq!(app.hover_word, Some((0, 8, 15)), "about `compute`");
+    answer_hover(&app, id, Some("fn compute(x: i32) -> i32"));
+    assert!(app.drain_lsp_hover());
+    let popup = app.hover_popup.as_ref().expect("the reply opens the popup");
+    assert_eq!(popup.lines, vec![String::from("fn compute(x: i32) -> i32")]);
+    assert_eq!(popup.anchor, caret);
+    app.handle_key(key(KeyCode::Right, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.hover_popup.is_none(), "the next key closes it");
+}
+
+#[test]
+fn show_hover_on_a_problem_the_server_cannot_describe_shows_its_message() {
+    use crate::lsp::manager::{Diagnostic, DiagnosticSeverity};
+    let (mut app, _tmp) = caret_hover_app(10);
+    let path = app.editor.path.clone().unwrap();
+    app.editor.apply_diagnostics(
+        path,
+        vec![Diagnostic {
+            start_line: 0,
+            start_char: 8,
+            end_line: 0,
+            end_char: 15,
+            severity: DiagnosticSeverity::Error,
+            message: String::from("cannot find function `compute` in this scope"),
+            tags: Default::default(),
+            code: None,
+            origin: None,
+        }],
+    );
+    app.run_command(crate::widgets::command_palette::Command::ShowHover);
+    let id = app
+        .hover_request_id
+        .expect("the word still asks the server");
+    answer_hover(&app, id, None);
+    assert!(app.drain_lsp_hover());
+    let popup = app.hover_popup.as_ref().expect("the problem still shows");
+    assert_eq!(
+        popup.lines,
+        vec![String::from(
+            "Error: cannot find function `compute` in this scope"
+        )]
+    );
+}
+
+#[test]
+fn show_hover_reads_the_word_the_caret_ends_and_says_when_there_is_none() {
+    // As in VS Code: just past `compute` (on its `(`) is still on it.
+    let (mut app, _tmp) = caret_hover_app(15);
+    app.run_command(crate::widgets::command_palette::Command::ShowHover);
+    assert!(app.hover_request_id.is_some());
+    assert_eq!(app.hover_word, Some((0, 8, 15)));
+    // On `=`, after a space: nothing to describe, and the command says so.
+    app.editor.cursor_col = 6;
+    app.run_command(crate::widgets::command_palette::Command::ShowHover);
+    assert_eq!(app.hover_request_id, None);
+    assert!(app.hover_popup.is_none());
+    assert_eq!(app.status, "No hover information at the caret");
+}
+
+#[test]
+fn ctrl_k_ctrl_i_in_the_editor_shows_the_hover_and_ctrl_k_i_still_broadcasts() {
+    // #1518: the broadcast arm took I with or without Ctrl, so VS Code's
+    // Ctrl+K Ctrl+I (Cmd+K Cmd+I on macOS) toggled Broadcast Input.
+    let (mut app, _tmp) = caret_hover_app(10);
+    let cmd = if cfg!(target_os = "macos") {
+        KeyModifiers::SUPER
+    } else {
+        KeyModifiers::CONTROL
+    };
+    assert!(app.handle_cmd_k_chord(key(KeyCode::Char('i'), cmd)));
+    assert!(
+        app.hover_request_id.is_some(),
+        "the chord asks for the hover"
+    );
+    assert!(!app.pending_broadcast_enable);
+    assert!(!app.status.contains("Broadcast"), "{}", app.status);
+    assert!(app.handle_cmd_k_chord(key(KeyCode::Char('i'), KeyModifiers::NONE)));
+    assert!(
+        app.status.starts_with("Broadcast input needs"),
+        "plain Ctrl+K I keeps broadcast input: {}",
+        app.status
+    );
+}
+
 #[test]
 fn the_swallowed_prefix_click_dismisses_the_hover_and_tab_tooltip() {
     // The sibling test above binds `ctrl+click` to a real command, so it takes

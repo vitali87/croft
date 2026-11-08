@@ -617,6 +617,11 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 handler: "is_add_cursors_to_line_ends_key",
             },
             ShortcutEntry {
+                keys: "Cmd/Ctrl+K Cmd/Ctrl+I",
+                description: "Show the hover at the caret: any problem there, then type and docs",
+                handler: "",
+            },
+            ShortcutEntry {
                 keys: "F12",
                 description: "Go to definition",
                 handler: "is_go_to_definition_key",
