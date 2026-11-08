@@ -467,6 +467,56 @@ fn clicking_a_problem_row_opens_that_file_at_the_line() {
     assert_eq!(app.editor.cursor_row, 2, "and jumps to the diagnostic line");
 }
 
+/// #1523: the places a server points at to explain a diagnostic are rows
+/// under it, the file named relative to the workspace, and a click on one
+/// opens that place with its UTF-16 column converted (the emoji is two
+/// units, one character).
+#[test]
+fn clicking_a_related_location_row_opens_that_place() {
+    let tmp = tempfile::tempdir().unwrap();
+    let main = tmp.path().join("src/main.rs");
+    let lib = tmp.path().join("src/lib.rs");
+    std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+    std::fs::write(&main, "fn main() {}\n").unwrap();
+    std::fs::write(&lib, "fn a() {}\nlet s = \"😀\"; let first = &v[0];\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let wire = lsp_types::Diagnostic {
+        message: "cannot borrow `v` as mutable".into(),
+        related_information: Some(vec![lsp_types::DiagnosticRelatedInformation {
+            location: lsp_types::Location {
+                uri: lsp_types::Url::from_file_path(&lib).unwrap(),
+                range: lsp_types::Range::new(
+                    lsp_types::Position::new(1, 27),
+                    lsp_types::Position::new(1, 28),
+                ),
+            },
+            message: "immutable borrow occurs here".into(),
+        }]),
+        ..Default::default()
+    };
+    let d = crate::lsp::client::convert_diagnostic("rust-analyzer", &wire);
+    let by_server = std::collections::HashMap::from([(String::from("rust-analyzer"), vec![d])]);
+    app.lsp_diagnostics.insert(main, by_server);
+    app.rebuild_problems();
+    assert_eq!(
+        app.problems.groups()[0].items[0].related[0].rel_path,
+        "src/lib.rs"
+    );
+    app.bottom_panel_tab = BottomPanelTab::Problems;
+    let backend = ratatui::backend::TestBackend::new(140, 50);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    // Row 0 is the toolbar, 1 the file, 2 the diagnostic, 3 its related row.
+    let list = app.problems.last_area;
+    left_click(&mut app, list.x + 10, list.y + 3);
+    assert_eq!(app.editor.path.as_deref(), Some(lib.as_path()));
+    assert_eq!(
+        (app.editor.cursor_row, app.editor.cursor_col),
+        (1, 26),
+        "on the `v` the borrow takes"
+    );
+}
+
 /// #1522: unused names and unreachable code come as hints; like VS Code,
 /// the PROBLEMS list and its count leave them out, while the editor (its
 /// hover and quick fixes) still has them.
@@ -1186,6 +1236,7 @@ fn problem(
         message: message.into(),
         source: "ruff".into(),
         code: None,
+        related: Vec::new(),
     }
 }
 
@@ -1343,6 +1394,7 @@ fn seed_build_rows(app: &mut App, rows: &[(&std::path::Path, u32, u32, &str)]) {
                     message: (*msg).to_string(),
                     source: String::from("build"),
                     code: None,
+                    related: Vec::new(),
                 },
             ));
     }
@@ -1476,6 +1528,7 @@ fn go_to_next_problem_visits_every_entry_once_around_mixed_columns() {
                 message: msg.to_string(),
                 source: String::from("build"),
                 code: None,
+                related: Vec::new(),
             },
         )
     };

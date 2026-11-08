@@ -11814,7 +11814,8 @@ impl App {
         // Server diagnostics are already in the editor, so capture the
         // message synchronously; the squiggle's message must show even if the
         // server has no type info (or no LSP is attached at all).
-        self.hover_diagnostic = format_diagnostics(&self.editor.diagnostics_at(line, c));
+        self.hover_diagnostic =
+            format_diagnostics(&self.editor.diagnostics_at(line, c, self.workspace_root()));
         // Only a real word is worth a `textDocument/hover` round-trip; over
         // punctuation there is no symbol to describe, so show the diagnostic
         // alone right away.
@@ -12863,6 +12864,7 @@ impl App {
                     message: d.message,
                     source: d.source.to_string(),
                     code: None,
+                    related: Vec::new(),
                 },
             ));
         }
@@ -12941,7 +12943,7 @@ impl App {
     /// can fold it into its redraw decision). Files are grouped, ordered by
     /// path; each group's diagnostics are ordered by position.
     fn rebuild_problems(&mut self) -> bool {
-        use crate::widgets::problems::{ProblemGroup, ProblemItem};
+        use crate::widgets::problems::{ProblemGroup, ProblemItem, ProblemRelated};
         let mut paths: Vec<&PathBuf> = self
             .lsp_diagnostics
             .keys()
@@ -12971,6 +12973,18 @@ impl App {
                 let shown = diagnostics_by_source(by_server)
                     .filter(|(_, d)| d.severity != crate::lsp::manager::DiagnosticSeverity::Hint);
                 for (source, d) in shown {
+                    let related = d.related().into_iter().map(|r| ProblemRelated {
+                        rel_path: r
+                            .path
+                            .strip_prefix(self.workspace_root())
+                            .unwrap_or(&r.path)
+                            .to_string_lossy()
+                            .into_owned(),
+                        path: r.path,
+                        line: r.line,
+                        col: r.character,
+                        message: r.message,
+                    });
                     items.push(ProblemItem {
                         line: d.start_line,
                         col: d.start_char,
@@ -12979,6 +12993,7 @@ impl App {
                         message: d.message.clone(),
                         source: source.to_string(),
                         code: d.code.clone(),
+                        related: related.collect(),
                     });
                 }
             }
@@ -56485,6 +56500,7 @@ impl App {
                 message: d.message,
                 source,
                 code: d.code,
+                related: Vec::new(),
             },
         ))
     }
@@ -67581,7 +67597,7 @@ impl App {
                 let row = self.editor.cursor_row;
                 let diagnostic = self
                     .editor
-                    .diagnostics_at(row, self.editor.cursor_col)
+                    .diagnostics_at(row, self.editor.cursor_col, self.workspace_root())
                     .into_iter()
                     .next()
                     .map(|(_, m)| m);

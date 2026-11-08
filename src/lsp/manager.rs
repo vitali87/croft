@@ -738,6 +738,57 @@ pub struct DiagnosticOrigin {
     pub wire: lsp_types::Diagnostic,
 }
 
+impl Diagnostic {
+    /// The places the server points at to explain this diagnostic (#1523):
+    /// rustc's "immutable borrow occurs here", TypeScript's "'foo' is
+    /// declared here". Read off the diagnostic as the server sent it rather
+    /// than copied out of it; one croft made itself has none.
+    pub fn related(&self) -> Vec<RelatedLocation> {
+        let Some(origin) = self.origin.as_deref() else {
+            return Vec::new();
+        };
+        origin
+            .wire
+            .related_information
+            .iter()
+            .flatten()
+            .filter_map(|r| {
+                Some(RelatedLocation {
+                    path: r.location.uri.to_file_path().ok()?,
+                    line: r.location.range.start.line,
+                    character: r.location.range.start.character,
+                    message: r.message.clone(),
+                })
+            })
+            .collect()
+    }
+}
+
+/// One of a diagnostic's related locations (#1523): where its range starts,
+/// zero-based with a UTF-16 column like the diagnostic's own position.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelatedLocation {
+    pub path: PathBuf,
+    pub line: u32,
+    pub character: u32,
+    pub message: String,
+}
+
+impl RelatedLocation {
+    /// `file(line, col): message`, one-based, as VS Code appends it to the
+    /// diagnostic's hover, with the file relative to `root`.
+    pub fn label(&self, root: &Path) -> String {
+        let file = self.path.strip_prefix(root).unwrap_or(&self.path);
+        format!(
+            "{}({}, {}): {}",
+            file.display(),
+            self.line + 1,
+            self.character + 1,
+            self.message
+        )
+    }
+}
+
 /// A diagnostic's rule code with the server's `source` and the rule's
 /// documentation link, what a user needs to silence the rule or look it up
 /// (#1540).

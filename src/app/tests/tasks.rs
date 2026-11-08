@@ -1050,6 +1050,7 @@ fn task_matcher_hints_stay_out_of_the_problems_list_and_its_count() {
         message: String::from("m"),
         source: String::from("task"),
         code: None,
+        related: Vec::new(),
     };
     app.build_diagnostics.insert(
         a.clone(),
