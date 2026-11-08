@@ -459,10 +459,13 @@ impl FsWatch {
     }
 
     fn snapshot_expanded_dir_mtimes(tree: &FileTree) -> BTreeMap<PathBuf, Option<SystemTime>> {
+        // A compact row (#1486) also stamps the folders it folds in, open or
+        // not: an entry added to one of them splits the row.
         tree.nodes
             .iter()
-            .filter(|n| n.is_dir && n.expanded)
-            .map(|n| (n.path.clone(), Self::dir_modified(&n.path)))
+            .filter(|n| n.is_dir && (n.expanded || n.folded > 0))
+            .flat_map(|n| n.shown_paths())
+            .map(|p| (p.to_path_buf(), Self::dir_modified(p)))
             .collect()
     }
 

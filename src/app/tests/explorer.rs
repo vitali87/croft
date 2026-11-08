@@ -61,6 +61,40 @@ fn poll_classifies_a_secondary_root_against_the_root_that_owns_it() {
     );
 }
 
+/// #1486: the poll stamps every folder a compact row folds in, so a file
+/// added to `main` splits `src/main/java/com/acme` with no watcher, and
+/// `disable_compact_folders` lists every level again at once.
+#[test]
+fn the_poll_splits_a_compact_row_and_the_setting_unfolds_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    std::fs::create_dir_all(src.join("main/java/com/acme")).unwrap();
+    std::fs::write(src.join("main/java/com/acme/App.java"), "").unwrap();
+    std::fs::write(tmp.path().join("README.md"), "").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.fs_watch.disable();
+    let row = app.tree.row_of(&src).unwrap();
+    app.tree.select(row);
+    app.tree.expand_selected();
+    assert_eq!(app.tree.nodes[row].label(), "src/main/java/com/acme");
+    app.fs_watch.force_poll_due();
+    let _ = app.fs_watch.poll(&mut app.tree, &[]);
+
+    std::fs::write(src.join("main/Other.java"), "").unwrap();
+    app.fs_watch.force_poll_due();
+    assert!(app.fs_watch.poll(&mut app.tree, &[]).dirs_changed);
+    let label = |app: &App, path: &Path| app.tree.nodes[app.tree.row_of(path).unwrap()].label();
+    assert_eq!(label(&app, &src), "src/main");
+    assert_eq!(label(&app, &src.join("main/java")), "java/com/acme");
+
+    app.apply_merged_settings(&crate::prefs::Prefs {
+        disable_compact_folders: true,
+        ..Default::default()
+    });
+    assert_eq!(label(&app, &src), "src");
+    assert_eq!(label(&app, &src.join("main/java/com")), "com");
+}
+
 fn dir_node(path: &Path) -> crate::widgets::file_tree::Node {
     crate::widgets::file_tree::Node {
         path: path.to_path_buf(),
@@ -68,6 +102,7 @@ fn dir_node(path: &Path) -> crate::widgets::file_tree::Node {
         is_dir: true,
         expanded: false,
         loaded: false,
+        folded: 0,
     }
 }
 
@@ -1128,11 +1163,13 @@ fn picking_a_nested_file_via_cmd_p_expands_every_parent_dir_in_the_explorer_and_
         selected, target,
         "the explorer cursor must land on the picked file, not stay on whichever row was selected before — got {selected:?}"
     );
+    // A compact row (#1486) shows every folder it folds in.
     let visible_paths: Vec<String> = app
         .tree
         .nodes
         .iter()
-        .map(|n| n.path.display().to_string())
+        .flat_map(|n| n.shown_paths())
+        .map(|p| p.display().to_string())
         .collect();
     for expected_parent in [
         tmp.path().join("packages"),

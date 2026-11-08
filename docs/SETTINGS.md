@@ -104,7 +104,7 @@ allowlist — appearance and editor/terminal behavior:
 `render_whitespace`, `rulers`, `word_based_suggestions`, `disable_inline_blame`, `disable_auto_close_pairs`, `disable_paste_reindent`, `disable_quick_suggestions`,
 `disable_inline_values`, `disable_save_before_debug`, `disable_bracket_colors`, `disable_indent_guides`, `line_numbers`,
 `disable_inlay_hints`, `copy_on_select`, `disable_secret_redaction`, `disable_log_highlight`, `explorer_views`,
-`files_exclude`, `search_exclude`, `files_associations`, `languages` (only its
+`disable_compact_folders`, `files_exclude`, `search_exclude`, `files_associations`, `languages` (only its
 per-language editor keys; see below), `files_encoding`.
 
 Everything else — `disabled_extensions`, `mcp_consented`, `disable_remote_offer`, `remote_offer_excluded_hosts`, `config_sync_excluded_hosts`, `config_sync_excluded_files`, `fleet_groups`, `code_scanning`, `lane_agent`,
@@ -140,6 +140,7 @@ means the same thing whichever path reads it.
 | `editor.autoClosingBrackets: "never"` | `disable_auto_close_pairs` |
 | `debug.saveBeforeStart: "none"` | `disable_save_before_debug` (every other value saves before a launch, a task or a Testing run) |
 | `terminal.integrated.copyOnSelection` | `copy_on_select` |
+| `explorer.compactFolders` | `disable_compact_folders` (negated) |
 | `files.exclude` | `files_exclude` (the globs set to `true`; a glob set to `false` becomes `!glob`, which takes it back from an earlier layer; `when` clauses are left out). VS Code reads a bare glob such as `build` from the workspace root, so it arrives anchored, as `/build`, and `scripts/build/` stays visible |
 | `search.exclude` | `search_exclude` (same) |
 | `files.associations` | `files_associations` (ids normalised, so `jsonc` becomes `json`; an entry naming a language croft has neither a grammar nor a server for is left out) |

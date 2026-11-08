@@ -171,6 +171,7 @@ fn menu_item_at_handles_clipped_menu_so_clicks_dispatch_the_visible_row() {
         is_dir: false,
         expanded: false,
         loaded: true,
+        folded: 0,
     };
     let target = f.parent().unwrap().to_path_buf();
     let items = build_tree_context_menu_items(

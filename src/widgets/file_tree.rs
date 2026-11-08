@@ -17,6 +17,41 @@ pub struct Node {
     pub is_dir: bool,
     pub expanded: bool,
     pub loaded: bool,
+    /// Compact folders (#1486), VS Code's `explorer.compactFolders`: how
+    /// many folders above `path` this row folds in, each the only entry of
+    /// the one above it. 0 for an ordinary row. The row
+    /// `src/main/java/com/acme` folds 4, and its `path` is the deepest
+    /// folder, `acme`, so New File, paste and drop land there.
+    pub folded: usize,
+}
+
+impl Node {
+    /// Every folder the row shows, deepest first: `path` and the `folded`
+    /// folders above it.
+    pub fn shown_paths(&self) -> impl Iterator<Item = &Path> {
+        self.path.ancestors().take(self.folded + 1)
+    }
+
+    /// Whether this row shows `path`, as its own or as a folded-in folder.
+    pub fn shows(&self, path: &Path) -> bool {
+        self.shown_paths().any(|p| p == path)
+    }
+
+    /// The row's name: the entry's own, or a compact row's folder names
+    /// joined by `/`, as VS Code labels one.
+    pub fn label(&self) -> String {
+        let mut names: Vec<String> = self
+            .shown_paths()
+            .map(|p| {
+                p.file_name().map_or_else(
+                    || p.display().to_string(),
+                    |n| n.to_string_lossy().into_owned(),
+                )
+            })
+            .collect();
+        names.reverse();
+        names.join("/")
+    }
 }
 
 pub struct FileTree {
@@ -68,6 +103,10 @@ pub struct FileTree {
     /// The project's `files_exclude` globs (#1345): matching entries are
     /// not listed, like VS Code's `files.exclude`.
     pub exclude: crate::widgets::search::PathFilter,
+    /// Fold a folder whose only entry is a folder into one row with it
+    /// (#1486). On by default; the `disable_compact_folders` setting clears
+    /// it through [`Self::set_compact_folders`].
+    pub compact_folders: bool,
     /// Text painted after a ROOT row's name (#348): a worktree lane's
     /// branch and the badge of the agent seated in its pane, keyed by the
     /// root path. Swapped in by the app whenever a lane or a seat changes;
@@ -125,6 +164,7 @@ impl FileTree {
                 is_dir: true,
                 expanded: true,
                 loaded: false,
+                folded: 0,
             }],
             selected: 0,
             scroll: 0,
@@ -136,6 +176,7 @@ impl FileTree {
             scrub_tree: None,
             agent_touched: Arc::default(),
             exclude: Default::default(),
+            compact_folders: true,
             note_counts: Arc::default(),
             root_badges: Arc::default(),
             last_inner: Rect::default(),
@@ -167,6 +208,7 @@ impl FileTree {
             is_dir: true,
             expanded: true,
             loaded: false,
+            folded: 0,
         }];
         self.selected = 0;
         self.scroll = 0;
@@ -209,6 +251,7 @@ impl FileTree {
             is_dir: true,
             expanded: true,
             loaded: false,
+            folded: 0,
         });
         let idx = self.nodes.len() - 1;
         self.load_children(idx);
@@ -465,13 +508,10 @@ impl FileTree {
         paths
     }
 
-    fn load_children(&mut self, idx: usize) {
-        if self.nodes[idx].loaded {
-            return;
-        }
-        let path = self.nodes[idx].path.clone();
-        let depth = self.nodes[idx].depth + 1;
-        let mut entries: Vec<(PathBuf, bool)> = std::fs::read_dir(&path)
+    /// The entries the Explorer lists in `dir`, unsorted, each with whether
+    /// it is a folder.
+    fn read_entries(&self, dir: &Path) -> Vec<(PathBuf, bool)> {
+        std::fs::read_dir(dir)
             .ok()
             .into_iter()
             .flat_map(|rd| rd.filter_map(Result::ok))
@@ -484,7 +524,41 @@ impl FileTree {
                 (p, is_dir)
             })
             .filter(|(p, _)| !self.exclude.excludes(&self.root, p))
-            .collect();
+            .collect()
+    }
+
+    /// Re-derive row `idx`'s compact chain from disk (#1486) and return the
+    /// entries of the folder it ends on: from its top folder, fold in each
+    /// folder that is the only entry of the one above. Only a listed row
+    /// folds (on expand, as VS Code resolves single-child folders), at one
+    /// listing per level, what expanding each would have cost. A workspace
+    /// root never folds: it heads its section.
+    fn fold(&mut self, idx: usize) -> Vec<(PathBuf, bool)> {
+        let node = &mut self.nodes[idx];
+        if let Some(top) = node.path.ancestors().nth(node.folded) {
+            node.path = top.to_path_buf();
+        }
+        node.folded = 0;
+        let mut entries = self.read_entries(&self.nodes[idx].path);
+        while self.compact_folders
+            && self.nodes[idx].depth > 0
+            && let [(only, true)] = entries.as_slice()
+        {
+            let only = only.clone();
+            entries = self.read_entries(&only);
+            let node = &mut self.nodes[idx];
+            node.path = only;
+            node.folded += 1;
+        }
+        entries
+    }
+
+    fn load_children(&mut self, idx: usize) {
+        if self.nodes[idx].loaded {
+            return;
+        }
+        let depth = self.nodes[idx].depth + 1;
+        let mut entries = self.fold(idx);
         entries.sort_by(|a, b| match (a.1, b.1) {
             (true, false) => std::cmp::Ordering::Less,
             (false, true) => std::cmp::Ordering::Greater,
@@ -498,6 +572,7 @@ impl FileTree {
                 is_dir,
                 expanded: false,
                 loaded: false,
+                folded: 0,
             })
             .collect();
         let insert_at = idx + 1;
@@ -507,10 +582,14 @@ impl FileTree {
         self.nodes[idx].loaded = true;
     }
 
+    /// Reload row `idx`'s children, re-expanding those in `expanded_paths`
+    /// and re-folding the collapsed compact rows whose top folder is in
+    /// `folded_tops` (#1486), so a refresh leaves both as they were.
     fn load_children_preserving_expansion(
         &mut self,
         idx: usize,
         expanded_paths: &BTreeSet<PathBuf>,
+        folded_tops: &BTreeSet<PathBuf>,
     ) {
         self.load_children(idx);
         let child_depth = self.nodes[idx].depth + 1;
@@ -525,7 +604,9 @@ impl FileTree {
             }
             if self.nodes[child].is_dir && expanded_paths.contains(&self.nodes[child].path) {
                 self.nodes[child].expanded = true;
-                self.load_children_preserving_expansion(child, expanded_paths);
+                self.load_children_preserving_expansion(child, expanded_paths, folded_tops);
+            } else if folded_tops.contains(&self.nodes[child].path) {
+                self.fold(child);
             }
             child += 1;
             while child < self.nodes.len() && self.nodes[child].depth > child_depth {
@@ -770,7 +851,7 @@ impl FileTree {
         for component in rel.components() {
             current_path.push(component.as_os_str());
             let is_last = current_path == target;
-            let Some(idx) = self.nodes.iter().position(|n| n.path == current_path) else {
+            let Some(idx) = self.row_of(&current_path) else {
                 return false;
             };
             if !is_last && self.nodes[idx].is_dir && !self.nodes[idx].expanded {
@@ -778,7 +859,7 @@ impl FileTree {
                 self.load_children(idx);
             }
         }
-        let Some(final_idx) = self.nodes.iter().position(|n| n.path == target) else {
+        let Some(final_idx) = self.row_of(target) else {
             return false;
         };
         self.selected = final_idx;
@@ -821,11 +902,7 @@ impl FileTree {
         let start = start.min(n - 1);
         for off in 0..n {
             let idx = (start + off) % n;
-            let name = self.nodes[idx]
-                .path
-                .file_name()
-                .map(|s| s.to_string_lossy().to_ascii_lowercase())
-                .unwrap_or_default();
+            let name = self.nodes[idx].label().to_ascii_lowercase();
             if name.starts_with(&needle) {
                 return Some(idx);
             }
@@ -848,19 +925,32 @@ impl FileTree {
         while end < self.nodes.len() && self.nodes[end].depth > depth {
             end += 1;
         }
-        let expanded_paths: BTreeSet<PathBuf> = self.nodes[(idx + 1)..end]
+        // Every folder an open compact row shows counts as open (#1486),
+        // this row's own included: when its chain splits, the folders it
+        // splits into open again, so the rows under it stay on screen.
+        let expanded_paths: BTreeSet<PathBuf> = self.nodes[idx..end]
             .iter()
             .filter(|n| n.is_dir && n.expanded)
-            .map(|n| n.path.clone())
+            .flat_map(Node::shown_paths)
+            .map(Path::to_path_buf)
+            .collect();
+        let folded_tops: BTreeSet<PathBuf> = self.nodes[(idx + 1)..end]
+            .iter()
+            .filter(|n| !n.expanded && n.folded > 0)
+            .filter_map(|n| n.shown_paths().last().map(Path::to_path_buf))
             .collect();
         let selected_path = self.selected_path().map(Path::to_path_buf);
         self.nodes.drain((idx + 1)..end);
         self.nodes[idx].loaded = false;
         if self.nodes[idx].expanded {
-            self.load_children_preserving_expansion(idx, &expanded_paths);
+            self.load_children_preserving_expansion(idx, &expanded_paths, &folded_tops);
+        } else if self.nodes[idx].folded > 0 {
+            // A collapsed compact row checks its chain too, so an entry
+            // added to a folder it folds in splits it now.
+            self.fold(idx);
         }
         if let Some(path) = selected_path
-            && let Some(new_idx) = self.nodes.iter().position(|n| n.path == path)
+            && let Some(new_idx) = self.row_of(&path)
         {
             self.selected = new_idx;
             self.prune_marks();
@@ -893,23 +983,60 @@ impl FileTree {
     /// Index of the directory node whose path equals `path`, comparing both
     /// the raw stored path and its canonicalized form so this is robust to
     /// `/tmp` vs `/private/tmp` and similar symlink resolution differences.
+    ///
+    /// A compact row (#1486) answers for every folder it folds in, so an
+    /// entry added to `main` under `src/main/java` refreshes, and splits,
+    /// that row.
     pub fn index_of_dir(&self, path: &Path) -> Option<usize> {
         let canon_target = path.canonicalize().ok();
         self.nodes.iter().position(|n| {
             if !n.is_dir {
                 return false;
             }
-            if n.path == path {
+            if n.shows(path) {
                 return true;
             }
             if let Some(target) = canon_target.as_ref()
                 && let Ok(canon_node) = n.path.canonicalize()
-                && &canon_node == target
+                && canon_node
+                    .ancestors()
+                    .take(n.folded + 1)
+                    .any(|p| p == target)
             {
                 return true;
             }
             false
         })
+    }
+
+    /// The row showing `path`: its own, or the compact row that folds it
+    /// in (#1486).
+    pub fn row_of(&self, path: &Path) -> Option<usize> {
+        self.nodes.iter().position(|n| n.shows(path))
+    }
+
+    /// Turn compact folders (#1486) on or off, re-listing every root so
+    /// open rows fold or split at once. Only listed folders fold, so with
+    /// none open below the roots, as at launch, nothing is re-listed.
+    pub fn set_compact_folders(&mut self, on: bool) {
+        if self.compact_folders == on {
+            return;
+        }
+        self.compact_folders = on;
+        if !self
+            .nodes
+            .iter()
+            .any(|n| n.depth > 0 && (n.expanded || n.folded > 0))
+        {
+            return;
+        }
+        // Bottom up, so re-listing one section leaves the earlier roots'
+        // indices where they were.
+        for idx in (0..self.nodes.len()).rev() {
+            if self.nodes[idx].depth == 0 {
+                self.refresh_children(idx);
+            }
+        }
     }
 }
 
@@ -1655,11 +1782,7 @@ impl Widget for &mut FileTree {
             let mut spans: Vec<Span> = Vec::with_capacity(6);
             spans.push(Span::raw(indent));
 
-            let name = node
-                .path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_else(|| node.path.display().to_string());
+            let name = node.label();
 
             // Git-ignored and changed rows colour the *name* only — icons
             // keep their color, matching VS Code's git decorations.
@@ -1892,11 +2015,7 @@ impl Widget for &mut FileTree {
                     buf[(x, y)].set_style(Style::default().bg(bg));
                 }
                 let node = &self.nodes[aidx];
-                let name = node
-                    .path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| node.path.display().to_string());
+                let name = node.label();
                 let name_fg = self.name_fg(&node.path);
                 let spans = vec![
                     Span::raw("  ".repeat(node.depth)),
@@ -3269,6 +3388,7 @@ mod tests {
             is_dir: true,
             expanded: false,
             loaded: false,
+            folded: 0,
         };
         assert_eq!(
             create_target_dir_for(Some(&dir), Path::new("/r")),
@@ -3284,6 +3404,7 @@ mod tests {
             is_dir: false,
             expanded: false,
             loaded: false,
+            folded: 0,
         };
         assert_eq!(
             create_target_dir_for(Some(&file), Path::new("/r")),
@@ -3339,6 +3460,7 @@ mod tests {
             is_dir: true,
             expanded: true,
             loaded: true,
+            folded: 0,
         };
         assert!(delete_target_for(Some(&root_node), tmp.path()).is_none());
     }
@@ -3360,6 +3482,7 @@ mod tests {
             is_dir: false,
             expanded: false,
             loaded: false,
+            folded: 0,
         };
         assert_eq!(delete_target_for(Some(&node), tmp.path()), Some(f));
     }
@@ -3375,6 +3498,7 @@ mod tests {
             is_dir: true,
             expanded: false,
             loaded: false,
+            folded: 0,
         };
         assert_eq!(delete_target_for(Some(&node), tmp.path()), Some(sub));
     }
@@ -3561,6 +3685,113 @@ mod tests {
             tree.nodes.iter().any(|n| n.path.ends_with("brand-new.txt")),
             "the newly created file should be in the tree"
         );
+    }
+
+    /// The Maven layout of #1486: `src/main/java/com/acme/App.java` beside a
+    /// README, so the root itself lists two entries.
+    fn maven_fixture() -> (TempDir, FileTree) {
+        let tmp = TempDir::new().unwrap();
+        let acme = tmp.path().join("src/main/java/com/acme");
+        fs::create_dir_all(&acme).unwrap();
+        fs::write(acme.join("App.java"), "class App {}\n").unwrap();
+        fs::write(tmp.path().join("README.md"), "# hi\n").unwrap();
+        let tree = FileTree::new(tmp.path().to_path_buf());
+        (tmp, tree)
+    }
+
+    /// Each row as `depth label`, the root's left out.
+    fn rows(tree: &FileTree) -> String {
+        let label = |n: &Node| format!("{} {}", n.depth, n.label());
+        tree.nodes[1..]
+            .iter()
+            .map(label)
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    fn expand(tree: &mut FileTree, path: &Path) {
+        tree.select(tree.row_of(path).unwrap());
+        tree.expand_selected();
+    }
+
+    const FOLDED: &str = "1 src/main/java/com/acme, 2 App.java, 1 README.md";
+
+    #[test]
+    fn expanding_a_chain_of_only_child_folders_opens_one_row() {
+        let (tmp, mut tree) = maven_fixture();
+        assert_eq!(rows(&tree), "1 src, 1 README.md", "unlisted, src is src");
+        expand(&mut tree, &tmp.path().join("src"));
+        assert_eq!(rows(&tree), FOLDED, "one expansion, App.java one level in");
+        let row = &tree.nodes[1];
+        assert_eq!(row.path, tmp.path().join("src/main/java/com/acme"));
+        assert!(row.expanded && row.folded == 4);
+        let area = Rect::new(0, 0, 40, 6);
+        let mut buf = Buffer::empty(area);
+        (&mut tree).render(area, &mut buf);
+        let painted: String = (0..40).map(|x| buf[(x, 2)].symbol()).collect();
+        assert!(painted.contains("src/main/java/com/acme"), "{painted:?}");
+    }
+
+    #[test]
+    fn a_folder_with_two_entries_or_one_file_does_not_fold() {
+        let tmp = TempDir::new().unwrap();
+        fs::create_dir_all(tmp.path().join("src/main")).unwrap();
+        fs::create_dir_all(tmp.path().join("src/test")).unwrap();
+        fs::create_dir_all(tmp.path().join("docs")).unwrap();
+        fs::write(tmp.path().join("docs/a.md"), "").unwrap();
+        let mut tree = FileTree::new(tmp.path().to_path_buf());
+        expand(&mut tree, &tmp.path().join("src"));
+        expand(&mut tree, &tmp.path().join("docs"));
+        assert_eq!(rows(&tree), "1 docs, 2 a.md, 1 src, 2 main, 2 test");
+    }
+
+    #[test]
+    fn compact_folders_off_lists_every_level_and_toggles_open_rows() {
+        let (tmp, mut tree) = maven_fixture();
+        tree.set_compact_folders(false);
+        expand(&mut tree, &tmp.path().join("src"));
+        assert_eq!(rows(&tree), "1 src, 2 main, 1 README.md");
+        tree.set_compact_folders(true);
+        assert_eq!(rows(&tree), FOLDED, "turned on, the open src folds");
+        tree.set_compact_folders(false);
+        assert_eq!(
+            rows(&tree),
+            "1 src, 2 main, 3 java, 4 com, 5 acme, 6 App.java, 1 README.md",
+            "every folder the row showed stays open"
+        );
+    }
+
+    #[test]
+    fn an_entry_added_inside_a_chain_splits_it_on_refresh() {
+        let (tmp, mut tree) = maven_fixture();
+        let main = tmp.path().join("src/main");
+        expand(&mut tree, &tmp.path().join("src"));
+        let app = main.join("java/com/acme/App.java");
+        tree.select(tree.row_of(&app).unwrap());
+        fs::write(main.join("Other.java"), "").unwrap();
+        // The watcher reports `main`, which only the compact row shows.
+        tree.refresh_children(tree.index_of_dir(&main).unwrap());
+        assert_eq!(
+            rows(&tree),
+            "1 src/main, 2 java/com/acme, 3 App.java, 2 Other.java, 1 README.md"
+        );
+        assert_eq!(tree.selected_path(), Some(app.as_path()));
+        fs::remove_file(main.join("Other.java")).unwrap();
+        tree.refresh_children(tree.index_of_dir(&main).unwrap());
+        assert_eq!(rows(&tree), FOLDED, "the chain folds back");
+    }
+
+    #[test]
+    fn a_collapsed_chain_survives_a_parent_refresh_and_reveal_opens_it() {
+        let (tmp, mut tree) = maven_fixture();
+        expand(&mut tree, &tmp.path().join("src"));
+        tree.collapse_selected();
+        tree.refresh_children(0);
+        assert_eq!(rows(&tree), "1 src/main/java/com/acme, 1 README.md");
+        let app = tmp.path().join("src/main/java/com/acme/App.java");
+        assert!(tree.reveal_path(&app));
+        assert_eq!(tree.selected_path(), Some(app.as_path()));
+        assert_eq!(tree.nodes[tree.selected].depth, 2);
     }
 
     #[test]
@@ -3969,6 +4200,8 @@ mod tests {
             fs::write(root.join(format!("outer/inner/f{i:02}.rs")), "x\n").unwrap();
         }
         let mut tree = FileTree::new(root.to_path_buf());
+        // Three levels of rows, not the compact row `outer/inner` (#1486).
+        tree.compact_folders = false;
         // Expand outer, then inner, so the deep files are real rows.
         let outer = tree
             .nodes

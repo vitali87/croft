@@ -383,6 +383,11 @@ const SETTINGS: &[SettingMap] = &[
         convert: as_bool,
     },
     SettingMap {
+        vscode: "explorer.compactFolders",
+        croft: "disable_compact_folders",
+        convert: negated,
+    },
+    SettingMap {
         vscode: "files.exclude",
         croft: "files_exclude",
         convert: as_enabled_globs,
@@ -1732,6 +1737,7 @@ mod tests {
             "editor.bracketPairColorization.enabled": false,
             "editor.autoClosingBrackets": "never",
             "editor.renderWhitespace": "all",
+            "explorer.compactFolders": false,
             "terminal.integrated.scrollback": 20000,
             "editor.fontFamily": "Fira Code",
             "workbench.iconTheme": "material-icon-theme"
@@ -1740,6 +1746,7 @@ mod tests {
         convert_settings(&doc, &mut report);
 
         assert_eq!(report.settings["format_on_save"], json!(true));
+        assert_eq!(report.settings["disable_compact_folders"], json!(true));
         assert_eq!(
             report.settings["disable_bracket_colors"],
             json!(true),

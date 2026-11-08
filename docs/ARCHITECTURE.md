@@ -185,7 +185,7 @@ src/
     ├── editor_find.rs        VS Code-style inline Find bar (`Cmd+F`) with match highlight, Enter/Shift+Enter walk, case/whole-word/regex toggles and a Replace row (`Cmd+Opt+F`); Replace All runs through the same `split_for_highlight` as count and paint
     ├── extensions.rs         Extensions sidebar widget: projects bundled and user manifests into a theme-aware list grouped under BUILT-IN/INSTALLED/AVAILABLE, with pill toggles, +Add, trash, a local filter box and clear/refresh; reports clicks back to App, which owns the state
     ├── file_finder.rs   VS Code-style Quick Open (Cmd+P) fuzzy file picker with tiered match ranking (exact filename > prefix > substring > path > subsequence)
-    ├── file_tree.rs          `ignore::WalkBuilder` backed file tree: lazy children, fs-watcher refresh, multi-select, drag-drop, bulk trash, reveal-path, multi-root section rows and sticky scroll
+    ├── file_tree.rs          `ignore::WalkBuilder` backed file tree: lazy children, fs-watcher refresh, multi-select, drag-drop, bulk trash, reveal-path, multi-root section rows, sticky scroll and compact folders
     ├── header_pill.rs   shared section-header pill button (chip-backed codicon affordance + theme colours) used by both the Remote Explorer (+ / refresh) and Source Control (refresh) headers
     ├── captures.rs           the panel group's CAPTURES tab (iTerm2's Capture Output): lines collected by `capture` triggers, with Enter jumping to the originating pane row; pure widget capped at 500 entries, and it also shapes the "Ask Navigator about this line" turn
     ├── history_popup.rs      `Ctrl+Shift+H` command-history popup over command_history.rs: query line, newest-first deduped results with exit/duration/cwd meta, `Ctrl+R` scope filter
@@ -867,6 +867,8 @@ An `ignore::WalkBuilder`-backed tree with lazy children, fs-watcher refresh, mul
 **Sticky scroll** (VS Code 1.86's tree sticky). Scrolled deep, the off-screen ancestor chain of the top visible row pins to the top band. `sticky_ancestors` walks nearest-smaller-depth backwards, with a cap of 3 that keeps the deepest levels. The band overpaints content rows but never the selected row: the scroll clamp keeps selection on screen, so its band-relative row bounds the band.
 
 **Mouse handling against the band.** Hit rows are recorded per render as frame truth. A left-click on a pinned row selects it and scrolls it to the top; a right-click context-menus the pinned dir instead of the covered row. Both mouse arms resolve the band *before* `node_at_y`.
+
+**Compact folders** (VS Code's `explorer.compactFolders`, #1486). Listing a folder row (`fold`) also lists each folder that is the only entry of the one above, so `src/main/java/com/acme` is one row. Its `path` is the deepest folder, so create, paste, drop, rename and delete act there, and `folded` counts the folders above it. Folding happens when the row is listed, as VS Code resolves single-child folders on expand. Listing a parent never peeks into its children, so a big folder costs no more to open than before. Each listing re-derives the chain from the top, and `index_of_dir` / `row_of` answer for every folder a row shows. An entry added to `main` therefore reaches that row and splits it, and the poll stamps the folded folders too. Workspace roots never fold. `disable_compact_folders` turns it off.
 
 ### shell_integration.rs
 
