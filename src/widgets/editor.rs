@@ -3233,6 +3233,15 @@ pub enum GitMark {
     Deleted,
 }
 
+/// What the inline blame says of the cursor's line (#1556).
+#[derive(Clone, Copy, Debug)]
+pub enum LineBlame<'a> {
+    /// The line differs from HEAD: the annotation reads `Uncommitted changes`.
+    Uncommitted,
+    /// The commit that last changed the line.
+    Commit(&'a crate::git::BlameCommit),
+}
+
 /// One tick on the editor's overview ruler: the whole-file summary VS Code and
 /// Zed paint down the scrollbar track, so a problem or a search hit outside the
 /// viewport is still visible.
@@ -3487,6 +3496,11 @@ pub struct Editor {
     /// Whether to paint the current-line blame annotation (user pref, default
     /// on). The blame data is still fetched so toggling is instant.
     pub blame_enabled: bool,
+    /// The blame annotation painted this frame when it names a commit:
+    /// `(screen y, x range)`, which the mouse hovers for the commit's card
+    /// and clicks to open its changes (#1556). Cleared at render start, like
+    /// the lens spans.
+    blame_span: Option<(u16, std::ops::Range<u16>)>,
     /// Paint who typed each line in the gutter and name the seat in the
     /// inline-blame annotation (#349). Off by default: it is a review lens,
     /// not a resting state, and `Editor: Toggle Provenance` flips it for the
@@ -4159,6 +4173,7 @@ impl Editor {
             blame_lines: None,
             blame_for: None,
             blame_enabled: true,
+            blame_span: None,
             provenance_overlay: false,
             scroll: 0,
             scroll_sub: 0,
@@ -4935,6 +4950,22 @@ impl Editor {
     /// The git half of the annotation: author, age and summary of the
     /// cursor's line, or the uncommitted marker.
     fn committed_blame_annotation(&self) -> Option<String> {
+        Some(match self.cursor_line_blame()? {
+            LineBlame::Uncommitted => "Uncommitted changes".to_string(),
+            LineBlame::Commit(commit) => format!(
+                "{}, {} • {}",
+                commit.author,
+                crate::git::humanize_age(commit.age_secs),
+                commit.summary
+            ),
+        })
+    }
+
+    /// What the inline blame says of the cursor's line, or `None` when it
+    /// says nothing: blame is off or unavailable, or the line was edited
+    /// past the blamed range. Git: Open Commit for Line and the annotation's
+    /// hover and click act on its commit (#1556).
+    pub fn cursor_line_blame(&self) -> Option<LineBlame<'_>> {
         if !self.blame_enabled {
             return None;
         }
@@ -4958,7 +4989,7 @@ impl Editor {
             self.git_mark_at(self.cursor_row),
             Some(GitMark::Added | GitMark::Modified)
         ) {
-            return Some("Uncommitted changes".to_string());
+            return Some(LineBlame::Uncommitted);
         }
         // Insertions/deletions shift line indices out from under the blamed
         // snapshot; only trust the 1:1 mapping while the line counts match.
@@ -4972,15 +5003,19 @@ impl Editor {
         if text.is_some_and(|t| Some(t) != self.lines.get(self.cursor_row).map(String::as_str)) {
             return None;
         }
-        if commit.uncommitted {
-            return Some("Uncommitted changes".to_string());
-        }
-        Some(format!(
-            "{}, {} • {}",
-            commit.author,
-            crate::git::humanize_age(commit.age_secs),
-            commit.summary
-        ))
+        Some(if commit.uncommitted {
+            LineBlame::Uncommitted
+        } else {
+            LineBlame::Commit(commit)
+        })
+    }
+
+    /// Whether screen cell `(col, row)` is on the blame annotation painted
+    /// this frame, and it names a commit (#1556).
+    pub fn blame_annotation_at(&self, col: u16, row: u16) -> bool {
+        self.blame_span
+            .as_ref()
+            .is_some_and(|(y, xs)| *y == row && xs.contains(&col))
     }
 
     /// The buffer's merge-conflict blocks, rescanned only when the buffer
@@ -19397,6 +19432,7 @@ impl Widget for &mut Editor {
         self.last_hscrollbar = Rect::default();
         self.merge_action_spans.clear();
         self.code_lens_spans.clear();
+        self.blame_span = None;
         // Every rect this frame publishes is cleared up front, so a frame
         // that paints nothing leaves nothing behind for the mouse path to
         // hit-test against. `render_log` sets its own when it paints; the
@@ -20612,6 +20648,12 @@ impl Widget for &mut Editor {
                             .fg(self.theme.ignored_fg())
                             .add_modifier(Modifier::ITALIC),
                     );
+                    // Hover and click reach the commit it names (#1556);
+                    // `Uncommitted changes` has none to show.
+                    if matches!(self.cursor_line_blame(), Some(LineBlame::Commit(_))) {
+                        let w = unicode_width::UnicodeWidthStr::width(shown.as_str()) as u16;
+                        self.blame_span = Some((y, start_x..(start_x + w).min(right)));
+                    }
                 }
             }
 
@@ -24445,7 +24487,7 @@ mod tests {
         uncommitted: bool,
     ) -> std::sync::Arc<crate::git::BlameCommit> {
         std::sync::Arc::new(crate::git::BlameCommit {
-            short_hash: "abc12345".into(),
+            hash: "abc12345".into(),
             summary: summary.into(),
             author: author.into(),
             age_secs: age,

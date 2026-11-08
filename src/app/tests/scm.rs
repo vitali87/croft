@@ -4202,6 +4202,131 @@ fn clicking_a_commit_graph_row_opens_the_commit_patch_tab() {
     );
 }
 
+/// The issue's repo (#1556), open on `f.py` with its blame in: line 2 was
+/// raised to `b = 20` by a commit whose message has a body, and line 3,
+/// `c = 3`, is not committed. The caret is on line 2.
+fn blamed_line_app() -> (tempfile::TempDir, App) {
+    let tmp = make_committed_repo();
+    let p = tmp.path();
+    std::fs::write(p.join("f.py"), "a = 1\nb = 2\n").unwrap();
+    assert!(git_succeeds(p, &["add", "f.py"]));
+    assert!(git_succeeds(p, &["commit", "-qm", "Initial values"]));
+    std::fs::write(p.join("f.py"), "a = 1\nb = 20\n").unwrap();
+    let (author, message) = (
+        "--author=Bo Chen <bo@example.com>",
+        "Raise b to 20\n\nThe old limit overflowed.",
+    );
+    assert!(git_succeeds(p, &["commit", "-qa", author, "-m", message]));
+    std::fs::write(p.join("f.py"), "a = 1\nb = 20\nc = 3\n").unwrap();
+    let mut app = App::new(p.to_path_buf()).unwrap();
+    app.editor.open(&p.join("f.py")).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.cursor_row = 1;
+    app.sync_blame();
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the file's blame",
+        || {
+            app.drain_blame();
+            app.editor.blame_lines.is_some()
+        },
+    );
+    (tmp, app)
+}
+
+/// #1556: Git: Open Commit for Line opens the change the caret line's
+/// commit made to the file, as GitLens's Open Changes does.
+#[test]
+fn open_commit_for_line_shows_the_lines_commit_diff() {
+    let (_tmp, mut app) = blamed_line_app();
+    app.run_command(crate::widgets::command_palette::Command::GitOpenLineCommit);
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the commit's diff",
+        || {
+            app.drain_git_view();
+            app.git_view_job.is_none()
+        },
+    );
+    let diff = app
+        .editor
+        .diff
+        .as_ref()
+        .expect("the commit opens as a diff");
+    assert!(diff.left_lines.iter().any(|l| l == "b = 2"), "{diff:?}");
+    assert!(diff.right_lines.iter().any(|l| l == "b = 20"), "{diff:?}");
+    assert!(app.status.starts_with("Showing f.py at "), "{}", app.status);
+}
+
+/// #1556: Git: Copy Commit Hash for Line copies the full hash of the caret
+/// line's commit; an uncommitted line has none, and says so.
+#[test]
+fn copy_commit_hash_for_line_copies_the_lines_commit() {
+    let (tmp, mut app) = blamed_line_app();
+    let head = git_stdout_in(tmp.path(), &["rev-parse", "HEAD"]);
+    app.run_command(crate::widgets::command_palette::Command::GitCopyLineCommitHash);
+    assert_eq!(crate::clipboard::last_copy().as_deref(), Some(head.trim()));
+    assert_eq!(app.status, format!("Copied commit hash {}", &head[..8]));
+    app.editor.cursor_row = 2;
+    app.run_command(crate::widgets::command_palette::Command::GitCopyLineCommitHash);
+    assert_eq!(app.status, "Line 3 has uncommitted changes");
+    assert_eq!(crate::clipboard::last_copy().as_deref(), Some(head.trim()));
+}
+
+/// #1556: the pointer resting on line 2's inline blame shows its commit's
+/// card, with the email and the whole message the annotation leaves out;
+/// it stays along the annotation, goes off it, and a click opens the diff.
+#[test]
+fn hovering_the_inline_blame_shows_its_commits_whole_message() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let (_tmp, mut app) = blamed_line_app();
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let buf = term.backend().buffer();
+    let (col, row) = (0..30u16)
+        .find_map(|y| {
+            let cells: Vec<&str> = (0..120u16).map(|x| buf[(x, y)].symbol()).collect();
+            let x = cells.windows(5).position(|w| w.concat() == "Raise")?;
+            Some((x as u16, y))
+        })
+        .expect("line 2's blame is painted");
+    app.handle_mouse(mouse(MouseEventKind::Moved, col, row));
+    // What the dwell runs once the pointer has rested HOVER_DELAY.
+    app.hover_at_cell(col, row);
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the commit's card",
+        || {
+            app.drain_blame_hover();
+            app.hover_popup.is_some()
+        },
+    );
+    let card = app.hover_popup.as_ref().unwrap().lines.join("\n");
+    assert!(card.starts_with("Bo Chen <bo@example.com>\n"), "{card}");
+    assert!(
+        card.contains("Raise b to 20\n\nThe old limit overflowed."),
+        "{card}"
+    );
+    app.handle_mouse(mouse(MouseEventKind::Moved, col + 3, row));
+    assert!(
+        app.hover_popup.is_some(),
+        "the card stays along the annotation"
+    );
+    app.handle_mouse(mouse(MouseEventKind::Moved, col, row - 1));
+    assert!(app.hover_popup.is_none(), "and goes off it");
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the commit's diff",
+        || {
+            app.drain_git_view();
+            app.git_view_job.is_none()
+        },
+    );
+    let diff = app.editor.diff.as_ref().expect("a click opens the commit");
+    assert!(diff.right_lines.iter().any(|l| l == "b = 20"));
+}
+
 /// The issue's repo (#1627): `main` has "init app" and "update readme";
 /// `feature`, off "init app", has "fix crash on empty input" (appends to
 /// `app.txt`) and "add feature flag". HEAD is `main`.

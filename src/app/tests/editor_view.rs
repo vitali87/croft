@@ -282,14 +282,14 @@ fn inline_blame_annotation_paints_on_the_cursor_line() {
         Some(crate::git::Blame::new(
             vec![
                 std::sync::Arc::new(crate::git::BlameCommit {
-                    short_hash: "abc12345".into(),
+                    hash: "abc12345".into(),
                     summary: "init".into(),
                     author: "Vitali".into(),
                     age_secs: 3600,
                     uncommitted: false,
                 }),
                 std::sync::Arc::new(crate::git::BlameCommit {
-                    short_hash: "abc12345".into(),
+                    hash: "abc12345".into(),
                     summary: "add x".into(),
                     author: "Alice".into(),
                     age_secs: 60,

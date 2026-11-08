@@ -2726,7 +2726,9 @@ pub fn parse_commit_graph(out: &str, now: i64) -> Vec<GraphCommit> {
 /// `uncommitted`.
 #[derive(Debug, PartialEq, Eq)]
 pub struct BlameCommit {
-    pub short_hash: String,
+    /// The full hash, which Git: Copy Commit Hash for Line copies and Git:
+    /// Open Commit for Line shows (#1556).
+    pub hash: String,
     pub summary: String,
     pub author: String,
     /// Seconds since the commit's author-time, for [`humanize_age`].
@@ -2734,6 +2736,13 @@ pub struct BlameCommit {
     /// True for a not-yet-committed line (the zero hash `git blame` reports
     /// for working-tree changes).
     pub uncommitted: bool,
+}
+
+impl BlameCommit {
+    /// The hash's first eight digits, as the inline blame names a commit.
+    pub fn short_hash(&self) -> &str {
+        &self.hash[..self.hash.len().min(8)]
+    }
 }
 
 /// A file's blame, line by line (#1707). Each line's commit is shared with
@@ -2832,7 +2841,7 @@ pub fn parse_blame(out: &str, now: i64) -> Blame {
             if let Some(full) = hash.take() {
                 let commit = commits.entry(full).or_insert_with_key(|full| {
                     Arc::new(BlameCommit {
-                        short_hash: full.chars().take(8).collect(),
+                        hash: full.clone(),
                         summary: std::mem::take(&mut summary),
                         author: std::mem::take(&mut author),
                         age_secs: now - author_time,
@@ -3832,6 +3841,15 @@ pub fn commit_message(root: &Path, hash: &str) -> Result<String, String> {
     run_git(root, &["log", "-1", "--format=%B", hash])
         .map(|m| m.trim().to_string())
         .map_err(|e| e.to_string())
+}
+
+/// The inline blame's hover card for `hash` (#1556): author and email, the
+/// full date, the short hash and the whole message, which `git blame`
+/// does not give (its `summary` is the first line). No signature check: a
+/// `log.showSignature` config printed gpg's verdict above the card.
+pub fn commit_card(dir: &Path, hash: &str) -> Result<String, String> {
+    let format = "--format=%an <%ae>%n%ad (%ar)%ncommit %h%n%n%B";
+    run_git(dir, &["log", "-1", "--no-show-signature", format, hash]).map_err(|e| e.to_string())
 }
 
 // --- Remotes -------------------------------------------------------------
@@ -7308,7 +7326,8 @@ filename seed.txt
         let b = parse_blame(out, now);
         assert_eq!(b.len(), 2, "one entry per source line");
         let (first, text) = b.line(0).unwrap();
-        assert_eq!(first.short_hash, "abcdef01");
+        assert_eq!(first.hash, "abcdef0123456789abcdef0123456789abcdef01");
+        assert_eq!(first.short_hash(), "abcdef01");
         assert_eq!(first.author, "Vitali");
         assert_eq!(first.summary, "fix: the thing");
         assert_eq!(first.age_secs, 4, "now (10000) minus author-time (9996)");
@@ -7350,7 +7369,7 @@ filename seed.txt
         assert_eq!(third.author, "Vitali");
         assert_eq!(third.summary, "fix: the thing");
         assert_eq!(third.age_secs, 4);
-        assert_eq!(third.short_hash, "abcdef01");
+        assert_eq!(third.short_hash(), "abcdef01");
         assert!(
             std::ptr::eq(b.line(0).unwrap().0, third),
             "two lines of one commit share its record"
@@ -7372,7 +7391,7 @@ filename seed.txt
             "committed by init_repo_with_commit's user"
         );
         assert!(!first.uncommitted);
-        assert!(!first.short_hash.is_empty());
+        assert_eq!(first.hash.len(), 40, "the full hash");
         assert_eq!(
             b.line(1).unwrap().0.author,
             "a",
