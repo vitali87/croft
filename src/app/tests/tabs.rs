@@ -2515,3 +2515,71 @@ fn a_wheel_burst_over_a_background_split_pdf_steps_one_page() {
     assert!(app.scroll_inactive_group_at(10, 10, -1));
     assert_eq!(page(&app), 1);
 }
+
+/// With a submenu open, the wheel over the parent panel drives the parent:
+/// the submenu closes and the parent's highlight steps, instead of the
+/// submenu's highlight moving while the pointer is somewhere else.
+#[test]
+fn the_wheel_over_the_parent_panel_steps_the_parent_not_the_open_submenu() {
+    use crossterm::event::MouseEventKind;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    draw(&mut app, 120, 40);
+    open_tab_menu_on_split_and_move(&mut app);
+    let parent_row = app.context_menu.as_ref().unwrap().selected;
+    app.handle_menu_key(key(KeyCode::Right, KeyModifiers::NONE));
+    assert!(app.context_menu.as_ref().unwrap().open_submenu.is_some());
+    let menu = app.menu_rect().expect("the parent panel is laid out");
+    let sub = app.submenu_rect().expect("the submenu panel is laid out");
+    let (col, row) = (menu.y + 1..menu.y + menu.height - 1)
+        .flat_map(|y| (menu.x + 1..menu.x + menu.width - 1).map(move |x| (x, y)))
+        .find(|&(x, y)| !rect_contains(sub, x, y))
+        .expect("a parent cell the submenu does not cover");
+    app.handle_mouse(mouse(MouseEventKind::ScrollUp, col, row));
+    let m = app.context_menu.as_ref().unwrap();
+    assert!(m.open_submenu.is_none(), "the submenu closes");
+    assert!(m.selected < parent_row, "the parent's highlight stepped up");
+}
+
+/// The wheel over a background group that has not painted since the split
+/// still finds it: the geometric fallback splits the whole editor area, not
+/// the focused group's own share of it, which put every other group's rect
+/// inside that share and missed the pointer.
+#[test]
+fn the_wheel_finds_a_background_group_from_the_whole_editor_area() {
+    let tmp = tempfile::tempdir().unwrap();
+    let body: String = (1..=200).map(|n| format!("line {n}\n")).collect();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", &body);
+    app.split_editor();
+    assert!(app.editor_layout.is_split());
+    let whole = Rect {
+        x: 0,
+        y: 0,
+        width: 100,
+        height: 30,
+    };
+    let rects = app.editor_layout.leaf_rects(whole, EDITOR_SPLIT_MIN);
+    let active = app.editor_layout.active_dfs_index();
+    let other = rects
+        .iter()
+        .enumerate()
+        .find(|&(i, _)| i != active)
+        .map(|(_, r)| *r)
+        .unwrap();
+    // As after a render: the focused group knows only its own share, and
+    // the background group has no recorded rect yet.
+    app.editor_layout_area = whole;
+    app.editor.last_full_area = rects[active];
+    {
+        let mut groups = app.editor_layout.inactive_groups_mut();
+        groups[0].last_full_area = Rect::default();
+        // Its text view has a height, so a scroll can land.
+        groups[0].active_editor_mut().last_inner = Rect {
+            height: 20,
+            ..other
+        };
+    }
+    let (col, row) = (other.x + other.width / 2, other.y + other.height / 2);
+    assert!(app.scroll_inactive_group_at(col, row, 3));
+    assert_eq!(app.editor_layout.inactive_groups()[0].scroll, 3);
+}

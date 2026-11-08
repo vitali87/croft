@@ -4823,6 +4823,11 @@ pub struct App {
     /// (a press on a seam must not steal focus) and the seam-drag hit-test, for
     /// a grid of any depth.
     editor_seams: Vec<editor_layout::Seam>,
+    /// The whole editor area (every group) as the most recent render laid
+    /// it out: what `leaf_rects` splits into the groups' rects. The active
+    /// group's own `last_full_area` is only its share once the editor is
+    /// split, so a geometric hit-test must start from this instead.
+    editor_layout_area: Rect,
     /// Hit-test rectangles of the "[+]" buttons - one per terminal pane,
     /// indexed in lock-step with `terminals`. Empty when the pane is hidden
     /// or every pane is too narrow for the label.
@@ -7461,6 +7466,7 @@ impl App {
             terminal_height: None,
             splitter_drag: None,
             editor_seams: Vec::new(),
+            editor_layout_area: Rect::default(),
             sidebar_splitter_x: None,
             terminal_splitter_y: None,
             terminal_add_buttons: Vec::new(),
@@ -22509,7 +22515,7 @@ impl App {
             .editor_layout
             .inactive_dfs_index_at(col, row)
             .or_else(|| {
-                let area = self.editor.last_full_area;
+                let area = self.editor_layout_area;
                 if area.width == 0 || area.height == 0 {
                     return None;
                 }
@@ -23242,6 +23248,7 @@ impl App {
             // into `self.editor`; every other group lives in `editor_layout`.
             // Lay the leaves out and paint each at its rect (depth-first order),
             // reporting the active group's rect so popups anchor there.
+            self.editor_layout_area = editor_area;
             let rects = self.editor_layout.leaf_rects(editor_area, EDITOR_SPLIT_MIN);
             // The layout icons sit over the right end of the editor area's top
             // row; any group's tab strip that reaches it stops short of them.
@@ -63200,15 +63207,19 @@ impl App {
                     let over_submenu = self
                         .submenu_rect()
                         .is_some_and(|r| rect_contains(r, m.column, m.row));
-                    let visible = if over_submenu {
-                        self.submenu_rect()
-                            .map(|r| r.height.saturating_sub(2) as usize)
-                            .unwrap_or(0)
-                    } else {
-                        self.menu_rect()
-                            .map(|r| r.height.saturating_sub(2) as usize)
-                            .unwrap_or(0)
-                    };
+                    // Over the parent panel with a submenu open, the wheel
+                    // is the parent's: the submenu closes, as moving the
+                    // parent's highlight off its row does, and the parent
+                    // steps. Otherwise the active level steps.
+                    if !over_submenu
+                        && self
+                            .menu_rect()
+                            .is_some_and(|r| rect_contains(r, m.column, m.row))
+                        && let Some(menu) = self.context_menu.as_mut()
+                    {
+                        menu.close_submenu();
+                    }
+                    let visible = self.menu_visible_rows();
                     if let Some(menu) = self.context_menu.as_mut() {
                         menu.wheel_active(if down { 3 } else { -3 }, visible);
                     }
