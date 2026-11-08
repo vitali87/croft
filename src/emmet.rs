@@ -1608,9 +1608,9 @@ fn number(s: &str, at: Counter) -> String {
                     .parse::<usize>()
                     .unwrap_or(1);
                 value = if down {
-                    base.saturating_add(at.count - at.index)
+                    base.saturating_add(at.count.saturating_sub(at.index))
                 } else {
-                    base.saturating_add(at.index - 1)
+                    base.saturating_add(at.index.saturating_sub(1))
                 };
             }
             out.push_str(&format!("{value:0width$}"));
