@@ -702,7 +702,9 @@ pub struct Diagnostic {
 /// Two diagnostics are the same finding when everything croft shows of them
 /// matches. `origin` is left out: a server that reports one finding both
 /// pushed and pulled may give each copy different `data`, and the copies
-/// must still collapse into one row (`diagnostics_by_source`).
+/// must still collapse into one row (`diagnostics_by_source`). The related
+/// locations read from it are shown, though (#1523), so they count: a copy
+/// that names them is never dropped for one that does not.
 impl PartialEq for Diagnostic {
     fn eq(&self, other: &Self) -> bool {
         let Diagnostic {
@@ -725,6 +727,7 @@ impl PartialEq for Diagnostic {
             )
             && (severity, message, tags, code)
                 == (&other.severity, &other.message, &other.tags, &other.code)
+            && self.related() == other.related()
     }
 }
 

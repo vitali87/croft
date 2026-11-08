@@ -361,7 +361,8 @@ impl ProblemsPanel {
 
     /// True when `it` in `group` passes BOTH the severity cycle and the
     /// free-text filter (case-insensitive substring of the message or the
-    /// file path).
+    /// file path, or of a related row's, which keeps the diagnostic with all
+    /// its related rows, #1523).
     fn keeps_item(&self, group: &ProblemGroup, it: &ProblemItem) -> bool {
         if !self.filter.keeps(it.severity) {
             return false;
@@ -380,6 +381,10 @@ impl ProblemsPanel {
                 .to_string_lossy()
                 .to_lowercase()
                 .contains(&needle)
+            || it.related.iter().any(|r| {
+                r.message.to_lowercase().contains(&needle)
+                    || r.rel_path.to_lowercase().contains(&needle)
+            })
     }
 
     pub fn push_filter_char(&mut self, c: char) {
@@ -1131,6 +1136,38 @@ mod tests {
             p.push_filter_char(c);
         }
         assert_eq!(p.total_rows(), 0, "no row shows `rustc`");
+    }
+
+    /// #1523: text only a related row shows, its message or its file, finds
+    /// the diagnostic, which stays listed with all its related rows.
+    #[test]
+    fn text_filter_matches_a_related_rows_message_and_file() {
+        let related = |rel_path: &str, message: &str| ProblemRelated {
+            path: PathBuf::from("/repo").join(rel_path),
+            rel_path: rel_path.to_string(),
+            line: 1,
+            col: 2,
+            message: message.to_string(),
+        };
+        let mut missing = diag(3, DiagnosticSeverity::Error, "Property 'foo' is missing");
+        missing.related = vec![
+            related("src/bar.ts", "'foo' is declared here."),
+            related("src/other.ts", "and used here."),
+        ];
+        let mut p = ProblemsPanel::new();
+        p.set_groups(vec![group(
+            "a.ts",
+            vec![missing, diag(9, DiagnosticSeverity::Warning, "meh")],
+        )]);
+        for c in "declared here".chars() {
+            p.push_filter_char(c);
+        }
+        assert_eq!(p.total_rows(), 4, "header, diagnostic, both related rows");
+        p.clear_text_filter();
+        for c in "other.ts".chars() {
+            p.push_filter_char(c);
+        }
+        assert_eq!(p.total_rows(), 4, "a related row's file matches too");
     }
 
     /// The file header's count badge must reflect the ACTIVE severity
