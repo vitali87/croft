@@ -208,6 +208,36 @@ fn a_line_number_press_selects_the_line_and_a_drag_selects_lines() {
     }
 }
 
+/// #1570 negative: only the number's own columns select a line. A press on
+/// the blank chevron cell of a line with no fold, on the spacer before the
+/// change bar, or in a gutter with line numbers off still puts the caret at
+/// column 1 and selects nothing.
+#[test]
+fn only_the_line_number_columns_select_the_line() {
+    use crate::widgets::editor::LineNumbers;
+    let (mut app, _tmp, _f) = app_with_painted_file("l1\nl2\nl3\n");
+    let x = app.editor.last_inner.x;
+    let row = app.editor.last_inner.y + 1;
+    let spacer = x + app.editor.last_gutter_width - 1;
+    let selected = |app: &App| app.editor.selection.map(|s| s.normalised());
+    for col in [x + 1, spacer] {
+        app.editor_click.clear();
+        click_and_release(&mut app, col, row);
+        assert_eq!(selected(&app), None, "column {col} selects nothing");
+        assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (1, 0));
+    }
+    app.editor_click.clear();
+    click_and_release(&mut app, x + 2, row);
+    assert_eq!(selected(&app), Some(((1, 0), (2, 0))), "the number does");
+
+    app.editor.line_numbers = LineNumbers::Off;
+    draw(&mut app, 100, 30);
+    app.editor_click.clear();
+    click_and_release(&mut app, x + 2, row + 1);
+    assert_eq!(selected(&app), None, "no numbers, no line selection");
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (2, 0));
+}
+
 /// #1544 negative: the fold chevron still folds, and a lane click past the
 /// last line or with Shift held sets nothing.
 #[test]

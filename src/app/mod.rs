@@ -65837,12 +65837,11 @@ impl App {
                     }
                     // A press on a line number selects that line, and a drag
                     // down the numbers selects whole lines, as in VS Code
-                    // (#1570). It used to put the caret at column 1. After
-                    // the lane, the chevron and the play glyph, which own
-                    // their cells.
+                    // (#1570). It used to put the caret at column 1. Only
+                    // the number's own columns: a blank chevron cell, the
+                    // spacer and a gutter with no numbers keep that click.
                     if m.modifiers.is_empty()
-                        && self.editor_is_text()
-                        && self.editor.gutter_line_at(m.column, m.row).is_some()
+                        && self.editor.line_number_line_at(m.column, m.row).is_some()
                     {
                         self.editor_line_drag =
                             Some(self.editor.select_lines_at(None, m.column, m.row));

@@ -4402,6 +4402,21 @@ impl Editor {
         (line < self.lines.len()).then_some(line)
     }
 
+    /// The 0-based line whose number `(col, row)` is on (#1570): only the
+    /// number's own columns, right of the sign margin (the breakpoint lane
+    /// and the fold chevron) and left of the spacer before the change bar,
+    /// on any visual row of a source line. A press there selects the line,
+    /// as in VS Code. With line numbers off there are no such columns, and
+    /// views without source lines have none either.
+    pub fn line_number_line_at(&self, col: u16, row: u16) -> Option<usize> {
+        let x = self.last_inner.x;
+        let numbers = x + 2..x + self.last_gutter_width.saturating_sub(1);
+        if !numbers.contains(&col) || self.has_non_text_view() || self.markdown_preview.is_some() {
+            return None;
+        }
+        self.gutter_line_at(col, row)
+    }
+
     /// The 0-based line whose breakpoint lane `(col, row)` is on (#1544): the
     /// sign cell left of the fold chevron, where breakpoints draw, on any
     /// visual row of a source line. A left click there toggles a breakpoint,
@@ -13542,18 +13557,45 @@ impl Editor {
         self.dedup_carets();
     }
 
-    /// Drop extra carets that sit on the primary or on an earlier caret: kept
-    /// apart, the next key would edit the same spot twice.
+    /// Drop extra carets that sit on the primary or on an earlier caret, and
+    /// merge selections that overlap into one, as VS Code does (#1570):
+    /// kept apart, the next key would edit the same spot twice, and the
+    /// edit at the lower one left the upper one's end stale, so typing over
+    /// two overlapping line selections panicked or deleted lines nobody
+    /// selected. Selections that only touch stay apart, as does a caret at a
+    /// selection's edge. A merged selection keeps the place in the order and
+    /// the direction of its first member, so the primary stays the primary.
     fn dedup_carets(&mut self) {
-        let primary = self.selections_with_primary()[0].normalised();
-        let mut kept: Vec<EditorSelection> = Vec::with_capacity(self.carets.len());
-        for s in std::mem::take(&mut self.carets) {
-            let n = s.normalised();
-            if n != primary && !kept.iter().any(|k| k.normalised() == n) {
-                kept.push(s);
+        let all = self.selections_with_primary();
+        let mut by_start: Vec<usize> = (0..all.len()).collect();
+        by_start.sort_by_key(|&i| all[i].normalised());
+        // Each run of overlapping selections: (first member, start, end).
+        let mut runs: Vec<(usize, BPos, BPos)> = Vec::with_capacity(all.len());
+        for i in by_start {
+            let (start, end) = all[i].normalised();
+            match runs.last_mut() {
+                Some(run) if start < run.2 || (start, end) == (run.1, run.2) => {
+                    run.0 = run.0.min(i);
+                    run.2 = run.2.max(end);
+                }
+                _ => runs.push((i, start, end)),
             }
         }
-        self.carets = kept;
+        runs.sort_unstable_by_key(|run| run.0);
+        let mut merged = runs.into_iter().map(|(i, start, end)| {
+            let (anchor, head) = if all[i].anchor <= all[i].head {
+                (start, end)
+            } else {
+                (end, start)
+            };
+            EditorSelection { anchor, head }
+        });
+        let primary = merged.next().expect("the primary is always first");
+        if primary != all[0] {
+            self.selection = primary.has_area().then_some(primary);
+            (self.cursor_row, self.cursor_col) = primary.head;
+        }
+        self.carets = merged.collect();
     }
 
     /// A position kept as (rows from the last line, chars from its line's
@@ -40321,7 +40363,8 @@ mod tests {
         }];
         e.transform_selection_case(CaseTransform::Upper);
         assert_eq!(e.lines, vec!["HELLO world"]);
-        assert_eq!(selected_texts(&e), vec!["HELLO", "L"]);
+        // One inside the other is an overlap: they come back as one (#1570).
+        assert_eq!(selected_texts(&e), vec!["HELLO"]);
     }
 
     #[test]
@@ -40337,8 +40380,10 @@ mod tests {
         }];
         e.transform_selection_case(CaseTransform::Upper);
         assert_eq!(e.lines, vec!["HELLO WOrld"]);
-        assert_eq!(selected_texts(&e), vec!["HELLO", "LO WO"]);
-        assert_eq!(e.selection.unwrap().head, (0, 3), "direction is kept");
+        // The two overlap, so they come back as one (#1570): kept apart,
+        // typing over them would edit the shared text twice.
+        assert_eq!(selected_texts(&e), vec!["HELLO WO"]);
+        assert_eq!(e.selection.unwrap().head, (0, 0), "direction is kept");
     }
 
     #[test]

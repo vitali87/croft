@@ -3,27 +3,35 @@ use std::time::{Duration, Instant};
 
 const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(500);
 
+/// How far a run of plain clicks at one cell has got (#1570).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Run {
+    /// One click, which the next can make a double.
+    Single,
+    /// A double the editor kept, which the next click can make a triple.
+    Double,
+}
+
 #[derive(Default)]
 pub struct ClickTracker {
-    /// The last plain click and how many clicks its run has had: 1, or 2
-    /// once it completed a double that may still become a triple.
-    last: Option<(Instant, u16, u16, u8)>,
+    /// The last plain click and how far its run has got.
+    last: Option<(Instant, u16, u16, Run)>,
 }
 
 impl ClickTracker {
-    /// How many clicks the run this click would continue has had, or 0 when
-    /// it starts a new run: a modified click, another cell, or too late.
-    fn run_before(&self, now: Instant, col: u16, row: u16, mods: KeyModifiers) -> u8 {
+    /// The run this click would continue, or `None` when it starts a new
+    /// one: a modified click, another cell, or too late.
+    fn run_before(&self, now: Instant, col: u16, row: u16, mods: KeyModifiers) -> Option<Run> {
         match self.last {
-            Some((t, x, y, n))
+            Some((t, x, y, run))
                 if mods.is_empty()
                     && row == y
                     && col.abs_diff(x) <= 1
                     && now.duration_since(t) <= DOUBLE_CLICK_WINDOW =>
             {
-                n
+                Some(run)
             }
-            _ => 0,
+            _ => None,
         }
     }
 
@@ -40,7 +48,7 @@ impl ClickTracker {
     /// matched no link, so the user's next ordinary click selected a word
     /// they never double-clicked.
     pub fn is_double(&self, now: Instant, col: u16, row: u16, mods: KeyModifiers) -> bool {
-        self.run_before(now, col, row, mods) == 1
+        self.run_before(now, col, row, mods) == Some(Run::Single)
     }
 
     /// True when this click is the third of a run: it follows a double that
@@ -48,7 +56,7 @@ impl ClickTracker {
     /// inside the window (#1570). Only the editor keeps one, for its
     /// whole-line selection; every other tracker clears after a double.
     pub fn is_triple(&self, now: Instant, col: u16, row: u16, mods: KeyModifiers) -> bool {
-        self.run_before(now, col, row, mods) == 2
+        self.run_before(now, col, row, mods) == Some(Run::Double)
     }
 
     /// Arm the tracker with this click as a possible first half of a double.
@@ -58,7 +66,7 @@ impl ClickTracker {
     /// modified click from sitting harmlessly between two plain ones and
     /// letting them pair across it.
     pub fn record(&mut self, now: Instant, col: u16, row: u16, mods: KeyModifiers) {
-        self.last = mods.is_empty().then_some((now, col, row, 1));
+        self.last = mods.is_empty().then_some((now, col, row, Run::Single));
     }
 
     /// Keep this click as the second half of a double, so a third plain
@@ -66,7 +74,7 @@ impl ClickTracker {
     /// as a double used to, made the third click a fresh single that
     /// dropped the word the double had just selected.
     pub fn record_double(&mut self, now: Instant, col: u16, row: u16) {
-        self.last = Some((now, col, row, 2));
+        self.last = Some((now, col, row, Run::Double));
     }
 
     pub fn clear(&mut self) {
