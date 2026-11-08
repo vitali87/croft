@@ -1115,9 +1115,16 @@ fn format_cell(d: &calamine::Data) -> String {
     }
 }
 
-fn format_float(f: f64) -> String {
-    if f.fract() == 0.0 && f.abs() < 1e15 {
+/// A float as a spreadsheet shows a number with no format of its own:
+/// positional while that reads well, exponent notation for the very small
+/// and the very large (#1143). Positional `1e-50` is 52 characters, cut at
+/// the column width to a row of zeros that reads as zero.
+pub(crate) fn format_float(f: f64) -> String {
+    let a = f.abs();
+    if f.fract() == 0.0 && a < 1e15 {
         format!("{}", f as i64)
+    } else if f.is_finite() && a != 0.0 && !(1e-4..1e15).contains(&a) {
+        format!("{f:e}")
     } else {
         format!("{f}")
     }
@@ -1416,6 +1423,27 @@ mod tests {
         let mut d = sheet_of(&["10", "-2.5", "9", "1e3"]);
         d.sort_by_column(1);
         assert_eq!(column(&d, 1), ["-2.5", "9", "10", "1e3"]);
+    }
+
+    #[test]
+    fn very_small_and_very_large_floats_read_in_exponent_notation() {
+        use super::format_float as f;
+        assert_eq!(f(6.62607015e-34), "6.62607015e-34");
+        assert_eq!(f(1e-50), "1e-50");
+        assert_eq!(f(6.02214076e23), "6.02214076e23");
+        assert_eq!(f(1e300), "1e300");
+        assert_eq!(f(-2.5e-7), "-2.5e-7");
+        // Everyday numbers keep their positional form.
+        assert_eq!(f(0.0), "0");
+        assert_eq!(f(42.0), "42");
+        assert_eq!(f(1234.5678), "1234.5678");
+        assert_eq!(f(0.00012), "0.00012");
+        assert_eq!(f(-0.5), "-0.5");
+        for v in [6.62607015e-34, 1e-50, 1e300, 6.02214076e23, 0.1 + 0.2] {
+            let s = f(v);
+            assert!(s.len() <= 24, "{s} fits a column");
+            assert_eq!(s.parse::<f64>().unwrap(), v, "{s} reads back exactly");
+        }
     }
 
     #[test]
