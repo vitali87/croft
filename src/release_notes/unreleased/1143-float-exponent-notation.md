@@ -1,1 +1,0 @@
-fix: The sheet grid and the SQLite viewer show very small and very large numbers in exponent notation (`6.62607015e-34`, `1e-50`, `1e300`) instead of a long row of digits cut at the column width, which made `1e-50` read as zero.
