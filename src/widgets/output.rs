@@ -409,7 +409,7 @@ impl Widget for &mut OutputPanel {
                     Style::default().fg(level_color(line.level, self.theme)),
                 ),
                 Span::styled(
-                    line.text.replace('\n', " "),
+                    row_text(&line.text),
                     Style::default().fg(self.theme.ui(COLOR_MSG)),
                 ),
             ];
@@ -611,6 +611,42 @@ impl OutputPanel {
             );
         }
     }
+}
+
+/// Tab stops in an OUTPUT row, a terminal's: every 8 columns.
+const TAB_STOP: usize = 8;
+
+/// A bus line as one row: newlines become spaces and each tab advances to
+/// the next tab stop, counted in display columns, as a terminal shows it
+/// (#1114). ratatui draws a `\t` as nothing, so `FAIL\tpkg\t0.003s` read as
+/// `FAILpkg0.003s`.
+fn row_text(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains(['\t', '\n']) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    use unicode_segmentation::UnicodeSegmentation;
+    let mut out = String::with_capacity(text.len() + TAB_STOP);
+    let mut col = 0;
+    // Grapheme by grapheme, as ratatui draws them: `👩‍💻` is one two-column
+    // glyph, not three code points summing to four.
+    for g in text.graphemes(true) {
+        match g {
+            "\t" => {
+                let pad = TAB_STOP - col % TAB_STOP;
+                out.extend(std::iter::repeat_n(' ', pad));
+                col += pad;
+            }
+            "\n" | "\r\n" => {
+                out.push(' ');
+                col += 1;
+            }
+            g => {
+                out.push_str(g);
+                col += unicode_width::UnicodeWidthStr::width(g);
+            }
+        }
+    }
+    std::borrow::Cow::Owned(out)
 }
 
 #[cfg(test)]
@@ -943,6 +979,35 @@ mod tests {
         let text = render(&mut p, 80, 6);
         assert!(text.contains("kaboom here"), "renders the line: {text:?}");
         assert!(text.contains("error"), "renders the level tag: {text:?}");
+    }
+
+    #[test]
+    fn tabs_advance_to_the_next_tab_stop() {
+        // #1114: `go test` ends a package with FAIL<TAB>pkg<TAB>time.
+        assert_eq!(row_text("FAIL\tpkg\t0.1s"), "FAIL    pkg     0.1s");
+        assert_eq!(row_text("\tindented"), "        indented");
+        assert_eq!(row_text("exactly8\tx"), "exactly8        x");
+        // Stops count display columns: a CJK char is two.
+        assert_eq!(row_text("表\tx"), "表      x");
+        // A cluster of several code points is the one glyph ratatui draws.
+        assert_eq!(row_text("👩‍💻\tx"), "👩‍💻      x");
+        assert_eq!(row_text("one\ntwo"), "one two");
+        assert!(matches!(
+            row_text("plain"),
+            std::borrow::Cow::Borrowed("plain")
+        ));
+
+        let ch = "widget-test-tabs";
+        crate::output::push(ch, OutputLevel::Error, "FAIL\texample.com/gt/parse\t0.003s");
+        let mut p = OutputPanel::new();
+        p.sync();
+        let idx = p.channels.iter().position(|c| c == ch).unwrap();
+        p.select(idx);
+        let text = render(&mut p, 80, 6);
+        assert!(
+            text.contains("FAIL    example.com/gt/parse    0.003s"),
+            "the columns stay apart: {text:?}"
+        );
     }
 
     #[test]
