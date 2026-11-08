@@ -1295,6 +1295,25 @@ fn reloaded_rulers_reach_every_open_editor() {
     assert!(app.editor.editors.iter().all(|e| e.rulers.is_empty()));
 }
 
+/// #1569: a settings reload carries `home_walks_wrapped_rows` straight onto
+/// every open editor, not only the active one, so a tab picked without a
+/// focus sync walks (or does not) as the setting says.
+#[test]
+fn reloaded_home_walk_reaches_every_open_editor() {
+    let mut app = editor_app_with_lines(&["a b"]);
+    app.editor
+        .open_text_buffer(std::path::Path::new("later.txt"), "c d")
+        .unwrap();
+    app.apply_merged_settings(&crate::prefs::Prefs {
+        home_walks_wrapped_rows: true,
+        ..Default::default()
+    });
+    assert!(app.editor.editors.len() >= 2);
+    assert!(app.editor.editors.iter().all(|e| e.home_walks_rows));
+    app.apply_merged_settings(&crate::prefs::Prefs::default());
+    assert!(app.editor.editors.iter().all(|e| !e.home_walks_rows));
+}
+
 #[test]
 fn build_sticky_lines_pins_enclosing_headers_scrolled_above_the_viewport() {
     use crate::lsp::manager::OutlineKind;
