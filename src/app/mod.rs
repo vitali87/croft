@@ -6442,12 +6442,64 @@ fn welcome_note_summary_width(block_w: u16) -> u16 {
     block_w.saturating_sub(WELCOME_NOTE_GUTTER).max(1)
 }
 
+/// A note's summary wrapped to the card, its inline Markdown markers already
+/// removed (#954) so the height measure and the paint wrap the same text.
 fn wrapped_welcome_note_summary(
     note: &crate::release_notes::ReleaseNote,
     block_w: u16,
 ) -> Vec<String> {
     let w = welcome_note_summary_width(block_w);
-    wrap_cells_variable_width(note.summary, w, w)
+    let (text, _) = crate::release_notes::inline_markup(note.summary);
+    wrap_cells_variable_width(&text, w, w)
+}
+
+/// The wrapped `lines` of a note as styled lines (#954): wrapping only moves
+/// and collapses whitespace, so the non-space characters of `lines` are those
+/// of the summary's text in order, and each takes its own style back.
+fn styled_welcome_note_lines(
+    note: &crate::release_notes::ReleaseNote,
+    lines: &[String],
+    plain: Style,
+    code: Style,
+) -> Vec<ratatui::text::Line<'static>> {
+    use crate::release_notes::Inline;
+    let (text, styles) = crate::release_notes::inline_markup(note.summary);
+    let mut marks = text
+        .chars()
+        .zip(styles)
+        .filter(|(c, _)| !c.is_whitespace())
+        .map(|(_, s)| s);
+    lines
+        .iter()
+        .map(|line| {
+            let mut spans: Vec<ratatui::text::Span<'static>> = Vec::new();
+            let mut run = String::new();
+            let mut run_style = plain;
+            for c in line.chars() {
+                let style = if c.is_whitespace() {
+                    plain
+                } else {
+                    match marks.next().unwrap_or(Inline::Plain) {
+                        Inline::Plain => plain,
+                        Inline::Bold => plain.add_modifier(Modifier::BOLD),
+                        Inline::Code => code,
+                    }
+                };
+                if style != run_style && !run.is_empty() {
+                    spans.push(ratatui::text::Span::styled(
+                        std::mem::take(&mut run),
+                        run_style,
+                    ));
+                }
+                run_style = style;
+                run.push(c);
+            }
+            if !run.is_empty() {
+                spans.push(ratatui::text::Span::styled(run, run_style));
+            }
+            ratatui::text::Line::from(spans)
+        })
+        .collect()
 }
 
 fn welcome_note_row_height(note: &crate::release_notes::ReleaseNote, block_w: u16) -> u16 {
@@ -18449,15 +18501,16 @@ impl App {
                         .add_modifier(Modifier::BOLD),
                 );
                 let lines = wrapped_welcome_note_summary(note, inner_w_actual);
-                for (line_idx, line) in lines.iter().enumerate() {
+                let code_style = row_style.fg(self.theme.ui(crate::markdown::CODE));
+                let styled = styled_welcome_note_lines(note, &lines, row_style, code_style);
+                for (line_idx, line) in styled.iter().enumerate() {
                     let line_y = row_y + line_idx as u16;
                     if line_y >= last_row {
                         break;
                     }
-                    let clipped: String = line.chars().take(summary_w as usize).collect();
                     frame
                         .buffer_mut()
-                        .set_string(summary_x, line_y, clipped, row_style);
+                        .set_line(summary_x, line_y, line, summary_w);
                 }
                 row_y = row_y.saturating_add(lines.len().max(1) as u16);
             }
