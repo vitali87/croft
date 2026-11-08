@@ -10733,7 +10733,6 @@ impl App {
             return false;
         }
         self.completion_incomplete = result.is_incomplete;
-        self.completion_items_pos = self.completion_ask_pos;
         let Some((cx, cy)) = self.editor.cursor_screen_pos() else {
             return false;
         };
@@ -10788,6 +10787,10 @@ impl App {
                     format!("No completions match '{prefix}' ({server_count} from server)");
             }
         } else {
+            // Only now do the popup's items come from this reply: a reply
+            // that returned early above left the older items on screen, and
+            // those still shift from their own request.
+            self.completion_items_pos = self.completion_ask_pos;
             self.completion_popup = Some(popup);
         }
         true

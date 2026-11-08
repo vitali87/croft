@@ -5272,3 +5272,63 @@ fn an_older_reply_shown_during_a_reask_still_shifts_from_its_own_request() {
     app.handle_completion_popup_key(key(KeyCode::Enter, KeyModifiers::NONE));
     assert_eq!(app.editor.lines[0], "f(PRESS) {");
 }
+
+/// A re-ask's reply that installs no popup (here the caret is scrolled out of
+/// view when it lands) leaves the older reply's items on screen, so it must
+/// not take over their request point: accepting one of them after a
+/// Backspace would shift its range from the newer ask and swallow the `)`.
+#[test]
+fn a_reask_reply_that_installs_no_popup_keeps_the_shown_items_request_point() {
+    use crate::lsp::manager::CompletionResult;
+    use crate::widgets::editor::TextSpanEdit;
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("main.c");
+    std::fs::write(&path, "f(PR) {").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&path).unwrap();
+    app.focus_pane(Pane::Editor);
+    draw(&mut app, 100, 30);
+    // The shown reply was for `f(PR|`.
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 4;
+    app.completion_origin = Some((0, 3));
+    app.completion_ask_pos = Some((0, 4));
+    app.completion_request_id = Some(3);
+    let item = crate::lsp::CompletionItem {
+        label: String::from("PRESS"),
+        text_edit: Some(TextSpanEdit {
+            start: (0, 2),
+            end: (0, 4),
+            new_text: String::from("PRESS"),
+            utf16: true,
+        }),
+        ..Default::default()
+    };
+    assert!(app.apply_completion_result(CompletionResult {
+        request_id: 3,
+        is_incomplete: true,
+        path: path.clone(),
+        items: vec![item],
+    }));
+    // A Backspace, and the re-ask it sent from `f(P|`.
+    app.editor.lines[0] = String::from("f(P) {");
+    app.editor.cursor_col = 3;
+    app.completion_ask_pos = Some((0, 3));
+    app.completion_request_id = Some(4);
+    // Its reply lands while the caret is out of view: no new popup.
+    app.editor.scroll = 5;
+    let newer = crate::lsp::CompletionItem {
+        label: String::from("PRINT"),
+        ..Default::default()
+    };
+    assert!(!app.apply_completion_result(CompletionResult {
+        request_id: 4,
+        is_incomplete: true,
+        path: path.clone(),
+        items: vec![newer],
+    }));
+    app.editor.scroll = 0;
+    assert!(app.completion_popup.is_some(), "the older items stay open");
+    app.handle_completion_popup_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(app.editor.lines[0], "f(PRESS) {", "the `)` stays");
+}
