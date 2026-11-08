@@ -4299,6 +4299,10 @@ pub struct App {
     /// walk the caret to the clicked line, undoing the caret-preserving
     /// click. Cleared on the release and on the next press.
     breakpoint_lane_press: bool,
+    /// The line a triple-click or a line-number press selected (#1570): a
+    /// drag from it selects whole lines, from this one to the line under
+    /// the pointer. Cleared on the release and on the next press.
+    editor_line_drag: Option<usize>,
     /// A left-drag is moving the OUTLINE panel's scrollbar thumb. The outline
     /// is not a focusable `Pane`, so it gets its own drag latch rather than
     /// riding `scrollbar_drag`.
@@ -7327,6 +7331,7 @@ impl App {
             scrollbar_drag: None,
             editor_hscrollbar_drag: false,
             breakpoint_lane_press: false,
+            editor_line_drag: None,
             outline_scrollbar_drag: false,
             secondary_outline: Default::default(),
             secondary_outline_scrollbar_drag: false,
@@ -16676,6 +16681,14 @@ impl App {
         } else {
             format!("{n} cursors at line ends")
         };
+    }
+
+    /// VS Code "Expand Line Selection" (`Cmd+L` / `Ctrl+L`, #1570): select
+    /// the caret's whole line, and one more line on each further press.
+    fn expand_line_selection(&mut self) {
+        if self.editor_is_text() {
+            self.editor.expand_line_selection();
+        }
     }
 
     /// VS Code "Add Selection to Next Find Match" (`Cmd+D`): select the word
@@ -50342,6 +50355,10 @@ impl App {
             self.add_cursors_to_line_ends();
             return;
         }
+        if is_expand_line_selection_key(key) {
+            self.expand_line_selection();
+            return;
+        }
         if is_delete_line_key(key) {
             self.delete_current_line();
             return;
@@ -58895,6 +58912,7 @@ impl App {
             Cmd::AddSelectionToNextMatch => self.start_select_next_occurrence(),
             Cmd::SelectAllOccurrences => self.select_all_occurrences(),
             Cmd::AddCursorsToLineEnds => self.add_cursors_to_line_ends(),
+            Cmd::ExpandLineSelection => self.expand_line_selection(),
             Cmd::JumpToBracket => {
                 if !self.editor.jump_to_matching_bracket() {
                     self.status = String::from("Go to Bracket: no matching bracket");
@@ -64496,6 +64514,7 @@ impl App {
                 // A new press starts a new gesture, even if the release of a
                 // breakpoint-lane press never arrived.
                 self.breakpoint_lane_press = false;
+                self.editor_line_drag = None;
                 if in_secondary_outline {
                     self.click_secondary_outline(m.column, m.row);
                     return;
@@ -65816,6 +65835,21 @@ impl App {
                         self.poke_cursor();
                         return;
                     }
+                    // A press on a line number selects that line, and a drag
+                    // down the numbers selects whole lines, as in VS Code
+                    // (#1570). It used to put the caret at column 1. After
+                    // the lane, the chevron and the play glyph, which own
+                    // their cells.
+                    if m.modifiers.is_empty()
+                        && self.editor_is_text()
+                        && self.editor.gutter_line_at(m.column, m.row).is_some()
+                    {
+                        self.editor_line_drag =
+                            Some(self.editor.select_lines_at(None, m.column, m.row));
+                        self.editor_click.clear();
+                        self.poke_cursor();
+                        return;
+                    }
                     // VS Code Shift+Alt+drag: start a column (box) selection.
                     // Checked before the plain Alt+click caret so the two
                     // modifiers don't both fire.
@@ -65839,9 +65873,18 @@ impl App {
                     let is_double = self
                         .editor_click
                         .is_double(now, m.column, m.row, m.modifiers);
-                    if is_double {
-                        self.editor.select_word_at(m.column, m.row);
+                    if self
+                        .editor_click
+                        .is_triple(now, m.column, m.row, m.modifiers)
+                    {
+                        // A third click selects the whole line (#1570); a
+                        // drag from it extends line by line.
+                        self.editor_line_drag =
+                            Some(self.editor.select_lines_at(None, m.column, m.row));
                         self.editor_click.clear();
+                    } else if is_double {
+                        self.editor.select_word_at(m.column, m.row);
+                        self.editor_click.record_double(now, m.column, m.row);
                     } else {
                         // Anchor a fresh selection at the click; a drag widens it,
                         // a clean click ends up cleared on mouse-up.
@@ -66158,6 +66201,11 @@ impl App {
                         self.poke_cursor();
                         return;
                     }
+                    if let Some(anchor) = self.editor_line_drag {
+                        self.editor.select_lines_at(Some(anchor), m.column, m.row);
+                        self.poke_cursor();
+                        return;
+                    }
                     self.editor.mouse_drag(m.column, m.row);
                     self.poke_cursor();
                 } else if in_tree {
@@ -66215,6 +66263,7 @@ impl App {
             }
             MouseEventKind::Up(MouseButton::Left) => {
                 self.editor_tab_drag_from = None;
+                self.editor_line_drag = None;
                 // The release of a press that was forwarded to a tracking
                 // child goes to the same pane (#474), clamped to its grid
                 // like the drag. `report_mouse` may decline if the child
@@ -80456,9 +80505,10 @@ fn mouse_context_for(
 /// A left press reports `DoubleClick` when croft's own click tracker already
 /// considers it one, so a binding agrees with the built-in select-word
 /// behaviour rather than disagreeing about the same physical click. Triple
-/// click is NOT reported: the tracker distinguishes single from double only,
-/// and inventing a third level here would make `triple_click` bindings fire
-/// on the second click. `Gesture::parse` therefore rejects it with a load
+/// click is NOT reported: only the editor's tracker counts a third click,
+/// for its built-in line selection (#1570), and the others distinguish
+/// single from double only, so a `triple_click` binding would fire on the
+/// second click there. `Gesture::parse` therefore rejects it with a load
 /// warning rather than accepting a binding that could never behave.
 fn gesture_for(
     m: &MouseEvent,
@@ -80937,6 +80987,19 @@ fn is_add_cursors_to_line_ends_key(key: KeyEvent) -> bool {
         && !key
             .modifiers
             .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
+}
+
+/// `Cmd+L` (`Ctrl+L` too, as `Cmd+D` takes `Ctrl+D`): Expand Line Selection
+/// (#1570), VS Code's chord. Editor-only, so a focused shell keeps `Ctrl+L`
+/// to clear the screen; Shift belongs to Select All Occurrences.
+fn is_expand_line_selection_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('l' | 'L'))
+        && key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
+        && !key
+            .modifiers
+            .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
 }
 
 /// Editor-pane Change All Occurrences: `Cmd+F2` (macOS) or `Ctrl+F2` (Linux),

@@ -115,19 +115,97 @@ fn minimap_rgba_to_png_roundtrips() {
 }
 
 /// #1544 negative: the line number and the text body keep their clicks:
-/// they move the caret and set no breakpoint.
+/// the number selects its line (#1570), the text moves the caret, and
+/// neither sets a breakpoint.
 #[test]
-fn a_click_on_the_line_number_or_the_text_moves_the_caret_only() {
+fn a_click_on_the_line_number_or_the_text_sets_no_breakpoint() {
     let (mut app, _tmp, f) = app_with_painted_file("l1\nl2\nl3\nl4\nl5\n");
     let number = app.editor.last_inner.x + 2;
     let text_x = app.editor.last_inner.x + app.editor.last_gutter_width + 1;
     let (row2, row3) = (app.editor.last_inner.y + 2, app.editor.last_inner.y + 3);
     click_and_release(&mut app, number, row2);
-    assert_eq!(app.editor.cursor_row, 2, "the number click moves the caret");
+    assert_eq!(
+        app.editor.selection.map(|s| s.normalised()),
+        Some(((2, 0), (3, 0))),
+        "the number click selects its line"
+    );
     app.editor_click.clear();
     click_and_release(&mut app, text_x + 1, row3);
     assert_eq!(app.editor.cursor_row, 3, "the text click moves the caret");
     assert!(app.editor.breakpoint_lines(&f).is_empty());
+}
+
+/// #1570: a third click on the same cell inside the double-click window
+/// selects the whole line, newline included, so typing replaces it. It used
+/// to start over as a single click and drop the word the double selected.
+/// Holding the third press and dragging extends the selection by lines.
+#[test]
+fn a_triple_click_selects_the_line_and_a_drag_extends_it_by_lines() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let (mut app, _tmp, _f) = app_with_painted_file("def f():\n    return 1\n    pass\n");
+    let col = app.editor.last_inner.x + app.editor.last_gutter_width + 1 + 6;
+    let row = app.editor.last_inner.y + 1;
+    click_and_release(&mut app, col, row);
+    click_and_release(&mut app, col, row);
+    assert_eq!(
+        app.editor.selection.map(|s| s.normalised()),
+        Some(((1, 4), (1, 10))),
+        "the double selects `return`"
+    );
+    click_and_release(&mut app, col, row);
+    assert_eq!(
+        app.editor.selection.map(|s| s.normalised()),
+        Some(((1, 0), (2, 0))),
+        "the triple selects line 2 through the start of line 3"
+    );
+    app.handle_key(key(KeyCode::Char('Z'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.lines, ["def f():", "Z    pass"]);
+
+    let (mut app, _tmp, _f) = app_with_painted_file("def f():\n    return 1\n    pass\n");
+    click_and_release(&mut app, col, row);
+    click_and_release(&mut app, col, row);
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
+    app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), col, row + 1));
+    app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), col, row + 1));
+    assert_eq!(
+        app.editor.selection.map(|s| s.normalised()),
+        Some(((1, 0), (2, 8))),
+        "the drag takes whole lines 2 and 3, the last to its end"
+    );
+}
+
+/// #1570: a press on line number 2 selects that line through the start of
+/// line 3, and a drag down or up the numbers selects whole lines. It used to
+/// put the caret at column 1.
+#[test]
+fn a_line_number_press_selects_the_line_and_a_drag_selects_lines() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let (mut app, _tmp, _f) = app_with_painted_file("l1\nl2\nl3\nl4\nl5\n");
+    let number = app.editor.last_inner.x + 2;
+    let y = app.editor.last_inner.y;
+    click_and_release(&mut app, number, y + 1);
+    assert_eq!(
+        app.editor.selection.map(|s| s.normalised()),
+        Some(((1, 0), (2, 0)))
+    );
+    // Down from line 2 to line 4, then up from line 4 to line 1, the caret
+    // at the end the pointer went to.
+    for (from, to, want, caret) in [(1, 3, ((1, 0), (4, 0)), 4), (3, 0, ((0, 0), (4, 0)), 0)] {
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            number,
+            y + from,
+        ));
+        app.handle_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            number,
+            y + to,
+        ));
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), number, y + to));
+        assert_eq!(app.editor.selection.map(|s| s.normalised()), Some(want));
+        assert_eq!(app.editor.cursor_row, caret, "{from}->{to}");
+    }
 }
 
 /// #1544 negative: the fold chevron still folds, and a lane click past the

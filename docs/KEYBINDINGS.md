@@ -336,6 +336,8 @@ Variables expand as in VS Code: `$TM_FILENAME`, `$TM_FILENAME_BASE`, `$TM_DIRECT
 | Click the gutter fold chevron | Toggle the fold on that line: a `▾` marks an expanded foldable block (a function, loop, struct — any line whose body is more indented), a `▸` marks a collapsed one. Also on `Cmd+K` `Cmd+L` at the cursor, and Command Palette "Toggle Fold" / "Fold All" / "Unfold All" |
 | Arrow keys over a fold | Up and Down step over a collapsed block rather than into it; an edit that lands inside one (from search, Go to Definition or Go to Line) opens it, so typing never changes lines you cannot see |
 | Mouse drag | Select text; every other occurrence of a single-line selection highlights in blue |
+| Double-click / triple-click | Select the word / the whole line, newline included; dragging after a triple-click extends the selection line by line |
+| Click a line number | Select that line; drag down or up the line numbers to select whole lines |
 | `Ctrl`+`C` / `Cmd`+`C` | Copy the selection to the system clipboard |
 | `Cmd`+`Opt`+`C` / `Ctrl`+`Opt`+`C` | Copy Path: put the active file's absolute path on the system clipboard (also on the editor tab right-click menu) |
 | `Ctrl`+`X` / `Cmd`+`X` | Cut the selection |
@@ -358,6 +360,7 @@ Variables expand as in VS Code: `$TM_FILENAME`, `$TM_FILENAME_BASE`, `$TM_DIRECT
 | `Cmd`+`D` / `Ctrl`+`D` | Add Selection to Next Find Match: select the word under the cursor, then grow the multi-cursor one occurrence per press (whole words when it selected the word itself; a selection you made matches as text, inside other words too) |
 | `Cmd`+`Shift`+`L` / `Ctrl`+`Shift`+`L` | Select All Occurrences of Find Match: a cursor on every occurrence of the selection (or the word under the cursor) at once; also in the Command Palette |
 | `Shift`+`Alt`+`I` | Add Cursors to Line Ends: one cursor at the end of every line the selection touches; also in the Command Palette |
+| `Cmd`+`L` / `Ctrl`+`L` | Expand Line Selection: select the caret's whole line through the start of the next, and one more line on each further press (every cursor's selection grows the same way). Editor only: a focused terminal keeps `Ctrl`+`L` for the shell. Also in the Command Palette; VS Code's `expandLineSelection` imports onto it |
 | `Option`+click | Add (or toggle off) a secondary caret at the click |
 | `Shift`+`Option`+drag | Column (box) selection: one caret per spanned row |
 | `Cmd`+`F2` / `Ctrl`+`F2` | Change All Occurrences of the word under the cursor at once |
@@ -795,7 +798,7 @@ summarised in the status bar — it never fails silently.
 | Refused | Why |
 |---|---|
 | `cmd+click` / `super+click` | Terminals do not report Cmd/Super with mouse events (SGR mouse reporting carries no Super bit), so the binding could never fire. Use `ctrl` or `alt`. This is also why croft's own Go to Definition rides Ctrl. |
-| `triple_click` | croft's click tracker distinguishes single from double only, so a triple binding would fire on the second click and mean something other than what it says. |
+| `triple_click` | Bindings see single and double clicks only (the editor's own triple-click selects a line), so a triple binding would fire on the second click and mean something other than what it says. |
 | bare `click` in `editor` or `terminal` | It is how the caret is placed; rebinding it leaves no way to do that. Bare `click` in `file_tree` or `tab_strip` is allowed. |
 | bare `double_click` in `editor` or `terminal` | It is the only way to select a word; rebinding it leaves no way to do that. (Over a full-screen app that tracks the mouse the pair is forwarded to the app instead, see the terminal table, so word-select is unavailable there by design.) A *modified* double-click (`ctrl+double_click`) is bindable, and bare `double_click` in `file_tree` or `tab_strip` is allowed. |
 

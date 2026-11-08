@@ -16412,6 +16412,55 @@ impl Editor {
         self.last_edit_kind = None;
     }
 
+    /// Lines `from` through `to` as one whole-line selection (#1570): from
+    /// the start of the top line to the start of the line after the bottom
+    /// one, or to the end of the buffer's last line, which has none. With
+    /// `to` above `from` it runs upward, the caret at the top.
+    fn whole_lines(&self, from: usize, to: usize) -> EditorSelection {
+        let last = self.lines.len().saturating_sub(1);
+        let (top, bottom) = (from.min(to).min(last), from.max(to).min(last));
+        let start = (top, 0);
+        let end = if bottom < last {
+            (bottom + 1, 0)
+        } else {
+            (last, self.line_char_len(last))
+        };
+        let (anchor, head) = if to < from {
+            (end, start)
+        } else {
+            (start, end)
+        };
+        EditorSelection { anchor, head }
+    }
+
+    /// Whole-line selection by mouse (#1570), as VS Code's triple-click and
+    /// line-number click make: select from line `anchor` (the line under the
+    /// pointer when `None`) through the line under screen `(col, row)`, and
+    /// return the anchor so a drag can keep extending from it.
+    pub fn select_lines_at(&mut self, anchor: Option<usize>, col: u16, row: u16) -> usize {
+        self.click(col, row);
+        let anchor = anchor.unwrap_or(self.cursor_row);
+        self.set_selections(&[self.whole_lines(anchor, self.cursor_row)]);
+        anchor
+    }
+
+    /// VS Code "Expand Line Selection" (#1570): every cursor's selection
+    /// grows to the whole lines it touches, through the start of the next
+    /// line. A selection that already ends at a line start reaches one line
+    /// further, so each press adds a line.
+    pub fn expand_line_selection(&mut self) {
+        let all: Vec<EditorSelection> = self
+            .selections_with_primary()
+            .iter()
+            .map(|s| {
+                let (start, end) = s.normalised();
+                self.whole_lines(start.0, end.0)
+            })
+            .collect();
+        self.set_selections(&all);
+        self.last_edit_kind = None;
+    }
+
     /// Move the cursor to the screen coordinates (col, row). Used for mouse clicks.
     pub fn click(&mut self, col: u16, row: u16) {
         if self.lines.is_empty() || self.last_inner.height == 0 {
