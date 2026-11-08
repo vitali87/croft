@@ -875,7 +875,9 @@ pub fn lang_for_extension(ext: &str) -> Option<LangKind> {
         "rs" => LangKind::Rust,
         "py" | "pyi" | "pyw" => LangKind::Python,
         "js" | "mjs" | "cjs" | "jsx" => LangKind::JavaScript,
-        "ts" => LangKind::TypeScript,
+        // `.mts` / `.cts` are TypeScript's ES module and CommonJS files, as
+        // `.mjs` / `.cjs` are JavaScript's (#1162).
+        "ts" | "mts" | "cts" => LangKind::TypeScript,
         "tsx" => LangKind::Tsx,
         "json" | "jsonc" | "code-workspace" => LangKind::Json,
         "xml" | "xsd" | "xsl" | "xslt" | "svg" | "plist" => LangKind::Xml,
@@ -2241,6 +2243,8 @@ def f() -> Config:\n\
         assert_eq!(lang_for_extension("rs"), Some(LangKind::Rust));
         assert_eq!(lang_for_extension("py"), Some(LangKind::Python));
         assert_eq!(lang_for_extension("ts"), Some(LangKind::TypeScript));
+        assert_eq!(lang_for_extension("mts"), Some(LangKind::TypeScript));
+        assert_eq!(lang_for_extension("cts"), Some(LangKind::TypeScript));
         assert_eq!(lang_for_extension("tsx"), Some(LangKind::Tsx));
         assert_eq!(lang_for_extension("js"), Some(LangKind::JavaScript));
         assert_eq!(lang_for_extension("jsx"), Some(LangKind::JavaScript));

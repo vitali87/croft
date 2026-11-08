@@ -324,6 +324,18 @@ fn run_spec_for_node_picks_node_for_dot_js() {
 }
 
 #[test]
+fn run_spec_for_typescript_modules_picks_tsx_as_for_dot_ts() {
+    // #1162: `.mts` / `.cts` are TypeScript, so Run starts them with `tsx`.
+    let tmp = tempfile::tempdir().unwrap();
+    for name in ["mod.ts", "mod.mts", "mod.cts"] {
+        let f = tmp.path().join(name);
+        std::fs::write(&f, b"").unwrap();
+        let spec = App::run_spec_for(&f, tmp.path()).unwrap();
+        assert_eq!(spec.program, "tsx", "{name}");
+    }
+}
+
+#[test]
 fn run_spec_for_bash_picks_bash_for_dot_sh() {
     let tmp = tempfile::tempdir().unwrap();
     let f = tmp.path().join("build.sh");

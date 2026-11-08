@@ -13,7 +13,7 @@ api_version = 1
 # treats the whole family as one server (matches the old `lsp_server_family`).
 [[languages]]
 id = "typescript"
-extensions = ["ts"]
+extensions = ["ts", "mts", "cts"]
 root_markers = ["tsconfig.json", "jsconfig.json", "package.json"]
 
 [[languages]]
