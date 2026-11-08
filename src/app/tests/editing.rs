@@ -797,6 +797,21 @@ fn switching_tabs_clears_the_indentation_enter_left_behind() {
     );
 }
 
+/// #956: moving off the line with a key, through the app's key handling,
+/// clears what Enter left on it.
+#[test]
+fn arrowing_off_a_line_enter_only_indented_clears_it() {
+    let mut app = editor_app_with_lines(&["def f():", "    return 1", "x = 2"]);
+    app.editor.cursor_row = 1;
+    app.editor.cursor_col = 12;
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.lines[2], "    ");
+    app.handle_key(key(KeyCode::Down, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.lines, ["def f():", "    return 1", "", "x = 2"]);
+}
+
 #[test]
 fn editor_cmd_shift_enter_opens_line_above_with_indent() {
     // Open-line-above moved off Cmd+Shift+O (now Go to Symbol) onto its real

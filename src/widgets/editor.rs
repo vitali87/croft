@@ -9668,6 +9668,7 @@ impl Editor {
             && !self.lines[row].is_empty()
         {
             self.lines[row].clear();
+            self.remap_carets(|p| p);
             self.mark_buffer_changed();
         }
         self.note_auto_indent();
@@ -9715,6 +9716,9 @@ impl Editor {
             return;
         }
         self.lines[row].clear();
+        // A selection end or an extra caret on the line stays on it, at
+        // its new end, not past it.
+        self.remap_carets(|p| p);
         let pos = self.last_edit_pos;
         self.mark_buffer_changed();
         self.last_edit_pos = pos;
@@ -39696,6 +39700,20 @@ mod tests {
         e.move_down();
         e.trim_auto_indent(false);
         assert_eq!(e.lines[2], "    c", "typed-on lines keep their indentation");
+        // A selection from the line keeps its end on the line once cleared.
+        let mut e = editor_with("if x:\n    a = 1\n    b = 2");
+        e.cursor_row = 1;
+        e.cursor_col = 9;
+        e.insert_newline();
+        e.selection = Some(EditorSelection {
+            anchor: (2, 4),
+            head: (3, 4),
+        });
+        e.cursor_row = 3;
+        e.cursor_col = 4;
+        e.trim_auto_indent(false);
+        assert_eq!(e.lines[2], "");
+        assert_eq!(e.selection.map(|s| s.anchor), Some((2, 0)));
         // Negative: staying on the line keeps the indent where the caret is.
         let mut e = editor_with("if x:\n    a = 1");
         e.cursor_row = 1;
