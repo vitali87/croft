@@ -351,6 +351,11 @@ fn build_searcher() -> Searcher {
 #[derive(Clone, Debug, Default)]
 pub struct PathFilter {
     include: Option<GlobSet>,
+    /// The include globs that name a folder (#958): those whose last part
+    /// has no wildcard, such as `tests` or `src/widgets`. They also admit
+    /// what is inside the folder; `*.rs` does not admit a folder named
+    /// `generated.rs`.
+    include_dirs: Option<GlobSet>,
     exclude: Option<GlobSet>,
 }
 
@@ -390,10 +395,15 @@ pub fn invalid_globs(raw: &str) -> Vec<&str> {
 /// include list (`fail_closed`) yields an empty set that matches nothing, so
 /// a broken filter never widens a search or Replace All to every file.
 fn build_glob_set(raw: &str, fail_closed: bool) -> Option<GlobSet> {
+    build_glob_set_of(raw, fail_closed, |_| true)
+}
+
+/// [`build_glob_set`] over the entries `keep` accepts.
+fn build_glob_set_of(raw: &str, fail_closed: bool, keep: impl Fn(&str) -> bool) -> Option<GlobSet> {
     let mut builder = GlobSetBuilder::new();
     let mut any = false;
     let mut typed = false;
-    for pat in split_globs(raw) {
+    for pat in split_globs(raw).filter(|p| keep(p)) {
         typed = true;
         if let Some(g) = compile_glob(pat) {
             builder.add(g);
@@ -404,6 +414,14 @@ fn build_glob_set(raw: &str, fail_closed: bool) -> Option<GlobSet> {
         return None;
     }
     builder.build().ok()
+}
+
+/// Whether a glob names a folder rather than a kind of file: its last part
+/// is a plain name, as in `tests`, `src/widgets` or `./src`, not a pattern
+/// such as `*.rs` (#958).
+fn names_a_folder(pat: &str) -> bool {
+    let last = pat.trim_end_matches('/').rsplit('/').next().unwrap_or(pat);
+    !last.is_empty() && !last.contains(['*', '?', '[', '{'])
 }
 
 /// True when `rel` or one of the folders above it matches `set`: a glob that
@@ -419,6 +437,7 @@ impl PathFilter {
     pub fn new(include: &str, exclude: &str) -> Self {
         Self {
             include: build_glob_set(include, true),
+            include_dirs: build_glob_set_of(include, false, names_a_folder),
             exclude: build_glob_set(exclude, false),
         }
     }
@@ -435,11 +454,19 @@ impl PathFilter {
     /// present, the path must match it; then any exclude match drops the path.
     /// On both sides a glob that names a folder covers what is inside it, as
     /// in VS Code, so include `tests` or `src/widgets` searches those folders
-    /// (#958) and exclude `dist` hides everything under it (#1345).
+    /// (#958) and exclude `dist` hides everything under it (#1345). A folder
+    /// is only looked for inside the workspace: a file outside it (an open
+    /// buffer elsewhere) is not let in by a folder above the workspace.
     pub fn allows(&self, root: &Path, path: &Path) -> bool {
-        let rel = path.strip_prefix(root).unwrap_or(path);
+        let inside = path.strip_prefix(root).ok();
+        let rel = inside.unwrap_or(path);
         if let Some(inc) = &self.include
-            && !matches_self_or_parent(inc, rel)
+            && !inc.is_match(rel)
+            && !inside.is_some_and(|rel| {
+                self.include_dirs
+                    .as_ref()
+                    .is_some_and(|dirs| matches_self_or_parent(dirs, rel))
+            })
         {
             return false;
         }
@@ -5071,6 +5098,12 @@ mod tests {
         let f = PathFilter::new("./src", "");
         assert!(f.allows(root, Path::new("/proj/src/app/mod.rs")));
         assert!(!f.allows(root, Path::new("/proj/vendor/src/x.rs")));
+        // A file glob names files, not a folder that happens to match it,
+        // and a folder above the workspace lets nothing in.
+        let f = PathFilter::new("*.rs, src", "");
+        assert!(f.allows(root, Path::new("/proj/a/main.rs")));
+        assert!(!f.allows(root, Path::new("/proj/generated.rs/notes.txt")));
+        assert!(!f.allows(root, Path::new("/home/me/src/elsewhere.txt")));
         // The same folder names on the exclude side drop their contents.
         let f = PathFilter::new("", "src/widgets, dist");
         assert!(!f.allows(root, Path::new("/proj/src/widgets/search.rs")));
