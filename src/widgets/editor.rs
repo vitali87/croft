@@ -3586,6 +3586,12 @@ pub struct Editor {
     /// on-type formatting trigger detector (#254). Stale once any other
     /// edit bumps the seq.
     pub last_typed: Option<(char, u64)>,
+    /// The whitespace-only line Enter just indented (#956): its row, how
+    /// many characters of indentation it got, and the `edit_seq` that left
+    /// it so. The indentation is cleared again, as VS Code's
+    /// `trimAutoWhitespace` does, once the caret leaves the line with
+    /// nothing typed on it.
+    auto_indent: Option<(usize, usize, u64)>,
     /// Collaborators' caret positions in this file (multiplayer sessions,
     /// docs/MULTIPLAYER.md): (row, char col, participant color). Painted as
     /// colored block cells like secondary carets; the App rebuilds this
@@ -4173,6 +4179,7 @@ impl Editor {
             last_edit_origin: (0, 0),
             select_expand: None,
             last_typed: None,
+            auto_indent: None,
             ghost_carets: Vec::new(),
             ghost_caret_labels: Vec::new(),
             stream_stop_line: None,
@@ -9638,13 +9645,84 @@ impl Editor {
     }
 
     pub fn insert_newline(&mut self) {
+        // Enter again on a line Enter only indented leaves that line blank
+        // (#956): the indentation moves down with the caret, and the clear
+        // is part of this Enter's undo step.
+        let blank = self
+            .auto_indent
+            .take()
+            .filter(|&(row, len, seq)| {
+                seq == self.edit_seq
+                    && row == self.cursor_row
+                    && self.selection.is_none()
+                    && self.is_auto_indent_line(row, len)
+            })
+            .map(|(row, ..)| row);
         self.pin_on_edit();
         self.push_undo(EditKind::Newline);
         self.delete_selection_inner();
         self.smart_insert_newline_inner();
+        if let Some(row) = blank
+            && row < self.cursor_row
+            && self.lines[row].chars().all(|c| c == ' ' || c == '\t')
+            && !self.lines[row].is_empty()
+        {
+            self.lines[row].clear();
+            self.remap_carets(|p| p);
+            self.mark_buffer_changed();
+        }
+        self.note_auto_indent();
         self.recompute_highlights();
         // Newline is an on-type trigger for several servers (#254).
         self.last_typed = Some(('\n', self.edit_seq));
+    }
+
+    /// Remember the caret's line when Enter left it holding nothing but the
+    /// indentation it inserted, caret at its end (#956).
+    fn note_auto_indent(&mut self) {
+        let row = self.cursor_row;
+        self.auto_indent = self.lines.get(row).and_then(|line| {
+            let len = line.chars().count();
+            (len > 0 && self.cursor_col == len && line.chars().all(|c| c == ' ' || c == '\t'))
+                .then_some((row, len, self.edit_seq))
+        });
+    }
+
+    /// Whether `row` still holds exactly the `len` characters of
+    /// indentation Enter gave it and nothing else.
+    fn is_auto_indent_line(&self, row: usize, len: usize) -> bool {
+        self.lines.get(row).is_some_and(|line| {
+            line.chars().count() == len && line.chars().all(|c| c == ' ' || c == '\t')
+        })
+    }
+
+    /// Clear the indentation Enter put on a line the caret has since left
+    /// with nothing typed on it (#956), so a blank line between statements
+    /// is saved blank rather than as `"    "` that every linter flags. Called
+    /// after each key and click, with `tab_left` set for every tab but the
+    /// one being typed in: switching away from a tab leaves its line too.
+    /// It takes no undo step of its own: the step on top is still the one
+    /// before the Enter, so one Ctrl+Z still undoes the Enter.
+    pub fn trim_auto_indent(&mut self, tab_left: bool) {
+        let Some((row, len, seq)) = self.auto_indent else {
+            return;
+        };
+        if seq == self.edit_seq && row == self.cursor_row && !tab_left {
+            return;
+        }
+        self.auto_indent = None;
+        // Anything typed or edited since, here or elsewhere, keeps the line.
+        if seq != self.edit_seq || !self.is_auto_indent_line(row, len) {
+            return;
+        }
+        self.lines[row].clear();
+        // A selection end or an extra caret on the line stays on it, at
+        // its new end, not past it.
+        self.remap_carets(|p| p);
+        let pos = self.last_edit_pos;
+        self.mark_buffer_changed();
+        self.last_edit_pos = pos;
+        self.recompute_highlights();
     }
 
     fn smart_insert_newline_inner(&mut self) {
@@ -17049,10 +17127,14 @@ fn text_end(start: (usize, usize), text: &str) -> (usize, usize) {
 
 /// Title-case a string: the first alphanumeric of each run is upper-cased,
 /// the rest lower-cased, separators preserved. Used by Transform to Title
-/// Case.
+/// Case. An apostrophe (`'` or `’`) right after a letter stays inside the
+/// word, so `don't` and `journey's` keep a lower-case tail (#1016); one at
+/// the start of a word (`'tis`) still lets the next letter start it, as in
+/// VS Code.
 fn title_case(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut prev_alnum = false;
+    let mut prev_letter = false;
     for c in s.chars() {
         if c.is_alphanumeric() {
             if prev_alnum {
@@ -17061,9 +17143,15 @@ fn title_case(s: &str) -> String {
                 out.extend(c.to_uppercase());
             }
             prev_alnum = true;
+            prev_letter = c.is_alphabetic();
+        } else if matches!(c, '\'' | '\u{2019}') && prev_letter {
+            // `prev_alnum` stays set: the letter after it continues the word.
+            out.push(c);
+            prev_letter = false;
         } else {
             out.push(c);
             prev_alnum = false;
+            prev_letter = false;
         }
     }
     out
@@ -22407,6 +22495,16 @@ impl EditorTabs {
         self.active = idx;
         self.editors[self.active].focused = true;
         true
+    }
+
+    /// [`Editor::trim_auto_indent`] over every tab (#956): the active one
+    /// keeps the line its caret is still on when `focused_group`, and every
+    /// other tab has been switched away from, so its line was left.
+    pub fn trim_auto_indents(&mut self, focused_group: bool) {
+        let active = self.active;
+        for (i, editor) in self.editors.iter_mut().enumerate() {
+            editor.trim_auto_indent(!(focused_group && i == active));
+        }
     }
 
     /// Sweep EVERY open tab (not just the active one) for external on-disk
@@ -39557,6 +39655,94 @@ mod tests {
         });
         e.transform_selection_case(CaseTransform::Title);
         assert_eq!(e.lines, vec!["Hello There World"]);
+    }
+
+    /// #956: Enter, Enter inside a block leaves the first new line blank,
+    /// not holding the indentation, and the next line is still indented.
+    #[test]
+    fn enter_twice_leaves_no_indentation_on_the_blank_line() {
+        let mut e = editor_with("def area(w, h):\n    return w * h");
+        e.cursor_row = 1;
+        e.cursor_col = 16;
+        e.insert_newline();
+        assert_eq!(e.lines[2], "    ", "Enter indents the new line");
+        e.insert_newline();
+        for c in "total".chars() {
+            e.insert_char(c);
+        }
+        assert_eq!(
+            e.lines,
+            ["def area(w, h):", "    return w * h", "", "    total"]
+        );
+        // One Ctrl+Z per Enter, as before: the clear is part of the second.
+        e.undo();
+        e.undo();
+        assert_eq!(e.lines, ["def area(w, h):", "    return w * h", "    "]);
+    }
+
+    /// #956: leaving the indented line by moving off it clears it too; one
+    /// that got text keeps its indentation.
+    #[test]
+    fn leaving_an_indented_blank_line_clears_it_but_typing_keeps_it() {
+        let mut e = editor_with("if x:\n    a = 1\n    b = 2");
+        e.cursor_row = 1;
+        e.cursor_col = 9;
+        e.insert_newline();
+        e.move_down();
+        e.trim_auto_indent(false);
+        assert_eq!(e.lines[2], "", "moved off with nothing typed");
+        assert!(e.dirty);
+        let mut e = editor_with("if x:\n    a = 1\n    b = 2");
+        e.cursor_row = 1;
+        e.cursor_col = 9;
+        e.insert_newline();
+        e.insert_char('c');
+        e.move_down();
+        e.trim_auto_indent(false);
+        assert_eq!(e.lines[2], "    c", "typed-on lines keep their indentation");
+        // A selection from the line keeps its end on the line once cleared.
+        let mut e = editor_with("if x:\n    a = 1\n    b = 2");
+        e.cursor_row = 1;
+        e.cursor_col = 9;
+        e.insert_newline();
+        e.selection = Some(EditorSelection {
+            anchor: (2, 4),
+            head: (3, 4),
+        });
+        e.cursor_row = 3;
+        e.cursor_col = 4;
+        e.trim_auto_indent(false);
+        assert_eq!(e.lines[2], "");
+        assert_eq!(e.selection.map(|s| s.anchor), Some((2, 0)));
+        // Negative: staying on the line keeps the indent where the caret is.
+        let mut e = editor_with("if x:\n    a = 1");
+        e.cursor_row = 1;
+        e.cursor_col = 9;
+        e.insert_newline();
+        e.trim_auto_indent(false);
+        assert_eq!(e.lines[2], "    ");
+        assert_eq!(e.cursor_col, 4);
+    }
+
+    /// #1016: an apostrophe inside a word doesn't start a new one, so
+    /// contractions and possessives keep their lower-case tail; one that
+    /// opens a word (`'tis`) still capitalises the letter after it.
+    #[test]
+    fn title_case_keeps_contractions_whole() {
+        assert_eq!(
+            title_case("## don't stop believing: it's the journey's end"),
+            "## Don't Stop Believing: It's The Journey's End"
+        );
+        assert_eq!(
+            title_case("we'll be there by o'clock, won't we?"),
+            "We'll Be There By O'clock, Won't We?"
+        );
+        assert_eq!(
+            title_case("don\u{2019}t it\u{2019}s"),
+            "Don\u{2019}t It\u{2019}s"
+        );
+        assert_eq!(title_case("'tis the season"), "'Tis The Season");
+        assert_eq!(title_case("say 'hello' twice"), "Say 'Hello' Twice");
     }
 
     /// #1573: the four naming styles, from each other.

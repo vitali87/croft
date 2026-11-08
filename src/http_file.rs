@@ -395,6 +395,9 @@ pub fn resolve(
 }
 
 /// The request as a `curl` command line, single-quoted for a POSIX shell.
+/// The body goes in `--data-raw`, not `--data`: curl reads a `--data` value
+/// that starts with `@` as a file name, so `@channel deploy finished` would
+/// fail (or send a local file) instead of posting the text (#1064).
 pub fn to_curl(req: &ResolvedRequest) -> String {
     fn sq(s: &str) -> String {
         format!("'{}'", s.replace('\'', "'\\''"))
@@ -404,7 +407,7 @@ pub fn to_curl(req: &ResolvedRequest) -> String {
         out.push_str(&format!(" -H {}", sq(&format!("{k}: {v}"))));
     }
     if let Some(body) = &req.body {
-        out.push_str(&format!(" --data {}", sq(body)));
+        out.push_str(&format!(" --data-raw {}", sq(body)));
     }
     out
 }
@@ -863,8 +866,26 @@ DELETE {{host}}/users/1\n";
         let curl = to_curl(&req);
         assert_eq!(
             curl,
-            "curl -X POST 'http://x.test/it'\\''s' -H 'X-A: b c' --data '{\"q\": \"a'\\''b\"}'"
+            "curl -X POST 'http://x.test/it'\\''s' -H 'X-A: b c' --data-raw '{\"q\": \"a'\\''b\"}'"
         );
+    }
+
+    /// A body that starts with `@` is text to send, not a file for curl to
+    /// read (#1064): `--data-raw` never treats `@` specially.
+    #[test]
+    fn curl_line_sends_an_at_body_as_text() {
+        let req = ResolvedRequest {
+            method: String::from("POST"),
+            url: String::from("http://x.test/hook"),
+            headers: Vec::new(),
+            body: Some(String::from("@channel deploy finished")),
+        };
+        let curl = to_curl(&req);
+        assert!(
+            curl.ends_with(" --data-raw '@channel deploy finished'"),
+            "{curl}"
+        );
+        assert!(!curl.contains(" --data '"), "{curl}");
     }
 
     /// A JSON response renders as a `.jsonc` document: the RAW request line
