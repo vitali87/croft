@@ -874,7 +874,7 @@ fn display_width(s: &str) -> u16 {
             break;
         }
     }
-    w as u16
+    w.min(MAX_COL_DISPLAY_W as usize) as u16
 }
 
 /// Columns one grapheme of a cell takes in the grid. A control character
@@ -1207,6 +1207,14 @@ mod tests {
         // waits for a scroll.
         assert_eq!(super::visible_columns(&[5, 40], 0, 30), vec![(0, 0, 5)]);
         assert!(super::visible_columns(&[5], 0, 0).is_empty());
+    }
+
+    #[test]
+    fn a_cell_width_never_passes_the_column_cap() {
+        // 39 narrow columns then a wide glyph would be 41.
+        let s = format!("{}表", "x".repeat(super::MAX_COL_DISPLAY_W as usize - 1));
+        assert_eq!(super::display_width(&s), super::MAX_COL_DISPLAY_W);
+        assert_eq!(super::display_width("表表"), 4);
     }
 
     /// Write a zip of `(name, text)` members.
