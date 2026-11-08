@@ -3586,6 +3586,12 @@ pub struct Editor {
     /// on-type formatting trigger detector (#254). Stale once any other
     /// edit bumps the seq.
     pub last_typed: Option<(char, u64)>,
+    /// The whitespace-only line Enter just indented (#956): its row, how
+    /// many characters of indentation it got, and the `edit_seq` that left
+    /// it so. The indentation is cleared again, as VS Code's
+    /// `trimAutoWhitespace` does, once the caret leaves the line with
+    /// nothing typed on it.
+    auto_indent: Option<(usize, usize, u64)>,
     /// Collaborators' caret positions in this file (multiplayer sessions,
     /// docs/MULTIPLAYER.md): (row, char col, participant color). Painted as
     /// colored block cells like secondary carets; the App rebuilds this
@@ -4173,6 +4179,7 @@ impl Editor {
             last_edit_origin: (0, 0),
             select_expand: None,
             last_typed: None,
+            auto_indent: None,
             ghost_carets: Vec::new(),
             ghost_caret_labels: Vec::new(),
             stream_stop_line: None,
@@ -9638,13 +9645,79 @@ impl Editor {
     }
 
     pub fn insert_newline(&mut self) {
+        // Enter again on a line Enter only indented leaves that line blank
+        // (#956): the indentation moves down with the caret, and the clear
+        // is part of this Enter's undo step.
+        let blank = self
+            .auto_indent
+            .take()
+            .filter(|&(row, len, seq)| {
+                seq == self.edit_seq
+                    && row == self.cursor_row
+                    && self.selection.is_none()
+                    && self.is_auto_indent_line(row, len)
+            })
+            .map(|(row, ..)| row);
         self.pin_on_edit();
         self.push_undo(EditKind::Newline);
         self.delete_selection_inner();
         self.smart_insert_newline_inner();
+        if let Some(row) = blank
+            && row < self.cursor_row
+            && self.lines[row].chars().all(|c| c == ' ' || c == '\t')
+            && !self.lines[row].is_empty()
+        {
+            self.lines[row].clear();
+            self.mark_buffer_changed();
+        }
+        self.note_auto_indent();
         self.recompute_highlights();
         // Newline is an on-type trigger for several servers (#254).
         self.last_typed = Some(('\n', self.edit_seq));
+    }
+
+    /// Remember the caret's line when Enter left it holding nothing but the
+    /// indentation it inserted, caret at its end (#956).
+    fn note_auto_indent(&mut self) {
+        let row = self.cursor_row;
+        self.auto_indent = self.lines.get(row).and_then(|line| {
+            let len = line.chars().count();
+            (len > 0 && self.cursor_col == len && line.chars().all(|c| c == ' ' || c == '\t'))
+                .then_some((row, len, self.edit_seq))
+        });
+    }
+
+    /// Whether `row` still holds exactly the `len` characters of
+    /// indentation Enter gave it and nothing else.
+    fn is_auto_indent_line(&self, row: usize, len: usize) -> bool {
+        self.lines.get(row).is_some_and(|line| {
+            line.chars().count() == len && line.chars().all(|c| c == ' ' || c == '\t')
+        })
+    }
+
+    /// Clear the indentation Enter put on a line the caret has since left
+    /// with nothing typed on it (#956), so a blank line between statements
+    /// is saved blank rather than as `"    "` that every linter flags. Called
+    /// after each key and click. It takes no undo step of its own: the
+    /// step on top is still the one before the Enter, so one Ctrl+Z still
+    /// undoes the Enter.
+    pub fn trim_auto_indent_left_behind(&mut self) {
+        let Some((row, len, seq)) = self.auto_indent else {
+            return;
+        };
+        if seq == self.edit_seq && row == self.cursor_row {
+            return;
+        }
+        self.auto_indent = None;
+        // Anything typed or edited since, here or elsewhere, keeps the line.
+        if seq != self.edit_seq || !self.is_auto_indent_line(row, len) {
+            return;
+        }
+        self.lines[row].clear();
+        let pos = self.last_edit_pos;
+        self.mark_buffer_changed();
+        self.last_edit_pos = pos;
+        self.recompute_highlights();
     }
 
     fn smart_insert_newline_inner(&mut self) {
@@ -39567,6 +39640,59 @@ mod tests {
         });
         e.transform_selection_case(CaseTransform::Title);
         assert_eq!(e.lines, vec!["Hello There World"]);
+    }
+
+    /// #956: Enter, Enter inside a block leaves the first new line blank,
+    /// not holding the indentation, and the next line is still indented.
+    #[test]
+    fn enter_twice_leaves_no_indentation_on_the_blank_line() {
+        let mut e = editor_with("def area(w, h):\n    return w * h");
+        e.cursor_row = 1;
+        e.cursor_col = 16;
+        e.insert_newline();
+        assert_eq!(e.lines[2], "    ", "Enter indents the new line");
+        e.insert_newline();
+        for c in "total".chars() {
+            e.insert_char(c);
+        }
+        assert_eq!(
+            e.lines,
+            ["def area(w, h):", "    return w * h", "", "    total"]
+        );
+        // One Ctrl+Z per Enter, as before: the clear is part of the second.
+        e.undo();
+        e.undo();
+        assert_eq!(e.lines, ["def area(w, h):", "    return w * h", "    "]);
+    }
+
+    /// #956: leaving the indented line by moving off it clears it too; one
+    /// that got text keeps its indentation.
+    #[test]
+    fn leaving_an_indented_blank_line_clears_it_but_typing_keeps_it() {
+        let mut e = editor_with("if x:\n    a = 1\n    b = 2");
+        e.cursor_row = 1;
+        e.cursor_col = 9;
+        e.insert_newline();
+        e.move_down();
+        e.trim_auto_indent_left_behind();
+        assert_eq!(e.lines[2], "", "moved off with nothing typed");
+        assert!(e.dirty);
+        let mut e = editor_with("if x:\n    a = 1\n    b = 2");
+        e.cursor_row = 1;
+        e.cursor_col = 9;
+        e.insert_newline();
+        e.insert_char('c');
+        e.move_down();
+        e.trim_auto_indent_left_behind();
+        assert_eq!(e.lines[2], "    c", "typed-on lines keep their indentation");
+        // Negative: staying on the line keeps the indent where the caret is.
+        let mut e = editor_with("if x:\n    a = 1");
+        e.cursor_row = 1;
+        e.cursor_col = 9;
+        e.insert_newline();
+        e.trim_auto_indent_left_behind();
+        assert_eq!(e.lines[2], "    ");
+        assert_eq!(e.cursor_col, 4);
     }
 
     /// #1016: an apostrophe inside a word doesn't start a new one, so

@@ -26790,6 +26790,8 @@ impl App {
             && key.kind == KeyEventKind::Press;
         let before = zen_esc.then(|| self.esc_fingerprint());
         let result = self.recording_file_switches(|app| app.handle_key_inner(key));
+        // A line Enter only indented is cleared once the caret leaves it.
+        self.editor.trim_auto_indent_left_behind();
         if leader_armed {
             let chord = self.screencast.take_chord_step();
             self.screencast
@@ -62488,6 +62490,7 @@ impl App {
             );
         }
         self.recording_file_switches(|app| app.handle_mouse_inner(m));
+        self.editor.trim_auto_indent_left_behind();
     }
 
     fn handle_mouse_inner(&mut self, m: MouseEvent) {
