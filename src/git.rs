@@ -1055,8 +1055,8 @@ pub fn query_changes(root: &Path) -> Vec<ChangeEntry> {
     };
     let raw = String::from_utf8_lossy(&output.stdout);
     let mut entries = parse_porcelain_changes(&raw);
-    let staged = numstat_map(path_str, &["diff", "--cached", "--numstat"]);
-    let unstaged = numstat_map(path_str, &["diff", "--numstat"]);
+    let staged = numstat_map(path_str, &["diff", "--cached", "--numstat", "-z"]);
+    let unstaged = numstat_map(path_str, &["diff", "--numstat", "-z"]);
     for entry in &mut entries {
         let stats = match entry.kind.section() {
             ChangeSection::Staged => staged.get(&entry.path),
@@ -1077,26 +1077,33 @@ pub fn query_changes(root: &Path) -> Vec<ChangeEntry> {
     entries
 }
 
-/// Parse `git diff --numstat` output into a path→(additions, deletions)
-/// map. Each line is `\d+\t\d+\t<path>` for text diffs, or `-\t-\t<path>`
-/// for binary files (which we map to (0, 0) — there's no meaningful line
-/// count). Rename lines arrive as `add\tdel\told -> new` and we key on
-/// the destination path so the lookup matches what porcelain emitted.
+/// Parse `git diff --numstat -z` output into a path→(additions, deletions)
+/// map. Each record is `\d+\t\d+\t<path>\0` for a text diff, or
+/// `-\t-\t<path>\0` for a binary file (mapped to (0, 0): there's no
+/// meaningful line count). A rename or copy leaves the path field empty and
+/// follows it with two more fields, `<old>\0<new>\0`; we key on the
+/// destination so the lookup matches what porcelain emitted (#1164). Without
+/// `-z` git writes a rename as `src/{old.rs => new.rs}`, which matches no
+/// porcelain path, and `-z` paths are never C-quoted.
 pub fn parse_numstat(out: &str) -> std::collections::HashMap<String, (usize, usize)> {
     let mut map = std::collections::HashMap::new();
-    for line in out.lines() {
-        let mut parts = line.splitn(3, '\t');
-        let Some(adds) = parts.next() else { continue };
-        let Some(dels) = parts.next() else { continue };
-        let Some(path_part) = parts.next() else {
+    let mut fields = out.split('\0');
+    while let Some(record) = fields.next() {
+        let mut parts = record.splitn(3, '\t');
+        let (Some(adds), Some(dels), Some(path)) = (parts.next(), parts.next(), parts.next())
+        else {
             continue;
         };
         let additions = adds.parse::<usize>().unwrap_or(0);
         let deletions = dels.parse::<usize>().unwrap_or(0);
-        let path = if let Some((_, dst)) = path_part.split_once(" -> ") {
-            unquote_porcelain_path(dst)
+        let path = if path.is_empty() {
+            let _old = fields.next();
+            match fields.next() {
+                Some(new) => new.to_string(),
+                None => break,
+            }
         } else {
-            unquote_porcelain_path(path_part)
+            path.to_string()
         };
         map.insert(path, (additions, deletions));
     }
@@ -5360,19 +5367,51 @@ mod tests {
 
     #[test]
     fn parse_numstat_extracts_additions_deletions_per_path() {
-        let out = "12\t3\tsrc/app.rs\n5\t0\tREADME.md\n-\t-\tassets/logo.png\n";
+        let out = "12\t3\tsrc/app.rs\x005\t0\tREADME.md\x00-\t-\tassets/logo.png\x00";
         let map = parse_numstat(out);
         assert_eq!(map.get("src/app.rs"), Some(&(12, 3)));
         assert_eq!(map.get("README.md"), Some(&(5, 0)));
         assert_eq!(map.get("assets/logo.png"), Some(&(0, 0)));
+        // `-z` paths are never quoted: a space or a quote is the name itself.
+        let map = parse_numstat("1\t0\tmy \"notes\".md\x00");
+        assert_eq!(map.get("my \"notes\".md"), Some(&(1, 0)));
     }
 
     #[test]
     fn parse_numstat_keys_renames_on_destination_path() {
-        let out = "2\t1\told.rs -> new.rs\n";
+        // What `git diff --cached --numstat -z` prints for a rename into
+        // another folder, a rename beside a plain edit, and a rename
+        // inside one folder (#1164).
+        let out = "1\t1\t\x00dir1/a.txt\x00dir2/a.txt\x00\
+                   1\t1\tplain.txt\x00\
+                   2\t1\t\x00src/old.rs\x00src/new.rs\x00";
         let map = parse_numstat(out);
-        assert_eq!(map.get("new.rs"), Some(&(2, 1)));
-        assert!(!map.contains_key("old.rs"));
+        assert_eq!(map.get("dir2/a.txt"), Some(&(1, 1)));
+        assert_eq!(map.get("plain.txt"), Some(&(1, 1)));
+        assert_eq!(map.get("src/new.rs"), Some(&(2, 1)));
+        assert_eq!(map.len(), 3, "{map:?}");
+    }
+
+    #[test]
+    fn a_staged_rename_counts_the_lines_it_changed() {
+        // #1164: a renamed file that was also edited reported 0/0, so the
+        // staged total undercounted the commit.
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path();
+        init_repo_with_commit(p);
+        std::fs::create_dir_all(p.join("src")).unwrap();
+        std::fs::write(p.join("src/old.rs"), "l1\nl2\nl3\nl4\nl5\n").unwrap();
+        sh_git(p, &["add", "."]);
+        sh_git(p, &["commit", "-qm", "add"]);
+        sh_git(p, &["mv", "src/old.rs", "src/new.rs"]);
+        std::fs::write(p.join("src/new.rs"), "EDITED\nl2\nl3\nl4\nl5\n").unwrap();
+        sh_git(p, &["add", "-A"]);
+        let entries = query_changes(p);
+        let renamed = entries
+            .iter()
+            .find(|e| e.path == "src/new.rs")
+            .expect("the rename is listed under its new name");
+        assert_eq!((renamed.additions, renamed.deletions), (1, 1));
     }
 
     #[test]
