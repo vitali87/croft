@@ -1246,6 +1246,46 @@ fn the_palette_and_vim_recorders_are_one_recording_not_two() {
     );
 }
 
+/// #952: a recording started and stopped from the Command Palette leaves
+/// the stopping palette session out of the macro, so Replay N Times repeats
+/// the edits and never types into a palette. A palette session in the
+/// middle (here opened and dismissed) joins the macro whole and replays.
+#[test]
+fn a_macro_stopped_from_the_palette_replays_only_what_was_recorded() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "names.txt", "alice\nbob\ncarol\ndave\neve\n");
+    app.macros_path = tmp.path().join("macros.json");
+    let palette = key(
+        KeyCode::Char('p'),
+        KeyModifiers::SUPER | KeyModifiers::SHIFT,
+    );
+    let none = |code| key(code, KeyModifiers::NONE);
+    let run_from_palette = |app: &mut App, query: &str| {
+        app.handle_key(palette).unwrap();
+        type_str(app, query);
+        app.handle_key(none(KeyCode::Enter)).unwrap();
+    };
+    run_from_palette(&mut app, "Macro: Start/Stop Recording");
+    assert!(app.macro_recording.is_some(), "the palette started it");
+    app.handle_key(none(KeyCode::Home)).unwrap();
+    type_str(&mut app, "- ");
+    app.handle_key(palette).unwrap();
+    type_str(&mut app, "zz");
+    app.handle_key(none(KeyCode::Esc)).unwrap();
+    app.handle_key(none(KeyCode::Down)).unwrap();
+    run_from_palette(&mut app, "Macro: Start/Stop Recording");
+    assert!(app.macro_recording.is_none(), "the palette stopped it");
+    app.replay_last_macro(4);
+    assert!(
+        app.command_palette.is_none(),
+        "replay ends with no palette open"
+    );
+    assert_eq!(
+        app.editor.lines[..5],
+        ["- alice", "- bob", "- carol", "- dave", "- eve"]
+    );
+}
+
 /// #1345: Go to File skips excluded files, as VS Code's file search does
 /// for both settings, and still finds the rest.
 #[test]

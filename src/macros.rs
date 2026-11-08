@@ -350,6 +350,12 @@ fn parse_code(name: &str) -> Option<KeyCode> {
 pub struct Recording {
     pub register: Option<char>,
     pub recorded: Macro,
+    /// Keys that opened or went into the Command Palette, held back until it
+    /// closes (#952). A palette session that runs a command joins the macro
+    /// whole, chord, query and Enter, so it replays; one that stops the
+    /// recording is dropped with it instead of leaving the chord and the
+    /// typed query in the macro, which replay would type into a palette.
+    pub palette_keys: Vec<KeyEvent>,
 }
 
 /// The store: `~/.config/croft/macros.json`, a register name → macro map,

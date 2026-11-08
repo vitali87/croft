@@ -26726,6 +26726,7 @@ impl App {
         }
         let capture =
             self.macro_recording.is_some() && !self.macro_replaying && self.focus == Pane::Editor;
+        let palette_before = self.command_palette.is_some();
         // Esc Esc leaves Zen Mode (#1585), counting only Escapes in the
         // editor that closed or cleared nothing: one that dismisses a popup
         // or a selection is that, not half of the pair.
@@ -26754,7 +26755,9 @@ impl App {
         // is dropped, producing a macro that replays a focus change and then
         // silently loses its payload.
         if capture && self.macro_recording.is_some() {
-            if self.focus == Pane::Editor {
+            if palette_before || self.command_palette.is_some() {
+                self.hold_palette_macro_key(key, palette_before);
+            } else if self.focus == Pane::Editor {
                 self.record_macro_key(key);
             } else {
                 // The issue asks for skipped keys to be logged rather than
@@ -57995,6 +57998,37 @@ impl App {
         }
     }
 
+    /// Hold back a recorded key that opened or went into the Command Palette
+    /// (#952) until the palette closes: it then joins the macro with the rest
+    /// of that palette session, so a palette command replays whole. The
+    /// session that runs Macro: Start/Stop Recording never gets here with
+    /// its Enter, because stopping drops the recording and what it held.
+    /// One the palette was opened for without a key (a click) is dropped:
+    /// replayed without the chord, its query would be typed into the file.
+    fn hold_palette_macro_key(&mut self, key: crossterm::event::KeyEvent, palette_before: bool) {
+        let open_now = self.command_palette.is_some();
+        let Some(rec) = self.macro_recording.as_mut() else {
+            return;
+        };
+        if !palette_before && rec.palette_keys.is_empty() {
+            // The key that opened the palette: a session that replays.
+            rec.palette_keys.push(key);
+        } else if !rec.palette_keys.is_empty() {
+            rec.palette_keys.push(key);
+        } else {
+            crate::output::push(
+                "Macros",
+                crate::output::OutputLevel::Info,
+                &format!("skipped {key:?}: the palette was not opened from the keyboard"),
+            );
+        }
+        if !open_now {
+            for k in std::mem::take(&mut rec.palette_keys) {
+                rec.recorded.push_key(k);
+            }
+        }
+    }
+
     /// Start recording into `register` (vim `q{a-z}`) or into the unnamed
     /// last-recording slot (the palette command). Starting while already
     /// recording stops instead, so one gesture toggles.
@@ -58006,6 +58040,7 @@ impl App {
         self.macro_recording = Some(crate::macros::Recording {
             register,
             recorded: crate::macros::Macro::default(),
+            palette_keys: Vec::new(),
         });
         // One source of truth: vim's `q` branches on this, and a copy the
         // machine kept for itself drifted whenever the palette was used.
