@@ -13370,7 +13370,10 @@ impl App {
     /// The scope-header lines to pin as sticky scroll: the enclosing symbols of
     /// the top visible line whose header has scrolled above the viewport,
     /// outermost first, capped. Empty when the feature does not apply (welcome
-    /// screen, preview tab, no outline, or nothing scrolled off).
+    /// screen, preview tab, no outline, or nothing scrolled off). The header
+    /// is the symbol's name line (its `selectionRange`), not where its range
+    /// starts: a decorated Python `def` or `class` starts at `@route(...)`,
+    /// which names nothing and could be pinned over the `class` line (#940).
     fn build_sticky_lines(&self) -> Vec<u32> {
         let Some(path) = self.editor.path.as_deref() else {
             return Vec::new();
@@ -13385,7 +13388,7 @@ impl App {
         let symbols = self.outline.symbols();
         breadcrumb_symbol_chain(symbols, top, 0)
             .into_iter()
-            .map(|i| symbols[i].range_start_line)
+            .map(|i| symbols[i].line)
             .filter(|&l| l < top)
             .take(STICKY_SCROLL_MAX)
             .collect()
