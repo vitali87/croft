@@ -3340,6 +3340,15 @@ fn try_local_cross_install(ssh: &SshControl, source_stamp: &str) -> Result<Optio
     Ok(None)
 }
 
+/// What the on-box compile changes on the remote besides building croft,
+/// said before asking (#950): a "compile anyway?" that installs a toolchain
+/// and system packages without naming them is not consent.
+/// [`remote_install_command`] is the script these describe.
+pub const REMOTE_COMPILE_SIDE_EFFECTS: [&str; 2] = [
+    "If Rust is missing there, rustup installs it into ~/.rustup and ~/.cargo (about 1 GB); shell startup files are left alone.",
+    "If a C compiler, pkg-config or dtach is missing, or curl and ca-certificates to fetch Rust, the system package manager installs them, through `sudo -n` when not root.",
+];
+
 /// Ask on the controlling terminal before the slow on-box compile. The
 /// answer defaults to "no": quitting to run `croft setup-cross` once turns
 /// every future install into a seconds-long prebuilt-binary ship, so the
@@ -3351,6 +3360,9 @@ fn confirm_remote_compile_on_tty(host: &str, reason: &str) -> bool {
     eprintln!(
         "Croft can compile itself on {host} instead; the first build can take several minutes and loads the box."
     );
+    for line in REMOTE_COMPILE_SIDE_EFFECTS {
+        eprintln!("  - {line}");
+    }
     if !std::io::stdin().is_terminal() {
         eprintln!(
             "stdin is not a terminal; declining the remote compile. Run `croft setup-cross`, then retry."
@@ -3681,33 +3693,36 @@ if [ -f "$HOME/.cargo/env" ]; then
 fi
 export PATH="$HOME/.cargo/bin:$PATH"
 
-# Package installs need root. Run them directly when already root, otherwise
-# via sudo if available. CROFT_SUDO is empty in both the root and the
-# no-sudo case so the install commands stay identical.
-if [ "$(id -u)" = "0" ]; then
-  CROFT_SUDO=""
-elif command -v sudo >/dev/null 2>&1; then
-  CROFT_SUDO="sudo"
-else
-  CROFT_SUDO=""
-fi
+# Package installs need root. Run them directly when already root or when
+# there is no sudo, otherwise through sudo. `sudo -n` never prompts: an
+# account that needs a password fails at once with a clear message instead
+# of sudo's TTY errors on a session with no terminal (#950). A function, not
+# a variable holding "sudo -n": zsh, a common login shell, does not split an
+# unquoted variable into words, so it would look for a command "sudo -n".
+croft_sudo() {{
+  if [ "$(id -u)" != "0" ] && command -v sudo >/dev/null 2>&1; then
+    sudo -n "$@"
+  else
+    "$@"
+  fi
+}}
 
 # Install system packages with whatever package manager the box ships.
 croft_pkg_install() {{
   if command -v apt-get >/dev/null 2>&1; then
     export DEBIAN_FRONTEND=noninteractive
-    $CROFT_SUDO apt-get update
-    $CROFT_SUDO apt-get install -y "$@"
+    croft_sudo apt-get update
+    croft_sudo apt-get install -y "$@"
   elif command -v dnf >/dev/null 2>&1; then
-    $CROFT_SUDO dnf install -y "$@"
+    croft_sudo dnf install -y "$@"
   elif command -v yum >/dev/null 2>&1; then
-    $CROFT_SUDO yum install -y "$@"
+    croft_sudo yum install -y "$@"
   elif command -v apk >/dev/null 2>&1; then
-    $CROFT_SUDO apk add "$@"
+    croft_sudo apk add "$@"
   elif command -v pacman >/dev/null 2>&1; then
-    $CROFT_SUDO pacman -Sy --noconfirm "$@"
+    croft_sudo pacman -Sy --noconfirm "$@"
   elif command -v zypper >/dev/null 2>&1; then
-    $CROFT_SUDO zypper install -y "$@"
+    croft_sudo zypper install -y "$@"
   else
     return 1
   fi
@@ -3727,18 +3742,18 @@ croft_ensure_build_toolchain() {{
   fi
   if command -v apt-get >/dev/null 2>&1; then
     export DEBIAN_FRONTEND=noninteractive
-    $CROFT_SUDO apt-get update
-    $CROFT_SUDO apt-get install -y build-essential pkg-config
+    croft_sudo apt-get update
+    croft_sudo apt-get install -y build-essential pkg-config
   elif command -v dnf >/dev/null 2>&1; then
-    $CROFT_SUDO dnf install -y gcc make pkgconf-pkg-config
+    croft_sudo dnf install -y gcc make pkgconf-pkg-config
   elif command -v yum >/dev/null 2>&1; then
-    $CROFT_SUDO yum install -y gcc make pkgconfig
+    croft_sudo yum install -y gcc make pkgconfig
   elif command -v apk >/dev/null 2>&1; then
-    $CROFT_SUDO apk add build-base pkgconf
+    croft_sudo apk add build-base pkgconf
   elif command -v pacman >/dev/null 2>&1; then
-    $CROFT_SUDO pacman -Sy --noconfirm base-devel pkgconf
+    croft_sudo pacman -Sy --noconfirm base-devel pkgconf
   elif command -v zypper >/dev/null 2>&1; then
-    $CROFT_SUDO zypper install -y gcc make pkg-config
+    croft_sudo zypper install -y gcc make pkg-config
   else
     echo 'croft: no supported package manager found to install a C toolchain (need cc + pkg-config)' >&2
     return 1
@@ -3752,8 +3767,10 @@ if ! command -v cargo >/dev/null 2>&1; then
       exit 127
     fi
   fi
-  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
-  . "$HOME/.cargo/env"
+  # --no-modify-path: rustup would otherwise append `. "$HOME/.cargo/env"`
+  # to the remote user's ~/.bashrc and ~/.profile (#950). This script puts
+  # ~/.cargo/bin on PATH itself, just below.
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --no-modify-path
 fi
 export PATH="$HOME/.cargo/bin:$PATH"
 # Ensure the C toolchain before compiling, regardless of whether cargo was
@@ -5468,6 +5485,36 @@ Host !blocked *.internal
         assert!(command.contains("cargo install --path \"$HOME/.cache/croft/source\""));
         assert!(command.contains("rustup.rs"));
         assert!(command.contains("printf %s 'abc123' > \"$HOME/.cache/croft/install-stamp\""));
+    }
+
+    /// #950: the on-box compile leaves the remote user's shell startup files
+    /// alone, never waits on a sudo password prompt, and the question asked
+    /// first names what it installs.
+    #[test]
+    fn remote_install_leaves_rc_files_alone_and_never_prompts_for_sudo() {
+        let command = remote_install_command("abc123");
+        let rustup = command
+            .lines()
+            .find(|l| l.contains("sh.rustup.rs"))
+            .expect("rustup bootstraps a box without cargo");
+        assert!(rustup.contains("--no-modify-path"), "{rustup}");
+        assert!(command.contains("sudo -n \"$@\""));
+        assert!(
+            !command.contains("CROFT_SUDO"),
+            "a variable holding `sudo -n` is one word to zsh"
+        );
+        let said = REMOTE_COMPILE_SIDE_EFFECTS.join(" ");
+        for named in [
+            "rustup",
+            "~/.rustup",
+            "~/.cargo",
+            "sudo",
+            "dtach",
+            "curl",
+            "ca-certificates",
+        ] {
+            assert!(said.contains(named), "the prompt names {named}: {said}");
+        }
     }
 
     // The 2026-06-12 "horrendous typing latency on various" report: the

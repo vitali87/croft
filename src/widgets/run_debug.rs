@@ -127,6 +127,43 @@ fn with_bg(style: Style, bg: Option<Color>) -> Style {
     }
 }
 
+/// Word-wrap the panel's feedback line to rows at most `width` display
+/// columns wide (#944): a launch error is the message most worth reading and
+/// is usually far wider than the sidebar, so it gets as many rows as it
+/// needs instead of running across the border into the editor. A word wider
+/// than a row is split at the row's edge.
+fn wrap_feedback(text: &str, width: usize) -> Vec<String> {
+    use unicode_width::UnicodeWidthChar;
+    let width = width.max(1);
+    let mut rows = Vec::new();
+    let mut row = String::new();
+    let mut used = 0;
+    for word in text.split_whitespace() {
+        let w: usize = word.chars().map(|c| c.width().unwrap_or(0)).sum();
+        if used > 0 && used + 1 + w > width {
+            rows.push(std::mem::take(&mut row));
+            used = 0;
+        }
+        if used > 0 {
+            row.push(' ');
+            used += 1;
+        }
+        for c in word.chars() {
+            let cw = c.width().unwrap_or(0);
+            if used + cw > width && used > 0 {
+                rows.push(std::mem::take(&mut row));
+                used = 0;
+            }
+            row.push(c);
+            used += cw;
+        }
+    }
+    if !row.is_empty() {
+        rows.push(row);
+    }
+    rows
+}
+
 /// One wrapped console row: runs of text, each in the style its program
 /// output set (#1501).
 type ConsoleRow = Vec<(String, crate::ansi_text::AnsiStyle)>;
@@ -1332,8 +1369,14 @@ impl Widget for &mut RunDebugPanel {
             } else {
                 Style::default().fg(self.theme.ui(Color::Rgb(0xa3, 0xbe, 0x8c)))
             };
-            buf.set_string(inner.x + 1, next_y, msg.as_str(), style);
-            next_y = next_y.saturating_add(1);
+            let room = inner.width.saturating_sub(2) as usize;
+            for row in wrap_feedback(msg, room) {
+                if next_y >= inner.y + inner.height {
+                    break;
+                }
+                buf.set_stringn(inner.x + 1, next_y, &row, room, style);
+                next_y = next_y.saturating_add(1);
+            }
         }
         // BREAKPOINTS (#250): listed at rest too, so they can be found and
         // cleared without starting a session.
@@ -2049,6 +2092,62 @@ mod tests {
                 Widget::render(&mut panel, area, &mut buf);
             }
         }
+    }
+
+    /// #944: a feedback message wider than the panel wraps onto as many
+    /// rows as it needs, and nothing is painted past the panel's right edge
+    /// into the editor beside it.
+    #[test]
+    fn long_feedback_wraps_inside_the_panel() {
+        let msg =
+            "config \"Run server\": a go launch needs a \"program\" (a package directory or file)";
+        let mut panel = RunDebugPanel::new();
+        panel.set_active_file(Some(PathBuf::from("/work/run_me.py")));
+        panel.runnable = true;
+        panel.feedback = Some(String::from(msg));
+        panel.feedback_is_error = true;
+        let panel_area = Rect {
+            x: 0,
+            y: 0,
+            width: 28,
+            height: 40,
+        };
+        // A wider buffer stands in for the editor to the panel's right.
+        let mut buf = Buffer::empty(Rect {
+            width: 60,
+            ..panel_area
+        });
+        Widget::render(&mut panel, panel_area, &mut buf);
+        let row_text = |y: u16, xs: std::ops::Range<u16>| -> String {
+            xs.map(|x| buf[(x, y)].symbol().to_string()).collect()
+        };
+        for y in 0..40 {
+            assert_eq!(
+                row_text(y, 28..60).trim(),
+                "",
+                "row {y} painted past the panel"
+            );
+        }
+        let shown: Vec<String> = (0..40)
+            .map(|y| row_text(y, 0..28))
+            .filter(|r| r.contains("config") || r.contains("launch") || r.contains("file)"))
+            .collect();
+        assert!(shown.len() >= 2, "the message wraps: {shown:?}");
+        let words: String = (0..40)
+            .map(|y| row_text(y, 1..27).trim().to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            words.contains("directory or file)"),
+            "the end is shown: {words}"
+        );
+    }
+
+    #[test]
+    fn feedback_wraps_on_words_and_splits_a_word_wider_than_a_row() {
+        assert_eq!(wrap_feedback("aa bb cc", 5), vec!["aa bb", "cc"]);
+        assert_eq!(wrap_feedback("abcdefgh", 3), vec!["abc", "def", "gh"]);
+        assert_eq!(wrap_feedback("", 10), Vec::<String>::new());
     }
 
     #[test]

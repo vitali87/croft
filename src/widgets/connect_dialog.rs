@@ -63,6 +63,15 @@ pub struct ConnectDialog {
     pub caret_pos: Option<(u16, u16)>,
     pub submitted: bool,
     pub install_started_at: Option<Instant>,
+    /// What a yes to the slow remote compile also installs (#950), drawn
+    /// in the dialog itself above the answer box while it is asked, so it
+    /// is seen before the answer at any terminal size: the log panel that
+    /// could hold it is the first thing a short terminal drops.
+    pub notes: Vec<String>,
+    /// Whether the last frame drew every row of `notes` and the answer box
+    /// under them. A yes is only taken once it has (#950 review): on a
+    /// window too short to show it all, the question is not yet asked.
+    pub notes_shown: bool,
     /// The active theme: drives the gradient border on Black and every
     /// chrome color. Set by the app before render.
     pub theme: crate::theme::Theme,
@@ -97,6 +106,8 @@ impl ConnectDialog {
             caret_pos: None,
             submitted: false,
             install_started_at: None,
+            notes: Vec::new(),
+            notes_shown: false,
             theme: crate::theme::Theme::default(),
         }
     }
@@ -166,10 +177,13 @@ impl ConnectDialog {
 
     /// The installer cannot use the fast cross-build path and asks whether
     /// to compile on the remote box instead (slow) or abort so the user can
-    /// run `croft setup-cross` and reconnect for the fast install.
-    pub fn set_fallback_prompt(&mut self, reason: &str) {
+    /// run `croft setup-cross` and reconnect for the fast install. `notes`
+    /// says what else a yes installs; the dialog shows it above the answer.
+    pub fn set_fallback_prompt(&mut self, reason: &str, notes: &[&str]) {
         self.phase = DialogPhase::AwaitingFallbackConfirmation;
         self.prompt_text = format!("Fast install unavailable: {reason}");
+        self.notes = notes.iter().map(|n| n.to_string()).collect();
+        self.notes_shown = false;
         self.status_line = default_status_for(&self.phase, &self.host);
         self.input.clear();
         self.submitted = false;
@@ -286,17 +300,64 @@ fn default_status_for(phase: &DialogPhase, host: &str) -> String {
     }
 }
 
+/// The top row of a fallback prompt too tall for the window (#950 review):
+/// a yes is held until the whole question has been on screen.
+const TOO_SHORT_FOR_FALLBACK: &str = "Make the window taller to read the whole question";
+
+/// The fallback prompt's notes as the rows they take at `width` columns:
+/// a heading, then each note word-wrapped behind a `- ` lead (#950).
+fn note_rows(notes: &[String], width: usize) -> Vec<String> {
+    if notes.is_empty() {
+        return Vec::new();
+    }
+    let room = width.saturating_sub(2).max(1);
+    let mut rows = vec![String::from("A remote compile may also:")];
+    for note in notes {
+        let mut line = String::new();
+        let mut first = true;
+        for word in note.split_whitespace() {
+            let len = line.chars().count();
+            if len > 0 && len + 1 + word.chars().count() > room {
+                let lead = if first { "- " } else { "  " };
+                rows.push(format!("{lead}{}", std::mem::take(&mut line)));
+                first = false;
+            }
+            if !line.is_empty() {
+                line.push(' ');
+            }
+            line.push_str(word);
+        }
+        if !line.is_empty() {
+            let lead = if first { "- " } else { "  " };
+            rows.push(format!("{lead}{line}"));
+        }
+    }
+    rows
+}
+
 impl Widget for &mut ConnectDialog {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let installing = matches!(self.phase, DialogPhase::Installing);
         let target_width: u16 = if installing { 100 } else { 72 };
         let width = area.width.min(target_width).max(48);
+        let notes = if matches!(self.phase, DialogPhase::AwaitingFallbackConfirmation) {
+            note_rows(&self.notes, width.saturating_sub(2) as usize)
+        } else {
+            Vec::new()
+        };
+        // The notes sit between the prompt line and the answer box, one
+        // blank row below them, and the dialog grows to hold them.
+        let notes_h = if notes.is_empty() {
+            0
+        } else {
+            notes.len() as u16 + 1
+        };
         let (base_h, logs_h): (u16, u16) = if installing {
             (5, 24)
         } else if self.show_logs {
-            (12, 12)
+            (12 + notes_h, 12)
         } else {
-            (12, 0)
+            (12 + notes_h, 0)
         };
         let height = (base_h + logs_h).min(area.height.saturating_sub(2));
         let x = area.x + area.width.saturating_sub(width) / 2;
@@ -417,6 +478,24 @@ impl Widget for &mut ConnectDialog {
             cy = cy.saturating_add(2);
         }
 
+        // What a yes installs, above the answer box: drawn before it, so
+        // whenever the box is on screen the notes above it are too.
+        let mut notes_drawn = 0;
+        if !notes.is_empty() {
+            let style = Style::default()
+                .fg(self.theme.ui(Color::Rgb(0xe6, 0xed, 0xf5)))
+                .bg(self.theme.ui(PANEL_BG));
+            for row in &notes {
+                if cy >= inner.y + inner.height {
+                    break;
+                }
+                buf.set_stringn(inner.x, cy, row, inner.width as usize, style);
+                cy = cy.saturating_add(1);
+                notes_drawn += 1;
+            }
+            cy = cy.saturating_add(1);
+        }
+
         if self.phase.awaits_input() && cy + 1 < inner.y + inner.height {
             let field_w = inner.width.saturating_sub(2);
             let field_rect = Rect {
@@ -508,6 +587,28 @@ impl Widget for &mut ConnectDialog {
             cy = cy.saturating_add(2);
         }
 
+        self.notes_shown = notes_drawn == notes.len() && self.field_rect.height > 0;
+        if !notes.is_empty() && !self.notes_shown {
+            // The question doesn't fit, and a yes is held until it does: say
+            // so on the top row, the one row a short window always shows.
+            let style = Style::default()
+                .fg(self.theme.ui(RED))
+                .bg(self.theme.ui(PANEL_BG))
+                .add_modifier(Modifier::BOLD);
+            for dx in 0..inner.width {
+                let cell = &mut buf[(inner.x + dx, inner.y)];
+                cell.set_char(' ');
+                cell.set_style(Style::default().bg(self.theme.ui(PANEL_BG)));
+            }
+            buf.set_stringn(
+                inner.x + 1,
+                inner.y,
+                TOO_SHORT_FOR_FALLBACK,
+                inner.width.saturating_sub(1) as usize,
+                style,
+            );
+        }
+        let body_end = cy;
         let footer_y = inner.y + inner.height.saturating_sub(2);
         if footer_y >= cy {
             cy = footer_y;
@@ -578,7 +679,8 @@ impl Widget for &mut ConnectDialog {
         };
 
         if self.show_logs && cy > inner.y + 1 {
-            let log_top = cy.saturating_sub(logs_h);
+            // Never over the prompt, the notes or the answer box.
+            let log_top = cy.saturating_sub(logs_h).max(body_end);
             if log_top > inner.y && log_top < cy {
                 let log_rect = Rect {
                     x: inner.x,
@@ -680,7 +782,7 @@ mod tests {
     #[test]
     fn set_fallback_prompt_awaits_an_explicit_yes() {
         let mut d = ConnectDialog::new("gitcgr".to_string());
-        d.set_fallback_prompt("`cargo-zigbuild` not found");
+        d.set_fallback_prompt("`cargo-zigbuild` not found", &[]);
         assert_eq!(d.phase, DialogPhase::AwaitingFallbackConfirmation);
         assert!(d.phase.awaits_input());
         assert!(d.prompt_text.contains("cargo-zigbuild"));
@@ -690,6 +792,69 @@ mod tests {
         );
         assert!(!d.input_is_secret());
         assert!(d.show_logs, "the skip reason lives in the log panel");
+    }
+
+    /// #950 review: what a yes to the slow compile installs is drawn in the
+    /// dialog above the answer box, whole, even on a terminal too short to
+    /// show the log panel.
+    #[test]
+    fn fallback_notes_are_drawn_above_the_answer_box_on_a_short_terminal() {
+        let notes = [
+            "If Rust is missing there, rustup installs it into ~/.rustup and ~/.cargo (about 1 GB); shell startup files are left alone.",
+            "If a C compiler, pkg-config or dtach is missing, or curl and ca-certificates to fetch Rust, the system package manager installs them, through `sudo -n` when not root.",
+        ];
+        for (w, h) in [(80u16, 18u16), (48, 22), (200, 50)] {
+            let mut d = ConnectDialog::new("devbox".to_string());
+            d.set_fallback_prompt("`cargo-zigbuild` not found", &notes);
+            let area = Rect::new(0, 0, w, h);
+            let mut buf = Buffer::empty(area);
+            Widget::render(&mut d, area, &mut buf);
+            let field = d.field_rect;
+            let inner = d.last_inner;
+            assert!(field.height > 0, "{w}x{h}: the answer box is drawn");
+            assert!(d.notes_shown, "{w}x{h}");
+            let above: String = (inner.y..field.y)
+                .map(|y| {
+                    (inner.x..inner.right())
+                        .map(|x| buf[(x, y)].symbol().to_string())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            let shown: Vec<&str> = above.split_whitespace().collect();
+            for word in notes.iter().flat_map(|n| n.split_whitespace()) {
+                assert!(
+                    shown.contains(&word),
+                    "{w}x{h}: {word:?} is shown above the box"
+                );
+            }
+        }
+    }
+
+    /// #950 review: a window too short for the notes and the answer box
+    /// says so, so the app can hold a yes until they have been seen.
+    #[test]
+    fn a_window_too_short_for_the_fallback_notes_reports_them_unseen() {
+        let mut d = ConnectDialog::new("devbox".to_string());
+        d.set_fallback_prompt("no cross toolchain", &["one note", "another note"]);
+        for (h, seen) in [(12u16, false), (24, true)] {
+            let area = Rect::new(0, 0, 80, h);
+            let mut buf = Buffer::empty(area);
+            Widget::render(&mut d, area, &mut buf);
+            assert_eq!(d.notes_shown, seen, "80x{h}");
+            let screen: String = (0..h)
+                .map(|y| {
+                    (0..80)
+                        .map(|x| buf[(x, y)].symbol().to_string())
+                        .collect::<String>()
+                })
+                .collect();
+            assert_eq!(
+                screen.contains(TOO_SHORT_FOR_FALLBACK),
+                !seen,
+                "80x{h}: the window says when it is too short"
+            );
+        }
     }
 
     #[test]

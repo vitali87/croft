@@ -20,7 +20,8 @@ use crate::theme::Theme;
 
 const FG: Color = Color::Rgb(0xC0, 0xC5, 0xCE);
 const DIM: Color = Color::Rgb(0x60, 0x68, 0x78);
-const CODE: Color = Color::Rgb(0xD0, 0x87, 0x70);
+/// Inline code's colour, shared with the welcome card's release notes.
+pub(crate) const CODE: Color = Color::Rgb(0xD0, 0x87, 0x70);
 /// How far a `$$` display block sits in from its paragraph (#1564).
 const MATH_INDENT: &str = "    ";
 const RULE_COLS: usize = 60;

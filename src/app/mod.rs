@@ -6450,12 +6450,64 @@ fn welcome_note_summary_width(block_w: u16) -> u16 {
     block_w.saturating_sub(WELCOME_NOTE_GUTTER).max(1)
 }
 
+/// A note's summary wrapped to the card, its inline Markdown markers already
+/// removed (#954) so the height measure and the paint wrap the same text.
 fn wrapped_welcome_note_summary(
     note: &crate::release_notes::ReleaseNote,
     block_w: u16,
 ) -> Vec<String> {
     let w = welcome_note_summary_width(block_w);
-    wrap_cells_variable_width(note.summary, w, w)
+    let (text, _) = crate::release_notes::inline_markup(note.summary);
+    wrap_cells_variable_width(&text, w, w)
+}
+
+/// The wrapped `lines` of a note as styled lines (#954): wrapping only moves
+/// and collapses whitespace, so the non-space characters of `lines` are those
+/// of the summary's text in order, and each takes its own style back.
+fn styled_welcome_note_lines(
+    note: &crate::release_notes::ReleaseNote,
+    lines: &[String],
+    plain: Style,
+    code: Style,
+) -> Vec<ratatui::text::Line<'static>> {
+    use crate::release_notes::Inline;
+    let (text, styles) = crate::release_notes::inline_markup(note.summary);
+    let mut marks = text
+        .chars()
+        .zip(styles)
+        .filter(|(c, _)| !c.is_whitespace())
+        .map(|(_, s)| s);
+    lines
+        .iter()
+        .map(|line| {
+            let mut spans: Vec<ratatui::text::Span<'static>> = Vec::new();
+            let mut run = String::new();
+            let mut run_style = plain;
+            for c in line.chars() {
+                let style = if c.is_whitespace() {
+                    plain
+                } else {
+                    match marks.next().unwrap_or(Inline::Plain) {
+                        Inline::Plain => plain,
+                        Inline::Bold => plain.add_modifier(Modifier::BOLD),
+                        Inline::Code => code,
+                    }
+                };
+                if style != run_style && !run.is_empty() {
+                    spans.push(ratatui::text::Span::styled(
+                        std::mem::take(&mut run),
+                        run_style,
+                    ));
+                }
+                run_style = style;
+                run.push(c);
+            }
+            if !run.is_empty() {
+                spans.push(ratatui::text::Span::styled(run, run_style));
+            }
+            ratatui::text::Line::from(spans)
+        })
+        .collect()
 }
 
 fn welcome_note_row_height(note: &crate::release_notes::ReleaseNote, block_w: u16) -> u16 {
@@ -13385,7 +13437,10 @@ impl App {
     /// The scope-header lines to pin as sticky scroll: the enclosing symbols of
     /// the top visible line whose header has scrolled above the viewport,
     /// outermost first, capped. Empty when the feature does not apply (welcome
-    /// screen, preview tab, no outline, or nothing scrolled off).
+    /// screen, preview tab, no outline, or nothing scrolled off). The header
+    /// is the symbol's name line (its `selectionRange`), not where its range
+    /// starts: a decorated Python `def` or `class` starts at `@route(...)`,
+    /// which names nothing and could be pinned over the `class` line (#940).
     fn build_sticky_lines(&self) -> Vec<u32> {
         let Some(path) = self.editor.path.as_deref() else {
             return Vec::new();
@@ -13400,7 +13455,7 @@ impl App {
         let symbols = self.outline.symbols();
         breadcrumb_symbol_chain(symbols, top, 0)
             .into_iter()
-            .map(|i| symbols[i].range_start_line)
+            .map(|i| symbols[i].line)
             .filter(|&l| l < top)
             .take(STICKY_SCROLL_MAX)
             .collect()
@@ -18470,15 +18525,16 @@ impl App {
                         .add_modifier(Modifier::BOLD),
                 );
                 let lines = wrapped_welcome_note_summary(note, inner_w_actual);
-                for (line_idx, line) in lines.iter().enumerate() {
+                let code_style = row_style.fg(self.theme.ui(crate::markdown::CODE));
+                let styled = styled_welcome_note_lines(note, &lines, row_style, code_style);
+                for (line_idx, line) in styled.iter().enumerate() {
                     let line_y = row_y + line_idx as u16;
                     if line_y >= last_row {
                         break;
                     }
-                    let clipped: String = line.chars().take(summary_w as usize).collect();
                     frame
                         .buffer_mut()
-                        .set_string(summary_x, line_y, clipped, row_style);
+                        .set_line(summary_x, line_y, line, summary_w);
                 }
                 row_y = row_y.saturating_add(lines.len().max(1) as u16);
             }
@@ -26747,6 +26803,7 @@ impl App {
         }
         let capture =
             self.macro_recording.is_some() && !self.macro_replaying && self.focus == Pane::Editor;
+        let palette_before = self.command_palette.is_some();
         // Esc Esc leaves Zen Mode (#1585), counting only Escapes in the
         // editor that closed or cleared nothing: one that dismisses a popup
         // or a selection is that, not half of the pair.
@@ -26757,6 +26814,8 @@ impl App {
             && key.kind == KeyEventKind::Press;
         let before = zen_esc.then(|| self.esc_fingerprint());
         let result = self.recording_file_switches(|app| app.handle_key_inner(key));
+        // A line Enter only indented is cleared once the caret leaves it.
+        self.trim_auto_indents();
         if leader_armed {
             let chord = self.screencast.take_chord_step();
             self.screencast
@@ -26775,7 +26834,9 @@ impl App {
         // is dropped, producing a macro that replays a focus change and then
         // silently loses its payload.
         if capture && self.macro_recording.is_some() {
-            if self.focus == Pane::Editor {
+            if palette_before || self.command_palette.is_some() {
+                self.hold_palette_macro_key(key, palette_before);
+            } else if self.focus == Pane::Editor {
                 self.record_macro_key(key);
             } else {
                 // The issue asks for skipped keys to be logged rather than
@@ -29387,7 +29448,7 @@ impl App {
                     breakpoints,
                 ) {
                     Ok(session) => {
-                        self.debug_sessions.replace_with(name.clone(), session);
+                        self.adopt_debug_session(name.clone(), session, LaunchSlot::Replace);
                         self.run_debug.feedback = Some(format!("Debugging test {name}{using}"));
                         self.run_debug.feedback_is_error = false;
                         let lead = with_python_note(
@@ -29598,7 +29659,7 @@ impl App {
             breakpoints,
         ) {
             Ok(session) => {
-                self.debug_sessions.replace_with(name, session);
+                self.adopt_debug_session(name, session, LaunchSlot::Replace);
                 self.run_debug.feedback = Some(format!("Debugging test {name} (lldb)"));
                 self.run_debug.feedback_is_error = false;
                 self.status = self.with_failure_note(format!(
@@ -37495,13 +37556,8 @@ impl App {
             }
         };
         match result {
-            Ok(mut session) => {
-                // Held until `initialized`, then pushed with the rest (#611).
-                session.set_function_breakpoints(self.function_breakpoints.clone());
-                match slot {
-                    LaunchSlot::Replace => self.debug_sessions.replace_with(&name, session),
-                    LaunchSlot::Add => self.debug_sessions.push(&name, session),
-                }
+            Ok(session) => {
+                self.adopt_debug_session(&name, session, slot);
                 let verb = match rc.request {
                     RequestKind::Launch => "Debugging",
                     RequestKind::Attach => "Attached:",
@@ -37627,7 +37683,7 @@ impl App {
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default();
-                self.debug_sessions.replace_with(name.clone(), session);
+                self.adopt_debug_session(name.clone(), session, LaunchSlot::Replace);
                 self.run_debug.feedback = Some(format!("Debugging {name}"));
                 self.run_debug.feedback_is_error = false;
                 let lead = with_python_note(format!("Debugging {name}"), note.as_deref());
@@ -37667,7 +37723,7 @@ impl App {
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default();
-                self.debug_sessions.replace_with(name.clone(), session);
+                self.adopt_debug_session(name.clone(), session, LaunchSlot::Replace);
                 self.run_debug.feedback = Some(format!("Debugging {name}"));
                 self.run_debug.feedback_is_error = false;
                 self.status =
@@ -37720,7 +37776,7 @@ impl App {
         );
         match crate::dap::session::DapSession::launch_delve(&dlv, &dir, request, breakpoints) {
             Ok(session) => {
-                self.debug_sessions.replace_with(name.to_string(), session);
+                self.adopt_debug_session(name.to_string(), session, LaunchSlot::Replace);
                 self.run_debug.feedback = Some(format!("Debugging test {name}"));
                 self.run_debug.feedback_is_error = false;
                 self.status = self.with_failure_note(format!(
@@ -37770,7 +37826,7 @@ impl App {
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default();
-                self.debug_sessions.replace_with(name.clone(), session);
+                self.adopt_debug_session(name.clone(), session, LaunchSlot::Replace);
                 self.run_debug.feedback = Some(format!("Debugging {name}"));
                 self.run_debug.feedback_is_error = false;
                 self.status =
@@ -37924,7 +37980,7 @@ impl App {
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default();
-                self.debug_sessions.replace_with(name.clone(), session);
+                self.adopt_debug_session(name.clone(), session, LaunchSlot::Replace);
                 self.run_debug.feedback = Some(format!("Debugging {name} (lldb)"));
                 self.run_debug.feedback_is_error = false;
                 self.status =
@@ -38179,6 +38235,24 @@ impl App {
         }
         if refused && !names.is_empty() {
             self.status = String::from("This debugger does not support function breakpoints");
+        }
+    }
+
+    /// Install a freshly launched debug session, replacing the running ones
+    /// or, for a compound member, beside them. Every launch path comes
+    /// through here so the stored function breakpoints go with each new
+    /// session (held until `initialized`, then pushed with the rest): set one
+    /// and press F5 with no launch.json, and the program still pauses (#939).
+    fn adopt_debug_session(
+        &mut self,
+        name: impl Into<String>,
+        mut session: crate::dap::session::DapSession,
+        slot: LaunchSlot,
+    ) {
+        session.set_function_breakpoints(self.function_breakpoints.clone());
+        match slot {
+            LaunchSlot::Replace => self.debug_sessions.replace_with(name, session),
+            LaunchSlot::Add => self.debug_sessions.push(name, session),
         }
     }
 
@@ -47572,7 +47646,11 @@ impl App {
                 crate::install_session::InstallEvent::CanLaunch => can_launch = true,
                 crate::install_session::InstallEvent::FallbackPrompt { reason } => {
                     if let Some(dialog) = self.connect_dialog.as_mut() {
-                        dialog.set_fallback_prompt(&reason);
+                        // What a yes installs, shown before the answer (#950).
+                        dialog.set_fallback_prompt(
+                            &reason,
+                            &crate::remote::REMOTE_COMPILE_SIDE_EFFECTS,
+                        );
                     } else if let Some(session) = self.install_session.as_ref() {
                         // No dialog to ask through: decline so the installer
                         // errors out with the `croft setup-cross` guidance
@@ -48901,6 +48979,17 @@ impl App {
         let proceed = matches!(payload.trim().to_ascii_lowercase().as_str(), "y" | "yes");
         if proceed {
             if let Some(dialog) = self.connect_dialog.as_mut() {
+                // What a yes installs must have been on screen (#950): a
+                // window too short to show it all keeps the question open.
+                if !dialog.notes.is_empty() && !dialog.notes_shown {
+                    dialog.error = Some(String::from(
+                        "Make the window taller to read what a remote compile installs, then answer",
+                    ));
+                    // Emptied, so the y typed again once it fits is a yes,
+                    // not "yy".
+                    dialog.clear_input();
+                    return;
+                }
                 dialog.set_installing();
             }
             if let Some(session) = self.install_session.as_ref() {
@@ -57998,6 +58087,66 @@ impl App {
         }
     }
 
+    /// Hold back a recorded key that opened or went into the Command Palette
+    /// (#952) until the palette closes: it then joins the macro with the rest
+    /// of that palette session, so a palette command replays whole. The
+    /// session that runs Macro: Start/Stop Recording never gets here with
+    /// its Enter, because stopping drops the recording and what it held.
+    /// One the palette was opened for without a key (a click) is dropped:
+    /// replayed without the chord, its query would be typed into the file.
+    /// So is one whose command took focus out of the editor, such as
+    /// Terminal: Focus Terminal: the click that brings it back is not
+    /// recorded, so a replay would type the keys after it into the shell.
+    fn hold_palette_macro_key(&mut self, key: crossterm::event::KeyEvent, palette_before: bool) {
+        let open_now = self.command_palette.is_some();
+        let in_editor = self.focus == Pane::Editor;
+        let Some(rec) = self.macro_recording.as_mut() else {
+            return;
+        };
+        if !palette_before {
+            // The key that opened the palette starts a session that
+            // replays; whatever an earlier one held was never closed by a
+            // key, so it has nothing to replay.
+            rec.palette_keys.clear();
+            rec.palette_keys.push(key);
+        } else if !rec.palette_keys.is_empty() {
+            rec.palette_keys.push(key);
+        } else {
+            crate::output::push(
+                "Macros",
+                crate::output::OutputLevel::Info,
+                &format!("skipped {key:?}: the palette was not opened from the keyboard"),
+            );
+        }
+        if open_now {
+            return;
+        }
+        let held = std::mem::take(&mut rec.palette_keys);
+        if in_editor {
+            for k in held {
+                rec.recorded.push_key(k);
+            }
+        } else if !held.is_empty() {
+            crate::output::push(
+                "Macros",
+                crate::output::OutputLevel::Info,
+                "skipped a palette command that left the editor: recording captures the editor pane only",
+            );
+        }
+    }
+
+    /// Drop what a palette session held for the macro once the palette has
+    /// closed without a key, as a click outside it or on a row does (#952):
+    /// a session that is never closed from the keyboard has nothing that
+    /// replays, and a later session must not pick its keys up.
+    fn drop_unkeyed_palette_macro_keys(&mut self) {
+        if self.command_palette.is_none()
+            && let Some(rec) = self.macro_recording.as_mut()
+        {
+            rec.palette_keys.clear();
+        }
+    }
+
     /// Start recording into `register` (vim `q{a-z}`) or into the unnamed
     /// last-recording slot (the palette command). Starting while already
     /// recording stops instead, so one gesture toggles.
@@ -58009,6 +58158,7 @@ impl App {
         self.macro_recording = Some(crate::macros::Recording {
             register,
             recorded: crate::macros::Macro::default(),
+            palette_keys: Vec::new(),
         });
         // One source of truth: vim's `q` branches on this, and a copy the
         // machine kept for itself drifted whenever the palette was used.
@@ -62403,6 +62553,18 @@ impl App {
             );
         }
         self.recording_file_switches(|app| app.handle_mouse_inner(m));
+        self.drop_unkeyed_palette_macro_keys();
+        self.trim_auto_indents();
+    }
+
+    /// Clear the indentation Enter left on a line the caret has since left
+    /// (#956), in every tab of every editor group: a key or click that
+    /// switched tabs or groups has left the line in the one it came from.
+    fn trim_auto_indents(&mut self) {
+        self.editor.trim_auto_indents(true);
+        for group in self.editor_layout.inactive_groups_mut() {
+            group.trim_auto_indents(false);
+        }
     }
 
     fn handle_mouse_inner(&mut self, m: MouseEvent) {
