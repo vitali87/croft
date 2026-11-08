@@ -424,9 +424,20 @@ impl FsWatch {
             self.poll_interval = Self::back_off(poll_start);
             return out;
         }
+        // One refresh of a compact row (#1486) re-reads every folder it
+        // shows, so the others in its chain are skipped: a chain just
+        // expanded is all new stamps, and refreshing the row once per folder
+        // would read the chain that many times over.
+        let mut reread: BTreeSet<PathBuf> = BTreeSet::new();
         for dir in changed_dirs.iter().rev() {
+            if reread.contains(dir) {
+                continue;
+            }
             if let Some(idx) = tree.index_of_dir(dir) {
                 tree.refresh_children(idx);
+                if let Some(row) = tree.nodes.get(idx) {
+                    reread.extend(row.shown_paths().map(Path::to_path_buf));
+                }
             }
         }
         self.poll_dir_mtimes = Self::snapshot_expanded_dir_mtimes(tree);
