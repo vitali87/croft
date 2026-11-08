@@ -24,7 +24,7 @@ const COLOR_MSG: Color = Color::Rgb(0xCC, 0xCC, 0xCC);
 
 /// Keep the newest N captures; a chatty trigger on a huge build log must
 /// not grow without bound.
-const CAPTURES_MAX: usize = 500;
+pub(crate) const CAPTURES_MAX: usize = 500;
 
 /// One captured output line.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,11 +38,11 @@ pub struct CapturedLine {
     pub message: String,
     /// The whole escape-stripped output line that matched.
     pub line: String,
-    /// Where the line started in its pane, as a scroll-clock content id
-    /// ([`crate::triggers::TriggerHit::row`]): a line repeated by every
+    /// The capturing pane's id for the row the line started on
+    /// ([`crate::triggers::TriggerHit::anchor`]): a line repeated by every
     /// re-run jumps to this copy, not the newest (#1450). None when it is
     /// not known, and the jump takes the newest match.
-    pub row: Option<i64>,
+    pub anchor: Option<u64>,
 }
 
 /// Rows of pane context on each side of a captured line that ride an ask
@@ -337,7 +337,7 @@ mod tests {
             shell_pid: None,
             message: "build failed".into(),
             line: "error: could not compile `croft`".into(),
-            row: None,
+            anchor: None,
         };
         let context: Vec<String> = (0..3).map(|i| format!("ctx {i}")).collect();
         let (instruction, excerpt) = ask_prompt(&entry, &context, |t| t.to_string());
@@ -364,7 +364,7 @@ mod tests {
             shell_pid: None,
             message: "AKIAIOSFODNN7EXAMPLE".into(),
             line: "curl -H 'Authorization: Bearer AKIAIOSFODNN7EXAMPLE' failed".into(),
-            row: None,
+            anchor: None,
         };
         let context = vec![String::from("export TOKEN=AKIAIOSFODNN7EXAMPLE")];
         let mask = |t: &str| t.replace("AKIAIOSFODNN7EXAMPLE", "\u{2022}\u{2022}\u{2022}\u{2022}");

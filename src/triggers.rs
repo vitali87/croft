@@ -122,11 +122,11 @@ pub struct TriggerHit {
     /// the scan that fired it. The pane's reader stops its parser there to
     /// read where the line landed (#1450).
     pub end: usize,
-    /// The grid row the line starts on, as a scroll-clock content id (the
-    /// row's grid line plus the clock reading, which output scrolling past
-    /// leaves unchanged). Set by the pane's reader for `capture` hits, so
-    /// the jump finds THIS line and not its newest repeat; None otherwise.
-    pub row: Option<i64>,
+    /// The pane's id for the row the line starts on, set by its reader for
+    /// `capture` hits. The pane keeps that row and moves it with the output
+    /// (scrolling, a resize re-wrapping it), so the jump finds THIS line and
+    /// not its newest repeat; None otherwise.
+    pub anchor: Option<u64>,
 }
 
 pub fn triggers_path() -> PathBuf {
@@ -799,7 +799,7 @@ impl TriggerScanner {
                         message: interpolate(t.message.as_deref(), &caps),
                         line: line.to_string(),
                         end,
-                        row: None,
+                        anchor: None,
                     });
                 }
             }
@@ -1152,7 +1152,7 @@ mod tests {
                 message: String::from("build: FAILED"),
                 line: String::from("BUILD FAILED"),
                 end: 1,
-                row: None,
+                anchor: None,
             }]
         );
         out.clear();

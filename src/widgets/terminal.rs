@@ -729,6 +729,9 @@ pub struct PtyTerminal {
     /// `inline=1`, the imgcat protocol), anchored like marks. Capped at
     /// [`IMAGES_MAX`]; the app overlays the newest visible one.
     images: Arc<std::sync::Mutex<Vec<StoredImage>>>,
+    /// Where the lines `capture` triggers caught start (#1450), recorded by
+    /// the reader thread. Lock order: term → clock → capture_rows.
+    capture_rows: Arc<std::sync::Mutex<CaptureRows>>,
     /// The last few minutes of this pane's output, for Session: Rewind
     /// (#357). Written by the reader thread as chunks arrive; bounded by
     /// bytes, so a `yes`-style flood evicts rather than grows.
@@ -764,6 +767,12 @@ pub struct PaneImage {
 
 /// Most inline images kept per pane; older ones scroll away like text.
 const IMAGES_MAX: usize = 4;
+
+/// How many rows either side of its recorded row a captured line is still
+/// looked for (#1450). The row is read with the parser stopped right after
+/// the line, so it is exact unless a program moved the cursor around the
+/// line; looking any further could land on another run's copy.
+const CAPTURE_SLACK: i32 = 2;
 
 /// One quick-select hint for the render loop: the match span on absolute
 /// grid line `line` (char indices into the spacer-skipped row text; the
@@ -893,28 +902,120 @@ impl RunningCommand {
     }
 }
 
-/// Where the reader thread stops the parser inside one read: at a shell
-/// mark, to sample the cursor where it landed, at a wipe, to move the
-/// running command's output start past it, or right after a line a
-/// `capture` trigger caught (the index of its hit), to read the row the
-/// line landed on (#1450).
+/// Where the reader thread stops the parser inside one read:
+/// * at a shell mark, to sample the cursor where it landed;
+/// * at a wipe, to move the running command's output start past it;
+/// * right after a line a `capture` trigger caught (the index of its hit),
+///   to record the row the line starts on (#1450).
 enum ReadStop {
     Mark(crate::shell_integration::OscEvent),
     Wipe(Wipe),
     Capture(usize),
 }
 
-/// The row the line the parser just completed starts on, as a scroll-clock
-/// content id (grid line plus clock reading). The parser stands just past
-/// the line's newline, so the line ended on the row above the cursor and
-/// starts where that row's soft wraps begin.
-fn completed_line_row(term: &mut Term<VoidListener>, clock: &mut ScrollClock) -> i64 {
-    let top = term.grid().topmost_line().0;
-    let mut line = term.grid().cursor.point.line.0 - 1;
-    while line > top && row_wraps(term, line - 1) {
-        line -= 1;
+/// Where each line a `capture` trigger caught starts in its pane (#1450),
+/// by the id its hit carries to the CAPTURES entry. A row is stored as a
+/// scroll-clock content id (grid line plus clock reading), which output
+/// scrolling past leaves unchanged. A wipe that erases a row drops it, and
+/// a resize, which re-wraps lines by different numbers of rows that one
+/// clock shift cannot follow, re-finds every row by its place among the
+/// lines above the cursor ([`Self::reflow`]). Ids come from the
+/// process-wide [`next_mark_id`], so one never names another pane's row.
+#[derive(Default)]
+struct CaptureRows(std::collections::BTreeMap<u64, i64>);
+
+impl CaptureRows {
+    /// Record the line the parser just completed and return its id. The
+    /// parser stands just past the line's newline, so the line ended on the
+    /// row above the cursor and starts where that row's soft wraps begin.
+    /// Past the CAPTURES panel's cap the oldest are dropped.
+    fn record(&mut self, term: &mut Term<VoidListener>, clock: &mut ScrollClock) -> u64 {
+        let top = term.grid().topmost_line().0;
+        let mut line = term.grid().cursor.point.line.0 - 1;
+        while line > top && row_wraps(term, line - 1) {
+            line -= 1;
+        }
+        let id = next_mark_id();
+        self.0.insert(id, clock.tick(term) + i64::from(line));
+        while self.0.len() > crate::widgets::captures::CAPTURES_MAX {
+            self.0.pop_first();
+        }
+        id
     }
-    clock.tick(term) + i64::from(line)
+
+    /// The grid line `id`'s row is on at clock reading `now`, or None once
+    /// it was erased.
+    fn line(&self, id: u64, now: i64) -> Option<i64> {
+        self.0.get(&id).map(|row| row - now)
+    }
+
+    /// Drop the rows a wipe that just landed erased, `now` being the clock
+    /// read right after it (the same test as [`RunningCommand::follow_wipe`]).
+    fn follow_wipe(&mut self, wipe: Wipe, now: i64) {
+        self.0.retain(|_, row| {
+            let line = *row - now;
+            !((line >= 0 && wipe.screen) || (line < 0 && wipe.hist))
+        });
+    }
+
+    /// Carry every row across `resize`. A resize re-wraps a soft-wrapped
+    /// line onto more or fewer rows, but keeps every line and their order
+    /// (short of the scrollback overflowing, which drops the oldest), and
+    /// the cursor stays on its line. So a row's place in the list of line
+    /// starts counted up from the cursor survives it, and so does a row
+    /// below the cursor. The alternate screen holds the primary grid out of
+    /// reach, so a resize under a full-screen program moves nothing here.
+    fn reflow(
+        &mut self,
+        term: &mut Term<VoidListener>,
+        clock: &mut ScrollClock,
+        resize: impl FnOnce(&mut Term<VoidListener>),
+    ) {
+        if self.0.is_empty() || term.mode().contains(TermMode::ALT_SCREEN) {
+            resize(term);
+            return;
+        }
+        let now = clock.tick(term);
+        let before = line_starts_upward(term);
+        let top = i64::from(term.grid().topmost_line().0);
+        let cursor = i64::from(term.grid().cursor.point.line.0);
+        // (id, Ok(place among the line starts) | Err(line below the cursor))
+        let held: Vec<(u64, Result<usize, i64>)> = std::mem::take(&mut self.0)
+            .into_iter()
+            .filter_map(|(id, row)| {
+                let line = row - now;
+                let at = if line > cursor {
+                    Err(line)
+                } else {
+                    Ok(before.partition_point(|&s| i64::from(s) > line))
+                };
+                (line >= top).then_some((id, at))
+            })
+            .collect();
+        resize(term);
+        let now = clock.tick(term);
+        let after = line_starts_upward(term);
+        for (id, at) in held {
+            let line = match at {
+                Ok(k) => after.get(k).map(|&l| i64::from(l)),
+                Err(line) => Some(line),
+            };
+            if let Some(line) = line {
+                self.0.insert(id, now + line);
+            }
+        }
+    }
+}
+
+/// The rows that start a logical line, from the cursor's line up to the top
+/// of the scrollback.
+fn line_starts_upward(term: &Term<VoidListener>) -> Vec<i32> {
+    let top = term.grid().topmost_line().0;
+    let cursor = term.grid().cursor.point.line.0;
+    (top..=cursor)
+        .rev()
+        .filter(|&l| l == top || !row_wraps(term, l - 1))
+        .collect()
 }
 
 /// A finished command derived from the OSC 133 marks: the grid line of the
@@ -2137,6 +2238,8 @@ impl PtyTerminal {
         let marks_for_thread = marks.clone();
         let images = Arc::new(std::sync::Mutex::new(Vec::<StoredImage>::new()));
         let images_for_thread = images.clone();
+        let capture_rows = Arc::new(std::sync::Mutex::new(CaptureRows::default()));
+        let capture_rows_for_thread = capture_rows.clone();
         // Shutdown pipe + master fd for the reader's poll gate: the reader
         // must be wakeable without depending on the pty ever reaching EOF.
         let (shutdown_r, shutdown_w) = std::io::pipe().context("shutdown pipe")?;
@@ -2396,16 +2499,17 @@ impl PtyTerminal {
                                     if w.screen && w.hist {
                                         program_status_for_thread.lock().unwrap().reset();
                                     }
+                                    let now = clock_for_thread.lock().unwrap().tick(&mut t);
                                     if let Some(run) = running.as_mut() {
-                                        let now = clock_for_thread.lock().unwrap().tick(&mut t);
                                         run.follow_wipe(w, now);
                                     }
+                                    capture_rows_for_thread.lock().unwrap().follow_wipe(w, now);
                                     continue;
                                 }
                                 ReadStop::Capture(i) => {
                                     let mut clock = clock_for_thread.lock().unwrap();
-                                    trigger_hits[i].row =
-                                        Some(completed_line_row(&mut t, &mut clock));
+                                    let mut rows = capture_rows_for_thread.lock().unwrap();
+                                    trigger_hits[i].anchor = Some(rows.record(&mut t, &mut clock));
                                     continue;
                                 }
                             };
@@ -2700,6 +2804,7 @@ impl PtyTerminal {
             watch_rx,
             palette: crate::theme::VSCODE_ANSI,
             images,
+            capture_rows,
             rewind,
             #[cfg(test)]
             written_for_test: Arc::new(std::sync::Mutex::new(Vec::new())),
@@ -3209,22 +3314,23 @@ impl PtyTerminal {
             .collect()
     }
 
-    /// The grid line where a captured line starts, or `None`. `row` is the
-    /// row the pane's reader saw the line start on
-    /// ([`crate::triggers::TriggerHit::row`]): the matching row nearest it
-    /// wins, the upper one on a tie, so a line every re-run prints again
-    /// finds its own copy rather than the newest (#1450), and once that row
-    /// has rotated off the scrollback the line is gone, not stood in for
-    /// by a later copy. Without a row the newest match wins. The
-    /// straight case is a row carrying `needle` as a prefix; a pane
-    /// narrower than the needle instead shows the line's FIRST WRAPPED ROW,
-    /// whose text is a prefix OF the needle. That reverse arm is gated on
-    /// real wrap metadata, not row length: the row must itself soft-wrap
-    /// (WRAPLINE on its last cell) — otherwise any short unrelated row
-    /// sharing the prefix would win — and continuation rows (the PREVIOUS
-    /// row wraps) never match either arm, or a later continuation sharing
-    /// the prefix would beat the true start under the newest-first scan.
-    pub fn find_captured_line(&self, needle: &str, row: Option<i64>) -> Option<i32> {
+    /// The grid line where a captured line starts, or `None`. `anchor` is
+    /// this pane's id for the row its reader saw the line start on
+    /// ([`crate::triggers::TriggerHit::anchor`]): that row, or the matching
+    /// row nearest it within [`CAPTURE_SLACK`] (the upper one on a tie), so a
+    /// line every re-run prints again finds its own copy rather than the
+    /// newest (#1450). Once the row was erased or rotated off the scrollback
+    /// the line is gone, never stood in for by another copy. Without an
+    /// anchor the newest match wins. The straight case is a row carrying
+    /// `needle` as a prefix; a pane narrower than the needle instead shows
+    /// the line's FIRST WRAPPED ROW, whose text is a prefix OF the needle.
+    /// That reverse arm is gated on real wrap metadata, not row length: the
+    /// row must itself soft-wrap (WRAPLINE on its last cell) — otherwise any
+    /// short unrelated row sharing the prefix would win — and continuation
+    /// rows (the PREVIOUS row wraps) never match either arm, or a later
+    /// continuation sharing the prefix would beat the true start under the
+    /// newest-first scan.
+    pub fn find_captured_line(&self, needle: &str, anchor: Option<u64>) -> Option<i32> {
         if needle.is_empty() {
             return None;
         }
@@ -3246,15 +3352,16 @@ impl PtyTerminal {
             let t = text.trim_end();
             !t.is_empty() && (t.starts_with(needle) || (wraps(line) && needle.starts_with(t)))
         };
-        let Some(row) = row else {
+        let Some(id) = anchor else {
             return (top..=bottom).rev().find(|&line| starts(line));
         };
-        let at = row - self.clock_now(&term);
+        let now = self.clock_now(&term);
+        let at = self.capture_rows.lock().unwrap().line(id, now)?;
         if at < i64::from(top) {
             return None;
         }
         let at = at.min(i64::from(bottom)) as i32;
-        (0..=bottom - top).find_map(|d| [at - d, at + d].into_iter().find(|&line| starts(line)))
+        (0..=CAPTURE_SLACK).find_map(|d| [at - d, at + d].into_iter().find(|&line| starts(line)))
     }
 
     /// Every annotation translated against an EXPLICIT clock reading — the
@@ -4461,6 +4568,9 @@ impl PtyTerminal {
         // the fresh prompt.
         self.images.lock().unwrap().clear();
         self.marks.lock().unwrap().clear();
+        // The captured lines' rows go too: a CAPTURES entry must say its
+        // line is gone, not jump to a copy printed after the Clear (#1450).
+        self.capture_rows.lock().unwrap().0.clear();
         self.pty_dirty.store(true, Ordering::Release);
     }
 
@@ -4503,7 +4613,12 @@ impl PtyTerminal {
         // size.
         let mut term = self.term.lock();
         let size = TermSize::new(cols as usize, rows as usize);
-        resize_term(&mut term, size);
+        let mut clock = self.clock.lock().unwrap();
+        self.capture_rows
+            .lock()
+            .unwrap()
+            .reflow(&mut term, &mut clock, |term| resize_term(term, size));
+        drop(clock);
         self.backend.resize(cols, rows);
         drop(term);
         self.pty_dirty.store(true, Ordering::Release);

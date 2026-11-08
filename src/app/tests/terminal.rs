@@ -3549,6 +3549,12 @@ fn app_with_captures(script: &str, want: usize) -> (tempfile::TempDir, App) {
     .unwrap();
     app.drain_terminal_bells();
     app.terminals[0].write_input(b"\n");
+    await_captures(&mut app, want);
+    (tmp, app)
+}
+
+/// Drain the pane until the CAPTURES panel holds `want` entries.
+fn await_captures(app: &mut App, want: usize) {
     crate::test_budget::await_spawned(
         crate::test_budget::tests::SHELL_PAINT_BASE,
         "the error lines to be captured",
@@ -3557,7 +3563,6 @@ fn app_with_captures(script: &str, want: usize) -> (tempfile::TempDir, App) {
             app.captures.len() >= want
         },
     );
-    (tmp, app)
 }
 
 #[test]
@@ -3616,6 +3621,101 @@ fn a_capture_that_left_the_scrollback_is_not_stood_in_for_by_its_repeat() {
     assert!(
         app.terminals[0].selection_text().contains("err-7 broke"),
         "the copy still on screen is found: {}",
+        app.status
+    );
+}
+
+#[test]
+fn a_resize_that_rewraps_the_output_keeps_each_capture_on_its_own_copy() {
+    // A resize re-wraps the 200-column lines by a different number of rows
+    // above each copy, so no single scroll shift can follow both (#1450).
+    let long = "printf '%0200d\\n' 0";
+    let (_tmp, mut app) = app_with_captures(
+        &format!(
+            "echo ${{e}}-7 broke; echo first; {long}; echo ${{e}}-7 broke; echo second; \
+             {long}; {long}; {long}"
+        ),
+        2,
+    );
+    for (cols, when) in [(80, "as printed"), (40, "narrower"), (120, "wider")] {
+        app.terminals[0].resize(cols, 24);
+        for (i, next) in ["first", "second"].into_iter().enumerate() {
+            app.captures.select_index(i);
+            app.captures_open_selected();
+            let line = app.terminals[0]
+                .selection()
+                .unwrap_or_else(|| panic!("{when}: entry {i}: {}", app.status))
+                .anchor
+                .0;
+            let (lines, top) = app.terminals[0].grid_lines();
+            assert_eq!(
+                lines[(line - top) as usize + 1].trim_end(),
+                next,
+                "{when}: entry {i} selects its own copy"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_capture_erased_by_a_clear_is_not_stood_in_for_by_a_later_copy() {
+    // The program's own `clear` erases the first copy and the pane's Clear
+    // the second; each entry then says its line is gone rather than jumping
+    // to the copy printed after it (#1450).
+    let (_tmp, mut app) = app_with_captures(
+        "echo ${e}-7 broke; read y; printf '\\033[H\\033[2J\\033[3J'; echo ${e}-7 broke; \
+         read z; echo ${e}-7 broke",
+        1,
+    );
+    app.terminals[0].write_input(b"\n");
+    await_captures(&mut app, 2);
+    app.terminals[0].clear_screen_and_scrollback();
+    app.terminals[0].write_input(b"\n");
+    await_captures(&mut app, 3);
+    for i in 0..2 {
+        app.captures.select_index(i);
+        app.captures_open_selected();
+        assert_eq!(
+            app.status, "Captured line is no longer in the scrollback",
+            "entry {i}"
+        );
+        assert!(app.terminals[0].selection().is_none(), "entry {i}");
+    }
+    app.captures.select_index(2);
+    app.captures_open_selected();
+    assert!(
+        app.terminals[0].selection_text().contains("err-7 broke"),
+        "the copy printed after the Clear is found: {}",
+        app.status
+    );
+}
+
+#[test]
+fn a_capture_whose_pane_closed_takes_the_newest_match_in_the_active_pane() {
+    // The anchor names a row in the pane that recorded it; in the pane the
+    // jump falls back to, only the text means anything (#1450).
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[String::from("-c"), String::from("sleep 30")],
+        tmp.path(),
+    )
+    .unwrap();
+    app.terminals[0].feed_bytes_for_test(b"a line from a closed pane\r\n");
+    app.captures.push(crate::widgets::captures::CapturedLine {
+        pane: String::from("gone"),
+        shell_pid: None,
+        message: String::from("captured"),
+        line: String::from("a line from a closed pane"),
+        anchor: Some(u64::MAX),
+    });
+    app.captures_open_selected();
+    assert!(
+        app.terminals[0]
+            .selection_text()
+            .contains("a line from a closed pane"),
+        "{}",
         app.status
     );
 }
@@ -6661,7 +6761,7 @@ fn jumping_to_a_captured_line_reveals_the_folded_pane_that_holds_it() {
         shell_pid: Some(pid),
         message: String::from("captured"),
         line: String::from("a captured line worth jumping to"),
-        row: None,
+        anchor: None,
     });
     app.captures_open_selected();
 
