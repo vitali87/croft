@@ -300,6 +300,10 @@ fn default_status_for(phase: &DialogPhase, host: &str) -> String {
     }
 }
 
+/// The top row of a fallback prompt too tall for the window (#950 review):
+/// a yes is held until the whole question has been on screen.
+const TOO_SHORT_FOR_FALLBACK: &str = "Make the window taller to read the whole question";
+
 /// The fallback prompt's notes as the rows they take at `width` columns:
 /// a heading, then each note word-wrapped behind a `- ` lead (#950).
 fn note_rows(notes: &[String], width: usize) -> Vec<String> {
@@ -584,6 +588,26 @@ impl Widget for &mut ConnectDialog {
         }
 
         self.notes_shown = notes_drawn == notes.len() && self.field_rect.height > 0;
+        if !notes.is_empty() && !self.notes_shown {
+            // The question doesn't fit, and a yes is held until it does: say
+            // so on the top row, the one row a short window always shows.
+            let style = Style::default()
+                .fg(self.theme.ui(RED))
+                .bg(self.theme.ui(PANEL_BG))
+                .add_modifier(Modifier::BOLD);
+            for dx in 0..inner.width {
+                let cell = &mut buf[(inner.x + dx, inner.y)];
+                cell.set_char(' ');
+                cell.set_style(Style::default().bg(self.theme.ui(PANEL_BG)));
+            }
+            buf.set_stringn(
+                inner.x + 1,
+                inner.y,
+                TOO_SHORT_FOR_FALLBACK,
+                inner.width.saturating_sub(1) as usize,
+                style,
+            );
+        }
         let body_end = cy;
         let footer_y = inner.y + inner.height.saturating_sub(2);
         if footer_y >= cy {
@@ -818,6 +842,18 @@ mod tests {
             let mut buf = Buffer::empty(area);
             Widget::render(&mut d, area, &mut buf);
             assert_eq!(d.notes_shown, seen, "80x{h}");
+            let screen: String = (0..h)
+                .map(|y| {
+                    (0..80)
+                        .map(|x| buf[(x, y)].symbol().to_string())
+                        .collect::<String>()
+                })
+                .collect();
+            assert_eq!(
+                screen.contains(TOO_SHORT_FOR_FALLBACK),
+                !seen,
+                "80x{h}: the window says when it is too short"
+            );
         }
     }
 

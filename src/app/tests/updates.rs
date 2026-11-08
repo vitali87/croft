@@ -896,8 +896,12 @@ fn install_fallback_holds_a_yes_until_the_notes_have_been_shown() {
         let mut buf = ratatui::buffer::Buffer::empty(area);
         ratatui::widgets::Widget::render(app.connect_dialog.as_mut().unwrap(), area, &mut buf);
     };
+    let answer_y = |app: &mut App| {
+        app.handle_connect_dialog_key(key(KeyCode::Char('y'), KeyModifiers::NONE));
+        app.handle_connect_dialog_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    };
     render(&mut app, 12);
-    app.answer_install_fallback("y");
+    answer_y(&mut app);
     let dialog = app.connect_dialog.as_ref().expect("still asking");
     assert_eq!(dialog.phase, DialogPhase::AwaitingFallbackConfirmation);
     assert!(
@@ -907,7 +911,7 @@ fn install_fallback_holds_a_yes_until_the_notes_have_been_shown() {
             .is_some_and(|e| e.contains("taller"))
     );
     render(&mut app, 30);
-    app.answer_install_fallback("y");
+    answer_y(&mut app);
     assert_eq!(
         app.connect_dialog.as_ref().unwrap().phase,
         DialogPhase::Installing

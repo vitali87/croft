@@ -48961,6 +48961,9 @@ impl App {
                     dialog.error = Some(String::from(
                         "Make the window taller to read what a remote compile installs, then answer",
                     ));
+                    // Emptied, so the y typed again once it fits is a yes,
+                    // not "yy".
+                    dialog.clear_input();
                     return;
                 }
                 dialog.set_installing();
