@@ -35091,7 +35091,7 @@ impl App {
         }
         let runner: &str = match ext.as_str() {
             "js" | "mjs" | "cjs" => "node",
-            "ts" | "tsx" => "tsx",
+            "ts" | "tsx" | "mts" | "cts" => "tsx",
             "rb" => "ruby",
             "lua" => "lua",
             "php" => "php",

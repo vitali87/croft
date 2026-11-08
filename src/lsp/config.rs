@@ -286,6 +286,8 @@ mod tests {
         assert_eq!(Language::from_extension("PY"), Some(Language::PYTHON));
         assert_eq!(Language::from_extension("pyi"), Some(Language::PYTHON));
         assert_eq!(Language::from_extension("ts"), Some(Language::TYPESCRIPT));
+        assert_eq!(Language::from_extension("mts"), Some(Language::TYPESCRIPT));
+        assert_eq!(Language::from_extension("cts"), Some(Language::TYPESCRIPT));
         assert_eq!(Language::from_extension("tsx"), Some(Language::TSX));
         assert_eq!(Language::from_extension("js"), Some(Language::JAVASCRIPT));
         assert_eq!(Language::from_extension("mjs"), Some(Language::JAVASCRIPT));
