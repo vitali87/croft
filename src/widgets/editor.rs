@@ -6340,7 +6340,22 @@ impl Editor {
         self.last_edit_kind = None;
         self.image = None;
         self.sheet = None;
-        self.markdown_preview = None;
+        // A same-path reload (the FS-sync sweep after another pane saves the
+        // file, an agent or formatter rewriting it, a revert) keeps the
+        // rendered Markdown view (#1605): dropping it turned the tab back
+        // into source whenever anything rewrote the file. The `edit_seq`
+        // bump below rebuilds it from the new text. A notebook's view is
+        // rebuilt below anyway, and a document's or media card's belonged to
+        // a viewer this text route has just replaced.
+        let keep_preview = !changed_file
+            && self.lang == Some(LangKind::Markdown)
+            && self
+                .markdown_preview
+                .as_ref()
+                .is_some_and(|md| !md.notebook && md.doc_path.is_none());
+        if !keep_preview {
+            self.markdown_preview = None;
+        }
         self.hex = None;
         self.log = None;
         self.archive = None;
@@ -6541,6 +6556,7 @@ impl Editor {
             row_of_line: Vec::new(),
             scroll_to_source: None,
             links: crate::markdown::MdLinks::default(),
+            follows: None,
         });
         self.status = format!("Opened media info {}", path.display());
         Ok(())
@@ -6622,6 +6638,7 @@ impl Editor {
             row_of_line: Vec::new(),
             scroll_to_source: None,
             links: crate::markdown::MdLinks::default(),
+            follows: None,
         });
         self.status = format!("Opened document {}", path.display());
         Ok(())
@@ -7703,17 +7720,28 @@ impl Editor {
         if self.markdown_preview.is_none() {
             return;
         }
+        let text = self.lines.join("\n");
+        self.rebuild_markdown_preview_from(&text, None);
+    }
+
+    /// [`Self::rebuild_markdown_preview`] from `text` instead of this tab's
+    /// buffer (#1605): the source pane's text, for a preview to the side
+    /// that follows it, with `follows` naming that source (`None` when
+    /// `text` is the buffer's own).
+    pub fn rebuild_markdown_preview_from(&mut self, text: &str, follows: Option<(u64, u64)>) {
+        if self.markdown_preview.is_none() {
+            return;
+        }
         // The image-aware builder (#196 review): the plain one left
         // md.images pointing at anchors into the REPLACED lines, and
         // the wrap-key recompute then sliced with stale first_line
         // values - an out-of-range panic on a theme switch.
-        let text = self.lines.join("\n");
         let base = self
             .path
             .as_ref()
             .and_then(|p| p.parent().map(|d| d.to_path_buf()));
         let (lines, images, runnables, source_map, links) = crate::markdown::render_markdown_mapped(
-            &text,
+            text,
             self.theme,
             &mut self.registry,
             base.as_deref(),
@@ -7726,6 +7754,7 @@ impl Editor {
             md.runnables = runnables;
             md.links = links;
             md.built_seq = self.edit_seq;
+            md.follows = follows;
         }
     }
 
@@ -8527,6 +8556,7 @@ impl Editor {
             row_of_line: Vec::new(),
             scroll_to_source,
             links,
+            follows: None,
         });
         true
     }
@@ -8574,6 +8604,7 @@ impl Editor {
             row_of_line: Vec::new(),
             scroll_to_source: None,
             links: crate::markdown::MdLinks::default(),
+            follows: None,
         });
         true
     }
@@ -20955,8 +20986,10 @@ impl Editor {
     /// Paint the rendered Markdown preview: the pre-built lines flow through
     /// a wrapping `Paragraph` so paragraphs reflow with the pane, scrolled by
     /// the preview's own offset, with a scrollbar over the wrapped height.
-    /// Rebuilds first when the buffer moved under the preview (a live edit in
-    /// a split, an external reload) so it always shows the current text.
+    /// Rebuilds first when the buffer moved under the preview (an edit, an
+    /// external reload) so it always shows the current text. A preview to
+    /// the side shows its source pane's text, which the app hands it
+    /// (`App::sync_markdown_side_previews`, #1605).
     fn render_markdown_preview(&mut self, inner: Rect, buf: &mut Buffer) {
         let stale = self
             .markdown_preview
@@ -20969,26 +21002,7 @@ impl Editor {
         } else if stale {
             // The image-aware builder (#176): the plain one here left the
             // images list pointing at STALE anchors after a live edit.
-            let text = self.lines.join("\n");
-            let base = self
-                .path
-                .as_ref()
-                .and_then(|p| p.parent().map(|d| d.to_path_buf()));
-            let (lines, images, runnables, map, links) = crate::markdown::render_markdown_mapped(
-                &text,
-                self.theme,
-                &mut self.registry,
-                base.as_deref(),
-                self.md_outputs.clone(),
-            );
-            if let Some(md) = self.markdown_preview.as_mut() {
-                md.lines = lines;
-                md.source_map = map;
-                md.images = images;
-                md.runnables = runnables;
-                md.links = links;
-                md.built_seq = self.edit_seq;
-            }
+            self.rebuild_markdown_preview();
         }
         let Some(md) = self.markdown_preview.as_mut() else {
             return;
@@ -29916,6 +29930,34 @@ mod tests {
             text.contains("New heading") && !text.contains("Old heading"),
             "a stale preview must rebuild against the edited buffer; got:\n{text}"
         );
+    }
+
+    /// #1605: the same-path `open` behind every FS-sync reload (a save in
+    /// another pane, an agent rewriting the file) keeps the tab rendered,
+    /// showing the new text; another file still opens as source.
+    #[test]
+    fn markdown_preview_survives_a_same_path_reload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("doc.md");
+        std::fs::write(&path, "# Old heading\n").unwrap();
+        let mut e = Editor::new();
+        e.open(&path).unwrap();
+        assert!(e.toggle_markdown_preview());
+        std::fs::write(&path, "# Rewritten heading\n\nAnd a paragraph.\n").unwrap();
+        e.open(&path).unwrap();
+        assert!(
+            e.markdown_preview.is_some(),
+            "a reload of the same file must stay a preview"
+        );
+        let text = first_row_screen(&mut e, 60, 8);
+        assert!(
+            text.contains("Rewritten heading") && !text.contains("# Rewritten"),
+            "the preview must render the reloaded text; got:\n{text}"
+        );
+        let other = tmp.path().join("other.md");
+        std::fs::write(&other, "# Other\n").unwrap();
+        e.open(&other).unwrap();
+        assert!(e.markdown_preview.is_none(), "another file opens as source");
     }
 
     /// Render into a fresh buffer and return the whole screen as one string.

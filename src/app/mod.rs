@@ -27033,9 +27033,15 @@ impl App {
                 self.toggle_zen_mode();
                 true
             }
-            // Cmd+K V: Live Run, "values" for the active Python file.
+            // Cmd+K V: Live Run, "values" for the active Python file. On a
+            // Markdown tab it is VS Code's Open Preview to the Side (#1605);
+            // Live Run runs only Python, so no tab wants both.
             KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'v') => {
-                self.toggle_live_run();
+                if self.editor.language() == Some(crate::highlight::LangKind::Markdown) {
+                    self.open_markdown_preview_to_side();
+                } else {
+                    self.toggle_live_run();
+                }
                 true
             }
             // Cmd+K Cmd+F (SUPER/CTRL held on the second key): Format
@@ -50144,6 +50150,59 @@ impl App {
         }
     }
 
+    /// Markdown: Open Preview to the Side (#1605, VS Code's
+    /// `markdown.showPreviewToSide`): the active Markdown file rendered in
+    /// the next editor group, or in a new group to the right when there is
+    /// none, showing what is typed here as it is typed
+    /// ([`App::sync_markdown_side_previews`]). Focus stays on the source,
+    /// which a tab showing the preview turns back into.
+    fn open_markdown_preview_to_side(&mut self) {
+        let Some(path) = self.editor.path.clone() else {
+            self.status = String::from("Open Preview to the Side: save the file first");
+            return;
+        };
+        if self.editor.language() != Some(crate::highlight::LangKind::Markdown)
+            || self.editor.has_non_text_view()
+        {
+            self.status = String::from("Markdown Preview needs a Markdown file");
+            return;
+        }
+        if self.editor.markdown_preview.is_some() {
+            self.editor.toggle_markdown_preview();
+        }
+        let source = self.editor_layout.active_dfs_index();
+        let opened = if source + 1 < self.editor_layout.leaf_count() {
+            let here = std::mem::take(&mut self.editor);
+            self.editor = self.editor_layout.refocus_to_dfs(here, source + 1);
+            self.editor.open_preview(&path)
+        } else {
+            let mut group = EditorTabs::default();
+            let opened = group.open_preview(&path);
+            if opened.is_ok() {
+                group.copy_view_position_from(&self.editor);
+                let here = std::mem::replace(&mut self.editor, group);
+                self.editor_layout
+                    .split_active(here, editor_layout::SplitDir::Horizontal, true);
+            }
+            opened
+        };
+        if opened.is_ok() && self.editor.markdown_preview.is_none() {
+            self.editor.toggle_markdown_preview();
+        }
+        if self.editor_layout.active_dfs_index() != source {
+            let side = std::mem::take(&mut self.editor);
+            self.editor = self.editor_layout.refocus_to_dfs(side, source);
+        }
+        // The side pane comes up at the source's place and with its text.
+        self.md_scroll_synced = None;
+        self.sync_markdown_side_previews();
+        self.focus_pane(Pane::Editor);
+        self.status = match opened {
+            Ok(()) => format!("Previewing {} to the side", self.status_path(&path)),
+            Err(e) => format!("Open Preview to the Side: {e}"),
+        };
+    }
+
     fn handle_editor_key(&mut self, key: KeyEvent) {
         // Inline find bar (Cmd+F / Ctrl+F) eats every key while open.
         if self.editor_find.is_some() {
@@ -58932,6 +58991,7 @@ impl App {
             Cmd::ToggleInlineValues => self.toggle_inline_values(),
             Cmd::ToggleInlayHints => self.toggle_inlay_hints(),
             Cmd::ToggleMarkdownPreview => self.toggle_markdown_preview(),
+            Cmd::OpenMarkdownPreviewToSide => self.open_markdown_preview_to_side(),
             // Cmd+Enter's run from any terminal (#843): the same confirm popup.
             Cmd::RunCodeBlockAtCursor => {
                 if !self.run_fence_at_cursor(true) {
@@ -59510,6 +59570,10 @@ impl App {
                     // hex, reported honestly). Sticks across FS-sync
                     // reloads; cleared by opening a different file.
                     self.editor.force_text = true;
+                    // A Markdown preview is a view of the buffer that a
+                    // same-path reload keeps (#1605), not a route `open`
+                    // takes, so it is put down here.
+                    self.editor.markdown_preview = None;
                     match self.editor.open(&p) {
                         Ok(()) if self.editor.hex.is_some() => {
                             self.status =
@@ -68664,6 +68728,56 @@ impl App {
         }
         self.md_scroll_synced = Some(key);
         moved
+    }
+
+    /// Open Preview to the Side (#1605): a split's Markdown preview renders
+    /// the text being typed in the source pane beside it. Each pane's tab is
+    /// a buffer of its own, and nobody types into the preview's, so it showed
+    /// the file as last loaded. The panes pair as in
+    /// [`App::sync_markdown_scroll`], the focused pane's tab the preferred
+    /// source; a preview left with no source beside it shows its own buffer
+    /// again. The preview's buffer is never touched, so it stays clean.
+    /// Returns true when a preview was rebuilt.
+    pub fn sync_markdown_side_previews(&mut self) -> bool {
+        let mut tabs: Vec<&mut crate::widgets::editor::Editor> = std::iter::once(&mut self.editor)
+            .chain(self.editor_layout.inactive_groups_mut())
+            .filter_map(|group| {
+                let idx = group.active_index();
+                group.editors.get_mut(idx)
+            })
+            .collect();
+        let mut changed = false;
+        for p in 0..tabs.len() {
+            let follows = match tabs[p].markdown_preview.as_ref() {
+                Some(md) if !md.notebook && md.doc_path.is_none() => md.follows,
+                _ => continue,
+            };
+            let source = (0..tabs.len()).find(|&s| {
+                s != p
+                    && tabs[s].path.is_some()
+                    && tabs[s].path == tabs[p].path
+                    && tabs[s].markdown_preview.is_none()
+                    && !tabs[s].has_non_text_view()
+            });
+            let wanted = source.map(|s| (tabs[s].edit_seq, tabs[s].undo_step_id));
+            let built = tabs[p]
+                .markdown_preview
+                .as_ref()
+                .is_some_and(|md| md.built_seq == tabs[p].edit_seq);
+            // A preview of its own buffer is rebuilt by its render, as ever.
+            if wanted == follows && (built || wanted.is_none()) {
+                continue;
+            }
+            match source {
+                Some(s) => {
+                    let text = tabs[s].lines.join("\n");
+                    tabs[p].rebuild_markdown_preview_from(&text, wanted);
+                }
+                None => tabs[p].rebuild_markdown_preview(),
+            }
+            changed = true;
+        }
+        changed
     }
 
     /// Arm or disarm Live Run for the active file (Cmd+K V).
@@ -84558,8 +84672,10 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             app.poll_chrome_bake() | app.poll_welcome_bake() | app.poll_saved_session();
         // A closed tab's bookmarks are kept, and come back with its file.
         let bookmarks_changed = app.settle_bookmarks();
-        let live_run_changed =
-            app.tick_live_run() | app.sync_markdown_scroll() | app.tick_minimap();
+        let live_run_changed = app.tick_live_run()
+            | app.sync_markdown_side_previews()
+            | app.sync_markdown_scroll()
+            | app.tick_minimap();
         app.tick_code_lens();
         let code_lens_changed = app.tick_config_watch()
             | app.drain_lsp_code_lens()

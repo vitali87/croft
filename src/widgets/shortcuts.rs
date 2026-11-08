@@ -392,6 +392,11 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 handler: "is_markdown_preview_key",
             },
             ShortcutEntry {
+                keys: "Cmd/Ctrl+K V",
+                description: "Markdown: open the preview in the next group, showing what you type here",
+                handler: "",
+            },
+            ShortcutEntry {
                 keys: "Cmd/Ctrl+Enter",
                 description: "Markdown: run the runnable fence under the caret in a named pane, new or reused (confirms first; also the palette's Markdown: Run Code Block at Cursor)",
                 handler: "is_run_fence_key",

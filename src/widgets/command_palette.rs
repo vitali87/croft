@@ -200,6 +200,10 @@ pub enum Command {
     ToggleInlineValues,
     ToggleInlayHints,
     ToggleMarkdownPreview,
+    /// Markdown: Open Preview to the Side (#1605), VS Code's
+    /// `markdown.showPreviewToSide`: the rendered view in the next group,
+    /// following the source as it is typed.
+    OpenMarkdownPreviewToSide,
     /// Markdown: Run Code Block at Cursor (#843): Cmd+Enter's run of the
     /// fence under the caret, from any terminal.
     RunCodeBlockAtCursor,
@@ -770,6 +774,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::ToggleInlineValues,
     Command::ToggleInlayHints,
     Command::ToggleMarkdownPreview,
+    Command::OpenMarkdownPreviewToSide,
     Command::RunCodeBlockAtCursor,
     Command::RestoreSnapshot,
     Command::CloseEditor,
@@ -1257,6 +1262,7 @@ impl Command {
             Command::ToggleInlineValues => "Debug: Toggle Inline Values",
             Command::ToggleInlayHints => "Editor: Toggle Inlay Hints",
             Command::ToggleMarkdownPreview => "Markdown: Toggle Preview",
+            Command::OpenMarkdownPreviewToSide => "Markdown: Open Preview to the Side",
             Command::RunCodeBlockAtCursor => "Markdown: Run Code Block at Cursor",
             Command::RestoreSnapshot => "Local History: Restore Snapshot",
             Command::CloseEditor => "View: Close Editor",
@@ -1637,6 +1643,7 @@ impl Command {
             Command::ToggleInlineValues => "",
             Command::ToggleInlayHints => "",
             Command::ToggleMarkdownPreview => "Cmd+Shift+V",
+            Command::OpenMarkdownPreviewToSide => "Cmd+K V",
             Command::RunCodeBlockAtCursor => "Cmd+Enter",
             Command::RestoreSnapshot => "",
             Command::MergeAcceptCurrent => "Cmd+.",
@@ -2238,6 +2245,7 @@ impl Command {
             Command::ToggleInlineValues => "toggle_inline_values",
             Command::ToggleInlayHints => "toggle_inlay_hints",
             Command::ToggleMarkdownPreview => "toggle_markdown_preview",
+            Command::OpenMarkdownPreviewToSide => "open_markdown_preview_to_side",
             Command::RunCodeBlockAtCursor => "run_code_block_at_cursor",
             Command::RestoreSnapshot => "restore_snapshot",
             Command::CloseEditor => "close_editor",
