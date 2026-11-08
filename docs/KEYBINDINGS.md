@@ -487,7 +487,7 @@ Binary files open here automatically instead of erroring; the file is read in wi
 | Click / drag (hex grid or ASCII gutter) | Park the cursor / select a byte range |
 | Wheel | Scroll three rows |
 
-**Archive browser (`.zip`, `.jar`, `.whl` and other zip-based packages, `.tar`, `.tar.gz`, `.tgz`, `.tar.xz`, `.tar.bz2`, `.tar.zst`; misnamed containers detected by content)**
+**Archive browser (`.zip`, `.jar`, `.whl` and other zip-based packages, `.tar`, `.tar.gz` / `.tgz`, `.tar.xz` / `.txz`, `.tar.bz2` / `.tbz2` / `.tbz`, `.tar.zst` / `.tzst`; misnamed containers detected by content)**
 
 | Keys | Action |
 |------|--------|

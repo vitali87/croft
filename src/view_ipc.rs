@@ -1690,6 +1690,13 @@ mod tests {
             let name = format!("stdin.{}", extension_for(magic));
             assert_eq!(kind_from_ext(Path::new(&name)), Some(kind), "{name}");
         }
+        // `pzstd` output piped in opens with a skippable frame, not the zstd
+        // magic, and is still staged as a zstd tarball (#1645 review).
+        let pzstd = b"\x50\x2a\x4d\x18\x04\x00\x00\x00skip\x28\xb5\x2f\xfd\x04\x00";
+        assert_eq!(
+            stdin_extension(pzstd, None).unwrap().as_deref(),
+            Some("tzst")
+        );
     }
 
     #[test]

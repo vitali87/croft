@@ -1220,9 +1220,18 @@ mod tests {
                 bytes.extend(compressed(kind, part));
             }
             let p = tmp.path().join(name);
-            std::fs::write(&p, bytes).unwrap();
+            std::fs::write(&p, &bytes).unwrap();
             let view = list(&p, kind).unwrap();
             assert_eq!(view.entries.len(), 3, "{name}");
+            // By content too (#1645 review): `pzstd` output opens with a
+            // skippable frame, not the zstd magic, and a pipe or a missing
+            // extension leaves only the content to go by.
+            let bare = tmp.path().join(format!("{}-asset", kind.label()));
+            std::fs::write(&bare, &bytes).unwrap();
+            let mut e = crate::widgets::editor::Editor::new();
+            e.open(&bare).unwrap();
+            let opened = e.archive.as_ref().map(|a| (a.kind, a.entries.len()));
+            assert_eq!(opened, Some((kind, 3)), "{name} without its extension");
         }
     }
 

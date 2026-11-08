@@ -1037,7 +1037,7 @@ Maps a test name to a source location. `--list` carries no file or line, so `fin
 
 ### magic.rs
 
-Content-based format detection: a pure magic-byte signature table covering PNG, JPEG, GIF, WebP and BMP, PDF, the zip family, gzip, xz, bzip2, zstd, tar's offset-257 `ustar`, and SQLite. A bzip2 stream needs its first block's magic after `BZh` and the block-size digit, since those four ASCII bytes alone can start a text file.
+Content-based format detection: a pure magic-byte signature table covering PNG, JPEG, GIF, WebP and BMP, PDF, the zip family, gzip, xz, bzip2, zstd, tar's offset-257 `ustar`, and SQLite. A bzip2 stream needs its first block's magic after `BZh` and the block-size digit, since those four ASCII bytes alone can start a text file. A zstd stream is also recognised behind leading skippable frames (`pzstd` output), but only when a zstd frame follows them, since LZ4 uses the same skippable frames.
 
 **Second hint, not first.** It is consulted as the SECOND routing hint in `Editor::open`. The extension stays first, and sniffing decides when the extension gave no answer or lied — an image or sheet extension whose decode or parse fails falls through rather than failing the open.
 
