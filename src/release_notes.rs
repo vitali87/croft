@@ -98,19 +98,38 @@ pub fn inline_markup(summary: &str) -> (String, Vec<Inline>) {
             i += len + 2;
             continue;
         }
-        if c == '*' && chars.get(i + 1) == Some(&'*') {
-            let closes_later = chars[i + 2..].windows(2).any(|w| w == ['*', '*']);
-            if bold || closes_later {
-                bold = !bold;
-                i += 2;
-                continue;
-            }
+        if c == '*'
+            && chars.get(i + 1) == Some(&'*')
+            && (bold || bold_closes_later(&chars[i + 2..]))
+        {
+            bold = !bold;
+            i += 2;
+            continue;
         }
         text.push(c);
         styles.push(if bold { Inline::Bold } else { Inline::Plain });
         i += 1;
     }
     (text, styles)
+}
+
+/// Whether `rest` holds a `**` that closes a bold run: one outside a code
+/// span, since a `**` written inside backticks is code, not a marker.
+fn bold_closes_later(rest: &[char]) -> bool {
+    let mut i = 0;
+    while i < rest.len() {
+        if rest[i] == '`'
+            && let Some(len) = rest[i + 1..].iter().position(|&d| d == '`')
+        {
+            i += len + 2;
+            continue;
+        }
+        if rest[i] == '*' && rest.get(i + 1) == Some(&'*') {
+            return true;
+        }
+        i += 1;
+    }
+    false
 }
 
 #[cfg(test)]
@@ -219,6 +238,11 @@ mod tests {
         let (text, styles) = inline_markup("a ** b and a ` tick");
         assert_eq!(text, "a ** b and a ` tick", "unpaired markers are text");
         assert!(styles.iter().all(|&s| s == Inline::Plain));
+        // A `**` inside code doesn't close an unpaired one before it.
+        let (text, styles) = inline_markup("a ** b `x**y` c");
+        assert_eq!(text, "a ** b x**y c");
+        assert_eq!(styles[0], Inline::Plain);
+        assert_eq!(*styles.last().unwrap(), Inline::Plain);
     }
 
     /// #954: no note this build shows reaches the card with raw markers, so
