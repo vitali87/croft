@@ -58076,13 +58076,20 @@ impl App {
     /// its Enter, because stopping drops the recording and what it held.
     /// One the palette was opened for without a key (a click) is dropped:
     /// replayed without the chord, its query would be typed into the file.
+    /// So is one whose command took focus out of the editor, such as
+    /// Terminal: Focus Terminal: the click that brings it back is not
+    /// recorded, so a replay would type the keys after it into the shell.
     fn hold_palette_macro_key(&mut self, key: crossterm::event::KeyEvent, palette_before: bool) {
         let open_now = self.command_palette.is_some();
+        let in_editor = self.focus == Pane::Editor;
         let Some(rec) = self.macro_recording.as_mut() else {
             return;
         };
-        if !palette_before && rec.palette_keys.is_empty() {
-            // The key that opened the palette: a session that replays.
+        if !palette_before {
+            // The key that opened the palette starts a session that
+            // replays; whatever an earlier one held was never closed by a
+            // key, so it has nothing to replay.
+            rec.palette_keys.clear();
             rec.palette_keys.push(key);
         } else if !rec.palette_keys.is_empty() {
             rec.palette_keys.push(key);
@@ -58093,10 +58100,32 @@ impl App {
                 &format!("skipped {key:?}: the palette was not opened from the keyboard"),
             );
         }
-        if !open_now {
-            for k in std::mem::take(&mut rec.palette_keys) {
+        if open_now {
+            return;
+        }
+        let held = std::mem::take(&mut rec.palette_keys);
+        if in_editor {
+            for k in held {
                 rec.recorded.push_key(k);
             }
+        } else if !held.is_empty() {
+            crate::output::push(
+                "Macros",
+                crate::output::OutputLevel::Info,
+                "skipped a palette command that left the editor: recording captures the editor pane only",
+            );
+        }
+    }
+
+    /// Drop what a palette session held for the macro once the palette has
+    /// closed without a key, as a click outside it or on a row does (#952):
+    /// a session that is never closed from the keyboard has nothing that
+    /// replays, and a later session must not pick its keys up.
+    fn drop_unkeyed_palette_macro_keys(&mut self) {
+        if self.command_palette.is_none()
+            && let Some(rec) = self.macro_recording.as_mut()
+        {
+            rec.palette_keys.clear();
         }
     }
 
@@ -62506,6 +62535,7 @@ impl App {
             );
         }
         self.recording_file_switches(|app| app.handle_mouse_inner(m));
+        self.drop_unkeyed_palette_macro_keys();
         self.trim_auto_indents();
     }
 
