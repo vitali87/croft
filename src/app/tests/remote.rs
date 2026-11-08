@@ -1283,6 +1283,7 @@ fn the_output_ports_and_captures_tabs_are_announced_by_name_and_row() {
         shell_pid: None,
         message: "Build failed".into(),
         line: "error: build failed".into(),
+        row: None,
     });
     let snap = app.a11y_snapshot();
     assert_eq!(snap.focus, "Captures, 1 capture");

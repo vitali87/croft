@@ -3528,6 +3528,98 @@ fn capture_triggers_collect_into_the_captures_panel_and_jump_to_the_line() {
     );
 }
 
+/// An app whose only pane runs `script` (with `$e` set to `err`) under an
+/// `err-N` capture trigger, once `want` lines have been captured. Read-gated
+/// and assembled at runtime like the test above, so the trigger set reaches
+/// the pane first and the `▶ …` header never fires it.
+fn app_with_captures(script: &str, want: usize) -> (tempfile::TempDir, App) {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.triggers = std::sync::Arc::new(crate::triggers::TriggerSet::from_json(
+        r#"[ { "regex": "err-(\\d+)", "action": "capture", "message": "boom \\1" } ]"#,
+    ));
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[
+            String::from("-c"),
+            format!("read x; e=err; {script}; sleep 30"),
+        ],
+        tmp.path(),
+    )
+    .unwrap();
+    app.drain_terminal_bells();
+    app.terminals[0].write_input(b"\n");
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::SHELL_PAINT_BASE,
+        "the error lines to be captured",
+        || {
+            app.drain_terminal_bells();
+            app.captures.len() >= want
+        },
+    );
+    (tmp, app)
+}
+
+#[test]
+fn each_capture_of_a_repeated_line_jumps_to_its_own_copy() {
+    // #1450: a test that fails on every run prints the same line every run,
+    // and every entry jumped to the newest copy, so the first run's entry
+    // selected the last run's failure.
+    let (_tmp, mut app) =
+        app_with_captures("echo ${e}-7 broke; echo between; echo ${e}-7 broke", 2);
+    let mut rows = Vec::new();
+    for i in 0..2 {
+        app.captures.select_index(i);
+        app.captures_open_selected();
+        let sel = app.terminals[0]
+            .selection()
+            .expect("the jump selects the line");
+        assert!(
+            app.terminals[0].selection_text().contains("err-7 broke"),
+            "{}",
+            app.status
+        );
+        rows.push(sel.anchor.0);
+    }
+    assert_eq!(
+        rows[1] - rows[0],
+        2,
+        "the first entry selects the upper copy, the second the lower: {rows:?}"
+    );
+}
+
+#[test]
+fn a_capture_that_left_the_scrollback_is_not_stood_in_for_by_its_repeat() {
+    // 6000 filler rows push the first copy past the 5000-row scrollback.
+    let (_tmp, mut app) = app_with_captures(
+        "echo ${e}-7 broke; seq -f 'filler line %06g' 1 6000; echo ${e}-7 broke",
+        2,
+    );
+    let (lines, _) = app.terminals[0].grid_lines();
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|l| l.starts_with("err-7 broke"))
+            .count(),
+        1,
+        "precondition: the first copy rotated off the scrollback"
+    );
+    app.captures.select_index(0);
+    app.captures_open_selected();
+    assert_eq!(app.status, "Captured line is no longer in the scrollback");
+    assert!(
+        app.terminals[0].selection().is_none(),
+        "the first run's entry must not select the second run's line"
+    );
+    app.captures.select_index(1);
+    app.captures_open_selected();
+    assert!(
+        app.terminals[0].selection_text().contains("err-7 broke"),
+        "the copy still on screen is found: {}",
+        app.status
+    );
+}
+
 #[test]
 fn change_workspace_root_restores_the_incoming_workspaces_layout_when_the_panel_is_untouched() {
     let tmp = tempfile::tempdir().unwrap();
@@ -6569,6 +6661,7 @@ fn jumping_to_a_captured_line_reveals_the_folded_pane_that_holds_it() {
         shell_pid: Some(pid),
         message: String::from("captured"),
         line: String::from("a captured line worth jumping to"),
+        row: None,
     });
     app.captures_open_selected();
 

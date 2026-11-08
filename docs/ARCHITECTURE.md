@@ -741,7 +741,7 @@ iTerm2-style terminal triggers read from `~/.config/croft/triggers.json` — tol
 
 **Alt-screen tracking is positional.** It tracks entry and exit by DECSET/DECRST 47/1047/1049 and RIS in the stream itself, so alt-screen content never fires while primary text sharing a chunk with a transition still does. The reader feeds it every chunk unconditionally — otherwise its state machine would desync and splice phantom lines across skipped gaps.
 
-**Hit delivery.** Hits flow over an mpsc channel drained by the app tick into the status bar, with `\0`-`\9` capture interpolation. `capture` hits carry the whole matched line and land in the CAPTURES panel instead — see `widgets/captures.rs`.
+**Hit delivery.** Hits flow over an mpsc channel drained by the app tick into the status bar, with `\0`-`\9` capture interpolation. `capture` hits carry the whole matched line and land in the CAPTURES panel instead — see `widgets/captures.rs`. The reader scans a chunk before parsing it, so every hit knows where its line ended in the chunk; the parser stops there for a `capture` hit, and the hit records the row the line started on.
 
 **Distribution to panes.** Panes get the set via `set_triggers`, a ptr-eq no-op re-pushed every drain tick, so panes are covered wherever they were created; the inner Arc swaps on config reload.
 
@@ -939,7 +939,7 @@ The archive browser core. It lists members without reading payloads: zip-based p
 
 The panel group's CAPTURES tab, modelled on iTerm2's Capture Output. It holds output lines collected by `capture` triggers — the pane label, the interpolated message, and the whole escape-stripped line — with the newest selected. It is a pure widget, capped at 500 entries.
 
-**Jumping back to the line.** Enter or a click has the App switch to TERMINAL, find the pane by shell pid, locate the newest grid row matching the captured text, scroll it into view and select it. The match is a prefix match, since long lines wrap.
+**Jumping back to the line.** Enter or a click has the App switch to TERMINAL, find the pane by shell pid, locate the grid row matching the captured text, scroll it into view and select it. The match is a prefix match, since long lines wrap. Each entry keeps the row its line started on as a scroll-clock content id, read by the pane's reader with the parser stopped right after the line, so the jump takes the matching row nearest it: a line every re-run prints again jumps to its own run's copy, not the newest (#1450). Once that row has rotated off the scrollback the entry reports the line gone instead of standing a later copy in for it. An entry with no row falls back to the newest match.
 
 **Asking Navigator about a line.** It also shapes the "Ask Navigator about this line" turn: `context_window` gives the rows around the hit, `first_file_ref` gives the leftmost `path:line` in the line, and `ask_prompt` masks the line, the trigger message and the context through the caller's redaction, capping the excerpt at `ASK_CONTEXT_CHARS`.
 

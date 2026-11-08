@@ -118,6 +118,15 @@ pub struct TriggerHit {
     /// The whole escape-stripped output line that matched, so a captured
     /// entry can be jumped back to (and shown) in full.
     pub line: String,
+    /// Offset just past the newline that completed `line`, in the bytes of
+    /// the scan that fired it. The pane's reader stops its parser there to
+    /// read where the line landed (#1450).
+    pub end: usize,
+    /// The grid row the line starts on, as a scroll-clock content id (the
+    /// row's grid line plus the clock reading, which output scrolling past
+    /// leaves unchanged). Set by the pane's reader for `capture` hits, so
+    /// the jump finds THIS line and not its newest repeat; None otherwise.
+    pub row: Option<i64>,
 }
 
 pub fn triggers_path() -> PathBuf {
@@ -648,17 +657,18 @@ impl TriggerScanner {
 
     /// Like [`scan`](Self::scan), additionally pushing every completed
     /// primary-screen line (escape-stripped, blank ones included — batch
-    /// matchers care about section-ending blanks) into `lines`. The watch
-    /// problem matchers (#252) consume these instead of running a second
-    /// byte scanner over the same stream.
+    /// matchers care about section-ending blanks) into `lines`, with the
+    /// offset just past its newline. The watch problem matchers (#252)
+    /// consume these instead of running a second byte scanner over the
+    /// same stream.
     pub fn scan_collect(
         &mut self,
         bytes: &[u8],
         set: &TriggerSet,
         out: &mut Vec<TriggerHit>,
-        mut lines: Option<&mut Vec<String>>,
+        mut lines: Option<&mut Vec<(usize, String)>>,
     ) {
-        for &b in bytes {
+        for (i, &b) in bytes.iter().enumerate() {
             // Resolve a pending `\r` now that its successor is known: CRLF is
             // the PTY line ending (complete), a lone CR rewrites the line in
             // place (progress bars, spinners — reset without matching, so
@@ -666,7 +676,7 @@ impl TriggerScanner {
             if self.cr_pending && self.state == ScanState::Ground {
                 self.cr_pending = false;
                 if b == b'\n' {
-                    self.complete_line(set, out, lines.as_deref_mut());
+                    self.complete_line(set, out, lines.as_deref_mut(), i + 1);
                     continue;
                 }
                 self.reset_line();
@@ -674,7 +684,7 @@ impl TriggerScanner {
             match self.state {
                 ScanState::Ground => match b {
                     0x1b => self.state = ScanState::Esc,
-                    b'\n' => self.complete_line(set, out, lines.as_deref_mut()),
+                    b'\n' => self.complete_line(set, out, lines.as_deref_mut(), i + 1),
                     b'\r' => self.cr_pending = true,
                     0x00..=0x1f | 0x7f => {}
                     _ => {
@@ -765,14 +775,15 @@ impl TriggerScanner {
         &mut self,
         set: &TriggerSet,
         out: &mut Vec<TriggerHit>,
-        lines: Option<&mut Vec<String>>,
+        lines: Option<&mut Vec<(usize, String)>>,
+        end: usize,
     ) {
         if self.in_alt {
             self.reset_line();
             return;
         }
         if let Some(lines) = lines {
-            lines.push(String::from_utf8_lossy(&self.line).into_owned());
+            lines.push((end, String::from_utf8_lossy(&self.line).into_owned()));
         }
         if !self.line.is_empty() {
             let line = String::from_utf8_lossy(&self.line);
@@ -787,6 +798,8 @@ impl TriggerScanner {
                         action: t.action,
                         message: interpolate(t.message.as_deref(), &caps),
                         line: line.to_string(),
+                        end,
+                        row: None,
                     });
                 }
             }
@@ -1138,6 +1151,8 @@ mod tests {
                 action: TriggerAction::Notify,
                 message: String::from("build: FAILED"),
                 line: String::from("BUILD FAILED"),
+                end: 1,
+                row: None,
             }]
         );
         out.clear();
@@ -1289,6 +1304,12 @@ mod tests {
             out[0].line, "error[E0308]: mismatched types",
             "a capture hit carries the whole matched line for the panel"
         );
+        // Where the line ended in the scanned bytes, for the pane's reader
+        // to stop its parser at (#1450): just past the newline.
+        out.clear();
+        sc.scan(b"ok\r\nerror[E1]: x\r\nmore\n", &s, &mut out);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0].end, "ok\r\nerror[E1]: x\r\n".len());
     }
 
     #[test]

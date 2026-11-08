@@ -52460,10 +52460,11 @@ impl App {
 
     /// Jump the selected capture's pane back to the captured line: switch to
     /// the TERMINAL tab, focus the pane (found by shell pid; a closed pane
-    /// falls back to the active one), locate the newest grid row matching
-    /// the captured text, scroll it into view and select it. A very long
-    /// captured line wraps across grid rows, so the match is prefix-based
-    /// on the first wrapped row.
+    /// falls back to the active one), locate the grid row matching the
+    /// captured text nearest the row the line was printed on (so each run's
+    /// copy of a repeated line is its own entry, #1450), scroll it into view
+    /// and select it. A very long captured line wraps across grid rows, so
+    /// the match is prefix-based on the first wrapped row.
     pub fn captures_open_selected(&mut self) {
         let Some(entry) = self.captures.selected_entry().cloned() else {
             return;
@@ -52480,7 +52481,7 @@ impl App {
         self.set_bottom_panel_tab(BottomPanelTab::Terminal);
         self.focus_pane(Pane::Terminal);
         let needle: String = entry.line.trim_end().chars().take(60).collect();
-        let Some(line) = self.terminals[idx].find_captured_line(&needle) else {
+        let Some(line) = self.terminals[idx].find_captured_line(&needle, entry.row) else {
             self.status = String::from("Captured line is no longer in the scrollback");
             return;
         };
@@ -54788,6 +54789,7 @@ impl App {
                             shell_pid: t.shell_pid(),
                             message: h.message,
                             line: h.line,
+                            row: h.row,
                         });
                     }
                     crate::triggers::TriggerAction::Bell => {
@@ -56299,7 +56301,7 @@ impl App {
         // line alone otherwise.
         let needle: String = entry.line.trim_end().chars().take(60).collect();
         let context: Vec<String> = match self.terminals.get(idx) {
-            Some(t) => match t.find_captured_line(&needle) {
+            Some(t) => match t.find_captured_line(&needle, entry.row) {
                 Some(line) => {
                     let (lines, top) = t.grid_lines();
                     let hit = usize::try_from(line - top).unwrap_or(0);
