@@ -1288,3 +1288,25 @@ fn the_output_ports_and_captures_tabs_are_announced_by_name_and_row() {
     assert_eq!(snap.focus, "Captures, 1 capture");
     assert_eq!(snap.item.as_deref(), Some("Build failed, from zsh"));
 }
+
+/// #950: what a yes to the remote compile installs is in the dialog's log
+/// in full, wrapped so the narrowest dialog (48 columns, 46 inside) clips no
+/// word of it.
+#[test]
+fn remote_compile_disclosures_fit_the_narrowest_connect_dialog() {
+    let mut dialog = crate::widgets::connect_dialog::ConnectDialog::new(String::from("devbox"));
+    push_remote_compile_disclosures(&mut dialog);
+    assert!(
+        dialog.logs.iter().all(|l| l.chars().count() <= 46),
+        "{:?}",
+        dialog.logs
+    );
+    let shown = dialog.logs.join(" ");
+    let words = |s: &str| s.split_whitespace().map(str::to_string).collect::<Vec<_>>();
+    let shown_words = words(&shown);
+    for line in crate::remote::REMOTE_COMPILE_SIDE_EFFECTS {
+        for w in words(line) {
+            assert!(shown_words.contains(&w), "{w:?} is shown");
+        }
+    }
+}
