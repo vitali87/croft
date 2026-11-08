@@ -6434,26 +6434,6 @@ fn wrap_cells_variable_width(text: &str, first_width: u16, rest_width: u16) -> V
     }
 }
 
-/// Columns a remote-compile disclosure wraps to in the connect dialog's log
-/// (#950): the narrowest dialog (48 columns) less its border and the
-/// two-column lead, so no word of what a yes installs is clipped.
-const REMOTE_DISCLOSURE_WIDTH: u16 = 42;
-
-/// Say in the connect dialog's log, which the fallback prompt opens, what a
-/// yes to the remote compile installs, before it is answered (#950). Each
-/// line is wrapped to fit the narrowest dialog, whose log clips a long one.
-fn push_remote_compile_disclosures(dialog: &mut crate::widgets::connect_dialog::ConnectDialog) {
-    dialog.push_log("A remote compile may also:");
-    for line in crate::remote::REMOTE_COMPILE_SIDE_EFFECTS {
-        let rows =
-            wrap_cells_variable_width(line, REMOTE_DISCLOSURE_WIDTH, REMOTE_DISCLOSURE_WIDTH);
-        for (i, row) in rows.iter().enumerate() {
-            let lead = if i == 0 { "- " } else { "  " };
-            dialog.push_log(&format!("{lead}{row}"));
-        }
-    }
-}
-
 /// Cells reserved at the left of each highlight row for the kind glyph plus
 /// a one-cell gap before the summary text.
 const WELCOME_NOTE_GUTTER: u16 = 2;
@@ -47642,8 +47622,11 @@ impl App {
                 crate::install_session::InstallEvent::CanLaunch => can_launch = true,
                 crate::install_session::InstallEvent::FallbackPrompt { reason } => {
                     if let Some(dialog) = self.connect_dialog.as_mut() {
-                        dialog.set_fallback_prompt(&reason);
-                        push_remote_compile_disclosures(dialog);
+                        // What a yes installs, shown before the answer (#950).
+                        dialog.set_fallback_prompt(
+                            &reason,
+                            &crate::remote::REMOTE_COMPILE_SIDE_EFFECTS,
+                        );
                     } else if let Some(session) = self.install_session.as_ref() {
                         // No dialog to ask through: decline so the installer
                         // errors out with the `croft setup-cross` guidance
