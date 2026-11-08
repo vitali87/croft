@@ -900,9 +900,15 @@ fn a_shell_block_with_a_comment_runs_in_an_interactive_zsh() {
         typed += super::fence_command("sh", code, &scripts, "/bin/zsh").trim_end_matches('\r');
         typed += "\necho exit=$?\n";
     }
+    // Prompts and the partial-line mark blanked, so the output compared is
+    // only what the blocks print, whatever this zsh's defaults are.
     let Ok(mut zsh) = std::process::Command::new("zsh")
         .args(["-f", "-i"])
         .env("HOME", tmp.path())
+        .env("PS1", "")
+        .env("PS2", "")
+        .env("RPS1", "")
+        .env("PROMPT_EOL_MARK", "")
         .current_dir(tmp.path())
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
