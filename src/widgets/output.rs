@@ -624,22 +624,25 @@ fn row_text(text: &str) -> std::borrow::Cow<'_, str> {
     if !text.contains(['\t', '\n']) {
         return std::borrow::Cow::Borrowed(text);
     }
+    use unicode_segmentation::UnicodeSegmentation;
     let mut out = String::with_capacity(text.len() + TAB_STOP);
     let mut col = 0;
-    for c in text.chars() {
-        match c {
-            '\t' => {
+    // Grapheme by grapheme, as ratatui draws them: `👩‍💻` is one two-column
+    // glyph, not three code points summing to four.
+    for g in text.graphemes(true) {
+        match g {
+            "\t" => {
                 let pad = TAB_STOP - col % TAB_STOP;
                 out.extend(std::iter::repeat_n(' ', pad));
                 col += pad;
             }
-            '\n' => {
+            "\n" | "\r\n" => {
                 out.push(' ');
                 col += 1;
             }
-            c => {
-                out.push(c);
-                col += unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+            g => {
+                out.push_str(g);
+                col += unicode_width::UnicodeWidthStr::width(g);
             }
         }
     }
@@ -986,6 +989,8 @@ mod tests {
         assert_eq!(row_text("exactly8\tx"), "exactly8        x");
         // Stops count display columns: a CJK char is two.
         assert_eq!(row_text("表\tx"), "表      x");
+        // A cluster of several code points is the one glyph ratatui draws.
+        assert_eq!(row_text("👩‍💻\tx"), "👩‍💻      x");
         assert_eq!(row_text("one\ntwo"), "one two");
         assert!(matches!(
             row_text("plain"),
