@@ -38,19 +38,26 @@ impl Node {
     }
 
     /// The row's name: the entry's own, or a compact row's folder names
-    /// joined by `/`, as VS Code labels one.
+    /// joined by `/`, as VS Code labels one on every platform.
     pub fn label(&self) -> String {
-        let mut names: Vec<String> = self
-            .shown_paths()
-            .map(|p| {
-                p.file_name().map_or_else(
-                    || p.display().to_string(),
-                    |n| n.to_string_lossy().into_owned(),
-                )
-            })
-            .collect();
-        names.reverse();
-        names.join("/")
+        let name = |p: &Path| {
+            p.file_name().map_or_else(
+                || p.display().to_string(),
+                |n| n.to_string_lossy().into_owned(),
+            )
+        };
+        if self.folded == 0 {
+            return name(&self.path);
+        }
+        let shown: Vec<&Path> = self.shown_paths().collect();
+        let mut label = String::new();
+        for p in shown.into_iter().rev() {
+            if !label.is_empty() {
+                label.push('/');
+            }
+            label.push_str(&name(p));
+        }
+        label
     }
 }
 
@@ -3745,6 +3752,22 @@ mod tests {
         assert_eq!(rows(&tree), "1 docs, 2 a.md, 1 src, 2 main, 2 test");
     }
 
+    /// A folder whose only entry is a symlink back to itself does not fold
+    /// into a loop: a symlink is listed as itself, never as a folder, so
+    /// the chain stops there.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_back_to_its_folder_does_not_fold() {
+        let tmp = TempDir::new().unwrap();
+        let a = tmp.path().join("a");
+        fs::create_dir(&a).unwrap();
+        std::os::unix::fs::symlink(&a, a.join("again")).unwrap();
+        fs::write(tmp.path().join("README.md"), "").unwrap();
+        let mut tree = FileTree::new(tmp.path().to_path_buf());
+        expand(&mut tree, &a);
+        assert_eq!(rows(&tree), "1 a, 2 again, 1 README.md");
+    }
+
     #[test]
     fn compact_folders_off_lists_every_level_and_toggles_open_rows() {
         let (tmp, mut tree) = maven_fixture();
@@ -4201,7 +4224,7 @@ mod tests {
         }
         let mut tree = FileTree::new(root.to_path_buf());
         // Three levels of rows, not the compact row `outer/inner` (#1486).
-        tree.compact_folders = false;
+        tree.set_compact_folders(false);
         // Expand outer, then inner, so the deep files are real rows.
         let outer = tree
             .nodes

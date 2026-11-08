@@ -1588,7 +1588,7 @@ fn drag_target_over_the_sticky_band_is_the_pinned_directory() {
     std::fs::write(tmp.path().join("loose.txt"), "x\n").unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     // Three pinned rows, not the compact row `outer/inner` (#1486).
-    app.tree.compact_folders = false;
+    app.tree.set_compact_folders(false);
     let outer = app
         .tree
         .nodes
