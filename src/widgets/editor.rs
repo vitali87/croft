@@ -22471,10 +22471,12 @@ impl EditorTabs {
             return;
         }
         if let Some(page) = ed.pdf_page() {
+            // One page per wheel event, like the focused preview: the
+            // caller's notches are text lines (3 a tick), not pages.
             let target = if notches >= 0 {
-                page.saturating_add(notches as u32)
+                page.saturating_add(1)
             } else {
-                page.saturating_sub(notches.unsigned_abs()).max(1)
+                page.saturating_sub(1).max(1)
             };
             ed.set_pdf_page(target);
             return;

@@ -2508,11 +2508,13 @@ fn a_wheel_burst_over_a_background_split_pdf_steps_one_page() {
             .current_page
     };
     assert_eq!(page(&app), 1);
-    assert!(app.scroll_inactive_group_at(10, 10, 1));
-    assert!(app.scroll_inactive_group_at(10, 10, 1));
+    // The mouse handlers pass three text lines per wheel tick.
+    assert!(app.scroll_inactive_group_at(10, 10, 3));
+    assert_eq!(page(&app), 2, "one tick steps one page, not three");
+    assert!(app.scroll_inactive_group_at(10, 10, 3));
     assert_eq!(page(&app), 2, "a same-direction burst steps one page");
     // A reversal is deliberate and always passes.
-    assert!(app.scroll_inactive_group_at(10, 10, -1));
+    assert!(app.scroll_inactive_group_at(10, 10, -3));
     assert_eq!(page(&app), 1);
 }
 
@@ -2582,4 +2584,56 @@ fn the_wheel_finds_a_background_group_from_the_whole_editor_area() {
     let (col, row) = (other.x + other.width / 2, other.y + other.height / 2);
     assert!(app.scroll_inactive_group_at(col, row, 3));
     assert_eq!(app.editor_layout.inactive_groups()[0].scroll, 3);
+}
+
+/// Go to Line from the status bar takes the keyboard to the editor (the
+/// terminal may have had it when the readout was clicked) and is a Go Back
+/// stop, like Quick Open's `:line`.
+#[test]
+fn status_bar_go_to_line_focuses_the_editor_and_can_be_gone_back_from() {
+    let tmp = tempfile::tempdir().unwrap();
+    let body: String = (1..=10).map(|n| format!("line {n}\n")).collect();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", &body);
+    app.editor.cursor_row = 1;
+    app.focus = Pane::Terminal;
+    app.open_go_to_line_prompt();
+    app.input_prompt.as_mut().unwrap().value = String::from("8");
+    app.submit_input_prompt();
+    assert!(
+        matches!(app.focus, Pane::Editor),
+        "the editor takes the keys"
+    );
+    assert_eq!(app.editor.cursor_row, 7);
+    app.run_command(crate::widgets::command_palette::Command::NavigateBack);
+    assert_eq!(app.editor.cursor_row, 1, "Go Back returns to where it left");
+}
+
+/// Toggle Bookmark in the gutter menu marks the clicked line and leaves the
+/// caret, the selection and the view alone, as the gutter's own toggle
+/// does: moving the caret there kept the selection for the next key.
+#[test]
+fn the_gutter_menus_toggle_bookmark_leaves_the_caret_and_selection_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let body: String = (1..=10).map(|n| format!("line {n}\n")).collect();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", &body);
+    let path = app.editor.path.clone().unwrap();
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 4;
+    app.editor.selection = Some(crate::widgets::editor::EditorSelection {
+        anchor: (0, 0),
+        head: (0, 4),
+    });
+    app.dispatch_menu_action(
+        MenuAction::ToggleBookmarkAt { line: 8 },
+        tmp.path().to_path_buf(),
+    );
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (0, 4));
+    assert!(app.editor.selection.is_some(), "the selection stays");
+    assert!(
+        app.editor
+            .bookmarks
+            .get(&path)
+            .is_some_and(|s| s.contains(&8)),
+        "line 8 is bookmarked"
+    );
 }

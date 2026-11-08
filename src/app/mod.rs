@@ -40848,6 +40848,17 @@ impl App {
                         // goto_line_centered takes a 0-based row index. A
                         // selection left behind would be replaced by the next
                         // keystroke off screen, so it goes, as Ctrl+G's does.
+                        // Like Quick Open's `:line`, the jump is a Go Back
+                        // stop, and the editor takes the keys even when the
+                        // terminal had them when the status bar was clicked.
+                        if let Some(from) = self.editor.path.clone() {
+                            self.nav.record(NavLoc {
+                                path: from,
+                                row: self.editor.cursor_row,
+                                col: self.editor.cursor_col,
+                            });
+                        }
+                        self.focus_pane(Pane::Editor);
                         self.editor.clear_selection();
                         self.editor.goto_line_centered(n - 1);
                         self.status = format!("Line {n}");
@@ -71238,10 +71249,11 @@ impl App {
             }
             MenuAction::ToggleBookmarkAt { line } => {
                 self.focus_pane(Pane::Editor);
-                // `toggle_bookmark` acts on the cursor, so seat it on the
-                // clicked line first; `line` is 1-based, the editor 0-based.
-                self.editor.goto_line_centered(line.saturating_sub(1));
-                self.toggle_bookmark();
+                // The clicked line (1-based), with the caret, selection and
+                // scroll left alone, as the gutter's own toggle does: moving
+                // the caret there kept the selection, which the next key
+                // then replaced off screen.
+                self.toggle_bookmark_at(line);
             }
             MenuAction::NextBookmark => {
                 self.focus_pane(Pane::Editor);
