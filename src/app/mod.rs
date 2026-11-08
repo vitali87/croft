@@ -3868,6 +3868,13 @@ pub struct App {
     /// What gcc/clang-shaped build messages count their column in
     /// (`build_column_unit`), applied when a scan installs its rows.
     build_column_unit: crate::build_matchers::ColumnUnit,
+    /// The PROBLEMS entry Go to Next/Previous Problem last opened, as (its
+    /// file, line, column, place in the walked list) plus where that left
+    /// the caret (row, column). Repeating the command from that caret steps
+    /// from this entry, not from the caret: an entry past its line's end
+    /// leaves the caret clamped short of it, which compared as still ahead
+    /// and was picked again, and entries sharing a position were skipped.
+    last_problem_jump: Option<(PathBuf, u32, u32, usize, usize, usize)>,
     /// Signals that this workspace is too large for `auto` to run the sweep
     /// unasked (#256). Sent from the sweep's worker, since deciding it is a
     /// whole-workspace walk.
@@ -6964,6 +6971,7 @@ impl App {
             build_column_unit: crate::build_matchers::ColumnUnit::from_pref(
                 &loaded_prefs.build_column_unit,
             ),
+            last_problem_jump: None,
             test_jump_rx,
             test_jump_tx,
             timeline_fetched: None,
@@ -15928,22 +15936,50 @@ impl App {
         let key = |e: &(PathBuf, crate::widgets::problems::ProblemItem, u32)| {
             (e.0.clone(), e.1.line, e.2)
         };
-        let idx = match here {
-            None => {
-                if forward {
-                    0
-                } else {
-                    list.len() - 1
-                }
+        // Still where the last jump left the caret: step from that entry
+        // (by its place in the list when it is still there, else by its
+        // position), whatever the clamped caret compares as.
+        let from_last = self
+            .last_problem_jump
+            .as_ref()
+            .filter(|(p, _, _, _, row, col)| {
+                here.as_ref() == Some(p)
+                    && self.editor.cursor_row == *row
+                    && self.editor.cursor_col == *col
+            })
+            .and_then(|(p, line, col, at, _, _)| {
+                let same = |e: &(PathBuf, crate::widgets::problems::ProblemItem, u32)| {
+                    &e.0 == p && e.1.line == *line && e.1.col == *col
+                };
+                list.get(*at)
+                    .filter(|e| same(e))
+                    .map(|_| *at)
+                    .or_else(|| list.iter().position(same))
+            });
+        let idx = if let Some(at) = from_last {
+            if forward {
+                (at + 1) % list.len()
+            } else {
+                (at + list.len() - 1) % list.len()
             }
-            Some(p) => {
-                let at = (p, cur.0, cur.1);
-                if forward {
-                    list.iter().position(|e| key(e) > at).unwrap_or(0)
-                } else {
-                    list.iter()
-                        .rposition(|e| key(e) < at)
-                        .unwrap_or(list.len() - 1)
+        } else {
+            match here {
+                None => {
+                    if forward {
+                        0
+                    } else {
+                        list.len() - 1
+                    }
+                }
+                Some(p) => {
+                    let at = (p, cur.0, cur.1);
+                    if forward {
+                        list.iter().position(|e| key(e) > at).unwrap_or(0)
+                    } else {
+                        list.iter()
+                            .rposition(|e| key(e) < at)
+                            .unwrap_or(list.len() - 1)
+                    }
                 }
             }
         };
@@ -15957,6 +15993,14 @@ impl App {
             self.status = format!("Open failed: {e}");
             return;
         }
+        self.last_problem_jump = Some((
+            path.clone(),
+            item.line,
+            item.col,
+            idx,
+            self.editor.cursor_row,
+            self.editor.cursor_col,
+        ));
         let kind = match item.severity {
             DiagnosticSeverity::Error => "error",
             DiagnosticSeverity::Warning => "warning",

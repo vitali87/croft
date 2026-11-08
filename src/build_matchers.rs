@@ -158,15 +158,19 @@ fn convert_columns_within(
         by_file[slot].1.push(i);
     }
     for (path, rows) in by_file {
+        // Only a regular file is read: a printed path can name a device or
+        // a FIFO (`/dev/zero:1:2: error`), whose reported length is 0 but
+        // which reads forever or blocks the open, on the UI thread.
         let Some(len) = std::fs::metadata(&path)
             .ok()
+            .filter(std::fs::Metadata::is_file)
             .map(|m| m.len())
             .filter(|&n| n <= MAX_BYTES.min(budget))
         else {
             continue;
         };
         budget -= len;
-        let Ok(text) = std::fs::read_to_string(&path) else {
+        let Some(text) = read_capped(&path, len) else {
             continue;
         };
         let lines: Vec<&str> = text.lines().collect();
@@ -181,6 +185,20 @@ fn convert_columns_within(
             d.col = char_col(line, d.col as usize, unit, tabstop) as u32;
         }
     }
+}
+
+/// `path` as text, reading at most `limit` bytes: a file that grew past
+/// the size its metadata gave (or changed to something else since) is not
+/// read past it, and reads as `None` rather than a truncated line.
+fn read_capped(path: &std::path::Path, limit: u64) -> Option<String> {
+    use std::io::Read;
+    let mut text = String::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(limit + 1)
+        .read_to_string(&mut text)
+        .ok()?;
+    (text.len() as u64 <= limit).then_some(text)
 }
 
 /// One matched problem, file still as the tool printed it (resolution
@@ -740,5 +758,23 @@ csrc/c.c:1:20: error: 'y' undeclared (first use in this function)\n";
         assert_eq!(d[0].col, 3, "the first file is read and converted");
         assert_eq!(d[2].col, 3, "its second row comes from the same read");
         assert_eq!(d[1].col, 10, "the file past the budget is not read");
+    }
+
+    /// A printed path naming a device is never read: `/dev/zero` reports a
+    /// length of 0 and would read forever on the UI thread.
+    #[cfg(unix)]
+    #[test]
+    fn convert_columns_never_reads_a_device_a_build_message_names() {
+        let mut d = vec![BuildDiag {
+            file: String::from("/dev/zero"),
+            line: 0,
+            col: 5,
+            severity: DiagnosticSeverity::Error,
+            message: String::from("boom"),
+            source: String::from("build"),
+            needs_file: false,
+        }];
+        convert_columns(&mut d, std::path::Path::new("/"), ColumnUnit::Display, 8);
+        assert_eq!(d[0].col, 5, "the row keeps its column");
     }
 }

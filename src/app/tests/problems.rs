@@ -1420,6 +1420,36 @@ fn go_to_next_problem_between_entries_and_with_none() {
     );
 }
 
+/// An entry past its line's end leaves the caret clamped short of it, and
+/// entries can share a position: repeating Next Problem still walks every
+/// entry instead of picking the same one again.
+#[test]
+fn go_to_next_problem_walks_past_an_entry_beyond_its_line_and_shared_positions() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.c");
+    std::fs::write(&a, "int a;\nint b;\nint c;\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    seed_build_rows(
+        &mut app,
+        &[
+            (&a, 0, 50, "past the end"),
+            (&a, 2, 1, "first here"),
+            (&a, 2, 1, "second here"),
+        ],
+    );
+    let next = Command::from_id("next_problem").unwrap();
+    app.run_command(next);
+    assert!(app.status.contains("past the end"), "{}", app.status);
+    assert_eq!(app.editor.cursor_row, 0);
+    app.run_command(next);
+    assert!(app.status.contains("first here"), "{}", app.status);
+    app.run_command(next);
+    assert!(app.status.contains("second here"), "{}", app.status);
+    app.run_command(next);
+    assert!(app.status.contains("past the end"), "wraps: {}", app.status);
+}
+
 /// A watch task's batch is installed without a finished command's scan, and
 /// still gets the `build_column_unit` conversion: a gcc display column on a
 /// tabbed line lands on the character it names.
