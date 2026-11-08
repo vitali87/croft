@@ -1,0 +1,1 @@
+feature: The Markdown preview draws GitHub alerts (`> [!NOTE]`, `[!TIP]`, `[!IMPORTANT]`, `[!WARNING]`, `[!CAUTION]`) as GitHub does: a coloured title row with an icon, a bar in the alert's colour, and no raw `[!WARNING]` marker.
