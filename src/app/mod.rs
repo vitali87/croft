@@ -15916,6 +15916,7 @@ impl App {
         let cur = (self.editor.cursor_row as u32, self.editor.cursor_col as u32);
         let mut list: Vec<(PathBuf, crate::widgets::problems::ProblemItem, u32)> = Vec::new();
         for g in self.problems.groups() {
+            let start = list.len();
             for item in &g.items {
                 // Compare in characters, as the caret counts: an LSP column
                 // is UTF-16, and only the open file's text is at hand.
@@ -15928,6 +15929,12 @@ impl App {
                 };
                 list.push((g.path.clone(), item.clone(), ccol));
             }
+            // The panel orders a file's rows by their stored columns, UTF-16
+            // for an LSP row and characters for a build row, so on a line
+            // with astral characters the two disagree; the walk goes by the
+            // character position. Stable, so entries at one place keep
+            // their panel order.
+            list[start..].sort_by_key(|e| (e.1.line, e.2));
         }
         if list.is_empty() {
             self.status = String::from("No problems");

@@ -1450,6 +1450,47 @@ fn go_to_next_problem_walks_past_an_entry_beyond_its_line_and_shared_positions()
     assert!(app.status.contains("past the end"), "wraps: {}", app.status);
 }
 
+/// On a line with astral characters an LSP row's UTF-16 column and a build
+/// row's character column sort differently in the panel; Next Problem walks
+/// the file's entries by character position, nearest first.
+#[test]
+fn go_to_next_problem_orders_lsp_and_build_rows_by_character_position() {
+    use crate::lsp::manager::DiagnosticSeverity;
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.c");
+    std::fs::write(&a, "\u{1f600}\u{1f600}abc\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let row = |col: u32, col_utf16: bool, msg: &str| {
+        (
+            1,
+            crate::widgets::problems::ProblemItem {
+                line: 0,
+                col,
+                col_utf16,
+                severity: DiagnosticSeverity::Warning,
+                message: msg.to_string(),
+                source: String::from("build"),
+                code: None,
+            },
+        )
+    };
+    // `b` is character 3; UTF-16 column 4 is character 2, the `a`.
+    app.build_diagnostics
+        .entry(a.clone())
+        .or_default()
+        .extend([row(3, false, "at b"), row(4, true, "at a")]);
+    app.rebuild_problems();
+    app.editor.open_pinned(&a).unwrap();
+    let next = Command::from_id("next_problem").unwrap();
+    app.run_command(next);
+    assert!(app.status.contains("at a"), "nearest first: {}", app.status);
+    assert_eq!(app.editor.cursor_col, 2);
+    app.run_command(next);
+    assert!(app.status.contains("at b"), "{}", app.status);
+    assert_eq!(app.editor.cursor_col, 3);
+}
+
 /// An entry whose file no longer opens is passed over instead of holding
 /// every repeat of Next Problem on itself; when no entry opens, the failure
 /// is reported.
