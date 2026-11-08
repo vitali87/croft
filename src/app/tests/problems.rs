@@ -1450,6 +1450,34 @@ fn go_to_next_problem_walks_past_an_entry_beyond_its_line_and_shared_positions()
     assert!(app.status.contains("past the end"), "wraps: {}", app.status);
 }
 
+/// An entry whose file no longer opens is passed over instead of holding
+/// every repeat of Next Problem on itself; when no entry opens, the failure
+/// is reported.
+#[test]
+fn go_to_next_problem_passes_over_an_entry_whose_file_is_gone() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let gone = tmp.path().join("a_gone.c");
+    let b = tmp.path().join("b.c");
+    std::fs::write(&b, "int b;\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    seed_build_rows(&mut app, &[(&gone, 0, 1, "lost"), (&b, 0, 4, "found")]);
+    let next = Command::from_id("next_problem").unwrap();
+    app.run_command(next);
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(b.as_path()),
+        "{}",
+        app.status
+    );
+    assert!(app.status.contains("found"), "{}", app.status);
+    std::fs::remove_file(&b).unwrap();
+    let mut alone = App::new(tmp.path().to_path_buf()).unwrap();
+    seed_build_rows(&mut alone, &[(&gone, 0, 1, "lost")]);
+    alone.run_command(next);
+    assert!(alone.status.starts_with("Open failed"), "{}", alone.status);
+}
+
 /// A watch task's batch is installed without a finished command's scan, and
 /// still gets the `build_column_unit` conversion: a gcc display column on a
 /// tabbed line lands on the character it names.

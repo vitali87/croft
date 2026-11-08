@@ -15983,16 +15983,34 @@ impl App {
                 }
             }
         };
-        let (path, item, _) = list[idx].clone();
-        let opened = if item.col_utf16 {
-            self.open_at_utf16(&path, item.line, item.col)
-        } else {
-            self.open_at(&path, item.line as usize, item.col as usize)
+        // An entry whose file no longer opens (deleted since the build) is
+        // passed over in the walk's direction, so it cannot hold every
+        // repeat on itself; only when none opens is the failure reported.
+        let mut idx = idx;
+        let mut tried = 0;
+        let (path, item) = loop {
+            let (path, item, _) = list[idx].clone();
+            let opened = if item.col_utf16 {
+                self.open_at_utf16(&path, item.line, item.col)
+            } else {
+                self.open_at(&path, item.line as usize, item.col as usize)
+            };
+            match opened {
+                Ok(()) => break (path, item),
+                Err(e) => {
+                    tried += 1;
+                    if tried == list.len() {
+                        self.status = format!("Open failed: {e}");
+                        return;
+                    }
+                    idx = if forward {
+                        (idx + 1) % list.len()
+                    } else {
+                        (idx + list.len() - 1) % list.len()
+                    };
+                }
+            }
         };
-        if let Err(e) = opened {
-            self.status = format!("Open failed: {e}");
-            return;
-        }
         self.last_problem_jump = Some((
             path.clone(),
             item.line,

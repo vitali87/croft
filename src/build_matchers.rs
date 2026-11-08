@@ -72,8 +72,11 @@ pub fn tabstop_from_command(cmd: &str) -> usize {
 
 /// The 0-based character index in `line` of the 0-based column `col` counted
 /// in `unit`. A column past the end of the line lands on its character count,
-/// and one inside a wide character or a tab on that character.
-pub fn char_col(line: &str, col: usize, unit: ColumnUnit, tabstop: usize) -> usize {
+/// and one inside a wide character or a tab on that character. The
+/// one-column reference the conversion's single walk (`char_cols`) is
+/// checked against.
+#[cfg(test)]
+fn char_col(line: &str, col: usize, unit: ColumnUnit, tabstop: usize) -> usize {
     use unicode_width::UnicodeWidthChar;
     let tabstop = tabstop.max(1);
     match unit {
@@ -174,17 +177,60 @@ fn convert_columns_within(
             continue;
         };
         let lines: Vec<&str> = text.lines().collect();
-        for i in rows {
-            let d = &mut diags[i];
-            let Some(line) = lines.get(d.line as usize) else {
+        // A line's rows are converted together, in one walk along it
+        // (`char_cols`): thousands of rows on one long line cost one pass,
+        // not one pass each.
+        let mut keyed: Vec<(u32, usize, usize)> = rows
+            .into_iter()
+            .map(|i| (diags[i].line, diags[i].col as usize, i))
+            .collect();
+        keyed.sort_unstable();
+        for group in keyed.chunk_by(|a, b| a.0 == b.0) {
+            let Some(line) = lines.get(group[0].0 as usize) else {
                 continue;
             };
             if line.is_ascii() && !line.contains('\t') {
                 continue;
             }
-            d.col = char_col(line, d.col as usize, unit, tabstop) as u32;
+            let cols: Vec<usize> = group.iter().map(|g| g.1).collect();
+            for (g, c) in group.iter().zip(char_cols(line, &cols, unit, tabstop)) {
+                diags[g.2].col = c as u32;
+            }
         }
     }
+}
+
+/// [`char_col`] for many columns of one line in a single walk along it.
+/// `cols` must be in ascending order; the result holds each column's
+/// character index, in the same order.
+fn char_cols(line: &str, cols: &[usize], unit: ColumnUnit, tabstop: usize) -> Vec<usize> {
+    use unicode_width::UnicodeWidthChar;
+    if unit == ColumnUnit::Char {
+        return cols.to_vec();
+    }
+    let tabstop = tabstop.max(1);
+    let mut out = Vec::with_capacity(cols.len());
+    // Bytes (Byte) or cells (Display) before the current character.
+    let mut at = 0usize;
+    let mut count = 0usize;
+    for (i, c) in line.chars().enumerate() {
+        let end = at
+            + match unit {
+                ColumnUnit::Byte => c.len_utf8(),
+                _ if c == '\t' => tabstop - at % tabstop,
+                _ => c.width().unwrap_or(0),
+            };
+        while out.len() < cols.len() && cols[out.len()] < end {
+            out.push(i);
+        }
+        if out.len() == cols.len() {
+            return out;
+        }
+        at = end;
+        count = i + 1;
+    }
+    out.resize(cols.len(), count);
+    out
 }
 
 /// `path` as text if it is a regular file, reading at most `limit` bytes.
@@ -786,6 +832,29 @@ csrc/c.c:1:20: error: 'y' undeclared (first use in this function)\n";
         }];
         convert_columns(&mut d, std::path::Path::new("/"), ColumnUnit::Display, 8);
         assert_eq!(d[0].col, 5, "the row keeps its column");
+    }
+
+    /// The one-walk conversion of a line's columns gives exactly what
+    /// `char_col` gives for each column on its own, in both units, across
+    /// tabs, wide characters, zero-width ones and the end of the line.
+    #[test]
+    fn char_cols_matches_char_col_column_by_column() {
+        let line = "\t a\u{4e2d}e\u{301}b\tc\u{1f600}d";
+        let cols: Vec<usize> = (0..48).collect();
+        for unit in [ColumnUnit::Byte, ColumnUnit::Display, ColumnUnit::Char] {
+            for tabstop in [1, 4, 8] {
+                let one: Vec<usize> = cols
+                    .iter()
+                    .map(|&c| char_col(line, c, unit, tabstop))
+                    .collect();
+                assert_eq!(
+                    char_cols(line, &cols, unit, tabstop),
+                    one,
+                    "{unit:?} tabstop {tabstop}"
+                );
+            }
+        }
+        assert_eq!(char_cols("", &[0, 3], ColumnUnit::Display, 8), [0, 0]);
     }
 
     /// The read itself never blocks on a FIFO, even one that takes the
