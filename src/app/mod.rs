@@ -22476,6 +22476,19 @@ impl App {
             .inactive_groups_mut()
             .get_mut(inactive_idx)
         {
+            // A PDF page step is a synchronous rasterise, so a background
+            // split's PDF coalesces a wheel burst exactly like the focused one
+            // (see wheel_pdf_page), stamped after the render.
+            let ed = group.active_editor_mut();
+            let pdf_doc = (ed.diff.is_none() && ed.pdf_page().is_some()).then(|| ed.path.clone());
+            if let Some(doc) = pdf_doc {
+                if pdf_wheel_cooling(self.last_pdf_wheel.as_ref(), notches, &doc) {
+                    return true;
+                }
+                group.wheel_scroll_active(notches);
+                self.last_pdf_wheel = Some((std::time::Instant::now(), notches.signum(), doc));
+                return true;
+            }
             group.wheel_scroll_active(notches);
             return true;
         }
@@ -40751,7 +40764,10 @@ impl App {
                 match value.trim().parse::<usize>() {
                     Ok(n) if n > 0 => {
                         // The typed line is 1-based (what the status bar shows);
-                        // goto_line_centered takes a 0-based row index.
+                        // goto_line_centered takes a 0-based row index. A
+                        // selection left behind would be replaced by the next
+                        // keystroke off screen, so it goes, as Ctrl+G's does.
+                        self.editor.clear_selection();
                         self.editor.goto_line_centered(n - 1);
                         self.status = format!("Line {n}");
                     }
@@ -72518,13 +72534,8 @@ impl App {
     /// freezing the TUI for one render per event. A reversal is deliberate
     /// and always passes.
     fn wheel_pdf_page(&mut self, delta: i32) {
-        const COOLDOWN: std::time::Duration = std::time::Duration::from_millis(150);
         let doc = self.editor.path.clone();
-        if let Some((at, dir, last_doc)) = &self.last_pdf_wheel
-            && *dir == delta.signum()
-            && *last_doc == doc
-            && at.elapsed() < COOLDOWN
-        {
+        if pdf_wheel_cooling(self.last_pdf_wheel.as_ref(), delta, &doc) {
             return;
         }
         let Some(cur) = self.editor.pdf_page() else {
@@ -81477,6 +81488,22 @@ fn scrollback_opens_as_log(rows: &[String]) -> bool {
     }
     let cut = prefix.floor_char_boundary(prefix.len().min(8192));
     crate::ansi_text::looks_like_ansi(&prefix[..cut])
+}
+
+/// Whether a PDF wheel step of `delta` in `doc` falls inside the cooldown of
+/// the last one (`last`: when, which direction, which document): a
+/// same-direction repeat in the same document within 150 ms is dropped so a
+/// momentum flick costs one rasterise, not one per event. A reversal or
+/// another document always passes.
+fn pdf_wheel_cooling(
+    last: Option<&(std::time::Instant, i32, Option<PathBuf>)>,
+    delta: i32,
+    doc: &Option<PathBuf>,
+) -> bool {
+    const COOLDOWN: std::time::Duration = std::time::Duration::from_millis(150);
+    last.is_some_and(|(at, dir, last_doc)| {
+        *dir == delta.signum() && last_doc == doc && at.elapsed() < COOLDOWN
+    })
 }
 
 fn rect_contains(r: Rect, x: u16, y: u16) -> bool {

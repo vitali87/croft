@@ -2451,3 +2451,67 @@ fn move_editor_into_next_group_splits_then_previous_brings_it_back() {
     assert_eq!(tab_names_852(&app.editor), ["a.py", "b.py", "c.py"]);
     assert_eq!(active_name_1565(&app), "c.py");
 }
+
+/// Go to Line from the status bar drops the selection it leaves behind, as
+/// Ctrl+G does: otherwise the next keystroke replaced the old selection,
+/// off screen, instead of typing at the line jumped to.
+#[test]
+fn status_bar_go_to_line_drops_the_selection_it_leaves_behind() {
+    let tmp = tempfile::tempdir().unwrap();
+    let body: String = (1..=10).map(|n| format!("line {n}\n")).collect();
+    let mut app = app_with_open_file(tmp.path(), "a.txt", &body);
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 4;
+    app.editor.selection = Some(crate::widgets::editor::EditorSelection {
+        anchor: (0, 0),
+        head: (0, 4),
+    });
+    app.open_go_to_line_prompt();
+    app.input_prompt.as_mut().unwrap().value = String::from("8");
+    app.submit_input_prompt();
+    assert_eq!(app.editor.cursor_row, 7);
+    assert!(app.editor.selection.is_none(), "the old selection goes");
+    app.handle_editor_key(key(KeyCode::Char('x'), KeyModifiers::NONE));
+    assert_eq!(app.editor.lines[0], "line 1", "line 1 is left alone");
+    assert!(
+        app.editor.lines[7].contains('x'),
+        "the typing lands on line 8"
+    );
+}
+
+/// A wheel burst over a PDF in a background split steps one page, as it does
+/// in the focused group: every step is a synchronous rasterise, and without
+/// the cooldown a flick froze the UI for one render per queued event.
+#[test]
+fn a_wheel_burst_over_a_background_split_pdf_steps_one_page() {
+    require_pdf_backend();
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("doc.pdf");
+    write_three_page_pdf(&path);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&path).unwrap();
+    app.split_editor();
+    assert!(app.editor_layout.is_split());
+    let area = Rect {
+        x: 0,
+        y: 0,
+        width: 50,
+        height: 30,
+    };
+    app.editor_layout.inactive_groups_mut()[0].last_full_area = area;
+    let page = |app: &App| {
+        app.editor_layout.inactive_groups()[0]
+            .image
+            .as_ref()
+            .and_then(|i| i.pdf.as_ref())
+            .expect("the background group shows the PDF")
+            .current_page
+    };
+    assert_eq!(page(&app), 1);
+    assert!(app.scroll_inactive_group_at(10, 10, 1));
+    assert!(app.scroll_inactive_group_at(10, 10, 1));
+    assert_eq!(page(&app), 2, "a same-direction burst steps one page");
+    // A reversal is deliberate and always passes.
+    assert!(app.scroll_inactive_group_at(10, 10, -1));
+    assert_eq!(page(&app), 1);
+}
