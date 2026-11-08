@@ -13,6 +13,7 @@ repo has moved on since it was built shows a rebuild hint in the status bar.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import time
@@ -138,11 +139,12 @@ def demo(binary: str, files: dict[str, str], **kw) -> Demo:
 def wordcount(binary: str) -> Demo:
     """A Demo on the word-count crate, committed as "Count words"."""
     d = demo(binary, dict(WORDCOUNT))
+    # Your PATH, but the scene's HOME, so its .gitconfig names the author;
+    # GIT_* variables (GIT_AUTHOR_NAME, GIT_DIR) would override it.
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    env["HOME"] = str(d.home)
     for args in (["init", "-q"], ["add", "-A"], ["commit", "-q", "-m", "Count words"]):
-        subprocess.run(
-            ["git", *args], cwd=d.project, env={"HOME": str(d.home), "PATH": "/usr/bin:/bin"},
-            check=True, capture_output=True,
-        )
+        subprocess.run(["git", *args], cwd=d.project, env=env, check=True, capture_output=True)
     return d
 
 
@@ -388,11 +390,21 @@ SCENES = {
 }
 
 
-def main(binary: str, names: list[str]) -> None:
-    """Record `names`, or every scene, from `binary`."""
-    for name in names or SCENES:
+def main(argv: list[str]) -> int:
+    """Record the scenes `argv` names after the binary, or every scene."""
+    if not argv:
+        print(f"usage: docs_gifs.py <croft binary> [{' | '.join(SCENES)} ...]", file=sys.stderr)
+        return 2
+    binary, names = argv[0], argv[1:] or list(SCENES)
+    unknown = [n for n in names if n not in SCENES]
+    if unknown:
+        print(f"unknown scene {', '.join(unknown)}; scenes: {', '.join(SCENES)}", file=sys.stderr)
+        return 2
+    OUT.mkdir(parents=True, exist_ok=True)
+    for name in names:
         SCENES[name](binary, OUT / f"{name}.gif")
+    return 0
 
 
 if __name__ == "__main__":
-    main(sys.argv[1], sys.argv[2:])
+    sys.exit(main(sys.argv[1:]))
