@@ -1680,7 +1680,7 @@ impl LspManager {
     /// Test hook: deliver a hover reply as if a server had answered.
     #[cfg(test)]
     pub fn push_hover_for_test(&self, result: HoverResult) {
-        let _ = self.hover_test_tx.send(result);
+        self.hover_test_tx.send(result).expect("hover channel open");
     }
 
     /// Send one of rust-analyzer's own requests (#1626) for the caret at
@@ -2663,7 +2663,8 @@ type ClientKey = (Language, PathBuf);
 /// Why [`WorkerState::pick_server`] found no server to ask.
 enum NoServer {
     /// The file is not open, or no server set exists for its language and
-    /// root: the request is dropped without a reply.
+    /// root: the request is dropped without a reply (a hover gets an empty
+    /// one).
     Unknown,
     /// Servers run for the file, but none carries the method.
     Unsupported,
@@ -4435,19 +4436,21 @@ impl WorkerState {
         character: u32,
         tx: &std_mpsc::Sender<HoverResult>,
     ) {
+        // Every hover is answered, an empty answer when no server can give
+        // one: the app holds a problem's message until the reply, and Show
+        // Hover says when there is nothing (#1518).
+        let none = || {
+            let _ = tx.send(HoverResult {
+                request_id,
+                text: None,
+            });
+        };
         let (server_name, client_arc) = match self.pick_server(&path, |c| c.supports_hover).await {
             Ok(picked) => picked,
-            Err(NoServer::Unsupported) => {
-                let _ = tx.send(HoverResult {
-                    request_id,
-                    text: None,
-                });
-                return;
-            }
-            Err(NoServer::Unknown) => return,
+            Err(NoServer::Unsupported | NoServer::Unknown) => return none(),
         };
         let Ok(uri) = Url::from_file_path(&path) else {
-            return;
+            return none();
         };
         let tx = tx.clone();
         log_file::log(&format!(

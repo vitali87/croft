@@ -199,12 +199,12 @@ fn hovering_a_diagnostic_on_punctuation_shows_its_message_synchronously() {
     );
 }
 
-/// `let n = compute(1);` in an editor stood up by hand, the caret at `col`.
-/// No language server has the file open, so the only hover reply is the
-/// one a test pushes.
+/// `let n = compute(1);` in a `.txt` file stood up by hand, the caret at
+/// `col`. No language server has the file, so the worker answers each hover
+/// request with nothing; [`await_hover_reply`] waits for that answer.
 fn caret_hover_app(col: usize) -> (App, tempfile::TempDir) {
     let tmp = tempfile::tempdir().unwrap();
-    let f = tmp.path().join("main.rs");
+    let f = tmp.path().join("notes.txt");
     std::fs::write(&f, "let n = compute(1);\n").unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.editor.path = Some(f);
@@ -216,15 +216,45 @@ fn caret_hover_app(col: usize) -> (App, tempfile::TempDir) {
     (app, tmp)
 }
 
-fn answer_hover(app: &App, request_id: u64, text: Option<&str>) {
+fn answer_hover(app: &App, request_id: u64, text: &str) {
     app.lsp
         .as_ref()
         .unwrap()
         .push_hover_for_test(crate::lsp::manager::HoverResult {
             request_id,
-            text: text.map(String::from),
+            text: Some(String::from(text)),
         });
 }
+
+/// Drain until the worker's answer to the pending hover request lands.
+fn await_hover_reply(app: &mut App) {
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(200),
+        "the LSP worker to answer the hover request",
+        || app.drain_lsp_hover(),
+    );
+}
+
+fn diagnose_compute(app: &mut App) {
+    use crate::lsp::manager::{Diagnostic, DiagnosticSeverity};
+    let path = app.editor.path.clone().unwrap();
+    app.editor.apply_diagnostics(
+        path,
+        vec![Diagnostic {
+            start_line: 0,
+            start_char: 8,
+            end_line: 0,
+            end_char: 15,
+            severity: DiagnosticSeverity::Error,
+            message: String::from("cannot find function `compute` in this scope"),
+            tags: Default::default(),
+            code: None,
+            origin: None,
+        }],
+    );
+}
+
+const COMPUTE_PROBLEM: &str = "Error: cannot find function `compute` in this scope";
 
 #[test]
 fn show_hover_asks_about_the_caret_and_opens_the_popup_there() {
@@ -241,7 +271,9 @@ fn show_hover_asks_about_the_caret_and_opens_the_popup_there() {
         .hover_request_id
         .expect("a word at the caret asks the server");
     assert_eq!(app.hover_word, Some((0, 8, 15)), "about `compute`");
-    answer_hover(&app, id, Some("fn compute(x: i32) -> i32"));
+    // The worker's own empty answer first, so the pushed one is the last.
+    await_hover_reply(&mut app);
+    answer_hover(&app, id, "fn compute(x: i32) -> i32");
     assert!(app.drain_lsp_hover());
     let popup = app.hover_popup.as_ref().expect("the reply opens the popup");
     assert_eq!(popup.lines, vec![String::from("fn compute(x: i32) -> i32")]);
@@ -252,37 +284,83 @@ fn show_hover_asks_about_the_caret_and_opens_the_popup_there() {
 }
 
 #[test]
-fn show_hover_on_a_problem_the_server_cannot_describe_shows_its_message() {
-    use crate::lsp::manager::{Diagnostic, DiagnosticSeverity};
+fn show_hover_in_a_file_no_server_has_shows_a_problem_or_says_there_is_none() {
+    // The worker dropped a hover request no server could take, so the
+    // command waited forever: no popup for the problem, no status (#1518).
     let (mut app, _tmp) = caret_hover_app(10);
-    let path = app.editor.path.clone().unwrap();
-    app.editor.apply_diagnostics(
-        path,
-        vec![Diagnostic {
-            start_line: 0,
-            start_char: 8,
-            end_line: 0,
-            end_char: 15,
-            severity: DiagnosticSeverity::Error,
-            message: String::from("cannot find function `compute` in this scope"),
-            tags: Default::default(),
-            code: None,
-            origin: None,
-        }],
-    );
     app.run_command(crate::widgets::command_palette::Command::ShowHover);
-    let id = app
-        .hover_request_id
-        .expect("the word still asks the server");
-    answer_hover(&app, id, None);
-    assert!(app.drain_lsp_hover());
-    let popup = app.hover_popup.as_ref().expect("the problem still shows");
-    assert_eq!(
-        popup.lines,
-        vec![String::from(
-            "Error: cannot find function `compute` in this scope"
-        )]
-    );
+    assert!(app.hover_request_id.is_some(), "a word still asks");
+    await_hover_reply(&mut app);
+    assert!(app.hover_popup.is_none());
+    assert_eq!(app.status, "No hover information at the caret");
+
+    diagnose_compute(&mut app);
+    app.run_command(crate::widgets::command_palette::Command::ShowHover);
+    await_hover_reply(&mut app);
+    let popup = app.hover_popup.as_ref().expect("the problem shows");
+    assert_eq!(popup.lines, vec![String::from(COMPUTE_PROBLEM)]);
+}
+
+#[test]
+fn a_pointer_hover_in_a_file_no_server_has_shows_the_problem_on_a_word() {
+    // The same dropped request left the pointer's hover over a squiggled
+    // word blank, as only punctuation skipped the request.
+    let (mut app, _tmp) = caret_hover_app(0);
+    diagnose_compute(&mut app);
+    // text_x = gutter(2) + 1, so cell col 12 is char 9, inside `compute`.
+    let past = std::time::Instant::now() - HOVER_DELAY * 2;
+    app.hover.on_move(past, 12, 0);
+    app.poll_hover();
+    assert!(app.hover_request_id.is_some());
+    await_hover_reply(&mut app);
+    let popup = app.hover_popup.as_ref().expect("the problem shows");
+    assert_eq!(popup.lines, vec![String::from(COMPUTE_PROBLEM)]);
+}
+
+#[test]
+fn show_hover_is_not_taken_over_by_a_pointer_dwell_already_running() {
+    // A pointer that came to rest on `let` just before Ctrl+K Ctrl+I would
+    // fire next frame and put its own hover in place of the caret's.
+    let (mut app, _tmp) = caret_hover_app(10);
+    let past = std::time::Instant::now() - HOVER_DELAY * 2;
+    app.hover.on_move(past, 3, 0);
+    app.run_command(crate::widgets::command_palette::Command::ShowHover);
+    let id = app.hover_request_id;
+    let anchor = app.hover_anchor;
+    app.poll_hover();
+    assert_eq!(app.hover_request_id, id, "still the caret's request");
+    assert_eq!(app.hover_anchor, anchor);
+    assert_eq!(app.hover_word, Some((0, 8, 15)), "still about `compute`");
+}
+
+#[test]
+fn a_hover_reply_after_a_paste_over_the_word_is_dropped() {
+    // A paste is not a key, so it leaves the request pending; `average`
+    // over `compute` keeps the span, and only the edit count tells the
+    // reply describes text that is gone.
+    let (mut app, _tmp) = caret_hover_app(10);
+    app.run_command(crate::widgets::command_palette::Command::ShowHover);
+    let id = app.hover_request_id.expect("a request");
+    await_hover_reply(&mut app);
+    app.editor.selection = Some(crate::widgets::editor::EditorSelection {
+        anchor: (0, 8),
+        head: (0, 15),
+    });
+    app.handle_paste("average");
+    assert_eq!(app.editor.lines[0], "let n = average(1);");
+    assert_eq!(app.hover_request_id, Some(id), "still pending");
+    answer_hover(&app, id, "fn compute(x: i32) -> i32");
+    assert!(!app.drain_lsp_hover(), "the stale reply is dropped");
+    assert!(app.hover_popup.is_none());
+}
+
+#[test]
+fn an_empty_caret_hover_reply_leaves_a_newer_status_alone() {
+    let (mut app, _tmp) = caret_hover_app(10);
+    app.run_command(crate::widgets::command_palette::Command::ShowHover);
+    app.status = String::from("Saved notes.txt");
+    await_hover_reply(&mut app);
+    assert_eq!(app.status, "Saved notes.txt");
 }
 
 #[test]

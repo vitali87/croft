@@ -618,7 +618,7 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
             },
             ShortcutEntry {
                 keys: "Cmd/Ctrl+K Cmd/Ctrl+I",
-                description: "Show the hover at the caret: any problem there, then type and docs",
+                description: "Show or Focus Hover: type, docs and any problem at the caret",
                 handler: "",
             },
             ShortcutEntry {

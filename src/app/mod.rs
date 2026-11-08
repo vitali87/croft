@@ -5238,9 +5238,14 @@ pub struct App {
     /// the editor). Stacked above the async LSP hover reply by `compose_hover`
     /// so a squiggle's message shows even when the server returns no type info.
     hover_diagnostic: Option<String>,
-    /// The hover was asked for from the keyboard at the caret (#1518), not by
-    /// the pointer's rest: its reply is checked against the caret.
-    hover_at_caret: bool,
+    /// Set when the keyboard asked for the hover at the caret (#1518), not
+    /// the pointer's rest: its reply is checked against the caret, and says
+    /// there is no hover only over the status line this holds, the one shown
+    /// at the request, so a newer message is not replaced.
+    hover_at_caret: Option<String>,
+    /// The tab and edit count the hover was asked about: a reply after
+    /// either changed (a paste over the word keeps its span) is dropped.
+    hover_doc: (Option<PathBuf>, u64),
     /// Separate dwell timer for the editor tab strip. Hovering a tab for
     /// `HOVER_DELAY` surfaces `tab_tooltip` with the tab's full path so
     /// same-named files can be told apart. Kept distinct from `hover`
@@ -7915,7 +7920,8 @@ impl App {
             hover_anchor: None,
             hover_word: None,
             hover_diagnostic: None,
-            hover_at_caret: false,
+            hover_at_caret: None,
+            hover_doc: (None, 0),
             tab_hover: HoverDwell::default(),
             tab_tooltip: None,
             tab_hover_idx: None,
@@ -11805,6 +11811,9 @@ impl App {
         self.hover_popup = None;
         self.hover_diagnostic = None;
         self.hover_request_id = None;
+        // A pointer that came to rest just before the command would fire its
+        // own hover next frame and take this one's place.
+        self.hover.clear();
         let Some(anchor) = self.editor.cursor_screen_pos() else {
             return;
         };
@@ -11840,7 +11849,8 @@ impl App {
         };
         self.hover_anchor = Some((col, row));
         self.hover_word = Some(region);
-        self.hover_at_caret = at_caret;
+        self.hover_at_caret = at_caret.then(|| self.status.clone());
+        self.hover_doc = (self.editor.path.clone(), self.editor.edit_seq);
         // Debug hover-to-evaluate: while paused, hovering a variable shows its
         // current value (from the loaded locals/globals) instead of the LSP
         // type hover. Takes priority because the live value is what the user
@@ -12033,9 +12043,12 @@ impl App {
             if Some(result.request_id) != self.hover_request_id {
                 continue;
             }
+            if self.hover_doc.0 != self.editor.path || self.hover_doc.1 != self.editor.edit_seq {
+                continue;
+            }
             // A keyboard hover belongs to the caret (#1518), a dwell's to the
             // pointer; either may have moved off the word since the request.
-            let current = if self.hover_at_caret {
+            let current = if self.hover_at_caret.is_some() {
                 let (line, ch) = self.caret_hover_point();
                 self.editor.hover_region_at(line, ch)
             } else {
@@ -12053,7 +12066,7 @@ impl App {
             self.hover_popup =
                 compose_hover(self.hover_diagnostic.as_deref(), result.text.as_deref())
                     .map(|text| crate::widgets::hover_popup::HoverPopup::new(text, anchor));
-            if self.hover_popup.is_none() && self.hover_at_caret {
+            if self.hover_popup.is_none() && self.hover_at_caret.as_ref() == Some(&self.status) {
                 self.status = String::from(NO_HOVER_AT_CARET);
             }
             changed = true;
