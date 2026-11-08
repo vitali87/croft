@@ -1517,10 +1517,12 @@ impl Renderer<'_> {
                 .push_str(&format!(" {key}=\"{}\"", classes.join(" ")));
         }
         for (k, v) in &node.attrs {
+            // A name numbers like a value does: `[data-$@-]` (#1108).
+            let k = number(k, at);
             let k = match (jsx, k.as_str()) {
                 (true, "class") => "className",
                 (true, "for") => "htmlFor",
-                _ => k,
+                _ => k.as_str(),
             };
             let v = number(v, at).replace('"', "&quot;");
             self.out.push_str(&format!(" {k}=\"{v}\""));
@@ -1780,6 +1782,15 @@ mod tests {
         assert_eq!(
             ex("li[data-i=$@-]*2"),
             lis(&["<li data-i=\"2\"></li>", "<li data-i=\"1\"></li>"])
+        );
+        // Attribute names number too.
+        assert_eq!(
+            ex("li[data-$@-]*2"),
+            lis(&["<li data-2=\"\"></li>", "<li data-1=\"\"></li>"])
+        );
+        assert_eq!(
+            ex("li[data-$=x]*2"),
+            lis(&["<li data-1=\"x\"></li>", "<li data-2=\"x\"></li>"])
         );
         assert_eq!(ex("li{$$@-}*2"), lis(&["<li>02</li>", "<li>01</li>"]));
         assert_eq!(
