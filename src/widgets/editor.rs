@@ -17049,10 +17049,14 @@ fn text_end(start: (usize, usize), text: &str) -> (usize, usize) {
 
 /// Title-case a string: the first alphanumeric of each run is upper-cased,
 /// the rest lower-cased, separators preserved. Used by Transform to Title
-/// Case.
+/// Case. An apostrophe (`'` or `’`) right after a letter stays inside the
+/// word, so `don't` and `journey's` keep a lower-case tail (#1016); one at
+/// the start of a word (`'tis`) still lets the next letter start it, as in
+/// VS Code.
 fn title_case(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut prev_alnum = false;
+    let mut prev_letter = false;
     for c in s.chars() {
         if c.is_alphanumeric() {
             if prev_alnum {
@@ -17061,9 +17065,15 @@ fn title_case(s: &str) -> String {
                 out.extend(c.to_uppercase());
             }
             prev_alnum = true;
+            prev_letter = c.is_alphabetic();
+        } else if matches!(c, '\'' | '\u{2019}') && prev_letter {
+            // `prev_alnum` stays set: the letter after it continues the word.
+            out.push(c);
+            prev_letter = false;
         } else {
             out.push(c);
             prev_alnum = false;
+            prev_letter = false;
         }
     }
     out
@@ -39557,6 +39567,27 @@ mod tests {
         });
         e.transform_selection_case(CaseTransform::Title);
         assert_eq!(e.lines, vec!["Hello There World"]);
+    }
+
+    /// #1016: an apostrophe inside a word doesn't start a new one, so
+    /// contractions and possessives keep their lower-case tail; one that
+    /// opens a word (`'tis`) still capitalises the letter after it.
+    #[test]
+    fn title_case_keeps_contractions_whole() {
+        assert_eq!(
+            title_case("## don't stop believing: it's the journey's end"),
+            "## Don't Stop Believing: It's The Journey's End"
+        );
+        assert_eq!(
+            title_case("we'll be there by o'clock, won't we?"),
+            "We'll Be There By O'clock, Won't We?"
+        );
+        assert_eq!(
+            title_case("don\u{2019}t it\u{2019}s"),
+            "Don\u{2019}t It\u{2019}s"
+        );
+        assert_eq!(title_case("'tis the season"), "'Tis The Season");
+        assert_eq!(title_case("say 'hello' twice"), "Say 'Hello' Twice");
     }
 
     /// #1573: the four naming styles, from each other.
