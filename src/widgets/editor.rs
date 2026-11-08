@@ -3497,10 +3497,10 @@ pub struct Editor {
     /// on). The blame data is still fetched so toggling is instant.
     pub blame_enabled: bool,
     /// The blame annotation painted this frame when it names a commit:
-    /// `(screen y, x range)`, which the mouse hovers for the commit's card
-    /// and clicks to open its changes (#1556). Cleared at render start, like
-    /// the lens spans.
-    blame_span: Option<(u16, std::ops::Range<u16>)>,
+    /// `(screen y, x range, the commit's hash)`, which the mouse hovers for
+    /// the commit's card and clicks to open its changes (#1556). Cleared at
+    /// render start, like the lens spans.
+    blame_span: Option<(u16, std::ops::Range<u16>, String)>,
     /// Paint who typed each line in the gutter and name the seat in the
     /// inline-blame annotation (#349). Off by default: it is a review lens,
     /// not a resting state, and `Editor: Toggle Provenance` flips it for the
@@ -5010,12 +5010,13 @@ impl Editor {
         })
     }
 
-    /// Whether screen cell `(col, row)` is on the blame annotation painted
-    /// this frame, and it names a commit (#1556).
-    pub fn blame_annotation_at(&self, col: u16, row: u16) -> bool {
+    /// The hash of the commit the blame annotation painted this frame names
+    /// at screen cell `(col, row)`, if it is there (#1556).
+    pub fn blame_commit_at(&self, col: u16, row: u16) -> Option<&str> {
         self.blame_span
             .as_ref()
-            .is_some_and(|(y, xs)| *y == row && xs.contains(&col))
+            .filter(|(y, xs, _)| *y == row && xs.contains(&col))
+            .map(|(_, _, hash)| hash.as_str())
     }
 
     /// The buffer's merge-conflict blocks, rescanned only when the buffer
@@ -20650,9 +20651,10 @@ impl Widget for &mut Editor {
                     );
                     // Hover and click reach the commit it names (#1556);
                     // `Uncommitted changes` has none to show.
-                    if matches!(self.cursor_line_blame(), Some(LineBlame::Commit(_))) {
+                    if let Some(LineBlame::Commit(c)) = self.cursor_line_blame() {
+                        let hash = c.hash.clone();
                         let w = unicode_width::UnicodeWidthStr::width(shown.as_str()) as u16;
-                        self.blame_span = Some((y, start_x..(start_x + w).min(right)));
+                        self.blame_span = Some((y, start_x..(start_x + w).min(right), hash));
                     }
                 }
             }

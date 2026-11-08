@@ -11019,14 +11019,9 @@ impl App {
         }
     }
 
-    /// The pointer rested on the inline blame (#1556): fetch its commit's
-    /// card off the UI thread, for [`Self::drain_blame_hover`] to show.
-    fn hover_blame_card(&mut self, col: u16, row: u16) {
-        use crate::widgets::editor::LineBlame;
-        let Some(LineBlame::Commit(c)) = self.editor.cursor_line_blame() else {
-            return;
-        };
-        let hash = c.hash.clone();
+    /// The pointer rested on the inline blame naming `hash` (#1556): fetch
+    /// the commit's card off the UI thread, for [`Self::drain_blame_hover`].
+    fn hover_blame_card(&mut self, col: u16, row: u16, hash: String) {
         let shown = self.hover_popup.is_some();
         if shown && self.blame_hover.as_ref().is_some_and(|(h, _)| *h == hash) {
             return;
@@ -11049,20 +11044,22 @@ impl App {
     }
 
     /// Show the inline blame's commit card once `git log` has it, if the
-    /// pointer is still on the annotation. True when the card appeared.
+    /// pointer is still on an annotation naming that commit: a tab switch or
+    /// caret move while git ran can put another commit's there. True when
+    /// the card appeared.
     fn drain_blame_hover(&mut self) -> bool {
-        let Some(card) = self
+        let Some((hash, card)) = self
             .blame_hover
             .as_ref()
-            .and_then(|(_, rx)| rx.try_recv().ok())
+            .and_then(|(hash, rx)| rx.try_recv().ok().map(|card| (hash.clone(), card)))
         else {
             return false;
         };
-        let on_blame = self
+        let under = self
             .hover
             .cell()
-            .is_some_and(|(c, r)| self.editor.blame_annotation_at(c, r));
-        if !on_blame {
+            .and_then(|(c, r)| self.editor.blame_commit_at(c, r));
+        if under != Some(hash.as_str()) {
             self.blame_hover = None;
             return false;
         }
@@ -11841,10 +11838,11 @@ impl App {
             return;
         }
         self.hover.on_move(std::time::Instant::now(), col, row);
-        // The blame card (#1556) belongs to the annotation, not to a word:
-        // it stays while the pointer moves along it and goes when it leaves.
-        if self.blame_hover.is_some() {
-            if self.editor.blame_annotation_at(col, row) {
+        // The blame card (#1556) belongs to the annotation of its commit,
+        // not to a word: it stays while the pointer moves along that and
+        // goes when the pointer leaves it.
+        if let Some((hash, _)) = &self.blame_hover {
+            if self.editor.blame_commit_at(col, row) == Some(hash.as_str()) {
                 return;
             }
             self.blame_hover = None;
@@ -11886,8 +11884,8 @@ impl App {
     /// async `textDocument/hover`. Split out of `poll_hover` so the dwell
     /// timer doesn't have to be driven to test the resolution logic.
     fn hover_at_cell(&mut self, col: u16, row: u16) {
-        if self.editor.blame_annotation_at(col, row) {
-            self.hover_blame_card(col, row);
+        if let Some(hash) = self.editor.blame_commit_at(col, row) {
+            self.hover_blame_card(col, row, hash.to_string());
             return;
         }
         let Some((line, c)) = self.editor.buffer_pos_at(col, row) else {
@@ -64662,7 +64660,7 @@ impl App {
                     return;
                 }
                 // So is the inline blame (#1556): it opens its commit.
-                if in_editor && self.editor.blame_annotation_at(m.column, m.row) {
+                if in_editor && self.editor.blame_commit_at(m.column, m.row).is_some() {
                     self.open_commit_for_line();
                     return;
                 }

@@ -4280,16 +4280,7 @@ fn copy_commit_hash_for_line_copies_the_lines_commit() {
 fn hovering_the_inline_blame_shows_its_commits_whole_message() {
     use crossterm::event::{MouseButton, MouseEventKind};
     let (_tmp, mut app) = blamed_line_app();
-    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
-    term.draw(|f| app.render(f)).unwrap();
-    let buf = term.backend().buffer();
-    let (col, row) = (0..30u16)
-        .find_map(|y| {
-            let cells: Vec<&str> = (0..120u16).map(|x| buf[(x, y)].symbol()).collect();
-            let x = cells.windows(5).position(|w| w.concat() == "Raise")?;
-            Some((x as u16, y))
-        })
-        .expect("line 2's blame is painted");
+    let (col, row) = find_on_screen(&mut app, "Raise").expect("line 2's blame is painted");
     app.handle_mouse(mouse(MouseEventKind::Moved, col, row));
     // What the dwell runs once the pointer has rested HOVER_DELAY.
     app.hover_at_cell(col, row);
@@ -4325,6 +4316,50 @@ fn hovering_the_inline_blame_shows_its_commits_whole_message() {
     );
     let diff = app.editor.diff.as_ref().expect("a click opens the commit");
     assert!(diff.right_lines.iter().any(|l| l == "b = 20"));
+}
+
+/// #1556: a card git is still reading when another tab's blame comes up
+/// under the resting pointer is the card of a commit no longer there: it
+/// must not show over the new blame, whose own card shows instead.
+#[test]
+fn a_blame_card_for_a_commit_no_longer_under_the_pointer_is_dropped() {
+    use crossterm::event::MouseEventKind;
+    let (tmp, mut app) = blamed_line_app();
+    let (p, g) = (tmp.path(), tmp.path().join("g.py"));
+    std::fs::write(&g, "a = 1\nb = 20\n").unwrap();
+    assert!(git_succeeds(p, &["add", "g.py"]));
+    let author = "--author=Ann Lee <ann@example.com>";
+    assert!(git_succeeds(p, &["commit", "-q", author, "-m", "Add g"]));
+    let (col, row) = find_on_screen(&mut app, "Bo Chen").expect("f.py's blame is painted");
+    app.handle_mouse(mouse(MouseEventKind::Moved, col, row));
+    app.hover_at_cell(col, row);
+    app.editor.open(&g).unwrap();
+    app.editor.cursor_row = 1;
+    app.sync_blame();
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "g.py's blame",
+        || {
+            app.drain_blame();
+            app.editor.blame_for.as_deref() == Some(g.as_path()) && app.editor.blame_lines.is_some()
+        },
+    );
+    assert_eq!(find_on_screen(&mut app, "Ann Lee"), Some((col, row)));
+    crate::test_budget::await_spawned(std::time::Duration::from_millis(500), "f.py's card", || {
+        app.drain_blame_hover();
+        app.blame_hover.is_none() || app.hover_popup.is_some()
+    });
+    assert!(
+        app.hover_popup.is_none(),
+        "f.py's card shows over g.py's blame"
+    );
+    app.hover_at_cell(col, row);
+    crate::test_budget::await_spawned(std::time::Duration::from_millis(500), "g.py's card", || {
+        app.drain_blame_hover();
+        app.hover_popup.is_some()
+    });
+    let card = app.hover_popup.as_ref().unwrap().lines.join("\n");
+    assert!(card.starts_with("Ann Lee <ann@example.com>\n"), "{card}");
 }
 
 /// The issue's repo (#1627): `main` has "init app" and "update readme";
