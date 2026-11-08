@@ -1450,16 +1450,20 @@ fn go_to_next_problem_walks_past_an_entry_beyond_its_line_and_shared_positions()
     assert!(app.status.contains("past the end"), "wraps: {}", app.status);
 }
 
-/// On a line with astral characters an LSP row's UTF-16 column and a build
-/// row's character column sort differently in the panel; Next Problem walks
-/// the file's entries by character position, nearest first.
+/// Repeated Next Problem visits every entry once per round, whichever file
+/// is open: an LSP row's UTF-16 column and a build row's character column
+/// order differently on a line with astral characters, and the walk's order
+/// must not change when that file opens, or a step from the remembered
+/// entry passes over the rows that moved.
 #[test]
-fn go_to_next_problem_orders_lsp_and_build_rows_by_character_position() {
+fn go_to_next_problem_visits_every_entry_once_around_mixed_columns() {
     use crate::lsp::manager::DiagnosticSeverity;
     use crate::widgets::command_palette::Command;
     let tmp = tempfile::tempdir().unwrap();
     let a = tmp.path().join("a.c");
+    let b = tmp.path().join("b.c");
     std::fs::write(&a, "\u{1f600}\u{1f600}abc\n").unwrap();
+    std::fs::write(&b, "int b;\n").unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     let row = |col: u32, col_utf16: bool, msg: &str| {
         (
@@ -1475,20 +1479,29 @@ fn go_to_next_problem_orders_lsp_and_build_rows_by_character_position() {
             },
         )
     };
-    // `b` is character 3; UTF-16 column 4 is character 2, the `a`.
+    // In a.c, `b` is character 3 and UTF-16 column 4 is character 2.
     app.build_diagnostics
         .entry(a.clone())
         .or_default()
         .extend([row(3, false, "at b"), row(4, true, "at a")]);
+    app.build_diagnostics
+        .entry(b.clone())
+        .or_default()
+        .push(row(0, false, "in b.c"));
     app.rebuild_problems();
-    app.editor.open_pinned(&a).unwrap();
     let next = Command::from_id("next_problem").unwrap();
-    app.run_command(next);
-    assert!(app.status.contains("at a"), "nearest first: {}", app.status);
-    assert_eq!(app.editor.cursor_col, 2);
-    app.run_command(next);
-    assert!(app.status.contains("at b"), "{}", app.status);
-    assert_eq!(app.editor.cursor_col, 3);
+    let mut seen = Vec::new();
+    for _ in 0..3 {
+        app.run_command(next);
+        seen.push(app.status.clone());
+    }
+    for msg in ["at a", "at b", "in b.c"] {
+        assert_eq!(
+            seen.iter().filter(|s| s.contains(msg)).count(),
+            1,
+            "{msg} once in a round: {seen:?}"
+        );
+    }
 }
 
 /// An entry whose file no longer opens is passed over instead of holding
