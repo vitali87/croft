@@ -187,17 +187,27 @@ fn convert_columns_within(
     }
 }
 
-/// `path` as text, reading at most `limit` bytes: a file that grew past
-/// the size its metadata gave (or changed to something else since) is not
-/// read past it, and reads as `None` rather than a truncated line.
+/// `path` as text if it is a regular file, reading at most `limit` bytes.
+/// The open never blocks (`O_NONBLOCK`: a FIFO swapped in for the path
+/// after the caller's metadata check would otherwise wait for a writer, on
+/// the UI thread), and the opened handle itself is checked to be a regular
+/// file before anything is read. A file that grew past `limit` reads as
+/// `None` rather than as a truncated line.
 fn read_capped(path: &std::path::Path, limit: u64) -> Option<String> {
     use std::io::Read;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = opts.open(path).ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
     let mut text = String::new();
-    std::fs::File::open(path)
-        .ok()?
-        .take(limit + 1)
-        .read_to_string(&mut text)
-        .ok()?;
+    file.take(limit + 1).read_to_string(&mut text).ok()?;
     (text.len() as u64 <= limit).then_some(text)
 }
 
@@ -776,5 +786,28 @@ csrc/c.c:1:20: error: 'y' undeclared (first use in this function)\n";
         }];
         convert_columns(&mut d, std::path::Path::new("/"), ColumnUnit::Display, 8);
         assert_eq!(d[0].col, 5, "the row keeps its column");
+    }
+
+    /// The read itself never blocks on a FIFO, even one that takes the
+    /// path's place after the metadata check: the open does not wait for a
+    /// writer, and the opened handle is not a regular file, so nothing is
+    /// read.
+    #[cfg(unix)]
+    #[test]
+    fn read_capped_neither_blocks_on_nor_reads_a_fifo() {
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("pipe");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        // SAFETY: a valid NUL-terminated path and a plain mode.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        assert_eq!(read_capped(&fifo, 1024), None);
+        let file = dir.path().join("t.c");
+        std::fs::write(&file, "int u;\n").unwrap();
+        assert_eq!(read_capped(&file, 1024).as_deref(), Some("int u;\n"));
+        assert_eq!(
+            read_capped(&file, 3),
+            None,
+            "a file past the cap is not read"
+        );
     }
 }
