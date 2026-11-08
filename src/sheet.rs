@@ -1111,7 +1111,14 @@ fn format_cell(d: &calamine::Data) -> String {
         calamine::Data::Bool(b) => b.to_string(),
         calamine::Data::DateTime(dt) => dt.to_string(),
         calamine::Data::DateTimeIso(s) | calamine::Data::DurationIso(s) => s.clone(),
-        calamine::Data::Error(e) => format!("#{e:?}"),
+        // The code the file stores and every spreadsheet shows (`#DIV/0!`,
+        // `#N/A`), not the Rust variant name (`#Div0`, `#NA`) (#1144).
+        // calamine's `Display` spells error 0x2B `#DATA!`; Excel's code for it
+        // is `#GETTING_DATA`.
+        calamine::Data::Error(calamine::CellErrorType::GettingData) => {
+            String::from("#GETTING_DATA")
+        }
+        calamine::Data::Error(e) => e.to_string(),
     }
 }
 
@@ -1125,6 +1132,23 @@ fn format_float(f: f64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn formula_errors_read_as_the_codes_spreadsheets_show() {
+        use calamine::{CellErrorType as E, Data};
+        for (e, code) in [
+            (E::Div0, "#DIV/0!"),
+            (E::NA, "#N/A"),
+            (E::Name, "#NAME?"),
+            (E::Null, "#NULL!"),
+            (E::Num, "#NUM!"),
+            (E::Ref, "#REF!"),
+            (E::Value, "#VALUE!"),
+            (E::GettingData, "#GETTING_DATA"),
+        ] {
+            assert_eq!(super::format_cell(&Data::Error(e)), code);
+        }
+    }
+
     #[test]
     fn sorting_a_column_orders_numbers_as_numbers_and_toggles() {
         let mut d = super::parse_delimited(b"name,count\nb,10\nA,9\nc,100\n", b',', "s").unwrap();
