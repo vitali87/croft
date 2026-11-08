@@ -1373,8 +1373,9 @@ fn render_merge_panes(
 fn clip_pad_cells(text: &str, skip: usize, width: usize) -> String {
     let mut out = String::new();
     let mut used = 0;
+    let origin = cells_before(text, skip);
     for c in text.chars().skip(skip) {
-        let w = char_cells(c);
+        let w = char_cells_at(c, origin + used);
         if used + w > width {
             break;
         }
@@ -1415,8 +1416,9 @@ fn paint_intraline_range(
     }
     let mut cell = 0u16;
     let mut painted = false;
+    let origin = cells_before(text, skip);
     for (i, c) in text.chars().enumerate().skip(skip) {
-        let w = char_cells(c) as u16;
+        let w = char_cells_at(c, origin + usize::from(cell)) as u16;
         if cell + w > width {
             break;
         }
@@ -2000,12 +2002,12 @@ fn paint_diff_selection_band(
             if col == usize::MAX {
                 return usize::MAX;
             }
-            let drawn: usize = line
-                .chars()
-                .skip(diff.scroll_x)
-                .take(col.saturating_sub(diff.scroll_x))
-                .map(char_cells)
-                .sum();
+            let drawn: usize = cells_from(
+                line.chars()
+                    .skip(diff.scroll_x)
+                    .take(col.saturating_sub(diff.scroll_x)),
+                cells_before(line, diff.scroll_x),
+            );
             drawn + col.saturating_sub(line.chars().count().max(diff.scroll_x))
         };
         let cs_screen = to_cell(cs);
@@ -2112,12 +2114,13 @@ fn diff_side_line(
 fn char_at_cell_from(text: &str, skip: usize, cell: usize) -> usize {
     let mut at = 0;
     let mut len = 0;
+    let origin = cells_before(text, skip);
     for (i, c) in text.chars().enumerate() {
         len = i + 1;
         if i < skip {
             continue;
         }
-        let w = char_cells(c);
+        let w = char_cells_at(c, origin + at);
         if cell < at + w {
             return i;
         }
@@ -5373,14 +5376,22 @@ impl Editor {
                 // extent is in the same char columns: how far the line must
                 // scroll for its tail to fit `width` cells, plus `width`, so
                 // that `extent - width` is exactly that scroll.
-                let chars: Vec<char> = l.chars().collect();
-                if cells_of(&chars) + extra <= width {
-                    return chars.len() + extra;
+                // `cum[i]` is where char `i` starts, tab stops from the line's
+                // left edge, so the tail from `first` is `total - cum[first]`.
+                let mut cum = Vec::with_capacity(l.len() + 1);
+                let mut col = 0;
+                for c in l.chars() {
+                    cum.push(col);
+                    col += char_cells_at(c, col);
                 }
-                let (mut first, mut tail) = (chars.len(), extra);
-                while first > 0 && tail + char_cells(chars[first - 1]) <= width {
+                cum.push(col);
+                let len = cum.len() - 1;
+                if col + extra <= width {
+                    return len + extra;
+                }
+                let mut first = len;
+                while first > 0 && (col - cum[first - 1]) + extra <= width {
                     first -= 1;
-                    tail += char_cells(chars[first]);
                 }
                 first + width
             })
@@ -9125,6 +9136,34 @@ impl Editor {
     /// The indentation unit as text for the active style: N spaces or one tab.
     fn indent_unit(&self) -> String {
         self.indent_style().unit()
+    }
+
+    /// The display cell a row showing `line` from char `start` begins at, for
+    /// tab stops: a wrapped row counts from its own left edge, a flat one
+    /// from the line's (the cells scrolled past).
+    fn row_origin(&self, line: &str, start: usize) -> usize {
+        if self.wrap_enabled() {
+            0
+        } else {
+            cells_before(line, start)
+        }
+    }
+
+    /// The caret's column as the status bar shows it, counted in display
+    /// cells from 1: a tab moves it to the next tab stop, as in VS Code and
+    /// vim, so it agrees with where the caret is drawn.
+    pub fn cursor_visual_col(&self) -> usize {
+        self.sync_tab_cells();
+        // Only a tab is more than one column; a wide character counts one,
+        // like VS Code.
+        self.lines
+            .get(self.cursor_row)
+            .map_or(self.cursor_col, |l| {
+                l.chars().take(self.cursor_col).fold(0, |col, c| {
+                    col + if c == '\t' { tab_cells_at(col) } else { 1 }
+                })
+            })
+            + 1
     }
 
     /// Make `\t` measure and paint as this buffer's Tab Size from here on.
@@ -16537,6 +16576,7 @@ impl Editor {
         row.fill(
             &text[byte_index_of_char(text, base)..],
             base,
+            self.row_origin(text, base),
             self.row_inlay_spans(line)
                 .iter()
                 .filter(|(hc, _, _)| *hc >= base)
@@ -18882,8 +18922,40 @@ fn char_cells(c: char) -> usize {
     }
 }
 
+/// Cells a tab takes when it starts at display cell `col` of its row: up to
+/// the next multiple of Tab Size, as in vim and VS Code, so text after a tab
+/// lines up whatever came before it.
+fn tab_cells_at(col: usize) -> usize {
+    let t = TAB_CELLS.with(std::cell::Cell::get).max(1);
+    t - col % t
+}
+
+/// Cells `c` takes when it starts at display cell `col`.
+fn char_cells_at(c: char, col: usize) -> usize {
+    if c == '\t' {
+        tab_cells_at(col)
+    } else {
+        char_cells(c)
+    }
+}
+
+/// Cells `chars` take from display cell `origin` of their row on.
+fn cells_from(chars: impl IntoIterator<Item = char>, origin: usize) -> usize {
+    chars
+        .into_iter()
+        .fold(origin, |col, c| col + char_cells_at(c, col))
+        - origin
+}
+
+/// Cells `chars` take as a row of their own (tab stops count from its start).
 fn cells_of(chars: &[char]) -> usize {
-    chars.iter().map(|&c| char_cells(c)).sum()
+    cells_from(chars.iter().copied(), 0)
+}
+
+/// Display cells of the first `chars` characters of `line`, from the line's
+/// left edge: where its character number `chars` starts.
+fn cells_before(line: &str, chars: usize) -> usize {
+    cells_from(line.chars().take(chars), 0)
 }
 
 /// `text` as the editor paints it: each tab as the blank cells it takes
@@ -18891,11 +18963,28 @@ fn cells_of(chars: &[char]) -> usize {
 /// count for it. ratatui drops control characters, so a raw tab took no
 /// cell and the text after it slid left under all of them (#891).
 fn blank_tabs(text: &str) -> std::borrow::Cow<'_, str> {
-    if text.contains('\t') {
-        text.replace('\t', &" ".repeat(char_cells('\t'))).into()
-    } else {
-        text.into()
+    blank_tabs_from(text, 0)
+}
+
+/// [`blank_tabs`] for text that starts at display cell `origin` of its row,
+/// so each tab fills up to the next tab stop.
+fn blank_tabs_from(text: &str, origin: usize) -> std::borrow::Cow<'_, str> {
+    if !text.contains('\t') {
+        return text.into();
     }
+    let mut out = String::with_capacity(text.len() + 8);
+    let mut col = origin;
+    for c in text.chars() {
+        if c == '\t' {
+            let w = tab_cells_at(col);
+            out.extend(std::iter::repeat_n(' ', w));
+            col += w;
+        } else {
+            out.push(c);
+            col += char_cells(c);
+        }
+    }
+    out.into()
 }
 
 /// Soft-wrap a logical line into visual segments for word-wrap mode.
@@ -18926,7 +19015,7 @@ fn wrap_segments(chars: &[char], width: usize) -> Vec<(usize, usize)> {
         let mut limit = start;
         let mut used = 0;
         while limit < chars.len() {
-            let w = char_cells(chars[limit]);
+            let w = char_cells_at(chars[limit], used);
             if used + w > width && limit > start {
                 break;
             }
@@ -19336,29 +19425,40 @@ fn merge_overlay(base: &[HiSpan], over: &[HiSpan]) -> Vec<HiSpan> {
     out
 }
 
-fn build_line_spans<'a>(line: &'a str, spans: &[HiSpan]) -> Vec<Span<'a>> {
+/// `origin` is the display cell `line` starts at in its row (tab stops).
+fn build_line_spans<'a>(line: &'a str, spans: &[HiSpan], origin: usize) -> Vec<Span<'a>> {
     if spans.is_empty() {
-        return vec![Span::raw(blank_tabs(line))];
+        return vec![Span::raw(blank_tabs_from(line, origin))];
     }
     let mut out: Vec<Span> = Vec::with_capacity(spans.len() * 2);
     let mut cursor = 0usize;
+    // Display cells painted so far, from the row's left edge.
+    let mut col = origin;
+    let mut push = |out: &mut Vec<Span<'a>>, text: &'a str, style: Option<Style>| {
+        let shown = blank_tabs_from(text, col);
+        col += cells_from(text.chars(), col);
+        out.push(match style {
+            Some(st) => Span::styled(shown, st),
+            None => Span::raw(shown),
+        });
+    };
     for sp in spans {
         let range = sp.range();
         if range.start > cursor && range.start <= line.len() {
             let slice = &line[cursor..range.start];
             if !slice.is_empty() {
-                out.push(Span::raw(blank_tabs(slice)));
+                push(&mut out, slice, None);
             }
         }
         let s = range.start.min(line.len());
         let e = range.end.min(line.len());
         if e > s {
-            out.push(Span::styled(blank_tabs(&line[s..e]), sp.style));
+            push(&mut out, &line[s..e], Some(sp.style));
             cursor = e;
         }
     }
     if cursor < line.len() {
-        out.push(Span::raw(blank_tabs(&line[cursor..])));
+        push(&mut out, &line[cursor..], None);
     }
     out
 }
@@ -20155,8 +20255,9 @@ impl Widget for &mut Editor {
             let byte_end = byte_index_of_char(raw, row_end);
             // A wrapped row's width in CELLS, which is what the painters clip
             // by: its char count cut a row of wide characters in half.
+            let row_origin = self.row_origin(raw, row_start);
             let row_width = {
-                let cells: usize = raw[byte_start..byte_end].chars().map(char_cells).sum();
+                let cells: usize = cells_from(raw[byte_start..byte_end].chars(), row_origin);
                 cells.max(row_end - row_start).min(text_width as usize) as u16
             };
             let visible_raw = &raw[byte_start..byte_end];
@@ -20180,6 +20281,7 @@ impl Widget for &mut Editor {
             row_cells.fill(
                 visible_raw,
                 row_start,
+                row_origin,
                 self.row_inlay_spans(line_idx)
                     .iter()
                     .filter(|(hc, _, _)| *hc >= row_start && *hc <= hint_cap)
@@ -20192,7 +20294,7 @@ impl Widget for &mut Editor {
                     .into_iter()
                     .filter_map(|sp| sp.clipped(seg_bytes))
                     .collect();
-                let spans = build_line_spans(visible_raw, &shifted);
+                let spans = build_line_spans(visible_raw, &shifted, row_origin);
                 buf.set_line(text_x, y, &Line::from(spans), row_width);
             } else {
                 // Splice each hint label between the text segments it splits.
@@ -20209,7 +20311,13 @@ impl Widget for &mut Editor {
                     .filter(|(hc, _, _)| *hc >= row_start && *hc <= hint_cap)
                 {
                     if *hcol > from {
-                        out.extend(inlay_text_segment(raw, &merged, from, *hcol));
+                        out.extend(inlay_text_segment(
+                            raw,
+                            &merged,
+                            (row_start, row_origin),
+                            from,
+                            *hcol,
+                        ));
                     }
                     // A color swatch paints in ITS color (#254); plain
                     // hints keep the dim italic Zed look.
@@ -20221,7 +20329,13 @@ impl Widget for &mut Editor {
                     from = from.max(*hcol);
                 }
                 if row_end > from {
-                    out.extend(inlay_text_segment(raw, &merged, from, row_end));
+                    out.extend(inlay_text_segment(
+                        raw,
+                        &merged,
+                        (row_start, row_origin),
+                        from,
+                        row_end,
+                    ));
                 }
                 buf.set_line(text_x, y, &Line::from(out), row_width);
             }
@@ -20296,7 +20410,11 @@ impl Widget for &mut Editor {
                 let geometry = if guide_src == line_idx {
                     &row_cells
                 } else {
-                    src_cells = RowCells::of_line(&self.lines[guide_src], row_start);
+                    src_cells = RowCells::of_line_at(
+                        &self.lines[guide_src],
+                        row_start,
+                        self.row_origin(&self.lines[guide_src], row_start),
+                    );
                     &src_cells
                 };
                 for c in (0..guide_width).step_by(guide_step) {
@@ -20852,6 +20970,7 @@ impl Widget for &mut Editor {
                 &caret_raw[byte_index_of_char(caret_raw, caret_start)
                     ..byte_index_of_char(caret_raw, caret_end)],
                 caret_start,
+                self.row_origin(caret_raw, caret_start),
                 self.row_inlay_spans(*cl)
                     .iter()
                     .filter(|(hc, _, _)| *hc >= caret_start && *hc <= hint_cap)
@@ -21131,7 +21250,7 @@ impl Editor {
             .into_iter()
             .filter_map(|sp| sp.clipped(raw_bytes))
             .collect();
-        let spans = build_line_spans(raw, &clamped);
+        let spans = build_line_spans(raw, &clamped, 0);
         buf.set_line(text_x, y, &Line::from(spans), width);
     }
 
@@ -21175,8 +21294,8 @@ impl Editor {
             // text column: past the pane edge or onto the vertical scrollbar.
             // In cells, as the row was painted: wide characters before the
             // caret push it right by two each.
-            let visible_col =
-                RowCells::of_line(&self.lines[self.cursor_row], start).text_before(self.cursor_col);
+            let visible_col = RowCells::of_line_at(&self.lines[self.cursor_row], start, 0)
+                .text_before(self.cursor_col);
             let x = text_x as usize + visible_col;
             let right = (self.last_inner.x + self.last_inner.width)
                 .saturating_sub(u16::from(self.last_scrollbar.width > 0))
@@ -21290,7 +21409,7 @@ impl Editor {
             .chars()
             .skip(diff.scroll_x)
             .take(char_col - diff.scroll_x);
-        let drawn = before.map(char_cells).sum::<usize>();
+        let drawn = cells_from(before, cells_before(line, diff.scroll_x));
         let line_len = line.chars().count();
         // Past the end of the text the caret counts one cell per char.
         let vis_col = drawn + char_col.saturating_sub(line_len.max(diff.scroll_x));
@@ -21345,26 +21464,41 @@ impl RowCells {
     /// The geometry of a row showing `line` from buffer column `start`, with
     /// no inlay hints.
     fn of_line(line: &str, start: usize) -> Self {
+        Self::of_line_at(line, start, cells_before(line, start))
+    }
+
+    /// [`Self::of_line`] for a row whose first cell is display cell `origin`
+    /// of its tab stops: 0 for a wrapped row, the cells scrolled past for a
+    /// horizontally scrolled one.
+    fn of_line_at(line: &str, start: usize, origin: usize) -> Self {
         let mut row = Self::default();
-        row.fill(&line[byte_index_of_char(line, start)..], start, []);
+        row.fill(&line[byte_index_of_char(line, start)..], start, origin, []);
         row
     }
 
     /// Refill for a row painting `text` from buffer column `start` with
     /// `hints` spliced in, reusing the allocations.
-    fn fill(&mut self, text: &str, start: usize, hints: impl IntoIterator<Item = (usize, usize)>) {
+    fn fill(
+        &mut self,
+        text: &str,
+        start: usize,
+        origin: usize,
+        hints: impl IntoIterator<Item = (usize, usize)>,
+    ) {
         use unicode_segmentation::UnicodeSegmentation;
         self.start = start;
         self.before.clear();
         self.before.push(0);
         let mut cells = 0;
+        // Tab stops count from the row's left edge, `origin` cells before its
+        // first character.
         // ratatui paints a grapheme cluster as one glyph sized by the whole
         // cluster (`crate::cell_map`): `👍🏽` is two cells, not four, and `❤️`
         // two, not one. The cluster's first character takes those cells and
         // the rest none; a lone character keeps `char_cells`.
         for cluster in text.graphemes(true) {
             let mut chars = cluster.chars();
-            let first = chars.next().map_or(0, char_cells);
+            let first = chars.next().map_or(0, |c| char_cells_at(c, origin + cells));
             cells += match chars.clone().next() {
                 None => first,
                 Some(_) => unicode_width::UnicodeWidthStr::width(cluster),
@@ -21450,6 +21584,7 @@ fn paint_row_cells(
 fn inlay_text_segment<'a>(
     raw: &'a str,
     merged: &[HiSpan],
+    row: (usize, usize),
     from: usize,
     to: usize,
 ) -> Vec<Span<'a>> {
@@ -21461,7 +21596,14 @@ fn inlay_text_segment<'a>(
         .into_iter()
         .filter_map(|sp| sp.clipped(seg_bytes))
         .collect();
-    build_line_spans(seg, &shifted)
+    // Tab stops count from the row's left edge: its first char is `row.0`,
+    // which sits at display cell `row.1` (hint labels do not count).
+    let origin = row.1
+        + cells_from(
+            raw.chars().skip(row.0).take(from.saturating_sub(row.0)),
+            row.1,
+        );
+    build_line_spans(seg, &shifted, origin)
 }
 
 /// The (inactive, active) find-highlight styles, shared by the editor's
@@ -35548,7 +35690,7 @@ mod tests {
 
     #[test]
     fn build_line_spans_no_highlights() {
-        let spans = build_line_spans("hello", &[]);
+        let spans = build_line_spans("hello", &[], 0);
         assert_eq!(spans.len(), 1);
     }
 
@@ -35655,7 +35797,7 @@ mod tests {
             end: 5,
             style: Style::default(),
         }];
-        let spans = build_line_spans("hello", &hi);
+        let spans = build_line_spans("hello", &hi, 0);
         assert_eq!(spans.len(), 1);
     }
 
@@ -35666,7 +35808,7 @@ mod tests {
             end: 3,
             style: Style::default(),
         }];
-        let spans = build_line_spans("abcde", &hi);
+        let spans = build_line_spans("abcde", &hi, 0);
         // Expect: "a", "bc", "de"
         assert_eq!(spans.len(), 3);
     }
@@ -36059,8 +36201,8 @@ mod tests {
             let text_x = e.last_inner.x + e.last_gutter_width + 1;
             let y = e.last_inner.y;
             assert_eq!(
-                row_text(&buf, y, text_x, text_x + 11),
-                "x    y    z",
+                row_text(&buf, y, text_x, text_x + 9),
+                "x   y   z",
                 "wrap {wrap}"
             );
             let (cx, cy) = e.cursor_screen_pos().expect("the caret is on screen");
@@ -36070,7 +36212,7 @@ mod tests {
                 "the caret sits on z, wrap {wrap}"
             );
             assert_eq!(
-                e.buffer_pos_at(text_x + 5, y),
+                e.buffer_pos_at(text_x + 4, y),
                 Some((0, 2)),
                 "a click on y lands on y, wrap {wrap}"
             );
@@ -36097,6 +36239,55 @@ mod tests {
             assert_eq!(e.cursor_screen_pos(), Some((z_cell, y)), "tab size {width}");
             assert_eq!(e.buffer_pos_at(z_cell, y), Some((0, 2)), "tab size {width}");
         }
+    }
+
+    /// A tab runs to the next tab stop, so text after tabs lines up in columns
+    /// whatever sits before them (vim, VS Code), and Col counts those cells.
+    #[test]
+    fn a_tab_runs_to_the_next_tab_stop() {
+        let mut e = editor_with(" *   bits\t\tmodifier\n *   is_text\tthe key\n\tx\nab\tc");
+        e.set_indent_style(IndentStyle {
+            width: 8,
+            use_spaces: false,
+        });
+        e.wrap_override = Some(false);
+        let buf = guide_buf(&mut e, 60, 8);
+        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        let y0 = e.last_inner.y;
+        let row = |r: u16| -> Vec<String> {
+            (0..40)
+                .map(|x| buf[(text_x + x, y0 + r)].symbol().to_string())
+                .collect()
+        };
+        let find = |r: u16, s: &str| row(r).iter().position(|c| c == s);
+        // "bits" ends at cell 9, "is_text" at 12: both second words start at
+        // the stops 16 and 24 resp. 16, so "modifier" and "the key" line up
+        // only where the stops do.
+        assert_eq!(find(0, "m"), Some(24), "{:?}", row(0));
+        assert_eq!(
+            find(1, "k"),
+            Some(20),
+            "the key starts at the stop 16: {:?}",
+            row(1)
+        );
+        assert_eq!(find(2, "x"), Some(8));
+        assert_eq!(find(3, "c"), Some(8), "ab then a tab to the stop");
+        // The caret, a click and Col agree with the drawing.
+        e.cursor_row = 3;
+        e.cursor_col = 3;
+        assert_eq!(e.cursor_screen_pos(), Some((text_x + 8, y0 + 3)));
+        assert_eq!(e.buffer_pos_at(text_x + 8, y0 + 3), Some((3, 3)));
+        assert_eq!(
+            e.buffer_pos_at(text_x + 2, y0 + 3),
+            Some((3, 2)),
+            "the tab starts at cell 2"
+        );
+        assert_eq!(e.cursor_visual_col(), 9, "ab, the tab's 6 cells, then c");
+        e.cursor_row = 2;
+        e.cursor_col = 1;
+        assert_eq!(e.cursor_visual_col(), 9, "after one tab at Tab Size 8");
+        e.cursor_col = 0;
+        assert_eq!(e.cursor_visual_col(), 1);
     }
 
     #[test]
@@ -42961,13 +43152,13 @@ mod tests {
     #[test]
     fn row_cells_count_a_wide_character_as_two_cells_and_splice_hints() {
         let mut row = RowCells::default();
-        row.fill("a\u{8cbb}b", 0, [(2, 3)]);
+        row.fill("a\u{8cbb}b", 0, 0, [(2, 3)]);
         assert_eq!((row.cell(1), row.width(1)), (1, 2), "費 takes two cells");
         assert_eq!(row.cell(2), 6, "b sits past 費 and the hint anchored at it");
         assert_eq!(row.caret(2), 3, "a caret at the anchor is left of it");
         assert_eq!(row.end(2), 3, "a range ending there leaves it out");
         assert_eq!(row.end(4), 8, "the newline cell follows the text");
-        row.fill("\u{8cbb}b", 1, []);
+        row.fill("\u{8cbb}b", 1, 0, []);
         assert_eq!((row.cell(0), row.cell(2)), (0, 2), "scrolled to 費");
     }
 
@@ -43091,8 +43282,8 @@ mod tests {
             "\u{2192}   return\u{b7}1"
         );
         assert_eq!(
-            row_text(&buf, y0 + 1, text_x, text_x + 16),
-            "\u{b7}\u{b7}x\u{b7}=\u{b7}2\u{2192}   #\u{b7}tab"
+            row_text(&buf, y0 + 1, text_x, text_x + 13),
+            "\u{b7}\u{b7}x\u{b7}=\u{b7}2\u{2192}#\u{b7}tab"
         );
     }
 
