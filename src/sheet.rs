@@ -1113,6 +1113,11 @@ fn format_cell(d: &calamine::Data) -> String {
         calamine::Data::DateTimeIso(s) | calamine::Data::DurationIso(s) => s.clone(),
         // The code the file stores and every spreadsheet shows (`#DIV/0!`,
         // `#N/A`), not the Rust variant name (`#Div0`, `#NA`) (#1144).
+        // calamine's `Display` spells error 0x2B `#DATA!`; Excel's code for it
+        // is `#GETTING_DATA`.
+        calamine::Data::Error(calamine::CellErrorType::GettingData) => {
+            String::from("#GETTING_DATA")
+        }
         calamine::Data::Error(e) => e.to_string(),
     }
 }
@@ -1138,7 +1143,7 @@ mod tests {
             (E::Num, "#NUM!"),
             (E::Ref, "#REF!"),
             (E::Value, "#VALUE!"),
-            (E::GettingData, "#DATA!"),
+            (E::GettingData, "#GETTING_DATA"),
         ] {
             assert_eq!(super::format_cell(&Data::Error(e)), code);
         }
