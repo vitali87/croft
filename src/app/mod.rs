@@ -5180,6 +5180,14 @@ pub struct App {
     /// requested: the server's edit ranges describe the line then, and the
     /// accept shifts them by what was typed or deleted since.
     completion_origin: Option<(usize, usize)>,
+    /// The caret position the latest completion request was sent at. Unlike
+    /// `completion_origin` (the session's anchor, kept across re-asks so the
+    /// reply still opens in the word) it moves with every re-ask, because a
+    /// server's ranges describe the line at that very point.
+    completion_ask_pos: Option<(usize, usize)>,
+    /// The request position of the reply the open popup's items came from:
+    /// what an accepted item's ranges are shifted from.
+    completion_items_pos: Option<(usize, usize)>,
     /// The pending completion's last reply was marked `isIncomplete` (#1529):
     /// each word edit re-asks the server, whether or not any of its old items
     /// are still on screen. Lives only while `completion_request_id` does.
@@ -7796,6 +7804,8 @@ impl App {
             file_finder_index_dirty: false,
             completion_request_id: None,
             completion_origin: None,
+            completion_ask_pos: None,
+            completion_items_pos: None,
             completion_incomplete: false,
             completion_reask_due: false,
             completion_ask_due: None,
@@ -11063,6 +11073,10 @@ impl App {
                     format!("No completions match '{prefix}' ({server_count} from server)");
             }
         } else {
+            // Only now do the popup's items come from this reply: a reply
+            // that returned early above left the older items on screen, and
+            // those still shift from their own request.
+            self.completion_items_pos = self.completion_ask_pos;
             self.completion_popup = Some(popup);
         }
         true
@@ -11239,6 +11253,7 @@ impl App {
         });
         self.completion_request_id = Some(id);
         self.completion_origin = Some((self.editor.cursor_row, self.editor.cursor_col));
+        self.completion_ask_pos = self.completion_origin;
         self.completion_incomplete = false;
         self.completion_reask_due = false;
         self.completion_ask_due = None;
@@ -18053,11 +18068,16 @@ impl App {
         // Everything on this row from the request point on shifts with it,
         // both ways: a Backspace after the request made the server's end
         // reach past the word and swallow the `)` after it.
-        let shift: isize = match self.completion_origin {
+        // The shift runs from where the reply's own request was sent, not
+        // from the session's anchor: a re-ask answers for the caret as it was
+        // then, and counting from the anchor again took the letters typed
+        // before it twice, swallowing that many characters after the word.
+        let asked_at = self.completion_items_pos.or(self.completion_origin);
+        let shift: isize = match asked_at {
             Some((r, c)) if r == row => caret as isize - c as isize,
             _ => 0,
         };
-        let origin_col = self.completion_origin.map_or(caret, |(_, c)| c);
+        let origin_col = asked_at.map_or(caret, |(_, c)| c);
         let moved = |c: usize| -> usize {
             if c >= origin_col {
                 (c as isize + shift).max(0) as usize
@@ -18147,7 +18167,10 @@ impl App {
     ) -> Option<crate::widgets::editor::TextSpanEdit> {
         let (row, caret) = (self.editor.cursor_row, self.editor.cursor_col);
         let word = self.editor.word_before_cursor().chars().count();
-        let origin = self.completion_origin.filter(|&(r, _)| r == row);
+        let origin = self
+            .completion_items_pos
+            .or(self.completion_origin)
+            .filter(|&(r, _)| r == row);
         let text = item.insert_text.as_ref().unwrap_or(&item.label);
         (!item.is_snippet).then(|| crate::widgets::editor::TextSpanEdit {
             start: (row, caret.saturating_sub(word)),
@@ -18349,6 +18372,7 @@ impl App {
         };
         let id = lsp.request_completion(path, line, character, CompletionTrigger::Incomplete);
         self.completion_request_id = Some(id);
+        self.completion_ask_pos = Some((self.editor.cursor_row, self.editor.cursor_col));
     }
 
     /// After `c` is typed, open completion as VS Code does (#929): a
