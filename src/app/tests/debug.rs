@@ -5064,6 +5064,27 @@ fn function_breakpoints_are_kept_for_the_next_session() {
     assert!(app.function_breakpoints.is_empty());
 }
 
+/// #939: a function breakpoint set before F5 goes with the session however it
+/// started (the active file, a test, a launch.json config or a compound
+/// member), not only from launch.json.
+#[test]
+fn every_new_debug_session_carries_the_function_breakpoints() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.commit_function_breakpoint(String::from("apply_discount"));
+    app.adopt_debug_session("orders.py", stub_member(false), LaunchSlot::Replace);
+    let want = vec![String::from("apply_discount")];
+    assert_eq!(
+        app.debug_sessions.focused().unwrap().function_breakpoints,
+        want
+    );
+    app.adopt_debug_session("worker", stub_member(false), LaunchSlot::Add);
+    assert_eq!(app.debug_sessions.len(), 2, "a compound member is added");
+    for session in app.debug_sessions.iter_mut() {
+        assert_eq!(session.function_breakpoints, want);
+    }
+}
+
 #[test]
 fn run_to_cursor_without_a_session_says_so() {
     let tmp = tempfile::tempdir().unwrap();

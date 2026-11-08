@@ -29366,7 +29366,7 @@ impl App {
                     breakpoints,
                 ) {
                     Ok(session) => {
-                        self.debug_sessions.replace_with(name.clone(), session);
+                        self.adopt_debug_session(name.clone(), session, LaunchSlot::Replace);
                         self.run_debug.feedback = Some(format!("Debugging test {name}{using}"));
                         self.run_debug.feedback_is_error = false;
                         let lead = with_python_note(
@@ -29577,7 +29577,7 @@ impl App {
             breakpoints,
         ) {
             Ok(session) => {
-                self.debug_sessions.replace_with(name, session);
+                self.adopt_debug_session(name, session, LaunchSlot::Replace);
                 self.run_debug.feedback = Some(format!("Debugging test {name} (lldb)"));
                 self.run_debug.feedback_is_error = false;
                 self.status = self.with_failure_note(format!(
@@ -37474,13 +37474,8 @@ impl App {
             }
         };
         match result {
-            Ok(mut session) => {
-                // Held until `initialized`, then pushed with the rest (#611).
-                session.set_function_breakpoints(self.function_breakpoints.clone());
-                match slot {
-                    LaunchSlot::Replace => self.debug_sessions.replace_with(&name, session),
-                    LaunchSlot::Add => self.debug_sessions.push(&name, session),
-                }
+            Ok(session) => {
+                self.adopt_debug_session(&name, session, slot);
                 let verb = match rc.request {
                     RequestKind::Launch => "Debugging",
                     RequestKind::Attach => "Attached:",
@@ -37606,7 +37601,7 @@ impl App {
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default();
-                self.debug_sessions.replace_with(name.clone(), session);
+                self.adopt_debug_session(name.clone(), session, LaunchSlot::Replace);
                 self.run_debug.feedback = Some(format!("Debugging {name}"));
                 self.run_debug.feedback_is_error = false;
                 let lead = with_python_note(format!("Debugging {name}"), note.as_deref());
@@ -37646,7 +37641,7 @@ impl App {
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default();
-                self.debug_sessions.replace_with(name.clone(), session);
+                self.adopt_debug_session(name.clone(), session, LaunchSlot::Replace);
                 self.run_debug.feedback = Some(format!("Debugging {name}"));
                 self.run_debug.feedback_is_error = false;
                 self.status =
@@ -37699,7 +37694,7 @@ impl App {
         );
         match crate::dap::session::DapSession::launch_delve(&dlv, &dir, request, breakpoints) {
             Ok(session) => {
-                self.debug_sessions.replace_with(name.to_string(), session);
+                self.adopt_debug_session(name.to_string(), session, LaunchSlot::Replace);
                 self.run_debug.feedback = Some(format!("Debugging test {name}"));
                 self.run_debug.feedback_is_error = false;
                 self.status = self.with_failure_note(format!(
@@ -37749,7 +37744,7 @@ impl App {
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default();
-                self.debug_sessions.replace_with(name.clone(), session);
+                self.adopt_debug_session(name.clone(), session, LaunchSlot::Replace);
                 self.run_debug.feedback = Some(format!("Debugging {name}"));
                 self.run_debug.feedback_is_error = false;
                 self.status =
@@ -37903,7 +37898,7 @@ impl App {
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default();
-                self.debug_sessions.replace_with(name.clone(), session);
+                self.adopt_debug_session(name.clone(), session, LaunchSlot::Replace);
                 self.run_debug.feedback = Some(format!("Debugging {name} (lldb)"));
                 self.run_debug.feedback_is_error = false;
                 self.status =
@@ -38158,6 +38153,24 @@ impl App {
         }
         if refused && !names.is_empty() {
             self.status = String::from("This debugger does not support function breakpoints");
+        }
+    }
+
+    /// Install a freshly launched debug session, replacing the running ones
+    /// or, for a compound member, beside them. Every launch path comes
+    /// through here so the stored function breakpoints go with each new
+    /// session (held until `initialized`, then pushed with the rest): set one
+    /// and press F5 with no launch.json, and the program still pauses (#939).
+    fn adopt_debug_session(
+        &mut self,
+        name: impl Into<String>,
+        mut session: crate::dap::session::DapSession,
+        slot: LaunchSlot,
+    ) {
+        session.set_function_breakpoints(self.function_breakpoints.clone());
+        match slot {
+            LaunchSlot::Replace => self.debug_sessions.replace_with(name, session),
+            LaunchSlot::Add => self.debug_sessions.push(name, session),
         }
     }
 
