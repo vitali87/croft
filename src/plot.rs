@@ -321,15 +321,21 @@ pub fn parse(input: &str, x: Option<&str>, y: &[String]) -> Result<Dataset, Stri
             headers.join(", ")
         ))
     };
+    // A column with no value in any row (a trailing or leading delimiter on
+    // every line) holds no data: it is neither a series nor the labels
+    // (#1165). `.all()` over its non-empty cells would be vacuously true.
+    let empty = |i: usize| rows.iter().all(|r| r[i].is_empty());
     let numeric = |i: usize| {
-        rows.iter()
-            .filter(|r| !r[i].is_empty())
-            .all(|r| parse_number(&r[i]).is_some())
+        !empty(i)
+            && rows
+                .iter()
+                .filter(|r| !r[i].is_empty())
+                .all(|r| parse_number(&r[i]).is_some())
     };
 
     let x_col = match x {
         Some(name) => Some(column(name)?),
-        None => (0..headers.len()).find(|&i| !numeric(i)),
+        None => (0..headers.len()).find(|&i| !empty(i) && !numeric(i)),
     };
     let y_cols: Vec<usize> = if y.is_empty() {
         (0..headers.len())
@@ -1426,6 +1432,28 @@ mod tests {
             j.series[1].values[0].is_nan(),
             "a key missing on an earlier row pads with NaN"
         );
+    }
+
+    #[test]
+    fn a_column_empty_on_every_row_is_neither_a_series_nor_the_labels() {
+        // #1165: a leading delimiter on every line made the empty column the
+        // first series, so the bar chart drew nothing.
+        let d = ds(",month,revenue\n,Jan,120\n,Feb,340\n,Mar,210\n");
+        assert_eq!(
+            d.labels.as_deref(),
+            Some(&["Jan".to_string(), "Feb".into(), "Mar".into()][..])
+        );
+        assert_eq!(d.series.len(), 1, "{d:?}");
+        assert_eq!(d.series[0].name, "revenue");
+        assert_eq!(d.series[0].values, [120.0, 340.0, 210.0]);
+        // A trailing delimiter, with no label column at all.
+        let d = ds("revenue,\n120,\n340,\n");
+        assert_eq!(d.labels, None);
+        assert_eq!(d.series.len(), 1, "{d:?}");
+        assert_eq!(d.series[0].name, "revenue");
+        // Asked for by name, it is still not a numeric column.
+        let err = parse("a,b\n1,\n2,\n", None, &["b".into()]).unwrap_err();
+        assert!(err.contains("column \"b\" is not numeric"), "{err}");
     }
 
     #[test]
