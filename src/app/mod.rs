@@ -59531,6 +59531,20 @@ impl App {
                 }
             },
             Cmd::ReopenAsPreview => match self.editor.path.clone() {
+                // Markdown's preview is a toggle on the open tab, not a
+                // routing decision `open` makes (#1363): turn it on, as
+                // Markdown: Toggle Preview does, keeping the caret, undo
+                // history and any unsaved edits.
+                Some(_)
+                    if self.editor.language() == Some(crate::highlight::LangKind::Markdown)
+                        && !self.editor.has_non_text_view() =>
+                {
+                    if self.editor.markdown_preview.is_none() {
+                        self.toggle_markdown_preview();
+                    } else {
+                        self.status = String::from("Markdown Preview");
+                    }
+                }
                 Some(_) if self.editor.dirty => {
                     self.status =
                         String::from("Save or revert the buffer before reopening the preview");

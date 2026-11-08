@@ -3433,6 +3433,31 @@ fn reopen_as_preview_keeps_a_utf16_capture_as_text() {
     );
 }
 
+/// #1363: Markdown is previewed by a toggle, so Reopen as Preview turns the
+/// preview on instead of reopening the source and saying there is none. The
+/// tab keeps its caret and unsaved edits.
+#[test]
+fn reopen_as_preview_shows_the_markdown_preview() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let md = tmp.path().join("t.md");
+    std::fs::write(&md, "# Title\n\nSome *text*.\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&md).unwrap();
+    app.editor.cursor_row = 2;
+    app.editor.cursor_col = 5;
+    app.editor.insert_char('!');
+    assert!(app.editor.dirty);
+    app.run_command(Command::ReopenAsPreview);
+    assert!(app.editor.markdown_preview.is_some(), "the preview is on");
+    assert_eq!(app.status, "Markdown Preview");
+    assert!(app.editor.dirty, "the unsaved edit is kept, not reloaded");
+    assert_eq!(app.editor.lines[2], "Some !*text*.");
+    // Asked again, it stays on rather than flipping back to the source.
+    app.run_command(Command::ReopenAsPreview);
+    assert!(app.editor.markdown_preview.is_some());
+}
+
 /// #1537 negative: source code has a grammar and no preview, so Reopen as
 /// Preview still says so rather than turning it into a log.
 #[test]
