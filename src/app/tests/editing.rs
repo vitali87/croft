@@ -770,6 +770,33 @@ fn editor_cmd_o_opens_line_below_with_indent() {
     assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (1, 4));
 }
 
+/// #956: Enter leaves only indentation on its new line; switching to
+/// another tab leaves that line, so the tab switched away from is saved
+/// with it blank. The tab still being typed in keeps it under the caret.
+#[test]
+fn switching_tabs_clears_the_indentation_enter_left_behind() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.py");
+    let b = tmp.path().join("b.py");
+    std::fs::write(&a, "def f():\n    return 1\n").unwrap();
+    std::fs::write(&b, "x = 1\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&a).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.cursor_row = 1;
+    app.editor.cursor_col = 12;
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.lines[2], "    ", "the caret's line keeps it");
+    let a_tab = app.editor.active_index();
+    app.editor.open_in_new_tab(&b).unwrap();
+    app.trim_auto_indents();
+    assert_eq!(
+        app.editor.editors[a_tab].lines[2], "",
+        "a.py's line was left"
+    );
+}
+
 #[test]
 fn editor_cmd_shift_enter_opens_line_above_with_indent() {
     // Open-line-above moved off Cmd+Shift+O (now Go to Symbol) onto its real

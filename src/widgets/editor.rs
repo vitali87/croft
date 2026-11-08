@@ -9698,14 +9698,15 @@ impl Editor {
     /// Clear the indentation Enter put on a line the caret has since left
     /// with nothing typed on it (#956), so a blank line between statements
     /// is saved blank rather than as `"    "` that every linter flags. Called
-    /// after each key and click. It takes no undo step of its own: the
-    /// step on top is still the one before the Enter, so one Ctrl+Z still
-    /// undoes the Enter.
-    pub fn trim_auto_indent_left_behind(&mut self) {
+    /// after each key and click, with `tab_left` set for every tab but the
+    /// one being typed in: switching away from a tab leaves its line too.
+    /// It takes no undo step of its own: the step on top is still the one
+    /// before the Enter, so one Ctrl+Z still undoes the Enter.
+    pub fn trim_auto_indent(&mut self, tab_left: bool) {
         let Some((row, len, seq)) = self.auto_indent else {
             return;
         };
-        if seq == self.edit_seq && row == self.cursor_row {
+        if seq == self.edit_seq && row == self.cursor_row && !tab_left {
             return;
         }
         self.auto_indent = None;
@@ -22490,6 +22491,16 @@ impl EditorTabs {
         self.active = idx;
         self.editors[self.active].focused = true;
         true
+    }
+
+    /// [`Editor::trim_auto_indent`] over every tab (#956): the active one
+    /// keeps the line its caret is still on when `focused_group`, and every
+    /// other tab has been switched away from, so its line was left.
+    pub fn trim_auto_indents(&mut self, focused_group: bool) {
+        let active = self.active;
+        for (i, editor) in self.editors.iter_mut().enumerate() {
+            editor.trim_auto_indent(!(focused_group && i == active));
+        }
     }
 
     /// Sweep EVERY open tab (not just the active one) for external on-disk
@@ -39674,7 +39685,7 @@ mod tests {
         e.cursor_col = 9;
         e.insert_newline();
         e.move_down();
-        e.trim_auto_indent_left_behind();
+        e.trim_auto_indent(false);
         assert_eq!(e.lines[2], "", "moved off with nothing typed");
         assert!(e.dirty);
         let mut e = editor_with("if x:\n    a = 1\n    b = 2");
@@ -39683,14 +39694,14 @@ mod tests {
         e.insert_newline();
         e.insert_char('c');
         e.move_down();
-        e.trim_auto_indent_left_behind();
+        e.trim_auto_indent(false);
         assert_eq!(e.lines[2], "    c", "typed-on lines keep their indentation");
         // Negative: staying on the line keeps the indent where the caret is.
         let mut e = editor_with("if x:\n    a = 1");
         e.cursor_row = 1;
         e.cursor_col = 9;
         e.insert_newline();
-        e.trim_auto_indent_left_behind();
+        e.trim_auto_indent(false);
         assert_eq!(e.lines[2], "    ");
         assert_eq!(e.cursor_col, 4);
     }

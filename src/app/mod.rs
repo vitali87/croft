@@ -26791,7 +26791,7 @@ impl App {
         let before = zen_esc.then(|| self.esc_fingerprint());
         let result = self.recording_file_switches(|app| app.handle_key_inner(key));
         // A line Enter only indented is cleared once the caret leaves it.
-        self.editor.trim_auto_indent_left_behind();
+        self.trim_auto_indents();
         if leader_armed {
             let chord = self.screencast.take_chord_step();
             self.screencast
@@ -62490,7 +62490,17 @@ impl App {
             );
         }
         self.recording_file_switches(|app| app.handle_mouse_inner(m));
-        self.editor.trim_auto_indent_left_behind();
+        self.trim_auto_indents();
+    }
+
+    /// Clear the indentation Enter left on a line the caret has since left
+    /// (#956), in every tab of every editor group: a key or click that
+    /// switched tabs or groups has left the line in the one it came from.
+    fn trim_auto_indents(&mut self) {
+        self.editor.trim_auto_indents(true);
+        for group in self.editor_layout.inactive_groups_mut() {
+            group.trim_auto_indents(false);
+        }
     }
 
     fn handle_mouse_inner(&mut self, m: MouseEvent) {
