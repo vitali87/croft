@@ -1705,6 +1705,38 @@ fn change_all_occurrences_key_accepts_cmd_ctrl_or_alt_f2() {
 }
 
 #[test]
+fn the_references_picker_starts_on_the_reference_under_the_caret() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.rs");
+    std::fs::write(&a, "let x = x + x;\nfoo(x);\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&a).unwrap();
+    let targets = vec![
+        (a.clone(), 0, 4),
+        (a.clone(), 0, 8),
+        (a.clone(), 0, 12),
+        (a.clone(), 1, 4),
+        (tmp.path().join("b.rs"), 1, 4),
+    ];
+    // On the second `x` of line 1 (col 8..9, caret inside it).
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 9;
+    app.open_location_picker(targets.clone(), "references");
+    assert_eq!(app.context_menu.as_ref().unwrap().selected, 1);
+    // Another file's reference on the same line is not this one.
+    app.context_menu = None;
+    app.editor.cursor_row = 1;
+    app.editor.cursor_col = 4;
+    app.open_location_picker(targets.clone(), "references");
+    assert_eq!(app.context_menu.as_ref().unwrap().selected, 3);
+    // A caret on a line with no reference leaves the highlight on top.
+    app.context_menu = None;
+    app.editor.cursor_row = 5;
+    app.open_location_picker(targets, "references");
+    assert_eq!(app.context_menu.as_ref().unwrap().selected, 0);
+}
+
+#[test]
 fn implementation_picker_lists_every_target_as_a_jump_item() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();

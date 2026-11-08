@@ -15107,6 +15107,7 @@ impl App {
             return;
         }
         let root = self.tree.root.clone();
+        let current = self.location_under_caret(&targets);
         let items: Vec<(String, MenuAction)> = targets
             .into_iter()
             .map(|(path, line, col)| {
@@ -15127,7 +15128,32 @@ impl App {
         // server is ready, and the `context_menu` guard is armed a line too
         // late to protect the sidebar from this focus move.
         self.without_auto_hide(|app| app.focus_pane(Pane::Editor));
-        self.context_menu = Some(ContextMenu::flat(origin, items, root));
+        let mut menu = ContextMenu::flat(origin, items, root);
+        // Start on the reference the caret is on, as VS Code's peek does.
+        menu.selected = current;
+        self.context_menu = Some(menu);
+    }
+
+    /// Which of `targets` the caret is on: the one in this file, on the
+    /// caret's line, starting at or before the caret (the nearest such), else
+    /// the first one on that line. 0 when none is (a reference list opened
+    /// from elsewhere starts at the top).
+    fn location_under_caret(&self, targets: &[(PathBuf, u32, u32)]) -> usize {
+        let Some(path) = self.editor.path.as_deref() else {
+            return 0;
+        };
+        let (row, col) = (self.editor.cursor_row, self.editor.cursor_col);
+        let on_line = || {
+            targets
+                .iter()
+                .enumerate()
+                .filter(move |(_, (p, line, _))| p == path && *line as usize == row)
+        };
+        on_line()
+            .filter(|(_, (_, _, c))| *c as usize <= col)
+            .max_by_key(|(_, (_, _, c))| *c)
+            .or_else(|| on_line().next())
+            .map_or(0, |(i, _)| i)
     }
 
     /// Anchor a `ContextMenu` at the activity-bar gear. `menu_rect` clamps it
