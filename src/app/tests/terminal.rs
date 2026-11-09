@@ -3528,6 +3528,374 @@ fn capture_triggers_collect_into_the_captures_panel_and_jump_to_the_line() {
     );
 }
 
+/// An app whose only pane runs `script` (with `$e` set to `err`) under an
+/// `err-N` capture trigger, once `want` lines have been captured. Read-gated
+/// and assembled at runtime like the test above, so the trigger set reaches
+/// the pane first and the `▶ …` header never fires it.
+fn app_with_captures(script: &str, want: usize) -> (tempfile::TempDir, App) {
+    app_with_triggers(ERR_CAPTURE, script, want)
+}
+
+const ERR_CAPTURE: &str =
+    r#"[ { "regex": "err-(\\d+)", "action": "capture", "message": "boom \\1" } ]"#;
+
+/// [`app_with_captures`] with the pane's triggers given as JSON.
+fn app_with_triggers(triggers: &str, script: &str, want: usize) -> (tempfile::TempDir, App) {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.triggers = std::sync::Arc::new(crate::triggers::TriggerSet::from_json(triggers));
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[
+            String::from("-c"),
+            format!("read x; e=err; {script}; sleep 30"),
+        ],
+        tmp.path(),
+    )
+    .unwrap();
+    app.drain_terminal_bells();
+    app.terminals[0].write_input(b"\n");
+    await_captures(&mut app, want);
+    (tmp, app)
+}
+
+/// Drain the pane until the CAPTURES panel holds `want` entries.
+fn await_captures(app: &mut App, want: usize) {
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::SHELL_PAINT_BASE,
+        "the error lines to be captured",
+        || {
+            app.drain_terminal_bells();
+            app.captures.len() >= want
+        },
+    );
+}
+
+#[test]
+fn each_capture_of_a_repeated_line_jumps_to_its_own_copy() {
+    // #1450: a test that fails on every run prints the same line every run,
+    // and every entry jumped to the newest copy, so the first run's entry
+    // selected the last run's failure.
+    let (_tmp, mut app) =
+        app_with_captures("echo ${e}-7 broke; echo between; echo ${e}-7 broke", 2);
+    let mut rows = Vec::new();
+    for i in 0..2 {
+        app.captures.select_index(i);
+        app.captures_open_selected();
+        let sel = app.terminals[0]
+            .selection()
+            .expect("the jump selects the line");
+        assert!(
+            app.terminals[0].selection_text().contains("err-7 broke"),
+            "{}",
+            app.status
+        );
+        rows.push(sel.anchor.0);
+    }
+    assert_eq!(
+        rows[1] - rows[0],
+        2,
+        "the first entry selects the upper copy, the second the lower: {rows:?}"
+    );
+}
+
+#[test]
+fn a_capture_that_left_the_scrollback_is_not_stood_in_for_by_its_repeat() {
+    // 6000 filler rows push the first copy past the 5000-row scrollback.
+    let (_tmp, mut app) = app_with_captures(
+        "echo ${e}-7 broke; yes 'filler line' | head -n 6000; echo ${e}-7 broke",
+        2,
+    );
+    let (lines, _) = app.terminals[0].grid_lines();
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|l| l.starts_with("err-7 broke"))
+            .count(),
+        1,
+        "precondition: the first copy rotated off the scrollback"
+    );
+    app.captures.select_index(0);
+    app.captures_open_selected();
+    assert_eq!(app.status, "Captured line is no longer in the scrollback");
+    assert!(
+        app.terminals[0].selection().is_none(),
+        "the first run's entry must not select the second run's line"
+    );
+    app.captures.select_index(1);
+    app.captures_open_selected();
+    assert!(
+        app.terminals[0].selection_text().contains("err-7 broke"),
+        "the copy still on screen is found: {}",
+        app.status
+    );
+}
+
+#[test]
+fn a_resize_that_rewraps_the_output_keeps_each_capture_on_its_own_copy() {
+    // A resize re-wraps the 200-column lines by a different number of rows
+    // above each copy, so no single scroll shift can follow both (#1450).
+    let long = "printf '%0200d\\n' 0";
+    let (_tmp, mut app) = app_with_captures(
+        &format!(
+            "echo ${{e}}-7 broke; echo first; {long}; echo ${{e}}-7 broke; echo second; \
+             {long}; {long}; {long}"
+        ),
+        2,
+    );
+    for (cols, when) in [(80, "as printed"), (40, "narrower"), (120, "wider")] {
+        app.terminals[0].resize(cols, 24);
+        for (i, next) in ["first", "second"].into_iter().enumerate() {
+            app.captures.select_index(i);
+            app.captures_open_selected();
+            let line = app.terminals[0]
+                .selection()
+                .unwrap_or_else(|| panic!("{when}: entry {i}: {}", app.status))
+                .anchor
+                .0;
+            let (lines, top) = app.terminals[0].grid_lines();
+            assert_eq!(
+                lines[(line - top) as usize + 1].trim_end(),
+                next,
+                "{when}: entry {i} selects its own copy"
+            );
+        }
+    }
+}
+
+/// Run `before`, then a full-screen program that the pane is resized to 40
+/// columns under, then `after` once it exits (#1450).
+fn app_resized_under_a_full_screen_program(
+    before: &str,
+    want: usize,
+    after: &str,
+) -> (tempfile::TempDir, App) {
+    app_resized_under_a_full_screen_program_with(ERR_CAPTURE, before, want, after)
+}
+
+/// [`app_resized_under_a_full_screen_program`] with the triggers as JSON.
+fn app_resized_under_a_full_screen_program_with(
+    triggers: &str,
+    before: &str,
+    want: usize,
+    after: &str,
+) -> (tempfile::TempDir, App) {
+    let (tmp, mut app) = app_with_triggers(
+        triggers,
+        &format!(
+            "{before}; printf '\\033[?1049h'; read y; printf '\\033[?1049l'; {after}; echo back"
+        ),
+        want,
+    );
+    let wait = |app: &mut App, what: &str, done: &dyn Fn(&App) -> bool| {
+        crate::test_budget::await_spawned(
+            crate::test_budget::tests::SHELL_PAINT_BASE,
+            what,
+            || {
+                app.drain_terminal_bells();
+                done(app)
+            },
+        );
+    };
+    wait(&mut app, "the full-screen program", &|app| {
+        app.terminals[0].alt_screen()
+    });
+    app.terminals[0].resize(40, 24);
+    app.terminals[0].write_input(b"\n");
+    wait(&mut app, "the shell back on the primary screen", &|app| {
+        !app.terminals[0].alt_screen()
+            && app.terminals[0]
+                .grid_lines()
+                .0
+                .iter()
+                .any(|l| l.trim_end() == "back")
+    });
+    (tmp, app)
+}
+
+#[test]
+fn a_resize_under_a_full_screen_program_keeps_each_capture_on_its_own_copy() {
+    // A full-screen program hides the primary grid, but a resize re-wraps
+    // it all the same, out of reach. Each entry then finds its line by its
+    // text and its order among the copies, not the newest copy and not
+    // "gone" for a line still on screen (#1450).
+    let long = "printf '%0200d\\n' 0";
+    let (_tmp, mut app) = app_resized_under_a_full_screen_program(
+        &format!(
+            "echo ${{e}}-7 broke; echo first; {long}; echo ${{e}}-7 broke; echo second; \
+             {long}; {long}; {long}"
+        ),
+        2,
+        "true",
+    );
+    for (i, next) in ["first", "second"].into_iter().enumerate() {
+        app.captures.select_index(i);
+        app.captures_open_selected();
+        let line = app.terminals[0]
+            .selection()
+            .unwrap_or_else(|| panic!("entry {i}: {}", app.status))
+            .anchor
+            .0;
+        let (lines, top) = app.terminals[0].grid_lines();
+        assert_eq!(
+            lines[(line - top) as usize + 1].trim_end(),
+            next,
+            "entry {i} selects its own copy"
+        );
+    }
+}
+
+#[test]
+fn two_triggers_on_one_line_still_find_it_after_a_full_screen_resize() {
+    // Two `capture` triggers catch each copy, so each printed line has two
+    // entries; after a resize under a full-screen program each entry still
+    // counts printed lines, not entries, and selects its own copy (#1450).
+    let both = r#"[
+        { "regex": "err-(\\d+)", "action": "capture", "message": "boom \\1" },
+        { "regex": "broke", "action": "capture", "message": "broke" }
+    ]"#;
+    let (_tmp, mut app) = app_resized_under_a_full_screen_program_with(
+        both,
+        "echo ${e}-7 broke; echo first; echo ${e}-7 broke; echo second",
+        4,
+        "true",
+    );
+    for (i, next) in ["first", "first", "second", "second"]
+        .into_iter()
+        .enumerate()
+    {
+        app.captures.select_index(i);
+        app.captures_open_selected();
+        let line = app.terminals[0]
+            .selection()
+            .unwrap_or_else(|| panic!("entry {i}: {}", app.status))
+            .anchor
+            .0;
+        let (lines, top) = app.terminals[0].grid_lines();
+        assert_eq!(
+            lines[(line - top) as usize + 1].trim_end(),
+            next,
+            "entry {i} selects its own copy"
+        );
+    }
+}
+
+#[test]
+fn a_reset_after_a_full_screen_resize_drops_the_capture() {
+    // A reset (RIS) erases the screen and the scrollback. An entry whose row
+    // a full-screen resize had made unknown must then say its line is gone,
+    // not select text that starts the same and was printed after the reset
+    // without being captured (#1450).
+    let exact =
+        r#"[ { "regex": "^err-(\\d+) broke$", "action": "capture", "message": "boom \\1" } ]"#;
+    let (_tmp, mut app) = app_resized_under_a_full_screen_program_with(
+        exact,
+        "echo ${e}-7 broke",
+        1,
+        "printf '\\033c'; echo ${e}-7 broke again",
+    );
+    assert_eq!(app.captures.len(), 1, "the later line is not captured");
+    app.captures.select_index(0);
+    app.captures_open_selected();
+    assert_eq!(app.status, "Captured line is no longer in the scrollback");
+    assert!(app.terminals[0].selection().is_none());
+}
+
+#[test]
+fn a_copy_gone_after_a_full_screen_resize_is_not_stood_in_for_by_its_repeat() {
+    // The first copy rotates off the 5000-row scrollback after the resize
+    // under a full-screen program; its entry says so instead of taking the
+    // second copy, which its own entry still finds (#1450).
+    let (_tmp, mut app) = app_resized_under_a_full_screen_program(
+        "echo ${e}-7 broke; yes 'filler line' | head -n 4995; echo ${e}-7 broke; echo second",
+        2,
+        "yes 'filler line' | head -n 100",
+    );
+    let (lines, _) = app.terminals[0].grid_lines();
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|l| l.starts_with("err-7 broke"))
+            .count(),
+        1,
+        "precondition: the first copy rotated off the scrollback"
+    );
+    app.captures.select_index(0);
+    app.captures_open_selected();
+    assert_eq!(app.status, "Captured line is no longer in the scrollback");
+    assert!(app.terminals[0].selection().is_none());
+    app.captures.select_index(1);
+    app.captures_open_selected();
+    assert!(
+        app.terminals[0].selection_text().contains("err-7 broke"),
+        "the copy still on screen is found: {}",
+        app.status
+    );
+}
+
+#[test]
+fn a_capture_erased_by_a_clear_is_not_stood_in_for_by_a_later_copy() {
+    // The program's own `clear` erases the first copy and the pane's Clear
+    // the second; each entry then says its line is gone rather than jumping
+    // to the copy printed after it (#1450).
+    let (_tmp, mut app) = app_with_captures(
+        "echo ${e}-7 broke; read y; printf '\\033[H\\033[2J\\033[3J'; echo ${e}-7 broke; \
+         read z; echo ${e}-7 broke",
+        1,
+    );
+    app.terminals[0].write_input(b"\n");
+    await_captures(&mut app, 2);
+    app.terminals[0].clear_screen_and_scrollback();
+    app.terminals[0].write_input(b"\n");
+    await_captures(&mut app, 3);
+    for i in 0..2 {
+        app.captures.select_index(i);
+        app.captures_open_selected();
+        assert_eq!(
+            app.status, "Captured line is no longer in the scrollback",
+            "entry {i}"
+        );
+        assert!(app.terminals[0].selection().is_none(), "entry {i}");
+    }
+    app.captures.select_index(2);
+    app.captures_open_selected();
+    assert!(
+        app.terminals[0].selection_text().contains("err-7 broke"),
+        "the copy printed after the Clear is found: {}",
+        app.status
+    );
+}
+
+#[test]
+fn a_capture_whose_pane_closed_takes_the_newest_match_in_the_active_pane() {
+    // The anchor names a row in the pane that recorded it; in the pane the
+    // jump falls back to, only the text means anything (#1450).
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[String::from("-c"), String::from("sleep 30")],
+        tmp.path(),
+    )
+    .unwrap();
+    app.terminals[0].feed_bytes_for_test(b"a line from a closed pane\r\n");
+    app.captures.push(crate::widgets::captures::CapturedLine {
+        pane: String::from("gone"),
+        shell_pid: None,
+        message: String::from("captured"),
+        line: String::from("a line from a closed pane"),
+        anchor: Some(u64::MAX),
+    });
+    app.captures_open_selected();
+    assert!(
+        app.terminals[0]
+            .selection_text()
+            .contains("a line from a closed pane"),
+        "{}",
+        app.status
+    );
+}
+
 #[test]
 fn change_workspace_root_restores_the_incoming_workspaces_layout_when_the_panel_is_untouched() {
     let tmp = tempfile::tempdir().unwrap();
@@ -6587,6 +6955,7 @@ fn jumping_to_a_captured_line_reveals_the_folded_pane_that_holds_it() {
         shell_pid: Some(pid),
         message: String::from("captured"),
         line: String::from("a captured line worth jumping to"),
+        anchor: None,
     });
     app.captures_open_selected();
 

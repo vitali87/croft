@@ -54122,27 +54122,21 @@ impl App {
 
     /// Jump the selected capture's pane back to the captured line: switch to
     /// the TERMINAL tab, focus the pane (found by shell pid; a closed pane
-    /// falls back to the active one), locate the newest grid row matching
-    /// the captured text, scroll it into view and select it. A very long
-    /// captured line wraps across grid rows, so the match is prefix-based
-    /// on the first wrapped row.
+    /// falls back to the active one), locate the grid row matching the
+    /// captured text nearest the row the line was printed on (so each run's
+    /// copy of a repeated line is its own entry, #1450), scroll it into view
+    /// and select it. A very long captured line wraps across grid rows, so
+    /// the match is prefix-based on the first wrapped row.
     pub fn captures_open_selected(&mut self) {
         let Some(entry) = self.captures.selected_entry().cloned() else {
             return;
         };
-        let idx = entry
-            .shell_pid
-            .and_then(|pid| {
-                self.terminals
-                    .iter()
-                    .position(|t| t.shell_pid() == Some(pid))
-            })
-            .unwrap_or(self.active_terminal);
+        let (idx, anchor) = self.capture_pane(&entry);
         self.reveal_terminal_pane(idx);
         self.set_bottom_panel_tab(BottomPanelTab::Terminal);
         self.focus_pane(Pane::Terminal);
         let needle: String = entry.line.trim_end().chars().take(60).collect();
-        let Some(line) = self.terminals[idx].find_captured_line(&needle) else {
+        let Some(line) = self.terminals[idx].find_captured_line(&needle, anchor) else {
             self.status = String::from("Captured line is no longer in the scrollback");
             return;
         };
@@ -54155,6 +54149,22 @@ impl App {
         }));
         t.scroll_to_line(line);
         self.status = format!("Capture: {}", entry.message);
+    }
+
+    /// The pane a capture came from, found by shell pid, and the anchor to
+    /// find its line by. A closed pane falls back to the active one without
+    /// the anchor, which names a row only in the pane that recorded it: the
+    /// newest match is all another pane can offer.
+    fn capture_pane(&self, entry: &crate::widgets::captures::CapturedLine) -> (usize, Option<u64>) {
+        let found = entry.shell_pid.and_then(|pid| {
+            self.terminals
+                .iter()
+                .position(|t| t.shell_pid() == Some(pid))
+        });
+        match found {
+            Some(idx) => (idx, entry.anchor),
+            None => (self.active_terminal, None),
+        }
     }
 
     fn handle_terminal_key(&mut self, key: KeyEvent) {
@@ -56450,6 +56460,7 @@ impl App {
                             shell_pid: t.shell_pid(),
                             message: h.message,
                             line: h.line,
+                            anchor: h.anchor,
                         });
                     }
                     crate::triggers::TriggerAction::Bell => {
@@ -57949,19 +57960,12 @@ impl App {
             return;
         }
         let name = host.name().to_string();
-        let idx = entry
-            .shell_pid
-            .and_then(|pid| {
-                self.terminals
-                    .iter()
-                    .position(|t| t.shell_pid() == Some(pid))
-            })
-            .unwrap_or(self.active_terminal);
+        let (idx, anchor) = self.capture_pane(&entry);
         // The rows around the line, if it is still in the scrollback; the
         // line alone otherwise.
         let needle: String = entry.line.trim_end().chars().take(60).collect();
         let context: Vec<String> = match self.terminals.get(idx) {
-            Some(t) => match t.find_captured_line(&needle) {
+            Some(t) => match t.find_captured_line(&needle, anchor) {
                 Some(line) => {
                     let (lines, top) = t.grid_lines();
                     let hit = usize::try_from(line - top).unwrap_or(0);

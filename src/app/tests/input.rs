@@ -920,7 +920,7 @@ fn clicking_an_annotated_span_still_clears_the_click_selection() {
     // Anchor the note to the grid line the text actually landed on and aim
     // the click at that same line, rather than assuming both are row 0.
     let line = app.terminals[0]
-        .find_captured_line("annotated words here")
+        .find_captured_line("annotated words here", None)
         .expect("the fed text is on the grid");
     assert!(
         line >= 0,

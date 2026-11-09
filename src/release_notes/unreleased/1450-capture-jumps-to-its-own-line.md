@@ -1,0 +1,1 @@
+fix: A CAPTURES entry jumps to the line it captured, not the newest copy of it: when a re-run prints the same failure again, the first run's entry now selects the first run's line, also after the pane is resized, and an entry whose line was cleared or has left the scrollback says so.
