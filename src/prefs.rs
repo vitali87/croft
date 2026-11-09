@@ -244,6 +244,14 @@ pub struct Prefs {
     /// read as `auto`, so a typo cannot start a compile on a huge root.
     #[serde(default)]
     pub problems_project_scope: String,
+    /// What a gcc/clang-shaped build message counts its column in:
+    /// `display` (screen cells, a tab running to the next multiple of 8;
+    /// gcc 11 and newer), `byte` (clang, older gcc) or `char`. Unrecognised
+    /// or empty reads as `display`. It decides where "Go to Problem" and a
+    /// click in PROBLEMS put the caret on a line with a tab or a non-ASCII
+    /// character.
+    #[serde(default)]
+    pub build_column_unit: String,
     /// Default whitespace handling for new diff views: `off` (every byte
     /// counts), `leading` (ignore indentation changes), or `all` (ignore every
     /// whitespace-only difference). Unrecognised values read as `off`, so a
@@ -385,6 +393,13 @@ pub struct Prefs {
     /// the derived `Default` and an older config both mean "guides shown".
     #[serde(default)]
     pub disable_indent_guides: bool,
+    /// Home on a wrapped line (#1569): with this on, pressing Home on the
+    /// start of a continuation row goes to the start of the row above, one
+    /// visual row per press, before the line's own stops. Off (the default)
+    /// is VS Code's `cursorHome`: from a row's start straight to the line's
+    /// first non-blank character and column 0.
+    #[serde(default)]
+    pub home_walks_wrapped_rows: bool,
     /// Gutter line numbers (#1576, VS Code's `editor.lineNumbers`): "on"
     /// (also what the empty string an older config deserializes to means),
     /// "relative", "interval" or "off". Parsed by `LineNumbers::from_pref`.

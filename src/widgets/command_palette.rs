@@ -66,6 +66,10 @@ pub enum Command {
     MergePrevConflict,
     GoToNextChange,
     GoToPrevChange,
+    /// Walk the PROBLEMS list (build messages and diagnostics) from the
+    /// caret, across files, wrapping at the ends.
+    GoToNextProblem,
+    GoToPrevProblem,
     MergeComplete,
     MergeOpenEditor,
     MergeToggleBase,
@@ -660,6 +664,8 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::MergePrevConflict,
     Command::GoToNextChange,
     Command::GoToPrevChange,
+    Command::GoToNextProblem,
+    Command::GoToPrevProblem,
     Command::MergeComplete,
     Command::MergeOpenEditor,
     Command::MergeToggleBase,
@@ -1144,6 +1150,8 @@ impl Command {
             Command::MergePrevConflict => "Merge Conflict: Previous Conflict",
             Command::GoToNextChange => "Go to Next Change",
             Command::GoToPrevChange => "Go to Previous Change",
+            Command::GoToNextProblem => "Go to Next Problem",
+            Command::GoToPrevProblem => "Go to Previous Problem",
             Command::MergeComplete => "Merge: Complete Merge (stage file)",
             Command::MergeOpenEditor => "Merge: Open Merge Editor",
             Command::MergeToggleBase => "Merge: Show Base",
@@ -1640,6 +1648,10 @@ impl Command {
             Command::MergePrevConflict => "Shift+F7",
             Command::GoToNextChange => "F7",
             Command::GoToPrevChange => "Shift+F7",
+            // No default chord: F8 is the perf toggle here. Bind one in
+            // keybindings.json, or import VS Code's F8 / Shift+F8.
+            Command::GoToNextProblem => "",
+            Command::GoToPrevProblem => "",
             Command::MergeComplete => "",
             Command::MergeOpenEditor => "",
             Command::MergeToggleBase => "",
@@ -2119,6 +2131,8 @@ impl Command {
             Command::MergePrevConflict => "merge_prev_conflict",
             Command::GoToNextChange => "next_change",
             Command::GoToPrevChange => "previous_change",
+            Command::GoToNextProblem => "next_problem",
+            Command::GoToPrevProblem => "previous_problem",
             Command::MergeComplete => "merge_complete",
             Command::MergeOpenEditor => "merge_open_editor",
             Command::MergeToggleBase => "merge_toggle_base",

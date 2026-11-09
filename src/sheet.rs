@@ -838,10 +838,60 @@ fn compute_col_widths(headers: Option<&Vec<String>>, rows: &[Vec<String>]) -> Ve
     widths
 }
 
+/// The columns a grid body `body_w` wide shows from `scroll_col`: each one's
+/// index, x offset and drawn width, with a one-column gap after each. The
+/// renderer and mouse hit-testing both lay out with this, so a click lands
+/// on the cell drawn under it. A first column wider than the whole body is
+/// drawn clipped to it rather than left out: a narrow pane never shows an
+/// empty grid because one value is long (a 20-character CJK value is 40
+/// columns wide).
+pub fn visible_columns(widths: &[u16], scroll_col: usize, body_w: u16) -> Vec<(usize, u16, u16)> {
+    let mut out = Vec::new();
+    let mut x_off = 0u16;
+    for (c, &w) in widths.iter().enumerate().skip(scroll_col) {
+        if x_off.saturating_add(w).saturating_add(1) > body_w {
+            if out.is_empty() && body_w > 0 {
+                out.push((c, 0, body_w));
+            }
+            break;
+        }
+        out.push((c, x_off, w));
+        x_off += w + 1;
+    }
+    out
+}
+
+/// Screen columns a cell's text needs, capped at the widest a column gets.
+/// Counted the way the grid draws it (#1138): CJK, Hangul and emoji take
+/// two columns, so a count of chars gave `서울특별시` half its width and the
+/// next column painted over it.
 fn display_width(s: &str) -> u16 {
-    // unicode-width is a separate dep; chars().count() is good enough for
-    // ASCII and single-codepoint scripts that croft usually deals with.
-    s.chars().count().min(u16::MAX as usize) as u16
+    use unicode_segmentation::UnicodeSegmentation;
+    let mut w = 0;
+    for g in s.graphemes(true) {
+        w += grapheme_width(g);
+        if w >= MAX_COL_DISPLAY_W as usize {
+            break;
+        }
+    }
+    w.min(MAX_COL_DISPLAY_W as usize) as u16
+}
+
+/// Columns one grapheme of a cell takes in the grid. A control character
+/// is drawn as one visible glyph (`⏎`, `→`, `␀`), so it is one column each;
+/// anything else is as wide as the terminal draws it.
+pub(crate) fn grapheme_width(g: &str) -> usize {
+    if g.contains(char::is_control) {
+        g.chars().count()
+    } else {
+        unicode_width::UnicodeWidthStr::width(g)
+    }
+}
+
+/// Columns `s` takes in the grid: [`grapheme_width`] summed.
+pub(crate) fn text_width(s: &str) -> usize {
+    use unicode_segmentation::UnicodeSegmentation;
+    s.graphemes(true).map(grapheme_width).sum()
 }
 
 /// Refuse a sheet whose dense extent is over [`MAX_SHEET_CELLS`]. The
@@ -1111,13 +1161,27 @@ fn format_cell(d: &calamine::Data) -> String {
         calamine::Data::Bool(b) => b.to_string(),
         calamine::Data::DateTime(dt) => dt.to_string(),
         calamine::Data::DateTimeIso(s) | calamine::Data::DurationIso(s) => s.clone(),
-        calamine::Data::Error(e) => format!("#{e:?}"),
+        // The code the file stores and every spreadsheet shows (`#DIV/0!`,
+        // `#N/A`), not the Rust variant name (`#Div0`, `#NA`) (#1144).
+        // calamine's `Display` spells error 0x2B `#DATA!`; Excel's code for it
+        // is `#GETTING_DATA`.
+        calamine::Data::Error(calamine::CellErrorType::GettingData) => {
+            String::from("#GETTING_DATA")
+        }
+        calamine::Data::Error(e) => e.to_string(),
     }
 }
 
-fn format_float(f: f64) -> String {
-    if f.fract() == 0.0 && f.abs() < 1e15 {
+/// A float as a spreadsheet shows a number with no format of its own:
+/// positional while that reads well, exponent notation for the very small
+/// and the very large (#1143). Positional `1e-50` is 52 characters, cut at
+/// the column width to a row of zeros that reads as zero.
+pub(crate) fn format_float(f: f64) -> String {
+    let a = f.abs();
+    if f.fract() == 0.0 && a < 1e15 {
         format!("{}", f as i64)
+    } else if f.is_finite() && a != 0.0 && !(1e-4..1e15).contains(&a) {
+        format!("{f:e}")
     } else {
         format!("{f}")
     }
@@ -1125,6 +1189,23 @@ fn format_float(f: f64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn formula_errors_read_as_the_codes_spreadsheets_show() {
+        use calamine::{CellErrorType as E, Data};
+        for (e, code) in [
+            (E::Div0, "#DIV/0!"),
+            (E::NA, "#N/A"),
+            (E::Name, "#NAME?"),
+            (E::Null, "#NULL!"),
+            (E::Num, "#NUM!"),
+            (E::Ref, "#REF!"),
+            (E::Value, "#VALUE!"),
+            (E::GettingData, "#GETTING_DATA"),
+        ] {
+            assert_eq!(super::format_cell(&Data::Error(e)), code);
+        }
+    }
+
     #[test]
     fn sorting_a_column_orders_numbers_as_numbers_and_toggles() {
         let mut d = super::parse_delimited(b"name,count\nb,10\nA,9\nc,100\n", b',', "s").unwrap();
@@ -1140,6 +1221,31 @@ mod tests {
         assert!(d.sort_by_column(0));
         assert_eq!(col(&d, 0), ["A", "b", "c"], "text without case");
         assert_eq!(d.headers, ["name", "count"], "the header stays put");
+    }
+
+    #[test]
+    fn a_first_column_wider_than_the_body_is_clipped_not_dropped() {
+        // Columns that fit keep their width with a gap after each.
+        assert_eq!(
+            super::visible_columns(&[5, 8, 4], 0, 19),
+            vec![(0, 0, 5), (1, 6, 8)]
+        );
+        // One 40-wide column in a 30-wide body: drawn at 30, not left out.
+        assert_eq!(super::visible_columns(&[40, 5], 0, 30), vec![(0, 0, 30)]);
+        // Scrolled onto it, the same.
+        assert_eq!(super::visible_columns(&[3, 40], 1, 30), vec![(1, 0, 30)]);
+        // Only the FIRST column is clipped; a later one that does not fit
+        // waits for a scroll.
+        assert_eq!(super::visible_columns(&[5, 40], 0, 30), vec![(0, 0, 5)]);
+        assert!(super::visible_columns(&[5], 0, 0).is_empty());
+    }
+
+    #[test]
+    fn a_cell_width_never_passes_the_column_cap() {
+        // 39 narrow columns then a wide glyph would be 41.
+        let s = format!("{}表", "x".repeat(super::MAX_COL_DISPLAY_W as usize - 1));
+        assert_eq!(super::display_width(&s), super::MAX_COL_DISPLAY_W);
+        assert_eq!(super::display_width("表表"), 4);
     }
 
     /// Write a zip of `(name, text)` members.
@@ -1416,6 +1522,27 @@ mod tests {
         let mut d = sheet_of(&["10", "-2.5", "9", "1e3"]);
         d.sort_by_column(1);
         assert_eq!(column(&d, 1), ["-2.5", "9", "10", "1e3"]);
+    }
+
+    #[test]
+    fn very_small_and_very_large_floats_read_in_exponent_notation() {
+        use super::format_float as f;
+        assert_eq!(f(6.62607015e-34), "6.62607015e-34");
+        assert_eq!(f(1e-50), "1e-50");
+        assert_eq!(f(6.02214076e23), "6.02214076e23");
+        assert_eq!(f(1e300), "1e300");
+        assert_eq!(f(-2.5e-7), "-2.5e-7");
+        // Everyday numbers keep their positional form.
+        assert_eq!(f(0.0), "0");
+        assert_eq!(f(42.0), "42");
+        assert_eq!(f(1234.5678), "1234.5678");
+        assert_eq!(f(0.00012), "0.00012");
+        assert_eq!(f(-0.5), "-0.5");
+        for v in [6.62607015e-34, 1e-50, 1e300, 6.02214076e23, 0.1 + 0.2] {
+            let s = f(v);
+            assert!(s.len() <= 24, "{s} fits a column");
+            assert_eq!(s.parse::<f64>().unwrap(), v, "{s} reads back exactly");
+        }
     }
 
     #[test]

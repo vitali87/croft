@@ -1295,6 +1295,25 @@ fn reloaded_rulers_reach_every_open_editor() {
     assert!(app.editor.editors.iter().all(|e| e.rulers.is_empty()));
 }
 
+/// #1569: a settings reload carries `home_walks_wrapped_rows` straight onto
+/// every open editor, not only the active one, so a tab picked without a
+/// focus sync walks (or does not) as the setting says.
+#[test]
+fn reloaded_home_walk_reaches_every_open_editor() {
+    let mut app = editor_app_with_lines(&["a b"]);
+    app.editor
+        .open_text_buffer(std::path::Path::new("later.txt"), "c d")
+        .unwrap();
+    app.apply_merged_settings(&crate::prefs::Prefs {
+        home_walks_wrapped_rows: true,
+        ..Default::default()
+    });
+    assert!(app.editor.editors.len() >= 2);
+    assert!(app.editor.editors.iter().all(|e| e.home_walks_rows));
+    app.apply_merged_settings(&crate::prefs::Prefs::default());
+    assert!(app.editor.editors.iter().all(|e| !e.home_walks_rows));
+}
+
 #[test]
 fn build_sticky_lines_pins_enclosing_headers_scrolled_above_the_viewport() {
     use crate::lsp::manager::OutlineKind;
@@ -1318,6 +1337,31 @@ fn build_sticky_lines_pins_enclosing_headers_scrolled_above_the_viewport() {
     assert_eq!(app.build_sticky_lines(), vec![0]);
     // Parked on the class header itself: nothing is scrolled off, so no pins.
     app.editor.scroll = 0;
+    assert!(app.build_sticky_lines().is_empty());
+}
+
+/// #940: a decorated definition's range starts at its decorator, but the
+/// sticky header is its `def`/`class` line, which names it. With that line
+/// itself at the top, nothing is pinned over it.
+#[test]
+fn sticky_scroll_pins_the_name_line_of_a_decorated_definition() {
+    use crate::lsp::manager::OutlineKind;
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("api.py");
+    std::fs::write(&f, "x\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&f).unwrap();
+    // `@dataclass` on line 3 above `class Order:` on 4; inside it,
+    // `@staticmethod` on 6 above `def validate` on 7.
+    let mut order = sym("Order", OutlineKind::Class, 0, 3, 40);
+    order.line = 4;
+    let mut validate = sym("validate", OutlineKind::Method, 1, 6, 30);
+    validate.line = 7;
+    app.outline.set_symbols(f.clone(), vec![order, validate]);
+    app.editor.scroll = 20;
+    assert_eq!(app.build_sticky_lines(), vec![4, 7], "the name lines");
+    // Negative: the class line at the top is shown, not covered by a pin.
+    app.editor.scroll = 4;
     assert!(app.build_sticky_lines().is_empty());
 }
 
@@ -2390,4 +2434,45 @@ fn overwrite_mode_is_shown_by_a_glyph_after_the_wordmark_not_in_the_position() {
     let over = bar(&term);
     assert!(over.contains("ft \u{2381}"), "overwrite glyph: {over}");
     assert!(!over.contains("OVR"), "the Ln/Col segment stays unchanged");
+}
+
+#[test]
+fn a_crowded_tab_strip_offers_a_list_of_all_open_tabs() {
+    use crate::widgets::list_picker::ListPurpose;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    for i in 0..14 {
+        let f = tmp.path().join(format!("a_rather_long_name_{i:02}.txt"));
+        std::fs::write(&f, "x\n").unwrap();
+        app.editor.open_pinned(&f).unwrap();
+    }
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let y = app.editor.tab_strip_y_for_test();
+    let col = (0..100)
+        .find(|&c| app.editor.tab_list_button_at(c, y))
+        .expect("the tabs overflow, so the strip draws the list button");
+    assert_eq!(app.ui_tooltip_at(col, y), Some("Show All Open Tabs"));
+    app.handle_mouse(mouse(
+        crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        col,
+        y,
+    ));
+    let picker = app.list_picker.as_ref().expect("the button opens the list");
+    assert_eq!(picker.purpose, ListPurpose::OpenTab);
+    assert_eq!(picker.rows.len(), 14);
+    assert_eq!(picker.selected, 13, "the active tab is the selected row");
+    // Picking the first row activates that tab and scrolls the strip to it.
+    for _ in 0..13 {
+        app.handle_key(key(KeyCode::Up, KeyModifiers::NONE))
+            .unwrap();
+    }
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.active_index(), 0);
+    term.draw(|f| app.render(f)).unwrap();
+    assert!(
+        app.editor.tab_screen_x(0).is_some_and(|(_, w)| w > 0),
+        "the picked tab is on screen"
+    );
 }
