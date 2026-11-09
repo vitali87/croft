@@ -2461,19 +2461,19 @@ fn overwrite_mode_is_shown_by_a_glyph_after_the_workspace_cap_not_in_the_positio
     };
     term.draw(|f| app.render(f)).unwrap();
     let insert = bar(&term);
-    // The workspace cap ends on its rounded right edge; the glyph follows
-    // one cell of air later.
     assert!(
-        insert.contains("\u{e0b4} \u{2380}"),
-        "insert glyph after the workspace cap: {insert}"
+        !insert.contains('\u{2380}') && !insert.contains('\u{2381}'),
+        "Insert, the default, adds nothing to the bar: {insert}"
     );
     app.handle_key(key(KeyCode::Insert, KeyModifiers::NONE))
         .unwrap();
     term.draw(|f| app.render(f)).unwrap();
     let over = bar(&term);
+    // The workspace cap ends on its rounded right edge; the glyph follows
+    // one cell of air later.
     assert!(
         over.contains("\u{e0b4} \u{2381}"),
-        "overwrite glyph: {over}"
+        "overwrite glyph after the workspace cap: {over}"
     );
     assert!(!over.contains("OVR"), "the Ln/Col segment stays unchanged");
 }

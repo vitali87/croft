@@ -1184,22 +1184,18 @@ fn status_pill(label: &str, fill: Color, fg: Color) -> [Span<'static>; 3] {
     ]
 }
 
-/// The typing-mode glyph that follows the workspace cap in the status bar:
-/// the insertion symbol (⎀) in the bar's quiet `muted` tone while typing
-/// inserts, the continuous-underline symbol (⎁) in overwrite mode, lit in the
-/// brand orange so a switched mode is hard to miss. It sits on the left, away
-/// from the clickable position, encoding and language segments on the right.
-fn typing_mode_span(overwrite: bool, muted: Color) -> Span<'static> {
-    if overwrite {
-        Span::styled(
-            "\u{2381}",
-            Style::default()
-                .fg(BRAND_ORANGE)
-                .add_modifier(Modifier::BOLD),
-        )
-    } else {
-        Span::styled("\u{2380}", Style::default().fg(muted))
-    }
+/// The Overwrite badge that follows the workspace cap in the status bar: the
+/// continuous-underline symbol (⎁) in the brand orange, so a switched mode is
+/// hard to miss. Insert, the default, shows nothing, as in VS Code, and keeps
+/// the bar's cells for the segments after it. It sits on the left, away from
+/// the clickable position, encoding and language segments on the right.
+fn overwrite_mode_span() -> Span<'static> {
+    Span::styled(
+        "\u{2381}",
+        Style::default()
+            .fg(BRAND_ORANGE)
+            .add_modifier(Modifier::BOLD),
+    )
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -24348,8 +24344,10 @@ impl App {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| self.workspace_root().display().to_string());
         spans.extend(workspace_cap_spans(self.theme, &workspace_name));
-        spans.push(Span::raw(" "));
-        spans.push(typing_mode_span(self.overwrite_mode, tones.muted));
+        if self.overwrite_mode {
+            spans.push(Span::raw(" "));
+            spans.push(overwrite_mode_span());
+        }
         let redacted = self.redacted_on_screen();
         if redacted > 0 || self.redactions_revealed() {
             // How much of what is on screen is masked right now (#360): a
