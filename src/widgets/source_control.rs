@@ -834,13 +834,17 @@ impl SourceControlPanel {
         if y >= bottom {
             return y;
         }
+        let tones = crate::widgets::surface::tones(self.theme);
         buf.set_stringn(
             inner.x + 1,
             y,
             "REPOSITORIES",
             inner.width.saturating_sub(1) as usize,
             Style::default()
-                .fg(self.theme.ui(Color::Rgb(0x8a, 0x92, 0xa4)))
+                .fg(tones.map_or_else(
+                    || self.theme.ui(Color::Rgb(0x8a, 0x92, 0xa4)),
+                    |t| t.muted(),
+                ))
                 .add_modifier(Modifier::BOLD),
         );
         y += 1;
@@ -854,6 +858,65 @@ impl SourceControlPanel {
                 width: inner.width,
                 height: 1,
             };
+            // Croft Loch: rows stay on the chrome (the default background
+            // painted black bars across it), the active repository wears the
+            // selected-row band and bar, the label is body text and the
+            // branch muted.
+            if let Some(t) = tones {
+                let hovered = crate::widgets::hover::contains(rect, self.hover_pointer);
+                // Clear the row onto the chrome first: in the no-repo state
+                // the overview paints over the empty-state card's top.
+                for x in rect.left()..rect.right() {
+                    buf[(x, y)]
+                        .set_symbol(" ")
+                        .set_style(Style::default().bg(t.chrome()));
+                }
+                if row.active {
+                    crate::widgets::surface::paint_selected_row(
+                        buf,
+                        Rect {
+                            x: rect.x.saturating_sub(1),
+                            width: rect.width + u16::from(rect.x > 0),
+                            ..rect
+                        },
+                        t,
+                        t.chrome,
+                        self.focused,
+                    );
+                } else if hovered {
+                    buf.set_style(rect, Style::default().bg(t.hover_on(t.chrome)));
+                }
+                let branch = row.branch.as_deref().unwrap_or("—");
+                let weight = if row.active {
+                    Modifier::BOLD
+                } else {
+                    Modifier::empty()
+                };
+                let line = Line::from(vec![
+                    Span::styled(
+                        format!(" {}", row.label),
+                        Style::default().fg(t.text()).add_modifier(weight),
+                    ),
+                    Span::styled(format!("  {branch}"), Style::default().fg(t.muted())),
+                ]);
+                buf.set_line(rect.x, y, &line, rect.width);
+                let left_w = line.width() as u16;
+                if row.changes > 0 {
+                    let count = row.changes.to_string();
+                    let cx = (rect.x + rect.width).saturating_sub(count.len() as u16 + 1);
+                    if cx > rect.x + left_w {
+                        buf.set_string(
+                            cx,
+                            y,
+                            &count,
+                            Style::default().fg(self.theme.ui(Color::Rgb(0xe0, 0x9a, 0x4e))),
+                        );
+                    }
+                }
+                self.repo_row_areas.push((rect, row.workspace_root.clone()));
+                y += 1;
+                continue;
+            }
             let hover_bg =
                 crate::widgets::hover::row_hover_bg(rect, self.hover_pointer, self.theme);
             let (bg, fg) = if row.active {
@@ -901,6 +964,49 @@ impl SourceControlPanel {
         y
     }
 
+    /// Croft Loch's Commit split button: two soft slabs, Commit and its
+    /// dropdown caret, rounded only on their outer ends and joined across
+    /// the one-cell gap between their click targets by the same slab with a
+    /// thin darker seam on the label row, so it reads as one button with a
+    /// second action rather than two blocks. Each half lifts on its own
+    /// under the pointer.
+    fn render_soft_split_button(&self, buf: &mut Buffer, main: Rect, caret: Rect) {
+        use crate::widgets::surface::{CHEVRON_UNFOLDED, paint_soft_button};
+        let (fill, fg) = primary_button_colors(self.theme, self.focus_gradient);
+        let lift = |r: Rect| {
+            if crate::widgets::hover::contains(r, self.hover_pointer) {
+                lift_button(fill)
+            } else {
+                fill
+            }
+        };
+        let (main_fill, caret_fill) = (lift(main), lift(caret));
+        paint_soft_button(buf, main, main_fill, true, false);
+        paint_soft_button(buf, caret, caret_fill, false, true);
+        let gap = Rect {
+            x: main.right(),
+            width: caret.x.saturating_sub(main.right()),
+            ..main
+        };
+        if gap.width > 0 {
+            paint_soft_button(buf, gap, fill, false, false);
+            if let Color::Rgb(r, g, b) = fill {
+                let seam = crate::gradient::rgb_color(crate::gradient::lerp_rgb(
+                    (r, g, b),
+                    (0, 0, 0),
+                    0.45,
+                ));
+                for x in gap.left()..gap.right() {
+                    buf[(x, gap.y + gap.height / 2)]
+                        .set_symbol("\u{258f}")
+                        .set_fg(seam);
+                }
+            }
+        }
+        paint_button_label(buf, main, "\u{eab2} Commit", main_fill, fg);
+        paint_button_label(buf, caret, &CHEVRON_UNFOLDED.to_string(), caret_fill, fg);
+    }
+
     /// Map a click to the repositories-overview row it landed on (#161).
     pub fn click_repository(&self, x: u16, y: u16) -> Option<std::path::PathBuf> {
         self.repo_row_areas
@@ -937,7 +1043,16 @@ impl SourceControlPanel {
             .border_type(BorderType::Rounded)
             .border_style(card_border);
         let card_inner = card_block.inner(card_area);
-        card_block.render(card_area, buf);
+        // Croft Loch: a raised card with a rim (it never takes the keyboard,
+        // so no accent lip) in place of the rounded line box; same inset.
+        let tones = crate::widgets::surface::tones(self.theme);
+        match tones {
+            Some(t) => {
+                buf.set_style(card_area, Style::default().bg(t.raised()));
+                crate::widgets::surface::paint_quiet_frame(buf, card_area, self.theme);
+            }
+            None => card_block.render(card_area, buf),
+        }
         if card_inner.width < 4 || card_inner.height < 3 {
             return;
         }
@@ -951,9 +1066,15 @@ impl SourceControlPanel {
             self.theme.ui(Color::Rgb(0x60, 0x9a, 0xfe))
         };
         let dim_blue = self.theme.ui(Color::Rgb(0x4b, 0x50, 0x5a));
-        let text_white = self.theme.ui(Color::Rgb(0xff, 0xff, 0xff));
-        let text_dim = self.theme.ui(Color::Rgb(0x9d, 0xa5, 0xb4));
-        let blue_bg = if self.focus_gradient {
+        let text_white = tones.map_or_else(
+            || self.theme.ui(Color::Rgb(0xff, 0xff, 0xff)),
+            |t| t.strong(),
+        );
+        let text_dim = tones.map_or_else(
+            || self.theme.ui(Color::Rgb(0x9d, 0xa5, 0xb4)),
+            |t| t.muted(),
+        );
+        let blue_bg = if self.focus_gradient || tones.is_some() {
             crate::gradient::rgb_color(crate::gradient::PRIMARY_BTN_BG)
         } else {
             Color::Rgb(BUTTON_BG_RGB.0, BUTTON_BG_RGB.1, BUTTON_BG_RGB.2)
@@ -1063,7 +1184,8 @@ impl SourceControlPanel {
                     height: 3,
                 };
                 let text = format!("Open {label}");
-                render_rounded_button(buf, area, &text, blue_bg, text_white);
+                let hovered = crate::widgets::hover::contains(area, self.hover_pointer);
+                render_button(buf, area, &text, blue_bg, text_white, self.theme, hovered);
                 self.nested_repo_button_areas.push((area, path.clone()));
                 y += 4;
             }
@@ -1084,7 +1206,10 @@ impl SourceControlPanel {
                 height: 3,
             };
             self.last_init_repo_button_area = init_area;
-            render_rounded_button(buf, init_area, init_label, blue_bg, text_white);
+            let hovered = crate::widgets::hover::contains(init_area, self.hover_pointer);
+            render_button(
+                buf, init_area, init_label, blue_bg, text_white, self.theme, hovered,
+            );
         }
     }
 }
@@ -1282,6 +1407,81 @@ pub fn render_rounded_button(buf: &mut Buffer, area: Rect, label: &str, bg: Colo
     );
 }
 
+/// A primary button's fill and label ink: the brand teal under the Black
+/// theme (`focus_gradient`) and always under a `surfaces` theme, whose label
+/// takes the strong ink rather than pure white; VS Code's button blue with
+/// white on Croft Dark.
+pub fn primary_button_colors(theme: crate::theme::Theme, focus_gradient: bool) -> (Color, Color) {
+    let teal = crate::gradient::rgb_color(crate::gradient::PRIMARY_BTN_BG);
+    match crate::widgets::surface::tones(theme) {
+        Some(t) => (teal, t.strong()),
+        None => (
+            if focus_gradient {
+                teal
+            } else {
+                Color::Rgb(BUTTON_BG_RGB.0, BUTTON_BG_RGB.1, BUTTON_BG_RGB.2)
+            },
+            Color::Rgb(BUTTON_FG_RGB.0, BUTTON_FG_RGB.1, BUTTON_FG_RGB.2),
+        ),
+    }
+}
+
+/// A button colour lifted for the pointer: a step toward white, the hover a
+/// filled button takes in VS Code (`button.hoverBackground`).
+fn lift_button(fill: Color) -> Color {
+    match fill {
+        Color::Rgb(r, g, b) => crate::gradient::rgb_color(crate::gradient::lerp_rgb(
+            (r, g, b),
+            (0xff, 0xff, 0xff),
+            0.12,
+        )),
+        other => other,
+    }
+}
+
+/// Write `label` bold and centred on `area`'s middle row, truncated to the
+/// button's width rather than dropped (a blank button reads as broken).
+fn paint_button_label(buf: &mut Buffer, area: Rect, label: &str, bg: Color, fg: Color) {
+    let visible_label: String = label.chars().take(area.width as usize).collect();
+    if visible_label.is_empty() {
+        return;
+    }
+    let label_w = visible_label.chars().count() as u16;
+    buf.set_string(
+        area.x + (area.width - label_w) / 2,
+        area.y + area.height / 2,
+        &visible_label,
+        Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD),
+    );
+}
+
+/// The primary button every view draws (Commit, Initialize, Open, Run and
+/// Debug). A boxed theme gets [`render_rounded_button`]. Under a `surfaces`
+/// theme it is a soft slab ([`crate::widgets::surface::paint_soft_button`]):
+/// half-block caps make the three-row target read two rows tall with
+/// notched corners instead of drawing `╭╮╰╯` arcs on the chrome, and the
+/// pointer lifts it a step. The click target is the full `area` either way.
+pub fn render_button(
+    buf: &mut Buffer,
+    area: Rect,
+    label: &str,
+    bg: Color,
+    fg: Color,
+    theme: crate::theme::Theme,
+    hovered: bool,
+) {
+    if crate::widgets::surface::tones(theme).is_none() {
+        render_rounded_button(buf, area, label, bg, fg);
+        return;
+    }
+    if area.width < 2 || area.height < 1 {
+        return;
+    }
+    let fill = if hovered { lift_button(bg) } else { bg };
+    crate::widgets::surface::paint_soft_button(buf, area, fill, true, true);
+    paint_button_label(buf, area, label, fill, fg);
+}
+
 fn badge_color(kind: ChangeKind, theme: crate::theme::Theme) -> Color {
     match kind {
         ChangeKind::StagedAdded => theme.ui(Color::Rgb(0x81, 0xb8, 0x8c)),
@@ -1348,14 +1548,21 @@ impl Widget for &mut SourceControlPanel {
             + u16::try_from(unicode_width::UnicodeWidthStr::width(header_title.as_ref()))
                 .unwrap_or(u16::MAX)
                 .saturating_add(1);
+        // Croft Loch: the view title is the strong ink while the view has
+        // the keyboard and muted otherwise, never bold, as the Explorer's.
+        let tones = crate::widgets::surface::tones(self.theme);
+        let title_style = match tones {
+            Some(t) => Style::default().fg(if self.focused { t.strong() } else { t.muted() }),
+            None => Style::default()
+                .fg(self.theme.ui(Color::Rgb(0xb0, 0xb8, 0xc8)))
+                .add_modifier(Modifier::BOLD),
+        };
         buf.set_stringn(
             inner.x,
             inner.y,
             &header_title,
             inner.width as usize,
-            Style::default()
-                .fg(self.theme.ui(Color::Rgb(0xb0, 0xb8, 0xc8)))
-                .add_modifier(Modifier::BOLD),
+            title_style,
         );
         // Refresh pill at the right of the header row, mirroring the Remote
         // Explorer affordance. Live FS-driven refresh already keeps the panel
@@ -1393,11 +1600,17 @@ impl Widget for &mut SourceControlPanel {
                 };
                 self.header_more_btn = more_rect;
                 let more_hovered = crate::widgets::hover::contains(more_rect, self.hover_pointer);
+                // Croft Loch draws the Explorer's midline ellipsis, so the
+                // two views' "more" buttons are one glyph.
+                let more_glyph = match tones {
+                    Some(_) => '\u{22ef}',
+                    None => crate::widgets::scm_menu::ICON_ELLIPSIS,
+                };
                 crate::widgets::header_pill::render(
                     buf,
                     more_x,
                     inner.y,
-                    crate::widgets::scm_menu::ICON_ELLIPSIS,
+                    more_glyph,
                     self.theme,
                     more_hovered,
                 );
@@ -1437,9 +1650,14 @@ impl Widget for &mut SourceControlPanel {
         // U+EB14 was wrong: that's `cod-link-external`, the share-arrow
         // the user spotted; ACTIVITY_SOURCE_CONTROL in icons.rs had the
         // same mis-pin and is fixed in the same commit.
+        // Croft Loch keeps the accent for focus and selection: the glyph is
+        // a muted icon beside the branch name.
         spans.push(Span::styled(
             "\u{ea68} ",
-            Style::default().fg(self.theme.ui(Color::Rgb(0x88, 0xc0, 0xd0))),
+            Style::default().fg(match tones {
+                Some(t) => t.muted(),
+                None => self.theme.ui(Color::Rgb(0x88, 0xc0, 0xd0)),
+            }),
         ));
         let label = self.status.head_label().to_string();
         // The glyph (2 cells) plus the name is the clickable target that
@@ -1454,7 +1672,7 @@ impl Widget for &mut SourceControlPanel {
         spans.push(Span::styled(
             label,
             Style::default()
-                .fg(self.theme.ui(Color::White))
+                .fg(tones.map_or_else(|| self.theme.ui(Color::White), |t| t.text()))
                 .add_modifier(Modifier::BOLD),
         ));
         // What git stopped in the middle of (#1356): the ⋯ menu holds its
@@ -1514,7 +1732,20 @@ impl Widget for &mut SourceControlPanel {
             .border_type(BorderType::Rounded)
             .border_style(input_border_style);
         let input_inner = input_block.inner(input_box);
-        input_block.render(input_box, buf);
+        // Croft Loch: a raised well with a hairline edge (the rim at rest,
+        // the accent while it has the keyboard) in place of the rounded line
+        // box. The inner rect is the box's, so the text and the caret land on
+        // the same cells.
+        let field_focused = self.focused && !self.list_focused;
+        match tones {
+            Some(t) => crate::widgets::surface::paint_field(
+                buf,
+                input_box,
+                t,
+                if field_focused { t.accent() } else { t.rim() },
+            ),
+            None => input_block.render(input_box, buf),
+        }
         if input_inner.width > 0 && input_inner.height > 0 {
             let content_y = input_inner.y;
             // 1-cell left padding inside the rounded border, and clamp the
@@ -1529,18 +1760,24 @@ impl Widget for &mut SourceControlPanel {
             if self.message.is_empty() {
                 self.message_scroll = 0;
                 self.message_line_scroll = 0;
+                // Croft Loch: a short hint in the muted ink that fits a
+                // normal side bar whole instead of being cut mid-word.
+                let (placeholder, fg) = match tones {
+                    Some(t) => (
+                        "Message (\u{23ce} commit \u{b7} \u{21e7}\u{23ce} newline)",
+                        t.muted(),
+                    ),
+                    None => (
+                        "Message (Enter = commit, \u{21e7}Enter = new line, \u{2303}Enter = push)",
+                        Color::Rgb(INPUT_PROMPT_RGB.0, INPUT_PROMPT_RGB.1, INPUT_PROMPT_RGB.2),
+                    ),
+                };
                 buf.set_stringn(
                     text_x,
                     content_y,
-                    "Message (Enter = commit, \u{21e7}Enter = new line, \u{2303}Enter = push)",
+                    placeholder,
                     text_max,
-                    Style::default()
-                        .fg(Color::Rgb(
-                            INPUT_PROMPT_RGB.0,
-                            INPUT_PROMPT_RGB.1,
-                            INPUT_PROMPT_RGB.2,
-                        ))
-                        .add_modifier(Modifier::ITALIC),
+                    Style::default().fg(fg).add_modifier(Modifier::ITALIC),
                 );
             } else {
                 // Horizontal scroll: keep the caret inside the box so a
@@ -1578,7 +1815,8 @@ impl Widget for &mut SourceControlPanel {
                         content_y + row as u16,
                         &visible,
                         text_max,
-                        Style::default().fg(self.theme.ui(Color::White)),
+                        Style::default()
+                            .fg(tones.map_or_else(|| self.theme.ui(Color::White), |t| t.text())),
                     );
                 }
             }
@@ -1594,12 +1832,7 @@ impl Widget for &mut SourceControlPanel {
             return;
         }
         // Black theme: brand-teal Commit button; Croft Dark keeps VS Code blue.
-        let blue = if self.focus_gradient {
-            crate::gradient::rgb_color(crate::gradient::PRIMARY_BTN_BG)
-        } else {
-            Color::Rgb(BUTTON_BG_RGB.0, BUTTON_BG_RGB.1, BUTTON_BG_RGB.2)
-        };
-        let white = Color::Rgb(BUTTON_FG_RGB.0, BUTTON_FG_RGB.1, BUTTON_FG_RGB.2);
+        let (blue, white) = primary_button_colors(self.theme, self.focus_gradient);
         let split_caret_w: u16 = 3;
         let split_gap_w: u16 = 1;
         if inner.width >= 16 + split_caret_w + split_gap_w {
@@ -1622,8 +1855,12 @@ impl Widget for &mut SourceControlPanel {
             // ryanoasis/nerd-fonts glyphnames.json v3.4.0) — the same crisp
             // codicon VS Code paints on its Commit button, replacing the
             // generic Unicode check that did not match the dropdown glyphs.
-            render_rounded_button(buf, main_area, "\u{eab2} Commit", blue, white);
-            render_rounded_button(buf, caret_area, "▾", blue, white);
+            if tones.is_some() {
+                self.render_soft_split_button(buf, main_area, caret_area);
+            } else {
+                render_rounded_button(buf, main_area, "\u{eab2} Commit", blue, white);
+                render_rounded_button(buf, caret_area, "▾", blue, white);
+            }
         } else {
             let button_area = Rect {
                 x: inner.x,
@@ -1632,7 +1869,8 @@ impl Widget for &mut SourceControlPanel {
                 height: 3,
             };
             self.last_button_area = button_area;
-            render_rounded_button(buf, button_area, "Commit", blue, white);
+            let hovered = crate::widgets::hover::contains(button_area, self.hover_pointer);
+            render_button(buf, button_area, "Commit", blue, white, self.theme, hovered);
         }
         y += 3 + 1; // button + 1-row gap
 
@@ -1665,9 +1903,17 @@ impl Widget for &mut SourceControlPanel {
         if y >= inner.y + inner.height {
             return;
         }
-        let sep_style = Style::default().fg(self.theme.ui(Color::Rgb(0x40, 0x48, 0x58)));
+        // Croft Loch: a hairline seam hugging the list below, not a line
+        // twice as bright as every other seam in the side bar.
+        let (sep_glyph, sep_style) = match tones {
+            Some(t) => ("\u{2581}", Style::default().fg(t.hairline())),
+            None => (
+                "─",
+                Style::default().fg(self.theme.ui(Color::Rgb(0x40, 0x48, 0x58))),
+            ),
+        };
         for x in inner.x..inner.x + inner.width {
-            buf.set_string(x, y, "─", sep_style);
+            buf.set_string(x, y, sep_glyph, sep_style);
         }
         y += 1;
 
@@ -1713,7 +1959,7 @@ impl Widget for &mut SourceControlPanel {
                 list_area.y,
                 "No changes",
                 list_area.width as usize,
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(tones.map_or(Color::DarkGray, |t| t.muted())),
             );
             return;
         }
@@ -1731,30 +1977,50 @@ impl Widget for &mut SourceControlPanel {
                         .fold((0usize, 0usize, 0usize), |(c, a, d), e| {
                             (c + 1, a + e.additions, d + e.deletions)
                         });
-                    let mut header_spans = vec![
-                        Span::styled(
-                            "\u{25be} ",
-                            Style::default().fg(self.theme.ui(Color::Rgb(0xb0, 0xb8, 0xc8))),
-                        ),
-                        Span::styled(
-                            section_label(*section),
-                            Style::default()
-                                .fg(Color::Rgb(
-                                    SECTION_HEADER_RGB.0,
-                                    SECTION_HEADER_RGB.1,
-                                    SECTION_HEADER_RGB.2,
-                                ))
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                        Span::raw("  "),
-                        Span::styled(
-                            format!(" {count} "),
-                            Style::default()
-                                .fg(self.theme.ui(Color::White))
-                                .bg(self.theme.ui(Color::Rgb(0x2a, 0x33, 0x42)))
-                                .add_modifier(Modifier::BOLD),
-                        ),
-                    ];
+                    let mut header_spans = match tones {
+                        // Croft Loch: the side bar's section header (a muted
+                        // codicon chevron, the label in body text) and a
+                        // quiet count chip, muted on a faint lift.
+                        Some(t) => vec![
+                            Span::styled(
+                                format!("{} ", crate::widgets::surface::CHEVRON_UNFOLDED),
+                                Style::default().fg(t.muted()),
+                            ),
+                            Span::styled(
+                                section_label(*section),
+                                Style::default().fg(t.text()).add_modifier(Modifier::BOLD),
+                            ),
+                            Span::raw("  "),
+                            Span::styled(
+                                format!(" {count} "),
+                                Style::default().fg(t.muted()).bg(t.keycap_on(t.chrome())),
+                            ),
+                        ],
+                        None => vec![
+                            Span::styled(
+                                "\u{25be} ",
+                                Style::default().fg(self.theme.ui(Color::Rgb(0xb0, 0xb8, 0xc8))),
+                            ),
+                            Span::styled(
+                                section_label(*section),
+                                Style::default()
+                                    .fg(Color::Rgb(
+                                        SECTION_HEADER_RGB.0,
+                                        SECTION_HEADER_RGB.1,
+                                        SECTION_HEADER_RGB.2,
+                                    ))
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                            Span::raw("  "),
+                            Span::styled(
+                                format!(" {count} "),
+                                Style::default()
+                                    .fg(self.theme.ui(Color::White))
+                                    .bg(self.theme.ui(Color::Rgb(0x2a, 0x33, 0x42)))
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                        ],
+                    };
                     if sec_add > 0 || sec_del > 0 {
                         header_spans.push(Span::raw("  "));
                         if sec_add > 0 {
@@ -1803,10 +2069,36 @@ impl Widget for &mut SourceControlPanel {
                     // keeps the brightest tone, secondary rows a slightly
                     // dimmer one so the user still sees which file the
                     // editor is bound to.
+                    //
+                    // Croft Loch: the one selected-row anatomy (band plus the
+                    // accent bar in the pane's left padding column, greyed
+                    // while the list does not have the keyboard), and a
+                    // softer tint of the band for the rest of a multi-row
+                    // selection instead of the legacy navy.
+                    if let Some(t) = tones
+                        && is_primary
+                    {
+                        crate::widgets::surface::paint_selected_row(
+                            buf,
+                            Rect {
+                                x: area.x,
+                                width: row_width.saturating_add(list_area.x - area.x),
+                                ..row_rect
+                            },
+                            t,
+                            t.chrome,
+                            self.focused && self.list_focused,
+                        );
+                    }
                     let row_bg = if is_primary {
-                        Some(selected_bg)
+                        tones.is_none().then_some(selected_bg)
                     } else if is_in_multi {
-                        Some(self.theme.ui(Color::Rgb(0x1f, 0x3a, 0x5c)))
+                        Some(match tones {
+                            Some(t) => crate::gradient::rgb_color(crate::gradient::lerp_rgb(
+                                t.chrome, t.accent, 0.12,
+                            )),
+                            None => self.theme.ui(Color::Rgb(0x1f, 0x3a, 0x5c)),
+                        })
                     } else {
                         crate::widgets::hover::row_hover_bg(
                             row_rect,
@@ -1872,7 +2164,23 @@ impl Widget for &mut SourceControlPanel {
                     let show_actions = is_selected && text_w_unreserved > ROW_ACTIONS_WIDTH;
                     let text_w_reserved = if show_actions { ROW_ACTIONS_WIDTH } else { 0 };
                     let text_w = text_w_unreserved.saturating_sub(text_w_reserved);
-                    if text_w > 0 {
+                    if let Some(t) = tones
+                        && text_w > 0
+                    {
+                        // Croft Loch: the file name in body text, then its
+                        // folder in the muted ink, as VS Code lists changes,
+                        // so the eye finds the file before the path.
+                        let trimmed = path_str.trim_end_matches('/');
+                        let (dir, name) = match trimmed.rsplit_once('/') {
+                            Some((dir, name)) if !is_dir => (Some(dir), name),
+                            _ => (None, path_str),
+                        };
+                        let mut spans = vec![Span::styled(name, path_style.fg(t.text()))];
+                        if let Some(dir) = dir {
+                            spans.push(Span::styled(format!(" {dir}"), path_style.fg(t.muted())));
+                        }
+                        buf.set_line(text_x, row_y, &Line::from(spans), text_w);
+                    } else if text_w > 0 {
                         let path_para = Paragraph::new(path_str).style(path_style);
                         path_para.render(
                             Rect {
@@ -1885,7 +2193,10 @@ impl Widget for &mut SourceControlPanel {
                         );
                     }
                     if show_actions {
-                        let action_fg = self.theme.ui(Color::Rgb(0xd4, 0xd9, 0xe2));
+                        let action_fg = tones.map_or_else(
+                            || self.theme.ui(Color::Rgb(0xd4, 0xd9, 0xe2)),
+                            |t| t.text(),
+                        );
                         let mut action_style = Style::default().fg(action_fg);
                         if let Some(bg) = row_bg {
                             action_style = action_style.bg(bg);
@@ -1932,7 +2243,7 @@ impl Widget for &mut SourceControlPanel {
             }
         }
         if let Some(metrics) = scrollbar_metrics {
-            scrollbar::render_vertical(buf, metrics, self.focused, self.theme);
+            scrollbar::render_vertical_on_chrome(buf, metrics, self.focused, self.theme);
         }
     }
 }
@@ -2598,7 +2909,9 @@ mod tests {
     #[test]
     fn branch_row_uses_the_source_control_codicon_in_cyan() {
         use ratatui::buffer::Buffer;
+        // The cyan glyph is the boxed themes'; Croft Loch mutes it (below).
         let mut p = SourceControlPanel::new();
+        p.theme = crate::theme::Theme::BLACK;
         p.set_status(dummy_status_with_branch("main"), Vec::new());
         let area = Rect {
             x: 0,
@@ -2651,7 +2964,10 @@ mod tests {
     #[test]
     fn commit_button_uses_rounded_border_corners() {
         use ratatui::buffer::Buffer;
+        // The line-art corners are the boxed themes'; Croft Loch's soft
+        // split button has its own test.
         let mut p = SourceControlPanel::new();
+        p.theme = crate::theme::Theme::BLACK;
         p.set_status(dummy_status_with_branch("main"), Vec::new());
         let area = Rect {
             x: 0,
@@ -2729,9 +3045,195 @@ mod tests {
             "section header must include a count badge of 3:\n{dump}"
         );
         assert!(
-            dump.contains('▾') || dump.contains('▿'),
+            dump.contains('▾')
+                || dump.contains('▿')
+                || dump.contains(crate::widgets::surface::CHEVRON_UNFOLDED),
             "section header must carry a down chevron:\n{dump}"
         );
+    }
+
+    /// Croft Loch: the commit message is a raised well with a one-eighth
+    /// block edge (the rim at rest, the accent while it has the keyboard),
+    /// never the rounded line box, and its inner rect is the box's, so the
+    /// caret lands where it always has. The placeholder is the short one,
+    /// in the muted ink, whole at a normal side-bar width.
+    #[test]
+    fn croft_loch_commit_message_is_a_raised_well_with_a_hairline_edge() {
+        use ratatui::buffer::Buffer;
+        let t = crate::widgets::surface::tones(crate::theme::Theme::LOCH).unwrap();
+        let mut p = SourceControlPanel::new();
+        p.theme = crate::theme::Theme::LOCH;
+        p.set_status(dummy_status_with_branch("main"), Vec::new());
+        let area = Rect::new(0, 0, 40, 30);
+        let render = |p: &mut SourceControlPanel| {
+            let mut buf = Buffer::empty(area);
+            ratatui::widgets::Widget::render(&mut *p, area, &mut buf);
+            buf
+        };
+        let buf = render(&mut p);
+        let r = p.last_input_area;
+        assert_eq!(r.height, 3);
+        assert_eq!(buf[(r.x + 3, r.y)].symbol(), "\u{2581}", "top edge");
+        assert_eq!(buf[(r.x + 3, r.y)].fg, t.rim(), "the rim at rest");
+        assert_eq!(buf[(r.x, r.y + 1)].symbol(), "\u{2595}", "left edge");
+        assert_eq!(buf[(r.right() - 1, r.y + 1)].symbol(), "\u{258f}");
+        assert_eq!(buf[(r.x + 3, r.bottom() - 1)].symbol(), "\u{2594}");
+        assert_eq!(buf[(r.x + 3, r.y + 1)].bg, t.raised(), "a raised well");
+        let row: String = (r.x..r.right())
+            .map(|x| buf[(x, r.y + 1)].symbol())
+            .collect();
+        assert!(
+            row.contains("Message (\u{23ce} commit \u{b7} \u{21e7}\u{23ce} newline)"),
+            "{row:?}"
+        );
+        assert_eq!(buf[(r.x + 2, r.y + 1)].fg, t.muted());
+        for y in r.top()..r.bottom() {
+            for x in r.left()..r.right() {
+                assert!(
+                    !"\u{256d}\u{256e}\u{2570}\u{256f}\u{2500}\u{2502}"
+                        .contains(buf[(x, y)].symbol()),
+                    "a line-box glyph at ({x},{y})"
+                );
+            }
+        }
+        p.focused = true;
+        let buf = render(&mut p);
+        assert_eq!(buf[(r.x + 3, r.y)].fg, t.accent(), "the accent with focus");
+        assert_eq!(p.cursor_screen_pos(), Some((r.x + 2, r.y + 1)));
+    }
+
+    /// Croft Loch's Commit is one soft split button: half-block caps make
+    /// it read two rows tall with notched outer corners, the caret half
+    /// joins it across the gap by a thin seam, and each half lifts under
+    /// the pointer. The click targets are the boxed theme's rects.
+    #[test]
+    fn croft_loch_commit_is_a_soft_split_button() {
+        use ratatui::buffer::Buffer;
+        let mut p = SourceControlPanel::new();
+        p.theme = crate::theme::Theme::LOCH;
+        p.set_status(dummy_status_with_branch("main"), Vec::new());
+        let area = Rect::new(0, 0, 40, 30);
+        let mut buf = Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut p, area, &mut buf);
+        let (m, c) = (p.last_button_area, p.last_commit_caret_area);
+        assert_eq!((m.height, c.x), (3, m.x + m.width + 1), "same targets");
+        let teal = crate::gradient::rgb_color(crate::gradient::PRIMARY_BTN_BG);
+        assert_eq!(buf[(m.x, m.y)].symbol(), "\u{2597}", "notched outer corner");
+        assert_eq!(buf[(m.x, m.bottom() - 1)].symbol(), "\u{259d}");
+        assert_eq!(buf[(m.x + 2, m.y)].symbol(), "\u{2584}", "half-block cap");
+        assert_eq!(buf[(m.x + 2, m.y)].fg, teal);
+        assert_eq!(buf[(m.x + 2, m.bottom() - 1)].symbol(), "\u{2580}");
+        assert_eq!(buf[(m.right() - 1, m.y)].symbol(), "\u{2584}", "joined end");
+        assert_eq!(buf[(c.right() - 1, c.y)].symbol(), "\u{2596}");
+        assert_eq!(buf[(c.right() - 1, c.bottom() - 1)].symbol(), "\u{2598}");
+        assert_eq!(buf[(m.right(), m.y + 1)].symbol(), "\u{258f}", "the seam");
+        assert_eq!(buf[(m.right(), m.y + 1)].bg, teal);
+        assert_eq!(buf[(m.x + 1, m.y + 1)].bg, teal);
+        let label: String = (m.x..m.right())
+            .map(|x| buf[(x, m.y + 1)].symbol())
+            .collect();
+        assert!(label.contains("Commit"), "{label:?}");
+        p.hover_pointer = Some((m.x + 1, m.y + 1));
+        let mut buf = Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut p, area, &mut buf);
+        assert_ne!(buf[(m.x + 1, m.y + 1)].bg, teal, "the hovered half lifts");
+        assert_eq!(buf[(c.x + 1, c.y + 1)].bg, teal, "the other half stays");
+    }
+
+    /// Croft Loch's change list: a hairline above it, the file name in body
+    /// text with its folder after it in the muted ink, the selected row as
+    /// the band with the accent bar while the list has the keyboard, a
+    /// quiet count chip, and the branch glyph muted rather than the accent.
+    #[test]
+    fn croft_loch_change_rows_lead_with_the_name_and_wear_the_band() {
+        use crate::widgets::surface::{ROW_BAR, tones};
+        use ratatui::buffer::Buffer;
+        let t = tones(crate::theme::Theme::LOCH).unwrap();
+        let mut p = SourceControlPanel::new();
+        p.theme = crate::theme::Theme::LOCH;
+        p.set_status(
+            dummy_status_with_branch("main"),
+            vec![
+                ChangeEntry {
+                    path: "src/deep/a.py".into(),
+                    kind: ChangeKind::Modified,
+                    ..Default::default()
+                },
+                ChangeEntry {
+                    path: "b.py".into(),
+                    kind: ChangeKind::Modified,
+                    ..Default::default()
+                },
+            ],
+        );
+        p.focused = true;
+        assert!(p.focus_list());
+        let area = Rect::new(0, 0, 40, 30);
+        let mut buf = Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut p, area, &mut buf);
+        let rows: Vec<String> = (0..area.height)
+            .map(|y| (0..area.width).map(|x| buf[(x, y)].symbol()).collect())
+            .collect();
+        let y = rows
+            .iter()
+            .position(|r| r.contains("a.py src/deep"))
+            .expect("the name, then its folder") as u16;
+        let x = rows[y as usize].find("a.py").unwrap() as u16;
+        let x = rows[y as usize][..x as usize].chars().count() as u16;
+        assert_eq!(buf[(x, y)].fg, t.text());
+        assert_eq!(buf[(x + 5, y)].fg, t.muted(), "the folder is muted");
+        let selected = p.selected_change.expect("a row is selected");
+        let sel_y = rows
+            .iter()
+            .position(|r| r.contains(if selected == 0 { "a.py" } else { "b.py" }))
+            .unwrap() as u16;
+        assert_eq!(buf[(0, sel_y)].symbol(), ROW_BAR, "the bar in the padding");
+        assert_eq!(buf[(3, sel_y)].bg, t.band_on(t.chrome));
+        let list = p.last_list_area;
+        assert_eq!(
+            buf[(list.x + 2, list.y - 1)].symbol(),
+            "\u{2581}",
+            "hairline"
+        );
+        assert_eq!(buf[(list.x + 2, list.y - 1)].fg, t.hairline());
+        let branch_y = p.last_inner.y + 2;
+        let glyph = (0..area.width)
+            .find(|&x| buf[(x, branch_y)].symbol() == "\u{ea68}")
+            .unwrap();
+        assert_eq!(buf[(glyph, branch_y)].fg, t.muted(), "a muted branch glyph");
+    }
+
+    /// Croft Loch's REPOSITORIES rows stay on the chrome: no row paints the
+    /// terminal's default background across the side bar.
+    #[test]
+    fn croft_loch_repository_rows_keep_the_chrome() {
+        use ratatui::buffer::Buffer;
+        let t = crate::widgets::surface::tones(crate::theme::Theme::LOCH).unwrap();
+        let mut p = SourceControlPanel::new();
+        p.theme = crate::theme::Theme::LOCH;
+        p.status = dummy_status_with_branch("trunk");
+        p.repositories = ["gitb", "gitc"]
+            .iter()
+            .enumerate()
+            .map(|(i, label)| RepoRow {
+                label: String::from(*label),
+                branch: Some(String::from("trunk")),
+                changes: 0,
+                active: i == 0,
+                workspace_root: std::path::PathBuf::from(format!("/w/{label}")),
+            })
+            .collect();
+        let area = Rect::new(0, 0, 34, 20);
+        let mut buf = Buffer::empty(area);
+        // The side bar paints its chrome under every view first.
+        buf.set_style(area, Style::default().bg(t.chrome()));
+        (&mut p).render(area, &mut buf);
+        let (rect, _) = p.repo_row_areas[1].clone();
+        for x in rect.left()..rect.right() {
+            assert_eq!(buf[(x, rect.y)].bg, t.chrome(), "({x},{})", rect.y);
+        }
+        let (active, _) = p.repo_row_areas[0].clone();
+        assert_eq!(buf[(active.x + 2, active.y)].fg, t.text());
     }
 
     #[test]

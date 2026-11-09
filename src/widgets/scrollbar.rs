@@ -78,6 +78,47 @@ pub fn render_vertical(buf: &mut Buffer, metrics: VerticalScrollbar, focused: bo
     }
 }
 
+/// [`render_vertical`] without a track: only the thumb is painted and the
+/// lane keeps whatever surface lies under it. A side bar on a `surfaces`
+/// theme sits on the chrome tone, where the canvas-coloured track drew a
+/// black stripe down its edge; the thumb alone says where the view is.
+pub fn render_vertical_trackless(
+    buf: &mut Buffer,
+    metrics: VerticalScrollbar,
+    focused: bool,
+    theme: Theme,
+) {
+    let thumb_color = if focused {
+        theme.scrollbar_thumb_focused()
+    } else {
+        theme.scrollbar_thumb()
+    };
+    let thumb = Style::default().bg(thumb_color);
+    for row in metrics.thumb_start..metrics.thumb_start.saturating_add(metrics.thumb_len) {
+        if row >= metrics.area.height {
+            break;
+        }
+        let cell = &mut buf[(metrics.area.x, metrics.area.y + row)];
+        cell.set_symbol(" ");
+        cell.set_style(thumb);
+    }
+}
+
+/// The side bar's scrollbar: track-less under a `surfaces` theme (see
+/// [`render_vertical_trackless`]), the classic track and thumb otherwise.
+pub fn render_vertical_on_chrome(
+    buf: &mut Buffer,
+    metrics: VerticalScrollbar,
+    focused: bool,
+    theme: Theme,
+) {
+    if theme.surfaces().is_some() {
+        render_vertical_trackless(buf, metrics, focused, theme);
+    } else {
+        render_vertical(buf, metrics, focused, theme);
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HorizontalScrollbar {
     pub area: Rect,
@@ -211,6 +252,23 @@ mod tests {
         assert_eq!(buf[(2, 0)].bg, Color::Rgb(0x46, 0x46, 0x46));
         // Track matches the editor background, so the lane melts into it.
         assert_eq!(buf[(2, 4)].bg, Theme::BLACK.editor_bg());
+    }
+
+    /// A Croft Loch side bar keeps its chrome surface under the scrollbar
+    /// lane: only the thumb is painted, so no canvas stripe runs down it.
+    #[test]
+    fn a_croft_loch_side_bar_scrollbar_has_no_track() {
+        let chrome = Color::Rgb(0x0e, 0x10, 0x11);
+        let area = Rect::new(2, 0, 1, 5);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 4, 5));
+        buf.set_style(buf.area, Style::default().bg(chrome));
+        let metrics = vertical_metrics(area, 100, 20, 0).unwrap();
+        render_vertical_on_chrome(&mut buf, metrics, true, Theme::LOCH);
+        assert_eq!(buf[(2, 0)].bg, Theme::LOCH.scrollbar_thumb_focused());
+        assert_eq!(buf[(2, 4)].bg, chrome, "the lane keeps the chrome");
+        let mut boxed = Buffer::empty(Rect::new(0, 0, 4, 5));
+        render_vertical_on_chrome(&mut boxed, metrics, true, Theme::BLACK);
+        assert_eq!(boxed[(2, 4)].bg, Theme::BLACK.editor_bg(), "Black keeps it");
     }
 
     #[test]

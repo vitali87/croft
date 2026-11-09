@@ -56,6 +56,24 @@ impl NoteKind {
             Self::Fix => Color::Rgb(0xe0, 0x9a, 0x4e),
         }
     }
+
+    /// The gutter mark and its tint on `theme`. A boxed theme keeps the
+    /// rocket and the bug ([`Self::icon`], [`Self::color`]). A `surfaces`
+    /// theme (Croft Loch) marks a feature with a `+` in a softened accent and
+    /// a fix with a muted bullet: typographic marks rather than emoji, and a
+    /// fix no longer wears a bug beside every line of the release.
+    pub fn marker_for(self, theme: crate::theme::Theme) -> (&'static str, Color) {
+        let Some(t) = crate::widgets::surface::tones(theme) else {
+            return (self.icon(), self.color());
+        };
+        match self {
+            Self::Feature => (
+                "+",
+                crate::gradient::rgb_color(crate::gradient::lerp_rgb(t.accent, t.text, 0.25)),
+            ),
+            Self::Fix => ("\u{2022}", t.muted()),
+        }
+    }
 }
 
 /// A single welcome-panel highlight: a kind and a one-line description of what
@@ -330,5 +348,20 @@ mod tests {
     fn the_heading_names_the_release_or_the_build_past_it() {
         assert_eq!(heading(false, "0.2.11"), "IN THIS RELEASE (v0.2.11)");
         assert_eq!(heading(true, "0.2.11"), "IN THIS BUILD (v0.2.11+)");
+    }
+
+    /// Croft Loch marks the notes with typographic marks, not emoji: a `+`
+    /// for a feature, a muted bullet for a fix. Croft Black keeps its icons.
+    #[test]
+    fn croft_loch_marks_notes_with_a_plus_and_a_bullet() {
+        let loch = crate::theme::Theme::LOCH;
+        let t = crate::widgets::surface::tones(loch).unwrap();
+        assert_eq!(NoteKind::Feature.marker_for(loch).0, "+");
+        assert_eq!(NoteKind::Fix.marker_for(loch), ("\u{2022}", t.muted()));
+        let black = crate::theme::Theme::BLACK;
+        assert_eq!(
+            NoteKind::Fix.marker_for(black),
+            (NoteKind::Fix.icon(), NoteKind::Fix.color())
+        );
     }
 }
