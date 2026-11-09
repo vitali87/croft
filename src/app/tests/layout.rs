@@ -1314,6 +1314,48 @@ fn croft_loch_panel_tabs_step_from_muted_to_text_to_strong() {
     assert_eq!(first.x, inner.x, "the first title lines up with the shell");
 }
 
+/// Croft Loch: behind an open Command Palette the active panel tab's accent
+/// underline sinks with the rest of the backdrop, so the card's lip and its
+/// selection bar are the only full-strength accent on screen.
+#[test]
+fn croft_loch_palette_scrim_sinks_the_active_tabs_underline() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let t = crate::widgets::surface::tones(app.theme).expect("Croft Loch is the default");
+    let backend = ratatui::backend::TestBackend::new(140, 50);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    app.open_command_palette();
+    // A query that leaves a short card, so the panel's tab strip is
+    // clear of it and only the scrim lies over the tab.
+    app.command_palette
+        .as_mut()
+        .unwrap()
+        .set_query("toggle terminal");
+    term.draw(|f| app.render(f)).unwrap();
+    let card = app.command_palette.as_ref().unwrap().last_rect;
+    let tab = app.terminal_tab_rect;
+    assert!(
+        card.intersection(tab).is_empty(),
+        "the tab is behind the scrim: {card:?} / {tab:?}"
+    );
+    let buf = term.backend().buffer();
+    let word = (tab.x..tab.right())
+        .map(|x| &buf[(x, tab.y)])
+        .find(|c| c.symbol() != " ")
+        .unwrap();
+    assert!(word.modifier.contains(Modifier::UNDERLINED));
+    assert_ne!(word.underline_color, t.accent(), "no full-strength teal");
+    let ratatui::style::Color::Rgb(r, g, b) = word.bg else {
+        panic!("the scrim leaves an RGB fill: {:?}", word.bg);
+    };
+    let sunk = crate::gradient::lerp_rgb(t.accent, (r, g, b), 0.58);
+    assert_eq!(
+        word.underline_color,
+        crate::gradient::rgb_color(sunk),
+        "the underline sinks as far as the title's ink does"
+    );
+}
+
 /// Croft Loch gives every panel pane a top edge: the terminal and the views
 /// that share the panel draw a hairline under the tab strip, and the accent
 /// lip while the panel has the keyboard.
