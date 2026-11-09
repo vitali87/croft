@@ -338,7 +338,7 @@ mod tests {
         let area = Rect::new(0, 0, 20, 3);
         let mut buf = Buffer::empty(area);
         (&p).render(area, &mut buf);
-        assert_eq!(buf[(0, 0)].fg, t.rim(), "no accent lip");
+        assert_eq!(buf[(0, 0)].fg, t.raised(), "no accent lip");
         assert_eq!(buf[(2, 1)].symbol(), "f");
         assert_eq!(buf[(2, 1)].fg, t.text(), "the callee");
         assert_eq!(buf[(5, 1)].symbol(), "(");

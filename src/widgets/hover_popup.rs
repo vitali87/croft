@@ -882,7 +882,7 @@ mod tests {
         p.theme = theme;
         let (area, buf) = painted(&p, VP);
         assert_eq!(buf[(area.x, area.y)].symbol(), "\u{2594}");
-        assert_eq!(buf[(area.x, area.y)].fg, t.rim(), "no accent lip");
+        assert_eq!(buf[(area.x, area.y)].fg, t.raised(), "no accent lip");
         assert_eq!(buf[(area.x + 1, area.y + 1)].fg, t.strong(), "headline");
         assert_eq!(buf[(area.x + 1, area.y + 1)].bg, t.raised());
         for x in area.x..area.right() {

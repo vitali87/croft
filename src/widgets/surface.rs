@@ -44,8 +44,9 @@ pub struct Tones {
     pub raised: (u8, u8, u8),
     /// The seam between two surfaces.
     pub hairline: (u8, u8, u8),
-    /// A card's edge: a step past the hairline, so a popover's outline reads
-    /// against the raised body it surrounds.
+    /// A step past the hairline: the rules inside a card and a resting
+    /// field's outline, which must read against the raised body. A card
+    /// has no outline of its own: its shadow does the lifting.
     pub rim: (u8, u8, u8),
     /// Body text: names, labels, values.
     pub text: (u8, u8, u8),
@@ -831,9 +832,10 @@ fn shade(c: Color, theme: Theme) -> Color {
 /// The frame an overlay draws (Command Palette, pickers, popups, dialogs).
 /// On a boxed brand theme it is the gradient box. Under `surfaces` it is a
 /// card edge in one-eighth blocks hugging the overlay's outer boundary: an
-/// accent lip easing into the rim along the top, the rim on the other three
-/// sides, with a one-cell shadow below and to the right; a title painted on
-/// the top row keeps its cells.
+/// accent lip along the top that fades into the card, no visible line on
+/// the other three sides (the card reads as lifted by its shadow, never
+/// outlined), with a one-cell shadow below and to the right; a title
+/// painted on the top row keeps its cells.
 pub fn paint_overlay_frame(buf: &mut Buffer, rect: Rect, theme: Theme) {
     let Some(t) = tones(theme) else {
         crate::gradient::paint_gradient_box(buf, rect);
@@ -863,8 +865,8 @@ pub fn paint_anchored_frame(
     paint_card_edge(buf, rect, theme, lip, Some(anchor_row));
 }
 
-/// [`paint_overlay_frame`] without the accent lip: the whole edge in the
-/// rim. For hints and tooltips that never take the keyboard, so the accent
+/// [`paint_overlay_frame`] without the accent lip: no visible edge at
+/// all. For hints and tooltips that never take the keyboard, so the accent
 /// keeps meaning focus.
 pub fn paint_quiet_frame(buf: &mut Buffer, rect: Rect, theme: Theme) {
     if tones(theme).is_none() {
@@ -884,9 +886,9 @@ pub fn paint_tinted_frame(buf: &mut Buffer, rect: Rect, theme: Theme, tint: (u8,
     paint_card_edge(buf, rect, theme, Some(tint), None);
 }
 
-/// The card edge every overlay frame shares: the top in the `lip` easing
-/// into the rim (all rim without one), the rim on the other sides, and the
-/// one-cell shadow below and to the right, except on `spare_row`.
+/// The card edge every overlay frame shares: the top in the `lip` fading
+/// into the card (nothing without one), no visible line on the other
+/// sides, and the one-cell shadow below and to the right, except on `spare_row`.
 fn paint_card_edge(
     buf: &mut Buffer,
     rect: Rect,
@@ -902,31 +904,51 @@ fn paint_card_edge(
         return;
     }
     let (right, bottom) = (rect.right() - 1, rect.bottom() - 1);
-    paint_edge_row(
-        buf,
-        rect.x,
-        rect.y,
-        rect.width,
-        Edge::Top.glyph(),
-        |i| match lip {
-            Some(a) => lip_color(a, t.rim, i, rect.width),
-            None => t.rim(),
-        },
-    );
+    // The edge glyphs stay in place (a selected row's bar and a scroll cue
+    // recolour them), but each takes its own cell's fill, so it cannot be
+    // seen: the card has no outline, and the shadow alone lifts it.
+    let unseen = |cell: &Cell| match cell.bg {
+        Color::Rgb(..) => cell.bg,
+        _ => t.raised(),
+    };
+    paint_edge_row(buf, rect.x, rect.y, rect.width, Edge::Top.glyph(), |_| {
+        t.raised()
+    });
     paint_edge_row(
         buf,
         rect.x,
         bottom,
         rect.width,
         Edge::Bottom.glyph(),
-        |_| t.rim(),
+        |_| t.raised(),
     );
+    for x in rect.x..=right {
+        for (y, top) in [(rect.y, true), (bottom, false)] {
+            let cell = &mut buf[(x, y)];
+            let glyph = if top { Edge::Top } else { Edge::Bottom }.glyph();
+            if cell.symbol() != glyph {
+                continue;
+            }
+            let fg = match lip {
+                Some(a) if top => {
+                    let rest = match unseen(cell) {
+                        Color::Rgb(r, g, b) => (r, g, b),
+                        _ => t.raised,
+                    };
+                    lip_color(a, rest, x - rect.x, rect.width)
+                }
+                _ => unseen(cell),
+            };
+            cell.set_fg(fg);
+        }
+    }
     for y in rect.y + 1..bottom {
         for (x, edge) in [(rect.x, Edge::Left), (right, Edge::Right)] {
             let cell = &mut buf[(x, y)];
             if is_frame_cell(cell) {
+                let fg = unseen(cell);
                 cell.set_symbol(edge.glyph());
-                cell.set_fg(t.rim());
+                cell.set_fg(fg);
             }
         }
     }
@@ -1218,7 +1240,11 @@ mod tests {
         assert_eq!(buf[(1, 3)].symbol(), "\u{2581}", "bottom edge");
         assert_eq!(buf[(1, 2)].symbol(), "\u{258f}", "left edge");
         assert_eq!(buf[(8, 2)].symbol(), "\u{2595}", "right edge");
-        assert_eq!(buf[(8, 3)].fg, tones(theme).unwrap().rim());
+        // No outline: every edge glyph wears its own cell's fill, so it
+        // cannot be seen and the shadow alone lifts the card.
+        for (x, y) in [(1, 3), (1, 2), (8, 2), (8, 3)] {
+            assert_eq!(buf[(x, y)].fg, buf[(x, y)].bg, "({x}, {y}) is unseen");
+        }
         // Shadow: right column from the second row, bottom row from the
         // second column; the cell diagonally past the top-left is untouched.
         let shaded = shade(s.chrome(), theme);
@@ -1251,8 +1277,11 @@ mod tests {
         }
         assert_eq!(buf[(9, 2)].bg, shaded, "the right shadow still falls");
         assert_eq!(buf[(9, 3)].bg, shaded);
-        let t = tones(theme).unwrap();
-        assert_eq!(buf[(1, 1)].fg, t.rim(), "quiet: no accent lip");
+        assert_eq!(
+            buf[(1, 1)].fg,
+            buf[(1, 1)].bg,
+            "quiet: no accent lip, no edge"
+        );
         // Anchored to a row the shadow does not reach, it is the usual card.
         let mut free = fresh();
         paint_anchored_frame(&mut free, card, theme, 0, false);
