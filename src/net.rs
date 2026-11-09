@@ -31,6 +31,33 @@ pub fn get(url: &str) -> ureq::Request {
     builder(url).build().get(url)
 }
 
+/// A response body of at most `max` bytes, refused when it is longer rather
+/// than cut short at the cap: a truncated archive or binary that is then
+/// unpacked or run is worse than a failed download. A body over the cap is
+/// an `io::ErrorKind::FileTooLarge` error naming the limit.
+pub fn read_capped(reader: impl std::io::Read, max: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    reader.take(max.saturating_add(1)).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > max {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::FileTooLarge,
+            format!("the download is larger than its {} limit", size_label(max)),
+        ));
+    }
+    Ok(bytes)
+}
+
+/// `max` in whole MiB when it is a whole number of them, else in bytes.
+fn size_label(max: u64) -> String {
+    const MIB: u64 = 1024 * 1024;
+    if max >= MIB && max.is_multiple_of(MIB) {
+        format!("{} MiB", max / MIB)
+    } else {
+        format!("{max} bytes")
+    }
+}
+
 /// Why a request failed, short enough for a status line: the HTTP status, or
 /// the transport failure and its cause (DNS, refused, timeout, TLS), without
 /// the URL ureq's own message opens with. A certificate nothing in the trust
@@ -352,5 +379,27 @@ pub(crate) mod tests {
         let star = env(&[("https_proxy", "http://gw:1"), ("no_proxy", "*")]);
         assert_eq!(proxy_for("https://a.b/", &star), None);
         assert_eq!(proxy_for("https://a.b/", &env(&[])), None);
+    }
+
+    /// A body at the cap is read whole; one byte over is refused, never cut
+    /// short to the cap and handed on as if it were the whole download.
+    #[test]
+    fn a_body_over_the_cap_is_refused_not_truncated() {
+        let at_cap = read_capped(&[7u8; 16][..], 16).unwrap();
+        assert_eq!(at_cap, vec![7u8; 16]);
+        assert_eq!(read_capped(&[][..], 16).unwrap(), Vec::<u8>::new());
+
+        let over = read_capped(&[7u8; 17][..], 16).unwrap_err();
+        assert_eq!(over.kind(), std::io::ErrorKind::FileTooLarge);
+        assert_eq!(
+            over.to_string(),
+            "the download is larger than its 16 bytes limit"
+        );
+        let mib = 1024 * 1024;
+        let over = read_capped(std::io::repeat(0).take(mib + 1), mib).unwrap_err();
+        assert_eq!(
+            over.to_string(),
+            "the download is larger than its 1 MiB limit"
+        );
     }
 }

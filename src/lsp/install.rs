@@ -624,20 +624,21 @@ fn set_executable(_path: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Stream `url` into memory, capped at `max`. Follows redirects (release URLs
-/// 302 to a CDN). On failure, the reason: the HTTP status or the transport
-/// error (DNS, refused, timeout, TLS), so the log and status bar can say it.
+/// Stream `url` into memory, refusing a body over `max` rather than keeping
+/// its first `max` bytes. Follows redirects (release URLs 302 to a CDN). On
+/// failure, the reason: the HTTP status, the transport error (DNS, refused,
+/// timeout, TLS) or the size limit, so the log and status bar can say it.
 fn download_capped(url: &str, max: u64) -> Result<Vec<u8>, String> {
-    use std::io::Read;
     let resp = crate::net::get(url)
         .call()
         .map_err(|e| crate::net::describe(&e))?;
-    let mut bytes = Vec::new();
-    resp.into_reader()
-        .take(max)
-        .read_to_end(&mut bytes)
-        .map_err(|e| format!("reading the download: {e}"))?;
-    Ok(bytes)
+    crate::net::read_capped(resp.into_reader(), max).map_err(|e| {
+        if e.kind() == std::io::ErrorKind::FileTooLarge {
+            e.to_string()
+        } else {
+            format!("reading the download: {e}")
+        }
+    })
 }
 
 /// Gunzip a single-file `.gz` payload (the decompressed bytes ARE the binary)
@@ -857,7 +858,7 @@ fn digest_verdict(sha256: &[(&str, &str)], key: &str, bytes: &[u8]) -> Result<()
 /// Whether `bytes` hash to `expected` (hex SHA-256, either case). An empty
 /// or malformed expectation never matches: a gate that passes on a typo is
 /// no gate.
-fn sha256_matches(bytes: &[u8], expected: &str) -> bool {
+pub(crate) fn sha256_matches(bytes: &[u8], expected: &str) -> bool {
     use sha2::Digest;
     let expected = expected.trim().to_ascii_lowercase();
     expected.len() == 64 && format!("{:x}", sha2::Sha256::digest(bytes)) == expected

@@ -22,10 +22,16 @@ const PYTHON_VERSION: &str = "3.14";
 
 /// Pinned vscode-js-debug release. The `js-debug-dap-vX.Y.Z.tar.gz` asset is the
 /// bundled standalone debug server (the same artifact Zed and nvim/Mason use);
-/// it extracts to `js-debug/src/dapDebugServer.js`. Bump deliberately.
+/// it extracts to `js-debug/src/dapDebugServer.js`. Bump deliberately, and
+/// [`JS_DEBUG_SHA256`] with it.
 const JS_DEBUG_VERSION: &str = "v1.117.0";
 
-/// Cap on the js-debug tarball download (the v1.117 asset is ~10 MB; this is a
+/// SHA-256 of the [`JS_DEBUG_VERSION`] release's `js-debug-dap-*.tar.gz` asset.
+/// The download is checked against it before a byte is unpacked: an altered
+/// asset or a tampered delivery path is refused, never installed and run.
+const JS_DEBUG_SHA256: &str = "ad8d04ede9d4b75cc290fd5438a65047a06f786d04f604b6112485b36f090772";
+
+/// Cap on the js-debug tarball download (the v1.117 asset is ~1.2 MB; this is a
 /// generous ceiling that still refuses a runaway/redirected body).
 const MAX_JS_DEBUG_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -221,7 +227,7 @@ fn which(bin: &str) -> bool {
 
 /// Ensure the vscode-js-debug server is installed, downloading + extracting the
 /// pinned release tarball on first use. Returns the path to `dapDebugServer.js`.
-/// Blocking: the first call downloads ~10 MB and shells out to `tar`; later
+/// Blocking: the first call downloads ~1.2 MB and shells out to `tar`; later
 /// calls are a cheap existence check. Mirrors [`ensure_debug_venv`].
 pub fn ensure_js_debug() -> Result<PathBuf> {
     let dir = js_debug_dir().context("$HOME unset; cannot locate ~/.croft/js-debug")?;
@@ -259,20 +265,27 @@ pub fn ensure_js_debug() -> Result<PathBuf> {
     Ok(server)
 }
 
-/// Stream `url` to `dest`, capped at [`MAX_JS_DEBUG_BYTES`]. Follows redirects
-/// (the GitHub release URL 302s to a CDN).
+/// Download `url` to `dest`, refusing a body over [`MAX_JS_DEBUG_BYTES`] and
+/// one that is not the pinned release. Follows redirects (the GitHub release
+/// URL 302s to a CDN).
 fn download_to_file(url: &str, dest: &Path) -> Result<()> {
-    use std::io::Read;
     let resp = crate::net::get(url)
         .call()
         .context("downloading js-debug release")?;
-    let mut bytes = Vec::new();
-    resp.into_reader()
-        .take(MAX_JS_DEBUG_BYTES)
-        .read_to_end(&mut bytes)
+    let bytes = crate::net::read_capped(resp.into_reader(), MAX_JS_DEBUG_BYTES)
         .context("reading js-debug release body")?;
+    verify_js_debug(&bytes)?;
     std::fs::write(dest, &bytes).context("writing js-debug release tarball")?;
     Ok(())
+}
+
+/// Accept a js-debug download only when it is the pinned release byte for
+/// byte ([`JS_DEBUG_SHA256`]).
+fn verify_js_debug(bytes: &[u8]) -> Result<()> {
+    if crate::lsp::install::sha256_matches(bytes, JS_DEBUG_SHA256) {
+        return Ok(());
+    }
+    bail!("the js-debug {JS_DEBUG_VERSION} download failed its checksum; refusing to install it")
 }
 
 /// Where `dlv` is, for Go debugging (#264), in delve's own resolution order:
@@ -346,6 +359,38 @@ pub fn dlv_program() -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The js-debug pin is a full SHA-256, and a body that is not the pinned
+    /// release (here a stand-in, an empty body, and a valid gzip header) is
+    /// refused before anything is written or unpacked.
+    #[test]
+    fn a_js_debug_download_that_is_not_the_pinned_release_is_refused() {
+        assert_eq!(JS_DEBUG_SHA256.len(), 64);
+        assert!(
+            JS_DEBUG_SHA256
+                .chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+            "{JS_DEBUG_SHA256}"
+        );
+        for body in [&b"not the release"[..], b"", &[0x1f, 0x8b, 0x08, 0x00]] {
+            let why = verify_js_debug(body).unwrap_err().to_string();
+            assert!(why.contains("failed its checksum"), "{why}");
+        }
+    }
+
+    /// The pinned js-debug release still hashes to [`JS_DEBUG_SHA256`].
+    /// `#[ignore]`d because it hits the network; run it when bumping
+    /// [`JS_DEBUG_VERSION`]: `cargo test --bin croft -- --ignored pinned_js_debug`.
+    #[test]
+    #[ignore = "downloads the js-debug release from GitHub"]
+    fn the_pinned_js_debug_release_matches_its_checksum() {
+        let url = format!(
+            "https://github.com/microsoft/vscode-js-debug/releases/download/{JS_DEBUG_VERSION}/js-debug-dap-{JS_DEBUG_VERSION}.tar.gz"
+        );
+        let resp = crate::net::get(&url).call().expect("download js-debug");
+        let bytes = crate::net::read_capped(resp.into_reader(), MAX_JS_DEBUG_BYTES).unwrap();
+        verify_js_debug(&bytes).expect("the pinned digest matches the release");
+    }
 
     /// #264: the install picks the delve that debugs with this machine's
     /// Go: 1.25.2 for Go 1.24 and older (delve 1.27 refuses them), latest
