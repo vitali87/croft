@@ -1996,11 +1996,22 @@ fn menu_hint(action: &MenuAction, keymap: &crate::keymap::Keymap) -> Option<Stri
 
 /// Display width (in cells) a menu entry needs: its label plus the right-aligned
 /// shortcut hint (items) or the `▸` submenu indicator. Dividers need none.
-fn menu_entry_width(entry: &MenuEntry, keymap: &crate::keymap::Keymap) -> usize {
+/// `keycaps` measures the hint as a `surfaces` theme draws it, each key in
+/// a chip one cell of padding wider on each side.
+fn menu_entry_width(entry: &MenuEntry, keymap: &crate::keymap::Keymap, keycaps: bool) -> usize {
     match entry {
         MenuEntry::Item { label, action } => {
             let shortcut = menu_hint(action, keymap)
-                .map(|s| s.chars().count() + 2)
+                .map(|s| {
+                    let chips = if keycaps {
+                        s.split(' ')
+                            .map(|chord| crate::widgets::surface::chord_keys(chord).len())
+                            .sum::<usize>()
+                    } else {
+                        0
+                    };
+                    s.chars().count() + 2 * chips + 2
+                })
                 .unwrap_or(0);
             label.chars().count() + shortcut
         }
@@ -8967,6 +8978,11 @@ impl App {
         let cursor_on = self.cursor_should_be_visible();
         let _ = write!(out, "\x1b[?25l\x1b[s");
         for y in area.top()..area.bottom() {
+            // A `surfaces` theme's one-line pill leaves the rows around it
+            // unpainted: re-emitting them would blank the illustration.
+            if (area.left()..area.right()).all(|x| buf[(x, y)] == ratatui::buffer::Cell::EMPTY) {
+                continue;
+            }
             let _ = write!(out, "\x1b[{};{}H", y + 1, area.left() + 1);
             for x in area.left()..area.right() {
                 let cell = &buf[(x, y)];
@@ -25741,7 +25757,15 @@ impl App {
         let grad = self.popup_gradient();
         // The top-level panel; the open submenu's parent row stays highlighted.
         let top = menu.scroll_for(clipped.height.saturating_sub(2) as usize);
-        self.render_menu_panel(frame, clipped, &menu.items, menu.selected, top, grad);
+        let tones = crate::widgets::surface::tones(self.theme);
+        if let Some(t) = tones {
+            // The keyboard is in the submenu while one is open, so its
+            // parent row keeps an unfocused band without the accent bar.
+            let focused = menu.open_submenu.is_none();
+            self.render_menu_card(frame, clipped, &menu.items, menu.selected, top, focused, t);
+        } else {
+            self.render_menu_panel(frame, clipped, &menu.items, menu.selected, top, grad);
+        }
         // A breadcrumb picker shows what has been typed on its top border.
         if menu.crumb.is_some() && !self.crumb_filter.0.is_empty() {
             let text = if menu.items.is_empty() {
@@ -25751,15 +25775,16 @@ impl App {
             };
             let room = clipped.width.saturating_sub(4) as usize;
             let shown: String = text.chars().take(room).collect();
-            frame.buffer_mut().set_string(
-                clipped.x + 2,
-                clipped.y,
-                shown,
-                Style::default()
+            let style = match tones {
+                Some(t) => Style::default().fg(t.text()).bg(t.raised()),
+                None => Style::default()
                     .fg(self.theme.ui(Color::White))
                     .bg(self.theme.ui(Color::Rgb(0x1e, 0x1e, 0x1e)))
                     .add_modifier(Modifier::BOLD),
-            );
+            };
+            frame
+                .buffer_mut()
+                .set_string(clipped.x + 2, clipped.y, shown, style);
         }
         // Float the open submenu's panel beside its parent.
         if let Some(sub_rect) = self.submenu_rect()
@@ -25767,7 +25792,115 @@ impl App {
                 menu.open_submenu.and_then(|p| menu.items.get(p))
         {
             let sub_top = menu.submenu_scroll_for(menu.submenu_visible(sub_rect.height));
-            self.render_menu_panel(frame, sub_rect, items, menu.submenu_selected, sub_top, grad);
+            if let Some(t) = tones {
+                let sel = menu.submenu_selected;
+                self.render_menu_card(frame, sub_rect, items, sel, sub_top, true, t);
+            } else {
+                self.render_menu_panel(
+                    frame,
+                    sub_rect,
+                    items,
+                    menu.submenu_selected,
+                    sub_top,
+                    grad,
+                );
+            }
+        }
+    }
+
+    /// One menu panel as a `surfaces` theme draws it, in the same rect and
+    /// rows as [`Self::render_menu_panel`] so the hit tests are unchanged: a
+    /// raised card with the accent lip, rows in the body ink, the selected
+    /// row as the band with the accent bar on the card's edge (a plain band
+    /// while `focused` is false), section headers muted, separators a rule
+    /// across the whole card, and shortcuts as keycaps against the right
+    /// edge (`menu_entry_width` sizes the panel for them).
+    #[allow(clippy::too_many_arguments)]
+    fn render_menu_card(
+        &self,
+        frame: &mut ratatui::Frame,
+        rect: Rect,
+        entries: &[MenuEntry],
+        selected: usize,
+        top: usize,
+        focused: bool,
+        t: crate::widgets::surface::Tones,
+    ) {
+        use crate::widgets::surface;
+        let rect = rect.intersection(frame.area());
+        if rect.width < 3 || rect.height < 3 {
+            return;
+        }
+        let block = ratatui::widgets::Block::default()
+            .borders(ratatui::widgets::Borders::ALL)
+            .border_style(Style::default().fg(t.rim()))
+            .style(Style::default().bg(t.raised()));
+        frame.render_widget(ratatui::widgets::Clear, rect);
+        frame.render_widget(block, rect);
+        let buf = frame.buffer_mut();
+        surface::paint_overlay_frame(buf, rect, self.theme);
+        let inner = Rect {
+            x: rect.x + 1,
+            y: rect.y + 1,
+            width: rect.width - 2,
+            height: rect.height - 2,
+        };
+        for (i, entry) in entries.iter().enumerate().skip(top) {
+            if (i - top) as u16 >= inner.height {
+                break;
+            }
+            let y = inner.y + (i - top) as u16;
+            let (label, hint) = match entry {
+                MenuEntry::Separator => {
+                    // Edge to edge, so the rule meets the rim on both sides.
+                    let rule = "\u{2500}".repeat(rect.width as usize);
+                    buf.set_string(rect.x, y, &rule, Style::default().fg(t.rim()));
+                    continue;
+                }
+                MenuEntry::Header(label) => {
+                    buf.set_stringn(
+                        inner.x,
+                        y,
+                        format!(" {label}"),
+                        inner.width as usize,
+                        Style::default().fg(t.muted()),
+                    );
+                    continue;
+                }
+                MenuEntry::Item { label, action } => {
+                    (label.as_str(), menu_hint(action, &self.keymap))
+                }
+                MenuEntry::Submenu { label, .. } => (label.as_str(), None),
+            };
+            let is_sel = i == selected;
+            let row_bg = if is_sel {
+                let band = Rect::new(rect.x, y, rect.width - 1, 1);
+                surface::paint_selected_row(buf, band, t, t.raised, focused);
+                buf[(rect.x + 1, y)].bg
+            } else {
+                t.raised()
+            };
+            let ink = if is_sel { t.strong() } else { t.text() };
+            buf.set_stringn(
+                inner.x,
+                y,
+                format!(" {label}"),
+                inner.width as usize,
+                Style::default().fg(ink),
+            );
+            let trail: Vec<ratatui::text::Span> = match (entry, hint) {
+                (MenuEntry::Submenu { .. }, _) => vec![ratatui::text::Span::styled(
+                    "\u{25b8}",
+                    Style::default().fg(if is_sel { t.text() } else { t.muted() }),
+                )],
+                (_, Some(hint)) => surface::keycap_spans(&hint, t, row_bg, is_sel),
+                (_, None) => Vec::new(),
+            };
+            let trail_w: u16 = trail.iter().map(|s| s.width() as u16).sum();
+            if trail_w > 0 && trail_w + 2 <= inner.width {
+                let x = inner.right() - trail_w - 1;
+                buf.set_line(x, y, &ratatui::text::Line::from(trail), trail_w);
+            }
         }
     }
 
@@ -25915,6 +26048,62 @@ impl App {
         let item_w: u16 = label_w.max(caret.width);
         let item_x = (caret.x + caret.width).saturating_sub(item_w).max(main.x);
         let item_y_top = caret.y + caret.height;
+        self.source_control.commit_menu_item_areas.clear();
+        if let Some(t) = crate::widgets::surface::tones(self.theme) {
+            // A raised card with the accent lip, one row taller above and
+            // below than the rows, whose rim falls on the rows' pad cells:
+            // each hit rect is still the row drawn. Icons rest muted; the
+            // row under the pointer lifts, its icon and label with it.
+            let card = Rect {
+                x: item_x,
+                y: item_y_top,
+                width: item_w,
+                height: items.len() as u16 + 2,
+            }
+            .intersection(frame.area());
+            if card.width < 3 || card.height < 3 {
+                return;
+            }
+            let pointer = self.pointer_cell;
+            let buf = frame.buffer_mut();
+            ratatui::widgets::Widget::render(ratatui::widgets::Clear, card, buf);
+            buf.set_style(card, Style::default().bg(t.raised()));
+            crate::widgets::surface::paint_overlay_frame(buf, card, self.theme);
+            for (i, (item, label)) in items.into_iter().enumerate() {
+                let row_y = card.y + 1 + i as u16;
+                if row_y + 1 >= card.bottom() {
+                    break;
+                }
+                let row_rect = Rect::new(card.x, row_y, card.width, 1);
+                let lit = crate::widgets::hover::contains(row_rect, pointer);
+                if lit {
+                    let inner = Rect::new(card.x + 1, row_y, card.width - 2, 1);
+                    buf.set_style(inner, Style::default().bg(t.hover_on(t.raised)));
+                }
+                let (icon_fg, ink) = if lit {
+                    (t.text(), t.strong())
+                } else {
+                    (t.muted(), t.text())
+                };
+                buf.set_string(
+                    card.x + 1,
+                    row_y,
+                    item.icon().to_string(),
+                    Style::default().fg(icon_fg),
+                );
+                buf.set_stringn(
+                    card.x + 3,
+                    row_y,
+                    &label,
+                    usize::from(card.width.saturating_sub(4)),
+                    Style::default().fg(ink),
+                );
+                self.source_control
+                    .commit_menu_item_areas
+                    .push((row_rect, item));
+            }
+            return;
+        }
         let menu_rect = Rect {
             x: item_x,
             y: item_y_top,
@@ -25925,7 +26114,6 @@ impl App {
         let fg = self.theme.ui(Color::White);
         let style = Style::default().fg(fg).bg(bg);
         frame.render_widget(ratatui::widgets::Clear, menu_rect);
-        self.source_control.commit_menu_item_areas.clear();
         for (i, (item, label)) in items.into_iter().enumerate() {
             let row_y = item_y_top + i as u16;
             let row_rect = Rect {
@@ -26059,6 +26247,12 @@ impl App {
             ]),
         ]);
         frame.render_widget(ratatui::widgets::Paragraph::new(body), inner);
+        crate::widgets::approval_popup::paint_warning_card(
+            frame.buffer_mut(),
+            rect,
+            self.theme,
+            warn,
+        );
     }
 
     /// Confirmation modal for Revert Hunk: destroys the uncommitted edit
@@ -26126,6 +26320,12 @@ impl App {
             ]),
         ]);
         frame.render_widget(ratatui::widgets::Paragraph::new(body), inner);
+        crate::widgets::approval_popup::paint_warning_card(
+            frame.buffer_mut(),
+            rect,
+            self.theme,
+            warn,
+        );
     }
 
     /// The unsaved-changes prompt's words: its headline, the files, and
@@ -26218,6 +26418,12 @@ impl App {
             ]),
         ]);
         frame.render_widget(ratatui::widgets::Paragraph::new(body), inner);
+        crate::widgets::approval_popup::paint_warning_card(
+            frame.buffer_mut(),
+            rect,
+            self.theme,
+            warn,
+        );
     }
 
     /// The lossy-save prompt (#1053): what the file's encoding would destroy,
@@ -26288,6 +26494,12 @@ impl App {
             Paragraph::new(body).wrap(ratatui::widgets::Wrap { trim: false }),
             inner,
         );
+        crate::widgets::approval_popup::paint_warning_card(
+            frame.buffer_mut(),
+            rect,
+            self.theme,
+            danger,
+        );
     }
 
     /// The Replace All confirmation modal (#123): counts up front, commits
@@ -26349,6 +26561,12 @@ impl App {
         frame.render_widget(
             Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false }),
             inner,
+        );
+        crate::widgets::approval_popup::paint_warning_card(
+            frame.buffer_mut(),
+            rect,
+            self.theme,
+            warn,
         );
     }
 
@@ -26432,6 +26650,12 @@ impl App {
             ratatui::widgets::Paragraph::new(body).wrap(ratatui::widgets::Wrap { trim: false }),
             inner,
         );
+        crate::widgets::approval_popup::paint_warning_card(
+            frame.buffer_mut(),
+            rect,
+            self.theme,
+            accent,
+        );
     }
 
     /// Confirmation modal for "Discard All Changes" — reverts every tracked
@@ -26492,6 +26716,12 @@ impl App {
             ]),
         ]);
         frame.render_widget(ratatui::widgets::Paragraph::new(body), inner);
+        crate::widgets::approval_popup::paint_warning_card(
+            frame.buffer_mut(),
+            rect,
+            self.theme,
+            warn,
+        );
     }
 
     /// Confirmation modal for Drop Stash (#1128), in the Discard All style.
@@ -26558,6 +26788,12 @@ impl App {
             ]),
         ]);
         frame.render_widget(ratatui::widgets::Paragraph::new(body), inner);
+        crate::widgets::approval_popup::paint_warning_card(
+            frame.buffer_mut(),
+            rect,
+            self.theme,
+            warn,
+        );
     }
 
     /// Confirmation modal for enabling broadcast input: the classic footgun
@@ -26629,6 +26865,12 @@ impl App {
         frame.render_widget(
             ratatui::widgets::Paragraph::new(body).wrap(ratatui::widgets::Wrap { trim: true }),
             inner,
+        );
+        crate::widgets::approval_popup::paint_warning_card(
+            frame.buffer_mut(),
+            rect,
+            self.theme,
+            warn,
         );
     }
 
@@ -26711,6 +26953,12 @@ impl App {
             Span::raw(" / Esc cancel"),
         ]));
         frame.render_widget(ratatui::widgets::Paragraph::new(body), inner);
+        crate::widgets::approval_popup::paint_warning_card(
+            frame.buffer_mut(),
+            rect,
+            self.theme,
+            warn,
+        );
     }
 
     /// The confirm popup for a runnable fence (#353): the whole block, the
@@ -26811,6 +27059,12 @@ impl App {
             ratatui::widgets::Paragraph::new(ratatui::text::Text::from(lines)),
             inner,
         );
+        crate::widgets::approval_popup::paint_warning_card(
+            frame.buffer_mut(),
+            rect,
+            self.theme,
+            accent,
+        );
     }
 
     fn render_terminal_warning(&self, frame: &mut ratatui::Frame) {
@@ -26910,6 +27164,12 @@ impl App {
             ]),
         ]);
         frame.render_widget(ratatui::widgets::Paragraph::new(body), inner);
+        crate::widgets::approval_popup::paint_warning_card(
+            frame.buffer_mut(),
+            rect,
+            self.theme,
+            warn,
+        );
     }
 
     fn render_local_open_confirm(&self, frame: &mut ratatui::Frame) {
@@ -26981,6 +27241,12 @@ impl App {
             ]),
         ]);
         frame.render_widget(ratatui::widgets::Paragraph::new(body), inner);
+        crate::widgets::approval_popup::paint_warning_card(
+            frame.buffer_mut(),
+            rect,
+            self.theme,
+            self.theme.ui(Color::Rgb(0xff, 0xa5, 0x00)),
+        );
     }
 
     /// Zen Mode hides the status bar, so for a few seconds after entering
@@ -27007,21 +27273,32 @@ impl App {
             height,
         };
         let accent = self.theme.accent();
+        // A `surfaces` theme floats the hint as a raised card in body text,
+        // the accent only on its edge, rather than accent text in an accent
+        // box on the canvas.
+        let tones = crate::widgets::surface::tones(self.theme);
+        let (bg, fg) = match tones {
+            Some(t) => (t.raised(), t.text()),
+            None => (self.theme.editor_bg(), accent),
+        };
         let block = ratatui::widgets::Block::default()
             .borders(ratatui::widgets::Borders::ALL)
             .border_type(ratatui::widgets::BorderType::Rounded)
             .border_style(Style::default().fg(accent))
-            .style(Style::default().bg(self.theme.editor_bg()));
+            .style(Style::default().bg(bg));
         frame.render_widget(ratatui::widgets::Clear, rect);
         frame.render_widget(
             ratatui::widgets::Paragraph::new(ratatui::text::Span::styled(
                 text,
-                Style::default().fg(accent),
+                Style::default().fg(fg),
             ))
             .alignment(ratatui::layout::Alignment::Center)
             .block(block),
             rect,
         );
+        if tones.is_some() {
+            crate::widgets::surface::paint_overlay_frame(frame.buffer_mut(), rect, self.theme);
+        }
     }
 
     /// Paint the transient port-detection toast in the bottom-right corner and
@@ -27073,14 +27350,21 @@ impl App {
             width,
             height,
         };
+        let tones = crate::widgets::surface::tones(self.theme);
         let block = ratatui::widgets::Block::default()
             .borders(ratatui::widgets::Borders::ALL)
-            .border_style(Style::default().fg(accent))
-            .style(Style::default().bg(self.theme.editor_bg()))
-            .title(ratatui::text::Span::styled(
-                " PORT DETECTED ",
-                Style::default().fg(accent).add_modifier(Modifier::BOLD),
-            ));
+            .border_style(Style::default().fg(accent));
+        // A `surfaces` theme's toast is a raised card: no title on its edge
+        // (the body line says what was found, the lip runs unbroken).
+        let block = match tones {
+            Some(t) => block.style(Style::default().bg(t.raised())),
+            None => block
+                .style(Style::default().bg(self.theme.editor_bg()))
+                .title(ratatui::text::Span::styled(
+                    " PORT DETECTED ",
+                    Style::default().fg(accent).add_modifier(Modifier::BOLD),
+                )),
+        };
         frame.render_widget(ratatui::widgets::Clear, rect);
         frame.render_widget(block, rect);
         let inner = Rect {
@@ -27090,32 +27374,61 @@ impl App {
             height: rect.height.saturating_sub(2),
         };
 
+        let pointer = self.pointer_cell;
         let buf = frame.buffer_mut();
-        buf.set_stringn(
-            inner.x,
-            inner.y,
-            &title_line,
-            inner.width as usize,
-            Style::default().fg(self.theme.ui(Color::Rgb(0xCC, 0xCC, 0xCC))),
-        );
+        if let Some(t) = tones {
+            crate::widgets::surface::paint_overlay_frame(buf, rect, self.theme);
+            // The live dot in the accent, the port strong, the process muted.
+            let spans = vec![
+                Span::styled("\u{25cf} ", Style::default().fg(t.accent())),
+                Span::styled(format!("port {port}"), Style::default().fg(t.strong())),
+                Span::styled(format!("  {proc}"), Style::default().fg(t.muted())),
+            ];
+            buf.set_line(inner.x, inner.y, &Line::from(spans), inner.width);
+        } else {
+            buf.set_stringn(
+                inner.x,
+                inner.y,
+                &title_line,
+                inner.width as usize,
+                Style::default().fg(self.theme.ui(Color::Rgb(0xCC, 0xCC, 0xCC))),
+            );
+        }
         let mut bx = inner.x;
         let by = inner.y + 1;
         let mut rects: Vec<(Rect, PortToastAction)> = Vec::new();
-        for (label, action) in &actions {
+        for (i, (label, action)) in actions.iter().enumerate() {
             let w = label.chars().count() as u16;
             if bx + w > inner.x + inner.width {
                 break;
             }
-            buf.set_stringn(
-                bx,
-                by,
-                label,
-                w as usize,
-                Style::default()
+            let hit = Rect::new(bx, by, w, 1);
+            // The first action is the primary one, in the button fill; the
+            // others are chips a lift off the card, and the dismiss cross
+            // a bare muted mark until the pointer is on it.
+            let style = match tones {
+                Some(t) => {
+                    let lit = crate::widgets::hover::contains(hit, pointer);
+                    let lift = |c: Color| match c {
+                        Color::Rgb(r, g, b) => {
+                            rgb_color(crate::gradient::lerp_rgb((r, g, b), t.lift, 0.12))
+                        }
+                        other => other,
+                    };
+                    let (fill, fg) = match (i, *action) {
+                        (0, _) => (btn_bg, t.strong()),
+                        (_, PortToastAction::Dismiss) if !lit => (t.raised(), t.muted()),
+                        _ => (t.keycap_on(t.raised()), t.text()),
+                    };
+                    let fill = if lit { lift(fill) } else { fill };
+                    Style::default().fg(fg).bg(fill)
+                }
+                None => Style::default()
                     .fg(Color::White)
                     .bg(btn_bg)
                     .add_modifier(Modifier::BOLD),
-            );
+            };
+            buf.set_stringn(bx, by, label, w as usize, style);
             rects.push((
                 Rect {
                     x: bx,
@@ -27346,22 +27659,29 @@ impl App {
         };
         let rect = rect.intersection(area);
         let grad = self.popup_gradient();
-        let cursor_fg = if grad {
-            rgb_color(GRAD_TL)
-        } else {
-            self.theme.ui(Color::Rgb(0x4e, 0x9a, 0xff))
+        // A `surfaces` theme: the title in the strong ink on the card (no
+        // chip), the caret and the prompt mark in the accent (the field has
+        // the keyboard), the value in body text and the hint muted.
+        let tones = crate::widgets::surface::tones(self.theme);
+        let cursor_fg = match tones {
+            Some(t) => t.accent(),
+            None if grad => rgb_color(GRAD_TL),
+            None => self.theme.ui(Color::Rgb(0x4e, 0x9a, 0xff)),
         };
         let title_bg = if grad {
             rgb_color(POPUP_SEL_BG)
         } else {
             self.theme.ui(Color::Rgb(0x1e, 0x3a, 0x6e))
         };
+        let title_style = match tones {
+            Some(t) => Style::default().fg(t.strong()).bg(t.raised()),
+            None => Style::default()
+                .fg(self.theme.ui(Color::White))
+                .bg(title_bg),
+        };
         let title = ratatui::text::Span::styled(
             format!(" {} ", p.label),
-            Style::default()
-                .fg(self.theme.ui(Color::White))
-                .bg(title_bg)
-                .add_modifier(Modifier::BOLD),
+            title_style.add_modifier(Modifier::BOLD),
         );
         let block = ratatui::widgets::Block::default()
             .borders(ratatui::widgets::Borders::ALL)
@@ -27564,8 +27884,22 @@ impl App {
                 height: 1,
             },
         );
+        if let Some(t) = tones {
+            // Every kind's row is `> `, the value in white, the caret: the
+            // mark takes the accent, the value the body ink.
+            let buf = frame.buffer_mut();
+            for x in inner.x..inner.right() {
+                let cell = &mut buf[(x, inner.y)];
+                if x < inner.x + 2 {
+                    cell.set_fg(t.accent());
+                } else if cell.fg == self.theme.ui(Color::White) {
+                    cell.set_fg(t.text());
+                }
+            }
+        }
+        let hint_fg = tones.map_or(Color::DarkGray, |t| t.muted());
         let hint = ratatui::widgets::Paragraph::new(ratatui::text::Line::from(hint_text))
-            .style(Style::default().fg(Color::DarkGray));
+            .style(Style::default().fg(hint_fg));
         frame.render_widget(
             hint,
             Rect {
@@ -62054,6 +62388,7 @@ impl App {
             return;
         }
         let screen = frame.area();
+        self.scm_menu.hover = self.pointer_cell;
         crate::widgets::scm_menu::render(
             &mut self.scm_menu,
             anchor,
@@ -71326,7 +71661,7 @@ impl App {
         let widest = menu
             .items
             .iter()
-            .map(|e| menu_entry_width(e, &self.keymap))
+            .map(|e| menu_entry_width(e, &self.keymap, self.theme.surfaces().is_some()))
             .max()
             .unwrap_or(0);
         let area = self.last_frame_area;
@@ -71369,7 +71704,7 @@ impl App {
         let main = self.menu_rect()?;
         let widest = items
             .iter()
-            .map(|e| menu_entry_width(e, &self.keymap))
+            .map(|e| menu_entry_width(e, &self.keymap, self.theme.surfaces().is_some()))
             .max()
             .unwrap_or(0);
         let area = self.last_frame_area;

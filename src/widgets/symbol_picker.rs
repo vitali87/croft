@@ -249,6 +249,7 @@ pub fn render_symbol_picker(
     } else {
         theme.ui(Color::Rgb(0x1e, 0x3a, 0x6e))
     };
+    let tones = crate::widgets::surface::tones(theme);
 
     if inner.height == 0 || inner.width == 0 {
         return;
@@ -356,27 +357,35 @@ pub fn render_symbol_picker(
         let Some(sym) = picker.symbols.get(sym_idx) else {
             continue;
         };
-        let row_style = if is_selected {
-            Style::default().bg(sel_bg).fg(theme.ui(Color::White))
-        } else {
-            Style::default().fg(theme.ui(Color::Rgb(0xec, 0xef, 0xf4)))
-        };
-        let detail_style = if is_selected {
-            Style::default()
-                .bg(sel_bg)
-                .fg(theme.ui(Color::Rgb(0xa0, 0xb4, 0xd8)))
-        } else {
-            Style::default().fg(theme.ui(Color::Rgb(0x8e, 0x95, 0xa4)))
-        };
         let icon = for_outline_kind(sym.kind);
-        let icon_style = if is_selected {
-            Style::default().bg(sel_bg).fg(theme.ui(icon.color))
-        } else {
-            Style::default().fg(theme.ui(icon.color))
+        let (row_style, detail_style, icon_style) = match tones {
+            // The selected row's band and bar are painted after the rows,
+            // so a `surfaces` row carries only its inks.
+            Some(t) => (
+                Style::default().fg(if is_selected { t.strong() } else { t.text() }),
+                Style::default().fg(t.muted()),
+                Style::default().fg(theme.ui(icon.color)),
+            ),
+            None if is_selected => (
+                Style::default().bg(sel_bg).fg(theme.ui(Color::White)),
+                Style::default()
+                    .bg(sel_bg)
+                    .fg(theme.ui(Color::Rgb(0xa0, 0xb4, 0xd8))),
+                Style::default().bg(sel_bg).fg(theme.ui(icon.color)),
+            ),
+            None => (
+                Style::default().fg(theme.ui(Color::Rgb(0xec, 0xef, 0xf4))),
+                Style::default().fg(theme.ui(Color::Rgb(0x8e, 0x95, 0xa4))),
+                Style::default().fg(theme.ui(icon.color)),
+            ),
         };
         // Indent nested symbols by depth (capped), like the outline tree.
         let indent = "  ".repeat((sym.depth as usize).min(6));
-        let prefix = if is_selected { "> " } else { "  " };
+        let prefix = if is_selected && tones.is_none() {
+            "> "
+        } else {
+            "  "
+        };
         // Right-align the line number, like the palette's chord hint.
         let line_label = format!("{} ", sym.line + 1);
         let used = prefix.chars().count()
@@ -395,6 +404,31 @@ pub fn render_symbol_picker(
         ]));
     }
     Widget::render(Paragraph::new(lines), list_rect, buf);
+    if let Some(t) = tones {
+        paint_selected(buf, rect, list_rect, picker.selected, picker.scroll, t);
+    }
+}
+
+/// The selected row on a `surfaces` card: the band across the card with
+/// the accent bar on its left edge, at row `selected` of a list scrolled
+/// to `scroll` and drawn in `list` inside `card`. Nothing when it is off
+/// screen. Shared by the pickers whose rows carry no fill of their own.
+pub(crate) fn paint_selected(
+    buf: &mut Buffer,
+    card: Rect,
+    list: Rect,
+    selected: usize,
+    scroll: usize,
+    t: crate::widgets::surface::Tones,
+) {
+    let Some(row) = selected.checked_sub(scroll) else {
+        return;
+    };
+    if row >= usize::from(list.height) {
+        return;
+    }
+    let band = Rect::new(card.x, list.y + row as u16, card.width.saturating_sub(1), 1);
+    crate::widgets::surface::paint_selected_row(buf, band, t, t.raised, true);
 }
 
 #[cfg(test)]
@@ -498,5 +532,34 @@ mod tests {
         assert_eq!(p.selected_target(), Some((5, 0)));
         p.select_prev();
         assert_eq!(p.selected_target(), Some((1, 0)));
+    }
+
+    /// Croft Loch: the selected row is the band with the accent bar on the
+    /// card's edge and keeps its own inks; no `> ` marker, no forced white.
+    #[test]
+    fn croft_loch_selects_a_row_with_the_band_and_bar() {
+        use crate::widgets::surface;
+        let theme = crate::theme::Theme::from_id("loch");
+        let t = surface::tones(theme).unwrap();
+        let mut p = picker();
+        p.select_next();
+        let area = Rect::new(0, 0, 100, 30);
+        let mut buf = Buffer::empty(area);
+        render_symbol_picker(&mut p, area, &mut buf, theme, true);
+        let r = p.last_rect;
+        let row = |y: u16| -> String { (r.x..r.right()).map(|x| buf[(x, y)].symbol()).collect() };
+        let list_top = r.y + 3;
+        let y = list_top + 1;
+        assert!(row(y).contains("beta"), "{}", row(y));
+        assert!(!row(y).contains("> "), "{}", row(y));
+        assert_eq!(buf[(r.x, y)].symbol(), surface::ROW_BAR);
+        assert_eq!(buf[(r.x, y)].fg, t.accent());
+        assert_eq!(buf[(r.x + 2, y)].bg, t.band());
+        let name_x = (r.x..r.right())
+            .find(|&x| buf[(x, y)].symbol() == "b")
+            .unwrap();
+        assert_eq!(buf[(name_x, y)].fg, t.strong());
+        assert_ne!(buf[(r.x, list_top)].symbol(), surface::ROW_BAR);
+        assert_eq!(buf[(r.x + 2, list_top)].bg, t.raised());
     }
 }

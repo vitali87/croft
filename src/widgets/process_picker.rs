@@ -199,6 +199,7 @@ pub fn render_process_picker(
     } else {
         theme.ui(Color::Rgb(0x1e, 0x3a, 0x6e))
     };
+    let tones = crate::widgets::surface::tones(theme);
 
     if inner.height == 0 || inner.width == 0 {
         return;
@@ -219,12 +220,17 @@ pub fn render_process_picker(
     for (offset, target) in picker.targets[picker.scroll..end].iter().enumerate() {
         let row_idx = picker.scroll + offset;
         let is_selected = row_idx == picker.selected;
-        let row_style = if is_selected {
-            Style::default().bg(sel_bg).fg(theme.ui(Color::White))
-        } else {
-            Style::default().fg(theme.ui(Color::Rgb(0xec, 0xef, 0xf4)))
+        // A `surfaces` row carries only its ink; the band and bar follow.
+        let row_style = match tones {
+            Some(t) => Style::default().fg(if is_selected { t.strong() } else { t.text() }),
+            None if is_selected => Style::default().bg(sel_bg).fg(theme.ui(Color::White)),
+            None => Style::default().fg(theme.ui(Color::Rgb(0xec, 0xef, 0xf4))),
         };
-        let prefix = if is_selected { "> " } else { ROW_PREFIX };
+        let prefix = if is_selected && tones.is_none() {
+            "> "
+        } else {
+            ROW_PREFIX
+        };
         let room = (inner.width as usize).saturating_sub(prefix.chars().count() + ROW_END_GAP);
         lines.push(Line::from(vec![
             Span::styled(prefix.to_string(), row_style),
@@ -232,6 +238,16 @@ pub fn render_process_picker(
         ]));
     }
     Widget::render(Paragraph::new(lines), inner, buf);
+    if let Some(t) = tones {
+        crate::widgets::symbol_picker::paint_selected(
+            buf,
+            rect,
+            inner,
+            picker.selected,
+            picker.scroll,
+            t,
+        );
+    }
 }
 
 #[cfg(test)]

@@ -276,6 +276,7 @@ pub fn render_branch_picker(
     } else {
         theme.ui(Color::Rgb(0x1e, 0x3a, 0x6e))
     };
+    let tones = crate::widgets::surface::tones(theme);
 
     if inner.height == 0 || inner.width == 0 {
         return;
@@ -366,47 +367,77 @@ pub fn render_branch_picker(
     for (offset, row) in rows[picker.scroll..end].iter().enumerate() {
         let row_idx = picker.scroll + offset;
         let is_selected = row_idx == picker.selected;
-        let base = if is_selected {
-            Style::default().bg(sel_bg).fg(theme.ui(Color::White))
-        } else {
-            Style::default().fg(theme.ui(Color::Rgb(0xec, 0xef, 0xf4)))
+        // On a `surfaces` card the rows carry only inks (the band and bar
+        // come after): the current branch's dot in the accent (it is the
+        // active one), remotes muted, the Create row's glyph in the accent.
+        let base = match tones {
+            Some(t) => Style::default().fg(if is_selected { t.strong() } else { t.text() }),
+            None if is_selected => Style::default().bg(sel_bg).fg(theme.ui(Color::White)),
+            None => Style::default().fg(theme.ui(Color::Rgb(0xec, 0xef, 0xf4))),
         };
-        let prefix = if is_selected { "> " } else { "  " };
+        let prefix = if is_selected && tones.is_none() {
+            "> "
+        } else {
+            "  "
+        };
         let mut spans: Vec<Span<'static>> = vec![Span::styled(prefix.to_string(), base)];
         match row {
             Row::Existing(i) => {
                 let b = &picker.branches[*i];
                 let marker = if b.is_current { "● " } else { "  " };
+                let current = match tones {
+                    Some(t) => t.accent(),
+                    None => theme.ui(Color::Rgb(0xa3, 0xbe, 0x8c)),
+                };
                 spans.push(Span::styled(
                     marker.to_string(),
                     if b.is_current {
-                        Style::default().fg(theme.ui(Color::Rgb(0xa3, 0xbe, 0x8c)))
+                        Style::default().fg(current)
                     } else {
                         base
                     },
                 ));
                 spans.push(Span::styled(b.display.clone(), base));
                 if b.is_remote {
+                    let muted =
+                        tones.map_or_else(|| theme.ui(Color::Rgb(0x7a, 0x82, 0x90)), |t| t.muted());
                     spans.push(Span::styled(
                         "  (remote)".to_string(),
-                        Style::default().fg(theme.ui(Color::Rgb(0x7a, 0x82, 0x90))),
+                        Style::default().fg(muted),
                     ));
                 }
             }
             Row::Create(name) => {
-                let accent = Style::default()
-                    .fg(theme.ui(Color::Rgb(0x88, 0xc0, 0xd0)))
-                    .add_modifier(Modifier::BOLD);
+                let accent = match tones {
+                    Some(t) => Style::default().fg(t.accent()),
+                    None => Style::default()
+                        .fg(theme.ui(Color::Rgb(0x88, 0xc0, 0xd0)))
+                        .add_modifier(Modifier::BOLD),
+                };
+                let accent_text = match tones {
+                    Some(_) => base,
+                    None => accent,
+                };
                 spans.push(Span::styled("\u{eadc} ".to_string(), accent));
                 spans.push(Span::styled(
                     format!("Create new branch: {name}"),
-                    if is_selected { base } else { accent },
+                    if is_selected { base } else { accent_text },
                 ));
             }
         }
         lines.push(Line::from(spans));
     }
     Widget::render(Paragraph::new(lines), list_rect, buf);
+    if let Some(t) = tones {
+        crate::widgets::symbol_picker::paint_selected(
+            buf,
+            rect,
+            list_rect,
+            picker.selected,
+            picker.scroll,
+            t,
+        );
+    }
 }
 
 #[cfg(test)]

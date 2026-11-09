@@ -2,9 +2,11 @@ use ratatui::{
     buffer::Buffer,
     layout::Rect,
     style::{Color, Style},
-    text::{Line, Text},
+    text::{Line, Span, Text},
     widgets::{Block, Borders, Clear, Paragraph, Widget, Wrap},
 };
+
+use crate::widgets::surface;
 
 const MIN_WIDTH: u16 = 20;
 /// Compact tooltips (single-label button hints) shrink to fit their text
@@ -138,6 +140,14 @@ impl HoverPopup {
 
 impl Widget for &HoverPopup {
     fn render(self, area: Rect, buf: &mut Buffer) {
+        if let Some(t) = surface::tones(self.theme) {
+            if self.compact && self.lines.len() == 1 && area.height == 3 {
+                paint_pill(buf, area, &self.lines[0], t);
+            } else {
+                self.render_card(area, buf, t);
+            }
+            return;
+        }
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(self.theme.ui(Color::Rgb(0x4e, 0x9a, 0xff))))
@@ -163,6 +173,136 @@ impl Widget for &HoverPopup {
             let y = area.bottom().saturating_sub(1);
             paint_border_note(buf, area, y, '↓', max - scroll, marker);
         }
+    }
+}
+
+impl HoverPopup {
+    /// The hover as a `surfaces` theme draws it: a quiet card (a hover never
+    /// takes the keyboard, so its edge carries no accent lip) on the raised
+    /// tone, with a type ramp instead of one grey: the signature or first
+    /// line in the strong ink, fenced code in the body ink, prose a step
+    /// quieter, fence markers faint, and the section divider a rule in the
+    /// rim across the whole card. One styled line per text line, so the
+    /// wrapping `area_for` measures is the wrapping drawn.
+    fn render_card(&self, area: Rect, buf: &mut Buffer, t: surface::Tones) {
+        let inner_w = area.width.saturating_sub(2);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(t.rim()))
+            .style(Style::default().bg(t.raised()));
+        let max = self.max_scroll(area);
+        let scroll = self.scroll.min(max);
+        let para = Paragraph::new(Text::from(card_lines(&self.lines, t, inner_w)))
+            .wrap(Wrap { trim: false })
+            .block(block)
+            .style(Style::default().fg(t.text()))
+            .scroll((scroll, 0));
+        Widget::render(Clear, area, buf);
+        para.render(area, buf);
+        surface::paint_quiet_frame(buf, area, self.theme);
+        // A divider row carries on through the card's side edges, so the
+        // rule meets the rim instead of stopping a cell short of it.
+        if area.width >= 3 {
+            let (left, right) = (area.x, area.right() - 1);
+            for y in area.y + 1..area.bottom().saturating_sub(1) {
+                let rule = (left + 1..right).all(|x| {
+                    let cell = &buf[(x, y)];
+                    cell.symbol() == "─" && cell.fg == t.rim()
+                });
+                if rule {
+                    for x in [left, right] {
+                        buf[(x, y)].set_symbol("─").set_fg(t.rim());
+                    }
+                }
+            }
+        }
+        let marker = Style::default().fg(t.muted());
+        if scroll > 0 {
+            paint_border_note(buf, area, area.y, '↑', scroll, marker);
+        }
+        if max > scroll {
+            let y = area.bottom().saturating_sub(1);
+            paint_border_note(buf, area, y, '↓', max - scroll, marker);
+        }
+    }
+}
+
+/// The rule the app puts between a diagnostic and the language hover
+/// (`compose_hover`); a `surfaces` card draws it across its whole width.
+const DIVIDER: &str = "────────";
+
+/// Body prose on a `surfaces` card: between the body ink and the muted one,
+/// so the signature above it leads and the docs still read at length.
+pub(crate) fn prose_ink(t: surface::Tones) -> Color {
+    crate::gradient::rgb_color(crate::gradient::lerp_rgb(t.muted, t.text, 0.5))
+}
+
+/// The hover's lines styled for a `surfaces` card `inner_w` cells wide. A
+/// section's first line (the popup's first, or the first after a divider)
+/// outside a code fence is its headline, in the strong ink; fenced code is
+/// in the body ink with its fence markers faint; the rest is prose. The
+/// divider grows to the card's width, which still takes exactly one row.
+fn card_lines(lines: &[String], t: surface::Tones, inner_w: u16) -> Vec<Line<'static>> {
+    let mut out = Vec::with_capacity(lines.len());
+    let mut in_fence = false;
+    let mut headline = true;
+    for l in lines {
+        if l == DIVIDER {
+            let rule = "─".repeat(usize::from(inner_w.max(1)));
+            out.push(Line::from(Span::styled(rule, Style::default().fg(t.rim()))));
+            headline = true;
+            continue;
+        }
+        if l.trim_start().starts_with("```") {
+            in_fence = !in_fence;
+            headline = false;
+            out.push(Line::from(Span::styled(
+                l.clone(),
+                Style::default().fg(t.faint()),
+            )));
+            continue;
+        }
+        let fg = if in_fence {
+            t.text()
+        } else if headline && !l.trim().is_empty() {
+            headline = false;
+            t.strong()
+        } else {
+            prose_ink(t)
+        };
+        out.push(Line::from(Span::styled(l.clone(), Style::default().fg(fg))));
+    }
+    out
+}
+
+/// A one-line tooltip on a `surfaces` theme: a pill on the raised tone with
+/// half-block caps, on the middle row of the 3-row `area` that placement and
+/// the hit tests measure. The rows above and below are left as they are, so
+/// a hint reads as a label beside what it names rather than a boxed card.
+fn paint_pill(buf: &mut Buffer, area: Rect, label: &str, t: surface::Tones) {
+    let area = area.intersection(buf.area);
+    if area.width < 3 || area.height < 2 {
+        return;
+    }
+    let y = area.y + 1;
+    let fill = t.raised();
+    let body = Rect::new(area.x + 1, y, area.width - 2, 1);
+    Widget::render(Clear, body, buf);
+    buf.set_style(body, Style::default().bg(fill));
+    buf.set_stringn(
+        body.x,
+        y,
+        label,
+        usize::from(body.width),
+        Style::default().fg(t.text()).bg(fill),
+    );
+    // The caps keep the background beneath them, so the pill's ends round
+    // off against whatever surface the hint floats over.
+    for (x, cap) in [(area.x, "\u{2590}"), (area.right() - 1, "\u{258c}")] {
+        let cell = &mut buf[(x, y)];
+        cell.set_symbol(cap);
+        cell.set_fg(fill);
+        cell.modifier = ratatui::style::Modifier::empty();
     }
 }
 
@@ -489,6 +629,62 @@ mod tests {
         assert_eq!(area.width, MIN_WIDTH);
         let bottom = row_text(&buf, area, area.bottom() - 1);
         assert!(bottom.contains(" ↓ 24 "), "got {bottom:?}");
+    }
+
+    fn loch() -> crate::theme::Theme {
+        crate::theme::Theme::from_id("loch")
+    }
+
+    /// Croft Loch: a quiet card (rim, no accent lip, since a hover never
+    /// takes the keyboard) on the raised tone; the headline in the strong
+    /// ink, prose quieter, and the diagnostic divider a rule across the
+    /// whole card.
+    #[test]
+    fn croft_loch_hover_is_a_quiet_card_with_a_type_ramp() {
+        let theme = loch();
+        let t = surface::tones(theme).unwrap();
+        let text = format!("Error: bad\n{DIVIDER}\nfn foo() -> u8\ndocs here");
+        let mut p = HoverPopup::new(text, (10, 20));
+        p.theme = theme;
+        let (area, buf) = painted(&p, VP);
+        assert_eq!(buf[(area.x, area.y)].symbol(), "\u{2594}");
+        assert_eq!(buf[(area.x, area.y)].fg, t.rim(), "no accent lip");
+        assert_eq!(buf[(area.x + 1, area.y + 1)].fg, t.strong(), "headline");
+        assert_eq!(buf[(area.x + 1, area.y + 1)].bg, t.raised());
+        for x in area.x..area.right() {
+            assert_eq!(buf[(x, area.y + 2)].symbol(), "─", "({x}) the rule spans");
+            assert_eq!(buf[(x, area.y + 2)].fg, t.rim());
+        }
+        assert_eq!(
+            buf[(area.x + 1, area.y + 3)].fg,
+            t.strong(),
+            "a new section"
+        );
+        assert_eq!(buf[(area.x + 1, area.y + 4)].fg, prose_ink(t));
+    }
+
+    /// Croft Loch: a one-line tooltip is a pill on the middle row of the
+    /// same 3-row area (placement and hit tests unchanged), with half-block
+    /// caps and nothing drawn above or below it.
+    #[test]
+    fn croft_loch_compact_tooltip_is_a_one_row_pill() {
+        let theme = loch();
+        let t = surface::tones(theme).unwrap();
+        let mut p = HoverPopup::new_compact("Refresh".into(), (10, 12));
+        p.theme = theme;
+        let area = p.area_for(VP);
+        assert_eq!((area.width, area.height), (9, 3));
+        let mut buf = Buffer::empty(VP);
+        buf.set_string(area.x, area.y, "#########", Style::default());
+        p.render(area, &mut buf);
+        let y = area.y + 1;
+        assert_eq!(buf[(area.x, y)].symbol(), "\u{2590}");
+        assert_eq!(buf[(area.x, y)].fg, t.raised());
+        assert_eq!(buf[(area.right() - 1, y)].symbol(), "\u{258c}");
+        assert_eq!(row_text(&buf, area, y), "\u{2590}Refresh\u{258c}");
+        assert_eq!(buf[(area.x + 1, y)].bg, t.raised());
+        assert_eq!(buf[(area.x + 1, y)].fg, t.text());
+        assert_eq!(row_text(&buf, area, area.y), "#########", "row above kept");
     }
 
     #[test]

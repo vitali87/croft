@@ -9,6 +9,7 @@ use ratatui::{
 };
 
 use crate::lsp::CompletionItem;
+use crate::widgets::surface;
 
 const MAX_VISIBLE_ITEMS: usize = 10;
 const MIN_WIDTH: u16 = 24;
@@ -333,20 +334,24 @@ pub struct CompletionDetails<'a> {
 impl Widget for CompletionDetails<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let theme = self.popup.theme;
+        let tones = surface::tones(theme);
         let mut lines: Vec<Line> = Vec::new();
         for (i, l) in self.popup.details_lines().into_iter().enumerate() {
             // The first line is the signature when the item has one.
-            let style = if i == 0
+            let signature = i == 0
                 && self
                     .popup
                     .selected_item()
-                    .is_some_and(|it| it.detail.is_some())
-            {
-                Style::default()
+                    .is_some_and(|it| it.detail.is_some());
+            // A `surfaces` theme ranks the two by ink, not weight: the
+            // signature strong, the docs in the hover's prose ink.
+            let style = match (tones, signature) {
+                (Some(t), true) => Style::default().fg(t.strong()),
+                (Some(t), false) => Style::default().fg(crate::widgets::hover_popup::prose_ink(t)),
+                (None, true) => Style::default()
                     .fg(theme.ui(Color::Rgb(0xd0, 0xd6, 0xe0)))
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(theme.ui(Color::Rgb(0xb0, 0xb8, 0xc8)))
+                    .add_modifier(Modifier::BOLD),
+                (None, false) => Style::default().fg(theme.ui(Color::Rgb(0xb0, 0xb8, 0xc8))),
             };
             lines.push(Line::from(Span::styled(l, style)));
         }
@@ -359,40 +364,108 @@ impl Widget for CompletionDetails<'_> {
             .block(block)
             .wrap(ratatui::widgets::Wrap { trim: false })
             .render(area, buf);
-        if theme.framed_overlays() {
-            crate::widgets::surface::paint_overlay_frame(buf, area, theme);
+        if tones.is_some() {
+            // The list beside it carries the accent lip; a second lip
+            // restarting at their seam would read as two focused cards.
+            surface::paint_quiet_frame(buf, area, theme);
+        } else if theme.framed_overlays() {
+            surface::paint_overlay_frame(buf, area, theme);
         }
     }
+}
+
+/// The ink of a completion kind's glyph on a `surfaces` theme, from the
+/// syntax palette role the kind is drawn in, so a row's glyph matches how
+/// the same name looks in the code: callables as functions, types as types,
+/// modules and keywords as keywords, constants as constants, values in the
+/// plain foreground, and the rest (snippets, files, words) muted.
+fn kind_ink(kind: Option<lsp_types::CompletionItemKind>, theme: crate::theme::Theme) -> Color {
+    use lsp_types::CompletionItemKind as K;
+    let syn = theme.syntax();
+    let rgb = match kind {
+        Some(K::FUNCTION) | Some(K::METHOD) | Some(K::CONSTRUCTOR) => syn.function,
+        Some(K::CLASS)
+        | Some(K::STRUCT)
+        | Some(K::INTERFACE)
+        | Some(K::ENUM)
+        | Some(K::ENUM_MEMBER)
+        | Some(K::TYPE_PARAMETER) => syn.type_,
+        Some(K::MODULE) | Some(K::KEYWORD) => syn.keyword,
+        Some(K::CONSTANT) => syn.constant,
+        Some(K::VARIABLE) | Some(K::FIELD) | Some(K::PROPERTY) => syn.fg,
+        _ => return surface::tones(theme).map_or(Color::Reset, |t| t.muted()),
+    };
+    crate::gradient::rgb_color(rgb)
+}
+
+/// `label` as a `surfaces` row draws it: the part the typed `prefix`
+/// matched (case-insensitively, from the start) in the accent, the rest in
+/// `ink`. A label the prefix does not open (a match on its filter text)
+/// stays one span.
+fn label_spans(label: &str, prefix: &str, ink: Color, t: surface::Tones) -> Vec<Span<'static>> {
+    let n = prefix.chars().count();
+    let head: String = label.chars().take(n).collect();
+    if n == 0 || head.chars().count() < n || !head.eq_ignore_ascii_case(prefix) {
+        return vec![Span::styled(label.to_string(), Style::default().fg(ink))];
+    }
+    let tail: String = label.chars().skip(n).collect();
+    vec![
+        Span::styled(
+            head,
+            Style::default().fg(t.accent()).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(tail, Style::default().fg(ink)),
+    ]
 }
 
 impl Widget for &CompletionPopup {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let visible = self.visible_indices();
+        let tones = surface::tones(self.theme);
         // Inside the borders, after the kind glyph: what a row has for its
         // label and detail.
         let row_room = area.width.saturating_sub(2 + 3);
         let items: Vec<ListItem> = visible
             .iter()
-            .map(|&i| {
+            .enumerate()
+            .map(|(row, &i)| {
                 let item = &self.items[i];
                 let kind_glyph = kind_glyph(item.kind);
-                let mut spans = vec![
-                    Span::styled(
-                        format!(" {kind_glyph} "),
-                        Style::default().fg(self.theme.ui(Color::Rgb(0x6c, 0x88, 0xb0))),
-                    ),
-                    Span::raw(item.label.clone()),
-                ];
+                let mut spans = match tones {
+                    Some(t) => {
+                        let ink = if row == self.selected {
+                            t.strong()
+                        } else {
+                            t.text()
+                        };
+                        let mut s = vec![Span::styled(
+                            format!(" {kind_glyph} "),
+                            Style::default().fg(kind_ink(item.kind, self.theme)),
+                        )];
+                        s.extend(label_spans(&item.label, &self.prefix, ink, t));
+                        s
+                    }
+                    None => vec![
+                        Span::styled(
+                            format!(" {kind_glyph} "),
+                            Style::default().fg(self.theme.ui(Color::Rgb(0x6c, 0x88, 0xb0))),
+                        ),
+                        Span::raw(item.label.clone()),
+                    ],
+                };
                 // A detail too long for the row ends in `…` rather than at
                 // the border (#1527); the details pane has it whole.
                 let room = row_room.saturating_sub(cells(&item.label) + 2);
                 if let Some(detail) = item.detail.as_ref().filter(|_| room >= 2) {
-                    spans.push(Span::styled(
-                        format!("  {}", fit(detail, room)),
-                        Style::default()
+                    // DIM renders differently in every terminal; a
+                    // `surfaces` theme says "secondary" with its muted ink.
+                    let style = match tones {
+                        Some(t) => Style::default().fg(t.muted()),
+                        None => Style::default()
                             .fg(self.theme.ui(Color::Rgb(0x70, 0x78, 0x88)))
                             .add_modifier(Modifier::DIM),
-                    ));
+                    };
+                    spans.push(Span::styled(format!("  {}", fit(detail, room)), style));
                 }
                 ListItem::new(Line::from(spans))
             })
@@ -409,19 +482,40 @@ impl Widget for &CompletionPopup {
         } else {
             self.theme.ui(Color::Rgb(0x09, 0x67, 0xb8))
         };
-        let list = List::new(items).block(block).highlight_style(
-            Style::default()
-                .bg(sel_bg)
-                .fg(self.theme.ui(Color::Rgb(0xff, 0xff, 0xff)))
-                .add_modifier(Modifier::BOLD),
-        );
+        let list = List::new(items).block(block);
+        // A `surfaces` theme paints its selected row after the frame (the
+        // band and the accent bar on the card's edge); the boxed themes keep
+        // the List's own highlight.
+        let list = if tones.is_some() {
+            list
+        } else {
+            list.highlight_style(
+                Style::default()
+                    .bg(sel_bg)
+                    .fg(self.theme.ui(Color::Rgb(0xff, 0xff, 0xff)))
+                    .add_modifier(Modifier::BOLD),
+            )
+        };
 
         Widget::render(Clear, area, buf);
         let mut state = ListState::default();
         state.select(Some(self.selected));
         StatefulWidget::render(list, area, buf, &mut state);
         if self.theme.framed_overlays() {
-            crate::widgets::surface::paint_overlay_frame(buf, area, self.theme);
+            surface::paint_overlay_frame(buf, area, self.theme);
+        }
+        if let Some(t) = tones {
+            let shown = usize::from(area.height.saturating_sub(2));
+            let row = self.selected.checked_sub(state.offset());
+            if let Some(row) = row.filter(|&r| r < shown && self.selected < visible.len()) {
+                let rect = Rect {
+                    x: area.x,
+                    y: area.y + 1 + row as u16,
+                    width: area.width.saturating_sub(1),
+                    height: 1,
+                };
+                surface::paint_selected_row(buf, rect, t, t.raised, true);
+            }
         }
     }
 }
@@ -867,6 +961,57 @@ mod tests {
         );
         let (_, _, text) = screen(&p, VIEW);
         assert!(text.contains("trim_start  fn(&self) -> &str"), "{text}");
+    }
+
+    /// Croft Loch: the selected row is the band with the accent bar on the
+    /// card's edge (no forced white or bold); the typed prefix is in the
+    /// accent, the kind glyph in its syntax role's ink, the detail muted
+    /// without DIM; the details card beside it has no second accent lip.
+    #[test]
+    fn croft_loch_rows_mark_the_prefix_and_select_with_the_bar() {
+        let theme = crate::theme::Theme::from_id("loch");
+        let t = surface::tones(theme).unwrap();
+        let mut fun = documented("trim_start", "fn(&self) -> &str", TRIM_DOC);
+        fun.kind = Some(lsp_types::CompletionItemKind::FUNCTION);
+        let mut p = popup(
+            vec![documented("trim", "fn(&self) -> &str", ""), fun],
+            "tri",
+        );
+        p.theme = theme;
+        p.selected = 1;
+        let list = p.area_for(VIEW);
+        let mut buf = Buffer::empty(VIEW);
+        Widget::render(&p, list, &mut buf);
+        let (y0, y1) = (list.y + 1, list.y + 2);
+        // Row 0, unselected: no bar, prefix accent and bold, detail muted.
+        assert_ne!(buf[(list.x, y0)].symbol(), surface::ROW_BAR);
+        let label_x = list.x + 4;
+        assert_eq!(buf[(label_x, y0)].symbol(), "t");
+        assert_eq!(buf[(label_x, y0)].fg, t.accent());
+        assert!(buf[(label_x, y0)].modifier.contains(Modifier::BOLD));
+        assert_eq!(buf[(label_x + 3, y0)].fg, t.text(), "past the prefix");
+        let detail_x = label_x + "trim  ".len() as u16;
+        assert_eq!(buf[(detail_x, y0)].symbol(), "f");
+        assert_eq!(buf[(detail_x, y0)].fg, t.muted());
+        assert!(!buf[(detail_x, y0)].modifier.contains(Modifier::DIM));
+        // Row 1, selected: the bar and the band, the glyph in its role.
+        assert_eq!(buf[(list.x, y1)].symbol(), surface::ROW_BAR);
+        assert_eq!(buf[(list.x, y1)].fg, t.accent());
+        assert_eq!(buf[(label_x + 5, y1)].bg, t.band());
+        assert_eq!(buf[(label_x + 5, y1)].fg, t.strong());
+        assert_eq!(
+            buf[(list.x + 2, y1)].fg,
+            crate::gradient::rgb_color(theme.syntax().function)
+        );
+        // The details card is quiet: its top edge is the rim throughout.
+        let d = p.details_area_for(list, VIEW).unwrap();
+        p.details().render(d, &mut buf);
+        assert_eq!(buf[(d.x, d.y)].fg, t.rim());
+        assert_eq!(
+            buf[(d.x + 1, d.y + 1)].fg,
+            t.strong(),
+            "the signature leads"
+        );
     }
 
     /// #1527: a signature too long even for the widest list ends in `…`

@@ -45,6 +45,61 @@ fn black_theme_context_menu_uses_gradient_border_and_muted_selection() {
     assert_eq!(buf[(11, 11)].bg, rgb_color(POPUP_SEL_BG));
 }
 
+/// Croft Loch draws a context menu as a raised card: the selected row is
+/// the band with the accent bar on the card's edge, a separator runs from
+/// rim to rim, and a shortcut is keycaps the panel is widened to hold.
+#[test]
+fn croft_loch_context_menu_is_a_card_with_keycaps_and_a_selected_bar() {
+    use crate::widgets::surface;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.theme = crate::theme::Theme::from_id("loch");
+    let t = surface::tones(app.theme).unwrap();
+    let mut menu = ContextMenu::flat(
+        (10, 10),
+        vec![
+            (
+                String::from("New File"),
+                MenuAction::Create(CreateKind::File),
+            ),
+            (
+                String::from("New Folder"),
+                MenuAction::Create(CreateKind::Folder),
+            ),
+        ],
+        tmp.path().to_path_buf(),
+    );
+    menu.items.insert(1, MenuEntry::Separator);
+    app.context_menu = Some(menu);
+    let backend = ratatui::backend::TestBackend::new(140, 50);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let buf = term.backend().buffer();
+    let r = app.menu_rect().unwrap();
+    // The selected (first) row: the bar on the card's edge, the band.
+    assert_eq!(buf[(r.x, r.y + 1)].symbol(), surface::ROW_BAR);
+    assert_eq!(buf[(r.x, r.y + 1)].fg, t.accent());
+    assert_eq!(buf[(r.x + 2, r.y + 1)].bg, t.band());
+    // The separator meets the rim on both sides.
+    for x in r.x..r.right() {
+        assert_eq!(buf[(x, r.y + 2)].symbol(), "\u{2500}", "({x}) on the rule");
+    }
+    // New Folder's shortcut is keycaps, inside the panel.
+    let hint = menu_hint(&MenuAction::Create(CreateKind::Folder), &app.keymap).unwrap();
+    let caps: u16 = surface::keycap_spans(&hint, t, t.raised(), false)
+        .iter()
+        .map(|s| s.width() as u16)
+        .sum();
+    assert!(r.width >= "New Folder".len() as u16 + caps + 4, "{r:?}");
+    let cap_bg = t.keycap_on(t.raised());
+    assert!((r.x..r.right()).any(|x| buf[(x, r.y + 3)].bg == cap_bg));
+    assert_eq!(
+        buf[(r.right() - 1, r.y + 3)].symbol(),
+        "\u{2595}",
+        "rim kept"
+    );
+}
+
 #[test]
 fn black_theme_status_bar_is_near_black_not_navy() {
     let tmp = tempfile::tempdir().unwrap();
