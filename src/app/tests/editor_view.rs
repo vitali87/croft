@@ -2473,6 +2473,22 @@ fn overwrite_adds_a_combining_mark_to_the_letter_before_the_caret() {
 }
 
 #[test]
+fn overwrite_steps_past_an_emoji_a_typed_zwj_joins() {
+    // A ZWJ typed between 👩 and 💻 makes one 👩‍💻: the caret goes after it,
+    // so the next key replaces the `x`, not the 💻.
+    let (_t, mut app) = overwrite_app("\u{1F469}\u{1F4BB}x");
+    app.overwrite_mode = true;
+    app.editor.cursor_col = 1;
+    app.handle_key(key(KeyCode::Char('\u{200D}'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.lines[0], "\u{1F469}\u{200D}\u{1F4BB}x");
+    assert_eq!(app.editor.cursor_col, 3, "after the joined emoji");
+    app.handle_key(key(KeyCode::Char('a'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.lines[0], "\u{1F469}\u{200D}\u{1F4BB}a");
+}
+
+#[test]
 fn overwrite_drops_the_empty_selection_a_click_leaves() {
     let (_t, mut app) = overwrite_app("abcd");
     app.overwrite_mode = true;

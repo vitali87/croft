@@ -8719,7 +8719,7 @@ impl Editor {
     }
 
     pub fn insert_char(&mut self, c: char) {
-        if self.overwrite_applies(c) {
+        if self.overwrite_applies() {
             self.overwrite_char(c);
             return;
         }
@@ -8764,12 +8764,11 @@ impl Editor {
         self.last_typed = Some((c, self.edit_seq));
     }
 
-    /// Whether typed `c` should overwrite rather than insert: the mode is
-    /// on, there is a character to the right of the one caret on its line (at
-    /// the end of a line typing appends, as in every editor), no selection or
-    /// extra caret is in play (those keep their insert semantics), and `c`
-    /// does not complete the character before the caret.
-    fn overwrite_applies(&self, c: char) -> bool {
+    /// Whether a typed character should overwrite rather than insert: the
+    /// mode is on, there is a character to the right of the one caret on its
+    /// line (at the end of a line typing appends, as in every editor) and no
+    /// selection or extra caret is in play (those keep their insert semantics).
+    fn overwrite_applies(&self) -> bool {
         self.overwrite
             && self.carets.is_empty()
             && !self.selection.is_some_and(|s| s.has_area())
@@ -8777,13 +8776,11 @@ impl Editor {
                 .lines
                 .get(self.cursor_row)
                 .is_some_and(|l| self.cursor_col < l.chars().count())
-            && !self.joins_cluster_before_caret(c)
     }
 
     /// Whether `c` typed at the caret joins the cluster just before it: a
     /// combining accent after its letter, a vowel sign after its consonant, a
-    /// ZWJ or the next part of an emoji sequence. It belongs to that
-    /// character, so Overwrite inserts it instead of replacing the next one.
+    /// ZWJ or the next part of an emoji sequence.
     fn joins_cluster_before_caret(&self, c: char) -> bool {
         let Some(line) = self.lines.get(self.cursor_row) else {
             return false;
@@ -8799,9 +8796,11 @@ impl Editor {
     }
 
     /// Overwrite-mode typing: replace the character cluster under the caret
-    /// with `c` and step past it. One undo step per keystroke run, like
-    /// ordinary typing. Auto-closing pairs and tags are bypassed: a typed
-    /// bracket replaces, it does not grow a partner.
+    /// with `c` and step past it. A `c` that completes the character before
+    /// the caret (see [`Self::joins_cluster_before_caret`]) belongs to it, so
+    /// it is added and nothing is replaced. One undo step per keystroke run,
+    /// like ordinary typing. Auto-closing pairs and tags are bypassed: a
+    /// typed bracket replaces, it does not grow a partner.
     fn overwrite_char(&mut self, c: char) {
         self.pin_on_edit();
         self.push_undo(EditKind::InsertChar);
@@ -8810,13 +8809,17 @@ impl Editor {
         self.selection = None;
         let row = self.cursor_row;
         let from = self.byte_index(row, self.cursor_col);
-        let next = next_grapheme_col(&self.lines[row], self.cursor_col);
-        let to = self.byte_index(row, next);
+        let to = if self.joins_cluster_before_caret(c) {
+            from
+        } else {
+            let next = next_grapheme_col(&self.lines[row], self.cursor_col);
+            self.byte_index(row, next)
+        };
         let mut buf = [0u8; 4];
         self.lines[row].replace_range(from..to, c.encode_utf8(&mut buf));
-        // The typed char can join what follows into one cluster (a regional
-        // indicator before a flag); step past the whole cluster then, so the
-        // next keystroke never lands inside it.
+        // The typed char can join the clusters around it into one (a ZWJ
+        // between two emoji, a regional indicator before a flag); step past
+        // the whole cluster then, so the next keystroke never lands inside it.
         let col = self.cursor_col + 1;
         let line = &self.lines[row];
         self.cursor_col = if floor_grapheme_col(line, col) == col {
