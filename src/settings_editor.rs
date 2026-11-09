@@ -51,6 +51,7 @@ pub fn choices(key: &str) -> Option<Vec<String>> {
             return Some(std::iter::once(String::new()).chain(langs).collect());
         }
         "problems_project_scope" => &["auto", "on", "off"],
+        "build_column_unit" => &["display", "byte", "char"],
         "diff_ignore_whitespace" => &["off", "leading", "all"],
         "render_whitespace" => &["selection", "all", "none"],
         "line_numbers" => &["on", "relative", "interval", "off"],

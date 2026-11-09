@@ -6,7 +6,9 @@
 //! file would. Paragraph text is emitted unwrapped — the editor renders the
 //! lines through a wrapping `Paragraph`, so the preview reflows with the pane.
 
-use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{
+    Alignment, BlockQuoteKind, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd,
+};
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -20,7 +22,8 @@ use crate::theme::Theme;
 
 const FG: Color = Color::Rgb(0xC0, 0xC5, 0xCE);
 const DIM: Color = Color::Rgb(0x60, 0x68, 0x78);
-const CODE: Color = Color::Rgb(0xD0, 0x87, 0x70);
+/// Inline code's colour, shared with the welcome card's release notes.
+pub(crate) const CODE: Color = Color::Rgb(0xD0, 0x87, 0x70);
 /// How far a `$$` display block sits in from its paragraph (#1564).
 const MATH_INDENT: &str = "    ";
 const RULE_COLS: usize = 60;
@@ -1097,6 +1100,20 @@ fn cells(text: &str) -> usize {
     usize::from(crate::cell_map::CellMap::new(text).width())
 }
 
+/// A GitHub alert's icon, title and colour (#1386), as GitHub labels them.
+/// The icons are codicons, one cell wide in a Nerd Font like the Problems
+/// panel's (an emoji is two and would push the title off its bar), and the
+/// colours are the dark-theme status hues `Theme::ui` adapts per theme.
+fn alert_label(kind: BlockQuoteKind) -> (char, &'static str, Color) {
+    match kind {
+        BlockQuoteKind::Note => ('\u{ea74}', "Note", Color::Rgb(0x3b, 0x9e, 0xff)),
+        BlockQuoteKind::Tip => ('\u{ea61}', "Tip", Color::Rgb(0x8c, 0xc2, 0x65)),
+        BlockQuoteKind::Important => ('\u{eb42}', "Important", Color::Rgb(0xb1, 0x80, 0xd7)),
+        BlockQuoteKind::Warning => ('\u{ea6c}', "Warning", Color::Rgb(0xcc, 0xa7, 0x00)),
+        BlockQuoteKind::Caution => ('\u{ea87}', "Caution", Color::Rgb(0xf1, 0x4c, 0x4c)),
+    }
+}
+
 struct Renderer<'r> {
     theme: Theme,
     registry: &'r mut LangRegistry,
@@ -1109,7 +1126,9 @@ struct Renderer<'r> {
     heading: Option<HeadingLevel>,
     /// Ordered-list counters (`Some(next)`) or bullets (`None`), by depth.
     list_stack: Vec<Option<u64>>,
-    quote_depth: usize,
+    /// The open block quotes, outermost first: `Some` for a GitHub alert
+    /// (`> [!NOTE]`, #1386), whose bar takes the alert's colour.
+    quotes: Vec<Option<BlockQuoteKind>>,
     /// Set at `Item` start, emitted before the item's first content so a
     /// task-list marker can replace the plain bullet.
     pending_marker: Option<String>,
@@ -1180,10 +1199,26 @@ impl Renderer<'_> {
                 .fg(self.theme.accent())
                 .add_modifier(Modifier::UNDERLINED);
         }
-        if self.quote_depth > 0 {
+        // An alert's body is ordinary text, as GitHub draws it; only a
+        // plain quote is muted.
+        if self.quotes.last().is_some_and(Option::is_none) {
             style = style.fg(self.theme.ui(DIM)).add_modifier(Modifier::ITALIC);
         }
         style
+    }
+
+    /// The bars a row inside block quotes starts with, outermost first, each
+    /// in its quote's colour (an alert's own, #1386). Inline text gets them
+    /// from `begin_content`; code blocks and tables build their rows
+    /// themselves and ask here, or their rows would sit outside the callout.
+    fn quote_bars(&self) -> Vec<Span<'static>> {
+        self.quotes
+            .iter()
+            .map(|kind| {
+                let colour = kind.map_or(DIM, |k| alert_label(k).2);
+                Span::styled("\u{258e} ", Style::default().fg(self.theme.ui(colour)))
+            })
+            .collect()
     }
 
     /// The block prefix a fresh content line carries: quote bars, then list
@@ -1192,12 +1227,8 @@ impl Renderer<'_> {
         if !self.cur.is_empty() {
             return;
         }
-        for _ in 0..self.quote_depth {
-            self.cur.push(Span::styled(
-                "\u{258e} ",
-                Style::default().fg(self.theme.ui(DIM)),
-            ));
-        }
+        let bars = self.quote_bars();
+        self.cur.extend(bars);
         if !self.list_stack.is_empty() {
             let depth = self.list_stack.len() - 1;
             self.cur.push(Span::raw("  ".repeat(depth)));
@@ -1283,12 +1314,15 @@ impl Renderer<'_> {
             let line_starts = compute_line_starts(bytes);
             highlight_text(self.registry, k, bytes, &line_starts)
         });
+        let quote = self.quote_bars();
         for (i, line) in text.lines().enumerate() {
-            let mut spans = vec![if i == 0 && runnable.is_some() {
-                play.clone()
-            } else {
-                bar.clone()
-            }];
+            let mut spans = quote.clone();
+            spans.push(bar.clone());
+            // The glyph takes the row's first cell, where a click on it is
+            // looked for, so inside a quote it stands in for the outer bar.
+            if i == 0 && runnable.is_some() {
+                spans[0] = play.clone();
+            }
             match highlighted.as_ref().and_then(|h| h.get(i)) {
                 Some(hi) if !hi.is_empty() => spans.extend(code_line_spans(line, hi, code_fg)),
                 _ => spans.push(Span::styled(line.to_string(), Style::default().fg(code_fg))),
@@ -1315,6 +1349,10 @@ impl Renderer<'_> {
         let Some(out) = self.outputs.get(&r.lines.0) else {
             return;
         };
+        // Inside a quote the box keeps the quote's bars too, like its code.
+        let mut lead = self.quote_bars();
+        lead.push(bar.clone());
+        let row = |rest: Vec<Span<'static>>| Line::from([lead.clone(), rest].concat());
         let dim = Style::default().fg(self.theme.ui(Color::Rgb(0x9a, 0x9a, 0x9a)));
         // The status says which of the three things happened, because they
         // are genuinely different: it finished well, it finished badly, or
@@ -1335,8 +1373,7 @@ impl Renderer<'_> {
                 ),
             }
         };
-        self.out.push(Line::from(vec![
-            bar.clone(),
+        self.out.push(row(vec![
             Span::styled("Output".to_string(), dim.add_modifier(Modifier::BOLD)),
             status,
         ]));
@@ -1346,25 +1383,21 @@ impl Renderer<'_> {
         // end, and the pane still holds the whole thing.
         let skipped = lines.len().saturating_sub(OUTPUT_ROWS);
         if skipped > 0 {
-            self.out.push(Line::from(vec![
-                bar.clone(),
-                Span::styled(format!("… {skipped} earlier line(s)"), dim),
-            ]));
+            self.out.push(row(vec![Span::styled(
+                format!("… {skipped} earlier line(s)"),
+                dim,
+            )]));
         }
         let mut style = crate::ansi_text::AnsiStyle::default();
         for line in &lines[skipped..] {
-            let mut spans = vec![bar.clone()];
-            spans.extend(output_spans(line, &mut style, self.theme));
-            self.out.push(Line::from(spans));
+            self.out
+                .push(row(output_spans(line, &mut style, self.theme)));
         }
         if out.timed_out {
-            self.out.push(Line::from(vec![
-                bar.clone(),
-                Span::styled(
-                    "croft stopped waiting; the block is still running in its pane".to_string(),
-                    dim,
-                ),
-            ]));
+            self.out.push(row(vec![Span::styled(
+                "croft stopped waiting; the block is still running in its pane".to_string(),
+                dim,
+            )]));
         }
     }
 
@@ -1391,8 +1424,9 @@ impl Renderer<'_> {
                 widths[i] = widths[i].max(*w);
             }
         }
+        let quote = self.quote_bars();
         for (r, row) in rows.iter().enumerate() {
-            let mut spans: Vec<Span<'static>> = Vec::new();
+            let mut spans: Vec<Span<'static>> = quote.clone();
             let style = if r == 0 {
                 Style::default()
                     .fg(self.theme.ui(FG))
@@ -1425,7 +1459,7 @@ impl Renderer<'_> {
             self.out.push(Line::from(spans));
             if r == 0 {
                 // Header separator: ─ runs joined by ┼ at each column seam.
-                let mut sep: Vec<Span<'static>> = Vec::new();
+                let mut sep: Vec<Span<'static>> = quote.clone();
                 for (i, width) in widths.iter().enumerate() {
                     if i > 0 {
                         sep.push(Span::styled(
@@ -1503,13 +1537,16 @@ pub fn render_markdown_mapped(
     // it; without the option a display block ran into one paragraph line.
     // Front matter (#1385), YAML between `---` lines or TOML between `+++`
     // lines at the very top, is a block of its own rather than a rule, a
-    // paragraph and a setext heading.
+    // paragraph and a setext heading. GFM (#1386) only adds GitHub's alert
+    // quotes (`> [!NOTE]`), reported as the quote's kind with the marker
+    // stripped.
     let options = Options::ENABLE_TABLES
         | Options::ENABLE_STRIKETHROUGH
         | Options::ENABLE_TASKLISTS
         | Options::ENABLE_MATH
         | Options::ENABLE_YAML_STYLE_METADATA_BLOCKS
-        | Options::ENABLE_PLUSES_DELIMITED_METADATA_BLOCKS;
+        | Options::ENABLE_PLUSES_DELIMITED_METADATA_BLOCKS
+        | Options::ENABLE_GFM;
     let mut r = Renderer {
         theme,
         registry,
@@ -1521,7 +1558,7 @@ pub fn render_markdown_mapped(
         link: 0,
         heading: None,
         list_stack: Vec::new(),
-        quote_depth: 0,
+        quotes: Vec::new(),
         pending_marker: None,
         code_block: None,
         code_info: String::new(),
@@ -1571,7 +1608,7 @@ pub fn render_markdown_mapped(
                     r.ensure_blank();
                     r.heading = Some(level);
                 }
-                Tag::Paragraph if r.list_stack.is_empty() && r.quote_depth == 0 => {
+                Tag::Paragraph if r.list_stack.is_empty() && r.quotes.is_empty() => {
                     r.ensure_blank();
                 }
                 Tag::CodeBlock(kind) => {
@@ -1614,9 +1651,29 @@ pub fn render_markdown_mapped(
                     };
                     r.pending_marker = Some(marker);
                 }
-                Tag::BlockQuote(_) => {
+                Tag::BlockQuote(kind) => {
                     r.ensure_blank();
-                    r.quote_depth += 1;
+                    r.quotes.push(kind);
+                    // A GitHub alert (#1386) opens with a title row in its
+                    // colour where the source has the `[!KIND]` marker the
+                    // parser strips. That row anchors the marker's line; the
+                    // generic anchor below lands a row later on the same
+                    // line, so the final dedup drops it. A list item opening
+                    // on that line anchored it already, at the blank row the
+                    // quote just put above its title, so that one goes.
+                    if let Some(kind) = kind {
+                        source_map.retain(|&(line, _)| line != block_line);
+                        source_map.push((block_line, r.out.len()));
+                        let (icon, title, colour) = alert_label(kind);
+                        r.begin_content();
+                        r.cur.push(Span::styled(
+                            format!("{icon} {title}"),
+                            Style::default()
+                                .fg(theme.ui(colour))
+                                .add_modifier(Modifier::BOLD),
+                        ));
+                        r.flush_line();
+                    }
                 }
                 Tag::Emphasis => r.italic += 1,
                 Tag::Strong => r.bold += 1,
@@ -1723,7 +1780,7 @@ pub fn render_markdown_mapped(
                 }
                 TagEnd::Paragraph => {
                     r.flush_line();
-                    if r.list_stack.is_empty() && r.quote_depth == 0 {
+                    if r.list_stack.is_empty() && r.quotes.is_empty() {
                         r.out.push(Line::default());
                     }
                 }
@@ -1738,8 +1795,8 @@ pub fn render_markdown_mapped(
                 TagEnd::Item => r.flush_line(),
                 TagEnd::BlockQuote(_) => {
                     r.flush_line();
-                    r.quote_depth = r.quote_depth.saturating_sub(1);
-                    if r.quote_depth == 0 {
+                    r.quotes.pop();
+                    if r.quotes.is_empty() {
                         r.out.push(Line::default());
                     }
                 }
@@ -2136,6 +2193,34 @@ mod tests {
             );
             assert_eq!(source_line_for_built(&map, built), Some(src), "and back");
         }
+    }
+
+    /// #1386: an alert's marker line lands on its title row, not the body.
+    #[test]
+    fn an_alert_marker_line_maps_to_its_title_row() {
+        let md = "intro\n\n> [!NOTE]\n> body\n\nafter\n";
+        let mut reg = LangRegistry::new();
+        let (lines, _, _, map, _) =
+            render_markdown_mapped(md, Theme::default(), &mut reg, None, BlockOutputs::new());
+        for (src, needle) in [(2, "Note"), (3, "body"), (5, "after")] {
+            let built = built_line_for_source(&map, src).expect("mapped");
+            assert!(
+                line_text(&lines[built]).contains(needle),
+                "source line {src} should land on {needle:?}, got {:?}",
+                line_text(&lines[built])
+            );
+        }
+        // An alert opening a later list item: the item's own anchor for that
+        // line sat on the blank row above the title.
+        let md = "- one\n- > [!TIP]\n  > body\n";
+        let (lines, _, _, map, _) =
+            render_markdown_mapped(md, Theme::default(), &mut reg, None, BlockOutputs::new());
+        let built = built_line_for_source(&map, 1).expect("mapped");
+        assert!(
+            line_text(&lines[built]).contains("Tip"),
+            "got {:?}",
+            line_text(&lines[built])
+        );
     }
 
     #[test]
@@ -3082,6 +3167,92 @@ mod tests {
     fn blockquote_carries_the_bar_prefix() {
         let text = all_text(&render("> quoted wisdom"));
         assert!(text.contains("\u{258e} quoted wisdom"), "got:\n{text}");
+    }
+
+    /// #1386: a GitHub alert opens with a title row in its colour, the bar
+    /// takes that colour, the body reads as plain text, and the `[!KIND]`
+    /// marker is gone.
+    #[test]
+    fn a_github_alert_draws_a_coloured_title_row_without_its_marker() {
+        let lines = render("> [!WARNING]\n> text");
+        let rows: Vec<String> = lines.iter().map(text_of).collect();
+        assert_eq!(rows, ["\u{258e} \u{ea6c} Warning", "\u{258e} text"]);
+        // One cell per glyph: the icon must not push the title right.
+        assert_eq!(cells(&rows[0]), 11);
+        let warning = Theme::default().ui(Color::Rgb(0xcc, 0xa7, 0x00));
+        for line in &lines {
+            assert_eq!(line.spans[0].style.fg, Some(warning), "bar of {line:?}");
+        }
+        let title = lines[0].spans[1].style;
+        assert_eq!(title.fg, Some(warning));
+        assert!(title.add_modifier.contains(Modifier::BOLD));
+        let body = lines[1].spans[1].style;
+        assert!(!body.add_modifier.contains(Modifier::ITALIC), "{body:?}");
+        for (marker, title) in [
+            ("NOTE", "Note"),
+            ("TIP", "Tip"),
+            ("IMPORTANT", "Important"),
+            ("CAUTION", "Caution"),
+        ] {
+            let rows: Vec<String> = render(&format!("> [!{marker}]\n> body"))
+                .iter()
+                .map(text_of)
+                .collect();
+            assert!(rows[0].ends_with(&format!(" {title}")), "{rows:?}");
+            assert_eq!(rows[1..], ["\u{258e} body"], "{marker}");
+        }
+    }
+
+    /// #1386 negative: a plain quote, and one whose `[!KIND]` GitHub does
+    /// not know, stay muted quotes that keep every word.
+    #[test]
+    fn a_plain_quote_or_an_unknown_alert_kind_stays_a_plain_quote() {
+        for (md, row) in [
+            ("> quoted wisdom", "\u{258e} quoted wisdom"),
+            ("> [!UNKNOWN]\n> text", "\u{258e} [!UNKNOWN] text"),
+        ] {
+            let lines = render(md);
+            let rows: Vec<String> = lines.iter().map(text_of).collect();
+            assert_eq!(rows, [row]);
+            assert_eq!(lines[0].spans[0].style.fg, Some(Theme::default().ui(DIM)));
+            let body = lines[0].spans[1].style;
+            assert!(body.add_modifier.contains(Modifier::ITALIC), "{md:?}");
+        }
+    }
+
+    /// #1386 review: the rows a code block or a table builds itself keep the
+    /// alert's bar, so they stay inside the callout, and a runnable fence's
+    /// play glyph still takes the row's first cell, where a click on it is
+    /// looked for.
+    #[test]
+    fn code_and_table_rows_inside_an_alert_keep_its_bar() {
+        let warning = Theme::default().ui(Color::Rgb(0xcc, 0xa7, 0x00));
+        let lines = render(
+            "> [!WARNING]\n> ```rust\n> let x = 1;\n> ```\n>\n> | a | b |\n> | - | - |\n> | 1 | 2 |",
+        );
+        let rows: Vec<String> = lines.iter().map(text_of).collect();
+        let row = |needle: &str| {
+            lines
+                .iter()
+                .find(|l| text_of(l).contains(needle))
+                .unwrap_or_else(|| panic!("{needle:?} in {rows:?}"))
+        };
+        assert_eq!(text_of(row("let x = 1;")), "\u{258e} \u{258e} let x = 1;");
+        for needle in [
+            "let x = 1;",
+            "a \u{2502} b",
+            "\u{2500}\u{253c}\u{2500}",
+            "1 \u{2502} 2",
+        ] {
+            assert_eq!(row(needle).spans[0].style.fg, Some(warning), "{needle:?}");
+        }
+        let run = render("> [!TIP]\n> ```sh\n> make dev\n> ```");
+        let first = run
+            .iter()
+            .find(|l| text_of(l).contains("make dev"))
+            .expect("code row");
+        assert_eq!(first.spans[0].content.as_ref(), RUN_GLYPH, "{first:?}");
+        assert_eq!(text_of(first), format!("{RUN_GLYPH}\u{258e} make dev"));
     }
 
     #[test]

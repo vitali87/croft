@@ -1246,6 +1246,106 @@ fn the_palette_and_vim_recorders_are_one_recording_not_two() {
     );
 }
 
+/// #952: a recording started and stopped from the Command Palette leaves
+/// the stopping palette session out of the macro, so Replay N Times repeats
+/// the edits and never types into a palette. A palette command run in the
+/// middle (here Transform to Uppercase) joins the macro whole and replays.
+#[test]
+fn a_macro_stopped_from_the_palette_replays_only_what_was_recorded() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "names.txt", "alice\nbob\ncarol\ndave\neve\n");
+    app.macros_path = tmp.path().join("macros.json");
+    let palette = key(
+        KeyCode::Char('p'),
+        KeyModifiers::SUPER | KeyModifiers::SHIFT,
+    );
+    let none = |code| key(code, KeyModifiers::NONE);
+    let run_from_palette = |app: &mut App, query: &str| {
+        app.handle_key(palette).unwrap();
+        type_str(app, query);
+        app.handle_key(none(KeyCode::Enter)).unwrap();
+    };
+    run_from_palette(&mut app, "Macro: Start/Stop Recording");
+    assert!(app.macro_recording.is_some(), "the palette started it");
+    app.handle_key(none(KeyCode::Home)).unwrap();
+    type_str(&mut app, "- ");
+    run_from_palette(&mut app, "Transform to Uppercase");
+    app.handle_key(none(KeyCode::Down)).unwrap();
+    run_from_palette(&mut app, "Macro: Start/Stop Recording");
+    assert!(app.macro_recording.is_none(), "the palette stopped it");
+    assert_eq!(app.editor.lines[0], "- ALICE");
+    app.replay_last_macro(4);
+    assert!(
+        app.command_palette.is_none(),
+        "replay ends with no palette open"
+    );
+    assert_eq!(
+        app.editor.lines[..5],
+        ["- ALICE", "- BOB", "- CAROL", "- DAVE", "- EVE"]
+    );
+}
+
+/// #952 review: a palette command that takes focus out of the editor is
+/// left out of the macro. The click that brings focus back is not recorded,
+/// so replaying the command would send the keys after it to the shell.
+#[test]
+fn a_palette_command_that_leaves_the_editor_is_not_recorded() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "names.txt", "alice\nbob\n");
+    app.macros_path = tmp.path().join("macros.json");
+    let palette = key(
+        KeyCode::Char('p'),
+        KeyModifiers::SUPER | KeyModifiers::SHIFT,
+    );
+    let run_from_palette = |app: &mut App, query: &str| {
+        app.handle_key(palette).unwrap();
+        type_str(app, query);
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+            .unwrap();
+    };
+    run_from_palette(&mut app, "Macro: Start/Stop Recording");
+    type_str(&mut app, "x");
+    run_from_palette(&mut app, "Terminal: Focus Terminal");
+    assert!(app.focus != Pane::Editor, "the command left the editor");
+    app.focus_pane(Pane::Editor);
+    type_str(&mut app, "y");
+    run_from_palette(&mut app, "Macro: Start/Stop Recording");
+    app.replay_last_macro(1);
+    assert!(app.focus == Pane::Editor, "replay stays in the editor");
+    assert!(
+        app.editor.lines[0].starts_with("xyxy"),
+        "{:?}",
+        app.editor.lines
+    );
+}
+
+/// #952 review: a palette session closed by a click held keys that nothing
+/// replays; they are dropped, not picked up by the next palette session.
+#[test]
+fn a_palette_closed_by_a_click_leaves_nothing_for_the_macro() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "names.txt", "alice\n");
+    app.run_command(crate::widgets::command_palette::Command::MacroStartStopRecording);
+    app.handle_key(key(
+        KeyCode::Char('p'),
+        KeyModifiers::SUPER | KeyModifiers::SHIFT,
+    ))
+    .unwrap();
+    type_str(&mut app, "delete line");
+    let held = |app: &App| app.macro_recording.as_ref().unwrap().palette_keys.len();
+    assert!(held(&app) > 0, "an open palette session is held");
+    // A click outside closes the palette; any mouse event then lets go.
+    app.command_palette = None;
+    app.handle_mouse(crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::Moved,
+        column: 0,
+        row: 0,
+        modifiers: KeyModifiers::NONE,
+    });
+    assert_eq!(held(&app), 0);
+    assert!(app.macro_recording.as_ref().unwrap().recorded.is_empty());
+}
+
 /// #1345: Go to File skips excluded files, as VS Code's file search does
 /// for both settings, and still finds the rest.
 #[test]
@@ -1344,6 +1444,35 @@ fn the_palette_clear_bookmarks_command_leaves_a_preview_alone() {
     assert!(app.editor.toggle_markdown_preview());
     app.run_command(Command::ClearBookmarks);
     assert!(app.editor.bookmarked_lines().is_empty());
+}
+
+/// Typing in the bookmark picker narrows it to the matching rows.
+#[test]
+fn the_bookmark_picker_filters_as_you_type() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&a, "alpha\nbeta\ngamma\n").unwrap();
+    std::fs::write(&b, "one\ntwo\nthree\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&a).unwrap();
+    app.editor.cursor_row = 1;
+    app.toggle_bookmark();
+    app.editor.open_in_new_tab(&b).unwrap();
+    app.editor.cursor_row = 2;
+    app.toggle_bookmark();
+    app.run_command(Command::ViewBookmarks);
+    for c in "b.txt".chars() {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+            .unwrap();
+    }
+    let picker = app.list_picker.as_ref().expect("the picker stays open");
+    assert_eq!(picker.visible_count(), 1);
+    assert_eq!(
+        picker.selected_row().map(|r| r.label.as_str()),
+        Some("b.txt:3  three")
+    );
 }
 
 #[test]
@@ -2283,4 +2412,292 @@ fn the_palette_offers_the_move_editor_commands() {
         Some("View: Move Editor Left")
     );
     assert_eq!(tab_names_852(&app.editor), ["a.py", "c.py", "b.py"]);
+}
+
+/// Bookmarks: View Bookmarks lists the marks of every open tab, and picking
+/// a row opens that file at the marked line.
+#[test]
+fn the_bookmark_picker_lists_every_tabs_marks_and_jumps_to_one() {
+    use crate::widgets::command_palette::Command;
+    use crate::widgets::list_picker::ListPurpose;
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&a, "alpha\nbeta\ngamma\n").unwrap();
+    std::fs::write(&b, "one\ntwo\nthree\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.run_command(Command::ViewBookmarks);
+    assert!(app.list_picker.is_none(), "no bookmarks, no picker");
+    assert!(app.status.contains("No bookmarks"), "was {:?}", app.status);
+
+    app.editor.open(&a).unwrap();
+    app.editor.cursor_row = 1;
+    app.editor.toggle_bookmark();
+    app.editor.open_in_new_tab(&b).unwrap();
+    app.editor.cursor_row = 2;
+    app.editor.toggle_bookmark();
+    app.run_command(Command::ViewBookmarks);
+    let picker = app.list_picker.as_ref().expect("the picker opens");
+    assert_eq!(picker.purpose, ListPurpose::Bookmark);
+    let labels: Vec<&str> = picker.rows.iter().map(|r| r.label.as_str()).collect();
+    assert_eq!(labels, ["a.txt:2  beta", "b.txt:3  three"]);
+
+    // Home and End jump to the first and last row, like PgUp and PgDn.
+    app.handle_key(key(KeyCode::End, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.list_picker.as_ref().unwrap().selected, 1);
+    app.handle_key(key(KeyCode::Home, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.list_picker.as_ref().unwrap().selected, 0);
+
+    // Enter on the first row goes to a.txt line 2.
+    app.list_picker.as_mut().unwrap().selected = 0;
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.path.as_deref(), Some(a.as_path()));
+    assert_eq!(app.editor.cursor_row, 1);
+}
+
+/// View Bookmarks lists open files only: a preview tab that moved on from a
+/// file still holds that file's marks, but the file is no longer open, so
+/// neither it nor its text on disk shows up.
+#[test]
+fn the_bookmark_picker_leaves_out_a_file_no_tab_shows() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&a, "alpha\nbeta\n").unwrap();
+    std::fs::write(&b, "one\ntwo\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_preview(&a).unwrap();
+    app.editor.cursor_row = 1;
+    app.editor.toggle_bookmark();
+    app.editor.open_preview(&b).unwrap();
+    assert!(
+        !app.editor
+            .editors
+            .iter()
+            .any(|e| e.path.as_deref() == Some(a.as_path())),
+        "the preview slot moved on to b.txt"
+    );
+    assert!(
+        app.editor
+            .editors
+            .iter()
+            .any(|e| e.bookmarks.contains_key(&a)),
+        "a tab still holds a.txt's mark"
+    );
+    app.run_command(Command::ViewBookmarks);
+    assert!(app.list_picker.is_none(), "a.txt is not open");
+    assert!(app.status.contains("No bookmarks"), "was {:?}", app.status);
+}
+
+/// The marks of a tab in another editor group are listed too, and Enter on
+/// one moves focus to that group rather than opening the file again here.
+#[test]
+fn the_bookmark_picker_lists_another_groups_marks_and_jumps_into_it() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&a, "alpha\nbeta\ngamma\n").unwrap();
+    std::fs::write(&b, "one\ntwo\nthree\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&a).unwrap();
+    app.editor.cursor_row = 1;
+    app.editor.toggle_bookmark();
+    app.split_editor();
+    app.editor.open_preview(&b).unwrap();
+    app.editor.cursor_row = 2;
+    app.editor.toggle_bookmark();
+    let focused = app.editor_layout.active_dfs_index();
+    app.run_command(Command::ViewBookmarks);
+    let picker = app.list_picker.as_ref().expect("the picker opens");
+    let labels: Vec<&str> = picker.rows.iter().map(|r| r.label.as_str()).collect();
+    assert_eq!(labels, ["a.txt:2  beta", "b.txt:3  three"]);
+
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_ne!(
+        app.editor_layout.active_dfs_index(),
+        focused,
+        "focus moved to the group holding a.txt's mark"
+    );
+    assert_eq!(app.editor.path.as_deref(), Some(a.as_path()));
+    assert_eq!(app.editor.cursor_row, 1);
+    assert!(
+        app.editor.is_bookmarked(1),
+        "the tab with the mark is in front"
+    );
+    assert_eq!(app.status, "Bookmark at line 2");
+}
+
+/// A file open in two groups with the same line marked in both is one row.
+#[test]
+fn the_bookmark_picker_lists_a_mark_two_groups_share_once() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    std::fs::write(&a, "alpha\nbeta\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&a).unwrap();
+    app.editor.cursor_row = 1;
+    app.editor.toggle_bookmark();
+    app.split_editor();
+    app.editor.cursor_row = 1;
+    app.editor.toggle_bookmark();
+    assert!(app.editor.is_bookmarked(1));
+    app.run_command(Command::ViewBookmarks);
+    let picker = app.list_picker.as_ref().expect("the picker opens");
+    let labels: Vec<&str> = picker.rows.iter().map(|r| r.label.as_str()).collect();
+    assert_eq!(labels, ["a.txt:2  beta"]);
+}
+
+/// Enter opens the row's own path: a file name that is not UTF-8 used to
+/// turn into replacement characters on the way and fail to open.
+#[cfg(target_os = "linux")]
+#[test]
+fn the_bookmark_picker_opens_a_file_whose_name_is_not_utf8() {
+    use crate::widgets::command_palette::Command;
+    use std::os::unix::ffi::OsStrExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let odd = tmp.path().join(std::ffi::OsStr::from_bytes(b"caf\xe9.txt"));
+    let other = tmp.path().join("other.txt");
+    std::fs::write(&odd, "one\ntwo\n").unwrap();
+    std::fs::write(&other, "x\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&odd).unwrap();
+    app.editor.cursor_row = 1;
+    app.editor.toggle_bookmark();
+    app.editor.open_in_new_tab(&other).unwrap();
+    app.run_command(Command::ViewBookmarks);
+    assert!(app.list_picker.is_some(), "the picker opens");
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.status, "Bookmark at line 2");
+    assert_eq!(app.editor.path.as_deref(), Some(odd.as_path()));
+    assert_eq!(app.editor.cursor_row, 1);
+}
+
+/// The tab the mark came from is the one Enter brings up: a symbol tab
+/// beside the file's own tab holds a mark the file's tab does not, and
+/// the jump lands in the symbol tab rather than the first tab on the file.
+#[test]
+fn the_bookmark_picker_jumps_into_the_tab_that_holds_the_mark() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.py");
+    std::fs::write(&a, "def f():\n    return 1\n\ndef g():\n    return 2\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&a).unwrap();
+    app.open_symbol_tab_for("g".into(), 3, 4);
+    assert!(
+        app.editor.symbol_view.is_some(),
+        "the symbol tab is in front"
+    );
+    let symbol_tab = app.editor.active_index();
+    app.editor.cursor_row = 4;
+    app.editor.toggle_bookmark();
+    let file_tab = app
+        .editor
+        .editors
+        .iter()
+        .position(|e| e.symbol_view.is_none() && e.path.as_deref() == Some(a.as_path()))
+        .expect("the file's own tab");
+    app.editor.select(file_tab);
+    assert!(!app.editor.is_bookmarked(4), "the file's tab has no mark");
+
+    app.run_command(Command::ViewBookmarks);
+    let picker = app.list_picker.as_ref().expect("the picker opens");
+    let labels: Vec<&str> = picker.rows.iter().map(|r| r.label.as_str()).collect();
+    assert_eq!(labels, ["a.py:5  return 2"]);
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.active_index(), symbol_tab);
+    assert_eq!(app.editor.cursor_row, 4);
+    assert!(app.editor.is_bookmarked(4));
+}
+
+/// A selection in the destination tab is gone after the jump, so the next
+/// keystroke edits the bookmarked line instead of typing over the old
+/// selection.
+#[test]
+fn a_bookmark_jump_drops_the_destination_tabs_selection() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    std::fs::write(&a, "alpha\nbeta\ngamma\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&a).unwrap();
+    app.editor.cursor_row = 1;
+    app.editor.toggle_bookmark();
+    app.editor.select_all();
+    assert!(app.editor.selection.is_some());
+    app.run_command(Command::ViewBookmarks);
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.cursor_row, 1);
+    assert!(
+        app.editor.selection.is_none(),
+        "no selection left to type over"
+    );
+}
+
+/// Secondary carets in the destination tab go too: typing after the jump
+/// must not also edit the lines those carets sat on.
+#[test]
+fn a_bookmark_jump_drops_the_destination_tabs_extra_carets() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    std::fs::write(&a, "alpha\nbeta\ngamma\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&a).unwrap();
+    app.editor.cursor_row = 1;
+    app.editor.toggle_bookmark();
+    app.editor.cursor_row = 0;
+    app.editor.add_cursor_below();
+    assert!(!app.editor.carets.is_empty(), "a second caret is set");
+    app.run_command(Command::ViewBookmarks);
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.cursor_row, 1);
+    assert!(
+        app.editor.carets.is_empty(),
+        "no extra caret left to type at"
+    );
+}
+
+/// The editor's caret hides behind a list picker and comes back with it closed.
+#[test]
+fn the_editor_caret_is_hidden_while_a_list_picker_is_open() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    std::fs::write(&a, "alpha\nbeta\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_in_new_tab(&a).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.toggle_bookmark();
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    // The blink may be in its dark half; the steady (screen reader) phase
+    // keeps the test off the clock.
+    app.screen_reader = true;
+    assert!(
+        app.cursor_should_be_visible(),
+        "the caret shows in the editor"
+    );
+    app.run_command(Command::ViewBookmarks);
+    assert!(app.list_picker.is_some());
+    assert!(
+        !app.cursor_should_be_visible(),
+        "the caret stays hidden behind View Bookmarks"
+    );
+    app.dismiss_list_picker();
+    assert!(
+        app.cursor_should_be_visible(),
+        "and returns with the picker closed"
+    );
 }

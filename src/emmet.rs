@@ -412,7 +412,7 @@ pub fn expand(abbr: &str, indent: &str, profile: Profile) -> Option<(String, usi
         out: String::new(),
         caret: None,
     };
-    r.render_all(&nodes, None, 0, 1)?;
+    r.render_all(&nodes, None, 0, Counter::FIRST)?;
     if r.out.is_empty() {
         return None;
     }
@@ -921,10 +921,12 @@ impl Parser<'_> {
     /// the repetition index.
     fn ident(&mut self) -> String {
         let start = self.pos;
-        while self
-            .peek()
-            .is_some_and(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '$' | ':' | '!'))
-        {
+        while self.peek().is_some_and(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(c, '-' | '_' | '$' | ':' | '!')
+                // A numbering modifier, `$@-` or `$@3` (#1108).
+                || (c == '@' && self.pos > start && self.src[self.pos - 1] == '$')
+        }) {
             self.pos += 1;
         }
         self.src[start..self.pos].iter().collect()
@@ -1086,7 +1088,7 @@ pub fn wrap(
         out: String::new(),
         caret: None,
     };
-    r.render_all(&nodes, None, 0, 1)?;
+    r.render_all(&nodes, None, 0, Counter::FIRST)?;
     (!r.out.is_empty()).then_some(r.out)
 }
 
@@ -1408,6 +1410,19 @@ fn implicit_tag(parent: Option<&str>) -> &'static str {
     }
 }
 
+/// Where an element sits in the repetition that numbers it: the `index`th
+/// of `count` copies. `$@-` counts down from `count`, so `$` needs both.
+#[derive(Clone, Copy)]
+struct Counter {
+    index: usize,
+    count: usize,
+}
+
+impl Counter {
+    /// An element outside any repetition: the first of one.
+    const FIRST: Counter = Counter { index: 1, count: 1 };
+}
+
 struct Renderer<'a> {
     indent: &'a str,
     profile: Profile,
@@ -1425,14 +1440,21 @@ impl Renderer<'_> {
         nodes: &[Node],
         parent: Option<&str>,
         depth: usize,
-        inherited: usize,
+        inherited: Counter,
     ) -> Option<()> {
         for node in nodes {
             for i in 1..=node.repeat {
                 // A node without its own repetition numbers from the nearest
                 // repeated ancestor, so `li.item*3>a{Link $}` counts its links.
-                let index = if node.repeat > 1 { i } else { inherited };
-                self.render(node, parent, depth, index)?;
+                let at = if node.repeat > 1 {
+                    Counter {
+                        index: i,
+                        count: node.repeat,
+                    }
+                } else {
+                    inherited
+                };
+                self.render(node, parent, depth, at)?;
             }
         }
         Some(())
@@ -1443,10 +1465,10 @@ impl Renderer<'_> {
         node: &Node,
         parent: Option<&str>,
         depth: usize,
-        index: usize,
+        at: Counter,
     ) -> Option<()> {
         if node.group {
-            return self.render_all(&node.children, parent, depth, index);
+            return self.render_all(&node.children, parent, depth, at);
         }
         if node.bare_text {
             self.out.push_str(&self.indent.repeat(depth));
@@ -1458,7 +1480,7 @@ impl Renderer<'_> {
         // A text node is its text on its own line, as Emmet lays out
         // `p>{Click }+a{here}+{ to continue}` (#1197).
         if node.is_text_only() {
-            let text = number(node.text.as_deref().unwrap_or(""), index);
+            let text = number(node.text.as_deref().unwrap_or(""), at);
             self.out.push_str(&self.indent.repeat(depth));
             self.out.push_str(&text);
             self.out.push('\n');
@@ -1467,7 +1489,7 @@ impl Renderer<'_> {
         let name = if node.name.is_empty() {
             implicit_tag(parent).to_string()
         } else {
-            number(&node.name, index)
+            number(&node.name, at)
         };
         let void = VOID_ELEMENTS.contains(&name.as_str());
         // A void element has nowhere to put content, so `img>span` would
@@ -1486,21 +1508,23 @@ impl Renderer<'_> {
             self.out.push_str(" href=\"\"");
         }
         if let Some(id) = &node.id {
-            self.out.push_str(&format!(" id=\"{}\"", number(id, index)));
+            self.out.push_str(&format!(" id=\"{}\"", number(id, at)));
         }
         if !node.classes.is_empty() {
-            let classes: Vec<String> = node.classes.iter().map(|c| number(c, index)).collect();
+            let classes: Vec<String> = node.classes.iter().map(|c| number(c, at)).collect();
             let key = if jsx { "className" } else { "class" };
             self.out
                 .push_str(&format!(" {key}=\"{}\"", classes.join(" ")));
         }
         for (k, v) in &node.attrs {
+            // A name numbers like a value does: `[data-$@-]` (#1108).
+            let k = number(k, at);
             let k = match (jsx, k.as_str()) {
                 (true, "class") => "className",
                 (true, "for") => "htmlFor",
-                _ => k,
+                _ => k.as_str(),
             };
-            let v = number(v, index).replace('"', "&quot;");
+            let v = number(v, at).replace('"', "&quot;");
             self.out.push_str(&format!(" {k}=\"{v}\""));
         }
 
@@ -1527,15 +1551,15 @@ impl Renderer<'_> {
             self.out.push_str(&pad);
         } else if !node.children.is_empty() {
             self.out.push('\n');
-            self.render_all(&node.children, Some(&name), depth + 1, index)?;
+            self.render_all(&node.children, Some(&name), depth + 1, at)?;
             self.out.push_str(&pad);
         } else {
             let own = node
                 .per_line
                 .as_ref()
-                .and_then(|lines| lines.get(index.saturating_sub(1)))
+                .and_then(|lines| lines.get(at.index.saturating_sub(1)))
                 .cloned();
-            let text = own.or_else(|| node.text.as_deref().map(|t| number(t, index)));
+            let text = own.or_else(|| node.text.as_deref().map(|t| number(t, at)));
             if text.as_deref().unwrap_or("").is_empty() && self.caret.is_none() {
                 self.caret = Some(self.out.len());
             }
@@ -1548,10 +1572,12 @@ impl Renderer<'_> {
     }
 }
 
-/// Substitute `$` runs with `index`, zero-padded to the run's length —
-/// `item$` gives `item1`, `item$$$` gives `item001`. A `$` with no
-/// repetition still numbers, because `div.item$` is `item1`.
-fn number(s: &str, index: usize) -> String {
+/// Substitute `$` runs with the element's number, zero-padded to the run's
+/// length: `item$` gives `item1`, `item$$$` gives `item001`. A `$` with no
+/// repetition still numbers, because `div.item$` is `item1`. Emmet's
+/// modifiers follow the run (#1108): `$@-` counts down, `$@N` starts at N,
+/// and `$@-N` counts down to N.
+fn number(s: &str, at: Counter) -> String {
     if !s.contains('$') {
         return s.to_string();
     }
@@ -1565,7 +1591,29 @@ fn number(s: &str, index: usize) -> String {
                 i += 1;
             }
             let width = i - start;
-            out.push_str(&format!("{index:0width$}"));
+            let mut value = at.index;
+            if chars.get(i) == Some(&'@') {
+                i += 1;
+                let down = chars.get(i) == Some(&'-');
+                if down {
+                    i += 1;
+                }
+                let digits = i;
+                while chars.get(i).is_some_and(char::is_ascii_digit) {
+                    i += 1;
+                }
+                let base = chars[digits..i]
+                    .iter()
+                    .collect::<String>()
+                    .parse::<usize>()
+                    .unwrap_or(1);
+                value = if down {
+                    base.saturating_add(at.count.saturating_sub(at.index))
+                } else {
+                    base.saturating_add(at.index.saturating_sub(1))
+                };
+            }
+            out.push_str(&format!("{value:0width$}"));
         } else {
             out.push(chars[i]);
             i += 1;
@@ -1719,6 +1767,57 @@ mod tests {
             ex("li#row$$$*2"),
             "<li id=\"row001\"></li>\n<li id=\"row002\"></li>\n"
         );
+    }
+
+    /// #1108: `$@-` counts down, `$@N` starts at N, `$@-N` counts down to
+    /// N, in text, attribute values and names alike. The modifier was left
+    /// in the text (`Step 1@-`) and made a class or id expand to nothing.
+    #[test]
+    fn numbering_modifiers_count_down_and_start_where_asked() {
+        let lis = |items: &[&str]| -> String { items.iter().map(|i| format!("{i}\n")).collect() };
+        assert_eq!(
+            ex("li{Step $@-}*3"),
+            lis(&["<li>Step 3</li>", "<li>Step 2</li>", "<li>Step 1</li>"])
+        );
+        assert_eq!(
+            ex("li[data-i=$@-]*2"),
+            lis(&["<li data-i=\"2\"></li>", "<li data-i=\"1\"></li>"])
+        );
+        // Attribute names number too.
+        assert_eq!(
+            ex("li[data-$@-]*2"),
+            lis(&["<li data-2=\"\"></li>", "<li data-1=\"\"></li>"])
+        );
+        assert_eq!(
+            ex("li[data-$=x]*2"),
+            lis(&["<li data-1=\"x\"></li>", "<li data-2=\"x\"></li>"])
+        );
+        assert_eq!(ex("li{$$@-}*2"), lis(&["<li>02</li>", "<li>01</li>"]));
+        assert_eq!(
+            ex("li.item$@-*3"),
+            lis(&[
+                "<li class=\"item3\"></li>",
+                "<li class=\"item2\"></li>",
+                "<li class=\"item1\"></li>",
+            ])
+        );
+        assert_eq!(
+            ex("li#id$@5*2"),
+            lis(&["<li id=\"id5\"></li>", "<li id=\"id6\"></li>"])
+        );
+        assert_eq!(ex("h$@2*2"), lis(&["<h2></h2>", "<h3></h3>"]));
+        assert_eq!(
+            ex("li.a$@-3*2"),
+            lis(&["<li class=\"a4\"></li>", "<li class=\"a3\"></li>"])
+        );
+        // A child numbers from its repeated parent, modifier and all.
+        let out = ex("ul>li*3>a{Item $@3}");
+        for n in 3..=5 {
+            assert!(out.contains(&format!(">Item {n}</a>")), "{out}");
+        }
+        assert!(!out.contains('@'), "{out}");
+        // Outside a repetition, `$@-` is still the first of one.
+        assert_eq!(ex("p{$@-}"), "<p>1</p>\n");
     }
 
     #[test]

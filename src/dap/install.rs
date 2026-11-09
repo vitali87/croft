@@ -187,13 +187,17 @@ fn resolve_node_via_login_shell() -> Option<String> {
 /// captured stdout, `None` on timeout or spawn failure.
 fn run_bounded(program: &str, args: &[&str], timeout: Duration) -> Option<String> {
     use std::io::Read;
-    let mut child = Command::new(program)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
+    // A program written a moment ago (a test's stand-in interpreter) is "Text
+    // file busy" while another thread's forked child still holds its write
+    // descriptor; that read as "no version" instead of waiting it out.
+    let mut child = crate::review_ops::spawn_retrying_busy(
+        Command::new(program)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null()),
+    )
+    .ok()?;
     let mut stdout = child.stdout.take()?;
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {

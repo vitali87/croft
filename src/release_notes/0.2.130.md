@@ -1,0 +1,1 @@
+fix: Accepting a completion no longer swallows the characters after the word when the server re-asked while you typed: the `)` after `PR` stayed only for the first letter, and one more character went per further letter typed (clangd and other servers that cap their lists).

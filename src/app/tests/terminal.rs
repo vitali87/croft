@@ -5015,6 +5015,7 @@ fn the_terminal_image_yields_to_an_open_context_menu() {
     app.context_menu = Some(ContextMenu {
         crumb: None,
         scroll: Default::default(),
+        submenu_scroll: Default::default(),
         origin: (l.cell_x, l.cell_y),
         items: vec![
             MenuEntry::Item {
@@ -8033,4 +8034,18 @@ fn a_command_with_no_output_keeps_the_panes_problems() {
     app.watch_published_panes.insert(pane);
     assert!(!app.apply_build_scan(pane, Some(&cwd), "tsc --watch", "a.c:1:1: error: old\n"));
     assert!(app.apply_build_scan(pane, Some(&cwd), "make", "b.c:1:1: error: new\n"));
+}
+
+#[test]
+fn a_bracketed_paste_into_the_terminal_find_bar_lands_at_the_caret() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Terminal);
+    app.open_terminal_find();
+    app.terminal_find_set_query(String::from("ac"));
+    app.terminal_find.as_mut().unwrap().set_caret(1);
+    app.handle_paste("b\n");
+    let find = app.terminal_find.as_ref().unwrap();
+    assert_eq!(find.query, "abc");
+    assert_eq!(find.caret(), 2, "the caret stays after what was pasted");
 }

@@ -270,6 +270,9 @@ const SECONDARY_SIDEBAR_WIDTH: u16 = 30;
 /// it), and stays within the single top row (no overlap with editor content).
 const LAYOUT_ICON_CELLS_W: u16 = 2;
 const LAYOUT_ICON_CELLS_H: u16 = 1;
+/// Cells the three layout icons take at the right end of the top row: three
+/// icons, a one-column gap after the first two and a one-column right pad.
+const LAYOUT_ICONS_W: u16 = (LAYOUT_ICON_CELLS_W + 1) * 3;
 
 /// Which edge the primary side bar (and the activity bar that flanks it) dock
 /// to. VS Code's "Primary Side Bar Position". Persisted via `crate::prefs`.
@@ -336,6 +339,17 @@ struct PendingSelectionRanges {
     seq: u64,
     presses: usize,
     positions: Vec<(u32, u32)>,
+}
+
+/// Where a row of Bookmarks: View Bookmarks points: the tab holding the
+/// mark (its editor group by depth-first index, then its index in that
+/// group), the file it shows and the 1-based line.
+#[derive(Clone, Debug)]
+struct BookmarkTarget {
+    group: usize,
+    tab: usize,
+    path: PathBuf,
+    line: usize,
 }
 
 /// Pre-Zen visibility snapshot, restored verbatim when Zen Mode is toggled
@@ -1538,6 +1552,17 @@ enum MenuAction {
         line: u32,
         col: u32,
     },
+    /// Editor gutter: toggle a bookmark on 1-based `line`. The gutter menu has
+    /// no cursor to act on, so the line rides the action; the label reads
+    /// "Toggle Bookmark" either way, as the Bookmarks extension's does.
+    ToggleBookmarkAt {
+        line: usize,
+    },
+    /// Editor gutter: jump to the next bookmark in the open file, wrapping at
+    /// the end. Not line-scoped, so it rides the menu as a command.
+    NextBookmark,
+    /// Editor gutter: mirror of [`MenuAction::NextBookmark`] walking upwards.
+    PreviousBookmark,
     /// Editor gutter: toggle a breakpoint on 1-based `line`. Built from a
     /// glyph-margin right-click; the label reads "Add Breakpoint" or "Remove
     /// Breakpoint" depending on whether one already sits on that line, but both
@@ -1790,6 +1815,9 @@ fn shortcut_for(action: &MenuAction) -> Option<&'static str> {
         MenuAction::ToggleBreakpointAt { .. } => Some("F9"),
         MenuAction::EditBreakpointConditionAt { .. } => Some("⇧F9"),
         MenuAction::EditLogpointAt { .. } => Some("⇧⌥F9"),
+        MenuAction::ToggleBookmarkAt { .. } => Some("⌃⌥⇧K"),
+        MenuAction::NextBookmark => Some("⌃⌥."),
+        MenuAction::PreviousBookmark => Some("⌃⌥,"),
         MenuAction::AskNavigatorAt { .. } => Some("⌘K Q"),
         MenuAction::AskNavigatorSelection { .. } => Some("⌘K Q"),
         MenuAction::AskNavigatorAboutCapture => Some("n"),
@@ -2821,8 +2849,12 @@ struct ContextMenu {
     crumb: Option<usize>,
     /// The first top-level row on screen: a menu taller than the terminal
     /// (a big folder's breadcrumb picker) scrolls to keep the highlight in
-    /// view. Kept by [`scroll_for`](Self::scroll_for).
+    /// view. Kept by `scroll_for`.
     scroll: std::cell::Cell<usize>,
+    /// The first child row on screen inside the open submenu, driven by the
+    /// wheel (`wheel_active`) and kept in range by
+    /// render_context_menu.
+    submenu_scroll: std::cell::Cell<usize>,
 }
 
 impl ContextMenu {
@@ -2837,6 +2869,7 @@ impl ContextMenu {
             target_dir,
             crumb: None,
             scroll: Default::default(),
+            submenu_scroll: Default::default(),
         }
     }
 
@@ -2866,8 +2899,199 @@ impl ContextMenu {
         }
     }
 
-    /// The first top-level row shown when `visible` rows fit: the previous
-    /// offset, moved only as far as keeps `selected` on screen.
+    /// Move the cursor one selectable row up/down within the active level and
+    /// report whether it actually moved. Unlike [`move_cursor`](Self::move_cursor)
+    /// the caller learns the difference between a real step and hitting an end
+    /// (or a run of non-selectable rows), so a wheel notch that cannot move
+    /// the highlight can pan the view instead of dragging it.
+    fn step_cursor(&mut self, down: bool) -> bool {
+        let n = self.level_entries().len();
+        let mut i = self.level_selected();
+        while let Some(next) = if down {
+            (i + 1 < n).then_some(i + 1)
+        } else {
+            i.checked_sub(1)
+        } {
+            i = next;
+            if self.level_entries()[i].is_selectable() {
+                self.set_level_selected(i);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// The rows the open submenu's panel can paint, given its height.
+    fn submenu_visible(&self, height: u16) -> usize {
+        height.saturating_sub(2) as usize
+    }
+
+    /// Scroll the open submenu's panel by `notches` rows (positive = down),
+    /// clamped so its last page is not scrolled past. The submenu paints from
+    /// its own top offset, so it pans independently of the parent panel.
+    fn scroll_submenu(&mut self, notches: i32, visible: usize) -> bool {
+        let Some(parent) = self.open_submenu else {
+            return false;
+        };
+        let len = match self.items.get(parent) {
+            Some(MenuEntry::Submenu { items, .. }) => items.len(),
+            _ => return false,
+        };
+        let max = len.saturating_sub(visible.max(1));
+        let cur = self.submenu_scroll.get().min(max);
+        let next = if notches >= 0 {
+            cur.saturating_add(notches.unsigned_abs() as usize)
+        } else {
+            cur.saturating_sub(notches.unsigned_abs() as usize)
+        }
+        .min(max);
+        if next == cur {
+            return false;
+        }
+        self.submenu_scroll.set(next);
+        true
+    }
+
+    /// Keep the submenu's view offset in range and the highlighted child on
+    /// screen, given the rows the panel can paint. Mirrors
+    /// `scroll_for` for the top-level panel.
+    fn submenu_scroll_for(&self, visible: usize) -> usize {
+        let mut top = self.submenu_scroll.get();
+        if visible > 0 {
+            if self.submenu_selected < top {
+                top = self.submenu_selected;
+            } else if self.submenu_selected >= top + visible {
+                top = self.submenu_selected + 1 - visible;
+            }
+            let len = self
+                .open_submenu
+                .and_then(|p| match self.items.get(p) {
+                    Some(MenuEntry::Submenu { items, .. }) => Some(items.len()),
+                    _ => None,
+                })
+                .unwrap_or(0);
+            top = top.min(len.saturating_sub(visible));
+        }
+        self.submenu_scroll.set(top);
+        top
+    }
+
+    /// Scroll the active level with the wheel.
+    ///
+    /// The wheel walks the highlight through the level exactly like Up/Down
+    /// do, so the selection always stays visible and Enter still fires what
+    /// the user sees. When the highlight cannot step any further (both ends,
+    /// or nothing selectable below), the view offset itself moves — so a
+    /// clipped panel still pans instead of swallowing the notch. visible is
+    /// the row count the caller can paint at the active level.
+    fn wheel_active(&mut self, notches: i32, visible: usize) {
+        if notches == 0 {
+            return;
+        }
+        let down = notches > 0;
+        let steps = notches.unsigned_abs() as usize;
+        for _ in 0..steps {
+            if self.step_cursor(down) {
+                continue;
+            }
+            if self.open_submenu.is_some() {
+                self.scroll_submenu(if down { 1 } else { -1 }, visible);
+            } else {
+                let max = self.items.len().saturating_sub(visible.max(1));
+                let cur = self.scroll.get().min(max);
+                let next = if down {
+                    cur.saturating_add(1)
+                } else {
+                    cur.saturating_sub(1)
+                }
+                .min(max);
+                self.scroll.set(next);
+            }
+        }
+    }
+
+    /// Page the active level by pages screens (positive = down), one
+    /// PgDn/PgUp. The highlight jumps a whole visible page at a time — as in
+    /// VS Code's menus — skipping non-selectable rows, and the panel offset
+    /// follows it via scroll_for / submenu_scroll_for. A page of a level
+    /// that fits entirely just puts the cursor on the first / last entry.
+    fn page_active(&mut self, pages: i32, visible: usize) {
+        if pages == 0 {
+            return;
+        }
+        let down = pages > 0;
+        let entries = self.level_entries();
+        let n = entries.len();
+        if n == 0 {
+            return;
+        }
+        // A page is at least one row even in a one-row-tall panel.
+        let step = visible.max(1);
+        let cur = self.level_selected().min(n - 1);
+        // Walk step selectable rows in the requested direction; if the
+        // level runs out first, land on its last / first selectable row.
+        let mut idx = cur;
+        let mut moved = 0;
+        let mut scan = cur;
+        while moved < step {
+            let next = if down {
+                if scan + 1 >= n {
+                    break;
+                }
+                scan + 1
+            } else {
+                match scan.checked_sub(1) {
+                    Some(v) => v,
+                    None => break,
+                }
+            };
+            scan = next;
+            if entries[next].is_selectable() {
+                idx = next;
+                moved += 1;
+            }
+        }
+        if moved == 0 {
+            return;
+        }
+        self.set_level_selected(idx);
+        // Keep the view offset in step with the highlight so the panel pages
+        // with it rather than leaving the cursor off screen.
+        if self.open_submenu.is_some() {
+            self.submenu_scroll_for(visible);
+        } else {
+            self.scroll_for(visible);
+        }
+    }
+
+    /// Jump the active level's highlight to its first / last selectable row
+    /// (Home / End), skipping headers and dividers. The panel offset follows
+    /// through scroll_for / submenu_scroll_for.
+    fn jump_active(&mut self, to_end: bool, visible: usize) {
+        let n = self.level_entries().len();
+        if n == 0 {
+            return;
+        }
+        let found = if to_end {
+            (0..n)
+                .rev()
+                .find(|&i| self.level_entries()[i].is_selectable())
+        } else {
+            (0..n).find(|&i| self.level_entries()[i].is_selectable())
+        };
+        let Some(idx) = found else {
+            return;
+        };
+        self.set_level_selected(idx);
+        if self.open_submenu.is_some() {
+            self.submenu_scroll_for(visible);
+        } else {
+            self.scroll_for(visible);
+        }
+    }
+
+    /// The first top-level row shown when visible rows fit: the previous
+    /// offset, moved only as far as keeps selected on screen.
     fn scroll_for(&self, visible: usize) -> usize {
         let mut top = self.scroll.get();
         if visible > 0 {
@@ -3788,6 +4012,8 @@ pub struct App {
     /// Indentation guides (#129), VS Code `editor.guides.indentation`: on by
     /// default, pushed to every editor by the per-frame focus sync.
     indent_guides_enabled: bool,
+    /// Home walks back one wrapped row per press (`home_walks_wrapped_rows`).
+    home_walks_rows: bool,
     /// Bracket-pair colorization (#131): on by default, pushed to every
     /// editor by the per-frame focus sync like the indent guides.
     bracket_colors_enabled: bool,
@@ -3849,6 +4075,16 @@ pub struct App {
     /// Whether the sweep may run unasked (#256): `auto`, `on` or `off`.
     /// Read at startup; an unrecognised value behaves as `auto`.
     problems_project_scope: String,
+    /// What gcc/clang-shaped build messages count their column in
+    /// (`build_column_unit`), applied when a scan installs its rows.
+    build_column_unit: crate::build_matchers::ColumnUnit,
+    /// The PROBLEMS entry Go to Next/Previous Problem last opened, as (its
+    /// file, line, column, place in the walked list) plus where that left
+    /// the caret (row, column). Repeating the command from that caret steps
+    /// from this entry, not from the caret: an entry past its line's end
+    /// leaves the caret clamped short of it, which compared as still ahead
+    /// and was picked again, and entries sharing a position were skipped.
+    last_problem_jump: Option<(PathBuf, u32, u32, usize, usize, usize)>,
     /// Signals that this workspace is too large for `auto` to run the sweep
     /// unasked (#256). Sent from the sweep's worker, since deciding it is a
     /// whole-workspace walk.
@@ -3990,6 +4226,10 @@ pub struct App {
     drop_to_local: bool,
     is_remote: bool,
     context_menu: Option<ContextMenu>,
+    /// The type-to-filter state of an open breadcrumb picker: the typed text
+    /// and the picker's full, unfiltered rows. Reset whenever a picker opens
+    /// (`show_crumb_picker`) and read only while `context_menu.crumb` is set.
+    crumb_filter: (String, Vec<MenuEntry>),
     prompt: Option<Prompt>,
     fs_watch: FsWatch,
     /// One extra watcher per SECONDARY workspace root (#147), sharing the
@@ -4526,6 +4766,22 @@ pub struct App {
     /// the user must still hear after croft has gone: a hot-exit backup a
     /// quit could not remove (#862).
     exit_notes: Vec<String>,
+    /// Where each clean exit saves the session for the next launch, one
+    /// file per workspace (`~/.local/state/croft/sessions`, see
+    /// [`crate::session_state::saved_path`]). `None` saves none, as under
+    /// test unless a test points it at a tempdir.
+    pub session_dir: Option<PathBuf>,
+    /// The saved session being read off the UI thread once the first frame
+    /// is up, and whether its tabs may come back (hot exit brought none) or
+    /// only its bookmarks.
+    saved_session: Option<(
+        std::sync::mpsc::Receiver<crate::session_state::SessionState>,
+        bool,
+    )>,
+    /// The bookmarks of files no tab holds marks for any more, on their
+    /// saved lines: what the last tab holding them left when it closed
+    /// (see [`Self::settle_bookmarks`]).
+    closed_bookmarks: std::collections::HashMap<PathBuf, std::collections::BTreeSet<usize>>,
     /// The tasks backing the open Run Task picker; the picker row `id`
     /// indexes into this list.
     run_tasks: Vec<crate::tasks::Task>,
@@ -4577,6 +4833,11 @@ pub struct App {
     /// (a press on a seam must not steal focus) and the seam-drag hit-test, for
     /// a grid of any depth.
     editor_seams: Vec<editor_layout::Seam>,
+    /// The whole editor area (every group) as the most recent render laid
+    /// it out: what `leaf_rects` splits into the groups' rects. The active
+    /// group's own `last_full_area` is only its share once the editor is
+    /// split, so a geometric hit-test must start from this instead.
+    editor_layout_area: Rect,
     /// Hit-test rectangles of the "[+]" buttons - one per terminal pane,
     /// indexed in lock-step with `terminals`. Empty when the pane is hidden
     /// or every pane is too narrow for the label.
@@ -4919,6 +5180,14 @@ pub struct App {
     /// requested: the server's edit ranges describe the line then, and the
     /// accept shifts them by what was typed or deleted since.
     completion_origin: Option<(usize, usize)>,
+    /// The caret position the latest completion request was sent at. Unlike
+    /// `completion_origin` (the session's anchor, kept across re-asks so the
+    /// reply still opens in the word) it moves with every re-ask, because a
+    /// server's ranges describe the line at that very point.
+    completion_ask_pos: Option<(usize, usize)>,
+    /// The request position of the reply the open popup's items came from:
+    /// what an accepted item's ranges are shifted from.
+    completion_items_pos: Option<(usize, usize)>,
     /// The pending completion's last reply was marked `isIncomplete` (#1529):
     /// each word edit re-asks the server, whether or not any of its old items
     /// are still on screen. Lives only while `completion_request_id` does.
@@ -5291,6 +5560,8 @@ pub struct App {
     agent_ledger_saved: (u64, std::time::Instant),
     /// The (agent, file) behind each row of the lane-file picker.
     pending_lane_picks: Vec<(String, PathBuf)>,
+    /// The tab and line behind each row of Bookmarks: View Bookmarks.
+    pending_bookmarks: Vec<BookmarkTarget>,
     /// When the running Fix with Navigator turn started (#374): the clock
     /// its PROBLEMS-row spinner runs on, and the flag that keeps the main
     /// loop repainting while it runs. `None` when no fix is streaming.
@@ -5497,6 +5768,9 @@ pub struct App {
     agent_events: std::collections::VecDeque<crate::agents::AgentEvent>,
     /// Hit rect of the status bar's agents chip; empty when no agent is seated.
     status_agents_rect: Rect,
+    /// Hit rect of the status bar's `Ln X, Col Y` readout. A click opens the
+    /// Go to Line prompt: a readout becomes a control, as in VS Code.
+    status_position_rect: Rect,
     /// User-defined problem matchers (#252): `matchers.json` (user config
     /// dir + workspace `.croft/`), batch-scanned at the FinishedCommand
     /// boundary alongside the built-in table. Swapped wholesale on reload.
@@ -6404,12 +6678,64 @@ fn welcome_note_summary_width(block_w: u16) -> u16 {
     block_w.saturating_sub(WELCOME_NOTE_GUTTER).max(1)
 }
 
+/// A note's summary wrapped to the card, its inline Markdown markers already
+/// removed (#954) so the height measure and the paint wrap the same text.
 fn wrapped_welcome_note_summary(
     note: &crate::release_notes::ReleaseNote,
     block_w: u16,
 ) -> Vec<String> {
     let w = welcome_note_summary_width(block_w);
-    wrap_cells_variable_width(note.summary, w, w)
+    let (text, _) = crate::release_notes::inline_markup(note.summary);
+    wrap_cells_variable_width(&text, w, w)
+}
+
+/// The wrapped `lines` of a note as styled lines (#954): wrapping only moves
+/// and collapses whitespace, so the non-space characters of `lines` are those
+/// of the summary's text in order, and each takes its own style back.
+fn styled_welcome_note_lines(
+    note: &crate::release_notes::ReleaseNote,
+    lines: &[String],
+    plain: Style,
+    code: Style,
+) -> Vec<ratatui::text::Line<'static>> {
+    use crate::release_notes::Inline;
+    let (text, styles) = crate::release_notes::inline_markup(note.summary);
+    let mut marks = text
+        .chars()
+        .zip(styles)
+        .filter(|(c, _)| !c.is_whitespace())
+        .map(|(_, s)| s);
+    lines
+        .iter()
+        .map(|line| {
+            let mut spans: Vec<ratatui::text::Span<'static>> = Vec::new();
+            let mut run = String::new();
+            let mut run_style = plain;
+            for c in line.chars() {
+                let style = if c.is_whitespace() {
+                    plain
+                } else {
+                    match marks.next().unwrap_or(Inline::Plain) {
+                        Inline::Plain => plain,
+                        Inline::Bold => plain.add_modifier(Modifier::BOLD),
+                        Inline::Code => code,
+                    }
+                };
+                if style != run_style && !run.is_empty() {
+                    spans.push(ratatui::text::Span::styled(
+                        std::mem::take(&mut run),
+                        run_style,
+                    ));
+                }
+                run_style = style;
+                run.push(c);
+            }
+            if !run.is_empty() {
+                spans.push(ratatui::text::Span::styled(run, run_style));
+            }
+            ratatui::text::Line::from(spans)
+        })
+        .collect()
 }
 
 fn welcome_note_row_height(note: &crate::release_notes::ReleaseNote, block_w: u16) -> u16 {
@@ -6868,6 +7194,10 @@ impl App {
             } else {
                 loaded_prefs.problems_project_scope.clone()
             },
+            build_column_unit: crate::build_matchers::ColumnUnit::from_pref(
+                &loaded_prefs.build_column_unit,
+            ),
+            last_problem_jump: None,
             test_jump_rx,
             test_jump_tx,
             timeline_fetched: None,
@@ -6881,6 +7211,7 @@ impl App {
             inline_blame_enabled: !loaded_prefs.disable_inline_blame,
             provenance_overlay: false,
             indent_guides_enabled: !loaded_prefs.disable_indent_guides,
+            home_walks_rows: loaded_prefs.home_walks_wrapped_rows,
             bracket_colors_enabled: !loaded_prefs.disable_bracket_colors,
             whitespace_mode: crate::widgets::editor::WhitespaceMode::from_pref(
                 &loaded_prefs.render_whitespace,
@@ -6973,6 +7304,7 @@ impl App {
             drop_to_local: false,
             is_remote: is_remote_session(),
             context_menu: None,
+            crumb_filter: (String::new(), Vec::new()),
             prompt: None,
             fs_watch,
             fs_watch_extra: Vec::new(),
@@ -7142,6 +7474,9 @@ impl App {
             hot_exit_consumed: Vec::new(),
             hot_exit_unremoved: Vec::new(),
             exit_notes: Vec::new(),
+            session_dir: data_dir.as_deref().map(|dir| dir.join("sessions")),
+            saved_session: None,
+            closed_bookmarks: std::collections::HashMap::new(),
             run_tasks: Vec::new(),
             last_task: None,
             pending_terminal_warning: false,
@@ -7153,6 +7488,7 @@ impl App {
             terminal_height: None,
             splitter_drag: None,
             editor_seams: Vec::new(),
+            editor_layout_area: Rect::default(),
             sidebar_splitter_x: None,
             terminal_splitter_y: None,
             terminal_add_buttons: Vec::new(),
@@ -7358,6 +7694,7 @@ impl App {
             agents: crate::agents::AgentTable::load(&crate::agents::agents_path()),
             agent_events: std::collections::VecDeque::new(),
             status_agents_rect: Rect::default(),
+            status_position_rect: Rect::default(),
             matchers,
             watch_set,
             task_matcher_by_pane: std::collections::HashMap::new(),
@@ -7467,6 +7804,8 @@ impl App {
             file_finder_index_dirty: false,
             completion_request_id: None,
             completion_origin: None,
+            completion_ask_pos: None,
+            completion_items_pos: None,
             completion_incomplete: false,
             completion_reask_due: false,
             completion_ask_due: None,
@@ -7559,6 +7898,7 @@ impl App {
             agent_ledger_store: (!cfg!(test)).then(agent_ledger_store_path),
             agent_ledger_saved: (0, std::time::Instant::now()),
             pending_lane_picks: Vec::new(),
+            pending_bookmarks: Vec::new(),
             problems_fix_started: None,
             http_run: None,
             http_environment: None,
@@ -8994,7 +9334,14 @@ impl App {
     /// it can re-Show the caret after the OSC-1337 image emit only when the
     /// editor would have shown it this frame.
     fn cursor_should_be_visible(&self) -> bool {
-        if self.context_menu.is_some() || self.prompt.is_some() || !self.cursor_visible_phase() {
+        // A list picker (View Bookmarks, Quick Fix, ...) is the thing being
+        // typed into; the editor's caret behind it would only point at text it
+        // is not about to edit.
+        if self.context_menu.is_some()
+            || self.prompt.is_some()
+            || self.list_picker.is_some()
+            || !self.cursor_visible_phase()
+        {
             return false;
         }
         let editor_caret = if self.editor.diff.is_some() {
@@ -10726,6 +11073,10 @@ impl App {
                     format!("No completions match '{prefix}' ({server_count} from server)");
             }
         } else {
+            // Only now do the popup's items come from this reply: a reply
+            // that returned early above left the older items on screen, and
+            // those still shift from their own request.
+            self.completion_items_pos = self.completion_ask_pos;
             self.completion_popup = Some(popup);
         }
         true
@@ -10902,6 +11253,7 @@ impl App {
         });
         self.completion_request_id = Some(id);
         self.completion_origin = Some((self.editor.cursor_row, self.editor.cursor_col));
+        self.completion_ask_pos = self.completion_origin;
         self.completion_incomplete = false;
         self.completion_reask_due = false;
         self.completion_ask_due = None;
@@ -11120,6 +11472,9 @@ impl App {
         }
         if rect_contains(icons.customize, col, row) {
             return Some("Customize Layout");
+        }
+        if self.editor.tab_list_button_at(col, row) {
+            return Some("Show All Open Tabs");
         }
         // Activity bar: always visible, so it is checked regardless of which
         // sidebar view is open.
@@ -12433,16 +12788,27 @@ impl App {
             Some(m) => m.scan_batch(output),
             None => self.matchers.scan_batch(output, cmd),
         };
-        self.install_build_diags(pane, cwd, diags)
+        let tabstop = crate::build_matchers::tabstop_from_command(cmd);
+        self.install_build_diags(pane, cwd, diags, tabstop)
     }
 
     /// Install `diags` as pane `pane`'s PROBLEMS contribution (#119/#252).
+    /// The gcc/clang columns are converted here (`build_column_unit`, with
+    /// `tabstop` for a tab), so a watch task's batches get the same
+    /// conversion as a finished command's scan, and each row gets it once.
     fn install_build_diags(
         &mut self,
         pane: u64,
         cwd: Option<&Path>,
-        diags: Vec<crate::build_matchers::BuildDiag>,
+        mut diags: Vec<crate::build_matchers::BuildDiag>,
+        tabstop: usize,
     ) -> bool {
+        crate::build_matchers::convert_columns(
+            &mut diags,
+            cwd.unwrap_or(self.workspace_root()),
+            self.build_column_unit,
+            tabstop,
+        );
         let had_old = self
             .build_diag_files_by_pane
             .get(&pane)
@@ -13246,7 +13612,41 @@ impl App {
         let mut menu = ContextMenu::flat(origin, items, self.tree.root.clone());
         menu.selected = selected;
         menu.crumb = Some(i);
+        self.crumb_filter = (String::new(), menu.items.clone());
         self.context_menu = Some(menu);
+    }
+
+    /// Re-derive a breadcrumb picker's rows from `crumb_filter`: the rows
+    /// whose label contains the typed text (case-insensitive), keeping the
+    /// highlighted row when it survives and otherwise starting from the top.
+    fn apply_crumb_filter(&mut self) {
+        let Some(menu) = self.context_menu.as_mut() else {
+            return;
+        };
+        let (text, all) = &self.crumb_filter;
+        let kept = menu.items.get(menu.selected).and_then(|e| match e {
+            MenuEntry::Item { label, .. } => Some(label.clone()),
+            _ => None,
+        });
+        let needle = text.trim().to_lowercase();
+        menu.items = all
+            .iter()
+            .filter(|e| match e {
+                MenuEntry::Item { label, .. } => {
+                    needle.is_empty() || label.to_lowercase().contains(&needle)
+                }
+                _ => needle.is_empty(),
+            })
+            .cloned()
+            .collect();
+        menu.selected = kept
+            .and_then(|k| {
+                menu.items
+                    .iter()
+                    .position(|e| matches!(e, MenuEntry::Item { label, .. } if *label == k))
+            })
+            .unwrap_or(0);
+        menu.scroll.set(0);
     }
 
     /// A file picked from a breadcrumb picker opens as a Quick Open pick does.
@@ -13282,7 +13682,10 @@ impl App {
     /// The scope-header lines to pin as sticky scroll: the enclosing symbols of
     /// the top visible line whose header has scrolled above the viewport,
     /// outermost first, capped. Empty when the feature does not apply (welcome
-    /// screen, preview tab, no outline, or nothing scrolled off).
+    /// screen, preview tab, no outline, or nothing scrolled off). The header
+    /// is the symbol's name line (its `selectionRange`), not where its range
+    /// starts: a decorated Python `def` or `class` starts at `@route(...)`,
+    /// which names nothing and could be pinned over the `class` line (#940).
     fn build_sticky_lines(&self) -> Vec<u32> {
         let Some(path) = self.editor.path.as_deref() else {
             return Vec::new();
@@ -13297,7 +13700,7 @@ impl App {
         let symbols = self.outline.symbols();
         breadcrumb_symbol_chain(symbols, top, 0)
             .into_iter()
-            .map(|i| symbols[i].range_start_line)
+            .map(|i| symbols[i].line)
             .filter(|&l| l < top)
             .take(STICKY_SCROLL_MAX)
             .collect()
@@ -14925,6 +15328,7 @@ impl App {
         self.context_menu = Some(ContextMenu {
             crumb: None,
             scroll: Default::default(),
+            submenu_scroll: Default::default(),
             origin,
             items: self.customize_layout_items(),
             selected,
@@ -15328,6 +15732,7 @@ impl App {
         self.context_menu = Some(ContextMenu {
             crumb: None,
             scroll: Default::default(),
+            submenu_scroll: Default::default(),
             origin,
             items: items.into_iter().map(MenuEntry::from).collect(),
             selected,
@@ -15734,6 +16139,149 @@ impl App {
         self.editor.cursor_col = col.min(max_col);
         self.editor.ensure_cursor_col_visible();
         Ok(())
+    }
+
+    /// Go to the next (or previous) entry of the PROBLEMS list from the
+    /// caret: build messages and diagnostics together, files in the panel's
+    /// order and each file's entries by position, wrapping at the ends. The
+    /// entry under the caret is skipped, so repeating the command walks the
+    /// list. Works from the terminal pane too, which is the point after a
+    /// build: the caret jumps into the editor at the message's position.
+    fn go_to_problem(&mut self, forward: bool) {
+        use crate::lsp::manager::DiagnosticSeverity;
+        let here = self.editor.path.clone();
+        let cur = (self.editor.cursor_row as u32, self.editor.cursor_col as u32);
+        let mut list: Vec<(PathBuf, crate::widgets::problems::ProblemItem, u32)> = Vec::new();
+        // The walk keeps the panel's order, which does not depend on which
+        // file is open: only the open file's UTF-16 columns can be turned
+        // into characters, so ordering by converted columns reshuffled a
+        // file once it opened, and a step from the remembered entry then
+        // passed over the rows that had moved ahead of it.
+        for g in self.problems.groups() {
+            for item in &g.items {
+                // Compare in characters, as the caret counts: an LSP column
+                // is UTF-16, and only the open file's text is at hand.
+                let ccol = if item.col_utf16 && here.as_ref() == Some(&g.path) {
+                    self.editor
+                        .utf16_col_to_char_pub(item.line as usize, item.col)
+                        as u32
+                } else {
+                    item.col
+                };
+                list.push((g.path.clone(), item.clone(), ccol));
+            }
+        }
+        if list.is_empty() {
+            self.status = String::from("No problems");
+            return;
+        }
+        let key = |e: &(PathBuf, crate::widgets::problems::ProblemItem, u32)| {
+            (e.0.clone(), e.1.line, e.2)
+        };
+        // Still where the last jump left the caret: step from that entry
+        // (by its place in the list when it is still there, else by its
+        // position), whatever the clamped caret compares as.
+        let from_last = self
+            .last_problem_jump
+            .as_ref()
+            .filter(|(p, _, _, _, row, col)| {
+                here.as_ref() == Some(p)
+                    && self.editor.cursor_row == *row
+                    && self.editor.cursor_col == *col
+            })
+            .and_then(|(p, line, col, at, _, _)| {
+                let same = |e: &(PathBuf, crate::widgets::problems::ProblemItem, u32)| {
+                    &e.0 == p && e.1.line == *line && e.1.col == *col
+                };
+                list.get(*at)
+                    .filter(|e| same(e))
+                    .map(|_| *at)
+                    .or_else(|| list.iter().position(same))
+            });
+        let idx = if let Some(at) = from_last {
+            if forward {
+                (at + 1) % list.len()
+            } else {
+                (at + list.len() - 1) % list.len()
+            }
+        } else {
+            match here {
+                None => {
+                    if forward {
+                        0
+                    } else {
+                        list.len() - 1
+                    }
+                }
+                Some(p) => {
+                    let at = (p, cur.0, cur.1);
+                    if forward {
+                        list.iter().position(|e| key(e) > at).unwrap_or(0)
+                    } else {
+                        list.iter()
+                            .rposition(|e| key(e) < at)
+                            .unwrap_or(list.len() - 1)
+                    }
+                }
+            }
+        };
+        // An entry whose file no longer opens (deleted since the build) is
+        // passed over in the walk's direction, so it cannot hold every
+        // repeat on itself; only when none opens is the failure reported.
+        let mut idx = idx;
+        let mut tried = 0;
+        let (path, item) = loop {
+            let (path, item, _) = list[idx].clone();
+            let opened = if item.col_utf16 {
+                self.open_at_utf16(&path, item.line, item.col)
+            } else {
+                self.open_at(&path, item.line as usize, item.col as usize)
+            };
+            match opened {
+                Ok(()) => break (path, item),
+                Err(e) => {
+                    tried += 1;
+                    if tried == list.len() {
+                        self.status = format!("Open failed: {e}");
+                        return;
+                    }
+                    idx = if forward {
+                        (idx + 1) % list.len()
+                    } else {
+                        (idx + list.len() - 1) % list.len()
+                    };
+                }
+            }
+        };
+        self.last_problem_jump = Some((
+            path.clone(),
+            item.line,
+            item.col,
+            idx,
+            self.editor.cursor_row,
+            self.editor.cursor_col,
+        ));
+        let kind = match item.severity {
+            DiagnosticSeverity::Error => "error",
+            DiagnosticSeverity::Warning => "warning",
+            _ => "info",
+        };
+        let msg: String = item
+            .message
+            .lines()
+            .next()
+            .unwrap_or("")
+            .chars()
+            .take(120)
+            .collect();
+        let name = path.file_name().map(|n| n.to_string_lossy().into_owned());
+        self.status = format!(
+            "Problem {}/{} ({}{}): {kind}: {msg}",
+            idx + 1,
+            list.len(),
+            name.unwrap_or_default(),
+            format_args!(":{}", item.line + 1),
+        );
     }
 
     fn open_at(&mut self, path: &Path, row: usize, col: usize) -> Result<()> {
@@ -17520,11 +18068,16 @@ impl App {
         // Everything on this row from the request point on shifts with it,
         // both ways: a Backspace after the request made the server's end
         // reach past the word and swallow the `)` after it.
-        let shift: isize = match self.completion_origin {
+        // The shift runs from where the reply's own request was sent, not
+        // from the session's anchor: a re-ask answers for the caret as it was
+        // then, and counting from the anchor again took the letters typed
+        // before it twice, swallowing that many characters after the word.
+        let asked_at = self.completion_items_pos.or(self.completion_origin);
+        let shift: isize = match asked_at {
             Some((r, c)) if r == row => caret as isize - c as isize,
             _ => 0,
         };
-        let origin_col = self.completion_origin.map_or(caret, |(_, c)| c);
+        let origin_col = asked_at.map_or(caret, |(_, c)| c);
         let moved = |c: usize| -> usize {
             if c >= origin_col {
                 (c as isize + shift).max(0) as usize
@@ -17614,7 +18167,10 @@ impl App {
     ) -> Option<crate::widgets::editor::TextSpanEdit> {
         let (row, caret) = (self.editor.cursor_row, self.editor.cursor_col);
         let word = self.editor.word_before_cursor().chars().count();
-        let origin = self.completion_origin.filter(|&(r, _)| r == row);
+        let origin = self
+            .completion_items_pos
+            .or(self.completion_origin)
+            .filter(|&(r, _)| r == row);
         let text = item.insert_text.as_ref().unwrap_or(&item.label);
         (!item.is_snippet).then(|| crate::widgets::editor::TextSpanEdit {
             start: (row, caret.saturating_sub(word)),
@@ -17816,6 +18372,7 @@ impl App {
         };
         let id = lsp.request_completion(path, line, character, CompletionTrigger::Incomplete);
         self.completion_request_id = Some(id);
+        self.completion_ask_pos = Some((self.editor.cursor_row, self.editor.cursor_col));
     }
 
     /// After `c` is typed, open completion as VS Code does (#929): a
@@ -18358,15 +18915,16 @@ impl App {
                         .add_modifier(Modifier::BOLD),
                 );
                 let lines = wrapped_welcome_note_summary(note, inner_w_actual);
-                for (line_idx, line) in lines.iter().enumerate() {
+                let code_style = row_style.fg(self.theme.ui(crate::markdown::CODE));
+                let styled = styled_welcome_note_lines(note, &lines, row_style, code_style);
+                for (line_idx, line) in styled.iter().enumerate() {
                     let line_y = row_y + line_idx as u16;
                     if line_y >= last_row {
                         break;
                     }
-                    let clipped: String = line.chars().take(summary_w as usize).collect();
                     frame
                         .buffer_mut()
-                        .set_string(summary_x, line_y, clipped, row_style);
+                        .set_line(summary_x, line_y, line, summary_w);
                 }
                 row_y = row_y.saturating_add(lines.len().max(1) as u16);
             }
@@ -18452,7 +19010,7 @@ impl App {
         let w = LAYOUT_ICON_CELLS_W;
         let stride = w + 1; // one-column gap between icons
         // Three icons + a one-column right pad.
-        let needed = stride * 3;
+        let needed = LAYOUT_ICONS_W;
         if row.height == 0 || row.width < needed {
             return;
         }
@@ -19392,6 +19950,7 @@ impl App {
         self.context_menu = Some(ContextMenu {
             crumb: None,
             scroll: Default::default(),
+            submenu_scroll: Default::default(),
             origin,
             items,
             selected: 0,
@@ -21525,6 +22084,7 @@ impl App {
             ed.pdf_viewer_enabled = pdf_on;
             ed.csv_viewer_enabled = csv_on;
             ed.show_indent_guides = self.indent_guides_enabled;
+            ed.home_walks_rows = self.home_walks_rows;
             ed.show_bracket_colors = self.bracket_colors_enabled;
             ed.provenance_overlay = self.provenance_overlay;
             ed.whitespace_mode = whitespace_mode_in(langs, ws_global, editor_scope_id(ed));
@@ -21539,6 +22099,7 @@ impl App {
                 ed.pdf_viewer_enabled = pdf_on;
                 ed.csv_viewer_enabled = csv_on;
                 ed.show_indent_guides = self.indent_guides_enabled;
+                ed.home_walks_rows = self.home_walks_rows;
                 ed.show_bracket_colors = self.bracket_colors_enabled;
                 ed.provenance_overlay = self.provenance_overlay;
                 ed.whitespace_mode = whitespace_mode_in(langs, ws_global, editor_scope_id(ed));
@@ -22126,6 +22687,68 @@ impl App {
         self.split_editor_dir(editor_layout::SplitDir::Horizontal, true);
     }
 
+    /// Wheel-scroll the inactive split group under the pointer, if any.
+    ///
+    /// inactive_dfs_index_at hit-tests EditorTabs::last_full_area — the rect
+    /// a group recorded during its last render. That is stale for one frame
+    /// after focus moves, and worse, a group that has never painted since the
+    /// split was created has Rect::default(), so the wheel misses it
+    /// entirely (focused left → right pane never scrolled). So: use the
+    /// recorded rect when it actually contains the cell, and otherwise fall
+    /// back to the geometric layout (leaf_rects), excluding the active leaf,
+    /// which is the authority for where each group sits on screen right now.
+    ///
+    /// Returns true when a group was found and scrolled. Focus is never moved.
+    fn scroll_inactive_group_at(&mut self, col: u16, row: u16, notches: i32) -> bool {
+        if !self.editor_layout.is_split() {
+            return false;
+        }
+        let target = self
+            .editor_layout
+            .inactive_dfs_index_at(col, row)
+            .or_else(|| {
+                let area = self.editor_layout_area;
+                if area.width == 0 || area.height == 0 {
+                    return None;
+                }
+                let active = self.editor_layout.active_dfs_index();
+                self.editor_layout
+                    .leaf_rects(area, EDITOR_SPLIT_MIN)
+                    .iter()
+                    .enumerate()
+                    .position(|(i, r)| i != active && rect_contains(*r, col, row))
+            });
+        let Some(dfs) = target else {
+            return false;
+        };
+        // Same depth-first order as inactive_groups_mut, minus the active
+        // leaf — see collect_inactive_mut.
+        let active = self.editor_layout.active_dfs_index();
+        let inactive_idx = if dfs > active { dfs - 1 } else { dfs };
+        if let Some(group) = self
+            .editor_layout
+            .inactive_groups_mut()
+            .get_mut(inactive_idx)
+        {
+            // A PDF page step is a synchronous rasterise, so a background
+            // split's PDF coalesces a wheel burst exactly like the focused one
+            // (see wheel_pdf_page), stamped after the render.
+            let ed = group.active_editor_mut();
+            let pdf_doc = (ed.diff.is_none() && ed.pdf_page().is_some()).then(|| ed.path.clone());
+            if let Some(doc) = pdf_doc {
+                if pdf_wheel_cooling(self.last_pdf_wheel.as_ref(), notches, &doc) {
+                    return true;
+                }
+                group.wheel_scroll_active(notches);
+                self.last_pdf_wheel = Some((std::time::Instant::now(), notches.signum(), doc));
+                return true;
+            }
+            group.wheel_scroll_active(notches);
+            return true;
+        }
+        false
+    }
+
     /// Move keyboard focus to the editor group in the given physical
     /// column (`true` = left, `false` = right). Hoists the active group
     /// through `editor_layout` so the focused group is always `editor`, keeping
@@ -22185,6 +22808,8 @@ impl App {
         if !self.editor_layout.is_split() || !self.editor.is_blank_initial() {
             return;
         }
+        // The marks its last tab left go before the group does.
+        self.settle_bookmarks();
         // The focused group is empty; drop it and promote a surviving group to
         // become the new active editor. Evict the right slot's image so it
         // can't ghost after the column disappears.
@@ -22815,7 +23440,22 @@ impl App {
             // into `self.editor`; every other group lives in `editor_layout`.
             // Lay the leaves out and paint each at its rect (depth-first order),
             // reporting the active group's rect so popups anchor there.
+            self.editor_layout_area = editor_area;
             let rects = self.editor_layout.leaf_rects(editor_area, EDITOR_SPLIT_MIN);
+            // The layout icons sit over the right end of the editor area's top
+            // row; any group's tab strip that reaches it stops short of them.
+            let icons_left = if editor_area.width >= LAYOUT_ICONS_W {
+                editor_area.x + editor_area.width - LAYOUT_ICONS_W
+            } else {
+                u16::MAX
+            };
+            let reserve = |r: Rect| -> u16 {
+                if r.y == editor_area.y {
+                    (r.x + r.width).saturating_sub(icons_left).min(r.width)
+                } else {
+                    0
+                }
+            };
             if self.scrubber.is_some() && self.scrub_for != self.editor.path {
                 self.rebuild_scrub_view();
             }
@@ -22834,6 +23474,7 @@ impl App {
                     rects[active_idx] = ed_rect;
                 }
                 let active_area = rects[active_idx];
+                self.editor.set_tab_reserved_right(reserve(active_area));
                 frame.render_widget(&mut self.editor, active_area);
                 let inactive_rects: Vec<Rect> = rects
                     .iter()
@@ -22848,6 +23489,7 @@ impl App {
                     .zip(inactive_rects)
                 {
                     group.hover_pointer = pointer;
+                    group.set_tab_reserved_right(reserve(rect));
                     frame.render_widget(group, rect);
                 }
                 // Every boundary in the grid is a draggable seam (one per
@@ -22875,6 +23517,7 @@ impl App {
                         .style(Style::default().bg(self.theme.editor_bg())),
                     full_strip,
                 );
+                self.editor.set_tab_reserved_right(reserve(ed_rect));
                 frame.render_widget(&mut self.editor, ed_rect);
                 self.editor_seams.clear();
                 self.update_editor_image_overlay(0, ed_rect);
@@ -22882,6 +23525,7 @@ impl App {
                 self.paint_minimap(frame, img_rect);
                 ed_rect
             } else {
+                self.editor.set_tab_reserved_right(reserve(editor_area));
                 frame.render_widget(&mut self.editor, editor_area);
                 self.editor_seams.clear();
                 self.update_editor_image_overlay(0, editor_area);
@@ -23932,6 +24576,7 @@ impl App {
         self.status_eol_rect = Rect::default();
         self.status_language_rect = Rect::default();
         self.status_agents_rect = Rect::default();
+        self.status_position_rect = Rect::default();
         if status_h > 0 && right_total > 0 && right_total <= status_rect.width {
             let rx = status_rect.right() - right_total;
             if self.status_message_rect.right() > rx {
@@ -23967,8 +24612,8 @@ impl App {
             // shade up from the transient's dim gray, │ dividers between, and
             // a hover fill on the clickable segments (indices 1..=5) when the
             // pointer rests on them — same affordance as the activity bar.
-            // Ln/Col (index 0) is a readout, not a control, so it never
-            // hovers. Hit rects recorded in the same pass.
+            // Ln/Col (index 0) opens Go to Line, so it hovers like the rest.
+            // Hit rects recorded in the same pass.
             let seg_style = Style::default().fg(match self.theme.surfaces() {
                 Some(s) => s.muted(),
                 None => self.theme.ui(Color::Rgb(0xc9, 0xd2, 0xe3)),
@@ -23989,15 +24634,15 @@ impl App {
                     width: widths[i],
                     height: 1,
                 };
-                let hovered = i > 0
-                    && self
-                        .pointer_cell
-                        .is_some_and(|(pc, pr)| rect_contains(r, pc, pr));
+                let hovered = self
+                    .pointer_cell
+                    .is_some_and(|(pc, pr)| rect_contains(r, pc, pr));
                 right.push(Span::styled(
                     text.clone(),
                     if hovered { hover_style } else { seg_style },
                 ));
                 match i {
+                    0 => self.status_position_rect = r,
                     1 => self.status_indent_rect = r,
                     2 => self.status_encoding_rect = r,
                     3 => self.status_eol_rect = r,
@@ -24131,6 +24776,7 @@ impl App {
         if self.focus == Pane::Editor
             && self.context_menu.is_none()
             && self.prompt.is_none()
+            && self.list_picker.is_none()
             && self.cursor_visible_phase()
         {
             let pos = if self.editor.diff.is_some() {
@@ -24197,12 +24843,32 @@ impl App {
         // The top-level panel; the open submenu's parent row stays highlighted.
         let top = menu.scroll_for(clipped.height.saturating_sub(2) as usize);
         self.render_menu_panel(frame, clipped, &menu.items, menu.selected, top, grad);
+        // A breadcrumb picker shows what has been typed on its top border.
+        if menu.crumb.is_some() && !self.crumb_filter.0.is_empty() {
+            let text = if menu.items.is_empty() {
+                format!(" No match: {} ", self.crumb_filter.0)
+            } else {
+                format!(" Filter: {} ", self.crumb_filter.0)
+            };
+            let room = clipped.width.saturating_sub(4) as usize;
+            let shown: String = text.chars().take(room).collect();
+            frame.buffer_mut().set_string(
+                clipped.x + 2,
+                clipped.y,
+                shown,
+                Style::default()
+                    .fg(self.theme.ui(Color::White))
+                    .bg(self.theme.ui(Color::Rgb(0x1e, 0x1e, 0x1e)))
+                    .add_modifier(Modifier::BOLD),
+            );
+        }
         // Float the open submenu's panel beside its parent.
         if let Some(sub_rect) = self.submenu_rect()
             && let Some(MenuEntry::Submenu { items, .. }) =
                 menu.open_submenu.and_then(|p| menu.items.get(p))
         {
-            self.render_menu_panel(frame, sub_rect, items, menu.submenu_selected, 0, grad);
+            let sub_top = menu.submenu_scroll_for(menu.submenu_visible(sub_rect.height));
+            self.render_menu_panel(frame, sub_rect, items, menu.submenu_selected, sub_top, grad);
         }
     }
 
@@ -26134,6 +26800,13 @@ impl App {
                 self.undo_close_terminal();
                 true
             }
+            // Cmd+K Cmd+M (Ctrl+K Ctrl+M off macOS): View Bookmarks. Needs the
+            // trailing Cmd, so plain `Cmd+K M` below still maximizes the
+            // terminal pane.
+            KeyCode::Char(c) if plain && cmd_held && c.eq_ignore_ascii_case(&'m') => {
+                self.open_bookmark_picker();
+                true
+            }
             // Cmd+K Shift+W: reopen the most recently closed editor tab
             // (VS Code "Reopen Closed Editor"; ⇧W pairs with Cmd+W the way
             // ⇧T pairs with the terminal close). Matched case-insensitively
@@ -26586,6 +27259,7 @@ impl App {
         }
         let capture =
             self.macro_recording.is_some() && !self.macro_replaying && self.focus == Pane::Editor;
+        let palette_before = self.command_palette.is_some();
         // Esc Esc leaves Zen Mode (#1585), counting only Escapes in the
         // editor that closed or cleared nothing: one that dismisses a popup
         // or a selection is that, not half of the pair.
@@ -26596,6 +27270,8 @@ impl App {
             && key.kind == KeyEventKind::Press;
         let before = zen_esc.then(|| self.esc_fingerprint());
         let result = self.recording_file_switches(|app| app.handle_key_inner(key));
+        // A line Enter only indented is cleared once the caret leaves it.
+        self.trim_auto_indents();
         if leader_armed {
             let chord = self.screencast.take_chord_step();
             self.screencast
@@ -26614,7 +27290,9 @@ impl App {
         // is dropped, producing a macro that replays a focus change and then
         // silently loses its payload.
         if capture && self.macro_recording.is_some() {
-            if self.focus == Pane::Editor {
+            if palette_before || self.command_palette.is_some() {
+                self.hold_palette_macro_key(key, palette_before);
+            } else if self.focus == Pane::Editor {
                 self.record_macro_key(key);
             } else {
                 // The issue asks for skipped keys to be logged rather than
@@ -27558,7 +28236,23 @@ impl App {
                     self.open_search_hit(&hit);
                 }
             }
-            KeyCode::Backspace if self.search.backspace() => {
+            // The caret keys (#1729), as in every input row: Left/Right/
+            // Home/End move inside the focused field, Delete removes ahead,
+            // and Ctrl/Cmd/Alt makes Left/Right/Backspace/Delete walk by a word.
+            KeyCode::Left => self.search.move_caret(|t, c| {
+                crate::widgets::line_edit::caret_left(t, c, key_walks_by_word(key))
+            }),
+            KeyCode::Right => self.search.move_caret(|t, c| {
+                crate::widgets::line_edit::caret_right(t, c, key_walks_by_word(key))
+            }),
+            KeyCode::Home => self.search.move_caret(|_, _| 0),
+            KeyCode::End => self
+                .search
+                .move_caret(|t, _| crate::widgets::line_edit::char_len(t)),
+            KeyCode::Delete if self.search.delete_forward(key_walks_by_word(key)) => {
+                self.refresh_search_if_filtering();
+            }
+            KeyCode::Backspace if self.search.backspace_by(key_walks_by_word(key)) => {
                 self.refresh_search_if_filtering();
             }
             KeyCode::Up => self.search.move_up(),
@@ -29210,7 +29904,7 @@ impl App {
                     breakpoints,
                 ) {
                     Ok(session) => {
-                        self.debug_sessions.replace_with(name.clone(), session);
+                        self.adopt_debug_session(name.clone(), session, LaunchSlot::Replace);
                         self.run_debug.feedback = Some(format!("Debugging test {name}{using}"));
                         self.run_debug.feedback_is_error = false;
                         let lead = with_python_note(
@@ -29421,7 +30115,7 @@ impl App {
             breakpoints,
         ) {
             Ok(session) => {
-                self.debug_sessions.replace_with(name, session);
+                self.adopt_debug_session(name, session, LaunchSlot::Replace);
                 self.run_debug.feedback = Some(format!("Debugging test {name} (lldb)"));
                 self.run_debug.feedback_is_error = false;
                 self.status = self.with_failure_note(format!(
@@ -34877,7 +35571,7 @@ impl App {
         }
         let runner: &str = match ext.as_str() {
             "js" | "mjs" | "cjs" => "node",
-            "ts" | "tsx" => "tsx",
+            "ts" | "tsx" | "mts" | "cts" => "tsx",
             "rb" => "ruby",
             "lua" => "lua",
             "php" => "php",
@@ -37318,13 +38012,8 @@ impl App {
             }
         };
         match result {
-            Ok(mut session) => {
-                // Held until `initialized`, then pushed with the rest (#611).
-                session.set_function_breakpoints(self.function_breakpoints.clone());
-                match slot {
-                    LaunchSlot::Replace => self.debug_sessions.replace_with(&name, session),
-                    LaunchSlot::Add => self.debug_sessions.push(&name, session),
-                }
+            Ok(session) => {
+                self.adopt_debug_session(&name, session, slot);
                 let verb = match rc.request {
                     RequestKind::Launch => "Debugging",
                     RequestKind::Attach => "Attached:",
@@ -37450,7 +38139,7 @@ impl App {
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default();
-                self.debug_sessions.replace_with(name.clone(), session);
+                self.adopt_debug_session(name.clone(), session, LaunchSlot::Replace);
                 self.run_debug.feedback = Some(format!("Debugging {name}"));
                 self.run_debug.feedback_is_error = false;
                 let lead = with_python_note(format!("Debugging {name}"), note.as_deref());
@@ -37490,7 +38179,7 @@ impl App {
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default();
-                self.debug_sessions.replace_with(name.clone(), session);
+                self.adopt_debug_session(name.clone(), session, LaunchSlot::Replace);
                 self.run_debug.feedback = Some(format!("Debugging {name}"));
                 self.run_debug.feedback_is_error = false;
                 self.status =
@@ -37543,7 +38232,7 @@ impl App {
         );
         match crate::dap::session::DapSession::launch_delve(&dlv, &dir, request, breakpoints) {
             Ok(session) => {
-                self.debug_sessions.replace_with(name.to_string(), session);
+                self.adopt_debug_session(name.to_string(), session, LaunchSlot::Replace);
                 self.run_debug.feedback = Some(format!("Debugging test {name}"));
                 self.run_debug.feedback_is_error = false;
                 self.status = self.with_failure_note(format!(
@@ -37593,7 +38282,7 @@ impl App {
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default();
-                self.debug_sessions.replace_with(name.clone(), session);
+                self.adopt_debug_session(name.clone(), session, LaunchSlot::Replace);
                 self.run_debug.feedback = Some(format!("Debugging {name}"));
                 self.run_debug.feedback_is_error = false;
                 self.status =
@@ -37747,7 +38436,7 @@ impl App {
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_default();
-                self.debug_sessions.replace_with(name.clone(), session);
+                self.adopt_debug_session(name.clone(), session, LaunchSlot::Replace);
                 self.run_debug.feedback = Some(format!("Debugging {name} (lldb)"));
                 self.run_debug.feedback_is_error = false;
                 self.status =
@@ -38002,6 +38691,24 @@ impl App {
         }
         if refused && !names.is_empty() {
             self.status = String::from("This debugger does not support function breakpoints");
+        }
+    }
+
+    /// Install a freshly launched debug session, replacing the running ones
+    /// or, for a compound member, beside them. Every launch path comes
+    /// through here so the stored function breakpoints go with each new
+    /// session (held until `initialized`, then pushed with the rest): set one
+    /// and press F5 with no launch.json, and the program still pauses (#939).
+    fn adopt_debug_session(
+        &mut self,
+        name: impl Into<String>,
+        mut session: crate::dap::session::DapSession,
+        slot: LaunchSlot,
+    ) {
+        session.set_function_breakpoints(self.function_breakpoints.clone());
+        match slot {
+            LaunchSlot::Replace => self.debug_sessions.replace_with(name, session),
+            LaunchSlot::Add => self.debug_sessions.push(name, session),
         }
     }
 
@@ -40325,6 +41032,32 @@ impl App {
         };
         let purpose = prompt.purpose.clone();
         match purpose {
+            InputPurpose::GoToLine => {
+                self.close_input_prompt();
+                match value.trim().parse::<usize>() {
+                    Ok(n) if n > 0 => {
+                        // The typed line is 1-based (what the status bar shows);
+                        // goto_line_centered takes a 0-based row index. A
+                        // selection left behind would be replaced by the next
+                        // keystroke off screen, so it goes, as Ctrl+G's does.
+                        // Like Quick Open's `:line`, the jump is a Go Back
+                        // stop, and the editor takes the keys even when the
+                        // terminal had them when the status bar was clicked.
+                        if let Some(from) = self.editor.path.clone() {
+                            self.nav.record(NavLoc {
+                                path: from,
+                                row: self.editor.cursor_row,
+                                col: self.editor.cursor_col,
+                            });
+                        }
+                        self.focus_pane(Pane::Editor);
+                        self.editor.clear_selection();
+                        self.editor.goto_line_centered(n - 1);
+                        self.status = format!("Line {n}");
+                    }
+                    _ => self.status = format!("Not a line number: {}", value.trim()),
+                }
+            }
             InputPurpose::AddWatch => {
                 self.close_input_prompt();
                 self.add_watch_expression(value);
@@ -42885,6 +43618,26 @@ impl App {
         )
     }
 
+    /// The "all open tabs" list: every tab of the active group by its strip
+    /// label, the current one selected. Picking one activates it, scrolling the
+    /// strip to it.
+    fn open_tab_picker(&mut self) {
+        use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+        let rows: Vec<ListRow> = self
+            .editor
+            .tab_display_labels()
+            .into_iter()
+            .enumerate()
+            .map(|(i, label)| ListRow {
+                id: i.to_string(),
+                label,
+            })
+            .collect();
+        let mut picker = ListPicker::new(ListPurpose::OpenTab, "Open Tabs", rows);
+        picker.selected = self.editor.active_index();
+        self.open_list_picker(picker, "No open tabs");
+    }
+
     /// Act on the row chosen in the list picker.
     fn confirm_list_picker(&mut self) {
         use crate::widgets::list_picker::ListPurpose;
@@ -43255,6 +44008,14 @@ impl App {
                     );
                 }
             }
+            ListPurpose::Bookmark => {
+                // The row's own path, not one parsed back from text: a
+                // file name that is not UTF-8 would not survive the trip.
+                if let Some(target) = self.pending_bookmarks.get(index).cloned() {
+                    self.jump_to_bookmark(target);
+                }
+                self.pending_bookmarks.clear();
+            }
             ListPurpose::OutputChannel => {
                 self.output.sync();
                 self.output.select_by_name(&row.id);
@@ -43269,6 +44030,13 @@ impl App {
                 }
             }
             ListPurpose::NotebookKernel => self.choose_notebook_kernel(&row.id),
+            ListPurpose::OpenTab => {
+                if self.editor.select(index) {
+                    self.sync_open_file_poll_mtime();
+                }
+                self.focus_pane(Pane::Editor);
+                self.poke_cursor();
+            }
             ListPurpose::HttpEnvironment => {
                 self.status = if row.id.is_empty() {
                     String::from("HTTP: no environment")
@@ -47360,7 +48128,11 @@ impl App {
                 crate::install_session::InstallEvent::CanLaunch => can_launch = true,
                 crate::install_session::InstallEvent::FallbackPrompt { reason } => {
                     if let Some(dialog) = self.connect_dialog.as_mut() {
-                        dialog.set_fallback_prompt(&reason);
+                        // What a yes installs, shown before the answer (#950).
+                        dialog.set_fallback_prompt(
+                            &reason,
+                            &crate::remote::REMOTE_COMPILE_SIDE_EFFECTS,
+                        );
                     } else if let Some(session) = self.install_session.as_ref() {
                         // No dialog to ask through: decline so the installer
                         // errors out with the `croft setup-cross` guidance
@@ -48192,6 +48964,129 @@ impl App {
             sidebar_width: self.sidebar_width,
             terminal_height: self.terminal_height,
             focus_editor: self.focus == Pane::Editor,
+            // A path that is not UTF-8 cannot be a JSON key, and one such
+            // mark would fail the whole save.
+            bookmarks: self
+                .all_bookmarks()
+                .into_iter()
+                .filter(|(path, _)| path.to_str().is_some())
+                .collect(),
+            // Filled by the clean-exit save, the one a later launch may
+            // find the files changed since.
+            bookmark_text: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Every tab of every editor group: the focused tab first, then the
+    /// focused group's tabs and the other groups' in order. The order in
+    /// which a tab's copy of a file's marks counts.
+    fn editors_in_bookmark_order(&self) -> impl Iterator<Item = &Editor> + '_ {
+        std::iter::once(&*self.editor).chain(
+            std::iter::once(&self.editor)
+                .chain(self.editor_layout.inactive_groups())
+                .flat_map(|g| g.editors.iter()),
+        )
+    }
+
+    /// The tab whose copy of `path`'s marks counts: the first, in
+    /// [`Self::editors_in_bookmark_order`], that shows the file and holds
+    /// marks for it, since those follow its text; else the first that
+    /// still holds marks from showing it earlier.
+    fn bookmark_source(&self, path: &Path) -> Option<&Editor> {
+        self.editors_in_bookmark_order()
+            .find(|e| e.path.as_deref() == Some(path) && e.bookmarks.contains_key(path))
+            .or_else(|| {
+                self.editors_in_bookmark_order()
+                    .find(|e| e.bookmarks.contains_key(path))
+            })
+    }
+
+    /// The bookmarks of every tab of every editor group, keyed by file, one
+    /// set per file: each file's from [`Self::bookmark_source`]. The tabs of
+    /// a file hold the same marks (see [`Self::share_bookmarks`]), each on
+    /// its own text, so the set is never a union of their copies, which
+    /// would bring back a mark a tab cleared. A file whose tabs all closed
+    /// adds the marks they left.
+    fn all_bookmarks(
+        &self,
+    ) -> std::collections::HashMap<PathBuf, std::collections::BTreeSet<usize>> {
+        let mut all = std::collections::HashMap::new();
+        for ed in self.editors_in_bookmark_order() {
+            for path in ed.bookmarks.keys() {
+                if !all.contains_key(path)
+                    && let Some(source) = self.bookmark_source(path)
+                {
+                    all.insert(path.clone(), source.bookmarks[path].clone());
+                }
+            }
+        }
+        for (path, set) in &self.closed_bookmarks {
+            all.entry(path.clone()).or_insert_with(|| set.clone());
+        }
+        all
+    }
+
+    /// Keep the marks the tabs closed since the last call left, for each
+    /// file no open tab holds marks for, and hand a file's kept marks back
+    /// to the tabs that show it again. Run every tick, before anything
+    /// reads the marks. Returns whether a tab took marks back.
+    pub(crate) fn settle_bookmarks(&mut self) -> bool {
+        let mut released = self.editor.take_released_bookmarks();
+        for group in self.editor_layout.inactive_groups_mut() {
+            released.extend(group.take_released_bookmarks());
+        }
+        for marks in released {
+            for (path, set) in marks {
+                if !self
+                    .editors_in_bookmark_order()
+                    .any(|e| e.bookmarks.contains_key(&path))
+                {
+                    self.closed_bookmarks.insert(path, set);
+                }
+            }
+        }
+        if self.closed_bookmarks.is_empty() {
+            return false;
+        }
+        let mut taken = Vec::new();
+        let groups =
+            std::iter::once(&mut self.editor).chain(self.editor_layout.inactive_groups_mut());
+        for group in groups {
+            // A diff, image or sheet tab's rows are not the file's lines.
+            for ed in group.editors.iter_mut().filter(|e| !e.has_non_text_view()) {
+                if let Some(path) = ed.path.clone()
+                    && !ed.bookmarks.contains_key(&path)
+                    && let Some(set) = self.closed_bookmarks.get(&path)
+                {
+                    ed.adopt_bookmarks(&path, Some(set));
+                    taken.push(path);
+                }
+            }
+        }
+        for path in &taken {
+            self.closed_bookmarks.remove(path);
+        }
+        !taken.is_empty()
+    }
+
+    /// Hand saved bookmarks to every tab of every group, each taking its
+    /// file's set trimmed to the lines the file still has.
+    fn restore_bookmarks_everywhere(
+        &mut self,
+        marks: &std::collections::HashMap<PathBuf, std::collections::BTreeSet<usize>>,
+    ) {
+        if marks.is_empty() {
+            return;
+        }
+        self.closed_bookmarks
+            .retain(|path, _| !marks.contains_key(path));
+        for ed in self.editor.editors.iter_mut() {
+            ed.restore_bookmarks(marks);
+        }
+        for group in self.editor_layout.inactive_groups_mut() {
+            for ed in group.editors.iter_mut() {
+                ed.restore_bookmarks(marks);
+            }
         }
     }
 
@@ -48216,6 +49111,9 @@ impl App {
                 left.push(kept);
             }
         }
+        // Every tab is its own editor with its own marks: hand each the saved
+        // set once its file is open, trimmed to the lines the file still has.
+        self.restore_bookmarks_everywhere(&state.bookmarks);
         if state.active_tab < self.editor.tab_count() {
             self.editor.select(state.active_tab);
         }
@@ -48234,6 +49132,146 @@ impl App {
             Pane::Tree
         };
         left
+    }
+
+    /// This workspace's session file, saved at each clean exit.
+    fn saved_session_path(&self) -> Option<PathBuf> {
+        let dir = self.session_dir.as_deref()?;
+        Some(crate::session_state::saved_path(dir, self.workspace_root()))
+    }
+
+    /// Save the session for the next launch of this workspace (a clean
+    /// exit): its tabs, layout and bookmarks, without unsaved text.
+    fn save_session_for_next_launch(&mut self) -> Result<()> {
+        let Some(file) = self.saved_session_path() else {
+            return Ok(());
+        };
+        // A tab closed since the last tick still holds the only copy of
+        // its file's marks.
+        self.settle_bookmarks();
+        let mut state = self
+            .capture_session_state_with(false)
+            .without_unsaved_text();
+        // A clean exit throws unsaved edits away (the prompt asked first),
+        // and the next launch opens the file as it is on disk: a mark that
+        // moved with those edits goes back to its line there. Each mark on
+        // an open file also keeps what its line reads there, for a launch
+        // that finds the file changed since (see
+        // `SessionState::relocate_bookmarks_on_disk`).
+        for (path, set) in state.bookmarks.iter_mut() {
+            let Some(source) = self
+                .bookmark_source(path)
+                .filter(|s| s.path.as_deref() == Some(path.as_path()))
+            else {
+                continue;
+            };
+            let disk;
+            let lines: &[String] = if source.dirty {
+                let Ok(bytes) = std::fs::read(path) else {
+                    continue;
+                };
+                // Decoded as the tab decoded it, or a UTF-16 file matches no
+                // line of its buffer.
+                let (text, _, _) = source.encoding.decode(&bytes);
+                disk = crate::widgets::editor::split_into_lines(&text);
+                *set = crate::widgets::editor::carry_marks(set, &source.lines, &disk);
+                &disk
+            } else {
+                &source.lines
+            };
+            let text = set
+                .iter()
+                .filter_map(|&line| Some((line, lines.get(line.checked_sub(1)?)?.clone())))
+                .collect();
+            state.bookmark_text.insert(path.clone(), text);
+        }
+        state.bookmarks.retain(|_, set| !set.is_empty());
+        state
+            .bookmark_text
+            .retain(|path, _| state.bookmarks.contains_key(path));
+        state.save(&file)
+    }
+
+    /// Read the session the last clean exit saved on a thread of its own,
+    /// once the first frame is up, for [`Self::poll_saved_session`] to
+    /// apply. `tabs` false brings back only its bookmarks (hot exit
+    /// restored the tabs). A file saved for another workspace is ignored,
+    /// and so is a missing one: the first launch has none. The file stays,
+    /// so a crash before the next clean exit still has it.
+    fn read_saved_session(&mut self, tabs: bool) {
+        let Some(path) = self.saved_session_path() else {
+            return;
+        };
+        let root = self.workspace_root().to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        crate::startup_gate::spawn_after_first_frame(move || {
+            if let Ok(mut state) = crate::session_state::SessionState::load(&path)
+                && state.is_of(&root)
+            {
+                state.relocate_bookmarks_on_disk();
+                let _ = tx.send(state);
+            }
+        });
+        self.saved_session = Some((rx, tabs));
+    }
+
+    /// Apply the saved session once it is read (see
+    /// [`Self::read_saved_session`]). Its tabs come back only into an
+    /// editor still showing its blank first tab: a file the launch opened,
+    /// or one the user opened first, is not covered over. Returns whether
+    /// anything changed, for a redraw.
+    fn poll_saved_session(&mut self) -> bool {
+        let Some((rx, tabs)) = self.saved_session.as_ref() else {
+            return false;
+        };
+        let state = match rx.try_recv() {
+            Ok(state) => state,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.saved_session = None;
+                return false;
+            }
+        };
+        let tabs = *tabs;
+        self.saved_session = None;
+        if tabs && self.editor.is_blank_initial() && !state.tabs.is_empty() {
+            // No unsaved text, so nothing is left over to keep.
+            let _ = self.apply_session_state(&state);
+            self.sync_open_file_poll_mtime();
+        } else {
+            self.restore_bookmarks_everywhere(&state.bookmarks);
+            self.carry_saved_marks_onto_unsaved_tabs(&state.bookmarks);
+        }
+        true
+    }
+
+    /// The saved marks sit on each file's lines on disk (a clean exit saves
+    /// them there), but a tab hot exit brought back holds unsaved edits:
+    /// carry its file's marks from the file on disk onto its own lines.
+    fn carry_saved_marks_onto_unsaved_tabs(
+        &mut self,
+        marks: &std::collections::HashMap<PathBuf, std::collections::BTreeSet<usize>>,
+    ) {
+        let in_splits = self
+            .editor_layout
+            .inactive_groups_mut()
+            .into_iter()
+            .flat_map(|g| g.editors.iter_mut());
+        for ed in self.editor.editors.iter_mut().chain(in_splits) {
+            let Some(path) = ed.path.clone().filter(|_| ed.dirty) else {
+                continue;
+            };
+            let Some(set) = marks.get(&path) else {
+                continue;
+            };
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            let (text, _, _) = ed.encoding.decode(&bytes);
+            let disk = crate::widgets::editor::split_into_lines(&text);
+            let carried = crate::widgets::editor::carry_marks(set, &disk, &ed.lines);
+            ed.adopt_bookmarks(&path, Some(&carried));
+        }
     }
 
     /// Keep the xlsx cells an update relaunch could not put back (#1593)
@@ -48270,7 +49308,7 @@ impl App {
     fn restore_open_tab(
         &mut self,
         tab: &crate::session_state::OpenTabState,
-    ) -> Option<(&mut Editor, Vec<crate::widgets::editor::SheetCellEdit>)> {
+    ) -> Option<(&mut Editor, Vec<crate::sheet::SheetCellEdit>)> {
         let unsaved = tab.unsaved_text.as_deref().filter(|_| tab.dirty);
         let opened = tab
             .path
@@ -48423,6 +49461,17 @@ impl App {
         let proceed = matches!(payload.trim().to_ascii_lowercase().as_str(), "y" | "yes");
         if proceed {
             if let Some(dialog) = self.connect_dialog.as_mut() {
+                // What a yes installs must have been on screen (#950): a
+                // window too short to show it all keeps the question open.
+                if !dialog.notes.is_empty() && !dialog.notes_shown {
+                    dialog.error = Some(String::from(
+                        "Make the window taller to read what a remote compile installs, then answer",
+                    ));
+                    // Emptied, so the y typed again once it fits is a yes,
+                    // not "yy".
+                    dialog.clear_input();
+                    return;
+                }
                 dialog.set_installing();
             }
             if let Some(session) = self.install_session.as_ref() {
@@ -48777,15 +49826,85 @@ impl App {
     /// status bar. A buffer with no path on disk cannot hold marks, and says so
     /// rather than silently doing nothing.
     fn toggle_bookmark(&mut self) {
+        self.toggle_bookmark_at(self.editor.cursor_row + 1);
+    }
+
+    /// [`Self::toggle_bookmark`] for a given 1-based `line`, leaving the
+    /// cursor and scroll where they are (the gutter Ctrl+click).
+    fn toggle_bookmark_at(&mut self, line: usize) {
         if !self.editor_is_text() {
             return;
         }
-        let line = self.editor.cursor_row + 1;
-        self.status = match self.editor.toggle_bookmark() {
+        // Start from the marks the file's other tabs hold, or toggling here
+        // would hand every tab this tab's set alone.
+        self.adopt_shared_bookmarks();
+        self.status = match self.editor.toggle_bookmark_at(line) {
             Some(true) => format!("Bookmark set on line {line}"),
             Some(false) => format!("Bookmark cleared on line {line}"),
             None => String::from("Save the file before bookmarking a line"),
         };
+        if let Some(path) = self.editor.path.clone() {
+            self.share_bookmarks(&path);
+        }
+    }
+
+    /// Give the focused tab its file's marks from another tab, in any
+    /// group, when it holds none of its own: a tab opened on a file after
+    /// its marks were set starts without them.
+    fn adopt_shared_bookmarks(&mut self) {
+        // The marks a file's last tab left when it closed come back first.
+        self.settle_bookmarks();
+        let Some(path) = self.editor.path.clone() else {
+            return;
+        };
+        if self.editor.bookmarks.contains_key(&path) {
+            return;
+        }
+        let Some(source) = self.bookmark_source(&path) else {
+            return;
+        };
+        let set = &source.bookmarks[&path];
+        // A tab showing the file may hold unsaved edits this one lacks:
+        // each mark goes to the line it is on here.
+        let marks = if source.path.as_deref() == Some(path.as_path()) {
+            crate::widgets::editor::carry_marks(set, &source.lines, &self.editor.lines)
+        } else {
+            set.clone()
+        };
+        self.editor.adopt_bookmarks(&path, Some(&marks));
+    }
+
+    /// Hand `path`'s marks, as the focused tab now holds them, to every
+    /// other tab of every group that shows the file or still holds marks
+    /// for it, so a file has one set of marks: one set or cleared in a tab
+    /// is set or cleared in all of them.
+    fn share_bookmarks(&mut self, path: &Path) {
+        // The focused tab's set is the file's now; marks a closed tab left
+        // would bring back one it cleared.
+        self.closed_bookmarks.remove(path);
+        let active = self.editor.active_index();
+        let (before, rest) = self.editor.editors.split_at_mut(active);
+        let Some((source, after)) = rest.split_first_mut() else {
+            return;
+        };
+        let source: &Editor = source;
+        let marks = source.bookmarks.get(path);
+        let in_splits = self
+            .editor_layout
+            .inactive_groups_mut()
+            .into_iter()
+            .flat_map(|g| g.editors.iter_mut());
+        for ed in before.iter_mut().chain(after.iter_mut()).chain(in_splits) {
+            if ed.path.as_deref() == Some(path) {
+                // Another copy of the file, whose unsaved edits may differ
+                // from this one's: each mark goes to the line it is on there.
+                let carried =
+                    marks.map(|m| crate::widgets::editor::carry_marks(m, &source.lines, &ed.lines));
+                ed.adopt_bookmarks(path, carried.as_ref());
+            } else if ed.bookmarks.contains_key(path) {
+                ed.adopt_bookmarks(path, marks);
+            }
+        }
     }
 
     /// Jump to the next (`forward`) or previous bookmark in the open file,
@@ -48812,6 +49931,105 @@ impl App {
         };
     }
 
+    /// Bookmarks: View Bookmarks: a filterable list of every bookmark in
+    /// the open tabs of every editor group (`file:line  text of the line`),
+    /// Enter jumps to it. Only the file a tab shows counts: the marks a tab
+    /// still holds for a file it showed earlier are not of an open file.
+    fn open_bookmark_picker(&mut self) {
+        use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+        let root = self.tree.root.clone();
+        // The focused group first, so a mark it shares with another group
+        // jumps to the tab already in front of the user.
+        let active = self.editor_layout.active_dfs_index();
+        let groups = std::iter::once((active, &self.editor)).chain(
+            (0..self.editor_layout.leaf_count())
+                .filter_map(|g| Some((g, self.editor_layout.group_ref_at_dfs(g)?))),
+        );
+        // Two tabs on one file (a split, a symbol tab) list a shared mark once.
+        let mut seen = std::collections::HashSet::new();
+        let mut found: Vec<(BookmarkTarget, String)> = Vec::new();
+        for (group, tabs) in groups {
+            // A diff, image or sheet tab's rows are not the file's lines.
+            for (tab, ed) in tabs.editors.iter().enumerate() {
+                let Some(path) = ed.path.as_ref().filter(|_| !ed.has_non_text_view()) else {
+                    continue;
+                };
+                // Only lines the buffer has (see `bookmarked_lines`), and on
+                // a symbol tab only the lines of its symbol, the ones it shows.
+                for line in ed.bookmarked_lines() {
+                    if bookmark_line_shown(ed, line) && seen.insert((path.clone(), line)) {
+                        let text = ed.lines[line - 1].trim().chars().take(80).collect();
+                        let path = path.clone();
+                        found.push((
+                            BookmarkTarget {
+                                group,
+                                tab,
+                                path,
+                                line,
+                            },
+                            text,
+                        ));
+                    }
+                }
+            }
+        }
+        found.sort_by(|(a, _), (b, _)| (&a.path, a.line).cmp(&(&b.path, b.line)));
+        self.pending_bookmarks.clear();
+        let mut rows = Vec::with_capacity(found.len());
+        for (target, text) in found {
+            let shown = target.path.strip_prefix(&root).unwrap_or(&target.path);
+            rows.push(ListRow {
+                id: self.pending_bookmarks.len().to_string(),
+                label: format!("{}:{}  {text}", shown.display(), target.line),
+            });
+            self.pending_bookmarks.push(target);
+        }
+        let picker = ListPicker::new(ListPurpose::Bookmark, "Bookmarks", rows);
+        self.open_list_picker(picker, "No bookmarks (Cmd+Opt+Shift+K sets one)");
+    }
+
+    /// Enter on a View Bookmarks row: focus the editor group and the tab
+    /// that hold the mark, and put the caret on its line there, with no
+    /// selection left over for the next keystroke to type over. A tab that
+    /// closed or moved on since the list opened leaves the file to open in
+    /// that group as any jump would.
+    fn jump_to_bookmark(&mut self, target: BookmarkTarget) {
+        let BookmarkTarget {
+            group,
+            tab,
+            path,
+            line,
+        } = target;
+        if group != self.editor_layout.active_dfs_index()
+            && self.editor_layout.group_ref_at_dfs(group).is_some()
+        {
+            let current = std::mem::take(&mut self.editor);
+            self.editor = self.editor_layout.refocus_to_dfs(current, group);
+        }
+        self.hover_popup = None;
+        self.hover_diagnostic = None;
+        let same_tab = self.editor.editors.get(tab).is_some_and(|ed| {
+            ed.path.as_deref() == Some(path.as_path())
+                && !ed.has_non_text_view()
+                && bookmark_line_shown(ed, line)
+        });
+        if same_tab {
+            self.editor.select(tab);
+        } else if let Err(e) = self.editor.open_preview(&path) {
+            self.status = format!("Cannot open bookmark: {e}");
+            return;
+        } else {
+            // A tab opened here for a file another tab still shows gets
+            // that file's marks too.
+            self.adopt_shared_bookmarks();
+        }
+        self.sync_open_file_poll_mtime();
+        self.editor.jump_to_bookmark(line);
+        self.focus_pane(Pane::Editor);
+        self.poke_cursor();
+        self.status = format!("Bookmark at line {line}");
+    }
+
     /// Clear every bookmark in the open file, reporting how many went.
     fn clear_bookmarks(&mut self) {
         // Every path in (chord and palette) goes through here, so the guard
@@ -48821,6 +50039,11 @@ impl App {
             return;
         }
         let gone = self.editor.clear_bookmarks();
+        // From every tab of the file, or a copy left in another would bring
+        // the marks back with the next session.
+        if let Some(path) = self.editor.path.clone() {
+            self.share_bookmarks(&path);
+        }
         self.status = if gone == 0 {
             String::from("No bookmarks in this file")
         } else if gone == 1 {
@@ -52595,16 +53818,22 @@ impl App {
             self.status = String::from("Cmd+V: clipboard is empty");
             return;
         }
+        self.paste_str_into_search(s);
+        self.status = format!(
+            "Cmd+V: pasted into {} field",
+            search_field_name(self.search.field)
+        );
+    }
+
+    /// Paste `s` at the caret of the focused Search field, whichever it is,
+    /// for the clipboard key and the bracketed-paste event alike.
+    fn paste_str_into_search(&mut self, s: &str) {
         self.search.insert_str(s);
         // Replace text doesn't change which files match, so only re-run the
         // scan when the paste landed in a search-affecting field.
         if self.search.field != crate::widgets::search::SearchField::Replace {
             self.submit_search_query();
         }
-        self.status = format!(
-            "Cmd+V: pasted into {} field",
-            search_field_name(self.search.field)
-        );
     }
 
     fn paste_clipboard_into_editor(&mut self, text: Option<&str>) {
@@ -52719,17 +53948,12 @@ impl App {
         // (or tree) the user has since clicked into — the keystroke path is
         // already focus-gated via `match self.focus`, so paste must match it.
         if self.focus == Pane::Editor && self.editor_find.is_some() {
-            let mut new_q = self
-                .editor_find
-                .as_ref()
-                .map(|st| st.query.clone())
-                .unwrap_or_default();
-            for c in s.chars() {
-                if !c.is_control() {
-                    new_q.push(c);
-                }
-            }
-            self.editor_find_set_query(new_q);
+            // Pasted at the caret (#1729), like typing: the bar is an input
+            // line, and a middle-of-query paste must not jump to the end.
+            let text = s.to_string();
+            self.editor_find_edit_at_caret(|t, c| {
+                crate::widgets::editor_find::insert_at(t, c, &text)
+            });
             return false;
         }
         // Finder drag-and-drop into croft arrives via the host terminal as
@@ -52807,8 +54031,7 @@ impl App {
             }
         }
         if self.sidebar_view == SidebarView::Search && self.focus == Pane::Tree {
-            self.search.insert_str_into_query(s);
-            self.submit_search_query();
+            self.paste_str_into_search(s);
             self.status = format!("Pasted {} chars", s.chars().count());
             return false;
         }
@@ -52835,17 +54058,10 @@ impl App {
             }
             Pane::Terminal => {
                 if self.terminal_find.is_some() {
-                    let mut q = self
-                        .terminal_find
-                        .as_ref()
-                        .map(|st| st.query.clone())
-                        .unwrap_or_default();
-                    for c in s.chars() {
-                        if !c.is_control() {
-                            q.push(c);
-                        }
-                    }
-                    self.terminal_find_set_query(q);
+                    // At the caret, like the clipboard key (#1729).
+                    self.terminal_find_edit_at_caret(|t, at| {
+                        crate::widgets::line_edit::insert_at(t, at, s)
+                    });
                 } else {
                     self.paste_terminal_input(s.as_bytes());
                 }
@@ -53743,9 +54959,16 @@ impl App {
         // Watch publishes first: a batch replaces the pane's entries
         // wholesale, and marks the pane so the watcher's own eventual
         // FinishedCommand rescan cannot resurrect stale cycles.
+        // A batch has no command line to read `-ftabstop=` from, so its
+        // tabs count at the default stop.
         for (pane, cwd, diags) in watch_installs {
             self.watch_published_panes.insert(pane);
-            build_changed |= self.install_build_diags(pane, cwd.as_deref(), diags);
+            build_changed |= self.install_build_diags(
+                pane,
+                cwd.as_deref(),
+                diags,
+                crate::build_matchers::DEFAULT_TABSTOP,
+            );
         }
         for (pane, cwd, cmd, output) in build_scans {
             // A command that printed nothing (`cd`, `clear`) says nothing
@@ -53957,6 +55180,7 @@ impl App {
         self.context_menu = Some(ContextMenu {
             crumb: None,
             scroll: Default::default(),
+            submenu_scroll: Default::default(),
             origin,
             items: vec![
                 MenuEntry::header(header),
@@ -57354,6 +58578,66 @@ impl App {
         }
     }
 
+    /// Hold back a recorded key that opened or went into the Command Palette
+    /// (#952) until the palette closes: it then joins the macro with the rest
+    /// of that palette session, so a palette command replays whole. The
+    /// session that runs Macro: Start/Stop Recording never gets here with
+    /// its Enter, because stopping drops the recording and what it held.
+    /// One the palette was opened for without a key (a click) is dropped:
+    /// replayed without the chord, its query would be typed into the file.
+    /// So is one whose command took focus out of the editor, such as
+    /// Terminal: Focus Terminal: the click that brings it back is not
+    /// recorded, so a replay would type the keys after it into the shell.
+    fn hold_palette_macro_key(&mut self, key: crossterm::event::KeyEvent, palette_before: bool) {
+        let open_now = self.command_palette.is_some();
+        let in_editor = self.focus == Pane::Editor;
+        let Some(rec) = self.macro_recording.as_mut() else {
+            return;
+        };
+        if !palette_before {
+            // The key that opened the palette starts a session that
+            // replays; whatever an earlier one held was never closed by a
+            // key, so it has nothing to replay.
+            rec.palette_keys.clear();
+            rec.palette_keys.push(key);
+        } else if !rec.palette_keys.is_empty() {
+            rec.palette_keys.push(key);
+        } else {
+            crate::output::push(
+                "Macros",
+                crate::output::OutputLevel::Info,
+                &format!("skipped {key:?}: the palette was not opened from the keyboard"),
+            );
+        }
+        if open_now {
+            return;
+        }
+        let held = std::mem::take(&mut rec.palette_keys);
+        if in_editor {
+            for k in held {
+                rec.recorded.push_key(k);
+            }
+        } else if !held.is_empty() {
+            crate::output::push(
+                "Macros",
+                crate::output::OutputLevel::Info,
+                "skipped a palette command that left the editor: recording captures the editor pane only",
+            );
+        }
+    }
+
+    /// Drop what a palette session held for the macro once the palette has
+    /// closed without a key, as a click outside it or on a row does (#952):
+    /// a session that is never closed from the keyboard has nothing that
+    /// replays, and a later session must not pick its keys up.
+    fn drop_unkeyed_palette_macro_keys(&mut self) {
+        if self.command_palette.is_none()
+            && let Some(rec) = self.macro_recording.as_mut()
+        {
+            rec.palette_keys.clear();
+        }
+    }
+
     /// Start recording into `register` (vim `q{a-z}`) or into the unnamed
     /// last-recording slot (the palette command). Starting while already
     /// recording stops instead, so one gesture toggles.
@@ -57365,6 +58649,7 @@ impl App {
         self.macro_recording = Some(crate::macros::Recording {
             register,
             recorded: crate::macros::Macro::default(),
+            palette_keys: Vec::new(),
         });
         // One source of truth: vim's `q` branches on this, and a copy the
         // machine kept for itself drifted whenever the palette was used.
@@ -57727,6 +59012,8 @@ impl App {
                 }
             }
             Cmd::GoToNextChange => self.jump_editor_change(true),
+            Cmd::GoToNextProblem => self.go_to_problem(true),
+            Cmd::GoToPrevProblem => self.go_to_problem(false),
             Cmd::GoToPrevChange => self.jump_editor_change(false),
             Cmd::MergePrevConflict => {
                 if self.editor.merge.is_some() {
@@ -57972,6 +59259,7 @@ impl App {
             Cmd::NextBookmark => self.goto_bookmark(true),
             Cmd::PreviousBookmark => self.goto_bookmark(false),
             Cmd::ClearBookmarks => self.clear_bookmarks(),
+            Cmd::ViewBookmarks => self.open_bookmark_picker(),
             Cmd::SaveFile => self.save(),
             Cmd::SaveAs => self.open_save_as_prompt(),
             Cmd::SaveWithSudo => self.save_with_sudo(),
@@ -58268,6 +59556,20 @@ impl App {
                 }
             },
             Cmd::ReopenAsPreview => match self.editor.path.clone() {
+                // Markdown's preview is a toggle on the open tab, not a
+                // routing decision `open` makes (#1363): turn it on, as
+                // Markdown: Toggle Preview does, keeping the caret, undo
+                // history and any unsaved edits.
+                Some(_)
+                    if self.editor.language() == Some(crate::highlight::LangKind::Markdown)
+                        && !self.editor.has_non_text_view() =>
+                {
+                    if self.editor.markdown_preview.is_none() {
+                        self.toggle_markdown_preview();
+                    } else {
+                        self.status = String::from("Markdown Preview");
+                    }
+                }
                 Some(_) if self.editor.dirty => {
                     self.status =
                         String::from("Save or revert the buffer before reopening the preview");
@@ -59750,6 +61052,8 @@ impl App {
                     picker.select_next();
                 }
             }
+            (KeyCode::Home, _) => picker.select_first(),
+            (KeyCode::End, _) => picker.select_last(),
             (KeyCode::Left, _) => picker.move_cursor_left(),
             (KeyCode::Right, _) => picker.move_cursor_right(),
             (KeyCode::Backspace, _) => picker.pop_char(),
@@ -59963,6 +61267,7 @@ impl App {
         let count = crate::widgets::editor_find::count_matches(&lines, &new_query, opts);
         if let Some(state) = self.terminal_find.as_mut() {
             state.query = new_query.clone();
+            state.set_caret(new_query.chars().count());
             state.set_match_count(count, false);
             state.match_index = None;
         }
@@ -60046,47 +61351,68 @@ impl App {
         }
     }
 
+    /// Edit the terminal find query around its caret (#1729).
+    fn terminal_find_edit_at_caret(&mut self, edit: impl FnOnce(&str, usize) -> (String, usize)) {
+        let Some((text, caret)) = self.terminal_find.as_ref().map(|s| {
+            let (text, caret) = edit(&s.query, s.caret());
+            (text, caret)
+        }) else {
+            return;
+        };
+        self.terminal_find_set_query(text);
+        if let Some(s) = self.terminal_find.as_mut() {
+            s.set_caret(caret);
+        }
+    }
+
+    /// Move the terminal find caret without touching the query.
+    fn terminal_find_move_caret(&mut self, step: impl FnOnce(&str, usize) -> usize) {
+        if let Some(s) = self.terminal_find.as_mut() {
+            let at = step(&s.query, s.caret());
+            s.set_caret(at);
+        }
+    }
+
     fn handle_terminal_find_key(&mut self, key: KeyEvent) {
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        let by_word = key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER | KeyModifiers::ALT);
         match (key.code, key.modifiers) {
             (KeyCode::Esc, _) => self.close_terminal_find(),
             (KeyCode::Enter, _) | (KeyCode::F(3), _) => {
                 self.terminal_find_jump(!shift);
             }
-            (KeyCode::Backspace, _) => {
-                let mut q = self
-                    .terminal_find
-                    .as_ref()
-                    .map(|s| s.query.clone())
-                    .unwrap_or_default();
-                q.pop();
-                self.terminal_find_set_query(q);
-            }
+            // The caret keys (#1729), the same as the editor's find bar:
+            // the terminal's query is a real input line too.
+            (KeyCode::Left, _) => self.terminal_find_move_caret(|t, c| {
+                crate::widgets::editor_find::caret_left(t, c, by_word)
+            }),
+            (KeyCode::Right, _) => self.terminal_find_move_caret(|t, c| {
+                crate::widgets::editor_find::caret_right(t, c, by_word)
+            }),
+            (KeyCode::Home, _) => self.terminal_find_move_caret(|_, _| 0),
+            (KeyCode::End, _) => self.terminal_find_move_caret(|t, _| t.chars().count()),
+            (KeyCode::Delete, _) => self.terminal_find_edit_at_caret(|t, c| {
+                crate::widgets::editor_find::delete_at(t, c, by_word)
+            }),
+            (KeyCode::Backspace, _) => self.terminal_find_edit_at_caret(|t, c| {
+                crate::widgets::editor_find::delete_before(t, c, by_word)
+            }),
             (KeyCode::Char('v'), m)
                 if m.contains(KeyModifiers::CONTROL) || m.contains(KeyModifiers::SUPER) =>
             {
                 if let Some(text) = self.clipboard_text() {
-                    let mut q = self
-                        .terminal_find
-                        .as_ref()
-                        .map(|s| s.query.clone())
-                        .unwrap_or_default();
-                    for c in text.chars() {
-                        if !c.is_control() {
-                            q.push(c);
-                        }
-                    }
-                    self.terminal_find_set_query(q);
+                    self.terminal_find_edit_at_caret(|t, c| {
+                        crate::widgets::editor_find::insert_at(t, c, &text)
+                    });
                 }
             }
             (KeyCode::Char(c), m) if !m.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) => {
-                let mut q = self
-                    .terminal_find
-                    .as_ref()
-                    .map(|s| s.query.clone())
-                    .unwrap_or_default();
-                q.push(c);
-                self.terminal_find_set_query(q);
+                let typed = c.to_string();
+                self.terminal_find_edit_at_caret(|t, caret| {
+                    crate::widgets::editor_find::insert_at(t, caret, &typed)
+                });
             }
             _ => {}
         }
@@ -60688,6 +62014,14 @@ impl App {
     }
 
     fn editor_find_set_query(&mut self, new_query: String) {
+        // A whole-query replacement puts the caret after it; the caret
+        // editors below then move it where the edit left it.
+        // Assigned, not `set_caret`: that clamps to the query still in place,
+        // so a longer replacement would leave the caret inside it. Reads
+        // clamp through `caret()` once the new query is in.
+        if let Some(s) = self.editor_find.as_mut() {
+            s.caret = new_query.chars().count();
+        }
         let unchanged = self
             .editor_find
             .as_ref()
@@ -61089,22 +62423,45 @@ impl App {
             .unwrap_or(false)
     }
 
-    /// Append / edit the focused find-bar field: the replace row edits in
-    /// place, the query row re-runs the search via `editor_find_set_query`.
-    fn editor_find_edit_focused(&mut self, edit: impl FnOnce(&mut String)) {
+    /// Edit the focused find field around the caret (#1729): the query row
+    /// passes its caret through `edit`, the replace row — which has none —
+    /// always edits at its end.
+    fn editor_find_edit_at_caret(&mut self, edit: impl FnOnce(&str, usize) -> (String, usize)) {
         if self.editor_find_replace_focused() {
             if let Some(s) = self.editor_find.as_mut() {
-                edit(&mut s.replace);
+                let (text, caret) = edit(&s.replace, s.replace_caret());
+                s.replace = text;
+                s.set_replace_caret(caret);
             }
             return;
         }
-        let mut new_q = self
-            .editor_find
-            .as_ref()
-            .map(|s| s.query.clone())
-            .unwrap_or_default();
-        edit(&mut new_q);
-        self.editor_find_set_query(new_q);
+        let Some((text, caret)) = self.editor_find.as_ref().map(|s| {
+            let (text, caret) = edit(&s.query, s.caret());
+            (text, caret)
+        }) else {
+            return;
+        };
+        self.editor_find_set_query(text);
+        if let Some(s) = self.editor_find.as_mut() {
+            s.set_caret(caret);
+        }
+    }
+
+    /// Move the focused find bar's caret without touching the text. The
+    /// selection a seed put on the query is dropped, as any caret key does.
+    fn editor_find_move_caret(&mut self, step: impl FnOnce(&str, usize) -> usize) {
+        if self.editor_find_replace_focused() {
+            if let Some(s) = self.editor_find.as_mut() {
+                let at = step(&s.replace, s.replace_caret());
+                s.set_replace_caret(at);
+            }
+            return;
+        }
+        if let Some(s) = self.editor_find.as_mut() {
+            let at = step(&s.query, s.caret());
+            s.set_caret(at);
+            s.query_selected = false;
+        }
     }
 
     /// What Ctrl+F puts in the find bar: a one-line selection, else the
@@ -61192,21 +62549,10 @@ impl App {
                 .modifiers
                 .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
         if word_delete {
-            // The word before the end, with any spaces after it, as in a
-            // text field; a lone punctuation mark goes on its own.
-            self.editor_find_edit_focused(|s| {
-                let kept = s.trim_end().len();
-                let word_start = s[..kept]
-                    .char_indices()
-                    .rev()
-                    .find(|&(_, c)| !crate::widgets::editor::is_word_char(c))
-                    .map_or(0, |(i, c)| i + c.len_utf8());
-                let cut = if word_start == kept {
-                    s[..kept].char_indices().next_back().map_or(0, |(i, _)| i)
-                } else {
-                    word_start
-                };
-                s.truncate(cut);
+            // The word before the caret, as in a text field; a lone
+            // punctuation mark goes on its own.
+            self.editor_find_edit_at_caret(|text, caret| {
+                crate::widgets::editor_find::delete_before(text, caret, true)
             });
             return;
         }
@@ -61226,6 +62572,9 @@ impl App {
         let cmd_like = key
             .modifiers
             .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER);
+        let by_word = key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER | KeyModifiers::ALT);
         match (key.code, key.modifiers) {
             (KeyCode::Esc, _) => self.close_editor_find(),
             // `Cmd+Opt+Enter` (Linux: `Ctrl+Alt+Enter`) = Replace All,
@@ -61260,26 +62609,46 @@ impl App {
                     self.editor_find_jump_next();
                 }
             }
+            // The caret keys (#1729): the query is a real input line, so
+            // Left/Right/Home/End move inside it and Delete removes what
+            // lies ahead. Ctrl/Cmd/Alt with Left/Right/Delete walks by a
+            // word, as a text field does.
+            (KeyCode::Left, _) => {
+                self.editor_find_move_caret(|t, c| {
+                    crate::widgets::editor_find::caret_left(t, c, by_word)
+                });
+            }
+            (KeyCode::Right, _) => {
+                self.editor_find_move_caret(|t, c| {
+                    crate::widgets::editor_find::caret_right(t, c, by_word)
+                });
+            }
+            (KeyCode::Home, _) => self.editor_find_move_caret(|_, _| 0),
+            (KeyCode::End, _) => self.editor_find_move_caret(|t, _| t.chars().count()),
+            (KeyCode::Delete, _) => {
+                self.editor_find_edit_at_caret(|t, c| {
+                    crate::widgets::editor_find::delete_at(t, c, by_word)
+                });
+            }
             (KeyCode::Backspace, _) => {
-                self.editor_find_edit_focused(|s| {
-                    s.pop();
+                self.editor_find_edit_at_caret(|t, c| {
+                    crate::widgets::editor_find::delete_before(t, c, false)
                 });
             }
             (KeyCode::Char('v'), m)
                 if m.contains(KeyModifiers::CONTROL) || m.contains(KeyModifiers::SUPER) =>
             {
                 if let Some(text) = self.clipboard_text() {
-                    self.editor_find_edit_focused(|s| {
-                        for c in text.chars() {
-                            if !c.is_control() {
-                                s.push(c);
-                            }
-                        }
+                    self.editor_find_edit_at_caret(|t, c| {
+                        crate::widgets::editor_find::insert_at(t, c, &text)
                     });
                 }
             }
             (KeyCode::Char(c), m) if !m.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) => {
-                self.editor_find_edit_focused(|s| s.push(c));
+                let typed = c.to_string();
+                self.editor_find_edit_at_caret(|t, caret| {
+                    crate::widgets::editor_find::insert_at(t, caret, &typed)
+                });
             }
             _ => {}
         }
@@ -61691,6 +63060,18 @@ impl App {
             );
         }
         self.recording_file_switches(|app| app.handle_mouse_inner(m));
+        self.drop_unkeyed_palette_macro_keys();
+        self.trim_auto_indents();
+    }
+
+    /// Clear the indentation Enter left on a line the caret has since left
+    /// (#956), in every tab of every editor group: a key or click that
+    /// switched tabs or groups has left the line in the one it came from.
+    fn trim_auto_indents(&mut self) {
+        self.editor.trim_auto_indents(true);
+        for group in self.editor_layout.inactive_groups_mut() {
+            group.trim_auto_indents(false);
+        }
     }
 
     fn handle_mouse_inner(&mut self, m: MouseEvent) {
@@ -61724,6 +63105,57 @@ impl App {
         // that was never checked. Only the popup's keys answer it.
         if self.pending_terminal_paste.is_some() {
             return;
+        }
+        // A click on a find bar (in the editor or over a terminal) puts the
+        // caret of the row it lands on, before the pane under it sees it.
+        if matches!(m.kind, MouseEventKind::Down(MouseButton::Left))
+            && !self.modal_overlay_open()
+            && self.context_menu.is_none()
+        {
+            if self
+                .editor_find
+                .as_mut()
+                .is_some_and(|f| f.click_at(m.column, m.row))
+            {
+                // The bar takes the keys only while the editor has focus, so
+                // a click on it from the terminal or the side bar moves focus
+                // there too, or the typing after it would land elsewhere.
+                if self.focus != Pane::Editor {
+                    self.focus_pane(Pane::Editor);
+                }
+                return;
+            }
+            // The terminal find bar closes whenever the terminal loses
+            // focus, so a click on it always comes with focus already there.
+            if self
+                .terminal_find
+                .as_mut()
+                .is_some_and(|f| f.click_at(m.column, m.row))
+            {
+                return;
+            }
+        }
+        // The wheel over an editor group's tab strip scrolls its tabs.
+        if let Some(delta) = match m.kind {
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollLeft => Some(-1),
+            MouseEventKind::ScrollDown | MouseEventKind::ScrollRight => Some(1),
+            _ => None,
+        } && !self.modal_overlay_open()
+            && self.context_menu.is_none()
+        {
+            let mut scrolled = false;
+            for g in
+                std::iter::once(&mut self.editor).chain(self.editor_layout.inactive_groups_mut())
+            {
+                if g.tab_strip_contains(m.column, m.row) {
+                    g.scroll_tabs_wheel(delta);
+                    scrolled = true;
+                    break;
+                }
+            }
+            if scrolled {
+                return;
+            }
         }
         // A click on the port-detection toast's action buttons is consumed
         // before anything else; clicks elsewhere fall through to normal
@@ -61872,6 +63304,10 @@ impl App {
                 );
                 return;
             }
+            if rect_contains(self.status_position_rect, m.column, m.row) {
+                self.open_go_to_line_prompt();
+                return;
+            }
             if rect_contains(self.status_indent_rect, m.column, m.row) {
                 self.open_status_indent_menu(self.status_indent_rect.x, self.status_indent_rect.y);
                 return;
@@ -61987,6 +63423,34 @@ impl App {
                 MouseEventKind::Down(MouseButton::Right) => {
                     self.context_menu = None;
                     // fall through so the right-click below can re-open if applicable
+                }
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                    // The wheel walks the highlighted row through the level
+                    // (same as Up/Down), and pans the panel once the
+                    // highlight can move no further. Which level it drives
+                    // depends on the pointer: over the floating submenu it is
+                    // the submenu, anywhere else the top-level panel.
+                    let down = m.kind == MouseEventKind::ScrollDown;
+                    let over_submenu = self
+                        .submenu_rect()
+                        .is_some_and(|r| rect_contains(r, m.column, m.row));
+                    // Over the parent panel with a submenu open, the wheel
+                    // is the parent's: the submenu closes, as moving the
+                    // parent's highlight off its row does, and the parent
+                    // steps. Otherwise the active level steps.
+                    if !over_submenu
+                        && self
+                            .menu_rect()
+                            .is_some_and(|r| rect_contains(r, m.column, m.row))
+                        && let Some(menu) = self.context_menu.as_mut()
+                    {
+                        menu.close_submenu();
+                    }
+                    let visible = self.menu_visible_rows();
+                    if let Some(menu) = self.context_menu.as_mut() {
+                        menu.wheel_active(if down { 3 } else { -3 }, visible);
+                    }
+                    return;
                 }
                 _ => return,
             }
@@ -62587,6 +64051,7 @@ impl App {
                     self.context_menu = Some(ContextMenu {
                         crumb: None,
                         scroll: Default::default(),
+                        submenu_scroll: Default::default(),
                         origin: (m.column, m.row),
                         items,
                         selected: 0,
@@ -62751,6 +64216,7 @@ impl App {
                     self.context_menu = Some(ContextMenu {
                         crumb: None,
                         scroll: Default::default(),
+                        submenu_scroll: Default::default(),
                         origin: (m.column, m.row),
                         items,
                         selected: 0,
@@ -62855,6 +64321,18 @@ impl App {
                         String::from("Add Logpoint")
                     };
                     let mut items = vec![
+                        // Bookmarks sit above the breakpoint group: same gutter,
+                        // different tool, and the Bookmarks extension's own
+                        // labels so the chords read the same as in VS Code.
+                        (
+                            String::from("Toggle Bookmark"),
+                            MenuAction::ToggleBookmarkAt { line },
+                        ),
+                        (String::from("Next Bookmark"), MenuAction::NextBookmark),
+                        (
+                            String::from("Previous Bookmark"),
+                            MenuAction::PreviousBookmark,
+                        ),
                         (toggle_label, MenuAction::ToggleBreakpointAt { line }),
                         (cond_label, MenuAction::EditBreakpointConditionAt { line }),
                         (log_label, MenuAction::EditLogpointAt { line }),
@@ -63045,6 +64523,11 @@ impl App {
                 if in_editor && m.modifiers.contains(KeyModifiers::CONTROL) {
                     if m.modifiers.contains(KeyModifiers::SHIFT) {
                         self.nav_back();
+                    } else if let Some(line0) = self.editor.gutter_line_at(m.column, m.row) {
+                        // Ctrl+click on the gutter toggles a bookmark on that
+                        // line (a plain click there still toggles a breakpoint).
+                        self.toggle_bookmark_at(line0 + 1);
+                        self.poke_cursor();
                     } else {
                         self.trigger_definition_at(m.column, m.row);
                     }
@@ -63608,6 +65091,8 @@ impl App {
                     // Click inside one of the input boxes focuses that field.
                     if let Some(field) = self.search.field_at(m.column, m.row) {
                         self.search.focus_field(field);
+                        // A click in the text puts the caret under it.
+                        self.search.click_caret(m.column);
                         return;
                     }
                     if let Some(t) = self.search.toggle_at(m.column, m.row) {
@@ -64051,6 +65536,9 @@ impl App {
                             self.go_to_definition(path, line, col);
                         }
                         self.poke_cursor();
+                    } else if self.editor.tab_list_button_at(m.column, m.row) {
+                        self.focus_pane(Pane::Editor);
+                        self.open_tab_picker();
                     } else if let Some(idx) = self.editor.close_at(m.column, m.row) {
                         // The close cell of a pinned tab is an unpin button (it
                         // shows a thumb-tack, not the close cross), matching VS
@@ -64226,6 +65714,7 @@ impl App {
                             self.editor_click
                                 .is_double(now, m.column, m.row, m.modifiers);
                         let last_inner = self.editor.last_inner;
+                        self.editor.sync_tab_cells();
                         if let Some(diff) = self.editor.diff.as_mut() {
                             if let Some((side, row_idx, char_col)) =
                                 crate::widgets::editor::diff_hit_test(
@@ -64645,6 +66134,7 @@ impl App {
                 if in_editor {
                     if self.editor.diff.is_some() {
                         let last_inner = self.editor.last_inner;
+                        self.editor.sync_tab_cells();
                         if let Some(diff) = self.editor.diff.as_mut()
                             && let Some((_, row_idx, char_col)) =
                                 crate::widgets::editor::diff_hit_test(
@@ -64972,6 +66462,7 @@ impl App {
                     } else {
                         self.editor.scroll_down(3);
                     }
+                } else if self.scroll_inactive_group_at(m.column, m.row, 3) {
                 } else if rect_contains(self.terminal_rail_area, m.column, m.row) {
                     // The rail is its own scrollable list, like VS Code's
                     // terminal tabs. Paint clamps the offset.
@@ -65047,6 +66538,7 @@ impl App {
                     } else {
                         self.editor.scroll_up(3);
                     }
+                } else if self.scroll_inactive_group_at(m.column, m.row, -3) {
                 } else if rect_contains(self.terminal_rail_area, m.column, m.row) {
                     self.terminal_rail_scroll = self.terminal_rail_scroll.saturating_sub(1);
                 } else if let Some(idx) = terminal_hit {
@@ -68217,6 +69709,7 @@ impl App {
         if want_highlight != self.log_highlight {
             self.set_log_highlight(want_highlight);
         }
+        self.build_column_unit = crate::build_matchers::ColumnUnit::from_pref(&p.build_column_unit);
         self.auto_close_pairs = !p.disable_auto_close_pairs;
         self.editor.auto_close_pairs = self.auto_close_pairs;
         self.paste_reindent = !p.disable_paste_reindent;
@@ -68231,6 +69724,7 @@ impl App {
         self.editor.blame_enabled = self.inline_blame_enabled;
         self.indent_guides_enabled = !p.disable_indent_guides;
         self.editor.show_indent_guides = self.indent_guides_enabled;
+        self.home_walks_rows = p.home_walks_wrapped_rows;
         self.bracket_colors_enabled = !p.disable_bracket_colors;
         self.editor.show_bracket_colors = self.bracket_colors_enabled;
         self.whitespace_mode =
@@ -68238,14 +69732,17 @@ impl App {
         self.editor.whitespace_mode = self.whitespace_mode;
         self.rulers = crate::widgets::editor::normalize_rulers(&p.rulers);
         // Straight onto every open editor: the focus sync that otherwise
-        // carries it does not run per frame, so a reload would leave open
-        // tabs on the old rulers until an unrelated focus change.
+        // carries them does not run per frame, so a reload would leave open
+        // tabs on the old rulers and Home walk until an unrelated focus
+        // change.
         for ed in self.editor.editors.iter_mut() {
             ed.rulers.clone_from(&self.rulers);
+            ed.home_walks_rows = self.home_walks_rows;
         }
         for group in self.editor_layout.inactive_groups_mut() {
             for ed in group.editors.iter_mut() {
                 ed.rulers.clone_from(&self.rulers);
+                ed.home_walks_rows = self.home_walks_rows;
             }
         }
         self.line_numbers = crate::widgets::editor::LineNumbers::from_pref(&p.line_numbers);
@@ -68954,6 +70451,23 @@ impl App {
         })
     }
 
+    /// Rows the active menu level can paint: the open submenu's panel when
+    /// one is open, else the top-level panel. Shared by the wheel, PgUp/PgDn
+    /// and Home/End so every one of them pages against what is on screen.
+    fn menu_visible_rows(&self) -> usize {
+        let rect = if self
+            .context_menu
+            .as_ref()
+            .is_some_and(|m| m.open_submenu.is_some())
+        {
+            self.submenu_rect()
+        } else {
+            self.menu_rect()
+        };
+        rect.map(|r| r.height.saturating_sub(2) as usize)
+            .unwrap_or(0)
+    }
+
     /// If (x, y) hits a top-level menu row, return its index.
     fn menu_item_at(&self, x: u16, y: u16) -> Option<usize> {
         let r = self.menu_rect()?;
@@ -68980,11 +70494,45 @@ impl App {
         let MenuEntry::Submenu { items, .. } = menu.items.get(parent)? else {
             return None;
         };
-        let idx = inner_y as usize;
+        // The panel may be scrolled: the visible row maps to an entry offset
+        // by the same view offset the renderer painted from.
+        let top = menu.submenu_scroll_for(menu.submenu_visible(r.height));
+        let idx = top + inner_y as usize;
         (idx < items.len()).then_some(idx)
     }
 
     fn handle_menu_key(&mut self, key: KeyEvent) {
+        // A breadcrumb picker filters as you type (the rows are a long list
+        // of symbols, files or folders): characters narrow it, Backspace
+        // widens it, Esc clears the text before it dismisses the picker.
+        if self
+            .context_menu
+            .as_ref()
+            .is_some_and(|m| m.crumb.is_some() && m.open_submenu.is_none())
+        {
+            match key.code {
+                KeyCode::Char(c)
+                    if !key.modifiers.intersects(
+                        KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER,
+                    ) =>
+                {
+                    self.crumb_filter.0.push(c);
+                    self.apply_crumb_filter();
+                    return;
+                }
+                KeyCode::Backspace if !self.crumb_filter.0.is_empty() => {
+                    self.crumb_filter.0.pop();
+                    self.apply_crumb_filter();
+                    return;
+                }
+                KeyCode::Esc if !self.crumb_filter.0.is_empty() => {
+                    self.crumb_filter.0.clear();
+                    self.apply_crumb_filter();
+                    return;
+                }
+                _ => {}
+            }
+        }
         match key.code {
             KeyCode::Esc => {
                 // Esc backs out of an open submenu first; at the top level it
@@ -69005,6 +70553,22 @@ impl App {
             KeyCode::Down => {
                 if let Some(menu) = self.context_menu.as_mut() {
                     menu.move_cursor(true);
+                }
+            }
+            KeyCode::Home | KeyCode::End => {
+                let to_end = key.code == KeyCode::End;
+                let visible = self.menu_visible_rows();
+                if let Some(menu) = self.context_menu.as_mut() {
+                    menu.jump_active(to_end, visible);
+                }
+            }
+            KeyCode::PageUp | KeyCode::PageDown => {
+                // Page through the active level (the open submenu when the
+                // cursor is in it, else the top-level panel).
+                let down = key.code == KeyCode::PageDown;
+                let visible = self.menu_visible_rows();
+                if let Some(menu) = self.context_menu.as_mut() {
+                    menu.page_active(if down { 1 } else { -1 }, visible);
                 }
             }
             KeyCode::Left | KeyCode::Right
@@ -69900,6 +71464,22 @@ impl App {
                 self.focus_pane(Pane::Editor);
                 self.debug_edit_logpoint_line(line);
             }
+            MenuAction::ToggleBookmarkAt { line } => {
+                self.focus_pane(Pane::Editor);
+                // The clicked line (1-based), with the caret, selection and
+                // scroll left alone, as the gutter's own toggle does: moving
+                // the caret there kept the selection, which the next key
+                // then replaced off screen.
+                self.toggle_bookmark_at(line);
+            }
+            MenuAction::NextBookmark => {
+                self.focus_pane(Pane::Editor);
+                self.goto_bookmark(true);
+            }
+            MenuAction::PreviousBookmark => {
+                self.focus_pane(Pane::Editor);
+                self.goto_bookmark(false);
+            }
             MenuAction::AskNavigatorAt { line } => {
                 self.focus_pane(Pane::Editor);
                 self.open_ask_navigator((line, line), String::new());
@@ -70156,6 +71736,7 @@ impl App {
             target_dir: self.tree.root.clone(),
             crumb: None,
             scroll: Default::default(),
+            submenu_scroll: Default::default(),
         }
     }
 
@@ -70826,9 +72407,9 @@ impl App {
     /// than
     /// [`crate::hot_exit::UNREADABLE_KEPT_FOR`]. Called once, at a normal
     /// launch.
-    pub fn restore_hot_exit(&mut self) {
+    pub fn restore_hot_exit(&mut self) -> bool {
         let Some(dir) = self.hot_exit_dir.clone() else {
-            return;
+            return false;
         };
         let root = self.workspace_root().to_path_buf();
         let mut restored = 0usize;
@@ -70866,7 +72447,7 @@ impl App {
                         "Hot exit is off for this session: a backup is at its own path, {}, and could not be moved aside",
                         own.display()
                     );
-                    return;
+                    return false;
                 }
             }
         }
@@ -71022,6 +72603,7 @@ impl App {
         if !notes.is_empty() {
             self.status = notes.join("; ");
         }
+        restored > 0
     }
 
     /// Write what an unsaved-changes prompt (#862) asked about: the focused
@@ -71354,13 +72936,8 @@ impl App {
     /// freezing the TUI for one render per event. A reversal is deliberate
     /// and always passes.
     fn wheel_pdf_page(&mut self, delta: i32) {
-        const COOLDOWN: std::time::Duration = std::time::Duration::from_millis(150);
         let doc = self.editor.path.clone();
-        if let Some((at, dir, last_doc)) = &self.last_pdf_wheel
-            && *dir == delta.signum()
-            && *last_doc == doc
-            && at.elapsed() < COOLDOWN
-        {
+        if pdf_wheel_cooling(self.last_pdf_wheel.as_ref(), delta, &doc) {
             return;
         }
         let Some(cur) = self.editor.pdf_page() else {
@@ -72368,6 +73945,7 @@ impl App {
         self.context_menu = Some(ContextMenu {
             crumb: None,
             scroll: Default::default(),
+            submenu_scroll: Default::default(),
             origin: (col, row),
             items,
             selected: 0,
@@ -72392,7 +73970,7 @@ impl App {
                 label: format!(
                     "{}{}",
                     check(current == Some(lang)),
-                    crate::widgets::editor::language_label(Some(lang))
+                    crate::highlight::language_label(Some(lang))
                 ),
                 action: MenuAction::SetLanguage(Some(lang)),
             });
@@ -72448,6 +74026,18 @@ impl App {
             })
             .collect();
         self.open_status_menu(col, row, items);
+    }
+
+    /// Go to Line, opened by clicking the status bar's `Ln X, Col Y` readout.
+    /// The field is prefilled with the caret's current line, selected, so the
+    /// user can type over it or press Enter to stay put.
+    fn open_go_to_line_prompt(&mut self) {
+        use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+        let line = self.editor.cursor_row + 1;
+        self.open_input_prompt(
+            InputPrompt::new(InputPurpose::GoToLine, "Go to Line", "line number")
+                .with_value(line.to_string()),
+        );
     }
 
     /// Status-bar indentation picker, mirroring VS Code's "Select Indentation"
@@ -72519,6 +74109,7 @@ impl App {
         self.context_menu = Some(ContextMenu {
             crumb: None,
             scroll: Default::default(),
+            submenu_scroll: Default::default(),
             origin: (col, row),
             items,
             selected: 0,
@@ -77541,6 +79132,13 @@ fn is_extensions_jump_key(key: KeyEvent) -> bool {
     is_cmd_shift_letter(key, 'x')
 }
 
+/// Whether a caret or delete key walks by a word rather than a character:
+/// Ctrl, Cmd or Alt held (#1729).
+fn key_walks_by_word(key: KeyEvent) -> bool {
+    key.modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER | KeyModifiers::ALT)
+}
+
 /// `Ctrl/Cmd+Shift+M`: show the PROBLEMS tab from any pane, VS Code's
 /// "View: Focus Problems" (#852).
 fn is_show_problems_key(key: KeyEvent) -> bool {
@@ -78212,6 +79810,14 @@ fn is_indentation_to_tabs_key(key: KeyEvent) -> bool {
 /// surfaced as a command).
 fn is_trim_final_newlines_key(key: KeyEvent) -> bool {
     is_cmd_alt_shift_letter(key, 'n')
+}
+
+/// Whether `ed` shows 1-based `line`: every line of an ordinary tab, only
+/// its symbol's lines on a symbol tab (#369), where a caret elsewhere would
+/// be snapped back to the symbol's edge.
+fn bookmark_line_shown(ed: &Editor, line: usize) -> bool {
+    ed.symbol_clip()
+        .is_none_or(|(first, end)| (first..end).contains(&line.saturating_sub(1)))
 }
 
 /// `Cmd+Opt+Shift+K`: toggle a bookmark on the cursor's line (VS Code's
@@ -80025,17 +81631,10 @@ fn sheet_cell_at(view: &crate::sheet::SheetView, col: u16, row: u16) -> Option<(
     if col < g.body_x {
         return None;
     }
-    let mut x_off = 0u16;
-    for (c, w) in data.col_widths.iter().enumerate().skip(data.scroll_col) {
-        if x_off + w + 1 > g.body_w {
-            break;
-        }
-        if col >= g.body_x + x_off && col < g.body_x + x_off + w {
-            return Some((r, c));
-        }
-        x_off += w + 1;
-    }
-    None
+    crate::sheet::visible_columns(&data.col_widths, data.scroll_col, g.body_w)
+        .into_iter()
+        .find(|&(_, x_off, w)| col >= g.body_x + x_off && col < g.body_x + x_off + w)
+        .map(|(c, _, _)| (r, c))
 }
 
 /// Char-boundary helpers for the in-grid cell editor (#177): byte
@@ -80284,6 +81883,22 @@ fn scrollback_opens_as_log(rows: &[String]) -> bool {
     }
     let cut = prefix.floor_char_boundary(prefix.len().min(8192));
     crate::ansi_text::looks_like_ansi(&prefix[..cut])
+}
+
+/// Whether a PDF wheel step of `delta` in `doc` falls inside the cooldown of
+/// the last one (`last`: when, which direction, which document): a
+/// same-direction repeat in the same document within 150 ms is dropped so a
+/// momentum flick costs one rasterise, not one per event. A reversal or
+/// another document always passes.
+fn pdf_wheel_cooling(
+    last: Option<&(std::time::Instant, i32, Option<PathBuf>)>,
+    delta: i32,
+    doc: &Option<PathBuf>,
+) -> bool {
+    const COOLDOWN: std::time::Duration = std::time::Duration::from_millis(150);
+    last.is_some_and(|(at, dir, last_doc)| {
+        *dir == delta.signum() && last_doc == doc && at.elapsed() < COOLDOWN
+    })
 }
 
 fn rect_contains(r: Rect, x: u16, y: u16) -> bool {
@@ -82119,8 +83734,12 @@ pub fn run(
         }
     } else {
         // A normal launch brings back what hot exit kept of this workspace
-        // when croft last ended without a clean quit (#862).
-        app.restore_hot_exit();
+        // when croft last ended without a clean quit (#862). The session
+        // the last clean exit saved brings back its tabs when hot exit had
+        // none, and its bookmarks either way; it is read once the first
+        // frame is up, off this thread.
+        let restored = app.restore_hot_exit();
+        app.read_saved_session(!restored);
     }
     crate::startup_trace::mark("session restored");
     // `--zen`: hide the Explorer sidebar and terminal so the editor fills the
@@ -82380,6 +83999,10 @@ pub fn run(
             }
             crate::remote::RemoteOutcome::Exited => return Ok(()),
         }
+    }
+    // A clean exit: what the next launch of this workspace opens with.
+    if let Err(e) = app.save_session_for_next_launch() {
+        eprintln!("croft: could not save the session: {e:#}");
     }
     Ok(())
 }
@@ -82932,7 +84555,10 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         app.tick_hot_exit(std::time::Instant::now());
         let highlights_changed = app.poll_highlights();
         // Pictures baked off the UI thread (#1973) go up as they land.
-        let images_changed = app.poll_chrome_bake() | app.poll_welcome_bake();
+        let images_changed =
+            app.poll_chrome_bake() | app.poll_welcome_bake() | app.poll_saved_session();
+        // A closed tab's bookmarks are kept, and come back with its file.
+        let bookmarks_changed = app.settle_bookmarks();
         let live_run_changed =
             app.tick_live_run() | app.sync_markdown_scroll() | app.tick_minimap();
         app.tick_code_lens();
@@ -83090,6 +84716,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || auto_save_changed
             || highlights_changed
             || images_changed
+            || bookmarks_changed
             || live_run_changed
             || code_lens_changed
             || ws_symbols_changed

@@ -800,6 +800,41 @@ pub enum LangKind {
     Svelte,
 }
 
+/// Display name for a language mode, matching VS Code's status-bar labels.
+/// `None` is a buffer with no recognised grammar.
+pub fn language_label(lang: Option<LangKind>) -> &'static str {
+    match lang {
+        None => "Plain Text",
+        Some(LangKind::Rust) => "Rust",
+        Some(LangKind::Python) => "Python",
+        Some(LangKind::JavaScript) => "JavaScript",
+        Some(LangKind::TypeScript) => "TypeScript",
+        Some(LangKind::Tsx) => "TypeScript JSX",
+        Some(LangKind::Json) => "JSON",
+        Some(LangKind::Xml) => "XML",
+        Some(LangKind::Toml) => "TOML",
+        Some(LangKind::Yaml) => "YAML",
+        Some(LangKind::Markdown) => "Markdown",
+        Some(LangKind::Go) => "Go",
+        Some(LangKind::Html) => "HTML",
+        Some(LangKind::Css) => "CSS",
+        Some(LangKind::Bash) => "Shell Script",
+        Some(LangKind::C) => "C",
+        Some(LangKind::Cpp) => "C++",
+        Some(LangKind::Lua) => "Lua",
+        Some(LangKind::Ql) => "CodeQL",
+        Some(LangKind::Dbscheme) => "CodeQL Database Scheme",
+        Some(LangKind::Java) => "Java",
+        Some(LangKind::Ruby) => "Ruby",
+        Some(LangKind::CSharp) => "C#",
+        Some(LangKind::Sql) => "SQL",
+        Some(LangKind::Make) => "Makefile",
+        Some(LangKind::Dockerfile) => "Dockerfile",
+        Some(LangKind::Vue) => "Vue",
+        Some(LangKind::Svelte) => "Svelte",
+    }
+}
+
 /// The bare tree-sitter grammar handle for `kind` — the parser the
 /// expand-selection node-ancestry fallback walks (#254). Kept beside
 /// `build_config` so a new grammar joins highlighting and selection
@@ -840,7 +875,9 @@ pub fn lang_for_extension(ext: &str) -> Option<LangKind> {
         "rs" => LangKind::Rust,
         "py" | "pyi" | "pyw" => LangKind::Python,
         "js" | "mjs" | "cjs" | "jsx" => LangKind::JavaScript,
-        "ts" => LangKind::TypeScript,
+        // `.mts` / `.cts` are TypeScript's ES module and CommonJS files, as
+        // `.mjs` / `.cjs` are JavaScript's (#1162).
+        "ts" | "mts" | "cts" => LangKind::TypeScript,
         "tsx" => LangKind::Tsx,
         "json" | "jsonc" | "code-workspace" => LangKind::Json,
         "xml" | "xsd" | "xsl" | "xslt" | "svg" | "plist" => LangKind::Xml,
@@ -2206,6 +2243,8 @@ def f() -> Config:\n\
         assert_eq!(lang_for_extension("rs"), Some(LangKind::Rust));
         assert_eq!(lang_for_extension("py"), Some(LangKind::Python));
         assert_eq!(lang_for_extension("ts"), Some(LangKind::TypeScript));
+        assert_eq!(lang_for_extension("mts"), Some(LangKind::TypeScript));
+        assert_eq!(lang_for_extension("cts"), Some(LangKind::TypeScript));
         assert_eq!(lang_for_extension("tsx"), Some(LangKind::Tsx));
         assert_eq!(lang_for_extension("js"), Some(LangKind::JavaScript));
         assert_eq!(lang_for_extension("jsx"), Some(LangKind::JavaScript));

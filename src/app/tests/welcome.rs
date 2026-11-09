@@ -69,6 +69,46 @@ fn welcome_panel_renders_without_any_underlined_cells() {
     }
 }
 
+/// #954: a note written in Markdown shows its `**bold**` text bold and its
+/// `` `code` `` in the code colour, with none of the markers on the card.
+#[test]
+fn welcome_notes_draw_inline_markdown_without_its_markers() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.welcome.set_test_notes(vec![note_fixture(
+        crate::release_notes::NoteKind::Feature,
+        "Press **Add Database** or `Cmd+K V` to start",
+    )]);
+    let area = Rect {
+        x: 0,
+        y: 0,
+        width: 120,
+        height: 30,
+    };
+    let backend = ratatui::backend::TestBackend::new(area.width, area.height);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render_welcome(f, area)).unwrap();
+    let buffer = term.backend().buffer();
+    let rows: Vec<String> = (0..area.height)
+        .map(|y| (0..area.width).map(|x| buffer[(x, y)].symbol()).collect())
+        .collect();
+    let (y, row) = rows
+        .iter()
+        .enumerate()
+        .find(|(_, r)| r.contains("Press Add Database or Cmd+K V to start"))
+        .expect("the note is shown without its markers");
+    assert!(!rows.iter().any(|r| r.contains("**") || r.contains('`')));
+    let at = |needle: &str| row[..row.find(needle).unwrap()].chars().count() as u16;
+    let cell = |x: u16| &buffer[(x, y as u16)];
+    assert!(cell(at("Add")).modifier.contains(Modifier::BOLD));
+    assert!(!cell(at("Press")).modifier.contains(Modifier::BOLD));
+    assert_ne!(
+        cell(at("Cmd")).fg,
+        cell(at("Press")).fg,
+        "code is drawn in its own colour"
+    );
+}
+
 #[test]
 fn welcome_panel_does_not_paint_the_blazingly_fast_slogan_footer() {
     // The user asked to drop the chevron-bracketed

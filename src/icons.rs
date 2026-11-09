@@ -192,7 +192,7 @@ fn ext_icon(s: &str) -> Option<Icon> {
         ".py" | ".pyi" | ".pyc" | ".ipynb" => i('\u{e235}', 0x35, 0x72, 0xa5),
         ".js" | ".mjs" | ".cjs" => i('\u{e74e}', 0xcb, 0xcb, 0x41),
         ".jsx" | ".tsx" => i('\u{e7ba}', 0x51, 0x9a, 0xba),
-        ".ts" => i('\u{e628}', 0x51, 0x9a, 0xba),
+        ".ts" | ".mts" | ".cts" => i('\u{e628}', 0x51, 0x9a, 0xba),
         ".html" | ".htm" => i('\u{e736}', 0xe4, 0x4d, 0x26),
         ".css" | ".tcss" => i('\u{e749}', 0x42, 0xa5, 0xf5),
         ".scss" | ".sass" => i('\u{e603}', 0xcc, 0x66, 0x99),
@@ -268,6 +268,16 @@ mod tests {
         let icon = for_path("hello.py", ".py");
         assert_eq!(icon.glyph, '\u{e235}');
         assert_eq!(icon.color, rgb(0x35, 0x72, 0xa5));
+    }
+
+    #[test]
+    fn typescript_module_files_share_the_ts_icon() {
+        // #1162: `.mts` / `.cts` are TypeScript, as `.mjs` / `.cjs` are JavaScript.
+        let ts = for_path("mod.ts", ".ts");
+        for (name, ext) in [("mod.mts", ".mts"), ("mod.cts", ".cts")] {
+            let icon = for_path(name, ext);
+            assert_eq!((icon.glyph, icon.color), (ts.glyph, ts.color), "{name}");
+        }
     }
 
     #[test]

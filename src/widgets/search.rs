@@ -16,6 +16,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use unicode_width::UnicodeWidthStr;
 
+use crate::glob_list::split_globs;
+
 const MAX_LINE_LEN: usize = 200;
 
 /// Per-channel lift applied to the theme background to fill an idle input row,
@@ -349,29 +351,12 @@ fn build_searcher() -> Searcher {
 #[derive(Clone, Debug, Default)]
 pub struct PathFilter {
     include: Option<GlobSet>,
+    /// The include globs that name a folder (#958): those whose last part
+    /// has no wildcard, such as `tests` or `src/widgets`. They also admit
+    /// what is inside the folder; `*.rs` does not admit a folder named
+    /// `generated.rs`.
+    include_dirs: Option<GlobSet>,
     exclude: Option<GlobSet>,
-}
-
-/// The entries of a comma-separated glob list. Commas inside `{...}`
-/// belong to a brace alternate, so `*.{ts,tsx}, docs/**` is two entries
-/// (#1251).
-pub(crate) fn split_globs(raw: &str) -> impl Iterator<Item = &str> {
-    let mut depth = 0usize;
-    let mut start = 0;
-    let mut parts = Vec::new();
-    for (i, c) in raw.char_indices() {
-        match c {
-            '{' => depth += 1,
-            '}' => depth = depth.saturating_sub(1),
-            ',' if depth == 0 => {
-                parts.push(&raw[start..i]);
-                start = i + 1;
-            }
-            _ => {}
-        }
-    }
-    parts.push(&raw[start..]);
-    parts.into_iter().map(str::trim).filter(|p| !p.is_empty())
 }
 
 fn compile_glob(pat: &str) -> Option<Glob> {
@@ -410,10 +395,15 @@ pub fn invalid_globs(raw: &str) -> Vec<&str> {
 /// include list (`fail_closed`) yields an empty set that matches nothing, so
 /// a broken filter never widens a search or Replace All to every file.
 fn build_glob_set(raw: &str, fail_closed: bool) -> Option<GlobSet> {
+    build_glob_set_of(raw, fail_closed, |_| true)
+}
+
+/// [`build_glob_set`] over the entries `keep` accepts.
+fn build_glob_set_of(raw: &str, fail_closed: bool, keep: impl Fn(&str) -> bool) -> Option<GlobSet> {
     let mut builder = GlobSetBuilder::new();
     let mut any = false;
     let mut typed = false;
-    for pat in split_globs(raw) {
+    for pat in split_globs(raw).filter(|p| keep(p)) {
         typed = true;
         if let Some(g) = compile_glob(pat) {
             builder.add(g);
@@ -426,12 +416,28 @@ fn build_glob_set(raw: &str, fail_closed: bool) -> Option<GlobSet> {
     builder.build().ok()
 }
 
+/// Whether a glob names a folder rather than a kind of file: its last part
+/// is a plain name, as in `tests`, `src/widgets` or `./src`, not a pattern
+/// such as `*.rs` (#958).
+fn names_a_folder(pat: &str) -> bool {
+    let last = pat.trim_end_matches('/').rsplit('/').next().unwrap_or(pat);
+    !last.is_empty() && !last.contains(['*', '?', '[', '{'])
+}
+
+/// True when `rel` or one of the folders above it matches `set`: a glob that
+/// names a folder stands for everything inside it.
+fn matches_self_or_parent(set: &GlobSet, rel: &Path) -> bool {
+    rel.ancestors()
+        .any(|p| !p.as_os_str().is_empty() && set.is_match(p))
+}
+
 impl PathFilter {
     /// Compile a filter from the raw include/exclude input strings. An empty
     /// (or all-whitespace) string disables that side of the filter.
     pub fn new(include: &str, exclude: &str) -> Self {
         Self {
             include: build_glob_set(include, true),
+            include_dirs: build_glob_set_of(include, false, names_a_folder),
             exclude: build_glob_set(exclude, false),
         }
     }
@@ -446,17 +452,26 @@ impl PathFilter {
     /// done against the path relative to `root` (falling back to the full path
     /// when it isn't under `root`). Include wins first: if an include set is
     /// present, the path must match it; then any exclude match drops the path.
+    /// On both sides a glob that names a folder covers what is inside it, as
+    /// in VS Code, so include `tests` or `src/widgets` searches those folders
+    /// (#958) and exclude `dist` hides everything under it (#1345). A folder
+    /// is only looked for inside the workspace: a file outside it (an open
+    /// buffer elsewhere) is not let in by a folder above the workspace.
     pub fn allows(&self, root: &Path, path: &Path) -> bool {
-        let rel = path.strip_prefix(root).unwrap_or(path);
+        let inside = path.strip_prefix(root).ok();
+        let rel = inside.unwrap_or(path);
         if let Some(inc) = &self.include
             && !inc.is_match(rel)
+            && !inside.is_some_and(|rel| {
+                self.include_dirs
+                    .as_ref()
+                    .is_some_and(|dirs| matches_self_or_parent(dirs, rel))
+            })
         {
             return false;
         }
         if let Some(exc) = &self.exclude
-            && rel
-                .ancestors()
-                .any(|p| !p.as_os_str().is_empty() && exc.is_match(p))
+            && matches_self_or_parent(exc, rel)
         {
             return false;
         }
@@ -468,10 +483,9 @@ impl PathFilter {
     /// Code's exclude settings do (#1345).
     pub fn excludes(&self, root: &Path, path: &Path) -> bool {
         let rel = path.strip_prefix(root).unwrap_or(path);
-        self.exclude.as_ref().is_some_and(|exc| {
-            rel.ancestors()
-                .any(|p| !p.as_os_str().is_empty() && exc.is_match(p))
-        })
+        self.exclude
+            .as_ref()
+            .is_some_and(|exc| matches_self_or_parent(exc, rel))
     }
 
     /// An exclude-only filter from a list of globs (the project's exclude
@@ -1448,6 +1462,15 @@ pub struct SearchPanel {
     pub complete: bool,
     /// Selection range within the currently focused field's text.
     pub field_selection: Option<(usize, usize)>,
+    /// Caret of each field as a char index (#1729), indexed by
+    /// [`SearchField::index`]. `None` is "at the end of the text, wherever
+    /// that is now": a field nobody moved a caret in follows its text when
+    /// the text is assigned from outside. Reads clamp, so a mid-text caret
+    /// left past a shortened text falls back to the end too.
+    carets: [Option<usize>; 4],
+    /// Where each field's text starts on screen and the first char it shows,
+    /// captured each render so a click can place the caret.
+    field_origin: [(u16, usize); 4],
 
     // --- Hit-test geometry captured during render (absolute screen coords) ---
     /// The left expand chevron (toggles the Replace row).
@@ -1503,6 +1526,17 @@ pub enum SearchField {
     Exclude,
 }
 
+impl SearchField {
+    fn index(self) -> usize {
+        match self {
+            SearchField::Query => 0,
+            SearchField::Replace => 1,
+            SearchField::Include => 2,
+            SearchField::Exclude => 3,
+        }
+    }
+}
+
 impl SearchPanel {
     pub fn new(root: PathBuf) -> Self {
         Self {
@@ -1539,6 +1573,8 @@ impl SearchPanel {
             field: SearchField::Query,
             complete: false,
             field_selection: None,
+            carets: [None; 4],
+            field_origin: [(0, 0); 4],
             chevron_x: 0,
             chevron_y: 0,
             replace_all_x: 0,
@@ -1595,6 +1631,73 @@ impl SearchPanel {
         self.field = SearchField::Query;
         self.selection = None;
         self.field_selection = None;
+        for f in [
+            SearchField::Query,
+            SearchField::Include,
+            SearchField::Exclude,
+        ] {
+            self.carets[f.index()] = None;
+        }
+    }
+
+    /// The focused field's caret as a char index into its text.
+    pub fn caret(&self) -> usize {
+        self.field_caret(self.field)
+    }
+
+    fn field_text(&self, field: SearchField) -> &str {
+        match field {
+            SearchField::Query => &self.query,
+            SearchField::Replace => &self.replace,
+            SearchField::Include => &self.include,
+            SearchField::Exclude => &self.exclude,
+        }
+    }
+
+    fn field_caret(&self, field: SearchField) -> usize {
+        let text = self.field_text(field);
+        crate::widgets::line_edit::clamp(text, self.carets[field.index()].unwrap_or(usize::MAX))
+    }
+
+    /// Record `at` as `field`'s caret; the end of the text is stored as
+    /// "follow the end".
+    fn store_caret(&mut self, field: SearchField, at: usize) {
+        let len = crate::widgets::line_edit::char_len(self.field_text(field));
+        self.carets[field.index()] = (at < len).then_some(at);
+    }
+
+    fn set_caret(&mut self, at: usize) {
+        self.store_caret(self.field, at);
+    }
+
+    /// Move the focused field's caret with `step(text, caret)`, dropping the
+    /// field's selection as any caret key does.
+    pub fn move_caret(&mut self, step: impl FnOnce(&str, usize) -> usize) {
+        let at = step(self.active_text(), self.caret());
+        self.set_active_selection(None);
+        self.set_caret(at);
+    }
+
+    /// Put the focused field's caret under screen column `col`, from a click
+    /// in it (the text origin is the one the last render captured).
+    pub fn click_caret(&mut self, col: u16) {
+        let (text_x, start) = self.field_origin[self.field.index()];
+        let at = crate::widgets::line_edit::char_at_cell(
+            self.active_text(),
+            start,
+            usize::from(col.saturating_sub(text_x)),
+        );
+        self.set_active_selection(None);
+        self.set_caret(at);
+    }
+
+    /// Apply `edit(text, caret) -> (text, caret)` to the focused field.
+    fn edit_active(&mut self, edit: impl FnOnce(&str, usize) -> (String, usize)) -> bool {
+        let (text, caret) = edit(self.active_text(), self.caret());
+        let changed = text != self.active_text();
+        *self.active_text_mut() = text;
+        self.set_caret(caret);
+        changed
     }
 
     pub fn select_all_query(&mut self) {
@@ -1603,6 +1706,7 @@ impl SearchPanel {
         } else {
             self.selection = Some((0, self.query.len()));
         }
+        self.carets[SearchField::Query.index()] = None;
     }
 
     pub fn clear_selection(&mut self) {
@@ -1619,6 +1723,8 @@ impl SearchPanel {
         }
         self.query.replace_range(a..b, "");
         self.selection = None;
+        let at = crate::widgets::line_edit::char_of(&self.query, a);
+        self.store_caret(SearchField::Query, at);
         true
     }
 
@@ -1626,18 +1732,6 @@ impl SearchPanel {
         match self.selection_range() {
             Some((a, b)) if a < b => self.query[a..b].to_string(),
             _ => String::new(),
-        }
-    }
-
-    /// Insert `s` at the end of the query, replacing the current selection
-    /// (if any) first. Newlines and carriage returns are stripped — search
-    /// queries are single-line.
-    pub fn insert_str_into_query(&mut self, s: &str) {
-        self.delete_selection();
-        for c in s.chars() {
-            if c != '\n' && c != '\r' {
-                self.query.push(c);
-            }
         }
     }
 
@@ -1666,6 +1760,7 @@ impl SearchPanel {
     /// Clear the focused field's text entirely (used by Esc).
     pub fn active_text_mut_clear(&mut self) {
         self.active_text_mut().clear();
+        self.set_caret(0);
     }
 
     /// Clear the selection of the focused field.
@@ -1694,7 +1789,8 @@ impl SearchPanel {
             return;
         }
         self.delete_active_selection();
-        self.active_text_mut().push(c);
+        let typed = c.to_string();
+        self.edit_active(|t, at| crate::widgets::line_edit::insert_at(t, at, &typed));
     }
 
     /// Backspace one char (or the selection) from the focused field. Returns
@@ -1703,19 +1799,32 @@ impl SearchPanel {
         if self.delete_active_selection() {
             return true;
         }
-        self.active_text_mut().pop().is_some()
+        self.edit_active(|t, at| crate::widgets::line_edit::delete_before(t, at, false))
+    }
+
+    /// Delete the cluster (or, with `word`, the run) before the caret, or the
+    /// selection. Returns true when the text changed.
+    pub fn backspace_by(&mut self, word: bool) -> bool {
+        if self.delete_active_selection() {
+            return true;
+        }
+        self.edit_active(|t, at| crate::widgets::line_edit::delete_before(t, at, word))
+    }
+
+    /// Delete ahead of the caret (the Delete key), or the selection.
+    /// Returns true when the text changed.
+    pub fn delete_forward(&mut self, word: bool) -> bool {
+        if self.delete_active_selection() {
+            return true;
+        }
+        self.edit_active(|t, at| crate::widgets::line_edit::delete_at(t, at, word))
     }
 
     /// Insert `s` into the focused field, replacing the selection and stripping
     /// newlines (all Search inputs are single-line).
     pub fn insert_str(&mut self, s: &str) {
         self.delete_active_selection();
-        let text = self.active_text_mut();
-        for c in s.chars() {
-            if c != '\n' && c != '\r' {
-                text.push(c);
-            }
-        }
+        self.edit_active(|t, at| crate::widgets::line_edit::insert_at(t, at, s));
     }
 
     /// Select the whole text of the focused field.
@@ -1726,6 +1835,8 @@ impl SearchPanel {
         } else {
             self.set_active_selection(Some((0, len)));
         }
+        let end = crate::widgets::line_edit::char_len(self.active_text());
+        self.set_caret(end);
     }
 
     fn delete_active_selection(&mut self) -> bool {
@@ -1738,6 +1849,8 @@ impl SearchPanel {
         }
         self.active_text_mut().replace_range(a..b, "");
         self.set_active_selection(None);
+        let at = crate::widgets::line_edit::char_of(self.active_text(), a);
+        self.set_caret(at);
         true
     }
 
@@ -1917,6 +2030,8 @@ impl SearchPanel {
     pub fn clear_all(&mut self) {
         self.query.clear();
         self.replace.clear();
+        self.carets[SearchField::Query.index()] = None;
+        self.carets[SearchField::Replace.index()] = None;
         self.hits.clear();
         self.selected = 0;
         self.scroll = 0;
@@ -2328,6 +2443,8 @@ struct FieldArgs<'a> {
     lead_glyph: Option<&'a str>,
     /// Current text of the field.
     text: &'a str,
+    /// The caret as a char index into `text` (#1729).
+    caret: usize,
     /// Placeholder shown italic-grey when `text` is empty.
     placeholder: &'a str,
     /// Selection range within `text`, already normalised (a <= b).
@@ -2389,6 +2506,7 @@ fn render_field(
     args: FieldArgs,
     theme: crate::theme::Theme,
     caret_out: &mut Option<(u16, u16)>,
+    origin_out: &mut (u16, usize),
 ) -> Rect {
     if args.fill_right <= args.bar_x {
         return Rect {
@@ -2436,6 +2554,8 @@ fn render_field(
     let text_w = text_right.saturating_sub(text_x).saturating_add(1);
 
     let mut spans: Vec<Span> = Vec::with_capacity(4);
+    let win = crate::widgets::line_edit::window(args.text, args.caret, usize::from(text_w));
+    *origin_out = (text_x, win.start);
     if args.text.is_empty() {
         spans.push(Span::styled(
             args.placeholder.to_string(),
@@ -2449,17 +2569,28 @@ fn render_field(
         let selected = Style::default()
             .fg(theme.ui(Color::White))
             .bg(theme.ui(Color::Rgb(0x26, 0x4f, 0x78)));
-        match args.selection {
-            Some((a, b)) if a < b => {
+        // Only the part of the text the row has room for, scrolled so the
+        // caret is in view; the selection is clipped to it.
+        let (sb, eb) = (
+            crate::widgets::line_edit::byte_of(args.text, win.start),
+            crate::widgets::line_edit::byte_of(args.text, win.end),
+        );
+        let shown = &args.text[sb..eb];
+        let sel = args
+            .selection
+            .map(|(a, b)| (a.max(sb) - sb.min(a.max(sb)), b.min(eb).saturating_sub(sb)))
+            .filter(|&(a, b)| a < b && b <= shown.len());
+        match sel {
+            Some((a, b)) => {
                 if a > 0 {
-                    spans.push(Span::styled(args.text[..a].to_string(), plain));
+                    spans.push(Span::styled(shown[..a].to_string(), plain));
                 }
-                spans.push(Span::styled(args.text[a..b].to_string(), selected));
-                if b < args.text.len() {
-                    spans.push(Span::styled(args.text[b..].to_string(), plain));
+                spans.push(Span::styled(shown[a..b].to_string(), selected));
+                if b < shown.len() {
+                    spans.push(Span::styled(shown[b..].to_string(), plain));
                 }
             }
-            _ => spans.push(Span::styled(args.text.to_string(), plain)),
+            None => spans.push(Span::styled(shown.to_string(), plain)),
         }
     }
     if text_w > 0 {
@@ -2469,10 +2600,10 @@ fn render_field(
     // The caret rides just past the text (at the field's left edge when empty),
     // clamped inside the editable span. The app shows the host's blinking
     // hardware caret here only while this field is focused, so we record the
-    // cell for the focused field alone. Char count matches the commit box's
-    // caret model (`message_cursor`); Search has no mid-text caret.
+    // cell for the focused field alone. The caret is a char index, the
+    // commit box's model (`message_cursor`), drawn where the text window put it.
     if args.field_focused && text_w > 0 {
-        let off = (args.text.chars().count() as u16).min(text_w.saturating_sub(1));
+        let off = (win.caret_cell as u16).min(text_w.saturating_sub(1));
         *caret_out = Some((text_x + off, args.y));
     }
 
@@ -2623,6 +2754,7 @@ impl Widget for &mut SearchPanel {
         // it accumulates the single focused field's caret across the calls
         // below; committed to `self.caret_cell` once the cluster is laid out.
         let mut caret: Option<(u16, u16)> = None;
+        let mut origins = self.field_origin;
 
         // Query field: filled single row, magnifier lead, inset toggles.
         let query_focused = self.focused && self.field == SearchField::Query;
@@ -2634,6 +2766,7 @@ impl Widget for &mut SearchPanel {
                 fill_right: query_fill_right,
                 lead_glyph: Some("\u{ea6d}"),
                 text: &self.query,
+                caret: self.field_caret(SearchField::Query),
                 placeholder: "Search",
                 selection: self.selection_range(),
                 field_focused: query_focused,
@@ -2643,6 +2776,7 @@ impl Widget for &mut SearchPanel {
             },
             self.theme,
             &mut caret,
+            &mut origins[SearchField::Query.index()],
         );
 
         // Inset toggles `Aa ab .*`, painted on top of the query fill at its
@@ -2721,6 +2855,7 @@ impl Widget for &mut SearchPanel {
                     fill_right: replace_fill_right,
                     lead_glyph: Some(&crate::icons::SEARCH_REPLACE.to_string()),
                     text: &self.replace,
+                    caret: self.field_caret(SearchField::Replace),
                     placeholder: "Replace (Tab switches)",
                     selection: if self.field == SearchField::Replace {
                         self.active_selection()
@@ -2734,6 +2869,7 @@ impl Widget for &mut SearchPanel {
                 },
                 self.theme,
                 &mut caret,
+                &mut origins[SearchField::Replace.index()],
             );
             // `AB` (Preserve Case) inset at the replace field's right edge,
             // where VS Code keeps it, styled like the query's toggles.
@@ -2805,6 +2941,7 @@ impl Widget for &mut SearchPanel {
                         fill_right: detail_fill_right,
                         lead_glyph: None,
                         text: &self.include,
+                        caret: self.field_caret(SearchField::Include),
                         placeholder: "e.g. src/**/*.rs",
                         selection: if self.field == SearchField::Include {
                             self.active_selection()
@@ -2818,6 +2955,7 @@ impl Widget for &mut SearchPanel {
                     },
                     self.theme,
                     &mut caret,
+                    &mut origins[SearchField::Include.index()],
                 );
                 next_y += 1;
             }
@@ -2843,6 +2981,7 @@ impl Widget for &mut SearchPanel {
                         fill_right: detail_fill_right,
                         lead_glyph: None,
                         text: &self.exclude,
+                        caret: self.field_caret(SearchField::Exclude),
                         placeholder: "e.g. target, dist",
                         selection: if self.field == SearchField::Exclude {
                             self.active_selection()
@@ -2856,6 +2995,7 @@ impl Widget for &mut SearchPanel {
                     },
                     self.theme,
                     &mut caret,
+                    &mut origins[SearchField::Exclude.index()],
                 );
                 next_y += 1;
                 if !self.project_exclude.is_empty() && next_y + 1 < inner.y + inner.height {
@@ -2888,6 +3028,7 @@ impl Widget for &mut SearchPanel {
         // laid out. Always runs (the optional rows above only skip their own
         // render), so the app sees `None` whenever no field carried a caret.
         self.caret_cell = caret;
+        self.field_origin = origins;
 
         // ---- Separator + match-count caption ----
         let separator_y = next_y;
@@ -4939,6 +5080,37 @@ mod tests {
         assert!(f.allows(root, Path::new("/proj/src/targets/x.rs")));
     }
 
+    /// #958: an include glob that names a folder searches what is inside
+    /// it: a bare `tests` at any depth, `src/widgets` and `./src` from the
+    /// workspace root.
+    #[test]
+    fn an_included_folder_searches_the_files_inside_it() {
+        let root = Path::new("/proj");
+        let f = PathFilter::new("tests", "");
+        assert!(f.allows(root, Path::new("/proj/tests/cli.rs")));
+        assert!(f.allows(root, Path::new("/proj/crate/tests/deep/x.rs")));
+        assert!(!f.allows(root, Path::new("/proj/src/main.rs")));
+        // Negative: a name that only starts like the folder is left out.
+        assert!(!f.allows(root, Path::new("/proj/tests_old/x.rs")));
+        let f = PathFilter::new("src/widgets", "");
+        assert!(f.allows(root, Path::new("/proj/src/widgets/search.rs")));
+        assert!(!f.allows(root, Path::new("/proj/src/app/mod.rs")));
+        let f = PathFilter::new("./src", "");
+        assert!(f.allows(root, Path::new("/proj/src/app/mod.rs")));
+        assert!(!f.allows(root, Path::new("/proj/vendor/src/x.rs")));
+        // A file glob names files, not a folder that happens to match it,
+        // and a folder above the workspace lets nothing in.
+        let f = PathFilter::new("*.rs, src", "");
+        assert!(f.allows(root, Path::new("/proj/a/main.rs")));
+        assert!(!f.allows(root, Path::new("/proj/generated.rs/notes.txt")));
+        assert!(!f.allows(root, Path::new("/home/me/src/elsewhere.txt")));
+        // The same folder names on the exclude side drop their contents.
+        let f = PathFilter::new("", "src/widgets, dist");
+        assert!(!f.allows(root, Path::new("/proj/src/widgets/search.rs")));
+        assert!(!f.allows(root, Path::new("/proj/dist/bundle.js")));
+        assert!(f.allows(root, Path::new("/proj/src/app/mod.rs")));
+    }
+
     #[test]
     fn path_filter_invalid_exclude_hides_nothing() {
         // Negative: a broken exclude entry drops only itself.
@@ -5596,6 +5768,78 @@ mod tests {
         panel.type_char('b');
         assert_eq!(panel.query, "a");
         assert_eq!(panel.replace, "b");
+    }
+
+    /// #1729: the hardware caret sits on the cell of the char it is before,
+    /// and a query longer than the row scrolls so the caret stays inside it.
+    #[test]
+    fn the_caret_follows_its_char_and_a_long_query_scrolls() {
+        use ratatui::buffer::Buffer;
+        let tmp = TempDir::new().unwrap();
+        let mut panel = SearchPanel::new(tmp.path().to_path_buf());
+        panel.focused = true;
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 30,
+            height: 20,
+        };
+        let draw = |panel: &mut SearchPanel| {
+            let mut buf = Buffer::empty(area);
+            Widget::render(panel, area, &mut buf);
+            buf
+        };
+        for c in "abcdef".chars() {
+            panel.type_char(c);
+        }
+        draw(&mut panel);
+        let (end_x, _) = panel.cursor_screen_pos().unwrap();
+        panel.move_caret(|_, _| 3);
+        draw(&mut panel);
+        let (mid_x, y) = panel.cursor_screen_pos().unwrap();
+        assert_eq!(end_x - mid_x, 3, "three chars left of the end");
+        assert_eq!(y, panel.query_input_rect.y);
+        // Far longer than the row: the caret stays inside it either way.
+        panel.seed("0123456789".repeat(6), String::new(), String::new());
+        let buf = draw(&mut panel);
+        let r = panel.query_input_rect;
+        let (cx, cy) = panel.cursor_screen_pos().unwrap();
+        assert!(cx >= r.x && cx < r.right(), "caret {cx} inside {r:?}");
+        let row: String = (r.x..r.right())
+            .map(|x| buf[(x, cy)].symbol().to_string())
+            .collect();
+        assert!(row.contains("789"), "the tail is the part in view: {row:?}");
+        panel.move_caret(|_, _| 0);
+        let buf = draw(&mut panel);
+        let row: String = (r.x..r.right())
+            .map(|x| buf[(x, cy)].symbol().to_string())
+            .collect();
+        assert!(row.contains("0123"), "Home brings the head back: {row:?}");
+    }
+
+    /// #1729: a click in the text puts the caret under it.
+    #[test]
+    fn a_click_in_the_query_places_the_caret_under_it() {
+        use ratatui::buffer::Buffer;
+        let tmp = TempDir::new().unwrap();
+        let mut panel = SearchPanel::new(tmp.path().to_path_buf());
+        panel.focused = true;
+        for c in "abcdef".chars() {
+            panel.type_char(c);
+        }
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 30,
+            height: 20,
+        };
+        let mut buf = Buffer::empty(area);
+        Widget::render(&mut panel, area, &mut buf);
+        let (end_x, _) = panel.cursor_screen_pos().unwrap();
+        panel.click_caret(end_x - 4);
+        assert_eq!(panel.caret(), 2);
+        panel.click_caret(end_x + 5);
+        assert_eq!(panel.caret(), 6, "past the text is the end");
     }
 
     #[test]

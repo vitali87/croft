@@ -948,6 +948,26 @@ fn hex_typing_edits_bytes_and_cmd_s_writes_them_in_place() {
     );
 }
 
+#[test]
+fn a_half_typed_hex_byte_does_not_follow_the_cursor() {
+    // #1142: f, Right, 2 over 41 42 saved F2 into byte 1, a byte the user
+    // never typed on. Leaving byte 0 drops its half-typed digit.
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("h.bin");
+    std::fs::write(&p, b"ABCDEFGH\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_hex(&p).unwrap();
+    assert!(app.editor.hex.is_some());
+    app.handle_hex_key(key(KeyCode::Char('f'), KeyModifiers::NONE));
+    app.handle_hex_key(key(KeyCode::Right, KeyModifiers::NONE));
+    app.handle_hex_key(key(KeyCode::Char('2'), KeyModifiers::NONE));
+    let v = app.editor.hex.as_ref().unwrap();
+    assert_eq!(v.effective_byte(0), Some(b'A'));
+    assert_eq!(v.effective_byte(1), Some(b'B'));
+    assert_eq!(v.pending_nibble, Some(2), "the 2 starts byte 1 afresh");
+    assert!(!app.editor.dirty, "no byte has changed");
+}
+
 /// The firmware image from #1644: the text "1234" at 0x115 and 0x137, and
 /// the bytes 12 34 at 0x11A.
 fn app_with_firmware_in_hex(tmp: &std::path::Path) -> App {
@@ -3411,6 +3431,31 @@ fn reopen_as_preview_keeps_a_utf16_capture_as_text() {
         app.status,
         "No preview for this file type; showing the text"
     );
+}
+
+/// #1363: Markdown is previewed by a toggle, so Reopen as Preview turns the
+/// preview on instead of reopening the source and saying there is none. The
+/// tab keeps its caret and unsaved edits.
+#[test]
+fn reopen_as_preview_shows_the_markdown_preview() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let md = tmp.path().join("t.md");
+    std::fs::write(&md, "# Title\n\nSome *text*.\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&md).unwrap();
+    app.editor.cursor_row = 2;
+    app.editor.cursor_col = 5;
+    app.editor.insert_char('!');
+    assert!(app.editor.dirty);
+    app.run_command(Command::ReopenAsPreview);
+    assert!(app.editor.markdown_preview.is_some(), "the preview is on");
+    assert_eq!(app.status, "Markdown Preview");
+    assert!(app.editor.dirty, "the unsaved edit is kept, not reloaded");
+    assert_eq!(app.editor.lines[2], "Some !*text*.");
+    // Asked again, it stays on rather than flipping back to the source.
+    app.run_command(Command::ReopenAsPreview);
+    assert!(app.editor.markdown_preview.is_some());
 }
 
 /// #1537 negative: source code has a grammar and no preview, so Reopen as
