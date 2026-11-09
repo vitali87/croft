@@ -647,6 +647,7 @@ const COMMANDS: &[(&str, &str)] = &[
         "editor.action.insertCursorAtEndOfEachLineSelected",
         "add_cursors_to_line_ends",
     ),
+    ("expandLineSelection", "expand_line_selection"),
     ("editor.action.smartSelect.expand", "expand_selection"),
     ("editor.action.smartSelect.shrink", "shrink_selection"),
     ("editor.action.jumpToBracket", "jump_to_bracket"),
@@ -3840,6 +3841,22 @@ mod tests {
             [(
                 String::from("ctrl+alt+i"),
                 String::from("toggle_find_in_selection"),
+                None
+            )]
+        );
+    }
+
+    /// #1570: VS Code's Expand Line Selection chord imports onto croft's.
+    #[test]
+    fn expand_line_selection_imports() {
+        let doc = json!([{ "key": "ctrl+alt+l", "command": "expandLineSelection" }]);
+        let mut report = Report::default();
+        convert_keybindings(&doc, &mut report);
+        assert_eq!(
+            report.keybindings,
+            [(
+                String::from("ctrl+alt+l"),
+                String::from("expand_line_selection"),
                 None
             )]
         );

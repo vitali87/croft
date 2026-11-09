@@ -3,12 +3,38 @@ use std::time::{Duration, Instant};
 
 const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(500);
 
+/// How far a run of plain clicks at one cell has got (#1570).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Run {
+    /// One click, which the next can make a double.
+    Single,
+    /// A double the editor kept, which the next click can make a triple.
+    Double,
+}
+
 #[derive(Default)]
 pub struct ClickTracker {
-    last: Option<(Instant, u16, u16)>,
+    /// The last plain click and how far its run has got.
+    last: Option<(Instant, u16, u16, Run)>,
 }
 
 impl ClickTracker {
+    /// The run this click would continue, or `None` when it starts a new
+    /// one: a modified click, another cell, or too late.
+    fn run_before(&self, now: Instant, col: u16, row: u16, mods: KeyModifiers) -> Option<Run> {
+        match self.last {
+            Some((t, x, y, run))
+                if mods.is_empty()
+                    && row == y
+                    && col.abs_diff(x) <= 1
+                    && now.duration_since(t) <= DOUBLE_CLICK_WINDOW =>
+            {
+                Some(run)
+            }
+            _ => None,
+        }
+    }
+
     /// True when this click completes a double-click at (near enough) the
     /// same cell, inside the window.
     ///
@@ -22,14 +48,15 @@ impl ClickTracker {
     /// matched no link, so the user's next ordinary click selected a word
     /// they never double-clicked.
     pub fn is_double(&self, now: Instant, col: u16, row: u16, mods: KeyModifiers) -> bool {
-        mods.is_empty()
-            && matches!(
-                self.last,
-                Some((t, x, y))
-                    if row == y
-                        && col.abs_diff(x) <= 1
-                        && now.duration_since(t) <= DOUBLE_CLICK_WINDOW
-            )
+        self.run_before(now, col, row, mods) == Some(Run::Single)
+    }
+
+    /// True when this click is the third of a run: it follows a double that
+    /// [`record_double`](Self::record_double) kept, at the same cell and
+    /// inside the window (#1570). Only the editor keeps one, for its
+    /// whole-line selection; every other tracker clears after a double.
+    pub fn is_triple(&self, now: Instant, col: u16, row: u16, mods: KeyModifiers) -> bool {
+        self.run_before(now, col, row, mods) == Some(Run::Double)
     }
 
     /// Arm the tracker with this click as a possible first half of a double.
@@ -39,7 +66,15 @@ impl ClickTracker {
     /// modified click from sitting harmlessly between two plain ones and
     /// letting them pair across it.
     pub fn record(&mut self, now: Instant, col: u16, row: u16, mods: KeyModifiers) {
-        self.last = mods.is_empty().then_some((now, col, row));
+        self.last = mods.is_empty().then_some((now, col, row, Run::Single));
+    }
+
+    /// Keep this click as the second half of a double, so a third plain
+    /// click here inside the window is a triple (#1570). Clearing instead,
+    /// as a double used to, made the third click a fresh single that
+    /// dropped the word the double had just selected.
+    pub fn record_double(&mut self, now: Instant, col: u16, row: u16) {
+        self.last = Some((now, col, row, Run::Double));
     }
 
     pub fn clear(&mut self) {
@@ -47,7 +82,7 @@ impl ClickTracker {
     }
 
     pub fn clear_if_moved(&mut self, col: u16, row: u16) {
-        if let Some((_, x, y)) = self.last
+        if let Some((_, x, y, _)) = self.last
             && (col != x || row != y)
         {
             self.last = None;
@@ -215,5 +250,26 @@ mod tests {
             ),
             "past the window does not pair"
         );
+    }
+
+    // #1570: a third plain click at the same cell inside the window after a
+    // double is a triple, not a fresh single and not another double; a
+    // fourth starts over once the triple has cleared the run.
+    #[test]
+    fn a_third_click_after_a_kept_double_is_a_triple() {
+        let now = Instant::now();
+        let plain = KeyModifiers::NONE;
+        let mut t = ClickTracker::default();
+        t.record(now, 10, 3, plain);
+        assert!(t.is_double(now, 10, 3, plain) && !t.is_triple(now, 10, 3, plain));
+        t.record_double(now, 10, 3);
+        assert!(t.is_triple(now, 10, 3, plain), "three clicks are a triple");
+        assert!(!t.is_double(now, 10, 3, plain), "and not a second double");
+        assert!(!t.is_triple(now, 10, 3, KeyModifiers::SHIFT));
+        assert!(!t.is_triple(now, 10, 4, plain), "another row starts over");
+        let late = now + DOUBLE_CLICK_WINDOW + Duration::from_millis(1);
+        assert!(!t.is_triple(late, 10, 3, plain), "too late starts over");
+        t.clear();
+        assert!(!t.is_double(now, 10, 3, plain) && !t.is_triple(now, 10, 3, plain));
     }
 }

@@ -1375,6 +1375,57 @@ fn shift_alt_i_adds_a_cursor_at_each_line_end() {
     );
 }
 
+/// #1570: `Ctrl+L` selects the caret's line through the start of the next,
+/// each further press adds a line, and typing replaces them; it used to do
+/// nothing. On the last line, which has no line after it, it selects to the
+/// end. The palette and VS Code's `expandLineSelection` id reach it too.
+#[test]
+fn ctrl_l_selects_the_line_and_each_press_adds_the_next() {
+    use crate::widgets::command_palette::Command;
+    assert_eq!(
+        Command::from_id("expand_line_selection"),
+        Some(Command::ExpandLineSelection)
+    );
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "h.py", "a = 1\nb = 2\nc = 3");
+    app.handle_key(ctrl('l')).unwrap();
+    assert_eq!(app.editor.selection.unwrap().normalised(), ((0, 0), (1, 0)));
+    app.handle_key(ctrl('l')).unwrap();
+    assert_eq!(app.editor.selection.unwrap().normalised(), ((0, 0), (2, 0)));
+    app.handle_key(ctrl('l')).unwrap();
+    assert_eq!(app.editor.selection.unwrap().normalised(), ((0, 0), (2, 5)));
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    (app.editor.cursor_row, app.editor.cursor_col) = (1, 2);
+    assert!(run_from_palette(&mut app, "Expand Line Selection"));
+    type_char(&mut app, 'Z');
+    assert_eq!(app.editor.lines, ["a = 1", "Zc = 3"]);
+}
+
+/// #1570: with carets on lines 1 and 2, the first `Ctrl+L` leaves two line
+/// selections that only touch, and the second grows them into an overlap,
+/// which becomes one selection, so typing replaces lines 1 to 3 once. The
+/// overlap used to reach the edit kept apart: the lower replacement left the
+/// upper one's end stale, and typing panicked, or in a longer file deleted
+/// lines nobody selected.
+#[test]
+fn ctrl_l_merges_the_line_selections_of_two_carets_once_they_overlap() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "h.py", "a\nb\nc\nd");
+    app.run_command(Command::AddCursorBelow);
+    app.handle_key(ctrl('l')).unwrap();
+    assert_eq!(app.editor.carets.len(), 1, "touching selections stay two");
+    app.handle_key(ctrl('l')).unwrap();
+    assert!(
+        !app.editor.has_multi_cursor(),
+        "the overlap is one selection"
+    );
+    assert_eq!(app.editor.selection.unwrap().normalised(), ((0, 0), (3, 0)));
+    type_char(&mut app, 'Z');
+    assert_eq!(app.editor.lines, ["Zd"]);
+}
+
 const COLUMN_PY: &str = "alpha = 1\nbeta  = 2\ngamma = 3\n";
 
 fn column_chord(code: KeyCode, cmd: KeyModifiers) -> KeyEvent {

@@ -1042,6 +1042,7 @@ fn every_cmd_chord_is_ctrl_off_macos_unless_linux_md_lists_it() {
         is_change_all_occurrences_key,
         is_select_all_occurrences_key,
         is_add_cursors_to_line_ends_key,
+        is_expand_line_selection_key,
         is_select_next_occurrence_key,
         is_delete_line_key,
         is_go_to_definition_key,
