@@ -3437,6 +3437,10 @@ pub struct Editor {
     /// closers type over, selections surround, and backspace eats an empty
     /// pair. Synced from the app's persisted preference like `blame_enabled`.
     pub auto_close_pairs: bool,
+    /// Overwrite (Replace) mode, toggled by the Insert key: a typed character
+    /// replaces the one under the caret instead of pushing it along. Mirrored
+    /// from the app's single global switch, like `auto_close_pairs`.
+    pub overwrite: bool,
     /// The global on-save clean-ups (#1657), set by the app before each save.
     pub save_cleanup: SaveCleanup,
     /// Auto-closing TAGS (VS Code's `html.autoClosingTags` /
@@ -4159,6 +4163,7 @@ impl Editor {
             git_marks: std::collections::HashMap::new(),
             git_marks_seq: u64::MAX,
             auto_close_pairs: true,
+            overwrite: false,
             save_cleanup: SaveCleanup::default(),
             auto_close_tags: true,
             auto_pair_at: None,
@@ -8739,6 +8744,10 @@ impl Editor {
     }
 
     pub fn insert_char(&mut self, c: char) {
+        if self.overwrite_applies() {
+            self.overwrite_char(c);
+            return;
+        }
         if self.auto_close_tags && c == '>' && self.insert_closing_tag() {
             // Still a keystroke, like the pair path below: on-type
             // formatting (#254) keys off the typed character.
@@ -8777,6 +8786,74 @@ impl Editor {
         // this keystroke (seq must still match at the tick). Set here, not
         // in insert_char_raw: paste and snippet expansion go through the
         // raw path and must never count as typing.
+        self.last_typed = Some((c, self.edit_seq));
+    }
+
+    /// Whether a typed character should overwrite rather than insert: the
+    /// mode is on, there is a character to the right of the one caret on its
+    /// line (at the end of a line typing appends, as in every editor) and no
+    /// selection or extra caret is in play (those keep their insert semantics).
+    fn overwrite_applies(&self) -> bool {
+        self.overwrite
+            && self.carets.is_empty()
+            && !self.selection.is_some_and(|s| s.has_area())
+            && self
+                .lines
+                .get(self.cursor_row)
+                .is_some_and(|l| self.cursor_col < l.chars().count())
+    }
+
+    /// Whether `c` typed at the caret joins the cluster just before it: a
+    /// combining accent after its letter, a vowel sign after its consonant, a
+    /// ZWJ or the next part of an emoji sequence.
+    fn joins_cluster_before_caret(&self, c: char) -> bool {
+        let Some(line) = self.lines.get(self.cursor_row) else {
+            return false;
+        };
+        let byte = self.byte_index(self.cursor_row, self.cursor_col);
+        let Some(prev) = line[..byte].graphemes(true).next_back() else {
+            return false;
+        };
+        let mut joined = String::with_capacity(prev.len() + c.len_utf8());
+        joined.push_str(prev);
+        joined.push(c);
+        joined.graphemes(true).nth(1).is_none()
+    }
+
+    /// Overwrite-mode typing: replace the character cluster under the caret
+    /// with `c` and step past it. A `c` that completes the character before
+    /// the caret (see [`Self::joins_cluster_before_caret`]) belongs to it, so
+    /// it is added and nothing is replaced. One undo step per keystroke run,
+    /// like ordinary typing. Auto-closing pairs and tags are bypassed: a
+    /// typed bracket replaces, it does not grow a partner.
+    fn overwrite_char(&mut self, c: char) {
+        self.pin_on_edit();
+        self.push_undo(EditKind::InsertChar);
+        // A click leaves an empty selection behind; drop it, as the insert
+        // path does, or a later Shift+arrow would extend from the click.
+        self.selection = None;
+        let row = self.cursor_row;
+        let from = self.byte_index(row, self.cursor_col);
+        let to = if self.joins_cluster_before_caret(c) {
+            from
+        } else {
+            let next = next_grapheme_col(&self.lines[row], self.cursor_col);
+            self.byte_index(row, next)
+        };
+        let mut buf = [0u8; 4];
+        self.lines[row].replace_range(from..to, c.encode_utf8(&mut buf));
+        // The typed char can join the clusters around it into one (a ZWJ
+        // between two emoji, a regional indicator before a flag); step past
+        // the whole cluster then, so the next keystroke never lands inside it.
+        let col = self.cursor_col + 1;
+        let line = &self.lines[row];
+        self.cursor_col = if floor_grapheme_col(line, col) == col {
+            col
+        } else {
+            next_grapheme_col(line, col)
+        };
+        self.mark_buffer_changed();
+        self.recompute_highlights();
         self.last_typed = Some((c, self.edit_seq));
     }
 

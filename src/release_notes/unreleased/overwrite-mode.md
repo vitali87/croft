@@ -1,0 +1,1 @@
+feature: The Insert key switches the editor between Insert and Overwrite (Replace) typing. In Overwrite a typed character replaces the one under the caret; while it is on, the status bar shows ⎁ after the workspace name and the caret turns into a block.
