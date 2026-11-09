@@ -68,6 +68,9 @@ class Demo:
         _write_json(self.home / ".config/croft/config.json", config)
         if workspace_config is not None:
             _write_json(self.project / ".croft/config.json", workspace_config)
+        # croft starts bash as a login shell, which reads /etc/profile; on a
+        # system whose profile sets PS1 that beats the PS1 passed in `start`.
+        (self.home / ".bash_profile").write_text("PS1='$ '\n")
         for rel, text in (files or {"README.md": "# demo\n"}).items():
             path = self.project / rel
             path.parent.mkdir(parents=True, exist_ok=True)
@@ -85,6 +88,8 @@ class Demo:
             "HOME": str(self.home),
             "XDG_CACHE_HOME": str(self.home / ".cache"),
             "COLORTERM": "truecolor",
+            # No "update available" card in the middle of a recording.
+            "CROFT_NO_UPDATE_CHECK": "1",
         }
         cmd = " ".join(f"{k}={_q(v)}" for k, v in env.items())
         self._tmux(
