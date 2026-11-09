@@ -324,13 +324,24 @@ impl FsWatch {
         }
         self.watch_new_dirs(new_dirs, &mut out);
         if !affected.is_empty() {
+            // As in `poll`: one refresh of a compact row (#1486) re-reads
+            // every folder it shows, so the others in its chain are skipped.
+            // A bulk change (a checkout, an unpack) touches many folders of
+            // one chain, and refreshing the row once per folder would read
+            // the chain that many times over.
+            let mut reread: BTreeSet<PathBuf> = BTreeSet::new();
             for dir in affected.iter().rev() {
-                if let Some(idx) = tree.index_of_dir(dir) {
+                if reread.contains(dir) {
+                    continue;
+                }
+                let idx = tree
+                    .index_of_dir(dir)
+                    .or_else(|| dir.canonicalize().ok().and_then(|c| tree.index_of_dir(&c)));
+                if let Some(idx) = idx {
                     tree.refresh_children(idx);
-                } else if let Ok(c) = dir.canonicalize()
-                    && let Some(idx) = tree.index_of_dir(&c)
-                {
-                    tree.refresh_children(idx);
+                    if let Some(row) = tree.nodes.get(idx) {
+                        reread.extend(row.shown_paths().map(Path::to_path_buf));
+                    }
                 }
             }
             self.poll_dir_mtimes = Self::snapshot_expanded_dir_mtimes(tree);
