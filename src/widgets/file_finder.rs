@@ -1104,7 +1104,7 @@ fn render_finder_card(
             placeholder: "Search files by name \u{2014} append :line to jump",
             count: &count,
             verb: "open",
-            keep_count: false,
+            keep: None,
         },
     );
     let visible = card.list.height as usize;

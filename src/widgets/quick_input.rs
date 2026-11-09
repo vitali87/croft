@@ -28,6 +28,8 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Clear, Widget},
 };
+use std::borrow::Cow;
+
 use unicode_width::UnicodeWidthStr;
 
 use crate::theme::Theme;
@@ -118,10 +120,11 @@ pub struct Input<'a> {
     pub count: &'a str,
     /// What Enter does, for the footer (`run`, `open`, `select`).
     pub verb: &'a str,
-    /// The count names what Enter will do (a list picker's title while the
-    /// user filters), so it keeps its place on the row: the query scrolls
-    /// in what is left instead of crowding the count out.
-    pub keep_count: bool,
+    /// What the count must never lose (a list picker's title while the user
+    /// filters: what Enter will do). With it set the count keeps its place
+    /// on the row and the query scrolls in what is left; where the whole
+    /// count does not fit, this part alone stays, cut with `…` if need be.
+    pub keep: Option<&'a str>,
 }
 
 /// Paint the card: the raised body, the edge (accent lip, rim, shadow), the
@@ -183,13 +186,39 @@ pub fn paint_card(
     caret
 }
 
+/// The fewest query cells a kept count leaves beside itself.
+const MIN_KEPT_QUERY: usize = 6;
+
+/// What a kept count shows in `room` cells: the whole count, else the part
+/// it must keep, else that part cut to fit with a `…`. `None` when not even
+/// two cells are left for it.
+fn kept_label<'a>(count: &'a str, keep: &'a str, room: usize) -> Option<Cow<'a, str>> {
+    if count.width() <= room {
+        return Some(Cow::Borrowed(count));
+    }
+    if keep.width() <= room {
+        return Some(Cow::Borrowed(keep));
+    }
+    if room < 2 {
+        return None;
+    }
+    let mut cut = String::new();
+    let mut w = 0;
+    for c in keep.chars() {
+        let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+        if w + cw > room - 1 {
+            break;
+        }
+        cut.push(c);
+        w += cw;
+    }
+    cut.push('\u{2026}');
+    Some(Cow::Owned(cut))
+}
+
 /// The input row: the accent glyph, the query (or the placeholder) and the
 /// count at the right. A query wider than the field scrolls to keep the
 /// caret in view, a `…` standing for the hidden start. Returns the caret.
-/// The fewest query cells a kept count leaves beside itself; below that the
-/// count yields to the query as an ordinary count does.
-const MIN_KEPT_QUERY: usize = 6;
-
 fn paint_input_row(
     buf: &mut Buffer,
     left: u16,
@@ -213,11 +242,16 @@ fn paint_input_row(
         return None;
     }
     let field = usize::from(end - x0);
-    let count_w = input.count.width();
-    // A kept count claims its cells (and a two-cell gap) first, as long as
-    // a few cells of query still fit beside it; the query then scrolls in
-    // the rest, so typing never pushes the count off the row.
-    let kept = input.keep_count && count_w > 0 && count_w + 2 + MIN_KEPT_QUERY <= field;
+    // A kept count claims its cells (and a two-cell gap) first, leaving a
+    // few cells of query beside it; the query then scrolls in the rest, so
+    // typing never pushes what the count keeps off the row.
+    let kept_count = input
+        .keep
+        .filter(|_| !input.count.is_empty())
+        .and_then(|keep| kept_label(input.count, keep, field.saturating_sub(2 + MIN_KEPT_QUERY)));
+    let kept = kept_count.is_some();
+    let count: &str = kept_count.as_deref().unwrap_or(input.count);
+    let count_w = count.width();
     let end_q = if kept {
         end - u16::try_from(count_w + 2).unwrap_or(0)
     } else {
@@ -257,7 +291,7 @@ fn paint_input_row(
     // unless it is kept, when its cells were set aside above.
     if count_w > 0 && (kept || text_w + 1 + 2 + count_w <= field) {
         let cx = end - u16::try_from(count_w).unwrap_or(0);
-        buf.set_string(cx, y, input.count, Style::default().fg(t.muted()));
+        buf.set_string(cx, y, count, Style::default().fg(t.muted()));
     }
     Some((caret_x, y))
 }
@@ -478,8 +512,25 @@ mod tests {
             placeholder: "Type a command",
             count: "3 matches",
             verb: "run",
-            keep_count: false,
+            keep: None,
         }
+    }
+
+    #[test]
+    fn a_kept_count_falls_back_to_what_it_keeps_then_cuts_it() {
+        assert_eq!(
+            kept_label("Pop Stash \u{b7} 3 matches", "Pop Stash", 30).as_deref(),
+            Some("Pop Stash \u{b7} 3 matches")
+        );
+        assert_eq!(
+            kept_label("Pop Stash \u{b7} 100 matches", "Pop Stash", 12).as_deref(),
+            Some("Pop Stash")
+        );
+        assert_eq!(
+            kept_label("Pop Stash \u{b7} 100 matches", "Pop Stash", 5).as_deref(),
+            Some("Pop \u{2026}")
+        );
+        assert_eq!(kept_label("x \u{b7} 1 match", "Pop Stash", 1), None);
     }
 
     fn row(buf: &Buffer, y: u16, rect: Rect) -> String {

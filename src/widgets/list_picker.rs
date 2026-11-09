@@ -460,8 +460,9 @@ fn render_picker_card(
     let count = qi::count_label(total, filtering, false, "item", "items");
     // The title is the placeholder, which any typed character hides (a
     // space included); from then on it rides beside the count and keeps
-    // its cells, so a picker whose title is its operation (Apply Stash vs
-    // Pop Stash) never stops saying which it is.
+    // its cells, before the count itself where both do not fit, so a picker
+    // whose title is its operation (Apply Stash vs Pop Stash) never stops
+    // saying which it is.
     let titled = !picker.query.is_empty() && !picker.title.is_empty();
     let count = if titled {
         format!("{} \u{b7} {count}", picker.title)
@@ -480,7 +481,7 @@ fn render_picker_card(
             placeholder: &picker.title,
             count: &count,
             verb: "select",
-            keep_count: titled,
+            keep: titled.then_some(picker.title.as_str()),
         },
     );
     let visible = card.list.height as usize;
@@ -668,6 +669,35 @@ mod tests {
                 "the caret stays left of the title"
             );
         }
+    }
+
+    /// Where the title and the count do not both fit beside the query, the
+    /// title wins: a 60-column terminal's narrowest card filtering a
+    /// hundred stashes still says Pop Stash.
+    #[test]
+    fn croft_loch_picker_puts_its_title_before_the_count_when_narrow() {
+        let theme = crate::theme::Theme::from_id("loch");
+        let many: Vec<ListRow> = (0..100)
+            .map(|i| ListRow {
+                id: i.to_string(),
+                label: format!("stash@{{{i}}}: WIP on feature"),
+            })
+            .collect();
+        let mut p = ListPicker::new(ListPurpose::CodeAction, "Pop Stash", many);
+        for c in "feature".chars() {
+            p.push_char(c);
+        }
+        let screen = Rect::new(0, 0, 60, 30);
+        let mut buf = Buffer::empty(screen);
+        render_list_picker(&mut p, screen, &mut buf, theme, false);
+        let r = p.last_rect;
+        assert_eq!(r.width, 36, "the narrowest card");
+        let line: String = (r.x..r.right())
+            .map(|x| buf[(x, r.y + 1)].symbol().to_string())
+            .collect();
+        assert!(line.contains("feature"), "{line:?}");
+        assert!(line.contains("Pop Stash"), "{line:?}");
+        assert!(!line.contains("100"), "the count yields first: {line:?}");
     }
 
     #[test]
