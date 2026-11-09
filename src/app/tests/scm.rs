@@ -528,7 +528,8 @@ fn git_status_spans_clean_branch_is_quiet_with_no_dot() {
         .iter()
         .find(|s| s.content.contains("main"))
         .expect("branch span");
-    assert_ne!(main_span.style.fg, Some(GIT_DIRTY_COLOR));
+    let tones = StatusTones::new(theme, status_bar_bg(theme));
+    assert_eq!(main_span.style.fg, Some(tones.text));
     let glyph = spans
         .iter()
         .find(|s| s.content.contains('\u{ea68}'))
