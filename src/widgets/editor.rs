@@ -16640,7 +16640,8 @@ impl Editor {
 
     /// Severities and messages of every diagnostic whose range covers the
     /// character position, each message followed by its rule as
-    /// `source(code)` and the rule's link on a line of its own (#1540).
+    /// `source(code)` and the rule's link on a line of its own (#1540), then
+    /// a line per related location (#1523), its file relative to `root`.
     /// The position is `(line, ch)`. Decoded on demand from the retained
     /// `diagnostics` (UTF-16 positions) rather than the per-line span cache so
     /// the messages don't have to be duplicated into the render-time cache.
@@ -16652,6 +16653,7 @@ impl Editor {
         &self,
         line: usize,
         ch: usize,
+        root: &Path,
     ) -> Vec<(crate::lsp::manager::DiagnosticSeverity, String)> {
         if self.diagnostics_path.as_deref() != self.path.as_deref() {
             return Vec::new();
@@ -16678,7 +16680,12 @@ impl Editor {
             };
             let to = to.max(from + 1);
             if ch >= from && ch < to {
-                out.push((d.severity, message_with_code(d)));
+                let mut text = message_with_code(d);
+                for related in d.related() {
+                    text.push('\n');
+                    text.push_str(&related.label(root));
+                }
+                out.push((d.severity, text));
             }
         }
         out
@@ -28618,7 +28625,7 @@ mod tests {
             }],
         );
         assert_eq!(
-            e.diagnostics_at(0, 6),
+            e.diagnostics_at(0, 6, Path::new("/tmp")),
             vec![(
                 DiagnosticSeverity::Error,
                 String::from("Type 'number' is not assignable to type 'string'.")
@@ -28626,7 +28633,7 @@ mod tests {
             "a point inside the diagnostic range must surface its message"
         );
         assert!(
-            e.diagnostics_at(0, 0).is_empty(),
+            e.diagnostics_at(0, 0, Path::new("/tmp")).is_empty(),
             "a point outside every diagnostic range must surface nothing"
         );
     }
@@ -28667,7 +28674,7 @@ mod tests {
             ],
         );
         assert_eq!(
-            e.diagnostics_at(0, 8),
+            e.diagnostics_at(0, 8, Path::new("/tmp")),
             vec![(
                 crate::lsp::manager::DiagnosticSeverity::Warning,
                 String::from(
@@ -28676,11 +28683,50 @@ mod tests {
             )]
         );
         assert_eq!(
-            e.diagnostics_at(0, 12),
+            e.diagnostics_at(0, 12, Path::new("/tmp")),
             vec![(
                 crate::lsp::manager::DiagnosticSeverity::Warning,
                 String::from("`json` is unused")
             )]
+        );
+    }
+
+    /// #1523: the places the server points at to explain a diagnostic
+    /// follow it in the hover as `file(line, col): message`, one-based, the
+    /// file relative to the workspace.
+    #[test]
+    fn diagnostics_at_lists_the_related_locations_under_the_message() {
+        let mut e = editor_with("let first = &v[0]; v.push(2);");
+        e.path = Some(PathBuf::from("/w/src/main.rs"));
+        let at = |line, character, message: &str| lsp_types::DiagnosticRelatedInformation {
+            location: lsp_types::Location {
+                uri: lsp_types::Url::parse("file:///w/src/main.rs").unwrap(),
+                range: lsp_types::Range::new(
+                    lsp_types::Position::new(line, character),
+                    lsp_types::Position::new(line, character + 1),
+                ),
+            },
+            message: message.into(),
+        };
+        let wire = lsp_types::Diagnostic {
+            range: lsp_types::Range::new(
+                lsp_types::Position::new(0, 19),
+                lsp_types::Position::new(0, 28),
+            ),
+            message: "cannot borrow `v` as mutable".into(),
+            related_information: Some(vec![
+                at(0, 13, "immutable borrow occurs here"),
+                at(4, 15, "immutable borrow later used here"),
+            ]),
+            ..Default::default()
+        };
+        let d = crate::lsp::client::convert_diagnostic("rust-analyzer", &wire);
+        e.apply_diagnostics(PathBuf::from("/w/src/main.rs"), vec![d]);
+        assert_eq!(
+            e.diagnostics_at(0, 20, Path::new("/w"))[0].1,
+            "cannot borrow `v` as mutable\n\
+             src/main.rs(1, 14): immutable borrow occurs here\n\
+             src/main.rs(5, 16): immutable borrow later used here"
         );
     }
 
@@ -28705,7 +28751,7 @@ mod tests {
             }],
         );
         assert_eq!(
-            e.diagnostics_at(0, 6),
+            e.diagnostics_at(0, 6, Path::new("/tmp")),
             vec![(
                 DiagnosticSeverity::Warning,
                 String::from("missing semicolon")
@@ -34144,7 +34190,11 @@ mod tests {
             e.diagnostic_spans[0],
             vec![(11, 12, DiagnosticSeverity::Error)]
         );
-        assert_eq!(e.diagnostics_at(0, 11).len(), 1, "hovered at the row's end");
+        assert_eq!(
+            e.diagnostics_at(0, 11, Path::new("/tmp")).len(),
+            1,
+            "hovered at the row's end"
+        );
     }
 
     /// #911: a formatter's edit up to the end of that text keeps the final

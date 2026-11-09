@@ -4545,6 +4545,49 @@ fn a_pushed_and_pulled_finding_with_different_data_is_one_row() {
     assert_eq!(diagnostics_by_source(&store[&path]).count(), 1);
 }
 
+/// #1523: croft shows a finding's related locations, so a pulled copy that
+/// names them is not dropped as a duplicate of a pushed copy that does not.
+/// Two copies naming the same ones are still one row.
+#[test]
+fn a_pulled_copy_with_related_locations_is_not_dropped_for_a_pushed_one_without() {
+    use crate::lsp::manager::DiagnosticsUpdate;
+    let mut store = std::collections::HashMap::new();
+    let path = PathBuf::from("/w/main.rs");
+    let copy = |related: bool| {
+        let here = lsp_types::DiagnosticRelatedInformation {
+            location: lsp_types::Location {
+                uri: lsp_types::Url::parse("file:///w/main.rs").unwrap(),
+                range: Default::default(),
+            },
+            message: "immutable borrow occurs here".into(),
+        };
+        crate::lsp::client::convert_diagnostic(
+            "rust-analyzer",
+            &lsp_types::Diagnostic {
+                message: "cannot borrow `v` as mutable".into(),
+                related_information: related.then(|| vec![here]),
+                ..Default::default()
+            },
+        )
+    };
+    let update = |pulled, diagnostics| DiagnosticsUpdate {
+        path: path.clone(),
+        server: "rust-analyzer".into(),
+        diagnostics,
+        pulled,
+    };
+    store_diagnostics_update(&mut store, update(false, vec![copy(false)]));
+    store_diagnostics_update(&mut store, update(true, vec![copy(true)]));
+    let related = |store: &std::collections::HashMap<_, _>| {
+        diagnostics_by_source(&store[&path])
+            .map(|(_, d)| d.related().len())
+            .collect::<Vec<_>>()
+    };
+    assert!(related(&store).contains(&1), "{:?}", related(&store));
+    store_diagnostics_update(&mut store, update(false, vec![copy(true)]));
+    assert_eq!(related(&store), vec![1], "the same locations are one row");
+}
+
 /// #1102: a server that pushes a finding and also returns it to a pull
 /// lists it once, under the server's own name.
 #[test]

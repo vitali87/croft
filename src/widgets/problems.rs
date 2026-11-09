@@ -1,10 +1,12 @@
 //! The bottom panel's PROBLEMS tab: aggregated workspace diagnostics, grouped
 //! by file exactly like VS Code's Problems view. Each file is a collapsible
 //! header (file icon + name + relative dir + a count badge); under it sits one
-//! row per diagnostic (severity glyph + message + source server). Clicking a
-//! diagnostic jumps the editor to that line; clicking a header collapses the
-//! group. The rows are a pure projection of the app's per-file diagnostics
-//! store, refreshed whenever a language server republishes.
+//! row per diagnostic (severity glyph + message + source server), and under
+//! that an indented row per related location its server named (#1523).
+//! Clicking a diagnostic or a related row jumps the editor to that line;
+//! clicking a header collapses the group. The rows are a pure projection of
+//! the app's per-file diagnostics store, refreshed whenever a language server
+//! republishes.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -59,6 +61,21 @@ pub struct ProblemItem {
     /// The rule it reports (#1540), shown as `source(code)` after the
     /// message so it can be silenced or looked up.
     pub code: Option<crate::lsp::manager::DiagnosticCode>,
+    /// The places its server points at to explain it (#1523), each a row
+    /// of its own under it.
+    pub related: Vec<ProblemRelated>,
+}
+
+/// A related location under a diagnostic (#1523): "immutable borrow occurs
+/// here", "'foo' is declared here". Zero-based, the column in UTF-16 (LSP).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProblemRelated {
+    pub path: PathBuf,
+    /// `path` relative to the workspace root, as the row names it.
+    pub rel_path: String,
+    pub line: u32,
+    pub col: u32,
+    pub message: String,
 }
 
 /// All diagnostics for one file, the unit the Problems view groups by.
@@ -78,6 +95,8 @@ pub struct ProblemGroup {
 enum RenderRow {
     Header(usize),
     Diag(usize, usize),
+    /// A diagnostic's related location: group, item, index into `related`.
+    Related(usize, usize, usize),
 }
 
 /// Which files the panel lists (#256). `OpenFiles` matches the pre-#256
@@ -175,8 +194,9 @@ impl ProblemFilter {
 pub enum ProblemHit {
     /// A file header: collapse/expand its group.
     Header(PathBuf),
-    /// A diagnostic: jump the editor to `(path, line, col)` (zero-based).
-    /// `col_utf16` carries the column's unit through from [`ProblemItem`].
+    /// A diagnostic, or one of its related locations (#1523): jump the
+    /// editor to `(path, line, col)` (zero-based). `col_utf16` carries the
+    /// column's unit through from [`ProblemItem`].
     Diagnostic {
         path: PathBuf,
         line: u32,
@@ -184,6 +204,10 @@ pub enum ProblemHit {
         col_utf16: bool,
     },
 }
+
+/// What a related row starts with: two cells deeper than its diagnostic's
+/// message (`   {glyph} `), so it reads as that row's child (#1523).
+const RELATED_INDENT: &str = "       ";
 
 /// How many trailing characters of the free-text filter the toolbar
 /// chip shows. The filter itself is unbounded; only its display is.
@@ -292,23 +316,13 @@ impl ProblemsPanel {
     /// with its file: what screen reader mode reads out for the panel
     /// (#1295), which has no row selection of its own yet.
     pub fn top_diagnostic(&self) -> Option<(&ProblemGroup, &ProblemItem)> {
-        let mut row = 0usize;
-        for (g, items) in self.visible_groups() {
-            let group = &self.groups[g];
-            if self.group_by_file {
-                row += 1;
-                if self.collapsed.contains(&group.path) {
-                    continue;
-                }
-            }
-            for i in items {
-                if row >= self.scroll {
-                    return Some((group, &group.items[i]));
-                }
-                row += 1;
-            }
-        }
-        None
+        self.layout()
+            .into_iter()
+            .skip(self.scroll)
+            .find_map(|row| match row {
+                RenderRow::Diag(g, i) => Some((&self.groups[g], &self.groups[g].items[i])),
+                _ => None,
+            })
     }
 
     pub fn error_count(&self) -> usize {
@@ -351,7 +365,8 @@ impl ProblemsPanel {
 
     /// True when `it` in `group` passes BOTH the severity cycle and the
     /// free-text filter (case-insensitive substring of the message or the
-    /// file path).
+    /// file path, or of a related row's, which keeps the diagnostic with all
+    /// its related rows, #1523).
     fn keeps_item(&self, group: &ProblemGroup, it: &ProblemItem) -> bool {
         if !self.filter.keeps(it.severity) {
             return false;
@@ -370,6 +385,10 @@ impl ProblemsPanel {
                 .to_string_lossy()
                 .to_lowercase()
                 .contains(&needle)
+            || it.related.iter().any(|r| {
+                r.message.to_lowercase().contains(&needle)
+                    || r.rel_path.to_lowercase().contains(&needle)
+            })
     }
 
     pub fn push_filter_char(&mut self, c: char) {
@@ -416,21 +435,9 @@ impl ProblemsPanel {
     }
 
     /// The number of laid-out rows for the current filter, collapse state, and
-    /// grouping. Grouped: one header per visible file plus one row per shown
-    /// diagnostic of an expanded group. Flat: one row per shown diagnostic.
+    /// grouping.
     fn total_rows(&self) -> usize {
-        self.visible_groups()
-            .iter()
-            .map(|(g, items)| {
-                if !self.group_by_file {
-                    items.len()
-                } else if self.collapsed.contains(&self.groups[*g].path) {
-                    1
-                } else {
-                    1 + items.len()
-                }
-            })
-            .sum()
+        self.layout().len()
     }
 
     pub fn scroll_to_bar_y(&mut self, y: u16) -> bool {
@@ -472,6 +479,15 @@ impl ProblemsPanel {
                     col_utf16: item.col_utf16,
                 })
             }
+            RenderRow::Related(g, i, r) => {
+                let related = self.groups.get(*g)?.items.get(*i)?.related.get(*r)?;
+                Some(ProblemHit::Diagnostic {
+                    path: related.path.clone(),
+                    line: related.line,
+                    col: related.col,
+                    col_utf16: true,
+                })
+            }
         }
     }
 
@@ -487,7 +503,8 @@ impl ProblemsPanel {
         }
         match self.rows.get(self.scroll + offset)? {
             RenderRow::Header(_) => None,
-            RenderRow::Diag(g, i) => {
+            // A related row stands for the diagnostic it explains.
+            RenderRow::Diag(g, i) | RenderRow::Related(g, i, _) => {
                 let group = self.groups.get(*g)?;
                 let item = group.items.get(*i)?;
                 Some((group.path.clone(), item.clone()))
@@ -495,24 +512,32 @@ impl ProblemsPanel {
         }
     }
 
-    /// Rebuild the flat row list for the current filter, collapse state, and
-    /// grouping. Called at the top of `render` so `rows` always matches what
-    /// was painted.
-    fn build_rows(&mut self) {
-        self.rows.clear();
+    /// The rows for the current filter, collapse state, and grouping.
+    /// Grouped: a header per visible file, then, unless it is collapsed, a
+    /// row per shown diagnostic. Flat: the diagnostic rows only. Either way
+    /// each diagnostic's related locations follow it (#1523).
+    fn layout(&self) -> Vec<RenderRow> {
+        let mut rows = Vec::new();
         for (g, items) in self.visible_groups() {
-            if !self.group_by_file {
-                // Flat list: diagnostics only, no headers, no collapse.
-                self.rows
-                    .extend(items.into_iter().map(|i| RenderRow::Diag(g, i)));
-                continue;
+            if self.group_by_file {
+                rows.push(RenderRow::Header(g));
+                if self.collapsed.contains(&self.groups[g].path) {
+                    continue;
+                }
             }
-            self.rows.push(RenderRow::Header(g));
-            if !self.collapsed.contains(&self.groups[g].path) {
-                self.rows
-                    .extend(items.into_iter().map(|i| RenderRow::Diag(g, i)));
+            for i in items {
+                rows.push(RenderRow::Diag(g, i));
+                let related = self.groups[g].items[i].related.len();
+                rows.extend((0..related).map(|r| RenderRow::Related(g, i, r)));
             }
         }
+        rows
+    }
+
+    /// Rebuild the row list. Called at the top of `render` so `rows` always
+    /// matches what was painted.
+    fn build_rows(&mut self) {
+        self.rows = self.layout();
     }
 
     /// Cycle the severity filter (toolbar funnel). Resets scroll so the
@@ -716,6 +741,7 @@ impl Widget for &mut ProblemsPanel {
             let spans = match render_row {
                 RenderRow::Header(g) => self.header_spans(g),
                 RenderRow::Diag(g, i) => self.diag_spans(g, i),
+                RenderRow::Related(g, i, r) => self.related_spans(g, i, r),
             };
             Paragraph::new(Line::from(spans)).render(row_rect, buf);
         }
@@ -897,6 +923,27 @@ impl ProblemsPanel {
         }
         spans
     }
+
+    /// A related location's row (#1523), indented under its diagnostic's
+    /// message and read as VS Code's: `file [Ln, Col]: message`.
+    fn related_spans(&self, g: usize, i: usize, r: usize) -> Vec<Span<'static>> {
+        let related = &self.groups[g].items[i].related[r];
+        vec![
+            Span::styled(
+                format!(
+                    "{RELATED_INDENT}{} [Ln {}, Col {}]: ",
+                    related.rel_path,
+                    related.line + 1,
+                    related.col + 1
+                ),
+                Style::default().fg(self.theme.ui(COLOR_DIM)),
+            ),
+            Span::styled(
+                crate::lsp::manager::one_line(&related.message),
+                Style::default().fg(self.theme.ui(COLOR_MSG)),
+            ),
+        ]
+    }
 }
 
 #[cfg(test)]
@@ -914,6 +961,7 @@ mod tests {
             message: msg.to_string(),
             source: "rustc".to_string(),
             code: None,
+            related: Vec::new(),
         }
     }
 
@@ -1094,6 +1142,38 @@ mod tests {
         assert_eq!(p.total_rows(), 0, "no row shows `rustc`");
     }
 
+    /// #1523: text only a related row shows, its message or its file, finds
+    /// the diagnostic, which stays listed with all its related rows.
+    #[test]
+    fn text_filter_matches_a_related_rows_message_and_file() {
+        let related = |rel_path: &str, message: &str| ProblemRelated {
+            path: PathBuf::from("/repo").join(rel_path),
+            rel_path: rel_path.to_string(),
+            line: 1,
+            col: 2,
+            message: message.to_string(),
+        };
+        let mut missing = diag(3, DiagnosticSeverity::Error, "Property 'foo' is missing");
+        missing.related = vec![
+            related("src/bar.ts", "'foo' is declared here."),
+            related("src/other.ts", "and used here."),
+        ];
+        let mut p = ProblemsPanel::new();
+        p.set_groups(vec![group(
+            "a.ts",
+            vec![missing, diag(9, DiagnosticSeverity::Warning, "meh")],
+        )]);
+        for c in "declared here".chars() {
+            p.push_filter_char(c);
+        }
+        assert_eq!(p.total_rows(), 4, "header, diagnostic, both related rows");
+        p.clear_text_filter();
+        for c in "other.ts".chars() {
+            p.push_filter_char(c);
+        }
+        assert_eq!(p.total_rows(), 4, "a related row's file matches too");
+    }
+
     /// The file header's count badge must reflect the ACTIVE severity
     /// filter: with "Errors" selected, a file with 1 error and 2 warnings
     /// used to still show 3 over a single listed row.
@@ -1208,6 +1288,54 @@ mod tests {
             Some(false),
             "the build tool's identical column is NOT UTF-16"
         );
+    }
+
+    /// #1523: a diagnostic's related locations are indented rows under it,
+    /// in the flat list too, counted for scrolling, and a click on one jumps
+    /// to its own place, its column in UTF-16 like any server position.
+    #[test]
+    fn related_locations_are_rows_under_their_diagnostic_that_jump_there() {
+        let mut borrow = diag(3, DiagnosticSeverity::Error, "cannot borrow `v`");
+        borrow.related = vec![ProblemRelated {
+            path: PathBuf::from("/repo/src/lib.rs"),
+            rel_path: String::from("src/lib.rs"),
+            line: 2,
+            col: 17,
+            message: String::from("immutable borrow\r\noccurs here"),
+        }];
+        let mut p = ProblemsPanel::new();
+        p.set_groups(vec![group(
+            "a.rs",
+            vec![borrow, diag(9, DiagnosticSeverity::Warning, "meh")],
+        )]);
+        let row = |screen: &str, n| screen.lines().nth(n).unwrap_or_default().to_string();
+        let screen = render(&mut p, 80, 6);
+        assert!(row(&screen, 2).contains("cannot borrow `v`"), "{screen}");
+        assert!(
+            row(&screen, 3).starts_with(&format!(
+                "{RELATED_INDENT}src/lib.rs [Ln 3, Col 18]: immutable borrow occurs here"
+            )),
+            "{screen}"
+        );
+        assert!(
+            row(&screen, 4).contains("meh"),
+            "the next diagnostic follows"
+        );
+        assert_eq!(
+            p.hit_at(3),
+            Some(ProblemHit::Diagnostic {
+                path: PathBuf::from("/repo/src/lib.rs"),
+                line: 2,
+                col: 17,
+                col_utf16: true,
+            })
+        );
+        // Three list rows show four: the scroll reaches the last one.
+        render(&mut p, 80, 4);
+        p.scroll_down(10);
+        assert!(row(&render(&mut p, 80, 4), 3).contains("meh"));
+        p.toggle_group_by_file();
+        assert!(row(&render(&mut p, 80, 6), 2).contains("src/lib.rs [Ln 3"));
     }
 
     /// #1540: a row shows its rule as `source(code)`, with the diagnostic's
