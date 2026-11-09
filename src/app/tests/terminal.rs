@@ -3657,19 +3657,18 @@ fn a_resize_that_rewraps_the_output_keeps_each_capture_on_its_own_copy() {
     }
 }
 
-#[test]
-fn a_resize_under_a_full_screen_program_still_finds_each_capture() {
-    // A full-screen program hides the primary grid, but a resize re-wraps
-    // it all the same, out of reach. Each entry then finds its line by its
-    // text instead of saying a line still on screen is gone (#1450).
-    let long = "printf '%0200d\\n' 0";
-    let (_tmp, mut app) = app_with_captures(
+/// Run `before`, then a full-screen program that the pane is resized to 40
+/// columns under, then `after` once it exits (#1450).
+fn app_resized_under_a_full_screen_program(
+    before: &str,
+    want: usize,
+    after: &str,
+) -> (tempfile::TempDir, App) {
+    let (tmp, mut app) = app_with_captures(
         &format!(
-            "echo ${{e}}-7 broke; echo first; {long}; echo ${{e}}-7 broke; echo second; \
-             {long}; {long}; {long}; printf '\\033[?1049h'; read y; printf '\\033[?1049l'; \
-             echo back"
+            "{before}; printf '\\033[?1049h'; read y; printf '\\033[?1049l'; {after}; echo back"
         ),
-        2,
+        want,
     );
     let wait = |app: &mut App, what: &str, done: &dyn Fn(&App) -> bool| {
         crate::test_budget::await_spawned(
@@ -3694,15 +3693,71 @@ fn a_resize_under_a_full_screen_program_still_finds_each_capture() {
                 .iter()
                 .any(|l| l.trim_end() == "back")
     });
-    for i in 0..2 {
+    (tmp, app)
+}
+
+#[test]
+fn a_resize_under_a_full_screen_program_keeps_each_capture_on_its_own_copy() {
+    // A full-screen program hides the primary grid, but a resize re-wraps
+    // it all the same, out of reach. Each entry then finds its line by its
+    // text and its order among the copies, not the newest copy and not
+    // "gone" for a line still on screen (#1450).
+    let long = "printf '%0200d\\n' 0";
+    let (_tmp, mut app) = app_resized_under_a_full_screen_program(
+        &format!(
+            "echo ${{e}}-7 broke; echo first; {long}; echo ${{e}}-7 broke; echo second; \
+             {long}; {long}; {long}"
+        ),
+        2,
+        "true",
+    );
+    for (i, next) in ["first", "second"].into_iter().enumerate() {
         app.captures.select_index(i);
         app.captures_open_selected();
-        assert!(
-            app.terminals[0].selection_text().contains("err-7 broke"),
-            "entry {i}: {}",
-            app.status
+        let line = app.terminals[0]
+            .selection()
+            .unwrap_or_else(|| panic!("entry {i}: {}", app.status))
+            .anchor
+            .0;
+        let (lines, top) = app.terminals[0].grid_lines();
+        assert_eq!(
+            lines[(line - top) as usize + 1].trim_end(),
+            next,
+            "entry {i} selects its own copy"
         );
     }
+}
+
+#[test]
+fn a_copy_gone_after_a_full_screen_resize_is_not_stood_in_for_by_its_repeat() {
+    // The first copy rotates off the 5000-row scrollback after the resize
+    // under a full-screen program; its entry says so instead of taking the
+    // second copy, which its own entry still finds (#1450).
+    let (_tmp, mut app) = app_resized_under_a_full_screen_program(
+        "echo ${e}-7 broke; yes 'filler line' | head -n 4995; echo ${e}-7 broke; echo second",
+        2,
+        "yes 'filler line' | head -n 100",
+    );
+    let (lines, _) = app.terminals[0].grid_lines();
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|l| l.starts_with("err-7 broke"))
+            .count(),
+        1,
+        "precondition: the first copy rotated off the scrollback"
+    );
+    app.captures.select_index(0);
+    app.captures_open_selected();
+    assert_eq!(app.status, "Captured line is no longer in the scrollback");
+    assert!(app.terminals[0].selection().is_none());
+    app.captures.select_index(1);
+    app.captures_open_selected();
+    assert!(
+        app.terminals[0].selection_text().contains("err-7 broke"),
+        "the copy still on screen is found: {}",
+        app.status
+    );
 }
 
 #[test]
