@@ -8719,7 +8719,7 @@ impl Editor {
     }
 
     pub fn insert_char(&mut self, c: char) {
-        if self.overwrite_applies() {
+        if self.overwrite_applies(c) {
             self.overwrite_char(c);
             return;
         }
@@ -8764,11 +8764,12 @@ impl Editor {
         self.last_typed = Some((c, self.edit_seq));
     }
 
-    /// Whether a typed character should overwrite rather than insert: the
-    /// mode is on, there is a character to the right of the one caret on its
-    /// line (at the end of a line typing appends, as in every editor) and no
-    /// selection or extra caret is in play (those keep their insert semantics).
-    fn overwrite_applies(&self) -> bool {
+    /// Whether typed `c` should overwrite rather than insert: the mode is
+    /// on, there is a character to the right of the one caret on its line (at
+    /// the end of a line typing appends, as in every editor), no selection or
+    /// extra caret is in play (those keep their insert semantics), and `c`
+    /// does not complete the character before the caret.
+    fn overwrite_applies(&self, c: char) -> bool {
         self.overwrite
             && self.carets.is_empty()
             && !self.selection.is_some_and(|s| s.has_area())
@@ -8776,6 +8777,25 @@ impl Editor {
                 .lines
                 .get(self.cursor_row)
                 .is_some_and(|l| self.cursor_col < l.chars().count())
+            && !self.joins_cluster_before_caret(c)
+    }
+
+    /// Whether `c` typed at the caret joins the cluster just before it: a
+    /// combining accent after its letter, a vowel sign after its consonant, a
+    /// ZWJ or the next part of an emoji sequence. It belongs to that
+    /// character, so Overwrite inserts it instead of replacing the next one.
+    fn joins_cluster_before_caret(&self, c: char) -> bool {
+        let Some(line) = self.lines.get(self.cursor_row) else {
+            return false;
+        };
+        let byte = self.byte_index(self.cursor_row, self.cursor_col);
+        let Some(prev) = line[..byte].graphemes(true).next_back() else {
+            return false;
+        };
+        let mut joined = String::with_capacity(prev.len() + c.len_utf8());
+        joined.push_str(prev);
+        joined.push(c);
+        joined.graphemes(true).nth(1).is_none()
     }
 
     /// Overwrite-mode typing: replace the character cluster under the caret

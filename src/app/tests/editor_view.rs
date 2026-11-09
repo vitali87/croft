@@ -2449,6 +2449,30 @@ fn overwrite_leaves_the_caret_after_a_cluster_the_typed_char_joins() {
 }
 
 #[test]
+fn overwrite_adds_a_combining_mark_to_the_letter_before_the_caret() {
+    // The accent belongs to the `e` just typed: it must not eat the `b`.
+    let (_t, mut app) = overwrite_app("abcd");
+    app.overwrite_mode = true;
+    app.handle_key(key(KeyCode::Char('e'), KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('\u{301}'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.lines[0], "e\u{301}bcd");
+    assert_eq!(app.editor.cursor_col, 2);
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        app.editor.lines[0], "e\u{301}xcd",
+        "the next key replaces again"
+    );
+    app.editor.undo();
+    assert_eq!(
+        app.editor.lines[0], "abcd",
+        "still one undo step for the run"
+    );
+}
+
+#[test]
 fn overwrite_mode_is_shown_by_a_glyph_after_the_workspace_cap_not_in_the_position() {
     let (_t, mut app) = overwrite_app("abc");
     let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
