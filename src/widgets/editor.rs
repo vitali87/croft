@@ -44477,8 +44477,6 @@ mod tests {
 
     // ---- Overlays after wide characters (#873) ----
 
-    /// The glyphs on the first text row whose cells `pick` selects, left to
-    /// right: what an overlay covers on screen.
     /// A cell Croft Loch has tinted as a find match: an amber fill, red
     /// well above blue, which no other Loch editor fill (canvas, current
     /// line, selection, occurrence grey) is.
@@ -44486,6 +44484,8 @@ mod tests {
         matches!(c.bg, Color::Rgb(r, _, b) if r > b.saturating_add(24))
     }
 
+    /// The glyphs on the first text row whose cells `pick` selects, left to
+    /// right: what an overlay covers on screen.
     fn glyphs_where(
         e: &Editor,
         buf: &Buffer,
