@@ -1,0 +1,2 @@
+feature: A calmer status bar: a teal cap with the `<>` mark and the workspace's name replaces the wordmark, the branch stays quiet with a small amber dot for uncommitted changes, problem counts stay dim at zero, the line and column numbers stand out from their labels, and the language sits in a pill with its file icon.
+feature: Status bar badges (vim's mode, a macro or terminal recording, a running CodeQL query) are rounded pills, and messages name files inside the workspace by their relative path.
