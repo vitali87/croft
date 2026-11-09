@@ -120,6 +120,10 @@ pub enum Command {
 
     /// Pick a stash and open its changes (#1581).
     GitViewStash,
+    /// The caret line's commit, as the inline blame names it (#1556): open
+    /// the changes it made to the file, or copy its hash.
+    GitOpenLineCommit,
+    GitCopyLineCommitHash,
     AddCursorAbove,
     AddCursorBelow,
     ColumnSelectUp,
@@ -705,6 +709,8 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::GitCopyHeadLink,
     Command::GitOpenOnRemote,
     Command::GitViewStash,
+    Command::GitOpenLineCommit,
+    Command::GitCopyLineCommitHash,
     Command::AddCursorAbove,
     Command::AddCursorBelow,
     Command::ColumnSelectUp,
@@ -1193,6 +1199,8 @@ impl Command {
             Command::GitOpenOnRemote => "Git: Open on Remote",
 
             Command::GitViewStash => "Git: View Stash\u{2026}",
+            Command::GitOpenLineCommit => "Git: Open Commit for Line",
+            Command::GitCopyLineCommitHash => "Git: Copy Commit Hash for Line",
             Command::AddCursorAbove => "Add Cursor Above",
             Command::AddCursorBelow => "Add Cursor Below",
             Command::ColumnSelectUp => "Column Select Up",
@@ -1694,6 +1702,7 @@ impl Command {
             Command::GitCopyPermalink | Command::GitCopyHeadLink | Command::GitOpenOnRemote => "",
 
             Command::GitViewStash => "",
+            Command::GitOpenLineCommit | Command::GitCopyLineCommitHash => "",
             Command::AddCursorAbove => "Cmd+Opt+↑",
             Command::AddCursorBelow => "Cmd+Opt+↓",
             Command::ColumnSelectUp => "Cmd+Shift+Opt+↑",
@@ -2176,6 +2185,8 @@ impl Command {
             Command::GitOpenOnRemote => "git_open_on_remote",
 
             Command::GitViewStash => "git_view_stash",
+            Command::GitOpenLineCommit => "git_open_line_commit",
+            Command::GitCopyLineCommitHash => "git_copy_line_commit_hash",
             Command::AddCursorAbove => "add_cursor_above",
             Command::AddCursorBelow => "add_cursor_below",
             Command::ColumnSelectUp => "column_select_up",
@@ -2561,8 +2572,9 @@ impl Command {
     /// title: "layout" for the Customize Layout commands (#852), whose
     /// VS Code names mostly don't say it, the tab menu's "Keep Open" for
     /// View: Keep Editor, the hosts a shared link opens on (#1610), and VS
-    /// Code's own names for restarting a language server (#1621). Empty for
-    /// the rest.
+    /// Code's own names for restarting a language server (#1621), and
+    /// "blame" for the commands on the caret line's commit (#1556). Empty
+    /// for the rest.
     pub fn keyword(self) -> &'static str {
         if LAYOUT_COMMANDS.contains(&self) {
             "layout"
@@ -2578,6 +2590,11 @@ impl Command {
             Command::GitCopyPermalink | Command::GitCopyHeadLink | Command::GitOpenOnRemote
         ) {
             "github gitlab bitbucket share link url"
+        } else if matches!(
+            self,
+            Command::GitOpenLineCommit | Command::GitCopyLineCommitHash
+        ) {
+            "blame"
         } else {
             ""
         }

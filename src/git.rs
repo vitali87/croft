@@ -1982,6 +1982,24 @@ fn file_cwd(root: &Path, rel_path: &str) -> (PathBuf, String) {
     }
 }
 
+/// The top of the repository that holds `rel_path`, found from the file's
+/// own folder as [`file_cwd`] finds it, and the file's path from that top,
+/// which is how the rename walk in [`path_at_commit`] names it. Git run in a
+/// workspace that sits above a nested repository finds none (#1556). Falls
+/// back to `root` and `rel_path` outside any repository.
+fn repo_top_and_path(root: &Path, rel_path: &str) -> (PathBuf, String) {
+    let (dir, name) = file_cwd(root, rel_path);
+    let out = run_git(&dir, &["rev-parse", "--show-toplevel", "--show-prefix"]);
+    let mut lines = out.as_deref().unwrap_or_default().lines();
+    match lines.next() {
+        Some(top) if !top.is_empty() => {
+            let prefix = lines.next().unwrap_or_default();
+            (PathBuf::from(top), format!("{prefix}{name}"))
+        }
+        _ => (root.to_path_buf(), rel_path.to_string()),
+    }
+}
+
 /// Recent commits touching `rel_path`, newest first, via `git log --follow`
 /// (so the history survives renames, like VS Code's Timeline). Returns an
 /// empty vec when the path is untracked, the repo has no history, or git is
@@ -2039,8 +2057,11 @@ pub fn parse_file_history(out: &str, now: i64) -> Vec<FileHistoryEntry> {
 }
 
 /// Raw `git show <hash> -- <rel_path>` text: the file's diff in that commit,
-/// for opening a TIMELINE entry in the side-by-side diff viewer.
+/// for opening a TIMELINE entry in the side-by-side diff viewer. Run in the
+/// repository that holds the file, wherever the workspace `root` sits.
 pub fn show_commit_file_diff(root: &Path, hash: &str, rel_path: &str) -> Result<String, String> {
+    let (top, path) = repo_top_and_path(root, rel_path);
+    let (root, rel_path) = (top.as_path(), path.as_str());
     if path_filter(root, rel_path).is_some() {
         return filtered_commit_file_diff(root, hash, rel_path);
     }
@@ -2726,7 +2747,9 @@ pub fn parse_commit_graph(out: &str, now: i64) -> Vec<GraphCommit> {
 /// `uncommitted`.
 #[derive(Debug, PartialEq, Eq)]
 pub struct BlameCommit {
-    pub short_hash: String,
+    /// The full hash, which Git: Copy Commit Hash for Line copies and Git:
+    /// Open Commit for Line shows (#1556).
+    pub hash: String,
     pub summary: String,
     pub author: String,
     /// Seconds since the commit's author-time, for [`humanize_age`].
@@ -2734,6 +2757,13 @@ pub struct BlameCommit {
     /// True for a not-yet-committed line (the zero hash `git blame` reports
     /// for working-tree changes).
     pub uncommitted: bool,
+}
+
+impl BlameCommit {
+    /// The hash's first eight digits, as the inline blame names a commit.
+    pub fn short_hash(&self) -> &str {
+        &self.hash[..self.hash.len().min(8)]
+    }
 }
 
 /// A file's blame, line by line (#1707). Each line's commit is shared with
@@ -2832,7 +2862,7 @@ pub fn parse_blame(out: &str, now: i64) -> Blame {
             if let Some(full) = hash.take() {
                 let commit = commits.entry(full).or_insert_with_key(|full| {
                     Arc::new(BlameCommit {
-                        short_hash: full.chars().take(8).collect(),
+                        hash: full.clone(),
                         summary: std::mem::take(&mut summary),
                         author: std::mem::take(&mut author),
                         age_secs: now - author_time,
@@ -3832,6 +3862,16 @@ pub fn commit_message(root: &Path, hash: &str) -> Result<String, String> {
     run_git(root, &["log", "-1", "--format=%B", hash])
         .map(|m| m.trim().to_string())
         .map_err(|e| e.to_string())
+}
+
+/// The inline blame's hover card for `hash` (#1556): author and email, the
+/// full date, the short hash and the whole message, which `git blame`
+/// does not give (its `summary` is the first line). `--no-show-signature`
+/// because a `log.showSignature = true` config would otherwise print gpg's
+/// verdict above the card.
+pub fn commit_card(dir: &Path, hash: &str) -> Result<String, String> {
+    let format = "--format=%an <%ae>%n%ad (%ar)%ncommit %h%n%n%B";
+    run_git(dir, &["log", "-1", "--no-show-signature", format, hash]).map_err(|e| e.to_string())
 }
 
 // --- Remotes -------------------------------------------------------------
@@ -7308,7 +7348,8 @@ filename seed.txt
         let b = parse_blame(out, now);
         assert_eq!(b.len(), 2, "one entry per source line");
         let (first, text) = b.line(0).unwrap();
-        assert_eq!(first.short_hash, "abcdef01");
+        assert_eq!(first.hash, "abcdef0123456789abcdef0123456789abcdef01");
+        assert_eq!(first.short_hash(), "abcdef01");
         assert_eq!(first.author, "Vitali");
         assert_eq!(first.summary, "fix: the thing");
         assert_eq!(first.age_secs, 4, "now (10000) minus author-time (9996)");
@@ -7350,7 +7391,7 @@ filename seed.txt
         assert_eq!(third.author, "Vitali");
         assert_eq!(third.summary, "fix: the thing");
         assert_eq!(third.age_secs, 4);
-        assert_eq!(third.short_hash, "abcdef01");
+        assert_eq!(third.short_hash(), "abcdef01");
         assert!(
             std::ptr::eq(b.line(0).unwrap().0, third),
             "two lines of one commit share its record"
@@ -7372,7 +7413,7 @@ filename seed.txt
             "committed by init_repo_with_commit's user"
         );
         assert!(!first.uncommitted);
-        assert!(!first.short_hash.is_empty());
+        assert_eq!(first.hash.len(), 40, "the full hash");
         assert_eq!(
             b.line(1).unwrap().0.author,
             "a",
@@ -7391,6 +7432,19 @@ filename seed.txt
         init_repo_with_commit(&sub);
         let hist = file_history(tmp.path(), "sub/seed.txt", 10);
         assert_eq!(hist.len(), 1, "the commit in sub/ must be listed");
+    }
+
+    /// #1556: a TIMELINE row or Git: Open Commit for Line in a workspace
+    /// opened above the repository must still show the commit's diff.
+    #[test]
+    fn a_commits_file_diff_comes_from_the_repo_below_the_workspace_root() {
+        let tmp = TempDir::new().unwrap();
+        let sub = tmp.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        init_repo_with_commit(&sub);
+        let raw = show_commit_file_diff(tmp.path(), "HEAD", "sub/seed.txt").unwrap();
+        assert!(raw.contains("diff --git a/seed.txt b/seed.txt"), "{raw}");
+        assert!(raw.lines().any(|l| l == "+two"), "{raw}");
     }
 
     #[test]

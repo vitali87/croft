@@ -3990,6 +3990,10 @@ pub struct App {
     /// The file blame has been fetched (or is in flight) for; reset to `None`
     /// on HEAD move so the annotation refreshes after a commit / checkout.
     blame_fetched: Option<PathBuf>,
+    /// The commit whose card the pointer, resting on the inline blame, asked
+    /// for (#1556), and where `git log` sends it. Kept once the card shows,
+    /// so the card stays while the pointer moves along the annotation.
+    blame_hover: Option<(String, std::sync::mpsc::Receiver<Result<String, String>>)>,
     /// The network git operation in flight (push, pull, fetch, clone...),
     /// named for the status line, and where its finisher arrives.
     git_net_job: Option<(String, std::sync::mpsc::Receiver<GitNetDone>)>,
@@ -7213,6 +7217,7 @@ impl App {
             blame_rx,
             blame_tx,
             blame_fetched: None,
+            blame_hover: None,
             git_net_job: None,
             git_view_job: None,
             vim_mode_pref: false,
@@ -10995,6 +11000,87 @@ impl App {
         changed
     }
 
+    /// The caret line's commit as the inline blame names it (#1556), full
+    /// hash and short; when it names none, the status line says why.
+    fn caret_line_commit(&mut self) -> Option<(String, String)> {
+        use crate::widgets::editor::LineBlame;
+        let line = self.editor.cursor_row + 1;
+        self.status = match self.editor.cursor_line_blame() {
+            Some(LineBlame::Commit(c)) => {
+                return Some((c.hash.clone(), c.short_hash().to_string()));
+            }
+            Some(LineBlame::Uncommitted) => format!("Line {line} has uncommitted changes"),
+            None if !self.inline_blame_enabled => {
+                String::from("Inline blame is off: Git: Toggle Inline Blame turns it on")
+            }
+            None => format!("Git has no commit for line {line}"),
+        };
+        None
+    }
+
+    /// Git: Open Commit for Line, and a click on the inline blame (#1556):
+    /// the changes the caret line's commit made to this file, in the
+    /// side-by-side diff a TIMELINE row opens (GitLens's Open Changes).
+    fn open_commit_for_line(&mut self) {
+        if let Some((hash, _)) = self.caret_line_commit()
+            && let Some(path) = self.editor.path.clone()
+        {
+            self.open_timeline_diff(path, hash);
+        }
+    }
+
+    /// The pointer rested on the inline blame naming `hash` (#1556): fetch
+    /// the commit's card off the UI thread, for [`Self::drain_blame_hover`].
+    fn hover_blame_card(&mut self, col: u16, row: u16, hash: String) {
+        let shown = self.hover_popup.is_some();
+        if shown && self.blame_hover.as_ref().is_some_and(|(h, _)| *h == hash) {
+            return;
+        }
+        // The file's own folder is in its repository, as blame's is.
+        let Some(dir) = self.editor.path.as_deref().and_then(Path::parent) else {
+            return;
+        };
+        let dir = dir.to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let job = hash.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::git::commit_card(&dir, &job));
+        });
+        // A word's hover still in flight must not land over the card.
+        self.hover_request_id = None;
+        self.hover_word = None;
+        self.hover_anchor = Some((col, row));
+        self.blame_hover = Some((hash, rx));
+    }
+
+    /// Show the inline blame's commit card once `git log` has it, if the
+    /// pointer is still on an annotation naming that commit: a tab switch or
+    /// caret move while git ran can put another commit's there. True when
+    /// the card appeared.
+    fn drain_blame_hover(&mut self) -> bool {
+        let Some((hash, card)) = self
+            .blame_hover
+            .as_ref()
+            .and_then(|(hash, rx)| rx.try_recv().ok().map(|card| (hash.clone(), card)))
+        else {
+            return false;
+        };
+        let under = self
+            .hover
+            .cell()
+            .and_then(|(c, r)| self.editor.blame_commit_at(c, r));
+        if under != Some(hash.as_str()) {
+            self.blame_hover = None;
+            return false;
+        }
+        let card = card.unwrap_or_else(|e| format!("Could not read the commit: {e}"));
+        self.hover_popup = Some(crate::widgets::hover_popup::HoverPopup::new(
+            format!("{card}\n\nClick to open its changes (Git: Open Commit for Line)"),
+            self.hover_anchor.unwrap_or((0, 0)),
+        ));
+        true
+    }
+
     /// Drain LSP completion responses. Drops responses with stale request
     /// ids so a slow earlier reply cannot clobber a fresher popup. Returns
     /// true when the popup state changed and the next frame should redraw.
@@ -11762,6 +11848,16 @@ impl App {
             return;
         }
         self.hover.on_move(std::time::Instant::now(), col, row);
+        // The blame card (#1556) belongs to the annotation of its commit,
+        // not to a word: it stays while the pointer moves along that and
+        // goes when the pointer leaves it.
+        if let Some((hash, _)) = &self.blame_hover {
+            if self.editor.blame_commit_at(col, row) == Some(hash.as_str()) {
+                return;
+            }
+            self.blame_hover = None;
+            self.hover_popup = None;
+        }
         if self.hover_popup.is_some() {
             let current = self
                 .editor
@@ -11798,6 +11894,10 @@ impl App {
     /// async `textDocument/hover`. Split out of `poll_hover` so the dwell
     /// timer doesn't have to be driven to test the resolution logic.
     fn hover_at_cell(&mut self, col: u16, row: u16) {
+        if let Some(hash) = self.editor.blame_commit_at(col, row) {
+            self.hover_blame_card(col, row, hash.to_string());
+            return;
+        }
         let Some((line, c)) = self.editor.buffer_pos_at(col, row) else {
             return;
         };
@@ -14171,18 +14271,26 @@ impl App {
             .and_then(|p| self.roots.owning_root(p))
             .unwrap_or_else(|| self.roots.primary())
             .to_path_buf();
-        self.status = format!("Loading {rel} at {hash}\u{2026}");
+        // Git: Open Commit for Line passes the full hash (#1556), named here
+        // by its first eight digits as the inline blame names it; a TIMELINE
+        // row's is git's own short form already.
+        let shown = if hash.len() >= 40 {
+            hash[..8].to_string()
+        } else {
+            hash.clone()
+        };
+        self.status = format!("Loading {rel} at {shown}\u{2026}");
         self.spawn_git_view(move || {
             let result = crate::git::show_commit_file_diff(&timeline_root, &hash, &rel);
             Box::new(move |app: &mut App| match result {
                 Ok(raw) => {
-                    let label = std::path::PathBuf::from(format!("{rel} @ {hash}"));
+                    let label = std::path::PathBuf::from(format!("{rel} @ {shown}"));
                     if let Err(e) = app.editor.open_git_diff_side_by_side(&label, &raw) {
                         app.status = format!("Could not open diff: {e}");
                         return;
                     }
                     app.focus_pane(Pane::Editor);
-                    app.status = format!("Showing {rel} at {hash}");
+                    app.status = format!("Showing {rel} at {shown}");
                 }
                 Err(e) => app.status = format!("git show failed: {e}"),
             })
@@ -59292,6 +59400,12 @@ impl App {
             Cmd::GitCopyPermalink => self.share_link(ShareLink::CopyPermalink),
             Cmd::GitCopyHeadLink => self.share_link(ShareLink::CopyHeadLink),
             Cmd::GitOpenOnRemote => self.share_link(ShareLink::OpenOnRemote),
+            Cmd::GitOpenLineCommit => self.open_commit_for_line(),
+            Cmd::GitCopyLineCommitHash => {
+                if let Some((hash, short)) = self.caret_line_commit() {
+                    self.run_commit_action(CommitAction::CopyHash, &hash, &short);
+                }
+            }
             Cmd::ToggleFold => {
                 let row = self.editor.cursor_row;
                 self.editor.toggle_fold(row);
@@ -64624,6 +64738,11 @@ impl App {
                 if in_editor && let Some(idx) = self.editor.code_lens_at(m.column, m.row) {
                     self.focus_pane(Pane::Editor);
                     self.run_code_lens(idx);
+                    return;
+                }
+                // So is the inline blame (#1556): it opens its commit.
+                if in_editor && self.editor.blame_commit_at(m.column, m.row).is_some() {
+                    self.open_commit_for_line();
                     return;
                 }
                 if in_editor && self.editor.diff.is_none() {
@@ -84690,7 +84809,8 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         app.refresh_signature_help_if_moved();
         let sig_help_changed = app.drain_lsp_signature_help();
         app.poll_hover();
-        let hover_changed = app.drain_lsp_hover() | app.drain_lsp_rust_analyzer();
+        let hover_changed =
+            app.drain_lsp_hover() | app.drain_lsp_rust_analyzer() | app.drain_blame_hover();
         let tab_hover_changed = app.poll_tab_hover();
         let ui_tooltip_changed = app.poll_ui_tooltip();
         let definition_changed = app.drain_lsp_definition();

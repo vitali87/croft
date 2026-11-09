@@ -1051,6 +1051,20 @@ fn render_buf(app: &mut App) -> ratatui::buffer::Buffer {
     term.backend().buffer().clone()
 }
 
+/// Paint `app` at 120 x 44 and find the first screen cell where `needle`
+/// starts.
+fn find_on_screen(app: &mut App, needle: &str) -> Option<(u16, u16)> {
+    let backend = ratatui::backend::TestBackend::new(120, 44);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let buf = term.backend().buffer();
+    (0..44).find_map(|y| {
+        let text: String = (0..120).map(|x| buf[(x, y)].symbol()).collect();
+        let at = text.find(needle)?;
+        Some((text[..at].chars().count() as u16, y))
+    })
+}
+
 fn count_bg(buf: &ratatui::buffer::Buffer, c: Color) -> usize {
     let a = buf.area;
     (a.y..a.y + a.height)
