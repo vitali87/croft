@@ -1388,11 +1388,57 @@ fn clip_pad_cells(text: &str, skip: usize, width: usize) -> String {
     out
 }
 
+/// Lifts the inks laid on one diff fill (a changed row's tint, or its
+/// changed characters') so each reads at 4.5:1 on a `surfaces` theme
+/// ([`crate::widgets::surface::legible_ink`]). It remembers the last ink
+/// it lifted, so a run of cells in one colour costs one contrast check,
+/// not one per cell. Without tones (a boxed theme, an unchanged row) it
+/// hands every ink back untouched.
+struct DiffInkLift {
+    tones: Option<crate::widgets::surface::Tones>,
+    bg: (u8, u8, u8),
+    last: Option<(Color, Color)>,
+}
+
+impl DiffInkLift {
+    /// A lift onto fill `bg` with `legible`'s tones; `None`, or a fill
+    /// that is not an RGB colour, lifts nothing.
+    fn new(legible: Option<crate::widgets::surface::Tones>, bg: Color) -> Self {
+        let (tones, bg) = match (legible, bg) {
+            (Some(t), Color::Rgb(r, g, b)) => (Some(t), (r, g, b)),
+            _ => (None, (0, 0, 0)),
+        };
+        Self {
+            tones,
+            bg,
+            last: None,
+        }
+    }
+
+    /// `fg` as it must be drawn on the fill to read.
+    fn ink(&mut self, fg: Color) -> Color {
+        let (Some(t), Color::Rgb(r, g, b)) = (self.tones, fg) else {
+            return fg;
+        };
+        if let Some((from, to)) = self.last
+            && from == fg
+        {
+            return to;
+        }
+        let to =
+            crate::gradient::rgb_color(crate::widgets::surface::legible_ink((r, g, b), self.bg, t));
+        self.last = Some((fg, to));
+        to
+    }
+}
+
 /// Paint the changed characters `range` (char indices) of a diff line
 /// drawn at `text_x` from char `skip`, `width` cells wide, in `bg` (#1351).
 /// Cells follow display width, so a wide character before the change does
 /// not shift the mark (#1248). A range wholly past either edge puts a `›`
 /// or `‹` on that edge in `bg` instead, so a change off-screen still shows.
+/// With `legible` (a `surfaces` theme) an ink that would not read on the
+/// brighter `bg`, the code's or the edge flag's, is lifted until it does.
 #[allow(clippy::too_many_arguments)]
 fn paint_intraline_range(
     buf: &mut Buffer,
@@ -1404,11 +1450,16 @@ fn paint_intraline_range(
     (start, end): (usize, usize),
     bg: Color,
     fg: Color,
+    legible: Option<crate::widgets::surface::Tones>,
 ) {
     if start >= end || width == 0 {
         return;
     }
-    let edge = Style::default().fg(fg).bg(bg).add_modifier(Modifier::BOLD);
+    let mut lift = DiffInkLift::new(legible, bg);
+    let edge = Style::default()
+        .fg(lift.ink(fg))
+        .bg(bg)
+        .add_modifier(Modifier::BOLD);
     if end <= skip {
         buf.set_string(text_x, y, "\u{2039}", edge);
         return;
@@ -1422,7 +1473,9 @@ fn paint_intraline_range(
         }
         if (start..end).contains(&i) {
             for dx in 0..w {
-                buf[(text_x + cell + dx, y)].set_bg(bg);
+                let slot = &mut buf[(text_x + cell + dx, y)];
+                let ink = lift.ink(slot.fg);
+                slot.set_bg(bg).set_fg(ink);
             }
             painted = true;
         }
@@ -1437,7 +1490,9 @@ fn paint_intraline_range(
 /// wide, in its syntax colours (#2020): each character takes its span's
 /// foreground and weight, and keeps the row's background, which is what
 /// marks it removed, added or unchanged. Cells follow display width, as
-/// [`clip_pad_cells`] lays them down.
+/// [`clip_pad_cells`] lays them down. On a changed row of a `surfaces`
+/// theme `lift` raises a colour that would not read on the row's tint.
+#[allow(clippy::too_many_arguments)]
 fn paint_diff_syntax(
     buf: &mut Buffer,
     text_x: u16,
@@ -1446,6 +1501,7 @@ fn paint_diff_syntax(
     text: &str,
     skip: usize,
     spans: &[HiSpan],
+    mut lift: DiffInkLift,
 ) {
     if spans.is_empty() || width == 0 {
         return;
@@ -1467,6 +1523,7 @@ fn paint_diff_syntax(
         if let Some(span) = spans.get(next).filter(|s| s.range().contains(&byte)) {
             let style = Style {
                 bg: None,
+                fg: span.style.fg.map(|fg| lift.ink(fg)),
                 ..span.style
             };
             for dx in 0..w {
@@ -1479,12 +1536,14 @@ fn paint_diff_syntax(
 
 /// The inks the side-by-side and deleted-file diff views paint their rows
 /// with. A boxed theme keeps the saturated red and green rows it always
-/// had. A `surfaces` theme (Croft Loch) tints a changed row softly toward
-/// red or green over the canvas, so the code's own colours lead and the
-/// tint only says which side of the change a line is on; marks the changed
-/// characters in a stronger tint of the same hue; puts the `+`/`-` signs in
-/// the hue and the line numbers in the faint ink; and hatches the filler
-/// opposite an insertion or a deletion instead of filling it solid.
+/// had. A `surfaces` theme (Croft Loch) tints a changed row toward red or
+/// green over the canvas, firmly enough that a change is seen at a glance
+/// and calmly enough that the code's own colours still lead; marks the
+/// changed characters in a clearly brighter tint of the same hue; lifts a
+/// syntax colour that would not read on either tint; puts the `+`/`-`
+/// signs in the hue, a changed row's line number in the muted ink (the
+/// faint one sinks into the tint) and the rest faint; and hatches the
+/// filler opposite an insertion or a deletion instead of filling it solid.
 #[derive(Debug, Clone, Copy)]
 struct DiffInks {
     removed_bg: Color,
@@ -1500,6 +1559,10 @@ struct DiffInks {
     added_sign: Color,
     sign_modifier: Modifier,
     gutter_fg: Color,
+    /// The line number of a removed or added row: the gutter ink on a
+    /// boxed theme, a step up under `surfaces` so it keeps 3:1 on the
+    /// row's tint.
+    changed_gutter_fg: Color,
     intraline_removed: Color,
     intraline_added: Color,
     /// The background of the blank side of an inserted or deleted line:
@@ -1510,15 +1573,37 @@ struct DiffInks {
     hatch: Option<(&'static str, Color)>,
     /// The glyph and ink of the line between the two columns.
     seam: (&'static str, Color),
+    /// Under `surfaces`, the tones a syntax colour on a changed row is
+    /// lifted toward when it would fall under 4.5:1 on the row's tint or
+    /// on its changed characters' ([`crate::widgets::surface::legible_ink`]).
+    /// `None` on a boxed theme, whose inks are drawn exactly as they were.
+    legible: Option<crate::widgets::surface::Tones>,
 }
 
 /// Blend shares of the red (removed) and the green (added) a `surfaces`
-/// diff row is tinted with, and the stronger shares its changed characters
-/// take. Red reads louder than green at the same share, so the green gets
-/// a little more, as GitHub's dark diff does, and the two sides weigh the
-/// same.
-const DIFF_ROW_TINT: (f32, f32) = (0.15, 0.2);
-const DIFF_CHANGE_TINT: (f32, f32) = (0.34, 0.4);
+/// diff row is tinted with over the canvas, and the stronger shares its
+/// changed characters take. On Croft Loch's black a row lands near 1.6:1
+/// against the canvas, so a changed line is plain at a glance without
+/// shouting, and its changed characters a further 1.6:1 against the row,
+/// so a one-character edit is found without hunting. Croft's red and green
+/// carry about the same luminance, so equal shares give the two sides the
+/// same weight.
+const DIFF_ROW_TINT: (f32, f32) = (0.32, 0.32);
+const DIFF_CHANGE_TINT: (f32, f32) = (0.53, 0.53);
+
+/// How far a `surfaces` diff tint's hue is greyed toward the body ink
+/// before it is laid over the canvas: at the strength a row needs to be
+/// seen, the git red and green straight would read as brick and emerald;
+/// a fifth of grey keeps them plainly red and green but calm.
+const DIFF_TINT_GREY: f32 = 0.2;
+
+/// A `surfaces` diff fill: `hue`, greyed by [`DIFF_TINT_GREY`], laid
+/// `share` of the way over the canvas.
+fn diff_tint(t: crate::widgets::surface::Tones, hue: (u8, u8, u8), share: f32) -> Color {
+    use crate::gradient::{lerp_rgb, rgb_color};
+    let calm = lerp_rgb(hue, t.text, DIFF_TINT_GREY);
+    rgb_color(lerp_rgb(t.canvas, calm, share))
+}
 
 /// The [`DiffInks`] for `theme`.
 fn diff_inks(theme: crate::theme::Theme) -> DiffInks {
@@ -1540,12 +1625,14 @@ fn diff_inks(theme: crate::theme::Theme) -> DiffInks {
             added_sign: added_fg,
             sign_modifier: Modifier::BOLD,
             gutter_fg: theme.ui(Color::Rgb(0x6c, 0x7d, 0x9c)),
+            changed_gutter_fg: theme.ui(Color::Rgb(0x6c, 0x7d, 0x9c)),
             intraline_removed: theme.ui(Color::Rgb(rr, rg, rb)),
             intraline_added: theme.ui(Color::Rgb(ar, ag, ab)),
             filler_removed: removed_bg,
             filler_added: added_bg,
             hatch: None,
             seam: ("\u{2502}", theme.ui(Color::Rgb(0x3a, 0x42, 0x52))),
+            legible: None,
         };
     };
     let rgb = |c: Color| match c {
@@ -1554,8 +1641,8 @@ fn diff_inks(theme: crate::theme::Theme) -> DiffInks {
     };
     let (red, green) = (rgb(theme.git_deleted()), rgb(theme.git_added()));
     DiffInks {
-        removed_bg: rgb_color(lerp_rgb(t.canvas, red, DIFF_ROW_TINT.0)),
-        added_bg: rgb_color(lerp_rgb(t.canvas, green, DIFF_ROW_TINT.1)),
+        removed_bg: diff_tint(t, red, DIFF_ROW_TINT.0),
+        added_bg: diff_tint(t, green, DIFF_ROW_TINT.1),
         removed_fg: rgb_color(lerp_rgb(t.text, red, 0.3)),
         added_fg: rgb_color(lerp_rgb(t.text, green, 0.3)),
         equal_fg: t.text(),
@@ -1563,12 +1650,14 @@ fn diff_inks(theme: crate::theme::Theme) -> DiffInks {
         added_sign: rgb_color(green),
         sign_modifier: Modifier::empty(),
         gutter_fg: t.faint(),
-        intraline_removed: rgb_color(lerp_rgb(t.canvas, red, DIFF_CHANGE_TINT.0)),
-        intraline_added: rgb_color(lerp_rgb(t.canvas, green, DIFF_CHANGE_TINT.1)),
+        changed_gutter_fg: t.muted(),
+        intraline_removed: diff_tint(t, red, DIFF_CHANGE_TINT.0),
+        intraline_added: diff_tint(t, green, DIFF_CHANGE_TINT.1),
         filler_removed: t.canvas(),
         filler_added: t.canvas(),
         hatch: Some(("\u{2571}", rgb_color(lerp_rgb(t.canvas, t.faint, 0.34)))),
         seam: ("\u{258f}", t.hairline()),
+        legible: Some(t),
     }
 }
 
@@ -1966,6 +2055,7 @@ fn render_diff(
             | DiffRow::Replaced { left, .. } => Some(left),
             DiffRow::Added { .. } => None,
         };
+        let l_changed = l_cell_bg == removed_bg;
         let l_label = l_left_idx
             .map(|i| format!("{:>width$} ", i + 1, width = l_gutter as usize - 1))
             .unwrap_or_else(|| " ".repeat(l_gutter as usize));
@@ -1973,7 +2063,13 @@ fn render_diff(
             l_x,
             y,
             &l_label,
-            Style::default().fg(gutter_fg).bg(l_cell_bg),
+            Style::default()
+                .fg(if l_changed {
+                    inks.changed_gutter_fg
+                } else {
+                    gutter_fg
+                })
+                .bg(l_cell_bg),
         );
         buf.set_string(
             l_sign_x,
@@ -2010,6 +2106,7 @@ fn render_diff(
                 &l_text,
                 diff.scroll_x,
                 diff.syntax.left(i),
+                DiffInkLift::new(inks.legible.filter(|_| l_changed), l_cell_bg),
             );
         }
         // The changed characters of a replaced line (#1351), on both sides.
@@ -2028,6 +2125,7 @@ fn render_diff(
                 range,
                 inks.intraline_removed,
                 inks.removed_sign,
+                inks.legible,
             );
         }
         if l_left_idx.is_none() {
@@ -2050,6 +2148,7 @@ fn render_diff(
             | DiffRow::Replaced { right, .. } => Some(right),
             DiffRow::Removed { .. } => None,
         };
+        let r_changed = r_cell_bg == added_bg;
         let r_label = r_right_idx
             .map(|i| format!("{:>width$} ", i + 1, width = r_gutter as usize - 1))
             .unwrap_or_else(|| " ".repeat(r_gutter as usize));
@@ -2057,7 +2156,13 @@ fn render_diff(
             r_x,
             y,
             &r_label,
-            Style::default().fg(gutter_fg).bg(r_cell_bg),
+            Style::default()
+                .fg(if r_changed {
+                    inks.changed_gutter_fg
+                } else {
+                    gutter_fg
+                })
+                .bg(r_cell_bg),
         );
         // The group-by-seat lens (#349): a bar in this row's own hue, in the
         // gutter's last cell, on the lines this change ADDS. An unchanged
@@ -2118,6 +2223,7 @@ fn render_diff(
                 &r_text,
                 diff.scroll_x,
                 diff.syntax.right(i),
+                DiffInkLift::new(inks.legible.filter(|_| r_changed), r_cell_bg),
             );
         }
         if let Some((_, range)) = intraline {
@@ -2131,6 +2237,7 @@ fn render_diff(
                 range,
                 inks.intraline_added,
                 inks.added_sign,
+                inks.legible,
             );
         }
         if r_right_idx.is_none() {
@@ -2568,6 +2675,7 @@ fn render_unified_deletion(
             DiffRow::Equal { left, .. } => (Some(left), ' ', bg),
             DiffRow::Added { .. } => (None, ' ', bg),
         };
+        let changed = cell_bg == removed_bg;
         let label = left_idx
             .map(|i| format!("{:>width$} ", i + 1, width = gutter as usize - 1))
             .unwrap_or_else(|| " ".repeat(gutter as usize));
@@ -2575,7 +2683,13 @@ fn render_unified_deletion(
             inner.x,
             y,
             &label,
-            Style::default().fg(gutter_fg).bg(cell_bg),
+            Style::default()
+                .fg(if changed {
+                    inks.changed_gutter_fg
+                } else {
+                    gutter_fg
+                })
+                .bg(cell_bg),
         );
         buf.set_string(
             sign_x,
@@ -2615,6 +2729,7 @@ fn render_unified_deletion(
                 &text,
                 diff.scroll_x,
                 diff.syntax.left(i),
+                DiffInkLift::new(inks.legible.filter(|_| changed), cell_bg),
             );
         }
     }
@@ -38227,22 +38342,31 @@ mod tests {
 
     /// A file with no grammar keeps the diff's own tints: red text on the
     /// removed side, green on the added (Croft Loch's are the body ink
-    /// leaning toward each hue).
+    /// leaning toward each hue, and on the changed characters' brighter
+    /// tint that ink is lifted to read but still leans the same way).
     #[test]
     fn a_diff_with_no_grammar_keeps_its_red_and_green_text() {
         let (buf, inner, r_text_x) = render_wide_diff("x\nold line\n", "x\nnew line\n");
         let (l_text_x, y) = left_text_at(&buf, inner, 2, "old line");
         let inks = default_inks();
-        assert_eq!(buf[(l_text_x, y)].fg, inks.removed_fg);
-        assert_eq!(buf[(r_text_x, y)].fg, inks.added_fg);
-        let Color::Rgb(r, g, _) = inks.removed_fg else {
-            panic!("an RGB ink");
-        };
-        assert!(r > g, "removed text leans red");
-        let Color::Rgb(r, g, _) = inks.added_fg else {
-            panic!("an RGB ink");
-        };
-        assert!(g > r, "added text leans green");
+        // " line" is the unchanged tail; "old" / "new" are the change.
+        assert_eq!(buf[(l_text_x + 4, y)].fg, inks.removed_fg);
+        assert_eq!(buf[(r_text_x + 4, y)].fg, inks.added_fg);
+        for (ink, changed) in [
+            (inks.removed_fg, buf[(l_text_x, y)].fg),
+            (inks.added_fg, buf[(r_text_x, y)].fg),
+        ] {
+            for c in [ink, changed] {
+                let Color::Rgb(r, g, _) = c else {
+                    panic!("an RGB ink");
+                };
+                if ink == inks.removed_fg {
+                    assert!(r > g, "removed text leans red ({c:?})");
+                } else {
+                    assert!(g > r, "added text leans green ({c:?})");
+                }
+            }
+        }
     }
 
     /// A two-file diff of a one-line change plus an inserted line, drawn
@@ -38304,23 +38428,32 @@ mod tests {
         assert_eq!(hovered[(prev.x, prev.y)].fg, t.muted());
     }
 
-    /// Croft Loch: a changed row is a soft tint of its hue over the canvas,
-    /// its changed characters a stronger tint, its sign in the hue and its
-    /// line number faint; the blank side opposite an inserted line is a
-    /// faint hatch, and the footer is muted text with keycaps on chrome.
+    /// Croft Loch: a changed row is a tint of its hue over the canvas, its
+    /// changed characters a stronger tint, its sign in the hue and its line
+    /// number muted (an unchanged row's stays faint); the blank side
+    /// opposite an inserted line is a faint hatch, and the footer is muted
+    /// text with keycaps on chrome.
     #[test]
     fn croft_loch_diff_rows_are_soft_tints() {
         let theme = crate::theme::Theme::LOCH;
         let t = crate::widgets::surface::tones(theme).unwrap();
         let inks = diff_inks(theme);
-        let lerp = |c: Color, k: f32| {
+        let tint = |c: Color, k: f32| {
             let Color::Rgb(r, g, b) = c else {
                 panic!("an RGB colour");
             };
-            crate::gradient::rgb_color(crate::gradient::lerp_rgb(t.canvas, (r, g, b), k))
+            diff_tint(t, (r, g, b), k)
         };
-        assert_eq!(inks.removed_bg, lerp(theme.git_deleted(), DIFF_ROW_TINT.0));
-        assert_eq!(inks.added_bg, lerp(theme.git_added(), DIFF_ROW_TINT.1));
+        assert_eq!(inks.removed_bg, tint(theme.git_deleted(), DIFF_ROW_TINT.0));
+        assert_eq!(inks.added_bg, tint(theme.git_added(), DIFF_ROW_TINT.1));
+        let Color::Rgb(r, g, b) = inks.removed_bg else {
+            panic!("an RGB tint");
+        };
+        assert!(r > g && r > b, "the removed tint is still plainly red");
+        let Color::Rgb(r, g, b) = inks.added_bg else {
+            panic!("an RGB tint");
+        };
+        assert!(g > r && g > b, "the added tint is still plainly green");
         let (buf, inner, _) = render_diff_in(theme, None);
         let (l_text_x, y) = left_text_at(&buf, inner, 3, "backoff=1.5");
         let seam_x = inner.x + inner.width / 2;
@@ -38333,7 +38466,9 @@ mod tests {
         assert_eq!(buf[(l_text_x - 2, y)].fg, theme.git_deleted());
         assert_eq!(buf[(r_text_x - 2, y)].fg, theme.git_added());
         assert_eq!(buf[(inner.x, y)].symbol(), "2");
-        assert_eq!(buf[(inner.x, y)].fg, t.faint(), "line number");
+        assert_eq!(buf[(inner.x, y)].fg, t.muted(), "a changed line number");
+        assert_eq!(buf[(inner.x, y - 1)].symbol(), "1");
+        assert_eq!(buf[(inner.x, y - 1)].fg, t.faint(), "an unchanged one");
         assert_eq!(buf[(seam_x - 1, y)].bg, inks.removed_bg, "tint to the seam");
         assert_eq!(buf[(seam_x, y)].symbol(), "\u{258f}");
         // The inserted line: hatched on the left, tinted on the right.
@@ -38355,6 +38490,115 @@ mod tests {
             .collect();
         let f7 = cells.windows(2).position(|w| w == ["F", "7"]).unwrap() as u16;
         assert_eq!(buf[(inner.x + f7, foot)].bg, t.keycap_on(t.chrome()));
+    }
+
+    /// Croft Loch: a changed row's tint stands 1.5 to 1.7:1 off the black
+    /// canvas, so a change is seen at a glance and still sits calmly, its
+    /// changed characters a further 1.5:1 or more off the row, and its line
+    /// number reads at 3:1 on the tint; the hatch opposite an insertion
+    /// stays a whisper. A boxed theme lifts nothing and keeps one gutter
+    /// ink.
+    #[test]
+    fn croft_loch_diff_tints_are_plain_at_a_glance() {
+        use crate::theme::contrast_ratio;
+        let rgb = |c: Color| match c {
+            Color::Rgb(r, g, b) => (r, g, b),
+            other => panic!("an RGB colour, not {other:?}"),
+        };
+        let theme = crate::theme::Theme::LOCH;
+        let t = crate::widgets::surface::tones(theme).unwrap();
+        let inks = diff_inks(theme);
+        for (side, row, change) in [
+            ("removed", inks.removed_bg, inks.intraline_removed),
+            ("added", inks.added_bg, inks.intraline_added),
+        ] {
+            let tint = contrast_ratio(rgb(row), t.canvas);
+            assert!((1.5..=1.7).contains(&tint), "{side} row {tint:.2}:1");
+            let mark = contrast_ratio(rgb(change), rgb(row));
+            assert!(mark >= 1.5, "{side} change {mark:.2}:1 on its row");
+            let number = contrast_ratio(rgb(inks.changed_gutter_fg), rgb(row));
+            assert!(number >= 3.0, "{side} line number {number:.2}:1");
+            let faint = contrast_ratio(t.faint, rgb(row));
+            assert!(
+                faint < 3.0,
+                "the faint ink would not have read ({faint:.2}:1)"
+            );
+        }
+        let (_, hatch) = inks.hatch.expect("Loch hatches its filler");
+        assert!(
+            contrast_ratio(rgb(hatch), t.canvas) < 1.3,
+            "the hatch is subtle"
+        );
+
+        let boxed = diff_inks(crate::theme::Theme::BLACK);
+        assert!(boxed.legible.is_none(), "a boxed theme lifts no ink");
+        assert_eq!(boxed.changed_gutter_fg, boxed.gutter_fg);
+    }
+
+    /// Croft Loch: code on a changed row reads at 4.5:1 or better on the
+    /// row's tint and on its changed characters' stronger one. A colour
+    /// that already does (a keyword on the row) is left as the editor
+    /// draws it; one that would not (a comment) is lifted only as far as
+    /// it must, keeping its hue rather than turning into the strong ink.
+    #[test]
+    fn croft_loch_diff_lifts_code_that_would_not_read_on_a_tint() {
+        use crate::theme::contrast_ratio;
+        let rgb = |c: Color| match c {
+            Color::Rgb(r, g, b) => (r, g, b),
+            other => panic!("an RGB colour, not {other:?}"),
+        };
+        let file = |text: &str| {
+            let f = tempfile::Builder::new().suffix(".rs").tempfile().unwrap();
+            std::fs::write(f.path(), text).unwrap();
+            f
+        };
+        let head = "fn main() {\n    let a = 1;\n    // keep\n";
+        let f1 = file(&format!("{head}    // read the text\n    let n = 8;\n}}\n"));
+        let f2 = file(&format!(
+            "{head}    // read the file\n    let n = 12;\n}}\n"
+        ));
+        let mut t = EditorTabs::new();
+        t.open_diff(f1.path(), f2.path()).unwrap();
+        let idx = t.active_index();
+        t.editors[idx].theme = crate::theme::Theme::LOCH;
+        t.editors[idx].diff.as_mut().unwrap().colour_syntax(None);
+        let area = Rect::new(0, 0, 80, 14);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut t.editors[idx], area, &mut buf);
+        let ed = &t.editors[idx];
+        let tones = crate::widgets::surface::tones(ed.theme).unwrap();
+        let inner = ed.last_inner;
+        let seam_x = inner.x + inner.width / 2;
+        let r_text_x = seam_x + 1 + 2 + 2;
+        let (l_text_x, kept_let) = left_text_at(&buf, inner, 6, "    let a = 1;");
+        let (_, kept_comment) = left_text_at(&buf, inner, 6, "    // keep");
+        let (_, comment) = left_text_at(&buf, inner, 6, "    // read the text");
+        let (_, number) = left_text_at(&buf, inner, 6, "    let n = 8;");
+        let inks = diff_inks(ed.theme);
+        assert_eq!(buf[(l_text_x + 4, comment)].bg, inks.removed_bg);
+        assert_eq!(buf[(l_text_x + 16, comment)].bg, inks.intraline_removed);
+        for y in [comment, number] {
+            for x in (l_text_x..seam_x - 1).chain(r_text_x..inner.right()) {
+                let cell = &buf[(x, y)];
+                if cell.symbol() == " " {
+                    continue;
+                }
+                let ratio = contrast_ratio(rgb(cell.fg), rgb(cell.bg));
+                assert!(
+                    ratio >= 4.5,
+                    "{:?} at ({x},{y}): {ratio:.2}:1",
+                    cell.symbol()
+                );
+            }
+        }
+        assert_eq!(
+            buf[(l_text_x + 4, number)].fg,
+            buf[(l_text_x + 4, kept_let)].fg,
+            "`let` reads on the tint as it is"
+        );
+        let lifted = buf[(l_text_x + 4, comment)].fg;
+        assert_ne!(lifted, buf[(l_text_x + 4, kept_comment)].fg, "lifted");
+        assert_ne!(lifted, tones.strong(), "only as far as it must");
     }
 
     /// A boxed theme's diff is the one it always drew: the teal header

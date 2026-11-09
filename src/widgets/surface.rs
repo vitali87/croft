@@ -190,6 +190,29 @@ pub fn match_style(style: Style, t: Tones, theme: Theme, active: bool) -> Style 
     }
 }
 
+/// How many steps [`legible_ink`] takes from an ink to the strong one.
+const LEGIBLE_STEPS: u8 = 10;
+
+/// `fg` as it must be drawn on `bg` to read at 4.5:1 on a `surfaces`
+/// theme: unchanged when it already does, else eased toward the strong
+/// ink one step at a time until it does, so a syntax colour on a tinted
+/// fill (a diff row, its changed characters) keeps as much of its hue as
+/// the fill allows, and only a hopeless one becomes the strong ink, as
+/// [`match_style`] lifts a match's ink. A few float operations per call
+/// and no allocation; callers on the render path call it once per run of
+/// one ink, not per cell.
+pub fn legible_ink(fg: (u8, u8, u8), bg: (u8, u8, u8), t: Tones) -> (u8, u8, u8) {
+    use crate::theme::contrast_ratio;
+    let mut ink = fg;
+    for step in 1..=LEGIBLE_STEPS {
+        if contrast_ratio(ink, bg) >= MATCH_MIN_CONTRAST {
+            break;
+        }
+        ink = lerp_rgb(fg, t.strong, f32::from(step) / f32::from(LEGIBLE_STEPS));
+    }
+    ink
+}
+
 /// The [`Tones`] of a `surfaces` theme, or `None` on a boxed one.
 pub fn tones(theme: Theme) -> Option<Tones> {
     let s = theme.surfaces()?;
@@ -957,6 +980,25 @@ mod tests {
         let mut boxed = Buffer::empty(Rect::new(0, 0, 10, 3));
         paint_pane_top(&mut boxed, area, Theme::BLACK, true);
         assert_eq!(boxed, Buffer::empty(area), "a boxed theme draws nothing");
+    }
+
+    /// An ink that reads at 4.5:1 is kept; one that does not eases toward
+    /// the strong ink only as far as it must, keeping its hue; and on a
+    /// fill where nothing short of the strong ink would do, it is the
+    /// strong ink.
+    #[test]
+    fn a_legible_ink_lifts_only_as_far_as_it_must() {
+        use crate::theme::contrast_ratio;
+        let t = tones(loch()).unwrap();
+        let tint = (0x54, 0x1c, 0x19);
+        let keyword = (0xc3, 0xa6, 0xf2);
+        assert_eq!(legible_ink(keyword, tint, t), keyword, "already reads");
+        let comment = (0x6a, 0x7a, 0x78);
+        assert!(contrast_ratio(comment, tint) < 4.5);
+        let lifted = legible_ink(comment, tint, t);
+        assert!(contrast_ratio(lifted, tint) >= 4.5);
+        assert_ne!(lifted, t.strong, "keeps some of its hue");
+        assert_eq!(legible_ink(comment, (0xc0, 0xc0, 0xc0), t), t.strong);
     }
 
     #[test]
