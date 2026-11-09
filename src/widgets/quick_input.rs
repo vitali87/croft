@@ -757,11 +757,7 @@ mod tests {
         paint_scroll_cue(&mut buf, &card, t, 40, 0);
         let x = card.rect.right() - 1;
         assert_eq!(buf[(x, card.list.y)].fg, t.muted(), "the thumb at the top");
-        assert_eq!(
-            buf[(x, card.list.bottom() - 1)].fg,
-            t.hairline(),
-            "the track"
-        );
+        assert_eq!(buf[(x, card.list.bottom() - 1)].fg, t.raised(), "the track");
     }
 
     /// Croft Loch: where the scroll thumb crosses the selected row it is

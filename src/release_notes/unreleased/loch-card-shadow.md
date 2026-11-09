@@ -1,1 +1,1 @@
-fix: Popups, menus, hovers and dialogs on Croft Loch float on their shadow again, with only a whisper of an edge instead of a visible outline.
+fix: Popups, menus, hovers and dialogs on Croft Loch have no outline: the card blends into its surroundings and its shadow alone lifts it.
