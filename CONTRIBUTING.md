@@ -49,6 +49,10 @@ see [docs/MACOS.md](docs/MACOS.md#spotlight-indexing-and-the-build-directory).
   `doc comments stay with their function` CI job catches it. If you are removing
   a doc on purpose, add `doc-removal: src/path/to/file.rs::name` to a commit
   message. The CI error tells you the exact key to use.
+* **Moving code between files?** Add the line `pure-move: true` to a commit
+  message and CI proves every Rust item you touched moved byte for byte
+  (visibility may widen). `python3 scripts/check_pure_move.py list <file>`
+  lists a file's items with their line ranges, to plan the move.
 * **New or changed module?** Update its entry in
   [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). CI fails if you shorten a
   module's description without moving its reasoning into a `### <module>`

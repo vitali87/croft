@@ -1,27 +1,41 @@
 #!/usr/bin/env python3
-"""Parse Rust files into items, so a change can be proven to only move code.
+"""Prove a change only moves Rust items, byte for byte, and list what moved.
 
 Splitting an 86k-line file moves thousands of lines, and nobody can review
-that by reading it. Every line of a file is either part of an item - each
-free item, and each item inside an `impl` or inline `mod` block - or glue
-between items. An item's text is the item plus the docs, attributes and `//`
-comments directly above it, with the common indentation and the visibility
-on its signature line (moves widen it) normalised away. A method also keeps
-the code of its `impl` header, so `fmt` in `impl Display for X` and `fmt` in
-`impl Debug for X` are two items. Glue is `use` and `mod x;` declarations,
-`impl` and `mod` block headers (their docs and comments too) and closing
-braces, blank lines and `//!` docs.
+that by reading it. This parses every changed `.rs` file at both revisions
+into items - each free item, and each item inside an `impl` or inline `mod`
+block - and matches them by text. An item's text is the item plus the docs,
+attributes and `//` comments directly above it; before comparing, only the
+common indentation and the visibility on its signature line (moves widen it)
+are normalised. A method keeps the code of its `impl` header as part of its
+identity, so moving `fmt` from `impl Display for X` to `impl Debug for X`, or
+out of a `#[cfg(test)] impl`, is not a move.
+
+Glue is allowed and listed apart: `use` and `mod x;` declarations, `impl` and
+`mod` block headers (their docs and comments too) and closing braces, blank
+lines and `//!` docs. An inline `mod` header's attributes are glue as well, so
+a `#[cfg(test)] mod tests { }` that becomes its own file still matches; a cfg
+changed there shows only in the glue. Every other line belongs to an item,
+and an item that changed, or appeared or vanished without an identical twin,
+fails the check.
 
 Usage:
+  check_pure_move.py [--if-declared] <base-rev> <head-rev>
+      --if-declared: only fail when a commit message in base..head has the
+      line `pure-move: true`; otherwise print the report without diffs and
+      exit 0.
   check_pure_move.py list <file.rs>
       Print every item in a file: kind, name, impl header, lines, line count.
 """
 
 import bisect
+import difflib
 import os
 import re
 import sys
-from collections import namedtuple
+from collections import Counter, defaultdict, namedtuple
+
+from check_doc_ownership import exists_at, git
 
 Item = namedtuple("Item", "file kind name mods ctx start end norm")
 Glue = namedtuple("Glue", "file kind start end text")
@@ -51,6 +65,7 @@ SIG = re.compile(
 MACRO = re.compile(r"\s*((?:\w+::)*\w+)\s*!")
 # Kinds whose `{` belongs to a value or a path, not a body: only `;` ends them.
 SEMI_ONLY = {"const", "static", "type", "use"}
+PURE_MOVE = re.compile(r"^\s*pure-move:\s*true\s*$", re.MULTILINE | re.IGNORECASE)
 BLANK, COMMENT, DOC, INNER, CODE = range(5)
 
 
@@ -272,6 +287,142 @@ def parse(text, file=""):
     return items, glue
 
 
+def label(it):
+    return "::".join([it.file, *it.mods, *([it.ctx] if it.ctx else []), it.name])
+
+
+def span(it):
+    return f"{it.file}:{it.start + 1}-{it.end + 1}"
+
+
+def compare(old, new):
+    """(unchanged count, moved pairs, changed pairs, removed, added).
+
+    Identical text under the same impl header is the same item. A twin in
+    the same place is unchanged; anywhere else it moved. What is left pairs
+    up by kind and name as a change, and the rest was added or removed."""
+    groups = defaultdict(lambda: ([], []))
+    for side, its in enumerate((old, new)):
+        for it in its:
+            groups[(it.ctx, it.norm)][side].append(it)
+    unchanged, moved, gone, came = 0, [], [], []
+    for olds, news in groups.values():
+        at = defaultdict(list)
+        for n in news:
+            at[(n.file, n.mods, n.name)].append(n)
+        rest_old = []
+        for o in olds:
+            if at[(o.file, o.mods, o.name)]:
+                at[(o.file, o.mods, o.name)].pop()
+                unchanged += 1
+            else:
+                rest_old.append(o)
+        rest_new = [n for twins in at.values() for n in twins]
+        moved += zip(rest_old, rest_new)
+        gone += rest_old[len(rest_new) :]
+        came += rest_new[len(rest_old) :]
+    by_name = defaultdict(list)
+    for o in gone:
+        by_name[(o.kind, o.name)].append(o)
+    changed, added = [], []
+    for n in came:
+        twins = by_name.get((n.kind, n.name))
+        if not twins:
+            added.append(n)
+            continue
+        o = max(twins, key=lambda o: (o.ctx == n.ctx, o.file == n.file, o.mods == n.mods))
+        twins.remove(o)
+        changed.append((o, n))
+    removed = [o for twins in by_name.values() for o in twins]
+    return unchanged, moved, changed, removed, added
+
+
+def print_glue(sides):
+    """The glue one side has and the other lacks, in file order, so a
+    rewritten `//!` module doc reads top to bottom; blank lines only as a
+    count."""
+    counts, first = [], []
+    for _, glue in sides:
+        counts.append(Counter((g.file, g.kind, g.text) for g in glue))
+        at = {}
+        for g in glue:
+            at[(g.file, g.kind, g.text)] = min(at.get((g.file, g.kind, g.text), g.start), g.start)
+        first.append(at)
+    blanks = []
+    for sign, side, delta in (("-", 0, counts[0] - counts[1]), ("+", 1, counts[1] - counts[0])):
+        blanks.append(f"{sign}{sum(n for (_, kind, _), n in delta.items() if kind == 'blank')}")
+        for key, count in sorted(delta.items(), key=lambda kv: (kv[0][0], first[side][kv[0]])):
+            f, kind, text = key
+            if kind != "blank":
+                shown = text.replace("\n", "\n" + " " * 10)
+                times = f" (x{count})" if count > 1 else ""
+                print(f"  glue {sign}  {f}:{first[side][key] + 1}: {shown}{times}")
+    if blanks != ["-0", "+0"]:
+        print(f"  glue    blank lines {' '.join(blanks)}")
+
+
+def check(base, head, if_declared):
+    # NUL-separated, because a quoted non-ASCII path does not end in `.rs`
+    # and would be skipped: a gate that passes by not looking.
+    changed_files = [
+        f
+        for f in git("diff", "--name-only", "--no-renames", "-z", base, head).split("\0")
+        if f.endswith(".rs")
+    ]
+    if not changed_files:
+        print("No Rust files changed.")
+        return 0
+    declared = bool(PURE_MOVE.search(git("log", f"{base}..{head}", "--format=%B")))
+    enforced = declared or not if_declared
+    sides = ([], []), ([], [])
+    errors = []
+    for f in changed_files:
+        for rev, (items, glue) in zip((base, head), sides):
+            if exists_at(rev, f):
+                try:
+                    its, gl = parse(git("show", f"{rev}:{f}"), f)
+                except ParseError as e:
+                    errors.append(f"{f} at {rev}: {e}")
+                    continue
+                items += its
+                glue += gl
+    unchanged, moved, changed, removed, added = compare(sides[0][0], sides[1][0])
+    print(f"Pure-move check of {len(changed_files)} changed Rust file(s), {base}..{head}")
+    print(
+        f"  {unchanged} unchanged, {len(moved)} moved, {len(changed)} changed, "
+        f"{len(added)} added, {len(removed)} removed"
+    )
+    for o, n in sorted(moved, key=lambda p: (p[0].file, p[0].start)):
+        print(f"  moved    {o.kind} {label(o)} -> {label(n)} ({span(o)} -> {span(n)})")
+    print_glue(sides)
+    for o, n in changed:
+        print(f"  CHANGED  {n.kind} {label(o)} -> {label(n)}")
+        if o.norm == n.norm:
+            print("      same text, under a different impl header")
+        if not enforced:
+            continue
+        a, b = o.norm.split("\n"), n.norm.split("\n")
+        diff = list(difflib.unified_diff(a, b, span(o), span(n), n=1, lineterm=""))
+        for line in diff[:40]:
+            print("      " + line)
+        if len(diff) > 40:
+            print(f"      ... {len(diff) - 40} more diff line(s)")
+    for it in removed:
+        print(f"  REMOVED  {it.kind} {label(it)} ({span(it)})")
+    for it in added:
+        print(f"  ADDED    {it.kind} {label(it)} ({span(it)})")
+    for e in errors:
+        print(f"  UNPARSED {e}")
+    if not (changed or removed or added or errors):
+        print("Pure move: every changed item moved byte for byte.")
+        return 0
+    print("Not a pure move: the items above changed, or have no identical twin.")
+    if not enforced:
+        print("Not enforced, so no diffs: no commit in the range declares `pure-move: true`.")
+        return 0
+    return 1
+
+
 def list_items(path):
     with open(path, encoding="utf-8") as f:
         items, _ = parse(f.read(), path)
@@ -283,10 +434,14 @@ def list_items(path):
 
 def main(argv=None):
     args = list(sys.argv[1:] if argv is None else argv)
+    if_declared = "--if-declared" in args
+    args = [a for a in args if a != "--if-declared"]
     if len(args) == 2 and args[0] == "list":
         return list_items(args[1])
-    print(__doc__, file=sys.stderr)
-    return 2
+    if len(args) != 2:
+        print(__doc__, file=sys.stderr)
+        return 2
+    return check(*args, if_declared)
 
 
 if __name__ == "__main__":
