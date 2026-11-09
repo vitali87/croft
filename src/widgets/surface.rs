@@ -722,7 +722,28 @@ pub fn paint_overlay_frame(buf: &mut Buffer, rect: Rect, theme: Theme) {
         crate::gradient::paint_gradient_box(buf, rect);
         return;
     };
-    paint_card_edge(buf, rect, theme, Some(t.accent));
+    paint_card_edge(buf, rect, theme, Some(t.accent), None);
+}
+
+/// [`paint_overlay_frame`], or with `quiet` [`paint_quiet_frame`], for a
+/// card that floats beside the line of text it is about: the hover, a
+/// completion list and its details, parameter hints. Its shadow skips
+/// `anchor_row`, so a card placed just above its line never dims the very
+/// symbol or caret it describes; everywhere else it falls as usual. A boxed
+/// theme draws the gradient box its siblings do.
+pub fn paint_anchored_frame(
+    buf: &mut Buffer,
+    rect: Rect,
+    theme: Theme,
+    anchor_row: u16,
+    quiet: bool,
+) {
+    let Some(t) = tones(theme) else {
+        crate::gradient::paint_gradient_box(buf, rect);
+        return;
+    };
+    let lip = (!quiet).then_some(t.accent);
+    paint_card_edge(buf, rect, theme, lip, Some(anchor_row));
 }
 
 /// [`paint_overlay_frame`] without the accent lip: the whole edge in the
@@ -733,7 +754,7 @@ pub fn paint_quiet_frame(buf: &mut Buffer, rect: Rect, theme: Theme) {
         crate::gradient::paint_gradient_box(buf, rect);
         return;
     }
-    paint_card_edge(buf, rect, theme, None);
+    paint_card_edge(buf, rect, theme, None, None);
 }
 
 /// [`paint_overlay_frame`] with the lip in `tint` instead of the accent: a
@@ -743,10 +764,19 @@ pub fn paint_tinted_frame(buf: &mut Buffer, rect: Rect, theme: Theme, tint: (u8,
         crate::gradient::paint_gradient_box(buf, rect);
         return;
     }
-    paint_card_edge(buf, rect, theme, Some(tint));
+    paint_card_edge(buf, rect, theme, Some(tint), None);
 }
 
-fn paint_card_edge(buf: &mut Buffer, rect: Rect, theme: Theme, lip: Option<(u8, u8, u8)>) {
+/// The card edge every overlay frame shares: the top in the `lip` easing
+/// into the rim (all rim without one), the rim on the other sides, and the
+/// one-cell shadow below and to the right, except on `spare_row`.
+fn paint_card_edge(
+    buf: &mut Buffer,
+    rect: Rect,
+    theme: Theme,
+    lip: Option<(u8, u8, u8)>,
+    spare_row: Option<u16>,
+) {
     let Some(t) = tones(theme) else {
         return;
     };
@@ -791,11 +821,11 @@ fn paint_card_edge(buf: &mut Buffer, rect: Rect, theme: Theme, lip: Option<(u8, 
         cell.set_bg(bg);
     };
     if rect.right() < area.right() {
-        for y in rect.y + 1..=bottom {
+        for y in (rect.y + 1..=bottom).filter(|&y| Some(y) != spare_row) {
             shadow(&mut buf[(rect.right(), y)]);
         }
     }
-    if rect.bottom() < area.bottom() {
+    if rect.bottom() < area.bottom() && Some(rect.bottom()) != spare_row {
         for x in rect.x + 1..=rect.right().min(area.right() - 1) {
             shadow(&mut buf[(x, rect.bottom())]);
         }
@@ -988,6 +1018,43 @@ mod tests {
         assert_eq!(buf[(2, 4)].bg, shaded);
         assert_eq!(buf[(9, 1)].bg, s.chrome());
         assert_eq!(buf[(1, 4)].bg, s.chrome());
+    }
+
+    /// A card anchored to a line (a hover above the symbol it describes)
+    /// keeps its shadow off that line: the row under the card stays as it
+    /// was, while the shadow down the right side still falls.
+    #[test]
+    fn an_anchored_card_never_shadows_its_anchor_row() {
+        let theme = loch();
+        let s = theme.surfaces().unwrap();
+        let fresh = || {
+            let mut buf = Buffer::empty(Rect::new(0, 0, 12, 6));
+            buf.set_style(buf.area, Style::default().bg(s.chrome()));
+            buf
+        };
+        // The card's last row is 3; the line it is about is row 4.
+        let card = Rect::new(1, 1, 8, 3);
+        let mut buf = fresh();
+        paint_anchored_frame(&mut buf, card, theme, 4, true);
+        let shaded = shade(s.chrome(), theme);
+        for x in 0..12 {
+            assert_eq!(buf[(x, 4)].bg, s.chrome(), "({x}, 4) is the anchor row");
+        }
+        assert_eq!(buf[(9, 2)].bg, shaded, "the right shadow still falls");
+        assert_eq!(buf[(9, 3)].bg, shaded);
+        let t = tones(theme).unwrap();
+        assert_eq!(buf[(1, 1)].fg, t.rim(), "quiet: no accent lip");
+        // Anchored to a row the shadow does not reach, it is the usual card.
+        let mut free = fresh();
+        paint_anchored_frame(&mut free, card, theme, 0, false);
+        let mut plain = fresh();
+        paint_overlay_frame(&mut plain, card, theme);
+        assert_eq!(free, plain);
+        let mut boxed = Buffer::empty(Rect::new(0, 0, 12, 6));
+        let mut gradient = boxed.clone();
+        paint_anchored_frame(&mut boxed, card, Theme::BLACK, 4, true);
+        crate::gradient::paint_gradient_box(&mut gradient, card);
+        assert_eq!(boxed, gradient, "a boxed theme keeps the gradient box");
     }
 
     #[test]

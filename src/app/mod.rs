@@ -12284,9 +12284,21 @@ impl App {
             // Diagnostic on top, type info below (VS Code PR #166560). Either
             // side may be empty; an all-empty compose hides the popup.
             let anchor = self.hover_anchor.unwrap_or((0, 0));
+            // The server's part is about a symbol in this file's language,
+            // which a `surfaces` card lays out as path, signature and docs.
+            let lang = self.editor.language();
+            let symbol = result.text.is_some();
             self.hover_popup =
-                compose_hover(self.hover_diagnostic.as_deref(), result.text.as_deref())
-                    .map(|text| crate::widgets::hover_popup::HoverPopup::new(text, anchor));
+                compose_hover(self.hover_diagnostic.as_deref(), result.text.as_deref()).map(
+                    |text| {
+                        let popup = crate::widgets::hover_popup::HoverPopup::new(text, anchor);
+                        if symbol {
+                            popup.about_symbol(lang)
+                        } else {
+                            popup
+                        }
+                    },
+                );
             if self.hover_popup.is_none() && self.hover_at_caret.as_ref() == Some(&self.status) {
                 self.status = String::from(NO_HOVER_AT_CARET);
             }
@@ -24307,7 +24319,7 @@ impl App {
                     frame.render_widget(popup_ref, area);
                     // The selected item's signature and documentation (#1527).
                     if let Some(details) = popup_ref.details_area_for(area, focused_area) {
-                        frame.render_widget(popup_ref.details(), details);
+                        frame.render_widget(popup_ref.details().beside(area), details);
                     }
                 }
             }

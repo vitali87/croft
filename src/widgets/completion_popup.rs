@@ -322,13 +322,42 @@ impl CompletionPopup {
 
     /// The details pane, for rendering at [`Self::details_area_for`].
     pub fn details(&self) -> CompletionDetails<'_> {
-        CompletionDetails { popup: self }
+        CompletionDetails {
+            popup: self,
+            list: Rect::default(),
+        }
     }
 }
 
 /// The selected completion's details pane (#1527).
 pub struct CompletionDetails<'a> {
     popup: &'a CompletionPopup,
+    /// Where the list it describes was drawn, when the caller says
+    /// ([`CompletionDetails::beside`]), so a pane stacked just above the
+    /// list keeps its shadow off the list's edge.
+    list: Rect,
+}
+
+impl CompletionDetails<'_> {
+    /// The pane for a list drawn at `list`.
+    pub fn beside(self, list: Rect) -> Self {
+        Self { list, ..self }
+    }
+
+    /// The row a `surfaces` card's shadow must leave alone: the list's top
+    /// edge when the pane sits right on top of it, else the caret's line,
+    /// which a pane level with a list above the caret would otherwise dim.
+    fn spare_row(&self, area: Rect) -> u16 {
+        let over_list = self.list.width > 0
+            && area.bottom() == self.list.y
+            && area.x < self.list.right()
+            && self.list.x < area.right();
+        if over_list {
+            self.list.y
+        } else {
+            self.popup.anchor.1
+        }
+    }
 }
 
 impl Widget for CompletionDetails<'_> {
@@ -367,7 +396,7 @@ impl Widget for CompletionDetails<'_> {
         if tones.is_some() {
             // The list beside it carries the accent lip; a second lip
             // restarting at their seam would read as two focused cards.
-            surface::paint_quiet_frame(buf, area, theme);
+            surface::paint_anchored_frame(buf, area, theme, self.spare_row(area), true);
         } else if theme.framed_overlays() {
             surface::paint_overlay_frame(buf, area, theme);
         }
@@ -501,7 +530,11 @@ impl Widget for &CompletionPopup {
         let mut state = ListState::default();
         state.select(Some(self.selected));
         StatefulWidget::render(list, area, buf, &mut state);
-        if self.theme.framed_overlays() {
+        if tones.is_some() {
+            // Flipped above the caret, the list's shadow would fall on the
+            // line being typed.
+            surface::paint_anchored_frame(buf, area, self.theme, self.anchor.1, false);
+        } else if self.theme.framed_overlays() {
             surface::paint_overlay_frame(buf, area, self.theme);
         }
         if let Some(t) = tones {
@@ -1089,6 +1122,50 @@ mod tests {
         let (list, details, _) = screen(&p, narrow);
         let details = details.unwrap();
         assert_eq!(details.bottom(), list.y);
+    }
+
+    /// Croft Loch: flipped above the caret, the list and the pane level
+    /// with it keep their shadows off the caret's line, the one being
+    /// typed; a pane stacked right on top of the list keeps its shadow off
+    /// the list's edge.
+    #[test]
+    fn croft_loch_cards_never_shadow_the_caret_line_or_the_list() {
+        let theme = crate::theme::Theme::from_id("loch");
+        let t = surface::tones(theme).unwrap();
+        let lit = |vp: Rect| {
+            let mut buf = Buffer::empty(vp);
+            buf.set_style(vp, Style::default().bg(t.chrome()));
+            buf
+        };
+        let mut p = popup(vec![documented("trim", "fn(&self) -> &str", TRIM_DOC)], "");
+        p.theme = theme;
+        p.anchor = (10, 28);
+        let list = p.area_for(VIEW);
+        assert_eq!(list.bottom(), 28, "flipped above the caret");
+        let details = p.details_area_for(list, VIEW).unwrap();
+        assert_eq!(details.bottom(), 28, "level with the list");
+        let mut buf = lit(VIEW);
+        Widget::render(&p, list, &mut buf);
+        p.details().beside(list).render(details, &mut buf);
+        for x in 0..VIEW.width {
+            assert_eq!(buf[(x, 28)].bg, t.chrome(), "({x}, 28) not shaded");
+        }
+        assert_ne!(buf[(details.right(), details.y + 1)].bg, t.chrome());
+
+        let narrow = Rect::new(0, 0, 40, 30);
+        p.anchor = (2, 28);
+        let list = p.area_for(narrow);
+        let details = p.details_area_for(list, narrow).unwrap();
+        assert_eq!(details.bottom(), list.y, "stacked on the list");
+        let mut buf = lit(narrow);
+        Widget::render(&p, list, &mut buf);
+        let edge = buf[(list.x + 2, list.y)].clone();
+        p.details().beside(list).render(details, &mut buf);
+        assert_eq!(
+            buf[(list.x + 2, list.y)],
+            edge,
+            "the list's edge is not dimmed"
+        );
     }
 
     /// #1527 negative: an item with no detail and no documentation gets no

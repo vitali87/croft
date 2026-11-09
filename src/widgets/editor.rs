@@ -1477,15 +1477,290 @@ fn paint_diff_syntax(
     }
 }
 
+/// The inks the side-by-side and deleted-file diff views paint their rows
+/// with. A boxed theme keeps the saturated red and green rows it always
+/// had. A `surfaces` theme (Croft Loch) tints a changed row softly toward
+/// red or green over the canvas, so the code's own colours lead and the
+/// tint only says which side of the change a line is on; marks the changed
+/// characters in a stronger tint of the same hue; puts the `+`/`-` signs in
+/// the hue and the line numbers in the faint ink; and hatches the filler
+/// opposite an insertion or a deletion instead of filling it solid.
+#[derive(Debug, Clone, Copy)]
+struct DiffInks {
+    removed_bg: Color,
+    added_bg: Color,
+    /// Text on a removed / added row before its syntax colours land (all
+    /// of it in a file with no grammar).
+    removed_fg: Color,
+    added_fg: Color,
+    equal_fg: Color,
+    /// The `-` and `+` signs, and the `‹`/`›` that flag a change past an
+    /// edge.
+    removed_sign: Color,
+    added_sign: Color,
+    sign_modifier: Modifier,
+    gutter_fg: Color,
+    intraline_removed: Color,
+    intraline_added: Color,
+    /// The background of the blank side of an inserted or deleted line:
+    /// the row's tint on a boxed theme, the canvas under `surfaces`.
+    filler_removed: Color,
+    filler_added: Color,
+    /// The glyph and ink the filler is hatched with, under `surfaces`.
+    hatch: Option<(&'static str, Color)>,
+    /// The glyph and ink of the line between the two columns.
+    seam: (&'static str, Color),
+}
+
+/// Blend shares of the red (removed) and the green (added) a `surfaces`
+/// diff row is tinted with, and the stronger shares its changed characters
+/// take. Red reads louder than green at the same share, so the green gets
+/// a little more, as GitHub's dark diff does, and the two sides weigh the
+/// same.
+const DIFF_ROW_TINT: (f32, f32) = (0.15, 0.2);
+const DIFF_CHANGE_TINT: (f32, f32) = (0.34, 0.4);
+
+/// The [`DiffInks`] for `theme`.
+fn diff_inks(theme: crate::theme::Theme) -> DiffInks {
+    use crate::gradient::{lerp_rgb, rgb_color};
+    let Some(t) = crate::widgets::surface::tones(theme) else {
+        let removed_bg = theme.ui(Color::Rgb(0x4a, 0x1f, 0x1f));
+        let removed_fg = theme.ui(Color::Rgb(0xff, 0xb3, 0xb3));
+        let added_bg = theme.ui(Color::Rgb(0x1f, 0x42, 0x2a));
+        let added_fg = theme.ui(Color::Rgb(0xb6, 0xee, 0xc4));
+        let (rr, rg, rb) = crate::widgets::diff::INTRALINE_REMOVED_BG;
+        let (ar, ag, ab) = crate::widgets::diff::INTRALINE_ADDED_BG;
+        return DiffInks {
+            removed_bg,
+            added_bg,
+            removed_fg,
+            added_fg,
+            equal_fg: theme.ui(Color::Rgb(0xc5, 0xcd, 0xd9)),
+            removed_sign: removed_fg,
+            added_sign: added_fg,
+            sign_modifier: Modifier::BOLD,
+            gutter_fg: theme.ui(Color::Rgb(0x6c, 0x7d, 0x9c)),
+            intraline_removed: theme.ui(Color::Rgb(rr, rg, rb)),
+            intraline_added: theme.ui(Color::Rgb(ar, ag, ab)),
+            filler_removed: removed_bg,
+            filler_added: added_bg,
+            hatch: None,
+            seam: ("\u{2502}", theme.ui(Color::Rgb(0x3a, 0x42, 0x52))),
+        };
+    };
+    let rgb = |c: Color| match c {
+        Color::Rgb(r, g, b) => (r, g, b),
+        _ => t.text,
+    };
+    let (red, green) = (rgb(theme.git_deleted()), rgb(theme.git_added()));
+    DiffInks {
+        removed_bg: rgb_color(lerp_rgb(t.canvas, red, DIFF_ROW_TINT.0)),
+        added_bg: rgb_color(lerp_rgb(t.canvas, green, DIFF_ROW_TINT.1)),
+        removed_fg: rgb_color(lerp_rgb(t.text, red, 0.3)),
+        added_fg: rgb_color(lerp_rgb(t.text, green, 0.3)),
+        equal_fg: t.text(),
+        removed_sign: rgb_color(red),
+        added_sign: rgb_color(green),
+        sign_modifier: Modifier::empty(),
+        gutter_fg: t.faint(),
+        intraline_removed: rgb_color(lerp_rgb(t.canvas, red, DIFF_CHANGE_TINT.0)),
+        intraline_added: rgb_color(lerp_rgb(t.canvas, green, DIFF_CHANGE_TINT.1)),
+        filler_removed: t.canvas(),
+        filler_added: t.canvas(),
+        hatch: Some(("\u{2571}", rgb_color(lerp_rgb(t.canvas, t.faint, 0.34)))),
+        seam: ("\u{258f}", t.hairline()),
+    }
+}
+
+/// Hatch the blank side of an inserted or deleted line, cells `x0..x1` of
+/// row `y`, when the theme hatches filler (VS Code's diagonal fill).
+fn paint_diff_filler(buf: &mut Buffer, x0: u16, x1: u16, y: u16, inks: &DiffInks) {
+    let Some((glyph, fg)) = inks.hatch else {
+        return;
+    };
+    for x in x0..x1 {
+        buf[(x, y)].set_symbol(glyph).set_fg(fg);
+    }
+}
+
+/// A file label in a diff header split into the file's name and the
+/// qualifier after it (`main.rs (HEAD)` is `main.rs` and ` (HEAD)`), which
+/// a `surfaces` header mutes.
+fn split_diff_label(label: &str) -> (&str, &str) {
+    match label.rfind(" (") {
+        Some(i) if label.ends_with(')') && i > 0 => label.split_at(i),
+        _ => (label, ""),
+    }
+}
+
+/// The notes a diff header adds after the file names: the lenses it is
+/// seen through and what it could not do, each of which a reader must be
+/// told about (a hidden change must never read as an absent one).
+fn diff_header_notes(diff: &crate::widgets::diff::DiffData) -> Vec<String> {
+    let mut notes = Vec::new();
+    if diff.bytes_differ_but_lines_equal {
+        notes.push(String::from(
+            "whitespace-only change (trailing newline / CRLF / BOM) \u{2014} no line-level diff",
+        ));
+    }
+    if diff.ws_mode != crate::widgets::diff::DiffWhitespace::Off {
+        notes.push(format!("ignoring whitespace: {}", diff.ws_mode.label()));
+    }
+    if diff.group_by_seat {
+        notes.push(format!("by seat: {}", diff.seat_summary()));
+    }
+    if diff.coarse {
+        notes.push(String::from("large change: diff stopped early"));
+    }
+    notes
+}
+
+/// The diff header on a `surfaces` theme: the chrome tone instead of the
+/// teal band, and the type ramp instead of one bold white line. Each side's
+/// file name sits over its own column's code (the current side's in the
+/// strong ink, the other in body text), a qualifier like `(HEAD)` muted,
+/// `↔` faint on the seam between them, and the notes muted after; on a pane
+/// too narrow for two columns, or a diff with one side, they run on from
+/// the left. The text stops short of the `‹ ›` arrows, which are muted at
+/// rest and strong, on a faint chip, under the pointer. Returns the arrows'
+/// hit rects, the same cells the boxed header gives them.
+#[allow(clippy::too_many_arguments)]
+fn paint_surface_diff_header(
+    buf: &mut Buffer,
+    inner: Rect,
+    t: crate::widgets::surface::Tones,
+    left: &str,
+    right: Option<&str>,
+    notes: &[String],
+    columns: Option<(u16, u16, u16)>,
+    pointer: Option<(u16, u16)>,
+) -> (Rect, Rect) {
+    let y = inner.y;
+    let chrome = t.chrome();
+    buf.set_style(
+        Rect { height: 1, ..inner },
+        Style::default().bg(chrome).fg(t.text()),
+    );
+    for x in inner.x..inner.right() {
+        buf[(x, y)].set_symbol(" ");
+    }
+    let (prev, next) = paint_diff_nav_arrows(inner, chrome, buf);
+    // The header's text stops a cell before the arrows' strip.
+    let text_end = if prev.width > 0 {
+        prev.x.saturating_sub(2)
+    } else {
+        inner.right()
+    };
+    let ink = |fg: Color| Style::default().fg(fg).bg(chrome);
+    let label = |name: &str, strong: bool| {
+        let (file, qualifier) = split_diff_label(name);
+        vec![
+            Span::styled(
+                file.to_string(),
+                ink(if strong { t.strong() } else { t.text() }),
+            ),
+            Span::styled(qualifier.to_string(), ink(t.muted())),
+        ]
+    };
+    let mut tail: Vec<Span> = Vec::new();
+    for note in notes {
+        tail.push(Span::styled("  \u{b7}  ", ink(t.faint())));
+        tail.push(Span::styled(note.clone(), ink(t.muted())));
+    }
+    let put = |buf: &mut Buffer, x: u16, spans: Vec<Span>| {
+        if x < text_end {
+            buf.set_line(x, y, &Line::from(spans), text_end - x);
+        }
+    };
+    match (right, columns) {
+        (Some(right), Some((l_text_x, seam_x, r_text_x))) => {
+            put(buf, l_text_x, label(left, false));
+            put(buf, seam_x, vec![Span::styled("\u{2194}", ink(t.faint()))]);
+            let mut spans = label(right, true);
+            spans.extend(tail);
+            put(buf, r_text_x, spans);
+        }
+        (Some(right), None) => {
+            let mut spans = label(left, false);
+            spans.push(Span::styled("  \u{2194}  ", ink(t.faint())));
+            spans.extend(label(right, true));
+            spans.extend(tail);
+            put(buf, inner.x + 1, spans);
+        }
+        (None, _) => {
+            let mut spans = label(left, true);
+            spans.extend(tail);
+            put(buf, inner.x + 1, spans);
+        }
+    }
+    for arrow in [prev, next] {
+        if arrow.width == 0 {
+            continue;
+        }
+        let hovered = pointer == Some((arrow.x, arrow.y));
+        let style = if hovered {
+            Style::default().fg(t.strong()).bg(t.hover_on(t.chrome))
+        } else {
+            Style::default().fg(t.muted()).bg(chrome)
+        };
+        let cell = &mut buf[(arrow.x, arrow.y)];
+        cell.set_style(style);
+        cell.modifier.remove(Modifier::BOLD);
+    }
+    (prev, next)
+}
+
+/// The diff footer on a `surfaces` theme: muted text on the chrome tone,
+/// not a raised grey band, with key names as keycaps. `position` leads;
+/// each `(keys, words)` hint follows while the row has room for all of it,
+/// so a narrow pane drops whole hints from the end instead of cutting one.
+fn paint_surface_diff_footer(
+    buf: &mut Buffer,
+    row: Rect,
+    t: crate::widgets::surface::Tones,
+    position: &str,
+    hints: &[(&str, &str)],
+) {
+    let chrome = t.chrome();
+    buf.set_style(row, Style::default().bg(chrome));
+    for x in row.left()..row.right() {
+        buf[(x, row.y)].set_symbol(" ");
+    }
+    let muted = Style::default().fg(t.muted()).bg(chrome);
+    let mut spans = vec![Span::styled(format!(" {position}"), muted)];
+    let mut used: usize = spans.iter().map(|s| s.width()).sum();
+    for (keys, words) in hints {
+        let mut hint = vec![Span::styled("   ", muted)];
+        if !keys.is_empty() {
+            hint.extend(crate::widgets::surface::keycap_spans(
+                keys, t, chrome, false,
+            ));
+        }
+        if !words.is_empty() {
+            hint.push(Span::styled(format!(" {words}"), muted));
+        }
+        let w: usize = hint.iter().map(|s| s.width()).sum();
+        if used + w > usize::from(row.width) {
+            break;
+        }
+        used += w;
+        spans.extend(hint);
+    }
+    buf.set_line(row.x, row.y, &Line::from(spans), row.width);
+}
+
 /// Returns the hit-test rects of the prev / next change arrows painted
 /// in the diff header (in that order). Both are `Rect::default()` when
-/// the header was too narrow to allocate them.
+/// the header was too narrow to allocate them. `pointer` is the screen
+/// cell under the mouse, which lifts an arrow under it on a `surfaces`
+/// theme.
 fn render_diff(
     diff: &mut crate::widgets::diff::DiffData,
     inner: Rect,
     buf: &mut Buffer,
     bg: Color,
     theme: crate::theme::Theme,
+    pointer: Option<(u16, u16)>,
 ) -> (Rect, Rect) {
     use crate::widgets::diff::DiffRow;
     // Background fill so the diff sits on a clean canvas (see [`canvas_bg`]).
@@ -1503,7 +1778,7 @@ fn render_diff(
     // takes its colours when `poll_highlights` lands them.
     diff.colour_syntax(Some(HIGHLIGHT_INLINE_BUDGET));
     if diff.unified {
-        return render_unified_deletion(diff, inner, buf, bg, theme);
+        return render_unified_deletion(diff, inner, buf, bg, theme, pointer);
     }
     let left_name = diff
         .left_path
@@ -1522,62 +1797,10 @@ fn render_diff(
     } else {
         None
     };
-    let header = match (&right_name, diff.bytes_differ_but_lines_equal) {
-        (Some(r), true) => format!(
-            " diff: {left_name}  \u{2194}  {r}   \u{2022} whitespace-only change (trailing newline / CRLF / BOM) — no line-level diff "
-        ),
-        (Some(r), false) => format!(" diff: {left_name}  \u{2194}  {r} "),
-        // Synthetic git-diff text view: no real right-side path, so the
-        // header reads as the diff command instead of trailing "↔ null".
-        (None, _) => format!(" {left_name} "),
-    };
-    // Ignore-whitespace is a lens over the real diff, so say so in the header:
-    // a reader must never mistake a hidden change for an absent one.
-    let header = match diff.ws_mode {
-        crate::widgets::diff::DiffWhitespace::Off => header,
-        mode => format!("{header}\u{2022} ignoring whitespace: {} ", mode.label()),
-    };
-    // Same reason as the whitespace lens: a reader seeing coloured bars must
-    // be told what they mean and who is in them (#349).
-    let header = if diff.group_by_seat {
-        format!("{header}\u{2022} by seat: {} ", diff.seat_summary())
-    } else {
-        header
-    };
-    let header = if diff.coarse {
-        format!("{header}\u{2022} large change: diff stopped early ")
-    } else {
-        header
-    };
-    let head_bg = if diff.bytes_differ_but_lines_equal {
-        theme.ui(Color::Rgb(0x8a, 0x4a, 0x10))
-    } else {
-        theme.ui(Color::Rgb(0x09, 0x4d, 0x77))
-    };
-    let head_style = Style::default()
-        .fg(Color::White)
-        .bg(head_bg)
-        .add_modifier(Modifier::BOLD);
-    for x in inner.x..inner.x + inner.width {
-        buf[(x, inner.y)].set_style(head_style);
-        buf[(x, inner.y)].set_symbol(" ");
-    }
-    buf.set_string(inner.x, inner.y, &header, head_style);
-    let (prev_arrow, next_arrow) = paint_diff_nav_arrows(inner, head_bg, buf);
-
     // Two columns split exactly down the middle. Each column has a small
     // line-number gutter on its left and a 1-cell sign column showing
     // -, +, or space.
-    let body_top = inner.y + 1;
-    let body_height = inner.height.saturating_sub(2);
-    let status_y = inner.y + inner.height - 1;
-    if body_height == 0 {
-        return (prev_arrow, next_arrow);
-    }
     let half = inner.width / 2;
-    if half < 8 {
-        return (prev_arrow, next_arrow);
-    }
     let left_max = diff.left_lines.len();
     let right_max = diff.right_lines.len();
     let l_gutter = (left_max + 1).to_string().len() as u16 + 1;
@@ -1591,12 +1814,81 @@ fn render_diff(
     let r_sign_x = r_x + r_gutter;
     let r_text_x = r_sign_x + 2;
     let r_text_w = (inner.width - (half + 1)).saturating_sub(r_gutter + 2);
+    let seam_x = inner.x + half;
+    let inks = diff_inks(theme);
+    let tones = crate::widgets::surface::tones(theme);
+
+    let (prev_arrow, next_arrow) = if let Some(t) = tones {
+        let columns = (half >= 8).then_some((l_text_x, seam_x, r_text_x));
+        paint_surface_diff_header(
+            buf,
+            inner,
+            t,
+            &left_name,
+            right_name.as_deref(),
+            &diff_header_notes(diff),
+            columns,
+            pointer,
+        )
+    } else {
+        let header = match (&right_name, diff.bytes_differ_but_lines_equal) {
+            (Some(r), true) => format!(
+                " diff: {left_name}  \u{2194}  {r}   \u{2022} whitespace-only change (trailing newline / CRLF / BOM) — no line-level diff "
+            ),
+            (Some(r), false) => format!(" diff: {left_name}  \u{2194}  {r} "),
+            // Synthetic git-diff text view: no real right-side path, so the
+            // header reads as the diff command instead of trailing "↔ null".
+            (None, _) => format!(" {left_name} "),
+        };
+        // Ignore-whitespace is a lens over the real diff, so say so in the header:
+        // a reader must never mistake a hidden change for an absent one.
+        let header = match diff.ws_mode {
+            crate::widgets::diff::DiffWhitespace::Off => header,
+            mode => format!("{header}\u{2022} ignoring whitespace: {} ", mode.label()),
+        };
+        // Same reason as the whitespace lens: a reader seeing coloured bars must
+        // be told what they mean and who is in them (#349).
+        let header = if diff.group_by_seat {
+            format!("{header}\u{2022} by seat: {} ", diff.seat_summary())
+        } else {
+            header
+        };
+        let header = if diff.coarse {
+            format!("{header}\u{2022} large change: diff stopped early ")
+        } else {
+            header
+        };
+        let head_bg = if diff.bytes_differ_but_lines_equal {
+            theme.ui(Color::Rgb(0x8a, 0x4a, 0x10))
+        } else {
+            theme.ui(Color::Rgb(0x09, 0x4d, 0x77))
+        };
+        let head_style = Style::default()
+            .fg(Color::White)
+            .bg(head_bg)
+            .add_modifier(Modifier::BOLD);
+        for x in inner.x..inner.x + inner.width {
+            buf[(x, inner.y)].set_style(head_style);
+            buf[(x, inner.y)].set_symbol(" ");
+        }
+        buf.set_string(inner.x, inner.y, &header, head_style);
+        paint_diff_nav_arrows(inner, head_bg, buf)
+    };
+
+    let body_top = inner.y + 1;
+    let body_height = inner.height.saturating_sub(2);
+    let status_y = inner.y + inner.height - 1;
+    if body_height == 0 {
+        return (prev_arrow, next_arrow);
+    }
+    if half < 8 {
+        return (prev_arrow, next_arrow);
+    }
 
     // Vertical seam between the two columns.
-    let seam_x = inner.x + half;
     for y in body_top..body_top + body_height {
-        buf[(seam_x, y)].set_symbol("\u{2502}");
-        buf[(seam_x, y)].set_style(Style::default().fg(theme.ui(Color::Rgb(0x3a, 0x42, 0x52))));
+        buf[(seam_x, y)].set_symbol(inks.seam.0);
+        buf[(seam_x, y)].set_style(Style::default().fg(inks.seam.1));
     }
 
     let total = diff.rows.len();
@@ -1606,12 +1898,15 @@ fn render_diff(
         diff.scroll = max_scroll;
     }
 
-    let removed_bg = theme.ui(Color::Rgb(0x4a, 0x1f, 0x1f));
-    let removed_fg = theme.ui(Color::Rgb(0xff, 0xb3, 0xb3));
-    let added_bg = theme.ui(Color::Rgb(0x1f, 0x42, 0x2a));
-    let added_fg = theme.ui(Color::Rgb(0xb6, 0xee, 0xc4));
-    let equal_fg = theme.ui(Color::Rgb(0xc5, 0xcd, 0xd9));
-    let gutter_fg = theme.ui(Color::Rgb(0x6c, 0x7d, 0x9c));
+    let DiffInks {
+        removed_bg,
+        added_bg,
+        removed_fg,
+        added_fg,
+        equal_fg,
+        gutter_fg,
+        ..
+    } = inks;
 
     let find_needle = diff.find.needle.clone();
     let find_opts = diff.find.opts;
@@ -1643,7 +1938,7 @@ fn render_diff(
                 '-',
                 diff.left_lines.get(left).cloned().unwrap_or_default(),
             ),
-            DiffRow::Added { .. } => (added_bg, ' ', String::new()),
+            DiffRow::Added { .. } => (inks.filler_added, ' ', String::new()),
         };
         let (r_cell_bg, r_sign, r_text) = match row {
             DiffRow::Equal { right, .. } => (
@@ -1661,7 +1956,7 @@ fn render_diff(
                 '+',
                 diff.right_lines.get(right).cloned().unwrap_or_default(),
             ),
-            DiffRow::Removed { .. } => (removed_bg, ' ', String::new()),
+            DiffRow::Removed { .. } => (inks.filler_removed, ' ', String::new()),
         };
 
         // Left column.
@@ -1686,12 +1981,12 @@ fn render_diff(
             format!("{l_sign} "),
             Style::default()
                 .fg(if l_cell_bg == removed_bg {
-                    removed_fg
+                    inks.removed_sign
                 } else {
                     equal_fg
                 })
                 .bg(l_cell_bg)
-                .add_modifier(Modifier::BOLD),
+                .add_modifier(inks.sign_modifier),
         );
         let l_padded = clip_pad_cells(&l_text, diff.scroll_x, l_text_w as usize);
         buf.set_string(
@@ -1723,7 +2018,6 @@ fn render_diff(
             _ => None,
         };
         if let Some((range, _)) = intraline {
-            let (r, g, b) = crate::widgets::diff::INTRALINE_REMOVED_BG;
             paint_intraline_range(
                 buf,
                 l_text_x,
@@ -1732,9 +2026,21 @@ fn render_diff(
                 &l_text,
                 diff.scroll_x,
                 range,
-                theme.ui(Color::Rgb(r, g, b)),
-                removed_fg,
+                inks.intraline_removed,
+                inks.removed_sign,
             );
+        }
+        if l_left_idx.is_none() {
+            paint_diff_filler(buf, l_x, seam_x, y, &inks);
+        } else if tones.is_some() {
+            // The spacer before the seam takes the row's tint, so a changed
+            // row's band runs right up to the hairline.
+            buf[(seam_x - 1, y)].set_bg(l_cell_bg);
+        }
+        if tones.is_some() {
+            // The seam's glyph hugs its cell's left edge; the rest of the
+            // cell belongs to the right column's row.
+            buf[(seam_x, y)].set_bg(r_cell_bg);
         }
 
         // Right column.
@@ -1783,12 +2089,12 @@ fn render_diff(
             format!("{r_sign} "),
             Style::default()
                 .fg(if r_cell_bg == added_bg {
-                    added_fg
+                    inks.added_sign
                 } else {
                     equal_fg
                 })
                 .bg(r_cell_bg)
-                .add_modifier(Modifier::BOLD),
+                .add_modifier(inks.sign_modifier),
         );
         let r_padded = clip_pad_cells(&r_text, diff.scroll_x, r_text_w as usize);
         buf.set_string(
@@ -1815,7 +2121,6 @@ fn render_diff(
             );
         }
         if let Some((_, range)) = intraline {
-            let (r, g, b) = crate::widgets::diff::INTRALINE_ADDED_BG;
             paint_intraline_range(
                 buf,
                 r_text_x,
@@ -1824,9 +2129,12 @@ fn render_diff(
                 &r_text,
                 diff.scroll_x,
                 range,
-                theme.ui(Color::Rgb(r, g, b)),
-                added_fg,
+                inks.intraline_added,
+                inks.added_sign,
             );
+        }
+        if r_right_idx.is_none() {
+            paint_diff_filler(buf, r_x, inner.right(), y, &inks);
         }
 
         // Inline-find highlight: overpaint every occurrence of the needle
@@ -1923,6 +2231,24 @@ fn render_diff(
     // Status footer.
     let visible_first = diff.scroll + 1;
     let visible_last = end;
+    if let Some(t) = tones {
+        paint_surface_diff_footer(
+            buf,
+            Rect {
+                y: status_y,
+                height: 1,
+                ..inner
+            },
+            t,
+            &format!("{visible_first}\u{2013}{visible_last} of {total}"),
+            &[
+                ("F7", "next change"),
+                ("Shift+F7", "previous"),
+                ("PgUp PgDn", "scroll"),
+            ],
+        );
+        return (prev_arrow, next_arrow);
+    }
     let status = format!(
         " {visible_first}–{visible_last} of {total}  ·  ↑/↓ PgUp/PgDn  ·  ‹/› click arrows or F7 for next/prev change "
     );
@@ -2176,6 +2502,7 @@ fn render_unified_deletion(
     buf: &mut Buffer,
     bg: Color,
     theme: crate::theme::Theme,
+    pointer: Option<(u16, u16)>,
 ) -> (Rect, Rect) {
     use crate::widgets::diff::DiffRow;
     let name = diff
@@ -2183,18 +2510,24 @@ fn render_unified_deletion(
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| diff.left_path.display().to_string());
-    let header = format!(" diff: {name}  \u{2022} deleted (HEAD \u{2192} /dev/null) ");
-    let head_style = Style::default()
-        .fg(Color::White)
-        .bg(theme.ui(Color::Rgb(0x6b, 0x1f, 0x1f)))
-        .add_modifier(Modifier::BOLD);
-    for x in inner.x..inner.x + inner.width {
-        buf[(x, inner.y)].set_style(head_style);
-        buf[(x, inner.y)].set_symbol(" ");
-    }
-    buf.set_string(inner.x, inner.y, &header, head_style);
-    let (prev_arrow, next_arrow) =
-        paint_diff_nav_arrows(inner, theme.ui(Color::Rgb(0x6b, 0x1f, 0x1f)), buf);
+    let inks = diff_inks(theme);
+    let tones = crate::widgets::surface::tones(theme);
+    let (prev_arrow, next_arrow) = if let Some(t) = tones {
+        let note = [String::from("deleted (HEAD \u{2192} /dev/null)")];
+        paint_surface_diff_header(buf, inner, t, &name, None, &note, None, pointer)
+    } else {
+        let header = format!(" diff: {name}  \u{2022} deleted (HEAD \u{2192} /dev/null) ");
+        let head_style = Style::default()
+            .fg(Color::White)
+            .bg(theme.ui(Color::Rgb(0x6b, 0x1f, 0x1f)))
+            .add_modifier(Modifier::BOLD);
+        for x in inner.x..inner.x + inner.width {
+            buf[(x, inner.y)].set_style(head_style);
+            buf[(x, inner.y)].set_symbol(" ");
+        }
+        buf.set_string(inner.x, inner.y, &header, head_style);
+        paint_diff_nav_arrows(inner, theme.ui(Color::Rgb(0x6b, 0x1f, 0x1f)), buf)
+    };
 
     let body_top = inner.y + 1;
     let body_height = inner.height.saturating_sub(2);
@@ -2215,9 +2548,12 @@ fn render_unified_deletion(
         diff.scroll = max_scroll;
     }
 
-    let removed_bg = theme.ui(Color::Rgb(0x4a, 0x1f, 0x1f));
-    let removed_fg = theme.ui(Color::Rgb(0xff, 0xb3, 0xb3));
-    let gutter_fg = theme.ui(Color::Rgb(0x6c, 0x7d, 0x9c));
+    let DiffInks {
+        removed_bg,
+        removed_fg,
+        gutter_fg,
+        ..
+    } = inks;
 
     let end = (diff.scroll + viewport).min(total);
     for (vis_row, row_idx) in (diff.scroll..end).enumerate() {
@@ -2247,12 +2583,12 @@ fn render_unified_deletion(
             format!("{sign} "),
             Style::default()
                 .fg(if cell_bg == removed_bg {
-                    removed_fg
+                    inks.removed_sign
                 } else {
                     gutter_fg
                 })
                 .bg(cell_bg)
-                .add_modifier(Modifier::BOLD),
+                .add_modifier(inks.sign_modifier),
         );
         let text = left_idx
             .and_then(|i| diff.left_lines.get(i).cloned())
@@ -2266,7 +2602,7 @@ fn render_unified_deletion(
                 .fg(if cell_bg == removed_bg {
                     removed_fg
                 } else {
-                    theme.ui(Color::Rgb(0xc5, 0xcd, 0xd9))
+                    inks.equal_fg
                 })
                 .bg(cell_bg),
         );
@@ -2285,6 +2621,20 @@ fn render_unified_deletion(
 
     let visible_first = diff.scroll + 1;
     let visible_last = end;
+    if let Some(t) = tones {
+        paint_surface_diff_footer(
+            buf,
+            Rect {
+                y: status_y,
+                height: 1,
+                ..inner
+            },
+            t,
+            &format!("{visible_first}\u{2013}{visible_last} of {total}"),
+            &[("", "every line removed at HEAD"), ("PgUp PgDn", "scroll")],
+        );
+        return (prev_arrow, next_arrow);
+    }
     let status = format!(
         " {visible_first}\u{2013}{visible_last} of {total}  \u{00b7}  every line removed at HEAD  \u{00b7}  \u{2191}/\u{2193} PgUp/PgDn to scroll "
     );
@@ -19571,7 +19921,8 @@ impl Widget for &mut Editor {
             return;
         }
         if let Some(diff) = self.diff.as_mut() {
-            let (prev_arrow, next_arrow) = render_diff(diff, inner, buf, cbg, self.theme);
+            let (prev_arrow, next_arrow) =
+                render_diff(diff, inner, buf, cbg, self.theme, self.pointer);
             self.diff_prev_arrow = prev_arrow;
             self.diff_next_arrow = next_arrow;
             return;
@@ -37308,30 +37659,31 @@ mod tests {
         (l_text_x, y)
     }
 
-    fn intraline(rgb: (u8, u8, u8)) -> Color {
-        Color::Rgb(rgb.0, rgb.1, rgb.2)
+    /// The inks the default theme's diff view paints with, for the
+    /// tests that check where a mark lands rather than what it looks like.
+    fn default_inks() -> DiffInks {
+        diff_inks(crate::theme::Theme::default())
     }
 
     /// #1351: a one-character edit marks just that character on each side,
     /// in a stronger tint than the rest of the changed line.
     #[test]
     fn a_one_character_change_is_marked_within_the_line() {
-        use crate::widgets::diff::{INTRALINE_ADDED_BG, INTRALINE_REMOVED_BG};
         let (buf, inner, r_text_x) = render_wide_diff("x\nbackoff=1.5\n", "x\nbackoff=2.5\n");
         let (l_text_x, y) = left_text_at(&buf, inner, 2, "backoff=1.5");
         assert_eq!(buf[(l_text_x + 8, y)].symbol(), "1");
-        assert_eq!(buf[(l_text_x + 8, y)].bg, intraline(INTRALINE_REMOVED_BG));
+        assert_eq!(buf[(l_text_x + 8, y)].bg, default_inks().intraline_removed);
         assert_eq!(buf[(r_text_x + 8, y)].symbol(), "2");
-        assert_eq!(buf[(r_text_x + 8, y)].bg, intraline(INTRALINE_ADDED_BG));
+        assert_eq!(buf[(r_text_x + 8, y)].bg, default_inks().intraline_added);
         for col in [0u16, 7, 9, 10] {
             assert_ne!(
                 buf[(l_text_x + col, y)].bg,
-                intraline(INTRALINE_REMOVED_BG),
+                default_inks().intraline_removed,
                 "col {col}"
             );
             assert_ne!(
                 buf[(r_text_x + col, y)].bg,
-                intraline(INTRALINE_ADDED_BG),
+                default_inks().intraline_added,
                 "col {col}"
             );
         }
@@ -37341,13 +37693,12 @@ mod tests {
     /// marks, so it does not turn into confetti.
     #[test]
     fn a_rewritten_line_gets_no_character_marks() {
-        use crate::widgets::diff::{INTRALINE_ADDED_BG, INTRALINE_REMOVED_BG};
         let (buf, inner, _) = render_wide_diff("x\nalpha beta gamma\n", "x\nquite other words\n");
         let marked = (inner.y..inner.bottom())
             .flat_map(|y| (inner.x..inner.right()).map(move |x| (x, y)))
             .filter(|&p| {
                 let bg = buf[p].bg;
-                bg == intraline(INTRALINE_REMOVED_BG) || bg == intraline(INTRALINE_ADDED_BG)
+                bg == default_inks().intraline_removed || bg == default_inks().intraline_added
             })
             .count();
         assert_eq!(marked, 0);
@@ -37357,7 +37708,6 @@ mod tests {
     /// that edge, so two lines that look the same on screen say they differ.
     #[test]
     fn a_change_past_the_right_edge_is_flagged_at_the_edge() {
-        use crate::widgets::diff::INTRALINE_ADDED_BG;
         let line = |v: &str| {
             format!(
                 "TIMEOUT_SECONDS = compute_timeout(base=30, retries=3, backoff={v}, jitter=True)"
@@ -37374,22 +37724,21 @@ mod tests {
             "precondition: the change is off-screen"
         );
         assert_eq!(buf[(edge, y)].symbol(), "\u{203a}");
-        assert_eq!(buf[(edge, y)].bg, intraline(INTRALINE_ADDED_BG));
+        assert_eq!(buf[(edge, y)].bg, default_inks().intraline_added);
     }
 
     /// #1351: wide characters before the change keep the mark on the right
     /// cells (#1248): `語` takes two cells, so `b` is at cell 6.
     #[test]
     fn the_mark_stays_aligned_after_wide_characters() {
-        use crate::widgets::diff::INTRALINE_ADDED_BG;
         let (buf, inner, r_text_x) = render_wide_diff("x\n日本語a\n", "x\n日本語b\n");
         let (_, y) = left_text_at(&buf, inner, 2, "日");
         assert_eq!(buf[(r_text_x + 6, y)].symbol(), "b");
-        assert_eq!(buf[(r_text_x + 6, y)].bg, intraline(INTRALINE_ADDED_BG));
+        assert_eq!(buf[(r_text_x + 6, y)].bg, default_inks().intraline_added);
         for col in 0..6u16 {
             assert_ne!(
                 buf[(r_text_x + col, y)].bg,
-                intraline(INTRALINE_ADDED_BG),
+                default_inks().intraline_added,
                 "col {col}"
             );
         }
@@ -37407,7 +37756,7 @@ mod tests {
         for y in inner.y + 1..inner.y + 4 {
             assert_eq!(
                 buf[(seam_x, y)].symbol(),
-                "\u{2502}",
+                default_inks().seam.0,
                 "row {y}: {:?}",
                 row_text(&buf, y, inner.x, inner.right())
             );
@@ -37440,14 +37789,13 @@ mod tests {
     /// flush-left and its changed character is marked where it is drawn.
     #[test]
     fn a_tab_takes_its_cell_in_the_side_by_side_diff() {
-        use crate::widgets::diff::INTRALINE_REMOVED_BG;
         set_tab_cells(1);
         assert_eq!(clip_pad_cells("\tx", 0, 4), " x  ");
         // The diff draws a tab as the Tab Size of the buffer (4 by default).
         let (buf, inner, _) = render_wide_diff("x\n\tn = 1\n", "x\n\tn = 2\n");
         let (l_text_x, y) = left_text_at(&buf, inner, 2, "    n = 1");
         assert_eq!(buf[(l_text_x + 8, y)].symbol(), "1");
-        assert_eq!(buf[(l_text_x + 8, y)].bg, intraline(INTRALINE_REMOVED_BG));
+        assert_eq!(buf[(l_text_x + 8, y)].bg, default_inks().intraline_removed);
     }
 
     /// Narrow text clips and pads exactly as before: by character, to the
@@ -37463,7 +37811,7 @@ mod tests {
             .expect("ascii right line drawn at its column");
         assert_eq!(
             buf[(inner.x + inner.width / 2, changed)].symbol(),
-            "\u{2502}"
+            default_inks().seam.0
         );
     }
 
@@ -37504,8 +37852,11 @@ mod tests {
             row_text(&buf, changed, r_text_x, r_text_x + 14),
             "    let x = 2;"
         );
-        let removed_bg = ed.theme.ui(Color::Rgb(0x4a, 0x1f, 0x1f));
-        let added_bg = ed.theme.ui(Color::Rgb(0x1f, 0x42, 0x2a));
+        let DiffInks {
+            removed_bg,
+            added_bg,
+            ..
+        } = diff_inks(ed.theme);
         for (x, bg, side) in [
             (l_text_x, removed_bg, "removed"),
             (r_text_x, added_bg, "added"),
@@ -37523,20 +37874,194 @@ mod tests {
     }
 
     /// A file with no grammar keeps the diff's own tints: red text on the
-    /// removed side, green on the added.
+    /// removed side, green on the added (Croft Loch's are the body ink
+    /// leaning toward each hue).
     #[test]
     fn a_diff_with_no_grammar_keeps_its_red_and_green_text() {
         let (buf, inner, r_text_x) = render_wide_diff("x\nold line\n", "x\nnew line\n");
         let (l_text_x, y) = left_text_at(&buf, inner, 2, "old line");
-        let theme = crate::theme::Theme::default();
+        let inks = default_inks();
+        assert_eq!(buf[(l_text_x, y)].fg, inks.removed_fg);
+        assert_eq!(buf[(r_text_x, y)].fg, inks.added_fg);
+        let Color::Rgb(r, g, _) = inks.removed_fg else {
+            panic!("an RGB ink");
+        };
+        assert!(r > g, "removed text leans red");
+        let Color::Rgb(r, g, _) = inks.added_fg else {
+            panic!("an RGB ink");
+        };
+        assert!(g > r, "added text leans green");
+    }
+
+    /// A two-file diff of a one-line change plus an inserted line, drawn
+    /// 80 by 10 under `theme` with the pointer at `pointer`; returns the
+    /// buffer, the inner rect and the arrows' hit rects.
+    fn render_diff_in(
+        theme: crate::theme::Theme,
+        pointer: Option<(u16, u16)>,
+    ) -> (ratatui::buffer::Buffer, Rect, (Rect, Rect)) {
+        let f1 = tempfile::Builder::new().suffix(".txt").tempfile().unwrap();
+        let f2 = tempfile::Builder::new().suffix(".txt").tempfile().unwrap();
+        std::fs::write(f1.path(), "keep\nbackoff=1.5\ntail\n").unwrap();
+        std::fs::write(f2.path(), "keep\nbackoff=2.5\nnew line\ntail\n").unwrap();
+        let mut t = EditorTabs::new();
+        t.open_diff(f1.path(), f2.path()).unwrap();
+        let idx = t.active_index();
+        t.editors[idx].theme = theme;
+        t.editors[idx].pointer = pointer;
+        let area = Rect::new(0, 0, 80, 10);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut t.editors[idx], area, &mut buf);
+        let ed = &t.editors[idx];
+        (buf, ed.last_inner, (ed.diff_prev_arrow, ed.diff_next_arrow))
+    }
+
+    /// Croft Loch: the diff header sits on the chrome tone (not the teal
+    /// band), each file's name over its own column with the current side's
+    /// in the strong ink and `↔` faint on the seam; the `‹ ›` arrows are
+    /// muted at rest and strong under the pointer, on the same hit cells a
+    /// boxed theme gives them.
+    #[test]
+    fn croft_loch_diff_header_sits_on_chrome() {
+        let theme = crate::theme::Theme::LOCH;
+        let t = crate::widgets::surface::tones(theme).unwrap();
+        let (buf, inner, (prev, next)) = render_diff_in(theme, None);
+        for x in inner.x..inner.right() {
+            assert_eq!(buf[(x, inner.y)].bg, t.chrome(), "({x}) header on chrome");
+            assert!(!buf[(x, inner.y)].modifier.contains(Modifier::BOLD));
+        }
+        let row = row_text(&buf, inner.y, inner.x, inner.right());
+        assert!(!row.contains("diff:"), "{row:?}");
+        let seam_x = inner.x + inner.width / 2;
+        assert_eq!(buf[(seam_x, inner.y)].symbol(), "\u{2194}");
+        assert_eq!(buf[(seam_x, inner.y)].fg, t.faint());
+        // Two digits of gutter (3 lines + 1), a space, the sign and its pad.
+        let l_text_x = inner.x + 2 + 2;
+        let r_text_x = seam_x + 1 + 2 + 2;
+        assert_eq!(buf[(l_text_x, inner.y)].fg, t.text(), "the old side");
+        assert_eq!(buf[(r_text_x, inner.y)].fg, t.strong(), "the current side");
+        assert_ne!(buf[(r_text_x, inner.y)].symbol(), " ");
+        assert_eq!(buf[(prev.x, prev.y)].symbol(), "\u{2039}");
+        assert_eq!(buf[(prev.x, prev.y)].fg, t.muted());
+        assert_eq!(buf[(next.x, next.y)].fg, t.muted());
+        let (_, _, boxed) = render_diff_in(crate::theme::Theme::BLACK, None);
+        assert_eq!((prev, next), boxed, "the arrows keep their hit cells");
+        let (hovered, _, _) = render_diff_in(theme, Some((next.x, next.y)));
+        assert_eq!(hovered[(next.x, next.y)].fg, t.strong());
+        assert_eq!(hovered[(next.x, next.y)].bg, t.hover_on(t.chrome));
+        assert_eq!(hovered[(prev.x, prev.y)].fg, t.muted());
+    }
+
+    /// Croft Loch: a changed row is a soft tint of its hue over the canvas,
+    /// its changed characters a stronger tint, its sign in the hue and its
+    /// line number faint; the blank side opposite an inserted line is a
+    /// faint hatch, and the footer is muted text with keycaps on chrome.
+    #[test]
+    fn croft_loch_diff_rows_are_soft_tints() {
+        let theme = crate::theme::Theme::LOCH;
+        let t = crate::widgets::surface::tones(theme).unwrap();
+        let inks = diff_inks(theme);
+        let lerp = |c: Color, k: f32| {
+            let Color::Rgb(r, g, b) = c else {
+                panic!("an RGB colour");
+            };
+            crate::gradient::rgb_color(crate::gradient::lerp_rgb(t.canvas, (r, g, b), k))
+        };
+        assert_eq!(inks.removed_bg, lerp(theme.git_deleted(), DIFF_ROW_TINT.0));
+        assert_eq!(inks.added_bg, lerp(theme.git_added(), DIFF_ROW_TINT.1));
+        let (buf, inner, _) = render_diff_in(theme, None);
+        let (l_text_x, y) = left_text_at(&buf, inner, 3, "backoff=1.5");
+        let seam_x = inner.x + inner.width / 2;
+        let r_text_x = seam_x + 1 + 2 + 2;
+        assert_eq!(buf[(l_text_x, y)].bg, inks.removed_bg);
+        assert_eq!(buf[(r_text_x, y)].bg, inks.added_bg);
+        assert_eq!(buf[(l_text_x + 8, y)].bg, inks.intraline_removed, "the 1");
+        assert_eq!(buf[(r_text_x + 8, y)].bg, inks.intraline_added, "the 2");
+        assert_eq!(buf[(l_text_x - 2, y)].symbol(), "-");
+        assert_eq!(buf[(l_text_x - 2, y)].fg, theme.git_deleted());
+        assert_eq!(buf[(r_text_x - 2, y)].fg, theme.git_added());
+        assert_eq!(buf[(inner.x, y)].symbol(), "2");
+        assert_eq!(buf[(inner.x, y)].fg, t.faint(), "line number");
+        assert_eq!(buf[(seam_x - 1, y)].bg, inks.removed_bg, "tint to the seam");
+        assert_eq!(buf[(seam_x, y)].symbol(), "\u{258f}");
+        // The inserted line: hatched on the left, tinted on the right.
+        let ins = y + 1;
+        assert_eq!(row_text(&buf, ins, r_text_x, r_text_x + 8), "new line");
+        for x in inner.x..seam_x {
+            assert_eq!(buf[(x, ins)].symbol(), "\u{2571}", "({x}) hatched");
+            assert_eq!(buf[(x, ins)].bg, t.canvas());
+        }
+        assert_eq!(buf[(r_text_x, ins)].bg, inks.added_bg);
+        // The footer: muted on chrome, the keys as keycaps.
+        let foot = inner.bottom() - 1;
+        let text = row_text(&buf, foot, inner.x, inner.right());
+        assert!(text.contains(" F7 "), "{text:?}");
+        assert_eq!(buf[(inner.x + 1, foot)].fg, t.muted());
+        assert_eq!(buf[(inner.right() - 1, foot)].bg, t.chrome());
+        let cells: Vec<&str> = (inner.x..inner.right())
+            .map(|x| buf[(x, foot)].symbol())
+            .collect();
+        let f7 = cells.windows(2).position(|w| w == ["F", "7"]).unwrap() as u16;
+        assert_eq!(buf[(inner.x + f7, foot)].bg, t.keycap_on(t.chrome()));
+    }
+
+    /// A boxed theme's diff is the one it always drew: the teal header
+    /// band in bold white, the saturated red and green rows and the solid
+    /// filler, the `│` seam and the grey footer band.
+    #[test]
+    fn a_boxed_diff_keeps_its_bands_and_saturated_rows() {
+        let theme = crate::theme::Theme::BLACK;
+        let (buf, inner, _) = render_diff_in(theme, None);
         assert_eq!(
-            buf[(l_text_x, y)].fg,
-            theme.ui(Color::Rgb(0xff, 0xb3, 0xb3))
+            buf[(inner.x, inner.y)].bg,
+            theme.ui(Color::Rgb(0x09, 0x4d, 0x77))
         );
+        assert!(row_text(&buf, inner.y, inner.x, inner.right()).starts_with(" diff: "));
+        let (l_text_x, y) = left_text_at(&buf, inner, 3, "backoff=1.5");
         assert_eq!(
-            buf[(r_text_x, y)].fg,
-            theme.ui(Color::Rgb(0xb6, 0xee, 0xc4))
+            buf[(l_text_x, y)].bg,
+            theme.ui(Color::Rgb(0x4a, 0x1f, 0x1f))
         );
+        let (r, g, b) = crate::widgets::diff::INTRALINE_REMOVED_BG;
+        assert_eq!(buf[(l_text_x + 8, y)].bg, Color::Rgb(r, g, b));
+        assert_eq!(
+            buf[(inner.x, y + 1)].bg,
+            theme.ui(Color::Rgb(0x1f, 0x42, 0x2a)),
+            "the filler is the solid green"
+        );
+        assert_eq!(buf[(inner.x, y + 1)].symbol(), " ");
+        assert_eq!(buf[(inner.x + inner.width / 2, y)].symbol(), "\u{2502}");
+        assert_eq!(
+            buf[(inner.x, inner.bottom() - 1)].bg,
+            theme.ui(Color::Rgb(0x14, 0x18, 0x22))
+        );
+    }
+
+    /// Croft Loch's deleted-file view: the same chrome header (the name in
+    /// the strong ink, the note muted), soft red rows and a chrome footer.
+    #[test]
+    fn croft_loch_deleted_file_diff_is_calm() {
+        let theme = crate::theme::Theme::LOCH;
+        let t = crate::widgets::surface::tones(theme).unwrap();
+        let inks = diff_inks(theme);
+        let mut diff = crate::widgets::diff::DiffData::build_unified_deletion(
+            std::path::PathBuf::from("gone.txt"),
+            "one\ntwo\n",
+        );
+        let area = Rect::new(0, 0, 60, 8);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        render_diff(&mut diff, area, &mut buf, theme.editor_bg(), theme, None);
+        assert_eq!(buf[(0, 0)].bg, t.chrome());
+        let head = row_text(&buf, 0, 0, 60);
+        assert!(head.starts_with(" gone.txt  \u{b7}  deleted"), "{head:?}");
+        assert_eq!(buf[(1, 0)].fg, t.strong());
+        assert_eq!(buf[(14, 0)].symbol(), "d");
+        assert_eq!(buf[(14, 0)].fg, t.muted());
+        let text_x = 2 + 2;
+        assert_eq!(row_text(&buf, 1, text_x, text_x + 3), "one");
+        assert_eq!(buf[(text_x, 1)].bg, inks.removed_bg);
+        assert_eq!(buf[(text_x - 2, 1)].fg, theme.git_deleted());
+        assert_eq!(buf[(59, 7)].bg, t.chrome(), "footer on chrome");
     }
 
     #[test]

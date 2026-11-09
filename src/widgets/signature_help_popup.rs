@@ -135,8 +135,15 @@ impl Widget for &SignatureHelpPopup {
         Widget::render(Clear, area, buf);
         Widget::render(Paragraph::new(Line::from(spans)).block(block), area, buf);
         if tones.is_some() {
-            // A parameter hint never takes the keyboard: no accent lip.
-            crate::widgets::surface::paint_quiet_frame(buf, area, self.theme);
+            // A parameter hint never takes the keyboard: no accent lip. It
+            // sits just above the caret, so its shadow spares that line.
+            crate::widgets::surface::paint_anchored_frame(
+                buf,
+                area,
+                self.theme,
+                self.anchor.1,
+                true,
+            );
         } else if self.theme.framed_overlays() {
             crate::widgets::surface::paint_overlay_frame(buf, area, self.theme);
         }
@@ -341,5 +348,32 @@ mod tests {
         assert!(buf[(6, 1)].modifier.contains(Modifier::BOLD));
         assert_eq!(buf[(9, 1)].symbol(), "b");
         assert_eq!(buf[(9, 1)].fg, t.muted());
+    }
+
+    /// Croft Loch: the hint sits just above the caret, and its shadow
+    /// keeps off the caret's line, the one being typed.
+    #[test]
+    fn croft_loch_hint_never_shadows_the_line_being_typed() {
+        use ratatui::buffer::Buffer;
+        let theme = crate::theme::Theme::from_id("loch");
+        let t = crate::widgets::surface::tones(theme).unwrap();
+        let mut p = SignatureHelpPopup::new(
+            vec![sig("foo(a, b)", Some((4, 5)))],
+            0,
+            (4, 6),
+            PathBuf::from("f.rs"),
+            1,
+        );
+        p.theme = theme;
+        let vp = Rect::new(0, 0, 40, 10);
+        let area = p.area_for(vp);
+        assert_eq!(area.bottom(), 6, "right above the caret's line");
+        let mut buf = Buffer::empty(vp);
+        buf.set_style(vp, ratatui::style::Style::default().bg(t.chrome()));
+        (&p).render(area, &mut buf);
+        for x in vp.left()..vp.right() {
+            assert_eq!(buf[(x, 6)].bg, t.chrome(), "({x}, 6) not shaded");
+        }
+        assert_ne!(buf[(area.right(), area.y + 1)].bg, t.chrome());
     }
 }
