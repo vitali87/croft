@@ -399,7 +399,10 @@ fn zip_member_name<R: std::io::Read>(e: &zip::read::ZipFile<'_, R>) -> String {
     let raw = e.name_raw();
     match std::str::from_utf8(raw) {
         Ok(name) if !raw.is_ascii() => name.to_string(),
-        _ => e.name().to_string(),
+        _ => e.name().map_or_else(
+            |_| String::from_utf8_lossy(raw).into_owned(),
+            |n| n.into_owned(),
+        ),
     }
 }
 
