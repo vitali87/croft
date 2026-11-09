@@ -5957,18 +5957,29 @@ fn the_scrubber_slider_seeks_on_click_and_drag() {
 }
 
 /// #371's criterion, measured: after a warm-up pass, holding an arrow key
-/// back across up to 200 commits of this repository's own
-/// `src/app/mod.rs` stays under a frame (16 ms) per step, the step and the
-/// frame it paints. Highlighting that file takes over half a second, so a
-/// step shows the plain text the builder already split and swaps the
+/// back across up to 200 commits of the biggest source file in this
+/// repository stays under a frame (16 ms) per step, the step and the frame
+/// it paints. Highlighting a file that big takes far longer than a frame, so
+/// a step shows the plain text the builder already split and swaps the
 /// finished view in behind it. Needs this checkout's history, so it is
 /// ignored by default.
 #[test]
 #[ignore]
 fn scrubbing_the_biggest_file_stays_under_a_frame_per_step() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    // Picked at run time, so the file stays the biggest as code moves.
+    let biggest = rust_files_under(&root.join("src"))
+        .into_iter()
+        .max_by_key(|path| std::fs::metadata(path).map_or(0, |m| m.len()))
+        .expect("src holds Rust files");
+    let lines = std::fs::read_to_string(&biggest).unwrap().lines().count();
+    assert!(
+        lines >= 20_000,
+        "the biggest file, {}, has only {lines} lines: too few to measure a big file",
+        biggest.display()
+    );
     let mut app = App::new(root.clone()).unwrap();
-    app.editor.open(&root.join("src/app/mod.rs")).unwrap();
+    app.editor.open(&biggest).unwrap();
     app.scrub_history();
     let steps = app.scrubber.as_ref().map_or(0, |s| s.len()).min(200);
     assert!(steps > 20, "only {steps} commits to scrub");

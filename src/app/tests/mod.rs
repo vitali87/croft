@@ -44,6 +44,63 @@ mod viewers;
 mod vim;
 mod welcome;
 
+/// Every `.rs` file under `dir`, at any depth, in sorted path order. Hidden
+/// entries are skipped: an editor's lock file such as `.#mod.rs` is a link
+/// to nowhere, not source.
+fn rust_files_under(dir: &std::path::Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let mut dirs = vec![dir.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        let entries = std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("cannot list {}: {e}", dir.display()));
+        for entry in entries {
+            let entry = entry.unwrap();
+            if entry.file_name().to_string_lossy().starts_with('.') {
+                continue;
+            }
+            let path = entry.path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
+/// The app's production source as `(path, text)`: every `.rs` file under
+/// `src/app/` except the whole-app tests in `src/app/tests/`, read at run
+/// time in sorted path order. The tests that check a property of the app's
+/// source text scan all of it, not one file, so code moving between files, or
+/// a new file, stays covered. The whole-app tests are left out because they
+/// spell out the very markers those scans count.
+fn app_source_files() -> Vec<(PathBuf, String)> {
+    let app = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/app");
+    let tests = app.join("tests");
+    rust_files_under(&app)
+        .into_iter()
+        .filter(|path| !path.starts_with(&tests))
+        .map(|path| {
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+            (path, text)
+        })
+        .collect()
+}
+
+/// [`app_source_files`] as one text, each file starting on a line of its own,
+/// so a scan anchored on a line start sees a file's first line too.
+fn app_source() -> String {
+    let mut all = String::new();
+    for (_, text) in app_source_files() {
+        all.push('\n');
+        all.push_str(&text);
+    }
+    all
+}
+
 fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
     KeyEvent::new(code, mods)
 }

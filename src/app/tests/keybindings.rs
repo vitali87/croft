@@ -1067,14 +1067,18 @@ fn every_cmd_chord_is_ctrl_off_macos_unless_linux_md_lists_it() {
     predicates.push(("is_cmd_k_leader_key@shell", leader_in_shell));
 
     // Every predicate the key router defines is walked (the scan F1's own
-    // coverage test uses), so a new one cannot slip past unexamined.
-    const APP_SRC: &str = include_str!("../mod.rs");
-    let defined: BTreeSet<&str> = APP_SRC
-        .match_indices("\nfn is_")
-        .filter_map(|(i, _)| {
-            let rest = &APP_SRC[i + 4..];
+    // coverage test uses), so a new one cannot slip past unexamined. A
+    // predicate is a free function in any app source file, with or without
+    // a visibility.
+    let app_src = app_source();
+    let defined: BTreeSet<&str> = app_src
+        .lines()
+        .filter_map(|line| {
+            let rest = ["fn ", "pub fn ", "pub(crate) fn ", "pub(super) fn "]
+                .iter()
+                .find_map(|head| line.strip_prefix(head))?;
             let name = &rest[..rest.find('(')?];
-            name.ends_with("_key").then_some(name)
+            (name.starts_with("is_") && name.ends_with("_key")).then_some(name)
         })
         .collect();
     let walked: BTreeSet<&str> = predicates
@@ -1344,6 +1348,54 @@ fn every_cmd_chord_is_ctrl_off_macos_unless_linux_md_lists_it() {
             );
         }
     }
+}
+
+/// The set of `is_*_key` predicates in the app key router IS the list of
+/// shortcuts croft handles. Every one MUST be named in a ShortcutEntry's
+/// `handler` so it shows up in F1. This fails the build the moment a
+/// predicate is added without an entry (or an entry names a predicate that
+/// no longer exists), making "every shortcut appears in F1" a hard invariant
+/// rather than a hand-maintained hope.
+#[test]
+fn every_app_keybinding_predicate_is_documented_in_f1() {
+    use std::collections::BTreeSet;
+    let app_src = app_source();
+
+    // Every `fn is_*_key` defined in the app key router.
+    let mut handled: BTreeSet<&str> = BTreeSet::new();
+    for (i, _) in app_src.match_indices("fn is_") {
+        let after_fn = &app_src[i + 3..];
+        let Some(paren) = after_fn.find('(') else {
+            continue;
+        };
+        let name = &after_fn[..paren];
+        if name.ends_with("_key") && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+            handled.insert(name);
+        }
+    }
+    assert!(
+        !handled.is_empty(),
+        "scanned the app's source but found no is_*_key predicates; the scan is broken"
+    );
+
+    // Every predicate named by an F1 entry's `handler`.
+    let mut documented: BTreeSet<&str> = BTreeSet::new();
+    for group in crate::widgets::shortcuts::SHORTCUT_GROUPS {
+        for entry in group.entries {
+            for token in entry.handler.split_whitespace() {
+                documented.insert(token);
+            }
+        }
+    }
+
+    let missing: Vec<&&str> = handled.difference(&documented).collect();
+    let stale: Vec<&&str> = documented.difference(&handled).collect();
+    assert!(
+        missing.is_empty() && stale.is_empty(),
+        "F1 shortcuts overlay is out of sync with the app's key handlers.\n  \
+         UNDOCUMENTED (add a ShortcutEntry whose `handler` names each): {missing:?}\n  \
+         STALE (handler names a predicate that no longer exists): {stale:?}"
+    );
 }
 
 /// #843: the Keyboard Shortcuts view (`Ctrl`+`K` `Ctrl`+`S`) spells each
