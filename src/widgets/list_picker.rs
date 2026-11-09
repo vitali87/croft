@@ -458,10 +458,12 @@ fn render_picker_card(
     }
     let filtering = !picker.query.trim().is_empty();
     let count = qi::count_label(total, filtering, false, "item", "items");
-    // The title is the placeholder, which typing hides; while filtering it
-    // rides beside the count instead, so a picker whose title is its
-    // operation (Apply Stash vs Pop Stash) never loses saying which it is.
-    let count = if filtering && !picker.title.is_empty() {
+    // The title is the placeholder, which any typed character hides (a
+    // space included); from then on it rides beside the count and keeps
+    // its cells, so a picker whose title is its operation (Apply Stash vs
+    // Pop Stash) never stops saying which it is.
+    let titled = !picker.query.is_empty() && !picker.title.is_empty();
+    let count = if titled {
         format!("{} \u{b7} {count}", picker.title)
     } else {
         count
@@ -478,6 +480,7 @@ fn render_picker_card(
             placeholder: &picker.title,
             count: &count,
             verb: "select",
+            keep_count: titled,
         },
     );
     let visible = card.list.height as usize;
@@ -643,6 +646,28 @@ mod tests {
             .collect();
         assert!(line.contains("stash"), "{line:?}");
         assert!(line.contains("Pop Stash \u{b7} "), "{line:?}");
+        // A query of spaces hides the placeholder too, and a query longer
+        // than the field scrolls instead of pushing the title off the row.
+        for query in ["  ", &"stash ".repeat(20)] {
+            let mut p = ListPicker::new(ListPurpose::CodeAction, "Pop Stash", rows());
+            for c in query.chars() {
+                p.push_char(c);
+            }
+            let mut buf = Buffer::empty(screen);
+            render_list_picker(&mut p, screen, &mut buf, theme, false);
+            let r = p.last_rect;
+            let line: String = (r.x..r.right())
+                .map(|x| buf[(x, r.y + 1)].symbol().to_string())
+                .collect();
+            assert!(line.contains("Pop Stash \u{b7} "), "{query:?}: {line:?}");
+            let (cx, cy) = p.last_caret.expect("the caret stays on the row");
+            assert_eq!(cy, r.y + 1);
+            let title_col = line[..line.find("Pop Stash").unwrap()].chars().count();
+            assert!(
+                usize::from(cx - r.x) < title_col,
+                "the caret stays left of the title"
+            );
+        }
     }
 
     #[test]

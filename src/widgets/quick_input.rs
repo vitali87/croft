@@ -118,6 +118,10 @@ pub struct Input<'a> {
     pub count: &'a str,
     /// What Enter does, for the footer (`run`, `open`, `select`).
     pub verb: &'a str,
+    /// The count names what Enter will do (a list picker's title while the
+    /// user filters), so it keeps its place on the row: the query scrolls
+    /// in what is left instead of crowding the count out.
+    pub keep_count: bool,
 }
 
 /// Paint the card: the raised body, the edge (accent lip, rim, shadow), the
@@ -182,6 +186,10 @@ pub fn paint_card(
 /// The input row: the accent glyph, the query (or the placeholder) and the
 /// count at the right. A query wider than the field scrolls to keep the
 /// caret in view, a `…` standing for the hidden start. Returns the caret.
+/// The fewest query cells a kept count leaves beside itself; below that the
+/// count yields to the query as an ordinary count does.
+const MIN_KEPT_QUERY: usize = 6;
+
 fn paint_input_row(
     buf: &mut Buffer,
     left: u16,
@@ -206,15 +214,25 @@ fn paint_input_row(
     }
     let field = usize::from(end - x0);
     let count_w = input.count.width();
+    // A kept count claims its cells (and a two-cell gap) first, as long as
+    // a few cells of query still fit beside it; the query then scrolls in
+    // the rest, so typing never pushes the count off the row.
+    let kept = input.keep_count && count_w > 0 && count_w + 2 + MIN_KEPT_QUERY <= field;
+    let end_q = if kept {
+        end - u16::try_from(count_w + 2).unwrap_or(0)
+    } else {
+        end
+    };
+    let field_q = usize::from(end_q - x0);
     let (text_w, caret_x) = if input.query.is_empty() {
         let style = Style::default()
             .fg(t.muted())
             .add_modifier(Modifier::ITALIC);
-        let (after_x, _) = buf.set_stringn(x0, y, input.placeholder, field, style);
+        let (after_x, _) = buf.set_stringn(x0, y, input.placeholder, field_q, style);
         (usize::from(after_x - x0), x0)
     } else {
         let cursor = input.cursor.min(input.query.chars().count());
-        let (skip, lead) = crate::widgets::input_prompt::field_scroll(input.query, cursor, field);
+        let (skip, lead) = crate::widgets::input_prompt::field_scroll(input.query, cursor, field_q);
         let mut x = x0;
         if lead {
             buf.set_string(x, y, "\u{2026}", Style::default().fg(t.faint()));
@@ -227,13 +245,17 @@ fn paint_input_row(
             x,
             y,
             &visible,
-            usize::from(end - x),
+            usize::from(end_q.saturating_sub(x)),
             Style::default().fg(t.text()),
         );
-        (usize::from(after_x - x0), caret_x.min(end - 1))
+        (
+            usize::from(after_x - x0),
+            caret_x.min(end_q.max(x0 + 1) - 1),
+        )
     };
-    // The count only where it clears the text and the caret by two cells.
-    if count_w > 0 && text_w + 1 + 2 + count_w <= field {
+    // The count only where it clears the text and the caret by two cells,
+    // unless it is kept, when its cells were set aside above.
+    if count_w > 0 && (kept || text_w + 1 + 2 + count_w <= field) {
         let cx = end - u16::try_from(count_w).unwrap_or(0);
         buf.set_string(cx, y, input.count, Style::default().fg(t.muted()));
     }
@@ -456,6 +478,7 @@ mod tests {
             placeholder: "Type a command",
             count: "3 matches",
             verb: "run",
+            keep_count: false,
         }
     }
 

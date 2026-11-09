@@ -3187,6 +3187,7 @@ fn render_palette_card(
             placeholder: "Type a command",
             count: &count,
             verb: "run",
+            keep_count: false,
         },
     );
     let visible = card.list.height as usize;
