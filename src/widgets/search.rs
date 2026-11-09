@@ -3293,13 +3293,15 @@ impl Widget for &mut SearchPanel {
                 .fg(Color::Black)
                 .bg(self.theme.ui(Color::Rgb(0xff, 0xd7, 0x4a)))
                 .add_modifier(Modifier::BOLD);
-            // Croft Loch reads a row in three inks: the file name in body
-            // text, the line number faint, the preview muted with each match
-            // tinted amber over the row's own fill. On the selected row the
-            // line number and preview step up an ink, so they keep their
-            // contrast on the band. The selected row's first match is the
-            // one opening it lands on, so it takes the current match's
-            // stronger tint, as it will in the editor.
+            // Croft Loch reads a row in two inks: the file name in body
+            // text, the line number and the preview muted, with each match
+            // tinted amber over the row's own fill. The line number is where
+            // the result is, a fact read as often as the name, so it never
+            // drops to the faint ink kept for marks. On the selected row the
+            // preview steps up an ink, so it keeps its contrast on the band;
+            // the muted line number already does. The selected row's first
+            // match is the one opening it lands on, so it takes the current
+            // match's stronger tint, as it will in the editor.
             let (plain_style, line_no_style) = match tones {
                 Some(t) if is_selected => (
                     Style::default().fg(t.text()),
@@ -3307,7 +3309,7 @@ impl Widget for &mut SearchPanel {
                 ),
                 Some(t) => (
                     Style::default().fg(t.muted()),
-                    Style::default().fg(t.faint()),
+                    Style::default().fg(t.muted()),
                 ),
                 None => (
                     Style::default().fg(self.theme.ui(Color::Gray)),
@@ -6623,7 +6625,7 @@ mod tests {
     }
 
     /// Croft Loch: a result row reads in the ink ramp (file name in body
-    /// text, line number faint, preview muted), the selected row wears the
+    /// text, line number and preview muted), the selected row wears the
     /// shared selected-row anatomy across its full width (the band, and
     /// the accent bar in the pane's left padding while the view has focus)
     /// with its inks a step up, and the file name is never a teal chip.
@@ -6650,13 +6652,13 @@ mod tests {
         }
         assert_eq!(buf[(x, y)].fg, t.text(), "the file name is body text");
         assert!(!buf[(x, y)].modifier.contains(Modifier::BOLD));
-        assert_eq!(buf[(x + 5, y)].fg, t.muted(), "a step-up line number");
+        assert_eq!(buf[(x + 5, y)].fg, t.muted(), "the line number");
         assert_eq!(buf[(x + 8, y)].fg, t.text(), "a step-up preview");
 
         let (x2, y2) = cell_of(&buf, "a.rs:2:");
         assert_eq!(buf[(x2, y2)].fg, t.text());
         assert_eq!(buf[(x2, y2)].bg, t.chrome(), "other rows sit on the chrome");
-        assert_eq!(buf[(x2 + 5, y2)].fg, t.faint(), "the line number is faint");
+        assert_eq!(buf[(x2 + 5, y2)].fg, t.muted(), "the line number is muted");
         assert_eq!(buf[(x2 + 8, y2)].fg, t.muted(), "the preview is muted");
         assert_ne!(buf[(area.x, y2)].symbol(), ROW_BAR);
 
@@ -6669,6 +6671,35 @@ mod tests {
             buf[(area.x + 3, y)].bg,
             crate::gradient::rgb_color(selected_row_fill(t, t.chrome, false))
         );
+    }
+
+    /// Croft Loch: a result's `:N:` line number is where the hit is, so it
+    /// reads at 3:1 or better on every row it sits on, the plain chrome and
+    /// the selected row's band with and without focus, never in the faint
+    /// ink that sank to about 2:1.
+    #[test]
+    fn croft_loch_result_line_numbers_stay_readable_on_every_row() {
+        use crate::theme::contrast_ratio;
+        use crate::widgets::surface::tones;
+        let rgb = |c: Color| match c {
+            Color::Rgb(r, g, b) => (r, g, b),
+            other => panic!("an RGB colour, not {other:?}"),
+        };
+        let tmp = TempDir::new().unwrap();
+        let mut panel = loch_results_panel(&tmp);
+        let t = tones(panel.theme).unwrap();
+        for focused in [true, false] {
+            panel.focused = focused;
+            let buf = render_panel(&mut panel, 40);
+            for label in ["a.rs:1:", "a.rs:2:"] {
+                let (x, y) = cell_of(&buf, label);
+                let digit = &buf[(x + 5, y)];
+                assert_eq!(digit.symbol(), &label[5..6]);
+                assert_ne!(digit.fg, t.faint(), "{label} focused={focused}");
+                let ratio = contrast_ratio(rgb(digit.fg), rgb(digit.bg));
+                assert!(ratio >= 3.0, "{label} focused={focused}: {ratio:.2}:1");
+            }
+        }
     }
 
     /// Croft Loch: a match in a result's preview is the amber tint over

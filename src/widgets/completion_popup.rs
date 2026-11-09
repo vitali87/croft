@@ -394,8 +394,8 @@ impl Widget for CompletionDetails<'_> {
             .wrap(ratatui::widgets::Wrap { trim: false })
             .render(area, buf);
         if tones.is_some() {
-            // The list beside it carries the accent lip; a second lip
-            // restarting at their seam would read as two focused cards.
+            // Quiet like the list it describes: neither takes the caret
+            // from the editor, so neither wears the accent lip.
             surface::paint_anchored_frame(buf, area, theme, self.spare_row(area), true);
         } else if theme.framed_overlays() {
             surface::paint_overlay_frame(buf, area, theme);
@@ -487,8 +487,12 @@ impl Widget for &CompletionPopup {
                 let room = row_room.saturating_sub(cells(&item.label) + 2);
                 if let Some(detail) = item.detail.as_ref().filter(|_| room >= 2) {
                     // DIM renders differently in every terminal; a
-                    // `surfaces` theme says "secondary" with its muted ink.
+                    // `surfaces` theme says "secondary" with its muted ink,
+                    // and steps the chosen row's detail up to body text so
+                    // the row about to be inserted is the easiest to read
+                    // (muted sinks to about 3:1 on the band).
                     let style = match tones {
+                        Some(t) if row == self.selected => Style::default().fg(t.text()),
                         Some(t) => Style::default().fg(t.muted()),
                         None => Style::default()
                             .fg(self.theme.ui(Color::Rgb(0x70, 0x78, 0x88)))
@@ -531,9 +535,14 @@ impl Widget for &CompletionPopup {
         state.select(Some(self.selected));
         StatefulWidget::render(list, area, buf, &mut state);
         if tones.is_some() {
+            // The list never takes the caret from the editor (typing goes
+            // on into the buffer), so it wears the quiet card like the
+            // hover: an accent lip here would claim focus, and stacked
+            // right under the details pane's rim it read as two heavy
+            // lines. Its selected row's bar still marks the choice.
             // Flipped above the caret, the list's shadow would fall on the
-            // line being typed.
-            surface::paint_anchored_frame(buf, area, self.theme, self.anchor.1, false);
+            // line being typed, so the anchored frame spares that row.
+            surface::paint_anchored_frame(buf, area, self.theme, self.anchor.1, true);
         } else if self.theme.framed_overlays() {
             surface::paint_overlay_frame(buf, area, self.theme);
         }
@@ -999,7 +1008,7 @@ mod tests {
     /// Croft Loch: the selected row is the band with the accent bar on the
     /// card's edge (no forced white or bold); the typed prefix is in the
     /// accent, the kind glyph in its syntax role's ink, the detail muted
-    /// without DIM; the details card beside it has no second accent lip.
+    /// without DIM; the details card beside it is quiet too.
     #[test]
     fn croft_loch_rows_mark_the_prefix_and_select_with_the_bar() {
         let theme = crate::theme::Theme::from_id("loch");
@@ -1044,6 +1053,82 @@ mod tests {
             buf[(d.x + 1, d.y + 1)].fg,
             t.strong(),
             "the signature leads"
+        );
+    }
+
+    /// Croft Loch: the chosen row is the easiest one to read, its label in
+    /// the strong ink and its detail stepped up from muted to body text on
+    /// the band, while the other rows keep the muted detail.
+    #[test]
+    fn croft_loch_selected_row_detail_steps_up_to_body_text() {
+        use crate::theme::contrast_ratio;
+        let theme = crate::theme::Theme::from_id("loch");
+        let t = surface::tones(theme).unwrap();
+        let mut p = popup(
+            vec![
+                documented("trim", "fn(&self) -> &str", ""),
+                documented("trim_end", "fn(&self) -> &str", ""),
+            ],
+            "",
+        );
+        p.theme = theme;
+        p.selected = 1;
+        let list = p.area_for(VIEW);
+        let mut buf = Buffer::empty(VIEW);
+        Widget::render(&p, list, &mut buf);
+        let label_x = list.x + 4;
+        let (y0, y1) = (list.y + 1, list.y + 2);
+        let other = label_x + "trim  ".len() as u16;
+        let chosen = label_x + "trim_end  ".len() as u16;
+        assert_eq!(buf[(other, y0)].symbol(), "f");
+        assert_eq!(buf[(other, y0)].fg, t.muted(), "an unchosen row's detail");
+        assert_eq!(buf[(chosen, y1)].symbol(), "f");
+        assert_eq!(buf[(chosen, y1)].fg, t.text(), "the chosen row's detail");
+        assert_eq!(buf[(chosen, y1)].bg, t.band());
+        assert_eq!(buf[(label_x, y1)].fg, t.strong(), "the chosen label");
+        let Color::Rgb(r, g, b) = t.band() else {
+            panic!("an RGB band");
+        };
+        assert!(contrast_ratio(t.text, (r, g, b)) >= 4.5);
+    }
+
+    /// Croft Loch: the completion list never takes the caret from the
+    /// editor, so its card is the quiet one, the rim along the whole top
+    /// edge with no accent lip (the selected row's bar alone marks the
+    /// choice), and it keeps the shadow below and to the right. A boxed
+    /// theme still draws its gradient box.
+    #[test]
+    fn croft_loch_completion_list_wears_the_quiet_frame() {
+        let theme = crate::theme::Theme::from_id("loch");
+        let t = surface::tones(theme).unwrap();
+        let mut p = popup(vec![item("alpha"), item("beta")], "");
+        p.theme = theme;
+        let list = p.area_for(VIEW);
+        assert!(list.y > p.anchor.1, "drawn below the caret");
+        let mut buf = Buffer::empty(VIEW);
+        buf.set_style(VIEW, Style::default().bg(t.chrome()));
+        Widget::render(&p, list, &mut buf);
+        for x in list.x..list.right() {
+            assert_eq!(buf[(x, list.y)].symbol(), "\u{2594}", "({x}) top edge");
+            assert_eq!(buf[(x, list.y)].fg, t.rim(), "({x}) no accent lip");
+        }
+        assert_eq!(buf[(list.x, list.y + 1)].symbol(), surface::ROW_BAR);
+        assert_eq!(buf[(list.x, list.y + 1)].fg, t.accent());
+        assert_ne!(
+            buf[(list.right(), list.y + 1)].bg,
+            t.chrome(),
+            "the shadow still falls to the right"
+        );
+        assert_ne!(buf[(list.x + 1, list.bottom())].bg, t.chrome(), "and below");
+
+        let mut boxed = popup(vec![item("alpha"), item("beta")], "");
+        boxed.theme = crate::theme::Theme::BLACK;
+        let mut buf = Buffer::empty(VIEW);
+        Widget::render(&boxed, list, &mut buf);
+        assert_eq!(
+            buf[(list.x, list.y)].symbol(),
+            "\u{256d}",
+            "the gradient box"
         );
     }
 
