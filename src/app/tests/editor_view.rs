@@ -2160,9 +2160,25 @@ fn a_modal_quick_input_takes_the_accent_off_the_editor_seam() {
         let body = app.editor.last_body;
         term.backend().buffer()[(body.x, body.y)].fg
     };
+    // The palette's scrim sinks everything behind the card, the seam
+    // included, so the palette-open seam is the hairline as the scrim
+    // leaves it on the black canvas.
+    let theme = app.theme;
+    let behind_scrim = |c: ratatui::style::Color| {
+        let mut b = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 1, 1));
+        b[(0, 0)].set_fg(c).set_bg(t.canvas());
+        crate::widgets::surface::dim_backdrop(&mut b, Rect::default(), theme);
+        b[(0, 0)].fg
+    };
     assert_eq!(seam(&mut app), t.accent(), "the focused editor's lip");
     app.open_command_palette();
-    assert_eq!(seam(&mut app), t.hairline(), "the palette has the keyboard");
+    let palette_open = seam(&mut app);
+    assert_eq!(
+        palette_open,
+        behind_scrim(t.hairline()),
+        "the palette has the keyboard"
+    );
+    assert_ne!(palette_open, behind_scrim(t.accent()));
     assert!(app.focus == Pane::Editor && app.editor.focused);
     app.command_palette = None;
     assert_eq!(seam(&mut app), t.accent());
