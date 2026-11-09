@@ -561,6 +561,25 @@ fn git_status_spans_dirty_branch_adds_an_amber_dot_and_keeps_its_colour() {
 }
 
 #[test]
+fn git_status_spans_name_the_branch_in_a_light_themes_own_text_colour() {
+    // A light theme's foreground is already dark: adapting it again for a
+    // light background flipped it to near-white on the light bar.
+    let light = crate::theme::Theme::all()
+        .iter()
+        .find(|t| t.is_light() && !t.high_contrast())
+        .copied()
+        .expect("a bundled light theme");
+    let st = branch_status(false);
+    let spans = git_status_spans(&st, light);
+    let main_span = spans
+        .iter()
+        .find(|s| s.content.contains("main"))
+        .expect("branch span");
+    let (r, g, b) = light.syntax().fg;
+    assert_eq!(main_span.style.fg, Some(Color::Rgb(r, g, b)));
+}
+
+#[test]
 fn git_status_spans_renders_detached_hash_when_no_branch() {
     let st = crate::git::GitStatus {
         in_repo: true,

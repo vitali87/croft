@@ -149,6 +149,36 @@ fn workspace_cap_elides_a_long_folder_name() {
 }
 
 #[test]
+fn workspace_cap_elides_a_wide_name_by_the_cells_it_paints() {
+    // Thirty double-width chars: sixty cells, cut to fit the cap's
+    // WORKSPACE_CAP_MAX cells with the ellipsis, not its char count.
+    let wide = "\u{9879}".repeat(30);
+    let spans = workspace_cap_spans(crate::theme::Theme::default(), &wide);
+    let name = spans
+        .iter()
+        .find(|s| s.content.contains('\u{9879}'))
+        .map(|s| s.content.trim().to_string())
+        .unwrap();
+    assert!(name.ends_with('\u{2026}'), "{name}");
+    assert!(status_cells(&name) as usize <= WORKSPACE_CAP_MAX, "{name}");
+}
+
+#[test]
+fn high_contrast_themes_keep_the_status_bar_text_at_full_strength() {
+    // #1548: a high contrast theme resolves dim chrome text to its full
+    // foreground; the status bar's dim tone must not blend that back down.
+    let hc: Vec<_> = crate::theme::Theme::all()
+        .iter()
+        .filter(|t| t.high_contrast())
+        .collect();
+    assert!(!hc.is_empty(), "the bundled themes include high contrast");
+    for theme in hc {
+        let tones = StatusTones::new(*theme, status_bar_bg(*theme));
+        assert_eq!(tones.dim, tones.muted, "{}", theme.label());
+    }
+}
+
+#[test]
 fn workspace_relative_shortens_paths_inside_the_workspace() {
     let root = std::path::Path::new("/home/me/proj");
     assert_eq!(

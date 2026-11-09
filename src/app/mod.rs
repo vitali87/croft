@@ -993,6 +993,13 @@ const GIT_DIRTY_DOT: &str = "\u{2022}";
 const PILL_CAP_L: &str = "\u{e0b6}";
 const PILL_CAP_R: &str = "\u{e0b4}";
 
+/// The terminal cells `s` paints in, as ratatui lays it out. A wide
+/// character (`项`, an emoji) takes two, so a click target measured in
+/// `char`s would sit left of the text it belongs to.
+fn status_cells(s: &str) -> u16 {
+    unicode_width::UnicodeWidthStr::width(s) as u16
+}
+
 /// Cells left blank after the status bar's last right-hand segment: none,
 /// since the language pill's rounded end already reads as an edge.
 const STATUS_RIGHT_MARGIN: u16 = 0;
@@ -1010,17 +1017,23 @@ struct StatusTones {
 
 impl StatusTones {
     fn new(theme: crate::theme::Theme, bar: Color) -> Self {
+        // The theme's own foreground is already chosen for its background,
+        // light or dark; `theme.ui` would adapt it a second time (on a light
+        // theme, flipping dark text to near-white).
         let (r, g, b) = theme.syntax().fg;
-        let text = theme.ui(Color::Rgb(r, g, b));
+        let text = Color::Rgb(r, g, b);
         let muted = match theme.surfaces() {
             Some(s) => s.muted(),
             None => theme.ui(Color::Rgb(0x9a, 0xa4, 0xb8)),
         };
-        StatusTones {
-            text,
-            muted,
-            dim: mix_color(muted, bar, 0.6),
-        }
+        // A high contrast theme resolves chrome greys to full strength on
+        // purpose (#1548); blending toward the bar would undo that.
+        let dim = if theme.high_contrast() {
+            muted
+        } else {
+            mix_color(muted, bar, 0.6)
+        };
+        StatusTones { text, muted, dim }
     }
 }
 
@@ -1115,8 +1128,20 @@ const WORKSPACE_CAP_MAX: usize = 24;
 fn workspace_cap_spans(theme: crate::theme::Theme, name: &str) -> Vec<Span<'static>> {
     let fill = theme.selection();
     let tones = StatusTones::new(theme, status_bar_bg(theme));
-    let name: String = if name.chars().count() > WORKSPACE_CAP_MAX {
-        let mut s: String = name.chars().take(WORKSPACE_CAP_MAX - 1).collect();
+    // Measured in terminal cells, not chars: a wide name (`项目`) paints
+    // twice its char count, and every offset after the cap counts cells.
+    let name: String = if status_cells(name) as usize > WORKSPACE_CAP_MAX {
+        use unicode_width::UnicodeWidthChar;
+        let mut s = String::new();
+        let mut used = 0;
+        for c in name.chars() {
+            let w = c.width().unwrap_or(0);
+            if used + w > WORKSPACE_CAP_MAX - 1 {
+                break;
+            }
+            used += w;
+            s.push(c);
+        }
         s.push('\u{2026}');
         s
     } else {
@@ -24132,7 +24157,7 @@ impl App {
         }
         // The pill the update card rises from and Later folds it into; a
         // click opens or folds the card. Recorded as (start column, width).
-        let offer_chip_x: u16 = spans.iter().map(|s| s.content.chars().count() as u16).sum();
+        let offer_chip_x: u16 = spans.iter().map(|s| status_cells(&s.content)).sum();
         if let Some(toast) = self.update_toast.as_ref().filter(|t| !t.ready) {
             let hovered =
                 crate::widgets::hover::contains(self.status_offer_rect, self.pointer_cell);
@@ -24146,7 +24171,7 @@ impl App {
                 Color::White,
             ));
         }
-        let offer_chip_end: u16 = spans.iter().map(|s| s.content.chars().count() as u16).sum();
+        let offer_chip_end: u16 = spans.iter().map(|s| status_cells(&s.content)).sum();
         let offer_chip =
             (offer_chip_end > offer_chip_x).then(|| (offer_chip_x, offer_chip_end - offer_chip_x));
         if offer_chip.is_some() {
@@ -24154,7 +24179,7 @@ impl App {
         }
         // Both update pills are one click target, doing what the updater
         // chord does (#865); recorded as (start column, width).
-        let update_chip_x: u16 = spans.iter().map(|s| s.content.chars().count() as u16).sum();
+        let update_chip_x: u16 = spans.iter().map(|s| status_cells(&s.content)).sum();
         if self.any_update_ready() {
             spans.extend(crate::widgets::update_popup::pill_spans(
                 &format!(
@@ -24186,7 +24211,7 @@ impl App {
                     .add_modifier(Modifier::BOLD),
             ));
         }
-        let update_chip_end: u16 = spans.iter().map(|s| s.content.chars().count() as u16).sum();
+        let update_chip_end: u16 = spans.iter().map(|s| status_cells(&s.content)).sum();
         let update_chip = (update_chip_end > update_chip_x)
             .then(|| (update_chip_x, update_chip_end - update_chip_x));
         if self.any_update_in_progress() {
@@ -24270,8 +24295,8 @@ impl App {
                 self.theme.ui(Color::Rgb(0x2b, 0x5d, 0x8a)),
                 Color::White,
             );
-            let x: u16 = spans.iter().map(|s| s.content.chars().count() as u16).sum();
-            let w: u16 = pill.iter().map(|s| s.content.chars().count() as u16).sum();
+            let x: u16 = spans.iter().map(|s| status_cells(&s.content)).sum();
+            let w: u16 = pill.iter().map(|s| status_cells(&s.content)).sum();
             codeql_chip = Some((x, w));
             spans.extend(pill);
             spans.push(Span::raw(" "));
@@ -24393,7 +24418,7 @@ impl App {
         // that has something to say.
         let err_count = self.problems.error_count();
         let warn_count = self.problems.warning_count();
-        let diag_start_col: u16 = spans.iter().map(|s| s.content.chars().count() as u16).sum();
+        let diag_start_col: u16 = spans.iter().map(|s| status_cells(&s.content)).sum();
         // diag_len is measured from the very strings that render, so the hit
         // rect can never drift from the visible text.
         let diag_parts: [(String, Style); 4] = [
@@ -24426,10 +24451,7 @@ impl App {
                 }),
             ),
         ];
-        let diag_len: u16 = diag_parts
-            .iter()
-            .map(|(t, _)| t.chars().count() as u16)
-            .sum();
+        let diag_len: u16 = diag_parts.iter().map(|(t, _)| status_cells(t)).sum();
         spans.extend(diag_parts.into_iter().map(|(t, st)| Span::styled(t, st)));
         // Transient status message (e.g. "Saved editor.rs"), no keybinding
         // cheat-sheet — those live in F1 / the Command Palette now. Set apart
@@ -24467,7 +24489,7 @@ impl App {
         let mut status_x: u16 = 0;
         if !status_text.is_empty() {
             spans.push(Span::styled(format!("{div} "), zone_div));
-            let x: u16 = spans.iter().map(|s| s.content.chars().count() as u16).sum();
+            let x: u16 = spans.iter().map(|s| status_cells(&s.content)).sum();
             status_x = x;
             if status_h > 0 && x < outer[2].width {
                 self.announce_pos = Some((outer[2].x + x, outer[2].y));
@@ -24641,7 +24663,7 @@ impl App {
             };
             seg_texts.push(format!(" \u{25c6} {joined} "));
         }
-        let widths: Vec<u16> = seg_texts.iter().map(|s| s.chars().count() as u16).collect();
+        let widths: Vec<u16> = seg_texts.iter().map(|s| status_cells(s)).collect();
         // One cell of margin after the last segment, so the language pill's
         // rounded end does not touch the frame edge.
         let mut right_total: u16 =
@@ -24654,7 +24676,7 @@ impl App {
             let left_fixed: u16 = spans
                 .iter()
                 .take(spans.len().saturating_sub(1))
-                .map(|s| s.content.chars().count() as u16)
+                .map(|s| status_cells(&s.content))
                 .sum();
             let fits_beside = |right: u16| {
                 status_rect
