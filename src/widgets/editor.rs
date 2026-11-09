@@ -8805,6 +8805,9 @@ impl Editor {
     fn overwrite_char(&mut self, c: char) {
         self.pin_on_edit();
         self.push_undo(EditKind::InsertChar);
+        // A click leaves an empty selection behind; drop it, as the insert
+        // path does, or a later Shift+arrow would extend from the click.
+        self.selection = None;
         let row = self.cursor_row;
         let from = self.byte_index(row, self.cursor_col);
         let next = next_grapheme_col(&self.lines[row], self.cursor_col);

@@ -2473,6 +2473,23 @@ fn overwrite_adds_a_combining_mark_to_the_letter_before_the_caret() {
 }
 
 #[test]
+fn overwrite_drops_the_empty_selection_a_click_leaves() {
+    let (_t, mut app) = overwrite_app("abcd");
+    app.overwrite_mode = true;
+    app.editor.selection = Some(crate::widgets::editor::EditorSelection {
+        anchor: (0, 0),
+        head: (0, 0),
+    });
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.lines[0], "xbcd");
+    assert!(
+        app.editor.selection.is_none(),
+        "no stale anchor for a later Shift+arrow"
+    );
+}
+
+#[test]
 fn overwrite_mode_is_shown_by_a_glyph_after_the_workspace_cap_not_in_the_position() {
     let (_t, mut app) = overwrite_app("abc");
     let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
