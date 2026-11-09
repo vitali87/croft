@@ -185,8 +185,9 @@ fn welcome_tagline_constant_is_present() {
 /// any window size and whatever height the release-note card takes. The
 /// logo's cells are the image's, edge to edge; the tagline's last column
 /// reaches the badge's first, and once painted over its corner. Croft
-/// Black boxes the version beside the logo; Croft Loch sets it as a one-row
-/// pill on the box's middle row, in the same columns.
+/// Black boxes the version beside the logo; Croft Loch's picture logo sets it
+/// as a one-row pill on the box's middle row, in the same columns (the
+/// picture path is forced here: its cells stay blank while it bakes).
 #[test]
 fn the_welcome_version_never_overlaps_the_logo_or_the_tagline() {
     let tmp = tempfile::tempdir().unwrap();
@@ -203,6 +204,10 @@ fn the_welcome_version_never_overlaps_the_logo_or_the_tagline() {
         for notes in [Vec::new(), long_test_note()] {
             let mut app = App::new(tmp.path().to_path_buf()).unwrap();
             app.apply_theme(theme);
+            if loch {
+                app.inline_protocol = crate::iterm2_inline::InlineImageProtocol::Kitty;
+                app.cell_pixel = Some((8, 16));
+            }
             app.welcome.set_test_notes(notes);
             for w in (30..=200).step_by(3) {
                 for h in (8..=56).step_by(2) {
@@ -753,14 +758,55 @@ fn croft_loch_welcome_start_list_shows_keycaps_and_runs_on_click() {
     );
 }
 
-/// The Start list is the first thing a short window gives up, after the
-/// logo has shrunk to its floor: the release card never clips for it.
+/// Five notes for the Croft Loch layout tests, each wrapping to a few rows
+/// in a card and ending in a token of its own, so a test can tell which
+/// notes the card shows and that each one it shows is whole.
+fn five_test_notes() -> Vec<crate::release_notes::ReleaseNote> {
+    use crate::release_notes::{NoteKind, ReleaseNote};
+    [
+        "The first highlight is long enough to wrap onto a second row of the card \
+         at the common widths, and it ends in its token: note-one-end.",
+        "The second highlight wraps the same way, a sentence or two that a release \
+         card carries for a change worth naming: note-two-end.",
+        "A third, shorter one: note-three-end.",
+        "The fourth highlight wraps again, a line about a fix the card lists in \
+         the muted ink like any other: note-four-end.",
+        "And a fifth to round it off: note-five-end.",
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(i, summary)| ReleaseNote {
+        kind: if i == 3 {
+            NoteKind::Fix
+        } else {
+            NoteKind::Feature
+        },
+        summary,
+    })
+    .collect()
+}
+
+/// The tokens [`five_test_notes`] end in, in order.
+const FIVE_NOTE_ENDS: [&str; 5] = [
+    "note-one-end.",
+    "note-two-end.",
+    "note-three-end.",
+    "note-four-end.",
+    "note-five-end.",
+];
+
+/// Croft Loch's welcome keeps the Start list before the release card: in a
+/// short editor the card gives up notes, whole ones, and says how many with
+/// a "+N more" line, rather than the Start list giving way. The notes it
+/// keeps are the first ones, each ending inside the card.
 #[test]
-fn croft_loch_start_list_yields_before_the_release_card_clips() {
+fn croft_loch_release_card_shortens_before_the_start_list_goes() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.welcome.set_test_notes(long_test_note());
-    for h in (12..=50).step_by(2) {
+    app.welcome.set_test_notes(five_test_notes());
+    app.tour_done = false;
+    let mut seen_short = false;
+    for h in 8..=50 {
         let area = Rect::new(0, 0, 120, h);
         let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, h)).unwrap();
         term.draw(|f| app.render_welcome(f, area)).unwrap();
@@ -769,15 +815,212 @@ fn croft_loch_start_list_yields_before_the_release_card_clips() {
             .map(|y| (0..120).map(|x| buf[(x, y)].symbol()).collect::<String>())
             .collect::<Vec<_>>()
             .join("\n");
-        if text.contains("New File") {
+        // Wordmark (1), tagline (2), Start heading and four rows (6): the
+        // Start list shows from 9 inner rows, the frame's two padding rows
+        // on top.
+        assert_eq!(
+            text.contains("New File"),
+            h >= 11,
+            "the Start list shows whenever it fits, at height {h}"
+        );
+        let shown = FIVE_NOTE_ENDS
+            .iter()
+            .take_while(|end| text.contains(*end))
+            .count();
+        assert!(
+            FIVE_NOTE_ENDS[shown..]
+                .iter()
+                .all(|end| !text.contains(end)),
+            "the card keeps the first notes at height {h}"
+        );
+        if text.contains("What's new") {
+            assert!(shown > 0, "a card shows at least one note whole at {h}");
             assert!(
-                text.contains("cardclip-endcap."),
-                "at height {h} the Start list shows over a clipped card"
+                text.contains("New File"),
+                "the card never shows without the Start list at {h}"
             );
-            let logo = *app.overlays.welcome.layout().expect("laid out");
-            assert!(logo.cell_h >= 4, "the logo keeps its floor at height {h}");
+            let more = format!("+{} more", 5 - shown);
+            assert_eq!(
+                text.contains(&more),
+                shown < 5,
+                "the card says what it left out at height {h}"
+            );
+            seen_short |= shown < 5;
+        } else {
+            assert_eq!(shown, 0, "no note outside a card at height {h}");
         }
     }
+    assert!(seen_short, "a shortened card must be exercised");
+}
+
+/// The Croft Loch welcome plan's priorities: the wordmark, the tagline and
+/// the Start list first, the card shortened to whole notes after them, a
+/// tour chip where the Start list cannot fit, and the picture logo growing
+/// only once every note fits. Blocks sit one row apart, centred.
+#[test]
+fn croft_loch_welcome_plan_keeps_its_priorities() {
+    // A 21-row editor: wordmark, tagline, Start (heading and four rows),
+    // then a card of two whole notes and the "+N more" row: 21 rows.
+    let plan = loch_welcome_plan(21, true, 4, true, &[3, 3, 2, 3, 2]);
+    assert_eq!(plan.logo_y, 0);
+    assert_eq!(plan.logo_h, 1);
+    assert_eq!(plan.tagline_y, 2);
+    assert_eq!(plan.start_y, Some(4));
+    assert_eq!(plan.chip_y, None);
+    assert_eq!((plan.card_y, plan.card_h, plan.notes), (10, 11, 2));
+    // Too short for any note: the card goes, the rest is centred.
+    let plan = loch_welcome_plan(14, true, 4, true, &[3, 3]);
+    assert_eq!(plan.notes, 0);
+    assert_eq!(plan.logo_y, 2, "nine rows centred in fourteen");
+    // No room for the Start list: the tour chip takes its place.
+    let plan = loch_welcome_plan(6, true, 4, true, &[3]);
+    assert_eq!((plan.start_y, plan.chip_y), (None, Some(4)));
+    // Every note fits: the picture grows, capped at fourteen rows.
+    let plan = loch_welcome_plan(40, false, 4, true, &[3, 3]);
+    assert_eq!(plan.logo_h, 14);
+    assert_eq!(plan.notes, 2);
+    assert_eq!(plan.logo_y, (40 - (14 + 2 + 6 + 12)) / 2);
+    // Not every note fits: the picture keeps its floor and the card gives
+    // up a note.
+    let plan = loch_welcome_plan(23, false, 4, true, &[3, 3]);
+    assert_eq!((plan.logo_h, plan.notes), (4, 1));
+}
+
+/// Croft Loch's wordmark carries the version as a pill two cells after it,
+/// the pair centred as one group on the page's axis, at every width; the
+/// logo's cells are the wordmark's, so nothing else lands on them.
+#[test]
+fn croft_loch_version_pill_sits_two_cells_after_the_wordmark() {
+    let tmp = tempfile::tempdir().unwrap();
+    let version = format!(" v{} ", env!("CARGO_PKG_VERSION"));
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    for w in (30..=200).step_by(7) {
+        let area = Rect::new(0, 0, w, 36);
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, 36)).unwrap();
+        term.draw(|f| app.render_welcome(f, area)).unwrap();
+        let buf = term.backend().buffer();
+        let logo = *app.overlays.welcome.layout().expect("laid out");
+        assert_eq!((logo.cell_w, logo.cell_h), (6, 1), "the wordmark's cells");
+        let row: String = (0..w).map(|x| buf[(x, logo.cell_y)].symbol()).collect();
+        let mark_x = row.find("cr<>ft").expect("the wordmark") as u16;
+        assert_eq!(mark_x, logo.cell_x);
+        let cap = mark_x + 6 + 2;
+        assert_eq!(buf[(cap - 1, logo.cell_y)].symbol(), " ", "a 2-cell gap");
+        assert_eq!(
+            buf[(cap, logo.cell_y)].symbol(),
+            "\u{2590}",
+            "the pill's cap"
+        );
+        let label: String = (cap + 1..cap + 1 + version.len() as u16)
+            .map(|x| buf[(x, logo.cell_y)].symbol())
+            .collect();
+        assert_eq!(label, version, "the version inside the pill at {w}");
+        let end = cap + 1 + version.len() as u16;
+        assert_eq!(buf[(end, logo.cell_y)].symbol(), "\u{258c}");
+        // One group on the axis: as much room left of the wordmark as
+        // right of the pill, give or take the odd cell.
+        let (inner_l, inner_r) = (area.x + 1, area.right() - 1);
+        let (left, right) = (mark_x - inner_l, inner_r - (end + 1));
+        assert!(
+            left.abs_diff(right) <= 1,
+            "centred at {w}: {left} vs {right}"
+        );
+    }
+}
+
+/// At the screenshots' 140x36 with the side bar and the terminal panel open
+/// (an editor about twenty rows tall), Croft Loch's welcome shows the whole
+/// stack: the wordmark and version, the tagline, the Start list with the
+/// tour as its last row, and a release card shortened to whole notes with a
+/// "+N more" line, its blocks one blank row apart and centred on one axis.
+/// The Start rows answer the mouse where they are painted.
+#[test]
+fn croft_loch_welcome_fits_a_short_editor_with_the_start_list() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.welcome.set_test_notes(five_test_notes());
+    app.tour_done = false;
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 36)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let buf = term.backend().buffer().clone();
+    // One char per cell, so a char index is a column.
+    let rows: Vec<String> = (0..36)
+        .map(|y| {
+            (0..140)
+                .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
+                .collect()
+        })
+        .collect();
+    let col = |y: usize, needle: &str| -> u16 {
+        let r = &rows[y];
+        r[..r.find(needle).unwrap()].chars().count() as u16
+    };
+    let row_of = |needle: &str| {
+        rows.iter()
+            .position(|r| r.contains(needle))
+            .unwrap_or_else(|| panic!("{needle:?} on screen:\n{}", rows.join("\n")))
+    };
+    let mark = row_of("cr<>ft  \u{2590}");
+    let tagline = row_of(App::WELCOME_TAGLINE_CALM);
+    let start = row_of("Start   ");
+    let tour = row_of("Take the Tour");
+    let card = row_of("What's new");
+    for label in ["New File", "Go to File", "Command Palette"] {
+        let y = row_of(label);
+        assert!(start < y && y < tour, "{label} in the Start list");
+    }
+    assert_eq!(tagline, mark + 2, "one blank row under the wordmark");
+    assert_eq!(start, tagline + 2, "one blank row under the tagline");
+    assert_eq!(tour, start + 4, "the tour is the list's last row");
+    // The card's top edge sits one blank row under the list.
+    assert_eq!(
+        card,
+        tour + 3,
+        "one blank row between the list and the card"
+    );
+    let shown = FIVE_NOTE_ENDS
+        .iter()
+        .filter(|end| rows.iter().any(|r| r.contains(*end)))
+        .count();
+    assert!(shown >= 1 && shown < 5, "a shortened card: {shown} notes");
+    row_of(&format!("+{} more", 5 - shown));
+
+    // One axis: the tagline, the Start column and the card centre on the
+    // same column as the wordmark-and-version group (compared doubled, as
+    // first plus last column, so an odd width needs no rounding).
+    let version = format!("v{}", env!("CARGO_PKG_VERSION"));
+    let pill_end = col(mark, &version) + version.len() as u16 + 1;
+    let axis = col(mark, "cr<>ft") + pill_end;
+    let tagline_axis = col(tagline, "Lightweight") + col(tagline, "developers.") + 10;
+    let card_version = col(card, &version) + version.len() as u16 - 1;
+    let card_end = card_version + u16::from(rows[card][..].contains(&format!("{version}+")));
+    let card_axis = col(card, "What's new") + card_end;
+    let go = app
+        .welcome
+        .start_rows()
+        .iter()
+        .find(|(_, a)| {
+            *a == crate::app::welcome::StartAction::Command(
+                crate::widgets::command_palette::Command::QuickOpen,
+            )
+        })
+        .unwrap()
+        .0;
+    let start_axis = 2 * go.x + go.width - 1;
+    for (what, c) in [
+        ("tagline", tagline_axis),
+        ("Start list", start_axis),
+        ("card", card_axis),
+    ] {
+        assert!(c.abs_diff(axis) <= 2, "the {what} centred: {c} vs {axis}");
+    }
+
+    // The Start rows' hit rects are the painted rows: a real click on Go
+    // to File opens the finder, and the tour row is the tour's button.
+    assert_eq!(go.y as usize, row_of("Go to File"));
+    assert_eq!(app.welcome_tour_button.y as usize, tour);
+    left_click(&mut app, go.x + 2, go.y);
+    assert!(app.file_finder.is_some(), "Go to File opened the finder");
 }
 
 /// A long fixed note for the welcome-card tests: the live notes change with
