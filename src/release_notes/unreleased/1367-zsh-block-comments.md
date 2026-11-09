@@ -1,1 +1,0 @@
-fix: A runnable Markdown shell block with a `#` comment runs as written in zsh: `echo done  # note` printed the note, and a comment alone failed with "command not found: #" and exit 127, unless your zsh had `setopt interactive_comments`.
