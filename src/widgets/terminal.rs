@@ -4561,6 +4561,13 @@ impl PtyTerminal {
             // first would leave the "cleared" rows alive in scrollback.
             processor.advance(&mut *term, b"\x1b[2J\x1b[3J\x1b[H");
             term.scroll_display(Scroll::Bottom);
+            // The captured lines' rows go too: a CAPTURES entry must say its
+            // line is gone, not jump to a copy printed after the Clear
+            // (#1450). Cleared under the same `term` lock as the grid (lock
+            // order term -> capture_rows): the reader records a new capture
+            // while it holds `term`, so dropping the lock first would let a
+            // line printed in between keep its row on screen but lose it here.
+            self.capture_rows.lock().unwrap().0.clear();
         }
         // The content the images and OSC 133 marks anchored to is gone;
         // keeping either leaves overlays (a floating picture, phantom
@@ -4568,9 +4575,6 @@ impl PtyTerminal {
         // the fresh prompt.
         self.images.lock().unwrap().clear();
         self.marks.lock().unwrap().clear();
-        // The captured lines' rows go too: a CAPTURES entry must say its
-        // line is gone, not jump to a copy printed after the Clear (#1450).
-        self.capture_rows.lock().unwrap().0.clear();
         self.pty_dirty.store(true, Ordering::Release);
     }
 
