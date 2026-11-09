@@ -156,7 +156,10 @@ python3 scripts/check_doc_ownership.py "$base" HEAD     # doc comments
 CI also cross-builds the static musl binaries that `croft remote` ships, and an
 Android build. If you bump `rust-toolchain.toml`, add the cross targets
 (`rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl`) and
-make sure those jobs stay green.
+make sure those jobs stay green. Pull requests labelled `refactor`, and every
+push to `main`, also run clippy on macOS, since the Linux jobs never compile
+`#[cfg(target_os = "macos")]` code. CI fails if the published package nears
+crates.io's 10 MiB limit.
 
 ### Flaky tests
 

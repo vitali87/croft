@@ -1,0 +1,70 @@
+name: macOS
+
+# ci.yml builds on Linux only, so code behind `#[cfg(target_os = "macos")]`
+# (over a hundred sites) is first compiled by release.yml's Apple legs, which
+# run only when publish-crate.yml cuts a release: up to 50 merges after the
+# change that broke it. The refactor program (#2062) moves code between files
+# in bulk, mac-only blocks included, so its pull requests are checked on macOS
+# before they merge, and every push to main is checked after.
+#
+# A workflow of its own, not a job in ci.yml, because the label is what starts
+# it and the events that start a run belong to the whole file. `labeled` in
+# ci.yml would re-run its whole suite each time any label is added, and
+# Dependabot adds two to every pull request it opens. Skipping those jobs on
+# `labeled` instead would be worse: each skipped job posts a new "skipped"
+# result for the commit, which replaces its earlier one and reads as passing,
+# so a failure would disappear from the pull request. Here nothing else runs.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    # GitHub's default three, plus `labeled` so that adding `refactor` to an
+    # open pull request starts the check without waiting for another push.
+    types: [opened, synchronize, reopened, labeled]
+
+# The job only reads the checkout.
+permissions:
+  contents: read
+
+# Each label added to a refactor pull request starts a full run, even on a
+# head already being checked, and only a few macOS runners run at once. Every
+# run on a pull request checks its current head, so the newest one makes the
+# rest redundant; pushes to main group by commit, so none of them is cancelled.
+concurrency:
+  group: macos-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  macos:
+    name: macOS build check
+    # Every label the pull request carries, not just the one being added: a
+    # refactor pull request that gains any other label re-runs the check
+    # rather than skipping it, so a skip never hides an earlier failure on
+    # the same commit.
+    if: github.event_name == 'push' || contains(github.event.pull_request.labels.*.name, 'refactor')
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The build runs the branch's build scripts; the token is not
+          # needed after the fetch, so it does not stay in .git/config.
+          persist-credentials: false
+      # rust-toolchain.toml is the single source of truth; `rustup show`
+      # installs exactly the pinned channel and its components.
+      - name: Install the pinned toolchain
+        run: rustup show
+      # rust-cache already keys on the runner's OS; the key names the job the
+      # way the other jobs' keys do.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          key: macos
+      - name: Clippy on macOS (zero warnings)
+        # Clippy runs everything `cargo check` does before it lints, so a
+        # compile error fails this step too; a separate check would only
+        # type-check the whole crate twice.
+        run: cargo clippy --all-targets --locked -- -D warnings
