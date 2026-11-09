@@ -28,7 +28,7 @@ src/
 ├── file_ref.rs          `path:line[:col]` references detected in terminal text (rustc / grep / pytest / Python-traceback forms); backs Cmd/Ctrl+click-to-jump from any terminal pane with zero per-tool problem-matcher config
 ├── quickfix.rs           parses the last `grep`/`rg`/`git grep` command line into a pattern plus Search toggles and include/exclude globs, so "Search & Replace from Last grep/rg" seeds and runs the Search sidebar via `SearchPanel::seed`
 ├── git.rs                branch / dirty / ahead-behind status plus the working-tree operations the Source Control panel drives; multi-root, one `GitWorker` per workspace root
-├── magic.rs              content-based format detection: a magic-byte signature table (images, PDF, zip family, gzip, tar, SQLite) used as the SECOND routing hint in `Editor::open` — extension first, sniffing decides when it gave no answer or lied
+├── magic.rs              content-based format detection: a magic-byte signature table (images, PDF, zip family, gzip, xz, bzip2, zstd, tar, SQLite) used as the SECOND routing hint in `Editor::open` — extension first, sniffing decides when it gave no answer or lied
 ├── markdown.rs           rendered Markdown preview (Cmd/Ctrl+Shift+V): pulldown-cmark events to styled ratatui lines, tree-sitter fenced code, inline local images; pure, the editor holds the state
 ├── media.rs              audio/video info view for `.mp3`/`.wav`/`.flac`/`.m4a`/`.mp4`/`.m4v`/`.mov`: pure-Rust header parsers over a bounded head read, never decoding streams, rendered as a markdown card with an optional ffmpeg poster frame
 ├── mem_relief.rs         hands freed heap back to the OS (`malloc_trim` on glibc, zone pressure relief on macOS) once the resident size has grown well past its low-water mark, which starts at launch so a restored tab's parse peak is not kept; a release that frees little backs off rather than repeating every tick
@@ -42,7 +42,7 @@ src/
 ├── log_view.rs           windowed backing store for the rendered ANSI log view: a `memchr` line-offset index plus a 256 KiB parsed window around the viewport, head indexed sync and the tail in a background thread
 ├── hex.rs                hex viewer/editor core and the routing fallback for files the text heuristic rejects; pure state + windowed file IO, never loads the file whole
 ├── asciicast.rs          writing a session as an asciicast v2 recording, behind "Session: Record Terminal as Asciicast"; payloads go through `serde_json`, backwards timestamps are clamped
-├── archive.rs            archive browser core: zip-based packages (zip/jar/whl/apk/vsix/epub/...) and tar/tar.gz/tar.xz member listing without payload reads, size-gated before the parse; extract_member writes one member under a strictly lexical containment check; the tab is read-only
+├── archive.rs            archive browser core: zip-based packages (zip/jar/whl/apk/vsix/epub/...) and tar/tar.gz/tar.xz/tar.bz2/tar.zst member listing without payload reads, size-gated before the parse; extract_member writes one member under a strictly lexical containment check; the tab is read-only
 ├── highlight.rs          tree-sitter highlight registry per language; every span, captured or not, styles from the active theme's `SyntaxPalette`, snapshotted once per pass rather than a hardcoded Base16 literal; Markdown alone resolves injections (the inline grammar, fenced code by its language, front matter), each with its children included since the block grammar leaves delimiter hints inside the ranges it hands off
 ├── hot_exit.rs           hot exit (#862): the workspace's unsaved buffers backed up while unsaved under `~/.local/state/croft/hot-exit/<workspace digest>/<pid>.json`, one file per running croft; a launch restores only the files of crofts that are gone, as unsaved tabs, and a clean quit removes its own
 ├── history.rs            local history: per-save snapshots under `~/.config/croft/history` (raw bytes, deduped, capped, 10s merge window), merged into the Explorer timeline, backing snapshot diff/restore plus a per-line `.seats` authorship sidecar
@@ -929,13 +929,13 @@ An SGR span parser for colour-bearing text. One pass turns a raw line into visib
 
 ### archive.rs
 
-The archive browser core. It lists members without reading payloads: zip-based packages (zip, jar, whl, apk, aar, war, ear, nupkg, vsix, epub) through the central directory, tar, tar.gz and tar.xz through a header walk.
+The archive browser core. It lists members without reading payloads: zip-based packages (zip, jar, whl, apk, aar, war, ear, nupkg, vsix, epub) through the central directory, tar, tar.gz, tar.xz, tar.bz2 and tar.zst through a header walk. The bzip2 and zstd decoders are pure Rust (`bzip2` on its libbz2-rs-sys backend, and `ruzstd`), so the musl and Android cross builds need no C toolchain for them.
 
-**Why the size gate comes before the parse.** Each branch is bounded by FILE SIZE before parsing. Tar is capped at `TAR_LIST_CAP`, with an additional decoded-byte cap while a `.tar.gz` streams. A `.tar.xz` is decoded into memory under the same cap: its declared size is checked first, then the decoder stops at the cap, so an xz bomb is refused as a listing cap rather than inflated. Zip is capped at `ZIP_LIST_CAP`, because a zip's members cost ~87 bytes each, so a file under the editor's 50MB cap can declare 400k of them and take 1.65s to list on the frame loop. `ZipArchive::new` parses the whole central directory before any count exists, so the gate has to precede it.
+**Why the size gate comes before the parse.** Each branch is bounded by FILE SIZE before parsing. Tar is capped at `TAR_LIST_CAP`, with an additional decoded-byte cap while a `.tar.gz`, `.tar.bz2` or `.tar.zst` streams. The bzip2 and zstd readers take every stream or frame in the file, as `bzip2 -d` and `zstd -d` do, so a `pbzip2` or `pzstd` archive lists whole. A `.tar.xz` is decoded into memory under the same cap: its declared size is checked first, then the decoder stops at the cap, so an xz bomb is refused as a listing cap rather than inflated. Zip is capped at `ZIP_LIST_CAP`, because a zip's members cost ~87 bytes each, so a file under the editor's 50MB cap can declare 400k of them and take 1.65s to list on the frame loop. `ZipArchive::new` parses the whole central directory before any count exists, so the gate has to precede it.
 
 **Extraction is lexically contained.** `extract_member` writes ONE member into a destination under a strictly LEXICAL containment check: absolute paths, drive prefixes and `..`-traversal are refused before anything is written, and zip-slip is tested. Extraction is capped at 100MB.
 
-**How it reaches the editor.** The editor holds the read-only browser tab with selection nav and click-select/click-open. Enter extracts to the session scratch dir and reopens the copy through the standard open dispatch, so every member renders with its real viewer. Sniffed zip, gzip and tar containers route here before the hex fallback.
+**How it reaches the editor.** The editor holds the read-only browser tab with selection nav and click-select/click-open. Enter extracts to the session scratch dir and reopens the copy through the standard open dispatch, so every member renders with its real viewer. Sniffed zip, gzip, xz, bzip2, zstd and tar containers route here before the hex fallback.
 
 ### captures.rs
 
@@ -1039,7 +1039,7 @@ Maps a test name to a source location. `--list` carries no file or line, so `fin
 
 ### magic.rs
 
-Content-based format detection: a pure magic-byte signature table covering PNG, JPEG, GIF, WebP and BMP, PDF, the zip family, gzip, tar's offset-257 `ustar`, and SQLite.
+Content-based format detection: a pure magic-byte signature table covering PNG, JPEG, GIF, WebP and BMP, PDF, the zip family, gzip, xz, bzip2, zstd, tar's offset-257 `ustar`, and SQLite. A bzip2 stream needs its first block's magic after `BZh` and the block-size digit, since those four ASCII bytes alone can start a text file. A zstd stream is also recognised behind leading skippable frames (`pzstd` output), but only when a zstd frame follows them, since LZ4 uses the same skippable frames.
 
 **Second hint, not first.** It is consulted as the SECOND routing hint in `Editor::open`. The extension stays first, and sniffing decides when the extension gave no answer or lied — an image or sheet extension whose decode or parse fails falls through rather than failing the open.
 

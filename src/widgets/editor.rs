@@ -6201,10 +6201,20 @@ impl Editor {
                     return Ok(());
                 }
             }
-            // A `.tar.xz` under another name (#1645); a plain xz file is not
-            // a tar and falls through to hex.
-            Some(crate::magic::Magic::Xz) => {
-                match self.open_archive(path, crate::archive::ArchiveKind::TarXz) {
+            // A `.tar.xz`, `.tar.bz2` or `.tar.zst` under another name
+            // (#1645); a plain compressed file is not a tar and falls through
+            // to hex.
+            Some(
+                m @ (crate::magic::Magic::Xz
+                | crate::magic::Magic::Bzip2
+                | crate::magic::Magic::Zstd),
+            ) => {
+                let kind = match m {
+                    crate::magic::Magic::Xz => crate::archive::ArchiveKind::TarXz,
+                    crate::magic::Magic::Bzip2 => crate::archive::ArchiveKind::TarBz2,
+                    _ => crate::archive::ArchiveKind::TarZst,
+                };
+                match self.open_archive(path, kind) {
                     Ok(()) => return Ok(()),
                     Err(e) if crate::archive::is_list_cap_refusal(&e.to_string()) => {
                         self.route_note = Some((path.to_path_buf(), e.to_string()));

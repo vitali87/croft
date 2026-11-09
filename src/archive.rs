@@ -1,9 +1,9 @@
 //! Archive browser core (#179): list the members of a zip / jar / whl /
-//! tar / tar.gz / tar.xz archive without touching payloads, and extract ONE
-//! member on demand into a scratch directory so the standard open
-//! dispatch (text, image, PDF, sheet, hex) can render it. Extraction is
-//! containment-checked: a member whose path escapes the target
-//! directory (zip-slip) is refused.
+//! tar / tar.gz / tar.xz / tar.bz2 / tar.zst archive without touching
+//! payloads, and extract ONE member on demand into a scratch directory so
+//! the standard open dispatch (text, image, PDF, sheet, hex) can render it.
+//! Extraction is containment-checked: a member whose path escapes the
+//! target directory (zip-slip) is refused.
 
 use std::path::{Path, PathBuf};
 
@@ -87,6 +87,11 @@ pub enum ArchiveKind {
     /// releases. Decoded with `lzma-rs`, already a dependency for the
     /// language-server installs.
     TarXz,
+    /// `.tar.bz2` / `.tbz2` / `.tbz` (#1645): older source releases.
+    TarBz2,
+    /// `.tar.zst` / `.tzst` (#1645): Arch packages and newer release
+    /// artifacts.
+    TarZst,
 }
 
 impl ArchiveKind {
@@ -96,6 +101,8 @@ impl ArchiveKind {
             ArchiveKind::Tar => "TAR",
             ArchiveKind::TarGz => "TAR.GZ",
             ArchiveKind::TarXz => "TAR.XZ",
+            ArchiveKind::TarBz2 => "TAR.BZ2",
+            ArchiveKind::TarZst => "TAR.ZST",
         }
     }
 }
@@ -141,6 +148,74 @@ fn xz_tar_bytes(path: &Path, cap: u64) -> std::io::Result<Vec<u8>> {
     Ok(tar)
 }
 
+/// A zstd stream read frame after frame, as `zstd -d` reads it (#1645):
+/// `ruzstd`'s own reader stops at the end of the first frame, and `pzstd`
+/// writes several, each behind a skippable frame.
+struct ZstdFrames<R> {
+    source: R,
+    frame: ruzstd::decoding::FrameDecoder,
+}
+
+impl<R: std::io::BufRead> std::io::Read for ZstdFrames<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        use ruzstd::decoding::BlockDecodingStrategy;
+        use ruzstd::decoding::errors::{FrameDecoderError, ReadFrameHeaderError};
+        loop {
+            // A fresh decoder counts as a finished frame, so the first pass
+            // falls through to reading the first header.
+            while self.frame.can_collect() == 0 && !self.frame.is_finished() {
+                self.frame
+                    .decode_blocks(&mut self.source, BlockDecodingStrategy::UptoBlocks(1))
+                    .map_err(|e| std::io::Error::other(format!("zstd: {e}")))?;
+            }
+            if self.frame.can_collect() > 0 || buf.is_empty() {
+                return self.frame.read(buf);
+            }
+            if self.source.fill_buf()?.is_empty() {
+                return Ok(0);
+            }
+            match self.frame.reset(&mut self.source) {
+                Ok(()) => {}
+                Err(FrameDecoderError::ReadFrameHeaderError(ReadFrameHeaderError::SkipFrame {
+                    length,
+                    ..
+                })) => {
+                    let mut skip = std::io::Read::take(&mut self.source, length.into());
+                    if std::io::copy(&mut skip, &mut std::io::sink())? < u64::from(length) {
+                        return Err(std::io::Error::other("zstd: truncated skippable frame"));
+                    }
+                }
+                Err(e) => return Err(std::io::Error::other(format!("zstd: {e}"))),
+            }
+        }
+    }
+}
+
+/// The tar inside a tar-family archive, decoded. A compressed one fails once
+/// more than `cap` decoded bytes have been read: its size on disk says
+/// nothing about what it expands to (#198 review). A plain tar is bounded by
+/// the source-size gate in [`list`].
+fn tar_stream(path: &Path, kind: ArchiveKind, cap: u64) -> std::io::Result<Box<dyn std::io::Read>> {
+    let f = std::fs::File::open(path)?;
+    let decoded: Box<dyn std::io::Read> = match kind {
+        ArchiveKind::TarGz => Box::new(flate2::read::GzDecoder::new(f)),
+        ArchiveKind::TarXz => {
+            return Ok(Box::new(std::io::Cursor::new(xz_tar_bytes(path, cap)?)));
+        }
+        // Multi-stream, as `bzip2 -d` reads what `pbzip2` and `lbzip2` write.
+        ArchiveKind::TarBz2 => Box::new(bzip2::read::MultiBzDecoder::new(f)),
+        ArchiveKind::TarZst => Box::new(ZstdFrames {
+            source: std::io::BufReader::new(f),
+            frame: ruzstd::decoding::FrameDecoder::new(),
+        }),
+        _ => return Ok(Box::new(f)),
+    };
+    Ok(Box::new(CappedRead {
+        inner: decoded,
+        remaining: cap,
+    }))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ArchiveEntry {
     /// Member path as stored (forward slashes).
@@ -169,6 +244,12 @@ pub fn kind_from_ext(path: &Path) -> Option<ArchiveKind> {
     }
     if name.ends_with(".tar.xz") || name.ends_with(".txz") {
         return Some(ArchiveKind::TarXz);
+    }
+    if name.ends_with(".tar.bz2") || name.ends_with(".tbz2") || name.ends_with(".tbz") {
+        return Some(ArchiveKind::TarBz2);
+    }
+    if name.ends_with(".tar.zst") || name.ends_with(".tzst") {
+        return Some(ArchiveKind::TarZst);
     }
     if name.ends_with(".tar") {
         return Some(ArchiveKind::Tar);
@@ -212,27 +293,20 @@ pub fn list(path: &Path, kind: ArchiveKind) -> std::io::Result<ArchiveView> {
                 });
             }
         }
-        ArchiveKind::Tar | ArchiveKind::TarGz | ArchiveKind::TarXz => {
+        ArchiveKind::Tar
+        | ArchiveKind::TarGz
+        | ArchiveKind::TarXz
+        | ArchiveKind::TarBz2
+        | ArchiveKind::TarZst => {
             if meta.len() > TAR_LIST_CAP {
                 return Err(std::io::Error::other(format!(
                     "tar archive too large to list ({} bytes)",
                     meta.len()
                 )));
             }
-            let f = std::fs::File::open(path)?;
-            let read: Box<dyn std::io::Read> = match kind {
-                // Cap the DECODED bytes too: a small .tar.gz can expand
-                // far past the source-size gate above (#198 review).
-                ArchiveKind::TarGz => Box::new(CappedRead {
-                    inner: flate2::read::GzDecoder::new(f),
-                    remaining: TAR_LIST_CAP,
-                }),
-                ArchiveKind::TarXz => {
-                    Box::new(std::io::Cursor::new(xz_tar_bytes(path, TAR_LIST_CAP)?))
-                }
-                _ => Box::new(f),
-            };
-            let mut a = tar::Archive::new(read);
+            // The DECODED bytes are capped too: a small .tar.gz can expand
+            // far past the source-size gate above (#198 review).
+            let mut a = tar::Archive::new(tar_stream(path, kind, TAR_LIST_CAP)?);
             for entry in a.entries()? {
                 let e = entry?;
                 let hdr = e.header();
@@ -291,16 +365,13 @@ pub fn extract_member(
             }
             write_out(&dest, &mut e)?;
         }
-        ArchiveKind::Tar | ArchiveKind::TarGz | ArchiveKind::TarXz => {
-            let f = std::fs::File::open(path)?;
-            let read: Box<dyn std::io::Read> = match kind {
-                ArchiveKind::TarGz => Box::new(flate2::read::GzDecoder::new(f)),
-                ArchiveKind::TarXz => {
-                    Box::new(std::io::Cursor::new(xz_tar_bytes(path, TAR_LIST_CAP)?))
-                }
-                _ => Box::new(f),
-            };
-            let mut a = tar::Archive::new(read);
+        ArchiveKind::Tar
+        | ArchiveKind::TarGz
+        | ArchiveKind::TarXz
+        | ArchiveKind::TarBz2
+        | ArchiveKind::TarZst => {
+            // Under the listing's cap: a member it listed lies within it.
+            let mut a = tar::Archive::new(tar_stream(path, kind, TAR_LIST_CAP)?);
             for entry in a.entries()? {
                 let mut e = entry?;
                 if e.path()?.to_string_lossy() == member {
@@ -940,9 +1011,8 @@ mod tests {
         assert!(!outside.join("evil.txt").exists());
     }
 
-    /// #1645: the issue's `proj-1.0.tar.xz`, built from a tar of `proj/`,
-    /// `proj/README.md` and `proj/main.rs`.
-    fn make_tar_xz(p: &Path) {
+    /// #1645: the issue's tar of `proj/`, `proj/README.md` and `proj/main.rs`.
+    fn proj_tar() -> Vec<u8> {
         let mut t = tar::Builder::new(Vec::new());
         let mut dir = tar::Header::new_ustar();
         dir.set_entry_type(tar::EntryType::Directory);
@@ -960,10 +1030,31 @@ mod tests {
             hdr.set_cksum();
             t.append_data(&mut hdr, name, body.as_bytes()).unwrap();
         }
-        let tar_bytes = t.into_inner().unwrap();
+        t.into_inner().unwrap()
+    }
+
+    /// #1645: the issue's `proj-1.0.tar.xz`.
+    fn make_tar_xz(p: &Path) {
         let mut xz = Vec::new();
-        lzma_rs::xz_compress(&mut std::io::Cursor::new(&tar_bytes), &mut xz).unwrap();
+        lzma_rs::xz_compress(&mut std::io::Cursor::new(proj_tar()), &mut xz).unwrap();
         std::fs::write(p, xz).unwrap();
+    }
+
+    /// `bytes` compressed as a `kind` stream, by the crates the reader
+    /// decodes with.
+    fn compressed(kind: ArchiveKind, bytes: &[u8]) -> Vec<u8> {
+        match kind {
+            ArchiveKind::TarBz2 => {
+                let mut bz = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::fast());
+                bz.write_all(bytes).unwrap();
+                bz.finish().unwrap()
+            }
+            ArchiveKind::TarZst => ruzstd::encoding::compress_to_vec(
+                bytes,
+                ruzstd::encoding::CompressionLevel::Fastest,
+            ),
+            _ => unreachable!("{kind:?}"),
+        }
     }
 
     /// #1645: a `.tar.xz`, a `.txz` and the same bytes with no extension all
@@ -1066,6 +1157,120 @@ mod tests {
         assert!(xz_tar_bytes(&p, TAR_LIST_CAP).is_ok());
     }
 
+    /// #1645: a `.tar.bz2` and a `.tar.zst`, under each of their extensions
+    /// and under none, browse with their three members, where each opened as
+    /// a hex dump; and `proj/main.rs` extracts, so Enter on it opens it.
+    #[test]
+    fn a_tar_bz2_or_tar_zst_lists_and_extracts_by_extension_and_by_content() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bz2 = [
+            "proj-1.0.tar.bz2",
+            "proj-1.0.tbz2",
+            "proj-1.0.tbz",
+            "bz2-asset",
+        ];
+        let zst = ["proj-1.0.tar.zst", "proj-1.0.tzst", "zst-asset"];
+        for (kind, label, names) in [
+            (ArchiveKind::TarBz2, "TAR.BZ2", &bz2[..]),
+            (ArchiveKind::TarZst, "TAR.ZST", &zst[..]),
+        ] {
+            for name in names {
+                let p = tmp.path().join(name);
+                std::fs::write(&p, compressed(kind, &proj_tar())).unwrap();
+                let mut e = crate::widgets::editor::Editor::new();
+                e.open(&p).unwrap();
+                let view = e
+                    .archive
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("{name} opens as an archive, not hex"));
+                assert_eq!(view.kind.label(), label, "{name}");
+                let members: Vec<&str> = view.entries.iter().map(|m| m.path.as_str()).collect();
+                assert_eq!(
+                    members,
+                    vec!["proj/", "proj/README.md", "proj/main.rs"],
+                    "{name}"
+                );
+                let out =
+                    extract_member(&p, view.kind, "proj/main.rs", &tmp.path().join("out")).unwrap();
+                assert_eq!(std::fs::read_to_string(out).unwrap(), "fn main(){}\n");
+            }
+        }
+    }
+
+    /// #1645: a `.tar.bz2` of several streams (`pbzip2`, `lbzip2`) and a
+    /// `.tar.zst` of several frames, each behind a skippable frame (`pzstd`),
+    /// list every member, as `tar` does, not only the first stream's.
+    #[test]
+    fn a_multi_stream_tar_bz2_or_tar_zst_lists_every_member() {
+        let tmp = tempfile::tempdir().unwrap();
+        let tar = proj_tar();
+        // Mid-way through the second member's header.
+        let (head, tail) = tar.split_at(700);
+        for (name, kind) in [
+            ("multi.tar.bz2", ArchiveKind::TarBz2),
+            ("multi.tar.zst", ArchiveKind::TarZst),
+        ] {
+            let mut bytes = Vec::new();
+            for part in [head, tail] {
+                if kind == ArchiveKind::TarZst {
+                    bytes.extend_from_slice(&0x184D_2A50u32.to_le_bytes());
+                    bytes.extend_from_slice(&4u32.to_le_bytes());
+                    bytes.extend_from_slice(b"skip");
+                }
+                bytes.extend(compressed(kind, part));
+            }
+            let p = tmp.path().join(name);
+            std::fs::write(&p, &bytes).unwrap();
+            let view = list(&p, kind).unwrap();
+            assert_eq!(view.entries.len(), 3, "{name}");
+            // By content too (#1645 review): `pzstd` output opens with a
+            // skippable frame, not the zstd magic, and a pipe or a missing
+            // extension leaves only the content to go by.
+            let bare = tmp.path().join(format!("{}-asset", kind.label()));
+            std::fs::write(&bare, &bytes).unwrap();
+            let mut e = crate::widgets::editor::Editor::new();
+            e.open(&bare).unwrap();
+            let opened = e.archive.as_ref().map(|a| (a.kind, a.entries.len()));
+            assert_eq!(opened, Some((kind, 3)), "{name} without its extension");
+        }
+    }
+
+    /// #1645 negative: a bzip2 or zstd file that is not a tar is not listed
+    /// as an archive; it opens as it did before.
+    #[test]
+    fn a_plain_bz2_or_zst_file_is_not_an_archive() {
+        let tmp = tempfile::tempdir().unwrap();
+        for (name, kind) in [
+            ("notes.txt.bz2", ArchiveKind::TarBz2),
+            ("notes.txt.zst", ArchiveKind::TarZst),
+        ] {
+            let p = tmp.path().join(name);
+            std::fs::write(&p, compressed(kind, b"just some notes\n")).unwrap();
+            let mut e = crate::widgets::editor::Editor::new();
+            e.open(&p).unwrap();
+            assert!(e.archive.is_none(), "{name}: not a tar, so not an archive");
+        }
+    }
+
+    /// #1645 negative: a `.tar.bz2` or `.tar.zst` that decodes past the cap
+    /// is refused with the same listing-cap message as a `.tar.gz`, so the
+    /// hex viewer says why.
+    #[test]
+    fn a_tar_bz2_or_tar_zst_past_the_decoded_cap_is_refused_as_a_listing_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        for kind in [ArchiveKind::TarBz2, ArchiveKind::TarZst] {
+            let p = tmp.path().join(kind.label());
+            std::fs::write(&p, compressed(kind, &proj_tar())).unwrap();
+            let walk = |cap| -> std::io::Result<usize> {
+                let mut a = tar::Archive::new(tar_stream(&p, kind, cap)?);
+                a.entries()?.try_fold(0, |n, e| e.map(|_| n + 1))
+            };
+            let err = walk(1024).unwrap_err();
+            assert!(is_list_cap_refusal(&err.to_string()), "{kind:?}: {err}");
+            assert_eq!(walk(TAR_LIST_CAP).unwrap(), 3, "{kind:?}");
+        }
+    }
+
     /// #1645: the zip containers by other names route by extension.
     #[test]
     fn zip_based_packages_route_as_zip_by_extension() {
@@ -1085,6 +1290,8 @@ mod tests {
             );
         }
         assert_eq!(kind_from_ext(Path::new("notes.txt.xz")), None);
+        assert_eq!(kind_from_ext(Path::new("notes.txt.bz2")), None);
+        assert_eq!(kind_from_ext(Path::new("notes.txt.zst")), None);
     }
 
     #[test]
