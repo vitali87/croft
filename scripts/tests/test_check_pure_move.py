@@ -78,6 +78,38 @@ class Parser(unittest.TestCase):
         self.assertEqual([it.name for it in items], ["a"])
         self.assertEqual([g.kind for g in glue], ["doc", "doc", "doc", "blank", "blank"])
 
+    def test_the_braces_of_a_const_generic_argument_are_not_an_impl_body(self):
+        text = "impl Tr for Foo<{ 1 }> {\n    fn a(&self) {}\n}\n\nfn f() -> Vec<u8> {\n    vec![]\n}\n"
+        items, _ = pm.parse(text)
+        self.assertEqual(
+            [(it.name, it.ctx) for it in items], [("a", "impl Tr for Foo<{ 1 }>"), ("f", "")]
+        )
+
+    def test_a_second_item_on_the_line_where_one_ends_is_refused(self):
+        """Read as one item, the second would be hidden inside the first."""
+        for text in ("fn a() {} fn b() {}\n", "const A: u8 = 1; const B: u8 = 2;\n"):
+            with self.subTest(text=text), self.assertRaises(pm.ParseError):
+                pm.parse(text)
+        items, _ = pm.parse("fn a() {} // b\nconst A: u8 = 1; /* c */\n")
+        self.assertEqual([it.name for it in items], ["a", "A"])
+
+    def test_a_shebang_line_is_glue_and_an_inner_attribute_is_not(self):
+        items, glue = pm.parse("#!/usr/bin/env rust-script\nfn main() {}\n")
+        self.assertEqual([it.name for it in items], ["main"])
+        self.assertEqual(glue[0].kind, "shebang")
+        items, _ = pm.parse("#![allow(dead_code)]\nfn main() {}\n")
+        self.assertEqual([it.kind for it in items], ["attr", "fn"])
+
+    def test_whitespace_inside_a_string_in_glue_or_a_header_is_kept(self):
+        """`#[path = "a  b.rs"]` loads another file than `"a b.rs"`."""
+        one = pm.parse('#[path = "a b.rs"]\nmod child;\n')[1]
+        two = pm.parse('#[path = "a  b.rs"]\nmod child;\n')[1]
+        self.assertNotEqual([g.text for g in one], [g.text for g in two])
+        spaced = pm.parse('#[path   =   "a b.rs"]\nmod   child;\n')[1]
+        self.assertEqual([g.text for g in one], [g.text for g in spaced])
+        items, _ = pm.parse('#[doc = "x  y"]\nimpl   A {\n    fn f() {}\n}\n')
+        self.assertEqual(items[0].ctx, '#[doc = "x  y"] impl A')
+
     def test_list_prints_each_item_with_its_line_range(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
