@@ -156,8 +156,18 @@ pub fn render(
         })
         .collect();
     Paragraph::new(lines).render(body, buf);
-    let key = Style::default().fg(accent).add_modifier(Modifier::BOLD);
-    let dim = Style::default().fg(theme.ui(Color::Rgb(0x9a, 0xa4, 0xb2)));
+    // A `surfaces` theme says "press this" with the body ink against muted
+    // words; the boxed themes keep the bold amber keys.
+    let (key, dim) = match crate::widgets::surface::tones(theme) {
+        Some(t) => (
+            Style::default().fg(t.text()),
+            Style::default().fg(t.muted()),
+        ),
+        None => (
+            Style::default().fg(accent).add_modifier(Modifier::BOLD),
+            Style::default().fg(theme.ui(Color::Rgb(0x9a, 0xa4, 0xb2))),
+        ),
+    };
     let hint = match &ui.reason {
         Some(reason) => Line::from(vec![
             Span::styled("Reason: ", key),
@@ -194,4 +204,172 @@ pub fn render(
         ]),
     };
     Paragraph::new(hint).render(footer, buf);
+    paint_warning_card(buf, rect, theme, accent);
+}
+
+/// Codicon `warning` (U+EA6C), before a warning card's title.
+const WARNING_GLYPH: char = '\u{ea6c}';
+
+/// Restyle a warning or confirmation dialog drawn the boxed way in `rect`
+/// (a line box in `tint` with the title as an inverted chip on its top
+/// edge) as a `surfaces` card; a no-op on a boxed theme. The card keeps
+/// the raised body, gets [`surface::paint_tinted_frame`]'s edge with the
+/// lip in `tint`, and its title becomes bold `tint` text after a warning
+/// glyph, the chip gone. The body's inks move onto the tones: plain and
+/// white text to the body ink, greys to muted or body by their lightness,
+/// the amber path to the strong ink, and the named key-prompt colours
+/// (red, yellow, green) to the danger red, the amber and the accent, all
+/// at normal weight. One pass over the dialog's cells, only while one is
+/// open, so every confirm shares one look without restating its layout.
+///
+/// [`surface::paint_tinted_frame`]: crate::widgets::surface::paint_tinted_frame
+pub fn paint_warning_card(buf: &mut Buffer, rect: Rect, theme: Theme, tint: Color) {
+    use crate::gradient::rgb_color;
+    use crate::widgets::surface;
+    let Some(t) = surface::tones(theme) else {
+        return;
+    };
+    let rect = rect.intersection(buf.area);
+    if rect.width < 4 || rect.height < 3 {
+        return;
+    }
+    let Color::Rgb(tr, tg, tb) = tint else {
+        return;
+    };
+    // The chip's words, read back from the cells it filled.
+    let mut title = String::new();
+    for x in rect.x + 1..rect.right() - 1 {
+        let cell = &mut buf[(x, rect.y)];
+        if cell.bg == tint {
+            title.push_str(cell.symbol());
+            cell.set_symbol(" ");
+            cell.set_style(Style::reset().bg(t.raised()));
+        }
+    }
+    let raised = t.raised();
+    let lum = |(r, g, b): (u8, u8, u8)| u16::from(r) + u16::from(g) + u16::from(b);
+    let mid = (lum(t.muted) + lum(t.text)) / 2;
+    for y in rect.y + 1..rect.bottom() - 1 {
+        for x in rect.x + 1..rect.right() - 1 {
+            let cell = &mut buf[(x, y)];
+            let fg = match cell.fg {
+                Color::Reset | Color::White | Color::Gray => t.text(),
+                Color::Red | Color::LightRed => rgb_color((0xe7, 0x70, 0x70)),
+                Color::Yellow | Color::LightYellow => rgb_color((0xe7, 0xa7, 0x3c)),
+                Color::Green | Color::LightGreen => t.accent(),
+                Color::Rgb(0xeb, 0xcb, 0x8b) => t.strong(),
+                Color::Rgb(r, g, b) if r.max(g).max(b) - r.min(g).min(b) < 0x20 => {
+                    if lum((r, g, b)) < mid {
+                        t.muted()
+                    } else {
+                        t.text()
+                    }
+                }
+                other => other,
+            };
+            cell.set_fg(fg);
+            cell.set_bg(raised);
+            cell.modifier.remove(Modifier::BOLD);
+        }
+    }
+    surface::paint_tinted_frame(buf, rect, theme, (tr, tg, tb));
+    let title = title.trim();
+    if !title.is_empty() {
+        let label = format!(" {WARNING_GLYPH} {title} ");
+        let room = usize::from(rect.width.saturating_sub(3));
+        buf.set_stringn(
+            rect.x + 1,
+            rect.y,
+            label,
+            room,
+            Style::default()
+                .fg(tint)
+                .bg(raised)
+                .add_modifier(Modifier::BOLD),
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A confirm drawn the boxed way: a line box in `tint` with an inverted
+    /// title chip, a white sentence and red / green key prompts.
+    fn boxed_confirm(buf: &mut Buffer, rect: Rect, tint: Color) {
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(tint))
+            .style(Style::default().bg(Color::Rgb(0x15, 0x18, 0x19)))
+            .title(Span::styled(
+                " DROP STASH? ",
+                Style::default()
+                    .fg(Color::White)
+                    .bg(tint)
+                    .add_modifier(Modifier::BOLD),
+            ))
+            .render(rect, buf);
+        let body = vec![
+            Line::from(Span::styled(
+                "Gone for good.",
+                Style::default().fg(Color::White),
+            )),
+            Line::from(vec![
+                Span::styled(
+                    "[Y]",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ),
+                Span::raw("es   "),
+                Span::styled("[N]", Style::default().fg(Color::Green)),
+                Span::raw("o"),
+            ]),
+        ];
+        let inner = Rect::new(rect.x + 2, rect.y + 1, rect.width - 4, rect.height - 2);
+        Paragraph::new(body).render(inner, buf);
+    }
+
+    /// Croft Loch: the chip becomes bold tinted text after a warning glyph,
+    /// the edge the tinted card frame, and the body's inks the tones.
+    #[test]
+    fn croft_loch_turns_a_boxed_confirm_into_a_tinted_card() {
+        let theme = Theme::from_id("loch");
+        let t = crate::widgets::surface::tones(theme).unwrap();
+        let tint = Color::Rgb(0xe7, 0x70, 0x70);
+        let rect = Rect::new(0, 0, 40, 6);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 42, 8));
+        boxed_confirm(&mut buf, rect, tint);
+        paint_warning_card(&mut buf, rect, theme, tint);
+        let top: String = (0..40).map(|x| buf[(x, 0)].symbol()).collect();
+        assert!(
+            top.contains(&format!("{WARNING_GLYPH} DROP STASH?")),
+            "{top}"
+        );
+        for x in 0..40 {
+            assert_ne!(buf[(x, 0)].bg, tint, "({x}) no inverted chip");
+        }
+        assert_eq!(buf[(4, 0)].fg, tint);
+        assert!(buf[(4, 0)].modifier.contains(Modifier::BOLD));
+        assert_eq!(buf[(0, 0)].symbol(), "\u{2594}", "the card edge");
+        assert_eq!(buf[(0, 0)].fg, tint, "the lip in the tint");
+        assert_eq!(buf[(0, 3)].symbol(), "\u{258f}");
+        assert_eq!(buf[(2, 1)].fg, t.text(), "the sentence");
+        assert_eq!(buf[(3, 2)].symbol(), "Y");
+        assert_eq!(buf[(3, 2)].fg, tint);
+        assert!(!buf[(3, 2)].modifier.contains(Modifier::BOLD));
+        assert_eq!(buf[(11, 2)].symbol(), "N");
+        assert_eq!(buf[(11, 2)].fg, t.accent());
+        assert_eq!(buf[(5, 2)].fg, t.text(), "plain words");
+    }
+
+    /// A boxed theme's confirm is left exactly as it was drawn.
+    #[test]
+    fn a_boxed_theme_confirm_is_untouched() {
+        let tint = Color::Rgb(0xe7, 0x70, 0x70);
+        let rect = Rect::new(0, 0, 40, 6);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 42, 8));
+        boxed_confirm(&mut buf, rect, tint);
+        let before = buf.clone();
+        paint_warning_card(&mut buf, rect, Theme::BLACK, tint);
+        assert_eq!(buf, before);
+    }
 }

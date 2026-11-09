@@ -209,6 +209,7 @@ pub fn render_workspace_symbols(
     } else {
         theme.ui(Color::Rgb(0x1e, 0x3a, 0x6e))
     };
+    let tones = crate::widgets::surface::tones(theme);
 
     if inner.height == 0 || inner.width == 0 {
         return;
@@ -307,25 +308,32 @@ pub fn render_workspace_symbols(
     for (offset, item) in picker.results[picker.scroll..end].iter().enumerate() {
         let row_idx = picker.scroll + offset;
         let is_selected = row_idx == picker.selected;
-        let row_style = if is_selected {
-            Style::default().bg(sel_bg).fg(theme.ui(Color::White))
-        } else {
-            Style::default().fg(theme.ui(Color::Rgb(0xec, 0xef, 0xf4)))
-        };
-        let detail_style = if is_selected {
-            Style::default()
-                .bg(sel_bg)
-                .fg(theme.ui(Color::Rgb(0xa0, 0xb4, 0xd8)))
-        } else {
-            Style::default().fg(theme.ui(Color::Rgb(0x8e, 0x95, 0xa4)))
-        };
         let icon = for_outline_kind(item.kind);
-        let icon_style = if is_selected {
-            Style::default().bg(sel_bg).fg(theme.ui(icon.color))
-        } else {
-            Style::default().fg(theme.ui(icon.color))
+        let (row_style, detail_style, icon_style) = match tones {
+            // The band and bar are painted after the rows.
+            Some(t) => (
+                Style::default().fg(if is_selected { t.strong() } else { t.text() }),
+                Style::default().fg(t.muted()),
+                Style::default().fg(theme.ui(icon.color)),
+            ),
+            None if is_selected => (
+                Style::default().bg(sel_bg).fg(theme.ui(Color::White)),
+                Style::default()
+                    .bg(sel_bg)
+                    .fg(theme.ui(Color::Rgb(0xa0, 0xb4, 0xd8))),
+                Style::default().bg(sel_bg).fg(theme.ui(icon.color)),
+            ),
+            None => (
+                Style::default().fg(theme.ui(Color::Rgb(0xec, 0xef, 0xf4))),
+                Style::default().fg(theme.ui(Color::Rgb(0x8e, 0x95, 0xa4))),
+                Style::default().fg(theme.ui(icon.color)),
+            ),
         };
-        let prefix = if is_selected { "> " } else { "  " };
+        let prefix = if is_selected && tones.is_none() {
+            "> "
+        } else {
+            "  "
+        };
         // Right-align the workspace-relative path + line, like the in-file
         // picker right-aligns the line number.
         let path_label = format!(
@@ -348,6 +356,16 @@ pub fn render_workspace_symbols(
         ]));
     }
     Widget::render(Paragraph::new(lines), list_rect, buf);
+    if let Some(t) = tones {
+        crate::widgets::symbol_picker::paint_selected(
+            buf,
+            rect,
+            list_rect,
+            picker.selected,
+            picker.scroll,
+            t,
+        );
+    }
 }
 
 #[cfg(test)]

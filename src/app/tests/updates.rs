@@ -425,12 +425,15 @@ fn an_overlay_over_the_card_takes_the_clicks_on_it() {
                 .map(|(r, _)| *r)
         };
         let at = skip(&app).expect("Skip, while nothing covers it");
+        // The default theme's pill ends are half blocks.
+        let uncovered = term.backend().buffer()[(at.x, at.y)].symbol().to_string();
+        assert_eq!(uncovered, crate::widgets::update_popup::HALF_CAP_L);
 
         // A menu opened over the card's button row.
         app.open_status_indent_menu(at.x, at.y - 2);
         term.draw(|f| app.render(f)).unwrap();
         let cap = term.backend().buffer()[(at.x, at.y)].symbol().to_string();
-        assert_ne!(cap, "\u{e0b6}", "the menu covers Skip's cap");
+        assert_ne!(cap, uncovered, "the menu covers Skip's cap");
         assert_eq!(skip(&app), None, "a covered button is no target");
         left_click(&mut app, at.x + 1, at.y);
         assert!(app.update_toast.is_some(), "the click was the menu's");
