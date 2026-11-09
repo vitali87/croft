@@ -163,7 +163,8 @@ class PureMoves(unittest.TestCase):
                 repo.commit({"a.rs": new + "\n    fn f(&self) {}\n}\n"})
                 code, out = repo.check()
                 self.assertEqual(code, 1, out)
-                self.assertIn(f"CHANGED  fn a.rs::{pm.collapse([old[:-1]])}::f", out)
+                header = " ".join(old[:-1].split())
+                self.assertIn(f"CHANGED  fn a.rs::{header}::f", out)
                 self.assertIn("same text, under a different impl header", out)
 
     def test_an_edited_doc_or_comment_on_an_impl_header_is_listed(self):
