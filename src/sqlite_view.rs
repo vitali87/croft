@@ -133,7 +133,9 @@ pub fn table_page(path: &Path, table: &str, page: usize) -> Result<TablePage, St
                     String::new()
                 }
                 ValueRef::Integer(v) => v.to_string(),
-                ValueRef::Real(v) => v.to_string(),
+                // The sheet grid's float form, so 1e-50 is not cut at the
+                // column width into a row of zeros (#1143).
+                ValueRef::Real(v) => crate::sheet::format_float(v),
                 ValueRef::Text(t) => String::from_utf8_lossy(t).into_owned(),
                 ValueRef::Blob(b) => format!("<blob {} bytes>", b.len()),
             };
@@ -266,6 +268,28 @@ mod tests {
         assert!(fruit.null_cells.contains(&(1, 2)), "and marked as NULL");
         assert!(!fruit.null_cells.contains(&(0, 2)));
         assert!(fruit.name.contains("2 rows"));
+    }
+
+    #[test]
+    fn very_small_and_very_large_reals_read_in_exponent_notation() {
+        // #1143: positional 1e-50 was cut at the column width to zeros.
+        let tmp = tempfile::tempdir().unwrap();
+        let p = tmp.path().join("sci.db");
+        let conn = rusqlite::Connection::open(&p).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE m (name TEXT, value REAL);
+             INSERT INTO m VALUES ('planck', 6.62607015e-34), ('avogadro', 6.02214076e23),
+                                  ('tiny', 1e-50), ('pi', 3.14159), ('zero', 0.0);",
+        )
+        .unwrap();
+        drop(conn);
+        let view = open_database(&p).unwrap();
+        let m = &view.sheets[0];
+        let values: Vec<&str> = (0..5).map(|r| m.cell(r, 1)).collect();
+        assert_eq!(
+            values,
+            ["6.62607015e-34", "6.02214076e23", "1e-50", "3.14159", "0"]
+        );
     }
 
     /// #1002: NULL reads apart from `''`, text keeps its newlines and tabs
