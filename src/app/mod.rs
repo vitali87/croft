@@ -9349,14 +9349,18 @@ impl App {
     /// it can re-Show the caret after the OSC-1337 image emit only when the
     /// editor would have shown it this frame.
     fn cursor_should_be_visible(&self) -> bool {
+        if self.context_menu.is_some() || self.prompt.is_some() || !self.cursor_visible_phase() {
+            return false;
+        }
+        // On a `surfaces` theme the quick input's query has the terminal's
+        // caret (see `quick_input_owns_caret`).
+        if self.quick_input_owns_caret() {
+            return self.quick_input_caret().is_some();
+        }
         // A list picker (View Bookmarks, Quick Fix, ...) is the thing being
         // typed into; the editor's caret behind it would only point at text it
         // is not about to edit.
-        if self.context_menu.is_some()
-            || self.prompt.is_some()
-            || self.list_picker.is_some()
-            || !self.cursor_visible_phase()
-        {
+        if self.list_picker.is_some() {
             return false;
         }
         let editor_caret = if self.editor.diff.is_some() {
@@ -9386,6 +9390,36 @@ impl App {
             return true;
         }
         false
+    }
+
+    /// Whether a quick input (the Command Palette, Go to File, a list
+    /// picker or an input prompt) has the terminal's caret: on a `surfaces`
+    /// theme, which draws no caret block in the query, the caret goes there
+    /// and no pane's caret blinks through the card. A boxed theme paints its
+    /// own caret and keeps its caret rules as they were.
+    fn quick_input_owns_caret(&self) -> bool {
+        self.theme.surfaces().is_some()
+            && (self.command_palette.is_some()
+                || self.file_finder.is_some()
+                || self.list_picker.is_some()
+                || self.input_prompt.is_some())
+    }
+
+    /// Where the terminal's caret goes while a quick input is open: the
+    /// query caret of the topmost one (drawn last: list picker, input
+    /// prompt, palette, finder), as its last render placed it. `None` on a
+    /// boxed theme, whose quick inputs paint their own caret block.
+    fn quick_input_caret(&self) -> Option<(u16, u16)> {
+        if let Some(p) = &self.list_picker {
+            return p.last_caret;
+        }
+        if let Some(p) = &self.input_prompt {
+            return p.last_caret;
+        }
+        if let Some(p) = &self.command_palette {
+            return p.last_caret;
+        }
+        self.file_finder.as_ref().and_then(|f| f.last_caret)
     }
 
     /// True iff the caret is currently in its visible half of the blink
@@ -24957,11 +24991,24 @@ impl App {
         self.paint_terminal_suggestion(frame);
         self.render_screencast(frame, main_area);
 
+        // A quick input owns the caret while it is open on a `surfaces`
+        // theme: its query's, and no pane's caret blinking through the card.
+        let quick_input = self.quick_input_owns_caret();
+        if quick_input
+            && self.context_menu.is_none()
+            && self.prompt.is_none()
+            && self.cursor_visible_phase()
+            && let Some((cx, cy)) = self.quick_input_caret()
+        {
+            frame.set_cursor_position((cx, cy));
+        }
+
         // Show the host terminal's hardware caret only when the editor is
         // focused and has no modal overlay. The DECSCUSR style is set to
         // BlinkingBar at startup, so the terminal blinks a thin vertical
         // line over the cursor cell without replacing its character.
         if self.focus == Pane::Editor
+            && !quick_input
             && self.context_menu.is_none()
             && self.prompt.is_none()
             && self.list_picker.is_none()
@@ -24983,6 +25030,7 @@ impl App {
         // flat with no native caret cell.
         if self.focus == Pane::Tree
             && self.sidebar_view == SidebarView::SourceControl
+            && !quick_input
             && self.context_menu.is_none()
             && self.prompt.is_none()
             && self.cursor_visible_phase()
@@ -24997,6 +25045,7 @@ impl App {
         // caret at all (Extensions).
         if self.focus == Pane::Tree
             && self.sidebar_view == SidebarView::Search
+            && !quick_input
             && self.context_menu.is_none()
             && self.prompt.is_none()
             && self.cursor_visible_phase()
@@ -25006,6 +25055,7 @@ impl App {
         }
         if self.focus == Pane::Tree
             && self.sidebar_view == SidebarView::Extensions
+            && !quick_input
             && self.context_menu.is_none()
             && self.prompt.is_none()
             && self.cursor_visible_phase()
@@ -57745,6 +57795,9 @@ impl App {
     fn render_file_finder(&mut self, frame: &mut ratatui::Frame) {
         let theme = self.theme;
         let center = self.quick_input_position == QuickInputPosition::Center;
+        // Inline images are baked pixels the scrim cannot dim, so the
+        // backdrop stays lit where the terminal draws them.
+        let backdrop = !self.inline_images_enabled();
         let Some(finder) = self.file_finder.as_mut() else {
             return;
         };
@@ -57755,6 +57808,7 @@ impl App {
             frame.buffer_mut(),
             theme,
             center,
+            backdrop,
         );
     }
 
@@ -57923,6 +57977,9 @@ impl App {
     fn render_command_palette(&mut self, frame: &mut ratatui::Frame) {
         let theme = self.theme;
         let center = self.quick_input_position == QuickInputPosition::Center;
+        // Inline images are baked pixels the scrim cannot dim, so the
+        // backdrop stays lit where the terminal draws them.
+        let backdrop = !self.inline_images_enabled();
         let Some(palette) = self.command_palette.as_mut() else {
             return;
         };
@@ -57933,6 +57990,7 @@ impl App {
             frame.buffer_mut(),
             theme,
             center,
+            backdrop,
         );
     }
 
@@ -61309,10 +61367,19 @@ impl App {
     fn render_list_picker(&mut self, frame: &mut ratatui::Frame) {
         let full = frame.area();
         let theme = self.theme;
+        // Inline images are baked pixels the scrim cannot dim, so the
+        // backdrop stays lit where the terminal draws them.
+        let backdrop = !self.inline_images_enabled();
         let Some(picker) = self.list_picker.as_mut() else {
             return;
         };
-        crate::widgets::list_picker::render_list_picker(picker, full, frame.buffer_mut(), theme);
+        crate::widgets::list_picker::render_list_picker(
+            picker,
+            full,
+            frame.buffer_mut(),
+            theme,
+            backdrop,
+        );
     }
 
     /// Render the Source Control "⋯" actions menu under the header pill.
