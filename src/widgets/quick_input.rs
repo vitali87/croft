@@ -309,8 +309,11 @@ pub struct Row {
 }
 
 /// Paint result row `i` of the list (0 is the top visible row). A selected
-/// row gets the band with the accent bar in the card's left edge, so the
-/// band spans the card. `glyph` (a file icon) sits in the prompt glyph's
+/// row gets the band with the accent bar in the card's left edge, and the
+/// band runs on under the right edge too (the column [`paint_scroll_cue`]
+/// lights, painted over it afterwards), so it spans the card rim to rim
+/// with both ends meeting the edge alike, rather than stopping a cell
+/// short on the right. `glyph` (a file icon) sits in the prompt glyph's
 /// column, `label` at the text column, cut with a `…` when it runs out of
 /// room, and `trail` (keycaps) right-aligned against the gutter, dropped
 /// when the label leaves no room for it.
@@ -330,7 +333,7 @@ pub fn paint_row(buf: &mut Buffer, card: &Card, i: u16, t: Tones, row: Row) {
         let row = Rect {
             x: rect.x,
             y,
-            width: rect.width.saturating_sub(1),
+            width: rect.width,
             height: 1,
         };
         surface::paint_selected_row(buf, row, t, t.raised, true);
@@ -390,7 +393,9 @@ pub fn paint_empty(buf: &mut Buffer, card: &Card, t: Tones, message: &str) {
 
 /// Where the visible rows sit in a longer list: the card's right edge
 /// brightens to muted ink along the stretch the rows cover, so an
-/// overflowing list says it scrolls without a scrollbar's column.
+/// overflowing list says it scrolls without a scrollbar's column. Called
+/// after the rows: only the glyph and its ink change, so where the thumb
+/// crosses the selected row the band [`paint_row`] laid stays under it.
 pub fn paint_scroll_cue(buf: &mut Buffer, card: &Card, t: Tones, total: usize, scroll: usize) {
     let track = usize::from(card.list.height);
     if track == 0 || total <= track || card.rect.width < 2 {
@@ -411,10 +416,10 @@ pub fn paint_scroll_cue(buf: &mut Buffer, card: &Card, t: Tones, total: usize, s
 }
 
 /// The byte offsets in `hay` of the characters `query` matched, for the
-/// accent highlight: the first case-insensitive run of the whole query when
-/// there is one (what a typed word means), else the in-order subsequence
-/// the fuzzy filters accept, else nothing (a row kept for its keyword or
-/// its English title shows no highlight rather than a wrong one).
+/// [`hit_style`] highlight: the first case-insensitive run of the whole
+/// query when there is one (what a typed word means), else the in-order
+/// subsequence the fuzzy filters accept, else nothing (a row kept for its
+/// keyword or its English title shows no highlight rather than a wrong one).
 pub fn match_offsets(hay: &str, query: &str) -> Vec<usize> {
     let query = query.trim();
     if query.is_empty() {
@@ -474,9 +479,14 @@ pub fn highlighted(
     spans
 }
 
-/// The style a matched character takes: the accent, bold.
+/// The style a matched character takes: the strong ink, bold. Not the
+/// accent: a typed word matches on every row, so an accent hit would run a
+/// teal column down the whole list, louder than the selection it competes
+/// with, and the accent means focus and selection alone. A step of ink and
+/// weight over the row's `text` (or muted category) is enough to show what
+/// matched.
 pub fn hit_style(t: Tones) -> Style {
-    Style::default().fg(t.accent()).add_modifier(Modifier::BOLD)
+    Style::default().fg(t.strong()).add_modifier(Modifier::BOLD)
 }
 
 /// The count at the input row's right: the whole list's size (`412
@@ -674,6 +684,13 @@ mod tests {
         assert_eq!(buf[(r.x + 1, y)].bg, t.band(), "the band spans the card");
         assert_eq!(buf[(r.right() - 2, y)].bg, t.band());
         assert_eq!(
+            buf[(r.right() - 1, y)].bg,
+            t.band(),
+            "the band meets the right rim as it meets the left"
+        );
+        assert_eq!(buf[(r.right() - 1, y)].symbol(), "\u{2595}", "the rim");
+        assert_ne!(buf[(r.right(), y)].bg, t.band(), "not past the card");
+        assert_eq!(
             buf[(r.right() - 2, y)].symbol(),
             " ",
             "a gutter before the rim"
@@ -743,6 +760,39 @@ mod tests {
         assert_eq!(buf[(x, card.list.bottom() - 1)].fg, t.rim(), "the track");
     }
 
+    /// Croft Loch: where the scroll thumb crosses the selected row it is
+    /// painted on the band, which runs on under it to the rim, so the
+    /// band's right end is as square as its left.
+    #[test]
+    fn the_scroll_thumb_sits_on_the_selected_rows_band() {
+        let t = surface::tones(loch()).unwrap();
+        let area = Rect::new(0, 0, 60, 20);
+        let card = Card::layout(area, 50, 10, 40, false);
+        let mut buf = Buffer::empty(area);
+        paint_card(&mut buf, &card, loch(), t, &input(""));
+        for i in 0..card.list.height {
+            paint_row(
+                &mut buf,
+                &card,
+                i,
+                t,
+                Row {
+                    selected: i == 0,
+                    glyph: None,
+                    label: vec![Span::raw("row")],
+                    trail: Vec::new(),
+                },
+            );
+        }
+        paint_scroll_cue(&mut buf, &card, t, 40, 0);
+        let (x, y) = (card.rect.right() - 1, card.list.y);
+        assert_eq!(buf[(x, y)].symbol(), "\u{2595}");
+        assert_eq!(buf[(x, y)].fg, t.muted(), "the thumb");
+        assert_eq!(buf[(x, y)].bg, t.band(), "on the band");
+        assert_eq!(buf[(card.rect.x, y)].bg, t.band(), "both ends alike");
+        assert_eq!(buf[(x, y + 1)].bg, t.raised(), "an idle row is the card");
+    }
+
     #[test]
     fn matches_prefer_a_contiguous_run_then_fall_back_to_a_subsequence() {
         assert_eq!(
@@ -763,6 +813,19 @@ mod tests {
         let text: Vec<&str> = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, ["To", "ggle"]);
         assert_eq!(spans[0].style, hit_style(t));
+    }
+
+    /// Croft Loch: a matched character is the strong ink in bold, a step
+    /// over the body text, never the accent, which a whole-word query would
+    /// otherwise run down every row as a teal column.
+    #[test]
+    fn a_match_is_strong_bold_ink_not_the_accent() {
+        let t = surface::tones(loch()).unwrap();
+        let hit = hit_style(t);
+        assert_eq!(hit.fg, Some(t.strong()));
+        assert_ne!(hit.fg, Some(t.accent()));
+        assert!(hit.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(hit.bg, None, "the row's fill shows through");
     }
 
     #[test]

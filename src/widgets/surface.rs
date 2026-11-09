@@ -255,14 +255,21 @@ pub fn selected_row_fill(t: Tones, base: (u8, u8, u8), focused: bool) -> (u8, u8
 }
 
 /// A key-binding hint as keycaps on a `surfaces` theme: each key of a chord
-/// in its own chip, the chord's keys joined by a faint `+`, chords a space
+/// in its own chip, the chord's keys joined by a muted `+`, chords a space
 /// apart. `row` is the fill of the row the caps sit on, so a selected row's
 /// chips lift off its band rather than the card.
+///
+/// The `+` is muted, not faint: on the selected row's band a faint `+`
+/// falls to about 1.2:1 and `Ctrl+K Ctrl+L` reads as four loose keys
+/// rather than two chords, and muted keeps it past 3:1 on both the band
+/// and the card. A selected row's labels take the body ink so the chord
+/// still reads past 4.5:1 on chips lifted off the brighter band; an idle
+/// row's stay muted, so the keys recede behind the command names.
 pub fn keycap_spans(hint: &str, t: Tones, row: Color, selected: bool) -> Vec<Span<'static>> {
     let cap = Style::default()
         .bg(t.keycap_on(row))
         .fg(if selected { t.text() } else { t.muted() });
-    let sep = Style::default().fg(t.faint()).bg(row);
+    let sep = Style::default().fg(t.muted()).bg(row);
     let mut out = Vec::new();
     for (i, chord) in hint.split(' ').filter(|c| !c.is_empty()).enumerate() {
         if i > 0 {
@@ -303,8 +310,17 @@ pub fn chord_keys(chord: &str) -> Vec<&str> {
 /// ANSI colours through the theme's palette, the terminal default as the
 /// canvas (`bg`) or body text (`fg`).
 fn cell_rgb(c: Color, theme: Theme, fallback: (u8, u8, u8)) -> (u8, u8, u8) {
+    known_rgb(c, theme).unwrap_or(fallback)
+}
+
+/// The bytes a cell colour stands for, where croft knows them: RGB as is,
+/// the named and the first sixteen indexed colours through the theme's ANSI
+/// palette. `None` for the terminal default and the 256-colour indexes,
+/// whose bytes only the terminal knows: [`cell_rgb`] puts a fallback there,
+/// and [`dim_backdrop`] leaves such an underline colour as it is.
+fn known_rgb(c: Color, theme: Theme) -> Option<(u8, u8, u8)> {
     let ansi = theme.ansi();
-    match c {
+    Some(match c {
         Color::Rgb(r, g, b) => (r, g, b),
         Color::Black => ansi[0],
         Color::Red => ansi[1],
@@ -323,8 +339,8 @@ fn cell_rgb(c: Color, theme: Theme, fallback: (u8, u8, u8)) -> (u8, u8, u8) {
         Color::LightCyan => ansi[14],
         Color::White => ansi[15],
         Color::Indexed(i) if i < 16 => ansi[usize::from(i)],
-        _ => fallback,
-    }
+        _ => return None,
+    })
 }
 
 /// Recede everything outside `keep` behind a modal on a `surfaces` theme,
@@ -332,6 +348,12 @@ fn cell_rgb(c: Color, theme: Theme, fallback: (u8, u8, u8)) -> (u8, u8, u8) {
 /// text sinks most of the way into its own background and the background
 /// darkens a step, so the card is the only thing at full contrast. A no-op
 /// on a boxed theme.
+///
+/// A coloured underline sinks with the text: the active tab's accent
+/// underline (or a diagnostic's squiggle) is drawn in the cell's underline
+/// colour, not its ink, and left alone it would stay full-strength teal
+/// behind the palette, a second focus mark competing with the card's. An
+/// underline in the terminal default already follows the sunk ink.
 pub fn dim_backdrop(buf: &mut Buffer, keep: Rect, theme: Theme) {
     let Some(t) = tones(theme) else {
         return;
@@ -348,6 +370,9 @@ pub fn dim_backdrop(buf: &mut Buffer, keep: Rect, theme: Theme) {
             let fg = cell_rgb(cell.fg, theme, t.text);
             let bg2 = lerp_rgb(bg, (0, 0, 0), sink);
             cell.set_fg(rgb_color(lerp_rgb(fg, bg2, 0.58)));
+            if let Some(under) = known_rgb(cell.underline_color, theme) {
+                cell.underline_color = rgb_color(lerp_rgb(under, bg2, 0.58));
+            }
             cell.set_bg(rgb_color(bg2));
             cell.modifier.remove(Modifier::BOLD);
         }
@@ -994,8 +1019,37 @@ mod tests {
         let text: Vec<&str> = spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, [" Ctrl ", "+", " K ", " ", " Z "]);
         assert_eq!(spans[0].style.bg, Some(t.keycap_on(t.raised())));
-        assert_eq!(spans[1].style.fg, Some(t.faint()));
+        assert_eq!(spans[1].style.fg, Some(t.muted()));
         assert_eq!(chord_keys("Ctrl++"), ["Ctrl", "+"]);
+    }
+
+    /// Croft Loch: on the selected row's band a chord still reads as one
+    /// chord: the labels clear 4.5:1 on their chips and the `+` between
+    /// the keys clears 3:1 on the band, as it does on an idle row.
+    #[test]
+    fn a_selected_rows_keycaps_read_as_chords_on_the_band() {
+        use crate::theme::contrast_ratio;
+        let t = tones(loch()).unwrap();
+        let rgb = |c: Option<Color>| match c {
+            Some(Color::Rgb(r, g, b)) => (r, g, b),
+            other => panic!("not an RGB colour: {other:?}"),
+        };
+        for (row, selected) in [(t.band(), true), (t.raised(), false)] {
+            let spans = keycap_spans("Ctrl+K Ctrl+L", t, row, selected);
+            let text: Vec<&str> = spans.iter().map(|s| s.content.as_ref()).collect();
+            assert_eq!(text, [" Ctrl ", "+", " K ", " ", " Ctrl ", "+", " L "]);
+            let plus = &spans[1].style;
+            assert_eq!(plus.fg, Some(t.muted()), "the `+` is muted");
+            assert_eq!(plus.bg, Some(row));
+            let ratio = contrast_ratio(rgb(plus.fg), rgb(plus.bg));
+            assert!(ratio >= 3.0, "`+` at {ratio:.2}:1 (selected {selected})");
+            if selected {
+                let cap = &spans[0].style;
+                assert_eq!(cap.fg, Some(t.text()), "the label in body ink");
+                let ratio = contrast_ratio(rgb(cap.fg), rgb(cap.bg));
+                assert!(ratio >= 4.5, "label at {ratio:.2}:1");
+            }
+        }
     }
 
     #[test]
@@ -1008,6 +1062,50 @@ mod tests {
         assert_ne!(buf[(0, 0)].fg, t.text());
         assert_ne!(buf[(0, 0)].bg, t.chrome());
         let mut boxed = Buffer::empty(Rect::new(0, 0, 6, 3));
+        let before = boxed.clone();
+        dim_backdrop(&mut boxed, Rect::new(2, 1, 2, 1), Theme::BLACK);
+        assert_eq!(boxed, before);
+    }
+
+    /// Croft Loch: a coloured underline (the active tab's accent mark)
+    /// sinks behind the scrim exactly as the text does, so no full-strength
+    /// teal is left outside the card; the card's own underline is kept, a
+    /// terminal-default underline (which follows the sunk ink) is left
+    /// alone, and a boxed theme's buffer is untouched.
+    #[test]
+    fn the_backdrop_sinks_a_coloured_underline_with_the_text() {
+        let t = tones(loch()).unwrap();
+        let mut buf = Buffer::empty(Rect::new(0, 0, 6, 3));
+        buf.set_style(
+            buf.area,
+            Style::default()
+                .fg(t.accent())
+                .bg(t.chrome())
+                .underline_color(t.accent())
+                .add_modifier(Modifier::UNDERLINED),
+        );
+        buf[(5, 2)].underline_color = Color::Reset;
+        buf[(4, 2)].underline_color = Color::Cyan;
+        dim_backdrop(&mut buf, Rect::new(2, 1, 2, 1), loch());
+        let outside = &buf[(0, 0)];
+        assert_ne!(outside.underline_color, t.accent(), "the teal recedes");
+        assert_eq!(
+            outside.underline_color, outside.fg,
+            "the underline sinks as far as the ink it shares"
+        );
+        assert_eq!(buf[(2, 1)].underline_color, t.accent(), "the card keeps it");
+        assert_eq!(buf[(5, 2)].underline_color, Color::Reset);
+        let cyan = rgb_color(lerp_rgb(
+            loch().ansi()[6],
+            cell_rgb(buf[(4, 2)].bg, loch(), t.canvas),
+            0.58,
+        ));
+        assert_eq!(buf[(4, 2)].underline_color, cyan, "a palette colour sinks");
+        let mut boxed = Buffer::empty(Rect::new(0, 0, 6, 3));
+        boxed.set_style(
+            boxed.area,
+            Style::default().underline_color(Color::Rgb(0x4f, 0xb1, 0xa6)),
+        );
         let before = boxed.clone();
         dim_backdrop(&mut boxed, Rect::new(2, 1, 2, 1), Theme::BLACK);
         assert_eq!(boxed, before);

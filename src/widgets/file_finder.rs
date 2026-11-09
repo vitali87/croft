@@ -1233,9 +1233,10 @@ mod tests {
             .collect()
     }
 
-    /// Croft Loch: a titleless card, a row per file with its icon, the
-    /// name in body ink with the match in the accent, the folder muted, and
-    /// the selected row's accent bar on the card's left edge.
+    /// Croft Loch: a titleless card, a row per file with its icon (in its
+    /// own colour), the name in body ink with the match in bold strong ink
+    /// (the accent is the selection's alone), the folder muted, and the
+    /// selected row's accent bar on the card's left edge.
     #[test]
     fn croft_loch_finder_rows_read_like_the_explorer() {
         let t = crate::widgets::surface::tones(crate::theme::Theme::from_id("loch")).unwrap();
@@ -1252,7 +1253,12 @@ mod tests {
         );
         assert_eq!(buf[(rect.x, y)].fg, t.accent(), "the selection bar");
         let name = rect.x + 4;
-        assert_eq!(buf[(name, y)].fg, t.accent(), "`main` matched");
+        assert_eq!(buf[(name, y)].fg, t.strong(), "`main` matched");
+        assert_eq!(
+            buf[(rect.x + 2, y)].fg,
+            crate::theme::Theme::from_id("loch").ui(icon.color),
+            "the icon keeps its colour"
+        );
         assert!(buf[(name, y)].modifier.contains(Modifier::BOLD));
         assert_eq!(buf[(name + 4, y)].fg, t.text(), "the rest of the name");
         assert!(!buf[(name + 4, y)].modifier.contains(Modifier::BOLD));

@@ -3166,7 +3166,8 @@ pub fn render_command_palette(
 /// quick-input card ([`crate::widgets::quick_input`]) with no title on its
 /// edge, a `>` prompt, and rows that split a title at its first `: ` into a
 /// muted category and the command's name, the query's matched characters
-/// in the accent, and the binding as keycaps at the right.
+/// in bold strong ink ([`crate::widgets::quick_input::hit_style`]), and the
+/// binding as keycaps at the right.
 fn render_palette_card(
     palette: &mut CommandPalette,
     area: Rect,
@@ -3353,9 +3354,10 @@ mod tests {
 
     /// Croft Loch: the selected row is the band with the accent bar on the
     /// card's left edge, no `> ` marker; the title's category is muted, its
-    /// name in body ink, and the matched characters in the accent.
+    /// name in body ink, and the matched characters in bold strong ink (not
+    /// the accent, which stays for the selection).
     #[test]
-    fn croft_loch_palette_rows_split_the_category_and_accent_the_match() {
+    fn croft_loch_palette_rows_split_the_category_and_mark_the_match() {
         let t = crate::widgets::surface::tones(crate::theme::Theme::from_id("loch")).unwrap();
         let (palette, buf) = loch_palette("toggle terminal", Rect::new(0, 0, 120, 40));
         let rect = palette.last_rect;
@@ -3375,8 +3377,13 @@ mod tests {
         let view = at("View");
         assert_eq!(buf[(view, y)].fg, t.muted(), "the category recedes");
         let toggle = at("Toggle");
-        assert_eq!(buf[(toggle, y)].fg, t.accent(), "a matched character");
+        assert_eq!(buf[(toggle, y)].fg, t.strong(), "a matched character");
         assert!(buf[(toggle, y)].modifier.contains(Modifier::BOLD));
+        let teal = (rect.x + 1..rect.right())
+            .flat_map(|x| (y..y + 3).map(move |y| (x, y)))
+            .filter(|&(x, y)| buf[(x, y)].fg == t.accent())
+            .count();
+        assert_eq!(teal, 0, "no teal in a row's text, only the bar");
         let second = (rect.x..rect.right())
             .map(|x| buf[(x, y + 1)].symbol().to_string())
             .collect::<String>();
