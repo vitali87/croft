@@ -44,8 +44,9 @@ pub struct Tones {
     pub raised: (u8, u8, u8),
     /// The seam between two surfaces.
     pub hairline: (u8, u8, u8),
-    /// A card's edge: a step past the hairline, so a popover's outline reads
-    /// against the raised body it surrounds.
+    /// A step past the hairline: the rules inside a card and a resting
+    /// field's outline, which must read against the raised body. A card's
+    /// own edge is the quieter hairline, so its shadow does the lifting.
     pub rim: (u8, u8, u8),
     /// Body text: names, labels, values.
     pub text: (u8, u8, u8),
@@ -831,9 +832,10 @@ fn shade(c: Color, theme: Theme) -> Color {
 /// The frame an overlay draws (Command Palette, pickers, popups, dialogs).
 /// On a boxed brand theme it is the gradient box. Under `surfaces` it is a
 /// card edge in one-eighth blocks hugging the overlay's outer boundary: an
-/// accent lip easing into the rim along the top, the rim on the other three
-/// sides, with a one-cell shadow below and to the right; a title painted on
-/// the top row keeps its cells.
+/// accent lip easing into the hairline along the top, the hairline on the
+/// other three sides (a whisper of an edge, so the card reads as lifted by
+/// its shadow rather than outlined), with a one-cell shadow below and to the
+/// right; a title painted on the top row keeps its cells.
 pub fn paint_overlay_frame(buf: &mut Buffer, rect: Rect, theme: Theme) {
     let Some(t) = tones(theme) else {
         crate::gradient::paint_gradient_box(buf, rect);
@@ -864,7 +866,7 @@ pub fn paint_anchored_frame(
 }
 
 /// [`paint_overlay_frame`] without the accent lip: the whole edge in the
-/// rim. For hints and tooltips that never take the keyboard, so the accent
+/// hairline. For hints and tooltips that never take the keyboard, so the accent
 /// keeps meaning focus.
 pub fn paint_quiet_frame(buf: &mut Buffer, rect: Rect, theme: Theme) {
     if tones(theme).is_none() {
@@ -885,8 +887,8 @@ pub fn paint_tinted_frame(buf: &mut Buffer, rect: Rect, theme: Theme, tint: (u8,
 }
 
 /// The card edge every overlay frame shares: the top in the `lip` easing
-/// into the rim (all rim without one), the rim on the other sides, and the
-/// one-cell shadow below and to the right, except on `spare_row`.
+/// into the hairline (all hairline without one), the hairline on the other
+/// sides, and the one-cell shadow below and to the right, except on `spare_row`.
 fn paint_card_edge(
     buf: &mut Buffer,
     rect: Rect,
@@ -909,8 +911,8 @@ fn paint_card_edge(
         rect.width,
         Edge::Top.glyph(),
         |i| match lip {
-            Some(a) => lip_color(a, t.rim, i, rect.width),
-            None => t.rim(),
+            Some(a) => lip_color(a, t.hairline, i, rect.width),
+            None => t.hairline(),
         },
     );
     paint_edge_row(
@@ -919,14 +921,14 @@ fn paint_card_edge(
         bottom,
         rect.width,
         Edge::Bottom.glyph(),
-        |_| t.rim(),
+        |_| t.hairline(),
     );
     for y in rect.y + 1..bottom {
         for (x, edge) in [(rect.x, Edge::Left), (right, Edge::Right)] {
             let cell = &mut buf[(x, y)];
             if is_frame_cell(cell) {
                 cell.set_symbol(edge.glyph());
-                cell.set_fg(t.rim());
+                cell.set_fg(t.hairline());
             }
         }
     }
@@ -1218,7 +1220,7 @@ mod tests {
         assert_eq!(buf[(1, 3)].symbol(), "\u{2581}", "bottom edge");
         assert_eq!(buf[(1, 2)].symbol(), "\u{258f}", "left edge");
         assert_eq!(buf[(8, 2)].symbol(), "\u{2595}", "right edge");
-        assert_eq!(buf[(8, 3)].fg, tones(theme).unwrap().rim());
+        assert_eq!(buf[(8, 3)].fg, tones(theme).unwrap().hairline());
         // Shadow: right column from the second row, bottom row from the
         // second column; the cell diagonally past the top-left is untouched.
         let shaded = shade(s.chrome(), theme);
@@ -1252,7 +1254,7 @@ mod tests {
         assert_eq!(buf[(9, 2)].bg, shaded, "the right shadow still falls");
         assert_eq!(buf[(9, 3)].bg, shaded);
         let t = tones(theme).unwrap();
-        assert_eq!(buf[(1, 1)].fg, t.rim(), "quiet: no accent lip");
+        assert_eq!(buf[(1, 1)].fg, t.hairline(), "quiet: no accent lip");
         // Anchored to a row the shadow does not reach, it is the usual card.
         let mut free = fresh();
         paint_anchored_frame(&mut free, card, theme, 0, false);

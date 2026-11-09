@@ -1048,7 +1048,7 @@ mod tests {
         // The details card is quiet: its top edge is the rim throughout.
         let d = p.details_area_for(list, VIEW).unwrap();
         p.details().render(d, &mut buf);
-        assert_eq!(buf[(d.x, d.y)].fg, t.rim());
+        assert_eq!(buf[(d.x, d.y)].fg, t.hairline());
         assert_eq!(
             buf[(d.x + 1, d.y + 1)].fg,
             t.strong(),
@@ -1110,7 +1110,7 @@ mod tests {
         Widget::render(&p, list, &mut buf);
         for x in list.x..list.right() {
             assert_eq!(buf[(x, list.y)].symbol(), "\u{2594}", "({x}) top edge");
-            assert_eq!(buf[(x, list.y)].fg, t.rim(), "({x}) no accent lip");
+            assert_eq!(buf[(x, list.y)].fg, t.hairline(), "({x}) no accent lip");
         }
         assert_eq!(buf[(list.x, list.y + 1)].symbol(), surface::ROW_BAR);
         assert_eq!(buf[(list.x, list.y + 1)].fg, t.accent());
