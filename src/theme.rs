@@ -1063,7 +1063,13 @@ impl Theme {
 
     /// Resting ink of an unselected activity-bar icon (VS Code
     /// `activityBar.inactiveForeground`, #616161 on Light Modern).
+    ///
+    /// Croft Loch rests its icons in the muted ink, so the column recedes
+    /// behind the side bar's labels instead of competing with them.
     pub fn activity_icon_inactive_rgb(self) -> (u8, u8, u8) {
+        if let Some(t) = crate::widgets::surface::tones(self) {
+            return t.muted;
+        }
         self.ui_rgb((0x9d, 0xa5, 0xb4))
     }
 
@@ -1072,8 +1078,24 @@ impl Theme {
     /// The dark chrome paints these white, which is exactly why the baked
     /// icons cannot keep a hardcoded tint: on a light bar white ink is
     /// invisible (issue #225).
+    ///
+    /// Croft Loch's is the strong ink: the region's one emphasised mark.
     pub fn activity_icon_active_rgb(self) -> (u8, u8, u8) {
+        if let Some(t) = crate::widgets::surface::tones(self) {
+            return t.strong;
+        }
         self.ui_rgb((0xff, 0xff, 0xff))
+    }
+
+    /// Ink of an unselected icon under the pointer. Croft Loch lifts it to
+    /// body text, a step short of the selected icon's strong ink, so hover
+    /// and selection differ by more than the pill; every other theme lifts
+    /// it all the way to the active ink, as VS Code does.
+    pub fn activity_icon_hover_rgb(self) -> (u8, u8, u8) {
+        match crate::widgets::surface::tones(self) {
+            Some(t) => t.text,
+            None => self.activity_icon_active_rgb(),
+        }
     }
 
     /// The selection bar down the left edge of the selected icon (VS Code
@@ -1094,6 +1116,11 @@ impl Theme {
         rgb(self.activity_icon_active_rgb())
     }
 
+    /// [`Theme::activity_icon_hover_rgb`] as a cell color.
+    pub fn activity_icon_hover(self) -> Color {
+        rgb(self.activity_icon_hover_rgb())
+    }
+
     /// [`Theme::activity_icon_pill_rgb`] as a cell color.
     pub fn activity_icon_pill(self) -> Color {
         rgb(self.activity_icon_pill_rgb())
@@ -1101,8 +1128,13 @@ impl Theme {
 
     /// Resting ink of the activity bar's sponsor heart (#1940): GitHub
     /// Sponsors' pink (`fgColor.sponsors`), the one icon on the bar that is
-    /// not grey, as on GitHub's own Sponsor button.
+    /// not grey, as on GitHub's own Sponsor button. Croft Loch rests it in
+    /// the muted ink like its neighbours and lets the pink bloom only under
+    /// the pointer, so the bar's loudest pixel is not an idle heart.
     pub fn activity_sponsor_rgb(self) -> (u8, u8, u8) {
+        if let Some(t) = crate::widgets::surface::tones(self) {
+            return t.muted;
+        }
         self.ui_rgb((0xdb, 0x61, 0xa2))
     }
 
@@ -1729,6 +1761,33 @@ mod tests {
         // Croft Loch's selection bar is its own teal, not the VS Code blue.
         let loch = Theme::from_id("loch");
         assert_eq!(loch.activity_icon_pill_rgb(), loch.accent_rgb());
+    }
+
+    /// Croft Loch's activity bar recedes: icons rest in the muted ink, hover
+    /// lifts one to body text, the selected one is the strong ink, and the
+    /// sponsor heart rests muted with its pink kept for the pointer. Every
+    /// other theme's hover is still its active ink.
+    #[test]
+    fn croft_loch_activity_icons_rest_muted_and_hover_a_step_below_selected() {
+        let loch = Theme::from_id("loch");
+        let t = crate::widgets::surface::tones(loch).unwrap();
+        assert_eq!(loch.activity_icon_inactive_rgb(), t.muted);
+        assert_eq!(loch.activity_icon_hover_rgb(), t.text);
+        assert_eq!(loch.activity_icon_active_rgb(), t.strong);
+        assert_ne!(
+            loch.activity_icon_hover_rgb(),
+            loch.activity_icon_active_rgb()
+        );
+        assert_eq!(loch.activity_sponsor_rgb(), t.muted);
+        assert_eq!(loch.activity_sponsor_hover_rgb(), (0xf7, 0x78, 0xba));
+        for theme in Theme::all().iter().filter(|t| t.surfaces().is_none()) {
+            assert_eq!(
+                theme.activity_icon_hover_rgb(),
+                theme.activity_icon_active_rgb(),
+                "{}",
+                theme.label()
+            );
+        }
     }
 
     /// #1940: the sponsor heart is GitHub Sponsors' pink on a dark bar and

@@ -251,6 +251,129 @@ fn status_bar_shows_document_facts_not_a_keyboard_cheat_sheet() {
     );
 }
 
+/// Croft Loch's status bar speaks in colour only when something wants
+/// acting on: zero counts are muted, the transient message is muted italic
+/// commentary, the clickable facts sit a step brighter and lift to the
+/// strong ink on a faint chip under the pointer.
+#[test]
+fn croft_loch_status_bar_is_quiet_until_something_wants_acting_on() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let t = crate::widgets::surface::tones(app.theme).expect("Croft Loch is the default");
+    app.status = String::from("Saved notes");
+    let backend = ratatui::backend::TestBackend::new(140, 50);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let y = 49;
+    let buf = term.backend().buffer().clone();
+    let find = |needle: &str| {
+        let row: Vec<&str> = (0..140).map(|x| buf[(x, y)].symbol()).collect();
+        (0..140usize)
+            .find(|&x| row[x..].concat().starts_with(needle))
+            .map(|x| x as u16)
+            .unwrap_or_else(|| panic!("{needle:?} on the bar: {}", row.concat()))
+    };
+    for glyph in ["\u{ea87}", "\u{ea6c}"] {
+        assert_eq!(buf[(find(glyph), y)].fg, t.muted(), "a zero count is muted");
+    }
+    let msg = &buf[(find("Saved notes"), y)];
+    assert_eq!(msg.fg, t.muted());
+    assert!(msg.modifier.contains(Modifier::ITALIC));
+    let pos = app.status_position_rect;
+    assert!(pos.width > 0, "the facts are on the bar");
+    let fact = crate::gradient::rgb_color(crate::gradient::lerp_rgb(t.muted, t.text, 0.5));
+    assert_eq!(
+        buf[(pos.x + 1, y)].fg,
+        fact,
+        "the facts sit above the message"
+    );
+    app.handle_mouse(crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::Moved,
+        column: pos.x + 1,
+        row: y,
+        modifiers: KeyModifiers::NONE,
+    });
+    term.draw(|f| app.render(f)).unwrap();
+    let hovered = &term.backend().buffer()[(pos.x + 1, y)];
+    assert_eq!(hovered.fg, t.strong());
+    assert_eq!(hovered.bg, t.hover_on(t.chrome));
+}
+
+/// Croft Loch's state chips are one shape: a tag tinted in the chip's hue
+/// with half-block ends in place of its padding spaces, so the chip is as
+/// wide as the boxed theme's and its label reads the same.
+#[test]
+fn croft_loch_status_chips_are_tinted_tags_with_half_block_ends() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let t = crate::widgets::surface::tones(app.theme).unwrap();
+    app.vim.enabled = true;
+    let backend = ratatui::backend::TestBackend::new(140, 50);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let buf = term.backend().buffer();
+    let row: String = (0..140).map(|x| buf[(x, 49)].symbol()).collect();
+    assert!(row.contains("\u{2590}NORMAL\u{258c}"), "{row:?}");
+    assert!(!row.contains('\u{e0b6}') && !row.contains('\u{e0b4}'));
+    let x = (0..140u16).find(|&x| buf[(x, 49)].symbol() == "N").unwrap();
+    let (fill, ink) = (
+        crate::gradient::rgb_color(crate::gradient::lerp_rgb(t.chrome, t.accent, 0.22)),
+        crate::gradient::rgb_color(crate::gradient::lerp_rgb(t.accent, t.lift, 0.35)),
+    );
+    assert_eq!((buf[(x, 49)].fg, buf[(x, 49)].bg), (ink, fill));
+    assert!(!buf[(x, 49)].modifier.contains(Modifier::BOLD));
+    assert_eq!(buf[(x - 1, 49)].fg, fill, "the left end is the chip's tint");
+    assert_eq!(buf[(x - 1, 49)].bg, t.chrome(), "on the bar");
+    // The chip is as wide as Croft Black's ` NORMAL `.
+    let chip = status_chip(
+        app.theme,
+        String::from(" NORMAL "),
+        t.accent,
+        false,
+        Style::default(),
+    );
+    let w: usize = chip.iter().map(|s| s.content.chars().count()).sum();
+    assert_eq!(w, " NORMAL ".len());
+}
+
+/// Croft Loch's branch is passive information: body text, not bold, its
+/// glyph amber only while the tree is dirty, ahead/behind muted; the text
+/// is exactly what every other theme shows.
+#[test]
+fn croft_loch_quiets_the_branch_until_the_tree_is_dirty() {
+    let t = crate::widgets::surface::tones(crate::theme::Theme::LOCH).unwrap();
+    let status = crate::git::GitStatus {
+        in_repo: true,
+        branch: Some(String::from("main")),
+        ahead: 2,
+        ..Default::default()
+    };
+    let before: String = git_status_spans(&status)
+        .iter()
+        .map(|s| s.content.to_string())
+        .collect();
+    let mut spans = git_status_spans(&status);
+    quiet_git_spans(&mut spans, t, false);
+    let after: String = spans.iter().map(|s| s.content.to_string()).collect();
+    assert_eq!(after, before, "only the styles change");
+    assert_eq!(spans[1].style.fg, Some(t.text()), "a clean tree's glyph");
+    assert_eq!(spans[2].style.fg, Some(t.text()));
+    assert!(!spans[2].style.add_modifier.contains(Modifier::BOLD));
+    assert_eq!(spans[3].style.fg, Some(t.muted()), "ahead is muted");
+    let mut dirty = git_status_spans(&status);
+    quiet_git_spans(&mut dirty, t, true);
+    assert_eq!(
+        dirty[1].style.fg,
+        Some(GIT_DIRTY_COLOR),
+        "dirty: amber glyph"
+    );
+    assert_eq!(
+        dirty[2].style.fg,
+        Some(t.text()),
+        "the name stays body text"
+    );
+}
+
 #[test]
 fn status_bar_indent_menu_action_pins_the_editor_indent_style() {
     use crate::widgets::editor::IndentStyle;
@@ -683,6 +806,53 @@ fn the_selected_activity_icon_is_visible_on_the_light_theme() {
         selected.fg, selected.bg,
         "the selected glyph must not be painted in the bar's own background"
     );
+}
+
+/// Croft Loch's activity bar recedes: icons rest muted, a hovered one lifts
+/// to body text, the selected one is the strong ink beside the accent pill,
+/// no glyph is bold, and a count badge is a tint of the accent rather than a
+/// hard teal block.
+#[test]
+fn croft_loch_activity_icons_rest_muted_hover_to_text_and_tint_their_badge() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _) = app_with_unsaved_file(tmp.path());
+    let t = crate::widgets::surface::tones(app.theme).expect("Croft Loch is the default");
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+    let search = app.sidebar_areas.search_icon;
+    app.handle_mouse(crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::Moved,
+        column: search.x + 1,
+        row: search.y,
+        modifiers: KeyModifiers::NONE,
+    });
+    term.draw(|frame| app.render(frame)).unwrap();
+    let buf = term.backend().buffer();
+    let cell_of = |glyph: char| {
+        (0..40u16)
+            .flat_map(|y| (0..4u16).map(move |x| (x, y)))
+            .find(|&(x, y)| buf[(x, y)].symbol() == glyph.to_string())
+            .map(|(x, y)| ((x, y), buf[(x, y)].clone()))
+            .unwrap_or_else(|| panic!("the activity bar must paint {glyph:?}"))
+    };
+    let ((ex, ey), selected) = cell_of(crate::icons::ACTIVITY_EXPLORER);
+    let (_, hovered) = cell_of(crate::icons::ACTIVITY_SEARCH);
+    let (_, resting) = cell_of(crate::icons::ACTIVITY_EXTENSIONS);
+    assert_eq!(selected.fg, t.strong());
+    assert_eq!(hovered.fg, t.text());
+    assert_eq!(resting.fg, t.muted());
+    for cell in [&selected, &hovered, &resting] {
+        assert!(!cell.modifier.contains(Modifier::BOLD), "no bold glyphs");
+    }
+    let pill = &buf[(0, ey)];
+    assert_eq!((pill.symbol(), pill.fg), ("\u{258e}", t.accent()));
+    // The Explorer's unsaved count rides its slot's bottom-right cell.
+    let badge = &buf[(ex + 1, ey + 1)];
+    assert_eq!(badge.symbol(), "1");
+    let fill = crate::gradient::rgb_color(crate::gradient::lerp_rgb(t.chrome, t.accent, 0.22));
+    assert_eq!(badge.bg, fill, "a tint of the accent, not the accent");
+    assert!(!badge.modifier.contains(Modifier::BOLD));
 }
 
 /// Croft Loch paints the workbench as surfaces on exactly the layout every
@@ -1223,6 +1393,87 @@ fn the_active_panel_tab_is_underlined() {
             .modifier
             .contains(Modifier::UNDERLINED),
         "the trailing pad space is not underlined",
+    );
+}
+
+/// Croft Loch's panel tabs take three steps: the active title in the strong
+/// ink with the accent underline and no bold, a hovered title in body text
+/// (not the active ink), the rest muted; and the first title's word starts
+/// on the terminal's first text column.
+#[test]
+fn croft_loch_panel_tabs_step_from_muted_to_text_to_strong() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let t = crate::widgets::surface::tones(app.theme).expect("Croft Loch is the default");
+    let backend = ratatui::backend::TestBackend::new(140, 50);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let out = app.output_tab_rect;
+    app.handle_mouse(crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::Moved,
+        column: out.x + 2,
+        row: out.y,
+        modifiers: KeyModifiers::NONE,
+    });
+    term.draw(|f| app.render(f)).unwrap();
+    let buf = term.backend().buffer();
+    let word = |r: ratatui::layout::Rect| {
+        (r.x..r.right())
+            .map(|x| &buf[(x, r.y)])
+            .find(|c| c.symbol() != " ")
+            .unwrap()
+            .clone()
+    };
+    let active = word(app.terminal_tab_rect);
+    assert_eq!(active.fg, t.strong());
+    assert!(!active.modifier.contains(Modifier::BOLD));
+    assert!(active.modifier.contains(Modifier::UNDERLINED));
+    assert_eq!(active.underline_color, t.accent());
+    assert_eq!(word(app.output_tab_rect).fg, t.text(), "hover is body text");
+    assert_eq!(word(app.ports_tab_rect).fg, t.muted());
+    let first = app.problems_tab_rect;
+    assert_eq!(buf[(first.x, first.y)].symbol(), "P", "no leading pad");
+    let inner = app.terminals[0].last_inner;
+    assert_eq!(first.x, inner.x, "the first title lines up with the shell");
+}
+
+/// Croft Loch gives every panel pane a top edge: the terminal and the views
+/// that share the panel draw a hairline under the tab strip, and the accent
+/// lip while the panel has the keyboard.
+#[test]
+fn croft_loch_panel_panes_draw_a_hairline_or_the_lip_on_their_top_edge() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let t = crate::widgets::surface::tones(app.theme).expect("Croft Loch is the default");
+    app.focus_pane(Pane::Editor);
+    let backend = ratatui::backend::TestBackend::new(140, 50);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let pane = app.terminals[0].last_area;
+    let top = |term: &ratatui::Terminal<ratatui::backend::TestBackend>, x: u16, y: u16| {
+        let c = &term.backend().buffer()[(x, y)];
+        (c.symbol().to_string(), c.fg)
+    };
+    assert_eq!(
+        top(&term, pane.x + 4, pane.y),
+        ("\u{2594}".to_string(), t.hairline()),
+        "an unfocused pane's top edge is the hairline"
+    );
+    app.focus_pane(Pane::Terminal);
+    term.draw(|f| app.render(f)).unwrap();
+    assert_eq!(
+        top(&term, pane.x, pane.y),
+        ("\u{2594}".to_string(), t.accent()),
+        "the focused pane's lip starts in the accent"
+    );
+    app.set_bottom_panel_tab(BottomPanelTab::Problems);
+    app.focus_pane(Pane::Editor);
+    term.draw(|f| app.render(f)).unwrap();
+    let view = app.problems.last_area;
+    assert_eq!(
+        top(&term, view.x, view.y),
+        ("\u{2594}".to_string(), t.hairline()),
+        "PROBLEMS draws the same edge"
     );
 }
 

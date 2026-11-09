@@ -120,13 +120,32 @@ fn reset_session_bg_seq_restores_profile_default() {
 
 #[test]
 fn brand_spans_render_the_cr_ft_wordmark_with_orange_brackets() {
-    let spans = brand_spans(crate::theme::Theme::default());
+    let spans = brand_spans(crate::theme::Theme::BLACK);
     let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
     assert_eq!(text, " cr<>ft ");
     // The "<>" (the stylised "o") carries the logo orange; letters stay white.
     let bracket = spans.iter().find(|s| s.content == "<>").unwrap();
     assert_eq!(bracket.style.fg, Some(BRAND_ORANGE));
     assert_eq!(spans[0].style.fg, Some(Color::White));
+    assert!(spans[0].style.add_modifier.contains(Modifier::BOLD));
+}
+
+/// Croft Loch's bar keeps one emphasis: the letters are body text and not
+/// bold, and only the orange `<>` is bold.
+#[test]
+fn croft_loch_brand_spans_bold_only_the_orange_brackets() {
+    let theme = crate::theme::Theme::LOCH;
+    let t = crate::widgets::surface::tones(theme).unwrap();
+    let spans = brand_spans(theme);
+    let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+    assert_eq!(text, " cr<>ft ");
+    for letters in [&spans[0], &spans[2]] {
+        assert_eq!(letters.style.fg, Some(t.text()));
+        assert!(!letters.style.add_modifier.contains(Modifier::BOLD));
+    }
+    let bracket = spans.iter().find(|s| s.content == "<>").unwrap();
+    assert_eq!(bracket.style.fg, Some(BRAND_ORANGE));
+    assert!(bracket.style.add_modifier.contains(Modifier::BOLD));
 }
 
 #[test]
