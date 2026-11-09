@@ -3528,6 +3528,13 @@ pub struct Editor {
     pub cursor_row: usize,
     pub cursor_col: usize,
     pub focused: bool,
+    /// A modal quick input (Command Palette, Go to File, a list picker, any
+    /// modal overlay) holds the keyboard above this editor. `focused` keeps
+    /// saying where the keyboard returns; this only takes the accent marks
+    /// (the top rule's lip, the active tab's underline) off a `surfaces`
+    /// theme's editor while the overlay has it, so one thing at a time wears
+    /// the accent. Set by the app each frame.
+    pub overlay_has_keyboard: bool,
     /// When focused, draw the orange→green gradient border (Black theme)
     /// instead of the solid blue one. Set by the app's focus/theme sync.
     pub focus_gradient: bool,
@@ -4182,6 +4189,7 @@ impl Editor {
             cursor_row: 0,
             cursor_col: 0,
             focused: false,
+            overlay_has_keyboard: false,
             focus_gradient: false,
             theme: crate::theme::Theme::default(),
             pdf_viewer_enabled: true,
@@ -19428,9 +19436,16 @@ impl Widget for &mut Editor {
         // Black theme: replace the solid focus border with the orange→green
         // gradient that matches the welcome activity box. The editor has no
         // title, so nothing needs re-stamping over the gradient top edge.
-        // Croft Loch marks focus with a rule along the top edge instead.
-        if self.focused && surfaces {
-            crate::widgets::surface::paint_focus_rule(buf, area, self.theme);
+        // Croft Loch always draws the seam under the header along the top
+        // edge, and lights it with the accent lip only while the editor has
+        // the keyboard: a modal quick input above it takes the lip away.
+        if surfaces {
+            crate::widgets::surface::paint_pane_top(
+                buf,
+                area,
+                self.theme,
+                self.focused && !self.overlay_has_keyboard,
+            );
         } else if self.focused && self.focus_gradient {
             crate::gradient::paint_gradient_box(buf, area);
         }
@@ -19912,6 +19927,17 @@ impl Widget for &mut Editor {
             .flatten();
         let guide_fg = self.theme.indent_guide();
         let guide_active_fg = self.theme.indent_guide_active();
+        // A `surfaces` theme keeps the gutter quiet: an expanded fold's
+        // chevron shows on the caret's line, or on every foldable line while
+        // the pointer is over the gutter (VS Code's `showFoldingControls:
+        // mouseover`); the change bar hugs the code edge as a quarter block.
+        let surfaces = self.theme.surfaces().is_some();
+        let gutter_hovered = self.pointer.is_some_and(|(px, py)| {
+            px >= inner.x
+                && px <= inner.x + gutter_width
+                && py >= inner.y
+                && py < inner.y + inner.height
+        });
         // Each text row's geometry, refilled per row (#873).
         let mut row_cells = RowCells::default();
 
@@ -19983,7 +20009,7 @@ impl Widget for &mut Editor {
                         self.theme.ui(Color::Rgb(0xa0, 0x55, 0x55))
                     }
                     None if self.is_caret_line(line_idx) => self.theme.line_number_active(),
-                    None => Color::DarkGray,
+                    None => self.theme.line_number_fg(),
                 };
                 let gutter = Line::from(Span::styled(line_no, Style::default().fg(number_fg)));
                 buf.set_line(inner.x, y, &gutter, gutter_width);
@@ -20112,15 +20138,23 @@ impl Widget for &mut Editor {
             // second sign-margin column (`sign_x + 1`) so it never collides with
             // a breakpoint dot at `sign_x`. ▾ = expanded, ▸ = collapsed; the
             // collapsed one is brighter so hidden content is noticeable. Matches
-            // the gutter's own DarkGray line numbers (which are theme-agnostic).
+            // the gutter's own line numbers. On a `surfaces` theme the
+            // expanded one waits for the caret or the pointer, and the
+            // collapsed one, always shown, wears the muted ink.
             if (!wrap || row_start == 0) && self.is_foldable(line_idx) {
                 let collapsed = self.folded.contains(&line_idx);
-                let (glyph, color) = if collapsed {
-                    ("▸", self.theme.ui(Color::Gray))
+                let glyph = if collapsed {
+                    let ink = crate::widgets::surface::tones(self.theme)
+                        .map_or_else(|| self.theme.ui(Color::Gray), |t| t.muted());
+                    Some(("▸", ink))
+                } else if !surfaces || gutter_hovered || self.is_caret_line(line_idx) {
+                    Some(("▾", self.theme.line_number_fg()))
                 } else {
-                    ("▾", Color::DarkGray)
+                    None
                 };
-                buf.set_string(sign_x + 1, y, glyph, Style::default().fg(color));
+                if let Some((glyph, color)) = glyph {
+                    buf.set_string(sign_x + 1, y, glyph, Style::default().fg(color));
+                }
             }
 
             // Git gutter: a thin coloured bar in the spacer cell between the
@@ -20137,12 +20171,11 @@ impl Widget for &mut Editor {
                     GitMark::Modified => self.theme.git_modified(),
                     GitMark::Deleted => self.theme.git_deleted(),
                 };
-                buf.set_string(
-                    inner.x + gutter_width,
-                    y,
-                    "\u{2503}", // ┃ heavy vertical
-                    Style::default().fg(color),
-                );
+                // ┃ heavy vertical; ▎ left quarter block on a `surfaces`
+                // theme, a crisp stripe on the cell edge rather than a line
+                // through its middle.
+                let bar = if surfaces { "\u{258e}" } else { "\u{2503}" };
+                buf.set_string(inner.x + gutter_width, y, bar, Style::default().fg(color));
             }
             // Coverage lens (#263): the same lane, painted over the git bar
             // while a coverage report is shown. Green run, red never run,
@@ -20180,10 +20213,13 @@ impl Widget for &mut Editor {
                 && let Some(seat) = self.provenance.seat(line_idx)
             {
                 let (r, g, b) = seat.hue();
+                // ▎ left one-quarter block; ▏ one-eighth on a `surfaces`
+                // theme, whose change bar already takes the quarter block.
+                let bar = if surfaces { "\u{258f}" } else { "\u{258e}" };
                 buf.set_string(
                     inner.x + gutter_width,
                     y,
-                    "\u{258e}", // ▎ left one-quarter block
+                    bar,
                     Style::default().fg(self.theme.ui(Color::Rgb(r, g, b))),
                 );
             }
@@ -20970,7 +21006,7 @@ impl Widget for &mut Editor {
                     inner.x,
                     y,
                     &line_no,
-                    Style::default().fg(Color::DarkGray).bg(bg),
+                    Style::default().fg(self.theme.line_number_fg()).bg(bg),
                 );
                 self.paint_highlighted_line(buf, text_x, y, text_w, line as usize);
                 self.sticky_click_rows.push((y, line));
@@ -21681,10 +21717,13 @@ fn paint_block_cursor(
         return;
     }
     let cell = &mut buf[(text_x + col as u16, y)];
+    // The glyph under the block takes the canvas on a `surfaces` theme
+    // rather than the host palette's named black.
+    let fg = crate::widgets::surface::tones(theme).map_or(Color::Black, |t| t.canvas());
     cell.set_style(
         Style::default()
-            .fg(Color::Black)
-            .bg(theme.ui(Color::Rgb(0xae, 0xc6, 0xff)))
+            .fg(fg)
+            .bg(theme.secondary_caret_bg())
             .add_modifier(Modifier::BOLD),
     );
 }
@@ -22374,6 +22413,10 @@ fn paint_diagnostic_tags(
 pub struct Crumb {
     pub label: String,
     pub target: Option<(u32, u32)>,
+    /// The glyph and colour a `surfaces` theme draws before the label: the
+    /// file's type icon on the file crumb, the symbol kind's on a symbol
+    /// crumb, none on a folder. Not part of the crumb's hit range.
+    pub icon: Option<(char, Color)>,
 }
 
 /// A rendered breadcrumb crumb's hit-test span: `(x_start, width, jump target)`.
@@ -23860,6 +23903,138 @@ fn close_pill_fg(theme: crate::theme::Theme, pill: Color) -> Color {
     }
 }
 
+/// The file-type icon a tab leads with on a `surfaces` theme: the
+/// Explorer's icon for its file (a diff tab's left side), the plain file
+/// icon for an untitled buffer.
+fn tab_icon(ed: &Editor) -> crate::icons::Icon {
+    let path = ed
+        .path
+        .as_deref()
+        .or_else(|| ed.diff.as_ref().map(|d| d.left_path.as_path()));
+    match path.and_then(|p| p.file_name().map(|n| (p, n))) {
+        Some((p, name)) => {
+            let suffix = p
+                .extension()
+                .map(|e| format!(".{}", e.to_string_lossy()))
+                .unwrap_or_default();
+            crate::icons::for_path(&name.to_string_lossy(), &suffix)
+        }
+        None => crate::icons::DEFAULT_FILE,
+    }
+}
+
+/// One visible tab of the strip on a `surfaces` theme, for
+/// [`paint_surface_tab`]: where it sits and the states its look follows.
+struct SurfaceTab<'a> {
+    /// The tab's first cell (its leading pad).
+    x: u16,
+    y: u16,
+    label: &'a str,
+    /// Where the label starts, after the pad, the icon and its gap.
+    label_x: u16,
+    /// The close / pin / dirty-dot cell, the tab's close hit target.
+    close_x: u16,
+    ed: &'a Editor,
+    theme: crate::theme::Theme,
+    t: crate::widgets::surface::Tones,
+    /// The tab body's fill: canvas when active, the hover lift, or chrome.
+    bg: Color,
+    is_active: bool,
+    /// The tab's group is the focused editor group.
+    group_focused: bool,
+    /// That group has the keyboard (focused, no modal over it).
+    has_keyboard: bool,
+    tab_hovered: bool,
+    on_close: bool,
+}
+
+/// Paint a tab as ` {icon} {label} {close} ` on a `surfaces` theme. Three
+/// inks and no bold: an inactive label is muted and lifts to body text
+/// under the pointer; the active tab is the region's one strong label in
+/// the focused group and body text in another, and only in the group with
+/// the keyboard does it wear the accent, as an underline under its label.
+/// The close cross is muted on the active or hovered tab and faint on the
+/// rest; a dirty file shows a dot in that slot until the pointer is on the
+/// tab, so the tab keeps one width whether its file is dirty or not.
+fn paint_surface_tab(buf: &mut Buffer, tab: SurfaceTab<'_>) {
+    let SurfaceTab {
+        x,
+        y,
+        label,
+        label_x,
+        close_x,
+        ed,
+        theme,
+        t,
+        bg,
+        is_active,
+        group_focused,
+        has_keyboard,
+        tab_hovered,
+        on_close,
+    } = tab;
+    let fill = Style::default().bg(bg);
+    let label_fg = if is_active {
+        if group_focused { t.strong() } else { t.text() }
+    } else if tab_hovered {
+        t.text()
+    } else {
+        t.muted()
+    };
+    // The pads and gaps first, so every cell of the tab wears its fill.
+    for cx in [x, x + 2, close_x - 1, close_x + 1] {
+        buf.set_string(cx, y, " ", fill);
+    }
+    // The icon in its own colour on the active or hovered tab, eased most
+    // of the way into the tab's fill on the others.
+    let icon = tab_icon(ed);
+    let icon_fg = match (theme.ui(icon.color), bg) {
+        (Color::Rgb(r, g, b), Color::Rgb(br, bgc, bb)) if !(is_active || tab_hovered) => {
+            crate::gradient::rgb_color(crate::gradient::lerp_rgb((r, g, b), (br, bgc, bb), 0.45))
+        }
+        (c, _) => c,
+    };
+    buf.set_string(
+        x + 1,
+        y,
+        icon.glyph.to_string(),
+        Style::default().fg(icon_fg).bg(bg),
+    );
+    let mut style = Style::default().fg(label_fg).bg(bg);
+    if ed.preview {
+        style = style.add_modifier(Modifier::ITALIC);
+    }
+    buf.set_string(label_x, y, label, style);
+    if is_active && has_keyboard {
+        let width = Span::raw(label).width() as u16;
+        for ux in label_x..label_x + width {
+            let cell = &mut buf[(ux, y)];
+            cell.modifier.insert(Modifier::UNDERLINED);
+            cell.underline_color = t.accent();
+        }
+    }
+    // The close slot: a thumb-tack on a pinned tab (clicking it unpins), a
+    // dot on a dirty one while the pointer is elsewhere, else the cross.
+    let (glyph, ink) = if ed.pinned {
+        ("\u{f08d}", t.muted())
+    } else if ed.dirty && !tab_hovered {
+        ("\u{25cf}", if is_active { t.text() } else { t.muted() })
+    } else if is_active || tab_hovered {
+        ("\u{2715}", t.muted())
+    } else {
+        ("\u{2715}", t.faint())
+    };
+    let close_style = if on_close {
+        // The pill names exactly the glyph the click will land on.
+        Style::default()
+            .fg(t.strong())
+            .bg(theme.tab_close_pill_bg())
+    } else {
+        Style::default().fg(ink).bg(bg)
+    };
+    buf.set_string(close_x, y, glyph, close_style);
+}
+
 impl Widget for &mut EditorTabs {
     fn render(self, area: Rect, buf: &mut Buffer) {
         self.last_full_area = area;
@@ -23938,7 +24113,28 @@ impl Widget for &mut EditorTabs {
         }
         let active_tab_bg = theme.tab_active_bg();
         let pointer = self.hover_pointer;
-        let display_labels = disambiguated_tab_labels(&self.editors);
+        // A `surfaces` theme (Croft Loch) lays a tab out as
+        // ` {icon} {label} {close} `: a file-type icon leads the label, the
+        // dirty dot moves out of the label into the close slot (so a tab
+        // never changes width as its file goes dirty), and only the active
+        // tab of the group with the keyboard wears the accent, as an
+        // underline. Every other theme keeps ` {label} {close} `.
+        let tones = crate::widgets::surface::tones(theme);
+        let group_focused = self.editors[active].focused;
+        let has_keyboard = group_focused && !self.editors[active].overlay_has_keyboard;
+        let icon_w: u16 = if tones.is_some() { 2 } else { 0 };
+        let display_labels: Vec<String> = disambiguated_tab_labels(&self.editors)
+            .into_iter()
+            .zip(&self.editors)
+            .map(|(label, ed)| {
+                // The menus, status line and screen reader keep the `● `
+                // prefix (`tab_display_label`); only the strip drops it.
+                match label.strip_prefix("\u{25cf} ") {
+                    Some(rest) if tones.is_some() && ed.dirty => rest.to_string(),
+                    _ => label,
+                }
+            })
+            .collect();
         // Tabs never run under what the app paints at the strip's right end,
         // and the strip scrolls by tab when they do not all fit.
         let mut strip_right = strip.x
@@ -23952,7 +24148,9 @@ impl Widget for &mut EditorTabs {
                 // Display CELLS, not chars (#168 review): a CJK file or
                 // directory name is double-width, and a char count shifted
                 // the close button and hit ranges left of the painted text.
-                usize::from(Span::raw(l.as_str()).width() as u16) + 4 // a pad either side, the close cell and a gap
+                // A pad either side, the close cell and a gap, plus the icon
+                // and its gap on a `surfaces` theme.
+                usize::from(Span::raw(l.as_str()).width() as u16) + 4 + usize::from(icon_w)
             })
             .collect();
         let n = widths.len();
@@ -23971,13 +24169,18 @@ impl Widget for &mut EditorTabs {
                 py == strip.y && px >= strip_right && px < strip_right + TAB_LIST_W
             });
             // As the layout icons beside it: the glyph goes from grey to the
-            // accent on hover, the cell keeps the strip's own background.
+            // accent on hover, the cell keeps the strip's own background. On
+            // a `surfaces` theme it is a header action: muted at rest, the
+            // strong ink on a faint chip under the pointer.
             let fg = if hovered {
                 theme.ui(Color::Rgb(0x4e, 0x9a, 0xff))
             } else {
                 theme.ui(Color::Rgb(0xcc, 0xcc, 0xcc))
             };
-            let style = Style::default().fg(fg).bg(theme.tab_strip_bg());
+            let mut style = Style::default().fg(fg).bg(theme.tab_strip_bg());
+            if tones.is_some() {
+                style = style.patch(crate::widgets::header_pill::action_style(theme, hovered));
+            }
             buf.set_string(strip_right, strip.y, " \u{2261} ", style);
         }
         let avail = usize::from(strip_right.saturating_sub(strip.x));
@@ -24023,7 +24226,8 @@ impl Widget for &mut EditorTabs {
                 continue;
             }
             let is_active = i == active;
-            let close_x = cursor_x + 1 + label_chars + 1;
+            let label_x = cursor_x + 1 + icon_w;
+            let close_x = label_x + label_chars + 1;
             // Treatment C: the pointer resting anywhere on a tab lifts an
             // inactive tab's body (the active tab is already prominent), and
             // resting on the close cross gives that single cell a pill.
@@ -24039,6 +24243,31 @@ impl Widget for &mut EditorTabs {
             } else {
                 theme.tab_inactive_bg()
             };
+            if let Some(t) = tones {
+                paint_surface_tab(
+                    buf,
+                    SurfaceTab {
+                        x: cursor_x,
+                        y: strip.y,
+                        label: &label_text,
+                        label_x,
+                        close_x,
+                        ed,
+                        theme,
+                        t,
+                        bg,
+                        is_active,
+                        group_focused,
+                        has_keyboard,
+                        tab_hovered,
+                        on_close,
+                    },
+                );
+                self.tab_screen_ranges.push((cursor_x, width));
+                self.tab_close_x.push(close_x);
+                cursor_x = cursor_x.saturating_add(width);
+                continue;
+            }
             let fg = if is_active || hover_lift {
                 TAB_ACTIVE_FG
             } else {
@@ -24101,6 +24330,12 @@ impl Widget for &mut EditorTabs {
             }
             let max_x = area.x + area.width;
             let mut x = area.x + 1;
+            // On a `surfaces` theme the trail is in the theme's inks: faint
+            // separators, muted crumbs leading to the one you are in (the
+            // last) in body text, the file and symbol crumbs led by their
+            // icons.
+            let tones = crate::widgets::surface::tones(theme);
+            let last = self.breadcrumbs.len() - 1;
             for (i, crumb) in self.breadcrumbs.iter().enumerate() {
                 if i > 0 {
                     let sep = " \u{203A} "; // " › "
@@ -24108,19 +24343,31 @@ impl Widget for &mut EditorTabs {
                     if x + sw >= max_x {
                         break;
                     }
-                    buf.set_string(x, crumb_y, sep, Style::default().fg(Color::DarkGray).bg(bg));
+                    let sep_fg = tones.map_or(Color::DarkGray, |t| t.faint());
+                    buf.set_string(x, crumb_y, sep, Style::default().fg(sep_fg).bg(bg));
                     x += sw;
                 }
                 if x >= max_x {
                     break;
                 }
+                // The icon and its gap go before the label, outside its hit
+                // range, and only where a cell of the label still fits.
+                if tones.is_some()
+                    && let Some((glyph, color)) = crumb.icon
+                    && x + 2 < max_x
+                {
+                    let icon_style = Style::default().fg(theme.ui(color)).bg(bg);
+                    buf.set_string(x, crumb_y, glyph.to_string(), icon_style);
+                    x += 2;
+                }
                 let avail = (max_x - x) as usize;
                 // Symbol crumbs (clickable) read brighter than the informational
                 // path crumbs, mirroring VS Code's active/inactive breadcrumbs.
-                let fg = if crumb.target.is_some() {
-                    self.theme.ui(Color::Gray)
-                } else {
-                    Color::DarkGray
+                let fg = match tones {
+                    Some(t) if i == last => t.text(),
+                    Some(t) => t.muted(),
+                    None if crumb.target.is_some() => self.theme.ui(Color::Gray),
+                    None => Color::DarkGray,
                 };
                 // Budget and advance in display CELLS: `set_stringn` clips by
                 // grapheme width and reports where it stopped, so a CJK or
@@ -26318,7 +26565,9 @@ mod tests {
 
     /// The provenance lens paints a bar in the seat's hue in the gutter's
     /// spacer cell (#349): two seats, two colours, and a line with no record
-    /// paints nothing there. Off, the lane is the git gutter's alone.
+    /// paints nothing there. Off, the lane is the git gutter's alone. On
+    /// Croft Loch (the default) the bar is the one-eighth block, the quarter
+    /// block being the change bar's there.
     #[test]
     fn provenance_overlay_paints_a_seat_coloured_bar_per_line() {
         use crate::provenance::Seat;
@@ -26338,7 +26587,7 @@ mod tests {
         let bar_x = e.last_inner.x + e.last_gutter_width;
         assert_ne!(
             buf[(bar_x, e.last_inner.y)].symbol(),
-            "\u{258e}",
+            "\u{258f}",
             "off, the lens paints nothing"
         );
         e.provenance_overlay = true;
@@ -26347,16 +26596,16 @@ mod tests {
         let me = &buf[(bar_x, e.last_inner.y)];
         let agent = &buf[(bar_x, e.last_inner.y + 1)];
         let unknown = &buf[(bar_x, e.last_inner.y + 2)];
-        assert_eq!(me.symbol(), "\u{258e}", "a line you typed gets a bar");
+        assert_eq!(me.symbol(), "\u{258f}", "a line you typed gets a bar");
         assert_eq!(
             agent.symbol(),
-            "\u{258e}",
+            "\u{258f}",
             "a line an agent typed gets a bar"
         );
         assert_ne!(me.style().fg, agent.style().fg, "in distinct hues");
         assert_ne!(
             unknown.symbol(),
-            "\u{258e}",
+            "\u{258f}",
             "a line with no record is never guessed"
         );
     }
@@ -26434,11 +26683,17 @@ mod tests {
         // cell at `inner.x + gutter_width`, one cell left of the text.
         let bar_x = e.last_inner.x + e.last_gutter_width;
         let cell = &buf[(bar_x, e.last_inner.y + 1)];
+        // Croft Loch (the default) draws the bar as a quarter block on the
+        // cell's left edge; a boxed theme keeps the heavy centred bar.
         assert_eq!(
             cell.symbol(),
-            "\u{2503}",
+            "\u{258e}",
             "modified line shows a gutter bar"
         );
+        e.theme = crate::theme::Theme::BLACK;
+        let mut buf = Buffer::empty(area);
+        (&mut e).render(area, &mut buf);
+        assert_eq!(buf[(bar_x, e.last_inner.y + 1)].symbol(), "\u{2503}");
     }
 
     /// The gutter of a rendered `e` (#1576): each screen row's number
@@ -26525,6 +26780,25 @@ mod tests {
         let active = Some(e.theme.line_number_active());
         assert_eq!(styles[4].fg, active);
         assert_eq!(styles[7].fg, active, "an extra caret's line too");
+        assert_eq!(styles[3].fg, Some(e.theme.line_number_fg()));
+        assert_ne!(active, Some(e.theme.line_number_fg()));
+    }
+
+    /// Croft Loch's gutter is in its own inks, not the host's named greys:
+    /// the faint tone for the numbers, body text for the caret's; a boxed
+    /// theme keeps the terminal's dark grey.
+    #[test]
+    fn a_surfaces_gutter_numbers_in_the_themes_inks() {
+        let mut e = ten_lines();
+        e.cursor_row = 4;
+        let (_, styles) = gutter_column(&mut e, 10);
+        let t = crate::widgets::surface::tones(e.theme).expect("Loch is the default");
+        assert_eq!(styles[3].fg, Some(t.faint()));
+        assert_eq!(styles[4].fg, Some(t.text()));
+        let mut e = ten_lines();
+        e.theme = crate::theme::Theme::BLACK;
+        e.cursor_row = 4;
+        let (_, styles) = gutter_column(&mut e, 10);
         assert_eq!(styles[3].fg, Some(Color::DarkGray));
     }
 
@@ -29848,7 +30122,8 @@ mod tests {
         let mut buf = ratatui::buffer::Buffer::empty(area);
         (&mut e as &mut Editor).render(area, &mut buf);
         let text_x = e.last_inner.x + e.last_gutter_width + 1;
-        let block_x = (0..area.width).find(|&x| buf[(x, 1)].bg == Color::Rgb(0xae, 0xc6, 0xff));
+        let caret_bg = e.theme.secondary_caret_bg();
+        let block_x = (0..area.width).find(|&x| buf[(x, 1)].bg == caret_bg);
         assert_eq!(
             block_x,
             Some(text_x + 5),
@@ -38222,13 +38497,18 @@ mod tests {
         t.hover_pointer = Some((cx, area.y));
         let mut buf = Buffer::empty(area);
         (&mut t).render(area, &mut buf);
-        let pill = crate::theme::Theme::default().tab_close_pill_bg();
+        let theme = crate::theme::Theme::default();
+        let pill = theme.tab_close_pill_bg();
         assert_eq!(
             buf[(cx, area.y)].bg,
             pill,
             "the hovered cross cell wears the pill"
         );
-        assert_eq!(buf[(cx, area.y)].fg, Color::White);
+        // Croft Loch inks the glyph on its neutral pill in the strong grey,
+        // not bold white.
+        let t = crate::widgets::surface::tones(theme).expect("Loch is the default");
+        assert_eq!(buf[(cx, area.y)].fg, t.strong());
+        assert!(!buf[(cx, area.y)].modifier.contains(Modifier::BOLD));
         assert_eq!(
             buf[(cx, area.y)].symbol(),
             "\u{2715}",
@@ -38308,7 +38588,7 @@ mod tests {
         for (id, want) in [
             ("hc-black", Color::Black),
             ("hc-light", Color::White),
-            ("dark", Color::White),
+            ("dark-blue", Color::White),
         ] {
             let theme = crate::theme::Theme::from_id(id);
             let mut t = EditorTabs::new();
@@ -38405,6 +38685,257 @@ mod tests {
             hover,
             "the active tab keeps its own bg when a sibling is hovered"
         );
+    }
+
+    /// Two tabs on Croft Loch, `foo.rs` inactive and `bar.rs` active, the
+    /// group focused or not, rendered on an 80x10 area.
+    fn loch_tab_pair(focused: bool) -> (EditorTabs, Buffer) {
+        let mut t = EditorTabs::new();
+        t.editors[0].path = Some(PathBuf::from("/foo.rs"));
+        t.add_tab_with_path(PathBuf::from("/bar.rs"));
+        t.editors[1].focused = focused;
+        let mut buf = Buffer::empty(Rect::new(0, 0, 80, 10));
+        let area = buf.area;
+        (&mut t).render(area, &mut buf);
+        (t, buf)
+    }
+
+    /// Croft Loch lays a tab out as ` {icon} {label} {close} `: the
+    /// Explorer's file icon leads, an inactive label is muted with a faint
+    /// cross, and the active tab of the focused group is the strong ink,
+    /// never bold, with the accent only as an underline under its label.
+    #[test]
+    fn a_loch_tab_leads_with_its_icon_and_marks_the_focused_active_tab() {
+        let (t, buf) = loch_tab_pair(true);
+        let s = crate::widgets::surface::tones(crate::theme::Theme::default()).unwrap();
+        let (x0, w0) = t.tab_screen_x(0).unwrap();
+        let (x1, _) = t.tab_screen_x(1).unwrap();
+        assert_eq!(w0, 6 + 6, "pad, icon, gap, label, gap, close, pad");
+        let icon = crate::icons::for_path("foo.rs", ".rs");
+        assert_eq!(buf[(x0 + 1, 0)].symbol(), icon.glyph.to_string());
+        let (inactive, active) = (&buf[(x0 + 3, 0)], &buf[(x1 + 3, 0)]);
+        assert_eq!((inactive.symbol(), active.symbol()), ("f", "b"));
+        assert_eq!(inactive.fg, s.muted());
+        assert_eq!(active.fg, s.strong());
+        assert!(!active.modifier.contains(Modifier::BOLD), "no bold tabs");
+        assert!(active.modifier.contains(Modifier::UNDERLINED));
+        assert_eq!(active.underline_color, s.accent());
+        assert!(!inactive.modifier.contains(Modifier::UNDERLINED));
+        assert!(
+            !buf[(x1 + 1, 0)].modifier.contains(Modifier::UNDERLINED),
+            "the underline sits under the label, not the icon"
+        );
+        let (c0, c1) = (t.close_screen_x(0).unwrap(), t.close_screen_x(1).unwrap());
+        assert_eq!(buf[(c0, 0)].symbol(), "\u{2715}");
+        assert_eq!(buf[(c0, 0)].fg, s.faint(), "an inactive cross recedes");
+        assert_eq!(buf[(c1, 0)].fg, s.muted());
+    }
+
+    /// The accent means "has the keyboard": an unfocused group's active
+    /// tab is body text without the underline, and a modal over a focused
+    /// group takes the underline but leaves the tab its strong ink.
+    #[test]
+    fn a_loch_tab_wears_the_accent_only_while_its_group_has_the_keyboard() {
+        let s = crate::widgets::surface::tones(crate::theme::Theme::default()).unwrap();
+        let (t, buf) = loch_tab_pair(false);
+        let label = &buf[(t.tab_screen_x(1).unwrap().0 + 3, 0)];
+        assert_eq!(label.fg, s.text());
+        assert!(!label.modifier.contains(Modifier::UNDERLINED));
+        let (mut t, _) = loch_tab_pair(true);
+        t.editors[1].overlay_has_keyboard = true;
+        let mut buf = Buffer::empty(Rect::new(0, 0, 80, 10));
+        let area = buf.area;
+        (&mut t).render(area, &mut buf);
+        let label = &buf[(t.tab_screen_x(1).unwrap().0 + 3, 0)];
+        assert_eq!(label.fg, s.strong());
+        assert!(!label.modifier.contains(Modifier::UNDERLINED));
+    }
+
+    /// A dirty file's tab keeps its width on Croft Loch: the dot moves from
+    /// the label into the close slot, turns back into the cross under the
+    /// pointer, and the label the menus read still carries it.
+    #[test]
+    fn a_loch_dirty_tab_shows_its_dot_in_the_close_slot_without_moving() {
+        let (mut t, _) = loch_tab_pair(true);
+        let clean = t.tab_screen_x(0).unwrap();
+        t.editors[0].dirty = true;
+        let mut buf = Buffer::empty(Rect::new(0, 0, 80, 10));
+        let area = buf.area;
+        (&mut t).render(area, &mut buf);
+        assert_eq!(t.tab_screen_x(0).unwrap(), clean, "no width jump");
+        let c0 = t.close_screen_x(0).unwrap();
+        assert_eq!(buf[(c0, 0)].symbol(), "\u{25cf}");
+        assert_eq!(
+            buf[(clean.0 + 3, 0)].symbol(),
+            "f",
+            "no dot before the label"
+        );
+        assert!(t.tab_display_label(0).starts_with("\u{25cf} "));
+        t.hover_pointer = Some((clean.0 + 3, 0));
+        let mut buf = Buffer::empty(area);
+        (&mut t).render(area, &mut buf);
+        assert_eq!(buf[(c0, 0)].symbol(), "\u{2715}", "the cross on hover");
+        // A boxed theme keeps the dot in front of the label.
+        for ed in t.editors.iter_mut() {
+            ed.theme = crate::theme::Theme::BLACK;
+        }
+        t.hover_pointer = None;
+        let mut buf = Buffer::empty(area);
+        (&mut t).render(area, &mut buf);
+        assert_eq!(
+            buf[(t.tab_screen_x(0).unwrap().0 + 1, 0)].symbol(),
+            "\u{25cf}"
+        );
+    }
+
+    /// Hover on Croft Loch is a neutral lift: the hovered tab's label rises
+    /// to body text on the chrome's hover tone, and the close pill is a
+    /// neutral step above it, never the teal.
+    #[test]
+    fn a_loch_hover_is_a_neutral_lift() {
+        let theme = crate::theme::Theme::default();
+        let s = crate::widgets::surface::tones(theme).unwrap();
+        assert_eq!(theme.tab_hover_bg(), s.hover_on(s.chrome));
+        assert_ne!(theme.tab_close_pill_bg(), theme.tab_hover_bg());
+        assert_ne!(theme.tab_close_pill_bg(), theme.tab_active_bg());
+        let (mut t, _) = loch_tab_pair(true);
+        let (x0, _) = t.tab_screen_x(0).unwrap();
+        t.hover_pointer = Some((x0 + 3, 0));
+        let mut buf = Buffer::empty(Rect::new(0, 0, 80, 10));
+        let area = buf.area;
+        (&mut t).render(area, &mut buf);
+        assert_eq!(buf[(x0 + 3, 0)].fg, s.text());
+        assert_eq!(buf[(x0 + 1, 0)].bg, theme.tab_hover_bg());
+        assert_eq!(
+            buf[(t.close_screen_x(0).unwrap(), 0)].fg,
+            s.muted(),
+            "a hovered tab's cross comes forward"
+        );
+    }
+
+    /// Croft Loch's breadcrumbs are in its inks: faint separators, muted
+    /// crumbs, the last one in body text, and a crumb's icon drawn before
+    /// its label without joining the label's hit range.
+    #[test]
+    fn loch_breadcrumbs_lead_to_the_last_crumb_with_icons_outside_the_hit_range() {
+        let s = crate::widgets::surface::tones(crate::theme::Theme::default()).unwrap();
+        let mut tabs = EditorTabs::new();
+        tabs.breadcrumbs = vec![
+            Crumb {
+                label: "src".into(),
+                target: None,
+                icon: None,
+            },
+            Crumb {
+                label: "m.rs".into(),
+                target: None,
+                icon: Some(('R', Color::Rgb(0xde, 0xa5, 0x84))),
+            },
+            Crumb {
+                label: "build".into(),
+                target: Some((5, 2)),
+                icon: Some(('F', Color::Rgb(0xb1, 0x80, 0xd7))),
+            },
+        ];
+        let area = Rect::new(0, 0, 60, 10);
+        let mut buf = Buffer::empty(area);
+        (&mut tabs).render(area, &mut buf);
+        let row: String = (0..area.width).map(|x| buf[(x, 1)].symbol()).collect();
+        assert!(
+            row.starts_with(" src \u{203a} R m.rs \u{203a} F build"),
+            "{row:?}"
+        );
+        let sep = row.find('\u{203a}').unwrap();
+        let sep_x = row[..sep].chars().count() as u16;
+        assert_eq!(buf[(sep_x, 1)].fg, s.faint());
+        assert_eq!(buf[(1, 1)].fg, s.muted(), "a path crumb is muted");
+        let (fx, fw, _) = tabs.breadcrumb_ranges[1];
+        assert_eq!(buf[(fx, 1)].symbol(), "m");
+        assert_eq!(fw, 4, "the hit range is the label alone");
+        assert_eq!(buf[(fx - 2, 1)].symbol(), "R");
+        let theme = crate::theme::Theme::default();
+        assert_eq!(buf[(fx - 2, 1)].fg, theme.ui(Color::Rgb(0xde, 0xa5, 0x84)));
+        let (lx, _, target) = tabs.breadcrumb_ranges[2];
+        assert_eq!(target, Some((5, 2)));
+        assert_eq!(
+            buf[(lx, 1)].fg,
+            s.text(),
+            "the crumb you are in reads first"
+        );
+        // A boxed theme draws no icons.
+        for ed in tabs.editors.iter_mut() {
+            ed.theme = crate::theme::Theme::BLACK;
+        }
+        let mut buf = Buffer::empty(area);
+        (&mut tabs).render(area, &mut buf);
+        let row: String = (0..area.width).map(|x| buf[(x, 1)].symbol()).collect();
+        assert!(
+            row.starts_with(" src \u{203a} m.rs \u{203a} build"),
+            "{row:?}"
+        );
+    }
+
+    /// The seam under Croft Loch's header is always drawn: the plain
+    /// hairline while the editor is unfocused or a modal quick input has the
+    /// keyboard, the accent lip while it has the keyboard itself.
+    #[test]
+    fn a_loch_editor_always_draws_its_top_seam_and_lights_it_with_the_keyboard() {
+        let theme = crate::theme::Theme::default();
+        let s = crate::widgets::surface::tones(theme).unwrap();
+        let area = Rect::new(0, 0, 30, 6);
+        let top = |e: &mut Editor| {
+            let mut buf = Buffer::empty(area);
+            (&mut *e).render(area, &mut buf);
+            (buf[(0, 0)].symbol().to_string(), buf[(0, 0)].fg)
+        };
+        let mut e = editor_with("a\nb");
+        e.focused = false;
+        assert_eq!(top(&mut e), ("\u{2594}".to_string(), s.hairline()));
+        e.focused = true;
+        assert_eq!(top(&mut e), ("\u{2594}".to_string(), s.accent()));
+        e.overlay_has_keyboard = true;
+        assert_eq!(top(&mut e), ("\u{2594}".to_string(), s.hairline()));
+        assert!(e.focused, "the modal leaves focus where it was");
+    }
+
+    /// Croft Loch keeps an expanded fold's chevron out of the gutter until
+    /// the caret is on its line or the pointer is over the gutter; a
+    /// collapsed fold's chevron always shows, in the muted ink.
+    #[test]
+    fn loch_fold_chevrons_wait_for_the_caret_or_the_pointer() {
+        let s = crate::widgets::surface::tones(crate::theme::Theme::default()).unwrap();
+        let mut e = editor_with("fn a() {\n    x\n}\nfn b() {\n    y\n}");
+        e.cursor_row = 1;
+        let area = Rect::new(0, 0, 30, 10);
+        let chevrons = |e: &mut Editor| -> Vec<String> {
+            let mut buf = Buffer::empty(area);
+            (&mut *e).render(area, &mut buf);
+            let x = e.last_inner.x + 1;
+            (0..6)
+                .map(|r| buf[(x, e.last_inner.y + r)].symbol().to_string())
+                .collect()
+        };
+        assert!(e.is_foldable(0) && e.is_foldable(3));
+        let quiet = chevrons(&mut e);
+        assert_eq!(quiet[0], " ", "no chevron off the caret's line");
+        assert_eq!(quiet[3], " ");
+        e.cursor_row = 0;
+        assert_eq!(chevrons(&mut e)[0], "\u{25be}", "the caret's line shows it");
+        assert_eq!(chevrons(&mut e)[3], " ");
+        e.cursor_row = 1;
+        e.pointer = Some((e.last_inner.x, e.last_inner.y + 4));
+        let hovered = chevrons(&mut e);
+        assert_eq!(
+            (hovered[0].as_str(), hovered[3].as_str()),
+            ("\u{25be}", "\u{25be}")
+        );
+        e.pointer = None;
+        e.toggle_fold(3);
+        let mut buf = Buffer::empty(area);
+        (&mut e).render(area, &mut buf);
+        let cell = &buf[(e.last_inner.x + 1, e.last_inner.y + 3)];
+        assert_eq!(cell.symbol(), "\u{25b8}", "a collapsed fold always shows");
+        assert_eq!(cell.fg, s.muted());
     }
 
     /// The ten manifest themes recolor the editor body; the tab strip must
@@ -41689,14 +42220,17 @@ mod tests {
             Crumb {
                 label: "src".into(),
                 target: None,
+                icon: None,
             },
             Crumb {
                 label: "m.rs".into(),
                 target: None,
+                icon: None,
             },
             Crumb {
                 label: "build".into(),
                 target: Some((5, 2)),
+                icon: None,
             },
         ];
         let area = Rect {
@@ -41728,10 +42262,12 @@ mod tests {
             Crumb {
                 label: "文档文档".into(),
                 target: None,
+                icon: None,
             },
             Crumb {
                 label: "build".into(),
                 target: Some((5, 2)),
+                icon: None,
             },
         ];
         let area = Rect {
