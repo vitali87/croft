@@ -6976,9 +6976,29 @@ const LOCH_WELCOME_CARD_FRAME: u16 = 5;
 /// enough that the pill never looks like part of the name.
 const WELCOME_VERSION_GAP: u16 = 2;
 
-/// The least room between a Start row's label and its keycaps, so the
-/// widest row still reads as a label and a chord, not one run of text.
+/// The room between the widest Start label and the keycaps' column, so the
+/// widest row still reads as a label and a chord, not one run of text, while
+/// every chord stays close enough to pair with its label.
 const WELCOME_START_KEY_GAP: u16 = 4;
+
+/// Croft Loch's Start list columns, from its widest label and widest
+/// keycaps: where the keycaps start, as an offset from the list's left edge
+/// (one fixed column [`WELCOME_START_KEY_GAP`] cells past the widest label,
+/// so each chord sits beside its label and the chords line up), and the
+/// list's width, only what the labels and keycaps need. Spreading the list
+/// over the card's whole text column left the chords some seventy cells
+/// from their labels, where nothing tied a chord to its row.
+fn welcome_start_columns(label_w: u16, caps_w: u16) -> (u16, u16) {
+    let keys_dx = label_w + WELCOME_START_KEY_GAP;
+    (
+        keys_dx,
+        if caps_w > 0 {
+            keys_dx + caps_w
+        } else {
+            label_w
+        },
+    )
+}
 
 /// Where Croft Loch's welcome stack puts each block, in rows from the top of
 /// the welcome area. Computed by [`loch_welcome_plan`].
@@ -19626,22 +19646,26 @@ impl App {
             Vec::new()
         };
 
-        // The Start list's column is the release card's text column, so
-        // "Start" and "What's new" share a left edge and every chord ends
-        // where the card's version does; in an editor too narrow for that,
-        // just wide enough for the widest label, a gap and the widest
-        // keycaps, centred all the same. It shows only where the column and
-        // a cell of hover lift either side fit the area.
+        // The Start list hangs from the release card's text column, so
+        // "Start" and "What's new" share a left edge, and is only as wide as
+        // its labels and keycaps need, the keycaps in one column a fixed gap
+        // past the widest label ([`welcome_start_columns`]). Where the
+        // card's column cannot hold it, it centres on the axis instead. It
+        // shows only where it and a cell of hover lift either side fit.
         let start_rows = self.welcome_start_rows();
-        let start_col_w = start_rows
+        let start_label_w = start_rows
             .iter()
-            .map(|(label, chord, _)| {
-                let caps = ratatui::text::Line::from(keycap_spans(chord, t, t.canvas(), false));
-                label.chars().count() as u16 + WELCOME_START_KEY_GAP + caps.width() as u16
+            .map(|(label, _, _)| label.chars().count() as u16)
+            .max()
+            .unwrap_or(0);
+        let start_caps_w = start_rows
+            .iter()
+            .map(|(_, chord, _)| {
+                ratatui::text::Line::from(keycap_spans(chord, t, t.canvas(), false)).width() as u16
             })
             .max()
-            .unwrap_or(0)
-            .max(card_inner_w);
+            .unwrap_or(0);
+        let (start_keys_dx, start_col_w) = welcome_start_columns(start_label_w, start_caps_w);
         let start_fits = start_col_w + 2 <= area.width;
         let tour_offered = !self.tour_done && self.tour.is_none();
         let plan = loch_welcome_plan(
@@ -19760,22 +19784,29 @@ impl App {
             );
         }
 
-        // The Start list: a muted heading, then one row per action, its
-        // label in the body ink and its chord as keycaps ending on the
-        // column's right edge, read from the keymap as the palette reads
-        // it. A row lifts under the pointer (a cell of lift either side of
-        // the column) and runs its action on a click.
+        // The Start list: a heading in the strong ink (a heading outranks the
+        // rows it heads), then one row per action, its label in the body ink
+        // and its chord as keycaps in the list's keycap column, read from
+        // the keymap as the palette reads it. A row lifts under the pointer
+        // (a cell of lift either side of the list) and runs its action on a
+        // click; the lift is the row's click rect.
         if let Some(start_y) = plan.start_y {
             let start_y = area.y + start_y;
-            // Centred, this is exactly the card's text column when it is
-            // that wide (the card insets `width / 8 + 2` on either side).
-            let col_x = area.x + (area.width - start_col_w) / 2;
+            // The card's text column starts two cells into the card (its
+            // rim and a cell of inset); with no card under it, or a card too
+            // narrow to hold the list, the list centres on the axis.
+            let card_text_x = block_left + 2;
+            let col_x = if plan.notes > 0 && start_col_w <= card_inner_w {
+                card_text_x
+            } else {
+                area.x + (area.width - start_col_w) / 2
+            };
             let buf = frame.buffer_mut();
             buf.set_string(
                 col_x,
                 start_y,
                 "Start",
-                Style::default().fg(t.muted()).add_modifier(Modifier::BOLD),
+                Style::default().fg(t.strong()).add_modifier(Modifier::BOLD),
             );
             for (i, (label, chord, action)) in start_rows.iter().enumerate() {
                 let y = start_y + 1 + i as u16;
@@ -19803,7 +19834,7 @@ impl App {
                 if !chord.is_empty() {
                     let caps = ratatui::text::Line::from(keycap_spans(chord, t, row_bg, false));
                     let caps_w = caps.width() as u16;
-                    buf.set_line(col_x + start_col_w - caps_w, y, &caps, caps_w);
+                    buf.set_line(col_x + start_keys_dx, y, &caps, caps_w);
                 }
                 match action {
                     Some(action) => self.welcome.push_start_row(row, *action),
@@ -19864,8 +19895,9 @@ impl App {
         crate::widgets::surface::paint_quiet_frame(buf, box_rect, self.theme);
         let inner_x = box_rect.x + 2;
         let header_y = box_rect.y + 1;
-        // "What's new" in the muted ink, the version it describes
-        // right-aligned and quieter still, said once.
+        // "What's new" in the strong ink, bold, so the heading outranks the
+        // notes under it; the version it describes right-aligned in the
+        // muted ink, metadata said once.
         let unreleased = crate::release_notes::unreleased();
         let heading = if unreleased {
             "What's new in this build"
@@ -19882,7 +19914,7 @@ impl App {
             header_y,
             heading,
             usize::from(card_inner_w),
-            Style::default().fg(t.muted()).add_modifier(Modifier::BOLD),
+            Style::default().fg(t.strong()).add_modifier(Modifier::BOLD),
         );
         let (heading_w, card_version_w) = (
             heading.chars().count() as u16,
@@ -24260,6 +24292,7 @@ impl App {
             self.tree.hover_pointer = panel_pointer;
             self.search.hover_pointer = panel_pointer;
             self.source_control.hover_pointer = panel_pointer;
+            self.run_debug.hover_pointer = panel_pointer;
             self.remote.hover_pointer = panel_pointer;
             self.outline.hover_pointer = panel_pointer;
             self.open_editors.hover_pointer = panel_pointer;

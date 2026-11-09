@@ -59,18 +59,17 @@ impl NoteKind {
 
     /// The gutter mark and its tint on `theme`. A boxed theme keeps the
     /// rocket and the bug ([`Self::icon`], [`Self::color`]). A `surfaces`
-    /// theme (Croft Loch) marks a feature with a `+` in a softened accent and
-    /// a fix with a muted bullet: typographic marks rather than emoji, and a
-    /// fix no longer wears a bug beside every line of the release.
+    /// theme (Croft Loch) marks a feature with a `+` and a fix with a bullet,
+    /// both in the muted ink: typographic marks rather than emoji, a fix no
+    /// longer wears a bug beside every line of the release, and a feature's
+    /// mark is not teal, since the accent means focus and selection alone
+    /// and a bullet is decoration.
     pub fn marker_for(self, theme: crate::theme::Theme) -> (&'static str, Color) {
         let Some(t) = crate::widgets::surface::tones(theme) else {
             return (self.icon(), self.color());
         };
         match self {
-            Self::Feature => (
-                "+",
-                crate::gradient::rgb_color(crate::gradient::lerp_rgb(t.accent, t.text, 0.25)),
-            ),
+            Self::Feature => ("+", t.muted()),
             Self::Fix => ("\u{2022}", t.muted()),
         }
     }
@@ -351,12 +350,13 @@ mod tests {
     }
 
     /// Croft Loch marks the notes with typographic marks, not emoji: a `+`
-    /// for a feature, a muted bullet for a fix. Croft Black keeps its icons.
+    /// for a feature, a bullet for a fix, both in the muted ink (never the
+    /// accent, which is for focus and selection). Croft Black keeps its icons.
     #[test]
     fn croft_loch_marks_notes_with_a_plus_and_a_bullet() {
         let loch = crate::theme::Theme::LOCH;
         let t = crate::widgets::surface::tones(loch).unwrap();
-        assert_eq!(NoteKind::Feature.marker_for(loch).0, "+");
+        assert_eq!(NoteKind::Feature.marker_for(loch), ("+", t.muted()));
         assert_eq!(NoteKind::Fix.marker_for(loch), ("\u{2022}", t.muted()));
         let black = crate::theme::Theme::BLACK;
         assert_eq!(

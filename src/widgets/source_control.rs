@@ -986,12 +986,14 @@ impl SourceControlPanel {
         y
     }
 
-    /// Croft Loch's Commit split button: two soft slabs, Commit and its
-    /// dropdown caret, rounded only on their outer ends and joined across
-    /// the one-cell gap between their click targets by the same slab with a
-    /// thin darker seam on the label row, so it reads as one button with a
-    /// second action rather than two blocks. Each half lifts on its own
-    /// under the pointer.
+    /// Croft Loch's Commit split button: one pill on the middle row of its
+    /// click targets (the rows above and below stay chrome), Commit and its
+    /// dropdown caret capped only on their outer ends. The one-cell gap
+    /// between the two click targets carries a thin darker seam at its left
+    /// edge and belongs to the caret half's face, so it reads as one button
+    /// with a second action rather than two blocks, and the chevron centres
+    /// in the face right of the seam. Each half lifts on its own under the
+    /// pointer; the gap lifts with the caret it is painted as.
     fn render_soft_split_button(&self, buf: &mut Buffer, main: Rect, caret: Rect) {
         use crate::widgets::surface::{CHEVRON_UNFOLDED, paint_soft_button};
         let (fill, fg) = primary_button_colors(self.theme, self.focus_gradient);
@@ -1003,30 +1005,44 @@ impl SourceControlPanel {
             }
         };
         let (main_fill, caret_fill) = (lift(main), lift(caret));
-        paint_soft_button(buf, main, main_fill, true, false);
-        paint_soft_button(buf, caret, caret_fill, false, true);
+        let main_face = paint_soft_button(buf, main, main_fill, true, false);
+        let caret_face = paint_soft_button(buf, caret, caret_fill, false, true);
         let gap = Rect {
             x: main.right(),
             width: caret.x.saturating_sub(main.right()),
             ..main
         };
+        let mut caret_label = caret_face;
         if gap.width > 0 {
-            paint_soft_button(buf, gap, fill, false, false);
-            if let Color::Rgb(r, g, b) = fill {
+            let gap_face = paint_soft_button(buf, gap, caret_fill, false, false);
+            if let Color::Rgb(r, g, b) = fill
+                && gap_face.width > 0
+            {
                 let seam = crate::gradient::rgb_color(crate::gradient::lerp_rgb(
                     (r, g, b),
                     (0, 0, 0),
                     0.45,
                 ));
-                for x in gap.left()..gap.right() {
-                    buf[(x, gap.y + gap.height / 2)]
-                        .set_symbol("\u{258f}")
-                        .set_fg(seam);
-                }
+                buf[(gap_face.x, gap_face.y)]
+                    .set_symbol("\u{258f}")
+                    .set_fg(seam);
+            }
+            if caret_face.width > 0 && gap_face.width > 0 {
+                caret_label = Rect {
+                    x: gap_face.x,
+                    width: gap_face.width + caret_face.width,
+                    ..caret_face
+                };
             }
         }
-        paint_button_label(buf, main, "\u{eab2} Commit", main_fill, fg);
-        paint_button_label(buf, caret, &CHEVRON_UNFOLDED.to_string(), caret_fill, fg);
+        paint_button_label(buf, main_face, "\u{eab2} Commit", main_fill, fg);
+        paint_button_label(
+            buf,
+            caret_label,
+            &CHEVRON_UNFOLDED.to_string(),
+            caret_fill,
+            fg,
+        );
     }
 
     /// Map a click to the repositories-overview row it landed on (#161).
@@ -1479,10 +1495,12 @@ fn paint_button_label(buf: &mut Buffer, area: Rect, label: &str, bg: Color, fg: 
 
 /// The primary button every view draws (Commit, Initialize, Open, Run and
 /// Debug). A boxed theme gets [`render_rounded_button`]. Under a `surfaces`
-/// theme it is a soft slab ([`crate::widgets::surface::paint_soft_button`]):
-/// half-block caps make the three-row target read two rows tall with
-/// notched corners instead of drawing `╭╮╰╯` arcs on the chrome, and the
-/// pointer lifts it a step. The click target is the full `area` either way.
+/// theme it is a pill ([`crate::widgets::surface::paint_soft_button`]): one
+/// face row with half-block caps on the middle row of the three-row target,
+/// the rows above and below left as the surface it sits on, instead of
+/// drawing `╭╮╰╯` arcs on the chrome; the label centres between the caps
+/// and the pointer lifts the face a step. The click target is the full
+/// `area` either way, so the press area stays as generous as the box's.
 pub fn render_button(
     buf: &mut Buffer,
     area: Rect,
@@ -1500,8 +1518,8 @@ pub fn render_button(
         return;
     }
     let fill = if hovered { lift_button(bg) } else { bg };
-    crate::widgets::surface::paint_soft_button(buf, area, fill, true, true);
-    paint_button_label(buf, area, label, fill, fg);
+    let face = crate::widgets::surface::paint_soft_button(buf, area, fill, true, true);
+    paint_button_label(buf, face, label, fill, fg);
 }
 
 fn badge_color(kind: ChangeKind, theme: crate::theme::Theme) -> Color {
@@ -3199,13 +3217,16 @@ mod tests {
         assert!(row.contains("\u{23ce} commit"), "{row:?}");
     }
 
-    /// Croft Loch's Commit is one soft split button: half-block caps make
-    /// it read two rows tall with notched outer corners, the caret half
-    /// joins it across the gap by a thin seam, and each half lifts under
-    /// the pointer. The click targets are the boxed theme's rects.
+    /// Croft Loch's Commit is one calm split pill: the face is only the
+    /// middle row of the click targets, capped with half blocks on its outer
+    /// ends, the rows above and below left as chrome (no half-block bands,
+    /// no quadrant corners); the caret half joins it across the gap behind a
+    /// thin darker seam, and each half lifts under the pointer. The click
+    /// targets are the boxed theme's rects.
     #[test]
-    fn croft_loch_commit_is_a_soft_split_button() {
+    fn croft_loch_commit_is_a_one_row_split_pill() {
         use ratatui::buffer::Buffer;
+        let t = crate::widgets::surface::tones(crate::theme::Theme::LOCH).unwrap();
         let mut p = SourceControlPanel::new();
         p.theme = crate::theme::Theme::LOCH;
         p.set_status(dummy_status_with_branch("main"), Vec::new());
@@ -3215,26 +3236,52 @@ mod tests {
         let (m, c) = (p.last_button_area, p.last_commit_caret_area);
         assert_eq!((m.height, c.x), (3, m.x + m.width + 1), "same targets");
         let teal = crate::gradient::rgb_color(crate::gradient::PRIMARY_BTN_BG);
-        assert_eq!(buf[(m.x, m.y)].symbol(), "\u{2597}", "notched outer corner");
-        assert_eq!(buf[(m.x, m.bottom() - 1)].symbol(), "\u{259d}");
-        assert_eq!(buf[(m.x + 2, m.y)].symbol(), "\u{2584}", "half-block cap");
-        assert_eq!(buf[(m.x + 2, m.y)].fg, teal);
-        assert_eq!(buf[(m.x + 2, m.bottom() - 1)].symbol(), "\u{2580}");
-        assert_eq!(buf[(m.right() - 1, m.y)].symbol(), "\u{2584}", "joined end");
-        assert_eq!(buf[(c.right() - 1, c.y)].symbol(), "\u{2596}");
-        assert_eq!(buf[(c.right() - 1, c.bottom() - 1)].symbol(), "\u{2598}");
-        assert_eq!(buf[(m.right(), m.y + 1)].symbol(), "\u{258f}", "the seam");
-        assert_eq!(buf[(m.right(), m.y + 1)].bg, teal);
-        assert_eq!(buf[(m.x + 1, m.y + 1)].bg, teal);
+        let face_y = m.y + 1;
+        // The rows above and below the face are plain chrome.
+        for y in [m.y, m.bottom() - 1] {
+            for x in m.x..c.right() {
+                assert_eq!(buf[(x, y)].symbol(), " ", "no band at ({x}, {y})");
+                assert_eq!(buf[(x, y)].bg, t.chrome(), "chrome at ({x}, {y})");
+            }
+        }
+        // The face: half-block caps on the outer ends, keeping the chrome
+        // behind their empty half, the teal face between them.
+        assert_eq!(buf[(m.x, face_y)].symbol(), "\u{2590}", "the left cap");
+        assert_eq!(buf[(m.x, face_y)].fg, teal);
+        assert_eq!(buf[(m.x, face_y)].bg, t.chrome());
+        assert_eq!(buf[(c.right() - 1, face_y)].symbol(), "\u{258c}");
+        assert_eq!(buf[(c.right() - 1, face_y)].fg, teal);
+        assert_eq!(buf[(c.right() - 1, face_y)].bg, t.chrome());
+        for x in m.x + 1..c.right() - 1 {
+            assert_eq!(buf[(x, face_y)].bg, teal, "the face at {x}");
+        }
+        assert_eq!(buf[(m.right(), face_y)].symbol(), "\u{258f}", "the seam");
+        assert_ne!(buf[(m.right(), face_y)].fg, teal, "a darker seam");
         let label: String = (m.x..m.right())
-            .map(|x| buf[(x, m.y + 1)].symbol())
+            .map(|x| buf[(x, face_y)].symbol())
             .collect();
         assert!(label.contains("Commit"), "{label:?}");
-        p.hover_pointer = Some((m.x + 1, m.y + 1));
+        assert_eq!(
+            buf[(c.x, face_y)].symbol(),
+            crate::widgets::surface::CHEVRON_UNFOLDED.to_string(),
+            "the chevron centred right of the seam"
+        );
+        p.hover_pointer = Some((m.x + 1, m.y));
         let mut buf = Buffer::empty(area);
         ratatui::widgets::Widget::render(&mut p, area, &mut buf);
-        assert_ne!(buf[(m.x + 1, m.y + 1)].bg, teal, "the hovered half lifts");
-        assert_eq!(buf[(c.x + 1, c.y + 1)].bg, teal, "the other half stays");
+        assert_ne!(buf[(m.x + 1, face_y)].bg, teal, "the hovered half lifts");
+        assert_eq!(buf[(c.x + 1, face_y)].bg, teal, "the other half stays");
+        assert_eq!(buf[(m.x + 1, m.y)].bg, t.chrome(), "only the face lifts");
+        p.hover_pointer = Some((c.x + 1, c.bottom() - 1));
+        let mut buf = Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut p, area, &mut buf);
+        assert_eq!(buf[(m.x + 1, face_y)].bg, teal);
+        assert_ne!(buf[(c.x, face_y)].bg, teal, "the caret half lifts");
+        assert_eq!(
+            buf[(m.right(), face_y)].bg,
+            buf[(c.x, face_y)].bg,
+            "the seam cell lifts with the caret it belongs to"
+        );
     }
 
     /// Croft Loch's change list: a hairline above it, the file name in body
@@ -3643,6 +3690,49 @@ mod tests {
             !trimmed.is_empty() && trimmed.chars().any(|c| c.is_alphabetic()),
             "init-repo button row must carry a visible label, got {row:?}"
         );
+    }
+
+    /// Croft Loch's Initialize Repository button is the same one-row pill
+    /// as Commit: a teal face between half-block caps on its middle row, on
+    /// the raised card, whose rows above and below stay the card; the whole
+    /// three-row rect still answers the click and lifts the face on hover.
+    #[test]
+    fn croft_loch_initialize_button_is_a_one_row_pill_on_the_card() {
+        use crate::git::GitStatus;
+        let t = crate::widgets::surface::tones(crate::theme::Theme::LOCH).unwrap();
+        let teal = crate::gradient::rgb_color(crate::gradient::PRIMARY_BTN_BG);
+        let mut p = SourceControlPanel::new();
+        p.theme = crate::theme::Theme::LOCH;
+        p.status = GitStatus::default();
+        let area = Rect::new(0, 0, 40, 40);
+        let mut buf = Buffer::empty(area);
+        (&mut p).render(area, &mut buf);
+        let b = p.last_init_repo_button_area;
+        assert_eq!(b.height, 3, "the three-row target");
+        let face_y = b.y + 1;
+        assert_eq!(buf[(b.x, face_y)].symbol(), "\u{2590}");
+        assert_eq!(buf[(b.x, face_y)].bg, t.raised(), "the cap on the card");
+        assert_eq!(buf[(b.right() - 1, face_y)].symbol(), "\u{258c}");
+        assert_eq!(buf[(b.x + 1, face_y)].bg, teal);
+        let label: String = (b.x..b.right())
+            .map(|x| buf[(x, face_y)].symbol())
+            .collect();
+        assert!(label.contains("Initialize"), "{label:?}");
+        for y in [b.y, b.bottom() - 1] {
+            for x in b.x..b.right() {
+                assert_eq!(buf[(x, y)].symbol(), " ", "no band at ({x}, {y})");
+                assert_eq!(buf[(x, y)].bg, t.raised(), "the card at ({x}, {y})");
+            }
+        }
+        assert!(
+            p.click_init_repo_button(b.x, b.y),
+            "the top row still clicks"
+        );
+        p.hover_pointer = Some((b.x + 2, b.bottom() - 1));
+        let mut buf = Buffer::empty(area);
+        (&mut p).render(area, &mut buf);
+        assert_ne!(buf[(b.x + 1, face_y)].bg, teal, "the face lifts");
+        assert_eq!(buf[(b.x + 1, b.y)].bg, t.raised(), "only the face");
     }
 
     #[test]

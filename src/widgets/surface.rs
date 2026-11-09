@@ -531,49 +531,52 @@ pub fn paint_field(buf: &mut Buffer, rect: Rect, t: Tones, edge: Color) {
     }
 }
 
-/// A button's slab on a `surfaces` theme: a `fill`-coloured body whose first
-/// and last rows are half blocks (`▄` over, `▀` under), so a three-row
-/// button reads two rows tall, centred on its label row, with quadrant
-/// notches (`▗▖▝▘`) softening the corners on the ends that are `round`.
-/// An unrounded end is where a split button's halves join. A button shorter
-/// than three rows is a plain slab. The click target stays the full `area`.
+/// A button's face on a `surfaces` theme: one row, `area`'s middle (the row
+/// its label sits on), filled with `fill` and ended by half-block caps (`▐`
+/// on the left, `▌` on the right) on the ends that are `round`, so it reads
+/// as a calm pill. The rows above and below stay the surface it sits on: a
+/// three-row slab with half-block bands and quadrant corners read as a lumpy
+/// cross, its middle row wider than the bands, and terminals leave a thin
+/// gap between a band and the row under it. An unrounded end is where a
+/// split button's halves join, so the face runs to the cell edge there.
+/// The click target stays the full `area`; only what is painted is calmer.
+/// Returns the face's cells between the caps, where a label centres.
 pub fn paint_soft_button(
     buf: &mut Buffer,
     area: Rect,
     fill: Color,
     round_left: bool,
     round_right: bool,
-) {
+) -> Rect {
     let area = area.intersection(buf.area);
     if area.width == 0 || area.height == 0 {
-        return;
+        return Rect::default();
     }
-    buf.set_style(
-        Rect {
-            y: area.y + u16::from(area.height >= 3),
-            height: area.height - 2 * u16::from(area.height >= 3),
-            ..area
-        },
-        Style::default().bg(fill),
-    );
     for y in area.top()..area.bottom() {
         for x in area.left()..area.right() {
             buf[(x, y)].set_symbol(" ");
         }
     }
-    if area.height < 3 {
-        return;
+    // Caps only where a face cell is left between them: a sliver of a
+    // button is a plain slab rather than two caps with nothing inside.
+    let (left, right) = (u16::from(round_left), u16::from(round_right));
+    let (left, right) = if area.width > left + right {
+        (left, right)
+    } else {
+        (0, 0)
+    };
+    let y = area.y + area.height / 2;
+    let face = Rect::new(area.x + left, y, area.width - left - right, 1);
+    buf.set_style(face, Style::default().bg(fill));
+    if left > 0 {
+        buf[(area.x, y)].set_symbol("\u{2590}").set_fg(fill);
     }
-    let (right, bottom) = (area.right() - 1, area.bottom() - 1);
-    for x in area.left()..=right {
-        let (top, under) = match (x == area.x && round_left, x == right && round_right) {
-            (true, _) => ("\u{2597}", "\u{259d}"),
-            (_, true) => ("\u{2596}", "\u{2598}"),
-            _ => ("\u{2584}", "\u{2580}"),
-        };
-        buf[(x, area.y)].set_symbol(top).set_fg(fill);
-        buf[(x, bottom)].set_symbol(under).set_fg(fill);
+    if right > 0 {
+        buf[(area.right() - 1, y)]
+            .set_symbol("\u{258c}")
+            .set_fg(fill);
     }
+    face
 }
 
 /// The block a pane renders under a `surfaces` theme: the same one-cell
@@ -1208,26 +1211,37 @@ mod tests {
         assert_eq!(buf[(0, 1)].fg, t.rim());
     }
 
-    /// A soft button is three rows whose caps are half blocks, so it reads
-    /// two rows tall; only its rounded ends take the quadrant notches.
+    /// A soft button is a one-row pill on its middle row: half-block caps on
+    /// its rounded ends, the face between them, and the rows above and below
+    /// left as the surface under it (no bands, no quadrant corners).
     #[test]
-    fn a_soft_button_has_half_block_caps_and_notched_round_ends() {
+    fn a_soft_button_is_a_one_row_pill_with_half_block_caps() {
         let fill = Color::Rgb(0x0e, 0x7e, 0x76);
         let mut buf = Buffer::empty(Rect::new(0, 0, 5, 3));
         let area = buf.area;
-        paint_soft_button(&mut buf, area, fill, true, false);
+        let face = paint_soft_button(&mut buf, area, fill, true, false);
+        assert_eq!(face, Rect::new(1, 1, 4, 1), "the cells between the caps");
         let rows: Vec<String> = (0..3)
             .map(|y| (0..5).map(|x| buf[(x, y)].symbol()).collect())
             .collect();
-        assert_eq!(rows[0], "\u{2597}\u{2584}\u{2584}\u{2584}\u{2584}");
-        assert_eq!(rows[2], "\u{259d}\u{2580}\u{2580}\u{2580}\u{2580}");
-        assert_eq!(buf[(1, 0)].fg, fill);
+        assert_eq!(rows, ["     ", "\u{2590}    ", "     "]);
+        for x in 0..5 {
+            for y in [0, 2] {
+                assert_eq!(buf[(x, y)].bg, Color::Reset, "plain surface at ({x}, {y})");
+            }
+        }
+        assert_eq!(buf[(0, 1)].fg, fill);
         assert_eq!(
-            buf[(1, 0)].bg,
+            buf[(0, 1)].bg,
             Color::Reset,
             "the cap keeps what is under it"
         );
-        assert_eq!(buf[(2, 1)].bg, fill);
+        assert_eq!(buf[(4, 1)].bg, fill, "an unrounded end runs to the edge");
+        let mut buf = Buffer::empty(Rect::new(0, 0, 5, 3));
+        let face = paint_soft_button(&mut buf, area, fill, true, true);
+        assert_eq!(face, Rect::new(1, 1, 3, 1));
+        assert_eq!(buf[(4, 1)].symbol(), "\u{258c}");
+        assert_eq!(buf[(4, 1)].bg, Color::Reset);
     }
 
     /// A find match on Croft Loch is a calm amber tint of its own surface,

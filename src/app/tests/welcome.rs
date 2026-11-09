@@ -635,8 +635,9 @@ fn croft_loch_welcome_is_padding_on_the_canvas_with_the_boxed_inset() {
 }
 
 /// Croft Loch's release card: a raised surface with a quiet rim, headed
-/// "What's new" in the muted ink with the version right-aligned, its notes
-/// marked `+` (feature) and `•` (fix) rather than a rocket and a bug.
+/// "What's new" in the strong ink, bold (a heading outranks its notes), with
+/// the version right-aligned in the muted ink, its notes marked `+`
+/// (feature) and `•` (fix) in the muted ink rather than a rocket and a bug.
 #[test]
 fn croft_loch_release_card_is_a_raised_surface_with_quiet_marks() {
     let t = crate::widgets::surface::tones(crate::theme::Theme::LOCH).unwrap();
@@ -660,7 +661,12 @@ fn croft_loch_release_card_is_a_raised_surface_with_quiet_marks() {
         panic!("{needle} not on screen");
     };
     let (hx, hy) = find("What's new");
-    assert_eq!(buf[(hx, hy)].fg, t.muted());
+    assert_eq!(
+        buf[(hx, hy)].fg,
+        t.strong(),
+        "the heading outranks the notes"
+    );
+    assert!(buf[(hx, hy)].modifier.contains(Modifier::BOLD));
     assert_eq!(buf[(hx, hy)].bg, t.raised(), "on the raised card");
     let header: String = (0..area.width).map(|x| buf[(x, hy)].symbol()).collect();
     let version = format!("v{}", env!("CARGO_PKG_VERSION"));
@@ -671,6 +677,7 @@ fn croft_loch_release_card_is_a_raised_surface_with_quiet_marks() {
     assert_eq!(buf[(vx, hy)].fg, t.muted());
     let (fx, fy) = find("Did a new thing");
     assert_eq!(buf[(fx - 2, fy)].symbol(), "+");
+    assert_eq!(buf[(fx - 2, fy)].fg, t.muted(), "a muted mark, not teal");
     assert_eq!(buf[(fx, fy)].fg, t.text());
     let (bx, by) = find("Fixed an old thing");
     assert_eq!(buf[(bx - 2, by)].symbol(), "\u{2022}");
@@ -756,6 +763,127 @@ fn croft_loch_welcome_start_list_shows_keycaps_and_runs_on_click() {
         !app.click_welcome_start(go.x + 3, go.y + 30),
         "not on a row"
     );
+}
+
+/// Croft Loch's Start list pairs each chord with its label: the list hangs
+/// from the card's text column, its keycaps in one column four cells past
+/// the widest label, and it is only as wide as that, not the card's whole
+/// column. Each row's lift and click rect is the painted list and a cell
+/// either side, nothing more. "Start" is a heading in the strong ink, bold.
+#[test]
+fn croft_loch_start_keycaps_sit_in_one_column_beside_the_labels() {
+    let t = crate::widgets::surface::tones(crate::theme::Theme::LOCH).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.welcome.set_test_notes(long_test_note());
+    app.tour_done = false;
+    let (w, h) = (120u16, 50u16);
+    let draw = |app: &mut App| {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+        term.draw(|f| app.render_welcome(f, Rect::new(0, 0, w, h)))
+            .unwrap();
+        term.backend().buffer().clone()
+    };
+    let buf = draw(&mut app);
+    // One char per cell, so a char index is a column.
+    let rows: Vec<String> = (0..h)
+        .map(|y| {
+            (0..w)
+                .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
+                .collect()
+        })
+        .collect();
+    let row_of = |needle: &str| {
+        rows.iter()
+            .position(|r| r.contains(needle))
+            .unwrap_or_else(|| panic!("{needle:?} on screen:\n{}", rows.join("\n"))) as u16
+    };
+    let col = |y: u16, needle: &str| -> u16 {
+        let r = &rows[y as usize];
+        r[..r.find(needle).unwrap()].chars().count() as u16
+    };
+    let start = row_of("Start   ");
+    let x0 = col(start, "Start");
+    assert_eq!(
+        buf[(x0, start)].fg,
+        t.strong(),
+        "the heading outranks its rows"
+    );
+    assert!(buf[(x0, start)].modifier.contains(Modifier::BOLD));
+    let card = row_of("What's new");
+    assert_eq!(col(card, "What's new"), x0, "the card's text column");
+
+    let widest = "Command Palette".len() as u16;
+    let keys_x = x0 + widest + 4;
+    let cap_bg = t.keycap_on(t.canvas());
+    for label in ["New File", "Go to File", "Command Palette"] {
+        let y = row_of(label);
+        assert_eq!(col(y, label), x0, "{label} on the list's edge");
+        let first_cap = (x0..w).find(|&x| buf[(x, y)].bg == cap_bg).unwrap();
+        assert_eq!(first_cap, keys_x, "{label}'s keycaps in the one column");
+        let label_end = x0 + label.len() as u16;
+        assert!(
+            (label_end..keys_x).all(|x| buf[(x, y)].symbol() == " "),
+            "only the gap between {label} and its keycaps"
+        );
+    }
+
+    // Only as wide as it needs: the row rects end a cell past the last
+    // painted keycap, well inside the card's text column.
+    let painted_right = app
+        .welcome
+        .start_rows()
+        .iter()
+        .map(|(r, _)| {
+            (x0..w)
+                .rev()
+                .find(|&x| buf[(x, r.y)].symbol() != " " || buf[(x, r.y)].bg == cap_bg)
+                .unwrap()
+                + 1
+        })
+        .max()
+        .unwrap();
+    let card_version = col(card, &format!("v{}", env!("CARGO_PKG_VERSION")));
+    assert!(
+        painted_right + 10 < card_version,
+        "the list hugs its chords"
+    );
+    let mut rects: Vec<Rect> = app.welcome.start_rows().iter().map(|(r, _)| *r).collect();
+    rects.push(app.welcome_tour_button);
+    for r in &rects {
+        assert_eq!(
+            (r.x, r.right()),
+            (x0 - 1, painted_right + 1),
+            "a row's rect is the painted list and a cell either side"
+        );
+    }
+
+    // The lift is the rect: its last cell lifts, the cell past it does not,
+    // and a click lands exactly where the lift is.
+    let palette = app
+        .welcome
+        .start_rows()
+        .iter()
+        .find(|(_, a)| *a == crate::app::welcome::StartAction::CommandPalette)
+        .unwrap()
+        .0;
+    app.pointer_cell = Some((palette.right() - 1, palette.y));
+    let buf = draw(&mut app);
+    let lift = t.hover_on(t.canvas);
+    assert_eq!(buf[(palette.x, palette.y)].bg, lift);
+    assert_eq!(buf[(palette.right() - 1, palette.y)].bg, lift);
+    assert_eq!(buf[(palette.right(), palette.y)].bg, t.canvas());
+    assert!(!app.click_welcome_start(palette.right(), palette.y));
+    assert!(app.click_welcome_start(palette.right() - 1, palette.y));
+    assert!(app.command_palette.is_some(), "the palette opened");
+}
+
+/// The Start list's columns: the keycaps a fixed gap past the widest label,
+/// and the list as wide as the labels and keycaps, or the labels alone.
+#[test]
+fn welcome_start_columns_put_the_keycaps_a_gap_past_the_widest_label() {
+    assert_eq!(welcome_start_columns(15, 20), (19, 39));
+    assert_eq!(welcome_start_columns(13, 0), (17, 13));
 }
 
 /// Five notes for the Croft Loch layout tests, each wrapping to a few rows
@@ -932,8 +1060,9 @@ fn croft_loch_version_pill_sits_two_cells_after_the_wordmark() {
 /// (an editor about twenty rows tall), Croft Loch's welcome shows the whole
 /// stack: the wordmark and version, the tagline, the Start list with the
 /// tour as its last row, and a release card shortened to whole notes with a
-/// "+N more" line, its blocks one blank row apart and centred on one axis.
-/// The Start rows answer the mouse where they are painted.
+/// "+N more" line, its blocks one blank row apart, centred on one axis but
+/// for the Start list, which hangs from the card's text column. The Start
+/// rows answer the mouse where they are painted.
 #[test]
 fn croft_loch_welcome_fits_a_short_editor_with_the_start_list() {
     let tmp = tempfile::tempdir().unwrap();
@@ -990,9 +1119,10 @@ fn croft_loch_welcome_fits_a_short_editor_with_the_start_list() {
     assert!((1..5).contains(&shown), "a shortened card: {shown} notes");
     row_of(&format!("+{} more", 5 - shown));
 
-    // One axis: the tagline, the Start column and the card centre on the
-    // same column as the wordmark-and-version group (compared doubled, as
-    // first plus last column, so an odd width needs no rounding).
+    // One axis: the tagline and the card centre on the same column as the
+    // wordmark-and-version group (compared doubled, as first plus last
+    // column, so an odd width needs no rounding). The Start list hangs from
+    // the card's text column, as asserted above.
     let version = format!("v{}", env!("CARGO_PKG_VERSION"));
     let pill_end = col(mark, &version) + version.len() as u16 + 1;
     let axis = col(mark, "cr<>ft") + pill_end;
@@ -1000,6 +1130,9 @@ fn croft_loch_welcome_fits_a_short_editor_with_the_start_list() {
     let card_version = col(card, &version) + version.len() as u16 - 1;
     let card_end = card_version + u16::from(rows[card][..].contains(&format!("{version}+")));
     let card_axis = col(card, "What's new") + card_end;
+    for (what, c) in [("tagline", tagline_axis), ("card", card_axis)] {
+        assert!(c.abs_diff(axis) <= 2, "the {what} centred: {c} vs {axis}");
+    }
     let go = app
         .welcome
         .start_rows()
@@ -1011,17 +1144,14 @@ fn croft_loch_welcome_fits_a_short_editor_with_the_start_list() {
         })
         .unwrap()
         .0;
-    let start_axis = 2 * go.x + go.width - 1;
-    for (what, c) in [
-        ("tagline", tagline_axis),
-        ("Start list", start_axis),
-        ("card", card_axis),
-    ] {
-        assert!(c.abs_diff(axis) <= 2, "the {what} centred: {c} vs {axis}");
-    }
 
     // The Start rows' hit rects are the painted rows: a real click on Go
     // to File opens the finder, and the tour row is the tour's button.
+    assert_eq!(
+        go.x,
+        col(start, "Start") - 1,
+        "a cell of lift left of the list"
+    );
     assert_eq!(go.y as usize, row_of("Go to File"));
     assert_eq!(app.welcome_tour_button.y as usize, tour);
     left_click(&mut app, go.x + 2, go.y);
