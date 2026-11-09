@@ -3533,11 +3533,17 @@ fn capture_triggers_collect_into_the_captures_panel_and_jump_to_the_line() {
 /// and assembled at runtime like the test above, so the trigger set reaches
 /// the pane first and the `▶ …` header never fires it.
 fn app_with_captures(script: &str, want: usize) -> (tempfile::TempDir, App) {
+    app_with_triggers(ERR_CAPTURE, script, want)
+}
+
+const ERR_CAPTURE: &str =
+    r#"[ { "regex": "err-(\\d+)", "action": "capture", "message": "boom \\1" } ]"#;
+
+/// [`app_with_captures`] with the pane's triggers given as JSON.
+fn app_with_triggers(triggers: &str, script: &str, want: usize) -> (tempfile::TempDir, App) {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.triggers = std::sync::Arc::new(crate::triggers::TriggerSet::from_json(
-        r#"[ { "regex": "err-(\\d+)", "action": "capture", "message": "boom \\1" } ]"#,
-    ));
+    app.triggers = std::sync::Arc::new(crate::triggers::TriggerSet::from_json(triggers));
     app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
         "/bin/sh",
         &[
@@ -3664,7 +3670,18 @@ fn app_resized_under_a_full_screen_program(
     want: usize,
     after: &str,
 ) -> (tempfile::TempDir, App) {
-    let (tmp, mut app) = app_with_captures(
+    app_resized_under_a_full_screen_program_with(ERR_CAPTURE, before, want, after)
+}
+
+/// [`app_resized_under_a_full_screen_program`] with the triggers as JSON.
+fn app_resized_under_a_full_screen_program_with(
+    triggers: &str,
+    before: &str,
+    want: usize,
+    after: &str,
+) -> (tempfile::TempDir, App) {
+    let (tmp, mut app) = app_with_triggers(
+        triggers,
         &format!(
             "{before}; printf '\\033[?1049h'; read y; printf '\\033[?1049l'; {after}; echo back"
         ),
@@ -3726,6 +3743,62 @@ fn a_resize_under_a_full_screen_program_keeps_each_capture_on_its_own_copy() {
             "entry {i} selects its own copy"
         );
     }
+}
+
+#[test]
+fn two_triggers_on_one_line_still_find_it_after_a_full_screen_resize() {
+    // Two `capture` triggers catch each copy, so each printed line has two
+    // entries; after a resize under a full-screen program each entry still
+    // counts printed lines, not entries, and selects its own copy (#1450).
+    let both = r#"[
+        { "regex": "err-(\\d+)", "action": "capture", "message": "boom \\1" },
+        { "regex": "broke", "action": "capture", "message": "broke" }
+    ]"#;
+    let (_tmp, mut app) = app_resized_under_a_full_screen_program_with(
+        both,
+        "echo ${e}-7 broke; echo first; echo ${e}-7 broke; echo second",
+        4,
+        "true",
+    );
+    for (i, next) in ["first", "first", "second", "second"]
+        .into_iter()
+        .enumerate()
+    {
+        app.captures.select_index(i);
+        app.captures_open_selected();
+        let line = app.terminals[0]
+            .selection()
+            .unwrap_or_else(|| panic!("entry {i}: {}", app.status))
+            .anchor
+            .0;
+        let (lines, top) = app.terminals[0].grid_lines();
+        assert_eq!(
+            lines[(line - top) as usize + 1].trim_end(),
+            next,
+            "entry {i} selects its own copy"
+        );
+    }
+}
+
+#[test]
+fn a_reset_after_a_full_screen_resize_drops_the_capture() {
+    // A reset (RIS) erases the screen and the scrollback. An entry whose row
+    // a full-screen resize had made unknown must then say its line is gone,
+    // not select text that starts the same and was printed after the reset
+    // without being captured (#1450).
+    let exact =
+        r#"[ { "regex": "^err-(\\d+) broke$", "action": "capture", "message": "boom \\1" } ]"#;
+    let (_tmp, mut app) = app_resized_under_a_full_screen_program_with(
+        exact,
+        "echo ${e}-7 broke",
+        1,
+        "printf '\\033c'; echo ${e}-7 broke again",
+    );
+    assert_eq!(app.captures.len(), 1, "the later line is not captured");
+    app.captures.select_index(0);
+    app.captures_open_selected();
+    assert_eq!(app.status, "Captured line is no longer in the scrollback");
+    assert!(app.terminals[0].selection().is_none());
 }
 
 #[test]

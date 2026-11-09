@@ -921,17 +921,24 @@ enum ReadStop {
 /// clock shift cannot follow, re-finds every row by its place among the
 /// lines above the cursor ([`Self::reflow`]). A row that a resize under a
 /// full-screen program re-wrapped out of sight loses its place but keeps
-/// its text, which still tells it from its repeats ([`RowAt::Unknown`]).
-/// Ids come from the process-wide [`next_mark_id`], so one never names
-/// another pane's row, and a later capture always has a larger id.
+/// its text and the serial of the printed line it is on, which still tell
+/// it from its repeats ([`RowAt::Unknown`]). Ids come from the process-wide
+/// [`next_mark_id`], so one never names another pane's row, and a later
+/// capture always has a larger id.
 #[derive(Default)]
-struct CaptureRows(std::collections::BTreeMap<u64, CapturedRow>);
+struct CaptureRows {
+    rows: std::collections::BTreeMap<u64, CapturedRow>,
+    /// Serial of the printed line the newest capture is on.
+    line: u64,
+}
 
 /// One captured line: its row, None once a resize under a full-screen
-/// program re-wrapped it out of sight, and its text.
+/// program re-wrapped it out of sight; its text; and the serial of the
+/// printed line, which two triggers that catch the same line share.
 struct CapturedRow {
     row: Option<i64>,
     text: String,
+    line: u64,
 }
 
 /// Where a capture's row is now ([`CaptureRows::line`]).
@@ -940,7 +947,7 @@ enum RowAt {
     Line(i64),
     /// Still captured, but where is unknown. Output keeps its order, so it
     /// is the match of its text this many matches up from the bottom: one
-    /// for each later capture still held that the same text matches.
+    /// for each later printed line still held that the same text matches.
     Unknown { later: usize },
 }
 
@@ -963,10 +970,20 @@ impl CaptureRows {
         }
         let id = next_mark_id();
         let row = Some(clock.tick(term) + i64::from(line));
+        // Two triggers that catch one line stop the parser at the same
+        // place, so they record the same row: one printed line, one serial.
+        if self
+            .rows
+            .last_key_value()
+            .is_none_or(|(_, last)| last.row != row)
+        {
+            self.line += 1;
+        }
         let text = text.trim_end().to_owned();
-        self.0.insert(id, CapturedRow { row, text });
-        while self.0.len() > crate::widgets::captures::CAPTURES_MAX {
-            self.0.pop_first();
+        let line = self.line;
+        self.rows.insert(id, CapturedRow { row, text, line });
+        while self.rows.len() > crate::widgets::captures::CAPTURES_MAX {
+            self.rows.pop_first();
         }
         id
     }
@@ -974,28 +991,37 @@ impl CaptureRows {
     /// Where `id`'s row is at clock reading `now`, or None once it was
     /// erased. `needle` is the text the jump looks for.
     fn line(&self, id: u64, now: i64, needle: &str) -> Option<RowAt> {
-        let captured = self.0.get(&id)?;
+        let captured = self.rows.get(&id)?;
         Some(match captured.row {
             Some(row) => RowAt::Line(row - now),
-            None => RowAt::Unknown {
-                later: self
-                    .0
+            None => {
+                // Serials rise with ids, so the later lines' come in order.
+                let mut later: Vec<u64> = self
+                    .rows
                     .range((std::ops::Bound::Excluded(id), std::ops::Bound::Unbounded))
-                    .filter(|(_, c)| c.text.starts_with(needle))
-                    .count(),
-            },
+                    .filter(|(_, c)| c.line != captured.line && c.text.starts_with(needle))
+                    .map(|(_, c)| c.line)
+                    .collect();
+                later.dedup();
+                RowAt::Unknown { later: later.len() }
+            }
         })
     }
 
     /// Drop the rows a wipe that just landed erased, `now` being the clock
     /// read right after it (the same test as [`RunningCommand::follow_wipe`]).
-    /// A row whose place is unknown stays: its text search says if it went.
+    /// A row whose place is unknown cannot be told on screen from in the
+    /// scrollback, so it goes with any wipe of the scrollback (a reset, or
+    /// the ED 3 of a `clear`, whose ED 2 has already pushed the screen
+    /// there): an entry then says its line is gone rather than taking text
+    /// printed after the wipe.
     fn follow_wipe(&mut self, wipe: Wipe, now: i64) {
-        self.0.retain(|_, captured| {
-            captured.row.is_none_or(|row| {
+        self.rows.retain(|_, captured| match captured.row {
+            Some(row) => {
                 let line = row - now;
                 !((line >= 0 && wipe.screen) || (line < 0 && wipe.hist))
-            })
+            }
+            None => !wipe.hist,
         });
     }
 
@@ -1014,41 +1040,53 @@ impl CaptureRows {
         clock: &mut ScrollClock,
         resize: impl FnOnce(&mut Term<VoidListener>),
     ) {
-        if self.0.is_empty() {
+        if self.rows.is_empty() {
             resize(term);
             return;
         }
         if term.mode().contains(TermMode::ALT_SCREEN) {
             resize(term);
-            self.0.values_mut().for_each(|captured| captured.row = None);
+            self.rows
+                .values_mut()
+                .for_each(|captured| captured.row = None);
             return;
         }
         let now = clock.tick(term);
         let before = line_starts_upward(term);
         let top = i64::from(term.grid().topmost_line().0);
         let cursor = i64::from(term.grid().cursor.point.line.0);
-        // (id, text, Ok(place among the line starts) | Err(line below the
-        // cursor)), None for a row whose place was already unknown.
-        type Held = (u64, String, Option<Result<usize, i64>>);
-        let held: Vec<Held> = std::mem::take(&mut self.0)
+        // (id, the row's text and serial, Ok(place among the line starts) |
+        // Err(line below the cursor)), None for a row whose place was
+        // already unknown.
+        type Held = (u64, String, u64, Option<Result<usize, i64>>);
+        let held: Vec<Held> = std::mem::take(&mut self.rows)
             .into_iter()
-            .filter_map(|(id, CapturedRow { row, text })| {
-                let Some(row) = row else {
-                    return Some((id, text, None));
-                };
-                let line = row - now;
-                let at = if line > cursor {
-                    Err(line)
-                } else {
-                    Ok(before.partition_point(|&s| i64::from(s) > line))
-                };
-                (line >= top).then_some((id, text, Some(at)))
-            })
+            .filter_map(
+                |(
+                    id,
+                    CapturedRow {
+                        row,
+                        text,
+                        line: serial,
+                    },
+                )| {
+                    let Some(row) = row else {
+                        return Some((id, text, serial, None));
+                    };
+                    let line = row - now;
+                    let at = if line > cursor {
+                        Err(line)
+                    } else {
+                        Ok(before.partition_point(|&s| i64::from(s) > line))
+                    };
+                    (line >= top).then_some((id, text, serial, Some(at)))
+                },
+            )
             .collect();
         resize(term);
         let now = clock.tick(term);
         let after = line_starts_upward(term);
-        for (id, text, at) in held {
+        for (id, text, serial, at) in held {
             let row = match at {
                 None => None,
                 Some(Ok(k)) => match after.get(k) {
@@ -1057,7 +1095,14 @@ impl CaptureRows {
                 },
                 Some(Err(line)) => Some(now + line),
             };
-            self.0.insert(id, CapturedRow { row, text });
+            self.rows.insert(
+                id,
+                CapturedRow {
+                    row,
+                    text,
+                    line: serial,
+                },
+            );
         }
     }
 }
@@ -4629,7 +4674,7 @@ impl PtyTerminal {
             // order term -> capture_rows): the reader records a new capture
             // while it holds `term`, so dropping the lock first would let a
             // line printed in between keep its row on screen but lose it here.
-            self.capture_rows.lock().unwrap().0.clear();
+            self.capture_rows.lock().unwrap().rows.clear();
         }
         // The content the images and OSC 133 marks anchored to is gone;
         // keeping either leaves overlays (a floating picture, phantom
