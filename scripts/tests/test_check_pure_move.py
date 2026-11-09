@@ -110,6 +110,33 @@ class PureMoves(unittest.TestCase):
         self.assertEqual(code, 0, out)
         self.assertIn("moved    fn a.rs::inc -> a.rs::util::inc", out)
 
+    def test_narrowed_or_incomparable_visibility_fails(self):
+        """Only a wider reach is a pure move: a narrower one can hide what a
+        caller used, in place or while moving, and two scopes that do not
+        compare cannot be shown to be wider."""
+        cases = [
+            ("pub fn inc", "fn inc", "pub -> private"),
+            ("pub(crate) fn inc", "pub(in crate::a) fn inc", "pub(crate) -> pub(in crate::a)"),
+            ("pub(super) fn inc", "pub(in crate::a) fn inc", "pub(super) -> pub(in crate::a)"),
+        ]
+        for before, after, why in cases:
+            for moved in (False, True):
+                with self.subTest(why=why, moved=moved), tempfile.TemporaryDirectory() as tmp:
+                    repo = Repo(Path(tmp), {"a.rs": INC.replace("fn inc", before)})
+                    target = "b.rs" if moved else "a.rs"
+                    files = {target: INC.replace("fn inc", after)}
+                    if moved:
+                        files["a.rs"] = ""
+                    repo.commit(files)
+                    code, out = repo.check()
+                    self.assertEqual(code, 1, out)
+                    self.assertIn(f"CHANGED  fn a.rs::inc -> {target}::inc", out)
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp), {"a.rs": INC.replace("fn inc", "pub(in crate::a) fn inc")})
+            repo.commit({"a.rs": "", "b.rs": INC.replace("fn inc", "pub(crate) fn inc")})
+            code, out = repo.check()
+            self.assertEqual(code, 0, out)
+
     def test_docs_and_attributes_left_behind_fail(self):
         """Rust hands a stranded doc or attribute to the next item, so an
         item that moved without them changed two items, not zero."""

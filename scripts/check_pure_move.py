@@ -6,8 +6,9 @@ that by reading it. This parses every changed `.rs` file at both revisions
 into items - each free item, and each item inside an `impl` or inline `mod`
 block - and matches them by text. An item's text is the item plus the docs,
 attributes and `//` comments directly above it; before comparing, only the
-common indentation and the visibility on its signature line (moves widen it)
-are normalised. A method keeps the code of its `impl` header as part of its
+common indentation and the visibility on its signature line are normalised.
+A move may keep or widen that visibility; narrowing it, or changing it to one
+that does not compare (`pub(super)` to `pub(in a)`), is a change. A method keeps the code of its `impl` header as part of its
 identity, so moving `fmt` from `impl Display for X` to `impl Debug for X`, or
 out of a `#[cfg(test)] impl`, is not a move.
 
@@ -37,7 +38,7 @@ from collections import Counter, defaultdict, namedtuple
 
 from check_doc_ownership import exists_at, git
 
-Item = namedtuple("Item", "file kind name mods ctx start end norm")
+Item = namedtuple("Item", "file kind name mods ctx start end norm vis")
 Glue = namedtuple("Glue", "file kind start end text")
 
 # The start of anything whose braces are not structure. Only the raw prefix
@@ -201,7 +202,9 @@ def parse(text, file=""):
 
     def item(kind, name, mods, ctx, start, sig, col, end):
         body = lines[start : end + 1]
+        vis = ""
         if m := VIS.match(body[sig - start], col):
+            vis = re.sub(r"\s+", "", m.group(1))
             body[sig - start] = body[sig - start][: m.start(1)] + body[sig - start][m.end(1) :]
         free = [(ln, starts_in.get(start + n) != "string") for n, ln in enumerate(body)]
         indent = os.path.commonprefix(
@@ -210,7 +213,7 @@ def parse(text, file=""):
         norm = "\n".join(
             ln[len(indent) :] if ok and ln.startswith(indent) else ln for ln, ok in free
         )
-        items.append(Item(file, kind, name, mods, ctx, start, end, norm))
+        items.append(Item(file, kind, name, mods, ctx, start, end, norm, vis))
 
     def walk(lo, hi, mods, ctx):
         lead, sticky, i = None, False, lo
@@ -295,6 +298,28 @@ def span(it):
     return f"{it.file}:{it.start + 1}-{it.end + 1}"
 
 
+def vis_rank(vis):
+    """How far an item's visibility reaches: private (or `pub(self)`) 0,
+    `pub(super)` and `pub(in path)` 1, `pub(crate)` 2, `pub` 3. Two different
+    spellings at one rank (`pub(super)` and `pub(in a)`, or two paths) do
+    not compare."""
+    if vis in ("", "pub(self)", "pub(inself)"):
+        return 0
+    if vis == "pub(super)" or vis.startswith("pub(in"):
+        return 1
+    return {"pub(crate)": 2, "pub": 3}.get(vis)
+
+
+def widens(old, new):
+    """Whether visibility `old` -> `new` keeps or widens the item's reach. A
+    move may need a wider visibility; a narrower one can hide what callers
+    used, so it is a change, and so is one that cannot be compared."""
+    if old == new:
+        return True
+    a, b = vis_rank(old), vis_rank(new)
+    return a is not None and b is not None and b > a
+
+
 def compare(old, new):
     """(unchanged count, moved pairs, changed pairs, removed, added).
 
@@ -305,7 +330,7 @@ def compare(old, new):
     for side, its in enumerate((old, new)):
         for it in its:
             groups[(it.ctx, it.norm)][side].append(it)
-    unchanged, moved, gone, came = 0, [], [], []
+    unchanged, moved, narrowed, gone, came = 0, [], [], [], []
     for olds, news in groups.values():
         at = defaultdict(list)
         for n in news:
@@ -313,18 +338,22 @@ def compare(old, new):
         rest_old = []
         for o in olds:
             if at[(o.file, o.mods, o.name)]:
-                at[(o.file, o.mods, o.name)].pop()
-                unchanged += 1
+                n = at[(o.file, o.mods, o.name)].pop()
+                if widens(o.vis, n.vis):
+                    unchanged += 1
+                else:
+                    narrowed.append((o, n))
             else:
                 rest_old.append(o)
         rest_new = [n for twins in at.values() for n in twins]
-        moved += zip(rest_old, rest_new)
+        for o, n in zip(rest_old, rest_new):
+            (moved if widens(o.vis, n.vis) else narrowed).append((o, n))
         gone += rest_old[len(rest_new) :]
         came += rest_new[len(rest_old) :]
     by_name = defaultdict(list)
     for o in gone:
         by_name[(o.kind, o.name)].append(o)
-    changed, added = [], []
+    changed, added = list(narrowed), []
     for n in came:
         twins = by_name.get((n.kind, n.name))
         if not twins:
@@ -397,7 +426,9 @@ def check(base, head, if_declared):
     print_glue(sides)
     for o, n in changed:
         print(f"  CHANGED  {n.kind} {label(o)} -> {label(n)}")
-        if o.norm == n.norm:
+        if o.norm == n.norm and o.ctx == n.ctx:
+            print(f"      visibility narrowed or not comparable: {o.vis or 'private'} -> {n.vis or 'private'}")
+        elif o.norm == n.norm:
             print("      same text, under a different impl header")
         if not enforced:
             continue
