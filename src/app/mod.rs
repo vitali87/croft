@@ -1118,6 +1118,22 @@ fn git_status_spans<'a>(
     spans
 }
 
+/// A tinted badge's fill and ink on a `surfaces` theme's chrome: the hue
+/// laid over the chrome at a fifth of its strength (a little more under the
+/// pointer), and the hue lifted toward the foreground for the label, so a
+/// count badge reads in its own colour without a hard block of it.
+fn chip_tint(
+    t: crate::widgets::surface::Tones,
+    hue: (u8, u8, u8),
+    hovered: bool,
+) -> (Color, Color) {
+    let strength = if hovered { 0.32 } else { 0.22 };
+    (
+        rgb_color(crate::gradient::lerp_rgb(t.chrome, hue, strength)),
+        rgb_color(crate::gradient::lerp_rgb(hue, t.lift, 0.35)),
+    )
+}
+
 /// The longest workspace name the status bar's cap shows before it elides.
 const WORKSPACE_CAP_MAX: usize = 24;
 
@@ -2075,11 +2091,22 @@ fn menu_hint(action: &MenuAction, keymap: &crate::keymap::Keymap) -> Option<Stri
 
 /// Display width (in cells) a menu entry needs: its label plus the right-aligned
 /// shortcut hint (items) or the `▸` submenu indicator. Dividers need none.
-fn menu_entry_width(entry: &MenuEntry, keymap: &crate::keymap::Keymap) -> usize {
+/// `keycaps` measures the hint as a `surfaces` theme draws it, each key in
+/// a chip one cell of padding wider on each side.
+fn menu_entry_width(entry: &MenuEntry, keymap: &crate::keymap::Keymap, keycaps: bool) -> usize {
     match entry {
         MenuEntry::Item { label, action } => {
             let shortcut = menu_hint(action, keymap)
-                .map(|s| s.chars().count() + 2)
+                .map(|s| {
+                    let chips = if keycaps {
+                        s.split(' ')
+                            .map(|chord| crate::widgets::surface::chord_keys(chord).len())
+                            .sum::<usize>()
+                    } else {
+                        0
+                    };
+                    s.chars().count() + 2 * chips + 2
+                })
                 .unwrap_or(0);
             label.chars().count() + shortcut
         }
@@ -6934,6 +6961,139 @@ fn welcome_recents_height(notes: &[crate::release_notes::ReleaseNote], block_w: 
     1 + 1 + notes_h
 }
 
+/// The blank rows between the blocks of Croft Loch's welcome stack (the
+/// wordmark, the tagline, the Start list, the release card): one, the same
+/// everywhere, so the page keeps one rhythm at any height.
+const LOCH_WELCOME_GAP: u16 = 1;
+
+/// The rows of Croft Loch's release card around its notes: the top edge, the
+/// heading, the blank under it, the row under the notes (padding, or the
+/// "+N more" line when the card is shortened) and the bottom edge.
+const LOCH_WELCOME_CARD_FRAME: u16 = 5;
+
+/// Blank cells between the `cr<>ft` wordmark and the version pill beside it
+/// on Croft Loch's welcome page: close enough to read as one group, apart
+/// enough that the pill never looks like part of the name.
+const WELCOME_VERSION_GAP: u16 = 2;
+
+/// The room between the widest Start label and the keycaps' column, so the
+/// widest row still reads as a label and a chord, not one run of text, while
+/// every chord stays close enough to pair with its label.
+const WELCOME_START_KEY_GAP: u16 = 4;
+
+/// Croft Loch's Start list columns, from its widest label and widest
+/// keycaps: where the keycaps start, as an offset from the list's left edge
+/// (one fixed column [`WELCOME_START_KEY_GAP`] cells past the widest label,
+/// so each chord sits beside its label and the chords line up), and the
+/// list's width, only what the labels and keycaps need. Spreading the list
+/// over the card's whole text column left the chords some seventy cells
+/// from their labels, where nothing tied a chord to its row.
+fn welcome_start_columns(label_w: u16, caps_w: u16) -> (u16, u16) {
+    let keys_dx = label_w + WELCOME_START_KEY_GAP;
+    (
+        keys_dx,
+        if caps_w > 0 {
+            keys_dx + caps_w
+        } else {
+            label_w
+        },
+    )
+}
+
+/// Where Croft Loch's welcome stack puts each block, in rows from the top of
+/// the welcome area. Computed by [`loch_welcome_plan`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LochWelcomePlan {
+    /// The logo's first row and its height: one row for the text wordmark,
+    /// 4..=14 for the picture.
+    logo_y: u16,
+    logo_h: u16,
+    tagline_y: u16,
+    /// The Start list's heading row, when the list shows.
+    start_y: Option<u16>,
+    /// The Take the Tour chip's row, when the Start list cannot show it.
+    chip_y: Option<u16>,
+    /// The release card's top row and height, and how many notes it shows
+    /// whole (`notes == 0`: no card).
+    card_y: u16,
+    card_h: u16,
+    notes: usize,
+}
+
+/// Lay out Croft Loch's welcome stack in `height` rows, in priority order:
+/// the logo (one row for the text wordmark, the picture's 4-row floor
+/// otherwise), the tagline, the Start list (`start_rows` action rows under a
+/// heading), then the release card, which is shortened to the notes that fit
+/// whole (`note_heights`, each note's wrapped rows) rather than pushing the
+/// Start list out. When the Start list has no room, a one-row tour chip
+/// (`tour_chip`) takes its place. The picture grows (to 14 rows) only once
+/// every note fits, and the whole stack is centred vertically, its blocks
+/// [`LOCH_WELCOME_GAP`] apart.
+fn loch_welcome_plan(
+    height: u16,
+    text_logo: bool,
+    start_rows: u16,
+    tour_chip: bool,
+    note_heights: &[u16],
+) -> LochWelcomePlan {
+    let gap = LOCH_WELCOME_GAP;
+    let logo_floor = if text_logo { 1 } else { 4 };
+    // The rows each optional block adds, its leading gap included.
+    let tagline = gap + 1;
+    let start = if start_rows > 0 {
+        gap + 1 + start_rows
+    } else {
+        0
+    };
+    let chip = if tour_chip { gap + 1 } else { 0 };
+    let (start, chip) = if start > 0 && logo_floor + tagline + start <= height {
+        (start, 0)
+    } else if chip > 0 && logo_floor + tagline + chip <= height {
+        (0, chip)
+    } else {
+        (0, 0)
+    };
+    let above_card = tagline + start + chip;
+    let full_card = if note_heights.is_empty() {
+        0
+    } else {
+        gap + LOCH_WELCOME_CARD_FRAME + note_heights.iter().sum::<u16>()
+    };
+    let logo_h = if text_logo {
+        1
+    } else {
+        height
+            .saturating_sub(above_card)
+            .saturating_sub(full_card)
+            .clamp(4, 14)
+    };
+    let card_room = height.saturating_sub(logo_h + above_card + gap);
+    let (mut notes, mut card_h) = (0, 0);
+    let mut h = LOCH_WELCOME_CARD_FRAME;
+    for &nh in note_heights {
+        if h + nh > card_room {
+            break;
+        }
+        h += nh;
+        notes += 1;
+        card_h = h;
+    }
+    let total = logo_h + above_card + if notes > 0 { gap + card_h } else { 0 };
+    let logo_y = height.saturating_sub(total) / 2;
+    let tagline_y = logo_y + logo_h + gap;
+    let next = tagline_y + 1 + gap;
+    LochWelcomePlan {
+        logo_y,
+        logo_h,
+        tagline_y,
+        start_y: (start > 0).then_some(next),
+        chip_y: (chip > 0).then_some(next),
+        card_y: tagline_y + 1 + start + chip + gap,
+        card_h,
+        notes,
+    }
+}
+
 const WELCOME_TAGLINE: &str = "LIGHTWEIGHT.  BLAZINGLY FAST.  BUILT FOR DEVELOPERS.";
 
 use crate::gradient::{GRAD_TL, GRAD_TR, POPUP_SEL_BG, paint_gradient_box, rgb_color};
@@ -8268,7 +8428,8 @@ impl App {
                 self.theme.activity_icon_inactive_rgb(),
                 self.theme.activity_icon_active_rgb(),
                 self.theme.activity_icon_pill_rgb(),
-            ),
+            )
+            .with_hover(self.theme.activity_icon_hover_rgb()),
             sponsor_ink: crate::iterm2_inline::IconInk::new(
                 self.theme.activity_sponsor_rgb(),
                 self.theme.activity_sponsor_hover_rgb(),
@@ -9058,6 +9219,11 @@ impl App {
         let cursor_on = self.cursor_should_be_visible();
         let _ = write!(out, "\x1b[?25l\x1b[s");
         for y in area.top()..area.bottom() {
+            // A `surfaces` theme's one-line pill leaves the rows around it
+            // unpainted: re-emitting them would blank the illustration.
+            if (area.left()..area.right()).all(|x| buf[(x, y)] == ratatui::buffer::Cell::EMPTY) {
+                continue;
+            }
             let _ = write!(out, "\x1b[{};{}H", y + 1, area.left() + 1);
             for x in area.left()..area.right() {
                 let cell = &buf[(x, y)];
@@ -9510,14 +9676,18 @@ impl App {
     /// it can re-Show the caret after the OSC-1337 image emit only when the
     /// editor would have shown it this frame.
     fn cursor_should_be_visible(&self) -> bool {
+        if self.context_menu.is_some() || self.prompt.is_some() || !self.cursor_visible_phase() {
+            return false;
+        }
+        // On a `surfaces` theme the quick input's query has the terminal's
+        // caret (see `quick_input_owns_caret`).
+        if self.quick_input_owns_caret() {
+            return self.quick_input_caret().is_some();
+        }
         // A list picker (View Bookmarks, Quick Fix, ...) is the thing being
         // typed into; the editor's caret behind it would only point at text it
         // is not about to edit.
-        if self.context_menu.is_some()
-            || self.prompt.is_some()
-            || self.list_picker.is_some()
-            || !self.cursor_visible_phase()
-        {
+        if self.list_picker.is_some() {
             return false;
         }
         let editor_caret = if self.editor.diff.is_some() {
@@ -9547,6 +9717,36 @@ impl App {
             return true;
         }
         false
+    }
+
+    /// Whether a quick input (the Command Palette, Go to File, a list
+    /// picker or an input prompt) has the terminal's caret: on a `surfaces`
+    /// theme, which draws no caret block in the query, the caret goes there
+    /// and no pane's caret blinks through the card. A boxed theme paints its
+    /// own caret and keeps its caret rules as they were.
+    fn quick_input_owns_caret(&self) -> bool {
+        self.theme.surfaces().is_some()
+            && (self.command_palette.is_some()
+                || self.file_finder.is_some()
+                || self.list_picker.is_some()
+                || self.input_prompt.is_some())
+    }
+
+    /// Where the terminal's caret goes while a quick input is open: the
+    /// query caret of the topmost one (drawn last: list picker, input
+    /// prompt, palette, finder), as its last render placed it. `None` on a
+    /// boxed theme, whose quick inputs paint their own caret block.
+    fn quick_input_caret(&self) -> Option<(u16, u16)> {
+        if let Some(p) = &self.list_picker {
+            return p.last_caret;
+        }
+        if let Some(p) = &self.input_prompt {
+            return p.last_caret;
+        }
+        if let Some(p) = &self.command_palette {
+            return p.last_caret;
+        }
+        self.file_finder.as_ref().and_then(|f| f.last_caret)
     }
 
     /// True iff the caret is currently in its visible half of the blink
@@ -12326,9 +12526,21 @@ impl App {
             // Diagnostic on top, type info below (VS Code PR #166560). Either
             // side may be empty; an all-empty compose hides the popup.
             let anchor = self.hover_anchor.unwrap_or((0, 0));
+            // The server's part is about a symbol in this file's language,
+            // which a `surfaces` card lays out as path, signature and docs.
+            let lang = self.editor.language();
+            let symbol = result.text.is_some();
             self.hover_popup =
-                compose_hover(self.hover_diagnostic.as_deref(), result.text.as_deref())
-                    .map(|text| crate::widgets::hover_popup::HoverPopup::new(text, anchor));
+                compose_hover(self.hover_diagnostic.as_deref(), result.text.as_deref()).map(
+                    |text| {
+                        let popup = crate::widgets::hover_popup::HoverPopup::new(text, anchor);
+                        if symbol {
+                            popup.about_symbol(lang)
+                        } else {
+                            popup
+                        }
+                    },
+                );
             if self.hover_popup.is_none() && self.hover_at_caret.as_ref() == Some(&self.status) {
                 self.status = String::from(NO_HOVER_AT_CARET);
             }
@@ -13778,8 +13990,19 @@ impl App {
                 crumbs.push(Crumb {
                     label: os.to_string_lossy().into_owned(),
                     target: None,
+                    icon: None,
                 });
             }
+        }
+        // The file crumb wears its Explorer icon (drawn on a `surfaces`
+        // theme only); the folders before it stay plain.
+        if let Some(file) = crumbs.last_mut() {
+            let suffix = path
+                .extension()
+                .map(|e| format!(".{}", e.to_string_lossy()))
+                .unwrap_or_default();
+            let icon = crate::icons::for_path(&file.label, &suffix);
+            file.icon = Some((icon.glyph, icon.color));
         }
         // Symbol scope chain, only when the outline belongs to this file so a
         // stale outline from the previous tab never leaks into the bar.
@@ -13797,9 +14020,11 @@ impl App {
                 .map_or(self.editor.cursor_col, |v| v.cursor_col) as u32;
             for i in breadcrumb_symbol_chain(symbols, line, col) {
                 let s = &symbols[i];
+                let icon = crate::icons::for_outline_kind(s.kind);
                 crumbs.push(Crumb {
                     label: s.name.clone(),
                     target: Some((s.line, s.character)),
+                    icon: Some((icon.glyph, icon.color)),
                 });
             }
         }
@@ -16388,7 +16613,27 @@ impl App {
             };
             y = y.saturating_add(h);
             match v {
-                ExplorerView::Folders => frame.render_widget(&mut self.tree, rect),
+                ExplorerView::Folders => {
+                    frame.render_widget(&mut self.tree, rect);
+                    // Croft Loch: every stacked section ends on a hairline,
+                    // so the tree's blank bottom padding row takes the same
+                    // seam when a section follows it.
+                    if let Some(t) = crate::widgets::surface::tones(self.theme)
+                        && rect.bottom() < area.bottom()
+                        && rect.height > 1
+                    {
+                        crate::widgets::surface::paint_seam(
+                            frame.buffer_mut(),
+                            Rect {
+                                y: rect.bottom() - 1,
+                                height: 1,
+                                ..rect
+                            },
+                            crate::widgets::surface::Edge::Bottom,
+                            t.hairline(),
+                        );
+                    }
+                }
                 ExplorerView::OpenEditors => frame.render_widget(&mut self.open_editors, rect),
                 ExplorerView::Outline => frame.render_widget(&mut self.outline, rect),
                 ExplorerView::Timeline => frame.render_widget(&mut self.timeline, rect),
@@ -18904,12 +19149,24 @@ impl App {
         // no layout icons, so it must not keep the last frame's: their cells
         // now belong to the panel's tab row and its buttons (#1980).
         self.layout_icon_areas = LayoutIconAreas::default();
+        // Frame truth for the welcome's click targets: set again below by
+        // whatever this frame paints.
+        self.welcome_tour_button = Rect::default();
+        self.welcome.clear_start_rows();
         if outer_area.width == 0 || outer_area.height == 0 {
             return;
         }
         self.render_welcome_panel(frame, outer_area);
         // The first-launch tour (#377), until it has been taken or skipped.
-        if !self.tour_done && self.tour.is_none() && outer_area.height > 6 {
+        // Croft Loch places it in its own stack (a Start row, or a chip in
+        // the Start list's place), so this bottom button is the boxed
+        // themes' alone.
+        if crate::widgets::surface::tones(self.theme).is_none()
+            && !self.tour_done
+            && self.tour.is_none()
+            && outer_area.height > 6
+            && self.welcome_tour_button.width == 0
+        {
             let label = " Take the Tour ";
             let w = label.chars().count() as u16;
             if outer_area.width > w + 4 {
@@ -18931,6 +19188,68 @@ impl App {
                 self.welcome_tour_button = rect;
             }
         }
+    }
+
+    /// Croft Loch's welcome tagline: the same promise as [`WELCOME_TAGLINE`]
+    /// in sentence case, set quietly in the muted ink under the wordmark.
+    const WELCOME_TAGLINE_CALM: &'static str = "Lightweight. Blazingly fast. Built for developers.";
+
+    /// The chord shown beside `cmd` on the welcome screen's Start list,
+    /// exactly as the Command Palette shows it: a user's own binding, no
+    /// chord when a user binding took the built-in one, else the built-in
+    /// hint as this platform spells it.
+    fn welcome_chord(&self, cmd: crate::widgets::command_palette::Command) -> String {
+        match self.keymap.chord_for(cmd) {
+            Some(user) => crate::keymap::display_chord(&user),
+            None if self.keymap.shadows_builtin(cmd) => String::new(),
+            None => {
+                crate::widgets::command_palette::platform_hint(cmd.keybinding_hint()).into_owned()
+            }
+        }
+    }
+
+    /// The Start list Croft Loch's welcome screen offers, top to bottom:
+    /// each row's label, the chord beside it, and what a click runs (`None`
+    /// for the tour, whose click target is `welcome_tour_button`). The tour
+    /// is offered until it has been taken or skipped.
+    fn welcome_start_rows(&self) -> Vec<(&'static str, String, Option<welcome::StartAction>)> {
+        use crate::widgets::command_palette::Command;
+        use welcome::StartAction;
+        let mut rows = vec![
+            (
+                "New File",
+                self.welcome_chord(Command::NewUntitledFile),
+                Some(StartAction::Command(Command::NewUntitledFile)),
+            ),
+            (
+                "Go to File",
+                self.welcome_chord(Command::QuickOpen),
+                Some(StartAction::Command(Command::QuickOpen)),
+            ),
+            (
+                "Command Palette",
+                crate::widgets::command_palette::platform_hint("Cmd+Shift+P").into_owned(),
+                Some(StartAction::CommandPalette),
+            ),
+        ];
+        if !self.tour_done && self.tour.is_none() {
+            rows.push(("Take the Tour", String::new(), None));
+        }
+        rows
+    }
+
+    /// Run the welcome Start row a click landed on, if the welcome screen is
+    /// what the editor area shows.
+    fn click_welcome_start(&mut self, x: u16, y: u16) -> bool {
+        if self.editor_layout.is_split() || !self.editor.is_blank_initial() {
+            return false;
+        }
+        match self.welcome.start_action_at(x, y) {
+            Some(welcome::StartAction::Command(cmd)) => self.run_command(cmd),
+            Some(welcome::StartAction::CommandPalette) => self.open_command_palette(),
+            None => return false,
+        }
+        true
     }
 
     fn render_welcome_panel(&mut self, frame: &mut ratatui::Frame, outer_area: Rect) {
@@ -18986,6 +19305,12 @@ impl App {
         let block_left = area.x + area.width / 8;
         let block_right = area.x + area.width - area.width / 8;
         let block_w = block_right.saturating_sub(block_left);
+        // Croft Loch composes its own page: one centred column with a Start
+        // list, the release card shortened rather than the list dropped.
+        if let Some(t) = crate::widgets::surface::tones(self.theme) {
+            self.render_welcome_loch(frame, area, t, block_left, block_w);
+            return;
+        }
         let has_recent_panel = self.welcome.has_recent_panel();
         let recents_inner_h =
             welcome_recents_height(self.welcome.notes(), welcome_card_inner_width(block_w));
@@ -18993,16 +19318,17 @@ impl App {
         let footer_h = 1u16;
         // Gaps: blank row after logo, after tagline, after box.
         let gaps_h = 3u16;
+        let desired_card_h = if has_recent_panel {
+            recents_inner_h.saturating_add(4)
+        } else {
+            0
+        };
 
         let logo_max_w = (area.width as u32).saturating_sub(4) as u16;
         let logo_w_cells = logo_max_w.clamp(8, 48);
         // Box content needs at least the 4-cell border+inset envelope to be
         // worth drawing.
-        let desired_box_h = if has_recent_panel {
-            recents_inner_h.saturating_add(4)
-        } else {
-            0
-        };
+        let desired_box_h = desired_card_h;
         // Size the card first, then give the logo whatever remains (still
         // capped to its 4..14 band, so the stack can never overrun the
         // fixed-size ratatui buffer). The release note is the panel's
@@ -19015,7 +19341,8 @@ impl App {
             .saturating_sub(tagline_h + footer_h + gaps_h)
             .saturating_sub(desired_box_h)
             .clamp(4, 14);
-        let used_above_box = logo_h_cells + 1 + tagline_h + 1; // logo, gap, tagline, gap
+        // logo, gap, tagline, gap
+        let used_above_box = logo_h_cells + 1 + tagline_h + 1;
         let used_below_box = 1 + footer_h; // gap, footer
         let max_box_h = area
             .height
@@ -19029,35 +19356,12 @@ impl App {
         let logo_y = block_top;
         let area_max_y = area.y + area.height;
 
-        let desired = WelcomeLayout {
+        self.place_welcome_logo(WelcomeLayout {
             cell_x: logo_x,
             cell_y: logo_y,
             cell_w: logo_w_cells,
             cell_h: logo_h_cells,
-        };
-
-        // Re-bake the OSC-1337 image whenever the layout shifts (resize,
-        // sidebar toggle, font size change). The canvas is filled with the
-        // raw `EDITOR_BG_RGB` bytes interpreted as sRGB (iTerm2 decodes
-        // PNG bytes as sRGB by default). The pane's SGR-painted cells use
-        // `Color::Reset` so they fall back to the iTerm session bg, which
-        // we force to the same sRGB hex via `SetColors=bg=srgb:…` at
-        // startup. Both surfaces therefore display the same physical
-        // pixel pair-for-pair.
-        if !self.overlays.welcome.layout_matches(&desired) {
-            // The picture baked for the old layout is the wrong size for
-            // this one. Its replacement bakes off the UI thread (#1973), and
-            // the logo's cells stay blank until it lands; one still baking
-            // for an older layout is followed up when it lands.
-            self.overlays.welcome.disable();
-            self.overlays.welcome.set_layout(desired);
-            self.overlays.welcome.mark_dirty();
-            if self.welcome_bake.is_none()
-                && let Some(key) = self.welcome_bake_key()
-            {
-                self.start_welcome_bake(key);
-            }
-        }
+        });
 
         if !self.overlays.welcome.has_image() && self.welcome_bake.is_none() {
             // Text fallback for non-iTerm2 terminals.
@@ -19158,17 +19462,14 @@ impl App {
             );
         }
 
-        // Tagline.
         let tagline_y = logo_y + logo_h_cells + 1;
+        let tagline_style = Style::default().fg(self.theme.ui(Color::Rgb(0x88, 0xc0, 0xd0)));
         let tagline_w = WELCOME_TAGLINE.chars().count() as u16;
         let tagline_x = area.x + area.width.saturating_sub(tagline_w) / 2;
         if tagline_y < area_max_y && tagline_w <= area.width {
-            frame.buffer_mut().set_string(
-                tagline_x,
-                tagline_y,
-                WELCOME_TAGLINE,
-                Style::default().fg(self.theme.ui(Color::Rgb(0x88, 0xc0, 0xd0))),
-            );
+            frame
+                .buffer_mut()
+                .set_string(tagline_x, tagline_y, WELCOME_TAGLINE, tagline_style);
         }
 
         let box_y = tagline_y + tagline_h + 1;
@@ -19264,13 +19565,12 @@ impl App {
                 if row_y >= last_row {
                     break;
                 }
+                let (mark, mark_fg) = note.kind.marker_for(self.theme);
                 frame.buffer_mut().set_string(
                     inner_x,
                     row_y,
-                    note.kind.icon(),
-                    Style::default()
-                        .fg(note.kind.color())
-                        .add_modifier(Modifier::BOLD),
+                    mark,
+                    Style::default().fg(mark_fg).add_modifier(Modifier::BOLD),
                 );
                 let lines = wrapped_welcome_note_summary(note, inner_w_actual);
                 let code_style = row_style.fg(self.theme.ui(crate::markdown::CODE));
@@ -19286,6 +19586,376 @@ impl App {
                 }
                 row_y = row_y.saturating_add(lines.len().max(1) as u16);
             }
+        }
+    }
+
+    /// Re-bake the welcome logo's picture whenever its layout shifts
+    /// (resize, sidebar toggle, font size change). The canvas is filled with
+    /// the raw `EDITOR_BG_RGB` bytes interpreted as sRGB (iTerm2 decodes PNG
+    /// bytes as sRGB by default). The pane's SGR-painted cells use
+    /// `Color::Reset` so they fall back to the iTerm session bg, which we
+    /// force to the same sRGB hex via `SetColors=bg=srgb:…` at startup. Both
+    /// surfaces therefore display the same physical pixel pair-for-pair.
+    fn place_welcome_logo(&mut self, desired: WelcomeLayout) {
+        if !self.overlays.welcome.layout_matches(&desired) {
+            // The picture baked for the old layout is the wrong size for
+            // this one. Its replacement bakes off the UI thread (#1973), and
+            // the logo's cells stay blank until it lands; one still baking
+            // for an older layout is followed up when it lands.
+            self.overlays.welcome.disable();
+            self.overlays.welcome.set_layout(desired);
+            self.overlays.welcome.mark_dirty();
+            if self.welcome_bake.is_none()
+                && let Some(key) = self.welcome_bake_key()
+            {
+                self.start_welcome_bake(key);
+            }
+        }
+    }
+
+    /// Croft Loch's welcome page inside the padding `render_welcome_panel`
+    /// painted: one column of blocks centred on the area's axis, laid out by
+    /// [`loch_welcome_plan`] in priority order. The `cr<>ft` wordmark with
+    /// the version pill two cells after it (the picture logo keeps the
+    /// badge beside it), the calm tagline, the Start list, and the release
+    /// card, shortened to the notes that fit whole with a "+N more" line
+    /// rather than pushing the Start list out of a short editor.
+    fn render_welcome_loch(
+        &mut self,
+        frame: &mut ratatui::Frame,
+        area: Rect,
+        t: crate::widgets::surface::Tones,
+        block_left: u16,
+        block_w: u16,
+    ) {
+        use crate::widgets::surface::keycap_spans;
+        let area_max_y = area.y + area.height;
+        // The wordmark is the logo for good when no picture can be shown (no
+        // image protocol, or no cell size to bake one for), and it needs one
+        // row where the picture needs four. A picture that fails to bake
+        // falls back to the wordmark inside the picture's rows.
+        let text_logo = !self.inline_images_enabled() || self.cell_pixel.is_none();
+        let card_inner_w = welcome_card_inner_width(block_w);
+        let note_heights: Vec<u16> = if block_w >= 4 {
+            self.welcome
+                .notes()
+                .iter()
+                .map(|n| welcome_note_row_height(n, card_inner_w))
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        // The Start list hangs from the release card's text column, so
+        // "Start" and "What's new" share a left edge, and is only as wide as
+        // its labels and keycaps need, the keycaps in one column a fixed gap
+        // past the widest label ([`welcome_start_columns`]). Where the
+        // card's column cannot hold it, it centres on the axis instead. It
+        // shows only where it and a cell of hover lift either side fit.
+        let start_rows = self.welcome_start_rows();
+        let start_label_w = start_rows
+            .iter()
+            .map(|(label, _, _)| label.chars().count() as u16)
+            .max()
+            .unwrap_or(0);
+        let start_caps_w = start_rows
+            .iter()
+            .map(|(_, chord, _)| {
+                ratatui::text::Line::from(keycap_spans(chord, t, t.canvas(), false)).width() as u16
+            })
+            .max()
+            .unwrap_or(0);
+        let (start_keys_dx, start_col_w) = welcome_start_columns(start_label_w, start_caps_w);
+        let start_fits = start_col_w + 2 <= area.width;
+        let tour_offered = !self.tour_done && self.tour.is_none();
+        let plan = loch_welcome_plan(
+            area.height,
+            text_logo,
+            if start_fits {
+                start_rows.len() as u16
+            } else {
+                0
+            },
+            tour_offered,
+            &note_heights,
+        );
+
+        // The logo: the wordmark and the version pill as one group centred
+        // on the axis, or the picture's cells with the badge beside them.
+        let version_label = format!(" v{} ", env!("CARGO_PKG_VERSION"));
+        let version_w = version_label.chars().count() as u16;
+        let pill_w = version_w + 2;
+        let mark_w = 6; // "cr<>ft"
+        let logo_y = area.y + plan.logo_y;
+        let logo_w_cells = ((area.width as u32).saturating_sub(4) as u16).clamp(8, 48);
+        let (logo, pill_x) = if text_logo {
+            let group_w = mark_w + WELCOME_VERSION_GAP + pill_w;
+            let (mark_x, pill_x) = if group_w <= area.width {
+                let x = area.x + (area.width - group_w) / 2;
+                (x, Some(x + mark_w + WELCOME_VERSION_GAP))
+            } else {
+                (area.x + area.width.saturating_sub(mark_w) / 2, None)
+            };
+            let logo = WelcomeLayout {
+                cell_x: mark_x,
+                cell_y: logo_y,
+                cell_w: mark_w,
+                cell_h: 1,
+            };
+            (logo, pill_x)
+        } else {
+            let logo = WelcomeLayout {
+                cell_x: area.x + area.width.saturating_sub(logo_w_cells) / 2,
+                cell_y: logo_y,
+                cell_w: logo_w_cells,
+                cell_h: plan.logo_h,
+            };
+            (logo, None)
+        };
+        self.place_welcome_logo(logo);
+
+        if !self.overlays.welcome.has_image() && self.welcome_bake.is_none() {
+            // The wordmark itself: the letters in the strong ink and the
+            // `<>` (the stylised "o") in the brand orange, the one place that
+            // orange appears.
+            let letter = Style::default().fg(t.strong()).add_modifier(Modifier::BOLD);
+            let mark = ratatui::text::Line::from(vec![
+                Span::styled("cr", letter),
+                Span::styled(
+                    "<>",
+                    Style::default()
+                        .fg(BRAND_ORANGE)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("ft", letter),
+            ]);
+            let lx = logo.cell_x + logo.cell_w.saturating_sub(mark_w) / 2;
+            let ly = logo.cell_y + logo.cell_h / 2;
+            frame.buffer_mut().set_line(lx, ly, &mark, mark_w);
+        }
+
+        // The version: metadata, not a headline. A one-row pill on the
+        // raised tone with half-block caps, beside the wordmark. Beside the
+        // picture it keeps the badge's place (#1843): past the logo's cells,
+        // on the badge's middle row, or in the blank row under a logo too
+        // wide to sit beside.
+        let pill = |buf: &mut ratatui::buffer::Buffer, x: u16, y: u16| {
+            let caps = Style::default().fg(t.raised());
+            buf.set_string(x, y, "\u{2590}", caps);
+            buf.set_string(
+                x + 1,
+                y,
+                &version_label,
+                Style::default().fg(t.muted()).bg(t.raised()),
+            );
+            buf.set_string(x + 1 + version_w, y, "\u{258c}", caps);
+        };
+        if let Some(x) = pill_x {
+            pill(frame.buffer_mut(), x, logo_y);
+        } else if !text_logo {
+            let badge_x = logo.cell_x + logo.cell_w + 1;
+            let badge_y = logo_y + ((logo.cell_h * 5) / 6).min(logo.cell_h.saturating_sub(3));
+            let gap_y = logo_y + logo.cell_h;
+            if badge_x + version_w + 2 <= area.x + area.width && badge_y + 2 < area_max_y {
+                pill(frame.buffer_mut(), badge_x, badge_y + 1);
+            } else if gap_y + 2 < area_max_y && version_w <= area.width {
+                frame.buffer_mut().set_string(
+                    area.x + (area.width - version_w) / 2,
+                    gap_y,
+                    &version_label,
+                    Style::default().fg(t.muted()),
+                );
+            }
+        }
+
+        // The tagline in sentence case, muted and italic, so it reads as a
+        // line under the wordmark rather than a second banner.
+        let tagline_y = area.y + plan.tagline_y;
+        let tagline = Self::WELCOME_TAGLINE_CALM;
+        let tagline_w = tagline.chars().count() as u16;
+        if tagline_y < area_max_y && tagline_w <= area.width {
+            frame.buffer_mut().set_string(
+                area.x + (area.width - tagline_w) / 2,
+                tagline_y,
+                tagline,
+                Style::default()
+                    .fg(t.muted())
+                    .add_modifier(Modifier::ITALIC),
+            );
+        }
+
+        // The Start list: a heading in the strong ink (a heading outranks the
+        // rows it heads), then one row per action, its label in the body ink
+        // and its chord as keycaps in the list's keycap column, read from
+        // the keymap as the palette reads it. A row lifts under the pointer
+        // (a cell of lift either side of the list) and runs its action on a
+        // click; the lift is the row's click rect.
+        if let Some(start_y) = plan.start_y {
+            let start_y = area.y + start_y;
+            // The card's text column starts two cells into the card (its
+            // rim and a cell of inset); with no card under it, or a card too
+            // narrow to hold the list, the list centres on the axis.
+            let card_text_x = block_left + 2;
+            let col_x = if plan.notes > 0 && start_col_w <= card_inner_w {
+                card_text_x
+            } else {
+                area.x + (area.width - start_col_w) / 2
+            };
+            let buf = frame.buffer_mut();
+            buf.set_string(
+                col_x,
+                start_y,
+                "Start",
+                Style::default().fg(t.strong()).add_modifier(Modifier::BOLD),
+            );
+            for (i, (label, chord, action)) in start_rows.iter().enumerate() {
+                let y = start_y + 1 + i as u16;
+                let row = Rect {
+                    x: col_x - 1,
+                    y,
+                    width: start_col_w + 2,
+                    height: 1,
+                };
+                let hovered = crate::widgets::hover::contains(row, self.pointer_cell);
+                let row_bg = if hovered {
+                    t.hover_on(t.canvas)
+                } else {
+                    t.canvas()
+                };
+                if hovered {
+                    buf.set_style(row, Style::default().bg(row_bg));
+                }
+                buf.set_string(
+                    col_x,
+                    y,
+                    label,
+                    Style::default().fg(if hovered { t.strong() } else { t.text() }),
+                );
+                if !chord.is_empty() {
+                    let caps = ratatui::text::Line::from(keycap_spans(chord, t, row_bg, false));
+                    let caps_w = caps.width() as u16;
+                    buf.set_line(col_x + start_keys_dx, y, &caps, caps_w);
+                }
+                match action {
+                    Some(action) => self.welcome.push_start_row(row, *action),
+                    None => self.welcome_tour_button = row,
+                }
+            }
+        }
+
+        // No room for the Start list: the tour as a calm chip in its place,
+        // on the raised tone with half-block caps, lifting under the
+        // pointer; the accent stays for focus and selection.
+        if let Some(chip_y) = plan.chip_y {
+            let label = " Take the Tour ";
+            let w = label.chars().count() as u16;
+            if w + 2 <= area.width {
+                let rect = Rect {
+                    x: area.x + (area.width - w) / 2,
+                    y: area.y + chip_y,
+                    width: w,
+                    height: 1,
+                };
+                let hovered = crate::widgets::hover::contains(rect, self.pointer_cell);
+                let fill = if hovered {
+                    t.hover_on(t.raised)
+                } else {
+                    t.raised()
+                };
+                let buf = frame.buffer_mut();
+                buf.set_string(rect.x - 1, rect.y, "\u{2590}", Style::default().fg(fill));
+                buf.set_string(
+                    rect.x,
+                    rect.y,
+                    label,
+                    Style::default()
+                        .fg(if hovered { t.strong() } else { t.text() })
+                        .bg(fill),
+                );
+                buf.set_string(rect.right(), rect.y, "\u{258c}", Style::default().fg(fill));
+                self.welcome_tour_button = rect;
+            }
+        }
+
+        // The release card: a raised surface that floats on the canvas, its
+        // rim all round with no accent lip (it never takes the keyboard),
+        // holding the notes that fit whole and, when that is not all of
+        // them, a muted "+N more" line in the row under them.
+        if plan.notes == 0 {
+            return;
+        }
+        let box_rect = Rect {
+            x: block_left,
+            y: area.y + plan.card_y,
+            width: block_w,
+            height: plan.card_h,
+        };
+        let buf = frame.buffer_mut();
+        buf.set_style(box_rect, Style::default().bg(t.raised()));
+        crate::widgets::surface::paint_quiet_frame(buf, box_rect, self.theme);
+        let inner_x = box_rect.x + 2;
+        let header_y = box_rect.y + 1;
+        // "What's new" in the strong ink, bold, so the heading outranks the
+        // notes under it; the version it describes right-aligned in the
+        // muted ink, metadata said once.
+        let unreleased = crate::release_notes::unreleased();
+        let heading = if unreleased {
+            "What's new in this build"
+        } else {
+            "What's new"
+        };
+        let version = format!(
+            "v{}{}",
+            env!("CARGO_PKG_VERSION"),
+            if unreleased { "+" } else { "" }
+        );
+        buf.set_stringn(
+            inner_x,
+            header_y,
+            heading,
+            usize::from(card_inner_w),
+            Style::default().fg(t.strong()).add_modifier(Modifier::BOLD),
+        );
+        let (heading_w, card_version_w) = (
+            heading.chars().count() as u16,
+            version.chars().count() as u16,
+        );
+        if card_inner_w >= heading_w + card_version_w + 2 {
+            buf.set_string(
+                inner_x + card_inner_w - card_version_w,
+                header_y,
+                &version,
+                Style::default().fg(t.muted()),
+            );
+        }
+        // Each note: its typographic mark (`+` a feature, `•` a fix) in the
+        // gutter, then its summary wrapped to the card, continuation lines
+        // under the summary. The plan measured these very wraps, so every
+        // note shown ends inside the card (#99).
+        let row_style = Style::default().fg(t.text());
+        let code_style = row_style.fg(self.theme.ui(crate::markdown::CODE));
+        let summary_x = inner_x + WELCOME_NOTE_GUTTER;
+        let summary_w = card_inner_w.saturating_sub(WELCOME_NOTE_GUTTER);
+        let notes = self.welcome.notes();
+        let mut row_y = header_y + 2;
+        for note in &notes[..plan.notes] {
+            let (mark, mark_fg) = note.kind.marker_for(self.theme);
+            buf.set_string(inner_x, row_y, mark, Style::default().fg(mark_fg));
+            let lines = wrapped_welcome_note_summary(note, card_inner_w);
+            let styled = styled_welcome_note_lines(note, &lines, row_style, code_style);
+            for (i, line) in styled.iter().enumerate() {
+                buf.set_line(summary_x, row_y + i as u16, line, summary_w);
+            }
+            row_y += lines.len().max(1) as u16;
+        }
+        if plan.notes < notes.len() {
+            buf.set_stringn(
+                summary_x,
+                row_y,
+                format!("+{} more", notes.len() - plan.notes),
+                usize::from(summary_w),
+                Style::default().fg(t.muted()),
+            );
         }
     }
 
@@ -19403,15 +20073,24 @@ impl App {
         // in the 4-wide slot.
         let base = self.theme.ui(Color::Rgb(0xcc, 0xcc, 0xcc));
         let accent = self.theme.ui(Color::Rgb(0x4e, 0x9a, 0xff));
+        let surfaces = self.theme.surfaces().is_some();
+        let theme = self.theme;
         let mut paint = |x: u16, glyph: char| {
             let hovered = pointer.is_some_and(|(px, py)| py == y && px >= x && px < x + w);
-            let color = if hovered { accent } else { base };
-            frame.buffer_mut().set_string(
-                x + w / 2,
-                y,
-                glyph.to_string(),
-                Style::default().fg(color),
-            );
+            // On a `surfaces` theme these are header actions like the side
+            // bar's: muted at rest, and under the pointer the strong ink on
+            // a faint chip across the whole two-cell slot, never the accent.
+            let style = if surfaces {
+                crate::widgets::header_pill::action_style(theme, hovered)
+            } else {
+                Style::default().fg(if hovered { accent } else { base })
+            };
+            let buf = frame.buffer_mut();
+            if surfaces && hovered {
+                let chip = Rect::new(x, y, w, 1).intersection(buf.area);
+                buf.set_style(chip, style);
+            }
+            buf.set_string(x + w / 2, y, glyph.to_string(), style);
         };
         let side_glyph = if self.show_tree {
             crate::icons::LAYOUT_SIDEBAR_ON
@@ -19539,7 +20218,16 @@ impl App {
         // the bar in the same colors as an image-capable one instead of a
         // second, slightly-off set of greys.
         let active_color = self.theme.activity_icon_active();
+        let hover_color = self.theme.activity_icon_hover();
         let inactive_color = self.theme.activity_icon_inactive();
+        // Codicons have no bold weight; on Croft Loch bold would only set
+        // off some terminals' bold-as-bright, so its glyphs stay regular.
+        let tones = crate::widgets::surface::tones(self.theme);
+        let glyph_mods = if tones.is_some() {
+            Modifier::empty()
+        } else {
+            Modifier::BOLD
+        };
         let glyph_x = activity_icon_glyph_x(area);
         let render_glyph = |frame: &mut ratatui::Frame,
                             block: Rect,
@@ -19566,8 +20254,12 @@ impl App {
                 width: 1,
                 height: 1,
             };
-            let color = if is_active || is_hovered {
+            // Selected wins over hover; hover is its own step (body text on
+            // Croft Loch, the active ink elsewhere).
+            let color = if is_active {
                 active_color
+            } else if is_hovered {
+                hover_color
             } else {
                 inactive_color
             };
@@ -19576,14 +20268,26 @@ impl App {
                     Style::default()
                         .fg(color)
                         .bg(bg_color)
-                        .add_modifier(Modifier::BOLD),
+                        .add_modifier(glyph_mods),
                 ),
                 cell,
             );
         };
         // Text analogue of the baked count badge for image-less terminals: an
-        // accent cell with the count at the icon's bottom-right corner.
-        let badge_bg = self.theme.accent();
+        // accent cell with the count at the icon's bottom-right corner. Croft
+        // Loch tints it instead, the accent laid into the chrome with the
+        // digits in the accent lifted toward the foreground, so the count
+        // reads without a hard teal block beside a muted icon.
+        let badge_style = match tones {
+            Some(t) => {
+                let (fill, ink) = chip_tint(t, t.accent, false);
+                Style::default().fg(ink).bg(fill)
+            }
+            None => Style::default()
+                .fg(Color::White)
+                .bg(self.theme.accent())
+                .add_modifier(Modifier::BOLD),
+        };
         let render_count_badge = |frame: &mut ratatui::Frame, block: Rect, count: usize| {
             if count == 0 {
                 return;
@@ -19595,12 +20299,7 @@ impl App {
             };
             let w = label.chars().count() as u16;
             frame.render_widget(
-                ratatui::widgets::Paragraph::new(label).style(
-                    Style::default()
-                        .fg(Color::White)
-                        .bg(badge_bg)
-                        .add_modifier(Modifier::BOLD),
-                ),
+                ratatui::widgets::Paragraph::new(label).style(badge_style),
                 Rect {
                     x: block.x + block.width.saturating_sub(w),
                     y: block.y + block.height.saturating_sub(1),
@@ -19695,7 +20394,7 @@ impl App {
                             Style::default()
                                 .fg(color)
                                 .bg(bg_color)
-                                .add_modifier(Modifier::BOLD),
+                                .add_modifier(glyph_mods),
                         ),
                     Rect {
                         x: glyph_x,
@@ -20818,6 +21517,7 @@ impl App {
             return;
         }
         let brand = self.theme.gradient();
+        let tones = crate::widgets::surface::tones(self.theme);
         // Same selected-row treatment as the OPEN EDITORS list, so the rail
         // reads as the same family of chrome in both themes.
         let sel_bg = if brand {
@@ -20859,8 +21559,10 @@ impl App {
                 height: 1,
             };
             let active = i == self.active_terminal;
-            let bg = if active {
+            let bg = if active && tones.is_none() {
                 Some(sel_bg)
+            } else if active {
+                None
             } else {
                 crate::widgets::hover::row_hover_bg(row, self.pointer_cell, self.theme)
             };
@@ -20870,12 +21572,14 @@ impl App {
             let label = self.terminals[i].label().to_string();
             let room = TERMINAL_RAIL_LABEL_W as usize;
             let shown: String = label.chars().take(room).collect();
-            let fg = if active {
-                Style::default()
+            let fg = match tones {
+                // Croft Loch: the active terminal's name in body text on the
+                // selected-row band, the rest muted.
+                Some(t) => Style::default().fg(if active { t.text() } else { t.muted() }),
+                None if active => Style::default()
                     .fg(self.theme.ui(Color::White))
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
+                    .add_modifier(Modifier::BOLD),
+                None => Style::default(),
             };
             // `set_string` clips at the buffer edge, not the rail's, so a
             // label wider than a clamped rail would paint its tail over the
@@ -20887,6 +21591,18 @@ impl App {
                 row.width as usize,
                 fg,
             );
+            // The one selected-row anatomy: band plus the accent bar in the
+            // row's leading space, the bar only while the panel has the
+            // keyboard.
+            if active && let Some(t) = tones {
+                crate::widgets::surface::paint_selected_row(
+                    frame.buffer_mut(),
+                    row,
+                    t,
+                    t.canvas,
+                    self.focus == Pane::Terminal,
+                );
+            }
             self.terminal_rail_rects.push(row);
         }
     }
@@ -22685,14 +23401,24 @@ impl App {
         // Croft Loch's title row is a chrome band over the canvas the views
         // paint on, with muted inactive titles.
         let surfaces = self.theme.surfaces();
+        let tones = crate::widgets::surface::tones(self.theme);
         let strip_bg = surfaces.map_or(self.theme.editor_bg(), |s| s.chrome());
         frame.render_widget(Block::default().style(Style::default().bg(strip_bg)), strip);
         let brand = self.theme.gradient();
-        let active_fg = if brand {
-            crate::gradient::rgb_color(crate::gradient::PANEL_TITLE_FG)
-        } else {
-            self.theme.ui(Color::White)
+        // Croft Loch's three steps: the active title in the strong ink (its
+        // accent underline says the rest, so no bold), a hovered one lifted
+        // to body text, the others muted.
+        let active_fg = match tones {
+            Some(t) => t.strong(),
+            None if brand => crate::gradient::rgb_color(crate::gradient::PANEL_TITLE_FG),
+            None => self.theme.ui(Color::White),
         };
+        let active_mods = if tones.is_some() {
+            Modifier::empty()
+        } else {
+            Modifier::BOLD
+        };
+        let hover_fg = tones.map_or(active_fg, |t| t.text());
         let inactive_fg =
             surfaces.map_or(self.theme.ui(Color::Rgb(0x80, 0x88, 0x98)), |s| s.muted());
         let right = strip.x + strip.width;
@@ -22705,13 +23431,35 @@ impl App {
         // In images mode the count rides as an orange circle (the same raster
         // badge as the activity bar), emitted post-frame; recompute its anchor
         // each paint. Glyph-fallback terminals keep the powerline-cap pill.
-        let images = self.overlays.activity.has_images();
+        // Croft Loch draws neither: its count is a tinted chip in either mode,
+        // red while there are errors, amber for warnings, neutral otherwise.
+        let images = self.overlays.activity.has_images() && tones.is_none();
+        let badge_tint = tones.map(|t| {
+            let hue = if self.problems.error_count() > 0 {
+                (0xe5, 0x53, 0x4b)
+            } else if self.problems.warning_count() > 0 {
+                (0xe2, 0xa0, 0x3a)
+            } else {
+                t.muted
+            };
+            chip_tint(t, hue, false)
+        });
 
         // VS Code panel-group order: PROBLEMS, OUTPUT, TERMINAL, PORTS. PROBLEMS
         // alone carries the orange count badge after its label.
         // Each label is translated and padded to its click target.
-        let tabs =
-            BottomPanelTab::ALL.map(|tab| (tab, format!(" {} ", crate::i18n::tr(tab.label()))));
+        // Croft Loch drops the first title's leading pad, so its word lands
+        // on the terminal's first text column below it. The tab still starts
+        // a column in: the panel's edge column belongs to the splitter.
+        let flush_first = tones.is_some();
+        let tabs = BottomPanelTab::ALL.map(|tab| {
+            let pad = if flush_first && tab == BottomPanelTab::ALL[0] {
+                ""
+            } else {
+                " "
+            };
+            (tab, format!("{pad}{} ", crate::i18n::tr(tab.label())))
+        });
 
         // Lay each tab out left to right, recording its hit rect (which, for
         // PROBLEMS, spans the label and the pill together).
@@ -22757,9 +23505,9 @@ impl App {
                 Style::default()
                     .fg(active_fg)
                     .bg(strip_bg)
-                    .add_modifier(Modifier::BOLD)
+                    .add_modifier(active_mods)
             } else if crate::widgets::hover::row_hover_bg(*rect, pointer, self.theme).is_some() {
-                Style::default().fg(active_fg).bg(strip_bg)
+                Style::default().fg(hover_fg).bg(strip_bg)
             } else {
                 Style::default().fg(inactive_fg).bg(strip_bg)
             };
@@ -22778,7 +23526,17 @@ impl App {
             // Otherwise the powerline-cap pill is drawn as text.
             if *badge_w > 0 {
                 let bx = rect.x + unicode_width::UnicodeWidthStr::width(label.as_str()) as u16;
-                if images {
+                if let Some((fill, ink)) = badge_tint {
+                    if bx < right {
+                        buf.set_stringn(
+                            bx,
+                            rect.y,
+                            format!(" {count} "),
+                            right.saturating_sub(bx) as usize,
+                            Style::default().fg(ink).bg(fill),
+                        );
+                    }
+                } else if images {
                     if bx < right {
                         self.problems_badge_cell = Some((bx, rect.y));
                     }
@@ -22824,6 +23582,19 @@ impl App {
             }
         }
         self.paint_panel_actions(buf, strip, placed.last().map_or(strip.x, |p| p.2.right()));
+    }
+
+    /// Croft Loch's top edge for a view sharing the panel (PROBLEMS, OUTPUT,
+    /// PORTS, CAPTURES): the hairline under the tab strip, or the accent lip
+    /// while the panel has the keyboard, as each terminal pane draws its own.
+    /// A no-op on a boxed theme.
+    fn paint_panel_view_top(&self, frame: &mut ratatui::Frame, content: Rect) {
+        crate::widgets::surface::paint_pane_top(
+            frame.buffer_mut(),
+            content,
+            self.theme,
+            self.focus == Pane::Terminal,
+        );
     }
 
     /// The panel's own controls at the right end of its tab row (#1980), right
@@ -23521,6 +24292,7 @@ impl App {
             self.tree.hover_pointer = panel_pointer;
             self.search.hover_pointer = panel_pointer;
             self.source_control.hover_pointer = panel_pointer;
+            self.run_debug.hover_pointer = panel_pointer;
             self.remote.hover_pointer = panel_pointer;
             self.outline.hover_pointer = panel_pointer;
             self.open_editors.hover_pointer = panel_pointer;
@@ -23616,6 +24388,10 @@ impl App {
             // mirroring the terminal pane buttons' hover affordance.
             let pointer = self.pointer_cell;
             self.editor.hover_pointer = pointer;
+            // A modal quick input takes the keyboard without moving focus
+            // (no focus sync runs when one opens), so the editor learns each
+            // frame to drop its accent marks while one is up.
+            self.editor.overlay_has_keyboard = self.modal_overlay_open();
             // Without an inline-image protocol an image tab draws itself in
             // half blocks (#1591).
             let cell_images = !self.inline_images_enabled();
@@ -23834,6 +24610,9 @@ impl App {
                 let active_area = rects[active_idx];
                 self.editor.set_tab_reserved_right(reserve(active_area));
                 frame.render_widget(&mut self.editor, active_area);
+                if let Some((_, full_strip, _)) = minimap {
+                    self.paint_minimap_header(frame.buffer_mut(), full_strip);
+                }
                 let inactive_rects: Vec<Rect> = rects
                     .iter()
                     .enumerate()
@@ -23877,6 +24656,7 @@ impl App {
                 );
                 self.editor.set_tab_reserved_right(reserve(ed_rect));
                 frame.render_widget(&mut self.editor, ed_rect);
+                self.paint_minimap_header(frame.buffer_mut(), full_strip);
                 self.editor_seams.clear();
                 self.update_editor_image_overlay(0, ed_rect);
                 self.disable_editor_image(1);
@@ -23927,7 +24707,7 @@ impl App {
                     frame.render_widget(popup_ref, area);
                     // The selected item's signature and documentation (#1527).
                     if let Some(details) = popup_ref.details_area_for(area, focused_area) {
-                        frame.render_widget(popup_ref.details(), details);
+                        frame.render_widget(popup_ref.details().beside(area), details);
                     }
                 }
             }
@@ -24103,6 +24883,44 @@ impl App {
                     self.terminal_label_rects.clear();
                     self.terminal_collapse_buttons.clear();
                     self.terminal_strip_rects.clear();
+                    // Croft Loch hangs a lone terminal's `∨ +` on the tab row,
+                    // just left of the panel chevron, as VS Code does: the
+                    // panel's controls then share one row instead of stepping
+                    // down onto the pane, whose top edge stays a clean rule.
+                    // Only when both fit between the last tab and the chevron;
+                    // otherwise they keep the pane's top row.
+                    let header_slot = (crate::widgets::surface::tones(self.theme).is_some()
+                        && self.terminals.len() == 1
+                        && !self.terminals[0].collapsed
+                        && strip.height == 1
+                        && !self.panel_maximize_button.is_empty())
+                    .then(|| {
+                        let tabs_end = [
+                            self.problems_tab_rect,
+                            self.output_tab_rect,
+                            self.terminal_tab_rect,
+                            self.ports_tab_rect,
+                            self.captures_tab_rect,
+                        ]
+                        .iter()
+                        .map(|r| r.right())
+                        .max()
+                        .unwrap_or(strip.x);
+                        let x0 = tabs_end + 1;
+                        // The buttons keep one blank column at their right
+                        // edge; ending the slot one cell into the chevron
+                        // lays that column on the chevron's own padding, so
+                        // `+` sits two cells from the chevron's glyph, the
+                        // same step as between `∨` and `+`.
+                        let x1 = self.panel_maximize_button.x + 1;
+                        Rect::new(x0, strip.y, x1.saturating_sub(x0), 1)
+                    })
+                    .filter(|slot| {
+                        let need = TERMINAL_ADD_LABEL.chars().count()
+                            + TERMINAL_PROFILE_LABEL.chars().count()
+                            + 2;
+                        usize::from(slot.width) >= need
+                    });
                     for (i, col) in cols.iter().enumerate().take(self.terminals.len()) {
                         // Hidden panes still push placeholders so a button's
                         // position in each vec names its terminal index.
@@ -24131,7 +24949,7 @@ impl App {
                         self.terminal_strip_rects.push(Rect::default());
                         let buttons = paint_terminal_pane_buttons(
                             frame,
-                            *col,
+                            header_slot.unwrap_or(*col),
                             show_close,
                             maximized,
                             self.theme,
@@ -24214,6 +25032,15 @@ impl App {
                                         .fg(Color::Black)
                                         .bg(Color::Rgb(r, g, b))
                                         .add_modifier(Modifier::BOLD)
+                                } else if let Some(t) = crate::widgets::surface::tones(self.theme) {
+                                    // Croft Loch names the pane with the
+                                    // keyboard in the strong ink, the rest
+                                    // muted, so the labels say where focus is.
+                                    Style::default().fg(if self.terminals[i].focused {
+                                        t.strong()
+                                    } else {
+                                        t.muted()
+                                    })
                                 } else {
                                     crate::widgets::header_pill::action_style(self.theme, false)
                                 };
@@ -24259,6 +25086,7 @@ impl App {
                         t.redacted_on_screen = 0;
                     }
                     frame.render_widget(&mut self.problems, content);
+                    self.paint_panel_view_top(frame, content);
                 }
                 BottomPanelTab::Output => {
                     // Same hidden-terminal reset as PROBLEMS: the OUTPUT view
@@ -24275,6 +25103,7 @@ impl App {
                         t.redacted_on_screen = 0;
                     }
                     frame.render_widget(&mut self.output, content);
+                    self.paint_panel_view_top(frame, content);
                 }
                 BottomPanelTab::Ports => {
                     // Same hidden-terminal reset: the PORTS view covers the
@@ -24291,6 +25120,7 @@ impl App {
                         t.redacted_on_screen = 0;
                     }
                     frame.render_widget(&mut self.ports, content);
+                    self.paint_panel_view_top(frame, content);
                 }
                 BottomPanelTab::Captures => {
                     // Same hidden-terminal reset as the PORTS arm above.
@@ -24306,6 +25136,7 @@ impl App {
                         t.redacted_on_screen = 0;
                     }
                     frame.render_widget(&mut self.captures, content);
+                    self.paint_panel_view_top(frame, content);
                 }
             }
         } else {
@@ -25185,11 +26016,24 @@ impl App {
         self.paint_terminal_suggestion(frame);
         self.render_screencast(frame, main_area);
 
+        // A quick input owns the caret while it is open on a `surfaces`
+        // theme: its query's, and no pane's caret blinking through the card.
+        let quick_input = self.quick_input_owns_caret();
+        if quick_input
+            && self.context_menu.is_none()
+            && self.prompt.is_none()
+            && self.cursor_visible_phase()
+            && let Some((cx, cy)) = self.quick_input_caret()
+        {
+            frame.set_cursor_position((cx, cy));
+        }
+
         // Show the host terminal's hardware caret only when the editor is
         // focused and has no modal overlay. The DECSCUSR style is set to
         // BlinkingBar at startup, so the terminal blinks a thin vertical
         // line over the cursor cell without replacing its character.
         if self.focus == Pane::Editor
+            && !quick_input
             && self.context_menu.is_none()
             && self.prompt.is_none()
             && self.list_picker.is_none()
@@ -25211,6 +26055,7 @@ impl App {
         // flat with no native caret cell.
         if self.focus == Pane::Tree
             && self.sidebar_view == SidebarView::SourceControl
+            && !quick_input
             && self.context_menu.is_none()
             && self.prompt.is_none()
             && self.cursor_visible_phase()
@@ -25225,6 +26070,7 @@ impl App {
         // caret at all (Extensions).
         if self.focus == Pane::Tree
             && self.sidebar_view == SidebarView::Search
+            && !quick_input
             && self.context_menu.is_none()
             && self.prompt.is_none()
             && self.cursor_visible_phase()
@@ -25234,6 +26080,7 @@ impl App {
         }
         if self.focus == Pane::Tree
             && self.sidebar_view == SidebarView::Extensions
+            && !quick_input
             && self.context_menu.is_none()
             && self.prompt.is_none()
             && self.cursor_visible_phase()
@@ -25258,7 +26105,15 @@ impl App {
         let grad = self.popup_gradient();
         // The top-level panel; the open submenu's parent row stays highlighted.
         let top = menu.scroll_for(clipped.height.saturating_sub(2) as usize);
-        self.render_menu_panel(frame, clipped, &menu.items, menu.selected, top, grad);
+        let tones = crate::widgets::surface::tones(self.theme);
+        if let Some(t) = tones {
+            // The keyboard is in the submenu while one is open, so its
+            // parent row keeps an unfocused band without the accent bar.
+            let focused = menu.open_submenu.is_none();
+            self.render_menu_card(frame, clipped, &menu.items, menu.selected, top, focused, t);
+        } else {
+            self.render_menu_panel(frame, clipped, &menu.items, menu.selected, top, grad);
+        }
         // A breadcrumb picker shows what has been typed on its top border.
         if menu.crumb.is_some() && !self.crumb_filter.0.is_empty() {
             let text = if menu.items.is_empty() {
@@ -25268,15 +26123,16 @@ impl App {
             };
             let room = clipped.width.saturating_sub(4) as usize;
             let shown: String = text.chars().take(room).collect();
-            frame.buffer_mut().set_string(
-                clipped.x + 2,
-                clipped.y,
-                shown,
-                Style::default()
+            let style = match tones {
+                Some(t) => Style::default().fg(t.text()).bg(t.raised()),
+                None => Style::default()
                     .fg(self.theme.ui(Color::White))
                     .bg(self.theme.ui(Color::Rgb(0x1e, 0x1e, 0x1e)))
                     .add_modifier(Modifier::BOLD),
-            );
+            };
+            frame
+                .buffer_mut()
+                .set_string(clipped.x + 2, clipped.y, shown, style);
         }
         // Float the open submenu's panel beside its parent.
         if let Some(sub_rect) = self.submenu_rect()
@@ -25284,7 +26140,115 @@ impl App {
                 menu.open_submenu.and_then(|p| menu.items.get(p))
         {
             let sub_top = menu.submenu_scroll_for(menu.submenu_visible(sub_rect.height));
-            self.render_menu_panel(frame, sub_rect, items, menu.submenu_selected, sub_top, grad);
+            if let Some(t) = tones {
+                let sel = menu.submenu_selected;
+                self.render_menu_card(frame, sub_rect, items, sel, sub_top, true, t);
+            } else {
+                self.render_menu_panel(
+                    frame,
+                    sub_rect,
+                    items,
+                    menu.submenu_selected,
+                    sub_top,
+                    grad,
+                );
+            }
+        }
+    }
+
+    /// One menu panel as a `surfaces` theme draws it, in the same rect and
+    /// rows as [`Self::render_menu_panel`] so the hit tests are unchanged: a
+    /// raised card with the accent lip, rows in the body ink, the selected
+    /// row as the band with the accent bar on the card's edge (a plain band
+    /// while `focused` is false), section headers muted, separators a rule
+    /// across the whole card, and shortcuts as keycaps against the right
+    /// edge (`menu_entry_width` sizes the panel for them).
+    #[allow(clippy::too_many_arguments)]
+    fn render_menu_card(
+        &self,
+        frame: &mut ratatui::Frame,
+        rect: Rect,
+        entries: &[MenuEntry],
+        selected: usize,
+        top: usize,
+        focused: bool,
+        t: crate::widgets::surface::Tones,
+    ) {
+        use crate::widgets::surface;
+        let rect = rect.intersection(frame.area());
+        if rect.width < 3 || rect.height < 3 {
+            return;
+        }
+        let block = ratatui::widgets::Block::default()
+            .borders(ratatui::widgets::Borders::ALL)
+            .border_style(Style::default().fg(t.rim()))
+            .style(Style::default().bg(t.raised()));
+        frame.render_widget(ratatui::widgets::Clear, rect);
+        frame.render_widget(block, rect);
+        let buf = frame.buffer_mut();
+        surface::paint_overlay_frame(buf, rect, self.theme);
+        let inner = Rect {
+            x: rect.x + 1,
+            y: rect.y + 1,
+            width: rect.width - 2,
+            height: rect.height - 2,
+        };
+        for (i, entry) in entries.iter().enumerate().skip(top) {
+            if (i - top) as u16 >= inner.height {
+                break;
+            }
+            let y = inner.y + (i - top) as u16;
+            let (label, hint) = match entry {
+                MenuEntry::Separator => {
+                    // Edge to edge, so the rule meets the rim on both sides.
+                    let rule = "\u{2500}".repeat(rect.width as usize);
+                    buf.set_string(rect.x, y, &rule, Style::default().fg(t.rim()));
+                    continue;
+                }
+                MenuEntry::Header(label) => {
+                    buf.set_stringn(
+                        inner.x,
+                        y,
+                        format!(" {label}"),
+                        inner.width as usize,
+                        Style::default().fg(t.muted()),
+                    );
+                    continue;
+                }
+                MenuEntry::Item { label, action } => {
+                    (label.as_str(), menu_hint(action, &self.keymap))
+                }
+                MenuEntry::Submenu { label, .. } => (label.as_str(), None),
+            };
+            let is_sel = i == selected;
+            let row_bg = if is_sel {
+                let band = Rect::new(rect.x, y, rect.width - 1, 1);
+                surface::paint_selected_row(buf, band, t, t.raised, focused);
+                buf[(rect.x + 1, y)].bg
+            } else {
+                t.raised()
+            };
+            let ink = if is_sel { t.strong() } else { t.text() };
+            buf.set_stringn(
+                inner.x,
+                y,
+                format!(" {label}"),
+                inner.width as usize,
+                Style::default().fg(ink),
+            );
+            let trail: Vec<ratatui::text::Span> = match (entry, hint) {
+                (MenuEntry::Submenu { .. }, _) => vec![ratatui::text::Span::styled(
+                    "\u{25b8}",
+                    Style::default().fg(if is_sel { t.text() } else { t.muted() }),
+                )],
+                (_, Some(hint)) => surface::keycap_spans(&hint, t, row_bg, is_sel),
+                (_, None) => Vec::new(),
+            };
+            let trail_w: u16 = trail.iter().map(|s| s.width() as u16).sum();
+            if trail_w > 0 && trail_w + 2 <= inner.width {
+                let x = inner.right() - trail_w - 1;
+                buf.set_line(x, y, &ratatui::text::Line::from(trail), trail_w);
+            }
         }
     }
 
@@ -25432,6 +26396,62 @@ impl App {
         let item_w: u16 = label_w.max(caret.width);
         let item_x = (caret.x + caret.width).saturating_sub(item_w).max(main.x);
         let item_y_top = caret.y + caret.height;
+        self.source_control.commit_menu_item_areas.clear();
+        if let Some(t) = crate::widgets::surface::tones(self.theme) {
+            // A raised card with the accent lip, one row taller above and
+            // below than the rows, whose rim falls on the rows' pad cells:
+            // each hit rect is still the row drawn. Icons rest muted; the
+            // row under the pointer lifts, its icon and label with it.
+            let card = Rect {
+                x: item_x,
+                y: item_y_top,
+                width: item_w,
+                height: items.len() as u16 + 2,
+            }
+            .intersection(frame.area());
+            if card.width < 3 || card.height < 3 {
+                return;
+            }
+            let pointer = self.pointer_cell;
+            let buf = frame.buffer_mut();
+            ratatui::widgets::Widget::render(ratatui::widgets::Clear, card, buf);
+            buf.set_style(card, Style::default().bg(t.raised()));
+            crate::widgets::surface::paint_overlay_frame(buf, card, self.theme);
+            for (i, (item, label)) in items.into_iter().enumerate() {
+                let row_y = card.y + 1 + i as u16;
+                if row_y + 1 >= card.bottom() {
+                    break;
+                }
+                let row_rect = Rect::new(card.x, row_y, card.width, 1);
+                let lit = crate::widgets::hover::contains(row_rect, pointer);
+                if lit {
+                    let inner = Rect::new(card.x + 1, row_y, card.width - 2, 1);
+                    buf.set_style(inner, Style::default().bg(t.hover_on(t.raised)));
+                }
+                let (icon_fg, ink) = if lit {
+                    (t.text(), t.strong())
+                } else {
+                    (t.muted(), t.text())
+                };
+                buf.set_string(
+                    card.x + 1,
+                    row_y,
+                    item.icon().to_string(),
+                    Style::default().fg(icon_fg),
+                );
+                buf.set_stringn(
+                    card.x + 3,
+                    row_y,
+                    &label,
+                    usize::from(card.width.saturating_sub(4)),
+                    Style::default().fg(ink),
+                );
+                self.source_control
+                    .commit_menu_item_areas
+                    .push((row_rect, item));
+            }
+            return;
+        }
         let menu_rect = Rect {
             x: item_x,
             y: item_y_top,
@@ -25442,7 +26462,6 @@ impl App {
         let fg = self.theme.ui(Color::White);
         let style = Style::default().fg(fg).bg(bg);
         frame.render_widget(ratatui::widgets::Clear, menu_rect);
-        self.source_control.commit_menu_item_areas.clear();
         for (i, (item, label)) in items.into_iter().enumerate() {
             let row_y = item_y_top + i as u16;
             let row_rect = Rect {
@@ -25576,6 +26595,12 @@ impl App {
             ]),
         ]);
         frame.render_widget(ratatui::widgets::Paragraph::new(body), inner);
+        crate::widgets::approval_popup::paint_warning_card(
+            frame.buffer_mut(),
+            rect,
+            self.theme,
+            warn,
+        );
     }
 
     /// Confirmation modal for Revert Hunk: destroys the uncommitted edit
@@ -25643,6 +26668,12 @@ impl App {
             ]),
         ]);
         frame.render_widget(ratatui::widgets::Paragraph::new(body), inner);
+        crate::widgets::approval_popup::paint_warning_card(
+            frame.buffer_mut(),
+            rect,
+            self.theme,
+            warn,
+        );
     }
 
     /// The unsaved-changes prompt's words: its headline, the files, and
@@ -25735,6 +26766,12 @@ impl App {
             ]),
         ]);
         frame.render_widget(ratatui::widgets::Paragraph::new(body), inner);
+        crate::widgets::approval_popup::paint_warning_card(
+            frame.buffer_mut(),
+            rect,
+            self.theme,
+            warn,
+        );
     }
 
     /// The lossy-save prompt (#1053): what the file's encoding would destroy,
@@ -25805,6 +26842,12 @@ impl App {
             Paragraph::new(body).wrap(ratatui::widgets::Wrap { trim: false }),
             inner,
         );
+        crate::widgets::approval_popup::paint_warning_card(
+            frame.buffer_mut(),
+            rect,
+            self.theme,
+            danger,
+        );
     }
 
     /// The Replace All confirmation modal (#123): counts up front, commits
@@ -25866,6 +26909,12 @@ impl App {
         frame.render_widget(
             Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false }),
             inner,
+        );
+        crate::widgets::approval_popup::paint_warning_card(
+            frame.buffer_mut(),
+            rect,
+            self.theme,
+            warn,
         );
     }
 
@@ -25949,6 +26998,12 @@ impl App {
             ratatui::widgets::Paragraph::new(body).wrap(ratatui::widgets::Wrap { trim: false }),
             inner,
         );
+        crate::widgets::approval_popup::paint_warning_card(
+            frame.buffer_mut(),
+            rect,
+            self.theme,
+            accent,
+        );
     }
 
     /// Confirmation modal for "Discard All Changes" — reverts every tracked
@@ -26009,6 +27064,12 @@ impl App {
             ]),
         ]);
         frame.render_widget(ratatui::widgets::Paragraph::new(body), inner);
+        crate::widgets::approval_popup::paint_warning_card(
+            frame.buffer_mut(),
+            rect,
+            self.theme,
+            warn,
+        );
     }
 
     /// Confirmation modal for Drop Stash (#1128), in the Discard All style.
@@ -26075,6 +27136,12 @@ impl App {
             ]),
         ]);
         frame.render_widget(ratatui::widgets::Paragraph::new(body), inner);
+        crate::widgets::approval_popup::paint_warning_card(
+            frame.buffer_mut(),
+            rect,
+            self.theme,
+            warn,
+        );
     }
 
     /// Confirmation modal for enabling broadcast input: the classic footgun
@@ -26146,6 +27213,12 @@ impl App {
         frame.render_widget(
             ratatui::widgets::Paragraph::new(body).wrap(ratatui::widgets::Wrap { trim: true }),
             inner,
+        );
+        crate::widgets::approval_popup::paint_warning_card(
+            frame.buffer_mut(),
+            rect,
+            self.theme,
+            warn,
         );
     }
 
@@ -26228,6 +27301,12 @@ impl App {
             Span::raw(" / Esc cancel"),
         ]));
         frame.render_widget(ratatui::widgets::Paragraph::new(body), inner);
+        crate::widgets::approval_popup::paint_warning_card(
+            frame.buffer_mut(),
+            rect,
+            self.theme,
+            warn,
+        );
     }
 
     /// The confirm popup for a runnable fence (#353): the whole block, the
@@ -26328,6 +27407,12 @@ impl App {
             ratatui::widgets::Paragraph::new(ratatui::text::Text::from(lines)),
             inner,
         );
+        crate::widgets::approval_popup::paint_warning_card(
+            frame.buffer_mut(),
+            rect,
+            self.theme,
+            accent,
+        );
     }
 
     fn render_terminal_warning(&self, frame: &mut ratatui::Frame) {
@@ -26427,6 +27512,12 @@ impl App {
             ]),
         ]);
         frame.render_widget(ratatui::widgets::Paragraph::new(body), inner);
+        crate::widgets::approval_popup::paint_warning_card(
+            frame.buffer_mut(),
+            rect,
+            self.theme,
+            warn,
+        );
     }
 
     fn render_local_open_confirm(&self, frame: &mut ratatui::Frame) {
@@ -26498,6 +27589,12 @@ impl App {
             ]),
         ]);
         frame.render_widget(ratatui::widgets::Paragraph::new(body), inner);
+        crate::widgets::approval_popup::paint_warning_card(
+            frame.buffer_mut(),
+            rect,
+            self.theme,
+            self.theme.ui(Color::Rgb(0xff, 0xa5, 0x00)),
+        );
     }
 
     /// Zen Mode hides the status bar, so for a few seconds after entering
@@ -26524,21 +27621,32 @@ impl App {
             height,
         };
         let accent = self.theme.accent();
+        // A `surfaces` theme floats the hint as a raised card in body text,
+        // the accent only on its edge, rather than accent text in an accent
+        // box on the canvas.
+        let tones = crate::widgets::surface::tones(self.theme);
+        let (bg, fg) = match tones {
+            Some(t) => (t.raised(), t.text()),
+            None => (self.theme.editor_bg(), accent),
+        };
         let block = ratatui::widgets::Block::default()
             .borders(ratatui::widgets::Borders::ALL)
             .border_type(ratatui::widgets::BorderType::Rounded)
             .border_style(Style::default().fg(accent))
-            .style(Style::default().bg(self.theme.editor_bg()));
+            .style(Style::default().bg(bg));
         frame.render_widget(ratatui::widgets::Clear, rect);
         frame.render_widget(
             ratatui::widgets::Paragraph::new(ratatui::text::Span::styled(
                 text,
-                Style::default().fg(accent),
+                Style::default().fg(fg),
             ))
             .alignment(ratatui::layout::Alignment::Center)
             .block(block),
             rect,
         );
+        if tones.is_some() {
+            crate::widgets::surface::paint_overlay_frame(frame.buffer_mut(), rect, self.theme);
+        }
     }
 
     /// Paint the transient port-detection toast in the bottom-right corner and
@@ -26590,14 +27698,21 @@ impl App {
             width,
             height,
         };
+        let tones = crate::widgets::surface::tones(self.theme);
         let block = ratatui::widgets::Block::default()
             .borders(ratatui::widgets::Borders::ALL)
-            .border_style(Style::default().fg(accent))
-            .style(Style::default().bg(self.theme.editor_bg()))
-            .title(ratatui::text::Span::styled(
-                " PORT DETECTED ",
-                Style::default().fg(accent).add_modifier(Modifier::BOLD),
-            ));
+            .border_style(Style::default().fg(accent));
+        // A `surfaces` theme's toast is a raised card: no title on its edge
+        // (the body line says what was found, the lip runs unbroken).
+        let block = match tones {
+            Some(t) => block.style(Style::default().bg(t.raised())),
+            None => block
+                .style(Style::default().bg(self.theme.editor_bg()))
+                .title(ratatui::text::Span::styled(
+                    " PORT DETECTED ",
+                    Style::default().fg(accent).add_modifier(Modifier::BOLD),
+                )),
+        };
         frame.render_widget(ratatui::widgets::Clear, rect);
         frame.render_widget(block, rect);
         let inner = Rect {
@@ -26607,32 +27722,61 @@ impl App {
             height: rect.height.saturating_sub(2),
         };
 
+        let pointer = self.pointer_cell;
         let buf = frame.buffer_mut();
-        buf.set_stringn(
-            inner.x,
-            inner.y,
-            &title_line,
-            inner.width as usize,
-            Style::default().fg(self.theme.ui(Color::Rgb(0xCC, 0xCC, 0xCC))),
-        );
+        if let Some(t) = tones {
+            crate::widgets::surface::paint_overlay_frame(buf, rect, self.theme);
+            // The live dot in the accent, the port strong, the process muted.
+            let spans = vec![
+                Span::styled("\u{25cf} ", Style::default().fg(t.accent())),
+                Span::styled(format!("port {port}"), Style::default().fg(t.strong())),
+                Span::styled(format!("  {proc}"), Style::default().fg(t.muted())),
+            ];
+            buf.set_line(inner.x, inner.y, &Line::from(spans), inner.width);
+        } else {
+            buf.set_stringn(
+                inner.x,
+                inner.y,
+                &title_line,
+                inner.width as usize,
+                Style::default().fg(self.theme.ui(Color::Rgb(0xCC, 0xCC, 0xCC))),
+            );
+        }
         let mut bx = inner.x;
         let by = inner.y + 1;
         let mut rects: Vec<(Rect, PortToastAction)> = Vec::new();
-        for (label, action) in &actions {
+        for (i, (label, action)) in actions.iter().enumerate() {
             let w = label.chars().count() as u16;
             if bx + w > inner.x + inner.width {
                 break;
             }
-            buf.set_stringn(
-                bx,
-                by,
-                label,
-                w as usize,
-                Style::default()
+            let hit = Rect::new(bx, by, w, 1);
+            // The first action is the primary one, in the button fill; the
+            // others are chips a lift off the card, and the dismiss cross
+            // a bare muted mark until the pointer is on it.
+            let style = match tones {
+                Some(t) => {
+                    let lit = crate::widgets::hover::contains(hit, pointer);
+                    let lift = |c: Color| match c {
+                        Color::Rgb(r, g, b) => {
+                            rgb_color(crate::gradient::lerp_rgb((r, g, b), t.lift, 0.12))
+                        }
+                        other => other,
+                    };
+                    let (fill, fg) = match (i, *action) {
+                        (0, _) => (btn_bg, t.strong()),
+                        (_, PortToastAction::Dismiss) if !lit => (t.raised(), t.muted()),
+                        _ => (t.keycap_on(t.raised()), t.text()),
+                    };
+                    let fill = if lit { lift(fill) } else { fill };
+                    Style::default().fg(fg).bg(fill)
+                }
+                None => Style::default()
                     .fg(Color::White)
                     .bg(btn_bg)
                     .add_modifier(Modifier::BOLD),
-            );
+            };
+            buf.set_stringn(bx, by, label, w as usize, style);
             rects.push((
                 Rect {
                     x: bx,
@@ -26863,22 +28007,29 @@ impl App {
         };
         let rect = rect.intersection(area);
         let grad = self.popup_gradient();
-        let cursor_fg = if grad {
-            rgb_color(GRAD_TL)
-        } else {
-            self.theme.ui(Color::Rgb(0x4e, 0x9a, 0xff))
+        // A `surfaces` theme: the title in the strong ink on the card (no
+        // chip), the caret and the prompt mark in the accent (the field has
+        // the keyboard), the value in body text and the hint muted.
+        let tones = crate::widgets::surface::tones(self.theme);
+        let cursor_fg = match tones {
+            Some(t) => t.accent(),
+            None if grad => rgb_color(GRAD_TL),
+            None => self.theme.ui(Color::Rgb(0x4e, 0x9a, 0xff)),
         };
         let title_bg = if grad {
             rgb_color(POPUP_SEL_BG)
         } else {
             self.theme.ui(Color::Rgb(0x1e, 0x3a, 0x6e))
         };
+        let title_style = match tones {
+            Some(t) => Style::default().fg(t.strong()).bg(t.raised()),
+            None => Style::default()
+                .fg(self.theme.ui(Color::White))
+                .bg(title_bg),
+        };
         let title = ratatui::text::Span::styled(
             format!(" {} ", p.label),
-            Style::default()
-                .fg(self.theme.ui(Color::White))
-                .bg(title_bg)
-                .add_modifier(Modifier::BOLD),
+            title_style.add_modifier(Modifier::BOLD),
         );
         let block = ratatui::widgets::Block::default()
             .borders(ratatui::widgets::Borders::ALL)
@@ -27081,8 +28232,22 @@ impl App {
                 height: 1,
             },
         );
+        if let Some(t) = tones {
+            // Every kind's row is `> `, the value in white, the caret: the
+            // mark takes the accent, the value the body ink.
+            let buf = frame.buffer_mut();
+            for x in inner.x..inner.right() {
+                let cell = &mut buf[(x, inner.y)];
+                if x < inner.x + 2 {
+                    cell.set_fg(t.accent());
+                } else if cell.fg == self.theme.ui(Color::White) {
+                    cell.set_fg(t.text());
+                }
+            }
+        }
+        let hint_fg = tones.map_or(Color::DarkGray, |t| t.muted());
         let hint = ratatui::widgets::Paragraph::new(ratatui::text::Line::from(hint_text))
-            .style(Style::default().fg(Color::DarkGray));
+            .style(Style::default().fg(hint_fg));
         frame.render_widget(
             hint,
             Rect {
@@ -58038,6 +59203,9 @@ impl App {
     fn render_file_finder(&mut self, frame: &mut ratatui::Frame) {
         let theme = self.theme;
         let center = self.quick_input_position == QuickInputPosition::Center;
+        // Inline images are baked pixels the scrim cannot dim, so the
+        // backdrop stays lit where the terminal draws them.
+        let backdrop = !self.inline_images_enabled();
         let Some(finder) = self.file_finder.as_mut() else {
             return;
         };
@@ -58048,6 +59216,7 @@ impl App {
             frame.buffer_mut(),
             theme,
             center,
+            backdrop,
         );
     }
 
@@ -58216,6 +59385,9 @@ impl App {
     fn render_command_palette(&mut self, frame: &mut ratatui::Frame) {
         let theme = self.theme;
         let center = self.quick_input_position == QuickInputPosition::Center;
+        // Inline images are baked pixels the scrim cannot dim, so the
+        // backdrop stays lit where the terminal draws them.
+        let backdrop = !self.inline_images_enabled();
         let Some(palette) = self.command_palette.as_mut() else {
             return;
         };
@@ -58226,6 +59398,7 @@ impl App {
             frame.buffer_mut(),
             theme,
             center,
+            backdrop,
         );
     }
 
@@ -61608,10 +62781,19 @@ impl App {
     fn render_list_picker(&mut self, frame: &mut ratatui::Frame) {
         let full = frame.area();
         let theme = self.theme;
+        // Inline images are baked pixels the scrim cannot dim, so the
+        // backdrop stays lit where the terminal draws them.
+        let backdrop = !self.inline_images_enabled();
         let Some(picker) = self.list_picker.as_mut() else {
             return;
         };
-        crate::widgets::list_picker::render_list_picker(picker, full, frame.buffer_mut(), theme);
+        crate::widgets::list_picker::render_list_picker(
+            picker,
+            full,
+            frame.buffer_mut(),
+            theme,
+            backdrop,
+        );
     }
 
     /// Render the Source Control "⋯" actions menu under the header pill.
@@ -61625,6 +62807,7 @@ impl App {
             return;
         }
         let screen = frame.area();
+        self.scm_menu.hover = self.pointer_cell;
         crate::widgets::scm_menu::render(
             &mut self.scm_menu,
             anchor,
@@ -65523,6 +66706,9 @@ impl App {
                     self.start_demo();
                     return;
                 }
+                if self.click_welcome_start(m.column, m.row) {
+                    return;
+                }
                 if in_tree_scrollbar {
                     self.focus_pane(Pane::Tree);
                     self.tree.scroll_to_bar_y(m.row);
@@ -68686,6 +69872,19 @@ impl App {
             || self.list_picker.is_some()
             || (self.input_prompt.is_none() && self.modal_a11y().is_some());
         if picker && let Some(pos) = self.announce_pos {
+            // A `surfaces` quick input draws no caret of its own and lends
+            // the query the terminal's caret, which the announcement takes
+            // here: paint a block where the typing lands, as boxed themes do.
+            if self.quick_input_owns_caret()
+                && let Some((cx, cy)) = self.quick_input_caret()
+                && frame
+                    .area()
+                    .contains(ratatui::layout::Position { x: cx, y: cy })
+            {
+                frame.buffer_mut()[(cx, cy)]
+                    .modifier
+                    .insert(ratatui::style::Modifier::REVERSED);
+            }
             frame.set_cursor_position(pos);
             return;
         }
@@ -71016,7 +72215,7 @@ impl App {
         let widest = menu
             .items
             .iter()
-            .map(|e| menu_entry_width(e, &self.keymap))
+            .map(|e| menu_entry_width(e, &self.keymap, self.theme.surfaces().is_some()))
             .max()
             .unwrap_or(0);
         let area = self.last_frame_area;
@@ -71059,7 +72258,7 @@ impl App {
         let main = self.menu_rect()?;
         let widest = items
             .iter()
-            .map(|e| menu_entry_width(e, &self.keymap))
+            .map(|e| menu_entry_width(e, &self.keymap, self.theme.surfaces().is_some()))
             .max()
             .unwrap_or(0);
         let area = self.last_frame_area;
@@ -74507,6 +75706,37 @@ impl App {
             full_strip
         };
         Some((ed_rect, full_strip, img))
+    }
+
+    /// The minimap column's share of the editor header on a `surfaces`
+    /// theme, painted after the editor: the tab-strip row in the strip's
+    /// chrome, so the strip (and the layout icons on it) runs to the edge
+    /// instead of stopping a canvas-black column short, and the seam under
+    /// the breadcrumbs carried across the column. The editor's rule has
+    /// eased into the hairline by its far end, so the column takes that.
+    fn paint_minimap_header(&self, buf: &mut ratatui::buffer::Buffer, column: Rect) {
+        let Some(t) = crate::widgets::surface::tones(self.theme) else {
+            return;
+        };
+        let column = column.intersection(buf.area);
+        if column.height == 0 {
+            return;
+        }
+        let strip_row = Rect {
+            height: 1,
+            ..column
+        };
+        buf.set_style(strip_row, Style::default().bg(self.theme.tab_strip_bg()));
+        let body = self.editor.last_body;
+        if body.height >= 2 && body.y > column.y && body.y < column.bottom() {
+            for x in column.left()..column.right() {
+                let cell = &mut buf[(x, body.y)];
+                if cell.symbol() == " " {
+                    cell.set_symbol("\u{2594}");
+                    cell.set_fg(t.hairline());
+                }
+            }
+        }
     }
 
     /// Whether the open context menu (or its submenu, which floats further

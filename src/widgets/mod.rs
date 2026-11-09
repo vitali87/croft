@@ -31,6 +31,7 @@ pub mod ports;
 pub mod pr_review;
 pub mod problems;
 pub mod process_picker;
+pub mod quick_input;
 pub mod remote;
 pub mod run_debug;
 pub mod scm_menu;

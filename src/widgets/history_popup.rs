@@ -158,6 +158,7 @@ pub fn render_history_popup(
     } else {
         theme.ui(Color::Rgb(0x1e, 0x3a, 0x6e))
     };
+    let tones = crate::widgets::surface::tones(theme);
 
     // Query line with a block caret, the zoxide-jump idiom.
     let query_style = Style::default()
@@ -232,12 +233,30 @@ pub fn render_history_popup(
             width: list_rect.width,
             height: 1,
         };
-        if idx == pop.selected {
+        let selected = idx == pop.selected;
+        if selected && tones.is_none() {
             buf.set_style(r, Style::default().bg(sel_bg));
         }
         let ok = e.exit == Some(0);
+        // A `surfaces` theme keeps colour for what needs a look: a failed
+        // command's dot is red, a clean one's muted, and the command reads
+        // in body ink (strong when selected) rather than bold on every row.
+        let (ok_fg, cmd_style, meta_fg) = match tones {
+            Some(t) => (
+                t.muted(),
+                Style::default().fg(if selected { t.strong() } else { t.text() }),
+                t.muted(),
+            ),
+            None => (
+                theme.ui(Color::Rgb(0x4f, 0xb1, 0xa6)),
+                Style::default()
+                    .fg(theme.ui(Color::Rgb(0xec, 0xef, 0xf4)))
+                    .add_modifier(Modifier::BOLD),
+                theme.ui(Color::Rgb(0x80, 0x88, 0x98)),
+            ),
+        };
         let mark_style = Style::default().fg(if ok {
-            theme.ui(Color::Rgb(0x4f, 0xb1, 0xa6))
+            ok_fg
         } else {
             theme.ui(Color::Rgb(0xf1, 0x4c, 0x4c))
         });
@@ -252,16 +271,8 @@ pub fn render_history_popup(
         );
         let spans = vec![
             Span::styled("● ", mark_style),
-            Span::styled(
-                e.cmd.clone(),
-                Style::default()
-                    .fg(theme.ui(Color::Rgb(0xec, 0xef, 0xf4)))
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                meta,
-                Style::default().fg(theme.ui(Color::Rgb(0x80, 0x88, 0x98))),
-            ),
+            Span::styled(e.cmd.clone(), cmd_style),
+            Span::styled(meta, Style::default().fg(meta_fg)),
         ];
         Widget::render(
             Paragraph::new(Line::from(spans)),
@@ -273,5 +284,9 @@ pub fn render_history_popup(
             },
             buf,
         );
+        if selected && let Some(t) = tones {
+            let band = Rect::new(rect.x, y, rect.width.saturating_sub(1), 1);
+            crate::widgets::surface::paint_selected_row(buf, band, t, t.raised, true);
+        }
     }
 }

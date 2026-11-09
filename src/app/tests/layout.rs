@@ -685,6 +685,53 @@ fn the_selected_activity_icon_is_visible_on_the_light_theme() {
     );
 }
 
+/// Croft Loch's activity bar recedes: icons rest muted, a hovered one lifts
+/// to body text, the selected one is the strong ink beside the accent pill,
+/// no glyph is bold, and a count badge is a tint of the accent rather than a
+/// hard teal block.
+#[test]
+fn croft_loch_activity_icons_rest_muted_hover_to_text_and_tint_their_badge() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _) = app_with_unsaved_file(tmp.path());
+    let t = crate::widgets::surface::tones(app.theme).expect("Croft Loch is the default");
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+    let search = app.sidebar_areas.search_icon;
+    app.handle_mouse(crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::Moved,
+        column: search.x + 1,
+        row: search.y,
+        modifiers: KeyModifiers::NONE,
+    });
+    term.draw(|frame| app.render(frame)).unwrap();
+    let buf = term.backend().buffer();
+    let cell_of = |glyph: char| {
+        (0..40u16)
+            .flat_map(|y| (0..4u16).map(move |x| (x, y)))
+            .find(|&(x, y)| buf[(x, y)].symbol() == glyph.to_string())
+            .map(|(x, y)| ((x, y), buf[(x, y)].clone()))
+            .unwrap_or_else(|| panic!("the activity bar must paint {glyph:?}"))
+    };
+    let ((ex, ey), selected) = cell_of(crate::icons::ACTIVITY_EXPLORER);
+    let (_, hovered) = cell_of(crate::icons::ACTIVITY_SEARCH);
+    let (_, resting) = cell_of(crate::icons::ACTIVITY_EXTENSIONS);
+    assert_eq!(selected.fg, t.strong());
+    assert_eq!(hovered.fg, t.text());
+    assert_eq!(resting.fg, t.muted());
+    for cell in [&selected, &hovered, &resting] {
+        assert!(!cell.modifier.contains(Modifier::BOLD), "no bold glyphs");
+    }
+    let pill = &buf[(0, ey)];
+    assert_eq!((pill.symbol(), pill.fg), ("\u{258e}", t.accent()));
+    // The Explorer's unsaved count rides its slot's bottom-right cell.
+    let badge = &buf[(ex + 1, ey + 1)];
+    assert_eq!(badge.symbol(), "1");
+    let fill = crate::gradient::rgb_color(crate::gradient::lerp_rgb(t.chrome, t.accent, 0.22));
+    assert_eq!(badge.bg, fill, "a tint of the accent, not the accent");
+    assert!(!badge.modifier.contains(Modifier::BOLD));
+}
+
 /// Croft Loch paints the workbench as surfaces on exactly the layout every
 /// other theme gets: the same side bar and tree rects as Croft Black, no
 /// line box in the side bar or the panel, the side bar and status bar on
@@ -1223,6 +1270,129 @@ fn the_active_panel_tab_is_underlined() {
             .modifier
             .contains(Modifier::UNDERLINED),
         "the trailing pad space is not underlined",
+    );
+}
+
+/// Croft Loch's panel tabs take three steps: the active title in the strong
+/// ink with the accent underline and no bold, a hovered title in body text
+/// (not the active ink), the rest muted; and the first title's word starts
+/// on the terminal's first text column.
+#[test]
+fn croft_loch_panel_tabs_step_from_muted_to_text_to_strong() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let t = crate::widgets::surface::tones(app.theme).expect("Croft Loch is the default");
+    let backend = ratatui::backend::TestBackend::new(140, 50);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let out = app.output_tab_rect;
+    app.handle_mouse(crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::Moved,
+        column: out.x + 2,
+        row: out.y,
+        modifiers: KeyModifiers::NONE,
+    });
+    term.draw(|f| app.render(f)).unwrap();
+    let buf = term.backend().buffer();
+    let word = |r: ratatui::layout::Rect| {
+        (r.x..r.right())
+            .map(|x| &buf[(x, r.y)])
+            .find(|c| c.symbol() != " ")
+            .unwrap()
+            .clone()
+    };
+    let active = word(app.terminal_tab_rect);
+    assert_eq!(active.fg, t.strong());
+    assert!(!active.modifier.contains(Modifier::BOLD));
+    assert!(active.modifier.contains(Modifier::UNDERLINED));
+    assert_eq!(active.underline_color, t.accent());
+    assert_eq!(word(app.output_tab_rect).fg, t.text(), "hover is body text");
+    assert_eq!(word(app.ports_tab_rect).fg, t.muted());
+    let first = app.problems_tab_rect;
+    assert_eq!(buf[(first.x, first.y)].symbol(), "P", "no leading pad");
+    let inner = app.terminals[0].last_inner;
+    assert_eq!(first.x, inner.x, "the first title lines up with the shell");
+}
+
+/// Croft Loch: behind an open Command Palette the active panel tab's accent
+/// underline sinks with the rest of the backdrop, so the card's lip and its
+/// selection bar are the only full-strength accent on screen.
+#[test]
+fn croft_loch_palette_scrim_sinks_the_active_tabs_underline() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let t = crate::widgets::surface::tones(app.theme).expect("Croft Loch is the default");
+    let backend = ratatui::backend::TestBackend::new(140, 50);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    app.open_command_palette();
+    // A query that leaves a short card, so the panel's tab strip is
+    // clear of it and only the scrim lies over the tab.
+    app.command_palette
+        .as_mut()
+        .unwrap()
+        .set_query("toggle terminal");
+    term.draw(|f| app.render(f)).unwrap();
+    let card = app.command_palette.as_ref().unwrap().last_rect;
+    let tab = app.terminal_tab_rect;
+    assert!(
+        card.intersection(tab).is_empty(),
+        "the tab is behind the scrim: {card:?} / {tab:?}"
+    );
+    let buf = term.backend().buffer();
+    let word = (tab.x..tab.right())
+        .map(|x| &buf[(x, tab.y)])
+        .find(|c| c.symbol() != " ")
+        .unwrap();
+    assert!(word.modifier.contains(Modifier::UNDERLINED));
+    assert_ne!(word.underline_color, t.accent(), "no full-strength teal");
+    let ratatui::style::Color::Rgb(r, g, b) = word.bg else {
+        panic!("the scrim leaves an RGB fill: {:?}", word.bg);
+    };
+    let sunk = crate::gradient::lerp_rgb(t.accent, (r, g, b), 0.58);
+    assert_eq!(
+        word.underline_color,
+        crate::gradient::rgb_color(sunk),
+        "the underline sinks as far as the title's ink does"
+    );
+}
+
+/// Croft Loch gives every panel pane a top edge: the terminal and the views
+/// that share the panel draw a hairline under the tab strip, and the accent
+/// lip while the panel has the keyboard.
+#[test]
+fn croft_loch_panel_panes_draw_a_hairline_or_the_lip_on_their_top_edge() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let t = crate::widgets::surface::tones(app.theme).expect("Croft Loch is the default");
+    app.focus_pane(Pane::Editor);
+    let backend = ratatui::backend::TestBackend::new(140, 50);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let pane = app.terminals[0].last_area;
+    let top = |term: &ratatui::Terminal<ratatui::backend::TestBackend>, x: u16, y: u16| {
+        let c = &term.backend().buffer()[(x, y)];
+        (c.symbol().to_string(), c.fg)
+    };
+    assert_eq!(
+        top(&term, pane.x + 4, pane.y),
+        ("\u{2594}".to_string(), t.hairline()),
+        "an unfocused pane's top edge is the hairline"
+    );
+    app.focus_pane(Pane::Terminal);
+    term.draw(|f| app.render(f)).unwrap();
+    assert_eq!(
+        top(&term, pane.x, pane.y),
+        ("\u{2594}".to_string(), t.accent()),
+        "the focused pane's lip starts in the accent"
+    );
+    app.set_bottom_panel_tab(BottomPanelTab::Problems);
+    app.focus_pane(Pane::Editor);
+    term.draw(|f| app.render(f)).unwrap();
+    let view = app.problems.last_area;
+    assert_eq!(
+        top(&term, view.x, view.y),
+        ("\u{2594}".to_string(), t.hairline()),
+        "PROBLEMS draws the same edge"
     );
 }
 

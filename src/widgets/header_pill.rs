@@ -58,6 +58,10 @@ pub const MORE_LABEL: &str = " \u{22ef} ";
 /// 1-cell glyph always left a bare highlight cell beside the icon, which read
 /// as a misalignment. Callers keep a wider hit-test rect for a forgiving click
 /// target; only the visible highlight is snug.
+///
+/// Under a `surfaces` theme (Croft Loch) the button wears [`action_style`]:
+/// a muted icon at rest that recedes behind the view's title, the strong ink
+/// on a faint chip under the pointer, never bold and never the accent.
 pub fn render(
     buf: &mut Buffer,
     x: u16,
@@ -66,6 +70,10 @@ pub fn render(
     theme: crate::theme::Theme,
     hovered: bool,
 ) {
+    if crate::widgets::surface::tones(theme).is_some() {
+        buf.set_string(x, y, glyph.to_string(), action_style(theme, hovered));
+        return;
+    }
     let brand = theme.gradient();
     let fill = if brand {
         hovered.then(|| crate::gradient::rgb_color(crate::gradient::POPUP_SEL_BG))
@@ -100,7 +108,18 @@ pub fn render(
 ///   toolbar spirit (`icon.foreground`), no bold.
 /// * Black hover: white on the muted teal `POPUP_SEL_BG` pill standing in for
 ///   `toolbar.hoverBackground`.
+///
+/// Under a `surfaces` theme (Croft Loch) an idle button is a muted icon that
+/// recedes behind the titles beside it, and hover lifts it to body text on a
+/// faint chip: the accent is kept for what has focus or is selected.
 pub fn action_style(theme: crate::theme::Theme, hovered: bool) -> Style {
+    if let Some(t) = crate::widgets::surface::tones(theme) {
+        return if hovered {
+            Style::default().fg(t.strong()).bg(t.hover_on(t.chrome))
+        } else {
+            Style::default().fg(t.muted())
+        };
+    }
     let brand = theme.gradient();
     if !brand {
         return Style::default()
@@ -214,5 +233,21 @@ mod tests {
             Color::Reset,
             "the idle Black-theme pill grows its teal fill only on hover"
         );
+    }
+
+    /// Croft Loch: a header button is a quiet muted icon at rest and lifts
+    /// to the strong ink on a faint chip under the pointer, not bold.
+    #[test]
+    fn croft_loch_header_buttons_are_quiet_until_hovered() {
+        let loch = crate::theme::Theme::LOCH;
+        let t = crate::widgets::surface::tones(loch).unwrap();
+        let mut buf = Buffer::empty(Rect::new(0, 0, 6, 1));
+        render(&mut buf, 2, 0, REFRESH_GLYPH, loch, false);
+        assert_eq!(buf[(2, 0)].fg, t.muted());
+        assert_eq!(buf[(2, 0)].bg, Color::Reset, "no chip at rest");
+        assert!(!buf[(2, 0)].modifier.contains(Modifier::BOLD));
+        render(&mut buf, 2, 0, REFRESH_GLYPH, loch, true);
+        assert_eq!(buf[(2, 0)].fg, t.strong());
+        assert_eq!(buf[(2, 0)].bg, t.hover_on(t.chrome));
     }
 }

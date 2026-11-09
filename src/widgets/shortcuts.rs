@@ -1216,30 +1216,39 @@ pub struct ShortcutsModal {
 impl ShortcutsModal {
     pub fn lines(&self, theme: crate::theme::Theme) -> Vec<Line<'static>> {
         let mut out: Vec<Line<'static>> = Vec::new();
+        // A `surfaces` theme sets the sheet in its type ramp: group titles
+        // strong over a faint rule (the accent is for focus, not headings),
+        // the keys in body ink and what they do muted, so the eye scans
+        // down the keys column.
+        let (title, rule, keys, what) = match crate::widgets::surface::tones(theme) {
+            Some(t) => (
+                Style::default().fg(t.strong()).add_modifier(Modifier::BOLD),
+                Style::default().fg(t.faint()),
+                Style::default().fg(t.text()),
+                Style::default().fg(t.muted()),
+            ),
+            None => (
+                Style::default()
+                    .fg(theme.ui(Color::Rgb(0x4e, 0x9a, 0xff)))
+                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(theme.ui(Color::Rgb(0x4e, 0x9a, 0xff))),
+                Style::default().fg(theme.ui(Color::Yellow)),
+                Style::default().fg(theme.ui(Color::Rgb(0xd0, 0xd0, 0xd0))),
+            ),
+        };
         for (i, group) in SHORTCUT_GROUPS.iter().enumerate() {
             if i > 0 {
                 out.push(Line::from(""));
             }
-            out.push(Line::from(Span::styled(
-                group.title,
-                Style::default()
-                    .fg(theme.ui(Color::Rgb(0x4e, 0x9a, 0xff)))
-                    .add_modifier(Modifier::BOLD),
-            )));
+            out.push(Line::from(Span::styled(group.title, title)));
             out.push(Line::from(Span::styled(
                 "─".repeat(group.title.chars().count()),
-                Style::default().fg(theme.ui(Color::Rgb(0x4e, 0x9a, 0xff))),
+                rule,
             )));
             for entry in group.entries {
                 out.push(Line::from(vec![
-                    Span::styled(
-                        format!("  {:<32} ", entry.keys),
-                        Style::default().fg(theme.ui(Color::Yellow)),
-                    ),
-                    Span::styled(
-                        entry.description,
-                        Style::default().fg(theme.ui(Color::Rgb(0xd0, 0xd0, 0xd0))),
-                    ),
+                    Span::styled(format!("  {:<32} ", entry.keys), keys),
+                    Span::styled(entry.description, what),
                 ]));
             }
         }

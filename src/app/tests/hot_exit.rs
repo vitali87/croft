@@ -52,6 +52,43 @@ fn ctrl_q_with_an_unsaved_tab_asks_before_quitting() {
     assert!(!app.quit);
 }
 
+/// Croft Loch: the prompt is a card tinted amber: its title is bold amber
+/// text after a warning glyph on the raised tone, not an inverted chip, and
+/// its key prompts take the tones (S, the safe default, in the accent).
+#[test]
+fn croft_loch_draws_the_unsaved_prompt_as_a_tinted_card() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _) = app_with_unsaved_file(tmp.path());
+    app.theme = crate::theme::Theme::from_id("loch");
+    let t = crate::widgets::surface::tones(app.theme).unwrap();
+    press_ctrl_q(&mut app);
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let buf = term.backend().buffer();
+    // The first cell where `needle` starts, one char per cell.
+    let find = |needle: &str| {
+        let chars: Vec<String> = needle.chars().map(String::from).collect();
+        let n = chars.len() as u16;
+        (0..buf.area.height).find_map(|y| {
+            (0..buf.area.width.saturating_sub(n))
+                .find(|&x| (0..n).all(|i| buf[(x + i, y)].symbol() == chars[usize::from(i)]))
+                .map(|x| (x, y))
+        })
+    };
+    let (x, y) = find("UNSAVED CHANGES").expect("the title is drawn");
+    let amber = Color::Rgb(0xe7, 0xa7, 0x3c);
+    assert_eq!(buf[(x, y)].fg, amber);
+    assert_eq!(buf[(x, y)].bg, t.raised(), "no chip");
+    assert!(buf[(x, y)].modifier.contains(Modifier::BOLD));
+    assert_eq!(
+        buf[(x - 2, y)].symbol(),
+        "\u{ea6c}",
+        "after the warning glyph"
+    );
+    let (sx, sy) = find("[S]").expect("the save key");
+    assert_eq!(buf[(sx + 1, sy)].fg, t.accent());
+}
+
 /// #862: S saves every unsaved buffer, in every split, and then quits.
 #[test]
 fn s_at_the_quit_prompt_saves_every_split_and_quits() {

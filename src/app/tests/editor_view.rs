@@ -2234,6 +2234,90 @@ fn the_minimap_draws_as_braille_without_inline_images() {
     );
 }
 
+/// On Croft Loch the tab strip's chrome runs through the minimap's column
+/// to the right edge instead of stopping a black column short, and the seam
+/// under the breadcrumbs crosses the column too.
+#[test]
+fn a_loch_tab_strip_and_header_seam_run_through_the_minimap_column() {
+    let (_tmp, mut app) = text_minimap_app();
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 40)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let t = crate::widgets::surface::tones(app.theme).expect("Loch is the default");
+    let strip = app.minimap_img_rect;
+    let top = app.editor.last_full_area.y;
+    let seam_y = app.editor.last_body.y;
+    let buf = term.backend().buffer();
+    for x in strip.x..strip.x + strip.width {
+        assert_eq!(buf[(x, top)].bg, app.theme.tab_strip_bg(), "column {x}");
+        assert_eq!(buf[(x, seam_y)].symbol(), "\u{2594}", "column {x}");
+        assert_eq!(buf[(x, seam_y)].fg, t.hairline());
+    }
+}
+
+/// While a modal quick input has the keyboard, Croft Loch takes the accent
+/// lip off the editor's top seam (a hairline remains); focus itself stays
+/// on the editor, and the lip returns when the palette closes.
+#[test]
+fn a_modal_quick_input_takes_the_accent_off_the_editor_seam() {
+    let (_tmp, mut app) = text_minimap_app();
+    app.focus_pane(Pane::Editor);
+    let t = crate::widgets::surface::tones(app.theme).expect("Loch is the default");
+    let seam = |app: &mut App| {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 40)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        let body = app.editor.last_body;
+        term.backend().buffer()[(body.x, body.y)].fg
+    };
+    // The palette's scrim sinks everything behind the card, the seam
+    // included, so the palette-open seam is the hairline as the scrim
+    // leaves it on the black canvas.
+    let theme = app.theme;
+    let behind_scrim = |c: ratatui::style::Color| {
+        let mut b = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 1, 1));
+        b[(0, 0)].set_fg(c).set_bg(t.canvas());
+        crate::widgets::surface::dim_backdrop(&mut b, Rect::default(), theme);
+        b[(0, 0)].fg
+    };
+    assert_eq!(seam(&mut app), t.accent(), "the focused editor's lip");
+    app.open_command_palette();
+    let palette_open = seam(&mut app);
+    assert_eq!(
+        palette_open,
+        behind_scrim(t.hairline()),
+        "the palette has the keyboard"
+    );
+    assert_ne!(palette_open, behind_scrim(t.accent()));
+    assert!(app.focus == Pane::Editor && app.editor.focused);
+    app.command_palette = None;
+    assert_eq!(seam(&mut app), t.accent());
+}
+
+/// Croft Loch's layout icons are header actions: muted at rest, and under
+/// the pointer the strong ink on a faint chip across the two-cell slot,
+/// never the accent.
+#[test]
+fn loch_layout_icons_rest_muted_and_lift_on_a_chip() {
+    let (_tmp, mut app) = text_minimap_app();
+    app.chrome_bake = None;
+    app.overlays.activity.clear_images();
+    draw(&mut app, 160, 40);
+    let t = crate::widgets::surface::tones(app.theme).expect("Loch is the default");
+    let side = app.layout_icon_areas.toggle_side_bar;
+    let cust = app.layout_icon_areas.customize;
+    assert!(side.width == 2 && cust.width == 2);
+    app.pointer_cell = Some((cust.x, cust.y));
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 40)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let buf = term.backend().buffer();
+    let idle = &buf[(side.x + 1, side.y)];
+    assert_eq!(idle.fg, t.muted());
+    assert_eq!(idle.bg, app.theme.tab_strip_bg(), "no chip at rest");
+    let chip = t.hover_on(t.chrome);
+    assert_eq!(buf[(cust.x + 1, cust.y)].fg, t.strong());
+    assert_eq!(buf[(cust.x, cust.y)].bg, chip);
+    assert_eq!(buf[(cust.x + 1, cust.y)].bg, chip);
+}
+
 #[test]
 fn a_click_on_the_text_minimap_jumps_to_that_part_of_the_file() {
     let (_tmp, mut app) = text_minimap_app();

@@ -289,9 +289,44 @@ impl FileTree {
             self.theme.ignored_fg()
         } else if let Some(dec) = self.git_decoration(path) {
             self.theme.git_decoration_fg(dec)
+        } else if let Some(t) = crate::widgets::surface::tones(self.theme) {
+            // Croft Loch's body ink: the named White follows the host
+            // terminal's palette and is usually pure #fff.
+            t.text()
         } else {
             self.theme.ui(Color::White)
         }
+    }
+
+    /// A folder icon's colour: the icon's own tan on a boxed theme, eased
+    /// most of the way toward the muted ink under `surfaces`, so folders
+    /// read by their shape and a long tree is not a column of gold.
+    fn folder_icon_fg(&self, color: Color) -> Color {
+        match (crate::widgets::surface::tones(self.theme), color) {
+            (Some(t), Color::Rgb(r, g, b)) => {
+                crate::gradient::rgb_color(crate::gradient::lerp_rgb((r, g, b), t.muted, 0.45))
+            }
+            _ => self.theme.ui(color),
+        }
+    }
+
+    /// The active indent guide for Croft Loch's tree: the level of the
+    /// selected row's parent folder and the node-index range of that
+    /// folder's children, `(level, first, end)`. `None` when the selection
+    /// sits directly under a root, whose level draws no guide.
+    fn active_indent_guide(&self) -> Option<(usize, usize, usize)> {
+        let sel = self.nodes.get(self.selected)?;
+        if sel.depth < 2 {
+            return None;
+        }
+        let parent = (0..self.selected)
+            .rev()
+            .find(|&i| self.nodes[i].depth < sel.depth)?;
+        let level = self.nodes[parent].depth;
+        let end = (parent + 1..self.nodes.len())
+            .find(|&i| self.nodes[i].depth <= level)
+            .unwrap_or(self.nodes.len());
+        Some((level, parent + 1, end))
     }
 
     /// True when `path` is git-ignored: either listed in the ignored set
@@ -1531,7 +1566,17 @@ impl Widget for &mut FileTree {
         // Croft Dark keeps the historical white-on-navy chip.
         let label = format!(" {} ", crate::i18n::tr("EXPLORER"));
         let label_width = unicode_width::UnicodeWidthStr::width(label.as_str());
-        let title = if self.focus_gradient {
+        let tones = crate::widgets::surface::tones(self.theme);
+        // Croft Loch: the view title is the one label in the side bar that
+        // says where focus is, so it is the strong ink while the tree has
+        // the keyboard and recedes to muted otherwise. Never bold: weight
+        // is kept for the workspace root below it.
+        let title = if let Some(t) = tones {
+            Span::styled(
+                label,
+                Style::default().fg(if self.focused { t.strong() } else { t.muted() }),
+            )
+        } else if self.focus_gradient {
             Span::styled(
                 label,
                 Style::default()
@@ -1554,8 +1599,27 @@ impl Widget for &mut FileTree {
         // Black theme: replace the solid focus border with the orange→green
         // gradient (matching the welcome activity box), then re-stamp the
         // title the gradient top edge just overwrote. Croft Loch marks focus
-        // with a rule along the top edge that leaves the title alone.
-        if crate::widgets::surface::paint_view_focus(
+        // with the accent lip, which starts one cell past the title's own
+        // padding: the title keeps a breath of space on both sides and the
+        // lip's accent end sits right beside the name of the focused view.
+        if tones.is_some() {
+            if self.focused {
+                let lip_x = area
+                    .x
+                    .saturating_add(1)
+                    .saturating_add(u16::try_from(label_width).unwrap_or(u16::MAX))
+                    .min(area.right());
+                crate::widgets::surface::paint_focus_rule(
+                    buf,
+                    Rect {
+                        x: lip_x,
+                        width: area.right() - lip_x,
+                        ..area
+                    },
+                    self.theme,
+                );
+            }
+        } else if crate::widgets::surface::paint_view_focus(
             buf,
             area,
             self.theme,
@@ -1644,6 +1708,10 @@ impl Widget for &mut FileTree {
         // No Explorer filter any more, so no characters are ever highlighted.
         let query = String::new();
         let end = (scroll_pos + visible_height).min(visible.len());
+        // Croft Loch's indent guides: the guide of the selected row's parent
+        // folder is drawn a step brighter down that folder's children (VS
+        // Code's active indent guide), as `(level, first, end)` node indices.
+        let active_guide = tones.and_then(|_| self.active_indent_guide());
         for (row, &idx) in visible[scroll_pos..end].iter().enumerate() {
             let node = &self.nodes[idx];
             let is_selected = idx == self.selected;
@@ -1651,9 +1719,26 @@ impl Widget for &mut FileTree {
             let is_drop_target = self.drag_target == Some(idx);
             let y = inner.y + row as u16;
 
-            let indent = "  ".repeat(node.depth);
             let mut spans: Vec<Span> = Vec::with_capacity(6);
-            spans.push(Span::raw(indent));
+            match tones {
+                // Croft Loch: a thin guide under each ancestor folder's
+                // chevron, in the cells the indent already takes. The
+                // workspace root's level gets none: every row is under it,
+                // so its guide would only be a second left edge.
+                Some(t) if node.depth >= 2 => {
+                    spans.push(Span::raw("  "));
+                    for level in 1..node.depth {
+                        let active = active_guide.is_some_and(|(l, first, end)| {
+                            l == level && (first..end).contains(&idx)
+                        });
+                        spans.push(Span::styled(
+                            "\u{258f} ",
+                            Style::default().fg(if active { t.faint() } else { t.hairline() }),
+                        ));
+                    }
+                }
+                _ => spans.push(Span::raw("  ".repeat(node.depth))),
+            }
 
             let name = node
                 .path
@@ -1664,13 +1749,12 @@ impl Widget for &mut FileTree {
             // Git-ignored and changed rows colour the *name* only — icons
             // keep their color, matching VS Code's git decorations.
             let name_fg = self.name_fg(&node.path);
+            // Croft Loch's quiet layer: chevrons, the rolled-up dot, the
+            // root badge and note counts all in the muted ink.
+            let mark_fg = tones.map_or_else(|| self.theme.ui(Color::Gray), |t| t.muted());
 
             if node.is_dir {
-                let chev = if node.expanded {
-                    icons::CHEVRON_OPEN
-                } else {
-                    icons::CHEVRON_CLOSED
-                };
+                let chev = crate::widgets::surface::chevron(self.theme, node.expanded);
                 let icon = if node.expanded {
                     icons::FOLDER_OPEN
                 } else {
@@ -1678,13 +1762,20 @@ impl Widget for &mut FileTree {
                 };
                 spans.push(Span::styled(
                     format!("{chev} "),
-                    Style::default().fg(self.theme.ui(Color::Gray)),
+                    Style::default().fg(mark_fg),
                 ));
                 spans.push(Span::styled(
                     format!("{} ", icon.glyph),
-                    Style::default().fg(self.theme.ui(icon.color)),
+                    Style::default().fg(self.folder_icon_fg(icon.color)),
                 ));
-                let base = Style::default().fg(name_fg).add_modifier(Modifier::BOLD);
+                // Bold marks a folder on a boxed theme. Croft Loch keeps
+                // weight for the workspace root alone, so the tree reads as
+                // one calm list under a single heading.
+                let base = if tones.is_some() && node.depth > 0 {
+                    Style::default().fg(name_fg)
+                } else {
+                    Style::default().fg(name_fg).add_modifier(Modifier::BOLD)
+                };
                 push_name_spans(&mut spans, &name, &query, base, self.theme);
                 // A collapsed folder hiding an unreviewed agent write shows a
                 // dimmer copy of the file dot (#345), so the lane's changes
@@ -1693,7 +1784,7 @@ impl Widget for &mut FileTree {
                 if !node.expanded && self.hides_agent_touched(&node.path) {
                     spans.push(Span::styled(
                         format!(" {AGENT_DOT}"),
-                        Style::default().fg(self.theme.ui(Color::Gray)),
+                        Style::default().fg(mark_fg),
                     ));
                 }
                 // A lane root wears its branch and its agent after the name
@@ -1706,7 +1797,7 @@ impl Widget for &mut FileTree {
                     // `DarkGray` is a named colour `Theme::ui` passes through.
                     spans.push(Span::styled(
                         format!("  {badge}"),
-                        Style::default().fg(self.theme.ui(Color::Gray)),
+                        Style::default().fg(mark_fg),
                     ));
                 }
             } else {
@@ -1734,62 +1825,96 @@ impl Widget for &mut FileTree {
                 // alignment it reads the tree by. Trailing, it appears and
                 // clears without moving anything.
                 if self.is_agent_touched(&node.path) {
+                    // Croft Loch takes its own palette's yellow rather than
+                    // the named colour, which follows the host terminal.
+                    let dot = match tones {
+                        Some(_) => crate::gradient::rgb_color(self.theme.ansi()[3]),
+                        None => self.theme.ui(Color::Yellow),
+                    };
                     spans.push(Span::styled(
                         format!(" {AGENT_DOT}"),
-                        Style::default().fg(self.theme.ui(Color::Yellow)),
+                        Style::default().fg(dot),
                     ));
                 }
                 if let Some(n) = self.note_counts.get(&node.path) {
                     spans.push(Span::styled(
                         format!(" \u{270e}{n}"),
-                        Style::default().fg(self.theme.ui(Color::Gray)),
+                        Style::default().fg(mark_fg),
                     ));
                 }
             }
 
             let line = Line::from(spans);
-            // Black theme: the selected/marked rows wear the brand's muted
-            // dark-teal fill (identical to the right-click menu's selection),
-            // replacing the legacy bright-blue accent. Croft Dark keeps the
-            // historical blue. The drop target stays green either way.
-            // Croft Loch greys the selection while the tree is unfocused
-            // (VS Code's `list.inactiveSelectionBackground`), so only the
-            // focused pane wears the accent.
-            let (sel_bg, mark_bg) = if let Some(s) = self.theme.surfaces()
-                && !self.focused
-            {
-                (s.hairline(), self.theme.ui(Color::Rgb(0x18, 0x35, 0x32)))
-            } else if self.focus_gradient {
-                (
-                    crate::gradient::rgb_color(crate::gradient::POPUP_SEL_BG),
-                    self.theme.ui(Color::Rgb(0x18, 0x35, 0x32)),
-                )
-            } else {
-                (
-                    self.theme.ui(Color::Rgb(0x09, 0x4d, 0x77)),
-                    self.theme.ui(Color::Rgb(0x07, 0x33, 0x55)),
-                )
-            };
             let row_rect = Rect {
                 x: inner.x,
                 y,
                 width: row_width,
                 height: 1,
             };
-            let line_style = if is_drop_target {
-                Style::default().bg(self.theme.ui(Color::Rgb(0x2c, 0x60, 0x2e)))
-            } else if is_selected {
-                Style::default().bg(sel_bg)
-            } else if is_marked {
-                Style::default().bg(mark_bg)
-            } else if let Some(bg) =
-                crate::widgets::hover::row_hover_bg(row_rect, pointer, self.theme)
-            {
-                Style::default().bg(bg)
+            let drop_bg = self.theme.ui(Color::Rgb(0x2c, 0x60, 0x2e));
+            if let Some(t) = tones {
+                // Croft Loch: the one selected-row anatomy, the band with the
+                // accent bar standing in the pane's left padding column so
+                // the names keep their column; greyed while another pane has
+                // the keyboard. Marked rows wear a softer tint of the band,
+                // hover a neutral lift.
+                if is_drop_target {
+                    buf.set_style(row_rect, Style::default().bg(drop_bg));
+                } else if is_selected {
+                    crate::widgets::surface::paint_selected_row(
+                        buf,
+                        Rect {
+                            x: area.x,
+                            width: row_width.saturating_add(inner.x - area.x),
+                            ..row_rect
+                        },
+                        t,
+                        t.chrome,
+                        self.focused,
+                    );
+                } else if is_marked {
+                    let tint = crate::gradient::lerp_rgb(t.chrome, t.accent, 0.12);
+                    buf.set_style(
+                        row_rect,
+                        Style::default().bg(crate::gradient::rgb_color(tint)),
+                    );
+                } else if let Some(bg) =
+                    crate::widgets::hover::row_hover_bg(row_rect, pointer, self.theme)
+                {
+                    buf.set_style(row_rect, Style::default().bg(bg));
+                }
             } else {
-                Style::default()
-            };
-            buf.set_style(row_rect, line_style);
+                // Black theme: the selected/marked rows wear the brand's
+                // muted dark-teal fill (identical to the right-click menu's
+                // selection), replacing the legacy bright-blue accent. Croft
+                // Dark keeps the historical blue. The drop target stays
+                // green either way.
+                let (sel_bg, mark_bg) = if self.focus_gradient {
+                    (
+                        crate::gradient::rgb_color(crate::gradient::POPUP_SEL_BG),
+                        self.theme.ui(Color::Rgb(0x18, 0x35, 0x32)),
+                    )
+                } else {
+                    (
+                        self.theme.ui(Color::Rgb(0x09, 0x4d, 0x77)),
+                        self.theme.ui(Color::Rgb(0x07, 0x33, 0x55)),
+                    )
+                };
+                let line_style = if is_drop_target {
+                    Style::default().bg(drop_bg)
+                } else if is_selected {
+                    Style::default().bg(sel_bg)
+                } else if is_marked {
+                    Style::default().bg(mark_bg)
+                } else if let Some(bg) =
+                    crate::widgets::hover::row_hover_bg(row_rect, pointer, self.theme)
+                {
+                    Style::default().bg(bg)
+                } else {
+                    Style::default()
+                };
+                buf.set_style(row_rect, line_style);
+            }
             // A changed row's status sits at the right edge (#1513): the
             // file's letter, or a dot on a folder with changes inside. The
             // name is clipped short of it so a long name never covers it.
@@ -1884,7 +2009,10 @@ impl Widget for &mut FileTree {
                 .min(sel_row)
                 .min(visible_height.saturating_sub(1));
             let shown = &chain[chain.len() - band..];
-            let bg = self.theme.sticky_scroll_bg();
+            // Croft Loch lifts the band onto the raised tone: the theme's
+            // sticky tint is a hair off the chrome and vanished against it.
+            let bg = tones.map_or_else(|| self.theme.sticky_scroll_bg(), |t| t.raised());
+            let mark_fg = tones.map_or_else(|| self.theme.ui(Color::Gray), |t| t.muted());
             for (i, &aidx) in shown.iter().enumerate() {
                 let y = inner.y + i as u16;
                 for x in inner.x..inner.x + row_width {
@@ -1898,32 +2026,34 @@ impl Widget for &mut FileTree {
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| node.path.display().to_string());
                 let name_fg = self.name_fg(&node.path);
+                let name_style = if tones.is_some() && node.depth > 0 {
+                    Style::default().fg(name_fg).bg(bg)
+                } else {
+                    Style::default()
+                        .fg(name_fg)
+                        .bg(bg)
+                        .add_modifier(Modifier::BOLD)
+                };
                 let spans = vec![
                     Span::raw("  ".repeat(node.depth)),
                     Span::styled(
-                        format!("{} ", icons::CHEVRON_OPEN),
-                        Style::default().fg(self.theme.ui(Color::Gray)).bg(bg),
+                        format!("{} ", crate::widgets::surface::chevron(self.theme, true)),
+                        Style::default().fg(mark_fg).bg(bg),
                     ),
                     Span::styled(
                         format!("{} ", icons::FOLDER_OPEN.glyph),
                         Style::default()
-                            .fg(self.theme.ui(icons::FOLDER_OPEN.color))
+                            .fg(self.folder_icon_fg(icons::FOLDER_OPEN.color))
                             .bg(bg),
                     ),
-                    Span::styled(
-                        name,
-                        Style::default()
-                            .fg(name_fg)
-                            .bg(bg)
-                            .add_modifier(Modifier::BOLD),
-                    ),
+                    Span::styled(name, name_style),
                 ];
                 buf.set_line(inner.x, y, &Line::from(spans), row_width);
                 self.sticky_rows.push((y, aidx));
             }
         }
         if let Some(metrics) = scrollbar_metrics {
-            scrollbar::render_vertical(buf, metrics, self.focused, self.theme);
+            scrollbar::render_vertical_on_chrome(buf, metrics, self.focused, self.theme);
         }
     }
 }
@@ -2011,6 +2141,13 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    /// The plain name ink on the default theme (Croft Loch's body text):
+    /// what an unchanged, unignored row's name wears.
+    fn plain_ink() -> Color {
+        crate::widgets::surface::tones(crate::theme::Theme::default())
+            .map_or(Color::White, |t| t.text())
+    }
 
     fn fixture() -> (TempDir, FileTree) {
         let tmp = TempDir::new().unwrap();
@@ -2570,12 +2707,16 @@ mod tests {
     }
 
     /// Croft Loch: no box, a chrome surface, and the selection follows
-    /// VS Code's focus model: the accent while the tree has focus, grey
-    /// while another pane does. The rows sit where the boxed themes put them.
+    /// VS Code's focus model: the band with the accent bar in the pane's
+    /// left padding column while the tree has focus, a grey band without the
+    /// bar while another pane does. The rows sit where the boxed themes put
+    /// them, and the focus lip starts one cell past the title.
     #[test]
     fn croft_loch_explorer_is_an_unboxed_surface_with_a_focus_aware_selection() {
+        use crate::widgets::surface::{ROW_BAR, tones};
         let loch = crate::theme::Theme::from_id("loch");
         let s = loch.surfaces().unwrap();
+        let t = tones(loch).unwrap();
         let area = Rect::new(0, 0, 30, 8);
         let render = |focused: bool| {
             let (_tmp, mut tree) = fixture();
@@ -2591,14 +2732,182 @@ mod tests {
         assert_eq!(inner, Rect::new(1, 1, 28, 6), "the boxed inset is kept");
         assert_eq!(unfocused[(0, 3)].symbol(), " ", "no box on the left edge");
         assert_eq!(unfocused[(0, 3)].bg, s.chrome());
-        assert_eq!(unfocused[(1, 1)].bg, s.hairline(), "grey while unfocused");
+        assert_ne!(
+            unfocused[(1, 1)].bg,
+            s.chrome(),
+            "a grey band while unfocused"
+        );
+        assert_ne!(unfocused[(1, 1)].bg, t.band_on(t.chrome));
+        assert_eq!(unfocused[(0, 1)].symbol(), " ", "no bar while unfocused");
+        assert_eq!(unfocused[(0, 0)].symbol(), " ", "no lip while unfocused");
         let (_, focused) = render(true);
         assert_eq!(
             focused[(1, 1)].bg,
-            crate::gradient::rgb_color(crate::gradient::POPUP_SEL_BG),
-            "the accent while focused"
+            t.band_on(t.chrome),
+            "the band while focused"
         );
-        assert_eq!(focused[(0, 0)].symbol(), "\u{2594}", "the focus rule");
+        assert_eq!(focused[(0, 1)].symbol(), ROW_BAR, "the bar in the padding");
+        assert_eq!(focused[(0, 1)].fg, t.accent());
+        let top: String = (0..area.width).map(|x| focused[(x, 0)].symbol()).collect();
+        assert!(
+            top.starts_with("  EXPLORER \u{2594}"),
+            "the lip starts a cell past the title: {top:?}"
+        );
+        assert_eq!(
+            focused[(11, 0)].fg,
+            t.accent(),
+            "its accent end by the title"
+        );
+    }
+
+    /// Croft Loch's type ramp: the title is the strong ink only while the
+    /// tree has focus, folder names are body text and not bold (only the
+    /// workspace root keeps its weight), and the chevrons are the muted
+    /// codicon pair the panel uses.
+    #[test]
+    fn croft_loch_tree_type_ramp_keeps_weight_for_the_root_alone() {
+        use crate::widgets::surface::{CHEVRON_UNFOLDED, tones};
+        let loch = crate::theme::Theme::LOCH;
+        let t = tones(loch).unwrap();
+        let area = Rect::new(0, 0, 30, 8);
+        let (_tmp, mut tree) = fixture();
+        tree.theme = loch;
+        tree.focused = true;
+        tree.selected = 2;
+        let mut buf = Buffer::empty(area);
+        (&mut tree).render(area, &mut buf);
+        let at = |buf: &Buffer, needle: &str| -> (u16, u16) {
+            for y in 0..area.height {
+                let row: String = (0..area.width).map(|x| buf[(x, y)].symbol()).collect();
+                if let Some(i) = row.find(needle) {
+                    return (row[..i].chars().count() as u16, y);
+                }
+            }
+            panic!("{needle} not on screen");
+        };
+        let title = at(&buf, "EXPLORER");
+        assert_eq!(buf[title].fg, t.strong(), "focused title");
+        assert!(!buf[title].modifier.contains(Modifier::BOLD));
+        let src = at(&buf, "src");
+        assert_eq!(buf[src].fg, t.text());
+        assert!(
+            !buf[src].modifier.contains(Modifier::BOLD),
+            "folders are not bold"
+        );
+        assert_eq!(buf[(src.0 - 4, src.1)].fg, t.muted(), "muted chevron");
+        let root = tree.last_inner;
+        assert!(
+            buf[(root.x + 4, root.y)].modifier.contains(Modifier::BOLD),
+            "the workspace root keeps its weight"
+        );
+        assert_eq!(buf[(root.x, root.y)].symbol(), CHEVRON_UNFOLDED.to_string());
+        tree.focused = false;
+        let mut buf = Buffer::empty(area);
+        (&mut tree).render(area, &mut buf);
+        assert_eq!(buf[at(&buf, "EXPLORER")].fg, t.muted(), "unfocused title");
+    }
+
+    /// Croft Loch draws a thin guide under each ancestor folder (never a
+    /// box glyph, which the side bar's seam test counts), brighter down the
+    /// selected row's parent; the root's level has none.
+    #[test]
+    fn croft_loch_draws_thin_indent_guides_and_brightens_the_active_one() {
+        use crate::widgets::surface::tones;
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("a/b")).unwrap();
+        fs::write(root.join("a/b/deep.rs"), "//\n").unwrap();
+        fs::write(root.join("a/side.rs"), "//\n").unwrap();
+        let mut tree = FileTree::new(root.to_path_buf());
+        tree.theme = crate::theme::Theme::LOCH;
+        let t = tones(tree.theme).unwrap();
+        assert!(tree.reveal_path(&root.join("a/b/deep.rs")));
+        let deep = tree
+            .nodes
+            .iter()
+            .position(|n| n.path.ends_with("deep.rs"))
+            .unwrap();
+        tree.selected = deep;
+        let area = Rect::new(0, 0, 40, 10);
+        let mut buf = Buffer::empty(area);
+        (&mut tree).render(area, &mut buf);
+        let inner = tree.last_inner;
+        let row_of = |needle: &str| -> u16 {
+            (0..area.height)
+                .find(|&y| {
+                    (0..area.width)
+                        .map(|x| buf[(x, y)].symbol())
+                        .collect::<String>()
+                        .contains(needle)
+                })
+                .unwrap()
+        };
+        let (deep_y, side_y, b_y) = (row_of("deep.rs"), row_of("side.rs"), row_of(" b"));
+        // `deep.rs` sits at depth 3: guides for `a` (column 2) and `b`
+        // (column 4); `b` is its parent, so that guide is the active one.
+        assert_eq!(buf[(inner.x + 2, deep_y)].symbol(), "\u{258f}");
+        assert_eq!(buf[(inner.x + 2, deep_y)].fg, t.hairline());
+        assert_eq!(buf[(inner.x + 4, deep_y)].fg, t.faint(), "the active guide");
+        assert_eq!(buf[(inner.x + 2, side_y)].fg, t.hairline());
+        assert_eq!(buf[(inner.x + 2, b_y)].symbol(), "\u{258f}");
+        assert_eq!(
+            buf[(inner.x, b_y)].symbol(),
+            " ",
+            "no guide at the root level"
+        );
+        for y in 0..area.height {
+            for x in 0..area.width {
+                assert!(
+                    !"\u{2502}\u{250c}\u{2510}\u{2500}".contains(buf[(x, y)].symbol()),
+                    "a box glyph at ({x},{y})"
+                );
+            }
+        }
+    }
+
+    /// Croft Loch: a hovered row lifts by the chrome's neutral step, a
+    /// marked row wears a soft tint of the band, the sticky ancestor band
+    /// sits on the raised tone so it reads against the rows, and the
+    /// scrollbar lane keeps the chrome.
+    #[test]
+    fn croft_loch_hover_marks_and_sticky_band_use_the_tones() {
+        use crate::widgets::surface::tones;
+        let loch = crate::theme::Theme::LOCH;
+        let t = tones(loch).unwrap();
+        let (_tmp, mut tree) = fixture();
+        tree.theme = loch;
+        tree.focused = true;
+        tree.toggle_mark(2);
+        tree.selected = 0;
+        let area = Rect::new(0, 0, 30, 8);
+        tree.hover_pointer = Some((2, 2));
+        let mut buf = Buffer::empty(area);
+        (&mut tree).render(area, &mut buf);
+        assert_eq!(buf[(2, 2)].bg, t.hover_on(t.chrome), "hover lift");
+        let marked = buf[(2, 3)].bg;
+        assert_ne!(marked, t.chrome());
+        assert_ne!(marked, t.band_on(t.chrome), "softer than the band");
+
+        // A tall tree scrolled into a folder pins that folder on top.
+        let tmp = TempDir::new().unwrap();
+        let root = tmp.path();
+        fs::create_dir(root.join("dir")).unwrap();
+        for i in 0..20 {
+            fs::write(root.join(format!("dir/f{i:02}.rs")), "//\n").unwrap();
+        }
+        let mut tree = FileTree::new(root.to_path_buf());
+        tree.theme = loch;
+        assert!(tree.reveal_path(&root.join("dir/f19.rs")));
+        tree.selected = tree.nodes.len() - 1;
+        let mut buf = Buffer::empty(area);
+        (&mut tree).render(area, &mut buf);
+        let &(y, _) = tree.sticky_rows_for_test().first().expect("a sticky row");
+        assert_eq!(buf[(tree.last_inner.x + 3, y)].bg, t.raised());
+        let bar = tree.last_scrollbar;
+        assert!(bar.width > 0);
+        let lane: Vec<_> = (bar.y..bar.bottom()).map(|y| buf[(bar.x, y)].bg).collect();
+        assert!(lane.contains(&t.chrome()), "no canvas stripe: {lane:?}");
+        assert!(!lane.contains(&loch.editor_bg()));
     }
 
     #[test]
@@ -2634,6 +2943,8 @@ mod tests {
     #[test]
     fn a_selected_row_is_not_overridden_by_hovering_it() {
         let (_tmp, mut tree) = fixture();
+        // Croft Dark's selection blue; Croft Loch's band is checked below.
+        tree.theme = crate::theme::Theme::DARK_BLUE;
         tree.focused = true;
         tree.focus_gradient = false;
         tree.selected = 0;
@@ -2653,6 +2964,12 @@ mod tests {
             tree.theme.ui(Color::Rgb(0x09, 0x4d, 0x77)),
             "selection outranks hover so the row never dims to the hover lift"
         );
+        let loch = crate::theme::Theme::LOCH;
+        let t = crate::widgets::surface::tones(loch).unwrap();
+        tree.theme = loch;
+        let mut buf = Buffer::empty(area);
+        (&mut tree).render(area, &mut buf);
+        assert_eq!(buf[(area.x + 1, inner_y)].bg, t.band_on(t.chrome));
     }
 
     #[test]
@@ -2873,7 +3190,7 @@ mod tests {
         tree.ignored = Arc::new(HashSet::from([root.join("README.md")]));
         let theme = tree.theme;
         let (fg, badge, _) = row_with_badge(&mut tree, "main.rs");
-        assert_eq!((fg, badge.as_str()), (Color::White, " "), "unchanged");
+        assert_eq!((fg, badge.as_str()), (plain_ink(), " "), "unchanged");
         let (fg, badge, _) = row_with_badge(&mut tree, "README.md");
         assert_eq!(
             (fg, badge.as_str()),
@@ -2935,7 +3252,7 @@ mod tests {
         );
         assert_eq!(
             row_fg("main.rs"),
-            Color::White,
+            plain_ink(),
             "non-ignored names keep the normal foreground"
         );
     }
@@ -2991,11 +3308,11 @@ mod tests {
             panic!("{needle} not on screen");
         };
         assert_eq!(row_fg("main.rs"), dim, "absent at the commit: dimmed");
-        assert_eq!(row_fg("README.md"), Color::White, "present: normal");
-        assert_eq!(row_fg("src"), Color::White, "a present folder: normal");
+        assert_eq!(row_fg("README.md"), plain_ink(), "present: normal");
+        assert_eq!(row_fg("src"), plain_ink(), "a present folder: normal");
         assert_eq!(
             row_fg("Cargo.toml"),
-            Color::White,
+            plain_ink(),
             "another root is outside the listing"
         );
         // The working tree: nothing dims.

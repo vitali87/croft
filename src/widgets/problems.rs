@@ -723,6 +723,10 @@ impl Widget for &mut ProblemsPanel {
 
         let visible = (body.height as usize).min(self.rows.len().saturating_sub(self.scroll));
         self.visible_rows = visible as u16;
+        // Croft Loch keeps a one-cell gutter, so a row's text starts on the
+        // column a terminal's text does and switching tabs doesn't jog the
+        // content sideways. The hover fill still spans the whole row.
+        let gutter = u16::from(self.theme.surfaces().is_some());
 
         for row in 0..visible {
             let render_row = self.rows[self.scroll + row].clone();
@@ -743,7 +747,12 @@ impl Widget for &mut ProblemsPanel {
                 RenderRow::Diag(g, i) => self.diag_spans(g, i),
                 RenderRow::Related(g, i, r) => self.related_spans(g, i, r),
             };
-            Paragraph::new(Line::from(spans)).render(row_rect, buf);
+            let text_rect = Rect {
+                x: row_rect.x + gutter.min(row_rect.width),
+                width: row_rect.width.saturating_sub(gutter),
+                ..row_rect
+            };
+            Paragraph::new(Line::from(spans)).render(text_rect, buf);
         }
 
         if let Some(metrics) = bar {
@@ -1311,9 +1320,10 @@ mod tests {
         let row = |screen: &str, n| screen.lines().nth(n).unwrap_or_default().to_string();
         let screen = render(&mut p, 80, 6);
         assert!(row(&screen, 2).contains("cannot borrow `v`"), "{screen}");
+        // The default theme (Croft Loch) sets every row one gutter cell in.
         assert!(
             row(&screen, 3).starts_with(&format!(
-                "{RELATED_INDENT}src/lib.rs [Ln 3, Col 18]: immutable borrow occurs here"
+                " {RELATED_INDENT}src/lib.rs [Ln 3, Col 18]: immutable borrow occurs here"
             )),
             "{screen}"
         );
@@ -1336,6 +1346,35 @@ mod tests {
         assert!(row(&render(&mut p, 80, 4), 3).contains("meh"));
         p.toggle_group_by_file();
         assert!(row(&render(&mut p, 80, 6), 2).contains("src/lib.rs [Ln 3"));
+    }
+
+    /// Croft Loch keeps a one-cell gutter left of every row, so the list's
+    /// text starts on the same column as a terminal's; a boxed theme's rows
+    /// stay flush, as they always were.
+    #[test]
+    fn croft_loch_rows_keep_a_one_cell_gutter_and_black_stays_flush() {
+        let rows = |theme: crate::theme::Theme| {
+            let mut p = ProblemsPanel::new();
+            p.theme = theme;
+            p.set_groups(vec![group(
+                "a.rs",
+                vec![diag(3, DiagnosticSeverity::Error, "boom")],
+            )]);
+            render(&mut p, 60, 4)
+                .lines()
+                .map(String::from)
+                .collect::<Vec<_>>()
+        };
+        let loch = rows(crate::theme::Theme::LOCH);
+        let black = rows(crate::theme::Theme::BLACK);
+        assert!(loch[1].starts_with(' '), "{loch:?}");
+        assert_eq!(loch[1][1..].trim_end(), black[1].trim_end(), "header row");
+        assert_eq!(
+            loch[2][1..].trim_end(),
+            black[2].trim_end(),
+            "diagnostic row"
+        );
+        assert!(!black[1].starts_with(' '), "{black:?}");
     }
 
     /// #1540: a row shows its rule as `source(code)`, with the diagnostic's

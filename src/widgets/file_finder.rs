@@ -65,6 +65,10 @@ pub struct FileFinder {
     pub scroll: usize,
     pub last_rect: Rect,
     pub last_inner_height: u16,
+    /// Where the terminal's caret goes in the query, set by a `surfaces`
+    /// theme's render (which draws no caret of its own); `None` on a boxed
+    /// theme, whose caret is a painted block.
+    pub last_caret: Option<(u16, u16)>,
 }
 
 impl FileFinder {
@@ -78,6 +82,7 @@ impl FileFinder {
             scroll: 0,
             last_rect: Rect::default(),
             last_inner_height: 0,
+            last_caret: None,
         };
         me.refresh_results();
         me
@@ -869,13 +874,22 @@ fn build_file_index_with_blocked(root: &Path, blocked: Vec<PathBuf>) -> Vec<File
     out
 }
 
+/// Draw Go to File over `area`. `center` is Quick Input Position: Center;
+/// `backdrop` lets a `surfaces` theme dim what is behind the card (the App
+/// withholds it where inline images would not dim with the text).
 pub fn render_file_finder(
     finder: &mut FileFinder,
     area: Rect,
     buf: &mut Buffer,
     theme: crate::theme::Theme,
     center: bool,
+    backdrop: bool,
 ) {
+    if let Some(t) = crate::widgets::surface::tones(theme) {
+        render_finder_card(finder, area, buf, theme, t, center, backdrop);
+        return;
+    }
+    finder.last_caret = None;
     let width = area.width.saturating_mul(7) / 10;
     let width = width.clamp(40, 100).min(area.width);
     let height = area.height.saturating_mul(6) / 10;
@@ -1047,6 +1061,129 @@ pub fn render_file_finder(
     Widget::render(Paragraph::new(lines), list_rect, buf);
 }
 
+/// Go to File as a `surfaces` theme draws it: the shared quick-input card
+/// ([`crate::widgets::quick_input`]) with no title on its edge, a `›`
+/// prompt, and rows that read like the Explorer's: the file-type icon, the
+/// file name in body ink, its folder muted after it, and the query's
+/// matched characters in the accent.
+fn render_finder_card(
+    finder: &mut FileFinder,
+    area: Rect,
+    buf: &mut Buffer,
+    theme: crate::theme::Theme,
+    t: crate::widgets::surface::Tones,
+    center: bool,
+    backdrop: bool,
+) {
+    use crate::widgets::quick_input::{self as qi, Card, Input, Row};
+    let width = (area.width.saturating_mul(7) / 10).clamp(40, 100);
+    let max_h = (area.height.saturating_mul(6) / 10).max(10);
+    let total = finder.results.len();
+    let card = Card::layout(area, width, max_h, total, center);
+    finder.last_rect = card.rect;
+    finder.last_inner_height = card.list.height;
+    if backdrop {
+        crate::widgets::surface::dim_backdrop(buf, card.rect, theme);
+    }
+    let (file_query, _) = split_line_hint(&finder.query);
+    let file_query = file_query.trim();
+    let count = if finder.query.trim().is_empty() {
+        qi::count_label(finder.entries.len(), false, false, "file", "files")
+    } else {
+        qi::count_label(total, true, total >= MAX_RESULTS, "file", "files")
+    };
+    finder.last_caret = qi::paint_card(
+        buf,
+        &card,
+        theme,
+        t,
+        &Input {
+            glyph: "\u{203a}",
+            query: &finder.query,
+            cursor: finder.cursor,
+            placeholder: "Search files by name \u{2014} append :line to jump",
+            count: &count,
+            verb: "open",
+            keep: None,
+        },
+    );
+    let visible = card.list.height as usize;
+    if visible == 0 {
+        return;
+    }
+    if total == 0 {
+        let empty = if finder.entries.is_empty() {
+            "No files indexed"
+        } else {
+            "No matching files"
+        };
+        qi::paint_empty(buf, &card, t, empty);
+        return;
+    }
+    if finder.selected >= finder.scroll + visible {
+        finder.scroll = finder.selected + 1 - visible;
+    }
+    if finder.selected < finder.scroll {
+        finder.scroll = finder.selected;
+    }
+    let end = (finder.scroll + visible).min(total);
+    let hit = qi::hit_style(t);
+    for (offset, result) in finder.results[finder.scroll..end].iter().enumerate() {
+        let selected = finder.scroll + offset == finder.selected;
+        let entry = &result.entry;
+        let (dir_part, file_part) = split_dir_file(&entry.rel, entry.filename_start);
+        let offsets = finder_match_offsets(&entry.rel, entry.filename_start, file_query);
+        let suffix = Path::new(file_part)
+            .extension()
+            .map(|e| format!(".{}", e.to_string_lossy()))
+            .unwrap_or_default();
+        let icon = crate::icons::for_path(file_part, &suffix);
+        let glyph = Span::styled(
+            icon.glyph.to_string(),
+            Style::default().fg(theme.ui(icon.color)),
+        );
+        let mut label = qi::highlighted(
+            file_part,
+            entry.filename_start,
+            &offsets,
+            Style::default().fg(t.text()),
+            hit,
+        );
+        if !dir_part.is_empty() {
+            let dir_style = Style::default().fg(t.muted());
+            label.push(Span::styled("  ", dir_style));
+            label.extend(qi::highlighted(dir_part, 0, &offsets, dir_style, hit));
+        }
+        qi::paint_row(
+            buf,
+            &card,
+            offset as u16,
+            t,
+            Row {
+                selected,
+                glyph: Some(glyph),
+                label,
+                trail: Vec::new(),
+            },
+        );
+    }
+    qi::paint_scroll_cue(buf, &card, t, total, finder.scroll);
+}
+
+/// The byte offsets in `rel` to light for `query`, in the order the finder
+/// ranks: a run inside the file name first (the name tiers), then a run
+/// anywhere in the path, then the fuzzy subsequence over the path.
+fn finder_match_offsets(rel: &str, filename_start: usize, query: &str) -> Vec<usize> {
+    use crate::widgets::quick_input::{match_offsets, run_offsets};
+    if query.is_empty() {
+        return Vec::new();
+    }
+    match run_offsets(&rel[filename_start..], query) {
+        Some(run) => run.into_iter().map(|b| b + filename_start).collect(),
+        None => match_offsets(rel, query),
+    }
+}
+
 fn split_dir_file(rel: &str, filename_start: usize) -> (&str, &str) {
     if filename_start == 0 {
         ("", rel)
@@ -1060,6 +1197,103 @@ fn split_dir_file(rel: &str, filename_start: usize) -> (&str, &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn loch_finder(names: &[&str], query: &str) -> (FileFinder, Buffer) {
+        let entries: Vec<FileEntry> = names
+            .iter()
+            .map(|rel| {
+                let start = rel.rfind('/').map_or(0, |i| i + 1);
+                FileEntry {
+                    path: PathBuf::from(rel),
+                    rel: rel.to_string(),
+                    rel_lower: rel.to_lowercase(),
+                    filename_start: start,
+                    filename_start_lower: start,
+                }
+            })
+            .collect();
+        let mut f = FileFinder::new(Arc::new(entries));
+        f.set_query(query);
+        let area = Rect::new(0, 0, 120, 40);
+        let mut buf = Buffer::empty(area);
+        render_file_finder(
+            &mut f,
+            area,
+            &mut buf,
+            crate::theme::Theme::from_id("loch"),
+            false,
+            false,
+        );
+        (f, buf)
+    }
+
+    fn row_text(buf: &Buffer, rect: Rect, y: u16) -> String {
+        (rect.x..rect.right())
+            .map(|x| buf[(x, y)].symbol().to_string())
+            .collect()
+    }
+
+    /// Croft Loch: a titleless card, a row per file with its icon (in its
+    /// own colour), the name in body ink with the match in bold strong ink
+    /// (the accent is the selection's alone), the folder muted, and the
+    /// selected row's accent bar on the card's left edge.
+    #[test]
+    fn croft_loch_finder_rows_read_like_the_explorer() {
+        let t = crate::widgets::surface::tones(crate::theme::Theme::from_id("loch")).unwrap();
+        let (f, buf) = loch_finder(&["src/app/main.rs", "README.md"], "main");
+        let rect = f.last_rect;
+        let top = row_text(&buf, rect, rect.y);
+        assert!(!top.contains("Go to File"), "{top:?}");
+        let y = rect.y + 3;
+        let row = row_text(&buf, rect, y);
+        let icon = crate::icons::for_path("main.rs", ".rs");
+        assert!(
+            row.starts_with(&format!("\u{258e} {} main.rs  src/app", icon.glyph)),
+            "{row:?}"
+        );
+        assert_eq!(buf[(rect.x, y)].fg, t.accent(), "the selection bar");
+        let name = rect.x + 4;
+        assert_eq!(buf[(name, y)].fg, t.strong(), "`main` matched");
+        assert_eq!(
+            buf[(rect.x + 2, y)].fg,
+            crate::theme::Theme::from_id("loch").ui(icon.color),
+            "the icon keeps its colour"
+        );
+        assert!(buf[(name, y)].modifier.contains(Modifier::BOLD));
+        assert_eq!(buf[(name + 4, y)].fg, t.text(), "the rest of the name");
+        assert!(!buf[(name + 4, y)].modifier.contains(Modifier::BOLD));
+        assert_eq!(buf[(name + 9, y)].fg, t.muted(), "the folder");
+        let input = row_text(&buf, rect, rect.y + 1);
+        assert!(input.contains("\u{203a} main"), "{input:?}");
+        assert!(input.contains("1 match"), "{input:?}");
+        assert_eq!(f.last_caret, Some((rect.x + 8, rect.y + 1)));
+    }
+
+    /// Croft Loch: with nothing typed the placeholder says what to type and
+    /// the count is the index's size.
+    #[test]
+    fn croft_loch_finder_shows_a_placeholder_and_the_index_size() {
+        let (f, buf) = loch_finder(&["a.rs", "b.rs", "c.rs"], "");
+        let input = row_text(&buf, f.last_rect, f.last_rect.y + 1);
+        assert!(input.contains("Search files by name"), "{input:?}");
+        assert!(input.contains("3 files"), "{input:?}");
+        let (f, buf) = loch_finder(&["a.rs"], "zzz");
+        let body: String = (f.last_rect.y..f.last_rect.bottom())
+            .map(|y| row_text(&buf, f.last_rect, y))
+            .collect();
+        assert!(body.contains("No matching files"), "{body:?}");
+    }
+
+    #[test]
+    fn a_name_match_lights_the_name_before_a_path_match() {
+        assert_eq!(
+            finder_match_offsets("src/main/main.rs", 9, "main"),
+            [9, 10, 11, 12]
+        );
+        assert_eq!(finder_match_offsets("src/app/x.rs", 8, "app"), [4, 5, 6]);
+        assert_eq!(finder_match_offsets("src/foo/bar.rs", 8, "fbr"), [4, 8, 10]);
+        assert!(finder_match_offsets("a.rs", 0, "").is_empty());
+    }
 
     #[test]
     fn fuzzy_matching_compares_characters_not_bytes() {

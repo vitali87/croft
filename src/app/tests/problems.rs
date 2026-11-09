@@ -602,6 +602,8 @@ fn the_problems_count_paints_an_orange_pill_in_the_tab_strip() {
     use crate::lsp::manager::DiagnosticSeverity;
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // The boxed brand theme's pill; Croft Loch's tinted chip is below.
+    app.apply_theme(crate::theme::Theme::BLACK);
     let a = tmp.path().join("a.rs");
     let mut s1 = std::collections::HashMap::new();
     s1.insert(
@@ -624,6 +626,46 @@ fn the_problems_count_paints_an_orange_pill_in_the_tab_strip() {
     let cap_r = (strip.x..strip.x + strip.width)
         .any(|x| buf[(x, strip.y)].symbol() == "\u{e0b4}" && buf[(x, strip.y)].fg == orange);
     assert!(cap_r, "the pill has a rounded orange right cap");
+}
+
+/// Croft Loch's PROBLEMS count is a tinted chip, red while there are
+/// errors, with no Powerline caps and no brand orange, as wide as the
+/// boxed pill so the tab's hit rect is unchanged.
+#[test]
+fn croft_loch_problems_count_is_a_tinted_chip_without_caps() {
+    use crate::lsp::manager::DiagnosticSeverity;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let t = crate::widgets::surface::tones(app.theme).expect("Croft Loch is the default");
+    let a = tmp.path().join("a.rs");
+    let mut s1 = std::collections::HashMap::new();
+    s1.insert(
+        String::from("rustc"),
+        vec![diag(0, 1, DiagnosticSeverity::Error)],
+    );
+    app.lsp_diagnostics.insert(a, s1);
+    app.rebuild_problems();
+    let backend = ratatui::backend::TestBackend::new(140, 50);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let buf = term.backend().buffer();
+    let tab = app.problems_tab_rect;
+    let cells: Vec<_> = (tab.x..tab.right()).map(|x| &buf[(x, tab.y)]).collect();
+    let text: String = cells.iter().map(|c| c.symbol()).collect();
+    assert!(text.ends_with(" 1 "), "{text:?}");
+    let orange = crate::gradient::rgb_color(crate::gradient::GRAD_TR);
+    assert!(
+        cells
+            .iter()
+            .all(|c| !matches!(c.symbol(), "\u{e0b6}" | "\u{e0b4}") && c.bg != orange),
+        "no Powerline caps, no orange: {text:?}"
+    );
+    let digit = cells[cells.len() - 2];
+    let red = (0xe5, 0x53, 0x4b);
+    let fill = crate::gradient::rgb_color(crate::gradient::lerp_rgb(t.chrome, red, 0.22));
+    assert_eq!(digit.bg, fill, "the chip is red laid into the chrome");
+    assert_eq!(cells[cells.len() - 1].bg, fill, "padded both sides");
+    assert_ne!(digit.fg, digit.bg);
 }
 
 #[test]

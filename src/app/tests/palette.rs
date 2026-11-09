@@ -350,6 +350,112 @@ fn esc_closes_the_file_finder_modal() {
     );
 }
 
+/// Croft Loch: while the Command Palette is open the terminal's caret is
+/// the palette query's, never the editor's blinking through the card; a
+/// boxed theme paints its own caret block and keeps its caret rules.
+#[test]
+fn the_palette_owns_the_caret_while_it_is_open() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    std::fs::write(&a, "alpha\nbeta\n").unwrap();
+    for (theme, loch) in [
+        (crate::theme::Theme::from_id("loch"), true),
+        (crate::theme::Theme::BLACK, false),
+    ] {
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.apply_theme(theme);
+        app.editor.open_in_new_tab(&a).unwrap();
+        app.focus_pane(Pane::Editor);
+        app.screen_reader = true;
+        app.open_command_palette();
+        for c in "tog".chars() {
+            app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+                .unwrap();
+        }
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        let palette = app.command_palette.as_ref().unwrap();
+        let rect = palette.last_rect;
+        if loch {
+            assert_eq!(
+                app.quick_input_caret(),
+                Some((rect.x + 7, rect.y + 1)),
+                "after `tog` on the input row"
+            );
+            assert!(app.cursor_should_be_visible());
+        } else {
+            assert_eq!(app.quick_input_caret(), None, "a painted caret block");
+            assert!(!app.quick_input_owns_caret(), "boxed caret rules as before");
+        }
+    }
+}
+
+/// Screen reader mode parks the terminal's caret on the picker's
+/// announcement, so on Croft Loch, whose query has no caret of its own, a
+/// block marks where the typing lands instead of the query losing its caret.
+#[test]
+fn a_screen_reader_keeps_a_visible_caret_in_the_loch_palette_query() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.screen_reader = true;
+    app.open_command_palette();
+    for c in "tog".chars() {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+            .unwrap();
+    }
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let (cx, cy) = app
+        .quick_input_caret()
+        .expect("Loch hands the query a caret");
+    let buf = term.backend().buffer();
+    assert!(
+        buf[(cx, cy)].modifier.contains(Modifier::REVERSED),
+        "the query's caret is painted while the announcement has the terminal's"
+    );
+    let parked = term.get_cursor_position().unwrap();
+    assert_eq!(
+        Some((parked.x, parked.y)),
+        app.announce_pos,
+        "the terminal's caret stays on the announcement"
+    );
+}
+
+/// Croft Loch dims the screen behind a quick input, except where the
+/// terminal draws inline images, which are baked and would stay lit.
+#[test]
+fn the_quick_input_scrim_is_withheld_where_inline_images_draw() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("alpha.rs"), "fn main() {}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.open_file_finder();
+    let draw = |app: &mut App| {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        term.backend().buffer().clone()
+    };
+    let dimmed = draw(&mut app);
+    app.inline_protocol = crate::iterm2_inline::InlineImageProtocol::Kitty;
+    let lit = draw(&mut app);
+    let card = app.file_finder.as_ref().unwrap().last_rect;
+    let luma = |c: ratatui::style::Color| match c {
+        ratatui::style::Color::Rgb(r, g, b) => u32::from(r) + u32::from(g) + u32::from(b),
+        _ => 0,
+    };
+    let status = 39;
+    assert!(status > card.bottom(), "the status bar is off the card");
+    let darker = (0..120).any(|x| luma(dimmed[(x, status)].fg) < luma(lit[(x, status)].fg));
+    assert!(darker, "the scrim sinks the status bar");
+    for x in 0..120 {
+        if matches!(lit[(x, status)].fg, ratatui::style::Color::Rgb(..)) {
+            assert!(
+                luma(dimmed[(x, status)].fg) <= luma(lit[(x, status)].fg),
+                "nothing behind the card gets brighter ({x})"
+            );
+        }
+    }
+}
+
 /// Issue #207: under Croft Light the quick-input popups must paint light
 /// chrome, not the historical hardcoded dark constants. Renders the Cmd+P
 /// finder under both a dark theme and the light theme and inspects actual
@@ -2669,7 +2775,8 @@ fn a_bookmark_jump_drops_the_destination_tabs_extra_carets() {
     );
 }
 
-/// The editor's caret hides behind a list picker and comes back with it closed.
+/// The editor's caret hides behind a list picker and comes back with it
+/// closed. On Croft Loch the caret the picker shows is its own query's.
 #[test]
 fn the_editor_caret_is_hidden_while_a_list_picker_is_open() {
     use crate::widgets::command_palette::Command;
@@ -2689,12 +2796,22 @@ fn the_editor_caret_is_hidden_while_a_list_picker_is_open() {
         app.cursor_should_be_visible(),
         "the caret shows in the editor"
     );
+    let editor_caret = app.editor.cursor_screen_pos();
     app.run_command(Command::ViewBookmarks);
     assert!(app.list_picker.is_some());
     assert!(
         !app.cursor_should_be_visible(),
         "the caret stays hidden behind View Bookmarks"
     );
+    term.draw(|f| app.render(f)).unwrap();
+    let picker = app.list_picker.as_ref().unwrap();
+    let caret = app
+        .quick_input_caret()
+        .expect("Loch hands the query its caret");
+    assert_eq!(Some(caret), picker.last_caret);
+    assert_eq!(caret.1, picker.last_rect.y + 1, "on the picker's input row");
+    assert_ne!(Some(caret), editor_caret, "not the editor's");
+    assert!(app.cursor_should_be_visible());
     app.dismiss_list_picker();
     assert!(
         app.cursor_should_be_visible(),

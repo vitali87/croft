@@ -45,6 +45,61 @@ fn black_theme_context_menu_uses_gradient_border_and_muted_selection() {
     assert_eq!(buf[(11, 11)].bg, rgb_color(POPUP_SEL_BG));
 }
 
+/// Croft Loch draws a context menu as a raised card: the selected row is
+/// the band with the accent bar on the card's edge, a separator runs from
+/// rim to rim, and a shortcut is keycaps the panel is widened to hold.
+#[test]
+fn croft_loch_context_menu_is_a_card_with_keycaps_and_a_selected_bar() {
+    use crate::widgets::surface;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.theme = crate::theme::Theme::from_id("loch");
+    let t = surface::tones(app.theme).unwrap();
+    let mut menu = ContextMenu::flat(
+        (10, 10),
+        vec![
+            (
+                String::from("New File"),
+                MenuAction::Create(CreateKind::File),
+            ),
+            (
+                String::from("New Folder"),
+                MenuAction::Create(CreateKind::Folder),
+            ),
+        ],
+        tmp.path().to_path_buf(),
+    );
+    menu.items.insert(1, MenuEntry::Separator);
+    app.context_menu = Some(menu);
+    let backend = ratatui::backend::TestBackend::new(140, 50);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let buf = term.backend().buffer();
+    let r = app.menu_rect().unwrap();
+    // The selected (first) row: the bar on the card's edge, the band.
+    assert_eq!(buf[(r.x, r.y + 1)].symbol(), surface::ROW_BAR);
+    assert_eq!(buf[(r.x, r.y + 1)].fg, t.accent());
+    assert_eq!(buf[(r.x + 2, r.y + 1)].bg, t.band());
+    // The separator meets the rim on both sides.
+    for x in r.x..r.right() {
+        assert_eq!(buf[(x, r.y + 2)].symbol(), "\u{2500}", "({x}) on the rule");
+    }
+    // New Folder's shortcut is keycaps, inside the panel.
+    let hint = menu_hint(&MenuAction::Create(CreateKind::Folder), &app.keymap).unwrap();
+    let caps: u16 = surface::keycap_spans(&hint, t, t.raised(), false)
+        .iter()
+        .map(|s| s.width() as u16)
+        .sum();
+    assert!(r.width >= "New Folder".len() as u16 + caps + 4, "{r:?}");
+    let cap_bg = t.keycap_on(t.raised());
+    assert!((r.x..r.right()).any(|x| buf[(x, r.y + 3)].bg == cap_bg));
+    assert_eq!(
+        buf[(r.right() - 1, r.y + 3)].symbol(),
+        "\u{2595}",
+        "rim kept"
+    );
+}
+
 #[test]
 fn black_theme_status_bar_is_near_black_not_navy() {
     let tmp = tempfile::tempdir().unwrap();
@@ -594,6 +649,7 @@ fn black_theme_terminal_buttons_are_teal_icons_not_navy_chips() {
     use crate::gradient::{INNER_ACCENT, rgb_color};
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.apply_theme(crate::theme::Theme::BLACK);
     let add = terminal_header_probe(&mut app);
     let backend = ratatui::backend::TestBackend::new(140, 50);
     let mut term = ratatui::Terminal::new(backend).unwrap();
@@ -614,6 +670,7 @@ fn black_theme_terminal_button_hover_paints_teal_pill() {
     use crate::gradient::{POPUP_SEL_BG, rgb_color};
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.apply_theme(crate::theme::Theme::BLACK);
     let add = terminal_header_probe(&mut app);
     app.handle_mouse(crossterm::event::MouseEvent {
         kind: crossterm::event::MouseEventKind::Moved,
@@ -632,6 +689,33 @@ fn black_theme_terminal_button_hover_paints_teal_pill() {
         "hovered button wears the teal pill"
     );
     assert_eq!(buf[plus].fg, Color::White);
+}
+
+#[test]
+fn croft_loch_terminal_buttons_are_muted_until_hovered() {
+    let t = crate::widgets::surface::tones(crate::theme::Theme::LOCH).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let add = terminal_header_probe(&mut app);
+    let backend = ratatui::backend::TestBackend::new(140, 50);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let plus = (add.x + 1, add.y);
+    assert_eq!(
+        term.backend().buffer()[plus].fg,
+        t.muted(),
+        "idle: muted, not the accent"
+    );
+    app.handle_mouse(crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::Moved,
+        column: add.x + 1,
+        row: add.y,
+        modifiers: KeyModifiers::NONE,
+    });
+    term.draw(|f| app.render(f)).unwrap();
+    let cell = &term.backend().buffer()[plus];
+    assert_eq!(cell.fg, t.strong(), "hover lifts the icon");
+    assert_eq!(cell.bg, t.hover_on(t.chrome), "onto a faint chip");
 }
 
 #[test]
@@ -693,6 +777,7 @@ fn black_theme_sidebar_titles_are_chipless_brand_headers() {
     use crate::gradient::{PANEL_TITLE_FG, rgb_color};
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.apply_theme(crate::theme::Theme::BLACK);
     let buf = render_buf(&mut app);
     let tree = app.tree.last_area;
     assert_eq!(buf[(tree.x + 2, tree.y)].symbol(), "E");
@@ -702,6 +787,55 @@ fn black_theme_sidebar_titles_are_chipless_brand_headers() {
     let remote = app.remote.last_area;
     assert_eq!(buf[(remote.x + 2, remote.y)].symbol(), "R");
     assert_eq!(buf[(remote.x + 2, remote.y)].fg, rgb_color(PANEL_TITLE_FG));
+}
+
+/// Croft Loch's side bar titles say where focus is: EXPLORER in the strong
+/// ink while the tree has the keyboard and muted once it moves on, never
+/// bold, with the accent lip starting a cell past the title.
+#[test]
+fn croft_loch_side_bar_title_is_strong_only_while_focused() {
+    let t = crate::widgets::surface::tones(crate::theme::Theme::LOCH).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let buf = render_buf(&mut app);
+    let tree = app.tree.last_area;
+    let e = (tree.x + 2, tree.y);
+    assert_eq!(buf[e].symbol(), "E");
+    assert_eq!(buf[e].fg, t.strong(), "the focused view's title");
+    assert!(!buf[e].modifier.contains(Modifier::BOLD));
+    assert_eq!(buf[(tree.x + 10, tree.y)].symbol(), " ", "breathing room");
+    assert_eq!(buf[(tree.x + 11, tree.y)].symbol(), "\u{2594}", "the lip");
+    app.focus_pane(Pane::Editor);
+    let buf = render_buf(&mut app);
+    assert_eq!(buf[e].fg, t.muted(), "an unfocused view's title recedes");
+}
+
+/// Croft Loch: a hairline closes the tree off from the stacked section
+/// under it, the same seam every section draws below itself, and the
+/// section headers wear the muted codicon chevron.
+#[test]
+fn croft_loch_explorer_sections_are_divided_by_hairlines() {
+    let t = crate::widgets::surface::tones(crate::theme::Theme::LOCH).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("a.txt"), "x\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&tmp.path().join("a.txt")).unwrap();
+    if !app.explorer_views.is_visible(ExplorerView::Outline) {
+        app.toggle_explorer_view(ExplorerView::Outline);
+    }
+    let buf = render_buf(&mut app);
+    let tree = app.tree.last_area;
+    let outline = app.outline.last_area;
+    assert_eq!(outline.y, tree.bottom(), "the outline follows the tree");
+    let seam = (tree.x + 3, tree.bottom() - 1);
+    assert_eq!(buf[seam].symbol(), "\u{2581}", "a hairline under the tree");
+    assert_eq!(buf[seam].fg, t.hairline());
+    let chevron = (outline.x + 1, outline.y);
+    assert_eq!(
+        buf[chevron].symbol(),
+        crate::widgets::surface::CHEVRON_FOLDED.to_string()
+    );
+    assert_eq!(buf[chevron].fg, t.muted());
 }
 
 /// #1583: a German catalog for the frame's own titles, as a translator
@@ -857,6 +991,7 @@ fn black_theme_remote_header_buttons_are_near_white_icons() {
     use crate::gradient::{PANEL_TITLE_FG, rgb_color};
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.apply_theme(crate::theme::Theme::BLACK);
     app.sidebar_view = SidebarView::Remote;
     let buf = render_buf(&mut app);
     let add = app.remote.header_add_btn;
@@ -868,6 +1003,21 @@ fn black_theme_remote_header_buttons_are_near_white_icons() {
     assert_eq!(buf[(add.x, add.y)].fg, rgb_color(PANEL_TITLE_FG));
 }
 
+/// Croft Loch's view header buttons (Remote's `+` and refresh, Source
+/// Control's refresh and `⋯`) rest as muted icons, not bold near-white.
+#[test]
+fn croft_loch_side_bar_header_buttons_rest_muted() {
+    let t = crate::widgets::surface::tones(crate::theme::Theme::LOCH).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.sidebar_view = SidebarView::Remote;
+    let buf = render_buf(&mut app);
+    let add = app.remote.header_add_btn;
+    assert!(add.width > 0, "remote header add button must render");
+    assert_eq!(buf[(add.x, add.y)].fg, t.muted());
+    assert!(!buf[(add.x, add.y)].modifier.contains(Modifier::BOLD));
+}
+
 #[test]
 fn black_theme_active_editor_tab_wears_the_teal_selection_fill() {
     use crate::gradient::{POPUP_SEL_BG, rgb_color};
@@ -875,6 +1025,7 @@ fn black_theme_active_editor_tab_wears_the_teal_selection_fill() {
     let f = tmp.path().join("probe.txt");
     std::fs::write(&f, "alpha\n").unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.apply_theme(crate::theme::Theme::BLACK);
     app.editor.open_pinned(&f).unwrap();
     let buf = render_buf(&mut app);
     assert!(

@@ -607,6 +607,37 @@ fn clicking_the_port_toast_dismiss_button_clears_it() {
     );
 }
 
+/// Croft Loch: the port toast is a raised card with the card edge (no line
+/// box on the canvas, no title on its edge), its primary action in the
+/// button fill without bold, and the dismiss cross a bare muted mark.
+#[test]
+fn croft_loch_port_toast_is_a_raised_card() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.theme = crate::theme::Theme::from_id("loch");
+    let t = crate::widgets::surface::tones(app.theme).unwrap();
+    app.show_port_toast(3000, Some("node".into()));
+    let backend = ratatui::backend::TestBackend::new(140, 50);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let buf = term.backend().buffer();
+    let buttons = app.port_toast.as_ref().unwrap().buttons.clone();
+    let (open, _) = buttons[0];
+    let (dismiss, _) = *buttons.last().unwrap();
+    // The body line sits one row above the buttons, the edge one above it.
+    let top = open.y - 2;
+    let x0 = open.x - 2;
+    assert_eq!(buf[(x0, top)].symbol(), "\u{2594}");
+    assert_eq!(buf[(x0, top)].fg, t.accent(), "the lip");
+    let edge: String = (x0..x0 + 20).map(|x| buf[(x, top)].symbol()).collect();
+    assert!(!edge.contains("PORT"), "{edge}");
+    assert_eq!(buf[(open.x - 1, open.y)].bg, t.raised());
+    assert_eq!(buf[(open.x, open.y)].bg, app.theme.button());
+    assert!(!buf[(open.x, open.y)].modifier.contains(Modifier::BOLD));
+    assert_eq!(buf[(dismiss.x + 1, dismiss.y)].fg, t.muted());
+    assert_eq!(buf[(dismiss.x + 1, dismiss.y)].bg, t.raised());
+}
+
 #[test]
 fn relay_request_ids_are_unique_per_request() {
     // `Instant::now().elapsed()` measures the gap between an instant and
