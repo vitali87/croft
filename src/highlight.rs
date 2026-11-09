@@ -547,6 +547,16 @@ static SYNTAX: RwLock<SyntaxPalette> = RwLock::new(SyntaxPalette::BASE16);
 /// `apply_theme` and then re-highlights open editors so the change is visible
 /// immediately (cached spans carry baked colors).
 pub fn set_syntax_palette(palette: SyntaxPalette) {
+    // Under test the shared palette stays Base16. It is process-wide, every
+    // `App::new` pushes its theme's palette (Croft Loch's is not Base16),
+    // and App tests run on threads beside the highlight tests that pin
+    // Base16 colours, so a push here would make those tests pass or fail by
+    // scheduling. A test that needs another palette highlights through the
+    // explicit-palette paths (`highlight_text_with_palette`,
+    // `palette_style_for_name`) instead.
+    if cfg!(test) {
+        return;
+    }
     *SYNTAX.write().unwrap() = palette;
 }
 
@@ -2473,6 +2483,16 @@ def f() -> Config:\n\
                 "{kw} on a dark theme is {on_dark:.2}:1, want >= 4.5:1"
             );
         }
+    }
+
+    /// The shared palette never leaves Base16 under test: every `App::new`
+    /// pushes its theme's palette (Croft Loch's is its own), and the tests
+    /// here that pin Base16 colours must not pass or fail by which App test
+    /// happened to run beside them.
+    #[test]
+    fn the_shared_palette_stays_base16_under_test() {
+        set_syntax_palette(crate::theme::SyntaxPalette::LOCH);
+        assert_eq!(*SYNTAX.read().unwrap(), SyntaxPalette::BASE16);
     }
 
     /// The light/dark decision comes from the palette's foreground: a dark

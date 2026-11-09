@@ -5562,10 +5562,11 @@ fn scrubbing_shows_the_file_at_each_commit_and_its_changes() {
         }
         screen.push('\n');
     }
-    // Look at editor lines only (`N ┃text`): the explorer shows the temp
-    // dir's random name, which can itself contain "v2".
+    // Look at editor lines only (`N ▎text`, Croft Loch's change bar): the
+    // explorer shows the temp dir's random name, which can itself contain
+    // "v2".
     assert!(
-        screen.contains("┃v1") && !screen.contains("┃v2"),
+        screen.contains("▎v1") && !screen.contains("▎v2"),
         "only the root commit's text shows:\n{screen}"
     );
 }

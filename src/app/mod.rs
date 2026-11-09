@@ -13616,8 +13616,19 @@ impl App {
                 crumbs.push(Crumb {
                     label: os.to_string_lossy().into_owned(),
                     target: None,
+                    icon: None,
                 });
             }
+        }
+        // The file crumb wears its Explorer icon (drawn on a `surfaces`
+        // theme only); the folders before it stay plain.
+        if let Some(file) = crumbs.last_mut() {
+            let suffix = path
+                .extension()
+                .map(|e| format!(".{}", e.to_string_lossy()))
+                .unwrap_or_default();
+            let icon = crate::icons::for_path(&file.label, &suffix);
+            file.icon = Some((icon.glyph, icon.color));
         }
         // Symbol scope chain, only when the outline belongs to this file so a
         // stale outline from the previous tab never leaks into the bar.
@@ -13635,9 +13646,11 @@ impl App {
                 .map_or(self.editor.cursor_col, |v| v.cursor_col) as u32;
             for i in breadcrumb_symbol_chain(symbols, line, col) {
                 let s = &symbols[i];
+                let icon = crate::icons::for_outline_kind(s.kind);
                 crumbs.push(Crumb {
                     label: s.name.clone(),
                     target: Some((s.line, s.character)),
+                    icon: Some((icon.glyph, icon.color)),
                 });
             }
         }
@@ -19233,15 +19246,24 @@ impl App {
         // in the 4-wide slot.
         let base = self.theme.ui(Color::Rgb(0xcc, 0xcc, 0xcc));
         let accent = self.theme.ui(Color::Rgb(0x4e, 0x9a, 0xff));
+        let surfaces = self.theme.surfaces().is_some();
+        let theme = self.theme;
         let mut paint = |x: u16, glyph: char| {
             let hovered = pointer.is_some_and(|(px, py)| py == y && px >= x && px < x + w);
-            let color = if hovered { accent } else { base };
-            frame.buffer_mut().set_string(
-                x + w / 2,
-                y,
-                glyph.to_string(),
-                Style::default().fg(color),
-            );
+            // On a `surfaces` theme these are header actions like the side
+            // bar's: muted at rest, and under the pointer the strong ink on
+            // a faint chip across the whole two-cell slot, never the accent.
+            let style = if surfaces {
+                crate::widgets::header_pill::action_style(theme, hovered)
+            } else {
+                Style::default().fg(if hovered { accent } else { base })
+            };
+            let buf = frame.buffer_mut();
+            if surfaces && hovered {
+                let chip = Rect::new(x, y, w, 1).intersection(buf.area);
+                buf.set_style(chip, style);
+            }
+            buf.set_string(x + w / 2, y, glyph.to_string(), style);
         };
         let side_glyph = if self.show_tree {
             crate::icons::LAYOUT_SIDEBAR_ON
@@ -23446,6 +23468,10 @@ impl App {
             // mirroring the terminal pane buttons' hover affordance.
             let pointer = self.pointer_cell;
             self.editor.hover_pointer = pointer;
+            // A modal quick input takes the keyboard without moving focus
+            // (no focus sync runs when one opens), so the editor learns each
+            // frame to drop its accent marks while one is up.
+            self.editor.overlay_has_keyboard = self.modal_overlay_open();
             // Without an inline-image protocol an image tab draws itself in
             // half blocks (#1591).
             let cell_images = !self.inline_images_enabled();
@@ -23664,6 +23690,9 @@ impl App {
                 let active_area = rects[active_idx];
                 self.editor.set_tab_reserved_right(reserve(active_area));
                 frame.render_widget(&mut self.editor, active_area);
+                if let Some((_, full_strip, _)) = minimap {
+                    self.paint_minimap_header(frame.buffer_mut(), full_strip);
+                }
                 let inactive_rects: Vec<Rect> = rects
                     .iter()
                     .enumerate()
@@ -23707,6 +23736,7 @@ impl App {
                 );
                 self.editor.set_tab_reserved_right(reserve(ed_rect));
                 frame.render_widget(&mut self.editor, ed_rect);
+                self.paint_minimap_header(frame.buffer_mut(), full_strip);
                 self.editor_seams.clear();
                 self.update_editor_image_overlay(0, ed_rect);
                 self.disable_editor_image(1);
@@ -74086,6 +74116,37 @@ impl App {
             full_strip
         };
         Some((ed_rect, full_strip, img))
+    }
+
+    /// The minimap column's share of the editor header on a `surfaces`
+    /// theme, painted after the editor: the tab-strip row in the strip's
+    /// chrome, so the strip (and the layout icons on it) runs to the edge
+    /// instead of stopping a canvas-black column short, and the seam under
+    /// the breadcrumbs carried across the column. The editor's rule has
+    /// eased into the hairline by its far end, so the column takes that.
+    fn paint_minimap_header(&self, buf: &mut ratatui::buffer::Buffer, column: Rect) {
+        let Some(t) = crate::widgets::surface::tones(self.theme) else {
+            return;
+        };
+        let column = column.intersection(buf.area);
+        if column.height == 0 {
+            return;
+        }
+        let strip_row = Rect {
+            height: 1,
+            ..column
+        };
+        buf.set_style(strip_row, Style::default().bg(self.theme.tab_strip_bg()));
+        let body = self.editor.last_body;
+        if body.height >= 2 && body.y > column.y && body.y < column.bottom() {
+            for x in column.left()..column.right() {
+                let cell = &mut buf[(x, body.y)];
+                if cell.symbol() == " " {
+                    cell.set_symbol("\u{2594}");
+                    cell.set_fg(t.hairline());
+                }
+            }
+        }
     }
 
     /// Whether the open context menu (or its submenu, which floats further
