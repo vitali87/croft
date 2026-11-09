@@ -123,7 +123,7 @@ fn workspace_cap_carries_the_brand_mark_and_the_folder_name() {
     let theme = crate::theme::Theme::default();
     let spans = workspace_cap_spans(theme, "proj");
     let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
-    assert_eq!(text, " <> proj \u{e0b4} ");
+    assert_eq!(text, " <> proj \u{e0b4}");
     // The "<>" (the logo's stylised "o") carries the logo orange, on the
     // selection tint the whole cap shares; the rounded end is drawn in it.
     let bracket = spans.iter().find(|s| s.content == "<>").unwrap();

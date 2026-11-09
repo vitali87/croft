@@ -993,8 +993,9 @@ const GIT_DIRTY_DOT: &str = "\u{2022}";
 const PILL_CAP_L: &str = "\u{e0b6}";
 const PILL_CAP_R: &str = "\u{e0b4}";
 
-/// Cells left blank after the status bar's last right-hand segment.
-const STATUS_RIGHT_MARGIN: u16 = 1;
+/// Cells left blank after the status bar's last right-hand segment: none,
+/// since the language pill's rounded end already reads as an edge.
+const STATUS_RIGHT_MARGIN: u16 = 0;
 
 /// The status bar's three text tones, so hierarchy comes from brightness
 /// rather than from dividers or a colour per item: `text` for the values you
@@ -1071,18 +1072,19 @@ fn git_status_spans<'a>(
         status.head_label(),
         Style::default().fg(tones.text),
     ));
-    if status.dirty {
+    // The operation git stopped in (#1356), as `main | MERGING`, read as one
+    // phrase: the dirty dot comes after it.
+    if let Some(op) = status.operation {
         spans.push(Span::styled(
-            format!(" {GIT_DIRTY_DOT}"),
+            format!(" | {}", op.label()),
             Style::default()
                 .fg(theme.ui(GIT_DIRTY_COLOR))
                 .add_modifier(Modifier::BOLD),
         ));
     }
-    // The operation git stopped in (#1356), as `main | MERGING`.
-    if let Some(op) = status.operation {
+    if status.dirty {
         spans.push(Span::styled(
-            format!(" | {}", op.label()),
+            format!(" {GIT_DIRTY_DOT}"),
             Style::default()
                 .fg(theme.ui(GIT_DIRTY_COLOR))
                 .add_modifier(Modifier::BOLD),
@@ -1137,7 +1139,6 @@ fn workspace_cap_spans(theme: crate::theme::Theme, name: &str) -> Vec<Span<'stat
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(PILL_CAP_R, Style::default().fg(fill)),
-        Span::raw(" "),
     ]
 }
 
@@ -24327,8 +24328,9 @@ impl App {
         let zone_div = Style::default();
         let div = " ";
         let scm_spans = git_status_spans(&scm_status, self.theme);
-        // The cap already ends in a space; the git spans don't, so buy the
-        // spacer one cell of air only when the branch segment painted.
+        // The git spans open with their own air and the cap ends on its
+        // rounded edge, so the spacer takes one more cell only when the
+        // branch segment painted.
         let scm_present = !scm_spans.is_empty();
         spans.extend(scm_spans);
         spans.push(Span::styled(
@@ -24408,7 +24410,7 @@ impl App {
                 Style::default().fg(if err_count > 0 { tones.text } else { tones.dim }),
             ),
             (
-                String::from("  \u{ea6c} "),
+                String::from(" \u{ea6c} "),
                 Style::default().fg(if warn_count > 0 {
                     self.theme.ui(Color::Rgb(0xe5, 0xb5, 0x4a))
                 } else {
@@ -24464,7 +24466,7 @@ impl App {
         self.status_message_rect = Rect::default();
         let mut status_x: u16 = 0;
         if !status_text.is_empty() {
-            spans.push(Span::styled(format!("{div}  "), zone_div));
+            spans.push(Span::styled(format!("{div} "), zone_div));
             let x: u16 = spans.iter().map(|s| s.content.chars().count() as u16).sum();
             status_x = x;
             if status_h > 0 && x < outer[2].width {
