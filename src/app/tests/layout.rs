@@ -584,7 +584,7 @@ fn the_status_bar_names_the_operation_in_progress() {
     let p = tmp.path();
     assert!(!git_succeeds(p, &["merge", "feat"]));
     let status = crate::git::query(p);
-    let text: String = git_status_spans(&status)
+    let text: String = git_status_spans(&status, crate::theme::Theme::default())
         .iter()
         .map(|s| s.content.to_string())
         .collect();
@@ -593,7 +593,7 @@ fn the_status_bar_names_the_operation_in_progress() {
     assert!(git_succeeds(p, &["checkout", "-q", "feat"]));
     assert!(!git_succeeds(p, &["rebase", "main"]));
     let status = crate::git::query(p);
-    let text: String = git_status_spans(&status)
+    let text: String = git_status_spans(&status, crate::theme::Theme::default())
         .iter()
         .map(|s| s.content.to_string())
         .collect();
@@ -1664,6 +1664,35 @@ fn status_message_with_wide_chars_keeps_its_tail_beside_the_cluster() {
         row.contains("main.rs"),
         "the wide-char message keeps its tail: {row:?}"
     );
+}
+
+/// The status bar's left cap names the workspace folder, and every click
+/// target after it is placed by counting cells: a double-width name
+/// (`项目`, four cells for two chars) must not shift the problem counts'
+/// target left of the counts it opens.
+#[test]
+fn a_wide_workspace_name_keeps_the_status_bar_targets_under_their_text() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("\u{9879}\u{76ee}");
+    std::fs::create_dir(&root).unwrap();
+    let mut app = App::new(root).unwrap();
+    let backend = ratatui::backend::TestBackend::new(120, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let buf = term.backend().buffer().clone();
+    let y = buf.area.height - 1;
+    let glyph_x = (0..buf.area.width)
+        .find(|&x| buf[(x, y)].symbol() == "\u{ea87}")
+        .expect("the error count's glyph is on the bar");
+    // A wide char's second cell reads as a blank in the buffer.
+    let row = status_row(&term);
+    assert!(
+        row.contains("\u{9879} \u{76ee} "),
+        "the cap names the folder: {row:?}"
+    );
+    // The counts' target opens on the space before the glyph.
+    assert_eq!(app.status_diag_rect.x + 1, glyph_x);
+    assert_eq!(app.status_diag_rect.y, y);
 }
 
 /// #925: a message of several lines (git's text, a tool's error) is drawn

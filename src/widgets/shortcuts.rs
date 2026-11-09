@@ -392,6 +392,11 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 handler: "is_markdown_preview_key",
             },
             ShortcutEntry {
+                keys: "Cmd/Ctrl+K V",
+                description: "Markdown: open the preview in the next group, showing what you type here",
+                handler: "",
+            },
+            ShortcutEntry {
                 keys: "Cmd/Ctrl+Enter",
                 description: "Markdown: run the runnable fence under the caret in a named pane, new or reused (confirms first; also the palette's Markdown: Run Code Block at Cursor)",
                 handler: "is_run_fence_key",
@@ -615,6 +620,11 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 keys: "Shift+Opt+I / Shift+Alt+I",
                 description: "Add a cursor at the end of each selected line",
                 handler: "is_add_cursors_to_line_ends_key",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+K Cmd/Ctrl+I",
+                description: "Show or Focus Hover: type, docs and any problem at the caret",
+                handler: "",
             },
             ShortcutEntry {
                 keys: "F12",

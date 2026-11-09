@@ -954,7 +954,9 @@ fn a_grouped_review_queue_row_survives_the_status_bar() {
             .record_write(&lane.join(format!("src/l{i}.rs")), 100 + i as u64, &working);
     }
     app.run_command(crate::widgets::command_palette::Command::ShowAgentLane);
-    let backend = ratatui::backend::TestBackend::new(120, 40);
+    // 124 columns: the status bar's left cap names the workspace folder
+    // (`<> repo`), a few cells more than the old wordmark took.
+    let backend = ratatui::backend::TestBackend::new(124, 40);
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|f| app.render(f)).unwrap();
     let buf = term.backend().buffer().clone();

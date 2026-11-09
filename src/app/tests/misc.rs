@@ -119,14 +119,86 @@ fn reset_session_bg_seq_restores_profile_default() {
 }
 
 #[test]
-fn brand_spans_render_the_cr_ft_wordmark_with_orange_brackets() {
-    let spans = brand_spans(crate::theme::Theme::default());
+fn workspace_cap_carries_the_brand_mark_and_the_folder_name() {
+    let theme = crate::theme::Theme::default();
+    let spans = workspace_cap_spans(theme, "proj");
     let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
-    assert_eq!(text, " cr<>ft ");
-    // The "<>" (the stylised "o") carries the logo orange; letters stay white.
+    assert_eq!(text, " <> proj \u{e0b4}");
+    // The "<>" (the logo's stylised "o") carries the logo orange, on the
+    // selection tint the whole cap shares; the rounded end is drawn in it.
     let bracket = spans.iter().find(|s| s.content == "<>").unwrap();
     assert_eq!(bracket.style.fg, Some(BRAND_ORANGE));
-    assert_eq!(spans[0].style.fg, Some(Color::White));
+    assert_eq!(bracket.style.bg, Some(theme.selection()));
+    let cap = spans.iter().find(|s| s.content == PILL_CAP_R).unwrap();
+    assert_eq!(cap.style.fg, Some(theme.selection()));
+}
+
+#[test]
+fn workspace_cap_elides_a_long_folder_name() {
+    let long = "a-workspace-folder-name-far-too-long-for-the-bar";
+    let text: String = workspace_cap_spans(crate::theme::Theme::default(), long)
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect();
+    let name = text
+        .trim()
+        .trim_start_matches("<> ")
+        .trim_end_matches('\u{e0b4}');
+    assert_eq!(name.trim().chars().count(), WORKSPACE_CAP_MAX, "{text}");
+    assert!(name.trim().ends_with('\u{2026}'), "{text}");
+}
+
+#[test]
+fn workspace_cap_elides_a_wide_name_by_the_cells_it_paints() {
+    // Thirty double-width chars: sixty cells, cut to fit the cap's
+    // WORKSPACE_CAP_MAX cells with the ellipsis, not its char count.
+    let wide = "\u{9879}".repeat(30);
+    let spans = workspace_cap_spans(crate::theme::Theme::default(), &wide);
+    let name = spans
+        .iter()
+        .find(|s| s.content.contains('\u{9879}'))
+        .map(|s| s.content.trim().to_string())
+        .unwrap();
+    assert!(name.ends_with('\u{2026}'), "{name}");
+    assert!(status_cells(&name) as usize <= WORKSPACE_CAP_MAX, "{name}");
+}
+
+#[test]
+fn high_contrast_themes_keep_the_status_bar_text_at_full_strength() {
+    // #1548: a high contrast theme resolves dim chrome text to its full
+    // foreground; the status bar's dim tone must not blend that back down.
+    let hc: Vec<_> = crate::theme::Theme::all()
+        .iter()
+        .filter(|t| t.high_contrast())
+        .collect();
+    assert!(!hc.is_empty(), "the bundled themes include high contrast");
+    for theme in hc {
+        let tones = StatusTones::new(*theme, status_bar_bg(*theme));
+        assert_eq!(tones.dim, tones.muted, "{}", theme.label());
+    }
+}
+
+#[test]
+fn workspace_relative_shortens_paths_inside_the_workspace() {
+    let root = std::path::Path::new("/home/me/proj");
+    assert_eq!(
+        workspace_relative("Saved /home/me/proj/src/main.rs", root),
+        "Saved src/main.rs"
+    );
+    // Quoted, and more than once.
+    assert_eq!(
+        workspace_relative("Moved '/home/me/proj/a.rs' to /home/me/proj/b/a.rs", root),
+        "Moved 'a.rs' to b/a.rs"
+    );
+    // The root alone, a sibling folder, and the root inside another path
+    // are all left as they are.
+    for kept in [
+        "Opened /home/me/proj",
+        "Saved /home/me/proj2/x.rs",
+        "Saved /mnt/home/me/proj/x.rs",
+    ] {
+        assert_eq!(workspace_relative(kept, root), kept);
+    }
 }
 
 #[test]

@@ -3456,6 +3456,11 @@ fn reopen_as_preview_shows_the_markdown_preview() {
     // Asked again, it stays on rather than flipping back to the source.
     app.run_command(Command::ReopenAsPreview);
     assert!(app.editor.markdown_preview.is_some());
+    // Reopen as Text still lands in the source, though the same-path reload
+    // it does now keeps a Markdown preview (#1605).
+    app.editor.save_to_disk().unwrap();
+    app.run_command(Command::ReopenAsText);
+    assert!(app.editor.markdown_preview.is_none(), "{}", app.status);
 }
 
 /// #1537 negative: source code has a grammar and no preview, so Reopen as

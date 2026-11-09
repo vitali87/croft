@@ -199,6 +199,210 @@ fn hovering_a_diagnostic_on_punctuation_shows_its_message_synchronously() {
     );
 }
 
+/// `let n = compute(1);` in a `.txt` file stood up by hand, the caret at
+/// `col`. No language server has the file, so the worker answers each hover
+/// request with nothing; [`await_hover_reply`] waits for that answer.
+fn caret_hover_app(col: usize) -> (App, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("notes.txt");
+    std::fs::write(&f, "let n = compute(1);\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.path = Some(f);
+    app.editor.lines = vec![String::from("let n = compute(1);")];
+    app.editor.last_inner = ratatui::layout::Rect::new(0, 0, 80, 25);
+    app.editor.last_gutter_width = 2;
+    app.editor.cursor_col = col;
+    app.focus_pane(Pane::Editor);
+    (app, tmp)
+}
+
+fn answer_hover(app: &App, request_id: u64, text: &str) {
+    app.lsp
+        .as_ref()
+        .unwrap()
+        .push_hover_for_test(crate::lsp::manager::HoverResult {
+            request_id,
+            text: Some(String::from(text)),
+        });
+}
+
+/// Drain until the worker's answer to the pending hover request lands.
+fn await_hover_reply(app: &mut App) {
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(200),
+        "the LSP worker to answer the hover request",
+        || app.drain_lsp_hover(),
+    );
+}
+
+fn diagnose_compute(app: &mut App) {
+    use crate::lsp::manager::{Diagnostic, DiagnosticSeverity};
+    let path = app.editor.path.clone().unwrap();
+    app.editor.apply_diagnostics(
+        path,
+        vec![Diagnostic {
+            start_line: 0,
+            start_char: 8,
+            end_line: 0,
+            end_char: 15,
+            severity: DiagnosticSeverity::Error,
+            message: String::from("cannot find function `compute` in this scope"),
+            tags: Default::default(),
+            code: None,
+            origin: None,
+        }],
+    );
+}
+
+const COMPUTE_PROBLEM: &str = "Error: cannot find function `compute` in this scope";
+
+#[test]
+fn show_hover_asks_about_the_caret_and_opens_the_popup_there() {
+    // #1518: hover had no keyboard route. The command asks about the word
+    // at the caret, and the reply opens at the caret's cell with the
+    // pointer nowhere near it.
+    let (mut app, _tmp) = caret_hover_app(10);
+    let caret = app
+        .editor
+        .cursor_screen_pos()
+        .expect("the caret is on screen");
+    app.run_command(crate::widgets::command_palette::Command::ShowHover);
+    let id = app
+        .hover_request_id
+        .expect("a word at the caret asks the server");
+    assert_eq!(app.hover_word, Some((0, 8, 15)), "about `compute`");
+    // The worker's own empty answer first, so the pushed one is the last.
+    await_hover_reply(&mut app);
+    answer_hover(&app, id, "fn compute(x: i32) -> i32");
+    assert!(app.drain_lsp_hover());
+    let popup = app.hover_popup.as_ref().expect("the reply opens the popup");
+    assert_eq!(popup.lines, vec![String::from("fn compute(x: i32) -> i32")]);
+    assert_eq!(popup.anchor, caret);
+    app.handle_key(key(KeyCode::Right, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.hover_popup.is_none(), "the next key closes it");
+}
+
+#[test]
+fn show_hover_in_a_file_no_server_has_shows_a_problem_or_says_there_is_none() {
+    // The worker dropped a hover request no server could take, so the
+    // command waited forever: no popup for the problem, no status (#1518).
+    let (mut app, _tmp) = caret_hover_app(10);
+    app.run_command(crate::widgets::command_palette::Command::ShowHover);
+    assert!(app.hover_request_id.is_some(), "a word still asks");
+    await_hover_reply(&mut app);
+    assert!(app.hover_popup.is_none());
+    assert_eq!(app.status, "No hover information at the caret");
+
+    diagnose_compute(&mut app);
+    app.run_command(crate::widgets::command_palette::Command::ShowHover);
+    await_hover_reply(&mut app);
+    let popup = app.hover_popup.as_ref().expect("the problem shows");
+    assert_eq!(popup.lines, vec![String::from(COMPUTE_PROBLEM)]);
+}
+
+#[test]
+fn a_pointer_hover_in_a_file_no_server_has_shows_the_problem_on_a_word() {
+    // The same dropped request left the pointer's hover over a squiggled
+    // word blank, as only punctuation skipped the request.
+    let (mut app, _tmp) = caret_hover_app(0);
+    diagnose_compute(&mut app);
+    // text_x = gutter(2) + 1, so cell col 12 is char 9, inside `compute`.
+    let past = std::time::Instant::now() - HOVER_DELAY * 2;
+    app.hover.on_move(past, 12, 0);
+    app.poll_hover();
+    assert!(app.hover_request_id.is_some());
+    await_hover_reply(&mut app);
+    let popup = app.hover_popup.as_ref().expect("the problem shows");
+    assert_eq!(popup.lines, vec![String::from(COMPUTE_PROBLEM)]);
+}
+
+#[test]
+fn show_hover_is_not_taken_over_by_a_pointer_dwell_already_running() {
+    // A pointer that came to rest on `let` just before Ctrl+K Ctrl+I would
+    // fire next frame and put its own hover in place of the caret's.
+    let (mut app, _tmp) = caret_hover_app(10);
+    let past = std::time::Instant::now() - HOVER_DELAY * 2;
+    app.hover.on_move(past, 3, 0);
+    app.run_command(crate::widgets::command_palette::Command::ShowHover);
+    let id = app.hover_request_id;
+    let anchor = app.hover_anchor;
+    app.poll_hover();
+    assert_eq!(app.hover_request_id, id, "still the caret's request");
+    assert_eq!(app.hover_anchor, anchor);
+    assert_eq!(app.hover_word, Some((0, 8, 15)), "still about `compute`");
+}
+
+#[test]
+fn a_hover_reply_after_a_paste_over_the_word_is_dropped() {
+    // A paste is not a key, so it leaves the request pending; `average`
+    // over `compute` keeps the span, and only the edit count tells the
+    // reply describes text that is gone.
+    let (mut app, _tmp) = caret_hover_app(10);
+    app.run_command(crate::widgets::command_palette::Command::ShowHover);
+    let id = app.hover_request_id.expect("a request");
+    await_hover_reply(&mut app);
+    app.editor.selection = Some(crate::widgets::editor::EditorSelection {
+        anchor: (0, 8),
+        head: (0, 15),
+    });
+    app.handle_paste("average");
+    assert_eq!(app.editor.lines[0], "let n = average(1);");
+    assert_eq!(app.hover_request_id, Some(id), "still pending");
+    answer_hover(&app, id, "fn compute(x: i32) -> i32");
+    assert!(!app.drain_lsp_hover(), "the stale reply is dropped");
+    assert!(app.hover_popup.is_none());
+}
+
+#[test]
+fn an_empty_caret_hover_reply_leaves_a_newer_status_alone() {
+    let (mut app, _tmp) = caret_hover_app(10);
+    app.run_command(crate::widgets::command_palette::Command::ShowHover);
+    app.status = String::from("Saved notes.txt");
+    await_hover_reply(&mut app);
+    assert_eq!(app.status, "Saved notes.txt");
+}
+
+#[test]
+fn show_hover_reads_the_word_the_caret_ends_and_says_when_there_is_none() {
+    // As in VS Code: just past `compute` (on its `(`) is still on it.
+    let (mut app, _tmp) = caret_hover_app(15);
+    app.run_command(crate::widgets::command_palette::Command::ShowHover);
+    assert!(app.hover_request_id.is_some());
+    assert_eq!(app.hover_word, Some((0, 8, 15)));
+    // On `=`, after a space: nothing to describe, and the command says so.
+    app.editor.cursor_col = 6;
+    app.run_command(crate::widgets::command_palette::Command::ShowHover);
+    assert_eq!(app.hover_request_id, None);
+    assert!(app.hover_popup.is_none());
+    assert_eq!(app.status, "No hover information at the caret");
+}
+
+#[test]
+fn ctrl_k_ctrl_i_in_the_editor_shows_the_hover_and_ctrl_k_i_still_broadcasts() {
+    // #1518: the broadcast arm took I with or without Ctrl, so VS Code's
+    // Ctrl+K Ctrl+I (Cmd+K Cmd+I on macOS) toggled Broadcast Input.
+    let (mut app, _tmp) = caret_hover_app(10);
+    let cmd = if cfg!(target_os = "macos") {
+        KeyModifiers::SUPER
+    } else {
+        KeyModifiers::CONTROL
+    };
+    assert!(app.handle_cmd_k_chord(key(KeyCode::Char('i'), cmd)));
+    assert!(
+        app.hover_request_id.is_some(),
+        "the chord asks for the hover"
+    );
+    assert!(!app.pending_broadcast_enable);
+    assert!(!app.status.contains("Broadcast"), "{}", app.status);
+    assert!(app.handle_cmd_k_chord(key(KeyCode::Char('i'), KeyModifiers::NONE)));
+    assert!(
+        app.status.starts_with("Broadcast input needs"),
+        "plain Ctrl+K I keeps broadcast input: {}",
+        app.status
+    );
+}
+
 #[test]
 fn the_swallowed_prefix_click_dismisses_the_hover_and_tab_tooltip() {
     // The sibling test above binds `ctrl+click` to a real command, so it takes
@@ -4339,6 +4543,49 @@ fn a_pushed_and_pulled_finding_with_different_data_is_one_row() {
     store_diagnostics_update(&mut store, update(false, vec![copy(1)]));
     store_diagnostics_update(&mut store, update(true, vec![copy(2)]));
     assert_eq!(diagnostics_by_source(&store[&path]).count(), 1);
+}
+
+/// #1523: croft shows a finding's related locations, so a pulled copy that
+/// names them is not dropped as a duplicate of a pushed copy that does not.
+/// Two copies naming the same ones are still one row.
+#[test]
+fn a_pulled_copy_with_related_locations_is_not_dropped_for_a_pushed_one_without() {
+    use crate::lsp::manager::DiagnosticsUpdate;
+    let mut store = std::collections::HashMap::new();
+    let path = PathBuf::from("/w/main.rs");
+    let copy = |related: bool| {
+        let here = lsp_types::DiagnosticRelatedInformation {
+            location: lsp_types::Location {
+                uri: lsp_types::Url::parse("file:///w/main.rs").unwrap(),
+                range: Default::default(),
+            },
+            message: "immutable borrow occurs here".into(),
+        };
+        crate::lsp::client::convert_diagnostic(
+            "rust-analyzer",
+            &lsp_types::Diagnostic {
+                message: "cannot borrow `v` as mutable".into(),
+                related_information: related.then(|| vec![here]),
+                ..Default::default()
+            },
+        )
+    };
+    let update = |pulled, diagnostics| DiagnosticsUpdate {
+        path: path.clone(),
+        server: "rust-analyzer".into(),
+        diagnostics,
+        pulled,
+    };
+    store_diagnostics_update(&mut store, update(false, vec![copy(false)]));
+    store_diagnostics_update(&mut store, update(true, vec![copy(true)]));
+    let related = |store: &std::collections::HashMap<_, _>| {
+        diagnostics_by_source(&store[&path])
+            .map(|(_, d)| d.related().len())
+            .collect::<Vec<_>>()
+    };
+    assert!(related(&store).contains(&1), "{:?}", related(&store));
+    store_diagnostics_update(&mut store, update(false, vec![copy(true)]));
+    assert_eq!(related(&store), vec![1], "the same locations are one row");
 }
 
 /// #1102: a server that pushes a finding and also returns it to a pull

@@ -810,6 +810,11 @@ fn fence_command_shapes_the_typed_block() {
     assert!(
         super::fence_command("sh", "echo a\necho b\n", &scripts, "/bin/sh").starts_with("eval ")
     );
+    // #1367: a comment, alone or trailing, goes through eval too.
+    for code in ["# c\necho hi", "# c", "echo hi # c"] {
+        let cmd = super::fence_command("sh", code, &scripts, "/bin/zsh");
+        assert!(cmd.starts_with("eval "), "{cmd:?}");
+    }
     assert!(!scripts.exists(), "a shell block is typed, not written");
     // #1630: any other language is read from a private file on stdin, never
     // typed as a heredoc, which fish has no syntax for.
@@ -875,6 +880,56 @@ fn fence_blocks_with_tabs_or_bangs_run_exactly_as_shown() {
     assert!(sh.starts_with("eval \"$(printf '%b' "), "{sh}");
     let probe = format!("{}; pwd", sh.trim_end_matches('\r'));
     assert_eq!(run_typed_line(&probe, tmp.path()), "hi!\n/\n");
+}
+
+/// #1367: zsh at its prompt reads `#` as a word unless `interactive_comments`
+/// is set, and it is off by default, so a one-line block's comment printed
+/// or failed with exit 127. Typed into an interactive zsh with no startup
+/// files, as a pane's prompt reads it, the block's comment is a comment, and
+/// a `#` inside a word or quotes is kept.
+#[test]
+fn a_shell_block_with_a_comment_runs_in_an_interactive_zsh() {
+    let tmp = tempfile::tempdir().unwrap();
+    let scripts = tmp.path().join("blocks");
+    let mut typed = String::new();
+    for code in [
+        "echo done  # trailing note\n",
+        "# setup\n",
+        "echo '#a' b#c\n",
+    ] {
+        typed += super::fence_command("sh", code, &scripts, "/bin/zsh").trim_end_matches('\r');
+        typed += "\necho exit=$?\n";
+    }
+    // Prompts and the partial-line mark blanked, so the output compared is
+    // only what the blocks print, whatever this zsh's defaults are.
+    let Ok(mut zsh) = std::process::Command::new("zsh")
+        .args(["-f", "-i"])
+        .env("HOME", tmp.path())
+        .env("PS1", "")
+        .env("PS2", "")
+        .env("RPS1", "")
+        .env("PROMPT_EOL_MARK", "")
+        .current_dir(tmp.path())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    else {
+        return;
+    };
+    use std::io::Write;
+    zsh.stdin
+        .take()
+        .unwrap()
+        .write_all(typed.as_bytes())
+        .unwrap();
+    let out = zsh.wait_with_output().unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "done\nexit=0\nexit=0\n#a b#c\nexit=0\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 /// #920: a shell block of several lines reaches the shell as ONE command
@@ -1050,6 +1105,7 @@ fn task_matcher_hints_stay_out_of_the_problems_list_and_its_count() {
         message: String::from("m"),
         source: String::from("task"),
         code: None,
+        related: Vec::new(),
     };
     app.build_diagnostics.insert(
         a.clone(),

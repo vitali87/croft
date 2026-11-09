@@ -978,75 +978,209 @@ struct WelcomeBakeKey {
 /// Single source of truth for the application's user-facing name.
 pub const APP_NAME: &str = "croft";
 
-/// Agnoster-style status colours: clean working tree is green, any dirtiness
-/// (modified, staged, or untracked) flips the pill to yellow/orange.
-const GIT_CLEAN_COLOR: Color = Color::Rgb(0xa3, 0xbe, 0x8c);
+/// The amber a status-bar item takes when it wants attention: the
+/// uncommitted-changes dot beside the branch, and the operation git stopped
+/// in (`main | MERGING`).
 const GIT_DIRTY_COLOR: Color = Color::Rgb(0xeb, 0xcb, 0x8b);
 
-/// Build the status-bar spans for the git pill: branch glyph, branch name,
-/// optional ahead/behind counts.  Colour alone carries clean/dirty state, in
-/// the spirit of the Agnoster zsh theme.  Returns an empty vec outside a git
-/// repo so the bar shows nothing.
-fn git_status_spans<'a>(status: &'a crate::git::GitStatus) -> Vec<Span<'a>> {
+/// The dot after the branch name while the working tree has uncommitted
+/// changes (VS Code's `main*`): the branch itself keeps its quiet colour, so
+/// a dirty tree reads as one small mark rather than a recoloured segment.
+const GIT_DIRTY_DOT: &str = "\u{2022}";
+
+/// Powerline half circles, the rounded ends of a status-bar pill (as on the
+/// update pill, the PROBLEMS badge and the Extensions switches).
+const PILL_CAP_L: &str = "\u{e0b6}";
+const PILL_CAP_R: &str = "\u{e0b4}";
+
+/// The terminal cells `s` paints in, as ratatui lays it out. A wide
+/// character (`项`, an emoji) takes two, so a click target measured in
+/// `char`s would sit left of the text it belongs to.
+fn status_cells(s: &str) -> u16 {
+    unicode_width::UnicodeWidthStr::width(s) as u16
+}
+
+/// Cells left blank after the status bar's last right-hand segment: none,
+/// since the language pill's rounded end already reads as an edge.
+const STATUS_RIGHT_MARGIN: u16 = 0;
+
+/// The status bar's three text tones, so hierarchy comes from brightness
+/// rather than from dividers or a colour per item: `text` for the values you
+/// read (branch, line and column, language), `muted` for settings and
+/// commentary, and `dim` for labels and for counts that are zero.
+#[derive(Clone, Copy)]
+struct StatusTones {
+    text: Color,
+    muted: Color,
+    dim: Color,
+}
+
+impl StatusTones {
+    fn new(theme: crate::theme::Theme, bar: Color) -> Self {
+        // The theme's own foreground is already chosen for its background,
+        // light or dark; `theme.ui` would adapt it a second time (on a light
+        // theme, flipping dark text to near-white).
+        let (r, g, b) = theme.syntax().fg;
+        let text = Color::Rgb(r, g, b);
+        let muted = match theme.surfaces() {
+            Some(s) => s.muted(),
+            None => theme.ui(Color::Rgb(0x9a, 0xa4, 0xb8)),
+        };
+        // A high contrast theme resolves chrome greys to full strength on
+        // purpose (#1548); blending toward the bar would undo that.
+        let dim = if theme.high_contrast() {
+            muted
+        } else {
+            mix_color(muted, bar, 0.6)
+        };
+        StatusTones { text, muted, dim }
+    }
+}
+
+/// `a` blended toward `b` by `t` (0.0 keeps `a`); a non-RGB colour is kept.
+fn mix_color(a: Color, b: Color, t: f32) -> Color {
+    match (a, b) {
+        (Color::Rgb(ar, ag, ab), Color::Rgb(br, bg, bb)) => {
+            let m = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+            Color::Rgb(m(ar, br), m(ag, bg), m(ab, bb))
+        }
+        _ => a,
+    }
+}
+
+/// The status bar's background: Croft Loch's chrome surface, a near-black
+/// seam on the gradient (OLED) themes, the navy band elsewhere.
+fn status_bar_bg(theme: crate::theme::Theme) -> Color {
+    if let Some(s) = theme.surfaces() {
+        s.chrome()
+    } else if theme.gradient() {
+        theme.ui(Color::Rgb(0x18, 0x18, 0x18))
+    } else {
+        theme.ui(Color::Rgb(0x1e, 0x3a, 0x6e))
+    }
+}
+
+/// Build the status-bar spans for the git segment: the branch glyph in the
+/// theme accent, the branch name in the bar's text tone, an amber dot while
+/// the tree is dirty, and quiet ahead/behind counts. Returns an empty vec
+/// outside a git repo so the bar shows nothing.
+fn git_status_spans<'a>(
+    status: &'a crate::git::GitStatus,
+    theme: crate::theme::Theme,
+) -> Vec<Span<'a>> {
     if !status.in_repo {
         return Vec::new();
     }
-    let pill_color = if status.dirty {
-        GIT_DIRTY_COLOR
-    } else {
-        GIT_CLEAN_COLOR
-    };
-    let mut spans: Vec<Span> = Vec::with_capacity(6);
+    let tones = StatusTones::new(theme, status_bar_bg(theme));
+    let mut spans: Vec<Span> = Vec::with_capacity(7);
     spans.push(Span::raw("  "));
     // Codicon `cod-source-control` (U+EA68): the Y-fork that matches the
     // activity-bar Source Control icon, so the status-bar branch indicator
     // and the SCM panel share the same visual mark.
-    spans.push(Span::styled("\u{ea68} ", Style::default().fg(pill_color)));
-    let label = status.head_label();
     spans.push(Span::styled(
-        label,
-        Style::default().fg(pill_color).add_modifier(Modifier::BOLD),
+        "\u{ea68} ",
+        Style::default().fg(theme.accent()),
     ));
-    // The operation git stopped in (#1356), as `main | MERGING`.
+    spans.push(Span::styled(
+        status.head_label(),
+        Style::default().fg(tones.text),
+    ));
+    // The operation git stopped in (#1356), as `main | MERGING`, read as one
+    // phrase: the dirty dot comes after it.
     if let Some(op) = status.operation {
         spans.push(Span::styled(
             format!(" | {}", op.label()),
             Style::default()
-                .fg(GIT_DIRTY_COLOR)
+                .fg(theme.ui(GIT_DIRTY_COLOR))
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    if status.dirty {
+        spans.push(Span::styled(
+            format!(" {GIT_DIRTY_DOT}"),
+            Style::default()
+                .fg(theme.ui(GIT_DIRTY_COLOR))
                 .add_modifier(Modifier::BOLD),
         ));
     }
     if status.ahead > 0 {
         spans.push(Span::styled(
             format!(" \u{2191}{}", status.ahead),
-            Style::default().fg(GIT_CLEAN_COLOR),
+            Style::default().fg(tones.muted),
         ));
     }
     if status.behind > 0 {
         spans.push(Span::styled(
             format!(" \u{2193}{}", status.behind),
-            Style::default().fg(GIT_DIRTY_COLOR),
+            Style::default().fg(tones.muted),
         ));
     }
     spans
 }
 
-/// Spans for the "cr<>ft" wordmark at the left of the status bar, styled to
-/// mirror the app logo: white letters with the `<>` (the stylised "o") in the
-/// brand orange, sitting on the bar's own background rather than a pill.
-fn brand_spans(theme: crate::theme::Theme) -> Vec<Span<'static>> {
-    let letter = Style::default()
-        .fg(theme.ui(Color::White))
-        .add_modifier(Modifier::BOLD);
+/// The longest workspace name the status bar's cap shows before it elides.
+const WORKSPACE_CAP_MAX: usize = 24;
+
+/// Spans for the cap at the left edge of the status bar: the logo's `<>` in
+/// the brand orange and the workspace folder's name, on the theme's
+/// selection tint with a rounded right end. It anchors the bar the way VS
+/// Code's remote indicator does, and says which workspace this window is.
+fn workspace_cap_spans(theme: crate::theme::Theme, name: &str) -> Vec<Span<'static>> {
+    let fill = theme.selection();
+    let tones = StatusTones::new(theme, status_bar_bg(theme));
+    // Measured in terminal cells, not chars: a wide name (`项目`) paints
+    // twice its char count, and every offset after the cap counts cells.
+    let name: String = if status_cells(name) as usize > WORKSPACE_CAP_MAX {
+        use unicode_width::UnicodeWidthChar;
+        let mut s = String::new();
+        let mut used = 0;
+        for c in name.chars() {
+            let w = c.width().unwrap_or(0);
+            if used + w > WORKSPACE_CAP_MAX - 1 {
+                break;
+            }
+            used += w;
+            s.push(c);
+        }
+        s.push('\u{2026}');
+        s
+    } else {
+        name.to_string()
+    };
     vec![
-        Span::styled(" cr", letter),
+        Span::styled(" ", Style::default().bg(fill)),
         Span::styled(
             "<>",
             Style::default()
                 .fg(BRAND_ORANGE)
+                .bg(fill)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled("ft ", letter),
+        Span::styled(
+            format!(" {name} "),
+            Style::default()
+                .fg(tones.text)
+                .bg(fill)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(PILL_CAP_R, Style::default().fg(fill)),
+    ]
+}
+
+/// A status-bar badge (a recording, vim's mode, an attention flag) as a
+/// rounded pill: `label` padded by a cell each side, between half-circle
+/// caps in `fill`.
+fn status_pill(label: &str, fill: Color, fg: Color) -> [Span<'static>; 3] {
+    [
+        Span::styled(PILL_CAP_L, Style::default().fg(fill)),
+        Span::styled(
+            format!(" {label} "),
+            Style::default()
+                .fg(fg)
+                .bg(fill)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(PILL_CAP_R, Style::default().fg(fill)),
     ]
 }
 
@@ -3990,6 +4124,10 @@ pub struct App {
     /// The file blame has been fetched (or is in flight) for; reset to `None`
     /// on HEAD move so the annotation refreshes after a commit / checkout.
     blame_fetched: Option<PathBuf>,
+    /// The commit whose card the pointer, resting on the inline blame, asked
+    /// for (#1556), and where `git log` sends it. Kept once the card shows,
+    /// so the card stays while the pointer moves along the annotation.
+    blame_hover: Option<(String, std::sync::mpsc::Receiver<Result<String, String>>)>,
     /// The network git operation in flight (push, pull, fetch, clone...),
     /// named for the status line, and where its finisher arrives.
     git_net_job: Option<(String, std::sync::mpsc::Receiver<GitNetDone>)>,
@@ -5238,6 +5376,14 @@ pub struct App {
     /// the editor). Stacked above the async LSP hover reply by `compose_hover`
     /// so a squiggle's message shows even when the server returns no type info.
     hover_diagnostic: Option<String>,
+    /// Set when the keyboard asked for the hover at the caret (#1518), not
+    /// the pointer's rest: its reply is checked against the caret, and says
+    /// there is no hover only over the status line this holds, the one shown
+    /// at the request, so a newer message is not replaced.
+    hover_at_caret: Option<String>,
+    /// The tab and edit count the hover was asked about: a reply after
+    /// either changed (a paste over the word keeps its span) is dropped.
+    hover_doc: (Option<PathBuf>, u64),
     /// Separate dwell timer for the editor tab strip. Hovering a tab for
     /// `HOVER_DELAY` surfaces `tab_tooltip` with the tab's full path so
     /// same-named files can be told apart. Kept distinct from `hover`
@@ -7205,6 +7351,7 @@ impl App {
             blame_rx,
             blame_tx,
             blame_fetched: None,
+            blame_hover: None,
             git_net_job: None,
             git_view_job: None,
             vim_mode_pref: false,
@@ -7912,6 +8059,8 @@ impl App {
             hover_anchor: None,
             hover_word: None,
             hover_diagnostic: None,
+            hover_at_caret: None,
+            hover_doc: (None, 0),
             tab_hover: HoverDwell::default(),
             tab_tooltip: None,
             tab_hover_idx: None,
@@ -10987,6 +11136,87 @@ impl App {
         changed
     }
 
+    /// The caret line's commit as the inline blame names it (#1556), full
+    /// hash and short; when it names none, the status line says why.
+    fn caret_line_commit(&mut self) -> Option<(String, String)> {
+        use crate::widgets::editor::LineBlame;
+        let line = self.editor.cursor_row + 1;
+        self.status = match self.editor.cursor_line_blame() {
+            Some(LineBlame::Commit(c)) => {
+                return Some((c.hash.clone(), c.short_hash().to_string()));
+            }
+            Some(LineBlame::Uncommitted) => format!("Line {line} has uncommitted changes"),
+            None if !self.inline_blame_enabled => {
+                String::from("Inline blame is off: Git: Toggle Inline Blame turns it on")
+            }
+            None => format!("Git has no commit for line {line}"),
+        };
+        None
+    }
+
+    /// Git: Open Commit for Line, and a click on the inline blame (#1556):
+    /// the changes the caret line's commit made to this file, in the
+    /// side-by-side diff a TIMELINE row opens (GitLens's Open Changes).
+    fn open_commit_for_line(&mut self) {
+        if let Some((hash, _)) = self.caret_line_commit()
+            && let Some(path) = self.editor.path.clone()
+        {
+            self.open_timeline_diff(path, hash);
+        }
+    }
+
+    /// The pointer rested on the inline blame naming `hash` (#1556): fetch
+    /// the commit's card off the UI thread, for [`Self::drain_blame_hover`].
+    fn hover_blame_card(&mut self, col: u16, row: u16, hash: String) {
+        let shown = self.hover_popup.is_some();
+        if shown && self.blame_hover.as_ref().is_some_and(|(h, _)| *h == hash) {
+            return;
+        }
+        // The file's own folder is in its repository, as blame's is.
+        let Some(dir) = self.editor.path.as_deref().and_then(Path::parent) else {
+            return;
+        };
+        let dir = dir.to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let job = hash.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::git::commit_card(&dir, &job));
+        });
+        // A word's hover still in flight must not land over the card.
+        self.hover_request_id = None;
+        self.hover_word = None;
+        self.hover_anchor = Some((col, row));
+        self.blame_hover = Some((hash, rx));
+    }
+
+    /// Show the inline blame's commit card once `git log` has it, if the
+    /// pointer is still on an annotation naming that commit: a tab switch or
+    /// caret move while git ran can put another commit's there. True when
+    /// the card appeared.
+    fn drain_blame_hover(&mut self) -> bool {
+        let Some((hash, card)) = self
+            .blame_hover
+            .as_ref()
+            .and_then(|(hash, rx)| rx.try_recv().ok().map(|card| (hash.clone(), card)))
+        else {
+            return false;
+        };
+        let under = self
+            .hover
+            .cell()
+            .and_then(|(c, r)| self.editor.blame_commit_at(c, r));
+        if under != Some(hash.as_str()) {
+            self.blame_hover = None;
+            return false;
+        }
+        let card = card.unwrap_or_else(|e| format!("Could not read the commit: {e}"));
+        self.hover_popup = Some(crate::widgets::hover_popup::HoverPopup::new(
+            format!("{card}\n\nClick to open its changes (Git: Open Commit for Line)"),
+            self.hover_anchor.unwrap_or((0, 0)),
+        ));
+        true
+    }
+
     /// Drain LSP completion responses. Drops responses with stale request
     /// ids so a slow earlier reply cannot clobber a fresher popup. Returns
     /// true when the popup state changed and the next frame should redraw.
@@ -11754,6 +11984,16 @@ impl App {
             return;
         }
         self.hover.on_move(std::time::Instant::now(), col, row);
+        // The blame card (#1556) belongs to the annotation of its commit,
+        // not to a word: it stays while the pointer moves along that and
+        // goes when the pointer leaves it.
+        if let Some((hash, _)) = &self.blame_hover {
+            if self.editor.blame_commit_at(col, row) == Some(hash.as_str()) {
+                return;
+            }
+            self.blame_hover = None;
+            self.hover_popup = None;
+        }
         if self.hover_popup.is_some() {
             let current = self
                 .editor
@@ -11790,9 +12030,54 @@ impl App {
     /// async `textDocument/hover`. Split out of `poll_hover` so the dwell
     /// timer doesn't have to be driven to test the resolution logic.
     fn hover_at_cell(&mut self, col: u16, row: u16) {
+        if let Some(hash) = self.editor.blame_commit_at(col, row) {
+            self.hover_blame_card(col, row, hash.to_string());
+            return;
+        }
         let Some((line, c)) = self.editor.buffer_pos_at(col, row) else {
             return;
         };
+        self.hover_at(line, c, (col, row), false);
+    }
+
+    /// Show or Focus Hover (#1518): the hover the pointer's rest would open,
+    /// for the caret, anchored at the caret's cell. Says so when there is
+    /// nothing to show, where the pointer's hover stays silent.
+    fn show_hover_at_caret(&mut self) {
+        self.hover_popup = None;
+        self.hover_diagnostic = None;
+        self.hover_request_id = None;
+        // A pointer that came to rest just before the command would fire its
+        // own hover next frame and take this one's place.
+        self.hover.clear();
+        let Some(anchor) = self.editor.cursor_screen_pos() else {
+            return;
+        };
+        let (line, c) = self.caret_hover_point();
+        self.hover_at(line, c, anchor, true);
+        if self.hover_popup.is_none() && self.hover_request_id.is_none() {
+            self.status = String::from(NO_HOVER_AT_CARET);
+        }
+    }
+
+    /// The buffer point Show Hover describes: the caret, or the word ending
+    /// at it, as in VS Code, so a hover after typing a name or a word-right
+    /// move shows that word.
+    fn caret_hover_point(&self) -> (usize, usize) {
+        let (line, col) = (self.editor.cursor_row, self.editor.cursor_col);
+        if col > 0
+            && self.editor.hover_region_at(line, col).is_none()
+            && self.editor.word_at(line, col - 1).is_some()
+        {
+            return (line, col - 1);
+        }
+        (line, col)
+    }
+
+    /// Resolve a hover at buffer `(line, c)` with its popup at screen cell
+    /// `anchor`, for the pointer or, with `at_caret`, the caret.
+    fn hover_at(&mut self, line: usize, c: usize, anchor: (u16, u16), at_caret: bool) {
+        let (col, row) = anchor;
         // The region (word, or else a diagnostic span over punctuation) the
         // popup belongs to. Nothing of interest under the point → no hover.
         let Some(region) = self.editor.hover_region_at(line, c) else {
@@ -11800,6 +12085,8 @@ impl App {
         };
         self.hover_anchor = Some((col, row));
         self.hover_word = Some(region);
+        self.hover_at_caret = at_caret.then(|| self.status.clone());
+        self.hover_doc = (self.editor.path.clone(), self.editor.edit_seq);
         // Debug hover-to-evaluate: while paused, hovering a variable shows its
         // current value (from the loaded locals/globals) instead of the LSP
         // type hover. Takes priority because the live value is what the user
@@ -11816,7 +12103,8 @@ impl App {
         // Server diagnostics are already in the editor, so capture the
         // message synchronously; the squiggle's message must show even if the
         // server has no type info (or no LSP is attached at all).
-        self.hover_diagnostic = format_diagnostics(&self.editor.diagnostics_at(line, c));
+        self.hover_diagnostic =
+            format_diagnostics(&self.editor.diagnostics_at(line, c, self.workspace_root()));
         // Only a real word is worth a `textDocument/hover` round-trip; over
         // punctuation there is no symbol to describe, so show the diagnostic
         // alone right away.
@@ -11992,11 +12280,20 @@ impl App {
             if Some(result.request_id) != self.hover_request_id {
                 continue;
             }
-            let current = self
-                .hover
-                .cell()
-                .and_then(|(c, r)| self.editor.buffer_pos_at(c, r))
-                .and_then(|(line, ch)| self.editor.hover_region_at(line, ch));
+            if self.hover_doc.0 != self.editor.path || self.hover_doc.1 != self.editor.edit_seq {
+                continue;
+            }
+            // A keyboard hover belongs to the caret (#1518), a dwell's to the
+            // pointer; either may have moved off the word since the request.
+            let current = if self.hover_at_caret.is_some() {
+                let (line, ch) = self.caret_hover_point();
+                self.editor.hover_region_at(line, ch)
+            } else {
+                self.hover
+                    .cell()
+                    .and_then(|(c, r)| self.editor.buffer_pos_at(c, r))
+                    .and_then(|(line, ch)| self.editor.hover_region_at(line, ch))
+            };
             if current != self.hover_word {
                 continue;
             }
@@ -12006,6 +12303,9 @@ impl App {
             self.hover_popup =
                 compose_hover(self.hover_diagnostic.as_deref(), result.text.as_deref())
                     .map(|text| crate::widgets::hover_popup::HoverPopup::new(text, anchor));
+            if self.hover_popup.is_none() && self.hover_at_caret.as_ref() == Some(&self.status) {
+                self.status = String::from(NO_HOVER_AT_CARET);
+            }
             changed = true;
         }
         changed
@@ -12865,6 +13165,7 @@ impl App {
                     message: d.message,
                     source: d.source.to_string(),
                     code: None,
+                    related: Vec::new(),
                 },
             ));
         }
@@ -12943,7 +13244,7 @@ impl App {
     /// can fold it into its redraw decision). Files are grouped, ordered by
     /// path; each group's diagnostics are ordered by position.
     fn rebuild_problems(&mut self) -> bool {
-        use crate::widgets::problems::{ProblemGroup, ProblemItem};
+        use crate::widgets::problems::{ProblemGroup, ProblemItem, ProblemRelated};
         let mut paths: Vec<&PathBuf> = self
             .lsp_diagnostics
             .keys()
@@ -12973,6 +13274,18 @@ impl App {
                 let shown = diagnostics_by_source(by_server)
                     .filter(|(_, d)| d.severity != crate::lsp::manager::DiagnosticSeverity::Hint);
                 for (source, d) in shown {
+                    let related = d.related().into_iter().map(|r| ProblemRelated {
+                        rel_path: r
+                            .path
+                            .strip_prefix(self.workspace_root())
+                            .unwrap_or(&r.path)
+                            .to_string_lossy()
+                            .into_owned(),
+                        path: r.path,
+                        line: r.line,
+                        col: r.character,
+                        message: r.message,
+                    });
                     items.push(ProblemItem {
                         line: d.start_line,
                         col: d.start_char,
@@ -12981,6 +13294,7 @@ impl App {
                         message: d.message.clone(),
                         source: source.to_string(),
                         code: d.code.clone(),
+                        related: related.collect(),
                     });
                 }
             }
@@ -14108,18 +14422,26 @@ impl App {
             .and_then(|p| self.roots.owning_root(p))
             .unwrap_or_else(|| self.roots.primary())
             .to_path_buf();
-        self.status = format!("Loading {rel} at {hash}\u{2026}");
+        // Git: Open Commit for Line passes the full hash (#1556), named here
+        // by its first eight digits as the inline blame names it; a TIMELINE
+        // row's is git's own short form already.
+        let shown = if hash.len() >= 40 {
+            hash[..8].to_string()
+        } else {
+            hash.clone()
+        };
+        self.status = format!("Loading {rel} at {shown}\u{2026}");
         self.spawn_git_view(move || {
             let result = crate::git::show_commit_file_diff(&timeline_root, &hash, &rel);
             Box::new(move |app: &mut App| match result {
                 Ok(raw) => {
-                    let label = std::path::PathBuf::from(format!("{rel} @ {hash}"));
+                    let label = std::path::PathBuf::from(format!("{rel} @ {shown}"));
                     if let Err(e) = app.editor.open_git_diff_side_by_side(&label, &raw) {
                         app.status = format!("Could not open diff: {e}");
                         return;
                     }
                     app.focus_pane(Pane::Editor);
-                    app.status = format!("Showing {rel} at {hash}");
+                    app.status = format!("Showing {rel} at {shown}");
                 }
                 Err(e) => app.status = format!("git show failed: {e}"),
             })
@@ -23992,8 +24314,15 @@ impl App {
         // Owned snapshot: the spans borrow the status, and borrowing it
         // through scm_worker() would pin all of &self for the whole render.
         let scm_status = self.scm_worker().status().clone();
-        let mut spans: Vec<Span> = Vec::with_capacity(20);
-        spans.extend(brand_spans(self.theme));
+        let status_bg = status_bar_bg(self.theme);
+        let tones = StatusTones::new(self.theme, status_bg);
+        let mut spans: Vec<Span> = Vec::with_capacity(24);
+        let workspace_name = self
+            .workspace_root()
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| self.workspace_root().display().to_string());
+        spans.extend(workspace_cap_spans(self.theme, &workspace_name));
         let redacted = self.redacted_on_screen();
         if redacted > 0 || self.redactions_revealed() {
             // How much of what is on screen is masked right now (#360): a
@@ -24001,29 +24330,24 @@ impl App {
             // that a reveal window is open.
             let (label, bg) = if self.redactions_revealed() {
                 (
-                    format!(" \u{1f441} {redacted} revealed "),
+                    format!("\u{1f441} {redacted} revealed"),
                     Color::Rgb(0xc0, 0x39, 0x2b),
                 )
             } else {
                 (
-                    format!(" \u{2022} {redacted} redacted "),
+                    format!("\u{2022} {redacted} redacted"),
                     Color::Rgb(0x3a, 0x3f, 0x4b),
                 )
             };
-            spans.push(Span::styled(
-                label,
-                Style::default()
-                    .bg(self.theme.ui(bg))
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            ));
+            spans.extend(status_pill(&label, self.theme.ui(bg), Color::White));
+            spans.push(Span::raw(" "));
         }
         if let Some(span) = self.perf.status_span() {
             spans.push(span);
         }
         // The pill the update card rises from and Later folds it into; a
         // click opens or folds the card. Recorded as (start column, width).
-        let offer_chip_x: u16 = spans.iter().map(|s| s.content.chars().count() as u16).sum();
+        let offer_chip_x: u16 = spans.iter().map(|s| status_cells(&s.content)).sum();
         if let Some(toast) = self.update_toast.as_ref().filter(|t| !t.ready) {
             let hovered =
                 crate::widgets::hover::contains(self.status_offer_rect, self.pointer_cell);
@@ -24037,7 +24361,7 @@ impl App {
                 Color::White,
             ));
         }
-        let offer_chip_end: u16 = spans.iter().map(|s| s.content.chars().count() as u16).sum();
+        let offer_chip_end: u16 = spans.iter().map(|s| status_cells(&s.content)).sum();
         let offer_chip =
             (offer_chip_end > offer_chip_x).then(|| (offer_chip_x, offer_chip_end - offer_chip_x));
         if offer_chip.is_some() {
@@ -24045,7 +24369,7 @@ impl App {
         }
         // Both update pills are one click target, doing what the updater
         // chord does (#865); recorded as (start column, width).
-        let update_chip_x: u16 = spans.iter().map(|s| s.content.chars().count() as u16).sum();
+        let update_chip_x: u16 = spans.iter().map(|s| status_cells(&s.content)).sum();
         if self.any_update_ready() {
             spans.extend(crate::widgets::update_popup::pill_spans(
                 &format!(
@@ -24077,7 +24401,7 @@ impl App {
                     .add_modifier(Modifier::BOLD),
             ));
         }
-        let update_chip_end: u16 = spans.iter().map(|s| s.content.chars().count() as u16).sum();
+        let update_chip_end: u16 = spans.iter().map(|s| status_cells(&s.content)).sum();
         let update_chip = (update_chip_end > update_chip_x)
             .then(|| (update_chip_x, update_chip_end - update_chip_x));
         if self.any_update_in_progress() {
@@ -24127,16 +24451,14 @@ impl App {
             let left = until
                 .saturating_duration_since(std::time::Instant::now())
                 .as_secs();
-            spans.push(Span::styled(
-                format!(
-                    " \u{2713} auto-approving {agent} {}:{:02} ",
+            spans.extend(status_pill(
+                &format!(
+                    "\u{2713} auto-approving {agent} {}:{:02}",
                     left / 60,
                     left % 60
                 ),
-                Style::default()
-                    .bg(self.theme.ui(Color::Rgb(0x8a, 0x60, 0x00)))
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
+                self.theme.ui(Color::Rgb(0x8a, 0x60, 0x00)),
+                Color::White,
             ));
             spans.push(Span::raw(" "));
         }
@@ -24153,21 +24475,20 @@ impl App {
         let mut codeql_chip: Option<(u16, u16)> = None;
         if let Some((_, since)) = &self.codeql_run {
             let secs = since.elapsed().as_secs();
-            let text = format!(
-                " \u{27f3} CodeQL {} {}:{:02} \u{2715} ",
-                self.codeql_run_name,
-                secs / 60,
-                secs % 60
+            let pill = status_pill(
+                &format!(
+                    "\u{27f3} CodeQL {} {}:{:02} \u{2715}",
+                    self.codeql_run_name,
+                    secs / 60,
+                    secs % 60
+                ),
+                self.theme.ui(Color::Rgb(0x2b, 0x5d, 0x8a)),
+                Color::White,
             );
-            let x: u16 = spans.iter().map(|s| s.content.chars().count() as u16).sum();
-            codeql_chip = Some((x, text.chars().count() as u16));
-            spans.push(Span::styled(
-                text,
-                Style::default()
-                    .bg(self.theme.ui(Color::Rgb(0x2b, 0x5d, 0x8a)))
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            ));
+            let x: u16 = spans.iter().map(|s| status_cells(&s.content)).sum();
+            let w: u16 = pill.iter().map(|s| status_cells(&s.content)).sum();
+            codeql_chip = Some((x, w));
+            spans.extend(pill);
             spans.push(Span::raw(" "));
         }
         if let Some((_, _, started)) = &self.recording {
@@ -24175,12 +24496,10 @@ impl App {
             // leave on; it is not the macro recorder, so it has its own
             // badge and says how long it has run.
             let secs = started.elapsed().as_secs();
-            spans.push(Span::styled(
-                format!(" \u{25cf} CAST {}:{:02} ", secs / 60, secs % 60),
-                Style::default()
-                    .bg(self.theme.ui(Color::Rgb(0x8a, 0x1c, 0x5a)))
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
+            spans.extend(status_pill(
+                &format!("\u{25cf} CAST {}:{:02}", secs / 60, secs % 60),
+                self.theme.ui(Color::Rgb(0x8a, 0x1c, 0x5a)),
+                Color::White,
             ));
             spans.push(Span::raw(" "));
         }
@@ -24189,24 +24508,19 @@ impl App {
             // filled red badge rather than a dim hint (#255). A named register
             // shows which one, since vim users keep several.
             let label = match rec.register {
-                Some(r) => format!(" ● REC @{r} "),
-                None => String::from(" ● REC "),
+                Some(r) => format!("● REC @{r}"),
+                None => String::from("● REC"),
             };
-            spans.push(Span::styled(
-                label,
-                Style::default()
-                    .bg(self.theme.ui(Color::Rgb(0xc0, 0x2b, 0x2b)))
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
+            spans.extend(status_pill(
+                &label,
+                self.theme.ui(Color::Rgb(0xc0, 0x2b, 0x2b)),
+                Color::White,
             ));
             spans.push(Span::raw(" "));
         }
         if self.vim.enabled {
             let (text, bg) = match self.vim.command_line() {
-                Some(cmd) => (
-                    format!(" {cmd} "),
-                    self.theme.ui(Color::Rgb(0x33, 0x33, 0x33)),
-                ),
+                Some(cmd) => (cmd.to_string(), self.theme.ui(Color::Rgb(0x33, 0x33, 0x33))),
                 None => {
                     let label = self.vim.mode_label().unwrap_or("NORMAL");
                     let bg = match self.vim.mode() {
@@ -24216,33 +24530,22 @@ impl App {
                         }
                         _ => self.theme.ui(Color::Rgb(0x4e, 0x9a, 0xff)),
                     };
-                    (format!(" {label} "), bg)
+                    (label.to_string(), bg)
                 }
             };
-            spans.push(Span::styled(
-                text,
-                Style::default()
-                    .bg(bg)
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            ));
+            spans.extend(status_pill(&text, bg, Color::White));
             spans.push(Span::raw(" "));
         }
-        // Hairline zone divider (│): fences the brand/git zone, the
-        // diagnostics cluster, and the transient message off from each other
-        // so the bar reads as segments instead of one run of text. Quiet on
-        // both the navy and near-black bars.
-        let zone_div = Style::default().fg(self.theme.ui(Color::Rgb(0x3a, 0x41, 0x50)));
-        // Croft Loch spaces its zones apart the way VS Code's status bar
-        // does; the divider keeps its cell so no click target moves.
-        let div = if self.theme.surfaces().is_some() {
-            " "
-        } else {
-            "\u{2502}"
-        };
-        let scm_spans = git_status_spans(&scm_status);
-        // The wordmark already ends in a space; the git spans don't, so buy
-        // the divider one cell of air only when the branch segment painted.
+        // Zones are set apart by air rather than by drawn dividers, the way
+        // VS Code's status bar spaces its items: the bar reads as a few
+        // quiet groups instead of a ruled table. The spacer keeps its one
+        // cell, so no click target moves.
+        let zone_div = Style::default();
+        let div = " ";
+        let scm_spans = git_status_spans(&scm_status, self.theme);
+        // The git spans open with their own air and the cap ends on its
+        // rounded edge, so the spacer takes one more cell only when the
+        // branch segment painted.
         let scm_present = !scm_spans.is_empty();
         spans.extend(scm_spans);
         spans.push(Span::styled(
@@ -24257,79 +24560,93 @@ impl App {
         // survive a transport drop, so flag it for the whole session (rendered
         // before the transient status so a status update never hides it).
         if let Some(warning) = self.persistence_warning {
-            spans.push(Span::styled(
-                format!(" \u{26a0} {warning} "),
-                Style::default()
-                    .bg(self.theme.ui(Color::Rgb(0xff, 0x9d, 0x2f)))
-                    .fg(self.theme.ui(Color::Rgb(0x10, 0x13, 0x1a)))
-                    .add_modifier(Modifier::BOLD),
+            spans.extend(status_pill(
+                &format!("\u{26a0} {warning}"),
+                self.theme.ui(Color::Rgb(0xff, 0x9d, 0x2f)),
+                self.theme.ui(Color::Rgb(0x10, 0x13, 0x1a)),
             ));
-            spans.push(Span::raw("  "));
+            spans.push(Span::raw(" "));
         }
         // Multiplayer roster badge: how many clients are attached to this
         // persistent session, painted only when someone else is here
         // (manage them via Session: Participants, Cmd+K A).
         if self.session_participants.len() > 1 {
-            spans.push(Span::styled(
-                format!(" \u{f0c0} {} attached ", self.session_participants.len()),
-                Style::default()
-                    .bg(self.theme.ui(Color::Rgb(0x2f, 0x6f, 0xd0)))
-                    .fg(self.theme.ui(Color::Rgb(0xff, 0xff, 0xff)))
-                    .add_modifier(Modifier::BOLD),
+            spans.extend(status_pill(
+                &format!("\u{f0c0} {} attached", self.session_participants.len()),
+                self.theme.ui(Color::Rgb(0x2f, 0x6f, 0xd0)),
+                self.theme.ui(Color::Rgb(0xff, 0xff, 0xff)),
             ));
-            spans.push(Span::raw("  "));
+            spans.push(Span::raw(" "));
         }
         // AI-stream badge: a pilot is streaming an edit into a shared file;
         // orange like the persistence warning (attention, not decoration),
         // naming the cancel chord so the stop path is one glance away.
         if let Some(stream) = &self.collab_stream {
-            spans.push(Span::styled(
-                format!(
-                    " \u{23f9} {} streaming into {} (Cmd+K X to stop) ",
+            spans.extend(status_pill(
+                &format!(
+                    "\u{23f9} {} streaming into {} (Cmd+K X to stop)",
                     stream.name, stream.file
                 ),
-                Style::default()
-                    .bg(self.theme.ui(Color::Rgb(0xff, 0x9d, 0x2f)))
-                    .fg(self.theme.ui(Color::Rgb(0x10, 0x13, 0x1a)))
-                    .add_modifier(Modifier::BOLD),
+                self.theme.ui(Color::Rgb(0xff, 0x9d, 0x2f)),
+                self.theme.ui(Color::Rgb(0x10, 0x13, 0x1a)),
             ));
-            spans.push(Span::raw("  "));
+            spans.push(Span::raw(" "));
         } else if let Some(host) = &self.pair_host {
             // Resident navigator seated and idle: presence, not attention —
             // the stream badge above takes over whenever it is typing.
             spans.push(Span::styled(
                 format!(" \u{25c6} {} seated ", host.title()),
                 Style::default()
-                    .bg(self.theme.ui(Color::Rgb(0x3c, 0x41, 0x4f)))
                     .fg(self.theme.ui(Color::Rgb(0xff, 0x9d, 0x2f)))
                     .add_modifier(Modifier::BOLD),
             ));
-            spans.push(Span::raw("  "));
+            spans.push(Span::raw(" "));
         }
         // Diagnostics counts (click → PROBLEMS), VS Code-style, after git.
-        // Always shown so the bar reads as a health indicator at a glance.
+        // Always shown so the bar reads as a health indicator at a glance,
+        // but a count of zero stays dim: red and amber are kept for a count
+        // that has something to say.
         let err_count = self.problems.error_count();
         let warn_count = self.problems.warning_count();
-        let diag_start_col: u16 = spans.iter().map(|s| s.content.chars().count() as u16).sum();
-        // One cell between the counts, not three: the errors and warnings
-        // read as a single health cluster (they already share one hit rect).
+        let diag_start_col: u16 = spans.iter().map(|s| status_cells(&s.content)).sum();
         // diag_len is measured from the very strings that render, so the hit
         // rect can never drift from the visible text.
-        let err_text = format!(" \u{ea87} {err_count}");
-        let warn_text = format!(" \u{ea6c} {warn_count} ");
-        let diag_len = (err_text.chars().count() + warn_text.chars().count()) as u16;
-        spans.push(Span::styled(
-            err_text,
-            Style::default().fg(self.theme.ui(Color::Rgb(0xf1, 0x4c, 0x4c))),
-        ));
-        spans.push(Span::styled(
-            warn_text,
-            Style::default().fg(self.theme.ui(Color::Rgb(0xcc, 0xa7, 0x00))),
-        ));
+        let diag_parts: [(String, Style); 4] = [
+            (
+                String::from(" \u{ea87} "),
+                Style::default().fg(if err_count > 0 {
+                    self.theme.ui(Color::Rgb(0xf1, 0x4c, 0x4c))
+                } else {
+                    tones.dim
+                }),
+            ),
+            (
+                err_count.to_string(),
+                Style::default().fg(if err_count > 0 { tones.text } else { tones.dim }),
+            ),
+            (
+                String::from(" \u{ea6c} "),
+                Style::default().fg(if warn_count > 0 {
+                    self.theme.ui(Color::Rgb(0xe5, 0xb5, 0x4a))
+                } else {
+                    tones.dim
+                }),
+            ),
+            (
+                format!("{warn_count} "),
+                Style::default().fg(if warn_count > 0 {
+                    tones.text
+                } else {
+                    tones.dim
+                }),
+            ),
+        ];
+        let diag_len: u16 = diag_parts.iter().map(|(t, _)| status_cells(t)).sum();
+        spans.extend(diag_parts.into_iter().map(|(t, st)| Span::styled(t, st)));
         // Transient status message (e.g. "Saved editor.rs"), no keybinding
-        // cheat-sheet — those live in F1 / the Command Palette now. Fenced
-        // behind a divider and dimmed so commentary reads apart from the
-        // clickable clusters around it.
+        // cheat-sheet — those live in F1 / the Command Palette now. Set apart
+        // and muted so commentary reads apart from the clickable clusters
+        // around it.
         // Screen reader mode shows the announcement in the status slot, and
         // every status passes through the UI catalog (#621).
         let status_text = one_line(if self.screen_reader && !self.announcer.line.is_empty() {
@@ -24337,6 +24654,11 @@ impl App {
         } else {
             crate::i18n::tr(&self.status).into_owned()
         });
+        // Paths inside the workspace read relative to it, as Quick Open and
+        // the tabs name them: `Saved src/main.rs`, not the absolute path
+        // with the workspace's own location in front. The Messages channel
+        // below keeps the message as it was said.
+        let status_text = workspace_relative(&status_text, self.workspace_root());
         // A message seen for the first time is kept, in full, in the Messages
         // output channel, and may take the whole bar until the next key or
         // click (#1609): elided to fit, its middle was gone for good.
@@ -24357,14 +24679,14 @@ impl App {
         let mut status_x: u16 = 0;
         if !status_text.is_empty() {
             spans.push(Span::styled(format!("{div} "), zone_div));
-            let x: u16 = spans.iter().map(|s| s.content.chars().count() as u16).sum();
+            let x: u16 = spans.iter().map(|s| status_cells(&s.content)).sum();
             status_x = x;
             if status_h > 0 && x < outer[2].width {
                 self.announce_pos = Some((outer[2].x + x, outer[2].y));
             }
             spans.push(Span::styled(
                 status_text.clone(),
-                Style::default().fg(self.theme.ui(Color::Rgb(0x9a, 0xa4, 0xb8))),
+                Style::default().fg(tones.muted),
             ));
         }
 
@@ -24444,6 +24766,20 @@ impl App {
         } else {
             ""
         };
+        let language_icon = {
+            let name = self
+                .editor
+                .path
+                .as_deref()
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let suffix = name
+                .rfind('.')
+                .map(|i| name[i..].to_string())
+                .unwrap_or_default();
+            crate::icons::for_path(&name, &suffix)
+        };
         let mut seg_texts: Vec<String> = vec![
             format!(
                 " Ln {}, Col {}{coverage}{}{column_mode} ",
@@ -24459,7 +24795,13 @@ impl App {
             format!(" {} ", self.editor.indent_style().label()),
             format!(" {} ", self.editor.encoding.name()),
             format!(" {} ", self.editor.eol.label()),
-            format!(" {} ", self.editor.language_label()),
+            // The language rides a pill with the file's own icon, the
+            // right-hand counterpart of the workspace cap.
+            format!(
+                "{PILL_CAP_L}{} {}{PILL_CAP_R}",
+                language_icon.glyph,
+                self.editor.language_label()
+            ),
         ];
         // `2 agents · 1 waiting` (#344), only while an agent is seated; a
         // click focuses the waiting pane.
@@ -24511,8 +24853,11 @@ impl App {
             };
             seg_texts.push(format!(" \u{25c6} {joined} "));
         }
-        let widths: Vec<u16> = seg_texts.iter().map(|s| s.chars().count() as u16).collect();
-        let mut right_total: u16 = widths.iter().sum::<u16>() + (seg_texts.len() as u16 - 1);
+        let widths: Vec<u16> = seg_texts.iter().map(|s| status_cells(s)).collect();
+        // One cell of margin after the last segment, so the language pill's
+        // rounded end does not touch the frame edge.
+        let mut right_total: u16 =
+            widths.iter().sum::<u16>() + (seg_texts.len() as u16 - 1) + STATUS_RIGHT_MARGIN;
         // The right cluster paints OVER the left paragraph, so an over-long
         // transient loses exactly its tail — for "Opened <deep path>" that
         // was the filename, the one informative part (#100). Middle-elide
@@ -24521,7 +24866,7 @@ impl App {
             let left_fixed: u16 = spans
                 .iter()
                 .take(spans.len().saturating_sub(1))
-                .map(|s| s.content.chars().count() as u16)
+                .map(|s| status_cells(&s.content))
                 .sum();
             let fits_beside = |right: u16| {
                 status_rect
@@ -24555,17 +24900,6 @@ impl App {
             }
         }
 
-        // Black theme: drop the navy status strip to a near-black seam (a hair
-        // lighter than the #000000 editor so the bar still reads as distinct),
-        // matching VS Code's OLED themes. Croft Dark keeps the navy band.
-        // Croft Loch's bar is chrome, like the side bar and the tab strip.
-        let status_bg = if let Some(s) = self.theme.surfaces() {
-            s.chrome()
-        } else if self.popup_gradient() {
-            self.theme.ui(Color::Rgb(0x18, 0x18, 0x18))
-        } else {
-            self.theme.ui(Color::Rgb(0x1e, 0x3a, 0x6e))
-        };
         // Left fills the whole bar (background + left text); the right cluster
         // overwrites the right portion.
         frame.render_widget(
@@ -24610,20 +24944,20 @@ impl App {
             } else if self.status_diag_rect.right() > rx {
                 self.status_diag_rect.width = rx - self.status_diag_rect.x;
             }
-            // Build the spans now that x positions are known: segment fg one
-            // shade up from the transient's dim gray, │ dividers between, and
-            // a hover fill on the clickable segments (indices 1..=5) when the
-            // pointer rests on them — same affordance as the activity bar.
+            // Build the spans now that x positions are known. The settings
+            // (indentation, encoding, line endings) are muted; the position
+            // reads its numbers in the text tone over dim labels; the
+            // language sits in a pill. A clickable segment takes a fill
+            // under the pointer, the same affordance as the activity bar.
             // Ln/Col (index 0) opens Go to Line, so it hovers like the rest.
             // Hit rects recorded in the same pass.
-            let seg_style = Style::default().fg(match self.theme.surfaces() {
-                Some(s) => s.muted(),
-                None => self.theme.ui(Color::Rgb(0xc9, 0xd2, 0xe3)),
-            });
-            let hover_style = Style::default()
-                .bg(self.theme.ui(Color::Rgb(0x2a, 0x31, 0x40)))
-                .fg(self.theme.ui(Color::White));
-            let mut right: Vec<Span> = Vec::with_capacity(seg_texts.len() * 2 - 1);
+            let seg_style = Style::default().fg(tones.muted);
+            let lift = match self.theme.surfaces() {
+                Some(s) => s.hairline(),
+                None => self.theme.ui(Color::Rgb(0x2a, 0x31, 0x40)),
+            };
+            let hover_style = Style::default().bg(lift).fg(tones.text);
+            let mut right: Vec<Span> = Vec::with_capacity(seg_texts.len() * 4);
             let mut cx = rx;
             for (i, text) in seg_texts.iter().enumerate() {
                 if i > 0 {
@@ -24639,10 +24973,52 @@ impl App {
                 let hovered = self
                     .pointer_cell
                     .is_some_and(|(pc, pr)| rect_contains(r, pc, pr));
-                right.push(Span::styled(
-                    text.clone(),
-                    if hovered { hover_style } else { seg_style },
-                ));
+                if i == 4 {
+                    // The language pill: lit in the selection tint under
+                    // the pointer, so it hovers like the workspace cap reads.
+                    let fill = if hovered {
+                        self.theme.selection()
+                    } else {
+                        lift
+                    };
+                    let label = self.editor.language_label();
+                    right.push(Span::styled(PILL_CAP_L, Style::default().fg(fill)));
+                    right.push(Span::styled(
+                        language_icon.glyph.to_string(),
+                        Style::default().fg(language_icon.color).bg(fill),
+                    ));
+                    right.push(Span::styled(
+                        format!(" {label}"),
+                        Style::default().fg(tones.text).bg(fill),
+                    ));
+                    right.push(Span::styled(PILL_CAP_R, Style::default().fg(fill)));
+                } else if i == 0 && !hovered {
+                    // Numbers in the text tone, the words around them dim.
+                    let mut run = String::new();
+                    let mut run_digit = false;
+                    for c in text.chars() {
+                        let d = c.is_ascii_digit();
+                        if d != run_digit && !run.is_empty() {
+                            right.push(Span::styled(
+                                std::mem::take(&mut run),
+                                Style::default().fg(if run_digit { tones.text } else { tones.dim }),
+                            ));
+                        }
+                        run_digit = d;
+                        run.push(c);
+                    }
+                    if !run.is_empty() {
+                        right.push(Span::styled(
+                            run,
+                            Style::default().fg(if run_digit { tones.text } else { tones.dim }),
+                        ));
+                    }
+                } else {
+                    right.push(Span::styled(
+                        text.clone(),
+                        if hovered { hover_style } else { seg_style },
+                    ));
+                }
                 match i {
                     0 => self.status_position_rect = r,
                     1 => self.status_indent_rect = r,
@@ -27035,9 +27411,15 @@ impl App {
                 self.toggle_zen_mode();
                 true
             }
-            // Cmd+K V: Live Run, "values" for the active Python file.
+            // Cmd+K V: Live Run, "values" for the active Python file. On a
+            // Markdown tab it is VS Code's Open Preview to the Side (#1605);
+            // Live Run runs only Python, so no tab wants both.
             KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'v') => {
-                self.toggle_live_run();
+                if self.editor.language() == Some(crate::highlight::LangKind::Markdown) {
+                    self.open_markdown_preview_to_side();
+                } else {
+                    self.toggle_live_run();
+                }
                 true
             }
             // Cmd+K Cmd+F (SUPER/CTRL held on the second key): Format
@@ -27123,6 +27505,20 @@ impl App {
             // chord, so the Cmd+K leader hosts this the way it hosts Zen (Cmd+K Z).
             KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'b') => {
                 self.open_testing_view();
+                true
+            }
+            // Cmd+K Cmd+I in the editor (Ctrl+K Ctrl+I off macOS): Show or
+            // Focus Hover at the caret, VS Code's chord (#1518). Needs the
+            // trailing Cmd, so plain Cmd+K I below stays broadcast input,
+            // and outside the editor the chord broadcasts as before.
+            KeyCode::Char(c)
+                if plain
+                    && cmd_held
+                    && !shifted
+                    && c.eq_ignore_ascii_case(&'i')
+                    && self.focus == Pane::Editor =>
+            {
+                self.run_command(crate::widgets::command_palette::Command::ShowHover);
                 true
             }
             // Cmd+K Shift+I: toggle whether the active pane receives
@@ -50146,6 +50542,59 @@ impl App {
         }
     }
 
+    /// Markdown: Open Preview to the Side (#1605, VS Code's
+    /// `markdown.showPreviewToSide`): the active Markdown file rendered in
+    /// the next editor group, or in a new group to the right when there is
+    /// none, showing what is typed here as it is typed
+    /// ([`App::sync_markdown_side_previews`]). Focus stays on the source,
+    /// which a tab showing the preview turns back into.
+    fn open_markdown_preview_to_side(&mut self) {
+        let Some(path) = self.editor.path.clone() else {
+            self.status = String::from("Open Preview to the Side: save the file first");
+            return;
+        };
+        if self.editor.language() != Some(crate::highlight::LangKind::Markdown)
+            || self.editor.has_non_text_view()
+        {
+            self.status = String::from("Markdown Preview needs a Markdown file");
+            return;
+        }
+        if self.editor.markdown_preview.is_some() {
+            self.editor.toggle_markdown_preview();
+        }
+        let source = self.editor_layout.active_dfs_index();
+        let opened = if source + 1 < self.editor_layout.leaf_count() {
+            let here = std::mem::take(&mut self.editor);
+            self.editor = self.editor_layout.refocus_to_dfs(here, source + 1);
+            self.editor.open_preview(&path)
+        } else {
+            let mut group = EditorTabs::default();
+            let opened = group.open_preview(&path);
+            if opened.is_ok() {
+                group.copy_view_position_from(&self.editor);
+                let here = std::mem::replace(&mut self.editor, group);
+                self.editor_layout
+                    .split_active(here, editor_layout::SplitDir::Horizontal, true);
+            }
+            opened
+        };
+        if opened.is_ok() && self.editor.markdown_preview.is_none() {
+            self.editor.toggle_markdown_preview();
+        }
+        if self.editor_layout.active_dfs_index() != source {
+            let side = std::mem::take(&mut self.editor);
+            self.editor = self.editor_layout.refocus_to_dfs(side, source);
+        }
+        // The side pane comes up at the source's place and with its text.
+        self.md_scroll_synced = None;
+        self.sync_markdown_side_previews();
+        self.focus_pane(Pane::Editor);
+        self.status = match opened {
+            Ok(()) => format!("Previewing {} to the side", self.status_path(&path)),
+            Err(e) => format!("Open Preview to the Side: {e}"),
+        };
+    }
+
     fn handle_editor_key(&mut self, key: KeyEvent) {
         // Inline find bar (Cmd+F / Ctrl+F) eats every key while open.
         if self.editor_find.is_some() {
@@ -56487,6 +56936,7 @@ impl App {
                 message: d.message,
                 source,
                 code: d.code,
+                related: Vec::new(),
             },
         ))
     }
@@ -58934,6 +59384,7 @@ impl App {
             Cmd::ToggleInlineValues => self.toggle_inline_values(),
             Cmd::ToggleInlayHints => self.toggle_inlay_hints(),
             Cmd::ToggleMarkdownPreview => self.toggle_markdown_preview(),
+            Cmd::OpenMarkdownPreviewToSide => self.open_markdown_preview_to_side(),
             // Cmd+Enter's run from any terminal (#843): the same confirm popup.
             Cmd::RunCodeBlockAtCursor => {
                 if !self.run_fence_at_cursor(true) {
@@ -59055,6 +59506,7 @@ impl App {
             | Cmd::RenameSymbol
             | Cmd::TriggerSuggest
             | Cmd::TriggerParameterHints
+            | Cmd::ShowHover
                 if self.editor.has_non_text_view() =>
             {
                 self.status = format!("{} needs a text file", cmd.title());
@@ -59067,6 +59519,7 @@ impl App {
             Cmd::RenameSymbol => self.start_rename_symbol(),
             Cmd::TriggerSuggest => self.trigger_completion(),
             Cmd::TriggerParameterHints => self.trigger_signature_help(),
+            Cmd::ShowHover => self.show_hover_at_caret(),
             // Position-carrying commands (#259). They read the click the
             // dispatcher set, and do nothing from the keyboard: invoked from
             // the palette there is no click to act on, and guessing the
@@ -59213,6 +59666,12 @@ impl App {
             Cmd::GitCopyPermalink => self.share_link(ShareLink::CopyPermalink),
             Cmd::GitCopyHeadLink => self.share_link(ShareLink::CopyHeadLink),
             Cmd::GitOpenOnRemote => self.share_link(ShareLink::OpenOnRemote),
+            Cmd::GitOpenLineCommit => self.open_commit_for_line(),
+            Cmd::GitCopyLineCommitHash => {
+                if let Some((hash, short)) = self.caret_line_commit() {
+                    self.run_commit_action(CommitAction::CopyHash, &hash, &short);
+                }
+            }
             Cmd::ToggleFold => {
                 let row = self.editor.cursor_row;
                 self.editor.toggle_fold(row);
@@ -59512,6 +59971,10 @@ impl App {
                     // hex, reported honestly). Sticks across FS-sync
                     // reloads; cleared by opening a different file.
                     self.editor.force_text = true;
+                    // A Markdown preview is a view of the buffer that a
+                    // same-path reload keeps (#1605), not a route `open`
+                    // takes, so it is put down here.
+                    self.editor.markdown_preview = None;
                     match self.editor.open(&p) {
                         Ok(()) if self.editor.hex.is_some() => {
                             self.status =
@@ -64547,6 +65010,11 @@ impl App {
                     self.run_code_lens(idx);
                     return;
                 }
+                // So is the inline blame (#1556): it opens its commit.
+                if in_editor && self.editor.blame_commit_at(m.column, m.row).is_some() {
+                    self.open_commit_for_line();
+                    return;
+                }
                 if in_editor && self.editor.diff.is_none() {
                     let hit = self
                         .editor
@@ -67583,7 +68051,7 @@ impl App {
                 let row = self.editor.cursor_row;
                 let diagnostic = self
                     .editor
-                    .diagnostics_at(row, self.editor.cursor_col)
+                    .diagnostics_at(row, self.editor.cursor_col, self.workspace_root())
                     .into_iter()
                     .next()
                     .map(|(_, m)| m);
@@ -68668,6 +69136,56 @@ impl App {
         }
         self.md_scroll_synced = Some(key);
         moved
+    }
+
+    /// Open Preview to the Side (#1605): a split's Markdown preview renders
+    /// the text being typed in the source pane beside it. Each pane's tab is
+    /// a buffer of its own, and nobody types into the preview's, so it showed
+    /// the file as last loaded. The panes pair as in
+    /// [`App::sync_markdown_scroll`], the focused pane's tab the preferred
+    /// source; a preview left with no source beside it shows its own buffer
+    /// again. The preview's buffer is never touched, so it stays clean.
+    /// Returns true when a preview was rebuilt.
+    pub fn sync_markdown_side_previews(&mut self) -> bool {
+        let mut tabs: Vec<&mut crate::widgets::editor::Editor> = std::iter::once(&mut self.editor)
+            .chain(self.editor_layout.inactive_groups_mut())
+            .filter_map(|group| {
+                let idx = group.active_index();
+                group.editors.get_mut(idx)
+            })
+            .collect();
+        let mut changed = false;
+        for p in 0..tabs.len() {
+            let follows = match tabs[p].markdown_preview.as_ref() {
+                Some(md) if !md.notebook && md.doc_path.is_none() => md.follows,
+                _ => continue,
+            };
+            let source = (0..tabs.len()).find(|&s| {
+                s != p
+                    && tabs[s].path.is_some()
+                    && tabs[s].path == tabs[p].path
+                    && tabs[s].markdown_preview.is_none()
+                    && !tabs[s].has_non_text_view()
+            });
+            let wanted = source.map(|s| (tabs[s].edit_seq, tabs[s].undo_step_id));
+            let built = tabs[p]
+                .markdown_preview
+                .as_ref()
+                .is_some_and(|md| md.built_seq == tabs[p].edit_seq);
+            // A preview of its own buffer is rebuilt by its render, as ever.
+            if wanted == follows && (built || wanted.is_none()) {
+                continue;
+            }
+            match source {
+                Some(s) => {
+                    let text = tabs[s].lines.join("\n");
+                    tabs[p].rebuild_markdown_preview_from(&text, wanted);
+                }
+                None => tabs[p].rebuild_markdown_preview(),
+            }
+            changed = true;
+        }
+        changed
     }
 
     /// Arm or disarm Live Run for the active file (Cmd+K V).
@@ -78411,6 +78929,36 @@ fn one_line(text: String) -> String {
         .join(" ")
 }
 
+/// `text` with each absolute path under `root` written relative to it, for
+/// the status bar: `Saved /home/me/proj/src/main.rs` reads `Saved
+/// src/main.rs`. A path only counts where it starts a word (after the start,
+/// a space, a quote or a bracket), so `root` found inside some other
+/// absolute path is left alone; the root on its own is kept as is.
+fn workspace_relative(text: &str, root: &Path) -> String {
+    let root = root.to_string_lossy();
+    let root = root.trim_end_matches('/');
+    if root.is_empty() {
+        return text.to_string();
+    }
+    let needle = format!("{root}/");
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find(&needle) {
+        let starts_word = rest[..i]
+            .chars()
+            .next_back()
+            .or_else(|| out.chars().next_back())
+            .is_none_or(|c| c.is_whitespace() || "'\"`([{<".contains(c));
+        out.push_str(&rest[..i]);
+        if !starts_word {
+            out.push_str(&needle);
+        }
+        rest = &rest[i + needle.len()..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// The excerpt window for a Peek popup: up to `total` lines, at most
 /// `above` of them before `target`, clamped to the file. Returns the start
 /// line index and the excerpt slice (cloned).
@@ -79330,7 +79878,7 @@ fn is_run_fence_key(key: KeyEvent) -> bool {
 /// with the pane's directory on its import path, as before. Should the file
 /// not be written, the heredoc is the fallback.
 ///
-/// A shell block of several lines, or holding a tab or `!`, goes as one
+/// A shell block of several lines, or holding a tab, `!` or `#`, goes as one
 /// single-quoted `printf '%b'` argument instead. Typed line by line, each
 /// line was a command of its own, so the capture under the fence and the
 /// pane's outcome described only the first one to finish (#920); as one
@@ -79338,8 +79886,13 @@ fn is_run_fence_key(key: KeyEvent) -> bool {
 /// status it ends with. Typed into an interactive shell, a tab is
 /// completion and bash expands `!` as history, so what ran was not what
 /// the confirm popup showed. Inside single quotes neither happens, and the
-/// tab travels as `\t`. A backslash travels as `\0134`, since fish folds
-/// `\\` inside single quotes to one backslash where bash and zsh keep both.
+/// tab travels as `\t`. zsh reads a typed `#` as a word, not a comment,
+/// unless `interactive_comments` is set, and it is off by default: `echo
+/// done  # note` printed the note and a comment alone failed with exit 127
+/// (#1367). Text `eval`ed or `source`d is a script, where every shell reads
+/// a comment as one, and a `#` that is not a comment parses as typed. A
+/// backslash travels as `\0134`, since fish folds `\\` inside single
+/// quotes to one backslash where bash and zsh keep both.
 /// `shell` is the pane's shell: fish before 3.4 rejects `$(...)` as
 /// syntax, so a fish pane `source`s the decoded block from a `psub` file
 /// rather than `eval`ing it, which every fish reads alike. Not piped to
@@ -79359,7 +79912,7 @@ fn fence_command(interpreter: &str, code: &str, scripts: &Path, shell: &str) -> 
         }
         return format!("{interpreter} - <<'{end}'\n{code}\n{end}\r");
     }
-    if code.contains(['\n', '\t', '!']) {
+    if code.contains(['\n', '\t', '!', '#']) {
         let escaped = format!("{code}\n")
             .replace('\\', "\\0134")
             .replace('\n', "\\n")
@@ -83337,6 +83890,10 @@ fn key_to_bytes(key: KeyEvent, app_cursor: bool) -> Vec<u8> {
 /// mirroring the horizontal rule VS Code renders between hover sections.
 const HOVER_DIVIDER: &str = "────────";
 
+/// What Show or Focus Hover says when the caret has nothing to describe
+/// (#1518): a keyboard command that does nothing must say why.
+const NO_HOVER_AT_CARET: &str = "No hover information at the caret";
+
 /// Render the diagnostics under the hovered point into a single labelled text
 /// block, errors first (so the most severe message leads), each line prefixed
 /// with its severity. `None` when there are no diagnostics. The severity word
@@ -84563,8 +85120,10 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             app.poll_chrome_bake() | app.poll_welcome_bake() | app.poll_saved_session();
         // A closed tab's bookmarks are kept, and come back with its file.
         let bookmarks_changed = app.settle_bookmarks();
-        let live_run_changed =
-            app.tick_live_run() | app.sync_markdown_scroll() | app.tick_minimap();
+        let live_run_changed = app.tick_live_run()
+            | app.sync_markdown_side_previews()
+            | app.sync_markdown_scroll()
+            | app.tick_minimap();
         app.tick_code_lens();
         let code_lens_changed = app.tick_config_watch()
             | app.drain_lsp_code_lens()
@@ -84605,7 +85164,8 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         app.refresh_signature_help_if_moved();
         let sig_help_changed = app.drain_lsp_signature_help();
         app.poll_hover();
-        let hover_changed = app.drain_lsp_hover() | app.drain_lsp_rust_analyzer();
+        let hover_changed =
+            app.drain_lsp_hover() | app.drain_lsp_rust_analyzer() | app.drain_blame_hover();
         let tab_hover_changed = app.poll_tab_hover();
         let ui_tooltip_changed = app.poll_ui_tooltip();
         let definition_changed = app.drain_lsp_definition();

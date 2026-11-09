@@ -491,18 +491,17 @@ fn ctrl_shift_s_in_the_editor_jumps_to_source_control_without_saving() {
 #[test]
 fn git_status_spans_empty_when_not_in_repo() {
     let st = crate::git::GitStatus::default();
-    let spans = git_status_spans(&st);
+    let spans = git_status_spans(&st, crate::theme::Theme::default());
     assert!(spans.is_empty(), "no git pill outside a git repo");
 }
 
-#[test]
-fn git_status_spans_clean_branch_is_green() {
-    // Agnoster convention: clean working tree → green pill.
-    let st = crate::git::GitStatus {
+/// A `GitStatus` on `main` in a repository, clean or dirty.
+fn branch_status(dirty: bool) -> crate::git::GitStatus {
+    crate::git::GitStatus {
         in_repo: true,
         branch: Some("main".into()),
         detached_hash: None,
-        dirty: false,
+        dirty,
         ahead: 0,
         behind: 0,
         head_oid: None,
@@ -513,46 +512,72 @@ fn git_status_spans_clean_branch_is_green() {
         prepared_message: None,
         operation: None,
         rebasing_branch: None,
-    };
-    let spans = git_status_spans(&st);
-    let main_span = spans
-        .iter()
-        .find(|s| s.content.contains("main"))
-        .expect("branch span");
-    assert_eq!(main_span.style.fg, Some(GIT_CLEAN_COLOR));
+    }
 }
 
 #[test]
-fn git_status_spans_dirty_branch_is_yellow_not_red() {
-    // Agnoster convention: dirty working tree → yellow/orange pill.
-    // No red bullet either — colour alone carries the state.
-    let st = crate::git::GitStatus {
-        in_repo: true,
-        branch: Some("main".into()),
-        detached_hash: None,
-        dirty: true,
-        ahead: 0,
-        behind: 0,
-        head_oid: None,
-        ignored: std::sync::Arc::default(),
-        decorations: std::sync::Arc::default(),
-        repo_root: None,
-        changed_count: 0,
-        prepared_message: None,
-        operation: None,
-        rebasing_branch: None,
-    };
-    let spans = git_status_spans(&st);
+fn git_status_spans_clean_branch_is_quiet_with_no_dot() {
+    // A clean tree is the resting state: the branch reads in the bar's text
+    // tone, beside an accent glyph, with nothing amber anywhere.
+    let theme = crate::theme::Theme::default();
+    let st = branch_status(false);
+    let spans = git_status_spans(&st, theme);
     let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
-    assert!(
-        !joined.contains('●'),
-        "no red bullet — colour signals dirtiness"
-    );
+    assert!(!joined.contains(GIT_DIRTY_DOT), "{joined}");
     let main_span = spans
         .iter()
         .find(|s| s.content.contains("main"))
         .expect("branch span");
-    assert_eq!(main_span.style.fg, Some(GIT_DIRTY_COLOR));
+    let tones = StatusTones::new(theme, status_bar_bg(theme));
+    assert_eq!(main_span.style.fg, Some(tones.text));
+    let glyph = spans
+        .iter()
+        .find(|s| s.content.contains('\u{ea68}'))
+        .expect("branch glyph");
+    assert_eq!(glyph.style.fg, Some(theme.accent()));
+}
+
+#[test]
+fn git_status_spans_dirty_branch_adds_an_amber_dot_and_keeps_its_colour() {
+    // VS Code's `main*`: a dirty tree is one small amber mark after the
+    // branch, which itself keeps the colour it has when clean.
+    let theme = crate::theme::Theme::default();
+    let clean = git_status_spans(&branch_status(false), theme)
+        .iter()
+        .find(|s| s.content.contains("main"))
+        .map(|s| s.style)
+        .unwrap();
+    let st = branch_status(true);
+    let spans = git_status_spans(&st, theme);
+    let main_span = spans
+        .iter()
+        .find(|s| s.content.contains("main"))
+        .expect("branch span");
+    assert_eq!(main_span.style, clean);
+    let dot = spans
+        .iter()
+        .find(|s| s.content.contains(GIT_DIRTY_DOT))
+        .expect("dirty dot");
+    assert_eq!(dot.style.fg, Some(theme.ui(GIT_DIRTY_COLOR)));
+}
+
+#[test]
+fn git_status_spans_name_the_branch_in_a_light_themes_own_text_colour() {
+    // A light theme's foreground is already dark: adapting it again for a
+    // light background flipped it to near-white on the light bar.
+    let light = crate::theme::Theme::all()
+        .iter()
+        .find(|t| t.is_light() && !t.high_contrast())
+        .copied()
+        .expect("a bundled light theme");
+    let st = branch_status(false);
+    let spans = git_status_spans(&st, light);
+    let main_span = spans
+        .iter()
+        .find(|s| s.content.contains("main"))
+        .expect("branch span");
+    let (r, g, b) = light.syntax().fg;
+    assert_eq!(main_span.style.fg, Some(Color::Rgb(r, g, b)));
 }
 
 #[test]
@@ -573,7 +598,7 @@ fn git_status_spans_renders_detached_hash_when_no_branch() {
         operation: None,
         rebasing_branch: None,
     };
-    let spans = git_status_spans(&st);
+    let spans = git_status_spans(&st, crate::theme::Theme::default());
     let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
     assert!(joined.contains("abc1234"));
 }
@@ -596,7 +621,7 @@ fn git_status_spans_renders_ahead_behind_counts() {
         operation: None,
         rebasing_branch: None,
     };
-    let spans = git_status_spans(&st);
+    let spans = git_status_spans(&st, crate::theme::Theme::default());
     let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
     assert!(joined.contains("↑2"));
     assert!(joined.contains("↓1"));
@@ -1891,7 +1916,7 @@ fn a_rebase_names_the_branch_being_rebased() {
         assert!(!git_succeeds(p, rebase), "the rebase must conflict");
         let st = crate::git::query(p);
         assert_eq!(st.head_label(), "feat", "{rebase:?}");
-        let pill: String = git_status_spans(&st)
+        let pill: String = git_status_spans(&st, crate::theme::Theme::default())
             .iter()
             .map(|s| s.content.as_ref())
             .collect();
@@ -4200,6 +4225,166 @@ fn clicking_a_commit_graph_row_opens_the_commit_patch_tab() {
         body.contains("first commit") && body.contains("diff --git"),
         "the patch tab must carry the commit message and its diff"
     );
+}
+
+/// The issue's repo (#1556), open on `f.py` with its blame in: line 2 was
+/// raised to `b = 20` by a commit whose message has a body, and line 3,
+/// `c = 3`, is not committed. The caret is on line 2.
+fn blamed_line_app() -> (tempfile::TempDir, App) {
+    let tmp = make_committed_repo();
+    let p = tmp.path();
+    std::fs::write(p.join("f.py"), "a = 1\nb = 2\n").unwrap();
+    assert!(git_succeeds(p, &["add", "f.py"]));
+    assert!(git_succeeds(p, &["commit", "-qm", "Initial values"]));
+    std::fs::write(p.join("f.py"), "a = 1\nb = 20\n").unwrap();
+    let (author, message) = (
+        "--author=Bo Chen <bo@example.com>",
+        "Raise b to 20\n\nThe old limit overflowed.",
+    );
+    assert!(git_succeeds(p, &["commit", "-qa", author, "-m", message]));
+    std::fs::write(p.join("f.py"), "a = 1\nb = 20\nc = 3\n").unwrap();
+    let mut app = App::new(p.to_path_buf()).unwrap();
+    app.editor.open(&p.join("f.py")).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.cursor_row = 1;
+    app.sync_blame();
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the file's blame",
+        || {
+            app.drain_blame();
+            app.editor.blame_lines.is_some()
+        },
+    );
+    (tmp, app)
+}
+
+/// #1556: Git: Open Commit for Line opens the change the caret line's
+/// commit made to the file, as GitLens's Open Changes does.
+#[test]
+fn open_commit_for_line_shows_the_lines_commit_diff() {
+    let (_tmp, mut app) = blamed_line_app();
+    app.run_command(crate::widgets::command_palette::Command::GitOpenLineCommit);
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the commit's diff",
+        || {
+            app.drain_git_view();
+            app.git_view_job.is_none()
+        },
+    );
+    let diff = app
+        .editor
+        .diff
+        .as_ref()
+        .expect("the commit opens as a diff");
+    assert!(diff.left_lines.iter().any(|l| l == "b = 2"), "{diff:?}");
+    assert!(diff.right_lines.iter().any(|l| l == "b = 20"), "{diff:?}");
+    assert!(app.status.starts_with("Showing f.py at "), "{}", app.status);
+}
+
+/// #1556: Git: Copy Commit Hash for Line copies the full hash of the caret
+/// line's commit; an uncommitted line has none, and says so.
+#[test]
+fn copy_commit_hash_for_line_copies_the_lines_commit() {
+    let (tmp, mut app) = blamed_line_app();
+    let head = git_stdout_in(tmp.path(), &["rev-parse", "HEAD"]);
+    app.run_command(crate::widgets::command_palette::Command::GitCopyLineCommitHash);
+    assert_eq!(crate::clipboard::last_copy().as_deref(), Some(head.trim()));
+    assert_eq!(app.status, format!("Copied commit hash {}", &head[..8]));
+    app.editor.cursor_row = 2;
+    app.run_command(crate::widgets::command_palette::Command::GitCopyLineCommitHash);
+    assert_eq!(app.status, "Line 3 has uncommitted changes");
+    assert_eq!(crate::clipboard::last_copy().as_deref(), Some(head.trim()));
+}
+
+/// #1556: the pointer resting on line 2's inline blame shows its commit's
+/// card, with the email and the whole message the annotation leaves out;
+/// it stays along the annotation, goes off it, and a click opens the diff.
+#[test]
+fn hovering_the_inline_blame_shows_its_commits_whole_message() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let (_tmp, mut app) = blamed_line_app();
+    let (col, row) = find_on_screen(&mut app, "Raise").expect("line 2's blame is painted");
+    app.handle_mouse(mouse(MouseEventKind::Moved, col, row));
+    // What the dwell runs once the pointer has rested HOVER_DELAY.
+    app.hover_at_cell(col, row);
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the commit's card",
+        || {
+            app.drain_blame_hover();
+            app.hover_popup.is_some()
+        },
+    );
+    let card = app.hover_popup.as_ref().unwrap().lines.join("\n");
+    assert!(card.starts_with("Bo Chen <bo@example.com>\n"), "{card}");
+    assert!(
+        card.contains("Raise b to 20\n\nThe old limit overflowed."),
+        "{card}"
+    );
+    app.handle_mouse(mouse(MouseEventKind::Moved, col + 3, row));
+    assert!(
+        app.hover_popup.is_some(),
+        "the card stays along the annotation"
+    );
+    app.handle_mouse(mouse(MouseEventKind::Moved, col, row - 1));
+    assert!(app.hover_popup.is_none(), "and goes off it");
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the commit's diff",
+        || {
+            app.drain_git_view();
+            app.git_view_job.is_none()
+        },
+    );
+    let diff = app.editor.diff.as_ref().expect("a click opens the commit");
+    assert!(diff.right_lines.iter().any(|l| l == "b = 20"));
+}
+
+/// #1556: a card git is still reading when another tab's blame comes up
+/// under the resting pointer is the card of a commit no longer there: it
+/// must not show over the new blame, whose own card shows instead.
+#[test]
+fn a_blame_card_for_a_commit_no_longer_under_the_pointer_is_dropped() {
+    use crossterm::event::MouseEventKind;
+    let (tmp, mut app) = blamed_line_app();
+    let (p, g) = (tmp.path(), tmp.path().join("g.py"));
+    std::fs::write(&g, "a = 1\nb = 20\n").unwrap();
+    assert!(git_succeeds(p, &["add", "g.py"]));
+    let author = "--author=Ann Lee <ann@example.com>";
+    assert!(git_succeeds(p, &["commit", "-q", author, "-m", "Add g"]));
+    let (col, row) = find_on_screen(&mut app, "Bo Chen").expect("f.py's blame is painted");
+    app.handle_mouse(mouse(MouseEventKind::Moved, col, row));
+    app.hover_at_cell(col, row);
+    app.editor.open(&g).unwrap();
+    app.editor.cursor_row = 1;
+    app.sync_blame();
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "g.py's blame",
+        || {
+            app.drain_blame();
+            app.editor.blame_for.as_deref() == Some(g.as_path()) && app.editor.blame_lines.is_some()
+        },
+    );
+    assert_eq!(find_on_screen(&mut app, "Ann Lee"), Some((col, row)));
+    crate::test_budget::await_spawned(std::time::Duration::from_millis(500), "f.py's card", || {
+        app.drain_blame_hover();
+        app.blame_hover.is_none() || app.hover_popup.is_some()
+    });
+    assert!(
+        app.hover_popup.is_none(),
+        "f.py's card shows over g.py's blame"
+    );
+    app.hover_at_cell(col, row);
+    crate::test_budget::await_spawned(std::time::Duration::from_millis(500), "g.py's card", || {
+        app.drain_blame_hover();
+        app.hover_popup.is_some()
+    });
+    let card = app.hover_popup.as_ref().unwrap().lines.join("\n");
+    assert!(card.starts_with("Ann Lee <ann@example.com>\n"), "{card}");
 }
 
 /// The issue's repo (#1627): `main` has "init app" and "update readme";

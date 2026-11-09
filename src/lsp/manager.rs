@@ -702,7 +702,9 @@ pub struct Diagnostic {
 /// Two diagnostics are the same finding when everything croft shows of them
 /// matches. `origin` is left out: a server that reports one finding both
 /// pushed and pulled may give each copy different `data`, and the copies
-/// must still collapse into one row (`diagnostics_by_source`).
+/// must still collapse into one row (`diagnostics_by_source`). The related
+/// locations read from it are shown, though (#1523), so they count: a copy
+/// that names them is never dropped for one that does not.
 impl PartialEq for Diagnostic {
     fn eq(&self, other: &Self) -> bool {
         let Diagnostic {
@@ -725,6 +727,7 @@ impl PartialEq for Diagnostic {
             )
             && (severity, message, tags, code)
                 == (&other.severity, &other.message, &other.tags, &other.code)
+            && self.related() == other.related()
     }
 }
 
@@ -736,6 +739,65 @@ impl PartialEq for Diagnostic {
 pub struct DiagnosticOrigin {
     pub server: String,
     pub wire: lsp_types::Diagnostic,
+}
+
+impl Diagnostic {
+    /// The places the server points at to explain this diagnostic (#1523):
+    /// rustc's "immutable borrow occurs here", TypeScript's "'foo' is
+    /// declared here". Not stored on croft's diagnostic: built on demand
+    /// from the server's own, kept in `origin`; one croft made itself has
+    /// none.
+    pub fn related(&self) -> Vec<RelatedLocation> {
+        let Some(origin) = self.origin.as_deref() else {
+            return Vec::new();
+        };
+        origin
+            .wire
+            .related_information
+            .iter()
+            .flatten()
+            .filter_map(|r| {
+                Some(RelatedLocation {
+                    path: r.location.uri.to_file_path().ok()?,
+                    line: r.location.range.start.line,
+                    character: r.location.range.start.character,
+                    message: r.message.clone(),
+                })
+            })
+            .collect()
+    }
+}
+
+/// One of a diagnostic's related locations (#1523): where its range starts,
+/// zero-based with a UTF-16 column like the diagnostic's own position.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelatedLocation {
+    pub path: PathBuf,
+    pub line: u32,
+    pub character: u32,
+    pub message: String,
+}
+
+impl RelatedLocation {
+    /// `file(line, col): message`, one-based, as VS Code appends it to the
+    /// diagnostic's hover, with the file relative to `root`.
+    pub fn label(&self, root: &Path) -> String {
+        let file = self.path.strip_prefix(root).unwrap_or(&self.path);
+        format!(
+            "{}({}, {}): {}",
+            file.display(),
+            self.line + 1,
+            self.character + 1,
+            one_line(&self.message)
+        )
+    }
+}
+
+/// `text` on one line, each line break (`\r\n`, `\n` or `\r`) a space: a
+/// related location's message, which the hover and PROBLEMS show one
+/// location to a line (#1523).
+pub fn one_line(text: &str) -> String {
+    text.replace("\r\n", " ").replace(['\r', '\n'], " ")
 }
 
 /// A diagnostic's rule code with the server's `source` and the rule's
@@ -1230,6 +1292,10 @@ pub struct LspManager {
     completion_rx: std_mpsc::Receiver<CompletionResult>,
     signature_help_rx: std_mpsc::Receiver<SignatureHelpResult>,
     hover_rx: std_mpsc::Receiver<HoverResult>,
+    /// Test hook: a sender into `hover_rx`, so app tests can answer a
+    /// hover request without a server.
+    #[cfg(test)]
+    hover_test_tx: std_mpsc::Sender<HoverResult>,
     rust_analyzer_rx: std_mpsc::Receiver<RustAnalyzerResult>,
     def_rx: std_mpsc::Receiver<DefinitionResult>,
     /// Test hooks: senders into the three jump channels, so app tests can
@@ -1341,6 +1407,8 @@ impl LspManager {
         let (completion_tx, completion_rx) = std_mpsc::channel();
         let (signature_help_tx, signature_help_rx) = std_mpsc::channel();
         let (hover_tx, hover_rx) = std_mpsc::channel();
+        #[cfg(test)]
+        let hover_test_tx = hover_tx.clone();
         let (rust_analyzer_tx, rust_analyzer_rx) = std_mpsc::channel();
         let (def_tx, def_rx) = std_mpsc::channel();
         let (doc_symbols_tx, doc_symbols_rx) = std_mpsc::channel();
@@ -1452,6 +1520,8 @@ impl LspManager {
             completion_rx,
             signature_help_rx,
             hover_rx,
+            #[cfg(test)]
+            hover_test_tx,
             rust_analyzer_rx,
             def_rx,
             #[cfg(test)]
@@ -1667,6 +1737,12 @@ impl LspManager {
 
     pub fn drain_hover(&self) -> Option<HoverResult> {
         self.hover_rx.try_recv().ok()
+    }
+
+    /// Test hook: deliver a hover reply as if a server had answered.
+    #[cfg(test)]
+    pub fn push_hover_for_test(&self, result: HoverResult) {
+        self.hover_test_tx.send(result).expect("hover channel open");
     }
 
     /// Send one of rust-analyzer's own requests (#1626) for the caret at
@@ -2649,7 +2725,8 @@ type ClientKey = (Language, PathBuf);
 /// Why [`WorkerState::pick_server`] found no server to ask.
 enum NoServer {
     /// The file is not open, or no server set exists for its language and
-    /// root: the request is dropped without a reply.
+    /// root: the request is dropped without a reply (a hover gets an empty
+    /// one).
     Unknown,
     /// Servers run for the file, but none carries the method.
     Unsupported,
@@ -4421,19 +4498,21 @@ impl WorkerState {
         character: u32,
         tx: &std_mpsc::Sender<HoverResult>,
     ) {
+        // Every hover is answered, an empty answer when no server can give
+        // one: the app holds a problem's message until the reply, and Show
+        // Hover says when there is nothing (#1518).
+        let none = || {
+            let _ = tx.send(HoverResult {
+                request_id,
+                text: None,
+            });
+        };
         let (server_name, client_arc) = match self.pick_server(&path, |c| c.supports_hover).await {
             Ok(picked) => picked,
-            Err(NoServer::Unsupported) => {
-                let _ = tx.send(HoverResult {
-                    request_id,
-                    text: None,
-                });
-                return;
-            }
-            Err(NoServer::Unknown) => return,
+            Err(NoServer::Unsupported | NoServer::Unknown) => return none(),
         };
         let Ok(uri) = Url::from_file_path(&path) else {
-            return;
+            return none();
         };
         let tx = tx.clone();
         log_file::log(&format!(
@@ -10093,6 +10172,22 @@ while True:
             publish.code_description_support,
             Some(true),
             "#1540: a server may leave a rule's link out otherwise"
+        );
+    }
+
+    /// #1523: a related location takes one line of the hover, whatever
+    /// line breaks its message holds.
+    #[test]
+    fn a_related_location_label_is_one_line() {
+        let related = RelatedLocation {
+            path: PathBuf::from("/w/src/a.ts"),
+            line: 1,
+            character: 2,
+            message: "'foo'\ris\r\ndeclared\nhere.".into(),
+        };
+        assert_eq!(
+            related.label(Path::new("/w")),
+            "src/a.ts(2, 3): 'foo' is declared here."
         );
     }
 

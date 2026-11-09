@@ -16,7 +16,7 @@ def main(binary: str, gif: str) -> None:
     """Record the scenario from `binary` into `gif`."""
     with Demo(
         binary,
-        user_config={"auto_save": False, "theme": "dark"},
+        user_config={"auto_save": False},
         workspace_config={"copy_on_select": True},
         files={"src/main.rs": 'fn main() {\n    println!("hello");\n}\n'},
     ) as d:

@@ -92,6 +92,9 @@ pub enum Command {
     /// popup Ctrl+Space opens, and the parameter hints typing `(` asks for.
     TriggerSuggest,
     TriggerParameterHints,
+    /// Show or Focus Hover (#1518): the hover popup for the caret, the one
+    /// the pointer's rest opens, from the keyboard.
+    ShowHover,
     MouseAddCursorAtClick,
     MouseGoToDefinitionAtClick,
     MouseOpenLinkAtClick,
@@ -117,6 +120,10 @@ pub enum Command {
 
     /// Pick a stash and open its changes (#1581).
     GitViewStash,
+    /// The caret line's commit, as the inline blame names it (#1556): open
+    /// the changes it made to the file, or copy its hash.
+    GitOpenLineCommit,
+    GitCopyLineCommitHash,
     AddCursorAbove,
     AddCursorBelow,
     ColumnSelectUp,
@@ -200,6 +207,10 @@ pub enum Command {
     ToggleInlineValues,
     ToggleInlayHints,
     ToggleMarkdownPreview,
+    /// Markdown: Open Preview to the Side (#1605), VS Code's
+    /// `markdown.showPreviewToSide`: the rendered view in the next group,
+    /// following the source as it is typed.
+    OpenMarkdownPreviewToSide,
     /// Markdown: Run Code Block at Cursor (#843): Cmd+Enter's run of the
     /// fence under the caret, from any terminal.
     RunCodeBlockAtCursor,
@@ -684,6 +695,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::RenameSymbol,
     Command::TriggerSuggest,
     Command::TriggerParameterHints,
+    Command::ShowHover,
     Command::MouseAddCursorAtClick,
     Command::MouseGoToDefinitionAtClick,
     Command::MouseOpenLinkAtClick,
@@ -701,6 +713,8 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::GitCopyHeadLink,
     Command::GitOpenOnRemote,
     Command::GitViewStash,
+    Command::GitOpenLineCommit,
+    Command::GitCopyLineCommitHash,
     Command::AddCursorAbove,
     Command::AddCursorBelow,
     Command::ColumnSelectUp,
@@ -770,6 +784,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::ToggleInlineValues,
     Command::ToggleInlayHints,
     Command::ToggleMarkdownPreview,
+    Command::OpenMarkdownPreviewToSide,
     Command::RunCodeBlockAtCursor,
     Command::RestoreSnapshot,
     Command::CloseEditor,
@@ -1170,6 +1185,7 @@ impl Command {
             Command::RenameSymbol => "Rename Symbol",
             Command::TriggerSuggest => "Trigger Suggest",
             Command::TriggerParameterHints => "Trigger Parameter Hints",
+            Command::ShowHover => "Show or Focus Hover",
             Command::MouseAddCursorAtClick => "Mouse: Add Cursor at Click",
             Command::MouseGoToDefinitionAtClick => "Mouse: Go to Definition at Click",
             Command::MouseOpenLinkAtClick => "Mouse: Open Link at Click",
@@ -1188,6 +1204,8 @@ impl Command {
             Command::GitOpenOnRemote => "Git: Open on Remote",
 
             Command::GitViewStash => "Git: View Stash\u{2026}",
+            Command::GitOpenLineCommit => "Git: Open Commit for Line",
+            Command::GitCopyLineCommitHash => "Git: Copy Commit Hash for Line",
             Command::AddCursorAbove => "Add Cursor Above",
             Command::AddCursorBelow => "Add Cursor Below",
             Command::ColumnSelectUp => "Column Select Up",
@@ -1257,6 +1275,7 @@ impl Command {
             Command::ToggleInlineValues => "Debug: Toggle Inline Values",
             Command::ToggleInlayHints => "Editor: Toggle Inlay Hints",
             Command::ToggleMarkdownPreview => "Markdown: Toggle Preview",
+            Command::OpenMarkdownPreviewToSide => "Markdown: Open Preview to the Side",
             Command::RunCodeBlockAtCursor => "Markdown: Run Code Block at Cursor",
             Command::RestoreSnapshot => "Local History: Restore Snapshot",
             Command::CloseEditor => "View: Close Editor",
@@ -1637,6 +1656,7 @@ impl Command {
             Command::ToggleInlineValues => "",
             Command::ToggleInlayHints => "",
             Command::ToggleMarkdownPreview => "Cmd+Shift+V",
+            Command::OpenMarkdownPreviewToSide => "Cmd+K V",
             Command::RunCodeBlockAtCursor => "Cmd+Enter",
             Command::RestoreSnapshot => "",
             Command::MergeAcceptCurrent => "Cmd+.",
@@ -1672,6 +1692,7 @@ impl Command {
             // No chord of its own: VS Code's Ctrl+Shift+Space is the
             // terminal's Quick Select here. Typing `(` or `,` asks too.
             Command::TriggerParameterHints => "",
+            Command::ShowHover => "Cmd+K Cmd+I",
             Command::MouseAddCursorAtClick => "",
             Command::MouseGoToDefinitionAtClick => "",
             Command::MouseOpenLinkAtClick => "",
@@ -1688,6 +1709,7 @@ impl Command {
             Command::GitCopyPermalink | Command::GitCopyHeadLink | Command::GitOpenOnRemote => "",
 
             Command::GitViewStash => "",
+            Command::GitOpenLineCommit | Command::GitCopyLineCommitHash => "",
             Command::AddCursorAbove => "Cmd+Opt+↑",
             Command::AddCursorBelow => "Cmd+Opt+↓",
             Command::ColumnSelectUp => "Cmd+Shift+Opt+↑",
@@ -2151,6 +2173,7 @@ impl Command {
             Command::RenameSymbol => "rename_symbol",
             Command::TriggerSuggest => "trigger_suggest",
             Command::TriggerParameterHints => "trigger_parameter_hints",
+            Command::ShowHover => "show_hover",
             Command::MouseAddCursorAtClick => "mouse_add_cursor_at_click",
             Command::MouseGoToDefinitionAtClick => "mouse_go_to_definition_at_click",
             Command::MouseOpenLinkAtClick => "mouse_open_link_at_click",
@@ -2169,6 +2192,8 @@ impl Command {
             Command::GitOpenOnRemote => "git_open_on_remote",
 
             Command::GitViewStash => "git_view_stash",
+            Command::GitOpenLineCommit => "git_open_line_commit",
+            Command::GitCopyLineCommitHash => "git_copy_line_commit_hash",
             Command::AddCursorAbove => "add_cursor_above",
             Command::AddCursorBelow => "add_cursor_below",
             Command::ColumnSelectUp => "column_select_up",
@@ -2238,6 +2263,7 @@ impl Command {
             Command::ToggleInlineValues => "toggle_inline_values",
             Command::ToggleInlayHints => "toggle_inlay_hints",
             Command::ToggleMarkdownPreview => "toggle_markdown_preview",
+            Command::OpenMarkdownPreviewToSide => "open_markdown_preview_to_side",
             Command::RunCodeBlockAtCursor => "run_code_block_at_cursor",
             Command::RestoreSnapshot => "restore_snapshot",
             Command::CloseEditor => "close_editor",
@@ -2554,8 +2580,9 @@ impl Command {
     /// title: "layout" for the Customize Layout commands (#852), whose
     /// VS Code names mostly don't say it, the tab menu's "Keep Open" for
     /// View: Keep Editor, the hosts a shared link opens on (#1610), and VS
-    /// Code's own names for restarting a language server (#1621). Empty for
-    /// the rest.
+    /// Code's own names for restarting a language server (#1621), and
+    /// "blame" for the commands on the caret line's commit (#1556). Empty
+    /// for the rest.
     pub fn keyword(self) -> &'static str {
         if LAYOUT_COMMANDS.contains(&self) {
             "layout"
@@ -2571,6 +2598,11 @@ impl Command {
             Command::GitCopyPermalink | Command::GitCopyHeadLink | Command::GitOpenOnRemote
         ) {
             "github gitlab bitbucket share link url"
+        } else if matches!(
+            self,
+            Command::GitOpenLineCommit | Command::GitCopyLineCommitHash
+        ) {
+            "blame"
         } else {
             ""
         }
@@ -3273,6 +3305,8 @@ mod tests {
                 "trigger_suggest",
                 "Ctrl+Space",
             ),
+            // #1518: VS Code's title and chord, so "hover" finds it.
+            ("hover", "Show or Focus Hover", "show_hover", "Cmd+K Cmd+I"),
         ] {
             let mut palette = CommandPalette::new();
             palette.set_query(query);
