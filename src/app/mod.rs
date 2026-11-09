@@ -18643,7 +18643,7 @@ impl App {
                     self.completion_request_id = None;
                     return false;
                 }
-                self.editor.insert_char(c);
+                self.type_char_in_editor(c);
                 self.refresh_completion_prefix();
                 if !is_word_continuation(c) {
                     self.completion_popup = None;
@@ -51453,8 +51453,7 @@ impl App {
                     && !key.modifiers.contains(KeyModifiers::ALT)
                     && !key.modifiers.contains(KeyModifiers::SUPER) =>
             {
-                self.editor.overwrite = self.overwrite_mode;
-                self.editor.insert_char(c);
+                self.type_char_in_editor(c);
                 // With an incomplete list pending but none of it on screen,
                 // typing on still re-asks (#1529).
                 self.note_incomplete_completion_edit();
@@ -69370,10 +69369,20 @@ impl App {
         );
     }
 
+    /// Type `c` into the active editor in the app's typing mode. The mode is
+    /// copied first: a tab switched to in the same input batch has not had
+    /// its `overwrite` flag synced by the draw yet.
+    fn type_char_in_editor(&mut self, c: char) {
+        self.editor.overwrite = self.overwrite_mode;
+        self.editor.insert_char(c);
+    }
+
     /// Flip Insert/Overwrite typing (the Insert key).
     fn toggle_overwrite_mode(&mut self) {
         self.overwrite_mode = !self.overwrite_mode;
         self.editor.overwrite = self.overwrite_mode;
+        // Text typed before and after the switch undo as separate steps.
+        self.editor.break_undo_coalescing();
         self.status = format!(
             "{} mode",
             if self.overwrite_mode {
@@ -84880,6 +84889,9 @@ fn run_pending_scp_uploads(app: &mut App, terminal: &mut CroftTerminal) -> Resul
         let _ = out.write_all(&takeover_mode_seq());
         let _ = out.flush();
     }
+    // The takeover block set the steady bar; the next draw puts the
+    // overwrite block back if it is wanted.
+    app.caret_block_sent = false;
     terminal.clear().ok();
     app.overlays.activity.mark_dirty();
     app.overlays.welcome.mark_dirty();
@@ -85709,6 +85721,9 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                             let out = terminal.backend_mut();
                             let _ = out.write_all(&reattach_reassert_seq(app.theme));
                             let _ = out.flush();
+                            // The re-assert set the steady bar; resend the
+                            // overwrite block on the next draw if wanted.
+                            app.caret_block_sent = false;
                         }
                     }
                     _ => {}

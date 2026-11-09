@@ -2412,6 +2412,43 @@ fn overwrite_typing_undoes_in_one_step_and_a_selection_is_replaced_as_usual() {
 }
 
 #[test]
+fn switching_the_typing_mode_starts_a_new_undo_step() {
+    let (_t, mut app) = overwrite_app("hello");
+    app.handle_key(key(KeyCode::Char('A'), KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Insert, KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('B'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.lines[0], "ABello");
+    app.editor.undo();
+    assert_eq!(
+        app.editor.lines[0], "Ahello",
+        "the overwrite run undoes on its own"
+    );
+    app.editor.undo();
+    assert_eq!(app.editor.lines[0], "hello");
+}
+
+#[test]
+fn overwrite_leaves_the_caret_after_a_cluster_the_typed_char_joins() {
+    // U+1F1FA before the French flag's two indicators pairs with the first of
+    // them, so the caret must step past that new pair, not stop inside it.
+    let (_t, mut app) = overwrite_app("a\u{1F1EB}\u{1F1F7}");
+    app.overwrite_mode = true;
+    app.handle_key(key(KeyCode::Char('\u{1F1FA}'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.lines[0], "\u{1F1FA}\u{1F1EB}\u{1F1F7}");
+    assert_eq!(app.editor.cursor_col, 2, "after the joined pair");
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        app.editor.lines[0], "\u{1F1FA}\u{1F1EB}x",
+        "the next key replaces the cluster after the caret"
+    );
+}
+
+#[test]
 fn overwrite_mode_is_shown_by_a_glyph_after_the_workspace_cap_not_in_the_position() {
     let (_t, mut app) = overwrite_app("abc");
     let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();

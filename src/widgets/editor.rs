@@ -8791,7 +8791,16 @@ impl Editor {
         let to = self.byte_index(row, next);
         let mut buf = [0u8; 4];
         self.lines[row].replace_range(from..to, c.encode_utf8(&mut buf));
-        self.cursor_col += 1;
+        // The typed char can join what follows into one cluster (a regional
+        // indicator before a flag); step past the whole cluster then, so the
+        // next keystroke never lands inside it.
+        let col = self.cursor_col + 1;
+        let line = &self.lines[row];
+        self.cursor_col = if floor_grapheme_col(line, col) == col {
+            col
+        } else {
+            next_grapheme_col(line, col)
+        };
         self.mark_buffer_changed();
         self.recompute_highlights();
         self.last_typed = Some((c, self.edit_seq));
