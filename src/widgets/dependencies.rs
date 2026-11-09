@@ -680,7 +680,7 @@ impl Widget for &mut DependenciesPanel {
 
         if let Some(metrics) = bar {
             self.last_scrollbar = metrics.area;
-            scrollbar::render_vertical(buf, metrics, self.focused, self.theme);
+            scrollbar::render_vertical_on_chrome(buf, metrics, self.focused, self.theme);
         }
     }
 }

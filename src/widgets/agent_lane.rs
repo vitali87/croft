@@ -278,11 +278,10 @@ impl Widget for &mut AgentLanePanel {
             }
             let line = match &rows[self.scroll + i] {
                 LaneRow::Agent { name, unreviewed } => {
-                    let fold = if self.collapsed_agents.contains(name) {
-                        crate::icons::CHEVRON_CLOSED
-                    } else {
-                        crate::icons::CHEVRON_OPEN
-                    };
+                    let fold = crate::widgets::surface::chevron(
+                        self.theme,
+                        !self.collapsed_agents.contains(name),
+                    );
                     let mut spans = vec![Span::styled(
                         format!("{fold} \u{25c6} {name}"),
                         Style::default()

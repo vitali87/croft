@@ -864,6 +864,13 @@ impl SourceControlPanel {
             // branch muted.
             if let Some(t) = tones {
                 let hovered = crate::widgets::hover::contains(rect, self.hover_pointer);
+                // Clear the row onto the chrome first: in the no-repo state
+                // the overview paints over the empty-state card's top.
+                for x in rect.left()..rect.right() {
+                    buf[(x, y)]
+                        .set_symbol(" ")
+                        .set_style(Style::default().bg(t.chrome()));
+                }
                 if row.active {
                     crate::widgets::surface::paint_selected_row(
                         buf,
