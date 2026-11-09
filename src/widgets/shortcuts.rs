@@ -362,6 +362,11 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 handler: "is_select_next_occurrence_key",
             },
             ShortcutEntry {
+                keys: "Cmd/Ctrl+L",
+                description: "Select the current line; each press adds the next (also a triple-click or a line-number click)",
+                handler: "is_expand_line_selection_key",
+            },
+            ShortcutEntry {
                 keys: "Cmd/Ctrl+Shift+K",
                 description: "Delete the current line or every selected line",
                 handler: "is_delete_line_key",
@@ -390,6 +395,11 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 keys: "Cmd/Ctrl+Shift+V",
                 description: "Markdown: toggle the rendered preview for this file",
                 handler: "is_markdown_preview_key",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+K V",
+                description: "Markdown: open the preview in the next group, showing what you type here",
+                handler: "",
             },
             ShortcutEntry {
                 keys: "Cmd/Ctrl+Enter",

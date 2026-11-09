@@ -3437,6 +3437,10 @@ pub struct Editor {
     /// closers type over, selections surround, and backspace eats an empty
     /// pair. Synced from the app's persisted preference like `blame_enabled`.
     pub auto_close_pairs: bool,
+    /// Overwrite (Replace) mode, toggled by the Insert key: a typed character
+    /// replaces the one under the caret instead of pushing it along. Mirrored
+    /// from the app's single global switch, like `auto_close_pairs`.
+    pub overwrite: bool,
     /// The global on-save clean-ups (#1657), set by the app before each save.
     pub save_cleanup: SaveCleanup,
     /// Auto-closing TAGS (VS Code's `html.autoClosingTags` /
@@ -4166,6 +4170,7 @@ impl Editor {
             git_marks: std::collections::HashMap::new(),
             git_marks_seq: u64::MAX,
             auto_close_pairs: true,
+            overwrite: false,
             save_cleanup: SaveCleanup::default(),
             auto_close_tags: true,
             auto_pair_at: None,
@@ -4423,6 +4428,21 @@ impl Editor {
             self.text_row(vis_row)?.0
         };
         (line < self.lines.len()).then_some(line)
+    }
+
+    /// The 0-based line whose number `(col, row)` is on (#1570): only the
+    /// number's own columns, right of the sign margin (the breakpoint lane
+    /// and the fold chevron) and left of the spacer before the change bar,
+    /// on any visual row of a source line. A press there selects the line,
+    /// as in VS Code. With line numbers off there are no such columns, and
+    /// views without source lines have none either.
+    pub fn line_number_line_at(&self, col: u16, row: u16) -> Option<usize> {
+        let x = self.last_inner.x;
+        let numbers = x + 2..x + self.last_gutter_width.saturating_sub(1);
+        if !numbers.contains(&col) || self.has_non_text_view() || self.markdown_preview.is_some() {
+            return None;
+        }
+        self.gutter_line_at(col, row)
     }
 
     /// The 0-based line whose breakpoint lane `(col, row)` is on (#1544): the
@@ -6194,10 +6214,20 @@ impl Editor {
                     return Ok(());
                 }
             }
-            // A `.tar.xz` under another name (#1645); a plain xz file is not
-            // a tar and falls through to hex.
-            Some(crate::magic::Magic::Xz) => {
-                match self.open_archive(path, crate::archive::ArchiveKind::TarXz) {
+            // A `.tar.xz`, `.tar.bz2` or `.tar.zst` under another name
+            // (#1645); a plain compressed file is not a tar and falls through
+            // to hex.
+            Some(
+                m @ (crate::magic::Magic::Xz
+                | crate::magic::Magic::Bzip2
+                | crate::magic::Magic::Zstd),
+            ) => {
+                let kind = match m {
+                    crate::magic::Magic::Xz => crate::archive::ArchiveKind::TarXz,
+                    crate::magic::Magic::Bzip2 => crate::archive::ArchiveKind::TarBz2,
+                    _ => crate::archive::ArchiveKind::TarZst,
+                };
+                match self.open_archive(path, kind) {
                     Ok(()) => return Ok(()),
                     Err(e) if crate::archive::is_list_cap_refusal(&e.to_string()) => {
                         self.route_note = Some((path.to_path_buf(), e.to_string()));
@@ -6384,7 +6414,22 @@ impl Editor {
         self.last_edit_kind = None;
         self.image = None;
         self.sheet = None;
-        self.markdown_preview = None;
+        // A same-path reload (the FS-sync sweep after another pane saves the
+        // file, an agent or formatter rewriting it, a revert) keeps the
+        // rendered Markdown view (#1605): dropping it turned the tab back
+        // into source whenever anything rewrote the file. The `edit_seq`
+        // bump below rebuilds it from the new text. A notebook's view is
+        // rebuilt below anyway, and a document's or media card's belonged to
+        // a viewer this text route has just replaced.
+        let keep_preview = !changed_file
+            && self.lang == Some(LangKind::Markdown)
+            && self
+                .markdown_preview
+                .as_ref()
+                .is_some_and(|md| !md.notebook && md.doc_path.is_none());
+        if !keep_preview {
+            self.markdown_preview = None;
+        }
         self.hex = None;
         self.log = None;
         self.archive = None;
@@ -6585,6 +6630,7 @@ impl Editor {
             row_of_line: Vec::new(),
             scroll_to_source: None,
             links: crate::markdown::MdLinks::default(),
+            follows: None,
         });
         self.status = format!("Opened media info {}", path.display());
         Ok(())
@@ -6666,6 +6712,7 @@ impl Editor {
             row_of_line: Vec::new(),
             scroll_to_source: None,
             links: crate::markdown::MdLinks::default(),
+            follows: None,
         });
         self.status = format!("Opened document {}", path.display());
         Ok(())
@@ -7747,17 +7794,28 @@ impl Editor {
         if self.markdown_preview.is_none() {
             return;
         }
+        let text = self.lines.join("\n");
+        self.rebuild_markdown_preview_from(&text, None);
+    }
+
+    /// [`Self::rebuild_markdown_preview`] from `text` instead of this tab's
+    /// buffer (#1605): the source pane's text, for a preview to the side
+    /// that follows it, with `follows` naming that source (`None` when
+    /// `text` is the buffer's own).
+    pub fn rebuild_markdown_preview_from(&mut self, text: &str, follows: Option<(u64, u64)>) {
+        if self.markdown_preview.is_none() {
+            return;
+        }
         // The image-aware builder (#196 review): the plain one left
         // md.images pointing at anchors into the REPLACED lines, and
         // the wrap-key recompute then sliced with stale first_line
         // values - an out-of-range panic on a theme switch.
-        let text = self.lines.join("\n");
         let base = self
             .path
             .as_ref()
             .and_then(|p| p.parent().map(|d| d.to_path_buf()));
         let (lines, images, runnables, source_map, links) = crate::markdown::render_markdown_mapped(
-            &text,
+            text,
             self.theme,
             &mut self.registry,
             base.as_deref(),
@@ -7770,6 +7828,14 @@ impl Editor {
             md.runnables = runnables;
             md.links = links;
             md.built_seq = self.edit_seq;
+            md.follows = follows;
+            // The visual-row caches (images, play glyphs, scroll sync) are
+            // keyed on `(built_seq, width)`, and a preview following another
+            // pane rebuilds with its own `built_seq` unchanged (#1605
+            // review): without this they kept the first build's rows, so
+            // clicks and scrolling landed on stale lines. `(0, 0)` never
+            // matches a drawn width.
+            md.wrap_key = (0, 0);
         }
     }
 
@@ -8571,6 +8637,7 @@ impl Editor {
             row_of_line: Vec::new(),
             scroll_to_source,
             links,
+            follows: None,
         });
         true
     }
@@ -8618,6 +8685,7 @@ impl Editor {
             row_of_line: Vec::new(),
             scroll_to_source: None,
             links: crate::markdown::MdLinks::default(),
+            follows: None,
         });
         true
     }
@@ -8684,6 +8752,10 @@ impl Editor {
     }
 
     pub fn insert_char(&mut self, c: char) {
+        if self.overwrite_applies() {
+            self.overwrite_char(c);
+            return;
+        }
         if self.auto_close_tags && c == '>' && self.insert_closing_tag() {
             // Still a keystroke, like the pair path below: on-type
             // formatting (#254) keys off the typed character.
@@ -8722,6 +8794,74 @@ impl Editor {
         // this keystroke (seq must still match at the tick). Set here, not
         // in insert_char_raw: paste and snippet expansion go through the
         // raw path and must never count as typing.
+        self.last_typed = Some((c, self.edit_seq));
+    }
+
+    /// Whether a typed character should overwrite rather than insert: the
+    /// mode is on, there is a character to the right of the one caret on its
+    /// line (at the end of a line typing appends, as in every editor) and no
+    /// selection or extra caret is in play (those keep their insert semantics).
+    fn overwrite_applies(&self) -> bool {
+        self.overwrite
+            && self.carets.is_empty()
+            && !self.selection.is_some_and(|s| s.has_area())
+            && self
+                .lines
+                .get(self.cursor_row)
+                .is_some_and(|l| self.cursor_col < l.chars().count())
+    }
+
+    /// Whether `c` typed at the caret joins the cluster just before it: a
+    /// combining accent after its letter, a vowel sign after its consonant, a
+    /// ZWJ or the next part of an emoji sequence.
+    fn joins_cluster_before_caret(&self, c: char) -> bool {
+        let Some(line) = self.lines.get(self.cursor_row) else {
+            return false;
+        };
+        let byte = self.byte_index(self.cursor_row, self.cursor_col);
+        let Some(prev) = line[..byte].graphemes(true).next_back() else {
+            return false;
+        };
+        let mut joined = String::with_capacity(prev.len() + c.len_utf8());
+        joined.push_str(prev);
+        joined.push(c);
+        joined.graphemes(true).nth(1).is_none()
+    }
+
+    /// Overwrite-mode typing: replace the character cluster under the caret
+    /// with `c` and step past it. A `c` that completes the character before
+    /// the caret (see [`Self::joins_cluster_before_caret`]) belongs to it, so
+    /// it is added and nothing is replaced. One undo step per keystroke run,
+    /// like ordinary typing. Auto-closing pairs and tags are bypassed: a
+    /// typed bracket replaces, it does not grow a partner.
+    fn overwrite_char(&mut self, c: char) {
+        self.pin_on_edit();
+        self.push_undo(EditKind::InsertChar);
+        // A click leaves an empty selection behind; drop it, as the insert
+        // path does, or a later Shift+arrow would extend from the click.
+        self.selection = None;
+        let row = self.cursor_row;
+        let from = self.byte_index(row, self.cursor_col);
+        let to = if self.joins_cluster_before_caret(c) {
+            from
+        } else {
+            let next = next_grapheme_col(&self.lines[row], self.cursor_col);
+            self.byte_index(row, next)
+        };
+        let mut buf = [0u8; 4];
+        self.lines[row].replace_range(from..to, c.encode_utf8(&mut buf));
+        // The typed char can join the clusters around it into one (a ZWJ
+        // between two emoji, a regional indicator before a flag); step past
+        // the whole cluster then, so the next keystroke never lands inside it.
+        let col = self.cursor_col + 1;
+        let line = &self.lines[row];
+        self.cursor_col = if floor_grapheme_col(line, col) == col {
+            col
+        } else {
+            next_grapheme_col(line, col)
+        };
+        self.mark_buffer_changed();
+        self.recompute_highlights();
         self.last_typed = Some((c, self.edit_seq));
     }
 
@@ -13586,18 +13726,45 @@ impl Editor {
         self.dedup_carets();
     }
 
-    /// Drop extra carets that sit on the primary or on an earlier caret: kept
-    /// apart, the next key would edit the same spot twice.
+    /// Drop extra carets that sit on the primary or on an earlier caret, and
+    /// merge selections that overlap into one, as VS Code does (#1570):
+    /// kept apart, the next key would edit the same spot twice, and the
+    /// edit at the lower one left the upper one's end stale, so typing over
+    /// two overlapping line selections panicked or deleted lines nobody
+    /// selected. Selections that only touch stay apart, as does a caret at a
+    /// selection's edge. A merged selection keeps the place in the order and
+    /// the direction of its first member, so the primary stays the primary.
     fn dedup_carets(&mut self) {
-        let primary = self.selections_with_primary()[0].normalised();
-        let mut kept: Vec<EditorSelection> = Vec::with_capacity(self.carets.len());
-        for s in std::mem::take(&mut self.carets) {
-            let n = s.normalised();
-            if n != primary && !kept.iter().any(|k| k.normalised() == n) {
-                kept.push(s);
+        let all = self.selections_with_primary();
+        let mut by_start: Vec<usize> = (0..all.len()).collect();
+        by_start.sort_by_key(|&i| all[i].normalised());
+        // Each run of overlapping selections: (first member, start, end).
+        let mut runs: Vec<(usize, BPos, BPos)> = Vec::with_capacity(all.len());
+        for i in by_start {
+            let (start, end) = all[i].normalised();
+            match runs.last_mut() {
+                Some(run) if start < run.2 || (start, end) == (run.1, run.2) => {
+                    run.0 = run.0.min(i);
+                    run.2 = run.2.max(end);
+                }
+                _ => runs.push((i, start, end)),
             }
         }
-        self.carets = kept;
+        runs.sort_unstable_by_key(|run| run.0);
+        let mut merged = runs.into_iter().map(|(i, start, end)| {
+            let (anchor, head) = if all[i].anchor <= all[i].head {
+                (start, end)
+            } else {
+                (end, start)
+            };
+            EditorSelection { anchor, head }
+        });
+        let primary = merged.next().expect("the primary is always first");
+        if primary != all[0] {
+            self.selection = primary.has_area().then_some(primary);
+            (self.cursor_row, self.cursor_col) = primary.head;
+        }
+        self.carets = merged.collect();
     }
 
     /// A position kept as (rows from the last line, chars from its line's
@@ -16453,6 +16620,55 @@ impl Editor {
             anchor: (r, start),
             head: (r, end),
         });
+        self.last_edit_kind = None;
+    }
+
+    /// Lines `from` through `to` as one whole-line selection (#1570): from
+    /// the start of the top line to the start of the line after the bottom
+    /// one, or to the end of the buffer's last line, which has none. With
+    /// `to` above `from` it runs upward, the caret at the top.
+    fn whole_lines(&self, from: usize, to: usize) -> EditorSelection {
+        let last = self.lines.len().saturating_sub(1);
+        let (top, bottom) = (from.min(to).min(last), from.max(to).min(last));
+        let start = (top, 0);
+        let end = if bottom < last {
+            (bottom + 1, 0)
+        } else {
+            (last, self.line_char_len(last))
+        };
+        let (anchor, head) = if to < from {
+            (end, start)
+        } else {
+            (start, end)
+        };
+        EditorSelection { anchor, head }
+    }
+
+    /// Whole-line selection by mouse (#1570), as VS Code's triple-click and
+    /// line-number click make: select from line `anchor` (the line under the
+    /// pointer when `None`) through the line under screen `(col, row)`, and
+    /// return the anchor so a drag can keep extending from it.
+    pub fn select_lines_at(&mut self, anchor: Option<usize>, col: u16, row: u16) -> usize {
+        self.click(col, row);
+        let anchor = anchor.unwrap_or(self.cursor_row);
+        self.set_selections(&[self.whole_lines(anchor, self.cursor_row)]);
+        anchor
+    }
+
+    /// VS Code "Expand Line Selection" (#1570): every cursor's selection
+    /// grows to the whole lines it touches, through the start of the next
+    /// line. A selection that already ends at a line start reaches one line
+    /// further, so each press adds a line.
+    pub fn expand_line_selection(&mut self) {
+        let all: Vec<EditorSelection> = self
+            .selections_with_primary()
+            .iter()
+            .map(|s| {
+                let (start, end) = s.normalised();
+                self.whole_lines(start.0, end.0)
+            })
+            .collect();
+        self.set_selections(&all);
         self.last_edit_kind = None;
     }
 
@@ -21042,8 +21258,10 @@ impl Editor {
     /// Paint the rendered Markdown preview: the pre-built lines flow through
     /// a wrapping `Paragraph` so paragraphs reflow with the pane, scrolled by
     /// the preview's own offset, with a scrollbar over the wrapped height.
-    /// Rebuilds first when the buffer moved under the preview (a live edit in
-    /// a split, an external reload) so it always shows the current text.
+    /// Rebuilds first when the buffer moved under the preview (an edit, an
+    /// external reload) so it always shows the current text. A preview to
+    /// the side shows its source pane's text, which the app hands it
+    /// (`App::sync_markdown_side_previews`, #1605).
     fn render_markdown_preview(&mut self, inner: Rect, buf: &mut Buffer) {
         let stale = self
             .markdown_preview
@@ -21056,26 +21274,7 @@ impl Editor {
         } else if stale {
             // The image-aware builder (#176): the plain one here left the
             // images list pointing at STALE anchors after a live edit.
-            let text = self.lines.join("\n");
-            let base = self
-                .path
-                .as_ref()
-                .and_then(|p| p.parent().map(|d| d.to_path_buf()));
-            let (lines, images, runnables, map, links) = crate::markdown::render_markdown_mapped(
-                &text,
-                self.theme,
-                &mut self.registry,
-                base.as_deref(),
-                self.md_outputs.clone(),
-            );
-            if let Some(md) = self.markdown_preview.as_mut() {
-                md.lines = lines;
-                md.source_map = map;
-                md.images = images;
-                md.runnables = runnables;
-                md.links = links;
-                md.built_seq = self.edit_seq;
-            }
+            self.rebuild_markdown_preview();
         }
         let Some(md) = self.markdown_preview.as_mut() else {
             return;
@@ -30283,6 +30482,55 @@ mod tests {
             text.contains("New heading") && !text.contains("Old heading"),
             "a stale preview must rebuild against the edited buffer; got:\n{text}"
         );
+    }
+
+    /// #1605: the same-path `open` behind every FS-sync reload (a save in
+    /// another pane, an agent rewriting the file) keeps the tab rendered,
+    /// showing the new text; another file still opens as source.
+    #[test]
+    fn markdown_preview_survives_a_same_path_reload() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("doc.md");
+        std::fs::write(&path, "# Old heading\n").unwrap();
+        let mut e = Editor::new();
+        e.open(&path).unwrap();
+        assert!(e.toggle_markdown_preview());
+        std::fs::write(&path, "# Rewritten heading\n\nAnd a paragraph.\n").unwrap();
+        e.open(&path).unwrap();
+        assert!(
+            e.markdown_preview.is_some(),
+            "a reload of the same file must stay a preview"
+        );
+        let text = first_row_screen(&mut e, 60, 8);
+        assert!(
+            text.contains("Rewritten heading") && !text.contains("# Rewritten"),
+            "the preview must render the reloaded text; got:\n{text}"
+        );
+        let other = tmp.path().join("other.md");
+        std::fs::write(&other, "# Other\n").unwrap();
+        e.open(&other).unwrap();
+        assert!(e.markdown_preview.is_none(), "another file opens as source");
+    }
+
+    /// #1605 review: a preview rebuilt from another pane's text keeps its own
+    /// `built_seq`, so its row caches must still be rebuilt, or scroll sync,
+    /// link and play-glyph clicks use the first build's rows.
+    #[test]
+    fn a_preview_rebuilt_from_another_pane_refreshes_its_row_caches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("doc.md");
+        std::fs::write(&path, "# Title\n").unwrap();
+        let mut e = Editor::new();
+        e.open(&path).unwrap();
+        assert!(e.toggle_markdown_preview());
+        first_row_screen(&mut e, 60, 20);
+        let typed = "# Title\n\nA new paragraph.\n\n```sh\necho hi\n```\n";
+        e.rebuild_markdown_preview_from(typed, Some((7, 7)));
+        first_row_screen(&mut e, 60, 20);
+        let md = e.markdown_preview.as_ref().unwrap();
+        assert_eq!(md.row_of_line.len(), md.lines.len(), "scroll-sync rows");
+        assert_eq!(md.runnables.len(), 1);
+        assert_eq!(md.run_rows.len(), 1, "the new block's play glyph has a row");
     }
 
     /// Render into a fresh buffer and return the whole screen as one string.
@@ -40923,7 +41171,8 @@ mod tests {
         }];
         e.transform_selection_case(CaseTransform::Upper);
         assert_eq!(e.lines, vec!["HELLO world"]);
-        assert_eq!(selected_texts(&e), vec!["HELLO", "L"]);
+        // One inside the other is an overlap: they come back as one (#1570).
+        assert_eq!(selected_texts(&e), vec!["HELLO"]);
     }
 
     #[test]
@@ -40939,8 +41188,10 @@ mod tests {
         }];
         e.transform_selection_case(CaseTransform::Upper);
         assert_eq!(e.lines, vec!["HELLO WOrld"]);
-        assert_eq!(selected_texts(&e), vec!["HELLO", "LO WO"]);
-        assert_eq!(e.selection.unwrap().head, (0, 3), "direction is kept");
+        // The two overlap, so they come back as one (#1570): kept apart,
+        // typing over them would edit the shared text twice.
+        assert_eq!(selected_texts(&e), vec!["HELLO WO"]);
+        assert_eq!(e.selection.unwrap().head, (0, 0), "direction is kept");
     }
 
     #[test]

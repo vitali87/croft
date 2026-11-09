@@ -491,18 +491,17 @@ fn ctrl_shift_s_in_the_editor_jumps_to_source_control_without_saving() {
 #[test]
 fn git_status_spans_empty_when_not_in_repo() {
     let st = crate::git::GitStatus::default();
-    let spans = git_status_spans(&st);
+    let spans = git_status_spans(&st, crate::theme::Theme::default());
     assert!(spans.is_empty(), "no git pill outside a git repo");
 }
 
-#[test]
-fn git_status_spans_clean_branch_is_green() {
-    // Agnoster convention: clean working tree → green pill.
-    let st = crate::git::GitStatus {
+/// A `GitStatus` on `main` in a repository, clean or dirty.
+fn branch_status(dirty: bool) -> crate::git::GitStatus {
+    crate::git::GitStatus {
         in_repo: true,
         branch: Some("main".into()),
         detached_hash: None,
-        dirty: false,
+        dirty,
         ahead: 0,
         behind: 0,
         head_oid: None,
@@ -513,46 +512,72 @@ fn git_status_spans_clean_branch_is_green() {
         prepared_message: None,
         operation: None,
         rebasing_branch: None,
-    };
-    let spans = git_status_spans(&st);
-    let main_span = spans
-        .iter()
-        .find(|s| s.content.contains("main"))
-        .expect("branch span");
-    assert_eq!(main_span.style.fg, Some(GIT_CLEAN_COLOR));
+    }
 }
 
 #[test]
-fn git_status_spans_dirty_branch_is_yellow_not_red() {
-    // Agnoster convention: dirty working tree → yellow/orange pill.
-    // No red bullet either — colour alone carries the state.
-    let st = crate::git::GitStatus {
-        in_repo: true,
-        branch: Some("main".into()),
-        detached_hash: None,
-        dirty: true,
-        ahead: 0,
-        behind: 0,
-        head_oid: None,
-        ignored: std::sync::Arc::default(),
-        decorations: std::sync::Arc::default(),
-        repo_root: None,
-        changed_count: 0,
-        prepared_message: None,
-        operation: None,
-        rebasing_branch: None,
-    };
-    let spans = git_status_spans(&st);
+fn git_status_spans_clean_branch_is_quiet_with_no_dot() {
+    // A clean tree is the resting state: the branch reads in the bar's text
+    // tone, beside an accent glyph, with nothing amber anywhere.
+    let theme = crate::theme::Theme::default();
+    let st = branch_status(false);
+    let spans = git_status_spans(&st, theme);
     let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
-    assert!(
-        !joined.contains('●'),
-        "no red bullet — colour signals dirtiness"
-    );
+    assert!(!joined.contains(GIT_DIRTY_DOT), "{joined}");
     let main_span = spans
         .iter()
         .find(|s| s.content.contains("main"))
         .expect("branch span");
-    assert_eq!(main_span.style.fg, Some(GIT_DIRTY_COLOR));
+    let tones = StatusTones::new(theme, status_bar_bg(theme));
+    assert_eq!(main_span.style.fg, Some(tones.text));
+    let glyph = spans
+        .iter()
+        .find(|s| s.content.contains('\u{ea68}'))
+        .expect("branch glyph");
+    assert_eq!(glyph.style.fg, Some(theme.accent()));
+}
+
+#[test]
+fn git_status_spans_dirty_branch_adds_an_amber_dot_and_keeps_its_colour() {
+    // VS Code's `main*`: a dirty tree is one small amber mark after the
+    // branch, which itself keeps the colour it has when clean.
+    let theme = crate::theme::Theme::default();
+    let clean = git_status_spans(&branch_status(false), theme)
+        .iter()
+        .find(|s| s.content.contains("main"))
+        .map(|s| s.style)
+        .unwrap();
+    let st = branch_status(true);
+    let spans = git_status_spans(&st, theme);
+    let main_span = spans
+        .iter()
+        .find(|s| s.content.contains("main"))
+        .expect("branch span");
+    assert_eq!(main_span.style, clean);
+    let dot = spans
+        .iter()
+        .find(|s| s.content.contains(GIT_DIRTY_DOT))
+        .expect("dirty dot");
+    assert_eq!(dot.style.fg, Some(theme.ui(GIT_DIRTY_COLOR)));
+}
+
+#[test]
+fn git_status_spans_name_the_branch_in_a_light_themes_own_text_colour() {
+    // A light theme's foreground is already dark: adapting it again for a
+    // light background flipped it to near-white on the light bar.
+    let light = crate::theme::Theme::all()
+        .iter()
+        .find(|t| t.is_light() && !t.high_contrast())
+        .copied()
+        .expect("a bundled light theme");
+    let st = branch_status(false);
+    let spans = git_status_spans(&st, light);
+    let main_span = spans
+        .iter()
+        .find(|s| s.content.contains("main"))
+        .expect("branch span");
+    let (r, g, b) = light.syntax().fg;
+    assert_eq!(main_span.style.fg, Some(Color::Rgb(r, g, b)));
 }
 
 #[test]
@@ -573,7 +598,7 @@ fn git_status_spans_renders_detached_hash_when_no_branch() {
         operation: None,
         rebasing_branch: None,
     };
-    let spans = git_status_spans(&st);
+    let spans = git_status_spans(&st, crate::theme::Theme::default());
     let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
     assert!(joined.contains("abc1234"));
 }
@@ -596,7 +621,7 @@ fn git_status_spans_renders_ahead_behind_counts() {
         operation: None,
         rebasing_branch: None,
     };
-    let spans = git_status_spans(&st);
+    let spans = git_status_spans(&st, crate::theme::Theme::default());
     let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
     assert!(joined.contains("↑2"));
     assert!(joined.contains("↓1"));
@@ -1891,7 +1916,7 @@ fn a_rebase_names_the_branch_being_rebased() {
         assert!(!git_succeeds(p, rebase), "the rebase must conflict");
         let st = crate::git::query(p);
         assert_eq!(st.head_label(), "feat", "{rebase:?}");
-        let pill: String = git_status_spans(&st)
+        let pill: String = git_status_spans(&st, crate::theme::Theme::default())
             .iter()
             .map(|s| s.content.as_ref())
             .collect();

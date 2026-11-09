@@ -88,6 +88,7 @@ Per platform:
 | `Cmd+K` `Z` | Toggle Zen Mode: hide the activity bar, both side bars, the panel, and the status bar, and centre the editor; press again to restore exactly what was shown before |
 | `Esc` `Esc` | Leave Zen Mode (two Escapes in the editor within half a second; an Esc that closes a popup or clears a selection does not count) |
 | `Cmd+K` `V` | Toggle Live Run for the active Python file: it re-runs on every pause in typing, and each line shows the values it produced, what it printed or returned, and the exception it died with. Line numbers go green for statements that ran and red for ones that never did. Also in the palette as "Python: Toggle Live Run" |
+| `Cmd+K` `V` (Markdown) | Markdown: Open Preview to the Side: render the active Markdown file in the next editor group (a new one to the right when there is none) while you keep typing in the source. The preview shows each edit as you type, follows the source as it scrolls, and stays rendered when the file is saved (also in the palette as "Markdown: Open Preview to the Side", VS Code's `markdown.showPreviewToSide`) |
 | `Cmd+K` `B` | Show the Testing view (beaker icon); it discovers tests on first open (`cargo test` for Rust, `pytest` for Python). In the view: Enter runs all tests, `s` (or the ■ Stop control, or Testing: Cancel Test Run) stops a run or discovery in flight, `r` re-discovers, `o` opens OUTPUT on the Test Runner channel (as does clicking the "see OUTPUT › Test Runner" pointer a failed discovery or run shows), click a test's play/status glyph to run just it, click its name to jump to its source, click a suite header's play glyph to run the whole suite, click a row's eye to watch that test or suite (it reruns on every save under the project; the header's eye or `w` watches everything), ↑/↓ scroll or drag the scrollbar |
 | `Cmd+K` `Enter` | Run the test the editor caret sits in (also in the palette as "Testing: Run Test at Cursor") |
 | `Cmd+K` `Shift+Enter` | Debug the test the editor caret sits in: pytest runs as a debugpy module launch under the project's venv (with the `env`, `cwd`, `args`, `justMyCode` and other settings of a launch.json debugpy configuration whose `purpose` lists `"debug-test"`, as in VS Code), a cargo test binary launches under lldb-dap with the test name as its filter ("Testing: Debug Test at Cursor"); Alt+click a gutter ▷ does the same for that test. When the last run of that test FAILED and named a place in your own code, croft sets a temporary breakpoint at the assertion first, so the session stops where it broke without you finding the line; that breakpoint is removed when the session ends, and a breakpoint you set yourself on the same line is left alone |
@@ -312,11 +313,12 @@ Variables expand as in VS Code: `$TM_FILENAME`, `$TM_FILENAME_BASE`, `$TM_DIRECT
 | `Cmd`/`Ctrl`+`Opt`+`↑` / `↓` | Add a cursor above / below the current one (multi-cursor) |
 | `Cmd`/`Ctrl`+`Shift`+`Opt`+arrows / `PageUp` / `PageDown` | Column (box) selection from the keyboard, like `Shift`+`Opt`+drag: grow the box one row, one column or one screen, with one selection per row, so typing edits the same columns of every line. The box starts at the caret and keeps growing while the carets are the ones it made |
 | View: Toggle Column Selection Mode (palette) | While on, plain `Shift`+arrows and `Shift`+`PageUp` / `PageDown` grow a column selection; the status bar shows "Column Selection" beside Ln/Col |
+| `Insert` | Switch between Insert and Overwrite (Replace) typing: in Overwrite a typed character replaces the one under the caret (at the end of a line it appends, a selection is replaced as usual). One setting for all tabs; while it is on, the status bar shows ⎁ after the workspace name at its left end and the terminal caret becomes a block |
 | `Cmd`+`/` / `Ctrl`+`/` | Toggle line comment for the current line or every line the selection touches (language-aware; comments at the block's common indent) |
 | `Shift`+`Alt`+`A` | Toggle block comment around the selection (languages with a block comment) |
 | `Alt`+`Z` | Toggle soft word wrap for this file (overrides the per-language default until the file is reopened) |
 | `Alt`+`O` | C/C++: Switch Header/Source: open the header of the C, C++ or Objective-C source in the editor, or the source of the header, found beside it, across an `include/` ↔ `src/` split, else the same-named file elsewhere in the workspace that shares the most folders with it (also Command Palette, id `switch_header_source`) |
-| `Cmd`/`Ctrl`+`Shift`+`V` | Markdown: Toggle Preview — flip the active Markdown tab between its source and the rendered view (headings, emphasis, lists, quotes, tables, links, and fenced code blocks with the editor's own syntax colours). Arrows / PgUp / PgDn / Home / End / wheel scroll the preview; the same chord returns to the source. The preview opens at the part of the document the source was showing and returns there; with the source and the preview side by side in a split, the other pane follows as you scroll (also Command Palette "Markdown: Toggle Preview") |
+| `Cmd`/`Ctrl`+`Shift`+`V` | Markdown: Toggle Preview — flip the active Markdown tab between its source and the rendered view (headings, emphasis, lists, quotes, tables, links, and fenced code blocks with the editor's own syntax colours). Arrows / PgUp / PgDn / Home / End / wheel scroll the preview; the same chord returns to the source. The preview opens at the part of the document the source was showing and returns there; with the source and the preview side by side in a split, the other pane follows as you scroll and shows what you type in the source (`Cmd+K` `V` sets that up in one step). A preview stays a preview when the file changes on disk, whether you saved it in another pane or another program rewrote it (also Command Palette "Markdown: Toggle Preview") |
 | `Cmd`+`Shift`+`\` | Go to Bracket: jump the cursor to the matching bracket. From an opening bracket it lands on its close (and vice versa); from inside a pair it lands on the enclosing close. Brackets inside strings and comments are text and are skipped, as they are for bracket-pair colours, the match highlight and Select to Bracket |
 | `Cmd`+`Opt`+`\` | Select to Bracket: select the region between the matching brackets, including the brackets themselves |
 | `Ctrl`+`T` | Transpose Characters: swap the character before the cursor with the one after it and step right; at the end of a line the last character moves across the line break. With several cursors each one swaps around itself, in one undo step |
@@ -339,6 +341,8 @@ Variables expand as in VS Code: `$TM_FILENAME`, `$TM_FILENAME_BASE`, `$TM_DIRECT
 | Click the gutter fold chevron | Toggle the fold on that line: a `▾` marks an expanded foldable block (a function, loop, struct — any line whose body is more indented), a `▸` marks a collapsed one. Also on `Cmd+K` `Cmd+L` at the cursor, and Command Palette "Toggle Fold" / "Fold All" / "Unfold All" |
 | Arrow keys over a fold | Up and Down step over a collapsed block rather than into it; an edit that lands inside one (from search, Go to Definition or Go to Line) opens it, so typing never changes lines you cannot see |
 | Mouse drag | Select text; every other occurrence of a single-line selection highlights in blue |
+| Double-click / triple-click | Select the word / the whole line, newline included; dragging after a triple-click extends the selection line by line |
+| Click a line number | Select that line; drag down or up the line numbers to select whole lines |
 | `Ctrl`+`C` / `Cmd`+`C` | Copy the selection to the system clipboard |
 | `Cmd`+`Opt`+`C` / `Ctrl`+`Opt`+`C` | Copy Path: put the active file's absolute path on the system clipboard (also on the editor tab right-click menu) |
 | `Ctrl`+`X` / `Cmd`+`X` | Cut the selection |
@@ -361,6 +365,7 @@ Variables expand as in VS Code: `$TM_FILENAME`, `$TM_FILENAME_BASE`, `$TM_DIRECT
 | `Cmd`+`D` / `Ctrl`+`D` | Add Selection to Next Find Match: select the word under the cursor, then grow the multi-cursor one occurrence per press (whole words when it selected the word itself; a selection you made matches as text, inside other words too) |
 | `Cmd`+`Shift`+`L` / `Ctrl`+`Shift`+`L` | Select All Occurrences of Find Match: a cursor on every occurrence of the selection (or the word under the cursor) at once; also in the Command Palette |
 | `Shift`+`Alt`+`I` | Add Cursors to Line Ends: one cursor at the end of every line the selection touches; also in the Command Palette |
+| `Cmd`+`L` / `Ctrl`+`L` | Expand Line Selection: select the caret's whole line through the start of the next, and one more line on each further press (every cursor's selection grows the same way). Editor only: a focused terminal keeps `Ctrl`+`L` for the shell. Also in the Command Palette; VS Code's `expandLineSelection` imports onto it |
 | `Option`+click | Add (or toggle off) a secondary caret at the click |
 | `Shift`+`Option`+drag | Column (box) selection: one caret per spanned row |
 | `Cmd`+`F2` / `Ctrl`+`F2` | Change All Occurrences of the word under the cursor at once |
@@ -491,7 +496,7 @@ Binary files open here automatically instead of erroring; the file is read in wi
 | Click / drag (hex grid or ASCII gutter) | Park the cursor / select a byte range |
 | Wheel | Scroll three rows |
 
-**Archive browser (`.zip`, `.jar`, `.whl`, `.tar`, `.tar.gz`, `.tgz`; misnamed containers detected by content)**
+**Archive browser (`.zip`, `.jar`, `.whl` and other zip-based packages, `.tar`, `.tar.gz` / `.tgz`, `.tar.xz` / `.txz`, `.tar.bz2` / `.tbz2` / `.tbz`, `.tar.zst` / `.tzst`; misnamed containers detected by content)**
 
 | Keys | Action |
 |------|--------|
@@ -799,7 +804,7 @@ summarised in the status bar — it never fails silently.
 | Refused | Why |
 |---|---|
 | `cmd+click` / `super+click` | Terminals do not report Cmd/Super with mouse events (SGR mouse reporting carries no Super bit), so the binding could never fire. Use `ctrl` or `alt`. This is also why croft's own Go to Definition rides Ctrl. |
-| `triple_click` | croft's click tracker distinguishes single from double only, so a triple binding would fire on the second click and mean something other than what it says. |
+| `triple_click` | Bindings see single and double clicks only (the editor's own triple-click selects a line), so a triple binding would fire on the second click and mean something other than what it says. |
 | bare `click` in `editor` or `terminal` | It is how the caret is placed; rebinding it leaves no way to do that. Bare `click` in `file_tree` or `tab_strip` is allowed. |
 | bare `double_click` in `editor` or `terminal` | It is the only way to select a word; rebinding it leaves no way to do that. (Over a full-screen app that tracks the mouse the pair is forwarded to the app instead, see the terminal table, so word-select is unavailable there by design.) A *modified* double-click (`ctrl+double_click`) is bindable, and bare `double_click` in `file_tree` or `tab_strip` is allowed. |
 

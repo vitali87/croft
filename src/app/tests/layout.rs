@@ -251,129 +251,6 @@ fn status_bar_shows_document_facts_not_a_keyboard_cheat_sheet() {
     );
 }
 
-/// Croft Loch's status bar speaks in colour only when something wants
-/// acting on: zero counts are muted, the transient message is muted italic
-/// commentary, the clickable facts sit a step brighter and lift to the
-/// strong ink on a faint chip under the pointer.
-#[test]
-fn croft_loch_status_bar_is_quiet_until_something_wants_acting_on() {
-    let tmp = tempfile::tempdir().unwrap();
-    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    let t = crate::widgets::surface::tones(app.theme).expect("Croft Loch is the default");
-    app.status = String::from("Saved notes");
-    let backend = ratatui::backend::TestBackend::new(140, 50);
-    let mut term = ratatui::Terminal::new(backend).unwrap();
-    term.draw(|f| app.render(f)).unwrap();
-    let y = 49;
-    let buf = term.backend().buffer().clone();
-    let find = |needle: &str| {
-        let row: Vec<&str> = (0..140).map(|x| buf[(x, y)].symbol()).collect();
-        (0..140usize)
-            .find(|&x| row[x..].concat().starts_with(needle))
-            .map(|x| x as u16)
-            .unwrap_or_else(|| panic!("{needle:?} on the bar: {}", row.concat()))
-    };
-    for glyph in ["\u{ea87}", "\u{ea6c}"] {
-        assert_eq!(buf[(find(glyph), y)].fg, t.muted(), "a zero count is muted");
-    }
-    let msg = &buf[(find("Saved notes"), y)];
-    assert_eq!(msg.fg, t.muted());
-    assert!(msg.modifier.contains(Modifier::ITALIC));
-    let pos = app.status_position_rect;
-    assert!(pos.width > 0, "the facts are on the bar");
-    let fact = crate::gradient::rgb_color(crate::gradient::lerp_rgb(t.muted, t.text, 0.5));
-    assert_eq!(
-        buf[(pos.x + 1, y)].fg,
-        fact,
-        "the facts sit above the message"
-    );
-    app.handle_mouse(crossterm::event::MouseEvent {
-        kind: crossterm::event::MouseEventKind::Moved,
-        column: pos.x + 1,
-        row: y,
-        modifiers: KeyModifiers::NONE,
-    });
-    term.draw(|f| app.render(f)).unwrap();
-    let hovered = &term.backend().buffer()[(pos.x + 1, y)];
-    assert_eq!(hovered.fg, t.strong());
-    assert_eq!(hovered.bg, t.hover_on(t.chrome));
-}
-
-/// Croft Loch's state chips are one shape: a tag tinted in the chip's hue
-/// with half-block ends in place of its padding spaces, so the chip is as
-/// wide as the boxed theme's and its label reads the same.
-#[test]
-fn croft_loch_status_chips_are_tinted_tags_with_half_block_ends() {
-    let tmp = tempfile::tempdir().unwrap();
-    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    let t = crate::widgets::surface::tones(app.theme).unwrap();
-    app.vim.enabled = true;
-    let backend = ratatui::backend::TestBackend::new(140, 50);
-    let mut term = ratatui::Terminal::new(backend).unwrap();
-    term.draw(|f| app.render(f)).unwrap();
-    let buf = term.backend().buffer();
-    let row: String = (0..140).map(|x| buf[(x, 49)].symbol()).collect();
-    assert!(row.contains("\u{2590}NORMAL\u{258c}"), "{row:?}");
-    assert!(!row.contains('\u{e0b6}') && !row.contains('\u{e0b4}'));
-    let x = (0..140u16).find(|&x| buf[(x, 49)].symbol() == "N").unwrap();
-    let (fill, ink) = (
-        crate::gradient::rgb_color(crate::gradient::lerp_rgb(t.chrome, t.accent, 0.22)),
-        crate::gradient::rgb_color(crate::gradient::lerp_rgb(t.accent, t.lift, 0.35)),
-    );
-    assert_eq!((buf[(x, 49)].fg, buf[(x, 49)].bg), (ink, fill));
-    assert!(!buf[(x, 49)].modifier.contains(Modifier::BOLD));
-    assert_eq!(buf[(x - 1, 49)].fg, fill, "the left end is the chip's tint");
-    assert_eq!(buf[(x - 1, 49)].bg, t.chrome(), "on the bar");
-    // The chip is as wide as Croft Black's ` NORMAL `.
-    let chip = status_chip(
-        app.theme,
-        String::from(" NORMAL "),
-        t.accent,
-        false,
-        Style::default(),
-    );
-    let w: usize = chip.iter().map(|s| s.content.chars().count()).sum();
-    assert_eq!(w, " NORMAL ".len());
-}
-
-/// Croft Loch's branch is passive information: body text, not bold, its
-/// glyph amber only while the tree is dirty, ahead/behind muted; the text
-/// is exactly what every other theme shows.
-#[test]
-fn croft_loch_quiets_the_branch_until_the_tree_is_dirty() {
-    let t = crate::widgets::surface::tones(crate::theme::Theme::LOCH).unwrap();
-    let status = crate::git::GitStatus {
-        in_repo: true,
-        branch: Some(String::from("main")),
-        ahead: 2,
-        ..Default::default()
-    };
-    let before: String = git_status_spans(&status)
-        .iter()
-        .map(|s| s.content.to_string())
-        .collect();
-    let mut spans = git_status_spans(&status);
-    quiet_git_spans(&mut spans, t, false);
-    let after: String = spans.iter().map(|s| s.content.to_string()).collect();
-    assert_eq!(after, before, "only the styles change");
-    assert_eq!(spans[1].style.fg, Some(t.text()), "a clean tree's glyph");
-    assert_eq!(spans[2].style.fg, Some(t.text()));
-    assert!(!spans[2].style.add_modifier.contains(Modifier::BOLD));
-    assert_eq!(spans[3].style.fg, Some(t.muted()), "ahead is muted");
-    let mut dirty = git_status_spans(&status);
-    quiet_git_spans(&mut dirty, t, true);
-    assert_eq!(
-        dirty[1].style.fg,
-        Some(GIT_DIRTY_COLOR),
-        "dirty: amber glyph"
-    );
-    assert_eq!(
-        dirty[2].style.fg,
-        Some(t.text()),
-        "the name stays body text"
-    );
-}
-
 #[test]
 fn status_bar_indent_menu_action_pins_the_editor_indent_style() {
     use crate::widgets::editor::IndentStyle;
@@ -707,7 +584,7 @@ fn the_status_bar_names_the_operation_in_progress() {
     let p = tmp.path();
     assert!(!git_succeeds(p, &["merge", "feat"]));
     let status = crate::git::query(p);
-    let text: String = git_status_spans(&status)
+    let text: String = git_status_spans(&status, crate::theme::Theme::default())
         .iter()
         .map(|s| s.content.to_string())
         .collect();
@@ -716,7 +593,7 @@ fn the_status_bar_names_the_operation_in_progress() {
     assert!(git_succeeds(p, &["checkout", "-q", "feat"]));
     assert!(!git_succeeds(p, &["rebase", "main"]));
     let status = crate::git::query(p);
-    let text: String = git_status_spans(&status)
+    let text: String = git_status_spans(&status, crate::theme::Theme::default())
         .iter()
         .map(|s| s.content.to_string())
         .collect();
@@ -1915,6 +1792,35 @@ fn status_message_with_wide_chars_keeps_its_tail_beside_the_cluster() {
         row.contains("main.rs"),
         "the wide-char message keeps its tail: {row:?}"
     );
+}
+
+/// The status bar's left cap names the workspace folder, and every click
+/// target after it is placed by counting cells: a double-width name
+/// (`项目`, four cells for two chars) must not shift the problem counts'
+/// target left of the counts it opens.
+#[test]
+fn a_wide_workspace_name_keeps_the_status_bar_targets_under_their_text() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("\u{9879}\u{76ee}");
+    std::fs::create_dir(&root).unwrap();
+    let mut app = App::new(root).unwrap();
+    let backend = ratatui::backend::TestBackend::new(120, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let buf = term.backend().buffer().clone();
+    let y = buf.area.height - 1;
+    let glyph_x = (0..buf.area.width)
+        .find(|&x| buf[(x, y)].symbol() == "\u{ea87}")
+        .expect("the error count's glyph is on the bar");
+    // A wide char's second cell reads as a blank in the buffer.
+    let row = status_row(&term);
+    assert!(
+        row.contains("\u{9879} \u{76ee} "),
+        "the cap names the folder: {row:?}"
+    );
+    // The counts' target opens on the space before the glyph.
+    assert_eq!(app.status_diag_rect.x + 1, glyph_x);
+    assert_eq!(app.status_diag_rect.y, y);
 }
 
 /// #925: a message of several lines (git's text, a tool's error) is drawn

@@ -1,6 +1,6 @@
 [package]
 name = "croft-software"
-version = "0.2.132"
+version = "0.2.134"
 edition = "2024"
 description = "VSCode-style TUI written in Rust"
 license = "MIT"
@@ -230,6 +230,14 @@ umya-spreadsheet = { version = "3.1", default-features = false }
 flate2 = "1"
 # xz for cargo-dist release archives (csvlens ships tar.xz only, #465).
 lzma-rs = "0.3"
+# zstd and bzip2 for the archive browser's `.tar.zst` and `.tar.bz2` (#1645).
+# Both decode in pure Rust, so the musl and Android cross builds need no C
+# compiler: ruzstd is decode-only (`std` for its `io::Read` decoder, frame
+# hashing dropped), and bzip2's one default feature is the libbz2-rs-sys port
+# of libbzip2, not the bzip2-sys C build. Verified current on crates.io
+# 2026-11-08 (ruzstd 0.9.1, bzip2 0.6.1).
+ruzstd = { version = "0.9", default-features = false, features = ["std"] }
+bzip2 = "0.6"
 # Tar walking for the archive browser (#179): list members and extract
 # one on demand (tar/tar.gz/tgz); zip rides the existing zip crate.
 # 0.4.46 verified current on crates.io 2026-08-18.
