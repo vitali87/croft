@@ -6020,6 +6020,9 @@ impl Widget for &mut PtyTerminal {
 
         let reveal_redactions = self.reveal_redactions;
         let mut redacted_spans = 0usize;
+        // Croft Loch's inks and fills, looked up once per frame for the find
+        // highlight's amber tint rather than once per cell.
+        let tones = crate::widgets::surface::tones(self.theme);
         for y in 0..rows {
             // Find matches on this row once, then paint them per cell below.
             // Match positions are char indices in the spacer-skipped row text
@@ -6221,16 +6224,26 @@ impl Widget for &mut PtyTerminal {
                     style = style.bg(self.theme.ui(Color::Rgb(0x26, 0x4f, 0x78)));
                 }
                 // Find highlight: muted amber on every occurrence, bright
-                // orange on the active match (VS Code's find colours).
+                // orange on the active match (VS Code's find colours). Croft
+                // Loch tints the cell's own background amber instead, as the
+                // editor does, keeping the program's ink where it reads.
                 if let Some(paint) = row_paint.as_ref() {
-                    match paint.get(x as usize) {
-                        Some(1) => {
+                    match (paint.get(x as usize), tones) {
+                        (Some(&mark @ (1 | 2)), Some(t)) => {
+                            style = crate::widgets::surface::match_style(
+                                style,
+                                t,
+                                self.theme,
+                                mark == 2,
+                            );
+                        }
+                        (Some(1), None) => {
                             style = style
                                 .fg(Color::Black)
                                 .bg(self.theme.ui(Color::Rgb(0xff, 0xd7, 0x4a)))
                                 .add_modifier(Modifier::BOLD);
                         }
-                        Some(2) => {
+                        (Some(2), None) => {
                             style = style
                                 .fg(Color::Black)
                                 .bg(self.theme.ui(Color::Rgb(0xff, 0x8c, 0x2a)))
@@ -8152,6 +8165,69 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(20));
             waited_ms += 20;
+        }
+    }
+
+    /// The terminal's find highlight follows the editor's: Croft Loch tints
+    /// each matched cell's own background amber and keeps an ink that reads
+    /// on it, where a boxed theme stamps its black-on-gold block.
+    #[test]
+    fn terminal_find_matches_are_an_amber_tint_on_croft_loch_and_gold_when_boxed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut term = PtyTerminal::new_running(
+            "/bin/sh",
+            &[
+                String::from("-c"),
+                String::from("printf 'find the needle here\\n'; sleep 30"),
+            ],
+            tmp.path(),
+        )
+        .unwrap();
+        wait_for_grid(&term, |ls| ls.iter().any(|l| l.starts_with("find the")));
+        term.set_search(
+            Some(String::from("needle")),
+            crate::widgets::search::SearchOpts::default(),
+        );
+        let area = Rect::new(0, 0, 60, 10);
+        term.last_inner = Rect::new(1, 1, 58, 8);
+        // The cells of "needle" on the first row showing the phrase: the
+        // spawn banner echoes the command, so that may be the banner's copy
+        // rather than the output's, but every occurrence is a match.
+        let needle_cells = |buf: &Buffer| -> Vec<(u16, u16)> {
+            (0..area.height)
+                .find_map(|y| {
+                    let row: String = (0..area.width).map(|x| buf[(x, y)].symbol()).collect();
+                    let col = row.find("find the needle")?;
+                    let x0 = row[..col].chars().count() as u16 + 9;
+                    Some((x0..x0 + 6).map(|x| (x, y)).collect())
+                })
+                .expect("the output row rendered")
+        };
+        let gold = Color::Rgb(0xff, 0xd7, 0x4a);
+
+        assert!(
+            crate::widgets::surface::tones(term.theme).is_some(),
+            "Croft Loch by default"
+        );
+        let mut buf = Buffer::empty(area);
+        Widget::render(&mut term, area, &mut buf);
+        for (x, y) in needle_cells(&buf) {
+            let cell = &buf[(x, y)];
+            assert_ne!(cell.bg, gold, "no solid block on Croft Loch");
+            let (Color::Rgb(fr, fg, fb), Color::Rgb(br, bg, bb)) = (cell.fg, cell.bg) else {
+                panic!("RGB inks on the match: {cell:?}");
+            };
+            assert!(br > bb + 24, "the fill is a warm amber tint: {cell:?}");
+            assert!(crate::theme::contrast_ratio((fr, fg, fb), (br, bg, bb)) >= 4.5);
+            assert!(!cell.modifier.contains(Modifier::BOLD));
+        }
+
+        term.theme = crate::theme::Theme::BLACK;
+        let mut buf = Buffer::empty(area);
+        Widget::render(&mut term, area, &mut buf);
+        for (x, y) in needle_cells(&buf) {
+            assert_eq!(buf[(x, y)].bg, gold, "a boxed theme keeps the gold block");
+            assert_eq!(buf[(x, y)].fg, Color::Black);
         }
     }
 

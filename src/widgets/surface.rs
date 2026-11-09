@@ -132,6 +132,64 @@ impl Tones {
     }
 }
 
+/// The warm amber a `surfaces` theme tints find matches toward: the hue
+/// every editor uses for "found here", softened from croft's old #ffd74a so
+/// a tint of it sits calmly on the canvas. It is a fill, never an ink, and
+/// is kept clear of the accent so teal still means focus alone.
+pub const MATCH_AMBER: (u8, u8, u8) = (0xe0, 0xb0, 0x4a);
+
+/// How far a find match's fill moves from its surface toward
+/// [`MATCH_AMBER`]: enough to read as a mark on black, little enough that
+/// body text on it keeps well past 4.5:1.
+const MATCH_SOFT: f32 = 0.30;
+
+/// [`MATCH_SOFT`] for the current match (the one the caret, a Find Next or
+/// the selected search result points at): the same amber a clear step
+/// stronger, so it stands out among its siblings by weight rather than by a
+/// second hue, and the strong ink still reads on it at better than 4.5:1.
+const MATCH_ACTIVE: f32 = 0.50;
+
+/// The WCAG floor a match's ink must clear on its tint before it is kept.
+const MATCH_MIN_CONTRAST: f64 = 4.5;
+
+/// How far a tint eases back toward its surface, per step, when even the
+/// strong ink would not read on it (a current match over a selection band).
+const MATCH_EASE_STEP: f32 = 0.05;
+
+/// Restyle a cell (or span) `style` as a find match on a `surfaces` theme,
+/// the one definition the editor, the diff, a rendered log, the terminal and
+/// the Search view share so matches read alike everywhere.
+///
+/// The cell's own background is warmed toward [`MATCH_AMBER`], softly for
+/// every match and a clear step further for the `active` one, and its own
+/// ink is kept, so a match in code still reads in its syntax colour, unless
+/// that ink would fall under 4.5:1 on the tint (a comment, a muted preview),
+/// when it lifts to the strong ink. Over an already bright surface (the
+/// selection, a selected row's band) where even the strong ink would fall
+/// short, the tint eases back until it reads. Modifiers are left as they
+/// are: a match needs no bold to be found.
+///
+/// A handful of float operations per matched cell, with no allocation, so
+/// it is safe on the render path.
+pub fn match_style(style: Style, t: Tones, theme: Theme, active: bool) -> Style {
+    use crate::theme::contrast_ratio;
+    let base = cell_rgb(style.bg.unwrap_or(Color::Reset), theme, t.canvas);
+    let own = style.fg.map(|c| cell_rgb(c, theme, t.text));
+    let mut mix = if active { MATCH_ACTIVE } else { MATCH_SOFT };
+    loop {
+        let fill = lerp_rgb(base, MATCH_AMBER, mix);
+        if let Some(fg) = own
+            && contrast_ratio(fg, fill) >= MATCH_MIN_CONTRAST
+        {
+            return style.bg(rgb_color(fill)).fg(rgb_color(fg));
+        }
+        if mix <= 0.0 || contrast_ratio(t.strong, fill) >= MATCH_MIN_CONTRAST {
+            return style.bg(rgb_color(fill)).fg(t.strong());
+        }
+        mix -= MATCH_EASE_STEP;
+    }
+}
+
 /// The [`Tones`] of a `surfaces` theme, or `None` on a boxed one.
 pub fn tones(theme: Theme) -> Option<Tones> {
     let s = theme.surfaces()?;
@@ -172,11 +230,7 @@ pub fn paint_selected_row(
     if row.width == 0 || row.height == 0 {
         return;
     }
-    let band = if focused {
-        t.band_on(base)
-    } else {
-        rgb_color(lerp_rgb(base, t.lift, 0.07))
-    };
+    let band = rgb_color(selected_row_fill(t, base, focused));
     buf.set_style(row, Style::default().bg(band));
     if focused {
         for y in row.top()..row.bottom() {
@@ -185,6 +239,18 @@ pub fn paint_selected_row(
             cell.set_fg(t.accent());
             cell.set_bg(band);
         }
+    }
+}
+
+/// The fill [`paint_selected_row`] lays on surface `base`: the accent band
+/// while the list has the keyboard, a neutral grey step without it. For a
+/// row that paints a mark of its own over the band (a search match's tint)
+/// and so needs to know what it sits on.
+pub fn selected_row_fill(t: Tones, base: (u8, u8, u8), focused: bool) -> (u8, u8, u8) {
+    if focused {
+        lerp_rgb(base, t.accent, 0.24)
+    } else {
+        lerp_rgb(base, t.lift, 0.07)
     }
 }
 
@@ -1095,6 +1161,120 @@ mod tests {
             "the cap keeps what is under it"
         );
         assert_eq!(buf[(2, 1)].bg, fill);
+    }
+
+    /// A find match on Croft Loch is a calm amber tint of its own surface,
+    /// never the old solid yellow: a syntax ink that reads on it is kept,
+    /// one that would not (a comment) lifts to the strong ink, nothing is
+    /// made bold, and the current match is a clearly stronger tint.
+    #[test]
+    fn a_find_match_is_an_amber_tint_that_keeps_a_legible_ink() {
+        use crate::theme::contrast_ratio;
+        let theme = loch();
+        let t = tones(theme).unwrap();
+        let syn = crate::theme::SyntaxPalette::LOCH;
+        let on_canvas = |fg: (u8, u8, u8), active: bool| {
+            match_style(
+                Style::default().fg(rgb_color(fg)).bg(t.canvas()),
+                t,
+                theme,
+                active,
+            )
+        };
+        let soft = on_canvas(syn.keyword, false);
+        assert_eq!(
+            soft.bg,
+            Some(rgb_color(lerp_rgb(t.canvas, MATCH_AMBER, MATCH_SOFT)))
+        );
+        assert_ne!(soft.bg, Some(Color::Rgb(0xff, 0xd7, 0x4a)));
+        assert_eq!(soft.fg, Some(rgb_color(syn.keyword)), "the ink is kept");
+        assert!(!soft.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(
+            on_canvas(syn.comment, false).fg,
+            Some(t.strong()),
+            "a comment would not read on the tint, so it lifts"
+        );
+        let lum = |c: Option<Color>| match c {
+            Some(Color::Rgb(r, g, b)) => contrast_ratio((r, g, b), (0, 0, 0)),
+            _ => 0.0,
+        };
+        assert!(
+            lum(on_canvas(syn.keyword, true).bg) > lum(soft.bg) + 0.5,
+            "the current match is a clearly stronger tint"
+        );
+    }
+
+    /// Every ink a match can carry reads at 4.5:1 or better on its tint,
+    /// over every surface a match sits on: the canvas, the chrome, the
+    /// raised card, the hover lift, the selection and a selected row's
+    /// band (focused or not), as the current match or not. Where even the
+    /// strong ink would fall short (the current match on a teal band) the
+    /// tint eases back rather than giving up legibility.
+    #[test]
+    fn every_find_match_reads_at_four_and_a_half_to_one() {
+        use crate::theme::contrast_ratio;
+        let theme = loch();
+        let t = tones(theme).unwrap();
+        let syn = crate::theme::SyntaxPalette::LOCH;
+        let inks = [
+            t.text,
+            t.strong,
+            t.muted,
+            t.faint,
+            syn.comment,
+            syn.keyword,
+            syn.string,
+            syn.constant,
+            syn.function,
+            syn.type_,
+            syn.tag,
+            syn.fg,
+        ];
+        let bases = [
+            t.canvas,
+            t.chrome,
+            t.raised,
+            lerp_rgb(t.chrome, t.lift, 0.055),
+            (0x26, 0x4f, 0x4a),
+            selected_row_fill(t, t.chrome, true),
+            selected_row_fill(t, t.chrome, false),
+        ];
+        for base in bases {
+            for ink in inks {
+                for active in [false, true] {
+                    let s = match_style(
+                        Style::default().fg(rgb_color(ink)).bg(rgb_color(base)),
+                        t,
+                        theme,
+                        active,
+                    );
+                    let (Some(Color::Rgb(fr, fg, fb)), Some(Color::Rgb(br, bg, bb))) = (s.fg, s.bg)
+                    else {
+                        panic!("RGB inks for {ink:?} on {base:?}");
+                    };
+                    let ratio = contrast_ratio((fr, fg, fb), (br, bg, bb));
+                    assert!(
+                        ratio >= 4.5,
+                        "{ink:?} on {base:?} (active {active}) reads at {ratio:.2}"
+                    );
+                    assert_ne!(s.bg, Some(rgb_color(base)), "the match is marked");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn selected_row_fill_is_the_band_paint_selected_row_lays() {
+        let t = tones(loch()).unwrap();
+        for focused in [true, false] {
+            let mut buf = Buffer::empty(Rect::new(0, 0, 4, 1));
+            paint_selected_row(&mut buf, Rect::new(0, 0, 4, 1), t, t.chrome, focused);
+            assert_eq!(
+                buf[(2, 0)].bg,
+                rgb_color(selected_row_fill(t, t.chrome, focused))
+            );
+        }
+        assert_eq!(rgb_color(selected_row_fill(t, t.raised, true)), t.band());
     }
 
     #[test]

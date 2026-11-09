@@ -21751,7 +21751,9 @@ fn inlay_text_segment<'a>(
 }
 
 /// The (inactive, active) find-highlight styles, shared by the editor's
-/// highlighter and the rendered log's so the two tabs read the same.
+/// highlighter and the rendered log's so the two tabs read the same. A
+/// boxed theme's solid blocks; Croft Loch tints each cell instead
+/// ([`crate::widgets::surface::match_style`]).
 fn search_highlight_styles(theme: crate::theme::Theme) -> (Style, Style) {
     let inactive = Style::default()
         .fg(Color::Black)
@@ -21812,6 +21814,17 @@ fn paint_search_highlight(
         return;
     }
     let (inactive_style, active_style) = search_highlight_styles(theme);
+    // Croft Loch tints each matched cell's own background amber and keeps
+    // its syntax ink where it stays legible ([`surface::match_style`]); a
+    // boxed theme stamps the solid find style over it.
+    let tones = crate::widgets::surface::tones(theme);
+    let restyle = |active: bool| {
+        move |s: Style| match tones {
+            Some(t) => crate::widgets::surface::match_style(s, t, theme, active),
+            None if active => active_style,
+            None => inactive_style,
+        }
+    };
     let segments = crate::widgets::search::split_for_highlight(raw_line, needle, opts);
     // `abs_col` tracks the absolute character index in the original line.
     // Columns before the row's start are scrolled out; the rest map
@@ -21824,11 +21837,7 @@ fn paint_search_highlight(
         if is_match && in_window {
             let is_active =
                 active_match_on_line.is_some_and(|(c, l)| c == abs_col && l == chunk_cols);
-            let style = if is_active {
-                active_style
-            } else {
-                inactive_style
-            };
+            let style = restyle(is_active);
             for c in 0..chunk_cols {
                 let absolute = abs_col + c;
                 if absolute < row.start {
@@ -21838,20 +21847,13 @@ fn paint_search_highlight(
                 // so its band goes through the same cell map the text did;
                 // the editor's text path goes through its row geometry.
                 if let Some(cells) = cells {
-                    if !paint_log_cells(
-                        buf,
-                        text_x,
-                        text_x + text_width,
-                        y,
-                        cells,
-                        absolute,
-                        |_| style,
-                    ) {
+                    if !paint_log_cells(buf, text_x, text_x + text_width, y, cells, absolute, style)
+                    {
                         break;
                     }
                     continue;
                 }
-                if !paint_row_cells(buf, text_x, y, text_width, row, absolute, |_| style) {
+                if !paint_row_cells(buf, text_x, y, text_width, row, absolute, style) {
                     break;
                 }
             }
@@ -27485,6 +27487,8 @@ mod tests {
         // highlight were computed against the raw bytes.
         std::fs::write(&p, "plain\n\u{1b}[31mboom\u{1b}[0m tail\n").unwrap();
         let mut e = Editor::new();
+        // The boxed themes' orange active match; the columns are the point.
+        e.theme = crate::theme::Theme::BLACK;
         e.open(&p).unwrap();
         e.set_search_highlight(Some(String::from("boom")));
         e.active_search_match = Some((1, 0, 4));
@@ -30072,6 +30076,9 @@ mod tests {
         // keeps the BLACK foreground on a dark grey, which is unreadable,
         // and kills the orange active-match cue.
         let mut e = editor_with("config here");
+        // The boxed themes' black-on-gold block; Croft Loch's twin is
+        // `croft_loch_find_tints_stay_on_top_of_occurrence_tints`.
+        e.theme = crate::theme::Theme::BLACK;
         e.path = Some(PathBuf::from("/x/a.rs"));
         e.set_search_highlight(Some(String::from("config")));
         e.occurrences = vec![(0, 0, 6, false)];
@@ -37090,6 +37097,9 @@ mod tests {
     fn editor_render_paints_search_match_cells_with_yellow_bg() {
         use ratatui::buffer::Buffer;
         let mut e = editor_with("alpha needle bravo needle zulu");
+        // The boxed themes' solid find block; Croft Loch tints matches
+        // amber (`croft_loch_tints_find_matches_amber_and_the_current_one_stronger`).
+        e.theme = crate::theme::Theme::BLACK;
         e.set_search_highlight(Some(String::from("needle")));
         e.focused = true;
         let area = Rect {
@@ -37216,6 +37226,9 @@ mod tests {
     fn editor_render_does_not_paint_search_highlight_when_unset() {
         use ratatui::buffer::Buffer;
         let mut e = editor_with("alpha needle bravo");
+        // Pins the boxed themes' yellow; the Croft Loch twin is
+        // `croft_loch_paints_no_find_tint_when_the_highlight_is_unset`.
+        e.theme = crate::theme::Theme::BLACK;
         e.set_search_highlight(None);
         e.focused = true;
         let area = Rect {
@@ -37242,6 +37255,8 @@ mod tests {
     fn editor_render_search_highlight_is_case_insensitive() {
         use ratatui::buffer::Buffer;
         let mut e = editor_with("Foo bar FOO baz");
+        // Read through the boxed themes' solid find block.
+        e.theme = crate::theme::Theme::BLACK;
         e.set_search_highlight(Some(String::from("foo")));
         e.focused = true;
         let area = Rect {
@@ -37261,6 +37276,93 @@ mod tests {
         for col in 8..11u16 {
             assert_eq!(buf[(text_x + col, y)].bg, yellow, "cell {col} of 'FOO'");
         }
+    }
+
+    /// Croft Loch: a find match is an amber tint of the row it sits on, not
+    /// the solid yellow block, with the match's own ink kept (or lifted)
+    /// so it reads at 4.5:1 or better and no bold added; the current match
+    /// is a clearly stronger tint of the same amber.
+    #[test]
+    fn croft_loch_tints_find_matches_amber_and_the_current_one_stronger() {
+        use crate::widgets::surface;
+        use ratatui::buffer::Buffer;
+        let mut e = editor_with("alpha needle bravo needle zulu");
+        let t = surface::tones(e.theme).expect("the default theme is Croft Loch");
+        e.set_search_highlight(Some(String::from("needle")));
+        e.active_search_match = Some((0, 19, 6));
+        e.focused = true;
+        let area = Rect::new(0, 0, 60, 3);
+        let mut buf = Buffer::empty(area);
+        (&mut e).render(area, &mut buf);
+        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        let y = e.last_inner.y;
+        // The space before the first match carries the row's own fill (the
+        // current line's, as the caret is on this row).
+        let row = buf[(text_x + 5, y)].bg;
+        let tint = |active: bool| {
+            surface::match_style(Style::default().bg(row), t, e.theme, active)
+                .bg
+                .unwrap()
+        };
+        assert_ne!(tint(false), Color::Rgb(0xff, 0xd7, 0x4a));
+        assert_ne!(tint(false), tint(true));
+        let lum = |c: Color| match c {
+            Color::Rgb(r, g, b) => crate::theme::contrast_ratio((r, g, b), (0, 0, 0)),
+            _ => 0.0,
+        };
+        assert!(
+            lum(tint(true)) > lum(tint(false)) + 0.5,
+            "the current match is a clearly stronger tint"
+        );
+        for (cols, active) in [(6..12u16, false), (19..25u16, true)] {
+            for col in cols {
+                let cell = &buf[(text_x + col, y)];
+                assert_eq!(cell.bg, tint(active), "match cell {col}");
+                let (Color::Rgb(fr, fg, fb), Color::Rgb(br, bg, bb)) = (cell.fg, cell.bg) else {
+                    panic!("cell {col} has RGB inks: {cell:?}");
+                };
+                assert!(
+                    crate::theme::contrast_ratio((fr, fg, fb), (br, bg, bb)) >= 4.5,
+                    "cell {col} reads on its tint"
+                );
+                assert!(!cell.modifier.contains(Modifier::BOLD), "no bold on {col}");
+            }
+        }
+        assert_eq!(buf[(text_x + 12, y)].bg, row, "the tint stops at the match");
+    }
+
+    /// Croft Loch negative: with no find highlight set, no cell of the row
+    /// wears the amber tint.
+    #[test]
+    fn croft_loch_paints_no_find_tint_when_the_highlight_is_unset() {
+        let mut e = editor_with("alpha needle bravo");
+        e.set_search_highlight(None);
+        e.focused = true;
+        let buf = guide_buf(&mut e, 40, 3);
+        assert_eq!(glyphs_where(&e, &buf, loch_find_tint), "");
+    }
+
+    /// Croft Loch: Cmd+F then Enter parks the caret on a match whose
+    /// occurrences the idle documentHighlight then greys; the find tint is
+    /// laid over the occurrence grey (so it still reads as a match) and its
+    /// ink stays legible on it.
+    #[test]
+    fn croft_loch_find_tints_stay_on_top_of_occurrence_tints() {
+        let mut e = editor_with("config here");
+        e.path = Some(PathBuf::from("/x/a.rs"));
+        e.set_search_highlight(Some(String::from("config")));
+        e.occurrences = vec![(0, 0, 6, false)];
+        let buf = guide_buf(&mut e, 40, 5);
+        assert_eq!(glyphs_where(&e, &buf, loch_find_tint), "config");
+        let occ = e.theme.occurrence_bg();
+        assert_eq!(glyphs_where(&e, &buf, |c| c.bg == occ), "");
+        let y = e.last_inner.y;
+        let x = e.last_inner.x + e.last_gutter_width + 1;
+        let (Color::Rgb(fr, fg, fb), Color::Rgb(br, bg, bb)) = (buf[(x, y)].fg, buf[(x, y)].bg)
+        else {
+            panic!("RGB inks");
+        };
+        assert!(crate::theme::contrast_ratio((fr, fg, fb), (br, bg, bb)) >= 4.5);
     }
 
     #[test]
@@ -43852,6 +43954,13 @@ mod tests {
 
     /// The glyphs on the first text row whose cells `pick` selects, left to
     /// right: what an overlay covers on screen.
+    /// A cell Croft Loch has tinted as a find match: an amber fill, red
+    /// well above blue, which no other Loch editor fill (canvas, current
+    /// line, selection, occurrence grey) is.
+    fn loch_find_tint(c: &ratatui::buffer::Cell) -> bool {
+        matches!(c.bg, Color::Rgb(r, _, b) if r > b.saturating_add(24))
+    }
+
     fn glyphs_where(
         e: &Editor,
         buf: &Buffer,
@@ -43901,8 +44010,7 @@ mod tests {
         let mut e = editor_with("x = \"\u{1f44d}\u{1f3fd}\u{2764}\u{fe0f}\"  # food");
         e.set_search_highlight(Some("food".into()));
         let buf = guide_buf(&mut e, 60, 5);
-        let find_bg = Color::Rgb(0xff, 0xd7, 0x4a);
-        assert_eq!(glyphs_where(&e, &buf, |c| c.bg == find_bg), "food");
+        assert_eq!(glyphs_where(&e, &buf, loch_find_tint), "food");
     }
 
     #[test]
@@ -43911,8 +44019,7 @@ mod tests {
         e.set_search_highlight(Some("food".into()));
         e.occurrences = vec![(0, 22, 31, false)];
         let buf = guide_buf(&mut e, 60, 5);
-        let find_bg = Color::Rgb(0xff, 0xd7, 0x4a);
-        assert_eq!(glyphs_where(&e, &buf, |c| c.bg == find_bg), "food");
+        assert_eq!(glyphs_where(&e, &buf, loch_find_tint), "food");
         let occ_bg = e.theme.occurrence_bg();
         assert_eq!(glyphs_where(&e, &buf, |c| c.bg == occ_bg), "groceries");
     }

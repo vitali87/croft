@@ -2538,12 +2538,16 @@ fn render_field(
         buf[(x, args.y)].set_symbol(" ").set_style(fill_style);
     }
 
+    // Croft Loch writes the field in its ink ramp: the text in body ink,
+    // the placeholder and an idle lead glyph muted. A boxed theme keeps its
+    // historical colours.
+    let tones = crate::widgets::surface::tones(theme);
     let lead_w: u16 = if args.lead_glyph.is_some() { 2 } else { 0 };
     if let Some(g) = args.lead_glyph {
-        let lead_color = if args.field_focused {
-            args.accent
-        } else {
-            theme.ui(Color::Rgb(0x9d, 0xa5, 0xb4))
+        let lead_color = match tones {
+            _ if args.field_focused => args.accent,
+            Some(t) => t.muted(),
+            None => theme.ui(Color::Rgb(0x9d, 0xa5, 0xb4)),
         };
         buf.set_string(fill_x, args.y, g, Style::default().fg(lead_color).bg(fill));
     }
@@ -2557,17 +2561,25 @@ fn render_field(
     let win = crate::widgets::line_edit::window(args.text, args.caret, usize::from(text_w));
     *origin_out = (text_x, win.start);
     if args.text.is_empty() {
+        let ink = match tones {
+            Some(t) => t.muted(),
+            None => theme.ui(Color::Rgb(0x6c, 0x7d, 0x9c)),
+        };
         spans.push(Span::styled(
             args.placeholder.to_string(),
             Style::default()
-                .fg(theme.ui(Color::Rgb(0x6c, 0x7d, 0x9c)))
+                .fg(ink)
                 .bg(fill)
                 .add_modifier(Modifier::ITALIC),
         ));
     } else {
-        let plain = Style::default().fg(theme.ui(Color::White)).bg(fill);
+        let ink = match tones {
+            Some(t) => t.text(),
+            None => theme.ui(Color::White),
+        };
+        let plain = Style::default().fg(ink).bg(fill);
         let selected = Style::default()
-            .fg(theme.ui(Color::White))
+            .fg(ink)
             .bg(theme.ui(Color::Rgb(0x26, 0x4f, 0x78)));
         // Only the part of the text the row has room for, scrolled so the
         // caret is in view; the selection is clipped to it.
@@ -2654,16 +2666,21 @@ impl Widget for &mut SearchPanel {
             return;
         }
 
+        // Croft Loch's inks and fills; `None` on a boxed theme, which keeps
+        // the colours below exactly as they were.
+        let tones = crate::widgets::surface::tones(self.theme);
+
         // Row 0: "SEARCH" header (top-left) plus the VS Code SEARCH header
-        // actions (refresh / clear) at the top-right.
-        buf.set_string(
-            inner.x,
-            inner.y,
-            "SEARCH",
-            Style::default()
+        // actions (refresh / clear) at the top-right. Croft Loch titles the
+        // view as the Explorer does: the strong ink while it has the
+        // keyboard, muted otherwise, and never bold.
+        let title_style = match tones {
+            Some(t) => Style::default().fg(if self.focused { t.strong() } else { t.muted() }),
+            None => Style::default()
                 .fg(self.theme.ui(Color::Rgb(0xb0, 0xb8, 0xc8)))
                 .add_modifier(Modifier::BOLD),
-        );
+        };
+        buf.set_string(inner.x, inner.y, "SEARCH", title_style);
 
         // Header action icons, laid out from the right edge: clear (rightmost)
         // then refresh, each a single-cell click target that lifts to the accent
@@ -2682,12 +2699,17 @@ impl Widget for &mut SearchPanel {
                 let hot = self
                     .hover_pointer
                     .is_some_and(|(px, py)| py == inner.y && px == x);
-                let color = if hot {
-                    accent
+                // Croft Loch: the side bar's header actions, muted at rest
+                // and lifted to the strong ink on a faint chip under the
+                // pointer; the accent stays for focus.
+                let style = if tones.is_some() {
+                    crate::widgets::header_pill::action_style(self.theme, hot)
+                } else if hot {
+                    Style::default().fg(accent)
                 } else {
-                    self.theme.ui(Color::Rgb(0x8b, 0x94, 0xa4))
+                    Style::default().fg(self.theme.ui(Color::Rgb(0x8b, 0x94, 0xa4)))
                 };
-                buf.set_string(x, inner.y, glyph.to_string(), Style::default().fg(color));
+                buf.set_string(x, inner.y, glyph.to_string(), style);
             }
             self.refresh_x = refresh_x;
             self.clear_x = clear_x;
@@ -2728,23 +2750,25 @@ impl Widget for &mut SearchPanel {
         let query_reserve = query_fill_right.saturating_sub(case_x).saturating_add(1);
 
         // Expand chevron (far left). ▾ when Replace is open, ▸ when collapsed.
-        let chevron_color = if self.focused {
-            accent
-        } else {
-            Color::DarkGray
+        // Croft Loch: the side bar's codicon chevron in the muted ink, an
+        // idle icon like the Explorer's; the field's bar already says where
+        // focus is.
+        let chevron_style = match tones {
+            Some(t) => Style::default().fg(t.muted()),
+            None => Style::default()
+                .fg(if self.focused {
+                    accent
+                } else {
+                    Color::DarkGray
+                })
+                .add_modifier(Modifier::BOLD),
         };
-        let chevron_glyph = if self.replace_open {
-            crate::icons::CHEVRON_OPEN
-        } else {
-            crate::icons::CHEVRON_CLOSED
-        };
+        let chevron_glyph = crate::widgets::surface::chevron(self.theme, self.replace_open);
         buf.set_string(
             chevron_x,
             content_y,
             chevron_glyph.to_string(),
-            Style::default()
-                .fg(chevron_color)
-                .add_modifier(Modifier::BOLD),
+            chevron_style,
         );
         self.chevron_x = chevron_x;
         self.chevron_y = content_y;
@@ -2794,12 +2818,22 @@ impl Widget for &mut SearchPanel {
                 FIELD_FILL_LIFT_IDLE
             },
         );
-        let active_style = Style::default()
-            .fg(Color::White)
-            .bg(crate::gradient::rgb_color(crate::gradient::POPUP_SEL_BG))
-            .add_modifier(Modifier::BOLD);
+        // Croft Loch: an on toggle is the strong ink on the selection chip
+        // (no bold: weight is rare), an off one the muted ink.
+        let active_style = match tones {
+            Some(t) => Style::default()
+                .fg(t.strong())
+                .bg(crate::gradient::rgb_color(crate::gradient::POPUP_SEL_BG)),
+            None => Style::default()
+                .fg(Color::White)
+                .bg(crate::gradient::rgb_color(crate::gradient::POPUP_SEL_BG))
+                .add_modifier(Modifier::BOLD),
+        };
         let inactive_style = Style::default()
-            .fg(self.theme.ui(Color::Rgb(0x79, 0x82, 0x8f)))
+            .fg(match tones {
+                Some(t) => t.muted(),
+                None => self.theme.ui(Color::Rgb(0x79, 0x82, 0x8f)),
+            })
             .bg(toggle_fill);
         self.toggle_y = content_y;
         self.toggle_case_x = case_x;
@@ -2815,10 +2849,11 @@ impl Widget for &mut SearchPanel {
         }
 
         // `...` details expander, just past the query field. Accent when open.
-        let ellipsis_style = if self.details_open {
-            Style::default().fg(accent).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(self.theme.ui(Color::Rgb(0x79, 0x82, 0x8f)))
+        let ellipsis_style = match tones {
+            Some(t) if self.details_open => Style::default().fg(t.accent()),
+            Some(t) => Style::default().fg(t.muted()),
+            None if self.details_open => Style::default().fg(accent).add_modifier(Modifier::BOLD),
+            None => Style::default().fg(self.theme.ui(Color::Rgb(0x79, 0x82, 0x8f))),
         };
         buf.set_string(
             ellipsis_x,
@@ -2896,10 +2931,11 @@ impl Widget for &mut SearchPanel {
                 replace_all_x,
                 next_y,
                 crate::icons::SEARCH_REPLACE_ALL.to_string(),
-                Style::default().fg(if self.focused {
-                    accent
-                } else {
-                    self.theme.ui(Color::Rgb(0x9d, 0xa5, 0xb4))
+                Style::default().fg(match tones {
+                    // Croft Loch: an action icon, muted like the header's.
+                    Some(t) => t.muted(),
+                    None if self.focused => accent,
+                    None => self.theme.ui(Color::Rgb(0x9d, 0xa5, 0xb4)),
                 }),
             );
             self.replace_all_x = replace_all_x;
@@ -2916,7 +2952,10 @@ impl Widget for &mut SearchPanel {
         self.project_exclude_rect = Rect::default();
         if self.details_open {
             let detail_fill_right = inner_right.saturating_sub(1).max(bar_x + 1);
-            let caption_style = Style::default().fg(self.theme.ui(Color::Rgb(0x9d, 0xa5, 0xb4)));
+            let caption_style = Style::default().fg(match tones {
+                Some(t) => t.muted(),
+                None => self.theme.ui(Color::Rgb(0x9d, 0xa5, 0xb4)),
+            });
 
             if next_y + 2 < inner.y + inner.height {
                 // Hairline before the include group, matching the query/replace
@@ -3033,9 +3072,18 @@ impl Widget for &mut SearchPanel {
         // ---- Separator + match-count caption ----
         let separator_y = next_y;
         if separator_y < inner.y + inner.height {
-            let sep_style = Style::default().fg(self.theme.ui(Color::Rgb(0x40, 0x48, 0x58)));
+            // Croft Loch: a hairline seam hugging the results below, as
+            // Source Control draws above its changes, not a line twice as
+            // bright as every other seam in the side bar.
+            let (sep_glyph, sep_style) = match tones {
+                Some(t) => ("\u{2581}", Style::default().fg(t.hairline())),
+                None => (
+                    "─",
+                    Style::default().fg(self.theme.ui(Color::Rgb(0x40, 0x48, 0x58))),
+                ),
+            };
             for x in inner.x..inner.x + inner.width {
-                buf.set_string(x, separator_y, "─", sep_style);
+                buf.set_string(x, separator_y, sep_glyph, sep_style);
             }
         }
         let caption_y = separator_y + 1;
@@ -3057,17 +3105,32 @@ impl Widget for &mut SearchPanel {
                 results_start_y = y.max(caption_y + 1);
             } else {
                 let (results, files) = self.result_counts();
-                let header = format!(
-                    "{results} result{} in {files} file{}",
+                let (r_s, f_s) = (
                     if results == 1 { "" } else { "s" },
-                    if files == 1 { "" } else { "s" }
+                    if files == 1 { "" } else { "s" },
                 );
-                let caption = Line::from(Span::styled(
-                    header,
-                    Style::default()
-                        .fg(self.theme.ui(Color::Rgb(0x9d, 0xa5, 0xb4)))
-                        .add_modifier(Modifier::ITALIC),
-                ));
+                let caption = match tones {
+                    // Croft Loch: a quiet sentence in the muted ink whose
+                    // two counts, the part worth reading, are body text.
+                    Some(t) => {
+                        let (num, word) = (
+                            Style::default().fg(t.text()),
+                            Style::default().fg(t.muted()),
+                        );
+                        Line::from(vec![
+                            Span::styled(results.to_string(), num),
+                            Span::styled(format!(" result{r_s} in "), word),
+                            Span::styled(files.to_string(), num),
+                            Span::styled(format!(" file{f_s}"), word),
+                        ])
+                    }
+                    None => Line::from(Span::styled(
+                        format!("{results} result{r_s} in {files} file{f_s}"),
+                        Style::default()
+                            .fg(self.theme.ui(Color::Rgb(0x9d, 0xa5, 0xb4)))
+                            .add_modifier(Modifier::ITALIC),
+                    )),
+                };
                 buf.set_line(inner.x, caption_y, &caption, inner.width);
             }
         }
@@ -3128,7 +3191,12 @@ impl Widget for &mut SearchPanel {
                 width: row_width,
                 height: 1,
             };
-            if hit_idx != self.selected
+            let is_selected = hit_idx == self.selected;
+            // The fill under the row's text on Croft Loch (chrome, the hover
+            // lift or the selected band), which a match's amber tint is
+            // blended from so it reads the same on every row.
+            let mut row_fill = tones.map(|t| t.chrome());
+            if !is_selected
                 && let Some(bg) =
                     crate::widgets::hover::row_hover_bg(row_rect, self.hover_pointer, self.theme)
             {
@@ -3136,6 +3204,28 @@ impl Widget for &mut SearchPanel {
                 for rx in 0..row_width {
                     buf[(inner.x + rx, y)].set_symbol(" ").set_style(fill);
                 }
+                row_fill = row_fill.map(|_| bg);
+            }
+            // Croft Loch: the one selected-row anatomy, the band across the
+            // full row with the accent bar standing in the pane's left
+            // padding column (as the Explorer's does) so the names keep
+            // their column; greyed, barless, while another pane has the
+            // keyboard.
+            if is_selected && let Some(t) = tones {
+                crate::widgets::surface::paint_selected_row(
+                    buf,
+                    Rect {
+                        x: area.x,
+                        width: row_width.saturating_add(inner.x - area.x),
+                        ..row_rect
+                    },
+                    t,
+                    t.chrome,
+                    self.focused,
+                );
+                row_fill = Some(crate::gradient::rgb_color(
+                    crate::widgets::surface::selected_row_fill(t, t.chrome, self.focused),
+                ));
             }
             // Show just the basename so the matched line itself has room
             // to render inside a narrow side panel — without this, deep
@@ -3175,7 +3265,11 @@ impl Widget for &mut SearchPanel {
                 });
             // Black theme: selected result row matches the Explorer's
             // white-on-dark-teal selection; Croft Dark keeps black-on-blue.
-            let header_style = if hit_idx == self.selected {
+            let header_style = if let Some(t) = tones {
+                // Croft Loch: the file name is body text on every row; the
+                // band says which one is selected.
+                Style::default().fg(t.text())
+            } else if is_selected {
                 if self.focus_gradient {
                     Style::default()
                         .fg(Color::White)
@@ -3199,13 +3293,40 @@ impl Widget for &mut SearchPanel {
                 .fg(Color::Black)
                 .bg(self.theme.ui(Color::Rgb(0xff, 0xd7, 0x4a)))
                 .add_modifier(Modifier::BOLD);
-            let plain_style = Style::default().fg(self.theme.ui(Color::Gray));
-            let mut spans: Vec<Span> = vec![
-                Span::styled(format!(" {path_display}"), header_style),
-                Span::styled(
-                    format!(":{}: ", hit.line_no),
+            // Croft Loch reads a row in three inks: the file name in body
+            // text, the line number faint, the preview muted with each match
+            // tinted amber over the row's own fill. On the selected row the
+            // line number and preview step up an ink, so they keep their
+            // contrast on the band. The selected row's first match is the
+            // one opening it lands on, so it takes the current match's
+            // stronger tint, as it will in the editor.
+            let (plain_style, line_no_style) = match tones {
+                Some(t) if is_selected => (
+                    Style::default().fg(t.text()),
+                    Style::default().fg(t.muted()),
+                ),
+                Some(t) => (
+                    Style::default().fg(t.muted()),
+                    Style::default().fg(t.faint()),
+                ),
+                None => (
+                    Style::default().fg(self.theme.ui(Color::Gray)),
                     Style::default().fg(self.theme.ui(Color::Rgb(0xeb, 0xcb, 0x8b))),
                 ),
+            };
+            let match_style = |active: bool| match (tones, row_fill) {
+                (Some(t), Some(fill)) => crate::widgets::surface::match_style(
+                    plain_style.bg(fill),
+                    t,
+                    self.theme,
+                    active,
+                ),
+                _ => highlight_style,
+            };
+            let mut active_pending = is_selected;
+            let mut spans: Vec<Span> = vec![
+                Span::styled(format!(" {path_display}"), header_style),
+                Span::styled(format!(":{}: ", hit.line_no), line_no_style),
             ];
             // Inline replace preview (#123): while a replacement is typed,
             // each match renders dim and crossed out with the expanded
@@ -3245,14 +3366,13 @@ impl Widget for &mut SearchPanel {
                     ));
                     continue;
                 }
-                spans.push(Span::styled(
-                    chunk,
-                    if is_match {
-                        highlight_style
-                    } else {
-                        plain_style
-                    },
-                ));
+                let style = if is_match {
+                    let active = std::mem::take(&mut active_pending);
+                    match_style(active)
+                } else {
+                    plain_style
+                };
+                spans.push(Span::styled(chunk, style));
             }
             let line = Line::from(spans);
             buf.set_line(inner.x, y, &line, row_width);
@@ -6466,5 +6586,209 @@ mod tests {
         assert!(row.contains("note"), "{row:?}");
         assert!(row.starts_with("a.txt:1: "), "{row:?}");
         assert!(!row.contains('…'), "{row:?}");
+    }
+
+    /// A panel with two results for `needle` in `a.rs`, the first one
+    /// selected, on the default theme (Croft Loch).
+    fn loch_results_panel(tmp: &TempDir) -> SearchPanel {
+        let mut panel = SearchPanel::new(tmp.path().to_path_buf());
+        assert!(
+            crate::widgets::surface::tones(panel.theme).is_some(),
+            "the default theme is Croft Loch"
+        );
+        panel.query = "needle".into();
+        panel.hits = (1..=2)
+            .map(|line_no| SearchHit {
+                path: tmp.path().join("a.rs"),
+                line_no,
+                line_text: String::from("let needle = 1;"),
+                matches: 1,
+            })
+            .collect();
+        panel.selected = 0;
+        panel
+    }
+
+    /// The column and row where `label` starts on screen.
+    fn cell_of(buf: &Buffer, label: &str) -> (u16, u16) {
+        for y in buf.area.top()..buf.area.bottom() {
+            let row: String = (buf.area.left()..buf.area.right())
+                .map(|x| buf[(x, y)].symbol())
+                .collect();
+            if let Some(i) = row.find(label) {
+                return (row[..i].chars().count() as u16, y);
+            }
+        }
+        panic!("{label} not on screen:\n{}", buffer_to_string(buf));
+    }
+
+    /// Croft Loch: a result row reads in the ink ramp (file name in body
+    /// text, line number faint, preview muted), the selected row wears the
+    /// shared selected-row anatomy across its full width (the band, and
+    /// the accent bar in the pane's left padding while the view has focus)
+    /// with its inks a step up, and the file name is never a teal chip.
+    #[test]
+    fn croft_loch_result_rows_use_the_ink_ramp_and_the_selected_row_band() {
+        use crate::widgets::surface::{ROW_BAR, selected_row_fill, tones};
+        let tmp = TempDir::new().unwrap();
+        let mut panel = loch_results_panel(&tmp);
+        let t = tones(panel.theme).unwrap();
+        panel.focused = true;
+        let buf = render_panel(&mut panel, 40);
+        let band = crate::gradient::rgb_color(selected_row_fill(t, t.chrome, true));
+
+        let (x, y) = cell_of(&buf, "a.rs:1:");
+        let area = panel.last_area;
+        assert_eq!(buf[(area.x, y)].symbol(), ROW_BAR, "the bar in the padding");
+        assert_eq!(buf[(area.x, y)].fg, t.accent());
+        let right = panel.last_inner.x + panel.last_inner.width - 1;
+        for cx in area.x..=right {
+            if (x + 12..x + 18).contains(&cx) {
+                continue; // the match's own tint
+            }
+            assert_eq!(buf[(cx, y)].bg, band, "the band spans the row ({cx})");
+        }
+        assert_eq!(buf[(x, y)].fg, t.text(), "the file name is body text");
+        assert!(!buf[(x, y)].modifier.contains(Modifier::BOLD));
+        assert_eq!(buf[(x + 5, y)].fg, t.muted(), "a step-up line number");
+        assert_eq!(buf[(x + 8, y)].fg, t.text(), "a step-up preview");
+
+        let (x2, y2) = cell_of(&buf, "a.rs:2:");
+        assert_eq!(buf[(x2, y2)].fg, t.text());
+        assert_eq!(buf[(x2, y2)].bg, t.chrome(), "other rows sit on the chrome");
+        assert_eq!(buf[(x2 + 5, y2)].fg, t.faint(), "the line number is faint");
+        assert_eq!(buf[(x2 + 8, y2)].fg, t.muted(), "the preview is muted");
+        assert_ne!(buf[(area.x, y2)].symbol(), ROW_BAR);
+
+        // Without focus the band greys and the bar goes.
+        panel.focused = false;
+        let buf = render_panel(&mut panel, 40);
+        let (_, y) = cell_of(&buf, "a.rs:1:");
+        assert_ne!(buf[(area.x, y)].symbol(), ROW_BAR, "no bar without focus");
+        assert_eq!(
+            buf[(area.x + 3, y)].bg,
+            crate::gradient::rgb_color(selected_row_fill(t, t.chrome, false))
+        );
+    }
+
+    /// Croft Loch: a match in a result's preview is the amber tint over
+    /// the row's own fill (the selected row's first match the stronger,
+    /// current one), never the solid yellow block, and its ink reads on it
+    /// at 4.5:1 or better.
+    #[test]
+    fn croft_loch_result_matches_are_an_amber_tint_of_their_row() {
+        use crate::widgets::surface::{match_style, selected_row_fill, tones};
+        let tmp = TempDir::new().unwrap();
+        let mut panel = loch_results_panel(&tmp);
+        let t = tones(panel.theme).unwrap();
+        panel.focused = true;
+        let buf = render_panel(&mut panel, 40);
+        let band = crate::gradient::rgb_color(selected_row_fill(t, t.chrome, true));
+        let tint = |row: Color, active: bool| {
+            match_style(Style::default().bg(row), t, panel.theme, active)
+                .bg
+                .unwrap()
+        };
+        for (label, row, active) in [("a.rs:1:", band, true), ("a.rs:2:", t.chrome(), false)] {
+            let (x, y) = cell_of(&buf, label);
+            let first = x + 12; // past "a.rs:N: let "
+            for cx in first..first + 6 {
+                let cell = &buf[(cx, y)];
+                assert_eq!(cell.symbol(), &"needle"[usize::from(cx - first)..][..1]);
+                assert_eq!(cell.bg, tint(row, active), "{label} match cell {cx}");
+                assert_ne!(cell.bg, Color::Rgb(0xff, 0xd7, 0x4a));
+                assert!(!cell.modifier.contains(Modifier::BOLD));
+                let (Color::Rgb(fr, fg, fb), Color::Rgb(br, bg, bb)) = (cell.fg, cell.bg) else {
+                    panic!("RGB inks: {cell:?}");
+                };
+                assert!(crate::theme::contrast_ratio((fr, fg, fb), (br, bg, bb)) >= 4.5);
+            }
+            assert_eq!(buf[(first + 6, y)].bg, row, "the tint stops at the match");
+        }
+    }
+
+    /// Croft Loch: the pointer over an unselected result lifts it with the
+    /// neutral hover fill, and its match is tinted over that lift.
+    #[test]
+    fn croft_loch_hovered_result_rows_take_the_neutral_lift() {
+        use crate::widgets::surface::{match_style, tones};
+        let tmp = TempDir::new().unwrap();
+        let mut panel = loch_results_panel(&tmp);
+        let t = tones(panel.theme).unwrap();
+        let buf = render_panel(&mut panel, 40);
+        let (x, y) = cell_of(&buf, "a.rs:2:");
+        panel.hover_pointer = Some((x, y));
+        let buf = render_panel(&mut panel, 40);
+        let lift = t.hover_on(t.chrome);
+        assert_eq!(buf[(x, y)].bg, lift);
+        assert_eq!(buf[(x, y)].fg, t.text());
+        assert_eq!(
+            buf[(x + 12, y)].bg,
+            match_style(Style::default().bg(lift), t, panel.theme, false)
+                .bg
+                .unwrap()
+        );
+    }
+
+    /// Croft Loch: the result summary is a muted sentence whose counts are
+    /// body text, without the italic, and the title follows the Explorer's
+    /// (strong while focused, muted otherwise, never bold).
+    #[test]
+    fn croft_loch_summary_and_title_follow_the_ink_ramp() {
+        let tmp = TempDir::new().unwrap();
+        let mut panel = loch_results_panel(&tmp);
+        let t = crate::widgets::surface::tones(panel.theme).unwrap();
+        panel.focused = true;
+        let buf = render_panel(&mut panel, 40);
+        let (x, y) = cell_of(&buf, "2 results in 1 file");
+        assert_eq!(buf[(x, y)].fg, t.text(), "the count");
+        assert_eq!(buf[(x + 2, y)].fg, t.muted(), "the words");
+        assert_eq!(buf[(x + 13, y)].fg, t.text(), "the file count");
+        assert!(!buf[(x + 2, y)].modifier.contains(Modifier::ITALIC));
+        let (tx, ty) = cell_of(&buf, "SEARCH");
+        assert_eq!(buf[(tx, ty)].fg, t.strong());
+        assert!(!buf[(tx, ty)].modifier.contains(Modifier::BOLD));
+        // The query (the first "needle" on screen, above the results) is
+        // body text in its field.
+        let (qx, qy) = cell_of(&buf, "needle");
+        assert!(qy < y, "the field sits above the summary");
+        assert_eq!(buf[(qx, qy)].fg, t.text(), "the query is body text");
+        panel.focused = false;
+        let buf = render_panel(&mut panel, 40);
+        assert_eq!(buf[(tx, ty)].fg, t.muted());
+        // An empty field's placeholder is muted.
+        panel.query.clear();
+        let buf = render_panel(&mut panel, 40);
+        let (px, py) = cell_of(&buf, "Search");
+        assert_eq!(buf[(px, py)].fg, t.muted(), "the placeholder is muted");
+    }
+
+    /// The boxed themes keep their result rows exactly: Croft Black's
+    /// selected file name on the teal chip in bold white and its matches
+    /// black on the gold block, with no row bar.
+    #[test]
+    fn croft_black_result_rows_keep_the_teal_chip_and_gold_matches() {
+        let tmp = TempDir::new().unwrap();
+        let mut panel = loch_results_panel(&tmp);
+        panel.theme = crate::theme::Theme::BLACK;
+        panel.focus_gradient = true;
+        panel.focused = true;
+        let buf = render_panel(&mut panel, 40);
+        let (x, y) = cell_of(&buf, "a.rs:1:");
+        let chip = crate::gradient::rgb_color(crate::gradient::POPUP_SEL_BG);
+        assert_eq!(buf[(x, y)].bg, chip);
+        assert_eq!(buf[(x, y)].fg, Color::White);
+        assert!(buf[(x, y)].modifier.contains(Modifier::BOLD));
+        assert_ne!(
+            buf[(x + 5, y)].bg,
+            chip,
+            "only the file name wears the chip"
+        );
+        assert_eq!(buf[(x + 12, y)].bg, Color::Rgb(0xff, 0xd7, 0x4a));
+        assert_eq!(buf[(x + 12, y)].fg, Color::Black);
+        assert_ne!(
+            buf[(panel.last_area.x, y)].symbol(),
+            crate::widgets::surface::ROW_BAR
+        );
     }
 }
