@@ -79406,7 +79406,7 @@ fn is_run_fence_key(key: KeyEvent) -> bool {
 /// with the pane's directory on its import path, as before. Should the file
 /// not be written, the heredoc is the fallback.
 ///
-/// A shell block of several lines, or holding a tab or `!`, goes as one
+/// A shell block of several lines, or holding a tab, `!` or `#`, goes as one
 /// single-quoted `printf '%b'` argument instead. Typed line by line, each
 /// line was a command of its own, so the capture under the fence and the
 /// pane's outcome described only the first one to finish (#920); as one
@@ -79414,8 +79414,13 @@ fn is_run_fence_key(key: KeyEvent) -> bool {
 /// status it ends with. Typed into an interactive shell, a tab is
 /// completion and bash expands `!` as history, so what ran was not what
 /// the confirm popup showed. Inside single quotes neither happens, and the
-/// tab travels as `\t`. A backslash travels as `\0134`, since fish folds
-/// `\\` inside single quotes to one backslash where bash and zsh keep both.
+/// tab travels as `\t`. zsh reads a typed `#` as a word, not a comment,
+/// unless `interactive_comments` is set, and it is off by default: `echo
+/// done  # note` printed the note and a comment alone failed with exit 127
+/// (#1367). Text `eval`ed or `source`d is a script, where every shell reads
+/// a comment as one, and a `#` that is not a comment parses as typed. A
+/// backslash travels as `\0134`, since fish folds `\\` inside single
+/// quotes to one backslash where bash and zsh keep both.
 /// `shell` is the pane's shell: fish before 3.4 rejects `$(...)` as
 /// syntax, so a fish pane `source`s the decoded block from a `psub` file
 /// rather than `eval`ing it, which every fish reads alike. Not piped to
@@ -79435,7 +79440,7 @@ fn fence_command(interpreter: &str, code: &str, scripts: &Path, shell: &str) -> 
         }
         return format!("{interpreter} - <<'{end}'\n{code}\n{end}\r");
     }
-    if code.contains(['\n', '\t', '!']) {
+    if code.contains(['\n', '\t', '!', '#']) {
         let escaped = format!("{code}\n")
             .replace('\\', "\\0134")
             .replace('\n', "\\n")
