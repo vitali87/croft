@@ -919,10 +919,21 @@ enum ReadStop {
 /// scrolling past leaves unchanged. A wipe that erases a row drops it, and
 /// a resize, which re-wraps lines by different numbers of rows that one
 /// clock shift cannot follow, re-finds every row by its place among the
-/// lines above the cursor ([`Self::reflow`]). Ids come from the
-/// process-wide [`next_mark_id`], so one never names another pane's row.
+/// lines above the cursor ([`Self::reflow`]). A row that a resize under a
+/// full-screen program re-wrapped out of sight is kept as `None`: still
+/// captured, but found again by its text ([`RowAt::Unknown`]). Ids come
+/// from the process-wide [`next_mark_id`], so one never names another
+/// pane's row.
 #[derive(Default)]
-struct CaptureRows(std::collections::BTreeMap<u64, i64>);
+struct CaptureRows(std::collections::BTreeMap<u64, Option<i64>>);
+
+/// Where a capture's row is now ([`CaptureRows::line`]).
+enum RowAt {
+    /// On this grid line.
+    Line(i64),
+    /// Still captured, but where is unknown: look for its text instead.
+    Unknown,
+}
 
 impl CaptureRows {
     /// Record the line the parser just completed and return its id. The
@@ -936,25 +947,31 @@ impl CaptureRows {
             line -= 1;
         }
         let id = next_mark_id();
-        self.0.insert(id, clock.tick(term) + i64::from(line));
+        self.0.insert(id, Some(clock.tick(term) + i64::from(line)));
         while self.0.len() > crate::widgets::captures::CAPTURES_MAX {
             self.0.pop_first();
         }
         id
     }
 
-    /// The grid line `id`'s row is on at clock reading `now`, or None once
-    /// it was erased.
-    fn line(&self, id: u64, now: i64) -> Option<i64> {
-        self.0.get(&id).map(|row| row - now)
+    /// Where `id`'s row is at clock reading `now`, or None once it was
+    /// erased.
+    fn line(&self, id: u64, now: i64) -> Option<RowAt> {
+        self.0.get(&id).map(|row| match row {
+            Some(row) => RowAt::Line(row - now),
+            None => RowAt::Unknown,
+        })
     }
 
     /// Drop the rows a wipe that just landed erased, `now` being the clock
     /// read right after it (the same test as [`RunningCommand::follow_wipe`]).
+    /// A row whose place is unknown stays: its text search says if it went.
     fn follow_wipe(&mut self, wipe: Wipe, now: i64) {
         self.0.retain(|_, row| {
-            let line = *row - now;
-            !((line >= 0 && wipe.screen) || (line < 0 && wipe.hist))
+            row.is_none_or(|row| {
+                let line = row - now;
+                !((line >= 0 && wipe.screen) || (line < 0 && wipe.hist))
+            })
         });
     }
 
@@ -963,45 +980,59 @@ impl CaptureRows {
     /// (short of the scrollback overflowing, which drops the oldest), and
     /// the cursor stays on its line. So a row's place in the list of line
     /// starts counted up from the cursor survives it, and so does a row
-    /// below the cursor. The alternate screen holds the primary grid out of
-    /// reach, so a resize under a full-screen program moves nothing here.
+    /// below the cursor. Under a full-screen program the primary grid is
+    /// re-wrapped too, out of reach behind the alternate screen, so every
+    /// row's place becomes unknown and its entry finds it by its text.
     fn reflow(
         &mut self,
         term: &mut Term<VoidListener>,
         clock: &mut ScrollClock,
         resize: impl FnOnce(&mut Term<VoidListener>),
     ) {
-        if self.0.is_empty() || term.mode().contains(TermMode::ALT_SCREEN) {
+        if self.0.is_empty() {
             resize(term);
+            return;
+        }
+        if term.mode().contains(TermMode::ALT_SCREEN) {
+            resize(term);
+            self.0.values_mut().for_each(|row| *row = None);
             return;
         }
         let now = clock.tick(term);
         let before = line_starts_upward(term);
         let top = i64::from(term.grid().topmost_line().0);
         let cursor = i64::from(term.grid().cursor.point.line.0);
-        // (id, Ok(place among the line starts) | Err(line below the cursor))
-        let held: Vec<(u64, Result<usize, i64>)> = std::mem::take(&mut self.0)
+        // (id, Ok(place among the line starts) | Err(line below the cursor)),
+        // None for a row whose place was already unknown.
+        let held: Vec<(u64, Option<Result<usize, i64>>)> = std::mem::take(&mut self.0)
             .into_iter()
             .filter_map(|(id, row)| {
+                let Some(row) = row else {
+                    return Some((id, None));
+                };
                 let line = row - now;
                 let at = if line > cursor {
                     Err(line)
                 } else {
                     Ok(before.partition_point(|&s| i64::from(s) > line))
                 };
-                (line >= top).then_some((id, at))
+                (line >= top).then_some((id, Some(at)))
             })
             .collect();
         resize(term);
         let now = clock.tick(term);
         let after = line_starts_upward(term);
         for (id, at) in held {
+            let Some(at) = at else {
+                self.0.insert(id, None);
+                continue;
+            };
             let line = match at {
                 Ok(k) => after.get(k).map(|&l| i64::from(l)),
                 Err(line) => Some(line),
             };
             if let Some(line) = line {
-                self.0.insert(id, now + line);
+                self.0.insert(id, Some(now + line));
             }
         }
     }
@@ -3356,7 +3387,10 @@ impl PtyTerminal {
             return (top..=bottom).rev().find(|&line| starts(line));
         };
         let now = self.clock_now(&term);
-        let at = self.capture_rows.lock().unwrap().line(id, now)?;
+        let at = match self.capture_rows.lock().unwrap().line(id, now)? {
+            RowAt::Line(at) => at,
+            RowAt::Unknown => return (top..=bottom).rev().find(|&line| starts(line)),
+        };
         if at < i64::from(top) {
             return None;
         }

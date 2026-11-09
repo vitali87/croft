@@ -3597,7 +3597,7 @@ fn each_capture_of_a_repeated_line_jumps_to_its_own_copy() {
 fn a_capture_that_left_the_scrollback_is_not_stood_in_for_by_its_repeat() {
     // 6000 filler rows push the first copy past the 5000-row scrollback.
     let (_tmp, mut app) = app_with_captures(
-        "echo ${e}-7 broke; seq -f 'filler line %06g' 1 6000; echo ${e}-7 broke",
+        "echo ${e}-7 broke; yes 'filler line' | head -n 6000; echo ${e}-7 broke",
         2,
     );
     let (lines, _) = app.terminals[0].grid_lines();
@@ -3654,6 +3654,54 @@ fn a_resize_that_rewraps_the_output_keeps_each_capture_on_its_own_copy() {
                 "{when}: entry {i} selects its own copy"
             );
         }
+    }
+}
+
+#[test]
+fn a_resize_under_a_full_screen_program_still_finds_each_capture() {
+    // A full-screen program hides the primary grid, but a resize re-wraps
+    // it all the same, out of reach. Each entry then finds its line by its
+    // text instead of saying a line still on screen is gone (#1450).
+    let long = "printf '%0200d\\n' 0";
+    let (_tmp, mut app) = app_with_captures(
+        &format!(
+            "echo ${{e}}-7 broke; echo first; {long}; echo ${{e}}-7 broke; echo second; \
+             {long}; {long}; {long}; printf '\\033[?1049h'; read y; printf '\\033[?1049l'; \
+             echo back"
+        ),
+        2,
+    );
+    let wait = |app: &mut App, what: &str, done: &dyn Fn(&App) -> bool| {
+        crate::test_budget::await_spawned(
+            crate::test_budget::tests::SHELL_PAINT_BASE,
+            what,
+            || {
+                app.drain_terminal_bells();
+                done(app)
+            },
+        );
+    };
+    wait(&mut app, "the full-screen program", &|app| {
+        app.terminals[0].alt_screen()
+    });
+    app.terminals[0].resize(40, 24);
+    app.terminals[0].write_input(b"\n");
+    wait(&mut app, "the shell back on the primary screen", &|app| {
+        !app.terminals[0].alt_screen()
+            && app.terminals[0]
+                .grid_lines()
+                .0
+                .iter()
+                .any(|l| l.trim_end() == "back")
+    });
+    for i in 0..2 {
+        app.captures.select_index(i);
+        app.captures_open_selected();
+        assert!(
+            app.terminals[0].selection_text().contains("err-7 broke"),
+            "entry {i}: {}",
+            app.status
+        );
     }
 }
 
