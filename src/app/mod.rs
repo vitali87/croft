@@ -69423,6 +69423,19 @@ impl App {
             || self.list_picker.is_some()
             || (self.input_prompt.is_none() && self.modal_a11y().is_some());
         if picker && let Some(pos) = self.announce_pos {
+            // A `surfaces` quick input draws no caret of its own and lends
+            // the query the terminal's caret, which the announcement takes
+            // here: paint a block where the typing lands, as boxed themes do.
+            if self.quick_input_owns_caret()
+                && let Some((cx, cy)) = self.quick_input_caret()
+                && frame
+                    .area()
+                    .contains(ratatui::layout::Position { x: cx, y: cy })
+            {
+                frame.buffer_mut()[(cx, cy)]
+                    .modifier
+                    .insert(ratatui::style::Modifier::REVERSED);
+            }
             frame.set_cursor_position(pos);
             return;
         }

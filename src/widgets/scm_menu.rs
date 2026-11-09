@@ -613,7 +613,11 @@ fn render_card(
         true,
     );
     let rows = nodes.len() as u16;
-    let card_h = rows.saturating_add(2).min(screen.height);
+    // The card pads its rows with a row above and below for its rim, but
+    // only while that still fits: on a short terminal every action matters
+    // more than the padding, so the rows take the rim's rows instead.
+    let pad = edge_pad(rows, screen.height);
+    let card_h = (rows + 2 * pad).min(screen.height);
     let card = Rect {
         x: anchor.x.min(screen.x + screen.width.saturating_sub(top_w)),
         y: (anchor.y + anchor.height).min(screen.y + screen.height.saturating_sub(card_h)),
@@ -623,8 +627,8 @@ fn render_card(
     paint_card(buf, card, theme, t);
     let hover = state.hover;
     for (i, node) in nodes.iter().enumerate() {
-        let row_y = card.y + 1 + i as u16;
-        if row_y + 1 >= card.bottom() {
+        let row_y = card.y + pad + i as u16;
+        if row_y + pad >= card.bottom() {
             break;
         }
         let row = Rect::new(card.x, row_y, card.width, 1);
@@ -657,21 +661,22 @@ fn render_card(
         } else {
             card.x.saturating_sub(sub_w)
         };
-        let sub_h = (items.len() as u16).saturating_add(2).min(screen.height);
+        let sub_pad = edge_pad(items.len() as u16, screen.height);
+        let sub_h = (items.len() as u16 + 2 * sub_pad).min(screen.height);
         // Level the fly-out's first row with its parent row.
-        let parent_y = card.y + 1 + i as u16;
+        let parent_y = card.y + pad + i as u16;
         let sub = Rect {
             x: sub_x,
             y: parent_y
-                .saturating_sub(1)
+                .saturating_sub(sub_pad)
                 .min(screen.y + screen.height.saturating_sub(sub_h)),
             width: sub_w,
             height: sub_h,
         };
         paint_card(buf, sub, theme, t);
         for (j, l) in items.iter().enumerate() {
-            let row_y = sub.y + 1 + j as u16;
-            if row_y + 1 >= sub.bottom() {
+            let row_y = sub.y + sub_pad + j as u16;
+            if row_y + sub_pad >= sub.bottom() {
                 break;
             }
             let row = Rect::new(sub.x, row_y, sub.width, 1);
@@ -679,6 +684,12 @@ fn render_card(
             paint_card_row(buf, row, t, l.icon, l.label, false, lit, false);
             state.sub_hits.push((row, l.action));
         }
+    }
+
+    /// The rim rows a card of `rows` items gets above and below them: one
+    /// while the padded card fits the screen's height, else none.
+    fn edge_pad(rows: u16, height: u16) -> u16 {
+        u16::from(rows.saturating_add(2) <= height)
     }
 
     /// Clear `card`, fill it with the raised tone and draw its edge.
@@ -933,6 +944,34 @@ mod tests {
             st.click(pull.x + 4, pull.y),
             ClickOutcome::Fire(ScmAction::Pull)
         );
+    }
+
+    /// On a terminal too short for the padded card, Croft Loch's menu gives
+    /// its rim rows to the actions: every row the boxed menu reaches stays
+    /// reachable on the card too.
+    #[test]
+    fn croft_loch_keeps_every_action_reachable_on_a_short_terminal() {
+        let rows = menu_for(None).len() as u16;
+        let screen = Rect::new(0, 0, 120, rows + 1);
+        let anchor = Rect::new(10, 0, 2, 1);
+        let hits = |theme| {
+            let mut st = ScmMenuState {
+                open: true,
+                ..Default::default()
+            };
+            let mut buf = Buffer::empty(screen);
+            render(&mut st, anchor, screen, &mut buf, theme);
+            st.top_hits.len()
+        };
+        assert_eq!(
+            hits(crate::theme::Theme::from_id("loch")),
+            menu_for(None)
+                .iter()
+                .filter(|n| !matches!(n, Node::Sep))
+                .count(),
+            "no action clipped"
+        );
+        assert!(hits(crate::theme::Theme::from_id("loch")) >= hits(crate::theme::Theme::BLACK));
     }
 
     #[test]

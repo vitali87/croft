@@ -24128,9 +24128,11 @@ impl Widget for &mut EditorTabs {
             .zip(&self.editors)
             .map(|(label, ed)| {
                 // The menus, status line and screen reader keep the `● `
-                // prefix (`tab_display_label`); only the strip drops it.
+                // prefix (`tab_display_label`); only the strip drops it, and
+                // only where the close slot shows the dot instead: a pinned
+                // tab's slot holds the pin, so its label keeps the prefix.
                 match label.strip_prefix("\u{25cf} ") {
-                    Some(rest) if tones.is_some() && ed.dirty => rest.to_string(),
+                    Some(rest) if tones.is_some() && ed.dirty && !ed.pinned => rest.to_string(),
                     _ => label,
                 }
             })
@@ -38785,6 +38787,30 @@ mod tests {
         assert_eq!(
             buf[(t.tab_screen_x(0).unwrap().0 + 1, 0)].symbol(),
             "\u{25cf}"
+        );
+    }
+
+    /// A pinned tab's close slot holds its pin, so on Croft Loch a dirty
+    /// pinned tab keeps the dot in front of its label: editing it never
+    /// makes it look saved.
+    #[test]
+    fn a_loch_dirty_pinned_tab_keeps_its_dot_beside_the_pin() {
+        let (mut t, _) = loch_tab_pair(true);
+        t.editors[0].pinned = true;
+        t.editors[0].dirty = true;
+        let mut buf = Buffer::empty(Rect::new(0, 0, 80, 10));
+        let area = buf.area;
+        (&mut t).render(area, &mut buf);
+        let (x0, _) = t.tab_screen_x(0).unwrap();
+        assert_eq!(
+            buf[(t.close_screen_x(0).unwrap(), 0)].symbol(),
+            "\u{f08d}",
+            "the pin keeps the close slot"
+        );
+        assert_eq!(
+            buf[(x0 + 3, 0)].symbol(),
+            "\u{25cf}",
+            "the dot leads the label"
         );
     }
 

@@ -390,6 +390,37 @@ fn the_palette_owns_the_caret_while_it_is_open() {
     }
 }
 
+/// Screen reader mode parks the terminal's caret on the picker's
+/// announcement, so on Croft Loch, whose query has no caret of its own, a
+/// block marks where the typing lands instead of the query losing its caret.
+#[test]
+fn a_screen_reader_keeps_a_visible_caret_in_the_loch_palette_query() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.screen_reader = true;
+    app.open_command_palette();
+    for c in "tog".chars() {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+            .unwrap();
+    }
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let (cx, cy) = app
+        .quick_input_caret()
+        .expect("Loch hands the query a caret");
+    let buf = term.backend().buffer();
+    assert!(
+        buf[(cx, cy)].modifier.contains(Modifier::REVERSED),
+        "the query's caret is painted while the announcement has the terminal's"
+    );
+    let parked = term.get_cursor_position().unwrap();
+    assert_eq!(
+        Some((parked.x, parked.y)),
+        app.announce_pos,
+        "the terminal's caret stays on the announcement"
+    );
+}
+
 /// Croft Loch dims the screen behind a quick input, except where the
 /// terminal draws inline images, which are baked and would stay lit.
 #[test]

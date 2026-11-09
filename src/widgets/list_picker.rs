@@ -458,6 +458,14 @@ fn render_picker_card(
     }
     let filtering = !picker.query.trim().is_empty();
     let count = qi::count_label(total, filtering, false, "item", "items");
+    // The title is the placeholder, which typing hides; while filtering it
+    // rides beside the count instead, so a picker whose title is its
+    // operation (Apply Stash vs Pop Stash) never loses saying which it is.
+    let count = if filtering && !picker.title.is_empty() {
+        format!("{} \u{b7} {count}", picker.title)
+    } else {
+        count
+    };
     picker.last_caret = qi::paint_card(
         buf,
         &card,
@@ -615,6 +623,26 @@ mod tests {
             crate::widgets::surface::ROW_BAR
         );
         assert_eq!(p.last_caret, Some((r.x + 4, r.y + 1)));
+    }
+
+    /// A Loch picker's title is its placeholder, so once the user types it
+    /// moves beside the count: Pop Stash never reads like Apply Stash.
+    #[test]
+    fn croft_loch_picker_keeps_its_title_while_filtering() {
+        let theme = crate::theme::Theme::from_id("loch");
+        let mut p = ListPicker::new(ListPurpose::CodeAction, "Pop Stash", rows());
+        for c in "stash".chars() {
+            p.push_char(c);
+        }
+        let screen = Rect::new(0, 0, 80, 30);
+        let mut buf = Buffer::empty(screen);
+        render_list_picker(&mut p, screen, &mut buf, theme, false);
+        let r = p.last_rect;
+        let line: String = (r.x..r.right())
+            .map(|x| buf[(x, r.y + 1)].symbol().to_string())
+            .collect();
+        assert!(line.contains("stash"), "{line:?}");
+        assert!(line.contains("Pop Stash \u{b7} "), "{line:?}");
     }
 
     #[test]
