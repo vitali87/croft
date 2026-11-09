@@ -400,6 +400,7 @@ fn file_node(path: &Path) -> crate::widgets::file_tree::Node {
         is_dir: false,
         expanded: false,
         loaded: false,
+        folded: 0,
     }
 }
 

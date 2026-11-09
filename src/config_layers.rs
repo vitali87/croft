@@ -135,6 +135,7 @@ pub const WORKSPACE_ALLOWED_KEYS: &[&str] = &[
     "copy_on_select",
     "disable_log_highlight",
     "explorer_views",
+    "disable_compact_folders",
     "files_exclude",
     "search_exclude",
     "files_associations",

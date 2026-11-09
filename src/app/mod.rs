@@ -8314,6 +8314,8 @@ impl App {
         // The agent review queue as this workspace last left it (#345).
         let root = app.workspace_root().to_path_buf();
         app.apply_project_excludes(&loaded_prefs);
+        app.tree
+            .set_compact_folders(!loaded_prefs.disable_compact_folders);
         app.apply_file_associations(&loaded_prefs);
         app.apply_files_encoding(&loaded_prefs);
         app.watch_project_snippets();
@@ -69345,10 +69347,12 @@ impl App {
                 let (focus, item) = match self.sidebar_view {
                     SidebarView::Explorer => (
                         tr("Explorer"),
+                        // The row's label, so a compact row (#1486) reads
+                        // as shown, `src/main/java`, not its last folder.
                         self.tree
-                            .selected_path()
-                            .and_then(|p| p.file_name())
-                            .map(|n| n.to_string_lossy().into_owned()),
+                            .nodes
+                            .get(self.tree.selected)
+                            .map(crate::widgets::file_tree::Node::label),
                     ),
                     SidebarView::Search => self.search_a11y(),
                     SidebarView::SourceControl => self.source_control_a11y(),
@@ -71478,6 +71482,7 @@ impl App {
         self.auto_save_on_focus_change = p.auto_save_on_focus_change;
         self.copy_on_select = p.copy_on_select;
         self.apply_project_excludes(p);
+        self.tree.set_compact_folders(!p.disable_compact_folders);
         self.apply_file_associations(p);
         self.apply_files_encoding(p);
         // The ssh-pane offer's switches apply live like every other pref
