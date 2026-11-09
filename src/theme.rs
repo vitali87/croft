@@ -44,6 +44,11 @@ pub const VSCODE_ANSI: [(u8, u8, u8); 16] = [
     (0xe5, 0xe5, 0xe5),
 ];
 
+/// Logo orange (#e97c41), sampled from `assets/logo.png`: the colour of the
+/// `<>` angle brackets in the "cr<>ft" wordmark. Also the Extensions panel's
+/// trash button — the warm complement to the teal brand gradient.
+pub(crate) const BRAND_ORANGE: Color = Color::Rgb(0xe9, 0x7c, 0x41);
+
 /// The eight syntax-highlight colors a theme paints code with, shared by the
 /// tree-sitter highlighter and the LSP semantic-token overlay (both funnel
 /// through `highlight::style_for_name`). Grouped by role the way editor themes
@@ -463,6 +468,7 @@ impl Theme {
         };
         rgb(match self.surfaces_role((r, g, b), s) {
             Some(c) => c,
+            None if DIFF_ROW_FILLS.contains(&(r, g, b)) => (r, g, b),
             None if r.max(g).max(b) - r.min(g).min(b) < 0x30 => cool_grey((r, g, b)),
             None => (r, g, b),
         })
@@ -526,7 +532,7 @@ impl Theme {
             },
         };
         let (hi, lo) = (c.0.max(c.1).max(c.2), c.0.min(c.1).min(c.2));
-        let grey = hi - lo < 0x30;
+        let grey = hi - lo < 0x30 && !DIFF_ROW_FILLS.contains(&c);
         let fill = if light {
             luma(c) > 155.0
         } else {
@@ -540,6 +546,14 @@ impl Theme {
         })
     }
 }
+
+/// The diff view's removed (red) and added (green) row fills (#2020). They
+/// are dark, so their hues sit closer together than the grey tests in
+/// [`Theme::ui`] allow and read to them as greys: a `surfaces` theme turned
+/// both into its neutral grey, and a high contrast one into its background,
+/// which left the diff black and white. The red and the green are what say a
+/// line was removed or added, so every dark theme keeps them.
+const DIFF_ROW_FILLS: [(u8, u8, u8); 2] = [(0x4a, 0x1f, 0x1f), (0x1f, 0x42, 0x2a)];
 
 /// The light-theme half of [`Theme::ui`]: the dark chrome vocabulary
 /// mapped onto VS Code Light Modern.
@@ -1835,6 +1849,37 @@ mod tests {
             Color::DarkGray,
         ] {
             assert_eq!(loch.ui(c), c);
+        }
+    }
+
+    /// #2020: the diff's removed and added rows stay red and green under
+    /// the default theme and high contrast, instead of turning grey.
+    #[test]
+    fn diff_rows_keep_their_red_and_green_in_every_dark_theme() {
+        let red = Color::Rgb(0x4a, 0x1f, 0x1f);
+        let green = Color::Rgb(0x1f, 0x42, 0x2a);
+        for t in [
+            Theme::default(),
+            Theme::LOCH,
+            Theme::DARK_BLUE,
+            Theme::from_id("hc-black"),
+        ] {
+            let Color::Rgb(r, g, b) = t.ui(red) else {
+                panic!("{}: an RGB fill", t.label());
+            };
+            assert!(
+                r > g + 0x20 && r > b + 0x20,
+                "{}: removed reads red",
+                t.label()
+            );
+            let Color::Rgb(r, g, b) = t.ui(green) else {
+                panic!("{}: an RGB fill", t.label());
+            };
+            assert!(
+                g > r + 0x20 && g > b + 0x10,
+                "{}: added reads green",
+                t.label()
+            );
         }
     }
 

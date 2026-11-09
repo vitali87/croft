@@ -877,6 +877,47 @@ fn install_fallback_proceeds_only_on_an_explicit_yes() {
     }
 }
 
+/// #950 review: a yes is not taken while the window is too short to show
+/// what a remote compile installs and the answer box under it; once the
+/// whole question has been drawn, it is.
+#[test]
+fn install_fallback_holds_a_yes_until_the_notes_have_been_shown() {
+    use crate::widgets::connect_dialog::{ConnectDialog, DialogPhase};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let mut dialog = ConnectDialog::new("devbox".to_string());
+    dialog.set_fallback_prompt(
+        "no cross toolchain",
+        &crate::remote::REMOTE_COMPILE_SIDE_EFFECTS,
+    );
+    app.connect_dialog = Some(dialog);
+    let render = |app: &mut App, h: u16| {
+        let area = Rect::new(0, 0, 80, h);
+        let mut buf = ratatui::buffer::Buffer::empty(area);
+        ratatui::widgets::Widget::render(app.connect_dialog.as_mut().unwrap(), area, &mut buf);
+    };
+    let answer_y = |app: &mut App| {
+        app.handle_connect_dialog_key(key(KeyCode::Char('y'), KeyModifiers::NONE));
+        app.handle_connect_dialog_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    };
+    render(&mut app, 12);
+    answer_y(&mut app);
+    let dialog = app.connect_dialog.as_ref().expect("still asking");
+    assert_eq!(dialog.phase, DialogPhase::AwaitingFallbackConfirmation);
+    assert!(
+        dialog
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("taller"))
+    );
+    render(&mut app, 30);
+    answer_y(&mut app);
+    assert_eq!(
+        app.connect_dialog.as_ref().unwrap().phase,
+        DialogPhase::Installing
+    );
+}
+
 #[test]
 fn install_fallback_declines_and_tears_down_on_anything_else() {
     let tmp = tempfile::tempdir().unwrap();

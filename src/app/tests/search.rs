@@ -956,6 +956,144 @@ fn double_clicking_a_search_hit_pins_the_tab_so_the_next_hit_opens_beside_it() {
     );
 }
 
+/// #2008: a result row names only the file, so hits in same-named files read
+/// the same. Resting the pointer on a row arms a hint with that hit's full
+/// path, and moving to the next row re-arms it with the other file's.
+#[test]
+fn resting_on_a_search_result_arms_a_hint_with_its_full_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    for dir in ["one", "two"] {
+        std::fs::create_dir_all(tmp.path().join(dir)).unwrap();
+        std::fs::write(tmp.path().join(dir).join("mod.rs"), "needle\n").unwrap();
+    }
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::Search);
+    app.search.query = String::from("needle");
+    app.search.run_query();
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let rows: Vec<(u16, u16)> = {
+        let buf = term.backend().buffer();
+        (0..buf.area.height)
+            .filter_map(|y| {
+                let line: String = (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().to_string())
+                    .collect();
+                line.find(" mod.rs:1:")
+                    .map(|at| (line[..at].chars().count() as u16 + 2, y))
+            })
+            .collect()
+    };
+    assert_eq!(rows.len(), 2, "precondition: one row per mod.rs");
+    let canon = |dir: &str| {
+        let path = &app.search.hits[usize::from(dir == "two")].path;
+        assert!(path.ends_with(format!("{dir}/mod.rs")));
+        path.display().to_string()
+    };
+    let (one, two) = (canon("one"), canon("two"));
+
+    point_at(&mut app, rows[0]);
+    assert_eq!(app.ui_tooltip_label.as_deref(), Some(one.as_str()));
+    point_at(&mut app, rows[1]);
+    assert_eq!(app.ui_tooltip_label.as_deref(), Some(two.as_str()));
+
+    // Hidden behind a closed side bar, the rows it last drew have no hint.
+    app.show_tree = false;
+    point_at(&mut app, rows[0]);
+    assert_eq!(app.ui_tooltip_label, None);
+}
+
+fn point_at(app: &mut App, (column, row): (u16, u16)) {
+    app.handle_mouse(crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::Moved,
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    });
+}
+
+/// #2008: the rows move under a pointer that rests on one, as hits stream in
+/// or the list scrolls, and empty when the search is cleared. The hint
+/// follows the row under the pointer, not the file that was there.
+#[test]
+fn a_search_result_hint_follows_the_rows_that_move_under_a_resting_pointer() {
+    use crate::widgets::search::{SearchEvent, SearchHit};
+    let tmp = tempfile::tempdir().unwrap();
+    let hit = |name: &str| SearchHit {
+        path: tmp.path().join(name).join("mod.rs"),
+        line_no: 1,
+        line_text: String::from("needle"),
+        matches: 1,
+    };
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::Search);
+    app.search.query = String::from("needle");
+    app.search
+        .add_hits((0..60).map(|i| hit(&format!("f{i:02}"))).collect());
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let inner = app.search.last_inner;
+    let cell = (inner.x + 3, inner.y + app.search.results_start_offset + 2);
+    let row_path = |app: &App| {
+        app.search.hits[app.search.scroll + 2]
+            .path
+            .display()
+            .to_string()
+    };
+    point_at(&mut app, cell);
+    assert_eq!(
+        app.ui_tooltip_label.as_deref(),
+        Some(row_path(&app).as_str())
+    );
+
+    // The wheel scrolls another file under the pointer.
+    app.handle_mouse(crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::ScrollDown,
+        column: cell.0,
+        row: cell.1,
+        modifiers: KeyModifiers::NONE,
+    });
+    assert!(app.search.scroll > 0, "precondition: the list scrolled");
+    app.poll_ui_tooltip();
+    assert_eq!(
+        app.ui_tooltip_label.as_deref(),
+        Some(row_path(&app).as_str())
+    );
+
+    // A file that sorts first streams in and shifts every row down one.
+    let before = row_path(&app);
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.search_results_rx = rx;
+    tx.send(SearchEvent::Hits(
+        app.search.query.clone(),
+        app.search.opts,
+        vec![hit("a")],
+    ))
+    .unwrap();
+    assert!(app.drain_search_results());
+    app.poll_ui_tooltip();
+    assert_ne!(row_path(&app), before);
+    assert_eq!(
+        app.ui_tooltip_label.as_deref(),
+        Some(row_path(&app).as_str())
+    );
+
+    // Cleared, as a new workspace root clears it: nothing is under it.
+    app.search.hits.clear();
+    app.search.scroll = 0;
+    app.poll_ui_tooltip();
+    assert_eq!(app.ui_tooltip_label, None);
+
+    // A hit that fills the empty row under the pointer gets its hint.
+    app.search
+        .add_hits((0..5).map(|i| hit(&format!("g{i}"))).collect());
+    app.poll_ui_tooltip();
+    assert_eq!(
+        app.ui_tooltip_label.as_deref(),
+        Some(row_path(&app).as_str())
+    );
+}
+
 // --- Split editor (side-by-side panes) -----------------------------------
 
 /// Seeding the Search panel from a terminal command must describe THAT
@@ -2766,4 +2904,51 @@ fn a_click_on_the_find_bar_puts_the_caret_under_it() {
         3,
     ));
     assert_eq!(app.editor_find.as_ref().unwrap().caret(), 2);
+}
+
+/// #1729: the find bar takes the keys only while the editor has focus, so a
+/// click on it from another pane moves focus to the editor as well, or what
+/// is typed next would go to the pane that kept it.
+#[test]
+fn a_click_on_the_find_bar_from_another_pane_focuses_the_editor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let mut find = crate::widgets::editor_find::EditorFind::new(
+        String::from("needle"),
+        crate::widgets::search::SearchOpts::default(),
+    );
+    find.last_rect = ratatui::layout::Rect {
+        x: 10,
+        y: 2,
+        width: 48,
+        height: 3,
+    };
+    app.editor_find = Some(find);
+    app.focus = Pane::Tree;
+    app.handle_mouse(mouse(
+        crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+        15,
+        3,
+    ));
+    assert!(
+        app.focus == Pane::Editor,
+        "the click moved focus to the editor"
+    );
+    assert_eq!(app.editor_find.as_ref().unwrap().caret(), 2);
+}
+
+/// #1729: a whole-query replacement longer than the query it replaces puts
+/// the caret at its end, not where the old query ended.
+#[test]
+fn a_longer_whole_query_puts_the_find_caret_at_its_end() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor_find = Some(crate::widgets::editor_find::EditorFind::new(
+        String::from("ab"),
+        crate::widgets::search::SearchOpts::default(),
+    ));
+    app.editor_find_set_query(String::from("abcdef"));
+    let st = app.editor_find.as_ref().unwrap();
+    assert_eq!(st.query, "abcdef");
+    assert_eq!(st.caret(), 6);
 }

@@ -1325,3 +1325,238 @@ fn go_and_lint_rows_reach_problems_only_for_real_files() {
         ]
     );
 }
+
+/// Seed the build-diagnostic store the way a finished build does.
+fn seed_build_rows(app: &mut App, rows: &[(&std::path::Path, u32, u32, &str)]) {
+    use crate::lsp::manager::DiagnosticSeverity;
+    for (path, line, col, msg) in rows {
+        app.build_diagnostics
+            .entry(path.to_path_buf())
+            .or_default()
+            .push((
+                1,
+                crate::widgets::problems::ProblemItem {
+                    line: *line,
+                    col: *col,
+                    col_utf16: false,
+                    severity: DiagnosticSeverity::Warning,
+                    message: (*msg).to_string(),
+                    source: String::from("build"),
+                    code: None,
+                },
+            ));
+    }
+    app.rebuild_problems();
+}
+
+#[test]
+fn go_to_next_and_previous_problem_walk_the_build_messages_across_files_and_wrap() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.c");
+    let b = tmp.path().join("b.c");
+    std::fs::write(&a, "int a;\nint b;\nint c;\n").unwrap();
+    std::fs::write(&b, "int d;\nint e;\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    seed_build_rows(
+        &mut app,
+        &[(&a, 0, 4, "one"), (&a, 2, 1, "two"), (&b, 1, 2, "three")],
+    );
+    let next = Command::from_id("next_problem").expect("next_problem id");
+    let prev = Command::from_id("previous_problem").expect("previous_problem id");
+
+    // Nothing open: the first entry.
+    app.run_command(next);
+    assert_eq!(app.editor.path.as_deref(), Some(a.as_path()));
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (0, 4));
+    assert!(app.status.contains("Problem 1/3"), "{}", app.status);
+    assert!(app.status.contains("one"), "{}", app.status);
+    // On an entry: the next one, then across the file boundary, then wrap.
+    app.run_command(next);
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (2, 1));
+    app.run_command(next);
+    assert_eq!(app.editor.path.as_deref(), Some(b.as_path()));
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (1, 2));
+    app.run_command(next);
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(a.as_path()),
+        "wraps to the first"
+    );
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (0, 4));
+    // And back, wrapping to the last.
+    app.run_command(prev);
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(b.as_path()),
+        "wraps to the last"
+    );
+    app.run_command(prev);
+    assert_eq!(app.editor.path.as_deref(), Some(a.as_path()));
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (2, 1));
+}
+
+#[test]
+fn go_to_next_problem_between_entries_and_with_none() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.c");
+    std::fs::write(&a, "int a;\nint b;\nint c;\nint d;\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let next = Command::from_id("next_problem").unwrap();
+    app.run_command(next);
+    assert_eq!(app.status, "No problems");
+    seed_build_rows(&mut app, &[(&a, 1, 0, "x"), (&a, 3, 0, "y")]);
+    app.editor.open_pinned(&a).unwrap();
+    app.editor.cursor_row = 2;
+    app.editor.cursor_col = 0;
+    app.run_command(next);
+    assert_eq!(app.editor.cursor_row, 3, "the first entry after the caret");
+    app.editor.cursor_row = 0;
+    app.run_command(Command::from_id("previous_problem").unwrap());
+    assert_eq!(
+        app.editor.cursor_row, 3,
+        "before the first wraps to the last"
+    );
+}
+
+/// An entry past its line's end leaves the caret clamped short of it, and
+/// entries can share a position: repeating Next Problem still walks every
+/// entry instead of picking the same one again.
+#[test]
+fn go_to_next_problem_walks_past_an_entry_beyond_its_line_and_shared_positions() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.c");
+    std::fs::write(&a, "int a;\nint b;\nint c;\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    seed_build_rows(
+        &mut app,
+        &[
+            (&a, 0, 50, "past the end"),
+            (&a, 2, 1, "first here"),
+            (&a, 2, 1, "second here"),
+        ],
+    );
+    let next = Command::from_id("next_problem").unwrap();
+    app.run_command(next);
+    assert!(app.status.contains("past the end"), "{}", app.status);
+    assert_eq!(app.editor.cursor_row, 0);
+    app.run_command(next);
+    assert!(app.status.contains("first here"), "{}", app.status);
+    app.run_command(next);
+    assert!(app.status.contains("second here"), "{}", app.status);
+    app.run_command(next);
+    assert!(app.status.contains("past the end"), "wraps: {}", app.status);
+}
+
+/// Repeated Next Problem visits every entry once per round, whichever file
+/// is open: an LSP row's UTF-16 column and a build row's character column
+/// order differently on a line with astral characters, and the walk's order
+/// must not change when that file opens, or a step from the remembered
+/// entry passes over the rows that moved.
+#[test]
+fn go_to_next_problem_visits_every_entry_once_around_mixed_columns() {
+    use crate::lsp::manager::DiagnosticSeverity;
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.c");
+    let b = tmp.path().join("b.c");
+    std::fs::write(&a, "\u{1f600}\u{1f600}abc\n").unwrap();
+    std::fs::write(&b, "int b;\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let row = |col: u32, col_utf16: bool, msg: &str| {
+        (
+            1,
+            crate::widgets::problems::ProblemItem {
+                line: 0,
+                col,
+                col_utf16,
+                severity: DiagnosticSeverity::Warning,
+                message: msg.to_string(),
+                source: String::from("build"),
+                code: None,
+            },
+        )
+    };
+    // In a.c, `b` is character 3 and UTF-16 column 4 is character 2.
+    app.build_diagnostics
+        .entry(a.clone())
+        .or_default()
+        .extend([row(3, false, "at b"), row(4, true, "at a")]);
+    app.build_diagnostics
+        .entry(b.clone())
+        .or_default()
+        .push(row(0, false, "in b.c"));
+    app.rebuild_problems();
+    let next = Command::from_id("next_problem").unwrap();
+    let mut seen = Vec::new();
+    for _ in 0..3 {
+        app.run_command(next);
+        seen.push(app.status.clone());
+    }
+    for msg in ["at a", "at b", "in b.c"] {
+        assert_eq!(
+            seen.iter().filter(|s| s.contains(msg)).count(),
+            1,
+            "{msg} once in a round: {seen:?}"
+        );
+    }
+}
+
+/// An entry whose file no longer opens is passed over instead of holding
+/// every repeat of Next Problem on itself; when no entry opens, the failure
+/// is reported.
+#[test]
+fn go_to_next_problem_passes_over_an_entry_whose_file_is_gone() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let gone = tmp.path().join("a_gone.c");
+    let b = tmp.path().join("b.c");
+    std::fs::write(&b, "int b;\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    seed_build_rows(&mut app, &[(&gone, 0, 1, "lost"), (&b, 0, 4, "found")]);
+    let next = Command::from_id("next_problem").unwrap();
+    app.run_command(next);
+    assert_eq!(
+        app.editor.path.as_deref(),
+        Some(b.as_path()),
+        "{}",
+        app.status
+    );
+    assert!(app.status.contains("found"), "{}", app.status);
+    std::fs::remove_file(&b).unwrap();
+    let mut alone = App::new(tmp.path().to_path_buf()).unwrap();
+    seed_build_rows(&mut alone, &[(&gone, 0, 1, "lost")]);
+    alone.run_command(next);
+    assert!(alone.status.starts_with("Open failed"), "{}", alone.status);
+}
+
+/// A watch task's batch is installed without a finished command's scan, and
+/// still gets the `build_column_unit` conversion: a gcc display column on a
+/// tabbed line lands on the character it names.
+#[test]
+fn a_watch_batch_gets_the_build_column_conversion() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("t.c"), "{\n\t\t\tint u;\n}\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let row = crate::build_matchers::BuildDiag {
+        file: String::from("t.c"),
+        line: 1,
+        // Three tabs at stop 8 put `u` on display column 28.
+        col: 28,
+        severity: crate::lsp::manager::DiagnosticSeverity::Warning,
+        message: String::from("unused"),
+        source: String::from("build"),
+        needs_file: false,
+    };
+    app.install_build_diags(
+        7,
+        Some(tmp.path()),
+        vec![row],
+        crate::build_matchers::DEFAULT_TABSTOP,
+    );
+    let rows = &app.build_diagnostics[&tmp.path().join("t.c")];
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].1.col, 7, "display column 28 is the `u`, char 7");
+}

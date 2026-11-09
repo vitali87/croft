@@ -324,6 +324,18 @@ fn run_spec_for_node_picks_node_for_dot_js() {
 }
 
 #[test]
+fn run_spec_for_typescript_modules_picks_tsx_as_for_dot_ts() {
+    // #1162: `.mts` / `.cts` are TypeScript, so Run starts them with `tsx`.
+    let tmp = tempfile::tempdir().unwrap();
+    for name in ["mod.ts", "mod.mts", "mod.cts"] {
+        let f = tmp.path().join(name);
+        std::fs::write(&f, b"").unwrap();
+        let spec = App::run_spec_for(&f, tmp.path()).unwrap();
+        assert_eq!(spec.program, "tsx", "{name}");
+    }
+}
+
+#[test]
 fn run_spec_for_bash_picks_bash_for_dot_sh() {
     let tmp = tempfile::tempdir().unwrap();
     let f = tmp.path().join("build.sh");
@@ -1173,7 +1185,12 @@ fn a_task_problem_matcher_owns_its_pane_and_watch_publishes_win() {
     // A watch publish replaces the pane's batch wholesale — and the
     // watcher's own exit (a FinishedCommand rescan over its whole
     // history) must not resurrect old cycles: that one scan is skipped.
-    assert!(app.install_build_diags(7, Some(&cwd), Vec::new()));
+    assert!(app.install_build_diags(
+        7,
+        Some(&cwd),
+        Vec::new(),
+        crate::build_matchers::DEFAULT_TABSTOP
+    ));
     assert!(app.problems.groups().is_empty(), "empty batch clears");
     app.watch_published_panes.insert(7);
     assert!(

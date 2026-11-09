@@ -47,10 +47,11 @@ pub fn choices(key: &str) -> Option<Vec<String>> {
         // An enum: free text such as `enabled` was saved and then ignored.
         "code_scanning" => &["off", "on", "prompt"],
         "locale" => {
-            let langs = crate::i18n::languages(&crate::prefs::config_dir());
+            let langs = crate::i18n::languages(&crate::paths::config_dir());
             return Some(std::iter::once(String::new()).chain(langs).collect());
         }
         "problems_project_scope" => &["auto", "on", "off"],
+        "build_column_unit" => &["display", "byte", "char"],
         "diff_ignore_whitespace" => &["off", "leading", "all"],
         "render_whitespace" => &["selection", "all", "none"],
         "line_numbers" => &["on", "relative", "interval", "off"],
@@ -269,7 +270,7 @@ pub fn remove_key(text: &str, key: &str, platform: &str) -> Result<Option<String
     if text.trim().is_empty() {
         return Ok(None);
     }
-    let mut map = match serde_json::from_str::<Value>(&crate::tasks::strip_jsonc(text)) {
+    let mut map = match serde_json::from_str::<Value>(&crate::jsonc::strip_jsonc(text)) {
         Ok(Value::Object(m)) => m,
         Ok(_) => return Err(String::from("the settings file is not a JSON object")),
         Err(e) => return Err(format!("the settings file does not parse: {e}")),

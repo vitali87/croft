@@ -94,22 +94,34 @@ fn cluster_floor(text: &str, at: usize) -> usize {
     start
 }
 
-/// Whether the char at `i` is part of a word. A combining mark or variation
-/// selector takes the class of the char it follows, as in the editor, so a
-/// word walk never stops between `e` and its accent.
-fn is_word(chars: &[char], i: usize) -> bool {
-    crate::widgets::editor::word_char_at(chars, i)
+/// Whether each char of `text` is part of a word. A combining mark or
+/// variation selector takes the class of the char it follows, as in the
+/// editor's `word_char_at`, so a word walk never stops between `e` and its
+/// accent. One forward pass: asking `word_char_at` char by char rescans a run
+/// of marks back to its base each time, which a long pasted run of them makes
+/// quadratic.
+fn word_flags(text: &str) -> Vec<bool> {
+    let joins = |c: char| !c.is_control() && unicode_width::UnicodeWidthChar::width(c) == Some(0);
+    let mut flags: Vec<bool> = Vec::with_capacity(text.len());
+    for c in text.chars() {
+        let flag = match flags.last() {
+            Some(&prev) if joins(c) => prev,
+            _ => crate::widgets::editor::is_word_char(c),
+        };
+        flags.push(flag);
+    }
+    flags
 }
 
 /// Where a word walk ends when moving left from `at`: back over a run of
 /// non-word characters first, then over the word, as a text field walks.
 fn word_start_before(text: &str, at: usize) -> usize {
-    let chars: Vec<char> = text.chars().collect();
-    let mut i = at.min(chars.len());
-    while i > 0 && !is_word(&chars, i - 1) {
+    let word = word_flags(text);
+    let mut i = at.min(word.len());
+    while i > 0 && !word[i - 1] {
         i -= 1;
     }
-    while i > 0 && is_word(&chars, i - 1) {
+    while i > 0 && word[i - 1] {
         i -= 1;
     }
     cluster_floor(text, i)
@@ -117,15 +129,15 @@ fn word_start_before(text: &str, at: usize) -> usize {
 
 /// Where a word walk ends when moving right from `at`.
 fn word_end_after(text: &str, at: usize) -> usize {
-    let chars: Vec<char> = text.chars().collect();
-    let mut i = at.min(chars.len());
-    while i < chars.len() && !is_word(&chars, i) {
+    let word = word_flags(text);
+    let mut i = at.min(word.len());
+    while i < word.len() && !word[i] {
         i += 1;
     }
-    while i < chars.len() && is_word(&chars, i) {
+    while i < word.len() && word[i] {
         i += 1;
     }
-    cluster_floor(text, i).max(at.min(chars.len()))
+    cluster_floor(text, i).max(at.min(word.len()))
 }
 
 /// `caret` one step left in `text`, by a word when `word`.
@@ -162,7 +174,18 @@ pub fn insert_at(text: &str, caret: usize, add: &str) -> (String, usize) {
     out.push_str(&text[..b]);
     out.push_str(&added);
     out.push_str(&text[b..]);
-    (out, at + char_len(&added))
+    // What was inserted can join the text after it into one cluster (an `e`
+    // typed before a lone combining accent): the caret then goes after that
+    // cluster, never inside it, where the next edit's clamp would pull it
+    // back before the inserted text.
+    let end = at + char_len(&added);
+    let floor = cluster_floor(&out, end);
+    let caret = if floor == end {
+        end
+    } else {
+        cluster_after(&out, floor)
+    };
+    (out, caret)
 }
 
 /// `text` without the cluster (or, with `word`, the run) before `caret`, and
@@ -399,6 +422,26 @@ mod tests {
         let t = "e\u{301}x y";
         assert_eq!(caret_right(t, 0, true), 3);
         assert_eq!(caret_left(t, 3, true), 0);
+    }
+
+    #[test]
+    fn word_flags_classify_as_the_editor_does() {
+        let t = "e\u{301}x \u{301}y-\u{FE0F}_z";
+        let chars: Vec<char> = t.chars().collect();
+        let want: Vec<bool> = (0..chars.len())
+            .map(|i| crate::widgets::editor::word_char_at(&chars, i))
+            .collect();
+        assert_eq!(word_flags(t), want);
+    }
+
+    #[test]
+    fn typing_before_a_lone_accent_puts_the_caret_after_the_cluster_it_makes() {
+        // "e" typed before U+0301 becomes one cluster, "é": the caret goes
+        // after it, so the next char lands after the accent, not before "e".
+        let (t, c) = insert_at("\u{301}x", 0, "e");
+        assert_eq!((t.as_str(), c), ("e\u{301}x", 2));
+        let (t, c) = insert_at(&t, c, "d");
+        assert_eq!((t.as_str(), c), ("e\u{301}dx", 3));
     }
 
     #[test]

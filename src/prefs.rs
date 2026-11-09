@@ -26,6 +26,10 @@ pub struct LayoutPrefs {
     pub activity_bar: bool,
     #[serde(default = "default_true")]
     pub status_bar: bool,
+    /// The editor minimap. On unless switched off, also for an older config
+    /// that has no such key.
+    #[serde(default = "default_true")]
+    pub minimap: bool,
     #[serde(default)]
     pub side_bar_position: SideBarPosition,
     #[serde(default)]
@@ -56,6 +60,7 @@ impl Default for LayoutPrefs {
         Self {
             activity_bar: true,
             status_bar: true,
+            minimap: true,
             side_bar_position: SideBarPosition::default(),
             secondary_side_bar: false,
             panel_alignment: PanelAlignment::default(),
@@ -239,6 +244,14 @@ pub struct Prefs {
     /// read as `auto`, so a typo cannot start a compile on a huge root.
     #[serde(default)]
     pub problems_project_scope: String,
+    /// What a gcc/clang-shaped build message counts its column in:
+    /// `display` (screen cells, a tab running to the next multiple of 8;
+    /// gcc 11 and newer), `byte` (clang, older gcc) or `char`. Unrecognised
+    /// or empty reads as `display`. It decides where "Go to Problem" and a
+    /// click in PROBLEMS put the caret on a line with a tab or a non-ASCII
+    /// character.
+    #[serde(default)]
+    pub build_column_unit: String,
     /// Default whitespace handling for new diff views: `off` (every byte
     /// counts), `leading` (ignore indentation changes), or `all` (ignore every
     /// whitespace-only difference). Unrecognised values read as `off`, so a
@@ -380,6 +393,13 @@ pub struct Prefs {
     /// the derived `Default` and an older config both mean "guides shown".
     #[serde(default)]
     pub disable_indent_guides: bool,
+    /// Home on a wrapped line (#1569): with this on, pressing Home on the
+    /// start of a continuation row goes to the start of the row above, one
+    /// visual row per press, before the line's own stops. Off (the default)
+    /// is VS Code's `cursorHome`: from a row's start straight to the line's
+    /// first non-blank character and column 0.
+    #[serde(default)]
+    pub home_walks_wrapped_rows: bool,
     /// Gutter line numbers (#1576, VS Code's `editor.lineNumbers`): "on"
     /// (also what the empty string an older config deserializes to means),
     /// "relative", "interval" or "off". Parsed by `LineNumbers::from_pref`.
@@ -662,7 +682,7 @@ impl Prefs {
     /// so a strict parse here threw away every setting in a file that
     /// merely had a comment, re-enabling disabled extensions among others.
     fn parse(json: &str) -> serde_json::Result<Self> {
-        let value: serde_json::Value = serde_json::from_str(&crate::tasks::strip_jsonc(json))?;
+        let value: serde_json::Value = serde_json::from_str(&crate::jsonc::strip_jsonc(json))?;
         let mut prefs: Self = serde_json::from_value(value.clone())?;
         if let serde_json::Value::Object(map) = value {
             prefs.source = SourceDoc(Some(map));
@@ -1158,7 +1178,7 @@ pub(crate) mod test_hooks {
 /// consent or disabled extensions to the base file instead let a revoked
 /// consent survive a restart under a profile.
 fn prefs_file_in(config_dir: &Path) -> PathBuf {
-    if config_dir == self::config_dir() {
+    if config_dir == crate::paths::config_dir() {
         config_path()
     } else {
         config_dir.join("config.json")
@@ -1479,77 +1499,8 @@ pub fn config_path() -> PathBuf {
     crate::profiles::file("config.json")
 }
 
-pub(crate) fn config_dir() -> PathBuf {
-    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
-        return PathBuf::from(xdg).join("croft");
-    }
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    home.join(".config").join("croft")
-}
-
-/// Where croft keeps data that is the user's own and must outlive a cache
-/// clean (#1578): hot-exit backups of unsaved edits and sticky notes. XDG's
-/// state directory, `$XDG_STATE_HOME/croft`, by default
-/// `~/.local/state/croft`; the cache directory is for what can be rebuilt,
-/// and cleaners and `rm -rf ~/.cache` delete it.
-pub(crate) fn state_dir() -> PathBuf {
-    state_dir_from(std::env::var_os("XDG_STATE_HOME"), std::env::var_os("HOME"))
-}
-
-/// [`state_dir`] from the given `XDG_STATE_HOME` and `HOME`. The spec
-/// counts a relative value (an empty one included) as invalid, so it falls
-/// back to the default rather than landing under the working directory.
-fn state_dir_from(
-    xdg_state_home: Option<std::ffi::OsString>,
-    home: Option<std::ffi::OsString>,
-) -> PathBuf {
-    if let Some(xdg) = xdg_state_home
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-    {
-        return xdg.join("croft");
-    }
-    home.map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".local")
-        .join("state")
-        .join("croft")
-}
-
 #[cfg(test)]
 mod tests {
-
-    /// #1578: hot-exit backups and sticky notes are the user's own text, so
-    /// they live in XDG's state directory, not the cache that cleaners and
-    /// `rm -rf ~/.cache` are free to delete.
-    #[test]
-    fn user_data_lives_in_the_xdg_state_directory() {
-        use std::path::PathBuf;
-        assert_eq!(
-            super::state_dir_from(Some("/x/state".into()), Some("/home/u".into())),
-            PathBuf::from("/x/state/croft")
-        );
-        assert_eq!(
-            super::state_dir_from(None, Some("/home/u".into())),
-            PathBuf::from("/home/u/.local/state/croft")
-        );
-    }
-
-    /// Negative: an empty or relative `XDG_STATE_HOME` is invalid under the
-    /// XDG spec and is ignored, never joined onto the working directory.
-    #[test]
-    fn an_empty_or_relative_xdg_state_home_is_ignored() {
-        use std::path::PathBuf;
-        for bad in ["", "rel/state"] {
-            assert_eq!(
-                super::state_dir_from(Some(bad.into()), Some("/home/u".into())),
-                PathBuf::from("/home/u/.local/state/croft"),
-                "{bad:?}"
-            );
-        }
-    }
 
     #[test]
     fn finishing_the_tour_leaves_an_unreadable_config_alone() {
@@ -1713,7 +1664,7 @@ mod tests {
         // The comment survives the saves (#1129).
         assert!(text.contains("// shared base"), "{text}");
         let doc: serde_json::Value =
-            serde_json::from_str(&crate::tasks::strip_jsonc(&text)).unwrap();
+            serde_json::from_str(&crate::jsonc::strip_jsonc(&text)).unwrap();
         assert_eq!(doc["extends"], "base.json");
         assert_eq!(doc["macos"]["theme"], "light");
         assert_eq!(doc["future_setting"], 7);
@@ -1953,6 +1904,7 @@ mod tests {
             layout: LayoutPrefs {
                 activity_bar: false,
                 status_bar: false,
+                minimap: false,
                 side_bar_position: SideBarPosition::Right,
                 secondary_side_bar: true,
                 panel_alignment: PanelAlignment::Justify,
@@ -1973,6 +1925,7 @@ mod tests {
         let old = Prefs::load(&path).expect("load old").layout;
         assert_eq!(old, LayoutPrefs::default());
         assert!(old.activity_bar && old.status_bar);
+        assert!(old.minimap, "an older config keeps the minimap on");
         assert_eq!(old.side_bar_position, SideBarPosition::Left);
         assert!(!old.secondary_side_bar);
         assert_eq!(old.panel_alignment, PanelAlignment::Center);

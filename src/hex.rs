@@ -210,11 +210,12 @@ impl HexView {
             self.sel_anchor = None;
         }
         let max = self.file_len.saturating_sub(1);
-        self.cursor = if delta.is_negative() {
+        let to = if delta.is_negative() {
             self.cursor.saturating_sub(delta.unsigned_abs())
         } else {
             self.cursor.saturating_add(delta as u64).min(max)
         };
+        self.place_cursor(to);
         self.scroll_cursor_into_view(viewport_rows);
     }
 
@@ -226,8 +227,18 @@ impl HexView {
         } else {
             self.sel_anchor = None;
         }
-        self.cursor = off.min(self.file_len.saturating_sub(1));
+        self.place_cursor(off.min(self.file_len.saturating_sub(1)));
         self.scroll_cursor_into_view(viewport_rows);
+    }
+
+    /// Move the cursor to `to`. A half-typed byte belongs to the byte it was
+    /// typed on, so leaving that byte drops it (#1142): the next digit starts
+    /// a fresh byte here instead of finishing the old one on the wrong offset.
+    fn place_cursor(&mut self, to: u64) {
+        if to != self.cursor {
+            self.pending_nibble = None;
+        }
+        self.cursor = to;
     }
 
     fn scroll_cursor_into_view(&mut self, viewport_rows: usize) {
@@ -612,6 +623,32 @@ mod tests {
         assert!(v.type_hex_digit(0x1), "second nibble completes the byte");
         assert_eq!(v.effective_byte(0), Some(0x41));
         assert_eq!(v.pending_nibble, None);
+    }
+
+    #[test]
+    fn a_half_typed_byte_stays_on_the_byte_it_was_typed_on() {
+        // #1142: f, Right, 2 over 41 42 turned byte 1 into F2.
+        let (_t, mut v) = view_over(b"ABCD");
+        assert!(!v.type_hex_digit(0xf));
+        v.move_cursor(1, false, 4);
+        assert_eq!(
+            v.pending_nibble, None,
+            "leaving the byte drops its first digit"
+        );
+        assert!(!v.type_hex_digit(0x2), "the next digit starts a new byte");
+        assert_eq!(v.effective_byte(0), Some(b'A'));
+        assert_eq!(v.effective_byte(1), Some(b'B'));
+        assert!(!v.has_edits());
+        // Home/End, PageUp/PageDown and clicks move through set_cursor.
+        v.set_cursor(3, false, 4);
+        assert_eq!(v.pending_nibble, None);
+        // A key that does not move (Left at offset 0) keeps the digit.
+        let (_t, mut v) = view_over(b"AB");
+        assert!(!v.type_hex_digit(0xf));
+        v.move_cursor(-1, false, 4);
+        assert_eq!(v.pending_nibble, Some(0xf));
+        assert!(v.type_hex_digit(0x2));
+        assert_eq!(v.effective_byte(0), Some(0xf2));
     }
 
     #[test]

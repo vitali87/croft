@@ -23,12 +23,12 @@ static ACTIVE: RwLock<Option<String>> = RwLock::new(None);
 
 /// Where profiles live.
 pub fn profiles_dir() -> PathBuf {
-    crate::prefs::config_dir().join("profiles")
+    crate::paths::config_dir().join("profiles")
 }
 
 /// The global choice's file.
 fn global_choice_path() -> PathBuf {
-    crate::prefs::config_dir().join("profile")
+    crate::paths::config_dir().join("profile")
 }
 
 /// A workspace's own choice's file.
@@ -41,7 +41,7 @@ pub fn workspace_choice_path(root: &Path) -> PathBuf {
 pub fn file(name: &str) -> PathBuf {
     match active() {
         Some(profile) => profiles_dir().join(profile).join(name),
-        None => crate::prefs::config_dir().join(name),
+        None => crate::paths::config_dir().join(name),
     }
 }
 
@@ -258,7 +258,7 @@ mod tests {
         if active().is_none() {
             assert_eq!(
                 file("config.json"),
-                crate::prefs::config_dir().join("config.json")
+                crate::paths::config_dir().join("config.json")
             );
         }
     }

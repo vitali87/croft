@@ -210,7 +210,7 @@ pub fn startup_catalog(
 pub fn init(setting: Option<&str>) {
     let user_file_for = |lang: &str| {
         std::fs::read_to_string(
-            crate::prefs::config_dir()
+            crate::paths::config_dir()
                 .join("locales")
                 .join(format!("{lang}.json")),
         )
@@ -302,6 +302,7 @@ pub const TRANSLATABLE: &[&str] = &[
     "Move Right",
     "New File",
     "New Folder",
+    "Next Bookmark",
     "Open Symbol in Its Own Tab",
     "OUTLINE",
     "OUTPUT",
@@ -310,6 +311,7 @@ pub const TRANSLATABLE: &[&str] = &[
     "Panel Alignment",
     "Paste",
     "Pin",
+    "Previous Bookmark",
     "PORTS",
     "Primary Side Bar Position",
     "PROBLEMS",
@@ -323,6 +325,7 @@ pub const TRANSLATABLE: &[&str] = &[
     "Reveal in Finder",
     "Revert",
     "Run and Debug",
+    "S, save anyway",
     "Search",
     "Select for Compare",
     "Show Incoming Calls",
@@ -344,6 +347,7 @@ pub const TRANSLATABLE: &[&str] = &[
     "This will overwrite your local changes from HEAD.",
     "This will permanently delete the file from disk.",
     "TIMELINE",
+    "Toggle Bookmark",
     "Unpin",
     "UNSAVED CHANGES",
     "Untitled",

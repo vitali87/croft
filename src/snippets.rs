@@ -475,7 +475,7 @@ impl SnippetSet {
     /// with it (#1483). The second half is why none were loaded when the
     /// file does not parse at all; it is in the warnings too.
     pub fn parse(json: &str) -> (Self, Option<String>) {
-        let stripped = crate::tasks::strip_jsonc(json);
+        let stripped = crate::jsonc::strip_jsonc(json);
         if stripped.trim().is_empty() {
             return (Self::default(), None);
         }

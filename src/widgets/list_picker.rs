@@ -111,6 +111,9 @@ pub enum ListPurpose {
     /// Output: Select Channel… (#852): the OUTPUT channels, `id` the
     /// channel's name.
     OutputChannel,
+    /// Bookmarks: View Bookmarks: every bookmark in the open files; `id` is
+    /// an index into the App's pending bookmark targets.
+    Bookmark,
     /// Where to add a CodeQL database from (#578): `id` is an index into
     /// the App's database sources.
     CodeqlDbSource,
@@ -134,6 +137,9 @@ pub enum ListPurpose {
     /// HTTP: Switch Environment (#924): `id` the named environment of the
     /// `.http` env files, or empty for none.
     HttpEnvironment,
+    /// The tab strip's "all open tabs" button: every tab of the group, `id`
+    /// its index.
+    OpenTab,
 }
 
 /// The Review Pull Request row that asks for a number or URL instead.
@@ -241,6 +247,16 @@ impl ListPicker {
 
     pub fn select_prev(&mut self) {
         self.selected = self.selected.saturating_sub(1);
+    }
+
+    /// Home: the first matched row.
+    pub fn select_first(&mut self) {
+        self.selected = 0;
+    }
+
+    /// End: the last matched row.
+    pub fn select_last(&mut self) {
+        self.selected = self.visible_count().saturating_sub(1);
     }
 
     /// The matched-row index at screen row `y`, if `y` lands on a visible row.
