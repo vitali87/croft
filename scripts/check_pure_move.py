@@ -52,7 +52,7 @@ CHAR = re.compile(r"'(?:[^\\'\n]|\\(?:u\{[0-9a-fA-F_]{1,8}\}|x[0-9a-fA-F]{2}|.))
 STRING_TAIL = re.compile(r'[^"\\]*(?:\\.[^"\\]*)*"', re.DOTALL)
 NESTED = re.compile(r"/\*|\*/")
 NOT_NEWLINE = re.compile(r"[^\n]")
-STRUCT = re.compile(r"[(\[{)\]};]")
+STRUCT = re.compile(r"->|=>|[(\[{)\]};<>]")
 BRACKETS = re.compile(r"[(\[{)\]}]")
 OUTER_ATTR = re.compile(r"\s*#\s*\[")
 INNER_ATTR = re.compile(r"\s*#\s*!\s*\[")
@@ -76,10 +76,11 @@ class ParseError(Exception):
 
 def lex(text):
     """`text` with every string, char literal and comment blanked to spaces
-    (newlines kept, so lines and columns still line up), and what each line
-    that starts inside a literal or a block comment starts inside: "string",
-    "comment", or "inner" for a `/*!` doc. Re-indenting a line inside a
-    string changes the string, so it is never dedented."""
+    (newlines kept, so lines and columns still line up); what each line that
+    starts inside a literal or a block comment starts inside: "string",
+    "comment", or "inner" for a `/*!` doc; and the (start, end) offsets of
+    every literal and comment. Re-indenting a line inside a string changes
+    the string, so it is never dedented."""
     newlines = [m.start() for m in re.finditer("\n", text)]
     spans, starts_in, pos = [], {}, 0
 
@@ -127,7 +128,7 @@ def lex(text):
         pieces += [text[pos:start], NOT_NEWLINE.sub(" ", text[start:end])]
         pos = end
     pieces.append(text[pos:])
-    return "".join(pieces), starts_in
+    return "".join(pieces), starts_in, spans
 
 
 def line_kind(line, code, starts_in):
@@ -150,8 +151,30 @@ def line_kind(line, code, starts_in):
     return COMMENT if s.startswith(("//", "/*")) else CODE
 
 
-def collapse(lines):
-    return " ".join(" ".join(lines).split())
+WHITESPACE = re.compile(r"\s+")
+
+
+def collapse(text, segments, spans):
+    """The `(start, end)` offset ranges of `text`, each stripped and joined by
+    a space, with every run of whitespace outside a literal or comment shrunk
+    to one space. Whitespace inside a string is part of its value
+    (`#[path = "a  b.rs"]` names another file than `"a b.rs"`), so it is
+    kept as written."""
+    parts = []
+    for a, b in segments:
+        out, pos = [], a
+        k = max(bisect.bisect_right(spans, (a, float("inf"))) - 1, 0)
+        while k < len(spans) and spans[k][0] < b:
+            s, e = spans[k]
+            if e > a:
+                out.append(WHITESPACE.sub(" ", text[pos : max(s, a)]))
+                out.append(text[max(s, a) : min(e, b)])
+                pos = min(e, b)
+            k += 1
+        out.append(WHITESPACE.sub(" ", text[pos:b]))
+        if part := "".join(out).strip():
+            parts.append(part)
+    return " ".join(parts)
 
 
 def balanced_end(clines, i, col, hi):
@@ -167,27 +190,36 @@ def balanced_end(clines, i, col, hi):
 
 def extent(clines, j, col, hi, semi_only):
     """Where the item starting at (j, col) ends: (last line, (line, col) of
-    its body's `{` or None, line of that body's `}` or None). It ends at the
-    first line end at depth 0 after a `;` at depth 0 or, unless `semi_only`,
-    after the body closes."""
-    depth, body, close, done = 0, None, None, False
+    its body's `{` or None, line of that body's `}` or None, column just past
+    the token that ended it). It ends at the first line end at depth 0 after
+    a `;` at depth 0 or, unless `semi_only`, after the body closes. Before
+    the body, `<` and `>` nest too, so the braces of a const generic
+    argument (`impl Tr for Foo<{ 1 }> {`) are not taken for the body."""
+    depth, angle, body, close, done, stop = 0, 0, None, None, False, None
     for k in range(j, hi):
         for m in STRUCT.finditer(clines[k], col if k == j else 0):
             c = m.group()
+            if c in ("->", "=>"):
+                continue
+            if c in "<>":
+                if depth == 0 and body is None and not done:
+                    angle = angle + 1 if c == "<" else max(angle - 1, 0)
+                continue
             if c == ";":
-                done = done or depth == 0
+                if not done and depth == 0:
+                    done, stop = True, (k, m.end())
             elif c in "([{":
-                if c == "{" and depth == 0 and body is None and not done:
+                if c == "{" and depth == 0 and angle == 0 and body is None and not done:
                     body = (k, m.start())
                 depth += 1
             else:
                 depth -= 1
                 if depth < 0:
                     raise ParseError(f"line {k + 1}: unbalanced {c!r}")
-                if c == "}" and depth == 0 and not semi_only and close is None and not done:
-                    close, done = k, True
+                if c == "}" and depth == 0 and body and not semi_only and close is None and not done:
+                    close, done, stop = k, True, (k, m.end())
         if done and depth == 0:
-            return k, body, close
+            return k, body, close, stop[1] if stop[0] == k else 0
     raise ParseError(f"line {j + 1}: item never ends")
 
 
@@ -195,8 +227,16 @@ def parse(text, file=""):
     """Every item in `text` and every line of glue between them. Together
     they cover each line exactly once; a file that cannot be read that way
     raises ParseError rather than being half-checked."""
-    code, starts_in = lex(text)
+    code, starts_in, spans = lex(text)
     lines, clines = text.split("\n"), code.split("\n")
+    offsets = [0]
+    for ln in lines:
+        offsets.append(offsets[-1] + len(ln) + 1)
+
+    def line_range(k, upto=None):
+        """Line `k` as an offset range of `text`, up to column `upto`."""
+        return offsets[k], offsets[k] + (len(lines[k]) if upto is None else upto)
+
     kinds = [line_kind(ln, c, starts_in.get(i)) for i, (ln, c) in enumerate(zip(lines, clines))]
     items, glue = [], []
 
@@ -236,7 +276,8 @@ def parse(text, file=""):
             start = i if lead is None else lead
             if INNER_ATTR.match(clines[i]):
                 end = balanced_end(clines, i, clines[i].index("["), hi)[0]
-                item("attr", collapse(clines[i : end + 1]), mods, ctx, start, i, 0, end)
+                name = " ".join(" ".join(clines[i : end + 1]).split())
+                item("attr", name, mods, ctx, start, i, 0, end)
                 lead, sticky, i = None, False, end + 1
                 continue
             j, col = i, 0
@@ -253,7 +294,11 @@ def parse(text, file=""):
                 kind, name = "macro", m[1] + "!"
             else:
                 kind, name = "other", None
-            end, body, close = extent(clines, j, col, hi, kind in SEMI_ONLY)
+            end, body, close, stop = extent(clines, j, col, hi, kind in SEMI_ONLY)
+            if clines[end][stop:].strip():
+                # Rust allows it, rustfmt never writes it, and reading the
+                # rest of the line as part of this item would hide the next.
+                raise ParseError(f"line {end + 1}: another item starts where one ends")
             name = name or " ".join(sig.split())[:60]
             lead, sticky = None, False
             if (
@@ -269,8 +314,8 @@ def parse(text, file=""):
                 # the same method; the header's docs and comments stay out of
                 # it, so two `impl App` blocks still match. The glue keeps
                 # every line as written, so an edit to any of them is listed.
-                header = [lines[k] for k in range(start, body[0]) if kinds[k] == CODE]
-                head = collapse([*header, lines[body[0]][: body[1]]])
+                header = [line_range(k) for k in range(start, body[0]) if kinds[k] == CODE]
+                head = collapse(text, [*header, line_range(body[0], body[1])], spans)
                 written = "\n".join(ln.strip() for ln in lines[start : body[0] + 1])
                 glue.append(Glue(file, "header", start, body[0], written))
                 if kind == "impl":
@@ -279,14 +324,20 @@ def parse(text, file=""):
                     walk(body[0] + 1, close, (*mods, name), ctx)
                 glue.append(Glue(file, "close", close, close, lines[close].strip()))
             elif kind == "use" or (kind == "mod" and body is None):
-                glue.append(Glue(file, kind, start, end, collapse(lines[start : end + 1])))
+                written = collapse(text, [line_range(k) for k in range(start, end + 1)], spans)
+                glue.append(Glue(file, kind, start, end, written))
             else:
                 item(kind, name, mods, ctx, start, j, col, end)
             i = end + 1
         if lead is not None:
             item("comment", lines[lead].strip()[:60], mods, ctx, lead, lead, 0, hi - 1)
 
-    walk(0, len(lines), (), "")
+    first = 0
+    if lines[0].startswith("#!") and not INNER_ATTR.match(clines[0]):
+        # A shebang line, which Rust skips; `#![` is an inner attribute.
+        glue.append(Glue(file, "shebang", 0, 0, lines[0]))
+        first = 1
+    walk(first, len(lines), (), "")
     return items, glue
 
 
