@@ -76,11 +76,9 @@ pub fn python_version(python: &Path) -> Option<PyVersion> {
     if from_cfg.is_some() {
         return from_cfg;
     }
-    let out = run_bounded(
-        &python.to_string_lossy(),
-        &["-c", "import sys; print('%d.%d' % sys.version_info[:2])"],
-        Duration::from_secs(5),
-    )?;
+    let mut probe = Command::new(python);
+    probe.args(["-c", "import sys; print('%d.%d' % sys.version_info[:2])"]);
+    let out = run_bounded(probe, Duration::from_secs(5))?;
     PyVersion::parse(&out)
 }
 
@@ -168,32 +166,31 @@ pub fn node_bin_dir(node: &str) -> Option<PathBuf> {
 /// Ask the user's login+interactive shell to print node's absolute path by
 /// running it (`process.execPath`). `-i` is required because nvm defines its
 /// lazy `node` function in the interactive rc; the call is bounded so a
-/// misbehaving rc cannot hang croft.
+/// misbehaving rc cannot hang croft. The shell runs detached from croft's
+/// terminal and marks the path, through the same probe the language-server
+/// install uses (#2064): an attached interactive shell can take croft's
+/// terminal, and a line printed by the rc would read as the path.
 fn resolve_node_via_login_shell() -> Option<String> {
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| String::from("/bin/sh"));
     let out = run_bounded(
-        &shell,
-        &["-lic", "node -e 'process.stdout.write(process.execPath)'"],
+        crate::lsp::install::node_probe_command(),
         Duration::from_secs(8),
     )?;
-    let path = out.trim();
-    (!path.is_empty() && Path::new(path).is_file()).then(|| path.to_string())
+    let path = crate::lsp::install::parse_node_probe(&out)?;
+    Path::new(path).is_file().then(|| path.to_string())
 }
 
-/// Run `program args...` capturing stdout, killing it if it outlives `timeout`
+/// Run `cmd` capturing stdout, killing it if it outlives `timeout`
 /// (a login shell with a chatty/blocking rc must never wedge croft). Stdout is
 /// drained *while* the child runs: an rc that prints more than the OS pipe
 /// buffer would otherwise block in write() and never exit. Returns the
 /// captured stdout, `None` on timeout or spawn failure.
-fn run_bounded(program: &str, args: &[&str], timeout: Duration) -> Option<String> {
+fn run_bounded(mut cmd: Command, timeout: Duration) -> Option<String> {
     use std::io::Read;
     // A program written a moment ago (a test's stand-in interpreter) is "Text
     // file busy" while another thread's forked child still holds its write
     // descriptor; that read as "no version" instead of waiting it out.
     let mut child = crate::review_ops::spawn_retrying_busy(
-        Command::new(program)
-            .args(args)
-            .stdin(Stdio::null())
+        cmd.stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null()),
     )
@@ -402,11 +399,9 @@ mod tests {
     /// be drained while the child runs.
     #[test]
     fn run_bounded_survives_output_larger_than_the_pipe_buffer() {
-        let out = run_bounded(
-            "/bin/sh",
-            &["-c", "yes croft | head -c 200000"],
-            Duration::from_secs(3),
-        );
+        let mut sh = Command::new("/bin/sh");
+        sh.args(["-c", "yes croft | head -c 200000"]);
+        let out = run_bounded(sh, Duration::from_secs(3));
         assert_eq!(out.map(|s| s.len()), Some(200000));
     }
 

@@ -1537,26 +1537,7 @@ fn detached_shell_node_dir() -> Option<PathBuf> {
 }
 
 fn run_detached_node_probe() -> Option<PathBuf> {
-    use std::os::unix::process::CommandExt;
-    use std::process::Stdio;
-
-    let shell = std::env::var_os("SHELL").unwrap_or_else(|| OsString::from("/bin/sh"));
-    let script =
-        format!("node -e 'process.stdout.write(\"{NODE_PROBE_MARKER}\"+process.execPath)'");
-    let mut cmd = Command::new(shell);
-    cmd.args(["-l", "-i", "-c", &script])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    // Detach from croft's controlling terminal before exec so the interactive
-    // shell's job control can never reach croft's tty.
-    unsafe {
-        cmd.pre_exec(|| {
-            libc::setsid();
-            Ok(())
-        });
-    }
-    let out = cmd.output().ok()?;
+    let out = node_probe_command().output().ok()?;
     let stdout = String::from_utf8_lossy(&out.stdout);
     let path = parse_node_probe(&stdout)?;
     let node = Path::new(path);
@@ -1566,11 +1547,46 @@ fn run_detached_node_probe() -> Option<PathBuf> {
     node.parent().map(Path::to_path_buf)
 }
 
+/// The shell probe that asks where `node` lives: the user's login+interactive
+/// shell runs `node -e` and prints `process.execPath` after
+/// [`NODE_PROBE_MARKER`], detached from croft's terminal (see
+/// [`detached_shell_node_dir`] for why). Its stdout is read with
+/// [`parse_node_probe`]. Shared by the language-server install and the
+/// JavaScript debugger, so neither can run the shell attached (#2064).
+pub(crate) fn node_probe_command() -> Command {
+    let shell = std::env::var_os("SHELL").unwrap_or_else(|| OsString::from("/bin/sh"));
+    let script =
+        format!("node -e 'process.stdout.write(\"{NODE_PROBE_MARKER}\"+process.execPath)'");
+    detached_shell(&shell, &script)
+}
+
+/// `shell -l -i -c script` with stdin `/dev/null`, stdout piped and stderr
+/// discarded, started by `setsid` in a session of its own with no
+/// controlling terminal, so the interactive shell's job control can never
+/// reach croft's tty.
+fn detached_shell(shell: &std::ffi::OsStr, script: &str) -> Command {
+    use std::os::unix::process::CommandExt;
+    use std::process::Stdio;
+
+    let mut cmd = Command::new(shell);
+    cmd.args(["-l", "-i", "-c", script])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    cmd
+}
+
 /// Recover the node path from probe stdout: the absolute path written right
 /// after the last marker. Returns `None` if the marker is absent (the probe
 /// didn't run node) or the text after it isn't an absolute path. Tolerates
 /// arbitrary shell-init noise printed before the marker.
-fn parse_node_probe(stdout: &str) -> Option<&str> {
+pub(crate) fn parse_node_probe(stdout: &str) -> Option<&str> {
     let after = &stdout[stdout.rfind(NODE_PROBE_MARKER)? + NODE_PROBE_MARKER.len()..];
     let path = after.trim();
     (path.starts_with('/') && !path.is_empty()).then_some(path)
@@ -2497,6 +2513,34 @@ mod tests {
         assert_eq!(parse_node_probe("no marker here"), None);
         assert_eq!(parse_node_probe("__CROFT_NODE__"), None);
         assert_eq!(parse_node_probe("__CROFT_NODE__relative/path"), None);
+    }
+
+    /// The node probe's shell leads a session of its own (#2064), so it has
+    /// no controlling terminal and its job control cannot reach croft's.
+    /// Read from the shell's own `/proc/<pid>/stat`: `pid (comm) state ppid
+    /// pgrp session ...`.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_node_probe_shell_runs_in_a_session_of_its_own() {
+        let home = tempfile::tempdir().unwrap();
+        let out = detached_shell(
+            std::ffi::OsStr::new("/bin/sh"),
+            "printf __STAT__; cat /proc/$$/stat",
+        )
+        .env("HOME", home.path())
+        .env_remove("ENV")
+        .output()
+        .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stat = &stdout[stdout.rfind("__STAT__").expect("the probe ran") + "__STAT__".len()..];
+        let pid: i32 = stat.split_whitespace().next().unwrap().parse().unwrap();
+        let after_comm: Vec<&str> = stat[stat.rfind(')').unwrap() + 1..]
+            .split_whitespace()
+            .collect();
+        let session: i32 = after_comm[3].parse().unwrap();
+        assert_eq!(session, pid, "the shell leads its own session: {stat}");
+        let ours = unsafe { libc::getsid(0) };
+        assert_ne!(session, ours, "not croft's session");
     }
 
     #[test]

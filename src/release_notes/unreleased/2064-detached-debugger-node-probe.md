@@ -1,0 +1,1 @@
+fix: Starting a JavaScript or TypeScript debug session when node comes from nvm, fnm, asdf or volta no longer runs your shell attached to croft's terminal, where it could push croft into the background, and output from your shell's startup files no longer stops croft finding node.
