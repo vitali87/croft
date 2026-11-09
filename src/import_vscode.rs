@@ -664,6 +664,10 @@ const COMMANDS: &[(&str, &str)] = &[
     ("editor.foldRecursively", "fold_recursively"),
     ("editor.unfoldRecursively", "unfold_recursively"),
     ("markdown.showPreview", "toggle_markdown_preview"),
+    (
+        "markdown.showPreviewToSide",
+        "open_markdown_preview_to_side",
+    ),
     ("workbench.action.tasks.build", "run_build_task"),
     ("workbench.action.tasks.runTask", "run_task"),
     ("workbench.action.tasks.reRunTask", "rerun_last_task"),

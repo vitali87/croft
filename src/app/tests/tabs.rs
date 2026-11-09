@@ -1946,6 +1946,51 @@ fn a_split_preview_follows_the_source_pane_scroll() {
     );
 }
 
+/// #1605: Cmd+K V on a Markdown tab opens its preview in a new group to the
+/// right, which shows what is typed in the source as it is typed without
+/// touching its own buffer, and stays rendered when the source is saved.
+#[test]
+fn a_side_preview_follows_the_typing_and_stays_a_preview_across_a_save() {
+    fn side(app: &App) -> (String, bool) {
+        let groups = app.editor_layout.inactive_groups();
+        let tab = &groups[0].editors[groups[0].active_index()];
+        let md = tab
+            .markdown_preview
+            .as_ref()
+            .expect("the side pane previews");
+        let text = md.lines.iter().flat_map(|l| l.spans.iter());
+        (text.map(|s| s.content.as_ref()).collect(), tab.dirty)
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("README.md");
+    std::fs::write(&f, "# Title\n\nFirst paragraph.\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.format_on_save = false;
+    app.editor.open_pinned(&f).unwrap();
+    app.focus_pane(Pane::Editor);
+    assert!(app.handle_cmd_k_chord(key(KeyCode::Char('v'), KeyModifiers::NONE)));
+    assert_eq!(app.editor_layout.leaf_count(), 2, "{}", app.status);
+    assert!(
+        app.editor.markdown_preview.is_none(),
+        "focus stays on the source"
+    );
+    app.editor.cursor_row = 2;
+    app.editor.cursor_col = app.editor.lines[2].len();
+    type_str(&mut app, " Typed");
+    assert!(app.sync_markdown_side_previews(), "the edit re-renders it");
+    let (text, dirty) = side(&app);
+    assert!(text.contains("First paragraph. Typed"), "{text}");
+    assert!(!dirty, "the preview's own buffer is not edited");
+    assert!(
+        !app.sync_markdown_side_previews(),
+        "an unchanged source costs nothing"
+    );
+    app.handle_key(ctrl('s')).unwrap();
+    assert!(app.reload_open_file_after_external_change());
+    app.sync_markdown_side_previews();
+    assert!(side(&app).0.contains("First paragraph. Typed"));
+}
+
 /// #852 regression, driven by keys alone: `Ctrl+Alt+S` writes every dirty
 /// tab to disk, the inactive one included, not only the active tab.
 #[test]

@@ -87,6 +87,10 @@ pub struct MarkdownPreview {
     pub scroll_to_source: Option<usize>,
     /// What a click or Ctrl+click can follow (#931).
     pub links: MdLinks,
+    /// Open Preview to the Side (#1605): the `(edit_seq, undo_step_id)` of
+    /// the source pane this view was last built from, when it shows another
+    /// pane's text rather than its own buffer's. `None` = its own buffer.
+    pub follows: Option<(u64, u64)>,
 }
 
 impl MarkdownPreview {
@@ -3512,6 +3516,7 @@ mod preview_selection_tests {
             row_of_line: Vec::new(),
             scroll_to_source: None,
             links: MdLinks::default(),
+            follows: None,
         }
     }
 
