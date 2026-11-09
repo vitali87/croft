@@ -969,6 +969,11 @@ fn croft_loch_welcome_fits_a_short_editor_with_the_start_list() {
         let y = row_of(label);
         assert!(start < y && y < tour, "{label} in the Start list");
     }
+    assert_eq!(
+        col(start, "Start"),
+        col(card, "What's new"),
+        "the Start list sits in the card's text column"
+    );
     assert_eq!(tagline, mark + 2, "one blank row under the wordmark");
     assert_eq!(start, tagline + 2, "one blank row under the tagline");
     assert_eq!(tour, start + 4, "the tour is the list's last row");

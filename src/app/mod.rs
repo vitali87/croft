@@ -6875,10 +6875,6 @@ const WELCOME_VERSION_GAP: u16 = 2;
 /// widest row still reads as a label and a chord, not one run of text.
 const WELCOME_START_KEY_GAP: u16 = 4;
 
-/// The narrowest the Start list's column gets, so a keymap with short chords
-/// does not pinch it into a cramped strip under the wide tagline.
-const WELCOME_START_MIN_W: u16 = 36;
-
 /// Where Croft Loch's welcome stack puts each block, in rows from the top of
 /// the welcome area. Computed by [`loch_welcome_plan`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -19500,10 +19496,12 @@ impl App {
             Vec::new()
         };
 
-        // The Start list's column: wide enough for the widest label, a gap
-        // and the widest keycaps, so every chord ends on one right edge. It
-        // shows only where the column and a cell of hover lift either side
-        // fit the area.
+        // The Start list's column is the release card's text column, so
+        // "Start" and "What's new" share a left edge and every chord ends
+        // where the card's version does; in an editor too narrow for that,
+        // just wide enough for the widest label, a gap and the widest
+        // keycaps, centred all the same. It shows only where the column and
+        // a cell of hover lift either side fit the area.
         let start_rows = self.welcome_start_rows();
         let start_col_w = start_rows
             .iter()
@@ -19513,7 +19511,7 @@ impl App {
             })
             .max()
             .unwrap_or(0)
-            .max(WELCOME_START_MIN_W);
+            .max(card_inner_w);
         let start_fits = start_col_w + 2 <= area.width;
         let tour_offered = !self.tour_done && self.tour.is_none();
         let plan = loch_welcome_plan(
@@ -19639,6 +19637,8 @@ impl App {
         // the column) and runs its action on a click.
         if let Some(start_y) = plan.start_y {
             let start_y = area.y + start_y;
+            // Centred, this is exactly the card's text column when it is
+            // that wide (the card insets `width / 8 + 2` on either side).
             let col_x = area.x + (area.width - start_col_w) / 2;
             let buf = frame.buffer_mut();
             buf.set_string(
