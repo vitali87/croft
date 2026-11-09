@@ -1184,6 +1184,24 @@ fn status_pill(label: &str, fill: Color, fg: Color) -> [Span<'static>; 3] {
     ]
 }
 
+/// The typing-mode glyph that follows the workspace cap in the status bar:
+/// the insertion symbol (⎀) in the bar's quiet `muted` tone while typing
+/// inserts, the continuous-underline symbol (⎁) in overwrite mode, lit in the
+/// brand orange so a switched mode is hard to miss. It sits on the left, away
+/// from the clickable position, encoding and language segments on the right.
+fn typing_mode_span(overwrite: bool, muted: Color) -> Span<'static> {
+    if overwrite {
+        Span::styled(
+            "\u{2381}",
+            Style::default()
+                .fg(BRAND_ORANGE)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::styled("\u{2380}", Style::default().fg(muted))
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Pane {
     Tree,
@@ -4407,6 +4425,12 @@ pub struct App {
     git_head_oids: std::collections::BTreeMap<PathBuf, Option<String>>,
     git: GitWorker,
     cursor_blink: CursorBlink,
+    /// Overwrite (Replace) mode, toggled by the Insert key. One switch for the
+    /// whole app, as in VS Code: it follows you from tab to tab.
+    overwrite_mode: bool,
+    /// Whether the terminal's caret was last set to the overwrite block, so
+    /// the style escape is sent only when the wanted shape changes.
+    caret_block_sent: bool,
     editor_click: ClickTracker,
     tree_click: ClickTracker,
     terminal_click: ClickTracker,
@@ -7465,6 +7489,8 @@ impl App {
             git_head_oids: std::collections::BTreeMap::new(),
             git,
             cursor_blink: CursorBlink::new(),
+            overwrite_mode: false,
+            caret_block_sent: false,
             editor_click: ClickTracker::default(),
             tree_click: ClickTracker::default(),
             terminal_click: ClickTracker::default(),
@@ -11077,6 +11103,7 @@ impl App {
         self.editor.blame_enabled = self.inline_blame_enabled;
         self.editor.provenance_overlay = self.provenance_overlay;
         self.editor.auto_close_pairs = self.auto_close_pairs_for(editor_scope_id(&self.editor));
+        self.editor.overwrite = self.overwrite_mode;
         self.editor.whitespace_mode = whitespace_mode_in(
             &self.language_prefs,
             self.whitespace_mode,
@@ -24314,13 +24341,15 @@ impl App {
         let scm_status = self.scm_worker().status().clone();
         let status_bg = status_bar_bg(self.theme);
         let tones = StatusTones::new(self.theme, status_bg);
-        let mut spans: Vec<Span> = Vec::with_capacity(24);
+        let mut spans: Vec<Span> = Vec::with_capacity(26);
         let workspace_name = self
             .workspace_root()
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| self.workspace_root().display().to_string());
         spans.extend(workspace_cap_spans(self.theme, &workspace_name));
+        spans.push(Span::raw(" "));
+        spans.push(typing_mode_span(self.overwrite_mode, tones.muted));
         let redacted = self.redacted_on_screen();
         if redacted > 0 || self.redactions_revealed() {
             // How much of what is on screen is masked right now (#360): a
@@ -51409,6 +51438,8 @@ impl App {
             }
             KeyCode::Delete if word => self.editor.delete_word_right(),
             KeyCode::Delete => self.editor.delete_forward(),
+            // Insert flips between insert and overwrite (Replace) typing.
+            KeyCode::Insert if !shift && !cmd && !alt && !word => self.toggle_overwrite_mode(),
             KeyCode::Enter => self.editor.insert_newline(),
             // Tab advances a live snippet, else expands a snippet whose prefix
             // was just typed, else indents (whole block for a multi-line
@@ -51422,6 +51453,7 @@ impl App {
                     && !key.modifiers.contains(KeyModifiers::ALT)
                     && !key.modifiers.contains(KeyModifiers::SUPER) =>
             {
+                self.editor.overwrite = self.overwrite_mode;
                 self.editor.insert_char(c);
                 // With an incomplete list pending but none of it on screen,
                 // typing on still re-asks (#1529).
@@ -69338,6 +69370,38 @@ impl App {
         );
     }
 
+    /// Flip Insert/Overwrite typing (the Insert key).
+    fn toggle_overwrite_mode(&mut self) {
+        self.overwrite_mode = !self.overwrite_mode;
+        self.editor.overwrite = self.overwrite_mode;
+        self.status = format!(
+            "{} mode",
+            if self.overwrite_mode {
+                "Overwrite"
+            } else {
+                "Insert"
+            }
+        );
+    }
+
+    /// Make the terminal's caret match the typing mode: a block while the
+    /// editor has focus in overwrite mode, the steady bar croft runs with
+    /// otherwise. Emitted only when the wanted shape changes.
+    fn sync_caret_style(&mut self) {
+        let want_block = self.overwrite_mode && self.focus == Pane::Editor;
+        if want_block == self.caret_block_sent {
+            return;
+        }
+        self.caret_block_sent = want_block;
+        let style = if want_block {
+            crossterm::cursor::SetCursorStyle::SteadyBlock
+        } else {
+            crossterm::cursor::SetCursorStyle::SteadyBar
+        };
+        let mut out = stdout();
+        let _ = crossterm::execute!(out, style);
+    }
+
     /// Step the gutter's line numbers through on, relative, interval and
     /// off (#1576), on every editor, and save the choice.
     fn cycle_line_numbers(&mut self) {
@@ -85377,6 +85441,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             }
             let draw_start = std::time::Instant::now();
             let drawn = terminal.draw(|f| app.render_for_terminal(f))?;
+            app.sync_caret_style();
             let mut underlays = app.image_underlays(drawn.buffer);
             app.drawn_buffer = Some(drawn.buffer.clone());
             // Record render+flush time and the bytes ratatui shipped this

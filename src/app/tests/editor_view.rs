@@ -2337,6 +2337,110 @@ fn line_numbers_reach_every_split_group() {
     assert_eq!(modes(&app), [LineNumbers::Off, LineNumbers::Off]);
 }
 
+fn overwrite_app(text: &str) -> (tempfile::TempDir, App) {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus = Pane::Editor;
+    app.editor.lines = text.lines().map(String::from).collect();
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 0;
+    (tmp, app)
+}
+
+#[test]
+fn insert_key_toggles_overwrite_mode_and_typing_replaces() {
+    let (_t, mut app) = overwrite_app("abcdef");
+    app.handle_key(key(KeyCode::Char('X'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        app.editor.lines[0], "Xabcdef",
+        "insert mode pushes the text"
+    );
+    app.handle_key(key(KeyCode::Insert, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.overwrite_mode);
+    assert_eq!(app.status, "Overwrite mode");
+    app.handle_key(key(KeyCode::Char('Y'), KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('Z'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.lines[0], "XYZcdef", "overwrite replaces a, b");
+    assert_eq!(app.editor.cursor_col, 3);
+    app.handle_key(key(KeyCode::Insert, KeyModifiers::NONE))
+        .unwrap();
+    assert!(!app.overwrite_mode);
+    assert_eq!(app.status, "Insert mode");
+    app.handle_key(key(KeyCode::Char('!'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.lines[0], "XYZ!cdef");
+}
+
+#[test]
+fn overwrite_appends_at_the_end_of_a_line_and_replaces_a_whole_emoji() {
+    let (_t, mut app) = overwrite_app("a\u{1F468}\u{200D}\u{1F469}b");
+    app.overwrite_mode = true;
+    app.editor.cursor_col = 1;
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.lines[0], "axb", "the ZWJ cluster goes as one");
+    app.editor.cursor_col = 3;
+    app.handle_key(key(KeyCode::Char('!'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.lines[0], "axb!", "at the line end it appends");
+}
+
+#[test]
+fn overwrite_typing_undoes_in_one_step_and_a_selection_is_replaced_as_usual() {
+    let (_t, mut app) = overwrite_app("hello");
+    app.overwrite_mode = true;
+    app.handle_key(key(KeyCode::Char('J'), KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('K'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.lines[0], "JKllo");
+    app.editor.undo();
+    assert_eq!(app.editor.lines[0], "hello", "one undo step for the run");
+    app.editor.cursor_col = 1;
+    app.editor.selection = Some(crate::widgets::editor::EditorSelection {
+        anchor: (0, 1),
+        head: (0, 4),
+    });
+    app.editor.cursor_col = 4;
+    app.handle_key(key(KeyCode::Char('_'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.lines[0], "h_o", "a selection is replaced, once");
+}
+
+#[test]
+fn overwrite_mode_is_shown_by_a_glyph_after_the_workspace_cap_not_in_the_position() {
+    let (_t, mut app) = overwrite_app("abc");
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+    let bar = |t: &ratatui::Terminal<ratatui::backend::TestBackend>| -> String {
+        let b = t.backend().buffer();
+        let y = b.area.height - 1;
+        (0..b.area.width)
+            .map(|x| b[(x, y)].symbol().to_string())
+            .collect()
+    };
+    term.draw(|f| app.render(f)).unwrap();
+    let insert = bar(&term);
+    // The workspace cap ends on its rounded right edge; the glyph follows
+    // one cell of air later.
+    assert!(
+        insert.contains("\u{e0b4} \u{2380}"),
+        "insert glyph after the workspace cap: {insert}"
+    );
+    app.handle_key(key(KeyCode::Insert, KeyModifiers::NONE))
+        .unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let over = bar(&term);
+    assert!(
+        over.contains("\u{e0b4} \u{2381}"),
+        "overwrite glyph: {over}"
+    );
+    assert!(!over.contains("OVR"), "the Ln/Col segment stays unchanged");
+}
+
 #[test]
 fn a_crowded_tab_strip_offers_a_list_of_all_open_tabs() {
     use crate::widgets::list_picker::ListPurpose;
