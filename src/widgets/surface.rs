@@ -12,13 +12,281 @@
 use ratatui::{
     buffer::{Buffer, Cell},
     layout::Rect,
-    style::{Color, Style},
+    style::{Color, Modifier, Style},
     symbols::border,
+    text::Span,
     widgets::{Block, Borders},
 };
 
 use crate::gradient::{GRAD_TL, GRAD_TR, lerp_rgb, rgb_color};
 use crate::theme::Theme;
+
+/// The selected row's accent bar: a quarter-cell stripe on the row's left
+/// edge, the same mark the activity bar puts beside the active view.
+pub const ROW_BAR: &str = "\u{258e}";
+
+/// The working inks and fills a `surfaces` theme draws its chrome from,
+/// derived once from the theme's four surface tones, its canvas and its
+/// accent, so a light surfaces theme gets the same hierarchy turned the
+/// other way.
+///
+/// The rules they encode: three text inks (`text`, `muted`, `faint`) and a
+/// `strong` one for the single active title in a region; the accent only
+/// for what has focus, is selected or is active; a selected row is a
+/// `band` with the [`ROW_BAR`] in the accent; a card's edge is the `rim`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Tones {
+    /// The code canvas (editor and panel background).
+    pub canvas: (u8, u8, u8),
+    /// Side bar, activity bar, tab strip, panel title row, status bar.
+    pub chrome: (u8, u8, u8),
+    /// Every popover: palette, pickers, menus, hovers, toasts, dialogs.
+    pub raised: (u8, u8, u8),
+    /// The seam between two surfaces.
+    pub hairline: (u8, u8, u8),
+    /// A card's edge: a step past the hairline, so a popover's outline reads
+    /// against the raised body it surrounds.
+    pub rim: (u8, u8, u8),
+    /// Body text: names, labels, values.
+    pub text: (u8, u8, u8),
+    /// The one emphasised label in a region: the focused view's title, the
+    /// active tab.
+    pub strong: (u8, u8, u8),
+    /// Secondary text: inactive titles, paths, hints, idle icons.
+    pub muted: (u8, u8, u8),
+    /// Tertiary marks: line numbers, separators, dim chevrons.
+    pub faint: (u8, u8, u8),
+    /// Focus, selection and the active state, and nothing else.
+    pub accent: (u8, u8, u8),
+    /// White on a dark theme, black on a light one: what "lifting" a
+    /// surface blends toward.
+    pub lift: (u8, u8, u8),
+}
+
+impl Tones {
+    /// The canvas as a cell colour.
+    pub fn canvas(self) -> Color {
+        rgb_color(self.canvas)
+    }
+    /// The chrome surface as a cell colour.
+    pub fn chrome(self) -> Color {
+        rgb_color(self.chrome)
+    }
+    /// The raised surface as a cell colour.
+    pub fn raised(self) -> Color {
+        rgb_color(self.raised)
+    }
+    /// The hairline as a cell colour.
+    pub fn hairline(self) -> Color {
+        rgb_color(self.hairline)
+    }
+    /// The card rim as a cell colour.
+    pub fn rim(self) -> Color {
+        rgb_color(self.rim)
+    }
+    /// Body text as a cell colour.
+    pub fn text(self) -> Color {
+        rgb_color(self.text)
+    }
+    /// The strong ink as a cell colour.
+    pub fn strong(self) -> Color {
+        rgb_color(self.strong)
+    }
+    /// Muted text as a cell colour.
+    pub fn muted(self) -> Color {
+        rgb_color(self.muted)
+    }
+    /// Faint marks as a cell colour.
+    pub fn faint(self) -> Color {
+        rgb_color(self.faint)
+    }
+    /// The accent as a cell colour.
+    pub fn accent(self) -> Color {
+        rgb_color(self.accent)
+    }
+
+    /// The selected-row fill on a surface `base`: the accent laid over it
+    /// at a quarter strength, quiet enough that body text keeps its colour.
+    pub fn band_on(self, base: (u8, u8, u8)) -> Color {
+        rgb_color(lerp_rgb(base, self.accent, 0.24))
+    }
+
+    /// The selected-row fill on the raised surface (palette, pickers, menus).
+    pub fn band(self) -> Color {
+        self.band_on(self.raised)
+    }
+
+    /// A row the pointer is over, on surface `base`: a small neutral lift.
+    pub fn hover_on(self, base: (u8, u8, u8)) -> Color {
+        rgb_color(lerp_rgb(base, self.lift, 0.055))
+    }
+
+    /// A keycap chip's fill on a row whose fill is `row` (the band when the
+    /// row is selected).
+    pub fn keycap_on(self, row: Color) -> Color {
+        let base = match row {
+            Color::Rgb(r, g, b) => (r, g, b),
+            _ => self.raised,
+        };
+        rgb_color(lerp_rgb(base, self.lift, 0.085))
+    }
+}
+
+/// The [`Tones`] of a `surfaces` theme, or `None` on a boxed one.
+pub fn tones(theme: Theme) -> Option<Tones> {
+    let s = theme.surfaces()?;
+    let canvas = theme.editor_bg_rgb();
+    let lift = if theme.is_light() {
+        (0x00, 0x00, 0x00)
+    } else {
+        (0xff, 0xff, 0xff)
+    };
+    Some(Tones {
+        canvas,
+        chrome: s.chrome,
+        raised: s.raised,
+        hairline: s.hairline,
+        rim: lerp_rgb(s.raised, lift, 0.11),
+        text: lerp_rgb(s.muted, lift, 0.70),
+        strong: lerp_rgb(s.muted, lift, 0.90),
+        muted: s.muted,
+        faint: lerp_rgb(canvas, s.muted, 0.52),
+        accent: theme.accent_rgb(),
+        lift,
+    })
+}
+
+/// Paint `row` as the selected row of a list on a `surfaces` theme: the
+/// band over every cell, and, when the list has the keyboard, the accent
+/// [`ROW_BAR`] in its first cell (a pad cell or the card's left edge). The
+/// row's text keeps its colours. Without focus the band is the hairline
+/// tone, as VS Code greys an inactive selection.
+pub fn paint_selected_row(
+    buf: &mut Buffer,
+    row: Rect,
+    t: Tones,
+    base: (u8, u8, u8),
+    focused: bool,
+) {
+    let row = row.intersection(buf.area);
+    if row.width == 0 || row.height == 0 {
+        return;
+    }
+    let band = if focused {
+        t.band_on(base)
+    } else {
+        rgb_color(lerp_rgb(base, t.lift, 0.07))
+    };
+    buf.set_style(row, Style::default().bg(band));
+    if focused {
+        for y in row.top()..row.bottom() {
+            let cell = &mut buf[(row.x, y)];
+            cell.set_symbol(ROW_BAR);
+            cell.set_fg(t.accent());
+            cell.set_bg(band);
+        }
+    }
+}
+
+/// A key-binding hint as keycaps on a `surfaces` theme: each key of a chord
+/// in its own chip, the chord's keys joined by a faint `+`, chords a space
+/// apart. `row` is the fill of the row the caps sit on, so a selected row's
+/// chips lift off its band rather than the card.
+pub fn keycap_spans(hint: &str, t: Tones, row: Color, selected: bool) -> Vec<Span<'static>> {
+    let cap = Style::default()
+        .bg(t.keycap_on(row))
+        .fg(if selected { t.text() } else { t.muted() });
+    let sep = Style::default().fg(t.faint()).bg(row);
+    let mut out = Vec::new();
+    for (i, chord) in hint.split(' ').filter(|c| !c.is_empty()).enumerate() {
+        if i > 0 {
+            out.push(Span::styled(" ", sep));
+        }
+        for (j, key) in chord_keys(chord).into_iter().enumerate() {
+            if j > 0 {
+                out.push(Span::styled("+", sep));
+            }
+            out.push(Span::styled(format!(" {key} "), cap));
+        }
+    }
+    out
+}
+
+/// The keys of one chord: `Ctrl+Shift+P` is Ctrl, Shift and P, and a `+`
+/// that is itself the key (`Ctrl++`) stays a key.
+pub fn chord_keys(chord: &str) -> Vec<&str> {
+    let mut keys = Vec::new();
+    let mut rest = chord;
+    while let Some(first) = rest.chars().next() {
+        let skip = first.len_utf8();
+        match rest[skip..].find('+') {
+            Some(k) => {
+                keys.push(&rest[..skip + k]);
+                rest = &rest[skip + k + 1..];
+            }
+            None => {
+                keys.push(rest);
+                break;
+            }
+        }
+    }
+    keys
+}
+
+/// A cell colour as bytes for blending: RGB as is, the named and indexed
+/// ANSI colours through the theme's palette, the terminal default as the
+/// canvas (`bg`) or body text (`fg`).
+fn cell_rgb(c: Color, theme: Theme, fallback: (u8, u8, u8)) -> (u8, u8, u8) {
+    let ansi = theme.ansi();
+    match c {
+        Color::Rgb(r, g, b) => (r, g, b),
+        Color::Black => ansi[0],
+        Color::Red => ansi[1],
+        Color::Green => ansi[2],
+        Color::Yellow => ansi[3],
+        Color::Blue => ansi[4],
+        Color::Magenta => ansi[5],
+        Color::Cyan => ansi[6],
+        Color::Gray => ansi[7],
+        Color::DarkGray => ansi[8],
+        Color::LightRed => ansi[9],
+        Color::LightGreen => ansi[10],
+        Color::LightYellow => ansi[11],
+        Color::LightBlue => ansi[12],
+        Color::LightMagenta => ansi[13],
+        Color::LightCyan => ansi[14],
+        Color::White => ansi[15],
+        Color::Indexed(i) if i < 16 => ansi[usize::from(i)],
+        _ => fallback,
+    }
+}
+
+/// Recede everything outside `keep` behind a modal on a `surfaces` theme,
+/// the scrim Zed, Linear and Raycast draw under a command bar: each cell's
+/// text sinks most of the way into its own background and the background
+/// darkens a step, so the card is the only thing at full contrast. A no-op
+/// on a boxed theme.
+pub fn dim_backdrop(buf: &mut Buffer, keep: Rect, theme: Theme) {
+    let Some(t) = tones(theme) else {
+        return;
+    };
+    let area = buf.area;
+    let sink = if theme.is_light() { 0.0 } else { 0.30 };
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            if keep.contains(ratatui::layout::Position { x, y }) {
+                continue;
+            }
+            let cell = &mut buf[(x, y)];
+            let bg = cell_rgb(cell.bg, theme, t.canvas);
+            let fg = cell_rgb(cell.fg, theme, t.text);
+            let bg2 = lerp_rgb(bg, (0, 0, 0), sink);
+            cell.set_fg(rgb_color(lerp_rgb(fg, bg2, 0.58)));
+            cell.set_bg(rgb_color(bg2));
+            cell.modifier.remove(Modifier::BOLD);
+        }
+    }
+}
 
 /// Which side of its cells a seam hugs. The glyphs are one-eighth blocks, so
 /// a seam sits on the cell boundary instead of the cell's middle, and two
@@ -192,7 +460,9 @@ pub fn paint_seam(buf: &mut Buffer, rect: Rect, edge: Edge, color: Color) {
 }
 
 /// The brand gradient's colour at cell `i` of `n` (teal to orange), or the
-/// flat accent on a theme without the gradient.
+/// flat accent on a theme without the gradient. Kept for the boxed brand
+/// theme's callers; a `surfaces` theme draws its rules with [`lip_color`].
+#[allow(dead_code)]
 fn rule_color(theme: Theme, i: u16, n: u16) -> Color {
     if theme.gradient() {
         let t = if n > 1 {
@@ -206,18 +476,57 @@ fn rule_color(theme: Theme, i: u16, n: u16) -> Color {
     }
 }
 
+/// The accent lip's colour at cell `i` of `n`: the accent at the leading
+/// edge easing into `rest` across the first two fifths of the run (never
+/// fewer than six cells), so a focused pane or a card is marked at its
+/// corner and the rest of the edge is a quiet line. One hue, one meaning:
+/// the accent says "this has the keyboard".
+fn lip_color(accent: (u8, u8, u8), rest: (u8, u8, u8), i: u16, n: u16) -> Color {
+    let span = (f32::from(n) * 0.4).max(6.0);
+    let t = (f32::from(i) / span).clamp(0.0, 1.0);
+    let eased = t * t * (3.0 - 2.0 * t);
+    rgb_color(lerp_rgb(accent, rest, eased))
+}
+
 /// The focused pane's marker under a `surfaces` theme: a rule along the top
-/// edge of its frame row, in the brand gradient, broken wherever the pane
-/// painted a title or a button there. It stands where VS Code puts
-/// `tab.activeBorderTop`, and replaces the whole-pane focus box.
+/// edge of its frame row, the accent easing into the hairline, broken
+/// wherever the pane painted a title or a button there. It stands where VS
+/// Code puts `tab.activeBorderTop`, and replaces the whole-pane focus box.
 pub fn paint_focus_rule(buf: &mut Buffer, area: Rect, theme: Theme) {
     let area = area.intersection(buf.area);
     if area.height < 2 {
         return;
     }
+    let Some(t) = tones(theme) else {
+        paint_edge_row(buf, area.x, area.y, area.width, Edge::Top.glyph(), |i| {
+            rule_color(theme, i, area.width)
+        });
+        return;
+    };
     paint_edge_row(buf, area.x, area.y, area.width, Edge::Top.glyph(), |i| {
-        rule_color(theme, i, area.width)
+        lip_color(t.accent, t.hairline, i, area.width)
     });
+}
+
+/// A pane's top edge under a `surfaces` theme, focused or not: the focus
+/// rule while it has the keyboard, the plain hairline otherwise, so the seam
+/// between a header (tab strip, breadcrumbs, panel tabs) and the content
+/// below it is always drawn and only its colour says where focus is.
+pub fn paint_pane_top(buf: &mut Buffer, area: Rect, theme: Theme, focused: bool) {
+    let Some(t) = tones(theme) else {
+        return;
+    };
+    let area = area.intersection(buf.area);
+    if area.height < 2 {
+        return;
+    }
+    if focused {
+        paint_focus_rule(buf, area, theme);
+    } else {
+        paint_edge_row(buf, area.x, area.y, area.width, Edge::Top.glyph(), |_| {
+            t.hairline()
+        });
+    }
 }
 
 /// Darken a colour toward black, for the overlay shadow. A cell left on the
@@ -233,13 +542,41 @@ fn shade(c: Color, theme: Theme) -> Color {
 
 /// The frame an overlay draws (Command Palette, pickers, popups, dialogs).
 /// On a boxed brand theme it is the gradient box. Under `surfaces` it is a
-/// card edge in one-eighth blocks hugging the overlay's outer boundary, the
-/// brand gradient along the top and the hairline on the other three sides,
-/// with a one-cell shadow below and to the right; a title painted on the top
-/// row keeps its cells.
+/// card edge in one-eighth blocks hugging the overlay's outer boundary: an
+/// accent lip easing into the rim along the top, the rim on the other three
+/// sides, with a one-cell shadow below and to the right; a title painted on
+/// the top row keeps its cells.
 pub fn paint_overlay_frame(buf: &mut Buffer, rect: Rect, theme: Theme) {
-    let Some(s) = theme.surfaces() else {
+    let Some(t) = tones(theme) else {
         crate::gradient::paint_gradient_box(buf, rect);
+        return;
+    };
+    paint_card_edge(buf, rect, theme, Some(t.accent));
+}
+
+/// [`paint_overlay_frame`] without the accent lip: the whole edge in the
+/// rim. For hints and tooltips that never take the keyboard, so the accent
+/// keeps meaning focus.
+pub fn paint_quiet_frame(buf: &mut Buffer, rect: Rect, theme: Theme) {
+    if tones(theme).is_none() {
+        crate::gradient::paint_gradient_box(buf, rect);
+        return;
+    }
+    paint_card_edge(buf, rect, theme, None);
+}
+
+/// [`paint_overlay_frame`] with the lip in `tint` instead of the accent: a
+/// warning or a destructive confirmation marks its card in its own colour.
+pub fn paint_tinted_frame(buf: &mut Buffer, rect: Rect, theme: Theme, tint: (u8, u8, u8)) {
+    if tones(theme).is_none() {
+        crate::gradient::paint_gradient_box(buf, rect);
+        return;
+    }
+    paint_card_edge(buf, rect, theme, Some(tint));
+}
+
+fn paint_card_edge(buf: &mut Buffer, rect: Rect, theme: Theme, lip: Option<(u8, u8, u8)>) {
+    let Some(t) = tones(theme) else {
         return;
     };
     let area = buf.area;
@@ -247,23 +584,31 @@ pub fn paint_overlay_frame(buf: &mut Buffer, rect: Rect, theme: Theme) {
         return;
     }
     let (right, bottom) = (rect.right() - 1, rect.bottom() - 1);
-    paint_edge_row(buf, rect.x, rect.y, rect.width, Edge::Top.glyph(), |i| {
-        rule_color(theme, i, rect.width)
-    });
+    paint_edge_row(
+        buf,
+        rect.x,
+        rect.y,
+        rect.width,
+        Edge::Top.glyph(),
+        |i| match lip {
+            Some(a) => lip_color(a, t.rim, i, rect.width),
+            None => t.rim(),
+        },
+    );
     paint_edge_row(
         buf,
         rect.x,
         bottom,
         rect.width,
         Edge::Bottom.glyph(),
-        |_| s.hairline(),
+        |_| t.rim(),
     );
     for y in rect.y + 1..bottom {
         for (x, edge) in [(rect.x, Edge::Left), (right, Edge::Right)] {
             let cell = &mut buf[(x, y)];
             if is_frame_cell(cell) {
                 cell.set_symbol(edge.glyph());
-                cell.set_fg(s.hairline());
+                cell.set_fg(t.rim());
             }
         }
     }
@@ -316,16 +661,89 @@ mod tests {
     }
 
     #[test]
-    fn the_focus_rule_runs_the_brand_gradient_and_spares_the_title() {
-        let mut buf = Buffer::empty(Rect::new(0, 0, 12, 3));
+    fn the_focus_rule_eases_from_the_accent_into_the_hairline_and_spares_the_title() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 24, 3));
         buf.set_string(1, 0, "EX", Style::default());
         let area = buf.area;
         paint_focus_rule(&mut buf, area, loch());
+        let t = tones(loch()).unwrap();
         assert_eq!(buf[(0, 0)].symbol(), "\u{2594}");
-        assert_eq!(buf[(0, 0)].fg, rgb_color(GRAD_TL));
-        assert_eq!(buf[(11, 0)].fg, rgb_color(GRAD_TR));
+        assert_eq!(buf[(0, 0)].fg, t.accent(), "the lip starts at the accent");
+        assert_eq!(buf[(23, 0)].fg, t.hairline(), "and settles on the hairline");
         assert_eq!(buf[(1, 0)].symbol(), "E", "the title keeps its cells");
         assert_eq!(buf[(5, 1)].symbol(), " ", "only the top row is touched");
+    }
+
+    #[test]
+    fn an_unfocused_pane_top_is_the_hairline() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 10, 3));
+        let area = buf.area;
+        paint_pane_top(&mut buf, area, loch(), false);
+        let t = tones(loch()).unwrap();
+        for x in 0..10 {
+            assert_eq!(buf[(x, 0)].symbol(), "\u{2594}");
+            assert_eq!(buf[(x, 0)].fg, t.hairline());
+        }
+        let mut boxed = Buffer::empty(Rect::new(0, 0, 10, 3));
+        paint_pane_top(&mut boxed, area, Theme::BLACK, true);
+        assert_eq!(boxed, Buffer::empty(area), "a boxed theme draws nothing");
+    }
+
+    #[test]
+    fn loch_tones_rank_text_above_muted_above_faint() {
+        let t = tones(loch()).unwrap();
+        let l = |c: (u8, u8, u8)| u32::from(c.0) + u32::from(c.1) + u32::from(c.2);
+        assert!(l(t.strong) > l(t.text));
+        assert!(l(t.text) > l(t.muted));
+        assert!(l(t.muted) > l(t.faint));
+        assert!(l(t.faint) > l(t.canvas));
+        assert!(
+            l(t.rim) > l(t.raised),
+            "the rim reads against the card body"
+        );
+        assert!(tones(Theme::BLACK).is_none());
+    }
+
+    #[test]
+    fn a_selected_row_is_a_band_with_the_accent_bar_only_while_focused() {
+        let t = tones(loch()).unwrap();
+        let mut buf = Buffer::empty(Rect::new(0, 0, 8, 2));
+        buf.set_string(1, 0, "ab", Style::default().fg(Color::Red));
+        paint_selected_row(&mut buf, Rect::new(0, 0, 8, 1), t, t.raised, true);
+        assert_eq!(buf[(0, 0)].symbol(), ROW_BAR);
+        assert_eq!(buf[(0, 0)].fg, t.accent());
+        assert_eq!(buf[(1, 0)].bg, t.band());
+        assert_eq!(buf[(1, 0)].fg, Color::Red, "text keeps its colour");
+        assert_eq!(buf[(0, 1)].symbol(), " ", "only the row is touched");
+        paint_selected_row(&mut buf, Rect::new(0, 1, 8, 1), t, t.raised, false);
+        assert_eq!(buf[(0, 1)].symbol(), " ", "no bar without focus");
+        assert_ne!(buf[(3, 1)].bg, t.band());
+    }
+
+    #[test]
+    fn keycaps_put_each_key_of_a_chord_in_a_chip() {
+        let t = tones(loch()).unwrap();
+        let spans = keycap_spans("Ctrl+K Z", t, t.raised(), false);
+        let text: Vec<&str> = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, [" Ctrl ", "+", " K ", " ", " Z "]);
+        assert_eq!(spans[0].style.bg, Some(t.keycap_on(t.raised())));
+        assert_eq!(spans[1].style.fg, Some(t.faint()));
+        assert_eq!(chord_keys("Ctrl++"), ["Ctrl", "+"]);
+    }
+
+    #[test]
+    fn the_backdrop_sinks_everything_but_the_card() {
+        let t = tones(loch()).unwrap();
+        let mut buf = Buffer::empty(Rect::new(0, 0, 6, 3));
+        buf.set_style(buf.area, Style::default().fg(t.text()).bg(t.chrome()));
+        dim_backdrop(&mut buf, Rect::new(2, 1, 2, 1), loch());
+        assert_eq!(buf[(2, 1)].fg, t.text(), "the card keeps its contrast");
+        assert_ne!(buf[(0, 0)].fg, t.text());
+        assert_ne!(buf[(0, 0)].bg, t.chrome());
+        let mut boxed = Buffer::empty(Rect::new(0, 0, 6, 3));
+        let before = boxed.clone();
+        dim_backdrop(&mut boxed, Rect::new(2, 1, 2, 1), Theme::BLACK);
+        assert_eq!(boxed, before);
     }
 
     #[test]
@@ -390,7 +808,7 @@ mod tests {
         assert_eq!(buf[(1, 3)].symbol(), "\u{2581}", "bottom edge");
         assert_eq!(buf[(1, 2)].symbol(), "\u{258f}", "left edge");
         assert_eq!(buf[(8, 2)].symbol(), "\u{2595}", "right edge");
-        assert_eq!(buf[(8, 3)].fg, s.hairline());
+        assert_eq!(buf[(8, 3)].fg, tones(theme).unwrap().rim());
         // Shadow: right column from the second row, bottom row from the
         // second column; the cell diagonally past the top-left is untouched.
         let shaded = shade(s.chrome(), theme);

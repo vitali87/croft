@@ -482,7 +482,10 @@ impl Theme {
     /// `None` for any other color.
     fn surfaces_role(self, c: (u8, u8, u8), s: Surfaces) -> Option<(u8, u8, u8)> {
         Some(match c {
-            (0x16, 0x18, 0x1f) | (0x1e, 0x1e, 0x1e) => s.raised,
+            // Every popover body on the one raised surface: the palette and
+            // menus (0x16181f, 0x1e1e1e), and the hover, completion, details
+            // and signature cards (0x1e212a), which used to sit a tone above.
+            (0x16, 0x18, 0x1f) | (0x1e, 0x1e, 0x1e) | (0x1e, 0x21, 0x2a) => s.raised,
             (0x3b, 0x42, 0x52) => s.hairline,
             (0x1e, 0x3a, 0x6e) | (0x26, 0x4f, 0x78) | (0x09, 0x4d, 0x77) => self.selection,
             (0x07, 0x33, 0x55) | (0x37, 0x61, 0x8e) => blend(self.selection, 0.7, self.bg),

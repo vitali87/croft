@@ -100,7 +100,18 @@ pub fn render(
 ///   toolbar spirit (`icon.foreground`), no bold.
 /// * Black hover: white on the muted teal `POPUP_SEL_BG` pill standing in for
 ///   `toolbar.hoverBackground`.
+///
+/// Under a `surfaces` theme (Croft Loch) an idle button is a muted icon that
+/// recedes behind the titles beside it, and hover lifts it to body text on a
+/// faint chip: the accent is kept for what has focus or is selected.
 pub fn action_style(theme: crate::theme::Theme, hovered: bool) -> Style {
+    if let Some(t) = crate::widgets::surface::tones(theme) {
+        return if hovered {
+            Style::default().fg(t.strong()).bg(t.hover_on(t.chrome))
+        } else {
+            Style::default().fg(t.muted())
+        };
+    }
     let brand = theme.gradient();
     if !brand {
         return Style::default()

@@ -594,6 +594,7 @@ fn black_theme_terminal_buttons_are_teal_icons_not_navy_chips() {
     use crate::gradient::{INNER_ACCENT, rgb_color};
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.apply_theme(crate::theme::Theme::BLACK);
     let add = terminal_header_probe(&mut app);
     let backend = ratatui::backend::TestBackend::new(140, 50);
     let mut term = ratatui::Terminal::new(backend).unwrap();
@@ -614,6 +615,7 @@ fn black_theme_terminal_button_hover_paints_teal_pill() {
     use crate::gradient::{POPUP_SEL_BG, rgb_color};
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.apply_theme(crate::theme::Theme::BLACK);
     let add = terminal_header_probe(&mut app);
     app.handle_mouse(crossterm::event::MouseEvent {
         kind: crossterm::event::MouseEventKind::Moved,
@@ -632,6 +634,33 @@ fn black_theme_terminal_button_hover_paints_teal_pill() {
         "hovered button wears the teal pill"
     );
     assert_eq!(buf[plus].fg, Color::White);
+}
+
+#[test]
+fn croft_loch_terminal_buttons_are_muted_until_hovered() {
+    let t = crate::widgets::surface::tones(crate::theme::Theme::LOCH).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let add = terminal_header_probe(&mut app);
+    let backend = ratatui::backend::TestBackend::new(140, 50);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let plus = (add.x + 1, add.y);
+    assert_eq!(
+        term.backend().buffer()[plus].fg,
+        t.muted(),
+        "idle: muted, not the accent"
+    );
+    app.handle_mouse(crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::Moved,
+        column: add.x + 1,
+        row: add.y,
+        modifiers: KeyModifiers::NONE,
+    });
+    term.draw(|f| app.render(f)).unwrap();
+    let cell = &term.backend().buffer()[plus];
+    assert_eq!(cell.fg, t.strong(), "hover lifts the icon");
+    assert_eq!(cell.bg, t.hover_on(t.chrome), "onto a faint chip");
 }
 
 #[test]
