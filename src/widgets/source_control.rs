@@ -137,6 +137,28 @@ pub const MESSAGE_MAX_ROWS: usize = 6;
 /// Change-list rows a growing commit message never takes over.
 const MESSAGE_LIST_MIN_ROWS: u16 = 2;
 
+/// The empty commit field's placeholder on Croft Loch: one word, so it is
+/// whole in the narrowest side bar.
+const COMMIT_PLACEHOLDER: &str = "Message";
+
+/// The key hints Croft Loch's empty commit field can show at its right edge,
+/// longest first.
+const COMMIT_PLACEHOLDER_HINTS: [&str; 2] = [
+    "\u{23ce} commit \u{b7} \u{21e7}\u{23ce} newline",
+    "\u{23ce} commit",
+];
+
+/// The longest key hint that fits beside [`COMMIT_PLACEHOLDER`] in a field
+/// with `text_max` cells of text, at least three cells clear of it, or
+/// `None` when even the shortest would crowd it: a hint is shown whole or
+/// not at all, never cut mid-word the way one long placeholder was.
+fn commit_placeholder_hint(text_max: usize) -> Option<&'static str> {
+    let room = text_max.checked_sub(COMMIT_PLACEHOLDER.len() + 3)?;
+    COMMIT_PLACEHOLDER_HINTS
+        .into_iter()
+        .find(|hint| unicode_width::UnicodeWidthStr::width(*hint) <= room)
+}
+
 pub struct SourceControlPanel {
     pub focused: bool,
     /// True under the Black theme: overpaint the focused outer border with the
@@ -1760,25 +1782,43 @@ impl Widget for &mut SourceControlPanel {
             if self.message.is_empty() {
                 self.message_scroll = 0;
                 self.message_line_scroll = 0;
-                // Croft Loch: a short hint in the muted ink that fits a
-                // normal side bar whole instead of being cut mid-word.
-                let (placeholder, fg) = match tones {
-                    Some(t) => (
-                        "Message (\u{23ce} commit \u{b7} \u{21e7}\u{23ce} newline)",
-                        t.muted(),
-                    ),
-                    None => (
+                if let Some(t) = tones {
+                    // Croft Loch: "Message" in the muted ink, and the keys
+                    // as a faint hint at the field's right edge, as long a
+                    // hint as fits whole: never cut mid-word.
+                    buf.set_stringn(
+                        text_x,
+                        content_y,
+                        COMMIT_PLACEHOLDER,
+                        text_max,
+                        Style::default()
+                            .fg(t.muted())
+                            .add_modifier(Modifier::ITALIC),
+                    );
+                    if let Some(hint) = commit_placeholder_hint(text_max) {
+                        let w = unicode_width::UnicodeWidthStr::width(hint);
+                        buf.set_string(
+                            text_x + (text_max - w) as u16,
+                            content_y,
+                            hint,
+                            Style::default().fg(t.faint()),
+                        );
+                    }
+                } else {
+                    buf.set_stringn(
+                        text_x,
+                        content_y,
                         "Message (Enter = commit, \u{21e7}Enter = new line, \u{2303}Enter = push)",
-                        Color::Rgb(INPUT_PROMPT_RGB.0, INPUT_PROMPT_RGB.1, INPUT_PROMPT_RGB.2),
-                    ),
-                };
-                buf.set_stringn(
-                    text_x,
-                    content_y,
-                    placeholder,
-                    text_max,
-                    Style::default().fg(fg).add_modifier(Modifier::ITALIC),
-                );
+                        text_max,
+                        Style::default()
+                            .fg(Color::Rgb(
+                                INPUT_PROMPT_RGB.0,
+                                INPUT_PROMPT_RGB.1,
+                                INPUT_PROMPT_RGB.2,
+                            ))
+                            .add_modifier(Modifier::ITALIC),
+                    );
+                }
             } else {
                 // Horizontal scroll: keep the caret inside the box so a
                 // message wider than the input (e.g. a pasted path) stays
@@ -3055,8 +3095,8 @@ mod tests {
     /// Croft Loch: the commit message is a raised well with a one-eighth
     /// block edge (the rim at rest, the accent while it has the keyboard),
     /// never the rounded line box, and its inner rect is the box's, so the
-    /// caret lands where it always has. The placeholder is the short one,
-    /// in the muted ink, whole at a normal side-bar width.
+    /// caret lands where it always has. The placeholder is "Message" in the
+    /// muted ink, with the keys as a faint hint at the field's right edge.
     #[test]
     fn croft_loch_commit_message_is_a_raised_well_with_a_hairline_edge() {
         use ratatui::buffer::Buffer;
@@ -3082,11 +3122,11 @@ mod tests {
         let row: String = (r.x..r.right())
             .map(|x| buf[(x, r.y + 1)].symbol())
             .collect();
-        assert!(
-            row.contains("Message (\u{23ce} commit \u{b7} \u{21e7}\u{23ce} newline)"),
-            "{row:?}"
-        );
+        assert!(row.contains("Message"), "{row:?}");
+        assert!(row.contains("\u{23ce} commit"), "{row:?}");
         assert_eq!(buf[(r.x + 2, r.y + 1)].fg, t.muted());
+        let hint_x = r.x + row.chars().position(|c| c == '\u{23ce}').unwrap() as u16;
+        assert_eq!(buf[(hint_x, r.y + 1)].fg, t.faint(), "the hint is faint");
         for y in r.top()..r.bottom() {
             for x in r.left()..r.right() {
                 assert!(
@@ -3100,6 +3140,63 @@ mod tests {
         let buf = render(&mut p);
         assert_eq!(buf[(r.x + 3, r.y)].fg, t.accent(), "the accent with focus");
         assert_eq!(p.cursor_screen_pos(), Some((r.x + 2, r.y + 1)));
+    }
+
+    /// Croft Loch's empty commit field fits every side-bar width: "Message"
+    /// whole, then the longest key hint that fits whole, ending on the
+    /// field's last text cell, or no hint at all. Nothing is ever cut
+    /// mid-word, and the caret keeps its cell.
+    #[test]
+    fn croft_loch_commit_placeholder_is_whole_at_every_side_bar_width() {
+        use ratatui::buffer::Buffer;
+        let hints = [
+            "\u{23ce} commit \u{b7} \u{21e7}\u{23ce} newline",
+            "\u{23ce} commit",
+        ];
+        let mut seen = [false; 3];
+        for width in 16u16..=64 {
+            let mut p = SourceControlPanel::new();
+            p.theme = crate::theme::Theme::LOCH;
+            p.set_status(dummy_status_with_branch("main"), Vec::new());
+            let area = Rect::new(0, 0, width, 30);
+            let mut buf = Buffer::empty(area);
+            ratatui::widgets::Widget::render(&mut p, area, &mut buf);
+            let r = p.last_input_area;
+            // The text cells: a cell of padding inside each edge.
+            let (x0, x1) = (r.x + 2, r.right() - 2);
+            let text: String = (x0..x1).map(|x| buf[(x, r.y + 1)].symbol()).collect();
+            let rest = text
+                .strip_prefix("Message")
+                .unwrap_or_else(|| panic!("\"Message\" whole at width {width}: {text:?}"));
+            let hint = rest.trim_start();
+            match hints.iter().position(|h| *h == hint) {
+                Some(i) => {
+                    seen[i] = true;
+                    assert!(
+                        rest.len() - hint.len() >= 3,
+                        "the hint stands clear of the word at width {width}: {text:?}"
+                    );
+                }
+                None => {
+                    assert!(hint.is_empty(), "a cut hint at width {width}: {text:?}");
+                    seen[2] = true;
+                }
+            }
+        }
+        assert!(seen.iter().all(|s| *s), "every tier is exercised: {seen:?}");
+        // A normal side bar (the 30-column one the screenshots use) has
+        // room for the commit key at least.
+        let mut p = SourceControlPanel::new();
+        p.theme = crate::theme::Theme::LOCH;
+        p.set_status(dummy_status_with_branch("main"), Vec::new());
+        let area = Rect::new(0, 0, 30, 30);
+        let mut buf = Buffer::empty(area);
+        ratatui::widgets::Widget::render(&mut p, area, &mut buf);
+        let r = p.last_input_area;
+        let row: String = (r.x..r.right())
+            .map(|x| buf[(x, r.y + 1)].symbol())
+            .collect();
+        assert!(row.contains("\u{23ce} commit"), "{row:?}");
     }
 
     /// Croft Loch's Commit is one soft split button: half-block caps make
