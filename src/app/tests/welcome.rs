@@ -987,7 +987,7 @@ fn croft_loch_welcome_fits_a_short_editor_with_the_start_list() {
         .iter()
         .filter(|end| rows.iter().any(|r| r.contains(*end)))
         .count();
-    assert!(shown >= 1 && shown < 5, "a shortened card: {shown} notes");
+    assert!((1..5).contains(&shown), "a shortened card: {shown} notes");
     row_of(&format!("+{} more", 5 - shown));
 
     // One axis: the tagline, the Start column and the card centre on the

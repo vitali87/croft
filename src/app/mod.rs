@@ -6920,10 +6920,11 @@ fn loch_welcome_plan(
     } else {
         0
     };
+    let chip = if tour_chip { gap + 1 } else { 0 };
     let (start, chip) = if start > 0 && logo_floor + tagline + start <= height {
         (start, 0)
-    } else if tour_chip && logo_floor + tagline + gap + 1 <= height {
-        (0, gap + 1)
+    } else if chip > 0 && logo_floor + tagline + chip <= height {
+        (0, chip)
     } else {
         (0, 0)
     };
