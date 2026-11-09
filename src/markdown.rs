@@ -1071,7 +1071,7 @@ fn link_of(fg: Color) -> Option<usize> {
 /// Convert one highlighted source line into owned spans, filling unstyled
 /// gaps with `code_fg` — the theme's code foreground, never the Base16
 /// literal, so gaps match the captured tokens around them on every theme.
-fn code_line_spans(line: &str, spans: &[HiSpan], code_fg: Color) -> Vec<Span<'static>> {
+pub(crate) fn code_line_spans(line: &str, spans: &[HiSpan], code_fg: Color) -> Vec<Span<'static>> {
     let mut out = Vec::new();
     let mut cursor = 0usize;
     for sp in spans {
