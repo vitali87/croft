@@ -16226,7 +16226,27 @@ impl App {
             };
             y = y.saturating_add(h);
             match v {
-                ExplorerView::Folders => frame.render_widget(&mut self.tree, rect),
+                ExplorerView::Folders => {
+                    frame.render_widget(&mut self.tree, rect);
+                    // Croft Loch: every stacked section ends on a hairline,
+                    // so the tree's blank bottom padding row takes the same
+                    // seam when a section follows it.
+                    if let Some(t) = crate::widgets::surface::tones(self.theme)
+                        && rect.bottom() < area.bottom()
+                        && rect.height > 1
+                    {
+                        crate::widgets::surface::paint_seam(
+                            frame.buffer_mut(),
+                            Rect {
+                                y: rect.bottom() - 1,
+                                height: 1,
+                                ..rect
+                            },
+                            crate::widgets::surface::Edge::Bottom,
+                            t.hairline(),
+                        );
+                    }
+                }
                 ExplorerView::OpenEditors => frame.render_widget(&mut self.open_editors, rect),
                 ExplorerView::Outline => frame.render_widget(&mut self.outline, rect),
                 ExplorerView::Timeline => frame.render_widget(&mut self.timeline, rect),
@@ -18734,12 +18754,21 @@ impl App {
         // no layout icons, so it must not keep the last frame's: their cells
         // now belong to the panel's tab row and its buttons (#1980).
         self.layout_icon_areas = LayoutIconAreas::default();
+        // Frame truth for the welcome's click targets: set again below by
+        // whatever this frame paints.
+        self.welcome_tour_button = Rect::default();
+        self.welcome.clear_start_rows();
         if outer_area.width == 0 || outer_area.height == 0 {
             return;
         }
         self.render_welcome_panel(frame, outer_area);
         // The first-launch tour (#377), until it has been taken or skipped.
-        if !self.tour_done && self.tour.is_none() && outer_area.height > 6 {
+        // Croft Loch's Start list carries it as a row when it fits.
+        if !self.tour_done
+            && self.tour.is_none()
+            && outer_area.height > 6
+            && self.welcome_tour_button.width == 0
+        {
             let label = " Take the Tour ";
             let w = label.chars().count() as u16;
             if outer_area.width > w + 4 {
@@ -18749,18 +18778,103 @@ impl App {
                     width: w,
                     height: 1,
                 };
-                frame.render_widget(
-                    ratatui::widgets::Paragraph::new(label).style(
+                if let Some(t) = crate::widgets::surface::tones(self.theme) {
+                    // Croft Loch: a calm pill on the raised tone with
+                    // half-block caps, lifting under the pointer; the accent
+                    // stays for focus and selection.
+                    let hovered = crate::widgets::hover::contains(rect, self.pointer_cell);
+                    let fill = if hovered {
+                        t.hover_on(t.raised)
+                    } else {
+                        t.raised()
+                    };
+                    let buf = frame.buffer_mut();
+                    buf.set_string(rect.x - 1, rect.y, "\u{2590}", Style::default().fg(fill));
+                    buf.set_string(
+                        rect.x,
+                        rect.y,
+                        label,
                         Style::default()
-                            .fg(self.theme.accent_contrast_fg())
-                            .bg(self.theme.accent())
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    rect,
-                );
+                            .fg(if hovered { t.strong() } else { t.text() })
+                            .bg(fill),
+                    );
+                    buf.set_string(rect.right(), rect.y, "\u{258c}", Style::default().fg(fill));
+                } else {
+                    frame.render_widget(
+                        ratatui::widgets::Paragraph::new(label).style(
+                            Style::default()
+                                .fg(self.theme.accent_contrast_fg())
+                                .bg(self.theme.accent())
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        rect,
+                    );
+                }
                 self.welcome_tour_button = rect;
             }
         }
+    }
+
+    /// Croft Loch's welcome tagline: the same promise as [`WELCOME_TAGLINE`]
+    /// in sentence case, set quietly in the muted ink under the wordmark.
+    const WELCOME_TAGLINE_CALM: &'static str = "Lightweight. Blazingly fast. Built for developers.";
+
+    /// The chord shown beside `cmd` on the welcome screen's Start list,
+    /// exactly as the Command Palette shows it: a user's own binding, no
+    /// chord when a user binding took the built-in one, else the built-in
+    /// hint as this platform spells it.
+    fn welcome_chord(&self, cmd: crate::widgets::command_palette::Command) -> String {
+        match self.keymap.chord_for(cmd) {
+            Some(user) => crate::keymap::display_chord(&user),
+            None if self.keymap.shadows_builtin(cmd) => String::new(),
+            None => {
+                crate::widgets::command_palette::platform_hint(cmd.keybinding_hint()).into_owned()
+            }
+        }
+    }
+
+    /// The Start list Croft Loch's welcome screen offers, top to bottom:
+    /// each row's label, the chord beside it, and what a click runs (`None`
+    /// for the tour, whose click target is `welcome_tour_button`). The tour
+    /// is offered until it has been taken or skipped.
+    fn welcome_start_rows(&self) -> Vec<(&'static str, String, Option<welcome::StartAction>)> {
+        use crate::widgets::command_palette::Command;
+        use welcome::StartAction;
+        let mut rows = vec![
+            (
+                "New File",
+                self.welcome_chord(Command::NewUntitledFile),
+                Some(StartAction::Command(Command::NewUntitledFile)),
+            ),
+            (
+                "Go to File",
+                self.welcome_chord(Command::QuickOpen),
+                Some(StartAction::Command(Command::QuickOpen)),
+            ),
+            (
+                "Command Palette",
+                crate::widgets::command_palette::platform_hint("Cmd+Shift+P").into_owned(),
+                Some(StartAction::CommandPalette),
+            ),
+        ];
+        if !self.tour_done && self.tour.is_none() {
+            rows.push(("Take the Tour", String::new(), None));
+        }
+        rows
+    }
+
+    /// Run the welcome Start row a click landed on, if the welcome screen is
+    /// what the editor area shows.
+    fn click_welcome_start(&mut self, x: u16, y: u16) -> bool {
+        if self.editor_layout.is_split() || !self.editor.is_blank_initial() {
+            return false;
+        }
+        match self.welcome.start_action_at(x, y) {
+            Some(welcome::StartAction::Command(cmd)) => self.run_command(cmd),
+            Some(welcome::StartAction::CommandPalette) => self.open_command_palette(),
+            None => return false,
+        }
+        true
     }
 
     fn render_welcome_panel(&mut self, frame: &mut ratatui::Frame, outer_area: Rect) {
@@ -18823,16 +18937,39 @@ impl App {
         let footer_h = 1u16;
         // Gaps: blank row after logo, after tagline, after box.
         let gaps_h = 3u16;
+        let tones = crate::widgets::surface::tones(self.theme);
+        // Croft Loch's Start list (a heading, a row per action, a gap)
+        // between the tagline and the release card. It is the first thing
+        // to go in a short window, after the logo has shrunk to its floor:
+        // shown only when the whole stack, card included, still fits.
+        let start_rows = if tones.is_some() && welcome_card_inner_width(block_w) >= 24 {
+            self.welcome_start_rows()
+        } else {
+            Vec::new()
+        };
+        let start_need = if start_rows.is_empty() {
+            0
+        } else {
+            start_rows.len() as u16 + 2
+        };
+        let desired_card_h = if has_recent_panel {
+            recents_inner_h.saturating_add(4)
+        } else {
+            0
+        };
+        let start_h = if start_need > 0
+            && area.height >= tagline_h + footer_h + gaps_h + desired_card_h + 4 + start_need
+        {
+            start_need
+        } else {
+            0
+        };
 
         let logo_max_w = (area.width as u32).saturating_sub(4) as u16;
         let logo_w_cells = logo_max_w.clamp(8, 48);
         // Box content needs at least the 4-cell border+inset envelope to be
         // worth drawing.
-        let desired_box_h = if has_recent_panel {
-            recents_inner_h.saturating_add(4)
-        } else {
-            0
-        };
+        let desired_box_h = desired_card_h;
         // Size the card first, then give the logo whatever remains (still
         // capped to its 4..14 band, so the stack can never overrun the
         // fixed-size ratatui buffer). The release note is the panel's
@@ -18844,8 +18981,10 @@ impl App {
             .height
             .saturating_sub(tagline_h + footer_h + gaps_h)
             .saturating_sub(desired_box_h)
+            .saturating_sub(start_h)
             .clamp(4, 14);
-        let used_above_box = logo_h_cells + 1 + tagline_h + 1; // logo, gap, tagline, gap
+        // logo, gap, tagline, gap, and the Start list where it shows
+        let used_above_box = logo_h_cells + 1 + tagline_h + 1 + start_h;
         let used_below_box = 1 + footer_h; // gap, footer
         let max_box_h = area
             .height
@@ -18889,7 +19028,29 @@ impl App {
             }
         }
 
-        if !self.overlays.welcome.has_image() && self.welcome_bake.is_none() {
+        if !self.overlays.welcome.has_image()
+            && self.welcome_bake.is_none()
+            && let Some(t) = tones
+        {
+            // Croft Loch's text fallback is the wordmark itself: the letters
+            // in the strong ink and the `<>` (the stylised "o") in the brand
+            // orange, the one place that orange appears.
+            let letter = Style::default().fg(t.strong()).add_modifier(Modifier::BOLD);
+            let mark = ratatui::text::Line::from(vec![
+                Span::styled("cr", letter),
+                Span::styled(
+                    "<>",
+                    Style::default()
+                        .fg(BRAND_ORANGE)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("ft", letter),
+            ]);
+            let mark_w = mark.width() as u16;
+            let lx = logo_x.saturating_add(logo_w_cells.saturating_sub(mark_w) / 2);
+            let ly = logo_y + logo_h_cells / 2;
+            frame.buffer_mut().set_line(lx, ly, &mark, mark_w);
+        } else if !self.overlays.welcome.has_image() && self.welcome_bake.is_none() {
             // Text fallback for non-iTerm2 terminals.
             let label = " croft ";
             let lx = logo_x
@@ -18929,12 +19090,30 @@ impl App {
                 area.x + (area.width - version_w) / 2,
                 gap_y,
                 &version_label,
-                Style::default()
-                    .fg(self.theme.ui(rgb_color(GRAD_TL)))
-                    .add_modifier(Modifier::BOLD),
+                match tones {
+                    Some(t) => Style::default().fg(t.muted()),
+                    None => Style::default()
+                        .fg(self.theme.ui(rgb_color(GRAD_TL)))
+                        .add_modifier(Modifier::BOLD),
+                },
             );
         }
-        if badge_fits {
+        if badge_fits && let Some(t) = tones {
+            // Croft Loch: metadata, not a headline. A one-row pill on the
+            // raised tone with half-block caps, on the boxed badge's middle
+            // row and in its columns, so it clears the logo and the tagline
+            // exactly as the box did.
+            let buf = frame.buffer_mut();
+            let caps = Style::default().fg(t.raised());
+            buf.set_string(badge_x, badge_y + 1, "\u{2590}", caps);
+            buf.set_string(
+                badge_x + 1,
+                badge_y + 1,
+                &version_label,
+                Style::default().fg(t.muted()).bg(t.raised()),
+            );
+            buf.set_string(badge_x + 1 + version_w, badge_y + 1, "\u{258c}", caps);
+        } else if badge_fits {
             let badge_style = Style::default()
                 .fg(self.theme.ui(rgb_color(GRAD_TL)))
                 .add_modifier(Modifier::BOLD);
@@ -18988,20 +19167,92 @@ impl App {
             );
         }
 
-        // Tagline.
+        // Tagline: Croft Loch sets it in sentence case, muted and italic, so
+        // it reads as a line under the wordmark rather than a second banner.
         let tagline_y = logo_y + logo_h_cells + 1;
-        let tagline_w = WELCOME_TAGLINE.chars().count() as u16;
-        let tagline_x = area.x + area.width.saturating_sub(tagline_w) / 2;
-        if tagline_y < area_max_y && tagline_w <= area.width {
-            frame.buffer_mut().set_string(
-                tagline_x,
-                tagline_y,
+        let (tagline, tagline_style) = match tones {
+            Some(t) => (
+                Self::WELCOME_TAGLINE_CALM,
+                Style::default()
+                    .fg(t.muted())
+                    .add_modifier(Modifier::ITALIC),
+            ),
+            None => (
                 WELCOME_TAGLINE,
                 Style::default().fg(self.theme.ui(Color::Rgb(0x88, 0xc0, 0xd0))),
-            );
+            ),
+        };
+        let tagline_w = tagline.chars().count() as u16;
+        let tagline_x = area.x + area.width.saturating_sub(tagline_w) / 2;
+        if tagline_y < area_max_y && tagline_w <= area.width {
+            frame
+                .buffer_mut()
+                .set_string(tagline_x, tagline_y, tagline, tagline_style);
         }
 
-        let box_y = tagline_y + tagline_h + 1;
+        // Croft Loch's Start list, in the card's text column: a muted
+        // heading, then one row per action with its chord as keycaps at the
+        // right, read from the keymap as the palette reads it. A row lifts
+        // under the pointer and runs its action on a click.
+        let start_y = tagline_y + tagline_h + 1;
+        if start_h > 0
+            && let Some(t) = tones
+        {
+            let sx = block_left + 2;
+            let sw = welcome_card_inner_width(block_w);
+            let buf = frame.buffer_mut();
+            buf.set_stringn(
+                sx,
+                start_y,
+                "Start",
+                usize::from(sw),
+                Style::default().fg(t.muted()).add_modifier(Modifier::BOLD),
+            );
+            for (i, (label, chord, action)) in start_rows.iter().enumerate() {
+                let y = start_y + 1 + i as u16;
+                if y >= area_max_y {
+                    break;
+                }
+                let row = Rect {
+                    x: sx,
+                    y,
+                    width: sw,
+                    height: 1,
+                };
+                let hovered = crate::widgets::hover::contains(row, self.pointer_cell);
+                let row_bg = if hovered {
+                    t.hover_on(t.canvas)
+                } else {
+                    t.canvas()
+                };
+                if hovered {
+                    buf.set_style(row, Style::default().bg(row_bg));
+                }
+                let label_w = label.chars().count() as u16;
+                buf.set_stringn(
+                    sx + 2,
+                    y,
+                    label,
+                    usize::from(sw.saturating_sub(2)),
+                    Style::default().fg(if hovered { t.strong() } else { t.text() }),
+                );
+                if !chord.is_empty() {
+                    let caps = ratatui::text::Line::from(crate::widgets::surface::keycap_spans(
+                        chord, t, row_bg, false,
+                    ));
+                    let caps_w = caps.width() as u16;
+                    if sw >= caps_w + label_w + 6 {
+                        buf.set_line(sx + sw - caps_w - 1, y, &caps, caps_w);
+                    }
+                }
+                match action {
+                    Some(action) => self.welcome.push_start_row(row, *action),
+                    None => self.welcome_tour_button = row,
+                }
+            }
+        }
+
+        let box_y = start_y + start_h;
         if has_recent_panel && box_h >= 4 && block_w >= 4 && box_y + box_h <= area_max_y {
             let box_rect = Rect {
                 x: block_left,
@@ -19009,7 +19260,19 @@ impl App {
                 width: block_w,
                 height: box_h,
             };
-            if self.theme.is_light() {
+            if let Some(t) = tones {
+                // Croft Loch: a raised card that floats on the canvas, its
+                // rim all round with no accent lip (it never takes the
+                // keyboard), in place of the rainbow gradient box.
+                frame
+                    .buffer_mut()
+                    .set_style(box_rect, Style::default().bg(t.raised()));
+                crate::widgets::surface::paint_quiet_frame(
+                    frame.buffer_mut(),
+                    box_rect,
+                    self.theme,
+                );
+            } else if self.theme.is_light() {
                 // The brand gradient's teal leg washes out on white; paint
                 // the card border in the light widget-border grey instead.
                 let border = Style::default().fg(self.theme.ui(Color::Rgb(0x3b, 0x42, 0x52)));
@@ -19053,7 +19316,10 @@ impl App {
             let inner_y = box_rect.y + 1;
             let inner_w_actual = welcome_card_inner_width(box_rect.width);
 
-            let row_style = Style::default().fg(self.theme.ui(Color::Rgb(0xc5, 0xcd, 0xd9)));
+            let row_style = Style::default().fg(match tones {
+                Some(t) => t.text(),
+                None => self.theme.ui(Color::Rgb(0xc5, 0xcd, 0xd9)),
+            });
 
             // Header row: "> IN THIS RELEASE (vX.Y.Z)", or "> IN THIS BUILD
             // (vX.Y.Z+)" for a build carrying changes past that release. The
@@ -19062,25 +19328,61 @@ impl App {
             // (see `crate::release_notes`), so the heading names the exact
             // version.
             let header_y = inner_y;
-            frame.buffer_mut().set_string(
-                inner_x,
-                header_y,
-                "> ",
-                Style::default()
-                    .fg(self.theme.ui(rgb_color(GRAD_TR)))
-                    .add_modifier(Modifier::BOLD),
-            );
-            frame.buffer_mut().set_string(
-                inner_x + 2,
-                header_y,
-                crate::release_notes::heading(
-                    crate::release_notes::unreleased(),
+            if let Some(t) = tones {
+                // Croft Loch: "What's new" in the muted ink, the version it
+                // describes right-aligned and quieter still, said once.
+                let unreleased = crate::release_notes::unreleased();
+                let heading = if unreleased {
+                    "What's new in this build"
+                } else {
+                    "What's new"
+                };
+                let version = format!(
+                    "v{}{}",
                     env!("CARGO_PKG_VERSION"),
-                ),
-                Style::default()
-                    .fg(self.theme.ui(Color::White))
-                    .add_modifier(Modifier::BOLD),
-            );
+                    if unreleased { "+" } else { "" }
+                );
+                let buf = frame.buffer_mut();
+                buf.set_stringn(
+                    inner_x,
+                    header_y,
+                    heading,
+                    usize::from(inner_w_actual),
+                    Style::default().fg(t.muted()).add_modifier(Modifier::BOLD),
+                );
+                let (heading_w, version_w) = (
+                    heading.chars().count() as u16,
+                    version.chars().count() as u16,
+                );
+                if inner_w_actual >= heading_w + version_w + 2 {
+                    buf.set_string(
+                        inner_x + inner_w_actual - version_w,
+                        header_y,
+                        &version,
+                        Style::default().fg(t.muted()),
+                    );
+                }
+            } else {
+                frame.buffer_mut().set_string(
+                    inner_x,
+                    header_y,
+                    "> ",
+                    Style::default()
+                        .fg(self.theme.ui(rgb_color(GRAD_TR)))
+                        .add_modifier(Modifier::BOLD),
+                );
+                frame.buffer_mut().set_string(
+                    inner_x + 2,
+                    header_y,
+                    crate::release_notes::heading(
+                        crate::release_notes::unreleased(),
+                        env!("CARGO_PKG_VERSION"),
+                    ),
+                    Style::default()
+                        .fg(self.theme.ui(Color::White))
+                        .add_modifier(Modifier::BOLD),
+                );
+            }
 
             // Each highlight: a kind glyph in the gutter (rocket = new feature,
             // bug = fix) tinted by kind, then the wrapped one-line summary.
@@ -19094,13 +19396,19 @@ impl App {
                 if row_y >= last_row {
                     break;
                 }
+                // Croft Loch's marks are typographic (`+` and `•`) and not
+                // bold; a boxed theme keeps the rocket and the bug.
+                let (mark, mark_fg) = note.kind.marker_for(self.theme);
+                let mark_style = Style::default().fg(mark_fg);
                 frame.buffer_mut().set_string(
                     inner_x,
                     row_y,
-                    note.kind.icon(),
-                    Style::default()
-                        .fg(note.kind.color())
-                        .add_modifier(Modifier::BOLD),
+                    mark,
+                    if tones.is_some() {
+                        mark_style
+                    } else {
+                        mark_style.add_modifier(Modifier::BOLD)
+                    },
                 );
                 let lines = wrapped_welcome_note_summary(note, inner_w_actual);
                 let code_style = row_style.fg(self.theme.ui(crate::markdown::CODE));
@@ -65221,6 +65529,9 @@ impl App {
                 }
                 if rect_contains(self.welcome_tour_button, m.column, m.row) {
                     self.start_demo();
+                    return;
+                }
+                if self.click_welcome_start(m.column, m.row) {
                     return;
                 }
                 if in_tree_scrollbar {

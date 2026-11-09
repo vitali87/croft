@@ -722,6 +722,7 @@ fn black_theme_sidebar_titles_are_chipless_brand_headers() {
     use crate::gradient::{PANEL_TITLE_FG, rgb_color};
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.apply_theme(crate::theme::Theme::BLACK);
     let buf = render_buf(&mut app);
     let tree = app.tree.last_area;
     assert_eq!(buf[(tree.x + 2, tree.y)].symbol(), "E");
@@ -731,6 +732,55 @@ fn black_theme_sidebar_titles_are_chipless_brand_headers() {
     let remote = app.remote.last_area;
     assert_eq!(buf[(remote.x + 2, remote.y)].symbol(), "R");
     assert_eq!(buf[(remote.x + 2, remote.y)].fg, rgb_color(PANEL_TITLE_FG));
+}
+
+/// Croft Loch's side bar titles say where focus is: EXPLORER in the strong
+/// ink while the tree has the keyboard and muted once it moves on, never
+/// bold, with the accent lip starting a cell past the title.
+#[test]
+fn croft_loch_side_bar_title_is_strong_only_while_focused() {
+    let t = crate::widgets::surface::tones(crate::theme::Theme::LOCH).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let buf = render_buf(&mut app);
+    let tree = app.tree.last_area;
+    let e = (tree.x + 2, tree.y);
+    assert_eq!(buf[e].symbol(), "E");
+    assert_eq!(buf[e].fg, t.strong(), "the focused view's title");
+    assert!(!buf[e].modifier.contains(Modifier::BOLD));
+    assert_eq!(buf[(tree.x + 10, tree.y)].symbol(), " ", "breathing room");
+    assert_eq!(buf[(tree.x + 11, tree.y)].symbol(), "\u{2594}", "the lip");
+    app.focus_pane(Pane::Editor);
+    let buf = render_buf(&mut app);
+    assert_eq!(buf[e].fg, t.muted(), "an unfocused view's title recedes");
+}
+
+/// Croft Loch: a hairline closes the tree off from the stacked section
+/// under it, the same seam every section draws below itself, and the
+/// section headers wear the muted codicon chevron.
+#[test]
+fn croft_loch_explorer_sections_are_divided_by_hairlines() {
+    let t = crate::widgets::surface::tones(crate::theme::Theme::LOCH).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("a.txt"), "x\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&tmp.path().join("a.txt")).unwrap();
+    if !app.explorer_views.is_visible(ExplorerView::Outline) {
+        app.toggle_explorer_view(ExplorerView::Outline);
+    }
+    let buf = render_buf(&mut app);
+    let tree = app.tree.last_area;
+    let outline = app.outline.last_area;
+    assert_eq!(outline.y, tree.bottom(), "the outline follows the tree");
+    let seam = (tree.x + 3, tree.bottom() - 1);
+    assert_eq!(buf[seam].symbol(), "\u{2581}", "a hairline under the tree");
+    assert_eq!(buf[seam].fg, t.hairline());
+    let chevron = (outline.x + 1, outline.y);
+    assert_eq!(
+        buf[chevron].symbol(),
+        crate::widgets::surface::CHEVRON_FOLDED.to_string()
+    );
+    assert_eq!(buf[chevron].fg, t.muted());
 }
 
 /// #1583: a German catalog for the frame's own titles, as a translator
@@ -886,6 +936,7 @@ fn black_theme_remote_header_buttons_are_near_white_icons() {
     use crate::gradient::{PANEL_TITLE_FG, rgb_color};
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.apply_theme(crate::theme::Theme::BLACK);
     app.sidebar_view = SidebarView::Remote;
     let buf = render_buf(&mut app);
     let add = app.remote.header_add_btn;
@@ -897,6 +948,21 @@ fn black_theme_remote_header_buttons_are_near_white_icons() {
     assert_eq!(buf[(add.x, add.y)].fg, rgb_color(PANEL_TITLE_FG));
 }
 
+/// Croft Loch's view header buttons (Remote's `+` and refresh, Source
+/// Control's refresh and `⋯`) rest as muted icons, not bold near-white.
+#[test]
+fn croft_loch_side_bar_header_buttons_rest_muted() {
+    let t = crate::widgets::surface::tones(crate::theme::Theme::LOCH).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.sidebar_view = SidebarView::Remote;
+    let buf = render_buf(&mut app);
+    let add = app.remote.header_add_btn;
+    assert!(add.width > 0, "remote header add button must render");
+    assert_eq!(buf[(add.x, add.y)].fg, t.muted());
+    assert!(!buf[(add.x, add.y)].modifier.contains(Modifier::BOLD));
+}
+
 #[test]
 fn black_theme_active_editor_tab_wears_the_teal_selection_fill() {
     use crate::gradient::{POPUP_SEL_BG, rgb_color};
@@ -904,6 +970,7 @@ fn black_theme_active_editor_tab_wears_the_teal_selection_fill() {
     let f = tmp.path().join("probe.txt");
     std::fs::write(&f, "alpha\n").unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.apply_theme(crate::theme::Theme::BLACK);
     app.editor.open_pinned(&f).unwrap();
     let buf = render_buf(&mut app);
     assert!(

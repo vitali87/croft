@@ -17,7 +17,6 @@ use crate::git::GraphCommit;
 use crate::theme::Theme;
 use crate::widgets::scrollbar;
 
-const COLOR_HEADER: Color = Color::Rgb(0xE8, 0xEE, 0xF8);
 const COLOR_DIM: Color = Color::Rgb(0x60, 0x68, 0x78);
 const COLOR_SUMMARY: Color = Color::Rgb(0xCC, 0xCC, 0xCC);
 const COLOR_TAG: Color = Color::Rgb(0xEB, 0xCB, 0x8B);
@@ -335,32 +334,21 @@ impl Widget for &mut CommitGraphPanel {
             ..inner
         };
 
-        let chevron = if self.collapsed {
-            crate::icons::CHEVRON_CLOSED
-        } else {
-            crate::icons::CHEVRON_OPEN
-        };
         let header_y = inner.y;
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                format!("{chevron} "),
-                Style::default().fg(self.theme.ui(COLOR_DIM)),
-            ),
-            Span::styled(
-                "COMMITS",
-                Style::default()
-                    .fg(self.theme.ui(COLOR_HEADER))
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]))
-        .render(
-            Rect {
-                x: inner.x,
-                y: header_y,
-                width: inner.width,
-                height: 1,
-            },
+        let header_row = Rect {
+            x: inner.x,
+            y: header_y,
+            width: inner.width,
+            height: 1,
+        };
+        crate::widgets::surface::paint_section_header(
             buf,
+            header_row,
+            self.theme,
+            !self.collapsed,
+            "COMMITS",
+            Vec::new(),
+            crate::widgets::hover::contains(header_row, self.hover_pointer),
         );
         self.last_header_row = header_y;
         self.last_header_x = inner.x;

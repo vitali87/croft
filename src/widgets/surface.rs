@@ -339,6 +339,177 @@ pub fn section_block<'a>(theme: Theme, borders: Borders, style: Style) -> Block<
     }
 }
 
+/// The codicon chevrons a `surfaces` theme folds rows with (`chevron-right`,
+/// `chevron-down`), the pair the panel's own toggles already draw, so the
+/// side bar and the panel speak one icon family.
+pub const CHEVRON_FOLDED: char = '\u{eab6}';
+pub const CHEVRON_UNFOLDED: char = '\u{eab4}';
+
+/// The chevron a folding row shows: the codicon pair under `surfaces`, the
+/// geometric triangles ([`crate::icons::CHEVRON_OPEN`]) a boxed theme has
+/// always drawn. Both are one cell wide, so nothing after them moves.
+pub fn chevron(theme: Theme, open: bool) -> char {
+    match (theme.surfaces().is_some(), open) {
+        (true, true) => CHEVRON_UNFOLDED,
+        (true, false) => CHEVRON_FOLDED,
+        (false, true) => crate::icons::CHEVRON_OPEN,
+        (false, false) => crate::icons::CHEVRON_CLOSED,
+    }
+}
+
+/// The boxed themes' section-header inks: a dim chevron and a near-white
+/// bold label, shared by every stacked section so they can never drift.
+const SECTION_DIM: Color = Color::Rgb(0x60, 0x68, 0x78);
+const SECTION_LABEL: Color = Color::Rgb(0xE8, 0xEE, 0xF8);
+
+/// Paint the header of a stacked side-bar section (Outline, Timeline,
+/// Dependencies, Open Editors, the agent lane, the commit graph) on `row`:
+/// the chevron, the label and any `tail` spans after it (a count).
+///
+/// On a boxed theme this is the dim triangle and the bold near-white label
+/// those sections have always drawn. Under `surfaces` the header steps back
+/// a level from the view title: a muted codicon chevron, the label muted
+/// while folded and body text while open (calm, so the rows beneath carry
+/// the weight), and the pointer lifts the row the way it lifts a tree row,
+/// with the label taking the strong ink. `row` is the clickable header row;
+/// its last cell is the pane's right padding and stays out of the lift.
+pub fn paint_section_header(
+    buf: &mut Buffer,
+    row: Rect,
+    theme: Theme,
+    open: bool,
+    label: &str,
+    tail: Vec<Span<'static>>,
+    hovered: bool,
+) {
+    use ratatui::text::Line;
+    use ratatui::widgets::{Paragraph, Widget};
+    let row = row.intersection(buf.area);
+    if row.width == 0 || row.height == 0 {
+        return;
+    }
+    let chev = chevron(theme, open);
+    let Some(t) = tones(theme) else {
+        let mut spans = vec![
+            Span::styled(
+                format!("{chev} "),
+                Style::default().fg(theme.ui(SECTION_DIM)),
+            ),
+            Span::styled(
+                label.to_string(),
+                Style::default()
+                    .fg(theme.ui(SECTION_LABEL))
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ];
+        spans.extend(tail);
+        Paragraph::new(Line::from(spans)).render(row, buf);
+        return;
+    };
+    if hovered {
+        let lift = Rect {
+            width: row.width.saturating_sub(1).max(1),
+            ..row
+        };
+        buf.set_style(lift, Style::default().bg(t.hover_on(t.chrome)));
+    }
+    let label_fg = if hovered {
+        t.strong()
+    } else if open {
+        t.text()
+    } else {
+        t.muted()
+    };
+    let mut spans = vec![
+        Span::styled(
+            format!("{chev} "),
+            Style::default().fg(if hovered { t.text() } else { t.muted() }),
+        ),
+        Span::styled(
+            label.to_string(),
+            Style::default().fg(label_fg).add_modifier(Modifier::BOLD),
+        ),
+    ];
+    spans.extend(tail);
+    buf.set_line(row.x, row.y, &Line::from(spans), row.width);
+}
+
+/// A text field on a `surfaces` theme: `rect`'s inner cells on the raised
+/// tone, ringed by a one-eighth-block outline in `edge` that hugs them from
+/// the frame cells around (`▁` above, `▔` below, `▕` and `▏` at the sides),
+/// so the field reads as a recessed well with a crisp edge rather than a
+/// line box. The corners stay blank: at an eighth of a cell the missing
+/// corner pixel is not visible. The inner rect is a bordered block's, so
+/// text and caret land exactly where they would inside a line box.
+pub fn paint_field(buf: &mut Buffer, rect: Rect, t: Tones, edge: Color) {
+    if rect.width < 2 || rect.height < 2 || rect.intersection(buf.area) != rect {
+        return;
+    }
+    let inner = Rect::new(rect.x + 1, rect.y + 1, rect.width - 2, rect.height - 2);
+    buf.set_style(inner, Style::default().bg(t.raised()));
+    let (right, bottom) = (rect.right() - 1, rect.bottom() - 1);
+    for x in rect.x..=right {
+        let corner = x == rect.x || x == right;
+        for (y, glyph) in [(rect.y, "\u{2581}"), (bottom, "\u{2594}")] {
+            let cell = &mut buf[(x, y)];
+            cell.set_symbol(if corner { " " } else { glyph });
+            cell.set_fg(edge);
+        }
+    }
+    for y in inner.top()..inner.bottom() {
+        for (x, glyph) in [(rect.x, "\u{2595}"), (right, "\u{258f}")] {
+            let cell = &mut buf[(x, y)];
+            cell.set_symbol(glyph);
+            cell.set_fg(edge);
+        }
+    }
+}
+
+/// A button's slab on a `surfaces` theme: a `fill`-coloured body whose first
+/// and last rows are half blocks (`▄` over, `▀` under), so a three-row
+/// button reads two rows tall, centred on its label row, with quadrant
+/// notches (`▗▖▝▘`) softening the corners on the ends that are `round`.
+/// An unrounded end is where a split button's halves join. A button shorter
+/// than three rows is a plain slab. The click target stays the full `area`.
+pub fn paint_soft_button(
+    buf: &mut Buffer,
+    area: Rect,
+    fill: Color,
+    round_left: bool,
+    round_right: bool,
+) {
+    let area = area.intersection(buf.area);
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    buf.set_style(
+        Rect {
+            y: area.y + u16::from(area.height >= 3),
+            height: area.height - 2 * u16::from(area.height >= 3),
+            ..area
+        },
+        Style::default().bg(fill),
+    );
+    for y in area.top()..area.bottom() {
+        for x in area.left()..area.right() {
+            buf[(x, y)].set_symbol(" ");
+        }
+    }
+    if area.height < 3 {
+        return;
+    }
+    let (right, bottom) = (area.right() - 1, area.bottom() - 1);
+    for x in area.left()..=right {
+        let (top, under) = match (x == area.x && round_left, x == right && round_right) {
+            (true, _) => ("\u{2597}", "\u{259d}"),
+            (_, true) => ("\u{2596}", "\u{2598}"),
+            _ => ("\u{2584}", "\u{2580}"),
+        };
+        buf[(x, area.y)].set_symbol(top).set_fg(fill);
+        buf[(x, bottom)].set_symbol(under).set_fg(fill);
+    }
+}
+
 /// The block a pane renders under a `surfaces` theme: the same one-cell
 /// inset as a bordered box, painted as padding in `fill`, which also becomes
 /// the background of everything the pane leaves unpainted.
@@ -827,6 +998,103 @@ mod tests {
         paint_overlay_frame(&mut ours, card, Theme::BLACK);
         crate::gradient::paint_gradient_box(&mut theirs, card);
         assert_eq!(ours, theirs);
+    }
+
+    /// A boxed theme's section header is exactly what the six stacked
+    /// sections drew before they shared it: the dim triangle and the bold
+    /// near-white label.
+    #[test]
+    fn a_boxed_section_header_is_the_dim_triangle_and_bold_label() {
+        use ratatui::text::Line;
+        use ratatui::widgets::{Paragraph, Widget};
+        let theme = Theme::BLACK;
+        let row = Rect::new(1, 0, 20, 1);
+        let mut ours = Buffer::empty(Rect::new(0, 0, 22, 1));
+        paint_section_header(&mut ours, row, theme, false, "OUTLINE", Vec::new(), true);
+        let mut theirs = Buffer::empty(Rect::new(0, 0, 22, 1));
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                format!("{} ", crate::icons::CHEVRON_CLOSED),
+                Style::default().fg(theme.ui(SECTION_DIM)),
+            ),
+            Span::styled(
+                "OUTLINE",
+                Style::default()
+                    .fg(theme.ui(SECTION_LABEL))
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]))
+        .render(row, &mut theirs);
+        assert_eq!(ours, theirs);
+    }
+
+    /// Croft Loch's section header: a muted codicon chevron, the label
+    /// muted while folded and body text while open, and a neutral lift
+    /// with the strong ink under the pointer that stops short of the pane's
+    /// right padding.
+    #[test]
+    fn a_croft_loch_section_header_is_calm_and_lifts_under_the_pointer() {
+        let theme = loch();
+        let t = tones(theme).unwrap();
+        let row = Rect::new(1, 0, 20, 1);
+        let paint = |open: bool, hovered: bool| {
+            let mut buf = Buffer::empty(Rect::new(0, 0, 22, 1));
+            buf.set_style(buf.area, Style::default().bg(t.chrome()));
+            paint_section_header(&mut buf, row, theme, open, "OUTLINE", Vec::new(), hovered);
+            buf
+        };
+        let folded = paint(false, false);
+        assert_eq!(folded[(1, 0)].symbol(), CHEVRON_FOLDED.to_string());
+        assert_eq!(folded[(1, 0)].fg, t.muted());
+        assert_eq!(folded[(3, 0)].fg, t.muted(), "a folded label is muted");
+        assert_eq!(folded[(3, 0)].bg, t.chrome());
+        let open = paint(true, false);
+        assert_eq!(open[(1, 0)].symbol(), CHEVRON_UNFOLDED.to_string());
+        assert_eq!(open[(3, 0)].fg, t.text());
+        let hovered = paint(true, true);
+        assert_eq!(hovered[(3, 0)].fg, t.strong());
+        assert_eq!(hovered[(3, 0)].bg, t.hover_on(t.chrome));
+        assert_eq!(hovered[(20, 0)].bg, t.chrome(), "the padding stays chrome");
+    }
+
+    /// A field's edge hugs its raised inner cells from the frame cells
+    /// around them; the corners stay blank and the inner rect is untouched.
+    #[test]
+    fn a_field_is_a_raised_well_inside_an_eighth_block_edge() {
+        let t = tones(loch()).unwrap();
+        let mut buf = Buffer::empty(Rect::new(0, 0, 6, 3));
+        let area = buf.area;
+        paint_field(&mut buf, area, t, t.rim());
+        let rows: Vec<String> = (0..3)
+            .map(|y| (0..6).map(|x| buf[(x, y)].symbol()).collect())
+            .collect();
+        assert_eq!(rows[0], " \u{2581}\u{2581}\u{2581}\u{2581} ");
+        assert_eq!(rows[1], "\u{2595}    \u{258f}");
+        assert_eq!(rows[2], " \u{2594}\u{2594}\u{2594}\u{2594} ");
+        assert_eq!(buf[(2, 1)].bg, t.raised());
+        assert_eq!(buf[(0, 1)].fg, t.rim());
+    }
+
+    /// A soft button is three rows whose caps are half blocks, so it reads
+    /// two rows tall; only its rounded ends take the quadrant notches.
+    #[test]
+    fn a_soft_button_has_half_block_caps_and_notched_round_ends() {
+        let fill = Color::Rgb(0x0e, 0x7e, 0x76);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 5, 3));
+        let area = buf.area;
+        paint_soft_button(&mut buf, area, fill, true, false);
+        let rows: Vec<String> = (0..3)
+            .map(|y| (0..5).map(|x| buf[(x, y)].symbol()).collect())
+            .collect();
+        assert_eq!(rows[0], "\u{2597}\u{2584}\u{2584}\u{2584}\u{2584}");
+        assert_eq!(rows[2], "\u{259d}\u{2580}\u{2580}\u{2580}\u{2580}");
+        assert_eq!(buf[(1, 0)].fg, fill);
+        assert_eq!(
+            buf[(1, 0)].bg,
+            Color::Reset,
+            "the cap keeps what is under it"
+        );
+        assert_eq!(buf[(2, 1)].bg, fill);
     }
 
     #[test]

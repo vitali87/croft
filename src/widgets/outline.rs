@@ -11,7 +11,7 @@ use std::path::PathBuf;
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::{Color, Style},
     text::{Line, Span},
     widgets::{Borders, Paragraph, Widget},
 };
@@ -21,7 +21,6 @@ use crate::lsp::manager::OutlineSymbol;
 use crate::theme::Theme;
 use crate::widgets::scrollbar;
 
-const COLOR_HEADER: Color = Color::Rgb(0xE8, 0xEE, 0xF8);
 const COLOR_DIM: Color = Color::Rgb(0x60, 0x68, 0x78);
 const COLOR_NAME: Color = Color::Rgb(0xCC, 0xCC, 0xCC);
 
@@ -427,33 +426,22 @@ impl Widget for &mut OutlinePanel {
             ..inner
         };
 
-        // Header: chevron + OUTLINE, matching the SYSTEM panel's styling.
-        let chevron = if self.collapsed {
-            icons::CHEVRON_CLOSED
-        } else {
-            icons::CHEVRON_OPEN
-        };
+        // Header: chevron + OUTLINE, the shared section header.
         let header_y = inner.y;
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                format!("{chevron} "),
-                Style::default().fg(self.theme.ui(COLOR_DIM)),
-            ),
-            Span::styled(
-                crate::i18n::tr("OUTLINE"),
-                Style::default()
-                    .fg(self.theme.ui(COLOR_HEADER))
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]))
-        .render(
-            Rect {
-                x: inner.x,
-                y: header_y,
-                width: inner.width,
-                height: 1,
-            },
+        let header_row = Rect {
+            x: inner.x,
+            y: header_y,
+            width: inner.width,
+            height: 1,
+        };
+        crate::widgets::surface::paint_section_header(
             buf,
+            header_row,
+            self.theme,
+            !self.collapsed,
+            &crate::i18n::tr("OUTLINE"),
+            Vec::new(),
+            crate::widgets::hover::contains(header_row, self.hover_pointer),
         );
         self.last_header_row = header_y;
         self.last_header_x = inner.x;

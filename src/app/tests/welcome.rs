@@ -184,79 +184,104 @@ fn welcome_tagline_constant_is_present() {
 /// #1843: the version never shares a cell with the logo or the tagline, at
 /// any window size and whatever height the release-note card takes. The
 /// logo's cells are the image's, edge to edge; the tagline's last column
-/// reaches the badge's first, and once painted over its corner.
+/// reaches the badge's first, and once painted over its corner. Croft
+/// Black boxes the version beside the logo; Croft Loch sets it as a one-row
+/// pill on the box's middle row, in the same columns.
 #[test]
 fn the_welcome_version_never_overlaps_the_logo_or_the_tagline() {
     let tmp = tempfile::tempdir().unwrap();
     let version = format!("v{}", env!("CARGO_PKG_VERSION"));
-    let mut seen_badge = false;
-    let mut seen_below = false;
-    for notes in [Vec::new(), long_test_note()] {
-        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-        app.welcome.set_test_notes(notes);
-        for w in (30..=200).step_by(3) {
-            for h in (8..=56).step_by(2) {
-                let mut term =
-                    ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
-                term.draw(|f| app.render_welcome(f, f.area())).unwrap();
-                let buf = term.backend().buffer();
-                let rows: Vec<String> = (0..h)
-                    .map(|y| (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect())
-                    .collect();
-                let logo = *app.overlays.welcome.layout().expect("laid out");
-                // Beside the logo or in the row under it; the release-note
-                // card further down names the version too.
-                let hits: Vec<(u16, u16)> = rows
-                    .iter()
-                    .enumerate()
-                    .take((logo.cell_y + logo.cell_h + 1) as usize)
-                    .filter_map(|(y, r)| {
-                        r.find(&version)
-                            .map(|i| (r[..i].chars().count() as u16, y as u16))
-                    })
-                    .collect();
-                let Some(&(vx, vy)) = hits.first() else {
-                    continue;
-                };
-                assert_eq!(hits.len(), 1, "one version at {w}x{h}");
-                let boxed = vx >= 2 && buf[(vx - 2, vy)].symbol() == "\u{2502}";
-                let (x0, x1, y0, y1) = if boxed {
-                    seen_badge = true;
+    for theme in [crate::theme::Theme::BLACK, crate::theme::Theme::LOCH] {
+        let loch = theme.surfaces().is_some();
+        let tagline = if loch {
+            App::WELCOME_TAGLINE_CALM
+        } else {
+            WELCOME_TAGLINE
+        };
+        let mut seen_badge = false;
+        let mut seen_below = false;
+        for notes in [Vec::new(), long_test_note()] {
+            let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+            app.apply_theme(theme);
+            app.welcome.set_test_notes(notes);
+            for w in (30..=200).step_by(3) {
+                for h in (8..=56).step_by(2) {
+                    let mut term =
+                        ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+                    term.draw(|f| app.render_welcome(f, f.area())).unwrap();
+                    let buf = term.backend().buffer();
+                    let rows: Vec<String> = (0..h)
+                        .map(|y| (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect())
+                        .collect();
+                    let logo = *app.overlays.welcome.layout().expect("laid out");
+                    // Beside the logo or in the row under it; the release-note
+                    // card further down names the version too.
+                    let hits: Vec<(u16, u16)> = rows
+                        .iter()
+                        .enumerate()
+                        .take((logo.cell_y + logo.cell_h + 1) as usize)
+                        .filter_map(|(y, r)| {
+                            r.find(&version)
+                                .map(|i| (r[..i].chars().count() as u16, y as u16))
+                        })
+                        .collect();
+                    let Some(&(vx, vy)) = hits.first() else {
+                        continue;
+                    };
+                    assert_eq!(hits.len(), 1, "one version at {w}x{h}");
                     let x1 = vx + version.chars().count() as u16 + 1;
-                    for (x, y, corner) in [
-                        (vx - 2, vy - 1, "\u{256d}"),
-                        (x1, vy - 1, "\u{256e}"),
-                        (vx - 2, vy + 1, "\u{2570}"),
-                        (x1, vy + 1, "\u{256f}"),
-                    ] {
-                        assert_eq!(buf[(x, y)].symbol(), corner, "badge corner at {w}x{h}");
-                    }
-                    (vx - 2, x1, vy - 1, vy + 1)
-                } else {
-                    seen_below = true;
-                    (vx, vx + version.chars().count() as u16 - 1, vy, vy)
-                };
-                let logo_x1 = logo.cell_x + logo.cell_w - 1;
-                let logo_y1 = logo.cell_y + logo.cell_h - 1;
-                assert!(
-                    x1 < logo.cell_x || x0 > logo_x1 || y1 < logo.cell_y || y0 > logo_y1,
-                    "the version overlaps the logo at {w}x{h}"
-                );
-                if let Some(t) = rows.iter().position(|r| r.contains(WELCOME_TAGLINE)) {
-                    let t = t as u16;
+                    let boxed = !loch && vx >= 2 && buf[(vx - 2, vy)].symbol() == "\u{2502}";
+                    let pill = loch && vx >= 2 && buf[(vx - 2, vy)].symbol() == "\u{2590}";
+                    let (x0, x1, y0, y1) = if boxed {
+                        seen_badge = true;
+                        for (x, y, corner) in [
+                            (vx - 2, vy - 1, "\u{256d}"),
+                            (x1, vy - 1, "\u{256e}"),
+                            (vx - 2, vy + 1, "\u{2570}"),
+                            (x1, vy + 1, "\u{256f}"),
+                        ] {
+                            assert_eq!(buf[(x, y)].symbol(), corner, "badge corner at {w}x{h}");
+                        }
+                        (vx - 2, x1, vy - 1, vy + 1)
+                    } else if pill {
+                        seen_badge = true;
+                        assert_eq!(buf[(x1, vy)].symbol(), "\u{258c}", "pill cap at {w}x{h}");
+                        for y in [vy.saturating_sub(1), vy + 1] {
+                            for x in vx - 2..=x1 {
+                                assert!(
+                                    !"\u{256d}\u{256e}\u{2570}\u{256f}\u{2500}\u{2502}"
+                                        .contains(buf[(x, y)].symbol()),
+                                    "Croft Loch draws no box round the version at {w}x{h}"
+                                );
+                            }
+                        }
+                        (vx - 2, x1, vy, vy)
+                    } else {
+                        seen_below = true;
+                        (vx, vx + version.chars().count() as u16 - 1, vy, vy)
+                    };
+                    let logo_x1 = logo.cell_x + logo.cell_w - 1;
+                    let logo_y1 = logo.cell_y + logo.cell_h - 1;
                     assert!(
-                        t < y0 || t > y1,
-                        "the tagline crosses the version at {w}x{h}"
+                        x1 < logo.cell_x || x0 > logo_x1 || y1 < logo.cell_y || y0 > logo_y1,
+                        "the version overlaps the logo at {w}x{h}"
                     );
+                    if let Some(t) = rows.iter().position(|r| r.contains(tagline)) {
+                        let t = t as u16;
+                        assert!(
+                            t < y0 || t > y1,
+                            "the tagline crosses the version at {w}x{h}"
+                        );
+                    }
                 }
             }
         }
+        assert!(seen_badge, "the badge beside the logo must be exercised");
+        assert!(
+            seen_below,
+            "the version under a narrow logo must be exercised"
+        );
     }
-    assert!(seen_badge, "the boxed badge must be exercised");
-    assert!(
-        seen_below,
-        "the version under a narrow logo must be exercised"
-    );
 }
 
 #[test]
@@ -353,8 +378,9 @@ fn the_welcome_logo_bakes_off_the_ui_thread() {
         app.overlays.welcome.image_is_none(),
         "the frame waited for the logo bake"
     );
+    let text = cells_text(term.backend().buffer(), logo);
     assert!(
-        !cells_text(term.backend().buffer(), logo).contains("croft"),
+        !text.contains("croft") && !text.contains("cr<>ft"),
         "the text label flashed where the logo is about to go"
     );
     crate::test_budget::await_spawned(
@@ -398,24 +424,41 @@ fn a_welcome_logo_baked_for_an_old_layout_never_goes_up() {
 }
 
 /// A logo that cannot be baked at all (no image protocol to send it with)
-/// falls back to the text label, as before.
+/// falls back to the text label: the plain name on Croft Black, the
+/// `cr<>ft` wordmark on Croft Loch, its `<>` in the brand orange.
 #[test]
 fn a_welcome_logo_that_fails_to_bake_falls_back_to_the_label() {
-    let tmp = tempfile::tempdir().unwrap();
-    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.inline_protocol = crate::iterm2_inline::InlineImageProtocol::None;
-    app.cell_pixel = Some((8, 16));
-    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
-    term.draw(|f| app.render_welcome(f, f.area())).unwrap();
-    crate::test_budget::await_spawned(
-        std::time::Duration::from_millis(500),
-        "the welcome logo bake to land",
-        || app.poll_welcome_bake(),
-    );
-    assert!(app.overlays.welcome.image_is_none());
-    term.draw(|f| app.render_welcome(f, f.area())).unwrap();
-    let logo = *app.overlays.welcome.layout().expect("laid out");
-    assert!(cells_text(term.backend().buffer(), logo).contains("croft"));
+    for (theme, label) in [
+        (crate::theme::Theme::BLACK, "croft"),
+        (crate::theme::Theme::LOCH, "cr<>ft"),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.apply_theme(theme);
+        app.inline_protocol = crate::iterm2_inline::InlineImageProtocol::None;
+        app.cell_pixel = Some((8, 16));
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        term.draw(|f| app.render_welcome(f, f.area())).unwrap();
+        crate::test_budget::await_spawned(
+            std::time::Duration::from_millis(500),
+            "the welcome logo bake to land",
+            || app.poll_welcome_bake(),
+        );
+        assert!(app.overlays.welcome.image_is_none());
+        term.draw(|f| app.render_welcome(f, f.area())).unwrap();
+        let logo = *app.overlays.welcome.layout().expect("laid out");
+        let buf = term.backend().buffer();
+        let text = cells_text(buf, logo);
+        assert!(text.contains(label), "{label:?} in {text:?}");
+        if theme.surfaces().is_some() {
+            let at = text.find("<>").unwrap();
+            let (x, y) = (
+                logo.cell_x + (at as u16 % logo.cell_w),
+                logo.cell_y + (at as u16 / logo.cell_w),
+            );
+            assert_eq!(buf[(x, y)].fg, crate::theme::BRAND_ORANGE);
+        }
+    }
 }
 
 #[test]
@@ -544,8 +587,9 @@ fn welcome_paints_a_full_bordered_box_around_the_editor_area() {
 }
 
 /// Croft Loch draws the welcome page the way it draws an open editor: its
-/// frame is padding on the canvas, not a line box, and the page's content
-/// lands on exactly the cells it does under a boxed theme.
+/// frame is padding on the canvas, not a line box, and the page inside it
+/// is drawn in seams and surfaces too: no box-drawing glyph anywhere, the
+/// release card a raised surface rather than the gradient box.
 #[test]
 fn croft_loch_welcome_is_padding_on_the_canvas_with_the_boxed_inset() {
     let tmp = tempfile::tempdir().unwrap();
@@ -578,11 +622,161 @@ fn croft_loch_welcome_is_padding_on_the_canvas_with_the_boxed_inset() {
         assert_eq!(loch[(x, y)].symbol(), " ", "padding at ({x}, {y})");
     }
     for (x, y) in cells(inner) {
-        assert_eq!(
-            loch[(x, y)].symbol(),
-            black[(x, y)].symbol(),
-            "the content at ({x}, {y}) moved"
+        assert!(
+            !"─│┌┐└┘╭╮╰╯".contains(loch[(x, y)].symbol()),
+            "a line-box glyph at ({x}, {y}) on Croft Loch's welcome"
         );
+    }
+}
+
+/// Croft Loch's release card: a raised surface with a quiet rim, headed
+/// "What's new" in the muted ink with the version right-aligned, its notes
+/// marked `+` (feature) and `•` (fix) rather than a rocket and a bug.
+#[test]
+fn croft_loch_release_card_is_a_raised_surface_with_quiet_marks() {
+    let t = crate::widgets::surface::tones(crate::theme::Theme::LOCH).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.welcome.set_test_notes(vec![
+        note_fixture(crate::release_notes::NoteKind::Feature, "Did a new thing"),
+        note_fixture(crate::release_notes::NoteKind::Fix, "Fixed an old thing"),
+    ]);
+    let area = Rect::new(0, 0, 120, 44);
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 44)).unwrap();
+    term.draw(|f| app.render_welcome(f, area)).unwrap();
+    let buf = term.backend().buffer();
+    let find = |needle: &str| -> (u16, u16) {
+        for y in 0..area.height {
+            let row: String = (0..area.width).map(|x| buf[(x, y)].symbol()).collect();
+            if let Some(i) = row.find(needle) {
+                return (row[..i].chars().count() as u16, y);
+            }
+        }
+        panic!("{needle} not on screen");
+    };
+    let (hx, hy) = find("What's new");
+    assert_eq!(buf[(hx, hy)].fg, t.muted());
+    assert_eq!(buf[(hx, hy)].bg, t.raised(), "on the raised card");
+    let header: String = (0..area.width).map(|x| buf[(x, hy)].symbol()).collect();
+    let version = format!("v{}", env!("CARGO_PKG_VERSION"));
+    let vx = header
+        .find(&version)
+        .expect("the version on the header row") as u16;
+    assert!(vx > hx + 10, "the version right-aligned on the header");
+    assert_eq!(buf[(vx, hy)].fg, t.muted());
+    let (fx, fy) = find("Did a new thing");
+    assert_eq!(buf[(fx - 2, fy)].symbol(), "+");
+    assert_eq!(buf[(fx, fy)].fg, t.text());
+    let (bx, by) = find("Fixed an old thing");
+    assert_eq!(buf[(bx - 2, by)].symbol(), "\u{2022}");
+    assert_eq!(buf[(bx - 2, by)].fg, t.muted());
+    for (x, y) in (0..area.height).flat_map(|y| (0..area.width).map(move |x| (x, y))) {
+        let s = buf[(x, y)].symbol();
+        assert!(
+            s != "\u{f135}" && s != "\u{f188}",
+            "no rocket or bug at ({x},{y})"
+        );
+    }
+    // The tagline is the calm one, muted and italic.
+    let (tx, ty) = find(App::WELCOME_TAGLINE_CALM);
+    assert_eq!(buf[(tx, ty)].fg, t.muted());
+    assert!(buf[(tx, ty)].modifier.contains(Modifier::ITALIC));
+}
+
+/// Croft Loch's welcome offers a Start list when the window has the
+/// height: each action with its chord as keycaps (the palette's own chord
+/// text), and a click runs it. The tour rides along as a row.
+#[test]
+fn croft_loch_welcome_start_list_shows_keycaps_and_runs_on_click() {
+    let tmp = tempfile::tempdir().unwrap();
+    let area = Rect::new(0, 0, 120, 50);
+    let draw = |app: &mut App| {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 50)).unwrap();
+        term.draw(|f| app.render_welcome(f, area)).unwrap();
+        term.backend().buffer().clone()
+    };
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.welcome.set_test_notes(long_test_note());
+    app.tour_done = false;
+    let buf = draw(&mut app);
+    let rows: Vec<String> = (0..area.height)
+        .map(|y| (0..area.width).map(|x| buf[(x, y)].symbol()).collect())
+        .collect();
+    let row_of = |needle: &str| rows.iter().position(|r| r.contains(needle));
+    let start = row_of("Start").expect("the Start heading");
+    let new_file = row_of("New File").expect("a New File row");
+    let card = row_of("deliberately").expect("the card is whole");
+    assert!(
+        start < new_file && new_file < card,
+        "Start sits above the card"
+    );
+    assert!(rows[card..].iter().any(|r| r.contains("cardclip-endcap.")));
+    let quick = crate::widgets::command_palette::platform_hint("Cmd+P");
+    let (_, key) = quick.split_once('+').unwrap();
+    let go_to = row_of("Go to File").unwrap();
+    assert!(
+        rows[go_to].contains(&format!(" {key} ")),
+        "the chord as keycaps: {:?}",
+        rows[go_to]
+    );
+    // The tour is a row of the list, and its click target.
+    let tour = row_of("Take the Tour").unwrap();
+    assert_eq!(app.welcome_tour_button.y, tour as u16);
+    assert_eq!(
+        rows.iter().filter(|r| r.contains("Take the Tour")).count(),
+        1
+    );
+
+    let rects = app.welcome.start_rows().to_vec();
+    let palette = rects
+        .iter()
+        .find(|(_, a)| *a == crate::app::welcome::StartAction::CommandPalette)
+        .unwrap()
+        .0;
+    assert!(app.click_welcome_start(palette.x + 3, palette.y));
+    assert!(app.command_palette.is_some(), "the palette opened");
+    app.close_all_modals_for_test();
+    let go = rects
+        .iter()
+        .find(|(_, a)| {
+            *a == crate::app::welcome::StartAction::Command(
+                crate::widgets::command_palette::Command::QuickOpen,
+            )
+        })
+        .unwrap()
+        .0;
+    assert!(app.click_welcome_start(go.x + 3, go.y));
+    assert!(app.file_finder.is_some(), "Go to File opened the finder");
+    assert!(
+        !app.click_welcome_start(go.x + 3, go.y + 30),
+        "not on a row"
+    );
+}
+
+/// The Start list is the first thing a short window gives up, after the
+/// logo has shrunk to its floor: the release card never clips for it.
+#[test]
+fn croft_loch_start_list_yields_before_the_release_card_clips() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.welcome.set_test_notes(long_test_note());
+    for h in (12..=50).step_by(2) {
+        let area = Rect::new(0, 0, 120, h);
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, h)).unwrap();
+        term.draw(|f| app.render_welcome(f, area)).unwrap();
+        let buf = term.backend().buffer();
+        let text: String = (0..h)
+            .map(|y| (0..120).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n");
+        if text.contains("New File") {
+            assert!(
+                text.contains("cardclip-endcap."),
+                "at height {h} the Start list shows over a clipped card"
+            );
+            let logo = *app.overlays.welcome.layout().expect("laid out");
+            assert!(logo.cell_h >= 4, "the logo keeps its floor at height {h}");
+        }
     }
 }
 

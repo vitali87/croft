@@ -7,8 +7,6 @@ use ratatui::{
 };
 use std::path::PathBuf;
 
-const BUTTON_BG_RGB: (u8, u8, u8) = (0x09, 0x67, 0xb8);
-const BUTTON_FG_RGB: (u8, u8, u8) = (0xff, 0xff, 0xff);
 const BODY_FG_RGB: (u8, u8, u8) = (0xb0, 0xb8, 0xc8);
 const TITLE_FG_RGB: (u8, u8, u8) = (0xff, 0xff, 0xff);
 const FOCUS_BORDER_RGB: (u8, u8, u8) = (0x4e, 0x9a, 0xff);
@@ -1325,18 +1323,18 @@ impl Widget for &mut RunDebugPanel {
             height: BUTTON_H,
         };
         self.last_button_area = button_area;
-        // Black theme: brand-teal button fill; Croft Dark keeps VS Code blue.
-        let button_bg = if self.focus_gradient {
-            crate::gradient::rgb_color(crate::gradient::PRIMARY_BTN_BG)
-        } else {
-            Color::Rgb(BUTTON_BG_RGB.0, BUTTON_BG_RGB.1, BUTTON_BG_RGB.2)
-        };
-        crate::widgets::source_control::render_rounded_button(
+        // Black theme: brand-teal button fill; Croft Dark keeps VS Code blue;
+        // Croft Loch draws the shared soft slab.
+        let (button_bg, button_fg) =
+            crate::widgets::source_control::primary_button_colors(self.theme, self.focus_gradient);
+        crate::widgets::source_control::render_button(
             buf,
             button_area,
             label.as_str(),
             button_bg,
-            Color::Rgb(BUTTON_FG_RGB.0, BUTTON_FG_RGB.1, BUTTON_FG_RGB.2),
+            button_fg,
+            self.theme,
+            false,
         );
 
         let mut next_y = button_area.y + button_area.height + 1;
@@ -2031,7 +2029,10 @@ mod tests {
 
     #[test]
     fn run_and_debug_button_uses_rounded_border_corners() {
+        // The line-art corners are the boxed themes'; Croft Loch's soft
+        // slab is checked below.
         let mut panel = RunDebugPanel::new();
+        panel.theme = crate::theme::Theme::BLACK;
         let area = Rect {
             x: 0,
             y: 0,
@@ -2064,6 +2065,26 @@ mod tests {
             br, "╯",
             "bottom-right button corner must be rounded; got {br:?}"
         );
+    }
+
+    /// Croft Loch: the Run and Debug button is the shared soft slab, half
+    /// blocks over and under its label row with notched corners, in the
+    /// brand teal, rather than `╭╮╰╯` arcs on the chrome.
+    #[test]
+    fn croft_loch_run_and_debug_button_is_a_soft_slab() {
+        let mut panel = RunDebugPanel::new();
+        panel.theme = crate::theme::Theme::LOCH;
+        let area = Rect::new(0, 0, 36, 24);
+        let mut buf = Buffer::empty(area);
+        Widget::render(&mut panel, area, &mut buf);
+        let b = panel.last_button_area;
+        assert!(b.height == 3 && b.width >= 4, "button must be laid out");
+        let teal = crate::gradient::rgb_color(crate::gradient::PRIMARY_BTN_BG);
+        assert_eq!(buf[(b.x, b.y)].symbol(), "\u{2597}");
+        assert_eq!(buf[(b.x + 1, b.y)].symbol(), "\u{2584}");
+        assert_eq!(buf[(b.x + 1, b.y)].fg, teal);
+        assert_eq!(buf[(b.right() - 1, b.bottom() - 1)].symbol(), "\u{2598}");
+        assert_eq!(buf[(b.x + b.width / 2, b.y + 1)].bg, teal);
     }
 
     #[test]
