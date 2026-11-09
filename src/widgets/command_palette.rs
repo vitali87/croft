@@ -92,6 +92,9 @@ pub enum Command {
     /// popup Ctrl+Space opens, and the parameter hints typing `(` asks for.
     TriggerSuggest,
     TriggerParameterHints,
+    /// Show or Focus Hover (#1518): the hover popup for the caret, the one
+    /// the pointer's rest opens, from the keyboard.
+    ShowHover,
     MouseAddCursorAtClick,
     MouseGoToDefinitionAtClick,
     MouseOpenLinkAtClick,
@@ -684,6 +687,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::RenameSymbol,
     Command::TriggerSuggest,
     Command::TriggerParameterHints,
+    Command::ShowHover,
     Command::MouseAddCursorAtClick,
     Command::MouseGoToDefinitionAtClick,
     Command::MouseOpenLinkAtClick,
@@ -1170,6 +1174,7 @@ impl Command {
             Command::RenameSymbol => "Rename Symbol",
             Command::TriggerSuggest => "Trigger Suggest",
             Command::TriggerParameterHints => "Trigger Parameter Hints",
+            Command::ShowHover => "Show or Focus Hover",
             Command::MouseAddCursorAtClick => "Mouse: Add Cursor at Click",
             Command::MouseGoToDefinitionAtClick => "Mouse: Go to Definition at Click",
             Command::MouseOpenLinkAtClick => "Mouse: Open Link at Click",
@@ -1672,6 +1677,7 @@ impl Command {
             // No chord of its own: VS Code's Ctrl+Shift+Space is the
             // terminal's Quick Select here. Typing `(` or `,` asks too.
             Command::TriggerParameterHints => "",
+            Command::ShowHover => "Cmd+K Cmd+I",
             Command::MouseAddCursorAtClick => "",
             Command::MouseGoToDefinitionAtClick => "",
             Command::MouseOpenLinkAtClick => "",
@@ -2151,6 +2157,7 @@ impl Command {
             Command::RenameSymbol => "rename_symbol",
             Command::TriggerSuggest => "trigger_suggest",
             Command::TriggerParameterHints => "trigger_parameter_hints",
+            Command::ShowHover => "show_hover",
             Command::MouseAddCursorAtClick => "mouse_add_cursor_at_click",
             Command::MouseGoToDefinitionAtClick => "mouse_go_to_definition_at_click",
             Command::MouseOpenLinkAtClick => "mouse_open_link_at_click",
@@ -3273,6 +3280,8 @@ mod tests {
                 "trigger_suggest",
                 "Ctrl+Space",
             ),
+            // #1518: VS Code's title and chord, so "hover" finds it.
+            ("hover", "Show or Focus Hover", "show_hover", "Cmd+K Cmd+I"),
         ] {
             let mut palette = CommandPalette::new();
             palette.set_query(query);

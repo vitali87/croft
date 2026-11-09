@@ -5238,6 +5238,14 @@ pub struct App {
     /// the editor). Stacked above the async LSP hover reply by `compose_hover`
     /// so a squiggle's message shows even when the server returns no type info.
     hover_diagnostic: Option<String>,
+    /// Set when the keyboard asked for the hover at the caret (#1518), not
+    /// the pointer's rest: its reply is checked against the caret, and says
+    /// there is no hover only over the status line this holds, the one shown
+    /// at the request, so a newer message is not replaced.
+    hover_at_caret: Option<String>,
+    /// The tab and edit count the hover was asked about: a reply after
+    /// either changed (a paste over the word keeps its span) is dropped.
+    hover_doc: (Option<PathBuf>, u64),
     /// Separate dwell timer for the editor tab strip. Hovering a tab for
     /// `HOVER_DELAY` surfaces `tab_tooltip` with the tab's full path so
     /// same-named files can be told apart. Kept distinct from `hover`
@@ -7912,6 +7920,8 @@ impl App {
             hover_anchor: None,
             hover_word: None,
             hover_diagnostic: None,
+            hover_at_caret: None,
+            hover_doc: (None, 0),
             tab_hover: HoverDwell::default(),
             tab_tooltip: None,
             tab_hover_idx: None,
@@ -11791,6 +11801,47 @@ impl App {
         let Some((line, c)) = self.editor.buffer_pos_at(col, row) else {
             return;
         };
+        self.hover_at(line, c, (col, row), false);
+    }
+
+    /// Show or Focus Hover (#1518): the hover the pointer's rest would open,
+    /// for the caret, anchored at the caret's cell. Says so when there is
+    /// nothing to show, where the pointer's hover stays silent.
+    fn show_hover_at_caret(&mut self) {
+        self.hover_popup = None;
+        self.hover_diagnostic = None;
+        self.hover_request_id = None;
+        // A pointer that came to rest just before the command would fire its
+        // own hover next frame and take this one's place.
+        self.hover.clear();
+        let Some(anchor) = self.editor.cursor_screen_pos() else {
+            return;
+        };
+        let (line, c) = self.caret_hover_point();
+        self.hover_at(line, c, anchor, true);
+        if self.hover_popup.is_none() && self.hover_request_id.is_none() {
+            self.status = String::from(NO_HOVER_AT_CARET);
+        }
+    }
+
+    /// The buffer point Show Hover describes: the caret, or the word ending
+    /// at it, as in VS Code, so a hover after typing a name or a word-right
+    /// move shows that word.
+    fn caret_hover_point(&self) -> (usize, usize) {
+        let (line, col) = (self.editor.cursor_row, self.editor.cursor_col);
+        if col > 0
+            && self.editor.hover_region_at(line, col).is_none()
+            && self.editor.word_at(line, col - 1).is_some()
+        {
+            return (line, col - 1);
+        }
+        (line, col)
+    }
+
+    /// Resolve a hover at buffer `(line, c)` with its popup at screen cell
+    /// `anchor`, for the pointer or, with `at_caret`, the caret.
+    fn hover_at(&mut self, line: usize, c: usize, anchor: (u16, u16), at_caret: bool) {
+        let (col, row) = anchor;
         // The region (word, or else a diagnostic span over punctuation) the
         // popup belongs to. Nothing of interest under the point → no hover.
         let Some(region) = self.editor.hover_region_at(line, c) else {
@@ -11798,6 +11849,8 @@ impl App {
         };
         self.hover_anchor = Some((col, row));
         self.hover_word = Some(region);
+        self.hover_at_caret = at_caret.then(|| self.status.clone());
+        self.hover_doc = (self.editor.path.clone(), self.editor.edit_seq);
         // Debug hover-to-evaluate: while paused, hovering a variable shows its
         // current value (from the loaded locals/globals) instead of the LSP
         // type hover. Takes priority because the live value is what the user
@@ -11990,11 +12043,20 @@ impl App {
             if Some(result.request_id) != self.hover_request_id {
                 continue;
             }
-            let current = self
-                .hover
-                .cell()
-                .and_then(|(c, r)| self.editor.buffer_pos_at(c, r))
-                .and_then(|(line, ch)| self.editor.hover_region_at(line, ch));
+            if self.hover_doc.0 != self.editor.path || self.hover_doc.1 != self.editor.edit_seq {
+                continue;
+            }
+            // A keyboard hover belongs to the caret (#1518), a dwell's to the
+            // pointer; either may have moved off the word since the request.
+            let current = if self.hover_at_caret.is_some() {
+                let (line, ch) = self.caret_hover_point();
+                self.editor.hover_region_at(line, ch)
+            } else {
+                self.hover
+                    .cell()
+                    .and_then(|(c, r)| self.editor.buffer_pos_at(c, r))
+                    .and_then(|(line, ch)| self.editor.hover_region_at(line, ch))
+            };
             if current != self.hover_word {
                 continue;
             }
@@ -12004,6 +12066,9 @@ impl App {
             self.hover_popup =
                 compose_hover(self.hover_diagnostic.as_deref(), result.text.as_deref())
                     .map(|text| crate::widgets::hover_popup::HoverPopup::new(text, anchor));
+            if self.hover_popup.is_none() && self.hover_at_caret.as_ref() == Some(&self.status) {
+                self.status = String::from(NO_HOVER_AT_CARET);
+            }
             changed = true;
         }
         changed
@@ -27121,6 +27186,20 @@ impl App {
             // chord, so the Cmd+K leader hosts this the way it hosts Zen (Cmd+K Z).
             KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'b') => {
                 self.open_testing_view();
+                true
+            }
+            // Cmd+K Cmd+I in the editor (Ctrl+K Ctrl+I off macOS): Show or
+            // Focus Hover at the caret, VS Code's chord (#1518). Needs the
+            // trailing Cmd, so plain Cmd+K I below stays broadcast input,
+            // and outside the editor the chord broadcasts as before.
+            KeyCode::Char(c)
+                if plain
+                    && cmd_held
+                    && !shifted
+                    && c.eq_ignore_ascii_case(&'i')
+                    && self.focus == Pane::Editor =>
+            {
+                self.run_command(crate::widgets::command_palette::Command::ShowHover);
                 true
             }
             // Cmd+K Shift+I: toggle whether the active pane receives
@@ -59053,6 +59132,7 @@ impl App {
             | Cmd::RenameSymbol
             | Cmd::TriggerSuggest
             | Cmd::TriggerParameterHints
+            | Cmd::ShowHover
                 if self.editor.has_non_text_view() =>
             {
                 self.status = format!("{} needs a text file", cmd.title());
@@ -59065,6 +59145,7 @@ impl App {
             Cmd::RenameSymbol => self.start_rename_symbol(),
             Cmd::TriggerSuggest => self.trigger_completion(),
             Cmd::TriggerParameterHints => self.trigger_signature_help(),
+            Cmd::ShowHover => self.show_hover_at_caret(),
             // Position-carrying commands (#259). They read the click the
             // dispatcher set, and do nothing from the keyboard: invoked from
             // the palette there is no click to act on, and guessing the
@@ -83331,6 +83412,10 @@ fn key_to_bytes(key: KeyEvent, app_cursor: bool) -> Vec<u8> {
 /// Divider drawn between the diagnostic block and the language hover content,
 /// mirroring the horizontal rule VS Code renders between hover sections.
 const HOVER_DIVIDER: &str = "────────";
+
+/// What Show or Focus Hover says when the caret has nothing to describe
+/// (#1518): a keyboard command that does nothing must say why.
+const NO_HOVER_AT_CARET: &str = "No hover information at the caret";
 
 /// Render the diagnostics under the hovered point into a single labelled text
 /// block, errors first (so the most severe message leads), each line prefixed

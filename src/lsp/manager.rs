@@ -1230,6 +1230,10 @@ pub struct LspManager {
     completion_rx: std_mpsc::Receiver<CompletionResult>,
     signature_help_rx: std_mpsc::Receiver<SignatureHelpResult>,
     hover_rx: std_mpsc::Receiver<HoverResult>,
+    /// Test hook: a sender into `hover_rx`, so app tests can answer a
+    /// hover request without a server.
+    #[cfg(test)]
+    hover_test_tx: std_mpsc::Sender<HoverResult>,
     rust_analyzer_rx: std_mpsc::Receiver<RustAnalyzerResult>,
     def_rx: std_mpsc::Receiver<DefinitionResult>,
     /// Test hooks: senders into the three jump channels, so app tests can
@@ -1341,6 +1345,8 @@ impl LspManager {
         let (completion_tx, completion_rx) = std_mpsc::channel();
         let (signature_help_tx, signature_help_rx) = std_mpsc::channel();
         let (hover_tx, hover_rx) = std_mpsc::channel();
+        #[cfg(test)]
+        let hover_test_tx = hover_tx.clone();
         let (rust_analyzer_tx, rust_analyzer_rx) = std_mpsc::channel();
         let (def_tx, def_rx) = std_mpsc::channel();
         let (doc_symbols_tx, doc_symbols_rx) = std_mpsc::channel();
@@ -1452,6 +1458,8 @@ impl LspManager {
             completion_rx,
             signature_help_rx,
             hover_rx,
+            #[cfg(test)]
+            hover_test_tx,
             rust_analyzer_rx,
             def_rx,
             #[cfg(test)]
@@ -1667,6 +1675,12 @@ impl LspManager {
 
     pub fn drain_hover(&self) -> Option<HoverResult> {
         self.hover_rx.try_recv().ok()
+    }
+
+    /// Test hook: deliver a hover reply as if a server had answered.
+    #[cfg(test)]
+    pub fn push_hover_for_test(&self, result: HoverResult) {
+        self.hover_test_tx.send(result).expect("hover channel open");
     }
 
     /// Send one of rust-analyzer's own requests (#1626) for the caret at
@@ -2649,7 +2663,8 @@ type ClientKey = (Language, PathBuf);
 /// Why [`WorkerState::pick_server`] found no server to ask.
 enum NoServer {
     /// The file is not open, or no server set exists for its language and
-    /// root: the request is dropped without a reply.
+    /// root: the request is dropped without a reply (a hover gets an empty
+    /// one).
     Unknown,
     /// Servers run for the file, but none carries the method.
     Unsupported,
@@ -4421,19 +4436,21 @@ impl WorkerState {
         character: u32,
         tx: &std_mpsc::Sender<HoverResult>,
     ) {
+        // Every hover is answered, an empty answer when no server can give
+        // one: the app holds a problem's message until the reply, and Show
+        // Hover says when there is nothing (#1518).
+        let none = || {
+            let _ = tx.send(HoverResult {
+                request_id,
+                text: None,
+            });
+        };
         let (server_name, client_arc) = match self.pick_server(&path, |c| c.supports_hover).await {
             Ok(picked) => picked,
-            Err(NoServer::Unsupported) => {
-                let _ = tx.send(HoverResult {
-                    request_id,
-                    text: None,
-                });
-                return;
-            }
-            Err(NoServer::Unknown) => return,
+            Err(NoServer::Unsupported | NoServer::Unknown) => return none(),
         };
         let Ok(uri) = Url::from_file_path(&path) else {
-            return;
+            return none();
         };
         let tx = tx.clone();
         log_file::log(&format!(
