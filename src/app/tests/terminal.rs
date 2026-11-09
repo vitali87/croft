@@ -3668,6 +3668,7 @@ fn osc_9_4_progress_paints_a_border_gauge_and_pill_percent() {
         )
         .unwrap(),
     );
+    app.terminals[1].set_manual_name(Some(String::from("idle")));
     app.focus_pane(Pane::Terminal);
     crate::test_budget::await_spawned(
         crate::test_budget::tests::SHELL_PAINT_BASE,
@@ -3726,6 +3727,23 @@ fn osc_9_4_progress_paints_a_border_gauge_and_pill_percent() {
         top_row.contains("bld \u{b7} 46%"),
         "the name pill carries the percent: {top_row:?}"
     );
+    // Croft Loch keeps the gauge on its palette: the accent eased into the
+    // canvas, not VS Code's blue. The focused pane's name is the strong ink.
+    if let Some(t) = crate::widgets::surface::tones(app.theme) {
+        let buf = term.backend().buffer();
+        let quiet = crate::gradient::rgb_color(crate::gradient::lerp_rgb(t.accent, t.canvas, 0.25));
+        assert_eq!(buf[(inner.x, area.y + area.height - 1)].fg, quiet);
+        let b = (area.x..area.right())
+            .find(|&x| buf[(x, area.y)].symbol() == "b")
+            .unwrap();
+        assert!(app.terminals[0].focused);
+        assert_eq!(buf[(b, area.y)].fg, t.strong(), "the focused pane's name");
+        let other = app.terminals[1].last_area;
+        let i = (other.x..other.right())
+            .find(|&x| buf[(x, other.y)].symbol() == "i")
+            .expect("the other pane's name");
+        assert_eq!(buf[(i, other.y)].fg, t.muted(), "an unfocused pane's name");
+    }
 
     // State 0 clears: the gauge and the pill percent both vanish.
     app.terminals[0].write_input(b"\n");

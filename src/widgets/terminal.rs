@@ -5871,6 +5871,21 @@ fn named_to_ratatui(n: NamedColor, palette: &[(u8, u8, u8); 16]) -> Option<Color
     }
 }
 
+impl PtyTerminal {
+    /// The ink of a command that went well (a finished command's dot, a
+    /// normal OSC 9;4 gauge): VS Code's blue on a boxed theme; on Croft Loch
+    /// the accent eased a quarter of the way into the canvas, so success
+    /// reads as on-palette and quieter than a failure's red.
+    fn quiet_ok_ink(&self) -> Color {
+        match crate::widgets::surface::tones(self.theme) {
+            Some(t) => {
+                crate::gradient::rgb_color(crate::gradient::lerp_rgb(t.accent, t.canvas, 0.25))
+            }
+            None => self.theme.ui(Color::Rgb(0x1b, 0x81, 0xa8)),
+        }
+    }
+}
+
 impl Widget for &mut PtyTerminal {
     fn render(self, area: Rect, buf: &mut Buffer) {
         // A host-accent rule outranks the focus color: a production pane
@@ -5898,10 +5913,11 @@ impl Widget for &mut PtyTerminal {
         // every pane. Heavy glyphs give the emphasis for free, which is
         // what iTerm2 and WezTerm do for the same reason.
         //
-        // Croft Loch draws no box: the frame is padding on the canvas and the
-        // focused pane carries the brand rule along its top edge. A host
-        // accent keeps a full box there too, because a production pane must
-        // read as dangerous at a glance.
+        // Croft Loch draws no box: the frame is padding on the canvas, every
+        // pane's top edge is a hairline under the tab strip, and the focused
+        // pane's carries the accent lip. A host accent keeps a full box
+        // there too, because a production pane must read as dangerous at a
+        // glance.
         let surfaces = self.theme.surfaces().is_some() && self.accent.is_none();
         let block = if surfaces {
             crate::widgets::surface::pane_block(self.theme.editor_bg())
@@ -5919,8 +5935,8 @@ impl Widget for &mut PtyTerminal {
         block.render(area, buf);
         // Black theme: replace the solid focus border with the orange→green
         // gradient (matching the welcome activity box).
-        if self.focused && surfaces {
-            crate::widgets::surface::paint_focus_rule(buf, area, self.theme);
+        if surfaces {
+            crate::widgets::surface::paint_pane_top(buf, area, self.theme, self.focused);
         } else if self.focused && self.focus_gradient && self.accent.is_none() {
             crate::gradient::paint_gradient_box_heavy(buf, area);
         }
@@ -6293,7 +6309,7 @@ impl Widget for &mut PtyTerminal {
             let color = match state {
                 2 => self.theme.ui(Color::Rgb(0xf1, 0x4c, 0x4c)),
                 4 => self.theme.ui(Color::Rgb(0xe5, 0xc0, 0x7b)),
-                _ => self.theme.ui(Color::Rgb(0x1b, 0x81, 0xa8)),
+                _ => self.quiet_ok_ink(),
             };
             let by = area.y + area.height - 1;
             // The fill glyph has to be HEAVIER than the border it sits on,
@@ -6410,7 +6426,19 @@ impl Widget for &mut PtyTerminal {
                 })
                 .filter(|t| !t.trim().is_empty());
             if let Some(text) = header {
-                let bg = self.theme.ui(Color::Rgb(0x25, 0x2b, 0x36));
+                // Croft Loch pins the command on the raised surface in body
+                // text, the scroll depth muted: a quiet card, not a banner.
+                let tones = crate::widgets::surface::tones(self.theme);
+                let bg = tones.map_or(self.theme.ui(Color::Rgb(0x25, 0x2b, 0x36)), |t| t.raised());
+                let command_style = match tones {
+                    Some(t) => Style::default().fg(t.text()).bg(bg),
+                    None => Style::default()
+                        .fg(self.theme.ui(Color::Rgb(0xec, 0xf0, 0xf4)))
+                        .bg(bg)
+                        .add_modifier(Modifier::BOLD),
+                };
+                let depth_fg =
+                    tones.map_or(self.theme.ui(Color::Rgb(0x8b, 0x93, 0xa1)), |t| t.muted());
                 for x in 0..inner.width {
                     let cell = &mut buf[(inner.x + x, inner.y)];
                     cell.set_symbol(" ");
@@ -6432,12 +6460,7 @@ impl Widget for &mut PtyTerminal {
                     let cell = &mut buf[(xw, inner.y)];
                     let mut tmpc = [0u8; 4];
                     cell.set_symbol(ch.encode_utf8(&mut tmpc));
-                    cell.set_style(
-                        Style::default()
-                            .fg(self.theme.ui(Color::Rgb(0xec, 0xf0, 0xf4)))
-                            .bg(bg)
-                            .add_modifier(Modifier::BOLD),
-                    );
+                    cell.set_style(command_style);
                     xw += 1;
                 }
                 let right = format!(" \u{2191} {display_offset} ");
@@ -6448,11 +6471,7 @@ impl Widget for &mut PtyTerminal {
                         let cell = &mut buf[(x0 + j as u16, inner.y)];
                         let mut tmpc = [0u8; 4];
                         cell.set_symbol(ch.encode_utf8(&mut tmpc));
-                        cell.set_style(
-                            Style::default()
-                                .fg(self.theme.ui(Color::Rgb(0x8b, 0x93, 0xa1)))
-                                .bg(bg),
-                        );
+                        cell.set_style(Style::default().fg(depth_fg).bg(bg));
                     }
                 }
             }
@@ -6469,7 +6488,7 @@ impl Widget for &mut PtyTerminal {
                     let cell = &mut buf[(area.x, inner.y + vp as u16)];
                     cell.set_symbol("●");
                     cell.set_style(Style::default().fg(if ok {
-                        self.theme.ui(Color::Rgb(0x1b, 0x81, 0xa8))
+                        self.quiet_ok_ink()
                     } else {
                         self.theme.ui(Color::Rgb(0xf1, 0x4c, 0x4c))
                     }));
@@ -9092,6 +9111,40 @@ mod tests {
         );
     }
 
+    /// Croft Loch keeps a command that went well on its palette: the dot is
+    /// the accent eased into the canvas, not VS Code's blue. An unfocused
+    /// pane's top edge is the hairline, so its seam with the tab strip is
+    /// drawn even without the focus lip.
+    #[test]
+    fn croft_loch_paints_a_quiet_accent_dot_and_a_hairline_top_edge() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = "printf '\\033]133;A\\007$ cmd\\n\\033]133;B\\007\\033]133;C\\007out\\n\\033]133;D;0\\007'";
+        let mut term =
+            PtyTerminal::new_running("/bin/sh", &[String::from("-c"), script.into()], tmp.path())
+                .unwrap();
+        let mut waited = 0u32;
+        while term.command_decorations().is_empty() {
+            assert!(waited < 8000, "no decoration");
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            waited += 40;
+        }
+        term.theme = crate::theme::Theme::LOCH;
+        term.focused = false;
+        let t = crate::widgets::surface::tones(term.theme).unwrap();
+        let area = Rect::new(0, 0, 40, 12);
+        let mut buf = Buffer::empty(area);
+        (&mut term).render(area, &mut buf);
+        let deco = term.command_decorations()[0];
+        let y = 1 + u16::try_from(deco.line).unwrap();
+        assert_eq!(buf[(0, y)].symbol(), "●");
+        assert_eq!(
+            buf[(0, y)].fg,
+            crate::gradient::rgb_color(crate::gradient::lerp_rgb(t.accent, t.canvas, 0.25))
+        );
+        assert_eq!(buf[(5, 0)].symbol(), "\u{2594}");
+        assert_eq!(buf[(5, 0)].fg, t.hairline());
+    }
+
     #[test]
     fn foreign_terminal_shim_zdotdir_chains_to_the_user_rc() {
         // Regression: Ghostty and kitty inject their own shell integration by
@@ -11589,6 +11642,45 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Croft Loch pins a scrolled command on the raised surface in body
+    /// text, not bold, with the scroll depth muted: a quiet card rather than
+    /// a bright banner over the output.
+    #[test]
+    fn croft_loch_pins_the_sticky_command_on_the_raised_surface() {
+        use crate::shell_integration::OscEvent;
+        let (_tmp, mut t) = quiet_pty();
+        t.theme = crate::theme::Theme::LOCH;
+        let tones = crate::widgets::surface::tones(t.theme).unwrap();
+        let area = Rect::new(0, 0, 80, 20);
+        let mut buf = Buffer::empty(area);
+        (&mut t).render(area, &mut buf);
+        feed_pty(&t, b"$ ");
+        t.push_mark_for_test(OscEvent::PromptEnd, 2);
+        feed_pty(&t, b"make all\r\n");
+        t.push_mark_for_test(OscEvent::CommandStart, 0);
+        for i in 0..40 {
+            feed_pty(&t, format!("out-{i}\r\n").as_bytes());
+        }
+        t.push_mark_for_test(OscEvent::CommandEnd(Some(0)), 0);
+        t.scroll_to_top();
+        for _ in 0..5 {
+            t.scroll_down(1);
+        }
+        let mut buf = Buffer::empty(area);
+        (&mut t).render(area, &mut buf);
+        let inner = t.last_inner;
+        let at = |sym: &str| {
+            (inner.x..inner.right())
+                .find(|&x| buf[(x, inner.y)].symbol() == sym)
+                .unwrap_or_else(|| panic!("{sym:?} on the pinned row"))
+        };
+        let cell = &buf[(at("m"), inner.y)];
+        assert_eq!(cell.bg, tones.raised());
+        assert_eq!(cell.fg, tones.text());
+        assert!(!cell.modifier.contains(Modifier::BOLD));
+        assert_eq!(buf[(at("\u{2191}"), inner.y)].fg, tones.muted());
     }
 
     /// A prompt row rewritten SHORTER than the recorded 133;B column (a

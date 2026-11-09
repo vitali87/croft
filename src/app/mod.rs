@@ -1031,13 +1031,82 @@ fn git_status_spans<'a>(status: &'a crate::git::GitStatus) -> Vec<Span<'a>> {
     spans
 }
 
+/// Croft Loch's quiet branch: the glyph and name in body text, never bold,
+/// with the glyph turning amber only while the tree is dirty, the operation
+/// git stopped in in amber, and ahead/behind counts muted. Colour is for
+/// what wants acting on, not for a clean tree. Restyles the spans
+/// [`git_status_spans`] built, so their text, and every width measured
+/// from it, stays the same.
+fn quiet_git_spans(spans: &mut [Span<'_>], t: crate::widgets::surface::Tones, dirty: bool) {
+    let amber = Style::default().fg(GIT_DIRTY_COLOR);
+    for (i, span) in spans.iter_mut().enumerate() {
+        let c = span.content.as_ref();
+        span.style = match i {
+            1 if dirty => amber,
+            1 | 2 => Style::default().fg(t.text()),
+            _ if c.starts_with(" |") => amber,
+            _ if c.starts_with(" \u{2191}") || c.starts_with(" \u{2193}") => {
+                Style::default().fg(t.muted())
+            }
+            _ => span.style,
+        };
+    }
+}
+
+/// A tinted chip's fill and ink on a `surfaces` theme's chrome: the hue laid
+/// over the chrome at a fifth of its strength (a little more under the
+/// pointer), and the hue lifted toward the foreground for the label, so
+/// every state chip and count badge is one shape in its own colour.
+fn chip_tint(
+    t: crate::widgets::surface::Tones,
+    hue: (u8, u8, u8),
+    hovered: bool,
+) -> (Color, Color) {
+    let strength = if hovered { 0.32 } else { 0.22 };
+    (
+        rgb_color(crate::gradient::lerp_rgb(t.chrome, hue, strength)),
+        rgb_color(crate::gradient::lerp_rgb(hue, t.lift, 0.35)),
+    )
+}
+
+/// A state chip on the status bar (vim mode, REC, CAST, CodeQL, the update
+/// and session badges). A boxed theme paints `text` as one span in its
+/// `legacy` style. A `surfaces` theme paints every chip the same way: a tag
+/// tinted in `hue` ([`chip_tint`]) with half-block ends (`▐label▌`) in place
+/// of Powerline caps, the ends taking the label's padding spaces so the chip
+/// is exactly as wide as the boxed one and no click target moves.
+fn status_chip(
+    theme: crate::theme::Theme,
+    text: String,
+    hue: (u8, u8, u8),
+    hovered: bool,
+    legacy: Style,
+) -> Vec<Span<'static>> {
+    let Some(t) = crate::widgets::surface::tones(theme) else {
+        return vec![Span::styled(text, legacy)];
+    };
+    let (fill, ink) = chip_tint(t, hue, hovered);
+    let inner = text.strip_prefix(' ').unwrap_or(&text);
+    let inner = inner.strip_suffix(' ').unwrap_or(inner).to_string();
+    vec![
+        Span::styled("\u{2590}", Style::default().fg(fill)),
+        Span::styled(inner, Style::default().fg(ink).bg(fill)),
+        Span::styled("\u{258c}", Style::default().fg(fill)),
+    ]
+}
+
 /// Spans for the "cr<>ft" wordmark at the left of the status bar, styled to
 /// mirror the app logo: white letters with the `<>` (the stylised "o") in the
 /// brand orange, sitting on the bar's own background rather than a pill.
+/// Croft Loch keeps one emphasis on its bar: the letters are body text, not
+/// bold, and only the orange `<>` is.
 fn brand_spans(theme: crate::theme::Theme) -> Vec<Span<'static>> {
-    let letter = Style::default()
-        .fg(theme.ui(Color::White))
-        .add_modifier(Modifier::BOLD);
+    let letter = match crate::widgets::surface::tones(theme) {
+        Some(t) => Style::default().fg(t.text()),
+        None => Style::default()
+            .fg(theme.ui(Color::White))
+            .add_modifier(Modifier::BOLD),
+    };
     vec![
         Span::styled(" cr", letter),
         Span::styled(
@@ -8107,7 +8176,8 @@ impl App {
                 self.theme.activity_icon_inactive_rgb(),
                 self.theme.activity_icon_active_rgb(),
                 self.theme.activity_icon_pill_rgb(),
-            ),
+            )
+            .with_hover(self.theme.activity_icon_hover_rgb()),
             sponsor_ink: crate::iterm2_inline::IconInk::new(
                 self.theme.activity_sponsor_rgb(),
                 self.theme.activity_sponsor_hover_rgb(),
@@ -19369,7 +19439,16 @@ impl App {
         // the bar in the same colors as an image-capable one instead of a
         // second, slightly-off set of greys.
         let active_color = self.theme.activity_icon_active();
+        let hover_color = self.theme.activity_icon_hover();
         let inactive_color = self.theme.activity_icon_inactive();
+        // Codicons have no bold weight; on Croft Loch bold would only set
+        // off some terminals' bold-as-bright, so its glyphs stay regular.
+        let tones = crate::widgets::surface::tones(self.theme);
+        let glyph_mods = if tones.is_some() {
+            Modifier::empty()
+        } else {
+            Modifier::BOLD
+        };
         let glyph_x = activity_icon_glyph_x(area);
         let render_glyph = |frame: &mut ratatui::Frame,
                             block: Rect,
@@ -19396,8 +19475,12 @@ impl App {
                 width: 1,
                 height: 1,
             };
-            let color = if is_active || is_hovered {
+            // Selected wins over hover; hover is its own step (body text on
+            // Croft Loch, the active ink elsewhere).
+            let color = if is_active {
                 active_color
+            } else if is_hovered {
+                hover_color
             } else {
                 inactive_color
             };
@@ -19406,14 +19489,26 @@ impl App {
                     Style::default()
                         .fg(color)
                         .bg(bg_color)
-                        .add_modifier(Modifier::BOLD),
+                        .add_modifier(glyph_mods),
                 ),
                 cell,
             );
         };
         // Text analogue of the baked count badge for image-less terminals: an
-        // accent cell with the count at the icon's bottom-right corner.
-        let badge_bg = self.theme.accent();
+        // accent cell with the count at the icon's bottom-right corner. Croft
+        // Loch tints it instead, the accent laid into the chrome with the
+        // digits in the accent lifted toward the foreground, so the count
+        // reads without a hard teal block beside a muted icon.
+        let badge_style = match tones {
+            Some(t) => {
+                let (fill, ink) = chip_tint(t, t.accent, false);
+                Style::default().fg(ink).bg(fill)
+            }
+            None => Style::default()
+                .fg(Color::White)
+                .bg(self.theme.accent())
+                .add_modifier(Modifier::BOLD),
+        };
         let render_count_badge = |frame: &mut ratatui::Frame, block: Rect, count: usize| {
             if count == 0 {
                 return;
@@ -19425,12 +19520,7 @@ impl App {
             };
             let w = label.chars().count() as u16;
             frame.render_widget(
-                ratatui::widgets::Paragraph::new(label).style(
-                    Style::default()
-                        .fg(Color::White)
-                        .bg(badge_bg)
-                        .add_modifier(Modifier::BOLD),
-                ),
+                ratatui::widgets::Paragraph::new(label).style(badge_style),
                 Rect {
                     x: block.x + block.width.saturating_sub(w),
                     y: block.y + block.height.saturating_sub(1),
@@ -19525,7 +19615,7 @@ impl App {
                             Style::default()
                                 .fg(color)
                                 .bg(bg_color)
-                                .add_modifier(Modifier::BOLD),
+                                .add_modifier(glyph_mods),
                         ),
                     Rect {
                         x: glyph_x,
@@ -20648,6 +20738,7 @@ impl App {
             return;
         }
         let brand = self.theme.gradient();
+        let tones = crate::widgets::surface::tones(self.theme);
         // Same selected-row treatment as the OPEN EDITORS list, so the rail
         // reads as the same family of chrome in both themes.
         let sel_bg = if brand {
@@ -20689,8 +20780,10 @@ impl App {
                 height: 1,
             };
             let active = i == self.active_terminal;
-            let bg = if active {
+            let bg = if active && tones.is_none() {
                 Some(sel_bg)
+            } else if active {
+                None
             } else {
                 crate::widgets::hover::row_hover_bg(row, self.pointer_cell, self.theme)
             };
@@ -20700,12 +20793,14 @@ impl App {
             let label = self.terminals[i].label().to_string();
             let room = TERMINAL_RAIL_LABEL_W as usize;
             let shown: String = label.chars().take(room).collect();
-            let fg = if active {
-                Style::default()
+            let fg = match tones {
+                // Croft Loch: the active terminal's name in body text on the
+                // selected-row band, the rest muted.
+                Some(t) => Style::default().fg(if active { t.text() } else { t.muted() }),
+                None if active => Style::default()
                     .fg(self.theme.ui(Color::White))
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
+                    .add_modifier(Modifier::BOLD),
+                None => Style::default(),
             };
             // `set_string` clips at the buffer edge, not the rail's, so a
             // label wider than a clamped rail would paint its tail over the
@@ -20717,6 +20812,18 @@ impl App {
                 row.width as usize,
                 fg,
             );
+            // The one selected-row anatomy: band plus the accent bar in the
+            // row's leading space, the bar only while the panel has the
+            // keyboard.
+            if active && let Some(t) = tones {
+                crate::widgets::surface::paint_selected_row(
+                    frame.buffer_mut(),
+                    row,
+                    t,
+                    t.canvas,
+                    self.focus == Pane::Terminal,
+                );
+            }
             self.terminal_rail_rects.push(row);
         }
     }
@@ -22515,14 +22622,24 @@ impl App {
         // Croft Loch's title row is a chrome band over the canvas the views
         // paint on, with muted inactive titles.
         let surfaces = self.theme.surfaces();
+        let tones = crate::widgets::surface::tones(self.theme);
         let strip_bg = surfaces.map_or(self.theme.editor_bg(), |s| s.chrome());
         frame.render_widget(Block::default().style(Style::default().bg(strip_bg)), strip);
         let brand = self.theme.gradient();
-        let active_fg = if brand {
-            crate::gradient::rgb_color(crate::gradient::PANEL_TITLE_FG)
-        } else {
-            self.theme.ui(Color::White)
+        // Croft Loch's three steps: the active title in the strong ink (its
+        // accent underline says the rest, so no bold), a hovered one lifted
+        // to body text, the others muted.
+        let active_fg = match tones {
+            Some(t) => t.strong(),
+            None if brand => crate::gradient::rgb_color(crate::gradient::PANEL_TITLE_FG),
+            None => self.theme.ui(Color::White),
         };
+        let active_mods = if tones.is_some() {
+            Modifier::empty()
+        } else {
+            Modifier::BOLD
+        };
+        let hover_fg = tones.map_or(active_fg, |t| t.text());
         let inactive_fg =
             surfaces.map_or(self.theme.ui(Color::Rgb(0x80, 0x88, 0x98)), |s| s.muted());
         let right = strip.x + strip.width;
@@ -22535,13 +22652,35 @@ impl App {
         // In images mode the count rides as an orange circle (the same raster
         // badge as the activity bar), emitted post-frame; recompute its anchor
         // each paint. Glyph-fallback terminals keep the powerline-cap pill.
-        let images = self.overlays.activity.has_images();
+        // Croft Loch draws neither: its count is a tinted chip in either mode,
+        // red while there are errors, amber for warnings, neutral otherwise.
+        let images = self.overlays.activity.has_images() && tones.is_none();
+        let badge_tint = tones.map(|t| {
+            let hue = if self.problems.error_count() > 0 {
+                (0xe5, 0x53, 0x4b)
+            } else if self.problems.warning_count() > 0 {
+                (0xe2, 0xa0, 0x3a)
+            } else {
+                t.muted
+            };
+            chip_tint(t, hue, false)
+        });
 
         // VS Code panel-group order: PROBLEMS, OUTPUT, TERMINAL, PORTS. PROBLEMS
         // alone carries the orange count badge after its label.
         // Each label is translated and padded to its click target.
-        let tabs =
-            BottomPanelTab::ALL.map(|tab| (tab, format!(" {} ", crate::i18n::tr(tab.label()))));
+        // Croft Loch drops the first title's leading pad, so its word lands
+        // on the terminal's first text column below it. The tab still starts
+        // a column in: the panel's edge column belongs to the splitter.
+        let flush_first = tones.is_some();
+        let tabs = BottomPanelTab::ALL.map(|tab| {
+            let pad = if flush_first && tab == BottomPanelTab::ALL[0] {
+                ""
+            } else {
+                " "
+            };
+            (tab, format!("{pad}{} ", crate::i18n::tr(tab.label())))
+        });
 
         // Lay each tab out left to right, recording its hit rect (which, for
         // PROBLEMS, spans the label and the pill together).
@@ -22587,9 +22726,9 @@ impl App {
                 Style::default()
                     .fg(active_fg)
                     .bg(strip_bg)
-                    .add_modifier(Modifier::BOLD)
+                    .add_modifier(active_mods)
             } else if crate::widgets::hover::row_hover_bg(*rect, pointer, self.theme).is_some() {
-                Style::default().fg(active_fg).bg(strip_bg)
+                Style::default().fg(hover_fg).bg(strip_bg)
             } else {
                 Style::default().fg(inactive_fg).bg(strip_bg)
             };
@@ -22608,7 +22747,17 @@ impl App {
             // Otherwise the powerline-cap pill is drawn as text.
             if *badge_w > 0 {
                 let bx = rect.x + unicode_width::UnicodeWidthStr::width(label.as_str()) as u16;
-                if images {
+                if let Some((fill, ink)) = badge_tint {
+                    if bx < right {
+                        buf.set_stringn(
+                            bx,
+                            rect.y,
+                            format!(" {count} "),
+                            right.saturating_sub(bx) as usize,
+                            Style::default().fg(ink).bg(fill),
+                        );
+                    }
+                } else if images {
                     if bx < right {
                         self.problems_badge_cell = Some((bx, rect.y));
                     }
@@ -22654,6 +22803,19 @@ impl App {
             }
         }
         self.paint_panel_actions(buf, strip, placed.last().map_or(strip.x, |p| p.2.right()));
+    }
+
+    /// Croft Loch's top edge for a view sharing the panel (PROBLEMS, OUTPUT,
+    /// PORTS, CAPTURES): the hairline under the tab strip, or the accent lip
+    /// while the panel has the keyboard, as each terminal pane draws its own.
+    /// A no-op on a boxed theme.
+    fn paint_panel_view_top(&self, frame: &mut ratatui::Frame, content: Rect) {
+        crate::widgets::surface::paint_pane_top(
+            frame.buffer_mut(),
+            content,
+            self.theme,
+            self.focus == Pane::Terminal,
+        );
     }
 
     /// The panel's own controls at the right end of its tab row (#1980), right
@@ -23933,6 +24095,44 @@ impl App {
                     self.terminal_label_rects.clear();
                     self.terminal_collapse_buttons.clear();
                     self.terminal_strip_rects.clear();
+                    // Croft Loch hangs a lone terminal's `∨ +` on the tab row,
+                    // just left of the panel chevron, as VS Code does: the
+                    // panel's controls then share one row instead of stepping
+                    // down onto the pane, whose top edge stays a clean rule.
+                    // Only when both fit between the last tab and the chevron;
+                    // otherwise they keep the pane's top row.
+                    let header_slot = (crate::widgets::surface::tones(self.theme).is_some()
+                        && self.terminals.len() == 1
+                        && !self.terminals[0].collapsed
+                        && strip.height == 1
+                        && !self.panel_maximize_button.is_empty())
+                    .then(|| {
+                        let tabs_end = [
+                            self.problems_tab_rect,
+                            self.output_tab_rect,
+                            self.terminal_tab_rect,
+                            self.ports_tab_rect,
+                            self.captures_tab_rect,
+                        ]
+                        .iter()
+                        .map(|r| r.right())
+                        .max()
+                        .unwrap_or(strip.x);
+                        let x0 = tabs_end + 1;
+                        // The buttons keep one blank column at their right
+                        // edge; ending the slot one cell into the chevron
+                        // lays that column on the chevron's own padding, so
+                        // `+` sits two cells from the chevron's glyph, the
+                        // same step as between `∨` and `+`.
+                        let x1 = self.panel_maximize_button.x + 1;
+                        Rect::new(x0, strip.y, x1.saturating_sub(x0), 1)
+                    })
+                    .filter(|slot| {
+                        let need = TERMINAL_ADD_LABEL.chars().count()
+                            + TERMINAL_PROFILE_LABEL.chars().count()
+                            + 2;
+                        usize::from(slot.width) >= need
+                    });
                     for (i, col) in cols.iter().enumerate().take(self.terminals.len()) {
                         // Hidden panes still push placeholders so a button's
                         // position in each vec names its terminal index.
@@ -23961,7 +24161,7 @@ impl App {
                         self.terminal_strip_rects.push(Rect::default());
                         let buttons = paint_terminal_pane_buttons(
                             frame,
-                            *col,
+                            header_slot.unwrap_or(*col),
                             show_close,
                             maximized,
                             self.theme,
@@ -24044,6 +24244,15 @@ impl App {
                                         .fg(Color::Black)
                                         .bg(Color::Rgb(r, g, b))
                                         .add_modifier(Modifier::BOLD)
+                                } else if let Some(t) = crate::widgets::surface::tones(self.theme) {
+                                    // Croft Loch names the pane with the
+                                    // keyboard in the strong ink, the rest
+                                    // muted, so the labels say where focus is.
+                                    Style::default().fg(if self.terminals[i].focused {
+                                        t.strong()
+                                    } else {
+                                        t.muted()
+                                    })
                                 } else {
                                     crate::widgets::header_pill::action_style(self.theme, false)
                                 };
@@ -24089,6 +24298,7 @@ impl App {
                         t.redacted_on_screen = 0;
                     }
                     frame.render_widget(&mut self.problems, content);
+                    self.paint_panel_view_top(frame, content);
                 }
                 BottomPanelTab::Output => {
                     // Same hidden-terminal reset as PROBLEMS: the OUTPUT view
@@ -24105,6 +24315,7 @@ impl App {
                         t.redacted_on_screen = 0;
                     }
                     frame.render_widget(&mut self.output, content);
+                    self.paint_panel_view_top(frame, content);
                 }
                 BottomPanelTab::Ports => {
                     // Same hidden-terminal reset: the PORTS view covers the
@@ -24121,6 +24332,7 @@ impl App {
                         t.redacted_on_screen = 0;
                     }
                     frame.render_widget(&mut self.ports, content);
+                    self.paint_panel_view_top(frame, content);
                 }
                 BottomPanelTab::Captures => {
                     // Same hidden-terminal reset as the PORTS arm above.
@@ -24136,6 +24348,7 @@ impl App {
                         t.redacted_on_screen = 0;
                     }
                     frame.render_widget(&mut self.captures, content);
+                    self.paint_panel_view_top(frame, content);
                 }
             }
         } else {
@@ -24178,6 +24391,25 @@ impl App {
         // Owned snapshot: the spans borrow the status, and borrowing it
         // through scm_worker() would pin all of &self for the whole render.
         let scm_status = self.scm_worker().status().clone();
+        // Croft Loch's bar keeps one emphasis (the wordmark's `<>`) and
+        // speaks in colour only when something wants acting on; its state
+        // chips share one tinted shape ([`status_chip`]).
+        let loch = crate::widgets::surface::tones(self.theme);
+        // A chip with nothing to warn about wears the muted ink's tint.
+        let neutral_hue = loch.map_or((0x7d, 0x87, 0x86), |t| t.muted);
+        let accent_hue = self.theme.accent_rgb();
+        const RED_HUE: (u8, u8, u8) = (0xe5, 0x53, 0x4b);
+        const AMBER_HUE: (u8, u8, u8) = (0xe2, 0xa0, 0x3a);
+        const GREEN_HUE: (u8, u8, u8) = (0x4c, 0xb8, 0x5c);
+        const ORANGE_HUE: (u8, u8, u8) = (0xff, 0x9d, 0x2f);
+        // The bar's coloured words (a running update, a busy server, a
+        // kernel) keep their colour but give up bold on Croft Loch, whose
+        // one bold mark is the wordmark's `<>`.
+        let loud = if loch.is_some() {
+            Modifier::empty()
+        } else {
+            Modifier::BOLD
+        };
         let mut spans: Vec<Span> = Vec::with_capacity(20);
         spans.extend(brand_spans(self.theme));
         let redacted = self.redacted_on_screen();
@@ -24185,19 +24417,24 @@ impl App {
             // How much of what is on screen is masked right now (#360): a
             // screen-share host wants to know the count is non-zero, and
             // that a reveal window is open.
-            let (label, bg) = if self.redactions_revealed() {
+            let (label, bg, hue) = if self.redactions_revealed() {
                 (
                     format!(" \u{1f441} {redacted} revealed "),
                     Color::Rgb(0xc0, 0x39, 0x2b),
+                    RED_HUE,
                 )
             } else {
                 (
                     format!(" \u{2022} {redacted} redacted "),
                     Color::Rgb(0x3a, 0x3f, 0x4b),
+                    neutral_hue,
                 )
             };
-            spans.push(Span::styled(
+            spans.extend(status_chip(
+                self.theme,
                 label,
+                hue,
+                false,
                 Style::default()
                     .bg(self.theme.ui(bg))
                     .fg(Color::White)
@@ -24213,15 +24450,28 @@ impl App {
         if let Some(toast) = self.update_toast.as_ref().filter(|t| !t.ready) {
             let hovered =
                 crate::widgets::hover::contains(self.status_offer_rect, self.pointer_cell);
-            spans.extend(crate::widgets::update_popup::pill_spans(
-                &format!(
-                    "{} Update Available: v{}",
-                    crate::widgets::update_popup::PACKAGE_GLYPH,
-                    toast.release.version
-                ),
-                crate::widgets::update_popup::pill_fill(self.theme, hovered),
-                Color::White,
-            ));
+            let label = format!(
+                "{} Update Available: v{}",
+                crate::widgets::update_popup::PACKAGE_GLYPH,
+                toast.release.version
+            );
+            // The pill opens a card that takes the keyboard: the accent's
+            // tint on Croft Loch, the primary button's fill elsewhere.
+            if loch.is_some() {
+                spans.extend(status_chip(
+                    self.theme,
+                    format!(" {label} "),
+                    accent_hue,
+                    hovered,
+                    Style::default(),
+                ));
+            } else {
+                spans.extend(crate::widgets::update_popup::pill_spans(
+                    &label,
+                    crate::widgets::update_popup::pill_fill(self.theme, hovered),
+                    Color::White,
+                ));
+            }
         }
         let offer_chip_end: u16 = spans.iter().map(|s| s.content.chars().count() as u16).sum();
         let offer_chip =
@@ -24233,14 +24483,25 @@ impl App {
         // chord does (#865); recorded as (start column, width).
         let update_chip_x: u16 = spans.iter().map(|s| s.content.chars().count() as u16).sum();
         if self.any_update_ready() {
-            spans.extend(crate::widgets::update_popup::pill_spans(
-                &format!(
-                    "{} Update ready - {UPDATE_CROFT_CHORD} to relaunch",
-                    crate::widgets::update_popup::READY_GLYPH
-                ),
-                self.theme.ui(Color::Rgb(0x1f, 0x7a, 0x33)),
-                Color::White,
-            ));
+            let label = format!(
+                "{} Update ready - {UPDATE_CROFT_CHORD} to relaunch",
+                crate::widgets::update_popup::READY_GLYPH
+            );
+            if loch.is_some() {
+                spans.extend(status_chip(
+                    self.theme,
+                    format!(" {label} "),
+                    GREEN_HUE,
+                    false,
+                    Style::default(),
+                ));
+            } else {
+                spans.extend(crate::widgets::update_popup::pill_spans(
+                    &label,
+                    self.theme.ui(Color::Rgb(0x1f, 0x7a, 0x33)),
+                    Color::White,
+                ));
+            }
         }
         if let Some(current) = self.local_drift.as_ref()
             && self.update_status == UpdateStatus::Idle
@@ -24252,11 +24513,14 @@ impl App {
         {
             // Amber, persistent: the binary predates its own source tree
             // (#242). One keypress rebuilds it in the background.
-            spans.push(Span::styled(
+            spans.extend(status_chip(
+                self.theme,
                 format!(
                     " ⟳ croft {} < repo {current} - {UPDATE_CROFT_CHORD} to rebuild ",
                     env!("CROFT_GIT_HASH")
                 ),
+                AMBER_HUE,
+                false,
                 Style::default()
                     .bg(self.theme.ui(Color::Rgb(0x8a, 0x60, 0x00)))
                     .fg(Color::White)
@@ -24284,7 +24548,7 @@ impl App {
                 ),
                 Style::default()
                     .fg(self.theme.ui(Color::Rgb(0xff, 0x45, 0x4d)))
-                    .add_modifier(Modifier::BOLD),
+                    .add_modifier(loud),
             ));
         }
         if let Some(progress) = self.lsp_progress_status() {
@@ -24296,7 +24560,7 @@ impl App {
                 format!(" ⟳ {progress} "),
                 Style::default()
                     .fg(self.theme.ui(Color::Rgb(0x4e, 0x9a, 0xff)))
-                    .add_modifier(Modifier::BOLD),
+                    .add_modifier(loud),
             ));
         }
         if let Some(label) = &self.mcp_busy_label {
@@ -24306,19 +24570,22 @@ impl App {
                 format!(" {} {label} ", self.mcp_spinner_glyph()),
                 Style::default()
                     .fg(self.theme.ui(Color::Rgb(0x2d, 0xd4, 0xbf)))
-                    .add_modifier(Modifier::BOLD),
+                    .add_modifier(loud),
             ));
         }
         if let Some((agent, until)) = &self.auto_approve {
             let left = until
                 .saturating_duration_since(std::time::Instant::now())
                 .as_secs();
-            spans.push(Span::styled(
+            spans.extend(status_chip(
+                self.theme,
                 format!(
                     " \u{2713} auto-approving {agent} {}:{:02} ",
                     left / 60,
                     left % 60
                 ),
+                AMBER_HUE,
+                false,
                 Style::default()
                     .bg(self.theme.ui(Color::Rgb(0x8a, 0x60, 0x00)))
                     .fg(Color::White)
@@ -24331,7 +24598,7 @@ impl App {
                 chip,
                 Style::default()
                     .fg(self.theme.ui(Color::Rgb(0xf3, 0x9c, 0x12)))
-                    .add_modifier(Modifier::BOLD),
+                    .add_modifier(loud),
             ));
         }
         // A running CodeQL query (#578): what runs and for how long, and a
@@ -24346,14 +24613,20 @@ impl App {
                 secs % 60
             );
             let x: u16 = spans.iter().map(|s| s.content.chars().count() as u16).sum();
-            codeql_chip = Some((x, text.chars().count() as u16));
-            spans.push(Span::styled(
+            // A running task, and a click cancels it: the accent's tint on
+            // Croft Loch. Its width is measured from the spans it painted.
+            spans.extend(status_chip(
+                self.theme,
                 text,
+                accent_hue,
+                false,
                 Style::default()
                     .bg(self.theme.ui(Color::Rgb(0x2b, 0x5d, 0x8a)))
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD),
             ));
+            let end: u16 = spans.iter().map(|s| s.content.chars().count() as u16).sum();
+            codeql_chip = Some((x, end - x));
             spans.push(Span::raw(" "));
         }
         if let Some((_, _, started)) = &self.recording {
@@ -24361,8 +24634,11 @@ impl App {
             // leave on; it is not the macro recorder, so it has its own
             // badge and says how long it has run.
             let secs = started.elapsed().as_secs();
-            spans.push(Span::styled(
+            spans.extend(status_chip(
+                self.theme,
                 format!(" \u{25cf} CAST {}:{:02} ", secs / 60, secs % 60),
+                (0xd0, 0x5c, 0xa0),
+                false,
                 Style::default()
                     .bg(self.theme.ui(Color::Rgb(0x8a, 0x1c, 0x5a)))
                     .fg(Color::White)
@@ -24378,8 +24654,11 @@ impl App {
                 Some(r) => format!(" ● REC @{r} "),
                 None => String::from(" ● REC "),
             };
-            spans.push(Span::styled(
+            spans.extend(status_chip(
+                self.theme,
                 label,
+                RED_HUE,
+                false,
                 Style::default()
                     .bg(self.theme.ui(Color::Rgb(0xc0, 0x2b, 0x2b)))
                     .fg(Color::White)
@@ -24388,25 +24667,35 @@ impl App {
             spans.push(Span::raw(" "));
         }
         if self.vim.enabled {
-            let (text, bg) = match self.vim.command_line() {
+            // The mode is the editor's active state: NORMAL wears the
+            // accent's tint on Croft Loch, INSERT green, VISUAL violet, and
+            // a command being typed the neutral one.
+            let (text, bg, hue) = match self.vim.command_line() {
                 Some(cmd) => (
                     format!(" {cmd} "),
                     self.theme.ui(Color::Rgb(0x33, 0x33, 0x33)),
+                    neutral_hue,
                 ),
                 None => {
                     let label = self.vim.mode_label().unwrap_or("NORMAL");
-                    let bg = match self.vim.mode() {
-                        crate::vim::VimMode::Insert => self.theme.ui(Color::Rgb(0x1f, 0x7a, 0x33)),
-                        crate::vim::VimMode::Visual | crate::vim::VimMode::VisualLine => {
-                            self.theme.ui(Color::Rgb(0x8a, 0x4f, 0xbf))
+                    let (bg, hue) = match self.vim.mode() {
+                        crate::vim::VimMode::Insert => {
+                            (self.theme.ui(Color::Rgb(0x1f, 0x7a, 0x33)), GREEN_HUE)
                         }
-                        _ => self.theme.ui(Color::Rgb(0x4e, 0x9a, 0xff)),
+                        crate::vim::VimMode::Visual | crate::vim::VimMode::VisualLine => (
+                            self.theme.ui(Color::Rgb(0x8a, 0x4f, 0xbf)),
+                            (0xa8, 0x7c, 0xe6),
+                        ),
+                        _ => (self.theme.ui(Color::Rgb(0x4e, 0x9a, 0xff)), accent_hue),
                     };
-                    (format!(" {label} "), bg)
+                    (format!(" {label} "), bg, hue)
                 }
             };
-            spans.push(Span::styled(
+            spans.extend(status_chip(
+                self.theme,
                 text,
+                hue,
+                false,
                 Style::default()
                     .bg(bg)
                     .fg(Color::White)
@@ -24426,7 +24715,10 @@ impl App {
         } else {
             "\u{2502}"
         };
-        let scm_spans = git_status_spans(&scm_status);
+        let mut scm_spans = git_status_spans(&scm_status);
+        if let Some(t) = loch {
+            quiet_git_spans(&mut scm_spans, t, scm_status.dirty);
+        }
         // The wordmark already ends in a space; the git spans don't, so buy
         // the divider one cell of air only when the branch segment painted.
         let scm_present = !scm_spans.is_empty();
@@ -24443,8 +24735,11 @@ impl App {
         // survive a transport drop, so flag it for the whole session (rendered
         // before the transient status so a status update never hides it).
         if let Some(warning) = self.persistence_warning {
-            spans.push(Span::styled(
+            spans.extend(status_chip(
+                self.theme,
                 format!(" \u{26a0} {warning} "),
+                ORANGE_HUE,
+                false,
                 Style::default()
                     .bg(self.theme.ui(Color::Rgb(0xff, 0x9d, 0x2f)))
                     .fg(self.theme.ui(Color::Rgb(0x10, 0x13, 0x1a)))
@@ -24456,8 +24751,11 @@ impl App {
         // persistent session, painted only when someone else is here
         // (manage them via Session: Participants, Cmd+K A).
         if self.session_participants.len() > 1 {
-            spans.push(Span::styled(
+            spans.extend(status_chip(
+                self.theme,
                 format!(" \u{f0c0} {} attached ", self.session_participants.len()),
+                (0x5a, 0x8f, 0xd8),
+                false,
                 Style::default()
                     .bg(self.theme.ui(Color::Rgb(0x2f, 0x6f, 0xd0)))
                     .fg(self.theme.ui(Color::Rgb(0xff, 0xff, 0xff)))
@@ -24469,11 +24767,14 @@ impl App {
         // orange like the persistence warning (attention, not decoration),
         // naming the cancel chord so the stop path is one glance away.
         if let Some(stream) = &self.collab_stream {
-            spans.push(Span::styled(
+            spans.extend(status_chip(
+                self.theme,
                 format!(
                     " \u{23f9} {} streaming into {} (Cmd+K X to stop) ",
                     stream.name, stream.file
                 ),
+                ORANGE_HUE,
+                false,
                 Style::default()
                     .bg(self.theme.ui(Color::Rgb(0xff, 0x9d, 0x2f)))
                     .fg(self.theme.ui(Color::Rgb(0x10, 0x13, 0x1a)))
@@ -24483,8 +24784,11 @@ impl App {
         } else if let Some(host) = &self.pair_host {
             // Resident navigator seated and idle: presence, not attention —
             // the stream badge above takes over whenever it is typing.
-            spans.push(Span::styled(
+            spans.extend(status_chip(
+                self.theme,
                 format!(" \u{25c6} {} seated ", host.title()),
+                neutral_hue,
+                false,
                 Style::default()
                     .bg(self.theme.ui(Color::Rgb(0x3c, 0x41, 0x4f)))
                     .fg(self.theme.ui(Color::Rgb(0xff, 0x9d, 0x2f)))
@@ -24504,13 +24808,19 @@ impl App {
         let err_text = format!(" \u{ea87} {err_count}");
         let warn_text = format!(" \u{ea6c} {warn_count} ");
         let diag_len = (err_text.chars().count() + warn_text.chars().count()) as u16;
+        // Croft Loch colours a count only when it is not zero: a red 0 on
+        // a clean workspace reads as an alarm that isn't there.
+        let count_ink = |n: usize, hot: Color| match loch {
+            Some(t) if n == 0 => t.muted(),
+            _ => self.theme.ui(hot),
+        };
         spans.push(Span::styled(
             err_text,
-            Style::default().fg(self.theme.ui(Color::Rgb(0xf1, 0x4c, 0x4c))),
+            Style::default().fg(count_ink(err_count, Color::Rgb(0xf1, 0x4c, 0x4c))),
         ));
         spans.push(Span::styled(
             warn_text,
-            Style::default().fg(self.theme.ui(Color::Rgb(0xcc, 0xa7, 0x00))),
+            Style::default().fg(count_ink(warn_count, Color::Rgb(0xcc, 0xa7, 0x00))),
         ));
         // Transient status message (e.g. "Saved editor.rs"), no keybinding
         // cheat-sheet — those live in F1 / the Command Palette now. Fenced
@@ -24548,9 +24858,16 @@ impl App {
             if status_h > 0 && x < outer[2].width {
                 self.announce_pos = Some((outer[2].x + x, outer[2].y));
             }
+            // Commentary, not a control: Croft Loch sets it in the muted
+            // ink and italic, a step below the clickable facts at the right.
             spans.push(Span::styled(
                 status_text.clone(),
-                Style::default().fg(self.theme.ui(Color::Rgb(0x9a, 0xa4, 0xb8))),
+                match loch {
+                    Some(t) => Style::default()
+                        .fg(t.muted())
+                        .add_modifier(Modifier::ITALIC),
+                    None => Style::default().fg(self.theme.ui(Color::Rgb(0x9a, 0xa4, 0xb8))),
+                },
             ));
         }
 
@@ -24802,13 +25119,19 @@ impl App {
             // pointer rests on them — same affordance as the activity bar.
             // Ln/Col (index 0) opens Go to Line, so it hovers like the rest.
             // Hit rects recorded in the same pass.
-            let seg_style = Style::default().fg(match self.theme.surfaces() {
-                Some(s) => s.muted(),
+            // Croft Loch sets the facts between the muted and body inks, a
+            // step above the italic message, and lifts one under the
+            // pointer to the strong ink on a faint chip.
+            let seg_style = Style::default().fg(match loch {
+                Some(t) => rgb_color(crate::gradient::lerp_rgb(t.muted, t.text, 0.5)),
                 None => self.theme.ui(Color::Rgb(0xc9, 0xd2, 0xe3)),
             });
-            let hover_style = Style::default()
-                .bg(self.theme.ui(Color::Rgb(0x2a, 0x31, 0x40)))
-                .fg(self.theme.ui(Color::White));
+            let hover_style = match loch {
+                Some(t) => Style::default().bg(t.hover_on(t.chrome)).fg(t.strong()),
+                None => Style::default()
+                    .bg(self.theme.ui(Color::Rgb(0x2a, 0x31, 0x40)))
+                    .fg(self.theme.ui(Color::White)),
+            };
             let mut right: Vec<Span> = Vec::with_capacity(seg_texts.len() * 2 - 1);
             let mut cx = rx;
             for (i, text) in seg_texts.iter().enumerate() {

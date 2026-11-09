@@ -73,9 +73,12 @@ const INACTIVE_TINT: Rgba<u8> = Rgba([0x9d, 0xa5, 0xb4, 0xff]);
 pub struct IconInk {
     /// Resting, unselected glyph (VS Code `activityBar.inactiveForeground`).
     pub inactive: Rgba<u8>,
-    /// Selected glyph, and any glyph under the pointer
-    /// (`activityBar.foreground`).
+    /// Selected glyph (`activityBar.foreground`).
     pub active: Rgba<u8>,
+    /// A glyph under the pointer. The active ink unless a theme sets a step
+    /// of its own ([`IconInk::with_hover`]), so hovered and selected can
+    /// differ by more than the pill.
+    pub hover: Rgba<u8>,
     /// The selection bar down the icon's left edge
     /// (`activityBar.activeBorder`).
     pub pill: Rgba<u8>,
@@ -86,6 +89,7 @@ impl Default for IconInk {
         Self {
             inactive: INACTIVE_TINT,
             active: ACTIVE_TINT,
+            hover: ACTIVE_TINT,
             pill: ACTIVE_PILL,
         }
     }
@@ -98,18 +102,28 @@ impl IconInk {
         Self {
             inactive: opaque(inactive),
             active: opaque(active),
+            hover: opaque(active),
             pill: opaque(pill),
         }
     }
 
-    /// The glyph tint for `state`: hovered borrows the active ink (VS Code
-    /// lifts a hovered icon to the foreground color), only the pill tells
-    /// selected apart from merely hovered.
+    /// The same ink with its own hover step: Croft Loch lifts a hovered
+    /// icon to body text and keeps the brighter ink for the selected one.
+    pub fn with_hover(self, (r, g, b): (u8, u8, u8)) -> Self {
+        Self {
+            hover: Rgba([r, g, b, 0xff]),
+            ..self
+        }
+    }
+
+    /// The glyph tint for `state`: hovered takes the hover ink (the active
+    /// one unless a theme set its own, as VS Code lifts a hovered icon to
+    /// the foreground color), and the pill tells selected apart.
     fn tint(self, state: IconState) -> Rgba<u8> {
-        if state.tinted() {
-            self.active
-        } else {
-            self.inactive
+        match state {
+            IconState::Active => self.active,
+            IconState::Hovered => self.hover,
+            IconState::Inactive => self.inactive,
         }
     }
 }
@@ -169,12 +183,6 @@ pub enum IconState {
 }
 
 impl IconState {
-    /// Whether the glyph wears the bright (active-foreground) tint. Both the
-    /// hovered and active states do; only the resting state stays muted.
-    fn tinted(self) -> bool {
-        matches!(self, IconState::Hovered | IconState::Active)
-    }
-
     /// Whether the blue left selection pill is painted. Only the active
     /// (selected-view) state shows it, so a merely-hovered icon stays
     /// distinguishable from the selected one.
