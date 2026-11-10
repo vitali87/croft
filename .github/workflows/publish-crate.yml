@@ -1,14 +1,15 @@
 # Release every PUBLISH_EVERY version bumps: GitHub first, then crates.io.
 #
-# croft bumps its version on every shipped merge, which is far more often
-# than anyone needs a release. This mirrors code-graph-rag's cadence: on
-# each push to main, count the versions main has carried since the newest
-# one crates.io already holds (scripts/publish_cadence.py, anchored on the
-# crates.io index rather than on a counter kept in the repo), and when the
-# count reaches PUBLISH_EVERY, tag the commit that set that version, hand the
-# tag to release.yml for the prebuilt archives, the GitHub release and the
-# Homebrew formula, wait for that release, and only then publish the version
-# to crates.io from the same commit.
+# croft bumps its version on every merge that ships a feature, a fix or a
+# dependency update, which is far more often than anyone needs a release. This
+# mirrors code-graph-rag's cadence: on each push to main, count the versions
+# main has carried since the newest one crates.io already holds
+# (scripts/publish_cadence.py, anchored on the crates.io index rather than on
+# a counter kept in the repo), and when the count reaches PUBLISH_EVERY, tag
+# the commit that set that version, hand the tag to release.yml for the
+# prebuilt archives, the GitHub release and the Homebrew formula, wait for
+# that release, and only then publish the version to crates.io from the same
+# commit.
 #
 # crates.io goes last because `cargo binstall croft-software` asks crates.io
 # for the newest version and then downloads that version's archive from its

@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """Decide whether main's head is due for crates.io and a GitHub release.
 
-croft bumps its version on every shipped merge (the release-hygiene gate in
-ci.yml), so "publish every N bumps" means: count the versions main has
-carried since the newest one crates.io already holds, and publish when that
-count reaches N. The same cadence code-graph-rag's version-bump workflow
-applies to PyPI and its GitHub releases, with one difference in where the
-count comes from. That repo counts tags since its latest GitHub release; here
-the anchor is the crates.io index itself and the history is Cargo.toml's
-version line along main's first-parent chain. Neither is a counter stored in
-the repo, so a repeated run reaches the same answer. A due version goes to
-crates.io and, through release.yml, to a GitHub release: the one decision
-drives both, so the two hold the same versions.
+croft bumps its version on every merge that ships a feature, a fix or a
+dependency update (the release-hygiene gate in ci.yml; a merge whose notes are
+all refactor ones makes no version), so "publish every N bumps" means: count
+the versions main has carried since the newest one crates.io already holds,
+and publish when that count reaches N. The same cadence code-graph-rag's
+version-bump workflow applies to PyPI and its GitHub releases, with one
+difference in where the count comes from. That repo counts tags since its
+latest GitHub release; here the anchor is the crates.io index itself and the
+history is Cargo.toml's version line along main's first-parent chain. Neither
+is a counter stored in the repo, so a repeated run reaches the same answer. A
+due version goes to crates.io and, through release.yml, to a GitHub release:
+the one decision drives both, so the two hold the same versions.
 
 Usage (CI):
   publish_cadence.py --every N --head <Cargo.toml version> --from-git --fetch [--released] [--force]

@@ -27,6 +27,11 @@
 # run is still going are released together by the next run: each run folds
 # every fragment pending on main when it starts.
 #
+# A merge whose notes are all `refactor:` ones (a change that ships but
+# changes nothing in use) makes no version either. Its notes wait for the
+# next version with a feature, a fix or a dependency update, so the publish
+# cadence counts only changes users see.
+#
 # tag.yml then tags the pushed release commit `v<version>`. Every
 # PUBLISH_EVERY versions, publish-crate.yml starts release.yml, whose GitHub
 # release carries the notes of every version since the previous release, and
@@ -36,8 +41,9 @@ name: version bump
 on:
   push:
     branches: [main]
-  # For a minor or major release: run it by hand on main. With no fragment
-  # pending it releases nothing, as a push would.
+  # For a minor or major release: run it by hand on main. With no feature,
+  # fix or dependency change pending (no fragment, or only refactor ones) it
+  # releases nothing, as a push would.
   workflow_dispatch:
     inputs:
       bump:
@@ -104,7 +110,7 @@ jobs:
             git reset -q --hard origin/main
             new="$(python3 scripts/release.py cut "$BUMP")"
             if [ -z "$new" ]; then
-              echo "No release notes are pending on main; nothing to release."
+              echo "No feature, fix or dependency change is pending on main; nothing to release."
               exit 0
             fi
             git add -A src/release_notes Cargo.toml Cargo.lock

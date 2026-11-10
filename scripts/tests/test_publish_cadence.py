@@ -1,10 +1,11 @@
 """Tests for scripts/publish_cadence.py and the workflow that runs it.
 
-croft bumps its version on every shipped merge, so "publish every N bumps" is
-a count of the versions main has carried since the newest one crates.io
-already holds. The count comes from main's first-parent history and the
-crates.io index, never from a counter stored in the repo, so a run can be
-repeated and always reaches the same answer.
+croft bumps its version on every merge that ships a feature, a fix or a
+dependency update, so "publish every N bumps" is a count of the versions main
+has carried since the newest one crates.io already holds. The count comes from
+main's first-parent history and the crates.io index, never from a counter
+stored in the repo, so a run can be repeated and always reaches the same
+answer.
 
 The workflow that runs the script is checked by test_publish_crate_workflow.py.
 """
