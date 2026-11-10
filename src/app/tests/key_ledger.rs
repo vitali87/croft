@@ -656,11 +656,6 @@ fn fingerprint(app: &App, root: &Path) -> Seen {
         let rows: BTreeSet<usize> = m.values().flatten().copied().collect();
         runs(rows)
     };
-    let typed: Vec<u8> = app
-        .terminals
-        .iter()
-        .flat_map(|t| t.written_bytes_for_test())
-        .collect();
     let clip = crate::clipboard::test_clip::mock_read().unwrap_or_default();
     // Each app has a workspace of its own, so its path is not news.
     // Nor are the process and pane ids a scrollback dump is named with.
@@ -681,6 +676,17 @@ fn fingerprint(app: &App, root: &Path) -> Seen {
     };
     let quote = |s: &str| format!("{:?}", scrub(s));
     let on = |on: bool| on.then(String::new);
+    // What the app wrote to each terminal pane, by the pane's place in the
+    // panel: the same bytes sent to another pane are another effect.
+    let typed: Vec<String> = app
+        .terminals
+        .iter()
+        .enumerate()
+        .filter_map(|(i, t)| {
+            let bytes = t.written_bytes_for_test();
+            (!bytes.is_empty()).then(|| format!("{i}:{}", quote(&String::from_utf8_lossy(&bytes))))
+        })
+        .collect();
     // A picker or menu: what it holds and the row it has selected.
     let picked = |query: &str, cursor: usize, row: &str| {
         Some(format!("{} @{cursor} > {}", quote(query), quote(row)))
@@ -717,7 +723,7 @@ fn fingerprint(app: &App, root: &Path) -> Seen {
             ),
             ("status", quote(&app.status)),
             ("clip", quote(&clip)),
-            ("typed", quote(&String::from_utf8_lossy(&typed))),
+            ("typed", typed.join(" ")),
             (
                 "terms",
                 format!("{}@{}", app.terminals.len(), app.active_terminal),
@@ -909,4 +915,23 @@ fn a_keys_effects_name_what_it_changed_and_what_it_opened() {
     let down = effects(&before, &fingerprint(&app, root));
     assert_ne!(down, fx, "the palette's selected row is part of it");
     assert_eq!(runs([1, 2, 3, 7]), "1-3,7");
+}
+
+#[test]
+fn a_keys_effects_name_the_terminal_pane_it_typed_into() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let mut app = app_with_open_file(root, "main.rs", "fn main() {}\n");
+    let quiet = ["-c", "exec sleep 600"].map(String::from);
+    app.terminals
+        .push(PtyTerminal::new_running("/bin/sh", &quiet, root).unwrap());
+    let before = fingerprint(&app, root);
+    app.terminals[1].write_input(b"ls");
+    let second = effects(&before, &fingerprint(&app, root));
+    assert!(second.contains("typed=1:\"ls\""), "{second}");
+    // The same bytes in the first pane instead.
+    app.terminals[1] = PtyTerminal::new_running("/bin/sh", &quiet, root).unwrap();
+    app.terminals[0].write_input(b"ls");
+    let first = effects(&before, &fingerprint(&app, root));
+    assert!(first.contains("typed=0:\"ls\""), "{first}");
 }
