@@ -26,8 +26,8 @@ between files, a rename, a restructure that behaves the same. A merge whose
 pending notes are all refactor ones makes no version, so it never counts
 toward publish-crate.yml's cadence and never sets off a release that changes
 nothing for users. Its notes stay pending and go out with the next version
-that has a feature, a fix or a dependency update. A GitHub release sums
-them up in one line.
+that has a feature, a fix or a dependency update. The welcome card leaves
+refactor lines out, and a GitHub release sums them up in one line.
 
 Usage:
   release.py check <base> <head>         the PR gate: a shipped change carries

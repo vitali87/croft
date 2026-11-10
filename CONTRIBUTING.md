@@ -65,6 +65,21 @@ feature: Unsaved edits survive a kill and come back on the next launch.
 fix: Ctrl+Q asks before throwing away unsaved edits.
 ```
 
+If your change ships but nothing changes for the people using croft, use the
+third kind, `refactor:`:
+
+```text
+refactor: Moved the file tree's code into its own file (#2062). Nothing changes in use.
+```
+
+That covers code moved between files, renames, and restructuring that keeps
+the same behaviour. Reviewers check the claim: if anything a user can see or
+do is different, it's a `feature:` or a `fix:`. A merge whose notes are all
+`refactor:` makes no version of its own and never counts toward the 50 below.
+Its notes wait and go out with the next version that has a feature, a fix or a
+dependency update. The welcome card leaves refactor lines out, and a GitHub
+release sums them up in one line.
+
 **Never** change `version` in `Cargo.toml`, and never edit
 `src/release_notes/<version>.md`. After your PR merges, CI assigns the version,
 folds in the notes, and publishes the release. You don't need a fragment for
