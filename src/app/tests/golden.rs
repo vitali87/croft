@@ -324,11 +324,19 @@ impl Dirs {
         Dirs {
             golden: root.join("src/app/tests/golden"),
             actual: root.join("target/golden-actual"),
-            // `cargo package` keeps the manifest it was given under this
-            // name beside the one it publishes; a checkout never has it.
-            packaged: root.join("Cargo.toml.orig").is_file(),
+            packaged: packaged_source(),
         }
     }
+}
+
+/// Whether this is a published crate's source, which leaves the saved
+/// goldens and the key ledger out. `cargo package` keeps the manifest it
+/// was given under this name beside the one it publishes; a checkout never
+/// has it.
+pub(super) fn packaged_source() -> bool {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("Cargo.toml.orig")
+        .is_file()
 }
 
 /// Whether this run rewrites goldens instead of comparing them.

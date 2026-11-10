@@ -16,7 +16,9 @@
 //! something the next one starts from a new app. `CROFT_LEDGER_FRESH=1`
 //! builds a new app for every chord instead: slower, and the ledger must not
 //! move, which is how the keeping is checked. `CROFT_BLESS=1` rewrites the
-//! ledger after a change that is meant to move a chord.
+//! ledger after a change that is meant to move a chord. A published crate's
+//! source leaves the ledger out, as it does the screen goldens, and there
+//! the comparison is skipped with a note.
 //!
 //! One chord reaches outside the test: re-rooting the Explorer
 //! (`ctrl+shift+/`) writes the window title straight to the terminal, so the
@@ -1406,7 +1408,16 @@ fn check(owner: &str, now: &[String]) {
         bless(owner, now);
         return;
     }
-    let saved = std::fs::read_to_string(LEDGER).unwrap_or_default();
+    let saved = match std::fs::read_to_string(LEDGER) {
+        Ok(saved) => saved,
+        // A published crate's source leaves the ledger out, as it does the
+        // screen goldens, so there is nothing to compare with.
+        Err(_) if super::golden::packaged_source() => {
+            eprintln!("{owner}: skipped, a published crate's source has no saved ledger");
+            return;
+        }
+        Err(err) => panic!("no saved ledger at {LEDGER} ({err}): write it with CROFT_BLESS=1"),
+    };
     // The hints' owner also answers for a context the ledger names that is gone.
     let mine = |o: &str| o == owner || (owner == NOT_PRESSED && !known_owner(o));
     let old: BTreeSet<&str> = saved
