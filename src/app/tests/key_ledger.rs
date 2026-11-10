@@ -596,12 +596,20 @@ fn explorer(tree: &crate::widgets::file_tree::FileTree, root: &Path) -> String {
 }
 
 /// The Search view: the query, the field with the caret and where the caret
-/// is while it is focused, the replace and file fields while shown, the
-/// options on, and the hits with the one selected.
+/// is while it is focused, the text selected in the query or another field,
+/// the replace and file fields while shown, the options on, and the hits
+/// with the one selected.
 fn search_view(s: &crate::widgets::search::SearchPanel) -> String {
     let mut out = format!("{:?}", s.query);
     if s.focused {
         out.push_str(&format!(" @{:?}:{}", s.field, s.caret()));
+    }
+    // A selection is what the next copy or typed key acts on.
+    if let Some((a, b)) = s.selection_range() {
+        out.push_str(&format!(" sel={a}-{b}"));
+    }
+    if let Some((a, b)) = s.field_selection {
+        out.push_str(&format!(" field_sel={a}-{b}"));
     }
     if s.replace_open {
         out.push_str(&format!(" replace={:?}", s.replace));
@@ -1115,4 +1123,15 @@ fn a_keys_effects_name_what_it_did_to_an_open_picker() {
     type_char(&mut app, 'x');
     let fx = effects(&opened, &fingerprint(&app, root));
     assert!(fx.contains("~go_to_symbol(\"x\" @1 > "), "its query: {fx}");
+}
+
+#[test]
+fn a_keys_effects_name_the_text_selected_in_the_search_view() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "main.rs", "fn main() {}\n");
+    app.search.query = String::from("total");
+    assert!(!search_view(&app.search).contains("sel="));
+    app.search.select_all_query();
+    let view = search_view(&app.search);
+    assert!(view.contains(" sel=0-5"), "what a copy takes: {view}");
 }
