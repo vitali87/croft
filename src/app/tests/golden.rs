@@ -74,8 +74,18 @@
 //!   work is done. So no spinner or progress mark is turning when a scene
 //!   is drawn. The embedded terminal's shell output depends on the user's
 //!   shell and rc files, so no scene shows the terminal tab.
-//! * Time: no scene draws the clock, a date or an age.
-//! * Git: no scene's workspace is a repository.
+//! * Time: no scene draws the clock, a date or an age. COMMITS can show a
+//!   commit's age, though not at the width Source Control's scene leaves
+//!   it; that scene's commit is dated in 2099, so the age would read
+//!   `0 seconds ago` on every earlier clock ([`hermetic_git`]).
+//! * Git: every workspace but Source Control's is a temp dir that is no
+//!   repository. Source Control's repository is made with fixed names,
+//!   emails and dates, no global or system config, no template and no
+//!   hooks, and pins in its own config the keys a user's global config
+//!   would change in what the app's git runs print. The app's own git
+//!   commands inherit the environment, so a run with git's repository
+//!   variables set, as inside a git hook, cannot pass that scene, which
+//!   then fails at once saying so.
 //! * Host and user names: the hostname is drawn only beside a forwarded
 //!   port in PORTS and a shell's host only on a terminal tab; no scene
 //!   shows either, and `is_remote` is pinned to a local session.
@@ -973,6 +983,13 @@ fn owned_goldens() -> Vec<String> {
         "workbench-256",
         "workbench-16",
         "workbench-80x24",
+        "command-palette",
+        "quick-open",
+        "unsaved-changes-prompt",
+        "explorer-context-menu",
+        "settings-editor",
+        "search-results",
+        "source-control",
     ];
     let themed = crate::theme::Theme::all()
         .iter()
@@ -1071,4 +1088,202 @@ fn workbench_in_an_80x24_terminal() {
         crate::color_depth::ColorDepth::TrueColor,
         no_masks,
     );
+}
+
+/// Type `text` as plain key presses.
+fn type_text(app: &mut App, text: &str) {
+    for c in text.chars() {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+            .unwrap();
+    }
+}
+
+/// The cell where `needle` first starts on screen, searching row by row.
+fn find_on_screen(shot: &Shot, needle: &str) -> Option<(u16, u16)> {
+    let area = shot.buffer.area;
+    (0..area.height).find_map(|y| {
+        (0..area.width).find_map(|x| {
+            row_text(&shot.buffer, y, x, area.width)
+                .starts_with(needle)
+                .then_some((x, y))
+        })
+    })
+}
+
+/// [`workbench`] drawn as a scene in the default theme at 120x40.
+fn workbench_scene(name: &str, app: &mut App) {
+    check_scene(
+        name,
+        app,
+        (120, 40),
+        crate::color_depth::ColorDepth::TrueColor,
+        no_masks,
+    );
+}
+
+#[test]
+fn command_palette_with_a_typed_query() {
+    let (_fixture, mut app) = workbench(crate::theme::Theme::default());
+    app.open_command_palette();
+    type_text(&mut app, "toggle side");
+    workbench_scene("command-palette", &mut app);
+}
+
+#[test]
+fn quick_open_with_a_typed_query() {
+    let (_fixture, mut app) = workbench(crate::theme::Theme::default());
+    // The index is walked on a background thread; take it once it lands so
+    // the finder never opens on the synchronous fallback walk instead.
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the Go to File index to be built",
+        || {
+            app.poll_file_finder_index();
+            app.file_finder_index.is_some()
+        },
+    );
+    app.run_command(crate::widgets::command_palette::Command::QuickOpen);
+    type_text(&mut app, "re");
+    workbench_scene("quick-open", &mut app);
+}
+
+#[test]
+fn unsaved_changes_prompt_on_closing_a_tab() {
+    let (_fixture, mut app) = workbench(crate::theme::Theme::default());
+    type_text(&mut app, "x");
+    assert!(app.editor.dirty);
+    app.run_command(crate::widgets::command_palette::Command::CloseEditor);
+    assert!(app.pending_unsaved.is_some());
+    workbench_scene("unsaved-changes-prompt", &mut app);
+}
+
+#[test]
+fn explorer_context_menu_on_a_file() {
+    let (_fixture, mut app) = workbench(crate::theme::Theme::default());
+    let (laid_out, _) = draw(&mut app, 120, 40);
+    let (x, y) = find_on_screen(&laid_out, "README.md").expect("README.md is in the tree");
+    app.handle_mouse(crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Right),
+        column: x,
+        row: y,
+        modifiers: KeyModifiers::NONE,
+    });
+    assert!(app.context_menu.is_some());
+    workbench_scene("explorer-context-menu", &mut app);
+}
+
+#[test]
+fn settings_editor() {
+    let (_fixture, mut app) = workbench(crate::theme::Theme::default());
+    app.run_command(crate::widgets::command_palette::Command::OpenSettingsEditor);
+    assert!(app.settings_editor.is_some());
+    workbench_scene("settings-editor", &mut app);
+}
+
+#[test]
+fn search_view_with_results() {
+    let (_fixture, mut app) = workbench(crate::theme::Theme::default());
+    app.run_command(crate::widgets::command_palette::Command::ShowSearch);
+    type_text(&mut app, "greet");
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the search to finish",
+        || {
+            app.drain_search_results();
+            app.search.complete
+        },
+    );
+    assert!(!app.search.hits.is_empty());
+    workbench_scene("search-results", &mut app);
+}
+
+/// Fail at once, saying why, when git's repository variables are set, as
+/// they are inside a git hook: the app's own git commands inherit them and
+/// would read that repository instead of the fixture's, so the scene could
+/// only time out.
+fn refuse_inherited_git_repository() {
+    for var in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_COMMON_DIR",
+    ] {
+        assert!(
+            std::env::var_os(var).is_none(),
+            "{var} is set, as inside a git hook: the app's git commands would \
+             read that repository, not the fixture's. Run the suite outside \
+             the hook."
+        );
+    }
+}
+
+/// Run `git` in `dir` as a fixed author and committer on a fixed date,
+/// reading no configuration but the repository's own and running no hook,
+/// so the commit (and its hash) is the same on every machine. The date is
+/// in 2099, past any clock this suite runs on: COMMITS can show a commit's
+/// age, which a past date would grow by a year every year; a future one
+/// clamps to `0 seconds ago`, every run.
+fn hermetic_git(dir: &Path, args: &[&str]) {
+    const WHEN: &str = "2099-01-01T00:00:00+00:00";
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["-c", "core.hooksPath=/dev/null"])
+        .args(args)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_AUTHOR_NAME", "Golden Author")
+        .env("GIT_AUTHOR_EMAIL", "author@example.invalid")
+        .env("GIT_AUTHOR_DATE", WHEN)
+        .env("GIT_COMMITTER_NAME", "Golden Author")
+        .env("GIT_COMMITTER_EMAIL", "author@example.invalid")
+        .env("GIT_COMMITTER_DATE", WHEN)
+        .output()
+        .expect("git runs");
+    assert!(
+        out.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn source_control_with_a_staged_and_an_unstaged_change() {
+    refuse_inherited_git_repository();
+    let (_fixture, root) = workspace(&[("src/main.rs", MAIN_RS), ("README.md", "# golden\n")]);
+    // No template: its hooks and excludes would be the developer's.
+    hermetic_git(&root, &["init", "-q", "--template=", "-b", "main"]);
+    // The app's own git runs read the user's global config, which the
+    // repository's own overrides: a global `log.decorate = full` turns
+    // COMMITS' `main` into `refs/heads/main`, and `log.showSignature`
+    // mixes signature checks into the log the graph reads.
+    hermetic_git(&root, &["config", "log.decorate", "short"]);
+    hermetic_git(&root, &["config", "log.showSignature", "false"]);
+    hermetic_git(&root, &["add", "."]);
+    hermetic_git(&root, &["commit", "-q", "-m", "Add the greeter"]);
+    std::fs::write(root.join("src/greeting.rs"), "pub fn hello() {}\n").unwrap();
+    hermetic_git(&root, &["add", "src/greeting.rs"]);
+    std::fs::write(root.join("README.md"), "# golden\n\nNow with a greeting.\n").unwrap();
+
+    let mut app = app_with_theme(&root, crate::theme::Theme::default());
+    assert!(app.open_file_at_launch(&root.join("src/main.rs")));
+    app.run_command(crate::widgets::command_palette::Command::ShowSourceControl);
+    // Status, the change list, the default branch and the COMMITS graph
+    // each come back from a thread of their own; take them all. Nothing
+    // changes the repository after this, so a reply that lands later says
+    // the same.
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(1000),
+        "git to report the changes, the default branch and the commits",
+        || {
+            app.drain_git_responses();
+            app.sync_explorer_panels();
+            app.source_control.entries.len() == 2
+                && app.default_branch_ask.is_none()
+                && app.commit_graph.is_loaded()
+                && !app.graph_fetch_inflight
+        },
+    );
+    workbench_scene("source-control", &mut app);
 }
