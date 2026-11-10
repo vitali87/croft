@@ -20,12 +20,22 @@ Dependabot PR is, needs no fragment: Dependabot cannot write one. `cut`
 compares Cargo.lock with what it held at the last release and adds a line for
 the crates that moved, so their release says so whoever merged them.
 
+A highlight is one of three kinds: `feature:`, `fix:` or `refactor:`. The
+third is for a change that ships but changes nothing in use: code moved
+between files, a rename, a restructure that behaves the same. A merge whose
+pending notes are all refactor ones makes no version, so it never counts
+toward publish-crate.yml's cadence and never sets off a release that changes
+nothing for users. Its notes stay pending and go out with the next version
+that has a feature, a fix or a dependency update. The welcome card leaves
+refactor lines out, and a GitHub release sums them up in one line.
+
 Usage:
   release.py check <base> <head>         the PR gate: a shipped change carries
                                          a fragment and leaves the version alone
   release.py cut [patch|minor|major]     fold the fragments and bump; prints the
                                          new version, or nothing when no
-                                         fragment is pending
+                                         feature, fix or dependency update is
+                                         pending
   release.py notes <version>             the GitHub release body for <version>:
                                          reads the tags already released, one
                                          per line on stdin, and prints the notes
@@ -77,6 +87,24 @@ INLINE_REQUIREMENT = re.compile(r'(\{.*\bversion\s*=\s*)"[^"]*"')
 TABLE_REQUIREMENT = re.compile(r'^(\s*version\s*=\s*)"[^"]*"')
 # Past this many dependency updates a release's note counts them instead.
 NAMED_UPDATES = 5
+# The three kinds a highlight takes, as every message that asks for
+# highlights names them.
+PREFIXES = "'feature:', 'fix:' or 'refactor:'"
+# An issue or pull request a refactor line names, for the one line a GitHub
+# release sums its refactor lines up in.
+REFERENCE = re.compile(r"#([0-9]+)")
+# What Rust's `str::trim` removes: Unicode's White_Space set. The refactor
+# rule trims with it and breaks lines at "\n" alone, as the build's `lines`
+# does, so the cut and the build read the same lines. Python's own `strip()`
+# also removes \x1c-\x1f, and `splitlines()` also breaks at a form feed,
+# U+2028 and others: `refactor: A.<form feed>fix: B.` would then be a fix
+# here and one refactor line to the build, and a version cut for it would
+# hold notes the build refuses to bake.
+RUST_WHITESPACE = (
+    "\t\n\x0b\x0c\r \x85\xa0\u1680"
+    "\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a"
+    "\u2028\u2029\u202f\u205f\u3000"
+)
 
 
 class ReleaseError(Exception):
@@ -88,6 +116,80 @@ def has_highlight(text: str) -> bool:
     neither blank nor a `#` heading. A file holding only a heading is
     non-blank and still paints an empty card."""
     return any(line.strip() and not line.strip().startswith("#") for line in text.splitlines())
+
+
+def is_refactor_line(line: str) -> bool:
+    """Whether `line` is a refactor highlight: a change that ships but
+    changes nothing in use. Mirrors `is_refactor_line` in
+    src/release_notes/select.rs, and `release_notes::parse` leaves the same
+    lines off the card, so the build, the card and the cut agree on which
+    merges change something.
+
+    The line is read as `parse` reads it: trimmed, one leading `- ` or `* `
+    bullet dropped, trimmed again. It is a refactor line when the text before
+    its first colon is `refactor` in any letter case. That text is not
+    trimmed, as `parse` does not trim `feature` or `fix`, so `refactor : x`
+    is not one, and neither is `refactoring: x`. Trimming removes what Rust's
+    `trim` removes (RUST_WHITESPACE), so the two copies agree on every line.
+    """
+    line = line.strip(RUST_WHITESPACE)
+    if not line or line.startswith("#"):
+        return False
+    if line.startswith(("- ", "* ")):
+        line = line[2:].strip(RUST_WHITESPACE)
+    kind, colon, _ = line.partition(":")
+    return bool(colon) and kind.isascii() and kind.lower() == "refactor"
+
+
+def has_user_highlight(text: str) -> bool:
+    """Whether `text` holds a highlight that is not a refactor line: a
+    feature, a fix, or an unprefixed line, which the card reads as a fix.
+    Mirrors `has_user_highlight` in src/release_notes/select.rs, lines and
+    trimming included: lines break at "\\n" alone, as Rust's `lines` breaks
+    them. Only such a highlight, or a dependency update, makes a merge worth
+    a version."""
+    return any(
+        line.strip(RUST_WHITESPACE)
+        and not line.strip(RUST_WHITESPACE).startswith("#")
+        and not is_refactor_line(line)
+        for line in text.split("\n")
+    )
+
+
+def without_refactor_lines(text: str) -> tuple[str, list[str]]:
+    """`text` with its refactor lines taken out, and the lines taken out.
+
+    Lines break at "\\n" alone, as for `has_user_highlight`, so the release
+    body leaves out exactly the lines the card does. Every other line is kept
+    as it was, line ending included, so a text with no refactor line comes
+    back unchanged.
+    """
+    kept, dropped = [], []
+    for line in re.split(r"(?<=\n)", text):
+        (dropped if is_refactor_line(line) else kept).append(line)
+    return "".join(kept), dropped
+
+
+def refactor_summary(dropped: list[str]) -> str:
+    """The one line a GitHub release carries for the refactor lines it left
+    out. Users read a release for what changed in use, and the refactor
+    program (#2062) lands dozens of moves that change nothing, so they are
+    counted rather than listed. The issues and pull requests they name are
+    kept, in number order, for whoever wants the detail."""
+    references = sorted({int(n) for line in dropped for n in REFERENCE.findall(line)})
+    named = f" ({', '.join(f'#{n}' for n in references)})" if references else ""
+    count = "1 change" if len(dropped) == 1 else f"{len(dropped)} changes"
+    return f"refactor: Internal groundwork{named}: {count}. Nothing changes in use.\n"
+
+
+def with_refactor_summary(body: str, dropped: list[str]) -> str:
+    """`body` with the line that sums up `dropped` after it, as a paragraph
+    of its own. `body` unchanged when nothing was dropped."""
+    if not dropped:
+        return body
+    if body and not body.endswith("\n"):
+        body += "\n"
+    return body + ("\n" if body else "") + refactor_summary(dropped)
 
 
 def git(*args, cwd=None) -> str:
@@ -265,8 +367,14 @@ def cut(root, kind: str = "patch", released_lock: str | None = None) -> str | No
     fragments' highlights, since a dependency bump merges with no fragment.
     Returns the new version, or None when neither is pending: a merge that
     shipped nothing leaves neither, and an empty release would paint an empty
-    card. Every check runs before the first write, so a refused cut leaves
-    the tree as it found it.
+    card. Also None when every pending fragment holds only refactor lines and
+    no dependency moved, whatever `kind` asks for: such a merge changes
+    nothing in use, and a version of its own would count toward the publish
+    cadence and set off a release that changes nothing for users. Its
+    fragments stay pending and are folded, refactor lines and all, into the
+    next version that has a feature, a fix or a dependency update. Every
+    check runs before the first write, so a refused cut leaves the tree as it
+    found it.
     """
     root = Path(root)
     fragments = fragment_paths(root)
@@ -281,9 +389,11 @@ def cut(root, kind: str = "patch", released_lock: str | None = None) -> str | No
         if not has_highlight(text):
             raise ReleaseError(
                 f"{path.relative_to(root)} carries no highlights (blank, or nothing but "
-                "headings). Write one per line, each prefixed 'feature:' or 'fix:'."
+                f"headings). Write one per line, each prefixed {PREFIXES}."
             )
         texts.append(text)
+    if not updates and not any(has_user_highlight(text) for text in texts):
+        return None
     if updates:
         texts.append(update_note(updates))
 
@@ -321,6 +431,11 @@ def release_notes(root, version: str, released: list[str]) -> str:
     nothing and is left out. With nothing released before it, or nothing in
     between, the body is `version`'s own notes, as it was when every version
     was released.
+
+    Refactor lines are left out of every version's notes, since a user
+    reading a release wants what changed in use, and one line at the end
+    counts them instead. With no refactor line in the range the body is
+    exactly what it was before refactor lines existed.
     """
     root = Path(root)
     own = root / NOTES_DIR / f"{version}.md"
@@ -343,14 +458,15 @@ def release_notes(root, version: str, released: list[str]) -> str:
         reverse=True,
     )
     if len(versions) <= 1:
-        return own.read_text(encoding="utf-8")
-    sections = []
+        return with_refactor_summary(*without_refactor_lines(own.read_text(encoding="utf-8")))
+    sections, dropped = [], []
     for v in versions:
-        text = (root / NOTES_DIR / f"{v}.md").read_text(encoding="utf-8")
+        text, gone = without_refactor_lines((root / NOTES_DIR / f"{v}.md").read_text(encoding="utf-8"))
+        dropped += gone
         if not text.endswith("\n"):
             text += "\n"
         sections.append(f"## {v}\n\n{text}")
-    return "\n".join(sections)
+    return with_refactor_summary("\n".join(sections), dropped)
 
 
 def setting_commit(version: str, cwd=None) -> str:
@@ -441,7 +557,7 @@ def check(base: str, head: str, cwd=None) -> list[str]:
         elif code == "M" and not has_highlight(git("show", f"{head}:{path}", cwd=cwd)):
             errors.append(
                 f"::error file={path}::{path} carries no highlights (blank, or nothing but "
-                "headings). Write one per line, each prefixed 'feature:' or 'fix:'."
+                f"headings). Write one per line, each prefixed {PREFIXES}."
             )
 
     shipped = []
@@ -471,13 +587,13 @@ def check(base: str, head: str, cwd=None) -> list[str]:
             f"::error::This PR changes shipped files but adds no release notes. Add "
             f"{UNRELEASED_DIR}/<name>.md, named for this change (for example its issue "
             "number and a word or two), with its highlights one per line, each prefixed "
-            "'feature:' or 'fix:'. It is folded into the next version's notes after merge."
+            f"{PREFIXES}. It is folded into the next version's notes after merge."
         )
     for path in added:
         if not has_highlight(git("show", f"{head}:{path}", cwd=cwd)):
             errors.append(
                 f"::error file={path}::{path} carries no highlights (blank, or nothing but "
-                "headings). Write one per line, each prefixed 'feature:' or 'fix:'."
+                f"headings). Write one per line, each prefixed {PREFIXES}."
             )
     return errors
 
