@@ -707,6 +707,10 @@ pub fn is_tmux_env(term: Option<&str>, tmux_var: Option<&str>) -> bool {
 }
 
 pub fn detect_iterm2_inline_support() -> bool {
+    #[cfg(test)]
+    if PLAIN_HOST_FRAMES.with(std::cell::Cell::get) {
+        return false;
+    }
     if force_inline_images(std::env::var("CROFT_FORCE_INLINE_IMAGES").ok().as_deref()) {
         return true;
     }
@@ -718,6 +722,15 @@ pub fn detect_iterm2_inline_support() -> bool {
     // `CROFT_FORCE_INLINE_IMAGES=1`.
     let term_program = std::env::var("TERM_PROGRAM").ok();
     is_iterm2_term_program(term_program.as_deref())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Set by a test that draws frames as a terminal without iTerm2's
+    /// session background draws them (the screen goldens), whatever
+    /// terminal runs the suite. The environment is shared by every test in
+    /// the process, so changing it is no test's to do.
+    pub static PLAIN_HOST_FRAMES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 pub fn detect_tmux() -> bool {

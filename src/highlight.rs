@@ -553,11 +553,43 @@ pub fn set_syntax_palette(palette: SyntaxPalette) {
     // Base16 colours, so a push here would make those tests pass or fail by
     // scheduling. A test that needs another palette highlights through the
     // explicit-palette paths (`highlight_text_with_palette`,
-    // `palette_style_for_name`) instead.
+    // `palette_style_for_name`) instead, or gives its thread a palette of
+    // its own ([`set_thread_syntax_palette`]), which then takes the push.
     if cfg!(test) {
+        #[cfg(test)]
+        THREAD_SYNTAX.with(|own| {
+            if own.get().is_some() {
+                own.set(Some(palette));
+            }
+        });
         return;
     }
     *SYNTAX.write().unwrap() = palette;
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Under test, the code palette this thread highlights with instead of
+    /// the shared one, when it has one. The screen goldens give their thread
+    /// one, so `App::new`'s push of the theme's palette lands here and the
+    /// editor shows the theme's own code colours, as in the running app,
+    /// while the shared palette other tests pin stays Base16.
+    static THREAD_SYNTAX: std::cell::Cell<Option<SyntaxPalette>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// This thread's own code palette under test, if it has one.
+#[cfg(test)]
+pub(crate) fn thread_syntax_palette() -> Option<SyntaxPalette> {
+    THREAD_SYNTAX.with(std::cell::Cell::get)
+}
+
+/// Give this thread a code palette of its own under test, or `None` to read
+/// the shared one again. The editor's highlight pass carries it to the
+/// worker it starts.
+#[cfg(test)]
+pub(crate) fn set_thread_syntax_palette(palette: Option<SyntaxPalette>) {
+    THREAD_SYNTAX.with(|own| own.set(palette));
 }
 
 /// The palette keyed by capture name, resolved against the active theme's
@@ -565,6 +597,10 @@ pub fn set_syntax_palette(palette: SyntaxPalette) {
 /// by the LSP semantic-token overlay (via `semantic_style_for`) so both layers
 /// paint the same colors.
 fn style_for_name(name: &str) -> Style {
+    #[cfg(test)]
+    if let Some(own) = thread_syntax_palette() {
+        return palette_style_for_name(&own, name);
+    }
     palette_style_for_name(&SYNTAX.read().unwrap(), name)
 }
 
@@ -1713,6 +1749,8 @@ pub fn highlight_text_with_protected(
     // Snapshot the palette once per pass: the write happens only on a theme
     // switch, and one read beats a lock round-trip per token.
     let palette = *SYNTAX.read().unwrap();
+    #[cfg(test)]
+    let palette = thread_syntax_palette().unwrap_or(palette);
     highlight_text_with_palette(registry, kind, text, line_starts, &palette)
 }
 
@@ -2492,6 +2530,35 @@ def f() -> Config:\n\
     #[test]
     fn the_shared_palette_stays_base16_under_test() {
         set_syntax_palette(crate::theme::SyntaxPalette::LOCH);
+        assert_eq!(*SYNTAX.read().unwrap(), SyntaxPalette::BASE16);
+    }
+
+    /// A thread with a palette of its own takes the push the shared palette
+    /// ignores under test and highlights with it; a thread without one
+    /// never sees it.
+    #[test]
+    fn a_thread_with_its_own_palette_takes_the_push_under_test() {
+        let src = b"fn main() {}";
+        let keyword = |h: &[Vec<HiSpan>]| h[0][0].style.fg;
+        let line_starts = compute_line_starts(src);
+        set_thread_syntax_palette(Some(SyntaxPalette::BASE16));
+        set_syntax_palette(SyntaxPalette::LOCH);
+        assert_eq!(thread_syntax_palette(), Some(SyntaxPalette::LOCH));
+        let own = highlight_text(&mut LangRegistry::new(), LangKind::Rust, src, &line_starts);
+        let elsewhere = std::thread::spawn(move || {
+            highlight_text(&mut LangRegistry::new(), LangKind::Rust, src, &line_starts)
+        })
+        .join()
+        .unwrap();
+        set_thread_syntax_palette(None);
+        assert_eq!(
+            keyword(&own),
+            palette_style_for_name(&SyntaxPalette::LOCH, "keyword").fg
+        );
+        assert_eq!(
+            keyword(&elsewhere),
+            palette_style_for_name(&SyntaxPalette::BASE16, "keyword").fg
+        );
         assert_eq!(*SYNTAX.read().unwrap(), SyntaxPalette::BASE16);
     }
 

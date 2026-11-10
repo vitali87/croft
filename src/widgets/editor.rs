@@ -8440,9 +8440,15 @@ impl Editor {
         let text = self.lines.join("\n");
         let line_lens = embedded_line_lens(&self.lines);
         let (tx, rx) = std::sync::mpsc::channel();
+        // Under test a thread can carry a code palette of its own (the
+        // screen goldens' themes), which the pass reads on its worker.
+        #[cfg(test)]
+        let palette = crate::highlight::thread_syntax_palette();
         let spawned = std::thread::Builder::new()
             .name(String::from("croft-highlight"))
             .spawn(move || {
+                #[cfg(test)]
+                crate::highlight::set_thread_syntax_palette(palette);
                 // Nobody listening (the tab closed, or a newer pass replaced
                 // this one) is fine: the result is simply dropped.
                 let _ = tx.send(run_highlight_pass(kind, text, line_lens));
