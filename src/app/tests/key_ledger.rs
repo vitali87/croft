@@ -982,3 +982,514 @@ fn a_keys_effects_name_what_it_changed_and_what_it_opened() {
     );
     assert_eq!(runs([1, 2, 3, 7]), "1-3,7");
 }
+
+/// Where the ledger is kept.
+const LEDGER: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/src/app/tests/golden/key-ledger.txt"
+);
+
+/// The ledger's first lines, before the hints it does not press.
+const HEADER: &str = concat!(
+    "# What every advertised chord does in each main context: ",
+    "src/app/tests/key_ledger.rs.\n",
+    "# `context | chord | effects`. ",
+    "Rewrite with CROFT_BLESS=1 after a change meant to move one.\n",
+);
+
+/// What owns the ledger's lines that list the hints it does not press.
+const NOT_PRESSED: &str = "# not pressed";
+
+/// The file every context has open, the caret on `total`: a block comment,
+/// a function with a block nested in it, and a region holding another, so
+/// each fold and selection command has something of its own to do.
+const MAIN_RS: &str = concat!(
+    "/*\n",
+    " * Adds two numbers and prints the total.\n",
+    " */\n",
+    "fn main() {\n",
+    "    let total = add(1, 2);\n",
+    "    if total > 2 {\n",
+    "        println!(\"{total}\");\n",
+    "    }\n",
+    "}\n",
+    "\n",
+    "// #region helpers\n",
+    "fn add(a: i32, b: i32) -> i32 {\n",
+    "    a + b\n",
+    "}\n",
+    "// #endregion\n",
+);
+
+/// Where the caret is in [`MAIN_RS`]: on `total`.
+const ON_TOTAL: (usize, usize) = (4, 8);
+
+/// Where `total` ends, for the selection context.
+const TOTAL_END: (usize, usize) = (4, 13);
+
+/// A launch configuration whose program is asked for: F5 opens that question
+/// rather than starting whichever debugger this machine has.
+const LAUNCH_JSON: &str = r#"{"configurations": [{"name": "Ledger", "type": "lldb",
+  "request": "launch", "program": "${input:program}"}],
+  "inputs": [{"id": "program", "type": "promptString", "description": "Program"}]}"#;
+
+/// A workspace of `main.rs`, `docs/notes.md` and `.vscode/launch.json`.
+fn workspace(root: &Path) {
+    std::fs::create_dir_all(root.join("docs")).unwrap();
+    std::fs::create_dir_all(root.join(".vscode")).unwrap();
+    std::fs::write(root.join("main.rs"), MAIN_RS).unwrap();
+    std::fs::write(root.join("docs/notes.md"), "# Notes\n").unwrap();
+    std::fs::write(root.join(".vscode/launch.json"), LAUNCH_JSON).unwrap();
+}
+
+/// Make the workspace at `root` a repository: everything committed on
+/// `main`, then a change to `docs/notes.md` staged and `todo.txt` new. Who
+/// commits and that nothing signs or hooks a commit is the repository's own
+/// config, so a commit from croft goes the same way whatever the
+/// developer's git config says.
+fn repository(root: &Path) {
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "git {args:?}: {err}");
+    };
+    git(&["init", "-q", "-b", "main"]);
+    let config = root.join(".git/config");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str(
+        "[user]\n\tname = Ledger\n\temail = ledger@example.com\n\
+         [commit]\n\tgpgsign = false\n[core]\n\thooksPath = /dev/null\n",
+    );
+    std::fs::write(&config, text).unwrap();
+    git(&["add", "-A"]);
+    git(&["commit", "-q", "-m", "Start"]);
+    std::fs::write(root.join("docs/notes.md"), "# Notes\n\nShip it.\n").unwrap();
+    git(&["add", "docs/notes.md"]);
+    std::fs::write(root.join("todo.txt"), "tests\n").unwrap();
+}
+
+/// The contexts where a chord's own handler answers it, with no dialog
+/// open to take the key first.
+const NO_DIALOG: &[&str] = &[
+    "editor",
+    "selection",
+    "explorer",
+    "terminal",
+    "search",
+    "scm",
+];
+
+/// Chords whose answer depends on the machine rather than on croft, with the
+/// contexts they are left out of and why. With a dialog open the dialog
+/// answers them, and the machine makes no difference.
+const MACHINE_BOUND: &[(&[&str], &str, &str)] = &[
+    (
+        NO_DIALOG,
+        "ctrl+f5",
+        "lists this machine's running Python processes",
+    ),
+    (
+        NO_DIALOG,
+        "ctrl+k shift+g",
+        "asks a model when ANTHROPIC_API_KEY is set",
+    ),
+    (
+        NO_DIALOG,
+        "ctrl+shift+f9",
+        "reads CROFT_NO_UPDATE_CHECK and CROFT_REMOTE_AUTOUPDATE",
+    ),
+    (
+        &["explorer"],
+        "ctrl+z",
+        "jumps with zoxide, installed or not",
+    ),
+];
+
+/// Why `chord` is not pressed in `context`, when it is machine-bound there.
+fn machine_bound(context: &str, chord: &str) -> Option<&'static str> {
+    MACHINE_BOUND
+        .iter()
+        .find(|(contexts, c, _)| *c == chord && contexts.contains(&context))
+        .map(|(_, _, why)| *why)
+}
+
+/// One main branch of the key router, as the app is set up to reach it.
+struct Context {
+    name: &'static str,
+    /// Whether the workspace is a git repository.
+    repo: bool,
+    /// What turns an app with `main.rs` open, the caret on `total`, into
+    /// this context.
+    setup: fn(&mut App),
+}
+
+/// The contexts every chord is pressed in, in the ledger's order.
+const CONTEXTS: [Context; 8] = [
+    Context {
+        name: "editor",
+        repo: false,
+        setup: |app| app.focus_pane(Pane::Editor),
+    },
+    Context {
+        name: "selection",
+        repo: false,
+        setup: |app| {
+            app.focus_pane(Pane::Editor);
+            select(app, ON_TOTAL, TOTAL_END);
+        },
+    },
+    Context {
+        name: "explorer",
+        repo: false,
+        setup: |app| {
+            app.set_sidebar_view(SidebarView::Explorer);
+            app.focus_pane(Pane::Tree);
+            let main_rs = app
+                .tree
+                .nodes
+                .iter()
+                .position(|n| n.path.ends_with("main.rs"));
+            app.tree.selected = main_rs.expect("main.rs is in the Explorer");
+        },
+    },
+    Context {
+        name: "terminal",
+        repo: false,
+        setup: |app| {
+            app.show_terminal = true;
+            app.bottom_panel_tab = BottomPanelTab::Terminal;
+            app.focus_pane(Pane::Terminal);
+        },
+    },
+    Context {
+        name: "search",
+        repo: false,
+        setup: |app| {
+            app.set_sidebar_view(SidebarView::Search);
+            app.search.query = String::from("total");
+            app.search.run_query();
+            assert_eq!(app.search.hits.len(), 4, "`total` 4 times in main.rs");
+        },
+    },
+    Context {
+        name: "scm",
+        repo: true,
+        setup: |app| {
+            app.set_sidebar_view(SidebarView::SourceControl);
+            crate::test_budget::await_spawned(
+                std::time::Duration::from_millis(500),
+                "git status for Source Control",
+                || {
+                    app.drain_git_responses();
+                    app.source_control.entries.len() == 2
+                },
+            );
+            app.source_control.message = String::from("Ship it");
+            app.source_control.message_cursor = app.source_control.message.len();
+        },
+    },
+    Context {
+        name: "palette",
+        repo: false,
+        setup: |app| app.open_command_palette(),
+    },
+    Context {
+        name: "confirm",
+        repo: false,
+        setup: |app| {
+            app.focus_pane(Pane::Editor);
+            type_char(app, 'x');
+            press_ctrl_q(app);
+            assert!(app.pending_unsaved.is_some(), "the unsaved-changes prompt");
+        },
+    },
+];
+
+/// An app in a context, with what it shows before the next chord. Its fields
+/// drop in order, the app first and the folder it all lives in last.
+struct Built {
+    app: App,
+    root: PathBuf,
+    seen: Seen,
+    /// The shell App::new started, which the quiet child replaced.
+    shell: PtyTerminal,
+    _cache: crate::session_state::CacheDirForThisTestThread,
+    _tmp: tempfile::TempDir,
+}
+
+impl Built {
+    /// Done with: its terminals end on `enders`, the rest drops here.
+    fn retire(mut self, enders: &mut Enders) {
+        let mut terminals = std::mem::take(&mut self.app.terminals);
+        terminals.push(self.shell);
+        enders.end(terminals);
+    }
+}
+
+/// The app for `ctx` in a workspace of its own, one frame drawn so every
+/// pane has its size. A local session with no language server, so none
+/// starts and nothing depends on which are installed, and with a terminal
+/// child that prints nothing, so no prompt races a key onto the grid.
+fn build(ctx: &Context) -> Built {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("ws");
+    workspace(&root);
+    if ctx.repo {
+        repository(&root);
+    }
+    // croft's cache (scrollback dumps, sessions) goes beside it, not home.
+    let cache = crate::session_state::CacheDirForThisTestThread::set(&tmp.path().join("cache"));
+    let mut app = App::new(root.clone()).unwrap();
+    app.lsp = None;
+    app.is_remote = false;
+    app.selected_debug_config = Some(String::from("Ledger"));
+    let quiet = PtyTerminal::new_running(
+        "/bin/sh",
+        &[String::from("-c"), String::from("exec sleep 600")],
+        &root,
+    )
+    .unwrap();
+    let shell = std::mem::replace(&mut app.terminals[0], quiet);
+    app.clipboard_reader = || Some(String::from("CLIP"));
+    crate::clipboard::test_clip::mock_write("CLIP");
+    crate::clipboard::test_clip::remember_copy("CLIP");
+    app.editor.open_pinned(&root.join("main.rs")).unwrap();
+    (app.editor.cursor_row, app.editor.cursor_col) = ON_TOTAL;
+    (ctx.setup)(&mut app);
+    draw(&mut app, 120, 40);
+    let seen = fingerprint(&app, &root);
+    Built {
+        app,
+        root,
+        seen,
+        shell,
+        _cache: cache,
+        _tmp: tmp,
+    }
+}
+
+/// Ends the terminals of retired apps on threads of their own, a few at a
+/// time: ending one waits on its shell, most of a press's wall time.
+#[derive(Default)]
+struct Enders(std::collections::VecDeque<std::thread::JoinHandle<()>>);
+
+impl Enders {
+    /// How many retired apps' terminals may be ending at once.
+    const AT_ONCE: usize = 4;
+
+    fn end(&mut self, terminals: Vec<PtyTerminal>) {
+        if self.0.len() >= Self::AT_ONCE
+            && let Some(oldest) = self.0.pop_front()
+        {
+            oldest.join().unwrap();
+        }
+        self.0
+            .push_back(std::thread::spawn(move || drop(terminals)));
+    }
+}
+
+impl Drop for Enders {
+    fn drop(&mut self) {
+        for ender in self.0.drain(..) {
+            let _ = ender.join();
+        }
+    }
+}
+
+/// [`advertised`], worked out once for every test that presses them.
+fn advertised_once() -> &'static Advertised {
+    static ADVERTISED: std::sync::OnceLock<Advertised> = std::sync::OnceLock::new();
+    ADVERTISED.get_or_init(advertised)
+}
+
+/// The ledger's lines for `ctx`: every advertised chord pressed in it, in
+/// order, each on an app in the context and showing nothing any chord
+/// before it changed.
+fn presses(ctx: &Context) -> Vec<String> {
+    let fresh = std::env::var("CROFT_LEDGER_FRESH").is_ok_and(|v| v == "1");
+    let mut enders = Enders::default();
+    let mut kept: Option<Built> = None;
+    let mut lines = Vec::new();
+    for (chord, keys) in &advertised_once().0 {
+        if machine_bound(ctx.name, chord).is_some() {
+            continue;
+        }
+        let b = kept.get_or_insert_with(|| build(ctx));
+        let errors: Vec<String> = keys
+            .iter()
+            .filter_map(|k| b.app.handle_key(*k).err())
+            .map(|e| format!(" error={:?}", e.to_string()))
+            .collect();
+        // A git operation runs off the UI thread: its end is part of what
+        // the chord did, and git must not be busy while it is read.
+        if b.app.git_net_job.is_some() {
+            wait_for_git_net(&mut b.app);
+        }
+        let fx = effects(&b.seen, &fingerprint(&b.app, &b.root)) + &errors.concat();
+        let changed = fx != "-";
+        lines.push(format!("{} | {chord} | {fx}", ctx.name));
+        if fresh || changed {
+            kept.take().unwrap().retire(&mut enders);
+        }
+    }
+    if let Some(done) = kept {
+        done.retire(&mut enders);
+    }
+    lines
+}
+
+/// What owns a ledger line: its context, [`NOT_PRESSED`] for a hint it does
+/// not press, `None` for the header.
+fn owner_of(line: &str) -> Option<&str> {
+    if line.starts_with(NOT_PRESSED) {
+        Some(NOT_PRESSED)
+    } else if line.starts_with('#') || line.is_empty() {
+        None
+    } else {
+        line.split(" | ").next()
+    }
+}
+
+/// Whether `owner` still owns lines: the hints, or a context there is.
+fn known_owner(owner: &str) -> bool {
+    owner == NOT_PRESSED || CONTEXTS.iter().any(|c| c.name == owner)
+}
+
+/// Where a ledger line goes: the hints first, then each context in
+/// [`CONTEXTS`] order, its chords in the order they are pressed.
+fn place(line: &str) -> (usize, &str) {
+    let owner = owner_of(line).unwrap_or_default();
+    let ctx = CONTEXTS.iter().position(|c| c.name == owner);
+    let chord = line.split(" | ").nth(1).unwrap_or_default();
+    (ctx.map_or(0, |i| i + 1), chord)
+}
+
+/// Replace `owner`'s lines in the ledger with `now`, under a lock on the
+/// file, since each context's test writes its own lines and they run at
+/// once. The hints' owner also drops the lines of a context that is gone.
+fn bless(owner: &str, now: &[String]) {
+    use std::io::{Read, Seek, Write};
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(LEDGER)
+        .unwrap();
+    file.lock().unwrap();
+    let mut saved = String::new();
+    file.read_to_string(&mut saved).unwrap();
+    let kept = |o: &str| o != owner && (known_owner(o) || owner != NOT_PRESSED);
+    let mut lines: Vec<&str> = saved
+        .lines()
+        .filter(|l| owner_of(l).is_some_and(kept))
+        .chain(now.iter().map(String::as_str))
+        .collect();
+    lines.sort_by(|a, b| place(a).cmp(&place(b)).then(a.cmp(b)));
+    file.set_len(0).unwrap();
+    file.rewind().unwrap();
+    file.write_all(HEADER.as_bytes()).unwrap();
+    for line in lines {
+        writeln!(file, "{line}").unwrap();
+    }
+}
+
+/// Fail, listing the lines that moved, unless the ledger's lines for `owner`
+/// are `now`; with `CROFT_BLESS=1`, make them `now`.
+fn check(owner: &str, now: &[String]) {
+    if std::env::var("CROFT_BLESS").is_ok_and(|v| v == "1") {
+        bless(owner, now);
+        return;
+    }
+    let saved = std::fs::read_to_string(LEDGER).unwrap_or_default();
+    // The hints' owner also answers for a context the ledger names that is gone.
+    let mine = |o: &str| o == owner || (owner == NOT_PRESSED && !known_owner(o));
+    let old: BTreeSet<&str> = saved
+        .lines()
+        .filter(|l| owner_of(l).is_some_and(mine))
+        .collect();
+    let new: BTreeSet<&str> = now.iter().map(String::as_str).collect();
+    let mut moved: Vec<(&str, &str)> = old.difference(&new).map(|l| ("-", *l)).collect();
+    moved.extend(new.difference(&old).map(|l| ("+", *l)));
+    // A chord's old line just above its new one.
+    moved.sort_by_key(|(sign, line)| {
+        let context_and_chord: Vec<&str> = line.splitn(3, " | ").take(2).collect();
+        (context_and_chord, *sign == "+")
+    });
+    let moved: Vec<String> = moved
+        .iter()
+        .map(|(sign, line)| format!("{sign} {line}"))
+        .collect();
+    assert!(
+        moved.is_empty(),
+        "{} ledger line(s) moved: a shortcut now does something else. If that \
+         is meant, rewrite {LEDGER} with CROFT_BLESS=1.\n{}",
+        moved.len(),
+        moved.join("\n")
+    );
+}
+
+/// Press every advertised chord in the context named `name` and check what
+/// each did against the ledger.
+fn check_context(name: &str) {
+    let ctx = CONTEXTS.iter().find(|c| c.name == name).unwrap();
+    check(name, &presses(ctx));
+}
+
+#[test]
+fn the_ledger_lists_every_hint_it_does_not_press_and_why() {
+    let mut lines: Vec<String> = advertised_once().1.clone();
+    for (contexts, chord, why) in MACHINE_BOUND {
+        lines.push(format!("{} | {chord} | {why}", contexts.join(" ")));
+    }
+    let lines: Vec<String> = lines
+        .iter()
+        .map(|l| format!("{NOT_PRESSED} | {l}"))
+        .collect();
+    check(NOT_PRESSED, &lines);
+}
+
+#[test]
+fn every_advertised_chord_does_what_the_ledger_says_in_the_editor() {
+    check_context("editor");
+}
+
+#[test]
+fn every_advertised_chord_does_what_the_ledger_says_over_a_selection() {
+    check_context("selection");
+}
+
+#[test]
+fn every_advertised_chord_does_what_the_ledger_says_in_the_explorer() {
+    check_context("explorer");
+}
+
+#[test]
+fn every_advertised_chord_does_what_the_ledger_says_in_the_terminal() {
+    check_context("terminal");
+}
+
+#[test]
+fn every_advertised_chord_does_what_the_ledger_says_in_the_search_view() {
+    check_context("search");
+}
+
+#[test]
+fn every_advertised_chord_does_what_the_ledger_says_in_source_control() {
+    check_context("scm");
+}
+
+#[test]
+fn every_advertised_chord_does_what_the_ledger_says_in_the_command_palette() {
+    check_context("palette");
+}
+
+#[test]
+fn every_advertised_chord_does_what_the_ledger_says_in_a_confirm_dialog() {
+    check_context("confirm");
+}
