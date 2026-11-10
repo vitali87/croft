@@ -137,6 +137,17 @@ class PureMoves(unittest.TestCase):
             code, out = repo.check()
             self.assertEqual(code, 0, out)
 
+    def test_identical_items_moving_together_pair_by_visibility(self):
+        """A private helper and an identical `pub(crate)` one, moved to two
+        new files in the other order, is a pure move: neither narrows."""
+        helper = "fn helper() -> u8 {\n    1\n}\n"
+        repo = self.repo({"a.rs": helper, "b.rs": "pub(crate) " + helper})
+        repo.commit({"a.rs": "", "b.rs": "", "c.rs": "pub(crate) " + helper, "d.rs": helper})
+        code, out = repo.check()
+        self.assertEqual(code, 0, out)
+        self.assertIn("moved    fn a.rs::helper -> d.rs::helper", out)
+        self.assertIn("moved    fn b.rs::helper -> c.rs::helper", out)
+
     def test_docs_and_attributes_left_behind_fail(self):
         """Rust hands a stranded doc or attribute to the next item, so an
         item that moved without them changed two items, not zero."""

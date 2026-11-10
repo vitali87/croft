@@ -371,6 +371,34 @@ def widens(old, new):
     return a is not None and b is not None and b > a
 
 
+def pair_by_visibility(olds, news):
+    """Identical items moved from `olds` to `news`, paired so each keeps or
+    widens its visibility, as many pairs as can be: in list order, a private
+    helper and an identical `pub(crate)` one moving together could otherwise
+    be paired crosswise and read as a narrowing. Returns the pairs and the
+    items left on each side, in their original order."""
+    owner = [None] * len(news)
+
+    def place(i, tried):
+        for j, n in enumerate(news):
+            if j in tried or not widens(olds[i].vis, n.vis):
+                continue
+            tried.add(j)
+            if owner[j] is None or place(owner[j], tried):
+                owner[j] = i
+                return True
+        return False
+
+    for i in range(len(olds)):
+        place(i, set())
+    paired = {i for i in owner if i is not None}
+    pairs = sorted(((olds[i], news[j]) for j, i in enumerate(owner) if i is not None),
+                   key=lambda p: olds.index(p[0]))
+    left_old = [o for i, o in enumerate(olds) if i not in paired]
+    left_new = [n for j, n in enumerate(news) if owner[j] is None]
+    return pairs, left_old, left_new
+
+
 def compare(old, new):
     """(unchanged count, moved pairs, changed pairs, removed, added).
 
@@ -397,8 +425,9 @@ def compare(old, new):
             else:
                 rest_old.append(o)
         rest_new = [n for twins in at.values() for n in twins]
-        for o, n in zip(rest_old, rest_new):
-            (moved if widens(o.vis, n.vis) else narrowed).append((o, n))
+        pairs, rest_old, rest_new = pair_by_visibility(rest_old, rest_new)
+        moved += pairs
+        narrowed += zip(rest_old, rest_new)
         gone += rest_old[len(rest_new) :]
         came += rest_new[len(rest_old) :]
     by_name = defaultdict(list)
