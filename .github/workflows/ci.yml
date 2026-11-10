@@ -106,6 +106,16 @@ jobs:
           set -euo pipefail
           base="$(git merge-base "origin/$GITHUB_BASE_REF" HEAD)"
           python3 scripts/check_doc_ownership.py "$base" HEAD
+      # A file split moves thousands of lines nobody can review by reading.
+      # A branch that declares `pure-move: true` in a commit message gets
+      # proof instead: every Rust item it touched moved byte for byte. Without
+      # the declaration it prints what moved and changed, without diffs, and
+      # passes.
+      - name: A declared pure move only moves code
+        run: |
+          set -euo pipefail
+          base="$(git merge-base "origin/$GITHUB_BASE_REF" HEAD)"
+          python3 scripts/check_pure_move.py --if-declared "$base" HEAD
       # ARCHITECTURE.md's tree carries the reasons behind each module, and a
       # rewrite can cut a line's rationale away while the row and its
       # identifiers survive - which is what a row-level or identifier-level

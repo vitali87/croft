@@ -1,30 +1,46 @@
 #!/usr/bin/env python3
-"""Parse Rust files into items, so a change can be proven to only move code.
+"""Prove a change only moves Rust items, byte for byte, and list what moved.
 
 Splitting an 86k-line file moves thousands of lines, and nobody can review
-that by reading it. Every line of a file is either part of an item - each
-free item, and each item inside an `impl` or inline `mod` block - or glue
-between items. An item's text is the item plus the docs, attributes and `//`
-comments directly above it, with the common indentation and the visibility
-on its signature line (moves widen it) normalised away. A method also keeps
-the code of its `impl` header, so `fmt` in `impl Display for X` and `fmt` in
-`impl Debug for X` are two items. Glue is `use` and `mod x;` declarations,
-`impl` and `mod` block headers (their docs and comments too) and closing
-braces, blank lines and `//!` docs.
+that by reading it. This parses every changed `.rs` file at both revisions
+into items - each free item, and each item inside an `impl` or inline `mod`
+block - and matches them by text. An item's text is the item plus the docs,
+attributes and `//` comments directly above it; before comparing, only the
+common indentation and the visibility on its signature line are normalised.
+A move may keep or widen that visibility; narrowing it, or changing it to one
+that does not compare (`pub(super)` to `pub(in a)`), is a change. A method keeps the code of its `impl` header as part of its
+identity, so moving `fmt` from `impl Display for X` to `impl Debug for X`, or
+out of a `#[cfg(test)] impl`, is not a move.
+
+Glue is allowed and listed apart: `use` and `mod x;` declarations, `impl` and
+`mod` block headers (their docs and comments too) and closing braces, blank
+lines and `//!` docs. An inline `mod` header's attributes are glue as well, so
+a `#[cfg(test)] mod tests { }` that becomes its own file still matches; a cfg
+changed there shows only in the glue. Every other line belongs to an item,
+and an item that changed, or appeared or vanished without an identical twin,
+fails the check.
 
 Usage:
+  check_pure_move.py [--if-declared] <base-rev> <head-rev>
+      --if-declared: only fail when a commit message in base..head has the
+      line `pure-move: true`; otherwise print the report without diffs and
+      exit 0.
   check_pure_move.py list <file.rs>
       Print every item in a file: kind, name, impl header, lines, line count.
 """
 
 import bisect
+import difflib
 import os
 import re
 import sys
-from collections import namedtuple
+from collections import Counter, defaultdict, namedtuple
 
-Item = namedtuple("Item", "file kind name mods ctx start end norm")
-Glue = namedtuple("Glue", "file kind start end text")
+from check_doc_ownership import exists_at, git
+
+Item = namedtuple("Item", "file kind name mods ctx start end norm vis")
+# `scope` is where the glue sits: the inline module path, then any impl header.
+Glue = namedtuple("Glue", "file kind start end text scope", defaults=("",))
 
 # The start of anything whose braces are not structure. Only the raw prefix
 # changes how a literal ends (`b"`, `c"` and `b'` lex like `"` and `'`); it
@@ -51,6 +67,7 @@ SIG = re.compile(
 MACRO = re.compile(r"\s*((?:\w+::)*\w+)\s*!")
 # Kinds whose `{` belongs to a value or a path, not a body: only `;` ends them.
 SEMI_ONLY = {"const", "static", "type", "use"}
+PURE_MOVE = re.compile(r"^\s*pure-move:\s*true\s*$", re.MULTILINE | re.IGNORECASE)
 BLANK, COMMENT, DOC, INNER, CODE = range(5)
 
 
@@ -226,7 +243,9 @@ def parse(text, file=""):
 
     def item(kind, name, mods, ctx, start, sig, col, end):
         body = lines[start : end + 1]
+        vis = ""
         if m := VIS.match(body[sig - start], col):
+            vis = re.sub(r"\s+", "", m.group(1))
             body[sig - start] = body[sig - start][: m.start(1)] + body[sig - start][m.end(1) :]
         free = [(ln, starts_in.get(start + n) != "string") for n, ln in enumerate(body)]
         indent = os.path.commonprefix(
@@ -235,10 +254,26 @@ def parse(text, file=""):
         norm = "\n".join(
             ln[len(indent) :] if ok and ln.startswith(indent) else ln for ln, ok in free
         )
-        items.append(Item(file, kind, name, mods, ctx, start, end, norm))
+        items.append(Item(file, kind, name, mods, ctx, start, end, norm, vis))
+
+    def inner_attrs(lo, hi):
+        """The inner attributes at the top of the block body `lo..hi`, as
+        written (whitespace outside literals shrunk)."""
+        found, k = [], lo
+        while k < hi:
+            if kinds[k] != CODE:
+                k += 1
+                continue
+            if not INNER_ATTR.match(clines[k]):
+                break
+            e = balanced_end(clines, k, clines[k].index("["), hi)[0]
+            found.append(collapse(text, [line_range(x) for x in range(k, e + 1)], spans))
+            k = e + 1
+        return found
 
     def walk(lo, hi, mods, ctx):
         lead, sticky, i = None, False, lo
+        scope = " / ".join(part for part in ("::".join(mods), ctx) if part)
         while i < hi:
             kind = kinds[i]
             if kind != CODE:
@@ -250,7 +285,7 @@ def parse(text, file=""):
                         item("comment", lines[lead].strip()[:60], mods, ctx, lead, lead, 0, i - 1)
                         lead = None
                     what = "blank" if kind == BLANK else "doc"
-                    glue.append(Glue(file, what, i, i, lines[i].strip()))
+                    glue.append(Glue(file, what, i, i, lines[i].strip(), scope))
                 elif lead is None:
                     lead = i
                 i += 1
@@ -298,16 +333,28 @@ def parse(text, file=""):
                 # every line as written, so an edit to any of them is listed.
                 header = [line_range(k) for k in range(start, body[0]) if kinds[k] == CODE]
                 head = collapse(text, [*header, line_range(body[0], body[1])], spans)
+                if kind == "impl":
+                    # An inner attribute (`#![cfg(test)]`) applies to every
+                    # method in the block, so it is part of their identity
+                    # just as an outer one on the header is.
+                    head = " ".join([head, *inner_attrs(body[0] + 1, close)])
                 written = "\n".join(ln.strip() for ln in lines[start : body[0] + 1])
-                glue.append(Glue(file, "header", start, body[0], written))
+                had_items, had_glue = len(items), len(glue)
+                glue.append(Glue(file, "header", start, body[0], written, scope))
                 if kind == "impl":
                     walk(body[0] + 1, close, mods, head)
                 else:
                     walk(body[0] + 1, close, (*mods, name), ctx)
-                glue.append(Glue(file, "close", close, close, lines[close].strip()))
+                glue.append(Glue(file, "close", close, close, lines[close].strip(), scope))
+                if kind == "impl" and len(items) == had_items:
+                    # An impl with nothing in it (`unsafe impl Send for X {}`)
+                    # has no method to carry its header: as glue, adding or
+                    # dropping it would pass unseen, so it is an item.
+                    del glue[had_glue:]
+                    item(kind, name, mods, ctx, start, j, col, end)
             elif kind == "use" or (kind == "mod" and body is None):
                 written = collapse(text, [line_range(k) for k in range(start, end + 1)], spans)
-                glue.append(Glue(file, kind, start, end, written))
+                glue.append(Glue(file, kind, start, end, written, scope))
             else:
                 item(kind, name, mods, ctx, start, j, col, end)
             i = end + 1
@@ -323,6 +370,204 @@ def parse(text, file=""):
     return items, glue
 
 
+def label(it):
+    return "::".join([it.file, *it.mods, *([it.ctx] if it.ctx else []), it.name])
+
+
+def span(it):
+    return f"{it.file}:{it.start + 1}-{it.end + 1}"
+
+
+def vis_rank(vis):
+    """How far an item's visibility reaches: private (or `pub(self)`) 0,
+    `pub(super)` and `pub(in path)` 1, `pub(crate)` 2, `pub` 3. Two different
+    spellings at one rank (`pub(super)` and `pub(in a)`, or two paths) do
+    not compare."""
+    if vis in ("", "pub(self)", "pub(inself)"):
+        return 0
+    if vis == "pub(super)" or vis.startswith("pub(in"):
+        return 1
+    return {"pub(crate)": 2, "pub": 3}.get(vis)
+
+
+def widens(old, new):
+    """Whether visibility `old` -> `new` keeps or widens the item's reach. A
+    move may need a wider visibility; a narrower one can hide what callers
+    used, so it is a change, and so is one that cannot be compared."""
+    if old == new:
+        return True
+    a, b = vis_rank(old), vis_rank(new)
+    return a is not None and b is not None and b > a
+
+
+def pair_by_visibility(olds, news):
+    """Identical items moved from `olds` to `news`, paired so each keeps or
+    widens its visibility, as many pairs as can be: in list order, a private
+    helper and an identical `pub(crate)` one moving together could otherwise
+    be paired crosswise and read as a narrowing. Returns the pairs and the
+    items left on each side, in their original order."""
+    owner = [None] * len(news)
+
+    def place(i, tried):
+        for j, n in enumerate(news):
+            if j in tried or not widens(olds[i].vis, n.vis):
+                continue
+            tried.add(j)
+            if owner[j] is None or place(owner[j], tried):
+                owner[j] = i
+                return True
+        return False
+
+    for i in range(len(olds)):
+        place(i, set())
+    paired = {i for i in owner if i is not None}
+    pairs = sorted(((olds[i], news[j]) for j, i in enumerate(owner) if i is not None),
+                   key=lambda p: olds.index(p[0]))
+    left_old = [o for i, o in enumerate(olds) if i not in paired]
+    left_new = [n for j, n in enumerate(news) if owner[j] is None]
+    return pairs, left_old, left_new
+
+
+def compare(old, new):
+    """(unchanged count, moved pairs, changed pairs, removed, added).
+
+    Identical text under the same impl header is the same item. A twin in
+    the same place is unchanged; anywhere else it moved. What is left pairs
+    up by kind and name as a change, and the rest was added or removed."""
+    groups = defaultdict(lambda: ([], []))
+    for side, its in enumerate((old, new)):
+        for it in its:
+            groups[(it.ctx, it.norm)][side].append(it)
+    unchanged, moved, narrowed, gone, came = 0, [], [], [], []
+    for olds, news in groups.values():
+        at = defaultdict(list)
+        for n in news:
+            at[(n.file, n.mods, n.name)].append(n)
+        rest_old = []
+        for o in olds:
+            if at[(o.file, o.mods, o.name)]:
+                n = at[(o.file, o.mods, o.name)].pop()
+                if widens(o.vis, n.vis):
+                    unchanged += 1
+                else:
+                    narrowed.append((o, n))
+            else:
+                rest_old.append(o)
+        rest_new = [n for twins in at.values() for n in twins]
+        pairs, rest_old, rest_new = pair_by_visibility(rest_old, rest_new)
+        moved += pairs
+        narrowed += zip(rest_old, rest_new)
+        gone += rest_old[len(rest_new) :]
+        came += rest_new[len(rest_old) :]
+    by_name = defaultdict(list)
+    for o in gone:
+        by_name[(o.kind, o.name)].append(o)
+    changed, added = list(narrowed), []
+    for n in came:
+        twins = by_name.get((n.kind, n.name))
+        if not twins:
+            added.append(n)
+            continue
+        o = max(twins, key=lambda o: (o.ctx == n.ctx, o.file == n.file, o.mods == n.mods))
+        twins.remove(o)
+        changed.append((o, n))
+    removed = [o for twins in by_name.values() for o in twins]
+    return unchanged, moved, changed, removed, added
+
+
+def print_glue(sides):
+    """The glue one side has and the other lacks, in file order, so a
+    rewritten `//!` module doc reads top to bottom; blank lines only as a
+    count. Glue is told apart by where it sits too: a `use` swapped between
+    two inline modules of one file changes what their code calls."""
+    def key(g):
+        return (g.file, "", g.kind, "") if g.kind == "blank" else (g.file, g.scope, g.kind, g.text)
+
+    counts, first = [], []
+    for _, glue in sides:
+        counts.append(Counter(key(g) for g in glue))
+        at = {}
+        for g in glue:
+            at[key(g)] = min(at.get(key(g), g.start), g.start)
+        first.append(at)
+    blanks = []
+    for sign, side, delta in (("-", 0, counts[0] - counts[1]), ("+", 1, counts[1] - counts[0])):
+        blanks.append(f"{sign}{sum(n for k, n in delta.items() if k[2] == 'blank')}")
+        for k, count in sorted(delta.items(), key=lambda kv: (kv[0][0], first[side][kv[0]])):
+            f, scope, kind, text = k
+            if kind != "blank":
+                shown = text.replace("\n", "\n" + " " * 10)
+                times = f" (x{count})" if count > 1 else ""
+                where = f" in {scope}" if scope else ""
+                print(f"  glue {sign}  {f}:{first[side][k] + 1}{where}: {shown}{times}")
+    if blanks != ["-0", "+0"]:
+        print(f"  glue    blank lines {' '.join(blanks)}")
+
+
+def check(base, head, if_declared):
+    # NUL-separated, because a quoted non-ASCII path does not end in `.rs`
+    # and would be skipped: a gate that passes by not looking.
+    changed_files = [
+        f
+        for f in git("diff", "--name-only", "--no-renames", "-z", base, head).split("\0")
+        if f.endswith(".rs")
+    ]
+    if not changed_files:
+        print("No Rust files changed.")
+        return 0
+    declared = bool(PURE_MOVE.search(git("log", f"{base}..{head}", "--format=%B")))
+    enforced = declared or not if_declared
+    sides = ([], []), ([], [])
+    errors = []
+    for f in changed_files:
+        for rev, (items, glue) in zip((base, head), sides):
+            if exists_at(rev, f):
+                try:
+                    its, gl = parse(git("show", f"{rev}:{f}"), f)
+                except ParseError as e:
+                    errors.append(f"{f} at {rev}: {e}")
+                    continue
+                items += its
+                glue += gl
+    unchanged, moved, changed, removed, added = compare(sides[0][0], sides[1][0])
+    print(f"Pure-move check of {len(changed_files)} changed Rust file(s), {base}..{head}")
+    print(
+        f"  {unchanged} unchanged, {len(moved)} moved, {len(changed)} changed, "
+        f"{len(added)} added, {len(removed)} removed"
+    )
+    for o, n in sorted(moved, key=lambda p: (p[0].file, p[0].start)):
+        print(f"  moved    {o.kind} {label(o)} -> {label(n)} ({span(o)} -> {span(n)})")
+    print_glue(sides)
+    for o, n in changed:
+        print(f"  CHANGED  {n.kind} {label(o)} -> {label(n)}")
+        if o.norm == n.norm and o.ctx == n.ctx:
+            print(f"      visibility narrowed or not comparable: {o.vis or 'private'} -> {n.vis or 'private'}")
+        elif o.norm == n.norm:
+            print("      same text, under a different impl header")
+        if not enforced:
+            continue
+        a, b = o.norm.split("\n"), n.norm.split("\n")
+        diff = list(difflib.unified_diff(a, b, span(o), span(n), n=1, lineterm=""))
+        for line in diff[:40]:
+            print("      " + line)
+        if len(diff) > 40:
+            print(f"      ... {len(diff) - 40} more diff line(s)")
+    for it in removed:
+        print(f"  REMOVED  {it.kind} {label(it)} ({span(it)})")
+    for it in added:
+        print(f"  ADDED    {it.kind} {label(it)} ({span(it)})")
+    for e in errors:
+        print(f"  UNPARSED {e}")
+    if not (changed or removed or added or errors):
+        print("Pure move: every changed item moved byte for byte.")
+        return 0
+    print("Not a pure move: the items above changed, or have no identical twin.")
+    if not enforced:
+        print("Not enforced, so no diffs: no commit in the range declares `pure-move: true`.")
+        return 0
+    return 1
+
+
 def list_items(path):
     with open(path, encoding="utf-8") as f:
         items, _ = parse(f.read(), path)
@@ -334,10 +579,14 @@ def list_items(path):
 
 def main(argv=None):
     args = list(sys.argv[1:] if argv is None else argv)
+    if_declared = "--if-declared" in args
+    args = [a for a in args if a != "--if-declared"]
     if len(args) == 2 and args[0] == "list":
         return list_items(args[1])
-    print(__doc__, file=sys.stderr)
-    return 2
+    if len(args) != 2:
+        print(__doc__, file=sys.stderr)
+        return 2
+    return check(*args, if_declared)
 
 
 if __name__ == "__main__":
