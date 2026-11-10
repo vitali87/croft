@@ -588,6 +588,89 @@ fn search_view(s: &crate::widgets::search::SearchPanel) -> String {
     out
 }
 
+/// The Source Control view: the commit message and its caret, what has
+/// focus, the selected changes and every change listed.
+fn scm_view(sc: &crate::widgets::source_control::SourceControlPanel) -> String {
+    let mut out = format!("{:?}@{}", sc.message, sc.message_cursor);
+    if sc.focused {
+        out.push_str(" +focus");
+    }
+    if sc.list_focused {
+        out.push_str(" +list");
+    }
+    if let Some(i) = sc.selected_change {
+        out.push_str(&format!(" sel={i}"));
+    }
+    if !sc.multi_selection.is_empty() {
+        out.push_str(&format!(
+            " multi={}",
+            runs(sc.multi_selection.iter().copied())
+        ));
+    }
+    for e in &sc.entries {
+        out.push_str(&format!(" {:?}:{}", e.kind, e.path));
+    }
+    out
+}
+
+/// The repository at `root` as git reports it: the branch, the stashes and
+/// each change's two status letters, `-` outside a repository. The HEAD
+/// commit's id is left out: it changes with the clock.
+fn git_state(root: &Path) -> String {
+    if !root.join(".git").exists() {
+        return String::from("-");
+    }
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["status", "--porcelain=v2", "--branch", "--show-stash"])
+        .arg("--untracked-files=all")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut parts = Vec::new();
+    for line in text.lines() {
+        let fields: Vec<&str> = line.split(' ').collect();
+        // An entry's path is its last field: after 8 fields for an
+        // ordinary change, 9 for a rename and 10 for a conflict.
+        let path_after = |n: usize| line.splitn(n + 1, ' ').last().unwrap_or("");
+        match fields[0] {
+            "#" if fields.get(1) == Some(&"branch.head") => parts.push(fields[2].to_string()),
+            "#" if fields.get(1) == Some(&"stash") => parts.push(format!("stash={}", fields[2])),
+            "1" => parts.push(format!("{}:{}", fields[1], path_after(8))),
+            "2" => parts.push(format!("{}:{}", fields[1], path_after(9))),
+            "u" => parts.push(format!("{}:{}", fields[1], path_after(10))),
+            "?" | "!" => parts.push(format!("{0}{0}:{1}", fields[0], path_after(1))),
+            _ => {}
+        }
+    }
+    parts.join(",")
+}
+
+/// `text` with every word that reads as a commit id (7 to 40 lowercase hex
+/// digits, letters among them or not) as `<id>`: a commit's id changes with
+/// the clock.
+fn no_commit_ids(text: &str) -> String {
+    let id = |w: &str| {
+        (7..=40).contains(&w.len())
+            && w.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    };
+    let mut out = String::new();
+    let mut word = String::new();
+    for c in text.chars().map(Some).chain([None]) {
+        if let Some(c) = c.filter(char::is_ascii_alphanumeric) {
+            word.push(c);
+            continue;
+        }
+        out.push_str(if id(&word) { "<id>" } else { &word });
+        word.clear();
+        out.extend(c);
+    }
+    out
+}
+
 /// What a key can change that a user sees or acts on next.
 fn fingerprint(app: &App, root: &Path) -> Seen {
     let ed = &app.editor;
@@ -640,11 +723,15 @@ fn fingerprint(app: &App, root: &Path) -> Seen {
         )
     }));
     let scrub = |s: &str| {
-        news.iter()
-            .fold(s.to_string(), |s, (from, to)| s.replace(from, to))
+        no_commit_ids(
+            &news
+                .iter()
+                .fold(s.to_string(), |s, (from, to)| s.replace(from, to)),
+        )
     };
     let quote = |s: &str| format!("{:?}", scrub(s));
     let on = |on: bool| on.then(String::new);
+    let quoted = |s: &str| Some(quote(s));
     // A picker or menu: what it holds and the row it has selected.
     let picked = |query: &str, cursor: usize, row: &str| {
         Some(format!("{} @{cursor} > {}", quote(query), quote(row)))
@@ -688,6 +775,8 @@ fn fingerprint(app: &App, root: &Path) -> Seen {
             ),
             ("tree", explorer(&app.tree, root)),
             ("search", search_view(&app.search)),
+            ("scm", scm_view(&app.source_control)),
+            ("git", git_state(root)),
             ("files", files_digest(root)),
         ],
         flags: vec![
@@ -748,6 +837,13 @@ fn fingerprint(app: &App, root: &Path) -> Seen {
             ("menu", menu),
             ("scm_menu", on(app.scm_menu.open)),
             ("commit_menu", on(app.commit_menu_open)),
+            (
+                "commit_feedback",
+                app.source_control
+                    .commit_feedback
+                    .as_deref()
+                    .and_then(quoted),
+            ),
             ("shortcuts", on(app.shortcuts_modal.is_some())),
             ("settings", on(app.settings_editor.is_some())),
             ("connect", on(app.connect_dialog.is_some())),
@@ -825,13 +921,17 @@ fn digest(text: &str) -> String {
 }
 
 /// Every path under `root` and what each file holds, as one digest: what a
-/// key wrote, made or moved on disk.
+/// key wrote, made or moved on disk. A repository's `.git` is left to
+/// [`git_state`]: git rewrites its files with the clock in them.
 fn files_digest(root: &Path) -> String {
     let mut all = Vec::new();
     let mut dirs = vec![root.to_path_buf()];
     while let Some(dir) = dirs.pop() {
         for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
             let path = entry.path();
+            if path == root.join(".git") {
+                continue;
+            }
             let body = std::fs::read(&path).unwrap_or_default();
             all.push(format!(
                 "{}\n{}",
@@ -872,5 +972,13 @@ fn a_keys_effects_name_what_it_changed_and_what_it_opened() {
         .unwrap();
     let down = effects(&before, &fingerprint(&app, root));
     assert_ne!(down, fx, "the palette's selected row is part of it");
+    for id in ["1a2b3c4", "4042135", "fedcbae"] {
+        let line = format!("[main {id}] Ship it");
+        assert_eq!(no_commit_ids(&line), "[main <id>] Ship it");
+    }
+    assert_eq!(
+        no_commit_ids("added 12 lines, cafe"),
+        "added 12 lines, cafe"
+    );
     assert_eq!(runs([1, 2, 3, 7]), "1-3,7");
 }
