@@ -17,6 +17,7 @@ mod editor_view;
 mod explorer;
 mod extensions;
 mod files;
+#[cfg(target_os = "linux")]
 mod golden;
 mod hot_exit;
 mod input;
