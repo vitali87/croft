@@ -1466,6 +1466,9 @@ fn presses(ctx: &Context) -> Vec<String> {
         if b.app.git_net_job.is_some() {
             wait_for_git_net(&mut b.app);
         }
+        if ctx.repo {
+            settle_source_control(&mut b.app, &b.root);
+        }
         let fx = effects(&b.seen, &fingerprint(&b.app, &b.root)) + &errors.concat();
         let changed = fx != "-";
         lines.push(format!("{} | {chord} | {fx}", ctx.name));
@@ -1477,6 +1480,21 @@ fn presses(ctx: &Context) -> Vec<String> {
         done.retire(&mut enders);
     }
     lines
+}
+
+/// Wait until Source Control lists the changes git reports for `root`.
+/// A chord that stages or commits asks the git worker for the new state,
+/// whose reply lands only when the app drains it, so reading the panel at
+/// once would show the changes as they were next to the index as it is.
+fn settle_source_control(app: &mut App, root: &Path) {
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(1),
+        "Source Control to list the changes git reports",
+        || {
+            app.drain_git_responses();
+            app.source_control.entries == crate::git::query_changes(root)
+        },
+    );
 }
 
 /// What owns a ledger line: its context, [`NOT_PRESSED`] for a hint it does
