@@ -117,17 +117,17 @@ fn terminal_rename_split_and_kill_act_on_the_active_pane() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.focus_pane(Pane::Editor);
-    assert!(run_from_palette(&mut app, "Terminal: Split Terminal"));
+    assert!(run_palette_row_titled(&mut app, "Terminal: Split Terminal"));
     assert_eq!(app.terminals.len(), 2);
     assert!(app.show_terminal);
     app.active_terminal = 1;
-    assert!(run_from_palette(&mut app, "Terminal: Rename"));
+    assert!(run_palette_row_titled(&mut app, "Terminal: Rename"));
     assert!(matches!(
         app.prompt.as_ref().map(|p| &p.kind),
         Some(PromptKind::RenameTerminal(1))
     ));
     app.prompt = None;
-    assert!(run_from_palette(
+    assert!(run_palette_row_titled(
         &mut app,
         "Terminal: Kill the Active Terminal Instance"
     ));

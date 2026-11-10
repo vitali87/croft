@@ -827,24 +827,14 @@ fn editor_cmd_shift_o_opens_go_to_symbol() {
     );
 }
 
+/// A top-level [`sym`].
 fn outline_sym(
     name: &str,
     kind: crate::lsp::manager::OutlineKind,
     start: u32,
     end: u32,
 ) -> crate::lsp::manager::OutlineSymbol {
-    crate::lsp::manager::OutlineSymbol {
-        name: name.to_string(),
-        detail: None,
-        kind,
-        depth: 0,
-        line: start,
-        character: 0,
-        range_start_line: start,
-        range_end_line: end,
-        range_start_character: 0,
-        range_end_character: u32::MAX,
-    }
+    sym(name, kind, 0, start, end)
 }
 
 #[test]

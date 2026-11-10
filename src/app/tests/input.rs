@@ -456,7 +456,7 @@ fn screencast_mode_shows_the_keys_and_names_what_the_palette_ran() {
     app.handle_key(key(KeyCode::F(8), KeyModifiers::SHIFT))
         .unwrap();
     assert!(app.screencast.is_on(), "{}", app.status);
-    assert!(run_from_palette(&mut app, "View: Toggle Zen Mode"));
+    assert!(run_palette_row_titled(&mut app, "View: Toggle Zen Mode"));
     let screen = draw_screen(&mut app, 120, 30);
     assert!(
         screen.contains(" View: Toggle Zen Mode   Enter  View: Toggle Zen Mode"),

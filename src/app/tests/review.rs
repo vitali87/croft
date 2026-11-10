@@ -1363,9 +1363,7 @@ fn app_with_a_note_far_down() -> (
     app.editor.open_pinned(&f).unwrap();
     app.editor.cursor_row = 112;
     app.add_sticky_note("TODO before release, f56 must handle negative x");
-    let backend = ratatui::backend::TestBackend::new(120, 40);
-    let mut term = ratatui::Terminal::new(backend).unwrap();
-    term.draw(|fr| app.render(fr)).unwrap();
+    let term = draw_terminal(&mut app, 120, 40);
     (tmp, app, term)
 }
 
