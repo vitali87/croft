@@ -1145,8 +1145,8 @@ search | backspace | search="tota" @Query:4 hits=0@0
 search | cmd+[ | status="Search: unhandled Cmd+["
 search | cmd+\ | focus=editor groups=0,0+60x40[*main.rs] *60,0+60x40[*main.rs] search="total" hits=4@0
 search | cmd+] | status="Search: unhandled Cmd+]"
-search | cmd+a | -
-search | cmd+c | status="Copied 5 chars to clipboard" clip="total"
+search | cmd+a | search="total" @Query:5 sel=0-5 hits=4@0
+search | cmd+c | -
 search | cmd+e | status="vim mode on" +vim
 search | cmd+f12 | -
 search | cmd+t | focus=panel status="Split terminal: 2 active" terms=2@1 search="total" hits=4@0
@@ -1164,8 +1164,8 @@ search | ctrl+6 | status="Search: unhandled Ctrl+6"
 search | ctrl+7 | status="Search: unhandled Ctrl+7"
 search | ctrl+8 | status="Search: unhandled Ctrl+8"
 search | ctrl+9 | status="Search: unhandled Ctrl+9"
-search | ctrl+a | -
-search | ctrl+a ctrl+s | status="Saved <root>/main.rs"
+search | ctrl+a | search="total" @Query:5 sel=0-5 hits=4@0
+search | ctrl+a ctrl+s | status="Saved <root>/main.rs" search="total" @Query:5 sel=0-5 hits=4@0
 search | ctrl+alt+, | status="Search: unhandled Ctrl+,"
 search | ctrl+alt+- | status="Search: unhandled Ctrl+-"
 search | ctrl+alt+. | status="Search: unhandled Ctrl+."
@@ -1178,13 +1178,13 @@ search | ctrl+alt+f | status="Search: unhandled Ctrl+f"
 search | ctrl+alt+m | status="Minimap off" -minimap
 search | ctrl+alt+r | status="Search: unhandled Ctrl+r"
 search | ctrl+alt+s | status="Save All: nothing to save"
-search | ctrl+alt+shift+a | -
+search | ctrl+alt+shift+a | search="total" @Query:5 sel=0-5 hits=4@0
 search | ctrl+alt+shift+b | status="Search: unhandled Ctrl+B"
 search | ctrl+alt+shift+c | -
 search | ctrl+alt+shift+d | status="Search: unhandled Ctrl+D"
 search | ctrl+alt+shift+down | search="total" @Query:5 hits=4@1
 search | ctrl+alt+shift+e | status="Search: unhandled Ctrl+E"
-search | ctrl+alt+shift+f | -
+search | ctrl+alt+shift+f | search="total" @Query:5 sel=0-5 hits=4@0
 search | ctrl+alt+shift+g | status="Search: unhandled Ctrl+G"
 search | ctrl+alt+shift+j | status="Search: unhandled Ctrl+J"
 search | ctrl+alt+shift+k | status="Search: unhandled Ctrl+K"
@@ -1302,7 +1302,7 @@ search | ctrl+shift+c | -
 search | ctrl+shift+d | side=RunDebug search="total" hits=4@0
 search | ctrl+shift+e | side=Explorer search="total" hits=4@0
 search | ctrl+shift+enter | focus=editor caret=1:35 status="Opened main.rs at line 2" search="total" hits=4@0
-search | ctrl+shift+f | -
+search | ctrl+shift+f | search="total" @Query:5 sel=0-5 hits=4@0
 search | ctrl+shift+f12 | -
 search | ctrl+shift+f5 | +input("Program" "" @0)
 search | ctrl+shift+g | status="Search: unhandled Ctrl+G"
