@@ -731,60 +731,17 @@ fn shortcut_for_returns_expected_shortcuts_for_each_explorer_action() {
     );
 }
 
-/// #885: off macOS no row of the Customize Layout popup, the tab and
-/// Explorer menus, or the editor and terminal menus names a Mac key; on a
-/// Mac every row keeps its glyphs.
+/// #885: off macOS no menu row with a shortcut names a Mac key: the rows of
+/// the Customize Layout popup and the tab and Explorer menus, and every row
+/// with a shortcut in the menus built where they open. On a Mac every row
+/// keeps its glyphs.
 #[test]
 fn off_macos_no_menu_shortcut_names_a_mac_key() {
-    fn actions(entries: Vec<MenuEntry>) -> Vec<MenuAction> {
-        entries
-            .into_iter()
-            .flat_map(|e| match e {
-                MenuEntry::Item { action, .. } => vec![action],
-                MenuEntry::Submenu { items, .. } => actions(items),
-                _ => Vec::new(),
-            })
-            .collect()
-    }
     let tmp = tempfile::tempdir().unwrap();
     let f = tmp.path().join("a.rs");
     std::fs::write(&f, "fn main() {}\n").unwrap();
     let app = App::new(tmp.path().to_path_buf()).unwrap();
-    let mut all = actions(app.customize_layout_items());
-    all.extend(actions(build_tab_context_menu_items(
-        0,
-        3,
-        true,
-        Some(&f),
-        true,
-        true,
-        false,
-    )));
-    let tree = build_tree_context_menu_items(
-        Some(&file_node(&f)),
-        tmp.path(),
-        std::slice::from_ref(&f),
-        tmp.path(),
-        None,
-        None,
-    );
-    all.extend(tree.into_iter().map(|(_, a)| a));
-    let (row, col) = (0, 0);
-    all.extend([
-        MenuAction::ChangeAllOccurrencesAt { row, col },
-        MenuAction::GoToImplementationAt { row, col },
-        MenuAction::QuickFixAt { row, col },
-        MenuAction::EditLogpointAt { line: 0 },
-        MenuAction::EditorCut,
-        MenuAction::EditorCopy,
-        MenuAction::EditorPaste,
-        MenuAction::ShowCommandPalette,
-        MenuAction::TerminalCopySelection,
-        MenuAction::TerminalPaste,
-        MenuAction::SplitTerminal,
-        MenuAction::KillTerminal(0),
-        MenuAction::ClearTerminal(0),
-    ]);
+    let all = menu_row_actions(&app, &f);
     let mut hinted = 0;
     for action in &all {
         let Some(glyphs) = shortcut_for(action) else {
