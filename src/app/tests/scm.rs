@@ -1290,38 +1290,22 @@ fn discard_all_requires_confirmation_and_then_reverts_tracked_changes() {
     );
 }
 
-/// `git -C dir <args>` for app tests, asserting success; stdout trimmed.
-fn git_checked(dir: &Path, args: &[&str]) -> String {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "git {args:?}: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
-}
-
 /// #1350: Undo Last Commit (⋯ → Commit) takes the commit back: HEAD is
 /// the parent, its changes are staged, and its message is in the box.
 #[test]
 fn undo_last_commit_via_the_menu_puts_the_message_back_in_the_box() {
     use crate::widgets::scm_menu::ScmAction;
     let tmp = make_committed_repo();
-    let parent = git_checked(tmp.path(), &["rev-parse", "HEAD"]);
+    let parent = git_ok(tmp.path(), &["rev-parse", "HEAD"]);
     std::fs::write(tmp.path().join("b.txt"), "b\n").unwrap();
-    git_checked(tmp.path(), &["add", "b.txt"]);
-    git_checked(tmp.path(), &["commit", "-q", "-m", "Add b too early"]);
+    git_ok(tmp.path(), &["add", "b.txt"]);
+    git_ok(tmp.path(), &["commit", "-q", "-m", "Add b too early"]);
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.dispatch_scm_action(ScmAction::UndoLastCommit);
-    assert_eq!(git_checked(tmp.path(), &["rev-parse", "HEAD"]), parent);
+    assert_eq!(git_ok(tmp.path(), &["rev-parse", "HEAD"]), parent);
     assert_eq!(app.source_control.message, "Add b too early");
     assert_eq!(
-        git_checked(tmp.path(), &["diff", "--cached", "--name-only"]),
+        git_ok(tmp.path(), &["diff", "--cached", "--name-only"]),
         "b.txt"
     );
     assert!(
@@ -1339,8 +1323,8 @@ fn undo_last_commit_is_in_the_palette() {
     assert_eq!(cmd.title(), "Git: Undo Last Commit");
     let tmp = make_committed_repo();
     std::fs::write(tmp.path().join("b.txt"), "b\n").unwrap();
-    git_checked(tmp.path(), &["add", "b.txt"]);
-    git_checked(tmp.path(), &["commit", "-q", "-m", "second"]);
+    git_ok(tmp.path(), &["add", "b.txt"]);
+    git_ok(tmp.path(), &["commit", "-q", "-m", "second"]);
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.run_command(cmd);
     assert_eq!(app.source_control.message, "second");
@@ -1354,20 +1338,16 @@ fn undo_last_commit_warns_before_undoing_a_pushed_commit() {
     use crate::widgets::scm_menu::ScmAction;
     let tmp = make_committed_repo();
     let remote = tempfile::tempdir().unwrap();
-    git_checked(remote.path(), &["init", "-q", "--bare"]);
-    git_checked(
+    git_ok(remote.path(), &["init", "-q", "--bare"]);
+    git_ok(
         tmp.path(),
         &["remote", "add", "origin", remote.path().to_str().unwrap()],
     );
-    git_checked(tmp.path(), &["push", "-q", "-u", "origin", "main"]);
-    let head = git_checked(tmp.path(), &["rev-parse", "HEAD"]);
+    git_ok(tmp.path(), &["push", "-q", "-u", "origin", "main"]);
+    let head = git_ok(tmp.path(), &["rev-parse", "HEAD"]);
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.dispatch_scm_action(ScmAction::UndoLastCommit);
-    assert_eq!(
-        git_checked(tmp.path(), &["rev-parse", "HEAD"]),
-        head,
-        "not yet"
-    );
+    assert_eq!(git_ok(tmp.path(), &["rev-parse", "HEAD"]), head, "not yet");
     let warning = app
         .source_control
         .commit_feedback
@@ -1388,16 +1368,13 @@ fn undo_last_commit_keeps_a_message_the_user_typed() {
     use crate::widgets::scm_menu::ScmAction;
     let tmp = make_committed_repo();
     std::fs::write(tmp.path().join("b.txt"), "b\n").unwrap();
-    git_checked(tmp.path(), &["add", "b.txt"]);
-    git_checked(tmp.path(), &["commit", "-q", "-m", "second"]);
+    git_ok(tmp.path(), &["add", "b.txt"]);
+    git_ok(tmp.path(), &["commit", "-q", "-m", "second"]);
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.source_control.insert_str("my draft");
     app.dispatch_scm_action(ScmAction::UndoLastCommit);
     assert_eq!(app.source_control.message, "my draft");
-    assert_eq!(
-        git_checked(tmp.path(), &["log", "-1", "--format=%s"]),
-        "init"
-    );
+    assert_eq!(git_ok(tmp.path(), &["log", "-1", "--format=%s"]), "init");
 }
 
 /// #1352: Git: Revert Hunk with the caret on line 5 of an editor tab
@@ -3191,16 +3168,6 @@ fn drop_stash_answered_no_keeps_the_stash() {
     }
 }
 
-/// Runs `git` in `root` for the #1128 tests, failing the test on error.
-fn git_1128(root: &Path, args: &[&str]) {
-    let out = std::process::Command::new("git")
-        .args(args)
-        .current_dir(root)
-        .output()
-        .unwrap();
-    assert!(out.status.success(), "git {args:?}: {out:?}");
-}
-
 /// #1128: only a plain (or shifted) Y answers. Ctrl+Shift+Y is terminal copy
 /// mode, and pressing it with the question up must not drop the stash.
 #[test]
@@ -3236,7 +3203,7 @@ fn drop_stash_drops_the_named_stash_after_the_list_moves() {
     let (tmp, mut app) = drop_stash_picker_1128();
     app.confirm_list_picker();
     std::fs::write(tmp.path().join("billing.py"), "v3\n").unwrap();
-    git_1128(
+    git_ok(
         tmp.path(),
         &["stash", "push", "-q", "-m", "pushed meanwhile"],
     );
@@ -3261,7 +3228,7 @@ fn drop_stash_drops_the_named_stash_after_the_list_moves() {
 fn drop_stash_refuses_when_the_named_stash_is_gone() {
     let (tmp, mut app) = drop_stash_picker_1128();
     app.confirm_list_picker();
-    git_1128(tmp.path(), &["stash", "drop", "-q", "stash@{1}"]);
+    git_ok(tmp.path(), &["stash", "drop", "-q", "stash@{1}"]);
     app.handle_key(key(KeyCode::Char('y'), KeyModifiers::NONE))
         .unwrap();
     let left = stash_messages_1128(tmp.path());
@@ -6530,23 +6497,6 @@ fn scm_feedback_paints_nothing_over_the_merge_editor() {
     assert_row_crosses_the_merge_panes_858(&app, row);
 }
 
-/// Run git in `dir` for a #858 fixture, asserting it succeeded.
-fn git_858(dir: &std::path::Path, args: &[&str]) -> String {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "git {args:?} in {}: {}",
-        dir.display(),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
-}
-
 /// Local settings for a #858 fixture repo: an identity, no signing and
 /// no push negotiation from the user's global config, and how `git pull`
 /// reconciles (`pull.rebase`).
@@ -6558,7 +6508,7 @@ fn configure_858(dir: &std::path::Path, pull_rebase: &str) {
         ("push.negotiate", "false"),
         ("pull.rebase", pull_rebase),
     ] {
-        git_858(dir, &["config", key, value]);
+        git_ok(dir, &["config", key, value]);
     }
 }
 
@@ -6579,21 +6529,21 @@ fn remote_858(pull_rebase: &str) -> Remote858 {
     let theirs = dir.path().join("theirs");
     let mine = dir.path().join("mine");
     std::fs::create_dir(&theirs).unwrap();
-    git_858(
+    git_ok(
         dir.path(),
         &["init", "-q", "--bare", "-b", "main", "remote.git"],
     );
-    git_858(&theirs, &["init", "-q", "-b", "main"]);
+    git_ok(&theirs, &["init", "-q", "-b", "main"]);
     configure_858(&theirs, "false");
     std::fs::write(theirs.join("f.txt"), "one\n").unwrap();
-    git_858(&theirs, &["add", "-A"]);
-    git_858(&theirs, &["commit", "-qm", "one"]);
-    git_858(
+    git_ok(&theirs, &["add", "-A"]);
+    git_ok(&theirs, &["commit", "-qm", "one"]);
+    git_ok(
         &theirs,
         &["remote", "add", "origin", bare.to_str().unwrap()],
     );
-    git_858(&theirs, &["push", "-q", "-u", "origin", "main"]);
-    git_858(dir.path(), &["clone", "-q", bare.to_str().unwrap(), "mine"]);
+    git_ok(&theirs, &["push", "-q", "-u", "origin", "main"]);
+    git_ok(dir.path(), &["clone", "-q", bare.to_str().unwrap(), "mine"]);
     configure_858(&mine, pull_rebase);
     Remote858 {
         _dir: dir,
@@ -6606,8 +6556,8 @@ fn remote_858(pull_rebase: &str) -> Remote858 {
 /// Commit `text` to `file` in `repo`.
 fn commit_858(repo: &std::path::Path, file: &str, text: &str) {
     std::fs::write(repo.join(file), text).unwrap();
-    git_858(repo, &["add", "-A"]);
-    git_858(repo, &["commit", "-qm", file]);
+    git_ok(repo, &["add", "-A"]);
+    git_ok(repo, &["commit", "-qm", file]);
 }
 
 /// #858: Pull reported git's whole text, "Pulled: Updating a..b\n
@@ -6618,7 +6568,7 @@ fn commit_858(repo: &std::path::Path, file: &str, text: &str) {
 fn a_fast_forward_pull_reports_fast_forward_on_one_line() {
     let r = remote_858("false");
     commit_858(&r.theirs, "f.txt", "one\ntwo\n");
-    git_858(&r.theirs, &["push", "-q"]);
+    git_ok(&r.theirs, &["push", "-q"]);
     let mut app = App::new(r.mine.clone()).unwrap();
     app.pull_source_control();
     wait_for_git_net(&mut app);
@@ -6644,7 +6594,7 @@ fn a_fast_forward_pull_reports_fast_forward_on_one_line() {
 fn a_rebasing_pull_reports_the_rebase_not_the_fetch() {
     let r = remote_858("true");
     commit_858(&r.theirs, "f.txt", "one\ntwo\n");
-    git_858(&r.theirs, &["push", "-q"]);
+    git_ok(&r.theirs, &["push", "-q"]);
     commit_858(&r.mine, "g.txt", "mine\n");
     let mut app = App::new(r.mine.clone()).unwrap();
     app.pull_source_control();
@@ -6676,9 +6626,9 @@ fn a_pull_that_is_already_up_to_date_still_says_so() {
 #[test]
 fn a_failed_or_conflicted_pull_still_says_why() {
     let r = remote_858("false");
-    git_858(&r.mine, &["config", "pull.ff", "only"]);
+    git_ok(&r.mine, &["config", "pull.ff", "only"]);
     commit_858(&r.theirs, "f.txt", "one\ntheirs\n");
-    git_858(&r.theirs, &["push", "-q"]);
+    git_ok(&r.theirs, &["push", "-q"]);
     commit_858(&r.mine, "f.txt", "one\nmine\n");
     let mut app = App::new(r.mine.clone()).unwrap();
     app.pull_source_control();
@@ -6690,7 +6640,7 @@ fn a_failed_or_conflicted_pull_still_says_why() {
     );
     assert_one_line_858(&app);
 
-    git_858(&r.mine, &["config", "pull.ff", "false"]);
+    git_ok(&r.mine, &["config", "pull.ff", "false"]);
     app.pull_source_control();
     wait_for_git_net(&mut app);
     assert!(app.source_control.commit_feedback_is_error);
@@ -6709,7 +6659,7 @@ fn a_failed_or_conflicted_pull_still_says_why() {
 fn a_sync_reports_both_halves_on_one_line() {
     let r = remote_858("false");
     commit_858(&r.theirs, "f.txt", "one\ntwo\n");
-    git_858(&r.theirs, &["push", "-q"]);
+    git_ok(&r.theirs, &["push", "-q"]);
     commit_858(&r.mine, "g.txt", "mine\n");
     let mut app = App::new(r.mine.clone()).unwrap();
     app.sync_source_control();
@@ -6783,7 +6733,7 @@ fn fetch_and_force_push_report_the_ref_update_not_the_url() {
     use crate::widgets::scm_menu::ScmAction;
     let r = remote_858("false");
     commit_858(&r.theirs, "f.txt", "one\ntwo\n");
-    git_858(&r.theirs, &["push", "-q"]);
+    git_ok(&r.theirs, &["push", "-q"]);
     let mut app = App::new(r.mine.clone()).unwrap();
     app.dispatch_scm_action(ScmAction::Fetch);
     wait_for_git_net(&mut app);
@@ -6794,10 +6744,10 @@ fn fetch_and_force_push_report_the_ref_update_not_the_url() {
     );
     assert_one_line_858(&app);
 
-    git_858(&r.mine, &["merge", "-q", "--ff-only", "origin/main"]);
+    git_ok(&r.mine, &["merge", "-q", "--ff-only", "origin/main"]);
     commit_858(&r.mine, "g.txt", "mine\n");
-    git_858(&r.mine, &["push", "-q"]);
-    git_858(
+    git_ok(&r.mine, &["push", "-q"]);
+    git_ok(
         &r.mine,
         &["commit", "-q", "--amend", "-m", "g.txt, reworded"],
     );
@@ -6820,7 +6770,7 @@ fn switching_branch_reports_one_line() {
     use crate::widgets::scm_menu::ScmAction;
     let tmp = make_committed_repo();
     configure_858(tmp.path(), "false");
-    git_858(tmp.path(), &["branch", "feature"]);
+    git_ok(tmp.path(), &["branch", "feature"]);
     std::fs::write(tmp.path().join("seed.txt"), "edited\n").unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.set_sidebar_view(SidebarView::SourceControl);
@@ -6833,11 +6783,11 @@ fn switching_branch_reports_one_line() {
     );
 
     // `main` moves on under the edit: switching back would overwrite it.
-    git_858(tmp.path(), &["stash", "-q"]);
-    git_858(tmp.path(), &["checkout", "-q", "main"]);
+    git_ok(tmp.path(), &["stash", "-q"]);
+    git_ok(tmp.path(), &["checkout", "-q", "main"]);
     commit_858(tmp.path(), "seed.txt", "main moved\n");
-    git_858(tmp.path(), &["checkout", "-q", "feature"]);
-    git_858(tmp.path(), &["stash", "pop", "-q"]);
+    git_ok(tmp.path(), &["checkout", "-q", "feature"]);
+    git_ok(tmp.path(), &["stash", "pop", "-q"]);
     pick_branch_858(&mut app, ScmAction::CheckoutTo, "main");
     assert!(app.source_control.commit_feedback_is_error);
     assert_eq!(
@@ -6854,10 +6804,10 @@ fn blocked_switch_repo_925() -> tempfile::TempDir {
     let tmp = make_committed_repo();
     configure_858(tmp.path(), "false");
     commit_858(tmp.path(), "seed.txt", "one\ntwo\nthree\nfour\nfive\n");
-    git_858(tmp.path(), &["checkout", "-qb", "feature"]);
-    git_858(tmp.path(), &["checkout", "-q", "main"]);
+    git_ok(tmp.path(), &["checkout", "-qb", "feature"]);
+    git_ok(tmp.path(), &["checkout", "-q", "main"]);
     commit_858(tmp.path(), "seed.txt", "ONE\ntwo\nthree\nfour\nfive\n");
-    git_858(tmp.path(), &["checkout", "-q", "feature"]);
+    git_ok(tmp.path(), &["checkout", "-q", "feature"]);
     std::fs::write(tmp.path().join("seed.txt"), "one\ntwo\nthree\nfour\nFIVE\n").unwrap();
     tmp
 }
@@ -6880,21 +6830,18 @@ fn a_switch_blocked_by_local_changes_offers_stash_and_checkout() {
     );
     app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
         .unwrap();
-    assert_eq!(
-        git_858(tmp.path(), &["branch", "--show-current"]),
-        "feature"
-    );
-    assert_eq!(git_858(tmp.path(), &["stash", "list"]), "");
+    assert_eq!(git_ok(tmp.path(), &["branch", "--show-current"]), "feature");
+    assert_eq!(git_ok(tmp.path(), &["stash", "list"]), "");
 
     pick_branch_858(&mut app, ScmAction::CheckoutTo, "main");
     app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
         .unwrap();
-    assert_eq!(git_858(tmp.path(), &["branch", "--show-current"]), "main");
+    assert_eq!(git_ok(tmp.path(), &["branch", "--show-current"]), "main");
     assert_eq!(
         std::fs::read_to_string(&seed).unwrap(),
         "ONE\ntwo\nthree\nfour\nfive\n"
     );
-    assert_eq!(git_858(tmp.path(), &["stash", "list"]).lines().count(), 1);
+    assert_eq!(git_ok(tmp.path(), &["stash", "list"]).lines().count(), 1);
     assert!(!app.source_control.commit_feedback_is_error);
     assert_eq!(app.status, "Stashed your changes and switched to main");
 }
@@ -6912,12 +6859,12 @@ fn migrate_changes_brings_the_blocked_edit_along() {
         .unwrap();
     app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
         .unwrap();
-    assert_eq!(git_858(tmp.path(), &["branch", "--show-current"]), "main");
+    assert_eq!(git_ok(tmp.path(), &["branch", "--show-current"]), "main");
     assert_eq!(
         std::fs::read_to_string(tmp.path().join("seed.txt")).unwrap(),
         "ONE\ntwo\nthree\nfour\nFIVE\n"
     );
-    assert_eq!(git_858(tmp.path(), &["stash", "list"]), "");
+    assert_eq!(git_ok(tmp.path(), &["stash", "list"]), "");
     assert_eq!(app.status, "Switched to main with your changes");
 }
 
@@ -6946,7 +6893,7 @@ fn migrate_changes_pops_its_own_stash_when_a_checkout_hook_stashes_too() {
         .unwrap();
     app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
         .unwrap();
-    assert_eq!(git_858(tmp.path(), &["branch", "--show-current"]), "main");
+    assert_eq!(git_ok(tmp.path(), &["branch", "--show-current"]), "main");
     assert_eq!(
         std::fs::read_to_string(tmp.path().join("seed.txt")).unwrap(),
         "ONE\ntwo\nthree\nfour\nFIVE\n"
@@ -6955,7 +6902,7 @@ fn migrate_changes_pops_its_own_stash_when_a_checkout_hook_stashes_too() {
         !tmp.path().join("hook.txt").exists(),
         "the hook's stash stays put"
     );
-    let stashes = git_858(tmp.path(), &["stash", "list"]);
+    let stashes = git_ok(tmp.path(), &["stash", "list"]);
     assert_eq!(stashes.lines().count(), 1, "{stashes}");
     assert!(stashes.contains("hook"), "{stashes}");
     assert_eq!(app.status, "Switched to main with your changes");
@@ -6976,13 +6923,13 @@ fn migrating_changes_that_conflict_names_the_conflict_and_keeps_the_stash() {
         .unwrap();
     app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
         .unwrap();
-    assert_eq!(git_858(tmp.path(), &["branch", "--show-current"]), "main");
+    assert_eq!(git_ok(tmp.path(), &["branch", "--show-current"]), "main");
     assert_eq!(
         app.status,
         "Switched to main \u{b7} Migrate changes: 1 conflict (seed.txt)"
     );
     assert!(app.source_control.commit_feedback_is_error);
-    assert_eq!(git_858(tmp.path(), &["stash", "list"]).lines().count(), 1);
+    assert_eq!(git_ok(tmp.path(), &["stash", "list"]).lines().count(), 1);
 }
 
 /// #925: git stashes the files on disk, so with an edit still only in a
@@ -7004,17 +6951,14 @@ fn stash_and_checkout_asks_to_save_an_unsaved_tab_first() {
         .unwrap();
     let pending = app.pending_unsaved_scm.as_ref().expect("the prompt opens");
     assert_eq!(pending.op, ScmWrite::StashAndSwitch);
-    assert_eq!(
-        git_858(tmp.path(), &["branch", "--show-current"]),
-        "feature"
-    );
-    assert_eq!(git_858(tmp.path(), &["stash", "list"]), "");
+    assert_eq!(git_ok(tmp.path(), &["branch", "--show-current"]), "feature");
+    assert_eq!(git_ok(tmp.path(), &["stash", "list"]), "");
     app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE))
         .unwrap();
     assert!(app.pending_unsaved_scm.is_none());
-    assert_eq!(git_858(tmp.path(), &["branch", "--show-current"]), "main");
+    assert_eq!(git_ok(tmp.path(), &["branch", "--show-current"]), "main");
     assert_eq!(
-        git_858(tmp.path(), &["show", "stash@{0}:seed.txt"]),
+        git_ok(tmp.path(), &["show", "stash@{0}:seed.txt"]),
         "zero\none\ntwo\nthree\nfour\nFIVE"
     );
     assert_eq!(app.status, "Stashed your changes and switched to main");
@@ -7037,14 +6981,14 @@ fn stash_and_checkout_stops_when_the_branch_changed_meanwhile() {
     app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
         .unwrap();
     assert!(app.pending_unsaved_scm.is_some(), "the prompt opens");
-    git_858(tmp.path(), &["switch", "-q", "-c", "elsewhere"]);
+    git_ok(tmp.path(), &["switch", "-q", "-c", "elsewhere"]);
     app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE))
         .unwrap();
     assert_eq!(
-        git_858(tmp.path(), &["branch", "--show-current"]),
+        git_ok(tmp.path(), &["branch", "--show-current"]),
         "elsewhere"
     );
-    assert_eq!(git_858(tmp.path(), &["stash", "list"]), "");
+    assert_eq!(git_ok(tmp.path(), &["stash", "list"]), "");
     assert_eq!(
         app.status,
         "Stash & Checkout cancelled: the branch changed since the switch was refused"
@@ -7058,7 +7002,7 @@ fn stash_and_checkout_stops_when_the_branch_changed_meanwhile() {
 fn popping_a_stash_reports_the_dropped_entry_on_one_line() {
     let tmp = make_committed_repo();
     std::fs::write(tmp.path().join("seed.txt"), "stashed\n").unwrap();
-    git_858(tmp.path(), &["stash", "-q"]);
+    git_ok(tmp.path(), &["stash", "-q"]);
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.stash_pop_source_control();
     assert!(!app.source_control.commit_feedback_is_error);
@@ -7608,8 +7552,8 @@ fn clone_with_two_remotes() -> (tempfile::TempDir, std::path::PathBuf) {
     let tmp = tempfile::tempdir().unwrap();
     let up = tmp.path().join("up");
     std::fs::create_dir(&up).unwrap();
-    git_checked(&up, &["init", "-q", "-b", "main"]);
-    git_checked(
+    git_ok(&up, &["init", "-q", "-b", "main"]);
+    git_ok(
         &up,
         &[
             "-c",
@@ -7623,15 +7567,15 @@ fn clone_with_two_remotes() -> (tempfile::TempDir, std::path::PathBuf) {
             "i",
         ],
     );
-    git_checked(&up, &["branch", "feat"]);
+    git_ok(&up, &["branch", "feat"]);
     let fork = tmp.path().join("fork");
-    git_checked(tmp.path(), &["clone", "-q", "up", "fork"]);
-    git_checked(&fork, &["branch", "solo"]);
-    git_checked(tmp.path(), &["clone", "-q", "up", "clone"]);
+    git_ok(tmp.path(), &["clone", "-q", "up", "fork"]);
+    git_ok(&fork, &["branch", "solo"]);
+    git_ok(tmp.path(), &["clone", "-q", "up", "clone"]);
     let clone = tmp.path().join("clone");
-    git_checked(&clone, &["remote", "add", "upstream", "../up"]);
-    git_checked(&clone, &["remote", "add", "my/fork", "../fork"]);
-    git_checked(&clone, &["fetch", "-q", "--all"]);
+    git_ok(&clone, &["remote", "add", "upstream", "../up"]);
+    git_ok(&clone, &["remote", "add", "my/fork", "../fork"]);
+    git_ok(&clone, &["fetch", "-q", "--all"]);
     (tmp, clone)
 }
 
@@ -7681,9 +7625,9 @@ fn picking_a_branch_on_two_remotes_tracks_the_remote_picked() {
         "the switch worked: {}",
         app.status
     );
-    assert_eq!(git_checked(&clone, &["branch", "--show-current"]), "feat");
+    assert_eq!(git_ok(&clone, &["branch", "--show-current"]), "feat");
     assert_eq!(
-        git_checked(&clone, &["rev-parse", "--abbrev-ref", "feat@{upstream}"]),
+        git_ok(&clone, &["rev-parse", "--abbrev-ref", "feat@{upstream}"]),
         "upstream/feat"
     );
 }
@@ -7699,9 +7643,9 @@ fn a_remote_named_with_a_slash_checks_out_its_branch() {
         "the switch worked: {}",
         app.status
     );
-    assert_eq!(git_checked(&clone, &["branch", "--show-current"]), "solo");
+    assert_eq!(git_ok(&clone, &["branch", "--show-current"]), "solo");
     assert_eq!(
-        git_checked(&clone, &["rev-parse", "--abbrev-ref", "solo@{upstream}"]),
+        git_ok(&clone, &["rev-parse", "--abbrev-ref", "solo@{upstream}"]),
         "my/fork/solo"
     );
 }
@@ -7711,7 +7655,7 @@ fn a_remote_named_with_a_slash_checks_out_its_branch() {
 #[test]
 fn a_local_branch_hides_its_remotes_and_switches_plainly() {
     let (_tmp, clone) = clone_with_two_remotes();
-    git_checked(&clone, &["switch", "-q", "-c", "side"]);
+    git_ok(&clone, &["switch", "-q", "-c", "side"]);
     let mut app = App::new(clone.clone()).unwrap();
     app.open_branch_picker();
     let shown: Vec<String> = app
@@ -7726,7 +7670,7 @@ fn a_local_branch_hides_its_remotes_and_switches_plainly() {
     drop(app);
     let app = pick_branch(&clone, "main");
     assert!(app.branch_picker.is_none(), "{}", app.status);
-    assert_eq!(git_checked(&clone, &["branch", "--show-current"]), "main");
+    assert_eq!(git_ok(&clone, &["branch", "--show-current"]), "main");
 }
 
 /// A modified file whose tab has unsaved edits, opened from Source Control

@@ -2530,25 +2530,11 @@ fn focusing_a_secondary_roots_file_flips_source_control_to_its_repo() {
         vec!["config", "user.email", "a@b"],
         vec!["config", "user.name", "a"],
     ] {
-        let ok = std::process::Command::new("git")
-            .args(["-C"])
-            .arg(&repo)
-            .args(&args)
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        assert!(ok, "git setup step failed: {args:?}");
+        git_ok(&repo, &args);
     }
     std::fs::write(repo.join("seed.txt"), "one\n").unwrap();
     for args in [vec!["add", "."], vec!["commit", "-qm", "init"]] {
-        let ok = std::process::Command::new("git")
-            .args(["-C"])
-            .arg(&repo)
-            .args(&args)
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        assert!(ok, "git setup step failed: {args:?}");
+        git_ok(&repo, &args);
     }
     std::fs::write(repo.join("seed.txt"), "one\ntwo\n").unwrap();
 
@@ -2600,15 +2586,9 @@ fn focusing_a_secondary_roots_file_flips_source_control_to_its_repo() {
     app.source_control.message = String::from("from the panel");
     app.commit_staged_source_control();
     wait_for_git_net(&mut app);
-    let log = std::process::Command::new("git")
-        .args(["-C"])
-        .arg(&repo)
-        .args(["log", "--oneline"])
-        .output()
-        .unwrap();
-    assert!(log.status.success());
+    let log = git_ok(&repo, &["log", "--oneline"]);
     assert!(
-        String::from_utf8_lossy(&log.stdout).contains("from the panel"),
+        log.contains("from the panel"),
         "the commit lands in the ACTIVE repo, the one the panel shows"
     );
 }

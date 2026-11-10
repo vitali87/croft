@@ -1033,25 +1033,11 @@ fn review_fixture() -> (
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("repo");
     std::fs::create_dir(&root).unwrap();
-    for args in [
-        vec!["init", "-q", "-b", "main"],
-        vec!["config", "user.email", "a@b"],
-        vec!["config", "user.name", "a"],
-    ] {
-        let _ = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&root)
-            .args(&args)
-            .status();
-    }
+    git_init_with_identity(&root);
     let f = root.join("a.rs");
     std::fs::write(&f, "fn a() {}\nfn b() {}\n").unwrap();
     for args in [vec!["add", "."], vec!["commit", "-m", "init", "--quiet"]] {
-        let _ = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&root)
-            .args(&args)
-            .status();
+        let _ = git_succeeds(&root, &args);
     }
     let log = tmp.path().join("gh.log");
     let stdin = tmp.path().join("gh.stdin");
@@ -2031,23 +2017,12 @@ fn review_mode_checks_the_pr_out_and_leaving_removes_a_clean_checkout() {
     let home = tempfile::tempdir().unwrap();
     with_relay_home(home.path(), || {
         let tmp = tempfile::tempdir().unwrap();
-        let git = |dir: &Path, args: &[&str]| {
-            let out = std::process::Command::new("git")
-                .arg("-C")
-                .arg(dir)
-                .args(args)
-                .output()
-                .unwrap();
-            assert!(out.status.success(), "git {args:?}");
-            String::from_utf8_lossy(&out.stdout).trim().to_string()
-        };
+        let git = git_ok;
         // The "GitHub" repository, at a path ending in the PR's `o/r`, so
         // the remote naming it is found without a network.
         let up = tmp.path().join("o").join("r");
         std::fs::create_dir_all(&up).unwrap();
-        git(&up, &["init", "-q", "-b", "main"]);
-        git(&up, &["config", "user.email", "a@b"]);
-        git(&up, &["config", "user.name", "a"]);
+        git_init_with_identity(&up);
         std::fs::write(up.join("a.txt"), "base").unwrap();
         git(&up, &["add", "."]);
         git(&up, &["commit", "-q", "-m", "base"]);
