@@ -148,6 +148,38 @@ class PureMoves(unittest.TestCase):
         self.assertIn("moved    fn a.rs::helper -> d.rs::helper", out)
         self.assertIn("moved    fn b.rs::helper -> c.rs::helper", out)
 
+    def test_an_inner_attribute_of_an_impl_belongs_to_its_methods(self):
+        """`#![cfg(test)]` inside an impl guards every method in it, so a
+        method moved out of the block without it is not the same method."""
+        old = "impl App {\n    #![cfg(test)]\n\n    fn a() {}\n\n    fn b() {}\n}\n"
+        repo = self.repo({"a.rs": old})
+        repo.commit({
+            "a.rs": "impl App {\n    #![cfg(test)]\n\n    fn a() {}\n}\n",
+            "b.rs": "impl App {\n    fn b() {}\n}\n",
+        })
+        code, out = repo.check()
+        self.assertEqual(code, 1, out)
+        self.assertIn("CHANGED  fn a.rs::impl App #![cfg(test)]::b -> b.rs::impl App::b", out)
+
+    def test_an_empty_impl_block_is_an_item(self):
+        """With no method to carry its header, an added or dropped empty
+        impl (`unsafe impl Send`) would otherwise pass as glue."""
+        repo = self.repo({"a.rs": "struct X(*const u8);\n"})
+        repo.commit({"a.rs": "struct X(*const u8);\n\nunsafe impl Send for X {\n}\n"})
+        code, out = repo.check()
+        self.assertEqual(code, 1, out)
+        self.assertIn("ADDED    impl a.rs::unsafe impl Send for X", out)
+
+    def test_glue_is_told_apart_by_the_module_it_sits_in(self):
+        """Swapping two `use` lines between inline modules changes what each
+        module's code calls, so the report lists it."""
+        one, two = "use crate::one::f;", "use crate::two::f;"
+        repo = self.repo({"a.rs": f"mod x {{\n    {one}\n}}\n\nmod y {{\n    {two}\n}}\n"})
+        repo.commit({"a.rs": f"mod x {{\n    {two}\n}}\n\nmod y {{\n    {one}\n}}\n"})
+        _, out = repo.check()
+        self.assertIn(f"glue -  a.rs:2 in x: {one}", out)
+        self.assertIn(f"glue +  a.rs:2 in x: {two}", out)
+
     def test_docs_and_attributes_left_behind_fail(self):
         """Rust hands a stranded doc or attribute to the next item, so an
         item that moved without them changed two items, not zero."""

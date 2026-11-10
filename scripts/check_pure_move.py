@@ -39,7 +39,8 @@ from collections import Counter, defaultdict, namedtuple
 from check_doc_ownership import exists_at, git
 
 Item = namedtuple("Item", "file kind name mods ctx start end norm vis")
-Glue = namedtuple("Glue", "file kind start end text")
+# `scope` is where the glue sits: the inline module path, then any impl header.
+Glue = namedtuple("Glue", "file kind start end text scope", defaults=("",))
 
 # The start of anything whose braces are not structure. Only the raw prefix
 # changes how a literal ends (`b"`, `c"` and `b'` lex like `"` and `'`); it
@@ -255,8 +256,24 @@ def parse(text, file=""):
         )
         items.append(Item(file, kind, name, mods, ctx, start, end, norm, vis))
 
+    def inner_attrs(lo, hi):
+        """The inner attributes at the top of the block body `lo..hi`, as
+        written (whitespace outside literals shrunk)."""
+        found, k = [], lo
+        while k < hi:
+            if kinds[k] != CODE:
+                k += 1
+                continue
+            if not INNER_ATTR.match(clines[k]):
+                break
+            e = balanced_end(clines, k, clines[k].index("["), hi)[0]
+            found.append(collapse(text, [line_range(x) for x in range(k, e + 1)], spans))
+            k = e + 1
+        return found
+
     def walk(lo, hi, mods, ctx):
         lead, sticky, i = None, False, lo
+        scope = " / ".join(part for part in ("::".join(mods), ctx) if part)
         while i < hi:
             kind = kinds[i]
             if kind != CODE:
@@ -268,7 +285,7 @@ def parse(text, file=""):
                         item("comment", lines[lead].strip()[:60], mods, ctx, lead, lead, 0, i - 1)
                         lead = None
                     what = "blank" if kind == BLANK else "doc"
-                    glue.append(Glue(file, what, i, i, lines[i].strip()))
+                    glue.append(Glue(file, what, i, i, lines[i].strip(), scope))
                 elif lead is None:
                     lead = i
                 i += 1
@@ -316,16 +333,28 @@ def parse(text, file=""):
                 # every line as written, so an edit to any of them is listed.
                 header = [line_range(k) for k in range(start, body[0]) if kinds[k] == CODE]
                 head = collapse(text, [*header, line_range(body[0], body[1])], spans)
+                if kind == "impl":
+                    # An inner attribute (`#![cfg(test)]`) applies to every
+                    # method in the block, so it is part of their identity
+                    # just as an outer one on the header is.
+                    head = " ".join([head, *inner_attrs(body[0] + 1, close)])
                 written = "\n".join(ln.strip() for ln in lines[start : body[0] + 1])
-                glue.append(Glue(file, "header", start, body[0], written))
+                had_items, had_glue = len(items), len(glue)
+                glue.append(Glue(file, "header", start, body[0], written, scope))
                 if kind == "impl":
                     walk(body[0] + 1, close, mods, head)
                 else:
                     walk(body[0] + 1, close, (*mods, name), ctx)
-                glue.append(Glue(file, "close", close, close, lines[close].strip()))
+                glue.append(Glue(file, "close", close, close, lines[close].strip(), scope))
+                if kind == "impl" and len(items) == had_items:
+                    # An impl with nothing in it (`unsafe impl Send for X {}`)
+                    # has no method to carry its header: as glue, adding or
+                    # dropping it would pass unseen, so it is an item.
+                    del glue[had_glue:]
+                    item(kind, name, mods, ctx, start, j, col, end)
             elif kind == "use" or (kind == "mod" and body is None):
                 written = collapse(text, [line_range(k) for k in range(start, end + 1)], spans)
-                glue.append(Glue(file, kind, start, end, written))
+                glue.append(Glue(file, kind, start, end, written, scope))
             else:
                 item(kind, name, mods, ctx, start, j, col, end)
             i = end + 1
@@ -449,23 +478,28 @@ def compare(old, new):
 def print_glue(sides):
     """The glue one side has and the other lacks, in file order, so a
     rewritten `//!` module doc reads top to bottom; blank lines only as a
-    count."""
+    count. Glue is told apart by where it sits too: a `use` swapped between
+    two inline modules of one file changes what their code calls."""
+    def key(g):
+        return (g.file, "", g.kind, "") if g.kind == "blank" else (g.file, g.scope, g.kind, g.text)
+
     counts, first = [], []
     for _, glue in sides:
-        counts.append(Counter((g.file, g.kind, g.text) for g in glue))
+        counts.append(Counter(key(g) for g in glue))
         at = {}
         for g in glue:
-            at[(g.file, g.kind, g.text)] = min(at.get((g.file, g.kind, g.text), g.start), g.start)
+            at[key(g)] = min(at.get(key(g), g.start), g.start)
         first.append(at)
     blanks = []
     for sign, side, delta in (("-", 0, counts[0] - counts[1]), ("+", 1, counts[1] - counts[0])):
-        blanks.append(f"{sign}{sum(n for (_, kind, _), n in delta.items() if kind == 'blank')}")
-        for key, count in sorted(delta.items(), key=lambda kv: (kv[0][0], first[side][kv[0]])):
-            f, kind, text = key
+        blanks.append(f"{sign}{sum(n for k, n in delta.items() if k[2] == 'blank')}")
+        for k, count in sorted(delta.items(), key=lambda kv: (kv[0][0], first[side][kv[0]])):
+            f, scope, kind, text = k
             if kind != "blank":
                 shown = text.replace("\n", "\n" + " " * 10)
                 times = f" (x{count})" if count > 1 else ""
-                print(f"  glue {sign}  {f}:{first[side][key] + 1}: {shown}{times}")
+                where = f" in {scope}" if scope else ""
+                print(f"  glue {sign}  {f}:{first[side][k] + 1}{where}: {shown}{times}")
     if blanks != ["-0", "+0"]:
         print(f"  glue    blank lines {' '.join(blanks)}")
 
