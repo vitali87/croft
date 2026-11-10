@@ -17,6 +17,7 @@ mod editor_view;
 mod explorer;
 mod extensions;
 mod files;
+mod golden;
 mod hot_exit;
 mod input;
 mod keybindings;
