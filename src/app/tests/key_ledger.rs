@@ -96,11 +96,19 @@ fn keys_of(hint: &str) -> Result<Vec<KeyEvent>, String> {
 /// the palette's words: `Cmd/Ctrl+C / X / V` is three chords, `Cmd/Ctrl+R or
 /// F2` two, `Cmd/Ctrl+A then Cmd/Ctrl+S` one sequence, `F7 / Shift+F7 in a
 /// diff` two (where they apply is the context's business). `Cmd/Ctrl` reads
-/// both ways, since Linux spells some `Cmd` chords with `Super`.
+/// both ways, since Linux spells some `Cmd` chords with `Super`. A `Cmd`
+/// chord listed beside a `Ctrl` one (`Ctrl+Shift+C / Cmd+C`) is the Mac's
+/// key, so it reads `Super`: the hint already names the `Ctrl` chord, and
+/// LINUX.md gives such a `Cmd` chord no `Ctrl` form.
 fn alternatives(hint: &str) -> Vec<String> {
     let hint = hint.split(" in ").next().unwrap_or(hint);
     let hint = hint.split(" (").next().unwrap_or(hint);
     let hint = hint.replace(" then ", " ").replace(" + ", " ");
+    let hint = if hint.contains("Ctrl") && !hint.contains("Cmd/Ctrl") {
+        hint.replace("Cmd", "Super")
+    } else {
+        hint
+    };
     let arrows = [("Left", "←"), ("Right", "→"), ("Up", "↑"), ("Down", "↓")];
     let mut out = Vec::new();
     // `Cmd/Ctrl+C / X / V`: a bare key after a `/` takes the modifiers
@@ -369,6 +377,11 @@ fn the_ledger_reads_a_hint_as_the_keys_linux_presses() {
         "LINUX.md: no Ctrl form, so Super"
     );
     assert_eq!(keys("Cmd/Ctrl+R or F2"), ["ctrl+r", "ctrl+r", "f2"]);
+    assert_eq!(
+        keys("Ctrl+Shift+C / Cmd+C"),
+        ["ctrl+shift+c", "cmd+c"],
+        "LINUX.md: a Cmd chord beside its Ctrl one is Super"
+    );
     assert_eq!(keys("Cmd/Ctrl+K Shift+T"), ["ctrl+k shift+t"; 2]);
     assert_eq!(keys("F7 / Shift+F7 in a diff"), ["f7", "shift+f7"]);
     assert_eq!(keys("Shift+PgUp/PgDn"), ["shift+pageup", "shift+pagedown"]);
@@ -388,18 +401,32 @@ fn the_ledger_reads_a_hint_as_the_keys_linux_presses() {
     );
 }
 
-/// F1 rows whose keys the key check they name does not take, and why: bugs
+/// F1 rows with a key the key check they name does not take, and why: bugs
 /// in the sheet, each to be fixed in a change of its own. The ledger presses
 /// the keys the row names all the same.
-const MISLABELLED_F1_ROWS: &[(&str, &str)] = &[(
-    "Cmd+Shift+O",
-    "opening a line above moved to Cmd/Ctrl+Shift+Enter; the chord the row \
-     names opens Go to Symbol",
-)];
+const MISLABELLED_F1_ROWS: &[(&str, &str)] = &[
+    (
+        "Cmd+Shift+O",
+        "opening a line above moved to Cmd/Ctrl+Shift+Enter; the chord the row \
+         names opens Go to Symbol",
+    ),
+    (
+        "Cmd/Ctrl+Shift+\\",
+        "Go to Bracket has no Ctrl form off macOS (LINUX.md): Linux takes \
+         Super+Shift+\\ only, and the row's Ctrl+Shift+\\ does nothing there",
+    ),
+    (
+        "Cmd/Ctrl+Opt+\\",
+        "Select to Bracket has no Ctrl form off macOS (LINUX.md): Linux takes \
+         Super+Alt+\\ only, and the row's Ctrl+Alt+\\ does nothing there",
+    ),
+];
 
-/// An F1 row names the key check that answers it in `handler`: the row's
-/// keys must be keys that check takes, or the ledger presses another chord
-/// than the one the row means.
+/// An F1 row names the key check that answers it in `handler`: every key the
+/// row lists must be one a check it names takes, and each check it names must
+/// take one of them, or the ledger presses another chord than the one the row
+/// means. A row naming two checks (`Cmd+[ / Cmd+]`) splits its keys between
+/// them.
 #[test]
 fn every_f1_row_with_a_key_predicate_names_keys_its_predicate_takes() {
     let (chords, _) = advertised();
@@ -421,6 +448,8 @@ fn every_f1_row_with_a_key_predicate_names_keys_its_predicate_takes() {
                 .into_iter()
                 .map(|keys| keys.unwrap_or_else(|why| panic!("{row}: {why}"))[0])
                 .collect();
+            let mut untaken = firsts.clone();
+            let mut idle = Vec::new();
             for name in entry.handler.split_whitespace() {
                 let checks: Vec<KeyPredicate> = predicates
                     .iter()
@@ -428,22 +457,29 @@ fn every_f1_row_with_a_key_predicate_names_keys_its_predicate_takes() {
                     .map(|(_, p)| *p)
                     .collect();
                 assert!(!checks.is_empty(), "{row}: {name} is a key check");
-                let taken = firsts.iter().any(|k| checks.iter().any(|takes| takes(*k)));
-                let known = MISLABELLED_F1_ROWS
-                    .iter()
-                    .any(|(keys, _)| *keys == entry.keys);
-                if taken == known {
-                    wrong.push(format!(
-                        "{row} {name} taken={taken} listed={known}: {firsts:?}"
-                    ));
+                let takes = |k: &KeyEvent| checks.iter().any(|takes| takes(*k));
+                if !firsts.iter().any(takes) {
+                    idle.push(name);
                 }
+                untaken.retain(|k| !takes(k));
+            }
+            let taken = untaken.is_empty() && idle.is_empty();
+            let known = MISLABELLED_F1_ROWS
+                .iter()
+                .any(|(keys, _)| *keys == entry.keys);
+            if taken == known {
+                wrong.push(format!(
+                    "{row} {} listed={known}: no check takes `{}`, taking none: {idle:?}",
+                    entry.handler,
+                    spell(&untaken)
+                ));
             }
         }
     }
     assert!(
         wrong.is_empty(),
-        "an F1 row must name keys its handler takes; one that does not is in \
-         MISLABELLED_F1_ROWS until it is fixed:\n{}",
+        "every key an F1 row lists must be one its handler takes; a row with \
+         one that is not is in MISLABELLED_F1_ROWS until it is fixed:\n{}",
         wrong.join("\n")
     );
 }
@@ -703,11 +739,6 @@ fn fingerprint(app: &App, root: &Path) -> Seen {
         let rows: BTreeSet<usize> = m.values().flatten().copied().collect();
         runs(rows)
     };
-    let typed: Vec<u8> = app
-        .terminals
-        .iter()
-        .flat_map(|t| t.written_bytes_for_test())
-        .collect();
     let clip = crate::clipboard::test_clip::mock_read().unwrap_or_default();
     // Each app has a workspace of its own, so its path is not news.
     // Nor are the process and pane ids a scrollback dump is named with.
@@ -732,9 +763,26 @@ fn fingerprint(app: &App, root: &Path) -> Seen {
     let quote = |s: &str| format!("{:?}", scrub(s));
     let on = |on: bool| on.then(String::new);
     let quoted = |s: &str| Some(quote(s));
+    // What the app wrote to each terminal pane, by the pane's place in the
+    // panel: the same bytes sent to another pane are another effect.
+    let typed: Vec<String> = app
+        .terminals
+        .iter()
+        .enumerate()
+        .filter_map(|(i, t)| {
+            let bytes = t.written_bytes_for_test();
+            (!bytes.is_empty()).then(|| format!("{i}:{}", quote(&String::from_utf8_lossy(&bytes))))
+        })
+        .collect();
     // A picker or menu: what it holds and the row it has selected.
     let picked = |query: &str, cursor: usize, row: &str| {
         Some(format!("{} @{cursor} > {}", quote(query), quote(row)))
+    };
+    // A picker whose rows come from this machine (its processes, its
+    // zoxide database, the command history every test shares): the row it
+    // has selected by place, so the ledger reads the same everywhere.
+    let picked_at = |query: &str, cursor: usize, selected: usize| {
+        Some(format!("{} @{cursor} > #{selected}", quote(query)))
     };
     let menu = app.context_menu.as_ref().map(|m| {
         let label = |items: &[MenuEntry], i: usize| items.get(i).map_or("", menu_label).to_string();
@@ -768,7 +816,7 @@ fn fingerprint(app: &App, root: &Path) -> Seen {
             ),
             ("status", quote(&app.status)),
             ("clip", quote(&clip)),
-            ("typed", quote(&String::from_utf8_lossy(&typed))),
+            ("typed", typed.join(" ")),
             (
                 "terms",
                 format!("{}@{}", app.terminals.len(), app.active_terminal),
@@ -809,12 +857,48 @@ fn fingerprint(app: &App, root: &Path) -> Seen {
                     picked(&f.query, f.cursor, row)
                 }),
             ),
-            ("go_to_symbol", on(app.go_to_symbol.is_some())),
-            ("workspace_symbols", on(app.workspace_symbols.is_some())),
-            ("process_picker", on(app.process_picker.is_some())),
-            ("zoxide", on(app.zoxide_jump.is_some())),
-            ("history", on(app.command_history_popup.is_some())),
-            ("branch_picker", on(app.branch_picker.is_some())),
+            (
+                "go_to_symbol",
+                app.go_to_symbol.as_ref().and_then(|g| {
+                    // A symbol's row is where it jumps to.
+                    let row = g
+                        .selected_target()
+                        .map_or_else(String::new, |(l, c)| format!("{l}:{c}"));
+                    picked(&g.query, g.cursor, &row)
+                }),
+            ),
+            (
+                "workspace_symbols",
+                app.workspace_symbols.as_ref().and_then(|w| {
+                    let row = w.results.get(w.selected).map_or("", |r| &r.name);
+                    picked(&w.query, w.cursor, row)
+                }),
+            ),
+            (
+                "process_picker",
+                app.process_picker
+                    .as_ref()
+                    .map(|p| format!("> #{}", p.selected)),
+            ),
+            (
+                "zoxide",
+                app.zoxide_jump
+                    .as_ref()
+                    .and_then(|z| picked_at(&z.query, z.cursor, z.selected)),
+            ),
+            (
+                "history",
+                app.command_history_popup.as_ref().and_then(|h| {
+                    picked_at(&format!("{:?} {}", h.scope, h.query), h.cursor, h.selected)
+                }),
+            ),
+            (
+                "branch_picker",
+                app.branch_picker.as_ref().and_then(|b| {
+                    let row = b.branches.get(b.selected).map_or("", |r| &r.display);
+                    picked(&b.query, b.cursor, row)
+                }),
+            ),
             (
                 "input",
                 app.input_prompt
@@ -845,7 +929,13 @@ fn fingerprint(app: &App, root: &Path) -> Seen {
                     .and_then(quoted),
             ),
             ("shortcuts", on(app.shortcuts_modal.is_some())),
-            ("settings", on(app.settings_editor.is_some())),
+            (
+                "settings",
+                app.settings_editor.as_ref().map(|s| {
+                    let row = s.selected_row().map_or("", |r| &r.key);
+                    format!("{} > {}", quote(&s.query), quote(row))
+                }),
+            ),
             ("connect", on(app.connect_dialog.is_some())),
             ("approval", on(app.approval_ui.is_some())),
             ("find", on(app.editor_find.is_some())),
@@ -859,7 +949,13 @@ fn fingerprint(app: &App, root: &Path) -> Seen {
                     .map(|(refs, i)| format!("{i}/{}", refs.len())),
             ),
             ("hover", on(app.hover_popup.is_some())),
-            ("completion", on(app.completion_popup.is_some())),
+            (
+                "completion",
+                app.completion_popup.as_ref().map(|c| {
+                    let row = c.items.get(c.selected).map_or("", |r| &r.label);
+                    format!("{} > {}", quote(&c.prefix), quote(row))
+                }),
+            ),
             ("signature", on(app.signature_help_popup.is_some())),
             ("comment", on(ed.comment_focus.is_some())),
             ("leader", on(app.cmd_k_leader.is_some())),
@@ -981,4 +1077,42 @@ fn a_keys_effects_name_what_it_changed_and_what_it_opened() {
         "added 12 lines, cafe"
     );
     assert_eq!(runs([1, 2, 3, 7]), "1-3,7");
+}
+
+#[test]
+fn a_keys_effects_name_the_terminal_pane_it_typed_into() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let mut app = app_with_open_file(root, "main.rs", "fn main() {}\n");
+    let quiet = ["-c", "exec sleep 600"].map(String::from);
+    app.terminals
+        .push(PtyTerminal::new_running("/bin/sh", &quiet, root).unwrap());
+    let before = fingerprint(&app, root);
+    app.terminals[1].write_input(b"ls");
+    let second = effects(&before, &fingerprint(&app, root));
+    assert!(second.contains("typed=1:\"ls\""), "{second}");
+    // The same bytes in the first pane instead.
+    app.terminals[1] = PtyTerminal::new_running("/bin/sh", &quiet, root).unwrap();
+    app.terminals[0].write_input(b"ls");
+    let first = effects(&before, &fingerprint(&app, root));
+    assert!(first.contains("typed=0:\"ls\""), "{first}");
+}
+
+#[test]
+fn a_keys_effects_name_what_it_did_to_an_open_picker() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let mut app = app_with_open_file(root, "main.rs", "fn main() {}\n");
+    let before = fingerprint(&app, root);
+    app.handle_key(key(
+        KeyCode::Char('O'),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    ))
+    .unwrap();
+    let opened = fingerprint(&app, root);
+    let fx = effects(&before, &opened);
+    assert!(fx.contains("+go_to_symbol(\"\" @0 > "), "{fx}");
+    type_char(&mut app, 'x');
+    let fx = effects(&opened, &fingerprint(&app, root));
+    assert!(fx.contains("~go_to_symbol(\"x\" @1 > "), "its query: {fx}");
 }
