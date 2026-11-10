@@ -96,11 +96,19 @@ fn keys_of(hint: &str) -> Result<Vec<KeyEvent>, String> {
 /// the palette's words: `Cmd/Ctrl+C / X / V` is three chords, `Cmd/Ctrl+R or
 /// F2` two, `Cmd/Ctrl+A then Cmd/Ctrl+S` one sequence, `F7 / Shift+F7 in a
 /// diff` two (where they apply is the context's business). `Cmd/Ctrl` reads
-/// both ways, since Linux spells some `Cmd` chords with `Super`.
+/// both ways, since Linux spells some `Cmd` chords with `Super`. A `Cmd`
+/// chord listed beside a `Ctrl` one (`Ctrl+Shift+C / Cmd+C`) is the Mac's
+/// key, so it reads `Super`: the hint already names the `Ctrl` chord, and
+/// LINUX.md gives such a `Cmd` chord no `Ctrl` form.
 fn alternatives(hint: &str) -> Vec<String> {
     let hint = hint.split(" in ").next().unwrap_or(hint);
     let hint = hint.split(" (").next().unwrap_or(hint);
     let hint = hint.replace(" then ", " ").replace(" + ", " ");
+    let hint = if hint.contains("Ctrl") && !hint.contains("Cmd/Ctrl") {
+        hint.replace("Cmd", "Super")
+    } else {
+        hint
+    };
     let arrows = [("Left", "←"), ("Right", "→"), ("Up", "↑"), ("Down", "↓")];
     let mut out = Vec::new();
     // `Cmd/Ctrl+C / X / V`: a bare key after a `/` takes the modifiers
@@ -369,6 +377,11 @@ fn the_ledger_reads_a_hint_as_the_keys_linux_presses() {
         "LINUX.md: no Ctrl form, so Super"
     );
     assert_eq!(keys("Cmd/Ctrl+R or F2"), ["ctrl+r", "ctrl+r", "f2"]);
+    assert_eq!(
+        keys("Ctrl+Shift+C / Cmd+C"),
+        ["ctrl+shift+c", "cmd+c"],
+        "LINUX.md: a Cmd chord beside its Ctrl one is Super"
+    );
     assert_eq!(keys("Cmd/Ctrl+K Shift+T"), ["ctrl+k shift+t"; 2]);
     assert_eq!(keys("F7 / Shift+F7 in a diff"), ["f7", "shift+f7"]);
     assert_eq!(keys("Shift+PgUp/PgDn"), ["shift+pageup", "shift+pagedown"]);
