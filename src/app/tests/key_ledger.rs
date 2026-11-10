@@ -691,6 +691,12 @@ fn fingerprint(app: &App, root: &Path) -> Seen {
     let picked = |query: &str, cursor: usize, row: &str| {
         Some(format!("{} @{cursor} > {}", quote(query), quote(row)))
     };
+    // A picker whose rows come from this machine (its processes, its
+    // zoxide database, the command history every test shares): the row it
+    // has selected by place, so the ledger reads the same everywhere.
+    let picked_at = |query: &str, cursor: usize, selected: usize| {
+        Some(format!("{} @{cursor} > #{selected}", quote(query)))
+    };
     let menu = app.context_menu.as_ref().map(|m| {
         let label = |items: &[MenuEntry], i: usize| items.get(i).map_or("", menu_label).to_string();
         let mut out = format!(
@@ -762,12 +768,48 @@ fn fingerprint(app: &App, root: &Path) -> Seen {
                     picked(&f.query, f.cursor, row)
                 }),
             ),
-            ("go_to_symbol", on(app.go_to_symbol.is_some())),
-            ("workspace_symbols", on(app.workspace_symbols.is_some())),
-            ("process_picker", on(app.process_picker.is_some())),
-            ("zoxide", on(app.zoxide_jump.is_some())),
-            ("history", on(app.command_history_popup.is_some())),
-            ("branch_picker", on(app.branch_picker.is_some())),
+            (
+                "go_to_symbol",
+                app.go_to_symbol.as_ref().and_then(|g| {
+                    // A symbol's row is where it jumps to.
+                    let row = g
+                        .selected_target()
+                        .map_or_else(String::new, |(l, c)| format!("{l}:{c}"));
+                    picked(&g.query, g.cursor, &row)
+                }),
+            ),
+            (
+                "workspace_symbols",
+                app.workspace_symbols.as_ref().and_then(|w| {
+                    let row = w.results.get(w.selected).map_or("", |r| &r.name);
+                    picked(&w.query, w.cursor, row)
+                }),
+            ),
+            (
+                "process_picker",
+                app.process_picker
+                    .as_ref()
+                    .map(|p| format!("> #{}", p.selected)),
+            ),
+            (
+                "zoxide",
+                app.zoxide_jump
+                    .as_ref()
+                    .and_then(|z| picked_at(&z.query, z.cursor, z.selected)),
+            ),
+            (
+                "history",
+                app.command_history_popup.as_ref().and_then(|h| {
+                    picked_at(&format!("{:?} {}", h.scope, h.query), h.cursor, h.selected)
+                }),
+            ),
+            (
+                "branch_picker",
+                app.branch_picker.as_ref().and_then(|b| {
+                    let row = b.branches.get(b.selected).map_or("", |r| &r.display);
+                    picked(&b.query, b.cursor, row)
+                }),
+            ),
             (
                 "input",
                 app.input_prompt
@@ -791,7 +833,13 @@ fn fingerprint(app: &App, root: &Path) -> Seen {
             ("scm_menu", on(app.scm_menu.open)),
             ("commit_menu", on(app.commit_menu_open)),
             ("shortcuts", on(app.shortcuts_modal.is_some())),
-            ("settings", on(app.settings_editor.is_some())),
+            (
+                "settings",
+                app.settings_editor.as_ref().map(|s| {
+                    let row = s.selected_row().map_or("", |r| &r.key);
+                    format!("{} > {}", quote(&s.query), quote(row))
+                }),
+            ),
             ("connect", on(app.connect_dialog.is_some())),
             ("approval", on(app.approval_ui.is_some())),
             ("find", on(app.editor_find.is_some())),
@@ -805,7 +853,13 @@ fn fingerprint(app: &App, root: &Path) -> Seen {
                     .map(|(refs, i)| format!("{i}/{}", refs.len())),
             ),
             ("hover", on(app.hover_popup.is_some())),
-            ("completion", on(app.completion_popup.is_some())),
+            (
+                "completion",
+                app.completion_popup.as_ref().map(|c| {
+                    let row = c.items.get(c.selected).map_or("", |r| &r.label);
+                    format!("{} > {}", quote(&c.prefix), quote(row))
+                }),
+            ),
             ("signature", on(app.signature_help_popup.is_some())),
             ("comment", on(ed.comment_focus.is_some())),
             ("leader", on(app.cmd_k_leader.is_some())),
@@ -934,4 +988,23 @@ fn a_keys_effects_name_the_terminal_pane_it_typed_into() {
     app.terminals[0].write_input(b"ls");
     let first = effects(&before, &fingerprint(&app, root));
     assert!(first.contains("typed=0:\"ls\""), "{first}");
+}
+
+#[test]
+fn a_keys_effects_name_what_it_did_to_an_open_picker() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let mut app = app_with_open_file(root, "main.rs", "fn main() {}\n");
+    let before = fingerprint(&app, root);
+    app.handle_key(key(
+        KeyCode::Char('O'),
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+    ))
+    .unwrap();
+    let opened = fingerprint(&app, root);
+    let fx = effects(&before, &opened);
+    assert!(fx.contains("+go_to_symbol(\"\" @0 > "), "{fx}");
+    type_char(&mut app, 'x');
+    let fx = effects(&opened, &fingerprint(&app, root));
+    assert!(fx.contains("~go_to_symbol(\"x\" @1 > "), "its query: {fx}");
 }
