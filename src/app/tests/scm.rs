@@ -5387,16 +5387,6 @@ fn rebase_todo_keys_set_the_action_and_step_down() {
     );
 }
 
-fn press_rebase_keys(app: &mut App, keys: &str) {
-    for c in keys.chars() {
-        app.handle_key(crossterm::event::KeyEvent::new(
-            KeyCode::Char(c),
-            KeyModifiers::NONE,
-        ))
-        .unwrap();
-    }
-}
-
 const REBASE_PLAN: &str = "pick aaa111 c2\npick bbb222 c3\npick ccc333 c4\n\n# Rebase 805d070..ccc333 onto 805d070 (3 commands)\n#\n";
 
 #[test]
@@ -5404,7 +5394,7 @@ fn a_key_past_the_last_commit_leaves_the_plan_valid() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = app_with_open_file(tmp.path(), "git-rebase-todo", REBASE_PLAN);
     app.editor.cursor_row = 1;
-    press_rebase_keys(&mut app, "sss");
+    type_keys(&mut app, "sss");
     assert_eq!(
         &app.editor.lines[..4],
         &["pick aaa111 c2", "squash bbb222 c3", "squash ccc333 c4", ""],
@@ -5418,7 +5408,7 @@ fn an_action_key_on_a_blank_plan_line_types_nothing() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = app_with_open_file(tmp.path(), "git-rebase-todo", REBASE_PLAN);
     app.editor.cursor_row = 3;
-    press_rebase_keys(&mut app, "psd");
+    type_keys(&mut app, "psd");
     assert_eq!(app.editor.lines[3], "", "the blank line stays blank");
     assert_eq!(app.editor.cursor_row, 3);
 }
@@ -5431,10 +5421,10 @@ fn the_caret_skips_comments_to_the_next_commit() {
         "git-rebase-todo",
         "pick aaa111 c2\n# keep this one\n\npick bbb222 c3\n",
     );
-    press_rebase_keys(&mut app, "r");
+    type_keys(&mut app, "r");
     assert_eq!(app.editor.lines[0], "reword aaa111 c2");
     assert_eq!(app.editor.cursor_row, 3, "past the comment and the blank");
-    press_rebase_keys(&mut app, "f");
+    type_keys(&mut app, "f");
     assert_eq!(app.editor.lines[3], "fixup bbb222 c3");
 }
 
@@ -5442,7 +5432,7 @@ fn the_caret_skips_comments_to_the_next_commit() {
 fn squash_on_the_first_commit_is_refused() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = app_with_open_file(tmp.path(), "git-rebase-todo", REBASE_PLAN);
-    press_rebase_keys(&mut app, "s");
+    type_keys(&mut app, "s");
     assert_eq!(
         app.editor.lines[0], "pick aaa111 c2",
         "the line is unchanged"
@@ -5453,7 +5443,7 @@ fn squash_on_the_first_commit_is_refused() {
         "{}",
         app.status
     );
-    press_rebase_keys(&mut app, "f");
+    type_keys(&mut app, "f");
     assert_eq!(app.editor.lines[0], "pick aaa111 c2");
     assert!(app.status.contains("Can't fixup"), "{}", app.status);
 }
@@ -5462,7 +5452,7 @@ fn squash_on_the_first_commit_is_refused() {
 fn squash_below_only_dropped_commits_is_refused() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = app_with_open_file(tmp.path(), "git-rebase-todo", REBASE_PLAN);
-    press_rebase_keys(&mut app, "ds");
+    type_keys(&mut app, "ds");
     assert_eq!(app.editor.lines[0], "drop aaa111 c2");
     assert_eq!(app.editor.lines[1], "pick bbb222 c3");
     assert!(app.status.contains("Can't squash"), "{}", app.status);
@@ -5472,7 +5462,7 @@ fn squash_below_only_dropped_commits_is_refused() {
 fn other_actions_on_the_first_commit_still_apply() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = app_with_open_file(tmp.path(), "git-rebase-todo", REBASE_PLAN);
-    press_rebase_keys(&mut app, "e");
+    type_keys(&mut app, "e");
     assert_eq!(app.editor.lines[0], "edit aaa111 c2");
     assert_eq!(app.editor.cursor_row, 1);
     assert_eq!(app.status, crate::rebase_todo::HINT);
@@ -6177,10 +6167,7 @@ fn conflicting_pricing_repo_858() -> tempfile::TempDir {
 fn pick_branch_858(app: &mut App, action: crate::widgets::scm_menu::ScmAction, branch: &str) {
     app.dispatch_scm_action(action);
     assert!(app.branch_picker.is_some(), "{action:?} opens the picker");
-    for c in branch.chars() {
-        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
-            .unwrap();
-    }
+    type_keys(app, branch);
     app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
         .unwrap();
 }
@@ -7736,7 +7723,7 @@ fn scm_app_with_an_unsaved_modified_file() -> (tempfile::TempDir, std::path::Pat
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.editor.open_pinned(&f).unwrap();
     app.focus_pane(Pane::Editor);
-    type_str(&mut app, "# ");
+    type_keys(&mut app, "# ");
     assert!(
         app.editor.dirty,
         "staging: the file's tab has unsaved edits"

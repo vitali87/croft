@@ -1297,7 +1297,7 @@ fn save_all_does_not_quit_while_an_untitled_buffer_holds_text() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.focus_pane(Pane::Editor);
-    type_into_editor(&mut app, "note");
+    type_keys(&mut app, "note");
     assert!(app.editor.path.is_none() && app.editor.dirty, "setup");
     press_ctrl_q(&mut app);
     app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
@@ -1425,7 +1425,7 @@ fn app_with_edited_search_editor(tmp: &std::path::Path, query: &str) -> (App, St
     app.search.query = query.to_string();
     app.run_command(crate::widgets::command_palette::Command::OpenSearchEditor);
     app.focus_pane(Pane::Editor);
-    type_into_editor(&mut app, "x");
+    type_keys(&mut app, "x");
     assert!(app.editor.scratch && app.editor.dirty, "setup");
     (app, format!("Search: {query}"))
 }
@@ -1463,7 +1463,7 @@ fn ctrl_s_on_a_scratch_tab_writes_no_file_and_points_to_save_as() {
         app.status
     );
     assert_eq!(app.editor.path.as_deref(), Some(kept.as_path()));
-    type_into_editor(&mut app, "y");
+    type_keys(&mut app, "y");
     app.handle_key(ctrl_s).unwrap();
     assert!(!app.editor.dirty, "the file now saves: {}", app.status);
 }
@@ -1476,12 +1476,12 @@ fn auto_save_writes_the_files_but_never_a_scratch_tab() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = app_with_open_file(tmp.path(), "a.txt", "hello");
     app.auto_save = true;
-    type_into_editor(&mut app, "x");
+    type_keys(&mut app, "x");
     let label = "commit 951a5e7";
     app.editor
         .open_text_buffer(std::path::Path::new(label), "commit 951a5e7\n")
         .unwrap();
-    type_into_editor(&mut app, "y");
+    type_keys(&mut app, "y");
     assert!(app.editor.scratch && app.editor.dirty, "setup");
     app.editor.editors.iter_mut().for_each(age_last_edit);
     assert!(app.tick_auto_save(), "a.txt is due");
@@ -2410,7 +2410,7 @@ fn app_with_trailing_spaces_typed() -> (App, tempfile::TempDir) {
     let mut app = app_with_open_file(tmp.path(), "app.txt", "def f():\n    return 1\n");
     app.handle_key(key(KeyCode::End, KeyModifiers::NONE))
         .unwrap();
-    type_str(&mut app, "  # TODO   ");
+    type_keys(&mut app, "  # TODO   ");
     (app, tmp)
 }
 

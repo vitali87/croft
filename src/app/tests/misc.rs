@@ -768,7 +768,7 @@ fn show_memory_usage_opens_a_per_subsystem_report() {
         "{}",
         shown(&app)
     );
-    type_str(&mut app, "zz");
+    type_keys(&mut app, "zz");
     app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
         .unwrap();
     app.handle_key(key(KeyCode::Backspace, KeyModifiers::NONE))

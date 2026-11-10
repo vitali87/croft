@@ -2672,7 +2672,7 @@ fn find_seeds_the_whole_word_and_typing_replaces_it() {
     let (mut app, _tmp) = find_seed_app(0, 10);
     app.handle_key(ctrl('f')).unwrap();
     assert_eq!(find_query(&app), "loadOrders");
-    type_str(&mut app, "save");
+    type_keys(&mut app, "save");
     assert_eq!(find_query(&app), "save");
     assert!(app.editor_find.as_ref().unwrap().match_count >= 1);
 }
@@ -2692,9 +2692,9 @@ fn find_seeds_the_word_the_caret_just_left() {
 fn ctrl_f_on_an_open_bar_selects_its_query_again() {
     let (mut app, _tmp) = find_seed_app(0, 10);
     app.handle_key(ctrl('f')).unwrap();
-    type_str(&mut app, "save");
+    type_keys(&mut app, "save");
     app.handle_key(ctrl('f')).unwrap();
-    type_str(&mut app, "write");
+    type_keys(&mut app, "write");
     assert_eq!(find_query(&app), "write");
 }
 
@@ -2705,14 +2705,14 @@ fn an_unseeded_or_deselected_query_still_appends() {
     let (mut app, _tmp) = find_seed_app(2, 0);
     app.handle_key(ctrl('f')).unwrap();
     assert_eq!(find_query(&app), "");
-    type_str(&mut app, "sa");
-    type_str(&mut app, "ve");
+    type_keys(&mut app, "sa");
+    type_keys(&mut app, "ve");
     assert_eq!(find_query(&app), "save");
     let (mut app, _tmp) = find_seed_app(0, 10);
     app.handle_key(ctrl('f')).unwrap();
     app.handle_key(key(KeyCode::End, KeyModifiers::NONE))
         .unwrap();
-    type_str(&mut app, "X");
+    type_keys(&mut app, "X");
     assert_eq!(find_query(&app), "loadOrdersX");
 }
 

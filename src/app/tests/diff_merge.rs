@@ -1625,7 +1625,7 @@ fn compare_with_selected_diffs_an_unsaved_buffer_as_it_stands() {
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.editor.open_pinned(&a).unwrap();
     app.focus_pane(Pane::Editor);
-    type_str(&mut app, "z");
+    type_keys(&mut app, "z");
     app.dispatch_menu_action(
         MenuAction::CompareWithSelected {
             anchor: a.clone(),

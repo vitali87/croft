@@ -5245,11 +5245,6 @@ fn creating_a_codeql_query_writes_opens_and_lists_it_in_the_selected_pack() {
         let press = |app: &mut App, code: KeyCode| {
             app.handle_key(key(code, KeyModifiers::NONE)).unwrap();
         };
-        let type_str = |app: &mut App, text: &str| {
-            for c in text.chars() {
-                press(app, KeyCode::Char(c));
-            }
-        };
         let tmp = tempfile::tempdir().unwrap();
         let pack = tmp.path().join("pack");
         std::fs::create_dir_all(&pack).unwrap();
@@ -5281,7 +5276,7 @@ fn creating_a_codeql_query_writes_opens_and_lists_it_in_the_selected_pack() {
             }
         );
         assert!(prompt.title.contains("acme/go"), "{}", prompt.title);
-        type_str(&mut app, "find-calls");
+        type_keys(&mut app, "find-calls");
         press(&mut app, KeyCode::Enter);
         let created = pack.join("find-calls.ql");
         let text = std::fs::read_to_string(&created).expect("written");
@@ -5297,7 +5292,7 @@ fn creating_a_codeql_query_writes_opens_and_lists_it_in_the_selected_pack() {
         app.set_sidebar_view(SidebarView::CodeQL);
         app.focus = Pane::Tree;
         press(&mut app, KeyCode::Char('n'));
-        type_str(&mut app, "find-calls.ql");
+        type_keys(&mut app, "find-calls.ql");
         press(&mut app, KeyCode::Enter);
         assert!(app.status.contains("already exists"), "{}", app.status);
         assert_eq!(std::fs::read_to_string(&created).unwrap(), text);
@@ -5329,7 +5324,7 @@ fn creating_a_codeql_query_writes_opens_and_lists_it_in_the_selected_pack() {
             Some(Hit::Action(Action::CreateQuery))
         );
         press(&mut app, KeyCode::Enter);
-        type_str(&mut app, "hello");
+        type_keys(&mut app, "hello");
         press(&mut app, KeyCode::Enter);
         let created = empty.path().join("hello.ql");
         assert!(
@@ -5757,10 +5752,7 @@ fn codeql_variant_analysis_repositories_are_set_up_from_the_side_bar_and_palette
             app.handle_key(key(code, KeyModifiers::NONE)).unwrap();
         };
         let type_in = |app: &mut App, text: &str| {
-            for c in text.chars() {
-                app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
-                    .unwrap();
-            }
+            type_keys(app, text);
             app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
                 .unwrap();
         };
@@ -6485,10 +6477,7 @@ esac
             app.handle_key(key(code, KeyModifiers::NONE)).unwrap();
         };
         let type_in = |app: &mut App, text: &str| {
-            for c in text.chars() {
-                app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
-                    .unwrap();
-            }
+            type_keys(app, text);
             app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
                 .unwrap();
         };

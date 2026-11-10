@@ -4267,7 +4267,7 @@ fn typing_customize_layout_in_the_palette_opens_the_popup() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     open_palette_852(&mut app);
-    type_keys_852(&mut app, "customize layout");
+    type_keys(&mut app, "customize layout");
     app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
         .unwrap();
     let menu = app
