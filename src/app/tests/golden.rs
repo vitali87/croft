@@ -82,10 +82,12 @@
 //!   repository. Source Control's repository is made with fixed names,
 //!   emails and dates, no global or system config, no template and no
 //!   hooks, and pins in its own config the keys a user's global config
-//!   would change in what the app's git runs print. The app's own git
-//!   commands inherit the environment, so a run with git's repository
-//!   variables set, as inside a git hook, cannot pass that scene, which
-//!   then fails at once saying so.
+//!   would change in what the app's git runs print, the commit template
+//!   among them. The app's own git commands inherit the environment, so a
+//!   run with git's repository variables set, as inside a git hook, or
+//!   with settings passed in the environment (`GIT_CONFIG_COUNT`,
+//!   `GIT_CONFIG_PARAMETERS`), which outrank the repository's own, cannot
+//!   pass that scene, which then fails at once saying so.
 //! * Host and user names: the hostname is drawn only beside a forwarded
 //!   port in PORTS and a shell's host only on a terminal tab; no scene
 //!   shows either, and `is_remote` is pinned to a local session.
@@ -1197,11 +1199,13 @@ fn search_view_with_results() {
     workbench_scene("search-results", &mut app);
 }
 
-/// Fail at once, saying why, when git's repository variables are set, as
-/// they are inside a git hook: the app's own git commands inherit them and
-/// would read that repository instead of the fixture's, so the scene could
-/// only time out.
-fn refuse_inherited_git_repository() {
+/// Fail at once, saying why, when the environment carries git state the
+/// app's own git commands would inherit. Git's repository variables, set
+/// inside a git hook, point them at that repository instead of the
+/// fixture's, so the scene could only time out. Settings passed in the
+/// environment outrank the repository's own config, so a `log.decorate`
+/// there would change what COMMITS shows.
+fn refuse_inherited_git_state() {
     for var in [
         "GIT_DIR",
         "GIT_WORK_TREE",
@@ -1214,6 +1218,14 @@ fn refuse_inherited_git_repository() {
             "{var} is set, as inside a git hook: the app's git commands would \
              read that repository, not the fixture's. Run the suite outside \
              the hook."
+        );
+    }
+    for var in ["GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS"] {
+        assert!(
+            std::env::var_os(var).is_none(),
+            "{var} is set: the git settings it passes outrank the fixture's \
+             own config in the app's git commands. Run this scene with it \
+             unset."
         );
     }
 }
@@ -1250,7 +1262,7 @@ fn hermetic_git(dir: &Path, args: &[&str]) {
 
 #[test]
 fn source_control_with_a_staged_and_an_unstaged_change() {
-    refuse_inherited_git_repository();
+    refuse_inherited_git_state();
     let (_fixture, root) = workspace(&[("src/main.rs", MAIN_RS), ("README.md", "# golden\n")]);
     // No template: its hooks and excludes would be the developer's.
     hermetic_git(&root, &["init", "-q", "--template=", "-b", "main"]);
@@ -1260,6 +1272,9 @@ fn source_control_with_a_staged_and_an_unstaged_change() {
     // mixes signature checks into the log the graph reads.
     hermetic_git(&root, &["config", "log.decorate", "short"]);
     hermetic_git(&root, &["config", "log.showSignature", "false"]);
+    // A global `commit.template` would seed the empty message box with the
+    // developer's own text; an empty one seeds nothing.
+    hermetic_git(&root, &["config", "commit.template", "/dev/null"]);
     hermetic_git(&root, &["add", "."]);
     hermetic_git(&root, &["commit", "-q", "-m", "Add the greeter"]);
     std::fs::write(root.join("src/greeting.rs"), "pub fn hello() {}\n").unwrap();
