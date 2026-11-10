@@ -26,7 +26,8 @@ between files, a rename, a restructure that behaves the same. A merge whose
 pending notes are all refactor ones makes no version, so it never counts
 toward publish-crate.yml's cadence and never sets off a release that changes
 nothing for users. Its notes stay pending and go out with the next version
-that has a feature, a fix or a dependency update.
+that has a feature, a fix or a dependency update. A GitHub release sums
+them up in one line.
 
 Usage:
   release.py check <base> <head>         the PR gate: a shipped change carries
@@ -89,6 +90,9 @@ NAMED_UPDATES = 5
 # The three kinds a highlight takes, as every message that asks for
 # highlights names them.
 PREFIXES = "'feature:', 'fix:' or 'refactor:'"
+# An issue or pull request a refactor line names, for the one line a GitHub
+# release sums its refactor lines up in.
+REFERENCE = re.compile(r"#([0-9]+)")
 # What Rust's `str::trim` removes: Unicode's White_Space set. The refactor
 # rule trims with it and breaks lines at "\n" alone, as the build's `lines`
 # does, so the cut and the build read the same lines. Python's own `strip()`
@@ -150,6 +154,42 @@ def has_user_highlight(text: str) -> bool:
         and not is_refactor_line(line)
         for line in text.split("\n")
     )
+
+
+def without_refactor_lines(text: str) -> tuple[str, list[str]]:
+    """`text` with its refactor lines taken out, and the lines taken out.
+
+    Lines break at "\\n" alone, as for `has_user_highlight`, so the release
+    body leaves out exactly the lines the card does. Every other line is kept
+    as it was, line ending included, so a text with no refactor line comes
+    back unchanged.
+    """
+    kept, dropped = [], []
+    for line in re.split(r"(?<=\n)", text):
+        (dropped if is_refactor_line(line) else kept).append(line)
+    return "".join(kept), dropped
+
+
+def refactor_summary(dropped: list[str]) -> str:
+    """The one line a GitHub release carries for the refactor lines it left
+    out. Users read a release for what changed in use, and the refactor
+    program (#2062) lands dozens of moves that change nothing, so they are
+    counted rather than listed. The issues and pull requests they name are
+    kept, in number order, for whoever wants the detail."""
+    references = sorted({int(n) for line in dropped for n in REFERENCE.findall(line)})
+    named = f" ({', '.join(f'#{n}' for n in references)})" if references else ""
+    count = "1 change" if len(dropped) == 1 else f"{len(dropped)} changes"
+    return f"refactor: Internal groundwork{named}: {count}. Nothing changes in use.\n"
+
+
+def with_refactor_summary(body: str, dropped: list[str]) -> str:
+    """`body` with the line that sums up `dropped` after it, as a paragraph
+    of its own. `body` unchanged when nothing was dropped."""
+    if not dropped:
+        return body
+    if body and not body.endswith("\n"):
+        body += "\n"
+    return body + ("\n" if body else "") + refactor_summary(dropped)
 
 
 def git(*args, cwd=None) -> str:
@@ -391,6 +431,11 @@ def release_notes(root, version: str, released: list[str]) -> str:
     nothing and is left out. With nothing released before it, or nothing in
     between, the body is `version`'s own notes, as it was when every version
     was released.
+
+    Refactor lines are left out of every version's notes, since a user
+    reading a release wants what changed in use, and one line at the end
+    counts them instead. With no refactor line in the range the body is
+    exactly what it was before refactor lines existed.
     """
     root = Path(root)
     own = root / NOTES_DIR / f"{version}.md"
@@ -413,14 +458,15 @@ def release_notes(root, version: str, released: list[str]) -> str:
         reverse=True,
     )
     if len(versions) <= 1:
-        return own.read_text(encoding="utf-8")
-    sections = []
+        return with_refactor_summary(*without_refactor_lines(own.read_text(encoding="utf-8")))
+    sections, dropped = [], []
     for v in versions:
-        text = (root / NOTES_DIR / f"{v}.md").read_text(encoding="utf-8")
+        text, gone = without_refactor_lines((root / NOTES_DIR / f"{v}.md").read_text(encoding="utf-8"))
+        dropped += gone
         if not text.endswith("\n"):
             text += "\n"
         sections.append(f"## {v}\n\n{text}")
-    return "\n".join(sections)
+    return with_refactor_summary("\n".join(sections), dropped)
 
 
 def setting_commit(version: str, cwd=None) -> str:

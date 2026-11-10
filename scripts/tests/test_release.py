@@ -820,6 +820,10 @@ class RefactorLine(unittest.TestCase):
         self.assertFalse(release.has_user_highlight("refactor: Moved.\u2028fix: Repaired.\n"))
         self.assertFalse(release.has_user_highlight("refactor: Moved.\x1cfix: Repaired.\n"))
         self.assertTrue(release.has_user_highlight("\x1frefactor: Moved.\n"))
+        self.assertEqual(
+            release.without_refactor_lines("refactor: Moved.\x0cfix: Repaired.\nfix: C.\n"),
+            ("fix: C.\n", ["refactor: Moved.\x0cfix: Repaired.\n"]),
+        )
 
     def test_trimming_removes_what_rusts_trim_removes(self):
         """Unicode's White_Space set, which Rust's `trim` removes: Python's
@@ -903,6 +907,73 @@ class Notes(unittest.TestCase):
             root = self.notes_dir(tmp, **{"0_2_28": "fix: Old.\n"})
             with self.assertRaises(release.ReleaseError):
                 release.release_notes(root, "0.2.29", ["v0.2.28"])
+
+    def test_a_versions_own_refactor_lines_are_summed_up_at_the_end(self):
+        """The single-version body, which is otherwise the file as it is:
+        refactor lines change nothing in use, so one line counts them."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.notes_dir(
+                tmp, **{"0_2_28": "fix: Old.\n", "0_2_29": "refactor: Moved the tree (#2062).\nfix: A.\n"}
+            )
+            self.assertEqual(
+                release.release_notes(root, "0.2.29", ["v0.2.28"]),
+                "fix: A.\n\nrefactor: Internal groundwork (#2062): 1 change. Nothing changes in use.\n",
+            )
+            # The same with no release before it, and with no newline at the end.
+            (root / "src" / "release_notes" / "0.2.29.md").write_text("fix: A.\nrefactor: Moved (#2062).")
+            self.assertEqual(
+                release.release_notes(root, "0.2.29", []),
+                "fix: A.\n\nrefactor: Internal groundwork (#2062): 1 change. Nothing changes in use.\n",
+            )
+
+    def test_refactor_lines_across_versions_are_summed_up_in_one_line(self):
+        """Every version's section loses its refactor lines, and the one line
+        at the end names each issue once, in number order, not text order."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.notes_dir(
+                tmp,
+                **{
+                    "0_2_28": "refactor: Old (#1).\nfix: Old.\n",
+                    "0_2_29": "refactor: Moved (#2070).\nfix: A.\n- Refactor: Renamed (#2062, #2070).\n",
+                    "0_2_30": "feature: B.\n* REFACTOR: Split (#985).\n",
+                },
+            )
+            self.assertEqual(
+                release.release_notes(root, "0.2.30", ["v0.2.28"]),
+                "## 0.2.30\n\nfeature: B.\n\n## 0.2.29\n\nfix: A.\n\n"
+                "refactor: Internal groundwork (#985, #2062, #2070): 3 changes. Nothing changes in use.\n",
+            )
+
+    def test_refactor_lines_that_name_no_issue_are_counted_without_a_list(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.notes_dir(
+                tmp,
+                **{
+                    "0_2_28": "fix: Old.\n",
+                    "0_2_29": "fix: A.\nrefactor: Moved the tree.\n",
+                    "0_2_30": "refactor: Renamed a type.\nfeature: B.\n",
+                },
+            )
+            self.assertEqual(
+                release.release_notes(root, "0.2.30", ["v0.2.28"]),
+                "## 0.2.30\n\nfeature: B.\n\n## 0.2.29\n\nfix: A.\n\n"
+                "refactor: Internal groundwork: 2 changes. Nothing changes in use.\n",
+            )
+
+    def test_without_refactor_lines_the_body_is_byte_for_byte_as_before(self):
+        """Near misses, stray whitespace and a missing final newline: with no
+        refactor line the single-version body is the file as it is, and the
+        sections are joined exactly as they were."""
+        own = "# 0.2.29\nfix: A.  \nrefactoring: B.\n\trefactor : C.\n   \n- feature: D."
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.notes_dir(tmp, **{"0_2_28": "fix: Old.\n", "0_2_29": own})
+            self.assertEqual(release.release_notes(root, "0.2.29", ["v0.2.28"]), own)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.notes_dir(tmp, **{"0_2_27": "fix: Old.\n", "0_2_28": "fix: E.\n\n", "0_2_29": own})
+            self.assertEqual(
+                release.release_notes(root, "0.2.29", ["v0.2.27"]),
+                f"## 0.2.29\n\n{own}\n\n## 0.2.28\n\nfix: E.\n\n",
+            )
 
     def test_the_cli_reads_released_tags_on_stdin(self):
         with tempfile.TemporaryDirectory() as tmp:
