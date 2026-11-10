@@ -360,9 +360,7 @@ fn editor_menu_1117(select: bool) -> (tempfile::TempDir, App) {
         app.editor.cursor_col = 8;
         app.editor.extend_selection_to_cursor();
     }
-    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
-    term.draw(|frame| app.render(frame)).unwrap();
-    let buf = term.backend().buffer().clone();
+    let buf = draw_buffer(&mut app, 100, 30);
     let (x, y) = (0..buf.area.height)
         .find_map(|y| {
             let row: String = (0..buf.area.width).map(|x| buf[(x, y)].symbol()).collect();

@@ -1478,20 +1478,6 @@ fn a_submit_in_flight_keeps_new_comments_and_refuses_a_second_submit() {
     assert_eq!(left, vec![String::from("written meanwhile")]);
 }
 
-fn pr_screen(app: &mut App) -> String {
-    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(150, 32)).unwrap();
-    term.draw(|f| app.render(f)).unwrap();
-    let buf = term.backend().buffer();
-    let mut s = String::new();
-    for y in 0..buf.area.height {
-        for x in 0..buf.area.width {
-            s.push_str(buf[(x, y)].symbol());
-        }
-        s.push('\n');
-    }
-    s
-}
-
 #[test]
 fn a_pr_review_tab_lists_files_checks_and_a_summary() {
     // The cache-dir override is process-global; serialize with the
@@ -1505,7 +1491,7 @@ fn a_pr_review_tab_lists_files_checks_and_a_summary() {
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
         app.open_pr_review(crate::widgets::pr_review::tests::sample(), "o/r#579".into());
         assert!(app.editor.pr_review.is_some(), "the PR tab is active");
-        let screen = pr_screen(&mut app);
+        let screen = draw_screen(&mut app, 150, 32);
         for want in [
             "PR #579",
             "feat(sarif): model",
@@ -1532,7 +1518,7 @@ fn space_marks_a_file_viewed_and_it_persists() {
         app.handle_pr_review_key(key(KeyCode::Char(' '), KeyModifiers::NONE));
         let view = app.editor.pr_review.as_ref().unwrap();
         assert!(view.viewed.contains("src/sarif/view.rs"));
-        assert!(pr_screen(&mut app).contains("1 of 2 viewed"));
+        assert!(draw_screen(&mut app, 150, 32).contains("1 of 2 viewed"));
         // A new session sees the mark.
         let mut again = App::new(tmp.path().to_path_buf()).unwrap();
         again.open_pr_review(crate::widgets::pr_review::tests::sample(), "o/r#579".into());
@@ -1741,7 +1727,7 @@ fn pr_viewed_state_syncs_with_github() {
             vec!["a.rs"],
             "both pages applied, GitHub wins"
         );
-        assert!(pr_screen(&mut app).contains("1 of 3 viewed"));
+        assert!(draw_screen(&mut app, 150, 32).contains("1 of 3 viewed"));
         let stored = crate::pr_review::ViewedStore::load(&store_path).viewed("x/y#42");
         assert_eq!(
             stored.iter().map(String::as_str).collect::<Vec<_>>(),

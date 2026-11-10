@@ -1547,7 +1547,7 @@ fn save_all_and_stash_stashes_the_text_in_the_tab() {
         "",
         "nothing stashed yet"
     );
-    let rendered = screen_text_863(&mut app, 120, 40);
+    let rendered = draw_screen(&mut app, 120, 40);
     assert!(rendered.contains("Save All & Stash"), "{rendered}");
     app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE))
         .unwrap();
@@ -4672,7 +4672,7 @@ fn clicking_save_all_on_the_open_editors_header_saves_every_dirty_tab() {
     app.open_editors.collapsed = false;
     app.sidebar_view = SidebarView::Explorer;
     app.show_tree = true;
-    let buf = render_buffer_852(&mut app, 120, 40);
+    let buf = draw_buffer(&mut app, 120, 40);
     let hdr = app.open_editors.last_area;
     assert!(hdr.height > 0, "OPEN EDITORS is on screen");
     let save_all_x = (hdr.x..hdr.x + hdr.width)

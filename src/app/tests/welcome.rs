@@ -1585,7 +1585,7 @@ fn the_tour_keys_show_at_every_step_at_80_columns() {
             app.command_palette = None;
             app.file_finder = None;
             app.context_menu = None;
-            let screen = screen_text_863(&mut app, 80, 24);
+            let screen = draw_screen(&mut app, 80, 24);
             assert!(
                 screen.contains("Enter next \u{b7} Esc leave"),
                 "step {}: the keys are cut:\n{screen}",
@@ -1610,7 +1610,7 @@ fn the_tour_names_this_platform_s_modifier_on_screen() {
         app.start_demo();
         app.advance_tour();
         app.file_finder = None;
-        let screen = screen_text_863(&mut app, 200, 50);
+        let screen = draw_screen(&mut app, 200, 50);
         let (want, not) = if cfg!(target_os = "macos") {
             ("Cmd+P finds", "Ctrl+P finds")
         } else {
@@ -1638,7 +1638,7 @@ fn the_tour_caption_panel_stays_out_of_a_frame_too_small_for_it() {
         assert!(app.tour_caption_panel(Rect::new(0, 0, 19, 24)).is_none());
         assert!(app.tour_caption_panel(Rect::new(0, 0, 80, 3)).is_none());
         for (w, h) in [(20, 4), (19, 24), (80, 3), (12, 2)] {
-            let _ = screen_text_863(&mut app, w, h);
+            let _ = draw_screen(&mut app, w, h);
         }
         app.finish_tour();
         assert!(app.tour_caption_panel(Rect::new(0, 0, 80, 24)).is_none());

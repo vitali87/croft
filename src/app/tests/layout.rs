@@ -2217,13 +2217,6 @@ fn zen_mode_hides_all_chrome_then_restores_the_snapshot() {
     assert!(app.status_bar_visible);
 }
 
-/// A 200-column frame with `app` drawn into it, and its text (#1585).
-fn draw_wide(app: &mut App, w: u16) -> String {
-    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, 30)).unwrap();
-    term.draw(|f| app.render(f)).unwrap();
-    screen_text(&term)
-}
-
 /// The editor as last drawn, `(x, width)` (#1585): its text and the
 /// minimap strip carved from its right edge. Centered Layout centres the
 /// two together, as VS Code centres an editor with its minimap.
@@ -2244,7 +2237,7 @@ fn editor_column(app: &App) -> (u16, u16) {
 fn zen_mode_centres_the_editor_in_a_wide_window() {
     let (_tmp, mut app) = zen_app();
     app.toggle_zen_mode();
-    draw_wide(&mut app, 200);
+    draw_screen(&mut app, 200, 30);
     assert!(app.minimap_visible && app.minimap_room, "the minimap shows");
     assert_eq!(
         editor_column(&app),
@@ -2253,12 +2246,12 @@ fn zen_mode_centres_the_editor_in_a_wide_window() {
         app.editor.last_full_area
     );
     app.toggle_minimap();
-    draw_wide(&mut app, 200);
+    draw_screen(&mut app, 200, 30);
     let area = app.editor.last_full_area;
     assert_eq!((area.x, area.width), (40, 120), "{area:?}");
     app.toggle_minimap();
     app.toggle_zen_mode();
-    draw_wide(&mut app, 200);
+    draw_screen(&mut app, 200, 30);
     assert!(
         editor_column(&app).1 > 120,
         "out of Zen the editor fills its column again: {:?}",
@@ -2277,7 +2270,7 @@ fn toggle_centered_layout_centres_outside_zen_and_uncentres_zen() {
     app.run_command(crate::widgets::command_palette::Command::ToggleCenteredLayout);
     assert!(app.centered_layout);
     assert_eq!(app.status, "Centered Layout on");
-    draw_wide(&mut app, 200);
+    draw_screen(&mut app, 200, 30);
     assert_eq!(editor_column(&app), (40, 120));
     app.run_command(crate::widgets::command_palette::Command::ToggleCenteredLayout);
     assert!(!app.centered_layout);
@@ -2286,7 +2279,7 @@ fn toggle_centered_layout_centres_outside_zen_and_uncentres_zen() {
     assert!(app.centered_layout_active(), "Zen starts centred");
     app.run_command(crate::widgets::command_palette::Command::ToggleCenteredLayout);
     assert!(!app.centered_layout_active() && !app.centered_layout);
-    draw_wide(&mut app, 200);
+    draw_screen(&mut app, 200, 30);
     assert_eq!(editor_column(&app), (0, 200));
     let rows = app.customize_layout_items();
     assert!(
@@ -2301,12 +2294,12 @@ fn toggle_centered_layout_centres_outside_zen_and_uncentres_zen() {
 fn a_narrow_window_or_zen_without_centring_keeps_the_full_width() {
     let (_tmp, mut app) = zen_app();
     app.toggle_zen_mode();
-    draw_wide(&mut app, 110);
+    draw_screen(&mut app, 110, 30);
     assert_eq!(editor_column(&app), (0, 110));
     app.toggle_zen_mode();
     app.zen_center_layout = false;
     app.toggle_zen_mode();
-    draw_wide(&mut app, 200);
+    draw_screen(&mut app, 200, 30);
     assert_eq!(editor_column(&app), (0, 200));
     assert_eq!(
         centered_editor_rect(Rect::new(5, 1, 50, 9), 0),
@@ -2345,12 +2338,12 @@ fn esc_esc_leaves_zen_mode_and_restores_the_chrome() {
 #[test]
 fn entering_zen_says_how_to_leave_it_for_a_while() {
     let (_tmp, mut app) = zen_app();
-    assert!(!draw_wide(&mut app, 120).contains("Esc Esc to exit"));
+    assert!(!draw_screen(&mut app, 120, 30).contains("Esc Esc to exit"));
     app.toggle_zen_mode();
-    assert!(draw_wide(&mut app, 120).contains(zen_hint_text()));
+    assert!(draw_screen(&mut app, 120, 30).contains(zen_hint_text()));
     assert!(!app.expire_zen_hint(std::time::Instant::now()), "not yet");
     assert!(app.expire_zen_hint(std::time::Instant::now() + ZEN_HINT_FOR));
-    assert!(!draw_wide(&mut app, 120).contains("Esc Esc to exit"));
+    assert!(!draw_screen(&mut app, 120, 30).contains("Esc Esc to exit"));
     app.toggle_zen_mode();
     app.toggle_zen_mode();
     app.toggle_zen_mode();

@@ -177,9 +177,7 @@ fn app_with_open_file_and_editor_cell() -> (App, tempfile::TempDir, u16, u16) {
     std::fs::write(&f, "value = compute()\n").unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.editor.open(&f).unwrap();
-    let backend = ratatui::backend::TestBackend::new(100, 30);
-    let mut term = ratatui::Terminal::new(backend).unwrap();
-    term.draw(|frame| app.render(frame)).unwrap();
+    draw(&mut app, 100, 30);
     let col = app.editor.last_inner.x + app.editor.last_gutter_width as u16 + 3;
     let row = app.editor.last_inner.y + 1;
     assert!(
@@ -265,9 +263,7 @@ fn tree_app_with_keymap(json: &str) -> (App, tempfile::TempDir) {
     // one there is no editor to hit and the gesture falls through.
     app.editor.open_pinned(&f).unwrap();
     app.keymap = crate::keymap::Keymap::from_json(json);
-    let backend = ratatui::backend::TestBackend::new(100, 30);
-    let mut term = ratatui::Terminal::new(backend).unwrap();
-    term.draw(|frame| app.render(frame)).unwrap();
+    draw(&mut app, 100, 30);
     (app, tmp)
 }
 
@@ -282,9 +278,7 @@ fn three_tab_app(json: &str) -> (App, tempfile::TempDir) {
         app.editor.open_pinned(&f).unwrap();
     }
     app.keymap = crate::keymap::Keymap::from_json(json);
-    let backend = ratatui::backend::TestBackend::new(100, 30);
-    let mut term = ratatui::Terminal::new(backend).unwrap();
-    term.draw(|frame| app.render(frame)).unwrap();
+    draw(&mut app, 100, 30);
     (app, tmp)
 }
 
@@ -322,9 +316,7 @@ fn app_with_painted_file(text: &str) -> (App, tempfile::TempDir, std::path::Path
     std::fs::write(&f, text).unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.editor.open_pinned(&f).unwrap();
-    let backend = ratatui::backend::TestBackend::new(100, 30);
-    let mut term = ratatui::Terminal::new(backend).unwrap();
-    term.draw(|frame| app.render(frame)).unwrap();
+    draw(&mut app, 100, 30);
     (app, tmp, f)
 }
 
@@ -1017,8 +1009,8 @@ fn left_click(app: &mut App, column: u16, row: u16) {
 }
 
 // The screen helpers. Every `draw*` one renders a fresh frame of the size
-// its caller names; `screen_text`, `status_row` and `find_painted` only
-// read a terminal the test already drew.
+// its caller names; `screen_text`, `screen_char_rows`, `status_row` and
+// `find_painted` only read a terminal the test already drew.
 
 /// Draws `app` into a fresh `w` x `h` terminal and returns it, for a test
 /// that reads the frame or draws into it again.
@@ -1701,20 +1693,6 @@ fn app_with_symbol_tab_on_b(tmp: &tempfile::TempDir) -> (App, std::path::PathBuf
     (app, file)
 }
 
-fn painted(app: &mut App) -> String {
-    let backend = ratatui::backend::TestBackend::new(100, 30);
-    let mut term = ratatui::Terminal::new(backend).unwrap();
-    term.draw(|f| app.render(f)).unwrap();
-    let mut all = String::new();
-    for y in 0..30 {
-        for x in 0..100 {
-            all.push_str(term.backend().buffer()[(x, y)].symbol());
-        }
-        all.push('\n');
-    }
-    all
-}
-
 fn greet_to_welcome(
     file: &std::path::Path,
 ) -> Vec<(PathBuf, Vec<crate::widgets::editor::TextSpanEdit>)> {
@@ -2288,6 +2266,9 @@ fn sarif_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
     (tmp, log)
 }
 
+/// Every cell of a frame the test already drew, row after row, each row
+/// ending in a newline. A cell adds its whole symbol, so a wide or empty
+/// cell shifts the columns after it; [`screen_char_rows`] keeps them.
 fn screen_text(term: &ratatui::Terminal<ratatui::backend::TestBackend>) -> String {
     let buf = term.backend().buffer();
     let mut all = String::new();
@@ -2298,6 +2279,19 @@ fn screen_text(term: &ratatui::Terminal<ratatui::backend::TestBackend>) -> Strin
         all.push('\n');
     }
     all
+}
+
+/// The rows of a frame the test already drew, one char per cell (the first
+/// of its symbol, a space for an empty one), so a char index is a column.
+fn screen_char_rows(term: &ratatui::Terminal<ratatui::backend::TestBackend>) -> Vec<String> {
+    let buf = term.backend().buffer();
+    (0..buf.area.height)
+        .map(|y| {
+            (0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
+                .collect()
+        })
+        .collect()
 }
 
 /// A stand-in `codeql`: logs its arguments, writes `body` to the path its
@@ -2460,6 +2454,7 @@ fn codeql_run_on(tmp: &std::path::Path, db: &std::path::Path) -> PathBuf {
 
 const WEB_PY_1369: &str = "import sqlite3\n\ndef q(cur, name):\n    cur.execute(name)\n";
 
+/// The bottom row of a frame the test already drew: the status bar.
 fn status_row(term: &ratatui::Terminal<ratatui::backend::TestBackend>) -> String {
     let buf = term.backend().buffer();
     let y = buf.area.height - 1;
@@ -2520,21 +2515,6 @@ fn assert_one_line_858(app: &App) {
     }
 }
 
-/// Every cell of a drawn frame, row after row.
-fn screen_text_863(app: &mut App, w: u16, h: u16) -> String {
-    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
-    term.draw(|f| app.render(f)).unwrap();
-    let buf = term.backend().buffer();
-    let mut screen = String::new();
-    for y in 0..buf.area.height {
-        for x in 0..buf.area.width {
-            screen.push_str(buf[(x, y)].symbol());
-        }
-        screen.push('\n');
-    }
-    screen
-}
-
 /// #1203: open `notes/plan.md`, type a line, then take its folder away the
 /// way `git checkout` of a branch without it does.
 fn app_with_plan_whose_folder_was_removed(tmp: &std::path::Path) -> App {
@@ -2585,14 +2565,6 @@ fn open_palette_852(app: &mut App) {
         app.command_palette.is_some(),
         "Cmd+Shift+P opens the palette"
     );
-}
-
-/// Renders `app` at `w`x`h` and returns the frame's buffer.
-fn render_buffer_852(app: &mut App, w: u16, h: u16) -> ratatui::buffer::Buffer {
-    let backend = ratatui::backend::TestBackend::new(w, h);
-    let mut term = ratatui::Terminal::new(backend).unwrap();
-    term.draw(|f| app.render(f)).unwrap();
-    term.backend().buffer().clone()
 }
 
 // #852 (comment 3): the editor-tab actions (the tab menu's Close Others,
