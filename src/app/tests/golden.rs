@@ -984,8 +984,11 @@ fn every_golden_belongs_to_a_scene() {
         );
         return;
     };
+    // Goldens another test module saves here: the key ledger's.
+    const SAVED_ELSEWHERE: [&str; 1] = ["key-ledger"];
     let owned: Vec<String> = owned_goldens()
-        .iter()
+        .into_iter()
+        .chain(SAVED_ELSEWHERE.map(String::from))
         .map(|name| format!("{name}.txt"))
         .collect();
     let mut orphans: Vec<String> = entries
