@@ -21,18 +21,6 @@ fn a_finished_codeql_test_run_replaces_its_running_status_with_the_outcome() {
     );
 }
 
-fn screen_lower(term: &ratatui::Terminal<ratatui::backend::TestBackend>) -> String {
-    let buf = term.backend().buffer();
-    let mut all = String::new();
-    for y in 0..buf.area.height {
-        for x in 0..buf.area.width {
-            all.push_str(buf[(x, y)].symbol());
-        }
-        all.push('\n');
-    }
-    all.to_lowercase()
-}
-
 #[test]
 fn codeql_icon_sits_below_testing_and_opens_the_codeql_side_bar() {
     // #578: VS Code's CodeQL extension adds a QL entry to the activity bar;
@@ -54,7 +42,7 @@ fn codeql_icon_sits_below_testing_and_opens_the_codeql_side_bar() {
         left_click(&mut app, ql.x, ql.y);
         assert_eq!(app.sidebar_view, SidebarView::CodeQL);
         term.draw(|f| app.render(f)).unwrap();
-        let screen = screen_lower(&term);
+        let screen = screen_text(&term).to_lowercase();
         // The title sits on the side bar's top row, between the box's
         // dashes or, under a `surfaces` theme, on the focus rule.
         let side = app.last_sidebar_area.expect("the side bar is shown");
@@ -163,8 +151,11 @@ fn codeql_database_card_picker_switches_the_current_database() {
         }
         assert_eq!(app.codeql.current_db, Some(1));
         app.run_command(crate::widgets::command_palette::Command::CodeqlFocusSideBar);
-        assert!(find_on_screen(&mut app, "◆ gin-db").is_some(), "the card");
-        let (x, y) = find_on_screen(&mut app, "◆ gin-db").unwrap();
+        assert!(
+            draw_and_find(&mut app, 120, 44, "◆ gin-db").is_some(),
+            "the card"
+        );
+        let (x, y) = draw_and_find(&mut app, 120, 44, "◆ gin-db").unwrap();
         left_click(&mut app, x + 3, y);
         assert_eq!(
             app.codeql.selected_hit(),
@@ -189,9 +180,9 @@ fn codeql_database_card_picker_switches_the_current_database() {
             Some(0),
             "saved"
         );
-        assert!(find_on_screen(&mut app, "◆ flask-db").is_some());
+        assert!(draw_and_find(&mut app, 120, 44, "◆ flask-db").is_some());
         assert!(
-            find_on_screen(&mut app, "Python · ").is_some(),
+            draw_and_find(&mut app, 120, 44, "Python · ").is_some(),
             "the meta row names the language, then the size"
         );
         // Enter on the name row opens it too.
@@ -271,7 +262,7 @@ fn codeql_history_export_chip_reaches_the_export_prompt() {
         assert!(app.codeql.is_expanded(1));
         assert!(app.input_prompt.is_none() && app.list_picker.is_none());
         app.codeql.select_history(0);
-        let (x, y) = find_on_screen(&mut app, "↓ Export").expect("the chip");
+        let (x, y) = draw_and_find(&mut app, 120, 44, "↓ Export").expect("the chip");
         left_click(&mut app, x, y);
         let prompt = app.input_prompt.as_ref().expect("the export prompt");
         assert_eq!(

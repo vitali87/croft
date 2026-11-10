@@ -633,9 +633,7 @@ fn a_vscode_exclude_of_build_keeps_scripts_build_in_the_explorer() {
 
 /// Render once and return (title 'T' cell coords, add-button rect).
 fn terminal_header_probe(app: &mut App) -> Rect {
-    let backend = ratatui::backend::TestBackend::new(140, 50);
-    let mut term = ratatui::Terminal::new(backend).unwrap();
-    term.draw(|f| app.render(f)).unwrap();
+    draw(app, 140, 50);
     let area = app.terminal().last_area;
     assert!(
         area.width > 20 && area.height > 2,
@@ -758,7 +756,7 @@ fn black_theme_paints_no_legacy_navy_or_button_blue_in_any_sidebar_view() {
         SidebarView::RunDebug,
     ] {
         app.sidebar_view = view;
-        let buf = render_buf(&mut app);
+        let buf = draw_buffer(&mut app, 140, 50);
         assert_eq!(
             count_bg(&buf, navy),
             0,
@@ -778,12 +776,12 @@ fn black_theme_sidebar_titles_are_chipless_brand_headers() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.apply_theme(crate::theme::Theme::BLACK);
-    let buf = render_buf(&mut app);
+    let buf = draw_buffer(&mut app, 140, 50);
     let tree = app.tree.last_area;
     assert_eq!(buf[(tree.x + 2, tree.y)].symbol(), "E");
     assert_eq!(buf[(tree.x + 2, tree.y)].fg, rgb_color(PANEL_TITLE_FG));
     app.sidebar_view = SidebarView::Remote;
-    let buf = render_buf(&mut app);
+    let buf = draw_buffer(&mut app, 140, 50);
     let remote = app.remote.last_area;
     assert_eq!(buf[(remote.x + 2, remote.y)].symbol(), "R");
     assert_eq!(buf[(remote.x + 2, remote.y)].fg, rgb_color(PANEL_TITLE_FG));
@@ -797,7 +795,7 @@ fn croft_loch_side_bar_title_is_strong_only_while_focused() {
     let t = crate::widgets::surface::tones(crate::theme::Theme::LOCH).unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    let buf = render_buf(&mut app);
+    let buf = draw_buffer(&mut app, 140, 50);
     let tree = app.tree.last_area;
     let e = (tree.x + 2, tree.y);
     assert_eq!(buf[e].symbol(), "E");
@@ -806,7 +804,7 @@ fn croft_loch_side_bar_title_is_strong_only_while_focused() {
     assert_eq!(buf[(tree.x + 10, tree.y)].symbol(), " ", "breathing room");
     assert_eq!(buf[(tree.x + 11, tree.y)].symbol(), "\u{2594}", "the lip");
     app.focus_pane(Pane::Editor);
-    let buf = render_buf(&mut app);
+    let buf = draw_buffer(&mut app, 140, 50);
     assert_eq!(buf[e].fg, t.muted(), "an unfocused view's title recedes");
 }
 
@@ -823,7 +821,7 @@ fn croft_loch_explorer_sections_are_divided_by_hairlines() {
     if !app.explorer_views.is_visible(ExplorerView::Outline) {
         app.toggle_explorer_view(ExplorerView::Outline);
     }
-    let buf = render_buf(&mut app);
+    let buf = draw_buffer(&mut app, 140, 50);
     let tree = app.tree.last_area;
     let outline = app.outline.last_area;
     assert_eq!(outline.y, tree.bottom(), "the outline follows the tree");
@@ -993,7 +991,7 @@ fn black_theme_remote_header_buttons_are_near_white_icons() {
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.apply_theme(crate::theme::Theme::BLACK);
     app.sidebar_view = SidebarView::Remote;
-    let buf = render_buf(&mut app);
+    let buf = draw_buffer(&mut app, 140, 50);
     let add = app.remote.header_add_btn;
     assert!(add.width > 0, "remote header add button must render");
     // The snug pill paints the glyph at the rect origin (the highlight wraps
@@ -1011,7 +1009,7 @@ fn croft_loch_side_bar_header_buttons_rest_muted() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.sidebar_view = SidebarView::Remote;
-    let buf = render_buf(&mut app);
+    let buf = draw_buffer(&mut app, 140, 50);
     let add = app.remote.header_add_btn;
     assert!(add.width > 0, "remote header add button must render");
     assert_eq!(buf[(add.x, add.y)].fg, t.muted());
@@ -1027,7 +1025,7 @@ fn black_theme_active_editor_tab_wears_the_teal_selection_fill() {
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.apply_theme(crate::theme::Theme::BLACK);
     app.editor.open_pinned(&f).unwrap();
-    let buf = render_buf(&mut app);
+    let buf = draw_buffer(&mut app, 140, 50);
     assert!(
         count_bg(&buf, rgb_color(POPUP_SEL_BG)) > 0,
         "active tab must wear the muted teal fill under the Black theme"
@@ -1040,7 +1038,7 @@ fn black_theme_action_buttons_wear_the_brand_teal_fill() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.sidebar_view = SidebarView::SourceControl;
-    let buf = render_buf(&mut app);
+    let buf = draw_buffer(&mut app, 140, 50);
     let init = app.source_control.last_init_repo_button_area;
     assert!(
         init.width > 0,
@@ -1051,7 +1049,7 @@ fn black_theme_action_buttons_wear_the_brand_teal_fill() {
         rgb_color(PRIMARY_BTN_BG)
     );
     app.sidebar_view = SidebarView::RunDebug;
-    let buf = render_buf(&mut app);
+    let buf = draw_buffer(&mut app, 140, 50);
     let run = app.run_debug.last_button_area;
     assert!(run.width > 0, "Run and Debug button must render");
     assert_eq!(
@@ -1069,7 +1067,7 @@ fn dark_blue_theme_keeps_the_legacy_blue_chrome() {
     app.theme = crate::theme::Theme::DARK_BLUE;
     app.sync_focus_flags();
     app.editor.open_pinned(&f).unwrap();
-    let buf = render_buf(&mut app);
+    let buf = draw_buffer(&mut app, 140, 50);
     let navy = Color::Rgb(0x1e, 0x3a, 0x6e);
     let tree = app.tree.last_area;
     assert_eq!(
@@ -1079,7 +1077,7 @@ fn dark_blue_theme_keeps_the_legacy_blue_chrome() {
     );
     assert!(count_bg(&buf, navy) > 0, "active tab stays navy");
     app.sidebar_view = SidebarView::RunDebug;
-    let buf = render_buf(&mut app);
+    let buf = draw_buffer(&mut app, 140, 50);
     let run = app.run_debug.last_button_area;
     assert_eq!(
         buf[(run.x + run.width / 2, run.y + run.height / 2)].bg,
@@ -2035,7 +2033,7 @@ fn the_settings_editor_marks_changed_rows_and_shows_del_reset() {
     .unwrap();
     let mut app = settings_editor_app(cfg.path(), tmp.path());
     type_keys(&mut app, "auto save");
-    let buf = render_buf(&mut app);
+    let buf = draw_buffer(&mut app, 140, 50);
     let lines: Vec<String> = (0..buf.area.height)
         .map(|y| {
             (0..buf.area.width)
@@ -2202,7 +2200,7 @@ fn the_settings_editor_header_names_the_active_profile() {
     let cfg = tempfile::tempdir().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let mut app = settings_editor_app_in_profile(cfg.path(), tmp.path());
-    let text = screen_text_863(&mut app, 140, 40);
+    let text = draw_screen(&mut app, 140, 40);
     assert!(text.contains("profile work"), "{text}");
 }
 
@@ -2240,7 +2238,7 @@ fn without_a_profile_the_settings_editor_keeps_the_default_config() {
         "{ \"auto_save\": true }",
         "the profile's file is untouched"
     );
-    let text = screen_text_863(&mut app, 140, 40);
+    let text = draw_screen(&mut app, 140, 40);
     assert!(text.contains("Writing to user (config.json)"), "{text}");
 }
 

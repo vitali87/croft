@@ -57,7 +57,7 @@ fn a_remote_handoff_asks_about_edits_made_during_the_install() {
         app.poll_install_session();
         assert!(!app.quit, "the unsaved a.txt must not go with the handoff");
         assert!(app.pending_unsaved.is_some(), "it asks");
-        let screen = draw_screen(&mut app);
+        let screen = draw_screen(&mut app, 160, 40);
         assert!(screen.contains("ave all and connect"), "{screen}");
         app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE))
             .unwrap();
