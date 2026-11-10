@@ -669,15 +669,8 @@ fn app_with_change_bars() -> (App, tempfile::TempDir) {
     let f = root.join("v.txt");
     let body: String = (1..=20).map(|i| format!("value_{i}\n")).collect();
     std::fs::write(&f, &body).unwrap();
-    for args in [&["add", "v.txt"][..], &["commit", "-q", "-m", "values"]] {
-        let st = std::process::Command::new("git")
-            .arg("-C")
-            .arg(root)
-            .args(args)
-            .status()
-            .unwrap();
-        assert!(st.success());
-    }
+    git_ok(root, &["add", "v.txt"]);
+    git_ok(root, &["commit", "-q", "-m", "values"]);
     let edited: String = (1..=20)
         .filter(|&i| i != 9)
         .map(|i| {
@@ -1506,19 +1499,8 @@ fn app_with_baked_terminal_image(
 /// A repo with a real merge conflict in `shared.txt` (two blocks) produced
 /// by an actual `git merge`, plus a clean second file.
 fn conflicted_repo(tmp: &std::path::Path) {
-    let git = |args: &[&str]| {
-        std::process::Command::new("git")
-            .arg("-C")
-            .arg(tmp)
-            .args(args)
-            .env("GIT_AUTHOR_NAME", "t")
-            .env("GIT_AUTHOR_EMAIL", "t@t")
-            .env("GIT_COMMITTER_NAME", "t")
-            .env("GIT_COMMITTER_EMAIL", "t@t")
-            .output()
-            .unwrap()
-    };
-    git(&["init", "-q", "-b", "main"]);
+    let git = |args: &[&str]| git_succeeds(tmp, args);
+    git_init(tmp);
     std::fs::write(
         tmp.join("shared.txt"),
         "alpha\nbase-one\nm1\nm2\nm3\nm4\nm5\nbase-two\nomega\n",
@@ -1541,9 +1523,8 @@ fn conflicted_repo(tmp: &std::path::Path) {
     )
     .unwrap();
     git(&["commit", "-aqm", "main edit"]);
-    let merge = git(&["merge", "feature"]);
     assert!(
-        !merge.status.success(),
+        !git(&["merge", "feature"]),
         "the merge must conflict for these tests"
     );
 }
@@ -1795,19 +1776,7 @@ fn no_paths() -> std::collections::BTreeSet<std::path::PathBuf> {
 fn repo_with_seed(text: &str) -> (tempfile::TempDir, std::path::PathBuf) {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
-    for args in [
-        vec!["init", "-q", "-b", "main"],
-        vec!["config", "user.email", "a@b"],
-        vec!["config", "user.name", "a"],
-    ] {
-        let st = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&root)
-            .args(&args)
-            .status()
-            .unwrap();
-        assert!(st.success(), "git {args:?}");
-    }
+    git_init_with_identity(&root);
     let f = root.join("seed.txt");
     std::fs::write(&f, text).unwrap();
     git_ok(&root, &["add", "."]);
@@ -1845,21 +1814,10 @@ fn rewrite_later(path: &std::path::Path, text: &str) {
 /// tempdir to keep the lane inside it too.
 fn init_lane_repo(dir: &std::path::Path) {
     std::fs::create_dir_all(dir).unwrap();
-    let git = |args: &[&str]| {
-        let st = std::process::Command::new("git")
-            .arg("-C")
-            .arg(dir)
-            .args(args)
-            .status()
-            .unwrap();
-        assert!(st.success(), "git {args:?}");
-    };
-    git(&["init", "-q", "-b", "main"]);
-    git(&["config", "user.email", "a@b"]);
-    git(&["config", "user.name", "a"]);
+    git_init_with_identity(dir);
     std::fs::write(dir.join("seed.txt"), "one\n").unwrap();
-    git(&["add", "."]);
-    git(&["commit", "-q", "-m", "init"]);
+    git_ok(dir, &["add", "."]);
+    git_ok(dir, &["commit", "-q", "-m", "init"]);
 }
 
 /// Queue an agent's `Edit` of `file` (`old` -> `new`) through the hook
@@ -2077,20 +2035,8 @@ fn lens_at(line: usize, text: &str, title: &str, command: &str) -> crate::code_l
 /// v1+v2+v3.
 fn scrub_repo() -> tempfile::TempDir {
     let tmp = tempfile::tempdir().unwrap();
-    let git = |args: &[&str]| {
-        let ok = std::process::Command::new("git")
-            .arg("-C")
-            .arg(tmp.path())
-            .args(args)
-            .output()
-            .unwrap()
-            .status
-            .success();
-        assert!(ok, "git {args:?}");
-    };
-    git(&["init", "-q", "-b", "main"]);
-    git(&["config", "user.email", "a@b"]);
-    git(&["config", "user.name", "a"]);
+    let git = |args: &[&str]| git_ok(tmp.path(), args);
+    git_init_with_identity(tmp.path());
     let mut text = String::new();
     for v in ["v1", "v2", "v3"] {
         text.push_str(v);
@@ -2946,17 +2892,8 @@ fn app_with_a_saved_edit() -> (tempfile::TempDir, std::path::PathBuf, App) {
 fn app_on_a_pushed_github_file() -> (App, tempfile::TempDir, String) {
     let tmp = tempfile::tempdir().unwrap();
     let p = tmp.path();
-    let git = |args: &[&str]| {
-        let out = std::process::Command::new("git")
-            .arg("-C")
-            .arg(p)
-            .args(args)
-            .output()
-            .unwrap();
-        assert!(out.status.success(), "git {args:?}");
-        String::from_utf8_lossy(&out.stdout).trim().to_string()
-    };
-    git(&["init", "-q", "-b", "main"]);
+    let git = |args: &[&str]| git_ok(p, args);
+    git_init(p);
     std::fs::create_dir(p.join("src")).unwrap();
     std::fs::write(
         p.join("src/main.rs"),
@@ -2964,15 +2901,7 @@ fn app_on_a_pushed_github_file() -> (App, tempfile::TempDir, String) {
     )
     .unwrap();
     git(&["add", "."]);
-    git(&[
-        "-c",
-        "user.name=t",
-        "-c",
-        "user.email=t@t",
-        "commit",
-        "-qm",
-        "init",
-    ]);
+    git(&["commit", "-qm", "init"]);
     git(&["remote", "add", "origin", "git@github.com:acme/widgets.git"]);
     git(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
     let sha = git(&["rev-parse", "HEAD"]);
