@@ -3940,25 +3940,32 @@ fn the_view_socket_is_bound_before_the_first_pane_is_spawned() {
     // avoid for the cache dir. The repo already checks source-level properties
     // this way (`scripts/check_doc_ownership.py`). It is brittle to a rename,
     // and it fails loudly and says why, which is the trade being made.
-    let src = include_str!("../mod.rs");
-    let ctor = src
-        .find("pub fn new(root: PathBuf)")
+    let files = app_source_files();
+    let src = files
+        .iter()
+        .map(|(_, text)| text.as_str())
+        .find(|text| text.contains("pub fn new(root: PathBuf)"))
         .expect("App::new must exist for this guard to mean anything");
-    // Bounded to App::new's own body. Slicing to the end of the file let two
-    // plausible edits satisfy the guard while inverting the runtime order:
-    // extracting the pane spawn into a helper defined BELOW App::new (the
-    // marker's offset then jumps past the bind's), or a doc comment naming
-    // `Self::bind_view_socket()` somewhere above a later spawn.
+    let ctor = src.find("pub fn new(root: PathBuf)").unwrap();
+    // Bounded to App::new's own body, which ends at the method's closing
+    // brace. Slicing to the end of the file let two plausible edits satisfy
+    // the guard while inverting the runtime order: extracting the pane spawn
+    // into a helper defined BELOW App::new (the marker's offset then jumps
+    // past the bind's), or a doc comment naming `Self::bind_view_socket()`
+    // somewhere above a later spawn.
     let end = src[ctor..]
-        .find("\n    pub fn ")
+        .find("\n    }\n")
         .map(|i| ctor + i)
-        .unwrap_or(src.len());
+        .expect("App::new's body must end in its closing brace");
     let body = &src[ctor..end];
-    // And each marker must be unique in the file, so a second occurrence
-    // cannot silently be the one measured.
+    // And each marker must be unique in the app's source, so a second
+    // occurrence cannot silently be the one measured.
     for marker in ["Self::bind_view_socket()", "PtyTerminal::new(&root)"] {
         assert_eq!(
-            src.matches(marker).count(),
+            files
+                .iter()
+                .map(|(_, text)| text.matches(marker).count())
+                .sum::<usize>(),
             1,
             "{marker} must appear exactly once, or this guard measures whichever \
              copy comes first rather than the one that runs"

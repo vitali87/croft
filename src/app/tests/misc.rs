@@ -203,10 +203,10 @@ fn workspace_relative_shortens_paths_inside_the_workspace() {
 
 #[test]
 fn no_stale_tcode_pill_literal_in_source() {
-    let src = include_str!("../mod.rs");
+    let src = app_source();
     assert!(
         !src.contains("\" tcode \""),
-        "stale ` tcode ` pill literal still present in src/app/mod.rs"
+        "stale ` tcode ` pill literal still present in the app's source"
     );
 }
 
@@ -522,7 +522,7 @@ fn an_unknowable_cwd_still_allows_reuse_but_a_wrong_one_does_not() {
 /// catches a SEVENTH writer being added later without one.
 #[test]
 fn every_post_draw_overlay_writer_checks_the_screen_bound() {
-    let src = include_str!("../mod.rs");
+    let src = app_source();
     let guards = src.matches("app.overlay_fits_on_screen(").count();
     assert_eq!(
         guards, 5,
