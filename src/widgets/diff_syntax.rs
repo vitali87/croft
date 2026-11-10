@@ -301,9 +301,15 @@ impl DiffSyntax {
             return;
         };
         let (tx, rx) = std::sync::mpsc::channel();
+        // Under test a thread can carry a code palette of its own (the
+        // screen goldens' themes), which the pass reads on its worker.
+        #[cfg(test)]
+        let palette = crate::highlight::thread_syntax_palette();
         let spawned = std::thread::Builder::new()
             .name(String::from("croft-diff-highlight"))
             .spawn(move || {
+                #[cfg(test)]
+                crate::highlight::set_thread_syntax_palette(palette);
                 let _slot = slot;
                 // Nobody listening (the tab closed, or the view was rebuilt)
                 // is fine: the result is simply dropped.
@@ -426,6 +432,38 @@ mod tests {
             "a keyword and a name read in different colours"
         );
         assert!(syntax.left(5).is_empty(), "past the end there is nothing");
+    }
+
+    /// A pass on a worker colours with the code palette of the thread that
+    /// started it, as the editor's own pass does, so a test thread with a
+    /// theme's palette of its own sees that theme's colours in a diff too.
+    #[test]
+    fn a_pass_on_a_worker_colours_with_the_starting_threads_palette() {
+        let text = lines(&["fn a() {}"]);
+        let keyword = |spans: &[HiSpan]| {
+            spans
+                .iter()
+                .find(|s| s.range() == (0..2))
+                .map(|s| s.style)
+                .expect("`fn` has a span of its own")
+        };
+        let src = b"fn a() {}";
+        let starts = compute_line_starts(src);
+        let shared =
+            keyword(&highlight_text(&mut LangRegistry::new(), LangKind::Rust, src, &starts)[0]);
+        crate::highlight::set_thread_syntax_palette(Some(crate::theme::SyntaxPalette::LOCH));
+        let own =
+            keyword(&highlight_text(&mut LangRegistry::new(), LangKind::Rust, src, &starts)[0]);
+        let mut syntax = DiffSyntax::default();
+        syntax.ensure(&text, &text, || RUST, Some(Duration::from_secs(30)));
+        crate::highlight::set_thread_syntax_palette(None);
+        assert_ne!(own, shared, "the two palettes colour `fn` apart");
+        assert_eq!(
+            keyword(syntax.left(0)),
+            own,
+            "the worker took this thread's palette"
+        );
+        assert_eq!(keyword(syntax.right(0)), own);
     }
 
     #[test]
