@@ -15,8 +15,9 @@ name: tag
 # crates.io.
 #
 # Only the commit that set a version is tagged: the one whose first parent
-# carries another version. Any other push to main (the merge itself, or one
-# that ships nothing) still carries a version an earlier commit set, and its
+# carries another version. Any other push to main (the merge itself, one
+# that ships nothing, or one whose notes are all `refactor:` ones, which
+# makes no version) still carries a version an earlier commit set, and its
 # code is not that version's. publish-crate.yml publishes the commit that set
 # the version, found by the same comparison (`scripts/release.py commit`),
 # and refuses a tag on any other, so a later merge whose run executes before
