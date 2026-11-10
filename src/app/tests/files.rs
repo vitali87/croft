@@ -1528,7 +1528,7 @@ fn save_all_and_commit_commits_the_text_in_the_tab() {
     assert!(app.pending_unsaved_scm.is_none());
     assert!(!app.editor.dirty, "the tab was saved");
     assert_eq!(
-        git_out(tmp.path(), &["show", "HEAD:seed.txt"]),
+        git_stdout_untrimmed(tmp.path(), &["show", "HEAD:seed.txt"]),
         "edited changed\n"
     );
     assert_eq!(last_commit_message(tmp.path()), "bump seed\n\n");
@@ -1543,7 +1543,7 @@ fn save_all_and_stash_stashes_the_text_in_the_tab() {
     let pending = app.pending_unsaved_scm.as_ref().expect("the prompt opens");
     assert_eq!(pending.op, ScmWrite::Stash);
     assert_eq!(
-        git_out(tmp.path(), &["stash", "list"]),
+        git_stdout_untrimmed(tmp.path(), &["stash", "list"]),
         "",
         "nothing stashed yet"
     );
@@ -1556,11 +1556,11 @@ fn save_all_and_stash_stashes_the_text_in_the_tab() {
     // #1581: the stash asks for its name next, seeded with the message box.
     app.submit_input_prompt();
     assert_eq!(
-        git_out(tmp.path(), &["stash", "list", "--format=%gs"]),
+        git_stdout_untrimmed(tmp.path(), &["stash", "list", "--format=%gs"]),
         "On main: bump seed\n"
     );
     assert_eq!(
-        git_out(tmp.path(), &["show", "stash@{0}:seed.txt"]),
+        git_stdout_untrimmed(tmp.path(), &["show", "stash@{0}:seed.txt"]),
         "edited changed\n"
     );
     assert_eq!(

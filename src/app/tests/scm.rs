@@ -317,7 +317,7 @@ fn pressing_s_in_a_scm_diff_stages_only_the_hunk_under_the_caret() {
         .start_selection(crate::widgets::diff::DiffSide::Right, 1, 0);
     app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE))
         .unwrap();
-    let staged = git_stdout_in(tmp.path(), &["diff", "--cached"]);
+    let staged = git_stdout_untrimmed(tmp.path(), &["diff", "--cached"]);
     assert!(
         staged.contains("+LINE2"),
         "hunk 1 must land in the index: {staged}"
@@ -326,7 +326,7 @@ fn pressing_s_in_a_scm_diff_stages_only_the_hunk_under_the_caret() {
         !staged.contains("LINE18"),
         "hunk 2 must stay unstaged: {staged}"
     );
-    let unstaged = git_stdout_in(tmp.path(), &["diff"]);
+    let unstaged = git_stdout_untrimmed(tmp.path(), &["diff"]);
     assert!(
         unstaged.contains("+LINE18"),
         "hunk 2 must remain a working-tree change: {unstaged}"
@@ -340,7 +340,7 @@ fn pressing_s_with_no_caret_stages_the_first_visible_hunk() {
     let (tmp, mut app) = scm_two_hunk_app();
     app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE))
         .unwrap();
-    let staged = git_stdout_in(tmp.path(), &["diff", "--cached"]);
+    let staged = git_stdout_untrimmed(tmp.path(), &["diff", "--cached"]);
     assert!(
         staged.contains("+LINE2") && !staged.contains("LINE18"),
         "the first hunk is the default target: {staged}"
@@ -358,12 +358,12 @@ fn enter_commits_only_the_hunk_staged_with_s() {
     app.source_control.message_cursor = 11;
     app.handle_source_control_key(key(KeyCode::Enter, KeyModifiers::NONE));
     wait_for_git_net(&mut app);
-    let committed = git_stdout_in(tmp.path(), &["show", "HEAD:f.txt"]);
+    let committed = git_stdout_untrimmed(tmp.path(), &["show", "HEAD:f.txt"]);
     assert!(
         committed.contains("LINE2") && !committed.contains("LINE18"),
         "only the staged hunk is committed: {committed}"
     );
-    let unstaged = git_stdout_in(tmp.path(), &["diff"]);
+    let unstaged = git_stdout_untrimmed(tmp.path(), &["diff"]);
     assert!(
         unstaged.contains("+LINE18"),
         "the unstaged hunk stays a working-tree change: {unstaged}"
@@ -388,7 +388,7 @@ fn pressing_u_in_a_scm_diff_unstages_only_the_hunk_under_the_caret() {
         .start_selection(crate::widgets::diff::DiffSide::Right, 1, 0);
     app.handle_key(key(KeyCode::Char('u'), KeyModifiers::NONE))
         .unwrap();
-    let staged = git_stdout_in(tmp.path(), &["diff", "--cached"]);
+    let staged = git_stdout_untrimmed(tmp.path(), &["diff", "--cached"]);
     assert!(
         !staged.contains("LINE2"),
         "hunk 1 must leave the index: {staged}"
@@ -1844,17 +1844,6 @@ fn a_push_runs_off_the_ui_thread_and_reports_when_it_lands() {
     assert_eq!(remote_head, local_head);
 }
 
-/// Run git in `dir` and return its trimmed stdout ("" on failure).
-fn git_stdout(dir: &std::path::Path, args: &[&str]) -> String {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
-        .unwrap();
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
-}
-
 /// #1356: a conflicted merge is reported as one, and Abort Merge from
 /// the Source Control menu puts HEAD and the tree back as they were.
 #[test]
@@ -2876,14 +2865,14 @@ fn cmd_enter_in_source_control_falls_back_to_plain_commit_without_pushing() {
 #[test]
 fn commit_with_an_unsaved_tab_in_the_repo_asks_before_committing() {
     let (tmp, mut app) = scm_with_unsaved_tab();
-    let head = git_out(tmp.path(), &["rev-parse", "HEAD"]);
+    let head = git_stdout_untrimmed(tmp.path(), &["rev-parse", "HEAD"]);
     app.handle_source_control_key(key(KeyCode::Enter, KeyModifiers::NONE));
     wait_for_git_net(&mut app);
     let pending = app.pending_unsaved_scm.as_ref().expect("the prompt opens");
     assert_eq!(pending.op, ScmWrite::Commit);
     assert_eq!(pending.files, vec![tmp.path().join("seed.txt")]);
     assert_eq!(
-        git_out(tmp.path(), &["rev-parse", "HEAD"]),
+        git_stdout_untrimmed(tmp.path(), &["rev-parse", "HEAD"]),
         head,
         "no commit yet"
     );
@@ -2903,7 +2892,10 @@ fn commit_anyway_commits_the_disk_text_and_leaves_the_tab_unsaved() {
         .unwrap();
     wait_for_git_net(&mut app);
     assert!(app.pending_unsaved_scm.is_none());
-    assert_eq!(git_out(tmp.path(), &["show", "HEAD:seed.txt"]), "changed\n");
+    assert_eq!(
+        git_stdout_untrimmed(tmp.path(), &["show", "HEAD:seed.txt"]),
+        "changed\n"
+    );
     assert!(app.editor.dirty, "Commit Anyway saves nothing");
 }
 
@@ -2911,13 +2903,16 @@ fn commit_anyway_commits_the_disk_text_and_leaves_the_tab_unsaved() {
 #[test]
 fn cancelling_the_unsaved_prompt_commits_nothing() {
     let (tmp, mut app) = scm_with_unsaved_tab();
-    let head = git_out(tmp.path(), &["rev-parse", "HEAD"]);
+    let head = git_stdout_untrimmed(tmp.path(), &["rev-parse", "HEAD"]);
     app.handle_source_control_key(key(KeyCode::Enter, KeyModifiers::NONE));
     app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
         .unwrap();
     wait_for_git_net(&mut app);
     assert!(app.pending_unsaved_scm.is_none());
-    assert_eq!(git_out(tmp.path(), &["rev-parse", "HEAD"]), head);
+    assert_eq!(
+        git_stdout_untrimmed(tmp.path(), &["rev-parse", "HEAD"]),
+        head
+    );
     assert!(app.editor.dirty);
     assert_eq!(
         app.source_control.message, "bump seed",
@@ -2941,7 +2936,10 @@ fn an_unsaved_tab_outside_the_repo_does_not_hold_the_commit() {
     app.handle_source_control_key(key(KeyCode::Enter, KeyModifiers::NONE));
     wait_for_git_net(&mut app);
     assert!(app.pending_unsaved_scm.is_none(), "no prompt");
-    assert_eq!(git_out(tmp.path(), &["show", "HEAD:seed.txt"]), "changed\n");
+    assert_eq!(
+        git_stdout_untrimmed(tmp.path(), &["show", "HEAD:seed.txt"]),
+        "changed\n"
+    );
     assert_eq!(last_commit_message(tmp.path()), "bump seed\n\n");
 }
 
@@ -2951,7 +2949,7 @@ fn an_unsaved_tab_outside_the_repo_does_not_hold_the_commit() {
 #[test]
 fn the_unsaved_prompt_does_not_commit_after_source_control_moved_repos() {
     let (tmp, mut app) = scm_with_unsaved_tab();
-    let head = git_out(tmp.path(), &["rev-parse", "HEAD"]);
+    let head = git_stdout_untrimmed(tmp.path(), &["rev-parse", "HEAD"]);
     app.handle_source_control_key(key(KeyCode::Enter, KeyModifiers::NONE));
     let other = tempfile::tempdir().unwrap();
     app.pending_unsaved_scm
@@ -2962,7 +2960,10 @@ fn the_unsaved_prompt_does_not_commit_after_source_control_moved_repos() {
         .unwrap();
     wait_for_git_net(&mut app);
     assert!(app.pending_unsaved_scm.is_none());
-    assert_eq!(git_out(tmp.path(), &["rev-parse", "HEAD"]), head);
+    assert_eq!(
+        git_stdout_untrimmed(tmp.path(), &["rev-parse", "HEAD"]),
+        head
+    );
     assert!(
         app.status.contains("moved to another repository"),
         "{}",
@@ -2985,7 +2986,7 @@ fn an_empty_message_is_refused_before_the_unsaved_prompt() {
 }
 
 fn stash_names(root: &std::path::Path) -> String {
-    git_out(root, &["stash", "list", "--format=%gs"])
+    git_stdout_untrimmed(root, &["stash", "list", "--format=%gs"])
 }
 
 /// #1581: Stash asks what to call the stash, seeded with the commit box's
@@ -4291,7 +4292,7 @@ fn open_commit_for_line_shows_the_lines_commit_diff() {
 #[test]
 fn copy_commit_hash_for_line_copies_the_lines_commit() {
     let (tmp, mut app) = blamed_line_app();
-    let head = git_stdout_in(tmp.path(), &["rev-parse", "HEAD"]);
+    let head = git_stdout_untrimmed(tmp.path(), &["rev-parse", "HEAD"]);
     app.run_command(crate::widgets::command_palette::Command::GitCopyLineCommitHash);
     assert_eq!(crate::clipboard::last_copy().as_deref(), Some(head.trim()));
     assert_eq!(app.status, format!("Copied commit hash {}", &head[..8]));
@@ -5012,7 +5013,10 @@ fn a_hand_resolved_conflict_opens_as_its_own_result_and_completes() {
     assert!(!app.editor.dirty, "nothing in the file was replaced");
     app.complete_merge();
     assert!(app.status.contains("staged shared.txt"), "{}", app.status);
-    assert_eq!(git_out(tmp.path(), &["show", ":shared.txt"]), resolved);
+    assert_eq!(
+        git_stdout_untrimmed(tmp.path(), &["show", ":shared.txt"]),
+        resolved
+    );
 }
 
 /// #906: with one block resolved and a line added beside it, the merge
@@ -5051,8 +5055,14 @@ fn keeping_the_modified_side_of_a_modify_delete_stages_it() {
     let mut app = open_modify_delete(tmp.path(), true);
     app.run_command(crate::widgets::command_palette::Command::MergeAcceptAllCurrent);
     app.complete_merge();
-    assert_eq!(git_out(tmp.path(), &["show", ":gone.txt"]), "x\ny-main\n");
-    assert_eq!(git_out(tmp.path(), &["ls-files", "-u", "gone.txt"]), "");
+    assert_eq!(
+        git_stdout_untrimmed(tmp.path(), &["show", ":gone.txt"]),
+        "x\ny-main\n"
+    );
+    assert_eq!(
+        git_stdout_untrimmed(tmp.path(), &["ls-files", "-u", "gone.txt"]),
+        ""
+    );
     assert!(tmp.path().join("gone.txt").exists());
 }
 
@@ -7269,7 +7279,7 @@ fn staging_a_hunk_in_a_non_utf8_diff_is_refused() {
     app.stage_hunk_at_caret();
     assert!(app.status.contains("windows-1252"), "{}", app.status);
     assert_eq!(
-        git_stdout_in(tmp.path(), &["diff", "--cached", "--name-only"]),
+        git_stdout_untrimmed(tmp.path(), &["diff", "--cached", "--name-only"]),
         ""
     );
 }
@@ -7508,7 +7518,7 @@ fn clicking_a_changed_submodule_shows_its_diff() {
 #[test]
 fn discarding_a_submodule_refuses_instead_of_claiming_success() {
     let (_tmp, root) = repo_with_moved_dirty_submodule();
-    let inner_head = git_out(&root.join("lib"), &["rev-parse", "HEAD"]);
+    let inner_head = git_stdout_untrimmed(&root.join("lib"), &["rev-parse", "HEAD"]);
     let mut app = App::new(root.clone()).unwrap();
     app.pending_discard = Some(PendingDiscard {
         rel_path: "lib".into(),
@@ -7523,7 +7533,7 @@ fn discarding_a_submodule_refuses_instead_of_claiming_success() {
     );
     assert!(app.status.contains("submodule"), "status: {}", app.status);
     assert_eq!(
-        git_out(&root.join("lib"), &["rev-parse", "HEAD"]),
+        git_stdout_untrimmed(&root.join("lib"), &["rev-parse", "HEAD"]),
         inner_head
     );
     assert_eq!(
