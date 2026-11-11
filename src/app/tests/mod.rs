@@ -325,6 +325,128 @@ fn menu_action_of<'a>(items: &'a [MenuEntry], label: &str) -> Option<&'a MenuAct
     })
 }
 
+/// The actions of every row of the Customize Layout popup and the tab and
+/// Explorer menus over `file` (with a copied file to paste and another to
+/// compare with), and of the rows with a shortcut in the menus built where
+/// they open: the editor's, its gutter's, the Outline's, a folder's in the
+/// Explorer, the terminal's, a finished command's and a CAPTURES row's. These
+/// are the rows whose shortcuts the menus advertise (#885).
+fn menu_row_actions(app: &App, file: &Path) -> Vec<MenuAction> {
+    fn actions(entries: Vec<MenuEntry>) -> Vec<MenuAction> {
+        entries
+            .into_iter()
+            .flat_map(|e| match e {
+                MenuEntry::Item { action, .. } => vec![action],
+                MenuEntry::Submenu { items, .. } => actions(items),
+                _ => Vec::new(),
+            })
+            .collect()
+    }
+    let root = file.parent().unwrap();
+    let mut all = actions(app.customize_layout_items());
+    all.extend(actions(build_tab_context_menu_items(
+        0,
+        3,
+        true,
+        Some(file),
+        true,
+        true,
+        false,
+    )));
+    let copied = ExplorerClipboard {
+        mode: ExplorerClipMode::Copy,
+        paths: vec![file.to_path_buf()],
+    };
+    let tree = build_tree_context_menu_items(
+        Some(&file_node(file)),
+        root,
+        &[file.to_path_buf()],
+        root,
+        Some(&copied),
+        Some(&root.join("selected-for-compare.rs")),
+    );
+    all.extend(tree.into_iter().map(|(_, a)| a));
+    let (row, col, line) = (0, 0, 0);
+    let path = file.to_path_buf();
+    all.extend([
+        MenuAction::RenameSymbolAt { row, col },
+        MenuAction::ChangeAllOccurrencesAt { row, col },
+        MenuAction::GoToDefinitionAt { row, col },
+        MenuAction::GoToDeclarationAt { row, col },
+        MenuAction::GoToTypeDefinitionAt { row, col },
+        MenuAction::GoToImplementationAt { row, col },
+        MenuAction::GoToReferencesAt { row, col },
+        MenuAction::ShowCallsAt {
+            row,
+            col,
+            incoming: true,
+        },
+        MenuAction::ShowCallsAt {
+            row,
+            col,
+            incoming: false,
+        },
+        MenuAction::NavigateBack,
+        MenuAction::NavigateForward,
+        MenuAction::QuickFixAt { row, col },
+        MenuAction::AskNavigatorSelection { start: 0, end: 0 },
+        MenuAction::EditorCut,
+        MenuAction::EditorCopy,
+        MenuAction::EditorPaste,
+        MenuAction::ShowCommandPalette,
+        MenuAction::OpenThemePicker,
+        MenuAction::ToggleBreakpointAt { line },
+        MenuAction::EditBreakpointConditionAt { line },
+        MenuAction::EditLogpointAt { line },
+        MenuAction::ToggleBookmarkAt { line },
+        MenuAction::NextBookmark,
+        MenuAction::PreviousBookmark,
+        MenuAction::AskNavigatorAt { line },
+        MenuAction::GoToOutlineSymbol {
+            path: path.clone(),
+            line: 0,
+            col: 0,
+        },
+        MenuAction::OpenSymbolTab {
+            path,
+            name: String::from("main"),
+            first: 0,
+            last: 0,
+        },
+        MenuAction::MakeRoot(root.join("src")),
+        MenuAction::TerminalCopySelection,
+        MenuAction::TerminalPaste,
+        MenuAction::TerminalQuickSelect,
+        MenuAction::TerminalCopyMode,
+        MenuAction::TerminalCommandHistory,
+        MenuAction::OpenScrollbackInEditor,
+        MenuAction::ToggleBroadcastInput,
+        MenuAction::ToggleBroadcastExclusion,
+        MenuAction::UndoCloseTerminal,
+        MenuAction::SplitTerminal,
+        MenuAction::RenameTerminal(0),
+        MenuAction::ToggleMaximizeTerminal(0),
+        MenuAction::KillTerminal(0),
+        MenuAction::ClearTerminal(0),
+    ]);
+    let finished = crate::widgets::terminal::CommandDecoration {
+        id: 0,
+        line: 0,
+        exit: Some(0),
+        duration: None,
+        input: None,
+        output_start: 0,
+        output_end: 0,
+    };
+    all.extend([
+        MenuAction::CopyCommandOutput(0, finished),
+        MenuAction::SelectCommandOutput(0, finished),
+        MenuAction::RerunCommand(0, finished),
+        MenuAction::AskNavigatorAboutCapture,
+    ]);
+    all
+}
+
 fn dummy_activity_images() -> ActivityBarImages {
     let s = || String::from("\x1b]1337;File=inline=1:Zm9v\x07");
     ActivityBarImages {
