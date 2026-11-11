@@ -44,13 +44,15 @@
 //!   `inline_protocol`, `sixel_supported`, `cell_pixel`, `is_remote`,
 //!   `persistence_warning`, `osk_auto`) as soon as the App is built, so what
 //!   a scene does runs on the pinned values, and again just before drawing,
-//!   since a theme switch reads the environment again. The one read made
-//!   during a frame, `iterm2_inline::detect_iterm2_inline_support`
-//!   (`TERM_PROGRAM` and `CROFT_FORCE_INLINE_IMAGES`; under iTerm2 or
-//!   WezTerm the frame leaves the canvas to the session background), has no
-//!   App field, and `set_var` would race every other test in the process,
-//!   so [`draw`] answers it for its own thread through the `cfg(test)`-only
-//!   `PLAIN_HOST_FRAMES` ([`PlainHost`]).
+//!   since a theme switch reads the environment again. Two reads made
+//!   during a frame have no App field:
+//!   `iterm2_inline::detect_iterm2_inline_support` (`TERM_PROGRAM` and
+//!   `CROFT_FORCE_INLINE_IMAGES`; under iTerm2 or WezTerm the frame leaves
+//!   the canvas to the session background), and
+//!   `iterm2_inline::detect_inline_image_protocol`, which a picture open in
+//!   an editor reads for its canvas. `set_var` would race every other test
+//!   in the process, so [`draw`] answers both for its own thread through
+//!   the `cfg(test)`-only `PLAIN_HOST_FRAMES` ([`PlainHost`]).
 //! * The status line starts from a process-wide latch other tests may set
 //!   (`VIEW_BIND_ERROR`); scenes pin it to the "Ready" a clean start shows.
 //! * The caret blinks on the wall clock. [`draw`] resets the blink and
@@ -751,8 +753,9 @@ fn draw_once(app: &mut App, width: u16, height: u16) -> Shot {
     );
 }
 
-/// While alive, frames drawn on this thread are drawn as a terminal without
-/// iTerm2's session background draws them, whatever runs the suite.
+/// While alive, frames drawn on this thread are drawn as a plain terminal
+/// draws them, with no iTerm2 session background and no inline-image
+/// protocol, whatever terminal runs the suite.
 struct PlainHost;
 
 impl PlainHost {

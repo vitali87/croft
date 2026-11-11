@@ -486,7 +486,14 @@ pub fn inline_image_protocol_in(
     inline_image_protocol_for(term_program, term)
 }
 
+/// The inline-image protocol this croft writes with, from the terminal's
+/// environment: `TERM_PROGRAM`, `TERM` and `CROFT_INLINE_IMAGES`, then
+/// `CROFT_FORCE_INLINE_IMAGES` for a terminal that advertises none.
 pub fn detect_inline_image_protocol() -> InlineImageProtocol {
+    #[cfg(test)]
+    if PLAIN_HOST_FRAMES.with(std::cell::Cell::get) {
+        return InlineImageProtocol::None;
+    }
     let term_program = std::env::var("TERM_PROGRAM").ok();
     let term = std::env::var("TERM").ok();
     let protocol = inline_image_protocol_in(
@@ -706,6 +713,10 @@ pub fn is_tmux_env(term: Option<&str>, tmux_var: Option<&str>) -> bool {
         || term.is_some_and(|v| v.starts_with("tmux") || v.starts_with("screen"))
 }
 
+/// Whether the terminal draws iTerm2's inline images and session
+/// background: iTerm2 or WezTerm by `TERM_PROGRAM`, or any terminal with
+/// `CROFT_FORCE_INLINE_IMAGES` set. Under it a frame leaves the canvas to
+/// the session background instead of painting it.
 pub fn detect_iterm2_inline_support() -> bool {
     #[cfg(test)]
     if PLAIN_HOST_FRAMES.with(std::cell::Cell::get) {
@@ -726,10 +737,12 @@ pub fn detect_iterm2_inline_support() -> bool {
 
 #[cfg(test)]
 thread_local! {
-    /// Set by a test that draws frames as a terminal without iTerm2's
-    /// session background draws them (the screen goldens), whatever
-    /// terminal runs the suite. The environment is shared by every test in
-    /// the process, so changing it is no test's to do.
+    /// Set by a test that draws frames as a plain terminal draws them (the
+    /// screen goldens), whatever terminal runs the suite: no iTerm2 session
+    /// background ([`detect_iterm2_inline_support`]) and no inline-image
+    /// protocol ([`detect_inline_image_protocol`]), which a picture open in
+    /// an editor reads while it draws. The environment is shared by every
+    /// test in the process, so changing it is no test's to do.
     pub static PLAIN_HOST_FRAMES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
@@ -1423,6 +1436,33 @@ mod tests {
     #[test]
     fn missing_term_program_is_not_iterm2() {
         assert!(!is_iterm2_term_program(None));
+    }
+
+    /// A thread drawing as a plain terminal gets no image protocol and no
+    /// iTerm2 session background, whatever the environment says, and the
+    /// switch is its own: another thread still reads the environment.
+    #[test]
+    fn a_plain_host_thread_sees_no_image_support() {
+        let from_env = (
+            detect_inline_image_protocol(),
+            detect_iterm2_inline_support(),
+        );
+        PLAIN_HOST_FRAMES.with(|f| f.set(true));
+        let plain = (
+            detect_inline_image_protocol(),
+            detect_iterm2_inline_support(),
+        );
+        let other = std::thread::spawn(|| {
+            (
+                detect_inline_image_protocol(),
+                detect_iterm2_inline_support(),
+            )
+        })
+        .join()
+        .unwrap();
+        PLAIN_HOST_FRAMES.with(|f| f.set(false));
+        assert_eq!(plain, (InlineImageProtocol::None, false));
+        assert_eq!(other, from_env);
     }
 
     #[test]
