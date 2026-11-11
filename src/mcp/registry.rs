@@ -65,7 +65,14 @@ fn server_spawn(decl: &McpServerDecl) -> ServerSpawn {
 
 /// Bundled + user manifest sources, in load order.
 fn all_sources() -> Vec<String> {
-    all_sources_in_dir(&crate::paths::config_dir())
+    #[cfg(not(test))]
+    let user_dir = crate::paths::config_dir();
+    // Under test a dir nothing creates, as the settings layers use (#624):
+    // an extension the developer added must never steer a test, and a test
+    // that wants one seeds a scratch dir through the `_in_dir` reads.
+    #[cfg(test)]
+    let user_dir = std::env::temp_dir().join(format!("croft-test-config-{}", std::process::id()));
+    all_sources_in_dir(&user_dir)
 }
 
 /// Every manifest source, with the user extensions read from under an

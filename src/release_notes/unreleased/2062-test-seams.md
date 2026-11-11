@@ -1,0 +1,1 @@
+refactor: Groundwork for the refactor program (#2062): tests can draw frames as a plain terminal with a code palette of their own, and test builds no longer read the developer's own extensions. Nothing changes in use.
