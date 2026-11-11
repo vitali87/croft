@@ -487,11 +487,22 @@ fn every_f1_row_with_a_key_predicate_names_keys_its_predicate_takes() {
 }
 
 /// What the ledger reads off an app: values by name, then what is open or
-/// on, `None` while it is not, with a label where one tells it apart.
+/// on, `None` while it is not, with a label where one tells it apart. Each
+/// is kept twice: as the ledger prints it, with every commit id as `<id>`,
+/// and as read, which is what tells whether a key changed it. Two values
+/// that print alike can still differ, such as two hex-looking clipboards.
 struct Seen {
     values: Vec<(&'static str, String)>,
     flags: Vec<(&'static str, Option<String>)>,
+    raw_values: Vec<String>,
+    raw_flags: Vec<Option<String>>,
 }
+
+/// A fingerprint's values and flags, as `fields` reads them.
+type Fields = (
+    Vec<(&'static str, String)>,
+    Vec<(&'static str, Option<String>)>,
+);
 
 /// A group's tabs, the active one starred.
 fn tab_list(tabs: &crate::widgets::editor::EditorTabs) -> String {
@@ -719,6 +730,28 @@ fn no_commit_ids(text: &str) -> String {
 
 /// What a key can change that a user sees or acts on next.
 fn fingerprint(app: &App, root: &Path) -> Seen {
+    // Read from the disk and git once: they are the same for both passes.
+    let read = [
+        explorer(&app.tree, root),
+        search_view(&app.search),
+        scm_view(&app.source_control),
+        git_state(root),
+        files_digest(root),
+    ];
+    let (values, flags) = fields(app, root, &read, true);
+    let (raw_values, raw_flags) = fields(app, root, &read, false);
+    Seen {
+        values,
+        flags,
+        raw_values: raw_values.into_iter().map(|(_, v)| v).collect(),
+        raw_flags: raw_flags.into_iter().map(|(_, f)| f).collect(),
+    }
+}
+
+/// The fingerprint's values and flags, with every commit id as `<id>` when
+/// `hide_ids`. `read` holds what came from the disk and git: the Explorer,
+/// Search and Source Control views, `git status` and the files' digest.
+fn fields(app: &App, root: &Path, read: &[String; 5], hide_ids: bool) -> Fields {
     let ed = &app.editor;
     let focus = match app.focus {
         Pane::Tree => "side",
@@ -764,11 +797,10 @@ fn fingerprint(app: &App, root: &Path) -> Seen {
         )
     }));
     let scrub = |s: &str| {
-        no_commit_ids(
-            &news
-                .iter()
-                .fold(s.to_string(), |s, (from, to)| s.replace(from, to)),
-        )
+        let s = news
+            .iter()
+            .fold(s.to_string(), |s, (from, to)| s.replace(from, to));
+        if hide_ids { no_commit_ids(&s) } else { s }
     };
     let quote = |s: &str| format!("{:?}", scrub(s));
     let on = |on: bool| on.then(String::new);
@@ -807,8 +839,8 @@ fn fingerprint(app: &App, root: &Path) -> Seen {
         }
         out
     });
-    Seen {
-        values: vec![
+    (
+        vec![
             ("focus", String::from(focus)),
             ("side", side),
             ("panel", panel),
@@ -831,13 +863,13 @@ fn fingerprint(app: &App, root: &Path) -> Seen {
                 "terms",
                 format!("{}@{}", app.terminals.len(), app.active_terminal),
             ),
-            ("tree", explorer(&app.tree, root)),
-            ("search", search_view(&app.search)),
-            ("scm", scm_view(&app.source_control)),
-            ("git", git_state(root)),
-            ("files", files_digest(root)),
+            ("tree", read[0].clone()),
+            ("search", read[1].clone()),
+            ("scm", read[2].clone()),
+            ("git", read[3].clone()),
+            ("files", read[4].clone()),
         ],
-        flags: vec![
+        vec![
             ("quit", on(app.quit)),
             ("drop_to_local", on(app.drop_to_local)),
             ("minimap", on(app.minimap_visible)),
@@ -988,23 +1020,30 @@ fn fingerprint(app: &App, root: &Path) -> Seen {
             ("discard", on(app.pending_discard.is_some())),
             ("revert_hunk", on(app.pending_revert_hunk.is_some())),
         ],
-    }
+    )
 }
 
 /// What a key changed: `name=value` for a value, `+name` (with its label) for
 /// what opened or came on, `-name` for what closed or went off, and
 /// `~name(label)` for an open one whose label changed. `-` when nothing did.
 fn effects(before: &Seen, after: &Seen) -> String {
-    let values = before.values.iter().zip(&after.values);
+    // Whether something changed is read off the raw values; what is printed
+    // is the shown one, so a change a placeholder hides still counts.
+    let values = before
+        .raw_values
+        .iter()
+        .zip(&after.raw_values)
+        .zip(&after.values);
     let mut changed: Vec<String> = values
-        .filter(|((_, b), (_, a))| b != a)
-        .map(|((name, _), (_, a))| format!("{name}={a}"))
+        .filter(|((b, a), _)| b != a)
+        .map(|(_, (name, shown))| format!("{name}={shown}"))
         .collect();
-    let flags = before.flags.iter().zip(&after.flags);
+    let flags =
+        (before.raw_flags.iter().zip(&after.raw_flags)).zip(before.flags.iter().zip(&after.flags));
     changed.extend(
         flags
-            .filter(|((_, b), (_, a))| b != a)
-            .map(|((name, b), (_, a))| match (b, a.as_deref()) {
+            .filter(|((b, a), _)| b != a)
+            .map(|(_, ((name, b), (_, a)))| match (b, a.as_deref()) {
                 (_, None) => format!("-{name}"),
                 (None, Some("")) => format!("+{name}"),
                 (None, Some(label)) => format!("+{name}({label})"),
@@ -1087,6 +1126,24 @@ fn a_keys_effects_name_what_it_changed_and_what_it_opened() {
         "added 12 lines, cafe"
     );
     assert_eq!(runs([1, 2, 3, 7]), "1-3,7");
+}
+
+/// The ledger prints every commit id as `<id>` so it reads the same on every
+/// run, but whether a key changed something is read off the real values:
+/// a clipboard that goes from one hex-looking word to another is a change.
+#[test]
+fn a_change_the_commit_id_placeholder_hides_still_counts() {
+    let seen = |clip: &str| Seen {
+        values: vec![("clip", format!("{:?}", no_commit_ids(clip)))],
+        flags: vec![("commit_feedback", Some(no_commit_ids(clip)))],
+        raw_values: vec![format!("{clip:?}")],
+        raw_flags: vec![Some(clip.to_string())],
+    };
+    assert_eq!(
+        effects(&seen("1234567"), &seen("7654321")),
+        "clip=\"<id>\" ~commit_feedback(<id>)"
+    );
+    assert_eq!(effects(&seen("1234567"), &seen("1234567")), "-");
 }
 
 #[test]
