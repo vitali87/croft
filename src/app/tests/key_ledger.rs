@@ -485,11 +485,22 @@ fn every_f1_row_with_a_key_predicate_names_keys_its_predicate_takes() {
 }
 
 /// What the ledger reads off an app: values by name, then what is open or
-/// on, `None` while it is not, with a label where one tells it apart.
+/// on, `None` while it is not, with a label where one tells it apart. Each
+/// is kept twice: as the ledger prints it, with every commit id as `<id>`,
+/// and as read, which is what tells whether a key changed it. Two values
+/// that print alike can still differ, such as two hex-looking clipboards.
 struct Seen {
     values: Vec<(&'static str, String)>,
     flags: Vec<(&'static str, Option<String>)>,
+    raw_values: Vec<String>,
+    raw_flags: Vec<Option<String>>,
 }
+
+/// A fingerprint's values and flags, as `fields` reads them.
+type Fields = (
+    Vec<(&'static str, String)>,
+    Vec<(&'static str, Option<String>)>,
+);
 
 /// A group's tabs, the active one starred.
 fn tab_list(tabs: &crate::widgets::editor::EditorTabs) -> String {
@@ -632,8 +643,113 @@ fn search_view(s: &crate::widgets::search::SearchPanel) -> String {
     out
 }
 
+/// The Source Control view: the commit message and its caret, what has
+/// focus, the selected changes and every change listed.
+fn scm_view(sc: &crate::widgets::source_control::SourceControlPanel) -> String {
+    let mut out = format!("{:?}@{}", sc.message, sc.message_cursor);
+    if sc.focused {
+        out.push_str(" +focus");
+    }
+    if sc.list_focused {
+        out.push_str(" +list");
+    }
+    if let Some(i) = sc.selected_change {
+        out.push_str(&format!(" sel={i}"));
+    }
+    if !sc.multi_selection.is_empty() {
+        out.push_str(&format!(
+            " multi={}",
+            runs(sc.multi_selection.iter().copied())
+        ));
+    }
+    for e in &sc.entries {
+        out.push_str(&format!(" {:?}:{}", e.kind, e.path));
+    }
+    out
+}
+
+/// The repository at `root` as git reports it: the branch, the stashes and
+/// each change's two status letters, `-` outside a repository. The HEAD
+/// commit's id is left out: it changes with the clock.
+fn git_state(root: &Path) -> String {
+    if !root.join(".git").exists() {
+        return String::from("-");
+    }
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["status", "--porcelain=v2", "--branch", "--show-stash"])
+        .arg("--untracked-files=all")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut parts = Vec::new();
+    for line in text.lines() {
+        let fields: Vec<&str> = line.split(' ').collect();
+        // An entry's path is its last field: after 8 fields for an
+        // ordinary change, 9 for a rename and 10 for a conflict.
+        let path_after = |n: usize| line.splitn(n + 1, ' ').last().unwrap_or("");
+        match fields[0] {
+            "#" if fields.get(1) == Some(&"branch.head") => parts.push(fields[2].to_string()),
+            "#" if fields.get(1) == Some(&"stash") => parts.push(format!("stash={}", fields[2])),
+            "1" => parts.push(format!("{}:{}", fields[1], path_after(8))),
+            "2" => parts.push(format!("{}:{}", fields[1], path_after(9))),
+            "u" => parts.push(format!("{}:{}", fields[1], path_after(10))),
+            "?" | "!" => parts.push(format!("{0}{0}:{1}", fields[0], path_after(1))),
+            _ => {}
+        }
+    }
+    parts.join(",")
+}
+
+/// `text` with every word that reads as a commit id (7 to 40 lowercase hex
+/// digits, letters among them or not) as `<id>`: a commit's id changes with
+/// the clock.
+fn no_commit_ids(text: &str) -> String {
+    let id = |w: &str| {
+        (7..=40).contains(&w.len())
+            && w.bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    };
+    let mut out = String::new();
+    let mut word = String::new();
+    for c in text.chars().map(Some).chain([None]) {
+        if let Some(c) = c.filter(char::is_ascii_alphanumeric) {
+            word.push(c);
+            continue;
+        }
+        out.push_str(if id(&word) { "<id>" } else { &word });
+        word.clear();
+        out.extend(c);
+    }
+    out
+}
+
 /// What a key can change that a user sees or acts on next.
 fn fingerprint(app: &App, root: &Path) -> Seen {
+    // Read from the disk and git once: they are the same for both passes.
+    let read = [
+        explorer(&app.tree, root),
+        search_view(&app.search),
+        scm_view(&app.source_control),
+        git_state(root),
+        files_digest(root),
+    ];
+    let (values, flags) = fields(app, root, &read, true);
+    let (raw_values, raw_flags) = fields(app, root, &read, false);
+    Seen {
+        values,
+        flags,
+        raw_values: raw_values.into_iter().map(|(_, v)| v).collect(),
+        raw_flags: raw_flags.into_iter().map(|(_, f)| f).collect(),
+    }
+}
+
+/// The fingerprint's values and flags, with every commit id as `<id>` when
+/// `hide_ids`. `read` holds what came from the disk and git: the Explorer,
+/// Search and Source Control views, `git status` and the files' digest.
+fn fields(app: &App, root: &Path, read: &[String; 5], hide_ids: bool) -> Fields {
     let ed = &app.editor;
     let focus = match app.focus {
         Pane::Tree => "side",
@@ -679,11 +795,14 @@ fn fingerprint(app: &App, root: &Path) -> Seen {
         )
     }));
     let scrub = |s: &str| {
-        news.iter()
-            .fold(s.to_string(), |s, (from, to)| s.replace(from, to))
+        let s = news
+            .iter()
+            .fold(s.to_string(), |s, (from, to)| s.replace(from, to));
+        if hide_ids { no_commit_ids(&s) } else { s }
     };
     let quote = |s: &str| format!("{:?}", scrub(s));
     let on = |on: bool| on.then(String::new);
+    let quoted = |s: &str| Some(quote(s));
     // What the app wrote to each terminal pane, by the pane's place in the
     // panel: the same bytes sent to another pane are another effect.
     let typed: Vec<String> = app
@@ -718,8 +837,8 @@ fn fingerprint(app: &App, root: &Path) -> Seen {
         }
         out
     });
-    Seen {
-        values: vec![
+    (
+        vec![
             ("focus", String::from(focus)),
             ("side", side),
             ("panel", panel),
@@ -742,11 +861,13 @@ fn fingerprint(app: &App, root: &Path) -> Seen {
                 "terms",
                 format!("{}@{}", app.terminals.len(), app.active_terminal),
             ),
-            ("tree", explorer(&app.tree, root)),
-            ("search", search_view(&app.search)),
-            ("files", files_digest(root)),
+            ("tree", read[0].clone()),
+            ("search", read[1].clone()),
+            ("scm", read[2].clone()),
+            ("git", read[3].clone()),
+            ("files", read[4].clone()),
         ],
-        flags: vec![
+        vec![
             ("quit", on(app.quit)),
             ("drop_to_local", on(app.drop_to_local)),
             ("minimap", on(app.minimap_visible)),
@@ -840,6 +961,13 @@ fn fingerprint(app: &App, root: &Path) -> Seen {
             ("menu", menu),
             ("scm_menu", on(app.scm_menu.open)),
             ("commit_menu", on(app.commit_menu_open)),
+            (
+                "commit_feedback",
+                app.source_control
+                    .commit_feedback
+                    .as_deref()
+                    .and_then(quoted),
+            ),
             ("shortcuts", on(app.shortcuts_modal.is_some())),
             (
                 "settings",
@@ -890,23 +1018,30 @@ fn fingerprint(app: &App, root: &Path) -> Seen {
             ("discard", on(app.pending_discard.is_some())),
             ("revert_hunk", on(app.pending_revert_hunk.is_some())),
         ],
-    }
+    )
 }
 
 /// What a key changed: `name=value` for a value, `+name` (with its label) for
 /// what opened or came on, `-name` for what closed or went off, and
 /// `~name(label)` for an open one whose label changed. `-` when nothing did.
 fn effects(before: &Seen, after: &Seen) -> String {
-    let values = before.values.iter().zip(&after.values);
+    // Whether something changed is read off the raw values; what is printed
+    // is the shown one, so a change a placeholder hides still counts.
+    let values = before
+        .raw_values
+        .iter()
+        .zip(&after.raw_values)
+        .zip(&after.values);
     let mut changed: Vec<String> = values
-        .filter(|((_, b), (_, a))| b != a)
-        .map(|((name, _), (_, a))| format!("{name}={a}"))
+        .filter(|((b, a), _)| b != a)
+        .map(|(_, (name, shown))| format!("{name}={shown}"))
         .collect();
-    let flags = before.flags.iter().zip(&after.flags);
+    let flags =
+        (before.raw_flags.iter().zip(&after.raw_flags)).zip(before.flags.iter().zip(&after.flags));
     changed.extend(
         flags
-            .filter(|((_, b), (_, a))| b != a)
-            .map(|((name, b), (_, a))| match (b, a.as_deref()) {
+            .filter(|((b, a), _)| b != a)
+            .map(|(_, ((name, b), (_, a)))| match (b, a.as_deref()) {
                 (_, None) => format!("-{name}"),
                 (None, Some("")) => format!("+{name}"),
                 (None, Some(label)) => format!("+{name}({label})"),
@@ -929,13 +1064,17 @@ fn digest(text: &str) -> String {
 }
 
 /// Every path under `root` and what each file holds, as one digest: what a
-/// key wrote, made or moved on disk.
+/// key wrote, made or moved on disk. A repository's `.git` is left to
+/// [`git_state`]: git rewrites its files with the clock in them.
 fn files_digest(root: &Path) -> String {
     let mut all = Vec::new();
     let mut dirs = vec![root.to_path_buf()];
     while let Some(dir) = dirs.pop() {
         for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
             let path = entry.path();
+            if path == root.join(".git") {
+                continue;
+            }
             let body = std::fs::read(&path).unwrap_or_default();
             all.push(format!(
                 "{}\n{}",
@@ -976,7 +1115,33 @@ fn a_keys_effects_name_what_it_changed_and_what_it_opened() {
         .unwrap();
     let down = effects(&before, &fingerprint(&app, root));
     assert_ne!(down, fx, "the palette's selected row is part of it");
+    for id in ["1a2b3c4", "4042135", "fedcbae"] {
+        let line = format!("[main {id}] Ship it");
+        assert_eq!(no_commit_ids(&line), "[main <id>] Ship it");
+    }
+    assert_eq!(
+        no_commit_ids("added 12 lines, cafe"),
+        "added 12 lines, cafe"
+    );
     assert_eq!(runs([1, 2, 3, 7]), "1-3,7");
+}
+
+/// The ledger prints every commit id as `<id>` so it reads the same on every
+/// run, but whether a key changed something is read off the real values:
+/// a clipboard that goes from one hex-looking word to another is a change.
+#[test]
+fn a_change_the_commit_id_placeholder_hides_still_counts() {
+    let seen = |clip: &str| Seen {
+        values: vec![("clip", format!("{:?}", no_commit_ids(clip)))],
+        flags: vec![("commit_feedback", Some(no_commit_ids(clip)))],
+        raw_values: vec![format!("{clip:?}")],
+        raw_flags: vec![Some(clip.to_string())],
+    };
+    assert_eq!(
+        effects(&seen("1234567"), &seen("7654321")),
+        "clip=\"<id>\" ~commit_feedback(<id>)"
+    );
+    assert_eq!(effects(&seen("1234567"), &seen("1234567")), "-");
 }
 
 #[test]
