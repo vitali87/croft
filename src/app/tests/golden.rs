@@ -967,7 +967,18 @@ fn welcome_page() {
 
 /// The name of every golden a scene in this module owns.
 fn owned_goldens() -> Vec<String> {
-    ["workbench", "welcome"].map(String::from).to_vec()
+    let fixed = [
+        "workbench",
+        "welcome",
+        "workbench-256",
+        "workbench-16",
+        "workbench-80x24",
+    ];
+    let themed = crate::theme::Theme::all()
+        .iter()
+        .filter(|&&theme| theme != crate::theme::Theme::default())
+        .map(|theme| format!("workbench-theme-{}", theme.id()));
+    fixed.into_iter().map(String::from).chain(themed).collect()
 }
 
 /// A golden no scene owns, left by a renamed scene or a theme that left the
@@ -996,5 +1007,68 @@ fn every_golden_belongs_to_a_scene() {
     assert!(
         orphans.is_empty(),
         "goldens no scene owns (delete them, or add their scene to owned_goldens): {orphans:?}"
+    );
+}
+
+/// The workbench in every bundled theme but the default, whose scene is
+/// `workbench`. A theme added to the bundle fails here until its golden is
+/// blessed. Every theme is drawn before the test fails, so one run names
+/// them all.
+#[test]
+fn workbench_in_every_bundled_theme() {
+    let themes = crate::theme::Theme::all();
+    assert!(themes.contains(&crate::theme::Theme::default()));
+    let failures: Vec<String> = themes
+        .iter()
+        .filter(|&&theme| theme != crate::theme::Theme::default())
+        .filter_map(|&theme| {
+            let (_fixture, mut app) = workbench(theme);
+            let name = format!("workbench-theme-{}", theme.id());
+            scene(
+                &name,
+                &mut app,
+                (120, 40),
+                crate::color_depth::ColorDepth::TrueColor,
+                no_masks,
+            )
+            .err()
+        })
+        .collect();
+    assert!(failures.is_empty(), "{}", failures.join("\n\n"));
+}
+
+#[test]
+fn workbench_at_256_colours() {
+    let (_fixture, mut app) = workbench(crate::theme::Theme::default());
+    check_scene(
+        "workbench-256",
+        &mut app,
+        (120, 40),
+        crate::color_depth::ColorDepth::Ansi256,
+        no_masks,
+    );
+}
+
+#[test]
+fn workbench_at_16_colours() {
+    let (_fixture, mut app) = workbench(crate::theme::Theme::default());
+    check_scene(
+        "workbench-16",
+        &mut app,
+        (120, 40),
+        crate::color_depth::ColorDepth::Ansi16,
+        no_masks,
+    );
+}
+
+#[test]
+fn workbench_in_an_80x24_terminal() {
+    let (_fixture, mut app) = workbench(crate::theme::Theme::default());
+    check_scene(
+        "workbench-80x24",
+        &mut app,
+        (80, 24),
+        crate::color_depth::ColorDepth::TrueColor,
+        no_masks,
     );
 }
