@@ -1446,7 +1446,9 @@ impl Built {
 /// The app for `ctx` in a workspace of its own, one frame drawn so every
 /// pane has its size. A local session with no language server, so none
 /// starts and nothing depends on which are installed, and with a terminal
-/// child that prints nothing, so no prompt races a key onto the grid.
+/// child that prints nothing, so no prompt races a key onto the grid. It
+/// reads nothing from the developer's config folder, so their own
+/// extensions, snippets and macros cannot change the ledger.
 fn build(ctx: &Context) -> Built {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("ws");
@@ -1457,6 +1459,7 @@ fn build(ctx: &Context) -> Built {
     // croft's cache (scrollback dumps, sessions) goes beside it, not home.
     let cache = crate::session_state::CacheDirForThisTestThread::set(&tmp.path().join("cache"));
     let mut app = App::new(root.clone()).unwrap();
+    super::golden::without_user_files(&mut app, &tmp.path().join("config"));
     app.lsp = None;
     app.is_remote = false;
     app.selected_debug_config = Some(String::from("Ledger"));

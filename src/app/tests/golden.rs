@@ -34,10 +34,10 @@
 //!   agent table from the user's config folder and the hosts refused a
 //!   remote offer from the cache folder, and keeps the real config folder
 //!   as `config_dir`, where the Extensions view and the test worker look for
-//!   added extensions. [`app_with_theme`] points all of these at an empty
-//!   folder beside the workspace. Only the config watcher, which nothing but
-//!   the tick polls, and the embedded terminal's shell, which no scene
-//!   shows, still look at the real folders.
+//!   added extensions. [`without_user_files`] points all of these at an
+//!   empty folder beside the workspace. Only the config watcher, which
+//!   nothing but the tick polls, and the embedded terminal's shell, which no
+//!   scene shows, still look at the real folders.
 //! * The terminal's environment (`TERM`, `COLORTERM`, `TERM_PROGRAM`,
 //!   `SSH_*`, Termux's markers, `CROFT_FORCE_*`) is read into App fields at
 //!   startup; [`hermetic`] overwrites them (`color_depth`,
@@ -875,20 +875,7 @@ fn main() {
 fn app_with_theme(root: &Path, theme: crate::theme::Theme) -> App {
     let mut app = App::new(root.to_path_buf()).unwrap();
     hermetic(&mut app, crate::color_depth::ColorDepth::TrueColor);
-    // What `App::new` read from the user's config and cache folders, read
-    // again from an empty folder beside the workspace (the module doc says
-    // what each is).
-    let config = root.with_file_name("config");
-    app.config_dir = config.clone();
-    app.test_worker.set_extensions_dir(app.extensions_dir());
-    app.macros_path = config.join("macros.json");
-    app.macro_registers = crate::macros::load(&app.macros_path);
-    app.snippets = crate::snippets::SnippetSet::load(&config.join("snippets.json"));
-    app.triggers = std::sync::Arc::new(
-        crate::triggers::TriggerSet::load(&config.join("triggers.json")).with_builtin_redactions(),
-    );
-    app.agents = crate::agents::AgentTable::load(&config.join("agents.json"));
-    app.remote_offer_refused = Default::default();
+    without_user_files(&mut app, &root.with_file_name("config"));
     // A clean start says "Ready"; `App::new` reads that from a process-wide
     // latch other tests may set.
     app.status = String::from("Ready");
@@ -899,6 +886,26 @@ fn app_with_theme(root: &Path, theme: crate::theme::Theme) -> App {
     crate::highlight::set_syntax_palette(theme.syntax());
     app.sync_focus_flags();
     app
+}
+
+/// Read again from `config`, an empty folder of the test's own, what
+/// `App::new` under test still reads from the user's config and cache
+/// folders: the macros, snippets, terminal triggers and agent table, the
+/// hosts refused a remote offer, and `config_dir` itself, where the command
+/// palette, the Extensions view and the test worker look for added
+/// extensions. A developer's own extension or snippet then cannot change
+/// what a test sees.
+pub(super) fn without_user_files(app: &mut App, config: &Path) {
+    app.config_dir = config.to_path_buf();
+    app.test_worker.set_extensions_dir(app.extensions_dir());
+    app.macros_path = config.join("macros.json");
+    app.macro_registers = crate::macros::load(&app.macros_path);
+    app.snippets = crate::snippets::SnippetSet::load(&config.join("snippets.json"));
+    app.triggers = std::sync::Arc::new(
+        crate::triggers::TriggerSet::load(&config.join("triggers.json")).with_builtin_redactions(),
+    );
+    app.agents = crate::agents::AgentTable::load(&config.join("agents.json"));
+    app.remote_offer_refused = Default::default();
 }
 
 /// The workbench fixture: a small tree with `src/main.rs` open, the
