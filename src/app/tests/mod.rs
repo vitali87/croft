@@ -107,6 +107,149 @@ fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
     KeyEvent::new(code, mods)
 }
 
+/// A key check of the key router.
+#[cfg(not(target_os = "macos"))]
+type KeyPredicate = fn(KeyEvent) -> bool;
+
+/// Every `is_*_key` predicate of the key router by name, each taking only the
+/// key: the uniform list the keybinding tests walk. `is_cmd_k_leader_key`
+/// comes twice, as the editor and as a focused shell ask it (`@shell`).
+#[cfg(not(target_os = "macos"))]
+fn key_predicates() -> Vec<(&'static str, KeyPredicate)> {
+    macro_rules! preds {
+        ($($p:ident),* $(,)?) => { vec![$((stringify!($p), $p as KeyPredicate)),*] };
+    }
+    // The leader asked from the editor and from a focused shell.
+    fn leader_in_editor(key: KeyEvent) -> bool {
+        is_cmd_k_leader_key(key, ctrl_k_leads(false, false, false))
+    }
+    fn leader_in_shell(key: KeyEvent) -> bool {
+        is_cmd_k_leader_key(key, ctrl_k_leads(false, true, false))
+    }
+    // `is_save_key` also takes whether Shift is reported with Ctrl.
+    fn is_save_key_reporting_shift(key: KeyEvent) -> bool {
+        is_save_key(key, true)
+    }
+    let mut predicates: Vec<(&str, KeyPredicate)> = preds![
+        is_terminal_copy_key,
+        is_compare_key,
+        is_search_jump_key,
+        is_editor_find_key,
+        is_terminal_find_key,
+        is_editor_replace_key,
+        is_file_finder_key,
+        is_command_palette_key,
+        is_go_to_symbol_key,
+        is_focus_breadcrumbs_key,
+        is_toggle_line_comment_key,
+        is_toggle_block_comment_key,
+        is_toggle_wrap_key,
+        is_switch_header_source_key,
+        is_tree_zoxide_jump_key,
+        is_tree_new_file_key,
+        is_tree_new_folder_key,
+        is_tree_rename_key,
+        is_reveal_in_finder_key,
+        is_copy_path_key,
+        is_tree_make_root_key,
+        is_tree_make_parent_root_key,
+        is_explorer_jump_key,
+        is_source_control_jump_key,
+        is_run_debug_jump_key,
+        is_remote_jump_key,
+        is_extensions_jump_key,
+        is_drop_to_local_key,
+        is_run_build_task_key,
+        is_markdown_preview_key,
+        is_run_fence_key,
+        is_sidebar_toggle_key,
+        is_secondary_sidebar_toggle_key,
+        is_minimap_toggle_key,
+        is_terminal_toggle_key,
+        is_terminal_maximize_key,
+        is_quick_select_key,
+        is_copy_mode_key,
+        is_command_history_key,
+        is_terminal_split_key,
+        is_editor_split_key,
+        is_goto_bracket_key,
+        is_select_to_bracket_key,
+        is_navigate_back_key,
+        is_navigate_forward_key,
+        is_transpose_key,
+        is_indentation_to_spaces_key,
+        is_indentation_to_tabs_key,
+        is_trim_final_newlines_key,
+        is_toggle_bookmark_key,
+        is_switch_debug_session_key,
+        is_clear_bookmarks_key,
+        is_next_bookmark_key,
+        is_prev_bookmark_key,
+        is_join_lines_key,
+        is_transform_upper_key,
+        is_transform_lower_key,
+        is_copy_relative_path_key,
+        is_sort_lines_asc_key,
+        is_sort_lines_desc_key,
+        is_trim_trailing_whitespace_key,
+        is_increment_number_key,
+        is_decrement_number_key,
+        is_format_document_key,
+        is_emmet_expand_key,
+        is_quick_fix_key,
+        is_focus_group_left_key,
+        is_focus_group_right_key,
+        is_terminal_focus_key,
+        is_terminal_close_key,
+        is_terminal_cycle_key,
+        is_terminal_cycle_back_key,
+        is_delete_node_key,
+        is_completion_trigger_key,
+        is_save_all_key,
+        is_new_untitled_file_key,
+        is_replace_in_files_key,
+        is_search_details_key,
+        is_show_output_key,
+        is_show_problems_key,
+        is_update_croft_key,
+        is_editor_copy_key,
+        is_editor_cut_key,
+        is_search_paste_key,
+        is_editor_paste_key,
+        is_clipboard_paste_key,
+        is_editor_select_all_key,
+        is_editor_undo_key,
+        is_editor_redo_key,
+        is_rename_symbol_key,
+        is_change_all_occurrences_key,
+        is_select_all_occurrences_key,
+        is_add_cursors_to_line_ends_key,
+        is_expand_line_selection_key,
+        is_select_next_occurrence_key,
+        is_delete_line_key,
+        is_go_to_definition_key,
+        is_peek_definition_key,
+        is_go_to_references_key,
+        is_run_to_cursor_key,
+        is_peek_references_key,
+        is_go_to_declaration_key,
+        is_go_to_type_definition_key,
+        is_go_to_implementation_key,
+        is_vim_toggle_key,
+        is_editor_line_home_key,
+        is_editor_line_end_key,
+        is_editor_kill_to_eol_key,
+        is_editor_kill_to_bol_key,
+        is_editor_open_line_below_key,
+        is_editor_open_line_above_key,
+        is_close_tab_key,
+    ];
+    predicates.push(("is_save_key", is_save_key_reporting_shift));
+    predicates.push(("is_cmd_k_leader_key", leader_in_editor));
+    predicates.push(("is_cmd_k_leader_key@shell", leader_in_shell));
+    predicates
+}
+
 /// Shell command that prints `probe` on its own line WITHOUT the typed
 /// command line spelling the probe out.
 ///
