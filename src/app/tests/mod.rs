@@ -21,6 +21,8 @@ mod files;
 mod golden;
 mod hot_exit;
 mod input;
+#[cfg(target_os = "linux")]
+mod key_ledger;
 mod keybindings;
 mod layout;
 mod lsp;
