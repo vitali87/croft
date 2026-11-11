@@ -181,7 +181,11 @@ fn fetch_verified_index() -> Result<Vec<u8>> {
 /// unchanged index triggers no panel rebuild. Best-effort: any network/verify
 /// failure leaves the existing cache in place.
 fn refresh_blocking() -> bool {
-    if !index_armed() {
+    // Never under test: every app a test builds would download the index
+    // from the production server and write it into the developer's real
+    // cache, from a thread no test's cache redirect reaches. A test that
+    // needs an index caches one itself (`cache_index_for_test`).
+    if cfg!(test) || !index_armed() {
         return false;
     }
     let Ok(fresh) = fetch_verified_index() else {
