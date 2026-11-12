@@ -141,6 +141,7 @@ editor | ctrl+f12 | -
 editor | ctrl+f2 | caret=4:13 sel=4:8-4:13 carets=1:35-1:40,5:7-5:12,6:19-6:24 status="Selected 4 occurrences (type to replace, Esc to cancel)"
 editor | ctrl+g g | caret=0:0 status="Top of file"
 editor | ctrl+home | caret=0:0
+editor | ctrl+insert | -
 editor | ctrl+j | panel=hidden
 editor | ctrl+k | +leader
 editor | ctrl+k [ | status="Cannot collapse the last expanded terminal"
@@ -410,6 +411,7 @@ selection | ctrl+f12 | -
 selection | ctrl+f2 | status="No symbol under cursor"
 selection | ctrl+g g | caret=0:0 sel=- status="Top of file"
 selection | ctrl+home | caret=0:0 sel=-
+selection | ctrl+insert | status="Copied 5 chars to clipboard" clip="total"
 selection | ctrl+j | panel=hidden
 selection | ctrl+k | +leader
 selection | ctrl+k [ | status="Cannot collapse the last expanded terminal"
@@ -679,6 +681,7 @@ explorer | ctrl+f12 | -
 explorer | ctrl+f2 | +prompt("Rename main.rs" "main.rs")
 explorer | ctrl+g g | -
 explorer | ctrl+home | tree=./+,.vscode/,docs/,main.rs > .
+explorer | ctrl+insert | status="Copied 1 item"
 explorer | ctrl+j | panel=hidden
 explorer | ctrl+k | +leader
 explorer | ctrl+k [ | status="Cannot collapse the last expanded terminal"
@@ -947,6 +950,7 @@ terminal | ctrl+f12 | typed=0:"\u{1b}[24;5~"
 terminal | ctrl+f2 | typed=0:"\u{1b}[1;5Q"
 terminal | ctrl+g g | typed=0:"\u{7}g"
 terminal | ctrl+home | typed=0:"\u{1b}[1;5H"
+terminal | ctrl+insert | typed=0:"\u{1b}[2;5~"
 terminal | ctrl+j | focus=editor panel=hidden
 terminal | ctrl+k | typed=0:"\u{b}"
 terminal | ctrl+k [ | typed=0:"\u{b}["
@@ -1216,6 +1220,7 @@ search | ctrl+f12 | -
 search | ctrl+f2 | -
 search | ctrl+g g | status="Search: unhandled Ctrl+g" search="totalg" @Query:6 hits=0@0
 search | ctrl+home | search="total" @Query:0 hits=4@0
+search | ctrl+insert | -
 search | ctrl+j | panel=hidden
 search | ctrl+k | +leader
 search | ctrl+k [ | status="Cannot collapse the last expanded terminal"
@@ -1485,6 +1490,7 @@ scm | ctrl+f12 | -
 scm | ctrl+f2 | -
 scm | ctrl+g g | scm="Ship itg"@8 +focus StagedModified:docs/notes.md Untracked:todo.txt
 scm | ctrl+home | scm="Ship it"@0 +focus StagedModified:docs/notes.md Untracked:todo.txt
+scm | ctrl+insert | -
 scm | ctrl+j | panel=hidden
 scm | ctrl+k | +leader
 scm | ctrl+k [ | status="Cannot collapse the last expanded terminal"
@@ -1755,6 +1761,7 @@ palette | ctrl+f2 | -
 palette | ctrl+f5 | -
 palette | ctrl+g g | ~palette("g" @1 > "Go Back")
 palette | ctrl+home | -
+palette | ctrl+insert | -
 palette | ctrl+j | -
 palette | ctrl+k | -
 palette | ctrl+k [ | ~palette("[" @1 > "")
@@ -2027,6 +2034,7 @@ confirm | ctrl+f2 | -
 confirm | ctrl+f5 | -
 confirm | ctrl+g g | -
 confirm | ctrl+home | -
+confirm | ctrl+insert | -
 confirm | ctrl+j | -
 confirm | ctrl+k | -
 confirm | ctrl+k [ | -

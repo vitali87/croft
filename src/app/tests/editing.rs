@@ -50,6 +50,23 @@ fn ctrl_c_is_editor_copy_key() {
 }
 
 #[test]
+fn ctrl_insert_is_editor_copy_key() {
+    assert!(is_editor_copy_key(key(
+        KeyCode::Insert,
+        KeyModifiers::CONTROL
+    )));
+    // Plain Insert toggles overwrite; none of the other combinations copy.
+    for mods in [
+        KeyModifiers::NONE,
+        KeyModifiers::SHIFT,
+        KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        KeyModifiers::ALT,
+    ] {
+        assert!(!is_editor_copy_key(key(KeyCode::Insert, mods)), "{mods:?}");
+    }
+}
+
+#[test]
 fn cmd_c_is_editor_copy_key() {
     assert!(is_editor_copy_key(key(
         KeyCode::Char('c'),

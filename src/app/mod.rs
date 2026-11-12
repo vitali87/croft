@@ -82713,11 +82713,16 @@ impl CopyLanding {
 }
 
 /// Returns true if the given key event should copy the editor's current
-/// selection to the system clipboard. Recognises plain `Ctrl+C` and `Cmd+C`
-/// — there's no SIGINT collision since the editor pane is not a shell.
+/// selection to the system clipboard. Recognises plain `Ctrl+C`, `Cmd+C` and
+/// the classic `Ctrl+Insert` — there's no SIGINT collision since the editor
+/// pane is not a shell.
 fn is_editor_copy_key(key: KeyEvent) -> bool {
     let KeyCode::Char(c) = key.code else {
-        return false;
+        return key.code == KeyCode::Insert
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT);
     };
     if !c.eq_ignore_ascii_case(&'c') {
         return false;
