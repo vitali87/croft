@@ -50,6 +50,35 @@ fn opening_a_search_hit_marks_the_active_match_so_the_renderer_paints_it_orange(
 }
 
 #[test]
+fn opening_a_search_hit_scrolls_the_hit_line_into_view() {
+    // The hit's line is seated with the Go to Line scroll, not left wherever
+    // the preview's scroll was: a hit far down a file must move the view.
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("long.rs");
+    let mut body = String::new();
+    for i in 0..120 {
+        if i == 99 {
+            body.push_str("let needle_here = 1;\n");
+        } else {
+            body.push_str("let filler = 0;\n");
+        }
+    }
+    std::fs::write(&f, body).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::Search);
+    app.search.query = String::from("needle_here");
+    app.search.run_query();
+    let hit = app.search.selected_hit().cloned().expect("a hit");
+    app.open_search_hit(&hit);
+    assert_eq!(app.editor.cursor_row, 99);
+    assert!(
+        app.editor.scroll > 0,
+        "a hit on line 100 must scroll the editor, got scroll {}",
+        app.editor.scroll
+    );
+}
+
+#[test]
 fn typing_after_reactivating_search_replaces_instead_of_appending() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
@@ -2763,6 +2792,36 @@ fn search_announces_every_match_on_a_line() {
         matches: 2,
     }];
     assert_eq!(app.a11y_snapshot().focus, "Search, 2 matches in 1 file");
+}
+
+#[test]
+fn opening_a_search_hit_in_a_fresh_file_scrolls_to_it() {
+    // The file was never drawn, so the editor has no viewport to centre in;
+    // the hit must still end up in view rather than at the top of the file.
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("long.txt");
+    let body: String = (0..300)
+        .map(|i| {
+            if i == 200 {
+                "needle\n".to_string()
+            } else {
+                format!("line {i}\n")
+            }
+        })
+        .collect();
+    std::fs::write(&f, body).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::Search);
+    app.search.query = String::from("needle");
+    app.search.run_query();
+    let hit = app.search.selected_hit().cloned().expect("a hit");
+    app.open_search_hit(&hit);
+    assert_eq!(app.editor.cursor_row, 200);
+    assert!(
+        app.editor.scroll > 150 && app.editor.scroll <= 200,
+        "the hit is scrolled into reach, scroll = {}",
+        app.editor.scroll
+    );
 }
 
 /// #1729: the global search inputs are real input lines: Left/Right/Home/End

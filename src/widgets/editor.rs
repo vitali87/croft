@@ -16853,9 +16853,16 @@ impl Editor {
         self.cursor_row = line;
         self.cursor_col = self.cursor_col.min(self.line_char_len(line));
         let viewport = self.text_rows();
-        self.scroll = line
-            .saturating_sub(viewport / 2)
-            .min(self.lines.len().saturating_sub(viewport));
+        if viewport == 0 {
+            // Not rendered yet (a file opened for the first time has no
+            // geometry), so there is no middle to find: leave a few lines of
+            // context above the target and let the first render follow.
+            self.scroll = line.saturating_sub(5);
+        } else {
+            self.scroll = line
+                .saturating_sub(viewport / 2)
+                .min(self.lines.len().saturating_sub(viewport));
+        }
         self.last_edit_kind = None;
     }
 
