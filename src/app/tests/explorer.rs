@@ -3334,3 +3334,20 @@ fn a_paste_with_quick_open_over_the_new_file_prompt_goes_to_quick_open() {
     assert_eq!(app.file_finder.as_ref().unwrap().query, "lib.rs");
     assert_eq!(app.prompt.as_ref().unwrap().buffer, "main.rs");
 }
+
+#[test]
+fn a_paste_with_a_modal_over_the_new_file_prompt_leaves_the_name_alone() {
+    // A picker or dialog with no text field of its own, opened over a
+    // prompt, takes its keys; a paste then must not edit the hidden name.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    new_file_prompt(&mut app, tmp.path());
+    type_into_prompt(&mut app, "main.rs");
+    app.open_shortcuts_modal();
+    app.handle_paste("lib.rs");
+    assert_eq!(app.prompt.as_ref().unwrap().buffer, "main.rs");
+    assert!(
+        !app.editor.lines.join("\n").contains("lib.rs"),
+        "nor does the paste fall through to the editor behind"
+    );
+}

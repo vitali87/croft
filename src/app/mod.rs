@@ -21710,6 +21710,26 @@ impl App {
             || self.list_picker.is_some()
     }
 
+    /// Whether the single-line prompt (New File, Rename, ...) is the one
+    /// taking keys: open, with nothing `handle_key_inner` answers ahead of it
+    /// on top. A paste goes into the prompt only then, so it never edits the
+    /// name held under a picker, dialog or confirm drawn over it.
+    fn prompt_takes_input(&self) -> bool {
+        self.prompt.is_some()
+            && !self.modal_overlay_open()
+            && self.connect_dialog.is_none()
+            && self.settings_editor.is_none()
+            && self.pending_lossy_save.is_none()
+            && self.pending_unsaved.is_none()
+            && self.pending_replace_all.is_none()
+            && self.pending_unsaved_scm.is_none()
+            && self.pending_stash_drop.is_none()
+            && !self.pending_discard_all
+            && self.pending_run_block.is_none()
+            && self.pending_terminal_paste.is_none()
+            && !self.pending_broadcast_enable
+    }
+
     /// Whether auto-hide may collapse the sidebar RIGHT NOW. Every reason to
     /// hold it open lives here rather than being scattered through the call
     /// sites, so the interaction rules are one readable list and a new
@@ -53908,12 +53928,17 @@ impl App {
             return false;
         }
         // New File, Rename and the other single-line prompts take a paste at
-        // the caret, as the find bar does. Only after the pickers above: Quick
-        // Open and the palette open over a prompt and take its keys, so they
-        // take its paste too.
-        if let Some(prompt) = self.prompt.as_mut() {
-            let text: String = s.chars().filter(|c| !c.is_control()).collect();
-            prompt.edit(|t, at| crate::widgets::line_edit::insert_at(t, at, &text));
+        // the caret, as the find bar does, but only while they take the keys.
+        // Quick Open and the palette above take it when open over a prompt;
+        // under any other picker, dialog or confirm the paste is dropped,
+        // so it never edits the name the prompt holds out of sight.
+        if self.prompt.is_some() {
+            if self.prompt_takes_input()
+                && let Some(prompt) = self.prompt.as_mut()
+            {
+                let text: String = s.chars().filter(|c| !c.is_control()).collect();
+                prompt.edit(|t, at| crate::widgets::line_edit::insert_at(t, at, &text));
+            }
             return false;
         }
         // The in-file find bar is a pane-scoped widget, not a modal: it only
