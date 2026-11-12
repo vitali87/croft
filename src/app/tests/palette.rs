@@ -730,10 +730,7 @@ fn quick_open_with_a_line_range_lands_on_the_line_and_selects_the_range() {
     let type_and_enter = |app: &mut App, text: &str| {
         app.handle_key(key(KeyCode::Char('p'), KeyModifiers::SUPER))
             .unwrap();
-        for c in text.chars() {
-            app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
-                .unwrap();
-        }
+        type_keys(app, text);
         app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
             .unwrap();
     };
@@ -1328,13 +1325,13 @@ fn the_palette_and_vim_recorders_are_one_recording_not_two() {
     app.macros_path = tmp.path().join("macros.json");
 
     // vim starts, palette stops.
-    vim_feed_str(&mut app, "qa");
+    type_keys(&mut app, "qa");
     assert!(app.macro_recording.is_some());
     app.run_command(crate::widgets::command_palette::Command::MacroStartStopRecording);
     assert!(app.macro_recording.is_none(), "the palette stopped it");
 
     // A following `q` must START a fresh recording, not stop a phantom one.
-    vim_feed_str(&mut app, "qb");
+    type_keys(&mut app, "qb");
     assert_eq!(
         app.macro_recording.as_ref().map(|r| r.register),
         Some(Some('b')),
@@ -1345,7 +1342,7 @@ fn the_palette_and_vim_recorders_are_one_recording_not_two() {
     app.run_command(crate::widgets::command_palette::Command::MacroStartStopRecording);
     app.run_command(crate::widgets::command_palette::Command::MacroStartStopRecording);
     assert!(app.macro_recording.is_some(), "palette started one");
-    vim_feed(&mut app, 'q');
+    type_char(&mut app, 'q');
     assert!(
         app.macro_recording.is_none(),
         "a bare q stops what the palette started"
@@ -1368,13 +1365,13 @@ fn a_macro_stopped_from_the_palette_replays_only_what_was_recorded() {
     let none = |code| key(code, KeyModifiers::NONE);
     let run_from_palette = |app: &mut App, query: &str| {
         app.handle_key(palette).unwrap();
-        type_str(app, query);
+        type_keys(app, query);
         app.handle_key(none(KeyCode::Enter)).unwrap();
     };
     run_from_palette(&mut app, "Macro: Start/Stop Recording");
     assert!(app.macro_recording.is_some(), "the palette started it");
     app.handle_key(none(KeyCode::Home)).unwrap();
-    type_str(&mut app, "- ");
+    type_keys(&mut app, "- ");
     run_from_palette(&mut app, "Transform to Uppercase");
     app.handle_key(none(KeyCode::Down)).unwrap();
     run_from_palette(&mut app, "Macro: Start/Stop Recording");
@@ -1405,16 +1402,16 @@ fn a_palette_command_that_leaves_the_editor_is_not_recorded() {
     );
     let run_from_palette = |app: &mut App, query: &str| {
         app.handle_key(palette).unwrap();
-        type_str(app, query);
+        type_keys(app, query);
         app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
             .unwrap();
     };
     run_from_palette(&mut app, "Macro: Start/Stop Recording");
-    type_str(&mut app, "x");
+    type_keys(&mut app, "x");
     run_from_palette(&mut app, "Terminal: Focus Terminal");
     assert!(app.focus != Pane::Editor, "the command left the editor");
     app.focus_pane(Pane::Editor);
-    type_str(&mut app, "y");
+    type_keys(&mut app, "y");
     run_from_palette(&mut app, "Macro: Start/Stop Recording");
     app.replay_last_macro(1);
     assert!(app.focus == Pane::Editor, "replay stays in the editor");
@@ -1437,7 +1434,7 @@ fn a_palette_closed_by_a_click_leaves_nothing_for_the_macro() {
         KeyModifiers::SUPER | KeyModifiers::SHIFT,
     ))
     .unwrap();
-    type_str(&mut app, "delete line");
+    type_keys(&mut app, "delete line");
     let held = |app: &App| app.macro_recording.as_ref().unwrap().palette_keys.len();
     assert!(held(&app) > 0, "an open palette session is held");
     // A click outside closes the palette; any mouse event then lets go.
@@ -2161,7 +2158,7 @@ fn palette_query_layout_lists_the_customize_layout_commands() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     open_palette_852(&mut app);
-    type_keys_852(&mut app, "layout");
+    type_keys(&mut app, "layout");
     let titles: Vec<String> = app
         .command_palette
         .as_ref()
@@ -2195,17 +2192,17 @@ fn palette_toggles_the_activity_bar_status_bar_and_side_bar_position() {
     app.status_bar_visible = true;
     app.side_bar_position = SideBarPosition::Left;
     open_palette_852(&mut app);
-    type_keys_852(&mut app, "toggle status bar visibility");
+    type_keys(&mut app, "toggle status bar visibility");
     app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
         .unwrap();
     assert!(!app.status_bar_visible, "the status bar hides");
     open_palette_852(&mut app);
-    type_keys_852(&mut app, "toggle activity bar visibility");
+    type_keys(&mut app, "toggle activity bar visibility");
     app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
         .unwrap();
     assert!(!app.activity_bar_visible, "the activity bar hides");
     open_palette_852(&mut app);
-    type_keys_852(&mut app, "toggle primary side bar position");
+    type_keys(&mut app, "toggle primary side bar position");
     app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
         .unwrap();
     assert_eq!(app.side_bar_position, SideBarPosition::Right);
@@ -2220,20 +2217,20 @@ fn palette_sets_panel_alignment_and_quick_input_position_by_key() {
     app.panel_alignment = PanelAlignment::Center;
     app.quick_input_position = QuickInputPosition::Top;
     open_palette_852(&mut app);
-    type_keys_852(&mut app, "set panel alignment");
+    type_keys(&mut app, "set panel alignment");
     app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
         .unwrap();
     assert!(app.list_picker.is_some(), "the alignment picker opens");
-    type_keys_852(&mut app, "justify");
+    type_keys(&mut app, "justify");
     app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
         .unwrap();
     assert_eq!(app.panel_alignment, PanelAlignment::Justify);
     open_palette_852(&mut app);
-    type_keys_852(&mut app, "set quick input position");
+    type_keys(&mut app, "set quick input position");
     app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
         .unwrap();
     assert!(app.list_picker.is_some(), "the position picker opens");
-    type_keys_852(&mut app, "center");
+    type_keys(&mut app, "center");
     app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
         .unwrap();
     assert_eq!(app.quick_input_position, QuickInputPosition::Center);
@@ -2276,7 +2273,7 @@ fn palette_layout_commands_leave_the_customize_layout_popup_closed() {
 /// The palette's rows for `query`, then Esc.
 fn palette_rows_852(app: &mut App, query: &str) -> Vec<String> {
     open_palette_852(app);
-    type_keys_852(app, query);
+    type_keys(app, query);
     let rows = app
         .command_palette
         .as_ref()

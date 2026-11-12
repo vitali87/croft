@@ -1226,17 +1226,6 @@ fn vim_app(content: &str) -> (App, tempfile::TempDir) {
     (app, tmp)
 }
 
-fn vim_feed(app: &mut App, c: char) {
-    app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
-        .unwrap();
-}
-
-fn vim_feed_str(app: &mut App, s: &str) {
-    for c in s.chars() {
-        vim_feed(app, c);
-    }
-}
-
 /// The issue's repo (#1345): a committed `.vscode/settings.json` hides
 /// `**/generated` from files and `**/tests/fixtures` from search, and
 /// `parse_order` has one real hit, six fixture hits and one generated one.
@@ -1449,6 +1438,7 @@ fn cmd_shift_l(app: &mut App) {
     .unwrap();
 }
 
+/// Presses `c` with no modifier, as [`type_keys`] does for each character.
 fn type_char(app: &mut App, c: char) {
     app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
         .unwrap();
@@ -3173,10 +3163,12 @@ fn app_with_a_disk_conflict(tmp: &std::path::Path) -> (App, std::path::PathBuf) 
     (app, f)
 }
 
+/// Types `text` one unmodified keystroke per character through
+/// `App::handle_key`, into whatever has the keyboard: the editor (which
+/// leaves its buffer dirty), a palette, a picker, the find bar or Vim.
 fn type_keys(app: &mut App, text: &str) {
     for c in text.chars() {
-        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
-            .unwrap();
+        type_char(app, c);
     }
 }
 

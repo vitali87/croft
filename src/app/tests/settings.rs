@@ -534,7 +534,7 @@ fn a_settings_reload_keeps_the_current_vim_mode() {
         ..Default::default()
     };
     app.apply_merged_settings(&on);
-    vim_feed(&mut app, 'i');
+    type_char(&mut app, 'i');
     assert_eq!(app.vim.mode(), crate::vim::VimMode::Insert);
     app.apply_merged_settings(&on);
     assert!(app.vim.enabled);
@@ -1830,13 +1830,6 @@ fn settings_editor_app(cfg: &std::path::Path, tmp: &std::path::Path) -> App {
     app
 }
 
-fn type_query(app: &mut App, q: &str) {
-    for c in q.chars() {
-        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
-            .unwrap();
-    }
-}
-
 #[test]
 fn the_settings_editor_flips_a_setting_into_the_user_layer_and_applies_it() {
     // #612: search a setting, Enter edits it in place, the file and the live
@@ -1865,7 +1858,7 @@ fn the_settings_editor_flips_a_setting_into_the_user_layer_and_applies_it() {
         .cloned()
         .unwrap();
     assert_eq!(copy.layer, crate::config_layers::LayerKind::Workspace);
-    type_query(&mut app, "auto save");
+    type_keys(&mut app, "auto save");
     let row = app
         .settings_editor
         .as_ref()
@@ -1921,7 +1914,7 @@ fn del_resets_a_toggled_setting_and_drops_its_key() {
     )
     .unwrap();
     let mut app = settings_editor_app(cfg.path(), tmp.path());
-    type_query(&mut app, "auto save on focus change");
+    type_keys(&mut app, "auto save on focus change");
     assert_eq!(
         selected_setting(&app).layer,
         crate::config_layers::LayerKind::User
@@ -1952,7 +1945,7 @@ fn del_resets_a_number_setting_to_its_default() {
     )
     .unwrap();
     let mut app = settings_editor_app(cfg.path(), tmp.path());
-    type_query(&mut app, "terminal scrollback");
+    type_keys(&mut app, "terminal scrollback");
     app.handle_key(key(KeyCode::Delete, KeyModifiers::NONE))
         .unwrap();
     let written = user_config(cfg.path());
@@ -1980,7 +1973,7 @@ fn resetting_the_user_value_leaves_the_workspace_one_in_force() {
     )
     .unwrap();
     let mut app = settings_editor_app(cfg.path(), tmp.path());
-    type_query(&mut app, "copy on select");
+    type_keys(&mut app, "copy on select");
     app.handle_key(key(KeyCode::Delete, KeyModifiers::NONE))
         .unwrap();
     assert!(user_config(cfg.path()).get("copy_on_select").is_none());
@@ -2002,7 +1995,7 @@ fn del_on_a_setting_the_layer_does_not_set_writes_nothing() {
     let cfg = tempfile::tempdir().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let mut app = settings_editor_app(cfg.path(), tmp.path());
-    type_query(&mut app, "copy on select");
+    type_keys(&mut app, "copy on select");
     app.handle_key(key(KeyCode::Delete, KeyModifiers::NONE))
         .unwrap();
     assert!(!cfg.path().join("config.json").exists());
@@ -2041,7 +2034,7 @@ fn the_settings_editor_marks_changed_rows_and_shows_del_reset() {
     )
     .unwrap();
     let mut app = settings_editor_app(cfg.path(), tmp.path());
-    type_query(&mut app, "auto save");
+    type_keys(&mut app, "auto save");
     let buf = render_buf(&mut app);
     let lines: Vec<String> = (0..buf.area.height)
         .map(|y| {
@@ -2079,7 +2072,7 @@ fn the_settings_editor_writes_the_workspace_layer_only_for_allowed_keys() {
         app.settings_editor.as_ref().unwrap().target,
         crate::config_layers::LayerKind::Workspace
     );
-    type_query(&mut app, "format on save");
+    type_keys(&mut app, "format on save");
     app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
         .unwrap();
     let ws: serde_json::Value = serde_json::from_str(
@@ -2096,7 +2089,7 @@ fn the_settings_editor_writes_the_workspace_layer_only_for_allowed_keys() {
         app.handle_key(key(KeyCode::Backspace, KeyModifiers::NONE))
             .unwrap();
     }
-    type_query(&mut app, "sidebar auto hide");
+    type_keys(&mut app, "sidebar auto hide");
     app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
         .unwrap();
     assert!(app.status.contains("user"), "{}", app.status);
@@ -2163,7 +2156,7 @@ fn the_settings_editor_writes_the_active_profile_s_config() {
     let cfg = tempfile::tempdir().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let mut app = settings_editor_app_in_profile(cfg.path(), tmp.path());
-    type_query(&mut app, "auto save");
+    type_keys(&mut app, "auto save");
     assert_eq!(
         app.settings_editor
             .as_ref()
@@ -2235,7 +2228,7 @@ fn without_a_profile_the_settings_editor_keeps_the_default_config() {
         settings_row(&app, "auto_save").value,
         serde_json::json!(false)
     );
-    type_query(&mut app, "auto save");
+    type_keys(&mut app, "auto save");
     app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
         .unwrap();
     let written: serde_json::Value =
@@ -2256,7 +2249,7 @@ fn the_settings_editor_asks_for_a_number_and_refuses_one_that_is_not() {
     let cfg = tempfile::tempdir().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let mut app = settings_editor_app(cfg.path(), tmp.path());
-    type_query(&mut app, "terminal scrollback");
+    type_keys(&mut app, "terminal scrollback");
     app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
         .unwrap();
     assert!(matches!(
@@ -2285,7 +2278,7 @@ fn enter_on_the_unset_language_picks_one_in_the_editor() {
     let cfg = tempfile::tempdir().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let mut app = settings_editor_app(cfg.path(), tmp.path());
-    type_query(&mut app, "locale");
+    type_keys(&mut app, "locale");
     app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
         .unwrap();
     assert!(app.settings_editor.is_some(), "still in the editor");
@@ -2308,7 +2301,7 @@ fn an_unset_number_setting_takes_a_number_and_an_empty_entry_unsets_it() {
     let cfg = tempfile::tempdir().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let mut app = settings_editor_app(cfg.path(), tmp.path());
-    type_query(&mut app, "terminal rewind");
+    type_keys(&mut app, "terminal rewind");
     app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
         .unwrap();
     assert!(matches!(
@@ -2345,7 +2338,7 @@ fn a_value_the_setting_cannot_hold_is_refused() {
     app.write_setting("code_scanning", serde_json::json!("enabled"));
     assert!(app.status.contains("can't be enabled"), "{}", app.status);
     assert!(!cfg.path().join("config.json").exists());
-    type_query(&mut app, "code scanning");
+    type_keys(&mut app, "code scanning");
     app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
         .unwrap();
     assert!(app.input_prompt.is_none(), "a choice: no free text to type");
@@ -2371,7 +2364,7 @@ fn a_list_setting_opens_its_layer_file_at_the_key() {
     let mut app = settings_editor_app(cfg.path(), tmp.path());
     app.handle_key(key(KeyCode::Tab, KeyModifiers::NONE))
         .unwrap();
-    type_query(&mut app, "files_exclude");
+    type_keys(&mut app, "files_exclude");
     app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
         .unwrap();
     assert!(app.settings_editor.is_none());
@@ -2397,7 +2390,7 @@ fn a_list_setting_in_the_user_layer_opens_the_user_file_at_the_key() {
     )
     .unwrap();
     let mut app = settings_editor_app(cfg.path(), tmp.path());
-    type_query(&mut app, "search exclude");
+    type_keys(&mut app, "search exclude");
     app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
         .unwrap();
     let opened = app.editor.path.clone().unwrap();
@@ -2421,7 +2414,7 @@ fn confirming_an_empty_review_prefix_keeps_it_empty() {
     )
     .unwrap();
     let mut app = settings_editor_app(cfg.path(), tmp.path());
-    type_query(&mut app, "review_ai_prefix");
+    type_keys(&mut app, "review_ai_prefix");
     app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
         .unwrap();
     let prompt = app.input_prompt.as_ref().expect("a text prompt");
@@ -2442,11 +2435,11 @@ fn the_settings_editor_draws_its_value_prompt_on_top() {
     let cfg = tempfile::tempdir().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let mut app = settings_editor_app(cfg.path(), tmp.path());
-    type_query(&mut app, "terminal scrollback");
+    type_keys(&mut app, "terminal scrollback");
     app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
         .unwrap();
     assert!(app.input_prompt.is_some(), "Enter asks for the number");
-    type_query(&mut app, "424242");
+    type_keys(&mut app, "424242");
     let backend = ratatui::backend::TestBackend::new(120, 36);
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|frame| app.render(frame)).unwrap();

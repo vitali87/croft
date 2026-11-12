@@ -1668,7 +1668,7 @@ fn a_replayed_key_cannot_start_a_recording() {
     hostile.push_key(key(KeyCode::Char('c'), KeyModifiers::NONE));
     app.macro_registers.insert("b".into(), hostile);
 
-    vim_feed_str(&mut app, "@b");
+    type_keys(&mut app, "@b");
     assert!(
         app.macro_recording.is_none(),
         "replaying a recording gesture must not leave the editor recording"
@@ -1748,7 +1748,7 @@ fn a_macro_of_only_unknown_steps_reports_that_it_ran_nothing() {
     .unwrap();
     app.macro_registers = crate::macros::load(&path);
 
-    vim_feed_str(&mut app, "@u");
+    type_keys(&mut app, "@u");
     assert!(
         app.status.contains("no steps this version can replay"),
         "an all-unknown macro says so, got {:?}",
@@ -1809,7 +1809,7 @@ fn a_replay_aborts_visibly_and_keeps_earlier_iterations() {
     app.macro_registers.insert("z".into(), big);
     let before = app.editor.lines[0].clone();
 
-    vim_feed_str(&mut app, "99999@z");
+    type_keys(&mut app, "99999@z");
     assert!(
         app.status.contains("refused"),
         "a replay past the budget is refused visibly, got {:?}",
@@ -1832,7 +1832,7 @@ fn a_macro_paste_counts_its_characters_against_the_replay_budget() {
     big.push_paste(&"x".repeat(10_000));
     app.macro_registers.insert("z".into(), big);
     let before = app.editor.lines[0].clone();
-    vim_feed_str(&mut app, "100@z");
+    type_keys(&mut app, "100@z");
     assert!(
         app.status.contains("refused"),
         "a replay past the budget is refused visibly, got {:?}",
@@ -1852,7 +1852,7 @@ fn a_non_register_key_after_q_aborts_the_gesture() {
     app.editor.cursor_row = 0;
     app.editor.cursor_col = 0;
 
-    vim_feed(&mut app, 'q');
+    type_char(&mut app, 'q');
     app.handle_key(key(KeyCode::Down, KeyModifiers::NONE))
         .unwrap();
     assert!(
@@ -1861,7 +1861,7 @@ fn a_non_register_key_after_q_aborts_the_gesture() {
     );
 
     // The following letter must be an ordinary motion, not a register name.
-    vim_feed(&mut app, 'j');
+    type_char(&mut app, 'j');
     assert!(
         app.macro_recording.is_none(),
         "and does not retroactively start a recording"
@@ -1874,14 +1874,14 @@ fn a_replayed_key_is_never_recorded_into_the_macro_producing_it() {
     // guard a macro would grow while replaying and never terminate.
     let (mut app, tmp) = vim_app("one\ntwo\n");
     app.macros_path = tmp.path().join("macros.json");
-    vim_feed_str(&mut app, "qa");
-    vim_feed_str(&mut app, "IX");
+    type_keys(&mut app, "qa");
+    type_keys(&mut app, "IX");
     app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
         .unwrap();
-    vim_feed(&mut app, 'q');
+    type_char(&mut app, 'q');
     let recorded_len = app.macro_registers.get("a").unwrap().len();
 
-    vim_feed_str(&mut app, "@a");
+    type_keys(&mut app, "@a");
     assert_eq!(
         app.macro_registers.get("a").unwrap().len(),
         recorded_len,
@@ -1897,9 +1897,9 @@ fn record_and_replay_a_macro_with_a_paste(lines: &[&str], paste: &str) -> App {
     app.run_command(Command::MacroStartStopRecording);
     app.handle_key(key(KeyCode::End, KeyModifiers::NONE))
         .unwrap();
-    type_str(&mut app, ": ");
+    type_keys(&mut app, ": ");
     app.handle_paste(paste);
-    type_str(&mut app, " ok");
+    type_keys(&mut app, " ok");
     app.handle_key(key(KeyCode::Down, KeyModifiers::NONE))
         .unwrap();
     app.run_command(Command::MacroStartStopRecording);
@@ -1947,9 +1947,9 @@ fn a_paste_is_recorded_as_one_step_of_its_own() {
     use crate::widgets::command_palette::Command;
     let mut app = editor_app_with_lines(&["alpha"]);
     app.run_command(Command::MacroStartStopRecording);
-    type_str(&mut app, "ab");
+    type_keys(&mut app, "ab");
     app.handle_paste("P\nQ");
-    type_str(&mut app, "c");
+    type_keys(&mut app, "c");
     app.run_command(Command::MacroStartStopRecording);
     let steps = app.macro_last.as_ref().expect("recorded").steps.clone();
     assert_eq!(
@@ -1972,7 +1972,7 @@ fn a_paste_into_another_pane_while_recording_is_skipped_and_logged() {
     use crate::widgets::command_palette::Command;
     let mut app = editor_app_with_lines(&["alpha"]);
     app.run_command(Command::MacroStartStopRecording);
-    type_str(&mut app, "x");
+    type_keys(&mut app, "x");
     app.focus_pane(Pane::Tree);
     app.handle_paste("SKIPPED-PASTE-1464");
     app.focus_pane(Pane::Editor);
@@ -2030,16 +2030,16 @@ fn a_replayed_paste_is_never_recorded_again() {
 fn an_empty_recording_is_discarded_rather_than_clobbering_a_good_macro() {
     let (mut app, tmp) = vim_app("x\n");
     app.macros_path = tmp.path().join("macros.json");
-    vim_feed_str(&mut app, "qa");
-    vim_feed_str(&mut app, "IZ");
+    type_keys(&mut app, "qa");
+    type_keys(&mut app, "IZ");
     app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
         .unwrap();
-    vim_feed(&mut app, 'q');
+    type_char(&mut app, 'q');
     let good = app.macro_registers.get("a").cloned().unwrap();
 
     // Start and immediately stop: nothing recorded.
-    vim_feed_str(&mut app, "qa");
-    vim_feed(&mut app, 'q');
+    type_keys(&mut app, "qa");
+    type_char(&mut app, 'q');
     assert_eq!(
         app.macro_registers.get("a"),
         Some(&good),
@@ -2053,12 +2053,12 @@ fn a_macro_recorded_in_vim_mode_replays_from_the_palette() {
     // entry points are interchangeable — the issue calls this out explicitly.
     let (mut app, tmp) = vim_app("one\ntwo\n");
     app.macros_path = tmp.path().join("macros.json");
-    vim_feed_str(&mut app, "qa");
-    vim_feed_str(&mut app, "IX");
+    type_keys(&mut app, "qa");
+    type_keys(&mut app, "IX");
     app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
         .unwrap();
-    vim_feed(&mut app, 'j');
-    vim_feed(&mut app, 'q');
+    type_char(&mut app, 'j');
+    type_char(&mut app, 'q');
 
     app.run_command(crate::widgets::command_palette::Command::MacroReplayLast);
     assert_eq!(
@@ -2072,11 +2072,11 @@ fn a_register_survives_a_restart_through_macros_json() {
     let (mut app, tmp) = vim_app("one\n");
     let path = tmp.path().join("macros.json");
     app.macros_path = path.clone();
-    vim_feed_str(&mut app, "qa");
-    vim_feed_str(&mut app, "IX");
+    type_keys(&mut app, "qa");
+    type_keys(&mut app, "IX");
     app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
         .unwrap();
-    vim_feed(&mut app, 'q');
+    type_char(&mut app, 'q');
 
     // A fresh load of the store sees the register, which is what App::new does.
     let reloaded = crate::macros::load(&path);
