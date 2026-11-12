@@ -3316,3 +3316,21 @@ fn the_new_file_prompt_walks_and_deletes_by_word_and_takes_a_paste_at_the_caret(
         "paste drops the newline and lands at the caret"
     );
 }
+
+#[test]
+fn a_paste_with_quick_open_over_the_new_file_prompt_goes_to_quick_open() {
+    // Quick Open opens over a prompt without closing it and takes the keys
+    // typed into it; a paste must follow the keys, not change the name the
+    // prompt is holding underneath.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    new_file_prompt(&mut app, tmp.path());
+    type_into_prompt(&mut app, "main.rs");
+    app.handle_key(key(KeyCode::Char('p'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert!(app.file_finder.is_some(), "Ctrl+P opens Quick Open");
+    assert!(app.prompt.is_some(), "the prompt stays open underneath");
+    app.handle_paste("lib.rs");
+    assert_eq!(app.file_finder.as_ref().unwrap().query, "lib.rs");
+    assert_eq!(app.prompt.as_ref().unwrap().buffer, "main.rs");
+}

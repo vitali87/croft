@@ -53873,13 +53873,6 @@ impl App {
             }
             return false;
         }
-        // New File, Rename and the other single-line prompts take a paste at
-        // the caret, as the find bar does.
-        if let Some(prompt) = self.prompt.as_mut() {
-            let text: String = s.chars().filter(|c| !c.is_control()).collect();
-            prompt.edit(|t, at| crate::widgets::line_edit::insert_at(t, at, &text));
-            return false;
-        }
         if let Some(palette) = self.command_palette.as_mut() {
             for c in s.chars() {
                 if !c.is_control() {
@@ -53912,6 +53905,15 @@ impl App {
                 }
             }
             self.follow_quick_open_prefix();
+            return false;
+        }
+        // New File, Rename and the other single-line prompts take a paste at
+        // the caret, as the find bar does. Only after the pickers above: Quick
+        // Open and the palette open over a prompt and take its keys, so they
+        // take its paste too.
+        if let Some(prompt) = self.prompt.as_mut() {
+            let text: String = s.chars().filter(|c| !c.is_control()).collect();
+            prompt.edit(|t, at| crate::widgets::line_edit::insert_at(t, at, &text));
             return false;
         }
         // The in-file find bar is a pane-scoped widget, not a modal: it only
