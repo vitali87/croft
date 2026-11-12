@@ -454,7 +454,7 @@ fn close_to_the_right_counts_the_unsaved_tabs_it_keeps() {
         std::fs::write(f, "x\n").unwrap();
     }
     app.editor.open_pinned(&b).unwrap();
-    type_into_editor(&mut app, "y");
+    type_keys(&mut app, "y");
     app.editor.open_pinned(&c).unwrap();
     app.dispatch_menu_action(MenuAction::CloseTabsToRight(0), tmp.path().to_path_buf());
     let open: Vec<_> = app.editor.editors.iter().map(|e| e.path.clone()).collect();
@@ -514,7 +514,7 @@ fn s_at_the_close_prompt_saves_only_that_tab() {
     let b = tmp.path().join("b.txt");
     std::fs::write(&b, "bravo\n").unwrap();
     app.editor.open_pinned(&b).unwrap();
-    type_into_editor(&mut app, "y");
+    type_keys(&mut app, "y");
     app.editor.select(0);
     app.handle_key(key(KeyCode::Char('w'), KeyModifiers::SUPER))
         .unwrap();
@@ -602,7 +602,7 @@ fn discarding_a_tab_keeps_the_other_unsaved_tabs_backed_up() {
     let b = tmp.path().join("b.txt");
     std::fs::write(&b, "bravo\n").unwrap();
     app.editor.open_pinned(&b).unwrap();
-    type_into_editor(&mut app, "z");
+    type_keys(&mut app, "z");
     settle_hot_exit(&mut app);
     assert_eq!(app.editor.path.as_deref(), Some(b.as_path()), "setup");
     app.handle_key(key(KeyCode::Char('w'), KeyModifiers::SUPER))
@@ -1976,7 +1976,7 @@ fn a_side_preview_follows_the_typing_and_stays_a_preview_across_a_save() {
     );
     app.editor.cursor_row = 2;
     app.editor.cursor_col = app.editor.lines[2].len();
-    type_str(&mut app, " Typed");
+    type_keys(&mut app, " Typed");
     assert!(app.sync_markdown_side_previews(), "the edit re-renders it");
     let (text, dirty) = side(&app);
     assert!(text.contains("First paragraph. Typed"), "{text}");

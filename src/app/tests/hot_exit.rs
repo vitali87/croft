@@ -46,7 +46,7 @@ fn ctrl_q_with_an_unsaved_tab_asks_before_quitting() {
     // The prompt owns the keyboard: typing does not reach the buffer, and a
     // second Ctrl+Q does not force the quit.
     let before = app.editor.lines.clone();
-    type_into_editor(&mut app, "zz");
+    type_keys(&mut app, "zz");
     press_ctrl_q(&mut app);
     assert_eq!(app.editor.lines, before);
     assert!(!app.quit);
@@ -98,7 +98,7 @@ fn s_at_the_quit_prompt_saves_every_split_and_quits() {
     std::fs::write(&b, "bravo\n").unwrap();
     app.split_editor();
     app.editor.open_pinned(&b).unwrap();
-    type_into_editor(&mut app, "y");
+    type_keys(&mut app, "y");
     assert!(app.editor_layout.is_split(), "setup: two groups");
     press_ctrl_q(&mut app);
     assert!(!app.quit);
@@ -445,7 +445,7 @@ fn an_emptied_untitled_buffer_does_not_hold_up_a_quit() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.focus_pane(Pane::Editor);
-    type_into_editor(&mut app, "x");
+    type_keys(&mut app, "x");
     app.handle_key(key(KeyCode::Backspace, KeyModifiers::NONE))
         .unwrap();
     assert_eq!(app.editor.lines, vec![String::new()], "setup");
@@ -784,9 +784,7 @@ fn csv_grid_app(root: &std::path::Path, cache: &std::path::Path) -> (App, PathBu
 
 /// Type `value` into the grid's selected cell and commit it with Enter.
 fn type_into_cell(app: &mut App, value: &str) {
-    for c in value.chars() {
-        app.handle_sheet_key(key(KeyCode::Char(c), KeyModifiers::NONE));
-    }
+    type_into_sheet(app, value);
     app.handle_sheet_key(key(KeyCode::Enter, KeyModifiers::NONE));
 }
 
@@ -1794,7 +1792,7 @@ fn hot_exit_does_not_back_up_clean_buffers() {
         !crate::hot_exit::workspace_dir(cache.path(), tmp.path()).exists(),
         "not even the directory"
     );
-    type_into_editor(&mut app, "x");
+    type_keys(&mut app, "x");
     settle_hot_exit(&mut app);
     assert_eq!(hot_exit_files(cache.path(), tmp.path()).len(), 1, "setup");
     app.handle_key(key(KeyCode::Char('s'), KeyModifiers::CONTROL))
@@ -1824,7 +1822,7 @@ fn hot_exit_does_not_rewrite_an_unchanged_backup() {
         "sentinel",
         "not rewritten"
     );
-    type_into_editor(&mut app, "y");
+    type_keys(&mut app, "y");
     settle_hot_exit(&mut app);
     let backup = crate::hot_exit::Backup::load(&file).unwrap();
     assert!(
@@ -2559,7 +2557,7 @@ fn ctrl_n_opens_numbered_untitled_tabs() {
         assert!(app.focus == Pane::Editor);
         let first = app.editor.active_index();
         assert_eq!(app.editor.tab_display_label(first), "Untitled-1");
-        type_str(&mut app, "trace");
+        type_keys(&mut app, "trace");
         assert_eq!(app.editor.lines[0], "trace");
         app.handle_key(key(KeyCode::Char('n'), mods)).unwrap();
         assert_eq!(app.editor.tab_count(), 3);
@@ -2592,7 +2590,7 @@ fn quitting_with_text_in_an_untitled_tab_asks_first() {
     let mut app = app_with_open_file(tmp.path(), "b.txt", "keep\n");
     app.handle_key(key(KeyCode::Char('n'), KeyModifiers::SUPER))
         .unwrap();
-    type_str(&mut app, "draft");
+    type_keys(&mut app, "draft");
     press_ctrl_q(&mut app);
     assert!(!app.quit);
     assert_eq!(app.pending_unsaved, Some(UnsavedExit::Quit));
@@ -2608,7 +2606,7 @@ fn saving_an_untitled_tab_asks_where_and_names_the_tab() {
     let mut app = app_with_open_file(tmp.path(), "b.txt", "keep\n");
     app.handle_key(key(KeyCode::Char('n'), KeyModifiers::SUPER))
         .unwrap();
-    type_str(&mut app, "x = 1");
+    type_keys(&mut app, "x = 1");
     app.save();
     let prompt = app.prompt.as_mut().expect("Save asks where");
     assert!(matches!(prompt.kind, PromptKind::SaveAs));

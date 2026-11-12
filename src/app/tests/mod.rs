@@ -775,14 +775,6 @@ fn xlsx_value(p: &std::path::Path, col: u32, row: u32) -> String {
         .to_string()
 }
 
-/// Type `text` into the focused editor, which leaves its buffer dirty.
-fn type_into_editor(app: &mut App, text: &str) {
-    for c in text.chars() {
-        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
-            .unwrap();
-    }
-}
-
 fn press_ctrl_q(app: &mut App) {
     app.handle_key(key(KeyCode::Char('q'), KeyModifiers::CONTROL))
         .unwrap();
@@ -791,7 +783,7 @@ fn press_ctrl_q(app: &mut App) {
 /// An app with `a.txt` open, edited and unsaved, and the file's path (#862).
 fn app_with_unsaved_file(tmp: &std::path::Path) -> (App, PathBuf) {
     let mut app = app_with_open_file(tmp, "a.txt", "alpha\n");
-    type_into_editor(&mut app, "x");
+    type_keys(&mut app, "x");
     assert!(app.editor.dirty, "setup: typing leaves the buffer dirty");
     (app, tmp.join("a.txt"))
 }
@@ -878,10 +870,7 @@ fn run_from_palette(app: &mut App, title: &str) -> bool {
         KeyModifiers::SUPER | KeyModifiers::SHIFT,
     ))
     .unwrap();
-    for c in title.chars() {
-        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
-            .unwrap();
-    }
+    type_keys(app, title);
     let palette = app.command_palette.as_mut().expect("the palette opened");
     let Some(row) = palette.results.iter().position(|i| i.title() == title) else {
         app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
@@ -1542,10 +1531,7 @@ fn quick_open_typing(app: &mut App, typed: &str) {
     app.handle_key(key(KeyCode::Char('p'), KeyModifiers::SUPER))
         .unwrap();
     assert!(app.file_finder.is_some(), "Cmd+P opens Quick Open");
-    for c in typed.chars() {
-        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
-            .unwrap();
-    }
+    type_keys(app, typed);
 }
 
 /// A local-provider seat for tests: connects to the workspace relay but
@@ -2087,10 +2073,7 @@ fn type_a_header_line(app: &mut App) {
         .unwrap();
     app.handle_key(key(KeyCode::Up, KeyModifiers::NONE))
         .unwrap();
-    for c in "# header".chars() {
-        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
-            .unwrap();
-    }
+    type_keys(app, "# header");
 }
 
 // ---------------------------------------------------------------------------
@@ -2910,14 +2893,6 @@ fn revert_file(app: &mut App) {
     app.run_command(cmd);
 }
 
-/// Types `text` into whatever overlay has the keyboard, one key at a time.
-fn type_keys_852(app: &mut App, text: &str) {
-    for c in text.chars() {
-        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
-            .unwrap();
-    }
-}
-
 /// Opens the Command Palette with `Cmd+Shift+P`, as a user would.
 fn open_palette_852(app: &mut App) {
     app.handle_key(key(
@@ -2979,7 +2954,7 @@ fn tab_names_852(tabs: &crate::widgets::editor::EditorTabs) -> Vec<String> {
 /// Enter. Returns the title of the row Enter ran, `None` when none matched.
 fn run_in_palette_852(app: &mut App, query: &str) -> Option<String> {
     open_palette_852(app);
-    type_keys_852(app, query);
+    type_keys(app, query);
     let ran = app
         .command_palette
         .as_ref()
@@ -3195,13 +3170,6 @@ fn ctrl(c: char) -> KeyEvent {
     key(KeyCode::Char(c), KeyModifiers::CONTROL)
 }
 
-fn type_str(app: &mut App, s: &str) {
-    for c in s.chars() {
-        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
-            .unwrap();
-    }
-}
-
 fn find_query(app: &App) -> String {
     app.editor_find.as_ref().map(|s| s.query.clone()).unwrap()
 }
@@ -3309,7 +3277,7 @@ fn app_with_a_saved_edit() -> (tempfile::TempDir, std::path::PathBuf, App) {
     app.editor.open_pinned(&a).unwrap();
     app.focus_pane(Pane::Editor);
     app.handle_editor_key(key(KeyCode::End, KeyModifiers::NONE));
-    type_str(&mut app, "00");
+    type_keys(&mut app, "00");
     app.handle_key(ctrl('s')).unwrap();
     assert_eq!(std::fs::read_to_string(&a).unwrap(), "value = 100\n");
     assert!(!app.editor.dirty);

@@ -52,7 +52,7 @@ fn a_remote_handoff_asks_about_edits_made_during_the_install() {
         let mut app = app_with_open_file(tmp.path(), "a.txt", "alpha\n");
         // Nothing was unsaved when the connect was asked for; the edit
         // comes while the install runs.
-        type_into_editor(&mut app, "x");
+        type_keys(&mut app, "x");
         ready_to_hand_off(&mut app, event);
         app.poll_install_session();
         assert!(!app.quit, "the unsaved a.txt must not go with the handoff");

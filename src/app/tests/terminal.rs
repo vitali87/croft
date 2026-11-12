@@ -8245,7 +8245,7 @@ fn ctrl_n_leaves_terminals_vim_and_shifted_chords_alone() {
     let mut app = app_with_open_file(tmp.path(), "b.txt", "keep\n");
     app.handle_key(key(KeyCode::Char('n'), KeyModifiers::SUPER))
         .unwrap();
-    type_str(&mut app, "note");
+    type_keys(&mut app, "note");
     app.save();
     app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
         .unwrap();

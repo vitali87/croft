@@ -1769,7 +1769,7 @@ fn run_emmet(app: &mut App, cmd: crate::widgets::command_palette::Command, answe
     app.run_command(cmd);
     if let Some(answer) = answer {
         assert!(app.input_prompt.is_some(), "a prompt asks first");
-        type_str(app, answer);
+        type_keys(app, answer);
         app.submit_input_prompt();
     }
 }
@@ -2879,12 +2879,12 @@ fn end_on_a_short_line_leaves_the_view_alone() {
 fn ctrl_a_selects_the_query_and_ctrl_backspace_deletes_a_word() {
     let (mut app, _tmp) = find_seed_app(2, 0);
     app.handle_key(ctrl('f')).unwrap();
-    type_str(&mut app, "write rows");
+    type_keys(&mut app, "write rows");
     app.handle_key(key(KeyCode::Backspace, KeyModifiers::CONTROL))
         .unwrap();
     assert_eq!(find_query(&app), "write ");
     app.handle_key(ctrl('a')).unwrap();
-    type_str(&mut app, "read");
+    type_keys(&mut app, "read");
     assert_eq!(find_query(&app), "read");
 }
 
