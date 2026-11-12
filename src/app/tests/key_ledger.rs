@@ -672,14 +672,14 @@ fn scm_view(sc: &crate::widgets::source_control::SourceControlPanel) -> String {
 
 /// The repository at `root` as git reports it: the branch, the stashes and
 /// each change's two status letters, `-` outside a repository. The HEAD
-/// commit's id is left out: it changes with the clock.
+/// commit's id is left out: it changes with the clock. Read through
+/// [`test_git`], so neither a global ignore file nor a `GIT_DIR` from the
+/// developer's setup changes what it reports.
 fn git_state(root: &Path) -> String {
     if !root.join(".git").exists() {
         return String::from("-");
     }
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(root)
+    let out = test_git(root)
         .args(["status", "--porcelain=v2", "--branch", "--show-stash"])
         .arg("--untracked-files=all")
         .env("GIT_OPTIONAL_LOCKS", "0")
@@ -1255,22 +1255,17 @@ fn workspace(root: &Path) {
 }
 
 /// Make the workspace at `root` a repository: everything committed on
-/// `main`, then a change to `docs/notes.md` staged and `todo.txt` new. Who
-/// commits and that nothing signs or hooks a commit is the repository's own
-/// config, so a commit from croft goes the same way whatever the
-/// developer's git config says.
+/// `main`, then a change to `docs/notes.md` staged and `todo.txt` new. The
+/// fixture's own git commands go through [`test_git`], so the developer's
+/// git setup and a `GIT_DIR` a hook exports never reach them. Who commits
+/// from croft, and that nothing signs or hooks its commits, is the
+/// repository's own config, so a commit from croft goes the same way
+/// whatever the developer's git config says.
 fn repository(root: &Path) {
-    let git = |args: &[&str]| {
-        let out = std::process::Command::new("git")
-            .arg("-C")
-            .arg(root)
-            .args(args)
-            .output()
-            .unwrap();
-        let err = String::from_utf8_lossy(&out.stderr);
-        assert!(out.status.success(), "git {args:?}: {err}");
-    };
-    git(&["init", "-q", "-b", "main"]);
+    // The app's own git commands are production code and would read a
+    // repository a hook names; fail at once rather than ledger it.
+    super::golden::refuse_inherited_git_state();
+    git_init(root);
     let config = root.join(".git/config");
     let mut text = std::fs::read_to_string(&config).unwrap();
     text.push_str(
@@ -1278,10 +1273,10 @@ fn repository(root: &Path) {
          [commit]\n\tgpgsign = false\n[core]\n\thooksPath = /dev/null\n",
     );
     std::fs::write(&config, text).unwrap();
-    git(&["add", "-A"]);
-    git(&["commit", "-q", "-m", "Start"]);
+    git_ok(root, &["add", "-A"]);
+    git_ok(root, &["commit", "-q", "-m", "Start"]);
     std::fs::write(root.join("docs/notes.md"), "# Notes\n\nShip it.\n").unwrap();
-    git(&["add", "docs/notes.md"]);
+    git_ok(root, &["add", "docs/notes.md"]);
     std::fs::write(root.join("todo.txt"), "tests\n").unwrap();
 }
 
