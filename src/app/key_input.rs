@@ -3033,11 +3033,16 @@ pub(super) fn is_save_key(key: KeyEvent, kitty_keys: bool) -> bool {
 }
 
 /// Returns true if the given key event should copy the editor's current
-/// selection to the system clipboard. Recognises plain `Ctrl+C` and `Cmd+C`
-/// — there's no SIGINT collision since the editor pane is not a shell.
+/// selection to the system clipboard. Recognises plain `Ctrl+C`, `Cmd+C` and
+/// the classic `Ctrl+Insert` — there's no SIGINT collision since the editor
+/// pane is not a shell.
 pub(super) fn is_editor_copy_key(key: KeyEvent) -> bool {
     let KeyCode::Char(c) = key.code else {
-        return false;
+        return key.code == KeyCode::Insert
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT);
     };
     if !c.eq_ignore_ascii_case(&'c') {
         return false;
@@ -3067,9 +3072,11 @@ pub(super) fn is_editor_paste_key(key: KeyEvent) -> bool {
     is_clipboard_paste_key(key)
 }
 
+/// Paste: `Ctrl+V` / `Cmd+V`, its raw 0x16 byte, and the classic
+/// `Shift+Insert`.
 pub(super) fn is_clipboard_paste_key(key: KeyEvent) -> bool {
     let KeyCode::Char(c) = key.code else {
-        return false;
+        return key.code == KeyCode::Insert && key.modifiers == KeyModifiers::SHIFT;
     };
     if c == '\u{16}' {
         return true;
