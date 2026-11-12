@@ -5882,6 +5882,7 @@ impl Editor {
     /// buffer, the width or the Tab Size changes. Drives the horizontal
     /// scrollbar's content extent and the `scroll_col` clamp. `&mut self` so the lazy recompute can populate the cache.
     fn content_cols(&mut self, width: usize) -> usize {
+        use unicode_segmentation::UnicodeSegmentation;
         self.sync_tab_cells();
         let tab = char_cells('\t');
         if let Some((w, t, cols)) = self.hscroll_content_cols
@@ -5912,25 +5913,28 @@ impl Editor {
                 // that `extent - width` is exactly that scroll.
                 // Tab stops count from the line's left edge, so the tail from
                 // char `first` takes `col - start(first)` cells, which shrinks
-                // as `first` grows: the scroll is the first char starting at or
-                // past the `col + extra - width` cells that must scroll off.
-                // Two passes and no table per char, which on a huge one-line
-                // file was hundreds of MB before the first frame.
+                // as `first` grows: the scroll is the first grapheme cluster
+                // starting at or past the `col + extra - width` cells that must
+                // scroll off. A whole cluster, never a char inside one: the row
+                // scrolled to `👍🏽`'s skin tone draws the tone on its own, two
+                // cells wider than the tail measured here. Two passes and no
+                // table per char, which on a huge one-line file was hundreds of
+                // MB before the first frame.
                 let (col, len) =
                     char_cells_from(l, 0).fold((0, 0), |(col, n), (_, w)| (col + w, n + 1));
                 if col + extra <= width {
                     return len + extra;
                 }
                 let off = col + extra - width;
-                let first = char_cells_from(l, 0)
-                    .scan(0, |at, (_, w)| {
-                        let start = *at;
-                        *at += w;
-                        Some(start)
-                    })
-                    .position(|start| start >= off)
-                    .unwrap_or(len);
-                first + width
+                let (mut at, mut first) = (0, 0);
+                for cluster in l.graphemes(true) {
+                    if at >= off {
+                        return first + width;
+                    }
+                    at += cluster_cells_at(cluster, at);
+                    first += cluster.chars().count();
+                }
+                len + width
             })
             .max()
             .unwrap_or(0);
@@ -37519,6 +37523,15 @@ mod tests {
             use_spaces: false,
         });
         assert_eq!(e.content_cols(5), 3 + 5);
+        // `⇥👍🏽123456789` at Tab Size 4 is 15 cells. The scroll that shows its
+        // tail in 10 passes the whole emoji, not just its first char, which
+        // would leave the skin tone drawn alone and the last digit cut off.
+        e.lines = vec!["\t\u{1f44d}\u{1f3fd}123456789".to_string()];
+        e.set_indent_style(IndentStyle {
+            width: 4,
+            use_spaces: false,
+        });
+        assert_eq!(e.content_cols(10), 3 + 10);
     }
 
     #[test]
@@ -38525,7 +38538,7 @@ mod tests {
         let mut buf = Buffer::empty(Rect::new(0, 0, 6, 1));
         let bg = Color::Red;
         let line = "a\u{1f44d}\u{1f3fd}b";
-        paint_intraline_range(&mut buf, 0, 0, 6, line, 0, (2, 3), bg, Color::White);
+        paint_intraline_range(&mut buf, 0, 0, 6, line, 0, (2, 3), bg, Color::White, None);
         let marked: Vec<bool> = (0..6).map(|x| buf[(x, 0)].bg == bg).collect();
         assert_eq!(marked, [false, true, true, false, false, false]);
         assert_ne!(buf[(5, 0)].symbol(), "\u{203a}", "no off-screen marker");
@@ -38538,7 +38551,16 @@ mod tests {
         set_tab_cells(4);
         let mut buf = Buffer::empty(Rect::new(0, 0, 8, 1));
         let red = Style::default().fg(Color::Red);
-        paint_diff_syntax(&mut buf, 0, 0, 8, "a\tb", 0, &[HiSpan::new(2, 3, red)]);
+        paint_diff_syntax(
+            &mut buf,
+            0,
+            0,
+            8,
+            "a\tb",
+            0,
+            &[HiSpan::new(2, 3, red)],
+            DiffInkLift::new(None, Color::Reset),
+        );
         assert_eq!(clip_pad_cells("a\tb", 0, 8), "a   b   ");
         assert_eq!(buf[(4, 0)].fg, Color::Red, "b is drawn at the stop, cell 4");
         assert_eq!(buf[(5, 0)].fg, Color::Reset);
