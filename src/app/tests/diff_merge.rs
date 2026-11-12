@@ -772,9 +772,12 @@ fn taking_the_incoming_deletion_removes_the_file() {
     app.run_command(crate::widgets::command_palette::Command::MergeAcceptAllIncoming);
     app.complete_merge();
     assert!(!tmp.path().join("gone.txt").exists(), "{}", app.status);
-    assert_eq!(git_out(tmp.path(), &["ls-files", "gone.txt"]), "");
     assert_eq!(
-        git_out(tmp.path(), &["status", "--porcelain", "gone.txt"]),
+        git_stdout_untrimmed(tmp.path(), &["ls-files", "gone.txt"]),
+        ""
+    );
+    assert_eq!(
+        git_stdout_untrimmed(tmp.path(), &["status", "--porcelain", "gone.txt"]),
         "D  gone.txt\n"
     );
     assert!(app.status.contains("removed gone.txt"), "{}", app.status);
@@ -793,7 +796,10 @@ fn taking_the_current_deletion_removes_the_file() {
     app.run_command(crate::widgets::command_palette::Command::MergeAcceptAllCurrent);
     app.complete_merge();
     assert!(!tmp.path().join("gone.txt").exists(), "{}", app.status);
-    assert_eq!(git_out(tmp.path(), &["ls-files", "gone.txt"]), "");
+    assert_eq!(
+        git_stdout_untrimmed(tmp.path(), &["ls-files", "gone.txt"]),
+        ""
+    );
 }
 
 #[test]

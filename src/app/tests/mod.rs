@@ -702,13 +702,90 @@ fn nav_switch_fixture() -> (tempfile::TempDir, App, PathBuf, PathBuf) {
     (tmp, app, a, b)
 }
 
-fn git_stdout_in(root: &std::path::Path, args: &[&str]) -> String {
-    let out = std::process::Command::new("git")
-        .args(args)
-        .current_dir(root)
-        .output()
-        .unwrap();
-    String::from_utf8_lossy(&out.stdout).to_string()
+/// The author and committer of every commit a test makes with
+/// [`test_git`]. [`git_init_with_identity`] also writes it into the
+/// repository's own config, for fixtures where the app commits; a fixture
+/// that writes an identity of its own keeps that one for the app's commits.
+const TEST_GIT_NAME: &str = "a";
+const TEST_GIT_EMAIL: &str = "a@b";
+
+/// `git -C dir`, shut off from the developer's own git setup. Every git
+/// command a test runs itself, to build a fixture or to read one back,
+/// starts here. It inherits no `GIT_*` variable: no setting passed in the
+/// environment (`GIT_CONFIG_COUNT` and `GIT_CONFIG_PARAMETERS` entries, a
+/// template dir, a hash, dates, pathspec modes), and no `GIT_DIR`,
+/// `GIT_WORK_TREE` or `GIT_INDEX_FILE` that would point it at another
+/// repository (git exports those to a hook that runs the tests). It reads
+/// no global or system config (so no default branch, signing, hooks,
+/// aliases or identity of theirs) and no global ignore or attributes file.
+/// Commits are made as [`TEST_GIT_NAME`] and no editor opens. All of it is
+/// set on the command, never on the process. The app's own git calls are
+/// production code and never come here.
+fn test_git(dir: &Path) -> std::process::Command {
+    let mut git = std::process::Command::new("git");
+    for (name, _) in std::env::vars_os() {
+        if name.as_encoded_bytes().starts_with(b"GIT_") {
+            git.env_remove(name);
+        }
+    }
+    git.arg("-C")
+        .arg(dir)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        // Where git finds the global `ignore` and `attributes` files, which
+        // it reads whatever `GIT_CONFIG_GLOBAL` says.
+        .env("XDG_CONFIG_HOME", "/dev/null")
+        .env("GIT_AUTHOR_NAME", TEST_GIT_NAME)
+        .env("GIT_AUTHOR_EMAIL", TEST_GIT_EMAIL)
+        .env("GIT_COMMITTER_NAME", TEST_GIT_NAME)
+        .env("GIT_COMMITTER_EMAIL", TEST_GIT_EMAIL)
+        .env("GIT_EDITOR", "true");
+    git
+}
+
+/// `git init -q -b main` in `dir`: the first branch is `main` whatever the
+/// developer's `init.defaultBranch` says.
+fn git_init(dir: &Path) {
+    git_ok(dir, &["init", "-q", "-b", "main"]);
+}
+
+/// [`git_init`], then [`TEST_GIT_NAME`] as the repository's own identity,
+/// so the app's own commits there do not need the developer's.
+fn git_init_with_identity(dir: &Path) {
+    git_init(dir);
+    git_ok(dir, &["config", "user.email", TEST_GIT_EMAIL]);
+    git_ok(dir, &["config", "user.name", TEST_GIT_NAME]);
+}
+
+/// Runs [`test_git`] in `dir`, failing the test with git's error unless it
+/// succeeds; its stdout, trimmed.
+fn git_ok(dir: &Path, args: &[&str]) -> String {
+    let out = test_git(dir).args(args).output().unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?} in {}: {}",
+        dir.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// Runs [`test_git`] in `dir`; true when it succeeded. A git that cannot
+/// start fails the test. A caller that ignores the answer tolerates a step
+/// that fails.
+fn git_succeeds(dir: &Path, args: &[&str]) -> bool {
+    test_git(dir).args(args).output().unwrap().status.success()
+}
+
+/// Runs [`test_git`] in `dir`, succeeding or not; its stdout, trimmed.
+fn git_stdout(dir: &Path, args: &[&str]) -> String {
+    git_stdout_untrimmed(dir, args).trim().to_string()
+}
+
+/// [`git_stdout`] with git's trailing newline kept.
+fn git_stdout_untrimmed(dir: &Path, args: &[&str]) -> String {
+    let out = test_git(dir).args(args).output().unwrap();
+    String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
 fn file_node(path: &Path) -> crate::widgets::file_tree::Node {
@@ -885,32 +962,10 @@ fn markdown_fence_app(dir: &Path) -> App {
 fn make_committed_repo() -> tempfile::TempDir {
     let tmp = tempfile::tempdir().unwrap();
     let p = tmp.path();
-    let _ = std::process::Command::new("git")
-        .args(["-C"])
-        .arg(p)
-        .args(["init", "-q", "-b", "main"])
-        .output();
-    let _ = std::process::Command::new("git")
-        .args(["-C"])
-        .arg(p)
-        .args(["config", "user.email", "a@b"])
-        .status();
-    let _ = std::process::Command::new("git")
-        .args(["-C"])
-        .arg(p)
-        .args(["config", "user.name", "a"])
-        .status();
+    git_init_with_identity(p);
     std::fs::write(p.join("seed.txt"), b"seed\n").unwrap();
-    let _ = std::process::Command::new("git")
-        .args(["-C"])
-        .arg(p)
-        .args(["add", "seed.txt"])
-        .status();
-    let _ = std::process::Command::new("git")
-        .args(["-C"])
-        .arg(p)
-        .args(["commit", "-q", "-m", "init"])
-        .status();
+    let _ = git_succeeds(p, &["add", "seed.txt"]);
+    let _ = git_succeeds(p, &["commit", "-q", "-m", "init"]);
     tmp
 }
 
@@ -997,19 +1052,6 @@ fn diverged_repo() -> tempfile::TempDir {
     tmp
 }
 
-/// Run git in `dir` without an editor; true when it succeeded.
-fn git_succeeds(dir: &std::path::Path, args: &[&str]) -> bool {
-    std::process::Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .env("GIT_EDITOR", "true")
-        .output()
-        .unwrap()
-        .status
-        .success()
-}
-
 /// A repo with `seed.txt` changed and the Source Control panel open on it,
 /// ready to commit (#1241).
 fn scm_ready_to_commit() -> (tempfile::TempDir, App) {
@@ -1041,13 +1083,7 @@ fn scm_with_unsaved_tab() -> (tempfile::TempDir, App) {
 }
 
 fn last_commit_message(root: &std::path::Path) -> String {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["log", "-1", "--format=%B"])
-        .output()
-        .unwrap();
-    String::from_utf8_lossy(&out.stdout).into_owned()
+    git_stdout_untrimmed(root, &["log", "-1", "--format=%B"])
 }
 
 fn editor_app_with_lines(lines: &[&str]) -> App {
@@ -1871,19 +1907,8 @@ fn wait_for_conflicted_entry(app: &mut App) -> usize {
 /// #1244: `gone.txt` deleted on one branch and modified on the other, mid
 /// `git merge feature`. `deleted_on_feature` picks which side deleted it.
 fn modify_delete_repo(tmp: &std::path::Path, deleted_on_feature: bool) {
-    let git = |args: &[&str]| {
-        std::process::Command::new("git")
-            .arg("-C")
-            .arg(tmp)
-            .args(args)
-            .env("GIT_AUTHOR_NAME", "t")
-            .env("GIT_AUTHOR_EMAIL", "t@t")
-            .env("GIT_COMMITTER_NAME", "t")
-            .env("GIT_COMMITTER_EMAIL", "t@t")
-            .output()
-            .unwrap()
-    };
-    git(&["init", "-q", "-b", "main"]);
+    let git = |args: &[&str]| git_succeeds(tmp, args);
+    git_init(tmp);
     std::fs::write(tmp.join("gone.txt"), "x\ny\n").unwrap();
     git(&["add", "-A"]);
     git(&["commit", "-qm", "base"]);
@@ -1903,18 +1928,7 @@ fn modify_delete_repo(tmp: &std::path::Path, deleted_on_feature: bool) {
         git(&["rm", "-q", "gone.txt"]);
         git(&["commit", "-qm", "delete"]);
     }
-    let merge = git(&["merge", "feature"]);
-    assert!(!merge.status.success(), "modify/delete must conflict");
-}
-
-fn git_out(tmp: &std::path::Path, args: &[&str]) -> String {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(tmp)
-        .args(args)
-        .output()
-        .unwrap();
-    String::from_utf8_lossy(&out.stdout).into_owned()
+    assert!(!git(&["merge", "feature"]), "modify/delete must conflict");
 }
 
 fn open_modify_delete(tmp: &std::path::Path, deleted_on_feature: bool) -> App {
@@ -2125,16 +2139,6 @@ fn repo_with_seed(text: &str) -> (tempfile::TempDir, std::path::PathBuf) {
     git_ok(&root, &["add", "."]);
     git_ok(&root, &["commit", "-m", "init", "--quiet"]);
     (tmp, f)
-}
-
-fn git_ok(root: &std::path::Path, args: &[&str]) {
-    let st = std::process::Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(args)
-        .status()
-        .unwrap();
-    assert!(st.success(), "git {args:?}");
 }
 
 /// Write `text` to `path` so that its `(mtime, len)` stamp differs from the
@@ -3082,8 +3086,8 @@ fn encoded_repo(name: &str, head: &[u8], added: &[u8]) -> (tempfile::TempDir, st
     let tmp = make_committed_repo();
     let f = tmp.path().join(name);
     std::fs::write(&f, head).unwrap();
-    git_stdout_in(tmp.path(), &["add", name]);
-    git_stdout_in(tmp.path(), &["commit", "-qm", "encoded"]);
+    let _ = git_succeeds(tmp.path(), &["add", name]);
+    let _ = git_succeeds(tmp.path(), &["commit", "-qm", "encoded"]);
     std::fs::write(&f, [head, added].concat()).unwrap();
     (tmp, f)
 }
