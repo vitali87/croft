@@ -1863,10 +1863,10 @@ fn preview_link_under_the_pointer_lifts_to_the_hover_background() {
     app.editor.open_pinned(&readme).unwrap();
     app.focus_pane(Pane::Editor);
     app.toggle_markdown_preview();
-    render_buf(&mut app);
+    draw_buffer(&mut app, 140, 50);
     app.handle_key(key(KeyCode::Down, KeyModifiers::NONE))
         .unwrap();
-    render_buf(&mut app);
+    draw_buffer(&mut app, 140, 50);
     let md = app
         .editor
         .markdown_preview
@@ -1890,7 +1890,7 @@ fn preview_link_under_the_pointer_lifts_to_the_hover_background() {
             row,
             modifiers: KeyModifiers::NONE,
         });
-        let buf = render_buf(app);
+        let buf = draw_buffer(app, 140, 50);
         let rows = app.editor.markdown_preview.as_ref().unwrap().rows.clone();
         (buf, rows)
     };

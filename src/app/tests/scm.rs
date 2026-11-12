@@ -2887,7 +2887,7 @@ fn commit_with_an_unsaved_tab_in_the_repo_asks_before_committing() {
         head,
         "no commit yet"
     );
-    let rendered = screen_text_863(&mut app, 120, 40);
+    let rendered = draw_screen(&mut app, 120, 40);
     assert!(rendered.contains("UNSAVED CHANGES"), "{rendered}");
     assert!(rendered.contains("Save All & Commit"), "{rendered}");
     assert!(rendered.contains("seed.txt"), "{rendered}");
@@ -3156,7 +3156,7 @@ fn drop_stash_asks_before_it_deletes_the_stash() {
         2,
         "nothing dropped yet"
     );
-    let screen = draw_screen(&mut app);
+    let screen = draw_screen(&mut app, 160, 40);
     assert!(screen.contains("DROP STASH?"), "{screen}");
     assert!(screen.contains("WIP payment retries"), "{screen}");
     app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
@@ -3171,7 +3171,7 @@ fn drop_stash_asks_before_it_deletes_the_stash() {
         "the picked one went: {left:?}"
     );
     assert!(app.status.starts_with("Dropped stash"), "{}", app.status);
-    assert!(!draw_screen(&mut app).contains("DROP STASH?"));
+    assert!(!draw_screen(&mut app, 160, 40).contains("DROP STASH?"));
 }
 
 /// #1128 negative: N or Esc closes the question and keeps every stash.
@@ -3183,7 +3183,10 @@ fn drop_stash_answered_no_keeps_the_stash() {
         app.handle_key(key(answer, KeyModifiers::NONE)).unwrap();
         assert_eq!(stash_messages_1128(tmp.path()).len(), 2, "{answer:?}");
         assert_eq!(app.status, "Kept the stash");
-        assert!(!draw_screen(&mut app).contains("DROP STASH?"), "{answer:?}");
+        assert!(
+            !draw_screen(&mut app, 160, 40).contains("DROP STASH?"),
+            "{answer:?}"
+        );
     }
 }
 
@@ -3214,7 +3217,7 @@ fn drop_stash_ignores_a_modified_y() {
         "Ctrl+Shift+Y kept it"
     );
     assert!(
-        draw_screen(&mut app).contains("DROP STASH?"),
+        draw_screen(&mut app, 160, 40).contains("DROP STASH?"),
         "still asking"
     );
     app.handle_key(key(KeyCode::Char('Y'), KeyModifiers::SHIFT))
@@ -4305,7 +4308,7 @@ fn copy_commit_hash_for_line_copies_the_lines_commit() {
 fn hovering_the_inline_blame_shows_its_commits_whole_message() {
     use crossterm::event::{MouseButton, MouseEventKind};
     let (_tmp, mut app) = blamed_line_app();
-    let (col, row) = find_on_screen(&mut app, "Raise").expect("line 2's blame is painted");
+    let (col, row) = draw_and_find(&mut app, 120, 44, "Raise").expect("line 2's blame is painted");
     app.handle_mouse(mouse(MouseEventKind::Moved, col, row));
     // What the dwell runs once the pointer has rested HOVER_DELAY.
     app.hover_at_cell(col, row);
@@ -4355,7 +4358,7 @@ fn a_blame_card_for_a_commit_no_longer_under_the_pointer_is_dropped() {
     assert!(git_succeeds(p, &["add", "g.py"]));
     let author = "--author=Ann Lee <ann@example.com>";
     assert!(git_succeeds(p, &["commit", "-q", author, "-m", "Add g"]));
-    let (col, row) = find_on_screen(&mut app, "Bo Chen").expect("f.py's blame is painted");
+    let (col, row) = draw_and_find(&mut app, 120, 44, "Bo Chen").expect("f.py's blame is painted");
     app.handle_mouse(mouse(MouseEventKind::Moved, col, row));
     app.hover_at_cell(col, row);
     app.editor.open(&g).unwrap();
@@ -4369,7 +4372,10 @@ fn a_blame_card_for_a_commit_no_longer_under_the_pointer_is_dropped() {
             app.editor.blame_for.as_deref() == Some(g.as_path()) && app.editor.blame_lines.is_some()
         },
     );
-    assert_eq!(find_on_screen(&mut app, "Ann Lee"), Some((col, row)));
+    assert_eq!(
+        draw_and_find(&mut app, 120, 44, "Ann Lee"),
+        Some((col, row))
+    );
     crate::test_budget::await_spawned(std::time::Duration::from_millis(500), "f.py's card", || {
         app.drain_blame_hover();
         app.blame_hover.is_none() || app.hover_popup.is_some()
@@ -4422,8 +4428,7 @@ fn commit_graph_app(p: &std::path::Path) -> App {
         .set_rows(crate::widgets::commit_graph::layout_graph(
             crate::git::commit_graph(p, 100),
         ));
-    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(110, 44)).unwrap();
-    term.draw(|frame| app.render(frame)).unwrap();
+    draw(&mut app, 110, 44);
     app
 }
 
@@ -7415,7 +7420,7 @@ fn source_control_lists_the_repo_found_one_folder_down() {
     std::fs::create_dir_all(tmp.path().join(".hidden/.git")).unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.sidebar_view = SidebarView::SourceControl;
-    let _ = render_buf(&mut app);
+    let _ = draw_buffer(&mut app, 140, 50);
     let sub = tmp.path().join("sub").canonicalize().unwrap();
     assert_eq!(
         app.source_control.nested_repos,
@@ -7437,7 +7442,7 @@ fn source_control_still_offers_initialize_with_no_repo_below() {
     std::fs::create_dir(tmp.path().join("plain_dir")).unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.sidebar_view = SidebarView::SourceControl;
-    let _ = render_buf(&mut app);
+    let _ = draw_buffer(&mut app, 140, 50);
     assert!(app.source_control.nested_repos.is_empty());
     assert!(app.source_control.last_init_repo_button_area.width > 0);
 }

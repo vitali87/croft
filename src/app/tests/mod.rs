@@ -1342,32 +1342,45 @@ fn left_click(app: &mut App, column: u16, row: u16) {
     });
 }
 
+// The screen helpers. Every `draw*` one renders a fresh frame of the size
+// its caller names; `screen_text`, `status_row` and `find_painted` only
+// read a terminal the test already drew.
+
+/// Draws `app` into a fresh `w` x `h` terminal and returns it, for a test
+/// that reads the frame or draws into it again.
+fn draw_terminal(
+    app: &mut App,
+    w: u16,
+    h: u16,
+) -> ratatui::Terminal<ratatui::backend::TestBackend> {
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    term
+}
+
+/// Draws `app` at `w` x `h` and throws the frame away, for what drawing
+/// records on the app (hit rects, laid-out areas) that a click or an
+/// assertion reads next.
 fn draw(app: &mut App, w: u16, h: u16) {
-    let backend = ratatui::backend::TestBackend::new(w, h);
-    let mut term = ratatui::Terminal::new(backend).unwrap();
-    term.draw(|f| app.render(f)).unwrap();
+    draw_terminal(app, w, h);
 }
 
-/// Render the app at 140x50 and clone the buffer for color probing.
-fn render_buf(app: &mut App) -> ratatui::buffer::Buffer {
-    let backend = ratatui::backend::TestBackend::new(140, 50);
-    let mut term = ratatui::Terminal::new(backend).unwrap();
-    term.draw(|f| app.render(f)).unwrap();
-    term.backend().buffer().clone()
+/// Draws `app` at `w` x `h` and returns the frame's cells, for colour and
+/// style probes.
+fn draw_buffer(app: &mut App, w: u16, h: u16) -> ratatui::buffer::Buffer {
+    draw_terminal(app, w, h).backend().buffer().clone()
 }
 
-/// Paint `app` at 120 x 44 and find the first screen cell where `needle`
-/// starts.
-fn find_on_screen(app: &mut App, needle: &str) -> Option<(u16, u16)> {
-    let backend = ratatui::backend::TestBackend::new(120, 44);
-    let mut term = ratatui::Terminal::new(backend).unwrap();
-    term.draw(|f| app.render(f)).unwrap();
-    let buf = term.backend().buffer();
-    (0..44).find_map(|y| {
-        let text: String = (0..120).map(|x| buf[(x, y)].symbol()).collect();
-        let at = text.find(needle)?;
-        Some((text[..at].chars().count() as u16, y))
-    })
+/// Draws `app` at `w` x `h` and returns the frame as text, the way
+/// [`screen_text`] reads it.
+fn draw_screen(app: &mut App, w: u16, h: u16) -> String {
+    screen_text(&draw_terminal(app, w, h))
+}
+
+/// Draws `app` at `w` x `h` and finds the first cell where `needle` starts,
+/// the way [`find_painted`] does across the whole width.
+fn draw_and_find(app: &mut App, w: u16, h: u16, needle: &str) -> Option<(u16, u16)> {
+    find_painted(&draw_terminal(app, w, h), needle, 0..w)
 }
 
 fn count_bg(buf: &ratatui::buffer::Buffer, c: Color) -> usize {
@@ -2716,12 +2729,6 @@ for a in args:
     std::fs::write(&program, script).unwrap();
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755)).unwrap();
     program
-}
-
-fn draw_screen(app: &mut App) -> String {
-    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 40)).unwrap();
-    term.draw(|f| app.render(f)).unwrap();
-    screen_text(&term)
 }
 
 /// Two results in one file and one in another, for navigation.

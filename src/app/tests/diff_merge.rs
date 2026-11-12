@@ -189,7 +189,7 @@ fn diff_word_selection_highlights_every_other_occurrence() {
     std::fs::write(&f2, "alpha one\nalpha two\nalpha three\nalpha four\n").unwrap();
     app.editor.open_diff(&f1, &f2).unwrap();
     app.focus = Pane::Editor;
-    let _ = render_buf(&mut app);
+    let _ = draw_buffer(&mut app, 140, 50);
 
     // Select the word "alpha" (cols 0..5) on the left column of the first row.
     {
@@ -202,7 +202,7 @@ fn diff_word_selection_highlights_every_other_occurrence() {
         );
     }
 
-    let buf = render_buf(&mut app);
+    let buf = draw_buffer(&mut app, 140, 50);
     let occurrence = app.theme.ui(Color::Rgb(0x37, 0x61, 0x8e));
     let occ_cells = count_bg(&buf, occurrence);
     // The selected word itself is overpainted by the brighter selection band,

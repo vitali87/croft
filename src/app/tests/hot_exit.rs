@@ -36,7 +36,7 @@ fn ctrl_q_with_an_unsaved_tab_asks_before_quitting() {
     press_ctrl_q(&mut app);
     assert!(!app.quit, "an unsaved buffer must not be dropped by Ctrl+Q");
     assert_eq!(app.pending_unsaved, Some(UnsavedExit::Quit));
-    let screen = draw_screen(&mut app);
+    let screen = draw_screen(&mut app, 160, 40);
     assert!(screen.contains("UNSAVED CHANGES"), "{screen}");
     assert!(screen.contains("1 file has unsaved changes"), "{screen}");
     assert!(
@@ -102,7 +102,7 @@ fn s_at_the_quit_prompt_saves_every_split_and_quits() {
     assert!(app.editor_layout.is_split(), "setup: two groups");
     press_ctrl_q(&mut app);
     assert!(!app.quit);
-    let screen = draw_screen(&mut app);
+    let screen = draw_screen(&mut app, 160, 40);
     assert!(screen.contains("2 files have unsaved changes"), "{screen}");
     app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE))
         .unwrap();
@@ -471,7 +471,7 @@ fn closing_an_unsaved_tab_asks_rather_than_dropping_it() {
         Some(UnsavedExit::CloseTab { idx: 0, .. })
     ));
     assert_ne!(app.status, "Closed tab");
-    let screen = draw_screen(&mut app);
+    let screen = draw_screen(&mut app, 160, 40);
     assert!(screen.contains("This tab has unsaved changes"), "{screen}");
     app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
         .unwrap();
@@ -490,18 +490,18 @@ fn a_click_behind_the_unsaved_prompt_closes_nothing() {
     std::fs::write(&b, "bravo\n").unwrap();
     app.editor.open_pinned(&b).unwrap();
     app.editor.select(0);
-    draw_screen(&mut app);
+    draw_screen(&mut app, 160, 40);
     let row = app.editor.tab_strip_y_for_test();
     let col = app.editor.close_screen_x(1).expect("b.txt's close button");
     app.handle_key(key(KeyCode::Char('w'), KeyModifiers::SUPER))
         .unwrap();
-    draw_screen(&mut app);
+    draw_screen(&mut app, 160, 40);
     left_click(&mut app, col, row);
     assert_eq!(app.editor.tab_count(), 2, "the click went nowhere");
     assert!(app.pending_unsaved.is_some(), "the prompt is still asking");
     app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
         .unwrap();
-    draw_screen(&mut app);
+    draw_screen(&mut app, 160, 40);
     left_click(&mut app, col, row);
     assert_eq!(app.editor.tab_count(), 1, "with no prompt it closes b.txt");
 }
@@ -2594,7 +2594,7 @@ fn quitting_with_text_in_an_untitled_tab_asks_first() {
     press_ctrl_q(&mut app);
     assert!(!app.quit);
     assert_eq!(app.pending_unsaved, Some(UnsavedExit::Quit));
-    let screen = draw_screen(&mut app);
+    let screen = draw_screen(&mut app, 160, 40);
     assert!(screen.contains("Untitled-1"), "{screen}");
 }
 

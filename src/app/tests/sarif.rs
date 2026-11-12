@@ -601,7 +601,7 @@ fn sarif_info_tab_shows_rule_help_tags_and_related_locations() {
     let (tmp, log) = sarif_flow_fixture();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.editor.open(&log).unwrap();
-    let screen = draw_screen(&mut app);
+    let screen = draw_screen(&mut app, 160, 40);
     assert!(
         screen.contains("Use parameters instead."),
         "rule help:\n{screen}"
@@ -619,7 +619,7 @@ fn sarif_steps_tab_walks_the_code_flow_in_the_editor() {
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.editor.open_preview(&log).unwrap();
     app.handle_sarif_key(key(KeyCode::Char('d'), KeyModifiers::NONE));
-    let screen = draw_screen(&mut app);
+    let screen = draw_screen(&mut app, 160, 40);
     assert!(screen.contains("Steps"), "{screen}");
     assert!(
         screen.contains("source") && screen.contains("sink"),
@@ -653,17 +653,17 @@ fn sarif_stacks_and_raw_tabs() {
     app.editor.open(&log).unwrap();
     app.handle_sarif_key(key(KeyCode::Char('d'), KeyModifiers::NONE));
     app.handle_sarif_key(key(KeyCode::Char('d'), KeyModifiers::NONE));
-    let screen = draw_screen(&mut app);
+    let screen = draw_screen(&mut app, 160, 40);
     assert!(screen.contains("frame zero"), "stacks tab:\n{screen}");
     assert!(
         screen.contains("src/db.rs:3:2"),
         "frame location with its column:\n{screen}"
     );
     app.handle_sarif_key(key(KeyCode::Char('d'), KeyModifiers::NONE));
-    let screen = draw_screen(&mut app);
+    let screen = draw_screen(&mut app, 160, 40);
     assert!(screen.contains("\"ruleId\": \"R1\""), "raw tab:\n{screen}");
     app.handle_sarif_key(key(KeyCode::Char('D'), KeyModifiers::NONE));
-    let screen = draw_screen(&mut app);
+    let screen = draw_screen(&mut app, 160, 40);
     assert!(
         screen.contains("frame zero"),
         "D goes back a tab:\n{screen}"
@@ -791,7 +791,7 @@ fn sarif_fix_tab_previews_and_f_applies_the_fix_as_an_unsaved_edit() {
         for _ in 0..4 {
             app.handle_sarif_key(key(KeyCode::Char('d'), KeyModifiers::NONE));
         }
-        let screen = draw_screen(&mut app);
+        let screen = draw_screen(&mut app, 160, 40);
         assert!(
             screen.contains("Sanitise it"),
             "the fix's description:\n{screen}"
@@ -1042,7 +1042,7 @@ fn the_run_tab_shows_the_tool_its_invocation_and_notifications() {
         app.editor.sarif.as_ref().unwrap().tab,
         crate::sarif::view::Tab::Run
     );
-    let screen = draw_screen(&mut app);
+    let screen = draw_screen(&mut app, 160, 40);
     for want in [
         "CodeQL 2.19.3",
         "https://codeql.github.com",
@@ -1097,7 +1097,7 @@ fn the_sarif_key_legend_names_the_fix_log_baseline_and_export_keys() {
     let (tmp, log) = sarif_fixture();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.editor.open(&log).unwrap();
-    let screen = draw_screen(&mut app);
+    let screen = draw_screen(&mut app, 160, 40);
     for want in ["f fix", "o add log", "b baseline", "E export"] {
         assert!(screen.contains(want), "{want} missing:\n{screen}");
     }
@@ -1272,7 +1272,7 @@ fn the_info_tab_lists_the_results_taxa() {
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.editor.open(&log).unwrap();
     app.editor.sarif.as_mut().unwrap().selected = 1;
-    let screen = draw_screen(&mut app);
+    let screen = draw_screen(&mut app, 160, 40);
     assert!(screen.contains("CWE CWE-89: SqlInjection"), "{screen}");
 }
 
