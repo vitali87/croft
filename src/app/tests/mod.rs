@@ -1159,6 +1159,16 @@ fn relay_test_lock() -> &'static std::sync::Mutex<()> {
 /// `relay_test_lock`.
 const TEST_RELAY_KEY: &str = "0123456789abcdef";
 
+/// Give `app` a settings folder of its own, empty, for as long as the
+/// returned folder lives. `App::new` keeps the developer's own folder as
+/// `config_dir`, and finishing or skipping the tour saves `tour_done` there,
+/// so a test that starts the tour would otherwise write into their settings.
+fn own_settings(app: &mut App) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    app.config_dir = dir.path().to_path_buf();
+    dir
+}
+
 fn with_relay_home<T>(home: &std::path::Path, body: impl FnOnce() -> T) -> T {
     // The cache dir is redirected through its test override instead of
     // repointing the process-global `$HOME` (#37): unrelated test threads

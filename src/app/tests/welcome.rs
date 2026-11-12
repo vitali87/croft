@@ -1256,6 +1256,7 @@ fn the_demo_tour_runs_in_a_scratch_project_and_esc_cleans_up() {
     with_relay_home(home.path(), || {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let _settings = own_settings(&mut app);
         app.start_demo();
         let scratch = app.workspace_root().to_path_buf();
         assert_ne!(scratch, tmp.path(), "not the user's workspace");
@@ -1304,6 +1305,7 @@ fn walking_the_whole_tour_ends_it_and_cleans_up() {
     with_relay_home(home.path(), || {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let _settings = own_settings(&mut app);
         app.start_demo();
         let scratch = app.workspace_root().to_path_buf();
         let mut steps = 0;
@@ -1372,6 +1374,7 @@ fn starting_the_tour_again_while_it_runs_keeps_the_way_home() {
     with_relay_home(home.path(), || {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let _settings = own_settings(&mut app);
         app.start_demo();
         let scratch = app.workspace_root().to_path_buf();
         app.run_command(crate::widgets::command_palette::Command::TakeTheTour);
@@ -1400,6 +1403,7 @@ fn the_whole_tour_takes_enter_only_and_leaves_nothing_behind() {
     with_relay_home(home.path(), || {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let _settings = own_settings(&mut app);
         app.start_demo();
         let scratch = app.workspace_root().to_path_buf();
         let mut opened = Vec::new();
@@ -1472,6 +1476,7 @@ fn every_tour_caption_shows_whole_with_its_keys_at_80_columns() {
     with_relay_home(home.path(), || {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let _settings = own_settings(&mut app);
         app.start_demo();
         let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
         let words = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -1548,6 +1553,7 @@ fn leaving_the_tour_closes_the_samples_tabs_even_edited_ones() {
     with_relay_home(home.path(), || {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let _settings = own_settings(&mut app);
         app.start_demo();
         let scratch = app.workspace_root().to_path_buf();
         app.focus_pane(Pane::Editor);
@@ -1579,6 +1585,7 @@ fn the_tour_keys_show_at_every_step_at_80_columns() {
     with_relay_home(home.path(), || {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let _settings = own_settings(&mut app);
         app.start_demo();
         let mut steps = 0;
         while app.tour.is_some() && steps < 20 {
@@ -1607,6 +1614,7 @@ fn the_tour_names_this_platform_s_modifier_on_screen() {
     with_relay_home(home.path(), || {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let _settings = own_settings(&mut app);
         app.start_demo();
         app.advance_tour();
         app.file_finder = None;
@@ -1633,6 +1641,7 @@ fn the_tour_caption_panel_stays_out_of_a_frame_too_small_for_it() {
     with_relay_home(home.path(), || {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let _settings = own_settings(&mut app);
         app.start_demo();
         assert!(app.tour_caption_panel(Rect::new(0, 0, 80, 24)).is_some());
         assert!(app.tour_caption_panel(Rect::new(0, 0, 19, 24)).is_none());
@@ -1670,6 +1679,7 @@ fn starting_the_tour_sweeps_a_dead_tour_s_scratch_folder() {
         let mine = make(&format!("croft-demo-{}-1", std::process::id()), true);
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let _settings = own_settings(&mut app);
         app.start_demo();
         assert!(app.tour.is_some());
         assert!(!dead.exists(), "the dead tour's folder is swept");
@@ -1693,6 +1703,7 @@ fn esc_leaves_the_tour_from_a_picker_the_tour_opened() {
     with_relay_home(home.path(), || {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let _settings = own_settings(&mut app);
         app.start_demo();
         let scratch = app.workspace_root().to_path_buf();
         let theme = app.theme;

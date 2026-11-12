@@ -2090,6 +2090,7 @@ fn esc_in_a_palette_the_user_opened_keeps_the_tour() {
     with_relay_home(home.path(), || {
         let tmp = tempfile::tempdir().unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let _settings = own_settings(&mut app);
         app.start_demo();
         assert!(
             app.command_palette.is_none(),
