@@ -8366,17 +8366,20 @@ impl Editor {
         self.color_swatches = if total_bytes > COLOR_SWATCH_SCAN_MAX_BYTES {
             Vec::new()
         } else {
-            scan_color_swatches(
-                &self.lines,
-                matches!(
-                    self.lang,
-                    Some(LangKind::Css | LangKind::Html | LangKind::Vue | LangKind::Svelte)
-                ),
-            )
+            scan_color_swatches(&self.lines, self.swatch_decimal_short())
         };
         self.recompute_semantic_overlay();
         self.recompute_diagnostic_spans();
         self.recompute_inlay_spans();
+    }
+
+    /// Whether a short run of decimal digits after `#` is a colour here:
+    /// only in stylesheet-like buffers (elsewhere it is an issue reference).
+    fn swatch_decimal_short(&self) -> bool {
+        matches!(
+            self.lang,
+            Some(LangKind::Css | LangKind::Html | LangKind::Vue | LangKind::Svelte)
+        )
     }
 
     /// Whether this buffer is a plain `.log` file shown as text (#1537): no
@@ -18816,9 +18819,10 @@ fn parse_hsl_color(line: &str, i: usize) -> Option<((u8, u8, u8), usize)> {
     Some((hsl_to_rgb(h, s, l), close + 1))
 }
 
-/// Buffers above this size skip the color-swatch scan, for the same reason
-/// [`BRACKET_SCAN_MAX_BYTES`] gates bracket colorization: a per-edit,
-/// per-line scan must not make typing in a huge file pay for it.
+/// Buffers above this size skip the whole-buffer color-swatch scan, for the
+/// same reason [`BRACKET_SCAN_MAX_BYTES`] gates bracket colorization: a
+/// per-edit, per-line scan must not make typing in a huge file pay for it.
+/// Their visible lines are scanned at draw time instead.
 const COLOR_SWATCH_SCAN_MAX_BYTES: usize = 1_000_000;
 
 /// Inline color-literal decoration scan (the `naumovs.color-highlight`
@@ -21071,8 +21075,23 @@ impl Widget for &mut Editor {
             // bracket colorization so a color literal's own brackets (e.g.
             // `rgb(...)`) still read against the tint, and before the
             // overlays below (selection, search) so those still win over it.
+            // A buffer past the scan cap keeps no table; its visible lines
+            // are scanned here, a handful per frame, so a big file's
+            // literals are tinted too.
+            let scanned;
+            let hits = match self.color_swatches.get(line_idx) {
+                Some(hits) => Some(hits),
+                None if self.show_color_swatches => {
+                    scanned = scan_color_swatches(
+                        std::slice::from_ref(&self.lines[line_idx]),
+                        self.swatch_decimal_short(),
+                    );
+                    scanned.first()
+                }
+                None => None,
+            };
             if self.show_color_swatches
-                && let Some(hits) = self.color_swatches.get(line_idx)
+                && let Some(hits) = hits
             {
                 for &(start_c, end_c, bg, fg) in hits {
                     if end_c <= row_start {
@@ -44749,6 +44768,23 @@ mod tests {
             e.color_swatches.iter().all(Vec::is_empty),
             "an oversized buffer opts out of the color-swatch scan"
         );
+    }
+
+    #[test]
+    fn a_big_buffer_still_tints_the_literals_it_draws() {
+        let mut e = editor_with("");
+        e.lines = vec![String::from("x = Color::Rgb(0xff, 0, 0);")];
+        e.lines.extend(vec![
+            "y".repeat(64 * 1024);
+            COLOR_SWATCH_SCAN_MAX_BYTES / (64 * 1024) + 2
+        ]);
+        e.recompute_highlights();
+        assert!(e.color_swatches.is_empty(), "no whole-buffer table");
+        let buf = guide_buf(&mut e, 60, 6);
+        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        let y0 = e.last_inner.y;
+        assert_eq!(buf[(text_x + 4, y0)].bg, Color::Rgb(255, 0, 0));
+        assert_ne!(buf[(text_x, y0)].bg, Color::Rgb(255, 0, 0));
     }
 
     #[test]
