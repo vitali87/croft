@@ -2454,17 +2454,8 @@ fn closing_a_lane_refuses_while_a_sheet_cell_in_it_is_being_typed_into() {
     let repo = tmp.path().join("repo");
     init_lane_repo(&repo);
     std::fs::write(repo.join("stock.csv"), "item,qty\nbolt,4\n").unwrap();
-    let git = |args: &[&str]| {
-        let st = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&repo)
-            .args(args)
-            .status()
-            .unwrap();
-        assert!(st.success(), "git {args:?}");
-    };
-    git(&["add", "."]);
-    git(&["commit", "-q", "-m", "stock"]);
+    git_ok(&repo, &["add", "."]);
+    git_ok(&repo, &["commit", "-q", "-m", "stock"]);
     let mut app = App::new(repo.clone()).unwrap();
     app.terminal_session_path = tmp.path().join("sessions.json");
     app.lane_agent = None;
@@ -4021,15 +4012,7 @@ fn completing_an_approval_merge_approves_it_and_stages_nothing() {
     let home = tempfile::tempdir().unwrap();
     with_relay_home(home.path(), || {
         let tmp = tempfile::tempdir().unwrap();
-        let git = |args: &[&str]| {
-            std::process::Command::new("git")
-                .arg("-C")
-                .arg(tmp.path())
-                .args(args)
-                .output()
-                .unwrap()
-        };
-        git(&["init", "-q"]);
+        git_init(tmp.path());
         let target = tmp.path().join("a.rs");
         std::fs::write(&target, "one\ntwo\nthree\n").unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
@@ -4074,8 +4057,8 @@ fn completing_an_approval_merge_approves_it_and_stages_nothing() {
         assert!(app.approvals.is_empty(), "approved: {}", app.status);
         assert!(!app.status.contains("Stage failed"), "{}", app.status);
         assert!(app.status.starts_with("Approved"), "{}", app.status);
-        let staged = git(&["diff", "--cached", "--name-only"]);
-        assert!(staged.stdout.is_empty(), "nothing staged");
+        let staged = git_stdout_untrimmed(tmp.path(), &["diff", "--cached", "--name-only"]);
+        assert!(staged.is_empty(), "nothing staged");
 
         hook.set_read_timeout(Some(std::time::Duration::from_millis(500)))
             .unwrap();

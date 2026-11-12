@@ -3209,20 +3209,8 @@ fn the_outline_and_breadcrumbs_follow_the_scrubbed_commit() {
     // symbol jump lands in the history, and leaving brings the live
     // outline back.
     let tmp = tempfile::tempdir().unwrap();
-    let git = |args: &[&str]| {
-        let ok = std::process::Command::new("git")
-            .arg("-C")
-            .arg(tmp.path())
-            .args(args)
-            .output()
-            .unwrap()
-            .status
-            .success();
-        assert!(ok, "git {args:?}");
-    };
-    git(&["init", "-q", "-b", "main"]);
-    git(&["config", "user.email", "a@b"]);
-    git(&["config", "user.name", "a"]);
+    let git = |args: &[&str]| git_ok(tmp.path(), args);
+    git_init_with_identity(tmp.path());
     let file = tmp.path().join("lib.rs");
     std::fs::write(&file, "fn alpha() {\n    let a = 1;\n}\n").unwrap();
     git(&["add", "."]);

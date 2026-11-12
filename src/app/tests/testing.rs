@@ -1539,15 +1539,7 @@ fn an_external_rewrite_of_the_open_file_dims_its_coverage() {
 fn a_save_of_an_ignored_file_does_not_rerun_watched_tests() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().canonicalize().unwrap();
-    let git = |args: &[&str]| {
-        std::process::Command::new("git")
-            .arg("-C")
-            .arg(&root)
-            .args(args)
-            .output()
-            .unwrap()
-    };
-    git(&["init", "-q", "-b", "main"]);
+    git_init(&root);
     std::fs::write(root.join(".gitignore"), "*.log\nout/\n").unwrap();
     std::fs::create_dir_all(root.join("out")).unwrap();
     let mut app = App::new(root.clone()).unwrap();
