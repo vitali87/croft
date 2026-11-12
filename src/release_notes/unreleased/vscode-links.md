@@ -1,0 +1,1 @@
+feature: Croft.app can take over `vscode://` links: make it the scheme's handler and a `vscode://file/…:line` link opens that file in croft at that line, while every other `vscode:` link, such as an extension install, still goes to VS Code. Run `croft install-launcher` again to register the scheme.

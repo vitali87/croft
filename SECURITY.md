@@ -114,6 +114,9 @@ boundary is the operating system account it runs as:
   only do what you could already do by typing the command: the host must be
   an alias in your own `~/.ssh/config`, arguments may not begin with `-`, and
   a `decide` link needs the one-time token from the notification it answers.
+- **`vscode://` links**, once Croft handles that scheme, open only the file a
+  `vscode://file` link names, as VS Code would. Every other `vscode:` link is
+  handed to VS Code unchanged.
 - **Language servers, debug adapters, MCP servers, kernels and themes** are
   third-party code croft runs on your behalf. croft treats their protocol
   output as untrusted input, but it does not sandbox them: installing one is

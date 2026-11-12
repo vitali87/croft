@@ -11,8 +11,91 @@
 //! `~/.ssh/config`, and nothing may start with `-` (it would read as a flag).
 //! `croft install-link-handler` registers the scheme with the desktop
 //! (xdg) or with Termux's URL opener; the macOS launcher registers it itself.
+//!
+//! The launcher registers `vscode:` too, so Croft can stand in for VS Code:
+//! [`route`] opens a `vscode://file/<path>:<line>` link's file here and hands
+//! every other `vscode:` link to VS Code unchanged.
 
 use anyhow::{Result, bail};
+
+use crate::file_ref::FileRef;
+
+/// What `croft open-link` does with a link the desktop handed it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Route {
+    /// A `croft://` link: attach to, or answer, the session it names.
+    Croft(Link),
+    /// A `vscode://file/<path>[:line[:col]]` link: open that file here.
+    Open(FileRef),
+    /// Any other `vscode:` link (an extension install, a git clone): VS
+    /// Code's own business, handed to it unchanged.
+    Vscode(String),
+}
+
+/// VS Code's bundle id, which the links it keeps are handed to by name.
+const VSCODE_BUNDLE_ID: &str = "com.microsoft.VSCode";
+
+/// Sort a link the desktop handed croft: a `croft://` link is checked by
+/// [`parse`], a `vscode://file/…` link opens its file here, and any other
+/// `vscode:` link is left to VS Code.
+pub fn route(url: &str) -> Result<Route> {
+    let Some((scheme, rest)) = url.split_once(':') else {
+        bail!("{url:?} is not a link");
+    };
+    if scheme.eq_ignore_ascii_case("croft") {
+        return parse(url).map(Route::Croft);
+    }
+    // The launcher registers only these two schemes; anything else reaching
+    // here was typed, and croft has nothing to do with it.
+    if !scheme.eq_ignore_ascii_case("vscode") {
+        bail!("croft opens croft:// and vscode:// links, not {scheme}:");
+    }
+    let authority = rest
+        .strip_prefix("//")
+        .and_then(|r| r.split(['/', '?', '#']).next());
+    if authority != Some("file") {
+        return Ok(Route::Vscode(url.to_string()));
+    }
+    match crate::file_ref::editor_file_uri(url) {
+        Some(file) => Ok(Route::Open(file)),
+        None => bail!("{url} names no file"),
+    }
+}
+
+/// Whether carrying out `route` needs a croft window. A link VS Code keeps
+/// does not: it is handed over without opening one.
+pub fn needs_terminal(route: &Route) -> bool {
+    !matches!(route, Route::Vscode(_))
+}
+
+/// The croft argument that opens a file link's file at its position, in the
+/// `path:line[:col]` form croft takes from a shell. A link with no position
+/// is the bare path, so a link to a folder opens the folder.
+pub fn open_file_arg(file: &FileRef) -> String {
+    match (file.line, file.column) {
+        (1, None) => file.path.clone(),
+        (line, None) => format!("{}:{line}", file.path),
+        (line, Some(column)) => format!("{}:{line}:{column}", file.path),
+    }
+}
+
+/// Hand `url` to VS Code through `opener` (`/usr/bin/open` in use). `-b`
+/// names VS Code's bundle rather than the scheme: once Croft is the
+/// scheme's default handler, `open <url>` would hand the link straight back.
+pub fn forward_to_vscode(url: &str, mut opener: std::process::Command) -> Result<()> {
+    let out = opener
+        .args(["-b", VSCODE_BUNDLE_ID, url])
+        .output()
+        .map_err(|e| anyhow::anyhow!("could not hand {url} to VS Code: {e}"))?;
+    if !out.status.success() {
+        // `open` says why, e.g. VS Code is not installed.
+        bail!(
+            "VS Code did not take {url}: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
@@ -421,5 +504,123 @@ mod tests {
         // On an attach link, token and decision mean nothing.
         let l = parse(&format!("croft://attach?token={TOKEN}&decision=allow")).unwrap();
         assert_eq!(l.decide, None);
+    }
+
+    fn opened(url: &str) -> FileRef {
+        match route(url) {
+            Ok(Route::Open(f)) => f,
+            other => panic!("{url} should open a file here, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_vscode_file_link_opens_that_file_here_at_its_line() {
+        let f = opened("vscode://file//Users/me/my%20proj/a.rs:42:7");
+        assert_eq!(
+            (f.path.as_str(), f.line, f.column),
+            ("/Users/me/my proj/a.rs", 42, Some(7))
+        );
+        assert_eq!(open_file_arg(&f), "/Users/me/my proj/a.rs:42:7");
+        assert_eq!(
+            open_file_arg(&opened("vscode://file/Users/me/a.rs:42")),
+            "/Users/me/a.rs:42"
+        );
+        // No line: the bare path, so a link to a folder opens the folder.
+        assert_eq!(
+            open_file_arg(&opened("vscode://file//Users/me/proj")),
+            "/Users/me/proj"
+        );
+        assert!(needs_terminal(&route("vscode://file//a.rs").unwrap()));
+    }
+
+    #[test]
+    fn a_croft_link_still_routes_to_the_session_it_names() {
+        let url = "croft://attach?host=devbox&path=%2Fsrv%2Fapp";
+        let r = route(url).unwrap();
+        assert_eq!(r, Route::Croft(parse(url).unwrap()));
+        assert!(needs_terminal(&r));
+    }
+
+    /// Extension installs, git clones and extension callbacks are VS Code's,
+    /// not files: they go to VS Code byte for byte and open no window here.
+    #[test]
+    fn other_vscode_links_go_to_vs_code_unchanged_and_are_never_opened_as_files() {
+        for url in [
+            "vscode://vscode.git/clone?url=https%3A%2F%2Fgithub.com%2Fa%2Fb.git",
+            "vscode:extension/rust-lang.rust-analyzer",
+            "vscode://ms-vscode-remote.remote-ssh/open?host=box",
+            "vscode://settings/keybindings",
+        ] {
+            let r = route(url).unwrap();
+            assert_eq!(r, Route::Vscode(url.to_string()), "{url}");
+            assert!(!needs_terminal(&r), "{url}");
+        }
+    }
+
+    fn assert_refused(bad: &[&str]) {
+        for url in bad {
+            assert!(
+                route(url).is_err(),
+                "{url} should be refused: {:?}",
+                route(url)
+            );
+        }
+    }
+
+    #[test]
+    fn a_croft_link_with_no_such_action_is_refused() {
+        assert_refused(&["croft://bogus", "croft://run?cmd=ls"]);
+    }
+
+    /// Not handed to VS Code either: it would only report the same nothing.
+    #[test]
+    fn a_vscode_file_link_that_names_no_file_is_refused() {
+        assert_refused(&["vscode://file/", "vscode://file"]);
+    }
+
+    #[test]
+    fn a_link_in_a_scheme_the_launcher_does_not_register_is_refused() {
+        assert_refused(&[
+            "cursor://file//Users/me/a.rs:3",
+            "https://example.com/a.rs",
+            "file:///etc/hosts",
+            "not a link",
+        ]);
+    }
+
+    /// A stand-in for `/usr/bin/open`: `script` runs with the forwarded
+    /// arguments as `$@`.
+    fn sh(script: &str) -> std::process::Command {
+        let mut c = std::process::Command::new("/bin/sh");
+        c.args(["-c", script, "sh"]);
+        c
+    }
+
+    /// `open -b` names VS Code's bundle, not the scheme: once Croft is the
+    /// scheme's default, `open <url>` would hand the link straight back.
+    #[test]
+    fn a_link_goes_to_vs_code_by_its_bundle_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let args = dir.path().join("args");
+        let record = format!("printf '%s\\n' \"$@\" > '{}'", args.display());
+        forward_to_vscode("vscode:extension/a.b", sh(&record)).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&args).unwrap(),
+            "-b\ncom.microsoft.VSCode\nvscode:extension/a.b\n"
+        );
+    }
+
+    #[test]
+    fn a_link_vs_code_does_not_take_is_an_error_naming_the_link() {
+        let missing = "echo 'Unable to find application named com.microsoft.VSCode' >&2; exit 1";
+        let err = forward_to_vscode("vscode:extension/a.b", sh(missing))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("VS Code")
+                && err.contains("vscode:extension/a.b")
+                && err.contains("Unable to find application"),
+            "{err}"
+        );
     }
 }

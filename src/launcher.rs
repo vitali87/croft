@@ -31,6 +31,11 @@ const APP_NAME: &str = "Croft";
 /// read that file, not land in a full IDE, so the editor fills the window and
 /// the Explorer and terminal stay one keystroke away (Cmd+B / Cmd+J). Clicking
 /// the launcher itself opens the workspace with the normal layout.
+///
+/// A link (`croft://`, or `vscode://` once Croft handles that scheme) goes
+/// to croft first: one VS Code keeps, such as an extension install, is
+/// handed to VS Code there and then, and only a link croft carries out
+/// opens a window.
 fn launcher_script(croft_bin: &str, open_dir: &str) -> String {
     // The command crosses two shells (`do shell script`, then Ghostty runs
     // `--initial-command` through `/bin/sh -c`), so each path is its own
@@ -46,8 +51,11 @@ fn launcher_script(croft_bin: &str, open_dir: &str) -> String {
 end run
 
 on open location theURL
-	set inner to quoted form of {bin} & " open-link " & quoted form of theURL
-	do shell script "open -na Ghostty.app --args --initial-command=" & quoted form of inner
+	set verdict to do shell script quoted form of {bin} & " open-link --from-launcher " & quoted form of theURL
+	if verdict is "terminal" then
+		set inner to quoted form of {bin} & " open-link " & quoted form of theURL
+		do shell script "open -na Ghostty.app --args --initial-command=" & quoted form of inner
+	end if
 end open location
 
 on open theFiles
@@ -112,11 +120,13 @@ fn plist_edits() -> Vec<String> {
         "Add :CFBundleDocumentTypes:0:LSHandlerRank string Alternate",
         "Add :CFBundleDocumentTypes:0:LSItemContentTypes array",
         "Add :CFBundleDocumentTypes:0:LSItemContentTypes:0 string public.item",
-        // croft:// links (#359) arrive as `on open location`.
+        // croft:// links (#359) and vscode:// editor links arrive as
+        // `on open location`.
         "Add :CFBundleURLTypes array",
         "Add :CFBundleURLTypes:0:CFBundleURLName string com.vitali87.croft-link",
         "Add :CFBundleURLTypes:0:CFBundleURLSchemes array",
         "Add :CFBundleURLTypes:0:CFBundleURLSchemes:0 string croft",
+        "Add :CFBundleURLTypes:0:CFBundleURLSchemes:1 string vscode",
     ]
     .iter()
     .map(|s| (*s).to_string())
@@ -373,6 +383,40 @@ mod tests {
         // fatal batch rebuilds it — install() runs every cleanup delete first.
         assert!(cleanup.contains(&"Delete :CFBundleDocumentTypes".to_string()));
         assert!(edits.contains(&"Add :CFBundleDocumentTypes array".to_string()));
+    }
+
+    /// Croft can be made the `vscode://` handler, so editor links open here.
+    #[test]
+    fn plist_edits_register_the_croft_and_vscode_schemes() {
+        let e = plist_edits();
+        assert!(
+            e.contains(&"Add :CFBundleURLTypes:0:CFBundleURLSchemes:0 string croft".to_string())
+        );
+        assert!(
+            e.contains(&"Add :CFBundleURLTypes:0:CFBundleURLSchemes:1 string vscode".to_string())
+        );
+    }
+
+    /// A link VS Code keeps (an extension install) is handed over by croft
+    /// directly; only a link that needs croft opens a Ghostty window, or
+    /// every extension install would flash an empty one.
+    #[test]
+    fn a_link_opens_a_window_only_when_croft_says_it_needs_one() {
+        let s = launcher_script("/Users/v/.cargo/bin/croft", "/Users/v/Documents");
+        let (_, handler) = s.split_once("on open location theURL").unwrap();
+        let (handler, _) = handler.split_once("end open location").unwrap();
+        let (ask, window) = handler
+            .split_once(r#"if verdict is "terminal" then"#)
+            .unwrap_or_else(|| {
+                panic!("the handler must ask croft before opening a window: {handler}")
+            });
+        assert!(ask.contains(r#"" open-link --from-launcher ""#), "{ask}");
+        assert!(
+            !ask.contains("Ghostty"),
+            "no window before croft answers: {ask}"
+        );
+        assert!(window.contains("open -na Ghostty.app"), "{window}");
+        assert!(window.contains(r#"" open-link ""#), "{window}");
     }
 
     #[test]

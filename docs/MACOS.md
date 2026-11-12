@@ -75,6 +75,10 @@ An opened document fills the window, with the Explorer and terminal hidden, beca
 
 To make Croft the permanent handler for a file type, select a file in Finder, press `⌘I`, then under **Open With** choose Croft and click **Change All**. Do this in Finder rather than with `duti`: file types no installed app declares (`.tex` is a common one) get a *dynamic* type identifier, and LaunchServices rejects `duti -s` for those with `error -50` no matter which app you name.
 
+### `vscode://` links
+
+`Croft.app` registers the `vscode://` scheme too. Once Croft is that scheme's default handler, an "open in editor" link such as `vscode://file//Users/me/proj/src/main.rs:42:7` opens the file in croft at that line, the same as `croft /Users/me/proj/src/main.rs:42:7`. Every other `vscode:` link, such as an extension install from the Marketplace or `vscode://vscode.git/clone?…`, is handed to VS Code unchanged and opens no croft window. Without VS Code installed, those fail with an error naming the link.
+
 The launcher is an AppleScript applet rather than a shell script for this reason: macOS hands a double-clicked document to an app as an Apple Event, which a `#!/bin/sh` bundle executable cannot receive — it would launch with empty arguments and silently open the default folder instead of the file.
 
 ## Inline previews

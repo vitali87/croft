@@ -518,7 +518,15 @@ pub enum CliCommand {
     /// Open a `croft://attach?host=…&path=…&focus=…` link: attach to the
     /// session it names. The host must be an alias in ~/.ssh/config.
     /// A `croft://decide?…` link answers a pending agent edit instead.
-    OpenLink { url: String },
+    /// A `vscode://file/<path>:<line>` link opens that file here, and any
+    /// other `vscode:` link is handed to VS Code (macOS).
+    OpenLink {
+        url: String,
+        /// Print `terminal` instead of carrying out a link that needs a
+        /// croft window: the macOS launcher asks before opening one.
+        #[arg(long, hide = true)]
+        from_launcher: bool,
+    },
     // Issue #359.
     /// Approve or deny an agent's pending edit by the one-time token its
     /// notification carried, without attaching to the session.
@@ -1028,10 +1036,10 @@ impl Cli {
                 theme_import(&file, theme.as_deref(), id.as_deref(), dry_run)
             }
             Some(CliCommand::SetupGhostty { yes }) => setup_ghostty(yes),
-            Some(CliCommand::OpenLink { url }) => {
+            Some(CliCommand::OpenLink { url, from_launcher }) => {
                 // One line, like `croft view`: a link click deserves a
                 // sentence about the link, not croft's stack.
-                if let Err(e) = open_link(&url) {
+                if let Err(e) = open_link(&url, from_launcher) {
                     eprintln!("{e}");
                     std::process::exit(1);
                 }
@@ -1142,9 +1150,31 @@ fn run_git_editor(editor: &str, path: &std::ffi::OsStr) -> i32 {
 }
 
 /// `croft open-link` (#359): check the link, then become the `croft remote`
-/// or `croft attach` it describes, so the session gets this terminal.
-fn open_link(url: &str) -> Result<()> {
-    let mut link = crate::deep_link::parse(url)?;
+/// or `croft attach` it describes, so the session gets this terminal. A
+/// `vscode://file` link becomes `croft <path:line>`; any other `vscode:`
+/// link is VS Code's, handed to it unchanged.
+fn open_link(url: &str, from_launcher: bool) -> Result<()> {
+    use crate::deep_link::Route;
+    let route = crate::deep_link::route(url)?;
+    if from_launcher && crate::deep_link::needs_terminal(&route) {
+        // The launcher opens the window this link then runs in.
+        println!("terminal");
+        return Ok(());
+    }
+    let mut link = match route {
+        Route::Croft(link) => link,
+        Route::Open(file) => {
+            let mut cmd = Command::new(std::env::current_exe()?);
+            cmd.arg(crate::deep_link::open_file_arg(&file));
+            return become_croft(cmd);
+        }
+        Route::Vscode(url) => {
+            if !cfg!(target_os = "macos") {
+                anyhow::bail!("croft hands {url} to VS Code only on macOS");
+            }
+            return crate::deep_link::forward_to_vscode(&url, Command::new("/usr/bin/open"));
+        }
+    };
     if let Some(host) = link.host.take() {
         let targets: Vec<(String, Option<String>)> = crate::remote::discover_ssh_targets()
             .into_iter()
@@ -1176,6 +1206,13 @@ fn open_link(url: &str) -> Result<()> {
     if let Some(focus) = link.focus {
         cmd.env("CROFT_FOCUS", focus.as_str());
     }
+    become_croft(cmd)
+}
+
+/// Replace this process with `cmd`, a croft, so the window a link opened
+/// is that croft's; where `exec` is unavailable, run it and exit with its
+/// status.
+fn become_croft(mut cmd: Command) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt as _;
@@ -2443,6 +2480,30 @@ mod tests {
         assert!(
             Cli::try_parse_from(["croft", "pr"]).is_err(),
             "the number is required"
+        );
+    }
+
+    /// The macOS launcher asks first whether a link needs a croft window;
+    /// a link typed at a shell is carried out as before.
+    #[test]
+    fn open_link_takes_the_launchers_flag() {
+        let cli = Cli::try_parse_from([
+            "croft",
+            "open-link",
+            "--from-launcher",
+            "vscode://file//a.rs",
+        ])
+        .unwrap();
+        assert!(
+            format!("{:?}", cli.command).contains("from_launcher: true"),
+            "{:?}",
+            cli.command
+        );
+        let cli = Cli::try_parse_from(["croft", "open-link", "croft://attach"]).unwrap();
+        assert!(
+            format!("{:?}", cli.command).contains("from_launcher: false"),
+            "{:?}",
+            cli.command
         );
     }
 
