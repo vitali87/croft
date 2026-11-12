@@ -1,0 +1,1 @@
+fix: Editing a Rust, C++ or other language-server file no longer leaves stray colours (a keyword tint on the first letters of a freshly commented-out line, say) until the server answers. The server's semantic colours now move with the text through an edit, as the syntax colours do, instead of being read again at their old positions in the new text.

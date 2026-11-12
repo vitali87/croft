@@ -5721,6 +5721,89 @@ fn first_row_screen(e: &mut Editor, width: u16, height: u16) -> String {
 }
 
 #[test]
+fn semantic_tokens_move_with_an_edit_instead_of_being_decoded_against_the_new_text() {
+    let mut e = editor_with("fn f() {\n    return 1;\n}\n");
+    let p = std::path::PathBuf::from("/tmp/sem_edit.rs");
+    e.path = Some(p.clone());
+    let legend = std::sync::Arc::new(vec!["keyword".to_string()]);
+    // `return` on line 1, columns 4..10.
+    e.apply_semantic_tokens(p, vec![1, 4, 6, 0, 0], legend, true);
+    assert_eq!(e.semantic_overlay_for_test()[1].len(), 1);
+    // Comment the line out: "    // return 1;". The old batch, decoded
+    // over the new text, would tint "// ret" at 4..10.
+    e.lines[1] = String::from("    // return 1;");
+    e.recompute_highlights();
+    for span in &e.semantic_overlay_for_test()[1] {
+        let text = &e.lines[1][span.start as usize..span.end as usize];
+        assert_eq!(text, "return", "the token follows its word, got {text:?}");
+    }
+    // Any edit leaves the other lines' tokens alone.
+    e.lines[0] = String::from("fn  f() {");
+    e.recompute_highlights();
+    assert_eq!(e.semantic_overlay_for_test().len(), e.lines.len());
+}
+
+fn editor_with_a_batch(defer_carry: bool) -> Editor {
+    let mut e = editor_with("fn f() {\n    return 1;\n}\n");
+    let p = std::path::PathBuf::from("/tmp/sem_defer.rs");
+    e.path = Some(p.clone());
+    e.semantic_path = Some(p);
+    e.semantic_legend = Some(std::sync::Arc::new(vec!["keyword".to_string()]));
+    e.semantic_data = vec![1, 4, 6, 0, 0];
+    e.decode_semantic_overlay_deferring(defer_carry);
+    e
+}
+
+#[test]
+fn a_batch_decoded_in_the_first_frame_copies_the_text_only_after_it() {
+    let mut e = editor_with_a_batch(true);
+    assert_eq!(e.semantic_overlay_for_test()[1].len(), 1, "painted at once");
+    assert_eq!(e.semantic_base.len(), 0, "no copy of the text yet");
+    // The first frame is up: the copy is built, and carrying works.
+    e.settle_semantic_carry();
+    assert_eq!(e.semantic_base.len(), e.lines.len());
+    e.lines[1] = String::from("    // return 1;");
+    e.edit_seq += 1;
+    e.recompute_highlights();
+    for span in &e.semantic_overlay_for_test()[1] {
+        assert_eq!(
+            &e.lines[1][span.start as usize..span.end as usize],
+            "return"
+        );
+    }
+}
+
+#[test]
+fn an_edit_before_the_deferred_copy_drops_the_batch_instead_of_misplacing_it() {
+    let mut e = editor_with_a_batch(true);
+    e.lines[1] = String::from("    // return 1;");
+    e.edit_seq += 1;
+    e.recompute_highlights();
+    assert!(e.semantic_overlay_for_test().iter().all(Vec::is_empty));
+    e.settle_semantic_carry();
+    assert!(e.semantic_overlay_for_test().iter().all(Vec::is_empty));
+}
+
+#[test]
+fn a_theme_switch_decodes_an_untouched_batch_again_and_drops_a_moved_one() {
+    // Untouched: the overlay is rebuilt from the batch (the spans a stale
+    // palette baked are gone and the new ones are in).
+    let mut e = editor_with_a_batch(false);
+    for line in e.semantic_overlay.iter_mut() {
+        line.clear();
+    }
+    e.rehighlight_for_theme();
+    assert_eq!(e.semantic_overlay_for_test()[1].len(), 1);
+    // Moved by an edit: it cannot be decoded against the new text, so it
+    // goes until the server's reply to that edit.
+    e.lines[1] = String::from("    // return 1;");
+    e.edit_seq += 1;
+    e.recompute_highlights();
+    e.rehighlight_for_theme();
+    assert!(e.semantic_overlay_for_test().iter().all(Vec::is_empty));
+}
+
+#[test]
 fn range_batch_does_not_overwrite_a_full_batch_for_the_same_file() {
     // The viewport range request races the whole-document request on open.
     // If a range reply lands AFTER the full reply, it must be dropped so it
