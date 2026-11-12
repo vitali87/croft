@@ -1413,22 +1413,31 @@ fn paint_intraline_range(
         buf.set_string(text_x, y, "\u{2039}", edge);
         return;
     }
+    use unicode_segmentation::UnicodeSegmentation;
     let mut cell = 0u16;
     let mut painted = false;
     let from = byte_index_of_char(text, skip);
-    let cells = char_cells_from(&text[from..], cells_from(&text[..from], 0));
-    for (i, (_, w)) in (skip..).zip(cells) {
+    let mut col = cells_from(&text[..from], 0);
+    let mut i = skip;
+    // Cluster by cluster, as the text is drawn: a change to any character of
+    // one (`👍🏻` to `👍🏽` changes only the skin tone) marks the cells the
+    // whole cluster takes.
+    for cluster in text[from..].graphemes(true) {
+        let w = cluster_cells_at(cluster, col);
+        let n = cluster.chars().count();
+        col += w;
         let w = w as u16;
         if cell + w > width {
             break;
         }
-        if (start..end).contains(&i) {
+        if start < i + n && i < end {
             for dx in 0..w {
                 buf[(text_x + cell + dx, y)].set_bg(bg);
             }
             painted = true;
         }
         cell += w;
+        i += n;
     }
     if !painted {
         buf.set_string(text_x + width - 1, y, "\u{203a}", edge);
@@ -9144,18 +9153,16 @@ impl Editor {
     /// cells from 1: a tab moves it to the next tab stop, as in VS Code and
     /// vim, so it agrees with where the caret is drawn.
     pub fn cursor_visual_col(&self) -> usize {
-        use unicode_segmentation::UnicodeSegmentation;
         self.sync_tab_cells();
-        // Only a tab is more than one column; any other grapheme cluster,
-        // wide or `👍🏽`, counts one, like VS Code.
+        // Only a tab is more than one column; any other character, a wide
+        // one or each part of `👍🏽` included, counts one, exactly as VS
+        // Code's status bar counts (`CursorColumns.toStatusbarColumn`).
         self.lines
             .get(self.cursor_row)
             .map_or(self.cursor_col, |l| {
-                l[..byte_index_of_char(l, self.cursor_col)]
-                    .graphemes(true)
-                    .fold(0, |col, g| {
-                        col + if g == "\t" { tab_cells_at(col) } else { 1 }
-                    })
+                l.chars().take(self.cursor_col).fold(0, |col, c| {
+                    col + if c == '\t' { tab_cells_at(col) } else { 1 }
+                })
             })
             + 1
     }
@@ -37298,6 +37305,19 @@ mod tests {
         let line = "\u{1f44d}\u{1f3fd}\tX";
         assert_eq!(clip_pad_cells(line, 0, 6), "\u{1f44d}\u{1f3fd}  X ");
         assert_eq!(char_at_cell_from(line, 0, 4), 3, "a click on X lands on X");
+    }
+
+    /// A change to a character inside a grapheme cluster, such as only the
+    /// skin tone of `👍🏽`, marks the cells the whole cluster is drawn in.
+    #[test]
+    fn a_change_inside_an_emoji_cluster_marks_the_whole_cluster() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 6, 1));
+        let bg = Color::Red;
+        let line = "a\u{1f44d}\u{1f3fd}b";
+        paint_intraline_range(&mut buf, 0, 0, 6, line, 0, (2, 3), bg, Color::White);
+        let marked: Vec<bool> = (0..6).map(|x| buf[(x, 0)].bg == bg).collect();
+        assert_eq!(marked, [false, true, true, false, false, false]);
+        assert_ne!(buf[(5, 0)].symbol(), "\u{203a}", "no off-screen marker");
     }
 
     /// The diff's syntax colours land on the cells its text is drawn in, so a
