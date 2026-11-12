@@ -1,1 +1,0 @@
-refactor: Groundwork for the refactor program (#2062): release notes take a third kind, refactor:, for changes that change nothing in use, and a merge with only those makes no version of its own. Nothing changes in use.
