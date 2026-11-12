@@ -1616,7 +1616,7 @@ fn both_added_conflict(root: &std::path::Path) {
             &format!("fn {f}() {{\n    {f}();\n}}\n\nfn tail"),
         )
     };
-    git_ok(root, &["init", "-q", "-b", "main"]);
+    git_init(root);
     git_ok(root, &["config", "user.name", "t"]);
     git_ok(root, &["config", "user.email", "t@t"]);
     // Git's default style, whatever this machine's config says.
@@ -1630,13 +1630,10 @@ fn both_added_conflict(root: &std::path::Path) {
     git_ok(root, &["checkout", "-q", "main"]);
     std::fs::write(root.join("a.rs"), add("from_main")).unwrap();
     git_ok(root, &["commit", "-qam", "main"]);
-    let merge = std::process::Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["merge", "-q", "feature"])
-        .output()
-        .unwrap();
-    assert!(!merge.status.success(), "the merge must conflict");
+    assert!(
+        !git_succeeds(root, &["merge", "-q", "feature"]),
+        "the merge must conflict"
+    );
 }
 
 /// The conflict's footer row in `app`'s editor, with the shared `}` git
@@ -1692,7 +1689,7 @@ fn accept_both_reads_the_stages_of_the_files_own_repo() {
     let other = tmp.path().join("other");
     std::fs::create_dir(&repo).unwrap();
     std::fs::create_dir(&other).unwrap();
-    git_ok(&other, &["init", "-q"]);
+    git_init(&other);
     both_added_conflict(&repo);
     let mut app = App::new(repo.clone()).unwrap();
     app.add_workspace_folder(other.clone());
