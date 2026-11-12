@@ -3351,3 +3351,21 @@ fn a_paste_with_a_modal_over_the_new_file_prompt_leaves_the_name_alone() {
         "nor does the paste fall through to the editor behind"
     );
 }
+
+#[test]
+fn ctrl_v_as_a_key_pastes_into_the_new_file_prompt_at_the_caret() {
+    // A host with bracketed paste off sends Ctrl/Cmd+V as a key; the prompt
+    // reads the clipboard itself, as Quick Open does, instead of dropping it.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.clipboard_reader = || Some(String::from("lib\n"));
+    new_file_prompt(&mut app, tmp.path());
+    type_into_prompt(&mut app, "src/.rs");
+    for _ in 0..3 {
+        app.handle_key(key(KeyCode::Left, KeyModifiers::NONE))
+            .unwrap();
+    }
+    app.handle_key(key(KeyCode::Char('v'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert_eq!(app.prompt.as_ref().unwrap().buffer, "src/lib.rs");
+}

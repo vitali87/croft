@@ -78051,6 +78051,17 @@ impl App {
                     p.edit(|t, c| crate::widgets::line_edit::delete_at(t, c, word));
                 }
             }
+            // Ctrl/Cmd+V that reaches us as a key rather than a bracketed
+            // paste (bracketed paste off, or Cmd+V re-bound): read the
+            // clipboard and insert at the caret, as Quick Open does.
+            _ if is_clipboard_paste_key(key) => {
+                if let Some(text) = self.clipboard_text()
+                    && let Some(p) = self.prompt.as_mut()
+                {
+                    let text: String = text.chars().filter(|c| !c.is_control()).collect();
+                    p.edit(|t, at| crate::widgets::line_edit::insert_at(t, at, &text));
+                }
+            }
             KeyCode::Char(c) => {
                 if !key.modifiers.contains(KeyModifiers::CONTROL)
                     && !key.modifiers.contains(KeyModifiers::ALT)
