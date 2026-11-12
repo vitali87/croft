@@ -1543,16 +1543,6 @@ fn timestamps_gutter_toggles_on_and_shows_arrival_times() {
                 .any(|l| l.starts_with("gutter-row-9"))
         },
     );
-    fn screen_rows(term: &ratatui::Terminal<ratatui::backend::TestBackend>) -> Vec<String> {
-        let buf = term.backend().buffer();
-        (0..buf.area.height)
-            .map(|y| {
-                (0..buf.area.width)
-                    .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
-                    .collect()
-            })
-            .collect()
-    }
     fn gutter_of(rows: &[String], needle: &str) -> Option<String> {
         let row = rows.iter().find(|r| r.contains(needle))?;
         let inner = row.trim_end().trim_end_matches(['│', '┃']);
@@ -1572,7 +1562,7 @@ fn timestamps_gutter_toggles_on_and_shows_arrival_times() {
 
     // Off by default: the row ends with its own text, no clock.
     term.draw(|f| app.render(f)).unwrap();
-    let g = gutter_of(&screen_rows(&term), "gutter-row-9").unwrap_or_default();
+    let g = gutter_of(&screen_char_rows(&term), "gutter-row-9").unwrap_or_default();
     assert!(
         !g.chars().filter(|c| *c == ':').count().eq(&2),
         "no gutter while the toggle is off: {g:?}"
@@ -1581,7 +1571,7 @@ fn timestamps_gutter_toggles_on_and_shows_arrival_times() {
     app.toggle_terminal_timestamps();
     assert!(app.show_terminal_timestamps);
     term.draw(|f| app.render(f)).unwrap();
-    let g = gutter_of(&screen_rows(&term), "gutter-row-9").expect("row still on screen");
+    let g = gutter_of(&screen_char_rows(&term), "gutter-row-9").expect("row still on screen");
     let looks_like_clock = g.len() == 8
         && g.as_bytes()[2] == b':'
         && g.as_bytes()[5] == b':'
@@ -1593,7 +1583,7 @@ fn timestamps_gutter_toggles_on_and_shows_arrival_times() {
 
     app.toggle_terminal_timestamps();
     term.draw(|f| app.render(f)).unwrap();
-    let g = gutter_of(&screen_rows(&term), "gutter-row-9").unwrap_or_default();
+    let g = gutter_of(&screen_char_rows(&term), "gutter-row-9").unwrap_or_default();
     assert!(
         !(g.len() == 8 && g.as_bytes()[2] == b':' && g.as_bytes()[5] == b':'),
         "toggling off removes the gutter: {g:?}"
@@ -1620,23 +1610,13 @@ fn sticky_command_header_pins_the_command_while_scrolled_into_its_output() {
         "the command to finish",
         || !app.terminals[0].command_decorations().is_empty(),
     );
-    fn screen_rows(term: &ratatui::Terminal<ratatui::backend::TestBackend>) -> Vec<String> {
-        let buf = term.backend().buffer();
-        (0..buf.area.height)
-            .map(|y| {
-                (0..buf.area.width)
-                    .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
-                    .collect()
-            })
-            .collect()
-    }
     let backend = ratatui::backend::TestBackend::new(120, 40);
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|f| app.render(f)).unwrap();
     let inner = app.terminals[0].last_inner;
 
     // At the live bottom nothing pins.
-    let rows = screen_rows(&term);
+    let rows = screen_char_rows(&term);
     assert!(
         !rows[inner.y as usize].contains("build-it-77"),
         "no header at the live bottom: {:?}",
@@ -1650,7 +1630,7 @@ fn sticky_command_header_pins_the_command_while_scrolled_into_its_output() {
         app.terminals[0].scroll_down(1);
     }
     term.draw(|f| app.render(f)).unwrap();
-    let rows = screen_rows(&term);
+    let rows = screen_char_rows(&term);
     assert!(
         rows[inner.y as usize].contains("build-it-77 now"),
         "the command must pin to the pane's top row: {:?}",
@@ -1660,7 +1640,7 @@ fn sticky_command_header_pins_the_command_while_scrolled_into_its_output() {
     // Back at the live bottom the header unpins.
     app.terminals[0].reset_scrollback();
     term.draw(|f| app.render(f)).unwrap();
-    let rows = screen_rows(&term);
+    let rows = screen_char_rows(&term);
     assert!(
         !rows[inner.y as usize].contains("build-it-77"),
         "the header unpins at the live bottom: {:?}",

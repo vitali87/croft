@@ -1514,7 +1514,7 @@ fn a_long_crumb_picker_keeps_its_highlight_on_screen() {
     click_crumb(&mut app, 1);
     // The row the highlight is drawn on, with its label there.
     let shown = |app: &mut App| {
-        let screen = screen_text_863(app, 100, 20);
+        let screen = draw_screen(app, 100, 20);
         let r = app.menu_rect().unwrap();
         let sel = app.context_menu.as_ref().unwrap().selected;
         let y = (r.y + 1..r.y + r.height - 1)
@@ -2409,7 +2409,7 @@ fn a_symbol_tab_opens_beside_its_file_showing_only_the_symbol() {
 
     // Scrolled to the top, the clip, not the scroll, keeps `fn a` out.
     app.editor.scroll = 0;
-    let screen = painted(&mut app);
+    let screen = draw_screen(&mut app, 100, 30);
     assert!(
         screen.contains("b \u{b7} two.rs"),
         "titled by its symbol:\n{screen}"
@@ -2696,7 +2696,7 @@ fn an_outline_row_right_click_opens_that_symbol_as_a_tab() {
     app.outline.collapsed = false;
     let symbols = app.compute_syntax_outline(&file);
     app.outline.set_symbols(file.clone(), symbols);
-    painted(&mut app);
+    draw_screen(&mut app, 100, 30);
     let area = app.outline.last_area;
     let row = (area.y..area.y + area.height)
         .find(|&y| {
@@ -2766,7 +2766,7 @@ fn a_symbol_tab_never_scrolls_its_tail_off_a_pane_it_fits() {
     app.editor.cursor_row = 5;
     app.editor.cursor_col = 0;
     app.editor.scroll = 5;
-    painted(&mut app);
+    draw_screen(&mut app, 100, 30);
     assert_eq!(
         app.editor.scroll, 3,
         "fn b's three lines fill the pane top down"

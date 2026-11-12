@@ -2072,7 +2072,7 @@ fn open_editors_save_all_hides_while_collapsed_and_the_title_click_still_toggles
     app.open_editors.collapsed = true;
     app.sidebar_view = SidebarView::Explorer;
     app.show_tree = true;
-    let buf = render_buffer_852(&mut app, 120, 40);
+    let buf = draw_buffer(&mut app, 120, 40);
     let hdr = app.open_editors.last_area;
     assert!(hdr.height > 0, "OPEN EDITORS is on screen");
     assert!(
@@ -2083,7 +2083,7 @@ fn open_editors_save_all_hides_while_collapsed_and_the_title_click_still_toggles
     // The rightmost header cells, where the button sits when expanded.
     left_click(&mut app, hdr.x + hdr.width - 2, hdr.y);
     assert!(!app.open_editors.collapsed, "the header click expands it");
-    let _ = render_buffer_852(&mut app, 120, 40);
+    let _ = draw_buffer(&mut app, 120, 40);
     left_click(&mut app, hdr.x + 3, hdr.y);
     assert!(app.open_editors.collapsed, "the title click collapses it");
     assert_eq!(

@@ -457,7 +457,7 @@ fn screencast_mode_shows_the_keys_and_names_what_the_palette_ran() {
         .unwrap();
     assert!(app.screencast.is_on(), "{}", app.status);
     assert!(run_from_palette(&mut app, "View: Toggle Zen Mode"));
-    let screen = screen_text_863(&mut app, 120, 30);
+    let screen = draw_screen(&mut app, 120, 30);
     assert!(
         screen.contains(" View: Toggle Zen Mode   Enter  View: Toggle Zen Mode"),
         "the query typed, then Enter and what it ran:\n{screen}"
@@ -469,7 +469,7 @@ fn screencast_mode_shows_the_keys_and_names_what_the_palette_ran() {
     let now = std::time::Instant::now();
     assert!(!app.screencast.expire(now));
     assert!(app.screencast.expire(now + screencast::LINGER));
-    assert!(!screen_text_863(&mut app, 120, 30).contains("Enter  View"));
+    assert!(!draw_screen(&mut app, 120, 30).contains("Enter  View"));
     app.handle_key(key(KeyCode::F(8), KeyModifiers::SHIFT))
         .unwrap();
     assert!(!app.screencast.is_on());

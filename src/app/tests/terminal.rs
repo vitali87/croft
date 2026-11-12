@@ -1155,19 +1155,9 @@ fn quick_select_paints_gold_labels_and_broadcast_paints_modal_and_pills() {
         .unwrap(),
     );
     assert!(app.handle_cmd_k_chord(key(KeyCode::Char('i'), KeyModifiers::NONE)));
-    fn screen_rows(term: &ratatui::Terminal<ratatui::backend::TestBackend>) -> Vec<String> {
-        let buf = term.backend().buffer();
-        (0..buf.area.height)
-            .map(|y| {
-                (0..buf.area.width)
-                    .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
-                    .collect()
-            })
-            .collect()
-    }
     term.draw(|f| app.render(f)).unwrap();
     assert!(
-        screen_rows(&term)
+        screen_char_rows(&term)
             .iter()
             .any(|r| r.contains("BROADCAST INPUT TO ALL PANES?")),
         "the confirm modal must be painted while pending"
@@ -1175,7 +1165,7 @@ fn quick_select_paints_gold_labels_and_broadcast_paints_modal_and_pills() {
     app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
         .unwrap();
     term.draw(|f| app.render(f)).unwrap();
-    let marks = screen_rows(&term)
+    let marks = screen_char_rows(&term)
         .iter()
         .map(|r| r.matches('\u{21f6}').count())
         .sum::<usize>();
@@ -1835,13 +1825,6 @@ fn cross_pane_paste_via_bracketed_paste_works_in_every_destination_and_terminal_
         (tmp, app)
     }
 
-    fn render(app: &mut App) -> ratatui::Terminal<ratatui::backend::TestBackend> {
-        let backend = ratatui::backend::TestBackend::new(140, 50);
-        let mut term = ratatui::Terminal::new(backend).unwrap();
-        term.draw(|f| app.render(f)).unwrap();
-        term
-    }
-
     // Drive a bracketed paste from a non-path token, which is what
     // iTerm2 emits when the user presses Cmd+V with terminal text
     // on the clipboard. Non-path so the drop-handler branches in
@@ -1859,7 +1842,7 @@ fn cross_pane_paste_via_bracketed_paste_works_in_every_destination_and_terminal_
     // -- Case 1: paste into the editor while terminal is split.
     {
         let (_tmp, mut app) = seed_app();
-        let _draw = render(&mut app);
+        let _draw = draw_terminal(&mut app, 140, 50);
         app.focus_pane(Pane::Editor);
         app.handle_paste(payload_editor_split);
         assert!(
@@ -1875,9 +1858,9 @@ fn cross_pane_paste_via_bracketed_paste_works_in_every_destination_and_terminal_
     // -- Case 2: paste into the editor while terminal is maximised.
     {
         let (_tmp, mut app) = seed_app();
-        let _draw = render(&mut app);
+        let _draw = draw_terminal(&mut app, 140, 50);
         app.toggle_terminal_maximize();
-        let _draw = render(&mut app);
+        let _draw = draw_terminal(&mut app, 140, 50);
         app.focus_pane(Pane::Editor);
         app.handle_paste(payload_editor_max);
         assert!(
@@ -1894,7 +1877,7 @@ fn cross_pane_paste_via_bracketed_paste_works_in_every_destination_and_terminal_
     //    split. The user explicitly named this as broken.
     {
         let (_tmp, mut app) = seed_app();
-        let _draw = render(&mut app);
+        let _draw = draw_terminal(&mut app, 140, 50);
         app.focus_pane(Pane::Editor);
         app.open_editor_find();
         app.handle_paste(payload_find_split);
@@ -1913,9 +1896,9 @@ fn cross_pane_paste_via_bracketed_paste_works_in_every_destination_and_terminal_
     //    maximised.
     {
         let (_tmp, mut app) = seed_app();
-        let _draw = render(&mut app);
+        let _draw = draw_terminal(&mut app, 140, 50);
         app.toggle_terminal_maximize();
-        let _draw = render(&mut app);
+        let _draw = draw_terminal(&mut app, 140, 50);
         app.focus_pane(Pane::Editor);
         app.open_editor_find();
         app.handle_paste(payload_find_max);
@@ -1934,9 +1917,9 @@ fn cross_pane_paste_via_bracketed_paste_works_in_every_destination_and_terminal_
     //    terminal is split.
     {
         let (_tmp, mut app) = seed_app();
-        let _draw = render(&mut app);
+        let _draw = draw_terminal(&mut app, 140, 50);
         app.set_sidebar_view(SidebarView::Search);
-        let _draw = render(&mut app);
+        let _draw = draw_terminal(&mut app, 140, 50);
         app.handle_paste(payload_search_split);
         assert!(
             app.search.query.contains(payload_search_split),
@@ -1950,11 +1933,11 @@ fn cross_pane_paste_via_bracketed_paste_works_in_every_destination_and_terminal_
     //    failing while maximised worked; both must succeed.
     {
         let (_tmp, mut app) = seed_app();
-        let _draw = render(&mut app);
+        let _draw = draw_terminal(&mut app, 140, 50);
         app.toggle_terminal_maximize();
-        let _draw = render(&mut app);
+        let _draw = draw_terminal(&mut app, 140, 50);
         app.set_sidebar_view(SidebarView::Search);
-        let _draw = render(&mut app);
+        let _draw = draw_terminal(&mut app, 140, 50);
         app.handle_paste(payload_search_max);
         assert!(
             app.search.query.contains(payload_search_max),
@@ -1968,7 +1951,7 @@ fn cross_pane_paste_via_bracketed_paste_works_in_every_destination_and_terminal_
     //    writing the bytes back into the PTY.
     {
         let (_tmp, mut app) = seed_app();
-        let _draw = render(&mut app);
+        let _draw = draw_terminal(&mut app, 140, 50);
         app.focus_pane(Pane::Terminal);
         // No panic + handler completes is enough. Verifying the
         // PTY received the bytes requires polling the shell which
@@ -1980,9 +1963,9 @@ fn cross_pane_paste_via_bracketed_paste_works_in_every_destination_and_terminal_
     //    maximised.
     {
         let (_tmp, mut app) = seed_app();
-        let _draw = render(&mut app);
+        let _draw = draw_terminal(&mut app, 140, 50);
         app.toggle_terminal_maximize();
-        let _draw = render(&mut app);
+        let _draw = draw_terminal(&mut app, 140, 50);
         app.focus_pane(Pane::Terminal);
         app.handle_paste("clip-into-terminal-maximised");
     }
@@ -1994,9 +1977,9 @@ fn cross_pane_paste_via_bracketed_paste_works_in_every_destination_and_terminal_
     //    commit message when sidebar_view == SourceControl.
     {
         let (_tmp, mut app) = seed_app();
-        let _draw = render(&mut app);
+        let _draw = draw_terminal(&mut app, 140, 50);
         app.set_sidebar_view(SidebarView::SourceControl);
-        let _draw = render(&mut app);
+        let _draw = draw_terminal(&mut app, 140, 50);
         app.handle_paste(payload_sc);
         assert!(
             app.source_control.message.contains(payload_sc),
@@ -2008,7 +1991,7 @@ fn cross_pane_paste_via_bracketed_paste_works_in_every_destination_and_terminal_
     // -- Case 10: paste into the file-finder (Cmd+P quick-open).
     {
         let (_tmp, mut app) = seed_app();
-        let _draw = render(&mut app);
+        let _draw = draw_terminal(&mut app, 140, 50);
         app.open_file_finder();
         app.handle_paste(payload_finder);
         let q = app
@@ -4047,19 +4030,9 @@ fn osc_9_4_progress_paints_a_border_gauge_and_pill_percent() {
     let backend = ratatui::backend::TestBackend::new(140, 50);
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|f| app.render(f)).unwrap();
-    fn screen_rows(term: &ratatui::Terminal<ratatui::backend::TestBackend>) -> Vec<String> {
-        let buf = term.backend().buffer();
-        (0..buf.area.height)
-            .map(|y| {
-                (0..buf.area.width)
-                    .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
-                    .collect()
-            })
-            .collect()
-    }
     let area = app.terminals[0].last_area;
     let inner = app.terminals[0].last_inner;
-    let rows = screen_rows(&term);
+    let rows = screen_char_rows(&term);
     let border_row = &rows[(area.y + area.height - 1) as usize];
     // The gauge's fill glyph contrasts with the pane's own border weight
     // (#470): a focused pane draws a heavy border, so its fill is `═`
@@ -4121,7 +4094,7 @@ fn osc_9_4_progress_paints_a_border_gauge_and_pill_percent() {
         || app.terminals[0].progress().is_none(),
     );
     term.draw(|f| app.render(f)).unwrap();
-    let rows = screen_rows(&term);
+    let rows = screen_char_rows(&term);
     let border_row = &rows[(area.y + area.height - 1) as usize];
     // No FILL glyph remains. `━` is the border's own glyph on a focused
     // pane (#470), so a literal check here would fail on an intact border
@@ -7030,9 +7003,7 @@ fn maximizing_from_a_folded_strip_shows_the_pane_the_menu_named() {
 fn tracking_terminal_app(modes: &[u8]) -> (App, tempfile::TempDir, u16, u16, u16, u16) {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    let backend = ratatui::backend::TestBackend::new(120, 40);
-    let mut term = ratatui::Terminal::new(backend).unwrap();
-    term.draw(|f| app.render(f)).unwrap();
+    draw(&mut app, 120, 40);
     app.terminals[0].feed_bytes_for_test(modes);
     let inner = app.terminals[0].last_inner;
     assert!(
