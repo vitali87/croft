@@ -18729,12 +18729,24 @@ fn parse_color_component(text: &str) -> Option<u8> {
 }
 
 /// Parse a Rust-style color constructor starting at byte `i`:
-/// `Color::Rgb(0xeb, 0xcb, 0x8b)`, `Rgb(235, 203, 139)`, `Color::from_rgb(..)`
-/// or a bare `from_rgb(..)`, three integer literals. The whole call, path
-/// included, is the match. It must start at a path start (not glued to a
-/// word, `_` or `::`), so `MyRgb(` and `x::Rgb(` are left alone.
+/// `Color::Rgb(0xeb, 0xcb, 0x8b)`, `Rgb(235, 203, 139)`, `Color::from_rgb(..)`,
+/// a bare `from_rgb(..)`, and the alpha forms (`Rgba(..)`,
+/// `from_rgba_unmultiplied(..)`) whose fourth value is read but not drawn.
+/// The values may be wrapped in an array, as the `image` crate's
+/// `Rgba([0xff, 0, 0, 0xff])` has them. Every value is an integer literal.
+/// The whole call, path included, is the match. It must start at a path
+/// start (not glued to a word, `_` or `::`), so `x::Rgb(` is left alone.
 fn parse_code_rgb_color(line: &str, i: usize) -> Option<((u8, u8, u8), usize)> {
-    const PREFIXES: [&str; 4] = ["Color::Rgb(", "Color::from_rgb(", "Rgb(", "from_rgb("];
+    const PREFIXES: [&str; 8] = [
+        "Color::Rgba(",
+        "Color::Rgb(",
+        "Color::from_rgb(",
+        "Color::from_rgba_unmultiplied(",
+        "Rgba(",
+        "Rgb(",
+        "from_rgba_unmultiplied(",
+        "from_rgb(",
+    ];
     let rest = &line[i..];
     let prefix = PREFIXES.iter().find(|p| rest.starts_with(**p))?;
     if i > 0 {
@@ -18743,16 +18755,31 @@ fn parse_code_rgb_color(line: &str, i: usize) -> Option<((u8, u8, u8), usize)> {
             return None;
         }
     }
-    let close = rest.find(')')?;
-    let mut parts = rest[prefix.len()..close].split(',');
+    let args = &rest[prefix.len()..];
+    let (inner, consumed) = match args.trim_start().strip_prefix('[') {
+        Some(array) => {
+            let end = array.find(']')?;
+            let tail = array[end + 1..].trim_start().strip_prefix(')')?;
+            (&array[..end], rest.len() - tail.len())
+        }
+        None => {
+            let end = args.find(')')?;
+            (&args[..end], prefix.len() + end + 1)
+        }
+    };
+    let mut parts = inner.split(',');
     let r = parse_color_component(parts.next()?)?;
     let g = parse_color_component(parts.next()?)?;
     let b = parse_color_component(parts.next()?)?;
-    // A trailing comma is fine, a fourth value is not (`Rgba`-like calls).
+    let alpha = parts.next().filter(|p| !p.trim().is_empty());
+    if alpha.is_some_and(|a| parse_color_component(a).is_none()) {
+        return None;
+    }
+    // At most one more (empty) piece, from a trailing comma.
     if parts.any(|p| !p.trim().is_empty()) {
         return None;
     }
-    Some(((r, g, b), close + 1))
+    Some(((r, g, b), consumed))
 }
 
 /// Convert HSL (h in degrees, s/l as 0..=100 percentages) to sRGB.
@@ -44680,6 +44707,19 @@ mod tests {
             let out = scan_color_swatches(&[String::from(text)], false);
             assert_eq!(out[0].len(), 1, "{text}: {:?}", out[0]);
             assert_eq!(out[0][0].2, Color::Rgb(rgb.0, rgb.1, rgb.2), "{text}");
+        }
+        // The alpha forms, and the `image` crate's array form.
+        for (text, rgb) in [
+            ("Rgba([0xe9, 0x7c, 0x41, 0xff])", (0xe9, 0x7c, 0x41)),
+            ("Rgba([0xff, 0xff, 0xff, 0xff]));", (255, 255, 255)),
+            ("Color::Rgba(1, 2, 3, 128)", (1, 2, 3)),
+            ("Rgb([1, 2, 3])", (1, 2, 3)),
+        ] {
+            let out = scan_color_swatches(&[String::from(text)], false);
+            assert_eq!(out[0].len(), 1, "{text}: {:?}", out[0]);
+            assert_eq!(out[0][0].2, Color::Rgb(rgb.0, rgb.1, rgb.2), "{text}");
+            assert_eq!(out[0][0].0, 0, "{text}: from the constructor's name");
+            assert_eq!(out[0][0].1, text.find(')').unwrap() + 1, "{text}");
         }
         // Not a colour: a number out of range.
         for text in [
