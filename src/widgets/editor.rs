@@ -5381,23 +5381,26 @@ impl Editor {
                 // extent is in the same char columns: how far the line must
                 // scroll for its tail to fit `width` cells, plus `width`, so
                 // that `extent - width` is exactly that scroll.
-                // `cum[i]` is where char `i` starts, tab stops from the line's
-                // left edge, so the tail from `first` is `total - cum[first]`.
-                let mut cum = Vec::with_capacity(l.len() + 1);
-                let mut col = 0;
-                for (_, w) in char_cells_from(l, 0) {
-                    cum.push(col);
-                    col += w;
-                }
-                cum.push(col);
-                let len = cum.len() - 1;
+                // Tab stops count from the line's left edge, so the tail from
+                // char `first` takes `col - start(first)` cells, which shrinks
+                // as `first` grows: the scroll is the first char starting at or
+                // past the `col + extra - width` cells that must scroll off.
+                // Two passes and no table per char, which on a huge one-line
+                // file was hundreds of MB before the first frame.
+                let (col, len) =
+                    char_cells_from(l, 0).fold((0, 0), |(col, n), (_, w)| (col + w, n + 1));
                 if col + extra <= width {
                     return len + extra;
                 }
-                let mut first = len;
-                while first > 0 && (col - cum[first - 1]) + extra <= width {
-                    first -= 1;
-                }
+                let off = col + extra - width;
+                let first = char_cells_from(l, 0)
+                    .scan(0, |at, (_, w)| {
+                        let start = *at;
+                        *at += w;
+                        Some(start)
+                    })
+                    .position(|start| start >= off)
+                    .unwrap_or(len);
                 first + width
             })
             .max()
@@ -19020,59 +19023,47 @@ fn blank_tabs_from(text: &str, origin: usize) -> std::borrow::Cow<'_, str> {
 /// the rightmost break opportunity within the column, else split the
 /// over-long token.
 fn wrap_segments(line: &str, width: usize) -> Vec<(usize, usize)> {
-    if width == 0 || cells_from(line, 0) <= width {
+    if width == 0 {
         return vec![(0, line.chars().count())];
     }
-    // Each char with its cells as the row paints it ([`char_cells_from`]).
-    // A tab's cells depend on where it lands, and a wrapped row counts tab
-    // stops from its own left edge, so `cell` measures it from the row's.
-    let chars: Vec<(char, usize)> = char_cells_from(line, 0).collect();
-    let cell = |(c, w): (char, usize), used: usize| {
-        if c == '\t' { tab_cells_at(used) } else { w }
-    };
-    let row_cells = |from: usize| {
-        chars[from..]
-            .iter()
-            .fold(0, |used, &cw| used + cell(cw, used))
-    };
     let mut segs = Vec::new();
-    let mut start = 0;
-    while start < chars.len() {
-        if row_cells(start) <= width {
-            segs.push((start, chars.len()));
-            break;
-        }
+    let (mut start, mut start_byte) = (0, 0);
+    loop {
+        // A wrapped row counts tab stops from its own left edge, so each row
+        // is measured as text of its own ([`char_cells_from`]). One pass per
+        // row and nothing kept per char: a huge one-line file wraps without
+        // a table the size of the file.
+        let row = &line[start_byte..];
+        let (mut end, mut end_byte, mut used) = (start, start_byte, 0);
+        // The rightmost break-after char so far, as the `(char, byte)` just
+        // past it; never right at the row's start, so a row is never one
+        // char by a break (or stalls).
+        let mut brk = None;
+        let mut fits = true;
         // The hard limit counts CELLS, as the renderer clips: counted in
         // chars, a row of wide (CJK) characters was twice as wide as the
         // pane and its second half was never shown on any row. At least one
         // char per row, so a char wider than the pane cannot stall.
-        let mut limit = start;
-        let mut used = 0;
-        while limit < chars.len() {
-            let w = cell(chars[limit], used);
-            if used + w > width && limit > start {
+        for ((at, c), (_, w)) in row.char_indices().zip(char_cells_from(row, 0)) {
+            if used + w > width && end > start {
+                fits = false;
                 break;
             }
             used += w;
-            limit += 1;
-        }
-        // Scan back from the hard limit for the rightmost break-after char;
-        // `i` is the char count, so the char sits at `chars[i - 1]` and the
-        // segment becomes `[start, i)`. Stop at `start + 1` so a break right
-        // at the segment start can't produce a one-char row (or stall).
-        let mut brk = limit;
-        let mut i = limit;
-        while i > start + 1 {
-            if is_wrap_break_after(chars[i - 1].0) {
-                brk = i;
-                break;
+            end += 1;
+            end_byte = start_byte + at + c.len_utf8();
+            if end > start + 1 && is_wrap_break_after(c) {
+                brk = Some((end, end_byte));
             }
-            i -= 1;
         }
-        segs.push((start, brk));
-        start = brk;
+        if fits {
+            segs.push((start, end));
+            return segs;
+        }
+        (end, end_byte) = brk.unwrap_or((end, end_byte));
+        segs.push((start, end));
+        (start, start_byte) = (end, end_byte);
     }
-    segs
 }
 
 /// Map 1-based bookmark `marks` across a buffer change from `old` to `new`.
@@ -35792,6 +35783,20 @@ mod tests {
         }
     }
 
+    /// Each wrapped row counts tab stops from its own left edge: `⇥ef` on
+    /// the second row is 4 + 2 cells, so it fits in 6.
+    #[test]
+    fn wrap_segments_count_tab_stops_from_each_rows_left_edge() {
+        set_tab_cells(4);
+        assert_eq!(wrap_segments("abcd\tef", 6), vec![(0, 4), (4, 7)]);
+        assert_eq!(
+            wrap_segments("ab\tc", 5),
+            vec![(0, 4)],
+            "the tab stops at 4"
+        );
+        assert_eq!(wrap_segments("ab\tc", 4), vec![(0, 3), (3, 4)]);
+    }
+
     #[test]
     fn wrap_segments_tile_the_line_without_gaps() {
         let line = "alpha beta gamma delta epsilon zeta eta theta";
@@ -36401,6 +36406,14 @@ mod tests {
             use_spaces: false,
         });
         assert_eq!(e.content_cols(30), 10, "20 cells fit in 30");
+        // `ab⇥c` at Tab Size 8 is 9 cells, the tab running from cell 2 to 8:
+        // in 5 cells only `c` fits, so 3 chars scroll off.
+        e.lines = vec!["ab\tc".to_string()];
+        e.set_indent_style(IndentStyle {
+            width: 8,
+            use_spaces: false,
+        });
+        assert_eq!(e.content_cols(5), 3 + 5);
     }
 
     #[test]
