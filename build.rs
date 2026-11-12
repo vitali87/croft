@@ -32,11 +32,11 @@ mod select;
 /// Bake this build's release highlights into the binary.
 ///
 /// `select::baked` chooses them: the pending fragments in
-/// `src/release_notes/unreleased/` when there are any, otherwise
-/// `src/release_notes/<version>.md`. Each pull request writes a fragment of
-/// its own and the version-bump workflow folds them into the next version's
-/// notes after merge, so no two open pull requests edit one file or one
-/// version line.
+/// `src/release_notes/unreleased/` when any of them has a feature or a fix,
+/// otherwise `src/release_notes/<version>.md`. Each pull request writes a
+/// fragment of its own and the version-bump workflow folds them into the
+/// next version's notes after merge, so no two open pull requests edit one
+/// file or one version line.
 ///
 /// A build with neither is a BUILD error rather than an empty panel, keeping
 /// the guarantee the single file gave: a binary always describes itself.

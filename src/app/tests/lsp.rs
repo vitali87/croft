@@ -199,6 +199,210 @@ fn hovering_a_diagnostic_on_punctuation_shows_its_message_synchronously() {
     );
 }
 
+/// `let n = compute(1);` in a `.txt` file stood up by hand, the caret at
+/// `col`. No language server has the file, so the worker answers each hover
+/// request with nothing; [`await_hover_reply`] waits for that answer.
+fn caret_hover_app(col: usize) -> (App, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("notes.txt");
+    std::fs::write(&f, "let n = compute(1);\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.path = Some(f);
+    app.editor.lines = vec![String::from("let n = compute(1);")];
+    app.editor.last_inner = ratatui::layout::Rect::new(0, 0, 80, 25);
+    app.editor.last_gutter_width = 2;
+    app.editor.cursor_col = col;
+    app.focus_pane(Pane::Editor);
+    (app, tmp)
+}
+
+fn answer_hover(app: &App, request_id: u64, text: &str) {
+    app.lsp
+        .as_ref()
+        .unwrap()
+        .push_hover_for_test(crate::lsp::manager::HoverResult {
+            request_id,
+            text: Some(String::from(text)),
+        });
+}
+
+/// Drain until the worker's answer to the pending hover request lands.
+fn await_hover_reply(app: &mut App) {
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(200),
+        "the LSP worker to answer the hover request",
+        || app.drain_lsp_hover(),
+    );
+}
+
+fn diagnose_compute(app: &mut App) {
+    use crate::lsp::manager::{Diagnostic, DiagnosticSeverity};
+    let path = app.editor.path.clone().unwrap();
+    app.editor.apply_diagnostics(
+        path,
+        vec![Diagnostic {
+            start_line: 0,
+            start_char: 8,
+            end_line: 0,
+            end_char: 15,
+            severity: DiagnosticSeverity::Error,
+            message: String::from("cannot find function `compute` in this scope"),
+            tags: Default::default(),
+            code: None,
+            origin: None,
+        }],
+    );
+}
+
+const COMPUTE_PROBLEM: &str = "Error: cannot find function `compute` in this scope";
+
+#[test]
+fn show_hover_asks_about_the_caret_and_opens_the_popup_there() {
+    // #1518: hover had no keyboard route. The command asks about the word
+    // at the caret, and the reply opens at the caret's cell with the
+    // pointer nowhere near it.
+    let (mut app, _tmp) = caret_hover_app(10);
+    let caret = app
+        .editor
+        .cursor_screen_pos()
+        .expect("the caret is on screen");
+    app.run_command(crate::widgets::command_palette::Command::ShowHover);
+    let id = app
+        .hover_request_id
+        .expect("a word at the caret asks the server");
+    assert_eq!(app.hover_word, Some((0, 8, 15)), "about `compute`");
+    // The worker's own empty answer first, so the pushed one is the last.
+    await_hover_reply(&mut app);
+    answer_hover(&app, id, "fn compute(x: i32) -> i32");
+    assert!(app.drain_lsp_hover());
+    let popup = app.hover_popup.as_ref().expect("the reply opens the popup");
+    assert_eq!(popup.lines, vec![String::from("fn compute(x: i32) -> i32")]);
+    assert_eq!(popup.anchor, caret);
+    app.handle_key(key(KeyCode::Right, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.hover_popup.is_none(), "the next key closes it");
+}
+
+#[test]
+fn show_hover_in_a_file_no_server_has_shows_a_problem_or_says_there_is_none() {
+    // The worker dropped a hover request no server could take, so the
+    // command waited forever: no popup for the problem, no status (#1518).
+    let (mut app, _tmp) = caret_hover_app(10);
+    app.run_command(crate::widgets::command_palette::Command::ShowHover);
+    assert!(app.hover_request_id.is_some(), "a word still asks");
+    await_hover_reply(&mut app);
+    assert!(app.hover_popup.is_none());
+    assert_eq!(app.status, "No hover information at the caret");
+
+    diagnose_compute(&mut app);
+    app.run_command(crate::widgets::command_palette::Command::ShowHover);
+    await_hover_reply(&mut app);
+    let popup = app.hover_popup.as_ref().expect("the problem shows");
+    assert_eq!(popup.lines, vec![String::from(COMPUTE_PROBLEM)]);
+}
+
+#[test]
+fn a_pointer_hover_in_a_file_no_server_has_shows_the_problem_on_a_word() {
+    // The same dropped request left the pointer's hover over a squiggled
+    // word blank, as only punctuation skipped the request.
+    let (mut app, _tmp) = caret_hover_app(0);
+    diagnose_compute(&mut app);
+    // text_x = gutter(2) + 1, so cell col 12 is char 9, inside `compute`.
+    let past = std::time::Instant::now() - HOVER_DELAY * 2;
+    app.hover.on_move(past, 12, 0);
+    app.poll_hover();
+    assert!(app.hover_request_id.is_some());
+    await_hover_reply(&mut app);
+    let popup = app.hover_popup.as_ref().expect("the problem shows");
+    assert_eq!(popup.lines, vec![String::from(COMPUTE_PROBLEM)]);
+}
+
+#[test]
+fn show_hover_is_not_taken_over_by_a_pointer_dwell_already_running() {
+    // A pointer that came to rest on `let` just before Ctrl+K Ctrl+I would
+    // fire next frame and put its own hover in place of the caret's.
+    let (mut app, _tmp) = caret_hover_app(10);
+    let past = std::time::Instant::now() - HOVER_DELAY * 2;
+    app.hover.on_move(past, 3, 0);
+    app.run_command(crate::widgets::command_palette::Command::ShowHover);
+    let id = app.hover_request_id;
+    let anchor = app.hover_anchor;
+    app.poll_hover();
+    assert_eq!(app.hover_request_id, id, "still the caret's request");
+    assert_eq!(app.hover_anchor, anchor);
+    assert_eq!(app.hover_word, Some((0, 8, 15)), "still about `compute`");
+}
+
+#[test]
+fn a_hover_reply_after_a_paste_over_the_word_is_dropped() {
+    // A paste is not a key, so it leaves the request pending; `average`
+    // over `compute` keeps the span, and only the edit count tells the
+    // reply describes text that is gone.
+    let (mut app, _tmp) = caret_hover_app(10);
+    app.run_command(crate::widgets::command_palette::Command::ShowHover);
+    let id = app.hover_request_id.expect("a request");
+    await_hover_reply(&mut app);
+    app.editor.selection = Some(crate::widgets::editor::EditorSelection {
+        anchor: (0, 8),
+        head: (0, 15),
+    });
+    app.handle_paste("average");
+    assert_eq!(app.editor.lines[0], "let n = average(1);");
+    assert_eq!(app.hover_request_id, Some(id), "still pending");
+    answer_hover(&app, id, "fn compute(x: i32) -> i32");
+    assert!(!app.drain_lsp_hover(), "the stale reply is dropped");
+    assert!(app.hover_popup.is_none());
+}
+
+#[test]
+fn an_empty_caret_hover_reply_leaves_a_newer_status_alone() {
+    let (mut app, _tmp) = caret_hover_app(10);
+    app.run_command(crate::widgets::command_palette::Command::ShowHover);
+    app.status = String::from("Saved notes.txt");
+    await_hover_reply(&mut app);
+    assert_eq!(app.status, "Saved notes.txt");
+}
+
+#[test]
+fn show_hover_reads_the_word_the_caret_ends_and_says_when_there_is_none() {
+    // As in VS Code: just past `compute` (on its `(`) is still on it.
+    let (mut app, _tmp) = caret_hover_app(15);
+    app.run_command(crate::widgets::command_palette::Command::ShowHover);
+    assert!(app.hover_request_id.is_some());
+    assert_eq!(app.hover_word, Some((0, 8, 15)));
+    // On `=`, after a space: nothing to describe, and the command says so.
+    app.editor.cursor_col = 6;
+    app.run_command(crate::widgets::command_palette::Command::ShowHover);
+    assert_eq!(app.hover_request_id, None);
+    assert!(app.hover_popup.is_none());
+    assert_eq!(app.status, "No hover information at the caret");
+}
+
+#[test]
+fn ctrl_k_ctrl_i_in_the_editor_shows_the_hover_and_ctrl_k_i_still_broadcasts() {
+    // #1518: the broadcast arm took I with or without Ctrl, so VS Code's
+    // Ctrl+K Ctrl+I (Cmd+K Cmd+I on macOS) toggled Broadcast Input.
+    let (mut app, _tmp) = caret_hover_app(10);
+    let cmd = if cfg!(target_os = "macos") {
+        KeyModifiers::SUPER
+    } else {
+        KeyModifiers::CONTROL
+    };
+    assert!(app.handle_cmd_k_chord(key(KeyCode::Char('i'), cmd)));
+    assert!(
+        app.hover_request_id.is_some(),
+        "the chord asks for the hover"
+    );
+    assert!(!app.pending_broadcast_enable);
+    assert!(!app.status.contains("Broadcast"), "{}", app.status);
+    assert!(app.handle_cmd_k_chord(key(KeyCode::Char('i'), KeyModifiers::NONE)));
+    assert!(
+        app.status.starts_with("Broadcast input needs"),
+        "plain Ctrl+K I keeps broadcast input: {}",
+        app.status
+    );
+}
+
 #[test]
 fn the_swallowed_prefix_click_dismisses_the_hover_and_tab_tooltip() {
     // The sibling test above binds `ctrl+click` to a real command, so it takes
@@ -948,19 +1152,19 @@ fn due_ask(app: &App) -> Option<CompletionTrigger> {
 fn a_word_begun_in_code_opens_completion_as_it_is_typed() {
     let (_tmp, mut app) = typing_completion_app("x = ", ".");
     let path = app.editor.path.clone().unwrap();
-    type_into_editor(&mut app, "p");
+    type_keys(&mut app, "p");
     assert_eq!(due_ask(&app), Some(CompletionTrigger::Invoked));
     assert_eq!(app.completion_request_id, None, "asked after the sync");
-    type_into_editor(&mut app, "ri");
+    type_keys(&mut app, "ri");
     app.send_due_completion_ask();
     let id = app.completion_request_id.expect("one ask for the word");
     app.apply_completion_result(completion_reply(id, &path, &["print", "property"]));
     assert_eq!(popup_labels(&app), ["print"]);
-    type_into_editor(&mut app, "n");
+    type_keys(&mut app, "n");
     assert_eq!(due_ask(&app), None, "a later letter only filters");
     app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
         .unwrap();
-    type_into_editor(&mut app, "t");
+    type_keys(&mut app, "t");
     assert_eq!(
         (due_ask(&app), app.completion_popup.is_none()),
         (None, true)
@@ -974,18 +1178,18 @@ fn a_word_begun_in_code_opens_completion_as_it_is_typed() {
 fn quick_suggestions_stay_out_of_comments_strings_and_numbers() {
     for (text, typed) in [("x = 1  # ", "p"), ("x = '", "p"), ("x = ", "1")] {
         let (_tmp, mut app) = typing_completion_app(text, ".");
-        type_into_editor(&mut app, typed);
+        type_keys(&mut app, typed);
         assert_eq!(due_ask(&app), None, "{text}{typed}");
     }
     let (_tmp, mut app) = typing_completion_app("x = ab", ".");
     app.editor.cursor_col = 4;
-    type_into_editor(&mut app, "p");
+    type_keys(&mut app, "p");
     assert_eq!(due_ask(&app), None, "the middle of a word");
     app.quick_suggestions = false;
     app.editor.cursor_col = 7;
-    type_into_editor(&mut app, " os");
+    type_keys(&mut app, " os");
     assert_eq!(due_ask(&app), None);
-    type_into_editor(&mut app, ".");
+    type_keys(&mut app, ".");
     assert_eq!(due_ask(&app), Some(CompletionTrigger::Character('.')));
 }
 
@@ -1001,11 +1205,11 @@ fn the_server_s_trigger_characters_open_completion() {
     app.trigger_completion();
     let id = app.completion_request_id.unwrap();
     app.apply_completion_result(completion_reply(id, &path, &["os"]));
-    type_into_editor(&mut app, ".");
+    type_keys(&mut app, ".");
     assert_eq!(due_ask(&app), Some(CompletionTrigger::Character('.')));
     app.send_due_completion_ask();
     let id = app.completion_request_id.expect("the trigger asked");
-    type_into_editor(&mut app, "zz");
+    type_keys(&mut app, "zz");
     app.apply_completion_result(completion_reply(id, &path, &["path"]));
     assert!(app.completion_popup.is_none());
     assert!(
@@ -1013,16 +1217,16 @@ fn the_server_s_trigger_characters_open_completion() {
         "{}",
         app.status
     );
-    type_into_editor(&mut app, ".");
+    type_keys(&mut app, ".");
     app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
         .unwrap();
     app.send_due_completion_ask();
     assert_eq!(app.completion_request_id, None, "the caret left the line");
 
     let (_tmp, mut app) = typing_completion_app("x = os", "/");
-    type_into_editor(&mut app, ".");
+    type_keys(&mut app, ".");
     assert_eq!(due_ask(&app), None);
-    type_into_editor(&mut app, "/");
+    type_keys(&mut app, "/");
     assert_eq!(due_ask(&app), Some(CompletionTrigger::Character('/')));
 }
 
@@ -1544,7 +1748,7 @@ fn a_completion_accepted_in_a_vim_change_undoes_with_it() {
     let accept = || {
         let (tmp, path, mut app, tx) = completion_reply_app();
         app.vim.enabled = true;
-        vim_feed(&mut app, 'A');
+        type_char(&mut app, 'A');
         app.trigger_completion();
         let request_id = app.completion_request_id.unwrap();
         draw(&mut app, 100, 30);
@@ -1555,7 +1759,7 @@ fn a_completion_accepted_in_a_vim_change_undoes_with_it() {
         popup.items[0].resolve = Some(std::sync::Arc::default());
         app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
             .unwrap();
-        vim_feed(&mut app, ';');
+        type_char(&mut app, ';');
         let pending = app.completion_resolve.as_ref().expect("a resolve went out");
         let mut reply = completion_reply(pending.request_id, &path, &["load"]);
         reply.items[0].additional_edits = vec![crate::widgets::editor::TextSpanEdit {
@@ -1576,7 +1780,7 @@ fn a_completion_accepted_in_a_vim_change_undoes_with_it() {
     assert!(app.drain_lsp_completion());
     esc(&mut app);
     assert_eq!(app.editor.lines, [import, "import load;"]);
-    vim_feed(&mut app, 'u');
+    type_char(&mut app, 'u');
     assert_eq!(
         app.editor.lines,
         ["import lo"],
@@ -1587,7 +1791,7 @@ fn a_completion_accepted_in_a_vim_change_undoes_with_it() {
     esc(&mut app);
     tx.send(reply).unwrap();
     assert!(app.drain_lsp_completion());
-    vim_feed(&mut app, 'u');
+    type_char(&mut app, 'u');
     assert_eq!(
         app.editor.lines,
         ["import lo"],
@@ -1596,12 +1800,12 @@ fn a_completion_accepted_in_a_vim_change_undoes_with_it() {
 
     let (_tmp, mut app, tx, reply) = accept();
     esc(&mut app);
-    vim_feed_str(&mut app, "Ax");
+    type_keys(&mut app, "Ax");
     tx.send(reply).unwrap();
     assert!(app.drain_lsp_completion());
     esc(&mut app);
     assert_eq!(app.editor.lines, [import, "import load;x"]);
-    vim_feed(&mut app, 'u');
+    type_char(&mut app, 'u');
     assert_eq!(
         app.editor.lines,
         ["import load;x"],
@@ -1702,6 +1906,38 @@ fn change_all_occurrences_key_accepts_cmd_ctrl_or_alt_f2() {
         KeyCode::F(2),
         KeyModifiers::NONE
     )));
+}
+
+#[test]
+fn the_references_picker_starts_on_the_reference_under_the_caret() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.rs");
+    std::fs::write(&a, "let x = x + x;\nfoo(x);\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&a).unwrap();
+    let targets = vec![
+        (a.clone(), 0, 4),
+        (a.clone(), 0, 8),
+        (a.clone(), 0, 12),
+        (a.clone(), 1, 4),
+        (tmp.path().join("b.rs"), 1, 4),
+    ];
+    // On the second `x` of line 1 (col 8..9, caret inside it).
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 9;
+    app.open_location_picker(targets.clone(), "references");
+    assert_eq!(app.context_menu.as_ref().unwrap().selected, 1);
+    // Another file's reference on the same line is not this one.
+    app.context_menu = None;
+    app.editor.cursor_row = 1;
+    app.editor.cursor_col = 4;
+    app.open_location_picker(targets.clone(), "references");
+    assert_eq!(app.context_menu.as_ref().unwrap().selected, 3);
+    // A caret on a line with no reference leaves the highlight on top.
+    app.context_menu = None;
+    app.editor.cursor_row = 5;
+    app.open_location_picker(targets, "references");
+    assert_eq!(app.context_menu.as_ref().unwrap().selected, 0);
 }
 
 #[test]
@@ -3660,11 +3896,14 @@ fn app_with_week_notes(tmp: &tempfile::TempDir) -> (App, PathBuf) {
         "# shopping list\nmilk\neggs\n# todo\ncall bob\npay rent\n",
     );
     let file = app.editor.path.clone().unwrap();
-    type_at_line_end(&mut app, 1, "\nbread");
+    insert_at_line_end(&mut app, 1, "\nbread");
     (app, file)
 }
 
-fn type_at_line_end(app: &mut App, row: usize, text: &str) {
+/// Puts the caret at the end of `row` and inserts `text` straight into the
+/// editor's buffer, `\n` as a new line. No keystroke goes through
+/// `App::handle_key`, as it does with [`type_keys`].
+fn insert_at_line_end(app: &mut App, row: usize, text: &str) {
     app.editor.cursor_row = row;
     app.editor.cursor_col = app.editor.lines[row].chars().count();
     for c in text.chars() {
@@ -3704,7 +3943,7 @@ fn a_format_on_save_reply_for_a_buffer_typed_into_since_saves_it_unformatted() {
     let tmp = tempfile::tempdir().unwrap();
     let (mut app, file) = app_with_week_notes(&tmp);
     send_format_request(&mut app, &file, true);
-    type_at_line_end(&mut app, 2, "\nbutter");
+    insert_at_line_end(&mut app, 2, "\nbutter");
     app.land_format(Some(uppercase_headings()), false, Some(file.clone()), None);
     let typed = "# shopping list\nmilk\nbread\nbutter\neggs\n# todo\ncall bob\npay rent";
     assert_eq!(app.editor.lines.join("\n"), typed, "eggs survives");
@@ -3725,7 +3964,7 @@ fn a_format_document_reply_for_a_buffer_typed_into_since_is_dropped() {
     let tmp = tempfile::tempdir().unwrap();
     let (mut app, file) = app_with_week_notes(&tmp);
     send_format_request(&mut app, &file, false);
-    type_at_line_end(&mut app, 2, "\nbutter");
+    insert_at_line_end(&mut app, 2, "\nbutter");
     let before = app.editor.lines.clone();
     app.land_format(Some(uppercase_headings()), false, Some(file.clone()), None);
     assert_eq!(app.editor.lines, before);
@@ -3778,7 +4017,7 @@ fn the_language_servers_get_the_files_final_newline() {
     let synced = |app: &App| app.lsp.as_ref().unwrap().synced_text_for_test(&file);
     app.sync_lsp();
     assert_eq!(synced(&app).as_deref(), Some(SHOP_PY));
-    type_at_line_end(&mut app, 1, "  # all");
+    insert_at_line_end(&mut app, 1, "  # all");
     app.sync_lsp();
     assert_eq!(
         synced(&app).as_deref(),
@@ -4341,6 +4580,49 @@ fn a_pushed_and_pulled_finding_with_different_data_is_one_row() {
     assert_eq!(diagnostics_by_source(&store[&path]).count(), 1);
 }
 
+/// #1523: croft shows a finding's related locations, so a pulled copy that
+/// names them is not dropped as a duplicate of a pushed copy that does not.
+/// Two copies naming the same ones are still one row.
+#[test]
+fn a_pulled_copy_with_related_locations_is_not_dropped_for_a_pushed_one_without() {
+    use crate::lsp::manager::DiagnosticsUpdate;
+    let mut store = std::collections::HashMap::new();
+    let path = PathBuf::from("/w/main.rs");
+    let copy = |related: bool| {
+        let here = lsp_types::DiagnosticRelatedInformation {
+            location: lsp_types::Location {
+                uri: lsp_types::Url::parse("file:///w/main.rs").unwrap(),
+                range: Default::default(),
+            },
+            message: "immutable borrow occurs here".into(),
+        };
+        crate::lsp::client::convert_diagnostic(
+            "rust-analyzer",
+            &lsp_types::Diagnostic {
+                message: "cannot borrow `v` as mutable".into(),
+                related_information: related.then(|| vec![here]),
+                ..Default::default()
+            },
+        )
+    };
+    let update = |pulled, diagnostics| DiagnosticsUpdate {
+        path: path.clone(),
+        server: "rust-analyzer".into(),
+        diagnostics,
+        pulled,
+    };
+    store_diagnostics_update(&mut store, update(false, vec![copy(false)]));
+    store_diagnostics_update(&mut store, update(true, vec![copy(true)]));
+    let related = |store: &std::collections::HashMap<_, _>| {
+        diagnostics_by_source(&store[&path])
+            .map(|(_, d)| d.related().len())
+            .collect::<Vec<_>>()
+    };
+    assert!(related(&store).contains(&1), "{:?}", related(&store));
+    store_diagnostics_update(&mut store, update(false, vec![copy(true)]));
+    assert_eq!(related(&store), vec![1], "the same locations are one row");
+}
+
 /// #1102: a server that pushes a finding and also returns it to a pull
 /// lists it once, under the server's own name.
 #[test]
@@ -4753,9 +5035,7 @@ fn app_with_long_hover() -> (
         doc,
         (col, row),
     ));
-    let backend = ratatui::backend::TestBackend::new(100, 30);
-    let mut term = ratatui::Terminal::new(backend).unwrap();
-    term.draw(|frame| app.render(frame)).unwrap();
+    let term = draw_terminal(&mut app, 100, 30);
     (app, tmp, term)
 }
 

@@ -20,7 +20,7 @@ use std::process::Command;
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
-    style::{Color, Modifier, Style},
+    style::{Color, Style},
     text::{Line, Span},
     widgets::{Borders, Paragraph, Widget},
 };
@@ -29,7 +29,6 @@ use serde::Deserialize;
 use crate::theme::Theme;
 use crate::widgets::scrollbar;
 
-const COLOR_HEADER: Color = Color::Rgb(0xE8, 0xEE, 0xF8);
 const COLOR_DIM: Color = Color::Rgb(0x60, 0x68, 0x78);
 const COLOR_NAME: Color = Color::Rgb(0xCC, 0xCC, 0xCC);
 const COLOR_VERSION: Color = Color::Rgb(0x88, 0x9A, 0xC0);
@@ -575,32 +574,21 @@ impl Widget for &mut DependenciesPanel {
             ..inner
         };
 
-        let chevron = if self.collapsed {
-            crate::icons::CHEVRON_CLOSED
-        } else {
-            crate::icons::CHEVRON_OPEN
-        };
         let header_y = inner.y;
-        Paragraph::new(Line::from(vec![
-            Span::styled(
-                format!("{chevron} "),
-                Style::default().fg(self.theme.ui(COLOR_DIM)),
-            ),
-            Span::styled(
-                self.header.clone(),
-                Style::default()
-                    .fg(self.theme.ui(COLOR_HEADER))
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]))
-        .render(
-            Rect {
-                x: inner.x,
-                y: header_y,
-                width: inner.width,
-                height: 1,
-            },
+        let header_row = Rect {
+            x: inner.x,
+            y: header_y,
+            width: inner.width,
+            height: 1,
+        };
+        crate::widgets::surface::paint_section_header(
             buf,
+            header_row,
+            self.theme,
+            !self.collapsed,
+            &self.header,
+            Vec::new(),
+            crate::widgets::hover::contains(header_row, self.hover_pointer),
         );
         self.last_header_row = header_y;
         self.last_header_x = inner.x;
@@ -692,7 +680,7 @@ impl Widget for &mut DependenciesPanel {
 
         if let Some(metrics) = bar {
             self.last_scrollbar = metrics.area;
-            scrollbar::render_vertical(buf, metrics, self.focused, self.theme);
+            scrollbar::render_vertical_on_chrome(buf, metrics, self.focused, self.theme);
         }
     }
 }

@@ -107,24 +107,22 @@ impl Widget for &SignatureHelpPopup {
             .fg(self.theme.ui(Color::Rgb(0xff, 0xff, 0xff)))
             .add_modifier(Modifier::BOLD);
         let chars: Vec<char> = sig.label.chars().collect();
-        let spans: Vec<Span<'static>> = match sig.active_param {
-            Some((s, e)) if s < e && e <= chars.len() => {
-                let take = |r: std::ops::Range<usize>| chars[r].iter().collect::<String>();
-                vec![
-                    Span::styled(format!(" {}", take(0..s)), base),
-                    Span::styled(take(s..e), active),
-                    Span::styled(format!("{} ", take(e..chars.len())), base),
-                ]
-            }
-            _ => vec![Span::styled(format!(" {} ", sig.label), base)],
+        let tones = crate::widgets::surface::tones(self.theme);
+        let spans: Vec<Span<'static>> = match (tones, sig.active_param) {
+            (Some(t), active_param) => surfaces_spans(&chars, active_param, t),
+            (None, active_param) => plain_spans(&chars, active_param, &sig.label, base, active),
         };
 
         // A "2 of 3" counter when the server offers overloads, like VS Code.
         let mut title_spans = Vec::new();
         if self.signatures.len() > 1 {
+            let fg = tones.map_or_else(
+                || self.theme.ui(Color::Rgb(0x88, 0xc0, 0xd0)),
+                |t| t.muted(),
+            );
             title_spans.push(Span::styled(
                 format!(" {}/{} ", self.active_signature + 1, self.signatures.len()),
-                Style::default().fg(self.theme.ui(Color::Rgb(0x88, 0xc0, 0xd0))),
+                Style::default().fg(fg),
             ));
         }
 
@@ -136,10 +134,69 @@ impl Widget for &SignatureHelpPopup {
 
         Widget::render(Clear, area, buf);
         Widget::render(Paragraph::new(Line::from(spans)).block(block), area, buf);
-        if self.theme.framed_overlays() {
+        if tones.is_some() {
+            // A parameter hint never takes the keyboard: no accent lip. It
+            // sits just above the caret, so its shadow spares that line.
+            crate::widgets::surface::paint_anchored_frame(
+                buf,
+                area,
+                self.theme,
+                self.anchor.1,
+                true,
+            );
+        } else if self.theme.framed_overlays() {
             crate::widgets::surface::paint_overlay_frame(buf, area, self.theme);
         }
     }
+}
+
+/// The boxed themes' label: everything in `base`, the active parameter in
+/// `active`, a pad cell each side.
+fn plain_spans(
+    chars: &[char],
+    active_param: Option<(usize, usize)>,
+    label: &str,
+    base: Style,
+    active: Style,
+) -> Vec<Span<'static>> {
+    match active_param {
+        Some((s, e)) if s < e && e <= chars.len() => {
+            let take = |r: std::ops::Range<usize>| chars[r].iter().collect::<String>();
+            vec![
+                Span::styled(format!(" {}", take(0..s)), base),
+                Span::styled(take(s..e), active),
+                Span::styled(format!("{} ", take(e..chars.len())), base),
+            ]
+        }
+        _ => vec![Span::styled(format!(" {label} "), base)],
+    }
+}
+
+/// A `surfaces` theme's label, ranked by ink: the callee's name (up to the
+/// first `(`) in body text, the other parameters and punctuation muted,
+/// and the parameter being typed in the accent, bold, the one thing the
+/// eye should land on. The same cells as [`plain_spans`].
+fn surfaces_spans(
+    chars: &[char],
+    active_param: Option<(usize, usize)>,
+    t: crate::widgets::surface::Tones,
+) -> Vec<Span<'static>> {
+    let name_end = chars.iter().position(|&c| c == '(').unwrap_or(chars.len());
+    let (s, e) = match active_param {
+        Some((s, e)) if s < e && e <= chars.len() => (s, e),
+        _ => (chars.len(), chars.len()),
+    };
+    let name_end = name_end.min(s);
+    let take = |a: usize, b: usize| chars[a..b].iter().collect::<String>();
+    let text = Style::default().fg(t.text());
+    let muted = Style::default().fg(t.muted());
+    let hot = Style::default().fg(t.accent()).add_modifier(Modifier::BOLD);
+    vec![
+        Span::styled(format!(" {}", take(0, name_end)), text),
+        Span::styled(take(name_end, s), muted),
+        Span::styled(take(s, e), hot),
+        Span::styled(format!("{} ", take(e, chars.len())), muted),
+    ]
 }
 
 #[cfg(test)]
@@ -260,5 +317,63 @@ mod tests {
             }
         }
         assert!(found_bold_a, "active parameter 'a' must render bold");
+    }
+
+    /// Croft Loch: a quiet card (no accent lip; the hint never takes the
+    /// keyboard), the callee in body text, the other parameters muted and
+    /// the active one in the accent.
+    #[test]
+    fn croft_loch_marks_the_active_parameter_in_the_accent_on_a_quiet_card() {
+        use ratatui::buffer::Buffer;
+        let theme = crate::theme::Theme::from_id("loch");
+        let t = crate::widgets::surface::tones(theme).unwrap();
+        let mut p = SignatureHelpPopup::new(
+            vec![sig("foo(a, b)", Some((4, 5)))],
+            0,
+            (0, 5),
+            PathBuf::from("f.rs"),
+            1,
+        );
+        p.theme = theme;
+        let area = Rect::new(0, 0, 20, 3);
+        let mut buf = Buffer::empty(area);
+        (&p).render(area, &mut buf);
+        assert_eq!(buf[(0, 0)].fg, t.raised(), "no accent lip");
+        assert_eq!(buf[(2, 1)].symbol(), "f");
+        assert_eq!(buf[(2, 1)].fg, t.text(), "the callee");
+        assert_eq!(buf[(5, 1)].symbol(), "(");
+        assert_eq!(buf[(5, 1)].fg, t.muted());
+        assert_eq!(buf[(6, 1)].symbol(), "a");
+        assert_eq!(buf[(6, 1)].fg, t.accent());
+        assert!(buf[(6, 1)].modifier.contains(Modifier::BOLD));
+        assert_eq!(buf[(9, 1)].symbol(), "b");
+        assert_eq!(buf[(9, 1)].fg, t.muted());
+    }
+
+    /// Croft Loch: the hint sits just above the caret, and its shadow
+    /// keeps off the caret's line, the one being typed.
+    #[test]
+    fn croft_loch_hint_never_shadows_the_line_being_typed() {
+        use ratatui::buffer::Buffer;
+        let theme = crate::theme::Theme::from_id("loch");
+        let t = crate::widgets::surface::tones(theme).unwrap();
+        let mut p = SignatureHelpPopup::new(
+            vec![sig("foo(a, b)", Some((4, 5)))],
+            0,
+            (4, 6),
+            PathBuf::from("f.rs"),
+            1,
+        );
+        p.theme = theme;
+        let vp = Rect::new(0, 0, 40, 10);
+        let area = p.area_for(vp);
+        assert_eq!(area.bottom(), 6, "right above the caret's line");
+        let mut buf = Buffer::empty(vp);
+        buf.set_style(vp, ratatui::style::Style::default().bg(t.chrome()));
+        (&p).render(area, &mut buf);
+        for x in vp.left()..vp.right() {
+            assert_eq!(buf[(x, 6)].bg, t.chrome(), "({x}, 6) not shaded");
+        }
+        assert_ne!(buf[(area.right(), area.y + 1)].bg, t.chrome());
     }
 }

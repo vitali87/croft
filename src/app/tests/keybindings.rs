@@ -731,60 +731,17 @@ fn shortcut_for_returns_expected_shortcuts_for_each_explorer_action() {
     );
 }
 
-/// #885: off macOS no row of the Customize Layout popup, the tab and
-/// Explorer menus, or the editor and terminal menus names a Mac key; on a
-/// Mac every row keeps its glyphs.
+/// #885: off macOS no menu row with a shortcut names a Mac key: the rows of
+/// the Customize Layout popup and the tab and Explorer menus, and every row
+/// with a shortcut in the menus built where they open. On a Mac every row
+/// keeps its glyphs.
 #[test]
 fn off_macos_no_menu_shortcut_names_a_mac_key() {
-    fn actions(entries: Vec<MenuEntry>) -> Vec<MenuAction> {
-        entries
-            .into_iter()
-            .flat_map(|e| match e {
-                MenuEntry::Item { action, .. } => vec![action],
-                MenuEntry::Submenu { items, .. } => actions(items),
-                _ => Vec::new(),
-            })
-            .collect()
-    }
     let tmp = tempfile::tempdir().unwrap();
     let f = tmp.path().join("a.rs");
     std::fs::write(&f, "fn main() {}\n").unwrap();
     let app = App::new(tmp.path().to_path_buf()).unwrap();
-    let mut all = actions(app.customize_layout_items());
-    all.extend(actions(build_tab_context_menu_items(
-        0,
-        3,
-        true,
-        Some(&f),
-        true,
-        true,
-        false,
-    )));
-    let tree = build_tree_context_menu_items(
-        Some(&file_node(&f)),
-        tmp.path(),
-        std::slice::from_ref(&f),
-        tmp.path(),
-        None,
-        None,
-    );
-    all.extend(tree.into_iter().map(|(_, a)| a));
-    let (row, col) = (0, 0);
-    all.extend([
-        MenuAction::ChangeAllOccurrencesAt { row, col },
-        MenuAction::GoToImplementationAt { row, col },
-        MenuAction::QuickFixAt { row, col },
-        MenuAction::EditLogpointAt { line: 0 },
-        MenuAction::EditorCut,
-        MenuAction::EditorCopy,
-        MenuAction::EditorPaste,
-        MenuAction::ShowCommandPalette,
-        MenuAction::TerminalCopySelection,
-        MenuAction::TerminalPaste,
-        MenuAction::SplitTerminal,
-        MenuAction::KillTerminal(0),
-        MenuAction::ClearTerminal(0),
-    ]);
+    let all = menu_row_actions(&app, &f);
     let mut hinted = 0;
     for action in &all {
         let Some(glyphs) = shortcut_for(action) else {
@@ -934,146 +891,21 @@ fn ctrl_k_chords_reach_croft_off_macos_but_not_from_the_shell_or_vim() {
 fn every_cmd_chord_is_ctrl_off_macos_unless_linux_md_lists_it() {
     use std::collections::BTreeSet;
     type Pred = fn(KeyEvent) -> bool;
-    macro_rules! preds {
-        ($($p:ident),* $(,)?) => { vec![$((stringify!($p), $p as Pred)),*] };
-    }
-    // The leader asked from the editor and from a focused shell.
-    fn leader_in_editor(key: KeyEvent) -> bool {
-        is_cmd_k_leader_key(key, ctrl_k_leads(false, false, false))
-    }
-    fn leader_in_shell(key: KeyEvent) -> bool {
-        is_cmd_k_leader_key(key, ctrl_k_leads(false, true, false))
-    }
-    // `is_save_key` also takes whether Shift is reported with Ctrl.
-    fn is_save_key_reporting_shift(key: KeyEvent) -> bool {
-        is_save_key(key, true)
-    }
-    let mut predicates: Vec<(&str, Pred)> = preds![
-        is_terminal_copy_key,
-        is_compare_key,
-        is_search_jump_key,
-        is_editor_find_key,
-        is_terminal_find_key,
-        is_editor_replace_key,
-        is_file_finder_key,
-        is_command_palette_key,
-        is_go_to_symbol_key,
-        is_focus_breadcrumbs_key,
-        is_toggle_line_comment_key,
-        is_toggle_block_comment_key,
-        is_toggle_wrap_key,
-        is_switch_header_source_key,
-        is_tree_zoxide_jump_key,
-        is_tree_new_file_key,
-        is_tree_new_folder_key,
-        is_tree_rename_key,
-        is_reveal_in_finder_key,
-        is_copy_path_key,
-        is_tree_make_root_key,
-        is_tree_make_parent_root_key,
-        is_explorer_jump_key,
-        is_source_control_jump_key,
-        is_run_debug_jump_key,
-        is_remote_jump_key,
-        is_extensions_jump_key,
-        is_drop_to_local_key,
-        is_run_build_task_key,
-        is_markdown_preview_key,
-        is_run_fence_key,
-        is_sidebar_toggle_key,
-        is_secondary_sidebar_toggle_key,
-        is_minimap_toggle_key,
-        is_terminal_toggle_key,
-        is_terminal_maximize_key,
-        is_quick_select_key,
-        is_copy_mode_key,
-        is_command_history_key,
-        is_terminal_split_key,
-        is_editor_split_key,
-        is_goto_bracket_key,
-        is_select_to_bracket_key,
-        is_navigate_back_key,
-        is_navigate_forward_key,
-        is_transpose_key,
-        is_indentation_to_spaces_key,
-        is_indentation_to_tabs_key,
-        is_trim_final_newlines_key,
-        is_toggle_bookmark_key,
-        is_switch_debug_session_key,
-        is_clear_bookmarks_key,
-        is_next_bookmark_key,
-        is_prev_bookmark_key,
-        is_join_lines_key,
-        is_transform_upper_key,
-        is_transform_lower_key,
-        is_copy_relative_path_key,
-        is_sort_lines_asc_key,
-        is_sort_lines_desc_key,
-        is_trim_trailing_whitespace_key,
-        is_increment_number_key,
-        is_decrement_number_key,
-        is_format_document_key,
-        is_emmet_expand_key,
-        is_quick_fix_key,
-        is_focus_group_left_key,
-        is_focus_group_right_key,
-        is_terminal_focus_key,
-        is_terminal_close_key,
-        is_terminal_cycle_key,
-        is_terminal_cycle_back_key,
-        is_delete_node_key,
-        is_completion_trigger_key,
-        is_save_all_key,
-        is_new_untitled_file_key,
-        is_replace_in_files_key,
-        is_search_details_key,
-        is_show_output_key,
-        is_show_problems_key,
-        is_update_croft_key,
-        is_editor_copy_key,
-        is_editor_cut_key,
-        is_search_paste_key,
-        is_editor_paste_key,
-        is_clipboard_paste_key,
-        is_editor_select_all_key,
-        is_editor_undo_key,
-        is_editor_redo_key,
-        is_rename_symbol_key,
-        is_change_all_occurrences_key,
-        is_select_all_occurrences_key,
-        is_add_cursors_to_line_ends_key,
-        is_select_next_occurrence_key,
-        is_delete_line_key,
-        is_go_to_definition_key,
-        is_peek_definition_key,
-        is_go_to_references_key,
-        is_run_to_cursor_key,
-        is_peek_references_key,
-        is_go_to_declaration_key,
-        is_go_to_type_definition_key,
-        is_go_to_implementation_key,
-        is_vim_toggle_key,
-        is_editor_line_home_key,
-        is_editor_line_end_key,
-        is_editor_kill_to_eol_key,
-        is_editor_kill_to_bol_key,
-        is_editor_open_line_below_key,
-        is_editor_open_line_above_key,
-        is_close_tab_key,
-    ];
-    predicates.push(("is_save_key", is_save_key_reporting_shift));
-    predicates.push(("is_cmd_k_leader_key", leader_in_editor));
-    predicates.push(("is_cmd_k_leader_key@shell", leader_in_shell));
+    let predicates = key_predicates();
 
     // Every predicate the key router defines is walked (the scan F1's own
-    // coverage test uses), so a new one cannot slip past unexamined.
-    const APP_SRC: &str = include_str!("../mod.rs");
-    let defined: BTreeSet<&str> = APP_SRC
-        .match_indices("\nfn is_")
-        .filter_map(|(i, _)| {
-            let rest = &APP_SRC[i + 4..];
+    // coverage test uses), so a new one cannot slip past unexamined. A
+    // predicate is a free function in any app source file, with or without
+    // a visibility.
+    let app_src = app_source();
+    let defined: BTreeSet<&str> = app_src
+        .lines()
+        .filter_map(|line| {
+            let rest = ["fn ", "pub fn ", "pub(crate) fn ", "pub(super) fn "]
+                .iter()
+                .find_map(|head| line.strip_prefix(head))?;
             let name = &rest[..rest.find('(')?];
-            name.ends_with("_key").then_some(name)
+            (name.starts_with("is_") && name.ends_with("_key")).then_some(name)
         })
         .collect();
     let walked: BTreeSet<&str> = predicates
@@ -1343,6 +1175,54 @@ fn every_cmd_chord_is_ctrl_off_macos_unless_linux_md_lists_it() {
             );
         }
     }
+}
+
+/// The set of `is_*_key` predicates in the app key router IS the list of
+/// shortcuts croft handles. Every one MUST be named in a ShortcutEntry's
+/// `handler` so it shows up in F1. This fails the build the moment a
+/// predicate is added without an entry (or an entry names a predicate that
+/// no longer exists), making "every shortcut appears in F1" a hard invariant
+/// rather than a hand-maintained hope.
+#[test]
+fn every_app_keybinding_predicate_is_documented_in_f1() {
+    use std::collections::BTreeSet;
+    let app_src = app_source();
+
+    // Every `fn is_*_key` defined in the app key router.
+    let mut handled: BTreeSet<&str> = BTreeSet::new();
+    for (i, _) in app_src.match_indices("fn is_") {
+        let after_fn = &app_src[i + 3..];
+        let Some(paren) = after_fn.find('(') else {
+            continue;
+        };
+        let name = &after_fn[..paren];
+        if name.ends_with("_key") && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+            handled.insert(name);
+        }
+    }
+    assert!(
+        !handled.is_empty(),
+        "scanned the app's source but found no is_*_key predicates; the scan is broken"
+    );
+
+    // Every predicate named by an F1 entry's `handler`.
+    let mut documented: BTreeSet<&str> = BTreeSet::new();
+    for group in crate::widgets::shortcuts::SHORTCUT_GROUPS {
+        for entry in group.entries {
+            for token in entry.handler.split_whitespace() {
+                documented.insert(token);
+            }
+        }
+    }
+
+    let missing: Vec<&&str> = handled.difference(&documented).collect();
+    let stale: Vec<&&str> = documented.difference(&handled).collect();
+    assert!(
+        missing.is_empty() && stale.is_empty(),
+        "F1 shortcuts overlay is out of sync with the app's key handlers.\n  \
+         UNDOCUMENTED (add a ShortcutEntry whose `handler` names each): {missing:?}\n  \
+         STALE (handler names a predicate that no longer exists): {stale:?}"
+    );
 }
 
 /// #843: the Keyboard Shortcuts view (`Ctrl`+`K` `Ctrl`+`S`) spells each
@@ -1788,7 +1668,7 @@ fn a_replayed_key_cannot_start_a_recording() {
     hostile.push_key(key(KeyCode::Char('c'), KeyModifiers::NONE));
     app.macro_registers.insert("b".into(), hostile);
 
-    vim_feed_str(&mut app, "@b");
+    type_keys(&mut app, "@b");
     assert!(
         app.macro_recording.is_none(),
         "replaying a recording gesture must not leave the editor recording"
@@ -1868,7 +1748,7 @@ fn a_macro_of_only_unknown_steps_reports_that_it_ran_nothing() {
     .unwrap();
     app.macro_registers = crate::macros::load(&path);
 
-    vim_feed_str(&mut app, "@u");
+    type_keys(&mut app, "@u");
     assert!(
         app.status.contains("no steps this version can replay"),
         "an all-unknown macro says so, got {:?}",
@@ -1929,7 +1809,7 @@ fn a_replay_aborts_visibly_and_keeps_earlier_iterations() {
     app.macro_registers.insert("z".into(), big);
     let before = app.editor.lines[0].clone();
 
-    vim_feed_str(&mut app, "99999@z");
+    type_keys(&mut app, "99999@z");
     assert!(
         app.status.contains("refused"),
         "a replay past the budget is refused visibly, got {:?}",
@@ -1952,7 +1832,7 @@ fn a_macro_paste_counts_its_characters_against_the_replay_budget() {
     big.push_paste(&"x".repeat(10_000));
     app.macro_registers.insert("z".into(), big);
     let before = app.editor.lines[0].clone();
-    vim_feed_str(&mut app, "100@z");
+    type_keys(&mut app, "100@z");
     assert!(
         app.status.contains("refused"),
         "a replay past the budget is refused visibly, got {:?}",
@@ -1972,7 +1852,7 @@ fn a_non_register_key_after_q_aborts_the_gesture() {
     app.editor.cursor_row = 0;
     app.editor.cursor_col = 0;
 
-    vim_feed(&mut app, 'q');
+    type_char(&mut app, 'q');
     app.handle_key(key(KeyCode::Down, KeyModifiers::NONE))
         .unwrap();
     assert!(
@@ -1981,7 +1861,7 @@ fn a_non_register_key_after_q_aborts_the_gesture() {
     );
 
     // The following letter must be an ordinary motion, not a register name.
-    vim_feed(&mut app, 'j');
+    type_char(&mut app, 'j');
     assert!(
         app.macro_recording.is_none(),
         "and does not retroactively start a recording"
@@ -1994,14 +1874,14 @@ fn a_replayed_key_is_never_recorded_into_the_macro_producing_it() {
     // guard a macro would grow while replaying and never terminate.
     let (mut app, tmp) = vim_app("one\ntwo\n");
     app.macros_path = tmp.path().join("macros.json");
-    vim_feed_str(&mut app, "qa");
-    vim_feed_str(&mut app, "IX");
+    type_keys(&mut app, "qa");
+    type_keys(&mut app, "IX");
     app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
         .unwrap();
-    vim_feed(&mut app, 'q');
+    type_char(&mut app, 'q');
     let recorded_len = app.macro_registers.get("a").unwrap().len();
 
-    vim_feed_str(&mut app, "@a");
+    type_keys(&mut app, "@a");
     assert_eq!(
         app.macro_registers.get("a").unwrap().len(),
         recorded_len,
@@ -2017,9 +1897,9 @@ fn record_and_replay_a_macro_with_a_paste(lines: &[&str], paste: &str) -> App {
     app.run_command(Command::MacroStartStopRecording);
     app.handle_key(key(KeyCode::End, KeyModifiers::NONE))
         .unwrap();
-    type_str(&mut app, ": ");
+    type_keys(&mut app, ": ");
     app.handle_paste(paste);
-    type_str(&mut app, " ok");
+    type_keys(&mut app, " ok");
     app.handle_key(key(KeyCode::Down, KeyModifiers::NONE))
         .unwrap();
     app.run_command(Command::MacroStartStopRecording);
@@ -2067,9 +1947,9 @@ fn a_paste_is_recorded_as_one_step_of_its_own() {
     use crate::widgets::command_palette::Command;
     let mut app = editor_app_with_lines(&["alpha"]);
     app.run_command(Command::MacroStartStopRecording);
-    type_str(&mut app, "ab");
+    type_keys(&mut app, "ab");
     app.handle_paste("P\nQ");
-    type_str(&mut app, "c");
+    type_keys(&mut app, "c");
     app.run_command(Command::MacroStartStopRecording);
     let steps = app.macro_last.as_ref().expect("recorded").steps.clone();
     assert_eq!(
@@ -2092,7 +1972,7 @@ fn a_paste_into_another_pane_while_recording_is_skipped_and_logged() {
     use crate::widgets::command_palette::Command;
     let mut app = editor_app_with_lines(&["alpha"]);
     app.run_command(Command::MacroStartStopRecording);
-    type_str(&mut app, "x");
+    type_keys(&mut app, "x");
     app.focus_pane(Pane::Tree);
     app.handle_paste("SKIPPED-PASTE-1464");
     app.focus_pane(Pane::Editor);
@@ -2150,16 +2030,16 @@ fn a_replayed_paste_is_never_recorded_again() {
 fn an_empty_recording_is_discarded_rather_than_clobbering_a_good_macro() {
     let (mut app, tmp) = vim_app("x\n");
     app.macros_path = tmp.path().join("macros.json");
-    vim_feed_str(&mut app, "qa");
-    vim_feed_str(&mut app, "IZ");
+    type_keys(&mut app, "qa");
+    type_keys(&mut app, "IZ");
     app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
         .unwrap();
-    vim_feed(&mut app, 'q');
+    type_char(&mut app, 'q');
     let good = app.macro_registers.get("a").cloned().unwrap();
 
     // Start and immediately stop: nothing recorded.
-    vim_feed_str(&mut app, "qa");
-    vim_feed(&mut app, 'q');
+    type_keys(&mut app, "qa");
+    type_char(&mut app, 'q');
     assert_eq!(
         app.macro_registers.get("a"),
         Some(&good),
@@ -2173,12 +2053,12 @@ fn a_macro_recorded_in_vim_mode_replays_from_the_palette() {
     // entry points are interchangeable — the issue calls this out explicitly.
     let (mut app, tmp) = vim_app("one\ntwo\n");
     app.macros_path = tmp.path().join("macros.json");
-    vim_feed_str(&mut app, "qa");
-    vim_feed_str(&mut app, "IX");
+    type_keys(&mut app, "qa");
+    type_keys(&mut app, "IX");
     app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
         .unwrap();
-    vim_feed(&mut app, 'j');
-    vim_feed(&mut app, 'q');
+    type_char(&mut app, 'j');
+    type_char(&mut app, 'q');
 
     app.run_command(crate::widgets::command_palette::Command::MacroReplayLast);
     assert_eq!(
@@ -2192,11 +2072,11 @@ fn a_register_survives_a_restart_through_macros_json() {
     let (mut app, tmp) = vim_app("one\n");
     let path = tmp.path().join("macros.json");
     app.macros_path = path.clone();
-    vim_feed_str(&mut app, "qa");
-    vim_feed_str(&mut app, "IX");
+    type_keys(&mut app, "qa");
+    type_keys(&mut app, "IX");
     app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
         .unwrap();
-    vim_feed(&mut app, 'q');
+    type_char(&mut app, 'q');
 
     // A fresh load of the store sees the register, which is what App::new does.
     let reloaded = crate::macros::load(&path);

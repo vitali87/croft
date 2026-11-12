@@ -27,6 +27,12 @@ pub enum Magic {
     /// An xz stream (#1645): a `.tar.xz` under any name, or a plain
     /// compressed file the tar listing then declines.
     Xz,
+    /// A bzip2 stream (#1645): a `.tar.bz2` under any name, or a plain
+    /// compressed file the tar listing then declines.
+    Bzip2,
+    /// A zstd frame (#1645): a `.tar.zst` under any name, or a plain
+    /// compressed file the tar listing then declines.
+    Zstd,
     Tar,
     Sqlite,
 }
@@ -83,6 +89,22 @@ pub fn sniff(bytes: &[u8]) -> Option<Magic> {
     if bytes.starts_with(b"\xfd7zXZ\x00") {
         return Some(Magic::Xz);
     }
+    // "BZh" and a block-size digit, then the first block's magic (pi in
+    // BCD) or, for an empty stream, the end-of-stream one (sqrt pi): four
+    // ASCII bytes alone start plenty of text files.
+    if bytes.len() >= 10
+        && bytes.starts_with(b"BZh")
+        && (b'1'..=b'9').contains(&bytes[3])
+        && matches!(
+            &bytes[4..10],
+            b"\x31\x41\x59\x26\x53\x59" | b"\x17\x72\x45\x38\x50\x90"
+        )
+    {
+        return Some(Magic::Bzip2);
+    }
+    if bytes.starts_with(ZSTD_FRAME) || zstd_behind_skippable_frames(bytes) {
+        return Some(Magic::Zstd);
+    }
     if bytes.starts_with(b"SQLite format 3\0") {
         return Some(Magic::Sqlite);
     }
@@ -100,6 +122,28 @@ pub fn sniff(bytes: &[u8]) -> Option<Magic> {
         return Some(Magic::Bmp);
     }
     None
+}
+
+/// A zstd frame's magic number, little-endian `0xFD2FB528`.
+const ZSTD_FRAME: &[u8] = b"\x28\xb5\x2f\xfd";
+
+/// Whether `bytes` opens with skippable frames and then a zstd frame (#1645
+/// review): `pzstd` writes a skippable frame before each of its frames, so its
+/// output never starts with the zstd magic. LZ4 uses the same skippable
+/// frames, so only the frame behind them decides, and a skippable frame that
+/// runs past the sniffed head decides nothing.
+fn zstd_behind_skippable_frames(mut bytes: &[u8]) -> bool {
+    let mut skipped = false;
+    // Magic `0x184D2A50..=0x184D2A5F` little-endian, then a u32 length.
+    while bytes.len() >= 8 && (0x50..=0x5f).contains(&bytes[0]) && bytes[1..4] == *b"\x2a\x4d\x18" {
+        let len = u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]) as usize;
+        let Some(rest) = 8usize.checked_add(len).and_then(|end| bytes.get(end..)) else {
+            return false;
+        };
+        bytes = rest;
+        skipped = true;
+    }
+    skipped && bytes.starts_with(ZSTD_FRAME)
 }
 
 /// A Windows icon (#1652): `00 00 01 00` and an image count, then a
@@ -140,6 +184,18 @@ mod tests {
         assert_eq!(sniff(b"PK\x05\x06\x00\x00"), Some(Magic::Zip), "empty zip");
         assert_eq!(sniff(b"\x1f\x8b\x08\x00"), Some(Magic::Gzip));
         assert_eq!(sniff(b"\xfd7zXZ\x00\x00\x04"), Some(Magic::Xz));
+        assert_eq!(sniff(b"BZh91AY&SY\x00"), Some(Magic::Bzip2));
+        assert_eq!(
+            sniff(b"BZh9\x17\x72\x45\x38\x50\x90\x00"),
+            Some(Magic::Bzip2),
+            "empty bzip2 stream"
+        );
+        assert_eq!(sniff(b"\x28\xb5\x2f\xfd\x04\x00"), Some(Magic::Zstd));
+        assert_eq!(
+            sniff(b"\x50\x2a\x4d\x18\x04\x00\x00\x00skip\x28\xb5\x2f\xfd\x04\x00"),
+            Some(Magic::Zstd),
+            "pzstd: a skippable frame, then the zstd frame"
+        );
         assert_eq!(sniff(b"SQLite format 3\0"), Some(Magic::Sqlite));
         let mut tar = vec![0u8; 512];
         tar[257..262].copy_from_slice(b"ustar");
@@ -159,6 +215,18 @@ mod tests {
         assert_eq!(sniff(b"PK\x01\x02"), None, "central-dir record alone");
         assert_eq!(sniff(b"plain text here"), None);
         assert_eq!(sniff(b"SQLite format 4\0"), None);
+        assert_eq!(sniff(b"BZh9 is just text"), None, "no block magic");
+        assert_eq!(sniff(b"BZh01AY&SY\x00"), None, "no block-size digit");
+        assert_eq!(
+            sniff(b"\x50\x2a\x4d\x18\x04\x00\x00\x00skip\x04\x22\x4d\x18"),
+            None,
+            "a skippable frame in front of an LZ4 frame"
+        );
+        assert_eq!(
+            sniff(b"\x50\x2a\x4d\x18\xff\x00\x00\x00skip"),
+            None,
+            "a skippable frame running past the head"
+        );
         assert_eq!(sniff(b"II+\0\x08\0"), None, "BigTIFF: no decoder for it");
         assert_eq!(sniff(b"IM*\0"), None, "mixed byte-order mark");
         let mut not_tar = vec![0u8; 512];
@@ -221,6 +289,8 @@ mod tests {
             (Magic::Zip, false),
             (Magic::Gzip, false),
             (Magic::Xz, false),
+            (Magic::Bzip2, false),
+            (Magic::Zstd, false),
             (Magic::Tar, false),
             (Magic::Sqlite, false),
         ] {

@@ -7,8 +7,6 @@ use ratatui::{
 };
 use std::path::PathBuf;
 
-const BUTTON_BG_RGB: (u8, u8, u8) = (0x09, 0x67, 0xb8);
-const BUTTON_FG_RGB: (u8, u8, u8) = (0xff, 0xff, 0xff);
 const BODY_FG_RGB: (u8, u8, u8) = (0xb0, 0xb8, 0xc8);
 const TITLE_FG_RGB: (u8, u8, u8) = (0xff, 0xff, 0xff);
 const FOCUS_BORDER_RGB: (u8, u8, u8) = (0x4e, 0x9a, 0xff);
@@ -447,6 +445,10 @@ pub struct RunDebugPanel {
     /// session's console output on screen instead of wiping straight back to the
     /// Run button, so a fast-exiting program's output/errors stay readable.
     pub session_ended: bool,
+    /// The cell under the mouse pointer this frame, fed by the app like
+    /// every other side panel's, so the Run and Debug button lifts under it
+    /// the way Source Control's buttons do (a boxed theme ignores it).
+    pub hover_pointer: Option<(u16, u16)>,
 }
 
 impl RunDebugPanel {
@@ -481,6 +483,7 @@ impl RunDebugPanel {
             feedback: None,
             feedback_is_error: false,
             session_ended: false,
+            hover_pointer: None,
         }
     }
 
@@ -1325,18 +1328,18 @@ impl Widget for &mut RunDebugPanel {
             height: BUTTON_H,
         };
         self.last_button_area = button_area;
-        // Black theme: brand-teal button fill; Croft Dark keeps VS Code blue.
-        let button_bg = if self.focus_gradient {
-            crate::gradient::rgb_color(crate::gradient::PRIMARY_BTN_BG)
-        } else {
-            Color::Rgb(BUTTON_BG_RGB.0, BUTTON_BG_RGB.1, BUTTON_BG_RGB.2)
-        };
-        crate::widgets::source_control::render_rounded_button(
+        // Black theme: brand-teal button fill; Croft Dark keeps VS Code blue;
+        // Croft Loch draws the shared pill, lifted under the pointer.
+        let (button_bg, button_fg) =
+            crate::widgets::source_control::primary_button_colors(self.theme, self.focus_gradient);
+        crate::widgets::source_control::render_button(
             buf,
             button_area,
             label.as_str(),
             button_bg,
-            Color::Rgb(BUTTON_FG_RGB.0, BUTTON_FG_RGB.1, BUTTON_FG_RGB.2),
+            button_fg,
+            self.theme,
+            crate::widgets::hover::contains(button_area, self.hover_pointer),
         );
 
         let mut next_y = button_area.y + button_area.height + 1;
@@ -2031,7 +2034,10 @@ mod tests {
 
     #[test]
     fn run_and_debug_button_uses_rounded_border_corners() {
+        // The line-art corners are the boxed themes'; Croft Loch's soft
+        // slab is checked below.
         let mut panel = RunDebugPanel::new();
+        panel.theme = crate::theme::Theme::BLACK;
         let area = Rect {
             x: 0,
             y: 0,
@@ -2064,6 +2070,37 @@ mod tests {
             br, "╯",
             "bottom-right button corner must be rounded; got {br:?}"
         );
+    }
+
+    /// Croft Loch: the Run and Debug button is the shared one-row pill, the
+    /// brand teal face on its middle row between half-block caps, the rows
+    /// above and below left as the panel's surface, rather than `╭╮╰╯` arcs
+    /// on the chrome; the pointer anywhere on its three-row target lifts it.
+    #[test]
+    fn croft_loch_run_and_debug_button_is_a_one_row_pill() {
+        let mut panel = RunDebugPanel::new();
+        panel.theme = crate::theme::Theme::LOCH;
+        let area = Rect::new(0, 0, 36, 24);
+        let mut buf = Buffer::empty(area);
+        Widget::render(&mut panel, area, &mut buf);
+        let b = panel.last_button_area;
+        assert!(b.height == 3 && b.width >= 4, "button must be laid out");
+        let teal = crate::gradient::rgb_color(crate::gradient::PRIMARY_BTN_BG);
+        let face_y = b.y + 1;
+        assert_eq!(buf[(b.x, face_y)].symbol(), "\u{2590}");
+        assert_eq!(buf[(b.x, face_y)].fg, teal);
+        assert_eq!(buf[(b.right() - 1, face_y)].symbol(), "\u{258c}");
+        assert_eq!(buf[(b.x + b.width / 2, face_y)].bg, teal);
+        for y in [b.y, b.bottom() - 1] {
+            for x in b.x..b.right() {
+                assert_eq!(buf[(x, y)].symbol(), " ", "no band at ({x}, {y})");
+                assert_ne!(buf[(x, y)].bg, teal, "no slab at ({x}, {y})");
+            }
+        }
+        panel.hover_pointer = Some((b.x + 1, b.y));
+        let mut buf = Buffer::empty(area);
+        Widget::render(&mut panel, area, &mut buf);
+        assert_ne!(buf[(b.x + b.width / 2, face_y)].bg, teal, "the face lifts");
     }
 
     #[test]

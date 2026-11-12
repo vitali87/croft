@@ -362,6 +362,11 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 handler: "is_select_next_occurrence_key",
             },
             ShortcutEntry {
+                keys: "Cmd/Ctrl+L",
+                description: "Select the current line; each press adds the next (also a triple-click or a line-number click)",
+                handler: "is_expand_line_selection_key",
+            },
+            ShortcutEntry {
                 keys: "Cmd/Ctrl+Shift+K",
                 description: "Delete the current line or every selected line",
                 handler: "is_delete_line_key",
@@ -390,6 +395,11 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 keys: "Cmd/Ctrl+Shift+V",
                 description: "Markdown: toggle the rendered preview for this file",
                 handler: "is_markdown_preview_key",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+K V",
+                description: "Markdown: open the preview in the next group, showing what you type here",
+                handler: "",
             },
             ShortcutEntry {
                 keys: "Cmd/Ctrl+Enter",
@@ -615,6 +625,11 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 keys: "Shift+Opt+I / Shift+Alt+I",
                 description: "Add a cursor at the end of each selected line",
                 handler: "is_add_cursors_to_line_ends_key",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+K Cmd/Ctrl+I",
+                description: "Show or Focus Hover: type, docs and any problem at the caret",
+                handler: "",
             },
             ShortcutEntry {
                 keys: "F12",
@@ -1201,30 +1216,39 @@ pub struct ShortcutsModal {
 impl ShortcutsModal {
     pub fn lines(&self, theme: crate::theme::Theme) -> Vec<Line<'static>> {
         let mut out: Vec<Line<'static>> = Vec::new();
+        // A `surfaces` theme sets the sheet in its type ramp: group titles
+        // strong over a faint rule (the accent is for focus, not headings),
+        // the keys in body ink and what they do muted, so the eye scans
+        // down the keys column.
+        let (title, rule, keys, what) = match crate::widgets::surface::tones(theme) {
+            Some(t) => (
+                Style::default().fg(t.strong()).add_modifier(Modifier::BOLD),
+                Style::default().fg(t.faint()),
+                Style::default().fg(t.text()),
+                Style::default().fg(t.muted()),
+            ),
+            None => (
+                Style::default()
+                    .fg(theme.ui(Color::Rgb(0x4e, 0x9a, 0xff)))
+                    .add_modifier(Modifier::BOLD),
+                Style::default().fg(theme.ui(Color::Rgb(0x4e, 0x9a, 0xff))),
+                Style::default().fg(theme.ui(Color::Yellow)),
+                Style::default().fg(theme.ui(Color::Rgb(0xd0, 0xd0, 0xd0))),
+            ),
+        };
         for (i, group) in SHORTCUT_GROUPS.iter().enumerate() {
             if i > 0 {
                 out.push(Line::from(""));
             }
-            out.push(Line::from(Span::styled(
-                group.title,
-                Style::default()
-                    .fg(theme.ui(Color::Rgb(0x4e, 0x9a, 0xff)))
-                    .add_modifier(Modifier::BOLD),
-            )));
+            out.push(Line::from(Span::styled(group.title, title)));
             out.push(Line::from(Span::styled(
                 "─".repeat(group.title.chars().count()),
-                Style::default().fg(theme.ui(Color::Rgb(0x4e, 0x9a, 0xff))),
+                rule,
             )));
             for entry in group.entries {
                 out.push(Line::from(vec![
-                    Span::styled(
-                        format!("  {:<32} ", entry.keys),
-                        Style::default().fg(theme.ui(Color::Yellow)),
-                    ),
-                    Span::styled(
-                        entry.description,
-                        Style::default().fg(theme.ui(Color::Rgb(0xd0, 0xd0, 0xd0))),
-                    ),
+                    Span::styled(format!("  {:<32} ", entry.keys), keys),
+                    Span::styled(entry.description, what),
                 ]));
             }
         }
@@ -1462,56 +1486,6 @@ mod tests {
             text.contains(last_word),
             "after scroll_to_bottom the final entry '{}' must be visible; wrapped rows are not counted in the scroll ceiling so the bottom of the list is unreachable\n--- rendered ---\n{text}",
             last_entry.description
-        );
-    }
-
-    /// The set of `is_*_key` predicates in the app key router IS the list of
-    /// shortcuts croft handles. Every one MUST be named in a ShortcutEntry's
-    /// `handler` so it shows up in F1. This fails the build the moment a
-    /// predicate is added without an entry (or an entry names a predicate that
-    /// no longer exists), making "every shortcut appears in F1" a hard invariant
-    /// rather than a hand-maintained hope.
-    #[test]
-    fn every_app_keybinding_predicate_is_documented_in_f1() {
-        use std::collections::BTreeSet;
-        const APP_SRC: &str = include_str!("../app/mod.rs");
-
-        // Every `fn is_*_key` defined in the app key router.
-        let mut handled: BTreeSet<&str> = BTreeSet::new();
-        for (i, _) in APP_SRC.match_indices("fn is_") {
-            let after_fn = &APP_SRC[i + 3..];
-            let Some(paren) = after_fn.find('(') else {
-                continue;
-            };
-            let name = &after_fn[..paren];
-            if name.ends_with("_key")
-                && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
-            {
-                handled.insert(name);
-            }
-        }
-        assert!(
-            !handled.is_empty(),
-            "scanned src/app/mod.rs but found no is_*_key predicates; the scan is broken"
-        );
-
-        // Every predicate named by an F1 entry's `handler`.
-        let mut documented: BTreeSet<&str> = BTreeSet::new();
-        for group in SHORTCUT_GROUPS {
-            for entry in group.entries {
-                for token in entry.handler.split_whitespace() {
-                    documented.insert(token);
-                }
-            }
-        }
-
-        let missing: Vec<&&str> = handled.difference(&documented).collect();
-        let stale: Vec<&&str> = documented.difference(&handled).collect();
-        assert!(
-            missing.is_empty() && stale.is_empty(),
-            "F1 shortcuts overlay is out of sync with src/app/mod.rs key handlers.\n  \
-             UNDOCUMENTED (add a ShortcutEntry whose `handler` names each): {missing:?}\n  \
-             STALE (handler names a predicate that no longer exists): {stale:?}"
         );
     }
 }

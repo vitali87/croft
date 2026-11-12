@@ -1,6 +1,6 @@
 [package]
 name = "croft-software"
-version = "0.2.131"
+version = "0.2.141"
 edition = "2024"
 description = "VSCode-style TUI written in Rust"
 license = "MIT"
@@ -9,7 +9,8 @@ homepage = "https://croft.software"
 # crates.io refuses a package over 10 MiB, and the docs' GIFs alone are ~3 MB
 # of it. Nothing the build reads lives in these (`include_str!` and
 # `include_bytes!` reach into assets/, docs/*.md and src/ only).
-exclude = ["/docs/images/", "/.github/", "/scripts/", "/sonar-project.properties", "/greptile.json", "/.coderabbit.yaml"]
+# The screen goldens are test data that only `cargo test` reads, from disk.
+exclude = ["/docs/images/", "/.github/", "/scripts/", "/sonar-project.properties", "/greptile.json", "/.coderabbit.yaml", "/src/app/tests/golden/"]
 
 # Prebuilt binaries for `cargo binstall croft-software` (#376). The release
 # workflow publishes one tar.gz per target holding a single `croft` at the
@@ -230,6 +231,14 @@ umya-spreadsheet = { version = "3.1", default-features = false }
 flate2 = "1"
 # xz for cargo-dist release archives (csvlens ships tar.xz only, #465).
 lzma-rs = "0.3"
+# zstd and bzip2 for the archive browser's `.tar.zst` and `.tar.bz2` (#1645).
+# Both decode in pure Rust, so the musl and Android cross builds need no C
+# compiler: ruzstd is decode-only (`std` for its `io::Read` decoder, frame
+# hashing dropped), and bzip2's one default feature is the libbz2-rs-sys port
+# of libbzip2, not the bzip2-sys C build. Verified current on crates.io
+# 2026-11-08 (ruzstd 0.9.1, bzip2 0.6.1).
+ruzstd = { version = "0.9", default-features = false, features = ["std"] }
+bzip2 = "0.6"
 # Tar walking for the archive browser (#179): list members and extract
 # one on demand (tar/tar.gz/tgz); zip rides the existing zip crate.
 # 0.4.46 verified current on crates.io 2026-08-18.

@@ -92,6 +92,9 @@ pub enum Command {
     /// popup Ctrl+Space opens, and the parameter hints typing `(` asks for.
     TriggerSuggest,
     TriggerParameterHints,
+    /// Show or Focus Hover (#1518): the hover popup for the caret, the one
+    /// the pointer's rest opens, from the keyboard.
+    ShowHover,
     MouseAddCursorAtClick,
     MouseGoToDefinitionAtClick,
     MouseOpenLinkAtClick,
@@ -117,6 +120,10 @@ pub enum Command {
 
     /// Pick a stash and open its changes (#1581).
     GitViewStash,
+    /// The caret line's commit, as the inline blame names it (#1556): open
+    /// the changes it made to the file, or copy its hash.
+    GitOpenLineCommit,
+    GitCopyLineCommitHash,
     AddCursorAbove,
     AddCursorBelow,
     ColumnSelectUp,
@@ -129,6 +136,7 @@ pub enum Command {
     AddSelectionToNextMatch,
     SelectAllOccurrences,
     AddCursorsToLineEnds,
+    ExpandLineSelection,
     // --- Editor: bracket / character / indentation ops ---
     JumpToBracket,
     SelectToBracket,
@@ -200,6 +208,10 @@ pub enum Command {
     ToggleInlineValues,
     ToggleInlayHints,
     ToggleMarkdownPreview,
+    /// Markdown: Open Preview to the Side (#1605), VS Code's
+    /// `markdown.showPreviewToSide`: the rendered view in the next group,
+    /// following the source as it is typed.
+    OpenMarkdownPreviewToSide,
     /// Markdown: Run Code Block at Cursor (#843): Cmd+Enter's run of the
     /// fence under the caret, from any terminal.
     RunCodeBlockAtCursor,
@@ -684,6 +696,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::RenameSymbol,
     Command::TriggerSuggest,
     Command::TriggerParameterHints,
+    Command::ShowHover,
     Command::MouseAddCursorAtClick,
     Command::MouseGoToDefinitionAtClick,
     Command::MouseOpenLinkAtClick,
@@ -701,6 +714,8 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::GitCopyHeadLink,
     Command::GitOpenOnRemote,
     Command::GitViewStash,
+    Command::GitOpenLineCommit,
+    Command::GitCopyLineCommitHash,
     Command::AddCursorAbove,
     Command::AddCursorBelow,
     Command::ColumnSelectUp,
@@ -713,6 +728,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::AddSelectionToNextMatch,
     Command::SelectAllOccurrences,
     Command::AddCursorsToLineEnds,
+    Command::ExpandLineSelection,
     Command::JumpToBracket,
     Command::SelectToBracket,
     Command::TransposeCharacters,
@@ -770,6 +786,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::ToggleInlineValues,
     Command::ToggleInlayHints,
     Command::ToggleMarkdownPreview,
+    Command::OpenMarkdownPreviewToSide,
     Command::RunCodeBlockAtCursor,
     Command::RestoreSnapshot,
     Command::CloseEditor,
@@ -1170,6 +1187,7 @@ impl Command {
             Command::RenameSymbol => "Rename Symbol",
             Command::TriggerSuggest => "Trigger Suggest",
             Command::TriggerParameterHints => "Trigger Parameter Hints",
+            Command::ShowHover => "Show or Focus Hover",
             Command::MouseAddCursorAtClick => "Mouse: Add Cursor at Click",
             Command::MouseGoToDefinitionAtClick => "Mouse: Go to Definition at Click",
             Command::MouseOpenLinkAtClick => "Mouse: Open Link at Click",
@@ -1188,6 +1206,8 @@ impl Command {
             Command::GitOpenOnRemote => "Git: Open on Remote",
 
             Command::GitViewStash => "Git: View Stash\u{2026}",
+            Command::GitOpenLineCommit => "Git: Open Commit for Line",
+            Command::GitCopyLineCommitHash => "Git: Copy Commit Hash for Line",
             Command::AddCursorAbove => "Add Cursor Above",
             Command::AddCursorBelow => "Add Cursor Below",
             Command::ColumnSelectUp => "Column Select Up",
@@ -1200,6 +1220,7 @@ impl Command {
             Command::AddSelectionToNextMatch => "Add Selection to Next Find Match",
             Command::SelectAllOccurrences => "Select All Occurrences of Find Match",
             Command::AddCursorsToLineEnds => "Add Cursors to Line Ends",
+            Command::ExpandLineSelection => "Expand Line Selection",
             Command::JumpToBracket => "Go to Bracket",
             Command::SelectToBracket => "Select to Bracket",
             Command::TransposeCharacters => "Transpose Characters around the Cursor",
@@ -1257,6 +1278,7 @@ impl Command {
             Command::ToggleInlineValues => "Debug: Toggle Inline Values",
             Command::ToggleInlayHints => "Editor: Toggle Inlay Hints",
             Command::ToggleMarkdownPreview => "Markdown: Toggle Preview",
+            Command::OpenMarkdownPreviewToSide => "Markdown: Open Preview to the Side",
             Command::RunCodeBlockAtCursor => "Markdown: Run Code Block at Cursor",
             Command::RestoreSnapshot => "Local History: Restore Snapshot",
             Command::CloseEditor => "View: Close Editor",
@@ -1637,6 +1659,7 @@ impl Command {
             Command::ToggleInlineValues => "",
             Command::ToggleInlayHints => "",
             Command::ToggleMarkdownPreview => "Cmd+Shift+V",
+            Command::OpenMarkdownPreviewToSide => "Cmd+K V",
             Command::RunCodeBlockAtCursor => "Cmd+Enter",
             Command::RestoreSnapshot => "",
             Command::MergeAcceptCurrent => "Cmd+.",
@@ -1672,6 +1695,7 @@ impl Command {
             // No chord of its own: VS Code's Ctrl+Shift+Space is the
             // terminal's Quick Select here. Typing `(` or `,` asks too.
             Command::TriggerParameterHints => "",
+            Command::ShowHover => "Cmd+K Cmd+I",
             Command::MouseAddCursorAtClick => "",
             Command::MouseGoToDefinitionAtClick => "",
             Command::MouseOpenLinkAtClick => "",
@@ -1688,6 +1712,7 @@ impl Command {
             Command::GitCopyPermalink | Command::GitCopyHeadLink | Command::GitOpenOnRemote => "",
 
             Command::GitViewStash => "",
+            Command::GitOpenLineCommit | Command::GitCopyLineCommitHash => "",
             Command::AddCursorAbove => "Cmd+Opt+↑",
             Command::AddCursorBelow => "Cmd+Opt+↓",
             Command::ColumnSelectUp => "Cmd+Shift+Opt+↑",
@@ -1700,6 +1725,7 @@ impl Command {
             Command::AddSelectionToNextMatch => "Cmd+D",
             Command::SelectAllOccurrences => "Cmd+Shift+L",
             Command::AddCursorsToLineEnds => "Shift+Alt+I",
+            Command::ExpandLineSelection => "Cmd+L",
             Command::JumpToBracket => "Cmd+Shift+\\",
             Command::SelectToBracket => "Cmd+Opt+\\",
             Command::TransposeCharacters => "Ctrl+T",
@@ -2151,6 +2177,7 @@ impl Command {
             Command::RenameSymbol => "rename_symbol",
             Command::TriggerSuggest => "trigger_suggest",
             Command::TriggerParameterHints => "trigger_parameter_hints",
+            Command::ShowHover => "show_hover",
             Command::MouseAddCursorAtClick => "mouse_add_cursor_at_click",
             Command::MouseGoToDefinitionAtClick => "mouse_go_to_definition_at_click",
             Command::MouseOpenLinkAtClick => "mouse_open_link_at_click",
@@ -2169,6 +2196,8 @@ impl Command {
             Command::GitOpenOnRemote => "git_open_on_remote",
 
             Command::GitViewStash => "git_view_stash",
+            Command::GitOpenLineCommit => "git_open_line_commit",
+            Command::GitCopyLineCommitHash => "git_copy_line_commit_hash",
             Command::AddCursorAbove => "add_cursor_above",
             Command::AddCursorBelow => "add_cursor_below",
             Command::ColumnSelectUp => "column_select_up",
@@ -2181,6 +2210,7 @@ impl Command {
             Command::AddSelectionToNextMatch => "add_selection_to_next_match",
             Command::SelectAllOccurrences => "select_all_occurrences",
             Command::AddCursorsToLineEnds => "add_cursors_to_line_ends",
+            Command::ExpandLineSelection => "expand_line_selection",
             Command::JumpToBracket => "jump_to_bracket",
             Command::SelectToBracket => "select_to_bracket",
             Command::TransposeCharacters => "transpose_characters",
@@ -2238,6 +2268,7 @@ impl Command {
             Command::ToggleInlineValues => "toggle_inline_values",
             Command::ToggleInlayHints => "toggle_inlay_hints",
             Command::ToggleMarkdownPreview => "toggle_markdown_preview",
+            Command::OpenMarkdownPreviewToSide => "open_markdown_preview_to_side",
             Command::RunCodeBlockAtCursor => "run_code_block_at_cursor",
             Command::RestoreSnapshot => "restore_snapshot",
             Command::CloseEditor => "close_editor",
@@ -2554,8 +2585,9 @@ impl Command {
     /// title: "layout" for the Customize Layout commands (#852), whose
     /// VS Code names mostly don't say it, the tab menu's "Keep Open" for
     /// View: Keep Editor, the hosts a shared link opens on (#1610), and VS
-    /// Code's own names for restarting a language server (#1621). Empty for
-    /// the rest.
+    /// Code's own names for restarting a language server (#1621), and
+    /// "blame" for the commands on the caret line's commit (#1556). Empty
+    /// for the rest.
     pub fn keyword(self) -> &'static str {
         if LAYOUT_COMMANDS.contains(&self) {
             "layout"
@@ -2571,6 +2603,11 @@ impl Command {
             Command::GitCopyPermalink | Command::GitCopyHeadLink | Command::GitOpenOnRemote
         ) {
             "github gitlab bitbucket share link url"
+        } else if matches!(
+            self,
+            Command::GitOpenLineCommit | Command::GitCopyLineCommitHash
+        ) {
+            "blame"
         } else {
             ""
         }
@@ -2740,6 +2777,10 @@ pub struct CommandPalette {
     pub scroll: usize,
     pub last_rect: Rect,
     pub last_inner_height: u16,
+    /// Where the terminal's caret goes in the query, set by a `surfaces`
+    /// theme's render (which draws no caret of its own); `None` on a boxed
+    /// theme, whose caret is a painted block.
+    pub last_caret: Option<(u16, u16)>,
 }
 
 impl CommandPalette {
@@ -2755,6 +2796,7 @@ impl CommandPalette {
             scroll: 0,
             last_rect: Rect::default(),
             last_inner_height: 0,
+            last_caret: None,
         };
         me.refresh_results();
         me
@@ -2940,52 +2982,22 @@ impl CommandPalette {
     }
 }
 
-/// A keybinding hint as VS Code's keycaps: each key in its own `cap` chip,
-/// `+` between the keys of a chord and a space between chords, both in `sep`.
-fn keycaps(hint: &str, cap: Style, sep: Style) -> Vec<Span<'static>> {
-    let mut out = Vec::new();
-    for (i, chord) in hint.split(' ').filter(|c| !c.is_empty()).enumerate() {
-        if i > 0 {
-            out.push(Span::styled(" ", sep));
-        }
-        for (j, key) in chord_keys(chord).into_iter().enumerate() {
-            if j > 0 {
-                out.push(Span::styled("+", sep));
-            }
-            out.push(Span::styled(format!(" {key} "), cap));
-        }
-    }
-    out
-}
-
-/// The keys of one chord: `Ctrl+Shift+P` is Ctrl, Shift and P, and a `+`
-/// that is itself the key (`Ctrl++`) stays a key.
-fn chord_keys(chord: &str) -> Vec<&str> {
-    let mut keys = Vec::new();
-    let mut rest = chord;
-    while let Some(first) = rest.chars().next() {
-        let skip = first.len_utf8();
-        match rest[skip..].find('+') {
-            Some(k) => {
-                keys.push(&rest[..skip + k]);
-                rest = &rest[skip + k + 1..];
-            }
-            None => {
-                keys.push(rest);
-                break;
-            }
-        }
-    }
-    keys
-}
-
+/// Draw the Command Palette over `area`. `center` is Quick Input Position:
+/// Center; `backdrop` lets a `surfaces` theme dim what is behind the card
+/// (the App withholds it where inline images would not dim with the text).
 pub fn render_command_palette(
     palette: &mut CommandPalette,
     area: Rect,
     buf: &mut Buffer,
     theme: crate::theme::Theme,
     center: bool,
+    backdrop: bool,
 ) {
+    if let Some(t) = crate::widgets::surface::tones(theme) {
+        render_palette_card(palette, area, buf, theme, t, center, backdrop);
+        return;
+    }
+    palette.last_caret = None;
     let width = area.width.saturating_mul(7) / 10;
     let width = width.clamp(40, 100).min(area.width);
     let height = area.height.saturating_mul(6) / 10;
@@ -3132,27 +3144,8 @@ pub fn render_command_palette(
         };
         let prefix = if is_selected { "> " } else { "  " };
         let title = crate::i18n::tr(cmd.title());
-        let hint = palette.hint_for(cmd);
-        // Croft Loch draws the chord as VS Code's keycaps: a chip per key.
-        let hint_spans: Vec<Span<'static>> = match theme.surfaces() {
-            Some(s) => {
-                let cap_bg = if is_selected {
-                    crate::gradient::rgb_color(crate::gradient::lerp_rgb(
-                        crate::gradient::POPUP_SEL_BG,
-                        (0xff, 0xff, 0xff),
-                        0.14,
-                    ))
-                } else {
-                    s.hairline()
-                };
-                let cap = Style::default()
-                    .bg(cap_bg)
-                    .fg(theme.ui(Color::Rgb(0xec, 0xef, 0xf4)));
-                keycaps(&hint, cap, hint_style)
-            }
-            // Borrowed as written unless the platform respells it.
-            None => vec![Span::styled(hint, hint_style)],
-        };
+        // Borrowed as written unless the platform respells it.
+        let hint_spans: Vec<Span<'static>> = vec![Span::styled(palette.hint_for(cmd), hint_style)];
         // Right-align the keybinding hint: pad between the title and the hint
         // so the chord sits at the row's right edge, like VS Code.
         let hint_w: usize = hint_spans.iter().map(Span::width).sum();
@@ -3169,6 +3162,104 @@ pub fn render_command_palette(
     Widget::render(Paragraph::new(lines), list_rect, buf);
 }
 
+/// The Command Palette as a `surfaces` theme draws it: the shared
+/// quick-input card ([`crate::widgets::quick_input`]) with no title on its
+/// edge, a `>` prompt, and rows that split a title at its first `: ` into a
+/// muted category and the command's name, the query's matched characters
+/// in bold strong ink ([`crate::widgets::quick_input::hit_style`]), and the
+/// binding as keycaps at the right.
+fn render_palette_card(
+    palette: &mut CommandPalette,
+    area: Rect,
+    buf: &mut Buffer,
+    theme: crate::theme::Theme,
+    t: crate::widgets::surface::Tones,
+    center: bool,
+    backdrop: bool,
+) {
+    use crate::widgets::quick_input::{self as qi, Card, Input, Row};
+    let width = (area.width.saturating_mul(7) / 10).clamp(40, 100);
+    let max_h = (area.height.saturating_mul(6) / 10).max(10);
+    let total = palette.results.len();
+    let card = Card::layout(area, width, max_h, total, center);
+    palette.last_rect = card.rect;
+    palette.last_inner_height = card.list.height;
+    if backdrop {
+        crate::widgets::surface::dim_backdrop(buf, card.rect, theme);
+    }
+    let filtering = !palette.query.trim().is_empty();
+    let count = qi::count_label(total, filtering, false, "command", "commands");
+    palette.last_caret = qi::paint_card(
+        buf,
+        &card,
+        theme,
+        t,
+        &Input {
+            glyph: ">",
+            query: &palette.query,
+            cursor: palette.cursor,
+            placeholder: "Type a command",
+            count: &count,
+            verb: "run",
+            keep: None,
+        },
+    );
+    let visible = card.list.height as usize;
+    if visible == 0 {
+        return;
+    }
+    if total == 0 {
+        qi::paint_empty(buf, &card, t, "No matching commands");
+        return;
+    }
+    if palette.selected >= palette.scroll + visible {
+        palette.scroll = palette.selected + 1 - visible;
+    }
+    if palette.selected < palette.scroll {
+        palette.scroll = palette.selected;
+    }
+    let end = (palette.scroll + visible).min(total);
+    let hit = qi::hit_style(t);
+    for (offset, cmd) in palette.results[palette.scroll..end].iter().enumerate() {
+        let selected = palette.scroll + offset == palette.selected;
+        let title = crate::i18n::tr(cmd.title());
+        let offsets = qi::match_offsets(&title, &palette.query);
+        // `View: Toggle Terminal`: the category recedes, the name reads.
+        let split = title.find(": ").map_or(0, |i| i + 2);
+        let mut label = qi::highlighted(
+            &title[..split],
+            0,
+            &offsets,
+            Style::default().fg(t.muted()),
+            hit,
+        );
+        label.extend(qi::highlighted(
+            &title[split..],
+            split,
+            &offsets,
+            Style::default().fg(t.text()),
+            hit,
+        ));
+        label.retain(|s| !s.content.is_empty());
+        let hint = palette.hint_for(cmd);
+        let row_bg = if selected { t.band() } else { t.raised() };
+        let trail = crate::widgets::surface::keycap_spans(&hint, t, row_bg, selected);
+        qi::paint_row(
+            buf,
+            &card,
+            offset as u16,
+            t,
+            Row {
+                selected,
+                glyph: None,
+                label,
+                trail,
+            },
+        );
+    }
+    qi::paint_scroll_cue(buf, &card, t, total, palette.scroll);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3179,21 +3270,11 @@ mod tests {
 
     #[test]
     fn a_chord_splits_into_its_keys() {
+        use crate::widgets::surface::chord_keys;
         assert_eq!(chord_keys("Ctrl+Shift+P"), ["Ctrl", "Shift", "P"]);
         assert_eq!(chord_keys("F12"), ["F12"]);
         assert_eq!(chord_keys("Ctrl++"), ["Ctrl", "+"]);
         assert_eq!(chord_keys("\u{2318}+K"), ["\u{2318}", "K"]);
-    }
-
-    #[test]
-    fn keycaps_put_each_key_in_a_chip() {
-        let cap = Style::default().bg(Color::Rgb(1, 2, 3));
-        let sep = Style::default();
-        let spans = keycaps("Ctrl+K Z", cap, sep);
-        let text: Vec<&str> = spans.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(text, [" Ctrl ", "+", " K ", " ", " Z "]);
-        assert_eq!(spans[0].style, cap);
-        assert_eq!(spans[1].style, sep);
     }
 
     /// Croft Loch frames the palette as a card and shows chords
@@ -3205,7 +3286,7 @@ mod tests {
             palette.set_query("toggle terminal");
             let area = Rect::new(0, 0, 100, 30);
             let mut buf = Buffer::empty(area);
-            render_command_palette(&mut palette, area, &mut buf, theme, false);
+            render_command_palette(&mut palette, area, &mut buf, theme, false, false);
             (palette.last_rect, buf)
         };
         let (rect, buf) = render(crate::theme::Theme::from_id("loch"));
@@ -3222,6 +3303,158 @@ mod tests {
             .map(|x| buf[(x, rect.y + 3)].symbol().to_string())
             .collect();
         assert!(row.contains("Ctrl+J"), "plain hint on Croft Black: {row:?}");
+    }
+
+    fn loch_palette(query: &str, area: Rect) -> (CommandPalette, Buffer) {
+        let mut palette = CommandPalette::new();
+        palette.set_query(query);
+        let mut buf = Buffer::empty(area);
+        render_command_palette(
+            &mut palette,
+            area,
+            &mut buf,
+            crate::theme::Theme::from_id("loch"),
+            false,
+            false,
+        );
+        (palette, buf)
+    }
+
+    fn row_text(buf: &Buffer, rect: Rect, y: u16) -> String {
+        (rect.x..rect.right())
+            .map(|x| buf[(x, y)].symbol().to_string())
+            .collect()
+    }
+
+    /// Croft Loch: no title on the card's edge, and the card is as tall as
+    /// its results with its top where the tallest card's would be.
+    #[test]
+    fn croft_loch_palette_is_a_titleless_card_that_hugs_its_results() {
+        let area = Rect::new(0, 0, 120, 40);
+        let (all, buf) = loch_palette("", area);
+        let top = row_text(&buf, all.last_rect, all.last_rect.y);
+        assert!(
+            top.chars().all(|c| c == '\u{2594}'),
+            "an unbroken top edge: {top:?}"
+        );
+        assert!(!top.contains("Command Palette"));
+        let (one, buf) = loch_palette("toggle terminal", area);
+        assert_eq!(one.last_rect.y, all.last_rect.y, "the top stays put");
+        assert!(one.last_rect.height < all.last_rect.height);
+        assert_eq!(
+            one.last_inner_height,
+            crate::widgets::quick_input::MIN_LIST_ROWS
+        );
+        let input = row_text(&buf, one.last_rect, one.last_rect.y + 1);
+        assert!(input.contains("> toggle terminal"), "{input:?}");
+        assert!(input.contains("match"), "a count: {input:?}");
+        let footer = row_text(&buf, one.last_rect, one.last_rect.bottom() - 2);
+        assert!(footer.contains("esc close"), "{footer:?}");
+    }
+
+    /// Croft Loch: the selected row is the band with the accent bar on the
+    /// card's left edge, no `> ` marker; the title's category is muted, its
+    /// name in body ink, and the matched characters in bold strong ink (not
+    /// the accent, which stays for the selection).
+    #[test]
+    fn croft_loch_palette_rows_split_the_category_and_mark_the_match() {
+        let t = crate::widgets::surface::tones(crate::theme::Theme::from_id("loch")).unwrap();
+        let (palette, buf) = loch_palette("toggle terminal", Rect::new(0, 0, 120, 40));
+        let rect = palette.last_rect;
+        let y = rect.y + 3;
+        let row = row_text(&buf, rect, y);
+        assert!(
+            row.starts_with("\u{258e}   View: Toggle Terminal"),
+            "{row:?}"
+        );
+        assert!(!row.contains("> "), "{row:?}");
+        assert_eq!(buf[(rect.x, y)].fg, t.accent(), "the bar is the accent");
+        assert_eq!(buf[(rect.x + 1, y)].bg, t.band());
+        let at = |s: &str| {
+            let b = row.find(s).expect("on the row");
+            rect.x + u16::try_from(row[..b].chars().count()).unwrap()
+        };
+        let view = at("View");
+        assert_eq!(buf[(view, y)].fg, t.muted(), "the category recedes");
+        let toggle = at("Toggle");
+        assert_eq!(buf[(toggle, y)].fg, t.strong(), "a matched character");
+        assert!(buf[(toggle, y)].modifier.contains(Modifier::BOLD));
+        let teal = (rect.x + 1..rect.right())
+            .flat_map(|x| (y..y + 3).map(move |y| (x, y)))
+            .filter(|&(x, y)| buf[(x, y)].fg == t.accent())
+            .count();
+        assert_eq!(teal, 0, "no teal in a row's text, only the bar");
+        let second = (rect.x..rect.right())
+            .map(|x| buf[(x, y + 1)].symbol().to_string())
+            .collect::<String>();
+        assert!(!second.starts_with('\u{258e}'), "one bar: {second:?}");
+    }
+
+    /// Croft Loch hands the caret to the terminal (no painted block); a
+    /// boxed theme keeps its painted caret and asks for no terminal caret.
+    #[test]
+    fn croft_loch_palette_hands_the_caret_to_the_terminal() {
+        let area = Rect::new(0, 0, 100, 30);
+        let (palette, buf) = loch_palette("ab", area);
+        let rect = palette.last_rect;
+        assert_eq!(palette.last_caret, Some((rect.x + 6, rect.y + 1)));
+        let blinking = (0..area.height)
+            .flat_map(|y| (0..area.width).map(move |x| (x, y)))
+            .any(|(x, y)| buf[(x, y)].modifier.contains(Modifier::SLOW_BLINK));
+        assert!(!blinking, "no painted caret block");
+        let mut black = CommandPalette::new();
+        black.set_query("ab");
+        let mut buf = Buffer::empty(area);
+        render_command_palette(
+            &mut black,
+            area,
+            &mut buf,
+            crate::theme::Theme::BLACK,
+            false,
+            false,
+        );
+        assert_eq!(black.last_caret, None);
+    }
+
+    /// Croft Loch: no results is one centred, muted, italic line.
+    #[test]
+    fn croft_loch_palette_says_when_nothing_matches() {
+        let t = crate::widgets::surface::tones(crate::theme::Theme::from_id("loch")).unwrap();
+        let (palette, buf) = loch_palette("zzqqxxj", Rect::new(0, 0, 100, 30));
+        assert!(palette.results.is_empty());
+        let rect = palette.last_rect;
+        let (y, x) = (0..rect.height)
+            .map(|dy| rect.y + dy)
+            .find_map(|y| {
+                let row = row_text(&buf, rect, y);
+                row.find("No matching commands")
+                    .map(|b| (y, rect.x + u16::try_from(row[..b].chars().count()).unwrap()))
+            })
+            .expect("the empty state is drawn");
+        assert_eq!(buf[(x, y)].fg, t.muted());
+        assert!(buf[(x, y)].modifier.contains(Modifier::ITALIC));
+    }
+
+    /// Croft Loch dims the screen behind the palette when asked, and leaves
+    /// it alone when the App withholds the scrim (inline images).
+    #[test]
+    fn croft_loch_palette_dims_its_backdrop_on_request() {
+        let theme = crate::theme::Theme::from_id("loch");
+        let area = Rect::new(0, 0, 100, 30);
+        let draw = |backdrop: bool| {
+            let mut palette = CommandPalette::new();
+            let mut buf = Buffer::empty(area);
+            buf.set_string(
+                0,
+                29,
+                "behind",
+                Style::default().fg(Color::Rgb(0xd0, 0xd0, 0xd0)),
+            );
+            render_command_palette(&mut palette, area, &mut buf, theme, false, backdrop);
+            buf[(0, 29)].fg
+        };
+        assert_eq!(draw(false), Color::Rgb(0xd0, 0xd0, 0xd0));
+        assert_ne!(draw(true), Color::Rgb(0xd0, 0xd0, 0xd0));
     }
 
     #[test]
@@ -3273,6 +3506,8 @@ mod tests {
                 "trigger_suggest",
                 "Ctrl+Space",
             ),
+            // #1518: VS Code's title and chord, so "hover" finds it.
+            ("hover", "Show or Focus Hover", "show_hover", "Cmd+K Cmd+I"),
         ] {
             let mut palette = CommandPalette::new();
             palette.set_query(query);
@@ -3565,6 +3800,7 @@ mod tests {
             area,
             &mut buf,
             crate::theme::Theme::BLACK,
+            false,
             false,
         );
         let row = (0..area.height)

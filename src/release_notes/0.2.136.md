@@ -1,0 +1,1 @@
+feature: The Explorer folds folders that each hold only one folder into a single row, as VS Code's compact folders do: expanding `src` opens `src/main/java/com/acme` in one step, one indent level deep. New File, paste and drop go to the deepest folder. Set `disable_compact_folders` (or VS Code's `explorer.compactFolders: false`) to list every level.

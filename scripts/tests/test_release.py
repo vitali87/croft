@@ -168,6 +168,18 @@ class Check(unittest.TestCase):
             errors, _ = repo.check()
             self.assertEqual(errors, [])
 
+    def test_a_shipped_change_with_a_refactor_fragment_passes(self):
+        """A change that ships but changes nothing in use still carries a
+        note, of the third kind; the gate asks nothing more of it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            repo.branch()
+            repo.write("src/lib.rs", SHIPPED.replace("/ 2", "/ 3"))
+            repo.write("src/release_notes/unreleased/2062-move.md", "refactor: Moved the width.\n")
+            repo.commit()
+            errors, _ = repo.check()
+            self.assertEqual(errors, [])
+
     def test_a_shipped_change_without_a_fragment_fails(self):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Repo(Path(tmp))
@@ -176,6 +188,7 @@ class Check(unittest.TestCase):
             repo.commit()
             errors, _ = repo.check()
             self.assertIn("src/release_notes/unreleased/", joined(errors))
+            self.assertIn("'feature:', 'fix:' or 'refactor:'", joined(errors))
 
     def test_bumping_the_version_in_a_pr_fails(self):
         """The line every open PR used to fight over. The workflow assigns
@@ -671,6 +684,153 @@ class Cut(unittest.TestCase):
                 self.assertEqual(repo.cut(released_lock=released), "0.2.12", moved)
                 self.assertEqual(repo.read("src/release_notes/0.2.12.md"), expected, moved)
 
+    def test_only_refactor_notes_pending_releases_nothing(self):
+        """A merge that changes nothing in use makes no version: one would
+        count toward the publish cadence and set off a release that changes
+        nothing for users. Its notes stay for the next version."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            repo.write("src/release_notes/unreleased/2062-move.md", "refactor: Moved the tree (#2062).\n")
+            repo.write("src/release_notes/unreleased/2063-rename.md", "# Rename\n- Refactor: Renamed a type.\n")
+            repo.commit()
+            self.assertIsNone(repo.cut(released_lock=CARGO_LOCK))
+            self.assertEqual(repo.read("Cargo.toml"), CARGO_TOML)
+            self.assertEqual(repo.read("Cargo.lock"), CARGO_LOCK)
+            self.assertFalse(repo.exists("src/release_notes/0.2.12.md"))
+            self.assertEqual(
+                repo.read("src/release_notes/unreleased/2062-move.md"), "refactor: Moved the tree (#2062).\n"
+            )
+            self.assertTrue(repo.exists("src/release_notes/unreleased/2063-rename.md"))
+
+    def test_a_minor_bump_by_hand_with_only_refactor_notes_releases_nothing(self):
+        """Run by hand, as on a push: notes that change nothing in use are
+        no release, whichever component was asked for."""
+        for kind in ("minor", "major"):
+            with tempfile.TemporaryDirectory() as tmp:
+                repo = Repo(Path(tmp))
+                repo.write("src/release_notes/unreleased/2062-move.md", "refactor: Moved the tree.\n")
+                repo.commit()
+                self.assertIsNone(repo.cut(kind, released_lock=CARGO_LOCK), kind)
+                self.assertEqual(repo.read("Cargo.toml"), CARGO_TOML, kind)
+                self.assertTrue(repo.exists("src/release_notes/unreleased/2062-move.md"), kind)
+
+    def test_a_fix_among_refactor_notes_releases_them_all(self):
+        """The version that has a fix folds in the refactor notes that were
+        waiting, as the record of what it holds."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            repo.write("src/release_notes/unreleased/2062-move.md", "refactor: Moved the tree.\n")
+            repo.write("src/release_notes/unreleased/847-plot.md", "fix: Plot.\n")
+            repo.commit()
+            self.assertEqual(repo.cut(), "0.2.12")
+            self.assertEqual(repo.read("src/release_notes/0.2.12.md"), "refactor: Moved the tree.\nfix: Plot.\n")
+            self.assertFalse(repo.exists("src/release_notes/unreleased/2062-move.md"))
+            self.assertFalse(repo.exists("src/release_notes/unreleased/847-plot.md"))
+            self.assertIn('version = "0.2.12"\nedition', repo.read("Cargo.toml"))
+
+    def test_refactor_notes_with_a_dependency_update_are_released(self):
+        """A dependency update changes the binary users run, so it makes a
+        version, and the refactor notes waiting go out with it."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            repo.write("src/release_notes/unreleased/2062-move.md", "refactor: Moved the tree.\n")
+            repo.write("Cargo.lock", with_anstyle("0.2.12"))
+            repo.commit()
+            self.assertEqual(repo.cut(released_lock=CARGO_LOCK), "0.2.12")
+            self.assertEqual(
+                repo.read("src/release_notes/0.2.12.md"),
+                "refactor: Moved the tree.\nfix: Updated anstyle to 0.2.12.\n",
+            )
+            self.assertFalse(repo.exists("src/release_notes/unreleased/2062-move.md"))
+
+    def test_a_fragment_with_no_highlight_stops_the_cut_among_refactor_notes(self):
+        """The check that a note says something comes first: a fragment that
+        says nothing is an error even when nothing would be released."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            repo.write("src/release_notes/unreleased/2062-move.md", "refactor: Moved the tree.\n")
+            repo.write("src/release_notes/unreleased/848-edit.md", "# Edit\n")
+            repo.commit()
+            with self.assertRaises(release.ReleaseError) as caught:
+                repo.cut()
+            self.assertIn("848-edit.md", str(caught.exception))
+            self.assertIn("'feature:', 'fix:' or 'refactor:'", str(caught.exception))
+
+    def test_a_line_only_like_a_refactor_one_is_released(self):
+        """Only the kind `refactor`, in any letter case, before the first
+        colon counts, as `release_notes::parse` reads it; a near miss is a
+        line the card shows, so its merge makes a version."""
+        for text in ("refactoring: Moved the tree.\n", "refactor : Moved the tree.\n", "Moved the tree.\n"):
+            with tempfile.TemporaryDirectory() as tmp:
+                repo = Repo(Path(tmp))
+                repo.write("src/release_notes/unreleased/2062-move.md", text)
+                repo.commit()
+                self.assertEqual(repo.cut(), "0.2.12", text)
+
+    def test_lines_break_and_trim_as_the_build_reads_them(self):
+        """The build breaks lines at "\\n" alone and trims what Rust trims.
+        A form feed inside a refactor line keeps it one refactor line, so no
+        version is cut whose notes the build would refuse as refactor-only;
+        a leading \\x1f, which Rust keeps, makes a line the card shows."""
+        for text, released in [
+            ("refactor: Moved A.\x0cfix: B repaired.\n", None),
+            ("refactor: Moved A.\u2028fix: B repaired.\n", None),
+            ("\x1frefactor: Moved A.\n", "0.2.12"),
+        ]:
+            with tempfile.TemporaryDirectory() as tmp:
+                repo = Repo(Path(tmp))
+                repo.write("src/release_notes/unreleased/2062-move.md", text)
+                repo.commit()
+                self.assertEqual(repo.cut(released_lock=CARGO_LOCK), released, repr(text))
+
+
+class RefactorLine(unittest.TestCase):
+    """The rule for a refactor line, which src/release_notes/select.rs and
+    `release_notes::parse` write out too: the same table as their tests."""
+
+    def test_the_kind_before_the_first_colon_after_one_bullet(self):
+        for line, refactor in [
+            ("refactor: Moved.", True),
+            ("Refactor: Moved.", True),
+            ("  REFACTOR:Moved.\n", True),
+            ("- refactor: Moved.", True),
+            ("* REFACTOR: Moved.", True),
+            ("refactoring: Moved.", False),
+            ("refactor : x", False),
+            ("refactor Moved.", False),
+            ("# refactor: a heading", False),
+            ("", False),
+            ("fix: refactor: Moved.", False),
+            ("feature: Something new.", False),
+            ("fix: Something repaired.", False),
+            ("Something repaired.", False),
+            ("\u3000refactor: Moved.\x0b", True),
+            ("refactor: Moved.\x0cfix: Repaired.", True),
+            ("\x1frefactor: Moved.", False),
+        ]:
+            self.assertEqual(release.is_refactor_line(line), refactor, repr(line))
+
+    def test_a_user_highlight_is_any_highlight_but_a_refactor_line(self):
+        self.assertFalse(release.has_user_highlight("# 0.2.11\nrefactor: Moved.\n\n"))
+        self.assertFalse(release.has_user_highlight(""))
+        self.assertTrue(release.has_user_highlight("refactor: Moved.\nPlain text.\n"))
+        self.assertTrue(release.has_user_highlight("- feature: New.\n"))
+        # Lines break at "\n" alone, as Rust's `lines` breaks them.
+        self.assertFalse(release.has_user_highlight("refactor: Moved.\x0cfix: Repaired.\n"))
+        self.assertFalse(release.has_user_highlight("refactor: Moved.\u2028fix: Repaired.\n"))
+        self.assertFalse(release.has_user_highlight("refactor: Moved.\x1cfix: Repaired.\n"))
+        self.assertTrue(release.has_user_highlight("\x1frefactor: Moved.\n"))
+        self.assertEqual(
+            release.without_refactor_lines("refactor: Moved.\x0cfix: Repaired.\nfix: C.\n"),
+            ("fix: C.\n", ["refactor: Moved.\x0cfix: Repaired.\n"]),
+        )
+
+    def test_trimming_removes_what_rusts_trim_removes(self):
+        """Unicode's White_Space set, which Rust's `trim` removes: Python's
+        `isspace` less \\x1c-\\x1f, which Rust keeps."""
+        python = {chr(c) for c in range(0x110000) if chr(c).isspace()}
+        self.assertEqual(set(release.RUST_WHITESPACE), python - set("\x1c\x1d\x1e\x1f"))
+
 
 class Notes(unittest.TestCase):
     """The GitHub release body: every version's notes since the last release.
@@ -747,6 +907,73 @@ class Notes(unittest.TestCase):
             root = self.notes_dir(tmp, **{"0_2_28": "fix: Old.\n"})
             with self.assertRaises(release.ReleaseError):
                 release.release_notes(root, "0.2.29", ["v0.2.28"])
+
+    def test_a_versions_own_refactor_lines_are_summed_up_at_the_end(self):
+        """The single-version body, which is otherwise the file as it is:
+        refactor lines change nothing in use, so one line counts them."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.notes_dir(
+                tmp, **{"0_2_28": "fix: Old.\n", "0_2_29": "refactor: Moved the tree (#2062).\nfix: A.\n"}
+            )
+            self.assertEqual(
+                release.release_notes(root, "0.2.29", ["v0.2.28"]),
+                "fix: A.\n\nrefactor: Internal groundwork (#2062): 1 change. Nothing changes in use.\n",
+            )
+            # The same with no release before it, and with no newline at the end.
+            (root / "src" / "release_notes" / "0.2.29.md").write_text("fix: A.\nrefactor: Moved (#2062).")
+            self.assertEqual(
+                release.release_notes(root, "0.2.29", []),
+                "fix: A.\n\nrefactor: Internal groundwork (#2062): 1 change. Nothing changes in use.\n",
+            )
+
+    def test_refactor_lines_across_versions_are_summed_up_in_one_line(self):
+        """Every version's section loses its refactor lines, and the one line
+        at the end names each issue once, in number order, not text order."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.notes_dir(
+                tmp,
+                **{
+                    "0_2_28": "refactor: Old (#1).\nfix: Old.\n",
+                    "0_2_29": "refactor: Moved (#2070).\nfix: A.\n- Refactor: Renamed (#2062, #2070).\n",
+                    "0_2_30": "feature: B.\n* REFACTOR: Split (#985).\n",
+                },
+            )
+            self.assertEqual(
+                release.release_notes(root, "0.2.30", ["v0.2.28"]),
+                "## 0.2.30\n\nfeature: B.\n\n## 0.2.29\n\nfix: A.\n\n"
+                "refactor: Internal groundwork (#985, #2062, #2070): 3 changes. Nothing changes in use.\n",
+            )
+
+    def test_refactor_lines_that_name_no_issue_are_counted_without_a_list(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.notes_dir(
+                tmp,
+                **{
+                    "0_2_28": "fix: Old.\n",
+                    "0_2_29": "fix: A.\nrefactor: Moved the tree.\n",
+                    "0_2_30": "refactor: Renamed a type.\nfeature: B.\n",
+                },
+            )
+            self.assertEqual(
+                release.release_notes(root, "0.2.30", ["v0.2.28"]),
+                "## 0.2.30\n\nfeature: B.\n\n## 0.2.29\n\nfix: A.\n\n"
+                "refactor: Internal groundwork: 2 changes. Nothing changes in use.\n",
+            )
+
+    def test_without_refactor_lines_the_body_is_byte_for_byte_as_before(self):
+        """Near misses, stray whitespace and a missing final newline: with no
+        refactor line the single-version body is the file as it is, and the
+        sections are joined exactly as they were."""
+        own = "# 0.2.29\nfix: A.  \nrefactoring: B.\n\trefactor : C.\n   \n- feature: D."
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.notes_dir(tmp, **{"0_2_28": "fix: Old.\n", "0_2_29": own})
+            self.assertEqual(release.release_notes(root, "0.2.29", ["v0.2.28"]), own)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self.notes_dir(tmp, **{"0_2_27": "fix: Old.\n", "0_2_28": "fix: E.\n\n", "0_2_29": own})
+            self.assertEqual(
+                release.release_notes(root, "0.2.29", ["v0.2.27"]),
+                f"## 0.2.29\n\n{own}\n\n## 0.2.28\n\nfix: E.\n\n",
+            )
 
     def test_the_cli_reads_released_tags_on_stdin(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1105,6 +1332,18 @@ class Workflows(unittest.TestCase):
             self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
             self.assertIn("nothing to release", out.stdout)
             self.assertEqual(run(origin, "git", "log", "--format=%s", "-1", "main").strip(), "c")
+
+    def test_the_version_bump_step_with_only_refactor_notes_pushes_nothing(self):
+        """A merge that changes nothing in use: no release commit, so no
+        version for the publish cadence to count, and the note stays on
+        main for the next version."""
+        with tempfile.TemporaryDirectory() as tmp:
+            out, origin = self.bump(Path(tmp), {"2062-move.md": "refactor: Moved the tree.\n"})
+            self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+            self.assertIn("nothing to release", out.stdout)
+            self.assertEqual(run(origin, "git", "log", "--format=%s", "-1", "main").strip(), "c")
+            files = run(origin, "git", "ls-tree", "-r", "--name-only", "main", "src/release_notes/unreleased")
+            self.assertIn("src/release_notes/unreleased/2062-move.md", files.split())
 
     def test_the_version_bump_step_stops_on_a_fragment_that_says_nothing(self):
         with tempfile.TemporaryDirectory() as tmp:

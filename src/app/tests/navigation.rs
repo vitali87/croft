@@ -827,24 +827,14 @@ fn editor_cmd_shift_o_opens_go_to_symbol() {
     );
 }
 
+/// A top-level [`sym`].
 fn outline_sym(
     name: &str,
     kind: crate::lsp::manager::OutlineKind,
     start: u32,
     end: u32,
 ) -> crate::lsp::manager::OutlineSymbol {
-    crate::lsp::manager::OutlineSymbol {
-        name: name.to_string(),
-        detail: None,
-        kind,
-        depth: 0,
-        line: start,
-        character: 0,
-        range_start_line: start,
-        range_end_line: end,
-        range_start_character: 0,
-        range_end_character: u32::MAX,
-    }
+    sym(name, kind, 0, start, end)
 }
 
 #[test]
@@ -1514,7 +1504,7 @@ fn a_long_crumb_picker_keeps_its_highlight_on_screen() {
     click_crumb(&mut app, 1);
     // The row the highlight is drawn on, with its label there.
     let shown = |app: &mut App| {
-        let screen = screen_text_863(app, 100, 20);
+        let screen = draw_screen(app, 100, 20);
         let r = app.menu_rect().unwrap();
         let sel = app.context_menu.as_ref().unwrap().selected;
         let y = (r.y + 1..r.y + r.height - 1)
@@ -2409,7 +2399,7 @@ fn a_symbol_tab_opens_beside_its_file_showing_only_the_symbol() {
 
     // Scrolled to the top, the clip, not the scroll, keeps `fn a` out.
     app.editor.scroll = 0;
-    let screen = painted(&mut app);
+    let screen = draw_screen(&mut app, 100, 30);
     assert!(
         screen.contains("b \u{b7} two.rs"),
         "titled by its symbol:\n{screen}"
@@ -2696,7 +2686,7 @@ fn an_outline_row_right_click_opens_that_symbol_as_a_tab() {
     app.outline.collapsed = false;
     let symbols = app.compute_syntax_outline(&file);
     app.outline.set_symbols(file.clone(), symbols);
-    painted(&mut app);
+    draw_screen(&mut app, 100, 30);
     let area = app.outline.last_area;
     let row = (area.y..area.y + area.height)
         .find(|&y| {
@@ -2766,7 +2756,7 @@ fn a_symbol_tab_never_scrolls_its_tail_off_a_pane_it_fits() {
     app.editor.cursor_row = 5;
     app.editor.cursor_col = 0;
     app.editor.scroll = 5;
-    painted(&mut app);
+    draw_screen(&mut app, 100, 30);
     assert_eq!(
         app.editor.scroll, 3,
         "fn b's three lines fill the pane top down"
@@ -3209,20 +3199,8 @@ fn the_outline_and_breadcrumbs_follow_the_scrubbed_commit() {
     // symbol jump lands in the history, and leaving brings the live
     // outline back.
     let tmp = tempfile::tempdir().unwrap();
-    let git = |args: &[&str]| {
-        let ok = std::process::Command::new("git")
-            .arg("-C")
-            .arg(tmp.path())
-            .args(args)
-            .output()
-            .unwrap()
-            .status
-            .success();
-        assert!(ok, "git {args:?}");
-    };
-    git(&["init", "-q", "-b", "main"]);
-    git(&["config", "user.email", "a@b"]);
-    git(&["config", "user.name", "a"]);
+    let git = |args: &[&str]| git_ok(tmp.path(), args);
+    git_init_with_identity(tmp.path());
     let file = tmp.path().join("lib.rs");
     std::fs::write(&file, "fn alpha() {\n    let a = 1;\n}\n").unwrap();
     git(&["add", "."]);

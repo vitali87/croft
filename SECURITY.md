@@ -7,8 +7,10 @@ one, and how a fix reaches you.
 
 ## Supported versions
 
-croft ships as a rolling release. Every merge to `main` that changes what
-ships is tagged and published to GitHub Releases, crates.io and the Homebrew
+croft ships as a rolling release. Every merge to `main` that ships a
+feature, a fix or a dependency update gets a new version and tag, and a merge
+that only restructures code goes out with the next one. Releases are
+published from those tags to GitHub Releases, crates.io and the Homebrew
 tap, so there is no maintained branch behind the latest tag. Security fixes
 land in a new release, never as a patch to an old one.
 

@@ -115,19 +115,127 @@ fn minimap_rgba_to_png_roundtrips() {
 }
 
 /// #1544 negative: the line number and the text body keep their clicks:
-/// they move the caret and set no breakpoint.
+/// the number selects its line (#1570), the text moves the caret, and
+/// neither sets a breakpoint.
 #[test]
-fn a_click_on_the_line_number_or_the_text_moves_the_caret_only() {
+fn a_click_on_the_line_number_or_the_text_sets_no_breakpoint() {
     let (mut app, _tmp, f) = app_with_painted_file("l1\nl2\nl3\nl4\nl5\n");
     let number = app.editor.last_inner.x + 2;
     let text_x = app.editor.last_inner.x + app.editor.last_gutter_width + 1;
     let (row2, row3) = (app.editor.last_inner.y + 2, app.editor.last_inner.y + 3);
     click_and_release(&mut app, number, row2);
-    assert_eq!(app.editor.cursor_row, 2, "the number click moves the caret");
+    assert_eq!(
+        app.editor.selection.map(|s| s.normalised()),
+        Some(((2, 0), (3, 0))),
+        "the number click selects its line"
+    );
     app.editor_click.clear();
     click_and_release(&mut app, text_x + 1, row3);
     assert_eq!(app.editor.cursor_row, 3, "the text click moves the caret");
     assert!(app.editor.breakpoint_lines(&f).is_empty());
+}
+
+/// #1570: a third click on the same cell inside the double-click window
+/// selects the whole line, newline included, so typing replaces it. It used
+/// to start over as a single click and drop the word the double selected.
+/// Holding the third press and dragging extends the selection by lines.
+#[test]
+fn a_triple_click_selects_the_line_and_a_drag_extends_it_by_lines() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let (mut app, _tmp, _f) = app_with_painted_file("def f():\n    return 1\n    pass\n");
+    let col = app.editor.last_inner.x + app.editor.last_gutter_width + 1 + 6;
+    let row = app.editor.last_inner.y + 1;
+    click_and_release(&mut app, col, row);
+    click_and_release(&mut app, col, row);
+    assert_eq!(
+        app.editor.selection.map(|s| s.normalised()),
+        Some(((1, 4), (1, 10))),
+        "the double selects `return`"
+    );
+    click_and_release(&mut app, col, row);
+    assert_eq!(
+        app.editor.selection.map(|s| s.normalised()),
+        Some(((1, 0), (2, 0))),
+        "the triple selects line 2 through the start of line 3"
+    );
+    app.handle_key(key(KeyCode::Char('Z'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.lines, ["def f():", "Z    pass"]);
+
+    let (mut app, _tmp, _f) = app_with_painted_file("def f():\n    return 1\n    pass\n");
+    click_and_release(&mut app, col, row);
+    click_and_release(&mut app, col, row);
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), col, row));
+    app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), col, row + 1));
+    app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), col, row + 1));
+    assert_eq!(
+        app.editor.selection.map(|s| s.normalised()),
+        Some(((1, 0), (2, 8))),
+        "the drag takes whole lines 2 and 3, the last to its end"
+    );
+}
+
+/// #1570: a press on line number 2 selects that line through the start of
+/// line 3, and a drag down or up the numbers selects whole lines. It used to
+/// put the caret at column 1.
+#[test]
+fn a_line_number_press_selects_the_line_and_a_drag_selects_lines() {
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let (mut app, _tmp, _f) = app_with_painted_file("l1\nl2\nl3\nl4\nl5\n");
+    let number = app.editor.last_inner.x + 2;
+    let y = app.editor.last_inner.y;
+    click_and_release(&mut app, number, y + 1);
+    assert_eq!(
+        app.editor.selection.map(|s| s.normalised()),
+        Some(((1, 0), (2, 0)))
+    );
+    // Down from line 2 to line 4, then up from line 4 to line 1, the caret
+    // at the end the pointer went to.
+    for (from, to, want, caret) in [(1, 3, ((1, 0), (4, 0)), 4), (3, 0, ((0, 0), (4, 0)), 0)] {
+        app.handle_mouse(mouse(
+            MouseEventKind::Down(MouseButton::Left),
+            number,
+            y + from,
+        ));
+        app.handle_mouse(mouse(
+            MouseEventKind::Drag(MouseButton::Left),
+            number,
+            y + to,
+        ));
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), number, y + to));
+        assert_eq!(app.editor.selection.map(|s| s.normalised()), Some(want));
+        assert_eq!(app.editor.cursor_row, caret, "{from}->{to}");
+    }
+}
+
+/// #1570 negative: only the number's own columns select a line. A press on
+/// the blank chevron cell of a line with no fold, on the spacer before the
+/// change bar, or in a gutter with line numbers off still puts the caret at
+/// column 1 and selects nothing.
+#[test]
+fn only_the_line_number_columns_select_the_line() {
+    use crate::widgets::editor::LineNumbers;
+    let (mut app, _tmp, _f) = app_with_painted_file("l1\nl2\nl3\n");
+    let x = app.editor.last_inner.x;
+    let row = app.editor.last_inner.y + 1;
+    let spacer = x + app.editor.last_gutter_width - 1;
+    let selected = |app: &App| app.editor.selection.map(|s| s.normalised());
+    for col in [x + 1, spacer] {
+        app.editor_click.clear();
+        click_and_release(&mut app, col, row);
+        assert_eq!(selected(&app), None, "column {col} selects nothing");
+        assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (1, 0));
+    }
+    app.editor_click.clear();
+    click_and_release(&mut app, x + 2, row);
+    assert_eq!(selected(&app), Some(((1, 0), (2, 0))), "the number does");
+
+    app.editor.line_numbers = LineNumbers::Off;
+    draw(&mut app, 100, 30);
+    app.editor_click.clear();
+    click_and_release(&mut app, x + 2, row + 1);
+    assert_eq!(selected(&app), None, "no numbers, no line selection");
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (2, 0));
 }
 
 /// #1544 negative: the fold chevron still folds, and a lane click past the
@@ -282,14 +390,14 @@ fn inline_blame_annotation_paints_on_the_cursor_line() {
         Some(crate::git::Blame::new(
             vec![
                 std::sync::Arc::new(crate::git::BlameCommit {
-                    short_hash: "abc12345".into(),
+                    hash: "abc12345".into(),
                     summary: "init".into(),
                     author: "Vitali".into(),
                     age_secs: 3600,
                     uncommitted: false,
                 }),
                 std::sync::Arc::new(crate::git::BlameCommit {
-                    short_hash: "abc12345".into(),
+                    hash: "abc12345".into(),
                     summary: "add x".into(),
                     author: "Alice".into(),
                     age_secs: 60,
@@ -1435,16 +1543,6 @@ fn timestamps_gutter_toggles_on_and_shows_arrival_times() {
                 .any(|l| l.starts_with("gutter-row-9"))
         },
     );
-    fn screen_rows(term: &ratatui::Terminal<ratatui::backend::TestBackend>) -> Vec<String> {
-        let buf = term.backend().buffer();
-        (0..buf.area.height)
-            .map(|y| {
-                (0..buf.area.width)
-                    .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
-                    .collect()
-            })
-            .collect()
-    }
     fn gutter_of(rows: &[String], needle: &str) -> Option<String> {
         let row = rows.iter().find(|r| r.contains(needle))?;
         let inner = row.trim_end().trim_end_matches(['│', '┃']);
@@ -1464,7 +1562,7 @@ fn timestamps_gutter_toggles_on_and_shows_arrival_times() {
 
     // Off by default: the row ends with its own text, no clock.
     term.draw(|f| app.render(f)).unwrap();
-    let g = gutter_of(&screen_rows(&term), "gutter-row-9").unwrap_or_default();
+    let g = gutter_of(&screen_char_rows(&term), "gutter-row-9").unwrap_or_default();
     assert!(
         !g.chars().filter(|c| *c == ':').count().eq(&2),
         "no gutter while the toggle is off: {g:?}"
@@ -1473,7 +1571,7 @@ fn timestamps_gutter_toggles_on_and_shows_arrival_times() {
     app.toggle_terminal_timestamps();
     assert!(app.show_terminal_timestamps);
     term.draw(|f| app.render(f)).unwrap();
-    let g = gutter_of(&screen_rows(&term), "gutter-row-9").expect("row still on screen");
+    let g = gutter_of(&screen_char_rows(&term), "gutter-row-9").expect("row still on screen");
     let looks_like_clock = g.len() == 8
         && g.as_bytes()[2] == b':'
         && g.as_bytes()[5] == b':'
@@ -1485,7 +1583,7 @@ fn timestamps_gutter_toggles_on_and_shows_arrival_times() {
 
     app.toggle_terminal_timestamps();
     term.draw(|f| app.render(f)).unwrap();
-    let g = gutter_of(&screen_rows(&term), "gutter-row-9").unwrap_or_default();
+    let g = gutter_of(&screen_char_rows(&term), "gutter-row-9").unwrap_or_default();
     assert!(
         !(g.len() == 8 && g.as_bytes()[2] == b':' && g.as_bytes()[5] == b':'),
         "toggling off removes the gutter: {g:?}"
@@ -1512,23 +1610,13 @@ fn sticky_command_header_pins_the_command_while_scrolled_into_its_output() {
         "the command to finish",
         || !app.terminals[0].command_decorations().is_empty(),
     );
-    fn screen_rows(term: &ratatui::Terminal<ratatui::backend::TestBackend>) -> Vec<String> {
-        let buf = term.backend().buffer();
-        (0..buf.area.height)
-            .map(|y| {
-                (0..buf.area.width)
-                    .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
-                    .collect()
-            })
-            .collect()
-    }
     let backend = ratatui::backend::TestBackend::new(120, 40);
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|f| app.render(f)).unwrap();
     let inner = app.terminals[0].last_inner;
 
     // At the live bottom nothing pins.
-    let rows = screen_rows(&term);
+    let rows = screen_char_rows(&term);
     assert!(
         !rows[inner.y as usize].contains("build-it-77"),
         "no header at the live bottom: {:?}",
@@ -1542,7 +1630,7 @@ fn sticky_command_header_pins_the_command_while_scrolled_into_its_output() {
         app.terminals[0].scroll_down(1);
     }
     term.draw(|f| app.render(f)).unwrap();
-    let rows = screen_rows(&term);
+    let rows = screen_char_rows(&term);
     assert!(
         rows[inner.y as usize].contains("build-it-77 now"),
         "the command must pin to the pane's top row: {:?}",
@@ -1552,7 +1640,7 @@ fn sticky_command_header_pins_the_command_while_scrolled_into_its_output() {
     // Back at the live bottom the header unpins.
     app.terminals[0].reset_scrollback();
     term.draw(|f| app.render(f)).unwrap();
-    let rows = screen_rows(&term);
+    let rows = screen_char_rows(&term);
     assert!(
         !rows[inner.y as usize].contains("build-it-77"),
         "the header unpins at the live bottom: {:?}",
@@ -1587,6 +1675,8 @@ fn drag_target_over_the_sticky_band_is_the_pinned_directory() {
     }
     std::fs::write(tmp.path().join("loose.txt"), "x\n").unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // Three pinned rows, not the compact row `outer/inner` (#1486).
+    app.tree.set_compact_folders(false);
     let outer = app
         .tree
         .nodes
@@ -2126,6 +2216,90 @@ fn the_minimap_draws_as_braille_without_inline_images() {
     );
 }
 
+/// On Croft Loch the tab strip's chrome runs through the minimap's column
+/// to the right edge instead of stopping a black column short, and the seam
+/// under the breadcrumbs crosses the column too.
+#[test]
+fn a_loch_tab_strip_and_header_seam_run_through_the_minimap_column() {
+    let (_tmp, mut app) = text_minimap_app();
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 40)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let t = crate::widgets::surface::tones(app.theme).expect("Loch is the default");
+    let strip = app.minimap_img_rect;
+    let top = app.editor.last_full_area.y;
+    let seam_y = app.editor.last_body.y;
+    let buf = term.backend().buffer();
+    for x in strip.x..strip.x + strip.width {
+        assert_eq!(buf[(x, top)].bg, app.theme.tab_strip_bg(), "column {x}");
+        assert_eq!(buf[(x, seam_y)].symbol(), "\u{2594}", "column {x}");
+        assert_eq!(buf[(x, seam_y)].fg, t.hairline());
+    }
+}
+
+/// While a modal quick input has the keyboard, Croft Loch takes the accent
+/// lip off the editor's top seam (a hairline remains); focus itself stays
+/// on the editor, and the lip returns when the palette closes.
+#[test]
+fn a_modal_quick_input_takes_the_accent_off_the_editor_seam() {
+    let (_tmp, mut app) = text_minimap_app();
+    app.focus_pane(Pane::Editor);
+    let t = crate::widgets::surface::tones(app.theme).expect("Loch is the default");
+    let seam = |app: &mut App| {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 40)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        let body = app.editor.last_body;
+        term.backend().buffer()[(body.x, body.y)].fg
+    };
+    // The palette's scrim sinks everything behind the card, the seam
+    // included, so the palette-open seam is the hairline as the scrim
+    // leaves it on the black canvas.
+    let theme = app.theme;
+    let behind_scrim = |c: ratatui::style::Color| {
+        let mut b = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 1, 1));
+        b[(0, 0)].set_fg(c).set_bg(t.canvas());
+        crate::widgets::surface::dim_backdrop(&mut b, Rect::default(), theme);
+        b[(0, 0)].fg
+    };
+    assert_eq!(seam(&mut app), t.accent(), "the focused editor's lip");
+    app.open_command_palette();
+    let palette_open = seam(&mut app);
+    assert_eq!(
+        palette_open,
+        behind_scrim(t.hairline()),
+        "the palette has the keyboard"
+    );
+    assert_ne!(palette_open, behind_scrim(t.accent()));
+    assert!(app.focus == Pane::Editor && app.editor.focused);
+    app.command_palette = None;
+    assert_eq!(seam(&mut app), t.accent());
+}
+
+/// Croft Loch's layout icons are header actions: muted at rest, and under
+/// the pointer the strong ink on a faint chip across the two-cell slot,
+/// never the accent.
+#[test]
+fn loch_layout_icons_rest_muted_and_lift_on_a_chip() {
+    let (_tmp, mut app) = text_minimap_app();
+    app.chrome_bake = None;
+    app.overlays.activity.clear_images();
+    draw(&mut app, 160, 40);
+    let t = crate::widgets::surface::tones(app.theme).expect("Loch is the default");
+    let side = app.layout_icon_areas.toggle_side_bar;
+    let cust = app.layout_icon_areas.customize;
+    assert!(side.width == 2 && cust.width == 2);
+    app.pointer_cell = Some((cust.x, cust.y));
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 40)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let buf = term.backend().buffer();
+    let idle = &buf[(side.x + 1, side.y)];
+    assert_eq!(idle.fg, t.muted());
+    assert_eq!(idle.bg, app.theme.tab_strip_bg(), "no chip at rest");
+    let chip = t.hover_on(t.chrome);
+    assert_eq!(buf[(cust.x + 1, cust.y)].fg, t.strong());
+    assert_eq!(buf[(cust.x, cust.y)].bg, chip);
+    assert_eq!(buf[(cust.x + 1, cust.y)].bg, chip);
+}
+
 #[test]
 fn a_click_on_the_text_minimap_jumps_to_that_part_of_the_file() {
     let (_tmp, mut app) = text_minimap_app();
@@ -2335,6 +2509,219 @@ fn line_numbers_reach_every_split_group() {
     };
     app.apply_merged_settings(&prefs);
     assert_eq!(modes(&app), [LineNumbers::Off, LineNumbers::Off]);
+}
+
+fn overwrite_app(text: &str) -> (tempfile::TempDir, App) {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus = Pane::Editor;
+    app.editor.lines = text.lines().map(String::from).collect();
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 0;
+    (tmp, app)
+}
+
+#[test]
+fn insert_key_toggles_overwrite_mode_and_typing_replaces() {
+    let (_t, mut app) = overwrite_app("abcdef");
+    app.handle_key(key(KeyCode::Char('X'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        app.editor.lines[0], "Xabcdef",
+        "insert mode pushes the text"
+    );
+    app.handle_key(key(KeyCode::Insert, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.overwrite_mode);
+    assert_eq!(app.status, "Overwrite mode");
+    app.handle_key(key(KeyCode::Char('Y'), KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('Z'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.lines[0], "XYZcdef", "overwrite replaces a, b");
+    assert_eq!(app.editor.cursor_col, 3);
+    app.handle_key(key(KeyCode::Insert, KeyModifiers::NONE))
+        .unwrap();
+    assert!(!app.overwrite_mode);
+    assert_eq!(app.status, "Insert mode");
+    app.handle_key(key(KeyCode::Char('!'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.lines[0], "XYZ!cdef");
+}
+
+#[test]
+fn overwrite_appends_at_the_end_of_a_line_and_replaces_a_whole_emoji() {
+    let (_t, mut app) = overwrite_app("a\u{1F468}\u{200D}\u{1F469}b");
+    app.overwrite_mode = true;
+    app.editor.cursor_col = 1;
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.lines[0], "axb", "the ZWJ cluster goes as one");
+    app.editor.cursor_col = 3;
+    app.handle_key(key(KeyCode::Char('!'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.lines[0], "axb!", "at the line end it appends");
+}
+
+#[test]
+fn overwrite_typing_undoes_in_one_step_and_a_selection_is_replaced_as_usual() {
+    let (_t, mut app) = overwrite_app("hello");
+    app.overwrite_mode = true;
+    app.handle_key(key(KeyCode::Char('J'), KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('K'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.lines[0], "JKllo");
+    app.editor.undo();
+    assert_eq!(app.editor.lines[0], "hello", "one undo step for the run");
+    app.editor.cursor_col = 1;
+    app.editor.selection = Some(crate::widgets::editor::EditorSelection {
+        anchor: (0, 1),
+        head: (0, 4),
+    });
+    app.editor.cursor_col = 4;
+    app.handle_key(key(KeyCode::Char('_'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.lines[0], "h_o", "a selection is replaced, once");
+}
+
+#[test]
+fn switching_the_typing_mode_starts_a_new_undo_step() {
+    let (_t, mut app) = overwrite_app("hello");
+    app.handle_key(key(KeyCode::Char('A'), KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Insert, KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('B'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.lines[0], "ABello");
+    app.editor.undo();
+    assert_eq!(
+        app.editor.lines[0], "Ahello",
+        "the overwrite run undoes on its own"
+    );
+    app.editor.undo();
+    assert_eq!(app.editor.lines[0], "hello");
+}
+
+#[test]
+fn overwrite_leaves_the_caret_after_a_cluster_the_typed_char_joins() {
+    // U+1F1FA before the French flag's two indicators pairs with the first of
+    // them, so the caret must step past that new pair, not stop inside it.
+    let (_t, mut app) = overwrite_app("a\u{1F1EB}\u{1F1F7}");
+    app.overwrite_mode = true;
+    app.handle_key(key(KeyCode::Char('\u{1F1FA}'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.lines[0], "\u{1F1FA}\u{1F1EB}\u{1F1F7}");
+    assert_eq!(app.editor.cursor_col, 2, "after the joined pair");
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        app.editor.lines[0], "\u{1F1FA}\u{1F1EB}x",
+        "the next key replaces the cluster after the caret"
+    );
+}
+
+#[test]
+fn overwrite_adds_a_combining_mark_to_the_letter_before_the_caret() {
+    // The accent belongs to the `e` just typed: it must not eat the `b`.
+    let (_t, mut app) = overwrite_app("abcd");
+    app.overwrite_mode = true;
+    app.handle_key(key(KeyCode::Char('e'), KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('\u{301}'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.lines[0], "e\u{301}bcd");
+    assert_eq!(app.editor.cursor_col, 2);
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        app.editor.lines[0], "e\u{301}xcd",
+        "the next key replaces again"
+    );
+    app.editor.undo();
+    assert_eq!(
+        app.editor.lines[0], "abcd",
+        "still one undo step for the run"
+    );
+}
+
+#[test]
+fn overwrite_steps_past_an_emoji_a_typed_zwj_joins() {
+    // A ZWJ typed between 👩 and 💻 makes one 👩‍💻: the caret goes after it,
+    // so the next key replaces the `x`, not the 💻.
+    let (_t, mut app) = overwrite_app("\u{1F469}\u{1F4BB}x");
+    app.overwrite_mode = true;
+    app.editor.cursor_col = 1;
+    app.handle_key(key(KeyCode::Char('\u{200D}'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.lines[0], "\u{1F469}\u{200D}\u{1F4BB}x");
+    assert_eq!(app.editor.cursor_col, 3, "after the joined emoji");
+    app.handle_key(key(KeyCode::Char('a'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.lines[0], "\u{1F469}\u{200D}\u{1F4BB}a");
+}
+
+#[test]
+fn overwrite_drops_the_empty_selection_a_click_leaves() {
+    let (_t, mut app) = overwrite_app("abcd");
+    app.overwrite_mode = true;
+    app.editor.selection = Some(crate::widgets::editor::EditorSelection {
+        anchor: (0, 0),
+        head: (0, 0),
+    });
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.editor.lines[0], "xbcd");
+    assert!(
+        app.editor.selection.is_none(),
+        "no stale anchor for a later Shift+arrow"
+    );
+}
+
+#[test]
+fn overwrite_mode_is_shown_by_a_glyph_after_the_workspace_cap_not_in_the_position() {
+    let (_t, mut app) = overwrite_app("abc");
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+    let bar = |t: &ratatui::Terminal<ratatui::backend::TestBackend>| -> String {
+        let b = t.backend().buffer();
+        let y = b.area.height - 1;
+        (0..b.area.width)
+            .map(|x| b[(x, y)].symbol().to_string())
+            .collect()
+    };
+    term.draw(|f| app.render(f)).unwrap();
+    let insert = bar(&term);
+    assert!(
+        !insert.contains('\u{2380}') && !insert.contains('\u{2381}'),
+        "Insert, the default, adds nothing to the bar: {insert}"
+    );
+    app.handle_key(key(KeyCode::Insert, KeyModifiers::NONE))
+        .unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let over = bar(&term);
+    // The workspace cap ends on its rounded right edge; the glyph follows
+    // one cell of air later.
+    assert!(
+        over.contains("\u{e0b4} \u{2381}"),
+        "overwrite glyph after the workspace cap: {over}"
+    );
+    assert!(!over.contains("OVR"), "the Ln/Col segment stays unchanged");
+}
+
+#[test]
+fn centring_a_line_before_the_first_render_leaves_context_above() {
+    // A file opened for the first time has no viewport yet (zero text rows),
+    // so there is no middle to centre on: the target must still be brought
+    // near the top instead of staying at scroll 0 (a Global Search hit).
+    let mut e = crate::widgets::editor::Editor::new();
+    e.lines = (0..200).map(|i| format!("line {i}")).collect();
+    assert_eq!(e.text_rows(), 0, "precondition: not rendered yet");
+    e.goto_line_centered(100);
+    assert_eq!(e.cursor_row, 100);
+    assert_eq!(e.scroll, 95, "five lines of context above the target");
+    e.goto_line_centered(2);
+    assert_eq!(e.scroll, 0, "near the top it saturates at 0");
 }
 
 #[test]

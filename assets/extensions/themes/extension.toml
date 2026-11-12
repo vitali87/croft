@@ -78,12 +78,23 @@ osk_key = "#20242b"
 osk_special = "#14161b"
 osk_armed = "#0e7e76"
 # The active tab wears the canvas so it joins the code beneath it; the rest
-# of the strip is chrome.
+# of the strip is chrome. Hover is a neutral lift (never the accent), and the
+# close pill a step above it.
 tab_strip = "#0e1011"
 tab_inactive = "#0e1011"
 tab_active = "#000000"
-tab_hover = "#162323"
-tab_close_pill = "#264f4a"
+tab_hover = "#1b1d1e"
+tab_close_pill = "#2e3031"
+# A code palette tuned for the black canvas and the teal accent (mirrors
+# SyntaxPalette::LOCH in src/theme.rs).
+syn_comment = "#6a7a78"
+syn_keyword = "#c3a6f2"
+syn_string = "#a9d18e"
+syn_constant = "#f2a072"
+syn_function = "#7cc4e8"
+syn_type = "#e8cc8c"
+syn_tag = "#f08c8c"
+syn_fg = "#d3d9d8"
 
 # --- Ten dark themes inspired by popular editors (VS Code, Zed, Neovim,
 # PyCharm). Each carries its editor's real code palette via the `syn_*` fields

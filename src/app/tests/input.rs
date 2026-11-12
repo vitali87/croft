@@ -456,8 +456,8 @@ fn screencast_mode_shows_the_keys_and_names_what_the_palette_ran() {
     app.handle_key(key(KeyCode::F(8), KeyModifiers::SHIFT))
         .unwrap();
     assert!(app.screencast.is_on(), "{}", app.status);
-    assert!(run_from_palette(&mut app, "View: Toggle Zen Mode"));
-    let screen = screen_text_863(&mut app, 120, 30);
+    assert!(run_palette_row_titled(&mut app, "View: Toggle Zen Mode"));
+    let screen = draw_screen(&mut app, 120, 30);
     assert!(
         screen.contains(" View: Toggle Zen Mode   Enter  View: Toggle Zen Mode"),
         "the query typed, then Enter and what it ran:\n{screen}"
@@ -469,7 +469,7 @@ fn screencast_mode_shows_the_keys_and_names_what_the_palette_ran() {
     let now = std::time::Instant::now();
     assert!(!app.screencast.expire(now));
     assert!(app.screencast.expire(now + screencast::LINGER));
-    assert!(!screen_text_863(&mut app, 120, 30).contains("Enter  View"));
+    assert!(!draw_screen(&mut app, 120, 30).contains("Enter  View"));
     app.handle_key(key(KeyCode::F(8), KeyModifiers::SHIFT))
         .unwrap();
     assert!(!app.screencast.is_on());
@@ -920,7 +920,7 @@ fn clicking_an_annotated_span_still_clears_the_click_selection() {
     // Anchor the note to the grid line the text actually landed on and aim
     // the click at that same line, rather than assuming both are row 0.
     let line = app.terminals[0]
-        .find_captured_line("annotated words here")
+        .find_captured_line("annotated words here", None)
         .expect("the fed text is on the grid");
     assert!(
         line >= 0,

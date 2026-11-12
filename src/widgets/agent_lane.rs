@@ -17,7 +17,6 @@ use ratatui::{
 
 use crate::theme::Theme;
 
-const COLOR_HEADER: Color = Color::Rgb(0xE8, 0xEE, 0xF8);
 const COLOR_DIM: Color = Color::Rgb(0x60, 0x68, 0x78);
 const COLOR_FILE: Color = Color::Rgb(0xCC, 0xCC, 0xCC);
 const COLOR_AGENT: Color = Color::Rgb(0x8f, 0xd9, 0xcf);
@@ -202,11 +201,6 @@ impl Widget for &mut AgentLanePanel {
             width: inner.width.saturating_sub(CONTENT_INDENT),
             ..inner
         };
-        let chevron = if self.collapsed {
-            crate::icons::CHEVRON_CLOSED
-        } else {
-            crate::icons::CHEVRON_OPEN
-        };
         let total: usize = self
             .rows
             .iter()
@@ -215,32 +209,29 @@ impl Widget for &mut AgentLanePanel {
                 LaneRow::File { .. } => 0,
             })
             .sum();
-        let mut header = vec![
-            Span::styled(
-                format!("{chevron} "),
-                Style::default().fg(self.theme.ui(COLOR_DIM)),
-            ),
-            Span::styled(
-                "AGENT LANE",
-                Style::default()
-                    .fg(self.theme.ui(COLOR_HEADER))
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ];
+        // The unreviewed count is something to act on, so it keeps its
+        // amber after the label.
+        let mut tail = Vec::new();
         if total > 0 {
-            header.push(Span::styled(
+            tail.push(Span::styled(
                 format!("  {total}"),
                 Style::default().fg(self.theme.ui(COLOR_DOT)),
             ));
         }
-        Paragraph::new(Line::from(header)).render(
-            Rect {
-                x: inner.x,
-                y: inner.y,
-                width: inner.width,
-                height: 1,
-            },
+        let header_row = Rect {
+            x: inner.x,
+            y: inner.y,
+            width: inner.width,
+            height: 1,
+        };
+        crate::widgets::surface::paint_section_header(
             buf,
+            header_row,
+            self.theme,
+            !self.collapsed,
+            "AGENT LANE",
+            tail,
+            crate::widgets::hover::contains(header_row, self.hover_pointer),
         );
         self.last_header_row = inner.y;
         self.last_header_x = inner.x;
@@ -287,11 +278,10 @@ impl Widget for &mut AgentLanePanel {
             }
             let line = match &rows[self.scroll + i] {
                 LaneRow::Agent { name, unreviewed } => {
-                    let fold = if self.collapsed_agents.contains(name) {
-                        crate::icons::CHEVRON_CLOSED
-                    } else {
-                        crate::icons::CHEVRON_OPEN
-                    };
+                    let fold = crate::widgets::surface::chevron(
+                        self.theme,
+                        !self.collapsed_agents.contains(name),
+                    );
                     let mut spans = vec![Span::styled(
                         format!("{fold} \u{25c6} {name}"),
                         Style::default()

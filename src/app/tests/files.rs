@@ -1297,7 +1297,7 @@ fn save_all_does_not_quit_while_an_untitled_buffer_holds_text() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.focus_pane(Pane::Editor);
-    type_into_editor(&mut app, "note");
+    type_keys(&mut app, "note");
     assert!(app.editor.path.is_none() && app.editor.dirty, "setup");
     press_ctrl_q(&mut app);
     app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
@@ -1425,7 +1425,7 @@ fn app_with_edited_search_editor(tmp: &std::path::Path, query: &str) -> (App, St
     app.search.query = query.to_string();
     app.run_command(crate::widgets::command_palette::Command::OpenSearchEditor);
     app.focus_pane(Pane::Editor);
-    type_into_editor(&mut app, "x");
+    type_keys(&mut app, "x");
     assert!(app.editor.scratch && app.editor.dirty, "setup");
     (app, format!("Search: {query}"))
 }
@@ -1463,7 +1463,7 @@ fn ctrl_s_on_a_scratch_tab_writes_no_file_and_points_to_save_as() {
         app.status
     );
     assert_eq!(app.editor.path.as_deref(), Some(kept.as_path()));
-    type_into_editor(&mut app, "y");
+    type_keys(&mut app, "y");
     app.handle_key(ctrl_s).unwrap();
     assert!(!app.editor.dirty, "the file now saves: {}", app.status);
 }
@@ -1476,12 +1476,12 @@ fn auto_save_writes_the_files_but_never_a_scratch_tab() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = app_with_open_file(tmp.path(), "a.txt", "hello");
     app.auto_save = true;
-    type_into_editor(&mut app, "x");
+    type_keys(&mut app, "x");
     let label = "commit 951a5e7";
     app.editor
         .open_text_buffer(std::path::Path::new(label), "commit 951a5e7\n")
         .unwrap();
-    type_into_editor(&mut app, "y");
+    type_keys(&mut app, "y");
     assert!(app.editor.scratch && app.editor.dirty, "setup");
     app.editor.editors.iter_mut().for_each(age_last_edit);
     assert!(app.tick_auto_save(), "a.txt is due");
@@ -1528,7 +1528,7 @@ fn save_all_and_commit_commits_the_text_in_the_tab() {
     assert!(app.pending_unsaved_scm.is_none());
     assert!(!app.editor.dirty, "the tab was saved");
     assert_eq!(
-        git_out(tmp.path(), &["show", "HEAD:seed.txt"]),
+        git_stdout_untrimmed(tmp.path(), &["show", "HEAD:seed.txt"]),
         "edited changed\n"
     );
     assert_eq!(last_commit_message(tmp.path()), "bump seed\n\n");
@@ -1543,11 +1543,11 @@ fn save_all_and_stash_stashes_the_text_in_the_tab() {
     let pending = app.pending_unsaved_scm.as_ref().expect("the prompt opens");
     assert_eq!(pending.op, ScmWrite::Stash);
     assert_eq!(
-        git_out(tmp.path(), &["stash", "list"]),
+        git_stdout_untrimmed(tmp.path(), &["stash", "list"]),
         "",
         "nothing stashed yet"
     );
-    let rendered = screen_text_863(&mut app, 120, 40);
+    let rendered = draw_screen(&mut app, 120, 40);
     assert!(rendered.contains("Save All & Stash"), "{rendered}");
     app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE))
         .unwrap();
@@ -1556,11 +1556,11 @@ fn save_all_and_stash_stashes_the_text_in_the_tab() {
     // #1581: the stash asks for its name next, seeded with the message box.
     app.submit_input_prompt();
     assert_eq!(
-        git_out(tmp.path(), &["stash", "list", "--format=%gs"]),
+        git_stdout_untrimmed(tmp.path(), &["stash", "list", "--format=%gs"]),
         "On main: bump seed\n"
     );
     assert_eq!(
-        git_out(tmp.path(), &["show", "stash@{0}:seed.txt"]),
+        git_stdout_untrimmed(tmp.path(), &["show", "stash@{0}:seed.txt"]),
         "edited changed\n"
     );
     assert_eq!(
@@ -2410,7 +2410,7 @@ fn app_with_trailing_spaces_typed() -> (App, tempfile::TempDir) {
     let mut app = app_with_open_file(tmp.path(), "app.txt", "def f():\n    return 1\n");
     app.handle_key(key(KeyCode::End, KeyModifiers::NONE))
         .unwrap();
-    type_str(&mut app, "  # TODO   ");
+    type_keys(&mut app, "  # TODO   ");
     (app, tmp)
 }
 
@@ -3940,25 +3940,32 @@ fn the_view_socket_is_bound_before_the_first_pane_is_spawned() {
     // avoid for the cache dir. The repo already checks source-level properties
     // this way (`scripts/check_doc_ownership.py`). It is brittle to a rename,
     // and it fails loudly and says why, which is the trade being made.
-    let src = include_str!("../mod.rs");
-    let ctor = src
-        .find("pub fn new(root: PathBuf)")
+    let files = app_source_files();
+    let src = files
+        .iter()
+        .map(|(_, text)| text.as_str())
+        .find(|text| text.contains("pub fn new(root: PathBuf)"))
         .expect("App::new must exist for this guard to mean anything");
-    // Bounded to App::new's own body. Slicing to the end of the file let two
-    // plausible edits satisfy the guard while inverting the runtime order:
-    // extracting the pane spawn into a helper defined BELOW App::new (the
-    // marker's offset then jumps past the bind's), or a doc comment naming
-    // `Self::bind_view_socket()` somewhere above a later spawn.
+    let ctor = src.find("pub fn new(root: PathBuf)").unwrap();
+    // Bounded to App::new's own body, which ends at the method's closing
+    // brace. Slicing to the end of the file let two plausible edits satisfy
+    // the guard while inverting the runtime order: extracting the pane spawn
+    // into a helper defined BELOW App::new (the marker's offset then jumps
+    // past the bind's), or a doc comment naming `Self::bind_view_socket()`
+    // somewhere above a later spawn.
     let end = src[ctor..]
-        .find("\n    pub fn ")
+        .find("\n    }\n")
         .map(|i| ctor + i)
-        .unwrap_or(src.len());
+        .expect("App::new's body must end in its closing brace");
     let body = &src[ctor..end];
-    // And each marker must be unique in the file, so a second occurrence
-    // cannot silently be the one measured.
+    // And each marker must be unique in the app's source, so a second
+    // occurrence cannot silently be the one measured.
     for marker in ["Self::bind_view_socket()", "PtyTerminal::new(&root)"] {
         assert_eq!(
-            src.matches(marker).count(),
+            files
+                .iter()
+                .map(|(_, text)| text.matches(marker).count())
+                .sum::<usize>(),
             1,
             "{marker} must appear exactly once, or this guard measures whichever \
              copy comes first rather than the one that runs"
@@ -4672,7 +4679,7 @@ fn clicking_save_all_on_the_open_editors_header_saves_every_dirty_tab() {
     app.open_editors.collapsed = false;
     app.sidebar_view = SidebarView::Explorer;
     app.show_tree = true;
-    let buf = render_buffer_852(&mut app, 120, 40);
+    let buf = draw_buffer(&mut app, 120, 40);
     let hdr = app.open_editors.last_area;
     assert!(hdr.height > 0, "OPEN EDITORS is on screen");
     let save_all_x = (hdr.x..hdr.x + hdr.width)

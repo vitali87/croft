@@ -467,6 +467,56 @@ fn clicking_a_problem_row_opens_that_file_at_the_line() {
     assert_eq!(app.editor.cursor_row, 2, "and jumps to the diagnostic line");
 }
 
+/// #1523: the places a server points at to explain a diagnostic are rows
+/// under it, the file named relative to the workspace, and a click on one
+/// opens that place with its UTF-16 column converted (the emoji is two
+/// units, one character).
+#[test]
+fn clicking_a_related_location_row_opens_that_place() {
+    let tmp = tempfile::tempdir().unwrap();
+    let main = tmp.path().join("src/main.rs");
+    let lib = tmp.path().join("src/lib.rs");
+    std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+    std::fs::write(&main, "fn main() {}\n").unwrap();
+    std::fs::write(&lib, "fn a() {}\nlet s = \"😀\"; let first = &v[0];\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let wire = lsp_types::Diagnostic {
+        message: "cannot borrow `v` as mutable".into(),
+        related_information: Some(vec![lsp_types::DiagnosticRelatedInformation {
+            location: lsp_types::Location {
+                uri: lsp_types::Url::from_file_path(&lib).unwrap(),
+                range: lsp_types::Range::new(
+                    lsp_types::Position::new(1, 27),
+                    lsp_types::Position::new(1, 28),
+                ),
+            },
+            message: "immutable borrow occurs here".into(),
+        }]),
+        ..Default::default()
+    };
+    let d = crate::lsp::client::convert_diagnostic("rust-analyzer", &wire);
+    let by_server = std::collections::HashMap::from([(String::from("rust-analyzer"), vec![d])]);
+    app.lsp_diagnostics.insert(main, by_server);
+    app.rebuild_problems();
+    assert_eq!(
+        app.problems.groups()[0].items[0].related[0].rel_path,
+        "src/lib.rs"
+    );
+    app.bottom_panel_tab = BottomPanelTab::Problems;
+    let backend = ratatui::backend::TestBackend::new(140, 50);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    // Row 0 is the toolbar, 1 the file, 2 the diagnostic, 3 its related row.
+    let list = app.problems.last_area;
+    left_click(&mut app, list.x + 10, list.y + 3);
+    assert_eq!(app.editor.path.as_deref(), Some(lib.as_path()));
+    assert_eq!(
+        (app.editor.cursor_row, app.editor.cursor_col),
+        (1, 26),
+        "on the `v` the borrow takes"
+    );
+}
+
 /// #1522: unused names and unreachable code come as hints; like VS Code,
 /// the PROBLEMS list and its count leave them out, while the editor (its
 /// hover and quick fixes) still has them.
@@ -552,6 +602,8 @@ fn the_problems_count_paints_an_orange_pill_in_the_tab_strip() {
     use crate::lsp::manager::DiagnosticSeverity;
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // The boxed brand theme's pill; Croft Loch's tinted chip is below.
+    app.apply_theme(crate::theme::Theme::BLACK);
     let a = tmp.path().join("a.rs");
     let mut s1 = std::collections::HashMap::new();
     s1.insert(
@@ -574,6 +626,46 @@ fn the_problems_count_paints_an_orange_pill_in_the_tab_strip() {
     let cap_r = (strip.x..strip.x + strip.width)
         .any(|x| buf[(x, strip.y)].symbol() == "\u{e0b4}" && buf[(x, strip.y)].fg == orange);
     assert!(cap_r, "the pill has a rounded orange right cap");
+}
+
+/// Croft Loch's PROBLEMS count is a tinted chip, red while there are
+/// errors, with no Powerline caps and no brand orange, as wide as the
+/// boxed pill so the tab's hit rect is unchanged.
+#[test]
+fn croft_loch_problems_count_is_a_tinted_chip_without_caps() {
+    use crate::lsp::manager::DiagnosticSeverity;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let t = crate::widgets::surface::tones(app.theme).expect("Croft Loch is the default");
+    let a = tmp.path().join("a.rs");
+    let mut s1 = std::collections::HashMap::new();
+    s1.insert(
+        String::from("rustc"),
+        vec![diag(0, 1, DiagnosticSeverity::Error)],
+    );
+    app.lsp_diagnostics.insert(a, s1);
+    app.rebuild_problems();
+    let backend = ratatui::backend::TestBackend::new(140, 50);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let buf = term.backend().buffer();
+    let tab = app.problems_tab_rect;
+    let cells: Vec<_> = (tab.x..tab.right()).map(|x| &buf[(x, tab.y)]).collect();
+    let text: String = cells.iter().map(|c| c.symbol()).collect();
+    assert!(text.ends_with(" 1 "), "{text:?}");
+    let orange = crate::gradient::rgb_color(crate::gradient::GRAD_TR);
+    assert!(
+        cells
+            .iter()
+            .all(|c| !matches!(c.symbol(), "\u{e0b6}" | "\u{e0b4}") && c.bg != orange),
+        "no Powerline caps, no orange: {text:?}"
+    );
+    let digit = cells[cells.len() - 2];
+    let red = (0xe5, 0x53, 0x4b);
+    let fill = crate::gradient::rgb_color(crate::gradient::lerp_rgb(t.chrome, red, 0.22));
+    assert_eq!(digit.bg, fill, "the chip is red laid into the chrome");
+    assert_eq!(cells[cells.len() - 1].bg, fill, "padded both sides");
+    assert_ne!(digit.fg, digit.bg);
 }
 
 #[test]
@@ -1186,6 +1278,7 @@ fn problem(
         message: message.into(),
         source: "ruff".into(),
         code: None,
+        related: Vec::new(),
     }
 }
 
@@ -1343,6 +1436,7 @@ fn seed_build_rows(app: &mut App, rows: &[(&std::path::Path, u32, u32, &str)]) {
                     message: (*msg).to_string(),
                     source: String::from("build"),
                     code: None,
+                    related: Vec::new(),
                 },
             ));
     }
@@ -1476,6 +1570,7 @@ fn go_to_next_problem_visits_every_entry_once_around_mixed_columns() {
                 message: msg.to_string(),
                 source: String::from("build"),
                 code: None,
+                related: Vec::new(),
             },
         )
     };

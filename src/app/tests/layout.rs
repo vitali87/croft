@@ -584,7 +584,7 @@ fn the_status_bar_names_the_operation_in_progress() {
     let p = tmp.path();
     assert!(!git_succeeds(p, &["merge", "feat"]));
     let status = crate::git::query(p);
-    let text: String = git_status_spans(&status)
+    let text: String = git_status_spans(&status, crate::theme::Theme::default())
         .iter()
         .map(|s| s.content.to_string())
         .collect();
@@ -593,7 +593,7 @@ fn the_status_bar_names_the_operation_in_progress() {
     assert!(git_succeeds(p, &["checkout", "-q", "feat"]));
     assert!(!git_succeeds(p, &["rebase", "main"]));
     let status = crate::git::query(p);
-    let text: String = git_status_spans(&status)
+    let text: String = git_status_spans(&status, crate::theme::Theme::default())
         .iter()
         .map(|s| s.content.to_string())
         .collect();
@@ -683,6 +683,53 @@ fn the_selected_activity_icon_is_visible_on_the_light_theme() {
         selected.fg, selected.bg,
         "the selected glyph must not be painted in the bar's own background"
     );
+}
+
+/// Croft Loch's activity bar recedes: icons rest muted, a hovered one lifts
+/// to body text, the selected one is the strong ink beside the accent pill,
+/// no glyph is bold, and a count badge is a tint of the accent rather than a
+/// hard teal block.
+#[test]
+fn croft_loch_activity_icons_rest_muted_hover_to_text_and_tint_their_badge() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (mut app, _) = app_with_unsaved_file(tmp.path());
+    let t = crate::widgets::surface::tones(app.theme).expect("Croft Loch is the default");
+    let backend = ratatui::backend::TestBackend::new(120, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|frame| app.render(frame)).unwrap();
+    let search = app.sidebar_areas.search_icon;
+    app.handle_mouse(crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::Moved,
+        column: search.x + 1,
+        row: search.y,
+        modifiers: KeyModifiers::NONE,
+    });
+    term.draw(|frame| app.render(frame)).unwrap();
+    let buf = term.backend().buffer();
+    let cell_of = |glyph: char| {
+        (0..40u16)
+            .flat_map(|y| (0..4u16).map(move |x| (x, y)))
+            .find(|&(x, y)| buf[(x, y)].symbol() == glyph.to_string())
+            .map(|(x, y)| ((x, y), buf[(x, y)].clone()))
+            .unwrap_or_else(|| panic!("the activity bar must paint {glyph:?}"))
+    };
+    let ((ex, ey), selected) = cell_of(crate::icons::ACTIVITY_EXPLORER);
+    let (_, hovered) = cell_of(crate::icons::ACTIVITY_SEARCH);
+    let (_, resting) = cell_of(crate::icons::ACTIVITY_EXTENSIONS);
+    assert_eq!(selected.fg, t.strong());
+    assert_eq!(hovered.fg, t.text());
+    assert_eq!(resting.fg, t.muted());
+    for cell in [&selected, &hovered, &resting] {
+        assert!(!cell.modifier.contains(Modifier::BOLD), "no bold glyphs");
+    }
+    let pill = &buf[(0, ey)];
+    assert_eq!((pill.symbol(), pill.fg), ("\u{258e}", t.accent()));
+    // The Explorer's unsaved count rides its slot's bottom-right cell.
+    let badge = &buf[(ex + 1, ey + 1)];
+    assert_eq!(badge.symbol(), "1");
+    let fill = crate::gradient::rgb_color(crate::gradient::lerp_rgb(t.chrome, t.accent, 0.22));
+    assert_eq!(badge.bg, fill, "a tint of the accent, not the accent");
+    assert!(!badge.modifier.contains(Modifier::BOLD));
 }
 
 /// Croft Loch paints the workbench as surfaces on exactly the layout every
@@ -1226,6 +1273,129 @@ fn the_active_panel_tab_is_underlined() {
     );
 }
 
+/// Croft Loch's panel tabs take three steps: the active title in the strong
+/// ink with the accent underline and no bold, a hovered title in body text
+/// (not the active ink), the rest muted; and the first title's word starts
+/// on the terminal's first text column.
+#[test]
+fn croft_loch_panel_tabs_step_from_muted_to_text_to_strong() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let t = crate::widgets::surface::tones(app.theme).expect("Croft Loch is the default");
+    let backend = ratatui::backend::TestBackend::new(140, 50);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let out = app.output_tab_rect;
+    app.handle_mouse(crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::Moved,
+        column: out.x + 2,
+        row: out.y,
+        modifiers: KeyModifiers::NONE,
+    });
+    term.draw(|f| app.render(f)).unwrap();
+    let buf = term.backend().buffer();
+    let word = |r: ratatui::layout::Rect| {
+        (r.x..r.right())
+            .map(|x| &buf[(x, r.y)])
+            .find(|c| c.symbol() != " ")
+            .unwrap()
+            .clone()
+    };
+    let active = word(app.terminal_tab_rect);
+    assert_eq!(active.fg, t.strong());
+    assert!(!active.modifier.contains(Modifier::BOLD));
+    assert!(active.modifier.contains(Modifier::UNDERLINED));
+    assert_eq!(active.underline_color, t.accent());
+    assert_eq!(word(app.output_tab_rect).fg, t.text(), "hover is body text");
+    assert_eq!(word(app.ports_tab_rect).fg, t.muted());
+    let first = app.problems_tab_rect;
+    assert_eq!(buf[(first.x, first.y)].symbol(), "P", "no leading pad");
+    let inner = app.terminals[0].last_inner;
+    assert_eq!(first.x, inner.x, "the first title lines up with the shell");
+}
+
+/// Croft Loch: behind an open Command Palette the active panel tab's accent
+/// underline sinks with the rest of the backdrop, so the card's lip and its
+/// selection bar are the only full-strength accent on screen.
+#[test]
+fn croft_loch_palette_scrim_sinks_the_active_tabs_underline() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let t = crate::widgets::surface::tones(app.theme).expect("Croft Loch is the default");
+    let backend = ratatui::backend::TestBackend::new(140, 50);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    app.open_command_palette();
+    // A query that leaves a short card, so the panel's tab strip is
+    // clear of it and only the scrim lies over the tab.
+    app.command_palette
+        .as_mut()
+        .unwrap()
+        .set_query("toggle terminal");
+    term.draw(|f| app.render(f)).unwrap();
+    let card = app.command_palette.as_ref().unwrap().last_rect;
+    let tab = app.terminal_tab_rect;
+    assert!(
+        card.intersection(tab).is_empty(),
+        "the tab is behind the scrim: {card:?} / {tab:?}"
+    );
+    let buf = term.backend().buffer();
+    let word = (tab.x..tab.right())
+        .map(|x| &buf[(x, tab.y)])
+        .find(|c| c.symbol() != " ")
+        .unwrap();
+    assert!(word.modifier.contains(Modifier::UNDERLINED));
+    assert_ne!(word.underline_color, t.accent(), "no full-strength teal");
+    let ratatui::style::Color::Rgb(r, g, b) = word.bg else {
+        panic!("the scrim leaves an RGB fill: {:?}", word.bg);
+    };
+    let sunk = crate::gradient::lerp_rgb(t.accent, (r, g, b), 0.58);
+    assert_eq!(
+        word.underline_color,
+        crate::gradient::rgb_color(sunk),
+        "the underline sinks as far as the title's ink does"
+    );
+}
+
+/// Croft Loch gives every panel pane a top edge: the terminal and the views
+/// that share the panel draw a hairline under the tab strip, and the accent
+/// lip while the panel has the keyboard.
+#[test]
+fn croft_loch_panel_panes_draw_a_hairline_or_the_lip_on_their_top_edge() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let t = crate::widgets::surface::tones(app.theme).expect("Croft Loch is the default");
+    app.focus_pane(Pane::Editor);
+    let backend = ratatui::backend::TestBackend::new(140, 50);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let pane = app.terminals[0].last_area;
+    let top = |term: &ratatui::Terminal<ratatui::backend::TestBackend>, x: u16, y: u16| {
+        let c = &term.backend().buffer()[(x, y)];
+        (c.symbol().to_string(), c.fg)
+    };
+    assert_eq!(
+        top(&term, pane.x + 4, pane.y),
+        ("\u{2594}".to_string(), t.hairline()),
+        "an unfocused pane's top edge is the hairline"
+    );
+    app.focus_pane(Pane::Terminal);
+    term.draw(|f| app.render(f)).unwrap();
+    assert_eq!(
+        top(&term, pane.x, pane.y),
+        ("\u{2594}".to_string(), t.accent()),
+        "the focused pane's lip starts in the accent"
+    );
+    app.set_bottom_panel_tab(BottomPanelTab::Problems);
+    app.focus_pane(Pane::Editor);
+    term.draw(|f| app.render(f)).unwrap();
+    let view = app.problems.last_area;
+    assert_eq!(
+        top(&term, view.x, view.y),
+        ("\u{2594}".to_string(), t.hairline()),
+        "PROBLEMS draws the same edge"
+    );
+}
+
 #[test]
 fn osk_auto_shows_on_terminal_tap_and_only_when_armed() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1666,6 +1836,35 @@ fn status_message_with_wide_chars_keeps_its_tail_beside_the_cluster() {
     );
 }
 
+/// The status bar's left cap names the workspace folder, and every click
+/// target after it is placed by counting cells: a double-width name
+/// (`项目`, four cells for two chars) must not shift the problem counts'
+/// target left of the counts it opens.
+#[test]
+fn a_wide_workspace_name_keeps_the_status_bar_targets_under_their_text() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("\u{9879}\u{76ee}");
+    std::fs::create_dir(&root).unwrap();
+    let mut app = App::new(root).unwrap();
+    let backend = ratatui::backend::TestBackend::new(120, 30);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let buf = term.backend().buffer().clone();
+    let y = buf.area.height - 1;
+    let glyph_x = (0..buf.area.width)
+        .find(|&x| buf[(x, y)].symbol() == "\u{ea87}")
+        .expect("the error count's glyph is on the bar");
+    // A wide char's second cell reads as a blank in the buffer.
+    let row = status_row(&term);
+    assert!(
+        row.contains("\u{9879} \u{76ee} "),
+        "the cap names the folder: {row:?}"
+    );
+    // The counts' target opens on the space before the glyph.
+    assert_eq!(app.status_diag_rect.x + 1, glyph_x);
+    assert_eq!(app.status_diag_rect.y, y);
+}
+
 /// #925: a message of several lines (git's text, a tool's error) is drawn
 /// with a space where each line break or tab was; drawn as is, they were
 /// dropped and the words either side ran together.
@@ -2018,13 +2217,6 @@ fn zen_mode_hides_all_chrome_then_restores_the_snapshot() {
     assert!(app.status_bar_visible);
 }
 
-/// A 200-column frame with `app` drawn into it, and its text (#1585).
-fn draw_wide(app: &mut App, w: u16) -> String {
-    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, 30)).unwrap();
-    term.draw(|f| app.render(f)).unwrap();
-    screen_text(&term)
-}
-
 /// The editor as last drawn, `(x, width)` (#1585): its text and the
 /// minimap strip carved from its right edge. Centered Layout centres the
 /// two together, as VS Code centres an editor with its minimap.
@@ -2045,7 +2237,7 @@ fn editor_column(app: &App) -> (u16, u16) {
 fn zen_mode_centres_the_editor_in_a_wide_window() {
     let (_tmp, mut app) = zen_app();
     app.toggle_zen_mode();
-    draw_wide(&mut app, 200);
+    draw_screen(&mut app, 200, 30);
     assert!(app.minimap_visible && app.minimap_room, "the minimap shows");
     assert_eq!(
         editor_column(&app),
@@ -2054,12 +2246,12 @@ fn zen_mode_centres_the_editor_in_a_wide_window() {
         app.editor.last_full_area
     );
     app.toggle_minimap();
-    draw_wide(&mut app, 200);
+    draw_screen(&mut app, 200, 30);
     let area = app.editor.last_full_area;
     assert_eq!((area.x, area.width), (40, 120), "{area:?}");
     app.toggle_minimap();
     app.toggle_zen_mode();
-    draw_wide(&mut app, 200);
+    draw_screen(&mut app, 200, 30);
     assert!(
         editor_column(&app).1 > 120,
         "out of Zen the editor fills its column again: {:?}",
@@ -2078,7 +2270,7 @@ fn toggle_centered_layout_centres_outside_zen_and_uncentres_zen() {
     app.run_command(crate::widgets::command_palette::Command::ToggleCenteredLayout);
     assert!(app.centered_layout);
     assert_eq!(app.status, "Centered Layout on");
-    draw_wide(&mut app, 200);
+    draw_screen(&mut app, 200, 30);
     assert_eq!(editor_column(&app), (40, 120));
     app.run_command(crate::widgets::command_palette::Command::ToggleCenteredLayout);
     assert!(!app.centered_layout);
@@ -2087,7 +2279,7 @@ fn toggle_centered_layout_centres_outside_zen_and_uncentres_zen() {
     assert!(app.centered_layout_active(), "Zen starts centred");
     app.run_command(crate::widgets::command_palette::Command::ToggleCenteredLayout);
     assert!(!app.centered_layout_active() && !app.centered_layout);
-    draw_wide(&mut app, 200);
+    draw_screen(&mut app, 200, 30);
     assert_eq!(editor_column(&app), (0, 200));
     let rows = app.customize_layout_items();
     assert!(
@@ -2102,12 +2294,12 @@ fn toggle_centered_layout_centres_outside_zen_and_uncentres_zen() {
 fn a_narrow_window_or_zen_without_centring_keeps_the_full_width() {
     let (_tmp, mut app) = zen_app();
     app.toggle_zen_mode();
-    draw_wide(&mut app, 110);
+    draw_screen(&mut app, 110, 30);
     assert_eq!(editor_column(&app), (0, 110));
     app.toggle_zen_mode();
     app.zen_center_layout = false;
     app.toggle_zen_mode();
-    draw_wide(&mut app, 200);
+    draw_screen(&mut app, 200, 30);
     assert_eq!(editor_column(&app), (0, 200));
     assert_eq!(
         centered_editor_rect(Rect::new(5, 1, 50, 9), 0),
@@ -2146,12 +2338,12 @@ fn esc_esc_leaves_zen_mode_and_restores_the_chrome() {
 #[test]
 fn entering_zen_says_how_to_leave_it_for_a_while() {
     let (_tmp, mut app) = zen_app();
-    assert!(!draw_wide(&mut app, 120).contains("Esc Esc to exit"));
+    assert!(!draw_screen(&mut app, 120, 30).contains("Esc Esc to exit"));
     app.toggle_zen_mode();
-    assert!(draw_wide(&mut app, 120).contains(zen_hint_text()));
+    assert!(draw_screen(&mut app, 120, 30).contains(zen_hint_text()));
     assert!(!app.expire_zen_hint(std::time::Instant::now()), "not yet");
     assert!(app.expire_zen_hint(std::time::Instant::now() + ZEN_HINT_FOR));
-    assert!(!draw_wide(&mut app, 120).contains("Esc Esc to exit"));
+    assert!(!draw_screen(&mut app, 120, 30).contains("Esc Esc to exit"));
     app.toggle_zen_mode();
     app.toggle_zen_mode();
     app.toggle_zen_mode();
@@ -2561,19 +2753,8 @@ fn a_failed_spawner_releases_the_lock_so_another_window_can_host() {
 fn status_elision_never_fires_on_a_message_that_fits() {
     let tmp = tempfile::tempdir().unwrap();
     // A git repo puts the branch segment in the bar, like any real session.
-    let git = |args: &[&str]| {
-        std::process::Command::new("git")
-            .arg("-C")
-            .arg(tmp.path())
-            .args(args)
-            .env("GIT_AUTHOR_NAME", "t")
-            .env("GIT_AUTHOR_EMAIL", "t@t")
-            .env("GIT_COMMITTER_NAME", "t")
-            .env("GIT_COMMITTER_EMAIL", "t@t")
-            .output()
-            .unwrap()
-    };
-    git(&["init", "-q", "-b", "main"]);
+    let git = |args: &[&str]| git_succeeds(tmp.path(), args);
+    git_init(tmp.path());
     std::fs::write(tmp.path().join("a.txt"), "x\n").unwrap();
     git(&["add", "-A"]);
     git(&["commit", "-qm", "init"]);
@@ -4068,7 +4249,7 @@ fn typing_customize_layout_in_the_palette_opens_the_popup() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     open_palette_852(&mut app);
-    type_keys_852(&mut app, "customize layout");
+    type_keys(&mut app, "customize layout");
     app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
         .unwrap();
     let menu = app

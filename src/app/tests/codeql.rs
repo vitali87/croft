@@ -21,18 +21,6 @@ fn a_finished_codeql_test_run_replaces_its_running_status_with_the_outcome() {
     );
 }
 
-fn screen_lower(term: &ratatui::Terminal<ratatui::backend::TestBackend>) -> String {
-    let buf = term.backend().buffer();
-    let mut all = String::new();
-    for y in 0..buf.area.height {
-        for x in 0..buf.area.width {
-            all.push_str(buf[(x, y)].symbol());
-        }
-        all.push('\n');
-    }
-    all.to_lowercase()
-}
-
 #[test]
 fn codeql_icon_sits_below_testing_and_opens_the_codeql_side_bar() {
     // #578: VS Code's CodeQL extension adds a QL entry to the activity bar;
@@ -54,7 +42,7 @@ fn codeql_icon_sits_below_testing_and_opens_the_codeql_side_bar() {
         left_click(&mut app, ql.x, ql.y);
         assert_eq!(app.sidebar_view, SidebarView::CodeQL);
         term.draw(|f| app.render(f)).unwrap();
-        let screen = screen_lower(&term);
+        let screen = screen_text(&term).to_lowercase();
         // The title sits on the side bar's top row, between the box's
         // dashes or, under a `surfaces` theme, on the focus rule.
         let side = app.last_sidebar_area.expect("the side bar is shown");
@@ -143,20 +131,6 @@ fn codeql_add_database_button_offers_the_four_sources_in_a_picker() {
     });
 }
 
-/// Paint `app` at 120 x 44 and find the first screen cell where `needle`
-/// starts.
-fn find_on_screen(app: &mut App, needle: &str) -> Option<(u16, u16)> {
-    let backend = ratatui::backend::TestBackend::new(120, 44);
-    let mut term = ratatui::Terminal::new(backend).unwrap();
-    term.draw(|f| app.render(f)).unwrap();
-    let buf = term.backend().buffer();
-    (0..44).find_map(|y| {
-        let text: String = (0..120).map(|x| buf[(x, y)].symbol()).collect();
-        let at = text.find(needle)?;
-        Some((text[..at].chars().count() as u16, y))
-    })
-}
-
 #[test]
 fn codeql_database_card_picker_switches_the_current_database() {
     // #578: the database card's name row offers the databases in a picker;
@@ -177,8 +151,11 @@ fn codeql_database_card_picker_switches_the_current_database() {
         }
         assert_eq!(app.codeql.current_db, Some(1));
         app.run_command(crate::widgets::command_palette::Command::CodeqlFocusSideBar);
-        assert!(find_on_screen(&mut app, "◆ gin-db").is_some(), "the card");
-        let (x, y) = find_on_screen(&mut app, "◆ gin-db").unwrap();
+        assert!(
+            draw_and_find(&mut app, 120, 44, "◆ gin-db").is_some(),
+            "the card"
+        );
+        let (x, y) = draw_and_find(&mut app, 120, 44, "◆ gin-db").unwrap();
         left_click(&mut app, x + 3, y);
         assert_eq!(
             app.codeql.selected_hit(),
@@ -203,9 +180,9 @@ fn codeql_database_card_picker_switches_the_current_database() {
             Some(0),
             "saved"
         );
-        assert!(find_on_screen(&mut app, "◆ flask-db").is_some());
+        assert!(draw_and_find(&mut app, 120, 44, "◆ flask-db").is_some());
         assert!(
-            find_on_screen(&mut app, "Python · ").is_some(),
+            draw_and_find(&mut app, 120, 44, "Python · ").is_some(),
             "the meta row names the language, then the size"
         );
         // Enter on the name row opens it too.
@@ -285,7 +262,7 @@ fn codeql_history_export_chip_reaches_the_export_prompt() {
         assert!(app.codeql.is_expanded(1));
         assert!(app.input_prompt.is_none() && app.list_picker.is_none());
         app.codeql.select_history(0);
-        let (x, y) = find_on_screen(&mut app, "↓ Export").expect("the chip");
+        let (x, y) = draw_and_find(&mut app, 120, 44, "↓ Export").expect("the chip");
         left_click(&mut app, x, y);
         let prompt = app.input_prompt.as_ref().expect("the export prompt");
         assert_eq!(
@@ -1808,10 +1785,7 @@ fn codeql_pack_commands_install_dependencies_and_download_packs() {
         assert_eq!(app.status, "Installed the dependencies of acme/rust");
 
         app.run_command(Command::CodeqlDownloadPacks);
-        for c in "codeql/java-queries codeql/python-all@1.0.0".chars() {
-            app.input_prompt.as_mut().unwrap().push_char(c);
-        }
-        app.submit_input_prompt();
+        append_and_submit_prompt(&mut app, "codeql/java-queries codeql/python-all@1.0.0");
         wait(&mut app);
         assert_eq!(
             app.status,
@@ -1828,10 +1802,7 @@ fn codeql_pack_commands_install_dependencies_and_download_packs() {
 
         app.codeql_program = fake_codeql(bin.path(), "", 1, "ERROR: no such pack");
         app.run_command(Command::CodeqlDownloadPacks);
-        for c in "acme/missing".chars() {
-            app.input_prompt.as_mut().unwrap().push_char(c);
-        }
-        app.submit_input_prompt();
+        append_and_submit_prompt(&mut app, "acme/missing");
         wait(&mut app);
         assert_eq!(
             app.status,
@@ -5259,11 +5230,6 @@ fn creating_a_codeql_query_writes_opens_and_lists_it_in_the_selected_pack() {
         let press = |app: &mut App, code: KeyCode| {
             app.handle_key(key(code, KeyModifiers::NONE)).unwrap();
         };
-        let type_str = |app: &mut App, text: &str| {
-            for c in text.chars() {
-                press(app, KeyCode::Char(c));
-            }
-        };
         let tmp = tempfile::tempdir().unwrap();
         let pack = tmp.path().join("pack");
         std::fs::create_dir_all(&pack).unwrap();
@@ -5295,7 +5261,7 @@ fn creating_a_codeql_query_writes_opens_and_lists_it_in_the_selected_pack() {
             }
         );
         assert!(prompt.title.contains("acme/go"), "{}", prompt.title);
-        type_str(&mut app, "find-calls");
+        type_keys(&mut app, "find-calls");
         press(&mut app, KeyCode::Enter);
         let created = pack.join("find-calls.ql");
         let text = std::fs::read_to_string(&created).expect("written");
@@ -5311,7 +5277,7 @@ fn creating_a_codeql_query_writes_opens_and_lists_it_in_the_selected_pack() {
         app.set_sidebar_view(SidebarView::CodeQL);
         app.focus = Pane::Tree;
         press(&mut app, KeyCode::Char('n'));
-        type_str(&mut app, "find-calls.ql");
+        type_keys(&mut app, "find-calls.ql");
         press(&mut app, KeyCode::Enter);
         assert!(app.status.contains("already exists"), "{}", app.status);
         assert_eq!(std::fs::read_to_string(&created).unwrap(), text);
@@ -5343,7 +5309,7 @@ fn creating_a_codeql_query_writes_opens_and_lists_it_in_the_selected_pack() {
             Some(Hit::Action(Action::CreateQuery))
         );
         press(&mut app, KeyCode::Enter);
-        type_str(&mut app, "hello");
+        type_keys(&mut app, "hello");
         press(&mut app, KeyCode::Enter);
         let created = empty.path().join("hello.ql");
         assert!(
@@ -5771,10 +5737,7 @@ fn codeql_variant_analysis_repositories_are_set_up_from_the_side_bar_and_palette
             app.handle_key(key(code, KeyModifiers::NONE)).unwrap();
         };
         let type_in = |app: &mut App, text: &str| {
-            for c in text.chars() {
-                app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
-                    .unwrap();
-            }
+            type_keys(app, text);
             app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
                 .unwrap();
         };
@@ -6499,10 +6462,7 @@ esac
             app.handle_key(key(code, KeyModifiers::NONE)).unwrap();
         };
         let type_in = |app: &mut App, text: &str| {
-            for c in text.chars() {
-                app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
-                    .unwrap();
-            }
+            type_keys(app, text);
             app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
                 .unwrap();
         };

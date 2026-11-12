@@ -18,7 +18,6 @@ use ratatui::{
 use crate::theme::Theme;
 use crate::widgets::scrollbar;
 
-const COLOR_HEADER: Color = Color::Rgb(0xE8, 0xEE, 0xF8);
 const COLOR_DIM: Color = Color::Rgb(0x60, 0x68, 0x78);
 const COLOR_NAME: Color = Color::Rgb(0xCC, 0xCC, 0xCC);
 const COLOR_DIRTY: Color = Color::Rgb(0xE2, 0xC0, 0x8D);
@@ -214,13 +213,11 @@ impl Widget for &mut OpenEditorsPanel {
             ..inner
         };
 
-        let chevron = if self.collapsed {
-            crate::icons::CHEVRON_CLOSED
-        } else {
-            crate::icons::CHEVRON_OPEN
-        };
         let header_y = inner.y;
-        let chevron = format!("{chevron} ");
+        let chevron = format!(
+            "{} ",
+            crate::widgets::surface::chevron(self.theme, !self.collapsed)
+        );
         const TITLE: &str = "OPEN EDITORS";
         // The header's own text, measured in cells, so the Save All action
         // below clears it whatever the chevron glyph or title become.
@@ -228,23 +225,20 @@ impl Widget for &mut OpenEditorsPanel {
             use unicode_width::UnicodeWidthStr;
             u16::try_from(chevron.width() + TITLE.width()).unwrap_or(u16::MAX)
         };
-        Paragraph::new(Line::from(vec![
-            Span::styled(chevron, Style::default().fg(self.theme.ui(COLOR_DIM))),
-            Span::styled(
-                TITLE,
-                Style::default()
-                    .fg(self.theme.ui(COLOR_HEADER))
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]))
-        .render(
-            Rect {
-                x: inner.x,
-                y: header_y,
-                width: inner.width,
-                height: 1,
-            },
+        let header_row = Rect {
+            x: inner.x,
+            y: header_y,
+            width: inner.width,
+            height: 1,
+        };
+        crate::widgets::surface::paint_section_header(
             buf,
+            header_row,
+            self.theme,
+            !self.collapsed,
+            TITLE,
+            Vec::new(),
+            crate::widgets::hover::contains(header_row, self.hover_pointer),
         );
         self.last_header_row = header_y;
         self.last_header_x = inner.x;
@@ -372,7 +366,7 @@ impl Widget for &mut OpenEditorsPanel {
 
         if let Some(metrics) = bar {
             self.last_scrollbar = metrics.area;
-            scrollbar::render_vertical(buf, metrics, self.focused, self.theme);
+            scrollbar::render_vertical_on_chrome(buf, metrics, self.focused, self.theme);
         }
     }
 }

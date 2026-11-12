@@ -87,6 +87,10 @@ pub struct MarkdownPreview {
     pub scroll_to_source: Option<usize>,
     /// What a click or Ctrl+click can follow (#931).
     pub links: MdLinks,
+    /// Open Preview to the Side (#1605): the `(edit_seq, undo_step_id)` of
+    /// the source pane this view was last built from, when it shows another
+    /// pane's text rather than its own buffer's. `None` = its own buffer.
+    pub follows: Option<(u64, u64)>,
 }
 
 impl MarkdownPreview {
@@ -1067,7 +1071,7 @@ fn link_of(fg: Color) -> Option<usize> {
 /// Convert one highlighted source line into owned spans, filling unstyled
 /// gaps with `code_fg` — the theme's code foreground, never the Base16
 /// literal, so gaps match the captured tokens around them on every theme.
-fn code_line_spans(line: &str, spans: &[HiSpan], code_fg: Color) -> Vec<Span<'static>> {
+pub(crate) fn code_line_spans(line: &str, spans: &[HiSpan], code_fg: Color) -> Vec<Span<'static>> {
     let mut out = Vec::new();
     let mut cursor = 0usize;
     for sp in spans {
@@ -3512,6 +3516,7 @@ mod preview_selection_tests {
             row_of_line: Vec::new(),
             scroll_to_source: None,
             links: MdLinks::default(),
+            follows: None,
         }
     }
 

@@ -20,6 +20,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Widget},
 };
+use unicode_width::UnicodeWidthStr;
 
 /// The four ways VS Code's Databases view adds a database (#578).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -304,6 +305,10 @@ pub struct InputPrompt {
     /// or N no, and typing goes nowhere. A sentinel value in an editable
     /// field read as type-to-confirm, yet `no` + Enter still went ahead.
     pub confirm: bool,
+    /// Where the terminal's caret goes in the field, set by a `surfaces`
+    /// theme's render (which draws no caret of its own); `None` on a boxed
+    /// theme, whose caret is a painted block, and for a confirm.
+    pub last_caret: Option<(u16, u16)>,
 }
 
 impl InputPrompt {
@@ -324,6 +329,7 @@ impl InputPrompt {
             masked: false,
             selected: false,
             confirm: false,
+            last_caret: None,
         }
     }
 
@@ -505,7 +511,7 @@ impl InputPrompt {
 /// at char `cursor` is in view (#1601): the chars skipped, and whether a
 /// leading `…` takes the first cell to say so. Measured in terminal cells,
 /// so wide (CJK) chars count as two.
-fn field_scroll(value: &str, cursor: usize, width: usize) -> (usize, bool) {
+pub(crate) fn field_scroll(value: &str, cursor: usize, width: usize) -> (usize, bool) {
     use unicode_width::UnicodeWidthChar;
     let cells: Vec<usize> = value.chars().map(|c| c.width().unwrap_or(0)).collect();
     let cursor = cursor.min(cells.len());
@@ -531,6 +537,11 @@ pub fn render_input_prompt(
     buf: &mut Buffer,
     theme: crate::theme::Theme,
 ) {
+    if let Some(t) = crate::widgets::surface::tones(theme) {
+        render_prompt_card(prompt, screen, buf, theme, t);
+        return;
+    }
+    prompt.last_caret = None;
     let width = (screen.width.saturating_mul(6) / 10)
         .clamp(30, 90)
         .min(screen.width);
@@ -648,6 +659,121 @@ pub fn render_input_prompt(
             Style::default().fg(theme.ui(Color::Rgb(0x7a, 0x82, 0x90))),
         );
     }
+}
+
+/// The prompt as a `surfaces` theme draws it, in the quick inputs' idiom:
+/// a card with no title on its edge; the question as its one strong label;
+/// the value in a field lifted off the card, with the terminal's own caret;
+/// and the keys in a footer on the chrome tone. A confirm has the question
+/// and the footer only.
+fn render_prompt_card(
+    prompt: &mut InputPrompt,
+    screen: Rect,
+    buf: &mut Buffer,
+    theme: crate::theme::Theme,
+    t: crate::widgets::surface::Tones,
+) {
+    let width = (screen.width.saturating_mul(6) / 10)
+        .clamp(30, 90)
+        .min(screen.width);
+    // Edge, question, field, footer, edge; a confirm has no field.
+    let height: u16 = if prompt.confirm { 4 } else { 5 };
+    let rect = Rect {
+        x: screen.x + (screen.width.saturating_sub(width)) / 2,
+        y: screen.y + (screen.height.saturating_sub(height)) / 3,
+        width,
+        height: height.min(screen.height),
+    };
+    prompt.last_rect = rect;
+    prompt.last_caret = None;
+    if rect.width < 6 || rect.height < 3 || rect.intersection(buf.area) != rect {
+        return;
+    }
+    Widget::render(Clear, rect, buf);
+    buf.set_style(rect, Style::default().bg(t.raised()).fg(t.text()));
+    let footer = (rect.height == height).then(|| rect.bottom() - 2);
+    if let Some(fy) = footer {
+        let tray = Rect {
+            y: fy,
+            height: 2,
+            ..rect
+        };
+        buf.set_style(tray, Style::default().bg(t.chrome()));
+    }
+    crate::widgets::surface::paint_overlay_frame(buf, rect, theme);
+    let (x0, end) = (rect.x + 2, rect.right() - 2);
+    let room = usize::from(end - x0);
+    let title_style = Style::default().fg(t.strong());
+    let (cut, _) = buf.set_stringn(x0, rect.y + 1, &prompt.title, room, title_style);
+    if prompt.title.width() > room {
+        buf.set_string(cut.min(end - 1), rect.y + 1, "\u{2026}", title_style);
+    }
+    if let Some(fy) = footer {
+        let key = Style::default().fg(t.text());
+        let word = Style::default().fg(t.muted());
+        let hint = match prompt.hint.as_deref() {
+            Some(h) => Line::from(Span::styled(h, word)),
+            None => Line::from(vec![
+                Span::styled("\u{21b5}", key),
+                Span::styled(" confirm   ", word),
+                Span::styled("esc", key),
+                Span::styled(" cancel", word),
+            ]),
+        };
+        buf.set_line(x0, fy, &hint, end - x0);
+    }
+    if prompt.confirm || rect.height < 4 {
+        return;
+    }
+    // The field: a step lifted off the card, the text one cell in.
+    let field_y = rect.y + 2;
+    let well = crate::gradient::lerp_rgb(t.raised, t.lift, 0.06);
+    let field = Rect {
+        x: x0,
+        y: field_y,
+        width: end - x0,
+        height: 1,
+    };
+    buf.set_style(field, Style::default().bg(crate::gradient::rgb_color(well)));
+    let (tx, tw) = (x0 + 1, usize::from(field.width.saturating_sub(2)));
+    if tw == 0 {
+        return;
+    }
+    if prompt.value.is_empty() {
+        buf.set_stringn(
+            tx,
+            field_y,
+            &prompt.placeholder,
+            tw,
+            Style::default()
+                .fg(t.muted())
+                .add_modifier(Modifier::ITALIC),
+        );
+        prompt.last_caret = Some((tx, field_y));
+        return;
+    }
+    let shown = if prompt.masked {
+        "\u{2022}".repeat(prompt.value.chars().count())
+    } else {
+        prompt.value.clone()
+    };
+    let cursor = prompt.cursor.min(shown.chars().count());
+    let (skip, lead) = field_scroll(&shown, cursor, tw);
+    let mut x = tx;
+    if lead {
+        buf.set_string(x, field_y, "\u{2026}", Style::default().fg(t.faint()));
+        x += 1;
+    }
+    let mut value_style = Style::default().fg(t.text());
+    if prompt.selected {
+        value_style = value_style.bg(t.band_on(well));
+    }
+    let visible: String = shown.chars().skip(skip).collect();
+    let before: String = shown.chars().skip(skip).take(cursor - skip).collect();
+    let limit = usize::from((tx + u16::try_from(tw).unwrap_or(0)).saturating_sub(x));
+    buf.set_stringn(x, field_y, &visible, limit, value_style);
+    let caret = x + u16::try_from(before.width()).unwrap_or(u16::MAX);
+    prompt.last_caret = Some((caret.min(end - 1), field_y));
 }
 
 #[cfg(test)]
@@ -877,6 +1003,65 @@ mod tests {
         }
         assert_eq!(p.value, "");
         assert_eq!(p.submit_value().as_deref(), Some(""));
+    }
+
+    fn loch_prompt(p: &mut InputPrompt) -> Buffer {
+        let screen = Rect::new(0, 0, 80, 20);
+        let mut buf = Buffer::empty(screen);
+        render_input_prompt(p, screen, &mut buf, crate::theme::Theme::from_id("loch"));
+        buf
+    }
+
+    fn line(buf: &Buffer, r: Rect, y: u16) -> String {
+        (r.x..r.right())
+            .map(|x| buf[(x, y)].symbol().to_string())
+            .collect()
+    }
+
+    /// Croft Loch: the question is a label inside the card, not a title on
+    /// its edge; the value sits in a lifted field with the terminal's caret
+    /// at its end (no painted block); the keys are in a footer on chrome.
+    #[test]
+    fn croft_loch_prompt_is_a_card_with_a_field_and_a_footer() {
+        let t = crate::widgets::surface::tones(crate::theme::Theme::from_id("loch")).unwrap();
+        let mut p = prefilled("v1.2");
+        let buf = loch_prompt(&mut p);
+        let r = p.last_rect;
+        assert!(!line(&buf, r, r.y).contains("Tag"), "no title on the edge");
+        assert!(line(&buf, r, r.y + 1).contains("Tag"));
+        assert_eq!(buf[(r.x + 2, r.y + 1)].fg, t.strong());
+        let field = line(&buf, r, r.y + 2);
+        assert!(field.contains(" v1.2"), "{field:?}");
+        assert_ne!(buf[(r.x + 2, r.y + 2)].bg, t.raised(), "a lifted field");
+        assert_eq!(p.last_caret, Some((r.x + 7, r.y + 2)));
+        let blinking = (r.y..r.bottom())
+            .any(|y| (r.x..r.right()).any(|x| buf[(x, y)].modifier.contains(Modifier::SLOW_BLINK)));
+        assert!(!blinking, "no painted caret");
+        let footer = line(&buf, r, r.y + 3);
+        assert!(
+            footer.contains("\u{21b5} confirm   esc cancel"),
+            "{footer:?}"
+        );
+        assert_eq!(buf[(r.x + 2, r.y + 3)].bg, t.chrome());
+        let mut empty = InputPrompt::new(InputPurpose::CreateTag, "Tag", "name");
+        let buf = loch_prompt(&mut empty);
+        let r = empty.last_rect;
+        assert!(line(&buf, r, r.y + 2).contains(" name"));
+        assert!(buf[(r.x + 3, r.y + 2)].modifier.contains(Modifier::ITALIC));
+        assert_eq!(empty.last_caret, Some((r.x + 3, r.y + 2)));
+    }
+
+    /// Croft Loch: a confirm is the question and its keys, with no field
+    /// and no caret.
+    #[test]
+    fn croft_loch_confirm_asks_and_lists_its_keys() {
+        let mut p = trash_confirm();
+        let buf = loch_prompt(&mut p);
+        let r = p.last_rect;
+        assert_eq!(r.height, 4);
+        assert!(line(&buf, r, r.y + 1).contains("Move 'scratch.py' to Trash?"));
+        assert!(line(&buf, r, r.y + 2).contains("Enter or Y to trash"));
+        assert_eq!(p.last_caret, None);
     }
 
     /// #855: the box shows which keys answer it, where the prefilled value

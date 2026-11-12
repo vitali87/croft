@@ -73,9 +73,12 @@ const INACTIVE_TINT: Rgba<u8> = Rgba([0x9d, 0xa5, 0xb4, 0xff]);
 pub struct IconInk {
     /// Resting, unselected glyph (VS Code `activityBar.inactiveForeground`).
     pub inactive: Rgba<u8>,
-    /// Selected glyph, and any glyph under the pointer
-    /// (`activityBar.foreground`).
+    /// Selected glyph (`activityBar.foreground`).
     pub active: Rgba<u8>,
+    /// A glyph under the pointer. The active ink unless a theme sets a step
+    /// of its own ([`IconInk::with_hover`]), so hovered and selected can
+    /// differ by more than the pill.
+    pub hover: Rgba<u8>,
     /// The selection bar down the icon's left edge
     /// (`activityBar.activeBorder`).
     pub pill: Rgba<u8>,
@@ -86,6 +89,7 @@ impl Default for IconInk {
         Self {
             inactive: INACTIVE_TINT,
             active: ACTIVE_TINT,
+            hover: ACTIVE_TINT,
             pill: ACTIVE_PILL,
         }
     }
@@ -98,18 +102,28 @@ impl IconInk {
         Self {
             inactive: opaque(inactive),
             active: opaque(active),
+            hover: opaque(active),
             pill: opaque(pill),
         }
     }
 
-    /// The glyph tint for `state`: hovered borrows the active ink (VS Code
-    /// lifts a hovered icon to the foreground color), only the pill tells
-    /// selected apart from merely hovered.
+    /// The same ink with its own hover step: Croft Loch lifts a hovered
+    /// icon to body text and keeps the brighter ink for the selected one.
+    pub fn with_hover(self, (r, g, b): (u8, u8, u8)) -> Self {
+        Self {
+            hover: Rgba([r, g, b, 0xff]),
+            ..self
+        }
+    }
+
+    /// The glyph tint for `state`: hovered takes the hover ink (the active
+    /// one unless a theme set its own, as VS Code lifts a hovered icon to
+    /// the foreground color), and the pill tells selected apart.
     fn tint(self, state: IconState) -> Rgba<u8> {
-        if state.tinted() {
-            self.active
-        } else {
-            self.inactive
+        match state {
+            IconState::Active => self.active,
+            IconState::Hovered => self.hover,
+            IconState::Inactive => self.inactive,
         }
     }
 }
@@ -169,12 +183,6 @@ pub enum IconState {
 }
 
 impl IconState {
-    /// Whether the glyph wears the bright (active-foreground) tint. Both the
-    /// hovered and active states do; only the resting state stays muted.
-    fn tinted(self) -> bool {
-        matches!(self, IconState::Hovered | IconState::Active)
-    }
-
     /// Whether the blue left selection pill is painted. Only the active
     /// (selected-view) state shows it, so a merely-hovered icon stays
     /// distinguishable from the selected one.
@@ -478,7 +486,14 @@ pub fn inline_image_protocol_in(
     inline_image_protocol_for(term_program, term)
 }
 
+/// The inline-image protocol this croft writes with, from the terminal's
+/// environment: `TERM_PROGRAM`, `TERM` and `CROFT_INLINE_IMAGES`, then
+/// `CROFT_FORCE_INLINE_IMAGES` for a terminal that advertises none.
 pub fn detect_inline_image_protocol() -> InlineImageProtocol {
+    #[cfg(test)]
+    if PLAIN_HOST_FRAMES.with(std::cell::Cell::get) {
+        return InlineImageProtocol::None;
+    }
     let term_program = std::env::var("TERM_PROGRAM").ok();
     let term = std::env::var("TERM").ok();
     let protocol = inline_image_protocol_in(
@@ -698,7 +713,15 @@ pub fn is_tmux_env(term: Option<&str>, tmux_var: Option<&str>) -> bool {
         || term.is_some_and(|v| v.starts_with("tmux") || v.starts_with("screen"))
 }
 
+/// Whether the terminal draws iTerm2's inline images and session
+/// background: iTerm2 or WezTerm by `TERM_PROGRAM`, or any terminal with
+/// `CROFT_FORCE_INLINE_IMAGES` set. Under it a frame leaves the canvas to
+/// the session background instead of painting it.
 pub fn detect_iterm2_inline_support() -> bool {
+    #[cfg(test)]
+    if PLAIN_HOST_FRAMES.with(std::cell::Cell::get) {
+        return false;
+    }
     if force_inline_images(std::env::var("CROFT_FORCE_INLINE_IMAGES").ok().as_deref()) {
         return true;
     }
@@ -710,6 +733,17 @@ pub fn detect_iterm2_inline_support() -> bool {
     // `CROFT_FORCE_INLINE_IMAGES=1`.
     let term_program = std::env::var("TERM_PROGRAM").ok();
     is_iterm2_term_program(term_program.as_deref())
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Set by a test that draws frames as a plain terminal draws them (the
+    /// screen goldens), whatever terminal runs the suite: no iTerm2 session
+    /// background ([`detect_iterm2_inline_support`]) and no inline-image
+    /// protocol ([`detect_inline_image_protocol`]), which a picture open in
+    /// an editor reads while it draws. The environment is shared by every
+    /// test in the process, so changing it is no test's to do.
+    pub static PLAIN_HOST_FRAMES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 pub fn detect_tmux() -> bool {
@@ -1402,6 +1436,33 @@ mod tests {
     #[test]
     fn missing_term_program_is_not_iterm2() {
         assert!(!is_iterm2_term_program(None));
+    }
+
+    /// A thread drawing as a plain terminal gets no image protocol and no
+    /// iTerm2 session background, whatever the environment says, and the
+    /// switch is its own: another thread still reads the environment.
+    #[test]
+    fn a_plain_host_thread_sees_no_image_support() {
+        let from_env = (
+            detect_inline_image_protocol(),
+            detect_iterm2_inline_support(),
+        );
+        PLAIN_HOST_FRAMES.with(|f| f.set(true));
+        let plain = (
+            detect_inline_image_protocol(),
+            detect_iterm2_inline_support(),
+        );
+        let other = std::thread::spawn(|| {
+            (
+                detect_inline_image_protocol(),
+                detect_iterm2_inline_support(),
+            )
+        })
+        .join()
+        .unwrap();
+        PLAIN_HOST_FRAMES.with(|f| f.set(false));
+        assert_eq!(plain, (InlineImageProtocol::None, false));
+        assert_eq!(other, from_env);
     }
 
     #[test]

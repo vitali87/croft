@@ -454,7 +454,7 @@ fn close_to_the_right_counts_the_unsaved_tabs_it_keeps() {
         std::fs::write(f, "x\n").unwrap();
     }
     app.editor.open_pinned(&b).unwrap();
-    type_into_editor(&mut app, "y");
+    type_keys(&mut app, "y");
     app.editor.open_pinned(&c).unwrap();
     app.dispatch_menu_action(MenuAction::CloseTabsToRight(0), tmp.path().to_path_buf());
     let open: Vec<_> = app.editor.editors.iter().map(|e| e.path.clone()).collect();
@@ -514,7 +514,7 @@ fn s_at_the_close_prompt_saves_only_that_tab() {
     let b = tmp.path().join("b.txt");
     std::fs::write(&b, "bravo\n").unwrap();
     app.editor.open_pinned(&b).unwrap();
-    type_into_editor(&mut app, "y");
+    type_keys(&mut app, "y");
     app.editor.select(0);
     app.handle_key(key(KeyCode::Char('w'), KeyModifiers::SUPER))
         .unwrap();
@@ -602,7 +602,7 @@ fn discarding_a_tab_keeps_the_other_unsaved_tabs_backed_up() {
     let b = tmp.path().join("b.txt");
     std::fs::write(&b, "bravo\n").unwrap();
     app.editor.open_pinned(&b).unwrap();
-    type_into_editor(&mut app, "z");
+    type_keys(&mut app, "z");
     settle_hot_exit(&mut app);
     assert_eq!(app.editor.path.as_deref(), Some(b.as_path()), "setup");
     app.handle_key(key(KeyCode::Char('w'), KeyModifiers::SUPER))
@@ -1946,6 +1946,51 @@ fn a_split_preview_follows_the_source_pane_scroll() {
     );
 }
 
+/// #1605: Cmd+K V on a Markdown tab opens its preview in a new group to the
+/// right, which shows what is typed in the source as it is typed without
+/// touching its own buffer, and stays rendered when the source is saved.
+#[test]
+fn a_side_preview_follows_the_typing_and_stays_a_preview_across_a_save() {
+    fn side(app: &App) -> (String, bool) {
+        let groups = app.editor_layout.inactive_groups();
+        let tab = &groups[0].editors[groups[0].active_index()];
+        let md = tab
+            .markdown_preview
+            .as_ref()
+            .expect("the side pane previews");
+        let text = md.lines.iter().flat_map(|l| l.spans.iter());
+        (text.map(|s| s.content.as_ref()).collect(), tab.dirty)
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("README.md");
+    std::fs::write(&f, "# Title\n\nFirst paragraph.\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.format_on_save = false;
+    app.editor.open_pinned(&f).unwrap();
+    app.focus_pane(Pane::Editor);
+    assert!(app.handle_cmd_k_chord(key(KeyCode::Char('v'), KeyModifiers::NONE)));
+    assert_eq!(app.editor_layout.leaf_count(), 2, "{}", app.status);
+    assert!(
+        app.editor.markdown_preview.is_none(),
+        "focus stays on the source"
+    );
+    app.editor.cursor_row = 2;
+    app.editor.cursor_col = app.editor.lines[2].len();
+    type_keys(&mut app, " Typed");
+    assert!(app.sync_markdown_side_previews(), "the edit re-renders it");
+    let (text, dirty) = side(&app);
+    assert!(text.contains("First paragraph. Typed"), "{text}");
+    assert!(!dirty, "the preview's own buffer is not edited");
+    assert!(
+        !app.sync_markdown_side_previews(),
+        "an unchanged source costs nothing"
+    );
+    app.handle_key(ctrl('s')).unwrap();
+    assert!(app.reload_open_file_after_external_change());
+    app.sync_markdown_side_previews();
+    assert!(side(&app).0.contains("First paragraph. Typed"));
+}
+
 /// #852 regression, driven by keys alone: `Ctrl+Alt+S` writes every dirty
 /// tab to disk, the inactive one included, not only the active tab.
 #[test]
@@ -2027,7 +2072,7 @@ fn open_editors_save_all_hides_while_collapsed_and_the_title_click_still_toggles
     app.open_editors.collapsed = true;
     app.sidebar_view = SidebarView::Explorer;
     app.show_tree = true;
-    let buf = render_buffer_852(&mut app, 120, 40);
+    let buf = draw_buffer(&mut app, 120, 40);
     let hdr = app.open_editors.last_area;
     assert!(hdr.height > 0, "OPEN EDITORS is on screen");
     assert!(
@@ -2038,7 +2083,7 @@ fn open_editors_save_all_hides_while_collapsed_and_the_title_click_still_toggles
     // The rightmost header cells, where the button sits when expanded.
     left_click(&mut app, hdr.x + hdr.width - 2, hdr.y);
     assert!(!app.open_editors.collapsed, "the header click expands it");
-    let _ = render_buffer_852(&mut app, 120, 40);
+    let _ = draw_buffer(&mut app, 120, 40);
     left_click(&mut app, hdr.x + 3, hdr.y);
     assert!(app.open_editors.collapsed, "the title click collapses it");
     assert_eq!(
@@ -2057,7 +2102,7 @@ fn typing_the_tab_menus_keep_open_in_the_palette_keeps_the_preview_tab() {
     let p = tmp.path().join("p.rs");
     std::fs::write(&p, "x\n").unwrap();
     app.editor.open_preview(&p).unwrap();
-    let ran = run_in_palette_852(&mut app, "keep open");
+    let ran = run_palette_top_match(&mut app, "keep open");
     assert_eq!(ran.as_deref(), Some("View: Keep Editor"));
     assert!(!app.editor.preview, "the preview tab is kept");
 }
@@ -2156,7 +2201,7 @@ fn tab_commands_with_no_editor_open_only_say_so() {
             "No tabs to the right to close",
         ),
     ] {
-        let ran = run_in_palette_852(&mut app, title);
+        let ran = run_palette_top_match(&mut app, title);
         assert_eq!(ran.as_deref(), Some(title));
         assert_eq!(app.status, status, "{title}");
         assert!(app.editor.is_blank_initial(), "{title}");

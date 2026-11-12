@@ -52,12 +52,12 @@ fn a_remote_handoff_asks_about_edits_made_during_the_install() {
         let mut app = app_with_open_file(tmp.path(), "a.txt", "alpha\n");
         // Nothing was unsaved when the connect was asked for; the edit
         // comes while the install runs.
-        type_into_editor(&mut app, "x");
+        type_keys(&mut app, "x");
         ready_to_hand_off(&mut app, event);
         app.poll_install_session();
         assert!(!app.quit, "the unsaved a.txt must not go with the handoff");
         assert!(app.pending_unsaved.is_some(), "it asks");
-        let screen = draw_screen(&mut app);
+        let screen = draw_screen(&mut app, 160, 40);
         assert!(screen.contains("ave all and connect"), "{screen}");
         app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE))
             .unwrap();
@@ -607,6 +607,37 @@ fn clicking_the_port_toast_dismiss_button_clears_it() {
     );
 }
 
+/// Croft Loch: the port toast is a raised card with the card edge (no line
+/// box on the canvas, no title on its edge), its primary action in the
+/// button fill without bold, and the dismiss cross a bare muted mark.
+#[test]
+fn croft_loch_port_toast_is_a_raised_card() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.theme = crate::theme::Theme::from_id("loch");
+    let t = crate::widgets::surface::tones(app.theme).unwrap();
+    app.show_port_toast(3000, Some("node".into()));
+    let backend = ratatui::backend::TestBackend::new(140, 50);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let buf = term.backend().buffer();
+    let buttons = app.port_toast.as_ref().unwrap().buttons.clone();
+    let (open, _) = buttons[0];
+    let (dismiss, _) = *buttons.last().unwrap();
+    // The body line sits one row above the buttons, the edge one above it.
+    let top = open.y - 2;
+    let x0 = open.x - 2;
+    assert_eq!(buf[(x0, top)].symbol(), "\u{2594}");
+    assert_eq!(buf[(x0, top)].fg, t.accent(), "the lip");
+    let edge: String = (x0..x0 + 20).map(|x| buf[(x, top)].symbol()).collect();
+    assert!(!edge.contains("PORT"), "{edge}");
+    assert_eq!(buf[(open.x - 1, open.y)].bg, t.raised());
+    assert_eq!(buf[(open.x, open.y)].bg, app.theme.button());
+    assert!(!buf[(open.x, open.y)].modifier.contains(Modifier::BOLD));
+    assert_eq!(buf[(dismiss.x + 1, dismiss.y)].fg, t.muted());
+    assert_eq!(buf[(dismiss.x + 1, dismiss.y)].bg, t.raised());
+}
+
 #[test]
 fn relay_request_ids_are_unique_per_request() {
     // `Instant::now().elapsed()` measures the gap between an instant and
@@ -963,14 +994,7 @@ fn a_failed_provisioning_is_remembered_and_a_later_success_forgets_it() {
     // override so nothing touches this machine's real memory.
     let _serial = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
     let tmp = tempfile::tempdir().unwrap();
-    struct Restore;
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            *crate::paths::CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap() = None;
-        }
-    }
-    let _restore = Restore;
-    *crate::paths::CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap() = Some(tmp.path().join("cache"));
+    let _restore = override_cache_dir(tmp.path().join("cache"));
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     assert!(
         app.remote_offer_refused.is_empty(),
@@ -1009,15 +1033,8 @@ fn a_success_forgets_a_refusal_another_croft_recorded() {
     // host that demonstrably works for its whole seven-day TTL.
     let _serial = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
     let tmp = tempfile::tempdir().unwrap();
-    struct Restore;
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            *crate::paths::CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap() = None;
-        }
-    }
-    let _restore = Restore;
     let cache = tmp.path().join("cache");
-    *crate::paths::CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap() = Some(cache.clone());
+    let _restore = override_cache_dir(cache.clone());
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.remote_offer_refused.clear();
     let refused_path = crate::remote::refused_hosts_path(&cache);
@@ -1283,6 +1300,7 @@ fn the_output_ports_and_captures_tabs_are_announced_by_name_and_row() {
         shell_pid: None,
         message: "Build failed".into(),
         line: "error: build failed".into(),
+        anchor: None,
     });
     let snap = app.a11y_snapshot();
     assert_eq!(snap.focus, "Captures, 1 capture");

@@ -7,16 +7,23 @@
 //!
 //! A pull request that changes what ships writes its highlights to a
 //! fragment of its own, `src/release_notes/unreleased/<name>.md`: one per
-//! line, each prefixed `feature:` or `fix:`, each summary one short sentence.
-//! It never touches `version`. After the merge, the version-bump workflow
-//! folds the pending fragments into `src/release_notes/<version>.md` and
-//! bumps the version once, on main (`scripts/release.py`).
+//! line, each prefixed `feature:`, `fix:` or `refactor:`, each summary one
+//! short sentence. It never touches `version`. After the merge, the
+//! version-bump workflow folds the pending fragments into
+//! `src/release_notes/<version>.md` and bumps the version once, on main
+//! (`scripts/release.py`).
 //!
-//! A build carries the pending fragments when there are any, since those are
-//! the changes it has on top of its version's release, and its card says so
-//! (`heading`); otherwise it carries its version's notes. A build with
-//! neither does not build, so a binary always describes itself
-//! (`select::baked`).
+//! A `refactor:` line is for a change that ships but changes nothing in use:
+//! code moved between files, a rename, a restructure that behaves the same.
+//! The card leaves it out, since there is nothing to show, and a merge whose
+//! notes are all refactor ones makes no version: its notes wait for the next
+//! version that has a feature, a fix or a dependency update.
+//!
+//! A build carries the pending fragments when any of them has a feature or a
+//! fix, since those are the changes it has on top of its version's release,
+//! and its card says so (`heading`); otherwise it carries its version's
+//! notes. A build with neither does not build, so a binary always describes
+//! itself (`select::baked`).
 //!
 //! The layout exists because shared notes, and then a version bump in every
 //! pull request, put each open PR on the others' conflict path (#399): two
@@ -54,6 +61,23 @@ impl NoteKind {
         match self {
             Self::Feature => Color::Rgb(0x8c, 0xc2, 0x65),
             Self::Fix => Color::Rgb(0xe0, 0x9a, 0x4e),
+        }
+    }
+
+    /// The gutter mark and its tint on `theme`. A boxed theme keeps the
+    /// rocket and the bug ([`Self::icon`], [`Self::color`]). A `surfaces`
+    /// theme (Croft Loch) marks a feature with a `+` and a fix with a bullet,
+    /// both in the muted ink: typographic marks rather than emoji, a fix no
+    /// longer wears a bug beside every line of the release, and a feature's
+    /// mark is not teal, since the accent means focus and selection alone
+    /// and a bullet is decoration.
+    pub fn marker_for(self, theme: crate::theme::Theme) -> (&'static str, Color) {
+        let Some(t) = crate::widgets::surface::tones(theme) else {
+            return (self.icon(), self.color());
+        };
+        match self {
+            Self::Feature => ("+", t.muted()),
+            Self::Fix => ("\u{2022}", t.muted()),
         }
     }
 }
@@ -136,19 +160,21 @@ fn bold_closes_later(rest: &[char]) -> bool {
 mod select;
 
 /// This build's highlights, as `build.rs` chose them (`select::baked`): the
-/// pending fragments in `src/release_notes/unreleased/` when there are any,
-/// otherwise `src/release_notes/<version>.md`.
+/// pending fragments in `src/release_notes/unreleased/` when any of them has
+/// a feature or a fix, otherwise `src/release_notes/<version>.md`.
 const NOTES_MD: &str = include_str!(concat!(env!("OUT_DIR"), "/release_notes.md"));
 
 /// Whether the baked notes are pending fragments rather than a release's:
-/// the build carries changes that no release has yet.
+/// the build carries changes in use that no release has yet. With only
+/// refactor notes pending it is false, since the build then changes nothing
+/// in use on top of its release, and reads as that release.
 pub fn unreleased() -> bool {
     env!("CROFT_NOTES_UNRELEASED") == "1"
 }
 
 /// The card's heading. A build of a release names it; a build carrying
-/// changes past its version's release says so, since the notes below are
-/// not that release's.
+/// changes in use past its version's release says so, since the notes below
+/// are not that release's.
 pub fn heading(unreleased: bool, version: &str) -> String {
     if unreleased {
         format!("IN THIS BUILD (v{version}+)")
@@ -157,12 +183,18 @@ pub fn heading(unreleased: bool, version: &str) -> String {
     }
 }
 
-/// Parse the baked notes: one highlight per line, `feature:` or `fix:` first.
+/// Parse the baked notes: one highlight per line, `feature:`, `fix:` or
+/// `refactor:` first.
 ///
 /// Blank lines and `#` comments are skipped so a notes file can carry a
-/// heading. A line with no recognised prefix is a `Fix`, which is the
-/// conservative reading: describing a fix as a feature oversells the release,
-/// and the opposite merely undersells it.
+/// heading. A `refactor:` line is left off the card: it changes nothing in
+/// use, so there is nothing to show. A line with no recognised prefix is a
+/// `Fix`, which is the conservative reading: describing a fix as a feature
+/// oversells the release, and the opposite merely undersells it.
+///
+/// The refactor rule is `select::is_refactor_line`'s, written out here
+/// because `select` is compiled into the build script and the tests, not the
+/// binary. A test holds the two to the same answers.
 fn parse(md: &'static str) -> Vec<ReleaseNote> {
     md.lines()
         .map(str::trim)
@@ -171,19 +203,20 @@ fn parse(md: &'static str) -> Vec<ReleaseNote> {
         // and a leading bullet would otherwise make `- feature: x` an
         // unrecognised prefix: a Fix whose summary still carries the dash.
         .map(|l| l.strip_prefix("- ").or_else(|| l.strip_prefix("* ")).unwrap_or(l).trim())
-        .map(|line| match line.split_once(':') {
-            Some((kind, rest)) if kind.eq_ignore_ascii_case("feature") => ReleaseNote {
+        .filter_map(|line| match line.split_once(':') {
+            Some((kind, _)) if kind.eq_ignore_ascii_case("refactor") => None,
+            Some((kind, rest)) if kind.eq_ignore_ascii_case("feature") => Some(ReleaseNote {
                 kind: NoteKind::Feature,
                 summary: rest.trim_start(),
-            },
-            Some((kind, rest)) if kind.eq_ignore_ascii_case("fix") => ReleaseNote {
+            }),
+            Some((kind, rest)) if kind.eq_ignore_ascii_case("fix") => Some(ReleaseNote {
                 kind: NoteKind::Fix,
                 summary: rest.trim_start(),
-            },
-            _ => ReleaseNote {
+            }),
+            _ => Some(ReleaseNote {
                 kind: NoteKind::Fix,
                 summary: line,
-            },
+            }),
         })
         .collect()
 }
@@ -264,6 +297,42 @@ mod tests {
         }
     }
 
+    /// A refactor changes nothing in use, so the card has nothing to show
+    /// for it; the lines around it are read as before.
+    #[test]
+    fn a_refactor_line_is_left_off_the_card() {
+        let notes =
+            parse("feature: One.\nrefactor: Moved the tree.\n- Refactor: Renamed.\nfix: Two.\n");
+        assert_eq!(notes.len(), 2);
+        assert_eq!(notes[0].summary, "One.");
+        assert_eq!(notes[1].summary, "Two.");
+    }
+
+    /// `parse` writes the refactor rule out rather than calling
+    /// `select::is_refactor_line`, which the binary does not compile. Were
+    /// the two to drift, the card would show a line the build counted as
+    /// changing nothing, or hide one it counted as a change.
+    #[test]
+    fn parse_and_select_agree_on_which_lines_are_refactors() {
+        for (line, refactor) in [
+            ("refactor: Moved.", true),
+            ("Refactor: Moved.", true),
+            ("- refactor: Moved.", true),
+            ("* REFACTOR: Moved.", true),
+            ("refactoring: Moved.", false),
+            ("refactor : x", false),
+            ("feature: Something new.", false),
+            ("fix: Something repaired.", false),
+            ("Something repaired.", false),
+            ("\u{3000}refactor: Moved.\u{b}", true),
+            ("refactor: Moved.\u{c}fix: Repaired.", true),
+            ("\u{1f}refactor: Moved.", false),
+        ] {
+            assert_eq!(select::is_refactor_line(line), refactor, "{line:?}");
+            assert_eq!(parse(line).is_empty(), refactor, "{line:?}");
+        }
+    }
+
     #[test]
     fn headings_and_blank_lines_are_not_highlights() {
         let notes = parse("# 0.1.808\n\nfeature: One.\n\n   \nfix: Two.\n");
@@ -330,5 +399,21 @@ mod tests {
     fn the_heading_names_the_release_or_the_build_past_it() {
         assert_eq!(heading(false, "0.2.11"), "IN THIS RELEASE (v0.2.11)");
         assert_eq!(heading(true, "0.2.11"), "IN THIS BUILD (v0.2.11+)");
+    }
+
+    /// Croft Loch marks the notes with typographic marks, not emoji: a `+`
+    /// for a feature, a bullet for a fix, both in the muted ink (never the
+    /// accent, which is for focus and selection). Croft Black keeps its icons.
+    #[test]
+    fn croft_loch_marks_notes_with_a_plus_and_a_bullet() {
+        let loch = crate::theme::Theme::LOCH;
+        let t = crate::widgets::surface::tones(loch).unwrap();
+        assert_eq!(NoteKind::Feature.marker_for(loch), ("+", t.muted()));
+        assert_eq!(NoteKind::Fix.marker_for(loch), ("\u{2022}", t.muted()));
+        let black = crate::theme::Theme::BLACK;
+        assert_eq!(
+            NoteKind::Fix.marker_for(black),
+            (NoteKind::Fix.icon(), NoteKind::Fix.color())
+        );
     }
 }

@@ -1597,6 +1597,16 @@ struct PtyCroft {
 #[cfg(unix)]
 impl PtyCroft {
     fn spawn(dir: &std::path::Path, args: &[&str]) -> Self {
+        Self::spawn_with(dir, args, |_| {})
+    }
+
+    /// `spawn`, with `adjust` handed croft's command last, to change what it
+    /// starts with (its environment) before it starts.
+    fn spawn_with(
+        dir: &std::path::Path,
+        args: &[&str],
+        adjust: impl FnOnce(&mut std::process::Command),
+    ) -> Self {
         use std::os::fd::{FromRawFd, OwnedFd};
         use std::os::unix::process::CommandExt;
 
@@ -1639,6 +1649,7 @@ impl PtyCroft {
             .stdin(slave.try_clone().unwrap())
             .stdout(slave.try_clone().unwrap())
             .stderr(slave.try_clone().unwrap());
+        adjust(&mut cmd);
         // A child that cannot take the pty as its controlling terminal
         // fails to spawn here, rather than running detached from it.
         unsafe {
@@ -1712,6 +1723,36 @@ impl Drop for PtyCroft {
         unsafe { std::mem::ManuallyDrop::drop(&mut self.pty) };
         let _ = self.child.wait();
     }
+}
+
+/// `base`, what a wait costs on a quiet machine, stretched for the load this
+/// one is under. The rule is `src/test_budget.rs`'s, which this test binary
+/// cannot reach: x2, then x(the harness's threads + the load average) / CPUs,
+/// held between 2 and 4.
+#[cfg(unix)]
+fn spawn_budget(base: std::time::Duration) -> std::time::Duration {
+    let cpus = std::thread::available_parallelism().map_or(1, |n| n.get()) as f64;
+    // The flag wins over the variable, the last flag over the rest, as in
+    // libtest itself.
+    let mut threads = std::env::var("RUST_TEST_THREADS").ok();
+    let mut args = std::env::args();
+    while let Some(arg) = args.next() {
+        if let Some(n) = arg.strip_prefix("--test-threads=") {
+            threads = Some(n.to_string());
+        } else if arg == "--test-threads" {
+            threads = args.next();
+        }
+    }
+    let threads = threads
+        .and_then(|n| n.parse::<u32>().ok())
+        .map_or(cpus, f64::from);
+    let mut load = [0f64; 1];
+    // SAFETY: asked for one sample, getloadavg writes at most one.
+    let load = match unsafe { libc::getloadavg(load.as_mut_ptr(), 1) } {
+        1 => load[0],
+        _ => 0.0,
+    };
+    base * 2 * ((threads + load) / cpus).ceil().clamp(2.0, 4.0) as u32
 }
 
 /// #857: what croft's key reader makes of the bytes tmux sends for
@@ -1828,6 +1869,91 @@ fn ctrl_shift_s_as_tmux_sends_it_does_not_save_while_ctrl_s_does() {
         drawn.contains("SOURCE CONTROL"),
         "Ctrl+Shift+S opens Source Control"
     );
+}
+
+/// The step labels of a startup trace (`src/startup_trace.rs`), in the order
+/// croft marked them: the table under its `at step cpu step` header, each
+/// line three numbers and then the label, up to the blank line after it.
+#[cfg(unix)]
+fn traced_steps(trace: &str) -> Vec<String> {
+    trace
+        .lines()
+        .skip_while(|line| !line.split_whitespace().eq(["at", "step", "cpu", "step"]))
+        .skip(1)
+        .take_while(|line| !line.trim().is_empty())
+        .map(|line| {
+            line.split_whitespace()
+                .skip(3)
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect()
+}
+
+/// Tenet 1 on the real binary: the steps croft takes before its first frame,
+/// as its startup trace records them, are exactly the ones listed here and
+/// in this order. Order and membership only: how long a step takes varies
+/// with the machine, so no duration is checked.
+#[cfg(unix)]
+#[test]
+fn the_steps_before_the_first_frame_are_exactly_the_known_ones_in_order() {
+    // A new step before the first frame must be added here deliberately,
+    // with a reason, because tenet 1 forbids anything the first frame does
+    // not need: work that can wait runs after it (see `startup_gate`). Every
+    // mark below sits on the one path every launch of the editor takes
+    // (`Cli::run`, then `app::run` and `App::new`), unconditionally and on
+    // croft's main thread, so none depends on the machine, the terminal or
+    // SSH, and the list is the same for every launch.
+    const BEFORE_FIRST_FRAME: &[&str] = &[
+        "PATH ready",
+        "background work started",
+        "settings, keymap and matchers loaded",
+        "sockets bound",
+        "terminal shell spawned",
+        "file watcher started",
+        "editor state built",
+        "editor built",
+        "session restored",
+        "host terminal answered",
+        "screen set up",
+    ];
+    let tmp = tempfile::tempdir().unwrap();
+    let (home, workspace) = (tmp.path().join("home"), tmp.path().join("workspace"));
+    for dir in [&home, &workspace] {
+        std::fs::create_dir(dir).unwrap();
+    }
+    let trace = tmp.path().join("startup-trace.txt");
+    // Nothing inherited but the PATH: no SSH_* to make this a remote launch,
+    // no user configuration, no outer croft or tmux.
+    let mut croft = PtyCroft::spawn_with(&workspace, &[], |cmd| {
+        cmd.env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", &home)
+            .env("TERM", "xterm-256color")
+            .env("SHELL", "/bin/sh")
+            .env("CROFT_STARTUP_TRACE", &trace);
+    });
+    // croft writes the trace once the first frame is on screen, its closing
+    // line last. The host probe goes unanswered, as in the other launch
+    // tests: croft waits out its own short budget for a reply and goes on.
+    // The terminal is read meanwhile, so croft never blocks on a full one.
+    let written = || {
+        std::fs::read_to_string(&trace)
+            .ok()
+            .filter(|t| t.contains("\nFirst frame ") && t.ends_with(".\n"))
+    };
+    // 5s: a quiet machine gets the `PTY_LIMIT` the other launch tests have.
+    let budget = spawn_budget(std::time::Duration::from_secs(5));
+    let screen = croft.read_until(budget, |_| written().is_some());
+    let text = written().unwrap_or_else(|| {
+        panic!("croft wrote no startup trace within {budget:?}; its terminal showed {screen:?}")
+    });
+    let steps = traced_steps(&text);
+    let first_frame = steps
+        .iter()
+        .position(|step| step == "first frame on screen")
+        .unwrap_or_else(|| panic!("the trace has no first frame:\n{text}"));
+    assert_eq!(&steps[..first_frame], BEFORE_FIRST_FRAME, "{text}");
 }
 
 /// `croft edit --sequence-editor`, as git runs it from `GIT_SEQUENCE_EDITOR`,

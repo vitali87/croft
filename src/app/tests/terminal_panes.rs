@@ -117,17 +117,17 @@ fn terminal_rename_split_and_kill_act_on_the_active_pane() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.focus_pane(Pane::Editor);
-    assert!(run_from_palette(&mut app, "Terminal: Split Terminal"));
+    assert!(run_palette_row_titled(&mut app, "Terminal: Split Terminal"));
     assert_eq!(app.terminals.len(), 2);
     assert!(app.show_terminal);
     app.active_terminal = 1;
-    assert!(run_from_palette(&mut app, "Terminal: Rename"));
+    assert!(run_palette_row_titled(&mut app, "Terminal: Rename"));
     assert!(matches!(
         app.prompt.as_ref().map(|p| &p.kind),
         Some(PromptKind::RenameTerminal(1))
     ));
     app.prompt = None;
-    assert!(run_from_palette(
+    assert!(run_palette_row_titled(
         &mut app,
         "Terminal: Kill the Active Terminal Instance"
     ));
@@ -742,6 +742,65 @@ fn the_panel_row_controls_never_cover_a_tab() {
     assert!(app.terminal_focus_button.width > 0, "room for both at 70");
 }
 
+/// Croft Loch hangs a lone terminal's `∨ +` on the tab row, between the last
+/// tab and the panel chevron, so the panel's controls share one row and the
+/// pane's top edge stays a clean rule. They never cover a tab, the `+` still
+/// splits, and a row too narrow for both sends them back to the pane.
+#[test]
+fn croft_loch_hangs_a_lone_terminals_buttons_on_the_tab_row() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.show_tree = false;
+    draw(&mut app, 140, 40);
+    let strip_y = app.terminal_tab_rect.y;
+    let tabs_end = [
+        app.problems_tab_rect,
+        app.output_tab_rect,
+        app.terminal_tab_rect,
+        app.ports_tab_rect,
+        app.captures_tab_rect,
+    ]
+    .iter()
+    .map(|r| r.right())
+    .max()
+    .unwrap();
+    let (add, caret, chevron) = (
+        app.terminal_add_buttons[0],
+        app.terminal_profile_buttons[0],
+        app.panel_maximize_button,
+    );
+    assert_eq!((add.y, caret.y), (strip_y, strip_y), "on the tab row");
+    assert!(
+        caret.x > tabs_end && caret.right() == add.x,
+        "{caret:?} {add:?}"
+    );
+    assert_eq!(add.right(), chevron.x, "`+` meets the chevron's padding");
+    let pane = app.terminals[0].last_area;
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 40)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let edge: String = (pane.x..pane.right())
+        .map(|x| term.backend().buffer()[(x, pane.y)].symbol().to_string())
+        .collect();
+    assert!(
+        edge.chars().all(|c| c == '\u{2594}'),
+        "the pane's top edge is one unbroken rule: {edge:?}"
+    );
+    left_click(&mut app, add.x + 1, add.y);
+    assert_eq!(app.terminals.len(), 2, "the `+` still splits");
+    // Two panes: the buttons go back to each pane's own top row.
+    draw(&mut app, 140, 40);
+    assert_eq!(app.terminal_add_buttons[0].y, app.terminals[0].last_area.y);
+    // Croft Black keeps them on the pane, as before.
+    let mut black = App::new(tmp.path().to_path_buf()).unwrap();
+    black.apply_theme(crate::theme::Theme::BLACK);
+    black.show_tree = false;
+    draw(&mut black, 140, 40);
+    assert_eq!(
+        black.terminal_add_buttons[0].y,
+        black.terminals[0].last_area.y
+    );
+}
+
 /// #510: a pane the frame does not paint must drop `last_inner` as well as
 /// `last_area`.
 ///
@@ -947,6 +1006,43 @@ fn rail_is_a_fixed_narrow_column_showing_four_label_chars() {
         cells.contains("a-ve") && !cells.contains("a-ver"),
         "rail row must show exactly the first 4 label chars, got {cells:?}"
     );
+}
+
+/// Croft Loch's rail wears the one selected-row anatomy: the active row is
+/// the accent band with the `▎` bar in its leading cell while the panel has
+/// the keyboard, its name in body text; the other rows are muted.
+#[test]
+fn croft_loch_rail_marks_the_active_terminal_with_the_selected_row() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let t = crate::widgets::surface::tones(app.theme).expect("Croft Loch is the default");
+    app.split_terminal().unwrap();
+    app.terminal_pane_maximized = true;
+    app.terminals[0].set_manual_name(Some(String::from("zsh")));
+    app.terminals[1].set_manual_name(Some(String::from("logs")));
+    app.active_terminal = 0;
+    app.focus_pane(Pane::Terminal);
+    let backend = ratatui::backend::TestBackend::new(180, 40);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let buf = term.backend().buffer();
+    let (on, off) = (app.terminal_rail_rects[0], app.terminal_rail_rects[1]);
+    let bar = &buf[(on.x, on.y)];
+    assert_eq!(
+        (bar.symbol(), bar.fg),
+        (crate::widgets::surface::ROW_BAR, t.accent())
+    );
+    assert_eq!(bar.bg, t.band_on(t.canvas));
+    let z = (on.x..on.right())
+        .find(|&x| buf[(x, on.y)].symbol() == "z")
+        .unwrap();
+    assert_eq!(buf[(z, on.y)].fg, t.text());
+    assert!(!buf[(z, on.y)].modifier.contains(Modifier::BOLD));
+    let l = (off.x..off.right())
+        .find(|&x| buf[(x, off.y)].symbol() == "l")
+        .unwrap();
+    assert_eq!(buf[(l, off.y)].fg, t.muted());
+    assert_ne!(buf[(l, off.y)].bg, t.band_on(t.canvas));
 }
 
 #[test]

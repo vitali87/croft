@@ -431,6 +431,12 @@ pub struct Prefs {
     /// `files_exclude` (VS Code's `search.exclude`, #1345).
     #[serde(default)]
     pub search_exclude: Vec<String>,
+    /// Opt-out for compact folders (#1486), on by default like VS Code's
+    /// `explorer.compactFolders`: a folder whose only entry is a folder
+    /// shares its Explorer row, `src/main/java`. Stored as the disable flag
+    /// so the derived `Default` and an older config both mean "compact".
+    #[serde(default)]
+    pub disable_compact_folders: bool,
     /// The language a file opens in, by glob (VS Code's
     /// `files.associations`, #1574): `{ "*.tpl": "html" }`. A glob without
     /// a `/` matches the file name, one with a `/` the workspace-relative

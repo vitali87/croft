@@ -1,0 +1,678 @@
+croft screen golden v1
+scene: workbench-256
+size: 120x40
+theme: loch
+colour depth: 256
+settled after: 1 frame
+caret: row 3 col 43
+--- symbols
+00|    ▏ EXPLORER                   ⋯ ▕  main.rs ✕                                                                     |
+01|▎  ▏  golden                    ▕ src ›  main.rs                                                                    |
+02|    ▏    src                     ▕▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔|
+03|   ▏  ▏    greeting.rs           ▕    1  //! A tiny greeter.                                                    ⠭⠭⠁   |
+04|    ▏  ▏    main.rs               ▕    2                                                                         ⢻⣿⡟⠃  |
+05|   ▏     notes.txt               ▕    3  use std::fmt;                                                          ⢥⣤⣤⣤⣄⣀|
+06|    ▏     README.md               ▕    4                                                                         ⡠⠛⠛⠛⠛⠛|
+07|   ▏                              ▕    5  /// Who to greet, and how.                                             ⢲⣦⣤⡤⠤⠤|
+08|    ▏                              ▕    6  pub struct Greeting<'a> {                                              ⠊⠉⠁   |
+09|   ▏                              ▕    7  │   name: &'a str,                                                           |
+10|    ▏                              ▕    8  │   excited: bool,                                                           |
+11|   ▏                              ▕    9  }                                                                            |
+12|    ▏                              ▕   10                                                                               |
+13|   ▏                              ▕   11  impl fmt::Display for Greeting<'_> {                                         |
+14|    ▏                              ▕   12  │   fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {               |
+15|    ▏                              ▕   13  │   │   let mark = if self.excited { '!' } else { '.' };                     |
+16|    ▏                              ▕   14  │   │   write!(f, "Hello, {}{mark}", self.name)                              |
+17|    ▏                              ▕   15  │   }                                                                        |
+18|    ▏                              ▕   16  }                                                                            |
+19|    ▏                              ▕   17                                                                               |
+20|    ▏                              ▕   18  fn main() {                                                                  |
+21|    ▏                              ▕   19  │   let greeting = Greeting { name: "croft", excited: true };                |
+22|    ▏                              ▕   20  │   println!("{greeting}");                                          ━       |
+23|    ▏                              ▕   21  │   let count = 42;                                                          |
+24|    ▏                              ▕▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁|
+25|    ▏                              ▕ PROBLEMS  1   OUTPUT   TERMINAL   PORTS   CAPTURES                                |
+26|    ▏                              ▕▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔▔All ▾▔▔▔Grouped▔▔|
+27|    ▏                              ▕ ▾  main.rs src  1                                                                 |
+28|    ▏                              ▕     unused variable: `count` rust-analyzer [Ln 21, Col 9]                         |
+29|    ▏                              ▕                                                                                    |
+30|    ▏                              ▕                                                                                    |
+31|    ▏                              ▕                                                                                    |
+32|    ▏                              ▕                                                                                    |
+33|    ▏                              ▕                                                                                    |
+34|   ▏▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▕                                                                                    |
+35|    ▏ OUTLINE                     ▕                                                                                    |
+36|   ▏▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▕                                                                                    |
+37|    ▏ TIMELINE                    ▕                                                                                    |
+38|    ▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁▁|
+39| <> golden    0  1   Ready                                             Ln 1, Col 1   Spaces: 4   UTF-8   LF   Rust|
+--- cells
+r00 c037 icon U+E7A8
+r00 c112 icon U+EBF3
+r00 c115 icon U+EBF2
+r00 c118 icon U+EBEB
+r01 c002 icon U+EAF0
+r01 c005 icon U+EAB4
+r01 c007 icon U+EAF7
+r01 c043 icon U+E7A8
+r02 c007 icon U+EAB4
+r02 c009 icon U+EAF7
+r03 c002 icon U+EA6D
+r03 c011 icon U+E7A8
+r04 c011 icon U+E7A8
+r05 c002 icon U+EA68
+r05 c009 icon U+F15C
+r06 c009 icon U+F48A
+r07 c002 icon U+EB91
+r09 c002 icon U+EB39
+r11 c002 icon U+EAE6
+r13 c002 icon U+EA79
+r25 c117 icon U+EAB7
+r27 c039 icon U+E7A8
+r28 c040 icon U+EA6C
+r34 c002 icon U+EB05
+r35 c005 icon U+EAB6
+r36 c002 icon U+EB51
+r37 c005 icon U+EAB6
+r39 c011 icon U+E0B4
+r39 c014 icon U+EA87
+r39 c018 icon U+EA6C
+r39 c112 icon U+E0B6
+r39 c113 icon U+E7A8
+r39 c119 icon U+E0B4
+--- styles
+r00 c000-003 fg=reset bg=idx233
+r00 c004-004 fg=idx235 bg=idx233
+r00 c005-014 fg=idx244 bg=idx233
+r00 c015-031 fg=reset bg=idx233
+r00 c032-034 fg=idx244 bg=idx233
+r00 c035-035 fg=idx235 bg=idx233
+r00 c036-036 fg=reset bg=idx16
+r00 c037-037 fg=idx180 bg=idx16
+r00 c038-038 fg=reset bg=idx16
+r00 c039-045 fg=idx255 bg=idx16 ul=idx73 mod=UNDERLINED
+r00 c046-046 fg=reset bg=idx16
+r00 c047-047 fg=idx244 bg=idx16
+r00 c048-048 fg=reset bg=idx16
+r00 c049-111 fg=reset bg=idx233
+r00 c112-112 fg=idx244 bg=idx233
+r00 c113-114 fg=reset bg=idx233
+r00 c115-115 fg=idx244 bg=idx233
+r00 c116-117 fg=reset bg=idx233
+r00 c118-118 fg=idx244 bg=idx233
+r00 c119-119 fg=reset bg=idx233
+r01 c000-000 fg=idx73 bg=idx233
+r01 c001-001 fg=reset bg=idx233
+r01 c002-002 fg=idx255 bg=idx233
+r01 c003-003 fg=reset bg=idx233
+r01 c004-004 fg=idx235 bg=idx233
+r01 c005-006 fg=idx244 bg=idx233
+r01 c007-008 fg=idx144 bg=idx233
+r01 c009-014 fg=idx253 bg=idx233 mod=BOLD
+r01 c015-034 fg=reset bg=idx233
+r01 c035-035 fg=idx235 bg=idx233
+r01 c036-036 fg=reset bg=idx16
+r01 c037-039 fg=idx244 bg=idx16
+r01 c040-042 fg=idx238 bg=idx16
+r01 c043-043 fg=idx180 bg=idx16
+r01 c044-044 fg=reset bg=idx16
+r01 c045-051 fg=idx253 bg=idx16
+r01 c052-119 fg=reset bg=idx16
+r02 c000-003 fg=reset bg=idx233
+r02 c004-004 fg=idx235 bg=idx233
+r02 c005-006 fg=reset bg=idx233
+r02 c007-008 fg=idx244 bg=idx233
+r02 c009-010 fg=idx144 bg=idx233
+r02 c011-013 fg=idx253 bg=idx233
+r02 c014-034 fg=reset bg=idx233
+r02 c035-035 fg=idx235 bg=idx233
+r02 c036-041 fg=idx73 bg=idx16
+r02 c042-043 fg=idx72 bg=idx16
+r02 c044-049 fg=idx66 bg=idx16
+r02 c050-050 fg=idx65 bg=idx16
+r02 c051-051 fg=idx59 bg=idx16
+r02 c052-053 fg=idx240 bg=idx16
+r02 c054-055 fg=idx239 bg=idx16
+r02 c056-057 fg=idx238 bg=idx16
+r02 c058-060 fg=idx237 bg=idx16
+r02 c061-063 fg=idx236 bg=idx16
+r02 c064-119 fg=idx235 bg=idx16
+r03 c000-001 fg=reset bg=idx233
+r03 c002-002 fg=idx244 bg=idx233
+r03 c003-003 fg=reset bg=idx233
+r03 c004-004 fg=idx235 bg=idx233
+r03 c005-006 fg=reset bg=idx233
+r03 c007-008 fg=idx238 bg=idx233
+r03 c009-010 fg=reset bg=idx233
+r03 c011-012 fg=idx180 bg=idx233
+r03 c013-023 fg=idx253 bg=idx233
+r03 c024-034 fg=reset bg=idx233
+r03 c035-035 fg=idx235 bg=idx233
+r03 c036-036 fg=reset bg=idx16
+r03 c037-041 fg=idx253 bg=idx233
+r03 c042-042 fg=reset bg=idx233
+r03 c043-061 fg=idx243 bg=idx233 mod=ITALIC
+r03 c062-110 fg=reset bg=idx233
+r03 c111-111 fg=reset bg=idx16
+r03 c112-112 fg=reset bg=idx237
+r03 c113-113 fg=reset bg=idx16
+r03 c114-116 fg=idx243 bg=idx234
+r03 c117-119 fg=reset bg=idx234
+r04 c000-003 fg=reset bg=idx233
+r04 c004-004 fg=idx235 bg=idx234
+r04 c005-006 fg=reset bg=idx234
+r04 c007-008 fg=idx238 bg=idx234
+r04 c009-010 fg=reset bg=idx234
+r04 c011-012 fg=idx180 bg=idx234
+r04 c013-019 fg=idx253 bg=idx234
+r04 c020-034 fg=reset bg=idx234
+r04 c035-035 fg=idx235 bg=idx233
+r04 c036-036 fg=reset bg=idx16
+r04 c037-041 fg=idx238 bg=idx16
+r04 c042-111 fg=reset bg=idx16
+r04 c112-112 fg=reset bg=idx237
+r04 c113-113 fg=reset bg=idx16
+r04 c114-117 fg=idx243 bg=idx234
+r04 c118-119 fg=reset bg=idx234
+r05 c000-001 fg=reset bg=idx233
+r05 c002-002 fg=idx244 bg=idx233
+r05 c003-003 fg=reset bg=idx233
+r05 c004-004 fg=idx235 bg=idx233
+r05 c005-008 fg=reset bg=idx233
+r05 c009-010 fg=idx252 bg=idx233
+r05 c011-019 fg=idx253 bg=idx233
+r05 c020-034 fg=reset bg=idx233
+r05 c035-035 fg=idx235 bg=idx233
+r05 c036-036 fg=reset bg=idx16
+r05 c037-041 fg=idx238 bg=idx16
+r05 c042-042 fg=reset bg=idx16
+r05 c043-045 fg=idx147 bg=idx16 mod=BOLD
+r05 c046-046 fg=idx188 bg=idx16
+r05 c047-049 fg=idx186 bg=idx16
+r05 c050-055 fg=idx188 bg=idx16
+r05 c056-111 fg=reset bg=idx16
+r05 c112-112 fg=reset bg=idx237
+r05 c113-113 fg=reset bg=idx16
+r05 c114-115 fg=idx188 bg=idx234
+r05 c116-117 fg=idx186 bg=idx234
+r05 c118-118 fg=idx147 bg=idx234
+r05 c119-119 fg=idx188 bg=idx234
+r06 c000-003 fg=reset bg=idx233
+r06 c004-004 fg=idx235 bg=idx233
+r06 c005-008 fg=reset bg=idx233
+r06 c009-010 fg=idx67 bg=idx233
+r06 c011-019 fg=idx253 bg=idx233
+r06 c020-034 fg=reset bg=idx233
+r06 c035-035 fg=idx235 bg=idx233
+r06 c036-036 fg=reset bg=idx16
+r06 c037-041 fg=idx238 bg=idx16
+r06 c042-111 fg=reset bg=idx16
+r06 c112-112 fg=reset bg=idx237
+r06 c113-113 fg=reset bg=idx16
+r06 c114-114 fg=idx188 bg=idx234
+r06 c115-115 fg=idx147 bg=idx234
+r06 c116-116 fg=idx188 bg=idx234
+r06 c117-117 fg=idx210 bg=idx234
+r06 c118-118 fg=idx116 bg=idx234
+r06 c119-119 fg=idx188 bg=idx234
+r07 c000-001 fg=reset bg=idx233
+r07 c002-002 fg=idx244 bg=idx233
+r07 c003-003 fg=reset bg=idx233
+r07 c004-004 fg=idx235 bg=idx233
+r07 c005-034 fg=reset bg=idx233
+r07 c035-035 fg=idx235 bg=idx233
+r07 c036-036 fg=reset bg=idx16
+r07 c037-041 fg=idx238 bg=idx16
+r07 c042-042 fg=reset bg=idx16
+r07 c043-068 fg=idx243 bg=idx16 mod=ITALIC
+r07 c069-111 fg=reset bg=idx16
+r07 c112-112 fg=reset bg=idx237
+r07 c113-113 fg=reset bg=idx16
+r07 c114-114 fg=idx147 bg=idx234
+r07 c115-116 fg=idx188 bg=idx234
+r07 c117-117 fg=idx186 bg=idx234
+r07 c118-118 fg=idx116 bg=idx234
+r07 c119-119 fg=idx150 bg=idx234
+r08 c000-003 fg=reset bg=idx233
+r08 c004-004 fg=idx235 bg=idx233
+r08 c005-034 fg=reset bg=idx233
+r08 c035-035 fg=idx235 bg=idx233
+r08 c036-036 fg=reset bg=idx16
+r08 c037-041 fg=idx238 bg=idx16
+r08 c042-042 fg=reset bg=idx16
+r08 c043-045 fg=idx147 bg=idx16 mod=BOLD
+r08 c046-046 fg=idx188 bg=idx16
+r08 c047-052 fg=idx147 bg=idx16 mod=BOLD
+r08 c053-053 fg=idx188 bg=idx16
+r08 c054-061 fg=idx186 bg=idx16
+r08 c062-063 fg=idx188 bg=idx16
+r08 c064-064 fg=idx147 bg=idx16 mod=BOLD
+r08 c065-066 fg=idx188 bg=idx16
+r08 c067-067 fg=idx220 bg=idx16
+r08 c068-111 fg=reset bg=idx16
+r08 c112-112 fg=reset bg=idx237
+r08 c113-113 fg=reset bg=idx16
+r08 c114-115 fg=idx188 bg=idx234
+r08 c116-116 fg=idx215 bg=idx234
+r08 c117-119 fg=reset bg=idx234
+r09 c000-001 fg=reset bg=idx233
+r09 c002-002 fg=idx244 bg=idx233
+r09 c003-003 fg=reset bg=idx233
+r09 c004-004 fg=idx235 bg=idx233
+r09 c005-034 fg=reset bg=idx233
+r09 c035-035 fg=idx235 bg=idx233
+r09 c036-036 fg=reset bg=idx16
+r09 c037-041 fg=idx238 bg=idx16
+r09 c042-042 fg=reset bg=idx16
+r09 c043-043 fg=idx235 bg=idx16
+r09 c044-046 fg=idx188 bg=idx16
+r09 c047-050 fg=idx116 bg=idx16
+r09 c051-054 fg=idx188 bg=idx16
+r09 c055-055 fg=idx147 bg=idx16 mod=BOLD
+r09 c056-056 fg=idx188 bg=idx16
+r09 c057-059 fg=idx186 bg=idx16
+r09 c060-060 fg=idx188 bg=idx16
+r09 c061-111 fg=reset bg=idx16
+r09 c112-112 fg=reset bg=idx237
+r09 c113-119 fg=reset bg=idx16
+r10 c000-003 fg=reset bg=idx233
+r10 c004-004 fg=idx235 bg=idx233
+r10 c005-034 fg=reset bg=idx233
+r10 c035-035 fg=idx235 bg=idx233
+r10 c036-036 fg=reset bg=idx16
+r10 c037-041 fg=idx238 bg=idx16
+r10 c042-042 fg=reset bg=idx16
+r10 c043-043 fg=idx235 bg=idx16
+r10 c044-046 fg=idx188 bg=idx16
+r10 c047-053 fg=idx116 bg=idx16
+r10 c054-055 fg=idx188 bg=idx16
+r10 c056-059 fg=idx186 bg=idx16
+r10 c060-060 fg=idx188 bg=idx16
+r10 c061-111 fg=reset bg=idx16
+r10 c112-112 fg=reset bg=idx237
+r10 c113-119 fg=reset bg=idx16
+r11 c000-001 fg=reset bg=idx233
+r11 c002-002 fg=idx244 bg=idx233
+r11 c003-003 fg=reset bg=idx233
+r11 c004-004 fg=idx235 bg=idx233
+r11 c005-034 fg=reset bg=idx233
+r11 c035-035 fg=idx235 bg=idx233
+r11 c036-036 fg=reset bg=idx16
+r11 c037-041 fg=idx238 bg=idx16
+r11 c042-042 fg=reset bg=idx16
+r11 c043-043 fg=idx220 bg=idx16
+r11 c044-111 fg=reset bg=idx16
+r11 c112-112 fg=reset bg=idx237
+r11 c113-119 fg=reset bg=idx16
+r12 c000-003 fg=reset bg=idx233
+r12 c004-004 fg=idx235 bg=idx233
+r12 c005-034 fg=reset bg=idx233
+r12 c035-035 fg=idx235 bg=idx233
+r12 c036-036 fg=reset bg=idx16
+r12 c037-041 fg=idx238 bg=idx16
+r12 c042-111 fg=reset bg=idx16
+r12 c112-112 fg=reset bg=idx237
+r12 c113-119 fg=reset bg=idx16
+r13 c000-001 fg=reset bg=idx233
+r13 c002-002 fg=idx244 bg=idx233
+r13 c003-003 fg=reset bg=idx233
+r13 c004-004 fg=idx235 bg=idx233
+r13 c005-034 fg=reset bg=idx233
+r13 c035-035 fg=idx235 bg=idx233
+r13 c036-036 fg=reset bg=idx16
+r13 c037-041 fg=idx238 bg=idx16
+r13 c042-042 fg=reset bg=idx16
+r13 c043-046 fg=idx147 bg=idx16 mod=BOLD
+r13 c047-047 fg=idx188 bg=idx16
+r13 c048-050 fg=idx186 bg=idx16
+r13 c051-052 fg=idx188 bg=idx16
+r13 c053-059 fg=idx186 bg=idx16
+r13 c060-060 fg=idx188 bg=idx16
+r13 c061-063 fg=idx147 bg=idx16 mod=BOLD
+r13 c064-064 fg=idx188 bg=idx16
+r13 c065-072 fg=idx186 bg=idx16
+r13 c073-074 fg=idx188 bg=idx16
+r13 c075-075 fg=idx147 bg=idx16 mod=BOLD
+r13 c076-077 fg=idx188 bg=idx16
+r13 c078-078 fg=idx220 bg=idx16
+r13 c079-111 fg=reset bg=idx16
+r13 c112-112 fg=reset bg=idx237
+r13 c113-119 fg=reset bg=idx16
+r14 c000-003 fg=reset bg=idx233
+r14 c004-004 fg=idx235 bg=idx233
+r14 c005-034 fg=reset bg=idx233
+r14 c035-035 fg=idx235 bg=idx233
+r14 c036-036 fg=reset bg=idx16
+r14 c037-041 fg=idx238 bg=idx16
+r14 c042-042 fg=reset bg=idx16
+r14 c043-043 fg=idx235 bg=idx16
+r14 c044-046 fg=idx188 bg=idx16
+r14 c047-048 fg=idx147 bg=idx16 mod=BOLD
+r14 c049-049 fg=idx188 bg=idx16
+r14 c050-052 fg=idx116 bg=idx16
+r14 c053-053 fg=idx170 bg=idx16
+r14 c054-054 fg=idx188 bg=idx16
+r14 c055-058 fg=idx210 bg=idx16
+r14 c059-060 fg=idx188 bg=idx16
+r14 c061-061 fg=idx215 bg=idx16
+r14 c062-064 fg=idx188 bg=idx16
+r14 c065-067 fg=idx147 bg=idx16 mod=BOLD
+r14 c068-068 fg=idx188 bg=idx16
+r14 c069-071 fg=idx186 bg=idx16
+r14 c072-073 fg=idx188 bg=idx16
+r14 c074-082 fg=idx186 bg=idx16
+r14 c083-084 fg=idx188 bg=idx16
+r14 c085-085 fg=idx147 bg=idx16 mod=BOLD
+r14 c086-086 fg=idx188 bg=idx16
+r14 c087-087 fg=idx170 bg=idx16
+r14 c088-091 fg=idx188 bg=idx16
+r14 c092-094 fg=idx186 bg=idx16
+r14 c095-096 fg=idx188 bg=idx16
+r14 c097-102 fg=idx186 bg=idx16
+r14 c103-103 fg=idx188 bg=idx16
+r14 c104-104 fg=idx170 bg=idx16
+r14 c105-111 fg=reset bg=idx16
+r14 c112-112 fg=reset bg=idx237
+r14 c113-119 fg=reset bg=idx16
+r15 c000-003 fg=reset bg=idx233
+r15 c004-004 fg=idx235 bg=idx233
+r15 c005-034 fg=reset bg=idx233
+r15 c035-035 fg=idx235 bg=idx233
+r15 c036-036 fg=reset bg=idx16
+r15 c037-041 fg=idx238 bg=idx16
+r15 c042-042 fg=reset bg=idx16
+r15 c043-043 fg=idx235 bg=idx16
+r15 c044-046 fg=idx188 bg=idx16
+r15 c047-047 fg=idx235 bg=idx16
+r15 c048-050 fg=idx188 bg=idx16
+r15 c051-053 fg=idx147 bg=idx16 mod=BOLD
+r15 c054-061 fg=idx188 bg=idx16
+r15 c062-063 fg=idx147 bg=idx16 mod=BOLD
+r15 c064-064 fg=idx188 bg=idx16
+r15 c065-068 fg=idx210 bg=idx16
+r15 c069-069 fg=idx188 bg=idx16
+r15 c070-076 fg=idx116 bg=idx16
+r15 c077-077 fg=idx188 bg=idx16
+r15 c078-078 fg=idx39 bg=idx16
+r15 c079-079 fg=idx188 bg=idx16
+r15 c080-082 fg=idx150 bg=idx16
+r15 c083-083 fg=idx188 bg=idx16
+r15 c084-084 fg=idx39 bg=idx16
+r15 c085-085 fg=idx188 bg=idx16
+r15 c086-089 fg=idx147 bg=idx16 mod=BOLD
+r15 c090-090 fg=idx188 bg=idx16
+r15 c091-091 fg=idx39 bg=idx16
+r15 c092-092 fg=idx188 bg=idx16
+r15 c093-095 fg=idx150 bg=idx16
+r15 c096-096 fg=idx188 bg=idx16
+r15 c097-097 fg=idx39 bg=idx16
+r15 c098-098 fg=idx188 bg=idx16
+r15 c099-111 fg=reset bg=idx16
+r15 c112-112 fg=reset bg=idx237
+r15 c113-119 fg=reset bg=idx16
+r16 c000-003 fg=reset bg=idx233
+r16 c004-004 fg=idx235 bg=idx233
+r16 c005-034 fg=reset bg=idx233
+r16 c035-035 fg=idx235 bg=idx233
+r16 c036-036 fg=reset bg=idx16
+r16 c037-041 fg=idx238 bg=idx16
+r16 c042-042 fg=reset bg=idx16
+r16 c043-043 fg=idx235 bg=idx16
+r16 c044-046 fg=idx188 bg=idx16
+r16 c047-047 fg=idx235 bg=idx16
+r16 c048-050 fg=idx188 bg=idx16
+r16 c051-056 fg=idx116 bg=idx16
+r16 c057-057 fg=idx39 bg=idx16
+r16 c058-058 fg=idx215 bg=idx16
+r16 c059-060 fg=idx188 bg=idx16
+r16 c061-077 fg=idx150 bg=idx16
+r16 c078-079 fg=idx188 bg=idx16
+r16 c080-083 fg=idx210 bg=idx16
+r16 c084-088 fg=idx188 bg=idx16
+r16 c089-089 fg=idx39 bg=idx16
+r16 c090-111 fg=reset bg=idx16
+r16 c112-112 fg=reset bg=idx237
+r16 c113-119 fg=reset bg=idx16
+r17 c000-003 fg=reset bg=idx233
+r17 c004-004 fg=idx235 bg=idx233
+r17 c005-034 fg=reset bg=idx233
+r17 c035-035 fg=idx235 bg=idx233
+r17 c036-036 fg=reset bg=idx16
+r17 c037-041 fg=idx238 bg=idx16
+r17 c042-042 fg=reset bg=idx16
+r17 c043-043 fg=idx235 bg=idx16
+r17 c044-046 fg=idx188 bg=idx16
+r17 c047-047 fg=idx170 bg=idx16
+r17 c048-111 fg=reset bg=idx16
+r17 c112-112 fg=reset bg=idx237
+r17 c113-119 fg=reset bg=idx16
+r18 c000-003 fg=reset bg=idx233
+r18 c004-004 fg=idx235 bg=idx233
+r18 c005-034 fg=reset bg=idx233
+r18 c035-035 fg=idx235 bg=idx233
+r18 c036-036 fg=reset bg=idx16
+r18 c037-041 fg=idx238 bg=idx16
+r18 c042-042 fg=reset bg=idx16
+r18 c043-043 fg=idx220 bg=idx16
+r18 c044-111 fg=reset bg=idx16
+r18 c112-112 fg=reset bg=idx237
+r18 c113-119 fg=reset bg=idx16
+r19 c000-003 fg=reset bg=idx233
+r19 c004-004 fg=idx235 bg=idx233
+r19 c005-034 fg=reset bg=idx233
+r19 c035-035 fg=idx235 bg=idx233
+r19 c036-036 fg=reset bg=idx16
+r19 c037-041 fg=idx238 bg=idx16
+r19 c042-111 fg=reset bg=idx16
+r19 c112-112 fg=reset bg=idx237
+r19 c113-119 fg=reset bg=idx16
+r20 c000-003 fg=reset bg=idx233
+r20 c004-004 fg=idx235 bg=idx233
+r20 c005-034 fg=reset bg=idx233
+r20 c035-035 fg=idx235 bg=idx233
+r20 c036-036 fg=reset bg=idx16
+r20 c037-041 fg=idx238 bg=idx16
+r20 c042-042 fg=reset bg=idx16
+r20 c043-044 fg=idx147 bg=idx16 mod=BOLD
+r20 c045-045 fg=idx188 bg=idx16
+r20 c046-049 fg=idx116 bg=idx16
+r20 c050-051 fg=idx220 bg=idx16
+r20 c052-052 fg=idx188 bg=idx16
+r20 c053-053 fg=idx220 bg=idx16
+r20 c054-111 fg=reset bg=idx16
+r20 c112-112 fg=reset bg=idx237
+r20 c113-119 fg=reset bg=idx16
+r21 c000-003 fg=reset bg=idx233
+r21 c004-004 fg=idx235 bg=idx233
+r21 c005-034 fg=reset bg=idx233
+r21 c035-035 fg=idx235 bg=idx233
+r21 c036-036 fg=reset bg=idx16
+r21 c037-041 fg=idx238 bg=idx16
+r21 c042-042 fg=reset bg=idx16
+r21 c043-043 fg=idx235 bg=idx16
+r21 c044-046 fg=idx188 bg=idx16
+r21 c047-049 fg=idx147 bg=idx16 mod=BOLD
+r21 c050-061 fg=idx188 bg=idx16
+r21 c062-069 fg=idx186 bg=idx16
+r21 c070-070 fg=idx188 bg=idx16
+r21 c071-071 fg=idx170 bg=idx16
+r21 c072-072 fg=idx188 bg=idx16
+r21 c073-076 fg=idx116 bg=idx16
+r21 c077-078 fg=idx188 bg=idx16
+r21 c079-085 fg=idx150 bg=idx16
+r21 c086-087 fg=idx188 bg=idx16
+r21 c088-094 fg=idx116 bg=idx16
+r21 c095-096 fg=idx188 bg=idx16
+r21 c097-100 fg=idx215 bg=idx16
+r21 c101-101 fg=idx188 bg=idx16
+r21 c102-102 fg=idx170 bg=idx16
+r21 c103-103 fg=idx188 bg=idx16
+r21 c104-111 fg=reset bg=idx16
+r21 c112-112 fg=reset bg=idx237
+r21 c113-119 fg=reset bg=idx16
+r22 c000-003 fg=reset bg=idx233
+r22 c004-004 fg=idx235 bg=idx233
+r22 c005-034 fg=reset bg=idx233
+r22 c035-035 fg=idx235 bg=idx233
+r22 c036-036 fg=reset bg=idx16
+r22 c037-041 fg=idx238 bg=idx16
+r22 c042-042 fg=reset bg=idx16
+r22 c043-043 fg=idx235 bg=idx16
+r22 c044-046 fg=idx188 bg=idx16
+r22 c047-054 fg=idx116 bg=idx16
+r22 c055-055 fg=idx170 bg=idx16
+r22 c056-067 fg=idx150 bg=idx16
+r22 c068-068 fg=idx170 bg=idx16
+r22 c069-069 fg=idx188 bg=idx16
+r22 c070-111 fg=reset bg=idx16
+r22 c112-112 fg=idx178 bg=idx237
+r22 c113-119 fg=reset bg=idx16
+r23 c000-003 fg=reset bg=idx233
+r23 c004-004 fg=idx235 bg=idx233
+r23 c005-034 fg=reset bg=idx233
+r23 c035-035 fg=idx235 bg=idx233
+r23 c036-036 fg=reset bg=idx16
+r23 c037-041 fg=idx238 bg=idx16
+r23 c042-042 fg=reset bg=idx16
+r23 c043-043 fg=idx235 bg=idx16
+r23 c044-046 fg=idx188 bg=idx16
+r23 c047-049 fg=idx147 bg=idx16 mod=BOLD
+r23 c050-050 fg=idx188 bg=idx16
+r23 c051-055 fg=idx188 bg=idx16 ul=idx178 mod=UNDERLINED
+r23 c056-058 fg=idx188 bg=idx16
+r23 c059-060 fg=idx215 bg=idx16
+r23 c061-061 fg=idx188 bg=idx16
+r23 c062-111 fg=reset bg=idx16
+r23 c112-112 fg=reset bg=idx237
+r23 c113-119 fg=reset bg=idx16
+r24 c000-003 fg=reset bg=idx233
+r24 c004-004 fg=idx235 bg=idx233
+r24 c005-034 fg=reset bg=idx233
+r24 c035-035 fg=idx235 bg=idx233
+r24 c036-119 fg=idx235 bg=idx16
+r25 c000-003 fg=reset bg=idx233
+r25 c004-004 fg=idx235 bg=idx233
+r25 c005-034 fg=reset bg=idx233
+r25 c035-035 fg=idx235 bg=idx233
+r25 c036-036 fg=reset bg=idx233
+r25 c037-044 fg=idx255 bg=idx233 ul=idx73 mod=UNDERLINED
+r25 c045-045 fg=idx255 bg=idx233
+r25 c046-048 fg=idx216 bg=idx236
+r25 c049-049 fg=reset bg=idx233
+r25 c050-057 fg=idx244 bg=idx233
+r25 c058-058 fg=reset bg=idx233
+r25 c059-068 fg=idx244 bg=idx233
+r25 c069-069 fg=reset bg=idx233
+r25 c070-076 fg=idx244 bg=idx233
+r25 c077-077 fg=reset bg=idx233
+r25 c078-087 fg=idx244 bg=idx233
+r25 c088-115 fg=reset bg=idx233
+r25 c116-118 fg=idx244 bg=idx233
+r25 c119-119 fg=reset bg=idx233
+r26 c000-003 fg=reset bg=idx233
+r26 c004-004 fg=idx235 bg=idx233
+r26 c005-034 fg=reset bg=idx233
+r26 c035-035 fg=idx235 bg=idx233
+r26 c036-102 fg=idx235 bg=idx16
+r26 c103-107 fg=idx245 bg=idx16
+r26 c108-110 fg=idx235 bg=idx16
+r26 c111-117 fg=idx245 bg=idx16
+r26 c118-119 fg=idx235 bg=idx16
+r27 c000-003 fg=reset bg=idx233
+r27 c004-004 fg=idx235 bg=idx233
+r27 c005-034 fg=reset bg=idx233
+r27 c035-035 fg=idx235 bg=idx233
+r27 c036-036 fg=reset bg=idx16
+r27 c037-038 fg=idx242 bg=idx16
+r27 c039-040 fg=idx180 bg=idx16
+r27 c041-047 fg=idx255 bg=idx16 mod=BOLD
+r27 c048-054 fg=idx242 bg=idx16
+r27 c055-119 fg=reset bg=idx16
+r28 c000-003 fg=reset bg=idx233
+r28 c004-004 fg=idx235 bg=idx233
+r28 c005-034 fg=reset bg=idx233
+r28 c035-035 fg=idx235 bg=idx233
+r28 c036-036 fg=reset bg=idx16
+r28 c037-041 fg=idx178 bg=idx16
+r28 c042-065 fg=idx252 bg=idx16
+r28 c066-094 fg=idx242 bg=idx16
+r28 c095-119 fg=reset bg=idx16
+r29 c000-003 fg=reset bg=idx233
+r29 c004-004 fg=idx235 bg=idx233
+r29 c005-034 fg=reset bg=idx233
+r29 c035-035 fg=idx235 bg=idx233
+r29 c036-119 fg=reset bg=idx16
+r30 c000-003 fg=reset bg=idx233
+r30 c004-004 fg=idx235 bg=idx233
+r30 c005-034 fg=reset bg=idx233
+r30 c035-035 fg=idx235 bg=idx233
+r30 c036-119 fg=reset bg=idx16
+r31 c000-003 fg=reset bg=idx233
+r31 c004-004 fg=idx235 bg=idx233
+r31 c005-034 fg=reset bg=idx233
+r31 c035-035 fg=idx235 bg=idx233
+r31 c036-119 fg=reset bg=idx16
+r32 c000-003 fg=reset bg=idx233
+r32 c004-004 fg=idx235 bg=idx233
+r32 c005-034 fg=reset bg=idx233
+r32 c035-035 fg=idx235 bg=idx233
+r32 c036-119 fg=reset bg=idx16
+r33 c000-003 fg=reset bg=idx233
+r33 c004-004 fg=idx235 bg=idx233
+r33 c005-034 fg=reset bg=idx233
+r33 c035-035 fg=idx235 bg=idx233
+r33 c036-119 fg=reset bg=idx16
+r34 c000-001 fg=reset bg=idx233
+r34 c002-002 fg=idx244 bg=idx233
+r34 c003-003 fg=reset bg=idx233
+r34 c004-035 fg=idx235 bg=idx233
+r34 c036-119 fg=reset bg=idx16
+r35 c000-003 fg=reset bg=idx233
+r35 c004-004 fg=idx235 bg=idx233
+r35 c005-006 fg=idx244 bg=idx233
+r35 c007-013 fg=idx244 bg=idx233 mod=BOLD
+r35 c014-034 fg=reset bg=idx233
+r35 c035-035 fg=idx235 bg=idx233
+r35 c036-119 fg=reset bg=idx16
+r36 c000-001 fg=reset bg=idx233
+r36 c002-002 fg=idx244 bg=idx233
+r36 c003-003 fg=reset bg=idx233
+r36 c004-035 fg=idx235 bg=idx233
+r36 c036-119 fg=reset bg=idx16
+r37 c000-003 fg=reset bg=idx233
+r37 c004-004 fg=idx235 bg=idx233
+r37 c005-006 fg=idx244 bg=idx233
+r37 c007-014 fg=idx244 bg=idx233 mod=BOLD
+r37 c015-034 fg=reset bg=idx233
+r37 c035-035 fg=idx235 bg=idx233
+r37 c036-119 fg=reset bg=idx16
+r38 c000-003 fg=reset bg=idx233
+r38 c004-035 fg=idx235 bg=idx233
+r38 c036-119 fg=idx235 bg=idx16
+r39 c000-000 fg=reset bg=idx238
+r39 c001-002 fg=idx173 bg=idx238 mod=BOLD
+r39 c003-010 fg=idx188 bg=idx238 mod=BOLD
+r39 c011-011 fg=idx238 bg=idx233
+r39 c012-012 fg=reset bg=idx233
+r39 c013-016 fg=idx237 bg=idx233
+r39 c017-019 fg=idx179 bg=idx233
+r39 c020-021 fg=idx188 bg=idx233
+r39 c022-023 fg=reset bg=idx233
+r39 c024-028 fg=idx244 bg=idx233
+r39 c029-072 fg=reset bg=idx233
+r39 c073-076 fg=idx237 bg=idx233
+r39 c077-077 fg=idx188 bg=idx233
+r39 c078-083 fg=idx237 bg=idx233
+r39 c084-084 fg=idx188 bg=idx233
+r39 c085-085 fg=idx237 bg=idx233
+r39 c086-086 fg=reset bg=idx233
+r39 c087-097 fg=idx244 bg=idx233
+r39 c098-098 fg=reset bg=idx233
+r39 c099-105 fg=idx244 bg=idx233
+r39 c106-106 fg=reset bg=idx233
+r39 c107-110 fg=idx244 bg=idx233
+r39 c111-111 fg=reset bg=idx233
+r39 c112-112 fg=idx235 bg=idx233
+r39 c113-113 fg=idx180 bg=idx235
+r39 c114-118 fg=idx188 bg=idx235
+r39 c119-119 fg=idx235 bg=idx233

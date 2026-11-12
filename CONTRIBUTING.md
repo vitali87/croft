@@ -49,6 +49,10 @@ see [docs/MACOS.md](docs/MACOS.md#spotlight-indexing-and-the-build-directory).
   `doc comments stay with their function` CI job catches it. If you are removing
   a doc on purpose, add `doc-removal: src/path/to/file.rs::name` to a commit
   message. The CI error tells you the exact key to use.
+* **Moving code between files?** Add the line `pure-move: true` to a commit
+  message and CI proves every Rust item you touched moved byte for byte
+  (visibility may widen). `python3 scripts/check_pure_move.py list <file>`
+  lists a file's items with their line ranges, to plan the move.
 * **New or changed module?** Update its entry in
   [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). CI fails if you shorten a
   module's description without moving its reasoning into a `### <module>`
@@ -64,6 +68,21 @@ add one file named `src/release_notes/unreleased/<issue>-<slug>.md`, for example
 feature: Unsaved edits survive a kill and come back on the next launch.
 fix: Ctrl+Q asks before throwing away unsaved edits.
 ```
+
+If your change ships but nothing changes for the people using croft, use the
+third kind, `refactor:`:
+
+```text
+refactor: Moved the file tree's code into its own file (#2062). Nothing changes in use.
+```
+
+That covers code moved between files, renames, and restructuring that keeps
+the same behaviour. Reviewers check the claim: if anything a user can see or
+do is different, it's a `feature:` or a `fix:`. A merge whose notes are all
+`refactor:` makes no version of its own and never counts toward the 50 below.
+Its notes wait and go out with the next version that has a feature, a fix or a
+dependency update. The welcome card leaves refactor lines out, and a GitHub
+release sums them up in one line.
 
 **Never** change `version` in `Cargo.toml`, and never edit
 `src/release_notes/<version>.md`. After your PR merges, CI assigns the version,
@@ -156,7 +175,10 @@ python3 scripts/check_doc_ownership.py "$base" HEAD     # doc comments
 CI also cross-builds the static musl binaries that `croft remote` ships, and an
 Android build. If you bump `rust-toolchain.toml`, add the cross targets
 (`rustup target add x86_64-unknown-linux-musl aarch64-unknown-linux-musl`) and
-make sure those jobs stay green.
+make sure those jobs stay green. Pull requests labelled `refactor`, and every
+push to `main`, also run clippy on macOS, since the Linux jobs never compile
+`#[cfg(target_os = "macos")]` code. CI fails if the published package nears
+crates.io's 10 MiB limit.
 
 ### Flaky tests
 

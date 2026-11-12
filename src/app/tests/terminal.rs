@@ -1155,19 +1155,9 @@ fn quick_select_paints_gold_labels_and_broadcast_paints_modal_and_pills() {
         .unwrap(),
     );
     assert!(app.handle_cmd_k_chord(key(KeyCode::Char('i'), KeyModifiers::NONE)));
-    fn screen_rows(term: &ratatui::Terminal<ratatui::backend::TestBackend>) -> Vec<String> {
-        let buf = term.backend().buffer();
-        (0..buf.area.height)
-            .map(|y| {
-                (0..buf.area.width)
-                    .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
-                    .collect()
-            })
-            .collect()
-    }
     term.draw(|f| app.render(f)).unwrap();
     assert!(
-        screen_rows(&term)
+        screen_char_rows(&term)
             .iter()
             .any(|r| r.contains("BROADCAST INPUT TO ALL PANES?")),
         "the confirm modal must be painted while pending"
@@ -1175,7 +1165,7 @@ fn quick_select_paints_gold_labels_and_broadcast_paints_modal_and_pills() {
     app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
         .unwrap();
     term.draw(|f| app.render(f)).unwrap();
-    let marks = screen_rows(&term)
+    let marks = screen_char_rows(&term)
         .iter()
         .map(|r| r.matches('\u{21f6}').count())
         .sum::<usize>();
@@ -1835,13 +1825,6 @@ fn cross_pane_paste_via_bracketed_paste_works_in_every_destination_and_terminal_
         (tmp, app)
     }
 
-    fn render(app: &mut App) -> ratatui::Terminal<ratatui::backend::TestBackend> {
-        let backend = ratatui::backend::TestBackend::new(140, 50);
-        let mut term = ratatui::Terminal::new(backend).unwrap();
-        term.draw(|f| app.render(f)).unwrap();
-        term
-    }
-
     // Drive a bracketed paste from a non-path token, which is what
     // iTerm2 emits when the user presses Cmd+V with terminal text
     // on the clipboard. Non-path so the drop-handler branches in
@@ -1859,7 +1842,7 @@ fn cross_pane_paste_via_bracketed_paste_works_in_every_destination_and_terminal_
     // -- Case 1: paste into the editor while terminal is split.
     {
         let (_tmp, mut app) = seed_app();
-        let _draw = render(&mut app);
+        let _draw = draw_terminal(&mut app, 140, 50);
         app.focus_pane(Pane::Editor);
         app.handle_paste(payload_editor_split);
         assert!(
@@ -1875,9 +1858,9 @@ fn cross_pane_paste_via_bracketed_paste_works_in_every_destination_and_terminal_
     // -- Case 2: paste into the editor while terminal is maximised.
     {
         let (_tmp, mut app) = seed_app();
-        let _draw = render(&mut app);
+        let _draw = draw_terminal(&mut app, 140, 50);
         app.toggle_terminal_maximize();
-        let _draw = render(&mut app);
+        let _draw = draw_terminal(&mut app, 140, 50);
         app.focus_pane(Pane::Editor);
         app.handle_paste(payload_editor_max);
         assert!(
@@ -1894,7 +1877,7 @@ fn cross_pane_paste_via_bracketed_paste_works_in_every_destination_and_terminal_
     //    split. The user explicitly named this as broken.
     {
         let (_tmp, mut app) = seed_app();
-        let _draw = render(&mut app);
+        let _draw = draw_terminal(&mut app, 140, 50);
         app.focus_pane(Pane::Editor);
         app.open_editor_find();
         app.handle_paste(payload_find_split);
@@ -1913,9 +1896,9 @@ fn cross_pane_paste_via_bracketed_paste_works_in_every_destination_and_terminal_
     //    maximised.
     {
         let (_tmp, mut app) = seed_app();
-        let _draw = render(&mut app);
+        let _draw = draw_terminal(&mut app, 140, 50);
         app.toggle_terminal_maximize();
-        let _draw = render(&mut app);
+        let _draw = draw_terminal(&mut app, 140, 50);
         app.focus_pane(Pane::Editor);
         app.open_editor_find();
         app.handle_paste(payload_find_max);
@@ -1934,9 +1917,9 @@ fn cross_pane_paste_via_bracketed_paste_works_in_every_destination_and_terminal_
     //    terminal is split.
     {
         let (_tmp, mut app) = seed_app();
-        let _draw = render(&mut app);
+        let _draw = draw_terminal(&mut app, 140, 50);
         app.set_sidebar_view(SidebarView::Search);
-        let _draw = render(&mut app);
+        let _draw = draw_terminal(&mut app, 140, 50);
         app.handle_paste(payload_search_split);
         assert!(
             app.search.query.contains(payload_search_split),
@@ -1950,11 +1933,11 @@ fn cross_pane_paste_via_bracketed_paste_works_in_every_destination_and_terminal_
     //    failing while maximised worked; both must succeed.
     {
         let (_tmp, mut app) = seed_app();
-        let _draw = render(&mut app);
+        let _draw = draw_terminal(&mut app, 140, 50);
         app.toggle_terminal_maximize();
-        let _draw = render(&mut app);
+        let _draw = draw_terminal(&mut app, 140, 50);
         app.set_sidebar_view(SidebarView::Search);
-        let _draw = render(&mut app);
+        let _draw = draw_terminal(&mut app, 140, 50);
         app.handle_paste(payload_search_max);
         assert!(
             app.search.query.contains(payload_search_max),
@@ -1968,7 +1951,7 @@ fn cross_pane_paste_via_bracketed_paste_works_in_every_destination_and_terminal_
     //    writing the bytes back into the PTY.
     {
         let (_tmp, mut app) = seed_app();
-        let _draw = render(&mut app);
+        let _draw = draw_terminal(&mut app, 140, 50);
         app.focus_pane(Pane::Terminal);
         // No panic + handler completes is enough. Verifying the
         // PTY received the bytes requires polling the shell which
@@ -1980,9 +1963,9 @@ fn cross_pane_paste_via_bracketed_paste_works_in_every_destination_and_terminal_
     //    maximised.
     {
         let (_tmp, mut app) = seed_app();
-        let _draw = render(&mut app);
+        let _draw = draw_terminal(&mut app, 140, 50);
         app.toggle_terminal_maximize();
-        let _draw = render(&mut app);
+        let _draw = draw_terminal(&mut app, 140, 50);
         app.focus_pane(Pane::Terminal);
         app.handle_paste("clip-into-terminal-maximised");
     }
@@ -1994,9 +1977,9 @@ fn cross_pane_paste_via_bracketed_paste_works_in_every_destination_and_terminal_
     //    commit message when sidebar_view == SourceControl.
     {
         let (_tmp, mut app) = seed_app();
-        let _draw = render(&mut app);
+        let _draw = draw_terminal(&mut app, 140, 50);
         app.set_sidebar_view(SidebarView::SourceControl);
-        let _draw = render(&mut app);
+        let _draw = draw_terminal(&mut app, 140, 50);
         app.handle_paste(payload_sc);
         assert!(
             app.source_control.message.contains(payload_sc),
@@ -2008,7 +1991,7 @@ fn cross_pane_paste_via_bracketed_paste_works_in_every_destination_and_terminal_
     // -- Case 10: paste into the file-finder (Cmd+P quick-open).
     {
         let (_tmp, mut app) = seed_app();
-        let _draw = render(&mut app);
+        let _draw = draw_terminal(&mut app, 140, 50);
         app.open_file_finder();
         app.handle_paste(payload_finder);
         let q = app
@@ -2663,7 +2646,7 @@ fn terminal_clear_from_the_palette_empties_the_active_pane() {
     app.active_terminal = 1;
     await_terminal_probe(&mut app, "cleared-1562");
     app.focus_pane(Pane::Editor);
-    assert!(run_from_palette(&mut app, "Terminal: Clear"));
+    assert!(run_palette_row_titled(&mut app, "Terminal: Clear"));
     assert!(
         !app.terminals[1].visible_text().contains("cleared-1562"),
         "{}",
@@ -3528,6 +3511,374 @@ fn capture_triggers_collect_into_the_captures_panel_and_jump_to_the_line() {
     );
 }
 
+/// An app whose only pane runs `script` (with `$e` set to `err`) under an
+/// `err-N` capture trigger, once `want` lines have been captured. Read-gated
+/// and assembled at runtime like the test above, so the trigger set reaches
+/// the pane first and the `▶ …` header never fires it.
+fn app_with_captures(script: &str, want: usize) -> (tempfile::TempDir, App) {
+    app_with_triggers(ERR_CAPTURE, script, want)
+}
+
+const ERR_CAPTURE: &str =
+    r#"[ { "regex": "err-(\\d+)", "action": "capture", "message": "boom \\1" } ]"#;
+
+/// [`app_with_captures`] with the pane's triggers given as JSON.
+fn app_with_triggers(triggers: &str, script: &str, want: usize) -> (tempfile::TempDir, App) {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.triggers = std::sync::Arc::new(crate::triggers::TriggerSet::from_json(triggers));
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[
+            String::from("-c"),
+            format!("read x; e=err; {script}; sleep 30"),
+        ],
+        tmp.path(),
+    )
+    .unwrap();
+    app.drain_terminal_bells();
+    app.terminals[0].write_input(b"\n");
+    await_captures(&mut app, want);
+    (tmp, app)
+}
+
+/// Drain the pane until the CAPTURES panel holds `want` entries.
+fn await_captures(app: &mut App, want: usize) {
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::SHELL_PAINT_BASE,
+        "the error lines to be captured",
+        || {
+            app.drain_terminal_bells();
+            app.captures.len() >= want
+        },
+    );
+}
+
+#[test]
+fn each_capture_of_a_repeated_line_jumps_to_its_own_copy() {
+    // #1450: a test that fails on every run prints the same line every run,
+    // and every entry jumped to the newest copy, so the first run's entry
+    // selected the last run's failure.
+    let (_tmp, mut app) =
+        app_with_captures("echo ${e}-7 broke; echo between; echo ${e}-7 broke", 2);
+    let mut rows = Vec::new();
+    for i in 0..2 {
+        app.captures.select_index(i);
+        app.captures_open_selected();
+        let sel = app.terminals[0]
+            .selection()
+            .expect("the jump selects the line");
+        assert!(
+            app.terminals[0].selection_text().contains("err-7 broke"),
+            "{}",
+            app.status
+        );
+        rows.push(sel.anchor.0);
+    }
+    assert_eq!(
+        rows[1] - rows[0],
+        2,
+        "the first entry selects the upper copy, the second the lower: {rows:?}"
+    );
+}
+
+#[test]
+fn a_capture_that_left_the_scrollback_is_not_stood_in_for_by_its_repeat() {
+    // 6000 filler rows push the first copy past the 5000-row scrollback.
+    let (_tmp, mut app) = app_with_captures(
+        "echo ${e}-7 broke; yes 'filler line' | head -n 6000; echo ${e}-7 broke",
+        2,
+    );
+    let (lines, _) = app.terminals[0].grid_lines();
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|l| l.starts_with("err-7 broke"))
+            .count(),
+        1,
+        "precondition: the first copy rotated off the scrollback"
+    );
+    app.captures.select_index(0);
+    app.captures_open_selected();
+    assert_eq!(app.status, "Captured line is no longer in the scrollback");
+    assert!(
+        app.terminals[0].selection().is_none(),
+        "the first run's entry must not select the second run's line"
+    );
+    app.captures.select_index(1);
+    app.captures_open_selected();
+    assert!(
+        app.terminals[0].selection_text().contains("err-7 broke"),
+        "the copy still on screen is found: {}",
+        app.status
+    );
+}
+
+#[test]
+fn a_resize_that_rewraps_the_output_keeps_each_capture_on_its_own_copy() {
+    // A resize re-wraps the 200-column lines by a different number of rows
+    // above each copy, so no single scroll shift can follow both (#1450).
+    let long = "printf '%0200d\\n' 0";
+    let (_tmp, mut app) = app_with_captures(
+        &format!(
+            "echo ${{e}}-7 broke; echo first; {long}; echo ${{e}}-7 broke; echo second; \
+             {long}; {long}; {long}"
+        ),
+        2,
+    );
+    for (cols, when) in [(80, "as printed"), (40, "narrower"), (120, "wider")] {
+        app.terminals[0].resize(cols, 24);
+        for (i, next) in ["first", "second"].into_iter().enumerate() {
+            app.captures.select_index(i);
+            app.captures_open_selected();
+            let line = app.terminals[0]
+                .selection()
+                .unwrap_or_else(|| panic!("{when}: entry {i}: {}", app.status))
+                .anchor
+                .0;
+            let (lines, top) = app.terminals[0].grid_lines();
+            assert_eq!(
+                lines[(line - top) as usize + 1].trim_end(),
+                next,
+                "{when}: entry {i} selects its own copy"
+            );
+        }
+    }
+}
+
+/// Run `before`, then a full-screen program that the pane is resized to 40
+/// columns under, then `after` once it exits (#1450).
+fn app_resized_under_a_full_screen_program(
+    before: &str,
+    want: usize,
+    after: &str,
+) -> (tempfile::TempDir, App) {
+    app_resized_under_a_full_screen_program_with(ERR_CAPTURE, before, want, after)
+}
+
+/// [`app_resized_under_a_full_screen_program`] with the triggers as JSON.
+fn app_resized_under_a_full_screen_program_with(
+    triggers: &str,
+    before: &str,
+    want: usize,
+    after: &str,
+) -> (tempfile::TempDir, App) {
+    let (tmp, mut app) = app_with_triggers(
+        triggers,
+        &format!(
+            "{before}; printf '\\033[?1049h'; read y; printf '\\033[?1049l'; {after}; echo back"
+        ),
+        want,
+    );
+    let wait = |app: &mut App, what: &str, done: &dyn Fn(&App) -> bool| {
+        crate::test_budget::await_spawned(
+            crate::test_budget::tests::SHELL_PAINT_BASE,
+            what,
+            || {
+                app.drain_terminal_bells();
+                done(app)
+            },
+        );
+    };
+    wait(&mut app, "the full-screen program", &|app| {
+        app.terminals[0].alt_screen()
+    });
+    app.terminals[0].resize(40, 24);
+    app.terminals[0].write_input(b"\n");
+    wait(&mut app, "the shell back on the primary screen", &|app| {
+        !app.terminals[0].alt_screen()
+            && app.terminals[0]
+                .grid_lines()
+                .0
+                .iter()
+                .any(|l| l.trim_end() == "back")
+    });
+    (tmp, app)
+}
+
+#[test]
+fn a_resize_under_a_full_screen_program_keeps_each_capture_on_its_own_copy() {
+    // A full-screen program hides the primary grid, but a resize re-wraps
+    // it all the same, out of reach. Each entry then finds its line by its
+    // text and its order among the copies, not the newest copy and not
+    // "gone" for a line still on screen (#1450).
+    let long = "printf '%0200d\\n' 0";
+    let (_tmp, mut app) = app_resized_under_a_full_screen_program(
+        &format!(
+            "echo ${{e}}-7 broke; echo first; {long}; echo ${{e}}-7 broke; echo second; \
+             {long}; {long}; {long}"
+        ),
+        2,
+        "true",
+    );
+    for (i, next) in ["first", "second"].into_iter().enumerate() {
+        app.captures.select_index(i);
+        app.captures_open_selected();
+        let line = app.terminals[0]
+            .selection()
+            .unwrap_or_else(|| panic!("entry {i}: {}", app.status))
+            .anchor
+            .0;
+        let (lines, top) = app.terminals[0].grid_lines();
+        assert_eq!(
+            lines[(line - top) as usize + 1].trim_end(),
+            next,
+            "entry {i} selects its own copy"
+        );
+    }
+}
+
+#[test]
+fn two_triggers_on_one_line_still_find_it_after_a_full_screen_resize() {
+    // Two `capture` triggers catch each copy, so each printed line has two
+    // entries; after a resize under a full-screen program each entry still
+    // counts printed lines, not entries, and selects its own copy (#1450).
+    let both = r#"[
+        { "regex": "err-(\\d+)", "action": "capture", "message": "boom \\1" },
+        { "regex": "broke", "action": "capture", "message": "broke" }
+    ]"#;
+    let (_tmp, mut app) = app_resized_under_a_full_screen_program_with(
+        both,
+        "echo ${e}-7 broke; echo first; echo ${e}-7 broke; echo second",
+        4,
+        "true",
+    );
+    for (i, next) in ["first", "first", "second", "second"]
+        .into_iter()
+        .enumerate()
+    {
+        app.captures.select_index(i);
+        app.captures_open_selected();
+        let line = app.terminals[0]
+            .selection()
+            .unwrap_or_else(|| panic!("entry {i}: {}", app.status))
+            .anchor
+            .0;
+        let (lines, top) = app.terminals[0].grid_lines();
+        assert_eq!(
+            lines[(line - top) as usize + 1].trim_end(),
+            next,
+            "entry {i} selects its own copy"
+        );
+    }
+}
+
+#[test]
+fn a_reset_after_a_full_screen_resize_drops_the_capture() {
+    // A reset (RIS) erases the screen and the scrollback. An entry whose row
+    // a full-screen resize had made unknown must then say its line is gone,
+    // not select text that starts the same and was printed after the reset
+    // without being captured (#1450).
+    let exact =
+        r#"[ { "regex": "^err-(\\d+) broke$", "action": "capture", "message": "boom \\1" } ]"#;
+    let (_tmp, mut app) = app_resized_under_a_full_screen_program_with(
+        exact,
+        "echo ${e}-7 broke",
+        1,
+        "printf '\\033c'; echo ${e}-7 broke again",
+    );
+    assert_eq!(app.captures.len(), 1, "the later line is not captured");
+    app.captures.select_index(0);
+    app.captures_open_selected();
+    assert_eq!(app.status, "Captured line is no longer in the scrollback");
+    assert!(app.terminals[0].selection().is_none());
+}
+
+#[test]
+fn a_copy_gone_after_a_full_screen_resize_is_not_stood_in_for_by_its_repeat() {
+    // The first copy rotates off the 5000-row scrollback after the resize
+    // under a full-screen program; its entry says so instead of taking the
+    // second copy, which its own entry still finds (#1450).
+    let (_tmp, mut app) = app_resized_under_a_full_screen_program(
+        "echo ${e}-7 broke; yes 'filler line' | head -n 4995; echo ${e}-7 broke; echo second",
+        2,
+        "yes 'filler line' | head -n 100",
+    );
+    let (lines, _) = app.terminals[0].grid_lines();
+    assert_eq!(
+        lines
+            .iter()
+            .filter(|l| l.starts_with("err-7 broke"))
+            .count(),
+        1,
+        "precondition: the first copy rotated off the scrollback"
+    );
+    app.captures.select_index(0);
+    app.captures_open_selected();
+    assert_eq!(app.status, "Captured line is no longer in the scrollback");
+    assert!(app.terminals[0].selection().is_none());
+    app.captures.select_index(1);
+    app.captures_open_selected();
+    assert!(
+        app.terminals[0].selection_text().contains("err-7 broke"),
+        "the copy still on screen is found: {}",
+        app.status
+    );
+}
+
+#[test]
+fn a_capture_erased_by_a_clear_is_not_stood_in_for_by_a_later_copy() {
+    // The program's own `clear` erases the first copy and the pane's Clear
+    // the second; each entry then says its line is gone rather than jumping
+    // to the copy printed after it (#1450).
+    let (_tmp, mut app) = app_with_captures(
+        "echo ${e}-7 broke; read y; printf '\\033[H\\033[2J\\033[3J'; echo ${e}-7 broke; \
+         read z; echo ${e}-7 broke",
+        1,
+    );
+    app.terminals[0].write_input(b"\n");
+    await_captures(&mut app, 2);
+    app.terminals[0].clear_screen_and_scrollback();
+    app.terminals[0].write_input(b"\n");
+    await_captures(&mut app, 3);
+    for i in 0..2 {
+        app.captures.select_index(i);
+        app.captures_open_selected();
+        assert_eq!(
+            app.status, "Captured line is no longer in the scrollback",
+            "entry {i}"
+        );
+        assert!(app.terminals[0].selection().is_none(), "entry {i}");
+    }
+    app.captures.select_index(2);
+    app.captures_open_selected();
+    assert!(
+        app.terminals[0].selection_text().contains("err-7 broke"),
+        "the copy printed after the Clear is found: {}",
+        app.status
+    );
+}
+
+#[test]
+fn a_capture_whose_pane_closed_takes_the_newest_match_in_the_active_pane() {
+    // The anchor names a row in the pane that recorded it; in the pane the
+    // jump falls back to, only the text means anything (#1450).
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[String::from("-c"), String::from("sleep 30")],
+        tmp.path(),
+    )
+    .unwrap();
+    app.terminals[0].feed_bytes_for_test(b"a line from a closed pane\r\n");
+    app.captures.push(crate::widgets::captures::CapturedLine {
+        pane: String::from("gone"),
+        shell_pid: None,
+        message: String::from("captured"),
+        line: String::from("a line from a closed pane"),
+        anchor: Some(u64::MAX),
+    });
+    app.captures_open_selected();
+    assert!(
+        app.terminals[0]
+            .selection_text()
+            .contains("a line from a closed pane"),
+        "{}",
+        app.status
+    );
+}
+
 #[test]
 fn change_workspace_root_restores_the_incoming_workspaces_layout_when_the_panel_is_untouched() {
     let tmp = tempfile::tempdir().unwrap();
@@ -3668,6 +4019,7 @@ fn osc_9_4_progress_paints_a_border_gauge_and_pill_percent() {
         )
         .unwrap(),
     );
+    app.terminals[1].set_manual_name(Some(String::from("idle")));
     app.focus_pane(Pane::Terminal);
     crate::test_budget::await_spawned(
         crate::test_budget::tests::SHELL_PAINT_BASE,
@@ -3678,19 +4030,9 @@ fn osc_9_4_progress_paints_a_border_gauge_and_pill_percent() {
     let backend = ratatui::backend::TestBackend::new(140, 50);
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|f| app.render(f)).unwrap();
-    fn screen_rows(term: &ratatui::Terminal<ratatui::backend::TestBackend>) -> Vec<String> {
-        let buf = term.backend().buffer();
-        (0..buf.area.height)
-            .map(|y| {
-                (0..buf.area.width)
-                    .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
-                    .collect()
-            })
-            .collect()
-    }
     let area = app.terminals[0].last_area;
     let inner = app.terminals[0].last_inner;
-    let rows = screen_rows(&term);
+    let rows = screen_char_rows(&term);
     let border_row = &rows[(area.y + area.height - 1) as usize];
     // The gauge's fill glyph contrasts with the pane's own border weight
     // (#470): a focused pane draws a heavy border, so its fill is `═`
@@ -3726,6 +4068,23 @@ fn osc_9_4_progress_paints_a_border_gauge_and_pill_percent() {
         top_row.contains("bld \u{b7} 46%"),
         "the name pill carries the percent: {top_row:?}"
     );
+    // Croft Loch keeps the gauge on its palette: the accent eased into the
+    // canvas, not VS Code's blue. The focused pane's name is the strong ink.
+    if let Some(t) = crate::widgets::surface::tones(app.theme) {
+        let buf = term.backend().buffer();
+        let quiet = crate::gradient::rgb_color(crate::gradient::lerp_rgb(t.accent, t.canvas, 0.25));
+        assert_eq!(buf[(inner.x, area.y + area.height - 1)].fg, quiet);
+        let b = (area.x..area.right())
+            .find(|&x| buf[(x, area.y)].symbol() == "b")
+            .unwrap();
+        assert!(app.terminals[0].focused);
+        assert_eq!(buf[(b, area.y)].fg, t.strong(), "the focused pane's name");
+        let other = app.terminals[1].last_area;
+        let i = (other.x..other.right())
+            .find(|&x| buf[(x, other.y)].symbol() == "i")
+            .expect("the other pane's name");
+        assert_eq!(buf[(i, other.y)].fg, t.muted(), "an unfocused pane's name");
+    }
 
     // State 0 clears: the gauge and the pill percent both vanish.
     app.terminals[0].write_input(b"\n");
@@ -3735,7 +4094,7 @@ fn osc_9_4_progress_paints_a_border_gauge_and_pill_percent() {
         || app.terminals[0].progress().is_none(),
     );
     term.draw(|f| app.render(f)).unwrap();
-    let rows = screen_rows(&term);
+    let rows = screen_char_rows(&term);
     let border_row = &rows[(area.y + area.height - 1) as usize];
     // No FILL glyph remains. `━` is the border's own glyph on a focused
     // pane (#470), so a literal check here would fail on an intact border
@@ -6569,6 +6928,7 @@ fn jumping_to_a_captured_line_reveals_the_folded_pane_that_holds_it() {
         shell_pid: Some(pid),
         message: String::from("captured"),
         line: String::from("a captured line worth jumping to"),
+        anchor: None,
     });
     app.captures_open_selected();
 
@@ -6643,9 +7003,7 @@ fn maximizing_from_a_folded_strip_shows_the_pane_the_menu_named() {
 fn tracking_terminal_app(modes: &[u8]) -> (App, tempfile::TempDir, u16, u16, u16, u16) {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    let backend = ratatui::backend::TestBackend::new(120, 40);
-    let mut term = ratatui::Terminal::new(backend).unwrap();
-    term.draw(|f| app.render(f)).unwrap();
+    draw(&mut app, 120, 40);
     app.terminals[0].feed_bytes_for_test(modes);
     let inner = app.terminals[0].last_inner;
     assert!(
@@ -7858,7 +8216,7 @@ fn ctrl_n_leaves_terminals_vim_and_shifted_chords_alone() {
     let mut app = app_with_open_file(tmp.path(), "b.txt", "keep\n");
     app.handle_key(key(KeyCode::Char('n'), KeyModifiers::SUPER))
         .unwrap();
-    type_str(&mut app, "note");
+    type_keys(&mut app, "note");
     app.save();
     app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
         .unwrap();

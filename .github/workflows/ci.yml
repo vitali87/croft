@@ -17,6 +17,8 @@ name: CI
 on:
   push:
     branches: [main]
+  # No `labeled` type here, on purpose: every job below would re-run each time
+  # any label is added. macos.yml, which a label does start, says more.
   pull_request:
 
 # Every job here only reads the checkout; none writes to the repo, its issues
@@ -106,6 +108,16 @@ jobs:
           set -euo pipefail
           base="$(git merge-base "origin/$GITHUB_BASE_REF" HEAD)"
           python3 scripts/check_doc_ownership.py "$base" HEAD
+      # A file split moves thousands of lines nobody can review by reading.
+      # A branch that declares `pure-move: true` in a commit message gets
+      # proof instead: every Rust item it touched moved byte for byte. Without
+      # the declaration it prints what moved and changed, without diffs, and
+      # passes.
+      - name: A declared pure move only moves code
+        run: |
+          set -euo pipefail
+          base="$(git merge-base "origin/$GITHUB_BASE_REF" HEAD)"
+          python3 scripts/check_pure_move.py --if-declared "$base" HEAD
       # ARCHITECTURE.md's tree carries the reasons behind each module, and a
       # rewrite can cut a line's rationale away while the row and its
       # identifiers survive - which is what a row-level or identifier-level
@@ -183,6 +195,34 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Formatting (pinned rustfmt, zero diffs)
         run: cargo fmt --check
+      - name: Package stays under crates.io's 10 MiB limit
+        # crates.io refuses a .crate over 10 MiB (10485760 bytes), and only
+        # the upload finds out: publish-crate.yml uploads last, after the
+        # tag and the GitHub release are out, and its dry run before them
+        # never reaches the upload. The package was 9308884 bytes when this
+        # gate went in, so it fails at 9.5 MiB, while there is still room to
+        # choose what to drop. --no-verify: this measures the archive only,
+        # in seconds; that dry run is what proves it builds. Early in the
+        # job so a failing test cannot skip it.
+        run: |
+          set -euo pipefail
+          # Exactly one .crate may be measured, so none is left from an
+          # earlier version in a restored target/.
+          rm -rf target/package
+          cargo package --locked --no-verify --allow-dirty
+          crates=(target/package/croft-software-*.crate)
+          [ "${#crates[@]}" -eq 1 ] && [ -f "${crates[0]}" ] \
+            || { echo "::error::expected one croft-software .crate in target/package"; exit 1; }
+          size="$(stat -c %s "${crates[0]}")"
+          limit=9961472
+          echo "${crates[0]} is $size bytes; this gate fails above $limit, crates.io above 10485760"
+          if [ "$size" -gt "$limit" ]; then
+            echo "::error::the crate is $size bytes, over the $limit-byte gate. Add files the build never reads to \`exclude\` in Cargo.toml (include_str! and include_bytes! read only assets/, src/, docs/*.md and README.md), or shrink an included asset. \`cargo package --list\` shows what ships; the largest files (uncompressed) follow."
+            # sed, not head: head stops reading early, sort then dies of
+            # SIGPIPE, and pipefail ends the step before the `exit 1`.
+            tar -tvzf "${crates[0]}" | sort -k3,3nr | sed -n '1,15p'
+            exit 1
+          fi
       - name: Clippy (zero warnings)
         run: cargo clippy --all-targets -- -D warnings
       - name: Issue-vetting script tests (stdlib, no venv)

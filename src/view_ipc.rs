@@ -457,7 +457,10 @@ pub fn extension_for(magic: crate::magic::Magic) -> &'static str {
         // `txz`, not `xz`: `archive::kind_from_ext` claims it, so a stream
         // past the text-size guard still reaches the tar.xz browser rather
         // than hex. A plain xz that is not a tar falls through to hex anyway.
+        // Likewise for bzip2 and zstd.
         Magic::Xz => "txz",
+        Magic::Bzip2 => "tbz2",
+        Magic::Zstd => "tzst",
         Magic::Tar => "tar",
         Magic::Sqlite => "sqlite",
     }
@@ -1672,6 +1675,28 @@ mod tests {
         let mut e = crate::widgets::editor::Editor::new();
         e.open(&p).unwrap();
         assert_eq!(e.archive.as_ref().expect("browsed").kind.label(), "TAR.XZ");
+    }
+
+    /// #1645: piped bzip2 and zstd are staged under names `kind_from_ext`
+    /// claims too, for the same reason as xz above.
+    #[test]
+    fn staged_bzip2_and_zstd_stdin_route_to_their_tar_browsers_by_extension() {
+        use crate::archive::{ArchiveKind, kind_from_ext};
+        use crate::magic::Magic;
+        for (magic, kind) in [
+            (Magic::Bzip2, ArchiveKind::TarBz2),
+            (Magic::Zstd, ArchiveKind::TarZst),
+        ] {
+            let name = format!("stdin.{}", extension_for(magic));
+            assert_eq!(kind_from_ext(Path::new(&name)), Some(kind), "{name}");
+        }
+        // `pzstd` output piped in opens with a skippable frame, not the zstd
+        // magic, and is still staged as a zstd tarball (#1645 review).
+        let pzstd = b"\x50\x2a\x4d\x18\x04\x00\x00\x00skip\x28\xb5\x2f\xfd\x04\x00";
+        assert_eq!(
+            stdin_extension(pzstd, None).unwrap().as_deref(),
+            Some("tzst")
+        );
     }
 
     #[test]

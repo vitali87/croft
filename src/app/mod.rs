@@ -978,76 +978,240 @@ struct WelcomeBakeKey {
 /// Single source of truth for the application's user-facing name.
 pub const APP_NAME: &str = "croft";
 
-/// Agnoster-style status colours: clean working tree is green, any dirtiness
-/// (modified, staged, or untracked) flips the pill to yellow/orange.
-const GIT_CLEAN_COLOR: Color = Color::Rgb(0xa3, 0xbe, 0x8c);
+/// The amber a status-bar item takes when it wants attention: the
+/// uncommitted-changes dot beside the branch, and the operation git stopped
+/// in (`main | MERGING`).
 const GIT_DIRTY_COLOR: Color = Color::Rgb(0xeb, 0xcb, 0x8b);
 
-/// Build the status-bar spans for the git pill: branch glyph, branch name,
-/// optional ahead/behind counts.  Colour alone carries clean/dirty state, in
-/// the spirit of the Agnoster zsh theme.  Returns an empty vec outside a git
-/// repo so the bar shows nothing.
-fn git_status_spans<'a>(status: &'a crate::git::GitStatus) -> Vec<Span<'a>> {
+/// The dot after the branch name while the working tree has uncommitted
+/// changes (VS Code's `main*`): the branch itself keeps its quiet colour, so
+/// a dirty tree reads as one small mark rather than a recoloured segment.
+const GIT_DIRTY_DOT: &str = "\u{2022}";
+
+/// Powerline half circles, the rounded ends of a status-bar pill (as on the
+/// update pill, the PROBLEMS badge and the Extensions switches).
+const PILL_CAP_L: &str = "\u{e0b6}";
+const PILL_CAP_R: &str = "\u{e0b4}";
+
+/// The terminal cells `s` paints in, as ratatui lays it out. A wide
+/// character (`项`, an emoji) takes two, so a click target measured in
+/// `char`s would sit left of the text it belongs to.
+fn status_cells(s: &str) -> u16 {
+    unicode_width::UnicodeWidthStr::width(s) as u16
+}
+
+/// Cells left blank after the status bar's last right-hand segment: none,
+/// since the language pill's rounded end already reads as an edge.
+const STATUS_RIGHT_MARGIN: u16 = 0;
+
+/// The status bar's three text tones, so hierarchy comes from brightness
+/// rather than from dividers or a colour per item: `text` for the values you
+/// read (branch, line and column, language), `muted` for settings and
+/// commentary, and `dim` for labels and for counts that are zero.
+#[derive(Clone, Copy)]
+struct StatusTones {
+    text: Color,
+    muted: Color,
+    dim: Color,
+}
+
+impl StatusTones {
+    fn new(theme: crate::theme::Theme, bar: Color) -> Self {
+        // The theme's own foreground is already chosen for its background,
+        // light or dark; `theme.ui` would adapt it a second time (on a light
+        // theme, flipping dark text to near-white).
+        let (r, g, b) = theme.syntax().fg;
+        let text = Color::Rgb(r, g, b);
+        let muted = match theme.surfaces() {
+            Some(s) => s.muted(),
+            None => theme.ui(Color::Rgb(0x9a, 0xa4, 0xb8)),
+        };
+        // A high contrast theme resolves chrome greys to full strength on
+        // purpose (#1548); blending toward the bar would undo that.
+        let dim = if theme.high_contrast() {
+            muted
+        } else {
+            mix_color(muted, bar, 0.6)
+        };
+        StatusTones { text, muted, dim }
+    }
+}
+
+/// `a` blended toward `b` by `t` (0.0 keeps `a`); a non-RGB colour is kept.
+fn mix_color(a: Color, b: Color, t: f32) -> Color {
+    match (a, b) {
+        (Color::Rgb(ar, ag, ab), Color::Rgb(br, bg, bb)) => {
+            let m = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+            Color::Rgb(m(ar, br), m(ag, bg), m(ab, bb))
+        }
+        _ => a,
+    }
+}
+
+/// The status bar's background: Croft Loch's chrome surface, a near-black
+/// seam on the gradient (OLED) themes, the navy band elsewhere.
+fn status_bar_bg(theme: crate::theme::Theme) -> Color {
+    if let Some(s) = theme.surfaces() {
+        s.chrome()
+    } else if theme.gradient() {
+        theme.ui(Color::Rgb(0x18, 0x18, 0x18))
+    } else {
+        theme.ui(Color::Rgb(0x1e, 0x3a, 0x6e))
+    }
+}
+
+/// Build the status-bar spans for the git segment: the branch glyph in the
+/// theme accent, the branch name in the bar's text tone, an amber dot while
+/// the tree is dirty, and quiet ahead/behind counts. Returns an empty vec
+/// outside a git repo so the bar shows nothing.
+fn git_status_spans<'a>(
+    status: &'a crate::git::GitStatus,
+    theme: crate::theme::Theme,
+) -> Vec<Span<'a>> {
     if !status.in_repo {
         return Vec::new();
     }
-    let pill_color = if status.dirty {
-        GIT_DIRTY_COLOR
-    } else {
-        GIT_CLEAN_COLOR
-    };
-    let mut spans: Vec<Span> = Vec::with_capacity(6);
+    let tones = StatusTones::new(theme, status_bar_bg(theme));
+    let mut spans: Vec<Span> = Vec::with_capacity(7);
     spans.push(Span::raw("  "));
     // Codicon `cod-source-control` (U+EA68): the Y-fork that matches the
     // activity-bar Source Control icon, so the status-bar branch indicator
     // and the SCM panel share the same visual mark.
-    spans.push(Span::styled("\u{ea68} ", Style::default().fg(pill_color)));
-    let label = status.head_label();
     spans.push(Span::styled(
-        label,
-        Style::default().fg(pill_color).add_modifier(Modifier::BOLD),
+        "\u{ea68} ",
+        Style::default().fg(theme.accent()),
     ));
-    // The operation git stopped in (#1356), as `main | MERGING`.
+    spans.push(Span::styled(
+        status.head_label(),
+        Style::default().fg(tones.text),
+    ));
+    // The operation git stopped in (#1356), as `main | MERGING`, read as one
+    // phrase: the dirty dot comes after it.
     if let Some(op) = status.operation {
         spans.push(Span::styled(
             format!(" | {}", op.label()),
             Style::default()
-                .fg(GIT_DIRTY_COLOR)
+                .fg(theme.ui(GIT_DIRTY_COLOR))
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    if status.dirty {
+        spans.push(Span::styled(
+            format!(" {GIT_DIRTY_DOT}"),
+            Style::default()
+                .fg(theme.ui(GIT_DIRTY_COLOR))
                 .add_modifier(Modifier::BOLD),
         ));
     }
     if status.ahead > 0 {
         spans.push(Span::styled(
             format!(" \u{2191}{}", status.ahead),
-            Style::default().fg(GIT_CLEAN_COLOR),
+            Style::default().fg(tones.muted),
         ));
     }
     if status.behind > 0 {
         spans.push(Span::styled(
             format!(" \u{2193}{}", status.behind),
-            Style::default().fg(GIT_DIRTY_COLOR),
+            Style::default().fg(tones.muted),
         ));
     }
     spans
 }
 
-/// Spans for the "cr<>ft" wordmark at the left of the status bar, styled to
-/// mirror the app logo: white letters with the `<>` (the stylised "o") in the
-/// brand orange, sitting on the bar's own background rather than a pill.
-fn brand_spans(theme: crate::theme::Theme) -> Vec<Span<'static>> {
-    let letter = Style::default()
-        .fg(theme.ui(Color::White))
-        .add_modifier(Modifier::BOLD);
+/// A tinted badge's fill and ink on a `surfaces` theme's chrome: the hue
+/// laid over the chrome at a fifth of its strength (a little more under the
+/// pointer), and the hue lifted toward the foreground for the label, so a
+/// count badge reads in its own colour without a hard block of it.
+fn chip_tint(
+    t: crate::widgets::surface::Tones,
+    hue: (u8, u8, u8),
+    hovered: bool,
+) -> (Color, Color) {
+    let strength = if hovered { 0.32 } else { 0.22 };
+    (
+        rgb_color(crate::gradient::lerp_rgb(t.chrome, hue, strength)),
+        rgb_color(crate::gradient::lerp_rgb(hue, t.lift, 0.35)),
+    )
+}
+
+/// The longest workspace name the status bar's cap shows before it elides.
+const WORKSPACE_CAP_MAX: usize = 24;
+
+/// Spans for the cap at the left edge of the status bar: the logo's `<>` in
+/// the brand orange and the workspace folder's name, on the theme's
+/// selection tint with a rounded right end. It anchors the bar the way VS
+/// Code's remote indicator does, and says which workspace this window is.
+fn workspace_cap_spans(theme: crate::theme::Theme, name: &str) -> Vec<Span<'static>> {
+    let fill = theme.selection();
+    let tones = StatusTones::new(theme, status_bar_bg(theme));
+    // Measured in terminal cells, not chars: a wide name (`项目`) paints
+    // twice its char count, and every offset after the cap counts cells.
+    let name: String = if status_cells(name) as usize > WORKSPACE_CAP_MAX {
+        use unicode_width::UnicodeWidthChar;
+        let mut s = String::new();
+        let mut used = 0;
+        for c in name.chars() {
+            let w = c.width().unwrap_or(0);
+            if used + w > WORKSPACE_CAP_MAX - 1 {
+                break;
+            }
+            used += w;
+            s.push(c);
+        }
+        s.push('\u{2026}');
+        s
+    } else {
+        name.to_string()
+    };
     vec![
-        Span::styled(" cr", letter),
+        Span::styled(" ", Style::default().bg(fill)),
         Span::styled(
             "<>",
             Style::default()
                 .fg(BRAND_ORANGE)
+                .bg(fill)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled("ft ", letter),
+        Span::styled(
+            format!(" {name} "),
+            Style::default()
+                .fg(tones.text)
+                .bg(fill)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(PILL_CAP_R, Style::default().fg(fill)),
     ]
+}
+
+/// A status-bar badge (a recording, vim's mode, an attention flag) as a
+/// rounded pill: `label` padded by a cell each side, between half-circle
+/// caps in `fill`.
+fn status_pill(label: &str, fill: Color, fg: Color) -> [Span<'static>; 3] {
+    [
+        Span::styled(PILL_CAP_L, Style::default().fg(fill)),
+        Span::styled(
+            format!(" {label} "),
+            Style::default()
+                .fg(fg)
+                .bg(fill)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(PILL_CAP_R, Style::default().fg(fill)),
+    ]
+}
+
+/// The Overwrite badge that follows the workspace cap in the status bar: the
+/// continuous-underline symbol (⎁) in the brand orange, so a switched mode is
+/// hard to miss. Insert, the default, shows nothing, as in VS Code, and keeps
+/// the bar's cells for the segments after it. It sits on the left, away from
+/// the clickable position, encoding and language segments on the right.
+fn overwrite_mode_span() -> Span<'static> {
+    Span::styled(
+        "\u{2381}",
+        Style::default()
+            .fg(BRAND_ORANGE)
+            .add_modifier(Modifier::BOLD),
+    )
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1927,11 +2091,22 @@ fn menu_hint(action: &MenuAction, keymap: &crate::keymap::Keymap) -> Option<Stri
 
 /// Display width (in cells) a menu entry needs: its label plus the right-aligned
 /// shortcut hint (items) or the `▸` submenu indicator. Dividers need none.
-fn menu_entry_width(entry: &MenuEntry, keymap: &crate::keymap::Keymap) -> usize {
+/// `keycaps` measures the hint as a `surfaces` theme draws it, each key in
+/// a chip one cell of padding wider on each side.
+fn menu_entry_width(entry: &MenuEntry, keymap: &crate::keymap::Keymap, keycaps: bool) -> usize {
     match entry {
         MenuEntry::Item { label, action } => {
             let shortcut = menu_hint(action, keymap)
-                .map(|s| s.chars().count() + 2)
+                .map(|s| {
+                    let chips = if keycaps {
+                        s.split(' ')
+                            .map(|chord| crate::widgets::surface::chord_keys(chord).len())
+                            .sum::<usize>()
+                    } else {
+                        0
+                    };
+                    s.chars().count() + 2 * chips + 2
+                })
                 .unwrap_or(0);
             label.chars().count() + shortcut
         }
@@ -3990,6 +4165,10 @@ pub struct App {
     /// The file blame has been fetched (or is in flight) for; reset to `None`
     /// on HEAD move so the annotation refreshes after a commit / checkout.
     blame_fetched: Option<PathBuf>,
+    /// The commit whose card the pointer, resting on the inline blame, asked
+    /// for (#1556), and where `git log` sends it. Kept once the card shows,
+    /// so the card stays while the pointer moves along the annotation.
+    blame_hover: Option<(String, std::sync::mpsc::Receiver<Result<String, String>>)>,
     /// The network git operation in flight (push, pull, fetch, clone...),
     /// named for the status line, and where its finisher arrives.
     git_net_job: Option<(String, std::sync::mpsc::Receiver<GitNetDone>)>,
@@ -4269,6 +4448,12 @@ pub struct App {
     git_head_oids: std::collections::BTreeMap<PathBuf, Option<String>>,
     git: GitWorker,
     cursor_blink: CursorBlink,
+    /// Overwrite (Replace) mode, toggled by the Insert key. One switch for the
+    /// whole app, as in VS Code: it follows you from tab to tab.
+    overwrite_mode: bool,
+    /// Whether the terminal's caret was last set to the overwrite block, so
+    /// the style escape is sent only when the wanted shape changes.
+    caret_block_sent: bool,
     editor_click: ClickTracker,
     tree_click: ClickTracker,
     terminal_click: ClickTracker,
@@ -4299,6 +4484,10 @@ pub struct App {
     /// walk the caret to the clicked line, undoing the caret-preserving
     /// click. Cleared on the release and on the next press.
     breakpoint_lane_press: bool,
+    /// The line a triple-click or a line-number press selected (#1570): a
+    /// drag from it selects whole lines, from this one to the line under
+    /// the pointer. Cleared on the release and on the next press.
+    editor_line_drag: Option<usize>,
     /// A left-drag is moving the OUTLINE panel's scrollbar thumb. The outline
     /// is not a focusable `Pane`, so it gets its own drag latch rather than
     /// riding `scrollbar_drag`.
@@ -5238,6 +5427,14 @@ pub struct App {
     /// the editor). Stacked above the async LSP hover reply by `compose_hover`
     /// so a squiggle's message shows even when the server returns no type info.
     hover_diagnostic: Option<String>,
+    /// Set when the keyboard asked for the hover at the caret (#1518), not
+    /// the pointer's rest: its reply is checked against the caret, and says
+    /// there is no hover only over the status line this holds, the one shown
+    /// at the request, so a newer message is not replaced.
+    hover_at_caret: Option<String>,
+    /// The tab and edit count the hover was asked about: a reply after
+    /// either changed (a paste over the word keeps its span) is dropped.
+    hover_doc: (Option<PathBuf>, u64),
     /// Separate dwell timer for the editor tab strip. Hovering a tab for
     /// `HOVER_DELAY` surfaces `tab_tooltip` with the tab's full path so
     /// same-named files can be told apart. Kept distinct from `hover`
@@ -6764,6 +6961,139 @@ fn welcome_recents_height(notes: &[crate::release_notes::ReleaseNote], block_w: 
     1 + 1 + notes_h
 }
 
+/// The blank rows between the blocks of Croft Loch's welcome stack (the
+/// wordmark, the tagline, the Start list, the release card): one, the same
+/// everywhere, so the page keeps one rhythm at any height.
+const LOCH_WELCOME_GAP: u16 = 1;
+
+/// The rows of Croft Loch's release card around its notes: the top edge, the
+/// heading, the blank under it, the row under the notes (padding, or the
+/// "+N more" line when the card is shortened) and the bottom edge.
+const LOCH_WELCOME_CARD_FRAME: u16 = 5;
+
+/// Blank cells between the `cr<>ft` wordmark and the version pill beside it
+/// on Croft Loch's welcome page: close enough to read as one group, apart
+/// enough that the pill never looks like part of the name.
+const WELCOME_VERSION_GAP: u16 = 2;
+
+/// The room between the widest Start label and the keycaps' column, so the
+/// widest row still reads as a label and a chord, not one run of text, while
+/// every chord stays close enough to pair with its label.
+const WELCOME_START_KEY_GAP: u16 = 4;
+
+/// Croft Loch's Start list columns, from its widest label and widest
+/// keycaps: where the keycaps start, as an offset from the list's left edge
+/// (one fixed column [`WELCOME_START_KEY_GAP`] cells past the widest label,
+/// so each chord sits beside its label and the chords line up), and the
+/// list's width, only what the labels and keycaps need. Spreading the list
+/// over the card's whole text column left the chords some seventy cells
+/// from their labels, where nothing tied a chord to its row.
+fn welcome_start_columns(label_w: u16, caps_w: u16) -> (u16, u16) {
+    let keys_dx = label_w + WELCOME_START_KEY_GAP;
+    (
+        keys_dx,
+        if caps_w > 0 {
+            keys_dx + caps_w
+        } else {
+            label_w
+        },
+    )
+}
+
+/// Where Croft Loch's welcome stack puts each block, in rows from the top of
+/// the welcome area. Computed by [`loch_welcome_plan`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LochWelcomePlan {
+    /// The logo's first row and its height: one row for the text wordmark,
+    /// 4..=14 for the picture.
+    logo_y: u16,
+    logo_h: u16,
+    tagline_y: u16,
+    /// The Start list's heading row, when the list shows.
+    start_y: Option<u16>,
+    /// The Take the Tour chip's row, when the Start list cannot show it.
+    chip_y: Option<u16>,
+    /// The release card's top row and height, and how many notes it shows
+    /// whole (`notes == 0`: no card).
+    card_y: u16,
+    card_h: u16,
+    notes: usize,
+}
+
+/// Lay out Croft Loch's welcome stack in `height` rows, in priority order:
+/// the logo (one row for the text wordmark, the picture's 4-row floor
+/// otherwise), the tagline, the Start list (`start_rows` action rows under a
+/// heading), then the release card, which is shortened to the notes that fit
+/// whole (`note_heights`, each note's wrapped rows) rather than pushing the
+/// Start list out. When the Start list has no room, a one-row tour chip
+/// (`tour_chip`) takes its place. The picture grows (to 14 rows) only once
+/// every note fits, and the whole stack is centred vertically, its blocks
+/// [`LOCH_WELCOME_GAP`] apart.
+fn loch_welcome_plan(
+    height: u16,
+    text_logo: bool,
+    start_rows: u16,
+    tour_chip: bool,
+    note_heights: &[u16],
+) -> LochWelcomePlan {
+    let gap = LOCH_WELCOME_GAP;
+    let logo_floor = if text_logo { 1 } else { 4 };
+    // The rows each optional block adds, its leading gap included.
+    let tagline = gap + 1;
+    let start = if start_rows > 0 {
+        gap + 1 + start_rows
+    } else {
+        0
+    };
+    let chip = if tour_chip { gap + 1 } else { 0 };
+    let (start, chip) = if start > 0 && logo_floor + tagline + start <= height {
+        (start, 0)
+    } else if chip > 0 && logo_floor + tagline + chip <= height {
+        (0, chip)
+    } else {
+        (0, 0)
+    };
+    let above_card = tagline + start + chip;
+    let full_card = if note_heights.is_empty() {
+        0
+    } else {
+        gap + LOCH_WELCOME_CARD_FRAME + note_heights.iter().sum::<u16>()
+    };
+    let logo_h = if text_logo {
+        1
+    } else {
+        height
+            .saturating_sub(above_card)
+            .saturating_sub(full_card)
+            .clamp(4, 14)
+    };
+    let card_room = height.saturating_sub(logo_h + above_card + gap);
+    let (mut notes, mut card_h) = (0, 0);
+    let mut h = LOCH_WELCOME_CARD_FRAME;
+    for &nh in note_heights {
+        if h + nh > card_room {
+            break;
+        }
+        h += nh;
+        notes += 1;
+        card_h = h;
+    }
+    let total = logo_h + above_card + if notes > 0 { gap + card_h } else { 0 };
+    let logo_y = height.saturating_sub(total) / 2;
+    let tagline_y = logo_y + logo_h + gap;
+    let next = tagline_y + 1 + gap;
+    LochWelcomePlan {
+        logo_y,
+        logo_h,
+        tagline_y,
+        start_y: (start > 0).then_some(next),
+        chip_y: (chip > 0).then_some(next),
+        card_y: tagline_y + 1 + start + chip + gap,
+        card_h,
+        notes,
+    }
+}
+
 const WELCOME_TAGLINE: &str = "LIGHTWEIGHT.  BLAZINGLY FAST.  BUILT FOR DEVELOPERS.";
 
 use crate::gradient::{GRAD_TL, GRAD_TR, POPUP_SEL_BG, paint_gradient_box, rgb_color};
@@ -7205,6 +7535,7 @@ impl App {
             blame_rx,
             blame_tx,
             blame_fetched: None,
+            blame_hover: None,
             git_net_job: None,
             git_view_job: None,
             vim_mode_pref: false,
@@ -7318,6 +7649,8 @@ impl App {
             git_head_oids: std::collections::BTreeMap::new(),
             git,
             cursor_blink: CursorBlink::new(),
+            overwrite_mode: false,
+            caret_block_sent: false,
             editor_click: ClickTracker::default(),
             tree_click: ClickTracker::default(),
             terminal_click: ClickTracker::default(),
@@ -7327,6 +7660,7 @@ impl App {
             scrollbar_drag: None,
             editor_hscrollbar_drag: false,
             breakpoint_lane_press: false,
+            editor_line_drag: None,
             outline_scrollbar_drag: false,
             secondary_outline: Default::default(),
             secondary_outline_scrollbar_drag: false,
@@ -7912,6 +8246,8 @@ impl App {
             hover_anchor: None,
             hover_word: None,
             hover_diagnostic: None,
+            hover_at_caret: None,
+            hover_doc: (None, 0),
             tab_hover: HoverDwell::default(),
             tab_tooltip: None,
             tab_hover_idx: None,
@@ -7978,6 +8314,8 @@ impl App {
         // The agent review queue as this workspace last left it (#345).
         let root = app.workspace_root().to_path_buf();
         app.apply_project_excludes(&loaded_prefs);
+        app.tree
+            .set_compact_folders(!loaded_prefs.disable_compact_folders);
         app.apply_file_associations(&loaded_prefs);
         app.apply_files_encoding(&loaded_prefs);
         app.watch_project_snippets();
@@ -8092,7 +8430,8 @@ impl App {
                 self.theme.activity_icon_inactive_rgb(),
                 self.theme.activity_icon_active_rgb(),
                 self.theme.activity_icon_pill_rgb(),
-            ),
+            )
+            .with_hover(self.theme.activity_icon_hover_rgb()),
             sponsor_ink: crate::iterm2_inline::IconInk::new(
                 self.theme.activity_sponsor_rgb(),
                 self.theme.activity_sponsor_hover_rgb(),
@@ -8882,6 +9221,11 @@ impl App {
         let cursor_on = self.cursor_should_be_visible();
         let _ = write!(out, "\x1b[?25l\x1b[s");
         for y in area.top()..area.bottom() {
+            // A `surfaces` theme's one-line pill leaves the rows around it
+            // unpainted: re-emitting them would blank the illustration.
+            if (area.left()..area.right()).all(|x| buf[(x, y)] == ratatui::buffer::Cell::EMPTY) {
+                continue;
+            }
             let _ = write!(out, "\x1b[{};{}H", y + 1, area.left() + 1);
             for x in area.left()..area.right() {
                 let cell = &buf[(x, y)];
@@ -9334,14 +9678,18 @@ impl App {
     /// it can re-Show the caret after the OSC-1337 image emit only when the
     /// editor would have shown it this frame.
     fn cursor_should_be_visible(&self) -> bool {
+        if self.context_menu.is_some() || self.prompt.is_some() || !self.cursor_visible_phase() {
+            return false;
+        }
+        // On a `surfaces` theme the quick input's query has the terminal's
+        // caret (see `quick_input_owns_caret`).
+        if self.quick_input_owns_caret() {
+            return self.quick_input_caret().is_some();
+        }
         // A list picker (View Bookmarks, Quick Fix, ...) is the thing being
         // typed into; the editor's caret behind it would only point at text it
         // is not about to edit.
-        if self.context_menu.is_some()
-            || self.prompt.is_some()
-            || self.list_picker.is_some()
-            || !self.cursor_visible_phase()
-        {
+        if self.list_picker.is_some() {
             return false;
         }
         let editor_caret = if self.editor.diff.is_some() {
@@ -9371,6 +9719,36 @@ impl App {
             return true;
         }
         false
+    }
+
+    /// Whether a quick input (the Command Palette, Go to File, a list
+    /// picker or an input prompt) has the terminal's caret: on a `surfaces`
+    /// theme, which draws no caret block in the query, the caret goes there
+    /// and no pane's caret blinks through the card. A boxed theme paints its
+    /// own caret and keeps its caret rules as they were.
+    fn quick_input_owns_caret(&self) -> bool {
+        self.theme.surfaces().is_some()
+            && (self.command_palette.is_some()
+                || self.file_finder.is_some()
+                || self.list_picker.is_some()
+                || self.input_prompt.is_some())
+    }
+
+    /// Where the terminal's caret goes while a quick input is open: the
+    /// query caret of the topmost one (drawn last: list picker, input
+    /// prompt, palette, finder), as its last render placed it. `None` on a
+    /// boxed theme, whose quick inputs paint their own caret block.
+    fn quick_input_caret(&self) -> Option<(u16, u16)> {
+        if let Some(p) = &self.list_picker {
+            return p.last_caret;
+        }
+        if let Some(p) = &self.input_prompt {
+            return p.last_caret;
+        }
+        if let Some(p) = &self.command_palette {
+            return p.last_caret;
+        }
+        self.file_finder.as_ref().and_then(|f| f.last_caret)
     }
 
     /// True iff the caret is currently in its visible half of the blink
@@ -10928,6 +11306,7 @@ impl App {
         self.editor.blame_enabled = self.inline_blame_enabled;
         self.editor.provenance_overlay = self.provenance_overlay;
         self.editor.auto_close_pairs = self.auto_close_pairs_for(editor_scope_id(&self.editor));
+        self.editor.overwrite = self.overwrite_mode;
         self.editor.whitespace_mode = whitespace_mode_in(
             &self.language_prefs,
             self.whitespace_mode,
@@ -10983,6 +11362,87 @@ impl App {
             }
         }
         changed
+    }
+
+    /// The caret line's commit as the inline blame names it (#1556), full
+    /// hash and short; when it names none, the status line says why.
+    fn caret_line_commit(&mut self) -> Option<(String, String)> {
+        use crate::widgets::editor::LineBlame;
+        let line = self.editor.cursor_row + 1;
+        self.status = match self.editor.cursor_line_blame() {
+            Some(LineBlame::Commit(c)) => {
+                return Some((c.hash.clone(), c.short_hash().to_string()));
+            }
+            Some(LineBlame::Uncommitted) => format!("Line {line} has uncommitted changes"),
+            None if !self.inline_blame_enabled => {
+                String::from("Inline blame is off: Git: Toggle Inline Blame turns it on")
+            }
+            None => format!("Git has no commit for line {line}"),
+        };
+        None
+    }
+
+    /// Git: Open Commit for Line, and a click on the inline blame (#1556):
+    /// the changes the caret line's commit made to this file, in the
+    /// side-by-side diff a TIMELINE row opens (GitLens's Open Changes).
+    fn open_commit_for_line(&mut self) {
+        if let Some((hash, _)) = self.caret_line_commit()
+            && let Some(path) = self.editor.path.clone()
+        {
+            self.open_timeline_diff(path, hash);
+        }
+    }
+
+    /// The pointer rested on the inline blame naming `hash` (#1556): fetch
+    /// the commit's card off the UI thread, for [`Self::drain_blame_hover`].
+    fn hover_blame_card(&mut self, col: u16, row: u16, hash: String) {
+        let shown = self.hover_popup.is_some();
+        if shown && self.blame_hover.as_ref().is_some_and(|(h, _)| *h == hash) {
+            return;
+        }
+        // The file's own folder is in its repository, as blame's is.
+        let Some(dir) = self.editor.path.as_deref().and_then(Path::parent) else {
+            return;
+        };
+        let dir = dir.to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let job = hash.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::git::commit_card(&dir, &job));
+        });
+        // A word's hover still in flight must not land over the card.
+        self.hover_request_id = None;
+        self.hover_word = None;
+        self.hover_anchor = Some((col, row));
+        self.blame_hover = Some((hash, rx));
+    }
+
+    /// Show the inline blame's commit card once `git log` has it, if the
+    /// pointer is still on an annotation naming that commit: a tab switch or
+    /// caret move while git ran can put another commit's there. True when
+    /// the card appeared.
+    fn drain_blame_hover(&mut self) -> bool {
+        let Some((hash, card)) = self
+            .blame_hover
+            .as_ref()
+            .and_then(|(hash, rx)| rx.try_recv().ok().map(|card| (hash.clone(), card)))
+        else {
+            return false;
+        };
+        let under = self
+            .hover
+            .cell()
+            .and_then(|(c, r)| self.editor.blame_commit_at(c, r));
+        if under != Some(hash.as_str()) {
+            self.blame_hover = None;
+            return false;
+        }
+        let card = card.unwrap_or_else(|e| format!("Could not read the commit: {e}"));
+        self.hover_popup = Some(crate::widgets::hover_popup::HoverPopup::new(
+            format!("{card}\n\nClick to open its changes (Git: Open Commit for Line)"),
+            self.hover_anchor.unwrap_or((0, 0)),
+        ));
+        true
     }
 
     /// Drain LSP completion responses. Drops responses with stale request
@@ -11752,6 +12212,16 @@ impl App {
             return;
         }
         self.hover.on_move(std::time::Instant::now(), col, row);
+        // The blame card (#1556) belongs to the annotation of its commit,
+        // not to a word: it stays while the pointer moves along that and
+        // goes when the pointer leaves it.
+        if let Some((hash, _)) = &self.blame_hover {
+            if self.editor.blame_commit_at(col, row) == Some(hash.as_str()) {
+                return;
+            }
+            self.blame_hover = None;
+            self.hover_popup = None;
+        }
         if self.hover_popup.is_some() {
             let current = self
                 .editor
@@ -11788,9 +12258,54 @@ impl App {
     /// async `textDocument/hover`. Split out of `poll_hover` so the dwell
     /// timer doesn't have to be driven to test the resolution logic.
     fn hover_at_cell(&mut self, col: u16, row: u16) {
+        if let Some(hash) = self.editor.blame_commit_at(col, row) {
+            self.hover_blame_card(col, row, hash.to_string());
+            return;
+        }
         let Some((line, c)) = self.editor.buffer_pos_at(col, row) else {
             return;
         };
+        self.hover_at(line, c, (col, row), false);
+    }
+
+    /// Show or Focus Hover (#1518): the hover the pointer's rest would open,
+    /// for the caret, anchored at the caret's cell. Says so when there is
+    /// nothing to show, where the pointer's hover stays silent.
+    fn show_hover_at_caret(&mut self) {
+        self.hover_popup = None;
+        self.hover_diagnostic = None;
+        self.hover_request_id = None;
+        // A pointer that came to rest just before the command would fire its
+        // own hover next frame and take this one's place.
+        self.hover.clear();
+        let Some(anchor) = self.editor.cursor_screen_pos() else {
+            return;
+        };
+        let (line, c) = self.caret_hover_point();
+        self.hover_at(line, c, anchor, true);
+        if self.hover_popup.is_none() && self.hover_request_id.is_none() {
+            self.status = String::from(NO_HOVER_AT_CARET);
+        }
+    }
+
+    /// The buffer point Show Hover describes: the caret, or the word ending
+    /// at it, as in VS Code, so a hover after typing a name or a word-right
+    /// move shows that word.
+    fn caret_hover_point(&self) -> (usize, usize) {
+        let (line, col) = (self.editor.cursor_row, self.editor.cursor_col);
+        if col > 0
+            && self.editor.hover_region_at(line, col).is_none()
+            && self.editor.word_at(line, col - 1).is_some()
+        {
+            return (line, col - 1);
+        }
+        (line, col)
+    }
+
+    /// Resolve a hover at buffer `(line, c)` with its popup at screen cell
+    /// `anchor`, for the pointer or, with `at_caret`, the caret.
+    fn hover_at(&mut self, line: usize, c: usize, anchor: (u16, u16), at_caret: bool) {
+        let (col, row) = anchor;
         // The region (word, or else a diagnostic span over punctuation) the
         // popup belongs to. Nothing of interest under the point → no hover.
         let Some(region) = self.editor.hover_region_at(line, c) else {
@@ -11798,6 +12313,8 @@ impl App {
         };
         self.hover_anchor = Some((col, row));
         self.hover_word = Some(region);
+        self.hover_at_caret = at_caret.then(|| self.status.clone());
+        self.hover_doc = (self.editor.path.clone(), self.editor.edit_seq);
         // Debug hover-to-evaluate: while paused, hovering a variable shows its
         // current value (from the loaded locals/globals) instead of the LSP
         // type hover. Takes priority because the live value is what the user
@@ -11814,7 +12331,8 @@ impl App {
         // Server diagnostics are already in the editor, so capture the
         // message synchronously; the squiggle's message must show even if the
         // server has no type info (or no LSP is attached at all).
-        self.hover_diagnostic = format_diagnostics(&self.editor.diagnostics_at(line, c));
+        self.hover_diagnostic =
+            format_diagnostics(&self.editor.diagnostics_at(line, c, self.workspace_root()));
         // Only a real word is worth a `textDocument/hover` round-trip; over
         // punctuation there is no symbol to describe, so show the diagnostic
         // alone right away.
@@ -11990,20 +12508,44 @@ impl App {
             if Some(result.request_id) != self.hover_request_id {
                 continue;
             }
-            let current = self
-                .hover
-                .cell()
-                .and_then(|(c, r)| self.editor.buffer_pos_at(c, r))
-                .and_then(|(line, ch)| self.editor.hover_region_at(line, ch));
+            if self.hover_doc.0 != self.editor.path || self.hover_doc.1 != self.editor.edit_seq {
+                continue;
+            }
+            // A keyboard hover belongs to the caret (#1518), a dwell's to the
+            // pointer; either may have moved off the word since the request.
+            let current = if self.hover_at_caret.is_some() {
+                let (line, ch) = self.caret_hover_point();
+                self.editor.hover_region_at(line, ch)
+            } else {
+                self.hover
+                    .cell()
+                    .and_then(|(c, r)| self.editor.buffer_pos_at(c, r))
+                    .and_then(|(line, ch)| self.editor.hover_region_at(line, ch))
+            };
             if current != self.hover_word {
                 continue;
             }
             // Diagnostic on top, type info below (VS Code PR #166560). Either
             // side may be empty; an all-empty compose hides the popup.
             let anchor = self.hover_anchor.unwrap_or((0, 0));
+            // The server's part is about a symbol in this file's language,
+            // which a `surfaces` card lays out as path, signature and docs.
+            let lang = self.editor.language();
+            let symbol = result.text.is_some();
             self.hover_popup =
-                compose_hover(self.hover_diagnostic.as_deref(), result.text.as_deref())
-                    .map(|text| crate::widgets::hover_popup::HoverPopup::new(text, anchor));
+                compose_hover(self.hover_diagnostic.as_deref(), result.text.as_deref()).map(
+                    |text| {
+                        let popup = crate::widgets::hover_popup::HoverPopup::new(text, anchor);
+                        if symbol {
+                            popup.about_symbol(lang)
+                        } else {
+                            popup
+                        }
+                    },
+                );
+            if self.hover_popup.is_none() && self.hover_at_caret.as_ref() == Some(&self.status) {
+                self.status = String::from(NO_HOVER_AT_CARET);
+            }
             changed = true;
         }
         changed
@@ -12863,6 +13405,7 @@ impl App {
                     message: d.message,
                     source: d.source.to_string(),
                     code: None,
+                    related: Vec::new(),
                 },
             ));
         }
@@ -12941,7 +13484,7 @@ impl App {
     /// can fold it into its redraw decision). Files are grouped, ordered by
     /// path; each group's diagnostics are ordered by position.
     fn rebuild_problems(&mut self) -> bool {
-        use crate::widgets::problems::{ProblemGroup, ProblemItem};
+        use crate::widgets::problems::{ProblemGroup, ProblemItem, ProblemRelated};
         let mut paths: Vec<&PathBuf> = self
             .lsp_diagnostics
             .keys()
@@ -12971,6 +13514,18 @@ impl App {
                 let shown = diagnostics_by_source(by_server)
                     .filter(|(_, d)| d.severity != crate::lsp::manager::DiagnosticSeverity::Hint);
                 for (source, d) in shown {
+                    let related = d.related().into_iter().map(|r| ProblemRelated {
+                        rel_path: r
+                            .path
+                            .strip_prefix(self.workspace_root())
+                            .unwrap_or(&r.path)
+                            .to_string_lossy()
+                            .into_owned(),
+                        path: r.path,
+                        line: r.line,
+                        col: r.character,
+                        message: r.message,
+                    });
                     items.push(ProblemItem {
                         line: d.start_line,
                         col: d.start_char,
@@ -12979,6 +13534,7 @@ impl App {
                         message: d.message.clone(),
                         source: source.to_string(),
                         code: d.code.clone(),
+                        related: related.collect(),
                     });
                 }
             }
@@ -13436,8 +13992,19 @@ impl App {
                 crumbs.push(Crumb {
                     label: os.to_string_lossy().into_owned(),
                     target: None,
+                    icon: None,
                 });
             }
+        }
+        // The file crumb wears its Explorer icon (drawn on a `surfaces`
+        // theme only); the folders before it stay plain.
+        if let Some(file) = crumbs.last_mut() {
+            let suffix = path
+                .extension()
+                .map(|e| format!(".{}", e.to_string_lossy()))
+                .unwrap_or_default();
+            let icon = crate::icons::for_path(&file.label, &suffix);
+            file.icon = Some((icon.glyph, icon.color));
         }
         // Symbol scope chain, only when the outline belongs to this file so a
         // stale outline from the previous tab never leaks into the bar.
@@ -13455,9 +14022,11 @@ impl App {
                 .map_or(self.editor.cursor_col, |v| v.cursor_col) as u32;
             for i in breadcrumb_symbol_chain(symbols, line, col) {
                 let s = &symbols[i];
+                let icon = crate::icons::for_outline_kind(s.kind);
                 crumbs.push(Crumb {
                     label: s.name.clone(),
                     target: Some((s.line, s.character)),
+                    icon: Some((icon.glyph, icon.color)),
                 });
             }
         }
@@ -14106,18 +14675,26 @@ impl App {
             .and_then(|p| self.roots.owning_root(p))
             .unwrap_or_else(|| self.roots.primary())
             .to_path_buf();
-        self.status = format!("Loading {rel} at {hash}\u{2026}");
+        // Git: Open Commit for Line passes the full hash (#1556), named here
+        // by its first eight digits as the inline blame names it; a TIMELINE
+        // row's is git's own short form already.
+        let shown = if hash.len() >= 40 {
+            hash[..8].to_string()
+        } else {
+            hash.clone()
+        };
+        self.status = format!("Loading {rel} at {shown}\u{2026}");
         self.spawn_git_view(move || {
             let result = crate::git::show_commit_file_diff(&timeline_root, &hash, &rel);
             Box::new(move |app: &mut App| match result {
                 Ok(raw) => {
-                    let label = std::path::PathBuf::from(format!("{rel} @ {hash}"));
+                    let label = std::path::PathBuf::from(format!("{rel} @ {shown}"));
                     if let Err(e) = app.editor.open_git_diff_side_by_side(&label, &raw) {
                         app.status = format!("Could not open diff: {e}");
                         return;
                     }
                     app.focus_pane(Pane::Editor);
-                    app.status = format!("Showing {rel} at {hash}");
+                    app.status = format!("Showing {rel} at {shown}");
                 }
                 Err(e) => app.status = format!("git show failed: {e}"),
             })
@@ -15122,6 +15699,7 @@ impl App {
             return;
         }
         let root = self.tree.root.clone();
+        let current = self.location_under_caret(&targets);
         let items: Vec<(String, MenuAction)> = targets
             .into_iter()
             .map(|(path, line, col)| {
@@ -15142,7 +15720,32 @@ impl App {
         // server is ready, and the `context_menu` guard is armed a line too
         // late to protect the sidebar from this focus move.
         self.without_auto_hide(|app| app.focus_pane(Pane::Editor));
-        self.context_menu = Some(ContextMenu::flat(origin, items, root));
+        let mut menu = ContextMenu::flat(origin, items, root);
+        // Start on the reference the caret is on, as VS Code's peek does.
+        menu.selected = current;
+        self.context_menu = Some(menu);
+    }
+
+    /// Which of `targets` the caret is on: the one in this file, on the
+    /// caret's line, starting at or before the caret (the nearest such), else
+    /// the first one on that line. 0 when none is (a reference list opened
+    /// from elsewhere starts at the top).
+    fn location_under_caret(&self, targets: &[(PathBuf, u32, u32)]) -> usize {
+        let Some(path) = self.editor.path.as_deref() else {
+            return 0;
+        };
+        let (row, col) = (self.editor.cursor_row, self.editor.cursor_col);
+        let on_line = || {
+            targets
+                .iter()
+                .enumerate()
+                .filter(move |(_, (p, line, _))| p == path && *line as usize == row)
+        };
+        on_line()
+            .filter(|(_, (_, _, c))| *c as usize <= col)
+            .max_by_key(|(_, (_, _, c))| *c)
+            .or_else(|| on_line().next())
+            .map_or(0, |(i, _)| i)
     }
 
     /// Anchor a `ContextMenu` at the activity-bar gear. `menu_rect` clamps it
@@ -16038,7 +16641,27 @@ impl App {
             };
             y = y.saturating_add(h);
             match v {
-                ExplorerView::Folders => frame.render_widget(&mut self.tree, rect),
+                ExplorerView::Folders => {
+                    frame.render_widget(&mut self.tree, rect);
+                    // Croft Loch: every stacked section ends on a hairline,
+                    // so the tree's blank bottom padding row takes the same
+                    // seam when a section follows it.
+                    if let Some(t) = crate::widgets::surface::tones(self.theme)
+                        && rect.bottom() < area.bottom()
+                        && rect.height > 1
+                    {
+                        crate::widgets::surface::paint_seam(
+                            frame.buffer_mut(),
+                            Rect {
+                                y: rect.bottom() - 1,
+                                height: 1,
+                                ..rect
+                            },
+                            crate::widgets::surface::Edge::Bottom,
+                            t.hairline(),
+                        );
+                    }
+                }
                 ExplorerView::OpenEditors => frame.render_widget(&mut self.open_editors, rect),
                 ExplorerView::Outline => frame.render_widget(&mut self.outline, rect),
                 ExplorerView::Timeline => frame.render_widget(&mut self.timeline, rect),
@@ -16676,6 +17299,14 @@ impl App {
         } else {
             format!("{n} cursors at line ends")
         };
+    }
+
+    /// VS Code "Expand Line Selection" (`Cmd+L` / `Ctrl+L`, #1570): select
+    /// the caret's whole line, and one more line on each further press.
+    fn expand_line_selection(&mut self) {
+        if self.editor_is_text() {
+            self.editor.expand_line_selection();
+        }
     }
 
     /// VS Code "Add Selection to Next Find Match" (`Cmd+D`): select the word
@@ -18294,7 +18925,7 @@ impl App {
                     self.completion_request_id = None;
                     return false;
                 }
-                self.editor.insert_char(c);
+                self.type_char_in_editor(c);
                 self.refresh_completion_prefix();
                 if !is_word_continuation(c) {
                     self.completion_popup = None;
@@ -18546,12 +19177,24 @@ impl App {
         // no layout icons, so it must not keep the last frame's: their cells
         // now belong to the panel's tab row and its buttons (#1980).
         self.layout_icon_areas = LayoutIconAreas::default();
+        // Frame truth for the welcome's click targets: set again below by
+        // whatever this frame paints.
+        self.welcome_tour_button = Rect::default();
+        self.welcome.clear_start_rows();
         if outer_area.width == 0 || outer_area.height == 0 {
             return;
         }
         self.render_welcome_panel(frame, outer_area);
         // The first-launch tour (#377), until it has been taken or skipped.
-        if !self.tour_done && self.tour.is_none() && outer_area.height > 6 {
+        // Croft Loch places it in its own stack (a Start row, or a chip in
+        // the Start list's place), so this bottom button is the boxed
+        // themes' alone.
+        if crate::widgets::surface::tones(self.theme).is_none()
+            && !self.tour_done
+            && self.tour.is_none()
+            && outer_area.height > 6
+            && self.welcome_tour_button.width == 0
+        {
             let label = " Take the Tour ";
             let w = label.chars().count() as u16;
             if outer_area.width > w + 4 {
@@ -18573,6 +19216,68 @@ impl App {
                 self.welcome_tour_button = rect;
             }
         }
+    }
+
+    /// Croft Loch's welcome tagline: the same promise as [`WELCOME_TAGLINE`]
+    /// in sentence case, set quietly in the muted ink under the wordmark.
+    const WELCOME_TAGLINE_CALM: &'static str = "Lightweight. Blazingly fast. Built for developers.";
+
+    /// The chord shown beside `cmd` on the welcome screen's Start list,
+    /// exactly as the Command Palette shows it: a user's own binding, no
+    /// chord when a user binding took the built-in one, else the built-in
+    /// hint as this platform spells it.
+    fn welcome_chord(&self, cmd: crate::widgets::command_palette::Command) -> String {
+        match self.keymap.chord_for(cmd) {
+            Some(user) => crate::keymap::display_chord(&user),
+            None if self.keymap.shadows_builtin(cmd) => String::new(),
+            None => {
+                crate::widgets::command_palette::platform_hint(cmd.keybinding_hint()).into_owned()
+            }
+        }
+    }
+
+    /// The Start list Croft Loch's welcome screen offers, top to bottom:
+    /// each row's label, the chord beside it, and what a click runs (`None`
+    /// for the tour, whose click target is `welcome_tour_button`). The tour
+    /// is offered until it has been taken or skipped.
+    fn welcome_start_rows(&self) -> Vec<(&'static str, String, Option<welcome::StartAction>)> {
+        use crate::widgets::command_palette::Command;
+        use welcome::StartAction;
+        let mut rows = vec![
+            (
+                "New File",
+                self.welcome_chord(Command::NewUntitledFile),
+                Some(StartAction::Command(Command::NewUntitledFile)),
+            ),
+            (
+                "Go to File",
+                self.welcome_chord(Command::QuickOpen),
+                Some(StartAction::Command(Command::QuickOpen)),
+            ),
+            (
+                "Command Palette",
+                crate::widgets::command_palette::platform_hint("Cmd+Shift+P").into_owned(),
+                Some(StartAction::CommandPalette),
+            ),
+        ];
+        if !self.tour_done && self.tour.is_none() {
+            rows.push(("Take the Tour", String::new(), None));
+        }
+        rows
+    }
+
+    /// Run the welcome Start row a click landed on, if the welcome screen is
+    /// what the editor area shows.
+    fn click_welcome_start(&mut self, x: u16, y: u16) -> bool {
+        if self.editor_layout.is_split() || !self.editor.is_blank_initial() {
+            return false;
+        }
+        match self.welcome.start_action_at(x, y) {
+            Some(welcome::StartAction::Command(cmd)) => self.run_command(cmd),
+            Some(welcome::StartAction::CommandPalette) => self.open_command_palette(),
+            None => return false,
+        }
+        true
     }
 
     fn render_welcome_panel(&mut self, frame: &mut ratatui::Frame, outer_area: Rect) {
@@ -18628,6 +19333,12 @@ impl App {
         let block_left = area.x + area.width / 8;
         let block_right = area.x + area.width - area.width / 8;
         let block_w = block_right.saturating_sub(block_left);
+        // Croft Loch composes its own page: one centred column with a Start
+        // list, the release card shortened rather than the list dropped.
+        if let Some(t) = crate::widgets::surface::tones(self.theme) {
+            self.render_welcome_loch(frame, area, t, block_left, block_w);
+            return;
+        }
         let has_recent_panel = self.welcome.has_recent_panel();
         let recents_inner_h =
             welcome_recents_height(self.welcome.notes(), welcome_card_inner_width(block_w));
@@ -18635,16 +19346,17 @@ impl App {
         let footer_h = 1u16;
         // Gaps: blank row after logo, after tagline, after box.
         let gaps_h = 3u16;
+        let desired_card_h = if has_recent_panel {
+            recents_inner_h.saturating_add(4)
+        } else {
+            0
+        };
 
         let logo_max_w = (area.width as u32).saturating_sub(4) as u16;
         let logo_w_cells = logo_max_w.clamp(8, 48);
         // Box content needs at least the 4-cell border+inset envelope to be
         // worth drawing.
-        let desired_box_h = if has_recent_panel {
-            recents_inner_h.saturating_add(4)
-        } else {
-            0
-        };
+        let desired_box_h = desired_card_h;
         // Size the card first, then give the logo whatever remains (still
         // capped to its 4..14 band, so the stack can never overrun the
         // fixed-size ratatui buffer). The release note is the panel's
@@ -18657,7 +19369,8 @@ impl App {
             .saturating_sub(tagline_h + footer_h + gaps_h)
             .saturating_sub(desired_box_h)
             .clamp(4, 14);
-        let used_above_box = logo_h_cells + 1 + tagline_h + 1; // logo, gap, tagline, gap
+        // logo, gap, tagline, gap
+        let used_above_box = logo_h_cells + 1 + tagline_h + 1;
         let used_below_box = 1 + footer_h; // gap, footer
         let max_box_h = area
             .height
@@ -18671,35 +19384,12 @@ impl App {
         let logo_y = block_top;
         let area_max_y = area.y + area.height;
 
-        let desired = WelcomeLayout {
+        self.place_welcome_logo(WelcomeLayout {
             cell_x: logo_x,
             cell_y: logo_y,
             cell_w: logo_w_cells,
             cell_h: logo_h_cells,
-        };
-
-        // Re-bake the OSC-1337 image whenever the layout shifts (resize,
-        // sidebar toggle, font size change). The canvas is filled with the
-        // raw `EDITOR_BG_RGB` bytes interpreted as sRGB (iTerm2 decodes
-        // PNG bytes as sRGB by default). The pane's SGR-painted cells use
-        // `Color::Reset` so they fall back to the iTerm session bg, which
-        // we force to the same sRGB hex via `SetColors=bg=srgb:…` at
-        // startup. Both surfaces therefore display the same physical
-        // pixel pair-for-pair.
-        if !self.overlays.welcome.layout_matches(&desired) {
-            // The picture baked for the old layout is the wrong size for
-            // this one. Its replacement bakes off the UI thread (#1973), and
-            // the logo's cells stay blank until it lands; one still baking
-            // for an older layout is followed up when it lands.
-            self.overlays.welcome.disable();
-            self.overlays.welcome.set_layout(desired);
-            self.overlays.welcome.mark_dirty();
-            if self.welcome_bake.is_none()
-                && let Some(key) = self.welcome_bake_key()
-            {
-                self.start_welcome_bake(key);
-            }
-        }
+        });
 
         if !self.overlays.welcome.has_image() && self.welcome_bake.is_none() {
             // Text fallback for non-iTerm2 terminals.
@@ -18800,17 +19490,14 @@ impl App {
             );
         }
 
-        // Tagline.
         let tagline_y = logo_y + logo_h_cells + 1;
+        let tagline_style = Style::default().fg(self.theme.ui(Color::Rgb(0x88, 0xc0, 0xd0)));
         let tagline_w = WELCOME_TAGLINE.chars().count() as u16;
         let tagline_x = area.x + area.width.saturating_sub(tagline_w) / 2;
         if tagline_y < area_max_y && tagline_w <= area.width {
-            frame.buffer_mut().set_string(
-                tagline_x,
-                tagline_y,
-                WELCOME_TAGLINE,
-                Style::default().fg(self.theme.ui(Color::Rgb(0x88, 0xc0, 0xd0))),
-            );
+            frame
+                .buffer_mut()
+                .set_string(tagline_x, tagline_y, WELCOME_TAGLINE, tagline_style);
         }
 
         let box_y = tagline_y + tagline_h + 1;
@@ -18906,13 +19593,12 @@ impl App {
                 if row_y >= last_row {
                     break;
                 }
+                let (mark, mark_fg) = note.kind.marker_for(self.theme);
                 frame.buffer_mut().set_string(
                     inner_x,
                     row_y,
-                    note.kind.icon(),
-                    Style::default()
-                        .fg(note.kind.color())
-                        .add_modifier(Modifier::BOLD),
+                    mark,
+                    Style::default().fg(mark_fg).add_modifier(Modifier::BOLD),
                 );
                 let lines = wrapped_welcome_note_summary(note, inner_w_actual);
                 let code_style = row_style.fg(self.theme.ui(crate::markdown::CODE));
@@ -18928,6 +19614,376 @@ impl App {
                 }
                 row_y = row_y.saturating_add(lines.len().max(1) as u16);
             }
+        }
+    }
+
+    /// Re-bake the welcome logo's picture whenever its layout shifts
+    /// (resize, sidebar toggle, font size change). The canvas is filled with
+    /// the raw `EDITOR_BG_RGB` bytes interpreted as sRGB (iTerm2 decodes PNG
+    /// bytes as sRGB by default). The pane's SGR-painted cells use
+    /// `Color::Reset` so they fall back to the iTerm session bg, which we
+    /// force to the same sRGB hex via `SetColors=bg=srgb:…` at startup. Both
+    /// surfaces therefore display the same physical pixel pair-for-pair.
+    fn place_welcome_logo(&mut self, desired: WelcomeLayout) {
+        if !self.overlays.welcome.layout_matches(&desired) {
+            // The picture baked for the old layout is the wrong size for
+            // this one. Its replacement bakes off the UI thread (#1973), and
+            // the logo's cells stay blank until it lands; one still baking
+            // for an older layout is followed up when it lands.
+            self.overlays.welcome.disable();
+            self.overlays.welcome.set_layout(desired);
+            self.overlays.welcome.mark_dirty();
+            if self.welcome_bake.is_none()
+                && let Some(key) = self.welcome_bake_key()
+            {
+                self.start_welcome_bake(key);
+            }
+        }
+    }
+
+    /// Croft Loch's welcome page inside the padding `render_welcome_panel`
+    /// painted: one column of blocks centred on the area's axis, laid out by
+    /// [`loch_welcome_plan`] in priority order. The `cr<>ft` wordmark with
+    /// the version pill two cells after it (the picture logo keeps the
+    /// badge beside it), the calm tagline, the Start list, and the release
+    /// card, shortened to the notes that fit whole with a "+N more" line
+    /// rather than pushing the Start list out of a short editor.
+    fn render_welcome_loch(
+        &mut self,
+        frame: &mut ratatui::Frame,
+        area: Rect,
+        t: crate::widgets::surface::Tones,
+        block_left: u16,
+        block_w: u16,
+    ) {
+        use crate::widgets::surface::keycap_spans;
+        let area_max_y = area.y + area.height;
+        // The wordmark is the logo for good when no picture can be shown (no
+        // image protocol, or no cell size to bake one for), and it needs one
+        // row where the picture needs four. A picture that fails to bake
+        // falls back to the wordmark inside the picture's rows.
+        let text_logo = !self.inline_images_enabled() || self.cell_pixel.is_none();
+        let card_inner_w = welcome_card_inner_width(block_w);
+        let note_heights: Vec<u16> = if block_w >= 4 {
+            self.welcome
+                .notes()
+                .iter()
+                .map(|n| welcome_note_row_height(n, card_inner_w))
+                .collect()
+        } else {
+            Vec::new()
+        };
+
+        // The Start list hangs from the release card's text column, so
+        // "Start" and "What's new" share a left edge, and is only as wide as
+        // its labels and keycaps need, the keycaps in one column a fixed gap
+        // past the widest label ([`welcome_start_columns`]). Where the
+        // card's column cannot hold it, it centres on the axis instead. It
+        // shows only where it and a cell of hover lift either side fit.
+        let start_rows = self.welcome_start_rows();
+        let start_label_w = start_rows
+            .iter()
+            .map(|(label, _, _)| label.chars().count() as u16)
+            .max()
+            .unwrap_or(0);
+        let start_caps_w = start_rows
+            .iter()
+            .map(|(_, chord, _)| {
+                ratatui::text::Line::from(keycap_spans(chord, t, t.canvas(), false)).width() as u16
+            })
+            .max()
+            .unwrap_or(0);
+        let (start_keys_dx, start_col_w) = welcome_start_columns(start_label_w, start_caps_w);
+        let start_fits = start_col_w + 2 <= area.width;
+        let tour_offered = !self.tour_done && self.tour.is_none();
+        let plan = loch_welcome_plan(
+            area.height,
+            text_logo,
+            if start_fits {
+                start_rows.len() as u16
+            } else {
+                0
+            },
+            tour_offered,
+            &note_heights,
+        );
+
+        // The logo: the wordmark and the version pill as one group centred
+        // on the axis, or the picture's cells with the badge beside them.
+        let version_label = format!(" v{} ", env!("CARGO_PKG_VERSION"));
+        let version_w = version_label.chars().count() as u16;
+        let pill_w = version_w + 2;
+        let mark_w = 6; // "cr<>ft"
+        let logo_y = area.y + plan.logo_y;
+        let logo_w_cells = ((area.width as u32).saturating_sub(4) as u16).clamp(8, 48);
+        let (logo, pill_x) = if text_logo {
+            let group_w = mark_w + WELCOME_VERSION_GAP + pill_w;
+            let (mark_x, pill_x) = if group_w <= area.width {
+                let x = area.x + (area.width - group_w) / 2;
+                (x, Some(x + mark_w + WELCOME_VERSION_GAP))
+            } else {
+                (area.x + area.width.saturating_sub(mark_w) / 2, None)
+            };
+            let logo = WelcomeLayout {
+                cell_x: mark_x,
+                cell_y: logo_y,
+                cell_w: mark_w,
+                cell_h: 1,
+            };
+            (logo, pill_x)
+        } else {
+            let logo = WelcomeLayout {
+                cell_x: area.x + area.width.saturating_sub(logo_w_cells) / 2,
+                cell_y: logo_y,
+                cell_w: logo_w_cells,
+                cell_h: plan.logo_h,
+            };
+            (logo, None)
+        };
+        self.place_welcome_logo(logo);
+
+        if !self.overlays.welcome.has_image() && self.welcome_bake.is_none() {
+            // The wordmark itself: the letters in the strong ink and the
+            // `<>` (the stylised "o") in the brand orange, the one place that
+            // orange appears.
+            let letter = Style::default().fg(t.strong()).add_modifier(Modifier::BOLD);
+            let mark = ratatui::text::Line::from(vec![
+                Span::styled("cr", letter),
+                Span::styled(
+                    "<>",
+                    Style::default()
+                        .fg(BRAND_ORANGE)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("ft", letter),
+            ]);
+            let lx = logo.cell_x + logo.cell_w.saturating_sub(mark_w) / 2;
+            let ly = logo.cell_y + logo.cell_h / 2;
+            frame.buffer_mut().set_line(lx, ly, &mark, mark_w);
+        }
+
+        // The version: metadata, not a headline. A one-row pill on the
+        // raised tone with half-block caps, beside the wordmark. Beside the
+        // picture it keeps the badge's place (#1843): past the logo's cells,
+        // on the badge's middle row, or in the blank row under a logo too
+        // wide to sit beside.
+        let pill = |buf: &mut ratatui::buffer::Buffer, x: u16, y: u16| {
+            let caps = Style::default().fg(t.raised());
+            buf.set_string(x, y, "\u{2590}", caps);
+            buf.set_string(
+                x + 1,
+                y,
+                &version_label,
+                Style::default().fg(t.muted()).bg(t.raised()),
+            );
+            buf.set_string(x + 1 + version_w, y, "\u{258c}", caps);
+        };
+        if let Some(x) = pill_x {
+            pill(frame.buffer_mut(), x, logo_y);
+        } else if !text_logo {
+            let badge_x = logo.cell_x + logo.cell_w + 1;
+            let badge_y = logo_y + ((logo.cell_h * 5) / 6).min(logo.cell_h.saturating_sub(3));
+            let gap_y = logo_y + logo.cell_h;
+            if badge_x + version_w + 2 <= area.x + area.width && badge_y + 2 < area_max_y {
+                pill(frame.buffer_mut(), badge_x, badge_y + 1);
+            } else if gap_y + 2 < area_max_y && version_w <= area.width {
+                frame.buffer_mut().set_string(
+                    area.x + (area.width - version_w) / 2,
+                    gap_y,
+                    &version_label,
+                    Style::default().fg(t.muted()),
+                );
+            }
+        }
+
+        // The tagline in sentence case, muted and italic, so it reads as a
+        // line under the wordmark rather than a second banner.
+        let tagline_y = area.y + plan.tagline_y;
+        let tagline = Self::WELCOME_TAGLINE_CALM;
+        let tagline_w = tagline.chars().count() as u16;
+        if tagline_y < area_max_y && tagline_w <= area.width {
+            frame.buffer_mut().set_string(
+                area.x + (area.width - tagline_w) / 2,
+                tagline_y,
+                tagline,
+                Style::default()
+                    .fg(t.muted())
+                    .add_modifier(Modifier::ITALIC),
+            );
+        }
+
+        // The Start list: a heading in the strong ink (a heading outranks the
+        // rows it heads), then one row per action, its label in the body ink
+        // and its chord as keycaps in the list's keycap column, read from
+        // the keymap as the palette reads it. A row lifts under the pointer
+        // (a cell of lift either side of the list) and runs its action on a
+        // click; the lift is the row's click rect.
+        if let Some(start_y) = plan.start_y {
+            let start_y = area.y + start_y;
+            // The card's text column starts two cells into the card (its
+            // rim and a cell of inset); with no card under it, or a card too
+            // narrow to hold the list, the list centres on the axis.
+            let card_text_x = block_left + 2;
+            let col_x = if plan.notes > 0 && start_col_w <= card_inner_w {
+                card_text_x
+            } else {
+                area.x + (area.width - start_col_w) / 2
+            };
+            let buf = frame.buffer_mut();
+            buf.set_string(
+                col_x,
+                start_y,
+                "Start",
+                Style::default().fg(t.strong()).add_modifier(Modifier::BOLD),
+            );
+            for (i, (label, chord, action)) in start_rows.iter().enumerate() {
+                let y = start_y + 1 + i as u16;
+                let row = Rect {
+                    x: col_x - 1,
+                    y,
+                    width: start_col_w + 2,
+                    height: 1,
+                };
+                let hovered = crate::widgets::hover::contains(row, self.pointer_cell);
+                let row_bg = if hovered {
+                    t.hover_on(t.canvas)
+                } else {
+                    t.canvas()
+                };
+                if hovered {
+                    buf.set_style(row, Style::default().bg(row_bg));
+                }
+                buf.set_string(
+                    col_x,
+                    y,
+                    label,
+                    Style::default().fg(if hovered { t.strong() } else { t.text() }),
+                );
+                if !chord.is_empty() {
+                    let caps = ratatui::text::Line::from(keycap_spans(chord, t, row_bg, false));
+                    let caps_w = caps.width() as u16;
+                    buf.set_line(col_x + start_keys_dx, y, &caps, caps_w);
+                }
+                match action {
+                    Some(action) => self.welcome.push_start_row(row, *action),
+                    None => self.welcome_tour_button = row,
+                }
+            }
+        }
+
+        // No room for the Start list: the tour as a calm chip in its place,
+        // on the raised tone with half-block caps, lifting under the
+        // pointer; the accent stays for focus and selection.
+        if let Some(chip_y) = plan.chip_y {
+            let label = " Take the Tour ";
+            let w = label.chars().count() as u16;
+            if w + 2 <= area.width {
+                let rect = Rect {
+                    x: area.x + (area.width - w) / 2,
+                    y: area.y + chip_y,
+                    width: w,
+                    height: 1,
+                };
+                let hovered = crate::widgets::hover::contains(rect, self.pointer_cell);
+                let fill = if hovered {
+                    t.hover_on(t.raised)
+                } else {
+                    t.raised()
+                };
+                let buf = frame.buffer_mut();
+                buf.set_string(rect.x - 1, rect.y, "\u{2590}", Style::default().fg(fill));
+                buf.set_string(
+                    rect.x,
+                    rect.y,
+                    label,
+                    Style::default()
+                        .fg(if hovered { t.strong() } else { t.text() })
+                        .bg(fill),
+                );
+                buf.set_string(rect.right(), rect.y, "\u{258c}", Style::default().fg(fill));
+                self.welcome_tour_button = rect;
+            }
+        }
+
+        // The release card: a raised surface that floats on the canvas, its
+        // rim all round with no accent lip (it never takes the keyboard),
+        // holding the notes that fit whole and, when that is not all of
+        // them, a muted "+N more" line in the row under them.
+        if plan.notes == 0 {
+            return;
+        }
+        let box_rect = Rect {
+            x: block_left,
+            y: area.y + plan.card_y,
+            width: block_w,
+            height: plan.card_h,
+        };
+        let buf = frame.buffer_mut();
+        buf.set_style(box_rect, Style::default().bg(t.raised()));
+        crate::widgets::surface::paint_quiet_frame(buf, box_rect, self.theme);
+        let inner_x = box_rect.x + 2;
+        let header_y = box_rect.y + 1;
+        // "What's new" in the strong ink, bold, so the heading outranks the
+        // notes under it; the version it describes right-aligned in the
+        // muted ink, metadata said once.
+        let unreleased = crate::release_notes::unreleased();
+        let heading = if unreleased {
+            "What's new in this build"
+        } else {
+            "What's new"
+        };
+        let version = format!(
+            "v{}{}",
+            env!("CARGO_PKG_VERSION"),
+            if unreleased { "+" } else { "" }
+        );
+        buf.set_stringn(
+            inner_x,
+            header_y,
+            heading,
+            usize::from(card_inner_w),
+            Style::default().fg(t.strong()).add_modifier(Modifier::BOLD),
+        );
+        let (heading_w, card_version_w) = (
+            heading.chars().count() as u16,
+            version.chars().count() as u16,
+        );
+        if card_inner_w >= heading_w + card_version_w + 2 {
+            buf.set_string(
+                inner_x + card_inner_w - card_version_w,
+                header_y,
+                &version,
+                Style::default().fg(t.muted()),
+            );
+        }
+        // Each note: its typographic mark (`+` a feature, `•` a fix) in the
+        // gutter, then its summary wrapped to the card, continuation lines
+        // under the summary. The plan measured these very wraps, so every
+        // note shown ends inside the card (#99).
+        let row_style = Style::default().fg(t.text());
+        let code_style = row_style.fg(self.theme.ui(crate::markdown::CODE));
+        let summary_x = inner_x + WELCOME_NOTE_GUTTER;
+        let summary_w = card_inner_w.saturating_sub(WELCOME_NOTE_GUTTER);
+        let notes = self.welcome.notes();
+        let mut row_y = header_y + 2;
+        for note in &notes[..plan.notes] {
+            let (mark, mark_fg) = note.kind.marker_for(self.theme);
+            buf.set_string(inner_x, row_y, mark, Style::default().fg(mark_fg));
+            let lines = wrapped_welcome_note_summary(note, card_inner_w);
+            let styled = styled_welcome_note_lines(note, &lines, row_style, code_style);
+            for (i, line) in styled.iter().enumerate() {
+                buf.set_line(summary_x, row_y + i as u16, line, summary_w);
+            }
+            row_y += lines.len().max(1) as u16;
+        }
+        if plan.notes < notes.len() {
+            buf.set_stringn(
+                summary_x,
+                row_y,
+                format!("+{} more", notes.len() - plan.notes),
+                usize::from(summary_w),
+                Style::default().fg(t.muted()),
+            );
         }
     }
 
@@ -19045,15 +20101,24 @@ impl App {
         // in the 4-wide slot.
         let base = self.theme.ui(Color::Rgb(0xcc, 0xcc, 0xcc));
         let accent = self.theme.ui(Color::Rgb(0x4e, 0x9a, 0xff));
+        let surfaces = self.theme.surfaces().is_some();
+        let theme = self.theme;
         let mut paint = |x: u16, glyph: char| {
             let hovered = pointer.is_some_and(|(px, py)| py == y && px >= x && px < x + w);
-            let color = if hovered { accent } else { base };
-            frame.buffer_mut().set_string(
-                x + w / 2,
-                y,
-                glyph.to_string(),
-                Style::default().fg(color),
-            );
+            // On a `surfaces` theme these are header actions like the side
+            // bar's: muted at rest, and under the pointer the strong ink on
+            // a faint chip across the whole two-cell slot, never the accent.
+            let style = if surfaces {
+                crate::widgets::header_pill::action_style(theme, hovered)
+            } else {
+                Style::default().fg(if hovered { accent } else { base })
+            };
+            let buf = frame.buffer_mut();
+            if surfaces && hovered {
+                let chip = Rect::new(x, y, w, 1).intersection(buf.area);
+                buf.set_style(chip, style);
+            }
+            buf.set_string(x + w / 2, y, glyph.to_string(), style);
         };
         let side_glyph = if self.show_tree {
             crate::icons::LAYOUT_SIDEBAR_ON
@@ -19181,7 +20246,16 @@ impl App {
         // the bar in the same colors as an image-capable one instead of a
         // second, slightly-off set of greys.
         let active_color = self.theme.activity_icon_active();
+        let hover_color = self.theme.activity_icon_hover();
         let inactive_color = self.theme.activity_icon_inactive();
+        // Codicons have no bold weight; on Croft Loch bold would only set
+        // off some terminals' bold-as-bright, so its glyphs stay regular.
+        let tones = crate::widgets::surface::tones(self.theme);
+        let glyph_mods = if tones.is_some() {
+            Modifier::empty()
+        } else {
+            Modifier::BOLD
+        };
         let glyph_x = activity_icon_glyph_x(area);
         let render_glyph = |frame: &mut ratatui::Frame,
                             block: Rect,
@@ -19208,8 +20282,12 @@ impl App {
                 width: 1,
                 height: 1,
             };
-            let color = if is_active || is_hovered {
+            // Selected wins over hover; hover is its own step (body text on
+            // Croft Loch, the active ink elsewhere).
+            let color = if is_active {
                 active_color
+            } else if is_hovered {
+                hover_color
             } else {
                 inactive_color
             };
@@ -19218,14 +20296,26 @@ impl App {
                     Style::default()
                         .fg(color)
                         .bg(bg_color)
-                        .add_modifier(Modifier::BOLD),
+                        .add_modifier(glyph_mods),
                 ),
                 cell,
             );
         };
         // Text analogue of the baked count badge for image-less terminals: an
-        // accent cell with the count at the icon's bottom-right corner.
-        let badge_bg = self.theme.accent();
+        // accent cell with the count at the icon's bottom-right corner. Croft
+        // Loch tints it instead, the accent laid into the chrome with the
+        // digits in the accent lifted toward the foreground, so the count
+        // reads without a hard teal block beside a muted icon.
+        let badge_style = match tones {
+            Some(t) => {
+                let (fill, ink) = chip_tint(t, t.accent, false);
+                Style::default().fg(ink).bg(fill)
+            }
+            None => Style::default()
+                .fg(Color::White)
+                .bg(self.theme.accent())
+                .add_modifier(Modifier::BOLD),
+        };
         let render_count_badge = |frame: &mut ratatui::Frame, block: Rect, count: usize| {
             if count == 0 {
                 return;
@@ -19237,12 +20327,7 @@ impl App {
             };
             let w = label.chars().count() as u16;
             frame.render_widget(
-                ratatui::widgets::Paragraph::new(label).style(
-                    Style::default()
-                        .fg(Color::White)
-                        .bg(badge_bg)
-                        .add_modifier(Modifier::BOLD),
-                ),
+                ratatui::widgets::Paragraph::new(label).style(badge_style),
                 Rect {
                     x: block.x + block.width.saturating_sub(w),
                     y: block.y + block.height.saturating_sub(1),
@@ -19337,7 +20422,7 @@ impl App {
                             Style::default()
                                 .fg(color)
                                 .bg(bg_color)
-                                .add_modifier(Modifier::BOLD),
+                                .add_modifier(glyph_mods),
                         ),
                     Rect {
                         x: glyph_x,
@@ -20460,6 +21545,7 @@ impl App {
             return;
         }
         let brand = self.theme.gradient();
+        let tones = crate::widgets::surface::tones(self.theme);
         // Same selected-row treatment as the OPEN EDITORS list, so the rail
         // reads as the same family of chrome in both themes.
         let sel_bg = if brand {
@@ -20501,8 +21587,10 @@ impl App {
                 height: 1,
             };
             let active = i == self.active_terminal;
-            let bg = if active {
+            let bg = if active && tones.is_none() {
                 Some(sel_bg)
+            } else if active {
+                None
             } else {
                 crate::widgets::hover::row_hover_bg(row, self.pointer_cell, self.theme)
             };
@@ -20512,12 +21600,14 @@ impl App {
             let label = self.terminals[i].label().to_string();
             let room = TERMINAL_RAIL_LABEL_W as usize;
             let shown: String = label.chars().take(room).collect();
-            let fg = if active {
-                Style::default()
+            let fg = match tones {
+                // Croft Loch: the active terminal's name in body text on the
+                // selected-row band, the rest muted.
+                Some(t) => Style::default().fg(if active { t.text() } else { t.muted() }),
+                None if active => Style::default()
                     .fg(self.theme.ui(Color::White))
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default()
+                    .add_modifier(Modifier::BOLD),
+                None => Style::default(),
             };
             // `set_string` clips at the buffer edge, not the rail's, so a
             // label wider than a clamped rail would paint its tail over the
@@ -20529,6 +21619,18 @@ impl App {
                 row.width as usize,
                 fg,
             );
+            // The one selected-row anatomy: band plus the accent bar in the
+            // row's leading space, the bar only while the panel has the
+            // keyboard.
+            if active && let Some(t) = tones {
+                crate::widgets::surface::paint_selected_row(
+                    frame.buffer_mut(),
+                    row,
+                    t,
+                    t.canvas,
+                    self.focus == Pane::Terminal,
+                );
+            }
             self.terminal_rail_rects.push(row);
         }
     }
@@ -22327,14 +23429,24 @@ impl App {
         // Croft Loch's title row is a chrome band over the canvas the views
         // paint on, with muted inactive titles.
         let surfaces = self.theme.surfaces();
+        let tones = crate::widgets::surface::tones(self.theme);
         let strip_bg = surfaces.map_or(self.theme.editor_bg(), |s| s.chrome());
         frame.render_widget(Block::default().style(Style::default().bg(strip_bg)), strip);
         let brand = self.theme.gradient();
-        let active_fg = if brand {
-            crate::gradient::rgb_color(crate::gradient::PANEL_TITLE_FG)
-        } else {
-            self.theme.ui(Color::White)
+        // Croft Loch's three steps: the active title in the strong ink (its
+        // accent underline says the rest, so no bold), a hovered one lifted
+        // to body text, the others muted.
+        let active_fg = match tones {
+            Some(t) => t.strong(),
+            None if brand => crate::gradient::rgb_color(crate::gradient::PANEL_TITLE_FG),
+            None => self.theme.ui(Color::White),
         };
+        let active_mods = if tones.is_some() {
+            Modifier::empty()
+        } else {
+            Modifier::BOLD
+        };
+        let hover_fg = tones.map_or(active_fg, |t| t.text());
         let inactive_fg =
             surfaces.map_or(self.theme.ui(Color::Rgb(0x80, 0x88, 0x98)), |s| s.muted());
         let right = strip.x + strip.width;
@@ -22347,13 +23459,35 @@ impl App {
         // In images mode the count rides as an orange circle (the same raster
         // badge as the activity bar), emitted post-frame; recompute its anchor
         // each paint. Glyph-fallback terminals keep the powerline-cap pill.
-        let images = self.overlays.activity.has_images();
+        // Croft Loch draws neither: its count is a tinted chip in either mode,
+        // red while there are errors, amber for warnings, neutral otherwise.
+        let images = self.overlays.activity.has_images() && tones.is_none();
+        let badge_tint = tones.map(|t| {
+            let hue = if self.problems.error_count() > 0 {
+                (0xe5, 0x53, 0x4b)
+            } else if self.problems.warning_count() > 0 {
+                (0xe2, 0xa0, 0x3a)
+            } else {
+                t.muted
+            };
+            chip_tint(t, hue, false)
+        });
 
         // VS Code panel-group order: PROBLEMS, OUTPUT, TERMINAL, PORTS. PROBLEMS
         // alone carries the orange count badge after its label.
         // Each label is translated and padded to its click target.
-        let tabs =
-            BottomPanelTab::ALL.map(|tab| (tab, format!(" {} ", crate::i18n::tr(tab.label()))));
+        // Croft Loch drops the first title's leading pad, so its word lands
+        // on the terminal's first text column below it. The tab still starts
+        // a column in: the panel's edge column belongs to the splitter.
+        let flush_first = tones.is_some();
+        let tabs = BottomPanelTab::ALL.map(|tab| {
+            let pad = if flush_first && tab == BottomPanelTab::ALL[0] {
+                ""
+            } else {
+                " "
+            };
+            (tab, format!("{pad}{} ", crate::i18n::tr(tab.label())))
+        });
 
         // Lay each tab out left to right, recording its hit rect (which, for
         // PROBLEMS, spans the label and the pill together).
@@ -22399,9 +23533,9 @@ impl App {
                 Style::default()
                     .fg(active_fg)
                     .bg(strip_bg)
-                    .add_modifier(Modifier::BOLD)
+                    .add_modifier(active_mods)
             } else if crate::widgets::hover::row_hover_bg(*rect, pointer, self.theme).is_some() {
-                Style::default().fg(active_fg).bg(strip_bg)
+                Style::default().fg(hover_fg).bg(strip_bg)
             } else {
                 Style::default().fg(inactive_fg).bg(strip_bg)
             };
@@ -22420,7 +23554,17 @@ impl App {
             // Otherwise the powerline-cap pill is drawn as text.
             if *badge_w > 0 {
                 let bx = rect.x + unicode_width::UnicodeWidthStr::width(label.as_str()) as u16;
-                if images {
+                if let Some((fill, ink)) = badge_tint {
+                    if bx < right {
+                        buf.set_stringn(
+                            bx,
+                            rect.y,
+                            format!(" {count} "),
+                            right.saturating_sub(bx) as usize,
+                            Style::default().fg(ink).bg(fill),
+                        );
+                    }
+                } else if images {
                     if bx < right {
                         self.problems_badge_cell = Some((bx, rect.y));
                     }
@@ -22466,6 +23610,19 @@ impl App {
             }
         }
         self.paint_panel_actions(buf, strip, placed.last().map_or(strip.x, |p| p.2.right()));
+    }
+
+    /// Croft Loch's top edge for a view sharing the panel (PROBLEMS, OUTPUT,
+    /// PORTS, CAPTURES): the hairline under the tab strip, or the accent lip
+    /// while the panel has the keyboard, as each terminal pane draws its own.
+    /// A no-op on a boxed theme.
+    fn paint_panel_view_top(&self, frame: &mut ratatui::Frame, content: Rect) {
+        crate::widgets::surface::paint_pane_top(
+            frame.buffer_mut(),
+            content,
+            self.theme,
+            self.focus == Pane::Terminal,
+        );
     }
 
     /// The panel's own controls at the right end of its tab row (#1980), right
@@ -23163,6 +24320,7 @@ impl App {
             self.tree.hover_pointer = panel_pointer;
             self.search.hover_pointer = panel_pointer;
             self.source_control.hover_pointer = panel_pointer;
+            self.run_debug.hover_pointer = panel_pointer;
             self.remote.hover_pointer = panel_pointer;
             self.outline.hover_pointer = panel_pointer;
             self.open_editors.hover_pointer = panel_pointer;
@@ -23258,6 +24416,10 @@ impl App {
             // mirroring the terminal pane buttons' hover affordance.
             let pointer = self.pointer_cell;
             self.editor.hover_pointer = pointer;
+            // A modal quick input takes the keyboard without moving focus
+            // (no focus sync runs when one opens), so the editor learns each
+            // frame to drop its accent marks while one is up.
+            self.editor.overlay_has_keyboard = self.modal_overlay_open();
             // Without an inline-image protocol an image tab draws itself in
             // half blocks (#1591).
             let cell_images = !self.inline_images_enabled();
@@ -23476,6 +24638,9 @@ impl App {
                 let active_area = rects[active_idx];
                 self.editor.set_tab_reserved_right(reserve(active_area));
                 frame.render_widget(&mut self.editor, active_area);
+                if let Some((_, full_strip, _)) = minimap {
+                    self.paint_minimap_header(frame.buffer_mut(), full_strip);
+                }
                 let inactive_rects: Vec<Rect> = rects
                     .iter()
                     .enumerate()
@@ -23519,6 +24684,7 @@ impl App {
                 );
                 self.editor.set_tab_reserved_right(reserve(ed_rect));
                 frame.render_widget(&mut self.editor, ed_rect);
+                self.paint_minimap_header(frame.buffer_mut(), full_strip);
                 self.editor_seams.clear();
                 self.update_editor_image_overlay(0, ed_rect);
                 self.disable_editor_image(1);
@@ -23569,7 +24735,7 @@ impl App {
                     frame.render_widget(popup_ref, area);
                     // The selected item's signature and documentation (#1527).
                     if let Some(details) = popup_ref.details_area_for(area, focused_area) {
-                        frame.render_widget(popup_ref.details(), details);
+                        frame.render_widget(popup_ref.details().beside(area), details);
                     }
                 }
             }
@@ -23745,6 +24911,44 @@ impl App {
                     self.terminal_label_rects.clear();
                     self.terminal_collapse_buttons.clear();
                     self.terminal_strip_rects.clear();
+                    // Croft Loch hangs a lone terminal's `∨ +` on the tab row,
+                    // just left of the panel chevron, as VS Code does: the
+                    // panel's controls then share one row instead of stepping
+                    // down onto the pane, whose top edge stays a clean rule.
+                    // Only when both fit between the last tab and the chevron;
+                    // otherwise they keep the pane's top row.
+                    let header_slot = (crate::widgets::surface::tones(self.theme).is_some()
+                        && self.terminals.len() == 1
+                        && !self.terminals[0].collapsed
+                        && strip.height == 1
+                        && !self.panel_maximize_button.is_empty())
+                    .then(|| {
+                        let tabs_end = [
+                            self.problems_tab_rect,
+                            self.output_tab_rect,
+                            self.terminal_tab_rect,
+                            self.ports_tab_rect,
+                            self.captures_tab_rect,
+                        ]
+                        .iter()
+                        .map(|r| r.right())
+                        .max()
+                        .unwrap_or(strip.x);
+                        let x0 = tabs_end + 1;
+                        // The buttons keep one blank column at their right
+                        // edge; ending the slot one cell into the chevron
+                        // lays that column on the chevron's own padding, so
+                        // `+` sits two cells from the chevron's glyph, the
+                        // same step as between `∨` and `+`.
+                        let x1 = self.panel_maximize_button.x + 1;
+                        Rect::new(x0, strip.y, x1.saturating_sub(x0), 1)
+                    })
+                    .filter(|slot| {
+                        let need = TERMINAL_ADD_LABEL.chars().count()
+                            + TERMINAL_PROFILE_LABEL.chars().count()
+                            + 2;
+                        usize::from(slot.width) >= need
+                    });
                     for (i, col) in cols.iter().enumerate().take(self.terminals.len()) {
                         // Hidden panes still push placeholders so a button's
                         // position in each vec names its terminal index.
@@ -23773,7 +24977,7 @@ impl App {
                         self.terminal_strip_rects.push(Rect::default());
                         let buttons = paint_terminal_pane_buttons(
                             frame,
-                            *col,
+                            header_slot.unwrap_or(*col),
                             show_close,
                             maximized,
                             self.theme,
@@ -23856,6 +25060,15 @@ impl App {
                                         .fg(Color::Black)
                                         .bg(Color::Rgb(r, g, b))
                                         .add_modifier(Modifier::BOLD)
+                                } else if let Some(t) = crate::widgets::surface::tones(self.theme) {
+                                    // Croft Loch names the pane with the
+                                    // keyboard in the strong ink, the rest
+                                    // muted, so the labels say where focus is.
+                                    Style::default().fg(if self.terminals[i].focused {
+                                        t.strong()
+                                    } else {
+                                        t.muted()
+                                    })
                                 } else {
                                     crate::widgets::header_pill::action_style(self.theme, false)
                                 };
@@ -23901,6 +25114,7 @@ impl App {
                         t.redacted_on_screen = 0;
                     }
                     frame.render_widget(&mut self.problems, content);
+                    self.paint_panel_view_top(frame, content);
                 }
                 BottomPanelTab::Output => {
                     // Same hidden-terminal reset as PROBLEMS: the OUTPUT view
@@ -23917,6 +25131,7 @@ impl App {
                         t.redacted_on_screen = 0;
                     }
                     frame.render_widget(&mut self.output, content);
+                    self.paint_panel_view_top(frame, content);
                 }
                 BottomPanelTab::Ports => {
                     // Same hidden-terminal reset: the PORTS view covers the
@@ -23933,6 +25148,7 @@ impl App {
                         t.redacted_on_screen = 0;
                     }
                     frame.render_widget(&mut self.ports, content);
+                    self.paint_panel_view_top(frame, content);
                 }
                 BottomPanelTab::Captures => {
                     // Same hidden-terminal reset as the PORTS arm above.
@@ -23948,6 +25164,7 @@ impl App {
                         t.redacted_on_screen = 0;
                     }
                     frame.render_widget(&mut self.captures, content);
+                    self.paint_panel_view_top(frame, content);
                 }
             }
         } else {
@@ -23990,8 +25207,19 @@ impl App {
         // Owned snapshot: the spans borrow the status, and borrowing it
         // through scm_worker() would pin all of &self for the whole render.
         let scm_status = self.scm_worker().status().clone();
-        let mut spans: Vec<Span> = Vec::with_capacity(20);
-        spans.extend(brand_spans(self.theme));
+        let status_bg = status_bar_bg(self.theme);
+        let tones = StatusTones::new(self.theme, status_bg);
+        let mut spans: Vec<Span> = Vec::with_capacity(26);
+        let workspace_name = self
+            .workspace_root()
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| self.workspace_root().display().to_string());
+        spans.extend(workspace_cap_spans(self.theme, &workspace_name));
+        if self.overwrite_mode {
+            spans.push(Span::raw(" "));
+            spans.push(overwrite_mode_span());
+        }
         let redacted = self.redacted_on_screen();
         if redacted > 0 || self.redactions_revealed() {
             // How much of what is on screen is masked right now (#360): a
@@ -23999,29 +25227,24 @@ impl App {
             // that a reveal window is open.
             let (label, bg) = if self.redactions_revealed() {
                 (
-                    format!(" \u{1f441} {redacted} revealed "),
+                    format!("\u{1f441} {redacted} revealed"),
                     Color::Rgb(0xc0, 0x39, 0x2b),
                 )
             } else {
                 (
-                    format!(" \u{2022} {redacted} redacted "),
+                    format!("\u{2022} {redacted} redacted"),
                     Color::Rgb(0x3a, 0x3f, 0x4b),
                 )
             };
-            spans.push(Span::styled(
-                label,
-                Style::default()
-                    .bg(self.theme.ui(bg))
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            ));
+            spans.extend(status_pill(&label, self.theme.ui(bg), Color::White));
+            spans.push(Span::raw(" "));
         }
         if let Some(span) = self.perf.status_span() {
             spans.push(span);
         }
         // The pill the update card rises from and Later folds it into; a
         // click opens or folds the card. Recorded as (start column, width).
-        let offer_chip_x: u16 = spans.iter().map(|s| s.content.chars().count() as u16).sum();
+        let offer_chip_x: u16 = spans.iter().map(|s| status_cells(&s.content)).sum();
         if let Some(toast) = self.update_toast.as_ref().filter(|t| !t.ready) {
             let hovered =
                 crate::widgets::hover::contains(self.status_offer_rect, self.pointer_cell);
@@ -24035,7 +25258,7 @@ impl App {
                 Color::White,
             ));
         }
-        let offer_chip_end: u16 = spans.iter().map(|s| s.content.chars().count() as u16).sum();
+        let offer_chip_end: u16 = spans.iter().map(|s| status_cells(&s.content)).sum();
         let offer_chip =
             (offer_chip_end > offer_chip_x).then(|| (offer_chip_x, offer_chip_end - offer_chip_x));
         if offer_chip.is_some() {
@@ -24043,7 +25266,7 @@ impl App {
         }
         // Both update pills are one click target, doing what the updater
         // chord does (#865); recorded as (start column, width).
-        let update_chip_x: u16 = spans.iter().map(|s| s.content.chars().count() as u16).sum();
+        let update_chip_x: u16 = spans.iter().map(|s| status_cells(&s.content)).sum();
         if self.any_update_ready() {
             spans.extend(crate::widgets::update_popup::pill_spans(
                 &format!(
@@ -24075,7 +25298,7 @@ impl App {
                     .add_modifier(Modifier::BOLD),
             ));
         }
-        let update_chip_end: u16 = spans.iter().map(|s| s.content.chars().count() as u16).sum();
+        let update_chip_end: u16 = spans.iter().map(|s| status_cells(&s.content)).sum();
         let update_chip = (update_chip_end > update_chip_x)
             .then(|| (update_chip_x, update_chip_end - update_chip_x));
         if self.any_update_in_progress() {
@@ -24125,16 +25348,14 @@ impl App {
             let left = until
                 .saturating_duration_since(std::time::Instant::now())
                 .as_secs();
-            spans.push(Span::styled(
-                format!(
-                    " \u{2713} auto-approving {agent} {}:{:02} ",
+            spans.extend(status_pill(
+                &format!(
+                    "\u{2713} auto-approving {agent} {}:{:02}",
                     left / 60,
                     left % 60
                 ),
-                Style::default()
-                    .bg(self.theme.ui(Color::Rgb(0x8a, 0x60, 0x00)))
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
+                self.theme.ui(Color::Rgb(0x8a, 0x60, 0x00)),
+                Color::White,
             ));
             spans.push(Span::raw(" "));
         }
@@ -24151,21 +25372,20 @@ impl App {
         let mut codeql_chip: Option<(u16, u16)> = None;
         if let Some((_, since)) = &self.codeql_run {
             let secs = since.elapsed().as_secs();
-            let text = format!(
-                " \u{27f3} CodeQL {} {}:{:02} \u{2715} ",
-                self.codeql_run_name,
-                secs / 60,
-                secs % 60
+            let pill = status_pill(
+                &format!(
+                    "\u{27f3} CodeQL {} {}:{:02} \u{2715}",
+                    self.codeql_run_name,
+                    secs / 60,
+                    secs % 60
+                ),
+                self.theme.ui(Color::Rgb(0x2b, 0x5d, 0x8a)),
+                Color::White,
             );
-            let x: u16 = spans.iter().map(|s| s.content.chars().count() as u16).sum();
-            codeql_chip = Some((x, text.chars().count() as u16));
-            spans.push(Span::styled(
-                text,
-                Style::default()
-                    .bg(self.theme.ui(Color::Rgb(0x2b, 0x5d, 0x8a)))
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            ));
+            let x: u16 = spans.iter().map(|s| status_cells(&s.content)).sum();
+            let w: u16 = pill.iter().map(|s| status_cells(&s.content)).sum();
+            codeql_chip = Some((x, w));
+            spans.extend(pill);
             spans.push(Span::raw(" "));
         }
         if let Some((_, _, started)) = &self.recording {
@@ -24173,12 +25393,10 @@ impl App {
             // leave on; it is not the macro recorder, so it has its own
             // badge and says how long it has run.
             let secs = started.elapsed().as_secs();
-            spans.push(Span::styled(
-                format!(" \u{25cf} CAST {}:{:02} ", secs / 60, secs % 60),
-                Style::default()
-                    .bg(self.theme.ui(Color::Rgb(0x8a, 0x1c, 0x5a)))
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
+            spans.extend(status_pill(
+                &format!("\u{25cf} CAST {}:{:02}", secs / 60, secs % 60),
+                self.theme.ui(Color::Rgb(0x8a, 0x1c, 0x5a)),
+                Color::White,
             ));
             spans.push(Span::raw(" "));
         }
@@ -24187,24 +25405,19 @@ impl App {
             // filled red badge rather than a dim hint (#255). A named register
             // shows which one, since vim users keep several.
             let label = match rec.register {
-                Some(r) => format!(" ● REC @{r} "),
-                None => String::from(" ● REC "),
+                Some(r) => format!("● REC @{r}"),
+                None => String::from("● REC"),
             };
-            spans.push(Span::styled(
-                label,
-                Style::default()
-                    .bg(self.theme.ui(Color::Rgb(0xc0, 0x2b, 0x2b)))
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
+            spans.extend(status_pill(
+                &label,
+                self.theme.ui(Color::Rgb(0xc0, 0x2b, 0x2b)),
+                Color::White,
             ));
             spans.push(Span::raw(" "));
         }
         if self.vim.enabled {
             let (text, bg) = match self.vim.command_line() {
-                Some(cmd) => (
-                    format!(" {cmd} "),
-                    self.theme.ui(Color::Rgb(0x33, 0x33, 0x33)),
-                ),
+                Some(cmd) => (cmd.to_string(), self.theme.ui(Color::Rgb(0x33, 0x33, 0x33))),
                 None => {
                     let label = self.vim.mode_label().unwrap_or("NORMAL");
                     let bg = match self.vim.mode() {
@@ -24214,33 +25427,22 @@ impl App {
                         }
                         _ => self.theme.ui(Color::Rgb(0x4e, 0x9a, 0xff)),
                     };
-                    (format!(" {label} "), bg)
+                    (label.to_string(), bg)
                 }
             };
-            spans.push(Span::styled(
-                text,
-                Style::default()
-                    .bg(bg)
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            ));
+            spans.extend(status_pill(&text, bg, Color::White));
             spans.push(Span::raw(" "));
         }
-        // Hairline zone divider (│): fences the brand/git zone, the
-        // diagnostics cluster, and the transient message off from each other
-        // so the bar reads as segments instead of one run of text. Quiet on
-        // both the navy and near-black bars.
-        let zone_div = Style::default().fg(self.theme.ui(Color::Rgb(0x3a, 0x41, 0x50)));
-        // Croft Loch spaces its zones apart the way VS Code's status bar
-        // does; the divider keeps its cell so no click target moves.
-        let div = if self.theme.surfaces().is_some() {
-            " "
-        } else {
-            "\u{2502}"
-        };
-        let scm_spans = git_status_spans(&scm_status);
-        // The wordmark already ends in a space; the git spans don't, so buy
-        // the divider one cell of air only when the branch segment painted.
+        // Zones are set apart by air rather than by drawn dividers, the way
+        // VS Code's status bar spaces its items: the bar reads as a few
+        // quiet groups instead of a ruled table. The spacer keeps its one
+        // cell, so no click target moves.
+        let zone_div = Style::default();
+        let div = " ";
+        let scm_spans = git_status_spans(&scm_status, self.theme);
+        // The git spans open with their own air and the cap ends on its
+        // rounded edge, so the spacer takes one more cell only when the
+        // branch segment painted.
         let scm_present = !scm_spans.is_empty();
         spans.extend(scm_spans);
         spans.push(Span::styled(
@@ -24255,79 +25457,93 @@ impl App {
         // survive a transport drop, so flag it for the whole session (rendered
         // before the transient status so a status update never hides it).
         if let Some(warning) = self.persistence_warning {
-            spans.push(Span::styled(
-                format!(" \u{26a0} {warning} "),
-                Style::default()
-                    .bg(self.theme.ui(Color::Rgb(0xff, 0x9d, 0x2f)))
-                    .fg(self.theme.ui(Color::Rgb(0x10, 0x13, 0x1a)))
-                    .add_modifier(Modifier::BOLD),
+            spans.extend(status_pill(
+                &format!("\u{26a0} {warning}"),
+                self.theme.ui(Color::Rgb(0xff, 0x9d, 0x2f)),
+                self.theme.ui(Color::Rgb(0x10, 0x13, 0x1a)),
             ));
-            spans.push(Span::raw("  "));
+            spans.push(Span::raw(" "));
         }
         // Multiplayer roster badge: how many clients are attached to this
         // persistent session, painted only when someone else is here
         // (manage them via Session: Participants, Cmd+K A).
         if self.session_participants.len() > 1 {
-            spans.push(Span::styled(
-                format!(" \u{f0c0} {} attached ", self.session_participants.len()),
-                Style::default()
-                    .bg(self.theme.ui(Color::Rgb(0x2f, 0x6f, 0xd0)))
-                    .fg(self.theme.ui(Color::Rgb(0xff, 0xff, 0xff)))
-                    .add_modifier(Modifier::BOLD),
+            spans.extend(status_pill(
+                &format!("\u{f0c0} {} attached", self.session_participants.len()),
+                self.theme.ui(Color::Rgb(0x2f, 0x6f, 0xd0)),
+                self.theme.ui(Color::Rgb(0xff, 0xff, 0xff)),
             ));
-            spans.push(Span::raw("  "));
+            spans.push(Span::raw(" "));
         }
         // AI-stream badge: a pilot is streaming an edit into a shared file;
         // orange like the persistence warning (attention, not decoration),
         // naming the cancel chord so the stop path is one glance away.
         if let Some(stream) = &self.collab_stream {
-            spans.push(Span::styled(
-                format!(
-                    " \u{23f9} {} streaming into {} (Cmd+K X to stop) ",
+            spans.extend(status_pill(
+                &format!(
+                    "\u{23f9} {} streaming into {} (Cmd+K X to stop)",
                     stream.name, stream.file
                 ),
-                Style::default()
-                    .bg(self.theme.ui(Color::Rgb(0xff, 0x9d, 0x2f)))
-                    .fg(self.theme.ui(Color::Rgb(0x10, 0x13, 0x1a)))
-                    .add_modifier(Modifier::BOLD),
+                self.theme.ui(Color::Rgb(0xff, 0x9d, 0x2f)),
+                self.theme.ui(Color::Rgb(0x10, 0x13, 0x1a)),
             ));
-            spans.push(Span::raw("  "));
+            spans.push(Span::raw(" "));
         } else if let Some(host) = &self.pair_host {
             // Resident navigator seated and idle: presence, not attention —
             // the stream badge above takes over whenever it is typing.
             spans.push(Span::styled(
                 format!(" \u{25c6} {} seated ", host.title()),
                 Style::default()
-                    .bg(self.theme.ui(Color::Rgb(0x3c, 0x41, 0x4f)))
                     .fg(self.theme.ui(Color::Rgb(0xff, 0x9d, 0x2f)))
                     .add_modifier(Modifier::BOLD),
             ));
-            spans.push(Span::raw("  "));
+            spans.push(Span::raw(" "));
         }
         // Diagnostics counts (click → PROBLEMS), VS Code-style, after git.
-        // Always shown so the bar reads as a health indicator at a glance.
+        // Always shown so the bar reads as a health indicator at a glance,
+        // but a count of zero stays dim: red and amber are kept for a count
+        // that has something to say.
         let err_count = self.problems.error_count();
         let warn_count = self.problems.warning_count();
-        let diag_start_col: u16 = spans.iter().map(|s| s.content.chars().count() as u16).sum();
-        // One cell between the counts, not three: the errors and warnings
-        // read as a single health cluster (they already share one hit rect).
+        let diag_start_col: u16 = spans.iter().map(|s| status_cells(&s.content)).sum();
         // diag_len is measured from the very strings that render, so the hit
         // rect can never drift from the visible text.
-        let err_text = format!(" \u{ea87} {err_count}");
-        let warn_text = format!(" \u{ea6c} {warn_count} ");
-        let diag_len = (err_text.chars().count() + warn_text.chars().count()) as u16;
-        spans.push(Span::styled(
-            err_text,
-            Style::default().fg(self.theme.ui(Color::Rgb(0xf1, 0x4c, 0x4c))),
-        ));
-        spans.push(Span::styled(
-            warn_text,
-            Style::default().fg(self.theme.ui(Color::Rgb(0xcc, 0xa7, 0x00))),
-        ));
+        let diag_parts: [(String, Style); 4] = [
+            (
+                String::from(" \u{ea87} "),
+                Style::default().fg(if err_count > 0 {
+                    self.theme.ui(Color::Rgb(0xf1, 0x4c, 0x4c))
+                } else {
+                    tones.dim
+                }),
+            ),
+            (
+                err_count.to_string(),
+                Style::default().fg(if err_count > 0 { tones.text } else { tones.dim }),
+            ),
+            (
+                String::from(" \u{ea6c} "),
+                Style::default().fg(if warn_count > 0 {
+                    self.theme.ui(Color::Rgb(0xe5, 0xb5, 0x4a))
+                } else {
+                    tones.dim
+                }),
+            ),
+            (
+                format!("{warn_count} "),
+                Style::default().fg(if warn_count > 0 {
+                    tones.text
+                } else {
+                    tones.dim
+                }),
+            ),
+        ];
+        let diag_len: u16 = diag_parts.iter().map(|(t, _)| status_cells(t)).sum();
+        spans.extend(diag_parts.into_iter().map(|(t, st)| Span::styled(t, st)));
         // Transient status message (e.g. "Saved editor.rs"), no keybinding
-        // cheat-sheet — those live in F1 / the Command Palette now. Fenced
-        // behind a divider and dimmed so commentary reads apart from the
-        // clickable clusters around it.
+        // cheat-sheet — those live in F1 / the Command Palette now. Set apart
+        // and muted so commentary reads apart from the clickable clusters
+        // around it.
         // Screen reader mode shows the announcement in the status slot, and
         // every status passes through the UI catalog (#621).
         let status_text = one_line(if self.screen_reader && !self.announcer.line.is_empty() {
@@ -24335,6 +25551,11 @@ impl App {
         } else {
             crate::i18n::tr(&self.status).into_owned()
         });
+        // Paths inside the workspace read relative to it, as Quick Open and
+        // the tabs name them: `Saved src/main.rs`, not the absolute path
+        // with the workspace's own location in front. The Messages channel
+        // below keeps the message as it was said.
+        let status_text = workspace_relative(&status_text, self.workspace_root());
         // A message seen for the first time is kept, in full, in the Messages
         // output channel, and may take the whole bar until the next key or
         // click (#1609): elided to fit, its middle was gone for good.
@@ -24355,14 +25576,14 @@ impl App {
         let mut status_x: u16 = 0;
         if !status_text.is_empty() {
             spans.push(Span::styled(format!("{div} "), zone_div));
-            let x: u16 = spans.iter().map(|s| s.content.chars().count() as u16).sum();
+            let x: u16 = spans.iter().map(|s| status_cells(&s.content)).sum();
             status_x = x;
             if status_h > 0 && x < outer[2].width {
                 self.announce_pos = Some((outer[2].x + x, outer[2].y));
             }
             spans.push(Span::styled(
                 status_text.clone(),
-                Style::default().fg(self.theme.ui(Color::Rgb(0x9a, 0xa4, 0xb8))),
+                Style::default().fg(tones.muted),
             ));
         }
 
@@ -24442,6 +25663,20 @@ impl App {
         } else {
             ""
         };
+        let language_icon = {
+            let name = self
+                .editor
+                .path
+                .as_deref()
+                .and_then(|p| p.file_name())
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let suffix = name
+                .rfind('.')
+                .map(|i| name[i..].to_string())
+                .unwrap_or_default();
+            crate::icons::for_path(&name, &suffix)
+        };
         let mut seg_texts: Vec<String> = vec![
             format!(
                 " Ln {}, Col {}{coverage}{}{column_mode} ",
@@ -24457,7 +25692,13 @@ impl App {
             format!(" {} ", self.editor.indent_style().label()),
             format!(" {} ", self.editor.encoding.name()),
             format!(" {} ", self.editor.eol.label()),
-            format!(" {} ", self.editor.language_label()),
+            // The language rides a pill with the file's own icon, the
+            // right-hand counterpart of the workspace cap.
+            format!(
+                "{PILL_CAP_L}{} {}{PILL_CAP_R}",
+                language_icon.glyph,
+                self.editor.language_label()
+            ),
         ];
         // `2 agents · 1 waiting` (#344), only while an agent is seated; a
         // click focuses the waiting pane.
@@ -24509,8 +25750,11 @@ impl App {
             };
             seg_texts.push(format!(" \u{25c6} {joined} "));
         }
-        let widths: Vec<u16> = seg_texts.iter().map(|s| s.chars().count() as u16).collect();
-        let mut right_total: u16 = widths.iter().sum::<u16>() + (seg_texts.len() as u16 - 1);
+        let widths: Vec<u16> = seg_texts.iter().map(|s| status_cells(s)).collect();
+        // One cell of margin after the last segment, so the language pill's
+        // rounded end does not touch the frame edge.
+        let mut right_total: u16 =
+            widths.iter().sum::<u16>() + (seg_texts.len() as u16 - 1) + STATUS_RIGHT_MARGIN;
         // The right cluster paints OVER the left paragraph, so an over-long
         // transient loses exactly its tail — for "Opened <deep path>" that
         // was the filename, the one informative part (#100). Middle-elide
@@ -24519,7 +25763,7 @@ impl App {
             let left_fixed: u16 = spans
                 .iter()
                 .take(spans.len().saturating_sub(1))
-                .map(|s| s.content.chars().count() as u16)
+                .map(|s| status_cells(&s.content))
                 .sum();
             let fits_beside = |right: u16| {
                 status_rect
@@ -24553,17 +25797,6 @@ impl App {
             }
         }
 
-        // Black theme: drop the navy status strip to a near-black seam (a hair
-        // lighter than the #000000 editor so the bar still reads as distinct),
-        // matching VS Code's OLED themes. Croft Dark keeps the navy band.
-        // Croft Loch's bar is chrome, like the side bar and the tab strip.
-        let status_bg = if let Some(s) = self.theme.surfaces() {
-            s.chrome()
-        } else if self.popup_gradient() {
-            self.theme.ui(Color::Rgb(0x18, 0x18, 0x18))
-        } else {
-            self.theme.ui(Color::Rgb(0x1e, 0x3a, 0x6e))
-        };
         // Left fills the whole bar (background + left text); the right cluster
         // overwrites the right portion.
         frame.render_widget(
@@ -24608,20 +25841,20 @@ impl App {
             } else if self.status_diag_rect.right() > rx {
                 self.status_diag_rect.width = rx - self.status_diag_rect.x;
             }
-            // Build the spans now that x positions are known: segment fg one
-            // shade up from the transient's dim gray, │ dividers between, and
-            // a hover fill on the clickable segments (indices 1..=5) when the
-            // pointer rests on them — same affordance as the activity bar.
+            // Build the spans now that x positions are known. The settings
+            // (indentation, encoding, line endings) are muted; the position
+            // reads its numbers in the text tone over dim labels; the
+            // language sits in a pill. A clickable segment takes a fill
+            // under the pointer, the same affordance as the activity bar.
             // Ln/Col (index 0) opens Go to Line, so it hovers like the rest.
             // Hit rects recorded in the same pass.
-            let seg_style = Style::default().fg(match self.theme.surfaces() {
-                Some(s) => s.muted(),
-                None => self.theme.ui(Color::Rgb(0xc9, 0xd2, 0xe3)),
-            });
-            let hover_style = Style::default()
-                .bg(self.theme.ui(Color::Rgb(0x2a, 0x31, 0x40)))
-                .fg(self.theme.ui(Color::White));
-            let mut right: Vec<Span> = Vec::with_capacity(seg_texts.len() * 2 - 1);
+            let seg_style = Style::default().fg(tones.muted);
+            let lift = match self.theme.surfaces() {
+                Some(s) => s.hairline(),
+                None => self.theme.ui(Color::Rgb(0x2a, 0x31, 0x40)),
+            };
+            let hover_style = Style::default().bg(lift).fg(tones.text);
+            let mut right: Vec<Span> = Vec::with_capacity(seg_texts.len() * 4);
             let mut cx = rx;
             for (i, text) in seg_texts.iter().enumerate() {
                 if i > 0 {
@@ -24637,10 +25870,52 @@ impl App {
                 let hovered = self
                     .pointer_cell
                     .is_some_and(|(pc, pr)| rect_contains(r, pc, pr));
-                right.push(Span::styled(
-                    text.clone(),
-                    if hovered { hover_style } else { seg_style },
-                ));
+                if i == 4 {
+                    // The language pill: lit in the selection tint under
+                    // the pointer, so it hovers like the workspace cap reads.
+                    let fill = if hovered {
+                        self.theme.selection()
+                    } else {
+                        lift
+                    };
+                    let label = self.editor.language_label();
+                    right.push(Span::styled(PILL_CAP_L, Style::default().fg(fill)));
+                    right.push(Span::styled(
+                        language_icon.glyph.to_string(),
+                        Style::default().fg(language_icon.color).bg(fill),
+                    ));
+                    right.push(Span::styled(
+                        format!(" {label}"),
+                        Style::default().fg(tones.text).bg(fill),
+                    ));
+                    right.push(Span::styled(PILL_CAP_R, Style::default().fg(fill)));
+                } else if i == 0 && !hovered {
+                    // Numbers in the text tone, the words around them dim.
+                    let mut run = String::new();
+                    let mut run_digit = false;
+                    for c in text.chars() {
+                        let d = c.is_ascii_digit();
+                        if d != run_digit && !run.is_empty() {
+                            right.push(Span::styled(
+                                std::mem::take(&mut run),
+                                Style::default().fg(if run_digit { tones.text } else { tones.dim }),
+                            ));
+                        }
+                        run_digit = d;
+                        run.push(c);
+                    }
+                    if !run.is_empty() {
+                        right.push(Span::styled(
+                            run,
+                            Style::default().fg(if run_digit { tones.text } else { tones.dim }),
+                        ));
+                    }
+                } else {
+                    right.push(Span::styled(
+                        text.clone(),
+                        if hovered { hover_style } else { seg_style },
+                    ));
+                }
                 match i {
                     0 => self.status_position_rect = r,
                     1 => self.status_indent_rect = r,
@@ -24769,11 +26044,24 @@ impl App {
         self.paint_terminal_suggestion(frame);
         self.render_screencast(frame, main_area);
 
+        // A quick input owns the caret while it is open on a `surfaces`
+        // theme: its query's, and no pane's caret blinking through the card.
+        let quick_input = self.quick_input_owns_caret();
+        if quick_input
+            && self.context_menu.is_none()
+            && self.prompt.is_none()
+            && self.cursor_visible_phase()
+            && let Some((cx, cy)) = self.quick_input_caret()
+        {
+            frame.set_cursor_position((cx, cy));
+        }
+
         // Show the host terminal's hardware caret only when the editor is
         // focused and has no modal overlay. The DECSCUSR style is set to
         // BlinkingBar at startup, so the terminal blinks a thin vertical
         // line over the cursor cell without replacing its character.
         if self.focus == Pane::Editor
+            && !quick_input
             && self.context_menu.is_none()
             && self.prompt.is_none()
             && self.list_picker.is_none()
@@ -24795,6 +26083,7 @@ impl App {
         // flat with no native caret cell.
         if self.focus == Pane::Tree
             && self.sidebar_view == SidebarView::SourceControl
+            && !quick_input
             && self.context_menu.is_none()
             && self.prompt.is_none()
             && self.cursor_visible_phase()
@@ -24809,6 +26098,7 @@ impl App {
         // caret at all (Extensions).
         if self.focus == Pane::Tree
             && self.sidebar_view == SidebarView::Search
+            && !quick_input
             && self.context_menu.is_none()
             && self.prompt.is_none()
             && self.cursor_visible_phase()
@@ -24818,6 +26108,7 @@ impl App {
         }
         if self.focus == Pane::Tree
             && self.sidebar_view == SidebarView::Extensions
+            && !quick_input
             && self.context_menu.is_none()
             && self.prompt.is_none()
             && self.cursor_visible_phase()
@@ -24842,7 +26133,15 @@ impl App {
         let grad = self.popup_gradient();
         // The top-level panel; the open submenu's parent row stays highlighted.
         let top = menu.scroll_for(clipped.height.saturating_sub(2) as usize);
-        self.render_menu_panel(frame, clipped, &menu.items, menu.selected, top, grad);
+        let tones = crate::widgets::surface::tones(self.theme);
+        if let Some(t) = tones {
+            // The keyboard is in the submenu while one is open, so its
+            // parent row keeps an unfocused band without the accent bar.
+            let focused = menu.open_submenu.is_none();
+            self.render_menu_card(frame, clipped, &menu.items, menu.selected, top, focused, t);
+        } else {
+            self.render_menu_panel(frame, clipped, &menu.items, menu.selected, top, grad);
+        }
         // A breadcrumb picker shows what has been typed on its top border.
         if menu.crumb.is_some() && !self.crumb_filter.0.is_empty() {
             let text = if menu.items.is_empty() {
@@ -24852,15 +26151,16 @@ impl App {
             };
             let room = clipped.width.saturating_sub(4) as usize;
             let shown: String = text.chars().take(room).collect();
-            frame.buffer_mut().set_string(
-                clipped.x + 2,
-                clipped.y,
-                shown,
-                Style::default()
+            let style = match tones {
+                Some(t) => Style::default().fg(t.text()).bg(t.raised()),
+                None => Style::default()
                     .fg(self.theme.ui(Color::White))
                     .bg(self.theme.ui(Color::Rgb(0x1e, 0x1e, 0x1e)))
                     .add_modifier(Modifier::BOLD),
-            );
+            };
+            frame
+                .buffer_mut()
+                .set_string(clipped.x + 2, clipped.y, shown, style);
         }
         // Float the open submenu's panel beside its parent.
         if let Some(sub_rect) = self.submenu_rect()
@@ -24868,7 +26168,115 @@ impl App {
                 menu.open_submenu.and_then(|p| menu.items.get(p))
         {
             let sub_top = menu.submenu_scroll_for(menu.submenu_visible(sub_rect.height));
-            self.render_menu_panel(frame, sub_rect, items, menu.submenu_selected, sub_top, grad);
+            if let Some(t) = tones {
+                let sel = menu.submenu_selected;
+                self.render_menu_card(frame, sub_rect, items, sel, sub_top, true, t);
+            } else {
+                self.render_menu_panel(
+                    frame,
+                    sub_rect,
+                    items,
+                    menu.submenu_selected,
+                    sub_top,
+                    grad,
+                );
+            }
+        }
+    }
+
+    /// One menu panel as a `surfaces` theme draws it, in the same rect and
+    /// rows as [`Self::render_menu_panel`] so the hit tests are unchanged: a
+    /// raised card with the accent lip, rows in the body ink, the selected
+    /// row as the band with the accent bar on the card's edge (a plain band
+    /// while `focused` is false), section headers muted, separators a rule
+    /// across the whole card, and shortcuts as keycaps against the right
+    /// edge (`menu_entry_width` sizes the panel for them).
+    #[allow(clippy::too_many_arguments)]
+    fn render_menu_card(
+        &self,
+        frame: &mut ratatui::Frame,
+        rect: Rect,
+        entries: &[MenuEntry],
+        selected: usize,
+        top: usize,
+        focused: bool,
+        t: crate::widgets::surface::Tones,
+    ) {
+        use crate::widgets::surface;
+        let rect = rect.intersection(frame.area());
+        if rect.width < 3 || rect.height < 3 {
+            return;
+        }
+        let block = ratatui::widgets::Block::default()
+            .borders(ratatui::widgets::Borders::ALL)
+            .border_style(Style::default().fg(t.rim()))
+            .style(Style::default().bg(t.raised()));
+        frame.render_widget(ratatui::widgets::Clear, rect);
+        frame.render_widget(block, rect);
+        let buf = frame.buffer_mut();
+        surface::paint_overlay_frame(buf, rect, self.theme);
+        let inner = Rect {
+            x: rect.x + 1,
+            y: rect.y + 1,
+            width: rect.width - 2,
+            height: rect.height - 2,
+        };
+        for (i, entry) in entries.iter().enumerate().skip(top) {
+            if (i - top) as u16 >= inner.height {
+                break;
+            }
+            let y = inner.y + (i - top) as u16;
+            let (label, hint) = match entry {
+                MenuEntry::Separator => {
+                    // Edge to edge, so the rule meets the rim on both sides.
+                    let rule = "\u{2500}".repeat(rect.width as usize);
+                    buf.set_string(rect.x, y, &rule, Style::default().fg(t.rim()));
+                    continue;
+                }
+                MenuEntry::Header(label) => {
+                    buf.set_stringn(
+                        inner.x,
+                        y,
+                        format!(" {label}"),
+                        inner.width as usize,
+                        Style::default().fg(t.muted()),
+                    );
+                    continue;
+                }
+                MenuEntry::Item { label, action } => {
+                    (label.as_str(), menu_hint(action, &self.keymap))
+                }
+                MenuEntry::Submenu { label, .. } => (label.as_str(), None),
+            };
+            let is_sel = i == selected;
+            let row_bg = if is_sel {
+                let band = Rect::new(rect.x, y, rect.width - 1, 1);
+                surface::paint_selected_row(buf, band, t, t.raised, focused);
+                buf[(rect.x + 1, y)].bg
+            } else {
+                t.raised()
+            };
+            let ink = if is_sel { t.strong() } else { t.text() };
+            buf.set_stringn(
+                inner.x,
+                y,
+                format!(" {label}"),
+                inner.width as usize,
+                Style::default().fg(ink),
+            );
+            let trail: Vec<ratatui::text::Span> = match (entry, hint) {
+                (MenuEntry::Submenu { .. }, _) => vec![ratatui::text::Span::styled(
+                    "\u{25b8}",
+                    Style::default().fg(if is_sel { t.text() } else { t.muted() }),
+                )],
+                (_, Some(hint)) => surface::keycap_spans(&hint, t, row_bg, is_sel),
+                (_, None) => Vec::new(),
+            };
+            let trail_w: u16 = trail.iter().map(|s| s.width() as u16).sum();
+            if trail_w > 0 && trail_w + 2 <= inner.width {
+                let x = inner.right() - trail_w - 1;
+                buf.set_line(x, y, &ratatui::text::Line::from(trail), trail_w);
+            }
         }
     }
 
@@ -25016,6 +26424,62 @@ impl App {
         let item_w: u16 = label_w.max(caret.width);
         let item_x = (caret.x + caret.width).saturating_sub(item_w).max(main.x);
         let item_y_top = caret.y + caret.height;
+        self.source_control.commit_menu_item_areas.clear();
+        if let Some(t) = crate::widgets::surface::tones(self.theme) {
+            // A raised card with the accent lip, one row taller above and
+            // below than the rows, whose rim falls on the rows' pad cells:
+            // each hit rect is still the row drawn. Icons rest muted; the
+            // row under the pointer lifts, its icon and label with it.
+            let card = Rect {
+                x: item_x,
+                y: item_y_top,
+                width: item_w,
+                height: items.len() as u16 + 2,
+            }
+            .intersection(frame.area());
+            if card.width < 3 || card.height < 3 {
+                return;
+            }
+            let pointer = self.pointer_cell;
+            let buf = frame.buffer_mut();
+            ratatui::widgets::Widget::render(ratatui::widgets::Clear, card, buf);
+            buf.set_style(card, Style::default().bg(t.raised()));
+            crate::widgets::surface::paint_overlay_frame(buf, card, self.theme);
+            for (i, (item, label)) in items.into_iter().enumerate() {
+                let row_y = card.y + 1 + i as u16;
+                if row_y + 1 >= card.bottom() {
+                    break;
+                }
+                let row_rect = Rect::new(card.x, row_y, card.width, 1);
+                let lit = crate::widgets::hover::contains(row_rect, pointer);
+                if lit {
+                    let inner = Rect::new(card.x + 1, row_y, card.width - 2, 1);
+                    buf.set_style(inner, Style::default().bg(t.hover_on(t.raised)));
+                }
+                let (icon_fg, ink) = if lit {
+                    (t.text(), t.strong())
+                } else {
+                    (t.muted(), t.text())
+                };
+                buf.set_string(
+                    card.x + 1,
+                    row_y,
+                    item.icon().to_string(),
+                    Style::default().fg(icon_fg),
+                );
+                buf.set_stringn(
+                    card.x + 3,
+                    row_y,
+                    &label,
+                    usize::from(card.width.saturating_sub(4)),
+                    Style::default().fg(ink),
+                );
+                self.source_control
+                    .commit_menu_item_areas
+                    .push((row_rect, item));
+            }
+            return;
+        }
         let menu_rect = Rect {
             x: item_x,
             y: item_y_top,
@@ -25026,7 +26490,6 @@ impl App {
         let fg = self.theme.ui(Color::White);
         let style = Style::default().fg(fg).bg(bg);
         frame.render_widget(ratatui::widgets::Clear, menu_rect);
-        self.source_control.commit_menu_item_areas.clear();
         for (i, (item, label)) in items.into_iter().enumerate() {
             let row_y = item_y_top + i as u16;
             let row_rect = Rect {
@@ -25160,6 +26623,12 @@ impl App {
             ]),
         ]);
         frame.render_widget(ratatui::widgets::Paragraph::new(body), inner);
+        crate::widgets::approval_popup::paint_warning_card(
+            frame.buffer_mut(),
+            rect,
+            self.theme,
+            warn,
+        );
     }
 
     /// Confirmation modal for Revert Hunk: destroys the uncommitted edit
@@ -25227,6 +26696,12 @@ impl App {
             ]),
         ]);
         frame.render_widget(ratatui::widgets::Paragraph::new(body), inner);
+        crate::widgets::approval_popup::paint_warning_card(
+            frame.buffer_mut(),
+            rect,
+            self.theme,
+            warn,
+        );
     }
 
     /// The unsaved-changes prompt's words: its headline, the files, and
@@ -25319,6 +26794,12 @@ impl App {
             ]),
         ]);
         frame.render_widget(ratatui::widgets::Paragraph::new(body), inner);
+        crate::widgets::approval_popup::paint_warning_card(
+            frame.buffer_mut(),
+            rect,
+            self.theme,
+            warn,
+        );
     }
 
     /// The lossy-save prompt (#1053): what the file's encoding would destroy,
@@ -25389,6 +26870,12 @@ impl App {
             Paragraph::new(body).wrap(ratatui::widgets::Wrap { trim: false }),
             inner,
         );
+        crate::widgets::approval_popup::paint_warning_card(
+            frame.buffer_mut(),
+            rect,
+            self.theme,
+            danger,
+        );
     }
 
     /// The Replace All confirmation modal (#123): counts up front, commits
@@ -25450,6 +26937,12 @@ impl App {
         frame.render_widget(
             Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false }),
             inner,
+        );
+        crate::widgets::approval_popup::paint_warning_card(
+            frame.buffer_mut(),
+            rect,
+            self.theme,
+            warn,
         );
     }
 
@@ -25533,6 +27026,12 @@ impl App {
             ratatui::widgets::Paragraph::new(body).wrap(ratatui::widgets::Wrap { trim: false }),
             inner,
         );
+        crate::widgets::approval_popup::paint_warning_card(
+            frame.buffer_mut(),
+            rect,
+            self.theme,
+            accent,
+        );
     }
 
     /// Confirmation modal for "Discard All Changes" — reverts every tracked
@@ -25593,6 +27092,12 @@ impl App {
             ]),
         ]);
         frame.render_widget(ratatui::widgets::Paragraph::new(body), inner);
+        crate::widgets::approval_popup::paint_warning_card(
+            frame.buffer_mut(),
+            rect,
+            self.theme,
+            warn,
+        );
     }
 
     /// Confirmation modal for Drop Stash (#1128), in the Discard All style.
@@ -25659,6 +27164,12 @@ impl App {
             ]),
         ]);
         frame.render_widget(ratatui::widgets::Paragraph::new(body), inner);
+        crate::widgets::approval_popup::paint_warning_card(
+            frame.buffer_mut(),
+            rect,
+            self.theme,
+            warn,
+        );
     }
 
     /// Confirmation modal for enabling broadcast input: the classic footgun
@@ -25730,6 +27241,12 @@ impl App {
         frame.render_widget(
             ratatui::widgets::Paragraph::new(body).wrap(ratatui::widgets::Wrap { trim: true }),
             inner,
+        );
+        crate::widgets::approval_popup::paint_warning_card(
+            frame.buffer_mut(),
+            rect,
+            self.theme,
+            warn,
         );
     }
 
@@ -25812,6 +27329,12 @@ impl App {
             Span::raw(" / Esc cancel"),
         ]));
         frame.render_widget(ratatui::widgets::Paragraph::new(body), inner);
+        crate::widgets::approval_popup::paint_warning_card(
+            frame.buffer_mut(),
+            rect,
+            self.theme,
+            warn,
+        );
     }
 
     /// The confirm popup for a runnable fence (#353): the whole block, the
@@ -25912,6 +27435,12 @@ impl App {
             ratatui::widgets::Paragraph::new(ratatui::text::Text::from(lines)),
             inner,
         );
+        crate::widgets::approval_popup::paint_warning_card(
+            frame.buffer_mut(),
+            rect,
+            self.theme,
+            accent,
+        );
     }
 
     fn render_terminal_warning(&self, frame: &mut ratatui::Frame) {
@@ -26011,6 +27540,12 @@ impl App {
             ]),
         ]);
         frame.render_widget(ratatui::widgets::Paragraph::new(body), inner);
+        crate::widgets::approval_popup::paint_warning_card(
+            frame.buffer_mut(),
+            rect,
+            self.theme,
+            warn,
+        );
     }
 
     fn render_local_open_confirm(&self, frame: &mut ratatui::Frame) {
@@ -26082,6 +27617,12 @@ impl App {
             ]),
         ]);
         frame.render_widget(ratatui::widgets::Paragraph::new(body), inner);
+        crate::widgets::approval_popup::paint_warning_card(
+            frame.buffer_mut(),
+            rect,
+            self.theme,
+            self.theme.ui(Color::Rgb(0xff, 0xa5, 0x00)),
+        );
     }
 
     /// Zen Mode hides the status bar, so for a few seconds after entering
@@ -26108,21 +27649,32 @@ impl App {
             height,
         };
         let accent = self.theme.accent();
+        // A `surfaces` theme floats the hint as a raised card in body text,
+        // the accent only on its edge, rather than accent text in an accent
+        // box on the canvas.
+        let tones = crate::widgets::surface::tones(self.theme);
+        let (bg, fg) = match tones {
+            Some(t) => (t.raised(), t.text()),
+            None => (self.theme.editor_bg(), accent),
+        };
         let block = ratatui::widgets::Block::default()
             .borders(ratatui::widgets::Borders::ALL)
             .border_type(ratatui::widgets::BorderType::Rounded)
             .border_style(Style::default().fg(accent))
-            .style(Style::default().bg(self.theme.editor_bg()));
+            .style(Style::default().bg(bg));
         frame.render_widget(ratatui::widgets::Clear, rect);
         frame.render_widget(
             ratatui::widgets::Paragraph::new(ratatui::text::Span::styled(
                 text,
-                Style::default().fg(accent),
+                Style::default().fg(fg),
             ))
             .alignment(ratatui::layout::Alignment::Center)
             .block(block),
             rect,
         );
+        if tones.is_some() {
+            crate::widgets::surface::paint_overlay_frame(frame.buffer_mut(), rect, self.theme);
+        }
     }
 
     /// Paint the transient port-detection toast in the bottom-right corner and
@@ -26174,14 +27726,21 @@ impl App {
             width,
             height,
         };
+        let tones = crate::widgets::surface::tones(self.theme);
         let block = ratatui::widgets::Block::default()
             .borders(ratatui::widgets::Borders::ALL)
-            .border_style(Style::default().fg(accent))
-            .style(Style::default().bg(self.theme.editor_bg()))
-            .title(ratatui::text::Span::styled(
-                " PORT DETECTED ",
-                Style::default().fg(accent).add_modifier(Modifier::BOLD),
-            ));
+            .border_style(Style::default().fg(accent));
+        // A `surfaces` theme's toast is a raised card: no title on its edge
+        // (the body line says what was found, the lip runs unbroken).
+        let block = match tones {
+            Some(t) => block.style(Style::default().bg(t.raised())),
+            None => block
+                .style(Style::default().bg(self.theme.editor_bg()))
+                .title(ratatui::text::Span::styled(
+                    " PORT DETECTED ",
+                    Style::default().fg(accent).add_modifier(Modifier::BOLD),
+                )),
+        };
         frame.render_widget(ratatui::widgets::Clear, rect);
         frame.render_widget(block, rect);
         let inner = Rect {
@@ -26191,32 +27750,61 @@ impl App {
             height: rect.height.saturating_sub(2),
         };
 
+        let pointer = self.pointer_cell;
         let buf = frame.buffer_mut();
-        buf.set_stringn(
-            inner.x,
-            inner.y,
-            &title_line,
-            inner.width as usize,
-            Style::default().fg(self.theme.ui(Color::Rgb(0xCC, 0xCC, 0xCC))),
-        );
+        if let Some(t) = tones {
+            crate::widgets::surface::paint_overlay_frame(buf, rect, self.theme);
+            // The live dot in the accent, the port strong, the process muted.
+            let spans = vec![
+                Span::styled("\u{25cf} ", Style::default().fg(t.accent())),
+                Span::styled(format!("port {port}"), Style::default().fg(t.strong())),
+                Span::styled(format!("  {proc}"), Style::default().fg(t.muted())),
+            ];
+            buf.set_line(inner.x, inner.y, &Line::from(spans), inner.width);
+        } else {
+            buf.set_stringn(
+                inner.x,
+                inner.y,
+                &title_line,
+                inner.width as usize,
+                Style::default().fg(self.theme.ui(Color::Rgb(0xCC, 0xCC, 0xCC))),
+            );
+        }
         let mut bx = inner.x;
         let by = inner.y + 1;
         let mut rects: Vec<(Rect, PortToastAction)> = Vec::new();
-        for (label, action) in &actions {
+        for (i, (label, action)) in actions.iter().enumerate() {
             let w = label.chars().count() as u16;
             if bx + w > inner.x + inner.width {
                 break;
             }
-            buf.set_stringn(
-                bx,
-                by,
-                label,
-                w as usize,
-                Style::default()
+            let hit = Rect::new(bx, by, w, 1);
+            // The first action is the primary one, in the button fill; the
+            // others are chips a lift off the card, and the dismiss cross
+            // a bare muted mark until the pointer is on it.
+            let style = match tones {
+                Some(t) => {
+                    let lit = crate::widgets::hover::contains(hit, pointer);
+                    let lift = |c: Color| match c {
+                        Color::Rgb(r, g, b) => {
+                            rgb_color(crate::gradient::lerp_rgb((r, g, b), t.lift, 0.12))
+                        }
+                        other => other,
+                    };
+                    let (fill, fg) = match (i, *action) {
+                        (0, _) => (btn_bg, t.strong()),
+                        (_, PortToastAction::Dismiss) if !lit => (t.raised(), t.muted()),
+                        _ => (t.keycap_on(t.raised()), t.text()),
+                    };
+                    let fill = if lit { lift(fill) } else { fill };
+                    Style::default().fg(fg).bg(fill)
+                }
+                None => Style::default()
                     .fg(Color::White)
                     .bg(btn_bg)
                     .add_modifier(Modifier::BOLD),
-            );
+            };
+            buf.set_stringn(bx, by, label, w as usize, style);
             rects.push((
                 Rect {
                     x: bx,
@@ -26447,22 +28035,29 @@ impl App {
         };
         let rect = rect.intersection(area);
         let grad = self.popup_gradient();
-        let cursor_fg = if grad {
-            rgb_color(GRAD_TL)
-        } else {
-            self.theme.ui(Color::Rgb(0x4e, 0x9a, 0xff))
+        // A `surfaces` theme: the title in the strong ink on the card (no
+        // chip), the caret and the prompt mark in the accent (the field has
+        // the keyboard), the value in body text and the hint muted.
+        let tones = crate::widgets::surface::tones(self.theme);
+        let cursor_fg = match tones {
+            Some(t) => t.accent(),
+            None if grad => rgb_color(GRAD_TL),
+            None => self.theme.ui(Color::Rgb(0x4e, 0x9a, 0xff)),
         };
         let title_bg = if grad {
             rgb_color(POPUP_SEL_BG)
         } else {
             self.theme.ui(Color::Rgb(0x1e, 0x3a, 0x6e))
         };
+        let title_style = match tones {
+            Some(t) => Style::default().fg(t.strong()).bg(t.raised()),
+            None => Style::default()
+                .fg(self.theme.ui(Color::White))
+                .bg(title_bg),
+        };
         let title = ratatui::text::Span::styled(
             format!(" {} ", p.label),
-            Style::default()
-                .fg(self.theme.ui(Color::White))
-                .bg(title_bg)
-                .add_modifier(Modifier::BOLD),
+            title_style.add_modifier(Modifier::BOLD),
         );
         let block = ratatui::widgets::Block::default()
             .borders(ratatui::widgets::Borders::ALL)
@@ -26665,8 +28260,22 @@ impl App {
                 height: 1,
             },
         );
+        if let Some(t) = tones {
+            // Every kind's row is `> `, the value in white, the caret: the
+            // mark takes the accent, the value the body ink.
+            let buf = frame.buffer_mut();
+            for x in inner.x..inner.right() {
+                let cell = &mut buf[(x, inner.y)];
+                if x < inner.x + 2 {
+                    cell.set_fg(t.accent());
+                } else if cell.fg == self.theme.ui(Color::White) {
+                    cell.set_fg(t.text());
+                }
+            }
+        }
+        let hint_fg = tones.map_or(Color::DarkGray, |t| t.muted());
         let hint = ratatui::widgets::Paragraph::new(ratatui::text::Line::from(hint_text))
-            .style(Style::default().fg(Color::DarkGray));
+            .style(Style::default().fg(hint_fg));
         frame.render_widget(
             hint,
             Rect {
@@ -27033,9 +28642,15 @@ impl App {
                 self.toggle_zen_mode();
                 true
             }
-            // Cmd+K V: Live Run, "values" for the active Python file.
+            // Cmd+K V: Live Run, "values" for the active Python file. On a
+            // Markdown tab it is VS Code's Open Preview to the Side (#1605);
+            // Live Run runs only Python, so no tab wants both.
             KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'v') => {
-                self.toggle_live_run();
+                if self.editor.language() == Some(crate::highlight::LangKind::Markdown) {
+                    self.open_markdown_preview_to_side();
+                } else {
+                    self.toggle_live_run();
+                }
                 true
             }
             // Cmd+K Cmd+F (SUPER/CTRL held on the second key): Format
@@ -27121,6 +28736,20 @@ impl App {
             // chord, so the Cmd+K leader hosts this the way it hosts Zen (Cmd+K Z).
             KeyCode::Char(c) if plain && c.eq_ignore_ascii_case(&'b') => {
                 self.open_testing_view();
+                true
+            }
+            // Cmd+K Cmd+I in the editor (Ctrl+K Ctrl+I off macOS): Show or
+            // Focus Hover at the caret, VS Code's chord (#1518). Needs the
+            // trailing Cmd, so plain Cmd+K I below stays broadcast input,
+            // and outside the editor the chord broadcasts as before.
+            KeyCode::Char(c)
+                if plain
+                    && cmd_held
+                    && !shifted
+                    && c.eq_ignore_ascii_case(&'i')
+                    && self.focus == Pane::Editor =>
+            {
+                self.run_command(crate::widgets::command_palette::Command::ShowHover);
                 true
             }
             // Cmd+K Shift+I: toggle whether the active pane receives
@@ -49550,7 +51179,6 @@ impl App {
                     .line_no
                     .saturating_sub(1)
                     .min(self.editor.lines.len().saturating_sub(1));
-                self.editor.cursor_row = row;
                 // Drop the cursor at the first match column on this line so
                 // long lines (HTML with base64 blobs, minified JS) auto-scroll
                 // horizontally and the user lands on the match instead of the
@@ -49584,7 +51212,9 @@ impl App {
                 let match_col = first_match.map(|(c, _)| c).unwrap_or(0);
                 self.editor.active_search_match = first_match.map(|(c, len)| (row, c, len));
                 self.editor.cursor_col = match_col;
-                self.editor.scroll_col = 0;
+                // Centre the hit's line, as Go to Line does, instead of
+                // leaving it wherever the preview's scroll happened to be.
+                self.editor.goto_line_centered(row);
                 self.editor.ensure_cursor_col_visible();
                 self.status = format!(
                     "Opened {} at line {}",
@@ -50144,6 +51774,59 @@ impl App {
         }
     }
 
+    /// Markdown: Open Preview to the Side (#1605, VS Code's
+    /// `markdown.showPreviewToSide`): the active Markdown file rendered in
+    /// the next editor group, or in a new group to the right when there is
+    /// none, showing what is typed here as it is typed
+    /// ([`App::sync_markdown_side_previews`]). Focus stays on the source,
+    /// which a tab showing the preview turns back into.
+    fn open_markdown_preview_to_side(&mut self) {
+        let Some(path) = self.editor.path.clone() else {
+            self.status = String::from("Open Preview to the Side: save the file first");
+            return;
+        };
+        if self.editor.language() != Some(crate::highlight::LangKind::Markdown)
+            || self.editor.has_non_text_view()
+        {
+            self.status = String::from("Markdown Preview needs a Markdown file");
+            return;
+        }
+        if self.editor.markdown_preview.is_some() {
+            self.editor.toggle_markdown_preview();
+        }
+        let source = self.editor_layout.active_dfs_index();
+        let opened = if source + 1 < self.editor_layout.leaf_count() {
+            let here = std::mem::take(&mut self.editor);
+            self.editor = self.editor_layout.refocus_to_dfs(here, source + 1);
+            self.editor.open_preview(&path)
+        } else {
+            let mut group = EditorTabs::default();
+            let opened = group.open_preview(&path);
+            if opened.is_ok() {
+                group.copy_view_position_from(&self.editor);
+                let here = std::mem::replace(&mut self.editor, group);
+                self.editor_layout
+                    .split_active(here, editor_layout::SplitDir::Horizontal, true);
+            }
+            opened
+        };
+        if opened.is_ok() && self.editor.markdown_preview.is_none() {
+            self.editor.toggle_markdown_preview();
+        }
+        if self.editor_layout.active_dfs_index() != source {
+            let side = std::mem::take(&mut self.editor);
+            self.editor = self.editor_layout.refocus_to_dfs(side, source);
+        }
+        // The side pane comes up at the source's place and with its text.
+        self.md_scroll_synced = None;
+        self.sync_markdown_side_previews();
+        self.focus_pane(Pane::Editor);
+        self.status = match opened {
+            Ok(()) => format!("Previewing {} to the side", self.status_path(&path)),
+            Err(e) => format!("Open Preview to the Side: {e}"),
+        };
+    }
+
     fn handle_editor_key(&mut self, key: KeyEvent) {
         // Inline find bar (Cmd+F / Ctrl+F) eats every key while open.
         if self.editor_find.is_some() {
@@ -50340,6 +52023,10 @@ impl App {
         }
         if is_add_cursors_to_line_ends_key(key) {
             self.add_cursors_to_line_ends();
+            return;
+        }
+        if is_expand_line_selection_key(key) {
+            self.expand_line_selection();
             return;
         }
         if is_delete_line_key(key) {
@@ -50960,6 +52647,8 @@ impl App {
             }
             KeyCode::Delete if word => self.editor.delete_word_right(),
             KeyCode::Delete => self.editor.delete_forward(),
+            // Insert flips between insert and overwrite (Replace) typing.
+            KeyCode::Insert if !shift && !cmd && !alt && !word => self.toggle_overwrite_mode(),
             KeyCode::Enter => self.editor.insert_newline(),
             // Tab advances a live snippet, else expands a snippet whose prefix
             // was just typed, else indents (whole block for a multi-line
@@ -50973,7 +52662,7 @@ impl App {
                     && !key.modifiers.contains(KeyModifiers::ALT)
                     && !key.modifiers.contains(KeyModifiers::SUPER) =>
             {
-                self.editor.insert_char(c);
+                self.type_char_in_editor(c);
                 // With an incomplete list pending but none of it on screen,
                 // typing on still re-asks (#1529).
                 self.note_incomplete_completion_edit();
@@ -52460,27 +54149,21 @@ impl App {
 
     /// Jump the selected capture's pane back to the captured line: switch to
     /// the TERMINAL tab, focus the pane (found by shell pid; a closed pane
-    /// falls back to the active one), locate the newest grid row matching
-    /// the captured text, scroll it into view and select it. A very long
-    /// captured line wraps across grid rows, so the match is prefix-based
-    /// on the first wrapped row.
+    /// falls back to the active one), locate the grid row matching the
+    /// captured text nearest the row the line was printed on (so each run's
+    /// copy of a repeated line is its own entry, #1450), scroll it into view
+    /// and select it. A very long captured line wraps across grid rows, so
+    /// the match is prefix-based on the first wrapped row.
     pub fn captures_open_selected(&mut self) {
         let Some(entry) = self.captures.selected_entry().cloned() else {
             return;
         };
-        let idx = entry
-            .shell_pid
-            .and_then(|pid| {
-                self.terminals
-                    .iter()
-                    .position(|t| t.shell_pid() == Some(pid))
-            })
-            .unwrap_or(self.active_terminal);
+        let (idx, anchor) = self.capture_pane(&entry);
         self.reveal_terminal_pane(idx);
         self.set_bottom_panel_tab(BottomPanelTab::Terminal);
         self.focus_pane(Pane::Terminal);
         let needle: String = entry.line.trim_end().chars().take(60).collect();
-        let Some(line) = self.terminals[idx].find_captured_line(&needle) else {
+        let Some(line) = self.terminals[idx].find_captured_line(&needle, anchor) else {
             self.status = String::from("Captured line is no longer in the scrollback");
             return;
         };
@@ -52493,6 +54176,22 @@ impl App {
         }));
         t.scroll_to_line(line);
         self.status = format!("Capture: {}", entry.message);
+    }
+
+    /// The pane a capture came from, found by shell pid, and the anchor to
+    /// find its line by. A closed pane falls back to the active one without
+    /// the anchor, which names a row only in the pane that recorded it: the
+    /// newest match is all another pane can offer.
+    fn capture_pane(&self, entry: &crate::widgets::captures::CapturedLine) -> (usize, Option<u64>) {
+        let found = entry.shell_pid.and_then(|pid| {
+            self.terminals
+                .iter()
+                .position(|t| t.shell_pid() == Some(pid))
+        });
+        match found {
+            Some(idx) => (idx, entry.anchor),
+            None => (self.active_terminal, None),
+        }
     }
 
     fn handle_terminal_key(&mut self, key: KeyEvent) {
@@ -54788,6 +56487,7 @@ impl App {
                             shell_pid: t.shell_pid(),
                             message: h.message,
                             line: h.line,
+                            anchor: h.anchor,
                         });
                     }
                     crate::triggers::TriggerAction::Bell => {
@@ -56287,19 +57987,12 @@ impl App {
             return;
         }
         let name = host.name().to_string();
-        let idx = entry
-            .shell_pid
-            .and_then(|pid| {
-                self.terminals
-                    .iter()
-                    .position(|t| t.shell_pid() == Some(pid))
-            })
-            .unwrap_or(self.active_terminal);
+        let (idx, anchor) = self.capture_pane(&entry);
         // The rows around the line, if it is still in the scrollback; the
         // line alone otherwise.
         let needle: String = entry.line.trim_end().chars().take(60).collect();
         let context: Vec<String> = match self.terminals.get(idx) {
-            Some(t) => match t.find_captured_line(&needle) {
+            Some(t) => match t.find_captured_line(&needle, anchor) {
                 Some(line) => {
                     let (lines, top) = t.grid_lines();
                     let hit = usize::try_from(line - top).unwrap_or(0);
@@ -56485,6 +58178,7 @@ impl App {
                 message: d.message,
                 source,
                 code: d.code,
+                related: Vec::new(),
             },
         ))
     }
@@ -57542,6 +59236,9 @@ impl App {
     fn render_file_finder(&mut self, frame: &mut ratatui::Frame) {
         let theme = self.theme;
         let center = self.quick_input_position == QuickInputPosition::Center;
+        // Inline images are baked pixels the scrim cannot dim, so the
+        // backdrop stays lit where the terminal draws them.
+        let backdrop = !self.inline_images_enabled();
         let Some(finder) = self.file_finder.as_mut() else {
             return;
         };
@@ -57552,6 +59249,7 @@ impl App {
             frame.buffer_mut(),
             theme,
             center,
+            backdrop,
         );
     }
 
@@ -57720,6 +59418,9 @@ impl App {
     fn render_command_palette(&mut self, frame: &mut ratatui::Frame) {
         let theme = self.theme;
         let center = self.quick_input_position == QuickInputPosition::Center;
+        // Inline images are baked pixels the scrim cannot dim, so the
+        // backdrop stays lit where the terminal draws them.
+        let backdrop = !self.inline_images_enabled();
         let Some(palette) = self.command_palette.as_mut() else {
             return;
         };
@@ -57730,6 +59431,7 @@ impl App {
             frame.buffer_mut(),
             theme,
             center,
+            backdrop,
         );
     }
 
@@ -58895,6 +60597,7 @@ impl App {
             Cmd::AddSelectionToNextMatch => self.start_select_next_occurrence(),
             Cmd::SelectAllOccurrences => self.select_all_occurrences(),
             Cmd::AddCursorsToLineEnds => self.add_cursors_to_line_ends(),
+            Cmd::ExpandLineSelection => self.expand_line_selection(),
             Cmd::JumpToBracket => {
                 if !self.editor.jump_to_matching_bracket() {
                     self.status = String::from("Go to Bracket: no matching bracket");
@@ -58932,6 +60635,7 @@ impl App {
             Cmd::ToggleInlineValues => self.toggle_inline_values(),
             Cmd::ToggleInlayHints => self.toggle_inlay_hints(),
             Cmd::ToggleMarkdownPreview => self.toggle_markdown_preview(),
+            Cmd::OpenMarkdownPreviewToSide => self.open_markdown_preview_to_side(),
             // Cmd+Enter's run from any terminal (#843): the same confirm popup.
             Cmd::RunCodeBlockAtCursor => {
                 if !self.run_fence_at_cursor(true) {
@@ -59053,6 +60757,7 @@ impl App {
             | Cmd::RenameSymbol
             | Cmd::TriggerSuggest
             | Cmd::TriggerParameterHints
+            | Cmd::ShowHover
                 if self.editor.has_non_text_view() =>
             {
                 self.status = format!("{} needs a text file", cmd.title());
@@ -59065,6 +60770,7 @@ impl App {
             Cmd::RenameSymbol => self.start_rename_symbol(),
             Cmd::TriggerSuggest => self.trigger_completion(),
             Cmd::TriggerParameterHints => self.trigger_signature_help(),
+            Cmd::ShowHover => self.show_hover_at_caret(),
             // Position-carrying commands (#259). They read the click the
             // dispatcher set, and do nothing from the keyboard: invoked from
             // the palette there is no click to act on, and guessing the
@@ -59211,6 +60917,12 @@ impl App {
             Cmd::GitCopyPermalink => self.share_link(ShareLink::CopyPermalink),
             Cmd::GitCopyHeadLink => self.share_link(ShareLink::CopyHeadLink),
             Cmd::GitOpenOnRemote => self.share_link(ShareLink::OpenOnRemote),
+            Cmd::GitOpenLineCommit => self.open_commit_for_line(),
+            Cmd::GitCopyLineCommitHash => {
+                if let Some((hash, short)) = self.caret_line_commit() {
+                    self.run_commit_action(CommitAction::CopyHash, &hash, &short);
+                }
+            }
             Cmd::ToggleFold => {
                 let row = self.editor.cursor_row;
                 self.editor.toggle_fold(row);
@@ -59510,6 +61222,10 @@ impl App {
                     // hex, reported honestly). Sticks across FS-sync
                     // reloads; cleared by opening a different file.
                     self.editor.force_text = true;
+                    // A Markdown preview is a view of the buffer that a
+                    // same-path reload keeps (#1605), not a route `open`
+                    // takes, so it is put down here.
+                    self.editor.markdown_preview = None;
                     match self.editor.open(&p) {
                         Ok(()) if self.editor.hex.is_some() => {
                             self.status =
@@ -61098,10 +62814,19 @@ impl App {
     fn render_list_picker(&mut self, frame: &mut ratatui::Frame) {
         let full = frame.area();
         let theme = self.theme;
+        // Inline images are baked pixels the scrim cannot dim, so the
+        // backdrop stays lit where the terminal draws them.
+        let backdrop = !self.inline_images_enabled();
         let Some(picker) = self.list_picker.as_mut() else {
             return;
         };
-        crate::widgets::list_picker::render_list_picker(picker, full, frame.buffer_mut(), theme);
+        crate::widgets::list_picker::render_list_picker(
+            picker,
+            full,
+            frame.buffer_mut(),
+            theme,
+            backdrop,
+        );
     }
 
     /// Render the Source Control "⋯" actions menu under the header pill.
@@ -61115,6 +62840,7 @@ impl App {
             return;
         }
         let screen = frame.area();
+        self.scm_menu.hover = self.pointer_cell;
         crate::widgets::scm_menu::render(
             &mut self.scm_menu,
             anchor,
@@ -64496,6 +66222,7 @@ impl App {
                 // A new press starts a new gesture, even if the release of a
                 // breakpoint-lane press never arrived.
                 self.breakpoint_lane_press = false;
+                self.editor_line_drag = None;
                 if in_secondary_outline {
                     self.click_secondary_outline(m.column, m.row);
                     return;
@@ -64543,6 +66270,11 @@ impl App {
                 if in_editor && let Some(idx) = self.editor.code_lens_at(m.column, m.row) {
                     self.focus_pane(Pane::Editor);
                     self.run_code_lens(idx);
+                    return;
+                }
+                // So is the inline blame (#1556): it opens its commit.
+                if in_editor && self.editor.blame_commit_at(m.column, m.row).is_some() {
+                    self.open_commit_for_line();
                     return;
                 }
                 if in_editor && self.editor.diff.is_none() {
@@ -65005,6 +66737,9 @@ impl App {
                 }
                 if rect_contains(self.welcome_tour_button, m.column, m.row) {
                     self.start_demo();
+                    return;
+                }
+                if self.click_welcome_start(m.column, m.row) {
                     return;
                 }
                 if in_tree_scrollbar {
@@ -65816,6 +67551,20 @@ impl App {
                         self.poke_cursor();
                         return;
                     }
+                    // A press on a line number selects that line, and a drag
+                    // down the numbers selects whole lines, as in VS Code
+                    // (#1570). It used to put the caret at column 1. Only
+                    // the number's own columns: a blank chevron cell, the
+                    // spacer and a gutter with no numbers keep that click.
+                    if m.modifiers.is_empty()
+                        && self.editor.line_number_line_at(m.column, m.row).is_some()
+                    {
+                        self.editor_line_drag =
+                            Some(self.editor.select_lines_at(None, m.column, m.row));
+                        self.editor_click.clear();
+                        self.poke_cursor();
+                        return;
+                    }
                     // VS Code Shift+Alt+drag: start a column (box) selection.
                     // Checked before the plain Alt+click caret so the two
                     // modifiers don't both fire.
@@ -65839,9 +67588,18 @@ impl App {
                     let is_double = self
                         .editor_click
                         .is_double(now, m.column, m.row, m.modifiers);
-                    if is_double {
-                        self.editor.select_word_at(m.column, m.row);
+                    if self
+                        .editor_click
+                        .is_triple(now, m.column, m.row, m.modifiers)
+                    {
+                        // A third click selects the whole line (#1570); a
+                        // drag from it extends line by line.
+                        self.editor_line_drag =
+                            Some(self.editor.select_lines_at(None, m.column, m.row));
                         self.editor_click.clear();
+                    } else if is_double {
+                        self.editor.select_word_at(m.column, m.row);
+                        self.editor_click.record_double(now, m.column, m.row);
                     } else {
                         // Anchor a fresh selection at the click; a drag widens it,
                         // a clean click ends up cleared on mouse-up.
@@ -66158,6 +67916,11 @@ impl App {
                         self.poke_cursor();
                         return;
                     }
+                    if let Some(anchor) = self.editor_line_drag {
+                        self.editor.select_lines_at(Some(anchor), m.column, m.row);
+                        self.poke_cursor();
+                        return;
+                    }
                     self.editor.mouse_drag(m.column, m.row);
                     self.poke_cursor();
                 } else if in_tree {
@@ -66215,6 +67978,7 @@ impl App {
             }
             MouseEventKind::Up(MouseButton::Left) => {
                 self.editor_tab_drag_from = None;
+                self.editor_line_drag = None;
                 // The release of a press that was forwarded to a tracking
                 // child goes to the same pane (#474), clamped to its grid
                 // like the drag. `report_mouse` may decline if the child
@@ -67581,7 +69345,7 @@ impl App {
                 let row = self.editor.cursor_row;
                 let diagnostic = self
                     .editor
-                    .diagnostics_at(row, self.editor.cursor_col)
+                    .diagnostics_at(row, self.editor.cursor_col, self.workspace_root())
                     .into_iter()
                     .next()
                     .map(|(_, m)| m);
@@ -67614,10 +69378,12 @@ impl App {
                 let (focus, item) = match self.sidebar_view {
                     SidebarView::Explorer => (
                         tr("Explorer"),
+                        // The row's label, so a compact row (#1486) reads
+                        // as shown, `src/main/java`, not its last folder.
                         self.tree
-                            .selected_path()
-                            .and_then(|p| p.file_name())
-                            .map(|n| n.to_string_lossy().into_owned()),
+                            .nodes
+                            .get(self.tree.selected)
+                            .map(crate::widgets::file_tree::Node::label),
                     ),
                     SidebarView::Search => self.search_a11y(),
                     SidebarView::SourceControl => self.source_control_a11y(),
@@ -68141,6 +69907,19 @@ impl App {
             || self.list_picker.is_some()
             || (self.input_prompt.is_none() && self.modal_a11y().is_some());
         if picker && let Some(pos) = self.announce_pos {
+            // A `surfaces` quick input draws no caret of its own and lends
+            // the query the terminal's caret, which the announcement takes
+            // here: paint a block where the typing lands, as boxed themes do.
+            if self.quick_input_owns_caret()
+                && let Some((cx, cy)) = self.quick_input_caret()
+                && frame
+                    .area()
+                    .contains(ratatui::layout::Position { x: cx, y: cy })
+            {
+                frame.buffer_mut()[(cx, cy)]
+                    .modifier
+                    .insert(ratatui::style::Modifier::REVERSED);
+            }
             frame.set_cursor_position(pos);
             return;
         }
@@ -68666,6 +70445,56 @@ impl App {
         moved
     }
 
+    /// Open Preview to the Side (#1605): a split's Markdown preview renders
+    /// the text being typed in the source pane beside it. Each pane's tab is
+    /// a buffer of its own, and nobody types into the preview's, so it showed
+    /// the file as last loaded. The panes pair as in
+    /// [`App::sync_markdown_scroll`], the focused pane's tab the preferred
+    /// source; a preview left with no source beside it shows its own buffer
+    /// again. The preview's buffer is never touched, so it stays clean.
+    /// Returns true when a preview was rebuilt.
+    pub fn sync_markdown_side_previews(&mut self) -> bool {
+        let mut tabs: Vec<&mut crate::widgets::editor::Editor> = std::iter::once(&mut self.editor)
+            .chain(self.editor_layout.inactive_groups_mut())
+            .filter_map(|group| {
+                let idx = group.active_index();
+                group.editors.get_mut(idx)
+            })
+            .collect();
+        let mut changed = false;
+        for p in 0..tabs.len() {
+            let follows = match tabs[p].markdown_preview.as_ref() {
+                Some(md) if !md.notebook && md.doc_path.is_none() => md.follows,
+                _ => continue,
+            };
+            let source = (0..tabs.len()).find(|&s| {
+                s != p
+                    && tabs[s].path.is_some()
+                    && tabs[s].path == tabs[p].path
+                    && tabs[s].markdown_preview.is_none()
+                    && !tabs[s].has_non_text_view()
+            });
+            let wanted = source.map(|s| (tabs[s].edit_seq, tabs[s].undo_step_id));
+            let built = tabs[p]
+                .markdown_preview
+                .as_ref()
+                .is_some_and(|md| md.built_seq == tabs[p].edit_seq);
+            // A preview of its own buffer is rebuilt by its render, as ever.
+            if wanted == follows && (built || wanted.is_none()) {
+                continue;
+            }
+            match source {
+                Some(s) => {
+                    let text = tabs[s].lines.join("\n");
+                    tabs[p].rebuild_markdown_preview_from(&text, wanted);
+                }
+                None => tabs[p].rebuild_markdown_preview(),
+            }
+            changed = true;
+        }
+        changed
+    }
+
     /// Arm or disarm Live Run for the active file (Cmd+K V).
     pub(crate) fn toggle_live_run(&mut self) {
         let Some(path) = self.editor.path.clone() else {
@@ -68818,6 +70647,48 @@ impl App {
                 "off"
             }
         );
+    }
+
+    /// Type `c` into the active editor in the app's typing mode. The mode is
+    /// copied first: a tab switched to in the same input batch has not had
+    /// its `overwrite` flag synced by the draw yet.
+    fn type_char_in_editor(&mut self, c: char) {
+        self.editor.overwrite = self.overwrite_mode;
+        self.editor.insert_char(c);
+    }
+
+    /// Flip Insert/Overwrite typing (the Insert key).
+    fn toggle_overwrite_mode(&mut self) {
+        self.overwrite_mode = !self.overwrite_mode;
+        self.editor.overwrite = self.overwrite_mode;
+        // Text typed before and after the switch undo as separate steps.
+        self.editor.break_undo_coalescing();
+        self.status = format!(
+            "{} mode",
+            if self.overwrite_mode {
+                "Overwrite"
+            } else {
+                "Insert"
+            }
+        );
+    }
+
+    /// Make the terminal's caret match the typing mode: a block while the
+    /// editor has focus in overwrite mode, the steady bar croft runs with
+    /// otherwise. Emitted only when the wanted shape changes.
+    fn sync_caret_style(&mut self) {
+        let want_block = self.overwrite_mode && self.focus == Pane::Editor;
+        if want_block == self.caret_block_sent {
+            return;
+        }
+        self.caret_block_sent = want_block;
+        let style = if want_block {
+            crossterm::cursor::SetCursorStyle::SteadyBlock
+        } else {
+            crossterm::cursor::SetCursorStyle::SteadyBar
+        };
+        let mut out = stdout();
+        let _ = crossterm::execute!(out, style);
     }
 
     /// Step the gutter's line numbers through on, relative, interval and
@@ -69642,6 +71513,7 @@ impl App {
         self.auto_save_on_focus_change = p.auto_save_on_focus_change;
         self.copy_on_select = p.copy_on_select;
         self.apply_project_excludes(p);
+        self.tree.set_compact_folders(!p.disable_compact_folders);
         self.apply_file_associations(p);
         self.apply_files_encoding(p);
         // The ssh-pane offer's switches apply live like every other pref
@@ -70379,7 +72251,7 @@ impl App {
         let widest = menu
             .items
             .iter()
-            .map(|e| menu_entry_width(e, &self.keymap))
+            .map(|e| menu_entry_width(e, &self.keymap, self.theme.surfaces().is_some()))
             .max()
             .unwrap_or(0);
         let area = self.last_frame_area;
@@ -70422,7 +72294,7 @@ impl App {
         let main = self.menu_rect()?;
         let widest = items
             .iter()
-            .map(|e| menu_entry_width(e, &self.keymap))
+            .map(|e| menu_entry_width(e, &self.keymap, self.theme.surfaces().is_some()))
             .max()
             .unwrap_or(0);
         let area = self.last_frame_area;
@@ -73870,6 +75742,37 @@ impl App {
             full_strip
         };
         Some((ed_rect, full_strip, img))
+    }
+
+    /// The minimap column's share of the editor header on a `surfaces`
+    /// theme, painted after the editor: the tab-strip row in the strip's
+    /// chrome, so the strip (and the layout icons on it) runs to the edge
+    /// instead of stopping a canvas-black column short, and the seam under
+    /// the breadcrumbs carried across the column. The editor's rule has
+    /// eased into the hairline by its far end, so the column takes that.
+    fn paint_minimap_header(&self, buf: &mut ratatui::buffer::Buffer, column: Rect) {
+        let Some(t) = crate::widgets::surface::tones(self.theme) else {
+            return;
+        };
+        let column = column.intersection(buf.area);
+        if column.height == 0 {
+            return;
+        }
+        let strip_row = Rect {
+            height: 1,
+            ..column
+        };
+        buf.set_style(strip_row, Style::default().bg(self.theme.tab_strip_bg()));
+        let body = self.editor.last_body;
+        if body.height >= 2 && body.y > column.y && body.y < column.bottom() {
+            for x in column.left()..column.right() {
+                let cell = &mut buf[(x, body.y)];
+                if cell.symbol() == " " {
+                    cell.set_symbol("\u{2594}");
+                    cell.set_fg(t.hairline());
+                }
+            }
+        }
     }
 
     /// Whether the open context menu (or its submenu, which floats further
@@ -78406,6 +80309,36 @@ fn one_line(text: String) -> String {
         .join(" ")
 }
 
+/// `text` with each absolute path under `root` written relative to it, for
+/// the status bar: `Saved /home/me/proj/src/main.rs` reads `Saved
+/// src/main.rs`. A path only counts where it starts a word (after the start,
+/// a space, a quote or a bracket), so `root` found inside some other
+/// absolute path is left alone; the root on its own is kept as is.
+fn workspace_relative(text: &str, root: &Path) -> String {
+    let root = root.to_string_lossy();
+    let root = root.trim_end_matches('/');
+    if root.is_empty() {
+        return text.to_string();
+    }
+    let needle = format!("{root}/");
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find(&needle) {
+        let starts_word = rest[..i]
+            .chars()
+            .next_back()
+            .or_else(|| out.chars().next_back())
+            .is_none_or(|c| c.is_whitespace() || "'\"`([{<".contains(c));
+        out.push_str(&rest[..i]);
+        if !starts_word {
+            out.push_str(&needle);
+        }
+        rest = &rest[i + needle.len()..];
+    }
+    out.push_str(rest);
+    out
+}
+
 /// The excerpt window for a Peek popup: up to `total` lines, at most
 /// `above` of them before `target`, clamped to the file. Returns the start
 /// line index and the excerpt slice (cloned).
@@ -79325,7 +81258,7 @@ fn is_run_fence_key(key: KeyEvent) -> bool {
 /// with the pane's directory on its import path, as before. Should the file
 /// not be written, the heredoc is the fallback.
 ///
-/// A shell block of several lines, or holding a tab or `!`, goes as one
+/// A shell block of several lines, or holding a tab, `!` or `#`, goes as one
 /// single-quoted `printf '%b'` argument instead. Typed line by line, each
 /// line was a command of its own, so the capture under the fence and the
 /// pane's outcome described only the first one to finish (#920); as one
@@ -79333,8 +81266,13 @@ fn is_run_fence_key(key: KeyEvent) -> bool {
 /// status it ends with. Typed into an interactive shell, a tab is
 /// completion and bash expands `!` as history, so what ran was not what
 /// the confirm popup showed. Inside single quotes neither happens, and the
-/// tab travels as `\t`. A backslash travels as `\0134`, since fish folds
-/// `\\` inside single quotes to one backslash where bash and zsh keep both.
+/// tab travels as `\t`. zsh reads a typed `#` as a word, not a comment,
+/// unless `interactive_comments` is set, and it is off by default: `echo
+/// done  # note` printed the note and a comment alone failed with exit 127
+/// (#1367). Text `eval`ed or `source`d is a script, where every shell reads
+/// a comment as one, and a `#` that is not a comment parses as typed. A
+/// backslash travels as `\0134`, since fish folds `\\` inside single
+/// quotes to one backslash where bash and zsh keep both.
 /// `shell` is the pane's shell: fish before 3.4 rejects `$(...)` as
 /// syntax, so a fish pane `source`s the decoded block from a `psub` file
 /// rather than `eval`ing it, which every fish reads alike. Not piped to
@@ -79354,7 +81292,7 @@ fn fence_command(interpreter: &str, code: &str, scripts: &Path, shell: &str) -> 
         }
         return format!("{interpreter} - <<'{end}'\n{code}\n{end}\r");
     }
-    if code.contains(['\n', '\t', '!']) {
+    if code.contains(['\n', '\t', '!', '#']) {
         let escaped = format!("{code}\n")
             .replace('\\', "\\0134")
             .replace('\n', "\\n")
@@ -80456,9 +82394,10 @@ fn mouse_context_for(
 /// A left press reports `DoubleClick` when croft's own click tracker already
 /// considers it one, so a binding agrees with the built-in select-word
 /// behaviour rather than disagreeing about the same physical click. Triple
-/// click is NOT reported: the tracker distinguishes single from double only,
-/// and inventing a third level here would make `triple_click` bindings fire
-/// on the second click. `Gesture::parse` therefore rejects it with a load
+/// click is NOT reported: only the editor's tracker counts a third click,
+/// for its built-in line selection (#1570), and the others distinguish
+/// single from double only, so a `triple_click` binding would fire on the
+/// second click there. `Gesture::parse` therefore rejects it with a load
 /// warning rather than accepting a binding that could never behave.
 fn gesture_for(
     m: &MouseEvent,
@@ -80937,6 +82876,19 @@ fn is_add_cursors_to_line_ends_key(key: KeyEvent) -> bool {
         && !key
             .modifiers
             .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
+}
+
+/// `Cmd+L` (`Ctrl+L` too, as `Cmd+D` takes `Ctrl+D`): Expand Line Selection
+/// (#1570), VS Code's chord. Editor-only, so a focused shell keeps `Ctrl+L`
+/// to clear the screen; Shift belongs to Select All Occurrences.
+fn is_expand_line_selection_key(key: KeyEvent) -> bool {
+    matches!(key.code, KeyCode::Char('l' | 'L'))
+        && key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER)
+        && !key
+            .modifiers
+            .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT)
 }
 
 /// Editor-pane Change All Occurrences: `Cmd+F2` (macOS) or `Ctrl+F2` (Linux),
@@ -83332,6 +85284,10 @@ fn key_to_bytes(key: KeyEvent, app_cursor: bool) -> Vec<u8> {
 /// mirroring the horizontal rule VS Code renders between hover sections.
 const HOVER_DIVIDER: &str = "────────";
 
+/// What Show or Focus Hover says when the caret has nothing to describe
+/// (#1518): a keyboard command that does nothing must say why.
+const NO_HOVER_AT_CARET: &str = "No hover information at the caret";
+
 /// Render the diagnostics under the hovered point into a single labelled text
 /// block, errors first (so the most severe message leads), each line prefixed
 /// with its severity. `None` when there are no diagnostics. The severity word
@@ -84259,6 +86215,9 @@ fn run_pending_scp_uploads(app: &mut App, terminal: &mut CroftTerminal) -> Resul
         let _ = out.write_all(&takeover_mode_seq());
         let _ = out.flush();
     }
+    // The takeover block set the steady bar; the next draw puts the
+    // overwrite block back if it is wanted.
+    app.caret_block_sent = false;
     terminal.clear().ok();
     app.overlays.activity.mark_dirty();
     app.overlays.welcome.mark_dirty();
@@ -84558,8 +86517,10 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             app.poll_chrome_bake() | app.poll_welcome_bake() | app.poll_saved_session();
         // A closed tab's bookmarks are kept, and come back with its file.
         let bookmarks_changed = app.settle_bookmarks();
-        let live_run_changed =
-            app.tick_live_run() | app.sync_markdown_scroll() | app.tick_minimap();
+        let live_run_changed = app.tick_live_run()
+            | app.sync_markdown_side_previews()
+            | app.sync_markdown_scroll()
+            | app.tick_minimap();
         app.tick_code_lens();
         let code_lens_changed = app.tick_config_watch()
             | app.drain_lsp_code_lens()
@@ -84600,7 +86561,8 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         app.refresh_signature_help_if_moved();
         let sig_help_changed = app.drain_lsp_signature_help();
         app.poll_hover();
-        let hover_changed = app.drain_lsp_hover() | app.drain_lsp_rust_analyzer();
+        let hover_changed =
+            app.drain_lsp_hover() | app.drain_lsp_rust_analyzer() | app.drain_blame_hover();
         let tab_hover_changed = app.poll_tab_hover();
         let ui_tooltip_changed = app.poll_ui_tooltip();
         let definition_changed = app.drain_lsp_definition();
@@ -84817,6 +86779,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             }
             let draw_start = std::time::Instant::now();
             let drawn = terminal.draw(|f| app.render_for_terminal(f))?;
+            app.sync_caret_style();
             let mut underlays = app.image_underlays(drawn.buffer);
             app.drawn_buffer = Some(drawn.buffer.clone());
             // Record render+flush time and the bytes ratatui shipped this
@@ -85084,6 +87047,9 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                             let out = terminal.backend_mut();
                             let _ = out.write_all(&reattach_reassert_seq(app.theme));
                             let _ = out.flush();
+                            // The re-assert set the steady bar; resend the
+                            // overwrite block on the next draw if wanted.
+                            app.caret_block_sent = false;
                         }
                     }
                     _ => {}

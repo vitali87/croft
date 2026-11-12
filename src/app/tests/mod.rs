@@ -17,8 +17,12 @@ mod editor_view;
 mod explorer;
 mod extensions;
 mod files;
+#[cfg(target_os = "linux")]
+mod golden;
 mod hot_exit;
 mod input;
+#[cfg(target_os = "linux")]
+mod key_ledger;
 mod keybindings;
 mod layout;
 mod lsp;
@@ -44,8 +48,208 @@ mod viewers;
 mod vim;
 mod welcome;
 
+/// Every `.rs` file under `dir`, at any depth, in sorted path order. Hidden
+/// entries are skipped: an editor's lock file such as `.#mod.rs` is a link
+/// to nowhere, not source.
+fn rust_files_under(dir: &std::path::Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let mut dirs = vec![dir.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        let entries = std::fs::read_dir(&dir)
+            .unwrap_or_else(|e| panic!("cannot list {}: {e}", dir.display()));
+        for entry in entries {
+            let entry = entry.unwrap();
+            if entry.file_name().to_string_lossy().starts_with('.') {
+                continue;
+            }
+            let path = entry.path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
+/// The app's production source as `(path, text)`: every `.rs` file under
+/// `src/app/` except the whole-app tests in `src/app/tests/`, read at run
+/// time in sorted path order. The tests that check a property of the app's
+/// source text scan all of it, not one file, so code moving between files, or
+/// a new file, stays covered. The whole-app tests are left out because they
+/// spell out the very markers those scans count.
+fn app_source_files() -> Vec<(PathBuf, String)> {
+    let app = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/app");
+    let tests = app.join("tests");
+    rust_files_under(&app)
+        .into_iter()
+        .filter(|path| !path.starts_with(&tests))
+        .map(|path| {
+            let text = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+            (path, text)
+        })
+        .collect()
+}
+
+/// [`app_source_files`] as one text, each file starting on a line of its own,
+/// so a scan anchored on a line start sees a file's first line too.
+fn app_source() -> String {
+    let mut all = String::new();
+    for (_, text) in app_source_files() {
+        all.push('\n');
+        all.push_str(&text);
+    }
+    all
+}
+
 fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
     KeyEvent::new(code, mods)
+}
+
+/// A key check of the key router.
+#[cfg(not(target_os = "macos"))]
+type KeyPredicate = fn(KeyEvent) -> bool;
+
+/// Every `is_*_key` predicate of the key router by name, each taking only the
+/// key: the uniform list the keybinding tests walk. `is_cmd_k_leader_key`
+/// comes twice, as the editor and as a focused shell ask it (`@shell`).
+#[cfg(not(target_os = "macos"))]
+fn key_predicates() -> Vec<(&'static str, KeyPredicate)> {
+    macro_rules! preds {
+        ($($p:ident),* $(,)?) => { vec![$((stringify!($p), $p as KeyPredicate)),*] };
+    }
+    // The leader asked from the editor and from a focused shell.
+    fn leader_in_editor(key: KeyEvent) -> bool {
+        is_cmd_k_leader_key(key, ctrl_k_leads(false, false, false))
+    }
+    fn leader_in_shell(key: KeyEvent) -> bool {
+        is_cmd_k_leader_key(key, ctrl_k_leads(false, true, false))
+    }
+    // `is_save_key` also takes whether Shift is reported with Ctrl.
+    fn is_save_key_reporting_shift(key: KeyEvent) -> bool {
+        is_save_key(key, true)
+    }
+    let mut predicates: Vec<(&str, KeyPredicate)> = preds![
+        is_terminal_copy_key,
+        is_compare_key,
+        is_search_jump_key,
+        is_editor_find_key,
+        is_terminal_find_key,
+        is_editor_replace_key,
+        is_file_finder_key,
+        is_command_palette_key,
+        is_go_to_symbol_key,
+        is_focus_breadcrumbs_key,
+        is_toggle_line_comment_key,
+        is_toggle_block_comment_key,
+        is_toggle_wrap_key,
+        is_switch_header_source_key,
+        is_tree_zoxide_jump_key,
+        is_tree_new_file_key,
+        is_tree_new_folder_key,
+        is_tree_rename_key,
+        is_reveal_in_finder_key,
+        is_copy_path_key,
+        is_tree_make_root_key,
+        is_tree_make_parent_root_key,
+        is_explorer_jump_key,
+        is_source_control_jump_key,
+        is_run_debug_jump_key,
+        is_remote_jump_key,
+        is_extensions_jump_key,
+        is_drop_to_local_key,
+        is_run_build_task_key,
+        is_markdown_preview_key,
+        is_run_fence_key,
+        is_sidebar_toggle_key,
+        is_secondary_sidebar_toggle_key,
+        is_minimap_toggle_key,
+        is_terminal_toggle_key,
+        is_terminal_maximize_key,
+        is_quick_select_key,
+        is_copy_mode_key,
+        is_command_history_key,
+        is_terminal_split_key,
+        is_editor_split_key,
+        is_goto_bracket_key,
+        is_select_to_bracket_key,
+        is_navigate_back_key,
+        is_navigate_forward_key,
+        is_transpose_key,
+        is_indentation_to_spaces_key,
+        is_indentation_to_tabs_key,
+        is_trim_final_newlines_key,
+        is_toggle_bookmark_key,
+        is_switch_debug_session_key,
+        is_clear_bookmarks_key,
+        is_next_bookmark_key,
+        is_prev_bookmark_key,
+        is_join_lines_key,
+        is_transform_upper_key,
+        is_transform_lower_key,
+        is_copy_relative_path_key,
+        is_sort_lines_asc_key,
+        is_sort_lines_desc_key,
+        is_trim_trailing_whitespace_key,
+        is_increment_number_key,
+        is_decrement_number_key,
+        is_format_document_key,
+        is_emmet_expand_key,
+        is_quick_fix_key,
+        is_focus_group_left_key,
+        is_focus_group_right_key,
+        is_terminal_focus_key,
+        is_terminal_close_key,
+        is_terminal_cycle_key,
+        is_terminal_cycle_back_key,
+        is_delete_node_key,
+        is_completion_trigger_key,
+        is_save_all_key,
+        is_new_untitled_file_key,
+        is_replace_in_files_key,
+        is_search_details_key,
+        is_show_output_key,
+        is_show_problems_key,
+        is_update_croft_key,
+        is_editor_copy_key,
+        is_editor_cut_key,
+        is_search_paste_key,
+        is_editor_paste_key,
+        is_clipboard_paste_key,
+        is_editor_select_all_key,
+        is_editor_undo_key,
+        is_editor_redo_key,
+        is_rename_symbol_key,
+        is_change_all_occurrences_key,
+        is_select_all_occurrences_key,
+        is_add_cursors_to_line_ends_key,
+        is_expand_line_selection_key,
+        is_select_next_occurrence_key,
+        is_delete_line_key,
+        is_go_to_definition_key,
+        is_peek_definition_key,
+        is_go_to_references_key,
+        is_run_to_cursor_key,
+        is_peek_references_key,
+        is_go_to_declaration_key,
+        is_go_to_type_definition_key,
+        is_go_to_implementation_key,
+        is_vim_toggle_key,
+        is_editor_line_home_key,
+        is_editor_line_end_key,
+        is_editor_kill_to_eol_key,
+        is_editor_kill_to_bol_key,
+        is_editor_open_line_below_key,
+        is_editor_open_line_above_key,
+        is_close_tab_key,
+    ];
+    predicates.push(("is_save_key", is_save_key_reporting_shift));
+    predicates.push(("is_cmd_k_leader_key", leader_in_editor));
+    predicates.push(("is_cmd_k_leader_key@shell", leader_in_shell));
+    predicates
 }
 
 /// Shell command that prints `probe` on its own line WITHOUT the typed
@@ -123,6 +327,128 @@ fn menu_action_of<'a>(items: &'a [MenuEntry], label: &str) -> Option<&'a MenuAct
     })
 }
 
+/// The actions of every row of the Customize Layout popup and the tab and
+/// Explorer menus over `file` (with a copied file to paste and another to
+/// compare with), and of the rows with a shortcut in the menus built where
+/// they open: the editor's, its gutter's, the Outline's, a folder's in the
+/// Explorer, the terminal's, a finished command's and a CAPTURES row's. These
+/// are the rows whose shortcuts the menus advertise (#885).
+fn menu_row_actions(app: &App, file: &Path) -> Vec<MenuAction> {
+    fn actions(entries: Vec<MenuEntry>) -> Vec<MenuAction> {
+        entries
+            .into_iter()
+            .flat_map(|e| match e {
+                MenuEntry::Item { action, .. } => vec![action],
+                MenuEntry::Submenu { items, .. } => actions(items),
+                _ => Vec::new(),
+            })
+            .collect()
+    }
+    let root = file.parent().unwrap();
+    let mut all = actions(app.customize_layout_items());
+    all.extend(actions(build_tab_context_menu_items(
+        0,
+        3,
+        true,
+        Some(file),
+        true,
+        true,
+        false,
+    )));
+    let copied = ExplorerClipboard {
+        mode: ExplorerClipMode::Copy,
+        paths: vec![file.to_path_buf()],
+    };
+    let tree = build_tree_context_menu_items(
+        Some(&file_node(file)),
+        root,
+        &[file.to_path_buf()],
+        root,
+        Some(&copied),
+        Some(&root.join("selected-for-compare.rs")),
+    );
+    all.extend(tree.into_iter().map(|(_, a)| a));
+    let (row, col, line) = (0, 0, 0);
+    let path = file.to_path_buf();
+    all.extend([
+        MenuAction::RenameSymbolAt { row, col },
+        MenuAction::ChangeAllOccurrencesAt { row, col },
+        MenuAction::GoToDefinitionAt { row, col },
+        MenuAction::GoToDeclarationAt { row, col },
+        MenuAction::GoToTypeDefinitionAt { row, col },
+        MenuAction::GoToImplementationAt { row, col },
+        MenuAction::GoToReferencesAt { row, col },
+        MenuAction::ShowCallsAt {
+            row,
+            col,
+            incoming: true,
+        },
+        MenuAction::ShowCallsAt {
+            row,
+            col,
+            incoming: false,
+        },
+        MenuAction::NavigateBack,
+        MenuAction::NavigateForward,
+        MenuAction::QuickFixAt { row, col },
+        MenuAction::AskNavigatorSelection { start: 0, end: 0 },
+        MenuAction::EditorCut,
+        MenuAction::EditorCopy,
+        MenuAction::EditorPaste,
+        MenuAction::ShowCommandPalette,
+        MenuAction::OpenThemePicker,
+        MenuAction::ToggleBreakpointAt { line },
+        MenuAction::EditBreakpointConditionAt { line },
+        MenuAction::EditLogpointAt { line },
+        MenuAction::ToggleBookmarkAt { line },
+        MenuAction::NextBookmark,
+        MenuAction::PreviousBookmark,
+        MenuAction::AskNavigatorAt { line },
+        MenuAction::GoToOutlineSymbol {
+            path: path.clone(),
+            line: 0,
+            col: 0,
+        },
+        MenuAction::OpenSymbolTab {
+            path,
+            name: String::from("main"),
+            first: 0,
+            last: 0,
+        },
+        MenuAction::MakeRoot(root.join("src")),
+        MenuAction::TerminalCopySelection,
+        MenuAction::TerminalPaste,
+        MenuAction::TerminalQuickSelect,
+        MenuAction::TerminalCopyMode,
+        MenuAction::TerminalCommandHistory,
+        MenuAction::OpenScrollbackInEditor,
+        MenuAction::ToggleBroadcastInput,
+        MenuAction::ToggleBroadcastExclusion,
+        MenuAction::UndoCloseTerminal,
+        MenuAction::SplitTerminal,
+        MenuAction::RenameTerminal(0),
+        MenuAction::ToggleMaximizeTerminal(0),
+        MenuAction::KillTerminal(0),
+        MenuAction::ClearTerminal(0),
+    ]);
+    let finished = crate::widgets::terminal::CommandDecoration {
+        id: 0,
+        line: 0,
+        exit: Some(0),
+        duration: None,
+        input: None,
+        output_start: 0,
+        output_end: 0,
+    };
+    all.extend([
+        MenuAction::CopyCommandOutput(0, finished),
+        MenuAction::SelectCommandOutput(0, finished),
+        MenuAction::RerunCommand(0, finished),
+        MenuAction::AskNavigatorAboutCapture,
+    ]);
+    all
+}
+
 fn dummy_activity_images() -> ActivityBarImages {
     let s = || String::from("\x1b]1337;File=inline=1:Zm9v\x07");
     ActivityBarImages {
@@ -177,9 +503,7 @@ fn app_with_open_file_and_editor_cell() -> (App, tempfile::TempDir, u16, u16) {
     std::fs::write(&f, "value = compute()\n").unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.editor.open(&f).unwrap();
-    let backend = ratatui::backend::TestBackend::new(100, 30);
-    let mut term = ratatui::Terminal::new(backend).unwrap();
-    term.draw(|frame| app.render(frame)).unwrap();
+    draw(&mut app, 100, 30);
     let col = app.editor.last_inner.x + app.editor.last_gutter_width as u16 + 3;
     let row = app.editor.last_inner.y + 1;
     assert!(
@@ -265,9 +589,7 @@ fn tree_app_with_keymap(json: &str) -> (App, tempfile::TempDir) {
     // one there is no editor to hit and the gesture falls through.
     app.editor.open_pinned(&f).unwrap();
     app.keymap = crate::keymap::Keymap::from_json(json);
-    let backend = ratatui::backend::TestBackend::new(100, 30);
-    let mut term = ratatui::Terminal::new(backend).unwrap();
-    term.draw(|frame| app.render(frame)).unwrap();
+    draw(&mut app, 100, 30);
     (app, tmp)
 }
 
@@ -282,9 +604,7 @@ fn three_tab_app(json: &str) -> (App, tempfile::TempDir) {
         app.editor.open_pinned(&f).unwrap();
     }
     app.keymap = crate::keymap::Keymap::from_json(json);
-    let backend = ratatui::backend::TestBackend::new(100, 30);
-    let mut term = ratatui::Terminal::new(backend).unwrap();
-    term.draw(|frame| app.render(frame)).unwrap();
+    draw(&mut app, 100, 30);
     (app, tmp)
 }
 
@@ -322,9 +642,7 @@ fn app_with_painted_file(text: &str) -> (App, tempfile::TempDir, std::path::Path
     std::fs::write(&f, text).unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.editor.open_pinned(&f).unwrap();
-    let backend = ratatui::backend::TestBackend::new(100, 30);
-    let mut term = ratatui::Terminal::new(backend).unwrap();
-    term.draw(|frame| app.render(frame)).unwrap();
+    draw(&mut app, 100, 30);
     (app, tmp, f)
 }
 
@@ -384,13 +702,90 @@ fn nav_switch_fixture() -> (tempfile::TempDir, App, PathBuf, PathBuf) {
     (tmp, app, a, b)
 }
 
-fn git_stdout_in(root: &std::path::Path, args: &[&str]) -> String {
-    let out = std::process::Command::new("git")
-        .args(args)
-        .current_dir(root)
-        .output()
-        .unwrap();
-    String::from_utf8_lossy(&out.stdout).to_string()
+/// The author and committer of every commit a test makes with
+/// [`test_git`]. [`git_init_with_identity`] also writes it into the
+/// repository's own config, for fixtures where the app commits; a fixture
+/// that writes an identity of its own keeps that one for the app's commits.
+const TEST_GIT_NAME: &str = "a";
+const TEST_GIT_EMAIL: &str = "a@b";
+
+/// `git -C dir`, shut off from the developer's own git setup. Every git
+/// command a test runs itself, to build a fixture or to read one back,
+/// starts here. It inherits no `GIT_*` variable: no setting passed in the
+/// environment (`GIT_CONFIG_COUNT` and `GIT_CONFIG_PARAMETERS` entries, a
+/// template dir, a hash, dates, pathspec modes), and no `GIT_DIR`,
+/// `GIT_WORK_TREE` or `GIT_INDEX_FILE` that would point it at another
+/// repository (git exports those to a hook that runs the tests). It reads
+/// no global or system config (so no default branch, signing, hooks,
+/// aliases or identity of theirs) and no global ignore or attributes file.
+/// Commits are made as [`TEST_GIT_NAME`] and no editor opens. All of it is
+/// set on the command, never on the process. The app's own git calls are
+/// production code and never come here.
+fn test_git(dir: &Path) -> std::process::Command {
+    let mut git = std::process::Command::new("git");
+    for (name, _) in std::env::vars_os() {
+        if name.as_encoded_bytes().starts_with(b"GIT_") {
+            git.env_remove(name);
+        }
+    }
+    git.arg("-C")
+        .arg(dir)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        // Where git finds the global `ignore` and `attributes` files, which
+        // it reads whatever `GIT_CONFIG_GLOBAL` says.
+        .env("XDG_CONFIG_HOME", "/dev/null")
+        .env("GIT_AUTHOR_NAME", TEST_GIT_NAME)
+        .env("GIT_AUTHOR_EMAIL", TEST_GIT_EMAIL)
+        .env("GIT_COMMITTER_NAME", TEST_GIT_NAME)
+        .env("GIT_COMMITTER_EMAIL", TEST_GIT_EMAIL)
+        .env("GIT_EDITOR", "true");
+    git
+}
+
+/// `git init -q -b main` in `dir`: the first branch is `main` whatever the
+/// developer's `init.defaultBranch` says.
+fn git_init(dir: &Path) {
+    git_ok(dir, &["init", "-q", "-b", "main"]);
+}
+
+/// [`git_init`], then [`TEST_GIT_NAME`] as the repository's own identity,
+/// so the app's own commits there do not need the developer's.
+fn git_init_with_identity(dir: &Path) {
+    git_init(dir);
+    git_ok(dir, &["config", "user.email", TEST_GIT_EMAIL]);
+    git_ok(dir, &["config", "user.name", TEST_GIT_NAME]);
+}
+
+/// Runs [`test_git`] in `dir`, failing the test with git's error unless it
+/// succeeds; its stdout, trimmed.
+fn git_ok(dir: &Path, args: &[&str]) -> String {
+    let out = test_git(dir).args(args).output().unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?} in {}: {}",
+        dir.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// Runs [`test_git`] in `dir`; true when it succeeded. A git that cannot
+/// start fails the test. A caller that ignores the answer tolerates a step
+/// that fails.
+fn git_succeeds(dir: &Path, args: &[&str]) -> bool {
+    test_git(dir).args(args).output().unwrap().status.success()
+}
+
+/// Runs [`test_git`] in `dir`, succeeding or not; its stdout, trimmed.
+fn git_stdout(dir: &Path, args: &[&str]) -> String {
+    git_stdout_untrimmed(dir, args).trim().to_string()
+}
+
+/// [`git_stdout`] with git's trailing newline kept.
+fn git_stdout_untrimmed(dir: &Path, args: &[&str]) -> String {
+    let out = test_git(dir).args(args).output().unwrap();
+    String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
 fn file_node(path: &Path) -> crate::widgets::file_tree::Node {
@@ -400,9 +795,13 @@ fn file_node(path: &Path) -> crate::widgets::file_tree::Node {
         is_dir: false,
         expanded: false,
         loaded: false,
+        folded: 0,
     }
 }
 
+/// Types `text` one unmodified keystroke per character straight into the
+/// sheet grid's own handler, `App::handle_sheet_key`, skipping the
+/// `App::handle_key` routing that [`type_keys`] goes through.
 fn type_into_sheet(app: &mut App, text: &str) {
     for ch in text.chars() {
         app.handle_sheet_key(key(KeyCode::Char(ch), KeyModifiers::NONE));
@@ -448,14 +847,6 @@ fn xlsx_value(p: &std::path::Path, col: u32, row: u32) -> String {
         .to_string()
 }
 
-/// Type `text` into the focused editor, which leaves its buffer dirty.
-fn type_into_editor(app: &mut App, text: &str) {
-    for c in text.chars() {
-        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
-            .unwrap();
-    }
-}
-
 fn press_ctrl_q(app: &mut App) {
     app.handle_key(key(KeyCode::Char('q'), KeyModifiers::CONTROL))
         .unwrap();
@@ -464,7 +855,7 @@ fn press_ctrl_q(app: &mut App) {
 /// An app with `a.txt` open, edited and unsaved, and the file's path (#862).
 fn app_with_unsaved_file(tmp: &std::path::Path) -> (App, PathBuf) {
     let mut app = app_with_open_file(tmp, "a.txt", "alpha\n");
-    type_into_editor(&mut app, "x");
+    type_keys(&mut app, "x");
     assert!(app.editor.dirty, "setup: typing leaves the buffer dirty");
     (app, tmp.join("a.txt"))
 }
@@ -542,19 +933,17 @@ fn app_with_run_script() -> (tempfile::TempDir, App) {
     (tmp, app)
 }
 
-/// Run the Command Palette row titled `title` the way a user does: open the
-/// palette (Cmd+Shift+P), type the title, pick its row, Enter. Returns false,
-/// running nothing, when no row has that title.
-fn run_from_palette(app: &mut App, title: &str) -> bool {
+/// Run the Command Palette row titled exactly `title` the way a user does:
+/// open the palette (Cmd+Shift+P), type the title, pick that row wherever
+/// the search ranks it, Enter. Returns false, running nothing, when no row
+/// has that title. [`run_palette_top_match`] runs the top row instead.
+fn run_palette_row_titled(app: &mut App, title: &str) -> bool {
     app.handle_key(key(
         KeyCode::Char('p'),
         KeyModifiers::SUPER | KeyModifiers::SHIFT,
     ))
     .unwrap();
-    for c in title.chars() {
-        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
-            .unwrap();
-    }
+    type_keys(app, title);
     let palette = app.command_palette.as_mut().expect("the palette opened");
     let Some(row) = palette.results.iter().position(|i| i.title() == title) else {
         app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
@@ -577,32 +966,10 @@ fn markdown_fence_app(dir: &Path) -> App {
 fn make_committed_repo() -> tempfile::TempDir {
     let tmp = tempfile::tempdir().unwrap();
     let p = tmp.path();
-    let _ = std::process::Command::new("git")
-        .args(["-C"])
-        .arg(p)
-        .args(["init", "-q", "-b", "main"])
-        .output();
-    let _ = std::process::Command::new("git")
-        .args(["-C"])
-        .arg(p)
-        .args(["config", "user.email", "a@b"])
-        .status();
-    let _ = std::process::Command::new("git")
-        .args(["-C"])
-        .arg(p)
-        .args(["config", "user.name", "a"])
-        .status();
+    git_init_with_identity(p);
     std::fs::write(p.join("seed.txt"), b"seed\n").unwrap();
-    let _ = std::process::Command::new("git")
-        .args(["-C"])
-        .arg(p)
-        .args(["add", "seed.txt"])
-        .status();
-    let _ = std::process::Command::new("git")
-        .args(["-C"])
-        .arg(p)
-        .args(["commit", "-q", "-m", "init"])
-        .status();
+    let _ = git_succeeds(p, &["add", "seed.txt"]);
+    let _ = git_succeeds(p, &["commit", "-q", "-m", "init"]);
     tmp
 }
 
@@ -632,15 +999,8 @@ fn app_with_change_bars() -> (App, tempfile::TempDir) {
     let f = root.join("v.txt");
     let body: String = (1..=20).map(|i| format!("value_{i}\n")).collect();
     std::fs::write(&f, &body).unwrap();
-    for args in [&["add", "v.txt"][..], &["commit", "-q", "-m", "values"]] {
-        let st = std::process::Command::new("git")
-            .arg("-C")
-            .arg(root)
-            .args(args)
-            .status()
-            .unwrap();
-        assert!(st.success());
-    }
+    git_ok(root, &["add", "v.txt"]);
+    git_ok(root, &["commit", "-q", "-m", "values"]);
     let edited: String = (1..=20)
         .filter(|&i| i != 9)
         .map(|i| {
@@ -689,19 +1049,6 @@ fn diverged_repo() -> tempfile::TempDir {
     tmp
 }
 
-/// Run git in `dir` without an editor; true when it succeeded.
-fn git_succeeds(dir: &std::path::Path, args: &[&str]) -> bool {
-    std::process::Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .env("GIT_EDITOR", "true")
-        .output()
-        .unwrap()
-        .status
-        .success()
-}
-
 /// A repo with `seed.txt` changed and the Source Control panel open on it,
 /// ready to commit (#1241).
 fn scm_ready_to_commit() -> (tempfile::TempDir, App) {
@@ -733,13 +1080,7 @@ fn scm_with_unsaved_tab() -> (tempfile::TempDir, App) {
 }
 
 fn last_commit_message(root: &std::path::Path) -> String {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["log", "-1", "--format=%B"])
-        .output()
-        .unwrap();
-    String::from_utf8_lossy(&out.stdout).into_owned()
+    git_stdout_untrimmed(root, &["log", "-1", "--format=%B"])
 }
 
 fn editor_app_with_lines(lines: &[&str]) -> App {
@@ -818,6 +1159,16 @@ fn relay_test_lock() -> &'static std::sync::Mutex<()> {
 /// `relay_test_lock`.
 const TEST_RELAY_KEY: &str = "0123456789abcdef";
 
+/// Give `app` a settings folder of its own, empty, for as long as the
+/// returned folder lives. `App::new` keeps the developer's own folder as
+/// `config_dir`, and finishing or skipping the tour saves `tour_done` there,
+/// so a test that starts the tour would otherwise write into their settings.
+fn own_settings(app: &mut App) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    app.config_dir = dir.path().to_path_buf();
+    dir
+}
+
 fn with_relay_home<T>(home: &std::path::Path, body: impl FnOnce() -> T) -> T {
     // The cache dir is redirected through its test override instead of
     // repointing the process-global `$HOME` (#37): unrelated test threads
@@ -852,6 +1203,23 @@ fn with_relay_home<T>(home: &std::path::Path, body: impl FnOnce() -> T) -> T {
         std::env::set_var("CROFT_RELAY_KEY", TEST_RELAY_KEY);
     }
     body()
+}
+
+/// Puts the app's cache dir back when dropped, panic or not; made by
+/// [`override_cache_dir`].
+struct CacheDirOverride;
+
+impl Drop for CacheDirOverride {
+    fn drop(&mut self) {
+        *crate::paths::CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap() = None;
+    }
+}
+
+/// Points the app's cache dir at `dir` until the returned guard drops. The
+/// override is process-wide, so the caller holds [`relay_test_lock`].
+fn override_cache_dir(dir: PathBuf) -> CacheDirOverride {
+    *crate::paths::CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap() = Some(dir);
+    CacheDirOverride
 }
 
 /// Drop a fake `bin/python` shim in `dir/.venv/bin/python` so the venv
@@ -897,17 +1265,6 @@ fn vim_app(content: &str) -> (App, tempfile::TempDir) {
     app.focus = Pane::Editor;
     app.vim.enabled = true;
     (app, tmp)
-}
-
-fn vim_feed(app: &mut App, c: char) {
-    app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
-        .unwrap();
-}
-
-fn vim_feed_str(app: &mut App, s: &str) {
-    for c in s.chars() {
-        vim_feed(app, c);
-    }
 }
 
 /// The issue's repo (#1345): a committed `.vscode/settings.json` hides
@@ -1037,18 +1394,45 @@ fn left_click(app: &mut App, column: u16, row: u16) {
     });
 }
 
-fn draw(app: &mut App, w: u16, h: u16) {
-    let backend = ratatui::backend::TestBackend::new(w, h);
-    let mut term = ratatui::Terminal::new(backend).unwrap();
+// The screen helpers. Every `draw*` one renders a fresh frame of the size
+// its caller names; `screen_text`, `screen_char_rows`, `status_row` and
+// `find_painted` only read a terminal the test already drew.
+
+/// Draws `app` into a fresh `w` x `h` terminal and returns it, for a test
+/// that reads the frame or draws into it again.
+fn draw_terminal(
+    app: &mut App,
+    w: u16,
+    h: u16,
+) -> ratatui::Terminal<ratatui::backend::TestBackend> {
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
     term.draw(|f| app.render(f)).unwrap();
+    term
 }
 
-/// Render the app at 140x50 and clone the buffer for color probing.
-fn render_buf(app: &mut App) -> ratatui::buffer::Buffer {
-    let backend = ratatui::backend::TestBackend::new(140, 50);
-    let mut term = ratatui::Terminal::new(backend).unwrap();
-    term.draw(|f| app.render(f)).unwrap();
-    term.backend().buffer().clone()
+/// Draws `app` at `w` x `h` and throws the frame away, for what drawing
+/// records on the app (hit rects, laid-out areas) that a click or an
+/// assertion reads next.
+fn draw(app: &mut App, w: u16, h: u16) {
+    draw_terminal(app, w, h);
+}
+
+/// Draws `app` at `w` x `h` and returns the frame's cells, for colour and
+/// style probes.
+fn draw_buffer(app: &mut App, w: u16, h: u16) -> ratatui::buffer::Buffer {
+    draw_terminal(app, w, h).backend().buffer().clone()
+}
+
+/// Draws `app` at `w` x `h` and returns the frame as text, the way
+/// [`screen_text`] reads it.
+fn draw_screen(app: &mut App, w: u16, h: u16) -> String {
+    screen_text(&draw_terminal(app, w, h))
+}
+
+/// Draws `app` at `w` x `h` and finds the first cell where `needle` starts,
+/// the way [`find_painted`] does across the whole width.
+fn draw_and_find(app: &mut App, w: u16, h: u16, needle: &str) -> Option<(u16, u16)> {
+    find_painted(&draw_terminal(app, w, h), needle, 0..w)
 }
 
 fn count_bg(buf: &ratatui::buffer::Buffer, c: Color) -> usize {
@@ -1108,6 +1492,7 @@ fn cmd_shift_l(app: &mut App) {
     .unwrap();
 }
 
+/// Presses `c` with no modifier, as [`type_keys`] does for each character.
 fn type_char(app: &mut App, c: char) {
     app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
         .unwrap();
@@ -1211,10 +1596,7 @@ fn quick_open_typing(app: &mut App, typed: &str) {
     app.handle_key(key(KeyCode::Char('p'), KeyModifiers::SUPER))
         .unwrap();
     assert!(app.file_finder.is_some(), "Cmd+P opens Quick Open");
-    for c in typed.chars() {
-        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
-            .unwrap();
-    }
+    type_keys(app, typed);
 }
 
 /// A local-provider seat for tests: connects to the workspace relay but
@@ -1431,9 +1813,7 @@ fn app_with_baked_terminal_image(
     app.focus_pane(Pane::Terminal);
     app.inline_protocol = protocol;
     app.cell_pixel = Some((8, 16));
-    let backend = ratatui::backend::TestBackend::new(100, 30);
-    let mut term = ratatui::Terminal::new(backend).unwrap();
-    term.draw(|f| app.render(f)).unwrap();
+    draw(&mut app, 100, 30);
     // The pane owns a REAL shell, and its startup output arrives whenever the
     // machine gets round to it (#326). Every assertion built on this fixture
     // reads the picture's position, so a prompt landing after the bake scrolls
@@ -1474,19 +1854,8 @@ fn app_with_baked_terminal_image(
 /// A repo with a real merge conflict in `shared.txt` (two blocks) produced
 /// by an actual `git merge`, plus a clean second file.
 fn conflicted_repo(tmp: &std::path::Path) {
-    let git = |args: &[&str]| {
-        std::process::Command::new("git")
-            .arg("-C")
-            .arg(tmp)
-            .args(args)
-            .env("GIT_AUTHOR_NAME", "t")
-            .env("GIT_AUTHOR_EMAIL", "t@t")
-            .env("GIT_COMMITTER_NAME", "t")
-            .env("GIT_COMMITTER_EMAIL", "t@t")
-            .output()
-            .unwrap()
-    };
-    git(&["init", "-q", "-b", "main"]);
+    let git = |args: &[&str]| git_succeeds(tmp, args);
+    git_init(tmp);
     std::fs::write(
         tmp.join("shared.txt"),
         "alpha\nbase-one\nm1\nm2\nm3\nm4\nm5\nbase-two\nomega\n",
@@ -1509,9 +1878,8 @@ fn conflicted_repo(tmp: &std::path::Path) {
     )
     .unwrap();
     git(&["commit", "-aqm", "main edit"]);
-    let merge = git(&["merge", "feature"]);
     assert!(
-        !merge.status.success(),
+        !git(&["merge", "feature"]),
         "the merge must conflict for these tests"
     );
 }
@@ -1549,19 +1917,8 @@ fn wait_for_conflicted_entry(app: &mut App) -> usize {
 /// #1244: `gone.txt` deleted on one branch and modified on the other, mid
 /// `git merge feature`. `deleted_on_feature` picks which side deleted it.
 fn modify_delete_repo(tmp: &std::path::Path, deleted_on_feature: bool) {
-    let git = |args: &[&str]| {
-        std::process::Command::new("git")
-            .arg("-C")
-            .arg(tmp)
-            .args(args)
-            .env("GIT_AUTHOR_NAME", "t")
-            .env("GIT_AUTHOR_EMAIL", "t@t")
-            .env("GIT_COMMITTER_NAME", "t")
-            .env("GIT_COMMITTER_EMAIL", "t@t")
-            .output()
-            .unwrap()
-    };
-    git(&["init", "-q", "-b", "main"]);
+    let git = |args: &[&str]| git_succeeds(tmp, args);
+    git_init(tmp);
     std::fs::write(tmp.join("gone.txt"), "x\ny\n").unwrap();
     git(&["add", "-A"]);
     git(&["commit", "-qm", "base"]);
@@ -1581,18 +1938,7 @@ fn modify_delete_repo(tmp: &std::path::Path, deleted_on_feature: bool) {
         git(&["rm", "-q", "gone.txt"]);
         git(&["commit", "-qm", "delete"]);
     }
-    let merge = git(&["merge", "feature"]);
-    assert!(!merge.status.success(), "modify/delete must conflict");
-}
-
-fn git_out(tmp: &std::path::Path, args: &[&str]) -> String {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(tmp)
-        .args(args)
-        .output()
-        .unwrap();
-    String::from_utf8_lossy(&out.stdout).into_owned()
+    assert!(!git(&["merge", "feature"]), "modify/delete must conflict");
 }
 
 fn open_modify_delete(tmp: &std::path::Path, deleted_on_feature: bool) -> App {
@@ -1697,20 +2043,6 @@ fn app_with_symbol_tab_on_b(tmp: &tempfile::TempDir) -> (App, std::path::PathBuf
     (app, file)
 }
 
-fn painted(app: &mut App) -> String {
-    let backend = ratatui::backend::TestBackend::new(100, 30);
-    let mut term = ratatui::Terminal::new(backend).unwrap();
-    term.draw(|f| app.render(f)).unwrap();
-    let mut all = String::new();
-    for y in 0..30 {
-        for x in 0..100 {
-            all.push_str(term.backend().buffer()[(x, y)].symbol());
-        }
-        all.push('\n');
-    }
-    all
-}
-
 fn greet_to_welcome(
     file: &std::path::Path,
 ) -> Vec<(PathBuf, Vec<crate::widgets::editor::TextSpanEdit>)> {
@@ -1756,10 +2088,7 @@ fn type_a_header_line(app: &mut App) {
         .unwrap();
     app.handle_key(key(KeyCode::Up, KeyModifiers::NONE))
         .unwrap();
-    for c in "# header".chars() {
-        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
-            .unwrap();
-    }
+    type_keys(app, "# header");
 }
 
 // ---------------------------------------------------------------------------
@@ -1780,8 +2109,7 @@ fn app_with_terminal_panes(
     for _ in 1..n {
         app.split_terminal().unwrap();
     }
-    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 30)).unwrap();
-    term.draw(|f| app.render(f)).unwrap();
+    let term = draw_terminal(&mut app, 160, 30);
     (tmp, app, term)
 }
 
@@ -1802,34 +2130,12 @@ fn no_paths() -> std::collections::BTreeSet<std::path::PathBuf> {
 fn repo_with_seed(text: &str) -> (tempfile::TempDir, std::path::PathBuf) {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().to_path_buf();
-    for args in [
-        vec!["init", "-q", "-b", "main"],
-        vec!["config", "user.email", "a@b"],
-        vec!["config", "user.name", "a"],
-    ] {
-        let st = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&root)
-            .args(&args)
-            .status()
-            .unwrap();
-        assert!(st.success(), "git {args:?}");
-    }
+    git_init_with_identity(&root);
     let f = root.join("seed.txt");
     std::fs::write(&f, text).unwrap();
     git_ok(&root, &["add", "."]);
     git_ok(&root, &["commit", "-m", "init", "--quiet"]);
     (tmp, f)
-}
-
-fn git_ok(root: &std::path::Path, args: &[&str]) {
-    let st = std::process::Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(args)
-        .status()
-        .unwrap();
-    assert!(st.success(), "git {args:?}");
 }
 
 /// Write `text` to `path` so that its `(mtime, len)` stamp differs from the
@@ -1862,21 +2168,10 @@ fn rewrite_later(path: &std::path::Path, text: &str) {
 /// tempdir to keep the lane inside it too.
 fn init_lane_repo(dir: &std::path::Path) {
     std::fs::create_dir_all(dir).unwrap();
-    let git = |args: &[&str]| {
-        let st = std::process::Command::new("git")
-            .arg("-C")
-            .arg(dir)
-            .args(args)
-            .status()
-            .unwrap();
-        assert!(st.success(), "git {args:?}");
-    };
-    git(&["init", "-q", "-b", "main"]);
-    git(&["config", "user.email", "a@b"]);
-    git(&["config", "user.name", "a"]);
+    git_init_with_identity(dir);
     std::fs::write(dir.join("seed.txt"), "one\n").unwrap();
-    git(&["add", "."]);
-    git(&["commit", "-q", "-m", "init"]);
+    git_ok(dir, &["add", "."]);
+    git_ok(dir, &["commit", "-q", "-m", "init"]);
 }
 
 /// Queue an agent's `Edit` of `file` (`old` -> `new`) through the hook
@@ -2094,20 +2389,8 @@ fn lens_at(line: usize, text: &str, title: &str, command: &str) -> crate::code_l
 /// v1+v2+v3.
 fn scrub_repo() -> tempfile::TempDir {
     let tmp = tempfile::tempdir().unwrap();
-    let git = |args: &[&str]| {
-        let ok = std::process::Command::new("git")
-            .arg("-C")
-            .arg(tmp.path())
-            .args(args)
-            .output()
-            .unwrap()
-            .status
-            .success();
-        assert!(ok, "git {args:?}");
-    };
-    git(&["init", "-q", "-b", "main"]);
-    git(&["config", "user.email", "a@b"]);
-    git(&["config", "user.name", "a"]);
+    let git = |args: &[&str]| git_ok(tmp.path(), args);
+    git_init_with_identity(tmp.path());
     let mut text = String::new();
     for v in ["v1", "v2", "v3"] {
         text.push_str(v);
@@ -2287,6 +2570,9 @@ fn sarif_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
     (tmp, log)
 }
 
+/// Every cell of a frame the test already drew, row after row, each row
+/// ending in a newline. A cell adds its whole symbol, so a wide or empty
+/// cell shifts the columns after it; [`screen_char_rows`] keeps them.
 fn screen_text(term: &ratatui::Terminal<ratatui::backend::TestBackend>) -> String {
     let buf = term.backend().buffer();
     let mut all = String::new();
@@ -2297,6 +2583,19 @@ fn screen_text(term: &ratatui::Terminal<ratatui::backend::TestBackend>) -> Strin
         all.push('\n');
     }
     all
+}
+
+/// The rows of a frame the test already drew, one char per cell (the first
+/// of its symbol, a space for an empty one), so a char index is a column.
+fn screen_char_rows(term: &ratatui::Terminal<ratatui::backend::TestBackend>) -> Vec<String> {
+    let buf = term.backend().buffer();
+    (0..buf.area.height)
+        .map(|y| {
+            (0..buf.area.width)
+                .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
+                .collect()
+        })
+        .collect()
 }
 
 /// A stand-in `codeql`: logs its arguments, writes `body` to the path its
@@ -2404,12 +2703,6 @@ for a in args:
     program
 }
 
-fn draw_screen(app: &mut App) -> String {
-    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 40)).unwrap();
-    term.draw(|f| app.render(f)).unwrap();
-    screen_text(&term)
-}
-
 /// Two results in one file and one in another, for navigation.
 fn sarif_nav_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
     let tmp = tempfile::tempdir().unwrap();
@@ -2465,6 +2758,7 @@ fn codeql_run_on(tmp: &std::path::Path, db: &std::path::Path) -> PathBuf {
 
 const WEB_PY_1369: &str = "import sqlite3\n\ndef q(cur, name):\n    cur.execute(name)\n";
 
+/// The bottom row of a frame the test already drew: the status bar.
 fn status_row(term: &ratatui::Terminal<ratatui::backend::TestBackend>) -> String {
     let buf = term.backend().buffer();
     let y = buf.area.height - 1;
@@ -2525,21 +2819,6 @@ fn assert_one_line_858(app: &App) {
     }
 }
 
-/// Every cell of a drawn frame, row after row.
-fn screen_text_863(app: &mut App, w: u16, h: u16) -> String {
-    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
-    term.draw(|f| app.render(f)).unwrap();
-    let buf = term.backend().buffer();
-    let mut screen = String::new();
-    for y in 0..buf.area.height {
-        for x in 0..buf.area.width {
-            screen.push_str(buf[(x, y)].symbol());
-        }
-        screen.push('\n');
-    }
-    screen
-}
-
 /// #1203: open `notes/plan.md`, type a line, then take its folder away the
 /// way `git checkout` of a branch without it does.
 fn app_with_plan_whose_folder_was_removed(tmp: &std::path::Path) -> App {
@@ -2579,14 +2858,6 @@ fn revert_file(app: &mut App) {
     app.run_command(cmd);
 }
 
-/// Types `text` into whatever overlay has the keyboard, one key at a time.
-fn type_keys_852(app: &mut App, text: &str) {
-    for c in text.chars() {
-        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
-            .unwrap();
-    }
-}
-
 /// Opens the Command Palette with `Cmd+Shift+P`, as a user would.
 fn open_palette_852(app: &mut App) {
     app.handle_key(key(
@@ -2598,14 +2869,6 @@ fn open_palette_852(app: &mut App) {
         app.command_palette.is_some(),
         "Cmd+Shift+P opens the palette"
     );
-}
-
-/// Renders `app` at `w`x`h` and returns the frame's buffer.
-fn render_buffer_852(app: &mut App, w: u16, h: u16) -> ratatui::buffer::Buffer {
-    let backend = ratatui::backend::TestBackend::new(w, h);
-    let mut term = ratatui::Terminal::new(backend).unwrap();
-    term.draw(|f| app.render(f)).unwrap();
-    term.backend().buffer().clone()
 }
 
 // #852 (comment 3): the editor-tab actions (the tab menu's Close Others,
@@ -2645,10 +2908,12 @@ fn tab_names_852(tabs: &crate::widgets::editor::EditorTabs) -> Vec<String> {
 }
 
 /// Runs `query` from the palette as a user does: `Cmd+Shift+P`, type it,
-/// Enter. Returns the title of the row Enter ran, `None` when none matched.
-fn run_in_palette_852(app: &mut App, query: &str) -> Option<String> {
+/// Enter on whatever row the search put on top, whatever its title. Returns
+/// the title of the row Enter ran, `None` when none matched.
+/// [`run_palette_row_titled`] picks the row by its exact title instead.
+fn run_palette_top_match(app: &mut App, query: &str) -> Option<String> {
     open_palette_852(app);
-    type_keys_852(app, query);
+    type_keys(app, query);
     let ran = app
         .command_palette
         .as_ref()
@@ -2785,8 +3050,7 @@ fn wide_line_app(tmp: &std::path::Path) -> (App, ratatui::Terminal<ratatui::back
     );
     let mut app = app_with_open_file(tmp, "h300.txt", &format!("{line}\nshort\n"));
     app.focus_pane(Pane::Editor);
-    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
-    term.draw(|frame| app.render(frame)).unwrap();
+    let term = draw_terminal(&mut app, 100, 30);
     (app, term)
 }
 
@@ -2797,8 +3061,8 @@ fn encoded_repo(name: &str, head: &[u8], added: &[u8]) -> (tempfile::TempDir, st
     let tmp = make_committed_repo();
     let f = tmp.path().join(name);
     std::fs::write(&f, head).unwrap();
-    git_stdout_in(tmp.path(), &["add", name]);
-    git_stdout_in(tmp.path(), &["commit", "-qm", "encoded"]);
+    let _ = git_succeeds(tmp.path(), &["add", name]);
+    let _ = git_succeeds(tmp.path(), &["commit", "-qm", "encoded"]);
     std::fs::write(&f, [head, added].concat()).unwrap();
     (tmp, f)
 }
@@ -2832,11 +3096,24 @@ fn app_with_a_disk_conflict(tmp: &std::path::Path) -> (App, std::path::PathBuf) 
     (app, f)
 }
 
+/// Types `text` one unmodified keystroke per character through
+/// `App::handle_key`, into whatever has the keyboard: the editor (which
+/// leaves its buffer dirty), a palette, a picker, the find bar or Vim.
 fn type_keys(app: &mut App, text: &str) {
     for c in text.chars() {
-        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
-            .unwrap();
+        type_char(app, c);
     }
+}
+
+/// Pushes `text` one char at a time onto the end of the open input prompt's
+/// value, not as keystrokes through `App::handle_key` the way [`type_keys`]
+/// does, then submits it. `replace_and_submit_prompt` in the debug tests
+/// replaces the value instead.
+fn append_and_submit_prompt(app: &mut App, text: &str) {
+    for c in text.chars() {
+        app.input_prompt.as_mut().unwrap().push_char(c);
+    }
+    app.submit_input_prompt();
 }
 
 // ---- Find bar seeding selects the word under the caret (#1278) ----
@@ -2860,13 +3137,6 @@ fn find_seed_app(row: usize, col: usize) -> (App, tempfile::TempDir) {
 
 fn ctrl(c: char) -> KeyEvent {
     key(KeyCode::Char(c), KeyModifiers::CONTROL)
-}
-
-fn type_str(app: &mut App, s: &str) {
-    for c in s.chars() {
-        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
-            .unwrap();
-    }
 }
 
 fn find_query(app: &App) -> String {
@@ -2976,7 +3246,7 @@ fn app_with_a_saved_edit() -> (tempfile::TempDir, std::path::PathBuf, App) {
     app.editor.open_pinned(&a).unwrap();
     app.focus_pane(Pane::Editor);
     app.handle_editor_key(key(KeyCode::End, KeyModifiers::NONE));
-    type_str(&mut app, "00");
+    type_keys(&mut app, "00");
     app.handle_key(ctrl('s')).unwrap();
     assert_eq!(std::fs::read_to_string(&a).unwrap(), "value = 100\n");
     assert!(!app.editor.dirty);
@@ -2988,17 +3258,8 @@ fn app_with_a_saved_edit() -> (tempfile::TempDir, std::path::PathBuf, App) {
 fn app_on_a_pushed_github_file() -> (App, tempfile::TempDir, String) {
     let tmp = tempfile::tempdir().unwrap();
     let p = tmp.path();
-    let git = |args: &[&str]| {
-        let out = std::process::Command::new("git")
-            .arg("-C")
-            .arg(p)
-            .args(args)
-            .output()
-            .unwrap();
-        assert!(out.status.success(), "git {args:?}");
-        String::from_utf8_lossy(&out.stdout).trim().to_string()
-    };
-    git(&["init", "-q", "-b", "main"]);
+    let git = |args: &[&str]| git_ok(p, args);
+    git_init(p);
     std::fs::create_dir(p.join("src")).unwrap();
     std::fs::write(
         p.join("src/main.rs"),
@@ -3006,15 +3267,7 @@ fn app_on_a_pushed_github_file() -> (App, tempfile::TempDir, String) {
     )
     .unwrap();
     git(&["add", "."]);
-    git(&[
-        "-c",
-        "user.name=t",
-        "-c",
-        "user.email=t@t",
-        "commit",
-        "-qm",
-        "init",
-    ]);
+    git(&["commit", "-qm", "init"]);
     git(&["remote", "add", "origin", "git@github.com:acme/widgets.git"]);
     git(&["update-ref", "refs/remotes/origin/main", "HEAD"]);
     let sha = git(&["rev-parse", "HEAD"]);

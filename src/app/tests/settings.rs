@@ -45,6 +45,61 @@ fn black_theme_context_menu_uses_gradient_border_and_muted_selection() {
     assert_eq!(buf[(11, 11)].bg, rgb_color(POPUP_SEL_BG));
 }
 
+/// Croft Loch draws a context menu as a raised card: the selected row is
+/// the band with the accent bar on the card's edge, a separator runs from
+/// rim to rim, and a shortcut is keycaps the panel is widened to hold.
+#[test]
+fn croft_loch_context_menu_is_a_card_with_keycaps_and_a_selected_bar() {
+    use crate::widgets::surface;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.theme = crate::theme::Theme::from_id("loch");
+    let t = surface::tones(app.theme).unwrap();
+    let mut menu = ContextMenu::flat(
+        (10, 10),
+        vec![
+            (
+                String::from("New File"),
+                MenuAction::Create(CreateKind::File),
+            ),
+            (
+                String::from("New Folder"),
+                MenuAction::Create(CreateKind::Folder),
+            ),
+        ],
+        tmp.path().to_path_buf(),
+    );
+    menu.items.insert(1, MenuEntry::Separator);
+    app.context_menu = Some(menu);
+    let backend = ratatui::backend::TestBackend::new(140, 50);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let buf = term.backend().buffer();
+    let r = app.menu_rect().unwrap();
+    // The selected (first) row: the bar on the card's edge, the band.
+    assert_eq!(buf[(r.x, r.y + 1)].symbol(), surface::ROW_BAR);
+    assert_eq!(buf[(r.x, r.y + 1)].fg, t.accent());
+    assert_eq!(buf[(r.x + 2, r.y + 1)].bg, t.band());
+    // The separator meets the rim on both sides.
+    for x in r.x..r.right() {
+        assert_eq!(buf[(x, r.y + 2)].symbol(), "\u{2500}", "({x}) on the rule");
+    }
+    // New Folder's shortcut is keycaps, inside the panel.
+    let hint = menu_hint(&MenuAction::Create(CreateKind::Folder), &app.keymap).unwrap();
+    let caps: u16 = surface::keycap_spans(&hint, t, t.raised(), false)
+        .iter()
+        .map(|s| s.width() as u16)
+        .sum();
+    assert!(r.width >= "New Folder".len() as u16 + caps + 4, "{r:?}");
+    let cap_bg = t.keycap_on(t.raised());
+    assert!((r.x..r.right()).any(|x| buf[(x, r.y + 3)].bg == cap_bg));
+    assert_eq!(
+        buf[(r.right() - 1, r.y + 3)].symbol(),
+        "\u{2595}",
+        "rim kept"
+    );
+}
+
 #[test]
 fn black_theme_status_bar_is_near_black_not_navy() {
     let tmp = tempfile::tempdir().unwrap();
@@ -479,7 +534,7 @@ fn a_settings_reload_keeps_the_current_vim_mode() {
         ..Default::default()
     };
     app.apply_merged_settings(&on);
-    vim_feed(&mut app, 'i');
+    type_char(&mut app, 'i');
     assert_eq!(app.vim.mode(), crate::vim::VimMode::Insert);
     app.apply_merged_settings(&on);
     assert!(app.vim.enabled);
@@ -578,9 +633,7 @@ fn a_vscode_exclude_of_build_keeps_scripts_build_in_the_explorer() {
 
 /// Render once and return (title 'T' cell coords, add-button rect).
 fn terminal_header_probe(app: &mut App) -> Rect {
-    let backend = ratatui::backend::TestBackend::new(140, 50);
-    let mut term = ratatui::Terminal::new(backend).unwrap();
-    term.draw(|f| app.render(f)).unwrap();
+    draw(app, 140, 50);
     let area = app.terminal().last_area;
     assert!(
         area.width > 20 && area.height > 2,
@@ -594,6 +647,7 @@ fn black_theme_terminal_buttons_are_teal_icons_not_navy_chips() {
     use crate::gradient::{INNER_ACCENT, rgb_color};
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.apply_theme(crate::theme::Theme::BLACK);
     let add = terminal_header_probe(&mut app);
     let backend = ratatui::backend::TestBackend::new(140, 50);
     let mut term = ratatui::Terminal::new(backend).unwrap();
@@ -614,6 +668,7 @@ fn black_theme_terminal_button_hover_paints_teal_pill() {
     use crate::gradient::{POPUP_SEL_BG, rgb_color};
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.apply_theme(crate::theme::Theme::BLACK);
     let add = terminal_header_probe(&mut app);
     app.handle_mouse(crossterm::event::MouseEvent {
         kind: crossterm::event::MouseEventKind::Moved,
@@ -632,6 +687,33 @@ fn black_theme_terminal_button_hover_paints_teal_pill() {
         "hovered button wears the teal pill"
     );
     assert_eq!(buf[plus].fg, Color::White);
+}
+
+#[test]
+fn croft_loch_terminal_buttons_are_muted_until_hovered() {
+    let t = crate::widgets::surface::tones(crate::theme::Theme::LOCH).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let add = terminal_header_probe(&mut app);
+    let backend = ratatui::backend::TestBackend::new(140, 50);
+    let mut term = ratatui::Terminal::new(backend).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let plus = (add.x + 1, add.y);
+    assert_eq!(
+        term.backend().buffer()[plus].fg,
+        t.muted(),
+        "idle: muted, not the accent"
+    );
+    app.handle_mouse(crossterm::event::MouseEvent {
+        kind: crossterm::event::MouseEventKind::Moved,
+        column: add.x + 1,
+        row: add.y,
+        modifiers: KeyModifiers::NONE,
+    });
+    term.draw(|f| app.render(f)).unwrap();
+    let cell = &term.backend().buffer()[plus];
+    assert_eq!(cell.fg, t.strong(), "hover lifts the icon");
+    assert_eq!(cell.bg, t.hover_on(t.chrome), "onto a faint chip");
 }
 
 #[test]
@@ -674,7 +756,7 @@ fn black_theme_paints_no_legacy_navy_or_button_blue_in_any_sidebar_view() {
         SidebarView::RunDebug,
     ] {
         app.sidebar_view = view;
-        let buf = render_buf(&mut app);
+        let buf = draw_buffer(&mut app, 140, 50);
         assert_eq!(
             count_bg(&buf, navy),
             0,
@@ -693,15 +775,65 @@ fn black_theme_sidebar_titles_are_chipless_brand_headers() {
     use crate::gradient::{PANEL_TITLE_FG, rgb_color};
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    let buf = render_buf(&mut app);
+    app.apply_theme(crate::theme::Theme::BLACK);
+    let buf = draw_buffer(&mut app, 140, 50);
     let tree = app.tree.last_area;
     assert_eq!(buf[(tree.x + 2, tree.y)].symbol(), "E");
     assert_eq!(buf[(tree.x + 2, tree.y)].fg, rgb_color(PANEL_TITLE_FG));
     app.sidebar_view = SidebarView::Remote;
-    let buf = render_buf(&mut app);
+    let buf = draw_buffer(&mut app, 140, 50);
     let remote = app.remote.last_area;
     assert_eq!(buf[(remote.x + 2, remote.y)].symbol(), "R");
     assert_eq!(buf[(remote.x + 2, remote.y)].fg, rgb_color(PANEL_TITLE_FG));
+}
+
+/// Croft Loch's side bar titles say where focus is: EXPLORER in the strong
+/// ink while the tree has the keyboard and muted once it moves on, never
+/// bold, with the accent lip starting a cell past the title.
+#[test]
+fn croft_loch_side_bar_title_is_strong_only_while_focused() {
+    let t = crate::widgets::surface::tones(crate::theme::Theme::LOCH).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let buf = draw_buffer(&mut app, 140, 50);
+    let tree = app.tree.last_area;
+    let e = (tree.x + 2, tree.y);
+    assert_eq!(buf[e].symbol(), "E");
+    assert_eq!(buf[e].fg, t.strong(), "the focused view's title");
+    assert!(!buf[e].modifier.contains(Modifier::BOLD));
+    assert_eq!(buf[(tree.x + 10, tree.y)].symbol(), " ", "breathing room");
+    assert_eq!(buf[(tree.x + 11, tree.y)].symbol(), "\u{2594}", "the lip");
+    app.focus_pane(Pane::Editor);
+    let buf = draw_buffer(&mut app, 140, 50);
+    assert_eq!(buf[e].fg, t.muted(), "an unfocused view's title recedes");
+}
+
+/// Croft Loch: a hairline closes the tree off from the stacked section
+/// under it, the same seam every section draws below itself, and the
+/// section headers wear the muted codicon chevron.
+#[test]
+fn croft_loch_explorer_sections_are_divided_by_hairlines() {
+    let t = crate::widgets::surface::tones(crate::theme::Theme::LOCH).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("a.txt"), "x\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open_pinned(&tmp.path().join("a.txt")).unwrap();
+    if !app.explorer_views.is_visible(ExplorerView::Outline) {
+        app.toggle_explorer_view(ExplorerView::Outline);
+    }
+    let buf = draw_buffer(&mut app, 140, 50);
+    let tree = app.tree.last_area;
+    let outline = app.outline.last_area;
+    assert_eq!(outline.y, tree.bottom(), "the outline follows the tree");
+    let seam = (tree.x + 3, tree.bottom() - 1);
+    assert_eq!(buf[seam].symbol(), "\u{2581}", "a hairline under the tree");
+    assert_eq!(buf[seam].fg, t.hairline());
+    let chevron = (outline.x + 1, outline.y);
+    assert_eq!(
+        buf[chevron].symbol(),
+        crate::widgets::surface::CHEVRON_FOLDED.to_string()
+    );
+    assert_eq!(buf[chevron].fg, t.muted());
 }
 
 /// #1583: a German catalog for the frame's own titles, as a translator
@@ -857,8 +989,9 @@ fn black_theme_remote_header_buttons_are_near_white_icons() {
     use crate::gradient::{PANEL_TITLE_FG, rgb_color};
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.apply_theme(crate::theme::Theme::BLACK);
     app.sidebar_view = SidebarView::Remote;
-    let buf = render_buf(&mut app);
+    let buf = draw_buffer(&mut app, 140, 50);
     let add = app.remote.header_add_btn;
     assert!(add.width > 0, "remote header add button must render");
     // The snug pill paints the glyph at the rect origin (the highlight wraps
@@ -868,6 +1001,21 @@ fn black_theme_remote_header_buttons_are_near_white_icons() {
     assert_eq!(buf[(add.x, add.y)].fg, rgb_color(PANEL_TITLE_FG));
 }
 
+/// Croft Loch's view header buttons (Remote's `+` and refresh, Source
+/// Control's refresh and `⋯`) rest as muted icons, not bold near-white.
+#[test]
+fn croft_loch_side_bar_header_buttons_rest_muted() {
+    let t = crate::widgets::surface::tones(crate::theme::Theme::LOCH).unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.sidebar_view = SidebarView::Remote;
+    let buf = draw_buffer(&mut app, 140, 50);
+    let add = app.remote.header_add_btn;
+    assert!(add.width > 0, "remote header add button must render");
+    assert_eq!(buf[(add.x, add.y)].fg, t.muted());
+    assert!(!buf[(add.x, add.y)].modifier.contains(Modifier::BOLD));
+}
+
 #[test]
 fn black_theme_active_editor_tab_wears_the_teal_selection_fill() {
     use crate::gradient::{POPUP_SEL_BG, rgb_color};
@@ -875,8 +1023,9 @@ fn black_theme_active_editor_tab_wears_the_teal_selection_fill() {
     let f = tmp.path().join("probe.txt");
     std::fs::write(&f, "alpha\n").unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.apply_theme(crate::theme::Theme::BLACK);
     app.editor.open_pinned(&f).unwrap();
-    let buf = render_buf(&mut app);
+    let buf = draw_buffer(&mut app, 140, 50);
     assert!(
         count_bg(&buf, rgb_color(POPUP_SEL_BG)) > 0,
         "active tab must wear the muted teal fill under the Black theme"
@@ -889,7 +1038,7 @@ fn black_theme_action_buttons_wear_the_brand_teal_fill() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.sidebar_view = SidebarView::SourceControl;
-    let buf = render_buf(&mut app);
+    let buf = draw_buffer(&mut app, 140, 50);
     let init = app.source_control.last_init_repo_button_area;
     assert!(
         init.width > 0,
@@ -900,7 +1049,7 @@ fn black_theme_action_buttons_wear_the_brand_teal_fill() {
         rgb_color(PRIMARY_BTN_BG)
     );
     app.sidebar_view = SidebarView::RunDebug;
-    let buf = render_buf(&mut app);
+    let buf = draw_buffer(&mut app, 140, 50);
     let run = app.run_debug.last_button_area;
     assert!(run.width > 0, "Run and Debug button must render");
     assert_eq!(
@@ -918,7 +1067,7 @@ fn dark_blue_theme_keeps_the_legacy_blue_chrome() {
     app.theme = crate::theme::Theme::DARK_BLUE;
     app.sync_focus_flags();
     app.editor.open_pinned(&f).unwrap();
-    let buf = render_buf(&mut app);
+    let buf = draw_buffer(&mut app, 140, 50);
     let navy = Color::Rgb(0x1e, 0x3a, 0x6e);
     let tree = app.tree.last_area;
     assert_eq!(
@@ -928,7 +1077,7 @@ fn dark_blue_theme_keeps_the_legacy_blue_chrome() {
     );
     assert!(count_bg(&buf, navy) > 0, "active tab stays navy");
     app.sidebar_view = SidebarView::RunDebug;
-    let buf = render_buf(&mut app);
+    let buf = draw_buffer(&mut app, 140, 50);
     let run = app.run_debug.last_button_area;
     assert_eq!(
         buf[(run.x + run.width / 2, run.y + run.height / 2)].bg,
@@ -1679,13 +1828,6 @@ fn settings_editor_app(cfg: &std::path::Path, tmp: &std::path::Path) -> App {
     app
 }
 
-fn type_query(app: &mut App, q: &str) {
-    for c in q.chars() {
-        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
-            .unwrap();
-    }
-}
-
 #[test]
 fn the_settings_editor_flips_a_setting_into_the_user_layer_and_applies_it() {
     // #612: search a setting, Enter edits it in place, the file and the live
@@ -1714,7 +1856,7 @@ fn the_settings_editor_flips_a_setting_into_the_user_layer_and_applies_it() {
         .cloned()
         .unwrap();
     assert_eq!(copy.layer, crate::config_layers::LayerKind::Workspace);
-    type_query(&mut app, "auto save");
+    type_keys(&mut app, "auto save");
     let row = app
         .settings_editor
         .as_ref()
@@ -1770,7 +1912,7 @@ fn del_resets_a_toggled_setting_and_drops_its_key() {
     )
     .unwrap();
     let mut app = settings_editor_app(cfg.path(), tmp.path());
-    type_query(&mut app, "auto save on focus change");
+    type_keys(&mut app, "auto save on focus change");
     assert_eq!(
         selected_setting(&app).layer,
         crate::config_layers::LayerKind::User
@@ -1801,7 +1943,7 @@ fn del_resets_a_number_setting_to_its_default() {
     )
     .unwrap();
     let mut app = settings_editor_app(cfg.path(), tmp.path());
-    type_query(&mut app, "terminal scrollback");
+    type_keys(&mut app, "terminal scrollback");
     app.handle_key(key(KeyCode::Delete, KeyModifiers::NONE))
         .unwrap();
     let written = user_config(cfg.path());
@@ -1829,7 +1971,7 @@ fn resetting_the_user_value_leaves_the_workspace_one_in_force() {
     )
     .unwrap();
     let mut app = settings_editor_app(cfg.path(), tmp.path());
-    type_query(&mut app, "copy on select");
+    type_keys(&mut app, "copy on select");
     app.handle_key(key(KeyCode::Delete, KeyModifiers::NONE))
         .unwrap();
     assert!(user_config(cfg.path()).get("copy_on_select").is_none());
@@ -1851,7 +1993,7 @@ fn del_on_a_setting_the_layer_does_not_set_writes_nothing() {
     let cfg = tempfile::tempdir().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let mut app = settings_editor_app(cfg.path(), tmp.path());
-    type_query(&mut app, "copy on select");
+    type_keys(&mut app, "copy on select");
     app.handle_key(key(KeyCode::Delete, KeyModifiers::NONE))
         .unwrap();
     assert!(!cfg.path().join("config.json").exists());
@@ -1890,8 +2032,8 @@ fn the_settings_editor_marks_changed_rows_and_shows_del_reset() {
     )
     .unwrap();
     let mut app = settings_editor_app(cfg.path(), tmp.path());
-    type_query(&mut app, "auto save");
-    let buf = render_buf(&mut app);
+    type_keys(&mut app, "auto save");
+    let buf = draw_buffer(&mut app, 140, 50);
     let lines: Vec<String> = (0..buf.area.height)
         .map(|y| {
             (0..buf.area.width)
@@ -1928,7 +2070,7 @@ fn the_settings_editor_writes_the_workspace_layer_only_for_allowed_keys() {
         app.settings_editor.as_ref().unwrap().target,
         crate::config_layers::LayerKind::Workspace
     );
-    type_query(&mut app, "format on save");
+    type_keys(&mut app, "format on save");
     app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
         .unwrap();
     let ws: serde_json::Value = serde_json::from_str(
@@ -1945,7 +2087,7 @@ fn the_settings_editor_writes_the_workspace_layer_only_for_allowed_keys() {
         app.handle_key(key(KeyCode::Backspace, KeyModifiers::NONE))
             .unwrap();
     }
-    type_query(&mut app, "sidebar auto hide");
+    type_keys(&mut app, "sidebar auto hide");
     app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
         .unwrap();
     assert!(app.status.contains("user"), "{}", app.status);
@@ -2012,7 +2154,7 @@ fn the_settings_editor_writes_the_active_profile_s_config() {
     let cfg = tempfile::tempdir().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let mut app = settings_editor_app_in_profile(cfg.path(), tmp.path());
-    type_query(&mut app, "auto save");
+    type_keys(&mut app, "auto save");
     assert_eq!(
         app.settings_editor
             .as_ref()
@@ -2058,7 +2200,7 @@ fn the_settings_editor_header_names_the_active_profile() {
     let cfg = tempfile::tempdir().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let mut app = settings_editor_app_in_profile(cfg.path(), tmp.path());
-    let text = screen_text_863(&mut app, 140, 40);
+    let text = draw_screen(&mut app, 140, 40);
     assert!(text.contains("profile work"), "{text}");
 }
 
@@ -2084,7 +2226,7 @@ fn without_a_profile_the_settings_editor_keeps_the_default_config() {
         settings_row(&app, "auto_save").value,
         serde_json::json!(false)
     );
-    type_query(&mut app, "auto save");
+    type_keys(&mut app, "auto save");
     app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
         .unwrap();
     let written: serde_json::Value =
@@ -2096,7 +2238,7 @@ fn without_a_profile_the_settings_editor_keeps_the_default_config() {
         "{ \"auto_save\": true }",
         "the profile's file is untouched"
     );
-    let text = screen_text_863(&mut app, 140, 40);
+    let text = draw_screen(&mut app, 140, 40);
     assert!(text.contains("Writing to user (config.json)"), "{text}");
 }
 
@@ -2105,7 +2247,7 @@ fn the_settings_editor_asks_for_a_number_and_refuses_one_that_is_not() {
     let cfg = tempfile::tempdir().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let mut app = settings_editor_app(cfg.path(), tmp.path());
-    type_query(&mut app, "terminal scrollback");
+    type_keys(&mut app, "terminal scrollback");
     app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
         .unwrap();
     assert!(matches!(
@@ -2123,10 +2265,6 @@ fn the_settings_editor_asks_for_a_number_and_refuses_one_that_is_not() {
     assert_eq!(written["terminal_scrollback"], serde_json::json!(5000));
 }
 
-fn written_settings(cfg: &std::path::Path) -> serde_json::Value {
-    serde_json::from_str(&std::fs::read_to_string(cfg.join("config.json")).unwrap()).unwrap()
-}
-
 /// #1555: Enter on the unset UI language picks a language in place; it used
 /// to close the editor and open `config.json` at line 1.
 #[test]
@@ -2134,11 +2272,11 @@ fn enter_on_the_unset_language_picks_one_in_the_editor() {
     let cfg = tempfile::tempdir().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let mut app = settings_editor_app(cfg.path(), tmp.path());
-    type_query(&mut app, "locale");
+    type_keys(&mut app, "locale");
     app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
         .unwrap();
     assert!(app.settings_editor.is_some(), "still in the editor");
-    let lang = written_settings(cfg.path())["locale"].clone();
+    let lang = user_config(cfg.path())["locale"].clone();
     assert!(lang.is_string(), "a language was set: {lang}");
     let row = app
         .settings_editor
@@ -2157,7 +2295,7 @@ fn an_unset_number_setting_takes_a_number_and_an_empty_entry_unsets_it() {
     let cfg = tempfile::tempdir().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let mut app = settings_editor_app(cfg.path(), tmp.path());
-    type_query(&mut app, "terminal rewind");
+    type_keys(&mut app, "terminal rewind");
     app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
         .unwrap();
     assert!(matches!(
@@ -2172,11 +2310,11 @@ fn an_unset_number_setting_takes_a_number_and_an_empty_entry_unsets_it() {
     app.close_input_prompt();
     app.submit_setting_value("terminal_rewind_mb", "500");
     assert_eq!(
-        written_settings(cfg.path())["terminal_rewind_mb"],
+        user_config(cfg.path())["terminal_rewind_mb"],
         serde_json::json!(500)
     );
     app.submit_setting_value("terminal_rewind_mb", "");
-    let written = written_settings(cfg.path());
+    let written = user_config(cfg.path());
     assert!(
         written.get("terminal_rewind_mb").is_none(),
         "unset, so its default applies: {written}"
@@ -2194,12 +2332,12 @@ fn a_value_the_setting_cannot_hold_is_refused() {
     app.write_setting("code_scanning", serde_json::json!("enabled"));
     assert!(app.status.contains("can't be enabled"), "{}", app.status);
     assert!(!cfg.path().join("config.json").exists());
-    type_query(&mut app, "code scanning");
+    type_keys(&mut app, "code scanning");
     app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
         .unwrap();
     assert!(app.input_prompt.is_none(), "a choice: no free text to type");
     assert_eq!(
-        written_settings(cfg.path())["code_scanning"],
+        user_config(cfg.path())["code_scanning"],
         serde_json::json!("on")
     );
 }
@@ -2220,7 +2358,7 @@ fn a_list_setting_opens_its_layer_file_at_the_key() {
     let mut app = settings_editor_app(cfg.path(), tmp.path());
     app.handle_key(key(KeyCode::Tab, KeyModifiers::NONE))
         .unwrap();
-    type_query(&mut app, "files_exclude");
+    type_keys(&mut app, "files_exclude");
     app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
         .unwrap();
     assert!(app.settings_editor.is_none());
@@ -2246,7 +2384,7 @@ fn a_list_setting_in_the_user_layer_opens_the_user_file_at_the_key() {
     )
     .unwrap();
     let mut app = settings_editor_app(cfg.path(), tmp.path());
-    type_query(&mut app, "search exclude");
+    type_keys(&mut app, "search exclude");
     app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
         .unwrap();
     let opened = app.editor.path.clone().unwrap();
@@ -2270,7 +2408,7 @@ fn confirming_an_empty_review_prefix_keeps_it_empty() {
     )
     .unwrap();
     let mut app = settings_editor_app(cfg.path(), tmp.path());
-    type_query(&mut app, "review_ai_prefix");
+    type_keys(&mut app, "review_ai_prefix");
     app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
         .unwrap();
     let prompt = app.input_prompt.as_ref().expect("a text prompt");
@@ -2279,7 +2417,7 @@ fn confirming_an_empty_review_prefix_keeps_it_empty() {
     app.close_input_prompt();
     app.submit_setting_value("review_ai_prefix", &value);
     assert_eq!(
-        written_settings(cfg.path())["review_ai_prefix"],
+        user_config(cfg.path())["review_ai_prefix"],
         serde_json::json!("")
     );
 }
@@ -2291,11 +2429,11 @@ fn the_settings_editor_draws_its_value_prompt_on_top() {
     let cfg = tempfile::tempdir().unwrap();
     let tmp = tempfile::tempdir().unwrap();
     let mut app = settings_editor_app(cfg.path(), tmp.path());
-    type_query(&mut app, "terminal scrollback");
+    type_keys(&mut app, "terminal scrollback");
     app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
         .unwrap();
     assert!(app.input_prompt.is_some(), "Enter asks for the number");
-    type_query(&mut app, "424242");
+    type_keys(&mut app, "424242");
     let backend = ratatui::backend::TestBackend::new(120, 36);
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|frame| app.render(frame)).unwrap();

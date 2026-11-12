@@ -1,0 +1,2197 @@
+# What every advertised chord does in each main context: src/app/tests/key_ledger.rs.
+# `context | chord | effects`. Rewrite with CROFT_BLESS=1 after a change meant to move one.
+# not pressed | F1 Editor: vim chords | Cmd+N Cmd+d d | N stands for a count
+# not pressed | F1 Editor: vim chords | Cmd+N Cmd+g g | N stands for a count
+# not pressed | F1 Editor: vim chords | Cmd+N Cmd+y y | N stands for a count
+# not pressed | F1 Editor: vim chords | Cmd+g N g | N stands for a count
+# not pressed | F1 Editor: vim mode (Cmd+E) | / or ? then Enter, n / N | vim mode's keys (a capital means Shift there); the ledger has no vim context
+# not pressed | F1 Editor: vim mode (Cmd+E) | 0 / ^ / $ | vim mode's keys (a capital means Shift there); the ledger has no vim context
+# not pressed | F1 Editor: vim mode (Cmd+E) | :w / :q / :wq / :x / :q! / :qa / :N | vim mode's keys (a capital means Shift there); the ledger has no vim context
+# not pressed | F1 Editor: vim mode (Cmd+E) | Esc | vim mode's keys (a capital means Shift there); the ledger has no vim context
+# not pressed | F1 Editor: vim mode (Cmd+E) | N (digits) | vim mode's keys (a capital means Shift there); the ledger has no vim context
+# not pressed | F1 Editor: vim mode (Cmd+E) | d / y / c + motion or object | vim mode's keys (a capital means Shift there); the ledger has no vim context
+# not pressed | F1 Editor: vim mode (Cmd+E) | dd / yy / cc | vim mode's keys (a capital means Shift there); the ledger has no vim context
+# not pressed | F1 Editor: vim mode (Cmd+E) | f / t / F / T then char, ; / , | vim mode's keys (a capital means Shift there); the ledger has no vim context
+# not pressed | F1 Editor: vim mode (Cmd+E) | gg / G / N G | vim mode's keys (a capital means Shift there); the ledger has no vim context
+# not pressed | F1 Editor: vim mode (Cmd+E) | h / j / k / l / arrows | vim mode's keys (a capital means Shift there); the ledger has no vim context
+# not pressed | F1 Editor: vim mode (Cmd+E) | i / a / I / A | vim mode's keys (a capital means Shift there); the ledger has no vim context
+# not pressed | F1 Editor: vim mode (Cmd+E) | o / O | vim mode's keys (a capital means Shift there); the ledger has no vim context
+# not pressed | F1 Editor: vim mode (Cmd+E) | p / P | vim mode's keys (a capital means Shift there); the ledger has no vim context
+# not pressed | F1 Editor: vim mode (Cmd+E) | u | vim mode's keys (a capital means Shift there); the ledger has no vim context
+# not pressed | F1 Editor: vim mode (Cmd+E) | v / V | vim mode's keys (a capital means Shift there); the ledger has no vim context
+# not pressed | F1 Editor: vim mode (Cmd+E) | w / b / e | vim mode's keys (a capital means Shift there); the ledger has no vim context
+# not pressed | F1 Editor: vim mode (Cmd+E) | x | vim mode's keys (a capital means Shift there); the ledger has no vim context
+# not pressed | F1 Explorer | Alt-click / Ctrl-click | a mouse gesture
+# not pressed | F1 Explorer | Drag onto folder | a mouse gesture
+# not pressed | F1 Extensions sidebar | Type | typing, not a chord
+# not pressed | F1 Run & Debug | Click  in the gutter | a mouse gesture
+# not pressed | F1 Search sidebar | Click Aa / ab / .* | a mouse gesture
+# not pressed | F1 Search sidebar | Type | typing, not a chord
+# not pressed | F1 Source Control sidebar | Click + / - | a mouse gesture
+# not pressed | F1 Source Control sidebar | Click branch name | a mouse gesture
+# not pressed | F1 Source Control sidebar | Type | typing, not a chord
+# not pressed | F1 Terminal | Any key | typing, not a chord
+# not pressed | F1 Terminal | Click the prompt line | a mouse gesture
+# not pressed | F1 Terminal | Cmd/Ctrl+click a URL | a mouse gesture
+# not pressed | F1 Terminal | Cmd/Ctrl+click a path:line | a mouse gesture
+# not pressed | editor selection explorer terminal search scm | ctrl+f5 | lists this machine's running Python processes
+# not pressed | editor selection explorer terminal search scm | ctrl+k shift+g | asks a model when ANTHROPIC_API_KEY is set
+# not pressed | editor selection explorer terminal search scm | ctrl+shift+f9 | reads CROFT_NO_UPDATE_CHECK and CROFT_REMOTE_AUTOUPDATE
+# not pressed | explorer | ctrl+z | jumps with zoxide, installed or not
+editor | alt+backspace | tabs=*● main.rs text=15L#ac09b3f1 caret=4:4
+editor | alt+c | -
+editor | alt+cmd+\ | caret=8:1 sel=3:10-8:1
+editor | alt+cmd+f | status="Replace: Tab switches field, Enter replaces, Cmd+Opt+Enter replaces all, Esc close" +find
+editor | alt+cmd+left | -
+editor | alt+cmd+right | -
+editor | alt+d | -
+editor | alt+delete | tabs=*● main.rs text=15L#bb0bf786
+editor | alt+down | tabs=*● main.rs text=15L#1cf61342 caret=5:8
+editor | alt+f12 | status="No language server for this file"
+editor | alt+f9 | status="Start debugging first to set exception breakpoints"
+editor | alt+l | -
+editor | alt+left | caret=4:4
+editor | alt+o | -
+editor | alt+p | -
+editor | alt+r | -
+editor | alt+right | caret=4:13
+editor | alt+shift+a | tabs=*● main.rs text=15L#93375dfc caret=4:32
+editor | alt+shift+down | tabs=*● main.rs text=16L#321d831e caret=5:8
+editor | alt+shift+f12 | -
+editor | alt+shift+f9 | +prompt("Add Logpoint · line 5" "")
+editor | alt+shift+i | status="Select the lines to put cursors at the ends of"
+editor | alt+shift+left | -
+editor | alt+shift+right | caret=4:13 sel=4:8-4:13
+editor | alt+shift+up | tabs=*● main.rs text=16L#321d831e
+editor | alt+up | tabs=*● main.rs text=15L#614ba9a0 caret=3:8
+editor | alt+w | -
+editor | alt+z | +wrap
+editor | backspace | tabs=*● main.rs text=15L#9e4f1a90 caret=4:7
+editor | cmd+[ | -
+editor | cmd+\ | groups=0,0+60x40[*main.rs] *60,0+60x40[*main.rs]
+editor | cmd+] | -
+editor | cmd+a | caret=14:13 sel=0:0-14:13 status="Selected 221 chars"
+editor | cmd+c | -
+editor | cmd+e | status="vim mode on" +vim
+editor | cmd+f12 | -
+editor | cmd+t | focus=panel status="Split terminal: 2 active" terms=2@1
+editor | cmd+v | tabs=*● main.rs text=15L#ebaedc8c caret=4:12 status="Pasted 4 chars"
+editor | cmd+w | tabs=*untitled text=0L#811c9dc5 caret=0:0 status="Closed tab"
+editor | ctrl+- | status="No previous location"
+editor | ctrl+. | status="No language server for this file"
+editor | ctrl+/ | tabs=*● main.rs text=15L#dbdca184 caret=4:11
+editor | ctrl+1 | status="Tab 1"
+editor | ctrl+2 | -
+editor | ctrl+3 | -
+editor | ctrl+4 | -
+editor | ctrl+5 | -
+editor | ctrl+6 | -
+editor | ctrl+7 | -
+editor | ctrl+8 | -
+editor | ctrl+9 | -
+editor | ctrl+a | caret=4:0
+editor | ctrl+a ctrl+s | caret=4:0 status="Saved <root>/main.rs"
+editor | ctrl+alt+, | status="No bookmarks in this file (Cmd+Opt+Shift+K sets one)"
+editor | ctrl+alt+- | tabs=*● main.rs text=15L#247221d3 caret=4:20
+editor | ctrl+alt+. | status="No bookmarks in this file (Cmd+Opt+Shift+K sets one)"
+editor | ctrl+alt+= | tabs=*● main.rs text=15L#91ea7155 caret=4:20
+editor | ctrl+alt+\ | -
+editor | ctrl+alt+b | status="Secondary side bar shown" +aux
+editor | ctrl+alt+c | status="Copied path: <root>/main.rs" clip="<root>/main.rs"
+editor | ctrl+alt+down | carets=5:8
+editor | ctrl+alt+f | status="Replace: Tab switches field, Enter replaces, Cmd+Opt+Enter replaces all, Esc close" +find
+editor | ctrl+alt+m | status="Minimap off" -minimap
+editor | ctrl+alt+r | -
+editor | ctrl+alt+s | status="Save All: nothing to save"
+editor | ctrl+alt+shift+a | tabs=*● main.rs text=15L#4c3e40da
+editor | ctrl+alt+shift+b | status="No bookmarks in this file"
+editor | ctrl+alt+shift+c | status="Copied relative path: main.rs" clip="main.rs"
+editor | ctrl+alt+shift+d | tabs=*● main.rs text=14L#80f7c600
+editor | ctrl+alt+shift+down | caret=5:8 carets=4:8
+editor | ctrl+alt+shift+e | status="Emmet: not available in Rust files"
+editor | ctrl+alt+shift+f | focus=side side=Search search="" @Query:0 hits=0@0
+editor | ctrl+alt+shift+g | caret=14:0 status="Bottom of file"
+editor | ctrl+alt+shift+j | tabs=*● main.rs text=14L#53b114fc caret=4:26
+editor | ctrl+alt+shift+k | marks=-/5 status="Bookmark set on line 5"
+editor | ctrl+alt+shift+l | tabs=*● main.rs
+editor | ctrl+alt+shift+left | sel=4:7-4:8
+editor | ctrl+alt+shift+n | -
+editor | ctrl+alt+shift+pagedown | caret=14:8 carets=4:8,5:8,6:8,7:5,8:1,9:0,10:8,11:8,12:8,13:1
+editor | ctrl+alt+shift+pageup | caret=0:2 carets=1:8,2:3,3:8,4:8
+editor | ctrl+alt+shift+right | caret=4:9 sel=4:8-4:9
+editor | ctrl+alt+shift+s | status="Converted indentation to spaces"
+editor | ctrl+alt+shift+t | focus=panel status="Split terminal: 2 active" terms=2@1
+editor | ctrl+alt+shift+u | tabs=*● main.rs text=15L#d70f871e
+editor | ctrl+alt+shift+up | caret=3:8 carets=4:8
+editor | ctrl+alt+shift+w | -
+editor | ctrl+alt+t | -
+editor | ctrl+alt+up | carets=3:8
+editor | ctrl+b | side=hidden
+editor | ctrl+backspace | tabs=*● main.rs text=15L#ac09b3f1 caret=4:4
+editor | ctrl+c | -
+editor | ctrl+d | caret=4:13 sel=4:8-4:13
+editor | ctrl+d d | tabs=*● main.rs text=15L#9ccd3884 caret=4:9
+editor | ctrl+delete | tabs=*● main.rs text=15L#bb0bf786
+editor | ctrl+e | caret=4:26
+editor | ctrl+end | caret=14:13
+editor | ctrl+enter | tabs=*● main.rs text=16L#3947f2c8 caret=5:4 status="Opened line below"
+editor | ctrl+f | status="Find: type to search, Enter next, Shift+Enter prev, Esc close" +find
+editor | ctrl+f10 | status="Run to Cursor: no debug session"
+editor | ctrl+f12 | -
+editor | ctrl+f2 | caret=4:13 sel=4:8-4:13 carets=1:35-1:40,5:7-5:12,6:19-6:24 status="Selected 4 occurrences (type to replace, Esc to cancel)"
+editor | ctrl+g g | caret=0:0 status="Top of file"
+editor | ctrl+home | caret=0:0
+editor | ctrl+j | panel=hidden
+editor | ctrl+k | +leader
+editor | ctrl+k [ | status="Cannot collapse the last expanded terminal"
+editor | ctrl+k \ | groups=*0,0+120x20[*main.rs] 0,20+120x20[*main.rs]
+editor | ctrl+k ] | status="No collapsed terminal panes"
+editor | ctrl+k a | status="Not a persistent session (start one with `croft attach`)"
+editor | ctrl+k b | focus=side side=Testing
+editor | ctrl+k c | status="Compare with Selected: nothing selected yet"
+editor | ctrl+k ctrl+/ | folded=1-2
+editor | ctrl+k ctrl+0 | caret=3:8 folded=1-2,4-7,11-14
+editor | ctrl+k ctrl+1 | caret=3:8 folded=1-2,4-7,11-14
+editor | ctrl+k ctrl+2 | folded=6,12
+editor | ctrl+k ctrl+3 | -
+editor | ctrl+k ctrl+4 | -
+editor | ctrl+k ctrl+5 | -
+editor | ctrl+k ctrl+6 | -
+editor | ctrl+k ctrl+7 | -
+editor | ctrl+k ctrl+8 | folded=11-14
+editor | ctrl+k ctrl+9 | -
+editor | ctrl+k ctrl+f | status="Select something to format"
+editor | ctrl+k ctrl+i | status="No hover information at the caret"
+editor | ctrl+k ctrl+j | -
+editor | ctrl+k ctrl+l | caret=3:8 folded=4-7
+editor | ctrl+k ctrl+m | status="No bookmarks (Cmd+Opt+Shift+K sets one)"
+editor | ctrl+k ctrl+q | status="No edits this session"
+editor | ctrl+k ctrl+s | +list("KeyboardShortcuts " @0 > "Move Line Up  ·  Alt+↑")
+editor | ctrl+k ctrl+t | +menu("  Croft Black" > "✔ Croft Loch")
+editor | ctrl+k d | tabs=main.rs,*terminal-<pid>-<pane>-scrollback.log text=0L#811c9dc5 caret=0:0 status="Opened 1 scrollback lines as a rendered log"
+editor | ctrl+k e | focus=side status="Revealed main.rs in Explorer" tree=./+,.vscode/,docs/,main.rs > main.rs
+editor | ctrl+k enter | status="No test runner detected in this workspace (is its extension enabled?)"
+editor | ctrl+k f | status="Format on Save: on"
+editor | ctrl+k h | status="Call hierarchy: no language server for this file"
+editor | ctrl+k i | status="Broadcast input needs at least two terminal panes (Cmd+T splits)"
+editor | ctrl+k k | status="Cleared terminal"
+editor | ctrl+k m | status="Only one terminal open"
+editor | ctrl+k n | +prompt("Note on line 5" "")
+editor | ctrl+k o | status="New Window failed: opening a new window is only supported on macOS"
+editor | ctrl+k p | status="Pinned tab"
+editor | ctrl+k q | status="Navigator is not active (run croft pair in this workspace)"
+editor | ctrl+k r | +prompt("Rename Terminal" "")
+editor | ctrl+k right | status="No tabs to the right to close"
+editor | ctrl+k s | status="Selected main.rs for compare"
+editor | ctrl+k shift+\ | groups=0,0+60x40[*main.rs] *60,0+60x40[*main.rs]
+editor | ctrl+k shift+c | status="Compare with Selected: nothing selected yet"
+editor | ctrl+k shift+d | status="Type hierarchy: no language server for this file"
+editor | ctrl+k shift+e | status="No code lens on this line"
+editor | ctrl+k shift+enter | status="No test runner detected in this workspace"
+editor | ctrl+k shift+f | tabs=main.rs,*Search Editor text=3L#6cabf539 caret=0:0 status="Search Editor: type a query on the first line, then Cmd+K Shift+R"
+editor | ctrl+k shift+h | status="Call hierarchy: no language server for this file"
+editor | ctrl+k shift+i | status=" excluded from broadcast input"
+editor | ctrl+k shift+l | +input("New worktree lane" "" @0)
+editor | ctrl+k shift+n | tabs=*● main.rs text=15L#dd47e8c2 caret=4:9
+editor | ctrl+k shift+o | status="New Window failed: opening a new window is only supported on macOS"
+editor | ctrl+k shift+p | status="Tab is already kept open"
+editor | ctrl+k shift+q | status="Not attached to a persistent session: nothing to detach from"
+editor | ctrl+k shift+r | status="Not a Search Editor"
+editor | ctrl+k shift+s | status="Selected main.rs for compare"
+editor | ctrl+k shift+t | status="No recently closed terminals"
+editor | ctrl+k shift+u | status="Type hierarchy: no language server for this file"
+editor | ctrl+k shift+v | tabs=main.rs,*main · main.rs scroll=3:0 status="Opened main as its own tab"
+editor | ctrl+k shift+w | status="No closed tabs to reopen"
+editor | ctrl+k u | tabs=*untitled text=0L#811c9dc5 caret=0:0 status="Closed 1 saved tab"
+editor | ctrl+k v | status="Live Run runs Python files (.py)"
+editor | ctrl+k w | tabs=*untitled text=0L#811c9dc5 caret=0:0 status="Closed 1 tab"
+editor | ctrl+k x | status="No AI stream is active"
+editor | ctrl+k y | status="Navigator is not active (run croft pair in this workspace)"
+editor | ctrl+k z | side=hidden panel=hidden status="Zen Mode on" +zen -activity_bar -status_bar
+editor | ctrl+l | caret=5:0 sel=4:0-5:0
+editor | ctrl+left | caret=4:4
+editor | ctrl+n | tabs=main.rs,*Untitled-1 text=0L#811c9dc5 caret=0:0 status="Untitled-1: saving asks where to write it"
+editor | ctrl+o | tabs=*● main.rs text=16L#3947f2c8 caret=5:4 status="Opened line below"
+editor | ctrl+p | status="Go to File: 3 files indexed — Esc to close" +quick_open("" @0 > ".vscode/launch.json")
+editor | ctrl+p # | status="Go to Symbol in Workspace: type to search — Esc to close" +workspace_symbols("" @0 > "")
+editor | ctrl+q | +quit
+editor | ctrl+r | -
+editor | ctrl+right | caret=4:13
+editor | ctrl+s | status="Saved <root>/main.rs"
+editor | ctrl+shift+- | status="No forward location"
+editor | ctrl+shift+. | +menu(".vscode/" > "main.rs")
+editor | ctrl+shift+/ | -
+editor | ctrl+shift+\ | -
+editor | ctrl+shift+b | status="No build task detected; pick one"
+editor | ctrl+shift+c | -
+editor | ctrl+shift+d | focus=side side=RunDebug
+editor | ctrl+shift+e | focus=side
+editor | ctrl+shift+enter | tabs=*● main.rs text=16L#2fdf5584 caret=4:4 status="Opened line above"
+editor | ctrl+shift+f | focus=side side=Search search="" @Query:0 hits=0@0
+editor | ctrl+shift+f12 | -
+editor | ctrl+shift+f5 | +input("Program" "" @0)
+editor | ctrl+shift+g | caret=14:0 status="Bottom of file"
+editor | ctrl+shift+h | focus=side side=Search search="" @Replace:0 replace="" hits=0@0
+editor | ctrl+shift+j | focus=panel panel=Terminal+max
+editor | ctrl+shift+k | tabs=*● main.rs text=14L#311e159e caret=4:0 status="Deleted 1 line" clip="    let total = add(1, 2);\n"
+editor | ctrl+shift+l | caret=4:13 sel=4:8-4:13 carets=1:35-1:40,5:7-5:12,6:19-6:24 status="Selected 4 occurrences (type to replace, Esc to cancel)"
+editor | ctrl+shift+m | focus=panel panel=Problems
+editor | ctrl+shift+n | -
+editor | ctrl+shift+o | status="Go to Symbol: 0 symbols — Esc to close" +go_to_symbol("" @0 > "")
+editor | ctrl+shift+p | status="Command Palette: 386 commands — Esc to close" +palette("" @0 > "Move Line Up")
+editor | ctrl+shift+pagedown | status="Move: the editor is already the last tab"
+editor | ctrl+shift+pageup | status="Move: the editor is already the first tab"
+editor | ctrl+shift+r | focus=side side=Remote
+editor | ctrl+shift+s | status="Saved <root>/main.rs"
+editor | ctrl+shift+space | +completion("" > "add")
+editor | ctrl+shift+t | focus=panel status="Split terminal: 2 active" terms=2@1
+editor | ctrl+shift+u | focus=panel panel=Output
+editor | ctrl+shift+v | status="Markdown Preview needs a Markdown file"
+editor | ctrl+shift+w | tabs=*untitled text=0L#811c9dc5 caret=0:0 status="Closed tab"
+editor | ctrl+shift+x | focus=side side=Extensions
+editor | ctrl+shift+y | -
+editor | ctrl+shift+z | status="Nothing to redo"
+editor | ctrl+space | +completion("" > "add")
+editor | ctrl+t | tabs=*● main.rs text=15L#fa56b536 caret=4:9
+editor | ctrl+u | tabs=*● main.rs text=15L#074dae91 caret=4:0 status="Killed 8 chars" clip="    let "
+editor | ctrl+v | tabs=*● main.rs text=15L#ebaedc8c caret=4:12 status="Pasted 4 chars"
+editor | ctrl+w | tabs=*untitled text=0L#811c9dc5 caret=0:0 status="Closed tab"
+editor | ctrl+x | -
+editor | ctrl+y y | status="Yanked 1 line" clip="    let total = add(1, 2);\n"
+editor | ctrl+z | status="Nothing to undo"
+editor | delete | tabs=*● main.rs text=15L#39142b54
+editor | down | caret=5:8
+editor | down enter | tabs=*● main.rs text=16L#e5b3b506 caret=6:4
+editor | end | caret=4:26
+editor | enter | tabs=*● main.rs text=16L#390b55a6 caret=5:4
+editor | esc | -
+editor | esc esc | -
+editor | f1 | status="Shortcuts: Esc to close" +shortcuts
+editor | f10 | -
+editor | f11 | -
+editor | f12 | -
+editor | f2 | status="No language server for this file"
+editor | f3 | -
+editor | f4 | status="No navigator comments in this file"
+editor | f5 | +input("Program" "" @0)
+editor | f6 | focus=panel
+editor | f7 | status="No changes in this file"
+editor | f9 | marks=5/- status="Breakpoint set at line 5"
+editor | home | caret=4:4
+editor | left | caret=4:7
+editor | n | tabs=*● main.rs text=15L#017b2962 caret=4:9
+editor | pagedown | caret=14:8 scroll=14:0
+editor | pageup | caret=0:2
+editor | r | tabs=*● main.rs text=15L#3c36005e caret=4:9
+editor | right | caret=4:9
+editor | s | tabs=*● main.rs text=15L#4b2ef75d caret=4:9
+editor | shift+backtab | tabs=*● main.rs text=15L#11abec9e caret=4:4
+editor | shift+cmd+\ | caret=8:0
+editor | shift+cmd+t | focus=panel
+editor | shift+down | caret=5:8 sel=4:8-5:8
+editor | shift+end | caret=4:26 sel=4:8-4:26
+editor | shift+f11 | -
+editor | shift+f12 | -
+editor | shift+f4 | status="No navigator comments in this file"
+editor | shift+f5 | status="Debug session stopped"
+editor | shift+f7 | status="No changes in this file"
+editor | shift+f8 | status="Screencast Mode on: the keys you press show at the bottom (Shift+F8 to stop)" +screencast
+editor | shift+f9 | +prompt("Add Conditional Breakpoint · line 5" "")
+editor | shift+home | caret=4:4 sel=4:8-4:4
+editor | shift+left | caret=4:7 sel=4:8-4:7
+editor | shift+pagedown | caret=14:8 sel=4:8-14:8 scroll=14:0
+editor | shift+pageup | caret=0:2 sel=4:8-0:2
+editor | shift+right | caret=4:9 sel=4:8-4:9
+editor | shift+up | caret=3:8 sel=4:8-3:8
+editor | space | tabs=*● main.rs text=15L#867a5b88 caret=4:9
+editor | tab | tabs=*● main.rs text=15L#5cff89ae caret=4:12
+editor | u | tabs=*● main.rs text=15L#f0fe86db caret=4:9
+editor | up | caret=3:8
+selection | alt+backspace | tabs=*● main.rs text=15L#bb0bf786 caret=4:8 sel=-
+selection | alt+c | -
+selection | alt+cmd+\ | caret=8:1 sel=3:10-8:1
+selection | alt+cmd+f | status="Replace: Tab switches field, Enter replaces, Cmd+Opt+Enter replaces all, Esc close" +find
+selection | alt+cmd+left | -
+selection | alt+cmd+right | -
+selection | alt+d | -
+selection | alt+delete | tabs=*● main.rs text=15L#bb0bf786 caret=4:8 sel=-
+selection | alt+down | tabs=*● main.rs text=15L#1cf61342 caret=5:13 sel=5:8-5:13
+selection | alt+f12 | status="No language server for this file"
+selection | alt+f9 | status="Start debugging first to set exception breakpoints"
+selection | alt+l | -
+selection | alt+left | caret=4:8 sel=-
+selection | alt+o | -
+selection | alt+p | -
+selection | alt+r | -
+selection | alt+right | caret=4:19 sel=-
+selection | alt+shift+a | tabs=*● main.rs text=15L#97d61866 caret=4:19 sel=-
+selection | alt+shift+down | tabs=*● main.rs text=16L#321d831e caret=5:13 sel=5:8-5:13
+selection | alt+shift+f12 | -
+selection | alt+shift+f9 | +prompt("Add Logpoint · line 5" "")
+selection | alt+shift+i | caret=4:26 sel=- status="1 cursors at line ends"
+selection | alt+shift+left | -
+selection | alt+shift+right | caret=4:26 sel=4:4-4:26
+selection | alt+shift+up | tabs=*● main.rs text=16L#321d831e
+selection | alt+up | tabs=*● main.rs text=15L#614ba9a0 caret=3:13 sel=3:8-3:13
+selection | alt+w | -
+selection | alt+z | +wrap
+selection | backspace | tabs=*● main.rs text=15L#bb0bf786 caret=4:8 sel=-
+selection | cmd+[ | -
+selection | cmd+\ | groups=0,0+60x40[*main.rs] *60,0+60x40[*main.rs] sel=-
+selection | cmd+] | -
+selection | cmd+a | caret=14:13 sel=0:0-14:13 status="Selected 221 chars"
+selection | cmd+c | status="Copied 5 chars to clipboard" clip="total"
+selection | cmd+e | status="vim mode on" +vim
+selection | cmd+f12 | -
+selection | cmd+t | focus=panel status="Split terminal: 2 active" terms=2@1
+selection | cmd+v | tabs=*● main.rs text=15L#968f684c caret=4:12 sel=- status="Pasted 4 chars"
+selection | cmd+w | tabs=*untitled text=0L#811c9dc5 caret=0:0 sel=- status="Closed tab"
+selection | ctrl+- | status="No previous location"
+selection | ctrl+. | status="No language server for this file"
+selection | ctrl+/ | tabs=*● main.rs text=15L#dbdca184 caret=4:16 sel=4:11-4:16
+selection | ctrl+1 | status="Tab 1"
+selection | ctrl+2 | -
+selection | ctrl+3 | -
+selection | ctrl+4 | -
+selection | ctrl+5 | -
+selection | ctrl+6 | -
+selection | ctrl+7 | -
+selection | ctrl+8 | -
+selection | ctrl+9 | -
+selection | ctrl+a | caret=4:0 sel=-
+selection | ctrl+a ctrl+s | caret=4:0 sel=- status="Saved <root>/main.rs"
+selection | ctrl+alt+, | status="No bookmarks in this file (Cmd+Opt+Shift+K sets one)"
+selection | ctrl+alt+- | tabs=*● main.rs text=15L#247221d3 caret=4:20 sel=-
+selection | ctrl+alt+. | status="No bookmarks in this file (Cmd+Opt+Shift+K sets one)"
+selection | ctrl+alt+= | tabs=*● main.rs text=15L#91ea7155 caret=4:20 sel=-
+selection | ctrl+alt+\ | -
+selection | ctrl+alt+b | status="Secondary side bar shown" +aux
+selection | ctrl+alt+c | status="Copied path: <root>/main.rs" clip="<root>/main.rs"
+selection | ctrl+alt+down | carets=5:13
+selection | ctrl+alt+f | status="Replace: Tab switches field, Enter replaces, Cmd+Opt+Enter replaces all, Esc close" +find
+selection | ctrl+alt+m | status="Minimap off" -minimap
+selection | ctrl+alt+r | -
+selection | ctrl+alt+s | status="Save All: nothing to save"
+selection | ctrl+alt+shift+a | -
+selection | ctrl+alt+shift+b | status="No bookmarks in this file"
+selection | ctrl+alt+shift+c | status="Copied relative path: main.rs" clip="main.rs"
+selection | ctrl+alt+shift+d | -
+selection | ctrl+alt+shift+down | caret=5:13 sel=5:8-5:13 carets=4:8-4:13
+selection | ctrl+alt+shift+e | status="Emmet: not available in Rust files"
+selection | ctrl+alt+shift+f | focus=side side=Search search="" @Query:0 hits=0@0
+selection | ctrl+alt+shift+g | caret=14:0 sel=- status="Bottom of file"
+selection | ctrl+alt+shift+j | tabs=*● main.rs text=14L#53b114fc caret=4:26 sel=-
+selection | ctrl+alt+shift+k | marks=-/5 status="Bookmark set on line 5"
+selection | ctrl+alt+shift+l | tabs=*● main.rs
+selection | ctrl+alt+shift+left | caret=4:12 sel=4:8-4:12
+selection | ctrl+alt+shift+n | -
+selection | ctrl+alt+shift+pagedown | caret=14:13 sel=14:8-14:13 carets=4:8-4:13,5:8-5:13,6:8-6:13,7:5,8:1,9:0,10:8-10:13,11:8-11:13,12:8-12:9,13:1
+selection | ctrl+alt+shift+pageup | caret=0:2 sel=- carets=1:8-1:13,2:3,3:8-3:11,4:8-4:13
+selection | ctrl+alt+shift+right | caret=4:14 sel=4:8-4:14
+selection | ctrl+alt+shift+s | status="Converted indentation to spaces"
+selection | ctrl+alt+shift+t | focus=panel status="Split terminal: 2 active" terms=2@1
+selection | ctrl+alt+shift+u | tabs=*● main.rs text=15L#d70f871e
+selection | ctrl+alt+shift+up | caret=3:11 sel=3:8-3:11 carets=4:8-4:13
+selection | ctrl+alt+shift+w | -
+selection | ctrl+alt+t | -
+selection | ctrl+alt+up | carets=3:11
+selection | ctrl+b | side=hidden
+selection | ctrl+backspace | tabs=*● main.rs text=15L#bb0bf786 caret=4:8 sel=-
+selection | ctrl+c | status="Copied 5 chars to clipboard" clip="total"
+selection | ctrl+d | caret=5:12 sel=5:7-5:12 carets=4:8-4:13 status="Selected 2 occurrences (type to replace, Esc to cancel)"
+selection | ctrl+d d | tabs=*● main.rs text=15L#9987e09e caret=5:8 sel=- carets=4:9 status="Selected 2 occurrences (type to replace, Esc to cancel)"
+selection | ctrl+delete | tabs=*● main.rs text=15L#bb0bf786 caret=4:8 sel=-
+selection | ctrl+e | caret=4:26 sel=-
+selection | ctrl+end | caret=14:13 sel=-
+selection | ctrl+enter | tabs=*● main.rs text=16L#3947f2c8 caret=5:4 sel=- status="Opened line below"
+selection | ctrl+f | status="Find: type to search, Enter next, Shift+Enter prev, Esc close" +find
+selection | ctrl+f10 | status="Run to Cursor: no debug session"
+selection | ctrl+f12 | -
+selection | ctrl+f2 | status="No symbol under cursor"
+selection | ctrl+g g | caret=0:0 sel=- status="Top of file"
+selection | ctrl+home | caret=0:0 sel=-
+selection | ctrl+j | panel=hidden
+selection | ctrl+k | +leader
+selection | ctrl+k [ | status="Cannot collapse the last expanded terminal"
+selection | ctrl+k \ | groups=*0,0+120x20[*main.rs] 0,20+120x20[*main.rs] sel=-
+selection | ctrl+k ] | status="No collapsed terminal panes"
+selection | ctrl+k a | status="Not a persistent session (start one with `croft attach`)"
+selection | ctrl+k b | focus=side side=Testing
+selection | ctrl+k c | status="Compare with Selected: nothing selected yet"
+selection | ctrl+k ctrl+/ | folded=1-2
+selection | ctrl+k ctrl+0 | caret=3:13 folded=1-2,4-7,11-14
+selection | ctrl+k ctrl+1 | caret=3:11 folded=1-2,4-7,11-14
+selection | ctrl+k ctrl+2 | folded=6,12
+selection | ctrl+k ctrl+3 | -
+selection | ctrl+k ctrl+4 | -
+selection | ctrl+k ctrl+5 | -
+selection | ctrl+k ctrl+6 | -
+selection | ctrl+k ctrl+7 | -
+selection | ctrl+k ctrl+8 | folded=11-14
+selection | ctrl+k ctrl+9 | -
+selection | ctrl+k ctrl+f | status="No language server for this file"
+selection | ctrl+k ctrl+i | status="No hover information at the caret"
+selection | ctrl+k ctrl+j | -
+selection | ctrl+k ctrl+l | caret=3:11 folded=4-7
+selection | ctrl+k ctrl+m | status="No bookmarks (Cmd+Opt+Shift+K sets one)"
+selection | ctrl+k ctrl+q | status="No edits this session"
+selection | ctrl+k ctrl+s | +list("KeyboardShortcuts " @0 > "Move Line Up  ·  Alt+↑")
+selection | ctrl+k ctrl+t | +menu("  Croft Black" > "✔ Croft Loch")
+selection | ctrl+k d | tabs=main.rs,*terminal-<pid>-<pane>-scrollback.log text=0L#811c9dc5 caret=0:0 sel=- status="Opened 1 scrollback lines as a rendered log"
+selection | ctrl+k e | focus=side status="Revealed main.rs in Explorer" tree=./+,.vscode/,docs/,main.rs > main.rs
+selection | ctrl+k enter | status="No test runner detected in this workspace (is its extension enabled?)"
+selection | ctrl+k f | status="Format on Save: on"
+selection | ctrl+k h | status="Call hierarchy: no language server for this file"
+selection | ctrl+k i | status="Broadcast input needs at least two terminal panes (Cmd+T splits)"
+selection | ctrl+k k | status="Cleared terminal"
+selection | ctrl+k m | status="Only one terminal open"
+selection | ctrl+k n | +prompt("Note on line 5" "")
+selection | ctrl+k o | status="New Window failed: opening a new window is only supported on macOS"
+selection | ctrl+k p | status="Pinned tab"
+selection | ctrl+k q | status="Navigator is not active (run croft pair in this workspace)"
+selection | ctrl+k r | +prompt("Rename Terminal" "")
+selection | ctrl+k right | status="No tabs to the right to close"
+selection | ctrl+k s | status="Selected main.rs for compare"
+selection | ctrl+k shift+\ | groups=0,0+60x40[*main.rs] *60,0+60x40[*main.rs] sel=-
+selection | ctrl+k shift+c | status="Compare with Selected: nothing selected yet"
+selection | ctrl+k shift+d | status="Type hierarchy: no language server for this file"
+selection | ctrl+k shift+e | status="No code lens on this line"
+selection | ctrl+k shift+enter | status="No test runner detected in this workspace"
+selection | ctrl+k shift+f | tabs=main.rs,*Search Editor text=3L#6cabf539 caret=0:0 sel=- status="Search Editor: type a query on the first line, then Cmd+K Shift+R"
+selection | ctrl+k shift+h | status="Call hierarchy: no language server for this file"
+selection | ctrl+k shift+i | status=" excluded from broadcast input"
+selection | ctrl+k shift+l | +input("New worktree lane" "" @0)
+selection | ctrl+k shift+n | tabs=*● main.rs text=15L#1d098ee2 caret=4:9 sel=-
+selection | ctrl+k shift+o | status="New Window failed: opening a new window is only supported on macOS"
+selection | ctrl+k shift+p | status="Tab is already kept open"
+selection | ctrl+k shift+q | status="Not attached to a persistent session: nothing to detach from"
+selection | ctrl+k shift+r | status="Not a Search Editor"
+selection | ctrl+k shift+s | status="Selected main.rs for compare"
+selection | ctrl+k shift+t | status="No recently closed terminals"
+selection | ctrl+k shift+u | status="Type hierarchy: no language server for this file"
+selection | ctrl+k shift+v | tabs=main.rs,*main · main.rs sel=- scroll=3:0 status="Opened main as its own tab"
+selection | ctrl+k shift+w | status="No closed tabs to reopen"
+selection | ctrl+k u | tabs=*untitled text=0L#811c9dc5 caret=0:0 sel=- status="Closed 1 saved tab"
+selection | ctrl+k v | status="Live Run runs Python files (.py)"
+selection | ctrl+k w | tabs=*untitled text=0L#811c9dc5 caret=0:0 sel=- status="Closed 1 tab"
+selection | ctrl+k x | status="No AI stream is active"
+selection | ctrl+k y | status="Navigator is not active (run croft pair in this workspace)"
+selection | ctrl+k z | side=hidden panel=hidden status="Zen Mode on" +zen -activity_bar -status_bar
+selection | ctrl+l | caret=5:0 sel=4:0-5:0
+selection | ctrl+left | caret=4:8 sel=-
+selection | ctrl+n | tabs=main.rs,*Untitled-1 text=0L#811c9dc5 caret=0:0 sel=- status="Untitled-1: saving asks where to write it"
+selection | ctrl+o | tabs=*● main.rs text=16L#3947f2c8 caret=5:4 sel=- status="Opened line below"
+selection | ctrl+p | status="Go to File: 3 files indexed — Esc to close" +quick_open("" @0 > ".vscode/launch.json")
+selection | ctrl+p # | status="Go to Symbol in Workspace: type to search — Esc to close" +workspace_symbols("" @0 > "")
+selection | ctrl+q | +quit
+selection | ctrl+r | -
+selection | ctrl+right | caret=4:19 sel=-
+selection | ctrl+s | status="Saved <root>/main.rs"
+selection | ctrl+shift+- | status="No forward location"
+selection | ctrl+shift+. | +menu(".vscode/" > "main.rs")
+selection | ctrl+shift+/ | -
+selection | ctrl+shift+\ | -
+selection | ctrl+shift+b | status="No build task detected; pick one"
+selection | ctrl+shift+c | status="Copied 5 chars to clipboard" clip="total"
+selection | ctrl+shift+d | focus=side side=RunDebug
+selection | ctrl+shift+e | focus=side
+selection | ctrl+shift+enter | tabs=*● main.rs text=16L#2fdf5584 caret=4:4 sel=- status="Opened line above"
+selection | ctrl+shift+f | focus=side side=Search search="" @Query:0 hits=0@0
+selection | ctrl+shift+f12 | -
+selection | ctrl+shift+f5 | +input("Program" "" @0)
+selection | ctrl+shift+g | caret=14:0 sel=- status="Bottom of file"
+selection | ctrl+shift+h | focus=side side=Search search="" @Replace:0 replace="" hits=0@0
+selection | ctrl+shift+j | focus=panel panel=Terminal+max
+selection | ctrl+shift+k | tabs=*● main.rs text=14L#311e159e caret=4:0 sel=- status="Deleted 1 line" clip="    let total = add(1, 2);\n"
+selection | ctrl+shift+l | carets=1:35-1:40,5:7-5:12,6:19-6:24 status="Selected 4 occurrences (type to replace, Esc to cancel)"
+selection | ctrl+shift+m | focus=panel panel=Problems
+selection | ctrl+shift+n | -
+selection | ctrl+shift+o | status="Go to Symbol: 0 symbols — Esc to close" +go_to_symbol("" @0 > "")
+selection | ctrl+shift+p | status="Command Palette: 386 commands — Esc to close" +palette("" @0 > "Move Line Up")
+selection | ctrl+shift+pagedown | status="Move: the editor is already the last tab"
+selection | ctrl+shift+pageup | status="Move: the editor is already the first tab"
+selection | ctrl+shift+r | focus=side side=Remote
+selection | ctrl+shift+s | status="Saved <root>/main.rs"
+selection | ctrl+shift+space | status="No suggestions"
+selection | ctrl+shift+t | focus=panel status="Split terminal: 2 active" terms=2@1
+selection | ctrl+shift+u | focus=panel panel=Output
+selection | ctrl+shift+v | status="Markdown Preview needs a Markdown file"
+selection | ctrl+shift+w | tabs=*untitled text=0L#811c9dc5 caret=0:0 sel=- status="Closed tab"
+selection | ctrl+shift+x | focus=side side=Extensions
+selection | ctrl+shift+y | -
+selection | ctrl+shift+z | status="Nothing to redo"
+selection | ctrl+space | status="No suggestions"
+selection | ctrl+t | tabs=*● main.rs text=15L#6f3cd906 caret=4:14 sel=-
+selection | ctrl+u | tabs=*● main.rs text=15L#8206ff8f caret=4:0 sel=- status="Killed 13 chars" clip="    let total"
+selection | ctrl+v | tabs=*● main.rs text=15L#968f684c caret=4:12 sel=- status="Pasted 4 chars"
+selection | ctrl+w | tabs=*untitled text=0L#811c9dc5 caret=0:0 sel=- status="Closed tab"
+selection | ctrl+x | tabs=*● main.rs text=15L#bb0bf786 caret=4:8 sel=- status="Cut 5 chars to clipboard" clip="total"
+selection | ctrl+y y | status="Yanked 1 line" clip="    let total = add(1, 2);\n"
+selection | ctrl+z | status="Nothing to undo"
+selection | delete | tabs=*● main.rs text=15L#bb0bf786 caret=4:8 sel=-
+selection | down | caret=5:13 sel=-
+selection | down enter | tabs=*● main.rs text=16L#922519de caret=6:4 sel=-
+selection | end | caret=4:26 sel=-
+selection | enter | tabs=*● main.rs text=16L#67be9a9e caret=5:4 sel=-
+selection | esc | sel=-
+selection | esc esc | sel=-
+selection | f1 | status="Shortcuts: Esc to close" +shortcuts
+selection | f10 | -
+selection | f11 | -
+selection | f12 | -
+selection | f2 | status="No language server for this file"
+selection | f3 | -
+selection | f4 | status="No navigator comments in this file"
+selection | f5 | +input("Program" "" @0)
+selection | f6 | focus=panel
+selection | f7 | status="No changes in this file"
+selection | f9 | marks=5/- status="Breakpoint set at line 5"
+selection | home | caret=4:4 sel=-
+selection | left | caret=4:12 sel=-
+selection | n | tabs=*● main.rs text=15L#179d0102 caret=4:9 sel=-
+selection | pagedown | caret=14:13 sel=- scroll=14:0
+selection | pageup | caret=0:2 sel=-
+selection | r | tabs=*● main.rs text=15L#cb7d5fe6 caret=4:9 sel=-
+selection | right | caret=4:14 sel=-
+selection | s | tabs=*● main.rs text=15L#00c81b13 caret=4:9 sel=-
+selection | shift+backtab | tabs=*● main.rs text=15L#11abec9e caret=4:9 sel=4:4-4:9
+selection | shift+cmd+\ | caret=8:0 sel=-
+selection | shift+cmd+t | focus=panel
+selection | shift+down | caret=5:13 sel=4:8-5:13
+selection | shift+end | caret=4:26 sel=4:8-4:26
+selection | shift+f11 | -
+selection | shift+f12 | -
+selection | shift+f4 | status="No navigator comments in this file"
+selection | shift+f5 | status="Debug session stopped"
+selection | shift+f7 | status="No changes in this file"
+selection | shift+f8 | status="Screencast Mode on: the keys you press show at the bottom (Shift+F8 to stop)" +screencast
+selection | shift+f9 | +prompt("Add Conditional Breakpoint · line 5" "")
+selection | shift+home | caret=4:4 sel=4:8-4:4
+selection | shift+left | caret=4:12 sel=4:8-4:12
+selection | shift+pagedown | caret=14:13 sel=4:8-14:13 scroll=14:0
+selection | shift+pageup | caret=0:2 sel=4:8-0:2
+selection | shift+right | caret=4:14 sel=4:8-4:14
+selection | shift+up | caret=3:11 sel=4:8-3:11
+selection | space | tabs=*● main.rs text=15L#cdca88e0 caret=4:9 sel=-
+selection | tab | tabs=*● main.rs text=15L#5f6f8816 caret=4:12 sel=-
+selection | u | tabs=*● main.rs text=15L#f9473661 caret=4:9 sel=-
+selection | up | caret=3:11 sel=-
+explorer | alt+backspace | +input("Move 'main.rs' to Trash?" "" @0)
+explorer | alt+c | -
+explorer | alt+cmd+\ | -
+explorer | alt+cmd+f | -
+explorer | alt+cmd+left | -
+explorer | alt+cmd+right | -
+explorer | alt+d | -
+explorer | alt+delete | +input("Move 'main.rs' to Trash?" "" @0)
+explorer | alt+down | -
+explorer | alt+f12 | -
+explorer | alt+f9 | status="Start debugging first to set exception breakpoints"
+explorer | alt+l | -
+explorer | alt+left | -
+explorer | alt+o | -
+explorer | alt+p | -
+explorer | alt+r | -
+explorer | alt+right | status="Opened <root>/main.rs"
+explorer | alt+shift+a | -
+explorer | alt+shift+down | -
+explorer | alt+shift+f12 | -
+explorer | alt+shift+f9 | +prompt("Add Logpoint · line 5" "")
+explorer | alt+shift+i | -
+explorer | alt+shift+left | -
+explorer | alt+shift+right | status="Opened <root>/main.rs"
+explorer | alt+shift+up | tree=./+,.vscode/,docs/,main.rs > docs marked=.,.vscode,docs
+explorer | alt+up | tree=./+,.vscode/,docs/,main.rs > docs
+explorer | alt+w | -
+explorer | alt+z | -
+explorer | backspace | +input("Move 'main.rs' to Trash?" "" @0)
+explorer | cmd+[ | -
+explorer | cmd+\ | focus=editor groups=0,0+60x40[*main.rs] *60,0+60x40[*main.rs]
+explorer | cmd+] | -
+explorer | cmd+a | tree=./+,.vscode/,docs/,main.rs > main.rs marked=.,.vscode,docs,main.rs
+explorer | cmd+c | status="Copied 1 item"
+explorer | cmd+e | status="vim mode on" +vim
+explorer | cmd+f12 | -
+explorer | cmd+t | focus=panel status="Split terminal: 2 active" terms=2@1
+explorer | cmd+v | status="Explorer clipboard is empty"
+explorer | cmd+w | -
+explorer | ctrl+- | -
+explorer | ctrl+. | -
+explorer | ctrl+/ | -
+explorer | ctrl+1 | -
+explorer | ctrl+2 | -
+explorer | ctrl+3 | -
+explorer | ctrl+4 | -
+explorer | ctrl+5 | -
+explorer | ctrl+6 | -
+explorer | ctrl+7 | -
+explorer | ctrl+8 | -
+explorer | ctrl+9 | -
+explorer | ctrl+a | tree=./+,.vscode/,docs/,main.rs > main.rs marked=.,.vscode,docs,main.rs
+explorer | ctrl+a ctrl+s | status="Saved <root>/main.rs" tree=./+,.vscode/,docs/,main.rs > main.rs marked=.,.vscode,docs,main.rs
+explorer | ctrl+alt+, | -
+explorer | ctrl+alt+- | -
+explorer | ctrl+alt+. | -
+explorer | ctrl+alt+= | -
+explorer | ctrl+alt+\ | -
+explorer | ctrl+alt+b | status="Secondary side bar shown" +aux
+explorer | ctrl+alt+c | status="Copied 1 item"
+explorer | ctrl+alt+down | -
+explorer | ctrl+alt+f | -
+explorer | ctrl+alt+m | status="Minimap off" -minimap
+explorer | ctrl+alt+r | -
+explorer | ctrl+alt+s | status="Save All: nothing to save"
+explorer | ctrl+alt+shift+a | tree=./+,.vscode/,docs/,main.rs > main.rs marked=.,.vscode,docs,main.rs
+explorer | ctrl+alt+shift+b | -
+explorer | ctrl+alt+shift+c | status="Copied 1 item"
+explorer | ctrl+alt+shift+d | -
+explorer | ctrl+alt+shift+down | -
+explorer | ctrl+alt+shift+e | -
+explorer | ctrl+alt+shift+f | side=Search search="" @Query:0 hits=0@0
+explorer | ctrl+alt+shift+g | -
+explorer | ctrl+alt+shift+j | -
+explorer | ctrl+alt+shift+k | -
+explorer | ctrl+alt+shift+l | -
+explorer | ctrl+alt+shift+left | -
+explorer | ctrl+alt+shift+n | -
+explorer | ctrl+alt+shift+pagedown | tree=./+,.vscode/,docs/,main.rs > main.rs marked=.,.vscode,docs,main.rs
+explorer | ctrl+alt+shift+pageup | tree=./+,.vscode/,docs/,main.rs > . marked=.
+explorer | ctrl+alt+shift+right | status="Opened <root>/main.rs"
+explorer | ctrl+alt+shift+s | -
+explorer | ctrl+alt+shift+t | focus=panel status="Split terminal: 2 active" terms=2@1
+explorer | ctrl+alt+shift+u | -
+explorer | ctrl+alt+shift+up | tree=./+,.vscode/,docs/,main.rs > docs marked=.,.vscode,docs
+explorer | ctrl+alt+shift+w | -
+explorer | ctrl+alt+t | -
+explorer | ctrl+alt+up | tree=./+,.vscode/,docs/,main.rs > docs
+explorer | ctrl+b | side=hidden
+explorer | ctrl+backspace | +input("Move 'main.rs' to Trash?" "" @0)
+explorer | ctrl+c | status="Copied 1 item"
+explorer | ctrl+d | status="Selected main.rs for compare — Ctrl/Cmd+D again on another file"
+explorer | ctrl+d d | status="Selected main.rs for compare — Ctrl/Cmd+D again on another file" tree=./+,.vscode/,docs/,main.rs > docs
+explorer | ctrl+delete | +input("Move 'main.rs' to Trash?" "" @0)
+explorer | ctrl+e | -
+explorer | ctrl+end | -
+explorer | ctrl+enter | focus=editor status="Opened <root>/main.rs"
+explorer | ctrl+f | +prompt("New File in ." "")
+explorer | ctrl+f10 | status="Run to Cursor: no debug session"
+explorer | ctrl+f12 | -
+explorer | ctrl+f2 | +prompt("Rename main.rs" "main.rs")
+explorer | ctrl+g g | -
+explorer | ctrl+home | tree=./+,.vscode/,docs/,main.rs > .
+explorer | ctrl+j | panel=hidden
+explorer | ctrl+k | +leader
+explorer | ctrl+k [ | status="Cannot collapse the last expanded terminal"
+explorer | ctrl+k \ | focus=editor groups=*0,0+120x20[*main.rs] 0,20+120x20[*main.rs]
+explorer | ctrl+k ] | status="No collapsed terminal panes"
+explorer | ctrl+k a | status="Not a persistent session (start one with `croft attach`)"
+explorer | ctrl+k b | side=Testing
+explorer | ctrl+k c | status="Compare with Selected: nothing selected yet"
+explorer | ctrl+k ctrl+/ | folded=1-2
+explorer | ctrl+k ctrl+0 | caret=3:8 folded=1-2,4-7,11-14
+explorer | ctrl+k ctrl+1 | caret=3:8 folded=1-2,4-7,11-14
+explorer | ctrl+k ctrl+2 | folded=6,12
+explorer | ctrl+k ctrl+3 | -
+explorer | ctrl+k ctrl+4 | -
+explorer | ctrl+k ctrl+5 | -
+explorer | ctrl+k ctrl+6 | -
+explorer | ctrl+k ctrl+7 | -
+explorer | ctrl+k ctrl+8 | folded=11-14
+explorer | ctrl+k ctrl+9 | -
+explorer | ctrl+k ctrl+f | status="Select something to format"
+explorer | ctrl+k ctrl+i | status="Broadcast input needs at least two terminal panes (Cmd+T splits)"
+explorer | ctrl+k ctrl+j | -
+explorer | ctrl+k ctrl+l | caret=3:8 folded=4-7
+explorer | ctrl+k ctrl+m | status="No bookmarks (Cmd+Opt+Shift+K sets one)"
+explorer | ctrl+k ctrl+q | status="No edits this session"
+explorer | ctrl+k ctrl+s | +list("KeyboardShortcuts " @0 > "Move Line Up  ·  Alt+↑")
+explorer | ctrl+k ctrl+t | +menu("  Croft Black" > "✔ Croft Loch")
+explorer | ctrl+k d | focus=editor tabs=main.rs,*terminal-<pid>-<pane>-scrollback.log text=0L#811c9dc5 caret=0:0 status="Opened 1 scrollback lines as a rendered log"
+explorer | ctrl+k e | status="Revealed main.rs in Explorer"
+explorer | ctrl+k enter | status="No test runner detected in this workspace (is its extension enabled?)"
+explorer | ctrl+k f | status="Format on Save: on"
+explorer | ctrl+k h | status="Call hierarchy: no language server for this file"
+explorer | ctrl+k i | status="Broadcast input needs at least two terminal panes (Cmd+T splits)"
+explorer | ctrl+k k | status="Cleared terminal"
+explorer | ctrl+k m | status="Only one terminal open"
+explorer | ctrl+k n | -
+explorer | ctrl+k o | status="New Window failed: opening a new window is only supported on macOS"
+explorer | ctrl+k p | status="Pinned tab"
+explorer | ctrl+k q | status="Navigator is not active (run croft pair in this workspace)"
+explorer | ctrl+k r | +prompt("Rename Terminal" "")
+explorer | ctrl+k right | status="No tabs to the right to close"
+explorer | ctrl+k s | status="Selected main.rs for compare"
+explorer | ctrl+k shift+\ | focus=editor groups=0,0+60x40[*main.rs] *60,0+60x40[*main.rs]
+explorer | ctrl+k shift+c | status="Compare with Selected: nothing selected yet"
+explorer | ctrl+k shift+d | status="Type hierarchy: no language server for this file"
+explorer | ctrl+k shift+e | status="No code lens on this line"
+explorer | ctrl+k shift+enter | status="No test runner detected in this workspace"
+explorer | ctrl+k shift+f | focus=editor tabs=main.rs,*Search Editor text=3L#6cabf539 caret=0:0 status="Search Editor: type a query on the first line, then Cmd+K Shift+R"
+explorer | ctrl+k shift+h | status="Call hierarchy: no language server for this file"
+explorer | ctrl+k shift+i | status=" excluded from broadcast input"
+explorer | ctrl+k shift+l | +input("New worktree lane" "" @0)
+explorer | ctrl+k shift+n | -
+explorer | ctrl+k shift+o | status="New Window failed: opening a new window is only supported on macOS"
+explorer | ctrl+k shift+p | status="Tab is already kept open"
+explorer | ctrl+k shift+q | status="Not attached to a persistent session: nothing to detach from"
+explorer | ctrl+k shift+r | status="Not a Search Editor"
+explorer | ctrl+k shift+s | status="Selected main.rs for compare"
+explorer | ctrl+k shift+t | status="No recently closed terminals"
+explorer | ctrl+k shift+u | status="Type hierarchy: no language server for this file"
+explorer | ctrl+k shift+v | focus=editor tabs=main.rs,*main · main.rs scroll=3:0 status="Opened main as its own tab"
+explorer | ctrl+k shift+w | status="No closed tabs to reopen"
+explorer | ctrl+k u | tabs=*untitled text=0L#811c9dc5 caret=0:0 status="Closed 1 saved tab"
+explorer | ctrl+k v | status="Live Run runs Python files (.py)"
+explorer | ctrl+k w | tabs=*untitled text=0L#811c9dc5 caret=0:0 status="Closed 1 tab"
+explorer | ctrl+k x | status="No AI stream is active"
+explorer | ctrl+k y | status="Navigator is not active (run croft pair in this workspace)"
+explorer | ctrl+k z | side=hidden panel=hidden status="Zen Mode on" +zen -activity_bar -status_bar
+explorer | ctrl+l | -
+explorer | ctrl+left | -
+explorer | ctrl+n | focus=editor tabs=main.rs,*Untitled-1 text=0L#811c9dc5 caret=0:0 status="Untitled-1: saving asks where to write it"
+explorer | ctrl+o | -
+explorer | ctrl+p | status="Go to File: 3 files indexed — Esc to close" +quick_open("" @0 > ".vscode/launch.json")
+explorer | ctrl+p # | status="Go to Symbol in Workspace: type to search — Esc to close" +workspace_symbols("" @0 > "")
+explorer | ctrl+q | +quit
+explorer | ctrl+r | +prompt("Rename main.rs" "main.rs")
+explorer | ctrl+right | status="Opened <root>/main.rs"
+explorer | ctrl+s | status="Saved <root>/main.rs"
+explorer | ctrl+shift+- | -
+explorer | ctrl+shift+. | focus=editor +menu(".vscode/" > "main.rs")
+explorer | ctrl+shift+/ | status="Workspace root: <root>" typed=0:"\u{5}x\u{15}cd '<root>'\n" tree=./+,.vscode/,docs/,main.rs > .
+explorer | ctrl+shift+\ | -
+explorer | ctrl+shift+b | status="No build task detected; pick one"
+explorer | ctrl+shift+c | status="Copied 1 item"
+explorer | ctrl+shift+d | side=RunDebug
+explorer | ctrl+shift+e | -
+explorer | ctrl+shift+enter | focus=editor status="Opened <root>/main.rs"
+explorer | ctrl+shift+f | side=Search search="" @Query:0 hits=0@0
+explorer | ctrl+shift+f12 | -
+explorer | ctrl+shift+f5 | +input("Program" "" @0)
+explorer | ctrl+shift+g | -
+explorer | ctrl+shift+h | side=Search search="" @Replace:0 replace="" hits=0@0
+explorer | ctrl+shift+j | focus=panel panel=Terminal+max
+explorer | ctrl+shift+k | -
+explorer | ctrl+shift+l | -
+explorer | ctrl+shift+m | focus=panel panel=Problems
+explorer | ctrl+shift+n | +prompt("New Folder in ." "")
+explorer | ctrl+shift+o | status="Go to Symbol: 0 symbols — Esc to close" +go_to_symbol("" @0 > "")
+explorer | ctrl+shift+p | status="Command Palette: 386 commands — Esc to close" +palette("" @0 > "Move Line Up")
+explorer | ctrl+shift+pagedown | tree=./+,.vscode/,docs/,main.rs > main.rs marked=.,.vscode,docs,main.rs
+explorer | ctrl+shift+pageup | tree=./+,.vscode/,docs/,main.rs > . marked=.
+explorer | ctrl+shift+r | side=Remote
+explorer | ctrl+shift+s | status="Saved <root>/main.rs"
+explorer | ctrl+shift+space | -
+explorer | ctrl+shift+t | focus=panel status="Split terminal: 2 active" terms=2@1
+explorer | ctrl+shift+u | focus=panel panel=Output
+explorer | ctrl+shift+v | status="Explorer clipboard is empty"
+explorer | ctrl+shift+w | -
+explorer | ctrl+shift+x | side=Extensions
+explorer | ctrl+shift+y | -
+explorer | ctrl+shift+z | -
+explorer | ctrl+space | -
+explorer | ctrl+t | -
+explorer | ctrl+u | -
+explorer | ctrl+v | status="Explorer clipboard is empty"
+explorer | ctrl+w | -
+explorer | ctrl+x | status="Cut 1 item"
+explorer | ctrl+y y | -
+explorer | delete | +input("Move 'main.rs' to Trash?" "" @0)
+explorer | down | -
+explorer | down enter | focus=editor status="Opened <root>/main.rs"
+explorer | end | -
+explorer | enter | focus=editor status="Opened <root>/main.rs"
+explorer | esc | -
+explorer | esc esc | -
+explorer | f1 | status="Shortcuts: Esc to close" +shortcuts
+explorer | f10 | -
+explorer | f11 | -
+explorer | f12 | -
+explorer | f2 | +prompt("Rename main.rs" "main.rs")
+explorer | f3 | -
+explorer | f4 | -
+explorer | f5 | +input("Program" "" @0)
+explorer | f6 | focus=editor
+explorer | f7 | -
+explorer | f9 | marks=5/- status="Breakpoint set at line 5"
+explorer | home | tree=./+,.vscode/,docs/,main.rs > .
+explorer | left | -
+explorer | n | -
+explorer | pagedown | -
+explorer | pageup | tree=./+,.vscode/,docs/,main.rs > .
+explorer | r | -
+explorer | right | status="Opened <root>/main.rs"
+explorer | s | -
+explorer | shift+backtab | -
+explorer | shift+cmd+\ | -
+explorer | shift+cmd+t | focus=panel
+explorer | shift+down | -
+explorer | shift+end | tree=./+,.vscode/,docs/,main.rs > main.rs marked=.,.vscode,docs,main.rs
+explorer | shift+f11 | -
+explorer | shift+f12 | -
+explorer | shift+f4 | -
+explorer | shift+f5 | status="Debug session stopped"
+explorer | shift+f7 | -
+explorer | shift+f8 | status="Screencast Mode on: the keys you press show at the bottom (Shift+F8 to stop)" +screencast
+explorer | shift+f9 | +prompt("Add Conditional Breakpoint · line 5" "")
+explorer | shift+home | tree=./+,.vscode/,docs/,main.rs > . marked=.
+explorer | shift+left | -
+explorer | shift+pagedown | tree=./+,.vscode/,docs/,main.rs > main.rs marked=.,.vscode,docs,main.rs
+explorer | shift+pageup | tree=./+,.vscode/,docs/,main.rs > . marked=.
+explorer | shift+right | status="Opened <root>/main.rs"
+explorer | shift+up | tree=./+,.vscode/,docs/,main.rs > docs marked=.,.vscode,docs
+explorer | space | -
+explorer | tab | -
+explorer | u | -
+explorer | up | tree=./+,.vscode/,docs/,main.rs > docs
+terminal | alt+backspace | typed=0:"\u{1b}\u{7f}"
+terminal | alt+c | typed=0:"\u{1b}c"
+terminal | alt+cmd+\ | typed=0:"\u{1b}\\"
+terminal | alt+cmd+f | typed=0:"\u{1b}f"
+terminal | alt+cmd+left | -
+terminal | alt+cmd+right | -
+terminal | alt+d | typed=0:"\u{1b}d"
+terminal | alt+delete | typed=0:"\u{1b}[3;3~"
+terminal | alt+down | typed=0:"\u{1b}[1;3B"
+terminal | alt+f12 | typed=0:"\u{1b}[24;3~"
+terminal | alt+f9 | status="Start debugging first to set exception breakpoints"
+terminal | alt+l | typed=0:"\u{1b}l"
+terminal | alt+left | typed=0:"\u{1b}b"
+terminal | alt+o | typed=0:"\u{1b}o"
+terminal | alt+p | typed=0:"\u{1b}p"
+terminal | alt+r | typed=0:"\u{1b}r"
+terminal | alt+right | typed=0:"\u{1b}f"
+terminal | alt+shift+a | typed=0:"\u{1b}A"
+terminal | alt+shift+down | typed=0:"\u{1b}[1;4B"
+terminal | alt+shift+f12 | typed=0:"\u{1b}[24;4~"
+terminal | alt+shift+f9 | +prompt("Add Logpoint · line 5" "")
+terminal | alt+shift+i | typed=0:"\u{1b}I"
+terminal | alt+shift+left | typed=0:"\u{1b}[1;4D"
+terminal | alt+shift+right | typed=0:"\u{1b}[1;4C"
+terminal | alt+shift+up | typed=0:"\u{1b}[1;4A"
+terminal | alt+up | typed=0:"\u{1b}[1;3A"
+terminal | alt+w | typed=0:"\u{1b}w"
+terminal | alt+z | typed=0:"\u{1b}z"
+terminal | backspace | typed=0:"\u{7f}"
+terminal | cmd+[ | -
+terminal | cmd+\ | focus=editor groups=0,0+60x40[*main.rs] *60,0+60x40[*main.rs]
+terminal | cmd+] | -
+terminal | cmd+a | typed=0:"a"
+terminal | cmd+c | status="Nothing selected: drag to select first"
+terminal | cmd+e | status="vim mode on" +vim
+terminal | cmd+f12 | typed=0:"\u{1b}[24~"
+terminal | cmd+t | status="Split terminal: 2 active" terms=2@1
+terminal | cmd+v | typed=0:"CLIP"
+terminal | cmd+w | status="Cannot close the last terminal; press Ctrl+J to hide"
+terminal | ctrl+- | -
+terminal | ctrl+. | -
+terminal | ctrl+/ | typed=0:"\u{1f}"
+terminal | ctrl+1 | -
+terminal | ctrl+2 | typed=0:"\0"
+terminal | ctrl+3 | typed=0:"\u{1b}"
+terminal | ctrl+4 | typed=0:"\u{1c}"
+terminal | ctrl+5 | typed=0:"\u{1d}"
+terminal | ctrl+6 | typed=0:"\u{1e}"
+terminal | ctrl+7 | typed=0:"\u{1f}"
+terminal | ctrl+8 | typed=0:"\u{7f}"
+terminal | ctrl+9 | -
+terminal | ctrl+a | typed=0:"\u{1}"
+terminal | ctrl+a ctrl+s | status="Saved <root>/main.rs" typed=0:"\u{1}"
+terminal | ctrl+alt+, | -
+terminal | ctrl+alt+- | -
+terminal | ctrl+alt+. | -
+terminal | ctrl+alt+= | -
+terminal | ctrl+alt+\ | typed=0:"\u{1b}\u{1c}"
+terminal | ctrl+alt+b | status="Secondary side bar shown" +aux
+terminal | ctrl+alt+c | typed=0:"\u{1b}\u{3}"
+terminal | ctrl+alt+down | status="No command marks yet (shell integration needs a zsh prompt)"
+terminal | ctrl+alt+f | typed=0:"\u{1b}\u{6}"
+terminal | ctrl+alt+m | status="Minimap off" -minimap
+terminal | ctrl+alt+r | typed=0:"\u{1b}\u{12}"
+terminal | ctrl+alt+s | status="Save All: nothing to save"
+terminal | ctrl+alt+shift+a | typed=0:"\u{1b}\u{1}"
+terminal | ctrl+alt+shift+b | typed=0:"\u{1b}\u{2}"
+terminal | ctrl+alt+shift+c | status="Nothing selected: drag to select first"
+terminal | ctrl+alt+shift+d | typed=0:"\u{1b}\u{4}"
+terminal | ctrl+alt+shift+down | status="No command marks yet (shell integration needs a zsh prompt)"
+terminal | ctrl+alt+shift+e | typed=0:"\u{1b}\u{5}"
+terminal | ctrl+alt+shift+f | focus=side side=Search search="" @Query:0 hits=0@0
+terminal | ctrl+alt+shift+g | typed=0:"\u{1b}\u{7}"
+terminal | ctrl+alt+shift+j | typed=0:"\u{1b}\n"
+terminal | ctrl+alt+shift+k | typed=0:"\u{1b}\u{b}"
+terminal | ctrl+alt+shift+l | typed=0:"\u{1b}\u{c}"
+terminal | ctrl+alt+shift+left | typed=0:"\u{1b}[1;8D"
+terminal | ctrl+alt+shift+n | typed=0:"\u{1b}\u{e}"
+terminal | ctrl+alt+shift+pagedown | -
+terminal | ctrl+alt+shift+pageup | -
+terminal | ctrl+alt+shift+right | typed=0:"\u{1b}[1;8C"
+terminal | ctrl+alt+shift+s | typed=0:"\u{1b}\u{13}"
+terminal | ctrl+alt+shift+t | status="Split terminal: 2 active" terms=2@1
+terminal | ctrl+alt+shift+u | typed=0:"\u{1b}\u{15}"
+terminal | ctrl+alt+shift+up | status="No command marks yet (shell integration needs a zsh prompt)"
+terminal | ctrl+alt+shift+w | status="Cannot close the last terminal; press Ctrl+J to hide"
+terminal | ctrl+alt+t | typed=0:"\u{1b}\u{14}"
+terminal | ctrl+alt+up | status="No command marks yet (shell integration needs a zsh prompt)"
+terminal | ctrl+b | typed=0:"\u{2}"
+terminal | ctrl+backspace | typed=0:"\u{8}"
+terminal | ctrl+c | typed=0:"\u{3}"
+terminal | ctrl+d | typed=0:"\u{4}"
+terminal | ctrl+d d | typed=0:"\u{4}d"
+terminal | ctrl+delete | typed=0:"\u{1b}[3;5~"
+terminal | ctrl+e | typed=0:"\u{5}"
+terminal | ctrl+end | typed=0:"\u{1b}[1;5F"
+terminal | ctrl+enter | typed=0:"\r"
+terminal | ctrl+f | status="Find in terminal: type to search, Enter next, Shift+Enter prev, Esc close" +terminal_find
+terminal | ctrl+f10 | status="Run to Cursor: no debug session"
+terminal | ctrl+f12 | typed=0:"\u{1b}[24;5~"
+terminal | ctrl+f2 | typed=0:"\u{1b}[1;5Q"
+terminal | ctrl+g g | typed=0:"\u{7}g"
+terminal | ctrl+home | typed=0:"\u{1b}[1;5H"
+terminal | ctrl+j | focus=editor panel=hidden
+terminal | ctrl+k | typed=0:"\u{b}"
+terminal | ctrl+k [ | typed=0:"\u{b}["
+terminal | ctrl+k \ | typed=0:"\u{b}\\"
+terminal | ctrl+k ] | typed=0:"\u{b}]"
+terminal | ctrl+k a | typed=0:"\u{b}a"
+terminal | ctrl+k b | typed=0:"\u{b}b"
+terminal | ctrl+k c | typed=0:"\u{b}c"
+terminal | ctrl+k ctrl+/ | typed=0:"\u{b}\u{1f}"
+terminal | ctrl+k ctrl+0 | typed=0:"\u{b}"
+terminal | ctrl+k ctrl+1 | typed=0:"\u{b}"
+terminal | ctrl+k ctrl+2 | typed=0:"\u{b}\0"
+terminal | ctrl+k ctrl+3 | typed=0:"\u{b}\u{1b}"
+terminal | ctrl+k ctrl+4 | typed=0:"\u{b}\u{1c}"
+terminal | ctrl+k ctrl+5 | typed=0:"\u{b}\u{1d}"
+terminal | ctrl+k ctrl+6 | typed=0:"\u{b}\u{1e}"
+terminal | ctrl+k ctrl+7 | typed=0:"\u{b}\u{1f}"
+terminal | ctrl+k ctrl+8 | typed=0:"\u{b}\u{7f}"
+terminal | ctrl+k ctrl+9 | typed=0:"\u{b}"
+terminal | ctrl+k ctrl+f | status="Find in terminal: type to search, Enter next, Shift+Enter prev, Esc close" typed=0:"\u{b}" +terminal_find
+terminal | ctrl+k ctrl+i | typed=0:"\u{b}\t"
+terminal | ctrl+k ctrl+j | focus=editor panel=hidden typed=0:"\u{b}"
+terminal | ctrl+k ctrl+l | typed=0:"\u{b}\u{c}"
+terminal | ctrl+k ctrl+m | typed=0:"\u{b}\r"
+terminal | ctrl+k ctrl+q | typed=0:"\u{b}\u{11}"
+terminal | ctrl+k ctrl+s | status="Saved <root>/main.rs" typed=0:"\u{b}"
+terminal | ctrl+k ctrl+t | typed=0:"\u{b}\u{14}"
+terminal | ctrl+k d | typed=0:"\u{b}d"
+terminal | ctrl+k e | typed=0:"\u{b}e"
+terminal | ctrl+k enter | typed=0:"\u{b}\r"
+terminal | ctrl+k f | typed=0:"\u{b}f"
+terminal | ctrl+k h | typed=0:"\u{b}h"
+terminal | ctrl+k i | typed=0:"\u{b}i"
+terminal | ctrl+k k | typed=0:"\u{b}k"
+terminal | ctrl+k m | typed=0:"\u{b}m"
+terminal | ctrl+k n | typed=0:"\u{b}n"
+terminal | ctrl+k o | typed=0:"\u{b}o"
+terminal | ctrl+k p | typed=0:"\u{b}p"
+terminal | ctrl+k q | typed=0:"\u{b}q"
+terminal | ctrl+k r | typed=0:"\u{b}r"
+terminal | ctrl+k right | typed=0:"\u{b}\u{1b}[C"
+terminal | ctrl+k s | typed=0:"\u{b}s"
+terminal | ctrl+k shift+\ | typed=0:"\u{b}\\"
+terminal | ctrl+k shift+c | typed=0:"\u{b}C"
+terminal | ctrl+k shift+d | typed=0:"\u{b}D"
+terminal | ctrl+k shift+e | typed=0:"\u{b}E"
+terminal | ctrl+k shift+enter | typed=0:"\u{b}\r"
+terminal | ctrl+k shift+f | typed=0:"\u{b}F"
+terminal | ctrl+k shift+h | typed=0:"\u{b}H"
+terminal | ctrl+k shift+i | typed=0:"\u{b}I"
+terminal | ctrl+k shift+l | typed=0:"\u{b}L"
+terminal | ctrl+k shift+n | typed=0:"\u{b}N"
+terminal | ctrl+k shift+o | typed=0:"\u{b}O"
+terminal | ctrl+k shift+p | typed=0:"\u{b}P"
+terminal | ctrl+k shift+q | typed=0:"\u{b}Q"
+terminal | ctrl+k shift+r | typed=0:"\u{b}R"
+terminal | ctrl+k shift+s | typed=0:"\u{b}S"
+terminal | ctrl+k shift+t | typed=0:"\u{b}T"
+terminal | ctrl+k shift+u | typed=0:"\u{b}U"
+terminal | ctrl+k shift+v | typed=0:"\u{b}V"
+terminal | ctrl+k shift+w | typed=0:"\u{b}W"
+terminal | ctrl+k u | typed=0:"\u{b}u"
+terminal | ctrl+k v | typed=0:"\u{b}v"
+terminal | ctrl+k w | typed=0:"\u{b}w"
+terminal | ctrl+k x | typed=0:"\u{b}x"
+terminal | ctrl+k y | typed=0:"\u{b}y"
+terminal | ctrl+k z | typed=0:"\u{b}z"
+terminal | ctrl+l | typed=0:"\u{c}"
+terminal | ctrl+left | typed=0:"\u{1b}[1;5D"
+terminal | ctrl+n | typed=0:"\u{e}"
+terminal | ctrl+o | typed=0:"\u{f}"
+terminal | ctrl+p | status="Go to File: 3 files indexed — Esc to close" +quick_open("" @0 > ".vscode/launch.json")
+terminal | ctrl+p # | status="Go to Symbol in Workspace: type to search — Esc to close" +workspace_symbols("" @0 > "")
+terminal | ctrl+q | typed=0:"\u{11}"
+terminal | ctrl+r | typed=0:"\u{12}"
+terminal | ctrl+right | typed=0:"\u{1b}[1;5C"
+terminal | ctrl+s | status="Saved <root>/main.rs"
+terminal | ctrl+shift+- | -
+terminal | ctrl+shift+. | -
+terminal | ctrl+shift+/ | typed=0:"\u{1f}"
+terminal | ctrl+shift+\ | typed=0:"\u{1c}"
+terminal | ctrl+shift+b | status="No build task detected; pick one"
+terminal | ctrl+shift+c | status="Nothing selected: drag to select first"
+terminal | ctrl+shift+d | focus=side side=RunDebug
+terminal | ctrl+shift+e | focus=side
+terminal | ctrl+shift+enter | typed=0:"\r"
+terminal | ctrl+shift+f | focus=side side=Search search="" @Query:0 hits=0@0
+terminal | ctrl+shift+f12 | typed=0:"\u{1b}[24;6~"
+terminal | ctrl+shift+f5 | +input("Program" "" @0)
+terminal | ctrl+shift+g | typed=0:"\u{7}"
+terminal | ctrl+shift+h | +history("All " @0 > #0)
+terminal | ctrl+shift+j | panel=Terminal+max
+terminal | ctrl+shift+k | typed=0:"\u{b}"
+terminal | ctrl+shift+l | typed=0:"\u{c}"
+terminal | ctrl+shift+m | panel=Problems
+terminal | ctrl+shift+n | typed=0:"\u{e}"
+terminal | ctrl+shift+o | status="Go to Symbol: 0 symbols — Esc to close" +go_to_symbol("" @0 > "")
+terminal | ctrl+shift+p | status="Command Palette: 386 commands — Esc to close" +palette("" @0 > "Move Line Up")
+terminal | ctrl+shift+pagedown | -
+terminal | ctrl+shift+pageup | -
+terminal | ctrl+shift+r | focus=side side=Remote
+terminal | ctrl+shift+s | status="Saved <root>/main.rs"
+terminal | ctrl+shift+space | status="Quick select: type a label to copy, UPPERCASE pastes, Esc cancels"
+terminal | ctrl+shift+t | status="Split terminal: 2 active" terms=2@1
+terminal | ctrl+shift+u | panel=Output
+terminal | ctrl+shift+v | typed=0:"CLIP"
+terminal | ctrl+shift+w | status="Cannot close the last terminal; press Ctrl+J to hide"
+terminal | ctrl+shift+x | focus=side side=Extensions
+terminal | ctrl+shift+y | status="Copy mode: h/j/k/l w/b/e 0/$ g/G move, v/V/^V select, y copies, Esc exits"
+terminal | ctrl+shift+z | typed=0:"\u{1a}"
+terminal | ctrl+space | typed=0:"\0"
+terminal | ctrl+t | typed=0:"\u{14}"
+terminal | ctrl+u | typed=0:"\u{15}"
+terminal | ctrl+v | typed=0:"\u{16}"
+terminal | ctrl+w | typed=0:"\u{17}"
+terminal | ctrl+x | typed=0:"\u{18}"
+terminal | ctrl+y y | typed=0:"\u{19}y"
+terminal | ctrl+z | typed=0:"\u{1a}"
+terminal | delete | typed=0:"\u{1b}[3~"
+terminal | down | typed=0:"\u{1b}[B"
+terminal | down enter | typed=0:"\u{1b}[B\r"
+terminal | end | typed=0:"\u{1b}[F"
+terminal | enter | typed=0:"\r"
+terminal | esc | typed=0:"\u{1b}"
+terminal | esc esc | typed=0:"\u{1b}\u{1b}"
+terminal | f1 | status="Shortcuts: Esc to close" +shortcuts
+terminal | f10 | typed=0:"\u{1b}[21~"
+terminal | f11 | typed=0:"\u{1b}[23~"
+terminal | f12 | typed=0:"\u{1b}[24~"
+terminal | f2 | typed=0:"\u{1b}OQ"
+terminal | f3 | typed=0:"\u{1b}OR"
+terminal | f4 | typed=0:"\u{1b}OS"
+terminal | f5 | typed=0:"\u{1b}[15~"
+terminal | f6 | focus=side
+terminal | f7 | typed=0:"\u{1b}[18~"
+terminal | f9 | typed=0:"\u{1b}[20~"
+terminal | home | typed=0:"\u{1b}[H"
+terminal | left | typed=0:"\u{1b}[D"
+terminal | n | typed=0:"n"
+terminal | pagedown | typed=0:"\u{1b}[6~"
+terminal | pageup | typed=0:"\u{1b}[5~"
+terminal | r | typed=0:"r"
+terminal | right | typed=0:"\u{1b}[C"
+terminal | s | typed=0:"s"
+terminal | shift+backtab | typed=0:"\u{1b}[Z"
+terminal | shift+cmd+\ | typed=0:"\\"
+terminal | shift+cmd+t | -
+terminal | shift+down | typed=0:"\u{1b}[1;2B"
+terminal | shift+end | -
+terminal | shift+f11 | -
+terminal | shift+f12 | typed=0:"\u{1b}[24;2~"
+terminal | shift+f4 | typed=0:"\u{1b}[1;2S"
+terminal | shift+f5 | status="Debug session stopped"
+terminal | shift+f7 | typed=0:"\u{1b}[18;2~"
+terminal | shift+f8 | status="Screencast Mode on: the keys you press show at the bottom (Shift+F8 to stop)" +screencast
+terminal | shift+f9 | +prompt("Add Conditional Breakpoint · line 5" "")
+terminal | shift+home | -
+terminal | shift+left | typed=0:"\u{1b}[1;2D"
+terminal | shift+pagedown | -
+terminal | shift+pageup | -
+terminal | shift+right | typed=0:"\u{1b}[1;2C"
+terminal | shift+up | typed=0:"\u{1b}[1;2A"
+terminal | space | typed=0:" "
+terminal | tab | typed=0:"\t"
+terminal | u | typed=0:"u"
+terminal | up | typed=0:"\u{1b}[A"
+search | alt+backspace | search="" @Query:0 hits=0@0
+search | alt+c | status="Search: Match Case on" search="total" @Query:5 +case hits=0@0
+search | alt+cmd+\ | status="Search: unhandled Cmd+\\"
+search | alt+cmd+f | status="Search: unhandled Cmd+f"
+search | alt+cmd+left | -
+search | alt+cmd+right | -
+search | alt+d | search="total" @Query:5 include="" exclude="" hits=4@0
+search | alt+delete | -
+search | alt+down | search="total" @Query:5 hits=4@1
+search | alt+f12 | -
+search | alt+f9 | status="Start debugging first to set exception breakpoints"
+search | alt+l | -
+search | alt+left | search="total" @Query:0 hits=4@0
+search | alt+o | -
+search | alt+p | status="Search: Preserve Case on" search="total" @Query:5 +preserve hits=4@0
+search | alt+r | status="Search: Use Regular Expression on" search="total" @Query:5 +regex hits=0@0
+search | alt+right | -
+search | alt+shift+a | -
+search | alt+shift+down | search="total" @Query:5 hits=4@1
+search | alt+shift+f12 | -
+search | alt+shift+f9 | +prompt("Add Logpoint · line 5" "")
+search | alt+shift+i | -
+search | alt+shift+left | search="total" @Query:0 hits=4@0
+search | alt+shift+right | -
+search | alt+shift+up | -
+search | alt+up | -
+search | alt+w | status="Search: Match Whole Word on" search="total" @Query:5 +word hits=0@0
+search | alt+z | -
+search | backspace | search="tota" @Query:4 hits=0@0
+search | cmd+[ | status="Search: unhandled Cmd+["
+search | cmd+\ | focus=editor groups=0,0+60x40[*main.rs] *60,0+60x40[*main.rs] search="total" hits=4@0
+search | cmd+] | status="Search: unhandled Cmd+]"
+search | cmd+a | search="total" @Query:5 sel=0-5 hits=4@0
+search | cmd+c | -
+search | cmd+e | status="vim mode on" +vim
+search | cmd+f12 | -
+search | cmd+t | focus=panel status="Split terminal: 2 active" terms=2@1 search="total" hits=4@0
+search | cmd+v | status="Cmd+V: pasted into search field" search="totalCLIP" @Query:9 hits=0@0
+search | cmd+w | status="Search: unhandled Cmd+w"
+search | ctrl+- | status="Search: unhandled Ctrl+-"
+search | ctrl+. | status="Search: unhandled Ctrl+."
+search | ctrl+/ | status="Search: unhandled Ctrl+/"
+search | ctrl+1 | status="Search: unhandled Ctrl+1"
+search | ctrl+2 | status="Search: unhandled Ctrl+2"
+search | ctrl+3 | status="Search: unhandled Ctrl+3"
+search | ctrl+4 | status="Search: unhandled Ctrl+4"
+search | ctrl+5 | status="Search: unhandled Ctrl+5"
+search | ctrl+6 | status="Search: unhandled Ctrl+6"
+search | ctrl+7 | status="Search: unhandled Ctrl+7"
+search | ctrl+8 | status="Search: unhandled Ctrl+8"
+search | ctrl+9 | status="Search: unhandled Ctrl+9"
+search | ctrl+a | search="total" @Query:5 sel=0-5 hits=4@0
+search | ctrl+a ctrl+s | status="Saved <root>/main.rs" search="total" @Query:5 sel=0-5 hits=4@0
+search | ctrl+alt+, | status="Search: unhandled Ctrl+,"
+search | ctrl+alt+- | status="Search: unhandled Ctrl+-"
+search | ctrl+alt+. | status="Search: unhandled Ctrl+."
+search | ctrl+alt+= | status="Search: unhandled Ctrl+="
+search | ctrl+alt+\ | status="Search: unhandled Ctrl+\\"
+search | ctrl+alt+b | status="Secondary side bar shown" +aux
+search | ctrl+alt+c | -
+search | ctrl+alt+down | search="total" @Query:5 hits=4@1
+search | ctrl+alt+f | status="Search: unhandled Ctrl+f"
+search | ctrl+alt+m | status="Minimap off" -minimap
+search | ctrl+alt+r | status="Search: unhandled Ctrl+r"
+search | ctrl+alt+s | status="Save All: nothing to save"
+search | ctrl+alt+shift+a | search="total" @Query:5 sel=0-5 hits=4@0
+search | ctrl+alt+shift+b | status="Search: unhandled Ctrl+B"
+search | ctrl+alt+shift+c | -
+search | ctrl+alt+shift+d | status="Search: unhandled Ctrl+D"
+search | ctrl+alt+shift+down | search="total" @Query:5 hits=4@1
+search | ctrl+alt+shift+e | status="Search: unhandled Ctrl+E"
+search | ctrl+alt+shift+f | search="total" @Query:5 sel=0-5 hits=4@0
+search | ctrl+alt+shift+g | status="Search: unhandled Ctrl+G"
+search | ctrl+alt+shift+j | status="Search: unhandled Ctrl+J"
+search | ctrl+alt+shift+k | status="Search: unhandled Ctrl+K"
+search | ctrl+alt+shift+l | status="Search: unhandled Ctrl+L"
+search | ctrl+alt+shift+left | search="total" @Query:0 hits=4@0
+search | ctrl+alt+shift+n | status="Search: unhandled Ctrl+N"
+search | ctrl+alt+shift+pagedown | -
+search | ctrl+alt+shift+pageup | -
+search | ctrl+alt+shift+right | -
+search | ctrl+alt+shift+s | status="Search: unhandled Ctrl+S"
+search | ctrl+alt+shift+t | focus=panel status="Split terminal: 2 active" terms=2@1 search="total" hits=4@0
+search | ctrl+alt+shift+u | status="Search: unhandled Ctrl+U"
+search | ctrl+alt+shift+up | -
+search | ctrl+alt+shift+w | status="Search: unhandled Ctrl+W"
+search | ctrl+alt+t | status="Search: unhandled Ctrl+t"
+search | ctrl+alt+up | -
+search | ctrl+b | side=hidden
+search | ctrl+backspace | search="" @Query:0 hits=0@0
+search | ctrl+c | -
+search | ctrl+d | status="Search: unhandled Ctrl+d"
+search | ctrl+d d | status="Search: unhandled Ctrl+d" search="totald" @Query:6 hits=0@0
+search | ctrl+delete | -
+search | ctrl+e | status="Search: unhandled Ctrl+e"
+search | ctrl+end | -
+search | ctrl+enter | focus=editor caret=1:35 status="Opened main.rs at line 2" search="total" hits=4@0
+search | ctrl+f | status="Search: unhandled Ctrl+f"
+search | ctrl+f10 | status="Run to Cursor: no debug session"
+search | ctrl+f12 | -
+search | ctrl+f2 | -
+search | ctrl+g g | status="Search: unhandled Ctrl+g" search="totalg" @Query:6 hits=0@0
+search | ctrl+home | search="total" @Query:0 hits=4@0
+search | ctrl+j | panel=hidden
+search | ctrl+k | +leader
+search | ctrl+k [ | status="Cannot collapse the last expanded terminal"
+search | ctrl+k \ | focus=editor groups=*0,0+120x20[*main.rs] 0,20+120x20[*main.rs] search="total" hits=4@0
+search | ctrl+k ] | status="No collapsed terminal panes"
+search | ctrl+k a | status="Not a persistent session (start one with `croft attach`)"
+search | ctrl+k b | side=Testing search="total" hits=4@0
+search | ctrl+k c | status="Compare with Selected: nothing selected yet"
+search | ctrl+k ctrl+/ | folded=1-2
+search | ctrl+k ctrl+0 | caret=3:8 folded=1-2,4-7,11-14
+search | ctrl+k ctrl+1 | caret=3:8 folded=1-2,4-7,11-14
+search | ctrl+k ctrl+2 | folded=6,12
+search | ctrl+k ctrl+3 | -
+search | ctrl+k ctrl+4 | -
+search | ctrl+k ctrl+5 | -
+search | ctrl+k ctrl+6 | -
+search | ctrl+k ctrl+7 | -
+search | ctrl+k ctrl+8 | folded=11-14
+search | ctrl+k ctrl+9 | -
+search | ctrl+k ctrl+f | status="Select something to format"
+search | ctrl+k ctrl+i | status="Broadcast input needs at least two terminal panes (Cmd+T splits)"
+search | ctrl+k ctrl+j | -
+search | ctrl+k ctrl+l | caret=3:8 folded=4-7
+search | ctrl+k ctrl+m | status="No bookmarks (Cmd+Opt+Shift+K sets one)"
+search | ctrl+k ctrl+q | status="No edits this session"
+search | ctrl+k ctrl+s | +list("KeyboardShortcuts " @0 > "Move Line Up  ·  Alt+↑")
+search | ctrl+k ctrl+t | +menu("  Croft Black" > "✔ Croft Loch")
+search | ctrl+k d | focus=editor tabs=main.rs,*terminal-<pid>-<pane>-scrollback.log text=0L#811c9dc5 caret=0:0 status="Opened 1 scrollback lines as a rendered log" search="total" hits=4@0
+search | ctrl+k e | side=Explorer status="Revealed main.rs in Explorer" tree=./+,.vscode/,docs/,main.rs > main.rs search="total" hits=4@0
+search | ctrl+k enter | status="No test runner detected in this workspace (is its extension enabled?)"
+search | ctrl+k f | status="Format on Save: on"
+search | ctrl+k h | status="Call hierarchy: no language server for this file"
+search | ctrl+k i | status="Broadcast input needs at least two terminal panes (Cmd+T splits)"
+search | ctrl+k k | status="Cleared terminal"
+search | ctrl+k m | status="Only one terminal open"
+search | ctrl+k n | search="totaln" @Query:6 hits=0@0
+search | ctrl+k o | status="New Window failed: opening a new window is only supported on macOS"
+search | ctrl+k p | status="Pinned tab"
+search | ctrl+k q | status="Navigator is not active (run croft pair in this workspace)"
+search | ctrl+k r | +prompt("Rename Terminal" "")
+search | ctrl+k right | status="No tabs to the right to close"
+search | ctrl+k s | status="Selected main.rs for compare"
+search | ctrl+k shift+\ | focus=editor groups=0,0+60x40[*main.rs] *60,0+60x40[*main.rs] search="total" hits=4@0
+search | ctrl+k shift+c | status="Compare with Selected: nothing selected yet"
+search | ctrl+k shift+d | status="Type hierarchy: no language server for this file"
+search | ctrl+k shift+e | status="No code lens on this line"
+search | ctrl+k shift+enter | status="No test runner detected in this workspace"
+search | ctrl+k shift+f | focus=editor tabs=main.rs,*Search: total text=9L#c0995ee4 caret=0:0 status="Search Editor: 4 result(s)" search="total" hits=4@0
+search | ctrl+k shift+h | status="Call hierarchy: no language server for this file"
+search | ctrl+k shift+i | status=" excluded from broadcast input"
+search | ctrl+k shift+l | +input("New worktree lane" "" @0)
+search | ctrl+k shift+n | search="totalN" @Query:6 hits=0@0
+search | ctrl+k shift+o | status="New Window failed: opening a new window is only supported on macOS"
+search | ctrl+k shift+p | status="Tab is already kept open"
+search | ctrl+k shift+q | status="Not attached to a persistent session: nothing to detach from"
+search | ctrl+k shift+r | status="Not a Search Editor"
+search | ctrl+k shift+s | status="Selected main.rs for compare"
+search | ctrl+k shift+t | status="No recently closed terminals"
+search | ctrl+k shift+u | status="Type hierarchy: no language server for this file"
+search | ctrl+k shift+v | focus=editor tabs=main.rs,*main · main.rs scroll=3:0 status="Opened main as its own tab" search="total" hits=4@0
+search | ctrl+k shift+w | status="No closed tabs to reopen"
+search | ctrl+k u | tabs=*untitled text=0L#811c9dc5 caret=0:0 status="Closed 1 saved tab"
+search | ctrl+k v | status="Live Run runs Python files (.py)"
+search | ctrl+k w | tabs=*untitled text=0L#811c9dc5 caret=0:0 status="Closed 1 tab"
+search | ctrl+k x | status="No AI stream is active"
+search | ctrl+k y | status="Navigator is not active (run croft pair in this workspace)"
+search | ctrl+k z | side=hidden panel=hidden status="Zen Mode on" +zen -activity_bar -status_bar
+search | ctrl+l | status="Search: unhandled Ctrl+l"
+search | ctrl+left | search="total" @Query:0 hits=4@0
+search | ctrl+n | focus=editor tabs=main.rs,*Untitled-1 text=0L#811c9dc5 caret=0:0 status="Untitled-1: saving asks where to write it" search="total" hits=4@0
+search | ctrl+o | status="Search: unhandled Ctrl+o"
+search | ctrl+p | status="Go to File: 3 files indexed — Esc to close" +quick_open("" @0 > ".vscode/launch.json")
+search | ctrl+p # | status="Go to Symbol in Workspace: type to search — Esc to close" +workspace_symbols("" @0 > "")
+search | ctrl+q | +quit
+search | ctrl+r | status="Search: unhandled Ctrl+r"
+search | ctrl+right | -
+search | ctrl+s | status="Saved <root>/main.rs"
+search | ctrl+shift+- | status="Search: unhandled Ctrl+-"
+search | ctrl+shift+. | focus=editor search="total" hits=4@0 +menu(".vscode/" > "main.rs")
+search | ctrl+shift+/ | status="Search: unhandled Ctrl+/"
+search | ctrl+shift+\ | status="Search: unhandled Ctrl+\\"
+search | ctrl+shift+b | status="No build task detected; pick one"
+search | ctrl+shift+c | -
+search | ctrl+shift+d | side=RunDebug search="total" hits=4@0
+search | ctrl+shift+e | side=Explorer search="total" hits=4@0
+search | ctrl+shift+enter | focus=editor caret=1:35 status="Opened main.rs at line 2" search="total" hits=4@0
+search | ctrl+shift+f | search="total" @Query:5 sel=0-5 hits=4@0
+search | ctrl+shift+f12 | -
+search | ctrl+shift+f5 | +input("Program" "" @0)
+search | ctrl+shift+g | status="Search: unhandled Ctrl+G"
+search | ctrl+shift+h | search="total" @Replace:0 replace="" hits=4@0
+search | ctrl+shift+j | focus=panel panel=Terminal+max search="total" hits=4@0
+search | ctrl+shift+k | status="Search: unhandled Ctrl+K"
+search | ctrl+shift+l | status="Search: unhandled Ctrl+L"
+search | ctrl+shift+m | focus=panel panel=Problems search="total" hits=4@0
+search | ctrl+shift+n | status="Search: unhandled Ctrl+N"
+search | ctrl+shift+o | status="Go to Symbol: 0 symbols — Esc to close" +go_to_symbol("" @0 > "")
+search | ctrl+shift+p | status="Command Palette: 386 commands — Esc to close" +palette("" @0 > "Move Line Up")
+search | ctrl+shift+pagedown | -
+search | ctrl+shift+pageup | -
+search | ctrl+shift+r | side=Remote search="total" hits=4@0
+search | ctrl+shift+s | status="Saved <root>/main.rs"
+search | ctrl+shift+space | status="Search: unhandled Ctrl+ "
+search | ctrl+shift+t | focus=panel status="Split terminal: 2 active" terms=2@1 search="total" hits=4@0
+search | ctrl+shift+u | focus=panel panel=Output search="total" hits=4@0
+search | ctrl+shift+v | status="Cmd+V: pasted into search field" search="totalCLIP" @Query:9 hits=0@0
+search | ctrl+shift+w | status="Search: unhandled Ctrl+W"
+search | ctrl+shift+x | side=Extensions search="total" hits=4@0
+search | ctrl+shift+y | status="Search: unhandled Ctrl+Y"
+search | ctrl+shift+z | status="Search: unhandled Ctrl+Z"
+search | ctrl+space | status="Search: unhandled Ctrl+ "
+search | ctrl+t | status="Search: unhandled Ctrl+t"
+search | ctrl+u | status="Search: unhandled Ctrl+u"
+search | ctrl+v | status="Cmd+V: pasted into search field" search="totalCLIP" @Query:9 hits=0@0
+search | ctrl+w | status="Search: unhandled Ctrl+w"
+search | ctrl+x | -
+search | ctrl+y y | status="Search: unhandled Ctrl+y" search="totaly" @Query:6 hits=0@0
+search | ctrl+z | status="Search: unhandled Ctrl+z"
+search | delete | -
+search | down | search="total" @Query:5 hits=4@1
+search | down enter | focus=editor status="Opened main.rs at line 5" search="total" hits=4@1
+search | end | -
+search | enter | focus=editor caret=1:35 status="Opened main.rs at line 2" search="total" hits=4@0
+search | esc | search="" @Query:0 hits=0@0
+search | esc esc | side=Explorer search="" hits=0@0
+search | f1 | status="Shortcuts: Esc to close" +shortcuts
+search | f10 | -
+search | f11 | -
+search | f12 | -
+search | f2 | -
+search | f3 | -
+search | f4 | -
+search | f5 | +input("Program" "" @0)
+search | f6 | focus=editor search="total" hits=4@0
+search | f7 | -
+search | f9 | marks=5/- status="Breakpoint set at line 5"
+search | home | search="total" @Query:0 hits=4@0
+search | left | search="total" @Query:4 hits=4@0
+search | n | search="totaln" @Query:6 hits=0@0
+search | pagedown | -
+search | pageup | -
+search | r | search="totalr" @Query:6 hits=0@0
+search | right | -
+search | s | search="totals" @Query:6 hits=0@0
+search | shift+backtab | -
+search | shift+cmd+\ | status="Search: unhandled Cmd+\\"
+search | shift+cmd+t | focus=panel search="total" hits=4@0
+search | shift+down | search="total" @Query:5 hits=4@1
+search | shift+end | -
+search | shift+f11 | -
+search | shift+f12 | -
+search | shift+f4 | -
+search | shift+f5 | status="Debug session stopped"
+search | shift+f7 | -
+search | shift+f8 | status="Screencast Mode on: the keys you press show at the bottom (Shift+F8 to stop)" +screencast
+search | shift+f9 | +prompt("Add Conditional Breakpoint · line 5" "")
+search | shift+home | search="total" @Query:0 hits=4@0
+search | shift+left | search="total" @Query:4 hits=4@0
+search | shift+pagedown | -
+search | shift+pageup | -
+search | shift+right | -
+search | shift+up | -
+search | space | search="total " @Query:6 hits=0@0
+search | tab | -
+search | u | search="totalu" @Query:6 hits=0@0
+search | up | -
+scm | alt+backspace | scm="Ship i"@6 +focus StagedModified:docs/notes.md Untracked:todo.txt
+scm | alt+c | -
+scm | alt+cmd+\ | -
+scm | alt+cmd+f | -
+scm | alt+cmd+left | -
+scm | alt+cmd+right | -
+scm | alt+d | -
+scm | alt+delete | -
+scm | alt+down | scm="Ship it"@7 +focus +list sel=0 multi=0 StagedModified:docs/notes.md Untracked:todo.txt
+scm | alt+f12 | -
+scm | alt+f9 | status="Start debugging first to set exception breakpoints"
+scm | alt+l | -
+scm | alt+left | scm="Ship it"@6 +focus StagedModified:docs/notes.md Untracked:todo.txt
+scm | alt+o | -
+scm | alt+p | -
+scm | alt+r | -
+scm | alt+right | -
+scm | alt+shift+a | -
+scm | alt+shift+down | scm="Ship it"@7 +focus +list sel=0 multi=0 StagedModified:docs/notes.md Untracked:todo.txt
+scm | alt+shift+f12 | -
+scm | alt+shift+f9 | +prompt("Add Logpoint · line 5" "")
+scm | alt+shift+i | -
+scm | alt+shift+left | scm="Ship it"@6 +focus StagedModified:docs/notes.md Untracked:todo.txt
+scm | alt+shift+right | -
+scm | alt+shift+up | -
+scm | alt+up | -
+scm | alt+w | -
+scm | alt+z | -
+scm | backspace | scm="Ship i"@6 +focus StagedModified:docs/notes.md Untracked:todo.txt
+scm | cmd+[ | -
+scm | cmd+\ | focus=editor groups=0,0+60x40[*main.rs] *60,0+60x40[*main.rs] scm="Ship it"@7 StagedModified:docs/notes.md Untracked:todo.txt
+scm | cmd+] | -
+scm | cmd+a | status="Selected 2 change(s)" scm="Ship it"@7 +focus sel=0 multi=0-1 StagedModified:docs/notes.md Untracked:todo.txt
+scm | cmd+c | -
+scm | cmd+e | status="vim mode on" +vim
+scm | cmd+f12 | -
+scm | cmd+t | focus=panel status="Split terminal: 2 active" terms=2@1 scm="Ship it"@7 StagedModified:docs/notes.md Untracked:todo.txt
+scm | cmd+v | scm="Ship itCLIP"@11 +focus StagedModified:docs/notes.md Untracked:todo.txt
+scm | cmd+w | -
+scm | ctrl+- | -
+scm | ctrl+. | -
+scm | ctrl+/ | -
+scm | ctrl+1 | -
+scm | ctrl+2 | -
+scm | ctrl+3 | -
+scm | ctrl+4 | -
+scm | ctrl+5 | -
+scm | ctrl+6 | -
+scm | ctrl+7 | -
+scm | ctrl+8 | -
+scm | ctrl+9 | -
+scm | ctrl+a | status="Selected 2 change(s)" scm="Ship it"@7 +focus sel=0 multi=0-1 StagedModified:docs/notes.md Untracked:todo.txt
+scm | ctrl+a ctrl+s | status="Staged todo.txt" scm="Ship it"@7 +focus sel=0 multi=0-1 StagedModified:docs/notes.md StagedAdded:todo.txt git=main,M.:docs/notes.md,A.:todo.txt
+scm | ctrl+alt+, | -
+scm | ctrl+alt+- | -
+scm | ctrl+alt+. | -
+scm | ctrl+alt+= | -
+scm | ctrl+alt+\ | -
+scm | ctrl+alt+b | status="Secondary side bar shown" +aux
+scm | ctrl+alt+c | -
+scm | ctrl+alt+down | scm="Ship it"@7 +focus +list sel=0 multi=0 StagedModified:docs/notes.md Untracked:todo.txt
+scm | ctrl+alt+f | -
+scm | ctrl+alt+m | status="Minimap off" -minimap
+scm | ctrl+alt+r | -
+scm | ctrl+alt+s | status="Save All: nothing to save"
+scm | ctrl+alt+shift+a | status="Selected 2 change(s)" scm="Ship it"@7 +focus sel=0 multi=0-1 StagedModified:docs/notes.md Untracked:todo.txt
+scm | ctrl+alt+shift+b | -
+scm | ctrl+alt+shift+c | -
+scm | ctrl+alt+shift+d | -
+scm | ctrl+alt+shift+down | scm="Ship it"@7 +focus +list sel=0 multi=0 StagedModified:docs/notes.md Untracked:todo.txt
+scm | ctrl+alt+shift+e | -
+scm | ctrl+alt+shift+f | side=Search search="" @Query:0 hits=0@0 scm="Ship it"@7 StagedModified:docs/notes.md Untracked:todo.txt
+scm | ctrl+alt+shift+g | -
+scm | ctrl+alt+shift+j | -
+scm | ctrl+alt+shift+k | -
+scm | ctrl+alt+shift+l | -
+scm | ctrl+alt+shift+left | scm="Ship it"@6 +focus StagedModified:docs/notes.md Untracked:todo.txt
+scm | ctrl+alt+shift+n | -
+scm | ctrl+alt+shift+pagedown | -
+scm | ctrl+alt+shift+pageup | -
+scm | ctrl+alt+shift+right | -
+scm | ctrl+alt+shift+s | status="No change selected to stage"
+scm | ctrl+alt+shift+t | focus=panel status="Split terminal: 2 active" terms=2@1 scm="Ship it"@7 StagedModified:docs/notes.md Untracked:todo.txt
+scm | ctrl+alt+shift+u | -
+scm | ctrl+alt+shift+up | -
+scm | ctrl+alt+shift+w | -
+scm | ctrl+alt+t | -
+scm | ctrl+alt+up | -
+scm | ctrl+b | side=hidden
+scm | ctrl+backspace | scm="Ship i"@6 +focus StagedModified:docs/notes.md Untracked:todo.txt
+scm | ctrl+c | -
+scm | ctrl+d | -
+scm | ctrl+d d | scm="Ship itd"@8 +focus StagedModified:docs/notes.md Untracked:todo.txt
+scm | ctrl+delete | -
+scm | ctrl+e | -
+scm | ctrl+end | -
+scm | ctrl+enter | status="Commit ok; push failed: no remote to publish this branch to" scm=""@0 +focus Untracked:todo.txt git=main,??:todo.txt +commit_feedback("commit ok; push failed: no remote to publish this branch to")
+scm | ctrl+f | -
+scm | ctrl+f10 | status="Run to Cursor: no debug session"
+scm | ctrl+f12 | -
+scm | ctrl+f2 | -
+scm | ctrl+g g | scm="Ship itg"@8 +focus StagedModified:docs/notes.md Untracked:todo.txt
+scm | ctrl+home | scm="Ship it"@0 +focus StagedModified:docs/notes.md Untracked:todo.txt
+scm | ctrl+j | panel=hidden
+scm | ctrl+k | +leader
+scm | ctrl+k [ | status="Cannot collapse the last expanded terminal"
+scm | ctrl+k \ | focus=editor groups=*0,0+120x20[*main.rs] 0,20+120x20[*main.rs] scm="Ship it"@7 StagedModified:docs/notes.md Untracked:todo.txt
+scm | ctrl+k ] | status="No collapsed terminal panes"
+scm | ctrl+k a | status="Not a persistent session (start one with `croft attach`)"
+scm | ctrl+k b | side=Testing scm="Ship it"@7 StagedModified:docs/notes.md Untracked:todo.txt
+scm | ctrl+k c | status="Compare with Selected: nothing selected yet"
+scm | ctrl+k ctrl+/ | folded=1-2
+scm | ctrl+k ctrl+0 | caret=3:8 folded=1-2,4-7,11-14
+scm | ctrl+k ctrl+1 | caret=3:8 folded=1-2,4-7,11-14
+scm | ctrl+k ctrl+2 | folded=6,12
+scm | ctrl+k ctrl+3 | -
+scm | ctrl+k ctrl+4 | -
+scm | ctrl+k ctrl+5 | -
+scm | ctrl+k ctrl+6 | -
+scm | ctrl+k ctrl+7 | -
+scm | ctrl+k ctrl+8 | folded=11-14
+scm | ctrl+k ctrl+9 | -
+scm | ctrl+k ctrl+f | status="Select something to format"
+scm | ctrl+k ctrl+i | status="Broadcast input needs at least two terminal panes (Cmd+T splits)"
+scm | ctrl+k ctrl+j | -
+scm | ctrl+k ctrl+l | caret=3:8 folded=4-7
+scm | ctrl+k ctrl+m | status="No bookmarks (Cmd+Opt+Shift+K sets one)"
+scm | ctrl+k ctrl+q | status="No edits this session"
+scm | ctrl+k ctrl+s | +list("KeyboardShortcuts " @0 > "Move Line Up  ·  Alt+↑")
+scm | ctrl+k ctrl+t | +menu("  Croft Black" > "✔ Croft Loch")
+scm | ctrl+k d | focus=editor tabs=main.rs,*terminal-<pid>-<pane>-scrollback.log text=0L#811c9dc5 caret=0:0 status="Opened 1 scrollback lines as a rendered log" scm="Ship it"@7 StagedModified:docs/notes.md Untracked:todo.txt
+scm | ctrl+k e | side=Explorer status="Revealed main.rs in Explorer" tree=./+,.git/,.vscode/,docs/,main.rs,todo.txt > main.rs scm="Ship it"@7 StagedModified:docs/notes.md Untracked:todo.txt
+scm | ctrl+k enter | status="No test runner detected in this workspace (is its extension enabled?)"
+scm | ctrl+k f | status="Format on Save: on"
+scm | ctrl+k h | status="Call hierarchy: no language server for this file"
+scm | ctrl+k i | status="Broadcast input needs at least two terminal panes (Cmd+T splits)"
+scm | ctrl+k k | status="Cleared terminal"
+scm | ctrl+k m | status="Only one terminal open"
+scm | ctrl+k n | scm="Ship itn"@8 +focus StagedModified:docs/notes.md Untracked:todo.txt
+scm | ctrl+k o | status="New Window failed: opening a new window is only supported on macOS"
+scm | ctrl+k p | status="Pinned tab"
+scm | ctrl+k q | status="Navigator is not active (run croft pair in this workspace)"
+scm | ctrl+k r | +prompt("Rename Terminal" "")
+scm | ctrl+k right | status="No tabs to the right to close"
+scm | ctrl+k s | status="Selected main.rs for compare"
+scm | ctrl+k shift+\ | focus=editor groups=0,0+60x40[*main.rs] *60,0+60x40[*main.rs] scm="Ship it"@7 StagedModified:docs/notes.md Untracked:todo.txt
+scm | ctrl+k shift+c | status="Compare with Selected: nothing selected yet"
+scm | ctrl+k shift+d | status="Type hierarchy: no language server for this file"
+scm | ctrl+k shift+e | status="No code lens on this line"
+scm | ctrl+k shift+enter | status="No test runner detected in this workspace"
+scm | ctrl+k shift+f | focus=editor tabs=main.rs,*Search Editor text=3L#6cabf539 caret=0:0 status="Search Editor: type a query on the first line, then Cmd+K Shift+R" scm="Ship it"@7 StagedModified:docs/notes.md Untracked:todo.txt
+scm | ctrl+k shift+h | status="Call hierarchy: no language server for this file"
+scm | ctrl+k shift+i | status=" excluded from broadcast input"
+scm | ctrl+k shift+l | +input("New worktree lane" "" @0)
+scm | ctrl+k shift+n | scm="Ship itN"@8 +focus StagedModified:docs/notes.md Untracked:todo.txt
+scm | ctrl+k shift+o | status="New Window failed: opening a new window is only supported on macOS"
+scm | ctrl+k shift+p | status="Tab is already kept open"
+scm | ctrl+k shift+q | status="Not attached to a persistent session: nothing to detach from"
+scm | ctrl+k shift+r | status="Not a Search Editor"
+scm | ctrl+k shift+s | status="Selected main.rs for compare"
+scm | ctrl+k shift+t | status="No recently closed terminals"
+scm | ctrl+k shift+u | status="Type hierarchy: no language server for this file"
+scm | ctrl+k shift+v | focus=editor tabs=main.rs,*main · main.rs scroll=3:0 status="Opened main as its own tab" scm="Ship it"@7 StagedModified:docs/notes.md Untracked:todo.txt
+scm | ctrl+k shift+w | status="No closed tabs to reopen"
+scm | ctrl+k u | tabs=*untitled text=0L#811c9dc5 caret=0:0 status="Closed 1 saved tab"
+scm | ctrl+k v | status="Live Run runs Python files (.py)"
+scm | ctrl+k w | tabs=*untitled text=0L#811c9dc5 caret=0:0 status="Closed 1 tab"
+scm | ctrl+k x | status="No AI stream is active"
+scm | ctrl+k y | status="Navigator is not active (run croft pair in this workspace)"
+scm | ctrl+k z | side=hidden panel=hidden status="Zen Mode on" +zen -activity_bar -status_bar
+scm | ctrl+l | -
+scm | ctrl+left | scm="Ship it"@6 +focus StagedModified:docs/notes.md Untracked:todo.txt
+scm | ctrl+n | focus=editor tabs=main.rs,*Untitled-1 text=0L#811c9dc5 caret=0:0 status="Untitled-1: saving asks where to write it" scm="Ship it"@7 StagedModified:docs/notes.md Untracked:todo.txt
+scm | ctrl+o | -
+scm | ctrl+p | status="Go to File: 4 files indexed — Esc to close" +quick_open("" @0 > ".vscode/launch.json")
+scm | ctrl+p # | status="Go to Symbol in Workspace: type to search — Esc to close" +workspace_symbols("" @0 > "")
+scm | ctrl+q | +quit
+scm | ctrl+r | -
+scm | ctrl+right | -
+scm | ctrl+s | status="No change selected to stage"
+scm | ctrl+shift+- | -
+scm | ctrl+shift+. | focus=editor scm="Ship it"@7 StagedModified:docs/notes.md Untracked:todo.txt +menu(".vscode/" > "main.rs")
+scm | ctrl+shift+/ | -
+scm | ctrl+shift+\ | -
+scm | ctrl+shift+b | status="No build task detected; pick one"
+scm | ctrl+shift+c | -
+scm | ctrl+shift+d | side=RunDebug scm="Ship it"@7 StagedModified:docs/notes.md Untracked:todo.txt
+scm | ctrl+shift+e | side=Explorer scm="Ship it"@7 StagedModified:docs/notes.md Untracked:todo.txt
+scm | ctrl+shift+enter | status="Commit ok; push failed: no remote to publish this branch to" scm=""@0 +focus Untracked:todo.txt git=main,??:todo.txt +commit_feedback("commit ok; push failed: no remote to publish this branch to")
+scm | ctrl+shift+f | side=Search search="" @Query:0 hits=0@0 scm="Ship it"@7 StagedModified:docs/notes.md Untracked:todo.txt
+scm | ctrl+shift+f12 | -
+scm | ctrl+shift+f5 | +input("Program" "" @0)
+scm | ctrl+shift+g | -
+scm | ctrl+shift+h | side=Search search="" @Replace:0 replace="" hits=0@0 scm="Ship it"@7 StagedModified:docs/notes.md Untracked:todo.txt
+scm | ctrl+shift+j | focus=panel panel=Terminal+max scm="Ship it"@7 StagedModified:docs/notes.md Untracked:todo.txt
+scm | ctrl+shift+k | -
+scm | ctrl+shift+l | -
+scm | ctrl+shift+m | focus=panel panel=Problems scm="Ship it"@7 StagedModified:docs/notes.md Untracked:todo.txt
+scm | ctrl+shift+n | -
+scm | ctrl+shift+o | status="Go to Symbol: 0 symbols — Esc to close" +go_to_symbol("" @0 > "")
+scm | ctrl+shift+p | status="Command Palette: 386 commands — Esc to close" +palette("" @0 > "Move Line Up")
+scm | ctrl+shift+pagedown | -
+scm | ctrl+shift+pageup | -
+scm | ctrl+shift+r | side=Remote scm="Ship it"@7 StagedModified:docs/notes.md Untracked:todo.txt
+scm | ctrl+shift+s | -
+scm | ctrl+shift+space | -
+scm | ctrl+shift+t | focus=panel status="Split terminal: 2 active" terms=2@1 scm="Ship it"@7 StagedModified:docs/notes.md Untracked:todo.txt
+scm | ctrl+shift+u | focus=panel panel=Output scm="Ship it"@7 StagedModified:docs/notes.md Untracked:todo.txt
+scm | ctrl+shift+v | scm="Ship itCLIP"@11 +focus StagedModified:docs/notes.md Untracked:todo.txt
+scm | ctrl+shift+w | -
+scm | ctrl+shift+x | side=Extensions scm="Ship it"@7 StagedModified:docs/notes.md Untracked:todo.txt
+scm | ctrl+shift+y | -
+scm | ctrl+shift+z | -
+scm | ctrl+space | -
+scm | ctrl+t | -
+scm | ctrl+u | -
+scm | ctrl+v | scm="Ship itCLIP"@11 +focus StagedModified:docs/notes.md Untracked:todo.txt
+scm | ctrl+w | -
+scm | ctrl+x | -
+scm | ctrl+y y | scm="Ship ity"@8 +focus StagedModified:docs/notes.md Untracked:todo.txt
+scm | ctrl+z | -
+scm | delete | -
+scm | down | scm="Ship it"@7 +focus +list sel=0 multi=0 StagedModified:docs/notes.md Untracked:todo.txt
+scm | down enter | focus=editor tabs=main.rs,*notes.md (HEAD) ↔ notes.md text=0L#811c9dc5 caret=0:0 scm="Ship it"@7 +list sel=0 multi=0 StagedModified:docs/notes.md Untracked:todo.txt
+scm | end | -
+scm | enter | status="Committed: [main <id>] Ship it" scm=""@0 +focus Untracked:todo.txt git=main,??:todo.txt +commit_feedback("[main <id>] Ship it")
+scm | esc | side=Explorer scm="Ship it"@7 StagedModified:docs/notes.md Untracked:todo.txt
+scm | esc esc | side=Explorer scm="Ship it"@7 StagedModified:docs/notes.md Untracked:todo.txt
+scm | f1 | status="Shortcuts: Esc to close" +shortcuts
+scm | f10 | -
+scm | f11 | -
+scm | f12 | -
+scm | f2 | -
+scm | f3 | -
+scm | f4 | -
+scm | f5 | +input("Program" "" @0)
+scm | f6 | focus=editor scm="Ship it"@7 StagedModified:docs/notes.md Untracked:todo.txt
+scm | f7 | -
+scm | f9 | marks=5/- status="Breakpoint set at line 5"
+scm | home | scm="Ship it"@0 +focus StagedModified:docs/notes.md Untracked:todo.txt
+scm | left | scm="Ship it"@6 +focus StagedModified:docs/notes.md Untracked:todo.txt
+scm | n | scm="Ship itn"@8 +focus StagedModified:docs/notes.md Untracked:todo.txt
+scm | pagedown | -
+scm | pageup | -
+scm | r | scm="Ship itr"@8 +focus StagedModified:docs/notes.md Untracked:todo.txt
+scm | right | -
+scm | s | scm="Ship its"@8 +focus StagedModified:docs/notes.md Untracked:todo.txt
+scm | shift+backtab | -
+scm | shift+cmd+\ | -
+scm | shift+cmd+t | focus=panel scm="Ship it"@7 StagedModified:docs/notes.md Untracked:todo.txt
+scm | shift+down | scm="Ship it"@7 +focus +list sel=0 multi=0 StagedModified:docs/notes.md Untracked:todo.txt
+scm | shift+end | -
+scm | shift+f11 | -
+scm | shift+f12 | -
+scm | shift+f4 | -
+scm | shift+f5 | status="Debug session stopped"
+scm | shift+f7 | -
+scm | shift+f8 | status="Screencast Mode on: the keys you press show at the bottom (Shift+F8 to stop)" +screencast
+scm | shift+f9 | +prompt("Add Conditional Breakpoint · line 5" "")
+scm | shift+home | scm="Ship it"@0 +focus StagedModified:docs/notes.md Untracked:todo.txt
+scm | shift+left | scm="Ship it"@6 +focus StagedModified:docs/notes.md Untracked:todo.txt
+scm | shift+pagedown | -
+scm | shift+pageup | -
+scm | shift+right | -
+scm | shift+up | -
+scm | space | scm="Ship it "@8 +focus StagedModified:docs/notes.md Untracked:todo.txt
+scm | tab | scm="Ship it"@7 +focus +list sel=0 multi=0 StagedModified:docs/notes.md Untracked:todo.txt
+scm | u | scm="Ship itu"@8 +focus StagedModified:docs/notes.md Untracked:todo.txt
+scm | up | -
+palette | alt+backspace | -
+palette | alt+c | ~palette("c" @1 > "Git: Commit")
+palette | alt+cmd+\ | -
+palette | alt+cmd+f | -
+palette | alt+cmd+left | -
+palette | alt+cmd+right | -
+palette | alt+d | ~palette("d" @1 > "Delete Line")
+palette | alt+delete | -
+palette | alt+down | ~palette("" @0 > "Move Line Down")
+palette | alt+f12 | -
+palette | alt+f9 | -
+palette | alt+l | ~palette("l" @1 > "View: Toggle Primary Side Bar")
+palette | alt+left | -
+palette | alt+o | ~palette("o" @1 > "View: Keep Editor")
+palette | alt+p | ~palette("p" @1 > "Git: Push")
+palette | alt+r | ~palette("r" @1 > "Redo")
+palette | alt+right | -
+palette | alt+shift+a | ~palette("A" @1 > "Fold All")
+palette | alt+shift+down | ~palette("" @0 > "Move Line Down")
+palette | alt+shift+f12 | -
+palette | alt+shift+f9 | -
+palette | alt+shift+i | ~palette("I" @1 > "Replace in File")
+palette | alt+shift+left | -
+palette | alt+shift+right | -
+palette | alt+shift+up | -
+palette | alt+up | -
+palette | alt+w | ~palette("w" @1 > "File: Save with Sudo")
+palette | alt+z | ~palette("z" @1 > "View: Toggle Zen Mode")
+palette | backspace | -
+palette | cmd+[ | -
+palette | cmd+\ | -
+palette | cmd+] | -
+palette | cmd+a | -
+palette | cmd+c | -
+palette | cmd+e | -
+palette | cmd+f12 | -
+palette | cmd+t | -
+palette | cmd+v | -
+palette | cmd+w | -
+palette | ctrl+- | -
+palette | ctrl+. | -
+palette | ctrl+/ | -
+palette | ctrl+1 | -
+palette | ctrl+2 | -
+palette | ctrl+3 | -
+palette | ctrl+4 | -
+palette | ctrl+5 | -
+palette | ctrl+6 | -
+palette | ctrl+7 | -
+palette | ctrl+8 | -
+palette | ctrl+9 | -
+palette | ctrl+a | -
+palette | ctrl+a ctrl+s | -
+palette | ctrl+alt+, | -
+palette | ctrl+alt+- | -
+palette | ctrl+alt+. | -
+palette | ctrl+alt+= | -
+palette | ctrl+alt+\ | -
+palette | ctrl+alt+b | -
+palette | ctrl+alt+c | -
+palette | ctrl+alt+down | ~palette("" @0 > "Move Line Down")
+palette | ctrl+alt+f | -
+palette | ctrl+alt+m | -
+palette | ctrl+alt+r | -
+palette | ctrl+alt+s | -
+palette | ctrl+alt+shift+a | -
+palette | ctrl+alt+shift+b | -
+palette | ctrl+alt+shift+c | -
+palette | ctrl+alt+shift+d | -
+palette | ctrl+alt+shift+down | ~palette("" @0 > "Move Line Down")
+palette | ctrl+alt+shift+e | -
+palette | ctrl+alt+shift+f | -
+palette | ctrl+alt+shift+g | -
+palette | ctrl+alt+shift+j | -
+palette | ctrl+alt+shift+k | -
+palette | ctrl+alt+shift+l | -
+palette | ctrl+alt+shift+left | -
+palette | ctrl+alt+shift+n | -
+palette | ctrl+alt+shift+pagedown | ~palette("" @0 > "Kill to End of Line")
+palette | ctrl+alt+shift+pageup | -
+palette | ctrl+alt+shift+right | -
+palette | ctrl+alt+shift+s | -
+palette | ctrl+alt+shift+t | -
+palette | ctrl+alt+shift+u | -
+palette | ctrl+alt+shift+up | -
+palette | ctrl+alt+shift+w | -
+palette | ctrl+alt+t | -
+palette | ctrl+alt+up | -
+palette | ctrl+b | -
+palette | ctrl+backspace | -
+palette | ctrl+c | -
+palette | ctrl+d | -
+palette | ctrl+d d | ~palette("d" @1 > "Delete Line")
+palette | ctrl+delete | -
+palette | ctrl+e | -
+palette | ctrl+end | -
+palette | ctrl+enter | tabs=*● main.rs text=15L#614ba9a0 caret=3:8 status="" -palette
+palette | ctrl+f | -
+palette | ctrl+f10 | -
+palette | ctrl+f12 | -
+palette | ctrl+f2 | -
+palette | ctrl+f5 | -
+palette | ctrl+g g | ~palette("g" @1 > "Go Back")
+palette | ctrl+home | -
+palette | ctrl+j | -
+palette | ctrl+k | -
+palette | ctrl+k [ | ~palette("[" @1 > "")
+palette | ctrl+k \ | ~palette("\\" @1 > "")
+palette | ctrl+k ] | ~palette("]" @1 > "")
+palette | ctrl+k a | ~palette("a" @1 > "Fold All")
+palette | ctrl+k b | ~palette("b" @1 > "Git: Open Commit for Line")
+palette | ctrl+k c | ~palette("c" @1 > "Git: Commit")
+palette | ctrl+k ctrl+/ | -
+palette | ctrl+k ctrl+0 | -
+palette | ctrl+k ctrl+1 | -
+palette | ctrl+k ctrl+2 | -
+palette | ctrl+k ctrl+3 | -
+palette | ctrl+k ctrl+4 | -
+palette | ctrl+k ctrl+5 | -
+palette | ctrl+k ctrl+6 | -
+palette | ctrl+k ctrl+7 | -
+palette | ctrl+k ctrl+8 | -
+palette | ctrl+k ctrl+9 | -
+palette | ctrl+k ctrl+f | -
+palette | ctrl+k ctrl+i | -
+palette | ctrl+k ctrl+j | -
+palette | ctrl+k ctrl+l | -
+palette | ctrl+k ctrl+m | -
+palette | ctrl+k ctrl+q | -
+palette | ctrl+k ctrl+s | -
+palette | ctrl+k ctrl+t | -
+palette | ctrl+k d | ~palette("d" @1 > "Delete Line")
+palette | ctrl+k e | ~palette("e" @1 > "Kill to End of Line")
+palette | ctrl+k enter | tabs=*● main.rs text=15L#614ba9a0 caret=3:8 status="" -palette
+palette | ctrl+k f | ~palette("f" @1 > "Quick Fix")
+palette | ctrl+k h | ~palette("h" @1 > "Git: Stage Hunk")
+palette | ctrl+k i | ~palette("i" @1 > "Replace in File")
+palette | ctrl+k k | ~palette("k" @1 > "View: Keep Editor")
+palette | ctrl+k m | ~palette("m" @1 > "Move Line Up")
+palette | ctrl+k n | ~palette("n" @1 > "Go to Next Change")
+palette | ctrl+k o | ~palette("o" @1 > "View: Keep Editor")
+palette | ctrl+k p | ~palette("p" @1 > "Git: Push")
+palette | ctrl+k q | ~palette("q" @1 > "Quick Fix")
+palette | ctrl+k r | ~palette("r" @1 > "Redo")
+palette | ctrl+k right | -
+palette | ctrl+k s | ~palette("s" @1 > "File: Save")
+palette | ctrl+k shift+\ | ~palette("\\" @1 > "")
+palette | ctrl+k shift+c | ~palette("C" @1 > "Git: Commit")
+palette | ctrl+k shift+d | ~palette("D" @1 > "Delete Line")
+palette | ctrl+k shift+e | ~palette("E" @1 > "Kill to End of Line")
+palette | ctrl+k shift+enter | tabs=*● main.rs text=15L#614ba9a0 caret=3:8 status="" -palette
+palette | ctrl+k shift+f | ~palette("F" @1 > "Quick Fix")
+palette | ctrl+k shift+g | ~palette("G" @1 > "Go Back")
+palette | ctrl+k shift+h | ~palette("H" @1 > "Git: Stage Hunk")
+palette | ctrl+k shift+i | ~palette("I" @1 > "Replace in File")
+palette | ctrl+k shift+l | ~palette("L" @1 > "View: Toggle Primary Side Bar")
+palette | ctrl+k shift+n | ~palette("N" @1 > "Go to Next Change")
+palette | ctrl+k shift+o | ~palette("O" @1 > "View: Keep Editor")
+palette | ctrl+k shift+p | ~palette("P" @1 > "Git: Push")
+palette | ctrl+k shift+q | ~palette("Q" @1 > "Quick Fix")
+palette | ctrl+k shift+r | ~palette("R" @1 > "Redo")
+palette | ctrl+k shift+s | ~palette("S" @1 > "File: Save")
+palette | ctrl+k shift+t | ~palette("T" @1 > "Toggle Fold")
+palette | ctrl+k shift+u | ~palette("U" @1 > "Undo")
+palette | ctrl+k shift+v | ~palette("V" @1 > "Toggle Vim Mode")
+palette | ctrl+k shift+w | ~palette("W" @1 > "File: Save with Sudo")
+palette | ctrl+k u | ~palette("u" @1 > "Undo")
+palette | ctrl+k v | ~palette("v" @1 > "Toggle Vim Mode")
+palette | ctrl+k w | ~palette("w" @1 > "File: Save with Sudo")
+palette | ctrl+k x | ~palette("x" @1 > "Quick Fix")
+palette | ctrl+k y | ~palette("y" @1 > "View: Toggle Primary Side Bar")
+palette | ctrl+k z | ~palette("z" @1 > "View: Toggle Zen Mode")
+palette | ctrl+l | -
+palette | ctrl+left | -
+palette | ctrl+n | -
+palette | ctrl+o | -
+palette | ctrl+p | -
+palette | ctrl+p # | ~palette("#" @1 > "")
+palette | ctrl+q | -
+palette | ctrl+r | -
+palette | ctrl+right | -
+palette | ctrl+s | -
+palette | ctrl+shift+- | -
+palette | ctrl+shift+. | -
+palette | ctrl+shift+/ | -
+palette | ctrl+shift+\ | -
+palette | ctrl+shift+b | -
+palette | ctrl+shift+c | -
+palette | ctrl+shift+d | -
+palette | ctrl+shift+e | -
+palette | ctrl+shift+enter | tabs=*● main.rs text=15L#614ba9a0 caret=3:8 status="" -palette
+palette | ctrl+shift+f | -
+palette | ctrl+shift+f12 | -
+palette | ctrl+shift+f5 | -
+palette | ctrl+shift+f9 | -
+palette | ctrl+shift+g | -
+palette | ctrl+shift+h | -
+palette | ctrl+shift+j | -
+palette | ctrl+shift+k | -
+palette | ctrl+shift+l | -
+palette | ctrl+shift+m | -
+palette | ctrl+shift+n | -
+palette | ctrl+shift+o | -
+palette | ctrl+shift+p | -
+palette | ctrl+shift+pagedown | ~palette("" @0 > "Kill to End of Line")
+palette | ctrl+shift+pageup | -
+palette | ctrl+shift+r | -
+palette | ctrl+shift+s | -
+palette | ctrl+shift+space | -
+palette | ctrl+shift+t | -
+palette | ctrl+shift+u | -
+palette | ctrl+shift+v | -
+palette | ctrl+shift+w | -
+palette | ctrl+shift+x | -
+palette | ctrl+shift+y | -
+palette | ctrl+shift+z | -
+palette | ctrl+space | -
+palette | ctrl+t | -
+palette | ctrl+u | -
+palette | ctrl+v | -
+palette | ctrl+w | -
+palette | ctrl+x | -
+palette | ctrl+y y | ~palette("y" @1 > "View: Toggle Primary Side Bar")
+palette | ctrl+z | -
+palette | delete | -
+palette | down | ~palette("" @0 > "Move Line Down")
+palette | down enter | tabs=*● main.rs text=15L#1cf61342 caret=5:8 status="" -palette
+palette | end | -
+palette | enter | tabs=*● main.rs text=15L#614ba9a0 caret=3:8 status="" -palette
+palette | esc | status="" -palette
+palette | esc esc | status="" -palette
+palette | f1 | -
+palette | f10 | -
+palette | f11 | -
+palette | f12 | -
+palette | f2 | -
+palette | f3 | -
+palette | f4 | -
+palette | f5 | -
+palette | f6 | -
+palette | f7 | -
+palette | f9 | -
+palette | home | -
+palette | left | -
+palette | n | ~palette("n" @1 > "Go to Next Change")
+palette | pagedown | ~palette("" @0 > "Kill to End of Line")
+palette | pageup | -
+palette | r | ~palette("r" @1 > "Redo")
+palette | right | -
+palette | s | ~palette("s" @1 > "File: Save")
+palette | shift+backtab | -
+palette | shift+cmd+\ | -
+palette | shift+cmd+t | -
+palette | shift+down | ~palette("" @0 > "Move Line Down")
+palette | shift+end | -
+palette | shift+f11 | -
+palette | shift+f12 | -
+palette | shift+f4 | -
+palette | shift+f5 | -
+palette | shift+f7 | -
+palette | shift+f8 | -
+palette | shift+f9 | -
+palette | shift+home | -
+palette | shift+left | -
+palette | shift+pagedown | ~palette("" @0 > "Kill to End of Line")
+palette | shift+pageup | -
+palette | shift+right | -
+palette | shift+up | -
+palette | space | ~palette(" " @1 > "Move Line Up")
+palette | tab | -
+palette | u | ~palette("u" @1 > "Undo")
+palette | up | -
+confirm | alt+backspace | -
+confirm | alt+c | -
+confirm | alt+cmd+\ | -
+confirm | alt+cmd+f | -
+confirm | alt+cmd+left | -
+confirm | alt+cmd+right | -
+confirm | alt+d | -
+confirm | alt+delete | -
+confirm | alt+down | -
+confirm | alt+f12 | -
+confirm | alt+f9 | -
+confirm | alt+l | -
+confirm | alt+left | -
+confirm | alt+o | -
+confirm | alt+p | -
+confirm | alt+r | -
+confirm | alt+right | -
+confirm | alt+shift+a | -
+confirm | alt+shift+down | -
+confirm | alt+shift+f12 | -
+confirm | alt+shift+f9 | -
+confirm | alt+shift+i | -
+confirm | alt+shift+left | -
+confirm | alt+shift+right | -
+confirm | alt+shift+up | -
+confirm | alt+up | -
+confirm | alt+w | -
+confirm | alt+z | -
+confirm | backspace | -
+confirm | cmd+[ | -
+confirm | cmd+\ | -
+confirm | cmd+] | -
+confirm | cmd+a | -
+confirm | cmd+c | -
+confirm | cmd+e | -
+confirm | cmd+f12 | -
+confirm | cmd+t | -
+confirm | cmd+v | -
+confirm | cmd+w | -
+confirm | ctrl+- | -
+confirm | ctrl+. | -
+confirm | ctrl+/ | -
+confirm | ctrl+1 | -
+confirm | ctrl+2 | -
+confirm | ctrl+3 | -
+confirm | ctrl+4 | -
+confirm | ctrl+5 | -
+confirm | ctrl+6 | -
+confirm | ctrl+7 | -
+confirm | ctrl+8 | -
+confirm | ctrl+9 | -
+confirm | ctrl+a | -
+confirm | ctrl+a ctrl+s | -
+confirm | ctrl+alt+, | -
+confirm | ctrl+alt+- | -
+confirm | ctrl+alt+. | -
+confirm | ctrl+alt+= | -
+confirm | ctrl+alt+\ | -
+confirm | ctrl+alt+b | -
+confirm | ctrl+alt+c | -
+confirm | ctrl+alt+down | -
+confirm | ctrl+alt+f | -
+confirm | ctrl+alt+m | -
+confirm | ctrl+alt+r | -
+confirm | ctrl+alt+s | -
+confirm | ctrl+alt+shift+a | -
+confirm | ctrl+alt+shift+b | -
+confirm | ctrl+alt+shift+c | -
+confirm | ctrl+alt+shift+d | -
+confirm | ctrl+alt+shift+down | -
+confirm | ctrl+alt+shift+e | -
+confirm | ctrl+alt+shift+f | -
+confirm | ctrl+alt+shift+g | -
+confirm | ctrl+alt+shift+j | -
+confirm | ctrl+alt+shift+k | -
+confirm | ctrl+alt+shift+l | -
+confirm | ctrl+alt+shift+left | -
+confirm | ctrl+alt+shift+n | -
+confirm | ctrl+alt+shift+pagedown | -
+confirm | ctrl+alt+shift+pageup | -
+confirm | ctrl+alt+shift+right | -
+confirm | ctrl+alt+shift+s | -
+confirm | ctrl+alt+shift+t | -
+confirm | ctrl+alt+shift+u | -
+confirm | ctrl+alt+shift+up | -
+confirm | ctrl+alt+shift+w | -
+confirm | ctrl+alt+t | -
+confirm | ctrl+alt+up | -
+confirm | ctrl+b | -
+confirm | ctrl+backspace | -
+confirm | ctrl+c | -
+confirm | ctrl+d | -
+confirm | ctrl+d d | +quit -unsaved
+confirm | ctrl+delete | -
+confirm | ctrl+e | -
+confirm | ctrl+end | -
+confirm | ctrl+enter | tabs=*main.rs files=27L#afbd942b +quit -unsaved
+confirm | ctrl+f | -
+confirm | ctrl+f10 | -
+confirm | ctrl+f12 | -
+confirm | ctrl+f2 | -
+confirm | ctrl+f5 | -
+confirm | ctrl+g g | -
+confirm | ctrl+home | -
+confirm | ctrl+j | -
+confirm | ctrl+k | -
+confirm | ctrl+k [ | -
+confirm | ctrl+k \ | -
+confirm | ctrl+k ] | -
+confirm | ctrl+k a | -
+confirm | ctrl+k b | -
+confirm | ctrl+k c | -
+confirm | ctrl+k ctrl+/ | -
+confirm | ctrl+k ctrl+0 | -
+confirm | ctrl+k ctrl+1 | -
+confirm | ctrl+k ctrl+2 | -
+confirm | ctrl+k ctrl+3 | -
+confirm | ctrl+k ctrl+4 | -
+confirm | ctrl+k ctrl+5 | -
+confirm | ctrl+k ctrl+6 | -
+confirm | ctrl+k ctrl+7 | -
+confirm | ctrl+k ctrl+8 | -
+confirm | ctrl+k ctrl+9 | -
+confirm | ctrl+k ctrl+f | -
+confirm | ctrl+k ctrl+i | -
+confirm | ctrl+k ctrl+j | -
+confirm | ctrl+k ctrl+l | -
+confirm | ctrl+k ctrl+m | -
+confirm | ctrl+k ctrl+q | -
+confirm | ctrl+k ctrl+s | -
+confirm | ctrl+k ctrl+t | -
+confirm | ctrl+k d | +quit -unsaved
+confirm | ctrl+k e | -
+confirm | ctrl+k enter | tabs=*main.rs files=27L#afbd942b +quit -unsaved
+confirm | ctrl+k f | -
+confirm | ctrl+k h | -
+confirm | ctrl+k i | -
+confirm | ctrl+k k | -
+confirm | ctrl+k m | -
+confirm | ctrl+k n | status="Cancelled: did not quit" -unsaved
+confirm | ctrl+k o | -
+confirm | ctrl+k p | -
+confirm | ctrl+k q | -
+confirm | ctrl+k r | -
+confirm | ctrl+k right | -
+confirm | ctrl+k s | tabs=*main.rs files=27L#afbd942b +quit -unsaved
+confirm | ctrl+k shift+\ | -
+confirm | ctrl+k shift+c | -
+confirm | ctrl+k shift+d | +quit -unsaved
+confirm | ctrl+k shift+e | -
+confirm | ctrl+k shift+enter | tabs=*main.rs files=27L#afbd942b +quit -unsaved
+confirm | ctrl+k shift+f | -
+confirm | ctrl+k shift+g | -
+confirm | ctrl+k shift+h | -
+confirm | ctrl+k shift+i | -
+confirm | ctrl+k shift+l | -
+confirm | ctrl+k shift+n | status="Cancelled: did not quit" -unsaved
+confirm | ctrl+k shift+o | -
+confirm | ctrl+k shift+p | -
+confirm | ctrl+k shift+q | -
+confirm | ctrl+k shift+r | -
+confirm | ctrl+k shift+s | tabs=*main.rs files=27L#afbd942b +quit -unsaved
+confirm | ctrl+k shift+t | -
+confirm | ctrl+k shift+u | -
+confirm | ctrl+k shift+v | -
+confirm | ctrl+k shift+w | -
+confirm | ctrl+k u | -
+confirm | ctrl+k v | -
+confirm | ctrl+k w | -
+confirm | ctrl+k x | -
+confirm | ctrl+k y | -
+confirm | ctrl+k z | -
+confirm | ctrl+l | -
+confirm | ctrl+left | -
+confirm | ctrl+n | -
+confirm | ctrl+o | -
+confirm | ctrl+p | -
+confirm | ctrl+p # | -
+confirm | ctrl+q | -
+confirm | ctrl+r | -
+confirm | ctrl+right | -
+confirm | ctrl+s | -
+confirm | ctrl+shift+- | -
+confirm | ctrl+shift+. | -
+confirm | ctrl+shift+/ | -
+confirm | ctrl+shift+\ | -
+confirm | ctrl+shift+b | -
+confirm | ctrl+shift+c | -
+confirm | ctrl+shift+d | -
+confirm | ctrl+shift+e | -
+confirm | ctrl+shift+enter | tabs=*main.rs files=27L#afbd942b +quit -unsaved
+confirm | ctrl+shift+f | -
+confirm | ctrl+shift+f12 | -
+confirm | ctrl+shift+f5 | -
+confirm | ctrl+shift+f9 | -
+confirm | ctrl+shift+g | -
+confirm | ctrl+shift+h | -
+confirm | ctrl+shift+j | -
+confirm | ctrl+shift+k | -
+confirm | ctrl+shift+l | -
+confirm | ctrl+shift+m | -
+confirm | ctrl+shift+n | -
+confirm | ctrl+shift+o | -
+confirm | ctrl+shift+p | -
+confirm | ctrl+shift+pagedown | -
+confirm | ctrl+shift+pageup | -
+confirm | ctrl+shift+r | -
+confirm | ctrl+shift+s | -
+confirm | ctrl+shift+space | -
+confirm | ctrl+shift+t | -
+confirm | ctrl+shift+u | -
+confirm | ctrl+shift+v | -
+confirm | ctrl+shift+w | -
+confirm | ctrl+shift+x | -
+confirm | ctrl+shift+y | -
+confirm | ctrl+shift+z | -
+confirm | ctrl+space | -
+confirm | ctrl+t | -
+confirm | ctrl+u | -
+confirm | ctrl+v | -
+confirm | ctrl+w | -
+confirm | ctrl+x | -
+confirm | ctrl+y y | -
+confirm | ctrl+z | -
+confirm | delete | -
+confirm | down | -
+confirm | down enter | tabs=*main.rs files=27L#afbd942b +quit -unsaved
+confirm | end | -
+confirm | enter | tabs=*main.rs files=27L#afbd942b +quit -unsaved
+confirm | esc | status="Cancelled: did not quit" -unsaved
+confirm | esc esc | status="Cancelled: did not quit" -unsaved
+confirm | f1 | -
+confirm | f10 | -
+confirm | f11 | -
+confirm | f12 | -
+confirm | f2 | -
+confirm | f3 | -
+confirm | f4 | -
+confirm | f5 | -
+confirm | f6 | -
+confirm | f7 | -
+confirm | f9 | -
+confirm | home | -
+confirm | left | -
+confirm | n | status="Cancelled: did not quit" -unsaved
+confirm | pagedown | -
+confirm | pageup | -
+confirm | r | -
+confirm | right | -
+confirm | s | tabs=*main.rs files=27L#afbd942b +quit -unsaved
+confirm | shift+backtab | -
+confirm | shift+cmd+\ | -
+confirm | shift+cmd+t | -
+confirm | shift+down | -
+confirm | shift+end | -
+confirm | shift+f11 | -
+confirm | shift+f12 | -
+confirm | shift+f4 | -
+confirm | shift+f5 | -
+confirm | shift+f7 | -
+confirm | shift+f8 | -
+confirm | shift+f9 | -
+confirm | shift+home | -
+confirm | shift+left | -
+confirm | shift+pagedown | -
+confirm | shift+pageup | -
+confirm | shift+right | -
+confirm | shift+up | -
+confirm | space | -
+confirm | tab | -
+confirm | u | -
+confirm | up | -

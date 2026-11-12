@@ -83,6 +83,23 @@ impl SyntaxPalette {
         tag: (0xbf, 0x61, 0x6a),
         fg: (0xc0, 0xc5, 0xce),
     };
+
+    /// Croft Loch's code palette, tuned for its pure black canvas and teal
+    /// accent rather than Base16 Ocean's slate (#2b303b), where function
+    /// blue-grey and plain identifiers blurred together. Every role clears
+    /// 4.5:1 on #000 (comment 4.7, tag 8.8, the rest 10 to 14.7); hues stay
+    /// clear of the accent so teal keeps meaning focus, and the warm
+    /// constant is a relative of the brand orange.
+    pub const LOCH: SyntaxPalette = SyntaxPalette {
+        comment: (0x6a, 0x7a, 0x78),
+        keyword: (0xc3, 0xa6, 0xf2),
+        string: (0xa9, 0xd1, 0x8e),
+        constant: (0xf2, 0xa0, 0x72),
+        function: (0x7c, 0xc4, 0xe8),
+        type_: (0xe8, 0xcc, 0x8c),
+        tag: (0xf0, 0x8c, 0x8c),
+        fg: (0xd3, 0xd9, 0xd8),
+    };
 }
 
 /// The layered surfaces a `surfaces` theme paints in place of pane boxes
@@ -203,12 +220,15 @@ impl Theme {
         osk_special: (0x14, 0x16, 0x1b),
         osk_armed: (0x0e, 0x7e, 0x76),
         ansi: VSCODE_ANSI,
-        syntax: SyntaxPalette::BASE16,
+        syntax: SyntaxPalette::LOCH,
         tab_strip: (0x0e, 0x10, 0x11),
         tab_inactive: (0x0e, 0x10, 0x11),
         tab_active: (0x00, 0x00, 0x00),
-        tab_hover: (0x16, 0x23, 0x23),
-        tab_pill: (0x26, 0x4f, 0x4a),
+        // Hover is a neutral lift, never the accent: the strip's chrome
+        // lifted 5.5% toward white (`Tones::hover_on`), and the close pill a
+        // keycap step above that.
+        tab_hover: (0x1b, 0x1d, 0x1e),
+        tab_pill: (0x2e, 0x30, 0x31),
         high_contrast: false,
         surfaces: Some(Surfaces {
             chrome: (0x0e, 0x10, 0x11),
@@ -482,7 +502,10 @@ impl Theme {
     /// `None` for any other color.
     fn surfaces_role(self, c: (u8, u8, u8), s: Surfaces) -> Option<(u8, u8, u8)> {
         Some(match c {
-            (0x16, 0x18, 0x1f) | (0x1e, 0x1e, 0x1e) => s.raised,
+            // Every popover body on the one raised surface: the palette and
+            // menus (0x16181f, 0x1e1e1e), and the hover, completion, details
+            // and signature cards (0x1e212a), which used to sit a tone above.
+            (0x16, 0x18, 0x1f) | (0x1e, 0x1e, 0x1e) | (0x1e, 0x21, 0x2a) => s.raised,
             (0x3b, 0x42, 0x52) => s.hairline,
             (0x1e, 0x3a, 0x6e) | (0x26, 0x4f, 0x78) | (0x09, 0x4d, 0x77) => self.selection,
             (0x07, 0x33, 0x55) | (0x37, 0x61, 0x8e) => blend(self.selection, 0.7, self.bg),
@@ -797,6 +820,11 @@ impl Theme {
     /// blended over each theme's background so it stays a whisper above the
     /// editor surface on dark and light themes alike.
     pub fn indent_guide(self) -> Color {
+        // A `surfaces` theme draws structure in its seam tone, so guides
+        // read as the same hairlines that part its panes.
+        if let Some(t) = crate::widgets::surface::tones(self) {
+            return t.hairline();
+        }
         self.blend_over_bg((0x88, 0x88, 0x88), 0.38)
     }
 
@@ -811,14 +839,33 @@ impl Theme {
     /// containing the cursor (VS Code `editorIndentGuide.activeBackground1`,
     /// #707070 on the dark default). Same grey, blended stronger.
     pub fn indent_guide_active(self) -> Color {
+        // One ink step above the hairline the other guides wear.
+        if let Some(t) = crate::widgets::surface::tones(self) {
+            return t.faint();
+        }
         self.blend_over_bg((0x88, 0x88, 0x88), 0.80)
+    }
+
+    /// The line numbers away from the caret, and the expanded fold chevron
+    /// beside them (VS Code `editorLineNumber.foreground`). The terminal's
+    /// own dark grey on a boxed theme; the faint ink on a `surfaces` theme,
+    /// so the gutter follows the theme's palette instead of the host's.
+    pub fn line_number_fg(self) -> Color {
+        match crate::widgets::surface::tones(self) {
+            Some(t) => t.faint(),
+            None => Color::DarkGray,
+        }
     }
 
     /// The line number of a caret's line (VS Code
     /// `editorLineNumber.activeForeground`, #C6C6C6 on dark and #0B216F on
-    /// light), brighter than the other numbers' grey (#1576).
+    /// light), brighter than the other numbers' grey (#1576). A `surfaces`
+    /// theme uses its body text ink, so the caret's number sits in the same
+    /// grey family as the rest of the chrome.
     pub fn line_number_active(self) -> Color {
-        if self.is_light() {
+        if let Some(t) = crate::widgets::surface::tones(self) {
+            t.text()
+        } else if self.is_light() {
             Color::Rgb(0x0b, 0x21, 0x6f)
         } else {
             Color::Rgb(0xc6, 0xc6, 0xc6)
@@ -827,8 +874,15 @@ impl Theme {
 
     /// Background wash behind the cursor's line (VS Code
     /// `editor.lineHighlightBackground`): the accent at a whisper (8%) over
-    /// the editor surface, spanning gutter through code (#248).
+    /// the editor surface, spanning gutter through code (#248). On a pure
+    /// black canvas that whisper is invisible, so a `surfaces` theme lifts
+    /// the line to its chrome tone instead: a neutral band in the side bar's
+    /// own surface, clearly apart from the raised sticky headers and the
+    /// teal selection.
     pub fn current_line_bg(self) -> Color {
+        if let Some(t) = crate::widgets::surface::tones(self) {
+            return t.chrome();
+        }
         self.blend_over_bg(self.accent, 0.08)
     }
 
@@ -853,8 +907,13 @@ impl Theme {
     /// Background of the pinned sticky-scroll header rows (VS Code
     /// `editorStickyScroll.background`): the editor background lifted a hair
     /// so the pinned scope headers read as a distinct band above the content
-    /// (toward white on dark themes, toward black on light ones).
+    /// (toward white on dark themes, toward black on light ones). A
+    /// `surfaces` theme floats them on its raised tone, a step above the
+    /// chrome-toned current line, so the two bands never read as one.
     pub fn sticky_scroll_bg(self) -> Color {
+        if let Some(t) = crate::widgets::surface::tones(self) {
+            return t.raised();
+        }
         let lift = if self.is_light() {
             (0x00, 0x00, 0x00)
         } else {
@@ -934,13 +993,32 @@ impl Theme {
     /// The scrollbar thumb when its pane is unfocused (VS Code's resting
     /// `scrollbarSlider.background`, #797979 at 40% alpha).
     pub fn scrollbar_thumb(self) -> Color {
+        // A `surfaces` theme rests the thumb in its seam tone: present, cool
+        // and quiet, the same hairline that parts its panes.
+        if let Some(t) = crate::widgets::surface::tones(self) {
+            return t.hairline();
+        }
         self.blend_over_bg((0x79, 0x79, 0x79), 0.40)
     }
 
     /// The scrollbar thumb when its pane is focused (VS Code's brighter hover
-    /// value, #646464 at 70% alpha).
+    /// value, #646464 at 70% alpha). On a `surfaces` theme, the hairline a
+    /// quarter of the way to the muted ink: brighter, still the cool grey.
     pub fn scrollbar_thumb_focused(self) -> Color {
+        if let Some(t) = crate::widgets::surface::tones(self) {
+            return rgb(blend(t.muted, 0.25, t.hairline));
+        }
         self.blend_over_bg((0x64, 0x64, 0x64), 0.70)
+    }
+
+    /// A secondary caret's block (multi-cursor): VS Code's periwinkle on a
+    /// boxed theme; the accent on a `surfaces` theme, where every caret is
+    /// the one colour that means "you are typing here".
+    pub fn secondary_caret_bg(self) -> Color {
+        match crate::widgets::surface::tones(self) {
+            Some(t) => t.accent(),
+            None => self.ui(Color::Rgb(0xae, 0xc6, 0xff)),
+        }
     }
 
     /// The editor tab bar's background (VS Code
@@ -985,7 +1063,13 @@ impl Theme {
 
     /// Resting ink of an unselected activity-bar icon (VS Code
     /// `activityBar.inactiveForeground`, #616161 on Light Modern).
+    ///
+    /// Croft Loch rests its icons in the muted ink, so the column recedes
+    /// behind the side bar's labels instead of competing with them.
     pub fn activity_icon_inactive_rgb(self) -> (u8, u8, u8) {
+        if let Some(t) = crate::widgets::surface::tones(self) {
+            return t.muted;
+        }
         self.ui_rgb((0x9d, 0xa5, 0xb4))
     }
 
@@ -994,8 +1078,24 @@ impl Theme {
     /// The dark chrome paints these white, which is exactly why the baked
     /// icons cannot keep a hardcoded tint: on a light bar white ink is
     /// invisible (issue #225).
+    ///
+    /// Croft Loch's is the strong ink: the region's one emphasised mark.
     pub fn activity_icon_active_rgb(self) -> (u8, u8, u8) {
+        if let Some(t) = crate::widgets::surface::tones(self) {
+            return t.strong;
+        }
         self.ui_rgb((0xff, 0xff, 0xff))
+    }
+
+    /// Ink of an unselected icon under the pointer. Croft Loch lifts it to
+    /// body text, a step short of the selected icon's strong ink, so hover
+    /// and selection differ by more than the pill; every other theme lifts
+    /// it all the way to the active ink, as VS Code does.
+    pub fn activity_icon_hover_rgb(self) -> (u8, u8, u8) {
+        match crate::widgets::surface::tones(self) {
+            Some(t) => t.text,
+            None => self.activity_icon_active_rgb(),
+        }
     }
 
     /// The selection bar down the left edge of the selected icon (VS Code
@@ -1016,6 +1116,11 @@ impl Theme {
         rgb(self.activity_icon_active_rgb())
     }
 
+    /// [`Theme::activity_icon_hover_rgb`] as a cell color.
+    pub fn activity_icon_hover(self) -> Color {
+        rgb(self.activity_icon_hover_rgb())
+    }
+
     /// [`Theme::activity_icon_pill_rgb`] as a cell color.
     pub fn activity_icon_pill(self) -> Color {
         rgb(self.activity_icon_pill_rgb())
@@ -1023,8 +1128,13 @@ impl Theme {
 
     /// Resting ink of the activity bar's sponsor heart (#1940): GitHub
     /// Sponsors' pink (`fgColor.sponsors`), the one icon on the bar that is
-    /// not grey, as on GitHub's own Sponsor button.
+    /// not grey, as on GitHub's own Sponsor button. Croft Loch rests it in
+    /// the muted ink like its neighbours and lets the pink bloom only under
+    /// the pointer, so the bar's loudest pixel is not an idle heart.
     pub fn activity_sponsor_rgb(self) -> (u8, u8, u8) {
+        if let Some(t) = crate::widgets::surface::tones(self) {
+            return t.muted;
+        }
         self.ui_rgb((0xdb, 0x61, 0xa2))
     }
 
@@ -1492,6 +1602,71 @@ mod tests {
         assert!(0.299 * f32::from(r) + 0.587 * f32::from(g) + 0.114 * f32::from(b) > 230.0);
     }
 
+    /// Croft Loch's editor draws from its own tones: a visible chrome band
+    /// for the caret's line, apart from the raised sticky headers and the
+    /// teal selection; hairline guides and scrollbar thumb with a brighter
+    /// step for the active guide and a focused pane; faint line numbers;
+    /// and the accent for a secondary caret. Croft Black keeps every value.
+    #[test]
+    fn croft_loch_editor_washes_come_from_its_tones() {
+        let loch = Theme::LOCH;
+        let t = crate::widgets::surface::tones(loch).expect("Loch has surfaces");
+        assert_eq!(loch.current_line_bg(), t.chrome());
+        assert_ne!(loch.current_line_bg(), loch.sticky_scroll_bg());
+        assert_ne!(
+            loch.current_line_bg(),
+            loch.ui(Color::Rgb(0x26, 0x4f, 0x78))
+        );
+        assert_eq!(loch.sticky_scroll_bg(), t.raised());
+        assert_eq!(loch.indent_guide(), t.hairline());
+        assert_ne!(loch.indent_guide_active(), loch.indent_guide());
+        assert_eq!(loch.scrollbar_thumb(), t.hairline());
+        let luma = |c: Color| match c {
+            Color::Rgb(r, g, b) => u32::from(r) + u32::from(g) + u32::from(b),
+            _ => panic!("expected Rgb"),
+        };
+        assert!(luma(loch.scrollbar_thumb_focused()) > luma(loch.scrollbar_thumb()));
+        assert_eq!(loch.line_number_fg(), t.faint());
+        assert_eq!(loch.line_number_active(), t.text());
+        assert_eq!(loch.secondary_caret_bg(), loch.accent());
+        let black = Theme::BLACK;
+        assert_eq!(black.line_number_fg(), Color::DarkGray);
+        assert_eq!(black.line_number_active(), Color::Rgb(0xc6, 0xc6, 0xc6));
+        assert_eq!(black.secondary_caret_bg(), Color::Rgb(0xae, 0xc6, 0xff));
+        assert_eq!(black.scrollbar_thumb(), Color::Rgb(0x30, 0x30, 0x30));
+        assert_eq!(black.indent_guide(), Color::Rgb(0x34, 0x34, 0x34));
+        assert_eq!(black.sticky_scroll_bg(), Color::Rgb(0x0f, 0x0f, 0x0f));
+    }
+
+    /// Croft Loch's code palette is its own, tuned for the black canvas,
+    /// and every role stays readable there; the boxed built-ins keep
+    /// Base16 Ocean byte for byte.
+    #[test]
+    fn croft_loch_carries_a_code_palette_for_its_black_canvas() {
+        let p = Theme::LOCH.syntax();
+        assert_eq!(p, SyntaxPalette::LOCH);
+        assert_ne!(p, SyntaxPalette::BASE16);
+        assert_eq!(
+            Theme::from_id("loch").syntax(),
+            p,
+            "manifest mirrors the const"
+        );
+        for (role, c) in [
+            ("comment", p.comment),
+            ("keyword", p.keyword),
+            ("string", p.string),
+            ("constant", p.constant),
+            ("function", p.function),
+            ("type", p.type_),
+            ("tag", p.tag),
+            ("fg", p.fg),
+        ] {
+            let ratio = contrast_ratio(c, Theme::LOCH.editor_bg_rgb());
+            assert!(ratio >= 4.5, "{role} reads at {ratio:.2}:1");
+        }
+        assert_eq!(Theme::BLACK.syntax(), SyntaxPalette::BASE16);
+    }
+
     #[test]
     fn accent_contrast_fg_flips_only_on_dark_accents() {
         // Built-in dark themes have light accents: black text, unchanged.
@@ -1586,6 +1761,33 @@ mod tests {
         // Croft Loch's selection bar is its own teal, not the VS Code blue.
         let loch = Theme::from_id("loch");
         assert_eq!(loch.activity_icon_pill_rgb(), loch.accent_rgb());
+    }
+
+    /// Croft Loch's activity bar recedes: icons rest in the muted ink, hover
+    /// lifts one to body text, the selected one is the strong ink, and the
+    /// sponsor heart rests muted with its pink kept for the pointer. Every
+    /// other theme's hover is still its active ink.
+    #[test]
+    fn croft_loch_activity_icons_rest_muted_and_hover_a_step_below_selected() {
+        let loch = Theme::from_id("loch");
+        let t = crate::widgets::surface::tones(loch).unwrap();
+        assert_eq!(loch.activity_icon_inactive_rgb(), t.muted);
+        assert_eq!(loch.activity_icon_hover_rgb(), t.text);
+        assert_eq!(loch.activity_icon_active_rgb(), t.strong);
+        assert_ne!(
+            loch.activity_icon_hover_rgb(),
+            loch.activity_icon_active_rgb()
+        );
+        assert_eq!(loch.activity_sponsor_rgb(), t.muted);
+        assert_eq!(loch.activity_sponsor_hover_rgb(), (0xf7, 0x78, 0xba));
+        for theme in Theme::all().iter().filter(|t| t.surfaces().is_none()) {
+            assert_eq!(
+                theme.activity_icon_hover_rgb(),
+                theme.activity_icon_active_rgb(),
+                "{}",
+                theme.label()
+            );
+        }
     }
 
     /// #1940: the sponsor heart is GitHub Sponsors' pink on a dark bar and

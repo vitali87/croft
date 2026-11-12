@@ -2454,17 +2454,8 @@ fn closing_a_lane_refuses_while_a_sheet_cell_in_it_is_being_typed_into() {
     let repo = tmp.path().join("repo");
     init_lane_repo(&repo);
     std::fs::write(repo.join("stock.csv"), "item,qty\nbolt,4\n").unwrap();
-    let git = |args: &[&str]| {
-        let st = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&repo)
-            .args(args)
-            .status()
-            .unwrap();
-        assert!(st.success(), "git {args:?}");
-    };
-    git(&["add", "."]);
-    git(&["commit", "-q", "-m", "stock"]);
+    git_ok(&repo, &["add", "."]);
+    git_ok(&repo, &["commit", "-q", "-m", "stock"]);
     let mut app = App::new(repo.clone()).unwrap();
     app.terminal_session_path = tmp.path().join("sessions.json");
     app.lane_agent = None;
@@ -2895,11 +2886,9 @@ fn app_with_body_suggestion(tmp: &std::path::Path) -> App {
     app
 }
 
-/// The screen as rows, at `w` x `h`.
-fn screen_rows(app: &mut App, w: u16, h: u16) -> Vec<String> {
-    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
-    term.draw(|f| app.render(f)).unwrap();
-    screen_text(&term).lines().map(str::to_string).collect()
+/// [`draw_screen`] as rows: draws `app` at `w` x `h`, one string per row.
+fn draw_screen_rows(app: &mut App, w: u16, h: u16) -> Vec<String> {
+    draw_screen(app, w, h).lines().map(str::to_string).collect()
 }
 
 /// #1625: every line of a multi-line suggestion is painted under the
@@ -2910,7 +2899,7 @@ fn a_multi_line_suggestion_paints_every_line_under_the_caret() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = app_with_body_suggestion(tmp.path());
     let before = app.editor.lines.clone();
-    let rows = screen_rows(&mut app, 120, 30);
+    let rows = draw_screen_rows(&mut app, 120, 30);
     let at = |needle: &str| {
         rows.iter()
             .position(|r| r.contains(needle))
@@ -2936,7 +2925,7 @@ fn a_suggestion_taller_than_the_pane_counts_the_lines_left_over() {
     let seq = app.editor.edit_seq;
     let body: String = (1..=60).map(|i| format!("\n    x{i} = {i}")).collect();
     app.editor.ghost = Some(Ghost::insert(0, 14, seq, body));
-    let rows = screen_rows(&mut app, 120, 30);
+    let rows = draw_screen_rows(&mut app, 120, 30);
     let shown = (1..=60)
         .filter(|i| rows.iter().any(|r| r.contains(&format!("x{i} = {i}"))))
         .count();
@@ -3195,19 +3184,6 @@ fn the_mcp_tool_gate_refuses_a_changed_definition() {
     assert!(err.contains("toggle the extension off and on"), "{err}");
 }
 
-fn popup_screen(app: &mut App, w: u16, h: u16) -> String {
-    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
-    term.draw(|f| app.render(f)).unwrap();
-    let mut screen = String::new();
-    for y in 0..h {
-        for x in 0..w {
-            screen.push_str(term.backend().buffer()[(x, y)].symbol());
-        }
-        screen.push('\n');
-    }
-    screen
-}
-
 /// #347: what the language server says about a proposal's file while it is
 /// checked goes to the popup, against the proposed row it names, and not to
 /// the buffer's diagnostics; answering the proposal ends the check.
@@ -3232,7 +3208,7 @@ fn a_proposals_diagnostics_show_in_the_popup_not_the_buffer() {
         opened: true,
         by_server: Default::default(),
     });
-    let screen = popup_screen(&mut app, 110, 30);
+    let screen = draw_screen(&mut app, 110, 30);
     assert!(screen.contains("Checking the proposed file"), "{screen}");
     app.apply_diagnostics_updates(vec![crate::lsp::manager::DiagnosticsUpdate {
         path: file.clone(),
@@ -3254,7 +3230,7 @@ fn a_proposals_diagnostics_show_in_the_popup_not_the_buffer() {
         !app.lsp_diagnostics.contains_key(&file),
         "the buffer's diagnostics are the buffer's"
     );
-    let screen = popup_screen(&mut app, 110, 30);
+    let screen = draw_screen(&mut app, 110, 30);
     assert!(
         screen.contains("1 error, 0 warnings in the proposed file"),
         "{screen}"
@@ -4036,15 +4012,7 @@ fn completing_an_approval_merge_approves_it_and_stages_nothing() {
     let home = tempfile::tempdir().unwrap();
     with_relay_home(home.path(), || {
         let tmp = tempfile::tempdir().unwrap();
-        let git = |args: &[&str]| {
-            std::process::Command::new("git")
-                .arg("-C")
-                .arg(tmp.path())
-                .args(args)
-                .output()
-                .unwrap()
-        };
-        git(&["init", "-q"]);
+        git_init(tmp.path());
         let target = tmp.path().join("a.rs");
         std::fs::write(&target, "one\ntwo\nthree\n").unwrap();
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
@@ -4089,8 +4057,8 @@ fn completing_an_approval_merge_approves_it_and_stages_nothing() {
         assert!(app.approvals.is_empty(), "approved: {}", app.status);
         assert!(!app.status.contains("Stage failed"), "{}", app.status);
         assert!(app.status.starts_with("Approved"), "{}", app.status);
-        let staged = git(&["diff", "--cached", "--name-only"]);
-        assert!(staged.stdout.is_empty(), "nothing staged");
+        let staged = git_stdout_untrimmed(tmp.path(), &["diff", "--cached", "--name-only"]);
+        assert!(staged.is_empty(), "nothing staged");
 
         hook.set_read_timeout(Some(std::time::Duration::from_millis(500)))
             .unwrap();

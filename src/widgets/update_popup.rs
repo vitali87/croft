@@ -39,6 +39,10 @@ pub const LOG_GLYPH: char = '\u{eb9d}';
 /// badge and the Extensions switches).
 const CAP_L: &str = "\u{e0b6}";
 const CAP_R: &str = "\u{e0b4}";
+/// A `surfaces` theme's pill ends: half blocks, which every font draws,
+/// where the Powerline caps show as boxes without a patched one.
+pub const HALF_CAP_L: &str = "\u{2590}";
+pub const HALF_CAP_R: &str = "\u{258c}";
 
 /// What the card says. `A` is the caller's action type, handed back with
 /// the rect each control was painted at.
@@ -71,12 +75,33 @@ struct Palette {
     secondary_fg: Color,
     primary: Color,
     primary_hover: Color,
+    primary_fg: Color,
     link: Color,
 }
 
 impl Palette {
     fn of(theme: Theme) -> Self {
         let primary = theme.button();
+        if let Some(t) = crate::widgets::surface::tones(theme) {
+            // The refined inks: the title strong, labels muted, values in
+            // body text; secondary pills a lift off the card (the keycap
+            // chip's), the link glyph muted until the pointer is on it.
+            let secondary = t.keycap_on(t.raised());
+            return Palette {
+                bg: t.raised(),
+                title: t.strong(),
+                label: t.muted(),
+                value: t.text(),
+                divider: t.rim(),
+                secondary,
+                secondary_hover: lift(secondary, theme),
+                secondary_fg: t.text(),
+                primary,
+                primary_hover: lift(primary, theme),
+                primary_fg: t.strong(),
+                link: t.accent(),
+            };
+        }
         Palette {
             bg: theme.ui(Color::Rgb(0x16, 0x18, 0x1f)),
             title: theme.ui(Color::White),
@@ -91,6 +116,7 @@ impl Palette {
             secondary_fg: theme.ui(Color::Rgb(0xe5, 0xe9, 0xf0)),
             primary,
             primary_hover: lift(primary, theme),
+            primary_fg: Color::White,
             link: theme.accent(),
         }
     }
@@ -123,6 +149,21 @@ pub fn pill_spans(label: &str, fill: Color, fg: Color) -> [Span<'static>; 3] {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(CAP_R, Style::default().fg(fill)),
+    ]
+}
+
+/// [`pill_spans`] as `theme` draws a pill on the card: a `surfaces` theme
+/// rounds it with half blocks instead of Powerline caps and leaves the label
+/// at its normal weight (the card's title is its one bold thing). The same
+/// width either way.
+fn card_pill_spans(theme: Theme, label: &str, fill: Color, fg: Color) -> [Span<'static>; 3] {
+    if crate::widgets::surface::tones(theme).is_none() {
+        return pill_spans(label, fill, fg);
+    }
+    [
+        Span::styled(HALF_CAP_L, Style::default().fg(fill)),
+        Span::styled(format!(" {label} "), Style::default().fg(fg).bg(fill)),
+        Span::styled(HALF_CAP_R, Style::default().fg(fill)),
     ]
 }
 
@@ -275,13 +316,13 @@ impl<A: Copy> Card<A> {
             let hit = Rect::new(bx, y, pw, 1);
             let hovered = crate::widgets::hover::contains(hit, pointer);
             let (fill, fg) = match (primary, hovered) {
-                (true, false) => (p.primary, Color::White),
-                (true, true) => (p.primary_hover, Color::White),
+                (true, false) => (p.primary, p.primary_fg),
+                (true, true) => (p.primary_hover, p.primary_fg),
                 (false, false) => (p.secondary, p.secondary_fg),
                 (false, true) => (p.secondary_hover, p.secondary_fg),
             };
             let mut cx = bx;
-            for span in pill_spans(label, fill, fg) {
+            for span in card_pill_spans(theme, label, fill, fg) {
                 let (end, _) = buf.set_span(cx, y, &span, pw);
                 cx = end;
             }
@@ -292,8 +333,15 @@ impl<A: Copy> Card<A> {
 
         if let Some((glyph, label, action)) = &self.link {
             // The divider runs the card's full width and joins a line
-            // border with tees; a `surfaces` card edge has no line to join.
-            for dx in rect.x + 1..rect.right() - 1 {
+            // border with tees; a `surfaces` card edge has no line to join,
+            // so its rule runs edge to edge in the rim and meets the edge.
+            let surfaces = crate::widgets::surface::tones(theme).is_some();
+            let span = if surfaces {
+                rect.x..rect.right()
+            } else {
+                rect.x + 1..rect.right() - 1
+            };
+            for dx in span {
                 buf[(dx, y)].set_symbol("\u{2500}").set_fg(p.divider);
             }
             for (sx, tee) in [(rect.x, "\u{251c}"), (rect.right() - 1, "\u{2524}")] {
@@ -305,7 +353,13 @@ impl<A: Copy> Card<A> {
             y += 1;
             let hit = Rect::new(rect.x + 1, y, rect.width - 2, 1);
             let hovered = crate::widgets::hover::contains(hit, pointer);
-            buf.set_stringn(x, y, glyph.to_string(), 1, Style::default().fg(p.link));
+            // The accent marks the link only while the pointer is on it.
+            let glyph_fg = if surfaces && !hovered {
+                p.label
+            } else {
+                p.link
+            };
+            buf.set_stringn(x, y, glyph.to_string(), 1, Style::default().fg(glyph_fg));
             let style = if hovered {
                 Style::default()
                     .fg(p.link)
@@ -482,5 +536,38 @@ mod tests {
         assert_eq!(wrap("one two three", 7), ["one two", "three"]);
         assert_eq!(wrap("  ", 7), Vec::<String>::new());
         assert_eq!(wrap("unbreakable", 4), ["unbreakable"]);
+    }
+
+    /// Croft Loch: pills end in half blocks (no Powerline caps, which need
+    /// a patched font), at the same width and hit rects; the divider is a
+    /// rim-coloured rule from edge to edge; the link's glyph is muted until
+    /// the pointer is on it.
+    #[test]
+    fn croft_loch_pills_use_half_block_caps_and_the_divider_spans_the_card() {
+        let theme = Theme::from_id("loch");
+        let t = crate::widgets::surface::tones(theme).unwrap();
+        let c = card();
+        let h = c.height(WIDTH);
+        let area = Rect::new(0, 0, WIDTH, h);
+        let mut buf = Buffer::empty(area);
+        let hits = c.render(&mut buf, area, theme, None);
+        let update = hits[2].0;
+        assert_eq!(update.right(), WIDTH - INSET, "the primary is flush right");
+        assert_eq!(buf[(update.x, update.y)].symbol(), HALF_CAP_L);
+        assert_eq!(buf[(update.right() - 1, update.y)].symbol(), HALF_CAP_R);
+        assert_eq!(buf[(update.x, update.y)].fg, theme.button());
+        assert!(
+            !buf[(update.x + 2, update.y)]
+                .modifier
+                .contains(Modifier::BOLD)
+        );
+        let skip = hits[0].0;
+        assert_eq!(buf[(skip.x + 2, skip.y)].bg, t.keycap_on(t.raised()));
+        for x in 0..WIDTH {
+            assert_eq!(buf[(x, h - 3)].symbol(), "\u{2500}", "({x}) on the rule");
+            assert_eq!(buf[(x, h - 3)].fg, t.rim());
+        }
+        assert_eq!(buf[(INSET, h - 2)].fg, t.muted(), "the link glyph rests");
+        assert_eq!(buf[(INSET + 2, 1)].fg, t.strong(), "the title");
     }
 }

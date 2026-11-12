@@ -1863,10 +1863,10 @@ fn preview_link_under_the_pointer_lifts_to_the_hover_background() {
     app.editor.open_pinned(&readme).unwrap();
     app.focus_pane(Pane::Editor);
     app.toggle_markdown_preview();
-    render_buf(&mut app);
+    draw_buffer(&mut app, 140, 50);
     app.handle_key(key(KeyCode::Down, KeyModifiers::NONE))
         .unwrap();
-    render_buf(&mut app);
+    draw_buffer(&mut app, 140, 50);
     let md = app
         .editor
         .markdown_preview
@@ -1890,7 +1890,7 @@ fn preview_link_under_the_pointer_lifts_to_the_hover_background() {
             row,
             modifiers: KeyModifiers::NONE,
         });
-        let buf = render_buf(app);
+        let buf = draw_buffer(app, 140, 50);
         let rows = app.editor.markdown_preview.as_ref().unwrap().rows.clone();
         (buf, rows)
     };
@@ -3035,15 +3035,8 @@ fn an_http_file_runs_requests_and_keeps_secrets_out_of_history_and_the_tab() {
     // family: hold their lock and restore via RAII, exactly as
     // `with_relay_home` does, so a panic cannot leak the redirect into
     // later tests (#428 review).
-    struct RestoreCacheDir;
-    impl Drop for RestoreCacheDir {
-        fn drop(&mut self) {
-            *crate::paths::CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap() = None;
-        }
-    }
     let _cache_lock = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    let _restore = RestoreCacheDir;
-    *crate::paths::CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap() = Some(tmp.path().join("cache"));
+    let _restore = override_cache_dir(tmp.path().join("cache"));
 
     // A 1x1 PNG via the image crate, so the decode on open genuinely works.
     let png_bytes = {
@@ -3456,6 +3449,11 @@ fn reopen_as_preview_shows_the_markdown_preview() {
     // Asked again, it stays on rather than flipping back to the source.
     app.run_command(Command::ReopenAsPreview);
     assert!(app.editor.markdown_preview.is_some());
+    // Reopen as Text still lands in the source, though the same-path reload
+    // it does now keeps a Markdown preview (#1605).
+    app.editor.save_to_disk().unwrap();
+    app.run_command(Command::ReopenAsText);
+    assert!(app.editor.markdown_preview.is_none(), "{}", app.status);
 }
 
 /// #1537 negative: source code has a grammar and no preview, so Reopen as

@@ -70,13 +70,13 @@ fn a_count_before_a_closing_q_is_discarded_too() {
     app.macros_path = tmp.path().join("macros.json");
     app.editor.cursor_row = 0;
     app.editor.cursor_col = 0;
-    vim_feed_str(&mut app, "qa");
-    vim_feed_str(&mut app, "3q");
+    type_keys(&mut app, "qa");
+    type_keys(&mut app, "3q");
     assert!(
         app.macro_recording.is_none(),
         "3q still stops the recording"
     );
-    vim_feed(&mut app, 'j');
+    type_char(&mut app, 'j');
     assert_eq!(
         app.editor.cursor_row, 1,
         "the discarded 3 must not make the next j move three rows"
@@ -93,8 +93,8 @@ fn a_count_before_q_does_not_leak_into_the_recording() {
     app.macros_path = tmp.path().join("macros.json");
     app.editor.cursor_row = 0;
     app.editor.cursor_col = 0;
-    vim_feed_str(&mut app, "3qa");
-    vim_feed(&mut app, 'j');
+    type_keys(&mut app, "3qa");
+    type_char(&mut app, 'j');
     assert_eq!(
         app.editor.cursor_row, 1,
         "the stale 3 must not make the recording's first j move three rows"
@@ -110,7 +110,7 @@ fn vim_q_records_into_a_register_and_at_replays_it() {
     app.editor.cursor_row = 0;
     app.editor.cursor_col = 0;
 
-    vim_feed_str(&mut app, "qa");
+    type_keys(&mut app, "qa");
     assert!(
         app.macro_recording.is_some(),
         "qa starts recording into a register"
@@ -122,20 +122,20 @@ fn vim_q_records_into_a_register_and_at_replays_it() {
     );
 
     // Record "insert X at the line start, then go down a line".
-    vim_feed_str(&mut app, "IX");
+    type_keys(&mut app, "IX");
     app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
         .unwrap();
-    vim_feed(&mut app, 'j');
-    vim_feed(&mut app, 'q');
+    type_char(&mut app, 'j');
+    type_char(&mut app, 'q');
     assert!(app.macro_recording.is_none(), "the closing q stops");
     assert_eq!(app.editor.lines[0], "Xone", "the recorded keys still ran");
 
     // Replay once on line two.
-    vim_feed_str(&mut app, "@a");
+    type_keys(&mut app, "@a");
     assert_eq!(app.editor.lines[1], "Xtwo", "@a replays the register");
 
     // `@@` repeats the same macro.
-    vim_feed_str(&mut app, "@@");
+    type_keys(&mut app, "@@");
     assert_eq!(app.editor.lines[2], "Xthree", "@@ repeats the last macro");
 }
 
@@ -148,14 +148,14 @@ fn vim_a_count_replays_the_macro_that_many_times() {
     app.editor.cursor_row = 0;
     app.editor.cursor_col = 0;
 
-    vim_feed_str(&mut app, "qz");
-    vim_feed_str(&mut app, "IX");
+    type_keys(&mut app, "qz");
+    type_keys(&mut app, "IX");
     app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
         .unwrap();
-    vim_feed(&mut app, 'j');
-    vim_feed(&mut app, 'q');
+    type_char(&mut app, 'j');
+    type_char(&mut app, 'q');
 
-    vim_feed_str(&mut app, "3@z");
+    type_keys(&mut app, "3@z");
     assert_eq!(
         (
             app.editor.lines[1].as_str(),
@@ -170,35 +170,35 @@ fn vim_a_count_replays_the_macro_that_many_times() {
 #[test]
 fn vim_dd_deletes_the_current_line() {
     let (mut app, _t) = vim_app("alpha\nbeta\ngamma");
-    vim_feed_str(&mut app, "dd");
+    type_keys(&mut app, "dd");
     assert_eq!(app.editor.lines, vec!["beta", "gamma"]);
 }
 
 #[test]
 fn vim_count_dd_deletes_multiple_lines() {
     let (mut app, _t) = vim_app("a\nb\nc\nd");
-    vim_feed_str(&mut app, "2dd");
+    type_keys(&mut app, "2dd");
     assert_eq!(app.editor.lines, vec!["c", "d"]);
 }
 
 #[test]
 fn vim_x_deletes_char_under_cursor() {
     let (mut app, _t) = vim_app("hello");
-    vim_feed(&mut app, 'x');
+    type_char(&mut app, 'x');
     assert_eq!(app.editor.lines, vec!["ello"]);
 }
 
 #[test]
 fn vim_dw_deletes_word_and_trailing_space() {
     let (mut app, _t) = vim_app("foo bar");
-    vim_feed_str(&mut app, "dw");
+    type_keys(&mut app, "dw");
     assert_eq!(app.editor.lines, vec!["bar"]);
 }
 
 #[test]
 fn vim_de_deletes_to_word_end_inclusive() {
     let (mut app, _t) = vim_app("foo bar");
-    vim_feed_str(&mut app, "de");
+    type_keys(&mut app, "de");
     assert_eq!(app.editor.lines, vec![" bar"]);
 }
 
@@ -215,7 +215,7 @@ fn vim_cw_keeps_the_blank_after_the_word() {
     ] {
         let (mut app, _t) = vim_app("one two three");
         app.editor.cursor_col = start;
-        vim_feed_str(&mut app, keys);
+        type_keys(&mut app, keys);
         app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
             .unwrap();
         assert_eq!(app.editor.lines, vec![want], "{keys} from column {start}");
@@ -238,7 +238,7 @@ fn vim_u_undoes_a_change_and_its_typed_text_at_once() {
         }
         app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
             .unwrap();
-        vim_feed(&mut app, 'u');
+        type_char(&mut app, 'u');
         assert_eq!(
             app.editor.lines,
             vec!["one two three", "second line"],
@@ -253,7 +253,7 @@ fn vim_u_undoes_a_change_and_its_typed_text_at_once() {
 #[test]
 fn a_change_left_on_another_tab_does_not_swallow_the_next_edit() {
     let (mut app, tmp) = vim_app("one two");
-    vim_feed_str(&mut app, "cwONE");
+    type_keys(&mut app, "cwONE");
     let other = tmp.path().join("other.txt");
     std::fs::write(&other, "x").unwrap();
     app.editor.open_pinned(&other).unwrap();
@@ -263,7 +263,7 @@ fn a_change_left_on_another_tab_does_not_swallow_the_next_edit() {
     app.editor.select(0);
     app.editor.insert_str(" PASTE");
     assert_eq!(app.editor.lines, vec!["ONE PASTE two"]);
-    vim_feed(&mut app, 'u');
+    type_char(&mut app, 'u');
     assert_eq!(app.editor.lines, vec!["ONE two"], "only the paste");
 }
 
@@ -272,17 +272,17 @@ fn a_change_left_on_another_tab_does_not_swallow_the_next_edit() {
 #[test]
 fn vim_an_edit_after_a_change_undoes_on_its_own() {
     let (mut app, _t) = vim_app("one two");
-    vim_feed_str(&mut app, "cwONE");
+    type_keys(&mut app, "cwONE");
     app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
         .unwrap();
-    vim_feed_str(&mut app, "xu");
+    type_keys(&mut app, "xu");
     assert_eq!(app.editor.lines, vec!["ONE two"]);
-    vim_feed(&mut app, 'u');
+    type_char(&mut app, 'u');
     assert_eq!(app.editor.lines, vec!["one two"]);
     // The undone step held `cw`'s selection: none is left to paint, and
     // `x` deletes one char, not the word.
     assert_eq!(app.editor.selection, None);
-    vim_feed(&mut app, 'x');
+    type_char(&mut app, 'x');
     assert_eq!(app.editor.lines[0].chars().count(), 6);
 }
 
@@ -290,7 +290,7 @@ fn vim_an_edit_after_a_change_undoes_on_its_own() {
 #[test]
 fn vim_dot_says_it_is_not_supported() {
     let (mut app, _t) = vim_app("a\nb\nc");
-    vim_feed_str(&mut app, "dd.");
+    type_keys(&mut app, "dd.");
     assert_eq!(app.editor.lines, vec!["b", "c"]);
     assert_eq!(app.status, "Repeat (.) is not supported in vim mode");
 }
@@ -299,22 +299,22 @@ fn vim_dot_says_it_is_not_supported() {
 fn vim_diw_deletes_inner_word() {
     let (mut app, _t) = vim_app("foo bar baz");
     // cursor on "foo"
-    vim_feed_str(&mut app, "diw");
+    type_keys(&mut app, "diw");
     assert_eq!(app.editor.lines, vec![" bar baz"]);
 }
 
 #[test]
 fn vim_dollar_then_d_deletes_to_end_of_line() {
     let (mut app, _t) = vim_app("hello world");
-    vim_feed_str(&mut app, "wd$");
+    type_keys(&mut app, "wd$");
     assert_eq!(app.editor.lines, vec!["hello "]);
 }
 
 #[test]
 fn vim_insert_types_text_then_esc_returns_to_normal() {
     let (mut app, _t) = vim_app("bc");
-    vim_feed(&mut app, 'i');
-    vim_feed(&mut app, 'a');
+    type_char(&mut app, 'i');
+    type_char(&mut app, 'a');
     app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
         .unwrap();
     assert_eq!(app.editor.lines, vec!["abc"]);
@@ -324,8 +324,8 @@ fn vim_insert_types_text_then_esc_returns_to_normal() {
 #[test]
 fn vim_append_inserts_after_cursor() {
     let (mut app, _t) = vim_app("ac");
-    vim_feed(&mut app, 'a'); // insert after the 'a'
-    vim_feed(&mut app, 'b');
+    type_char(&mut app, 'a'); // insert after the 'a'
+    type_char(&mut app, 'b');
     app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
         .unwrap();
     assert_eq!(app.editor.lines, vec!["abc"]);
@@ -334,8 +334,8 @@ fn vim_append_inserts_after_cursor() {
 #[test]
 fn vim_open_line_below_enters_insert_on_fresh_line() {
     let (mut app, _t) = vim_app("first");
-    vim_feed(&mut app, 'o');
-    vim_feed_str(&mut app, "second");
+    type_char(&mut app, 'o');
+    type_keys(&mut app, "second");
     app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
         .unwrap();
     assert_eq!(app.editor.lines, vec!["first", "second"]);
@@ -344,8 +344,8 @@ fn vim_open_line_below_enters_insert_on_fresh_line() {
 #[test]
 fn vim_yank_line_then_paste_duplicates_it() {
     let (mut app, _t) = vim_app("dup\ntail");
-    vim_feed_str(&mut app, "yy");
-    vim_feed(&mut app, 'p');
+    type_keys(&mut app, "yy");
+    type_char(&mut app, 'p');
     assert_eq!(app.editor.lines, vec!["dup", "dup", "tail"]);
 }
 
@@ -356,9 +356,9 @@ fn vim_yank_line_then_paste_duplicates_it() {
 fn vim_put_works_where_the_host_clipboard_cant_be_read() {
     let (mut app, _t) = vim_app("one\ntwo");
     app.clipboard_reader = || None;
-    vim_feed_str(&mut app, "yyp");
+    type_keys(&mut app, "yyp");
     assert_eq!(app.editor.lines, vec!["one", "one", "two"]);
-    vim_feed_str(&mut app, "Gddggp");
+    type_keys(&mut app, "Gddggp");
     assert_eq!(app.editor.lines, vec!["one", "two", "one"]);
 }
 
@@ -367,7 +367,7 @@ fn vim_put_works_where_the_host_clipboard_cant_be_read() {
 fn vim_put_with_nothing_to_put_says_so() {
     let (mut app, _t) = vim_app("one");
     app.clipboard_reader = || None;
-    vim_feed(&mut app, 'p');
+    type_char(&mut app, 'p');
     assert_eq!(app.editor.lines, vec!["one"]);
     assert_eq!(app.status, "Nothing to paste: the clipboard can't be read");
 }
@@ -375,25 +375,25 @@ fn vim_put_with_nothing_to_put_says_so() {
 #[test]
 fn vim_visual_select_then_delete_removes_selection() {
     let (mut app, _t) = vim_app("abcdef");
-    vim_feed(&mut app, 'v'); // visual at col 0 (covers 'a')
-    vim_feed(&mut app, 'l'); // extend to 'b'
-    vim_feed(&mut app, 'l'); // extend to 'c'
-    vim_feed(&mut app, 'd'); // delete a,b,c inclusive
+    type_char(&mut app, 'v'); // visual at col 0 (covers 'a')
+    type_char(&mut app, 'l'); // extend to 'b'
+    type_char(&mut app, 'l'); // extend to 'c'
+    type_char(&mut app, 'd'); // delete a,b,c inclusive
     assert_eq!(app.editor.lines, vec!["def"]);
 }
 
 #[test]
 fn vim_normal_mode_swallows_plain_letters() {
     let (mut app, _t) = vim_app("text");
-    vim_feed(&mut app, 'z'); // unmapped in Normal: must not be inserted
+    type_char(&mut app, 'z'); // unmapped in Normal: must not be inserted
     assert_eq!(app.editor.lines, vec!["text"]);
 }
 
 #[test]
 fn vim_search_moves_cursor_to_match() {
     let (mut app, _t) = vim_app("alpha needle omega");
-    vim_feed(&mut app, '/');
-    vim_feed_str(&mut app, "needle");
+    type_char(&mut app, '/');
+    type_keys(&mut app, "needle");
     app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
         .unwrap();
     assert_eq!(app.editor.cursor_row, 0);
@@ -407,8 +407,8 @@ fn vim_search_moves_cursor_to_match() {
 fn vim_search_records_active_match_and_advances_with_n() {
     // Two matches on one line: "x needle y needle z" -> cols 2 and 11.
     let (mut app, _t) = vim_app("x needle y needle z");
-    vim_feed(&mut app, '/');
-    vim_feed_str(&mut app, "needle");
+    type_char(&mut app, '/');
+    type_keys(&mut app, "needle");
     app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
         .unwrap();
     assert_eq!(
@@ -416,7 +416,7 @@ fn vim_search_records_active_match_and_advances_with_n() {
         Some((0, 2, 6)),
         "the match the cursor jumped to must be recorded as (row, col_chars, len_chars) so the renderer paints it orange while the other 'needle' stays yellow"
     );
-    vim_feed(&mut app, 'n');
+    type_char(&mut app, 'n');
     assert_eq!(
         app.editor.active_search_match,
         Some((0, 11, 6)),
@@ -430,7 +430,7 @@ fn vim_gg_and_capital_g_jump_between_ends() {
     app.handle_key(key(KeyCode::Char('G'), KeyModifiers::SHIFT))
         .unwrap();
     assert_eq!(app.editor.cursor_row, 2);
-    vim_feed_str(&mut app, "gg");
+    type_keys(&mut app, "gg");
     assert_eq!(app.editor.cursor_row, 0);
 }
 
@@ -447,7 +447,7 @@ fn a_saved_vim_mode_turns_modal_editing_on_in_normal_mode() {
     app.apply_merged_settings(&on);
     assert!(app.vim.enabled, "the saved default applies");
     assert_eq!(app.vim.mode(), crate::vim::VimMode::Normal);
-    vim_feed_str(&mut app, "dd");
+    type_keys(&mut app, "dd");
     assert_eq!(app.editor.lines, vec![""], "dd deletes the line, not typed");
     app.apply_merged_settings(&crate::prefs::Prefs::default());
     assert!(!app.vim.enabled, "the pref taken off turns it off");
@@ -540,8 +540,8 @@ fn vim_toggle_works_from_any_pane_even_with_no_editor_focus() {
 #[test]
 fn vim_toggle_off_clears_search_highlights() {
     let (mut app, _t) = vim_app("x needle y needle z");
-    vim_feed(&mut app, '/');
-    vim_feed_str(&mut app, "needle");
+    type_char(&mut app, '/');
+    type_keys(&mut app, "needle");
     app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
         .unwrap();
     assert!(
@@ -571,7 +571,7 @@ fn vim_toggle_off_restores_plain_typing() {
     app.handle_key(key(KeyCode::Char('e'), KeyModifiers::SUPER))
         .unwrap();
     assert!(!app.vim.enabled);
-    vim_feed_str(&mut app, "hi");
+    type_keys(&mut app, "hi");
     assert_eq!(app.editor.lines, vec!["hi"]);
 }
 
@@ -589,15 +589,15 @@ fn vim_toggle_on_with_cmd_e_enables_modal_editing() {
     assert!(app.vim.enabled);
     assert_eq!(app.vim.mode(), crate::vim::VimMode::Normal);
     // A plain letter is now a Normal-mode command, not inserted text.
-    vim_feed(&mut app, 'x');
+    type_char(&mut app, 'x');
     assert_eq!(app.editor.lines, vec!["bc"]);
 }
 
 #[test]
 fn vim_ex_goto_line_number() {
     let (mut app, _t) = vim_app("l1\nl2\nl3\nl4");
-    vim_feed(&mut app, ':');
-    vim_feed(&mut app, '3');
+    type_char(&mut app, ':');
+    type_char(&mut app, '3');
     app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
         .unwrap();
     assert_eq!(app.editor.cursor_row, 2);
@@ -608,7 +608,7 @@ fn vim_cmd_save_shortcut_still_works_in_normal_mode() {
     // A Cmd-modified key must pass through to the editor's own handling
     // rather than being swallowed by Normal mode.
     let (mut app, _t) = vim_app("data");
-    vim_feed(&mut app, 'x'); // edit so the buffer is dirty: "ata"
+    type_char(&mut app, 'x'); // edit so the buffer is dirty: "ata"
     app.handle_key(key(KeyCode::Char('s'), KeyModifiers::SUPER))
         .unwrap();
     assert_eq!(app.editor.lines, vec!["ata"]);
@@ -665,7 +665,7 @@ fn vim_operators_in_a_symbol_tab_stay_inside_its_symbol() {
         let mut app = vim_symbol_tab_on_b(&tmp);
         app.editor.cursor_row = row;
         app.editor.cursor_col = col;
-        vim_feed_str(&mut app, keys);
+        type_keys(&mut app, keys);
         assert_eq!(app.editor.lines, after, "{keys}");
     }
 }
@@ -678,7 +678,7 @@ fn a_vim_line_count_in_a_symbol_tab_stops_at_its_last_line() {
     let mut app = vim_symbol_tab_on_b(&tmp);
     app.editor.cursor_row = 4;
     app.editor.cursor_col = 0;
-    vim_feed_str(&mut app, "5yy");
+    type_keys(&mut app, "5yy");
     assert_eq!(app.status, "Yanked 2 line(s)");
 }
 

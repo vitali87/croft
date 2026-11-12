@@ -20,7 +20,7 @@ fn edits_left_at_the_connect_prompt_are_not_asked_about_again() {
     let tmp = tempfile::tempdir().unwrap();
     let (mut app, _) = app_with_unsaved_file(tmp.path());
     app.remote_handoff_ok = app.unsaved_stamp();
-    type_into_editor(&mut app, "y");
+    type_keys(&mut app, "y");
     ready_to_hand_off(&mut app, crate::install_session::InstallEvent::CanLaunch);
     app.poll_install_session();
     assert!(!app.quit, "the later edit was never agreed to");

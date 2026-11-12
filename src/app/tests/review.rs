@@ -954,7 +954,9 @@ fn a_grouped_review_queue_row_survives_the_status_bar() {
             .record_write(&lane.join(format!("src/l{i}.rs")), 100 + i as u64, &working);
     }
     app.run_command(crate::widgets::command_palette::Command::ShowAgentLane);
-    let backend = ratatui::backend::TestBackend::new(120, 40);
+    // 124 columns: the status bar's left cap names the workspace folder
+    // (`<> repo`), a few cells more than the old wordmark took.
+    let backend = ratatui::backend::TestBackend::new(124, 40);
     let mut term = ratatui::Terminal::new(backend).unwrap();
     term.draw(|f| app.render(f)).unwrap();
     let buf = term.backend().buffer().clone();
@@ -1031,25 +1033,11 @@ fn review_fixture() -> (
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("repo");
     std::fs::create_dir(&root).unwrap();
-    for args in [
-        vec!["init", "-q", "-b", "main"],
-        vec!["config", "user.email", "a@b"],
-        vec!["config", "user.name", "a"],
-    ] {
-        let _ = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&root)
-            .args(&args)
-            .status();
-    }
+    git_init_with_identity(&root);
     let f = root.join("a.rs");
     std::fs::write(&f, "fn a() {}\nfn b() {}\n").unwrap();
     for args in [vec!["add", "."], vec!["commit", "-m", "init", "--quiet"]] {
-        let _ = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&root)
-            .args(&args)
-            .status();
+        let _ = git_succeeds(&root, &args);
     }
     let log = tmp.path().join("gh.log");
     let stdin = tmp.path().join("gh.stdin");
@@ -1375,9 +1363,7 @@ fn app_with_a_note_far_down() -> (
     app.editor.open_pinned(&f).unwrap();
     app.editor.cursor_row = 112;
     app.add_sticky_note("TODO before release, f56 must handle negative x");
-    let backend = ratatui::backend::TestBackend::new(120, 40);
-    let mut term = ratatui::Terminal::new(backend).unwrap();
-    term.draw(|fr| app.render(fr)).unwrap();
+    let term = draw_terminal(&mut app, 120, 40);
     (tmp, app, term)
 }
 
@@ -1476,20 +1462,6 @@ fn a_submit_in_flight_keeps_new_comments_and_refuses_a_second_submit() {
     assert_eq!(left, vec![String::from("written meanwhile")]);
 }
 
-fn pr_screen(app: &mut App) -> String {
-    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(150, 32)).unwrap();
-    term.draw(|f| app.render(f)).unwrap();
-    let buf = term.backend().buffer();
-    let mut s = String::new();
-    for y in 0..buf.area.height {
-        for x in 0..buf.area.width {
-            s.push_str(buf[(x, y)].symbol());
-        }
-        s.push('\n');
-    }
-    s
-}
-
 #[test]
 fn a_pr_review_tab_lists_files_checks_and_a_summary() {
     // The cache-dir override is process-global; serialize with the
@@ -1503,7 +1475,7 @@ fn a_pr_review_tab_lists_files_checks_and_a_summary() {
         let mut app = App::new(tmp.path().to_path_buf()).unwrap();
         app.open_pr_review(crate::widgets::pr_review::tests::sample(), "o/r#579".into());
         assert!(app.editor.pr_review.is_some(), "the PR tab is active");
-        let screen = pr_screen(&mut app);
+        let screen = draw_screen(&mut app, 150, 32);
         for want in [
             "PR #579",
             "feat(sarif): model",
@@ -1530,7 +1502,7 @@ fn space_marks_a_file_viewed_and_it_persists() {
         app.handle_pr_review_key(key(KeyCode::Char(' '), KeyModifiers::NONE));
         let view = app.editor.pr_review.as_ref().unwrap();
         assert!(view.viewed.contains("src/sarif/view.rs"));
-        assert!(pr_screen(&mut app).contains("1 of 2 viewed"));
+        assert!(draw_screen(&mut app, 150, 32).contains("1 of 2 viewed"));
         // A new session sees the mark.
         let mut again = App::new(tmp.path().to_path_buf()).unwrap();
         again.open_pr_review(crate::widgets::pr_review::tests::sample(), "o/r#579".into());
@@ -1739,7 +1711,7 @@ fn pr_viewed_state_syncs_with_github() {
             vec!["a.rs"],
             "both pages applied, GitHub wins"
         );
-        assert!(pr_screen(&mut app).contains("1 of 3 viewed"));
+        assert!(draw_screen(&mut app, 150, 32).contains("1 of 3 viewed"));
         let stored = crate::pr_review::ViewedStore::load(&store_path).viewed("x/y#42");
         assert_eq!(
             stored.iter().map(String::as_str).collect::<Vec<_>>(),
@@ -2043,23 +2015,12 @@ fn review_mode_checks_the_pr_out_and_leaving_removes_a_clean_checkout() {
     let home = tempfile::tempdir().unwrap();
     with_relay_home(home.path(), || {
         let tmp = tempfile::tempdir().unwrap();
-        let git = |dir: &Path, args: &[&str]| {
-            let out = std::process::Command::new("git")
-                .arg("-C")
-                .arg(dir)
-                .args(args)
-                .output()
-                .unwrap();
-            assert!(out.status.success(), "git {args:?}");
-            String::from_utf8_lossy(&out.stdout).trim().to_string()
-        };
+        let git = git_ok;
         // The "GitHub" repository, at a path ending in the PR's `o/r`, so
         // the remote naming it is found without a network.
         let up = tmp.path().join("o").join("r");
         std::fs::create_dir_all(&up).unwrap();
-        git(&up, &["init", "-q", "-b", "main"]);
-        git(&up, &["config", "user.email", "a@b"]);
-        git(&up, &["config", "user.name", "a"]);
+        git_init_with_identity(&up);
         std::fs::write(up.join("a.txt"), "base").unwrap();
         git(&up, &["add", "."]);
         git(&up, &["commit", "-q", "-m", "base"]);
