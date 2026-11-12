@@ -1332,10 +1332,7 @@ fn create_tag_via_the_menu_opens_an_input_then_creates_the_tag() {
         .as_ref()
         .expect("Create Tag must open an input prompt");
     assert_eq!(prompt.purpose, InputPurpose::CreateTag);
-    for c in "v9.9.9".chars() {
-        app.input_prompt.as_mut().unwrap().push_char(c);
-    }
-    app.submit_input_prompt();
+    append_and_submit_prompt(&mut app, "v9.9.9");
     // #1582: then the optional message; Enter on a blank one makes a
     // lightweight tag.
     assert_eq!(
@@ -1371,13 +1368,6 @@ fn repo_with_bare_origin() -> (tempfile::TempDir, tempfile::TempDir) {
     (tmp, bare)
 }
 
-fn type_and_submit(app: &mut App, text: &str) {
-    for c in text.chars() {
-        app.input_prompt.as_mut().unwrap().push_char(c);
-    }
-    app.submit_input_prompt();
-}
-
 /// #1582: the Tags menu makes an annotated tag from a message, pushes it,
 /// and deletes it from the remote after a confirmation, keeping the local
 /// tag.
@@ -1388,8 +1378,8 @@ fn the_tags_menu_annotates_pushes_and_deletes_a_remote_tag() {
     let (tmp, bare) = repo_with_bare_origin();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.dispatch_scm_action(ScmAction::CreateTag);
-    type_and_submit(&mut app, "v1.0");
-    type_and_submit(&mut app, "Release 1.0");
+    append_and_submit_prompt(&mut app, "v1.0");
+    append_and_submit_prompt(&mut app, "Release 1.0");
     assert_eq!(git_stdout(tmp.path(), &["cat-file", "-t", "v1.0"]), "tag");
     assert_eq!(
         git_stdout(
@@ -5993,10 +5983,7 @@ fn a_failed_scm_op_names_the_operation_and_git_s_error_line() {
 
     git_ok(tmp.path(), &["tag", "v1"]);
     app.dispatch_scm_action(ScmAction::CreateTag);
-    for c in "v1".chars() {
-        app.input_prompt.as_mut().unwrap().push_char(c);
-    }
-    app.submit_input_prompt();
+    append_and_submit_prompt(&mut app, "v1");
     // The optional message (#1582), left blank.
     app.submit_input_prompt();
     assert_eq!(

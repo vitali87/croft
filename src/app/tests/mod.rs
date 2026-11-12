@@ -799,6 +799,9 @@ fn file_node(path: &Path) -> crate::widgets::file_tree::Node {
     }
 }
 
+/// Types `text` one unmodified keystroke per character straight into the
+/// sheet grid's own handler, `App::handle_sheet_key`, skipping the
+/// `App::handle_key` routing that [`type_keys`] goes through.
 fn type_into_sheet(app: &mut App, text: &str) {
     for ch in text.chars() {
         app.handle_sheet_key(key(KeyCode::Char(ch), KeyModifiers::NONE));
@@ -930,10 +933,11 @@ fn app_with_run_script() -> (tempfile::TempDir, App) {
     (tmp, app)
 }
 
-/// Run the Command Palette row titled `title` the way a user does: open the
-/// palette (Cmd+Shift+P), type the title, pick its row, Enter. Returns false,
-/// running nothing, when no row has that title.
-fn run_from_palette(app: &mut App, title: &str) -> bool {
+/// Run the Command Palette row titled exactly `title` the way a user does:
+/// open the palette (Cmd+Shift+P), type the title, pick that row wherever
+/// the search ranks it, Enter. Returns false, running nothing, when no row
+/// has that title. [`run_palette_top_match`] runs the top row instead.
+fn run_palette_row_titled(app: &mut App, title: &str) -> bool {
     app.handle_key(key(
         KeyCode::Char('p'),
         KeyModifiers::SUPER | KeyModifiers::SHIFT,
@@ -1189,6 +1193,23 @@ fn with_relay_home<T>(home: &std::path::Path, body: impl FnOnce() -> T) -> T {
         std::env::set_var("CROFT_RELAY_KEY", TEST_RELAY_KEY);
     }
     body()
+}
+
+/// Puts the app's cache dir back when dropped, panic or not; made by
+/// [`override_cache_dir`].
+struct CacheDirOverride;
+
+impl Drop for CacheDirOverride {
+    fn drop(&mut self) {
+        *crate::paths::CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap() = None;
+    }
+}
+
+/// Points the app's cache dir at `dir` until the returned guard drops. The
+/// override is process-wide, so the caller holds [`relay_test_lock`].
+fn override_cache_dir(dir: PathBuf) -> CacheDirOverride {
+    *crate::paths::CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap() = Some(dir);
+    CacheDirOverride
 }
 
 /// Drop a fake `bin/python` shim in `dir/.venv/bin/python` so the venv
@@ -1782,9 +1803,7 @@ fn app_with_baked_terminal_image(
     app.focus_pane(Pane::Terminal);
     app.inline_protocol = protocol;
     app.cell_pixel = Some((8, 16));
-    let backend = ratatui::backend::TestBackend::new(100, 30);
-    let mut term = ratatui::Terminal::new(backend).unwrap();
-    term.draw(|f| app.render(f)).unwrap();
+    draw(&mut app, 100, 30);
     // The pane owns a REAL shell, and its startup output arrives whenever the
     // machine gets round to it (#326). Every assertion built on this fixture
     // reads the picture's position, so a prompt landing after the bake scrolls
@@ -2080,8 +2099,7 @@ fn app_with_terminal_panes(
     for _ in 1..n {
         app.split_terminal().unwrap();
     }
-    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 30)).unwrap();
-    term.draw(|f| app.render(f)).unwrap();
+    let term = draw_terminal(&mut app, 160, 30);
     (tmp, app, term)
 }
 
@@ -2880,8 +2898,10 @@ fn tab_names_852(tabs: &crate::widgets::editor::EditorTabs) -> Vec<String> {
 }
 
 /// Runs `query` from the palette as a user does: `Cmd+Shift+P`, type it,
-/// Enter. Returns the title of the row Enter ran, `None` when none matched.
-fn run_in_palette_852(app: &mut App, query: &str) -> Option<String> {
+/// Enter on whatever row the search put on top, whatever its title. Returns
+/// the title of the row Enter ran, `None` when none matched.
+/// [`run_palette_row_titled`] picks the row by its exact title instead.
+fn run_palette_top_match(app: &mut App, query: &str) -> Option<String> {
     open_palette_852(app);
     type_keys(app, query);
     let ran = app
@@ -3020,8 +3040,7 @@ fn wide_line_app(tmp: &std::path::Path) -> (App, ratatui::Terminal<ratatui::back
     );
     let mut app = app_with_open_file(tmp, "h300.txt", &format!("{line}\nshort\n"));
     app.focus_pane(Pane::Editor);
-    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
-    term.draw(|frame| app.render(frame)).unwrap();
+    let term = draw_terminal(&mut app, 100, 30);
     (app, term)
 }
 
@@ -3074,6 +3093,17 @@ fn type_keys(app: &mut App, text: &str) {
     for c in text.chars() {
         type_char(app, c);
     }
+}
+
+/// Pushes `text` one char at a time onto the end of the open input prompt's
+/// value, not as keystrokes through `App::handle_key` the way [`type_keys`]
+/// does, then submits it. `replace_and_submit_prompt` in the debug tests
+/// replaces the value instead.
+fn append_and_submit_prompt(app: &mut App, text: &str) {
+    for c in text.chars() {
+        app.input_prompt.as_mut().unwrap().push_char(c);
+    }
+    app.submit_input_prompt();
 }
 
 // ---- Find bar seeding selects the word under the caret (#1278) ----

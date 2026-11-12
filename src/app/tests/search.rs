@@ -1596,7 +1596,10 @@ fn find_in_selection_without_a_selection_takes_the_caret_line() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = app_with_open_file(tmp.path(), "f.py", FIND_IN_SELECTION_SRC);
     (app.editor.cursor_row, app.editor.cursor_col) = (7, 0);
-    assert!(run_from_palette(&mut app, "Find: Toggle Find in Selection"));
+    assert!(run_palette_row_titled(
+        &mut app,
+        "Find: Toggle Find in Selection"
+    ));
     let state = app.editor_find.as_ref().expect("the bar opened");
     assert_eq!(state.in_selection, Some(((7, 0), (7, 16))));
     for c in "x".chars() {

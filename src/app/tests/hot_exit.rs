@@ -131,8 +131,7 @@ fn draw_and_cursor(
     ratatui::Terminal<ratatui::backend::TestBackend>,
     ratatui::layout::Position,
 ) {
-    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
-    term.draw(|f| app.render(f)).unwrap();
+    let mut term = draw_terminal(app, 100, 30);
     let pos = term.get_cursor_position().unwrap();
     (term, pos)
 }
@@ -398,7 +397,7 @@ fn without_a_dialog_the_editor_is_announced_and_mode_off_stays_quiet() {
 fn a_run_block_confirm_over_the_broadcast_one_takes_the_key() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = markdown_fence_app(tmp.path());
-    assert!(run_from_palette(
+    assert!(run_palette_row_titled(
         &mut app,
         "Markdown: Run Code Block at Cursor"
     ));

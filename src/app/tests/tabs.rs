@@ -2102,7 +2102,7 @@ fn typing_the_tab_menus_keep_open_in_the_palette_keeps_the_preview_tab() {
     let p = tmp.path().join("p.rs");
     std::fs::write(&p, "x\n").unwrap();
     app.editor.open_preview(&p).unwrap();
-    let ran = run_in_palette_852(&mut app, "keep open");
+    let ran = run_palette_top_match(&mut app, "keep open");
     assert_eq!(ran.as_deref(), Some("View: Keep Editor"));
     assert!(!app.editor.preview, "the preview tab is kept");
 }
@@ -2201,7 +2201,7 @@ fn tab_commands_with_no_editor_open_only_say_so() {
             "No tabs to the right to close",
         ),
     ] {
-        let ran = run_in_palette_852(&mut app, title);
+        let ran = run_palette_top_match(&mut app, title);
         assert_eq!(ran.as_deref(), Some(title));
         assert_eq!(app.status, status, "{title}");
         assert!(app.editor.is_blank_initial(), "{title}");

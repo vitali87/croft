@@ -95,7 +95,7 @@ fn the_palette_goes_to_implementations_at_the_caret() {
     let mut app = app_with_open_file(tmp.path(), "lib.rs", "trait Shape {}\n");
     app.editor.cursor_col = 7;
     assert!(app.implementation_request_id.is_none());
-    assert!(run_from_palette(&mut app, "Go to Implementations"));
+    assert!(run_palette_row_titled(&mut app, "Go to Implementations"));
     assert!(
         app.implementation_request_id.is_some(),
         "the request went to the language servers"
@@ -109,7 +109,7 @@ fn the_palette_opens_the_zoxide_jump_from_any_pane() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.focus_pane(Pane::Editor);
-    assert!(run_from_palette(
+    assert!(run_palette_row_titled(
         &mut app,
         "Explorer: Jump to Directory (zoxide)"
     ));
@@ -126,10 +126,16 @@ fn the_palette_focuses_the_left_and_right_editor_groups() {
     app.split_editor();
     assert_eq!(app.editor_layout.active_dfs_index(), 1);
     app.focus_pane(Pane::Tree);
-    assert!(run_from_palette(&mut app, "View: Focus Left Editor Group"));
+    assert!(run_palette_row_titled(
+        &mut app,
+        "View: Focus Left Editor Group"
+    ));
     assert_eq!(app.editor_layout.active_dfs_index(), 0);
     assert!(app.focus == Pane::Editor);
-    assert!(run_from_palette(&mut app, "View: Focus Right Editor Group"));
+    assert!(run_palette_row_titled(
+        &mut app,
+        "View: Focus Right Editor Group"
+    ));
     assert_eq!(app.editor_layout.active_dfs_index(), 1);
 }
 
@@ -144,15 +150,18 @@ fn the_palette_focuses_the_next_and_previous_terminal() {
     app.split_terminal().unwrap();
     app.active_terminal = 0;
     app.focus_pane(Pane::Editor);
-    assert!(run_from_palette(&mut app, "Terminal: Focus Next Terminal"));
+    assert!(run_palette_row_titled(
+        &mut app,
+        "Terminal: Focus Next Terminal"
+    ));
     assert_eq!(app.active_terminal, 1);
     assert!(app.focus == Pane::Terminal);
-    assert!(run_from_palette(
+    assert!(run_palette_row_titled(
         &mut app,
         "Terminal: Focus Previous Terminal"
     ));
     assert_eq!(app.active_terminal, 0);
-    assert!(run_from_palette(
+    assert!(run_palette_row_titled(
         &mut app,
         "Terminal: Focus Previous Terminal"
     ));
@@ -203,7 +212,7 @@ fn the_palette_selects_the_whole_buffer() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = app_with_open_file(tmp.path(), "notes.txt", "one\ntwo");
     app.focus_pane(Pane::Tree);
-    assert!(run_from_palette(&mut app, "Select All"));
+    assert!(run_palette_row_titled(&mut app, "Select All"));
     assert!(app.focus == Pane::Editor);
     assert_eq!(app.editor.selection_text(), "one\ntwo");
 }
@@ -232,7 +241,7 @@ fn the_palette_runs_the_markdown_code_block_at_the_caret() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = markdown_fence_app(tmp.path());
     let panes = app.terminals.len();
-    assert!(run_from_palette(
+    assert!(run_palette_row_titled(
         &mut app,
         "Markdown: Run Code Block at Cursor"
     ));
@@ -260,10 +269,10 @@ fn insert_line_below_and_above_are_palette_commands() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = app_with_open_file(tmp.path(), "i.py", "a = 1\nb = 2\n");
     app.editor.cursor_col = 2;
-    assert!(run_from_palette(&mut app, "Insert Line Below"));
+    assert!(run_palette_row_titled(&mut app, "Insert Line Below"));
     assert_eq!(app.editor.lines, ["a = 1", "", "b = 2"]);
     app.editor.cursor_row = 2;
-    assert!(run_from_palette(&mut app, "Insert Line Above"));
+    assert!(run_palette_row_titled(&mut app, "Insert Line Above"));
     assert_eq!(app.editor.lines, ["a = 1", "", "", "b = 2"]);
     assert_eq!(app.editor.cursor_row, 2);
 }
@@ -1363,18 +1372,18 @@ fn a_macro_stopped_from_the_palette_replays_only_what_was_recorded() {
         KeyModifiers::SUPER | KeyModifiers::SHIFT,
     );
     let none = |code| key(code, KeyModifiers::NONE);
-    let run_from_palette = |app: &mut App, query: &str| {
+    let run_palette_row_titled = |app: &mut App, query: &str| {
         app.handle_key(palette).unwrap();
         type_keys(app, query);
         app.handle_key(none(KeyCode::Enter)).unwrap();
     };
-    run_from_palette(&mut app, "Macro: Start/Stop Recording");
+    run_palette_row_titled(&mut app, "Macro: Start/Stop Recording");
     assert!(app.macro_recording.is_some(), "the palette started it");
     app.handle_key(none(KeyCode::Home)).unwrap();
     type_keys(&mut app, "- ");
-    run_from_palette(&mut app, "Transform to Uppercase");
+    run_palette_row_titled(&mut app, "Transform to Uppercase");
     app.handle_key(none(KeyCode::Down)).unwrap();
-    run_from_palette(&mut app, "Macro: Start/Stop Recording");
+    run_palette_row_titled(&mut app, "Macro: Start/Stop Recording");
     assert!(app.macro_recording.is_none(), "the palette stopped it");
     assert_eq!(app.editor.lines[0], "- ALICE");
     app.replay_last_macro(4);
@@ -1400,19 +1409,19 @@ fn a_palette_command_that_leaves_the_editor_is_not_recorded() {
         KeyCode::Char('p'),
         KeyModifiers::SUPER | KeyModifiers::SHIFT,
     );
-    let run_from_palette = |app: &mut App, query: &str| {
+    let run_palette_row_titled = |app: &mut App, query: &str| {
         app.handle_key(palette).unwrap();
         type_keys(app, query);
         app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
             .unwrap();
     };
-    run_from_palette(&mut app, "Macro: Start/Stop Recording");
+    run_palette_row_titled(&mut app, "Macro: Start/Stop Recording");
     type_keys(&mut app, "x");
-    run_from_palette(&mut app, "Terminal: Focus Terminal");
+    run_palette_row_titled(&mut app, "Terminal: Focus Terminal");
     assert!(app.focus != Pane::Editor, "the command left the editor");
     app.focus_pane(Pane::Editor);
     type_keys(&mut app, "y");
-    run_from_palette(&mut app, "Macro: Start/Stop Recording");
+    run_palette_row_titled(&mut app, "Macro: Start/Stop Recording");
     app.replay_last_macro(1);
     assert!(app.focus == Pane::Editor, "replay stays in the editor");
     assert!(
@@ -2108,7 +2117,10 @@ fn the_palette_turns_the_startup_tab_into_untitled_1() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     assert!(app.editor.is_blank_initial());
-    assert!(run_from_palette(&mut app, "File: New Untitled Text File"));
+    assert!(run_palette_row_titled(
+        &mut app,
+        "File: New Untitled Text File"
+    ));
     assert_eq!(app.editor.tab_count(), 1);
     assert_eq!(app.editor.tab_display_label(0), "Untitled-1");
     assert!(!app.editor.is_blank_initial(), "no welcome screen over it");
@@ -2288,7 +2300,7 @@ fn palette_rows_852(app: &mut App, query: &str) -> Vec<String> {
 fn palette_close_other_editors_keeps_only_the_active_tab() {
     let (mut app, _tmp) = tabs_app_852(&["a.rs", "b.rs", "c.rs", "d.rs"]);
     app.editor.select(1);
-    let ran = run_in_palette_852(&mut app, "View: Close Other Editors in Group");
+    let ran = run_palette_top_match(&mut app, "View: Close Other Editors in Group");
     assert_eq!(
         tab_names_852(&app.editor),
         ["b.rs"],
@@ -2303,7 +2315,7 @@ fn palette_close_other_editors_keeps_only_the_active_tab() {
 fn palette_close_editors_to_the_right_closes_only_the_tabs_right_of_the_active_one() {
     let (mut app, _tmp) = tabs_app_852(&["a.rs", "b.rs", "c.rs", "d.rs"]);
     app.editor.select(1);
-    let ran = run_in_palette_852(&mut app, "View: Close Editors to the Right in Group");
+    let ran = run_palette_top_match(&mut app, "View: Close Editors to the Right in Group");
     assert_eq!(
         tab_names_852(&app.editor),
         ["a.rs", "b.rs"],
@@ -2320,7 +2332,7 @@ fn palette_close_saved_editors_closes_the_saved_tabs_and_keeps_the_dirty_one() {
     let (mut app, tmp) = tabs_app_852(&["a.rs", "b.rs", "c.rs"]);
     app.editor.select(1);
     type_into_active_tab_852(&mut app);
-    let ran = run_in_palette_852(&mut app, "View: Close Saved Editors in Group");
+    let ran = run_palette_top_match(&mut app, "View: Close Saved Editors in Group");
     assert_eq!(
         tab_names_852(&app.editor),
         ["b.rs"],
@@ -2339,7 +2351,7 @@ fn palette_close_saved_editors_closes_the_saved_tabs_and_keeps_the_dirty_one() {
 #[test]
 fn palette_close_all_editors_closes_every_tab() {
     let (mut app, _tmp) = tabs_app_852(&["a.rs", "b.rs", "c.rs"]);
-    let ran = run_in_palette_852(&mut app, "View: Close All Editors");
+    let ran = run_palette_top_match(&mut app, "View: Close All Editors");
     assert!(
         app.editor.is_blank_initial(),
         "the palette ran {ran:?}; tabs left: {:?}",
@@ -2353,7 +2365,7 @@ fn palette_close_all_editors_closes_every_tab() {
 #[test]
 fn palette_pin_editor_and_unpin_editor_pin_and_unpin_the_active_tab() {
     let (mut app, _tmp) = tabs_app_852(&["a.rs", "b.rs", "c.rs"]);
-    let ran = run_in_palette_852(&mut app, "View: Pin Editor");
+    let ran = run_palette_top_match(&mut app, "View: Pin Editor");
     assert!(app.editor.pinned, "the palette ran {ran:?}");
     assert_eq!(
         tab_names_852(&app.editor),
@@ -2361,7 +2373,7 @@ fn palette_pin_editor_and_unpin_editor_pin_and_unpin_the_active_tab() {
         "a pinned tab moves leftmost"
     );
     assert_eq!(app.status, "Pinned tab");
-    let ran = run_in_palette_852(&mut app, "View: Unpin Editor");
+    let ran = run_palette_top_match(&mut app, "View: Unpin Editor");
     assert!(!app.editor.pinned, "the palette ran {ran:?}");
     assert_eq!(
         app.editor.path.as_deref().and_then(Path::file_name),
@@ -2402,7 +2414,7 @@ fn palette_keep_editor_keeps_the_preview_tab_open() {
     std::fs::write(&p, "x\n").unwrap();
     app.editor.open_preview(&p).unwrap();
     assert!(app.editor.preview, "fixture: p.rs is the preview tab");
-    let ran = run_in_palette_852(&mut app, "View: Keep Editor");
+    let ran = run_palette_top_match(&mut app, "View: Keep Editor");
     assert!(!app.editor.preview, "the palette ran {ran:?}");
     assert_eq!(app.status, "Kept tab open");
 }
@@ -2415,7 +2427,7 @@ fn palette_close_other_editors_keeps_the_active_and_the_pinned_tabs() {
     let (mut app, tmp) = tabs_app_852(&["a.rs", "b.rs", "c.rs", "d.rs"]);
     app.dispatch_menu_action(MenuAction::ToggleTabPin(0), tmp.path().to_path_buf());
     app.editor.select(2);
-    run_in_palette_852(&mut app, "View: Close Other Editors in Group");
+    run_palette_top_match(&mut app, "View: Close Other Editors in Group");
     assert_eq!(tab_names_852(&app.editor), ["a.rs", "c.rs"]);
     assert!(app.editor.editors[0].pinned, "the pinned a.rs survives");
     assert_eq!(app.editor.active_index(), 1, "c.rs stays active");
@@ -2433,7 +2445,7 @@ fn palette_close_other_editors_keeps_the_active_and_the_pinned_tabs() {
 #[test]
 fn palette_close_editors_to_the_right_on_the_last_tab_closes_nothing() {
     let (mut app, _tmp) = tabs_app_852(&["a.rs", "b.rs", "c.rs"]);
-    run_in_palette_852(&mut app, "View: Close Editors to the Right in Group");
+    run_palette_top_match(&mut app, "View: Close Editors to the Right in Group");
     assert_eq!(tab_names_852(&app.editor), ["a.rs", "b.rs", "c.rs"]);
     assert_eq!(app.editor.active_index(), 2);
     assert!(app.closed_tabs.is_empty(), "nothing to reopen");
@@ -2455,7 +2467,7 @@ fn palette_tab_commands_leave_the_other_split_alone() {
     ] {
         let (mut app, _tmp) = split_tabs_app_852(active);
         let before = tabs_snapshot_852(&app);
-        let ran = run_in_palette_852(&mut app, title);
+        let ran = run_palette_top_match(&mut app, title);
         assert_eq!(ran.as_deref(), Some(title));
         let after = tabs_snapshot_852(&app);
         assert!(after.2, "{title}: still split");
@@ -2508,7 +2520,7 @@ fn the_palette_offers_the_move_editor_commands() {
         );
     }
     assert_eq!(
-        run_in_palette_852(&mut app, "View: Move Editor Left").as_deref(),
+        run_palette_top_match(&mut app, "View: Move Editor Left").as_deref(),
         Some("View: Move Editor Left")
     );
     assert_eq!(tab_names_852(&app.editor), ["a.py", "c.py", "b.py"]);

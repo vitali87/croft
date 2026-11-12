@@ -1367,7 +1367,7 @@ fn shift_alt_i_adds_a_cursor_at_each_line_end() {
 
     let mut app = occurrences_app(tmp.path());
     select(&mut app, (0, 0), (2, 0));
-    assert!(run_from_palette(&mut app, "Add Cursors to Line Ends"));
+    assert!(run_palette_row_titled(&mut app, "Add Cursors to Line Ends"));
     type_char(&mut app, ';');
     assert_eq!(
         app.editor.lines,
@@ -1397,7 +1397,7 @@ fn ctrl_l_selects_the_line_and_each_press_adds_the_next() {
     app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
         .unwrap();
     (app.editor.cursor_row, app.editor.cursor_col) = (1, 2);
-    assert!(run_from_palette(&mut app, "Expand Line Selection"));
+    assert!(run_palette_row_titled(&mut app, "Expand Line Selection"));
     type_char(&mut app, 'Z');
     assert_eq!(app.editor.lines, ["a = 1", "Zc = 3"]);
 }

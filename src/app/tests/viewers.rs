@@ -3035,15 +3035,8 @@ fn an_http_file_runs_requests_and_keeps_secrets_out_of_history_and_the_tab() {
     // family: hold their lock and restore via RAII, exactly as
     // `with_relay_home` does, so a panic cannot leak the redirect into
     // later tests (#428 review).
-    struct RestoreCacheDir;
-    impl Drop for RestoreCacheDir {
-        fn drop(&mut self) {
-            *crate::paths::CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap() = None;
-        }
-    }
     let _cache_lock = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    let _restore = RestoreCacheDir;
-    *crate::paths::CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap() = Some(tmp.path().join("cache"));
+    let _restore = override_cache_dir(tmp.path().join("cache"));
 
     // A 1x1 PNG via the image crate, so the decode on open genuinely works.
     let png_bytes = {
