@@ -1373,9 +1373,7 @@ fn render_merge_panes(
 fn clip_pad_cells(text: &str, skip: usize, width: usize) -> String {
     let mut out = String::new();
     let mut used = 0;
-    let origin = cells_before(text, skip);
-    for c in text.chars().skip(skip) {
-        let w = char_cells_at(c, origin + used);
+    for (c, w) in chars_with_cells(text, 0).skip(skip) {
         if used + w > width {
             break;
         }
@@ -1416,9 +1414,8 @@ fn paint_intraline_range(
     }
     let mut cell = 0u16;
     let mut painted = false;
-    let origin = cells_before(text, skip);
-    for (i, c) in text.chars().enumerate().skip(skip) {
-        let w = char_cells_at(c, origin + usize::from(cell)) as u16;
+    for (i, (_, w)) in chars_with_cells(text, 0).enumerate().skip(skip) {
+        let w = w as u16;
         if cell + w > width {
             break;
         }
@@ -1454,7 +1451,8 @@ fn paint_diff_syntax(
     }
     let mut cell = 0u16;
     let mut next = 0;
-    for (i, (byte, c)) in text.char_indices().enumerate() {
+    let cells = chars_with_cells(text, 0).map(|(_, w)| w as u16);
+    for (i, ((byte, _), w)) in text.char_indices().zip(cells).enumerate() {
         // Spans arrive in order and do not overlap.
         while spans.get(next).is_some_and(|s| s.range().end <= byte) {
             next += 1;
@@ -1462,7 +1460,6 @@ fn paint_diff_syntax(
         if i < skip {
             continue;
         }
-        let w = char_cells(c) as u16;
         if cell + w > width {
             break;
         }
@@ -2002,12 +1999,7 @@ fn paint_diff_selection_band(
             if col == usize::MAX {
                 return usize::MAX;
             }
-            let drawn: usize = cells_from(
-                line.chars()
-                    .skip(diff.scroll_x)
-                    .take(col.saturating_sub(diff.scroll_x)),
-                cells_before(line, diff.scroll_x),
-            );
+            let drawn = cells_between(line, diff.scroll_x, col);
             drawn + col.saturating_sub(line.chars().count().max(diff.scroll_x))
         };
         let cs_screen = to_cell(cs);
@@ -2109,18 +2101,17 @@ fn diff_side_line(
 }
 
 /// The char index of `text` drawn on screen cell `cell` when the row starts
-/// at char `skip` (tabs as [`char_cells`]). A cell past the end of the text
-/// counts on from its length, one char per cell, as before tabs had width.
+/// at char `skip` (cells as [`chars_with_cells`] measures them). A cell past
+/// the end of the text counts on from its length, one char per cell, as
+/// before tabs had width.
 fn char_at_cell_from(text: &str, skip: usize, cell: usize) -> usize {
     let mut at = 0;
     let mut len = 0;
-    let origin = cells_before(text, skip);
-    for (i, c) in text.chars().enumerate() {
+    for (i, (_, w)) in chars_with_cells(text, 0).enumerate() {
         len = i + 1;
         if i < skip {
             continue;
         }
-        let w = char_cells_at(c, origin + at);
         if cell < at + w {
             return i;
         }
@@ -5380,9 +5371,9 @@ impl Editor {
                 // left edge, so the tail from `first` is `total - cum[first]`.
                 let mut cum = Vec::with_capacity(l.len() + 1);
                 let mut col = 0;
-                for c in l.chars() {
+                for (_, w) in chars_with_cells(l, 0) {
                     cum.push(col);
-                    col += char_cells_at(c, col);
+                    col += w;
                 }
                 cum.push(col);
                 let len = cum.len() - 1;
@@ -11458,8 +11449,8 @@ impl Editor {
         // Clipped by terminal cells, not chars: a wide character takes two,
         // and `set_string` would paint past the text column otherwise.
         let mut cells = 0usize;
-        let shown: String = line
-            .replace('\t', &" ".repeat(self.indent_style().width.max(1) as usize))
+        // Tabs to their stops, as the line will paint once accepted.
+        let shown: String = blank_tabs(line)
             .chars()
             .skip(skip)
             .take_while(|&c| {
@@ -18939,23 +18930,54 @@ fn char_cells_at(c: char, col: usize) -> usize {
     }
 }
 
-/// Cells `chars` take from display cell `origin` of their row on.
-fn cells_from(chars: impl IntoIterator<Item = char>, origin: usize) -> usize {
-    chars
-        .into_iter()
-        .fold(origin, |col, c| col + char_cells_at(c, col))
-        - origin
+/// Each character of `text` with the cells it takes when `text` starts at
+/// display cell `origin` of its row, as ratatui paints it. A grapheme
+/// cluster is one glyph sized by the whole cluster (`crate::cell_map`):
+/// `👍🏽` is two cells, not four, and `❤️` two, not one, so the cluster's
+/// first character takes those cells and the rest none. A tab runs to the
+/// next tab stop after them. The drawing, the caret, clicks and the diff
+/// view all measure through here, so a tab after a cluster lands on the
+/// same cell for each of them.
+fn chars_with_cells(text: &str, origin: usize) -> impl Iterator<Item = (char, usize)> + '_ {
+    use unicode_segmentation::UnicodeSegmentation;
+    let mut col = origin;
+    text.graphemes(true).flat_map(move |cluster| {
+        let mut chars = cluster.chars();
+        let first = chars.next().unwrap_or_default();
+        let cells = if chars.as_str().is_empty() {
+            char_cells_at(first, col)
+        } else {
+            unicode_width::UnicodeWidthStr::width(cluster)
+        };
+        col += cells;
+        std::iter::once((first, cells)).chain(chars.map(|c| (c, 0)))
+    })
+}
+
+/// Cells `text` takes from display cell `origin` of its row on.
+fn cells_from(text: &str, origin: usize) -> usize {
+    chars_with_cells(text, origin).map(|(_, w)| w).sum()
 }
 
 /// Cells `chars` take as a row of their own (tab stops count from its start).
 fn cells_of(chars: &[char]) -> usize {
-    cells_from(chars.iter().copied(), 0)
+    chars.iter().fold(0, |col, &c| col + char_cells_at(c, col))
 }
 
 /// Display cells of the first `chars` characters of `line`, from the line's
 /// left edge: where its character number `chars` starts.
 fn cells_before(line: &str, chars: usize) -> usize {
-    cells_from(line.chars().take(chars), 0)
+    cells_between(line, 0, chars)
+}
+
+/// Display cells of `line`'s characters `from..to`, tab stops counted from
+/// the line's left edge.
+fn cells_between(line: &str, from: usize, to: usize) -> usize {
+    chars_with_cells(line, 0)
+        .take(to)
+        .skip(from)
+        .map(|(_, w)| w)
+        .sum()
 }
 
 /// `text` as the editor paints it: each tab as the blank cells it takes
@@ -18973,15 +18995,11 @@ fn blank_tabs_from(text: &str, origin: usize) -> std::borrow::Cow<'_, str> {
         return text.into();
     }
     let mut out = String::with_capacity(text.len() + 8);
-    let mut col = origin;
-    for c in text.chars() {
+    for (c, w) in chars_with_cells(text, origin) {
         if c == '\t' {
-            let w = tab_cells_at(col);
             out.extend(std::iter::repeat_n(' ', w));
-            col += w;
         } else {
             out.push(c);
-            col += char_cells(c);
         }
     }
     out.into()
@@ -19432,11 +19450,15 @@ fn build_line_spans<'a>(line: &'a str, spans: &[HiSpan], origin: usize) -> Vec<S
     }
     let mut out: Vec<Span> = Vec::with_capacity(spans.len() * 2);
     let mut cursor = 0usize;
-    // Display cells painted so far, from the row's left edge.
+    // Display cells painted so far, from the row's left edge. Only a tab's
+    // width depends on it, so a line without one skips the count.
+    let tabs = line.contains('\t');
     let mut col = origin;
     let mut push = |out: &mut Vec<Span<'a>>, text: &'a str, style: Option<Style>| {
         let shown = blank_tabs_from(text, col);
-        col += cells_from(text.chars(), col);
+        if tabs {
+            col += cells_from(text, col);
+        }
         out.push(match style {
             Some(st) => Span::styled(shown, st),
             None => Span::raw(shown),
@@ -20257,7 +20279,7 @@ impl Widget for &mut Editor {
             // by: its char count cut a row of wide characters in half.
             let row_origin = self.row_origin(raw, row_start);
             let row_width = {
-                let cells: usize = cells_from(raw[byte_start..byte_end].chars(), row_origin);
+                let cells: usize = cells_from(&raw[byte_start..byte_end], row_origin);
                 cells.max(row_end - row_start).min(text_width as usize) as u16
             };
             let visible_raw = &raw[byte_start..byte_end];
@@ -21405,11 +21427,7 @@ impl Editor {
         // Cells, not chars: a tab before the caret is Tab Size cells wide.
         self.sync_tab_cells();
         let line = diff_side_line(diff, row_idx, side);
-        let before = line
-            .chars()
-            .skip(diff.scroll_x)
-            .take(char_col - diff.scroll_x);
-        let drawn = cells_from(before, cells_before(line, diff.scroll_x));
+        let drawn = cells_between(line, diff.scroll_x, char_col);
         let line_len = line.chars().count();
         // Past the end of the text the caret counts one cell per char.
         let vis_col = drawn + char_col.saturating_sub(line_len.max(diff.scroll_x));
@@ -21485,28 +21503,16 @@ impl RowCells {
         origin: usize,
         hints: impl IntoIterator<Item = (usize, usize)>,
     ) {
-        use unicode_segmentation::UnicodeSegmentation;
         self.start = start;
         self.before.clear();
         self.before.push(0);
         let mut cells = 0;
-        // Tab stops count from the row's left edge, `origin` cells before its
-        // first character.
-        // ratatui paints a grapheme cluster as one glyph sized by the whole
-        // cluster (`crate::cell_map`): `👍🏽` is two cells, not four, and `❤️`
-        // two, not one. The cluster's first character takes those cells and
-        // the rest none; a lone character keeps `char_cells`.
-        for cluster in text.graphemes(true) {
-            let mut chars = cluster.chars();
-            let first = chars.next().map_or(0, |c| char_cells_at(c, origin + cells));
-            cells += match chars.clone().next() {
-                None => first,
-                Some(_) => unicode_width::UnicodeWidthStr::width(cluster),
-            };
+        // Measured as the row is painted ([`blank_tabs_from`]): a grapheme
+        // cluster as one glyph, a tab to the next stop from the row's left
+        // edge, `origin` cells before its first character.
+        for (_, w) in chars_with_cells(text, origin) {
+            cells += w;
             self.before.push(cells);
-            for _ in chars {
-                self.before.push(cells);
-            }
         }
         self.hints.clear();
         self.hints.extend(hints);
@@ -21598,11 +21604,8 @@ fn inlay_text_segment<'a>(
         .collect();
     // Tab stops count from the row's left edge: its first char is `row.0`,
     // which sits at display cell `row.1` (hint labels do not count).
-    let origin = row.1
-        + cells_from(
-            raw.chars().skip(row.0).take(from.saturating_sub(row.0)),
-            row.1,
-        );
+    let row_byte = byte_index_of_char(raw, row.0).min(byte_from);
+    let origin = row.1 + cells_from(&raw[row_byte..byte_from], row.1);
     build_line_spans(seg, &shifted, origin)
 }
 
@@ -36288,6 +36291,46 @@ mod tests {
         assert_eq!(e.cursor_visual_col(), 9, "after one tab at Tab Size 8");
         e.cursor_col = 0;
         assert_eq!(e.cursor_visual_col(), 1);
+    }
+
+    /// A grapheme cluster before a tab is one glyph (`👍🏽` is two cells, not
+    /// four), so the tab after it runs to the stop the drawing uses: the
+    /// caret and a click land on the text after it, and the diff view lays
+    /// out, hit-tests and colours that text on the same cell.
+    #[test]
+    fn a_tab_after_a_grapheme_cluster_runs_to_the_stop_it_is_drawn_at() {
+        let line = "\u{1f44d}\u{1f3fd}\tX";
+        for wrap in [false, true] {
+            let mut e = editor_with(line);
+            e.set_indent_style(IndentStyle {
+                width: 4,
+                use_spaces: false,
+            });
+            e.wrap_override = Some(wrap);
+            let buf = guide_buf(&mut e, 40, 4);
+            let text_x = e.last_inner.x + e.last_gutter_width + 1;
+            let y = e.last_inner.y;
+            assert_eq!(buf[(text_x + 4, y)].symbol(), "X", "wrap {wrap}");
+            e.cursor_col = 3;
+            assert_eq!(e.cursor_screen_pos(), Some((text_x + 4, y)), "wrap {wrap}");
+            assert_eq!(e.buffer_pos_at(text_x + 4, y), Some((0, 3)), "wrap {wrap}");
+        }
+        set_tab_cells(4);
+        assert_eq!(clip_pad_cells(line, 0, 6), "\u{1f44d}\u{1f3fd}  X ");
+        assert_eq!(char_at_cell_from(line, 0, 4), 3);
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 8,
+            height: 1,
+        };
+        let red = Style::default().fg(Color::Red);
+        for (text, x_byte) in [(line, 9), ("ab\tc", 3)] {
+            let mut buf = Buffer::empty(area);
+            let span = [HiSpan::new(x_byte, x_byte + 1, red)];
+            paint_diff_syntax(&mut buf, 0, 0, 8, text, 0, &span);
+            assert_eq!(buf[(4, 0)].fg, Color::Red, "{text:?} is coloured on cell 4");
+        }
     }
 
     #[test]
