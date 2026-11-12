@@ -18712,6 +18712,46 @@ fn parse_rgb_color(line: &str, i: usize) -> Option<((u8, u8, u8), usize)> {
     Some(((r, g, b), close + 1))
 }
 
+/// One integer of a code-level color call: decimal or `0x` hex, `_`
+/// separators allowed, an optional `u8` suffix (`0xeb`, `235`, `0xEB_u8`).
+fn parse_color_component(text: &str) -> Option<u8> {
+    let t = text.trim();
+    let t = t.strip_suffix("u8").unwrap_or(t).trim_end_matches('_');
+    let t: String = t.chars().filter(|&c| c != '_').collect();
+    let v = match t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+        None => t.parse().ok()?,
+    };
+    u8::try_from(v).ok()
+}
+
+/// Parse a Rust-style color constructor starting at byte `i`:
+/// `Color::Rgb(0xeb, 0xcb, 0x8b)`, `Rgb(235, 203, 139)`, `Color::from_rgb(..)`
+/// or a bare `from_rgb(..)`, three integer literals. The whole call, path
+/// included, is the match. It must start at a path start (not glued to a
+/// word, `_` or `::`), so `MyRgb(` and `x::Rgb(` are left alone.
+fn parse_code_rgb_color(line: &str, i: usize) -> Option<((u8, u8, u8), usize)> {
+    const PREFIXES: [&str; 4] = ["Color::Rgb(", "Color::from_rgb(", "Rgb(", "from_rgb("];
+    let rest = &line[i..];
+    let prefix = PREFIXES.iter().find(|p| rest.starts_with(**p))?;
+    if i > 0 {
+        let prev = line.as_bytes()[i - 1];
+        if prev.is_ascii_alphanumeric() || prev == b'_' || prev == b':' {
+            return None;
+        }
+    }
+    let close = rest.find(')')?;
+    let mut parts = rest[prefix.len()..close].split(',');
+    let r = parse_color_component(parts.next()?)?;
+    let g = parse_color_component(parts.next()?)?;
+    let b = parse_color_component(parts.next()?)?;
+    // A trailing comma is fine, a fourth value is not (`Rgba`-like calls).
+    if parts.any(|p| !p.trim().is_empty()) {
+        return None;
+    }
+    Some(((r, g, b), close + 1))
+}
+
 /// Convert HSL (h in degrees, s/l as 0..=100 percentages) to sRGB.
 fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (u8, u8, u8) {
     let s = s / 100.0;
@@ -18783,8 +18823,8 @@ const COLOR_SWATCH_SCAN_MAX_BYTES: usize = 1_000_000;
 
 /// Inline color-literal decoration scan (the `naumovs.color-highlight`
 /// convention): per line, the `(start char col, end char col, background,
-/// foreground)` of every `#hex` / `rgb()` / `rgba()` / `hsl()` / `hsla()`
-/// literal found anywhere in the text — comments, strings, and plain prose
+/// foreground)` of every `#hex` / `rgb()` / `rgba()` / `hsl()` / `hsla()` /
+/// `Color::Rgb(0xeb, 0xcb, 0x8b)` literal found anywhere in the text — comments, strings, and plain prose
 /// alike, since (unlike syntax highlighting) a color swatch has no notion of
 /// "this isn't code here." A byte-position match is converted to a char
 /// column range so the renderer's column math (shared with bracket
@@ -18803,6 +18843,7 @@ fn scan_color_swatches(
         let mut i = 0usize;
         while i < bytes.len() {
             let hit = parse_hex_color(bytes, i, decimal_short)
+                .or_else(|| parse_code_rgb_color(line, i))
                 .or_else(|| parse_rgb_color(line, i))
                 .or_else(|| parse_hsl_color(line, i));
             match hit {
@@ -44599,6 +44640,37 @@ mod tests {
         assert_eq!(out[0][0].2, Color::Rgb(255, 0, 0));
         // hsl(0, 100%, 50%) is pure red too.
         assert_eq!(out[0][1].2, Color::Rgb(255, 0, 0));
+    }
+
+    #[test]
+    fn scan_color_swatches_recognizes_code_level_rgb_constructors() {
+        let line = "const C: Color = Color::Rgb(0xeb, 0xcb, 0x8b);";
+        let out = scan_color_swatches(&[String::from(line)], false);
+        assert_eq!(out[0].len(), 1, "found: {:?}", out[0]);
+        let (from, to, bg, fg) = out[0][0];
+        let start = line.find("Color::Rgb").unwrap();
+        assert_eq!((from, to), (start, line.find(')').unwrap() + 1));
+        assert_eq!(bg, Color::Rgb(0xeb, 0xcb, 0x8b));
+        assert_eq!(fg, Color::Black, "dark ink on a light colour");
+        for (text, rgb) in [
+            ("Rgb(235, 203, 139)", (235, 203, 139)),
+            ("Color::Rgb(0x1E, 0xFF_u8, 7,)", (0x1e, 0xff, 7)),
+            ("Color::from_rgb(1, 2, 3)", (1, 2, 3)),
+            ("x = from_rgb(0, 0, 0x80)", (0, 0, 0x80)),
+        ] {
+            let out = scan_color_swatches(&[String::from(text)], false);
+            assert_eq!(out[0].len(), 1, "{text}: {:?}", out[0]);
+            assert_eq!(out[0][0].2, Color::Rgb(rgb.0, rgb.1, rgb.2), "{text}");
+        }
+        // Not a colour: a number out of range.
+        for text in [
+            "Color::Rgb(256, 0, 0)",
+            "Color::Rgb(r, g, b)",
+            "Color::Rgb(1, 2)",
+        ] {
+            let out = scan_color_swatches(&[String::from(text)], false);
+            assert!(out[0].is_empty(), "{text}: {:?}", out[0]);
+        }
     }
 
     #[test]

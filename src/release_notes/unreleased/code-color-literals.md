@@ -1,0 +1,1 @@
+feat: A colour constructor in code is tinted with its own colour, like `#rrggbb` and `rgb()` already are: `Color::Rgb(0xeb, 0xcb, 0x8b)`, `Rgb(235, 203, 139)`, `Color::from_rgb(..)` and `from_rgb(..)` with decimal or `0x` integers.
