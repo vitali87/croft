@@ -2653,3 +2653,2305 @@ impl App {
         }
     }
 }
+
+impl App {
+    /// Run a COMPOUND's own `preLaunchTask`, then launch its single member
+    /// (#318).
+    ///
+    /// Deliberately not folded into [`Self::launch_debug_config`]: that runs
+    /// the *config's* task as the last step before the adapter, while this one
+    /// runs before the member is even resolved. Keeping them separate is what
+    /// lets both fire for a compound whose member also declares a task, which
+    /// is what VS Code does.
+    ///
+    /// Same failure contract as a config's task, because a user cannot tell
+    /// the two apart from the outside: a task the workspace does not declare
+    /// is an error rather than a silent skip, and a non-zero exit aborts the
+    /// launch instead of debugging whatever the build left behind.
+    pub(super) fn launch_after_compound_task(
+        &mut self,
+        task_label: &str,
+        member: crate::dap::configs::DebugConfig,
+    ) {
+        if !self.debug_sessions.is_empty() {
+            self.debug_stop();
+        }
+        self.pending_debug_launch = None;
+        self.debug_build = None;
+        let root = self.active_workspace_root();
+        let tasks = crate::tasks::discover_tasks(&root);
+        let task = match crate::tasks::find_task(tasks, task_label) {
+            Ok(task) => task,
+            Err(near) => {
+                self.debug_error(format!(
+                    "compound preLaunchTask \"{task_label}\" not found{} — Tasks: Run Task lists what the workspace declares",
+                    did_you_mean(near)
+                ));
+                return;
+            }
+        };
+        let task = with_answers(task, &member.answers);
+        let command = self
+            .task_command_line(&task)
+            .unwrap_or_else(|_| task.command.clone());
+        let folder = self.active_workspace_root();
+        self.park_launch_behind(
+            task,
+            folder,
+            command,
+            PendingLaunchStep::Member(Box::new(member)),
+            "compound preLaunchTask",
+            "debug starts",
+        );
+    }
+
+    /// Resolve and launch one launch.json configuration: substitution against
+    /// the active editor state, then either straight to the adapter or parked
+    /// behind its `preLaunchTask`.
+    pub(super) fn launch_debug_config(&mut self, cfg: &crate::dap::configs::DebugConfig) {
+        use crate::dap::configs;
+        // Asked before anything running is stopped, so Esc on a question
+        // leaves the current session alone (#1424).
+        let mut refs = cfg.input_refs();
+        let mut defs = cfg.inputs.clone();
+        if let Some(label) = cfg.pre_launch_task() {
+            self.task_inputs(label, &mut refs, &mut defs);
+        }
+        let then = InputThen::Launch(Box::new(cfg.clone()));
+        match self.ask_inputs(&refs, &defs, &cfg.answers, then) {
+            Ok(true) => {}
+            Ok(false) => return,
+            Err(e) => {
+                self.debug_error(format!("config \"{}\": {e}", cfg.name));
+                return;
+            }
+        }
+        if !self.debug_sessions.is_empty() {
+            self.debug_stop();
+        }
+        self.pending_debug_launch = None;
+        self.debug_build = None;
+        self.pending_cargo_launches.clear();
+        // A new run: the previous run's cleanup is not this one's.
+        self.debug_post_tasks.clear();
+        // A compound member from another workspace folder resolves, and
+        // finds its preLaunchTask, there (#1425).
+        let root = cfg
+            .root
+            .clone()
+            .unwrap_or_else(|| self.active_workspace_root());
+        let ctx = configs::SubstCtx {
+            workspace_folder: root.clone(),
+            file: self.editor.path.clone(),
+            inputs: cfg.answers.clone(),
+            folders: self.workspace_folders(),
+        };
+        let mut rc = match configs::resolve(cfg, &ctx) {
+            Ok(rc) => rc,
+            Err(e) => {
+                self.debug_error(e);
+                return;
+            }
+        };
+        // Pinned to the root `program`/`outFiles` were resolved against
+        // (#1414): a `preLaunchTask` can run while the user focuses a file in
+        // another root, and recomputing the root at launch would point
+        // js-debug's source-map defaults at the wrong folder.
+        if rc.kind == crate::dap::session::AdapterKind::JsDebug {
+            rc.extra
+                .entry("__workspaceFolder")
+                .or_insert_with(|| serde_json::json!(root.to_string_lossy()));
+        }
+        self.record_post_debug_task(&rc);
+        if let Some(task_label) = rc.pre_launch_task.clone() {
+            let tasks = crate::tasks::discover_tasks(&root);
+            let task = match crate::tasks::find_task(tasks, &task_label) {
+                Ok(task) => task,
+                Err(near) => {
+                    self.debug_error(format!(
+                        "preLaunchTask \"{task_label}\" not found{} — Tasks: Run Task lists what the workspace declares",
+                        did_you_mean(near)
+                    ));
+                    return;
+                }
+            };
+            let task = with_answers(task, &cfg.answers);
+            let command = self
+                .task_command_line_in(&task, root.clone())
+                .unwrap_or_else(|_| task.command.clone());
+            self.park_launch_behind(
+                task,
+                root,
+                command,
+                PendingLaunchStep::Resolved(Box::new(rc)),
+                "preLaunchTask",
+                "debug starts",
+            );
+            return;
+        }
+        self.launch_resolved_config(rc);
+    }
+
+    /// Where the last run of `name` failed, if the runner named a place in
+    /// the user's own code (#373). Read back from the Test Runner output
+    /// channel, which already holds every line the run printed.
+    ///
+    /// Scoped to the failing test's own block: a run of the whole suite
+    /// prints many failures, and breaking on another test's assertion would
+    /// stop the debugger somewhere the user did not ask about. The block
+    /// starts at the runner's "failures:"-style banner for this test and
+    /// ends at the next test's banner.
+    pub(super) fn failure_site_of(
+        &self,
+        name: &str,
+    ) -> Option<crate::testing::failure_site::FailureSite> {
+        use crate::testing::failure_site::is_failure_banner;
+        let lines = crate::output::snapshot(crate::output::CHANNEL_TESTS)?;
+        let texts: Vec<&str> = lines.iter().map(|l| l.text.as_str()).collect();
+        // Walk backwards to the most recent BANNER for this test, so a
+        // re-run's output wins over an earlier one in the same channel.
+        // Anchoring on the banner rather than on any mention is what makes
+        // this work against real output: libtest reprints every failing
+        // name in its trailing `failures:` summary, so "the last line
+        // mentioning the name" lands after every block and finds nothing.
+        let start = texts.iter().rposition(|t| is_failure_banner(t, name))?;
+        // The block runs to the next test's banner, or to the end.
+        let end = texts[start + 1..]
+            .iter()
+            .position(|t| {
+                (t.trim_start().starts_with("---- ")
+                    || t.trim_start().starts_with('_')
+                    || t.trim_start().starts_with('\u{25cf}'))
+                    && !is_failure_banner(t, name)
+            })
+            .map(|i| start + 1 + i)
+            .unwrap_or(texts.len());
+        crate::testing::failure_site::failure_site(&texts[start..end].join("\n"))
+    }
+
+    /// Set a TEMPORARY breakpoint at the assertion the last run of `name`
+    /// failed on (#373), unless the user already has one there.
+    ///
+    /// Recorded in `debug_temp_breakpoint` so [`Self::disarm_failure_breakpoint`]
+    /// can take exactly this one back out: a breakpoint croft set and then
+    /// left behind would be indistinguishable from one the user set, and
+    /// would keep stopping them on a line they never chose.
+    pub(super) fn arm_failure_breakpoint(&mut self, name: &str, root: &Path) {
+        self.disarm_failure_breakpoint();
+        let Some((file, line)) = self
+            .failure_site_of(name)
+            .and_then(|site| site.resolve(root))
+        else {
+            return;
+        };
+        let line = line as usize;
+        let lines = self.editor.breakpoints.entry(file.clone()).or_default();
+        // The user's own breakpoint there is left alone: it is theirs, it
+        // outlives the session, and removing it on stop would delete work.
+        if !lines.insert(line) {
+            return;
+        }
+        self.debug_temp_breakpoint = Some((file.clone(), line));
+        // Recorded for the caller to append to whatever message it shows:
+        // setting `status` here would be overwritten moments later by the
+        // launch's own ("Building test binary…"), so the user would never
+        // learn a breakpoint had been set for them.
+        self.debug_temp_note = Some(format!(
+            "breaking at {}:{line} where it last failed",
+            file.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        ));
+    }
+
+    /// Append the armed-breakpoint note to `msg`, if one was armed (#373).
+    pub(super) fn with_failure_note(&self, msg: String) -> String {
+        match &self.debug_temp_note {
+            Some(note) => format!("{msg} — {note}"),
+            None => msg,
+        }
+    }
+
+    /// Remove the breakpoint [`Self::arm_failure_breakpoint`] set, if it is
+    /// still ours. The user may have removed it themselves mid-session, in
+    /// which case there is nothing to take back.
+    pub(super) fn disarm_failure_breakpoint(&mut self) {
+        self.debug_temp_note = None;
+        let Some((file, line)) = self.debug_temp_breakpoint.take() else {
+            return;
+        };
+        if let Some(lines) = self.editor.breakpoints.get_mut(&file) {
+            lines.remove(&line);
+            if lines.is_empty() {
+                self.editor.breakpoints.remove(&file);
+            }
+        }
+    }
+
+    /// The editor's breakpoints in launch shape, shared by every session
+    /// starter (zero-config and launch.json alike).
+    pub(super) fn collect_editor_breakpoints(
+        &self,
+    ) -> std::collections::BTreeMap<PathBuf, Vec<crate::dap::session::SourceBreakpoint>> {
+        self.editor
+            .breakpoints
+            .iter()
+            .map(|(p, lines)| (p.clone(), self.editor.source_breakpoints(p, lines)))
+            .collect()
+    }
+
+    /// Spawn the adapter for a resolved launch.json configuration and hand it
+    /// the built launch/attach request.
+    /// Launch a resolved config, replacing whatever was running.
+    pub(super) fn launch_resolved_config(&mut self, rc: crate::dap::configs::ResolvedConfig) {
+        self.launch_resolved_in(rc, LaunchSlot::Replace);
+    }
+
+    /// Launch a resolved config BESIDE what is running, for a compound member.
+    pub(super) fn launch_resolved_into_set(&mut self, rc: crate::dap::configs::ResolvedConfig) {
+        self.launch_resolved_in(rc, LaunchSlot::Add);
+    }
+
+    pub(super) fn launch_resolved_in(
+        &mut self,
+        mut rc: crate::dap::configs::ResolvedConfig,
+        slot: LaunchSlot,
+    ) {
+        use crate::dap::configs::{self, RequestKind};
+        use crate::dap::session::AdapterKind;
+        // The picker attaches by pid, which is lldb's attach; debugpy and
+        // js-debug attach by other means, and dropping the key silently would
+        // launch something the config did not ask for.
+        if rc.pick_process && rc.kind != AdapterKind::LldbDap {
+            self.debug_error(format!(
+                "config \"{}\": ${{command:pickProcess}} is supported for lldb attach only",
+                rc.name
+            ));
+            return;
+        }
+        // `${command:pickProcess}`: ask first, then come back here with the
+        // pid filled in (#250). Asked before the adapter lookup so the choice
+        // does not depend on it; a missing lldb-dap is reported on resume.
+        if rc.pick_process && rc.process_id.is_none() {
+            self.open_attach_process_picker(rc, slot);
+            return;
+        }
+        // A CodeLLDB `cargo` launch names no program: cargo builds it first
+        // (#1392), off the UI thread, and the launch resumes here with it.
+        if rc.kind == AdapterKind::LldbDap
+            && rc.request == RequestKind::Launch
+            && rc.program.is_none()
+            && let Some(spec) = configs::cargo_spec(&rc)
+        {
+            match spec {
+                Ok(spec) => self.start_cargo_program_build(rc, slot, spec),
+                Err(e) => self.debug_error(format!("config \"{}\": {e}", rc.name)),
+            }
+            return;
+        }
+        let breakpoints = self.collect_editor_breakpoints();
+        let cwd = rc
+            .cwd
+            .clone()
+            .unwrap_or_else(|| self.active_workspace_root());
+        let name = rc.name.clone();
+        // A note for the status: the debuggee interpreter's (#864) for a
+        // Python launch, or a browser run headless (#1410).
+        let mut launch_note = None;
+        let result = match rc.kind {
+            AdapterKind::Debugpy => {
+                if rc.request == RequestKind::Launch && rc.program.is_none() && rc.module.is_none()
+                {
+                    self.debug_error(format!(
+                        "config \"{name}\": a python launch needs a \"program\" or \"module\""
+                    ));
+                    return;
+                }
+                // Remote Attach (#1417): the port a `debugpy --listen`
+                // process serves is its own adapter, so the session talks to
+                // it directly; a second, local adapter in front of it waits
+                // for a debug server that never comes.
+                let attach = (rc.request == RequestKind::Attach)
+                    .then(|| configs::debugpy_request(&rc, Path::new("python3")));
+                let direct = attach
+                    .and_then(|r| configs::debugpy_connect_address(&r).map(|address| (r, address)));
+                if let Some((request, (host, port))) = direct {
+                    crate::dap::session::DapSession::attach_tcp(&host, port, request, breakpoints)
+                        .map_err(|e| {
+                            e.context(format!(
+                                "nothing answered on {host}:{port}; start the program with `python -m debugpy --listen {host}:{port}` first"
+                            ))
+                        })
+                } else {
+                    match crate::dap::install::ensure_debug_venv() {
+                        Ok(py) => {
+                            let adapter_args =
+                                vec![String::from("-m"), String::from("debugpy.adapter")];
+                            let program_py = config_project_python(
+                                &rc,
+                                &cwd,
+                                &self.active_workspace_root(),
+                                &py,
+                            );
+                            let request = configs::debugpy_request(&rc, &program_py);
+                            // Whichever interpreter runs the program, the
+                            // config's own included (#864).
+                            if rc.request == RequestKind::Launch {
+                                match launch_request_python(&request, &cwd)
+                                    .as_deref()
+                                    .map_or(Ok(None), debuggee_python_note)
+                                {
+                                    Ok(note) => launch_note = note,
+                                    Err(refusal) => {
+                                        self.debug_error(format!("config \"{name}\": {refusal}"));
+                                        return;
+                                    }
+                                }
+                            }
+                            crate::dap::session::DapSession::launch_with(
+                                &py.to_string_lossy(),
+                                &adapter_args,
+                                &cwd,
+                                request,
+                                breakpoints,
+                            )
+                        }
+                        Err(e) => {
+                            self.debug_error(format!("Debugger setup failed: {e}"));
+                            return;
+                        }
+                    }
+                }
+            }
+            AdapterKind::LldbDap => {
+                let Some(adapter) = lldb_dap_path() else {
+                    self.debug_error(lldb_dap_missing_message());
+                    return;
+                };
+                match rc.request {
+                    RequestKind::Launch => {
+                        let Some(program) = rc.program.as_deref() else {
+                            self.debug_error(format!(
+                                "config \"{name}\": an lldb launch needs a \"program\" (the built binary)"
+                            ));
+                            return;
+                        };
+                        match resolve_lldb_program(program, &cwd) {
+                            Ok(resolved) => {
+                                rc.program = Some(resolved.to_string_lossy().into_owned())
+                            }
+                            Err(e) => {
+                                self.debug_error(format!("config \"{name}\": {e}"));
+                                return;
+                            }
+                        }
+                    }
+                    // By pid, by program name or through attachCommands
+                    // (gdb-remote), sent as written (#1419).
+                    RequestKind::Attach => {
+                        if !configs::lldb_attach_has_target(&rc) {
+                            self.debug_error(format!(
+                                "config \"{name}\": an lldb attach needs a numeric \"processId\", a \"program\" or \"attachCommands\""
+                            ));
+                            return;
+                        }
+                    }
+                }
+                crate::dap::session::DapSession::launch_with(
+                    &adapter,
+                    &[],
+                    &cwd,
+                    configs::lldb_request(&rc),
+                    breakpoints,
+                )
+            }
+            AdapterKind::Delve => {
+                if rc.request == RequestKind::Launch && rc.program.is_none() {
+                    self.debug_error(format!(
+                        "config \"{name}\": a go launch needs a \"program\" (a package directory or file)"
+                    ));
+                    return;
+                }
+                // "Connect to server" (#1418): a headless delve already
+                // serves DAP at host:port, so croft connects to it rather
+                // than starting a dlv of its own.
+                let remote = configs::delve_remote_address(&rc);
+                if rc.request == RequestKind::Attach && rc.process_id.is_none() && remote.is_none()
+                {
+                    let remote_mode =
+                        rc.extra.get("mode").and_then(serde_json::Value::as_str) == Some("remote");
+                    self.debug_error(if remote_mode {
+                        format!("config \"{name}\": a go remote attach needs a \"port\"")
+                    } else {
+                        format!(
+                            "config \"{name}\": a go attach needs a \"processId\", or \"mode\": \"remote\" with a \"port\""
+                        )
+                    });
+                    return;
+                }
+                if let Some((host, port)) = remote {
+                    crate::dap::session::DapSession::attach_delve_server(
+                        &host,
+                        port,
+                        configs::delve_request(&rc),
+                        breakpoints,
+                    )
+                    .with_context(|| {
+                        format!(
+                            "nothing answered on {host}:{port}; start it first, e.g. `dlv debug <package> --headless --listen=:{port} --api-version=2 --accept-multiclient`"
+                        )
+                    })
+                } else {
+                    match crate::dap::install::dlv_program() {
+                        Ok(dlv) => crate::dap::session::DapSession::launch_delve(
+                            &dlv,
+                            &cwd,
+                            configs::delve_request(&rc),
+                            breakpoints,
+                        ),
+                        Err(e) => {
+                            self.debug_error(format!("{e}"));
+                            return;
+                        }
+                    }
+                }
+            }
+            AdapterKind::JsDebug => {
+                if let Some(e) = configs::js_config_error(&rc) {
+                    self.debug_error(format!("config \"{name}\": {e}"));
+                    return;
+                }
+                let browser = configs::browser_type(&rc.type_name).is_some();
+                let node = match crate::dap::install::node_program() {
+                    Ok(n) => n,
+                    Err(e) => {
+                        self.debug_error(format!("{e}"));
+                        return;
+                    }
+                };
+                let server = match crate::dap::install::ensure_js_debug() {
+                    Ok(s) => s,
+                    Err(e) => {
+                        self.debug_error(format!("Debugger setup failed: {e}"));
+                        return;
+                    }
+                };
+                let mut request = configs::js_request(&rc);
+                // A browser croft has no screen for would open where no one
+                // sees it (#1410): it runs headless, and the status says so.
+                if browser && rc.request == RequestKind::Launch && no_display_for_a_browser() {
+                    request = configs::with_headless_browser(request);
+                    launch_note = Some(String::from(
+                        "(no display here, so the browser runs headless)",
+                    ));
+                }
+                crate::dap::session::DapSession::launch_js_with(
+                    &node,
+                    &server,
+                    &cwd,
+                    configs::with_workspace_folder(request, &self.active_workspace_root()),
+                    breakpoints,
+                )
+            }
+        };
+        match result {
+            Ok(session) => {
+                self.adopt_debug_session(&name, session, slot);
+                let verb = match rc.request {
+                    RequestKind::Launch => "Debugging",
+                    RequestKind::Attach => "Attached:",
+                };
+                self.run_debug.feedback = Some(format!("{verb} {name}"));
+                self.run_debug.feedback_is_error = false;
+                let lead = with_python_note(format!("{verb} {name}"), launch_note.as_deref());
+                self.status = format!("{lead} — F5 continue · F10 step over · Shift+F5 stop");
+                self.reveal_debug_view();
+                if launch_note.is_some() {
+                    self.debug_console_push(lead);
+                }
+                // A cppdbg configuration runs under lldb-dap (#1394): say
+                // which of its gdb settings have no effect there. Here, not
+                // at the call site, so a preLaunchTask resume and a compound
+                // member say it too.
+                if !rc.ignored_keys.is_empty() {
+                    self.debug_console_push(format!(
+                        "config \"{name}\" runs under lldb-dap, which ignores its {}",
+                        rc.ignored_keys.join(", ")
+                    ));
+                }
+            }
+            Err(e) => self.debug_error(format!("Failed to start debugger: {e}")),
+        }
+    }
+
+    /// Launch a debug session for the active file, choosing the adapter by file
+    /// type. Python (debugpy) is the verified path; other recognised compiled
+    /// languages route to lldb-dap.
+    pub(super) fn start_debug_session(&mut self) {
+        use crate::dap::session::AdapterKind;
+        // Same as every other launch path: a parked older launch must not
+        // fire later and replace this one (#567).
+        self.pending_debug_launch = None;
+        self.debug_build = None;
+        // Zero-config "Debug active file" declares no postDebugTask.
+        self.debug_post_tasks.clear();
+        let Some(path) = self.editor.path.clone() else {
+            self.debug_error(String::from("Open a file to debug"));
+            return;
+        };
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        match crate::dap::registry::adapter_for_extension(&ext) {
+            Some(AdapterKind::Debugpy) => {}
+            Some(AdapterKind::LldbDap) => {
+                self.start_lldb_debug_session(&path);
+                return;
+            }
+            Some(AdapterKind::JsDebug) => {
+                self.start_js_debug_session(&path);
+                return;
+            }
+            Some(AdapterKind::Delve) => {
+                self.start_delve_debug_session(&path);
+                return;
+            }
+            None => {
+                // An executable binary (e.g. a compiled `target/debug/app`) can
+                // be debugged directly by lldb-dap with no build step.
+                if is_executable_file(&path) {
+                    self.launch_lldb(&path, &path);
+                } else if let Some(ext_id) = crate::dap::registry::disabled_extension_for(&ext) {
+                    // A debugger exists for this file type but its extension is
+                    // turned off — say so rather than claim none exists.
+                    self.debug_error(format!(
+                        "The {ext_id} debugger extension is disabled — enable it in Extensions"
+                    ));
+                } else {
+                    self.debug_error(format!(
+                        "No debugger for .{ext} files (Python, JS/TS, Rust, C/C++ are supported)"
+                    ));
+                }
+                return;
+            }
+        }
+        let debug_root = self
+            .roots
+            .owning_root(&path)
+            .unwrap_or_else(|| self.roots.primary())
+            .to_path_buf();
+        // The debug venv hosts only the adapter; the program runs under
+        // the interpreter Run would use, so its packages import (#864).
+        // One debugpy cannot run under is refused before any setup.
+        let program_py = debuggee_python(
+            path.parent().unwrap_or(&debug_root),
+            &debug_root,
+            std::env::var_os("PATH").as_deref(),
+        );
+        let note = match program_py.as_deref().map_or(Ok(None), debuggee_python_note) {
+            Ok(note) => note,
+            Err(refusal) => {
+                self.debug_error(refusal);
+                return;
+            }
+        };
+        let py = match crate::dap::install::ensure_debug_venv() {
+            Ok(py) => py,
+            Err(e) => {
+                self.debug_error(format!("Debugger setup failed: {e}"));
+                return;
+            }
+        };
+        let program_py = program_py.unwrap_or_else(|| py.clone());
+        let breakpoints = self.collect_editor_breakpoints();
+        let adapter_args = vec![String::from("-m"), String::from("debugpy.adapter")];
+        let py_str = py.to_string_lossy().into_owned();
+        match crate::dap::session::DapSession::launch(
+            &py_str,
+            &adapter_args,
+            &debug_root,
+            &path,
+            &program_py,
+            breakpoints,
+            false,
+        ) {
+            Ok(session) => {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                self.adopt_debug_session(name.clone(), session, LaunchSlot::Replace);
+                self.run_debug.feedback = Some(format!("Debugging {name}"));
+                self.run_debug.feedback_is_error = false;
+                let lead = with_python_note(format!("Debugging {name}"), note.as_deref());
+                self.status = format!("{lead} — F5 continue · F10 step over · Shift+F5 stop");
+                self.reveal_debug_view();
+                // After the reveal, which clears the console; it outlasts
+                // the status line.
+                if note.is_some() {
+                    self.debug_console_push(lead);
+                }
+            }
+            Err(e) => {
+                self.debug_error(format!("Failed to start debugger: {e}"));
+            }
+        }
+    }
+
+    /// Debug the Go file at `path` under delve (#264): its package's `main`,
+    /// or its tests for a `_test.go` file. delve builds the package itself.
+    pub(super) fn start_delve_debug_session(&mut self, path: &Path) {
+        let dlv = match crate::dap::install::dlv_program() {
+            Ok(d) => d,
+            Err(e) => {
+                self.debug_error(format!("{e}"));
+                return;
+            }
+        };
+        let breakpoints = self.collect_editor_breakpoints();
+        let cwd = path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| self.roots.primary().to_path_buf());
+        let request = crate::dap::session::delve_zero_config_request(path);
+        match crate::dap::session::DapSession::launch_delve(&dlv, &cwd, request, breakpoints) {
+            Ok(session) => {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                self.adopt_debug_session(name.clone(), session, LaunchSlot::Replace);
+                self.run_debug.feedback = Some(format!("Debugging {name}"));
+                self.run_debug.feedback_is_error = false;
+                self.status =
+                    format!("Debugging {name} — F5 continue · F10 step over · Shift+F5 stop");
+                self.reveal_debug_view();
+            }
+            Err(e) => {
+                self.debug_error(format!("Failed to start debugger: {e}"));
+            }
+        }
+    }
+
+    /// Debug one Go test under delve's `test` mode (#264), scoped to it
+    /// with `-test.run`. `name` is a tree id (`./pkg::TestName`), or a bare
+    /// function name from the caret, whose package is the open file's.
+    pub(super) fn start_delve_test_session(
+        &mut self,
+        root: &Path,
+        name: &str,
+        breakpoints: std::collections::BTreeMap<
+            PathBuf,
+            Vec<crate::dap::session::SourceBreakpoint>,
+        >,
+    ) {
+        let dir = match name.split_once("::") {
+            Some((pkg, _)) => crate::testing::gotest::package_dir(root, pkg),
+            None => self
+                .editor
+                .path
+                .as_deref()
+                .and_then(Path::parent)
+                .map(Path::to_path_buf),
+        };
+        let Some(dir) = dir else {
+            self.disarm_failure_breakpoint();
+            self.status = format!("Debug Test: no package directory for {name}");
+            return;
+        };
+        let dlv = match crate::dap::install::dlv_program() {
+            Ok(d) => d,
+            Err(e) => {
+                self.disarm_failure_breakpoint();
+                self.debug_error(format!("{e}"));
+                return;
+            }
+        };
+        let request = crate::dap::session::delve_test_request(
+            &dir,
+            &crate::testing::gotest::test_binary_args(name),
+        );
+        match crate::dap::session::DapSession::launch_delve(&dlv, &dir, request, breakpoints) {
+            Ok(session) => {
+                self.adopt_debug_session(name.to_string(), session, LaunchSlot::Replace);
+                self.run_debug.feedback = Some(format!("Debugging test {name}"));
+                self.run_debug.feedback_is_error = false;
+                self.status = self.with_failure_note(format!(
+                    "Debugging test {name} — F5 continue · F10 step over · Shift+F5 stop"
+                ));
+                self.reveal_debug_view();
+            }
+            Err(e) => self.debug_error(format!("Failed to start debugger: {e}")),
+        }
+    }
+
+    /// Launch a vscode-js-debug session for a `.js`/`.ts` file run under Node.
+    /// Provisions the js-debug server on first use, then drives the shared DAP
+    /// session machinery (which transparently spawns the parent + child
+    /// connections js-debug requires). TypeScript binds via source maps.
+    pub(super) fn start_js_debug_session(&mut self, path: &Path) {
+        let node = match crate::dap::install::node_program() {
+            Ok(n) => n,
+            Err(e) => {
+                self.debug_error(format!("{e}"));
+                return;
+            }
+        };
+        let server = match crate::dap::install::ensure_js_debug() {
+            Ok(s) => s,
+            Err(e) => {
+                self.debug_error(format!("Debugger setup failed: {e}"));
+                return;
+            }
+        };
+        let breakpoints = self.collect_editor_breakpoints();
+        let debug_root = self
+            .roots
+            .owning_root(path)
+            .unwrap_or_else(|| self.roots.primary())
+            .to_path_buf();
+        match crate::dap::session::DapSession::launch_js(
+            &node,
+            &server,
+            &debug_root,
+            path,
+            breakpoints,
+            false,
+        ) {
+            Ok(session) => {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                self.adopt_debug_session(name.clone(), session, LaunchSlot::Replace);
+                self.run_debug.feedback = Some(format!("Debugging {name}"));
+                self.run_debug.feedback_is_error = false;
+                self.status =
+                    format!("Debugging {name} — F5 continue · F10 step over · Shift+F5 stop");
+                self.reveal_debug_view();
+            }
+            Err(e) => {
+                self.debug_error(format!("Failed to start debugger: {e}"));
+            }
+        }
+    }
+
+    /// Launch lldb-dap on a Rust / C / C++ source file: build a debuggable
+    /// binary, then drive the same DAP session machinery as Python. The binary
+    /// build is the only language-specific step; breakpoints, stepping, call
+    /// stack, variables, and the REPL all flow through the shared session.
+    ///
+    /// Note: lldb-dap requires a permitted `debugserver` (macOS gates this
+    /// behind code-signing / `DevToolsSecurity`); where that isn't granted the
+    /// process runs without binding breakpoints. croft surfaces the adapter's
+    /// own status rather than pretending otherwise.
+    pub(super) fn start_lldb_debug_session(&mut self, path: &Path) {
+        if lldb_dap_path().is_none() {
+            self.debug_error(lldb_dap_missing_message());
+            return;
+        }
+        let is_rust = path
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("rs"));
+        if !is_rust {
+            self.begin_debug_build(path);
+            return;
+        }
+        // Compiled source: build a debuggable binary first, then debug it.
+        let binary = match self.build_debuggable_binary(path) {
+            Ok(b) => b,
+            Err(e) => {
+                self.debug_error(format!("Build for debug failed: {e}"));
+                return;
+            }
+        };
+        self.launch_lldb(&binary, path);
+    }
+
+    /// Start building the program F5 on the C/C++ file `path` debugs
+    /// (#1359): the project's CMake target, else the file with its
+    /// `compile_commands.json` flags, else the file alone. The build runs
+    /// on its own thread so a long one leaves the UI live; F5 again
+    /// replaces it.
+    pub(super) fn begin_debug_build(&mut self, path: &Path) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        // The root that owns the file: an added folder's project, not the
+        // primary's.
+        let workspace = self
+            .roots
+            .owning_root(path)
+            .unwrap_or_else(|| self.roots.primary())
+            .to_path_buf();
+        let source = path.to_path_buf();
+        let cache = croft_cache_dir().join("debug-builds");
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::cpp_build::build_for_debug(
+                &workspace, &source, &cache,
+            ));
+        });
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let msg = format!("Building {name} for debugging…");
+        self.run_debug.feedback = Some(msg.clone());
+        self.run_debug.feedback_is_error = false;
+        self.status = msg;
+        self.debug_build = Some((path.to_path_buf(), rx));
+    }
+
+    /// F5's C/C++ build, once it is done: the source it debugs and the
+    /// build's result. `None` while it runs or when none was started.
+    pub(super) fn take_debug_build(
+        &mut self,
+    ) -> Option<(
+        PathBuf,
+        Result<crate::cpp_build::Built, crate::cpp_build::Failed>,
+    )> {
+        let (_, rx) = self.debug_build.as_ref()?;
+        let result = match rx.try_recv() {
+            Ok(r) => r,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return None,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Err(crate::cpp_build::Failed {
+                summary: String::from("the build stopped without a result"),
+                output: String::new(),
+            }),
+        };
+        let (source, _) = self.debug_build.take()?;
+        Some((source, result))
+    }
+
+    /// Launch lldb-dap once F5's C/C++ build is done, or report why it
+    /// failed with the build's whole output in OUTPUT's "Debug Build"
+    /// channel. True when the build finished this tick.
+    pub(super) fn poll_debug_build(&mut self) -> bool {
+        let Some((source, result)) = self.take_debug_build() else {
+            return false;
+        };
+        match result {
+            Ok(built) => {
+                self.launch_lldb(&built.binary, &source);
+                if !self.run_debug.feedback_is_error {
+                    let line = self.run_debug.feedback.take().unwrap_or_default();
+                    self.run_debug.feedback = Some(format!("{line}, built by {}", built.how));
+                }
+            }
+            Err(failed) => {
+                const CHANNEL: &str = "Debug Build";
+                crate::output::clear(CHANNEL);
+                for line in failed.output.lines() {
+                    crate::output::push(CHANNEL, crate::output::OutputLevel::Error, line);
+                }
+                self.debug_error(format!(
+                    "Build for debug failed: {} (full output in OUTPUT › {CHANNEL})",
+                    failed.summary
+                ));
+            }
+        }
+        true
+    }
+
+    /// Launch lldb-dap on an already-built `binary`, attributing status to
+    /// `label_path` (the source for a compiled language, or the binary itself
+    /// for a directly-debugged executable). Shared by the compiled-source path
+    /// and the executable-binary path so neither duplicates the launch plumbing.
+    pub(super) fn launch_lldb(&mut self, binary: &Path, label_path: &Path) {
+        let Some(adapter) = lldb_dap_path() else {
+            self.debug_error(lldb_dap_missing_message());
+            return;
+        };
+        let breakpoints = self.collect_editor_breakpoints();
+        let cwd = label_path
+            .parent()
+            .unwrap_or(self.workspace_root())
+            .to_path_buf();
+        match crate::dap::session::DapSession::launch_with(
+            &adapter,
+            &[],
+            &cwd,
+            crate::dap::session::lldb_launch_request(binary, false),
+            breakpoints,
+        ) {
+            Ok(session) => {
+                let name = label_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                self.adopt_debug_session(name.clone(), session, LaunchSlot::Replace);
+                self.run_debug.feedback = Some(format!("Debugging {name} (lldb)"));
+                self.run_debug.feedback_is_error = false;
+                self.status =
+                    format!("Debugging {name} via lldb-dap — F5 continue · Shift+F5 stop");
+                self.reveal_debug_view();
+            }
+            Err(e) => {
+                self.debug_error(format!("Failed to start lldb-dap: {e}"));
+            }
+        }
+    }
+
+    /// Compile the single Rust file `path` with debug info and return the
+    /// binary, next to the source as `<stem>.dbg`. C and C++ build through
+    /// their project instead (`begin_debug_build`, #1359).
+    pub(super) fn build_debuggable_binary(&self, path: &Path) -> std::io::Result<PathBuf> {
+        let out = path.with_extension("dbg");
+        // .output(), never .status(): the compiler must not inherit croft's
+        // TTY - a compile error would spray its diagnostics over the UI
+        // (same class as the pdftoppm trailer-dictionary spray).
+        let cmd_out = std::process::Command::new("rustc")
+            .arg("-g")
+            .arg("-o")
+            .arg(&out)
+            .arg(path)
+            .output()?;
+        if !cmd_out.status.success() {
+            let stderr = String::from_utf8_lossy(&cmd_out.stderr);
+            return Err(std::io::Error::other(format!(
+                "rustc exited with {}: {}",
+                cmd_out.status,
+                stderr.trim()
+            )));
+        }
+        Ok(out)
+    }
+
+    /// F9: toggle a breakpoint on the cursor line, pushing it live if a session
+    /// is running.
+    pub fn debug_toggle_breakpoint(&mut self) {
+        self.debug_toggle_breakpoint_line(self.editor.cursor_row + 1);
+    }
+
+    /// Toggle a breakpoint on an explicit 1-based `line`, then push the file's
+    /// breakpoints to a live session. Shared by F9 (cursor line) and the gutter
+    /// right-click menu (clicked line).
+    pub(super) fn debug_toggle_breakpoint_line(&mut self, line: usize) {
+        match self.editor.toggle_breakpoint_line(line) {
+            Some((_, line, now_set)) => {
+                self.status = if now_set {
+                    format!("Breakpoint set at line {line}")
+                } else {
+                    format!("Breakpoint removed from line {line}")
+                };
+            }
+            None => {
+                self.status = String::from("Open a file to set a breakpoint");
+                return;
+            }
+        }
+        if let Some(path) = self.editor.path.clone() {
+            let specs = self
+                .editor
+                .breakpoints
+                .get(&path)
+                .map(|lines| self.editor.source_breakpoints(&path, lines))
+                .unwrap_or_default();
+            // Every session, not the focused one (#310): breakpoints are
+            // global editor state, handed to every session at launch, so a
+            // breakpoint set mid-run in a shared file must bind in all of
+            // them or it binds in the server and not the client.
+            for session in self.debug_sessions.iter_mut() {
+                session.update_breakpoints(&path, &specs);
+            }
+        }
+    }
+
+    /// Open the breakpoint-condition editor for the cursor line, pre-filled with
+    /// any existing condition.
+    pub fn debug_edit_condition(&mut self) {
+        self.debug_edit_condition_line(self.editor.cursor_row + 1);
+    }
+
+    /// Open the breakpoint-condition editor for an explicit 1-based `line` as a
+    /// centered popup (`PromptKind::BreakpointCondition`), pre-filled with any
+    /// existing condition. Shared by the command-palette entry (cursor line)
+    /// and the gutter right-click menu (clicked line). The popup, not the
+    /// status line, captures the input; commit lives in [`App::commit_prompt`].
+    pub(super) fn debug_edit_condition_line(&mut self, line: usize) {
+        let Some(path) = self.editor.path.clone() else {
+            self.status = String::from("Open a file to set a conditional breakpoint");
+            return;
+        };
+        let existing = self
+            .editor
+            .breakpoint_conditions
+            .get(&path)
+            .and_then(|c| c.get(&line))
+            .cloned()
+            .unwrap_or_default();
+        let label = if existing.is_empty() {
+            format!("Add Conditional Breakpoint · line {line}")
+        } else {
+            format!("Edit Condition · line {line}")
+        };
+        let target_dir = self.tree.root.clone();
+        self.prompt = Some(Prompt {
+            label,
+            buffer: existing,
+            caret: usize::MAX,
+            kind: PromptKind::BreakpointCondition { path, line },
+            target_dir,
+            error: None,
+        });
+    }
+
+    /// Commit the breakpoint-condition popup: ensure a breakpoint exists on the
+    /// line, attach the typed expression (or clear it when blank), and push the
+    /// file's breakpoints to a live session.
+    pub(super) fn commit_breakpoint_condition(&mut self, path: PathBuf, line: usize, expr: &str) {
+        self.editor
+            .breakpoints
+            .entry(path.clone())
+            .or_default()
+            .insert(line);
+        let cond = expr.trim();
+        if cond.is_empty() {
+            if let Some(c) = self.editor.breakpoint_conditions.get_mut(&path) {
+                c.remove(&line);
+            }
+            self.status = format!("Plain breakpoint at line {line}");
+        } else {
+            self.editor
+                .breakpoint_conditions
+                .entry(path.clone())
+                .or_default()
+                .insert(line, cond.to_string());
+            self.status = format!("Conditional breakpoint at line {line}");
+        }
+        let specs = self
+            .editor
+            .breakpoints
+            .get(&path)
+            .map(|l| self.editor.source_breakpoints(&path, l))
+            .unwrap_or_default();
+        // Every session (#310); see `debug_toggle_breakpoint_line`.
+        for session in self.debug_sessions.iter_mut() {
+            session.update_breakpoints(&path, &specs);
+        }
+    }
+
+    /// A one-line prompt with no pre-fill, for the #611 breakpoint kinds.
+    pub(super) fn open_debug_prompt(&mut self, label: String, buffer: String, kind: PromptKind) {
+        let target_dir = self.tree.root.clone();
+        self.prompt = Some(Prompt {
+            label,
+            buffer,
+            caret: usize::MAX,
+            kind,
+            target_dir,
+            error: None,
+        });
+    }
+
+    /// Debug: Add Hit Count Breakpoint (#611), on the cursor line.
+    pub fn debug_edit_hit_condition(&mut self) {
+        let Some(path) = self.editor.path.clone() else {
+            self.status = String::from("Open a file to set a hit count breakpoint");
+            return;
+        };
+        let line = self.editor.cursor_row + 1;
+        let existing = self
+            .editor
+            .breakpoint_hit_conditions
+            .get(&path)
+            .and_then(|h| h.get(&line))
+            .cloned()
+            .unwrap_or_default();
+        self.open_debug_prompt(
+            format!("Pause after how many hits? · line {line}"),
+            existing,
+            PromptKind::HitCondition { path, line },
+        );
+    }
+
+    /// Commit the hit-count popup: ensure a breakpoint on the line, attach
+    /// the count (or clear it when blank), and push the file's set to every
+    /// session.
+    pub(super) fn commit_hit_condition(&mut self, path: PathBuf, line: usize, hits: &str) {
+        self.editor
+            .breakpoints
+            .entry(path.clone())
+            .or_default()
+            .insert(line);
+        let hits = hits.trim();
+        if hits.is_empty() {
+            if let Some(h) = self.editor.breakpoint_hit_conditions.get_mut(&path) {
+                h.remove(&line);
+            }
+            self.status = format!("Plain breakpoint at line {line}");
+        } else {
+            self.editor
+                .breakpoint_hit_conditions
+                .entry(path.clone())
+                .or_default()
+                .insert(line, hits.to_string());
+            self.status = format!("Breakpoint at line {line} pauses on hit {hits}");
+        }
+        let specs = self
+            .editor
+            .breakpoints
+            .get(&path)
+            .map(|l| self.editor.source_breakpoints(&path, l))
+            .unwrap_or_default();
+        for session in self.debug_sessions.iter_mut() {
+            session.update_breakpoints(&path, &specs);
+        }
+    }
+
+    /// Debug: Add Function Breakpoint (#611).
+    pub fn debug_add_function_breakpoint(&mut self) {
+        self.open_debug_prompt(
+            String::from("Break on entry to function"),
+            String::new(),
+            PromptKind::FunctionBreakpoint,
+        );
+    }
+
+    pub(super) fn commit_function_breakpoint(&mut self, name: String) {
+        if name.is_empty() || self.function_breakpoints.contains(&name) {
+            return;
+        }
+        self.function_breakpoints.push(name.clone());
+        self.push_function_breakpoints();
+        self.status = format!("Function breakpoint: {name}");
+    }
+
+    /// Debug: Remove All Function Breakpoints (#611).
+    pub fn debug_clear_function_breakpoints(&mut self) {
+        self.function_breakpoints.clear();
+        self.push_function_breakpoints();
+        self.status = String::from("Function breakpoints removed");
+    }
+
+    pub(super) fn push_function_breakpoints(&mut self) {
+        let names = self.function_breakpoints.clone();
+        let mut refused = false;
+        for session in self.debug_sessions.iter_mut() {
+            if session.supports("supportsFunctionBreakpoints") {
+                session.set_function_breakpoints(names.clone());
+            } else {
+                refused = true;
+            }
+        }
+        if refused && !names.is_empty() {
+            self.status = String::from("This debugger does not support function breakpoints");
+        }
+    }
+
+    /// Install a freshly launched debug session, replacing the running ones
+    /// or, for a compound member, beside them. Every launch path comes
+    /// through here so the stored function breakpoints go with each new
+    /// session (held until `initialized`, then pushed with the rest): set one
+    /// and press F5 with no launch.json, and the program still pauses (#939).
+    pub(super) fn adopt_debug_session(
+        &mut self,
+        name: impl Into<String>,
+        mut session: crate::dap::session::DapSession,
+        slot: LaunchSlot,
+    ) {
+        session.set_function_breakpoints(self.function_breakpoints.clone());
+        match slot {
+            LaunchSlot::Replace => self.debug_sessions.replace_with(name, session),
+            LaunchSlot::Add => self.debug_sessions.push(name, session),
+        }
+    }
+
+    /// Debug: Run to Cursor (#611, Ctrl+F10): resume and pause once at the
+    /// caret line, without leaving a breakpoint behind.
+    pub fn debug_run_to_cursor(&mut self) {
+        let Some(path) = self.editor.path.clone() else {
+            return;
+        };
+        let line = self.editor.cursor_row as u32 + 1;
+        match self.debug_sessions.focused_mut() {
+            Some(session) if session.stopped_thread.is_some() => {
+                session.run_to_cursor(&path, line);
+                self.status = format!("Running to line {line}");
+            }
+            Some(_) => self.status = String::from("Run to Cursor needs the debugger paused"),
+            None => self.status = String::from("Run to Cursor: no debug session"),
+        }
+    }
+
+    /// Debug: Break When Value Changes (#611): prompt for a variable of the
+    /// paused frame.
+    pub fn debug_break_on_value_change(&mut self) {
+        match self.debug_sessions.focused() {
+            Some(s) if s.stopped_thread.is_none() => {
+                self.status = String::from("Break When Value Changes needs the debugger paused");
+            }
+            Some(s) if !s.supports("supportsDataBreakpoints") => {
+                self.status = String::from("This debugger does not support data breakpoints");
+            }
+            Some(_) => self.open_debug_prompt(
+                String::from("Break when this variable changes"),
+                String::new(),
+                PromptKind::DataBreakpoint,
+            ),
+            None => self.status = String::from("Break When Value Changes: no debug session"),
+        }
+    }
+
+    pub(super) fn commit_data_breakpoint(&mut self, name: &str) {
+        let Some(session) = self.debug_sessions.focused_mut() else {
+            return;
+        };
+        // The variable's container: the scope (or expanded variable) that
+        // lists it, which is what `dataBreakpointInfo` is asked against.
+        let container = session.scopes.iter().map(|s| s.variables_ref).find(|r| {
+            session
+                .variables
+                .get(r)
+                .is_some_and(|vs| vs.iter().any(|v| v.name == name))
+        });
+        match container {
+            Some(reference) => {
+                session.break_on_change(reference, name);
+                self.status = format!("Pausing when {name} changes");
+            }
+            None => self.status = format!("No variable named {name} in the paused frame"),
+        }
+    }
+
+    /// Debug: Remove All Data Breakpoints (#611).
+    pub fn debug_clear_data_breakpoints(&mut self) {
+        for session in self.debug_sessions.iter_mut() {
+            session.clear_data_breakpoints();
+        }
+        self.status = String::from("Data breakpoints removed");
+    }
+
+    /// Open the logpoint editor for the cursor line, pre-filled with any
+    /// existing message.
+    pub fn debug_edit_logpoint(&mut self) {
+        self.debug_edit_logpoint_line(self.editor.cursor_row + 1);
+    }
+
+    /// Open the logpoint editor for an explicit 1-based `line` as a centered
+    /// popup (`PromptKind::Logpoint`). Shared by the palette entry (cursor
+    /// line), Shift+Alt+F9, and the gutter right-click menu (clicked line).
+    pub(super) fn debug_edit_logpoint_line(&mut self, line: usize) {
+        let Some(path) = self.editor.path.clone() else {
+            self.status = String::from("Open a file to set a logpoint");
+            return;
+        };
+        let existing = self
+            .editor
+            .breakpoint_logs
+            .get(&path)
+            .and_then(|m| m.get(&line))
+            .cloned()
+            .unwrap_or_default();
+        let label = if existing.is_empty() {
+            format!("Add Logpoint · line {line}")
+        } else {
+            format!("Edit Logpoint · line {line}")
+        };
+        let target_dir = self.tree.root.clone();
+        self.prompt = Some(Prompt {
+            label,
+            buffer: existing,
+            caret: usize::MAX,
+            kind: PromptKind::Logpoint { path, line },
+            target_dir,
+            error: None,
+        });
+    }
+
+    /// Commit the logpoint popup: ensure a breakpoint exists on the line,
+    /// attach the typed message (or clear it when blank), and push the file's
+    /// breakpoints to a live session.
+    pub(super) fn commit_logpoint(&mut self, path: PathBuf, line: usize, message: &str) {
+        self.editor
+            .breakpoints
+            .entry(path.clone())
+            .or_default()
+            .insert(line);
+        let msg = message.trim();
+        if msg.is_empty() {
+            if let Some(m) = self.editor.breakpoint_logs.get_mut(&path) {
+                m.remove(&line);
+            }
+            self.status = format!("Plain breakpoint at line {line}");
+        } else {
+            self.editor
+                .breakpoint_logs
+                .entry(path.clone())
+                .or_default()
+                .insert(line, msg.to_string());
+            self.status = format!("Logpoint at line {line}");
+        }
+        let specs = self
+            .editor
+            .breakpoints
+            .get(&path)
+            .map(|l| self.editor.source_breakpoints(&path, l))
+            .unwrap_or_default();
+        // Every session (#310); see `debug_toggle_breakpoint_line`.
+        for session in self.debug_sessions.iter_mut() {
+            session.update_breakpoints(&path, &specs);
+        }
+    }
+
+    /// A click on the Run and Debug panel's debug toolbar (#1545): the same
+    /// action as the button's key.
+    pub(super) fn run_debug_control(&mut self, control: crate::widgets::run_debug::DebugControl) {
+        use crate::widgets::run_debug::DebugControl;
+        match control {
+            DebugControl::Continue => self.debug_start_or_continue(),
+            DebugControl::Pause => self.debug_pause(),
+            DebugControl::StepOver => self.debug_step("next"),
+            DebugControl::StepInto => self.debug_step("stepIn"),
+            DebugControl::StepOut => self.debug_step("stepOut"),
+            DebugControl::Restart => self.debug_restart(),
+            DebugControl::Stop => self.debug_stop_by_user(),
+        }
+        self.refresh_debug_panel();
+    }
+
+    /// Debug: Continue (#1543): resume a paused session. Unlike F5 it never
+    /// starts one, so a binding for it is inert with nothing to continue.
+    pub(super) fn debug_continue(&mut self) {
+        use crate::dap::session::SessionPhase;
+        match self.debug_sessions.focused().map(|s| s.phase) {
+            Some(SessionPhase::Stopped) => self.debug_start_or_continue(),
+            Some(_) => self.status = String::from("The program is already running"),
+            None => self.status = String::from("No debug session to continue"),
+        }
+    }
+
+    /// Debug: Step Into Target (#1543): ask the adapter which calls the
+    /// paused line makes; the answer arrives as `StepInTargets`. An adapter
+    /// that cannot say steps in plainly, as F11 does.
+    pub(super) fn debug_step_into_target(&mut self) {
+        use crate::dap::session::{SessionPhase, StepInTargetsAsk};
+        let Some(session) = self.debug_sessions.focused_mut() else {
+            self.status = String::from("No debug session to step");
+            return;
+        };
+        if session.phase != SessionPhase::Stopped {
+            self.status = String::from("Step Into Target needs a paused program");
+            return;
+        }
+        match session.request_step_in_targets() {
+            StepInTargetsAsk::Sent => {}
+            StepInTargetsAsk::NoFrame => {
+                self.status =
+                    String::from("The paused frame is still loading; try Step Into Target again");
+            }
+            StepInTargetsAsk::Unsupported => {
+                self.status = String::from(
+                    "This debugger cannot list step-in targets; stepping into the first call",
+                );
+                self.debug_step("stepIn");
+            }
+        }
+    }
+
+    /// The adapter's answer to Step Into Target: nothing to choose between
+    /// steps in plainly, one target steps into it, several open a picker.
+    pub(super) fn offer_step_in_targets(&mut self, targets: Vec<(i64, String)>) {
+        use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+        match targets.as_slice() {
+            [] => self.debug_step_into(None),
+            [(id, _)] => self.debug_step_into(Some(*id)),
+            _ => {
+                let rows = targets
+                    .into_iter()
+                    .map(|(id, label)| ListRow {
+                        id: id.to_string(),
+                        label,
+                    })
+                    .collect();
+                self.open_list_picker(
+                    ListPicker::new(ListPurpose::StepInTarget, "Step Into Target", rows),
+                    "",
+                );
+            }
+        }
+    }
+
+    /// Step into `target` on the paused line, or the first call to run.
+    pub(super) fn debug_step_into(&mut self, target: Option<i64>) {
+        match target {
+            Some(id) => {
+                if let Some(session) = self.debug_sessions.focused_mut() {
+                    session.step_in_target(id);
+                    self.editor.stop_line = None;
+                    self.clear_inline_values();
+                }
+            }
+            None => self.debug_step("stepIn"),
+        }
+    }
+
+    /// F10/F11/Shift+F11: step the paused thread (`next` / `stepIn` / `stepOut`).
+    pub fn debug_step(&mut self, command: &str) {
+        if let Some(session) = self.debug_sessions.focused_mut() {
+            session.step(command);
+            self.editor.stop_line = None;
+            self.clear_inline_values();
+        }
+    }
+
+    /// Toggle "break on raised exceptions" for the active session, with the
+    /// filter id this adapter uses for it (#1426). `uncaught` stays on so
+    /// unhandled exceptions still pause. No-op without a session.
+    pub fn debug_toggle_raised_exceptions(&mut self) {
+        let Some(session) = self.debug_sessions.focused_mut() else {
+            self.status = String::from("Start debugging first to set exception breakpoints");
+            return;
+        };
+        let Some(on) = session.toggle_raised_exceptions() else {
+            self.status = String::from(
+                "This debugger has no filter for raised exceptions; exception breakpoints are unchanged",
+            );
+            return;
+        };
+        let uncaught = session.has_exception_filter("uncaught");
+        self.status = String::from(match (on, uncaught) {
+            (true, true) => "Breaking on raised exceptions (and uncaught)",
+            (true, false) => "Breaking on raised exceptions",
+            (false, true) => "Breaking on uncaught exceptions only",
+            (false, false) => "No longer breaking on raised exceptions",
+        });
+    }
+
+    /// F6: interrupt a running program so it stops at the current line.
+    pub fn debug_pause(&mut self) {
+        match self.debug_sessions.focused_mut() {
+            Some(session) => {
+                session.pause();
+                self.status = String::from("Pausing");
+            }
+            None => self.status = String::from("No debug session to pause"),
+        }
+    }
+
+    /// Restart: tear down the current session and relaunch the active file with
+    /// the same breakpoints.
+    pub fn debug_restart(&mut self) {
+        if !self.debug_sessions.is_empty() {
+            self.debug_stop();
+        }
+        self.start_selected_debug();
+    }
+
+    /// A session ended: the expressions survive (they usually make sense for
+    /// the next run too), but the values, the changed-value baseline, and the
+    /// baseline latch are that session's — left in place they made every
+    /// watch flash "changed" on a fresh session's first stop.
+    pub(super) fn reset_watch_runtime(&mut self) {
+        self.watch_vals.clear();
+        self.watch_prev.clear();
+        self.watch_baseline_pending = false;
+    }
+
+    /// A compound member ended and siblings survive (#567): rebuild the
+    /// status and the panel line from the live set, naming what ended, which
+    /// session the view now shows, and every one still running. Without this
+    /// both kept naming the ended session.
+    pub(super) fn report_member_ended(&mut self, ended: &str) {
+        let running = self.debug_sessions.names().join(", ");
+        let focused = self
+            .debug_sessions
+            .focused_name()
+            .unwrap_or("?")
+            .to_string();
+        let what = self
+            .debug_compound
+            .as_deref()
+            .map_or_else(String::new, |c| format!(" compound {c}"));
+        self.run_debug.feedback = Some(format!("Debugging{what}: {running} ({ended} ended)"));
+        self.run_debug.feedback_is_error = false;
+        self.status =
+            format!("{ended} ended — showing {focused}; running: {running} · Shift+F5 stops all");
+    }
+
+    /// Move the UI to the session at `index` (#567). `events` holds what the
+    /// previously focused session produced this tick: its output goes to the
+    /// console now, and the rest goes back on its own backlog so it replays
+    /// when that session is focused again, rather than being applied to the
+    /// wrong one. `events` is then the new session's queued backlog, so the
+    /// caller's event loop replays its stop as if it had been focused all
+    /// along.
+    pub(super) fn refocus_debug_session(
+        &mut self,
+        index: usize,
+        events: &mut Vec<crate::dap::session::DapEvent>,
+    ) {
+        use crate::dap::session::DapEvent;
+        let old = self.debug_sessions.focused_index();
+        if index == old || !self.debug_sessions.focus(index) {
+            return;
+        }
+        let mut keep = Vec::new();
+        for ev in events.drain(..) {
+            match ev {
+                DapEvent::Output { category, text }
+                    if crate::dap::session::output_is_user_visible(&category) =>
+                {
+                    self.debug_console_push_output(old, &category, &text, false);
+                }
+                DapEvent::Output { .. } => {}
+                other => keep.push(other),
+            }
+        }
+        if let Some((_, named)) = self
+            .debug_sessions
+            .iter_named_mut_indexed()
+            .find(|(i, _)| *i == old)
+        {
+            keep.append(&mut named.backlog);
+            named.backlog = keep;
+        }
+        *events = self.debug_sessions.take_focused_backlog();
+        // The arrow belongs to the session that was focused; the phase pass
+        // after the event loop redraws it for the new one.
+        self.editor.stop_line = None;
+    }
+
+    /// Debug: Switch Session (#567): focus the next member of a compound, so
+    /// one stopped in the background can be inspected. Its queued events
+    /// replay on the next poll.
+    pub(super) fn switch_debug_session(&mut self) {
+        if self.debug_sessions.len() < 2 {
+            self.status = String::from("Only one debug session is running");
+            return;
+        }
+        let next = (self.debug_sessions.focused_index() + 1) % self.debug_sessions.len();
+        let mut none = Vec::new();
+        self.refocus_debug_session(next, &mut none);
+        // Nothing drained this tick belongs to the old session here, so the
+        // new session's backlog goes back to wait for the next poll.
+        if let Some((_, named)) = self
+            .debug_sessions
+            .iter_named_mut_indexed()
+            .find(|(i, _)| *i == next)
+        {
+            none.append(&mut named.backlog);
+            named.backlog = none;
+        }
+        let name = self
+            .debug_sessions
+            .focused_name()
+            .unwrap_or("?")
+            .to_string();
+        let running = self.debug_sessions.names().join(", ");
+        self.status = format!("Debugging {name} · running: {running}");
+        self.refresh_debug_panel();
+    }
+
+    /// Every breakpoint for the BREAKPOINTS list (#250), by file then line,
+    /// with its condition or log message.
+    pub(super) fn breakpoint_items(&self) -> Vec<crate::widgets::run_debug::BreakpointItem> {
+        let mut paths: Vec<&PathBuf> = self.editor.breakpoints.keys().collect();
+        paths.sort();
+        let mut items = Vec::new();
+        for path in paths {
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| path.display().to_string());
+            for &line in &self.editor.breakpoints[path] {
+                let condition = self
+                    .editor
+                    .breakpoint_conditions
+                    .get(path)
+                    .and_then(|m| m.get(&line));
+                let log = self
+                    .editor
+                    .breakpoint_logs
+                    .get(path)
+                    .and_then(|m| m.get(&line));
+                let detail = match (log, condition) {
+                    (Some(msg), _) => Some(format!("log {msg}")),
+                    (None, Some(cond)) => Some(format!("if {cond}")),
+                    (None, None) => None,
+                };
+                items.push(crate::widgets::run_debug::BreakpointItem {
+                    path: path.clone(),
+                    line,
+                    label: format!("{name}:{line}"),
+                    detail,
+                });
+            }
+        }
+        items
+    }
+
+    /// Bring the panel's BREAKPOINTS list up to date, and the tree's section
+    /// with it while a session is shown. A no-op when nothing changed.
+    pub(super) fn sync_breakpoint_list(&mut self) {
+        use crate::widgets::run_debug::DebugRowKind;
+        let items = self.breakpoint_items();
+        if items == self.run_debug.breakpoints {
+            return;
+        }
+        let n = items.len();
+        self.run_debug.breakpoints = items;
+        if self.run_debug.debug_active {
+            let rows = &mut self.run_debug.debug_rows;
+            if let Some(pos) = rows.iter().position(
+                |r| matches!(&r.kind, DebugRowKind::Header { title } if title == "BREAKPOINTS"),
+            ) {
+                rows.truncate(pos);
+            }
+            rows.extend(breakpoint_section_rows(n));
+        }
+    }
+
+    /// A click in the BREAKPOINTS list: jump to the breakpoint, or remove it
+    /// when the click landed on its `✕`.
+    pub(super) fn breakpoint_list_click(&mut self, index: usize, remove: bool) {
+        let Some(bp) = self.run_debug.breakpoints.get(index).cloned() else {
+            return;
+        };
+        if remove {
+            self.remove_breakpoint_at(&bp.path, bp.line);
+        } else if let Err(e) = self.open_at(&bp.path, bp.line.saturating_sub(1), 0) {
+            self.status = format!("Could not open {}: {e}", bp.path.display());
+        }
+        self.sync_breakpoint_list();
+    }
+
+    /// Remove the breakpoint at `path:line` (1-based) with its condition or
+    /// log message, and push the file's breakpoints to every live session so
+    /// it stops binding mid-run too, as F9 does.
+    pub(super) fn remove_breakpoint_at(&mut self, path: &Path, line: usize) {
+        if let Some(lines) = self.editor.breakpoints.get_mut(path) {
+            lines.remove(&line);
+            if lines.is_empty() {
+                self.editor.breakpoints.remove(path);
+            }
+        }
+        if let Some(m) = self.editor.breakpoint_conditions.get_mut(path) {
+            m.remove(&line);
+        }
+        if let Some(m) = self.editor.breakpoint_logs.get_mut(path) {
+            m.remove(&line);
+        }
+        let specs = self
+            .editor
+            .breakpoints
+            .get(path)
+            .map(|lines| self.editor.source_breakpoints(path, lines))
+            .unwrap_or_default();
+        let owned = path.to_path_buf();
+        for session in self.debug_sessions.iter_mut() {
+            session.update_breakpoints(&owned, &specs);
+        }
+        self.status = format!(
+            "Breakpoint removed from {}:{line}",
+            path.file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        );
+    }
+
+    /// Open the process picker for a `${command:pickProcess}` attach (#250),
+    /// parking the resolved config until a process is chosen.
+    pub(super) fn open_attach_process_picker(
+        &mut self,
+        rc: crate::dap::configs::ResolvedConfig,
+        slot: LaunchSlot,
+    ) {
+        use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+        let processes = list_user_processes();
+        if processes.is_empty() {
+            self.debug_error(format!(
+                "config \"{}\": no processes found to attach to",
+                rc.name
+            ));
+            return;
+        }
+        let rows = processes
+            .into_iter()
+            .map(|(pid, comm)| ListRow {
+                id: pid.to_string(),
+                label: format!("{pid:>7}  {comm}"),
+            })
+            .collect();
+        let title = format!("Attach \"{}\" to process", rc.name);
+        self.pending_attach = Some((rc, slot));
+        self.list_picker = Some(ListPicker::new(ListPurpose::AttachProcess, title, rows));
+    }
+
+    /// The parked attach with its `processId` set to the chosen `pid`, taken
+    /// out so a second confirm cannot launch it twice.
+    pub(super) fn take_pending_attach(
+        &mut self,
+        pid: i64,
+    ) -> Option<(crate::dap::configs::ResolvedConfig, LaunchSlot)> {
+        let (mut rc, slot) = self.pending_attach.take()?;
+        rc.process_id = Some(pid);
+        Some((rc, slot))
+    }
+
+    /// Remember a launched configuration's `postDebugTask` for the end of
+    /// this run (#250). A compound's members may name the same one; it runs
+    /// once.
+    pub(super) fn record_post_debug_task(&mut self, rc: &crate::dap::configs::ResolvedConfig) {
+        if let Some(task) = &rc.post_debug_task
+            && !self.debug_post_tasks.contains(task)
+        {
+            self.debug_post_tasks.push(task.clone());
+        }
+    }
+
+    /// Run the finished run's `postDebugTask`s, each once, in launch order.
+    /// A label no tasks.json declares is reported rather than skipped, the
+    /// same contract `preLaunchTask` has.
+    pub(super) fn run_post_debug_tasks(&mut self) {
+        let labels = std::mem::take(&mut self.debug_post_tasks);
+        if labels.is_empty() {
+            return;
+        }
+        let tasks = crate::tasks::discover_tasks(&self.active_workspace_root());
+        for label in labels {
+            match crate::tasks::find_task(tasks.clone(), &label) {
+                Ok(task) => {
+                    self.run_project_task(task);
+                }
+                Err(near) => {
+                    self.status = format!(
+                        "postDebugTask \"{label}\" not found{} — Tasks: Run Task lists what the workspace declares",
+                        did_you_mean(near)
+                    );
+                }
+            }
+        }
+    }
+
+    /// Shift+F5 and Debug: Stop Debugging. The user ending the run is when a
+    /// `postDebugTask` runs (#250); the internal `debug_stop` a relaunch uses
+    /// to replace the set is not, so it lives here rather than in there.
+    pub(super) fn debug_stop_by_user(&mut self) {
+        let was_running = !self.debug_sessions.is_empty();
+        self.debug_stop();
+        if was_running {
+            self.run_post_debug_tasks();
+        } else {
+            self.debug_post_tasks.clear();
+        }
+    }
+
+    /// Shift+F5: stop debugging and tear the session down.
+    pub fn debug_stop(&mut self) {
+        // EVERY session, not the focused one (#310). A compound launches
+        // several; disconnecting only the one the user happens to be looking
+        // at would leave its siblings running with nothing on screen owning
+        // them, which is the orphaning the issue names.
+        for (_, named) in self.debug_sessions.iter_named_mut_indexed() {
+            mirror_open_console_lines(
+                &mut named.console,
+                &self.debug_console,
+                self.debug_console_dropped,
+            );
+            named.session.disconnect();
+        }
+        self.debug_sessions.clear();
+        // A `cargo` build still running for a launch (#1392) must not start
+        // its debuggee after the user stopped debugging.
+        self.pending_cargo_launches.clear();
+        self.debug_compound = None;
+        // A C/C++ build still running must not launch once it finishes
+        // (#1359): Stop means stop.
+        self.debug_build = None;
+        self.reset_watch_runtime();
+        // Sweep js-debug's detached watchdog (and any leftover tree) once it has
+        // reparented to init after the server dies. See the Terminated arm in
+        // `poll_dap` and `crate::dap::reaper`.
+        crate::dap::reaper::reap_orphaned_js_debug_async(std::time::Duration::from_millis(
+            REAPER_TEARDOWN_GRACE_MS,
+        ));
+        self.editor.stop_line = None;
+        self.editor.unverified_breakpoints.clear();
+        // The breakpoint croft set at the failing assertion goes with the
+        // session that asked for it (#373).
+        self.disarm_failure_breakpoint();
+        self.clear_inline_values();
+        self.status = String::from("Debug session stopped");
+        // Clear the paused-state feedback ("Paused (breakpoint)") so the
+        // empty-state panel doesn't keep showing it under the Run button.
+        self.run_debug.feedback = None;
+        self.run_debug.feedback_is_error = false;
+        // Refresh now: `poll_dap` early-returns once the session is gone, so it
+        // would never deactivate the panel on its own — without this the Run &
+        // Debug panel keeps showing the stale "Paused" tree until the next event.
+        self.refresh_debug_panel();
+    }
+
+    pub fn run_active_file(&mut self) {
+        if self.editor.path.is_none() {
+            self.run_debug.feedback = Some(String::from("Open a file first"));
+            self.run_debug.feedback_is_error = true;
+            return;
+        }
+        self.launch_with_unsaved_saved(Self::run_active_file_now);
+    }
+
+    pub(super) fn run_active_file_now(&mut self) {
+        let Some(path) = self.editor.path.clone() else {
+            return;
+        };
+        let run_root = self
+            .roots
+            .owning_root(&path)
+            .unwrap_or_else(|| self.roots.primary())
+            .to_path_buf();
+        let Some(spec) = Self::run_spec_for(&path, &run_root) else {
+            self.run_debug.feedback = Some(format!(
+                "Don't know how to run {}",
+                path.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| path.display().to_string())
+            ));
+            self.run_debug.feedback_is_error = true;
+            return;
+        };
+        match PtyTerminal::new_running(&spec.program, &spec.args, &spec.cwd) {
+            Ok(term) => {
+                let target = self.active_terminal + 1;
+                self.terminals.insert(target, term);
+                self.active_terminal = target;
+                if !self.show_terminal {
+                    self.show_terminal = true;
+                }
+                self.focus_pane(Pane::Terminal);
+                self.run_debug.feedback = Some(format!(
+                    "Running {}",
+                    path.file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_else(|| path.display().to_string())
+                ));
+                self.run_debug.feedback_is_error = false;
+            }
+            Err(e) => {
+                self.run_debug.feedback = Some(format!("Failed to spawn terminal: {e}"));
+                self.run_debug.feedback_is_error = true;
+            }
+        }
+    }
+
+    pub fn consume_process_picker_image_clear(&mut self) -> bool {
+        self.overlays.process_picker_clear.consume()
+    }
+
+    /// Open the "Debug: Attach to Python Process" picker. Enumerates running
+    /// CPython 3.14+ processes (those with PEP 768 `sys.remote_exec`); shows a
+    /// status message and opens nothing when there are none.
+    pub(super) fn open_attach_python_picker(&mut self) {
+        if self.process_picker.is_some() {
+            return;
+        }
+        let targets = crate::dap::discovery::attachable_python_targets();
+        if targets.is_empty() {
+            self.run_debug.feedback = Some(String::from(
+                "No attachable Python 3.14+ processes found (PEP 768 needs CPython 3.14+)",
+            ));
+            self.run_debug.feedback_is_error = true;
+            self.status = String::from("Attach: no Python 3.14+ processes running");
+            return;
+        }
+        let count = targets.len();
+        self.process_picker = Some(crate::widgets::process_picker::ProcessPicker::new(targets));
+        self.overlays.process_picker_clear.request();
+        self.status = format!("Attach: {count} Python process(es) — Esc to close, Enter to attach");
+    }
+
+    pub(super) fn close_process_picker(&mut self) {
+        if self.process_picker.take().is_some() {
+            self.overlays.process_picker_clear.request();
+            self.overlays.activity.mark_dirty();
+            self.overlays.welcome.mark_dirty();
+            self.overlays.hero.mark_dirty();
+            self.invalidate_editor_image_layouts();
+            self.status.clear();
+        }
+    }
+
+    pub(super) fn handle_process_picker_key(&mut self, key: KeyEvent) {
+        let Some(picker) = self.process_picker.as_mut() else {
+            return;
+        };
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) => self.close_process_picker(),
+            (KeyCode::Enter, _) => self.attach_process_picker_selection(),
+            (KeyCode::Up, _) => picker.select_prev(),
+            (KeyCode::Down, _) => picker.select_next(),
+            (KeyCode::PageUp, _) => {
+                for _ in 0..10 {
+                    picker.select_prev();
+                }
+            }
+            (KeyCode::PageDown, _) => {
+                for _ in 0..10 {
+                    picker.select_next();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Attach to the highlighted process and dismiss the picker: Enter's
+    /// action, shared with a mouse click on a result row.
+    pub(super) fn attach_process_picker_selection(&mut self) {
+        let Some(picker) = self.process_picker.as_ref() else {
+            return;
+        };
+        let target = picker.selected_target().cloned();
+        self.close_process_picker();
+        if let Some(target) = target {
+            self.attach_to_python_target(target);
+        }
+    }
+
+    pub(super) fn handle_process_picker_mouse(&mut self, m: MouseEvent) {
+        let Some(picker) = self.process_picker.as_mut() else {
+            return;
+        };
+        let inside = rect_contains(picker.last_rect, m.column, m.row);
+        match m.kind {
+            MouseEventKind::ScrollDown => {
+                for _ in 0..3 {
+                    picker.select_next();
+                }
+            }
+            MouseEventKind::ScrollUp => {
+                for _ in 0..3 {
+                    picker.select_prev();
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Down(MouseButton::Right)
+                if !inside =>
+            {
+                self.close_process_picker();
+            }
+            // Click a row to attach to it, the way VS Code's quick-pick behaves.
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(idx) = picker.row_index_at(m.row) {
+                    picker.selected = idx;
+                    self.attach_process_picker_selection();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub(super) fn render_process_picker(&mut self, frame: &mut ratatui::Frame) {
+        let theme = self.theme;
+        let Some(picker) = self.process_picker.as_mut() else {
+            return;
+        };
+        let area = frame.area();
+        crate::widgets::process_picker::render_process_picker(
+            picker,
+            area,
+            frame.buffer_mut(),
+            theme,
+        );
+    }
+
+    /// Spawn `pdb -p <pid>` for the chosen target in a new PTY terminal,
+    /// wrapping in `sudo` when the platform requires elevation (always on
+    /// macOS; on Linux unless Yama `ptrace_scope` is relaxed). The PTY hosts
+    /// both the interactive pdb prompt and any `sudo` password prompt — the
+    /// edge a GUI debugger lacks.
+    pub(super) fn attach_to_python_target(&mut self, target: crate::dap::discovery::PyTarget) {
+        use crate::dap::remote_attach::{Platform, plan_attach, read_yama_ptrace_scope};
+        let pid = target.pid;
+        let plan = match plan_attach(
+            target.version,
+            target.exe,
+            pid,
+            Platform::current(),
+            read_yama_ptrace_scope(),
+        ) {
+            Ok(plan) => plan,
+            Err(e) => {
+                self.run_debug.feedback = Some(format!("Cannot attach to PID {pid}: {e:?}"));
+                self.run_debug.feedback_is_error = true;
+                return;
+            }
+        };
+        let (program, args) = plan.command_line();
+        match PtyTerminal::new_running(&program, &args, self.workspace_root()) {
+            Ok(term) => {
+                let slot = self.active_terminal + 1;
+                self.terminals.insert(slot, term);
+                self.active_terminal = slot;
+                if !self.show_terminal {
+                    self.show_terminal = true;
+                }
+                self.focus_pane(Pane::Terminal);
+                self.run_debug.feedback = Some(format!("Attaching debugger to PID {pid}"));
+                self.run_debug.feedback_is_error = false;
+            }
+            Err(e) => {
+                self.run_debug.feedback = Some(format!("Failed to spawn terminal: {e}"));
+                self.run_debug.feedback_is_error = true;
+            }
+        }
+    }
+
+    /// Rebuild the inline-value trailers (#135) from the current stop's
+    /// already-fetched VARIABLES data, on every editor showing the stopped
+    /// file (inactive split groups render too).
+    pub(super) fn refresh_inline_values(&mut self) {
+        use crate::dap::session::SessionPhase;
+        if !self.inline_values_enabled {
+            return;
+        }
+        let Some(session) = self.debug_sessions.focused() else {
+            return;
+        };
+        if session.phase != SessionPhase::Stopped {
+            return;
+        }
+        let Some((path, line)) = session.current_location.clone() else {
+            return;
+        };
+        let locals = crate::dap::session::inline_locals(&session.scopes, &session.variables);
+        for ed in self.editor.editors.iter_mut() {
+            if ed.path.as_deref() == Some(path.as_path()) {
+                ed.set_inline_values_from_locals(line, &locals);
+            }
+        }
+        for group in self.editor_layout.inactive_groups_mut() {
+            for ed in group.editors.iter_mut() {
+                if ed.path.as_deref() == Some(path.as_path()) {
+                    ed.set_inline_values_from_locals(line, &locals);
+                }
+            }
+        }
+    }
+
+    /// Drop every inline-value trailer, in every editor of every group —
+    /// called wherever the stop arrow clears (resume, step, terminate).
+    pub(super) fn clear_inline_values(&mut self) {
+        for ed in self.editor.editors.iter_mut() {
+            ed.inline_values.clear();
+        }
+        for group in self.editor_layout.inactive_groups_mut() {
+            for ed in group.editors.iter_mut() {
+                ed.inline_values.clear();
+            }
+        }
+    }
+
+    pub(super) fn toggle_inline_values(&mut self) {
+        self.inline_values_enabled = !self.inline_values_enabled;
+        if self.inline_values_enabled {
+            self.refresh_inline_values();
+        } else {
+            self.clear_inline_values();
+        }
+        self.status = format!(
+            "Debug Inline Values: {}",
+            if self.inline_values_enabled {
+                "on"
+            } else {
+                "off"
+            }
+        );
+        if !cfg!(test) {
+            self.report_unsaved_setting(crate::prefs::save_inline_values(
+                self.inline_values_enabled,
+            ));
+        }
+    }
+
+    /// Send `path`'s current breakpoints to every debug session.
+    pub(super) fn resend_breakpoints(&mut self, path: &Path) {
+        if self.debug_sessions.is_empty() {
+            return;
+        }
+        let specs = self
+            .editor
+            .breakpoints
+            .get(path)
+            .map(|lines| self.editor.source_breakpoints(path, lines))
+            .unwrap_or_default();
+        for session in self.debug_sessions.iter_mut() {
+            session.update_breakpoints(path, &specs);
+        }
+    }
+}
+
+/// Walk from `start` up to and including `workspace_root` looking for a
+/// venv-style Python interpreter. Returns `(interpreter_path, owning_dir)`
+/// where `owning_dir` is the directory that contains the venv folder — the
+/// natural cwd for the run.
+///
+/// The walk stops at `workspace_root`: a venv that lives ABOVE the workspace
+/// would belong to a different project the user has not opened, and using it
+/// silently would surprise them.
+pub(super) fn find_python_venv(start: &Path, workspace_root: &Path) -> Option<(PathBuf, PathBuf)> {
+    let mut probe = start.to_path_buf();
+    loop {
+        for venv_name in [".venv", "venv", ".env"] {
+            let py = probe.join(venv_name).join("bin").join("python");
+            if py.is_file() {
+                return Some((py, probe));
+            }
+        }
+        if probe == workspace_root {
+            return None;
+        }
+        match probe.parent() {
+            Some(parent) if parent != probe => {
+                if !parent.starts_with(workspace_root) && parent != workspace_root {
+                    return None;
+                }
+                probe = parent.to_path_buf();
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// The interpreter that runs Python code in `dir`: the nearest venv up to
+/// `workspace_root` ([`find_python_venv`]), else [`project_python`]. Live
+/// Run and the debugger's program both use it, so a script debugs against
+/// the same installed packages it runs with (#864).
+pub(super) fn project_python_for(dir: &Path, workspace_root: &Path) -> PathBuf {
+    find_python_venv(dir, workspace_root)
+        .map(|(py, _)| py)
+        .unwrap_or_else(|| project_python(workspace_root))
+}
+
+/// The interpreter a debugged Python program in `dir` runs under (#864):
+/// the one Run would use ([`project_python_for`]) when it exists, a venv or
+/// a `python3` on `path_var`. None otherwise, and the launch keeps the debug
+/// venv's own python, where the program always ran, rather than a bare
+/// `python3` that cannot start.
+pub(super) fn debuggee_python(
+    dir: &Path,
+    workspace_root: &Path,
+    path_var: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
+    find_python_venv(dir, workspace_root)
+        .map(|(py, _)| py)
+        .or_else(|| project_python_on(workspace_root, path_var))
+}
+
+/// What a Python debug launch says about the interpreter its program runs
+/// under (#864). Err is the refusal when debugpy cannot run there at all;
+/// Some is the clause naming one older than attach's 3.14 floor, `under
+/// Python 3.12 (.venv); attach needs 3.14+`; None is for 3.14+, or a version
+/// that cannot be read (the launch then reports for itself).
+pub(super) fn debuggee_python_note(python: &Path) -> Result<Option<String>, String> {
+    use crate::dap::install::{DEBUGPY_MIN_PYTHON, python_version, pyvenv_cfg};
+    use crate::dap::remote_attach::MIN_ATTACH_VERSION;
+    let Some(version) = python_version(python) else {
+        return Ok(None);
+    };
+    let (major, minor) = (version.major, version.minor);
+    // A venv by its folder name, as the issue's `.venv`; else the path.
+    let label = pyvenv_cfg(python)
+        .and_then(|cfg| Some(cfg.parent()?.file_name()?.to_string_lossy().into_owned()))
+        .unwrap_or_else(|| python.display().to_string());
+    // Minor versions only: a 3.10.0 debuggee meets debugpy's 3.10 floor.
+    if (major, minor) < (DEBUGPY_MIN_PYTHON.major, DEBUGPY_MIN_PYTHON.minor) {
+        return Err(format!(
+            "Python {major}.{minor} ({label}) is too old to debug: debugpy needs {}.{}+",
+            DEBUGPY_MIN_PYTHON.major, DEBUGPY_MIN_PYTHON.minor
+        ));
+    }
+    if !version.supports_remote_attach() {
+        return Ok(Some(format!(
+            "under Python {major}.{minor} ({label}); attach needs {}.{}+",
+            MIN_ATTACH_VERSION.major, MIN_ATTACH_VERSION.minor
+        )));
+    }
+    Ok(None)
+}
+
+/// Whether a browser croft launches would have no screen to open on
+/// (#1410): croft is reached over SSH, or on Linux no X or Wayland display
+/// is set. macOS and Windows always have one locally.
+pub(super) fn no_display_for_a_browser() -> bool {
+    no_display(
+        crate::remote::running_over_ssh(),
+        cfg!(target_os = "linux"),
+        |k| std::env::var_os(k).is_some_and(|v| !v.is_empty()),
+    )
+}
+
+/// Whether there is no display, given whether croft runs over SSH, whether
+/// it is on Linux, and which environment variables are `set` (#1410).
+pub(crate) fn no_display(over_ssh: bool, linux: bool, set: impl Fn(&str) -> bool) -> bool {
+    over_ssh || (linux && !set("DISPLAY") && !set("WAYLAND_DISPLAY"))
+}
+
+/// `lead` followed by the note on the debuggee's interpreter, if any (#864).
+pub(super) fn with_python_note(lead: String, note: Option<&str>) -> String {
+    match note {
+        Some(note) => format!("{lead} {note}"),
+        None => lead,
+    }
+}
+
+/// The interpreter a debugpy `launch` request runs its program under: its
+/// `python` (a path, or a command line whose first word is one) or legacy
+/// `pythonPath`. A relative path with a folder in it is found where debugpy
+/// starts it, so the version check runs the same file (#864 review): the
+/// request's `cwd`, else the folder of a `program`, else `adapter_dir`, the
+/// folder the adapter runs in. A bare name is left to PATH, as debugpy
+/// leaves it.
+pub(super) fn launch_request_python(
+    request: &serde_json::Value,
+    adapter_dir: &Path,
+) -> Option<PathBuf> {
+    let args = &request["arguments"];
+    let python = args.get("python").or_else(|| args.get("pythonPath"))?;
+    let python = PathBuf::from(python.as_str().or_else(|| python.get(0)?.as_str())?);
+    if python.is_absolute() || python.components().count() < 2 {
+        return Some(python);
+    }
+    let program_dir = args["program"]
+        .as_str()
+        .and_then(|p| Path::new(p).parent())
+        .filter(|dir| !dir.as_os_str().is_empty());
+    let launch_dir = match args["cwd"].as_str() {
+        Some(cwd) => adapter_dir.join(cwd),
+        None => program_dir.map_or_else(|| adapter_dir.to_path_buf(), |d| adapter_dir.join(d)),
+    };
+    Some(launch_dir.join(python))
+}
+
+/// The interpreter Debug Test's pytest runs under once any debug-test
+/// config is applied (#1398): the request's own `python`, a config's
+/// included, but not the debug venv's stand-in for a project that has no
+/// interpreter of its own, which was never the project's to report on.
+pub(super) fn debug_test_python(
+    request: &serde_json::Value,
+    root: &Path,
+    adapter_py: &Path,
+    project_found: bool,
+) -> Option<PathBuf> {
+    launch_request_python(request, root).filter(|py| project_found || py != adapter_py)
+}
+
+/// The interpreter a launch.json Python config's program runs under when
+/// the config names none (#864): resolved from the program's directory,
+/// or from `cwd` for a `module` launch, as [`debuggee_python`] does, with
+/// `adapter_python` (the debug venv's) only when that finds nothing.
+pub(super) fn config_project_python(
+    rc: &crate::dap::configs::ResolvedConfig,
+    cwd: &Path,
+    workspace_root: &Path,
+    adapter_python: &Path,
+) -> PathBuf {
+    // A `module` launch drops `program` from the request (debugpy refuses
+    // both), so the program's directory says nothing about what runs.
+    let program = rc.program.as_deref().filter(|_| rc.module.is_none());
+    let dir = program
+        .map(|p| crate::dap::configs::absolute_in(p, cwd))
+        .and_then(|p| p.parent().map(Path::to_path_buf))
+        .unwrap_or_else(|| cwd.to_path_buf());
+    debuggee_python(&dir, workspace_root, std::env::var_os("PATH").as_deref())
+        .unwrap_or_else(|| adapter_python.to_path_buf())
+}
