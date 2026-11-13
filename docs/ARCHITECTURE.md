@@ -133,6 +133,7 @@ src/
 │   ├── review.rs        pull-request review tabs and in-editor comment boxes
 │   ├── runners.rs       Testing view, Tasks, runnable blocks, notebooks, Fleet, Live Run, .http requests
 │   ├── screencast.rs    Screencast Mode (Shift+F8): the keys pressed, the command each ran and the cell a click hit, drawn over the frame for a recording
+│   ├── viewers.rs       spreadsheet/CSV/SQLite, PDF, archive, hex, log and Markdown viewers
 │   ├── welcome.rs       welcome-screen state: the "IN THIS RELEASE" highlights, read synchronously from `release_notes::release_notes()` (no thread, no network)
 │   └── tests/           whole-app tests, one file per area; `mod.rs` holds the helpers more than one file uses. `golden.rs` draws whole screens the way the main loop does and compares every cell, colour and the caret with the snapshots in `golden/` (`CROFT_BLESS=1` rewrites them; its module doc lists what it pins and masks)
 ├── dap/                 debugger stack: Debug Adapter Protocol client. debugpy (Python: the adapter on a private 3.14+ venv, the program on the project's own interpreter, #864) is the verified mechanism; Rust/C/C++ route to lldb-dap; JS/TS route to vscode-js-debug; Go routes to delve (`dlv dap` over TCP, single-session, #264). Which file types each handles is a data-driven extension axis (see registry.rs)
