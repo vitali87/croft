@@ -437,7 +437,7 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 handler: "is_editor_cut_key",
             },
             ShortcutEntry {
-                keys: "Cmd/Ctrl+V",
+                keys: "Cmd/Ctrl+V / Shift+Insert",
                 description: "Paste at the cursor",
                 handler: "is_editor_paste_key",
             },
