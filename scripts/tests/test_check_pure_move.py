@@ -109,6 +109,67 @@ class PureMoves(unittest.TestCase):
         code, out = repo.check()
         self.assertEqual(code, 0, out)
         self.assertIn("moved    fn a.rs::inc -> a.rs::util::inc", out)
+        self.assertIn(", private -> pub(in crate::a))", out)
+        self.assertIn("1 visibility widened", out)
+
+    def test_a_visibility_widened_in_place_is_listed(self):
+        repo = self.repo({"a.rs": INC})
+        repo.commit({"a.rs": INC.replace("fn inc", "pub(crate) fn inc")})
+        code, out = repo.check()
+        self.assertEqual(code, 0, out)
+        self.assertIn("  widened  fn a.rs::inc (a.rs:1-5 -> a.rs:1-5, private -> pub(crate))", out)
+        self.assertIn("0 unchanged, 0 moved, 0 changed, 0 added, 0 removed; 1 visibility widened", out)
+
+    def test_a_widened_signature_that_rustfmt_wraps_still_matches(self):
+        """Widening can push a signature past the line limit; rustfmt then puts
+        each parameter on a line of its own with a trailing comma, which is
+        layout, not a change."""
+        before = "fn place(&self, at: u8) -> Option<(Vec<u8>, bool)> {\n    None\n}\n"
+        after = (
+            "pub(super) fn place(\n    &self,\n    at: u8,\n) -> Option<(Vec<u8>, bool)> {\n"
+            "    None\n}\n"
+        )
+        repo = self.repo({"a.rs": before})
+        repo.commit({"a.rs": "", "b.rs": after})
+        code, out = repo.check()
+        self.assertEqual(code, 0, out)
+        self.assertIn("moved    fn a.rs::place -> b.rs::place", out)
+
+    def test_a_change_inside_a_wrapped_signature_still_fails(self):
+        before = "fn place(&self, at: u8) -> bool {\n    true\n}\n"
+        cases = [
+            ("pub(super) fn place(\n    &self,\n    at: u16,\n) -> bool {\n", "a parameter's type"),
+            ("pub(super) fn place(\n    &mut self,\n    at: u8,\n) -> bool {\n", "the receiver"),
+            ("pub(super) fn place(\n    &self,\n) -> bool {\n", "a parameter dropped"),
+            ("pub(super) fn place(\n    &self, // at: u8,\n) -> bool {\n", "a parameter commented out"),
+        ]
+        for head, why in cases:
+            with self.subTest(why=why), tempfile.TemporaryDirectory() as tmp:
+                repo = Repo(Path(tmp), {"a.rs": before})
+                repo.commit({"a.rs": "", "b.rs": head + "    true\n}\n"})
+                code, out = repo.check()
+                self.assertEqual(code, 1, out)
+                self.assertIn("CHANGED  fn a.rs::place -> b.rs::place", out)
+
+    def test_code_after_a_comment_in_a_signature_is_not_the_comment(self):
+        """A `//` comment ends at its line: a parameter on the next line is
+        code, and the same words on the comment's own line are not."""
+        live = "fn place(\n    // at the start\n    at: u8,\n) -> bool {\n    true\n}\n"
+        dead = "fn place(\n    // at the start at: u8\n) -> bool {\n    true\n}\n"
+        repo = self.repo({"a.rs": live})
+        repo.commit({"a.rs": "", "b.rs": dead})
+        code, out = repo.check()
+        self.assertEqual(code, 1, out)
+        self.assertIn("CHANGED  fn a.rs::place -> b.rs::place", out)
+
+    def test_literals_in_a_wrapped_declaration_are_compared_as_written(self):
+        before = 'const NAME: &str = "a\n  b";\n'
+        after = 'pub(super) const NAME: &str =\n    "a\n b";\n'
+        repo = self.repo({"a.rs": before})
+        repo.commit({"a.rs": "", "b.rs": after})
+        code, out = repo.check()
+        self.assertEqual(code, 1, out)
+        self.assertIn("CHANGED  const a.rs::NAME -> b.rs::NAME", out)
 
     def test_narrowed_or_incomparable_visibility_fails(self):
         """Only a wider reach is a pure move: a narrower one can hide what a
