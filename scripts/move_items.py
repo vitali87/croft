@@ -627,16 +627,31 @@ def cargo_errors(root, mode):
     """[(code, message)] of every error `cargo clippy <mode>` reports with
     warnings denied: `--bins` builds the app, `--tests` its tests."""
     cmd = ["cargo", "clippy", mode, "--keep-going", "--message-format=json", "--", "-D", "warnings"]
-    out = subprocess.run(cmd, cwd=root, capture_output=True, text=True).stdout
+    run = subprocess.run(cmd, cwd=root, capture_output=True, text=True)
+    return read_errors(mode, run.returncode, run.stdout, run.stderr)
+
+
+def read_errors(mode, status, stdout, stderr):
+    """The compiler errors in cargo's JSON `stdout`, as (code, message); an
+    error with no code has code "". rustc's closing "aborting due to ..."
+    only counts the others, so it is left out. A build that failed with no
+    compiler error to show for it (a dependency, a build script, cargo
+    itself) raises BuildError: a failure is never read as a clean build."""
     errors = []
-    for line in out.splitlines():
+    for line in stdout.splitlines():
         try:
             m = json.loads(line)
         except ValueError:
             continue
         msg = m.get("message") or {}
-        if m.get("reason") == "compiler-message" and msg.get("level") == "error" and msg.get("code"):
-            errors.append((msg["code"]["code"], msg["message"]))
+        if m.get("reason") != "compiler-message" or msg.get("level") not in ("error", "error: internal compiler error"):
+            continue
+        if not msg.get("code") and msg.get("message", "").startswith("aborting due to"):
+            continue
+        errors.append(((msg.get("code") or {}).get("code", ""), msg.get("message", "")))
+    if status != 0 and not errors:
+        tail = "\n  ".join(stderr.strip().splitlines()[-15:])
+        raise BuildError(f"cargo clippy {mode} failed with no compiler error to fix:\n  {tail}")
     return sorted(set(errors))
 
 

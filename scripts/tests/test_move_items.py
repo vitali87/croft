@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import os
 import subprocess
 import sys
@@ -359,6 +360,31 @@ class Helpers(unittest.TestCase):
         with self.assertRaises(mi.BuildError) as e:
             mi.fix_glue(self.GLUE, errors, [], {"seq": ("commands", "pub(super)")})
         self.assertIn("seq is used outside app but is pub(super) in commands.rs", str(e.exception))
+
+    @staticmethod
+    def message(level, text, code=None):
+        body = {"level": level, "message": text, "code": {"code": code} if code else None}
+        return json.dumps({"reason": "compiler-message", "message": body})
+
+    def test_build_errors_are_read_with_or_without_a_code(self):
+        out = "\n".join([
+            self.message("error", "unused import: `commands::*`", "unused_imports"),
+            self.message("error", "something with no code"),
+            self.message("error", "aborting due to 2 previous errors"),
+            self.message("warning", "a warning that is not denied", "dead_code"),
+            "not json",
+        ])
+        errors = mi.read_errors("--bins", 101, out, "")
+        self.assertEqual(errors, [("", "something with no code"),
+                                  ("unused_imports", "unused import: `commands::*`")])
+        with self.assertRaises(mi.BuildError):
+            mi.fix_glue(self.GLUE, errors, [], {})
+
+    def test_a_failed_build_with_no_compiler_error_is_not_clean(self):
+        with self.assertRaises(mi.BuildError) as e:
+            mi.read_errors("--tests", 101, "", "error: failed to run custom build command for `x`\n")
+        self.assertIn("failed to run custom build command", str(e.exception))
+        self.assertEqual(mi.read_errors("--tests", 0, "", ""), [])
 
     def test_halves_numbers_only_files_that_take_two_prs(self):
         rows = [(0, "", "fn", "-", "a"), (1, "x", "fn", "-", "b"), (2, "y", "fn", "-", "c"),

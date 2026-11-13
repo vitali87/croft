@@ -233,12 +233,40 @@ DECLARED = {"fn", "const", "static", "struct", "enum", "union", "trait", "type",
 # A comma at the end of a line before a closing bracket on the next one: the
 # trailing comma rustfmt adds when it puts a list one entry per line.
 WRAPPED_COMMA = re.compile(r",[ \t]*\n\s*(?=[)\]>{])")
+# The opening bracket of a macro call, `name!(`, `name![` or `name!{`.
+MACRO_CALL = re.compile(r"\b[A-Za-z_]\w*\s*!\s*([(\[{])")
+CLOSER = {"(": ")", "[": "]", "{": "}"}
+
+
+def keep_macro_commas(text):
+    """`text` with every comma inside a macro call's brackets swapped for
+    `\\2`, so no rule drops it: a macro may match `(a,)` and `(a)` apart and
+    expand them differently, so a trailing comma there is not layout."""
+    out, pos = [], 0
+    for m in MACRO_CALL.finditer(text):
+        if m.start() < pos:
+            continue
+        depth, end = 0, len(text)
+        for k in range(m.start(1), len(text)):
+            if text[k] in CLOSER:
+                depth += 1
+            elif text[k] in ")]}":
+                depth -= 1
+                if depth == 0:
+                    end = k + 1
+                    break
+        out.append(text[pos : m.start(1)])
+        out.append(text[m.start(1) : end].replace(",", "\2"))
+        pos = end
+    out.append(text[pos:])
+    return "".join(out)
 
 
 def one_line(text, spans, a, b):
     """`text[a:b]`, a declaration, as one line: whitespace runs shrunk to a
     space, none after an opening or before a closing bracket, and a trailing
-    comma before a bracket on the next line dropped. Literals and comments
+    comma before a bracket on the next line dropped, unless it sits in a
+    macro call. Literals and comments
     are kept as written, so no rule reaches inside them, and the line break
     that ends a `//` comment stays one: code that follows the comment on its
     next line is not code commented out on the same one."""
@@ -253,12 +281,12 @@ def one_line(text, spans, a, b):
             pos = min(e, b)
         k += 1
     pieces.append(text[pos:b])
-    out = WRAPPED_COMMA.sub("\n", "".join(pieces))
+    out = WRAPPED_COMMA.sub("\n", keep_macro_commas("".join(pieces)))
     out = re.sub(r"\s+", " ", out).strip()
     out = re.sub(r"([(\[<]) ", r"\1", out)
     out = re.sub(r" ([)\]>])", r"\1", out)
     out = re.sub("\0(\\d+)\0", lambda m: kept[int(m[1])], out)
-    return out.replace("\1", "\n")
+    return out.replace("\1", "\n").replace("\2", ",")
 
 
 def parse(text, file=""):

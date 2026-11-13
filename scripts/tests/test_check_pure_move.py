@@ -151,6 +151,35 @@ class PureMoves(unittest.TestCase):
                 self.assertEqual(code, 1, out)
                 self.assertIn("CHANGED  fn a.rs::place -> b.rs::place", out)
 
+    def test_a_trailing_comma_inside_a_macro_call_is_a_change(self):
+        """`m!(1,)` and `m!(1)` are different inputs: a macro can match them
+        apart. A trailing comma rustfmt adds to a wrapped list is layout; one
+        in a macro call is not, so it is compared as written."""
+        cases = [
+            ("choose!(1)", "choose!(\n    1,\n)", "a wrapped call"),
+            ("outer!(inner!(1))", "outer!(inner!(\n    1,\n))", "a nested call"),
+            ("[1, choose!(2)]", "[\n    1,\n    choose!(\n        2,\n    ),\n]", "a call in a list"),
+        ]
+        for value, wrapped, why in cases:
+            before = f"const X: u8 = {value};\n"
+            after = f"pub(super) const X: u8 = {wrapped};\n"
+            with self.subTest(why=why), tempfile.TemporaryDirectory() as tmp:
+                repo = Repo(Path(tmp), {"a.rs": before})
+                repo.commit({"a.rs": "", "b.rs": after})
+                code, out = repo.check()
+                self.assertEqual(code, 1, out)
+                self.assertIn("CHANGED  const a.rs::X -> b.rs::X", out)
+
+    def test_a_wrapped_array_and_a_wrapped_macro_call_still_match(self):
+        before = 'const A: [u8; 2] = [1, 2];\n\nconst B: &str = concat!("a", "b");\n'
+        after = ('pub(super) const A: [u8; 2] = [\n    1,\n    2,\n];\n\n'
+                 'pub(super) const B: &str = concat!(\n    "a",\n    "b"\n);\n')
+        repo = self.repo({"a.rs": before})
+        repo.commit({"a.rs": "", "b.rs": after})
+        code, out = repo.check()
+        self.assertEqual(code, 0, out)
+        self.assertIn("2 visibility widened", out)
+
     def test_code_after_a_comment_in_a_signature_is_not_the_comment(self):
         """A `//` comment ends at its line: a parameter on the next line is
         code, and the same words on the comment's own line are not."""
