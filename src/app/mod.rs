@@ -17958,12 +17958,6 @@ impl App {
         self.complete_pending_save();
     }
 
-    /// VS Code "Quick Fix" (`Cmd+.`): ask the language server for the code
-    /// actions available at the cursor (with the diagnostics on that line as
-    /// context) and present them in a picker. No-op on read-only preview tabs.
-    /// The reply is handled in [`Self::drain_lsp_code_actions`].
-    /// The Quick Fix picker for a merge conflict at the cursor: VS Code's
-    /// three accept actions, applied locally with no LSP involvement.
     /// F7 / Shift+F7: move the caret to the next / previous conflict header,
     /// wrapping, and say which of how many the caret landed on.
     fn jump_conflict(&mut self, backwards: bool) {
@@ -17985,6 +17979,8 @@ impl App {
         self.status = format!("Conflict {} of {}", idx + 1, blocks.len());
     }
 
+    /// The Quick Fix picker for a merge conflict at the cursor: VS Code's
+    /// three accept actions, applied locally with no LSP involvement.
     fn open_merge_conflict_picker(&mut self) {
         use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
         let rows = vec![
@@ -18488,6 +18484,10 @@ impl App {
         (start, end, diagnostics)
     }
 
+    /// VS Code "Quick Fix" (`Cmd+.`): ask the language server for the code
+    /// actions available at the cursor (with the diagnostics on that line as
+    /// context) and present them in a picker. No-op on read-only preview tabs.
+    /// The reply is handled in [`Self::drain_lsp_code_actions`].
     fn start_code_action(&mut self) {
         if self.editor.has_non_text_view() {
             return;
@@ -56419,10 +56419,6 @@ impl App {
         }
     }
 
-    /// Drain freshly scraped ports from every terminal and, on a low cadence,
-    /// poll the socket table. Output-scrape hits are browser-facing
-    /// announcements, so a new one raises the toast; socket-poll hits populate
-    /// the PORTS tab silently. Returns whether anything changed (for redraw).
     /// Surface BEL rings and OSC 9 notifications from any pane in the status
     /// bar (VS Code shows a bell on the terminal tab; croft's status line is
     /// its equivalent). Returns true when either arrived so the loop redraws.
@@ -56903,6 +56899,10 @@ impl App {
         });
     }
 
+    /// Drain freshly scraped ports from every terminal and, on a low cadence,
+    /// poll the socket table. Output-scrape hits are browser-facing
+    /// announcements, so a new one raises the toast; socket-poll hits populate
+    /// the PORTS tab silently. Returns whether anything changed (for redraw).
     fn drain_ports_and_poll(&mut self) -> bool {
         let mut changed = false;
         if self
@@ -68482,9 +68482,6 @@ impl App {
         }
     }
 
-    /// Flip `editor.formatOnSave`, persist it, and report the new state.
-    /// Persistence is skipped under test so the suite never writes the
-    /// developer's `~/.config/croft/config.json` (mirrors the layout prefs).
     /// The auto-save delay after the last edit, VS Code's
     /// `files.autoSaveDelay` default.
     const AUTO_SAVE_DELAY: std::time::Duration = std::time::Duration::from_millis(1000);
@@ -70858,6 +70855,9 @@ impl App {
         }
     }
 
+    /// Flip `editor.formatOnSave`, persist it, and report the new state.
+    /// Persistence is skipped under test so the suite never writes the
+    /// developer's `~/.config/croft/config.json` (mirrors the layout prefs).
     fn toggle_format_on_save(&mut self) {
         self.format_on_save = !self.format_on_save;
         self.status = if self.format_on_save {
@@ -75839,8 +75839,6 @@ impl App {
         self.poke_cursor();
     }
 
-    /// Right-click on the minimap strip: a compact menu mirroring VS Code's
-    /// (Minimap toggle + Side submenu).
     /// Build a status-bar popup menu at `(col, row)`. `menu_rect` clamps it up
     /// to fit, so opening at the bottom status row renders above the bar.
     fn open_status_menu(&mut self, col: u16, row: u16, items: Vec<MenuEntry>) {
@@ -75987,6 +75985,8 @@ impl App {
         self.open_status_menu(col, row, items);
     }
 
+    /// Right-click on the minimap strip: a compact menu mirroring VS Code's
+    /// (Minimap toggle + Side submenu).
     fn open_minimap_menu(&mut self, col: u16, row: u16) {
         let check = |on: bool| if on { "\u{2713} " } else { "  " };
         let items = vec![
@@ -76127,11 +76127,6 @@ impl App {
         true
     }
 
-    /// Keyboard navigation for spreadsheet preview tabs. All gestures are
-    /// scroll-only: arrows pan one row/column, PageUp/PageDown jump by a
-    /// full viewport, Home/End jump to the first/last row, Tab/Shift+Tab
-    /// switch worksheets. Anything else is swallowed so a stray keystroke
-    /// can't insert characters into a buffer the user can't see.
     /// Go to Next / Previous Change (#1352): in a diff tab its hunks, in a
     /// buffer with merge conflicts its conflicts, otherwise the editor's
     /// change bars, wrapping at the ends.
@@ -76323,6 +76318,11 @@ impl App {
         );
     }
 
+    /// Keyboard navigation for spreadsheet preview tabs. All gestures are
+    /// scroll-only: arrows pan one row/column, PageUp/PageDown jump by a
+    /// full viewport, Home/End jump to the first/last row, Tab/Shift+Tab
+    /// switch worksheets. Anything else is swallowed so a stray keystroke
+    /// can't insert characters into a buffer the user can't see.
     fn handle_sheet_key(&mut self, key: KeyEvent) {
         let visible = sheet_visible_rows(self.editor.last_inner);
         let Some(sheet) = self.editor.sheet.as_mut() else {
@@ -81612,15 +81612,6 @@ fn is_terminal_maximize_key(key: KeyEvent) -> bool {
         && !key.modifiers.contains(KeyModifiers::SUPER)
 }
 
-/// `Cmd+T` (or legacy `Ctrl+Shift+T`): spawn an additional terminal next
-/// to the active one. iTerm2's GlobalKeyMap forwards `Cmd+T` as
-/// `ESC [ 116 ; 9 u`, which crossterm decodes to `Char('t') + SUPER`.
-/// In the SUPER branch we reject SHIFT so the `Cmd+Shift+T` focus chord
-/// (see `is_terminal_focus_key`) does not double-fire as a split, and
-/// reject ALT so `Cmd+Opt+T` (iTerm2's relocated New Tab) is left alone.
-/// `Ctrl+Shift+Space`: WezTerm's quick-select chord. No Cmd involved, so it
-/// needs no host-terminal forwarder — it arrives disambiguated through the
-/// kitty keyboard protocol exactly like the Ctrl+Shift+T split chord.
 /// One compiled per-host accent rule: hostname glob, accent color, badge.
 type HostAccent = (globset::GlobMatcher, (u8, u8, u8), Option<String>);
 
@@ -81641,6 +81632,9 @@ fn compile_host_accents(rules: &[crate::prefs::HostAccentRule]) -> Vec<HostAccen
         .collect()
 }
 
+/// `Ctrl+Shift+Space`: WezTerm's quick-select chord. No Cmd involved, so it
+/// needs no host-terminal forwarder — it arrives disambiguated through the
+/// kitty keyboard protocol exactly like the Ctrl+Shift+T split chord.
 fn is_quick_select_key(key: KeyEvent) -> bool {
     matches!(key.code, KeyCode::Char(' '))
         && key.modifiers.contains(KeyModifiers::CONTROL)
@@ -81665,6 +81659,12 @@ fn is_command_history_key(key: KeyEvent) -> bool {
         && key.modifiers.contains(KeyModifiers::SHIFT)
 }
 
+/// `Cmd+T` (or legacy `Ctrl+Shift+T`): spawn an additional terminal next
+/// to the active one. iTerm2's GlobalKeyMap forwards `Cmd+T` as
+/// `ESC [ 116 ; 9 u`, which crossterm decodes to `Char('t') + SUPER`.
+/// In the SUPER branch we reject SHIFT so the `Cmd+Shift+T` focus chord
+/// (see `is_terminal_focus_key`) does not double-fire as a split, and
+/// reject ALT so `Cmd+Opt+T` (iTerm2's relocated New Tab) is left alone.
 fn is_terminal_split_key(key: KeyEvent) -> bool {
     let KeyCode::Char(c) = key.code else {
         return false;
@@ -82267,9 +82267,8 @@ fn cargo_package_relative(root: &Path, path: &Path) -> Option<String> {
     rel_to(root)
 }
 
-/// Returns true if the given key event should trigger "Save".
-/// Recognises Ctrl+S (cross-platform) and Cmd/Super+S (macOS-style).
-/// Case-insensitive on the letter so Shift+Ctrl+S also works.
+/// Whether typing `c` continues a word (a letter, a digit or `_`), so the
+/// completion list stays open.
 fn is_word_continuation(c: char) -> bool {
     c.is_alphanumeric() || c == '_'
 }
@@ -82576,27 +82575,6 @@ fn read_system_clipboard() -> Option<String> {
     crate::clipboard::read_string()
 }
 
-/// Copy `text` to the host system clipboard.
-///
-/// Order of attempts:
-///   1. **macOS native** — `clipboard::write_string` posts directly to
-///      `NSPasteboard.generalPasteboard` (with `pbcopy` as a process-level
-///      fall-back inside the same helper). This is the canonical Cocoa
-///      clipboard API and is the *only* path that survives every iTerm2
-///      configuration we have seen in the wild. OSC 52 is, empirically,
-///      silently dropped by iTerm2 in some setups even with
-///      `AllowClipboardAccess` enabled in `com.googlecode.iterm2` — and
-///      writing escape bytes directly to the alt-screen stdout always
-///      risks racing with the next ratatui frame.
-///   2. **OSC 52 fall-back** — only if the native write returned false
-///      (non-macOS croft binary on a Linux remote host, where the only
-///      hand-shake with the user's local terminal is via escape bytes
-///      through the SSH PTY). The fall-back is best-effort.
-///
-/// Returns true when the native path acknowledged the write so the call
-/// site can downgrade the status message if it ever needs to. Today all
-/// call sites discard the boolean; the return value is here so future
-/// code can branch on it.
 /// VS Code "Copy Relative Path" text: `path` relative to the workspace `root`,
 /// or the absolute `path` when it lives outside the root (never a `../` walk).
 /// Pure so the relativization is unit-tested without touching the clipboard.
@@ -82703,6 +82681,27 @@ fn cells_in(buf: &ratatui::buffer::Buffer, r: Rect) -> Vec<ratatui::buffer::Cell
     r.positions().map(|p| buf[p].clone()).collect()
 }
 
+/// Copy `text` to the host system clipboard.
+///
+/// Order of attempts:
+///   1. **macOS native** — `clipboard::write_string` posts directly to
+///      `NSPasteboard.generalPasteboard` (with `pbcopy` as a process-level
+///      fall-back inside the same helper). This is the canonical Cocoa
+///      clipboard API and is the *only* path that survives every iTerm2
+///      configuration we have seen in the wild. OSC 52 is, empirically,
+///      silently dropped by iTerm2 in some setups even with
+///      `AllowClipboardAccess` enabled in `com.googlecode.iterm2` — and
+///      writing escape bytes directly to the alt-screen stdout always
+///      risks racing with the next ratatui frame.
+///   2. **OSC 52 fall-back** — only if the native write returned false
+///      (non-macOS croft binary on a Linux remote host, where the only
+///      hand-shake with the user's local terminal is via escape bytes
+///      through the SSH PTY). The fall-back is best-effort.
+///
+/// Returns true when the native path acknowledged the write so the call
+/// site can downgrade the status message if it ever needs to. Today all
+/// call sites discard the boolean; the return value is here so future
+/// code can branch on it.
 fn copy_to_clipboard(text: &str) -> bool {
     crate::clipboard::remember_copy(text);
     if crate::clipboard::write_string(text) {
@@ -82877,8 +82876,6 @@ fn is_rename_symbol_key(key: KeyEvent) -> bool {
         && !key.modifiers.contains(KeyModifiers::ALT)
 }
 
-/// True for `.ts`/`.tsx`/`.js`/`.jsx` paths — the languages served by the
-/// croft-managed vtsls, used to re-open just those docs after vtsls installs.
 /// Collapse a language to the server "family" it shares a managed server with.
 /// vtsls serves the whole TypeScript/JS family but reports its config language
 /// as `TypeScript`, so all four map together; every other language is its own
@@ -85375,8 +85372,6 @@ fn compose_hover(diagnostic: Option<&str>, hover: Option<&str>) -> Option<String
 #[cfg(test)]
 mod tests;
 
-/// Stdout wrapper that tallies every byte ratatui flushes through the
-/// backend. The main loop reads + resets the counter once per frame to
 /// Action verb parsed from a participant-action row id (`grant:3` etc.).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ParticipantVerb {
@@ -85580,10 +85575,11 @@ fn participant_row(p: &crate::session_host::Participant) -> crate::widgets::list
     }
 }
 
-/// ratatui's writer. It counts the bytes each frame ships, to surface the
-/// per-frame payload size in the F8 perf HUD, and holds them until the frame
-/// flushes, so the whole frame reaches the terminal in one write. Straight
-/// through to stdout, a full repaint went out a kilobyte at a time,
+/// The stdout wrapper that is ratatui's writer. It counts the bytes each
+/// frame ships, to surface the per-frame payload size in the F8 perf HUD
+/// (which reads and resets the count once per frame), and holds them until
+/// the frame flushes, so the whole frame reaches the terminal in one write.
+/// Straight through to stdout, a full repaint went out a kilobyte at a time,
 /// tens of writes the terminal could draw between, so a launch's first frame
 /// visibly painted in; and every few-byte cursor move or colour change took
 /// stdout's lock on its way.
