@@ -52,9 +52,9 @@ see [docs/MACOS.md](docs/MACOS.md#spotlight-indexing-and-the-build-directory).
 * **Moving code between files?** Add the line `pure-move: true` to a commit
   message and CI proves every Rust item you touched moved byte for byte
   (visibility may widen, and rustfmt may lay out anew an item the wider
-  visibility made too long). `python3 scripts/check_pure_move.py list <file>` lists a file's items
-  with their line ranges, to plan the move. The split of `src/app/mod.rs`
-  (#2062) is done by `scripts/move_items.py --pr N`, from
+  visibility made too long). `python3 scripts/check_pure_move.py list <file>`
+  lists a file's items with their line ranges, to plan the move. The split of
+  `src/app/mod.rs` (#2062) is done by `scripts/move_items.py --pr N`, from
   `scripts/split_manifest.tsv`.
 * **New or changed module?** Update its entry in
   [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). CI fails if you shorten a

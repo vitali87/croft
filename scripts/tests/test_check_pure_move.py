@@ -144,6 +144,8 @@ class PureMoves(unittest.TestCase):
             ("type Value = (u8,\n);\n", "pub(super) type Value = (u8);\n", "a wrapped alias"),
             ("type Value = (u8,);\n", "pub(super) type Value = (u8);\n", "an alias"),
             ("fn f(_: (u8,)) {}\n", "pub(super) fn f(\n    _: (u8),\n) {}\n", "a wrapped parameter"),
+            ("fn f() -> (u8) {\n    0\n}\n", "pub(super) fn f() -> (\n    u8,\n) {\n    0\n}\n",
+             "a wrapped return type"),
             ("const X: u8 = { let (a,) = (1,); a };\n",
              "pub(super) const X: u8 = {\n    let (a) = (1,);\n    a\n};\n", "a pattern"),
         ]
