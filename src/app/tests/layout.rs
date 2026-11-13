@@ -2753,19 +2753,8 @@ fn a_failed_spawner_releases_the_lock_so_another_window_can_host() {
 fn status_elision_never_fires_on_a_message_that_fits() {
     let tmp = tempfile::tempdir().unwrap();
     // A git repo puts the branch segment in the bar, like any real session.
-    let git = |args: &[&str]| {
-        std::process::Command::new("git")
-            .arg("-C")
-            .arg(tmp.path())
-            .args(args)
-            .env("GIT_AUTHOR_NAME", "t")
-            .env("GIT_AUTHOR_EMAIL", "t@t")
-            .env("GIT_COMMITTER_NAME", "t")
-            .env("GIT_COMMITTER_EMAIL", "t@t")
-            .output()
-            .unwrap()
-    };
-    git(&["init", "-q", "-b", "main"]);
+    let git = |args: &[&str]| git_succeeds(tmp.path(), args);
+    git_init(tmp.path());
     std::fs::write(tmp.path().join("a.txt"), "x\n").unwrap();
     git(&["add", "-A"]);
     git(&["commit", "-qm", "init"]);

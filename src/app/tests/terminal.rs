@@ -2646,7 +2646,7 @@ fn terminal_clear_from_the_palette_empties_the_active_pane() {
     app.active_terminal = 1;
     await_terminal_probe(&mut app, "cleared-1562");
     app.focus_pane(Pane::Editor);
-    assert!(run_from_palette(&mut app, "Terminal: Clear"));
+    assert!(run_palette_row_titled(&mut app, "Terminal: Clear"));
     assert!(
         !app.terminals[1].visible_text().contains("cleared-1562"),
         "{}",

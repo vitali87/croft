@@ -1388,19 +1388,8 @@ fn code_scanning_follows_the_branch_when_on_and_only_says_so_when_prompting() {
     let home = tempfile::tempdir().unwrap();
     with_relay_home(home.path(), || {
         let tmp = tempfile::tempdir().unwrap();
-        let git = |args: &[&str]| {
-            let out = std::process::Command::new("git")
-                .arg("-C")
-                .arg(tmp.path())
-                .args(args)
-                .output()
-                .unwrap();
-            assert!(out.status.success(), "git {args:?}");
-            String::from_utf8_lossy(&out.stdout).trim().to_string()
-        };
-        git(&["init", "-q", "-b", "main"]);
-        git(&["config", "user.email", "a@b"]);
-        git(&["config", "user.name", "a"]);
+        let git = |args: &[&str]| git_ok(tmp.path(), args);
+        git_init_with_identity(tmp.path());
         std::fs::write(tmp.path().join("a.txt"), "a").unwrap();
         git(&["add", "."]);
         git(&["commit", "-q", "-m", "scanned"]);

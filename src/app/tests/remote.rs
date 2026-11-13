@@ -994,14 +994,7 @@ fn a_failed_provisioning_is_remembered_and_a_later_success_forgets_it() {
     // override so nothing touches this machine's real memory.
     let _serial = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
     let tmp = tempfile::tempdir().unwrap();
-    struct Restore;
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            *crate::paths::CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap() = None;
-        }
-    }
-    let _restore = Restore;
-    *crate::paths::CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap() = Some(tmp.path().join("cache"));
+    let _restore = override_cache_dir(tmp.path().join("cache"));
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     assert!(
         app.remote_offer_refused.is_empty(),
@@ -1040,15 +1033,8 @@ fn a_success_forgets_a_refusal_another_croft_recorded() {
     // host that demonstrably works for its whole seven-day TTL.
     let _serial = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
     let tmp = tempfile::tempdir().unwrap();
-    struct Restore;
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            *crate::paths::CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap() = None;
-        }
-    }
-    let _restore = Restore;
     let cache = tmp.path().join("cache");
-    *crate::paths::CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap() = Some(cache.clone());
+    let _restore = override_cache_dir(cache.clone());
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.remote_offer_refused.clear();
     let refused_path = crate::remote::refused_hosts_path(&cache);

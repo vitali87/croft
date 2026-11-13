@@ -1373,8 +1373,8 @@ fn render_merge_panes(
 fn clip_pad_cells(text: &str, skip: usize, width: usize) -> String {
     let mut out = String::new();
     let mut used = 0;
-    for c in text.chars().skip(skip) {
-        let w = char_cells(c);
+    let from = byte_index_of_char(text, skip);
+    for (c, w) in char_cells_from(&text[from..], cells_from(&text[..from], 0)) {
         if used + w > width {
             break;
         }
@@ -1464,14 +1464,24 @@ fn paint_intraline_range(
         buf.set_string(text_x, y, "\u{2039}", edge);
         return;
     }
+    use unicode_segmentation::UnicodeSegmentation;
     let mut cell = 0u16;
     let mut painted = false;
-    for (i, c) in text.chars().enumerate().skip(skip) {
-        let w = char_cells(c) as u16;
+    let from = byte_index_of_char(text, skip);
+    let mut col = cells_from(&text[..from], 0);
+    let mut i = skip;
+    // Cluster by cluster, as the text is drawn: a change to any character of
+    // one (`👍🏻` to `👍🏽` changes only the skin tone) marks the cells the
+    // whole cluster takes.
+    for cluster in text[from..].graphemes(true) {
+        let w = cluster_cells_at(cluster, col);
+        let n = cluster.chars().count();
+        col += w;
+        let w = w as u16;
         if cell + w > width {
             break;
         }
-        if (start..end).contains(&i) {
+        if start < i + n && i < end {
             for dx in 0..w {
                 let slot = &mut buf[(text_x + cell + dx, y)];
                 let ink = lift.ink(slot.fg);
@@ -1480,6 +1490,7 @@ fn paint_intraline_range(
             painted = true;
         }
         cell += w;
+        i += n;
     }
     if !painted {
         buf.set_string(text_x + width - 1, y, "\u{203a}", edge);
@@ -1508,15 +1519,15 @@ fn paint_diff_syntax(
     }
     let mut cell = 0u16;
     let mut next = 0;
-    for (i, (byte, c)) in text.char_indices().enumerate() {
+    let from = byte_index_of_char(text, skip);
+    let cells = char_cells_from(&text[from..], cells_from(&text[..from], 0));
+    for ((byte, _), (_, w)) in text[from..].char_indices().zip(cells) {
+        let byte = from + byte;
         // Spans arrive in order and do not overlap.
         while spans.get(next).is_some_and(|s| s.range().end <= byte) {
             next += 1;
         }
-        if i < skip {
-            continue;
-        }
-        let w = char_cells(c) as u16;
+        let w = w as u16;
         if cell + w > width {
             break;
         }
@@ -2433,12 +2444,9 @@ fn paint_diff_selection_band(
             if col == usize::MAX {
                 return usize::MAX;
             }
-            let drawn: usize = line
-                .chars()
-                .skip(diff.scroll_x)
-                .take(col.saturating_sub(diff.scroll_x))
-                .map(char_cells)
-                .sum();
+            let from = byte_index_of_char(line, diff.scroll_x);
+            let to = byte_index_of_char(line, col.max(diff.scroll_x));
+            let drawn = cells_from(&line[from..to], cells_from(&line[..from], 0));
             drawn + col.saturating_sub(line.chars().count().max(diff.scroll_x))
         };
         let cs_screen = to_cell(cs);
@@ -2540,23 +2548,23 @@ fn diff_side_line(
 }
 
 /// The char index of `text` drawn on screen cell `cell` when the row starts
-/// at char `skip` (tabs as [`char_cells`]). A cell past the end of the text
-/// counts on from its length, one char per cell, as before tabs had width.
+/// at char `skip` (cells as [`char_cells_from`] counts them). A cell past the
+/// end of the text counts on from its length, one char per cell, as before
+/// tabs had width.
 fn char_at_cell_from(text: &str, skip: usize, cell: usize) -> usize {
     let mut at = 0;
-    let mut len = 0;
-    for (i, c) in text.chars().enumerate() {
-        len = i + 1;
-        if i < skip {
-            continue;
-        }
-        let w = char_cells(c);
+    let from = byte_index_of_char(text, skip);
+    // Chars up to the row's first: `skip`, or the whole line when it is
+    // scrolled past its end.
+    let mut i = text[..from].chars().count();
+    for (_, w) in char_cells_from(&text[from..], cells_from(&text[..from], 0)) {
         if cell < at + w {
             return i;
         }
         at += w;
+        i += 1;
     }
-    len.max(skip) + cell.saturating_sub(at)
+    i.max(skip) + cell.saturating_sub(at)
 }
 
 /// Paint `‹` and `›` glyphs at the right edge of a diff header so the
@@ -5874,6 +5882,7 @@ impl Editor {
     /// buffer, the width or the Tab Size changes. Drives the horizontal
     /// scrollbar's content extent and the `scroll_col` clamp. `&mut self` so the lazy recompute can populate the cache.
     fn content_cols(&mut self, width: usize) -> usize {
+        use unicode_segmentation::UnicodeSegmentation;
         self.sync_tab_cells();
         let tab = char_cells('\t');
         if let Some((w, t, cols)) = self.hscroll_content_cols
@@ -5902,16 +5911,30 @@ impl Editor {
                 // extent is in the same char columns: how far the line must
                 // scroll for its tail to fit `width` cells, plus `width`, so
                 // that `extent - width` is exactly that scroll.
-                let chars: Vec<char> = l.chars().collect();
-                if cells_of(&chars) + extra <= width {
-                    return chars.len() + extra;
+                // Tab stops count from the line's left edge, so the tail from
+                // char `first` takes `col - start(first)` cells, which shrinks
+                // as `first` grows: the scroll is the first grapheme cluster
+                // starting at or past the `col + extra - width` cells that must
+                // scroll off. A whole cluster, never a char inside one: the row
+                // scrolled to `👍🏽`'s skin tone draws the tone on its own, two
+                // cells wider than the tail measured here. Two passes and no
+                // table per char, which on a huge one-line file was hundreds of
+                // MB before the first frame.
+                let (col, len) =
+                    char_cells_from(l, 0).fold((0, 0), |(col, n), (_, w)| (col + w, n + 1));
+                if col + extra <= width {
+                    return len + extra;
                 }
-                let (mut first, mut tail) = (chars.len(), extra);
-                while first > 0 && tail + char_cells(chars[first - 1]) <= width {
-                    first -= 1;
-                    tail += char_cells(chars[first]);
+                let off = col + extra - width;
+                let (mut at, mut first) = (0, 0);
+                for cluster in l.graphemes(true) {
+                    if at >= off {
+                        return first + width;
+                    }
+                    at += cluster_cells_at(cluster, at);
+                    first += cluster.chars().count();
                 }
-                first + width
+                len + width
             })
             .max()
             .unwrap_or(0);
@@ -5942,7 +5965,7 @@ impl Editor {
         let mut out = Vec::new();
         for line in body.split('\n') {
             let chars: Vec<char> = line.chars().collect();
-            for &(s, e) in &wrap_segments(&chars, bw) {
+            for &(s, e) in &wrap_segments(line, bw) {
                 out.push(chars[s..e].iter().collect());
             }
         }
@@ -6134,12 +6157,7 @@ impl Editor {
 
     /// Wrap segments of a single logical line at the given text width.
     fn line_segments(&self, line: usize, width: usize) -> Vec<(usize, usize)> {
-        let chars: Vec<char> = self
-            .lines
-            .get(line)
-            .map(|l| l.chars().collect())
-            .unwrap_or_default();
-        wrap_segments(&chars, width)
+        wrap_segments(self.lines.get(line).map_or("", String::as_str), width)
     }
 
     /// Number of visual rows a logical line occupies. Avoids allocating the
@@ -9783,6 +9801,35 @@ impl Editor {
     /// The indentation unit as text for the active style: N spaces or one tab.
     fn indent_unit(&self) -> String {
         self.indent_style().unit()
+    }
+
+    /// The display cell a row showing `line` from char `start` begins at, for
+    /// tab stops: a wrapped row counts from its own left edge, a flat one
+    /// from the line's (the cells scrolled past).
+    fn row_origin(&self, line: &str, start: usize) -> usize {
+        if self.wrap_enabled() {
+            0
+        } else {
+            cells_before(line, start)
+        }
+    }
+
+    /// The caret's column as the status bar shows it, counted in display
+    /// cells from 1: a tab moves it to the next tab stop, as in VS Code and
+    /// vim, so it agrees with where the caret is drawn.
+    pub fn cursor_visual_col(&self) -> usize {
+        self.sync_tab_cells();
+        // Only a tab is more than one column; any other character, a wide
+        // one or each part of `👍🏽` included, counts one, exactly as VS
+        // Code's status bar counts (`CursorColumns.toStatusbarColumn`).
+        self.lines
+            .get(self.cursor_row)
+            .map_or(self.cursor_col, |l| {
+                l.chars().take(self.cursor_col).fold(0, |col, c| {
+                    col + if c == '\t' { tab_cells_at(col) } else { 1 }
+                })
+            })
+            + 1
     }
 
     /// Make `\t` measure and paint as this buffer's Tab Size from here on.
@@ -16856,9 +16903,16 @@ impl Editor {
         self.cursor_row = line;
         self.cursor_col = self.cursor_col.min(self.line_char_len(line));
         let viewport = self.text_rows();
-        self.scroll = line
-            .saturating_sub(viewport / 2)
-            .min(self.lines.len().saturating_sub(viewport));
+        if viewport == 0 {
+            // Not rendered yet (a file opened for the first time has no
+            // geometry), so there is no middle to find: leave a few lines of
+            // context above the target and let the first render follow.
+            self.scroll = line.saturating_sub(5);
+        } else {
+            self.scroll = line
+                .saturating_sub(viewport / 2)
+                .min(self.lines.len().saturating_sub(viewport));
+        }
         self.last_edit_kind = None;
     }
 
@@ -17271,6 +17325,7 @@ impl Editor {
         row.fill(
             &text[byte_index_of_char(text, base)..],
             base,
+            self.row_origin(text, base),
             self.row_inlay_spans(line)
                 .iter()
                 .filter(|(hc, _, _)| *hc >= base)
@@ -19692,8 +19747,64 @@ fn char_cells(c: char) -> usize {
     }
 }
 
-fn cells_of(chars: &[char]) -> usize {
-    chars.iter().map(|&c| char_cells(c)).sum()
+/// Cells a tab takes when it starts at display cell `col` of its row: up to
+/// the next multiple of Tab Size, as in vim and VS Code, so text after a tab
+/// lines up whatever came before it.
+fn tab_cells_at(col: usize) -> usize {
+    let t = TAB_CELLS.with(std::cell::Cell::get).max(1);
+    t - col % t
+}
+
+/// Cells `c` takes when it starts at display cell `col`.
+fn char_cells_at(c: char, col: usize) -> usize {
+    if c == '\t' {
+        tab_cells_at(col)
+    } else {
+        char_cells(c)
+    }
+}
+
+/// Cells the grapheme cluster `cluster` takes when it starts at display cell
+/// `col`. ratatui paints a cluster as one glyph sized by the whole cluster
+/// (`crate::cell_map`): `👍🏽` is two cells, not four, and `❤️` two, not one.
+/// A lone character keeps [`char_cells_at`], so a tab runs to the next stop
+/// (a tab is always a cluster of its own).
+fn cluster_cells_at(cluster: &str, col: usize) -> usize {
+    let mut chars = cluster.chars();
+    match (chars.next(), chars.next()) {
+        (Some(c), None) => char_cells_at(c, col),
+        (Some(_), Some(_)) => unicode_width::UnicodeWidthStr::width(cluster),
+        (None, _) => 0,
+    }
+}
+
+/// Each character of `text` with the cells it takes when `text` starts at
+/// display cell `origin` of its row: a cluster's first character takes the
+/// whole cluster's cells ([`cluster_cells_at`]) and the rest none. Everything
+/// that measures text for tab stops goes through here, so the drawing, the
+/// caret and clicks agree on where a tab after an emoji ends.
+fn char_cells_from(text: &str, origin: usize) -> impl Iterator<Item = (char, usize)> + '_ {
+    use unicode_segmentation::UnicodeSegmentation;
+    let mut col = origin;
+    text.graphemes(true).flat_map(move |cluster| {
+        let w = cluster_cells_at(cluster, col);
+        col += w;
+        cluster
+            .chars()
+            .enumerate()
+            .map(move |(i, c)| (c, if i == 0 { w } else { 0 }))
+    })
+}
+
+/// Cells `text` takes from display cell `origin` of its row on.
+fn cells_from(text: &str, origin: usize) -> usize {
+    char_cells_from(text, origin).map(|(_, w)| w).sum()
+}
+
+/// Display cells of the first `chars` characters of `line`, from the line's
+/// left edge: where its character number `chars` starts.
+fn cells_before(line: &str, chars: usize) -> usize {
+    cells_from(&line[..byte_index_of_char(line, chars)], 0)
 }
 
 /// `text` as the editor paints it: each tab as the blank cells it takes
@@ -19701,65 +19812,79 @@ fn cells_of(chars: &[char]) -> usize {
 /// count for it. ratatui drops control characters, so a raw tab took no
 /// cell and the text after it slid left under all of them (#891).
 fn blank_tabs(text: &str) -> std::borrow::Cow<'_, str> {
-    if text.contains('\t') {
-        text.replace('\t', &" ".repeat(char_cells('\t'))).into()
-    } else {
-        text.into()
+    blank_tabs_from(text, 0)
+}
+
+/// [`blank_tabs`] for text that starts at display cell `origin` of its row,
+/// so each tab fills up to the next tab stop.
+fn blank_tabs_from(text: &str, origin: usize) -> std::borrow::Cow<'_, str> {
+    if !text.contains('\t') {
+        return text.into();
     }
+    let mut out = String::with_capacity(text.len() + 8);
+    for (c, w) in char_cells_from(text, origin) {
+        if c == '\t' {
+            out.extend(std::iter::repeat_n(' ', w));
+        } else {
+            out.push(c);
+        }
+    }
+    out.into()
 }
 
 /// Soft-wrap a logical line into visual segments for word-wrap mode.
 ///
-/// Each segment is a half-open `(start_char, end_char)` range over `chars`;
-/// the segments tile the line with no gaps or overlaps, so the inverse maps
-/// (cursor -> screen, click -> cursor) stay exact. Breaks after the last
-/// break-after character at or before `width` when one exists (word wrap), and
-/// hard-breaks a single token longer than `width` at the column. A line that
-/// already fits, an empty line, or `width == 0` yields one segment so the line
-/// still occupies a row. Mirrors VS Code's monospace wrap: pick the rightmost
-/// break opportunity within the column, else split the over-long token.
-fn wrap_segments(chars: &[char], width: usize) -> Vec<(usize, usize)> {
-    if width == 0 || chars.len() <= width && cells_of(chars) <= width {
-        return vec![(0, chars.len())];
+/// Each segment is a half-open `(start_char, end_char)` range over the chars
+/// of `line`; the segments tile the line with no gaps or overlaps, so the
+/// inverse maps (cursor -> screen, click -> cursor) stay exact. Breaks after
+/// the last break-after character at or before `width` when one exists (word
+/// wrap), and hard-breaks a single token longer than `width` at the column. A
+/// line that already fits, an empty line, or `width == 0` yields one segment
+/// so the line still occupies a row. Mirrors VS Code's monospace wrap: pick
+/// the rightmost break opportunity within the column, else split the
+/// over-long token.
+fn wrap_segments(line: &str, width: usize) -> Vec<(usize, usize)> {
+    if width == 0 {
+        return vec![(0, line.chars().count())];
     }
     let mut segs = Vec::new();
-    let mut start = 0;
-    while start < chars.len() {
-        if cells_of(&chars[start..]) <= width {
-            segs.push((start, chars.len()));
-            break;
-        }
+    let (mut start, mut start_byte) = (0, 0);
+    loop {
+        // A wrapped row counts tab stops from its own left edge, so each row
+        // is measured as text of its own ([`char_cells_from`]). One pass per
+        // row and nothing kept per char: a huge one-line file wraps without
+        // a table the size of the file.
+        let row = &line[start_byte..];
+        let (mut end, mut end_byte, mut used) = (start, start_byte, 0);
+        // The rightmost break-after char so far, as the `(char, byte)` just
+        // past it; never right at the row's start, so a row is never one
+        // char by a break (or stalls).
+        let mut brk = None;
+        let mut fits = true;
         // The hard limit counts CELLS, as the renderer clips: counted in
         // chars, a row of wide (CJK) characters was twice as wide as the
         // pane and its second half was never shown on any row. At least one
         // char per row, so a char wider than the pane cannot stall.
-        let mut limit = start;
-        let mut used = 0;
-        while limit < chars.len() {
-            let w = char_cells(chars[limit]);
-            if used + w > width && limit > start {
+        for ((at, c), (_, w)) in row.char_indices().zip(char_cells_from(row, 0)) {
+            if used + w > width && end > start {
+                fits = false;
                 break;
             }
             used += w;
-            limit += 1;
-        }
-        // Scan back from the hard limit for the rightmost break-after char;
-        // `i` is the char count, so the char sits at `chars[i - 1]` and the
-        // segment becomes `[start, i)`. Stop at `start + 1` so a break right
-        // at the segment start can't produce a one-char row (or stall).
-        let mut brk = limit;
-        let mut i = limit;
-        while i > start + 1 {
-            if is_wrap_break_after(chars[i - 1]) {
-                brk = i;
-                break;
+            end += 1;
+            end_byte = start_byte + at + c.len_utf8();
+            if end > start + 1 && is_wrap_break_after(c) {
+                brk = Some((end, end_byte));
             }
-            i -= 1;
         }
-        segs.push((start, brk));
-        start = brk;
+        if fits {
+            segs.push((start, end));
+            return segs;
+        }
+        (end, end_byte) = brk.unwrap_or((end, end_byte));
+        segs.push((start, end));
+        (start, start_byte) = (end, end_byte);
     }
-    segs
 }
 
 /// Map 1-based bookmark `marks` across a buffer change from `old` to `new`.
@@ -20146,29 +20271,40 @@ fn merge_overlay(base: &[HiSpan], over: &[HiSpan]) -> Vec<HiSpan> {
     out
 }
 
-fn build_line_spans<'a>(line: &'a str, spans: &[HiSpan]) -> Vec<Span<'a>> {
+/// `origin` is the display cell `line` starts at in its row (tab stops).
+fn build_line_spans<'a>(line: &'a str, spans: &[HiSpan], origin: usize) -> Vec<Span<'a>> {
     if spans.is_empty() {
-        return vec![Span::raw(blank_tabs(line))];
+        return vec![Span::raw(blank_tabs_from(line, origin))];
     }
     let mut out: Vec<Span> = Vec::with_capacity(spans.len() * 2);
     let mut cursor = 0usize;
+    // Display cells painted so far, from the row's left edge.
+    let mut col = origin;
+    let mut push = |out: &mut Vec<Span<'a>>, text: &'a str, style: Option<Style>| {
+        let shown = blank_tabs_from(text, col);
+        col += cells_from(text, col);
+        out.push(match style {
+            Some(st) => Span::styled(shown, st),
+            None => Span::raw(shown),
+        });
+    };
     for sp in spans {
         let range = sp.range();
         if range.start > cursor && range.start <= line.len() {
             let slice = &line[cursor..range.start];
             if !slice.is_empty() {
-                out.push(Span::raw(blank_tabs(slice)));
+                push(&mut out, slice, None);
             }
         }
         let s = range.start.min(line.len());
         let e = range.end.min(line.len());
         if e > s {
-            out.push(Span::styled(blank_tabs(&line[s..e]), sp.style));
+            push(&mut out, &line[s..e], Some(sp.style));
             cursor = e;
         }
     }
     if cursor < line.len() {
-        out.push(Span::raw(blank_tabs(&line[cursor..])));
+        push(&mut out, &line[cursor..], None);
     }
     out
 }
@@ -20995,8 +21131,9 @@ impl Widget for &mut Editor {
             let byte_end = byte_index_of_char(raw, row_end);
             // A wrapped row's width in CELLS, which is what the painters clip
             // by: its char count cut a row of wide characters in half.
+            let row_origin = self.row_origin(raw, row_start);
             let row_width = {
-                let cells: usize = raw[byte_start..byte_end].chars().map(char_cells).sum();
+                let cells: usize = cells_from(&raw[byte_start..byte_end], row_origin);
                 cells.max(row_end - row_start).min(text_width as usize) as u16
             };
             let visible_raw = &raw[byte_start..byte_end];
@@ -21020,6 +21157,7 @@ impl Widget for &mut Editor {
             row_cells.fill(
                 visible_raw,
                 row_start,
+                row_origin,
                 self.row_inlay_spans(line_idx)
                     .iter()
                     .filter(|(hc, _, _)| *hc >= row_start && *hc <= hint_cap)
@@ -21032,7 +21170,7 @@ impl Widget for &mut Editor {
                     .into_iter()
                     .filter_map(|sp| sp.clipped(seg_bytes))
                     .collect();
-                let spans = build_line_spans(visible_raw, &shifted);
+                let spans = build_line_spans(visible_raw, &shifted, row_origin);
                 buf.set_line(text_x, y, &Line::from(spans), row_width);
             } else {
                 // Splice each hint label between the text segments it splits.
@@ -21049,7 +21187,13 @@ impl Widget for &mut Editor {
                     .filter(|(hc, _, _)| *hc >= row_start && *hc <= hint_cap)
                 {
                     if *hcol > from {
-                        out.extend(inlay_text_segment(raw, &merged, from, *hcol));
+                        out.extend(inlay_text_segment(
+                            raw,
+                            &merged,
+                            (row_start, row_origin),
+                            from,
+                            *hcol,
+                        ));
                     }
                     // A color swatch paints in ITS color (#254); plain
                     // hints keep the dim italic Zed look.
@@ -21061,7 +21205,13 @@ impl Widget for &mut Editor {
                     from = from.max(*hcol);
                 }
                 if row_end > from {
-                    out.extend(inlay_text_segment(raw, &merged, from, row_end));
+                    out.extend(inlay_text_segment(
+                        raw,
+                        &merged,
+                        (row_start, row_origin),
+                        from,
+                        row_end,
+                    ));
                 }
                 buf.set_line(text_x, y, &Line::from(out), row_width);
             }
@@ -21151,7 +21301,11 @@ impl Widget for &mut Editor {
                 let geometry = if guide_src == line_idx {
                     &row_cells
                 } else {
-                    src_cells = RowCells::of_line(&self.lines[guide_src], row_start);
+                    src_cells = RowCells::of_line_at(
+                        &self.lines[guide_src],
+                        row_start,
+                        self.row_origin(&self.lines[guide_src], row_start),
+                    );
                     &src_cells
                 };
                 for c in (0..guide_width).step_by(guide_step) {
@@ -21714,6 +21868,7 @@ impl Widget for &mut Editor {
                 &caret_raw[byte_index_of_char(caret_raw, caret_start)
                     ..byte_index_of_char(caret_raw, caret_end)],
                 caret_start,
+                self.row_origin(caret_raw, caret_start),
                 self.row_inlay_spans(*cl)
                     .iter()
                     .filter(|(hc, _, _)| *hc >= caret_start && *hc <= hint_cap)
@@ -21976,7 +22131,7 @@ impl Editor {
             .into_iter()
             .filter_map(|sp| sp.clipped(raw_bytes))
             .collect();
-        let spans = build_line_spans(raw, &clamped);
+        let spans = build_line_spans(raw, &clamped, 0);
         buf.set_line(text_x, y, &Line::from(spans), width);
     }
 
@@ -22020,8 +22175,8 @@ impl Editor {
             // text column: past the pane edge or onto the vertical scrollbar.
             // In cells, as the row was painted: wide characters before the
             // caret push it right by two each.
-            let visible_col =
-                RowCells::of_line(&self.lines[self.cursor_row], start).text_before(self.cursor_col);
+            let visible_col = RowCells::of_line_at(&self.lines[self.cursor_row], start, 0)
+                .text_before(self.cursor_col);
             let x = text_x as usize + visible_col;
             let right = (self.last_inner.x + self.last_inner.width)
                 .saturating_sub(u16::from(self.last_scrollbar.width > 0))
@@ -22131,11 +22286,9 @@ impl Editor {
         // Cells, not chars: a tab before the caret is Tab Size cells wide.
         self.sync_tab_cells();
         let line = diff_side_line(diff, row_idx, side);
-        let before = line
-            .chars()
-            .skip(diff.scroll_x)
-            .take(char_col - diff.scroll_x);
-        let drawn = before.map(char_cells).sum::<usize>();
+        let from = byte_index_of_char(line, diff.scroll_x);
+        let to = byte_index_of_char(line, char_col.max(diff.scroll_x));
+        let drawn = cells_from(&line[from..to], cells_from(&line[..from], 0));
         let line_len = line.chars().count();
         // Past the end of the text the caret counts one cell per char.
         let vis_col = drawn + char_col.saturating_sub(line_len.max(diff.scroll_x));
@@ -22190,34 +22343,37 @@ impl RowCells {
     /// The geometry of a row showing `line` from buffer column `start`, with
     /// no inlay hints.
     fn of_line(line: &str, start: usize) -> Self {
+        Self::of_line_at(line, start, cells_before(line, start))
+    }
+
+    /// [`Self::of_line`] for a row whose first cell is display cell `origin`
+    /// of its tab stops: 0 for a wrapped row, the cells scrolled past for a
+    /// horizontally scrolled one.
+    fn of_line_at(line: &str, start: usize, origin: usize) -> Self {
         let mut row = Self::default();
-        row.fill(&line[byte_index_of_char(line, start)..], start, []);
+        row.fill(&line[byte_index_of_char(line, start)..], start, origin, []);
         row
     }
 
     /// Refill for a row painting `text` from buffer column `start` with
     /// `hints` spliced in, reusing the allocations.
-    fn fill(&mut self, text: &str, start: usize, hints: impl IntoIterator<Item = (usize, usize)>) {
-        use unicode_segmentation::UnicodeSegmentation;
+    fn fill(
+        &mut self,
+        text: &str,
+        start: usize,
+        origin: usize,
+        hints: impl IntoIterator<Item = (usize, usize)>,
+    ) {
         self.start = start;
         self.before.clear();
         self.before.push(0);
         let mut cells = 0;
-        // ratatui paints a grapheme cluster as one glyph sized by the whole
-        // cluster (`crate::cell_map`): `👍🏽` is two cells, not four, and `❤️`
-        // two, not one. The cluster's first character takes those cells and
-        // the rest none; a lone character keeps `char_cells`.
-        for cluster in text.graphemes(true) {
-            let mut chars = cluster.chars();
-            let first = chars.next().map_or(0, char_cells);
-            cells += match chars.clone().next() {
-                None => first,
-                Some(_) => unicode_width::UnicodeWidthStr::width(cluster),
-            };
+        // Tab stops count from the row's left edge, `origin` cells before its
+        // first character. A grapheme cluster's first character takes the
+        // whole cluster's cells and the rest none ([`char_cells_from`]).
+        for (_, w) in char_cells_from(text, origin) {
+            cells += w;
             self.before.push(cells);
-            for _ in chars {
-                self.before.push(cells);
-            }
         }
         self.hints.clear();
         self.hints.extend(hints);
@@ -22295,6 +22451,7 @@ fn paint_row_cells(
 fn inlay_text_segment<'a>(
     raw: &'a str,
     merged: &[HiSpan],
+    row: (usize, usize),
     from: usize,
     to: usize,
 ) -> Vec<Span<'a>> {
@@ -22306,7 +22463,11 @@ fn inlay_text_segment<'a>(
         .into_iter()
         .filter_map(|sp| sp.clipped(seg_bytes))
         .collect();
-    build_line_spans(seg, &shifted)
+    // Tab stops count from the row's left edge: its first char is `row.0`,
+    // which sits at display cell `row.1` (hint labels do not count).
+    let row_start = byte_index_of_char(raw, row.0).min(byte_from);
+    let origin = row.1 + cells_from(&raw[row_start..byte_from], row.1);
+    build_line_spans(seg, &shifted, origin)
 }
 
 /// The (inactive, active) find-highlight styles, shared by the editor's
@@ -36733,33 +36894,29 @@ mod tests {
 
     #[test]
     fn build_line_spans_no_highlights() {
-        let spans = build_line_spans("hello", &[]);
+        let spans = build_line_spans("hello", &[], 0);
         assert_eq!(spans.len(), 1);
-    }
-
-    fn chars(s: &str) -> Vec<char> {
-        s.chars().collect()
     }
 
     #[test]
     fn wrap_segments_short_line_is_one_segment() {
-        assert_eq!(wrap_segments(&chars("hello"), 20), vec![(0, 5)]);
-        assert_eq!(wrap_segments(&chars(""), 20), vec![(0, 0)]);
+        assert_eq!(wrap_segments("hello", 20), vec![(0, 5)]);
+        assert_eq!(wrap_segments("", 20), vec![(0, 0)]);
         // width 0 must not loop forever - one segment covering the line.
-        assert_eq!(wrap_segments(&chars("abc"), 0), vec![(0, 3)]);
+        assert_eq!(wrap_segments("abc", 0), vec![(0, 3)]);
     }
 
     #[test]
     fn wrap_segments_breaks_after_a_space() {
         // "the quick brown" at width 10 breaks after "the quick " (10 chars).
-        let segs = wrap_segments(&chars("the quick brown"), 10);
+        let segs = wrap_segments("the quick brown", 10);
         assert_eq!(segs, vec![(0, 10), (10, 15)]);
     }
 
     #[test]
     fn wrap_segments_hard_breaks_a_too_long_word() {
         // No space in the first 6 chars, so the word is split at the column.
-        let segs = wrap_segments(&chars("abcdefghij"), 6);
+        let segs = wrap_segments("abcdefghij", 6);
         assert_eq!(segs, vec![(0, 6), (6, 10)]);
     }
 
@@ -36767,18 +36924,18 @@ mod tests {
     fn wrap_segments_breaks_after_punctuation_like_vscode() {
         // VS Code breaks after `/` (a break-after char), so a path folds at
         // the slash rather than mid-segment.
-        let segs = wrap_segments(&chars("abc/defgh"), 6);
+        let segs = wrap_segments("abc/defgh", 6);
         assert_eq!(segs, vec![(0, 4), (4, 9)]);
     }
 
     #[test]
     fn wrap_segments_count_wide_characters_as_two_cells() {
         let line: String = std::iter::repeat_n('漢', 60).collect();
-        let segs = wrap_segments(&chars(&line), 30);
+        let segs = wrap_segments(&line, 30);
         assert_eq!(segs.len(), 4, "{segs:?}");
         assert!(segs.iter().all(|&(s, e)| e - s == 15), "{segs:?}");
         // A char wider than the pane still makes progress.
-        assert_eq!(wrap_segments(&chars("漢漢"), 1), vec![(0, 1), (1, 2)]);
+        assert_eq!(wrap_segments("漢漢", 1), vec![(0, 1), (1, 2)]);
     }
 
     #[test]
@@ -36822,10 +36979,24 @@ mod tests {
         }
     }
 
+    /// Each wrapped row counts tab stops from its own left edge: `⇥ef` on
+    /// the second row is 4 + 2 cells, so it fits in 6.
+    #[test]
+    fn wrap_segments_count_tab_stops_from_each_rows_left_edge() {
+        set_tab_cells(4);
+        assert_eq!(wrap_segments("abcd\tef", 6), vec![(0, 4), (4, 7)]);
+        assert_eq!(
+            wrap_segments("ab\tc", 5),
+            vec![(0, 4)],
+            "the tab stops at 4"
+        );
+        assert_eq!(wrap_segments("ab\tc", 4), vec![(0, 3), (3, 4)]);
+    }
+
     #[test]
     fn wrap_segments_tile_the_line_without_gaps() {
         let line = "alpha beta gamma delta epsilon zeta eta theta";
-        let segs = wrap_segments(&chars(line), 12);
+        let segs = wrap_segments(line, 12);
         assert_eq!(segs.first().unwrap().0, 0);
         assert_eq!(segs.last().unwrap().1, line.chars().count());
         for pair in segs.windows(2) {
@@ -36840,7 +37011,7 @@ mod tests {
             end: 5,
             style: Style::default(),
         }];
-        let spans = build_line_spans("hello", &hi);
+        let spans = build_line_spans("hello", &hi, 0);
         assert_eq!(spans.len(), 1);
     }
 
@@ -36851,7 +37022,7 @@ mod tests {
             end: 3,
             style: Style::default(),
         }];
-        let spans = build_line_spans("abcde", &hi);
+        let spans = build_line_spans("abcde", &hi, 0);
         // Expect: "a", "bc", "de"
         assert_eq!(spans.len(), 3);
     }
@@ -37244,8 +37415,8 @@ mod tests {
             let text_x = e.last_inner.x + e.last_gutter_width + 1;
             let y = e.last_inner.y;
             assert_eq!(
-                row_text(&buf, y, text_x, text_x + 11),
-                "x    y    z",
+                row_text(&buf, y, text_x, text_x + 9),
+                "x   y   z",
                 "wrap {wrap}"
             );
             let (cx, cy) = e.cursor_screen_pos().expect("the caret is on screen");
@@ -37255,7 +37426,7 @@ mod tests {
                 "the caret sits on z, wrap {wrap}"
             );
             assert_eq!(
-                e.buffer_pos_at(text_x + 5, y),
+                e.buffer_pos_at(text_x + 4, y),
                 Some((0, 2)),
                 "a click on y lands on y, wrap {wrap}"
             );
@@ -37281,6 +37452,82 @@ mod tests {
             assert_eq!(buf[(z_cell, y)].symbol(), "z", "tab size {width}");
             assert_eq!(e.cursor_screen_pos(), Some((z_cell, y)), "tab size {width}");
             assert_eq!(e.buffer_pos_at(z_cell, y), Some((0, 2)), "tab size {width}");
+        }
+    }
+
+    /// A tab runs to the next tab stop, so text after tabs lines up in columns
+    /// whatever sits before them (vim, VS Code), and Col counts those cells.
+    #[test]
+    fn a_tab_runs_to_the_next_tab_stop() {
+        let mut e = editor_with(" *   bits\t\tmodifier\n *   is_text\tthe key\n\tx\nab\tc");
+        e.set_indent_style(IndentStyle {
+            width: 8,
+            use_spaces: false,
+        });
+        e.wrap_override = Some(false);
+        let buf = guide_buf(&mut e, 60, 8);
+        let text_x = e.last_inner.x + e.last_gutter_width + 1;
+        let y0 = e.last_inner.y;
+        let row = |r: u16| -> Vec<String> {
+            (0..40)
+                .map(|x| buf[(text_x + x, y0 + r)].symbol().to_string())
+                .collect()
+        };
+        let find = |r: u16, s: &str| row(r).iter().position(|c| c == s);
+        // "bits" ends at cell 9, "is_text" at 12: both second words start at
+        // the stops 16 and 24 resp. 16, so "modifier" and "the key" line up
+        // only where the stops do.
+        assert_eq!(find(0, "m"), Some(24), "{:?}", row(0));
+        assert_eq!(
+            find(1, "k"),
+            Some(20),
+            "the key starts at the stop 16: {:?}",
+            row(1)
+        );
+        assert_eq!(find(2, "x"), Some(8));
+        assert_eq!(find(3, "c"), Some(8), "ab then a tab to the stop");
+        // The caret, a click and Col agree with the drawing.
+        e.cursor_row = 3;
+        e.cursor_col = 3;
+        assert_eq!(e.cursor_screen_pos(), Some((text_x + 8, y0 + 3)));
+        assert_eq!(e.buffer_pos_at(text_x + 8, y0 + 3), Some((3, 3)));
+        assert_eq!(
+            e.buffer_pos_at(text_x + 2, y0 + 3),
+            Some((3, 2)),
+            "the tab starts at cell 2"
+        );
+        assert_eq!(e.cursor_visual_col(), 9, "ab, the tab's 6 cells, then c");
+        e.cursor_row = 2;
+        e.cursor_col = 1;
+        assert_eq!(e.cursor_visual_col(), 9, "after one tab at Tab Size 8");
+        e.cursor_col = 0;
+        assert_eq!(e.cursor_visual_col(), 1);
+    }
+
+    /// A tab after a grapheme cluster runs from where the cluster ends as
+    /// drawn: `👍🏽` is two cells, not the four its two characters measure one
+    /// by one, so the text after the tab, the caret and a click agree.
+    #[test]
+    fn a_tab_after_an_emoji_cluster_counts_from_its_drawn_cells() {
+        for wrap in [false, true] {
+            let mut e = editor_with("\u{1f44d}\u{1f3fd}\tX");
+            e.set_indent_style(IndentStyle {
+                width: 4,
+                use_spaces: false,
+            });
+            e.wrap_override = Some(wrap);
+            let buf = guide_buf(&mut e, 40, 4);
+            let text_x = e.last_inner.x + e.last_gutter_width + 1;
+            let y = e.last_inner.y;
+            assert_eq!(buf[(text_x + 4, y)].symbol(), "X", "wrap {wrap}");
+            e.cursor_col = 3;
+            assert_eq!(e.cursor_screen_pos(), Some((text_x + 4, y)), "wrap {wrap}");
+            assert_eq!(
+                e.buffer_pos_at(text_x + 4, y),
+                Some((0, 3)),
+                "a click on X lands before X, wrap {wrap}"
+            );
+            assert_eq!(e.cursor_visual_col(), 5, "the cluster counts one column");
         }
     }
 
@@ -37355,6 +37602,23 @@ mod tests {
             use_spaces: false,
         });
         assert_eq!(e.content_cols(30), 10, "20 cells fit in 30");
+        // `ab⇥c` at Tab Size 8 is 9 cells, the tab running from cell 2 to 8:
+        // in 5 cells only `c` fits, so 3 chars scroll off.
+        e.lines = vec!["ab\tc".to_string()];
+        e.set_indent_style(IndentStyle {
+            width: 8,
+            use_spaces: false,
+        });
+        assert_eq!(e.content_cols(5), 3 + 5);
+        // `⇥👍🏽123456789` at Tab Size 4 is 15 cells. The scroll that shows its
+        // tail in 10 passes the whole emoji, not just its first char, which
+        // would leave the skin tone drawn alone and the last digit cut off.
+        e.lines = vec!["\t\u{1f44d}\u{1f3fd}123456789".to_string()];
+        e.set_indent_style(IndentStyle {
+            width: 4,
+            use_spaces: false,
+        });
+        assert_eq!(e.content_cols(10), 3 + 10);
     }
 
     #[test]
@@ -38342,6 +38606,51 @@ mod tests {
         assert_eq!(clip_pad_cells("日本語", 0, 5), "日本 ");
         assert_eq!(clip_pad_cells("日本語", 1, 6), "本語  ");
         assert_eq!(clip_pad_cells("ab日", 0, 3), "ab ");
+    }
+
+    /// The diff measures a tab after a grapheme cluster from the cells the
+    /// cluster is drawn in, so its text, marks and clicks stay together.
+    #[test]
+    fn the_diff_counts_a_tab_after_an_emoji_cluster_from_its_drawn_cells() {
+        set_tab_cells(4);
+        let line = "\u{1f44d}\u{1f3fd}\tX";
+        assert_eq!(clip_pad_cells(line, 0, 6), "\u{1f44d}\u{1f3fd}  X ");
+        assert_eq!(char_at_cell_from(line, 0, 4), 3, "a click on X lands on X");
+    }
+
+    /// A change to a character inside a grapheme cluster, such as only the
+    /// skin tone of `👍🏽`, marks the cells the whole cluster is drawn in.
+    #[test]
+    fn a_change_inside_an_emoji_cluster_marks_the_whole_cluster() {
+        let mut buf = Buffer::empty(Rect::new(0, 0, 6, 1));
+        let bg = Color::Red;
+        let line = "a\u{1f44d}\u{1f3fd}b";
+        paint_intraline_range(&mut buf, 0, 0, 6, line, 0, (2, 3), bg, Color::White, None);
+        let marked: Vec<bool> = (0..6).map(|x| buf[(x, 0)].bg == bg).collect();
+        assert_eq!(marked, [false, true, true, false, false, false]);
+        assert_ne!(buf[(5, 0)].symbol(), "\u{203a}", "no off-screen marker");
+    }
+
+    /// The diff's syntax colours land on the cells its text is drawn in, so a
+    /// token after a tab is coloured at the tab stop, not Tab Size cells on.
+    #[test]
+    fn the_diffs_syntax_colours_follow_the_tab_stops() {
+        set_tab_cells(4);
+        let mut buf = Buffer::empty(Rect::new(0, 0, 8, 1));
+        let red = Style::default().fg(Color::Red);
+        paint_diff_syntax(
+            &mut buf,
+            0,
+            0,
+            8,
+            "a\tb",
+            0,
+            &[HiSpan::new(2, 3, red)],
+            DiffInkLift::new(None, Color::Reset),
+        );
+        assert_eq!(clip_pad_cells("a\tb", 0, 8), "a   b   ");
+        assert_eq!(buf[(4, 0)].fg, Color::Red, "b is drawn at the stop, cell 4");
+        assert_eq!(buf[(5, 0)].fg, Color::Reset);
     }
 
     /// #891: a tab takes one cell in the diff, as its selection, find
@@ -44900,13 +45209,13 @@ mod tests {
     #[test]
     fn row_cells_count_a_wide_character_as_two_cells_and_splice_hints() {
         let mut row = RowCells::default();
-        row.fill("a\u{8cbb}b", 0, [(2, 3)]);
+        row.fill("a\u{8cbb}b", 0, 0, [(2, 3)]);
         assert_eq!((row.cell(1), row.width(1)), (1, 2), "費 takes two cells");
         assert_eq!(row.cell(2), 6, "b sits past 費 and the hint anchored at it");
         assert_eq!(row.caret(2), 3, "a caret at the anchor is left of it");
         assert_eq!(row.end(2), 3, "a range ending there leaves it out");
         assert_eq!(row.end(4), 8, "the newline cell follows the text");
-        row.fill("\u{8cbb}b", 1, []);
+        row.fill("\u{8cbb}b", 1, 0, []);
         assert_eq!((row.cell(0), row.cell(2)), (0, 2), "scrolled to 費");
     }
 
@@ -45028,8 +45337,8 @@ mod tests {
             "\u{2192}   return\u{b7}1"
         );
         assert_eq!(
-            row_text(&buf, y0 + 1, text_x, text_x + 16),
-            "\u{b7}\u{b7}x\u{b7}=\u{b7}2\u{2192}   #\u{b7}tab"
+            row_text(&buf, y0 + 1, text_x, text_x + 13),
+            "\u{b7}\u{b7}x\u{b7}=\u{b7}2\u{2192}#\u{b7}tab"
         );
     }
 
