@@ -49,10 +49,10 @@ const REFRESH_GLYPH: char = '\u{eb37}';
 /// Each list item is two cells tall: mark + name + toggle on the first line,
 /// blurb on the second, like VS Code's two-line extension rows.
 const ROW_H: u16 = 2;
-/// Cells reserved at the right edge for the toggle pill: 4 for the switch
-/// (2 caps + track + knob) plus a 1-cell margin. The click zone is everything
+/// Cells reserved at the right edge for the toggle pill: 5 for the switch
+/// (2 caps + 3 track cells the knob rides on) plus a 1-cell margin. The click zone is everything
 /// from `last_switch_left` to the panel edge.
-const SWITCH_ZONE: u16 = 5;
+const SWITCH_ZONE: u16 = 6;
 /// Cells reserved just left of the switch for a row's uninstall (trash) button,
 /// drawn only on removable INSTALLED rows: the glyph plus a 1-cell gap. The
 /// click zone is `[last_uninstall_left, last_switch_left)`.
@@ -89,8 +89,12 @@ impl Palette {
 /// Paint the rounded toggle pill at `(sw_x, y)` over the row background `row_bg`
 /// (so the half-circle caps blend into the panel or the selection fill). On =
 /// the theme's lit track with the knob to the right; off = a grey track with the
-/// knob to the left. Occupies 4 cells: `[cap, track, track, cap]` with the knob
-/// overlaying a track cell.
+/// knob to the left. Occupies 5 cells: `[cap, track, track, track, cap]`.
+///
+/// The knob glyph (a Nerd Font codicon) is about two cells wide and a terminal
+/// lets it spill into the next cell only when that cell is blank; beside a cap
+/// glyph it is clipped to a half circle. So the knob sits in cell 1 (off) or 2
+/// (on), covering cells 1-2 or 2-3, and the cell after it is always blank track.
 fn draw_switch(
     buf: &mut Buffer,
     sw_x: u16,
@@ -104,7 +108,7 @@ fn draw_switch(
         .fg(track)
         .bg(row_bg.unwrap_or(Color::Reset));
     buf.set_string(sw_x, y, SWITCH_CAP_L.to_string(), cap_style);
-    for i in 1..=2 {
+    for i in 1..=3 {
         buf.set_string(sw_x + i, y, " ", Style::default().bg(track));
     }
     let (knob_i, knob_fg) = if on {
@@ -118,7 +122,7 @@ fn draw_switch(
         SWITCH_KNOB.to_string(),
         Style::default().fg(knob_fg).bg(track),
     );
-    buf.set_string(sw_x + 3, y, SWITCH_CAP_R.to_string(), cap_style);
+    buf.set_string(sw_x + 4, y, SWITCH_CAP_R.to_string(), cap_style);
 }
 
 #[cfg(test)]
@@ -1080,6 +1084,28 @@ mod tests {
             Some(SWITCH_OFF_TRACK),
             "a disabled row's pill track is grey"
         );
+    }
+
+    #[test]
+    fn the_cell_after_the_knob_is_blank_track_so_the_wide_glyph_is_not_clipped() {
+        let mut panel = ExtensionsPanel::new();
+        panel.set_items(items());
+        panel.theme = Theme::BLACK;
+        let (buf, _) = render(&mut panel, 44, 16);
+        let sw_x = panel.last_switch_left;
+        for row in 0..2 {
+            let y = panel.row_hits[row].0;
+            let knob = (0..5)
+                .find(|i| buf[(sw_x + i, y)].symbol().starts_with(SWITCH_KNOB))
+                .expect("a knob in the pill");
+            let next = buf[(sw_x + knob + 1, y)].symbol();
+            assert_eq!(next, " ", "row {row}: the cell right of the knob is blank");
+            assert_eq!(
+                buf[(sw_x + 4, y)].symbol().chars().next(),
+                Some(SWITCH_CAP_R),
+                "row {row}: the pill ends with its right cap"
+            );
+        }
     }
 
     #[test]
