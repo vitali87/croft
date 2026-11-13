@@ -131,6 +131,7 @@ src/
 │   ├── overlay.rs       inline-image overlay state + clear-on-hide latches (iTerm2 cell eviction; the Kitty path adds a delete-all on the same clear frames)
 │   ├── perf_hud.rs      F8 performance HUD
 │   ├── review.rs        pull-request review tabs and in-editor comment boxes
+│   ├── runners.rs       Testing view, Tasks, runnable blocks, notebooks, Fleet, Live Run, .http requests
 │   ├── screencast.rs    Screencast Mode (Shift+F8): the keys pressed, the command each ran and the cell a click hit, drawn over the frame for a recording
 │   ├── welcome.rs       welcome-screen state: the "IN THIS RELEASE" highlights, read synchronously from `release_notes::release_notes()` (no thread, no network)
 │   └── tests/           whole-app tests, one file per area; `mod.rs` holds the helpers more than one file uses. `golden.rs` draws whole screens the way the main loop does and compares every cell, colour and the caret with the snapshots in `golden/` (`CROFT_BLESS=1` rewrites them; its module doc lists what it pins and masks)
