@@ -82763,9 +82763,11 @@ fn is_editor_paste_key(key: KeyEvent) -> bool {
     is_clipboard_paste_key(key)
 }
 
+/// Paste: `Ctrl+V` / `Cmd+V`, its raw 0x16 byte, and the classic
+/// `Shift+Insert`.
 fn is_clipboard_paste_key(key: KeyEvent) -> bool {
     let KeyCode::Char(c) = key.code else {
-        return false;
+        return key.code == KeyCode::Insert && key.modifiers == KeyModifiers::SHIFT;
     };
     if c == '\u{16}' {
         return true;

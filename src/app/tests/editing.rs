@@ -991,6 +991,27 @@ fn cmd_v_is_recognised_as_editor_paste_key() {
     )));
 }
 
+#[test]
+fn shift_insert_is_a_paste_key_and_only_shift_insert() {
+    assert!(is_editor_paste_key(key(
+        KeyCode::Insert,
+        KeyModifiers::SHIFT
+    )));
+    assert!(is_search_paste_key(key(
+        KeyCode::Insert,
+        KeyModifiers::SHIFT
+    )));
+    // Plain Insert toggles overwrite and Ctrl+Insert copies.
+    for mods in [
+        KeyModifiers::NONE,
+        KeyModifiers::CONTROL,
+        KeyModifiers::SHIFT | KeyModifiers::CONTROL,
+        KeyModifiers::SHIFT | KeyModifiers::ALT,
+    ] {
+        assert!(!is_editor_paste_key(key(KeyCode::Insert, mods)), "{mods:?}");
+    }
+}
+
 /// #933: where the host clipboard can't be read (Linux with no wl-paste,
 /// xclip or xsel, as over SSH), Ctrl+V pastes what croft itself last
 /// copied. Before, a copy went out by OSC 52 only and Ctrl+V found nothing.

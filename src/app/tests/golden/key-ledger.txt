@@ -299,6 +299,7 @@ editor | shift+f7 | status="No changes in this file"
 editor | shift+f8 | status="Screencast Mode on: the keys you press show at the bottom (Shift+F8 to stop)" +screencast
 editor | shift+f9 | +prompt("Add Conditional Breakpoint · line 5" "")
 editor | shift+home | caret=4:4 sel=4:8-4:4
+editor | shift+insert | tabs=*● main.rs text=15L#ebaedc8c caret=4:12 status="Pasted 4 chars"
 editor | shift+left | caret=4:7 sel=4:8-4:7
 editor | shift+pagedown | caret=14:8 sel=4:8-14:8 scroll=14:0
 editor | shift+pageup | caret=0:2 sel=4:8-0:2
@@ -569,6 +570,7 @@ selection | shift+f7 | status="No changes in this file"
 selection | shift+f8 | status="Screencast Mode on: the keys you press show at the bottom (Shift+F8 to stop)" +screencast
 selection | shift+f9 | +prompt("Add Conditional Breakpoint · line 5" "")
 selection | shift+home | caret=4:4 sel=4:8-4:4
+selection | shift+insert | tabs=*● main.rs text=15L#968f684c caret=4:12 sel=- status="Pasted 4 chars"
 selection | shift+left | caret=4:12 sel=4:8-4:12
 selection | shift+pagedown | caret=14:13 sel=4:8-14:13 scroll=14:0
 selection | shift+pageup | caret=0:2 sel=4:8-0:2
@@ -838,6 +840,7 @@ explorer | shift+f7 | -
 explorer | shift+f8 | status="Screencast Mode on: the keys you press show at the bottom (Shift+F8 to stop)" +screencast
 explorer | shift+f9 | +prompt("Add Conditional Breakpoint · line 5" "")
 explorer | shift+home | tree=./+,.vscode/,docs/,main.rs > . marked=.
+explorer | shift+insert | status="Explorer clipboard is empty"
 explorer | shift+left | -
 explorer | shift+pagedown | tree=./+,.vscode/,docs/,main.rs > main.rs marked=.,.vscode,docs,main.rs
 explorer | shift+pageup | tree=./+,.vscode/,docs/,main.rs > . marked=.
@@ -1108,6 +1111,7 @@ terminal | shift+f7 | typed=0:"\u{1b}[18;2~"
 terminal | shift+f8 | status="Screencast Mode on: the keys you press show at the bottom (Shift+F8 to stop)" +screencast
 terminal | shift+f9 | +prompt("Add Conditional Breakpoint · line 5" "")
 terminal | shift+home | -
+terminal | shift+insert | typed=0:"CLIP"
 terminal | shift+left | typed=0:"\u{1b}[1;2D"
 terminal | shift+pagedown | -
 terminal | shift+pageup | -
@@ -1378,6 +1382,7 @@ search | shift+f7 | -
 search | shift+f8 | status="Screencast Mode on: the keys you press show at the bottom (Shift+F8 to stop)" +screencast
 search | shift+f9 | +prompt("Add Conditional Breakpoint · line 5" "")
 search | shift+home | search="total" @Query:0 hits=4@0
+search | shift+insert | status="Cmd+V: pasted into search field" search="totalCLIP" @Query:9 hits=0@0
 search | shift+left | search="total" @Query:4 hits=4@0
 search | shift+pagedown | -
 search | shift+pageup | -
@@ -1648,6 +1653,7 @@ scm | shift+f7 | -
 scm | shift+f8 | status="Screencast Mode on: the keys you press show at the bottom (Shift+F8 to stop)" +screencast
 scm | shift+f9 | +prompt("Add Conditional Breakpoint · line 5" "")
 scm | shift+home | scm="Ship it"@0 +focus StagedModified:docs/notes.md Untracked:todo.txt
+scm | shift+insert | scm="Ship itCLIP"@11 +focus StagedModified:docs/notes.md Untracked:todo.txt
 scm | shift+left | scm="Ship it"@6 +focus StagedModified:docs/notes.md Untracked:todo.txt
 scm | shift+pagedown | -
 scm | shift+pageup | -
@@ -1921,6 +1927,7 @@ palette | shift+f7 | -
 palette | shift+f8 | -
 palette | shift+f9 | -
 palette | shift+home | -
+palette | shift+insert | -
 palette | shift+left | -
 palette | shift+pagedown | ~palette("" @0 > "Kill to End of Line")
 palette | shift+pageup | -
@@ -2194,6 +2201,7 @@ confirm | shift+f7 | -
 confirm | shift+f8 | -
 confirm | shift+f9 | -
 confirm | shift+home | -
+confirm | shift+insert | -
 confirm | shift+left | -
 confirm | shift+pagedown | -
 confirm | shift+pageup | -
