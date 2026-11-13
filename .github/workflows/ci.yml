@@ -108,6 +108,10 @@ jobs:
           set -euo pipefail
           base="$(git merge-base "origin/$GITHUB_BASE_REF" HEAD)"
           python3 scripts/check_doc_ownership.py "$base" HEAD
+      # The pure-move check asks the pinned rustfmt whether an item that a
+      # wider visibility made too long was only laid out anew.
+      - name: Install the pinned toolchain
+        run: rustup show
       # A file split moves thousands of lines nobody can review by reading.
       # A branch that declares `pure-move: true` in a commit message gets
       # proof instead: every Rust item it touched moved byte for byte. Without

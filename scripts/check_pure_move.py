@@ -6,14 +6,15 @@ that by reading it. This parses every changed `.rs` file at both revisions
 into items - each free item, and each item inside an `impl` or inline `mod`
 block - and matches them by text. An item's text is the item plus the docs,
 attributes and `//` comments directly above it; before comparing, only the
-common indentation and the visibility on its signature line are normalised,
-and the declaration itself (from its keyword to the `{` that opens its body,
-or to the end of an item with none) is read as one line: rustfmt wraps a
-signature that a wider visibility pushed past the line limit, and a line
-break, or the trailing comma rustfmt puts before a bracket on a line of its
-own, is not a change. Literals and comments in it are compared as written.
+common indentation and the visibility on its signature line are normalised.
 A move may keep or widen that visibility; narrowing it, or changing it to one
-that does not compare (`pub(super)` to `pub(in a)`), is a change. A method keeps the code of its `impl` header as part of its
+that does not compare (`pub(super)` to `pub(in a)`), is a change. Each widening
+is listed. A wider visibility can push a line past the width limit, so
+rustfmt lays the item out anew; an item whose text differs is still a match
+when rustfmt, given both versions without their visibility, prints the same
+text for each. rustfmt changes layout only, never meaning, and it keeps every
+comma that means something (a one-item tuple's, one in a macro call), so two
+versions it prints alike mean the same. A method keeps the code of its `impl` header as part of its
 identity, so moving `fmt` from `impl Display for X` to `impl Debug for X`, or
 out of a `#[cfg(test)] impl`, is not a move.
 
@@ -38,6 +39,7 @@ import bisect
 import difflib
 import os
 import re
+import subprocess
 import sys
 from collections import Counter, defaultdict, namedtuple
 
@@ -229,66 +231,6 @@ def extent(clines, j, col, hi, semi_only):
     raise ParseError(f"line {j + 1}: item never ends")
 
 
-DECLARED = {"fn", "const", "static", "struct", "enum", "union", "trait", "type", "impl", "mod"}
-# A comma at the end of a line before a closing bracket on the next one: the
-# trailing comma rustfmt adds when it puts a list one entry per line.
-WRAPPED_COMMA = re.compile(r",[ \t]*\n\s*(?=[)\]>{])")
-# The opening bracket of a macro call, `name!(`, `name![` or `name!{`.
-MACRO_CALL = re.compile(r"\b[A-Za-z_]\w*\s*!\s*([(\[{])")
-CLOSER = {"(": ")", "[": "]", "{": "}"}
-
-
-def keep_macro_commas(text):
-    """`text` with every comma inside a macro call's brackets swapped for
-    `\\2`, so no rule drops it: a macro may match `(a,)` and `(a)` apart and
-    expand them differently, so a trailing comma there is not layout."""
-    out, pos = [], 0
-    for m in MACRO_CALL.finditer(text):
-        if m.start() < pos:
-            continue
-        depth, end = 0, len(text)
-        for k in range(m.start(1), len(text)):
-            if text[k] in CLOSER:
-                depth += 1
-            elif text[k] in ")]}":
-                depth -= 1
-                if depth == 0:
-                    end = k + 1
-                    break
-        out.append(text[pos : m.start(1)])
-        out.append(text[m.start(1) : end].replace(",", "\2"))
-        pos = end
-    out.append(text[pos:])
-    return "".join(out)
-
-
-def one_line(text, spans, a, b):
-    """`text[a:b]`, a declaration, as one line: whitespace runs shrunk to a
-    space, none after an opening or before a closing bracket, and a trailing
-    comma before a bracket on the next line dropped, unless it sits in a
-    macro call. Literals and comments
-    are kept as written, so no rule reaches inside them, and the line break
-    that ends a `//` comment stays one: code that follows the comment on its
-    next line is not code commented out on the same one."""
-    pieces, kept, pos = [], [], a
-    k = max(bisect.bisect_right(spans, (a, float("inf"))) - 1, 0)
-    while k < len(spans) and spans[k][0] < b:
-        s, e = spans[k]
-        if e > a:
-            pieces.append(text[pos:max(s, a)])
-            kept.append(text[max(s, a):min(e, b)])
-            pieces.append(f"\0{len(kept) - 1}\0" + ("\1" if kept[-1].startswith("//") else ""))
-            pos = min(e, b)
-        k += 1
-    pieces.append(text[pos:b])
-    out = WRAPPED_COMMA.sub("\n", keep_macro_commas("".join(pieces)))
-    out = re.sub(r"\s+", " ", out).strip()
-    out = re.sub(r"([(\[<]) ", r"\1", out)
-    out = re.sub(r" ([)\]>])", r"\1", out)
-    out = re.sub("\0(\\d+)\0", lambda m: kept[int(m[1])], out)
-    return out.replace("\1", "\n").replace("\2", ",")
-
-
 def parse(text, file=""):
     """Every item in `text` and every line of glue between them. Together
     they cover each line exactly once; a file that cannot be read that way
@@ -306,37 +248,19 @@ def parse(text, file=""):
     kinds = [line_kind(ln, c, starts_in.get(i)) for i, (ln, c) in enumerate(zip(lines, clines))]
     items, glue = [], []
 
-    def item(kind, name, mods, ctx, start, sig, col, end, body_at=None):
+    def item(kind, name, mods, ctx, start, sig, col, end):
         body = lines[start : end + 1]
-        # `kw`: where the declaration starts in its line once the visibility
-        # is gone; `decl`: where it starts in the file's own line.
-        rest = lines[sig][col:]
-        vis, kw = "", col + len(rest) - len(rest.lstrip())
-        decl = kw
+        vis = ""
         if m := VIS.match(body[sig - start], col):
             vis = re.sub(r"\s+", "", m.group(1))
-            kw, decl = m.start(1), m.end(1)
             body[sig - start] = body[sig - start][: m.start(1)] + body[sig - start][m.end(1) :]
         free = [(ln, starts_in.get(start + n) != "string") for n, ln in enumerate(body)]
         indent = os.path.commonprefix(
             [ln[: len(ln) - len(ln.lstrip())] for ln, ok in free if ok and ln.strip()]
         )
-        out = [ln[len(indent) :] if ok and ln.startswith(indent) else ln for ln, ok in free]
-        if kind in DECLARED:
-            # The declaration, from its keyword to its body's `{` (taken in)
-            # or to the item's end, as one line; what follows the `{` on its
-            # line stays a line of its own.
-            if body_at and kind not in SEMI_ONLY:
-                last, upto = body_at[0], body_at[1] + 1
-            else:
-                last, upto = end, len(lines[end])
-            first = sig - start
-            prefix = body[first][:kw]
-            prefix = prefix[len(indent) :] if prefix.startswith(indent) else prefix
-            head = one_line(text, spans, offsets[sig] + decl, offsets[last] + upto)
-            tail = lines[last][upto:].lstrip()
-            out = out[:first] + [prefix + head] + ([tail] if tail else []) + out[last - start + 1 :]
-        norm = "\n".join(out)
+        norm = "\n".join(
+            ln[len(indent) :] if ok and ln.startswith(indent) else ln for ln, ok in free
+        )
         items.append(Item(file, kind, name, mods, ctx, start, end, norm, vis))
 
     def inner_attrs(lo, hi):
@@ -434,12 +358,12 @@ def parse(text, file=""):
                     # has no method to carry its header: as glue, adding or
                     # dropping it would pass unseen, so it is an item.
                     del glue[had_glue:]
-                    item(kind, name, mods, ctx, start, j, col, end, body)
+                    item(kind, name, mods, ctx, start, j, col, end)
             elif kind == "use" or (kind == "mod" and body is None):
                 written = collapse(text, [line_range(k) for k in range(start, end + 1)], spans)
                 glue.append(Glue(file, kind, start, end, written, scope))
             else:
-                item(kind, name, mods, ctx, start, j, col, end, body)
+                item(kind, name, mods, ctx, start, j, col, end)
             i = end + 1
         if lead is not None:
             item("comment", lines[lead].strip()[:60], mods, ctx, lead, lead, 0, hi - 1)
@@ -511,12 +435,69 @@ def pair_by_visibility(olds, news):
     return pairs, left_old, left_new
 
 
-def compare(old, new):
+def shown(vis):
+    """A visibility as written, from its whitespace-free form."""
+    return re.sub(r"^pub\(in(?=\w)", "pub(in ", vis) if vis else "private"
+
+
+def reach(o, n):
+    """`, private -> pub(super)` when a move or an edit in place widened the
+    item's visibility, for the reviewer to see; nothing when it kept it."""
+    return f", {shown(o.vis)} -> {shown(n.vis)}" if o.vis != n.vis else ""
+
+
+def edition():
+    """The Rust edition in ./Cargo.toml, which rustfmt needs to parse code."""
+    try:
+        with open("Cargo.toml", encoding="utf-8") as f:
+            if m := re.search(r'^edition\s*=\s*"(\d+)"', f.read(), re.MULTILINE):
+                return m[1]
+    except OSError:
+        pass
+    return "2021"
+
+
+def rustfmt(text, ed):
+    """`text` as rustfmt prints it, with the repository's rustfmt.toml when
+    there is one, or None when rustfmt cannot (it is missing, or the text
+    does not parse): then nothing is taken to match."""
+    cmd = ["rustfmt", "--edition", ed, "--emit", "stdout"]
+    if os.path.exists("rustfmt.toml"):
+        cmd += ["--config-path", "rustfmt.toml"]
+    try:
+        run = subprocess.run(cmd, input=text, capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return run.stdout if run.returncode == 0 else None
+
+
+def standalone(it):
+    """The item's text, its visibility gone, as a file rustfmt can parse: a
+    method or other associated item inside a stand-in `impl` or `trait`."""
+    if not it.ctx:
+        return it.norm + "\n"
+    head = "trait PureMove {" if re.search(r"(^|\s)trait\s", it.ctx) else "impl PureMove {"
+    body = "\n".join("    " + ln if ln else ln for ln in it.norm.split("\n"))
+    return f"{head}\n{body}\n}}\n"
+
+
+def laid_out_alike(o, n, ed=None):
+    """Whether rustfmt prints the two versions of an item, both without their
+    visibility, as the same text."""
+    ed = ed or edition()
+    a = rustfmt(standalone(o), ed)
+    return a is not None and a == rustfmt(standalone(n), ed)
+
+
+def compare(old, new, alike=None):
     """(unchanged count, moved pairs, changed pairs, removed, added).
 
     Identical text under the same impl header is the same item. A twin in
     the same place is unchanged; anywhere else it moved. What is left pairs
-    up by kind and name as a change, and the rest was added or removed."""
+    up by kind and name as a change, and the rest was added or removed. A
+    change under the same header whose visibility widened is still a match
+    when `alike` (rustfmt) says only the layout differs: in place it is a
+    widening, anywhere else a move; those pairs are returned in `relaid`."""
     groups = defaultdict(lambda: ([], []))
     for side, its in enumerate((old, new)):
         for it in its:
@@ -557,18 +538,16 @@ def compare(old, new):
         twins.remove(o)
         changed.append((o, n))
     removed = [o for twins in by_name.values() for o in twins]
-    return unchanged, widened, moved, changed, removed, added
-
-
-def shown(vis):
-    """A visibility as written, from its whitespace-free form."""
-    return re.sub(r"^pub\(in(?=\w)", "pub(in ", vis) if vis else "private"
-
-
-def reach(o, n):
-    """`, private -> pub(super)` when a move or an edit in place widened the
-    item's visibility, for the reviewer to see; nothing when it kept it."""
-    return f", {shown(o.vis)} -> {shown(n.vis)}" if o.vis != n.vis else ""
+    relaid, still = [], []
+    for o, n in changed:
+        if (alike and o.kind == n.kind and o.ctx == n.ctx and o.norm != n.norm
+                and widens(o.vis, n.vis) and alike(o, n)):
+            relaid.append((o, n))
+            in_place = (o.file, o.mods, o.name) == (n.file, n.mods, n.name)
+            (widened if in_place and o.vis != n.vis else moved).append((o, n))
+        else:
+            still.append((o, n))
+    return unchanged, widened, moved, still, removed, added, relaid
 
 
 def print_glue(sides):
@@ -625,17 +604,26 @@ def check(base, head, if_declared):
                     continue
                 items += its
                 glue += gl
-    unchanged, widened, moved, changed, removed, added = compare(sides[0][0], sides[1][0])
-    wider = len(widened) + sum(1 for o, n in moved if o.vis != n.vis)
+    ed = edition()
+    unchanged, widened, moved, changed, removed, added, relaid = compare(
+        sides[0][0], sides[1][0], lambda o, n: laid_out_alike(o, n, ed)
+    )
+    wider = sum(1 for o, n in widened + moved if o.vis != n.vis)
     print(f"Pure-move check of {len(changed_files)} changed Rust file(s), {base}..{head}")
     print(
         f"  {unchanged} unchanged, {len(moved)} moved, {len(changed)} changed, "
-        f"{len(added)} added, {len(removed)} removed; {wider} visibility widened"
+        f"{len(added)} added, {len(removed)} removed; {wider} visibility widened, "
+        f"{len(relaid)} laid out anew by rustfmt"
     )
+    anew = {(id(o), id(n)) for o, n in relaid}
+
+    def note(o, n):
+        return reach(o, n) + (", laid out anew by rustfmt" if (id(o), id(n)) in anew else "")
+
     for o, n in sorted(widened, key=lambda p: (p[0].file, p[0].start)):
-        print(f"  widened  {o.kind} {label(o)} ({span(o)} -> {span(n)}{reach(o, n)})")
+        print(f"  widened  {o.kind} {label(o)} ({span(o)} -> {span(n)}{note(o, n)})")
     for o, n in sorted(moved, key=lambda p: (p[0].file, p[0].start)):
-        print(f"  moved    {o.kind} {label(o)} -> {label(n)} ({span(o)} -> {span(n)}{reach(o, n)})")
+        print(f"  moved    {o.kind} {label(o)} -> {label(n)} ({span(o)} -> {span(n)}{note(o, n)})")
     print_glue(sides)
     for o, n in changed:
         print(f"  CHANGED  {n.kind} {label(o)} -> {label(n)}")

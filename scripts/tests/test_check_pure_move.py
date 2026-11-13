@@ -133,7 +133,43 @@ class PureMoves(unittest.TestCase):
         repo.commit({"a.rs": "", "b.rs": after})
         code, out = repo.check()
         self.assertEqual(code, 0, out)
-        self.assertIn("moved    fn a.rs::place -> b.rs::place", out)
+        self.assertIn("moved    fn a.rs::place -> b.rs::place (a.rs:1-3 -> b.rs:1-6, private -> "
+                      "pub(super), laid out anew by rustfmt)", out)
+        self.assertIn("1 laid out anew by rustfmt", out)
+
+    def test_a_one_item_tuple_is_not_its_item(self):
+        """`(u8,)` is a tuple and `(u8)` is a `u8`: the comma is the type, so
+        no layout rule may drop it, wrapped or not."""
+        cases = [
+            ("type Value = (u8,\n);\n", "pub(super) type Value = (u8);\n", "a wrapped alias"),
+            ("type Value = (u8,);\n", "pub(super) type Value = (u8);\n", "an alias"),
+            ("fn f(_: (u8,)) {}\n", "pub(super) fn f(\n    _: (u8),\n) {}\n", "a wrapped parameter"),
+            ("const X: u8 = { let (a,) = (1,); a };\n",
+             "pub(super) const X: u8 = {\n    let (a) = (1,);\n    a\n};\n", "a pattern"),
+        ]
+        for before, after, why in cases:
+            with self.subTest(why=why), tempfile.TemporaryDirectory() as tmp:
+                repo = Repo(Path(tmp), {"a.rs": before})
+                repo.commit({"a.rs": "", "b.rs": after})
+                code, out = repo.check()
+                self.assertEqual(code, 1, out)
+                self.assertIn("CHANGED", out)
+
+    def test_a_widened_item_rustfmt_rewraps_in_place_is_a_widening(self):
+        before = "impl A {\n    fn place(&self, at: u8) -> Option<(Vec<u8>, bool, String, String, String)> {\n        None\n    }\n}\n"
+        after = ("impl A {\n    pub(super) fn place(\n        &self,\n        at: u8,\n"
+                 "    ) -> Option<(Vec<u8>, bool, String, String, String)> {\n        None\n    }\n}\n")
+        repo = self.repo({"a.rs": before})
+        repo.commit({"a.rs": after})
+        code, out = repo.check()
+        self.assertEqual(code, 0, out)
+        self.assertIn("widened  fn a.rs::impl A::place", out)
+        self.assertIn("private -> pub(super), laid out anew by rustfmt", out)
+
+    def test_text_rustfmt_cannot_read_never_matches(self):
+        self.assertIsNone(pm.rustfmt("fn (", "2021"))
+        broken = pm.Item("a.rs", "fn", "f", [], "", 0, 0, "fn (", "")
+        self.assertFalse(pm.laid_out_alike(broken, broken, "2021"))
 
     def test_a_change_inside_a_wrapped_signature_still_fails(self):
         before = "fn place(&self, at: u8) -> bool {\n    true\n}\n"
