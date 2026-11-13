@@ -25681,7 +25681,7 @@ impl App {
             format!(
                 " Ln {}, Col {}{coverage}{}{column_mode} ",
                 self.editor.cursor_row + 1,
-                self.editor.cursor_col + 1,
+                self.editor.cursor_visual_col(),
                 // The file refuses this user's writes (#1379).
                 if self.editor.write_protected {
                     " \u{b7} Read-only"
