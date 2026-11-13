@@ -118,6 +118,7 @@ src/
 ├── zoxide.rs            zoxide integration: strict query + typo-tolerant fuzzy fallback (Damerau-Levenshtein) + install only on the user's y to the popup's offer, never at launch (pkg on Termux, curl script elsewhere), its outcome and failure reason kept for the session + InstallState surfaced to the Cmd+Z jump popup
 ├── app/                 event loop, three-pane layout + activity bar, key dispatch, status bar, mouse, clipboard, splitters, preview overlays, Customize Layout (compute_chrome_layout / panel_band_rect pure geometry, secondary side bar, Zen Mode)
 │   ├── mod.rs           the main App: render, key / mouse dispatch, status bar, splitters
+│   ├── agents_collab.rs coding agents, lanes, the AI navigator, multiplayer sessions
 │   ├── click.rs         double / triple click detection
 │   ├── code_scanning.rs SARIF results viewer, GitHub code scanning, SARIF logs as problems
 │   ├── codeql.rs        the CodeQL side bar: databases, queries, results, variant analysis, the CLI
