@@ -1,0 +1,1 @@
+fix: A tab now runs to the next tab stop (Tab Size cells) instead of always being Tab Size cells wide, so text after tabs lines up in columns as in vim and VS Code, and the caret, clicks, selection, word wrap and horizontal scrolling follow it. Col in the status bar counts display columns, so one tab at Tab Size 4 puts the caret at Col 5.
