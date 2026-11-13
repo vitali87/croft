@@ -119,6 +119,7 @@ src/
 ├── app/                 event loop, three-pane layout + activity bar, key dispatch, status bar, mouse, clipboard, splitters, preview overlays, Customize Layout (compute_chrome_layout / panel_band_rect pure geometry, secondary side bar, Zen Mode)
 │   ├── mod.rs           the main App: render, key / mouse dispatch, status bar, splitters
 │   ├── click.rs         double / triple click detection
+│   ├── code_scanning.rs SARIF results viewer, GitHub code scanning, SARIF logs as problems
 │   ├── cursor_blink.rs  caret blink timing
 │   ├── fs_watch.rs      filesystem watch + poll fallback feeding tree / editor / terminal refresh. The poll stats the file behind EVERY open tab, not just the focused one: a boundary dir carries no watch at all (see the storm rules — never root a stream at or above `target/`, `node_modules/`, `.git/`) and an in-place write does not move its parent dir's mtime, so for a file sitting directly in one this stat is the only thing that can notice a change; cost is one stat per open tab per (adaptively backed-off) tick
 │   ├── git_worker.rs    off-thread git status / changes worker
