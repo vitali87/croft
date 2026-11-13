@@ -51,8 +51,8 @@ see [docs/MACOS.md](docs/MACOS.md#spotlight-indexing-and-the-build-directory).
   message. The CI error tells you the exact key to use.
 * **Moving code between files?** Add the line `pure-move: true` to a commit
   message and CI proves every Rust item you touched moved byte for byte
-  (visibility may widen, and rustfmt may lay out anew an item that made too
-  long). `python3 scripts/check_pure_move.py list <file>` lists a file's items
+  (visibility may widen, and rustfmt may lay out anew an item the wider
+  visibility made too long). `python3 scripts/check_pure_move.py list <file>` lists a file's items
   with their line ranges, to plan the move. The split of `src/app/mod.rs`
   (#2062) is done by `scripts/move_items.py --pr N`, from
   `scripts/split_manifest.tsv`.
