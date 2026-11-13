@@ -8,7 +8,13 @@ block - and matches them by text. An item's text is the item plus the docs,
 attributes and `//` comments directly above it; before comparing, only the
 common indentation and the visibility on its signature line are normalised.
 A move may keep or widen that visibility; narrowing it, or changing it to one
-that does not compare (`pub(super)` to `pub(in a)`), is a change. A method keeps the code of its `impl` header as part of its
+that does not compare (`pub(super)` to `pub(in a)`), is a change. Each widening
+is listed. A wider visibility can push a line past the width limit, so
+rustfmt lays the item out anew; an item whose text differs is still a match
+when rustfmt, given both versions without their visibility, prints the same
+text for each. rustfmt changes layout only, never meaning, and it keeps every
+comma that means something (a one-item tuple's, one in a macro call), so two
+versions it prints alike mean the same. A method keeps the code of its `impl` header as part of its
 identity, so moving `fmt` from `impl Display for X` to `impl Debug for X`, or
 out of a `#[cfg(test)] impl`, is not a move.
 
@@ -33,6 +39,7 @@ import bisect
 import difflib
 import os
 import re
+import subprocess
 import sys
 from collections import Counter, defaultdict, namedtuple
 
@@ -428,17 +435,74 @@ def pair_by_visibility(olds, news):
     return pairs, left_old, left_new
 
 
-def compare(old, new):
+def shown(vis):
+    """A visibility as written, from its whitespace-free form."""
+    return re.sub(r"^pub\(in(?=\w)", "pub(in ", vis) if vis else "private"
+
+
+def reach(o, n):
+    """`, private -> pub(super)` when a move or an edit in place widened the
+    item's visibility, for the reviewer to see; nothing when it kept it."""
+    return f", {shown(o.vis)} -> {shown(n.vis)}" if o.vis != n.vis else ""
+
+
+def edition():
+    """The Rust edition in ./Cargo.toml, which rustfmt needs to parse code."""
+    try:
+        with open("Cargo.toml", encoding="utf-8") as f:
+            if m := re.search(r'^edition\s*=\s*"(\d+)"', f.read(), re.MULTILINE):
+                return m[1]
+    except OSError:
+        pass
+    return "2021"
+
+
+def rustfmt(text, ed):
+    """`text` as rustfmt prints it, with the repository's rustfmt.toml when
+    there is one, or None when rustfmt cannot (it is missing, or the text
+    does not parse): then nothing is taken to match."""
+    cmd = ["rustfmt", "--edition", ed, "--emit", "stdout"]
+    if os.path.exists("rustfmt.toml"):
+        cmd += ["--config-path", "rustfmt.toml"]
+    try:
+        run = subprocess.run(cmd, input=text, capture_output=True, text=True, timeout=60)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return run.stdout if run.returncode == 0 else None
+
+
+def standalone(it):
+    """The item's text, its visibility gone, as a file rustfmt can parse: a
+    method or other associated item inside a stand-in `impl` or `trait`."""
+    if not it.ctx:
+        return it.norm + "\n"
+    head = "trait PureMove {" if re.search(r"(^|\s)trait\s", it.ctx) else "impl PureMove {"
+    body = "\n".join("    " + ln if ln else ln for ln in it.norm.split("\n"))
+    return f"{head}\n{body}\n}}\n"
+
+
+def laid_out_alike(o, n, ed=None):
+    """Whether rustfmt prints the two versions of an item, both without their
+    visibility, as the same text."""
+    ed = ed or edition()
+    a = rustfmt(standalone(o), ed)
+    return a is not None and a == rustfmt(standalone(n), ed)
+
+
+def compare(old, new, alike=None):
     """(unchanged count, moved pairs, changed pairs, removed, added).
 
     Identical text under the same impl header is the same item. A twin in
     the same place is unchanged; anywhere else it moved. What is left pairs
-    up by kind and name as a change, and the rest was added or removed."""
+    up by kind and name as a change, and the rest was added or removed. A
+    change under the same header whose visibility widened is still a match
+    when `alike` (rustfmt) says only the layout differs: in place it is a
+    widening, anywhere else a move; those pairs are returned in `relaid`."""
     groups = defaultdict(lambda: ([], []))
     for side, its in enumerate((old, new)):
         for it in its:
             groups[(it.ctx, it.norm)][side].append(it)
-    unchanged, moved, narrowed, gone, came = 0, [], [], [], []
+    unchanged, widened, moved, narrowed, gone, came = 0, [], [], [], [], []
     for olds, news in groups.values():
         at = defaultdict(list)
         for n in news:
@@ -447,7 +511,9 @@ def compare(old, new):
         for o in olds:
             if at[(o.file, o.mods, o.name)]:
                 n = at[(o.file, o.mods, o.name)].pop()
-                if widens(o.vis, n.vis):
+                if o.vis != n.vis and widens(o.vis, n.vis):
+                    widened.append((o, n))
+                elif widens(o.vis, n.vis):
                     unchanged += 1
                 else:
                     narrowed.append((o, n))
@@ -472,7 +538,16 @@ def compare(old, new):
         twins.remove(o)
         changed.append((o, n))
     removed = [o for twins in by_name.values() for o in twins]
-    return unchanged, moved, changed, removed, added
+    relaid, still = [], []
+    for o, n in changed:
+        if (alike and o.kind == n.kind and o.ctx == n.ctx and o.norm != n.norm
+                and widens(o.vis, n.vis) and alike(o, n)):
+            relaid.append((o, n))
+            in_place = (o.file, o.mods, o.name) == (n.file, n.mods, n.name)
+            (widened if in_place and o.vis != n.vis else moved).append((o, n))
+        else:
+            still.append((o, n))
+    return unchanged, widened, moved, still, removed, added, relaid
 
 
 def print_glue(sides):
@@ -529,19 +604,31 @@ def check(base, head, if_declared):
                     continue
                 items += its
                 glue += gl
-    unchanged, moved, changed, removed, added = compare(sides[0][0], sides[1][0])
+    ed = edition()
+    unchanged, widened, moved, changed, removed, added, relaid = compare(
+        sides[0][0], sides[1][0], lambda o, n: laid_out_alike(o, n, ed)
+    )
+    wider = sum(1 for o, n in widened + moved if o.vis != n.vis)
     print(f"Pure-move check of {len(changed_files)} changed Rust file(s), {base}..{head}")
     print(
         f"  {unchanged} unchanged, {len(moved)} moved, {len(changed)} changed, "
-        f"{len(added)} added, {len(removed)} removed"
+        f"{len(added)} added, {len(removed)} removed; {wider} visibility widened, "
+        f"{len(relaid)} laid out anew by rustfmt"
     )
+    anew = {(id(o), id(n)) for o, n in relaid}
+
+    def note(o, n):
+        return reach(o, n) + (", laid out anew by rustfmt" if (id(o), id(n)) in anew else "")
+
+    for o, n in sorted(widened, key=lambda p: (p[0].file, p[0].start)):
+        print(f"  widened  {o.kind} {label(o)} ({span(o)} -> {span(n)}{note(o, n)})")
     for o, n in sorted(moved, key=lambda p: (p[0].file, p[0].start)):
-        print(f"  moved    {o.kind} {label(o)} -> {label(n)} ({span(o)} -> {span(n)})")
+        print(f"  moved    {o.kind} {label(o)} -> {label(n)} ({span(o)} -> {span(n)}{note(o, n)})")
     print_glue(sides)
     for o, n in changed:
         print(f"  CHANGED  {n.kind} {label(o)} -> {label(n)}")
         if o.norm == n.norm and o.ctx == n.ctx:
-            print(f"      visibility narrowed or not comparable: {o.vis or 'private'} -> {n.vis or 'private'}")
+            print(f"      visibility narrowed or not comparable: {shown(o.vis)} -> {shown(n.vis)}")
         elif o.norm == n.norm:
             print("      same text, under a different impl header")
         if not enforced:

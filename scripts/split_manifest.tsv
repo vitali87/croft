@@ -1,0 +1,2562 @@
+# Stage B of the refactor program (#2062): where each item of src/app/mod.rs goes.
+# One row per item, in file order. pr 0 means the item stays in mod.rs.
+# kind, impl and name are as `scripts/check_pure_move.py list` prints them;
+# twins (the same kind, impl and name, such as a pair of #[cfg] platform
+# copies) have one row each and always move together.
+pr	file	kind	impl	name
+0		enum	-	SidebarView
+18	explorer	enum	-	ExplorerView
+18	explorer	const	impl ExplorerView	ALL
+18	explorer	fn	impl ExplorerView	label
+0		struct	-	ExplorerViewVisibility
+18	explorer	fn	impl ExplorerViewVisibility	from_prefs
+18	explorer	fn	impl ExplorerViewVisibility	as_prefs
+18	explorer	fn	impl ExplorerViewVisibility	is_visible
+18	explorer	fn	impl ExplorerViewVisibility	toggle
+29	workbench	enum	-	ActivityIcon
+29	workbench	fn	impl ActivityIcon	view
+29	workbench	const	-	SPONSOR_URL
+15	scm	const	-	SCRUB_COMMIT_LIMIT
+15	scm	const	-	SCRUB_VIEWS_KEPT
+15	scm	const	-	SCRUB_OUTLINES_KEPT
+7	runners	const	-	FLEET_TIMEOUT
+29	workbench	const	-	ACTIVITY_BAR_WIDTH
+29	workbench	const	-	ACTIVITY_ICON_HEIGHT
+29	workbench	const	-	ACTIVITY_ICON_GAP
+30	inline_images	const	-	FALLBACK_CELL_PIXEL
+13	host_integration	fn	-	manual_update_check_refusal
+30	inline_images	fn	-	cell_pixel_of
+29	workbench	const	-	SECONDARY_SIDEBAR_WIDTH
+29	workbench	const	-	LAYOUT_ICON_CELLS_W
+29	workbench	const	-	LAYOUT_ICON_CELLS_H
+29	workbench	const	-	LAYOUT_ICONS_W
+29	workbench	enum	-	SideBarPosition
+29	workbench	enum	-	PanelAlignment
+29	workbench	const	impl PanelAlignment	OPTIONS
+29	workbench	enum	-	QuickInputPosition
+29	workbench	const	impl QuickInputPosition	OPTIONS
+0		struct	-	PendingSelectionRanges
+0		struct	-	BookmarkTarget
+0		struct	-	PreZenLayout
+0		struct	-	LayoutIconAreas
+0		struct	-	ChromeLayout
+29	workbench	fn	-	centered_editor_rect
+29	workbench	fn	-	zen_hint_text
+29	workbench	fn	-	compute_chrome_layout
+29	workbench	fn	-	panel_band_rect
+0		fn	-	fallback_popup_rect
+29	workbench	fn	-	activity_icon_glyph_x
+5	debugger	fn	-	lldb_dap_rank
+5	debugger	fn	-	lldb_dap_path
+5	debugger	fn	-	lldb_dap_missing_message
+5	debugger	fn	-	project_python
+5	debugger	fn	-	project_python_on
+5	debugger	fn	-	is_executable_file
+5	debugger	fn	-	push_variable_rows
+29	workbench	fn	-	activity_explorer_y
+29	workbench	fn	-	activity_search_y
+29	workbench	fn	-	activity_source_control_y
+29	workbench	fn	-	activity_run_debug_y
+29	workbench	fn	-	activity_remote_y
+29	workbench	fn	-	activity_extensions_y
+29	workbench	fn	-	activity_testing_y
+29	workbench	fn	-	activity_explorer_block
+29	workbench	fn	-	activity_search_block
+29	workbench	fn	-	activity_source_control_block
+29	workbench	fn	-	activity_remote_block
+29	workbench	fn	-	activity_run_debug_block
+29	workbench	fn	-	activity_extensions_block
+29	workbench	fn	-	activity_testing_block
+29	workbench	fn	-	activity_codeql_y
+29	workbench	fn	-	activity_codeql_block
+29	workbench	const	-	ACTIVITY_BOTTOM_INSET
+29	workbench	fn	-	activity_settings_block
+29	workbench	fn	-	activity_last_view_bottom
+29	workbench	fn	-	activity_sponsor_block
+0		struct	-	SidebarAreas
+0		struct	-	ActivityBarImages
+0		struct	-	ChromeBakeInput
+30	inline_images	fn	impl ChromeBakeInput	outdates
+0		struct	-	ChromeImages
+0		struct	-	WelcomeBakeKey
+0		const	-	APP_NAME
+39	frame	const	-	GIT_DIRTY_COLOR
+39	frame	const	-	GIT_DIRTY_DOT
+39	frame	const	-	PILL_CAP_L
+39	frame	const	-	PILL_CAP_R
+39	frame	fn	-	status_cells
+39	frame	const	-	STATUS_RIGHT_MARGIN
+0		struct	-	StatusTones
+39	frame	fn	impl StatusTones	new
+39	frame	fn	-	mix_color
+39	frame	fn	-	status_bar_bg
+39	frame	fn	-	git_status_spans
+29	workbench	fn	-	chip_tint
+39	frame	const	-	WORKSPACE_CAP_MAX
+39	frame	fn	-	workspace_cap_spans
+39	frame	fn	-	status_pill
+39	frame	fn	-	overwrite_mode_span
+0		enum	-	Pane
+0		enum	-	BottomPanelTab
+0		const	impl BottomPanelTab	ALL
+0		fn	impl BottomPanelTab	label
+0		fn	impl BottomPanelTab	show_command
+28	bottom_panel	const	-	PORT_TOAST_HEIGHT
+0		struct	-	PortToast
+28	bottom_panel	enum	-	PortToastAction
+0		enum	-	CreateKind
+10	agents_collab	enum	-	PairLockDenial
+0		struct	-	UpdateToast
+13	host_integration	fn	impl UpdateToast	offer
+13	host_integration	enum	-	UpdateToastAction
+13	host_integration	enum	-	UpdateSource
+0		struct	-	PendingRunBlock
+0		struct	-	PendingCapture
+10	agents_collab	fn	-	canonicalize_existing_ancestor
+13	host_integration	enum	-	UpdateStatus
+20	language_servers	enum	-	OnTypeReply
+39	frame	const	-	UPDATE_SPINNER_FRAMES
+39	frame	const	-	UPDATE_SPINNER_FRAME_MS
+5	debugger	const	-	REAPER_TEARDOWN_GRACE_MS
+39	frame	fn	-	update_spinner_frame
+15	scm	enum	-	ShareLink
+20	language_servers	enum	-	CrumbTarget
+0		enum	-	MenuAction
+15	scm	enum	-	CommitAction
+31	menus	fn	-	shortcut_for
+31	menus	fn	-	menu_action_command
+31	menus	fn	-	platform_shortcut_for
+31	menus	fn	-	menu_hint
+31	menus	fn	-	menu_entry_width
+5	debugger	enum	-	PendingLaunchStep
+0		struct	-	CompoundLaunch
+5	debugger	enum	-	MemberOutcome
+5	debugger	enum	-	LaunchSlot
+5	debugger	fn	-	index_after_removals
+5	debugger	fn	-	mirror_open_console_lines
+7	runners	fn	-	fleet_shell_command
+10	agents_collab	type	-	LaneCountKey
+4	review	const	-	PR_CHECKS_POLL
+4	review	type	-	PrViewedRx
+0		struct	-	PrViewedWrite
+4	review	type	-	PrViewedWriteRx
+0		struct	-	CodeScanList
+4	review	type	-	PrCheckoutRx
+0		struct	-	PrCheckout
+4	review	enum	-	PrGhJob
+15	scm	type	-	GitNetDone
+20	language_servers	type	-	OutlineKey
+20	language_servers	type	-	OutlineParse
+5	debugger	fn	-	breakpoint_section_rows
+5	debugger	fn	-	list_user_processes
+0		struct	-	InputRun
+5	debugger	enum	-	InputThen
+0		struct	-	PendingDebugLaunch
+5	debugger	enum	-	PreLaunchWait
+5	debugger	fn	impl PreLaunchWait	of
+5	debugger	fn	-	finished_settles_pending
+5	debugger	const	-	PRELAUNCH_MARK_GRACE
+5	debugger	fn	-	resolve_lldb_program
+5	debugger	fn	-	pending_abort_reason
+5	debugger	fn	-	debug_end_message
+18	explorer	enum	-	ExplorerClipMode
+0		struct	-	ExplorerClipboard
+20	language_servers	type	-	PeekLocation
+18	explorer	enum	-	FileMove
+0		struct	-	PendingFileMove
+23	search	fn	-	search_editor_label
+23	search	fn	-	is_search_editor_tab
+23	search	fn	-	header_query_for_status
+18	explorer	const	-	FILE_MOVE_DEADLINE
+0		static	-	TEST_KEYBINDINGS_SEQ
+20	language_servers	const	-	CODE_LENS_SETTLE
+0		struct	-	TreeTypeahead
+18	explorer	const	-	TREE_TYPEAHEAD_WINDOW
+0		struct	-	ExplorerDrag
+26	editor_tabs	fn	-	build_tab_context_menu_items
+18	explorer	fn	-	build_tree_context_menu_items
+18	explorer	fn	-	build_tree_context_menu_items_in_dir
+18	explorer	fn	-	build_tree_context_menu_items_with
+18	explorer	fn	-	maybe_add_reveal_in_finder
+31	menus	enum	-	MenuEntry
+31	menus	fn	impl MenuEntry	item
+31	menus	fn	impl MenuEntry	header
+31	menus	fn	impl MenuEntry	action
+31	menus	fn	impl MenuEntry	is_selectable
+31	menus	fn	impl From<(String, MenuAction)> for MenuEntry	from
+0		struct	-	ContextMenu
+31	menus	fn	impl ContextMenu	flat
+31	menus	fn	impl ContextMenu	localize
+31	menus	fn	impl ContextMenu	step_cursor
+31	menus	fn	impl ContextMenu	submenu_visible
+31	menus	fn	impl ContextMenu	scroll_submenu
+31	menus	fn	impl ContextMenu	submenu_scroll_for
+31	menus	fn	impl ContextMenu	wheel_active
+31	menus	fn	impl ContextMenu	page_active
+31	menus	fn	impl ContextMenu	jump_active
+31	menus	fn	impl ContextMenu	scroll_for
+31	menus	fn	impl ContextMenu	level_entries
+31	menus	fn	impl ContextMenu	level_selected
+31	menus	fn	impl ContextMenu	set_level_selected
+31	menus	fn	impl ContextMenu	move_cursor
+31	menus	fn	impl ContextMenu	cursor_entry
+31	menus	fn	impl ContextMenu	cursor_action
+31	menus	fn	impl ContextMenu	open_cursor_submenu
+31	menus	fn	impl ContextMenu	close_submenu
+0		enum	-	PromptKind
+0		struct	-	Prompt
+32	prompts	fn	impl Prompt	caret
+32	prompts	fn	impl Prompt	edit
+32	prompts	fn	impl Prompt	walk
+15	scm	enum	-	ScmWrite
+15	scm	fn	impl ScmWrite	is_stash
+15	scm	fn	impl ScmWrite	verb
+0		struct	-	PendingUnsavedScm
+0		struct	-	PendingStashDrop
+0		struct	-	PendingDiscard
+0		struct	-	PendingRevertHunk
+27	save_restore	enum	-	UnsavedExit
+27	save_restore	fn	impl UnsavedExit	verb
+27	save_restore	fn	-	holds_unsaved
+0		struct	-	LossySave
+27	save_restore	fn	impl LossySave	name
+27	save_restore	fn	impl LossySave	text
+27	save_restore	fn	impl LossySave	spoken
+15	scm	enum	-	BranchPurpose
+0		struct	-	TourRun
+0		struct	-	SshOffer
+0		struct	-	ForwardedPointer
+0		struct	-	TerminalSelectAutoScroll
+0		struct	-	QuickSelectState
+0		struct	-	QuickHint
+0		struct	-	CopyModeState
+24	terminal_panes	enum	-	CopySelKind
+24	terminal_panes	const	-	UNDO_CLOSE_GRACE
+26	editor_tabs	const	-	CLOSED_TAB_STACK_CAP
+0		struct	-	ClosedTab
+26	editor_tabs	fn	impl ClosedTab	of
+26	editor_tabs	fn	-	bulk_close_records
+26	editor_tabs	fn	-	bulk_close_status
+0		struct	-	ClosedTerminal
+7	runners	type	-	PendingTestDebug
+7	runners	type	-	PendingCargoLaunch
+7	runners	enum	-	LastTestRun
+0		struct	-	RunningStatus
+24	terminal_panes	fn	impl RunningStatus	new
+24	terminal_panes	fn	impl RunningStatus	settle
+24	terminal_panes	fn	-	pane_run_outcome
+15	scm	type	-	GraphReply
+15	scm	type	-	GraphReplyRx
+15	scm	type	-	GraphReplyTx
+0		struct	-	App
+33	editor_input	enum	-	VimOp
+0		struct	-	EditorVimChord
+33	editor_input	fn	impl EditorVimChord	reset
+0		struct	-	EditorImageLayout
+0		struct	-	TerminalImageLayout
+0		struct	-	MarkdownImageLayout
+30	inline_images	enum	-	MinimapSide
+30	inline_images	const	-	MINIMAP_WIDTH_CELLS
+30	inline_images	const	-	MINIMAP_MIN_EDITOR_WIDTH
+30	inline_images	const	-	MINIMAP_EDIT_REBAKE
+30	inline_images	const	-	MINIMAP_MAX_LINE_PX
+30	inline_images	const	-	MINIMAP_TEXT_CHARS_PER_DOT
+30	inline_images	type	-	BrailleCell
+30	inline_images	fn	-	braille_minimap
+0		struct	-	MinimapBase
+30	inline_images	type	-	MinimapSig
+0		struct	-	MinimapLayout
+0		struct	-	PortPoll
+0		struct	-	MinimapOverlay
+30	inline_images	fn	-	composite_minimap_viewport
+30	inline_images	fn	-	rgba_to_png
+29	workbench	enum	-	SplitterDrag
+29	workbench	const	-	EDITOR_SPLIT_MIN
+20	language_servers	const	-	STICKY_SCROLL_MAX
+29	workbench	const	-	SIDEBAR_WIDTH_DEFAULT
+29	workbench	const	-	SIDEBAR_WIDTH_MIN
+29	workbench	const	-	TERMINAL_HEIGHT_MIN
+29	workbench	const	-	EDITOR_HEIGHT_MIN
+29	workbench	const	-	OSK_MIN_FRAME_HEIGHT
+29	workbench	const	-	RIGHT_PANE_MIN
+29	workbench	const	-	ZEN_ESC_WINDOW
+29	workbench	const	-	ZEN_HINT_FOR
+36	key_input	const	-	CMD_K_LEADER_TIMEOUT
+18	explorer	const	-	ZOXIDE_JUMP_MIN_WIDTH
+18	explorer	fn	-	zoxide_jump_status
+0		struct	-	WelcomeLayout
+0		struct	-	ScpUpload
+0		struct	-	PendingRemotePull
+12	remote_sessions	enum	-	RemotePullKind
+12	remote_sessions	const	-	REMOTE_PULL_TIMEOUT
+28	bottom_panel	const	-	PORT_TOAST_TTL
+28	bottom_panel	const	-	PORT_POLL_INTERVAL
+24	terminal_panes	const	-	TERMINAL_LABEL_INTERVAL
+0		struct	-	RemoteLaunch
+0		struct	-	SarifDownload
+1	code_scanning	fn	-	fetch_sarif_source
+0		fn	-	split_at_char_count
+0		fn	-	wrap_cells_variable_width
+14	welcome_screen	const	-	WELCOME_NOTE_GUTTER
+14	welcome_screen	fn	-	welcome_note_summary_width
+14	welcome_screen	fn	-	wrapped_welcome_note_summary
+14	welcome_screen	fn	-	styled_welcome_note_lines
+14	welcome_screen	fn	-	welcome_note_row_height
+14	welcome_screen	fn	-	welcome_card_inner_width
+14	welcome_screen	fn	-	welcome_recents_height
+14	welcome_screen	const	-	LOCH_WELCOME_GAP
+14	welcome_screen	const	-	LOCH_WELCOME_CARD_FRAME
+14	welcome_screen	const	-	WELCOME_VERSION_GAP
+14	welcome_screen	const	-	WELCOME_START_KEY_GAP
+14	welcome_screen	fn	-	welcome_start_columns
+0		struct	-	LochWelcomePlan
+14	welcome_screen	fn	-	loch_welcome_plan
+14	welcome_screen	const	-	WELCOME_TAGLINE
+0		struct	-	LspQuestion
+0		struct	-	PendingCompletionResolve
+22	completion	enum	-	ImportUndo
+22	completion	fn	-	text_hash_before
+20	language_servers	fn	-	server_message_status
+0		fn	-	open_url
+0		fn	-	remote_host_label
+28	bottom_panel	enum	-	PortOpenAction
+28	bottom_panel	fn	-	plan_port_open
+9	settings	fn	-	config_watch_paths
+0		fn	impl App	new
+30	inline_images	fn	impl App	theme_bg_pixel
+30	inline_images	fn	impl App	chrome_bg_pixel
+30	inline_images	fn	impl App	inline_images_enabled
+30	inline_images	fn	impl App	image_eviction_needs_screen_wipe
+30	inline_images	fn	impl App	evict_inline_images_on_clear
+30	inline_images	fn	impl App	consume_resize_repaint
+30	inline_images	fn	impl App	init_graphics
+30	inline_images	fn	impl App	start_chrome_bake
+30	inline_images	fn	impl App	drop_chrome_images
+30	inline_images	fn	impl App	poll_chrome_bake
+30	inline_images	fn	impl App	apply_chrome_images
+30	inline_images	fn	impl App	bake_chrome_images
+30	inline_images	fn	impl App	clear_run_debug_icon_if_emitted
+30	inline_images	fn	impl App	flush_run_debug_icon_overlay
+30	inline_images	fn	impl App	clear_problems_badge_if_emitted
+30	inline_images	fn	impl App	flush_problems_badge_overlay
+30	inline_images	fn	impl App	flush_no_repo_hero_overlay
+30	inline_images	fn	impl App	flush_ssh_empty_state_overlay
+30	inline_images	fn	impl App	consume_ssh_empty_state_image_clear
+30	inline_images	fn	impl App	consume_run_debug_image_clear
+30	inline_images	fn	impl App	consume_problems_badge_image_clear
+30	inline_images	fn	impl App	consume_activity_image_clear
+30	inline_images	fn	impl App	on_resize
+30	inline_images	fn	impl App	consume_no_repo_hero_image_clear
+30	inline_images	fn	impl App	active_sidebar_image_rect
+30	inline_images	fn	impl App	flush_tooltip_over_image
+30	inline_images	fn	impl App	pending_activity_image_overlays
+30	inline_images	fn	impl App	settings_menu_active
+30	inline_images	fn	impl App	activity_keepalive_allowed
+0		fn	impl App	flush_activity_image_overlays
+30	inline_images	fn	impl App	overlay_fits_on_screen
+0		fn	impl App	poke_cursor
+39	frame	fn	impl App	cursor_should_be_visible
+39	frame	fn	impl App	quick_input_owns_caret
+39	frame	fn	impl App	quick_input_caret
+39	frame	fn	impl App	cursor_visible_phase
+15	scm	fn	impl App	refresh_git_status_debounced
+0		fn	impl App	sync_open_file_poll_mtime
+18	explorer	fn	impl App	polled_open_file_paths
+18	explorer	fn	impl App	open_tab_paths
+18	explorer	fn	impl App	reload_open_file_after_external_change
+18	explorer	fn	impl App	prompt_disk_conflict
+18	explorer	fn	impl App	poll_filesystem_changes
+18	explorer	fn	impl App	try_install_pending_init
+15	scm	fn	impl App	drain_git_responses
+15	scm	fn	impl App	ask_default_branch
+15	scm	fn	impl App	take_default_branch
+15	scm	fn	impl App	seed_active_scm
+29	workbench	fn	impl App	refresh_scm_change_badge
+29	workbench	fn	impl App	build_count_badge_image
+27	save_restore	fn	impl App	unsaved_count
+29	workbench	fn	impl App	refresh_explorer_unsaved_badge
+29	workbench	fn	impl App	refresh_remote_ports_badge
+29	workbench	fn	impl App	refresh_testing_badge
+29	workbench	fn	impl App	refresh_problems_badge
+23	search	fn	impl App	submit_search_query
+23	search	fn	impl App	drain_search_results
+35	commands	fn	impl App	drain_ext_index_refresh
+35	commands	fn	impl App	refresh_extension_index
+20	language_servers	fn	impl App	sync_lsp
+28	bottom_panel	fn	impl App	sync_markdown_lint
+28	bottom_panel	fn	impl App	withdraw_markdown_lint
+1	code_scanning	fn	impl App	sync_sarif_diagnostics
+0		fn	impl App	workspace_root
+0		fn	impl App	scm_root
+7	runners	fn	impl App	followed_test_root
+7	runners	fn	impl App	refollow_test_root
+0		fn	impl App	active_workspace_root
+0		fn	impl App	workspace_folders
+15	scm	fn	impl App	sync_nested_repos
+15	scm	fn	impl App	git_worker_for_root
+15	scm	fn	impl App	git_worker_for_root_mut
+15	scm	fn	impl App	scm_worker
+15	scm	fn	impl App	refresh_scm_repositories
+15	scm	fn	impl App	active_git_bypass_debounce
+15	scm	fn	impl App	sync_git_gutters
+15	scm	fn	impl App	sync_blame
+15	scm	fn	impl App	drain_blame
+15	scm	fn	impl App	caret_line_commit
+15	scm	fn	impl App	open_commit_for_line
+15	scm	fn	impl App	hover_blame_card
+15	scm	fn	impl App	drain_blame_hover
+22	completion	fn	impl App	drain_lsp_completion
+22	completion	fn	impl App	apply_completion_result
+22	completion	fn	impl App	completion_origin_covers_caret
+22	completion	fn	impl App	apply_resolved_completion
+22	completion	fn	impl App	handle_editor_tab
+22	completion	fn	impl App	try_expand_snippet
+22	completion	fn	impl App	expand_snippet
+22	completion	fn	impl App	expand_snippet_in
+22	completion	fn	impl App	trigger_completion
+22	completion	fn	impl App	request_completion_at_caret
+22	completion	fn	impl App	word_completion_items
+22	completion	fn	impl App	trigger_signature_help
+22	completion	fn	impl App	dismiss_signature_help
+22	completion	fn	impl App	refresh_signature_help_if_moved
+22	completion	fn	impl App	drain_lsp_signature_help
+29	workbench	fn	impl App	activity_icon_at
+38	mouse_input	fn	impl App	ui_tooltip_text_at
+38	mouse_input	fn	impl App	search_result_hint_at
+38	mouse_input	fn	impl App	ui_tooltip_at
+38	mouse_input	fn	impl App	extensions_tooltip_at
+38	mouse_input	fn	impl App	reread_ui_tooltip
+38	mouse_input	fn	impl App	poll_ui_tooltip
+38	mouse_input	fn	impl App	on_mouse_moved
+38	mouse_input	fn	impl App	poll_hover
+38	mouse_input	fn	impl App	hover_at_cell
+38	mouse_input	fn	impl App	show_hover_at_caret
+38	mouse_input	fn	impl App	caret_hover_point
+38	mouse_input	fn	impl App	hover_at
+38	mouse_input	fn	impl App	poll_tab_hover
+20	language_servers	fn	impl App	rust_analyzer_serves_active_file
+20	language_servers	fn	impl App	request_rust_analyzer
+20	language_servers	fn	impl App	drain_lsp_rust_analyzer
+20	language_servers	fn	impl App	apply_rust_analyzer_result
+38	mouse_input	fn	impl App	drain_lsp_hover
+20	language_servers	fn	impl App	drain_lsp_semantic_tokens
+20	language_servers	fn	impl App	drain_lsp_inlay_hints
+20	language_servers	fn	impl App	fan_out_batch
+20	language_servers	fn	impl App	drain_lsp_document_links
+20	language_servers	fn	impl App	open_document_link
+20	language_servers	fn	impl App	drain_lsp_folding_ranges
+20	language_servers	fn	impl App	drain_lsp_document_colors
+20	language_servers	fn	impl App	change_color_presentation
+20	language_servers	fn	impl App	drain_lsp_color_presentations
+28	bottom_panel	fn	impl App	merged_diagnostics
+28	bottom_panel	const	impl App	PROJECT_CHECK_ID
+28	bottom_panel	fn	impl App	first_meaningful_line
+28	bottom_panel	fn	impl App	drain_project_check
+28	bottom_panel	fn	impl App	queue_project_check_result_for_test
+28	bottom_panel	fn	impl App	project_check_hinted_for_test
+28	bottom_panel	fn	impl App	send_project_hint_for_test
+28	bottom_panel	fn	impl App	finish_project_check_for_test
+28	bottom_panel	fn	impl App	ingest_project_check
+28	bottom_panel	const	impl App	PROJECT_CHECK_AUTO_MAX_FILES
+28	bottom_panel	fn	impl App	workspace_exceeds
+28	bottom_panel	fn	impl App	project_check_auto_enabled
+28	bottom_panel	fn	impl App	project_scope_mode
+28	bottom_panel	fn	impl App	project_check_command
+28	bottom_panel	fn	impl App	collect_tsc_runs
+28	bottom_panel	fn	impl App	project_check_count
+28	bottom_panel	fn	impl App	apply_build_scan
+28	bottom_panel	fn	impl App	install_build_diags
+28	bottom_panel	fn	impl App	reload_matchers
+28	bottom_panel	fn	impl App	clear_build_diagnostics
+0		fn	impl App	open_buffer_paths
+28	bottom_panel	fn	impl App	rebuild_problems
+28	bottom_panel	fn	impl App	drain_lsp_diagnostics
+28	bottom_panel	fn	impl App	apply_diagnostics_updates
+20	language_servers	fn	impl App	drain_lsp_progress
+20	language_servers	fn	impl App	apply_server_update
+20	language_servers	fn	impl App	ask_next_lsp_question
+20	language_servers	fn	impl App	show_server_document
+20	language_servers	fn	impl App	lsp_progress_status
+20	language_servers	fn	impl App	refresh_semantic_tokens_if_requested
+20	language_servers	fn	impl App	refresh_inlay_hints_if_requested
+20	language_servers	fn	impl App	refresh_workspace_diagnostics_if_requested
+20	language_servers	fn	impl App	request_inlay_hints_for_open_editors
+20	language_servers	fn	impl App	inlay_hint_targets
+20	language_servers	fn	impl App	toggle_inlay_hints
+20	language_servers	fn	impl App	go_to_definition
+20	language_servers	fn	impl App	try_go_to_definition
+20	language_servers	fn	impl App	build_breadcrumbs
+20	language_servers	fn	impl App	breadcrumb_targets
+20	language_servers	fn	impl App	open_breadcrumb_picker
+20	language_servers	fn	impl App	open_crumb_folder_picker
+20	language_servers	fn	impl App	show_crumb_picker
+20	language_servers	fn	impl App	apply_crumb_filter
+20	language_servers	fn	impl App	open_crumb_file
+20	language_servers	fn	impl App	focus_breadcrumbs
+20	language_servers	fn	impl App	build_sticky_lines
+20	language_servers	fn	impl App	sync_outline
+20	language_servers	fn	impl App	start_outline_parse
+20	language_servers	fn	impl App	drain_outline_parse
+18	explorer	fn	impl App	sync_explorer_panels
+18	explorer	fn	impl App	activate_open_editor
+18	explorer	fn	impl App	open_timeline_diff
+18	explorer	fn	impl App	restore_history_snapshot
+20	language_servers	fn	impl App	apply_outline_symbols
+20	language_servers	fn	impl App	compute_syntax_outline
+20	language_servers	fn	impl App	drain_lsp_document_symbols
+20	language_servers	fn	impl App	drain_lsp_definition
+20	language_servers	fn	impl App	open_peek_popup
+20	language_servers	fn	impl App	open_peek_popup_titled
+20	language_servers	fn	impl App	close_peek_popup
+20	language_servers	fn	impl App	show_peeked_reference
+20	language_servers	fn	impl App	step_peeked_reference
+20	language_servers	fn	impl App	peek_references_at_cursor
+20	language_servers	fn	impl App	drain_lsp_declaration
+20	language_servers	fn	impl App	drain_lsp_type_definition
+20	language_servers	fn	impl App	finish_jump
+20	language_servers	fn	impl App	drain_lsp_implementation
+20	language_servers	fn	impl App	drain_lsp_references
+20	language_servers	fn	impl App	drain_lsp_call_hierarchy
+20	language_servers	fn	impl App	present_call_hierarchy_menu
+20	language_servers	fn	impl App	request_call_hierarchy_at_cursor
+20	language_servers	fn	impl App	request_type_hierarchy_at_cursor
+20	language_servers	fn	impl App	editor_language_supports_call_hierarchy
+20	language_servers	fn	impl App	editor_language
+20	language_servers	fn	impl App	editor_language_supports
+20	language_servers	fn	impl App	tick_on_type_formatting
+20	language_servers	fn	impl App	on_type_reply_disposition
+20	language_servers	fn	impl App	drain_lsp_on_type_format
+20	language_servers	fn	impl App	apply_on_type_edits
+20	language_servers	fn	impl App	tick_linked_editing
+20	language_servers	fn	impl App	drain_lsp_linked_editing
+20	language_servers	fn	impl App	expand_selection
+20	language_servers	fn	impl App	shrink_selection
+20	language_servers	fn	impl App	drain_lsp_selection_ranges
+20	language_servers	fn	impl App	tick_occurrences
+20	language_servers	fn	impl App	drain_lsp_document_highlights
+20	language_servers	fn	impl App	open_location_picker
+20	language_servers	fn	impl App	location_under_caret
+29	workbench	fn	impl App	settings_menu_origin
+29	workbench	fn	impl App	open_settings_menu
+29	workbench	fn	impl App	open_sponsor_page
+29	workbench	fn	impl App	customize_layout_origin
+29	workbench	fn	impl App	customize_layout_items
+29	workbench	fn	impl App	open_customize_layout_menu_on
+29	workbench	fn	impl App	open_customize_layout_menu_at
+29	workbench	fn	impl App	open_customize_layout_menu
+29	workbench	fn	impl App	persist_layout
+29	workbench	fn	impl App	toggle_activity_bar
+29	workbench	fn	impl App	toggle_status_bar
+29	workbench	fn	impl App	set_side_bar_position
+29	workbench	fn	impl App	set_panel_alignment
+29	workbench	fn	impl App	set_quick_input_position
+29	workbench	fn	impl App	open_panel_alignment_picker
+29	workbench	fn	impl App	open_quick_input_position_picker
+29	workbench	fn	impl App	after_chrome_visibility_change
+29	workbench	fn	impl App	toggle_side_bar
+29	workbench	fn	impl App	toggle_secondary_side_bar
+29	workbench	fn	impl App	toggle_zen_mode
+29	workbench	fn	impl App	centered_layout_active
+29	workbench	fn	impl App	toggle_centered_layout
+29	workbench	fn	impl App	note_idle_zen_esc
+29	workbench	fn	impl App	esc_fingerprint
+29	workbench	fn	impl App	expire_zen_hint
+29	workbench	fn	impl App	toggle_screencast_mode
+29	workbench	fn	impl App	screencast_hides_typing
+29	workbench	fn	impl App	render_screencast
+9	settings	fn	impl App	open_theme_picker
+18	explorer	fn	impl App	explorer_view_label
+18	explorer	fn	impl App	explorer_view_available
+18	explorer	fn	impl App	open_explorer_views_menu
+18	explorer	fn	impl App	toggle_explorer_view
+18	explorer	fn	impl App	agent_lane_panel_rows
+18	explorer	fn	impl App	lane_changes
+18	explorer	fn	impl App	show_agent_lane_section
+18	explorer	fn	impl App	render_explorer_sections
+9	settings	fn	impl App	apply_theme
+9	settings	fn	impl App	apply_theme_visuals
+9	settings	fn	impl App	rebake_inline_images
+26	editor_tabs	fn	impl App	open_at_utf16
+26	editor_tabs	fn	impl App	go_to_problem
+26	editor_tabs	fn	impl App	open_at
+26	editor_tabs	fn	impl App	place_caret_at
+26	editor_tabs	fn	impl App	current_nav_loc
+26	editor_tabs	fn	impl App	recording_file_switches
+26	editor_tabs	fn	impl App	editor_group_identity
+26	editor_tabs	fn	impl App	keep_preview_open_for_navigation_to
+26	editor_tabs	fn	impl App	restore_preview_after_failed_navigation
+26	editor_tabs	fn	impl App	nav_back
+26	editor_tabs	fn	impl App	nav_forward
+26	editor_tabs	fn	impl App	goto_last_edit_location
+21	language_servers	fn	impl App	trigger_definition_at
+21	language_servers	fn	impl App	peek_definition_at_cursor
+21	language_servers	fn	impl App	request_definition_at_cursor
+21	language_servers	fn	impl App	request_at_cursor
+21	language_servers	fn	impl App	request_declaration_at_cursor
+21	language_servers	fn	impl App	request_type_definition_at_cursor
+21	language_servers	fn	impl App	request_implementation_at_cursor
+21	language_servers	fn	impl App	request_references_at_cursor
+21	language_servers	fn	impl App	editor_language_supports_declaration
+21	language_servers	fn	impl App	editor_language_supports_type_definition
+21	language_servers	fn	impl App	editor_language_supports_implementation
+21	language_servers	fn	impl App	editor_language_supports_references
+21	language_servers	fn	impl App	editor_language_supports_code_action
+33	editor_input	fn	impl App	start_change_all_occurrences
+33	editor_input	fn	impl App	select_all_occurrences
+33	editor_input	fn	impl App	add_cursors_to_line_ends
+33	editor_input	fn	impl App	expand_line_selection
+33	editor_input	fn	impl App	start_select_next_occurrence
+33	editor_input	fn	impl App	delete_current_line
+33	editor_input	fn	impl App	kill_to_end_of_line
+21	language_servers	fn	impl App	start_rename_symbol
+21	language_servers	fn	impl App	open_rename_prompt_fallback
+21	language_servers	fn	impl App	drain_lsp_prepare_rename
+21	language_servers	fn	impl App	apply_prepare_rename_verdict
+21	language_servers	fn	impl App	drain_lsp_rename
+21	language_servers	fn	impl App	land_rename
+21	language_servers	fn	impl App	stale_edit_target
+21	language_servers	fn	impl App	edit_seqs_in_every_group
+21	language_servers	fn	impl App	buffer_group
+21	language_servers	fn	impl App	apply_edits_to_open_buffer
+21	language_servers	fn	impl App	apply_rename_edits
+21	language_servers	fn	impl App	start_format_document
+21	language_servers	fn	impl App	format_target_seq
+21	language_servers	fn	impl App	format_selection
+21	language_servers	fn	impl App	drain_prettier_format
+21	language_servers	fn	impl App	drain_lsp_format
+21	language_servers	fn	impl App	drain_lsp_format_at
+21	language_servers	fn	impl App	save_without_formatting
+21	language_servers	fn	impl App	path_is_saved
+21	language_servers	fn	impl App	land_format
+17	diff_merge	fn	impl App	jump_conflict
+17	diff_merge	fn	impl App	open_merge_conflict_picker
+17	diff_merge	fn	impl App	resolve_merge_at_cursor
+17	diff_merge	fn	impl App	untrimmed_both_at
+17	diff_merge	fn	impl App	resolve_all_merge
+17	diff_merge	fn	impl App	complete_merge
+17	diff_merge	fn	impl App	open_merge_editor_for
+17	diff_merge	fn	impl App	repo_rel
+17	diff_merge	fn	impl App	merge_view_sync
+17	diff_merge	fn	impl App	merge_target_conflict
+17	diff_merge	fn	impl App	merge_set_conflict
+17	diff_merge	fn	impl App	merge_apply
+17	diff_merge	fn	impl App	merge_accept_all
+17	diff_merge	fn	impl App	merge_toggle_side
+17	diff_merge	fn	impl App	merge_jump
+21	language_servers	fn	impl App	code_action_request
+21	language_servers	fn	impl App	start_code_action
+21	language_servers	fn	impl App	drain_lsp_code_actions
+21	language_servers	fn	impl App	open_code_action_picker
+21	language_servers	fn	impl App	apply_code_action
+21	language_servers	fn	impl App	apply_resolved_code_action
+21	language_servers	fn	impl App	resolve_and_apply_code_action
+22	completion	fn	impl App	accept_completion_edit
+22	completion	fn	impl App	typed_word_edit
+22	completion	fn	impl App	request_completion_imports
+22	completion	fn	impl App	handle_completion_popup_key
+22	completion	fn	impl App	refresh_completion_prefix
+22	completion	fn	impl App	note_incomplete_completion_edit
+22	completion	fn	impl App	send_due_completion_reask
+22	completion	fn	impl App	note_completion_typed
+22	completion	fn	impl App	send_due_completion_ask
+18	explorer	fn	impl App	drain_fs_events
+18	explorer	fn	impl App	forward_disk_changes_to_lsp
+0		fn	impl App	cycle_focus
+14	welcome_screen	fn	impl App	consume_welcome_image_clear
+14	welcome_screen	fn	impl App	render_welcome
+14	welcome_screen	const	impl App	WELCOME_TAGLINE_CALM
+14	welcome_screen	fn	impl App	welcome_chord
+14	welcome_screen	fn	impl App	welcome_start_rows
+14	welcome_screen	fn	impl App	click_welcome_start
+14	welcome_screen	fn	impl App	render_welcome_panel
+14	welcome_screen	fn	impl App	place_welcome_logo
+14	welcome_screen	fn	impl App	render_welcome_loch
+21	language_servers	fn	impl App	render_secondary_side_bar
+21	language_servers	fn	impl App	with_secondary_outline
+21	language_servers	fn	impl App	click_secondary_outline
+29	workbench	fn	impl App	paint_layout_icons
+29	workbench	fn	impl App	render_activity_bar
+29	workbench	fn	impl App	set_sidebar_view
+29	workbench	fn	impl App	click_activity_view
+29	workbench	fn	impl App	activity_view_active
+35	commands	fn	impl App	refresh_extensions
+35	commands	fn	impl App	reload_lsp_extensions
+35	commands	fn	impl App	compare_extensions_with_vscode
+0		fn	impl App	pane_visible
+28	bottom_panel	fn	impl App	toggle_terminal
+28	bottom_panel	fn	impl App	toggle_terminal_maximize
+0		fn	impl App	terminal
+0		fn	impl App	terminal_mut
+24	terminal_panes	fn	impl App	split_terminal
+24	terminal_panes	fn	impl App	split_terminal_with_shell
+24	terminal_panes	fn	impl App	next_terminal_cwd
+24	terminal_panes	fn	impl App	insert_terminal
+24	terminal_panes	fn	impl App	terminal_status
+24	terminal_panes	fn	impl App	save_terminal_session
+24	terminal_panes	fn	impl App	restore_terminal_session
+24	terminal_panes	fn	impl App	restore_terminal_session_with
+24	terminal_panes	fn	impl App	save_terminal_session_if_hosted
+24	terminal_panes	fn	impl App	terminal_profiles
+24	terminal_panes	fn	impl App	terminal_caret_origin
+24	terminal_panes	fn	impl App	open_terminal_profile_picker
+24	terminal_panes	fn	impl App	run_terminal_command
+24	terminal_panes	fn	impl App	clear_terminal_at
+24	terminal_panes	fn	impl App	begin_rename_terminal
+24	terminal_panes	fn	impl App	begin_annotate_terminal
+24	terminal_panes	fn	impl App	delete_terminal_annotations_in_selection
+24	terminal_panes	fn	impl App	close_terminal_at
+24	terminal_panes	fn	impl App	toggle_terminal_pane_maximize
+13	host_integration	fn	impl App	answer_view_client
+24	terminal_panes	fn	impl App	paint_terminal_collapsed_strip
+24	terminal_panes	fn	impl App	toggle_terminal_collapse
+24	terminal_panes	fn	impl App	collapse_active_terminal_pane
+24	terminal_panes	fn	impl App	reveal_terminal_pane
+24	terminal_panes	fn	impl App	restore_all_terminal_panes
+24	terminal_panes	fn	impl App	ensure_a_terminal_pane_is_expanded
+24	terminal_panes	fn	impl App	clear_terminal_rail
+24	terminal_panes	fn	impl App	paint_terminal_rail
+24	terminal_panes	fn	impl App	move_terminal
+24	terminal_panes	fn	impl App	flush_terminal_session
+24	terminal_panes	fn	impl App	close_active_terminal
+24	terminal_panes	fn	impl App	split_terminal_reporting
+24	terminal_panes	fn	impl App	close_terminal_reporting
+24	terminal_panes	fn	impl App	dismiss_exited_terminal
+24	terminal_panes	fn	impl App	live_terminal_count
+24	terminal_panes	fn	impl App	undo_close_terminal
+24	terminal_panes	fn	impl App	reap_closed_terminals
+26	editor_tabs	fn	impl App	record_closed_tab_at
+26	editor_tabs	fn	impl App	push_closed_tabs
+26	editor_tabs	fn	impl App	record_closed_tabs_where
+26	editor_tabs	fn	impl App	reopen_closed_tab
+24	terminal_panes	fn	impl App	set_host_accents
+25	terminal_tools	fn	impl App	toggle_secret_redaction
+25	terminal_tools	fn	impl App	reveal_redacted_secrets
+25	terminal_tools	fn	impl App	redactions_revealed
+25	terminal_tools	fn	impl App	tick_redaction_reveal
+25	terminal_tools	fn	impl App	redacted_on_screen
+25	terminal_tools	fn	impl App	forwarded_pane_index
+25	terminal_tools	fn	impl App	terminal_text_for_copy
+25	terminal_tools	fn	impl App	toggle_terminal_timestamps
+25	terminal_tools	fn	impl App	toggle_broadcast_input
+25	terminal_tools	fn	impl App	confirm_pending_broadcast
+25	terminal_tools	fn	impl App	cancel_pending_broadcast
+25	terminal_tools	fn	impl App	toggle_broadcast_exclusion
+25	terminal_tools	fn	impl App	run_selected_text_in_terminal
+25	terminal_tools	fn	impl App	paste_terminal_input
+25	terminal_tools	fn	impl App	multiline_paste_needs_confirm
+25	terminal_tools	fn	impl App	confirm_pending_terminal_paste
+25	terminal_tools	fn	impl App	cancel_pending_terminal_paste
+25	terminal_tools	fn	impl App	paste_terminal_input_now
+24	terminal_panes	fn	impl App	cycle_terminal
+24	terminal_panes	fn	impl App	cycle_terminal_back
+24	terminal_panes	fn	impl App	step_active_terminal
+24	terminal_panes	fn	impl App	drain_terminals_dirty
+24	terminal_panes	fn	impl App	record_resize
+24	terminal_panes	fn	impl App	record_active_screen
+24	terminal_panes	fn	impl App	peek_terminals_dirty
+24	terminal_panes	fn	impl App	peek_terminals_pending_bytes
+24	terminal_panes	fn	impl App	terminal_at_pos
+29	workbench	fn	impl App	without_auto_hide
+10	agents_collab	fn	impl App	sync_approval_check
+10	agents_collab	fn	impl App	end_approval_check
+10	agents_collab	fn	impl App	drain_hook_requests
+10	agents_collab	fn	impl App	dirty_tab_lines
+10	agents_collab	fn	impl App	refresh_approval_target_dirty
+10	agents_collab	fn	impl App	notify_new_approvals
+10	agents_collab	fn	impl App	apply_auto_approve
+10	agents_collab	fn	impl App	stop_auto_approve
+10	agents_collab	fn	impl App	handle_approval_key
+10	agents_collab	fn	impl App	start_approval_edit
+10	agents_collab	fn	impl App	check_approval_edit
+10	agents_collab	fn	impl App	approve_saved_edit
+10	agents_collab	fn	impl App	render_approval_popup
+0		fn	impl App	modal_overlay_open
+33	editor_input	fn	impl App	prompt_takes_input
+29	workbench	fn	impl App	sidebar_structurally_suppressed
+29	workbench	fn	impl App	sidebar_auto_hide_allowed
+29	workbench	fn	impl App	toggle_sidebar_auto_hide
+29	workbench	fn	impl App	maybe_auto_hide_sidebar
+38	mouse_input	fn	impl App	dismiss_click_overlays
+29	workbench	fn	impl App	tick_sidebar_auto_hide
+29	workbench	fn	impl App	tick_sidebar_auto_hide_at
+0		fn	impl App	focus_pane
+0		fn	impl App	sync_focus_flags
+24	terminal_panes	fn	impl App	dress_host_accents
+0		fn	impl App	popup_gradient
+39	frame	fn	impl App	paint_surface_seams
+28	bottom_panel	fn	impl App	paint_panel_tabs
+28	bottom_panel	fn	impl App	paint_panel_view_top
+28	bottom_panel	fn	impl App	paint_panel_actions
+28	bottom_panel	fn	impl App	set_bottom_panel_tab
+28	bottom_panel	fn	impl App	show_status_messages
+28	bottom_panel	fn	impl App	open_output_channel_picker
+26	editor_tabs	fn	impl App	split_editor
+26	editor_tabs	fn	impl App	split_editor_dir
+26	editor_tabs	fn	impl App	move_active_editor
+26	editor_tabs	fn	impl App	move_active_editor_to_group
+26	editor_tabs	fn	impl App	move_active_editor_to_adjacent_group
+26	editor_tabs	fn	impl App	move_active_tab
+26	editor_tabs	fn	impl App	split_in_group
+26	editor_tabs	fn	impl App	scroll_inactive_group_at
+26	editor_tabs	fn	impl App	focus_editor_group
+26	editor_tabs	fn	impl App	seam_at
+26	editor_tabs	fn	impl App	collapse_split_if_empty
+26	editor_tabs	fn	impl App	move_into_new_window
+26	editor_tabs	fn	impl App	copy_into_new_window
+26	editor_tabs	fn	impl App	open_tab_in_new_window
+39	frame	fn	impl App	render_for_terminal
+39	frame	fn	impl App	render
+31	menus	fn	impl App	render_context_menu
+31	menus	fn	impl App	render_menu_card
+31	menus	fn	impl App	render_menu_panel
+15	scm	fn	impl App	render_commit_dropdown
+15	scm	fn	impl App	dispatch_commit_menu_item
+15	scm	fn	impl App	render_discard_confirm
+15	scm	fn	impl App	render_revert_hunk_confirm
+27	save_restore	fn	impl App	unsaved_confirm_text
+27	save_restore	fn	impl App	render_unsaved_confirm
+27	save_restore	fn	impl App	render_lossy_save_confirm
+23	search	fn	impl App	render_replace_all_confirm
+15	scm	fn	impl App	render_unsaved_scm_confirm
+15	scm	fn	impl App	render_discard_all_confirm
+15	scm	fn	impl App	render_stash_drop_confirm
+25	terminal_tools	fn	impl App	render_broadcast_confirm
+25	terminal_tools	fn	impl App	render_terminal_paste_confirm
+25	terminal_tools	fn	impl App	render_run_block_confirm
+13	host_integration	fn	impl App	render_terminal_warning
+12	remote_sessions	fn	impl App	render_local_open_confirm
+29	workbench	fn	impl App	render_zen_hint
+28	bottom_panel	fn	impl App	render_port_toast
+13	host_integration	fn	impl App	render_update_toast
+13	host_integration	fn	impl App	paint_update_toast
+13	host_integration	fn	impl App	update_card_covers
+13	host_integration	fn	impl App	drop_covered_update_controls
+13	host_integration	fn	impl App	update_card
+32	prompts	fn	impl App	prompt_field_line
+32	prompts	fn	impl App	render_prompt
+36	key_input	fn	impl App	ctrl_k_leads_here
+36	key_input	fn	impl App	handle_cmd_k_chord
+36	key_input	fn	impl App	handle_key
+36	key_input	fn	impl App	handle_key_inner
+23	search	fn	impl App	handle_search_key
+23	search	fn	impl App	toggle_search_opt
+23	search	fn	impl App	open_replace_in_files
+23	search	fn	impl App	refresh_search_if_filtering
+23	search	fn	impl App	run_search_replace_all
+23	search	fn	impl App	dirty_open_paths
+23	search	fn	impl App	confirm_pending_replace_all
+23	search	fn	impl App	cancel_pending_replace_all
+12	remote_sessions	fn	impl App	handle_remote_key
+15	scm	fn	impl App	handle_source_control_key
+15	scm	fn	impl App	handle_source_control_list_key
+15	scm	fn	impl App	refresh_source_control
+15	scm	fn	impl App	refresh_commit_graph
+15	scm	fn	impl App	open_stash_patch
+15	scm	fn	impl App	open_commit_patch
+35	commands	fn	impl App	handle_extensions_key
+35	commands	fn	impl App	toggle_selected_extension
+35	commands	fn	impl App	uninstall_selected_extension
+35	commands	fn	impl App	perform_extension_uninstall
+35	commands	fn	impl App	persist_extension_consent
+35	commands	fn	impl App	forget_extension_consent
+35	commands	fn	impl App	extensions_dir
+35	commands	fn	impl App	is_extension_enabled
+2	codeql	fn	impl App	codeql_unavailable
+5	debugger	fn	impl App	handle_run_debug_key
+7	runners	fn	impl App	handle_testing_key
+7	runners	fn	impl App	show_test_runner_output
+7	runners	fn	impl App	refuse_test_run_while_busy
+7	runners	fn	impl App	cancel_test_run
+7	runners	fn	impl App	testing_runner_available
+7	runners	fn	impl App	rebind_test_root
+7	runners	fn	impl App	run_all_tests_with_coverage
+7	runners	fn	impl App	sync_coverage
+7	runners	fn	impl App	file_changed_since_coverage
+7	runners	fn	impl App	clear_coverage
+7	runners	fn	impl App	show_coverage_report
+35	commands	fn	impl App	show_memory_usage
+7	runners	fn	impl App	install_coverage_tool
+5	debugger	fn	impl App	install_delve
+12	remote_sessions	fn	impl App	sync_config_to
+7	runners	fn	impl App	toggle_test_watch
+7	runners	fn	impl App	tick_test_watch
+7	runners	fn	impl App	go_to_first_failed_test
+2	codeql	fn	impl App	run_codeql_tests
+2	codeql	fn	impl App	accept_codeql_test_output
+2	codeql	fn	impl App	set_codeql_program
+2	codeql	fn	impl App	resolve_codeql_cli
+7	runners	fn	impl App	run_all_tests
+7	runners	fn	impl App	run_test
+7	runners	fn	impl App	jump_to_test_source
+7	runners	fn	impl App	run_suite
+7	runners	fn	impl App	run_test_at_cursor
+7	runners	fn	impl App	run_named_test
+7	runners	fn	impl App	run_named_test_now
+7	runners	fn	impl App	testing_busy_says_so
+7	runners	fn	impl App	run_tests_in_current_file
+7	runners	fn	impl App	rerun_failed_tests
+7	runners	fn	impl App	start_many_tests
+7	runners	fn	impl App	rerun_last_test_run
+7	runners	fn	impl App	await_test_run_outcome
+7	runners	fn	impl App	announce_test_run_end
+7	runners	fn	impl App	speak_test_run_end
+7	runners	fn	impl App	await_pane_outcome
+7	runners	fn	impl App	run_test_at_cursor_with_coverage
+7	runners	fn	impl App	run_test_at_cursor_with_coverage_now
+7	runners	fn	impl App	run_scope_with_coverage
+7	runners	fn	impl App	run_scope_with_coverage_now
+5	debugger	fn	impl App	debug_test_at_cursor
+5	debugger	fn	impl App	test_runner_for_focused_file
+5	debugger	fn	impl App	debug_named_test
+5	debugger	fn	impl App	debug_named_test_now
+5	debugger	fn	impl App	start_test_binary_build
+5	debugger	fn	impl App	start_cargo_program_build
+5	debugger	fn	impl App	drain_pending_cargo_launch
+5	debugger	fn	impl App	drain_pending_test_debug
+5	debugger	fn	impl App	launch_lldb_test_debug
+7	runners	fn	impl App	discover_tests
+7	runners	fn	impl App	rediscover_tests
+2	codeql	fn	impl App	open_codeql_view
+2	codeql	fn	impl App	handle_codeql_key
+2	codeql	fn	impl App	open_codeql_database_sources
+2	codeql	fn	impl App	open_codeql_database_picker
+2	codeql	fn	impl App	activate_codeql
+2	codeql	fn	impl App	codeql_variant_path
+2	codeql	fn	impl App	refresh_codeql_variant
+2	codeql	fn	impl App	edit_codeql_variant
+2	codeql	fn	impl App	prompt_codeql_controller
+2	codeql	fn	impl App	submit_codeql_controller
+2	codeql	fn	impl App	prompt_add_codeql_variant_repo
+2	codeql	fn	impl App	submit_add_codeql_variant_repo
+2	codeql	fn	impl App	prompt_codeql_variant_code_search
+2	codeql	fn	impl App	codeql_search_language
+2	codeql	fn	impl App	start_codeql_variant_code_search
+2	codeql	fn	impl App	drain_codeql_code_search
+2	codeql	fn	impl App	prompt_add_codeql_variant_list
+2	codeql	fn	impl App	submit_add_codeql_variant_list
+2	codeql	fn	impl App	prompt_add_codeql_variant_owner
+2	codeql	fn	impl App	install_codeql_pack_dependencies
+2	codeql	fn	impl App	open_codeql_quick_query
+2	codeql	fn	impl App	prompt_download_codeql_packs
+2	codeql	fn	impl App	submit_download_codeql_packs
+2	codeql	fn	impl App	start_codeql_pack_job
+2	codeql	fn	impl App	drain_codeql_pack_job
+2	codeql	fn	impl App	submit_add_codeql_variant_owner
+2	codeql	fn	impl App	prompt_rename_codeql_variant_list
+2	codeql	fn	impl App	submit_rename_codeql_variant_list
+2	codeql	fn	impl App	remove_codeql_variant_item
+2	codeql	fn	impl App	perform_remove_codeql_variant_list
+2	codeql	fn	impl App	keep_codeql_selection_on_a_row
+2	codeql	fn	impl App	select_codeql_variant_item
+2	codeql	fn	impl App	open_codeql_variant_config
+2	codeql	fn	impl App	codeql_variant_github_url
+2	codeql	fn	impl App	open_codeql_variant_on_github
+0		fn	impl App	open_url_for_user
+0		fn	impl App	try_open_url_for_user
+2	codeql	fn	impl App	current_codeql_database
+2	codeql	fn	impl App	confirm_remove_codeql_database
+2	codeql	fn	impl App	codeql_cached_copy
+2	codeql	fn	impl App	cache_entry_holding
+2	codeql	fn	impl App	perform_remove_codeql_database
+2	codeql	fn	impl App	prompt_rename_codeql_database
+2	codeql	fn	impl App	submit_rename_codeql_database
+2	codeql	fn	impl App	sort_codeql_databases
+2	codeql	fn	impl App	reveal_codeql_database
+2	codeql	fn	impl App	upgrade_codeql_database
+2	codeql	fn	impl App	start_codeql_db_job
+2	codeql	fn	impl App	drain_codeql_upgrade
+2	codeql	fn	impl App	copy_codeql_version
+2	codeql	fn	impl App	drain_codeql_version
+2	codeql	fn	impl App	read_codeql_version
+2	codeql	fn	impl App	download_codeql_cli
+2	codeql	fn	impl App	start_codeql_cli_download
+2	codeql	fn	impl App	drain_codeql_cli_download
+2	codeql	fn	impl App	check_codeql_cli_updates
+2	codeql	fn	impl App	drain_codeql_cli_check
+2	codeql	fn	impl App	add_codeql_database_source
+2	codeql	fn	impl App	unused_codeql_databases
+2	codeql	fn	impl App	confirm_delete_unused_codeql_databases
+2	codeql	fn	impl App	perform_delete_unused_codeql_databases
+2	codeql	fn	impl App	codeql_db_store_path
+2	codeql	fn	impl App	codeql_db_cache_dir
+2	codeql	fn	impl App	codeql_source_cache_dir
+2	codeql	fn	impl App	codeql_history_path
+2	codeql	fn	impl App	codeql_results_dir
+2	codeql	fn	impl App	refresh_codeql_history
+2	codeql	fn	impl App	current_codeql_history
+2	codeql	fn	impl App	codeql_cached_results
+2	codeql	fn	impl App	confirm_remove_codeql_history
+2	codeql	fn	impl App	perform_remove_codeql_history
+2	codeql	fn	impl App	prompt_rename_codeql_history
+2	codeql	fn	impl App	submit_rename_codeql_history
+2	codeql	fn	impl App	sort_codeql_history
+2	codeql	fn	impl App	view_codeql_history_query
+2	codeql	fn	impl App	view_codeql_history_query_text
+2	codeql	fn	impl App	codeql_history_log
+2	codeql	fn	impl App	show_codeql_evaluator_log
+2	codeql	fn	impl App	show_codeql_query_log
+2	codeql	fn	impl App	show_codeql_evaluator_log_summary
+2	codeql	fn	impl App	drain_codeql_log_summary
+2	codeql	fn	impl App	codeql_log_predicates
+2	codeql	fn	impl App	show_codeql_evaluator_log_viewer
+2	codeql	fn	impl App	drain_codeql_log_viewer
+2	codeql	fn	impl App	compare_codeql_performance
+2	codeql	fn	impl App	drain_codeql_perf_compare
+2	codeql	fn	impl App	prompt_export_codeql_results
+2	codeql	fn	impl App	submit_export_codeql_results
+2	codeql	fn	impl App	preview_codeql_query_help
+2	codeql	fn	impl App	drain_codeql_query_help
+2	codeql	fn	impl App	compare_codeql_results
+2	codeql	fn	impl App	open_codeql_results_directory
+2	codeql	fn	impl App	open_codeql_history_results_dir
+2	codeql	fn	impl App	refresh_codeql_queries
+2	codeql	fn	impl App	discover_codeql_queries
+2	codeql	fn	impl App	drain_codeql_queries
+2	codeql	fn	impl App	prompt_create_codeql_query
+2	codeql	fn	impl App	submit_create_codeql_query
+3	codeql	fn	impl App	refresh_codeql_variant_runs
+3	codeql	fn	impl App	open_codeql_variant_run
+3	codeql	fn	impl App	poll_codeql_variant_runs
+3	codeql	fn	impl App	codeql_variant_run
+3	codeql	fn	impl App	copy_codeql_variant_repo_list
+3	codeql	fn	impl App	view_codeql_variant_logs
+3	codeql	fn	impl App	open_codeql_variant_results
+3	codeql	fn	impl App	fetch_codeql_variant_results
+3	codeql	fn	impl App	drain_codeql_variant_results
+3	codeql	fn	impl App	prompt_export_codeql_variant_results
+3	codeql	fn	impl App	start_export_codeql_variant_results
+3	codeql	fn	impl App	drain_codeql_variant_export
+3	codeql	fn	impl App	codeql_variant_runs_path
+3	codeql	fn	impl App	run_codeql_variant_analysis
+3	codeql	fn	impl App	drain_codeql_variant_submit
+3	codeql	fn	impl App	run_codeql_query
+3	codeql	fn	impl App	run_codeql_query_suite
+3	codeql	fn	impl App	run_codeql_file
+3	codeql	fn	impl App	run_codeql_file_with
+3	codeql	fn	impl App	prompt_run_codeql_published_pack
+3	codeql	fn	impl App	run_codeql_published_pack
+3	codeql	fn	impl App	run_codeql_file_on
+3	codeql	fn	impl App	check_codeql_suite
+3	codeql	fn	impl App	quick_eval_codeql
+3	codeql	fn	impl App	debug_codeql_query
+3	codeql	fn	impl App	codeql_command_until
+3	codeql	fn	impl App	cancel_codeql_run
+3	codeql	fn	impl App	walk_codeql_results
+3	codeql	fn	impl App	codeql_source_file
+3	codeql	fn	impl App	codeql_decode_sets
+3	codeql	fn	impl App	show_codeql_result_sets
+3	codeql	fn	impl App	codeql_stdout
+3	codeql	fn	impl App	codeql_contextual_target
+3	codeql	fn	impl App	codeql_contextual_dir
+3	codeql	fn	impl App	codeql_contextual_query
+3	codeql	fn	impl App	view_codeql_cfg
+3	codeql	fn	impl App	drain_codeql_doc
+3	codeql	fn	impl App	open_codeql_referenced_file
+3	codeql	fn	impl App	codeql_chosen_run
+3	codeql	fn	impl App	codeql_run_database
+3	codeql	fn	impl App	view_codeql_alerts
+3	codeql	fn	impl App	view_codeql_raw_results
+3	codeql	fn	impl App	open_codeql_model_editor
+3	codeql	fn	impl App	model_codeql_endpoint
+3	codeql	fn	impl App	choose_codeql_model
+3	codeql	fn	impl App	save_codeql_model
+3	codeql	fn	impl App	write_codeql_models
+3	codeql	fn	impl App	drain_codeql_model
+3	codeql	fn	impl App	view_codeql_ast
+3	codeql	fn	impl App	drain_codeql_ast
+3	codeql	fn	impl App	codeql_command
+3	codeql	fn	impl App	drain_codeql_run
+3	codeql	fn	impl App	record_codeql_run
+3	codeql	fn	impl App	run_codeql_pack
+3	codeql	fn	impl App	run_codeql_batch
+3	codeql	fn	impl App	run_codeql_query_on_databases
+3	codeql	fn	impl App	open_codeql_multi_db_picker
+3	codeql	fn	impl App	choose_codeql_multi_db
+3	codeql	fn	impl App	run_all_codeql_queries
+3	codeql	fn	impl App	run_selected_codeql_queries
+3	codeql	fn	impl App	start_next_queued_codeql
+3	codeql	fn	impl App	cancel_codeql_queue
+3	codeql	fn	impl App	refresh_codeql_databases
+0		fn	impl App	typed_path
+0		fn	impl App	typed_path_checked
+3	codeql	fn	impl App	submit_codeql_database
+3	codeql	fn	impl App	drain_codeql_db_job
+3	codeql	fn	impl App	register_codeql_database
+3	codeql	fn	impl App	extract_codeql_zip
+3	codeql	fn	impl App	download_codeql_zip_from_url
+3	codeql	fn	impl App	download_codeql_db_from_github
+35	commands	fn	impl App	set_extension_enabled
+3	codeql	fn	impl App	codeql_availability_changed
+7	runners	fn	impl App	open_testing_view
+5	debugger	fn	impl App	refresh_run_debug
+5	debugger	fn	impl App	run_spec_for
+5	debugger	fn	impl App	poll_dap
+5	debugger	fn	impl App	refresh_debug_panel
+5	debugger	fn	impl App	build_debug_view
+5	debugger	fn	impl App	refresh_watches
+5	debugger	fn	impl App	add_watch_expression
+5	debugger	fn	impl App	remove_watch_expression
+5	debugger	fn	impl App	debug_console_push
+5	debugger	fn	impl App	debug_console_push_output
+5	debugger	fn	impl App	debug_console_push_line
+5	debugger	fn	impl App	debug_console_append
+5	debugger	fn	impl App	debug_repl_submit
+5	debugger	fn	impl App	debug_hover_value
+5	debugger	fn	impl App	debug_panel_click
+5	debugger	fn	impl App	debug_row_menu
+5	debugger	fn	impl App	copy_debug_value
+5	debugger	fn	impl App	copy_call_stack
+8	viewers	fn	impl App	open_hex_find_prompt
+5	debugger	fn	impl App	open_add_watch_prompt
+5	debugger	fn	impl App	run_debug_button_action
+5	debugger	fn	impl App	reveal_debug_view
+5	debugger	fn	impl App	debug_error
+5	debugger	fn	impl App	launch_with_unsaved_saved
+5	debugger	fn	impl App	run_with_unsaved_saved
+7	runners	fn	impl App	test_run_with_unsaved_saved
+5	debugger	fn	impl App	unsaved_editor_names
+5	debugger	fn	impl App	debug_start_or_continue
+5	debugger	fn	impl App	start_selected_debug
+5	debugger	fn	impl App	start_selected_debug_now
+5	debugger	fn	impl App	launch_compound
+5	debugger	fn	impl App	open_add_debug_config
+5	debugger	fn	impl App	prompt_debug_config_field
+5	debugger	fn	impl App	submit_debug_config_field
+5	debugger	fn	impl App	finish_debug_config_draft
+5	debugger	fn	impl App	open_debug_config_picker
+5	debugger	fn	impl App	launch_member_into_set
+5	debugger	fn	impl App	launch_after_compound_task_all
+5	debugger	fn	impl App	park_launch_behind
+5	debugger	fn	impl App	launch_compound_members
+5	debugger	fn	impl App	resume_pending_launch
+7	runners	fn	impl App	task_inputs
+7	runners	fn	impl App	ask_inputs
+7	runners	fn	impl App	ask_next_input
+7	runners	fn	impl App	answer_input
+6	debugger	fn	impl App	launch_after_compound_task
+6	debugger	fn	impl App	launch_debug_config
+6	debugger	fn	impl App	failure_site_of
+6	debugger	fn	impl App	arm_failure_breakpoint
+6	debugger	fn	impl App	with_failure_note
+6	debugger	fn	impl App	disarm_failure_breakpoint
+6	debugger	fn	impl App	collect_editor_breakpoints
+6	debugger	fn	impl App	launch_resolved_config
+6	debugger	fn	impl App	launch_resolved_into_set
+6	debugger	fn	impl App	launch_resolved_in
+6	debugger	fn	impl App	start_debug_session
+6	debugger	fn	impl App	start_delve_debug_session
+6	debugger	fn	impl App	start_delve_test_session
+6	debugger	fn	impl App	start_js_debug_session
+6	debugger	fn	impl App	start_lldb_debug_session
+6	debugger	fn	impl App	begin_debug_build
+6	debugger	fn	impl App	take_debug_build
+6	debugger	fn	impl App	poll_debug_build
+6	debugger	fn	impl App	launch_lldb
+6	debugger	fn	impl App	build_debuggable_binary
+6	debugger	fn	impl App	debug_toggle_breakpoint
+6	debugger	fn	impl App	debug_toggle_breakpoint_line
+6	debugger	fn	impl App	debug_edit_condition
+6	debugger	fn	impl App	debug_edit_condition_line
+6	debugger	fn	impl App	commit_breakpoint_condition
+6	debugger	fn	impl App	open_debug_prompt
+6	debugger	fn	impl App	debug_edit_hit_condition
+6	debugger	fn	impl App	commit_hit_condition
+6	debugger	fn	impl App	debug_add_function_breakpoint
+6	debugger	fn	impl App	commit_function_breakpoint
+6	debugger	fn	impl App	debug_clear_function_breakpoints
+6	debugger	fn	impl App	push_function_breakpoints
+6	debugger	fn	impl App	adopt_debug_session
+6	debugger	fn	impl App	debug_run_to_cursor
+6	debugger	fn	impl App	debug_break_on_value_change
+6	debugger	fn	impl App	commit_data_breakpoint
+6	debugger	fn	impl App	debug_clear_data_breakpoints
+6	debugger	fn	impl App	debug_edit_logpoint
+6	debugger	fn	impl App	debug_edit_logpoint_line
+6	debugger	fn	impl App	commit_logpoint
+6	debugger	fn	impl App	run_debug_control
+6	debugger	fn	impl App	debug_continue
+6	debugger	fn	impl App	debug_step_into_target
+6	debugger	fn	impl App	offer_step_in_targets
+6	debugger	fn	impl App	debug_step_into
+6	debugger	fn	impl App	debug_step
+6	debugger	fn	impl App	debug_toggle_raised_exceptions
+6	debugger	fn	impl App	debug_pause
+6	debugger	fn	impl App	debug_restart
+6	debugger	fn	impl App	reset_watch_runtime
+6	debugger	fn	impl App	report_member_ended
+6	debugger	fn	impl App	refocus_debug_session
+6	debugger	fn	impl App	switch_debug_session
+6	debugger	fn	impl App	breakpoint_items
+6	debugger	fn	impl App	sync_breakpoint_list
+6	debugger	fn	impl App	breakpoint_list_click
+6	debugger	fn	impl App	remove_breakpoint_at
+6	debugger	fn	impl App	open_attach_process_picker
+6	debugger	fn	impl App	take_pending_attach
+6	debugger	fn	impl App	record_post_debug_task
+6	debugger	fn	impl App	run_post_debug_tasks
+6	debugger	fn	impl App	debug_stop_by_user
+6	debugger	fn	impl App	debug_stop
+6	debugger	fn	impl App	run_active_file
+6	debugger	fn	impl App	run_active_file_now
+15	scm	fn	impl App	open_source_control_entry
+27	save_restore	fn	impl App	open_file_at_launch
+15	scm	fn	impl App	initialize_repository
+15	scm	fn	impl App	stage_selected_source_control_entries
+15	scm	fn	impl App	push_source_control
+15	scm	fn	impl App	finish_push
+15	scm	fn	impl App	pull_source_control
+15	scm	fn	impl App	finish_pull
+15	scm	fn	impl App	sync_source_control
+15	scm	fn	impl App	finish_sync
+15	scm	fn	impl App	stash_source_control
+15	scm	fn	impl App	ask_stash_message
+15	scm	fn	impl App	perform_stash
+15	scm	fn	impl App	stash_tracked
+15	scm	fn	impl App	stash_pop_source_control
+15	scm	fn	impl App	unstage_source_control_entry
+16	scm	comment	impl App	// --- Source Control "⋯" menu plumbing --------------------
+16	scm	fn	impl App	log_git
+16	scm	fn	impl App	git_error_line
+16	scm	fn	impl App	git_operation_or_say
+16	scm	fn	impl App	abort_git_operation
+16	scm	fn	impl App	continue_git_operation
+16	scm	fn	impl App	skip_git_operation
+16	scm	fn	impl App	bisect_mark_source_control
+16	scm	fn	impl App	report_git_operation_step
+16	scm	fn	impl App	continue_rebase_after_commit
+16	scm	fn	impl App	run_scm_op
+16	scm	fn	impl App	spawn_git_net
+16	scm	fn	impl App	spawn_git_view
+16	scm	fn	impl App	drain_git_view
+16	scm	fn	impl App	repo_git_busy
+16	scm	fn	impl App	git_net_busy
+16	scm	fn	impl App	spawn_scm_op
+16	scm	fn	impl App	finish_clone
+16	scm	fn	impl App	drain_git_net
+16	scm	fn	impl App	stage_all_source_control
+16	scm	fn	impl App	unstage_all_source_control
+16	scm	fn	impl App	request_discard_all_source_control
+16	scm	fn	impl App	confirm_pending_stash_drop
+16	scm	fn	impl App	cancel_pending_discard_all
+16	scm	fn	impl App	confirm_pending_discard_all
+16	scm	fn	impl App	stash_include_untracked_source_control
+16	scm	fn	impl App	stash_staged_source_control
+16	scm	fn	impl App	unsaved_repo_files
+16	scm	fn	impl App	hold_for_unsaved
+16	scm	fn	impl App	scm_root_moved
+16	scm	fn	impl App	run_scm_write
+16	scm	fn	impl App	save_all_then_pending_scm
+16	scm	fn	impl App	finish_scm_after_save
+16	scm	fn	impl App	continue_pending_scm_without_saving
+16	scm	fn	impl App	cancel_pending_unsaved_scm
+16	scm	fn	impl App	require_commit_message
+16	scm	fn	impl App	commit_staged_source_control
+16	scm	fn	impl App	commit_all_source_control
+16	scm	fn	impl App	commit_amend_source_control
+16	scm	fn	impl App	undo_last_commit_source_control
+16	scm	fn	impl App	commit_and_sync_source_control
+16	scm	fn	impl App	publish_branch_source_control
+16	scm	fn	impl App	show_git_output
+16	scm	fn	impl App	open_branch_picker_for
+32	prompts	fn	impl App	open_input_prompt
+32	prompts	fn	impl App	close_input_prompt
+32	prompts	fn	impl App	open_list_picker
+32	prompts	fn	impl App	dismiss_list_picker
+32	prompts	fn	impl App	close_list_picker
+16	scm	fn	impl App	dispatch_scm_action
+16	scm	fn	impl App	push_tags_source_control
+16	scm	fn	impl App	open_remote_tag_picker
+16	scm	fn	impl App	remote_tag_root_moved
+16	scm	fn	impl App	show_remote_tags
+16	scm	fn	impl App	open_stash_picker
+16	scm	fn	impl App	open_tag_picker
+16	scm	fn	impl App	open_remote_picker
+16	scm	fn	impl App	open_push_to_remote_picker
+32	prompts	fn	impl App	submit_input_prompt
+10	agents_collab	fn	impl App	open_participants_picker
+10	agents_collab	fn	impl App	detach_session_client
+10	agents_collab	fn	impl App	open_participant_actions
+10	agents_collab	fn	impl App	run_participant_action
+10	agents_collab	fn	impl App	poll_session_presence
+10	agents_collab	fn	impl App	poll_session_typing
+10	agents_collab	fn	impl App	apply_typist_change
+10	agents_collab	fn	impl App	maybe_seat_navigator
+10	agents_collab	fn	impl App	poll_pair
+4	review	fn	impl App	handle_comment_focus_key
+4	review	fn	impl App	submit_comment_reply
+4	review	fn	impl App	note_file_key
+4	review	fn	impl App	open_sticky_note_prompt
+4	review	fn	impl App	add_sticky_note
+4	review	fn	impl App	publish_note
+4	review	fn	impl App	save_notes
+4	review	fn	impl App	note_box_id
+4	review	fn	impl App	change_note_box
+4	review	fn	impl App	delete_sticky_note_here
+4	review	const	impl App	PENDING_REVIEW_ID
+4	review	fn	impl App	pending_review_index
+4	review	fn	impl App	open_review_comment_prompt
+4	review	fn	impl App	add_pending_review_comment
+4	review	fn	impl App	pending_is_for
+4	review	fn	impl App	open_review_submit
+4	review	fn	impl App	submit_review
+4	review	fn	impl App	toggle_review_thread_resolved
+4	review	fn	impl App	reply_to_review_thread
+4	review	fn	impl App	drain_review_ops
+4	review	fn	impl App	rename_review_boxes_path
+4	review	fn	impl App	ignore_comment_box
+4	review	fn	impl App	ignore_focused_comment
+4	review	fn	impl App	next_comment_from_caret
+10	agents_collab	fn	impl App	open_ask_navigator
+10	agents_collab	fn	impl App	yield_to_navigator
+10	agents_collab	fn	impl App	tick_proactive_navigator
+10	agents_collab	fn	impl App	toggle_proactive_navigator
+10	agents_collab	fn	impl App	toggle_navigator
+10	agents_collab	fn	impl App	clear_navigator_notes
+4	review	fn	impl App	cycle_comment_box
+10	agents_collab	fn	impl App	poll_collab
+10	agents_collab	fn	impl App	drop_lost_collab_session
+10	agents_collab	fn	impl App	collab_labels_dirty
+10	agents_collab	fn	impl App	collab_cancel_stream
+10	agents_collab	fn	impl App	stream_stop_row
+10	agents_collab	fn	impl App	mirror_offline_siblings
+10	agents_collab	fn	impl App	owner_buffer_text
+10	agents_collab	fn	impl App	end_collab_undo_group
+10	agents_collab	fn	impl App	apply_collab_spans
+10	agents_collab	fn	impl App	finish_collab_bootstrap
+10	agents_collab	fn	impl App	is_collab_guest
+26	editor_tabs	fn	impl App	open_tab_picker
+32	prompts	fn	impl App	confirm_list_picker
+9	settings	fn	impl App	open_settings_view
+9	settings	fn	impl App	open_workspace_settings
+7	runners	fn	impl App	open_run_task_picker
+7	runners	fn	impl App	task_command_line
+7	runners	fn	impl App	task_command_line_in
+7	runners	fn	impl App	run_project_task
+7	runners	fn	impl App	run_project_task_in
+7	runners	fn	impl App	assign_task_matcher
+7	runners	fn	impl App	run_build_task
+7	runners	fn	impl App	rerun_last_task
+7	runners	fn	impl App	start_project_task
+16	scm	fn	impl App	apply_branch_picker_selection
+16	scm	fn	impl App	view_staged_diff_source_control
+16	scm	fn	impl App	view_default_branch_diff_source_control
+16	scm	fn	impl App	view_previous_commit_diff_source_control
+16	scm	fn	impl App	commit_and_push_source_control
+16	scm	fn	impl App	finish_commit_and_push
+16	scm	fn	impl App	stage_source_control_entry
+16	scm	fn	impl App	diff_hunk_patch_at_caret
+16	scm	fn	impl App	editor_hunk_patch_at_caret
+16	scm	fn	impl App	diff_selected_lines_patch
+16	scm	fn	impl App	repo_relative_path
+17	diff_merge	fn	impl App	diff_cycle_whitespace_mode
+17	diff_merge	fn	impl App	diff_toggle_group_by_seat
+17	diff_merge	fn	impl App	reload_seats_for
+17	diff_merge	fn	impl App	seats_for_working_file
+16	scm	fn	impl App	stage_hunk_at_caret
+16	scm	fn	impl App	unstage_hunk_at_caret
+16	scm	fn	impl App	request_revert_hunk_at_caret
+16	scm	fn	impl App	confirm_pending_revert_hunk
+16	scm	fn	impl App	cancel_pending_revert_hunk
+16	scm	fn	impl App	refresh_after_hunk_op
+17	diff_merge	fn	impl App	tag_open_diff
+17	diff_merge	fn	impl App	unsaved_text_in_any_group
+17	diff_merge	fn	impl App	open_diff_across_groups
+17	diff_merge	fn	impl App	refresh_open_diff_views
+16	scm	fn	impl App	request_discard_source_control_entry
+16	scm	fn	impl App	confirm_pending_discard
+16	scm	fn	impl App	cancel_pending_discard
+13	host_integration	fn	impl App	arm_terminal_warning
+13	host_integration	fn	impl App	dismiss_terminal_warning
+16	scm	fn	impl App	commit_source_control
+16	scm	fn	impl App	spawn_commit
+16	scm	fn	impl App	report_commit_failure
+12	remote_sessions	fn	impl App	expire_ssh_offer
+12	remote_sessions	fn	impl App	apply_ssh_samples
+12	remote_sessions	fn	impl App	consider_ssh_offer
+12	remote_sessions	fn	impl App	pane_cwd_report
+12	remote_sessions	fn	impl App	accept_ssh_offer
+12	remote_sessions	fn	impl App	note_provisioning_failed
+12	remote_sessions	fn	impl App	note_provisioning_succeeded
+12	remote_sessions	fn	impl App	dismiss_ssh_offer
+12	remote_sessions	fn	impl App	request_remote_launch
+12	remote_sessions	fn	impl App	start_remote_launch
+12	remote_sessions	fn	impl App	open_workspace_on_ssh_host
+14	welcome_screen	fn	impl App	start_demo
+14	welcome_screen	fn	impl App	advance_tour
+14	welcome_screen	fn	impl App	finish_tour
+14	welcome_screen	fn	impl App	perform_tour_action
+14	welcome_screen	fn	impl App	render_tour_caption
+14	welcome_screen	const	impl App	TOUR_KEYS
+14	welcome_screen	fn	impl App	tour_caption_panel
+14	welcome_screen	fn	impl App	close_all_modals_for_test
+17	diff_merge	fn	impl App	scrub_history
+26	editor_tabs	fn	impl App	sync_symbol_views
+26	editor_tabs	fn	impl App	symbol_view_paths
+26	editor_tabs	fn	impl App	symbol_path_is_live
+26	editor_tabs	fn	impl App	mirror_symbol_siblings
+26	editor_tabs	fn	impl App	follow_symbol_views
+26	editor_tabs	fn	impl App	active_file_symbols
+26	editor_tabs	fn	impl App	open_symbol_tab
+26	editor_tabs	fn	impl App	open_symbol_tab_for
+7	runners	fn	impl App	notebook_kernel_chip
+24	terminal_panes	fn	impl App	toggle_session_recording
+4	review	fn	impl App	review_context
+4	review	fn	impl App	review_file_context
+4	review	fn	impl App	set_review_pr
+4	review	fn	impl App	review_pr_number
+4	review	fn	impl App	open_export_comments
+4	review	fn	impl App	show_export_ready
+4	review	fn	impl App	show_export_preview
+4	review	fn	impl App	post_exported_comments
+4	review	fn	impl App	load_review_threads
+4	review	fn	impl App	show_review_threads
+24	terminal_panes	fn	impl App	record_terminal_output
+7	runners	fn	impl App	run_fleet_command
+7	runners	fn	impl App	drain_fleet_results
+7	runners	fn	impl App	handle_fleet_key
+7	runners	fn	impl App	save_fleet_capture
+7	runners	fn	impl App	open_fleet_shell
+11	agents_collab	fn	impl App	open_new_lane_prompt
+11	agents_collab	fn	impl App	create_worktree_lane
+11	agents_collab	fn	impl App	open_lane_pane
+11	agents_collab	fn	impl App	agent_lane_rows
+11	agents_collab	fn	impl App	sync_lane_root_badges
+11	agents_collab	fn	impl App	close_lane_panes
+11	agents_collab	fn	impl App	unsaved_file_under
+11	agents_collab	fn	impl App	diff_worktree_lane
+11	agents_collab	fn	impl App	close_worktree_lane
+17	diff_merge	fn	impl App	handle_scrubber_key
+17	diff_merge	fn	impl App	scrubbed_file
+17	diff_merge	fn	impl App	close_scrubber_for_tab
+17	diff_merge	fn	impl App	scrub_open_here
+17	diff_merge	fn	impl App	scrub_diff_to_working_tree
+17	diff_merge	fn	impl App	scrub_seek_column
+17	diff_merge	fn	impl App	render_scrub_slider
+17	diff_merge	fn	impl App	jump_in_scrub_view
+17	diff_merge	fn	impl App	sync_scrub_tree
+17	diff_merge	fn	impl App	rebuild_scrub_view
+17	diff_merge	fn	impl App	scrub_names
+17	diff_merge	fn	impl App	scrub_name_at
+17	diff_merge	fn	impl App	park_scrub_view
+17	diff_merge	fn	impl App	keep_scrub_view
+17	diff_merge	fn	impl App	keep_view
+17	diff_merge	fn	impl App	prefetch_scrub_views
+17	diff_merge	fn	impl App	scrub_view_anchor
+17	diff_merge	fn	impl App	align_scrub_view
+17	diff_merge	fn	impl App	request_scrub_views
+17	diff_merge	fn	impl App	drain_scrub_views
+12	remote_sessions	fn	impl App	poll_connect_dialog
+12	remote_sessions	fn	impl App	poll_install_session
+12	remote_sessions	fn	impl App	hand_off_to_remote
+13	host_integration	fn	impl App	start_update_watch_if_remote
+13	host_integration	fn	impl App	poll_source_build_marker
+13	host_integration	fn	impl App	apply_source_build_state
+21	language_servers	fn	impl App	restart_language_servers
+21	language_servers	fn	impl App	restart_language_servers_for_file
+13	host_integration	fn	impl App	start_drift_probe_if_local
+13	host_integration	fn	impl App	start_update_check_if_local
+13	host_integration	fn	impl App	poll_update_check
+13	host_integration	fn	impl App	start_staged_update
+13	host_integration	fn	impl App	dismiss_update_offer
+13	host_integration	fn	impl App	staged_update_binary
+13	host_integration	fn	impl App	any_update_ready
+13	host_integration	fn	impl App	any_update_in_progress
+13	host_integration	fn	impl App	poll_drift_probe
+13	host_integration	fn	impl App	start_local_reinstall
+13	host_integration	fn	impl App	update_armed
+13	host_integration	fn	impl App	update_croft
+13	host_integration	fn	impl App	poll_manual_update_check
+13	host_integration	fn	impl App	poll_update_watch
+13	host_integration	fn	impl App	update_spinner_glyph
+13	host_integration	fn	impl App	update_spinner_phase
+35	commands	fn	impl App	mcp_spinner_glyph
+35	commands	fn	impl App	mcp_spinner_phase
+13	host_integration	fn	impl App	arm_reexec
+27	save_restore	fn	impl App	capture_session_state
+27	save_restore	fn	impl App	capture_session_state_with
+26	editor_tabs	fn	impl App	editors_in_bookmark_order
+26	editor_tabs	fn	impl App	bookmark_source
+26	editor_tabs	fn	impl App	all_bookmarks
+26	editor_tabs	fn	impl App	settle_bookmarks
+26	editor_tabs	fn	impl App	restore_bookmarks_everywhere
+27	save_restore	fn	impl App	apply_session_state
+27	save_restore	fn	impl App	saved_session_path
+27	save_restore	fn	impl App	save_session_for_next_launch
+27	save_restore	fn	impl App	read_saved_session
+27	save_restore	fn	impl App	poll_saved_session
+27	save_restore	fn	impl App	carry_saved_marks_onto_unsaved_tabs
+27	save_restore	fn	impl App	hold_unrestored_tabs
+27	save_restore	fn	impl App	restore_open_tab
+12	remote_sessions	fn	impl App	tear_down_connect_auth
+12	remote_sessions	fn	impl App	handle_connect_dialog_key
+12	remote_sessions	fn	impl App	handle_connect_dialog_click
+12	remote_sessions	fn	impl App	answer_install_fallback
+12	remote_sessions	fn	impl App	open_ssh_config_in_editor
+12	remote_sessions	fn	impl App	open_ssh_learn_more
+12	remote_sessions	fn	impl App	refresh_remote_if_config_changed
+23	search	fn	impl App	open_search_hit
+18	explorer	fn	impl App	handle_tree_key
+33	editor_input	fn	impl App	toggle_vim_mode
+33	editor_input	fn	impl App	follow_vim_mode_pref
+0		fn	impl App	editor_is_text
+33	editor_input	fn	impl App	bump_number_under_cursor
+26	editor_tabs	fn	impl App	toggle_bookmark
+26	editor_tabs	fn	impl App	toggle_bookmark_at
+26	editor_tabs	fn	impl App	adopt_shared_bookmarks
+26	editor_tabs	fn	impl App	share_bookmarks
+26	editor_tabs	fn	impl App	goto_bookmark
+26	editor_tabs	fn	impl App	open_bookmark_picker
+26	editor_tabs	fn	impl App	jump_to_bookmark
+26	editor_tabs	fn	impl App	clear_bookmarks
+22	completion	fn	impl App	expand_emmet_abbreviation
+22	completion	fn	impl App	open_emmet_prompt
+22	completion	fn	impl App	run_emmet_edit
+8	viewers	fn	impl App	toggle_markdown_preview
+8	viewers	fn	impl App	open_markdown_preview_to_side
+33	editor_input	fn	impl App	handle_editor_key
+33	editor_input	fn	impl App	handle_editor_vim_chord
+33	editor_input	fn	impl App	cancel_editor_vim_chord
+33	editor_input	fn	impl App	end_vim_undo_groups
+33	editor_input	fn	impl App	apply_vim_action
+33	editor_input	fn	impl App	vim_line_len
+33	editor_input	fn	impl App	vim_first_non_blank
+33	editor_input	fn	impl App	vim_apply_motion
+33	editor_input	fn	impl App	vim_find_char
+33	editor_input	fn	impl App	vim_class_at
+33	editor_input	fn	impl App	vim_next_pos
+33	editor_input	fn	impl App	vim_prev_pos
+33	editor_input	fn	impl App	vim_word_forward
+33	editor_input	fn	impl App	vim_word_backward
+33	editor_input	fn	impl App	vim_word_end
+33	editor_input	fn	impl App	vim_change_word_end
+33	editor_input	fn	impl App	vim_operate_lines
+33	editor_input	fn	impl App	vim_operate_motion
+33	editor_input	fn	impl App	vim_operate_textobject
+33	editor_input	fn	impl App	vim_apply_operator_to_selection
+33	editor_input	fn	impl App	clamp_to_symbol_clip
+33	editor_input	fn	impl App	vim_line_range_for_motion
+33	editor_input	fn	impl App	vim_delete_chars
+33	editor_input	fn	impl App	vim_enter_insert
+33	editor_input	fn	impl App	vim_paste
+33	editor_input	fn	impl App	vim_visual_operate
+33	editor_input	fn	impl App	vim_run_ex
+33	editor_input	fn	impl App	vim_search
+33	editor_input	fn	impl App	vim_find_match
+33	editor_input	fn	impl App	vim_sync_visual_selection
+28	bottom_panel	fn	impl App	handle_problems_key
+28	bottom_panel	fn	impl App	handle_output_key
+28	bottom_panel	fn	impl App	handle_ports_key
+25	terminal_tools	fn	impl App	handle_captures_key
+24	terminal_panes	fn	impl App	open_scrollback_in_editor
+26	editor_tabs	fn	impl App	close_tabs_with_path_everywhere
+26	editor_tabs	fn	impl App	close_clean_tabs_under_everywhere
+7	runners	fn	impl App	send_http_request_under_caret
+7	runners	fn	impl App	copy_http_request_as_curl
+7	runners	fn	impl App	http_request_under_caret
+7	runners	fn	impl App	open_http_environment_picker
+7	runners	fn	impl App	drain_http_responses
+25	terminal_tools	fn	impl App	open_command_history
+25	terminal_tools	fn	impl App	refresh_command_history_results
+25	terminal_tools	fn	impl App	handle_command_history_key
+25	terminal_tools	fn	impl App	captures_open_selected
+25	terminal_tools	fn	impl App	capture_pane
+25	terminal_tools	fn	impl App	handle_terminal_key
+25	terminal_tools	fn	impl App	write_terminal_key
+34	editor_input	fn	impl App	copy_terminal_selection
+34	editor_input	fn	impl App	deliver_copied_text
+34	editor_input	fn	impl App	copy_where_pasted
+34	editor_input	fn	impl App	push_clipboard_via_relay
+34	editor_input	fn	impl App	paste_clipboard_into_terminal
+8	viewers	fn	impl App	begin_log_selection
+8	viewers	fn	impl App	log_file_click
+8	viewers	fn	impl App	update_log_selection
+8	viewers	fn	impl App	copy_log_selection
+8	viewers	fn	impl App	begin_preview_selection
+8	viewers	fn	impl App	preview_runnable_at
+8	viewers	fn	impl App	follow_preview_link
+7	runners	fn	impl App	pending_run_block_for
+7	runners	fn	impl App	run_markdown_block
+7	runners	fn	impl App	run_notebook_cells
+7	runners	fn	impl App	poll_notebook_kernels
+7	runners	fn	impl App	select_notebook_kernel
+7	runners	fn	impl App	start_kernel_session
+7	runners	fn	impl App	poll_kernel_listing
+7	runners	fn	impl App	open_kernel_picker
+7	runners	fn	impl App	choose_notebook_kernel
+7	runners	fn	impl App	kernel_choice_dismissed
+7	runners	fn	impl App	notebook_kernel_request
+7	runners	fn	impl App	run_fence_at_cursor
+7	runners	fn	impl App	run_block_in_pane
+7	runners	fn	impl App	confirm_pending_run_block
+7	runners	fn	impl App	cancel_pending_run_block
+7	runners	fn	impl App	arm_block_capture
+7	runners	fn	impl App	persist_block_output
+7	runners	fn	impl App	settle_block_captures
+7	runners	fn	impl App	publish_block_outputs
+7	runners	fn	impl App	block_pane_prefix
+8	viewers	fn	impl App	update_preview_selection
+34	editor_input	fn	impl App	copy_editor_selection
+34	editor_input	fn	impl App	editor_view_has_selection
+34	editor_input	fn	impl App	cut_editor_selection
+34	editor_input	fn	impl App	paste_clipboard_into_search
+34	editor_input	fn	impl App	paste_str_into_search
+34	editor_input	fn	impl App	paste_clipboard_into_editor
+34	editor_input	fn	impl App	clipboard_text
+34	editor_input	fn	impl App	handle_paste
+34	editor_input	fn	impl App	handle_paste_inner
+19	explorer	fn	impl App	import_paths_into_explorer
+12	remote_sessions	fn	impl App	import_paths_into_remote
+12	remote_sessions	fn	impl App	take_pending_scp_uploads
+25	terminal_tools	fn	impl App	tick_terminal_autoscroll
+12	remote_sessions	fn	impl App	drop_relay_active
+12	remote_sessions	fn	impl App	relay_dir
+12	remote_sessions	fn	impl App	relay_log_path
+12	remote_sessions	fn	impl App	relay_inbox_path
+12	remote_sessions	fn	impl App	ensure_relay_dir
+12	remote_sessions	fn	impl App	request_remote_pulls
+34	editor_input	fn	impl App	request_remote_clipboard
+13	host_integration	fn	impl App	bind_view_socket
+13	host_integration	fn	impl App	drain_view_requests
+13	host_integration	fn	impl App	apply_view_request
+12	remote_sessions	fn	impl App	drain_remote_pulls
+12	remote_sessions	fn	impl App	report_scp_results
+28	bottom_panel	fn	impl App	port_origin
+24	terminal_panes	fn	impl App	drain_terminal_bells
+24	terminal_panes	fn	impl App	settle_exited_terminals
+25	terminal_tools	fn	impl App	terminal_prompt_jump
+25	terminal_tools	fn	impl App	last_command_decoration
+25	terminal_tools	fn	impl App	decoration_dot_at
+25	terminal_tools	fn	impl App	copy_command_output
+25	terminal_tools	fn	impl App	select_command_output
+25	terminal_tools	fn	impl App	rerun_command
+25	terminal_tools	fn	impl App	open_command_decoration_menu
+28	bottom_panel	fn	impl App	drain_ports_and_poll
+13	host_integration	fn	impl App	handle_update_toast_click
+28	bottom_panel	fn	impl App	show_port_toast
+11	agents_collab	fn	impl App	apply_agent_samples
+11	agents_collab	fn	impl App	drain_agent_events
+11	agents_collab	fn	impl App	agent_counts
+11	agents_collab	fn	impl App	working_agents
+11	agents_collab	fn	impl App	attribute_writes_to_working_agents
+11	agents_collab	fn	impl App	path_under_roots
+11	agents_collab	fn	impl App	root_canons
+11	agents_collab	fn	impl App	sync_agent_lane_decorations
+11	agents_collab	fn	impl App	record_review_baseline
+11	agents_collab	fn	impl App	pick_agent_lane_file
+11	agents_collab	fn	impl App	diff_agent_lane_row
+11	agents_collab	fn	impl App	mark_agent_file_reviewed
+11	agents_collab	fn	impl App	mark_agent_file_reviewed_inner
+11	agents_collab	fn	impl App	mark_agent_lane_reviewed
+11	agents_collab	fn	impl App	focus_agent_pane
+24	terminal_panes	fn	impl App	root_for_path
+24	terminal_panes	fn	impl App	refresh_terminal_labels
+28	bottom_panel	fn	impl App	ports_open_selected
+28	bottom_panel	fn	impl App	ports_forward_selected
+28	bottom_panel	fn	impl App	ports_copy_selected
+28	bottom_panel	fn	impl App	ports_stop_selected
+25	terminal_tools	fn	impl App	terminal_would_open_something_at
+25	terminal_tools	fn	impl App	terminal_url_click
+23	search	fn	impl App	search_from_last_terminal_command
+23	search	fn	impl App	seed_search_from_command
+23	search	fn	impl App	seed_search_from_command_in
+25	terminal_tools	fn	impl App	terminal_file_click
+25	terminal_tools	fn	impl App	resolve_pane_path
+11	agents_collab	fn	impl App	ask_navigator_about_capture
+11	agents_collab	fn	impl App	fix_problem_with_navigator
+11	agents_collab	fn	impl App	navigator_fix_candidate
+11	agents_collab	fn	impl App	clear_problem_fix
+11	agents_collab	fn	impl App	problems_fix_spinner_phase
+25	terminal_tools	fn	impl App	open_resolved_file_ref
+25	terminal_tools	fn	impl App	open_resolved_file_ref_inner
+25	terminal_tools	fn	impl App	open_side_by_side
+25	terminal_tools	fn	impl App	open_detected_url
+12	remote_sessions	fn	impl App	handle_port_toast_click
+12	remote_sessions	fn	impl App	relay_request_id
+12	remote_sessions	fn	impl App	request_remote_forward
+12	remote_sessions	fn	impl App	request_remote_unforward
+12	remote_sessions	fn	impl App	request_remote_url_open
+12	remote_sessions	fn	impl App	handle_local_open_confirm_key
+9	settings	fn	impl App	user_settings_dir
+9	settings	fn	impl App	merged_settings_here
+9	settings	fn	impl App	open_settings_editor
+9	settings	fn	impl App	write_setting
+9	settings	fn	impl App	settings_target_file
+9	settings	fn	impl App	open_setting_in_json
+9	settings	fn	impl App	reset_setting
+9	settings	fn	impl App	handle_settings_editor_key
+9	settings	fn	impl App	submit_setting_value
+9	settings	fn	impl App	render_settings_editor
+9	settings	fn	impl App	open_shortcuts_modal
+9	settings	fn	impl App	close_shortcuts_modal
+9	settings	fn	impl App	consume_shortcuts_image_clear
+23	search	fn	impl App	consume_file_finder_image_clear
+23	search	fn	impl App	poll_file_finder_index
+23	search	fn	impl App	kick_file_finder_index_rebuild
+23	search	fn	impl App	switch_header_source
+23	search	fn	impl App	open_file_finder
+23	search	fn	impl App	close_file_finder
+23	search	fn	impl App	handle_file_finder_key
+23	search	fn	impl App	follow_quick_open_prefix
+23	search	fn	impl App	open_file_finder_selection
+23	search	fn	impl App	handle_file_finder_mouse
+23	search	fn	impl App	render_file_finder
+35	commands	fn	impl App	consume_command_palette_image_clear
+35	commands	fn	impl App	open_command_palette
+35	commands	fn	impl App	close_command_palette
+35	commands	fn	impl App	handle_command_palette_key
+35	commands	fn	impl App	run_command_palette_selection
+35	commands	fn	impl App	handle_command_palette_mouse
+35	commands	fn	impl App	render_command_palette
+21	language_servers	fn	impl App	open_go_to_symbol
+21	language_servers	fn	impl App	close_go_to_symbol
+21	language_servers	fn	impl App	handle_go_to_symbol_key
+21	language_servers	fn	impl App	jump_to_go_to_symbol_selection
+21	language_servers	fn	impl App	handle_go_to_symbol_mouse
+21	language_servers	fn	impl App	render_go_to_symbol
+21	language_servers	fn	impl App	open_workspace_symbols
+21	language_servers	fn	impl App	close_workspace_symbols
+21	language_servers	fn	impl App	workspace_symbols_requery
+21	language_servers	fn	impl App	workspace_symbols_dispatch_due
+21	language_servers	fn	impl App	apply_workspace_symbols
+21	language_servers	fn	impl App	drain_lsp_workspace_symbols
+21	language_servers	fn	impl App	handle_workspace_symbols_key
+21	language_servers	fn	impl App	jump_to_workspace_symbol_selection
+21	language_servers	fn	impl App	handle_workspace_symbols_mouse
+21	language_servers	fn	impl App	render_workspace_symbols
+6	debugger	fn	impl App	consume_process_picker_image_clear
+6	debugger	fn	impl App	open_attach_python_picker
+6	debugger	fn	impl App	close_process_picker
+6	debugger	fn	impl App	handle_process_picker_key
+6	debugger	fn	impl App	attach_process_picker_selection
+6	debugger	fn	impl App	handle_process_picker_mouse
+6	debugger	fn	impl App	render_process_picker
+6	debugger	fn	impl App	attach_to_python_target
+35	commands	fn	impl App	open_in_viewer
+35	commands	fn	impl App	run_viewer_command
+35	commands	fn	impl App	open_active_file_in_viewer
+35	commands	fn	impl App	run_palette_item
+35	commands	fn	impl App	run_extension_command
+35	commands	fn	impl App	spawn_mcp_command
+35	commands	fn	impl App	scratch_buffer_path
+35	commands	fn	impl App	poll_mcp
+34	editor_input	fn	impl App	record_macro_key
+34	editor_input	fn	impl App	hold_palette_macro_key
+34	editor_input	fn	impl App	drop_unkeyed_palette_macro_keys
+34	editor_input	fn	impl App	start_macro_recording
+34	editor_input	fn	impl App	stop_macro_recording
+34	editor_input	fn	impl App	replay_macro
+34	editor_input	fn	impl App	replay_last_macro
+34	editor_input	fn	impl App	replay_macro_register
+35	commands	fn	impl App	run_command
+9	settings	fn	impl App	open_config_file_in_editor
+19	explorer	fn	impl App	consume_zoxide_jump_image_clear
+19	explorer	fn	impl App	open_zoxide_jump
+19	explorer	fn	impl App	close_zoxide_jump
+19	explorer	fn	impl App	refresh_zoxide_results
+19	explorer	fn	impl App	handle_zoxide_jump_key
+19	explorer	fn	impl App	start_zoxide_install
+19	explorer	fn	impl App	add_zoxide_hook
+19	explorer	fn	impl App	poll_zoxide_install
+19	explorer	fn	impl App	apply_zoxide_jump_selection
+19	explorer	fn	impl App	handle_zoxide_jump_mouse
+19	explorer	fn	impl App	render_zoxide_jump
+25	terminal_tools	fn	impl App	render_command_history_popup
+16	scm	fn	impl App	consume_branch_picker_image_clear
+16	scm	fn	impl App	open_branch_picker
+16	scm	fn	impl App	close_branch_picker
+16	scm	fn	impl App	apply_branch_action
+16	scm	fn	impl App	offer_stash_and_switch
+16	scm	fn	impl App	stash_and_switch_picked
+16	scm	fn	impl App	stash_and_switch
+16	scm	fn	impl App	handle_branch_picker_key
+16	scm	fn	impl App	handle_branch_picker_mouse
+16	scm	fn	impl App	render_branch_picker
+32	prompts	fn	impl App	consume_input_prompt_image_clear
+32	prompts	fn	impl App	consume_list_picker_image_clear
+32	prompts	fn	impl App	handle_input_prompt_key
+32	prompts	fn	impl App	handle_input_prompt_mouse
+32	prompts	fn	impl App	render_input_prompt
+32	prompts	fn	impl App	handle_list_picker_key
+32	prompts	fn	impl App	handle_list_picker_mouse
+32	prompts	fn	impl App	render_list_picker
+16	scm	fn	impl App	render_scm_menu
+23	search	fn	impl App	open_editor_find
+25	terminal_tools	fn	impl App	open_terminal_find
+25	terminal_tools	fn	impl App	activate_terminal_pane
+25	terminal_tools	fn	impl App	close_terminal_find
+25	terminal_tools	fn	impl App	terminal_find_set_query
+25	terminal_tools	fn	impl App	terminal_find_jump
+25	terminal_tools	fn	impl App	terminal_find_edit_at_caret
+25	terminal_tools	fn	impl App	terminal_find_move_caret
+25	terminal_tools	fn	impl App	handle_terminal_find_key
+25	terminal_tools	fn	impl App	open_terminal_quick_select
+25	terminal_tools	fn	impl App	push_quick_select_hints
+25	terminal_tools	fn	impl App	close_terminal_quick_select
+25	terminal_tools	fn	impl App	open_terminal_copy_mode
+25	terminal_tools	fn	impl App	close_terminal_copy_mode
+25	terminal_tools	fn	impl App	apply_terminal_copy_mode
+25	terminal_tools	fn	impl App	char_idx_at_col
+25	terminal_tools	fn	impl App	handle_terminal_copy_mode_key
+25	terminal_tools	fn	impl App	handle_terminal_quick_select_key
+23	search	fn	impl App	open_editor_replace
+23	search	fn	impl App	close_editor_find
+23	search	fn	impl App	diff_find_viewport
+23	search	fn	impl App	diff_find_apply
+23	search	fn	impl App	diff_find_set_query
+23	search	fn	impl App	diff_find_current_pos
+23	search	fn	impl App	editor_find_set_query
+23	search	fn	impl App	editor_find_jump_next
+23	search	fn	impl App	editor_find_jump_prev
+23	search	fn	impl App	log_find_set_query
+8	viewers	fn	impl App	poll_log_index
+23	search	fn	impl App	log_find_step
+23	search	fn	impl App	scroll_log_to_match
+23	search	fn	impl App	jump_editor_to_match
+23	search	fn	impl App	editor_find_step
+23	search	fn	impl App	refresh_editor_find_index
+23	search	fn	impl App	editor_find_range
+23	search	fn	impl App	toggle_editor_find_in_selection
+23	search	fn	impl App	editor_find_recount
+23	search	fn	impl App	editor_find_replace_focused
+23	search	fn	impl App	editor_find_edit_at_caret
+23	search	fn	impl App	editor_find_move_caret
+23	search	fn	impl App	editor_find_seed
+23	search	fn	impl App	reselect_editor_find
+23	search	fn	impl App	handle_editor_find_key
+23	search	fn	impl App	editor_find_replace_current
+23	search	fn	impl App	editor_find_replace_all
+23	search	fn	impl App	render_editor_find
+25	terminal_tools	fn	impl App	render_terminal_find
+9	settings	fn	impl App	handle_shortcuts_modal_key
+9	settings	fn	impl App	handle_shortcuts_modal_mouse
+9	settings	fn	impl App	render_shortcuts_modal
+12	remote_sessions	fn	impl App	render_connect_dialog
+37	key_input	fn	impl App	toggle_voice_input
+37	key_input	fn	impl App	start_voice_input
+37	key_input	fn	impl App	cancel_voice_input
+37	key_input	fn	impl App	drain_voice
+37	key_input	fn	impl App	inject_voice_text
+37	key_input	fn	impl App	handle_osk_mouse
+38	mouse_input	fn	impl App	handle_mouse
+38	mouse_input	fn	impl App	trim_auto_indents
+38	mouse_input	fn	impl App	handle_mouse_inner
+27	save_restore	fn	impl App	editor_language_supports_formatting
+9	settings	fn	impl App	language_prefs_for
+9	settings	fn	impl App	format_on_save_for
+9	settings	fn	impl App	format_on_type_for
+9	settings	fn	impl App	auto_close_pairs_for
+9	settings	fn	impl App	inlay_hints_enabled_for
+9	settings	fn	impl App	whitespace_mode_for
+27	save_restore	fn	impl App	format_on_save_eligible
+27	save_restore	fn	impl App	foreign_formatter
+27	save_restore	fn	impl App	save_for_foreign_formatter
+27	save_restore	fn	impl App	arm_deferred_save
+27	save_restore	fn	impl App	complete_pending_save
+27	save_restore	const	impl App	AUTO_SAVE_DELAY
+27	save_restore	fn	impl App	tick_auto_save
+27	save_restore	fn	impl App	on_window_focus_lost
+27	save_restore	fn	impl App	note_focus_signature
+27	save_restore	fn	impl App	sweep_auto_save
+27	save_restore	fn	impl App	sweep_dirty_buffers
+27	save_restore	fn	impl App	save_all
+27	save_restore	fn	impl App	toggle_auto_save
+27	save_restore	fn	impl App	toggle_auto_save_on_focus_change
+17	diff_merge	fn	impl App	toggle_provenance
+16	scm	fn	impl App	toggle_inline_blame
+9	settings	fn	impl App	open_profiles
+9	settings	fn	impl App	switch_profile
+9	settings	fn	impl App	open_keyboard_shortcuts
+9	settings	fn	impl App	record_shortcut
+9	settings	fn	impl App	write_shortcut
+22	completion	fn	impl App	toggle_inline_suggestions
+22	completion	fn	impl App	editor_offers_inline_completion
+22	completion	fn	impl App	land_inline_lsp
+22	completion	fn	impl App	tick_inline_complete
+22	completion	fn	impl App	inline_suggestion_key
+39	frame	fn	impl App	a11y_snapshot
+39	frame	fn	impl App	modal_a11y
+39	frame	fn	impl App	bottom_panel_a11y
+39	frame	fn	impl App	search_a11y
+39	frame	fn	impl App	source_control_a11y
+39	frame	fn	impl App	update_announcer
+39	frame	fn	impl App	announce_event
+39	frame	fn	impl App	debug_pause_announcement
+39	frame	fn	impl App	toggle_screen_reader
+39	frame	fn	impl App	park_screen_reader_cursor
+25	terminal_tools	fn	impl App	paint_terminal_suggestion
+25	terminal_tools	fn	impl App	toggle_terminal_suggestions
+13	host_integration	fn	impl App	probe_view_path
+13	host_integration	fn	impl App	rebase_todo_key
+13	host_integration	fn	impl App	abort_rebase_todo
+23	search	fn	impl App	open_search_editor
+23	search	fn	impl App	rerun_search_editor
+23	search	fn	impl App	drain_search_editor
+23	search	fn	impl App	open_search_editor_result
+21	language_servers	fn	impl App	tick_code_lens
+21	language_servers	fn	impl App	drain_lsp_code_lens
+21	language_servers	fn	impl App	run_code_lens
+21	language_servers	fn	impl App	run_code_lens_at_cursor
+21	language_servers	fn	impl App	toggle_code_lens
+8	viewers	fn	impl App	sync_markdown_scroll
+8	viewers	fn	impl App	sync_markdown_side_previews
+7	runners	fn	impl App	toggle_live_run
+7	runners	fn	impl App	for_each_tab_of
+7	runners	fn	impl App	tick_live_run
+34	editor_input	fn	impl App	column_select_key
+34	editor_input	fn	impl App	toggle_column_selection_mode
+34	editor_input	fn	impl App	type_char_in_editor
+34	editor_input	fn	impl App	toggle_overwrite_mode
+34	editor_input	fn	impl App	sync_caret_style
+34	editor_input	fn	impl App	cycle_line_numbers
+34	editor_input	fn	impl App	apply_line_numbers
+34	editor_input	fn	impl App	toggle_render_whitespace
+6	debugger	fn	impl App	refresh_inline_values
+6	debugger	fn	impl App	clear_inline_values
+6	debugger	fn	impl App	toggle_inline_values
+34	editor_input	fn	impl App	toggle_bracket_colors
+34	editor_input	fn	impl App	toggle_indent_guides
+34	editor_input	fn	impl App	toggle_auto_close_pairs
+34	editor_input	fn	impl App	toggle_format_on_type
+34	editor_input	fn	impl App	toggle_format_on_save
+8	viewers	fn	impl App	toggle_log_highlight
+8	viewers	fn	impl App	set_log_highlight
+25	terminal_tools	fn	impl App	toggle_copy_on_select
+27	save_restore	fn	impl App	save
+27	save_restore	fn	impl App	save_active_tab
+27	save_restore	fn	impl App	format_and_save
+9	settings	fn	impl App	tick_config_watch
+9	settings	fn	impl App	tick_config_watch_at
+9	settings	fn	impl App	is_project_snippets_path
+9	settings	fn	impl App	reload_project_snippets
+9	settings	fn	impl App	watch_project_snippets
+9	settings	fn	impl App	project_snippet_watch_paths
+9	settings	fn	impl App	reload_config_if_needed
+9	settings	fn	impl App	reload_config_for_path
+23	search	fn	impl App	toggle_project_excludes
+9	settings	fn	impl App	apply_project_excludes
+9	settings	fn	impl App	apply_file_associations
+9	settings	fn	impl App	install_file_associations
+9	settings	fn	impl App	apply_files_encoding
+23	search	fn	impl App	without_project_excludes
+9	settings	fn	impl App	remerge_settings
+9	settings	fn	impl App	report_unsaved_setting
+9	settings	fn	impl App	apply_merged_settings
+27	save_restore	fn	impl App	lsp_notify_saved
+17	diff_merge	fn	impl App	sync_provenance
+17	diff_merge	fn	impl App	sync_provenance_for
+17	diff_merge	fn	impl App	record_history_snapshot_of
+6	debugger	fn	impl App	resend_breakpoints
+17	diff_merge	fn	impl App	keep_unsaved_buffers_in_history
+17	diff_merge	fn	impl App	record_history_snapshot_of_kept
+17	diff_merge	fn	impl App	spawn_history_record
+27	save_restore	fn	impl App	write_tab_to_disk
+27	save_restore	fn	impl App	write_current_to_disk
+27	save_restore	fn	impl App	prompt_write_protected
+27	save_restore	fn	impl App	owner_saves_active_file
+27	save_restore	fn	impl App	report_save_error
+27	save_restore	fn	impl App	save_with_sudo
+27	save_restore	fn	impl App	settle_sudo_saves
+27	save_restore	fn	impl App	prompt_encoding_loss
+27	save_restore	fn	impl App	confirm_lossy_save
+27	save_restore	fn	impl App	cancel_lossy_save
+31	menus	fn	impl App	context_menu_covers_rect
+31	menus	fn	impl App	menu_rect
+31	menus	fn	impl App	submenu_rect
+31	menus	fn	impl App	menu_visible_rows
+31	menus	fn	impl App	menu_item_at
+31	menus	fn	impl App	submenu_item_at
+31	menus	fn	impl App	handle_menu_key
+19	explorer	fn	impl App	add_workspace_folder
+19	explorer	fn	impl App	remove_workspace_folder
+19	explorer	fn	impl App	rebind_workspace_watchers
+19	explorer	fn	impl App	sync_workspace_fanout
+19	explorer	fn	impl App	refresh_workspace_title
+19	explorer	fn	impl App	save_workspace_folders
+19	explorer	fn	impl App	restore_workspace_folders
+19	explorer	fn	impl App	open_workspace_file
+19	explorer	fn	impl App	save_workspace_file
+19	explorer	fn	impl App	open_add_folder_picker
+11	agents_collab	fn	impl App	load_agent_ledger
+11	agents_collab	fn	impl App	persist_agent_ledger
+19	explorer	fn	impl App	change_workspace_root
+19	explorer	fn	impl App	is_explorer_focused
+19	explorer	fn	impl App	handle_explorer_shortcut
+19	explorer	fn	impl App	explorer_parent_for_make_root
+19	explorer	fn	impl App	explorer_selected_path
+19	explorer	fn	impl App	explorer_selected_folder
+19	explorer	fn	impl App	explorer_create_target_dir
+19	explorer	fn	impl App	palette_create_target_dir
+19	explorer	fn	impl App	apply_tree_typeahead
+31	menus	fn	impl App	dispatch_menu_action
+16	scm	fn	impl App	commit_graph_menu
+16	scm	fn	impl App	run_commit_action
+26	editor_tabs	fn	impl App	close_other_tabs
+26	editor_tabs	fn	impl App	close_tabs_to_right
+26	editor_tabs	fn	impl App	keep_tab_open
+26	editor_tabs	fn	impl App	toggle_tab_pin
+26	editor_tabs	fn	impl App	set_active_tab_pinned
+26	editor_tabs	fn	impl App	close_all_tabs
+26	editor_tabs	fn	impl App	close_saved_tabs
+27	save_restore	fn	impl App	guard_unsaved
+27	save_restore	fn	impl App	request_close_tab
+27	save_restore	fn	impl App	finish_unsaved_exit
+27	save_restore	fn	impl App	answer_unsaved
+27	save_restore	fn	impl App	cancel_unsaved
+27	save_restore	fn	impl App	drop_unsaved_exit
+27	save_restore	fn	impl App	close_tab_now
+27	save_restore	fn	impl App	tab_would_lose_edits
+27	save_restore	fn	impl App	unsaved_files
+27	save_restore	fn	impl App	unsaved_stamp
+27	save_restore	const	impl App	HOT_EXIT_DELAY
+27	save_restore	fn	impl App	tick_hot_exit
+27	save_restore	fn	impl App	newest_unsaved_edit
+27	save_restore	fn	impl App	hot_exit_path
+27	save_restore	fn	impl App	write_hot_exit
+27	save_restore	fn	impl App	capture_hot_exit
+27	save_restore	fn	impl App	clear_hot_exit
+27	save_restore	fn	impl App	remove_own_hot_exit
+27	save_restore	fn	impl App	restore_hot_exit
+27	save_restore	fn	impl App	save_tabs_for_exit
+16	scm	fn	impl App	share_link
+16	scm	fn	impl App	share_link_lines
+26	editor_tabs	fn	impl App	copy_path_to_clipboard
+26	editor_tabs	fn	impl App	copy_relative_path_to_clipboard
+26	editor_tabs	fn	impl App	reveal_in_explorer
+26	editor_tabs	fn	impl App	reveal_in_finder
+30	inline_images	fn	impl App	group_on_side
+8	viewers	fn	impl App	step_pdf_page
+8	viewers	fn	impl App	wheel_pdf_page
+8	viewers	fn	impl App	jump_pdf_page
+8	viewers	fn	impl App	pdf_link_target_at
+8	viewers	fn	impl App	focused_image_side
+30	inline_images	fn	impl App	invalidate_editor_image_layouts
+30	inline_images	fn	impl App	update_editor_image_overlay
+30	inline_images	fn	impl App	disable_editor_image
+30	inline_images	fn	impl App	consume_editor_image_clear
+30	inline_images	fn	impl App	editor_image_payload
+30	inline_images	fn	impl App	mark_editor_image_displayed
+30	inline_images	fn	impl App	update_terminal_image_overlay
+30	inline_images	fn	impl App	disable_terminal_image
+30	inline_images	fn	impl App	disable_markdown_image
+30	inline_images	fn	impl App	consume_markdown_image_clear
+30	inline_images	fn	impl App	mark_markdown_image_displayed
+30	inline_images	fn	impl App	markdown_image_payload
+30	inline_images	fn	impl App	update_markdown_image_overlay
+30	inline_images	fn	impl App	consume_terminal_image_clear
+30	inline_images	fn	impl App	terminal_image_payload
+30	inline_images	fn	impl App	mark_terminal_image_displayed
+30	inline_images	fn	impl App	update_minimap_overlay
+21	language_servers	fn	impl App	poll_highlights
+30	inline_images	fn	impl App	tick_minimap
+30	inline_images	fn	impl App	disable_minimap_image
+30	inline_images	fn	impl App	paint_minimap
+30	inline_images	fn	impl App	render_text_minimap
+30	inline_images	fn	impl App	toggle_minimap
+30	inline_images	fn	impl App	carve_minimap
+30	inline_images	fn	impl App	paint_minimap_header
+30	inline_images	fn	impl App	menu_covers
+30	inline_images	fn	impl App	minimap_image_payload
+30	inline_images	fn	impl App	consume_minimap_image_clear
+30	inline_images	fn	impl App	mark_minimap_image_displayed
+30	inline_images	fn	impl App	minimap_scroll_to_row
+31	menus	fn	impl App	open_status_menu
+31	menus	fn	impl App	open_status_language_menu
+31	menus	fn	impl App	open_status_eol_menu
+31	menus	fn	impl App	open_status_encoding_menu
+31	menus	fn	impl App	open_go_to_line_prompt
+31	menus	fn	impl App	open_status_indent_menu
+30	inline_images	fn	impl App	open_minimap_menu
+14	welcome_screen	fn	impl App	welcome_image_emit_payload
+14	welcome_screen	fn	impl App	mark_welcome_image_emitted
+14	welcome_screen	fn	impl App	welcome_bake_key
+14	welcome_screen	fn	impl App	start_welcome_bake
+14	welcome_screen	fn	impl App	poll_welcome_bake
+17	diff_merge	fn	impl App	jump_editor_change
+17	diff_merge	fn	impl App	jump_diff_change
+17	diff_merge	fn	impl App	jump_to_diff_file_under_caret
+17	diff_merge	fn	impl App	handle_diff_key
+8	viewers	fn	impl App	sort_sheet_by_column
+8	viewers	fn	impl App	handle_sheet_key
+4	review	fn	impl App	pr_viewed_path
+4	review	fn	impl App	open_pr_review
+4	review	fn	impl App	open_pr_number_prompt
+4	review	fn	impl App	submit_pr_number
+4	review	fn	impl App	start_pr_review
+4	review	fn	impl App	spawn_pr_gh
+4	review	fn	impl App	start_pr_viewed_fetch
+4	review	fn	impl App	queue_pr_viewed_write
+4	review	fn	impl App	touch_pr_viewed
+4	review	fn	impl App	pr_viewed_fenced
+4	review	fn	impl App	poll_pr_viewed
+4	review	fn	impl App	apply_github_viewed
+4	review	fn	impl App	refresh_pending_pr_checks
+4	review	fn	impl App	poll_pr_gh
+4	review	fn	impl App	handle_pr_review_key
+4	review	fn	impl App	checkout_pr_head
+4	review	fn	impl App	poll_pr_checkout
+4	review	fn	impl App	settle_pr_checkout
+4	review	fn	impl App	leave_pr_checkout
+1	code_scanning	fn	impl App	handle_sarif_key
+4	review	fn	impl App	open_pr_file_diff
+4	review	fn	impl App	open_pr_diff_section
+4	review	fn	impl App	show_pr_check_log
+1	code_scanning	fn	impl App	open_selected_sarif_result
+1	code_scanning	fn	impl App	start_sarif_download
+1	code_scanning	fn	impl App	poll_sarif_download
+1	code_scanning	fn	impl App	sarif_selected_place_and_origin
+1	code_scanning	fn	impl App	sarif_codeql_database
+1	code_scanning	fn	impl App	sarif_file_text
+1	code_scanning	fn	impl App	refresh_sarif_preview
+1	code_scanning	fn	impl App	sarif_targets
+4	review	fn	impl App	run_gh
+1	code_scanning	fn	impl App	open_code_scanning_picker
+1	code_scanning	fn	impl App	code_scan_branch
+1	code_scanning	fn	impl App	start_code_scan_lookup
+1	code_scanning	fn	impl App	poll_code_scanning
+1	code_scanning	fn	impl App	fetch_code_scan_analyses
+1	code_scanning	fn	impl App	start_dismiss_code_scanning_alert
+1	code_scanning	fn	impl App	dismiss_code_scanning_alert
+1	code_scanning	fn	impl App	open_code_scanning_analysis
+1	code_scanning	fn	impl App	submit_sarif_export
+1	code_scanning	fn	impl App	submit_sarif_baseline
+1	code_scanning	fn	impl App	submit_sarif_add_log
+1	code_scanning	fn	impl App	submit_sarif_locate
+1	code_scanning	fn	impl App	step_sarif_result
+1	code_scanning	fn	impl App	sync_sarif_selection_to_cursor
+1	code_scanning	fn	impl App	apply_sarif_fix
+1	code_scanning	fn	impl App	open_sarif_embedded
+1	code_scanning	fn	impl App	submit_sarif_columns
+1	code_scanning	fn	impl App	sync_sarif_step_marks
+1	code_scanning	fn	impl App	open_file_paths
+1	code_scanning	fn	impl App	open_sarif_loc
+8	viewers	fn	impl App	handle_log_key
+8	viewers	fn	impl App	handle_archive_key
+8	viewers	fn	impl App	open_selected_archive_member
+8	viewers	fn	impl App	open_archive_extract_prompt
+8	viewers	fn	impl App	handle_hex_key
+8	viewers	fn	impl App	sheet_structure_op
+8	viewers	fn	impl App	sqlite_page_step
+8	viewers	fn	impl App	sqlite_jump
+8	viewers	fn	impl App	sqlite_load_page
+8	viewers	fn	impl App	hex_find_next
+8	viewers	fn	impl App	hex_find_run
+29	workbench	fn	impl App	handle_splitter_drag
+19	explorer	fn	impl App	delete_selection
+19	explorer	fn	impl App	delete_paths
+16	scm	fn	impl App	open_tab_encoding
+19	explorer	fn	impl App	rename_open_path_everywhere
+19	explorer	fn	impl App	perform_delete_paths
+19	explorer	fn	impl App	copy_selection_to_explorer_clipboard
+19	explorer	fn	impl App	paste_target_dir
+19	explorer	fn	impl App	paste_explorer_clipboard
+19	explorer	fn	impl App	toggle_compare_on_selected_file
+19	explorer	fn	impl App	paste_into
+19	explorer	fn	impl App	move_or_copy_in_explorer
+19	explorer	fn	impl App	start_file_move
+19	explorer	fn	impl App	tick_file_moves
+19	explorer	fn	impl App	finish_file_move
+19	explorer	fn	impl App	run_file_move
+19	explorer	fn	impl App	apply_paste_or_drop
+32	prompts	fn	impl App	open_create_prompt
+0		fn	impl App	status_path
+27	save_restore	fn	impl App	revert_file
+27	save_restore	fn	impl App	new_untitled_file
+27	save_restore	fn	impl App	open_save_as_prompt
+27	save_restore	fn	impl App	save_as
+32	prompts	fn	impl App	open_rename_prompt
+32	prompts	fn	impl App	handle_prompt_key
+32	prompts	fn	impl App	commit_prompt
+13	host_integration	fn	-	keyboard_enhancement_flags
+21	language_servers	const	-	BASH_SERVER
+21	language_servers	const	-	SHFMT_MISSING
+21	language_servers	const	-	SHELLCHECK_MISSING
+21	language_servers	fn	-	is_shell_script
+21	language_servers	fn	-	tool_on_path
+13	host_integration	fn	-	takeover_mode_seq
+13	host_integration	fn	-	mode_reassert_seq
+0		fn	-	elide_middle
+0		fn	-	one_line
+0		fn	-	workspace_relative
+21	language_servers	fn	-	peek_excerpt
+37	key_input	fn	-	cmd_active
+37	key_input	fn	-	has_cmd
+37	key_input	fn	-	has_cmd_or_linux_ctrl
+13	host_integration	fn	-	set_title_seq
+13	host_integration	fn	-	set_session_bg_srgb_seq
+13	host_integration	fn	-	reset_session_bg_seq
+13	host_integration	fn	-	host_colors_seq
+13	host_integration	fn	-	theme_host_colors_seq
+13	host_integration	fn	-	reattach_reassert_seq
+13	host_integration	fn	-	reset_host_colors_seq
+26	editor_tabs	enum	-	HostTerminal
+26	editor_tabs	fn	-	detect_host_terminal
+26	editor_tabs	fn	-	spawn_new_window
+26	editor_tabs	fn	-	ghostty_open_argv
+26	editor_tabs	fn	-	new_window_shell_command
+26	editor_tabs	fn	-	applescript_escape
+26	editor_tabs	fn	-	iterm2_new_window_script
+26	editor_tabs	fn	-	apple_terminal_new_window_script
+26	editor_tabs	fn	-	spawn_new_window
+13	host_integration	fn	-	build_title
+37	key_input	fn	-	is_terminal_copy_key
+37	key_input	fn	-	is_compare_key
+37	key_input	fn	-	is_search_jump_key
+37	key_input	fn	-	is_editor_find_key
+37	key_input	fn	-	is_terminal_find_key
+37	key_input	fn	-	is_editor_replace_key
+37	key_input	fn	-	is_file_finder_key
+37	key_input	fn	-	is_command_palette_key
+37	key_input	fn	-	is_go_to_symbol_key
+37	key_input	fn	-	is_cmd_k_leader_key
+37	key_input	fn	-	ctrl_k_leads
+37	key_input	fn	-	is_toggle_line_comment_key
+37	key_input	fn	-	is_toggle_block_comment_key
+37	key_input	fn	-	is_switch_header_source_key
+37	key_input	fn	-	is_toggle_wrap_key
+37	key_input	fn	-	is_tree_zoxide_jump_key
+7	runners	enum	-	ProjectCheck
+24	terminal_panes	fn	-	find_texts
+37	key_input	fn	-	is_tree_new_file_key
+37	key_input	fn	-	is_new_untitled_file_key
+37	key_input	fn	-	is_tree_new_folder_key
+37	key_input	fn	-	is_tree_rename_key
+37	key_input	fn	-	is_reveal_in_finder_key
+37	key_input	fn	-	is_copy_path_key
+37	key_input	fn	-	is_tree_make_root_key
+37	key_input	fn	-	is_tree_make_parent_root_key
+37	key_input	fn	-	is_explorer_jump_key
+37	key_input	fn	-	is_source_control_jump_key
+37	key_input	fn	-	is_run_debug_jump_key
+37	key_input	fn	-	is_remote_jump_key
+37	key_input	fn	-	is_extensions_jump_key
+37	key_input	fn	-	key_walks_by_word
+37	key_input	fn	-	is_show_problems_key
+37	key_input	fn	-	is_show_output_key
+37	key_input	fn	-	is_replace_in_files_key
+23	search	fn	-	editor_find_lines
+23	search	fn	-	editor_find_scope_pos
+37	key_input	fn	-	search_toggle_for_key
+37	key_input	fn	-	is_search_details_key
+37	key_input	fn	-	is_save_all_key
+11	agents_collab	fn	-	turn_note_summary
+11	agents_collab	fn	-	next_note_by_row
+37	key_input	fn	-	is_drop_to_local_key
+37	key_input	fn	-	is_run_build_task_key
+37	key_input	fn	-	is_markdown_preview_key
+37	key_input	fn	-	is_run_fence_key
+7	runners	fn	-	fence_command
+7	runners	fn	-	block_script_dir
+7	runners	fn	-	absolute_block_dir
+7	runners	const	-	BLOCK_SCRIPT_TTL
+7	runners	fn	-	stage_block
+21	language_servers	const	-	LSP_PAUSED_FOR_BUILD
+0		fn	-	now_millis
+37	key_input	fn	-	is_cmd_shift_letter
+9	settings	fn	-	load_snippets
+9	settings	fn	-	load_all_snippets
+9	settings	fn	-	snippets_reload_status
+9	settings	fn	-	keybindings_reload_status
+37	key_input	fn	-	is_sidebar_toggle_key
+0		fn	-	a11y_count
+37	key_input	fn	-	is_secondary_sidebar_toggle_key
+37	key_input	fn	-	is_minimap_toggle_key
+37	key_input	fn	-	is_terminal_toggle_key
+37	key_input	fn	-	is_terminal_maximize_key
+12	remote_sessions	type	-	HostAccent
+12	remote_sessions	fn	-	compile_host_accents
+37	key_input	fn	-	is_quick_select_key
+37	key_input	fn	-	is_copy_mode_key
+37	key_input	fn	-	is_command_history_key
+37	key_input	fn	-	is_terminal_split_key
+37	key_input	fn	-	is_editor_split_key
+37	key_input	fn	-	is_goto_bracket_key
+37	key_input	fn	-	is_select_to_bracket_key
+37	key_input	fn	-	is_navigate_back_key
+37	key_input	fn	-	is_navigate_forward_key
+37	key_input	fn	-	is_transpose_key
+37	key_input	fn	-	is_indentation_to_spaces_key
+37	key_input	fn	-	is_indentation_to_tabs_key
+37	key_input	fn	-	is_trim_final_newlines_key
+26	editor_tabs	fn	-	bookmark_line_shown
+37	key_input	fn	-	is_toggle_bookmark_key
+37	key_input	fn	-	is_switch_debug_session_key
+37	key_input	fn	-	is_clear_bookmarks_key
+37	key_input	fn	-	is_next_bookmark_key
+37	key_input	fn	-	is_prev_bookmark_key
+37	key_input	fn	-	is_join_lines_key
+37	key_input	fn	-	is_transform_upper_key
+37	key_input	fn	-	is_transform_lower_key
+37	key_input	fn	-	is_copy_relative_path_key
+37	key_input	fn	-	is_sort_lines_asc_key
+37	key_input	fn	-	is_sort_lines_desc_key
+37	key_input	fn	-	is_trim_trailing_whitespace_key
+37	key_input	fn	-	is_increment_number_key
+37	key_input	fn	-	is_decrement_number_key
+37	key_input	fn	-	is_cmd_alt_char
+37	key_input	fn	-	is_format_document_key
+37	key_input	fn	-	is_emmet_expand_key
+21	language_servers	fn	-	syntax_outline_for
+21	language_servers	const	-	OUTLINE_INLINE_MAX_BYTES
+21	language_servers	fn	-	outline_parses_inline
+21	language_servers	fn	-	breadcrumb_symbol_chain
+37	key_input	fn	-	is_focus_breadcrumbs_key
+21	language_servers	fn	-	sibling_symbols
+37	key_input	fn	-	is_quick_fix_key
+37	key_input	fn	-	is_cmd_alt_shift_letter
+37	key_input	fn	-	is_focus_group_left_key
+37	key_input	fn	-	is_focus_group_right_key
+37	key_input	fn	-	is_terminal_focus_key
+37	key_input	fn	-	is_terminal_close_key
+37	key_input	fn	-	is_terminal_cycle_key
+37	key_input	fn	-	is_terminal_cycle_back_key
+37	key_input	fn	-	is_delete_node_key
+0		fn	-	whitespace_mode_in
+0		fn	-	path_scope_id
+0		fn	-	editor_scope_id
+0		fn	-	settings_scope_id
+0		fn	-	inlay_hints_on_in
+7	runners	fn	-	file_test_suite
+7	runners	fn	-	cargo_package_relative
+22	completion	fn	-	is_word_continuation
+27	save_restore	const	-	FORMAT_ON_SAVE_TIMEOUT
+27	save_restore	fn	-	save_all_summary
+21	language_servers	fn	-	is_signature_help_trigger
+9	settings	enum	-	ConfigFileSeed
+9	settings	const	-	SETTINGS_LAYER_TEMPLATE
+9	settings	const	-	SETTINGS_TEMPLATE
+21	language_servers	fn	-	snippet_completion_item
+37	key_input	fn	impl App	key_context
+37	key_input	fn	-	mouse_context_for
+37	key_input	fn	-	gesture_for
+37	key_input	fn	-	quoted_titles
+37	key_input	fn	-	is_rebindable_chord
+37	key_input	fn	-	snippet_key_continues
+37	key_input	fn	-	is_completion_trigger_key
+37	key_input	fn	-	is_save_key
+34	editor_input	fn	-	read_system_clipboard
+34	editor_input	fn	-	relative_clipboard_text
+11	agents_collab	fn	-	lane_root_badge
+11	agents_collab	fn	-	lane_launch_input
+7	runners	fn	-	pane_is_idle_at
+7	runners	fn	-	cwd_matches
+0		fn	-	cells_in
+0		fn	-	copy_to_clipboard
+22	completion	enum	-	EmmetEdit
+34	editor_input	enum	-	CopyLanding
+34	editor_input	fn	impl CopyLanding	status
+37	key_input	fn	-	is_editor_copy_key
+37	key_input	fn	-	is_editor_cut_key
+37	key_input	fn	-	is_search_paste_key
+23	search	fn	-	search_field_name
+37	key_input	fn	-	is_editor_paste_key
+37	key_input	fn	-	is_clipboard_paste_key
+37	key_input	fn	-	is_plain_ctrl_v
+37	key_input	fn	-	is_search_editing_shortcut
+37	key_input	fn	-	is_editor_select_all_key
+37	key_input	fn	-	is_editor_undo_key
+37	key_input	fn	-	is_editor_redo_key
+37	key_input	fn	-	is_rename_symbol_key
+21	language_servers	fn	-	lsp_server_family
+21	language_servers	fn	-	just_installed_covers_path
+37	key_input	fn	-	is_select_all_occurrences_key
+37	key_input	fn	-	is_add_cursors_to_line_ends_key
+37	key_input	fn	-	is_expand_line_selection_key
+37	key_input	fn	-	is_change_all_occurrences_key
+37	key_input	fn	-	is_select_next_occurrence_key
+37	key_input	fn	-	is_delete_line_key
+37	key_input	fn	-	is_go_to_definition_key
+37	key_input	fn	-	is_peek_definition_key
+37	key_input	fn	-	is_go_to_references_key
+37	key_input	fn	-	is_run_to_cursor_key
+37	key_input	fn	-	is_update_croft_key
+13	host_integration	const	-	UPDATE_CROFT_CHORD
+37	key_input	fn	-	is_peek_references_key
+37	key_input	fn	-	is_go_to_declaration_key
+37	key_input	fn	-	is_go_to_type_definition_key
+37	key_input	fn	-	is_go_to_implementation_key
+34	editor_input	fn	-	chord_status_text
+34	editor_input	fn	-	is_vim_chord_letter
+34	editor_input	fn	-	is_vim_chord_g
+34	editor_input	fn	-	is_vim_chord_y
+34	editor_input	fn	-	is_vim_goto_bottom
+34	editor_input	fn	-	chord_digit_value
+34	editor_input	fn	-	cmd_only_digit_value
+37	key_input	fn	-	is_vim_toggle_key
+34	editor_input	fn	-	reverse_find
+34	editor_input	fn	-	vim_motion_is_linewise
+34	editor_input	fn	-	vim_motion_is_forward_inclusive
+34	editor_input	fn	-	find_char_index
+34	editor_input	fn	-	rfind_char_index
+34	editor_input	fn	-	is_plain_letter
+37	key_input	fn	-	is_editor_line_home_key
+37	key_input	fn	-	is_editor_line_end_key
+37	key_input	fn	-	is_editor_kill_to_eol_key
+37	key_input	fn	-	is_editor_kill_to_bol_key
+37	key_input	fn	-	is_editor_open_line_below_key
+37	key_input	fn	-	is_editor_open_line_above_key
+37	key_input	fn	-	is_close_tab_key
+37	key_input	fn	-	jump_to_tab_index
+37	key_input	fn	-	legacy_ctrl_punct
+19	explorer	fn	-	drag_target_index
+19	explorer	fn	-	drop_target_dir
+19	explorer	fn	-	parse_dropped_paths
+19	explorer	fn	-	parse_foreign_dropped_paths
+19	explorer	fn	-	is_pure_path_payload
+19	explorer	fn	-	is_iterm2_inline_image_drop
+19	explorer	fn	-	parsed_drop_tokens
+19	explorer	fn	-	shell_split_drop_payload
+19	explorer	fn	-	normalise_dropped_token
+0		fn	-	truncate_for_display
+12	remote_sessions	fn	-	append_to_relay_log
+8	viewers	fn	-	sheet_cell_at
+8	viewers	fn	-	floor_char
+8	viewers	fn	-	ceil_char
+8	viewers	fn	-	sheet_follow_cursor
+8	viewers	fn	-	sheet_visible_rows
+21	language_servers	fn	-	semantic_reply_is_current
+8	viewers	fn	-	log_cell_at
+24	terminal_panes	fn	-	write_private
+24	terminal_panes	fn	-	reap_dead_scrollback_dumps
+0		fn	-	process_is_alive
+0		fn	-	process_is_alive
+24	terminal_panes	fn	-	scrollback_opens_as_log
+8	viewers	fn	-	pdf_wheel_cooling
+0		fn	-	rect_contains
+8	viewers	fn	-	seed_log_highlight_default
+8	viewers	fn	-	seed_log_highlight_default_at_startup
+8	viewers	macro	-	thread_local!
+8	viewers	fn	-	seed_log_highlight_default_at_startup
+17	diff_merge	fn	-	rebuild_diff_view
+24	terminal_panes	fn	-	mouse_mods
+30	inline_images	fn	-	sgr_for_cell
+30	inline_images	fn	-	rects_intersect
+0		struct	-	RunSpec
+6	debugger	fn	-	find_python_venv
+6	debugger	fn	-	project_python_for
+6	debugger	fn	-	debuggee_python
+6	debugger	fn	-	debuggee_python_note
+6	debugger	fn	-	no_display_for_a_browser
+6	debugger	fn	-	no_display
+6	debugger	fn	-	with_python_note
+6	debugger	fn	-	launch_request_python
+6	debugger	fn	-	debug_test_python
+6	debugger	fn	-	config_project_python
+24	terminal_panes	const	-	TERMINAL_ADD_LABEL
+24	terminal_panes	const	-	TERMINAL_CLOSE_LABEL
+24	terminal_panes	const	-	TERMINAL_PROFILE_LABEL
+24	terminal_panes	const	-	TERMINAL_MAX_LABEL
+24	terminal_panes	const	-	TERMINAL_RESTORE_LABEL
+24	terminal_panes	const	-	PANEL_MAXIMIZE_LABEL
+24	terminal_panes	const	-	PANEL_RESTORE_LABEL
+24	terminal_panes	const	-	TERMINAL_COLLAPSE_LABEL
+24	terminal_panes	const	-	TERMINAL_EXPAND_GLYPH
+24	terminal_panes	const	-	TERMINAL_STRIP_WIDE_STANDIN
+24	terminal_panes	const	-	TERMINAL_STRIP_W
+24	terminal_panes	const	-	TERMINAL_BUTTON_STRIP_W
+24	terminal_panes	fn	-	terminal_pane_constraints
+24	terminal_panes	const	-	TERMINAL_RAIL_ICON
+24	terminal_panes	const	-	TERMINAL_RAIL_LABEL_W
+24	terminal_panes	const	-	TERMINAL_RAIL_W
+0		fn	-	is_remote_session
+12	remote_sessions	fn	-	remote_persistence_status
+4	review	fn	-	bounded_output
+24	terminal_panes	fn	-	load_trigger_set
+0		struct	-	HttpRunOutcome
+13	host_integration	fn	-	prepare_view_listener
+13	host_integration	static	-	VIEW_BIND_ERROR
+13	host_integration	fn	-	view_status
+13	host_integration	fn	-	settings_not_loaded_status
+13	host_integration	fn	-	hook_bind_status
+13	host_integration	fn	-	sweep_dead_view_sockets
+13	host_integration	fn	-	sweep_dead_bind_stages
+13	host_integration	const	-	STAGED_STDIN_RETENTION
+13	host_integration	fn	-	sweep_staged_stdin
+29	workbench	fn	-	cursor_suffix
+12	remote_sessions	const	-	SSH_OFFER_TTL
+11	agents_collab	fn	-	agent_ledger_store_path
+11	agents_collab	fn	-	agent_ledger_key
+3	codeql	enum	-	CodeqlRunMode
+3	codeql	type	-	CodeqlCliCheck
+3	codeql	type	-	CodeqlQueryHelp
+3	codeql	type	-	CodeqlPackJob
+3	codeql	type	-	CodeqlDocJob
+3	codeql	type	-	CodeqlLogViewerJob
+3	codeql	const	-	CODEQL_DB_SOURCES
+3	codeql	type	-	CodeqlModelJob
+3	codeql	type	-	CodeqlUpgrade
+0		struct	-	VariantResultFiles
+3	codeql	type	-	VariantResults
+0		struct	-	VariantExport
+1	code_scanning	type	-	SarifStepSignature
+3	codeql	type	-	CodeqlRunPoll
+3	codeql	const	-	CODEQL_VARIANT_POLL
+3	codeql	const	-	CODEQL_VARIANT_FOLLOW
+3	codeql	type	-	CodeqlCodeSearch
+27	save_restore	fn	-	user_data_dir
+1	code_scanning	fn	-	utf16_col_to_char_in
+13	host_integration	fn	-	self_install_log_path
+13	host_integration	fn	-	staged_install_log_path
+13	host_integration	fn	-	reexec_binary_path
+37	key_input	const	-	SHORTCUT_RECORD_WINDOW
+19	explorer	fn	-	moved_path
+32	prompts	fn	-	resolve_typed_path
+8	viewers	fn	-	sheet_tab_state
+27	save_restore	fn	-	sidebar_view_label
+27	save_restore	fn	-	sidebar_view_from_label
+35	commands	fn	-	build_extension_items
+35	commands	fn	-	resolve_mcp_program
+35	commands	fn	-	mcp_tool_trust
+21	language_servers	fn	-	store_diagnostics_update
+35	commands	fn	-	run_mcp_command_blocking
+24	terminal_panes	fn	-	paint_terminal_pane_buttons
+0		struct	-	TerminalPaneButtons
+25	terminal_tools	fn	-	key_to_bytes
+21	language_servers	const	-	HOVER_DIVIDER
+21	language_servers	const	-	NO_HOVER_AT_CARET
+21	language_servers	fn	-	format_diagnostics
+21	language_servers	fn	-	compose_hover
+11	agents_collab	enum	-	ParticipantVerb
+0		struct	-	SessionCaret
+11	agents_collab	const	-	CARET_LABEL_FADE
+11	agents_collab	const	-	PROACTIVE_PAUSE
+0		struct	-	CollabCaret
+0		struct	-	CollabStreamInfo
+11	agents_collab	fn	-	next_remote_undo_group
+11	agents_collab	fn	-	collab_display_name
+11	agents_collab	fn	-	participant_color
+11	agents_collab	fn	-	collab_caret_color
+21	language_servers	fn	-	syntax_kind_of
+11	agents_collab	fn	-	repo_relative
+27	save_restore	fn	-	sudo_save_command
+27	save_restore	fn	-	stage_sudo_save
+11	agents_collab	fn	-	collab_file_key
+11	agents_collab	fn	-	parse_participant_action
+11	agents_collab	fn	-	participant_row
+0		struct	-	CountingWriter
+0		fn	impl CountingWriter	new
+0		fn	impl std::io::Write for CountingWriter	write
+0		fn	impl std::io::Write for CountingWriter	flush
+0		const	-	BEGIN_SYNCHRONIZED_UPDATE
+0		const	-	END_SYNCHRONIZED_UPDATE
+0		type	-	CroftTerminal
+7	runners	const	-	TEST_RUN_IN_PROGRESS
+0		fn	-	run
+0		struct	-	StartupProbe
+0		fn	#[cfg(unix)] impl StartupProbe	answer
+0		fn	#[cfg(unix)] impl Drop for StartupProbe	drop
+13	host_integration	fn	-	restore_host_terminal_state
+13	host_integration	const	-	TERMINAL_RESTORE_SEQ
+13	host_integration	fn	-	install_terminal_restore_panic_hook
+7	runners	fn	-	with_answers
+7	runners	fn	-	did_you_mean
+24	terminal_panes	fn	-	pasted_lines
+13	host_integration	fn	-	log_panic_to_file
+12	remote_sessions	fn	-	run_pending_scp_uploads
+0		struct	-	ImageUnderlays
+30	inline_images	fn	-	cells_fingerprint
+30	inline_images	fn	impl App	image_underlays
+30	inline_images	fn	impl App	chrome_image_due
+30	inline_images	fn	impl App	end_chrome_flush
+30	inline_images	fn	impl App	forget_sent_images
+0		fn	-	consume_any_image_clear
+0		fn	-	main_loop
