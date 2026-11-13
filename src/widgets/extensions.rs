@@ -35,7 +35,6 @@ const DESC_FG: Color = Color::Rgb(0x79, 0x82, 0x90); // blurb / dim text
 /// every Nerd Font (Powerline glyphs are universal).
 const SWITCH_CAP_L: char = '\u{e0b6}'; // left half-circle
 const SWITCH_CAP_R: char = '\u{e0b4}'; // right half-circle
-const SWITCH_KNOB: char = '\u{ebb4}'; // codicon circle-large-filled, cell-centered
 const SWITCH_OFF_TRACK: Color = Color::Rgb(0x3c, 0x44, 0x4e); // grey track (off)
 const SWITCH_KNOB_OFF: Color = Color::Rgb(0xcd, 0xd3, 0xdc); // dim knob (off)
 /// Codicon `search` magnifier for the filter box (matches the activity bar's
@@ -91,10 +90,10 @@ impl Palette {
 /// the theme's lit track with the knob to the right; off = a grey track with the
 /// knob to the left. Occupies 5 cells: `[cap, track, track, track, cap]`.
 ///
-/// The knob glyph (a Nerd Font codicon) is about two cells wide and a terminal
-/// lets it spill into the next cell only when that cell is blank; beside a cap
-/// glyph it is clipped to a half circle. So the knob sits in cell 1 (off) or 2
-/// (on), covering cells 1-2 or 2-3, and the cell after it is always blank track.
+/// The knob is a full circle glued from two half-circle glyphs in adjacent
+/// cells (left half, right half), so it fits its two cells in any font; a single
+/// wide glyph spilled out of its cell and was clipped next to a cap. It covers
+/// cells 1-2 (off) or 2-3 (on).
 fn draw_switch(
     buf: &mut Buffer,
     sw_x: u16,
@@ -116,12 +115,9 @@ fn draw_switch(
     } else {
         (1, SWITCH_KNOB_OFF)
     };
-    buf.set_string(
-        sw_x + knob_i,
-        y,
-        SWITCH_KNOB.to_string(),
-        Style::default().fg(knob_fg).bg(track),
-    );
+    let knob_style = Style::default().fg(knob_fg).bg(track);
+    buf.set_string(sw_x + knob_i, y, SWITCH_CAP_L.to_string(), knob_style);
+    buf.set_string(sw_x + knob_i + 1, y, SWITCH_CAP_R.to_string(), knob_style);
     buf.set_string(sw_x + 4, y, SWITCH_CAP_R.to_string(), cap_style);
 }
 
@@ -1087,24 +1083,24 @@ mod tests {
     }
 
     #[test]
-    fn the_cell_after_the_knob_is_blank_track_so_the_wide_glyph_is_not_clipped() {
+    fn the_knob_is_two_half_circles_in_adjacent_cells_inside_the_pill() {
         let mut panel = ExtensionsPanel::new();
         panel.set_items(items());
         panel.theme = Theme::BLACK;
         let (buf, _) = render(&mut panel, 44, 16);
         let sw_x = panel.last_switch_left;
-        for row in 0..2 {
+        // Row 0 is enabled (knob right, cells 2-3), row 1 disabled (cells 1-2).
+        for (row, left) in [(0usize, 2u16), (1, 1)] {
             let y = panel.row_hits[row].0;
-            let knob = (0..5)
-                .find(|i| buf[(sw_x + i, y)].symbol().starts_with(SWITCH_KNOB))
-                .expect("a knob in the pill");
-            let next = buf[(sw_x + knob + 1, y)].symbol();
-            assert_eq!(next, " ", "row {row}: the cell right of the knob is blank");
+            let sym = |i: u16| buf[(sw_x + i, y)].symbol().chars().next();
+            assert_eq!(sym(left), Some(SWITCH_CAP_L), "row {row}: knob left half");
             assert_eq!(
-                buf[(sw_x + 4, y)].symbol().chars().next(),
+                sym(left + 1),
                 Some(SWITCH_CAP_R),
-                "row {row}: the pill ends with its right cap"
+                "row {row}: knob right half"
             );
+            assert_eq!(sym(0), Some(SWITCH_CAP_L), "row {row}: pill left cap");
+            assert_eq!(sym(4), Some(SWITCH_CAP_R), "row {row}: pill right cap");
         }
     }
 
