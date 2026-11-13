@@ -122,6 +122,7 @@ src/
 │   ├── code_scanning.rs SARIF results viewer, GitHub code scanning, SARIF logs as problems
 │   ├── codeql.rs        the CodeQL side bar: databases, queries, results, variant analysis, the CLI
 │   ├── cursor_blink.rs  caret blink timing
+│   ├── debugger.rs      Run and Debug: launch, adapters, breakpoints, stepping, watches, console
 │   ├── fs_watch.rs      filesystem watch + poll fallback feeding tree / editor / terminal refresh. The poll stats the file behind EVERY open tab, not just the focused one: a boundary dir carries no watch at all (see the storm rules — never root a stream at or above `target/`, `node_modules/`, `.git/`) and an in-place write does not move its parent dir's mtime, so for a file sitting directly in one this stat is the only thing that can notice a change; cost is one stat per open tab per (adaptively backed-off) tick
 │   ├── git_worker.rs    off-thread git status / changes worker
 │   ├── hover.rs         LSP hover dwell timing
