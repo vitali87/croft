@@ -35,7 +35,7 @@ const DESC_FG: Color = Color::Rgb(0x79, 0x82, 0x90); // blurb / dim text
 /// every Nerd Font (Powerline glyphs are universal).
 const SWITCH_CAP_L: char = '\u{e0b6}'; // left half-circle
 const SWITCH_CAP_R: char = '\u{e0b4}'; // right half-circle
-const SWITCH_KNOB: char = '\u{ebb4}'; // codicon circle-large-filled, cell-centered
+const SWITCH_KNOB: char = '\u{25cf}'; // black circle: a standard glyph that fits one cell (the codicon one overflowed and was clipped)
 const SWITCH_OFF_TRACK: Color = Color::Rgb(0x3c, 0x44, 0x4e); // grey track (off)
 const SWITCH_KNOB_OFF: Color = Color::Rgb(0xcd, 0xd3, 0xdc); // dim knob (off)
 /// Codicon `search` magnifier for the filter box (matches the activity bar's
