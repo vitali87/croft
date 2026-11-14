@@ -119,6 +119,7 @@ src/
 ├── app/                 event loop, three-pane layout + activity bar, key dispatch, status bar, mouse, clipboard, splitters, preview overlays, Customize Layout (compute_chrome_layout / panel_band_rect pure geometry, secondary side bar, Zen Mode)
 │   ├── mod.rs           the main App: render, key / mouse dispatch, status bar, splitters
 │   ├── agents_collab.rs coding agents, lanes, the AI navigator, multiplayer sessions
+│   ├── bottom_panel.rs  bottom panel, OUTPUT, PROBLEMS and diagnostics, project check, PORTS
 │   ├── click.rs         double / triple click detection
 │   ├── code_scanning.rs SARIF results viewer, GitHub code scanning, SARIF logs as problems
 │   ├── codeql.rs        the CodeQL side bar: databases, queries, results, variant analysis, the CLI
