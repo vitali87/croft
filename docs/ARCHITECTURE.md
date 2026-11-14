@@ -144,6 +144,7 @@ src/
 │   ├── search.rs        Search view, Search Editor, find/replace bar, Quick Open
 │   ├── settings.rs      Settings editor, config watching, Keyboard Shortcuts editor, themes, profiles
 │   ├── terminal_panes.rs terminal panes: split, layout, profiles, recordings, panel save/restore
+│   ├── terminal_tools.rs terminal input, find, quick select, copy mode, command history, links
 │   ├── viewers.rs       spreadsheet/CSV/SQLite, PDF, archive, hex, log and Markdown viewers
 │   ├── welcome.rs       welcome-screen state: the "IN THIS RELEASE" highlights, read synchronously from `release_notes::release_notes()` (no thread, no network)
 │   ├── welcome_screen.rs welcome page drawing and the guided tour
