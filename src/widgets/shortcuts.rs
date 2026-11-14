@@ -417,7 +417,7 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 handler: "is_quick_fix_key",
             },
             ShortcutEntry {
-                keys: "Cmd/Ctrl+C",
+                keys: "Cmd/Ctrl+C / Ctrl+Insert",
                 description: "Copy the selection (native system clipboard; OSC 52 fallback on remote)",
                 handler: "is_editor_copy_key",
             },
@@ -437,7 +437,7 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 handler: "is_editor_cut_key",
             },
             ShortcutEntry {
-                keys: "Cmd/Ctrl+V",
+                keys: "Cmd/Ctrl+V / Shift+Insert",
                 description: "Paste at the cursor",
                 handler: "is_editor_paste_key",
             },

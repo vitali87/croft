@@ -141,6 +141,7 @@ editor | ctrl+f12 | -
 editor | ctrl+f2 | caret=4:13 sel=4:8-4:13 carets=1:35-1:40,5:7-5:12,6:19-6:24 status="Selected 4 occurrences (type to replace, Esc to cancel)"
 editor | ctrl+g g | caret=0:0 status="Top of file"
 editor | ctrl+home | caret=0:0
+editor | ctrl+insert | -
 editor | ctrl+j | panel=hidden
 editor | ctrl+k | +leader
 editor | ctrl+k [ | status="Cannot collapse the last expanded terminal"
@@ -298,6 +299,7 @@ editor | shift+f7 | status="No changes in this file"
 editor | shift+f8 | status="Screencast Mode on: the keys you press show at the bottom (Shift+F8 to stop)" +screencast
 editor | shift+f9 | +prompt("Add Conditional Breakpoint · line 5" "")
 editor | shift+home | caret=4:4 sel=4:8-4:4
+editor | shift+insert | tabs=*● main.rs text=15L#ebaedc8c caret=4:12 status="Pasted 4 chars"
 editor | shift+left | caret=4:7 sel=4:8-4:7
 editor | shift+pagedown | caret=14:8 sel=4:8-14:8 scroll=14:0
 editor | shift+pageup | caret=0:2 sel=4:8-0:2
@@ -410,6 +412,7 @@ selection | ctrl+f12 | -
 selection | ctrl+f2 | status="No symbol under cursor"
 selection | ctrl+g g | caret=0:0 sel=- status="Top of file"
 selection | ctrl+home | caret=0:0 sel=-
+selection | ctrl+insert | status="Copied 5 chars to clipboard" clip="total"
 selection | ctrl+j | panel=hidden
 selection | ctrl+k | +leader
 selection | ctrl+k [ | status="Cannot collapse the last expanded terminal"
@@ -567,6 +570,7 @@ selection | shift+f7 | status="No changes in this file"
 selection | shift+f8 | status="Screencast Mode on: the keys you press show at the bottom (Shift+F8 to stop)" +screencast
 selection | shift+f9 | +prompt("Add Conditional Breakpoint · line 5" "")
 selection | shift+home | caret=4:4 sel=4:8-4:4
+selection | shift+insert | tabs=*● main.rs text=15L#968f684c caret=4:12 sel=- status="Pasted 4 chars"
 selection | shift+left | caret=4:12 sel=4:8-4:12
 selection | shift+pagedown | caret=14:13 sel=4:8-14:13 scroll=14:0
 selection | shift+pageup | caret=0:2 sel=4:8-0:2
@@ -679,6 +683,7 @@ explorer | ctrl+f12 | -
 explorer | ctrl+f2 | +prompt("Rename main.rs" "main.rs")
 explorer | ctrl+g g | -
 explorer | ctrl+home | tree=./+,.vscode/,docs/,main.rs > .
+explorer | ctrl+insert | status="Copied 1 item"
 explorer | ctrl+j | panel=hidden
 explorer | ctrl+k | +leader
 explorer | ctrl+k [ | status="Cannot collapse the last expanded terminal"
@@ -835,6 +840,7 @@ explorer | shift+f7 | -
 explorer | shift+f8 | status="Screencast Mode on: the keys you press show at the bottom (Shift+F8 to stop)" +screencast
 explorer | shift+f9 | +prompt("Add Conditional Breakpoint · line 5" "")
 explorer | shift+home | tree=./+,.vscode/,docs/,main.rs > . marked=.
+explorer | shift+insert | status="Explorer clipboard is empty"
 explorer | shift+left | -
 explorer | shift+pagedown | tree=./+,.vscode/,docs/,main.rs > main.rs marked=.,.vscode,docs,main.rs
 explorer | shift+pageup | tree=./+,.vscode/,docs/,main.rs > . marked=.
@@ -947,6 +953,7 @@ terminal | ctrl+f12 | typed=0:"\u{1b}[24;5~"
 terminal | ctrl+f2 | typed=0:"\u{1b}[1;5Q"
 terminal | ctrl+g g | typed=0:"\u{7}g"
 terminal | ctrl+home | typed=0:"\u{1b}[1;5H"
+terminal | ctrl+insert | typed=0:"\u{1b}[2;5~"
 terminal | ctrl+j | focus=editor panel=hidden
 terminal | ctrl+k | typed=0:"\u{b}"
 terminal | ctrl+k [ | typed=0:"\u{b}["
@@ -1104,6 +1111,7 @@ terminal | shift+f7 | typed=0:"\u{1b}[18;2~"
 terminal | shift+f8 | status="Screencast Mode on: the keys you press show at the bottom (Shift+F8 to stop)" +screencast
 terminal | shift+f9 | +prompt("Add Conditional Breakpoint · line 5" "")
 terminal | shift+home | -
+terminal | shift+insert | typed=0:"CLIP"
 terminal | shift+left | typed=0:"\u{1b}[1;2D"
 terminal | shift+pagedown | -
 terminal | shift+pageup | -
@@ -1216,6 +1224,7 @@ search | ctrl+f12 | -
 search | ctrl+f2 | -
 search | ctrl+g g | status="Search: unhandled Ctrl+g" search="totalg" @Query:6 hits=0@0
 search | ctrl+home | search="total" @Query:0 hits=4@0
+search | ctrl+insert | -
 search | ctrl+j | panel=hidden
 search | ctrl+k | +leader
 search | ctrl+k [ | status="Cannot collapse the last expanded terminal"
@@ -1373,6 +1382,7 @@ search | shift+f7 | -
 search | shift+f8 | status="Screencast Mode on: the keys you press show at the bottom (Shift+F8 to stop)" +screencast
 search | shift+f9 | +prompt("Add Conditional Breakpoint · line 5" "")
 search | shift+home | search="total" @Query:0 hits=4@0
+search | shift+insert | status="Cmd+V: pasted into search field" search="totalCLIP" @Query:9 hits=0@0
 search | shift+left | search="total" @Query:4 hits=4@0
 search | shift+pagedown | -
 search | shift+pageup | -
@@ -1485,6 +1495,7 @@ scm | ctrl+f12 | -
 scm | ctrl+f2 | -
 scm | ctrl+g g | scm="Ship itg"@8 +focus StagedModified:docs/notes.md Untracked:todo.txt
 scm | ctrl+home | scm="Ship it"@0 +focus StagedModified:docs/notes.md Untracked:todo.txt
+scm | ctrl+insert | -
 scm | ctrl+j | panel=hidden
 scm | ctrl+k | +leader
 scm | ctrl+k [ | status="Cannot collapse the last expanded terminal"
@@ -1642,6 +1653,7 @@ scm | shift+f7 | -
 scm | shift+f8 | status="Screencast Mode on: the keys you press show at the bottom (Shift+F8 to stop)" +screencast
 scm | shift+f9 | +prompt("Add Conditional Breakpoint · line 5" "")
 scm | shift+home | scm="Ship it"@0 +focus StagedModified:docs/notes.md Untracked:todo.txt
+scm | shift+insert | scm="Ship itCLIP"@11 +focus StagedModified:docs/notes.md Untracked:todo.txt
 scm | shift+left | scm="Ship it"@6 +focus StagedModified:docs/notes.md Untracked:todo.txt
 scm | shift+pagedown | -
 scm | shift+pageup | -
@@ -1755,6 +1767,7 @@ palette | ctrl+f2 | -
 palette | ctrl+f5 | -
 palette | ctrl+g g | ~palette("g" @1 > "Go Back")
 palette | ctrl+home | -
+palette | ctrl+insert | -
 palette | ctrl+j | -
 palette | ctrl+k | -
 palette | ctrl+k [ | ~palette("[" @1 > "")
@@ -1914,6 +1927,7 @@ palette | shift+f7 | -
 palette | shift+f8 | -
 palette | shift+f9 | -
 palette | shift+home | -
+palette | shift+insert | -
 palette | shift+left | -
 palette | shift+pagedown | ~palette("" @0 > "Kill to End of Line")
 palette | shift+pageup | -
@@ -2027,6 +2041,7 @@ confirm | ctrl+f2 | -
 confirm | ctrl+f5 | -
 confirm | ctrl+g g | -
 confirm | ctrl+home | -
+confirm | ctrl+insert | -
 confirm | ctrl+j | -
 confirm | ctrl+k | -
 confirm | ctrl+k [ | -
@@ -2186,6 +2201,7 @@ confirm | shift+f7 | -
 confirm | shift+f8 | -
 confirm | shift+f9 | -
 confirm | shift+home | -
+confirm | shift+insert | -
 confirm | shift+left | -
 confirm | shift+pagedown | -
 confirm | shift+pageup | -
