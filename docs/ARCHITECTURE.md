@@ -122,6 +122,7 @@ src/
 │   ├── click.rs         double / triple click detection
 │   ├── code_scanning.rs SARIF results viewer, GitHub code scanning, SARIF logs as problems
 │   ├── codeql.rs        the CodeQL side bar: databases, queries, results, variant analysis, the CLI
+│   ├── completion.rs    completion popup, signature help, inline suggestions, Emmet
 │   ├── cursor_blink.rs  caret blink timing
 │   ├── debugger.rs      Run and Debug: launch, adapters, breakpoints, stepping, watches, console
 │   ├── diff_merge.rs    diff editor, merge conflicts, three-way merge, history scrubber, local history
