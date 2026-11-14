@@ -140,6 +140,7 @@ src/
 │   ├── nav.rs           editor back / forward navigation history
 │   ├── overlay.rs       inline-image overlay state + clear-on-hide latches (iTerm2 cell eviction; the Kitty path adds a delete-all on the same clear frames)
 │   ├── perf_hud.rs      F8 performance HUD
+│   ├── prompts.rs       input prompts and list pickers
 │   ├── remote_sessions.rs SSH sessions, hand-off to remote croft, config sync, uploads, port forwarding
 │   ├── review.rs        pull-request review tabs and in-editor comment boxes
 │   ├── runners.rs       Testing view, Tasks, runnable blocks, notebooks, Fleet, Live Run, .http requests
