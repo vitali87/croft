@@ -133,6 +133,7 @@ src/
 │   ├── git_worker.rs    off-thread git status / changes worker
 │   ├── host_integration.rs host-terminal sequences and restore, panic log, croft view socket, self-update
 │   ├── hover.rs         LSP hover dwell timing
+│   ├── inline_images.rs inline pictures: detection, chrome bake, per-frame overlays, minimap
 │   ├── language_servers.rs language-server features: go-to, rename, code actions, outline, breadcrumbs
 │   ├── memory_report.rs Developer: Show Memory Usage: the per-subsystem figures laid out as Markdown, opened as a rendered preview so typing can't edit it
 │   ├── nav.rs           editor back / forward navigation history
