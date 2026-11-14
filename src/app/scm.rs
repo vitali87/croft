@@ -2001,3 +2001,2228 @@ impl App {
         }
     }
 }
+
+impl App {
+    // --- Source Control "⋯" menu plumbing --------------------------------
+
+    /// Append a git command + its outcome to the rolling output log, which
+    /// the "Show Git Output" action surfaces read-only. Capped so a long
+    /// session can't grow it without bound.
+    pub(super) fn log_git(&mut self, label: &str, outcome: &Result<String, String>) {
+        let body = match outcome {
+            Ok(s) if s.is_empty() => String::from("(ok)"),
+            Ok(s) => s.clone(),
+            Err(e) => format!("error: {e}"),
+        };
+        self.git_output_log.push(format!("$ git {label}\n{body}"));
+        const CAP: usize = 200;
+        if self.git_output_log.len() > CAP {
+            let excess = self.git_output_log.len() - CAP;
+            self.git_output_log.drain(0..excess);
+        }
+    }
+
+    /// Git's error `err` on the one line the status bar and the Source
+    /// Control panel show ([`crate::git::error_line`]), its whole text sent
+    /// to the Git Output log under `label` (#858).
+    pub(super) fn git_error_line(&mut self, label: &str, err: &str) -> String {
+        self.log_git(label, &Err(err.to_string()));
+        crate::git::error_line(err)
+    }
+
+    /// The repository's operation in progress (#1356), read fresh, or
+    /// `None` with a status saying there is none.
+    pub(super) fn git_operation_or_say(&mut self) -> Option<crate::git::RepoOp> {
+        let op = crate::git::repo_operation(&self.scm_root());
+        if op.is_none() {
+            self.status =
+                String::from("No merge, rebase, cherry-pick, revert or bisect in progress");
+        }
+        op
+    }
+
+    /// Abort the merge, rebase, cherry-pick or revert in progress, or reset
+    /// a bisect (#1356; VS Code's Abort Merge / Abort Rebase).
+    pub(super) fn abort_git_operation(&mut self) {
+        if self.repo_git_busy() {
+            return;
+        }
+        let Some(op) = self.git_operation_or_say() else {
+            return;
+        };
+        let r = crate::git::abort_operation(&self.scm_root(), op);
+        let done = match op {
+            crate::git::RepoOp::Bisect => String::from("Bisect reset"),
+            _ => format!("Aborted the {}", op.command()),
+        };
+        self.run_scm_op(op.command(), r, &done, &format!("Git {}", op.command()));
+    }
+
+    /// Continue the rebase, cherry-pick or revert in progress once its
+    /// conflicts are resolved and staged (#1356; VS Code's Continue Rebase).
+    pub(super) fn continue_git_operation(&mut self) {
+        if self.repo_git_busy() {
+            return;
+        }
+        let Some(op) = self.git_operation_or_say() else {
+            return;
+        };
+        let r = crate::git::continue_operation(&self.scm_root(), op);
+        self.report_git_operation_step(op, r, "Continued");
+    }
+
+    /// Skip the commit the rebase, cherry-pick or revert stopped on
+    /// (#1356).
+    pub(super) fn skip_git_operation(&mut self) {
+        if self.repo_git_busy() {
+            return;
+        }
+        let Some(op) = self.git_operation_or_say() else {
+            return;
+        };
+        let r = crate::git::skip_operation(&self.scm_root(), op);
+        self.report_git_operation_step(op, r, "Skipped a commit of");
+    }
+
+    /// Mark the commit a bisect is on good or bad (#1356).
+    pub(super) fn bisect_mark_source_control(&mut self, good: bool) {
+        if self.repo_git_busy() {
+            return;
+        }
+        let r = crate::git::bisect_mark(&self.scm_root(), good);
+        self.run_scm_op(
+            "bisect",
+            r,
+            if good { "Marked good" } else { "Marked bad" },
+            "Bisect",
+        );
+    }
+
+    /// Report a Continue or Skip, saying where the operation stands now:
+    /// finished, or stopped again (the next conflict, with its step).
+    pub(super) fn report_git_operation_step(
+        &mut self,
+        op: crate::git::RepoOp,
+        r: Result<String, String>,
+        verb: &str,
+    ) {
+        let now = crate::git::repo_operation(&self.scm_root());
+        let done = match now {
+            None => format!("{verb} the {}, which is done", op.command()),
+            Some(next) => format!("{verb} the {}, now {}", op.command(), next.label()),
+        };
+        self.run_scm_op(op.command(), r, &done, &format!("Git {}", op.command()));
+    }
+
+    /// After a commit made from Source Control mid-rebase (#1356, the #989
+    /// path): carry on with the rebase, as VS Code's Commit button does
+    /// there, instead of leaving HEAD detached with the rest unapplied.
+    pub(super) fn continue_rebase_after_commit(&mut self) -> bool {
+        let root = self.scm_root();
+        let Some(op @ crate::git::RepoOp::Rebase { .. }) = crate::git::repo_operation(&root) else {
+            return true;
+        };
+        let r = crate::git::continue_operation(&root, op);
+        let continued = r.is_ok();
+        self.report_git_operation_step(op, r, "Committed and continued");
+        continued
+    }
+
+    /// Run an immediate git operation: log it, surface its summary or error
+    /// in the commit-feedback line, and refresh the panel. The single path
+    /// every "⋯"-menu leaf that acts now (vs. opening a modal) flows through.
+    /// `ok_prefix` heads a success ("Merged: …"); `noun` names the operation
+    /// when it fails ("Merge failed: …", "Merge: 1 conflict (pricing.py)"),
+    /// on one line from [`crate::git::failure_line`] (#858).
+    pub(super) fn run_scm_op(
+        &mut self,
+        label: &str,
+        outcome: Result<String, String>,
+        ok_prefix: &str,
+        noun: &str,
+    ) {
+        self.log_git(label, &outcome);
+        match outcome {
+            Ok(summary) => {
+                // git's result line, past a fetch's `From <url>`, a push's
+                // `To <url>` and the like (#858).
+                let summary = crate::git::result_line(&summary);
+                let line = if summary.is_empty() {
+                    ok_prefix.to_string()
+                } else {
+                    format!("{ok_prefix}: {summary}")
+                };
+                self.source_control.commit_feedback = Some(line.clone());
+                self.source_control.commit_feedback_is_error = false;
+                self.status = line;
+            }
+            Err(err) => {
+                let line = crate::git::failure_line(noun, &err);
+                self.source_control.commit_feedback = Some(line.clone());
+                self.source_control.commit_feedback_is_error = true;
+                self.status = line;
+            }
+        }
+        self.active_git_bypass_debounce();
+        self.refresh_git_status_debounced();
+        self.refresh_source_control();
+    }
+
+    /// Run a network git operation (push, pull, fetch, clone...) on a
+    /// worker thread. Run inline, a slow remote or a large clone froze the
+    /// whole UI until git returned. `job` runs off the UI thread and returns
+    /// the half that updates the app, which `drain_git_net` applies. One at
+    /// a time: two pushes racing each other help nobody.
+    pub(super) fn spawn_git_net(
+        &mut self,
+        what: &str,
+        job: impl FnOnce() -> GitNetDone + Send + 'static,
+    ) {
+        if self.git_net_busy() {
+            return;
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(job());
+        });
+        self.git_net_job = Some((what.to_string(), rx));
+        self.status = format!("Git: {what}\u{2026}");
+    }
+
+    /// Run a read-only git view off the UI thread; its finisher is applied by
+    /// [`Self::drain_git_view`]. A newer request supersedes a pending one,
+    /// whose result is then dropped.
+    pub(super) fn spawn_git_view(&mut self, job: impl FnOnce() -> GitNetDone + Send + 'static) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(job());
+        });
+        self.git_view_job = Some(rx);
+    }
+
+    /// Apply a finished git view. True when one landed.
+    pub(super) fn drain_git_view(&mut self) -> bool {
+        let Some(rx) = &self.git_view_job else {
+            return false;
+        };
+        match rx.try_recv() {
+            Ok(done) => {
+                self.git_view_job = None;
+                done(self);
+                true
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.git_view_job = None;
+                false
+            }
+        }
+    }
+
+    /// Whether a network operation on THIS repository is still running,
+    /// saying so: what a commit, stage or branch switch must not overlap
+    /// (they fight over `index.lock`, and a pull would land on the switched
+    /// branch). A clone writes into another directory and blocks nothing here.
+    pub(super) fn repo_git_busy(&mut self) -> bool {
+        match &self.git_net_job {
+            Some((running, _)) if running != "clone" => {
+                self.status = format!("Git: {running} is still running");
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether a network git operation is still running, saying so.
+    pub(super) fn git_net_busy(&mut self) -> bool {
+        let Some((running, _)) = &self.git_net_job else {
+            return false;
+        };
+        self.status = format!("Git: {running} is still running");
+        true
+    }
+
+    /// [`spawn_git_net`] for an operation whose result is reported by
+    /// [`run_scm_op`].
+    pub(super) fn spawn_scm_op(
+        &mut self,
+        label: &'static str,
+        ok_prefix: &'static str,
+        noun: &'static str,
+        op: impl FnOnce(&Path) -> Result<String, String> + Send + 'static,
+    ) {
+        let root = self.scm_root();
+        self.spawn_git_net(label, move || {
+            let r = op(&root);
+            Box::new(move |app: &mut App| app.run_scm_op(label, r, ok_prefix, noun))
+        });
+    }
+
+    pub(super) fn finish_clone(&mut self, result: Result<PathBuf, String>, origin: &Path) {
+        match result {
+            Ok(dest) => {
+                self.log_git("clone", &Ok(format!("into {}", dest.display())));
+                self.status = format!("Cloned into {}", self.status_path(&dest));
+                // Opened only if the user is still where the clone started:
+                // one who has moved to another folder meanwhile is not
+                // pulled out of it when the clone lands.
+                if self.tree.root == origin {
+                    self.change_workspace_root(dest);
+                }
+            }
+            Err(err) => {
+                let why = self.git_error_line("clone", &err);
+                self.source_control.commit_feedback = Some(format!("clone failed: {why}"));
+                self.source_control.commit_feedback_is_error = true;
+                self.status = format!("Clone failed: {why}");
+            }
+        }
+    }
+
+    /// Apply a finished network git operation. True when one landed.
+    pub(super) fn drain_git_net(&mut self) -> bool {
+        let Some((what, rx)) = &self.git_net_job else {
+            return false;
+        };
+        match rx.try_recv() {
+            Ok(done) => {
+                self.git_net_job = None;
+                done(self);
+                true
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => false,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.status = format!("Git: {what} ended without a result");
+                self.git_net_job = None;
+                true
+            }
+        }
+    }
+
+    pub fn stage_all_source_control(&mut self) {
+        let r = crate::git::stage_all(&self.scm_root());
+        self.run_scm_op("add -A", r, "Staged all", "Stage all");
+    }
+
+    pub fn unstage_all_source_control(&mut self) {
+        let r = crate::git::unstage_all(&self.scm_root());
+        self.run_scm_op("reset HEAD", r, "Unstaged all", "Unstage all");
+    }
+
+    /// Arm the Discard All confirmation. Destructive (reverts every tracked
+    /// edit to HEAD), so it never acts until `confirm_pending_discard_all`.
+    pub fn request_discard_all_source_control(&mut self) {
+        self.pending_discard_all = true;
+    }
+
+    /// Drop the stash the Drop Stash confirm was asked about (#1128).
+    pub(super) fn confirm_pending_stash_drop(&mut self) {
+        let Some(pending) = self.pending_stash_drop.take() else {
+            return;
+        };
+        let r = crate::git::stash_drop_oid(&pending.root, &pending.oid);
+        self.run_scm_op("stash drop", r, "Dropped stash", "Drop stash");
+    }
+
+    pub fn cancel_pending_discard_all(&mut self) {
+        self.pending_discard_all = false;
+    }
+
+    pub fn confirm_pending_discard_all(&mut self) {
+        if !self.pending_discard_all {
+            return;
+        }
+        self.pending_discard_all = false;
+        let r = crate::git::discard_all_tracked(&self.scm_root());
+        self.run_scm_op(
+            "checkout -- .",
+            r,
+            "Discarded all changes",
+            "Discard all changes",
+        );
+    }
+
+    /// `git stash push -u` from the commit dropdown.
+    pub(super) fn stash_include_untracked_source_control(&mut self) {
+        if self.hold_for_unsaved(ScmWrite::StashIncludeUntracked) {
+            return;
+        }
+        self.ask_stash_message(crate::git::StashKind::IncludeUntracked);
+    }
+
+    /// `git stash push --staged` from the commit dropdown.
+    pub(super) fn stash_staged_source_control(&mut self) {
+        if self.hold_for_unsaved(ScmWrite::StashStaged) {
+            return;
+        }
+        self.ask_stash_message(crate::git::StashKind::Staged);
+    }
+
+    /// The files of tabs with unsaved edits under the repository, each
+    /// once, in tab order. Untitled tabs and files outside the repository
+    /// are not the commit's business (#1438). A spreadsheet cell still being
+    /// typed into counts: its value is on screen but not yet in the buffer.
+    pub(super) fn unsaved_repo_files(&self) -> Vec<PathBuf> {
+        let root = self.scm_root();
+        let mut files: Vec<PathBuf> = Vec::new();
+        let groups = std::iter::once(&self.editor).chain(self.editor_layout.inactive_groups());
+        let unsaved = |e: &&crate::widgets::editor::Editor| {
+            // A scratch tab (#951) is no file of the repository's, though
+            // a Git Output tab's label sits under its root.
+            (e.dirty && !e.scratch)
+                || e.sheet
+                    .as_ref()
+                    .is_some_and(|s| s.editable() && s.editing.is_some())
+        };
+        for ed in groups.flat_map(|g| g.editors.iter()).filter(unsaved) {
+            if let Some(p) = ed.path.as_ref()
+                && p.starts_with(&root)
+                && !files.contains(p)
+            {
+                files.push(p.clone());
+            }
+        }
+        files
+    }
+
+    /// Whether `op` must wait for the unsaved-changes prompt (#1438). A
+    /// commit or stash records the files on disk, so an edit still only in
+    /// a tab would be left out with nothing said; VS Code asks first
+    /// (`git.promptToSaveFilesBeforeCommit` / `...BeforeStash`). True when
+    /// the prompt opened and the caller must stop.
+    pub(super) fn hold_for_unsaved(&mut self, op: ScmWrite) -> bool {
+        if std::mem::take(&mut self.scm_unsaved_cleared) {
+            return false;
+        }
+        let files = self.unsaved_repo_files();
+        if files.is_empty() {
+            return false;
+        }
+        let root = self.scm_root();
+        self.pending_unsaved_scm = Some(PendingUnsavedScm { op, root, files });
+        true
+    }
+
+    /// Whether Source Control now points at a repository other than `root`,
+    /// the one `op` was asked for (focus moved to another root's tab while
+    /// the prompt was open). The write is then dropped rather than run
+    /// against the wrong repository, and the status says so.
+    pub(super) fn scm_root_moved(&mut self, op: ScmWrite, root: &Path) -> bool {
+        if self.scm_root() == root {
+            return false;
+        }
+        let msg = format!(
+            "{} cancelled: Source Control moved to another repository",
+            op.verb()
+        );
+        self.status = msg.clone();
+        self.source_control.commit_feedback = Some(msg);
+        self.source_control.commit_feedback_is_error = true;
+        true
+    }
+
+    /// Run `op` past the unsaved-changes check, which already had its say.
+    pub(super) fn run_scm_write(&mut self, op: ScmWrite) {
+        self.scm_unsaved_cleared = true;
+        match op {
+            ScmWrite::Commit => self.commit_source_control(),
+            ScmWrite::CommitStaged => self.commit_staged_source_control(),
+            ScmWrite::CommitAll => self.commit_all_source_control(),
+            ScmWrite::Amend => self.commit_amend_source_control(),
+            ScmWrite::CommitAndSync => self.commit_and_sync_source_control(),
+            ScmWrite::CommitAndPush => self.commit_and_push_source_control(),
+            ScmWrite::Stash => self.stash_source_control(),
+            ScmWrite::StashIncludeUntracked => self.stash_include_untracked_source_control(),
+            ScmWrite::StashStaged => self.stash_staged_source_control(),
+            ScmWrite::StashAndSwitch => self.stash_and_switch_picked(false),
+            ScmWrite::MigrateAndSwitch => self.stash_and_switch_picked(true),
+        }
+        // A write that stopped before its check (busy git, empty message)
+        // must not carry the clearance to the next request.
+        self.scm_unsaved_cleared = false;
+    }
+
+    /// "Save All & Commit" (or Stash): save every dirty tab, then run the
+    /// write only when nothing under the repository is left unsaved, so the
+    /// commit never records half of the edits.
+    pub fn save_all_then_pending_scm(&mut self) {
+        let Some(pending) = self.pending_unsaved_scm.take() else {
+            return;
+        };
+        if self.scm_root_moved(pending.op, &pending.root) {
+            return;
+        }
+        // A cell still being typed into is part of the save, as Cmd+S
+        // treats it (#1140): commit it so Save All writes it.
+        for group in
+            std::iter::once(&mut self.editor).chain(self.editor_layout.inactive_groups_mut())
+        {
+            for ed in &mut group.editors {
+                if let Some(view) = ed.sheet.as_mut()
+                    && view.editable()
+                    && view.commit_edit().is_some()
+                {
+                    ed.dirty = true;
+                }
+            }
+        }
+        self.save_all();
+        if self.save_after_format.is_some() {
+            // The active tab is written when its formatter replies.
+            self.scm_after_format_save = Some((pending.op, pending.root));
+            return;
+        }
+        self.finish_scm_after_save(pending.op, &pending.root);
+    }
+
+    /// Run `op` once Save All is done, or say which files kept it from
+    /// running.
+    pub(super) fn finish_scm_after_save(&mut self, op: ScmWrite, root: &Path) {
+        if self.scm_root_moved(op, root) {
+            return;
+        }
+        let left = self.unsaved_repo_files();
+        if left.is_empty() {
+            self.run_scm_write(op);
+            return;
+        }
+        let names: Vec<String> = left
+            .iter()
+            .map(|p| {
+                p.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            })
+            .collect();
+        self.status = format!(
+            "{} cancelled: {} still unsaved - open it and press Cmd+S",
+            op.verb(),
+            names.join(", ")
+        );
+        self.source_control.commit_feedback = Some(format!(
+            "{} cancelled: {} not saved",
+            op.verb(),
+            names.join(", ")
+        ));
+        self.source_control.commit_feedback_is_error = true;
+    }
+
+    /// "Commit Anyway" (or Stash): run the write on the files as they are on
+    /// disk, as croft did before it asked.
+    pub fn continue_pending_scm_without_saving(&mut self) {
+        if let Some(pending) = self.pending_unsaved_scm.take()
+            && !self.scm_root_moved(pending.op, &pending.root)
+        {
+            self.run_scm_write(pending.op);
+        }
+    }
+
+    pub fn cancel_pending_unsaved_scm(&mut self) {
+        self.pending_unsaved_scm = None;
+    }
+
+    /// The commit message currently in the input box, trimmed, or an error
+    /// surfaced when it is empty (shared by the Commit submenu variants).
+    pub(super) fn require_commit_message(&mut self) -> Option<String> {
+        let message = self.source_control.message.trim().to_string();
+        if message.is_empty() {
+            self.source_control.commit_feedback = Some(String::from("Empty commit message"));
+            self.source_control.commit_feedback_is_error = true;
+            return None;
+        }
+        Some(message)
+    }
+
+    pub(super) fn commit_staged_source_control(&mut self) {
+        let Some(message) = self.require_commit_message() else {
+            return;
+        };
+        if self.hold_for_unsaved(ScmWrite::CommitStaged) {
+            return;
+        }
+        let root = self.scm_root();
+        let committed = message.clone();
+        self.spawn_commit(
+            message,
+            move || crate::git::commit_staged(&root, &committed),
+            |app, r| {
+                let committed = r.is_ok();
+                app.run_scm_op("commit -m", r, "Committed staged", "Commit staged");
+                if committed {
+                    app.continue_rebase_after_commit();
+                }
+            },
+        );
+    }
+
+    pub(super) fn commit_all_source_control(&mut self) {
+        let Some(message) = self.require_commit_message() else {
+            return;
+        };
+        // Before `add -A`, which would mark a conflict resolved with its
+        // markers still in it (#989).
+        if let Err(err) = crate::git::refuse_unmerged(&self.scm_root()) {
+            self.run_scm_op("add -A", Err(err), "Stage all", "Stage all");
+            return;
+        }
+
+        if self.hold_for_unsaved(ScmWrite::CommitAll) {
+            return;
+        }
+        let root = self.scm_root();
+        let committed = message.clone();
+        self.spawn_commit(
+            message,
+            move || {
+                crate::git::stage_all(&root).map_err(|err| format!("stage all failed: {err}"))?;
+                crate::git::commit_staged(&root, &committed)
+            },
+            |app, r| {
+                let committed = r.is_ok();
+                app.run_scm_op("commit (all)", r, "Committed all", "Commit all");
+                if committed {
+                    app.continue_rebase_after_commit();
+                }
+            },
+        );
+    }
+
+    pub(super) fn commit_amend_source_control(&mut self) {
+        // Amend keeps the prior message when the box is empty, otherwise
+        // rewrites it — matching VS Code's amend.
+        if self.hold_for_unsaved(ScmWrite::Amend) {
+            return;
+        }
+        let message = self.source_control.message.trim().to_string();
+        let root = self.scm_root();
+        let committed = message.clone();
+        self.spawn_commit(
+            message,
+            move || {
+                if committed.is_empty() {
+                    crate::git::commit_amend_no_edit(&root)
+                } else {
+                    crate::git::commit_amend(&root, &committed)
+                }
+            },
+            |app, r| app.run_scm_op("commit --amend", r, "Amended commit", "Amend commit"),
+        );
+    }
+
+    /// Undo Last Commit (#1350): the last commit goes back to Staged and
+    /// its message back into an empty box, so a reword or a re-pick of the
+    /// files is one step away. A commit already on the upstream is undone
+    /// only on a second ask, after a warning that it means a force push.
+    pub(super) fn undo_last_commit_source_control(&mut self) {
+        let root = self.scm_root();
+        let head = crate::git::query(&root).head_oid;
+        if head.is_some()
+            && crate::git::head_is_on_upstream(&root)
+            && self.undo_pushed_commit_armed != head
+        {
+            self.undo_pushed_commit_armed = head;
+            let warning = String::from(
+                "The last commit is already pushed: undoing it means a force push later. Undo Last Commit again to undo it anyway",
+            );
+            self.source_control.commit_feedback = Some(warning.clone());
+            self.source_control.commit_feedback_is_error = true;
+            self.status = warning;
+            return;
+        }
+        self.undo_pushed_commit_armed = None;
+        let outcome = crate::git::undo_last_commit(&root);
+        if let Ok(message) = &outcome
+            && self.source_control.message.trim().is_empty()
+        {
+            self.source_control.clear_message();
+            self.source_control.insert_str(message.trim());
+        }
+        let summary = outcome.map(|m| m.lines().next().unwrap_or("").trim().to_string());
+        self.run_scm_op(
+            "reset --soft HEAD~1",
+            summary,
+            "Undid last commit",
+            "Undo last commit",
+        );
+    }
+
+    pub(super) fn commit_and_sync_source_control(&mut self) {
+        if self.git_net_busy() {
+            return;
+        }
+        let Some(message) = self.require_commit_message() else {
+            return;
+        };
+        if self.hold_for_unsaved(ScmWrite::CommitAndSync) {
+            return;
+        }
+        let root = self.scm_root();
+        let committed = message.clone();
+        self.spawn_commit(
+            message,
+            move || crate::git::commit(&root, &committed),
+            |app, commit| {
+                app.log_git("commit", &commit);
+                if let Err(err) = commit {
+                    app.report_commit_failure(&err);
+                    return;
+                }
+                // Mid-rebase, sync only once the rebase is back on its branch.
+                if !app.continue_rebase_after_commit() {
+                    return;
+                }
+                app.sync_source_control();
+            },
+        );
+    }
+
+    pub(super) fn publish_branch_source_control(&mut self) {
+        let Some(branch) = self.source_control.status.branch.clone() else {
+            self.source_control.commit_feedback =
+                Some(String::from("Detached HEAD has no branch to publish"));
+            self.source_control.commit_feedback_is_error = true;
+            return;
+        };
+        self.spawn_scm_op("push -u", "Published", "Publish branch", move |root| {
+            crate::git::publish_branch(root, &branch)
+        });
+    }
+
+    /// Open the read-only "Git Output" log in an editor tab (VS Code's Git
+    /// output channel). Empty until croft has run an operation this session.
+    pub(super) fn show_git_output(&mut self) {
+        let body = if self.git_output_log.is_empty() {
+            String::from("(no git operations run yet this session)")
+        } else {
+            self.git_output_log.join("\n\n")
+        };
+        let label = self.scratch_buffer_path("Git Output");
+        if let Err(err) = self.editor.open_text_buffer(&label, &body) {
+            self.status = format!("Could not open Git Output: {err}");
+            return;
+        }
+        self.focus_pane(Pane::Editor);
+    }
+
+    /// Open the branch picker with an explicit purpose (Checkout by default,
+    /// or one of the Branch-submenu verbs).
+    pub(super) fn open_branch_picker_for(&mut self, purpose: BranchPurpose) {
+        self.branch_purpose = purpose;
+        self.open_branch_picker();
+    }
+
+    /// Route every "⋯"-menu leaf to its handler. Immediate ops run now;
+    /// ops needing a value or a choice open a modal/picker.
+    pub fn dispatch_scm_action(&mut self, action: crate::widgets::scm_menu::ScmAction) {
+        use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+        use crate::widgets::list_picker::ListPurpose;
+        use crate::widgets::scm_menu::ScmAction;
+        self.scm_menu.close();
+        // Nothing else touches the repository while a push, pull or fetch
+        // runs in the background: a commit or branch switch under it fights
+        // over `index.lock`, and a pull would land on the switched branch.
+        if !matches!(action, ScmAction::ShowGitOutput) && self.repo_git_busy() {
+            return;
+        }
+        match action {
+            ScmAction::Pull => self.pull_source_control(),
+            ScmAction::Push => self.push_source_control(),
+            ScmAction::Clone => self.open_input_prompt(InputPrompt::new(
+                InputPurpose::CloneUrl,
+                "Clone Repository",
+                "Repository URL (https://… or git@…)",
+            )),
+            ScmAction::CheckoutTo => self.open_branch_picker_for(BranchPurpose::Checkout),
+            ScmAction::Fetch => {
+                self.spawn_scm_op(
+                    "fetch --all --prune",
+                    "Fetched",
+                    "Fetch",
+                    crate::git::fetch_all,
+                );
+            }
+            ScmAction::ShowGitOutput => self.show_git_output(),
+            ScmAction::ContinueOperation => self.continue_git_operation(),
+            ScmAction::SkipOperation => self.skip_git_operation(),
+            ScmAction::AbortOperation => self.abort_git_operation(),
+            ScmAction::BisectGood => self.bisect_mark_source_control(true),
+            ScmAction::BisectBad => self.bisect_mark_source_control(false),
+            ScmAction::Commit => self.commit_source_control(),
+            ScmAction::CommitStaged => self.commit_staged_source_control(),
+            ScmAction::CommitAll => self.commit_all_source_control(),
+            ScmAction::CommitAmend => self.commit_amend_source_control(),
+            ScmAction::UndoLastCommit => self.undo_last_commit_source_control(),
+            ScmAction::CommitAndPush => self.commit_and_push_source_control(),
+            ScmAction::CommitAndSync => self.commit_and_sync_source_control(),
+            ScmAction::StageAll => self.stage_all_source_control(),
+            ScmAction::UnstageAll => self.unstage_all_source_control(),
+            ScmAction::DiscardAll => self.request_discard_all_source_control(),
+            ScmAction::Sync => self.sync_source_control(),
+            ScmAction::PullRebase => {
+                self.spawn_scm_op(
+                    "pull --rebase",
+                    "Pulled (rebase)",
+                    "Pull (rebase)",
+                    crate::git::pull_rebase,
+                );
+            }
+            ScmAction::PushTo => self.open_push_to_remote_picker(),
+            ScmAction::PushForce => {
+                self.spawn_scm_op(
+                    "push --force-with-lease",
+                    "Force-pushed",
+                    "Force push",
+                    crate::git::push_force,
+                );
+            }
+            ScmAction::PublishBranch => self.publish_branch_source_control(),
+            ScmAction::CreateBranch => self.open_branch_picker_for(BranchPurpose::Checkout),
+            ScmAction::CreateBranchFrom => self.open_branch_picker_for(BranchPurpose::CreateFrom),
+            ScmAction::RenameBranch => {
+                let seed = self
+                    .source_control
+                    .status
+                    .branch
+                    .clone()
+                    .unwrap_or_default();
+                self.open_input_prompt(
+                    InputPrompt::new(
+                        InputPurpose::RenameBranch,
+                        "Rename Branch",
+                        "New branch name",
+                    )
+                    .with_value(seed),
+                );
+            }
+            ScmAction::DeleteBranch => self.open_branch_picker_for(BranchPurpose::Delete),
+            ScmAction::Merge => self.open_branch_picker_for(BranchPurpose::Merge),
+            ScmAction::Rebase => self.open_branch_picker_for(BranchPurpose::Rebase),
+            ScmAction::AddRemote => self.open_input_prompt(InputPrompt::new(
+                InputPurpose::AddRemoteName,
+                "Add Remote",
+                "Remote name (e.g. origin)",
+            )),
+            ScmAction::RemoveRemote => self.open_remote_picker(ListPurpose::RemoveRemote),
+            ScmAction::Stash => self.stash_source_control(),
+            ScmAction::StashIncludeUntracked => self.stash_include_untracked_source_control(),
+            ScmAction::StashStaged => self.stash_staged_source_control(),
+            ScmAction::ApplyStash => self.open_stash_picker(ListPurpose::StashApply),
+            ScmAction::PopStashLatest => self.stash_pop_source_control(),
+            ScmAction::PopStashPick => self.open_stash_picker(ListPurpose::StashPop),
+            ScmAction::DropStash => self.open_stash_picker(ListPurpose::StashDrop),
+            ScmAction::ViewStash => self.open_stash_picker(ListPurpose::StashView),
+            ScmAction::CreateTag => self.open_input_prompt(InputPrompt::new(
+                InputPurpose::CreateTag,
+                "Create Tag",
+                "Tag name (e.g. v1.0.0)",
+            )),
+            ScmAction::DeleteTag => self.open_tag_picker(),
+            ScmAction::PushTags => self.push_tags_source_control(),
+            ScmAction::DeleteRemoteTag => self.open_remote_tag_picker(),
+        }
+    }
+
+    /// Source Control > Tags > Push Tags (#1582): every local tag to the
+    /// remote a new branch would be published to.
+    pub(super) fn push_tags_source_control(&mut self) {
+        let remote = match crate::git::tag_remote(&self.scm_root()) {
+            Ok(remote) => remote,
+            Err(err) => {
+                self.status = format!("Push tags: {err}");
+                return;
+            }
+        };
+        self.spawn_scm_op("push --tags", "Pushed tags", "Push tags", move |root| {
+            crate::git::push_tags(root, &remote)
+        });
+    }
+
+    /// Source Control > Tags > Delete Remote Tag (#1582): list the push
+    /// remote's tags off the UI thread, then pick one to delete there.
+    pub(super) fn open_remote_tag_picker(&mut self) {
+        let root = self.scm_root();
+        let remote = match crate::git::tag_remote(&root) {
+            Ok(remote) => remote,
+            Err(err) => {
+                self.status = format!("Delete remote tag: {err}");
+                return;
+            }
+        };
+        self.spawn_git_net("ls-remote --tags", move || {
+            let tags = crate::git::list_remote_tags(&root, &remote);
+            Box::new(move |app: &mut App| app.show_remote_tags(&root, &remote, tags))
+        });
+    }
+
+    /// Whether Source Control now points at a repository other than
+    /// `root`, the one whose remote tags were listed (#1582). The deletion
+    /// is then dropped rather than sent to another repository's remote of
+    /// the same name, and the status says so.
+    pub(super) fn remote_tag_root_moved(&mut self, root: &Path) -> bool {
+        if self.scm_root() == root {
+            return false;
+        }
+        self.status =
+            String::from("Delete remote tag cancelled: Source Control moved to another repository");
+        true
+    }
+
+    /// The picker over `remote`'s tags in `root`, once listed (#1582).
+    pub(super) fn show_remote_tags(
+        &mut self,
+        root: &Path,
+        remote: &str,
+        tags: Result<Vec<String>, String>,
+    ) {
+        use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+        if self.remote_tag_root_moved(root) {
+            return;
+        }
+        let tags = match tags {
+            Ok(tags) => tags,
+            Err(err) => {
+                self.status = format!("Remote tags: {}", crate::git::result_line(&err));
+                return;
+            }
+        };
+        self.status.clear();
+        self.remote_tag_root = Some(root.to_path_buf());
+        let rows = tags
+            .into_iter()
+            .map(|tag| ListRow {
+                id: format!("{remote}\t{tag}"),
+                label: tag,
+            })
+            .collect();
+        self.open_list_picker(
+            ListPicker::new(
+                ListPurpose::DeleteRemoteTag,
+                format!("Delete Remote Tag from {remote}"),
+                rows,
+            ),
+            &format!("No tags on {remote}"),
+        );
+    }
+
+    pub(super) fn open_stash_picker(&mut self, purpose: crate::widgets::list_picker::ListPurpose) {
+        use crate::widgets::list_picker::{ListPicker, ListRow};
+        let rows: Vec<ListRow> = match crate::git::list_stashes(&self.scm_root()) {
+            Ok(stashes) => stashes
+                .into_iter()
+                .map(|s| ListRow {
+                    id: s.index.to_string(),
+                    label: s.label(),
+                })
+                .collect(),
+            Err(err) => {
+                self.status = format!("Stashes: {err}");
+                return;
+            }
+        };
+        let title = match purpose {
+            crate::widgets::list_picker::ListPurpose::StashApply => "Apply Stash",
+            crate::widgets::list_picker::ListPurpose::StashDrop => "Drop Stash",
+            crate::widgets::list_picker::ListPurpose::StashView => "View Stash",
+            _ => "Pop Stash",
+        };
+        self.open_list_picker(
+            ListPicker::new(purpose, title, rows),
+            "No stashes to choose",
+        );
+    }
+
+    pub(super) fn open_tag_picker(&mut self) {
+        use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+        let rows: Vec<ListRow> = match crate::git::list_tags(&self.scm_root()) {
+            Ok(tags) => tags
+                .into_iter()
+                .map(|t| ListRow {
+                    id: t.clone(),
+                    label: t,
+                })
+                .collect(),
+            Err(err) => {
+                self.status = format!("Tags: {err}");
+                return;
+            }
+        };
+        self.open_list_picker(
+            ListPicker::new(ListPurpose::DeleteTag, "Delete Tag", rows),
+            "No tags to delete",
+        );
+    }
+
+    pub(super) fn open_remote_picker(&mut self, purpose: crate::widgets::list_picker::ListPurpose) {
+        use crate::widgets::list_picker::{ListPicker, ListRow};
+        let rows: Vec<ListRow> = match crate::git::list_remotes(&self.scm_root()) {
+            Ok(remotes) => remotes
+                .into_iter()
+                .map(|r| ListRow {
+                    id: r.name.clone(),
+                    label: format!("{}  {}", r.name, r.url),
+                })
+                .collect(),
+            Err(err) => {
+                self.status = format!("Remotes: {err}");
+                return;
+            }
+        };
+        self.open_list_picker(
+            ListPicker::new(purpose, "Remove Remote", rows),
+            "No remotes configured",
+        );
+    }
+
+    pub(super) fn open_push_to_remote_picker(&mut self) {
+        use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+        let rows: Vec<ListRow> = match crate::git::list_remotes(&self.scm_root()) {
+            Ok(remotes) => remotes
+                .into_iter()
+                .map(|r| ListRow {
+                    id: r.name.clone(),
+                    label: format!("{}  {}", r.name, r.url),
+                })
+                .collect(),
+            Err(err) => {
+                self.status = format!("Remotes: {err}");
+                return;
+            }
+        };
+        self.open_list_picker(
+            ListPicker::new(ListPurpose::PushToRemote, "Push to Remote", rows),
+            "No remotes configured",
+        );
+    }
+
+    /// Resolve the branch-picker selection per its open purpose.
+    pub(super) fn apply_branch_picker_selection(&mut self) {
+        if self.repo_git_busy() {
+            return;
+        }
+        let Some(picker) = self.branch_picker.as_ref() else {
+            return;
+        };
+        match self.branch_purpose {
+            BranchPurpose::Checkout => {
+                if let Some(action) = picker.selected_action() {
+                    self.apply_branch_action(action);
+                } else {
+                    self.close_branch_picker();
+                }
+            }
+            BranchPurpose::CreateFrom => {
+                let Some(base) = picker.selected_existing_branch() else {
+                    return;
+                };
+                self.close_branch_picker();
+                self.open_input_prompt(crate::widgets::input_prompt::InputPrompt::new(
+                    crate::widgets::input_prompt::InputPurpose::CreateBranchFrom { base },
+                    "Create Branch from",
+                    "New branch name",
+                ));
+            }
+            BranchPurpose::Delete => {
+                let Some(name) = picker.selected_existing_branch() else {
+                    return;
+                };
+                self.close_branch_picker();
+                let r = crate::git::delete_branch(&self.scm_root(), &name);
+                self.run_scm_op("branch -d", r, "Deleted branch", "Delete branch");
+            }
+            BranchPurpose::Merge => {
+                let Some(name) = picker.selected_existing_branch() else {
+                    return;
+                };
+                self.close_branch_picker();
+                let r = crate::git::merge_branch(&self.scm_root(), &name);
+                self.run_scm_op("merge", r, "Merged", "Merge");
+            }
+            BranchPurpose::Rebase => {
+                let Some(name) = picker.selected_existing_branch() else {
+                    return;
+                };
+                self.close_branch_picker();
+                let r = crate::git::rebase_branch(&self.scm_root(), &name);
+                self.run_scm_op("rebase", r, "Rebased", "Rebase");
+            }
+        }
+    }
+
+    /// Open the staged-changes diff (`git diff --staged`) in a read-only
+    /// editor tab. Mirrors VS Code's "View Staged Changes" — users hit
+    /// the dropdown, click View Staged Changes, and the editor tab pops up
+    /// with every `+`/`-` line of the staged hunks highlighted.
+    pub fn view_staged_diff_source_control(&mut self) {
+        let raw = match crate::git::diff_staged(&self.scm_root()) {
+            Ok(r) => r,
+            Err(err) => {
+                let why = self.git_error_line("diff --staged", &err);
+                self.source_control.commit_feedback = Some(format!("diff failed: {why}"));
+                self.source_control.commit_feedback_is_error = true;
+                self.status = format!("View Staged Changes failed: {why}");
+                return;
+            }
+        };
+        let label = std::path::PathBuf::from("git diff --staged");
+        if let Err(err) = self.editor.open_git_diff_side_by_side(&label, &raw) {
+            self.source_control.commit_feedback = Some(format!("open failed: {err}"));
+            self.source_control.commit_feedback_is_error = true;
+            self.status = format!("Could not open staged diff: {err}");
+            return;
+        }
+        self.tag_open_diff(crate::widgets::diff::DiffSource::GitCommand {
+            root: self.scm_root(),
+            kind: crate::widgets::diff::GitDiffKind::Staged,
+        });
+        self.source_control.commit_feedback = None;
+        self.status = String::from("Showing git diff --staged");
+        self.focus_pane(Pane::Editor);
+    }
+
+    /// Open `git diff <default-branch>` in a read-only editor tab. The
+    /// default branch is resolved via `git::default_branch` (origin/HEAD
+    /// first, then common local names). If resolution fails the error
+    /// surfaces in the commit-feedback line so the user can fix the
+    /// upstream-HEAD config instead of getting a silent no-op.
+    pub fn view_default_branch_diff_source_control(&mut self) {
+        let branch = match crate::git::default_branch(&self.scm_root()) {
+            Ok(b) => b,
+            Err(err) => {
+                self.source_control.commit_feedback = Some(err.clone());
+                self.source_control.commit_feedback_is_error = true;
+                self.status = format!("Default branch: {err}");
+                return;
+            }
+        };
+        let raw = match crate::git::diff_against_branch(&self.scm_root(), &branch) {
+            Ok(r) => r,
+            Err(err) => {
+                let why = self.git_error_line(&format!("diff {branch}"), &err);
+                self.source_control.commit_feedback = Some(format!("diff failed: {why}"));
+                self.source_control.commit_feedback_is_error = true;
+                self.status = format!("View Changes vs {branch} failed: {why}");
+                return;
+            }
+        };
+        // Name the base the diff starts from (#1444): the merge base, or
+        // the branch tip when the two share no history.
+        let (title, said) = match crate::git::merge_base(&self.scm_root(), &branch) {
+            Some(base) => (
+                format!(
+                    "git diff {} (merge base with {branch})",
+                    &base[..base.len().min(7)]
+                ),
+                format!("Showing changes since this branch left {branch}"),
+            ),
+            None => (
+                format!("git diff {branch}"),
+                format!("Showing git diff {branch}: no history in common, so against its tip"),
+            ),
+        };
+        let label = std::path::PathBuf::from(title);
+        if let Err(err) = self.editor.open_git_diff_side_by_side(&label, &raw) {
+            self.source_control.commit_feedback = Some(format!("open failed: {err}"));
+            self.source_control.commit_feedback_is_error = true;
+            self.status = format!("Could not open diff vs {branch}: {err}");
+            return;
+        }
+        self.tag_open_diff(crate::widgets::diff::DiffSource::GitCommand {
+            root: self.scm_root(),
+            kind: crate::widgets::diff::GitDiffKind::AgainstBranch(branch.clone()),
+        });
+        self.default_branch_label = Some(branch.clone());
+        self.source_control.commit_feedback = None;
+        self.status = said;
+        self.focus_pane(Pane::Editor);
+    }
+
+    /// Open `git diff HEAD~1` (working tree versus the commit before HEAD)
+    /// in a read-only editor tab. Mirrors "View Changes vs <default>" but
+    /// anchored on the previous commit, so the user can review everything
+    /// that changed since the last commit. A single-commit repo has no
+    /// `HEAD~1`; that error surfaces in the commit-feedback line rather
+    /// than as a silent no-op.
+    pub fn view_previous_commit_diff_source_control(&mut self) {
+        let raw = match crate::git::diff_previous_commit(&self.scm_root()) {
+            Ok(r) => r,
+            Err(err) => {
+                let why = self.git_error_line("diff HEAD~1", &err);
+                self.source_control.commit_feedback = Some(format!("diff failed: {why}"));
+                self.source_control.commit_feedback_is_error = true;
+                self.status = format!("View Changes vs previous failed: {why}");
+                return;
+            }
+        };
+        let label = std::path::PathBuf::from("git diff HEAD~1");
+        if let Err(err) = self.editor.open_git_diff_side_by_side(&label, &raw) {
+            self.source_control.commit_feedback = Some(format!("open failed: {err}"));
+            self.source_control.commit_feedback_is_error = true;
+            self.status = format!("Could not open diff vs previous: {err}");
+            return;
+        }
+        self.tag_open_diff(crate::widgets::diff::DiffSource::GitCommand {
+            root: self.scm_root(),
+            kind: crate::widgets::diff::GitDiffKind::PreviousCommit,
+        });
+        self.source_control.commit_feedback = None;
+        self.status = String::from("Showing git diff HEAD~1");
+        self.focus_pane(Pane::Editor);
+    }
+
+    pub fn commit_and_push_source_control(&mut self) {
+        // Checked before committing: a commit whose push is then refused
+        // would leave the user thinking it had been pushed.
+        if self.git_net_busy() {
+            return;
+        }
+        let message = self.source_control.message.trim().to_string();
+        if message.is_empty() {
+            self.source_control.commit_feedback = Some(String::from("Empty commit message"));
+            self.source_control.commit_feedback_is_error = true;
+            return;
+        }
+        if self.hold_for_unsaved(ScmWrite::CommitAndPush) {
+            return;
+        }
+        let root = self.scm_root();
+        let committed = message.clone();
+        self.spawn_commit(
+            message,
+            move || crate::git::commit(&root, &committed),
+            |app, r| {
+                app.log_git("commit", &r);
+                let commit_summary = match r {
+                    Ok(s) => crate::git::headline(&s).to_string(),
+                    Err(err) => {
+                        app.report_commit_failure(&err);
+                        return;
+                    }
+                };
+                // Mid-rebase, push only once the rebase is back on its
+                // branch, never from the detached HEAD it works on.
+                if !app.continue_rebase_after_commit() {
+                    return;
+                }
+                let root = app.scm_root();
+                app.spawn_git_net("push", move || {
+                    let r = crate::git::push_or_publish(&root);
+                    Box::new(move |app: &mut App| app.finish_commit_and_push(commit_summary, r))
+                });
+                app.active_git_bypass_debounce();
+                app.refresh_git_status_debounced();
+                app.refresh_source_control();
+            },
+        );
+    }
+
+    /// Report Commit & Push on one line (#858): the commit's headline and
+    /// the push's ref update, or why the push failed; the Git Output log
+    /// keeps git push's whole text.
+    pub(super) fn finish_commit_and_push(
+        &mut self,
+        commit_summary: String,
+        push: Result<String, String>,
+    ) {
+        self.log_git("push", &push);
+        let push = push
+            .map(|out| crate::git::summary_line(&out))
+            .map_err(|err| crate::git::error_line(&err));
+        match push {
+            Ok(push_summary) => {
+                let combined = if push_summary.is_empty() {
+                    commit_summary
+                } else {
+                    format!("{commit_summary} | pushed: {push_summary}")
+                };
+                self.source_control.commit_feedback = Some(combined.clone());
+                self.source_control.commit_feedback_is_error = false;
+                self.status = format!("Committed & pushed: {combined}");
+            }
+            Err(err) => {
+                self.source_control.commit_feedback =
+                    Some(format!("commit ok; push failed: {err}"));
+                self.source_control.commit_feedback_is_error = true;
+                self.status = format!("Commit ok; push failed: {err}");
+            }
+        }
+        self.active_git_bypass_debounce();
+        self.refresh_git_status_debounced();
+        self.refresh_source_control();
+    }
+
+    pub fn stage_source_control_entry(&mut self, entry_idx: usize) {
+        if self.repo_git_busy() {
+            return;
+        }
+        let Some(entry) = self.source_control.entries.get(entry_idx).cloned() else {
+            return;
+        };
+        match crate::git::stage_path(&self.scm_root(), &entry.path) {
+            Ok(()) => {
+                self.status = format!("Staged {}", entry.path);
+                self.active_git_bypass_debounce();
+                self.refresh_git_status_debounced();
+                self.refresh_source_control();
+            }
+            Err(err) => {
+                let why = self.git_error_line("add", &err);
+                self.status = format!("Stage failed: {why}");
+                self.source_control.commit_feedback = Some(why);
+                self.source_control.commit_feedback_is_error = true;
+            }
+        }
+    }
+
+    /// The workspace-relative path + single-hunk patch for the hunk under
+    /// the diff caret. Sets a status message and returns `None` when the
+    /// active tab isn't a working-tree diff or no hunk is at the cursor.
+    pub(super) fn diff_hunk_patch_at_caret(&mut self) -> Option<(String, String)> {
+        let built = match self.editor.diff.as_ref() {
+            None => self.editor_hunk_patch_at_caret().map_err(str::to_string),
+            Some(diff) if !diff.left_is_git_head => {
+                Err("Hunk actions need a working-tree diff from Source Control".to_string())
+            }
+            Some(diff) if diff.right_is_unsaved => {
+                Err("Save the file first: hunk actions apply to the file on disk".to_string())
+            }
+            // The patch is built from the decoded text, which would put UTF-8
+            // bytes into a blob stored in another encoding (#1242).
+            Some(diff) if diff.text_encoding != encoding_rs::UTF_8 => Err(format!(
+                "Hunk actions work on UTF-8 files only; this diff is {}: stage the whole file",
+                diff.text_encoding.name()
+            )),
+            Some(diff) => match self.repo_relative_path(&diff.right_path) {
+                None => Err("File is outside the repository".to_string()),
+                Some(rel) => match diff.hunk_range_at(diff.action_row()) {
+                    None => Err("No change hunk at the cursor".to_string()),
+                    Some(range) => {
+                        let patch = diff.hunk_patch(&rel, range);
+                        Ok((rel, patch))
+                    }
+                },
+            },
+        };
+        match built {
+            Ok(pair) => Some(pair),
+            Err(msg) => {
+                self.status = msg.to_string();
+                None
+            }
+        }
+    }
+
+    /// Stage / Unstage / Revert Hunk from an editor tab (#1352): the hunk
+    /// whose change bar the caret is on, as a patch of the file on disk
+    /// against HEAD, the same pair the gutter's bars come from. Refused
+    /// with unsaved edits, since the patch is applied to the saved file.
+    pub(super) fn editor_hunk_patch_at_caret(&mut self) -> Result<(String, String), &'static str> {
+        let Some(path) = self.editor.path.clone() else {
+            return Err("Hunk actions need a file in a git repository");
+        };
+        if self.editor.dirty {
+            return Err("Save the file first: hunk actions apply to the file on disk");
+        }
+        let row = self.editor.cursor_row;
+        let Some(mark) = self.editor.current_git_mark_at(row) else {
+            return Err("No change at the cursor");
+        };
+        let rel = self
+            .repo_relative_path(&path)
+            .ok_or("File is outside the repository")?;
+        let head = crate::git::read_file_at_head(&self.scm_root(), &rel)
+            .map_err(|_| "This file has no version in HEAD")?;
+        let disk = std::fs::read_to_string(&path).map_err(|_| "Could not read the file")?;
+        let data = crate::widgets::diff::DiffData::build_with_byte_check(
+            PathBuf::from(&rel),
+            path,
+            head.lines().map(str::to_string).collect(),
+            disk.lines().map(str::to_string).collect(),
+            Some(&head),
+            Some(&disk),
+        );
+        // The diff row showing this line; a deletion bar sits on the line
+        // after the removed run, so its hunk is the row just above.
+        use crate::widgets::diff::DiffRow;
+        let at = data
+            .rows
+            .iter()
+            .position(|r| match *r {
+                DiffRow::Equal { right, .. }
+                | DiffRow::Added { right }
+                | DiffRow::Replaced { right, .. } => right == row,
+                DiffRow::Removed { .. } => false,
+            })
+            .map(|i| {
+                if mark == crate::widgets::editor::GitMark::Deleted {
+                    i.saturating_sub(1)
+                } else {
+                    i
+                }
+            })
+            .ok_or("No change at the cursor")?;
+        let range = data.hunk_range_at(at).ok_or("No change at the cursor")?;
+        Ok((rel.clone(), data.hunk_patch(&rel, range)))
+    }
+
+    /// The workspace-relative path + patch for the SELECTED lines of the
+    /// open working-tree diff (VS Code's "Stage Selected Ranges"), or
+    /// `None` when there is no selection spanning a changed row, so the
+    /// caller falls back to the whole-hunk action.
+    pub(super) fn diff_selected_lines_patch(&self) -> Option<(String, String)> {
+        let diff = self.editor.diff.as_ref()?;
+        // Not UTF-8: left to the hunk path, which refuses it with a reason.
+        if !diff.left_is_git_head
+            || diff.right_is_unsaved
+            || diff.text_encoding != encoding_rs::UTF_8
+        {
+            return None;
+        }
+        let sel = diff.selection?;
+        if !sel.has_area() {
+            return None;
+        }
+        let rel = self.repo_relative_path(&diff.right_path)?;
+        let (start, end) = sel.normalized();
+        let patch = diff.selected_lines_patch(&rel, (start.0, end.0))?;
+        Some((rel, patch))
+    }
+
+    /// `path` relative to the repository top level, where `git apply` runs
+    /// (#139's convention). Relative to the WORKSPACE, a workspace opened on
+    /// `repo/sub` sent `x` for `sub/x`, and every hunk action failed or hit
+    /// a same-named file at the top level.
+    pub(super) fn repo_relative_path(&self, path: &Path) -> Option<String> {
+        let root = self.scm_root();
+        let rel = match path.strip_prefix(&root) {
+            Ok(rel) => rel.to_path_buf(),
+            Err(_) => path
+                .canonicalize()
+                .ok()?
+                .strip_prefix(root.canonicalize().ok()?)
+                .ok()?
+                .to_path_buf(),
+        };
+        Some(
+            rel.components()
+                .map(|c| c.as_os_str().to_string_lossy())
+                .collect::<Vec<_>>()
+                .join("/"),
+        )
+    }
+
+    /// Stage only the hunk under the diff caret (`git apply --cached`).
+    pub fn stage_hunk_at_caret(&mut self) {
+        // A selection spanning changed rows narrows the action to those
+        // lines (VS Code's "Stage Selected Ranges"); without one the whole
+        // hunk under the caret is staged, as before.
+        if let Some((rel, patch)) = self.diff_selected_lines_patch() {
+            match crate::git::apply_patch(&self.scm_root(), &patch, true, false) {
+                Ok(_) => {
+                    self.status = format!("Staged selected lines in {rel}");
+                    self.refresh_after_hunk_op();
+                }
+                Err(err) => self.status = format!("Stage selected lines failed: {err}"),
+            }
+            return;
+        }
+        let Some((rel, patch)) = self.diff_hunk_patch_at_caret() else {
+            return;
+        };
+        match crate::git::apply_patch(&self.scm_root(), &patch, true, false) {
+            Ok(_) => {
+                self.status = format!("Staged hunk in {rel}");
+                self.refresh_after_hunk_op();
+            }
+            Err(err) => self.status = format!("Stage hunk failed: {err}"),
+        }
+    }
+
+    /// Remove only the hunk under the diff caret from the index
+    /// (`git apply --cached -R`). Errors surface verbatim, e.g. when the
+    /// hunk was never staged.
+    pub fn unstage_hunk_at_caret(&mut self) {
+        // Same selection-first rule as staging: the reverse patch removes
+        // exactly the selected lines from the index.
+        if let Some((rel, patch)) = self.diff_selected_lines_patch() {
+            match crate::git::apply_patch(&self.scm_root(), &patch, true, true) {
+                Ok(_) => {
+                    self.status = format!("Unstaged selected lines in {rel}");
+                    self.refresh_after_hunk_op();
+                }
+                Err(err) => self.status = format!("Unstage selected lines failed: {err}"),
+            }
+            return;
+        }
+        let Some((rel, patch)) = self.diff_hunk_patch_at_caret() else {
+            return;
+        };
+        match crate::git::apply_patch(&self.scm_root(), &patch, true, true) {
+            Ok(_) => {
+                self.status = format!("Unstaged hunk in {rel}");
+                self.refresh_after_hunk_op();
+            }
+            Err(err) => self.status = format!("Unstage hunk failed: {err}"),
+        }
+    }
+
+    /// Arm the revert-hunk confirm popup for the hunk under the caret.
+    pub fn request_revert_hunk_at_caret(&mut self) {
+        if let Some((rel_path, patch)) = self.diff_hunk_patch_at_caret() {
+            self.pending_revert_hunk = Some(PendingRevertHunk { rel_path, patch });
+        }
+    }
+
+    pub fn confirm_pending_revert_hunk(&mut self) {
+        let Some(pr) = self.pending_revert_hunk.take() else {
+            return;
+        };
+        match crate::git::apply_patch(&self.scm_root(), &pr.patch, false, true) {
+            Ok(_) => {
+                self.status = format!("Reverted hunk in {}", pr.rel_path);
+                self.refresh_after_hunk_op();
+                // Reverted from an editor tab (#1352): show the restored text
+                // now rather than on the next file-system sweep.
+                if self.editor.diff.is_none() && self.editor.reload_if_clean().is_some() {
+                    self.sync_open_file_poll_mtime();
+                }
+                // The revert rewrote the working file; force the HEAD-side rebuild
+                // of the open view so it refreshes even if the rewrite landed
+                // within the stamp's granularity. Forced by the root the VIEW is
+                // tagged with, not `scm_root()` re-read now: the tag may predate the
+                // worker's first status reply and hold the workspace root.
+                let force_root = self
+                    .editor
+                    .diff
+                    .as_ref()
+                    .and_then(|d| match &d.source {
+                        crate::widgets::diff::DiffSource::HeadVsWorking { root, .. } => {
+                            Some(root.clone())
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| self.scm_root());
+                self.refresh_open_diff_views(
+                    true,
+                    std::slice::from_ref(&force_root),
+                    &std::collections::BTreeSet::new(),
+                );
+            }
+            Err(err) => self.status = format!("Revert hunk failed: {err}"),
+        }
+    }
+
+    pub fn cancel_pending_revert_hunk(&mut self) {
+        self.pending_revert_hunk = None;
+    }
+
+    pub(super) fn refresh_after_hunk_op(&mut self) {
+        self.active_git_bypass_debounce();
+        self.refresh_git_status_debounced();
+        self.refresh_source_control();
+    }
+
+    pub fn request_discard_source_control_entry(&mut self, entry_idx: usize) {
+        use crate::git::ChangeKind;
+        let Some(entry) = self.source_control.entries.get(entry_idx).cloned() else {
+            return;
+        };
+        let untracked = matches!(entry.kind, ChangeKind::Untracked);
+        let staged = matches!(
+            entry.kind,
+            ChangeKind::StagedAdded
+                | ChangeKind::StagedModified
+                | ChangeKind::StagedDeleted
+                | ChangeKind::StagedRenamed
+        );
+        self.pending_discard = Some(PendingDiscard {
+            rel_path: entry.path,
+            untracked,
+            staged,
+        });
+    }
+
+    pub fn confirm_pending_discard(&mut self) {
+        let Some(pd) = self.pending_discard.take() else {
+            return;
+        };
+        match crate::git::discard_path(&self.scm_root(), &pd.rel_path, pd.untracked, pd.staged) {
+            Ok(()) => {
+                self.status = format!("Discarded {}", pd.rel_path);
+                self.active_git_bypass_debounce();
+                self.refresh_git_status_debounced();
+                self.refresh_source_control();
+            }
+            Err(err) => {
+                let why = self.git_error_line("checkout -- (discard)", &err);
+                self.status = format!("Discard failed: {why}");
+                self.source_control.commit_feedback = Some(why);
+                self.source_control.commit_feedback_is_error = true;
+            }
+        }
+    }
+
+    pub fn cancel_pending_discard(&mut self) {
+        self.pending_discard = None;
+    }
+
+    pub(super) fn commit_source_control(&mut self) {
+        if self.repo_git_busy() {
+            return;
+        }
+        let message = self.source_control.message.trim().to_string();
+        if message.is_empty() {
+            self.source_control.commit_feedback = Some(String::from("Empty commit message"));
+            self.source_control.commit_feedback_is_error = true;
+            return;
+        }
+        if self.hold_for_unsaved(ScmWrite::Commit) {
+            return;
+        }
+        let root = self.scm_root();
+        let committed = message.clone();
+        self.spawn_commit(
+            message,
+            move || crate::git::commit(&root, &committed),
+            |app, r| {
+                app.log_git("commit", &r);
+                match r {
+                    Ok(summary) => {
+                        let headline = crate::git::headline(&summary);
+                        app.source_control.commit_feedback = Some(headline.to_string());
+                        app.source_control.commit_feedback_is_error = false;
+                        app.status = format!("Committed: {headline}");
+                        app.active_git_bypass_debounce();
+                        app.refresh_git_status_debounced();
+                        app.refresh_source_control();
+                        app.continue_rebase_after_commit();
+                    }
+                    Err(err) => app.report_commit_failure(&err),
+                }
+            },
+        );
+    }
+
+    /// Run a commit on the git worker (#1153). The repository's hooks
+    /// (pre-commit, commit-msg) can run for minutes; inline, the whole UI
+    /// froze until they ended and every key pressed meanwhile fired at once.
+    /// The message stays in the box until the commit lands, and is cleared
+    /// then only if it is still the one committed. `done` applies the
+    /// result on the UI thread.
+    pub(super) fn spawn_commit(
+        &mut self,
+        message: String,
+        commit: impl FnOnce() -> Result<String, String> + Send + 'static,
+        done: impl FnOnce(&mut App, Result<String, String>) + Send + 'static,
+    ) {
+        if self.git_net_busy() {
+            return;
+        }
+        self.spawn_git_net("commit", move || {
+            let r = commit();
+            Box::new(move |app: &mut App| {
+                if r.is_ok() && app.source_control.message.trim() == message.trim() {
+                    app.source_control.clear_after_commit();
+                }
+                done(app, r)
+            })
+        });
+        let running = String::from("Committing\u{2026} (running hooks)");
+        self.source_control.commit_feedback = Some(running.clone());
+        self.source_control.commit_feedback_is_error = false;
+        self.status = running;
+    }
+
+    /// A refused `git commit` (#858): the panel and the status bar name why
+    /// on one line ("nothing to commit, working tree clean", not the "On
+    /// branch main" git prints first); the Git Output log has the rest.
+    pub(super) fn report_commit_failure(&mut self, err: &str) {
+        let why = crate::git::error_line(err);
+        self.source_control.commit_feedback = Some(why.clone());
+        self.source_control.commit_feedback_is_error = true;
+        self.status = format!("Commit failed: {why}");
+    }
+
+    pub fn consume_branch_picker_image_clear(&mut self) -> bool {
+        self.overlays.branch_picker_clear.consume()
+    }
+
+    /// Open the Checkout / Create Branch picker, seeded with the repo's
+    /// branches (most-recently-committed first). A one-shot `git
+    /// for-each-ref` runs here, off the render path — same discipline as
+    /// the zoxide jumper. Outside a git repo there is nothing to pick, so
+    /// we report that instead of opening an empty box.
+    pub(super) fn open_branch_picker(&mut self) {
+        if self.branch_picker.is_some() {
+            return;
+        }
+        self.commit_menu_open = false;
+        match crate::git::list_branches(&self.scm_root()) {
+            Ok(branches) => {
+                let n = branches.len();
+                self.branch_picker =
+                    Some(crate::widgets::branch_picker::BranchPicker::new(branches));
+                self.overlays.branch_picker_clear.request();
+                self.status =
+                    format!("Branches: {n} — type to filter or name a new branch, Esc to close");
+            }
+            Err(err) => {
+                self.source_control.commit_feedback = Some(format!("branches: {err}"));
+                self.source_control.commit_feedback_is_error = true;
+                self.status = format!("Branch picker: {err}");
+            }
+        }
+    }
+
+    pub(super) fn close_branch_picker(&mut self) {
+        if self.branch_picker.take().is_some() {
+            self.overlays.branch_picker_clear.request();
+            self.overlays.activity.mark_dirty();
+            self.overlays.welcome.mark_dirty();
+            self.overlays.hero.mark_dirty();
+            self.invalidate_editor_image_layouts();
+            self.status.clear();
+        }
+    }
+
+    /// Run the action the highlighted picker row resolves to: switch to an
+    /// existing branch, or create-and-switch a new one. The picker closes
+    /// on success; on failure it stays open with the error in the SC
+    /// feedback line so the user can amend the name, unless local changes
+    /// blocked the switch: then Stash & Checkout is offered (#925). True
+    /// when the switch happened.
+    pub(super) fn apply_branch_action(
+        &mut self,
+        action: crate::widgets::branch_picker::BranchAction,
+    ) -> bool {
+        use crate::widgets::branch_picker::BranchAction;
+        let (result, verb, label, name) = match &action {
+            BranchAction::Checkout(name) => (
+                crate::git::checkout_branch(&self.scm_root(), name),
+                "Switched to",
+                "switch",
+                name,
+            ),
+            BranchAction::Track { remote_ref, name } => (
+                crate::git::track_remote_branch(&self.scm_root(), remote_ref, name),
+                "Switched to",
+                "switch --track",
+                name,
+            ),
+            BranchAction::Create(name) => (
+                crate::git::create_branch(&self.scm_root(), name),
+                "Created",
+                "switch -c",
+                name,
+            ),
+        };
+        self.log_git(label, &result);
+        match result {
+            Ok(summary) => {
+                // One line (#858): git's result, or, when git said only which
+                // edits it carried over (`M\tpath`) or how the branch stands
+                // against its upstream, where the switch went.
+                let summary = crate::git::result_line(&summary);
+                let (feedback, status) = if summary.is_empty() {
+                    let line = format!("{verb} {name}");
+                    (line.clone(), line)
+                } else {
+                    (summary.clone(), format!("{verb}: {summary}"))
+                };
+                self.close_branch_picker();
+                self.source_control.commit_feedback = Some(feedback);
+                self.source_control.commit_feedback_is_error = false;
+                self.status = status;
+                self.active_git_bypass_debounce();
+                self.refresh_git_status_debounced();
+                self.refresh_source_control();
+                true
+            }
+            Err(err) => {
+                if crate::git::local_changes_block_switch(&err) {
+                    self.offer_stash_and_switch(action);
+                }
+                let why = crate::git::error_line(&err);
+                self.source_control.commit_feedback = Some(format!("branch: {why}"));
+                self.source_control.commit_feedback_is_error = true;
+                self.status = format!("Branch: {why}");
+                false
+            }
+        }
+    }
+
+    /// A switch git refused because it would overwrite local changes
+    /// (#925): instead of a dead end, offer what VS Code does, Stash &
+    /// Checkout and Migrate Changes, in place of the branch picker.
+    pub(super) fn offer_stash_and_switch(
+        &mut self,
+        action: crate::widgets::branch_picker::BranchAction,
+    ) {
+        use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
+        let name = action.branch_name().to_string();
+        let rows = vec![
+            ListRow {
+                id: String::from("stash"),
+                label: format!("Stash & Checkout: stash your changes, then switch to {name}"),
+            },
+            ListRow {
+                id: String::from("migrate"),
+                label: format!("Migrate Changes: switch to {name} and bring your changes"),
+            },
+        ];
+        self.close_branch_picker();
+        let root = self.scm_root();
+        let from = crate::git::current_branch(&root);
+        self.blocked_switch = Some((root, from, action));
+        let title = format!("Your changes block the switch to {name}");
+        self.open_list_picker(ListPicker::new(ListPurpose::BlockedSwitch, title, rows), "");
+    }
+
+    /// Stash & Checkout or Migrate Changes picked (#925), past the
+    /// unsaved-changes prompt as any stash is (#1438): git stashes the files
+    /// on disk, so an edit still only in a tab would be left out, and the
+    /// switch would change the file under it.
+    pub(super) fn stash_and_switch_picked(&mut self, migrate: bool) {
+        let op = if migrate {
+            ScmWrite::MigrateAndSwitch
+        } else {
+            ScmWrite::StashAndSwitch
+        };
+        if self.hold_for_unsaved(op) {
+            return;
+        }
+        let Some((root, from, action)) = self.blocked_switch.take() else {
+            return;
+        };
+        // The prompt, or a formatter it waits on, leaves time to switch
+        // branches by hand: the changes to stash are then another branch's.
+        if crate::git::current_branch(&root) != from {
+            let what = if migrate {
+                "Migrate Changes"
+            } else {
+                "Stash & Checkout"
+            };
+            let line = format!("{what} cancelled: the branch changed since the switch was refused");
+            self.source_control.commit_feedback = Some(line.clone());
+            self.source_control.commit_feedback_is_error = true;
+            self.status = line;
+            return;
+        }
+        self.stash_and_switch(root, action, migrate);
+    }
+
+    /// Stash & Checkout, or with `migrate` Migrate Changes (#925): stash the
+    /// changes that blocked the switch, switch, and for a migration pop them
+    /// onto the new branch. A pop that stops on conflicts keeps the stash,
+    /// as git does; a switch that still fails leaves the changes stashed.
+    pub(super) fn stash_and_switch(
+        &mut self,
+        root: PathBuf,
+        action: crate::widgets::branch_picker::BranchAction,
+        migrate: bool,
+    ) {
+        if self.repo_git_busy() || root != self.scm_root() {
+            return;
+        }
+        let name = action.branch_name().to_string();
+        // The stash this makes is the one to pop, not an older one left
+        // behind should there be nothing to stash by now, nor a newer one a
+        // checkout hook pushes during the switch: it is popped by its commit.
+        let before = crate::git::stash_oid(&root, 0).ok();
+        let stash = crate::git::stash_push(&root, None);
+        self.log_git("stash push", &stash);
+        if let Err(err) = stash {
+            let line = crate::git::failure_line("Stash", &err);
+            self.source_control.commit_feedback = Some(line.clone());
+            self.source_control.commit_feedback_is_error = true;
+            self.status = line;
+            return;
+        }
+        let created = crate::git::stash_oid(&root, 0)
+            .ok()
+            .filter(|oid| before.as_ref() != Some(oid));
+        let switched = self.apply_branch_action(action);
+        let Some(created) = created else {
+            return;
+        };
+        let (line, is_error) = match (switched, migrate) {
+            (false, _) => {
+                let line = format!("{} \u{b7} your changes are in the stash", self.status);
+                (line, true)
+            }
+            (true, false) => (
+                format!("Stashed your changes and switched to {name}"),
+                false,
+            ),
+            (true, true) => {
+                let pop = crate::git::stash_pop_oid(&root, &created);
+                self.log_git("stash pop", &pop);
+                match pop {
+                    Ok(_) => (format!("Switched to {name} with your changes"), false),
+                    Err(err) => {
+                        let why = crate::git::failure_line("Migrate changes", &err);
+                        (format!("Switched to {name} \u{b7} {why}"), true)
+                    }
+                }
+            }
+        };
+        self.source_control.commit_feedback = Some(line.clone());
+        self.source_control.commit_feedback_is_error = is_error;
+        self.status = line;
+        self.refresh_source_control();
+    }
+
+    pub(super) fn handle_branch_picker_key(&mut self, key: KeyEvent) {
+        let Some(picker) = self.branch_picker.as_mut() else {
+            return;
+        };
+        match (key.code, key.modifiers) {
+            (KeyCode::Esc, _) => self.close_branch_picker(),
+            (KeyCode::Enter, _) => self.apply_branch_picker_selection(),
+            (KeyCode::Up, _) => picker.select_prev(),
+            (KeyCode::Down, _) => picker.select_next(),
+            (KeyCode::PageUp, _) => {
+                for _ in 0..10 {
+                    picker.select_prev();
+                }
+            }
+            (KeyCode::PageDown, _) => {
+                for _ in 0..10 {
+                    picker.select_next();
+                }
+            }
+            (KeyCode::Left, _) => picker.move_cursor_left(),
+            (KeyCode::Right, _) => picker.move_cursor_right(),
+            (KeyCode::Home, _) => picker.move_cursor_home(),
+            (KeyCode::End, _) => picker.move_cursor_end(),
+            (KeyCode::Backspace, _) => picker.pop_char(),
+            (KeyCode::Delete, _) => picker.delete_char(),
+            (KeyCode::Char(c), m) if !m.intersects(KeyModifiers::CONTROL | KeyModifiers::SUPER) => {
+                picker.push_char(c);
+            }
+            _ => {}
+        }
+    }
+
+    pub(super) fn handle_branch_picker_mouse(&mut self, m: MouseEvent) {
+        let Some(picker) = self.branch_picker.as_mut() else {
+            return;
+        };
+        let inside = rect_contains(picker.last_rect, m.column, m.row);
+        match m.kind {
+            MouseEventKind::ScrollDown => {
+                for _ in 0..3 {
+                    picker.select_next();
+                }
+            }
+            MouseEventKind::ScrollUp => {
+                for _ in 0..3 {
+                    picker.select_prev();
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) | MouseEventKind::Down(MouseButton::Right)
+                if !inside =>
+            {
+                self.close_branch_picker();
+            }
+            // Click a row to act on it, the way VS Code's quick-pick behaves.
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(idx) = picker.row_index_at(m.row) {
+                    picker.selected = idx;
+                    self.apply_branch_picker_selection();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub(super) fn render_branch_picker(&mut self, frame: &mut ratatui::Frame) {
+        let sidebar = self.last_sidebar_area;
+        let full = frame.area();
+        let theme = self.theme;
+        let Some(picker) = self.branch_picker.as_mut() else {
+            return;
+        };
+        // Anchor over the sidebar column like the jumper (it is a Source
+        // Control action), widening rightward for readable branch names;
+        // fall back to a centered box when the sidebar is collapsed.
+        let rect = match sidebar {
+            Some(side) if side.width >= 2 && side.height >= 4 => {
+                let width = side
+                    .width
+                    .max(ZOXIDE_JUMP_MIN_WIDTH)
+                    .min(full.width.saturating_sub(side.x));
+                Rect {
+                    x: side.x,
+                    y: side.y,
+                    width,
+                    height: side.height,
+                }
+            }
+            _ => fallback_popup_rect(full, 100),
+        };
+        crate::widgets::branch_picker::render_branch_picker(
+            picker,
+            rect,
+            frame.buffer_mut(),
+            theme,
+        );
+    }
+
+    /// Render the Source Control "⋯" actions menu under the header pill.
+    pub(super) fn render_scm_menu(&mut self, frame: &mut ratatui::Frame) {
+        if !self.scm_menu.open || self.sidebar_view != SidebarView::SourceControl {
+            self.scm_menu.close();
+            return;
+        }
+        let anchor = self.source_control.header_more_btn;
+        if anchor.width == 0 {
+            return;
+        }
+        let screen = frame.area();
+        self.scm_menu.hover = self.pointer_cell;
+        crate::widgets::scm_menu::render(
+            &mut self.scm_menu,
+            anchor,
+            screen,
+            frame.buffer_mut(),
+            self.theme,
+        );
+    }
+
+    pub(super) fn toggle_inline_blame(&mut self) {
+        self.inline_blame_enabled = !self.inline_blame_enabled;
+        self.editor.blame_enabled = self.inline_blame_enabled;
+        // Re-enabling refetches (the sync marker was left set); disabling
+        // keeps the data so a later re-enable can be instant if unchanged.
+        if self.inline_blame_enabled {
+            self.blame_fetched = None;
+        }
+        self.status = if self.inline_blame_enabled {
+            String::from("Inline Blame: on")
+        } else {
+            String::from("Inline Blame: off")
+        };
+        if !cfg!(test) {
+            self.report_unsaved_setting(crate::prefs::save_inline_blame(self.inline_blame_enabled));
+        }
+    }
+
+    /// The right-click menu of a COMMITS graph row (#1627), VS Code's
+    /// Source Control Graph menu: start a cherry-pick or revert from the
+    /// commit, check it out, branch, tag or reset there, or copy it.
+    pub(super) fn commit_graph_menu(
+        &self,
+        origin: (u16, u16),
+        commit: &crate::git::GraphCommit,
+    ) -> ContextMenu {
+        use crate::git::ResetMode;
+        let item = |label: &str, action: CommitAction| MenuEntry::Item {
+            label: label.to_string(),
+            action: MenuAction::CommitAction {
+                action,
+                hash: commit.hash.clone(),
+                short: commit.short_hash.clone(),
+            },
+        };
+        let items = vec![
+            item("Cherry-Pick", CommitAction::CherryPick),
+            item("Revert", CommitAction::Revert),
+            MenuEntry::Separator,
+            item("Checkout (Detached)", CommitAction::CheckoutDetached),
+            item("Create Branch Here...", CommitAction::CreateBranch),
+            item("Create Tag Here...", CommitAction::CreateTag),
+            MenuEntry::Submenu {
+                label: String::from("Reset Current Branch to Here"),
+                items: vec![
+                    item(
+                        "Soft (keep changes staged)",
+                        CommitAction::Reset(ResetMode::Soft),
+                    ),
+                    item(
+                        "Mixed (keep changes unstaged)",
+                        CommitAction::Reset(ResetMode::Mixed),
+                    ),
+                    item(
+                        "Hard (discard changes)",
+                        CommitAction::Reset(ResetMode::Hard),
+                    ),
+                ],
+            },
+            MenuEntry::Separator,
+            item("Copy Commit Hash", CommitAction::CopyHash),
+            item("Copy Commit Message", CommitAction::CopyMessage),
+        ];
+        ContextMenu {
+            origin,
+            items,
+            selected: 0,
+            open_submenu: None,
+            submenu_selected: 0,
+            target_dir: self.tree.root.clone(),
+            crumb: None,
+            scroll: Default::default(),
+            submenu_scroll: Default::default(),
+        }
+    }
+
+    /// Run one entry of [`App::commit_graph_menu`] on `hash`. A cherry-pick
+    /// or revert that conflicts stops like one started in a terminal, so
+    /// Git: Continue / Skip / Abort take it from there; a hard reset asks
+    /// first, the way Undo Last Commit does for a pushed commit.
+    pub(super) fn run_commit_action(&mut self, action: CommitAction, hash: &str, short: &str) {
+        use crate::git::ResetMode;
+        use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+        let root = self.scm_root();
+        if action != CommitAction::Reset(ResetMode::Hard) {
+            self.reset_hard_armed = None;
+        }
+        match action {
+            // Both commit, so signing and the commit hooks run: on the git
+            // worker, like a plain commit (#1153), not in the click.
+            CommitAction::CherryPick => {
+                let (hash, ok) = (hash.to_string(), format!("Cherry-picked {short}"));
+                self.spawn_git_net("cherry-pick", move || {
+                    let r = crate::git::cherry_pick(&root, &hash);
+                    Box::new(move |app: &mut App| {
+                        app.run_scm_op("cherry-pick", r, &ok, "Cherry-pick")
+                    })
+                });
+            }
+            CommitAction::Revert => {
+                let (hash, ok) = (hash.to_string(), format!("Reverted {short}"));
+                self.spawn_git_net("revert", move || {
+                    let r = crate::git::revert_commit(&root, &hash);
+                    Box::new(move |app: &mut App| app.run_scm_op("revert", r, &ok, "Revert"))
+                });
+            }
+            // A big checkout or a slow `post-checkout` hook would freeze
+            // the click, so this and reset run on the git worker too.
+            CommitAction::CheckoutDetached => {
+                let (hash, ok) = (hash.to_string(), format!("Checked out {short} (detached)"));
+                self.spawn_git_net("switch --detach", move || {
+                    let r = crate::git::checkout_detached(&root, &hash);
+                    Box::new(move |app: &mut App| {
+                        app.run_scm_op("switch --detach", r, &ok, "Checkout")
+                    })
+                });
+            }
+            CommitAction::CreateBranch => self.open_input_prompt(InputPrompt::new(
+                InputPurpose::CreateBranchFrom {
+                    base: hash.to_string(),
+                },
+                format!("Create Branch at {short}"),
+                "New branch name",
+            )),
+            CommitAction::CreateTag => self.open_input_prompt(InputPrompt::new(
+                InputPurpose::CreateTagAt {
+                    target: hash.to_string(),
+                },
+                format!("Create Tag at {short}"),
+                "Tag name (e.g. v1.0.0)",
+            )),
+            CommitAction::Reset(mode) => {
+                let armed = (mode == ResetMode::Hard).then(|| {
+                    (
+                        root.clone(),
+                        hash.to_string(),
+                        crate::git::worktree_fingerprint(&root),
+                    )
+                });
+                if armed.is_some() && self.reset_hard_armed != armed {
+                    self.reset_hard_armed = armed;
+                    let warning = format!(
+                        "Reset --hard to {short} discards every uncommitted change. Choose Hard again to reset anyway"
+                    );
+                    self.source_control.commit_feedback = Some(warning.clone());
+                    self.source_control.commit_feedback_is_error = true;
+                    self.status = warning;
+                    return;
+                }
+                self.reset_hard_armed = None;
+                let (hash, ok) = (hash.to_string(), format!("Reset to {short}"));
+                self.spawn_git_net("reset", move || {
+                    let r = crate::git::reset_to(&root, &hash, mode);
+                    Box::new(move |app: &mut App| app.run_scm_op("reset", r, &ok, "Reset"))
+                });
+            }
+            CommitAction::CopyHash => {
+                self.status = if copy_to_clipboard(hash) {
+                    format!("Copied commit hash {short}")
+                } else {
+                    String::from("Could not copy the commit hash to the clipboard")
+                };
+            }
+            CommitAction::CopyMessage => {
+                self.status = match crate::git::commit_message(&root, hash) {
+                    Ok(message) if copy_to_clipboard(&message) => {
+                        format!("Copied the message of {short}")
+                    }
+                    Ok(_) => String::from("Could not copy the commit message to the clipboard"),
+                    Err(e) => format!("Could not read the message of {short}: {e}"),
+                };
+            }
+        }
+    }
+
+    /// Git: Copy Permalink / Copy Head Link / Open on Remote (#1610): the
+    /// active file's selected lines, else the caret's line, on its remote's
+    /// web page. The status line says the link, or why there is none.
+    pub(super) fn share_link(&mut self, how: ShareLink) {
+        let Some(path) = self.editor.path.clone() else {
+            self.status = String::from("Open a file to link to its lines");
+            return;
+        };
+        let rev = match how {
+            ShareLink::CopyHeadLink => crate::git::LinkRev::Branch,
+            ShareLink::CopyPermalink | ShareLink::OpenOnRemote => crate::git::LinkRev::Commit,
+        };
+        let url = match crate::git::share_link(&path, Some(self.share_link_lines()), rev) {
+            Ok(url) => url,
+            Err(why) => {
+                self.status = format!("No link: {why}");
+                return;
+            }
+        };
+        if how == ShareLink::OpenOnRemote {
+            self.open_url_for_user(&url);
+            return;
+        }
+        // The clipboard the user pastes from, as any copy reaches it: the
+        // local one over the relay, else this machine's, else OSC 52.
+        let via_relay = self.is_relay_session && self.push_clipboard_via_relay(&url);
+        self.status = if via_relay || copy_to_clipboard(&url) {
+            format!("Copied {url}")
+        } else {
+            format!("Copied {url} via OSC 52 (the host terminal decides)")
+        };
+    }
+
+    /// The 1-based lines a shared link points at: the selection's, less a
+    /// last line it only reaches the start of (whole lines selected with
+    /// Shift+Down), else the caret's.
+    pub(super) fn share_link_lines(&self) -> (usize, usize) {
+        let caret = self.editor.cursor_row + 1;
+        let Some(sel) = self.editor.selection.filter(|s| s.has_area()) else {
+            return (caret, caret);
+        };
+        let ((start, _), (end, end_col)) = sel.normalised();
+        let end = if end_col == 0 && end > start {
+            end - 1
+        } else {
+            end
+        };
+        (start + 1, end + 1)
+    }
+
+    /// The encoding `path`'s open tab decodes it with, in any group; UTF-8
+    /// when it isn't open, which is what opening it would pick: a BOM still
+    /// wins in `decode_blob`, and bytes that are not UTF-8 get the plain
+    /// open rather than an editable diff of replacement characters.
+    pub(super) fn open_tab_encoding(&self, path: &Path) -> &'static encoding_rs::Encoding {
+        std::iter::once(&self.editor)
+            .chain(self.editor_layout.inactive_groups())
+            .flat_map(|g| g.editors.iter())
+            .find(|e| e.diff.is_none() && e.path.as_deref() == Some(path))
+            .map_or(encoding_rs::UTF_8, |e| e.encoding)
+    }
+}
