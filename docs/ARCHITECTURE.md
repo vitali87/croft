@@ -140,6 +140,7 @@ src/
 │   ├── remote_sessions.rs SSH sessions, hand-off to remote croft, config sync, uploads, port forwarding
 │   ├── review.rs        pull-request review tabs and in-editor comment boxes
 │   ├── runners.rs       Testing view, Tasks, runnable blocks, notebooks, Fleet, Live Run, .http requests
+│   ├── save_restore.rs  saving, unsaved prompts, hot exit, session save/restore
 │   ├── scm.rs           Source Control panel, background git, commits, branches, hunks, blame
 │   ├── screencast.rs    Screencast Mode (Shift+F8): the keys pressed, the command each ran and the cell a click hit, drawn over the frame for a recording
 │   ├── search.rs        Search view, Search Editor, find/replace bar, Quick Open
