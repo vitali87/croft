@@ -1541,7 +1541,7 @@ impl App {
     /// discard. Recognition normally ends on its own when you stop talking;
     /// this is only for abandoning a session that is stuck or unwanted. The
     /// killed worker reports `Empty`, which `drain_voice` turns into a "canceled"
-    /// message via this flag.
+    /// message via this flag; a transcript the session already sent is dropped.
     pub(super) fn cancel_voice_input(&mut self) {
         if let Some(handle) = self.voice_handle.as_ref() {
             self.voice_canceling = true;
@@ -1551,23 +1551,39 @@ impl App {
 
     /// Per-tick: deliver a finished voice session's result. Returns whether the
     /// next frame should redraw (transcript injected or a status message set).
+    ///
+    /// A cancel tap can reach croft after the dialog has sent its transcript,
+    /// and killing a recognizer that has exited cannot take the result back,
+    /// so a transcript is typed only if no cancel is pending. The frame loop
+    /// drains before it reads the input queued meanwhile, so a tap that came
+    /// in before the transcript can still be unread here. The transcript
+    /// therefore waits in `voice_ready` for the next drain, after that input
+    /// has been read.
     pub(super) fn drain_voice(&mut self) -> bool {
         let mut changed = false;
-        while let Ok(msg) = self.voice_rx.try_recv() {
+        if let Some(text) = self.voice_ready.take() {
             changed = true;
             self.voice_handle = None;
+            if std::mem::take(&mut self.voice_canceling) {
+                self.status = String::from("Voice input canceled");
+            } else {
+                self.inject_voice_text(&text);
+            }
+        }
+        while let Ok(msg) = self.voice_rx.try_recv() {
             match msg {
-                // A cancel tap can land after the dialog has already sent its
-                // transcript but before this drain: killing the recognizer
-                // then cannot take the result back, so drop it here.
-                crate::voice::VoiceMsg::Transcript(text) => {
-                    if std::mem::take(&mut self.voice_canceling) {
-                        self.status = String::from("Voice input canceled");
-                    } else {
-                        self.inject_voice_text(&text);
-                    }
+                crate::voice::VoiceMsg::Transcript(text) if !self.voice_canceling => {
+                    self.voice_ready = Some(text);
+                }
+                crate::voice::VoiceMsg::Transcript(_) => {
+                    changed = true;
+                    self.voice_handle = None;
+                    self.voice_canceling = false;
+                    self.status = String::from("Voice input canceled");
                 }
                 crate::voice::VoiceMsg::Empty => {
+                    changed = true;
+                    self.voice_handle = None;
                     self.status = if std::mem::take(&mut self.voice_canceling) {
                         String::from("Voice input canceled")
                     } else {
@@ -1575,6 +1591,8 @@ impl App {
                     };
                 }
                 crate::voice::VoiceMsg::Failed(e) => {
+                    changed = true;
+                    self.voice_handle = None;
                     self.voice_canceling = false;
                     self.status = e;
                 }

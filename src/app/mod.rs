@@ -1699,8 +1699,14 @@ pub struct App {
     voice_tx: std::sync::mpsc::Sender<crate::voice::VoiceMsg>,
     voice_handle: Option<crate::voice::VoiceHandle>,
     /// Set when a mic tap cancels a live session, so the resulting empty result
-    /// is reported as "canceled" rather than "no speech detected".
+    /// is reported as "canceled" rather than "no speech detected", and a
+    /// transcript is dropped rather than typed.
     voice_canceling: bool,
+    /// A finished session's transcript, held from the drain that received it
+    /// to the next one so the input queued in between is read first: a mic tap
+    /// among it cancels the transcript. `voice_handle` stays set meanwhile, so
+    /// that tap counts as a cancel rather than a new session.
+    voice_ready: Option<String>,
     pub editor: EditorTabs,
     /// The editor group layout tree. `editor` (above) is ALWAYS the active
     /// (focused) group, hoisted out of the tree's single active leaf, so the
@@ -4408,6 +4414,7 @@ impl App {
             voice_tx,
             voice_handle: None,
             voice_canceling: false,
+            voice_ready: None,
             editor,
             editor_layout: editor_layout::EditorLayout::single(),
             force_save_armed: false,
