@@ -330,6 +330,9 @@ class Helpers(unittest.TestCase):
                                       "pub(crate) use remote_sessions::takeover_mode_seq;",
                                       "use settings::*;", "pub use settings::SideBarPosition;"])
         self.assertEqual(len(done), 2)
+        self.assertTrue(all(d.endswith("used outside app") for d in done), done)
+        _, done = mi.fix_glue(self.GLUE, errors, errors, homes, "editor")
+        self.assertTrue(all(d.endswith("used outside editor") for d in done), done)
 
     def test_a_glob_only_the_tests_need_is_kept_for_the_tests_and_an_unneeded_one_goes(self):
         app = [("unused_imports", "unused import: `commands::*`"),
@@ -339,6 +342,20 @@ class Helpers(unittest.TestCase):
         self.assertEqual(lines[3:6], ["#[cfg(test)]", "use commands::*;", "use remote_sessions::*;"])
         self.assertNotIn("use settings::*;", lines)
         self.assertIn("dropped use settings::*: nothing needs it", done)
+
+    def test_a_re_export_only_the_tests_need_is_kept_for_the_tests(self):
+        """An item a test outside the module names by path (an editor helper
+        a line_edit test calls) is re-exported, and the app build then finds
+        the re-export unused: it gets `#[cfg(test)]`, as a glob would."""
+        glue = ["mod navigation;", "pub(crate) use navigation::word_char_at;",
+                "use navigation::*;", "pub struct Editor;"]
+        app = [("unused_imports", "unused import: `navigation::word_char_at`")]
+        lines, done = mi.fix_glue(glue, app, [], {})
+        self.assertEqual(lines[1:3], ["#[cfg(test)]", "pub(crate) use navigation::word_char_at;"])
+        self.assertEqual(done, ["re-export of navigation::word_char_at only under cfg(test)"])
+        lines, done = mi.fix_glue(glue, app, app, {})
+        self.assertNotIn("pub(crate) use navigation::word_char_at;", lines)
+        self.assertEqual(done, ["dropped the re-export of navigation::word_char_at: nothing needs it"])
 
     def test_a_guarded_glob_that_is_still_unused_goes_with_its_guard(self):
         guarded = ["mod commands;", "#[cfg(test)]", "use commands::*;", "pub struct App;"]
@@ -407,6 +424,178 @@ class Helpers(unittest.TestCase):
             with self.subTest(file=file):
                 self.assertTrue(doc and phrase and row)
                 self.assertTrue(all(len("//! " + ln) <= 100 for ln in doc.split("\n")))
+
+
+# A file split into a folder beside it (the editor), its tests inline.
+EDITOR = """use std::fmt;
+
+pub struct Editor {
+    n: u8,
+}
+
+impl Editor {
+    fn bump(&mut self) -> u8 {
+        self.n + 1
+    }
+
+    pub fn shown(&self) -> u8 {
+        self.n
+    }
+}
+
+/// The editor's tests.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TEXT: &str = "a
+    b";
+
+    #[test]
+    fn bumps() {
+        let mut e = Editor { n: 1 };
+        assert_eq!(e.bump(), 2);
+        let s = r#"
+    kept as written
+"#;
+        assert!(s.contains("kept") && TEXT.ends_with("    b"));
+    }
+}
+"""
+
+WIDGETS = """# Architecture
+
+```
+src/
+└── widgets/
+    ├── mod.rs
+    ├── editor.rs             The editor.
+    ├── editor_find.rs        Find.
+```
+"""
+
+# A target like the editor's, with the files a test moves items to.
+SPLIT = mi.EDITOR._replace(files={
+    "undo": ("Undo and redo.", "editor undo history", "undo and redo"),
+    "brackets": ("Bracket matching.", "editor bracket", "bracket matching"),
+})
+
+
+class OtherTargets(unittest.TestCase):
+    """The editor target: a file split into a folder beside it, and its inline
+    tests moved to their own file first."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.tmp = Path(tmp.name)
+        for rel, text in {
+            SPLIT.source: EDITOR,
+            mi.ARCH: WIDGETS,
+            SPLIT.manifest: manifest(EDITOR, {"bump": (1, "undo")}),
+            os.path.join(mi.NOTES, ".keep"): "",
+        }.items():
+            (self.tmp / rel).parent.mkdir(parents=True, exist_ok=True)
+            (self.tmp / rel).write_text(text)
+        git(self.tmp, "init", "-q", "-b", "main")
+        git(self.tmp, "config", "user.email", "t@example.com")
+        git(self.tmp, "config", "user.name", "t")
+        self.root = Root.__new__(Root)
+        self.root.path = self.tmp
+        self.root.commit()
+        git(self.tmp, "checkout", "-q", "-b", "work")
+
+    def tests_out(self):
+        return quiet(mi.main, ["--target", "editor", "--tests-out", "--root", str(self.tmp), "--no-fmt"])
+
+    def test_the_inline_tests_move_to_their_own_file_and_pass_the_pure_move_check(self):
+        code, out = self.tests_out()
+        self.assertEqual(code, 0, out)
+        self.assertIn("from src/widgets/editor.rs to src/widgets/editor/tests.rs", out)
+        self.assertTrue(self.root.read(SPLIT.source).endswith(
+            "/// The editor's tests.\n#[cfg(test)]\nmod tests;\n"))
+        tests = self.root.read("src/widgets/editor/tests.rs")
+        self.assertTrue(tests.startswith(
+            "//! The editor's own tests, moved out of editor.rs (#2062).\n\nuse super::*;\n"))
+        self.assertIn("\n#[test]\nfn bumps() {\n    let mut e", tests, "dedented one level")
+        self.root.commit()
+        code, report = self.root.pure()
+        self.assertEqual(code, 0, report)
+        self.assertIn("Pure move", report)
+
+    def test_lines_inside_a_string_keep_their_indentation(self):
+        self.tests_out()
+        tests = self.root.read("src/widgets/editor/tests.rs")
+        self.assertIn('const TEXT: &str = "a\n    b";', tests, "the string's value is unchanged")
+        self.assertIn('let s = r#"\n    kept as written\n"#;', tests)
+
+    def test_the_tests_get_a_release_note_and_a_row_under_the_new_folder(self):
+        self.tests_out()
+        note = self.root.read(os.path.join(mi.NOTES, "2062-split-editor-tests.md"))
+        self.assertIn("the editor's tests moved to their own file, src/widgets/editor/tests.rs.", note)
+        arch = self.root.read(mi.ARCH)
+        self.assertRegex(arch, r"editor\.rs +The editor\.\n    ├── editor/ +the editor's feature "
+                               r"files.*\n    │   ├── tests\.rs +the editor's own tests\n    ├── editor_find")
+
+    def test_a_file_without_one_tests_block_is_refused(self):
+        (self.tmp / SPLIT.source).write_text(EDITOR.split("/// The editor's tests.")[0])
+        code, out = self.tests_out()
+        self.assertEqual(code, 1)
+        self.assertIn("0 top-level `mod tests {` blocks", out)
+
+    def test_a_docs_tree_without_the_files_row_stops_tests_out_before_anything_is_written(self):
+        """The tests' docs row goes under the split file's row: with no such
+        row the tool must stop before it writes anything, not after it has
+        moved the tests and emptied the docs."""
+        no_row = WIDGETS.replace("    ├── editor.rs             The editor.\n", "")
+        (self.tmp / mi.ARCH).write_text(no_row)
+        code, out = self.tests_out()
+        self.assertEqual(code, 1)
+        self.assertIn("has no row starting '├── editor.rs'", out)
+        self.assertEqual(self.root.read(mi.ARCH), no_row)
+        self.assertEqual(self.root.read(SPLIT.source), EDITOR)
+        self.assertFalse((self.tmp / "src/widgets/editor/tests.rs").exists())
+        self.assertFalse((self.tmp / mi.NOTES / "2062-split-editor-tests.md").exists())
+
+    def test_a_docs_tree_without_the_files_row_stops_a_move_before_anything_is_written(self):
+        no_row = WIDGETS.replace("    ├── editor.rs             The editor.\n", "")
+        (self.tmp / mi.ARCH).write_text(no_row)
+        with self.assertRaises(mi.ManifestError):
+            quiet(mi.move, str(self.tmp), 1, False, False, SPLIT)
+        self.assertEqual(self.root.read(mi.ARCH), no_row)
+        self.assertEqual(self.root.read(SPLIT.source), EDITOR)
+        self.assertFalse((self.tmp / "src/widgets/editor").exists())
+
+    def test_a_move_goes_to_a_file_in_the_folder_beside_the_split_file(self):
+        quiet(mi.move, str(self.tmp), 1, False, False, SPLIT)
+        undo = self.root.read("src/widgets/editor/undo.rs")
+        self.assertTrue(undo.startswith("//! Undo and redo.\n\nuse super::*;\n\nimpl Editor {\n"))
+        self.assertIn("    pub(super) fn bump(&mut self) -> u8 {", undo)
+        editor = self.root.read(SPLIT.source)
+        self.assertTrue(editor.startswith("use std::fmt;\n\nmod undo;\n\npub struct Editor"),
+                        "the first `mod` goes after the `use` lines at the top")
+        self.assertNotIn("fn bump(", editor)
+        note = self.root.read(os.path.join(mi.NOTES, "2062-split-editor-undo.md"))
+        self.assertIn("the editor undo history code moved to its own file, "
+                      "src/widgets/editor/undo.rs.", note)
+        self.root.commit()
+        code, report = self.root.pure()
+        self.assertEqual(code, 0, report)
+
+    def test_rows_under_a_folder_go_in_name_order_and_the_folder_row_once(self):
+        once = mi.add_arch_row(WIDGETS, "undo", SPLIT)
+        twice = mi.add_arch_row(once, "brackets", SPLIT)
+        self.assertEqual(twice.count("├── editor/"), 1)
+        self.assertRegex(twice, r"├── editor/ .*\n    │   ├── brackets\.rs +bracket matching\n"
+                                r"    │   ├── undo\.rs +undo and redo\n    ├── editor_find")
+        self.assertEqual(mi.add_arch_row(twice, "undo", SPLIT), twice)
+
+    def test_every_target_names_its_own_manifest_file_and_folder(self):
+        self.assertEqual(sorted(mi.TARGETS), ["app", "editor"])
+        for t in mi.TARGETS.values():
+            with self.subTest(target=t.name):
+                self.assertTrue(t.source.endswith(".rs") and t.manifest.endswith(".tsv"))
+                self.assertFalse(t.dir.endswith("/mod"), "never foo/mod.rs (#2062 guardrail 7)")
 
 
 if __name__ == "__main__":
