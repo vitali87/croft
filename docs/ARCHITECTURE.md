@@ -118,50 +118,50 @@ src/
 ├── zoxide.rs            zoxide integration: strict query + typo-tolerant fuzzy fallback (Damerau-Levenshtein) + install only on the user's y to the popup's offer, never at launch (pkg on Termux, curl script elsewhere), its outcome and failure reason kept for the session + InstallState surfaced to the Cmd+Z jump popup
 ├── app/                 event loop, three-pane layout + activity bar, key dispatch, status bar, mouse, clipboard, splitters, preview overlays, Customize Layout (compute_chrome_layout / panel_band_rect pure geometry, secondary side bar, Zen Mode)
 │   ├── mod.rs           the `App` struct and the state types it holds, `App::new`, start-up (`run`) and the main loop, focus and pane helpers; each feature lives in its own file below
-│   ├── agents_collab.rs coding agents, lanes, the AI navigator, multiplayer sessions
-│   ├── bottom_panel.rs  bottom panel, OUTPUT, PROBLEMS and diagnostics, project check, PORTS
+│   ├── agents_collab.rs coding agents in panes, agent and worktree lanes, approving agent edits, the AI navigator, and multiplayer sessions: relay, presence and peer carets
+│   ├── bottom_panel.rs  the bottom panel and its tab strip, the OUTPUT picker, PROBLEMS and the diagnostics store, the whole-project check, build matchers, and the PORTS panel
 │   ├── click.rs         double / triple click detection
-│   ├── code_scanning.rs SARIF results viewer, GitHub code scanning, SARIF logs as problems
-│   ├── codeql.rs        the CodeQL side bar: databases, queries, results, variant analysis, the CLI
-│   ├── commands.rs      `run_command`, Command Palette, Extensions view
-│   ├── completion.rs    completion popup, signature help, inline suggestions, Emmet
+│   ├── code_scanning.rs SARIF results viewer (list, open, preview, baselines, export, fixes and step marks), GitHub code scanning (pick, download, follow branch, dismiss) and SARIF logs shown as problems
+│   ├── codeql.rs        the CodeQL side bar: databases, query history and logs, running queries, suites and packs, result viewers, AST and CFG, the model editor, the run queue, variant analysis, and downloading and updating the CLI
+│   ├── commands.rs      `run_command`, the Command Palette, the Extensions view, extension commands (MCP tools, viewers) and Show Memory Usage
+│   ├── completion.rs    the completion popup, auto-imports, snippets, signature help, ghost-text suggestions and Emmet
 │   ├── cursor_blink.rs  caret blink timing
-│   ├── debugger.rs      Run and Debug: launch, adapters, breakpoints, stepping, watches, console
-│   ├── diff_merge.rs    diff editor, merge conflicts, three-way merge, history scrubber, local history
-│   ├── editor_input.rs  editor keys, vim mode, macros, multi-cursor, clipboard and paste routing
+│   ├── debugger.rs      Run and Debug: launch configs and Add Configuration, compounds and preLaunchTask waits, adapters, debug builds, attach pickers, the paused view, watches, the console, stepping, every kind of breakpoint, Debug Test and inline values
+│   ├── diff_merge.rs    diff editor upkeep and navigation, merge conflicts and the three-way merge editor, the history scrubber, local history and the who-wrote-this lens
+│   ├── editor_input.rs  editor keys, vim mode, macros, multi-cursor and line commands, typing toggles, copy, cut and paste routing and the clipboard, and reading dropped file paths out of a paste
 │   ├── editor_layout.rs the tree of editor groups: splitting, moving focus between and collapsing them, and each group's rectangle; the focused group's tabs live in `App::editor`
-│   ├── editor_tabs.rs   tabs and editor groups, Go Back/Forward, bookmarks, new windows
-│   ├── explorer.rs      file tree, Explorer sections, workspace folders, re-rooting, outside changes
-│   ├── frame.rs         drawing each frame (`render`), status-bar text, caret visibility
+│   ├── editor_tabs.rs   tabs and editor groups, tab menus and pickers, Go Back/Forward, bookmarks, symbol tabs, and moving or copying an editor into a new window
+│   ├── explorer.rs      the file tree (keys, type-to-jump, cut, copy and paste, rename and move with server fixes, delete, drag targets), Explorer sections, workspace folders and .code-workspace files, re-rooting, file watching and outside changes, zoxide jump
+│   ├── frame.rs         drawing each frame (`render`), the status-bar text, caret visibility and the screen-reader descriptions
 │   ├── fs_watch.rs      filesystem watch + poll fallback feeding tree / editor / terminal refresh. The poll stats the file behind EVERY open tab, not just the focused one: a boundary dir carries no watch at all (see the storm rules — never root a stream at or above `target/`, `node_modules/`, `.git/`) and an in-place write does not move its parent dir's mtime, so for a file sitting directly in one this stat is the only thing that can notice a change; cost is one stat per open tab per (adaptively backed-off) tick
 │   ├── git_worker.rs    off-thread git status / changes worker
-│   ├── host_integration.rs host-terminal sequences and restore, panic log, croft view socket, self-update
+│   ├── host_integration.rs the host terminal: escape sequences, restoring it on exit or panic, the panic log, the unsupported-terminal notice, the `croft view` and `edit --wait` socket and rebase-todo editing, self-update and relaunch, and the update card
 │   ├── hover.rs         LSP hover dwell timing
-│   ├── inline_images.rs inline pictures: detection, chrome bake, per-frame overlays, minimap
-│   ├── key_input.rs     `handle_key`, Cmd+K chords, key predicates, keymap contexts
-│   ├── language_servers.rs language-server features: go-to, rename, code actions, outline, breadcrumbs
+│   ├── inline_images.rs pictures in the terminal: support detection, the background chrome bake, sending and clearing each picture every frame (the activity-bar icons included), the editor, terminal and Markdown overlays, and the minimap
+│   ├── key_input.rs     `handle_key` and `handle_key_inner`, Cmd+K chords, every `is_*_key` predicate, the key and mouse contexts for user keymaps, voice input and the on-screen keyboard
+│   ├── language_servers.rs language servers: sync, messages and progress, decorations, go-to and peek, hierarchies, rename, code actions, formatting, linked editing, smart select, highlights, symbol pickers, code lens, outline, breadcrumbs, sticky scroll, restart
 │   ├── memory_report.rs Developer: Show Memory Usage: the per-subsystem figures laid out as Markdown, opened as a rendered preview so typing can't edit it
-│   ├── menus.rs         context and dropdown menus, `dispatch_menu_action`
-│   ├── mouse_input.rs   mouse handling, hover popups and tooltips
+│   ├── menus.rs         right-click and dropdown menus: shortcut hints, ContextMenu methods, geometry, keys, drawing, `dispatch_menu_action`, and the status-bar click menus
+│   ├── mouse_input.rs   all mouse handling (`handle_mouse_inner`), hover popups and tooltips, and closing stale popups on a click
 │   ├── nav.rs           editor back / forward navigation history
 │   ├── overlay.rs       inline-image overlay state + clear-on-hide latches (iTerm2 cell eviction; the Kitty path adds a delete-all on the same clear frames)
 │   ├── perf_hud.rs      F8 performance HUD
-│   ├── prompts.rs       input prompts and list pickers
-│   ├── remote_sessions.rs SSH sessions, hand-off to remote croft, config sync, uploads, port forwarding
-│   ├── review.rs        pull-request review tabs and in-editor comment boxes
-│   ├── runners.rs       Testing view, Tasks, runnable blocks, notebooks, Fleet, Live Run, .http requests
-│   ├── save_restore.rs  saving, unsaved prompts, hot exit, session save/restore
-│   ├── scm.rs           Source Control panel, background git, commits, branches, hunks, blame
+│   ├── prompts.rs       the input popup and the list picker (opening, keys, clicks, drawing), `submit_input_prompt` and `confirm_list_picker`, and the small inline prompt
+│   ├── remote_sessions.rs SSH connect and install, the ssh-pane offer, handing off to a remote croft, Remote Explorer keys, config sync, drop relay and scp uploads, port forwarding, and opening URLs on the local machine
+│   ├── review.rs        pull-request review tabs (fetching with gh, viewed marks, checks, per-file diffs, worktree checkout) and the comment boxes in the editor: review threads, navigator notes and sticky notes
+│   ├── runners.rs       the Testing view, Tasks (Run Task, the build task, task inputs, problem matchers), runnable Markdown blocks, notebooks and kernels, Fleet, Live Run and .http requests
+│   ├── save_restore.rs  saving (save all, auto save, format on save, sudo save, encoding loss), unsaved prompts, hot exit, session save and restore, Revert, New Untitled, Save As and the launch file
+│   ├── scm.rs           Source Control: the panel and its keys, background git and its log, commits, push, pull and sync, stash, branches and pickers, hunks, permalinks, the commit graph, its dialogs, change gutters and inline blame
 │   ├── screencast.rs    Screencast Mode (Shift+F8): the keys pressed, the command each ran and the cell a click hit, drawn over the frame for a recording
-│   ├── search.rs        Search view, Search Editor, find/replace bar, Quick Open
-│   ├── settings.rs      Settings editor, config watching, Keyboard Shortcuts editor, themes, profiles
+│   ├── search.rs        the Search view and Replace All, Search Editor tabs, the find/replace bar (also over diffs and logs), Quick Open, and Switch Header/Source
+│   ├── settings.rs      the Settings editor and hub, live and per-language settings, watching config files, snippets, file associations and encodings, the Keyboard Shortcuts editor and the F1 overlay, the theme picker and profiles
 │   ├── sidebar_dwell.rs side bar auto-hide's grace delay: how long focus must stay away before the side bar collapses
-│   ├── terminal_panes.rs terminal panes: split, layout, profiles, recordings, panel save/restore
-│   ├── terminal_tools.rs terminal input, find, quick select, copy mode, command history, links
-│   ├── viewers.rs       spreadsheet/CSV/SQLite, PDF, archive, hex, log and Markdown viewers
+│   ├── terminal_panes.rs terminal panes: split, layout, collapse, maximize and rail, reorder, profiles, rename, notes, close and undo, saving and restoring the panel, redraw tracking, recordings, bells and exits, labels and pane buttons
+│   ├── terminal_tools.rs typing into terminals (key encoding, broadcast, paste confirm, redaction, timestamps), find, quick select, copy mode, command history and decorations, CAPTURES, links and inline suggestions
+│   ├── viewers.rs       read-only viewers: the spreadsheet, CSV and SQLite grid, PDF, archives, hex, rendered logs, and the Markdown preview with its scroll sync
 │   ├── welcome.rs       welcome-screen state: the "IN THIS RELEASE" highlights, read synchronously from `release_notes::release_notes()` (no thread, no network)
-│   ├── welcome_screen.rs welcome page drawing and the guided tour
-│   ├── workbench.rs     screen layout, Customize Layout, activity bar, splitters
+│   ├── welcome_screen.rs the welcome page (logo picture and its bake, wordmark, Start list, release-note card, Loch layout) and the guided tour
+│   ├── workbench.rs     screen layout and Customize Layout, the activity bar and its badges, the Manage menu, side-bar auto-hide, splitter drags and screencast mode
 │   └── tests/           whole-app tests, one file per area; `mod.rs` holds the helpers more than one file uses. `golden.rs` draws whole screens the way the main loop does and compares every cell, colour and the caret with the snapshots in `golden/` (`CROFT_BLESS=1` rewrites them; its module doc lists what it pins and masks)
 ├── dap/                 debugger stack: Debug Adapter Protocol client. debugpy (Python: the adapter on a private 3.14+ venv, the program on the project's own interpreter, #864) is the verified mechanism; Rust/C/C++ route to lldb-dap; JS/TS route to vscode-js-debug; Go routes to delve (`dlv dap` over TCP, single-session, #264). Which file types each handles is a data-driven extension axis (see registry.rs)
 │   ├── mod.rs
