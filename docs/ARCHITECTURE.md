@@ -235,6 +235,7 @@ src/
     │   ├── snippets.rs      snippets and tab stops, Emmet
     │   ├── span_edits.rs    edits from language servers, formatters and peers, applied as text spans
     │   ├── symbol_tabs.rs   symbol tabs, sibling tabs of one file kept in step
+    │   ├── tabs.rs          editor tabs: open, close, pin, move, previews, tab strip, breadcrumbs
     │   ├── tests.rs         the editor's own tests
     │   ├── transforms.rs    change case, bump numbers, transpose characters
     │   ├── typing.rs        typing, pasting and deleting, auto-closed pairs, quotes and tags
