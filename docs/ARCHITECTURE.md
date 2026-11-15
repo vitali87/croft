@@ -217,6 +217,7 @@ src/
     ├── editor.rs             tree-sitter highlighted editor with the full write path, mouse-drag selection, native clipboard, image / PDF / spreadsheet preview tabs, minimap rasterizer and code folding
     ├── editor/               the editor's feature files, beside editor.rs; each file's `//!` doc says what it holds
     │   ├── tests.rs         the editor's own tests
+    │   ├── viewers.rs       pictures, PDF, spreadsheets and SQLite, archives, hex, logs, Markdown and notebook previews
     ├── editor_find.rs        VS Code-style inline Find bar (`Cmd+F`) with match highlight, Enter/Shift+Enter walk, case/whole-word/regex toggles and a Replace row (`Cmd+Opt+F`); Replace All runs through the same `split_for_highlight` as count and paint
     ├── extensions.rs         Extensions sidebar widget: projects bundled and user manifests into a theme-aware list grouped under BUILT-IN/INSTALLED/AVAILABLE, with pill toggles, +Add, trash, a local filter box and clear/refresh; reports clicks back to App, which owns the state
     ├── file_finder.rs   VS Code-style Quick Open (Cmd+P) fuzzy file picker with tiered match ranking (exact filename > prefix > substring > path > subsequence)
