@@ -230,6 +230,7 @@ src/
     │   ├── selection.rs     selections, linked editing, expand and shrink selection
     │   ├── snippets.rs      snippets and tab stops, Emmet
     │   ├── span_edits.rs    edits from language servers, formatters and peers, applied as text spans
+    │   ├── symbol_tabs.rs   symbol tabs, sibling tabs of one file kept in step
     │   ├── tests.rs         the editor's own tests
     │   ├── transforms.rs    change case, bump numbers, transpose characters
     │   ├── typing.rs        typing, pasting and deleting, auto-closed pairs, quotes and tags
