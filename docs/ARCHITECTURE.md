@@ -136,6 +136,7 @@ src/
 │   ├── host_integration.rs host-terminal sequences and restore, panic log, croft view socket, self-update
 │   ├── hover.rs         LSP hover dwell timing
 │   ├── inline_images.rs inline pictures: detection, chrome bake, per-frame overlays, minimap
+│   ├── key_input.rs     `handle_key`, Cmd+K chords, key predicates, keymap contexts
 │   ├── language_servers.rs language-server features: go-to, rename, code actions, outline, breadcrumbs
 │   ├── memory_report.rs Developer: Show Memory Usage: the per-subsystem figures laid out as Markdown, opened as a rendered preview so typing can't edit it
 │   ├── menus.rs         context and dropdown menus, `dispatch_menu_action`
