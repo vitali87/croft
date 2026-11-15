@@ -534,6 +534,10 @@ impl App {
         } else {
             Pane::Tree
         };
+        // Every pane's focused look follows `focus` only through here: without
+        // it a restored editor focus took keys while the editor drew as
+        // unfocused and the Explorer kept its focused look (#2068).
+        self.sync_focus_flags();
         left
     }
 

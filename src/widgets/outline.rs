@@ -51,7 +51,7 @@ pub struct OutlinePanel {
     /// outline's lane matches the file tree's directly above it. Set by the app.
     pub theme: Theme,
     /// Whether the Explorer/tree has focus, for the brighter scrollbar thumb.
-    /// Mirrors `FileTree::focused`; set by the app each frame.
+    /// Mirrors `FileTree::focused`; set by the app at each focus change.
     pub focused: bool,
     /// Render-time pointer cell so the row under the cursor lights up, fed by
     /// the app each frame exactly like the other side panels.

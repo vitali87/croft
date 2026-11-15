@@ -5595,7 +5595,6 @@ impl App {
         self.problems.focus_gradient = gradient;
         self.problems.theme = self.theme;
         self.problems.focused = self.focus == Pane::Terminal;
-        self.problems.hover_pointer = self.pointer_cell;
         self.problems.fix_glyph = match self.problems_fix_started {
             Some(t) => update_spinner_frame(t.elapsed().as_millis()),
             None => "",
@@ -5603,19 +5602,16 @@ impl App {
         self.output.focus_gradient = gradient;
         self.output.theme = self.theme;
         self.output.focused = self.focus == Pane::Terminal;
-        self.output.hover_pointer = self.pointer_cell;
         self.output.sync();
         self.ports.focus_gradient = gradient;
         self.ports.theme = self.theme;
         self.ports.focused = self.focus == Pane::Terminal;
-        self.ports.hover_pointer = self.pointer_cell;
         for t in self.terminals.iter_mut() {
             t.show_timestamps = self.show_terminal_timestamps;
         }
         self.captures.focus_gradient = gradient;
         self.captures.theme = self.theme;
         self.captures.focused = self.focus == Pane::Terminal;
-        self.captures.hover_pointer = self.pointer_cell;
         for t in self.terminals.iter_mut() {
             t.focus_gradient = gradient;
             t.theme = self.theme;

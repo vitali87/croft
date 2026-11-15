@@ -1182,6 +1182,14 @@ impl App {
                 area
             };
             self.paint_panel_tabs(frame, strip);
+            // The render-time pointer cell, fed to the panel's views as it is
+            // to the side bar's above, so the row under the mouse lights up on
+            // every move and goes dark when the pointer leaves (#2068).
+            let panel_pointer = self.pointer_cell;
+            self.problems.hover_pointer = panel_pointer;
+            self.output.hover_pointer = panel_pointer;
+            self.ports.hover_pointer = panel_pointer;
+            self.captures.hover_pointer = panel_pointer;
             match self.bottom_panel_tab {
                 BottomPanelTab::Terminal => {
                     let n = self.terminals.len().max(1);
