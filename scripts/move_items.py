@@ -337,6 +337,7 @@ class BuildError(Exception):
 
 PRIVATE_IMPORT = re.compile(r"^[a-z]+(?: [a-z]+)* import `(\w+)` is private$")
 UNUSED_GLOB = re.compile(r"^unused import: `(\w+)::\*`$")
+UNUSED_ONE = re.compile(r"^unused import: `(\w+)::(\w+)`$")
 
 
 def item_key(it):
@@ -751,6 +752,12 @@ def glob_line(lines, file):
     return next((n for n, ln in enumerate(lines) if ln == f"use {file}::*;"), None)
 
 
+def reexport_line(lines, file, name):
+    """The line of a re-export `<vis> use <file>::<name>;` in mod.rs, or None."""
+    pat = re.compile(rf"^pub(\(\w+\))? use {file}::{name};$")
+    return next((n for n, ln in enumerate(lines) if pat.match(ln)), None)
+
+
 def fix_glue(lines, app, tests, homes, scope="app"):
     """mod.rs `lines` with the glue the build errors ask for, and what was
     done. `scope` names the module being split, for the messages. `app` and `tests` are the errors of the two builds; `homes` maps a
@@ -758,6 +765,7 @@ def fix_glue(lines, app, tests, homes, scope="app"):
     error is not one this fixes."""
     lines, done, unknown = list(lines), [], []
     private, unused = set(), {"app": set(), "tests": set()}
+    unused_one = {"app": set(), "tests": set()}
     for side, errors in (("app", app), ("tests", tests)):
         for code, message in errors:
             if code == "E0603" and (m := PRIVATE_IMPORT.match(message)) and m[1] in homes:
@@ -765,6 +773,9 @@ def fix_glue(lines, app, tests, homes, scope="app"):
             elif code == "unused_imports" and (m := UNUSED_GLOB.match(message)) \
                     and glob_line(lines, m[1]) is not None:
                 unused[side].add(m[1])
+            elif code == "unused_imports" and (m := UNUSED_ONE.match(message)) \
+                    and reexport_line(lines, m[1], m[2]) is not None:
+                unused_one[side].add((m[1], m[2]))
             else:
                 unknown.append(f"{side}: {code}: {message}")
     if unknown:
@@ -789,6 +800,20 @@ def fix_glue(lines, app, tests, homes, scope="app"):
             only = "test" if file in unused["app"] else "not(test)"
             lines.insert(at, f"#[cfg({only})]")
             done.append(f"use {file}::* only under cfg({only})")
+    # A re-export only the tests use (an item a test elsewhere names by its
+    # path) is unused in the app build: it gets `#[cfg(test)]` the same way.
+    for file, name in sorted(unused_one["app"] | unused_one["tests"]):
+        at = reexport_line(lines, file, name)
+        guarded = at > 0 and lines[at - 1].startswith("#[cfg(")
+        start = at - 1 if guarded else at
+        both = (file, name) in unused_one["app"] and (file, name) in unused_one["tests"]
+        if both or guarded:
+            del lines[start : at + 1]
+            done.append(f"dropped the re-export of {file}::{name}: nothing needs it")
+        else:
+            only = "test" if (file, name) in unused_one["app"] else "not(test)"
+            lines.insert(at, f"#[cfg({only})]")
+            done.append(f"re-export of {file}::{name} only under cfg({only})")
     return lines, done
 
 

@@ -343,6 +343,20 @@ class Helpers(unittest.TestCase):
         self.assertNotIn("use settings::*;", lines)
         self.assertIn("dropped use settings::*: nothing needs it", done)
 
+    def test_a_re_export_only_the_tests_need_is_kept_for_the_tests(self):
+        """An item a test outside the module names by path (an editor helper
+        a line_edit test calls) is re-exported, and the app build then finds
+        the re-export unused: it gets `#[cfg(test)]`, as a glob would."""
+        glue = ["mod navigation;", "pub(crate) use navigation::word_char_at;",
+                "use navigation::*;", "pub struct Editor;"]
+        app = [("unused_imports", "unused import: `navigation::word_char_at`")]
+        lines, done = mi.fix_glue(glue, app, [], {})
+        self.assertEqual(lines[1:3], ["#[cfg(test)]", "pub(crate) use navigation::word_char_at;"])
+        self.assertEqual(done, ["re-export of navigation::word_char_at only under cfg(test)"])
+        lines, done = mi.fix_glue(glue, app, app, {})
+        self.assertNotIn("pub(crate) use navigation::word_char_at;", lines)
+        self.assertEqual(done, ["dropped the re-export of navigation::word_char_at: nothing needs it"])
+
     def test_a_guarded_glob_that_is_still_unused_goes_with_its_guard(self):
         guarded = ["mod commands;", "#[cfg(test)]", "use commands::*;", "pub struct App;"]
         lines, _ = mi.fix_glue(guarded, [], [("unused_imports", "unused import: `commands::*`")], {})
