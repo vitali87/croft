@@ -225,6 +225,7 @@ src/
     │   ├── line_commands.rs move, duplicate, delete, join, sort and indent lines, convert indentation
     │   ├── lsp_overlays.rs  semantic tokens, inlay hints, diagnostics, links, code lenses, ghost text
     │   ├── multi_cursor.rs  multiple carets, occurrence selection, box and column selection
+    │   ├── navigation.rs    caret movement, scrolling, Go to Line, minimap
     │   ├── on_enter.rs      Enter, auto-indent, comment continuation, per-language Enter rules, paste re-indent
     │   ├── selection.rs     selections, linked editing, expand and shrink selection
     │   ├── snippets.rs      snippets and tab stops, Emmet
