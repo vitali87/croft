@@ -598,7 +598,9 @@ def add_arch_row(text, file, t=APP, desc=None):
     name = f"{file}.rs"
     if any(ln.startswith(f"{tree.row}{name} ") for ln in lines):
         return text
-    start = next(n for n, ln in enumerate(lines) if ln.startswith(tree.anchor))
+    start = next((n for n, ln in enumerate(lines) if ln.startswith(tree.anchor)), None)
+    if start is None:
+        raise ManifestError(f"{ARCH} has no row starting {tree.anchor.strip()!r} to list {name} by")
     if tree.folder:
         if not lines[start + 1].startswith(tree.folder.split("/")[0] + "/"):
             lines.insert(start + 1, tree.folder)
@@ -626,6 +628,16 @@ def halves(rows):
         for k, pr in enumerate(ns, 1):
             out[pr] = (file, k if len(ns) > 1 else 0)
     return out
+
+
+def write_all(files):
+    """Write each (path, text), making a new file's folder. Called only once
+    every text is worked out, so a step that fails first leaves every file as
+    it was."""
+    for path, text in files:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
 
 
 def move(root, pr, fmt=True, build=True, t=APP):
@@ -663,23 +675,20 @@ def move(root, pr, fmt=True, build=True, t=APP):
         doc = ["//! " + ln if ln else "//!" for ln in t.files[file][0].split("\n")]
         new_file = doc + ["", "use super::*;", ""] + body
         glue_free = free
-        os.makedirs(os.path.dirname(target), exist_ok=True)
     rest = cut(lines, picked, blocks, items)
     if not os.path.exists(target):
         rest = add_glue(rest, file, glue_free)
     elif glue_free:
         rest = add_glue_use_only(rest, file)
-    with open(target, "w", encoding="utf-8") as f:
-        f.write("\n".join(new_file).rstrip("\n") + "\n")
-    with open(mod_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(rest))
-    with open(os.path.join(root, note_path(file, half, t)), "w", encoding="utf-8") as f:
-        f.write(note_text(file, half, t))
     arch = os.path.join(root, ARCH)
     with open(arch, encoding="utf-8") as f:
-        text = f.read()
-    with open(arch, "w", encoding="utf-8") as f:
-        f.write(add_arch_row(text, file, t))
+        arch_text = add_arch_row(f.read(), file, t)
+    write_all([
+        (target, "\n".join(new_file).rstrip("\n") + "\n"),
+        (mod_path, "\n".join(rest)),
+        (os.path.join(root, note_path(file, half, t)), note_text(file, half, t)),
+        (arch, arch_text),
+    ])
     if fmt:
         subprocess.run(["cargo", "fmt"], cwd=root, check=True)
     widened = sum(1 for it in picked if not it.vis and it.kind in VISIBLE
@@ -870,22 +879,19 @@ def tests_out(root, t, fmt=True):
     target = os.path.join(root, t.dir, "tests.rs")
     if os.path.exists(target):
         raise ManifestError(f"{t.dir}/tests.rs exists already")
-    os.makedirs(os.path.dirname(target), exist_ok=True)
-    with open(target, "w", encoding="utf-8") as f:
-        f.write("\n".join(doc + [""] + out).rstrip("\n") + "\n")
     decl = re.sub(r"mod\s+tests\s*\{$", "mod tests;", lines[open_line])
     rest = lines[:open_line] + [decl] + lines[close + 1:]
-    with open(src, "w", encoding="utf-8") as f:
-        f.write("\n".join(rest))
-    with open(os.path.join(root, NOTES, f"2062-split-{t.note_prefix}tests.md"), "w",
-              encoding="utf-8") as f:
-        f.write(f"refactor: Groundwork for the refactor program (#2062): {t.tests[1]} moved "
-                f"to their own file, {t.dir}/tests.rs. Nothing changes in use.\n")
     arch = os.path.join(root, ARCH)
     with open(arch, encoding="utf-8") as f:
-        arch_text = f.read()
-    with open(arch, "w", encoding="utf-8") as f:
-        f.write(add_arch_row(arch_text, "tests", t, t.tests[2]))
+        arch_text = add_arch_row(f.read(), "tests", t, t.tests[2])
+    write_all([
+        (target, "\n".join(doc + [""] + out).rstrip("\n") + "\n"),
+        (src, "\n".join(rest)),
+        (os.path.join(root, NOTES, f"2062-split-{t.note_prefix}tests.md"),
+         f"refactor: Groundwork for the refactor program (#2062): {t.tests[1]} moved "
+         f"to their own file, {t.dir}/tests.rs. Nothing changes in use.\n"),
+        (arch, arch_text),
+    ])
     if fmt:
         subprocess.run(["cargo", "fmt"], cwd=root, check=True)
     moved = close - open_line - 1

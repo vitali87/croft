@@ -529,6 +529,29 @@ class OtherTargets(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("0 top-level `mod tests {` blocks", out)
 
+    def test_a_docs_tree_without_the_files_row_stops_tests_out_before_anything_is_written(self):
+        """The tests' docs row goes under the split file's row: with no such
+        row the tool must stop before it writes anything, not after it has
+        moved the tests and emptied the docs."""
+        no_row = WIDGETS.replace("    ├── editor.rs             The editor.\n", "")
+        (self.tmp / mi.ARCH).write_text(no_row)
+        code, out = self.tests_out()
+        self.assertEqual(code, 1)
+        self.assertIn("has no row starting '├── editor.rs'", out)
+        self.assertEqual(self.root.read(mi.ARCH), no_row)
+        self.assertEqual(self.root.read(SPLIT.source), EDITOR)
+        self.assertFalse((self.tmp / "src/widgets/editor/tests.rs").exists())
+        self.assertFalse((self.tmp / mi.NOTES / "2062-split-editor-tests.md").exists())
+
+    def test_a_docs_tree_without_the_files_row_stops_a_move_before_anything_is_written(self):
+        no_row = WIDGETS.replace("    ├── editor.rs             The editor.\n", "")
+        (self.tmp / mi.ARCH).write_text(no_row)
+        with self.assertRaises(mi.ManifestError):
+            quiet(mi.move, str(self.tmp), 1, False, False, SPLIT)
+        self.assertEqual(self.root.read(mi.ARCH), no_row)
+        self.assertEqual(self.root.read(SPLIT.source), EDITOR)
+        self.assertFalse((self.tmp / "src/widgets/editor").exists())
+
     def test_a_move_goes_to_a_file_in_the_folder_beside_the_split_file(self):
         quiet(mi.move, str(self.tmp), 1, False, False, SPLIT)
         undo = self.root.read("src/widgets/editor/undo.rs")
