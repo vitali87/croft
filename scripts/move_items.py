@@ -742,9 +742,9 @@ def glob_line(lines, file):
     return next((n for n, ln in enumerate(lines) if ln == f"use {file}::*;"), None)
 
 
-def fix_glue(lines, app, tests, homes):
+def fix_glue(lines, app, tests, homes, scope="app"):
     """mod.rs `lines` with the glue the build errors ask for, and what was
-    done. `app` and `tests` are the errors of the two builds; `homes` maps a
+    done. `scope` names the module being split, for the messages. `app` and `tests` are the errors of the two builds; `homes` maps a
     moved free item's name to (file, visibility). Raises BuildError when an
     error is not one this fixes."""
     lines, done, unknown = list(lines), [], []
@@ -763,12 +763,12 @@ def fix_glue(lines, app, tests, homes):
     for name in sorted(private):
         file, vis = homes[name]
         if vis not in ("pub", "pub(crate)"):
-            raise BuildError(f"{name} is used outside app but is {vis or 'private'} in {file}.rs")
+            raise BuildError(f"{name} is used outside {scope} but is {vis or 'private'} in {file}.rs")
         at = glob_line(lines, file)
         if at is None:
             at = next(n for n, ln in enumerate(lines) if ln == f"mod {file};")
         lines.insert(at + 1, f"{vis} use {file}::{name};")
-        done.append(f"re-exported {file}::{name} ({vis}): used outside app")
+        done.append(f"re-exported {file}::{name} ({vis}): used outside {scope}")
     for file in sorted(unused["app"] | unused["tests"]):
         at = glob_line(lines, file)
         guarded = at > 0 and lines[at - 1].startswith("#[cfg(")
@@ -807,7 +807,7 @@ def settle(root, rows, rounds=5, t=APP):
         homes = {n: (f, vis[(f, n)]) for n, f in homes.items() if (f, n) in vis}
         with open(mod_path, encoding="utf-8") as f:
             lines = f.read().split("\n")
-        lines, now = fix_glue(lines, app, tests, homes)
+        lines, now = fix_glue(lines, app, tests, homes, t.name)
         with open(mod_path, "w", encoding="utf-8") as f:
             f.write("\n".join(lines))
         subprocess.run(["cargo", "fmt"], cwd=root, check=True)

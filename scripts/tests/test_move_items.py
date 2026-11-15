@@ -330,6 +330,9 @@ class Helpers(unittest.TestCase):
                                       "pub(crate) use remote_sessions::takeover_mode_seq;",
                                       "use settings::*;", "pub use settings::SideBarPosition;"])
         self.assertEqual(len(done), 2)
+        self.assertTrue(all(d.endswith("used outside app") for d in done), done)
+        _, done = mi.fix_glue(self.GLUE, errors, errors, homes, "editor")
+        self.assertTrue(all(d.endswith("used outside editor") for d in done), done)
 
     def test_a_glob_only_the_tests_need_is_kept_for_the_tests_and_an_unneeded_one_goes(self):
         app = [("unused_imports", "unused import: `commands::*`"),
