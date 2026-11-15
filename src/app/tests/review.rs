@@ -796,6 +796,7 @@ fn review_boxes_follow_the_open_file_through_a_rename() {
     app.prompt = Some(super::Prompt {
         label: String::from("Rename a.rs"),
         buffer: String::from("renamed.rs"),
+        caret: usize::MAX,
         kind: super::PromptKind::Rename(old.clone()),
         target_dir: tmp.path().to_path_buf(),
         error: None,

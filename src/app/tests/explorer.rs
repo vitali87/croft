@@ -3277,3 +3277,118 @@ fn a_click_on_the_explorer_outline_still_jumps_with_the_secondary_bar_up() {
         "the caret moves to sym_004's line"
     );
 }
+
+fn new_file_prompt(app: &mut App, tmp: &std::path::Path) {
+    app.open_create_prompt(CreateKind::File, tmp.to_path_buf());
+}
+
+fn type_into_prompt(app: &mut App, text: &str) {
+    for c in text.chars() {
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::NONE))
+            .unwrap();
+    }
+}
+
+#[test]
+fn the_new_file_prompt_edits_at_a_caret() {
+    // New File, New Folder and Rename used to append and pop at the end only:
+    // a typo in the middle of a name meant retyping the tail.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    new_file_prompt(&mut app, tmp.path());
+    type_into_prompt(&mut app, "mian.rs");
+    // Six Lefts put the caret after the "m"; drop the "i", step over the "a"
+    // and put the "i" back where it belongs.
+    for _ in 0..6 {
+        app.handle_key(key(KeyCode::Left, KeyModifiers::NONE))
+            .unwrap();
+    }
+    app.handle_key(key(KeyCode::Delete, KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Right, KeyModifiers::NONE))
+        .unwrap();
+    type_into_prompt(&mut app, "i");
+    let p = app.prompt.as_ref().expect("prompt stays open");
+    assert_eq!(p.buffer, "main.rs");
+    app.handle_key(key(KeyCode::Home, KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Delete, KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::End, KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Backspace, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.prompt.as_ref().unwrap().buffer, "ain.r");
+}
+
+#[test]
+fn the_new_file_prompt_walks_and_deletes_by_word_and_takes_a_paste_at_the_caret() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    new_file_prompt(&mut app, tmp.path());
+    type_into_prompt(&mut app, "docs/old name.md");
+    app.handle_key(key(KeyCode::Backspace, KeyModifiers::CONTROL))
+        .unwrap();
+    assert_eq!(app.prompt.as_ref().unwrap().buffer, "docs/old name.");
+    app.handle_key(key(KeyCode::Left, KeyModifiers::CONTROL))
+        .unwrap();
+    app.handle_paste("X\nY");
+    let p = app.prompt.as_ref().unwrap();
+    assert_eq!(
+        p.buffer, "docs/old XYname.",
+        "paste drops the newline and lands at the caret"
+    );
+}
+
+#[test]
+fn a_paste_with_quick_open_over_the_new_file_prompt_goes_to_quick_open() {
+    // Quick Open opens over a prompt without closing it and takes the keys
+    // typed into it; a paste must follow the keys, not change the name the
+    // prompt is holding underneath.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    new_file_prompt(&mut app, tmp.path());
+    type_into_prompt(&mut app, "main.rs");
+    app.handle_key(key(KeyCode::Char('p'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert!(app.file_finder.is_some(), "Ctrl+P opens Quick Open");
+    assert!(app.prompt.is_some(), "the prompt stays open underneath");
+    app.handle_paste("lib.rs");
+    assert_eq!(app.file_finder.as_ref().unwrap().query, "lib.rs");
+    assert_eq!(app.prompt.as_ref().unwrap().buffer, "main.rs");
+}
+
+#[test]
+fn a_paste_with_a_modal_over_the_new_file_prompt_leaves_the_name_alone() {
+    // A picker or dialog with no text field of its own, opened over a
+    // prompt, takes its keys; a paste then must not edit the hidden name.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    new_file_prompt(&mut app, tmp.path());
+    type_into_prompt(&mut app, "main.rs");
+    app.open_shortcuts_modal();
+    app.handle_paste("lib.rs");
+    assert_eq!(app.prompt.as_ref().unwrap().buffer, "main.rs");
+    assert!(
+        !app.editor.lines.join("\n").contains("lib.rs"),
+        "nor does the paste fall through to the editor behind"
+    );
+}
+
+#[test]
+fn ctrl_v_as_a_key_pastes_into_the_new_file_prompt_at_the_caret() {
+    // A host with bracketed paste off sends Ctrl/Cmd+V as a key; the prompt
+    // reads the clipboard itself, as Quick Open does, instead of dropping it.
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.clipboard_reader = || Some(String::from("lib\n"));
+    new_file_prompt(&mut app, tmp.path());
+    type_into_prompt(&mut app, "src/.rs");
+    for _ in 0..3 {
+        app.handle_key(key(KeyCode::Left, KeyModifiers::NONE))
+            .unwrap();
+    }
+    app.handle_key(key(KeyCode::Char('v'), KeyModifiers::CONTROL))
+        .unwrap();
+    assert_eq!(app.prompt.as_ref().unwrap().buffer, "src/lib.rs");
+}
