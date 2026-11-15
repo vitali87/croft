@@ -18,12 +18,13 @@ croft ~/proj --open-file a.rs --zen  # ...focused on just the file (no sidebar/t
 
 ```bash
 croft remote <host>          # launch croft over SSH on a Linux server (host from ~/.ssh/config)
-croft devcontainer [folder]  # open a folder inside its dev container (.devcontainer/devcontainer.json)
+croft devcontainer [folder]              # open a folder inside its dev container
+croft devcontainer --config native       # the `.devcontainer/native` config, from this folder
 ```
 
 `croft remote <host>` installs itself on the box on first connect with no manual prep, and a stock cloud image works as-is. See [LINUX.md](LINUX.md#remote-croft-remote-host) for how the cross-compile and host provisioning work.
 
-`croft devcontainer` builds or pulls the image in `devcontainer.json`, starts the container with the folder mounted, runs `postCreateCommand` once, installs croft into it the same way, and runs it there. It supports `image`, `build`, `mounts`, `forwardPorts`, `postCreateCommand`, `workspaceFolder`, `containerEnv`, `remoteUser` and `runArgs`. The next run reuses the container. When `devcontainer.json` has changed since (comments and formatting don't count), it keeps the container and says so, since replacing it discards everything made inside it. `--rebuild` replaces it, and refuses while croft is still running in it from another terminal.
+`croft devcontainer` builds or pulls the image in `devcontainer.json`, starts the container with the folder mounted, runs `postCreateCommand` once, installs croft into it the same way, and runs it there. A single `.devcontainer/devcontainer.json` or `.devcontainer.json` is used as before. Several configs live in `.devcontainer/<name>/devcontainer.json` (for example `native` and `cross`); pass `--config <name>`. With no name, the names are listed and nothing is started. Each name keeps its own container. It supports `image`, `build`, `mounts`, `forwardPorts`, `postCreateCommand`, `workspaceFolder`, `containerEnv`, `remoteUser` and `runArgs`. The next run reuses the container. When `devcontainer.json` has changed since (comments and formatting don't count), it keeps the container and says so, since replacing it discards everything made inside it. `--rebuild` replaces it, and refuses while croft is still running in it from another terminal.
 
 ## Persistent sessions
 

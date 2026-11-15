@@ -434,12 +434,18 @@ pub enum CliCommand {
     // Issue #617.
     /// Open a workspace inside its dev container.
     ///
-    /// Reads `.devcontainer/devcontainer.json`, builds or pulls the image,
-    /// starts (or reuses) the container, runs `postCreateCommand` once,
-    /// installs croft into it and runs it there on this terminal.
+    /// Reads `.devcontainer/devcontainer.json`, or one of
+    /// `.devcontainer/<name>/devcontainer.json` when the workspace has
+    /// several. Builds or pulls the image, starts (or reuses) that config's
+    /// container, runs `postCreateCommand` once, installs croft into it and
+    /// runs it there on this terminal.
     Devcontainer {
         /// Workspace folder (default: the current directory).
         path: Option<std::path::PathBuf>,
+        /// Which config to use. See `devcontainer::list_configs`. Leaving this
+        /// off uses the only config, or lists the names.
+        #[arg(long, value_name = "NAME")]
+        config: Option<String>,
         /// Replace the existing container, discarding changes made inside
         /// it. Without it, an edited config keeps the container and says so.
         #[arg(long, default_value_t = false)]
@@ -895,9 +901,13 @@ impl Cli {
                 );
                 Ok(())
             }
-            Some(CliCommand::Devcontainer { path, rebuild }) => {
+            Some(CliCommand::Devcontainer {
+                path,
+                config,
+                rebuild,
+            }) => {
                 let root = path.unwrap_or_else(|| std::path::PathBuf::from("."));
-                crate::devcontainer::up_and_attach(&root, rebuild)
+                crate::devcontainer::up_and_attach(&root, config.as_deref(), rebuild)
             }
             Some(CliCommand::Pair {
                 workspace,

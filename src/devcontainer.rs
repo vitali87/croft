@@ -1,17 +1,21 @@
-//! Dev Containers (#617): `croft devcontainer [path]`.
+//! Dev Containers (#617): `croft devcontainer [path] --config <name>`.
 //!
 //! Reads the workspace's `.devcontainer/devcontainer.json` (or
-//! `.devcontainer.json`), builds or pulls its image, starts a container with
-//! the workspace mounted, runs `postCreateCommand` once, installs a croft
-//! binary into it the way `croft <host>` provisions a remote (a static musl
-//! cross-build when the toolchain is there), then runs croft inside it on
-//! this terminal.
+//! `.devcontainer.json`). A workspace with several configs keeps each in
+//! `.devcontainer/<name>/devcontainer.json`. `--config <name>` selects one
+//! (`list_configs`). With none given, the only config is used, or the names
+//! are listed. It builds or
+//! pulls the image, starts a container with the workspace mounted, runs
+//! `postCreateCommand` once, installs a croft binary into it the way
+//! `croft <host>` provisions a remote (a static musl cross-build when the
+//! toolchain is there), then runs croft inside it on this terminal.
 //!
-//! The container is labelled with the workspace path and a hash of the
-//! config, so the next run reattaches to it (starting it if stopped) instead
-//! of creating another. An edited config is only reported (#1110): replacing
-//! the container is `--rebuild`'s job, since it throws away everything made
-//! inside it, and kills a croft still running there with its unsaved edits.
+//! The container is labelled with the workspace path, the config name and a
+//! hash of the config, so the next run reattaches to that config's container
+//! (starting it if stopped) instead of creating another. An edited config is
+//! only reported (#1110): replacing the container is `--rebuild`'s job, since
+//! it throws away everything made inside it, and kills a croft still running
+//! there with its unsaved edits.
 //!
 //! Supported keys: `image`, `build` (`dockerfile`, `context`, `args`),
 //! `mounts`, `forwardPorts`, `postCreateCommand`, plus `workspaceFolder`,
@@ -27,8 +31,137 @@ use std::process::{Command, Stdio};
 const CONTAINER_BINARY: &str = "/usr/local/bin/croft";
 /// Label naming the workspace a container belongs to.
 const WORKSPACE_LABEL: &str = "croft.devcontainer";
+/// Label naming which config it is. See `list_configs`.
+const ID_LABEL: &str = "croft.devcontainer.id";
+/// Id of `.devcontainer/devcontainer.json`.
+const FLAT_CONFIG_ID: &str = "single/folder";
+/// Id of `.devcontainer.json` at the workspace root.
+const ROOT_CONFIG_ID: &str = "single/file";
 /// Label holding the hash of the config the container was made from.
 const CONFIG_LABEL: &str = "croft.devcontainer.config";
+
+/// One `devcontainer.json` in a workspace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigFile {
+    /// See `list_configs`.
+    pub id: String,
+    pub path: PathBuf,
+}
+
+/// Every dev container config in `root`, in id order.
+pub fn list_configs(root: &Path) -> Vec<ConfigFile> {
+    let flat = [
+        root.join(".devcontainer").join("devcontainer.json"),
+        root.join(".devcontainer.json"),
+    ];
+    let flats: Vec<PathBuf> = flat.into_iter().filter(|p| p.is_file()).collect();
+    let mut named = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(root.join(".devcontainer")) {
+        for ent in rd.flatten() {
+            if !ent.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let path = ent.path().join("devcontainer.json");
+            if path.is_file() {
+                if let Some(id) = ent.file_name().to_str() {
+                    named.push(ConfigFile {
+                        id: id.to_string(),
+                        path,
+                    });
+                }
+            }
+        }
+    }
+    let mut out: Vec<ConfigFile> = flats
+        .into_iter()
+        .map(|path| {
+            let id = if path.ends_with(".devcontainer.json") && path.parent() == Some(root) {
+                String::from(ROOT_CONFIG_ID)
+            } else {
+                String::from(FLAT_CONFIG_ID)
+            };
+            ConfigFile { id, path }
+        })
+        .chain(named)
+        .collect();
+    out.sort_by(|a, b| a.id.cmp(&b.id));
+    out
+}
+
+/// The config `name` asks for, or the only one when `name` is absent.
+pub fn resolve_config(root: &Path, name: Option<&str>) -> Result<ConfigFile> {
+    let configs = list_configs(root);
+    if configs.is_empty() {
+        bail!(
+            "no .devcontainer/devcontainer.json, .devcontainer/<name>/devcontainer.json \
+             or .devcontainer.json in {}",
+            root.display()
+        );
+    }
+    match name {
+        None if configs.len() == 1 => Ok(configs.into_iter().next().unwrap()),
+        None => bail!(
+            "{}",
+            config_choices(
+                "several dev containers; pass --config with one of",
+                &configs
+            )
+        ),
+        Some(want) => {
+            let hits: Vec<_> = configs.iter().filter(|c| c.id == want).cloned().collect();
+            match hits.len() {
+                1 => Ok(hits.into_iter().next().unwrap()),
+                0 => bail!(
+                    "{}",
+                    config_choices(
+                        &format!("no dev container named `{want}`; pass --config with one of"),
+                        &configs
+                    )
+                ),
+                _ => bail!(
+                    "more than one dev container is named `{want}`:\n{}",
+                    hits.iter()
+                        .map(|c| format!("  {}", c.path.display()))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                ),
+            }
+        }
+    }
+}
+
+/// `id - <json name>` lines, the json `name` omitted when it matches the id
+/// or the file does not parse.
+fn config_choices(head: &str, configs: &[ConfigFile]) -> String {
+    let mut out = format!("{head}:");
+    for c in configs {
+        let id = &c.id;
+        match display_name(&c.path) {
+            Some(title) if title != c.id => out.push_str(&format!("\n  {id} - {title}")),
+            _ => out.push_str(&format!("\n  {id}")),
+        }
+    }
+    out
+}
+
+/// An unlabelled container (made before configs had ids) belongs to a flat
+/// file only. The flat `.devcontainer/devcontainer.json` owns it whenever
+/// that file exists; `.devcontainer.json` owns it only when it is the only
+/// flat file. A folder named `default` never does.
+fn reuses_unlabelled_container(root: &Path, config: &ConfigFile) -> bool {
+    let primary = root.join(".devcontainer").join("devcontainer.json");
+    if config.path == primary {
+        return true;
+    }
+    config.path == root.join(".devcontainer.json") && !primary.is_file()
+}
+
+fn display_name(path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let v: Value = serde_json::from_str(&crate::jsonc::strip_jsonc(&text)).ok()?;
+    let name = v.get("name").and_then(Value::as_str)?.trim();
+    (!name.is_empty()).then(|| name.to_string())
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Source {
@@ -54,16 +187,6 @@ pub struct DevContainer {
     pub env: Vec<(String, String)>,
     pub remote_user: Option<String>,
     pub run_args: Vec<String>,
-}
-
-/// The config file for workspace `root`, if it has one.
-pub fn find_config(root: &Path) -> Option<PathBuf> {
-    [
-        root.join(".devcontainer").join("devcontainer.json"),
-        root.join(".devcontainer.json"),
-    ]
-    .into_iter()
-    .find(|p| p.is_file())
 }
 
 /// Expand `${localWorkspaceFolder}`, `${localWorkspaceFolderBasename}`,
@@ -274,16 +397,17 @@ fn hash(s: &str) -> String {
     format!("{h:016x}")
 }
 
-/// The tag a `build` config's image gets.
-fn image_tag(root: &Path) -> String {
+/// The tag a `build` config's image gets. `id` keeps two configs in one
+/// workspace from sharing a tag.
+fn image_tag(root: &Path, id: &str) -> String {
     format!(
         "croft-devcontainer-{}",
-        &hash(&root.display().to_string())[..12]
+        &hash(&format!("{}\0{id}", root.display()))[..12]
     )
 }
 
 /// `docker build` arguments for a `build` config, `None` for an `image`.
-pub fn build_args(dc: &DevContainer, root: &Path) -> Option<Vec<String>> {
+pub fn build_args(dc: &DevContainer, root: &Path, id: &str) -> Option<Vec<String>> {
     let Source::Build {
         dockerfile,
         context,
@@ -295,7 +419,7 @@ pub fn build_args(dc: &DevContainer, root: &Path) -> Option<Vec<String>> {
     let mut out = vec![
         "build".to_string(),
         "-t".into(),
-        image_tag(root),
+        image_tag(root, id),
         "-f".into(),
         dockerfile.display().to_string(),
     ];
@@ -308,10 +432,10 @@ pub fn build_args(dc: &DevContainer, root: &Path) -> Option<Vec<String>> {
 }
 
 /// `docker run` arguments that create the container.
-pub fn run_args(dc: &DevContainer, root: &Path, config_hash: &str) -> Vec<String> {
+pub fn run_args(dc: &DevContainer, root: &Path, id: &str, config_hash: &str) -> Vec<String> {
     let image = match &dc.source {
         Source::Image(i) => i.clone(),
-        Source::Build { .. } => image_tag(root),
+        Source::Build { .. } => image_tag(root, id),
     };
     let mut out = vec![
         "run".to_string(),
@@ -319,6 +443,8 @@ pub fn run_args(dc: &DevContainer, root: &Path, config_hash: &str) -> Vec<String
         "--init".into(),
         "--label".into(),
         format!("{WORKSPACE_LABEL}={}", root.display()),
+        "--label".into(),
+        format!("{ID_LABEL}={id}"),
         "--label".into(),
         format!("{CONFIG_LABEL}={config_hash}"),
         "--mount".into(),
@@ -355,7 +481,7 @@ pub fn run_args(dc: &DevContainer, root: &Path, config_hash: &str) -> Vec<String
 /// `docker run` are given and the `postCreateCommand`s, not of the file's
 /// text (#1110), so a comment or a reformat is no change. Keys used only at
 /// attach time, such as `remoteUser`, need no new container and are left out.
-fn config_hash(dc: &DevContainer, root: &Path) -> String {
+fn config_hash(dc: &DevContainer, root: &Path, id: &str) -> String {
     // `containerEnv` and `build.args` keep the file's key order, which
     // means nothing to the container.
     let mut dc = dc.clone();
@@ -363,8 +489,8 @@ fn config_hash(dc: &DevContainer, root: &Path) -> String {
     if let Source::Build { args, .. } = &mut dc.source {
         args.sort();
     }
-    let mut parts = run_args(&dc, root, "");
-    parts.extend(build_args(&dc, root).unwrap_or_default());
+    let mut parts = run_args(&dc, root, id, "");
+    parts.extend(build_args(&dc, root, id).unwrap_or_default());
     for argv in &dc.post_create {
         parts.push(String::from("postCreateCommand"));
         parts.extend(argv.iter().cloned());
@@ -457,26 +583,47 @@ fn binary_for(arch: &str) -> Result<PathBuf> {
 }
 
 /// Bring up `root`'s dev container and run croft in it on this terminal.
-pub fn up_and_attach(root: &Path, rebuild: bool) -> Result<()> {
+/// `name` selects a config (`list_configs`). Leaving it off uses the only
+/// config, or lists them.
+pub fn up_and_attach(root: &Path, name: Option<&str>, rebuild: bool) -> Result<()> {
     let root = root
         .canonicalize()
         .with_context(|| format!("opening {}", root.display()))?;
-    let Some(config) = find_config(&root) else {
-        bail!(
-            "no .devcontainer/devcontainer.json or .devcontainer.json in {}",
-            root.display()
-        );
-    };
-    let text = std::fs::read_to_string(&config)
-        .with_context(|| format!("reading {}", config.display()))?;
-    let mut dc = parse(&text, &config, &root, &|k| std::env::var(k).ok())?;
-    let config_hash = config_hash(&dc, &root);
+    let config = resolve_config(&root, name)?;
+    let id = config.id.clone();
+    let text = std::fs::read_to_string(&config.path)
+        .with_context(|| format!("reading {}", config.path.display()))?;
+    let mut dc = parse(&text, &config.path, &root, &|k| std::env::var(k).ok())?;
+    let config_hash = config_hash(&dc, &root, &id);
 
     let label = format!("label={WORKSPACE_LABEL}={}", root.display());
-    let mut container = docker_out(&["ps", "-aq", "--filter", &label])?
+    let id_label = format!("label={ID_LABEL}={id}");
+    let mut container = docker_out(&["ps", "-aq", "--filter", &label, "--filter", &id_label])?
         .lines()
         .next()
         .map(str::to_string);
+    // A container made before configs were named carries only the workspace
+    // label. Reuse it for the flat file that owned the workspace then, not
+    // for `.devcontainer/<name>/` (including a folder named `default`).
+    if container.is_none() && reuses_unlabelled_container(&root, &config) {
+        if let Ok(ids) = docker_out(&["ps", "-aq", "--filter", &label]) {
+            for cid in ids.lines().filter(|l| !l.is_empty()) {
+                // Fail closed: an inspect error is not evidence the container
+                // has no config id. Only a successful read of an absent label
+                // means this is the pre-naming container.
+                let got = docker_out(&[
+                    "inspect",
+                    "-f",
+                    &format!("{{{{index .Config.Labels \"{ID_LABEL}\"}}}}"),
+                    cid,
+                ])?;
+                if got.is_empty() || got == "<no value>" {
+                    container = Some(cid.to_string());
+                    break;
+                }
+            }
+        }
+    }
     if let Some(id) = container.clone() {
         if rebuild {
             // Fail closed: a check that can't be made is no evidence that
@@ -531,7 +678,7 @@ pub fn up_and_attach(root: &Path, rebuild: bool) -> Result<()> {
             id
         }
         None => {
-            if let Some(args) = build_args(&dc, &root) {
+            if let Some(args) = build_args(&dc, &root, &id) {
                 step("building the image");
                 let status = docker(&args)?;
                 if !status.success() {
@@ -539,7 +686,7 @@ pub fn up_and_attach(root: &Path, rebuild: bool) -> Result<()> {
                 }
             }
             step("creating the container");
-            let args = run_args(&dc, &root, &config_hash);
+            let args = run_args(&dc, &root, &id, &config_hash);
             let refs: Vec<&str> = args.iter().map(String::as_str).collect();
             let id = docker_out(&refs)?;
             for argv in &dc.post_create {
@@ -691,14 +838,15 @@ mod tests {
             r#"{ "build": { "dockerfile": "Dockerfile" }, "forwardPorts": [3000],
                  "mounts": ["type=volume,target=/x"], "runArgs": ["--cap-add=SYS_PTRACE"] }"#,
         );
-        let build = build_args(&dc, root).unwrap();
-        let tag = image_tag(root);
+        let build = build_args(&dc, root, "default").unwrap();
+        let tag = image_tag(root, "default");
         assert_eq!(build[..3], ["build".to_string(), "-t".into(), tag.clone()]);
         assert_eq!(build.last().unwrap(), "/home/me/proj/.devcontainer/.");
 
-        let run = run_args(&dc, root, "abc");
+        let run = run_args(&dc, root, "default", "abc");
         let joined = run.join(" ");
         assert!(joined.contains("--label croft.devcontainer=/home/me/proj"));
+        assert!(joined.contains("--label croft.devcontainer.id=default"));
         assert!(joined.contains("--label croft.devcontainer.config=abc"));
         assert!(joined.contains("-p 127.0.0.1:3000:3000"));
         assert!(joined.contains("--mount type=volume,target=/x"));
@@ -718,7 +866,7 @@ mod tests {
     #[test]
     fn the_config_hash_ignores_comments_and_formatting() {
         let root = Path::new("/home/me/proj");
-        let of = |text: &str| config_hash(&parse_str(text), root);
+        let of = |text: &str| config_hash(&parse_str(text), root, "default");
         let base = of(r#"{ "image": "ubuntu:24.04", "postCreateCommand": "make" }"#);
         for same in [
             "// Set up.\n{\n  \"image\": \"ubuntu:24.04\",\n  \"postCreateCommand\": \"make\", // why\n}\n",
@@ -768,6 +916,124 @@ mod tests {
         )));
         assert!(!croft_attached(&top("/home/me/bin/croft-helper")));
         assert!(!croft_attached(""));
+    }
+
+    #[test]
+    fn named_configs_are_listed_and_selected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let native = root.join(".devcontainer/native");
+        let cross = root.join(".devcontainer/cross");
+        std::fs::create_dir_all(&native).unwrap();
+        std::fs::create_dir_all(&cross).unwrap();
+        std::fs::write(
+            native.join("devcontainer.json"),
+            r#"{ "name": "Native build", "image": "native" }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            cross.join("devcontainer.json"),
+            r#"{ "name": "Cross build", "image": "cross" }"#,
+        )
+        .unwrap();
+
+        let ids: Vec<_> = list_configs(root).into_iter().map(|c| c.id).collect();
+        assert_eq!(ids, ["cross", "native"]);
+        assert!(
+            resolve_config(root, None)
+                .unwrap_err()
+                .to_string()
+                .contains("native - Native build")
+        );
+        assert_eq!(
+            resolve_config(root, Some("native")).unwrap().path,
+            native.join("devcontainer.json")
+        );
+        assert!(
+            resolve_config(root, Some("nope"))
+                .unwrap_err()
+                .to_string()
+                .contains("cross - Cross build")
+        );
+    }
+
+    #[test]
+    fn a_single_flat_config_uses_its_path_as_the_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let dir = root.join(".devcontainer");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("devcontainer.json"), r#"{ "image": "u" }"#).unwrap();
+        let found = resolve_config(root, None).unwrap();
+        assert_eq!(found.id, "single/folder");
+        assert_eq!(found.path, dir.join("devcontainer.json"));
+        assert_eq!(
+            resolve_config(root, Some("single/folder")).unwrap().path,
+            dir.join("devcontainer.json")
+        );
+    }
+
+    #[test]
+    fn flat_ids_stay_put_when_another_config_appears() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let flat = root.join(".devcontainer/devcontainer.json");
+        let named = root.join(".devcontainer/default/devcontainer.json");
+        let root_json = root.join(".devcontainer.json");
+        std::fs::create_dir_all(named.parent().unwrap()).unwrap();
+        std::fs::write(&flat, r#"{ "name": "Flat", "image": "flat" }"#).unwrap();
+        std::fs::write(&named, r#"{ "name": "Named default", "image": "named" }"#).unwrap();
+        std::fs::write(&root_json, r#"{ "image": "root" }"#).unwrap();
+
+        let ids: Vec<_> = list_configs(root).into_iter().map(|c| c.id).collect();
+        assert_eq!(ids, ["default", "single/file", "single/folder"]);
+        assert_eq!(
+            resolve_config(root, Some("single/folder")).unwrap().path,
+            flat
+        );
+        assert_eq!(
+            resolve_config(root, Some("single/file")).unwrap().path,
+            root_json
+        );
+        assert_eq!(resolve_config(root, Some("default")).unwrap().path, named);
+        let listed = resolve_config(root, None).unwrap_err().to_string();
+        assert!(listed.contains("single/folder - Flat"), "{listed}");
+        assert!(reuses_unlabelled_container(
+            root,
+            &resolve_config(root, Some("single/folder")).unwrap()
+        ));
+        assert!(!reuses_unlabelled_container(
+            root,
+            &resolve_config(root, Some("default")).unwrap()
+        ));
+        assert!(!reuses_unlabelled_container(
+            root,
+            &resolve_config(root, Some("single/file")).unwrap()
+        ));
+    }
+
+    #[test]
+    fn a_lone_root_devcontainer_json_keeps_the_unlabelled_container() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let path = root.join(".devcontainer.json");
+        std::fs::write(&path, r#"{ "image": "root" }"#).unwrap();
+        let found = resolve_config(root, None).unwrap();
+        assert_eq!(found.id, "single/file");
+        assert!(reuses_unlabelled_container(root, &found));
+        assert!(resolve_config(root, Some("single/folder")).is_err());
+    }
+
+    #[test]
+    fn image_tags_differ_by_config_name() {
+        let root = Path::new("/home/me/proj");
+        assert_ne!(image_tag(root, "native"), image_tag(root, "cross"));
+        let dc = parse_str(r#"{ "build": { "dockerfile": "Dockerfile" } }"#);
+        let native = run_args(&dc, root, "native", "abc").join(" ");
+        let cross = run_args(&dc, root, "cross", "abc").join(" ");
+        assert!(native.contains("--label croft.devcontainer.id=native"));
+        assert!(cross.contains("--label croft.devcontainer.id=cross"));
+        assert_ne!(native, cross);
     }
 
     #[test]
