@@ -131,6 +131,7 @@ src/
 │   ├── editor_input.rs  editor keys, vim mode, macros, multi-cursor, clipboard and paste routing
 │   ├── editor_tabs.rs   tabs and editor groups, Go Back/Forward, bookmarks, new windows
 │   ├── explorer.rs      file tree, Explorer sections, workspace folders, re-rooting, outside changes
+│   ├── frame.rs         drawing each frame (`render`), status-bar text, caret visibility
 │   ├── fs_watch.rs      filesystem watch + poll fallback feeding tree / editor / terminal refresh. The poll stats the file behind EVERY open tab, not just the focused one: a boundary dir carries no watch at all (see the storm rules — never root a stream at or above `target/`, `node_modules/`, `.git/`) and an in-place write does not move its parent dir's mtime, so for a file sitting directly in one this stat is the only thing that can notice a change; cost is one stat per open tab per (adaptively backed-off) tick
 │   ├── git_worker.rs    off-thread git status / changes worker
 │   ├── host_integration.rs host-terminal sequences and restore, panic log, croft view socket, self-update
