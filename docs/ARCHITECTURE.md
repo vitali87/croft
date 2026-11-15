@@ -218,6 +218,7 @@ src/
     ├── editor/               the editor's feature files, beside editor.rs; each file's `//!` doc says what it holds
     │   ├── diff_view.rs     side-by-side and inline diffs, merge panes, conflicts, a file at a commit
     │   ├── disk.rs          opening, reloading and saving: encodings, line endings, outside changes, save cleanups
+    │   ├── folding.rs       fold ranges and hidden lines, #region markers, indent guides
     │   ├── gutter.rs        breakpoints, bookmarks, git marks and blame, overview ruler, line numbers
     │   ├── highlighting.rs  syntax highlight passes, colours carried across edits, bracket colours, swatches
     │   ├── lsp_overlays.rs  semantic tokens, inlay hints, diagnostics, links, code lenses, ghost text
