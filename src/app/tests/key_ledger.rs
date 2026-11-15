@@ -403,27 +403,6 @@ fn the_ledger_reads_a_hint_as_the_keys_linux_presses() {
     );
 }
 
-/// F1 rows with a key the key check they name does not take, and why: bugs
-/// in the sheet, each to be fixed in a change of its own. The ledger presses
-/// the keys the row names all the same.
-const MISLABELLED_F1_ROWS: &[(&str, &str)] = &[
-    (
-        "Cmd+Shift+O",
-        "opening a line above moved to Cmd/Ctrl+Shift+Enter; the chord the row \
-         names opens Go to Symbol",
-    ),
-    (
-        "Cmd/Ctrl+Shift+\\",
-        "Go to Bracket has no Ctrl form off macOS (LINUX.md): Linux takes \
-         Super+Shift+\\ only, and the row's Ctrl+Shift+\\ does nothing there",
-    ),
-    (
-        "Cmd/Ctrl+Opt+\\",
-        "Select to Bracket has no Ctrl form off macOS (LINUX.md): Linux takes \
-         Super+Alt+\\ only, and the row's Ctrl+Alt+\\ does nothing there",
-    ),
-];
-
 /// An F1 row names the key check that answers it in `handler`: every key the
 /// row lists must be one a check it names takes, and each check it names must
 /// take one of them, or the ledger presses another chord than the one the row
@@ -465,13 +444,9 @@ fn every_f1_row_with_a_key_predicate_names_keys_its_predicate_takes() {
                 }
                 untaken.retain(|k| !takes(k));
             }
-            let taken = untaken.is_empty() && idle.is_empty();
-            let known = MISLABELLED_F1_ROWS
-                .iter()
-                .any(|(keys, _)| *keys == entry.keys);
-            if taken == known {
+            if !untaken.is_empty() || !idle.is_empty() {
                 wrong.push(format!(
-                    "{row} {} listed={known}: no check takes `{}`, taking none: {idle:?}",
+                    "{row} {}: no check takes `{}`, taking none: {idle:?}",
                     entry.handler,
                     spell(&untaken)
                 ));
@@ -480,8 +455,7 @@ fn every_f1_row_with_a_key_predicate_names_keys_its_predicate_takes() {
     }
     assert!(
         wrong.is_empty(),
-        "every key an F1 row lists must be one its handler takes; a row with \
-         one that is not is in MISLABELLED_F1_ROWS until it is fixed:\n{}",
+        "every key an F1 row lists must be one its handler takes:\n{}",
         wrong.join("\n")
     );
 }

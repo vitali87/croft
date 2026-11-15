@@ -95,7 +95,6 @@ editor | ctrl+alt+, | status="No bookmarks in this file (Cmd+Opt+Shift+K sets on
 editor | ctrl+alt+- | tabs=*● main.rs text=15L#247221d3 caret=4:20
 editor | ctrl+alt+. | status="No bookmarks in this file (Cmd+Opt+Shift+K sets one)"
 editor | ctrl+alt+= | tabs=*● main.rs text=15L#91ea7155 caret=4:20
-editor | ctrl+alt+\ | -
 editor | ctrl+alt+b | status="Secondary side bar shown" +aux
 editor | ctrl+alt+c | status="Copied path: <root>/main.rs" clip="<root>/main.rs"
 editor | ctrl+alt+down | carets=5:8
@@ -221,7 +220,6 @@ editor | ctrl+s | status="Saved <root>/main.rs"
 editor | ctrl+shift+- | status="No forward location"
 editor | ctrl+shift+. | +menu(".vscode/" > "main.rs")
 editor | ctrl+shift+/ | -
-editor | ctrl+shift+\ | -
 editor | ctrl+shift+b | status="No build task detected; pick one"
 editor | ctrl+shift+c | -
 editor | ctrl+shift+d | focus=side side=RunDebug
@@ -364,7 +362,6 @@ selection | ctrl+alt+, | status="No bookmarks in this file (Cmd+Opt+Shift+K sets
 selection | ctrl+alt+- | tabs=*● main.rs text=15L#247221d3 caret=4:20 sel=-
 selection | ctrl+alt+. | status="No bookmarks in this file (Cmd+Opt+Shift+K sets one)"
 selection | ctrl+alt+= | tabs=*● main.rs text=15L#91ea7155 caret=4:20 sel=-
-selection | ctrl+alt+\ | -
 selection | ctrl+alt+b | status="Secondary side bar shown" +aux
 selection | ctrl+alt+c | status="Copied path: <root>/main.rs" clip="<root>/main.rs"
 selection | ctrl+alt+down | carets=5:13
@@ -490,7 +487,6 @@ selection | ctrl+s | status="Saved <root>/main.rs"
 selection | ctrl+shift+- | status="No forward location"
 selection | ctrl+shift+. | +menu(".vscode/" > "main.rs")
 selection | ctrl+shift+/ | -
-selection | ctrl+shift+\ | -
 selection | ctrl+shift+b | status="No build task detected; pick one"
 selection | ctrl+shift+c | status="Copied 5 chars to clipboard" clip="total"
 selection | ctrl+shift+d | focus=side side=RunDebug
@@ -633,7 +629,6 @@ explorer | ctrl+alt+, | -
 explorer | ctrl+alt+- | -
 explorer | ctrl+alt+. | -
 explorer | ctrl+alt+= | -
-explorer | ctrl+alt+\ | -
 explorer | ctrl+alt+b | status="Secondary side bar shown" +aux
 explorer | ctrl+alt+c | status="Copied 1 item"
 explorer | ctrl+alt+down | -
@@ -759,7 +754,6 @@ explorer | ctrl+s | status="Saved <root>/main.rs"
 explorer | ctrl+shift+- | -
 explorer | ctrl+shift+. | focus=editor +menu(".vscode/" > "main.rs")
 explorer | ctrl+shift+/ | status="Workspace root: <root>" typed=0:"\u{5}x\u{15}cd '<root>'\n" tree=./+,.vscode/,docs/,main.rs > .
-explorer | ctrl+shift+\ | -
 explorer | ctrl+shift+b | status="No build task detected; pick one"
 explorer | ctrl+shift+c | status="Copied 1 item"
 explorer | ctrl+shift+d | side=RunDebug
@@ -901,7 +895,6 @@ terminal | ctrl+alt+, | -
 terminal | ctrl+alt+- | -
 terminal | ctrl+alt+. | -
 terminal | ctrl+alt+= | -
-terminal | ctrl+alt+\ | typed=0:"\u{1b}\u{1c}"
 terminal | ctrl+alt+b | status="Secondary side bar shown" +aux
 terminal | ctrl+alt+c | typed=0:"\u{1b}\u{3}"
 terminal | ctrl+alt+down | status="No command marks yet (shell integration needs a zsh prompt)"
@@ -1027,7 +1020,6 @@ terminal | ctrl+s | status="Saved <root>/main.rs"
 terminal | ctrl+shift+- | -
 terminal | ctrl+shift+. | -
 terminal | ctrl+shift+/ | typed=0:"\u{1f}"
-terminal | ctrl+shift+\ | typed=0:"\u{1c}"
 terminal | ctrl+shift+b | status="No build task detected; pick one"
 terminal | ctrl+shift+c | status="Nothing selected: drag to select first"
 terminal | ctrl+shift+d | focus=side side=RunDebug
@@ -1170,7 +1162,6 @@ search | ctrl+alt+, | status="Search: unhandled Ctrl+,"
 search | ctrl+alt+- | status="Search: unhandled Ctrl+-"
 search | ctrl+alt+. | status="Search: unhandled Ctrl+."
 search | ctrl+alt+= | status="Search: unhandled Ctrl+="
-search | ctrl+alt+\ | status="Search: unhandled Ctrl+\\"
 search | ctrl+alt+b | status="Secondary side bar shown" +aux
 search | ctrl+alt+c | -
 search | ctrl+alt+down | search="total" @Query:5 hits=4@1
@@ -1296,7 +1287,6 @@ search | ctrl+s | status="Saved <root>/main.rs"
 search | ctrl+shift+- | status="Search: unhandled Ctrl+-"
 search | ctrl+shift+. | focus=editor search="total" hits=4@0 +menu(".vscode/" > "main.rs")
 search | ctrl+shift+/ | status="Search: unhandled Ctrl+/"
-search | ctrl+shift+\ | status="Search: unhandled Ctrl+\\"
 search | ctrl+shift+b | status="No build task detected; pick one"
 search | ctrl+shift+c | -
 search | ctrl+shift+d | side=RunDebug search="total" hits=4@0
@@ -1439,7 +1429,6 @@ scm | ctrl+alt+, | -
 scm | ctrl+alt+- | -
 scm | ctrl+alt+. | -
 scm | ctrl+alt+= | -
-scm | ctrl+alt+\ | -
 scm | ctrl+alt+b | status="Secondary side bar shown" +aux
 scm | ctrl+alt+c | -
 scm | ctrl+alt+down | scm="Ship it"@7 +focus +list sel=0 multi=0 StagedModified:docs/notes.md Untracked:todo.txt
@@ -1565,7 +1554,6 @@ scm | ctrl+s | status="No change selected to stage"
 scm | ctrl+shift+- | -
 scm | ctrl+shift+. | focus=editor scm="Ship it"@7 StagedModified:docs/notes.md Untracked:todo.txt +menu(".vscode/" > "main.rs")
 scm | ctrl+shift+/ | -
-scm | ctrl+shift+\ | -
 scm | ctrl+shift+b | status="No build task detected; pick one"
 scm | ctrl+shift+c | -
 scm | ctrl+shift+d | side=RunDebug scm="Ship it"@7 StagedModified:docs/notes.md Untracked:todo.txt
@@ -1708,7 +1696,6 @@ palette | ctrl+alt+, | -
 palette | ctrl+alt+- | -
 palette | ctrl+alt+. | -
 palette | ctrl+alt+= | -
-palette | ctrl+alt+\ | -
 palette | ctrl+alt+b | -
 palette | ctrl+alt+c | -
 palette | ctrl+alt+down | ~palette("" @0 > "Move Line Down")
@@ -1836,7 +1823,6 @@ palette | ctrl+s | -
 palette | ctrl+shift+- | -
 palette | ctrl+shift+. | -
 palette | ctrl+shift+/ | -
-palette | ctrl+shift+\ | -
 palette | ctrl+shift+b | -
 palette | ctrl+shift+c | -
 palette | ctrl+shift+d | -
@@ -1980,7 +1966,6 @@ confirm | ctrl+alt+, | -
 confirm | ctrl+alt+- | -
 confirm | ctrl+alt+. | -
 confirm | ctrl+alt+= | -
-confirm | ctrl+alt+\ | -
 confirm | ctrl+alt+b | -
 confirm | ctrl+alt+c | -
 confirm | ctrl+alt+down | -
@@ -2108,7 +2093,6 @@ confirm | ctrl+s | -
 confirm | ctrl+shift+- | -
 confirm | ctrl+shift+. | -
 confirm | ctrl+shift+/ | -
-confirm | ctrl+shift+\ | -
 confirm | ctrl+shift+b | -
 confirm | ctrl+shift+c | -
 confirm | ctrl+shift+d | -

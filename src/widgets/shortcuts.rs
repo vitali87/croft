@@ -507,12 +507,12 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 handler: "is_transpose_key",
             },
             ShortcutEntry {
-                keys: "Cmd/Ctrl+Shift+\\",
+                keys: "Cmd+Shift+\\",
                 description: "Go to the matching bracket",
                 handler: "is_goto_bracket_key",
             },
             ShortcutEntry {
-                keys: "Cmd/Ctrl+Opt+\\",
+                keys: "Cmd+Opt+\\",
                 description: "Select to the matching bracket",
                 handler: "is_select_to_bracket_key",
             },
@@ -742,7 +742,7 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 handler: "is_editor_open_line_below_key",
             },
             ShortcutEntry {
-                keys: "Cmd+Shift+O",
+                keys: "Cmd/Ctrl+Shift+Enter",
                 description: "Open a new line above, inheriting indent",
                 handler: "is_editor_open_line_above_key",
             },
