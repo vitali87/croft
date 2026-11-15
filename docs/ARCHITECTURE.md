@@ -216,6 +216,7 @@ src/
     ├── diff.rs               side-by-side file diff renderer behind the explorer's Compare action; also derives hunk ranges and the unified patches behind the diff pane's stage / unstage / revert keys
     ├── editor.rs             tree-sitter highlighted editor with the full write path, mouse-drag selection, native clipboard, image / PDF / spreadsheet preview tabs, minimap rasterizer and code folding
     ├── editor/               the editor's feature files, beside editor.rs; each file's `//!` doc says what it holds
+    │   ├── comments.rs      toggle line and block comments, per-language comment tokens
     │   ├── diff_view.rs     side-by-side and inline diffs, merge panes, conflicts, a file at a commit
     │   ├── disk.rs          opening, reloading and saving: encodings, line endings, outside changes, save cleanups
     │   ├── folding.rs       fold ranges and hidden lines, #region markers, indent guides
