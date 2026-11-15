@@ -697,7 +697,7 @@ mod tests {
     fn probe_reports_drift_against_a_real_repo_and_silence_when_current() {
         let dir = scratch_dir("drift");
         let git = |args: &[&str]| {
-            let out = std::process::Command::new("git")
+            let out = crate::test_git::test_git_command()
                 .arg("-C")
                 .arg(&dir)
                 .args(args)
