@@ -719,7 +719,18 @@ mod tests {
             "one",
         ]);
         let full = git(&["rev-parse", "HEAD"]);
-        let short = git(&["rev-parse", "--short", "HEAD"]);
+        // Read as `probe_drift` reads it, so a `core.abbrev` in the
+        // developer's own git config lengthens both alike.
+        let short = String::from_utf8(
+            crate::test_git::app_git(&dir)
+                .args(["rev-parse", "--short", "HEAD"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap()
+        .trim()
+        .to_string();
 
         assert_eq!(probe_drift(dir.to_str().unwrap(), &full), None);
         assert_eq!(probe_drift(dir.to_str().unwrap(), "unknown"), None);

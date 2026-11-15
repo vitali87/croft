@@ -2,7 +2,8 @@
 //!
 //! Every git command a test runs itself, to build a fixture repository or to
 //! read one back, starts at [`test_git`] or [`test_git_command`], in any
-//! module's tests. A test that ran a plain `git` read the developer's
+//! module's tests. The one exception is a value the test compares with the
+//! app's own git output: [`app_git`] reads that as the app does. A test that ran a plain `git` read the developer's
 //! environment and global config instead: a `GIT_AUTHOR_NAME` set by a CI
 //! runner or a sandbox authored the fixture's commits, and a hook's
 //! `GIT_DIR` pointed git at another repository. The app's own git calls are
@@ -58,6 +59,18 @@ pub(crate) fn test_git(dir: &Path) -> Command {
     git
 }
 
+/// `git -C dir` run as the app runs git: in the developer's own environment
+/// and config, like the production code. Only for reading back a value a
+/// test then compares with what the app's own git call printed, so both
+/// sides read the same settings (an abbreviation length, diff prefixes, a
+/// log format) and agree whatever those are. Building a fixture never
+/// starts here: that is [`test_git`].
+pub(crate) fn app_git(dir: &Path) -> Command {
+    let mut git = Command::new("git");
+    git.arg("-C").arg(dir);
+    git
+}
+
 /// `git init -q -b main` in `dir`: the first branch is `main` whatever the
 /// developer's `init.defaultBranch` says.
 pub(crate) fn git_init(dir: &Path) {
@@ -106,6 +119,18 @@ pub(crate) fn git_stdout_untrimmed(dir: &Path, args: &[&str]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2210 review: [`app_git`] is plain `git -C dir`, changing nothing in
+    /// the environment, so what it reads matches what the app's own git
+    /// calls read under any config the developer has.
+    #[test]
+    fn app_git_runs_git_as_the_app_does() {
+        let git = app_git(Path::new("/some/repo"));
+        assert_eq!(git.get_program(), "git");
+        assert_eq!(git.get_envs().count(), 0, "no variable set or removed");
+        let args: Vec<_> = git.get_args().collect();
+        assert_eq!(args, ["-C", "/some/repo"]);
+    }
 
     /// #2103: a commit made through [`test_git`] is authored by
     /// [`TEST_GIT_NAME`], whatever identity the environment names, and

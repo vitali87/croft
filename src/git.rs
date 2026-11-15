@@ -5725,6 +5725,15 @@ mod tests {
         String::from_utf8_lossy(&out.stdout).into_owned()
     }
 
+    /// What `git <args>` prints in `p` when run as the app runs git, to
+    /// compare with the app's own output: both read the developer's git
+    /// config, so a setting there (diff prefixes, `core.abbrev`, a log
+    /// format) changes both alike.
+    fn app_git_out(p: &Path, args: &[&str]) -> String {
+        let out = crate::test_git::app_git(p).args(args).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
     #[test]
     fn staging_a_bracketed_path_stages_only_that_file() {
         let tmp = tempfile::tempdir().unwrap();
@@ -5951,6 +5960,16 @@ mod tests {
             .arg(p)
             .args(["commit", "-m", "init", "--quiet"])
             .status();
+    }
+
+    /// Pin git's own `a/` and `b/` diff prefixes in `p`'s repository config,
+    /// which outranks the developer's: a test that looks for them in the
+    /// app's diff output then holds whatever `diff.noprefix` or
+    /// `diff.mnemonicPrefix` the developer set. The app reads either form
+    /// (#2020); only the test's expected text names one.
+    fn pin_diff_prefixes(p: &Path) {
+        git_in(p, &["config", "diff.noprefix", "false"]);
+        git_in(p, &["config", "diff.mnemonicPrefix", "false"]);
     }
 
     /// `git -C p <args>`, asserting it succeeded; its stdout, trimmed.
@@ -7033,11 +7052,14 @@ mod tests {
     fn git_diff_views_are_unchanged_without_colour_config() {
         let (tmp, _) = repo_with_a_staged_edit();
         let p = tmp.path();
-        assert_eq!(diff_staged(p).unwrap(), sh_git(p, &["diff", "--staged"]));
+        assert_eq!(
+            diff_staged(p).unwrap(),
+            app_git_out(p, &["diff", "--staged"])
+        );
         sh_git(p, &["commit", "-qm", "two"]);
         assert_eq!(
             show_commit(p, "HEAD").unwrap(),
-            sh_git(p, &["show", "--stat", "--patch", "HEAD"])
+            app_git_out(p, &["show", "--stat", "--patch", "HEAD"])
         );
     }
 
@@ -7097,6 +7119,7 @@ mod tests {
     #[test]
     fn diff_against_branch_starts_from_the_merge_base() {
         let tmp = branch_behind_a_moved_main();
+        pin_diff_prefixes(tmp.path());
         let out = diff_against_branch(tmp.path(), "main").unwrap();
         assert!(out.contains("+++ b/feature.py"), "{out}");
         assert!(!out.contains("teammate.py"), "{out}");
@@ -7137,7 +7160,7 @@ mod tests {
         git(&["commit", "-qam", "three"]);
         std::fs::write(p.join("new.txt"), "x\n").unwrap();
         git(&["add", "new.txt"]);
-        let plain = String::from_utf8(git(&["diff", "main"]).stdout).unwrap();
+        let plain = app_git_out(p, &["diff", "main"]);
         assert!(plain.contains("+three"), "{plain}");
         assert_eq!(diff_against_branch(p, "main").unwrap(), plain);
     }
@@ -7163,7 +7186,7 @@ mod tests {
         git(&["add", "."]);
         git(&["commit", "-qm", "other root"]);
         assert_eq!(merge_base(p, "main"), None);
-        let plain = String::from_utf8(git(&["diff", "main"]).stdout).unwrap();
+        let plain = app_git_out(p, &["diff", "main"]);
         assert!(plain.contains("seed.txt"), "{plain}");
         assert_eq!(diff_against_branch(p, "main").unwrap(), plain);
     }
@@ -7443,6 +7466,7 @@ filename seed.txt
         let sub = tmp.path().join("sub");
         std::fs::create_dir(&sub).unwrap();
         init_repo_with_commit(&sub);
+        pin_diff_prefixes(&sub);
         let raw = show_commit_file_diff(tmp.path(), "HEAD", "sub/seed.txt").unwrap();
         assert!(raw.contains("diff --git a/seed.txt b/seed.txt"), "{raw}");
         assert!(raw.lines().any(|l| l == "+two"), "{raw}");
@@ -8430,7 +8454,7 @@ sed -n '1,7p' GUIDE.md > g.tmp && echo 'Run `uv run -m pricing`.' >> g.tmp && mv
         let raw = show_commit_file_diff(tmp.path(), hash.trim(), "notes.md").unwrap();
         assert_eq!(
             raw,
-            sh_git(tmp.path(), &["show", hash.trim(), "--", "notes.md"]),
+            app_git_out(tmp.path(), &["show", hash.trim(), "--", "notes.md"]),
             "an unfiltered file keeps git's own diff, commit header and all"
         );
         // And what git stores for the filtered file is still the cleaned
