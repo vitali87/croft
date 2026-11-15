@@ -6658,7 +6658,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             | app.drain_review_ops();
         let connect_changed = app.poll_connect_dialog() | app.drain_scrub_views();
         let install_changed = app.poll_install_session();
-        let update_changed = app.poll_update_watch();
+        let update_changed = app.poll_update_watch() | app.poll_background_panic();
         let http_changed = app.drain_http_responses();
         let reveal_changed = app.tick_redaction_reveal();
         app.sync_lsp();
