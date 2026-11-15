@@ -158,6 +158,13 @@ impl App {
                 self.open_participants_picker();
                 true
             }
+            // Cmd+K L on a remote session: Drop to Local (#2071), its own
+            // chord, so Cmd+Shift+L selects all occurrences there as it does
+            // locally. Not Cmd+K Cmd+L, which carries Cmd on the second key.
+            KeyCode::Char(c) if plain && !shifted && !cmd_held && c.eq_ignore_ascii_case(&'l') => {
+                self.drop_to_local_if_remote();
+                true
+            }
             // Cmd+K Shift+X: close the other tabs of the focused group, as the
             // tab menu's Close Others and View: Close Other Editors in Group
             // do (#2072). The menu's old ⌥⌘T hint was iTerm2's New Tab and a
@@ -1381,10 +1388,6 @@ impl App {
             self.open_replace_in_files();
             return Ok(());
         }
-        if self.is_remote && is_drop_to_local_key(key) {
-            self.guard_unsaved(UnsavedExit::DropToLocal);
-            return Ok(());
-        }
         if self.sidebar_view == SidebarView::Search
             && self.focus == Pane::Tree
             && is_search_editing_shortcut(key)
@@ -2173,10 +2176,6 @@ pub(super) fn is_save_all_key(key: KeyEvent) -> bool {
         return false;
     }
     key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers.contains(KeyModifiers::SUPER)
-}
-
-pub(super) fn is_drop_to_local_key(key: KeyEvent) -> bool {
-    is_cmd_shift_letter(key, 'l')
 }
 
 /// `Ctrl/Cmd+Shift+B`: run the project's auto-detected build task, VS
@@ -3044,8 +3043,8 @@ pub(super) fn is_rename_symbol_key(key: KeyEvent) -> bool {
 }
 
 /// `Cmd+Shift+L` (`Ctrl+Shift+L` off macOS): Select All Occurrences of Find
-/// Match (#1558), VS Code's chord. On a remote session Drop to Local takes
-/// it first.
+/// Match (#1558), VS Code's chord, the same on a remote session: Drop to
+/// Local, which took it there, is `Cmd+K L` (#2071).
 pub(super) fn is_select_all_occurrences_key(key: KeyEvent) -> bool {
     is_cmd_shift_letter(key, 'l')
 }

@@ -160,7 +160,6 @@ fn key_predicates() -> Vec<(&'static str, KeyPredicate)> {
         is_run_debug_jump_key,
         is_remote_jump_key,
         is_extensions_jump_key,
-        is_drop_to_local_key,
         is_run_build_task_key,
         is_markdown_preview_key,
         is_run_fence_key,

@@ -2226,6 +2226,7 @@ impl App {
             Cmd::OpenWorkspaceOnSshHost => self.open_workspace_on_ssh_host(),
             Cmd::ScrubHistory => self.scrub_history(),
             Cmd::DebugInstallDelve => self.install_delve(),
+            Cmd::DropToLocal => self.drop_to_local_if_remote(),
             Cmd::RemoteSyncConfigNow => {
                 self.open_input_prompt(crate::widgets::input_prompt::InputPrompt::new(
                     crate::widgets::input_prompt::InputPurpose::SyncConfigHost,

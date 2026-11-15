@@ -561,6 +561,9 @@ pub enum Command {
     DebugInstallDelve,
     /// Remote: Sync Config Now (#262): push the syncable config to a host.
     RemoteSyncConfigNow,
+    /// Remote: Drop to Local (#2071): end this remote croft and go back to
+    /// the local one it was launched from.
+    DropToLocal,
     StopAutoApprove,
     ScrubOpenHere,
     ScrubDiffToWorkingTree,
@@ -1062,6 +1065,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::ScrubHistory,
     Command::DebugInstallDelve,
     Command::RemoteSyncConfigNow,
+    Command::DropToLocal,
     Command::StopAutoApprove,
     Command::ScrubOpenHere,
     Command::ScrubDiffToWorkingTree,
@@ -1560,6 +1564,7 @@ impl Command {
             Command::ScrubHistory => "Source Control: Scrub History",
             Command::DebugInstallDelve => "Debug: Install Go Debugger (delve)",
             Command::RemoteSyncConfigNow => "Remote: Sync Config Now",
+            Command::DropToLocal => "Remote: Drop to Local",
             Command::StopAutoApprove => "Agents: Stop Auto-Approving",
             Command::ScrubOpenHere => "Source Control: Open Scrubbed File Here",
             Command::ScrubDiffToWorkingTree => "Source Control: Diff Scrubbed File to Working Tree",
@@ -2065,6 +2070,9 @@ impl Command {
             Command::ScrubHistory => "",
             Command::DebugInstallDelve => "",
             Command::RemoteSyncConfigNow => "",
+            // Its own chord (#2071): Cmd+Shift+L, which it shared, selects
+            // all occurrences everywhere, a remote session included.
+            Command::DropToLocal => "Cmd+K L",
             Command::StopAutoApprove => "",
             Command::ScrubOpenHere => "",
             Command::ScrubDiffToWorkingTree => "",
@@ -2541,6 +2549,7 @@ impl Command {
             Command::ScrubHistory => "scm_scrub_history",
             Command::DebugInstallDelve => "debug_install_delve",
             Command::RemoteSyncConfigNow => "remote_sync_config_now",
+            Command::DropToLocal => "drop_to_local",
             Command::StopAutoApprove => "agents_stop_auto_approve",
             Command::ScrubOpenHere => "scm_scrub_open_here",
             Command::ScrubDiffToWorkingTree => "scm_scrub_diff_working_tree",

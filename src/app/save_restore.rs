@@ -1756,6 +1756,18 @@ impl App {
         self.status = String::from("Not saved: the file on disk is unchanged");
     }
 
+    /// Remote: Drop to Local (`Cmd+K L`, #2071): on a remote session, end it
+    /// and hand back to the local croft it was launched from, asking first
+    /// about unsaved edits as a quit does. A local croft has nothing to
+    /// leave, and says so rather than doing nothing.
+    pub(super) fn drop_to_local_if_remote(&mut self) {
+        if self.is_remote {
+            self.guard_unsaved(UnsavedExit::DropToLocal);
+        } else {
+            self.status = String::from("Drop to Local: this croft is not a remote session");
+        }
+    }
+
     /// Go on with `exit`, unless it would drop unsaved changes (#862): then
     /// raise the prompt that asks whether to save them first. Every quit and
     /// every single-tab close comes through here. The update relaunch alone

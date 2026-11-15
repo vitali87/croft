@@ -137,9 +137,9 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 handler: "is_remote_jump_key",
             },
             ShortcutEntry {
-                keys: "Cmd/Ctrl+Shift+L",
-                description: "Disconnect a remote session and drop back into the local croft",
-                handler: "is_drop_to_local_key",
+                keys: "Cmd+K L",
+                description: "Disconnect a remote session and drop back into the local croft (palette: Remote: Drop to Local)",
+                handler: "",
             },
             ShortcutEntry {
                 keys: "Cmd+Shift+T",

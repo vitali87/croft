@@ -174,6 +174,7 @@ editor | ctrl+k f | status="Format on Save: on"
 editor | ctrl+k h | status="Call hierarchy: no language server for this file"
 editor | ctrl+k i | status="Broadcast input needs at least two terminal panes (Cmd+T splits)"
 editor | ctrl+k k | status="Cleared terminal"
+editor | ctrl+k l | status="Drop to Local: this croft is not a remote session"
 editor | ctrl+k m | status="Only one terminal open"
 editor | ctrl+k n | +prompt("Note on line 5" "")
 editor | ctrl+k o | status="New Window failed: opening a new window is only supported on macOS"
@@ -238,7 +239,7 @@ editor | ctrl+shift+l | caret=4:13 sel=4:8-4:13 carets=1:35-1:40,5:7-5:12,6:19-6
 editor | ctrl+shift+m | focus=panel panel=Problems
 editor | ctrl+shift+n | -
 editor | ctrl+shift+o | status="Go to Symbol: 0 symbols — Esc to close" +go_to_symbol("" @0 > "")
-editor | ctrl+shift+p | status="Command Palette: 386 commands — Esc to close" +palette("" @0 > "Move Line Up")
+editor | ctrl+shift+p | status="Command Palette: 387 commands — Esc to close" +palette("" @0 > "Move Line Up")
 editor | ctrl+shift+pagedown | status="Move: the editor is already the last tab"
 editor | ctrl+shift+pageup | status="Move: the editor is already the first tab"
 editor | ctrl+shift+r | focus=side side=Remote
@@ -443,6 +444,7 @@ selection | ctrl+k f | status="Format on Save: on"
 selection | ctrl+k h | status="Call hierarchy: no language server for this file"
 selection | ctrl+k i | status="Broadcast input needs at least two terminal panes (Cmd+T splits)"
 selection | ctrl+k k | status="Cleared terminal"
+selection | ctrl+k l | status="Drop to Local: this croft is not a remote session"
 selection | ctrl+k m | status="Only one terminal open"
 selection | ctrl+k n | +prompt("Note on line 5" "")
 selection | ctrl+k o | status="New Window failed: opening a new window is only supported on macOS"
@@ -507,7 +509,7 @@ selection | ctrl+shift+l | carets=1:35-1:40,5:7-5:12,6:19-6:24 status="Selected 
 selection | ctrl+shift+m | focus=panel panel=Problems
 selection | ctrl+shift+n | -
 selection | ctrl+shift+o | status="Go to Symbol: 0 symbols — Esc to close" +go_to_symbol("" @0 > "")
-selection | ctrl+shift+p | status="Command Palette: 386 commands — Esc to close" +palette("" @0 > "Move Line Up")
+selection | ctrl+shift+p | status="Command Palette: 387 commands — Esc to close" +palette("" @0 > "Move Line Up")
 selection | ctrl+shift+pagedown | status="Move: the editor is already the last tab"
 selection | ctrl+shift+pageup | status="Move: the editor is already the first tab"
 selection | ctrl+shift+r | focus=side side=Remote
@@ -712,6 +714,7 @@ explorer | ctrl+k f | status="Format on Save: on"
 explorer | ctrl+k h | status="Call hierarchy: no language server for this file"
 explorer | ctrl+k i | status="Broadcast input needs at least two terminal panes (Cmd+T splits)"
 explorer | ctrl+k k | status="Cleared terminal"
+explorer | ctrl+k l | status="Drop to Local: this croft is not a remote session"
 explorer | ctrl+k m | status="Only one terminal open"
 explorer | ctrl+k n | -
 explorer | ctrl+k o | status="New Window failed: opening a new window is only supported on macOS"
@@ -776,7 +779,7 @@ explorer | ctrl+shift+l | -
 explorer | ctrl+shift+m | focus=panel panel=Problems
 explorer | ctrl+shift+n | +prompt("New Folder in ." "")
 explorer | ctrl+shift+o | status="Go to Symbol: 0 symbols — Esc to close" +go_to_symbol("" @0 > "")
-explorer | ctrl+shift+p | status="Command Palette: 386 commands — Esc to close" +palette("" @0 > "Move Line Up")
+explorer | ctrl+shift+p | status="Command Palette: 387 commands — Esc to close" +palette("" @0 > "Move Line Up")
 explorer | ctrl+shift+pagedown | tree=./+,.vscode/,docs/,main.rs > main.rs marked=.,.vscode,docs,main.rs
 explorer | ctrl+shift+pageup | tree=./+,.vscode/,docs/,main.rs > . marked=.
 explorer | ctrl+shift+r | side=Remote
@@ -980,6 +983,7 @@ terminal | ctrl+k f | typed=0:"\u{b}f"
 terminal | ctrl+k h | typed=0:"\u{b}h"
 terminal | ctrl+k i | typed=0:"\u{b}i"
 terminal | ctrl+k k | typed=0:"\u{b}k"
+terminal | ctrl+k l | typed=0:"\u{b}l"
 terminal | ctrl+k m | typed=0:"\u{b}m"
 terminal | ctrl+k n | typed=0:"\u{b}n"
 terminal | ctrl+k o | typed=0:"\u{b}o"
@@ -1044,7 +1048,7 @@ terminal | ctrl+shift+l | typed=0:"\u{c}"
 terminal | ctrl+shift+m | panel=Problems
 terminal | ctrl+shift+n | typed=0:"\u{e}"
 terminal | ctrl+shift+o | status="Go to Symbol: 0 symbols — Esc to close" +go_to_symbol("" @0 > "")
-terminal | ctrl+shift+p | status="Command Palette: 386 commands — Esc to close" +palette("" @0 > "Move Line Up")
+terminal | ctrl+shift+p | status="Command Palette: 387 commands — Esc to close" +palette("" @0 > "Move Line Up")
 terminal | ctrl+shift+pagedown | -
 terminal | ctrl+shift+pageup | -
 terminal | ctrl+shift+r | focus=side side=Remote
@@ -1249,6 +1253,7 @@ search | ctrl+k f | status="Format on Save: on"
 search | ctrl+k h | status="Call hierarchy: no language server for this file"
 search | ctrl+k i | status="Broadcast input needs at least two terminal panes (Cmd+T splits)"
 search | ctrl+k k | status="Cleared terminal"
+search | ctrl+k l | status="Drop to Local: this croft is not a remote session"
 search | ctrl+k m | status="Only one terminal open"
 search | ctrl+k n | search="totaln" @Query:6 hits=0@0
 search | ctrl+k o | status="New Window failed: opening a new window is only supported on macOS"
@@ -1313,7 +1318,7 @@ search | ctrl+shift+l | status="Search: unhandled Ctrl+L"
 search | ctrl+shift+m | focus=panel panel=Problems search="total" hits=4@0
 search | ctrl+shift+n | status="Search: unhandled Ctrl+N"
 search | ctrl+shift+o | status="Go to Symbol: 0 symbols — Esc to close" +go_to_symbol("" @0 > "")
-search | ctrl+shift+p | status="Command Palette: 386 commands — Esc to close" +palette("" @0 > "Move Line Up")
+search | ctrl+shift+p | status="Command Palette: 387 commands — Esc to close" +palette("" @0 > "Move Line Up")
 search | ctrl+shift+pagedown | -
 search | ctrl+shift+pageup | -
 search | ctrl+shift+r | side=Remote search="total" hits=4@0
@@ -1518,6 +1523,7 @@ scm | ctrl+k f | status="Format on Save: on"
 scm | ctrl+k h | status="Call hierarchy: no language server for this file"
 scm | ctrl+k i | status="Broadcast input needs at least two terminal panes (Cmd+T splits)"
 scm | ctrl+k k | status="Cleared terminal"
+scm | ctrl+k l | status="Drop to Local: this croft is not a remote session"
 scm | ctrl+k m | status="Only one terminal open"
 scm | ctrl+k n | scm="Ship itn"@8 +focus StagedModified:docs/notes.md Untracked:todo.txt
 scm | ctrl+k o | status="New Window failed: opening a new window is only supported on macOS"
@@ -1582,7 +1588,7 @@ scm | ctrl+shift+l | -
 scm | ctrl+shift+m | focus=panel panel=Problems scm="Ship it"@7 StagedModified:docs/notes.md Untracked:todo.txt
 scm | ctrl+shift+n | -
 scm | ctrl+shift+o | status="Go to Symbol: 0 symbols — Esc to close" +go_to_symbol("" @0 > "")
-scm | ctrl+shift+p | status="Command Palette: 386 commands — Esc to close" +palette("" @0 > "Move Line Up")
+scm | ctrl+shift+p | status="Command Palette: 387 commands — Esc to close" +palette("" @0 > "Move Line Up")
 scm | ctrl+shift+pagedown | -
 scm | ctrl+shift+pageup | -
 scm | ctrl+shift+r | side=Remote scm="Ship it"@7 StagedModified:docs/notes.md Untracked:todo.txt
@@ -1788,6 +1794,7 @@ palette | ctrl+k f | ~palette("f" @1 > "Quick Fix")
 palette | ctrl+k h | ~palette("h" @1 > "Git: Stage Hunk")
 palette | ctrl+k i | ~palette("i" @1 > "Replace in File")
 palette | ctrl+k k | ~palette("k" @1 > "View: Keep Editor")
+palette | ctrl+k l | ~palette("l" @1 > "View: Toggle Primary Side Bar")
 palette | ctrl+k m | ~palette("m" @1 > "Move Line Up")
 palette | ctrl+k n | ~palette("n" @1 > "Go to Next Change")
 palette | ctrl+k o | ~palette("o" @1 > "View: Keep Editor")
@@ -2060,6 +2067,7 @@ confirm | ctrl+k f | -
 confirm | ctrl+k h | -
 confirm | ctrl+k i | -
 confirm | ctrl+k k | -
+confirm | ctrl+k l | -
 confirm | ctrl+k m | -
 confirm | ctrl+k n | status="Cancelled: did not quit" -unsaved
 confirm | ctrl+k o | -

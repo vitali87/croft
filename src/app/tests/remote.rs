@@ -20,11 +20,10 @@ fn drop_to_local_with_unsaved_edits_asks_first() {
     let tmp = tempfile::tempdir().unwrap();
     let (mut app, a) = app_with_unsaved_file(tmp.path());
     app.is_remote = true;
-    let drop_key = key(
-        KeyCode::Char('l'),
-        KeyModifiers::SUPER | KeyModifiers::SHIFT,
-    );
-    app.handle_key(drop_key).unwrap();
+    app.handle_key(key(KeyCode::Char('k'), KeyModifiers::SUPER))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('l'), KeyModifiers::NONE))
+        .unwrap();
     assert!(!app.quit && !app.drop_to_local);
     assert_eq!(app.pending_unsaved, Some(UnsavedExit::DropToLocal));
     app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE))
@@ -160,57 +159,66 @@ fn cmd_shift_r_jumps_to_remote_from_any_pane() {
     assert_eq!(app.sidebar_view, SidebarView::Remote);
 }
 
+/// #2071: Drop to Local is `Cmd+K L`, the same on every pane, and the
+/// palette's Remote: Drop to Local; on a remote session either ends it and
+/// hands back to the local croft.
 #[test]
-fn is_drop_to_local_key_matches_only_cmd_shift_l() {
-    assert!(is_drop_to_local_key(key(
-        KeyCode::Char('l'),
-        KeyModifiers::SUPER | KeyModifiers::SHIFT
-    )));
-    assert!(is_drop_to_local_key(key(
-        KeyCode::Char('L'),
-        KeyModifiers::CONTROL | KeyModifiers::SHIFT
-    )));
-    assert!(!is_drop_to_local_key(key(
-        KeyCode::Char('l'),
-        KeyModifiers::SUPER
-    )));
-    assert!(!is_drop_to_local_key(key(
-        KeyCode::Char('q'),
-        KeyModifiers::CONTROL
-    )));
-    assert!(!is_drop_to_local_key(key(
-        KeyCode::Char('r'),
-        KeyModifiers::SUPER | KeyModifiers::SHIFT
-    )));
-}
-
-#[test]
-fn cmd_shift_l_on_remote_requests_drop_to_local() {
+fn cmd_k_l_on_remote_requests_drop_to_local() {
     let mut app = editor_app_with_lines(&["x"]);
     app.is_remote = true;
-    app.handle_key(key(
-        KeyCode::Char('l'),
-        KeyModifiers::SUPER | KeyModifiers::SHIFT,
-    ))
-    .unwrap();
+    app.handle_key(key(KeyCode::Char('k'), KeyModifiers::SUPER))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('l'), KeyModifiers::NONE))
+        .unwrap();
     assert!(
         app.drop_to_local && app.quit,
-        "Cmd+Shift+L on a remote-launched croft must request a clean hand-back to the local croft"
+        "Cmd+K L on a remote-launched croft must request a clean hand-back to the local croft"
+    );
+    let mut app = editor_app_with_lines(&["x"]);
+    app.is_remote = true;
+    app.run_command(crate::widgets::command_palette::Command::DropToLocal);
+    assert!(
+        app.drop_to_local && app.quit,
+        "and so does the palette's row"
     );
 }
 
+/// #2071: Cmd+Shift+L selects all occurrences on a remote session, as it
+/// does locally. It used to end the session instead, at once when nothing
+/// was unsaved, leaving Select All Occurrences no key there.
 #[test]
-fn cmd_shift_l_on_local_is_inert() {
+fn cmd_shift_l_selects_all_occurrences_on_remote_too() {
+    for remote in [false, true] {
+        let mut app = editor_app_with_lines(&["foo bar foo", "foo"]);
+        app.is_remote = remote;
+        app.handle_key(key(
+            KeyCode::Char('l'),
+            KeyModifiers::SUPER | KeyModifiers::SHIFT,
+        ))
+        .unwrap();
+        assert!(!app.drop_to_local && !app.quit, "remote={remote}");
+        assert!(
+            app.status.contains("Selected 3 occurrences"),
+            "remote={remote}: {}",
+            app.status
+        );
+    }
+}
+
+/// #2071: on a local croft, Drop to Local has nothing to leave and says so.
+#[test]
+fn drop_to_local_on_local_says_there_is_nothing_to_leave() {
     let mut app = editor_app_with_lines(&["x"]);
     app.is_remote = false;
-    app.handle_key(key(
-        KeyCode::Char('l'),
-        KeyModifiers::SUPER | KeyModifiers::SHIFT,
-    ))
-    .unwrap();
+    app.handle_key(key(KeyCode::Char('k'), KeyModifiers::SUPER))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('l'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(!app.drop_to_local && !app.quit);
     assert!(
-        !app.drop_to_local && !app.quit,
-        "Cmd+Shift+L on a local croft must do nothing - there is no remote session to leave"
+        app.status.contains("not a remote session"),
+        "{}",
+        app.status
     );
 }
 
