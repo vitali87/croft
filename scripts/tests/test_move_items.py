@@ -417,13 +417,14 @@ class Helpers(unittest.TestCase):
 
     def test_every_file_in_the_manifest_has_its_doc_note_and_row(self):
         root = Path(__file__).resolve().parents[2]
-        rows = mi.read_manifest(root / mi.MANIFEST)
-        files = {file for pr, file, *_ in rows if pr}
-        self.assertEqual(files, set(mi.FILES))
-        for file, (doc, phrase, row) in mi.FILES.items():
-            with self.subTest(file=file):
-                self.assertTrue(doc and phrase and row)
-                self.assertTrue(all(len("//! " + ln) <= 100 for ln in doc.split("\n")))
+        for t in mi.TARGETS.values():
+            rows = mi.read_manifest(root / t.manifest)
+            files = {file for pr, file, *_ in rows if pr}
+            self.assertEqual(files, set(t.files), t.name)
+            for file, (doc, phrase, row) in t.files.items():
+                with self.subTest(target=t.name, file=file):
+                    self.assertTrue(doc and phrase and row)
+                    self.assertTrue(all(len("//! " + ln) <= 100 for ln in doc.split("\n")))
 
 
 # A file split into a folder beside it (the editor), its tests inline.
