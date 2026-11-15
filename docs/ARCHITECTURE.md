@@ -119,6 +119,7 @@ src/
 ├── app/                 event loop, three-pane layout + activity bar, key dispatch, status bar, mouse, clipboard, splitters, preview overlays, Customize Layout (compute_chrome_layout / panel_band_rect pure geometry, secondary side bar, Zen Mode)
 │   ├── mod.rs           the main App: render, key / mouse dispatch, status bar, splitters
 │   ├── agents_collab.rs coding agents, lanes, the AI navigator, multiplayer sessions
+│   ├── bottom_panel.rs  bottom panel, OUTPUT, PROBLEMS and diagnostics, project check, PORTS
 │   ├── click.rs         double / triple click detection
 │   ├── code_scanning.rs SARIF results viewer, GitHub code scanning, SARIF logs as problems
 │   ├── codeql.rs        the CodeQL side bar: databases, queries, results, variant analysis, the CLI
@@ -126,19 +127,25 @@ src/
 │   ├── cursor_blink.rs  caret blink timing
 │   ├── debugger.rs      Run and Debug: launch, adapters, breakpoints, stepping, watches, console
 │   ├── diff_merge.rs    diff editor, merge conflicts, three-way merge, history scrubber, local history
+│   ├── editor_input.rs  editor keys, vim mode, macros, multi-cursor, clipboard and paste routing
+│   ├── editor_tabs.rs   tabs and editor groups, Go Back/Forward, bookmarks, new windows
 │   ├── explorer.rs      file tree, Explorer sections, workspace folders, re-rooting, outside changes
 │   ├── fs_watch.rs      filesystem watch + poll fallback feeding tree / editor / terminal refresh. The poll stats the file behind EVERY open tab, not just the focused one: a boundary dir carries no watch at all (see the storm rules — never root a stream at or above `target/`, `node_modules/`, `.git/`) and an in-place write does not move its parent dir's mtime, so for a file sitting directly in one this stat is the only thing that can notice a change; cost is one stat per open tab per (adaptively backed-off) tick
 │   ├── git_worker.rs    off-thread git status / changes worker
 │   ├── host_integration.rs host-terminal sequences and restore, panic log, croft view socket, self-update
 │   ├── hover.rs         LSP hover dwell timing
+│   ├── inline_images.rs inline pictures: detection, chrome bake, per-frame overlays, minimap
 │   ├── language_servers.rs language-server features: go-to, rename, code actions, outline, breadcrumbs
 │   ├── memory_report.rs Developer: Show Memory Usage: the per-subsystem figures laid out as Markdown, opened as a rendered preview so typing can't edit it
+│   ├── menus.rs         context and dropdown menus, `dispatch_menu_action`
 │   ├── nav.rs           editor back / forward navigation history
 │   ├── overlay.rs       inline-image overlay state + clear-on-hide latches (iTerm2 cell eviction; the Kitty path adds a delete-all on the same clear frames)
 │   ├── perf_hud.rs      F8 performance HUD
+│   ├── prompts.rs       input prompts and list pickers
 │   ├── remote_sessions.rs SSH sessions, hand-off to remote croft, config sync, uploads, port forwarding
 │   ├── review.rs        pull-request review tabs and in-editor comment boxes
 │   ├── runners.rs       Testing view, Tasks, runnable blocks, notebooks, Fleet, Live Run, .http requests
+│   ├── save_restore.rs  saving, unsaved prompts, hot exit, session save/restore
 │   ├── scm.rs           Source Control panel, background git, commits, branches, hunks, blame
 │   ├── screencast.rs    Screencast Mode (Shift+F8): the keys pressed, the command each ran and the cell a click hit, drawn over the frame for a recording
 │   ├── search.rs        Search view, Search Editor, find/replace bar, Quick Open
@@ -148,6 +155,7 @@ src/
 │   ├── viewers.rs       spreadsheet/CSV/SQLite, PDF, archive, hex, log and Markdown viewers
 │   ├── welcome.rs       welcome-screen state: the "IN THIS RELEASE" highlights, read synchronously from `release_notes::release_notes()` (no thread, no network)
 │   ├── welcome_screen.rs welcome page drawing and the guided tour
+│   ├── workbench.rs     screen layout, Customize Layout, activity bar, splitters
 │   └── tests/           whole-app tests, one file per area; `mod.rs` holds the helpers more than one file uses. `golden.rs` draws whole screens the way the main loop does and compares every cell, colour and the caret with the snapshots in `golden/` (`CROFT_BLESS=1` rewrites them; its module doc lists what it pins and masks)
 ├── dap/                 debugger stack: Debug Adapter Protocol client. debugpy (Python: the adapter on a private 3.14+ venv, the program on the project's own interpreter, #864) is the verified mechanism; Rust/C/C++ route to lldb-dap; JS/TS route to vscode-js-debug; Go routes to delve (`dlv dap` over TCP, single-session, #264). Which file types each handles is a data-driven extension axis (see registry.rs)
 │   ├── mod.rs
