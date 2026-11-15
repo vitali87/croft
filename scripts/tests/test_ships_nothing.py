@@ -360,6 +360,84 @@ class Verdicts(unittest.TestCase):
         )
         self.assertEqual(filt.cfg_test_ranges(text), [])
 
+    def test_a_block_comment_right_after_a_string_yields_no_ranges(self):
+        """#2217 review: with the string removed, `"x" /* { */` leaves the
+        comment at the start of the line's code, where a mid-line pattern
+        missed it and the braces inside it were counted."""
+        text = (
+            "#[cfg(test)]\nmod tests {\n    fn t() -> &'static str {\n"
+            '        "x" /* { */\n    }\n}\n'
+            "pub fn g() -> &'static str {\n    \"y\" /* } */\n}\n"
+        )
+        self.assertEqual(filt.cfg_test_ranges(text), [])
+
+    def test_an_attribute_and_module_inside_a_string_are_not_a_range(self):
+        """#2217 review: lines inside a multi-line raw string are its
+        content, not items, however much they look like a test module."""
+        text = (
+            'const PROMPT: &str = r#"\n#[cfg(test)]\nmod old;\n"#;\n'
+            'fn main() { print!("{PROMPT}"); }\n'
+        )
+        self.assertEqual(filt.cfg_test_ranges(text), [])
+
+    def test_editing_a_string_that_looks_like_a_test_module_ships(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            before = 'const PROMPT: &str = r#"\n#[cfg(test)]\nmod old;\n"#;\n'
+            repo.commit("a.rs", before)
+            run(repo.path, "git", "checkout", "-q", "-b", "change")
+            repo.commit("a.rs", before.replace("mod old;", "mod new;"))
+            self.assertFalse(repo.verdict())
+
+    def test_a_declaration_slipped_under_an_existing_attribute_ships(self):
+        """#2217 review: `mod tests;` inserted between `#[cfg(test)]` and the
+        function it guarded takes the attribute off that function, which then
+        ships, though every touched line sits inside the new span."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            repo.commit("a.rs", "#[cfg(test)]\npub fn helper() {}\n")
+            run(repo.path, "git", "checkout", "-q", "-b", "change")
+            repo.commit("a.rs", "#[cfg(test)]\nmod tests;\npub fn helper() {}\n")
+            self.assertFalse(repo.verdict())
+
+    def test_a_module_slipped_under_an_existing_attribute_ships(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            repo.commit("a.rs", "#[cfg(test)]\npub fn helper() {}\n")
+            run(repo.path, "git", "checkout", "-q", "-b", "change")
+            repo.commit(
+                "a.rs",
+                "#[cfg(test)]\nmod tests {\n    fn t() {}\n}\npub fn helper() {}\n",
+            )
+            self.assertFalse(repo.verdict())
+
+    def test_removing_a_declaration_from_under_its_attribute_ships(self):
+        """The reverse: the attribute now guards the function below, which
+        leaves the release build."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            repo.commit("a.rs", "#[cfg(test)]\nmod tests;\npub fn helper() {}\n")
+            run(repo.path, "git", "checkout", "-q", "-b", "change")
+            repo.commit("a.rs", "#[cfg(test)]\npub fn helper() {}\n")
+            self.assertFalse(repo.verdict())
+
+    def test_edits_in_two_test_modules_that_shift_each_other_ship_nothing(self):
+        """The attribute check follows each span to its line on the other
+        side, past the lines an earlier hunk added."""
+        two = (
+            "pub fn a() {}\n#[cfg(test)]\nmod one {\n    fn t() {}\n}\n"
+            "pub fn b() {}\n#[cfg(test)]\nmod two {\n    fn t() {}\n}\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            repo.commit("a.rs", two)
+            run(repo.path, "git", "checkout", "-q", "-b", "change")
+            repo.commit(
+                "a.rs",
+                two.replace("    fn t() {}\n", "    fn t() {}\n    fn u() {}\n    fn v() {}\n"),
+            )
+            self.assertTrue(repo.verdict())
+
     def test_the_cli_reports_the_verdict_as_its_exit_status(self):
         """The gate is shell, so the answer has to arrive as a status."""
         with tempfile.TemporaryDirectory() as tmp:
@@ -464,6 +542,51 @@ class TestOnlyModules(unittest.TestCase):
                 repo, {"src/widgets/fixtures/mod.rs": "pub fn f() -> u8 {\n    2\n}\n"}
             )
             self.assertTrue(repo.verdict("src/widgets/fixtures/mod.rs"))
+
+    def test_a_release_declaration_with_a_trailing_comment_ships(self):
+        """#2217 review: `pub mod helper; // shared` declares the module for
+        the release build as surely as the bare form."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self.repo(
+                tmp,
+                {
+                    "src/main.rs": "#[cfg(test)]\nmod helper;\nfn main() {}\n",
+                    "src/lib.rs": "pub mod helper; // shared\n",
+                    "src/helper.rs": "pub fn f() -> u8 {\n    1\n}\n",
+                },
+            )
+            self.change(repo, {"src/helper.rs": "pub fn f() -> u8 {\n    2\n}\n"})
+            self.assertFalse(repo.verdict("src/helper.rs"))
+
+    def test_a_test_only_declaration_with_a_trailing_comment_ships_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self.repo(
+                tmp,
+                {
+                    "src/main.rs": "#[cfg(test)]\nmod helper; // fixtures\nfn main() {}\n",
+                    "src/helper.rs": "pub fn f() -> u8 {\n    1\n}\n",
+                },
+            )
+            self.change(repo, {"src/helper.rs": "pub fn f() -> u8 {\n    2\n}\n"})
+            self.assertTrue(repo.verdict("src/helper.rs"))
+
+    def test_a_file_a_path_attribute_can_load_ships(self):
+        """#2217 review: `#[path = "helper.rs"] mod production;` loads the
+        file into the release build under another name, which a reading by
+        name cannot see."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self.repo(
+                tmp,
+                {
+                    "src/main.rs": (
+                        "#[cfg(test)]\nmod helper;\n"
+                        '#[path = "helper.rs"]\nmod production;\nfn main() {}\n'
+                    ),
+                    "src/helper.rs": "pub fn f() -> u8 {\n    1\n}\n",
+                },
+            )
+            self.change(repo, {"src/helper.rs": "pub fn f() -> u8 {\n    2\n}\n"})
+            self.assertFalse(repo.verdict("src/helper.rs"))
 
     def test_making_a_shipped_module_test_only_ships(self):
         """Adding `#[cfg(test)]` above a declaration takes a module out of

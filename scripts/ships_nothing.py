@@ -67,16 +67,13 @@ def git(*args, cwd=None, allow_missing_path=False):
     return done.stdout
 
 
-# A `/*` that opens mid-line, in a line's code: `BlockTracker` strips strings,
-# chars and `//` but not block comments, so a brace inside one is counted as
-# structure and a span can swallow the shipped code below it. Rare enough that
-# refusing to answer is better than parsing it. Read off the code only: a
-# glob in a string (`"src/**/*.rs"`, `format!("{remote}/*")`) opens no
-# comment, and matching the raw line made every file holding one ship.
-MID_LINE_BLOCK_COMMENT = re.compile(r"\S.*/\*")
-
 # A module declared without a body, `mod name;` (its body is another file).
+# Matched against a line's code, so a trailing `// comment` does not hide it.
 MOD_DECLARATION = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+[A-Za-z_]\w*\s*;\s*$")
+
+# An attribute that names a module's file, `#[path = "x.rs"]`, directly or
+# through `cfg_attr`. Matched loosely: a false hit only costs an exemption.
+PATH_ATTRIBUTE = re.compile(r"#!?\[.*\bpath\s*=")
 
 
 def literal_lines(text):
@@ -108,14 +105,19 @@ def cfg_test_ranges(text):
     counted through `BlockTracker`, which removes string and char literals
     first: a `format!("{}")` inside a test would otherwise close the module
     early and leave the rest of the file looking like shipped code.
+
+    A block comment anywhere in a line's code yields no spans at all. The
+    tracker strips strings, chars and `//` but not `/* */`, so a brace inside
+    one is counted as structure and a span can swallow the shipped code below
+    it. Rare enough that refusing to answer is better than parsing it. Read
+    off the code with its literals removed: a glob in a string
+    (`"src/**/*.rs"`) opens no comment, and a comment right after a string
+    (`"x" /* { */`) still does.
     """
     lines = text.splitlines()
     kinds = classify(lines)
     stripper = BlockTracker()
-    if any(
-        kinds[i] == CODE and MID_LINE_BLOCK_COMMENT.search(stripper.feed(l))
-        for i, l in enumerate(lines)
-    ):
+    if any(kinds[i] == CODE and "/*" in stripper.feed(l) for i, l in enumerate(lines)):
         return []
     tracker = BlockTracker()
     ranges = []
@@ -123,13 +125,19 @@ def cfg_test_ranges(text):
     open_at = None
     for i, line in enumerate(lines):
         depth_before = tracker.depth
-        if kinds[i] == CODE:
-            tracker.feed(line)
+        # A line that starts inside a multi-line string is that string's
+        # content: a `#[cfg(test)]` or `mod name;` there is text the binary
+        # carries, not an item.
+        in_literal = tracker.open_string is not None
+        code = tracker.feed(line) if kinds[i] == CODE else ""
         if open_at is not None:
             start, outer = open_at
             if tracker.depth <= outer:
                 ranges.append((start + 1, i + 1))
                 open_at = None
+            continue
+        if in_literal:
+            attr_at = None
             continue
         if CFG_TEST.match(line):
             attr_at = i
@@ -145,7 +153,7 @@ def cfg_test_ranges(text):
             continue
         if MOD.match(line) and tracker.depth > depth_before:
             open_at = (attr_at, depth_before)
-        elif kinds[i] == CODE and MOD_DECLARATION.match(line):
+        elif kinds[i] == CODE and MOD_DECLARATION.match(code):
             # `#[cfg(test)] mod name;`: the declaration is the whole span. Its
             # body is another file, which compiles only for tests too.
             ranges.append((attr_at + 1, i + 1))
@@ -156,7 +164,8 @@ def cfg_test_ranges(text):
 
 
 def changed_lines(base, head, path, cwd=None):
-    """(lines removed from base, lines added at head, the raw diff), 1-indexed.
+    """(lines removed from base, lines added at head, the raw diff, the
+    hunks as `(base_start, base_len, head_start, head_len)`), 1-indexed.
 
     The diff text comes back because "no hunk headers" has two causes: the
     file did not change, and git did not describe the change. `git diff -U0`
@@ -164,33 +173,82 @@ def changed_lines(base, head, path, cwd=None):
     `@@` line at all, and inferring "unchanged" from that waives a bump.
     """
     diff = git("diff", "--no-renames", "-U0", base, head, "--", path, cwd=cwd)
-    removed, added = [], []
+    removed, added, hunks = [], [], []
     for line in diff.splitlines():
         m = HUNK.match(line)
         if not m:
             continue
-        base_start, base_len, head_start, head_len = (
+        hunk = (
             int(m.group(1)),
             int(m.group(2) or 1),
             int(m.group(3)),
             int(m.group(4) or 1),
         )
+        base_start, base_len, head_start, head_len = hunk
+        hunks.append(hunk)
         removed.extend(range(base_start, base_start + base_len))
         added.extend(range(head_start, head_start + head_len))
-    return removed, added, diff
+    return removed, added, diff, hunks
+
+
+def counterpart(n, hunks, side):
+    """The line an unchanged line `n` was on the other side of the diff:
+    `side` is "head" to map a head line to the base, "base" for the reverse.
+    None when `n` is itself a changed line.
+
+    With `-U0` a hunk of length 0 sits AFTER its start line, so every line
+    past it shifts by what the hunk took out or put in.
+    """
+    shift = 0
+    for base_start, base_len, head_start, head_len in hunks:
+        start, length, other = (
+            (head_start, head_len, base_len) if side == "head" else (base_start, base_len, head_len)
+        )
+        end = start + length - 1 if length else start
+        if length and start <= n <= end:
+            return None
+        if n > end:
+            shift += other - length
+    return n + shift
 
 
 def inside(line_no, ranges):
     return any(start <= line_no <= end for start, end in ranges)
 
 
+def path_attribute_anywhere(rev, cwd=None):
+    """Whether any Rust file at `rev` names a module's file with a
+    `#[path]` attribute. Such a declaration can load a file under any module
+    name, from anywhere, so no name-based reading of the parents can rule out
+    a release build loading it. croft has none; the day it does, a whole-file
+    exemption costs a line of notes instead."""
+    done = subprocess.run(
+        ("git", "grep", "-z", "-I", "-E", "-e", r"#!?\[.*path[[:space:]]*=", rev, "--", "*.rs"),
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+    )
+    if done.returncode == 1:
+        return False
+    if done.returncode != 0:
+        raise SystemExit(f"git grep failed: {done.stderr.strip()}")
+    return any(
+        PATH_ATTRIBUTE.search(hit.split("\0", 1)[-1]) for hit in done.stdout.splitlines()
+    )
+
+
 def declared_for_tests_only(rev, path, cwd=None):
     """Whether, at `rev`, the module in `path` is declared only for tests:
     its parent file declares it as `#[cfg(test)] mod name;` at least once and
     never otherwise, so nothing in it compiles into a release build. A test
-    helper module like `src/test_git.rs` is the case. A parent the rules
-    below do not find (a `#[path]` attribute, an inline `mod name { .. }`)
-    leaves the file counted as shipped.
+    helper module like `src/test_git.rs` is the case.
+
+    Anything else that names the module in a parent's code - an inline
+    `mod name { .. }`, two declarations on one line, `#[cfg(test)] mod name;`
+    written on one line - leaves the file counted as shipped, and so does a
+    `#[path]` attribute anywhere in the tree. Literals and `//` comments are
+    removed first, so a trailing comment cannot hide a release declaration
+    and a string cannot fake a test-only one.
     """
     parts = Path(path).parts
     if len(parts) < 2 or parts[0] != "src" or not path.endswith(".rs"):
@@ -208,18 +266,26 @@ def declared_for_tests_only(rev, path, cwd=None):
     else:
         folder = "/".join(dir_parts)
         parents = [f"{folder}.rs", f"{folder}/mod.rs"]
-    declaration = re.compile(
-        rf"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+{re.escape(name)}\s*;\s*$"
-    )
+    if path_attribute_anywhere(rev, cwd=cwd):
+        return False
+    mention = re.compile(rf"\bmod\s+{re.escape(name)}\b")
     found = False
     for parent in parents:
         text = git("show", f"{rev}:{parent}", cwd=cwd, allow_missing_path=True)
         ranges = cfg_test_ranges(text)
-        for n, line in enumerate(text.splitlines(), 1):
-            if declaration.match(line):
-                if not inside(n, ranges):
-                    return False
-                found = True
+        lines = text.splitlines()
+        kinds = classify(lines)
+        tracker = BlockTracker()
+        for n, line in enumerate(lines, 1):
+            if kinds[n - 1] != CODE:
+                continue
+            in_literal = tracker.open_string is not None
+            code = tracker.feed(line)
+            if not mention.search(code):
+                continue
+            if in_literal or not MOD_DECLARATION.match(code) or not inside(n, ranges):
+                return False
+            found = True
     return found
 
 
@@ -239,7 +305,7 @@ def ships_nothing(base, head, path, cwd=None):
     sides = [rev for rev, text in ((base, base_text), (head, head_text)) if text]
     if sides and all(declared_for_tests_only(rev, path, cwd=cwd) for rev in sides):
         return True
-    removed, added, diff = changed_lines(base, head, path, cwd=cwd)
+    removed, added, diff, hunks = changed_lines(base, head, path, cwd=cwd)
     if not removed and not added and diff.strip():
         # git described a change it did not give hunk headers for - a file it
         # treats as binary. Nothing here can read that, so it ships.
@@ -280,9 +346,34 @@ def ships_nothing(base, head, path, cwd=None):
     # puts a test module in. A touched attribute is therefore only test-only
     # when its WHOLE module moved with it, which is what a test module added
     # or deleted in one piece looks like.
-    return _whole_span_moved(base_ranges, removed, base_lines) and _whole_span_moved(
-        head_ranges, added, head_lines
-    )
+    if not (
+        _whole_span_moved(base_ranges, removed, base_lines)
+        and _whole_span_moved(head_ranges, added, head_lines)
+    ):
+        return False
+    # An attribute the diff did not touch can still change what it applies
+    # to. `mod tests;` inserted under an existing `#[cfg(test)]` takes the
+    # attribute off the item below, which then ships; deleting it does the
+    # reverse. Every span the change touched must therefore open at an
+    # untouched attribute that opened a span on the other side too, or have
+    # moved with its attribute (checked above).
+    return _attribute_kept_its_span(
+        head_ranges, added, base_ranges, hunks, "head"
+    ) and _attribute_kept_its_span(base_ranges, removed, head_ranges, hunks, "base")
+
+
+def _attribute_kept_its_span(ranges, touched, other_ranges, hunks, side):
+    """True when every span holding a touched line either had its attribute
+    touched too (a module added or removed whole) or opens at an attribute
+    that opens a span on the other side of the diff as well."""
+    marked = set(touched)
+    other_starts = {start for start, _ in other_ranges}
+    for start, end in ranges:
+        if start in marked or not any(start <= n <= end for n in marked):
+            continue
+        if counterpart(start, hunks, side) not in other_starts:
+            return False
+    return True
 
 
 def _whole_span_moved(ranges, touched, lines):
