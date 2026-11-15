@@ -223,6 +223,7 @@ src/
     │   ├── folding.rs       fold ranges and hidden lines, #region markers, indent guides
     │   ├── gutter.rs        breakpoints, bookmarks, git marks and blame, overview ruler, line numbers
     │   ├── highlighting.rs  syntax highlight passes, colours carried across edits, bracket colours, swatches
+    │   ├── language.rs      language picking, indentation detection, whitespace display, rulers
     │   ├── line_commands.rs move, duplicate, delete, join, sort and indent lines, convert indentation
     │   ├── lsp_overlays.rs  semantic tokens, inlay hints, diagnostics, links, code lenses, ghost text
     │   ├── mouse.rs         clicks, drags, and what lies under the pointer
