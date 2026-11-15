@@ -216,6 +216,18 @@ impl VoiceHandle {
     }
 }
 
+#[cfg(test)]
+impl VoiceHandle {
+    /// A session whose recognizer has already exited: how the app holds its
+    /// handle between the worker sending the result and the frame loop
+    /// draining it.
+    pub fn finished() -> Self {
+        VoiceHandle {
+            child: Arc::new(Mutex::new(None)),
+        }
+    }
+}
+
 /// Start a recognition session. Spawns `termux-dialog speech`, reads its single
 /// JSON result object on a background thread, and sends the recognized text as
 /// the transcript over `tx` (or `Failed`/`Empty` on a recognizer error or

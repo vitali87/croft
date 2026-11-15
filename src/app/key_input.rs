@@ -1557,9 +1557,15 @@ impl App {
             changed = true;
             self.voice_handle = None;
             match msg {
+                // A cancel tap can land after the dialog has already sent its
+                // transcript but before this drain: killing the recognizer
+                // then cannot take the result back, so drop it here.
                 crate::voice::VoiceMsg::Transcript(text) => {
-                    self.voice_canceling = false;
-                    self.inject_voice_text(&text);
+                    if std::mem::take(&mut self.voice_canceling) {
+                        self.status = String::from("Voice input canceled");
+                    } else {
+                        self.inject_voice_text(&text);
+                    }
                 }
                 crate::voice::VoiceMsg::Empty => {
                     self.status = if std::mem::take(&mut self.voice_canceling) {
