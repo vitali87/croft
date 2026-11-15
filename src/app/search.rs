@@ -188,19 +188,21 @@ impl App {
         if is_editor_copy_key(key) {
             let text = self.search.active_selection_text();
             if !text.is_empty() {
-                copy_to_clipboard(&text);
-                self.status = format!("Copied {} chars to clipboard", text.chars().count());
+                self.deliver_copied_text(&text);
             }
             return;
         }
         if is_editor_cut_key(key) {
             let text = self.search.active_selection_text();
             if !text.is_empty() {
-                copy_to_clipboard(&text);
                 let n = text.chars().count();
+                let landing = self.copy_where_pasted(&text);
                 self.search.backspace();
                 self.refresh_search_if_filtering();
-                self.status = format!("Cut {n} chars to clipboard");
+                self.status = match landing {
+                    CopyLanding::Clipboard => format!("Cut {n} chars to clipboard"),
+                    _ => format!("Cut {n} chars{}", landing.note()),
+                };
             }
             return;
         }

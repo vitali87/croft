@@ -5864,40 +5864,6 @@ fn cells_in(buf: &ratatui::buffer::Buffer, r: Rect) -> Vec<ratatui::buffer::Cell
     r.positions().map(|p| buf[p].clone()).collect()
 }
 
-/// Copy `text` to the host system clipboard.
-///
-/// Order of attempts:
-///   1. **macOS native** — `clipboard::write_string` posts directly to
-///      `NSPasteboard.generalPasteboard` (with `pbcopy` as a process-level
-///      fall-back inside the same helper). This is the canonical Cocoa
-///      clipboard API and is the *only* path that survives every iTerm2
-///      configuration we have seen in the wild. OSC 52 is, empirically,
-///      silently dropped by iTerm2 in some setups even with
-///      `AllowClipboardAccess` enabled in `com.googlecode.iterm2` — and
-///      writing escape bytes directly to the alt-screen stdout always
-///      risks racing with the next ratatui frame.
-///   2. **OSC 52 fall-back** — only if the native write returned false
-///      (non-macOS croft binary on a Linux remote host, where the only
-///      hand-shake with the user's local terminal is via escape bytes
-///      through the SSH PTY). The fall-back is best-effort.
-///
-/// Returns true when the native path acknowledged the write so the call
-/// site can downgrade the status message if it ever needs to. Today all
-/// call sites discard the boolean; the return value is here so future
-/// code can branch on it.
-fn copy_to_clipboard(text: &str) -> bool {
-    crate::clipboard::remember_copy(text);
-    if crate::clipboard::write_string(text) {
-        return true;
-    }
-    use std::io::Write;
-    let bytes = crate::widgets::terminal::osc52_copy_seq(text);
-    let mut out = std::io::stdout();
-    let _ = out.write_all(&bytes);
-    let _ = out.flush();
-    false
-}
-
 /// Cap a string at `max` characters by inserting an ellipsis in the
 /// end so the start (scheme/host) stays visible. No ellipsis marker anywhere in
 /// croft, so overflow is cut plainly from the right rather than elided in the

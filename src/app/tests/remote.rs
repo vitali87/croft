@@ -1306,3 +1306,49 @@ fn the_output_ports_and_captures_tabs_are_announced_by_name_and_row() {
     assert_eq!(snap.focus, "Captures, 1 capture");
     assert_eq!(snap.item.as_deref(), Some("Build failed, from zsh"));
 }
+
+/// #2070: on a relay session every copy goes home to the clipboard of the
+/// machine the user types at, not only the terminal's (#1667). The editor's
+/// Copy and Delete Line, Copy Path and the Ports view's copy all wrote the
+/// remote box's clipboard, so pasting at home gave the old text.
+#[test]
+fn every_copy_on_a_relay_session_reaches_the_local_clipboard() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("a.txt");
+    std::fs::write(&p, "alpha beta\nsecond\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&p).unwrap();
+    app.focus_pane(Pane::Editor);
+
+    app.handle_key(key(KeyCode::Char('a'), KeyModifiers::SUPER))
+        .unwrap();
+    let sent = relay_copied(&mut app, |app| {
+        app.handle_key(key(KeyCode::Char('c'), KeyModifiers::SUPER))
+            .unwrap();
+    });
+    assert_eq!(sent.as_deref(), Some("alpha beta\nsecond"), "editor Copy");
+    assert!(app.status.contains("local clipboard"), "{}", app.status);
+
+    let sent = relay_copied(&mut app, |app| app.copy_path_to_clipboard(p.clone()));
+    assert_eq!(sent, Some(p.display().to_string()), "Copy Path");
+    assert!(
+        app.status.ends_with("sent to the local clipboard"),
+        "{}",
+        app.status
+    );
+
+    app.editor.clear_selection();
+    app.editor.cursor_row = 0;
+    let sent = relay_copied(&mut app, |app| app.delete_current_line());
+    assert_eq!(sent.as_deref(), Some("alpha beta\n"), "Delete Line");
+
+    app.ports
+        .upsert(3000, None, None, crate::widgets::ports::PortOrigin::Local);
+    let sent = relay_copied(&mut app, |app| app.ports_copy_selected());
+    assert_eq!(
+        sent.as_deref(),
+        Some("http://127.0.0.1:3000/"),
+        "Ports copy"
+    );
+}

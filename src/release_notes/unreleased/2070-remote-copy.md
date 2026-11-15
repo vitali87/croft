@@ -1,0 +1,1 @@
+fix: In a croft remote session every copy now reaches the clipboard of the machine you type at, not only terminal copies: the editor, vim, Delete Line, Copy Path, commit hashes and messages, Ports, Search, the log view, Copy Request as a shell command and CodeQL copies; the status line says where a copy went when it was not this machine's clipboard (#2070).

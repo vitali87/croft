@@ -1169,6 +1169,22 @@ fn own_settings(app: &mut App) -> tempfile::TempDir {
     dir
 }
 
+/// Run `copy` on a relay session and return what it sent home to the local
+/// clipboard, or `None` when nothing went over the relay.
+fn relay_copied(app: &mut App, copy: impl FnOnce(&mut App)) -> Option<String> {
+    let home = tempfile::tempdir().unwrap();
+    app.is_relay_session = true;
+    let (log, inbox) = with_relay_home(home.path(), || {
+        let log = app.relay_log_path().expect("relay log path derivable");
+        let inbox = app.relay_inbox_path().expect("relay inbox path derivable");
+        copy(app);
+        (log, inbox)
+    });
+    let written = std::fs::read_to_string(&log).ok()?;
+    let id = written.lines().last()?.strip_prefix("copy\t")?.to_string();
+    std::fs::read_to_string(inbox.join(format!("{id}.txt"))).ok()
+}
+
 fn with_relay_home<T>(home: &std::path::Path, body: impl FnOnce() -> T) -> T {
     // The cache dir is redirected through its test override instead of
     // repointing the process-global `$HOME` (#37): unrelated test threads
