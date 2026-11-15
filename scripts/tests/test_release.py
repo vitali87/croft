@@ -302,6 +302,31 @@ class Check(unittest.TestCase):
             self.assertEqual(errors, [])
             self.assertIn("No shipped files changed", out)
 
+    def test_a_modules_test_file_or_folder_anywhere_in_src_ships_nothing(self):
+        """A module's tests moved out to `<module>/tests.rs` (the editor's,
+        #2062) or split into `<module>/tests/` are declared
+        `#[cfg(test)] mod tests;`, so neither ships, wherever the module is."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            repo.write("src/widgets/editor/tests.rs", "use super::*;\n\n#[test]\nfn t() {}\n")
+            repo.commit()
+            repo.branch()
+            repo.write("src/widgets/editor/tests.rs", "use super::*;\n\nmod typing;\n")
+            repo.write("src/widgets/editor/tests/typing.rs", "use super::*;\n\n#[test]\nfn t() {}\n")
+            repo.commit()
+            errors, out = repo.check()
+            self.assertEqual(errors, [])
+            self.assertIn("No shipped files changed", out)
+
+    def test_a_shipped_folder_whose_name_only_starts_with_tests_still_ships(self):
+        """`src/testing/` is the Test Runner, shipped code: only a path
+        segment named exactly `tests` is test-only."""
+        for path in ("src/testing/worker.rs", "src/widgets/latests.rs", "src/tests_helper.rs"):
+            self.assertTrue(release.SHIPPED.match(path) and not release.NOT_SHIPPED.match(path), path)
+        for path in ("src/app/tests.rs", "src/app/tests/golden.rs", "src/widgets/editor/tests.rs",
+                     "src/widgets/editor/tests/typing.rs"):
+            self.assertTrue(release.NOT_SHIPPED.match(path), path)
+
     def test_editing_a_pending_fragment_alone_needs_no_new_one(self):
         """A typo fix in a note that has not shipped yet changes no code, so
         it does not owe a note of its own."""
