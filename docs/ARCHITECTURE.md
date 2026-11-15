@@ -220,6 +220,7 @@ src/
     │   ├── disk.rs          opening, reloading and saving: encodings, line endings, outside changes, save cleanups
     │   ├── gutter.rs        breakpoints, bookmarks, git marks and blame, overview ruler, line numbers
     │   ├── highlighting.rs  syntax highlight passes, colours carried across edits, bracket colours, swatches
+    │   ├── lsp_overlays.rs  semantic tokens, inlay hints, diagnostics, links, code lenses, ghost text
     │   ├── span_edits.rs    edits from language servers, formatters and peers, applied as text spans
     │   ├── tests.rs         the editor's own tests
     │   ├── undo.rs          undo and redo, undo groups, history kept for a reopened file
