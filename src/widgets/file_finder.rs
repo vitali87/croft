@@ -8,11 +8,15 @@ use ratatui::{
 };
 use rayon::prelude::*;
 use std::cmp::Ordering;
-use std::collections::BinaryHeap;
+use std::collections::{BinaryHeap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 const MAX_RESULTS: usize = 40;
+/// The most bytes one keystroke reads to count the lines of the files a
+/// `:line` query lists (#2127). A file past it is left in the list, as an
+/// unknown, rather than holding up the keystroke.
+const LINE_COUNT_BUDGET: u64 = 32 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct FileEntry {
@@ -69,6 +73,23 @@ pub struct FileFinder {
     /// theme's render (which draws no caret of its own); `None` on a boxed
     /// theme, whose caret is a painted block.
     pub last_caret: Option<(u16, u16)>,
+    /// Said above the list when no match has the line a `:line` query names
+    /// (#2127), so the list shows every match, longest first.
+    pub notice: Option<String>,
+    /// Lines counted in files a `:line` query listed, kept while the file's
+    /// size and time are unchanged so each keystroke reads a file once.
+    line_counts: HashMap<PathBuf, LineCount>,
+}
+
+/// What counting a file's lines found (#2127).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LineCount {
+    /// The lines found, counting no further than the line asked for.
+    lines: usize,
+    /// The whole file was read: `lines` is all it has.
+    complete: bool,
+    len: u64,
+    modified: Option<std::time::SystemTime>,
 }
 
 impl FileFinder {
@@ -83,6 +104,8 @@ impl FileFinder {
             last_rect: Rect::default(),
             last_inner_height: 0,
             last_caret: None,
+            notice: None,
+            line_counts: HashMap::new(),
         };
         me.refresh_results();
         me
@@ -228,6 +251,7 @@ impl FileFinder {
         // alpha.rs and a place in it, and a needle carrying the suffix would
         // match nothing at all (#472).
         let (file_part, hint) = split_line_hint(&self.query);
+        self.notice = None;
         let mut needle: String = file_part.trim().to_lowercase();
         // A hint with no file (`:236`) names a line in nothing: listing every
         // file and opening the first at that line would be a surprise, so it
@@ -312,7 +336,104 @@ impl FileFinder {
                 entry: entries[slot.idx].clone(),
             })
             .collect();
+        if let Some(hint) = hint {
+            self.keep_files_reaching(hint);
+        }
     }
+
+    /// With a `:line` hint, list only the matches long enough to have that
+    /// line, or the last line of a `:line-line` range (#2127): `a.ts:318`
+    /// names the one `a.ts` that has a line 318, not every `a.ts`. When no
+    /// match has it, every match stays, longest first, and [`Self::notice`]
+    /// says so, since the line is likely mistyped.
+    ///
+    /// Only the listed matches are read, each only as far as the line asked
+    /// for, and each count is kept between keystrokes. A file that can't be
+    /// read, or is past the keystroke's [`LINE_COUNT_BUDGET`], stays listed.
+    fn keep_files_reaching(&mut self, hint: LineHint) {
+        let needed = hint.end.unwrap_or(hint.line);
+        let mut budget = LINE_COUNT_BUDGET;
+        let results = std::mem::take(&mut self.results);
+        let counts: Vec<Option<LineCount>> = results
+            .iter()
+            .map(|r| self.line_count(&r.entry.path, needed, &mut budget))
+            .collect();
+        let reaches = |c: &Option<LineCount>| c.is_none_or(|c| c.lines >= needed);
+        if results.is_empty() || counts.iter().any(reaches) {
+            self.results = results
+                .into_iter()
+                .zip(&counts)
+                .filter(|(_, c)| reaches(c))
+                .map(|(r, _)| r)
+                .collect();
+            return;
+        }
+        // Every count is a whole file's, and short of the line. A stable
+        // sort keeps the match order among files of one length.
+        let mut ranked: Vec<(ScoredResult, usize)> = results
+            .into_iter()
+            .zip(counts)
+            .map(|(r, c)| (r, c.map_or(0, |c| c.lines)))
+            .collect();
+        ranked.sort_by_key(|(_, lines)| std::cmp::Reverse(*lines));
+        self.notice = Some(format!("no match has line {needed} \u{b7} longest first"));
+        self.results = ranked.into_iter().map(|(r, _)| r).collect();
+    }
+
+    /// The lines of `path`, counted no further than `needed`, from the
+    /// cache while the file's size and time are unchanged.
+    fn line_count(&mut self, path: &Path, needed: usize, budget: &mut u64) -> Option<LineCount> {
+        let meta = std::fs::metadata(path).ok()?;
+        let (len, modified) = (meta.len(), meta.modified().ok());
+        if let Some(c) = self.line_counts.get(path)
+            && c.len == len
+            && c.modified == modified
+            && (c.complete || c.lines >= needed)
+        {
+            return Some(*c);
+        }
+        let (lines, complete) = count_lines(path, needed, budget)?;
+        let c = LineCount {
+            lines,
+            complete,
+            len,
+            modified,
+        };
+        self.line_counts.insert(path.to_path_buf(), c);
+        Some(c)
+    }
+}
+
+/// The lines in the file at `path`, reading no further than the `cap`-th:
+/// `(cap, false)` once it has that many, `(n, true)` with its whole count
+/// when it has fewer. A last line without a newline counts. `None` when the
+/// file can't be read or `budget` (bytes, shared by one keystroke's reads)
+/// runs out first.
+fn count_lines(path: &Path, cap: usize, budget: &mut u64) -> Option<(usize, bool)> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut newlines = 0usize;
+    let mut last = None;
+    loop {
+        if *budget == 0 {
+            return None;
+        }
+        let n = file.read(&mut buf).ok()?;
+        if n == 0 {
+            break;
+        }
+        *budget = budget.saturating_sub(n as u64);
+        newlines += memchr::memchr_iter(b'\n', &buf[..n]).count();
+        last = buf[..n].last().copied();
+        if newlines >= cap {
+            return Some((cap, false));
+        }
+    }
+    Some((
+        newlines + usize::from(last.is_some_and(|b| b != b'\n')),
+        true,
+    ))
 }
 
 /// One ranked match candidate. Ordering is "worse comes first" so a
@@ -980,10 +1101,26 @@ pub fn render_file_finder(
         width: inner.width,
         height: 1,
     };
-    let sep_line = Line::from(Span::styled(
-        "─".repeat(separator_rect.width as usize),
-        Style::default().fg(theme.ui(Color::Rgb(0x3b, 0x42, 0x52))),
-    ));
+    let rule = Style::default().fg(theme.ui(Color::Rgb(0x3b, 0x42, 0x52)));
+    let sep_line = match finder.notice.as_deref() {
+        // No match has the line asked for (#2127): said on the rule, above
+        // the list it explains.
+        Some(notice) => {
+            let label = format!("\u{2500} {notice} ");
+            let fill = (separator_rect.width as usize).saturating_sub(label.chars().count());
+            Line::from(vec![
+                Span::styled(
+                    label,
+                    Style::default().fg(theme.ui(Color::Rgb(0xeb, 0xcb, 0x8b))),
+                ),
+                Span::styled("\u{2500}".repeat(fill), rule),
+            ])
+        }
+        None => Line::from(Span::styled(
+            "\u{2500}".repeat(separator_rect.width as usize),
+            rule,
+        )),
+    };
     Widget::render(Paragraph::new(sep_line), separator_rect, buf);
 
     let list_rect = Rect {
@@ -1087,7 +1224,10 @@ fn render_finder_card(
     }
     let (file_query, _) = split_line_hint(&finder.query);
     let file_query = file_query.trim();
-    let count = if finder.query.trim().is_empty() {
+    let count = if let Some(notice) = &finder.notice {
+        // No match has the line asked for (#2127): the count's place says so.
+        notice.clone()
+    } else if finder.query.trim().is_empty() {
         qi::count_label(finder.entries.len(), false, false, "file", "files")
     } else {
         qi::count_label(total, true, total >= MAX_RESULTS, "file", "files")
@@ -1436,6 +1576,123 @@ mod tests {
         let single = build_multi_file_index(&[a_root]);
         assert_eq!(single.len(), 1);
         assert_eq!(single[0].rel, "main.rs");
+    }
+
+    /// `n` numbered lines written to `rel` under `root`, and its entry.
+    fn file_with_lines(root: &Path, rel: &str, n: usize) -> FileEntry {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let text: String = (1..=n).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(&path, text).unwrap();
+        FileEntry { path, ..entry(rel) }
+    }
+
+    fn listed(finder: &FileFinder) -> Vec<&str> {
+        finder
+            .visible_results()
+            .iter()
+            .map(|r| r.entry.rel.as_str())
+            .collect()
+    }
+
+    /// #2127: `a.ts:318` lists only the `a.ts` long enough to have a line
+    /// 318, not every `a.ts` in the workspace; a range needs its last line.
+    #[test]
+    fn a_line_hint_lists_only_files_that_have_the_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let entries = vec![
+            file_with_lines(tmp.path(), "web/a.ts", 50),
+            file_with_lines(tmp.path(), "api/a.ts", 400),
+            file_with_lines(tmp.path(), "cli/a.ts", 90),
+        ];
+        let mut finder = FileFinder::new(Arc::new(entries));
+        finder.set_query("a.ts");
+        assert_eq!(listed(&finder).len(), 3, "no hint: every a.ts");
+        finder.set_query("a.ts:318");
+        assert_eq!(listed(&finder), ["api/a.ts"]);
+        assert_eq!(finder.notice, None);
+        finder.set_query("a.ts:90");
+        assert_eq!(listed(&finder).len(), 2, "the last line counts");
+        assert!(!listed(&finder).contains(&"web/a.ts"));
+        finder.set_query("a.ts:40-120");
+        assert_eq!(listed(&finder), ["api/a.ts"], "a range needs its last line");
+        finder.set_query("a.ts:7:3");
+        assert_eq!(listed(&finder).len(), 3, "every one has line 7");
+    }
+
+    /// #2127 negative: when no match has the line, every match is listed,
+    /// longest first, and the finder says why, since the line is likely
+    /// mistyped.
+    #[test]
+    fn a_line_no_match_has_lists_every_match_longest_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        let entries = vec![
+            file_with_lines(tmp.path(), "web/a.ts", 50),
+            file_with_lines(tmp.path(), "api/a.ts", 400),
+            file_with_lines(tmp.path(), "cli/a.ts", 90),
+        ];
+        let mut finder = FileFinder::new(Arc::new(entries));
+        finder.set_query("a.ts:5000");
+        assert_eq!(listed(&finder), ["api/a.ts", "cli/a.ts", "web/a.ts"]);
+        assert_eq!(
+            finder.notice.as_deref(),
+            Some("no match has line 5000 \u{b7} longest first")
+        );
+        finder.set_query("a.ts:318");
+        assert_eq!(finder.notice, None, "the notice goes once a match has it");
+    }
+
+    /// #2127: a count is kept between keystrokes while the file is
+    /// unchanged, and a file that grows is counted again.
+    #[test]
+    fn a_line_hint_recounts_a_file_that_changed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let short = file_with_lines(tmp.path(), "a.ts", 10);
+        let path = short.path.clone();
+        let mut finder = FileFinder::new(Arc::new(vec![short]));
+        finder.set_query("a.ts:200");
+        assert_eq!(
+            finder.notice.as_deref().map(|n| n.contains("200")),
+            Some(true)
+        );
+        let text: String = (1..=300).map(|i| format!("line {i}\n")).collect();
+        std::fs::write(&path, text).unwrap();
+        finder.set_query("a.ts:20");
+        finder.set_query("a.ts:200");
+        assert_eq!(listed(&finder), ["a.ts"]);
+        assert_eq!(finder.notice, None, "the grown file has line 200");
+    }
+
+    /// #2127: what counts as a line, and the cap that stops the read.
+    #[test]
+    fn count_lines_counts_a_last_line_without_a_newline_and_stops_at_the_cap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = |name: &str, text: &str| {
+            let p = tmp.path().join(name);
+            std::fs::write(&p, text).unwrap();
+            p
+        };
+        let mut budget = LINE_COUNT_BUDGET;
+        assert_eq!(count_lines(&file("e", ""), 5, &mut budget), Some((0, true)));
+        assert_eq!(
+            count_lines(&file("n", "a\nb\n"), 5, &mut budget),
+            Some((2, true))
+        );
+        assert_eq!(
+            count_lines(&file("t", "a\nb"), 5, &mut budget),
+            Some((2, true))
+        );
+        assert_eq!(
+            count_lines(&file("c", "1\n2\n3\n4\n"), 3, &mut budget),
+            Some((3, false))
+        );
+        assert_eq!(count_lines(&tmp.path().join("gone"), 3, &mut budget), None);
+        let mut spent = 0;
+        assert_eq!(
+            count_lines(&file("b", "a\n"), 5, &mut spent),
+            None,
+            "no budget left"
+        );
     }
 
     fn entry(rel: &str) -> FileEntry {
