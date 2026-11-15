@@ -53,9 +53,15 @@ see [docs/MACOS.md](docs/MACOS.md#spotlight-indexing-and-the-build-directory).
   message and CI proves every Rust item you touched moved byte for byte
   (visibility may widen, and rustfmt may lay out anew an item the wider
   visibility made too long). `python3 scripts/check_pure_move.py list <file>`
-  lists a file's items with their line ranges, to plan the move. The split of
-  `src/app/mod.rs` (#2062) is done by `scripts/move_items.py --pr N`, from
+  lists a file's items with their line ranges, to plan the move.
+  `scripts/move_items.py` moves the items a manifest assigns to a file and
+  writes the move's glue, release note and docs row; it split
+  `src/app/mod.rs` into feature files (#2062) from
   `scripts/split_manifest.tsv`.
+* **Adding to the app?** Put a feature's code in its file under `src/app/`
+  (see the list in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)), not in
+  `src/app/mod.rs`, which keeps only the `App` struct, its state, start-up and
+  the main loop. A new feature that fits no file gets a file of its own.
 * **New or changed module?** Update its entry in
   [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). CI fails if you shorten a
   module's description without moving its reasoning into a `### <module>`

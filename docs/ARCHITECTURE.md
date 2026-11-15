@@ -117,45 +117,51 @@ src/
 ├── voice.rs              voice input for the Termux OSK mic key: delegates to `termux-dialog speech`, auto-installs `termux-api`, and injects the transcript via handle_key; a tap opens the dialog, a second tap cancels
 ├── zoxide.rs            zoxide integration: strict query + typo-tolerant fuzzy fallback (Damerau-Levenshtein) + install only on the user's y to the popup's offer, never at launch (pkg on Termux, curl script elsewhere), its outcome and failure reason kept for the session + InstallState surfaced to the Cmd+Z jump popup
 ├── app/                 event loop, three-pane layout + activity bar, key dispatch, status bar, mouse, clipboard, splitters, preview overlays, Customize Layout (compute_chrome_layout / panel_band_rect pure geometry, secondary side bar, Zen Mode)
-│   ├── mod.rs           the main App: render, key / mouse dispatch, status bar, splitters
-│   ├── agents_collab.rs coding agents, lanes, the AI navigator, multiplayer sessions
-│   ├── bottom_panel.rs  bottom panel, OUTPUT, PROBLEMS and diagnostics, project check, PORTS
+│   ├── mod.rs           the `App` struct and the state types it holds, `App::new`, start-up (`run`) and the main loop, focus and pane helpers; each feature lives in its own file below
+│   ├── agents_collab.rs coding agents in panes, agent and worktree lanes, approving agent edits, the AI navigator, and multiplayer sessions: relay, presence and peer carets
+│   ├── bottom_panel.rs  the bottom panel and its tab strip, the OUTPUT picker, PROBLEMS and the diagnostics store, the whole-project check, build matchers, and the PORTS panel
 │   ├── click.rs         double / triple click detection
-│   ├── code_scanning.rs SARIF results viewer, GitHub code scanning, SARIF logs as problems
-│   ├── codeql.rs        the CodeQL side bar: databases, queries, results, variant analysis, the CLI
-│   ├── completion.rs    completion popup, signature help, inline suggestions, Emmet
+│   ├── code_scanning.rs SARIF results viewer (list, open, preview, baselines, export, fixes and step marks), GitHub code scanning (pick, download, follow branch, dismiss) and SARIF logs shown as problems
+│   ├── codeql.rs        the CodeQL side bar: databases, query history and logs, running queries, suites and packs, result viewers, AST and CFG, the model editor, the run queue, variant analysis, and downloading and updating the CLI
+│   ├── commands.rs      `run_command`, the Command Palette, the Extensions view, extension commands (MCP tools, viewers) and Show Memory Usage
+│   ├── completion.rs    the completion popup, auto-imports, snippets, signature help, ghost-text suggestions and Emmet
 │   ├── cursor_blink.rs  caret blink timing
-│   ├── debugger.rs      Run and Debug: launch, adapters, breakpoints, stepping, watches, console
-│   ├── diff_merge.rs    diff editor, merge conflicts, three-way merge, history scrubber, local history
-│   ├── editor_input.rs  editor keys, vim mode, macros, multi-cursor, clipboard and paste routing
-│   ├── editor_tabs.rs   tabs and editor groups, Go Back/Forward, bookmarks, new windows
-│   ├── explorer.rs      file tree, Explorer sections, workspace folders, re-rooting, outside changes
+│   ├── debugger.rs      Run and Debug: launch configs and Add Configuration, compounds and preLaunchTask waits, adapters, debug builds, attach pickers, the paused view, watches, the console, stepping, every kind of breakpoint, Debug Test and inline values
+│   ├── diff_merge.rs    diff editor upkeep and navigation, merge conflicts and the three-way merge editor, the history scrubber, local history and the who-wrote-this lens
+│   ├── editor_input.rs  editor keys, vim mode, macros, multi-cursor and line commands, typing toggles, copy, cut and paste routing and the clipboard, and reading dropped file paths out of a paste
+│   ├── editor_layout.rs the tree of editor groups: splitting, moving focus between and collapsing them, and each group's rectangle; the focused group's tabs live in `App::editor`
+│   ├── editor_tabs.rs   tabs and editor groups, tab menus and pickers, Go Back/Forward, bookmarks, symbol tabs, and moving or copying an editor into a new window
+│   ├── explorer.rs      the file tree (keys, type-to-jump, cut, copy and paste, rename and move with server fixes, delete, drag targets), Explorer sections, workspace folders and .code-workspace files, re-rooting, file watching and outside changes, zoxide jump
+│   ├── frame.rs         drawing each frame (`render`), the status-bar text, caret visibility and the screen-reader descriptions
 │   ├── fs_watch.rs      filesystem watch + poll fallback feeding tree / editor / terminal refresh. The poll stats the file behind EVERY open tab, not just the focused one: a boundary dir carries no watch at all (see the storm rules — never root a stream at or above `target/`, `node_modules/`, `.git/`) and an in-place write does not move its parent dir's mtime, so for a file sitting directly in one this stat is the only thing that can notice a change; cost is one stat per open tab per (adaptively backed-off) tick
 │   ├── git_worker.rs    off-thread git status / changes worker
-│   ├── host_integration.rs host-terminal sequences and restore, panic log, croft view socket, self-update
+│   ├── host_integration.rs the host terminal: escape sequences, restoring it on exit or panic, the panic log, the unsupported-terminal notice, the `croft view` and `edit --wait` socket and rebase-todo editing, self-update and relaunch, and the update card
 │   ├── hover.rs         LSP hover dwell timing
-│   ├── inline_images.rs inline pictures: detection, chrome bake, per-frame overlays, minimap
-│   ├── language_servers.rs language-server features: go-to, rename, code actions, outline, breadcrumbs
+│   ├── inline_images.rs pictures in the terminal: support detection, the background chrome bake, sending and clearing each picture every frame (the activity-bar icons included), the editor, terminal and Markdown overlays, and the minimap
+│   ├── key_input.rs     `handle_key` and `handle_key_inner`, Cmd+K chords, every `is_*_key` predicate, the key and mouse contexts for user keymaps, voice input and the on-screen keyboard
+│   ├── language_servers.rs language servers: sync, messages and progress, decorations, go-to and peek, hierarchies, rename, code actions, formatting, linked editing, smart select, highlights, symbol pickers, code lens, outline, breadcrumbs, sticky scroll, restart
 │   ├── memory_report.rs Developer: Show Memory Usage: the per-subsystem figures laid out as Markdown, opened as a rendered preview so typing can't edit it
-│   ├── menus.rs         context and dropdown menus, `dispatch_menu_action`
+│   ├── menus.rs         right-click and dropdown menus: shortcut hints, ContextMenu methods, geometry, keys, drawing, `dispatch_menu_action`, and the status-bar click menus
+│   ├── mouse_input.rs   all mouse handling (`handle_mouse_inner`), hover popups and tooltips, and closing stale popups on a click
 │   ├── nav.rs           editor back / forward navigation history
 │   ├── overlay.rs       inline-image overlay state + clear-on-hide latches (iTerm2 cell eviction; the Kitty path adds a delete-all on the same clear frames)
 │   ├── perf_hud.rs      F8 performance HUD
-│   ├── prompts.rs       input prompts and list pickers
-│   ├── remote_sessions.rs SSH sessions, hand-off to remote croft, config sync, uploads, port forwarding
-│   ├── review.rs        pull-request review tabs and in-editor comment boxes
-│   ├── runners.rs       Testing view, Tasks, runnable blocks, notebooks, Fleet, Live Run, .http requests
-│   ├── save_restore.rs  saving, unsaved prompts, hot exit, session save/restore
-│   ├── scm.rs           Source Control panel, background git, commits, branches, hunks, blame
+│   ├── prompts.rs       the input popup and the list picker (opening, keys, clicks, drawing), `submit_input_prompt` and `confirm_list_picker`, and the small inline prompt
+│   ├── remote_sessions.rs SSH connect and install, the ssh-pane offer, handing off to a remote croft, Remote Explorer keys, config sync, drop relay and scp uploads, port forwarding, and opening URLs on the local machine
+│   ├── review.rs        pull-request review tabs (fetching with gh, viewed marks, checks, per-file diffs, worktree checkout) and the comment boxes in the editor: review threads, navigator notes and sticky notes
+│   ├── runners.rs       the Testing view, Tasks (Run Task, the build task, task inputs, problem matchers), runnable Markdown blocks, notebooks and kernels, Fleet, Live Run and .http requests
+│   ├── save_restore.rs  saving (save all, auto save, format on save, sudo save, encoding loss), unsaved prompts, hot exit, session save and restore, Revert, New Untitled, Save As and the launch file
+│   ├── scm.rs           Source Control: the panel and its keys, background git and its log, commits, push, pull and sync, stash, branches and pickers, hunks, permalinks, the commit graph, its dialogs, change gutters and inline blame
 │   ├── screencast.rs    Screencast Mode (Shift+F8): the keys pressed, the command each ran and the cell a click hit, drawn over the frame for a recording
-│   ├── search.rs        Search view, Search Editor, find/replace bar, Quick Open
-│   ├── settings.rs      Settings editor, config watching, Keyboard Shortcuts editor, themes, profiles
-│   ├── terminal_panes.rs terminal panes: split, layout, profiles, recordings, panel save/restore
-│   ├── terminal_tools.rs terminal input, find, quick select, copy mode, command history, links
-│   ├── viewers.rs       spreadsheet/CSV/SQLite, PDF, archive, hex, log and Markdown viewers
+│   ├── search.rs        the Search view and Replace All, Search Editor tabs, the find/replace bar (also over diffs and logs), Quick Open, and Switch Header/Source
+│   ├── settings.rs      the Settings editor and hub, live and per-language settings, watching config files, snippets, file associations and encodings, the Keyboard Shortcuts editor and the F1 overlay, the theme picker and profiles
+│   ├── sidebar_dwell.rs side bar auto-hide's grace delay: how long focus must stay away before the side bar collapses
+│   ├── terminal_panes.rs terminal panes: split, layout, collapse, maximize and rail, reorder, profiles, rename, notes, close and undo, saving and restoring the panel, redraw tracking, recordings, bells and exits, labels and pane buttons
+│   ├── terminal_tools.rs typing into terminals (key encoding, broadcast, paste confirm, redaction, timestamps), find, quick select, copy mode, command history and decorations, CAPTURES, links and inline suggestions
+│   ├── viewers.rs       read-only viewers: the spreadsheet, CSV and SQLite grid, PDF, archives, hex, rendered logs, and the Markdown preview with its scroll sync
 │   ├── welcome.rs       welcome-screen state: the "IN THIS RELEASE" highlights, read synchronously from `release_notes::release_notes()` (no thread, no network)
-│   ├── welcome_screen.rs welcome page drawing and the guided tour
-│   ├── workbench.rs     screen layout, Customize Layout, activity bar, splitters
+│   ├── welcome_screen.rs the welcome page (logo picture and its bake, wordmark, Start list, release-note card, Loch layout) and the guided tour
+│   ├── workbench.rs     screen layout and Customize Layout, the activity bar and its badges, the Manage menu, side-bar auto-hide, splitter drags and screencast mode
 │   └── tests/           whole-app tests, one file per area; `mod.rs` holds the helpers more than one file uses. `golden.rs` draws whole screens the way the main loop does and compares every cell, colour and the caret with the snapshots in `golden/` (`CROFT_BLESS=1` rewrites them; its module doc lists what it pins and masks)
 ├── dap/                 debugger stack: Debug Adapter Protocol client. debugpy (Python: the adapter on a private 3.14+ venv, the program on the project's own interpreter, #864) is the verified mechanism; Rust/C/C++ route to lldb-dap; JS/TS route to vscode-js-debug; Go routes to delve (`dlv dap` over TCP, single-session, #264). Which file types each handles is a data-driven extension axis (see registry.rs)
 │   ├── mod.rs
@@ -453,7 +459,7 @@ The inline-image baking pipeline and protocol dispatch: iTerm2 OSC 1337, Kitty g
 
 **The one unconditional wipe.** Resize/WINCH (`App::consume_resize_repaint`) always wipes. A dtach reattach fires WINCH against a blank physical screen while ratatui's back buffer says every cell is painted, so the next frame must clear and repaint on every protocol, Kitty included.
 
-**Re-asserting terminal modes on reattach.** The same WINCH also re-asserts the startup terminal modes (`mode_reassert_seq` in app/mod.rs: alt screen, mouse tracking, bracketed paste, kitty keyboard flags via the SET form, never a push) when `CROFT_SESSION_PERSISTENT` is set, because a reattached terminal never received the startup DECSETs and would otherwise have a dead mouse until the next updater re-exec. `takeover_mode_seq` is the single source of truth for those modes — startup, the post-scp TUI restore, and the reattach re-assert all emit the same block, with a test pinning the embedding — so a mode added at startup can never go missing from the reattach path. New startup modes go there, never inline at a call site.
+**Re-asserting terminal modes on reattach.** The same WINCH also re-asserts the startup terminal modes (`mode_reassert_seq` in app/host_integration.rs: alt screen, mouse tracking, bracketed paste, kitty keyboard flags via the SET form, never a push) when `CROFT_SESSION_PERSISTENT` is set, because a reattached terminal never received the startup DECSETs and would otherwise have a dead mouse until the next updater re-exec. `takeover_mode_seq` is the single source of truth for those modes — startup, the post-scp TUI restore, and the reattach re-assert all emit the same block, with a test pinning the embedding — so a mode added at startup can never go missing from the reattach path. New startup modes go there, never inline at a call site.
 
 **Releasing the terminal when the transport drops (#1460).** A dropped SSH connection ends the session's ssh without the remote croft running its teardown, and ssh puts the tty back in cooked mode. The terminal is left on that croft's alt screen with mouse tracking on. Anything printed next would scroll croft's screen, and every mouse move would echo as `^[[<35;…M`. So `run_croft_session` (remote.rs) writes `lost_session_release_seq` before it prints anything about a failed session, then drops whatever input is already queued. The sequence clears the kitty keyboard flags while the alt screen still shows, turns off every mode `takeover_mode_seq` turns on (a test checks the two against each other), and leaves the alt screen last, behind a DECSC so that leaving is harmless when the main screen already shows. It also resets the default colours (OSC 110/111, and iTerm2's session background), as croft's own exit does: nothing runs after a session that is given up (Ctrl+C during the reconnect, the attempts running out, a host with no session to resume), so the shell gets its colours back here. The reconnect progress then prints on the main screen. The resumed croft's WINCH sends `reattach_reassert_seq`, which is the startup modes followed by the theme's default colours, and repaints. The colours also reach a terminal attaching for the first time, which never had them.
 
@@ -671,7 +677,7 @@ Moves through a branch's history. This is the cursor behind "Source Control: Scr
 
 **Two boundary decisions.** Stepping back from the tree lands on HEAD rather than skipping it — they are different views, since one has your unsaved edits. And the oldest commit is a wall rather than a wrap, because a drag that reappeared at the present would read as the slider slipping.
 
-**A step never builds a view on the UI thread.** Highlighting and diffing a big file takes far longer than a frame (the 35k-line `src/app/mod.rs` takes over half a second), and even splitting it into lines costs several milliseconds. So `ViewBuilder` runs two lanes on their own threads. The plain lane keeps the split text of the commits around the cursor ready; a step shows that at once. The finished lane builds the highlighted, gutter-marked view, which `App::drain_scrub_views` swaps in when it lands. Each step replaces both queues rather than adding to them, so a held arrow key leaves no backlog of commits already passed. The app keeps up to `SCRUB_VIEWS_KEPT` of each kind, so stepping back is free, and frees evicted views off the UI thread. The finished lane also parses the version's OUTLINE symbols, which `sync_outline` shows once they land (the previous outline of the same file stays until then; another file's is cleared), since parsing the whole file on each step cost about 400 ms. Both lanes also fill the whole-buffer caches a first paint would compute (fold tables, conflict markers, the widest line), so the UI thread paints only the visible rows. Measured on this repository's `src/app/mod.rs` (35k lines, 121 commits), a warm step is about 1 ms p50 and 2 ms p95, against the 16 ms budget.
+**A step never builds a view on the UI thread.** Highlighting and diffing a big file takes far longer than a frame (a 35,000-line file takes over half a second), and even splitting it into lines costs several milliseconds. So `ViewBuilder` runs two lanes on their own threads. The plain lane keeps the split text of the commits around the cursor ready; a step shows that at once. The finished lane builds the highlighted, gutter-marked view, which `App::drain_scrub_views` swaps in when it lands. Each step replaces both queues rather than adding to them, so a held arrow key leaves no backlog of commits already passed. The app keeps up to `SCRUB_VIEWS_KEPT` of each kind, so stepping back is free, and frees evicted views off the UI thread. The finished lane also parses the version's OUTLINE symbols, which `sync_outline` shows once they land (the previous outline of the same file stays until then; another file's is cleared), since parsing the whole file on each step cost about 400 ms. Both lanes also fill the whole-buffer caches a first paint would compute (fold tables, conflict markers, the widest line), so the UI thread paints only the visible rows. Measured on this repository's `src/app/mod.rs` before it was split into feature files (35k lines, 121 commits), a warm step is about 1 ms p50 and 2 ms p95, against the 16 ms budget.
 
 ### pair_host.rs
 

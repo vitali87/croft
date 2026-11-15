@@ -82,7 +82,8 @@ So option (b) is not blocked on the emulator. It is blocked on four things:
 
 Inline images never enter the ratatui buffer and never enter any client's
 alacritty grid. They are written straight to stdout, after the frame, with
-absolute cursor positioning (`app/mod.rs:5911-5943`):
+absolute cursor positioning (`App::flush_activity_image_overlays` in
+`app/mod.rs`, and the overlays in `app/inline_images.rs`):
 
 ```rust
 let _ = write!(out, "\x1b[?25l\x1b[s");
@@ -113,7 +114,7 @@ diffing code to measure. What the tree does record:
 - `pty_pending_bytes` (`terminal.rs:446-455`) exists precisely to distinguish
   interactive echo from a bulk stream, so that "large ones stay capped so they
   can't saturate the ssh pipe and starve input."
-- `is_remote_session()` (`app/mod.rs:46819-46826`) throttles PTY redraws further
+- `is_remote_session()` (`app/mod.rs`) throttles PTY redraws further
   over SSH for the same reason.
 
 Byte-rate saturation over a network hop is a known, already-mitigated problem
