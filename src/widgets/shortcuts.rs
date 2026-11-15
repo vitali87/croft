@@ -463,7 +463,12 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
             },
             ShortcutEntry {
                 keys: "Cmd+K →",
-                description: "Close the tabs right of the active one (palette: View: Close Editors to the Right in Group; View: Close Other Editors in Group closes all but it)",
+                description: "Close the tabs right of the active one (palette: View: Close Editors to the Right in Group)",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd+K Shift+X",
+                description: "Close the other tabs of this group, keeping pinned and unsaved ones (palette: View: Close Other Editors in Group)",
                 handler: "",
             },
             ShortcutEntry {

@@ -158,6 +158,16 @@ impl App {
                 self.open_participants_picker();
                 true
             }
+            // Cmd+K Shift+X: close the other tabs of the focused group, as the
+            // tab menu's Close Others and View: Close Other Editors in Group
+            // do (#2072). The menu's old ⌥⌘T hint was iTerm2's New Tab and a
+            // Linux desktop's new terminal, a chord croft never received.
+            // Matched case-insensitively for the same CSI-u reason as Shift+W
+            // above, and before the plain X arm below.
+            KeyCode::Char(c) if shifted && plain && c.eq_ignore_ascii_case(&'x') => {
+                self.run_command(crate::widgets::command_palette::Command::CloseOtherEditors);
+                true
+            }
             // Cmd+K X: cancel the AI stream (croft pair) — the keyboard
             // form of the gutter stop button; the pilot reverts the
             // streamed text.

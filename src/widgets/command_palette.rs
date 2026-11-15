@@ -1779,9 +1779,9 @@ impl Command {
             Command::CloseEditor => "Cmd+W",
             Command::ReopenClosedEditor => "Cmd+K Shift+W",
             Command::ZoxideJump => "Cmd+Z in Explorer",
-            // No chord: the tab menu's ⌥⌘T hint is iTerm2's own New Tab
-            // chord, which croft leaves alone.
-            Command::CloseOtherEditors => "",
+            // Not VS Code's ⌥⌘T, which iTerm2 keeps for New Tab and a Linux
+            // desktop for a new terminal (#2072).
+            Command::CloseOtherEditors => "Cmd+K Shift+X",
             Command::CloseEditorsToTheRight => "Cmd+K →",
             Command::CloseSavedEditors => "Cmd+K U",
             Command::CloseAllEditors => "Cmd+K W",
@@ -3677,13 +3677,13 @@ mod tests {
 
     /// #852 (comment 3): each editor-tab action is in the palette under
     /// VS Code's title, as the top row for that title, showing the chord
-    /// croft has for it (Close Others has none: the tab menu's ⌥⌘T is not a
-    /// chord croft binds).
+    /// croft has for it (Close Others is croft's own Cmd+K Shift+X, #2072:
+    /// VS Code's ⌥⌘T never reaches croft).
     #[test]
     fn the_editor_tab_commands_are_found_under_their_vscode_titles() {
         let mut palette = CommandPalette::new();
         for (title, chord) in [
-            ("View: Close Other Editors in Group", ""),
+            ("View: Close Other Editors in Group", "Cmd+K Shift+X"),
             ("View: Close Editors to the Right in Group", "Cmd+K →"),
             ("View: Close Saved Editors in Group", "Cmd+K U"),
             ("View: Close All Editors", "Cmd+K W"),
