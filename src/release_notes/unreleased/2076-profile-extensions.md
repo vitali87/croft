@@ -1,0 +1,1 @@
+fix: With a settings profile active, turning an extension off or on in Extensions now decides whether its viewers and commands are offered and run, in the Command Palette and the Explorer menu alike (#2076).

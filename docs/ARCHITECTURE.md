@@ -187,7 +187,7 @@ src/
 │   ├── mod.rs           module overview + McpOutcome (the off-thread worker's result)
 │   ├── transport.rs     JSON-RPC 2.0 over newline-delimited JSON on the server's stdio (the MCP stdio framing; simpler than DAP's Content-Length); setsid-detached child, reader thread -> mpsc, stderr drained into an 8 KiB tail whose last line names why a server exited before answering, least-privilege env_clear()+envs()
 │   ├── client.rs        the MCP lifecycle, dual-era: a server/discover probe settles each server's era once, then 2026-07-28 per-request _meta with no handshake, or the legacy initialize -> notifications/initialized fallback, before tools/list -> tools/call; synchronous id-correlated calls; tool_fingerprint for trust-on-first-use rug-pull detection
-│   ├── registry.rs           data-driven command registry: `contributed_commands()` for eager palette registration and `resolve_command_in_dir()` for lazy tool/server resolution from `[[commands]]`/`[[mcp_servers]]`, plus the `[[viewers]]` lookups
+│   ├── registry.rs           data-driven command registry: `contributed_commands_in_dir()` for eager palette registration and `resolve_command_in_dir()` for lazy tool/server resolution from `[[commands]]`/`[[mcp_servers]]`, plus the `[[viewers]]` lookups
 │   ├── catalog.rs            the curated MCP catalog (AVAILABLE tier of the Extensions panel): bundled CATALOG_MANIFESTS merged with the remote signed index, with install/uninstall gated by provenance so croft removes only what it added, never a hand-dropped user manifest
 │   └── registry_index.rs the remote vetted index (extensions.croft.software): fetches index.json plus its signature and verifies ed25519 against a baked `INDEX_PUBLIC_KEY` BEFORE caching; stale-while-revalidate, disarmed when the key is all-zero
 ├── lsp/                 LSP client stack
@@ -1383,7 +1383,7 @@ A content-keyed disk cache of semantic-token batches at `~/.croft/sem-cache`.
 
 ### mcp/registry.rs
 
-Data-driven MCP registration. `contributed_commands()` does eager palette registration and skips disabled entries; `resolve_command_in_dir()` is lazy, yielding a tool plus a spawnable server with a pinned `Provision`, with the app passing the config dir it carries. Both read the `[[commands]]` and `[[mcp_servers]]` manifests.
+Data-driven MCP registration. `contributed_commands_in_dir()` does eager palette registration and skips disabled entries; `resolve_command_in_dir()` is lazy, yielding a tool plus a spawnable server with a pinned `Provision`, with the app passing the config dir it carries and its own disabled set, the one the Extensions panel shows and saves to the active profile (#2076). Both read the `[[commands]]` and `[[mcp_servers]]` manifests.
 
 **Viewers come from the same manifest path.** `contributed_viewer_commands_in_dir()` and `viewer_for_path_in_dir()` read `[[viewers]]`, which is a terminal program run on a file in its own pane.
 
