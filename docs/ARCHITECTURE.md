@@ -222,6 +222,7 @@ src/
     │   ├── highlighting.rs  syntax highlight passes, colours carried across edits, bracket colours, swatches
     │   ├── lsp_overlays.rs  semantic tokens, inlay hints, diagnostics, links, code lenses, ghost text
     │   ├── on_enter.rs      Enter, auto-indent, comment continuation, per-language Enter rules, paste re-indent
+    │   ├── snippets.rs      snippets and tab stops, Emmet
     │   ├── span_edits.rs    edits from language servers, formatters and peers, applied as text spans
     │   ├── tests.rs         the editor's own tests
     │   ├── typing.rs        typing, pasting and deleting, auto-closed pairs, quotes and tags
