@@ -697,6 +697,7 @@ impl App {
             self.agent_lane_panel.hover_pointer = panel_pointer;
             self.dependencies.hover_pointer = panel_pointer;
             self.extensions.hover_pointer = panel_pointer;
+            self.testing.hover_pointer = panel_pointer;
             self.commit_graph.hover_pointer = panel_pointer;
             // Explorer stacks its toggled sub-views (Open Editors / Folders /
             // Outline / Timeline / Dependencies) inside the usable strip.
