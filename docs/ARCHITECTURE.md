@@ -221,6 +221,7 @@ src/
     │   ├── gutter.rs        breakpoints, bookmarks, git marks and blame, overview ruler, line numbers
     │   ├── highlighting.rs  syntax highlight passes, colours carried across edits, bracket colours, swatches
     │   ├── lsp_overlays.rs  semantic tokens, inlay hints, diagnostics, links, code lenses, ghost text
+    │   ├── multi_cursor.rs  multiple carets, occurrence selection, box and column selection
     │   ├── on_enter.rs      Enter, auto-indent, comment continuation, per-language Enter rules, paste re-indent
     │   ├── snippets.rs      snippets and tab stops, Emmet
     │   ├── span_edits.rs    edits from language servers, formatters and peers, applied as text spans
