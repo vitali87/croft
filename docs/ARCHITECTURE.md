@@ -219,6 +219,7 @@ src/
     │   ├── diff_view.rs     side-by-side and inline diffs, merge panes, conflicts, a file at a commit
     │   ├── disk.rs          opening, reloading and saving: encodings, line endings, outside changes, save cleanups
     │   ├── gutter.rs        breakpoints, bookmarks, git marks and blame, overview ruler, line numbers
+    │   ├── highlighting.rs  syntax highlight passes, colours carried across edits, bracket colours, swatches
     │   ├── span_edits.rs    edits from language servers, formatters and peers, applied as text spans
     │   ├── tests.rs         the editor's own tests
     │   ├── undo.rs          undo and redo, undo groups, history kept for a reopened file
