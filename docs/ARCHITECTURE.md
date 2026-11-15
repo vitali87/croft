@@ -230,6 +230,7 @@ src/
     │   ├── snippets.rs      snippets and tab stops, Emmet
     │   ├── span_edits.rs    edits from language servers, formatters and peers, applied as text spans
     │   ├── tests.rs         the editor's own tests
+    │   ├── transforms.rs    change case, bump numbers, transpose characters
     │   ├── typing.rs        typing, pasting and deleting, auto-closed pairs, quotes and tags
     │   ├── undo.rs          undo and redo, undo groups, history kept for a reopened file
     │   ├── viewers.rs       pictures, PDF, spreadsheets and SQLite, archives, hex, logs, Markdown and notebook previews
