@@ -223,6 +223,7 @@ src/
     │   ├── lsp_overlays.rs  semantic tokens, inlay hints, diagnostics, links, code lenses, ghost text
     │   ├── span_edits.rs    edits from language servers, formatters and peers, applied as text spans
     │   ├── tests.rs         the editor's own tests
+    │   ├── typing.rs        typing, pasting and deleting, auto-closed pairs, quotes and tags
     │   ├── undo.rs          undo and redo, undo groups, history kept for a reopened file
     │   ├── viewers.rs       pictures, PDF, spreadsheets and SQLite, archives, hex, logs, Markdown and notebook previews
     │   ├── wrap.rs          soft wrap rows, comment boxes between lines
