@@ -129,6 +129,7 @@ src/
 │   ├── debugger.rs      Run and Debug: launch, adapters, breakpoints, stepping, watches, console
 │   ├── diff_merge.rs    diff editor, merge conflicts, three-way merge, history scrubber, local history
 │   ├── editor_input.rs  editor keys, vim mode, macros, multi-cursor, clipboard and paste routing
+│   ├── editor_layout.rs the tree of editor groups: splitting, moving focus between and collapsing them, and each group's rectangle; the focused group's tabs live in `App::editor`
 │   ├── editor_tabs.rs   tabs and editor groups, Go Back/Forward, bookmarks, new windows
 │   ├── explorer.rs      file tree, Explorer sections, workspace folders, re-rooting, outside changes
 │   ├── frame.rs         drawing each frame (`render`), status-bar text, caret visibility
@@ -154,6 +155,7 @@ src/
 │   ├── screencast.rs    Screencast Mode (Shift+F8): the keys pressed, the command each ran and the cell a click hit, drawn over the frame for a recording
 │   ├── search.rs        Search view, Search Editor, find/replace bar, Quick Open
 │   ├── settings.rs      Settings editor, config watching, Keyboard Shortcuts editor, themes, profiles
+│   ├── sidebar_dwell.rs side bar auto-hide's grace delay: how long focus must stay away before the side bar collapses
 │   ├── terminal_panes.rs terminal panes: split, layout, profiles, recordings, panel save/restore
 │   ├── terminal_tools.rs terminal input, find, quick select, copy mode, command history, links
 │   ├── viewers.rs       spreadsheet/CSV/SQLite, PDF, archive, hex, log and Markdown viewers
@@ -675,7 +677,7 @@ Moves through a branch's history. This is the cursor behind "Source Control: Scr
 
 **Two boundary decisions.** Stepping back from the tree lands on HEAD rather than skipping it — they are different views, since one has your unsaved edits. And the oldest commit is a wall rather than a wrap, because a drag that reappeared at the present would read as the slider slipping.
 
-**A step never builds a view on the UI thread.** Highlighting and diffing a big file takes far longer than a frame (a 35,000-line file takes over half a second), and even splitting it into lines costs several milliseconds. So `ViewBuilder` runs two lanes on their own threads. The plain lane keeps the split text of the commits around the cursor ready; a step shows that at once. The finished lane builds the highlighted, gutter-marked view, which `App::drain_scrub_views` swaps in when it lands. Each step replaces both queues rather than adding to them, so a held arrow key leaves no backlog of commits already passed. The app keeps up to `SCRUB_VIEWS_KEPT` of each kind, so stepping back is free, and frees evicted views off the UI thread. The finished lane also parses the version's OUTLINE symbols, which `sync_outline` shows once they land (the previous outline of the same file stays until then; another file's is cleared), since parsing the whole file on each step cost about 400 ms. Both lanes also fill the whole-buffer caches a first paint would compute (fold tables, conflict markers, the widest line), so the UI thread paints only the visible rows. Measured on this repository's `src/app/mod.rs` (35k lines, 121 commits), a warm step is about 1 ms p50 and 2 ms p95, against the 16 ms budget.
+**A step never builds a view on the UI thread.** Highlighting and diffing a big file takes far longer than a frame (a 35,000-line file takes over half a second), and even splitting it into lines costs several milliseconds. So `ViewBuilder` runs two lanes on their own threads. The plain lane keeps the split text of the commits around the cursor ready; a step shows that at once. The finished lane builds the highlighted, gutter-marked view, which `App::drain_scrub_views` swaps in when it lands. Each step replaces both queues rather than adding to them, so a held arrow key leaves no backlog of commits already passed. The app keeps up to `SCRUB_VIEWS_KEPT` of each kind, so stepping back is free, and frees evicted views off the UI thread. The finished lane also parses the version's OUTLINE symbols, which `sync_outline` shows once they land (the previous outline of the same file stays until then; another file's is cleared), since parsing the whole file on each step cost about 400 ms. Both lanes also fill the whole-buffer caches a first paint would compute (fold tables, conflict markers, the widest line), so the UI thread paints only the visible rows. Measured on this repository's `src/app/mod.rs` before it was split into feature files (35k lines, 121 commits), a warm step is about 1 ms p50 and 2 ms p95, against the 16 ms budget.
 
 ### pair_host.rs
 
