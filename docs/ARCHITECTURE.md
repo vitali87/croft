@@ -219,6 +219,7 @@ src/
     │   ├── diff_view.rs     side-by-side and inline diffs, merge panes, conflicts, a file at a commit
     │   ├── span_edits.rs    edits from language servers, formatters and peers, applied as text spans
     │   ├── tests.rs         the editor's own tests
+    │   ├── undo.rs          undo and redo, undo groups, history kept for a reopened file
     │   ├── viewers.rs       pictures, PDF, spreadsheets and SQLite, archives, hex, logs, Markdown and notebook previews
     ├── editor_find.rs        VS Code-style inline Find bar (`Cmd+F`) with match highlight, Enter/Shift+Enter walk, case/whole-word/regex toggles and a Replace row (`Cmd+Opt+F`); Replace All runs through the same `split_for_highlight` as count and paint
     ├── extensions.rs         Extensions sidebar widget: projects bundled and user manifests into a theme-aware list grouped under BUILT-IN/INSTALLED/AVAILABLE, with pill toggles, +Add, trash, a local filter box and clear/refresh; reports clicks back to App, which owns the state
