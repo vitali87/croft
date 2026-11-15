@@ -1456,8 +1456,13 @@ fn handle_clipboard_request(host: &str, socket: &Path, inbox_dir: &str, request_
 ///
 /// The payload file is removed in the same command that reads it: a copy is
 /// transient, and leaving them behind grows the relay dir for the life of the
-/// session. There is no inbox sentinel to write — nothing on the remote side
-/// is waiting on the answer.
+/// session.
+///
+/// Only a copy that did NOT reach this clipboard is answered, with `.err` in
+/// the request's inbox directory: this machine had no clipboard to write (a
+/// Linux box with no clipboard tool), or the payload never arrived. The
+/// remote croft then sends it by OSC 52, which reaches this machine's
+/// terminal over the SSH session. A copy that landed costs no round trip.
 fn handle_copy_request(host: &str, socket: &Path, inbox_dir: &str, request_id: &str) {
     // The id indexes a file in the inbox this pump owns, and it is
     // interpolated into a remote shell command, so it is checked before use:
@@ -1512,13 +1517,22 @@ fn handle_copy_request(host: &str, socket: &Path, inbox_dir: &str, request_id: &
         Err(_) => {
             let _ = child.kill();
             let _ = child.wait();
+            write_relay_err(
+                host,
+                socket,
+                inbox_dir,
+                request_id,
+                "copy payload timed out",
+            );
             return;
         }
     };
     if payload.is_empty() || payload.len() > MAX_COPY_PAYLOAD_BYTES {
         return;
     }
-    let _ = crate::clipboard::write_string(&String::from_utf8_lossy(&payload));
+    if !crate::clipboard::write_string(&String::from_utf8_lossy(&payload)) {
+        write_relay_err(host, socket, inbox_dir, request_id, "no clipboard to write");
+    }
 }
 
 /// A copy payload the pump will bring home, capped because it lands in THIS

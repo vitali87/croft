@@ -1352,3 +1352,82 @@ fn every_copy_on_a_relay_session_reaches_the_local_clipboard() {
         "Ports copy"
     );
 }
+
+/// #2070: a copy on a relay session goes home and leaves this box's
+/// clipboard alone, so a paste inside croft must not read that clipboard
+/// first. Cut then Paste put back what was on it before the cut.
+#[test]
+fn a_cut_then_paste_on_a_relay_session_puts_back_the_cut_text() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("a.txt");
+    std::fs::write(&p, "alpha beta\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.clipboard_reader = || Some(String::from("stale remote text"));
+    app.editor.open(&p).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.selection = Some(crate::widgets::editor::EditorSelection {
+        anchor: (0, 0),
+        head: (0, 5),
+    });
+    app.editor.cursor_col = 5;
+
+    let sent = relay_copied(&mut app, |app| {
+        app.handle_key(key(KeyCode::Char('x'), KeyModifiers::SUPER))
+            .unwrap();
+    });
+    assert_eq!(sent.as_deref(), Some("alpha"), "the cut went home");
+    assert_eq!(app.editor.lines[0], " beta");
+
+    app.editor.cursor_col = app.editor.lines[0].chars().count();
+    app.handle_key(key(KeyCode::Char('v'), KeyModifiers::SUPER))
+        .unwrap();
+    assert_eq!(app.editor.lines[0], " betaalpha", "{}", app.status);
+}
+
+/// #2070: when the local machine has no clipboard to write, its pump
+/// answers the copy with `.err`, and the copy goes by OSC 52 from here, as
+/// it did before copies went home. A copy with no answer sends nothing.
+#[test]
+fn a_relay_copy_the_local_machine_could_not_take_goes_by_osc52() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.is_relay_session = true;
+    let _ = crate::clipboard::test_clip::take_osc52_sent();
+    with_relay_home(home.path(), || {
+        let inbox = app.relay_inbox_path().expect("relay inbox derivable");
+        assert_eq!(app.copy_where_pasted("landed"), CopyLanding::Local);
+        assert_eq!(app.copy_where_pasted("refused"), CopyLanding::Local);
+        let ids: Vec<String> = app
+            .pending_relay_copies
+            .iter()
+            .map(|c| c.request_id.clone())
+            .collect();
+        assert_eq!(ids.len(), 2, "both copies wait for an answer");
+
+        assert!(!app.drain_relay_copies(), "no answer yet");
+        assert!(crate::clipboard::test_clip::take_osc52_sent().is_empty());
+
+        let refused = inbox.join(&ids[1]);
+        std::fs::create_dir_all(&refused).unwrap();
+        std::fs::write(refused.join(".err"), "no clipboard to write").unwrap();
+        assert!(app.drain_relay_copies());
+        assert_eq!(
+            crate::clipboard::test_clip::take_osc52_sent(),
+            vec![String::from("refused")]
+        );
+        assert!(app.status.contains("via OSC 52"), "{}", app.status);
+        assert!(!refused.exists(), "the answer is cleared");
+        assert_eq!(app.pending_relay_copies.len(), 1, "the other still waits");
+
+        app.pending_relay_copies[0].started_at -= RELAY_COPY_ANSWER_WAIT;
+        assert!(!app.drain_relay_copies());
+        assert!(
+            app.pending_relay_copies.is_empty(),
+            "silence means it landed"
+        );
+        assert!(crate::clipboard::test_clip::take_osc52_sent().is_empty());
+    });
+}

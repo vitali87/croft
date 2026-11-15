@@ -2247,6 +2247,9 @@ pub struct App {
     /// Drops awaiting reverse-pull from the user's local Mac via the
     /// drop-relay launched by the local croft parent. Polled each frame.
     pending_remote_pulls: Vec<PendingRemotePull>,
+    /// Copies sent home over the relay whose pump answer is still due; see
+    /// `drain_relay_copies`.
+    pending_relay_copies: Vec<PendingRelayCopy>,
     /// This croft's `croft view` listener (#362).
     ///
     /// `None` when the bind failed: a croft that cannot offer `croft view`
@@ -4617,6 +4620,7 @@ impl App {
             tree_drag: None,
             pending_scp_uploads: Vec::new(),
             pending_remote_pulls: Vec::new(),
+            pending_relay_copies: Vec::new(),
             view_listener,
             hook_listener,
             hook_root: root.clone(),
@@ -6581,7 +6585,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let search_changed = app.drain_search_results();
         let log_index_changed = app.poll_log_index();
         let remote_changed = app.refresh_remote_if_config_changed();
-        let pulls_changed = app.drain_remote_pulls();
+        let pulls_changed = app.drain_remote_pulls() | app.drain_relay_copies();
         let view_changed = app.drain_view_requests();
         let hook_changed = app.drain_hook_requests()
             | app.poll_pr_gh()

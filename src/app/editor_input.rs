@@ -1997,24 +1997,65 @@ impl App {
     ///      clipboard tool, where the only hand-shake with the user's own
     ///      terminal is escape bytes through the SSH PTY). Best-effort, and
     ///      the landing says so.
+    ///
+    /// On a relay session the local machine's clipboard comes first, over
+    /// the relay. When it has no clipboard to write (a Linux box with no
+    /// clipboard tool), its pump says so and `drain_relay_copies` sends the
+    /// OSC 52 sequence from here instead, which the user's terminal gets
+    /// over the SSH session as it did before the copy went home.
     pub(super) fn copy_where_pasted(&mut self, text: &str) -> CopyLanding {
         crate::clipboard::remember_copy(text);
-        if self.is_relay_session && self.push_clipboard_via_relay(text) {
+        if self.is_relay_session
+            && let Some(request_id) = self.push_clipboard_via_relay(text)
+        {
+            self.pending_relay_copies.push(PendingRelayCopy {
+                request_id,
+                text: text.to_owned(),
+                started_at: std::time::Instant::now(),
+            });
             CopyLanding::Local
         } else if crate::clipboard::write_string(text) {
             CopyLanding::Clipboard
         } else {
-            use std::io::Write;
-            let bytes = crate::widgets::terminal::osc52_copy_seq(text);
-            let mut out = std::io::stdout();
-            let _ = out.write_all(&bytes);
-            let _ = out.flush();
+            crate::clipboard::send_osc52(text);
             CopyLanding::Osc52
         }
     }
 
+    /// Follow up the relay copies whose answer is due. The pump answers only
+    /// a copy it could not put on the local clipboard, with `.err` in the
+    /// request's inbox directory; that copy goes by OSC 52 instead, the
+    /// fallback a copy off a relay session gets. Silence means it landed,
+    /// so a copy with no answer by [`RELAY_COPY_ANSWER_WAIT`] is let go:
+    /// that also covers a local croft too old to answer at all.
+    pub fn drain_relay_copies(&mut self) -> bool {
+        if self.pending_relay_copies.is_empty() {
+            return false;
+        }
+        let Some(inbox) = self.relay_inbox_path() else {
+            self.pending_relay_copies.clear();
+            return false;
+        };
+        let mut changed = false;
+        for copy in std::mem::take(&mut self.pending_relay_copies) {
+            let request_dir = inbox.join(&copy.request_id);
+            if request_dir.join(".err").exists() {
+                let _ = std::fs::remove_dir_all(&request_dir);
+                crate::clipboard::send_osc52(&copy.text);
+                let n = copy.text.chars().count();
+                self.status = format!(
+                    "The local machine has no clipboard to write: sent {n} chars via OSC 52 (the host terminal decides)"
+                );
+                changed = true;
+            } else if copy.started_at.elapsed() < RELAY_COPY_ANSWER_WAIT {
+                self.pending_relay_copies.push(copy);
+            }
+        }
+        changed
+    }
+
     /// Push copied text to the LOCAL machine's clipboard over the drop relay.
-    /// Returns whether the request was queued.
+    /// Returns the request's id when it was queued.
     ///
     /// The payload goes in a file in the relay INBOX rather than into the
     /// request line: a request is one TAB-SEPARATED LINE, while copied text
@@ -2027,19 +2068,21 @@ impl App {
     /// caps what it will read into the local machine's memory and drops
     /// anything past it, and a selection that pastes back half-formed is worse
     /// than falling through to the ordinary clipboard route and saying so.
-    pub(super) fn push_clipboard_via_relay(&mut self, text: &str) -> bool {
+    pub(super) fn push_clipboard_via_relay(&mut self, text: &str) -> Option<String> {
         if text.len() > crate::remote::MAX_COPY_PAYLOAD_BYTES {
-            return false;
+            return None;
         }
         let (Some(log_path), Some(inbox)) = (self.relay_log_path(), self.relay_inbox_path()) else {
-            return false;
+            return None;
         };
         self.ensure_relay_dir();
         let request_id = Self::relay_request_id("copy");
         if std::fs::write(inbox.join(format!("{request_id}.txt")), text).is_err() {
-            return false;
+            return None;
         }
-        append_to_relay_log(&log_path, &format!("copy\t{request_id}\n")).is_ok()
+        append_to_relay_log(&log_path, &format!("copy\t{request_id}\n"))
+            .is_ok()
+            .then_some(request_id)
     }
 
     /// Paste the host clipboard into the terminal: the chord (Cmd+V /
@@ -2193,7 +2236,16 @@ impl App {
     /// itself last copied when the host clipboard can't be read (#933), as
     /// on a Linux host with no clipboard tool, where copies go out only by
     /// OSC 52.
+    ///
+    /// On a relay session croft's last copy comes FIRST. Every copy there
+    /// goes home to the clipboard of the machine the user types at and
+    /// leaves this box's alone (#2070), so this box's clipboard holds
+    /// nothing copied in croft: reading it first made a Cut then Paste, or
+    /// vim's `d` then `p`, put back whatever was on it before.
     pub(super) fn clipboard_text(&self) -> Option<String> {
+        if self.is_relay_session {
+            return crate::clipboard::last_copy().or_else(self.clipboard_reader);
+        }
         (self.clipboard_reader)().or_else(crate::clipboard::last_copy)
     }
 
@@ -2889,6 +2941,20 @@ pub(super) fn relative_clipboard_text(path: &Path, root: &Path) -> String {
         .unwrap_or(path)
         .display()
         .to_string()
+}
+
+/// How long a relay copy waits for the pump to say the local machine had no
+/// clipboard to write. The pump gives up reading a payload after 15 s, and
+/// claims and answers each take one more SSH round trip.
+pub(super) const RELAY_COPY_ANSWER_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// A copy sent home over the relay, kept until the pump's answer is due so
+/// it can still go by OSC 52 if the local machine had no clipboard.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct PendingRelayCopy {
+    pub(super) request_id: String,
+    pub(super) text: String,
+    pub(super) started_at: std::time::Instant,
 }
 
 /// Where `App::copy_where_pasted` put a copy.
