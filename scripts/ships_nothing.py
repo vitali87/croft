@@ -67,11 +67,16 @@ def git(*args, cwd=None, allow_missing_path=False):
     return done.stdout
 
 
-# A `/*` that opens mid-line. `BlockTracker` strips strings, chars and `//`
-# but not block comments, so a brace inside one is counted as structure and a
-# span can swallow the shipped code below it. Rare enough (no instance in
-# `src/` today) that refusing to answer is better than parsing it.
+# A `/*` that opens mid-line, in a line's code: `BlockTracker` strips strings,
+# chars and `//` but not block comments, so a brace inside one is counted as
+# structure and a span can swallow the shipped code below it. Rare enough that
+# refusing to answer is better than parsing it. Read off the code only: a
+# glob in a string (`"src/**/*.rs"`, `format!("{remote}/*")`) opens no
+# comment, and matching the raw line made every file holding one ship.
 MID_LINE_BLOCK_COMMENT = re.compile(r"\S.*/\*")
+
+# A module declared without a body, `mod name;` (its body is another file).
+MOD_DECLARATION = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+[A-Za-z_]\w*\s*;\s*$")
 
 
 def literal_lines(text):
@@ -106,7 +111,11 @@ def cfg_test_ranges(text):
     """
     lines = text.splitlines()
     kinds = classify(lines)
-    if any(kinds[i] == CODE and MID_LINE_BLOCK_COMMENT.search(l) for i, l in enumerate(lines)):
+    stripper = BlockTracker()
+    if any(
+        kinds[i] == CODE and MID_LINE_BLOCK_COMMENT.search(stripper.feed(l))
+        for i, l in enumerate(lines)
+    ):
         return []
     tracker = BlockTracker()
     ranges = []
@@ -136,6 +145,10 @@ def cfg_test_ranges(text):
             continue
         if MOD.match(line) and tracker.depth > depth_before:
             open_at = (attr_at, depth_before)
+        elif kinds[i] == CODE and MOD_DECLARATION.match(line):
+            # `#[cfg(test)] mod name;`: the declaration is the whole span. Its
+            # body is another file, which compiles only for tests too.
+            ranges.append((attr_at + 1, i + 1))
         attr_at = None
     # A module still open at EOF is a miscount or a truncated file. Reporting
     # it as a range would exempt everything below the attribute.
@@ -171,6 +184,45 @@ def inside(line_no, ranges):
     return any(start <= line_no <= end for start, end in ranges)
 
 
+def declared_for_tests_only(rev, path, cwd=None):
+    """Whether, at `rev`, the module in `path` is declared only for tests:
+    its parent file declares it as `#[cfg(test)] mod name;` at least once and
+    never otherwise, so nothing in it compiles into a release build. A test
+    helper module like `src/test_git.rs` is the case. A parent the rules
+    below do not find (a `#[path]` attribute, an inline `mod name { .. }`)
+    leaves the file counted as shipped.
+    """
+    parts = Path(path).parts
+    if len(parts) < 2 or parts[0] != "src" or not path.endswith(".rs"):
+        return False
+    if parts[-1] == "mod.rs":
+        if len(parts) < 3:
+            return False
+        name, dir_parts = parts[-2], parts[:-2]
+    else:
+        name, dir_parts = Path(parts[-1]).stem, parts[:-1]
+    if dir_parts == ("src",):
+        if name in ("main", "lib"):
+            return False
+        parents = ["src/main.rs", "src/lib.rs"]
+    else:
+        folder = "/".join(dir_parts)
+        parents = [f"{folder}.rs", f"{folder}/mod.rs"]
+    declaration = re.compile(
+        rf"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+{re.escape(name)}\s*;\s*$"
+    )
+    found = False
+    for parent in parents:
+        text = git("show", f"{rev}:{parent}", cwd=cwd, allow_missing_path=True)
+        ranges = cfg_test_ranges(text)
+        for n, line in enumerate(text.splitlines(), 1):
+            if declaration.match(line):
+                if not inside(n, ranges):
+                    return False
+                found = True
+    return found
+
+
 def ships_nothing(base, head, path, cwd=None):
     """True when every line this change touches is inside a test module.
 
@@ -182,6 +234,11 @@ def ships_nothing(base, head, path, cwd=None):
         return False
     base_text = git("show", f"{base}:{path}", cwd=cwd, allow_missing_path=True)
     head_text = git("show", f"{head}:{path}", cwd=cwd, allow_missing_path=True)
+    # A module only tests compile, on every side it exists: a change to any
+    # line of it ships nothing.
+    sides = [rev for rev, text in ((base, base_text), (head, head_text)) if text]
+    if sides and all(declared_for_tests_only(rev, path, cwd=cwd) for rev in sides):
+        return True
     removed, added, diff = changed_lines(base, head, path, cwd=cwd)
     if not removed and not added and diff.strip():
         # git described a change it did not give hunk headers for - a file it

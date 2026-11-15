@@ -239,11 +239,21 @@ class Verdicts(unittest.TestCase):
         text = "fn f() {}\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn t() {}\n"
         self.assertEqual(filt.cfg_test_ranges(text), [])
 
-    def test_a_module_declaration_without_a_body_is_not_a_range(self):
-        """`mod tests;` puts the body in another file and opens no braces, so
-        the span would run to the end of THIS file and cover shipped code."""
+    def test_a_module_declaration_without_a_body_spans_only_itself(self):
+        """`#[cfg(test)] mod tests;` puts the body in another file and opens
+        no braces: the span is the attribute and the declaration, and must
+        not run on over the shipped code below it."""
         text = "#[cfg(test)]\nmod tests;\npub fn shipped() -> u8 {\n    1\n}\n"
-        self.assertEqual(filt.cfg_test_ranges(text), [])
+        self.assertEqual(filt.cfg_test_ranges(text), [(1, 2)])
+
+    def test_a_glob_in_a_string_is_not_a_block_comment(self):
+        """`/*` inside a string opens no comment. Reading the raw line made
+        any file holding a glob (`"src/**/*.rs"`) ship whatever changed."""
+        text = (
+            'pub fn glob() -> &\'static str {\n    "src/**/*.rs"\n}\n'
+            "#[cfg(test)]\nmod tests {\n    #[test]\n    fn t() {}\n}\n"
+        )
+        self.assertEqual(filt.cfg_test_ranges(text), [(4, 8)])
 
     def test_a_doc_comment_between_the_attribute_and_its_module_is_read(self):
         """`classify` labels `///` as DOC, not SKIP, and a documented test
@@ -377,6 +387,97 @@ class Verdicts(unittest.TestCase):
             )
             self.assertEqual(ships.returncode, 1, ships.stderr)
 
+
+
+class TestOnlyModules(unittest.TestCase):
+    """#2210 review: a module only tests compile ships nothing, declared as
+    `#[cfg(test)] mod name;` in its parent, and so does the declaration."""
+
+    def repo(self, tmp, files):
+        repo = Repo(Path(tmp))
+        for name, text in files.items():
+            (repo.path / name).parent.mkdir(parents=True, exist_ok=True)
+            (repo.path / name).write_text(text)
+        run(repo.path, "git", "add", "-A")
+        run(repo.path, "git", "commit", "-q", "-m", "base")
+        run(repo.path, "git", "checkout", "-q", "-b", "change")
+        return repo
+
+    def change(self, repo, files):
+        for name, text in files.items():
+            (repo.path / name).parent.mkdir(parents=True, exist_ok=True)
+            (repo.path / name).write_text(text)
+        run(repo.path, "git", "add", "-A")
+        run(repo.path, "git", "commit", "-q", "-m", "change")
+
+    def test_adding_a_test_only_module_and_its_declaration_ships_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self.repo(tmp, {"src/main.rs": "mod a;\nfn main() {}\n"})
+            self.change(
+                repo,
+                {
+                    "src/main.rs": "mod a;\n#[cfg(test)]\nmod helper;\nfn main() {}\n",
+                    "src/helper.rs": "pub fn fixture() -> u8 {\n    1\n}\n",
+                },
+            )
+            self.assertTrue(repo.verdict("src/main.rs"))
+            self.assertTrue(repo.verdict("src/helper.rs"))
+
+    def test_a_module_declared_for_the_release_build_ships(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self.repo(tmp, {"src/main.rs": "fn main() {}\n"})
+            self.change(
+                repo,
+                {
+                    "src/main.rs": "mod helper;\nfn main() {}\n",
+                    "src/helper.rs": "pub fn fixture() -> u8 {\n    1\n}\n",
+                },
+            )
+            self.assertFalse(repo.verdict("src/main.rs"))
+            self.assertFalse(repo.verdict("src/helper.rs"))
+
+    def test_a_module_one_crate_root_ships_ships(self):
+        """Declared for tests in main.rs but for real in lib.rs: it ships."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self.repo(
+                tmp,
+                {
+                    "src/main.rs": "#[cfg(test)]\nmod helper;\nfn main() {}\n",
+                    "src/lib.rs": "pub mod helper;\n",
+                    "src/helper.rs": "pub fn fixture() -> u8 {\n    1\n}\n",
+                },
+            )
+            self.change(repo, {"src/helper.rs": "pub fn fixture() -> u8 {\n    2\n}\n"})
+            self.assertFalse(repo.verdict("src/helper.rs"))
+
+    def test_a_nested_test_only_module_ships_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self.repo(
+                tmp,
+                {
+                    "src/main.rs": "mod widgets;\nfn main() {}\n",
+                    "src/widgets.rs": "pub mod editor;\n#[cfg(test)]\nmod fixtures;\n",
+                    "src/widgets/fixtures/mod.rs": "pub fn f() -> u8 {\n    1\n}\n",
+                },
+            )
+            self.change(
+                repo, {"src/widgets/fixtures/mod.rs": "pub fn f() -> u8 {\n    2\n}\n"}
+            )
+            self.assertTrue(repo.verdict("src/widgets/fixtures/mod.rs"))
+
+    def test_making_a_shipped_module_test_only_ships(self):
+        """Adding `#[cfg(test)]` above a declaration takes a module out of
+        the release build: the binary changes."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self.repo(
+                tmp,
+                {
+                    "src/main.rs": "mod helper;\nfn main() {}\n",
+                    "src/helper.rs": "pub fn f() -> u8 {\n    1\n}\n",
+                },
+            )
+            self.change(repo, {"src/main.rs": "#[cfg(test)]\nmod helper;\nfn main() {}\n"})
+            self.assertFalse(repo.verdict("src/main.rs"))
 
 if __name__ == "__main__":
     unittest.main()
