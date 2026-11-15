@@ -230,6 +230,7 @@ src/
     │   ├── multi_cursor.rs  multiple carets, occurrence selection, box and column selection
     │   ├── navigation.rs    caret movement, scrolling, Go to Line, minimap
     │   ├── on_enter.rs      Enter, auto-indent, comment continuation, per-language Enter rules, paste re-indent
+    │   ├── render.rs        drawing rows, caret, selections, search matches and diagnostics; character widths
     │   ├── selection.rs     selections, linked editing, expand and shrink selection
     │   ├── snippets.rs      snippets and tab stops, Emmet
     │   ├── span_edits.rs    edits from language servers, formatters and peers, applied as text spans
