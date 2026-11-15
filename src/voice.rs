@@ -216,6 +216,18 @@ impl VoiceHandle {
     }
 }
 
+#[cfg(test)]
+impl VoiceHandle {
+    /// A session whose recognizer has already exited: how the app holds its
+    /// handle between the worker sending the result and the frame loop
+    /// draining it.
+    pub fn finished() -> Self {
+        VoiceHandle {
+            child: Arc::new(Mutex::new(None)),
+        }
+    }
+}
+
 /// Start a recognition session. Spawns `termux-dialog speech`, reads its single
 /// JSON result object on a background thread, and sends the recognized text as
 /// the transcript over `tx` (or `Failed`/`Empty` on a recognizer error or
@@ -274,13 +286,14 @@ pub fn start(tx: Sender<VoiceMsg>) -> VoiceHandle {
         if let Some(stderr) = stderr.as_mut() {
             let _ = stderr.read_to_string(&mut err);
         }
-        let status = if let Ok(mut guard) = reader_shared.lock()
-            && let Some(child) = guard.as_mut()
-        {
-            child.wait().ok()
-        } else {
-            None
-        };
+        // Take the child out of the shared slot before reaping it. A cancel tap
+        // can still arrive after this (the app has not drained the result
+        // yet), and `stop` must then find nothing to signal: once reaped, the
+        // pid and its process group id are free for the system to reuse.
+        // Waiting outside the lock also keeps such a `stop` from blocking the
+        // UI thread until the dialog exits.
+        let child = reader_shared.lock().ok().and_then(|mut guard| guard.take());
+        let status = child.and_then(|mut child| child.wait().ok());
         set_listening(false);
         let parsed = serde_json::from_str::<serde_json::Value>(json.trim()).ok();
         let field = |key: &str| -> String {

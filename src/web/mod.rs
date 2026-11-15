@@ -671,7 +671,12 @@ mod tests {
         assert!(!path.exists());
     }
 
-    fn write_upgrade(w: &mut impl Write, addr: SocketAddr, protocols: &str, origin: Option<&str>) {
+    fn write_upgrade(
+        w: &mut impl Write,
+        addr: SocketAddr,
+        protocols: &str,
+        origin: Option<&str>,
+    ) -> std::io::Result<()> {
         let origin = origin
             .map(|o| format!("Origin: {o}\r\n"))
             .unwrap_or_default();
@@ -679,7 +684,6 @@ mod tests {
             w,
             "GET / HTTP/1.1\r\nHost: {addr}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: {protocols}\r\n{origin}\r\n"
         )
-        .unwrap();
     }
 
     /// A minimal WebSocket client over the bridge.
@@ -728,7 +732,7 @@ mod tests {
     impl Client {
         fn connect(addr: SocketAddr, protocols: &str, origin: Option<&str>) -> (TcpStream, String) {
             let mut tcp = TcpStream::connect(addr).unwrap();
-            write_upgrade(&mut tcp, addr, protocols, origin);
+            write_upgrade(&mut tcp, addr, protocols, origin).unwrap();
             let mut head = Vec::new();
             let mut b = [0u8; 1];
             while !head.ends_with(b"\r\n\r\n") && tcp.read(&mut b).unwrap() == 1 {
@@ -1036,7 +1040,7 @@ mod tests {
                 rustls::ClientConnection::new(Arc::clone(&client), "localhost".try_into().unwrap())
                     .unwrap();
             let mut tls = rustls::StreamOwned::new(conn, tcp);
-            write_upgrade(&mut tls, addr, protocols, origin);
+            write_upgrade(&mut tls, addr, protocols, origin).unwrap();
             let mut head = Vec::new();
             let mut b = [0u8; 1];
             while !head.ends_with(b"\r\n\r\n") && tls.read(&mut b).unwrap_or(0) == 1 {
@@ -1058,7 +1062,10 @@ mod tests {
         plain
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
-        write_upgrade(&mut plain, addr, "croft, croft.token.secret", None);
+        // The listener can hang up on the first bytes that are not TLS,
+        // before the rest of the request is written. That refusal is what
+        // this checks for, so a write cut short passes too.
+        let _ = write_upgrade(&mut plain, addr, "croft, croft.token.secret", None);
         let mut got = Vec::new();
         let _ = plain.read_to_end(&mut got);
         assert!(

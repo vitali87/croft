@@ -1025,3 +1025,78 @@ fn focus_reports_are_turned_on_at_startup_and_off_on_exit() {
         "restoring must never re-enable them"
     );
 }
+
+/// A voice session's transcript can sit in the queue for a frame: the speech
+/// dialog has finished and sent it, but the frame loop has not drained it yet.
+/// A mic tap in that frame is a cancel, and the cancel must win: the text is
+/// dropped, not typed.
+#[test]
+fn a_transcript_queued_when_the_mic_is_tapped_to_cancel_is_not_typed() {
+    let (mut app, _tmp, _f) = app_with_painted_file("x\n");
+    app.focus = Pane::Editor;
+    app.voice_handle = Some(crate::voice::VoiceHandle::finished());
+    app.voice_tx
+        .send(crate::voice::VoiceMsg::Transcript(String::from("hello")))
+        .unwrap();
+
+    app.toggle_voice_input();
+    assert!(app.drain_voice(), "draining the result must redraw");
+
+    assert_eq!(app.editor.lines[0], "x", "a canceled transcript was typed");
+    assert_eq!(app.status, "Voice input canceled");
+    assert!(app.voice_handle.is_none(), "the session must be over");
+}
+
+/// The frame loop's own order: it drains voice results before it reads the
+/// input that queued up meanwhile. So a tap that reached croft before the
+/// transcript did can be read after the drain that received it. That tap is
+/// still a cancel: the drain holds the transcript until the next one, after
+/// the queued input has been read, so the tap cancels it instead of starting
+/// a new session over typed text.
+#[test]
+fn a_cancel_tap_read_after_the_drain_that_received_the_transcript_still_wins() {
+    let (mut app, _tmp, _f) = app_with_painted_file("x\n");
+    app.focus = Pane::Editor;
+    app.voice_handle = Some(crate::voice::VoiceHandle::finished());
+    app.voice_tx
+        .send(crate::voice::VoiceMsg::Transcript(String::from("hello")))
+        .unwrap();
+
+    app.drain_voice();
+    assert_eq!(
+        app.editor.lines[0], "x",
+        "typed before queued input was read"
+    );
+    assert!(
+        app.voice_handle.is_some(),
+        "the tap must still find the session"
+    );
+
+    app.toggle_voice_input();
+    assert!(app.drain_voice(), "dropping the result must redraw");
+
+    assert_eq!(app.editor.lines[0], "x", "a canceled transcript was typed");
+    assert_eq!(app.status, "Voice input canceled");
+    assert!(
+        app.voice_handle.is_none(),
+        "the tap must not start a new session"
+    );
+}
+
+/// The control for the tests above: with no cancel tap, the transcript is
+/// typed into the focused editor on the drain after the one that received it.
+#[test]
+fn a_transcript_with_no_cancel_tap_is_typed() {
+    let (mut app, _tmp, _f) = app_with_painted_file("x\n");
+    app.focus = Pane::Editor;
+    app.voice_handle = Some(crate::voice::VoiceHandle::finished());
+    app.voice_tx
+        .send(crate::voice::VoiceMsg::Transcript(String::from("hello")))
+        .unwrap();
+
+    app.drain_voice();
+    assert!(app.drain_voice(), "typing the transcript must redraw");
+
+    assert_eq!(app.editor.lines[0], "hellox");
+    assert!(app.voice_handle.is_none());
+}

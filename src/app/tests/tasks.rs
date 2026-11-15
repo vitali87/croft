@@ -51,22 +51,36 @@ fn cmd_shift_b_runs_the_projects_build_task_in_a_named_pane() {
 #[test]
 fn rerunning_a_task_reuses_its_pane_instead_of_stacking_new_ones() {
     let tmp = tempfile::tempdir().unwrap();
-    std::fs::write(tmp.path().join("Makefile"), "build:\n\ttrue\n").unwrap();
+    // The recipe prints a sum only the build's shell works out, so the
+    // pane shows `built_42` once the build has run and never before: the
+    // typed `make build` line cannot contain it.
+    std::fs::write(
+        tmp.path().join("Makefile"),
+        "build:\n\t@echo built_$$((40 + 2))\n",
+    )
+    .unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     let chord = key(
         KeyCode::Char('B'),
         KeyModifiers::SUPER | KeyModifiers::SHIFT,
     );
     app.handle_key(chord).unwrap();
-    // Wait for the pane's shell to come back to its prompt so the rerun
-    // path sees an idle pane (a busy pane legitimately gets a new one).
-    // Load-scaled and LOUD (#397): the fixed 5000ms loop broke out silently
-    // on timeout, so under suite load the next step met a pane still busy
-    // and the assertion after it misreported the timeout as its own failure.
+    // Wait for the build to finish and the pane's shell to come back to
+    // its prompt, so the rerun path sees an idle pane (a busy pane
+    // legitimately gets a new one). The shell alone is not enough: a fresh
+    // pane's shell owns the foreground before it has even started the
+    // build, so under load the wait passed at once and the rerun met the
+    // build still running. Load-scaled and LOUD (#397): the fixed 5000ms
+    // loop broke out silently on timeout, so under suite load the next step
+    // met a pane still busy and the assertion after it misreported the
+    // timeout as its own failure.
     crate::test_budget::await_spawned(
         crate::test_budget::tests::TASK_PANE_PROMPT_BASE,
-        "the task pane's shell to return to its prompt",
-        || app.terminals[app.active_terminal].foreground_is_shell(),
+        "the build to run and the task pane's shell to return to its prompt",
+        || {
+            let pane = &app.terminals[app.active_terminal];
+            pane.visible_text().contains("built_42") && pane.foreground_is_shell()
+        },
     );
     let after_first = app.terminals.len();
     app.handle_key(chord).unwrap();
