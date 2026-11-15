@@ -225,6 +225,7 @@ src/
     │   ├── highlighting.rs  syntax highlight passes, colours carried across edits, bracket colours, swatches
     │   ├── line_commands.rs move, duplicate, delete, join, sort and indent lines, convert indentation
     │   ├── lsp_overlays.rs  semantic tokens, inlay hints, diagnostics, links, code lenses, ghost text
+    │   ├── mouse.rs         clicks, drags, and what lies under the pointer
     │   ├── multi_cursor.rs  multiple carets, occurrence selection, box and column selection
     │   ├── navigation.rs    caret movement, scrolling, Go to Line, minimap
     │   ├── on_enter.rs      Enter, auto-indent, comment continuation, per-language Enter rules, paste re-indent
