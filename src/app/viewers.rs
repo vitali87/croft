@@ -223,16 +223,19 @@ impl App {
             return false;
         }
         let bytes = text.len();
-        copy_to_clipboard(&text);
+        let landing = self.copy_where_pasted(&text);
         // Say what was actually copied. `clamped` is true for the byte CAP
         // and for a sweep that ran out of budget on escape-heavy text, and in
         // the second case the copy can be far short of the cap: naming the
         // cap then tells the user they got four megabytes when they got a
         // fraction of one.
         self.status = if clamped {
-            format!("Copied {bytes} bytes; the selection was larger than one copy allows")
+            format!(
+                "Copied {bytes} bytes{}; the selection was larger than one copy allows",
+                landing.note()
+            )
         } else {
-            format!("Copied {bytes} bytes")
+            format!("Copied {bytes} bytes{}", landing.note())
         };
         true
     }
@@ -380,7 +383,7 @@ impl App {
                         .map(|md| md.selection_text())
                         .unwrap_or_default();
                     if !text.is_empty() {
-                        copy_to_clipboard(&text);
+                        self.copy_where_pasted(&text);
                     }
                 }
                 true

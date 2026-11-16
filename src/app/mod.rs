@@ -2247,6 +2247,9 @@ pub struct App {
     /// Drops awaiting reverse-pull from the user's local Mac via the
     /// drop-relay launched by the local croft parent. Polled each frame.
     pending_remote_pulls: Vec<PendingRemotePull>,
+    /// Copies sent home over the relay whose pump answer is still due; see
+    /// `drain_relay_copies`.
+    pending_relay_copies: Vec<PendingRelayCopy>,
     /// This croft's `croft view` listener (#362).
     ///
     /// `None` when the bind failed: a croft that cannot offer `croft view`
@@ -4617,6 +4620,7 @@ impl App {
             tree_drag: None,
             pending_scp_uploads: Vec::new(),
             pending_remote_pulls: Vec::new(),
+            pending_relay_copies: Vec::new(),
             view_listener,
             hook_listener,
             hook_root: root.clone(),
@@ -5864,40 +5868,6 @@ fn cells_in(buf: &ratatui::buffer::Buffer, r: Rect) -> Vec<ratatui::buffer::Cell
     r.positions().map(|p| buf[p].clone()).collect()
 }
 
-/// Copy `text` to the host system clipboard.
-///
-/// Order of attempts:
-///   1. **macOS native** — `clipboard::write_string` posts directly to
-///      `NSPasteboard.generalPasteboard` (with `pbcopy` as a process-level
-///      fall-back inside the same helper). This is the canonical Cocoa
-///      clipboard API and is the *only* path that survives every iTerm2
-///      configuration we have seen in the wild. OSC 52 is, empirically,
-///      silently dropped by iTerm2 in some setups even with
-///      `AllowClipboardAccess` enabled in `com.googlecode.iterm2` — and
-///      writing escape bytes directly to the alt-screen stdout always
-///      risks racing with the next ratatui frame.
-///   2. **OSC 52 fall-back** — only if the native write returned false
-///      (non-macOS croft binary on a Linux remote host, where the only
-///      hand-shake with the user's local terminal is via escape bytes
-///      through the SSH PTY). The fall-back is best-effort.
-///
-/// Returns true when the native path acknowledged the write so the call
-/// site can downgrade the status message if it ever needs to. Today all
-/// call sites discard the boolean; the return value is here so future
-/// code can branch on it.
-fn copy_to_clipboard(text: &str) -> bool {
-    crate::clipboard::remember_copy(text);
-    if crate::clipboard::write_string(text) {
-        return true;
-    }
-    use std::io::Write;
-    let bytes = crate::widgets::terminal::osc52_copy_seq(text);
-    let mut out = std::io::stdout();
-    let _ = out.write_all(&bytes);
-    let _ = out.flush();
-    false
-}
-
 /// Cap a string at `max` characters by inserting an ellipsis in the
 /// end so the start (scheme/host) stays visible. No ellipsis marker anywhere in
 /// croft, so overflow is cut plainly from the right rather than elided in the
@@ -6615,7 +6585,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let search_changed = app.drain_search_results();
         let log_index_changed = app.poll_log_index();
         let remote_changed = app.refresh_remote_if_config_changed();
-        let pulls_changed = app.drain_remote_pulls();
+        let pulls_changed = app.drain_remote_pulls() | app.drain_relay_copies();
         let view_changed = app.drain_view_requests();
         let hook_changed = app.drain_hook_requests()
             | app.poll_pr_gh()
