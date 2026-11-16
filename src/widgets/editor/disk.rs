@@ -647,8 +647,6 @@ impl Editor {
         self.undo_stack.clear();
         self.redo_stack.clear();
         self.last_edit_kind = None;
-        self.image = None;
-        self.sheet = None;
         // A same-path reload (the FS-sync sweep after another pane saves the
         // file, an agent or formatter rewriting it, a revert) keeps the
         // rendered Markdown view (#1605): dropping it turned the tab back
@@ -662,19 +660,15 @@ impl Editor {
                 .markdown_preview
                 .as_ref()
                 .is_some_and(|md| !md.notebook && md.doc_path.is_none());
-        if !keep_preview {
-            self.markdown_preview = None;
-        }
-        self.hex = None;
-        self.log = None;
-        self.archive = None;
-        self.pr_review = None;
-        self.fleet = None;
-        self.sarif = None;
-        // A real file supersedes any diff view this editor was showing —
-        // without this a restore-then-reload keeps rendering the stale diff.
-        self.diff = None;
-        self.merge = None;
+        let kept_preview = if keep_preview {
+            self.markdown_preview.take()
+        } else {
+            None
+        };
+        // A real file supersedes every other view, a diff included: without
+        // this a restore-then-reload keeps rendering the stale diff.
+        self.clear_viewers();
+        self.markdown_preview = kept_preview;
         self.status = match sarif_refusal {
             Some(why) => format!("Opened {} as text: {why}", path.display()),
             None => format!("Opened {}", path.display()),

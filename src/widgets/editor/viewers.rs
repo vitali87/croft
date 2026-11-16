@@ -1028,6 +1028,35 @@ pub(super) fn sheet_delim(kind: crate::sheet::SheetKind) -> u8 {
 }
 
 impl Editor {
+    /// Drop every view this tab could be showing other than its text: the
+    /// diff and merge views with their hunk-arrow rects, the image or PDF,
+    /// the sheet, hex, log and archive views, the Markdown, document or
+    /// media preview, and the PR review, fleet and SARIF views.
+    ///
+    /// Every file opener calls this before installing its own view, so a
+    /// tab reused for another file (the preview tab) keeps nothing of what
+    /// it showed before. The render and the key dispatch each pick the first
+    /// view that is set, so a leftover one paints over the new file or takes
+    /// its keys: a diff reopened as a preview kept its clickable hunk arrows
+    /// (#187), a stale log kept painting over "Reopen as Hex", and a
+    /// document preview kept the keys of the image, PDF or sheet opened after
+    /// it (#2069).
+    pub(super) fn clear_viewers(&mut self) {
+        self.diff = None;
+        self.merge = None;
+        self.diff_prev_arrow = Rect::default();
+        self.diff_next_arrow = Rect::default();
+        self.image = None;
+        self.sheet = None;
+        self.hex = None;
+        self.log = None;
+        self.archive = None;
+        self.markdown_preview = None;
+        self.pr_review = None;
+        self.fleet = None;
+        self.sarif = None;
+    }
+
     pub(super) fn open_image(&mut self, path: &Path) -> Result<()> {
         let meta = std::fs::metadata(path)?;
         if meta.len() > MAX_IMAGE_BYTES {
@@ -1065,6 +1094,7 @@ impl Editor {
         self.redo_stack.clear();
         self.last_edit_kind = None;
         self.highlights = vec![Vec::new()];
+        self.clear_viewers();
         self.image = Some(ImageView {
             bytes,
             format_label,
@@ -1075,23 +1105,6 @@ impl Editor {
             generation: next_image_generation(),
             pdf: None,
         });
-        // A diff view is superseded like every other kind: `open`'s text
-        // tail clears it, but the preview openers return before reaching
-        // that tail, and the render's arrow-rect clearing sits after the
-        // preview arms' early returns — so a diff tab reopened as a
-        // preview kept its label, caret, and CLICKABLE hunk arrows
-        // (#187 review). Clear the state and the frame-truth rects here.
-        self.diff = None;
-        self.merge = None;
-        self.diff_prev_arrow = Rect::default();
-        self.diff_next_arrow = Rect::default();
-        self.sheet = None;
-        self.hex = None;
-        self.log = None;
-        self.archive = None;
-        self.pr_review = None;
-        self.fleet = None;
-        self.sarif = None;
         self.status = format!("Opened image {}", path.display());
         Ok(())
     }
@@ -1138,18 +1151,7 @@ impl Editor {
         self.redo_stack.clear();
         self.last_edit_kind = None;
         self.highlights = vec![Vec::new()];
-        self.diff = None;
-        self.merge = None;
-        self.diff_prev_arrow = Rect::default();
-        self.diff_next_arrow = Rect::default();
-        self.image = None;
-        self.sheet = None;
-        self.hex = None;
-        self.log = None;
-        self.archive = None;
-        self.pr_review = None;
-        self.fleet = None;
-        self.sarif = None;
+        self.clear_viewers();
         self.markdown_preview = Some(crate::markdown::MarkdownPreview {
             rows: Vec::new(),
             selection: None,
@@ -1220,18 +1222,7 @@ impl Editor {
         self.redo_stack.clear();
         self.last_edit_kind = None;
         self.highlights = vec![Vec::new()];
-        self.diff = None;
-        self.merge = None;
-        self.diff_prev_arrow = Rect::default();
-        self.diff_next_arrow = Rect::default();
-        self.image = None;
-        self.sheet = None;
-        self.hex = None;
-        self.log = None;
-        self.archive = None;
-        self.pr_review = None;
-        self.fleet = None;
-        self.sarif = None;
+        self.clear_viewers();
         self.markdown_preview = Some(crate::markdown::MarkdownPreview {
             rows: Vec::new(),
             selection: None,
@@ -1292,16 +1283,7 @@ impl Editor {
         self.redo_stack.clear();
         self.last_edit_kind = None;
         self.highlights = vec![Vec::new()];
-        self.diff = None;
-        self.merge = None;
-        self.diff_prev_arrow = Rect::default();
-        self.diff_next_arrow = Rect::default();
-        self.image = None;
-        self.sheet = None;
-        self.hex = None;
-        self.log = None;
-        self.markdown_preview = None;
-        self.sarif = None;
+        self.clear_viewers();
         self.archive = Some(view);
         self.status = format!("Opened archive {}", path.display());
         Ok(())
@@ -1348,24 +1330,7 @@ impl Editor {
         self.redo_stack.clear();
         self.last_edit_kind = None;
         self.highlights = vec![Vec::new()];
-        // A diff view is superseded like every other kind: `open`'s text
-        // tail clears it, but the preview openers return before reaching
-        // that tail, and the render's arrow-rect clearing sits after the
-        // preview arms' early returns — so a diff tab reopened as a
-        // preview kept its label, caret, and CLICKABLE hunk arrows
-        // (#187 review). Clear the state and the frame-truth rects here.
-        self.diff = None;
-        self.merge = None;
-        self.diff_prev_arrow = Rect::default();
-        self.diff_next_arrow = Rect::default();
-        self.sheet = None;
-        self.hex = None;
-        self.log = None;
-        self.archive = None;
-        self.pr_review = None;
-        self.fleet = None;
-        self.sarif = None;
-        self.markdown_preview = None;
+        self.clear_viewers();
         self.image = Some(ImageView {
             bytes: png,
             format_label: String::from("SVG"),
@@ -1415,23 +1380,7 @@ impl Editor {
         self.redo_stack.clear();
         self.last_edit_kind = None;
         self.highlights = vec![Vec::new()];
-        // A diff view is superseded like every other kind: `open`'s text
-        // tail clears it, but the preview openers return before reaching
-        // that tail, and the render's arrow-rect clearing sits after the
-        // preview arms' early returns — so a diff tab reopened as a
-        // preview kept its label, caret, and CLICKABLE hunk arrows
-        // (#187 review). Clear the state and the frame-truth rects here.
-        self.diff = None;
-        self.merge = None;
-        self.diff_prev_arrow = Rect::default();
-        self.diff_next_arrow = Rect::default();
-        self.image = None;
-        self.hex = None;
-        self.log = None;
-        self.archive = None;
-        self.pr_review = None;
-        self.fleet = None;
-        self.sarif = None;
+        self.clear_viewers();
         self.status = format!("Opened {} ({})", path.display(), view.kind.label());
         self.sheet = Some(view);
     }
@@ -1481,6 +1430,7 @@ impl Editor {
         self.redo_stack.clear();
         self.last_edit_kind = None;
         self.highlights = vec![Vec::new()];
+        self.clear_viewers();
         self.image = Some(ImageView {
             bytes,
             format_label: String::from("PDF"),
@@ -1498,23 +1448,6 @@ impl Editor {
                 links: None,
             }),
         });
-        // A diff view is superseded like every other kind: `open`'s text
-        // tail clears it, but the preview openers return before reaching
-        // that tail, and the render's arrow-rect clearing sits after the
-        // preview arms' early returns — so a diff tab reopened as a
-        // preview kept its label, caret, and CLICKABLE hunk arrows
-        // (#187 review). Clear the state and the frame-truth rects here.
-        self.diff = None;
-        self.merge = None;
-        self.diff_prev_arrow = Rect::default();
-        self.diff_next_arrow = Rect::default();
-        self.sheet = None;
-        self.hex = None;
-        self.log = None;
-        self.archive = None;
-        self.pr_review = None;
-        self.fleet = None;
-        self.sarif = None;
         self.status = format!("Opened PDF {}", path.display());
         Ok(())
     }
@@ -1670,19 +1603,7 @@ impl Editor {
         self.redo_stack.clear();
         self.last_edit_kind = None;
         self.highlights = vec![Vec::new()];
-        // Same supersede-every-other-kind reset the other preview openers do.
-        self.diff = None;
-        self.merge = None;
-        self.diff_prev_arrow = Rect::default();
-        self.diff_next_arrow = Rect::default();
-        self.image = None;
-        self.sheet = None;
-        self.markdown_preview = None;
-        self.archive = None;
-        self.pr_review = None;
-        self.fleet = None;
-        self.sarif = None;
-        self.hex = None;
+        self.clear_viewers();
         self.log = Some(view);
         self.log_reload_top = None;
         self.status = format!("Opened {} as a rendered log", path.display());
@@ -1723,17 +1644,7 @@ impl Editor {
         self.redo_stack.clear();
         self.last_edit_kind = None;
         self.highlights = vec![Vec::new()];
-        // Same supersede-every-other-kind reset the other preview openers do.
-        self.diff = None;
-        self.merge = None;
-        self.diff_prev_arrow = Rect::default();
-        self.diff_next_arrow = Rect::default();
-        self.image = None;
-        self.sheet = None;
-        self.markdown_preview = None;
-        self.archive = None;
-        self.hex = None;
-        self.log = None;
+        self.clear_viewers();
         let n = view.entries.len();
         self.sarif = Some(view);
         self.status = format!(
@@ -1828,26 +1739,7 @@ impl Editor {
         self.redo_stack.clear();
         self.last_edit_kind = None;
         self.highlights = vec![Vec::new()];
-        // A diff view is superseded like every other kind: `open`'s text
-        // tail clears it, but the preview openers return before reaching
-        // that tail, and the render's arrow-rect clearing sits after the
-        // preview arms' early returns — so a diff tab reopened as a
-        // preview kept its label, caret, and CLICKABLE hunk arrows
-        // (#187 review). Clear the state and the frame-truth rects here.
-        self.diff = None;
-        self.merge = None;
-        self.diff_prev_arrow = Rect::default();
-        self.diff_next_arrow = Rect::default();
-        self.image = None;
-        self.sheet = None;
-        self.markdown_preview = None;
-        self.archive = None;
-        self.pr_review = None;
-        self.fleet = None;
-        self.sarif = None;
-        // The render dispatch checks `log` BEFORE `hex`, so a stale log would
-        // keep painting after "Reopen as Hex" reported success.
-        self.log = None;
+        self.clear_viewers();
         self.hex = Some(view);
         // Only for the file it was set for: an open can set the note and
         // then fail before reaching a viewer, and this is also reached

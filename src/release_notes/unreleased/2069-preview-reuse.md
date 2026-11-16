@@ -1,0 +1,1 @@
+fix: An image, PDF or spreadsheet opened in the preview tab after a rendered Markdown file, document or media file takes the keyboard again (page keys turn PDF pages, arrows and typing work in the grid), and Cmd/Ctrl+W closes it; Cmd/Ctrl+W also closes a tab showing rendered Markdown, a document or a media file (#2069).

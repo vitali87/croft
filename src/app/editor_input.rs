@@ -309,6 +309,14 @@ impl App {
                 }
                 return;
             }
+            // Close Tab (Cmd/Ctrl+W) for the same reason: the close-tab check
+            // further down, above the diff / sheet / image guards, is never
+            // reached from here, so a rendered Markdown, document or media
+            // preview could not be closed from the keyboard (#2069).
+            if is_close_tab_key(key) {
+                self.request_close_tab(self.editor.active_index());
+                return;
+            }
             // Copy the rendered selection (#215): the preview swallows every
             // other key, so without this branch Cmd+C here never copies.
             if is_editor_copy_key(key) {
