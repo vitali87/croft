@@ -206,6 +206,7 @@ src/
 │   │   ├── decorations.rs       inlay hints, links, code lenses, folding ranges, document colours
 │   │   ├── diagnostics.rs       diagnostics pushed and pulled, per document and workspace-wide
 │   │   ├── discovery.rs         a file's language and project root, server config, finding the executable, rustup
+│   │   ├── formatting.rs        formatting a document, a range, and on type
 │   │   ├── hover.rs             hover, rust-analyzer's own requests
 │   │   ├── navigation.rs        definition, declaration, type definition, implementation, references, hierarchies
 │   │   ├── rename.rs            rename, prepare rename, file renames
