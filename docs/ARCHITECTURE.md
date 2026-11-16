@@ -206,6 +206,7 @@ src/
 │   │   ├── discovery.rs         a file's language and project root, server config, finding the executable, rustup
 │   │   ├── hover.rs             hover, rust-analyzer's own requests
 │   │   ├── navigation.rs        definition, declaration, type definition, implementation, references, hierarchies
+│   │   ├── semantic_tokens.rs   semantic tokens, whole and by range, the server's legend
 │   │   ├── symbols.rs           document outline, workspace symbol search
 │   │   ├── tests.rs             the language-server manager's own tests
 │   ├── manifest.rs           declarative `extension.toml` loader for the extension system: parses a manifest's `[[languages]]`, `[[language_servers]]`, `[[themes]]`, `[[debug_adapters]]`, `[[test_runners]]`, `[[mcp_servers]]`, `[[commands]]` and `[[viewers]]` blocks
