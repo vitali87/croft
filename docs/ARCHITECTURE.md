@@ -212,6 +212,7 @@ src/
 │   │   ├── navigation.rs        definition, declaration, type definition, implementation, references, hierarchies
 │   │   ├── rename.rs            rename, prepare rename, file renames
 │   │   ├── semantic_tokens.rs   semantic tokens, whole and by range, the server's legend
+│   │   ├── servers.rs           starting, pre-warming, restarting and replacing servers; which server serves a file
 │   │   ├── symbols.rs           document outline, workspace symbol search
 │   │   ├── tests.rs             the language-server manager's own tests
 │   │   ├── text_ranges.rs       symbol occurrences, linked editing ranges, selection ranges
