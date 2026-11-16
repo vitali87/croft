@@ -6581,6 +6581,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         // Pull in any filesystem-watcher events first so the tree reflects
         // disk reality on the very next frame.
         let fs_changed = app.drain_fs_events();
+        crate::startup_trace::mark("file changes read");
         // Peek without clearing so we can coalesce PTY-only redraws without
         // losing bytes that the reader thread has already advanced into the
         // terminal grid.
@@ -6621,6 +6622,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             | app.poll_pr_gh()
             | app.poll_pr_checkout()
             | app.poll_code_scanning();
+        crate::startup_trace::mark("background results collected");
         app.sync_approval_check();
         app.persist_agent_ledger(false);
         let kernel_changed = app.poll_notebook_kernels();
@@ -6628,6 +6630,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let session_presence_changed = app.poll_session_presence();
         let session_typing_changed = app.poll_session_typing();
         let collab_changed = app.poll_collab();
+        crate::startup_trace::mark("agents, ports and collaborators polled");
         let symbol_views_changed = app.sync_symbol_views() | symbol_views_settled;
         let bells_changed = app.drain_terminal_bells();
         // A block whose command has finished gets its output box (#354).
@@ -6640,12 +6643,14 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         app.flush_terminal_session();
         let auto_save_changed = app.tick_auto_save();
         app.tick_hot_exit(std::time::Instant::now());
+        crate::startup_trace::mark("terminal panes and saves ticked");
         let highlights_changed = app.poll_highlights();
         // Pictures baked off the UI thread (#1973) go up as they land.
         let images_changed =
             app.poll_chrome_bake() | app.poll_welcome_bake() | app.poll_saved_session();
         // A closed tab's bookmarks are kept, and come back with its file.
         let bookmarks_changed = app.settle_bookmarks();
+        crate::startup_trace::mark("highlights and pictures polled");
         let live_run_changed = app.tick_live_run()
             | app.sync_markdown_side_previews()
             | app.sync_markdown_scroll()
@@ -6661,9 +6666,11 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let update_changed = app.poll_update_watch();
         let http_changed = app.drain_http_responses();
         let reveal_changed = app.tick_redaction_reveal();
+        crate::startup_trace::mark("watchers and dialogs polled");
         app.sync_lsp();
         app.send_due_completion_ask();
         app.send_due_completion_reask();
+        crate::startup_trace::mark("language servers synced");
         let markdown_lint_changed = app.sync_markdown_lint();
         let sarif_diagnostics_changed = app.sync_sarif_diagnostics();
         app.sync_sarif_selection_to_cursor();
@@ -6674,6 +6681,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         app.sync_blame();
         app.sync_provenance();
         let blame_changed = app.drain_blame() | app.drain_git_net() | app.drain_git_view();
+        crate::startup_trace::mark("lint, gutters and blame synced");
         // Request/refresh the OUTLINE for the active file (after sync_lsp so the
         // edit-seq it reads is current) and advance follow-cursor.
         let outline_sync_changed = app.sync_outline();
@@ -6683,6 +6691,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         // Refresh the Explorer's other stacked sub-views (Open Editors list,
         // Timeline git history, Dependencies) and drain their workers.
         let explorer_panels_changed = app.sync_explorer_panels();
+        crate::startup_trace::mark("outline and Explorer views synced");
         app.refresh_semantic_tokens_if_requested();
         app.refresh_inlay_hints_if_requested();
         app.refresh_workspace_diagnostics_if_requested();
@@ -6720,6 +6729,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let color_pres_changed = app.drain_lsp_color_presentations();
         let diagnostics_changed = app.drain_lsp_diagnostics();
         let progress_changed = app.drain_lsp_progress();
+        crate::startup_trace::mark("language server replies read");
         let dap_changed = app.poll_dap() | app.poll_debug_build();
         let tests_changed = app.test_worker.drain(&mut app.testing)
             | app.drain_pending_test_debug()
@@ -6748,9 +6758,11 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                 &remote_host_label(),
             );
         }
+        crate::startup_trace::mark("debugger and tests polled");
         let mcp_changed = app.poll_mcp();
         let pair_changed =
             app.maybe_seat_navigator() | app.poll_pair() | app.tick_proactive_navigator();
+        crate::startup_trace::mark("AI tools polled");
         let voice_changed = app.drain_voice();
         let zen_hint_changed = app.expire_zen_hint(std::time::Instant::now());
         let screencast_changed = app.screencast.expire(std::time::Instant::now());
@@ -6906,8 +6918,10 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                 app.overlays.hero.mark_dirty();
                 app.forget_sent_images();
             }
+            crate::startup_trace::mark("loop work done");
             let draw_start = std::time::Instant::now();
             let drawn = terminal.draw(|f| app.render_for_terminal(f))?;
+            crate::startup_trace::mark("frame drawn");
             app.sync_caret_style();
             let mut underlays = app.image_underlays(drawn.buffer);
             app.drawn_buffer = Some(drawn.buffer.clone());

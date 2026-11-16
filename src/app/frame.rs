@@ -667,6 +667,7 @@ impl App {
             // post-draw OSC image flush both treat it as absent (no ghosting).
             self.sidebar_areas = SidebarAreas::default();
         }
+        crate::startup_trace::mark("activity bar drawn");
 
         // Secondary side bar: the active file's Outline, on the edge opposite
         // the primary side bar.
@@ -752,6 +753,7 @@ impl App {
                 }
             }
         }
+        crate::startup_trace::mark("side bar drawn");
         if !self.editor_layout.is_split() && self.editor.is_blank_initial() {
             self.render_welcome(frame, editor_area);
             // The previous frame may have rendered an image-preview tab
@@ -1143,6 +1145,7 @@ impl App {
             };
             self.paint_layout_icons(frame, strip_row);
         }
+        crate::startup_trace::mark("editor drawn");
         if let Some(area) = terminal_area {
             // Left/Right panel alignment narrows the terminal to one half of
             // its band; paint the leftover strip with the editor background so
@@ -1573,6 +1576,7 @@ impl App {
             );
         }
 
+        crate::startup_trace::mark("panel drawn");
         // Owned snapshot: the spans borrow the status, and borrowing it
         // through scm_worker() would pin all of &self for the whole render.
         let scm_status = self.scm_worker().status().clone();
@@ -2486,6 +2490,7 @@ impl App {
             frame.set_cursor_position((cx, cy));
         }
         self.park_screen_reader_cursor(frame);
+        crate::startup_trace::mark("status bar and popups drawn");
     }
 
     /// What screen reader mode describes this frame (#621).

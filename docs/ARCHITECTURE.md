@@ -1463,7 +1463,9 @@ Holds a launch's background work until its first frame is up. Started all at onc
 
 Where a launch's time goes. `main` starts the clock, a handful of `mark`s through `Cli::run`, `app::run` and `App::new` note when each startup step finished and how much of it this thread spent computing, and `finish`, called the moment the first frame is flushed, writes the list to `~/.cache/croft/startup-trace.txt` (`CROFT_STARTUP_TRACE=<file>` moves it).
 
-**Always on.** A launch from Croft.app or a Dock icon carries no environment of ours, so a switch would never reach the launch that most needs measuring. A mark is a clock read and a push, a dozen per launch, and the file goes out after the frame.
+**The first frame is split too (#1973).** Getting from "screen set up" to the frame on screen is the main loop's first pass over every poll and drain, then the draw, and a launch that spent seconds there said only that. `main_loop` marks the pass in groups (file changes, background results, collaborators, panes and saves, language servers, the Explorer's views, AI tools, and so on) and `render` marks each part of the screen it draws, so a slow first frame names the group or the part that held it. The loop and the render keep running after the frame, where `mark` finds the trace finished and costs one load.
+
+**Always on.** A launch from Croft.app or a Dock icon carries no environment of ours, so a switch would never reach the launch that most needs measuring. A mark is a clock read and a push, a few dozen per launch, and the file goes out after the frame.
 
 **The processes before croft head it.** From Croft.app, Ghostty is a new process too, started by `open -na`, and its own startup and its `login` wrapper count toward the wait as much as croft's code. `lineage` walks the parent chain (`proc_pidinfo` on macOS, to the microsecond; `/proc` on Linux, in clock ticks) and the trace lists when each began, so a slow launch says whether the time went to the terminal or to croft.
 
