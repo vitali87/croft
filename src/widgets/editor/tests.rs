@@ -15760,6 +15760,32 @@ fn a_preview_tab_with_unsaved_changes_is_never_replaced() {
     );
 }
 
+/// A dirty preview tab is pinned for good, not just skipped: once saved, it
+/// must not turn replaceable again while a newer preview tab sits beside it
+/// (#2073 review).
+#[test]
+fn a_dirty_preview_tab_stays_pinned_once_saved() {
+    let dir = tempfile::tempdir().unwrap();
+    let [a, b, c] = ["a.rs", "b.rs", "c.rs"].map(|n| dir.path().join(n));
+    for p in [&a, &b, &c] {
+        std::fs::write(p, "x\n").unwrap();
+    }
+    let mut t = EditorTabs::new();
+    t.open_preview(&a).unwrap();
+    // As a path that sets the flag itself would leave it.
+    t.editors[0].dirty = true;
+
+    t.open_preview(&b).unwrap();
+    assert!(!t.editors[0].preview, "the dirty preview tab is pinned");
+    assert_eq!(t.preview_index(), Some(1), "b is the preview now");
+
+    t.editors[0].dirty = false;
+    t.open_preview(&c).unwrap();
+    assert_eq!(t.tab_count(), 2, "c replaces the preview, b");
+    assert_eq!(t.editors[0].path.as_deref(), Some(a.as_path()));
+    assert_eq!(t.editors[1].path.as_deref(), Some(c.as_path()));
+}
+
 #[test]
 fn editor_tabs_find_tab_with_path_returns_index_when_open() {
     let mut t = EditorTabs::new();
