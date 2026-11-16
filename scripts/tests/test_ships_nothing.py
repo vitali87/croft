@@ -89,6 +89,28 @@ class Ranges(unittest.TestCase):
         text = "fn f() {}\n#[cfg(test)]\nfn helper() -> u8 {\n    1\n}\n"
         self.assertEqual(filt.cfg_test_ranges(text), [])
 
+    def test_an_attribute_inside_a_block_comment_is_not_a_range(self):
+        """#2217 review: `#[cfg(test)]` inside `/* */` is comment text and
+        guards nothing; the `mod helper;` below it ships."""
+        text = "/*\n#[cfg(test)]\n*/\nmod helper;\nfn main() {}\n"
+        self.assertEqual(filt.cfg_test_ranges(text), [])
+
+    def test_a_comment_line_that_ends_in_code_yields_no_ranges(self):
+        """#2217 review: `/* comment */ }` closes the module after its
+        comment; a reading that skips the line as a comment never counts the
+        brace, and the span runs on over shipped code."""
+        text = (
+            "mod outer {\n    #[cfg(test)]\n    mod tests {\n    /* comment */ }\n"
+            '    pub const SRC: &str = include_str!("helper.rs");\n}\n'
+        )
+        self.assertEqual(filt.cfg_test_ranges(text), [])
+
+    def test_lines_are_counted_as_git_counts_them(self):
+        """A U+2028 inside a string is one character to Rust and git, not a
+        line break, so the span after it keeps git's line numbers."""
+        text = 'const S: &str = "a\u2028b";\n#[cfg(test)]\nmod tests {\n    fn t() {}\n}\n'
+        self.assertEqual(filt.cfg_test_ranges(text), [(2, 5)])
+
     def test_a_file_with_no_tests_has_no_ranges(self):
         self.assertEqual(filt.cfg_test_ranges("fn f() {}\n"), [])
 
@@ -239,11 +261,21 @@ class Verdicts(unittest.TestCase):
         text = "fn f() {}\n#[cfg(test)]\nmod tests {\n    #[test]\n    fn t() {}\n"
         self.assertEqual(filt.cfg_test_ranges(text), [])
 
-    def test_a_module_declaration_without_a_body_is_not_a_range(self):
-        """`mod tests;` puts the body in another file and opens no braces, so
-        the span would run to the end of THIS file and cover shipped code."""
+    def test_a_module_declaration_without_a_body_spans_only_itself(self):
+        """`#[cfg(test)] mod tests;` puts the body in another file and opens
+        no braces: the span is the attribute and the declaration, and must
+        not run on over the shipped code below it."""
         text = "#[cfg(test)]\nmod tests;\npub fn shipped() -> u8 {\n    1\n}\n"
-        self.assertEqual(filt.cfg_test_ranges(text), [])
+        self.assertEqual(filt.cfg_test_ranges(text), [(1, 2)])
+
+    def test_a_glob_in_a_string_is_not_a_block_comment(self):
+        """`/*` inside a string opens no comment. Reading the raw line made
+        any file holding a glob (`"src/**/*.rs"`) ship whatever changed."""
+        text = (
+            'pub fn glob() -> &\'static str {\n    "src/**/*.rs"\n}\n'
+            "#[cfg(test)]\nmod tests {\n    #[test]\n    fn t() {}\n}\n"
+        )
+        self.assertEqual(filt.cfg_test_ranges(text), [(4, 8)])
 
     def test_a_doc_comment_between_the_attribute_and_its_module_is_read(self):
         """`classify` labels `///` as DOC, not SKIP, and a documented test
@@ -350,6 +382,112 @@ class Verdicts(unittest.TestCase):
         )
         self.assertEqual(filt.cfg_test_ranges(text), [])
 
+    def test_a_block_comment_right_after_a_string_yields_no_ranges(self):
+        """#2217 review: with the string removed, `"x" /* { */` leaves the
+        comment at the start of the line's code, where a mid-line pattern
+        missed it and the braces inside it were counted."""
+        text = (
+            "#[cfg(test)]\nmod tests {\n    fn t() -> &'static str {\n"
+            '        "x" /* { */\n    }\n}\n'
+            "pub fn g() -> &'static str {\n    \"y\" /* } */\n}\n"
+        )
+        self.assertEqual(filt.cfg_test_ranges(text), [])
+
+    def test_an_attribute_and_module_inside_a_string_are_not_a_range(self):
+        """#2217 review: lines inside a multi-line raw string are its
+        content, not items, however much they look like a test module."""
+        text = (
+            'const PROMPT: &str = r#"\n#[cfg(test)]\nmod old;\n"#;\n'
+            'fn main() { print!("{PROMPT}"); }\n'
+        )
+        self.assertEqual(filt.cfg_test_ranges(text), [])
+
+    def test_editing_a_string_that_looks_like_a_test_module_ships(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            before = 'const PROMPT: &str = r#"\n#[cfg(test)]\nmod old;\n"#;\n'
+            repo.commit("a.rs", before)
+            run(repo.path, "git", "checkout", "-q", "-b", "change")
+            repo.commit("a.rs", before.replace("mod old;", "mod new;"))
+            self.assertFalse(repo.verdict())
+
+    def test_a_declaration_slipped_under_an_existing_attribute_ships(self):
+        """#2217 review: `mod tests;` inserted between `#[cfg(test)]` and the
+        function it guarded takes the attribute off that function, which then
+        ships, though every touched line sits inside the new span."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            repo.commit("a.rs", "#[cfg(test)]\npub fn helper() {}\n")
+            run(repo.path, "git", "checkout", "-q", "-b", "change")
+            repo.commit("a.rs", "#[cfg(test)]\nmod tests;\npub fn helper() {}\n")
+            self.assertFalse(repo.verdict())
+
+    def test_a_module_slipped_under_an_existing_attribute_ships(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            repo.commit("a.rs", "#[cfg(test)]\npub fn helper() {}\n")
+            run(repo.path, "git", "checkout", "-q", "-b", "change")
+            repo.commit(
+                "a.rs",
+                "#[cfg(test)]\nmod tests {\n    fn t() {}\n}\npub fn helper() {}\n",
+            )
+            self.assertFalse(repo.verdict())
+
+    def test_removing_a_declaration_from_under_its_attribute_ships(self):
+        """The reverse: the attribute now guards the function below, which
+        leaves the release build."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            repo.commit("a.rs", "#[cfg(test)]\nmod tests;\npub fn helper() {}\n")
+            run(repo.path, "git", "checkout", "-q", "-b", "change")
+            repo.commit("a.rs", "#[cfg(test)]\npub fn helper() {}\n")
+            self.assertFalse(repo.verdict())
+
+    def test_a_declaration_slipped_above_a_test_module_ships(self):
+        """#2217 review: `mod added;` between an existing `#[cfg(test)]` and
+        the module it guarded takes the attribute off that module, which
+        then ships, though the attribute opens a span on both sides."""
+        module = "mod existing {\n    fn t() {}\n}\n"
+        for base, head in (
+            ("#[cfg(test)]\n" + module, "#[cfg(test)]\nmod added;\n" + module),
+            ("#[cfg(test)]\nmod added;\n" + module, "#[cfg(test)]\n" + module),
+        ):
+            with self.subTest(base=base, head=head), tempfile.TemporaryDirectory() as tmp:
+                repo = Repo(Path(tmp))
+                repo.commit("a.rs", base)
+                run(repo.path, "git", "checkout", "-q", "-b", "change")
+                repo.commit("a.rs", head)
+                self.assertFalse(repo.verdict())
+
+    def test_a_test_module_that_grows_over_shipped_code_ships(self):
+        """A brace added inside a test module can move its end below shipped
+        code that did not change: that code leaves the release build."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            repo.commit("a.rs", "#[cfg(test)]\nmod t {\n}\nfn shipped() {}\n")
+            run(repo.path, "git", "checkout", "-q", "-b", "change")
+            repo.commit(
+                "a.rs", "#[cfg(test)]\nmod t {\nfn helper() {\n}\nfn shipped() {}\n}\n"
+            )
+            self.assertFalse(repo.verdict())
+
+    def test_edits_in_two_test_modules_that_shift_each_other_ship_nothing(self):
+        """The attribute check follows each span to its line on the other
+        side, past the lines an earlier hunk added."""
+        two = (
+            "pub fn a() {}\n#[cfg(test)]\nmod one {\n    fn t() {}\n}\n"
+            "pub fn b() {}\n#[cfg(test)]\nmod two {\n    fn t() {}\n}\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            repo.commit("a.rs", two)
+            run(repo.path, "git", "checkout", "-q", "-b", "change")
+            repo.commit(
+                "a.rs",
+                two.replace("    fn t() {}\n", "    fn t() {}\n    fn u() {}\n    fn v() {}\n"),
+            )
+            self.assertTrue(repo.verdict())
+
     def test_the_cli_reports_the_verdict_as_its_exit_status(self):
         """The gate is shell, so the answer has to arrive as a status."""
         with tempfile.TemporaryDirectory() as tmp:
@@ -377,6 +515,558 @@ class Verdicts(unittest.TestCase):
             )
             self.assertEqual(ships.returncode, 1, ships.stderr)
 
+
+
+class TestOnlyModules(unittest.TestCase):
+    """#2210 review: a module only tests compile ships nothing, declared as
+    `#[cfg(test)] mod name;` in its parent, and so does the declaration."""
+
+    def repo(self, tmp, files):
+        repo = Repo(Path(tmp))
+        for name, text in files.items():
+            (repo.path / name).parent.mkdir(parents=True, exist_ok=True)
+            (repo.path / name).write_text(text)
+        run(repo.path, "git", "add", "-A")
+        run(repo.path, "git", "commit", "-q", "-m", "base")
+        run(repo.path, "git", "checkout", "-q", "-b", "change")
+        return repo
+
+    def change(self, repo, files):
+        for name, text in files.items():
+            (repo.path / name).parent.mkdir(parents=True, exist_ok=True)
+            (repo.path / name).write_text(text)
+        run(repo.path, "git", "add", "-A")
+        run(repo.path, "git", "commit", "-q", "-m", "change")
+
+    def test_adding_a_test_only_module_and_its_declaration_ships_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self.repo(tmp, {"src/main.rs": "mod a;\nfn main() {}\n"})
+            self.change(
+                repo,
+                {
+                    "src/main.rs": "mod a;\n#[cfg(test)]\nmod helper;\nfn main() {}\n",
+                    "src/helper.rs": "pub fn fixture() -> u8 {\n    1\n}\n",
+                },
+            )
+            self.assertTrue(repo.verdict("src/main.rs"))
+            self.assertTrue(repo.verdict("src/helper.rs"))
+
+    def test_a_module_declared_for_the_release_build_ships(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self.repo(tmp, {"src/main.rs": "fn main() {}\n"})
+            self.change(
+                repo,
+                {
+                    "src/main.rs": "mod helper;\nfn main() {}\n",
+                    "src/helper.rs": "pub fn fixture() -> u8 {\n    1\n}\n",
+                },
+            )
+            self.assertFalse(repo.verdict("src/main.rs"))
+            self.assertFalse(repo.verdict("src/helper.rs"))
+
+    def test_a_module_one_crate_root_ships_ships(self):
+        """Declared for tests in main.rs but for real in lib.rs: it ships."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self.repo(
+                tmp,
+                {
+                    "src/main.rs": "#[cfg(test)]\nmod helper;\nfn main() {}\n",
+                    "src/lib.rs": "pub mod helper;\n",
+                    "src/helper.rs": "pub fn fixture() -> u8 {\n    1\n}\n",
+                },
+            )
+            self.change(repo, {"src/helper.rs": "pub fn fixture() -> u8 {\n    2\n}\n"})
+            self.assertFalse(repo.verdict("src/helper.rs"))
+
+    def test_a_nested_test_only_module_ships_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self.repo(
+                tmp,
+                {
+                    "src/main.rs": "mod widgets;\nfn main() {}\n",
+                    "src/widgets.rs": "pub mod editor;\n#[cfg(test)]\nmod fixtures;\n",
+                    "src/widgets/fixtures/mod.rs": "pub fn f() -> u8 {\n    1\n}\n",
+                },
+            )
+            self.change(
+                repo, {"src/widgets/fixtures/mod.rs": "pub fn f() -> u8 {\n    2\n}\n"}
+            )
+            self.assertTrue(repo.verdict("src/widgets/fixtures/mod.rs"))
+
+    def test_a_release_declaration_with_a_trailing_comment_ships(self):
+        """#2217 review: `pub mod helper; // shared` declares the module for
+        the release build as surely as the bare form."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self.repo(
+                tmp,
+                {
+                    "src/main.rs": "#[cfg(test)]\nmod helper;\nfn main() {}\n",
+                    "src/lib.rs": "pub mod helper; // shared\n",
+                    "src/helper.rs": "pub fn f() -> u8 {\n    1\n}\n",
+                },
+            )
+            self.change(repo, {"src/helper.rs": "pub fn f() -> u8 {\n    2\n}\n"})
+            self.assertFalse(repo.verdict("src/helper.rs"))
+
+    def test_a_test_only_declaration_with_a_trailing_comment_ships_nothing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self.repo(
+                tmp,
+                {
+                    "src/main.rs": "#[cfg(test)]\nmod helper; // fixtures\nfn main() {}\n",
+                    "src/helper.rs": "pub fn f() -> u8 {\n    1\n}\n",
+                },
+            )
+            self.change(repo, {"src/helper.rs": "pub fn f() -> u8 {\n    2\n}\n"})
+            self.assertTrue(repo.verdict("src/helper.rs"))
+
+    def test_a_file_a_path_attribute_can_load_ships(self):
+        """#2217 review: `#[path = "helper.rs"] mod production;` loads the
+        file into the release build under another name, which a reading by
+        name cannot see."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self.repo(
+                tmp,
+                {
+                    "src/main.rs": (
+                        "#[cfg(test)]\nmod helper;\n"
+                        '#[path = "helper.rs"]\nmod production;\nfn main() {}\n'
+                    ),
+                    "src/helper.rs": "pub fn f() -> u8 {\n    1\n}\n",
+                },
+            )
+            self.change(repo, {"src/helper.rs": "pub fn f() -> u8 {\n    2\n}\n"})
+            self.assertFalse(repo.verdict("src/helper.rs"))
+
+    def test_a_path_attribute_split_over_lines_still_ships(self):
+        """#2217 review: Rust lets an attribute run over several lines, and
+        rustfmt wraps a long `cfg_attr` that way."""
+        for attribute in (
+            '#[path\n    = "helper.rs"]\nmod production;\n',
+            '#[cfg_attr(\n    not(test),\n    path = "helper.rs"\n)]\nmod production;\n',
+        ):
+            with self.subTest(attribute=attribute), tempfile.TemporaryDirectory() as tmp:
+                repo = self.repo(
+                    tmp,
+                    {
+                        "src/main.rs": "#[cfg(test)]\nmod helper;\n" + attribute + "fn main() {}\n",
+                        "src/helper.rs": "pub fn f() -> u8 {\n    1\n}\n",
+                    },
+                )
+                self.change(repo, {"src/helper.rs": "pub fn f() -> u8 {\n    2\n}\n"})
+                self.assertFalse(repo.verdict("src/helper.rs"))
+
+    def test_a_path_attribute_naming_another_file_leaves_the_exemption(self):
+        """croft's own build.rs loads `src/release_notes/select.rs` by
+        `#[path]`; that cannot load `src/helper.rs`, and a `format!` argument
+        named `path` is no attribute at all."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self.repo(
+                tmp,
+                {
+                    "build.rs": '#[path = "src/select.rs"]\nmod select;\nfn main() {}\n',
+                    "src/select.rs": "pub fn baked() -> u8 {\n    1\n}\n",
+                    "src/main.rs": (
+                        "#[cfg(test)]\nmod helper;\n"
+                        'fn main() {\n    let p = "x";\n    print!("{path}", path = p);\n}\n'
+                    ),
+                    "src/helper.rs": "pub fn f() -> u8 {\n    1\n}\n",
+                },
+            )
+            self.change(repo, {"src/helper.rs": "pub fn f() -> u8 {\n    2\n}\n"})
+            self.assertTrue(repo.verdict("src/helper.rs"))
+
+    def shipped_by(self, files, path="src/helper.rs"):
+        """The verdict on an edit to `path` in a repo of `files`."""
+        with tempfile.TemporaryDirectory() as tmp:
+            files = {path: "pub fn f() -> u8 {\n    1\n}\n", **files}
+            repo = self.repo(tmp, files)
+            self.change(repo, {path: "pub fn f() -> u8 {\n    2\n}\n"})
+            return repo.verdict(path)
+
+    def test_a_release_declaration_hidden_from_a_line_reading_ships(self):
+        """#2217 review: Rust lets a declaration break after `mod`, carry a
+        comment between its words, or spell the name as `r#helper`; each
+        still declares `helper` for the release build."""
+        for release in (
+            "pub mod\n    helper;\n",
+            "pub mod /* shared */ helper;\n",
+            "pub mod r#helper;\n",
+        ):
+            with self.subTest(release=release):
+                self.assertFalse(
+                    self.shipped_by(
+                        {
+                            "src/main.rs": "#[cfg(test)]\nmod helper;\nfn main() {}\n",
+                            "src/lib.rs": release,
+                        }
+                    )
+                )
+
+    def test_a_test_only_declaration_over_two_lines_ships_nothing(self):
+        self.assertTrue(
+            self.shipped_by({"src/main.rs": "#[cfg(test)]\nmod\n    helper;\nfn main() {}\n"})
+        )
+
+    def test_an_attribute_in_a_block_comment_does_not_make_a_module_test_only(self):
+        """#2217 review: the `#[cfg(test)]` is comment text, so `mod helper;`
+        compiles for the release build."""
+        self.assertFalse(
+            self.shipped_by({"src/main.rs": "/*\n#[cfg(test)]\n*/\nmod helper;\nfn main() {}\n"})
+        )
+
+    def test_a_path_attribute_with_an_escape_ships(self):
+        """#2217 review: `"hel\\x70er.rs"` is `"helper.rs"` to Rust; a value
+        this does not decode counts as naming any file."""
+        self.assertFalse(
+            self.shipped_by(
+                {
+                    "src/main.rs": (
+                        "#[cfg(test)]\nmod helper;\n"
+                        '#[path = "hel\\x70er.rs"]\nmod production;\nfn main() {}\n'
+                    )
+                }
+            )
+        )
+
+    def test_a_path_attribute_on_an_inline_module_ships_what_it_can_reach(self):
+        """#2217 review: `#[path = "widgets"]` on an inline module makes its
+        children load from `src/widgets/`, so `production::helper` loads
+        `src/widgets/helper.rs` for the release build."""
+        self.assertFalse(
+            self.shipped_by(
+                {
+                    "src/main.rs": (
+                        "mod widgets;\n"
+                        '#[path = "widgets"]\nmod production {\n    pub mod helper;\n}\n'
+                        "fn main() {}\n"
+                    ),
+                    "src/widgets.rs": "#[cfg(test)]\npub mod helper;\n",
+                },
+                path="src/widgets/helper.rs",
+            )
+        )
+
+    def test_a_file_a_path_attribute_loads_declares_its_neighbours(self):
+        """A file loaded by `#[path]` finds its own children beside it, as a
+        crate root does: `src/select.rs` declaring `pub mod helper;` loads
+        `src/helper.rs` into the build script."""
+        self.assertFalse(
+            self.shipped_by(
+                {
+                    "build.rs": '#[path = "src/select.rs"]\nmod select;\nfn main() {}\n',
+                    "src/select.rs": "pub mod helper;\n",
+                    "src/main.rs": "#[cfg(test)]\nmod helper;\nfn main() {}\n",
+                }
+            )
+        )
+
+    def test_an_inline_module_further_up_ships_the_file(self):
+        """`pub mod a { pub mod helper; }` in lib.rs loads `src/a/helper.rs`
+        though `src/a.rs` declares it only for tests."""
+        self.assertFalse(
+            self.shipped_by(
+                {
+                    "src/main.rs": "mod a;\nfn main() {}\n",
+                    "src/a.rs": "#[cfg(test)]\nmod helper;\n",
+                    "src/lib.rs": "pub mod a {\n    pub mod helper;\n}\n",
+                },
+                path="src/a/helper.rs",
+            )
+        )
+
+    def test_a_file_an_include_macro_reads_ships(self):
+        """`include_str!` puts the file's text in the binary, and `include!`
+        its code, whatever the module tree says. A name the macro's
+        argument does not pin down counts as any name."""
+        for reader in (
+            'const SRC: &str = include_str!("helper.rs");\n',
+            'include!(concat!(env!("OUT_DIR"), "/", env!("NAME")));\n',
+        ):
+            with self.subTest(reader=reader):
+                self.assertFalse(
+                    self.shipped_by(
+                        {"src/main.rs": "#[cfg(test)]\nmod helper;\n" + reader + "fn main() {}\n"}
+                    )
+                )
+
+    def test_a_comment_inside_a_loader_still_ships(self):
+        """#2217 review: Rust reads a comment between tokens as whitespace,
+        so `path /* shared */ =` is a `#[path]` and `include_str /* x */ !`
+        an `include_str!`."""
+        for loader in (
+            '#[path /* shared */ = "helper.rs"]\nmod production;\n',
+            'const SRC: &str = include_str /* shared */ !("helper.rs");\n',
+        ):
+            with self.subTest(loader=loader):
+                self.assertFalse(
+                    self.shipped_by(
+                        {"src/main.rs": "#[cfg(test)]\nmod helper;\n" + loader + "fn main() {}\n"}
+                    )
+                )
+
+    def test_a_module_file_of_any_name_is_read_for_loaders(self):
+        """#2217 review: `#[path]` loads a file whatever its name, so
+        `production.inc` is a module whose `include_str!("helper.rs")` puts
+        the file in the binary."""
+        self.assertFalse(
+            self.shipped_by(
+                {
+                    "src/main.rs": (
+                        '#[cfg(test)]\nmod helper;\n#[path = "production.inc"]\nmod production;\n'
+                        'fn main() {\n    print!("{}", production::SRC);\n}\n'
+                    ),
+                    "src/production.inc": 'pub const SRC: &str = include_str!("helper.rs");\n',
+                }
+            )
+        )
+
+    def test_a_path_attribute_naming_a_missing_file_ships(self):
+        self.assertFalse(
+            self.shipped_by(
+                {
+                    "src/main.rs": (
+                        '#[cfg(test)]\nmod helper;\n#[path = "gone.inc"]\nmod production;\n'
+                        "fn main() {}\n"
+                    )
+                }
+            )
+        )
+
+    def test_an_edit_inside_the_tests_of_an_embedded_file_ships(self):
+        """#2217 review: `include_str!("helper.rs")` puts the whole file in
+        the binary, test module and all, so an edit inside that test module
+        changes what ships."""
+        with tempfile.TemporaryDirectory() as tmp:
+            body = "pub fn f() -> u8 {{\n    1\n}}\n\n#[cfg(test)]\nmod tests {{\n    #[test]\n    fn t() {{\n        assert!({});\n    }}\n}}\n"
+            repo = self.repo(
+                tmp,
+                {
+                    "src/main.rs": (
+                        "mod helper;\n"
+                        'const SRC: &str = include_str!("helper.rs");\nfn main() {}\n'
+                    ),
+                    "src/helper.rs": body.format("true"),
+                },
+            )
+            self.change(repo, {"src/helper.rs": body.format("false")})
+            self.assertFalse(repo.verdict("src/helper.rs"))
+
+    def test_an_edit_inside_the_tests_of_a_file_a_generated_module_can_embed_ships(self):
+        """#2217 review: a `#[path]` module missing from the tree is
+        written by the build, and can `include_str!` any file; an edit in
+        that file's test module may then change the binary."""
+        with tempfile.TemporaryDirectory() as tmp:
+            body = "pub fn f() -> u8 {{\n    1\n}}\n\n#[cfg(test)]\nmod tests {{\n    #[test]\n    fn t() {{\n        assert!({});\n    }}\n}}\n"
+            repo = self.repo(
+                tmp,
+                {
+                    "src/main.rs": (
+                        'mod helper;\n#[path = "production.inc"]\nmod production;\nfn main() {}\n'
+                    ),
+                    "src/helper.rs": body.format("true"),
+                },
+            )
+            self.change(repo, {"src/helper.rs": body.format("false")})
+            self.assertFalse(repo.verdict("src/helper.rs"))
+
+    def test_an_include_after_a_comment_that_closes_a_test_module_ships(self):
+        """#2217 review: the `include_str!` sits outside the test module,
+        whose closing brace follows a comment on the same line."""
+        self.assertFalse(
+            self.shipped_by(
+                {
+                    "src/main.rs": (
+                        "mod outer {\n    #[cfg(test)]\n    mod tests {\n    /* comment */ }\n"
+                        '    pub const SRC: &str = include_str!("helper.rs");\n}\n'
+                        "#[cfg(test)]\nmod helper;\nfn main() {}\n"
+                    )
+                }
+            )
+        )
+
+    def test_an_edit_inside_the_tests_of_a_file_an_escaped_path_module_can_embed_ships(self):
+        """#2217 review: `"product\\x69on.inc"` is `production.inc` to Rust,
+        a module this never reads, which can embed any file."""
+        with tempfile.TemporaryDirectory() as tmp:
+            body = "pub fn f() -> u8 {{\n    1\n}}\n\n#[cfg(test)]\nmod tests {{\n    #[test]\n    fn t() {{\n        assert!({});\n    }}\n}}\n"
+            repo = self.repo(
+                tmp,
+                {
+                    "src/main.rs": (
+                        'mod helper;\n#[path = "product\\x69on.inc"]\nmod production;\nfn main() {}\n'
+                    ),
+                    "src/production.inc": 'pub const SRC: &str = include_str!("helper.rs");\n',
+                    "src/helper.rs": body.format("true"),
+                },
+            )
+            self.change(repo, {"src/helper.rs": body.format("false")})
+            self.assertFalse(repo.verdict("src/helper.rs"))
+
+    def test_an_edit_inside_the_tests_of_a_file_a_nested_path_module_can_embed_ships(self):
+        """#2217 review: `#[path]` on a module inside `mod outer { .. }` loads
+        `src/outer/production.inc`, which this does not read, and which
+        embeds `helper.rs`."""
+        with tempfile.TemporaryDirectory() as tmp:
+            body = "pub fn f() -> u8 {{\n    1\n}}\n\n#[cfg(test)]\nmod tests {{\n    #[test]\n    fn t() {{\n        assert!({});\n    }}\n}}\n"
+            repo = self.repo(
+                tmp,
+                {
+                    "src/main.rs": (
+                        'mod helper;\nmod outer {\n    #[path = "production.inc"]\n    pub mod production;\n}\n'
+                        "fn main() {}\n"
+                    ),
+                    "src/outer/production.inc": 'pub const SRC: &str = include_str!("../helper.rs");\n',
+                    "src/helper.rs": body.format("true"),
+                },
+            )
+            self.change(repo, {"src/helper.rs": body.format("false")})
+            self.assertFalse(repo.verdict("src/helper.rs"))
+
+    def test_an_include_inside_a_test_module_does_not_count(self):
+        """croft's port detector has a test that reads its own source with
+        `include_str!`; inside `#[cfg(test)]` that compiles only for tests,
+        so the file's test-only edits still ship nothing."""
+        with tempfile.TemporaryDirectory() as tmp:
+            body = (
+                "pub fn f() -> u8 {{\n    1\n}}\n\n#[cfg(test)]\nmod tests {{\n"
+                '    #[test]\n    fn t() {{\n        let src = include_str!("helper.rs");\n'
+                "        assert!({});\n    }}\n}}\n"
+            )
+            repo = self.repo(
+                tmp,
+                {"src/main.rs": "mod helper;\nfn main() {}\n", "src/helper.rs": body.format("true")},
+            )
+            self.change(repo, {"src/helper.rs": body.format("!src.is_empty()")})
+            self.assertTrue(repo.verdict("src/helper.rs"))
+
+    def test_an_include_on_a_test_modules_closing_line_ships(self):
+        """#2217 review: the `include_str!` follows the brace that closes the
+        test module on the same line, so it is outside the module and
+        compiles into the release build."""
+        self.assertFalse(
+            self.shipped_by(
+                {
+                    "src/main.rs": (
+                        "#[cfg(test)]\nmod helper;\n#[cfg(test)]\nmod tests {\n    fn t() {}\n"
+                        '} pub const SRC: &str = include_str!("helper.rs");\n'
+                        'fn main() {\n    print!("{SRC}");\n}\n'
+                    )
+                }
+            )
+        )
+
+    def test_an_include_before_a_test_modules_attribute_on_one_line_ships(self):
+        """The mirror case: the `include_str!` comes before `#[cfg(test)]`
+        on the line the test module starts on."""
+        self.assertFalse(
+            self.shipped_by(
+                {
+                    "src/main.rs": (
+                        "#[cfg(test)]\nmod helper;\n"
+                        'pub const SRC: &str = include_str!("helper.rs"); #[cfg(test)] mod tests {\n'
+                        '    fn t() {}\n}\nfn main() {\n    print!("{SRC}");\n}\n'
+                    )
+                }
+            )
+        )
+
+    def test_test_module_spans_run_from_the_attribute_to_the_closing_brace(self):
+        toks = filt.rust_tokens(
+            'a!(); #[cfg(test)] #[allow(x)] pub(crate) mod t { b!(); } c!();\n'
+            "#[cfg(test)]\nmod d;\n#[cfg(not(test))]\nmod e {}\n"
+        )
+        spans = filt._test_module_spans(toks)
+        self.assertEqual(len(spans), 1, "only the module with a body and exact cfg(test)")
+        first, last = spans[0]
+        self.assertEqual(toks[first], ("punct", "#"))
+        self.assertEqual(toks[last], ("punct", "}"))
+        inside = [w for k, w in toks[first : last + 1] if k == "ident"]
+        self.assertIn("b", inside)
+        self.assertNotIn("a", inside)
+        self.assertNotIn("c", inside)
+
+    def test_code_pasted_in_by_include_ships(self):
+        """#2217 review: `include!` pastes a file in as code, and that code
+        can declare modules or read files itself (here `production.inc`
+        reads `helper.rs`); nothing follows it, so it counts as unknown."""
+        self.assertFalse(
+            self.shipped_by(
+                {
+                    "src/main.rs": (
+                        '#[cfg(test)]\nmod helper;\ninclude!("production.inc");\n'
+                        'fn main() {\n    print!("{SRC}");\n}\n'
+                    ),
+                    "src/production.inc": 'const SRC: &str = include_str!("helper.rs");\n',
+                }
+            )
+        )
+
+    def test_a_renamed_include_macro_ships(self):
+        """After `use std::include_str as text;`, `text!("helper.rs")` reads
+        the file under a name this does not know."""
+        self.assertFalse(
+            self.shipped_by(
+                {
+                    "src/main.rs": (
+                        "#[cfg(test)]\nmod helper;\nuse std::include_str as text;\n"
+                        'const SRC: &str = text!("helper.rs");\nfn main() {}\n'
+                    )
+                }
+            )
+        )
+
+    def test_an_include_of_another_file_leaves_the_exemption(self):
+        """croft's own shape: `concat!(env!("OUT_DIR"), "/notes.md")` reads a
+        `notes.md`, which is not `src/helper.rs`."""
+        self.assertTrue(
+            self.shipped_by(
+                {
+                    "src/main.rs": (
+                        "#[cfg(test)]\nmod helper;\n"
+                        'const N: &str = include_str!(concat!(env!("OUT_DIR"), "/notes.md"));\n'
+                        "fn main() {}\n"
+                    )
+                }
+            )
+        )
+
+    def test_a_crate_root_cargo_names_declares_its_neighbours(self):
+        """A `[lib] path` in Cargo.toml is a crate root like `src/lib.rs`."""
+        self.assertFalse(
+            self.shipped_by(
+                {
+                    "Cargo.toml": '[package]\nname = "x"\n\n[lib]\npath = "src/core.rs"\n',
+                    "src/core.rs": "pub mod helper;\n",
+                    "src/main.rs": "#[cfg(test)]\nmod helper;\nfn main() {}\n",
+                }
+            )
+        )
+
+    def test_a_binary_in_src_bin_declares_its_neighbours(self):
+        self.assertFalse(
+            self.shipped_by(
+                {
+                    "src/bin/tool.rs": "pub mod helper;\nfn main() {}\n",
+                    "src/bin/check.rs": "#[cfg(test)]\nmod helper;\nfn main() {}\n",
+                },
+                path="src/bin/helper.rs",
+            )
+        )
+
+    def test_making_a_shipped_module_test_only_ships(self):
+        """Adding `#[cfg(test)]` above a declaration takes a module out of
+        the release build: the binary changes."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self.repo(
+                tmp,
+                {
+                    "src/main.rs": "mod helper;\nfn main() {}\n",
+                    "src/helper.rs": "pub fn f() -> u8 {\n    1\n}\n",
+                },
+            )
+            self.change(repo, {"src/main.rs": "#[cfg(test)]\nmod helper;\nfn main() {}\n"})
+            self.assertFalse(repo.verdict("src/main.rs"))
 
 if __name__ == "__main__":
     unittest.main()

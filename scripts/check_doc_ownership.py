@@ -196,6 +196,8 @@ class BlockTracker:
         return "".join(out)
 
     def feed(self, line):
+        """Track `line`; return its code, literals and comments removed, for
+        a caller that reads the line as structure too."""
         header = BLOCK_HEADER.match(line) if self.open_string is None else None
         code = self._code_of(line)
         if header:
@@ -215,6 +217,7 @@ class BlockTracker:
         self.depth = max(self.depth + delta, 0)
         while self.blocks and self.blocks[-1][0] >= self.depth:
             self.blocks.pop()
+        return code
 
 
 def git(*args, allow_missing_path=False):
