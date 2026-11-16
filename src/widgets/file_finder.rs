@@ -99,6 +99,9 @@ pub struct FileFinder {
     line_check_generation: u64,
     /// The thread the checks run on, started by the first one.
     line_worker: Option<LineWorker>,
+    /// How long a keystroke waits for a check's answer: [`LINE_CHECK_WAIT`],
+    /// or none in a test that needs the answer to land late.
+    line_check_wait: std::time::Duration,
 }
 
 /// A `:line` check running on its own thread (#2127): the matches it is
@@ -109,6 +112,10 @@ struct LineCheck {
     candidates: Vec<ScoredResult>,
     /// More files matched than the ranking kept.
     more_matched: bool,
+    /// The row picked before this check started, when the unchecked list
+    /// drawn meanwhile does not show it: the answer picks it again if it is
+    /// listed, unless the user picks another row first.
+    chosen: Option<PathBuf>,
     rx: std::sync::mpsc::Receiver<LineCheckDone>,
 }
 
@@ -242,6 +249,7 @@ impl FileFinder {
             line_check: None,
             line_check_generation: 0,
             line_worker: None,
+            line_check_wait: LINE_CHECK_WAIT,
         };
         me.refresh_results();
         me
@@ -265,10 +273,19 @@ impl FileFinder {
         }
         let chosen = self.selected_entry().map(|e| e.path.clone());
         self.refresh_results();
-        self.selected = chosen
-            .and_then(|p| self.results.iter().position(|r| r.entry.path == p))
-            .unwrap_or(0);
+        let listed = chosen
+            .as_ref()
+            .and_then(|p| self.results.iter().position(|r| &r.entry.path == p));
+        self.selected = listed.unwrap_or(0);
         self.scroll = self.scroll.min(self.selected);
+        // The unchecked list drawn until the answer lands holds only the
+        // best-ranked matches, which may not include the row picked: the
+        // check keeps it, so the answer can pick it again.
+        if listed.is_none()
+            && let Some(check) = self.line_check.as_mut()
+        {
+            check.chosen = chosen;
+        }
         true
     }
 
@@ -387,14 +404,24 @@ impl FileFinder {
         if self.results.is_empty() {
             return;
         }
+        self.forget_kept_choice();
         if self.selected + 1 < self.results.len() {
             self.selected += 1;
         }
     }
 
     pub fn select_prev(&mut self) {
+        self.forget_kept_choice();
         if self.selected > 0 {
             self.selected -= 1;
+        }
+    }
+
+    /// The user picked a row while a check runs: the answer keeps that one,
+    /// not the row the check was keeping from before it started.
+    fn forget_kept_choice(&mut self) {
+        if let Some(check) = self.line_check.as_mut() {
+            check.chosen = None;
         }
     }
 
@@ -587,12 +614,13 @@ impl FileFinder {
             needed,
             tx,
         });
-        let answer = rx.recv_timeout(LINE_CHECK_WAIT).ok();
+        let answer = rx.recv_timeout(self.line_check_wait).ok();
         self.line_check = Some(LineCheck {
             generation,
             needed,
             candidates,
             more_matched,
+            chosen: None,
             rx,
         });
         if let Some(done) = answer {
@@ -622,12 +650,14 @@ impl FileFinder {
             .take(MAX_RESULTS)
             .collect();
         // An answer that comes after the keystroke can find a row already
-        // picked from the unchecked list: it stays picked if it is still
-        // listed, so Enter opens the file chosen, not the first one.
-        let chosen = self
-            .results
-            .get(self.selected)
-            .map(|r| r.entry.path.clone());
+        // picked from the unchecked list, or one the check kept from before
+        // it started: it stays picked if it is still listed, so Enter opens
+        // the file chosen, not the first one.
+        let chosen = check.chosen.clone().or_else(|| {
+            self.results
+                .get(self.selected)
+                .map(|r| r.entry.path.clone())
+        });
         let keep_choice = |list: &[ScoredResult]| {
             chosen
                 .as_ref()
@@ -2022,6 +2052,7 @@ mod tests {
             needed: 5,
             candidates: candidates.clone(),
             more_matched: false,
+            chosen: None,
             rx,
         });
         // The last long match is picked; one long match is listed above it.
@@ -2236,6 +2267,49 @@ mod tests {
             "the same counts rerun nothing"
         );
         assert_eq!(finder.line_check_generation, checks, "no check started");
+    }
+
+    /// #2127 review: a recheck draws the best-ranked matches unchecked until
+    /// its answer lands, and they need not include the row picked. The
+    /// check keeps that row, so the answer picks it again; a row the user
+    /// picks meanwhile wins instead.
+    #[test]
+    fn a_late_recheck_answer_picks_the_row_it_kept() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Forty-one short `x.ts` rank above the two long ones, by length.
+        let mut entries: Vec<FileEntry> = (0..41)
+            .map(|i| file_with_lines(tmp.path(), &format!("s{i}/x.ts"), 2))
+            .collect();
+        entries.push(file_with_lines(tmp.path(), "long/a/x.ts", 10));
+        entries.push(file_with_lines(tmp.path(), "long/b/x.ts", 10));
+        let a = entries[41].path.clone();
+        let b = entries[42].path.clone();
+        let mut finder = FileFinder::new(Arc::new(entries));
+        query(&mut finder, "x.ts:5");
+        assert_eq!(listed(&finder), ["long/a/x.ts", "long/b/x.ts"]);
+        finder.select_next();
+        // Every answer from here on lands after the list is drawn.
+        finder.line_check_wait = std::time::Duration::ZERO;
+
+        assert!(finder.set_open_lines(HashMap::from([(a.clone(), 20)])));
+        assert!(finder.line_check.is_some(), "the recheck is still running");
+        assert!(
+            finder.visible_results().iter().all(|r| r.entry.path != b),
+            "the unchecked list does not show the row picked"
+        );
+        finder.finish_line_check();
+        assert_eq!(finder.selected_entry().map(|e| &e.path), Some(&b));
+
+        // Picking a row while the next recheck runs drops the kept one.
+        assert!(finder.set_open_lines(HashMap::from([(a.clone(), 30)])));
+        assert!(finder.line_check.is_some(), "the recheck is still running");
+        finder.select_next();
+        finder.finish_line_check();
+        assert_eq!(
+            finder.selected_entry().map(|e| &e.path),
+            Some(&a),
+            "the short row picked is gone, so the first match is picked"
+        );
     }
 
     /// #2127 review: the check looks past the first page of matches, so a
