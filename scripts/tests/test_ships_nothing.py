@@ -817,6 +817,42 @@ class TestOnlyModules(unittest.TestCase):
             )
         )
 
+    def test_an_edit_inside_the_tests_of_an_embedded_file_ships(self):
+        """#2217 review: `include_str!("helper.rs")` puts the whole file in
+        the binary, test module and all, so an edit inside that test module
+        changes what ships."""
+        with tempfile.TemporaryDirectory() as tmp:
+            body = "pub fn f() -> u8 {{\n    1\n}}\n\n#[cfg(test)]\nmod tests {{\n    #[test]\n    fn t() {{\n        assert!({});\n    }}\n}}\n"
+            repo = self.repo(
+                tmp,
+                {
+                    "src/main.rs": (
+                        "mod helper;\n"
+                        'const SRC: &str = include_str!("helper.rs");\nfn main() {}\n'
+                    ),
+                    "src/helper.rs": body.format("true"),
+                },
+            )
+            self.change(repo, {"src/helper.rs": body.format("false")})
+            self.assertFalse(repo.verdict("src/helper.rs"))
+
+    def test_an_include_inside_a_test_module_does_not_count(self):
+        """croft's port detector has a test that reads its own source with
+        `include_str!`; inside `#[cfg(test)]` that compiles only for tests,
+        so the file's test-only edits still ship nothing."""
+        with tempfile.TemporaryDirectory() as tmp:
+            body = (
+                "pub fn f() -> u8 {{\n    1\n}}\n\n#[cfg(test)]\nmod tests {{\n"
+                '    #[test]\n    fn t() {{\n        let src = include_str!("helper.rs");\n'
+                "        assert!({});\n    }}\n}}\n"
+            )
+            repo = self.repo(
+                tmp,
+                {"src/main.rs": "mod helper;\nfn main() {}\n", "src/helper.rs": body.format("true")},
+            )
+            self.change(repo, {"src/helper.rs": body.format("!src.is_empty()")})
+            self.assertTrue(repo.verdict("src/helper.rs"))
+
     def test_code_pasted_in_by_include_ships(self):
         """#2217 review: `include!` pastes a file in as code, and that code
         can declare modules or read files itself (here `production.inc`

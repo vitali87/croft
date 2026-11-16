@@ -257,16 +257,22 @@ MODULE_NAME = re.compile(r"[^\W\d]\w*")
 CARGO_TARGETS = ("lib", "bin", "test", "bench", "example")
 
 
-def rust_tokens(text):
+def rust_tokens(text, lines=None):
     """`(kind, text)` for every token of `text` but whitespace and comments.
     Kinds are `ident`, `str`, `char`, `life`, `num` and `punct`. A string
     token's text is its contents, or None when they hold an escape, which
-    nothing here decodes. Block comments nest, as Rust's do."""
+    nothing here decodes. Block comments nest, as Rust's do. Given a list as
+    `lines`, each token's 1-indexed line is appended to it."""
     out = []
     pos, end = 0, len(text)
+    line, counted = 1, 0
     while pos < end:
         m = _TOKEN.match(text, pos)
         kind = m.lastgroup
+        if lines is not None and kind not in ("ws", "line", "block"):
+            line += text.count("\n", counted, m.start())
+            counted = m.start()
+            lines.append(line)
         if kind == "block":
             depth = 1
             for edge in _BLOCK_EDGE.finditer(text, m.end()):
@@ -431,7 +437,7 @@ def _resolved(folder, value):
     return target
 
 
-def _loaders_in(path, toks):
+def _loaders_in(path, toks, lines=(), test_spans=()):
     """What one file's own text can load beside its plain `mod` children:
     `(files a top-level #[path] mod x; loads, folders another #[path] can
     load from, names an include_str! or include_bytes! reads)`. None stands
@@ -441,6 +447,10 @@ def _loaders_in(path, toks):
     `text!("helper.rs")` reads a file under a name this does not know. Only a
     `use` can rename a macro; elsewhere `include` is an ordinary name (croft
     has a search field called that).
+
+    An include macro inside a `#[cfg(test)]` module (`test_spans`, by the
+    `lines` of `toks`) compiles only for tests, so it is not counted: croft's
+    port detector has a test that reads its own source that way.
 
     A macro this does not know can still read files: a procedural macro, or
     a `macro_rules!` handed `include_str` as an argument. croft has neither,
@@ -496,13 +506,18 @@ def _loaders_in(path, toks):
                 else:
                     folders.append(folder)
         elif tok[0] == "ident" and tok[1].removeprefix("r#") in INCLUDE_MACROS:
+            if lines and inside(lines[i], test_spans):
+                continue
             called = (
                 i + 2 < len(toks) and toks[i + 1] == ("punct", "!") and _opens(toks[i + 2])
             )
             if called and tok[1].removeprefix("r#") != "include":
                 names.append(_included_name(toks[i + 3 : _closing(toks, i + 2)]))
             elif called or in_use:
+                # Pasted code, or a renamed macro: it can embed a file or
+                # declare a module that nothing here sees.
                 names.append(None)
+                roots.append(None)
     return roots, folders, names
 
 
@@ -532,7 +547,8 @@ def module_loaders(rev, cwd=None):
     """Everything at `rev` that can load a source file into a build,
     other than a plain `mod name;` in a conventional parent:
     `(root files, folders a #[path] can load from, file names an
-    include!-family macro reads, whether any of it could not be read)`.
+    include_str! or include_bytes! reads, whether some module loading could
+    not be pinned down, whether some file embedding could not)`.
 
     Roots are the files that find their children beside them: `src/main.rs`,
     `src/lib.rs`, `build.rs`, `src/bin/*.rs`, `src/bin/*/main.rs`, any target
@@ -563,9 +579,19 @@ def _module_loaders(commit, cwd):
         read.update(paths)
         for path, text in zip(paths, _blobs(commit, paths, cwd)):
             try:
-                more_roots, more_folders, more_names = _loaders_in(path, rust_tokens(text))
+                lines = []
+                toks = rust_tokens(text, lines)
+                # The test modules only matter to a file that names an
+                # include macro, and finding them costs a second pass.
+                mentions_include = any(
+                    kind == "ident" and word.removeprefix("r#") in INCLUDE_MACROS
+                    for kind, word in toks
+                )
+                more_roots, more_folders, more_names = _loaders_in(
+                    path, toks, lines, cfg_test_ranges(text) if mentions_include else ()
+                )
             except LexError:
-                more_roots, more_folders, more_names = [None], [], []
+                more_roots, more_folders, more_names = [None], [], [None]
             roots += more_roots
             folders += more_folders
             names += more_names
@@ -576,12 +602,12 @@ def _module_loaders(commit, cwd):
         loaded = {r for r in roots if r is not None and r not in read}
         roots += [None for r in loaded if r not in tree]
         paths = sorted(r for r in loaded if r in tree)
-    unknown = None in roots or None in folders or None in names
     return (
         frozenset(r for r in roots if r is not None),
         tuple(f for f in folders if f is not None),
         frozenset(n for n in names if n is not None),
-        unknown,
+        None in roots or None in folders,
+        None in names,
     )
 
 
@@ -629,8 +655,8 @@ def declared_for_tests_only(rev, path, cwd=None):
     parts = Path(path).parts
     if len(parts) < 2 or parts[0] != "src" or not path.endswith(".rs"):
         return False
-    roots, folders, names, unknown = module_loaders(rev, cwd=cwd)
-    if unknown or path in roots or Path(path).name in names:
+    roots, folders, names, unknown_load, unknown_embed = module_loaders(rev, cwd=cwd)
+    if unknown_load or unknown_embed or path in roots or Path(path).name in names:
         return False
     if any(_under(path, folder) for folder in folders):
         return False
@@ -692,6 +718,13 @@ def ships_nothing(base, head, path, cwd=None):
     sides = [rev for rev, text in ((base, base_text), (head, head_text)) if text]
     if sides and all(declared_for_tests_only(rev, path, cwd=cwd) for rev in sides):
         return True
+    # A file an `include_str!` or `include_bytes!` embeds ships as text, its
+    # test modules too: an edit anywhere in it changes the binary. So does
+    # every file when some embedding cannot be pinned down.
+    for rev in sides:
+        _, _, names, _, unknown_embed = module_loaders(rev, cwd=cwd)
+        if unknown_embed or Path(path).name in names:
+            return False
     removed, added, diff, hunks = changed_lines(base, head, path, cwd=cwd)
     if not removed and not added and diff.strip():
         # git described a change it did not give hunk headers for - a file it
