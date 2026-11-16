@@ -5505,6 +5505,8 @@ impl App {
             self.focus == Pane::Tree && self.sidebar_view == SidebarView::RunDebug;
         self.extensions.focused =
             self.focus == Pane::Tree && self.sidebar_view == SidebarView::Extensions;
+        self.testing.focused =
+            self.focus == Pane::Tree && self.sidebar_view == SidebarView::Testing;
         self.editor.focused = self.focus == Pane::Editor;
         // Inactive groups are by definition NOT the focused editor group, so
         // their borders never light up even while the editor pane holds focus.
@@ -5569,6 +5571,8 @@ impl App {
         self.run_debug.theme = self.theme;
         self.codeql.focus_gradient = gradient;
         self.codeql.theme = self.theme;
+        self.testing.focus_gradient = gradient;
+        self.testing.theme = self.theme;
         let explorer_focused =
             self.focus == Pane::Tree && self.sidebar_view == SidebarView::Explorer;
         self.outline.focus_gradient = gradient;
