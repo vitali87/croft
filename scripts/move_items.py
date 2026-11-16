@@ -299,7 +299,159 @@ APP = Target(
 )
 
 # What each file split out of src/widgets/editor.rs holds, as FILES above.
-EDITOR_FILES = {}
+EDITOR_FILES = {
+    "viewers": (
+        "Files the editor shows rather than edits as text: pictures and SVG, PDF pages,\n"
+        "spreadsheet and SQLite grids (their edits and saves too), archives, hex, logs and gzip,\n"
+        "SARIF, and the Markdown and notebook previews.",
+        "editor's file viewer",
+        "pictures, PDF, spreadsheets and SQLite, archives, hex, logs, Markdown and notebook previews",
+    ),
+    "diff_view": (
+        "The diff and merge views: side-by-side and inline diffs, the three-way merge panes and\n"
+        "their accept chips, merge conflicts, and a file as it was at a commit.",
+        "editor's diff and merge view",
+        "side-by-side and inline diffs, merge panes, conflicts, a file at a commit",
+    ),
+    "span_edits": (
+        "Edits that arrive from elsewhere: language servers, formatters and peers, applied as\n"
+        "text spans that keep the caret, the view and the undo history in step.",
+        "editor's span edit",
+        "edits from language servers, formatters and peers, applied as text spans",
+    ),
+    "undo": (
+        "Undo and redo: snapshots, undo groups and coalescing, the stack limits, and the history\n"
+        "a closed tab keeps for when its file is opened again.",
+        "editor's undo history",
+        "undo and redo, undo groups, history kept for a reopened file",
+    ),
+    "disk": (
+        "Opening, reloading and saving a file: reading and decoding it, line endings and\n"
+        "encodings, outside changes and conflicts, write protection, and the cleanups on save.",
+        "editor's open and save",
+        "opening, reloading and saving: encodings, line endings, outside changes, save cleanups",
+    ),
+    "gutter": (
+        "The gutter and its marks: breakpoints, bookmarks, git change marks and blame, the\n"
+        "overview ruler, line numbers, and keeping marks on their lines as text moves.",
+        "editor gutter",
+        "breakpoints, bookmarks, git marks and blame, overview ruler, line numbers",
+    ),
+    "wrap": (
+        "Soft wrap and comment boxes: the rows each line takes on screen, and drawing and\n"
+        "clicking the comment boxes shown between lines.",
+        "editor's soft wrap and comment box",
+        "soft wrap rows, comment boxes between lines",
+    ),
+    "highlighting": (
+        "Syntax colouring: highlight passes on and off the UI thread, carrying colours across an\n"
+        "edit, bracket-pair colours and colour swatches.",
+        "editor's syntax colouring",
+        "syntax highlight passes, colours carried across edits, bracket colours, swatches",
+    ),
+    "lsp_overlays": (
+        "What language servers report, laid over the text: semantic tokens, inlay hints, links,\n"
+        "colours, occurrences, diagnostics, inline values, code lenses and ghost text.",
+        "editor's language-server overlay",
+        "semantic tokens, inlay hints, diagnostics, links, code lenses, ghost text",
+    ),
+    "typing": (
+        "Typing and deleting: inserting and pasting text, overwrite mode, auto-closed pairs,\n"
+        "quotes and tags, and what completion needs to know about the caret.",
+        "editor's typing",
+        "typing, pasting and deleting, auto-closed pairs, quotes and tags",
+    ),
+    "on_enter": (
+        "What Enter does: auto-indent, continuing comments and lists, the per-language Enter\n"
+        "rules (Markdown, YAML and others), and re-indenting a paste.",
+        "editor's Enter and auto-indent",
+        "Enter, auto-indent, comment continuation, per-language Enter rules, paste re-indent",
+    ),
+    "snippets": (
+        "Snippets and their tab stops, and Emmet: expanding abbreviations, wrapping, and editing\n"
+        "the tag at the caret.",
+        "editor's snippet and Emmet",
+        "snippets and tab stops, Emmet",
+    ),
+    "multi_cursor": (
+        "Several carets at once: adding carets, selecting occurrences, box and column\n"
+        "selection, and applying an edit at every caret.",
+        "editor's multi-cursor",
+        "multiple carets, occurrence selection, box and column selection",
+    ),
+    "selection": (
+        "Selections: making and clearing them, the selected text, linked editing, and expanding\n"
+        "or shrinking a selection by syntax.",
+        "editor's selection",
+        "selections, linked editing, expand and shrink selection",
+    ),
+    "folding": (
+        "Folding and indent guides: fold ranges from indentation, language servers and #region\n"
+        "markers, hidden lines, and the guides drawn at each indent.",
+        "editor's folding",
+        "fold ranges and hidden lines, #region markers, indent guides",
+    ),
+    "line_commands": (
+        "Whole-line commands: move, duplicate, delete, join and sort lines, indent and dedent,\n"
+        "trim whitespace, replace in place, and converting indentation.",
+        "editor's line command",
+        "move, duplicate, delete, join, sort and indent lines, convert indentation",
+    ),
+    "comments": (
+        "Comment toggling: line and block comments for each language, JSX comments, and the\n"
+        "comment tokens each language uses.",
+        "editor's comment toggling",
+        "toggle line and block comments, per-language comment tokens",
+    ),
+    "transforms": (
+        "Text transforms: changing case, bumping the number at the caret, and transposing\n"
+        "characters.",
+        "editor's text transform",
+        "change case, bump numbers, transpose characters",
+    ),
+    "navigation": (
+        "Moving the caret and the view: arrows, words, Home and End, pages, Go to Line,\n"
+        "scrolling, the minimap and the scrollbar.",
+        "editor's caret movement and scrolling",
+        "caret movement, scrolling, Go to Line, minimap",
+    ),
+    "symbol_tabs": (
+        "Symbol tabs and sibling tabs of one file: keeping a symbol tab on its symbol, and\n"
+        "mirroring a sibling's text, unsaved state and caret.",
+        "editor's symbol tab",
+        "symbol tabs, sibling tabs of one file kept in step",
+    ),
+    "brackets": (
+        "Brackets: matching pairs, jumping and selecting to the matching bracket, and\n"
+        "highlighting the pair at the caret.",
+        "editor's bracket matching",
+        "bracket matching, jump and select to the matching bracket",
+    ),
+    "mouse": (
+        "The mouse in the editor: clicks, double and triple clicks, drags, and what lies under\n"
+        "the pointer (a word, a diagnostic, a hover region).",
+        "editor's mouse handling",
+        "clicks, drags, and what lies under the pointer",
+    ),
+    "language": (
+        "Language and indentation settings: picking a buffer's language, detecting and setting\n"
+        "its indentation, whitespace display and rulers.",
+        "editor's language and indentation setting",
+        "language picking, indentation detection, whitespace display, rulers",
+    ),
+    "render": (
+        "Drawing the editor: each row's text, colours and overlays, the caret, selections and\n"
+        "search matches, diagnostics, and how wide each character is drawn.",
+        "editor drawing",
+        "drawing rows, caret, selections, search matches and diagnostics; character widths",
+    ),
+    "tabs": (
+        "The editor's tabs: opening, closing, pinning and moving them, previews and diff tabs,\n"
+        "the tab strip and its labels, and the breadcrumbs.",
+        "editor tab",
+        "editor tabs: open, close, pin, move, previews, tab strip, breadcrumbs",
+    ),
+}
 
 EDITOR = Target(
     "editor", "scripts/split_editor_manifest.tsv", "src/widgets/editor.rs",
