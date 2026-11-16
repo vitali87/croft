@@ -1483,7 +1483,7 @@ impl App {
                     self.editor.eol = eol;
                     // The content is unchanged but the on-disk bytes will differ:
                     // mark dirty so the user saves to apply the new EOL.
-                    self.editor.dirty = true;
+                    self.editor.mark_dirty();
                 }
                 self.status = format!("End of Line: {}", eol.label());
             }

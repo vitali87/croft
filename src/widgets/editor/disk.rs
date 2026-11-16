@@ -1538,7 +1538,7 @@ impl Editor {
         if std::fs::read(&path).ok().as_deref() != Some(written) {
             return false;
         }
-        self.dirty = self.bytes_for_disk().as_deref() != Some(written);
+        self.set_dirty(self.bytes_for_disk().as_deref() != Some(written));
         self.write_protected = write_protection(&path).is_some();
         // A consent to overwrite was for a save this one has now made.
         self.overwrite_protected_armed = false;

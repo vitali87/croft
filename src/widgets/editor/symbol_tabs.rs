@@ -128,7 +128,7 @@ impl Editor {
             self.lines.push(String::new());
         }
         self.mark_buffer_changed();
-        self.dirty = dirty;
+        self.set_dirty(dirty);
         self.recompute_highlights();
     }
 

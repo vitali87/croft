@@ -2489,6 +2489,37 @@ fn cmd_w_closes_a_rendered_markdown_tab() {
     assert!(app.editor.markdown_preview.is_none());
 }
 
+/// A cell typed into a spreadsheet opened with one click pins its tab, as an
+/// edit in a text tab does: the next one-click open goes beside it, and the
+/// unsaved cell stays (#2073).
+#[test]
+fn a_cell_edited_in_a_preview_sheet_pins_the_tab() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("data.csv"), csv_body(5)).unwrap();
+    std::fs::write(tmp.path().join("notes.txt"), "notes\n").unwrap();
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    click_open_in_explorer(&mut app, "data.csv");
+    assert_eq!(app.editor.preview_index(), Some(0), "setup: a preview tab");
+    app.handle_key(key(KeyCode::Char('9'), KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.editor.dirty, "setup: Enter commits the cell");
+    assert!(
+        !app.editor.editors[0].preview,
+        "a committed cell must pin the tab"
+    );
+
+    click_open_in_explorer(&mut app, "notes.txt");
+    assert_eq!(
+        app.editor.tab_count(),
+        2,
+        "the next one-click open must not replace the edited sheet"
+    );
+    assert!(app.editor.editors[0].dirty, "the unsaved cell must stay");
+}
+
 /// Output scrolling under an on-screen inline image moves only the
 /// placement row; re-running the full decode + Lanczos resize + PNG encode
 /// per scrolled row froze the render thread for the whole pane height on

@@ -15605,6 +15605,161 @@ fn pin_active_clears_preview_flag() {
     assert!(!t.editors[1].preview);
 }
 
+/// A Rust file each command in [`every_edit_command_pins_the_preview_tab`]
+/// changes: unsorted lines, trailing blanks, a tab and a space indent, and
+/// extra final newlines.
+const PIN_TEXT: &str = "zeta() {}  \n\talpha = 1;\n    beta = 2;\n\n\n";
+
+/// A named edit command, run on a fresh preview tab.
+type EditCommand = (&'static str, fn(&mut Editor));
+
+/// Each command changes the text of a preview tab, so it must pin it: the
+/// next single-click on another file opens beside it instead of replacing it
+/// and dropping the edit. Only typing, Enter, Backspace, Delete and paste
+/// pinned; these did not (#2073).
+#[test]
+fn every_edit_command_pins_the_preview_tab() {
+    let commands: [EditCommand; 15] = [
+        ("Move Line Down", |e| e.move_lines_down()),
+        ("Move Line Up", |e| {
+            e.cursor_row = 1;
+            e.move_lines_up();
+        }),
+        ("Copy Line Down", |e| e.duplicate_lines_down()),
+        ("Copy Line Up", |e| e.duplicate_lines_up()),
+        ("Toggle Line Comment", |e| {
+            e.toggle_line_comment();
+        }),
+        ("Toggle Block Comment", |e| {
+            e.toggle_block_comment();
+        }),
+        ("Join Lines", |e| e.join_lines()),
+        ("Transform to Uppercase", |e| {
+            e.select_all();
+            e.transform_selection_case(CaseTransform::Upper);
+        }),
+        ("Sort Lines Ascending", |e| {
+            e.select_all();
+            e.sort_lines(true);
+        }),
+        ("Trim Trailing Whitespace", |e| {
+            e.trim_trailing_whitespace();
+        }),
+        ("Trim Final Newlines", |e| {
+            e.trim_final_newlines();
+        }),
+        ("Transpose Characters", |e| {
+            e.cursor_col = 1;
+            e.transpose_chars();
+        }),
+        ("Convert Indentation to Spaces", |e| {
+            e.indentation_to_spaces()
+        }),
+        ("Convert Indentation to Tabs", |e| e.indentation_to_tabs()),
+        ("Cut", |e| {
+            e.select_all();
+            e.delete_selection();
+        }),
+    ];
+    for (name, run) in commands {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a.rs");
+        let b = dir.path().join("b.rs");
+        std::fs::write(&a, PIN_TEXT).unwrap();
+        std::fs::write(&b, "b\n").unwrap();
+        let mut t = EditorTabs::new();
+        t.open_preview(&a).unwrap();
+        assert_eq!(t.preview_index(), Some(0), "{name}: setup");
+
+        run(&mut t.editors[0]);
+        assert!(
+            t.editors[0].dirty,
+            "{name}: setup: the command must change the text"
+        );
+        assert!(!t.editors[0].preview, "{name} must pin the preview tab");
+
+        let edited = t.editors[0].lines.join("\n");
+        t.open_preview(&b).unwrap();
+        assert_eq!(
+            t.tab_count(),
+            2,
+            "{name}: the next preview open must open beside the edited tab"
+        );
+        assert_eq!(
+            t.editors[0].lines.join("\n"),
+            edited,
+            "{name}: the edit must survive"
+        );
+    }
+}
+
+/// A file reopened with the history it had when it closed can be undone in
+/// the preview tab without a keystroke typed there. An undo that leaves
+/// unsaved text pins the tab like any edit (#2073).
+#[test]
+fn an_undo_that_leaves_unsaved_text_pins_the_preview_tab() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = dir.path().join("a.rs");
+    let b = dir.path().join("b.rs");
+    let c = dir.path().join("c.rs");
+    std::fs::write(&a, "one\ntwo\n").unwrap();
+    std::fs::write(&b, "b\n").unwrap();
+    std::fs::write(&c, "c\n").unwrap();
+    let mut t = EditorTabs::new();
+    t.open_pinned(&b).unwrap();
+    t.open_preview(&a).unwrap();
+    t.move_lines_down();
+    t.save_to_disk().unwrap();
+    assert!(t.close_tab(1), "setup: a.rs closes, keeping its history");
+    t.open_preview(&a).unwrap();
+    assert_eq!(
+        t.preview_index(),
+        Some(1),
+        "setup: a.rs is back in a preview tab"
+    );
+
+    assert!(
+        t.undo(),
+        "setup: the kept history must come back with the file"
+    );
+    assert!(t.editors[1].dirty, "setup: the undo leaves unsaved text");
+    assert!(!t.editors[1].preview, "the undo must pin the preview tab");
+    t.open_preview(&c).unwrap();
+    assert_eq!(
+        t.tab_count(),
+        3,
+        "the next preview open must not replace a.rs"
+    );
+}
+
+/// Whatever made a preview tab dirty, a preview open neither replaces it nor
+/// drops it on the way to a file open in another tab (#2073).
+#[test]
+fn a_preview_tab_with_unsaved_changes_is_never_replaced() {
+    let dir = tempfile::tempdir().unwrap();
+    let [a, b, c] = ["a.rs", "b.rs", "c.rs"].map(|n| dir.path().join(n));
+    for p in [&a, &b, &c] {
+        std::fs::write(p, "x\n").unwrap();
+    }
+    let mut t = EditorTabs::new();
+    t.open_pinned(&c).unwrap();
+    t.open_preview(&a).unwrap();
+    // As a path that sets the flag itself would leave it.
+    t.editors[1].dirty = true;
+
+    t.open_preview(&b).unwrap();
+    assert_eq!(t.tab_count(), 3, "a dirty preview tab must not be replaced");
+    assert_eq!(t.editors[1].path.as_deref(), Some(a.as_path()));
+
+    t.open_preview(&c).unwrap();
+    assert!(
+        t.editors
+            .iter()
+            .any(|e| e.path.as_deref() == Some(a.as_path())),
+        "switching to an open file must not drop a dirty preview tab"
+    );
+}
+
 #[test]
 fn editor_tabs_find_tab_with_path_returns_index_when_open() {
     let mut t = EditorTabs::new();

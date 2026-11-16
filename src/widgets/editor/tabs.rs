@@ -698,8 +698,13 @@ impl EditorTabs {
         })
     }
 
+    /// The tab a preview open may replace, or drop when the file it opens is
+    /// already in another tab. A tab with unsaved changes is never it: every
+    /// edit pins its tab ([`Editor::mark_dirty`]), and this keeps a path that
+    /// sets `dirty` some other way from losing its edit to the next preview
+    /// open (#2073).
     pub fn preview_index(&self) -> Option<usize> {
-        self.editors.iter().position(|e| e.preview)
+        self.editors.iter().position(|e| e.preview && !e.dirty)
     }
 
     /// Mark the active tab as pinned (no longer the preview slot). Called

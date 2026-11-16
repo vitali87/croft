@@ -310,7 +310,10 @@ impl Editor {
         // Crossing a save point (auto save or Cmd+S since the snapshot)
         // means the restored text differs from disk: stay dirty so the next
         // sweep reconverges them instead of leaving a silent divergence.
-        self.dirty = snap.dirty || self.save_seq != snap.save_seq;
+        // A restore that leaves unsaved changes pins the tab like any edit:
+        // a file reopened with its closed-file history can be undone in the
+        // preview tab without a keystroke typed there (#2073).
+        self.set_dirty(snap.dirty || self.save_seq != snap.save_seq);
         // Undo/redo restored the WHOLE buffer, siblings included; the
         // linked-editing mirror must not replay on top of that (#254).
         self.linked_ranges.clear();
