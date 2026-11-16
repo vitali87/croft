@@ -214,31 +214,34 @@ src/
     ├── connect_dialog.rs    remote SSH connect modal (host + auth prompt phases)
     ├── dependencies.rs       collapsible, language-aware DEPENDENCIES section: detects the workspace's package ecosystems from root manifests (Cargo.toml, pyproject.toml, package.json, go.mod), resolves packages off-thread; display-only, gated on detection
     ├── diff.rs               side-by-side file diff renderer behind the explorer's Compare action; also derives hunk ranges and the unified patches behind the diff pane's stage / unstage / revert keys
-    ├── editor.rs             tree-sitter highlighted editor with the full write path, mouse-drag selection, native clipboard, image / PDF / spreadsheet preview tabs, minimap rasterizer and code folding
+    ├── editor.rs             the `Editor` type and its constructor, the data types its parts share (undo snapshots, diff inks, tab state and others) and the small helpers every part uses; each feature lives in a file in `editor/` below
     ├── editor/               the editor's feature files, beside editor.rs; each file's `//!` doc says what it holds
-    │   ├── brackets.rs      bracket matching, jump and select to the matching bracket
-    │   ├── comments.rs      toggle line and block comments, per-language comment tokens
-    │   ├── diff_view.rs     side-by-side and inline diffs, merge panes, conflicts, a file at a commit
-    │   ├── disk.rs          opening, reloading and saving: encodings, line endings, outside changes, save cleanups
-    │   ├── folding.rs       fold ranges and hidden lines, #region markers, indent guides
-    │   ├── gutter.rs        breakpoints, bookmarks, git marks and blame, overview ruler, line numbers
-    │   ├── highlighting.rs  syntax highlight passes, colours carried across edits, bracket colours, swatches
-    │   ├── line_commands.rs move, duplicate, delete, join, sort and indent lines, convert indentation
-    │   ├── lsp_overlays.rs  semantic tokens, inlay hints, diagnostics, links, code lenses, ghost text
-    │   ├── mouse.rs         clicks, drags, and what lies under the pointer
-    │   ├── multi_cursor.rs  multiple carets, occurrence selection, box and column selection
-    │   ├── navigation.rs    caret movement, scrolling, Go to Line, minimap
-    │   ├── on_enter.rs      Enter, auto-indent, comment continuation, per-language Enter rules, paste re-indent
-    │   ├── selection.rs     selections, linked editing, expand and shrink selection
-    │   ├── snippets.rs      snippets and tab stops, Emmet
-    │   ├── span_edits.rs    edits from language servers, formatters and peers, applied as text spans
-    │   ├── symbol_tabs.rs   symbol tabs, sibling tabs of one file kept in step
+    │   ├── brackets.rs      brackets: matching pairs, jumping and selecting to the matching bracket, and highlighting the pair at the caret
+    │   ├── comments.rs      comment toggling: line and block comments for each language, JSX comments, and the comment tokens each language uses
+    │   ├── diff_view.rs     the diff and merge views: side-by-side and inline diffs, the three-way merge panes and their accept chips, merge conflicts, and a file as it was at a commit
+    │   ├── disk.rs          opening, reloading and saving a file: reading and decoding it, line endings and encodings, outside changes and conflicts, write protection, and the cleanups on save
+    │   ├── folding.rs       folding and indent guides: fold ranges from indentation, language servers and #region markers, hidden lines, and the guides drawn at each indent
+    │   ├── gutter.rs        the gutter and its marks: breakpoints, bookmarks, git change marks and blame, the overview ruler, line numbers, and keeping marks on their lines as text moves
+    │   ├── highlighting.rs  syntax colouring: highlight passes on and off the UI thread, carrying colours across an edit, bracket-pair colours and colour swatches
+    │   ├── language.rs      language and indentation settings: picking a buffer's language, detecting and setting its indentation, whitespace display and rulers
+    │   ├── line_commands.rs whole-line commands: move, duplicate, delete, join and sort lines, indent and dedent, trim whitespace, replace in place, and converting indentation
+    │   ├── lsp_overlays.rs  what language servers report, laid over the text: semantic tokens, inlay hints, links, colours, occurrences, diagnostics, inline values, code lenses and ghost text
+    │   ├── mouse.rs         the mouse in the editor: clicks, double and triple clicks, drags, and what lies under the pointer (a word, a diagnostic, a hover region)
+    │   ├── multi_cursor.rs  several carets at once: adding carets, selecting occurrences, box and column selection, and applying an edit at every caret
+    │   ├── navigation.rs    moving the caret and the view: arrows, words, Home and End, pages, Go to Line, scrolling, the minimap and the scrollbar
+    │   ├── on_enter.rs      what Enter does: auto-indent, continuing comments and lists, the per-language Enter rules (Markdown, YAML and others), and re-indenting a paste
+    │   ├── render.rs        drawing the editor: each row's text, colours and overlays, the caret, selections and search matches, diagnostics, and how wide each character is drawn
+    │   ├── selection.rs     selections: making and clearing them, the selected text, linked editing, and expanding or shrinking a selection by syntax
+    │   ├── snippets.rs      snippets and their tab stops, and Emmet: expanding abbreviations, wrapping, and editing the tag at the caret
+    │   ├── span_edits.rs    edits that arrive from elsewhere: language servers, formatters and peers, applied as text spans that keep the caret, the view and the undo history in step
+    │   ├── symbol_tabs.rs   symbol tabs and sibling tabs of one file: keeping a symbol tab on its symbol, and mirroring a sibling's text, unsaved state and caret
+    │   ├── tabs.rs          the editor's tabs: opening, closing, pinning and moving them, previews and diff tabs, the tab strip and its labels, and the breadcrumbs
     │   ├── tests.rs         the editor's own tests
-    │   ├── transforms.rs    change case, bump numbers, transpose characters
-    │   ├── typing.rs        typing, pasting and deleting, auto-closed pairs, quotes and tags
-    │   ├── undo.rs          undo and redo, undo groups, history kept for a reopened file
-    │   ├── viewers.rs       pictures, PDF, spreadsheets and SQLite, archives, hex, logs, Markdown and notebook previews
-    │   ├── wrap.rs          soft wrap rows, comment boxes between lines
+    │   ├── transforms.rs    text transforms: changing case, bumping the number at the caret, and transposing characters
+    │   ├── typing.rs        typing and deleting: inserting and pasting text, overwrite mode, auto-closed pairs, quotes and tags, and what completion needs to know about the caret
+    │   ├── undo.rs          undo and redo: snapshots, undo groups and coalescing, the stack limits, and the history a closed tab keeps for when its file is opened again
+    │   ├── viewers.rs       files the editor shows rather than edits as text: pictures and SVG, PDF pages, spreadsheet and SQLite grids (their edits and saves too), archives, hex, logs and gzip, SARIF, and the Markdown and notebook previews
+    │   ├── wrap.rs          soft wrap and comment boxes: the rows each line takes on screen, and drawing and clicking the comment boxes shown between lines
     ├── editor_find.rs        VS Code-style inline Find bar (`Cmd+F`) with match highlight, Enter/Shift+Enter walk, case/whole-word/regex toggles and a Replace row (`Cmd+Opt+F`); Replace All runs through the same `split_for_highlight` as count and paint
     ├── extensions.rs         Extensions sidebar widget: projects bundled and user manifests into a theme-aware list grouped under BUILT-IN/INSTALLED/AVAILABLE, with pill toggles, +Add, trash, a local filter box and clear/refresh; reports clicks back to App, which owns the state
     ├── file_finder.rs   VS Code-style Quick Open (Cmd+P) fuzzy file picker with tiered match ranking (exact filename > prefix > substring > path > subsequence)
@@ -351,7 +354,7 @@ While a mouse drag is held (`drag_selecting`, ended by `end_drag` from the app's
 
 ### editor.rs
 
-A tree-sitter highlighted editor with a full write path, mouse-drag selection, native-clipboard copy and cut, plus image, PDF and spreadsheet preview tabs.
+A tree-sitter highlighted editor with a full write path, mouse-drag selection, native-clipboard copy and cut, plus image, PDF and spreadsheet preview tabs. `editor.rs` holds the `Editor` type, its constructor and the data types its parts share; each feature below lives in its own file in `editor/` (#2062), named in the tree above.
 
 **Canvas backgrounds.** The CSV and diff canvases fill with `canvas_bg`: `Reset` on iTerm2 to inherit the SetColors session bg, and the theme's `editor_bg` on every other host, where `Reset` would override the frame prefill and leave a host-black island. The image and PDF canvas uses `image_canvas_bg` instead — still `Reset` on Kitty hosts, because the preview sits at `KITTY_Z_BELOW_TEXT_AND_BG` and Kitty paints any cell with a non-default background over an image that deep, so an explicit fill would hide the picture behind its own canvas. The themed look survives via the bake's theme-bg letterbox.
 
