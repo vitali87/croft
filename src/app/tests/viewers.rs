@@ -2395,6 +2395,106 @@ fn a_spreadsheet_opened_with_one_click_scrolls_with_the_arrow_keys() {
     );
 }
 
+/// One click on a Markdown file, Cmd+Shift+V for its rendered preview, then
+/// one click on `next`: the preview tab now shows `next`, and its keys must
+/// reach it. The rendered preview used to survive the swap hidden under the
+/// new view, so it took every key and Cmd+W did nothing (#2069).
+fn markdown_preview_then_one_click(
+    next: &str,
+    write_next: impl FnOnce(&std::path::Path),
+) -> (tempfile::TempDir, App) {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("notes.md"), "# Notes\n\nSome text.\n").unwrap();
+    write_next(&tmp.path().join(next));
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    click_open_in_explorer(&mut app, "notes.md");
+    app.toggle_markdown_preview();
+    assert!(
+        app.editor.markdown_preview.is_some(),
+        "setup: the rendered Markdown must be showing"
+    );
+    click_open_in_explorer(&mut app, next);
+    assert_eq!(
+        app.editor.tab_count(),
+        1,
+        "setup: {next} must reuse the preview tab"
+    );
+    assert!(
+        app.editor.markdown_preview.is_none(),
+        "opening {next} in the preview tab must drop the rendered Markdown it showed"
+    );
+    (tmp, app)
+}
+
+#[test]
+fn a_spreadsheet_opened_over_a_markdown_preview_takes_the_keys() {
+    let (_tmp, mut app) =
+        markdown_preview_then_one_click("data.csv", |p| std::fs::write(p, csv_body(40)).unwrap());
+
+    app.handle_key(key(KeyCode::Down, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        sheet_cursor(&app).0,
+        1,
+        "Down must move the grid's cell cursor"
+    );
+    app.handle_key(key(KeyCode::Char('w'), KeyModifiers::SUPER))
+        .unwrap();
+    assert!(app.editor.sheet.is_none(), "Cmd+W must close the sheet tab");
+}
+
+#[test]
+fn a_pdf_opened_over_a_markdown_preview_pages_with_the_keys() {
+    require_pdf_backend();
+    let (_tmp, mut app) = markdown_preview_then_one_click("doc.pdf", write_three_page_pdf);
+
+    app.handle_key(key(KeyCode::PageDown, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(current_pdf_page(&app), 2, "PageDown must turn the page");
+    app.handle_key(key(KeyCode::Char('w'), KeyModifiers::SUPER))
+        .unwrap();
+    assert!(app.editor.image.is_none(), "Cmd+W must close the PDF tab");
+}
+
+#[test]
+fn an_image_opened_over_a_markdown_preview_closes_with_cmd_w() {
+    let (_tmp, mut app) = markdown_preview_then_one_click("pic.png", write_test_png);
+
+    assert!(app.editor.image.is_some(), "the image must be showing");
+    app.handle_key(key(KeyCode::Char('w'), KeyModifiers::SUPER))
+        .unwrap();
+    assert!(app.editor.image.is_none(), "Cmd+W must close the image tab");
+}
+
+/// Cmd+W on a tab showing rendered Markdown closes it. The rendered view
+/// takes every key and returned before the close-tab check, so the tab could
+/// not be closed from the keyboard (#2069).
+#[test]
+fn cmd_w_closes_a_rendered_markdown_tab() {
+    let tmp = tempfile::tempdir().unwrap();
+    let md = tmp.path().join("notes.md");
+    std::fs::write(&md, "# Notes\n\nSome text.\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&md).unwrap();
+    app.focus = Pane::Editor;
+    app.toggle_markdown_preview();
+    assert!(
+        app.editor.markdown_preview.is_some(),
+        "setup: the rendered Markdown must be showing"
+    );
+
+    app.handle_key(key(KeyCode::Char('w'), KeyModifiers::SUPER))
+        .unwrap();
+
+    assert_ne!(
+        app.editor.path.as_deref(),
+        Some(md.as_path()),
+        "Cmd+W on rendered Markdown must close the tab"
+    );
+    assert!(app.editor.markdown_preview.is_none());
+}
+
 /// Output scrolling under an on-screen inline image moves only the
 /// placement row; re-running the full decode + Lanczos resize + PNG encode
 /// per scrolled row froze the render thread for the whole pane height on
