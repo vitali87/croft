@@ -75,6 +75,7 @@ use lsp_types::NumberOrString;
 use pin_project_lite::pin_project;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use serde_json::value::RawValue;
 use serde_json::Value as JsonValue;
 use thiserror::Error;
 use tower_service::Service;
@@ -328,7 +329,9 @@ enum RpcVersion {
     V2,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+// Patched for croft (PATCHED.md): never deserialized any more, see
+// `IncomingMessage`.
+#[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 enum Message {
     Request(AnyRequest),
@@ -363,12 +366,16 @@ pub struct AnyNotification {
 }
 
 /// A dynamic runtime response.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Patched for croft (PATCHED.md): `result` is kept as the JSON text it
+/// arrived as, and is decoded once, by the request waiting for it, straight
+/// into that request's own result type.
+#[derive(Debug, Clone, Serialize)]
 #[non_exhaustive]
 struct AnyResponse {
     id: RequestId,
     #[serde(skip_serializing_if = "Option::is_none")]
-    result: Option<JsonValue>,
+    result: Option<Box<RawValue>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<ResponseError>,
 }
@@ -446,8 +453,8 @@ impl Message {
         reader.read_exact(&mut buf).await?;
         #[cfg(feature = "tracing")]
         ::tracing::trace!(msg = %String::from_utf8_lossy(&buf), "incoming");
-        let msg = serde_json::from_slice::<RawMessage<Self>>(&buf)?;
-        Ok(msg.inner)
+        let msg = serde_json::from_slice::<IncomingMessage>(&buf)?;
+        Ok(msg.into_message()?)
     }
 
     async fn write(&self, mut writer: impl AsyncWrite + Unpin) -> Result<()> {
@@ -461,6 +468,67 @@ impl Message {
         writer.flush().await?;
         Ok(())
     }
+}
+
+/// One message as read off the wire, before it is told apart as a request, a
+/// response or a notification.
+///
+/// Patched for croft (PATCHED.md). Published, `Message::read` decoded a
+/// `RawMessage<Message>`: a `flatten` over an `untagged` enum, for which
+/// serde buffers the whole message into its own tree, copies that tree for
+/// the variant it tries, and then builds a `serde_json::Value` from the copy.
+/// A reply was three trees before anyone read it (~90 MB, briefly, for the
+/// semantic tokens of a 2 MB file). Read field by field instead, a message is
+/// parsed once, and a response's result is not parsed at all here.
+#[derive(Deserialize)]
+struct IncomingMessage {
+    #[serde(rename = "jsonrpc")]
+    _jsonrpc: RpcVersion,
+    #[serde(default)]
+    id: Option<RequestId>,
+    #[serde(default)]
+    method: Option<String>,
+    #[serde(default)]
+    params: JsonValue,
+    #[serde(default)]
+    result: Option<Box<RawValue>>,
+    #[serde(default)]
+    error: Option<ResponseError>,
+}
+
+impl IncomingMessage {
+    /// The message, told apart as the published `untagged` enum told it
+    /// apart, trying its variants in order: an id and a method make a
+    /// request, an id alone a response, a method alone a notification. A
+    /// `null` id counts as none, as it did there.
+    fn into_message(self) -> Result<Message, serde_json::Error> {
+        match (self.id, self.method) {
+            (Some(id), Some(method)) => Ok(Message::Request(AnyRequest {
+                id,
+                method,
+                params: self.params,
+            })),
+            (Some(id), None) => Ok(Message::Response(AnyResponse {
+                id,
+                result: self.result,
+                error: self.error,
+            })),
+            (None, Some(method)) => Ok(Message::Notification(AnyNotification {
+                method,
+                params: self.params,
+            })),
+            (None, None) => Err(<serde_json::Error as serde::de::Error>::custom(
+                "data did not match any variant of untagged enum Message",
+            )),
+        }
+    }
+}
+
+/// A response's result for the peer: `null` when it carried none, as the
+/// published `unwrap_or_default` of an absent `Value` gave.
+fn response_result(result: Option<Box<RawValue>>) -> Box<RawValue> {
+    result
+        .unwrap_or_else(|| RawValue::from_string(String::from("null")).expect("null is valid JSON"))
 }
 
 /// Service main loop driver for either Language Servers or Language Clients.
@@ -649,7 +717,15 @@ where
         let this = self.project();
         let (mut result, mut error) = (None, None);
         match ready!(this.fut.poll(cx)) {
-            Ok(v) => result = Some(v),
+            Ok(v) => match serde_json::value::to_raw_value(&v) {
+                Ok(raw) => result = Some(raw),
+                Err(err) => {
+                    error = Some(ResponseError::new(
+                        ErrorCode::INTERNAL_ERROR,
+                        format!("failed to serialize the response: {err}"),
+                    ));
+                }
+            },
             Err(err) => error = Some(err.into()),
         }
         Poll::Ready(AnyResponse {
@@ -778,7 +854,7 @@ impl<T: DeserializeOwned> Future for PeerSocketRequestFuture<T> {
             .poll(cx)
             .map_err(|_| Error::ServiceStopped))?;
         Poll::Ready(match resp.error {
-            None => Ok(serde_json::from_value(resp.result.unwrap_or_default())?),
+            None => Ok(serde_json::from_str(response_result(resp.result).get())?),
             Some(err) => Err(Error::Response(err)),
         })
     }
@@ -911,6 +987,69 @@ mod tests {
             Err(Error::ServiceStopped)
         ));
         assert!(matches!(socket.emit(42i32), Err(Error::ServiceStopped)));
+    }
+
+    // Patched for croft (PATCHED.md): `IncomingMessage` tells messages apart
+    // as the published untagged `Message` did.
+    fn incoming(json: &str) -> std::result::Result<Message, serde_json::Error> {
+        serde_json::from_str::<IncomingMessage>(json)?.into_message()
+    }
+
+    #[test]
+    fn incoming_messages_are_told_apart_as_the_untagged_enum_did() {
+        let req = incoming(r#"{"jsonrpc":"2.0","id":1,"method":"m","params":{"a":1}}"#);
+        assert!(matches!(req, Ok(Message::Request(r))
+            if r.id == RequestId::Number(1) && r.method == "m" && r.params["a"] == 1));
+        let bare = incoming(r#"{"jsonrpc":"2.0","id":"x","method":"m"}"#);
+        assert!(matches!(bare, Ok(Message::Request(r)) if r.params.is_null()));
+        let resp = incoming(r#"{"jsonrpc":"2.0","id":2,"result":{"data":[1,2,3]}}"#);
+        assert!(matches!(resp, Ok(Message::Response(r))
+            if r.id == RequestId::Number(2)
+                && r.result.as_deref().map(RawValue::get) == Some(r#"{"data":[1,2,3]}"#)
+                && r.error.is_none()));
+        let null_result = incoming(r#"{"jsonrpc":"2.0","id":3,"result":null}"#);
+        assert!(matches!(null_result, Ok(Message::Response(r)) if r.result.is_none()));
+        let failed = incoming(
+            r#"{"jsonrpc":"2.0","id":4,"error":{"code":-32601,"message":"no such method"}}"#,
+        );
+        assert!(matches!(failed, Ok(Message::Response(r))
+            if r.result.is_none()
+                && r.error.as_ref().is_some_and(|e| e.code == ErrorCode::METHOD_NOT_FOUND)));
+        let notif = incoming(r#"{"jsonrpc":"2.0","method":"n","params":[1]}"#);
+        assert!(
+            matches!(notif, Ok(Message::Notification(n)) if n.method == "n" && n.params[0] == 1)
+        );
+        // A null id is no id: a notification when there is a method, as the
+        // untagged enum fell through to it.
+        let null_id = incoming(r#"{"jsonrpc":"2.0","id":null,"method":"n"}"#);
+        assert!(matches!(null_id, Ok(Message::Notification(_))));
+        assert!(incoming(r#"{"jsonrpc":"2.0","id":null,"result":1}"#).is_err());
+        assert!(incoming(r#"{"jsonrpc":"2.0"}"#).is_err());
+        assert!(
+            incoming(r#"{"id":1,"result":1}"#).is_err(),
+            "jsonrpc is required"
+        );
+        assert!(incoming(r#"{"jsonrpc":"1.0","id":1,"result":1}"#).is_err());
+    }
+
+    #[test]
+    fn a_response_result_decodes_into_its_type_and_absent_reads_as_null() {
+        let raw = RawValue::from_string(String::from("[1,2]")).unwrap();
+        let got: Vec<u32> = serde_json::from_str(response_result(Some(raw)).get()).unwrap();
+        assert_eq!(got, vec![1, 2]);
+        let none: Option<u32> = serde_json::from_str(response_result(None).get()).unwrap();
+        assert_eq!(none, None);
+    }
+
+    #[test]
+    fn a_response_croft_sends_serializes_its_result_as_written() {
+        let resp = AnyResponse {
+            id: RequestId::Number(7),
+            result: Some(serde_json::value::to_raw_value(&serde_json::json!({"k": [1]})).unwrap()),
+            error: None,
+        };
+        let text = serde_json::to_string(&RawMessage::new(Message::Response(resp))).unwrap();
+        assert_eq!(text, r#"{"jsonrpc":"2.0","id":7,"result":{"k":[1]}}"#);
     }
 
     #[test]

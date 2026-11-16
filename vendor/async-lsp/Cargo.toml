@@ -97,6 +97,8 @@ features = ["derive"]
 
 [dependencies.serde_json]
 version = "1.0.95"
+# Patched for croft (PATCHED.md): a response's result is kept as RawValue.
+features = ["raw_value"]
 
 [dependencies.thiserror]
 version = "2"

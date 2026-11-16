@@ -22,7 +22,8 @@ impl Future for PeerSocketResponseFuture {
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         match self.rx.poll_unpin(cx) {
             Poll::Ready(Ok(resp)) => Poll::Ready(match resp.error {
-                None => Ok(resp.result.unwrap_or_default()),
+                None => serde_json::from_str(crate::response_result(resp.result).get())
+                    .map_err(|err| ResponseError::new(ErrorCode::INTERNAL_ERROR, err)),
                 Some(resp_err) => Err(resp_err),
             }),
             Poll::Ready(Err(_closed)) => Poll::Ready(Err(ResponseError::new(
