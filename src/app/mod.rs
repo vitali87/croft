@@ -5326,22 +5326,34 @@ impl App {
         crate::dap::configs::workspace_folders(self.roots.iter())
     }
 
-    /// The lines of every text buffer open in any leaf, by path (#2127): a
-    /// Quick Open `:line` query counts these, since picking one opens the
-    /// buffer as it is, unsaved edits and all.
+    /// The lines of every text buffer open in the active group, by path
+    /// (#2127): a Quick Open `:line` query counts these, since a pick opens
+    /// into the active group and reuses its tab for the file, unsaved edits
+    /// and all. Groups share no buffers, so a file open only in another
+    /// group opens from disk, and its saved file is what counts.
     fn open_text_line_counts(&self) -> std::collections::HashMap<PathBuf, usize> {
         self.editor
             .editors
             .iter()
-            .chain(
-                self.editor_layout
-                    .inactive_leaf_tabs()
-                    .into_iter()
-                    .flat_map(|g| g.editors.iter()),
-            )
             .filter(|e| !e.has_non_text_view())
             .filter_map(|e| Some((e.path.clone()?, e.lines.len())))
             .collect()
+    }
+
+    /// Keep an open Quick Open's buffer line counts current (#2127). A
+    /// buffer can change while Quick Open is up (the file watcher reloads
+    /// it, an agent or a collab peer edits it), and a `:line` query must
+    /// count it as a pick would open it now. Cheap: one entry per tab of the
+    /// active group, and the check reruns only when a count changed. True
+    /// when the list changed.
+    pub(super) fn sync_file_finder_open_lines(&mut self) -> bool {
+        if self.file_finder.is_none() {
+            return false;
+        }
+        let open = self.open_text_line_counts();
+        self.file_finder
+            .as_mut()
+            .is_some_and(|f| f.set_open_lines(open))
     }
 
     /// Every open buffer's path, across the active leaf and every inactive
@@ -6604,10 +6616,11 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let log_index_changed = app.poll_log_index();
         let remote_changed = app.refresh_remote_if_config_changed();
         let pulls_changed = app.drain_remote_pulls() | app.drain_relay_copies();
-        let finder_changed = app
-            .file_finder
-            .as_mut()
-            .is_some_and(|f| f.poll_line_check());
+        let finder_changed = app.sync_file_finder_open_lines()
+            | app
+                .file_finder
+                .as_mut()
+                .is_some_and(|f| f.poll_line_check());
         let view_changed = app.drain_view_requests();
         let hook_changed = app.drain_hook_requests()
             | app.poll_pr_gh()

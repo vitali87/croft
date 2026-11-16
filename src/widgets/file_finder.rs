@@ -247,15 +247,29 @@ impl FileFinder {
         me
     }
 
-    /// The lines of each text file open in the editor (#2127), for a
-    /// `:line` query to count instead of the saved file.
-    pub fn set_open_lines(&mut self, open: HashMap<PathBuf, usize>) {
+    /// The lines of each text buffer a pick would open (#2127), for a
+    /// `:line` query to count instead of the saved file. The app hands these
+    /// over on every tick while Quick Open is up, since a buffer can change
+    /// behind it: a reload from disk, an agent's or a collab peer's edit.
+    /// Only a change reruns the check, and the row picked stays picked if
+    /// it is still listed. True when the list changed.
+    pub fn set_open_lines(&mut self, open: HashMap<PathBuf, usize>) -> bool {
+        if open == self.open_lines {
+            return false;
+        }
         self.open_lines = open;
         self.line_counts
             .retain(|path, _| !self.open_lines.contains_key(path));
-        if self.line_hint().is_some() {
-            self.refresh_results();
+        if self.line_hint().is_none() {
+            return false;
         }
+        let chosen = self.selected_entry().map(|e| e.path.clone());
+        self.refresh_results();
+        self.selected = chosen
+            .and_then(|p| self.results.iter().position(|r| r.entry.path == p))
+            .unwrap_or(0);
+        self.scroll = self.scroll.min(self.selected);
+        true
     }
 
     /// Apply a `:line` check's answer if it has come. True when the list
@@ -276,7 +290,7 @@ impl FileFinder {
     /// Wait for the running `:line` check's answer and apply it, for a test
     /// that asserts what the check decides.
     #[cfg(test)]
-    fn finish_line_check(&mut self) {
+    pub(crate) fn finish_line_check(&mut self) {
         if let Some(done) = self.line_check.as_ref().and_then(|c| c.rx.recv().ok()) {
             self.apply_line_check(done);
         }
@@ -2181,6 +2195,47 @@ mod tests {
         let mut both = listed(&finder);
         both.sort_unstable();
         assert_eq!(both, ["api/a.ts", "web/a.ts"]);
+    }
+
+    /// #2127 review: a buffer that grows while Quick Open is up is
+    /// rechecked, and the row picked stays picked. The same counts again
+    /// rerun nothing, since the app hands them over on every tick.
+    #[test]
+    fn open_lines_that_change_recheck_and_keep_the_row_picked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let entries = vec![
+            file_with_lines(tmp.path(), "web/a.ts", 50),
+            file_with_lines(tmp.path(), "api/a.ts", 400),
+            file_with_lines(tmp.path(), "lib/a.ts", 400),
+        ];
+        let web = entries[0].path.clone();
+        let mut finder = FileFinder::new(Arc::new(entries));
+        assert!(
+            !finder.set_open_lines(HashMap::from([(web.clone(), 50)])),
+            "no query, nothing to recheck"
+        );
+        query(&mut finder, "a.ts:318");
+        let mut two = listed(&finder);
+        two.sort_unstable();
+        assert_eq!(two, ["api/a.ts", "lib/a.ts"]);
+        let picked = finder.visible_results()[1].entry.rel.clone();
+        finder.select_next();
+
+        assert!(finder.set_open_lines(HashMap::from([(web.clone(), 400)])));
+        finder.finish_line_check();
+        assert_eq!(listed(&finder).len(), 3, "the grown buffer has the line");
+        assert_eq!(
+            finder.selected_entry().map(|e| e.rel.as_str()),
+            Some(picked.as_str()),
+            "the row picked stays picked"
+        );
+
+        let checks = finder.line_check_generation;
+        assert!(
+            !finder.set_open_lines(HashMap::from([(web, 400)])),
+            "the same counts rerun nothing"
+        );
+        assert_eq!(finder.line_check_generation, checks, "no check started");
     }
 
     /// #2127 review: the check looks past the first page of matches, so a
