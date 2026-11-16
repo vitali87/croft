@@ -1901,7 +1901,8 @@ fn the_steps_before_the_first_frame_are_exactly_the_known_ones_in_order() {
     // with a reason, because tenet 1 forbids anything the first frame does
     // not need: work that can wait runs after it (see `startup_gate`). Every
     // mark below sits on the one path every launch of the editor takes
-    // (`Cli::run`, then `app::run` and `App::new`), unconditionally and on
+    // (`Cli::run`, then `app::run` and `App::new`, then the main loop's first
+    // pass and the render of its first frame), unconditionally and on
     // croft's main thread, so none depends on the machine, the terminal or
     // SSH, and the list is the same for every launch.
     const BEFORE_FIRST_FRAME: &[&str] = &[
@@ -1916,6 +1917,30 @@ fn the_steps_before_the_first_frame_are_exactly_the_known_ones_in_order() {
         "session restored",
         "host terminal answered",
         "screen set up",
+        // The first frame's own parts (#1973): the main loop's first pass
+        // over its polls and drains, in groups, then each part of the screen
+        // the frame draws. Marks only, no work: they split the one step that
+        // used to read "first frame on screen", so a launch that is slow to
+        // draw says which part held it.
+        "file changes read",
+        "background results collected",
+        "agents, ports and collaborators polled",
+        "terminal panes and saves ticked",
+        "highlights and pictures polled",
+        "watchers and dialogs polled",
+        "language servers synced",
+        "lint, gutters and blame synced",
+        "outline and Explorer views synced",
+        "language server replies read",
+        "debugger and tests polled",
+        "AI tools polled",
+        "loop work done",
+        "activity bar drawn",
+        "side bar drawn",
+        "editor drawn",
+        "panel drawn",
+        "status bar and popups drawn",
+        "frame drawn",
     ];
     let tmp = tempfile::tempdir().unwrap();
     let (home, workspace) = (tmp.path().join("home"), tmp.path().join("workspace"));
