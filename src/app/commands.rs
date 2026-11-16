@@ -502,6 +502,7 @@ impl App {
             );
         }
         palette.set_hidden(hidden);
+        palette.set_pinned(crate::user_menu::UserMenu::load().pinned());
         // The chords as keybindings.json leaves them (#1482): a user's own
         // chord, and no built-in chord a user binding gave to another command.
         palette.hint_overrides = crate::widgets::command_palette::ALL_COMMANDS
@@ -2410,6 +2411,11 @@ impl App {
             Cmd::OpenTriggersJson => self.open_config_file_in_editor(
                 crate::triggers::triggers_path(),
                 ConfigFileSeed::Triggers,
+            ),
+            Cmd::OpenUserMenu => self.open_user_menu(),
+            Cmd::OpenUserMenuJson => self.open_config_file_in_editor(
+                crate::user_menu::menu_path(),
+                ConfigFileSeed::UserMenu,
             ),
             Cmd::OpenMatchersJson => self.open_config_file_in_editor(
                 crate::problem_matchers::matchers_path(),

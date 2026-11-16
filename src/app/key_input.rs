@@ -392,6 +392,12 @@ impl App {
                 self.begin_rename_terminal(self.active_terminal);
                 true
             }
+            // Cmd+K Shift+M: the user's menu (menu.json). Must precede the
+            // plain M arm below, which matches either case.
+            KeyCode::Char(c) if shifted && plain && c.eq_ignore_ascii_case(&'m') => {
+                self.open_user_menu();
+                true
+            }
             // Cmd+K M: maximize the active terminal pane / restore the even
             // split (croft binding; VS Code leaves its panel-maximize
             // relative unbound, and every croft action carries an
