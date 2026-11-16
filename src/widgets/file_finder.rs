@@ -263,10 +263,19 @@ impl FileFinder {
         if self.line_hint().is_none() {
             return false;
         }
-        // The query is the same, so the list on screen stays until the
-        // recheck's answer lands, rather than the unchecked best matches,
-        // which need not hold the row picked: Enter meanwhile opens that row,
-        // and the answer keeps it picked if it is still listed.
+        self.rerun_keeping_the_pick();
+        true
+    }
+
+    /// Rerun the query, unchanged, against what changed behind it: the file
+    /// index or an open buffer's lines (#2127). The row picked stays picked
+    /// while its file is listed. A `:line` check is not waited for. While it
+    /// runs, the list on screen stays, rather than the unchecked best
+    /// matches, which need not hold the row picked: Enter meanwhile opens
+    /// that row, and the answer keeps it picked if it is still listed. An
+    /// empty list, as before the first index lands, has no row to keep, so
+    /// the unchecked matches are drawn at once.
+    fn rerun_keeping_the_pick(&mut self) {
         let chosen = self.selected_entry().map(|e| e.path.clone());
         let shown = (
             std::mem::take(&mut self.results),
@@ -275,15 +284,16 @@ impl FileFinder {
             self.notice.take(),
         );
         self.refresh_results_waiting(std::time::Duration::ZERO);
-        if self.line_check.is_some() {
+        if self.line_check.is_some() && chosen.is_some() {
             (self.results, self.selected, self.scroll, self.notice) = shown;
-        } else {
-            self.selected = chosen
-                .and_then(|p| self.results.iter().position(|r| r.entry.path == p))
-                .unwrap_or(0);
-            self.scroll = self.scroll.min(self.selected);
+            return;
         }
-        true
+        // A row whose file is no longer listed keeps its place, inside the
+        // list.
+        self.selected = chosen
+            .and_then(|p| self.results.iter().position(|r| r.entry.path == p))
+            .unwrap_or_else(|| shown.1.min(self.results.len().saturating_sub(1)));
+        self.scroll = self.scroll.min(self.selected);
     }
 
     /// Apply a `:line` check's answer if it has come. True when the list
@@ -338,15 +348,7 @@ impl FileFinder {
             return;
         }
         self.entries = entries;
-        self.refresh_results();
-        if self.results.is_empty() {
-            self.selected = 0;
-        } else if self.selected >= self.results.len() {
-            self.selected = self.results.len() - 1;
-        }
-        if self.scroll > self.selected {
-            self.scroll = self.selected;
-        }
+        self.rerun_keeping_the_pick();
     }
 
     pub fn push_char(&mut self, c: char) {
@@ -2313,6 +2315,82 @@ mod tests {
         finder.select_prev();
         finder.finish_line_check();
         assert_eq!(finder.selected_entry().map(|e| &e.path), Some(&a));
+    }
+
+    /// #2127 review: a file index refreshed while Quick Open is up (a file
+    /// made or removed in the workspace) reruns the query the way an open
+    /// buffer's recheck does. A `:line` query keeps the list and the row
+    /// picked on screen until the answer lands, and the answer keeps that
+    /// row. With no hint, the row picked follows its file to where the new
+    /// index ranks it, so Enter never opens the file a new one pushed up.
+    #[test]
+    fn an_index_refresh_keeps_the_row_picked() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Forty-one short `x.ts` rank above the long ones, by length.
+        let mut entries: Vec<FileEntry> = (0..41)
+            .map(|i| file_with_lines(tmp.path(), &format!("s{i}/x.ts"), 2))
+            .collect();
+        entries.push(file_with_lines(tmp.path(), "long/a/x.ts", 10));
+        entries.push(file_with_lines(tmp.path(), "long/b/x.ts", 10));
+        let b = entries[42].path.clone();
+        let mut finder = FileFinder::new(Arc::new(entries.clone()));
+        query(&mut finder, "x.ts:5");
+        assert_eq!(listed(&finder), ["long/a/x.ts", "long/b/x.ts"]);
+        finder.select_next();
+
+        entries.push(file_with_lines(tmp.path(), "long/c/x.ts", 10));
+        finder.replace_entries(Arc::new(entries));
+        assert!(finder.line_check.is_some(), "the recheck is still running");
+        assert_eq!(
+            listed(&finder),
+            ["long/a/x.ts", "long/b/x.ts"],
+            "the list on screen stays until the answer lands"
+        );
+        assert_eq!(
+            finder.selected_entry().map(|e| &e.path),
+            Some(&b),
+            "Enter meanwhile opens the row picked"
+        );
+        finder.finish_line_check();
+        assert_eq!(
+            listed(&finder),
+            ["long/a/x.ts", "long/b/x.ts", "long/c/x.ts"],
+            "the new file is checked and listed"
+        );
+        assert_eq!(finder.selected_entry().map(|e| &e.path), Some(&b));
+
+        // Opened before the first index landed, the list is empty: there is
+        // no row to keep, so the new matches show unchecked at once.
+        let mut finder = FileFinder::new(Arc::new(Vec::new()));
+        query(&mut finder, "x.ts:5");
+        assert!(listed(&finder).is_empty());
+        finder.replace_entries(Arc::new(vec![
+            file_with_lines(tmp.path(), "short/x.ts", 2),
+            file_with_lines(tmp.path(), "long/a/x.ts", 10),
+        ]));
+        assert!(finder.line_check.is_some(), "the check is still running");
+        assert_eq!(listed(&finder), ["short/x.ts", "long/a/x.ts"]);
+        finder.finish_line_check();
+        assert_eq!(listed(&finder), ["long/a/x.ts"]);
+
+        let mut finder = FileFinder::new(Arc::new(vec![entry("a/x.ts"), entry("b/x.ts")]));
+        query(&mut finder, "x.ts");
+        finder.select_next();
+        assert_eq!(
+            finder.selected_entry().map(|e| e.rel.as_str()),
+            Some("b/x.ts")
+        );
+        finder.replace_entries(Arc::new(vec![
+            entry("x.ts"),
+            entry("a/x.ts"),
+            entry("b/x.ts"),
+        ]));
+        assert_eq!(listed(&finder), ["x.ts", "a/x.ts", "b/x.ts"]);
+        assert_eq!(
+            finder.selected_entry().map(|e| e.rel.as_str()),
+            Some("b/x.ts"),
+            "a better-ranked new file does not take the row picked"
+        );
     }
 
     /// #2127 review: the check looks past the first page of matches, so a
