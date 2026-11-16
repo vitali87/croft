@@ -307,3 +307,12 @@ lto = false
 codegen-units = 16
 debug = false
 strip = "symbols"
+
+# async-lsp 0.2.4 as published, with one change to how it reads a message
+# from a language server (vendor/async-lsp/PATCHED.md). Published, it parsed
+# every reply three times over before croft saw it; a big file's semantic
+# tokens alone briefly took ~90 MB. Drop this once upstream reads messages
+# the same way. `cargo publish` leaves [patch] out of the published manifest,
+# so `cargo install croft-software` builds against the crates.io release.
+[patch.crates-io]
+async-lsp = { path = "vendor/async-lsp" }
