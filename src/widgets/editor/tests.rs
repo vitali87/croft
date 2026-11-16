@@ -17319,6 +17319,24 @@ fn a_net_zero_line_count_edit_still_moves_the_folds() {
     assert!(e.is_line_hidden(3) && !e.is_line_hidden(2));
 }
 
+/// A whole-buffer swap drops the selection and every extra caret with the
+/// old text (#2074): left on rows the shorter new text no longer has, they
+/// indexed past its end on the next frame or keystroke.
+#[test]
+fn replacing_every_line_drops_the_selection_and_extra_carets() {
+    let mut e = editor_with("one\ntwo\nthree\nfour\nfive");
+    e.cursor_row = 4;
+    e.selection = Some(EditorSelection {
+        anchor: (3, 0),
+        head: (4, 2),
+    });
+    e.carets = vec![EditorSelection::new(2, 1), EditorSelection::new(4, 3)];
+    e.replace_all_lines(vec![String::from("only")]);
+    assert!(e.selection.is_none());
+    assert!(e.carets.is_empty());
+    assert_eq!(e.cursor_row, 0, "the caret clamps into the new text");
+}
+
 /// The #1611 file, with `def b()` (row 4, body rows 5-6) folded.
 fn folded_b() -> Editor {
     let mut e =

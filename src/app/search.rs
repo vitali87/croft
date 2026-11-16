@@ -2007,9 +2007,12 @@ impl App {
         let text = crate::search_editor::render(&header, &hits, &self.tree.root);
         let lines: Vec<String> = text.lines().map(str::to_string).collect();
         let mut landed = false;
+        // A whole-buffer replacement like Replace All (#2074): one undo step,
+        // the old selection and extra carets dropped (left on rows the new
+        // results no longer have, they crashed the next frame), and the
+        // tab's layout and highlights rebuilt for the new text.
         self.for_each_tab_of(&label, |tab| {
-            tab.lines = lines.clone();
-            tab.cursor_row = tab.cursor_row.min(tab.lines.len().saturating_sub(1));
+            tab.replace_all_lines(lines.clone());
             tab.cursor_col = 0;
             landed = true;
         });

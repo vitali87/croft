@@ -2469,6 +2469,69 @@ fn a_search_editor_reruns_its_header_and_opens_results() {
     assert_eq!(app.editor.cursor_row, 1, "the match's line, 0-based");
 }
 
+/// Re-run the active Search Editor and wait for its results to land.
+fn rerun_search_editor_and_wait(app: &mut App) {
+    assert!(app.handle_cmd_k_chord(key(KeyCode::Char('R'), KeyModifiers::SHIFT)));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !app.drain_search_editor() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the rerun never landed"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// A rerun lands like Replace All (#2074). A word selected and an extra
+/// caret on rows the shorter new results no longer have go with the old
+/// text, so the next frame and a copy work instead of indexing past the
+/// end; and one undo takes back the rerun alone.
+#[test]
+fn a_search_editor_rerun_drops_a_selection_its_results_no_longer_have() {
+    use crate::widgets::editor::EditorSelection;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    let many: String = (0..60).map(|i| format!("common line {i}\n")).collect();
+    std::fs::write(root.join("many.txt"), many).unwrap();
+    std::fs::write(root.join("one.txt"), "a rare word\n").unwrap();
+    let mut app = App::new(root.clone()).unwrap();
+    app.run_command(crate::widgets::command_palette::Command::OpenSearchEditor);
+    app.focus_pane(Pane::Editor);
+    app.editor.lines[0] = String::from("# Query: common");
+    rerun_search_editor_and_wait(&mut app);
+    let many_rows = app.editor.lines.len();
+    assert!(many_rows > 50, "setup: one row per hit, got {many_rows}");
+
+    // The query changes to a rare word, and a word far down the old list is
+    // selected, with an extra caret below it.
+    app.editor.lines[0] = String::from("# Query: rare");
+    let row = many_rows - 5;
+    app.editor.cursor_row = row;
+    app.editor.cursor_col = 4;
+    app.editor.selection = Some(EditorSelection {
+        anchor: (row, 0),
+        head: (row, 4),
+    });
+    app.editor.carets = vec![EditorSelection::new(row + 2, 1)];
+    let before_rerun = app.editor.lines.join("\n");
+    rerun_search_editor_and_wait(&mut app);
+
+    let rare_rows = app.editor.lines.len();
+    assert!(rare_rows < row, "setup: the new results are shorter");
+    assert!(app.editor.selection.is_none(), "the old selection must go");
+    assert!(app.editor.carets.is_empty(), "the extra carets must go");
+    draw(&mut app, 120, 40);
+    app.handle_key(key(KeyCode::Char('c'), KeyModifiers::SUPER))
+        .unwrap();
+
+    assert!(app.editor.undo(), "the rerun must leave an undo step");
+    assert_eq!(
+        app.editor.lines.join("\n"),
+        before_rerun,
+        "the rerun must be its own undo step"
+    );
+}
+
 /// #860: VS Code's `Alt+C` / `Alt+W` / `Alt+R` flip the Search side bar's
 /// `Aa` / `ab` / `.*` toggles from any of its inputs, and `Alt+D` opens and
 /// closes the include / exclude rows, all of which were click-only. Plain
