@@ -2555,6 +2555,27 @@ impl App {
         }
     }
 
+    /// Keep the buffer ratatui just drew for [`Self::chrome_image_due`], on
+    /// the terminals it reads it for: every one but Kitty's protocol, which
+    /// keeps pictures on a layer of their own. On Kitty (Ghostty, kitty) the
+    /// copy was a whole screen of cells cloned after every frame and never
+    /// read, so none is kept there.
+    pub(super) fn keep_drawn_buffer(&mut self, drawn: &ratatui::buffer::Buffer) {
+        if self.inline_protocol == crate::iterm2_inline::InlineImageProtocol::Kitty {
+            self.drawn_buffer = None;
+            return;
+        }
+        match self.drawn_buffer.as_mut() {
+            // Into the cells of the last copy, so a frame reuses them
+            // rather than allocating a screen's worth anew.
+            Some(kept) => {
+                kept.area = drawn.area;
+                kept.content.clone_from(&drawn.content);
+            }
+            None => self.drawn_buffer = Some(drawn.clone()),
+        }
+    }
+
     /// Whether a small chrome image must be sent this frame (#682). These
     /// used to go out after every redraw, so a keystroke re-sent each one
     /// over SSH. Now one goes out when it is new, changed or moved, and on

@@ -6894,7 +6894,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             crate::startup_trace::mark("frame drawn");
             app.sync_caret_style();
             let mut underlays = app.image_underlays(drawn.buffer);
-            app.drawn_buffer = Some(drawn.buffer.clone());
+            app.keep_drawn_buffer(drawn.buffer);
             // Record render+flush time and the bytes ratatui shipped this
             // frame so the F8 HUD can show where remote latency goes.
             app.perf.record_draw(draw_start.elapsed().as_micros());
@@ -6910,7 +6910,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                 app.forget_sent_images();
                 let drawn = terminal.draw(|f| app.render_for_terminal(f))?;
                 underlays = app.image_underlays(drawn.buffer);
-                app.drawn_buffer = Some(drawn.buffer.clone());
+                app.keep_drawn_buffer(drawn.buffer);
             }
             // After ratatui flushes its diff, paint the activity-bar icons
             // directly via OSC-1337 on every redraw. We previously gated
