@@ -5322,6 +5322,24 @@ impl App {
         crate::dap::configs::workspace_folders(self.roots.iter())
     }
 
+    /// The lines of every text buffer open in any leaf, by path (#2127): a
+    /// Quick Open `:line` query counts these, since picking one opens the
+    /// buffer as it is, unsaved edits and all.
+    fn open_text_line_counts(&self) -> std::collections::HashMap<PathBuf, usize> {
+        self.editor
+            .editors
+            .iter()
+            .chain(
+                self.editor_layout
+                    .inactive_leaf_tabs()
+                    .into_iter()
+                    .flat_map(|g| g.editors.iter()),
+            )
+            .filter(|e| !e.has_non_text_view())
+            .filter_map(|e| Some((e.path.clone()?, e.lines.len())))
+            .collect()
+    }
+
     /// Every open buffer's path, across the active leaf and every inactive
     /// one. `App::editor` is the hoisted active leaf and `inactive_leaf_tabs`
     /// walks the rest, so together they cover each leaf exactly once.
@@ -6616,6 +6634,10 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let log_index_changed = app.poll_log_index();
         let remote_changed = app.refresh_remote_if_config_changed();
         let pulls_changed = app.drain_remote_pulls();
+        let finder_changed = app
+            .file_finder
+            .as_mut()
+            .is_some_and(|f| f.poll_line_check());
         let view_changed = app.drain_view_requests();
         let hook_changed = app.drain_hook_requests()
             | app.poll_pr_gh()
@@ -6792,6 +6814,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || log_index_changed
             || remote_changed
             || pulls_changed
+            || finder_changed
             || view_changed
             || hook_changed
             || kernel_changed

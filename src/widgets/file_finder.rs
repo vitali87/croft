@@ -13,10 +13,19 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 const MAX_RESULTS: usize = 40;
-/// The most bytes one keystroke reads to count the lines of the files a
-/// `:line` query lists (#2127). A file past it is left in the list, as an
-/// unknown, rather than holding up the keystroke.
+/// The most bytes one `:line` check reads to count the lines of the files a
+/// query matches (#2127). A file past it is left in the list, as an
+/// unknown, rather than read on.
 const LINE_COUNT_BUDGET: u64 = 32 * 1024 * 1024;
+/// The most matches one `:line` check looks at, in rank order (#2127). A
+/// common name can match thousands of files; the ranking keeps this many,
+/// so a file that has the line is found past the first page of matches.
+const LINE_CHECK_MAX_FILES: usize = 2_000;
+/// How long a keystroke waits for its `:line` check before drawing the
+/// matches unchecked (#2127). A local disk answers well inside it, so the
+/// list does not flicker; a stalled network mount cannot hold the keystroke
+/// past it, and its answer is applied when it comes.
+const LINE_CHECK_WAIT: std::time::Duration = std::time::Duration::from_millis(16);
 
 #[derive(Clone, Debug)]
 pub struct FileEntry {
@@ -79,6 +88,45 @@ pub struct FileFinder {
     /// Lines counted in files a `:line` query listed, kept while the file's
     /// size and time are unchanged so each keystroke reads a file once.
     line_counts: HashMap<PathBuf, LineCount>,
+    /// Lines in the text files open in the editor, which a pick opens as
+    /// they are, unsaved edits and all: a `:line` query counts these rather
+    /// than what is saved (#2127). Set by the app when the finder opens.
+    open_lines: HashMap<PathBuf, usize>,
+    /// The `:line` check counting off the UI thread, if one is running.
+    line_check: Option<LineCheck>,
+    /// Bumped by every check started, so an older query's answer is never
+    /// applied to a newer one.
+    line_check_generation: u64,
+}
+
+/// A `:line` check running on its own thread (#2127): the matches it is
+/// checking, best first, and where its answer comes back.
+struct LineCheck {
+    generation: u64,
+    needed: usize,
+    candidates: Vec<ScoredResult>,
+    /// More files matched than the ranking kept.
+    more_matched: bool,
+    rx: std::sync::mpsc::Receiver<LineCheckDone>,
+}
+
+/// What a `:line` check found.
+struct LineCheckDone {
+    generation: u64,
+    /// The lines of each candidate checked, in rank order, counted no
+    /// further than the line asked for; `None` for one it could not tell.
+    /// Shorter than the candidates when the check stopped early.
+    lines: Vec<Option<usize>>,
+    /// Counts read from disk, for the cache.
+    counted: Vec<(PathBuf, LineCount)>,
+}
+
+/// One candidate as a `:line` check gets it: its lines when it is open in
+/// the editor, else what the cache holds for it.
+struct LineJob {
+    path: PathBuf,
+    open: Option<usize>,
+    cached: Option<LineCount>,
 }
 
 /// What counting a file's lines found (#2127).
@@ -106,9 +154,47 @@ impl FileFinder {
             last_caret: None,
             notice: None,
             line_counts: HashMap::new(),
+            open_lines: HashMap::new(),
+            line_check: None,
+            line_check_generation: 0,
         };
         me.refresh_results();
         me
+    }
+
+    /// The lines of each text file open in the editor (#2127), for a
+    /// `:line` query to count instead of the saved file.
+    pub fn set_open_lines(&mut self, open: HashMap<PathBuf, usize>) {
+        self.open_lines = open;
+        self.line_counts
+            .retain(|path, _| !self.open_lines.contains_key(path));
+        if self.line_hint().is_some() {
+            self.refresh_results();
+        }
+    }
+
+    /// Apply a `:line` check's answer if it has come. True when the list
+    /// changed, so the frame is redrawn.
+    pub fn poll_line_check(&mut self) -> bool {
+        let done = match self.line_check.as_ref().map(|c| c.rx.try_recv()) {
+            Some(Ok(done)) => done,
+            Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
+                self.line_check = None;
+                return false;
+            }
+            _ => return false,
+        };
+        self.apply_line_check(done);
+        true
+    }
+
+    /// Wait for the running `:line` check's answer and apply it, for a test
+    /// that asserts what the check decides.
+    #[cfg(test)]
+    fn finish_line_check(&mut self) {
+        if let Some(done) = self.line_check.as_ref().and_then(|c| c.rx.recv().ok()) {
+            self.apply_line_check(done);
+        }
     }
 
     pub fn set_query(&mut self, q: &str) {
@@ -252,6 +338,8 @@ impl FileFinder {
         // match nothing at all (#472).
         let (file_part, hint) = split_line_hint(&self.query);
         self.notice = None;
+        // A check still running answers the query before this one.
+        self.line_check = None;
         let mut needle: String = file_part.trim().to_lowercase();
         // A hint with no file (`:236`) names a line in nothing: listing every
         // file and opening the first at that line would be a surprise, so it
@@ -290,54 +378,66 @@ impl FileFinder {
             return;
         }
         let entries: &[FileEntry] = &self.entries;
+        // A `:line` query ranks more than a page of matches, so the check
+        // can find the files that have the line further down (#2127).
+        let keep = if hint.is_some() {
+            LINE_CHECK_MAX_FILES
+        } else {
+            MAX_RESULTS
+        };
         // Score in parallel with rayon and accumulate per-thread top-K
         // bounded heaps, then merge. With N=1.5M entries on a typical
         // home dir, this drops keystroke latency from ~300 ms (serial,
         // full sort) to single-digit ms (multi-core, heap of K=40).
-        let merged: BinaryHeap<RankedSlot> = entries
+        let (merged, matched): (BinaryHeap<RankedSlot>, usize) = entries
             .par_iter()
             .enumerate()
             .fold(
-                || BinaryHeap::<RankedSlot>::with_capacity(MAX_RESULTS + 1),
-                |mut heap, (idx, entry)| {
-                    if let Some((tier, score)) =
+                || (BinaryHeap::<RankedSlot>::with_capacity(MAX_RESULTS + 1), 0),
+                |(mut heap, matched), (idx, entry)| {
+                    let Some((tier, score)) =
                         score_entry(&needle, &entry.rel_lower, entry.filename_start_lower)
-                    {
-                        push_topk(
-                            &mut heap,
-                            RankedSlot {
-                                tier,
-                                rel_len: entry.rel.len() as u32,
-                                score,
-                                idx,
-                            },
-                            MAX_RESULTS,
-                        );
-                    }
-                    heap
+                    else {
+                        return (heap, matched);
+                    };
+                    push_topk(
+                        &mut heap,
+                        RankedSlot {
+                            tier,
+                            rel_len: entry.rel.len() as u32,
+                            score,
+                            idx,
+                        },
+                        keep,
+                    );
+                    (heap, matched + 1)
                 },
             )
             .reduce(
-                || BinaryHeap::<RankedSlot>::with_capacity(MAX_RESULTS + 1),
-                |mut a, b| {
+                || (BinaryHeap::<RankedSlot>::with_capacity(MAX_RESULTS + 1), 0),
+                |(mut a, n), (b, m)| {
                     for slot in b {
-                        push_topk(&mut a, slot, MAX_RESULTS);
+                        push_topk(&mut a, slot, keep);
                     }
-                    a
+                    (a, n + m)
                 },
             );
         // Our Ord orders BEST as LEAST (so the max-heap root is the
         // worst-of-top-K, evictable in O(log K)). into_sorted_vec
         // therefore returns ascending = best-first already.
         let top: Vec<RankedSlot> = merged.into_sorted_vec();
-        self.results = top
+        let ranked: Vec<ScoredResult> = top
             .into_iter()
             .map(|slot| ScoredResult {
                 entry: entries[slot.idx].clone(),
             })
             .collect();
-        if let Some(hint) = hint {
-            self.keep_files_reaching(hint);
+        match hint {
+            Some(hint) => {
+                let more_matched = matched > ranked.len();
+                self.start_line_check(ranked, hint.end.unwrap_or(hint.line), more_matched);
+            }
+            None => self.results = ranked,
         }
     }
 
@@ -347,75 +447,201 @@ impl FileFinder {
     /// match has it, every match stays, longest first, and [`Self::notice`]
     /// says so, since the line is likely mistyped.
     ///
-    /// Only the listed matches are read, each only as far as the line asked
-    /// for, and each count is kept between keystrokes. A file that can't be
-    /// read, or is past the keystroke's [`LINE_COUNT_BUDGET`], stays listed.
-    fn keep_files_reaching(&mut self, hint: LineHint) {
-        let needed = hint.end.unwrap_or(hint.line);
-        let mut budget = LINE_COUNT_BUDGET;
-        let results = std::mem::take(&mut self.results);
-        let counts: Vec<Option<LineCount>> = results
-            .iter()
-            .map(|r| self.line_count(&r.entry.path, needed, &mut budget))
-            .collect();
-        let reaches = |c: &Option<LineCount>| c.is_none_or(|c| c.lines >= needed);
-        if results.is_empty() || counts.iter().any(reaches) {
-            self.results = results
-                .into_iter()
-                .zip(&counts)
-                .filter(|(_, c)| reaches(c))
-                .map(|(r, _)| r)
-                .collect();
+    /// The counting reads files, so it runs on its own thread: a file on a
+    /// stalled network mount must not freeze the UI. The keystroke waits
+    /// [`LINE_CHECK_WAIT`] for the answer and otherwise draws the matches
+    /// unchecked until [`Self::poll_line_check`] applies it. Matches are
+    /// read in rank order, each only as far as the line asked for, until a
+    /// page of them is known to have the line; each count is kept between
+    /// keystrokes. A file that can't be read or counted the editor's way
+    /// stays listed, as an unknown.
+    fn start_line_check(
+        &mut self,
+        candidates: Vec<ScoredResult>,
+        needed: usize,
+        more_matched: bool,
+    ) {
+        self.results = candidates.iter().take(MAX_RESULTS).cloned().collect();
+        if candidates.is_empty() {
             return;
         }
-        // Every count is a whole file's, and short of the line. A stable
-        // sort keeps the match order among files of one length.
-        let mut ranked: Vec<(ScoredResult, usize)> = results
-            .into_iter()
-            .zip(counts)
-            .map(|(r, c)| (r, c.map_or(0, |c| c.lines)))
+        self.line_check_generation += 1;
+        let generation = self.line_check_generation;
+        let jobs: Vec<LineJob> = candidates
+            .iter()
+            .map(|r| LineJob {
+                path: r.entry.path.clone(),
+                open: self.open_lines.get(&r.entry.path).copied(),
+                cached: self.line_counts.get(&r.entry.path).copied(),
+            })
             .collect();
-        ranked.sort_by_key(|(_, lines)| std::cmp::Reverse(*lines));
-        self.notice = Some(format!("no match has line {needed} \u{b7} longest first"));
-        self.results = ranked.into_iter().map(|(r, _)| r).collect();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (lines, counted) = check_lines(jobs, needed);
+            let _ = tx.send(LineCheckDone {
+                generation,
+                lines,
+                counted,
+            });
+        });
+        let answer = rx.recv_timeout(LINE_CHECK_WAIT).ok();
+        self.line_check = Some(LineCheck {
+            generation,
+            needed,
+            candidates,
+            more_matched,
+            rx,
+        });
+        if let Some(done) = answer {
+            self.apply_line_check(done);
+        }
     }
 
-    /// The lines of `path`, counted no further than `needed`, from the
-    /// cache while the file's size and time are unchanged.
-    fn line_count(&mut self, path: &Path, needed: usize, budget: &mut u64) -> Option<LineCount> {
-        let meta = std::fs::metadata(path).ok()?;
-        let (len, modified) = (meta.len(), meta.modified().ok());
-        if let Some(c) = self.line_counts.get(path)
-            && c.len == len
-            && c.modified == modified
-            && (c.complete || c.lines >= needed)
-        {
-            return Some(*c);
+    /// Filter the matches by what a `:line` check found. An answer to an
+    /// older query only fills the cache.
+    fn apply_line_check(&mut self, done: LineCheckDone) {
+        for (path, count) in done.counted {
+            self.line_counts.insert(path, count);
         }
-        let (lines, complete) = count_lines(path, needed, budget)?;
-        let c = LineCount {
+        let Some(check) = self.line_check.take_if(|c| c.generation == done.generation) else {
+            return;
+        };
+        let kept: Vec<ScoredResult> = check
+            .candidates
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| match done.lines.get(*i) {
+                Some(lines) => lines.is_none_or(|n| n >= check.needed),
+                // Past where the check stopped: not looked at, so unknown.
+                None => true,
+            })
+            .map(|(_, r)| r.clone())
+            .take(MAX_RESULTS)
+            .collect();
+        self.selected = 0;
+        self.scroll = 0;
+        if !kept.is_empty() {
+            self.notice = None;
+            self.results = kept;
+            return;
+        }
+        // Every match was counted whole and is short of the line. A stable
+        // sort keeps the match order among files of one length.
+        let mut ranked: Vec<(ScoredResult, usize)> = check
+            .candidates
+            .into_iter()
+            .zip(done.lines)
+            .map(|(r, lines)| (r, lines.unwrap_or(0)))
+            .collect();
+        ranked.sort_by_key(|(_, lines)| std::cmp::Reverse(*lines));
+        let needed = check.needed;
+        self.notice = Some(if check.more_matched {
+            format!(
+                "none of the first {} matches has line {needed} \u{b7} longest first",
+                LINE_CHECK_MAX_FILES
+            )
+        } else {
+            format!("no match has line {needed} \u{b7} longest first")
+        });
+        self.results = ranked
+            .into_iter()
+            .take(MAX_RESULTS)
+            .map(|(r, _)| r)
+            .collect();
+    }
+}
+
+/// Count, in rank order, the lines of the matches a `:line` query names,
+/// until a page of them is known to reach `needed` or can't be told (#2127).
+/// Off the UI thread: every read here may wait on the filesystem. Returns
+/// each checked candidate's lines (`None` when unknown) and the counts read
+/// from disk, for the cache.
+fn check_lines(
+    jobs: Vec<LineJob>,
+    needed: usize,
+) -> (Vec<Option<usize>>, Vec<(PathBuf, LineCount)>) {
+    let mut budget = LINE_COUNT_BUDGET;
+    let mut lines = Vec::with_capacity(MAX_RESULTS);
+    let mut counted = Vec::new();
+    let mut kept = 0;
+    for job in jobs {
+        if kept == MAX_RESULTS {
+            break;
+        }
+        let found = match job.open {
+            Some(n) => Some(n),
+            None => {
+                disk_line_count(&job.path, job.cached, needed, &mut budget).map(|(c, fresh)| {
+                    if fresh {
+                        counted.push((job.path.clone(), c));
+                    }
+                    c.lines
+                })
+            }
+        };
+        if found.is_none_or(|n| n >= needed) {
+            kept += 1;
+        }
+        lines.push(found);
+    }
+    (lines, counted)
+}
+
+/// The lines of the saved file at `path`, counted no further than `needed`,
+/// from `cached` while the file's size and time are unchanged; and whether
+/// the count is new. `None` for anything but a regular file (a FIFO would
+/// wait for a writer, a device could stream forever) and for a file
+/// [`count_lines`] can't count.
+fn disk_line_count(
+    path: &Path,
+    cached: Option<LineCount>,
+    needed: usize,
+    budget: &mut u64,
+) -> Option<(LineCount, bool)> {
+    let meta = std::fs::metadata(path).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    let (len, modified) = (meta.len(), meta.modified().ok());
+    if let Some(c) = cached
+        && c.len == len
+        && c.modified == modified
+        && (c.complete || c.lines >= needed)
+    {
+        return Some((c, false));
+    }
+    let (lines, complete) = count_lines(path, needed, budget)?;
+    Some((
+        LineCount {
             lines,
             complete,
             len,
             modified,
-        };
-        self.line_counts.insert(path.to_path_buf(), c);
-        Some(c)
-    }
+        },
+        true,
+    ))
 }
 
-/// The lines in the file at `path`, reading no further than the `cap`-th:
-/// `(cap, false)` once it has that many, `(n, true)` with its whole count
-/// when it has fewer. A last line without a newline counts. `None` when the
-/// file can't be read or `budget` (bytes, shared by one keystroke's reads)
-/// runs out first.
+/// The lines in the file at `path` as the editor splits them (#2127): `\n`,
+/// `\r\n` and a lone `\r` each end one, a last line with no ending counts,
+/// and an empty file has one. Read no further than line `cap`: `(cap, false)`
+/// as soon as that line has begun, `(n, true)` with the whole count when the
+/// file has fewer. `None` when the file can't be read, holds a NUL byte, or
+/// `budget` (bytes, shared by one check's reads) runs out first. A NUL is
+/// UTF-16 text, which the editor decodes before it splits lines and whose
+/// bytes hold `\n` that are not line ends, or a binary the editor shows as
+/// hex; every other encoding the editor reads ends lines with these bytes.
 fn count_lines(path: &Path, cap: usize, budget: &mut u64) -> Option<(usize, bool)> {
     use std::io::Read;
     let mut file = std::fs::File::open(path).ok()?;
     let mut buf = vec![0u8; 64 * 1024];
-    let mut newlines = 0usize;
-    let mut last = None;
+    // Line ends seen; whether a line has begun since the last; whether the
+    // last byte was a `\r`, which a `\n` right after only completes.
+    let (mut ended, mut begun, mut after_cr) = (0usize, false, false);
     loop {
+        if ended + usize::from(begun) >= cap {
+            return Some((cap, false));
+        }
         if *budget == 0 {
             return None;
         }
@@ -424,16 +650,34 @@ fn count_lines(path: &Path, cap: usize, budget: &mut u64) -> Option<(usize, bool
             break;
         }
         *budget = budget.saturating_sub(n as u64);
-        newlines += memchr::memchr_iter(b'\n', &buf[..n]).count();
-        last = buf[..n].last().copied();
-        if newlines >= cap {
-            return Some((cap, false));
+        let chunk = &buf[..n];
+        if memchr::memchr(0, chunk).is_some() {
+            return None;
+        }
+        let mut pos = 0;
+        for at in memchr::memchr2_iter(b'\n', b'\r', chunk) {
+            if at > pos {
+                begun = true;
+                after_cr = false;
+            }
+            if chunk[at] == b'\n' && after_cr {
+                after_cr = false;
+            } else {
+                ended += 1;
+                begun = false;
+                after_cr = chunk[at] == b'\r';
+            }
+            pos = at + 1;
+            if ended >= cap {
+                return Some((cap, false));
+            }
+        }
+        if pos < n {
+            begun = true;
+            after_cr = false;
         }
     }
-    Some((
-        newlines + usize::from(last.is_some_and(|b| b != b'\n')),
-        true,
-    ))
+    Some(((ended + usize::from(begun)).max(1), true))
 }
 
 /// One ranked match candidate. Ordering is "worse comes first" so a
@@ -1587,6 +1831,12 @@ mod tests {
         FileEntry { path, ..entry(rel) }
     }
 
+    /// Type `q` and wait for the `:line` check it starts, if any.
+    fn query(finder: &mut FileFinder, q: &str) {
+        finder.set_query(q);
+        finder.finish_line_check();
+    }
+
     fn listed(finder: &FileFinder) -> Vec<&str> {
         finder
             .visible_results()
@@ -1606,17 +1856,17 @@ mod tests {
             file_with_lines(tmp.path(), "cli/a.ts", 90),
         ];
         let mut finder = FileFinder::new(Arc::new(entries));
-        finder.set_query("a.ts");
+        query(&mut finder, "a.ts");
         assert_eq!(listed(&finder).len(), 3, "no hint: every a.ts");
-        finder.set_query("a.ts:318");
+        query(&mut finder, "a.ts:318");
         assert_eq!(listed(&finder), ["api/a.ts"]);
         assert_eq!(finder.notice, None);
-        finder.set_query("a.ts:90");
+        query(&mut finder, "a.ts:90");
         assert_eq!(listed(&finder).len(), 2, "the last line counts");
         assert!(!listed(&finder).contains(&"web/a.ts"));
-        finder.set_query("a.ts:40-120");
+        query(&mut finder, "a.ts:40-120");
         assert_eq!(listed(&finder), ["api/a.ts"], "a range needs its last line");
-        finder.set_query("a.ts:7:3");
+        query(&mut finder, "a.ts:7:3");
         assert_eq!(listed(&finder).len(), 3, "every one has line 7");
     }
 
@@ -1632,13 +1882,13 @@ mod tests {
             file_with_lines(tmp.path(), "cli/a.ts", 90),
         ];
         let mut finder = FileFinder::new(Arc::new(entries));
-        finder.set_query("a.ts:5000");
+        query(&mut finder, "a.ts:5000");
         assert_eq!(listed(&finder), ["api/a.ts", "cli/a.ts", "web/a.ts"]);
         assert_eq!(
             finder.notice.as_deref(),
             Some("no match has line 5000 \u{b7} longest first")
         );
-        finder.set_query("a.ts:318");
+        query(&mut finder, "a.ts:318");
         assert_eq!(finder.notice, None, "the notice goes once a match has it");
     }
 
@@ -1650,15 +1900,15 @@ mod tests {
         let short = file_with_lines(tmp.path(), "a.ts", 10);
         let path = short.path.clone();
         let mut finder = FileFinder::new(Arc::new(vec![short]));
-        finder.set_query("a.ts:200");
+        query(&mut finder, "a.ts:200");
         assert_eq!(
             finder.notice.as_deref().map(|n| n.contains("200")),
             Some(true)
         );
         let text: String = (1..=300).map(|i| format!("line {i}\n")).collect();
         std::fs::write(&path, text).unwrap();
-        finder.set_query("a.ts:20");
-        finder.set_query("a.ts:200");
+        query(&mut finder, "a.ts:20");
+        query(&mut finder, "a.ts:200");
         assert_eq!(listed(&finder), ["a.ts"]);
         assert_eq!(finder.notice, None, "the grown file has line 200");
     }
@@ -1673,7 +1923,11 @@ mod tests {
             p
         };
         let mut budget = LINE_COUNT_BUDGET;
-        assert_eq!(count_lines(&file("e", ""), 5, &mut budget), Some((0, true)));
+        assert_eq!(
+            count_lines(&file("e", ""), 5, &mut budget),
+            Some((1, true)),
+            "an empty file has its one line"
+        );
         assert_eq!(
             count_lines(&file("n", "a\nb\n"), 5, &mut budget),
             Some((2, true))
@@ -1693,6 +1947,128 @@ mod tests {
             None,
             "no budget left"
         );
+    }
+
+    /// #2127 review: lines end where the editor ends them. A lone `\r` ends
+    /// one, `\r\n` ends one, and the read stops once the line asked for has
+    /// begun rather than at its end. A NUL means UTF-16 or a binary, whose
+    /// lines these bytes do not tell.
+    #[test]
+    fn count_lines_ends_lines_where_the_editor_does() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = |name: &str, bytes: &[u8]| -> PathBuf {
+            let p = tmp.path().join(name);
+            std::fs::write(&p, bytes).unwrap();
+            p
+        };
+        let mut budget = LINE_COUNT_BUDGET;
+        let mut lines = |p: PathBuf, cap: usize| count_lines(&p, cap, &mut budget);
+        assert_eq!(lines(file("cr", b"a\rb\rc\r"), 9), Some((3, true)));
+        assert_eq!(lines(file("crlf", b"a\r\nb\r\nc"), 9), Some((3, true)));
+        assert_eq!(
+            lines(file("mixed", b"a\rb\nc\r\n\r\nd"), 9),
+            Some((5, true))
+        );
+        assert_eq!(lines(file("blank", b"\n\n"), 9), Some((2, true)));
+        assert_eq!(lines(file("begun", b"x\ny"), 2), Some((2, false)));
+        assert_eq!(lines(file("utf16", b"\xff\xfea\x00\n\x00b\x00"), 9), None);
+        let long = file("long", &vec![b'x'; 300 * 1024]);
+        let mut small = 64 * 1024;
+        assert_eq!(
+            count_lines(&long, 1, &mut small),
+            Some((1, false)),
+            "line 1 has begun: no need to read to its end"
+        );
+    }
+
+    /// #2127 review: a file open in the editor is counted as it is open,
+    /// unsaved lines included, since picking it opens that buffer.
+    #[test]
+    fn a_line_hint_counts_an_open_buffer_not_the_saved_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let entries = vec![
+            file_with_lines(tmp.path(), "web/a.ts", 50),
+            file_with_lines(tmp.path(), "api/a.ts", 400),
+        ];
+        let web = entries[0].path.clone();
+        let mut finder = FileFinder::new(Arc::new(entries));
+        query(&mut finder, "a.ts:318");
+        assert_eq!(listed(&finder), ["api/a.ts"]);
+        finder.set_open_lines(HashMap::from([(web, 400)]));
+        finder.finish_line_check();
+        let mut both = listed(&finder);
+        both.sort_unstable();
+        assert_eq!(both, ["api/a.ts", "web/a.ts"]);
+    }
+
+    /// #2127 review: the check looks past the first page of matches, so a
+    /// file that has the line is found when forty shorter ones rank above it.
+    #[test]
+    fn a_line_hint_finds_a_match_ranked_below_the_first_page() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut entries: Vec<FileEntry> = (0..MAX_RESULTS + 5)
+            .map(|i| file_with_lines(tmp.path(), &format!("d{i:02}/a.ts"), 10))
+            .collect();
+        entries.push(file_with_lines(tmp.path(), "a/much/deeper/dir/a.ts", 400));
+        let mut finder = FileFinder::new(Arc::new(entries));
+        query(&mut finder, "a.ts");
+        assert!(!listed(&finder).contains(&"a/much/deeper/dir/a.ts"));
+        query(&mut finder, "a.ts:318");
+        assert_eq!(listed(&finder), ["a/much/deeper/dir/a.ts"]);
+        assert_eq!(finder.notice, None);
+    }
+
+    /// #2127 review: a FIFO is never opened, since opening one waits for a
+    /// writer; it stays listed as a file the check can't tell.
+    #[cfg(unix)]
+    #[test]
+    fn a_line_hint_never_opens_a_fifo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fifo = tmp.path().join("pipe/a.ts");
+        std::fs::create_dir_all(fifo.parent().unwrap()).unwrap();
+        let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+        if !made.is_ok_and(|s| s.success()) {
+            return;
+        }
+        let entries = vec![
+            FileEntry {
+                path: fifo,
+                ..entry("pipe/a.ts")
+            },
+            file_with_lines(tmp.path(), "web/a.ts", 3),
+        ];
+        let mut finder = FileFinder::new(Arc::new(entries));
+        query(&mut finder, "a.ts:5");
+        assert_eq!(listed(&finder), ["pipe/a.ts"]);
+    }
+
+    /// #2127 review: the answer to an older query only fills the cache; it
+    /// never filters the list a newer query drew.
+    #[test]
+    fn an_older_line_check_answer_is_not_applied() {
+        let tmp = tempfile::tempdir().unwrap();
+        let entries = vec![
+            file_with_lines(tmp.path(), "web/a.ts", 50),
+            file_with_lines(tmp.path(), "api/a.ts", 400),
+        ];
+        let web = entries[0].path.clone();
+        let mut finder = FileFinder::new(Arc::new(entries));
+        query(&mut finder, "a.ts");
+        let before = listed(&finder).len();
+        let count = LineCount {
+            lines: 50,
+            complete: true,
+            len: 0,
+            modified: None,
+        };
+        finder.apply_line_check(LineCheckDone {
+            generation: finder.line_check_generation + 7,
+            lines: vec![Some(1)],
+            counted: vec![(web.clone(), count)],
+        });
+        assert_eq!(listed(&finder).len(), before);
+        assert_eq!(finder.line_counts.get(&web), Some(&count));
+        assert!(!finder.poll_line_check(), "nothing is running");
     }
 
     fn entry(rel: &str) -> FileEntry {
