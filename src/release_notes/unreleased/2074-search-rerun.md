@@ -1,1 +1,0 @@
-fix: Re-running a Search Editor (Cmd/Ctrl+K Shift+R) drops the old selection and extra cursors with the old results, so a word selected on a row the new results no longer have no longer crashes croft, and one undo takes the rerun back; Replace All and other whole-file rewrites drop extra cursors too (#2074).
