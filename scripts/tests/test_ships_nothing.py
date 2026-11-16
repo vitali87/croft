@@ -836,6 +836,24 @@ class TestOnlyModules(unittest.TestCase):
             self.change(repo, {"src/helper.rs": body.format("false")})
             self.assertFalse(repo.verdict("src/helper.rs"))
 
+    def test_an_edit_inside_the_tests_of_a_file_a_generated_module_can_embed_ships(self):
+        """#2217 review: a `#[path]` module missing from the tree is
+        written by the build, and can `include_str!` any file; an edit in
+        that file's test module may then change the binary."""
+        with tempfile.TemporaryDirectory() as tmp:
+            body = "pub fn f() -> u8 {{\n    1\n}}\n\n#[cfg(test)]\nmod tests {{\n    #[test]\n    fn t() {{\n        assert!({});\n    }}\n}}\n"
+            repo = self.repo(
+                tmp,
+                {
+                    "src/main.rs": (
+                        'mod helper;\n#[path = "production.inc"]\nmod production;\nfn main() {}\n'
+                    ),
+                    "src/helper.rs": body.format("true"),
+                },
+            )
+            self.change(repo, {"src/helper.rs": body.format("false")})
+            self.assertFalse(repo.verdict("src/helper.rs"))
+
     def test_an_include_inside_a_test_module_does_not_count(self):
         """croft's port detector has a test that reads its own source with
         `include_str!`; inside `#[cfg(test)]` that compiles only for tests,

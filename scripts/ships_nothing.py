@@ -453,8 +453,10 @@ def _loaders_in(path, toks, lines=(), test_spans=()):
     port detector has a test that reads its own source that way.
 
     A macro this does not know can still read files: a procedural macro, or
-    a `macro_rules!` handed `include_str` as an argument. croft has neither,
-    and this does not try to see them.
+    a `macro_rules!` handed `include_str` as an argument. So can a build
+    script, writing what it read into a file the crate then embeds. croft
+    has no such macro, and its build script reads only release notes; this
+    does not try to see them.
 
     A `#[path]` on a top-level `mod x;` loads exactly one file, relative to
     this one's folder, and that file then finds its own children beside it,
@@ -598,9 +600,11 @@ def _module_loaders(commit, cwd):
         # A `#[path]` can load a file of any name (`production.inc`), and
         # that file's own loaders count as much as a `.rs` file's: read
         # each one too, until none is new. One that is not in the tree is
-        # unknown.
+        # generated at build time, and what it loads or embeds is unknown.
         loaded = {r for r in roots if r is not None and r not in read}
-        roots += [None for r in loaded if r not in tree]
+        missing = [r for r in loaded if r not in tree]
+        roots += [None for _ in missing]
+        names += [None for _ in missing]
         paths = sorted(r for r in loaded if r in tree)
     return (
         frozenset(r for r in roots if r is not None),
