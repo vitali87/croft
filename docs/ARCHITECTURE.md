@@ -216,7 +216,18 @@ src/
     ├── diff.rs               side-by-side file diff renderer behind the explorer's Compare action; also derives hunk ranges and the unified patches behind the diff pane's stage / unstage / revert keys
     ├── editor.rs             tree-sitter highlighted editor with the full write path, mouse-drag selection, native clipboard, image / PDF / spreadsheet preview tabs, minimap rasterizer and code folding
     ├── editor/               the editor's feature files, beside editor.rs; each file's `//!` doc says what it holds
+    │   ├── diff_view.rs     side-by-side and inline diffs, merge panes, conflicts, a file at a commit
+    │   ├── disk.rs          opening, reloading and saving: encodings, line endings, outside changes, save cleanups
+    │   ├── gutter.rs        breakpoints, bookmarks, git marks and blame, overview ruler, line numbers
+    │   ├── highlighting.rs  syntax highlight passes, colours carried across edits, bracket colours, swatches
+    │   ├── lsp_overlays.rs  semantic tokens, inlay hints, diagnostics, links, code lenses, ghost text
+    │   ├── on_enter.rs      Enter, auto-indent, comment continuation, per-language Enter rules, paste re-indent
+    │   ├── span_edits.rs    edits from language servers, formatters and peers, applied as text spans
     │   ├── tests.rs         the editor's own tests
+    │   ├── typing.rs        typing, pasting and deleting, auto-closed pairs, quotes and tags
+    │   ├── undo.rs          undo and redo, undo groups, history kept for a reopened file
+    │   ├── viewers.rs       pictures, PDF, spreadsheets and SQLite, archives, hex, logs, Markdown and notebook previews
+    │   ├── wrap.rs          soft wrap rows, comment boxes between lines
     ├── editor_find.rs        VS Code-style inline Find bar (`Cmd+F`) with match highlight, Enter/Shift+Enter walk, case/whole-word/regex toggles and a Replace row (`Cmd+Opt+F`); Replace All runs through the same `split_for_highlight` as count and paint
     ├── extensions.rs         Extensions sidebar widget: projects bundled and user manifests into a theme-aware list grouped under BUILT-IN/INSTALLED/AVAILABLE, with pill toggles, +Add, trash, a local filter box and clear/refresh; reports clicks back to App, which owns the state
     ├── file_finder.rs   VS Code-style Quick Open (Cmd+P) fuzzy file picker with tiered match ranking (exact filename > prefix > substring > path > subsequence)
