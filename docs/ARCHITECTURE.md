@@ -202,6 +202,7 @@ src/
 │   ├── manager/              the language-server manager's feature files, beside manager.rs; each file's `//!` doc says what it holds
 │   │   ├── capabilities.rs      the client capabilities sent at initialize, standard semantic token types
 │   │   ├── completion.rs        completion, trigger characters, signature help, inline completion
+│   │   ├── decorations.rs       inlay hints, links, code lenses, folding ranges, document colours
 │   │   ├── diagnostics.rs       diagnostics pushed and pulled, per document and workspace-wide
 │   │   ├── discovery.rs         a file's language and project root, server config, finding the executable, rustup
 │   │   ├── hover.rs             hover, rust-analyzer's own requests
