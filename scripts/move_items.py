@@ -470,7 +470,27 @@ EDITOR = Target(
     ),
 )
 
-TARGETS = {t.name: t for t in (APP, EDITOR)}
+# What each file split out of src/lsp/manager.rs holds, as FILES above.
+LSP_FILES = {}
+
+LSP = Target(
+    "lsp", "scripts/split_lsp_manifest.tsv", "src/lsp/manager.rs",
+    "src/lsp/manager", LSP_FILES,
+    Tree(
+        "│   ├── manager.rs ",
+        "│   ├── manager/              the language-server manager's feature files, beside "
+        "manager.rs; each file's `//!` doc says what it holds",
+        "│   │   ├── ", 20,
+    ),
+    "lsp-",
+    (
+        "The language-server manager's own tests, moved out of manager.rs (#2062).",
+        "the language-server manager's tests",
+        "the language-server manager's own tests",
+    ),
+)
+
+TARGETS = {t.name: t for t in (APP, EDITOR, LSP)}
 
 # Kinds whose declaration can carry a visibility.
 VISIBLE = {"fn", "const", "static", "struct", "enum", "union", "trait", "type"}
