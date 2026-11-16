@@ -5728,9 +5728,20 @@ mod tests {
     /// What `git <args>` prints in `p` when run as the app runs git, to
     /// compare with the app's own output: both read the developer's git
     /// config, so a setting there (diff prefixes, `core.abbrev`, a log
-    /// format) changes both alike.
+    /// format) changes both alike. A `diff` or `show` also drops colour and
+    /// an external diff tool, as the app's `diff_text` always does (#1447),
+    /// so a `color.diff = always` or a `diff.external` there leaves the two
+    /// sides equal.
     fn app_git_out(p: &Path, args: &[&str]) -> String {
-        let out = crate::test_git::app_git(p).args(args).output().unwrap();
+        let mut git = crate::test_git::app_git(p);
+        match args.split_first() {
+            Some((sub, rest)) if matches!(*sub, "diff" | "show") => git
+                .arg(sub)
+                .args(["--no-color", "--no-ext-diff"])
+                .args(rest),
+            _ => git.args(args),
+        };
+        let out = git.output().unwrap();
         String::from_utf8_lossy(&out.stdout).into_owned()
     }
 
