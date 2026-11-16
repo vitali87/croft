@@ -588,6 +588,43 @@ class TestOnlyModules(unittest.TestCase):
             self.change(repo, {"src/helper.rs": "pub fn f() -> u8 {\n    2\n}\n"})
             self.assertFalse(repo.verdict("src/helper.rs"))
 
+    def test_a_path_attribute_split_over_lines_still_ships(self):
+        """#2217 review: Rust lets an attribute run over several lines, and
+        rustfmt wraps a long `cfg_attr` that way."""
+        for attribute in (
+            '#[path\n    = "helper.rs"]\nmod production;\n',
+            '#[cfg_attr(\n    not(test),\n    path = "helper.rs"\n)]\nmod production;\n',
+        ):
+            with self.subTest(attribute=attribute), tempfile.TemporaryDirectory() as tmp:
+                repo = self.repo(
+                    tmp,
+                    {
+                        "src/main.rs": "#[cfg(test)]\nmod helper;\n" + attribute + "fn main() {}\n",
+                        "src/helper.rs": "pub fn f() -> u8 {\n    1\n}\n",
+                    },
+                )
+                self.change(repo, {"src/helper.rs": "pub fn f() -> u8 {\n    2\n}\n"})
+                self.assertFalse(repo.verdict("src/helper.rs"))
+
+    def test_a_path_attribute_naming_another_file_leaves_the_exemption(self):
+        """croft's own build.rs loads `src/release_notes/select.rs` by
+        `#[path]`; that cannot load `src/helper.rs`, and a `format!` argument
+        named `path` is no attribute at all."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = self.repo(
+                tmp,
+                {
+                    "build.rs": '#[path = "src/select.rs"]\nmod select;\nfn main() {}\n',
+                    "src/main.rs": (
+                        "#[cfg(test)]\nmod helper;\n"
+                        'fn main() {\n    let p = "x";\n    print!("{path}", path = p);\n}\n'
+                    ),
+                    "src/helper.rs": "pub fn f() -> u8 {\n    1\n}\n",
+                },
+            )
+            self.change(repo, {"src/helper.rs": "pub fn f() -> u8 {\n    2\n}\n"})
+            self.assertTrue(repo.verdict("src/helper.rs"))
+
     def test_making_a_shipped_module_test_only_ships(self):
         """Adding `#[cfg(test)]` above a declaration takes a module out of
         the release build: the binary changes."""

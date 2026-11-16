@@ -21,6 +21,7 @@ Usage: ships_nothing.py <base> <head> <path>
 Exit 0 when the change ships nothing, 1 when it ships something.
 """
 
+import functools
 import re
 import subprocess
 import sys
@@ -71,9 +72,18 @@ def git(*args, cwd=None, allow_missing_path=False):
 # Matched against a line's code, so a trailing `// comment` does not hide it.
 MOD_DECLARATION = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+[A-Za-z_]\w*\s*;\s*$")
 
-# An attribute that names a module's file, `#[path = "x.rs"]`, directly or
-# through `cfg_attr`. Matched loosely: a false hit only costs an exemption.
-PATH_ATTRIBUTE = re.compile(r"#!?\[.*\bpath\s*=")
+# Where an attribute opens, `#[` or `#![`: rustfmt keeps it together, but
+# Rust lets whitespace, even a line break, split it.
+ATTRIBUTE_OPEN = re.compile(r"#\s*!?\s*\[")
+
+# `path =` inside an attribute, read off code with its literals removed: the
+# attribute names a module's file, directly or through `cfg_attr`.
+PATH_KEY = re.compile(r"\bpath\s*=")
+
+# The file a `path` attribute names, read off the attribute's raw text. A
+# value that is not a plain string literal is not read, and counts as
+# naming any file.
+PATH_VALUE = re.compile(r'\bpath\s*=\s*"((?:[^"\\]|\\.)*)"')
 
 
 def literal_lines(text):
@@ -216,25 +226,86 @@ def inside(line_no, ranges):
     return any(start <= line_no <= end for start, end in ranges)
 
 
-def path_attribute_anywhere(rev, cwd=None):
-    """Whether any Rust file at `rev` names a module's file with a
-    `#[path]` attribute. Such a declaration can load a file under any module
-    name, from anywhere, so no name-based reading of the parents can rule out
-    a release build loading it. croft has none; the day it does, a whole-file
-    exemption costs a line of notes instead."""
-    done = subprocess.run(
-        ("git", "grep", "-z", "-I", "-E", "-e", r"#!?\[.*path[[:space:]]*=", rev, "--", "*.rs"),
+def path_attribute_targets(rev, cwd=None):
+    """The file names that `#[path]` attributes at `rev` load modules from,
+    with `None` for one whose value cannot be read. Such an attribute can
+    load a file under any module name, so a reading of the parents by name
+    cannot rule out a release build loading it.
+
+    Read from each file's code with comments and literals removed, across
+    lines, and only inside an attribute's brackets: `#[path\n = "x.rs"]`
+    and a `cfg_attr` rustfmt wrapped over several lines count, while a
+    `format!` argument named `path` or a string holding `#[path = ..]` does
+    not. The answer is the same for every file a check asks about at one
+    commit, so it is worked out once per commit.
+    """
+    commit = git("rev-parse", "--verify", f"{rev}^{{commit}}", cwd=cwd).strip()
+    return _path_attribute_targets(commit, None if cwd is None else str(cwd))
+
+
+@functools.lru_cache(maxsize=None)
+def _path_attribute_targets(commit, cwd):
+    listed = subprocess.run(
+        (
+            "git", "grep", "-l", "-z", "-I", "-E",
+            "-e", "path[[:space:]]*=", "-e", "path[[:space:]]*$",
+            commit, "--", "*.rs",
+        ),
         cwd=cwd,
         capture_output=True,
-        text=True,
     )
-    if done.returncode == 1:
-        return False
-    if done.returncode != 0:
-        raise SystemExit(f"git grep failed: {done.stderr.strip()}")
-    return any(
-        PATH_ATTRIBUTE.search(hit.split("\0", 1)[-1]) for hit in done.stdout.splitlines()
+    if listed.returncode == 1:
+        return ()
+    if listed.returncode != 0:
+        raise SystemExit(f"git grep failed: {listed.stderr.decode().strip()}")
+    names = [hit.split(b":", 1)[1].decode() for hit in listed.stdout.split(b"\0") if hit]
+    blobs = subprocess.run(
+        ("git", "cat-file", "--batch"),
+        cwd=cwd,
+        input="".join(f"{commit}:{name}\n" for name in names).encode(),
+        capture_output=True,
+        check=True,
+    ).stdout
+    targets = []
+    at = 0
+    for _ in names:
+        header_end = blobs.index(b"\n", at)
+        size = int(blobs[at:header_end].split()[2])
+        text = blobs[header_end + 1 : header_end + 1 + size].decode(errors="replace")
+        at = header_end + 1 + size + 1
+        targets.extend(_path_attributes_in(text))
+    return tuple(targets)
+
+
+def _path_attributes_in(text):
+    """The `path` attribute values in one file's text, as for
+    `path_attribute_targets`."""
+    lines = text.splitlines()
+    kinds = classify(lines)
+    tracker = BlockTracker()
+    code = "\n".join(
+        tracker.feed(line) if kinds[i] in (CODE, ATTR) else "" for i, line in enumerate(lines)
     )
+    found = []
+    for opened in ATTRIBUTE_OPEN.finditer(code):
+        depth, end = 0, opened.end() - 1
+        while end < len(code):
+            if code[end] == "[":
+                depth += 1
+            elif code[end] == "]":
+                depth -= 1
+                if depth == 0:
+                    break
+            end += 1
+        if not PATH_KEY.search(code[opened.end() : end]):
+            continue
+        first, last = code.count("\n", 0, opened.start()), code.count("\n", 0, end)
+        values = PATH_VALUE.findall("\n".join(lines[first : last + 1]))
+        if values:
+            found.extend(Path(value).name for value in values)
+        else:
+            found.append(None)
+    return found
 
 
 def declared_for_tests_only(rev, path, cwd=None):
@@ -246,7 +317,8 @@ def declared_for_tests_only(rev, path, cwd=None):
     Anything else that names the module in a parent's code - an inline
     `mod name { .. }`, two declarations on one line, `#[cfg(test)] mod name;`
     written on one line - leaves the file counted as shipped, and so does a
-    `#[path]` attribute anywhere in the tree. Literals and `//` comments are
+    `#[path]` attribute that names a file of this one's name or whose value
+    cannot be read (see `path_attribute_targets`). Literals and `//` comments are
     removed first, so a trailing comment cannot hide a release declaration
     and a string cannot fake a test-only one.
     """
@@ -266,7 +338,8 @@ def declared_for_tests_only(rev, path, cwd=None):
     else:
         folder = "/".join(dir_parts)
         parents = [f"{folder}.rs", f"{folder}/mod.rs"]
-    if path_attribute_anywhere(rev, cwd=cwd):
+    file_name = Path(path).name
+    if any(t is None or t == file_name for t in path_attribute_targets(rev, cwd=cwd)):
         return False
     mention = re.compile(rf"\bmod\s+{re.escape(name)}\b")
     found = False
