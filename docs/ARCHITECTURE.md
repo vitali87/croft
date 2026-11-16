@@ -200,6 +200,7 @@ src/
 │   ├── log_file.rs      LSP stderr / debug log sink at ~/.croft/lsp.log
 │   ├── manager.rs            LSP lifecycle: workspace pre-warm at startup, spawn, did_open / did_change / did_save, completion, inline completion, documentSymbol, inlay hints, documentHighlight and whole-project pull diagnostics; a new server registry swapped in when an extension is added, removed or toggled
 │   ├── manager/              the language-server manager's feature files, beside manager.rs; each file's `//!` doc says what it holds
+│   │   ├── capabilities.rs      the client capabilities sent at initialize, standard semantic token types
 │   │   ├── discovery.rs         a file's language and project root, server config, finding the executable, rustup
 │   │   ├── tests.rs             the language-server manager's own tests
 │   ├── manifest.rs           declarative `extension.toml` loader for the extension system: parses a manifest's `[[languages]]`, `[[language_servers]]`, `[[themes]]`, `[[debug_adapters]]`, `[[test_runners]]`, `[[mcp_servers]]`, `[[commands]]` and `[[viewers]]` blocks
