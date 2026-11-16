@@ -1889,7 +1889,7 @@ impl Editor {
         let still_dirty = self.sheet.as_ref().is_some_and(|v| v.dirty);
         self.disk_stamp = Self::disk_stamp_of(&path);
         self.disk_conflict = false;
-        self.dirty = still_dirty;
+        self.set_dirty(still_dirty);
         Ok(SaveOutcome::Saved)
     }
 
@@ -2008,7 +2008,7 @@ impl Editor {
             _ => return cells.to_vec(),
         }
         view.dirty = true;
-        self.dirty = true;
+        self.mark_dirty();
         unapplied
     }
 

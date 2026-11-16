@@ -2823,7 +2823,7 @@ impl App {
     /// off (#1576), on every editor, and save the choice.
     pub(super) fn cycle_line_numbers(&mut self) {
         self.line_numbers = self.line_numbers.next();
-        self.apply_line_numbers();
+        self.apply_view_prefs();
         self.status = format!("Line Numbers: {}", self.line_numbers.pref_id());
         if !cfg!(test) {
             self.report_unsaved_setting(crate::prefs::save_line_numbers(
@@ -2835,20 +2835,9 @@ impl App {
     /// Give every open editor, in every split group, the current line
     /// number mode (#1576). A split beside the active one is on screen
     /// too, and nothing else resyncs it until focus next moves.
-    pub(super) fn apply_line_numbers(&mut self) {
-        let mode = self.line_numbers;
-        for group in
-            std::iter::once(&mut self.editor).chain(self.editor_layout.inactive_groups_mut())
-        {
-            for ed in &mut group.editors {
-                ed.line_numbers = mode;
-            }
-        }
-    }
-
     pub(super) fn toggle_render_whitespace(&mut self) {
         self.whitespace_mode = self.whitespace_mode.next();
-        self.editor.whitespace_mode = self.whitespace_mode;
+        self.apply_view_prefs();
         self.status = format!("Render Whitespace: {}", self.whitespace_mode.label());
         if !cfg!(test) {
             self.report_unsaved_setting(crate::prefs::save_render_whitespace(
@@ -2859,7 +2848,7 @@ impl App {
 
     pub(super) fn toggle_bracket_colors(&mut self) {
         self.bracket_colors_enabled = !self.bracket_colors_enabled;
-        self.editor.show_bracket_colors = self.bracket_colors_enabled;
+        self.apply_view_prefs();
         self.status = format!(
             "Bracket Pair Colorization: {}",
             if self.bracket_colors_enabled {
@@ -2877,7 +2866,7 @@ impl App {
 
     pub(super) fn toggle_indent_guides(&mut self) {
         self.indent_guides_enabled = !self.indent_guides_enabled;
-        self.editor.show_indent_guides = self.indent_guides_enabled;
+        self.apply_view_prefs();
         self.status = format!(
             "Indent Guides: {}",
             if self.indent_guides_enabled {

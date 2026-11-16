@@ -698,8 +698,28 @@ impl EditorTabs {
         })
     }
 
+    /// The tab a preview open may replace, or drop when the file it opens is
+    /// already in another tab. A tab holding unsaved work is never it
+    /// ([`holds_unsaved_work`]); a preview open pins such a tab first
+    /// ([`Self::pin_previews_with_unsaved_work`]) (#2073).
     pub fn preview_index(&self) -> Option<usize> {
-        self.editors.iter().position(|e| e.preview)
+        self.editors
+            .iter()
+            .position(|e| e.preview && !holds_unsaved_work(e))
+    }
+
+    /// Pin, for good, every preview tab holding unsaved work. Every edit
+    /// pins its tab ([`Editor::mark_dirty`]), but a sheet cell still being
+    /// typed into is not an edit yet, and a path that sets `dirty` some other
+    /// way would leave the tab a preview. Only skipping such a tab would put
+    /// a second preview beside it, and the first would turn replaceable
+    /// again once saved (#2073).
+    fn pin_previews_with_unsaved_work(&mut self) {
+        for e in &mut self.editors {
+            if e.preview && holds_unsaved_work(e) {
+                e.preview = false;
+            }
+        }
     }
 
     /// Mark the active tab as pinned (no longer the preview slot). Called
@@ -862,6 +882,7 @@ impl EditorTabs {
     /// switch to it. Otherwise reuse the existing preview slot, or create a
     /// fresh preview tab next to the active one when none exists.
     pub fn open_preview(&mut self, path: &Path) -> Result<()> {
+        self.pin_previews_with_unsaved_work();
         // A diff of the file is not the file (#1113): opening it lands on
         // its own tab, or a new one beside the diff.
         if let Some(idx) =
@@ -1362,6 +1383,12 @@ impl EditorTabs {
             self.editors[idx].path = Some(path);
         }
     }
+}
+
+/// Whether a tab holds work not yet saved: unsaved text, or a sheet cell
+/// still being typed into, which only becomes an edit when committed.
+fn holds_unsaved_work(e: &Editor) -> bool {
+    e.dirty || e.sheet_pending_cell().is_some()
 }
 
 impl Default for EditorTabs {

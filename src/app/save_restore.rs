@@ -1238,7 +1238,7 @@ impl App {
             && view.editable()
             && view.commit_edit().is_some()
         {
-            self.editor.dirty = true;
+            self.editor.mark_dirty();
         }
         // A CSV/TSV sheet with grid edits saves through its own
         // serialisation path (#177), same shape as the hex branch above.

@@ -2462,7 +2462,7 @@ impl App {
                     && view.editable()
                     && view.commit_edit().is_some()
                 {
-                    ed.dirty = true;
+                    ed.mark_dirty();
                 }
             }
         }

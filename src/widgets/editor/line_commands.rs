@@ -217,12 +217,16 @@ impl Editor {
         self.recompute_highlights();
     }
 
-    /// Swap in a whole new buffer as one undo step — the find bar's
-    /// Replace All. The cursor clamps to the new buffer's bounds.
+    /// Swap in a whole new buffer as one undo step: the find bar's Replace
+    /// All, a Search Editor rerun, an agent's or a runner's rewrite. The
+    /// cursor clamps to the new buffer's bounds, and the selection and any
+    /// extra carets go: they point into the old text, and one left on a row
+    /// the new text no longer has crashes the next frame (#2074).
     pub fn replace_all_lines(&mut self, new_lines: Vec<String>) {
         self.pin_on_edit();
         self.push_undo(EditKind::Replace);
         self.clear_selection();
+        self.collapse_carets();
         self.lines = new_lines;
         if self.lines.is_empty() {
             self.lines.push(String::new());

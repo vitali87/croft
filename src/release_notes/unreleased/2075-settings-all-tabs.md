@@ -1,0 +1,1 @@
+fix: Changing indent guides, bracket-pair colours or rendered whitespace, from config.json, the Settings editor or the Command Palette, updates every open tab and every split at once, not only the tab in front (#2075).

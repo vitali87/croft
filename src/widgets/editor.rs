@@ -1328,7 +1328,7 @@ impl Editor {
     }
 
     fn mark_buffer_changed(&mut self) {
-        self.dirty = true;
+        self.mark_dirty();
         self.last_edit_at = Some(std::time::Instant::now());
         self.last_edit_pos = Some((self.cursor_row, self.cursor_col));
         self.edit_seq = self.edit_seq.wrapping_add(1);
@@ -1370,13 +1370,34 @@ impl Editor {
             .unwrap_or(line.len())
     }
 
-    /// Any user-driven mutation pins the buffer (matches VS Code: typing in
-    /// a preview tab promotes it to a regular tab so a subsequent
-    /// single-click on another file can't silently replace your edits).
+    /// Mark the buffer as differing from disk, and pin its tab. A tab with
+    /// unsaved changes is never the replaceable preview slot: VS Code pins a
+    /// preview editor once it is dirty, so a later single-click on another
+    /// file opens beside it instead of replacing it and dropping the edit.
+    /// Every path that makes the buffer dirty comes through here, so a new
+    /// command cannot forget to pin (#2073).
+    pub(crate) fn mark_dirty(&mut self) {
+        self.dirty = true;
+        self.preview = false;
+    }
+
+    /// Set whether the buffer differs from disk, pinning the tab when it
+    /// does ([`Self::mark_dirty`]); for paths that work the answer out, such
+    /// as an undo back to the saved text or a hex edit undone.
+    pub(crate) fn set_dirty(&mut self, dirty: bool) {
+        if dirty {
+            self.mark_dirty();
+        } else {
+            self.dirty = false;
+        }
+    }
+
+    /// The typing paths call this before they edit: it pins the tab at once,
+    /// as `mark_dirty` does after any edit, and reveals the caret's fold so no
+    /// keystroke lands on a line hidden inside a fold. Commands that move
+    /// lines through folds handle them themselves (#1611).
     fn pin_on_edit(&mut self) {
         self.preview = false;
-        // Every mutating entry point calls this, so it is the one place that
-        // can guarantee no edit ever lands on a line hidden inside a fold.
         self.reveal_cursor_fold();
     }
 
