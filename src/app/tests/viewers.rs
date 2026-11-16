@@ -559,7 +559,12 @@ fn xlsx_grid_editing_saves_cells_and_holds_formulas_for_consent() {
     ws.cell_mut((2u32, 1u32)).set_value("qty");
     ws.cell_mut((1u32, 2u32)).set_value("apples");
     ws.cell_mut((2u32, 2u32)).set_value_number(3);
-    ws.cell_mut((2u32, 3u32)).set_formula("SUM(B2)");
+    // With its cached result, as Excel saves it: calamine 0.38 reads a
+    // formula whose cached value is a bare `<v/>` as empty, which would
+    // leave this row out of the used range and so out of the grid.
+    ws.cell_mut((2u32, 3u32))
+        .set_formula("SUM(B2)")
+        .set_formula_result_default("3");
     umya_spreadsheet::writer::xlsx::write(&book, &p).unwrap();
 
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();

@@ -1,0 +1,1 @@
+fix: Spreadsheets open and save through a patched zip library, closing five published zip security advisories, including one where a crafted file could show different contents than it really holds (#2232).
