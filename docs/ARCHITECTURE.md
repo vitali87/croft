@@ -216,14 +216,25 @@ src/
     ├── diff.rs               side-by-side file diff renderer behind the explorer's Compare action; also derives hunk ranges and the unified patches behind the diff pane's stage / unstage / revert keys
     ├── editor.rs             tree-sitter highlighted editor with the full write path, mouse-drag selection, native clipboard, image / PDF / spreadsheet preview tabs, minimap rasterizer and code folding
     ├── editor/               the editor's feature files, beside editor.rs; each file's `//!` doc says what it holds
+    │   ├── brackets.rs      bracket matching, jump and select to the matching bracket
+    │   ├── comments.rs      toggle line and block comments, per-language comment tokens
     │   ├── diff_view.rs     side-by-side and inline diffs, merge panes, conflicts, a file at a commit
     │   ├── disk.rs          opening, reloading and saving: encodings, line endings, outside changes, save cleanups
+    │   ├── folding.rs       fold ranges and hidden lines, #region markers, indent guides
     │   ├── gutter.rs        breakpoints, bookmarks, git marks and blame, overview ruler, line numbers
     │   ├── highlighting.rs  syntax highlight passes, colours carried across edits, bracket colours, swatches
+    │   ├── line_commands.rs move, duplicate, delete, join, sort and indent lines, convert indentation
     │   ├── lsp_overlays.rs  semantic tokens, inlay hints, diagnostics, links, code lenses, ghost text
+    │   ├── mouse.rs         clicks, drags, and what lies under the pointer
+    │   ├── multi_cursor.rs  multiple carets, occurrence selection, box and column selection
+    │   ├── navigation.rs    caret movement, scrolling, Go to Line, minimap
     │   ├── on_enter.rs      Enter, auto-indent, comment continuation, per-language Enter rules, paste re-indent
+    │   ├── selection.rs     selections, linked editing, expand and shrink selection
+    │   ├── snippets.rs      snippets and tab stops, Emmet
     │   ├── span_edits.rs    edits from language servers, formatters and peers, applied as text spans
+    │   ├── symbol_tabs.rs   symbol tabs, sibling tabs of one file kept in step
     │   ├── tests.rs         the editor's own tests
+    │   ├── transforms.rs    change case, bump numbers, transpose characters
     │   ├── typing.rs        typing, pasting and deleting, auto-closed pairs, quotes and tags
     │   ├── undo.rs          undo and redo, undo groups, history kept for a reopened file
     │   ├── viewers.rs       pictures, PDF, spreadsheets and SQLite, archives, hex, logs, Markdown and notebook previews
