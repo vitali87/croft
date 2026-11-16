@@ -1922,11 +1922,8 @@ impl App {
     /// "Copy Path".
     pub(super) fn copy_path_to_clipboard(&mut self, path: PathBuf) {
         let text = path.display().to_string();
-        self.status = if copy_to_clipboard(&text) {
-            format!("Copied path: {text}")
-        } else {
-            String::from("Could not copy path to clipboard")
-        };
+        let landing = self.copy_where_pasted(&text);
+        self.status = format!("Copied path: {text}{}", landing.note());
     }
 
     /// VS Code "Copy Relative Path": copy `path` relative to the workspace
@@ -1935,11 +1932,8 @@ impl App {
     /// holds a misleading `../../` walk or an empty string.
     pub(super) fn copy_relative_path_to_clipboard(&mut self, path: PathBuf) {
         let text = relative_clipboard_text(&path, self.workspace_root());
-        self.status = if copy_to_clipboard(&text) {
-            format!("Copied relative path: {text}")
-        } else {
-            String::from("Could not copy path to clipboard")
-        };
+        let landing = self.copy_where_pasted(&text);
+        self.status = format!("Copied relative path: {text}{}", landing.note());
     }
 
     /// Reveal `path` (an editor tab's file) in the Explorer tree: switch the

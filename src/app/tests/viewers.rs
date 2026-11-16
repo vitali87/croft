@@ -1302,8 +1302,9 @@ extensions = ["csv"]
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.config_dir = croft.clone();
     app.consented_extensions = consent_on_disk(&croft);
-    let viewer = crate::mcp::registry::viewer_by_id_in_dir(&croft, "tviewer/sh")
-        .expect("the scratch viewer");
+    let viewer =
+        crate::mcp::registry::viewer_by_id_in_dir(&croft, &app.disabled_extensions, "tviewer/sh")
+            .expect("the scratch viewer");
     let before = app.terminals.len();
     app.open_in_viewer(&viewer, &data);
     assert!(
@@ -1367,15 +1368,7 @@ extensions = ["csv"]
     app.consented_extensions = consent_on_disk(&croft);
     app.consented_extensions.insert("tviewer".into());
     let n = file_node(&csv);
-    let items = build_tree_context_menu_items_in_dir(
-        &croft,
-        Some(&n),
-        tmp.path(),
-        std::slice::from_ref(&csv),
-        tmp.path(),
-        None,
-        None,
-    );
+    let items = app.tree_context_menu_items(Some(&n), std::slice::from_ref(&csv), tmp.path());
     let row = items
         .iter()
         .find_map(|(label, a)| match a {
@@ -1394,10 +1387,11 @@ extensions = ["csv"]
         before + 1,
         "and the row resolves and opens"
     );
-    let palette_ids: Vec<String> = crate::mcp::registry::contributed_viewer_commands_in_dir(&croft)
-        .into_iter()
-        .map(|c| c.id)
-        .collect();
+    let palette_ids: Vec<String> =
+        crate::mcp::registry::contributed_viewer_commands_in_dir(&croft, &app.disabled_extensions)
+            .into_iter()
+            .map(|c| c.id)
+            .collect();
     assert!(
         palette_ids.iter().any(|id| id == "viewer:tviewer/sh"),
         "the palette row comes from the same dir: {palette_ids:?}"
@@ -3820,4 +3814,100 @@ fn a_wal_reload_keeps_the_sqlite_table_page_and_cell() {
     assert_eq!((data.cur_row, data.cur_col), (4, 1));
     assert!(data.scroll_row <= data.cur_row);
     drop(writer);
+}
+
+/// #2076: with a profile active, an extension is on or off as the
+/// Extensions panel shows it, which is the app's own set, saved to the
+/// profile's settings. The Explorer's viewer row, opening a viewer, the
+/// palette's rows and running a command all follow that set. They read the
+/// Default profile's config.json instead, so a viewer turned off in a
+/// profile was still offered, and a command the palette listed would not run.
+#[test]
+fn an_extension_is_on_or_off_as_the_app_s_own_set_says_everywhere() {
+    const VIEWER: &str = r#"
+id = "tviewer"
+name = "tviewer"
+api_version = 1
+[[viewers]]
+id = "sh"
+label = "Open in sh"
+command = "/bin/sh"
+args = ["-c", "sleep 30", "sh", "{file}"]
+extensions = ["csv"]
+"#;
+    const COMMAND: &str = r#"
+id = "tcmd"
+name = "tcmd"
+api_version = 1
+[[mcp_servers]]
+id = "srv"
+command = "/bin/true"
+[[commands]]
+id = "tcmd.now"
+title = "TCmd: Now"
+server = "srv"
+tool = "now"
+"#;
+    let (_scratch, croft) = scratch_config(&[("tviewer", VIEWER), ("tcmd", COMMAND)]);
+    // The Default profile's file: tcmd off, tviewer on.
+    std::fs::write(
+        croft.join("config.json"),
+        r#"{"disabled_extensions": ["tcmd"]}"#,
+    )
+    .unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let csv = tmp.path().join("data.csv");
+    std::fs::write(&csv, "a,b\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.config_dir = croft.clone();
+    // The active profile's set, as the Extensions panel holds it: the other
+    // way round, tviewer off and tcmd on.
+    app.disabled_extensions = std::collections::BTreeSet::from([String::from("tviewer")]);
+
+    let n = file_node(&csv);
+    let items = app.tree_context_menu_items(Some(&n), std::slice::from_ref(&csv), tmp.path());
+    assert!(
+        !items
+            .iter()
+            .any(|(_, a)| matches!(a, MenuAction::OpenInViewer(..))),
+        "the turned-off viewer gets no Explorer row: {items:?}"
+    );
+
+    app.open_command_palette();
+    let listed: Vec<String> = app
+        .command_palette
+        .as_ref()
+        .expect("the palette opens")
+        .extensions
+        .iter()
+        .map(|c| c.id.clone())
+        .collect();
+    app.command_palette = None;
+    assert!(
+        listed.iter().any(|id| id == "tcmd.now"),
+        "the turned-on command is listed: {listed:?}"
+    );
+    assert!(
+        !listed.iter().any(|id| id.contains("tviewer")),
+        "the turned-off viewer is not: {listed:?}"
+    );
+
+    let before = app.terminals.len();
+    app.dispatch_menu_action(
+        MenuAction::OpenInViewer(String::from("tviewer/sh"), csv.clone()),
+        tmp.path().to_path_buf(),
+    );
+    assert_eq!(
+        app.terminals.len(),
+        before,
+        "the turned-off viewer never opens"
+    );
+
+    app.status.clear();
+    app.run_extension_command("tcmd.now");
+    assert!(
+        !app.status.contains("unavailable"),
+        "the listed command runs (here, asks for consent first): {}",
+        app.status
+    );
 }

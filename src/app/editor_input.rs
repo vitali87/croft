@@ -95,11 +95,14 @@ impl App {
             return;
         }
         let yanked = self.editor.delete_caret_lines();
-        if !yanked.is_empty() {
-            copy_to_clipboard(&yanked);
-        }
         let n = yanked.lines().count();
-        self.status = format!("Deleted {n} {}", if n == 1 { "line" } else { "lines" });
+        let lines = if n == 1 { "line" } else { "lines" };
+        self.status = if yanked.is_empty() {
+            format!("Deleted {n} {lines}")
+        } else {
+            let landing = self.copy_where_pasted(&yanked);
+            format!("Deleted {n} {lines}{}", landing.note())
+        };
     }
 
     /// Kill from the caret to the end of its line, yanking the text to the
@@ -112,8 +115,8 @@ impl App {
         }
         let killed = self.editor.kill_to_eol();
         if !killed.is_empty() {
-            copy_to_clipboard(&killed);
-            self.status = format!("Killed {} chars", killed.chars().count());
+            let n = killed.chars().count();
+            self.status = format!("Killed {n} chars{}", self.copy_where_pasted(&killed).note());
         }
     }
 
@@ -841,8 +844,8 @@ impl App {
         if is_editor_kill_to_bol_key(key) {
             let killed = self.editor.kill_to_bol();
             if !killed.is_empty() {
-                copy_to_clipboard(&killed);
-                self.status = format!("Killed {} chars", killed.chars().count());
+                let n = killed.chars().count();
+                self.status = format!("Killed {n} chars{}", self.copy_where_pasted(&killed).note());
             }
             return;
         }
@@ -1153,10 +1156,13 @@ impl App {
                 VimOp::Y => {
                     let n = count.max(1);
                     let yanked = self.editor.yank_lines(n);
-                    if !yanked.is_empty() {
-                        copy_to_clipboard(&yanked);
-                    }
-                    self.status = format!("Yanked {n} {}", if n == 1 { "line" } else { "lines" });
+                    let lines = if n == 1 { "line" } else { "lines" };
+                    self.status = if yanked.is_empty() {
+                        format!("Yanked {n} {lines}")
+                    } else {
+                        let landing = self.copy_where_pasted(&yanked);
+                        format!("Yanked {n} {lines}{}", landing.note())
+                    };
                 }
                 VimOp::None => {}
             }
@@ -1560,17 +1566,17 @@ impl App {
         match op {
             Op::Delete => {
                 let text = self.editor.delete_lines(n);
-                copy_to_clipboard(&text);
-                self.status = format!("Deleted {n} line(s)");
+                let landing = self.copy_where_pasted(&text);
+                self.status = format!("Deleted {n} line(s){}", landing.note());
             }
             Op::Yank => {
                 let text = self.editor.yank_lines(n);
-                copy_to_clipboard(&text);
-                self.status = format!("Yanked {n} line(s)");
+                let landing = self.copy_where_pasted(&text);
+                self.status = format!("Yanked {n} line(s){}", landing.note());
             }
             Op::Change => {
                 let text = self.editor.delete_lines(n);
-                copy_to_clipboard(&text);
+                self.copy_where_pasted(&text);
                 self.editor.open_line_above();
                 self.vim.enter_insert_mode();
                 self.status = String::from("-- INSERT --");
@@ -1660,7 +1666,7 @@ impl App {
             });
         }
         let text = self.editor.selection_text();
-        copy_to_clipboard(&text);
+        self.copy_where_pasted(&text);
         match op {
             Op::Yank => {
                 self.editor.clear_selection();
@@ -1725,7 +1731,7 @@ impl App {
         let end = (col + count.max(1)).min(chars.len());
         if col < end {
             let deleted: String = chars[col..end].iter().collect();
-            copy_to_clipboard(&deleted);
+            self.copy_where_pasted(&deleted);
             for _ in col..end {
                 self.editor.delete_forward();
             }
@@ -1963,7 +1969,7 @@ impl App {
     /// an SSH session usually has no clipboard tool to write to at all.
     ///
     /// Everywhere else it is this machine's clipboard, with the OSC 52
-    /// fallback `copy_to_clipboard` already keeps for a host terminal that
+    /// fallback [`Self::copy_where_pasted`] keeps for a host terminal that
     /// honours it. That fallback is reported HONESTLY: whether the sequence is
     /// acted on is the host terminal's choice, not something croft can see, so
     /// claiming a copy landed would be a claim croft cannot make.
@@ -1973,22 +1979,83 @@ impl App {
     }
 
     /// The copy `deliver_copied_text` makes, without the status line, for a
-    /// caller that words its own. Every terminal copy goes this way (#1667):
-    /// Copy Output, copy mode, quick select and copy on select all wrote
-    /// the remote box's clipboard on a relay session.
+    /// caller that words its own. Every copy croft makes goes this way, so a
+    /// copy command cannot skip the relay by mistake: terminal copies did
+    /// (#1667), and so did the editor's, vim's, Copy Path, Copy Commit Hash
+    /// and the rest (#2070), all writing the remote box's clipboard on a
+    /// relay session, where pasting at home found the old text.
+    ///
+    /// Off a relay session, the order of attempts:
+    ///   1. **This machine's clipboard** — `clipboard::write_string` posts
+    ///      directly to `NSPasteboard.generalPasteboard` on macOS (with
+    ///      `pbcopy` as a fall-back inside the same helper), the only path
+    ///      that survives every iTerm2 configuration seen in the wild. OSC 52
+    ///      is, empirically, silently dropped by iTerm2 in some setups even
+    ///      with `AllowClipboardAccess` enabled, and writing escape bytes to
+    ///      the alt-screen stdout always risks racing the next frame.
+    ///   2. **OSC 52** — only if that write failed (a Linux box with no
+    ///      clipboard tool, where the only hand-shake with the user's own
+    ///      terminal is escape bytes through the SSH PTY). Best-effort, and
+    ///      the landing says so.
+    ///
+    /// On a relay session the local machine's clipboard comes first, over
+    /// the relay. When it has no clipboard to write (a Linux box with no
+    /// clipboard tool), its pump says so and `drain_relay_copies` sends the
+    /// OSC 52 sequence from here instead, which the user's terminal gets
+    /// over the SSH session as it did before the copy went home.
     pub(super) fn copy_where_pasted(&mut self, text: &str) -> CopyLanding {
-        if self.is_relay_session && self.push_clipboard_via_relay(text) {
-            crate::clipboard::remember_copy(text);
+        crate::clipboard::remember_copy(text);
+        if self.is_relay_session
+            && let Some(request_id) = self.push_clipboard_via_relay(text)
+        {
+            self.pending_relay_copies.push(PendingRelayCopy {
+                request_id,
+                text: text.to_owned(),
+                started_at: std::time::Instant::now(),
+            });
             CopyLanding::Local
-        } else if copy_to_clipboard(text) {
+        } else if crate::clipboard::write_string(text) {
             CopyLanding::Clipboard
         } else {
+            crate::clipboard::send_osc52(text);
             CopyLanding::Osc52
         }
     }
 
+    /// Follow up the relay copies whose answer is due. The pump answers only
+    /// a copy it could not put on the local clipboard, with `.err` in the
+    /// request's inbox directory; that copy goes by OSC 52 instead, the
+    /// fallback a copy off a relay session gets. Silence means it landed,
+    /// so a copy with no answer by [`RELAY_COPY_ANSWER_WAIT`] is let go:
+    /// that also covers a local croft too old to answer at all.
+    pub fn drain_relay_copies(&mut self) -> bool {
+        if self.pending_relay_copies.is_empty() {
+            return false;
+        }
+        let Some(inbox) = self.relay_inbox_path() else {
+            self.pending_relay_copies.clear();
+            return false;
+        };
+        let mut changed = false;
+        for copy in std::mem::take(&mut self.pending_relay_copies) {
+            let request_dir = inbox.join(&copy.request_id);
+            if request_dir.join(".err").exists() {
+                let _ = std::fs::remove_dir_all(&request_dir);
+                crate::clipboard::send_osc52(&copy.text);
+                let n = copy.text.chars().count();
+                self.status = format!(
+                    "The local machine has no clipboard to write: sent {n} chars via OSC 52 (the host terminal decides)"
+                );
+                changed = true;
+            } else if copy.started_at.elapsed() < RELAY_COPY_ANSWER_WAIT {
+                self.pending_relay_copies.push(copy);
+            }
+        }
+        changed
+    }
+
     /// Push copied text to the LOCAL machine's clipboard over the drop relay.
-    /// Returns whether the request was queued.
+    /// Returns the request's id when it was queued.
     ///
     /// The payload goes in a file in the relay INBOX rather than into the
     /// request line: a request is one TAB-SEPARATED LINE, while copied text
@@ -2001,19 +2068,21 @@ impl App {
     /// caps what it will read into the local machine's memory and drops
     /// anything past it, and a selection that pastes back half-formed is worse
     /// than falling through to the ordinary clipboard route and saying so.
-    pub(super) fn push_clipboard_via_relay(&mut self, text: &str) -> bool {
+    pub(super) fn push_clipboard_via_relay(&mut self, text: &str) -> Option<String> {
         if text.len() > crate::remote::MAX_COPY_PAYLOAD_BYTES {
-            return false;
+            return None;
         }
         let (Some(log_path), Some(inbox)) = (self.relay_log_path(), self.relay_inbox_path()) else {
-            return false;
+            return None;
         };
         self.ensure_relay_dir();
         let request_id = Self::relay_request_id("copy");
         if std::fs::write(inbox.join(format!("{request_id}.txt")), text).is_err() {
-            return false;
+            return None;
         }
-        append_to_relay_log(&log_path, &format!("copy\t{request_id}\n")).is_ok()
+        append_to_relay_log(&log_path, &format!("copy\t{request_id}\n"))
+            .is_ok()
+            .then_some(request_id)
     }
 
     /// Paste the host clipboard into the terminal: the chord (Cmd+V /
@@ -2052,8 +2121,7 @@ impl App {
         if let Some(md) = self.editor.markdown_preview.as_ref() {
             let text = md.selection_text();
             if !text.is_empty() {
-                copy_to_clipboard(&text);
-                self.status = format!("Copied {} chars to clipboard", text.chars().count());
+                self.deliver_copied_text(&text);
             }
             return;
         }
@@ -2070,8 +2138,7 @@ impl App {
             if let Some(text) = diff.selection_text()
                 && !text.is_empty()
             {
-                copy_to_clipboard(&text);
-                self.status = format!("Copied {} chars to clipboard", text.chars().count());
+                self.deliver_copied_text(&text);
             }
             return;
         }
@@ -2085,8 +2152,7 @@ impl App {
         if text.is_empty() {
             return;
         }
-        copy_to_clipboard(&text);
-        self.status = format!("Copied {} chars to clipboard", text.chars().count());
+        self.deliver_copied_text(&text);
     }
 
     /// Whether the active editor view shows a selection for Copy to take,
@@ -2117,10 +2183,13 @@ impl App {
             self.editor.clear_selection();
             return;
         }
-        copy_to_clipboard(&text);
         let n = text.chars().count();
+        let landing = self.copy_where_pasted(&text);
         self.editor.delete_selection();
-        self.status = format!("Cut {n} chars to clipboard");
+        self.status = match landing {
+            CopyLanding::Clipboard => format!("Cut {n} chars to clipboard"),
+            _ => format!("Cut {n} chars{}", landing.note()),
+        };
     }
 
     pub(super) fn paste_clipboard_into_search(&mut self, text: Option<&str>) {
@@ -2167,7 +2236,16 @@ impl App {
     /// itself last copied when the host clipboard can't be read (#933), as
     /// on a Linux host with no clipboard tool, where copies go out only by
     /// OSC 52.
+    ///
+    /// On a relay session croft's last copy comes FIRST. Every copy there
+    /// goes home to the clipboard of the machine the user types at and
+    /// leaves this box's alone (#2070), so this box's clipboard holds
+    /// nothing copied in croft: reading it first made a Cut then Paste, or
+    /// vim's `d` then `p`, put back whatever was on it before.
     pub(super) fn clipboard_text(&self) -> Option<String> {
+        if self.is_relay_session {
+            return crate::clipboard::last_copy().or_else(self.clipboard_reader);
+        }
         (self.clipboard_reader)().or_else(crate::clipboard::last_copy)
     }
 
@@ -2865,6 +2943,20 @@ pub(super) fn relative_clipboard_text(path: &Path, root: &Path) -> String {
         .to_string()
 }
 
+/// How long a relay copy waits for the pump to say the local machine had no
+/// clipboard to write. The pump gives up reading a payload after 15 s, and
+/// claims and answers each take one more SSH round trip.
+pub(super) const RELAY_COPY_ANSWER_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// A copy sent home over the relay, kept until the pump's answer is due so
+/// it can still go by OSC 52 if the local machine had no clipboard.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct PendingRelayCopy {
+    pub(super) request_id: String,
+    pub(super) text: String,
+    pub(super) started_at: std::time::Instant,
+}
+
 /// Where `App::copy_where_pasted` put a copy.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum CopyLanding {
@@ -2879,6 +2971,17 @@ pub(super) enum CopyLanding {
 }
 
 impl CopyLanding {
+    /// What to add to a status line that already says the text was taken
+    /// (`Deleted 3 lines`, `Cut 5 chars`) when it did not simply land on
+    /// this machine's clipboard: nothing for that, where it went otherwise.
+    pub(super) fn note(self) -> &'static str {
+        match self {
+            CopyLanding::Local => "; sent to the local clipboard",
+            CopyLanding::Clipboard => "",
+            CopyLanding::Osc52 => "; copied via OSC 52 (the host terminal decides)",
+        }
+    }
+
     /// The status line for copying `what`, saying honestly where it went.
     pub(super) fn status(self, what: &str) -> String {
         match self {

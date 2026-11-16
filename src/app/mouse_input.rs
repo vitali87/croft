@@ -1772,15 +1772,7 @@ impl App {
                     let target_dir =
                         crate::widgets::file_tree::create_target_dir_for(node, &self.tree.root);
                     let selection = self.tree.action_paths();
-                    let mut items = build_tree_context_menu_items_in_dir(
-                        &self.config_dir,
-                        node,
-                        &self.tree.root,
-                        &selection,
-                        &target_dir,
-                        self.tree_clipboard.as_ref(),
-                        self.compare_anchor.as_deref(),
-                    );
+                    let mut items = self.tree_context_menu_items(node, &selection, &target_dir);
                     let clicked = node.map(|n| n.path.clone());
                     maybe_add_reveal_in_finder(
                         &mut items,

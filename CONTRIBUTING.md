@@ -57,11 +57,16 @@ see [docs/MACOS.md](docs/MACOS.md#spotlight-indexing-and-the-build-directory).
   `scripts/move_items.py` moves the items a manifest assigns to a file and
   writes the move's glue, release note and docs row; it split
   `src/app/mod.rs` into feature files (#2062) from
-  `scripts/split_manifest.tsv`.
-* **Adding to the app?** Put a feature's code in its file under `src/app/`
-  (see the list in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)), not in
-  `src/app/mod.rs`, which keeps only the `App` struct, its state, start-up and
-  the main loop. A new feature that fits no file gets a file of its own.
+  `scripts/split_manifest.tsv`, and with `--target editor` split
+  `src/widgets/editor.rs` from `scripts/split_editor_manifest.tsv`
+  (`--tests-out` first moved the editor's inline tests to their own file).
+* **Adding to the app or the editor?** Put a feature's code in its file under
+  `src/app/` or `src/widgets/editor/` (see the lists in
+  [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)), not in `src/app/mod.rs`,
+  which keeps only the `App` struct, its state, start-up and the main loop, nor
+  in `src/widgets/editor.rs`, which keeps only the `Editor` type, its
+  constructor and the data types its parts share. A new feature that fits no
+  file gets a file of its own.
 * **New or changed module?** Update its entry in
   [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). CI fails if you shorten a
   module's description without moving its reasoning into a `### <module>`
