@@ -5,13 +5,18 @@
 //! `[[commands]]` / `[[mcp_servers]]` blocks in the bundled + user extension
 //! manifests, skipping any extension disabled in the Extensions panel.
 //!
-//! Two reads serve two phases. [`contributed_commands`] is the eager list the
+//! Two reads serve two phases. [`contributed_commands_in_dir`] is the eager list the
 //! command palette registers at startup (so a command is discoverable before its
 //! server ever spawns). [`resolve_command_in_dir`] is the lazy lookup the app runs when
 //! a command is invoked: it returns the tool to call plus the spawn intent for
 //! its server (program/args/env and the pinned [`Provision`]), which the app
 //! then ensures-installed and spawns. A command whose extension is disabled
 //! resolves to nothing.
+//!
+//! Which extensions are disabled is the caller's: the app passes its own set,
+//! the one the Extensions panel shows and saves to the active profile, so the
+//! palette, the Explorer's viewer row and running a command all agree with the
+//! panel (#2076).
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -63,38 +68,27 @@ fn server_spawn(decl: &McpServerDecl) -> ServerSpawn {
     }
 }
 
-/// Bundled + user manifest sources, in load order.
-fn all_sources() -> Vec<String> {
-    #[cfg(not(test))]
-    let user_dir = crate::paths::config_dir();
-    // Under test a dir nothing creates, as the settings layers use (#624):
-    // an extension the developer added must never steer a test, and a test
-    // that wants one seeds a scratch dir through the `_in_dir` reads.
-    #[cfg(test)]
-    let user_dir = std::env::temp_dir().join(format!("croft-test-config-{}", std::process::id()));
-    all_sources_in_dir(&user_dir)
-}
-
 /// Every manifest source, with the user extensions read from under an
 /// explicit config dir: the app carries the dir it was built with, so a
 /// test can seed a scratch dir instead of mutating the process-wide
 /// environment (which races sibling tests).
+///
+/// Under test the developer's own config dir gives no user extensions: an
+/// app a test builds carries that dir, and an extension the developer
+/// installed must never steer a test's palette, menus or snapshots (#624,
+/// #2218). A test that wants one seeds a scratch dir.
 fn all_sources_in_dir(config_dir: &Path) -> Vec<String> {
     let mut sources: Vec<String> = manifest::BUNDLED_MANIFESTS
         .iter()
         .map(|s| s.to_string())
         .collect();
+    if cfg!(test) && config_dir == crate::paths::config_dir() {
+        return sources;
+    }
     sources.extend(manifest::read_extension_sources(
         &config_dir.join("extensions"),
     ));
     sources
-}
-
-/// The disabled set as recorded under an explicit config dir.
-fn disabled_in_dir(config_dir: &Path) -> BTreeSet<String> {
-    crate::prefs::Prefs::load(&config_dir.join("config.json"))
-        .unwrap_or_default()
-        .disabled_extensions
 }
 
 /// Pure: every contributed command across `sources` whose extension is enabled,
@@ -247,12 +241,15 @@ fn viewer_commands_in(sources: &[String], disabled: &BTreeSet<String>) -> Vec<Co
 }
 
 /// The enabled viewer for `path`, if any extension contributes one.
-pub fn viewer_for_path_in_dir(config_dir: &Path, path: &Path) -> Option<ContributedViewer> {
-    viewer_for_path_in(
-        &all_sources_in_dir(config_dir),
-        &disabled_in_dir(config_dir),
-        path,
-    )
+/// `disabled` is the app's own set, the one the Extensions panel shows and
+/// saves to the active profile (#2076); the extensions are read from under
+/// `config_dir`.
+pub fn viewer_for_path_in_dir(
+    config_dir: &Path,
+    disabled: &BTreeSet<String>,
+    path: &Path,
+) -> Option<ContributedViewer> {
+    viewer_for_path_in(&all_sources_in_dir(config_dir), disabled, path)
 }
 
 /// Pure: the enabled viewer whose [`ContributedViewer::key`] is `key`.
@@ -267,29 +264,35 @@ fn viewer_by_key_in(
 }
 
 /// The enabled viewer with this key (`<extension id>/<viewer id>`), if any,
-/// read from under an explicit config dir.
-pub fn viewer_by_id_in_dir(config_dir: &Path, key: &str) -> Option<ContributedViewer> {
-    viewer_by_key_in(
-        &all_sources_in_dir(config_dir),
-        &disabled_in_dir(config_dir),
-        key,
-    )
+/// read from under an explicit config dir; `disabled` as for
+/// [`viewer_for_path_in_dir`].
+pub fn viewer_by_id_in_dir(
+    config_dir: &Path,
+    disabled: &BTreeSet<String>,
+    key: &str,
+) -> Option<ContributedViewer> {
+    viewer_by_key_in(&all_sources_in_dir(config_dir), disabled, key)
 }
 
-/// Palette rows for the enabled viewers.
-pub fn contributed_viewer_commands_in_dir(config_dir: &Path) -> Vec<ContributedCommand> {
-    viewer_commands_in(
-        &all_sources_in_dir(config_dir),
-        &disabled_in_dir(config_dir),
-    )
+/// Palette rows for the enabled viewers; `disabled` as for
+/// [`viewer_for_path_in_dir`].
+pub fn contributed_viewer_commands_in_dir(
+    config_dir: &Path,
+    disabled: &BTreeSet<String>,
+) -> Vec<ContributedCommand> {
+    viewer_commands_in(&all_sources_in_dir(config_dir), disabled)
 }
 
 /// The contributed commands to register eagerly in the palette (enabled
-/// extensions only). Reads prefs + manifests fresh; invoked when the palette is
-/// built, not on a hot path.
-pub fn contributed_commands() -> Vec<ContributedCommand> {
-    let disabled = crate::prefs::Prefs::load_or_default().disabled_extensions;
-    contributed_in(&all_sources(), &disabled)
+/// extensions only), with the manifests read fresh from under `config_dir`;
+/// `disabled` as for [`viewer_for_path_in_dir`], so the palette lists what
+/// [`resolve_command_in_dir`] runs. Invoked when the palette is built, not
+/// on a hot path.
+pub fn contributed_commands_in_dir(
+    config_dir: &Path,
+    disabled: &BTreeSet<String>,
+) -> Vec<ContributedCommand> {
+    contributed_in(&all_sources_in_dir(config_dir), disabled)
 }
 
 /// The ids of the commands extension `ext_id` declares, enabled or not,
@@ -303,13 +306,14 @@ pub fn command_ids_of_in_dir(config_dir: &Path, ext_id: &str) -> Vec<String> {
 }
 
 /// Resolve a palette command id to its server and tool, reading the
-/// extensions under an explicit config dir.
-pub fn resolve_command_in_dir(config_dir: &Path, command_id: &str) -> Option<ResolvedCommand> {
-    resolve_in(
-        &all_sources_in_dir(config_dir),
-        &disabled_in_dir(config_dir),
-        command_id,
-    )
+/// extensions under an explicit config dir; `disabled` as for
+/// [`viewer_for_path_in_dir`].
+pub fn resolve_command_in_dir(
+    config_dir: &Path,
+    disabled: &BTreeSet<String>,
+    command_id: &str,
+) -> Option<ResolvedCommand> {
+    resolve_in(&all_sources_in_dir(config_dir), disabled, command_id)
 }
 
 #[cfg(test)]
@@ -465,6 +469,23 @@ prompt = "URL"
 
     fn sources() -> Vec<String> {
         vec![FETCH.to_string()]
+    }
+
+    /// #2218: an app a test builds carries the developer's real config dir,
+    /// so that dir must give no user extensions under test, while a scratch
+    /// dir a test seeds still does.
+    #[test]
+    fn under_test_only_a_scratch_config_dir_gives_user_extensions() {
+        let bundled = manifest::BUNDLED_MANIFESTS.len();
+        assert_eq!(
+            all_sources_in_dir(&crate::paths::config_dir()).len(),
+            bundled
+        );
+        let scratch = tempfile::tempdir().unwrap();
+        let ext = scratch.path().join("extensions").join("mcp-fetch");
+        std::fs::create_dir_all(&ext).unwrap();
+        std::fs::write(ext.join("extension.toml"), FETCH).unwrap();
+        assert_eq!(all_sources_in_dir(scratch.path()).len(), bundled + 1);
     }
 
     #[test]

@@ -1179,7 +1179,11 @@ impl App {
             MenuAction::OpenInViewer(id, path) => {
                 // The row was built when the menu opened; an extension
                 // removed since then must not make the click a silent no-op.
-                match crate::mcp::registry::viewer_by_id_in_dir(&self.config_dir, &id) {
+                match crate::mcp::registry::viewer_by_id_in_dir(
+                    &self.config_dir,
+                    &self.disabled_extensions,
+                    &id,
+                ) {
                     Some(viewer) => self.open_in_viewer(&viewer, &path),
                     None => self.status = format!("{id} is no longer available"),
                 }
