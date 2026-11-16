@@ -471,7 +471,102 @@ EDITOR = Target(
 )
 
 # What each file split out of src/lsp/manager.rs holds, as FILES above.
-LSP_FILES = {}
+LSP_FILES = {
+    "discovery": (
+        "Finding each file's server: its language and project root, the server's config, and\n"
+        "the executable on PATH, in a toolchain's folders or through rustup, and the note shown\n"
+        "once when a server is missing.",
+        "language-server manager's server discovery",
+        "a file's language and project root, server config, finding the executable, rustup",
+    ),
+    "capabilities": (
+        "What croft tells a server it can do: the client capabilities sent at initialize, and\n"
+        "the standard semantic token types and modifiers it declares.",
+        "language-server manager's client capabilities",
+        "the client capabilities sent at initialize, standard semantic token types",
+    ),
+    "diagnostics": (
+        "Diagnostics: the problems servers report, pushed or pulled per document and for the\n"
+        "whole workspace, with their result ids, debounce and timeouts.",
+        "language-server manager's diagnostics",
+        "diagnostics pushed and pulled, per document and workspace-wide",
+    ),
+    "completion": (
+        "Completion and its kin: completion lists and resolving an item, trigger characters,\n"
+        "signature help, and inline (ghost text) completion.",
+        "language-server manager's completion",
+        "completion, trigger characters, signature help, inline completion",
+    ),
+    "hover": (
+        "Hover, and rust-analyzer's own requests (expand macro, parent module and others).",
+        "language-server manager's hover",
+        "hover, rust-analyzer's own requests",
+    ),
+    "navigation": (
+        "Going to code: definition, declaration, type definition, implementation, references,\n"
+        "and the call and type hierarchies.",
+        "language-server manager's go-to navigation",
+        "definition, declaration, type definition, implementation, references, hierarchies",
+    ),
+    "symbols": (
+        "Symbols: a document's outline, and workspace symbol search.",
+        "language-server manager's symbols",
+        "document outline, workspace symbol search",
+    ),
+    "semantic_tokens": (
+        "Semantic tokens: whole-document and range requests, the server's legend, and turning\n"
+        "its token stream into the editor's batches.",
+        "language-server manager's semantic tokens",
+        "semantic tokens, whole and by range, the server's legend",
+    ),
+    "decorations": (
+        "What servers lay over the text besides tokens: inlay hints, document links, code\n"
+        "lenses, folding ranges, and document colours and their presentations.",
+        "language-server manager's text decorations",
+        "inlay hints, links, code lenses, folding ranges, document colours",
+    ),
+    "text_ranges": (
+        "Ranges a server reports around the caret: occurrences of the symbol, linked editing\n"
+        "ranges, and the selection ranges that expand and shrink a selection.",
+        "language-server manager's text range",
+        "symbol occurrences, linked editing ranges, selection ranges",
+    ),
+    "rename": (
+        "Renaming: rename and prepare rename, and the edits servers make when files are renamed.",
+        "language-server manager's rename",
+        "rename, prepare rename, file renames",
+    ),
+    "code_actions": (
+        "Code actions: asking for them with the diagnostics at hand, resolving one, and running\n"
+        "a server command.",
+        "language-server manager's code action",
+        "code actions, resolving them, server commands",
+    ),
+    "formatting": (
+        "Formatting: a whole document, a range, and as you type.",
+        "language-server manager's formatting",
+        "formatting a document, a range, and on type",
+    ),
+    "documents": (
+        "Keeping servers in step with open documents: open, change, save and close, the text\n"
+        "each server last saw, and the files the workspace watcher reports changed.",
+        "language-server manager's document sync",
+        "open, change, save and close notifications, watched files",
+    ),
+    "servers": (
+        "Running the servers: starting the ones a file needs, pre-warming the workspace,\n"
+        "restarting a server that died, swapping in a new registry, and which server serves a\n"
+        "document.",
+        "language-server manager's server lifecycle",
+        "starting, pre-warming, restarting and replacing servers; which server serves a file",
+    ),
+    "worker": (
+        "The worker loop: the manager's thread that takes each command and routes it to the\n"
+        "servers.",
+        "language-server manager's worker loop",
+        "the worker loop that routes each command to the servers",
+    ),
+}
 
 LSP = Target(
     "lsp", "scripts/split_lsp_manifest.tsv", "src/lsp/manager.rs",
