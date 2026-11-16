@@ -25,7 +25,7 @@ pub(super) fn shortcut_for(action: &MenuAction) -> Option<&'static str> {
         MenuAction::RevealInExplorer(_) => Some("⌘K E"),
         MenuAction::Delete { .. } => Some("⌫"),
         MenuAction::CloseTab(_) => Some("⌘W"),
-        MenuAction::CloseOtherTabs(_) => Some("⌥⌘T"),
+        MenuAction::CloseOtherTabs(_) => Some("⌘K ⇧X"),
         MenuAction::CloseAllTabs => Some("⌘K W"),
         MenuAction::CloseSavedTabs => Some("⌘K U"),
         MenuAction::KeepTabOpen(_) => Some("⌘K ⇧P"),
@@ -123,6 +123,7 @@ pub(super) fn menu_action_command(
         MenuAction::TerminalCopyMode => Cmd::TerminalCopyMode,
         MenuAction::TerminalCommandHistory => Cmd::TerminalCommandHistory,
         MenuAction::OpenScrollbackInEditor => Cmd::TerminalOpenScrollback,
+        MenuAction::CloseOtherTabs(_) => Cmd::CloseOtherEditors,
         _ => return None,
     })
 }

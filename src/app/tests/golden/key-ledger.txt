@@ -123,7 +123,6 @@ editor | ctrl+alt+shift+t | focus=panel status="Split terminal: 2 active" terms=
 editor | ctrl+alt+shift+u | tabs=*● main.rs text=15L#d70f871e
 editor | ctrl+alt+shift+up | caret=3:8 carets=4:8
 editor | ctrl+alt+shift+w | -
-editor | ctrl+alt+t | -
 editor | ctrl+alt+up | carets=3:8
 editor | ctrl+b | side=hidden
 editor | ctrl+backspace | tabs=*● main.rs text=15L#ac09b3f1 caret=4:4
@@ -174,6 +173,7 @@ editor | ctrl+k f | status="Format on Save: on"
 editor | ctrl+k h | status="Call hierarchy: no language server for this file"
 editor | ctrl+k i | status="Broadcast input needs at least two terminal panes (Cmd+T splits)"
 editor | ctrl+k k | status="Cleared terminal"
+editor | ctrl+k l | status="Drop to Local: this croft is not a remote session"
 editor | ctrl+k m | status="Only one terminal open"
 editor | ctrl+k n | +prompt("Note on line 5" "")
 editor | ctrl+k o | status="New Window failed: opening a new window is only supported on macOS"
@@ -201,6 +201,7 @@ editor | ctrl+k shift+t | status="No recently closed terminals"
 editor | ctrl+k shift+u | status="Type hierarchy: no language server for this file"
 editor | ctrl+k shift+v | tabs=main.rs,*main · main.rs scroll=3:0 status="Opened main as its own tab"
 editor | ctrl+k shift+w | status="No closed tabs to reopen"
+editor | ctrl+k shift+x | status="No other tabs to close"
 editor | ctrl+k u | tabs=*untitled text=0L#811c9dc5 caret=0:0 status="Closed 1 saved tab"
 editor | ctrl+k v | status="Live Run runs Python files (.py)"
 editor | ctrl+k w | tabs=*untitled text=0L#811c9dc5 caret=0:0 status="Closed 1 tab"
@@ -236,7 +237,7 @@ editor | ctrl+shift+l | caret=4:13 sel=4:8-4:13 carets=1:35-1:40,5:7-5:12,6:19-6
 editor | ctrl+shift+m | focus=panel panel=Problems
 editor | ctrl+shift+n | -
 editor | ctrl+shift+o | status="Go to Symbol: 0 symbols — Esc to close" +go_to_symbol("" @0 > "")
-editor | ctrl+shift+p | status="Command Palette: 386 commands — Esc to close" +palette("" @0 > "Move Line Up")
+editor | ctrl+shift+p | status="Command Palette: 387 commands — Esc to close" +palette("" @0 > "Move Line Up")
 editor | ctrl+shift+pagedown | status="Move: the editor is already the last tab"
 editor | ctrl+shift+pageup | status="Move: the editor is already the first tab"
 editor | ctrl+shift+r | focus=side side=Remote
@@ -390,7 +391,6 @@ selection | ctrl+alt+shift+t | focus=panel status="Split terminal: 2 active" ter
 selection | ctrl+alt+shift+u | tabs=*● main.rs text=15L#d70f871e
 selection | ctrl+alt+shift+up | caret=3:11 sel=3:8-3:11 carets=4:8-4:13
 selection | ctrl+alt+shift+w | -
-selection | ctrl+alt+t | -
 selection | ctrl+alt+up | carets=3:11
 selection | ctrl+b | side=hidden
 selection | ctrl+backspace | tabs=*● main.rs text=15L#bb0bf786 caret=4:8 sel=-
@@ -441,6 +441,7 @@ selection | ctrl+k f | status="Format on Save: on"
 selection | ctrl+k h | status="Call hierarchy: no language server for this file"
 selection | ctrl+k i | status="Broadcast input needs at least two terminal panes (Cmd+T splits)"
 selection | ctrl+k k | status="Cleared terminal"
+selection | ctrl+k l | status="Drop to Local: this croft is not a remote session"
 selection | ctrl+k m | status="Only one terminal open"
 selection | ctrl+k n | +prompt("Note on line 5" "")
 selection | ctrl+k o | status="New Window failed: opening a new window is only supported on macOS"
@@ -468,6 +469,7 @@ selection | ctrl+k shift+t | status="No recently closed terminals"
 selection | ctrl+k shift+u | status="Type hierarchy: no language server for this file"
 selection | ctrl+k shift+v | tabs=main.rs,*main · main.rs sel=- scroll=3:0 status="Opened main as its own tab"
 selection | ctrl+k shift+w | status="No closed tabs to reopen"
+selection | ctrl+k shift+x | status="No other tabs to close"
 selection | ctrl+k u | tabs=*untitled text=0L#811c9dc5 caret=0:0 sel=- status="Closed 1 saved tab"
 selection | ctrl+k v | status="Live Run runs Python files (.py)"
 selection | ctrl+k w | tabs=*untitled text=0L#811c9dc5 caret=0:0 sel=- status="Closed 1 tab"
@@ -503,7 +505,7 @@ selection | ctrl+shift+l | carets=1:35-1:40,5:7-5:12,6:19-6:24 status="Selected 
 selection | ctrl+shift+m | focus=panel panel=Problems
 selection | ctrl+shift+n | -
 selection | ctrl+shift+o | status="Go to Symbol: 0 symbols — Esc to close" +go_to_symbol("" @0 > "")
-selection | ctrl+shift+p | status="Command Palette: 386 commands — Esc to close" +palette("" @0 > "Move Line Up")
+selection | ctrl+shift+p | status="Command Palette: 387 commands — Esc to close" +palette("" @0 > "Move Line Up")
 selection | ctrl+shift+pagedown | status="Move: the editor is already the last tab"
 selection | ctrl+shift+pageup | status="Move: the editor is already the first tab"
 selection | ctrl+shift+r | focus=side side=Remote
@@ -657,7 +659,6 @@ explorer | ctrl+alt+shift+t | focus=panel status="Split terminal: 2 active" term
 explorer | ctrl+alt+shift+u | -
 explorer | ctrl+alt+shift+up | tree=./+,.vscode/,docs/,main.rs > docs marked=.,.vscode,docs
 explorer | ctrl+alt+shift+w | -
-explorer | ctrl+alt+t | -
 explorer | ctrl+alt+up | tree=./+,.vscode/,docs/,main.rs > docs
 explorer | ctrl+b | side=hidden
 explorer | ctrl+backspace | +input("Move 'main.rs' to Trash?" "" @0)
@@ -708,6 +709,7 @@ explorer | ctrl+k f | status="Format on Save: on"
 explorer | ctrl+k h | status="Call hierarchy: no language server for this file"
 explorer | ctrl+k i | status="Broadcast input needs at least two terminal panes (Cmd+T splits)"
 explorer | ctrl+k k | status="Cleared terminal"
+explorer | ctrl+k l | status="Drop to Local: this croft is not a remote session"
 explorer | ctrl+k m | status="Only one terminal open"
 explorer | ctrl+k n | -
 explorer | ctrl+k o | status="New Window failed: opening a new window is only supported on macOS"
@@ -735,6 +737,7 @@ explorer | ctrl+k shift+t | status="No recently closed terminals"
 explorer | ctrl+k shift+u | status="Type hierarchy: no language server for this file"
 explorer | ctrl+k shift+v | focus=editor tabs=main.rs,*main · main.rs scroll=3:0 status="Opened main as its own tab"
 explorer | ctrl+k shift+w | status="No closed tabs to reopen"
+explorer | ctrl+k shift+x | status="No other tabs to close"
 explorer | ctrl+k u | tabs=*untitled text=0L#811c9dc5 caret=0:0 status="Closed 1 saved tab"
 explorer | ctrl+k v | status="Live Run runs Python files (.py)"
 explorer | ctrl+k w | tabs=*untitled text=0L#811c9dc5 caret=0:0 status="Closed 1 tab"
@@ -770,7 +773,7 @@ explorer | ctrl+shift+l | -
 explorer | ctrl+shift+m | focus=panel panel=Problems
 explorer | ctrl+shift+n | +prompt("New Folder in ." "")
 explorer | ctrl+shift+o | status="Go to Symbol: 0 symbols — Esc to close" +go_to_symbol("" @0 > "")
-explorer | ctrl+shift+p | status="Command Palette: 386 commands — Esc to close" +palette("" @0 > "Move Line Up")
+explorer | ctrl+shift+p | status="Command Palette: 387 commands — Esc to close" +palette("" @0 > "Move Line Up")
 explorer | ctrl+shift+pagedown | tree=./+,.vscode/,docs/,main.rs > main.rs marked=.,.vscode,docs,main.rs
 explorer | ctrl+shift+pageup | tree=./+,.vscode/,docs/,main.rs > . marked=.
 explorer | ctrl+shift+r | side=Remote
@@ -923,7 +926,6 @@ terminal | ctrl+alt+shift+t | status="Split terminal: 2 active" terms=2@1
 terminal | ctrl+alt+shift+u | typed=0:"\u{1b}\u{15}"
 terminal | ctrl+alt+shift+up | status="No command marks yet (shell integration needs a zsh prompt)"
 terminal | ctrl+alt+shift+w | status="Cannot close the last terminal; press Ctrl+J to hide"
-terminal | ctrl+alt+t | typed=0:"\u{1b}\u{14}"
 terminal | ctrl+alt+up | status="No command marks yet (shell integration needs a zsh prompt)"
 terminal | ctrl+b | typed=0:"\u{2}"
 terminal | ctrl+backspace | typed=0:"\u{8}"
@@ -974,6 +976,7 @@ terminal | ctrl+k f | typed=0:"\u{b}f"
 terminal | ctrl+k h | typed=0:"\u{b}h"
 terminal | ctrl+k i | typed=0:"\u{b}i"
 terminal | ctrl+k k | typed=0:"\u{b}k"
+terminal | ctrl+k l | typed=0:"\u{b}l"
 terminal | ctrl+k m | typed=0:"\u{b}m"
 terminal | ctrl+k n | typed=0:"\u{b}n"
 terminal | ctrl+k o | typed=0:"\u{b}o"
@@ -1001,6 +1004,7 @@ terminal | ctrl+k shift+t | typed=0:"\u{b}T"
 terminal | ctrl+k shift+u | typed=0:"\u{b}U"
 terminal | ctrl+k shift+v | typed=0:"\u{b}V"
 terminal | ctrl+k shift+w | typed=0:"\u{b}W"
+terminal | ctrl+k shift+x | typed=0:"\u{b}X"
 terminal | ctrl+k u | typed=0:"\u{b}u"
 terminal | ctrl+k v | typed=0:"\u{b}v"
 terminal | ctrl+k w | typed=0:"\u{b}w"
@@ -1036,7 +1040,7 @@ terminal | ctrl+shift+l | typed=0:"\u{c}"
 terminal | ctrl+shift+m | panel=Problems
 terminal | ctrl+shift+n | typed=0:"\u{e}"
 terminal | ctrl+shift+o | status="Go to Symbol: 0 symbols — Esc to close" +go_to_symbol("" @0 > "")
-terminal | ctrl+shift+p | status="Command Palette: 386 commands — Esc to close" +palette("" @0 > "Move Line Up")
+terminal | ctrl+shift+p | status="Command Palette: 387 commands — Esc to close" +palette("" @0 > "Move Line Up")
 terminal | ctrl+shift+pagedown | -
 terminal | ctrl+shift+pageup | -
 terminal | ctrl+shift+r | focus=side side=Remote
@@ -1190,7 +1194,6 @@ search | ctrl+alt+shift+t | focus=panel status="Split terminal: 2 active" terms=
 search | ctrl+alt+shift+u | status="Search: unhandled Ctrl+U"
 search | ctrl+alt+shift+up | -
 search | ctrl+alt+shift+w | status="Search: unhandled Ctrl+W"
-search | ctrl+alt+t | status="Search: unhandled Ctrl+t"
 search | ctrl+alt+up | -
 search | ctrl+b | side=hidden
 search | ctrl+backspace | search="" @Query:0 hits=0@0
@@ -1241,6 +1244,7 @@ search | ctrl+k f | status="Format on Save: on"
 search | ctrl+k h | status="Call hierarchy: no language server for this file"
 search | ctrl+k i | status="Broadcast input needs at least two terminal panes (Cmd+T splits)"
 search | ctrl+k k | status="Cleared terminal"
+search | ctrl+k l | status="Drop to Local: this croft is not a remote session"
 search | ctrl+k m | status="Only one terminal open"
 search | ctrl+k n | search="totaln" @Query:6 hits=0@0
 search | ctrl+k o | status="New Window failed: opening a new window is only supported on macOS"
@@ -1268,6 +1272,7 @@ search | ctrl+k shift+t | status="No recently closed terminals"
 search | ctrl+k shift+u | status="Type hierarchy: no language server for this file"
 search | ctrl+k shift+v | focus=editor tabs=main.rs,*main · main.rs scroll=3:0 status="Opened main as its own tab" search="total" hits=4@0
 search | ctrl+k shift+w | status="No closed tabs to reopen"
+search | ctrl+k shift+x | status="No other tabs to close"
 search | ctrl+k u | tabs=*untitled text=0L#811c9dc5 caret=0:0 status="Closed 1 saved tab"
 search | ctrl+k v | status="Live Run runs Python files (.py)"
 search | ctrl+k w | tabs=*untitled text=0L#811c9dc5 caret=0:0 status="Closed 1 tab"
@@ -1303,7 +1308,7 @@ search | ctrl+shift+l | status="Search: unhandled Ctrl+L"
 search | ctrl+shift+m | focus=panel panel=Problems search="total" hits=4@0
 search | ctrl+shift+n | status="Search: unhandled Ctrl+N"
 search | ctrl+shift+o | status="Go to Symbol: 0 symbols — Esc to close" +go_to_symbol("" @0 > "")
-search | ctrl+shift+p | status="Command Palette: 386 commands — Esc to close" +palette("" @0 > "Move Line Up")
+search | ctrl+shift+p | status="Command Palette: 387 commands — Esc to close" +palette("" @0 > "Move Line Up")
 search | ctrl+shift+pagedown | -
 search | ctrl+shift+pageup | -
 search | ctrl+shift+r | side=Remote search="total" hits=4@0
@@ -1457,7 +1462,6 @@ scm | ctrl+alt+shift+t | focus=panel status="Split terminal: 2 active" terms=2@1
 scm | ctrl+alt+shift+u | -
 scm | ctrl+alt+shift+up | -
 scm | ctrl+alt+shift+w | -
-scm | ctrl+alt+t | -
 scm | ctrl+alt+up | -
 scm | ctrl+b | side=hidden
 scm | ctrl+backspace | scm="Ship i"@6 +focus StagedModified:docs/notes.md Untracked:todo.txt
@@ -1508,6 +1512,7 @@ scm | ctrl+k f | status="Format on Save: on"
 scm | ctrl+k h | status="Call hierarchy: no language server for this file"
 scm | ctrl+k i | status="Broadcast input needs at least two terminal panes (Cmd+T splits)"
 scm | ctrl+k k | status="Cleared terminal"
+scm | ctrl+k l | status="Drop to Local: this croft is not a remote session"
 scm | ctrl+k m | status="Only one terminal open"
 scm | ctrl+k n | scm="Ship itn"@8 +focus StagedModified:docs/notes.md Untracked:todo.txt
 scm | ctrl+k o | status="New Window failed: opening a new window is only supported on macOS"
@@ -1535,6 +1540,7 @@ scm | ctrl+k shift+t | status="No recently closed terminals"
 scm | ctrl+k shift+u | status="Type hierarchy: no language server for this file"
 scm | ctrl+k shift+v | focus=editor tabs=main.rs,*main · main.rs scroll=3:0 status="Opened main as its own tab" scm="Ship it"@7 StagedModified:docs/notes.md Untracked:todo.txt
 scm | ctrl+k shift+w | status="No closed tabs to reopen"
+scm | ctrl+k shift+x | status="No other tabs to close"
 scm | ctrl+k u | tabs=*untitled text=0L#811c9dc5 caret=0:0 status="Closed 1 saved tab"
 scm | ctrl+k v | status="Live Run runs Python files (.py)"
 scm | ctrl+k w | tabs=*untitled text=0L#811c9dc5 caret=0:0 status="Closed 1 tab"
@@ -1570,7 +1576,7 @@ scm | ctrl+shift+l | -
 scm | ctrl+shift+m | focus=panel panel=Problems scm="Ship it"@7 StagedModified:docs/notes.md Untracked:todo.txt
 scm | ctrl+shift+n | -
 scm | ctrl+shift+o | status="Go to Symbol: 0 symbols — Esc to close" +go_to_symbol("" @0 > "")
-scm | ctrl+shift+p | status="Command Palette: 386 commands — Esc to close" +palette("" @0 > "Move Line Up")
+scm | ctrl+shift+p | status="Command Palette: 387 commands — Esc to close" +palette("" @0 > "Move Line Up")
 scm | ctrl+shift+pagedown | -
 scm | ctrl+shift+pageup | -
 scm | ctrl+shift+r | side=Remote scm="Ship it"@7 StagedModified:docs/notes.md Untracked:todo.txt
@@ -1724,7 +1730,6 @@ palette | ctrl+alt+shift+t | -
 palette | ctrl+alt+shift+u | -
 palette | ctrl+alt+shift+up | -
 palette | ctrl+alt+shift+w | -
-palette | ctrl+alt+t | -
 palette | ctrl+alt+up | -
 palette | ctrl+b | -
 palette | ctrl+backspace | -
@@ -1776,6 +1781,7 @@ palette | ctrl+k f | ~palette("f" @1 > "Quick Fix")
 palette | ctrl+k h | ~palette("h" @1 > "Git: Stage Hunk")
 palette | ctrl+k i | ~palette("i" @1 > "Replace in File")
 palette | ctrl+k k | ~palette("k" @1 > "View: Keep Editor")
+palette | ctrl+k l | ~palette("l" @1 > "View: Toggle Primary Side Bar")
 palette | ctrl+k m | ~palette("m" @1 > "Move Line Up")
 palette | ctrl+k n | ~palette("n" @1 > "Go to Next Change")
 palette | ctrl+k o | ~palette("o" @1 > "View: Keep Editor")
@@ -1804,6 +1810,7 @@ palette | ctrl+k shift+t | ~palette("T" @1 > "Toggle Fold")
 palette | ctrl+k shift+u | ~palette("U" @1 > "Undo")
 palette | ctrl+k shift+v | ~palette("V" @1 > "Toggle Vim Mode")
 palette | ctrl+k shift+w | ~palette("W" @1 > "File: Save with Sudo")
+palette | ctrl+k shift+x | ~palette("X" @1 > "Quick Fix")
 palette | ctrl+k u | ~palette("u" @1 > "Undo")
 palette | ctrl+k v | ~palette("v" @1 > "Toggle Vim Mode")
 palette | ctrl+k w | ~palette("w" @1 > "File: Save with Sudo")
@@ -1994,7 +2001,6 @@ confirm | ctrl+alt+shift+t | -
 confirm | ctrl+alt+shift+u | -
 confirm | ctrl+alt+shift+up | -
 confirm | ctrl+alt+shift+w | -
-confirm | ctrl+alt+t | -
 confirm | ctrl+alt+up | -
 confirm | ctrl+b | -
 confirm | ctrl+backspace | -
@@ -2046,6 +2052,7 @@ confirm | ctrl+k f | -
 confirm | ctrl+k h | -
 confirm | ctrl+k i | -
 confirm | ctrl+k k | -
+confirm | ctrl+k l | -
 confirm | ctrl+k m | -
 confirm | ctrl+k n | status="Cancelled: did not quit" -unsaved
 confirm | ctrl+k o | -
@@ -2074,6 +2081,7 @@ confirm | ctrl+k shift+t | -
 confirm | ctrl+k shift+u | -
 confirm | ctrl+k shift+v | -
 confirm | ctrl+k shift+w | -
+confirm | ctrl+k shift+x | -
 confirm | ctrl+k u | -
 confirm | ctrl+k v | -
 confirm | ctrl+k w | -
