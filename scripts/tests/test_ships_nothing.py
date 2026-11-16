@@ -940,6 +940,52 @@ class TestOnlyModules(unittest.TestCase):
             self.change(repo, {"src/helper.rs": body.format("!src.is_empty()")})
             self.assertTrue(repo.verdict("src/helper.rs"))
 
+    def test_an_include_on_a_test_modules_closing_line_ships(self):
+        """#2217 review: the `include_str!` follows the brace that closes the
+        test module on the same line, so it is outside the module and
+        compiles into the release build."""
+        self.assertFalse(
+            self.shipped_by(
+                {
+                    "src/main.rs": (
+                        "#[cfg(test)]\nmod helper;\n#[cfg(test)]\nmod tests {\n    fn t() {}\n"
+                        '} pub const SRC: &str = include_str!("helper.rs");\n'
+                        'fn main() {\n    print!("{SRC}");\n}\n'
+                    )
+                }
+            )
+        )
+
+    def test_an_include_before_a_test_modules_attribute_on_one_line_ships(self):
+        """The mirror case: the `include_str!` comes before `#[cfg(test)]`
+        on the line the test module starts on."""
+        self.assertFalse(
+            self.shipped_by(
+                {
+                    "src/main.rs": (
+                        "#[cfg(test)]\nmod helper;\n"
+                        'pub const SRC: &str = include_str!("helper.rs"); #[cfg(test)] mod tests {\n'
+                        '    fn t() {}\n}\nfn main() {\n    print!("{SRC}");\n}\n'
+                    )
+                }
+            )
+        )
+
+    def test_test_module_spans_run_from_the_attribute_to_the_closing_brace(self):
+        toks = filt.rust_tokens(
+            'a!(); #[cfg(test)] #[allow(x)] pub(crate) mod t { b!(); } c!();\n'
+            "#[cfg(test)]\nmod d;\n#[cfg(not(test))]\nmod e {}\n"
+        )
+        spans = filt._test_module_spans(toks)
+        self.assertEqual(len(spans), 1, "only the module with a body and exact cfg(test)")
+        first, last = spans[0]
+        self.assertEqual(toks[first], ("punct", "#"))
+        self.assertEqual(toks[last], ("punct", "}"))
+        inside = [w for k, w in toks[first : last + 1] if k == "ident"]
+        self.assertIn("b", inside)
+        self.assertNotIn("a", inside)
+        self.assertNotIn("c", inside)
+
     def test_code_pasted_in_by_include_ships(self):
         """#2217 review: `include!` pastes a file in as code, and that code
         can declare modules or read files itself (here `production.inc`

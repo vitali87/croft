@@ -462,7 +462,41 @@ def _resolved(folder, value):
     return target
 
 
-def _loaders_in(path, toks, lines=(), test_spans=()):
+def _test_module_spans(toks):
+    """The token spans `(first, last)` of every `#[cfg(test)] mod name { .. }`
+    in `toks`: from the attribute's `#` to the module's closing brace.
+
+    Read off the tokens rather than the lines `cfg_test_ranges` reports: a
+    line can hold code on both sides of a test module's edge
+    (`} const SRC: &str = include_str!("a.rs");`), and the include there is
+    shipped. Only the exact `cfg(test)` attribute on a module with a body
+    counts, as `cfg_test_ranges` reads it; anything else is left shipped,
+    which at worst asks for a release note this did not need.
+    """
+    spans = []
+    for i in range(len(toks) - 1):
+        if toks[i] != ("punct", "#") or toks[i + 1] != ("punct", "["):
+            continue
+        end = _closing(toks, i + 1)
+        if toks[i + 2 : end] != [
+            ("ident", "cfg"),
+            ("punct", "("),
+            ("ident", "test"),
+            ("punct", ")"),
+        ]:
+            continue
+        k = _past_attributes(toks, end + 1)
+        if (
+            k + 2 < len(toks)
+            and toks[k] == ("ident", "mod")
+            and toks[k + 1][0] == "ident"
+            and toks[k + 2] == ("punct", "{")
+        ):
+            spans.append((i, _closing(toks, k + 2)))
+    return spans
+
+
+def _loaders_in(path, toks):
     """What one file's own text can load beside its plain `mod` children:
     `(files a top-level #[path] mod x; loads, folders another #[path] can
     load from, names an include_str! or include_bytes! reads)`. None stands
@@ -473,9 +507,11 @@ def _loaders_in(path, toks, lines=(), test_spans=()):
     `use` can rename a macro; elsewhere `include` is an ordinary name (croft
     has a search field called that).
 
-    An include macro inside a `#[cfg(test)]` module (`test_spans`, by the
-    `lines` of `toks`) compiles only for tests, so it is not counted: croft's
-    port detector has a test that reads its own source that way.
+    An include macro inside a `#[cfg(test)]` module compiles only for tests,
+    so it is not counted: croft's port detector has a test that reads its own
+    source that way. Inside means between the module's braces, by token
+    (`_test_module_spans`), not on one of its lines: a shipped include can
+    share a line with the brace that closes a test module.
 
     A macro this does not know can still read files: a procedural macro, or
     a `macro_rules!` handed `include_str` as an argument. So can a build
@@ -493,6 +529,12 @@ def _loaders_in(path, toks, lines=(), test_spans=()):
     folder = posixpath.dirname(path)
     roots, folders, names = [], [], []
     in_use = False
+    # The test modules only matter to a file that names an include macro.
+    test_spans = (
+        _test_module_spans(toks)
+        if any(k == "ident" and w.removeprefix("r#") in INCLUDE_MACROS for k, w in toks)
+        else []
+    )
     for i, tok in enumerate(toks):
         if tok == ("ident", "use"):
             in_use = True
@@ -533,7 +575,7 @@ def _loaders_in(path, toks, lines=(), test_spans=()):
                 else:
                     folders.append(folder)
         elif tok[0] == "ident" and tok[1].removeprefix("r#") in INCLUDE_MACROS:
-            if lines and inside(lines[i], test_spans):
+            if any(first < i < last for first, last in test_spans):
                 continue
             called = (
                 i + 2 < len(toks) and toks[i + 1] == ("punct", "!") and _opens(toks[i + 2])
@@ -606,17 +648,7 @@ def _module_loaders(commit, cwd):
         read.update(paths)
         for path, text in zip(paths, _blobs(commit, paths, cwd)):
             try:
-                lines = []
-                toks = rust_tokens(text, lines)
-                # The test modules only matter to a file that names an
-                # include macro, and finding them costs a second pass.
-                mentions_include = any(
-                    kind == "ident" and word.removeprefix("r#") in INCLUDE_MACROS
-                    for kind, word in toks
-                )
-                more_roots, more_folders, more_names = _loaders_in(
-                    path, toks, lines, cfg_test_ranges(text) if mentions_include else ()
-                )
+                more_roots, more_folders, more_names = _loaders_in(path, rust_tokens(text))
             except LexError:
                 more_roots, more_folders, more_names = [None], [], [None]
             roots += more_roots
