@@ -1,1 +1,0 @@
-fix: In a remote session Cmd/Ctrl+Shift+L selects all occurrences, as it does locally, instead of ending the session; Drop to Local has its own key, Cmd/Ctrl+K L, and a Command Palette entry, Remote: Drop to Local (#2071).

@@ -1,1 +1,0 @@
-fix: Close Others has a key croft receives, Cmd/Ctrl+K Shift+X, shown in the tab menu, the palette and F1; the menu showed ⌥⌘T, which iTerm2 and many Linux desktops keep for themselves, and now shows a key you bind instead (#2072).
