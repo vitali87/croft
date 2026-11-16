@@ -1596,18 +1596,19 @@ pub struct App {
     /// bar paints in every pane, not only the focused one.
     provenance_overlay: bool,
     /// Indentation guides (#129), VS Code `editor.guides.indentation`: on by
-    /// default, pushed to every editor by the per-frame focus sync.
+    /// default, copied to every open tab by `apply_view_prefs`.
     indent_guides_enabled: bool,
     /// Home walks back one wrapped row per press (`home_walks_wrapped_rows`).
     home_walks_rows: bool,
-    /// Bracket-pair colorization (#131): on by default, pushed to every
-    /// editor by the per-frame focus sync like the indent guides.
+    /// Bracket-pair colorization (#131): on by default, copied to every
+    /// open tab by `apply_view_prefs` like the indent guides.
     bracket_colors_enabled: bool,
-    /// Whitespace rendering mode (#133), frame-synced to every editor;
+    /// Whitespace rendering mode (#133), copied to every open tab (under each
+    /// tab's language override) by `apply_view_prefs`;
     /// "selection" by default, the palette command cycles it.
     whitespace_mode: crate::widgets::editor::WhitespaceMode,
-    /// Ruler columns (#1524) from the `rulers` setting, synced onto every
-    /// editor each frame like `whitespace_mode`.
+    /// Ruler columns (#1524) from the `rulers` setting, copied to every open
+    /// tab by `apply_view_prefs` like `whitespace_mode`.
     rulers: Vec<u16>,
     /// Gutter line numbers (#1576): on, relative, interval or off.
     line_numbers: crate::widgets::editor::LineNumbers,
@@ -5437,6 +5438,29 @@ impl App {
         }
     }
 
+    /// Copy the editor view settings onto every open tab, in every group:
+    /// indent guides, bracket-pair colours, rendered whitespace (with each
+    /// tab's language override), the Home walk, rulers and line numbers.
+    /// Each tab draws from its own copy, and nothing copies them again per
+    /// frame, so a settings reload, a toggle and a focus change all come
+    /// through here: one that set only the active tab left the rest, and
+    /// every tab of another group, on the old look (#2075).
+    pub(super) fn apply_view_prefs(&mut self) {
+        let (langs, ws_global) = (&self.language_prefs, self.whitespace_mode);
+        for group in
+            std::iter::once(&mut self.editor).chain(self.editor_layout.inactive_groups_mut())
+        {
+            for ed in &mut group.editors {
+                ed.show_indent_guides = self.indent_guides_enabled;
+                ed.show_bracket_colors = self.bracket_colors_enabled;
+                ed.whitespace_mode = whitespace_mode_in(langs, ws_global, editor_scope_id(ed));
+                ed.home_walks_rows = self.home_walks_rows;
+                ed.rulers.clone_from(&self.rulers);
+                ed.line_numbers = self.line_numbers;
+            }
+        }
+    }
+
     fn sync_focus_flags(&mut self) {
         // Focus must never rest on a COLLAPSED pane (#313). A folded pane is
         // one column wide and is never rendered, so it paints no cursor and no
@@ -5533,20 +5557,13 @@ impl App {
         // when disabled, the editor opens those file types as plain text.
         let pdf_on = self.is_extension_enabled("pdf");
         let csv_on = self.is_extension_enabled("csv");
-        let (langs, ws_global) = (&self.language_prefs, self.whitespace_mode);
         for ed in self.editor.editors.iter_mut() {
             ed.focus_gradient = gradient;
             ed.theme = self.theme;
             ed.pdf_viewer_enabled = pdf_on;
             ed.csv_viewer_enabled = csv_on;
-            ed.show_indent_guides = self.indent_guides_enabled;
-            ed.home_walks_rows = self.home_walks_rows;
-            ed.show_bracket_colors = self.bracket_colors_enabled;
             ed.provenance_overlay = self.provenance_overlay;
-            ed.whitespace_mode = whitespace_mode_in(langs, ws_global, editor_scope_id(ed));
-            ed.line_numbers = self.line_numbers;
             ed.diff_ws_default = self.diff_ws_default;
-            ed.rulers.clone_from(&self.rulers);
         }
         for group in self.editor_layout.inactive_groups_mut() {
             for ed in group.editors.iter_mut() {
@@ -5554,16 +5571,11 @@ impl App {
                 ed.theme = self.theme;
                 ed.pdf_viewer_enabled = pdf_on;
                 ed.csv_viewer_enabled = csv_on;
-                ed.show_indent_guides = self.indent_guides_enabled;
-                ed.home_walks_rows = self.home_walks_rows;
-                ed.show_bracket_colors = self.bracket_colors_enabled;
                 ed.provenance_overlay = self.provenance_overlay;
-                ed.whitespace_mode = whitespace_mode_in(langs, ws_global, editor_scope_id(ed));
-                ed.line_numbers = self.line_numbers;
                 ed.diff_ws_default = self.diff_ws_default;
-                ed.rulers.clone_from(&self.rulers);
             }
         }
+        self.apply_view_prefs();
         self.tree.focus_gradient = gradient;
         self.tree.theme = self.theme;
         self.search.focus_gradient = gradient;
