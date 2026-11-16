@@ -307,6 +307,11 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 handler: "is_editor_find_key",
             },
             ShortcutEntry {
+                keys: "Alt+L",
+                description: "Find in selection: limit the search to the selected lines",
+                handler: "",
+            },
+            ShortcutEntry {
                 keys: "Cmd+Opt+F / Ctrl+Alt+F",
                 description: "Replace in current file (Tab switches field, Enter replaces, Cmd+Opt+Enter all)",
                 handler: "is_editor_replace_key",
@@ -665,6 +670,191 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 keys: "Ctrl+Shift+F12",
                 description: "Go to declaration",
                 handler: "is_go_to_declaration_key",
+            },
+        ],
+    },
+    ShortcutGroup {
+        title: "Editor: more chords",
+        entries: &[
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+K Cmd/Ctrl+L",
+                description: "Toggle the fold at the caret",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+K Cmd/Ctrl+0 / J",
+                description: "Fold all / unfold all",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+K Cmd/Ctrl+1 / 2 / 3 / 4 / 5 / 6 / 7",
+                description: "Fold every region at level 1 to 7",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+K Cmd/Ctrl+/",
+                description: "Fold all block comments",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+K Cmd/Ctrl+8 / 9",
+                description: "Fold / unfold all regions (#region markers)",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+K Cmd/Ctrl+F",
+                description: "Format Selection",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+K F",
+                description: "Toggle format on save",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+K Cmd/Ctrl+M",
+                description: "View Bookmarks: pick one to jump to",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+K Cmd/Ctrl+Q",
+                description: "Go to the last edit location",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+K Cmd/Ctrl+S",
+                description: "Open Keyboard Shortcuts: every command with its chord",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+K Cmd/Ctrl+T",
+                description: "Pick a color theme",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+K Shift+W",
+                description: "Reopen the last closed editor tab",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+K Enter",
+                description: "Run the test under the caret",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+K B",
+                description: "Show the Testing sidebar",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+K Shift+D / U",
+                description: "Show subtypes / supertypes of the symbol at the caret",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+K Shift+F",
+                description: "Open the search results in an editor",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+K Shift+R",
+                description: "Rerun the search in the search editor",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+K Shift+G",
+                description: "Toggle inline suggestions",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+K Shift+L",
+                description: "New worktree lane for an agent",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+K K",
+                description: "Clear the terminal",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+K R",
+                description: "Rename the terminal",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+K [",
+                description: "Collapse the terminal pane",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+K ]",
+                description: "Restore all collapsed terminal panes",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+K A",
+                description: "Session participants",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+K Shift+Q",
+                description: "Detach from the shared session",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+K Q",
+                description: "Ask the Navigator about the line or selection",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+K Y",
+                description: "Yield the turn to the Navigator",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+K X",
+                description: "Cancel the AI stream in a collaborative session",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+P then #",
+                description: "Go to Symbol in Workspace (type # after the Quick Open prompt)",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+Shift+Enter",
+                description: "Insert a line above the current one",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Ctrl+Shift+PageUp / PageDown",
+                description: "Move the editor tab left / right in its group",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Shift+Opt+Cmd/Ctrl+Left / Right / Up / Down / PageUp / PageDown",
+                description: "Column Select with the keyboard (also PageUp / PageDown)",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Shift+Alt+Right / Left",
+                description: "Expand / Shrink Selection to the next syntactic range",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd/Ctrl+K Shift+E",
+                description: "Run the CodeLens on the caret's line",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "F3",
+                description: "Find next in the hex view",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "F4 / Shift+F4",
+                description: "Next / ignore the Navigator comment",
+                handler: "",
             },
         ],
     },
@@ -1112,8 +1302,8 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 handler: "",
             },
             ShortcutEntry {
-                keys: "Alt+C / Alt+W / Alt+R",
-                description: "Toggle match case / whole word / regex from any Search input",
+                keys: "Alt+C / Alt+W / Alt+R / Alt+P",
+                description: "Toggle match case / whole word / regex / preserve case from any Search input",
                 handler: "",
             },
             ShortcutEntry {
@@ -1167,8 +1357,8 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 handler: "",
             },
             ShortcutEntry {
-                keys: "F7 / Shift+F7 in a diff",
-                description: "Jump to the next / previous change hunk",
+                keys: "F7 / Shift+F7",
+                description: "Next / previous change hunk in a diff, or merge conflict in a conflicted file",
                 handler: "",
             },
         ],
@@ -1338,6 +1528,96 @@ pub fn render_shortcuts_modal(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `Cmd/Ctrl` and `Opt/Alt` spellings folded together, modifiers sorted, so
+    /// a palette hint and an F1 row can be compared as chords.
+    fn canonical_chord(chord: &str) -> String {
+        let spelled = chord
+            .to_lowercase()
+            .replace("cmd/ctrl", "cmd")
+            .replace("ctrl/cmd", "cmd")
+            .replace("opt/alt", "alt")
+            .replace("alt/opt", "alt")
+            .replace("\u{2191}", "up")
+            .replace("\u{2193}", "down")
+            .replace("\u{2190}", "left")
+            .replace("\u{2192}", "right")
+            .replace('↑', "up")
+            .replace('↓', "down")
+            .replace('←', "left")
+            .replace('→', "right")
+            .replace(" then ", " ");
+        spelled
+            .split_whitespace()
+            .map(|step| {
+                let mut parts: Vec<String> = step
+                    .split('+')
+                    .map(|p| match p {
+                        "ctrl" | "super" | "control" => "cmd".to_string(),
+                        "opt" | "option" => "alt".to_string(),
+                        other => other.to_string(),
+                    })
+                    .collect();
+                let key = parts.pop().unwrap_or_default();
+                parts.sort();
+                parts.dedup();
+                parts.push(key);
+                parts.join("+")
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// Every chord an F1 row's `keys` spell: `A / B` lists, where `B` borrows
+    /// whatever of `A`'s modifiers and leading steps it leaves out.
+    fn chords_of(keys: &str) -> Vec<String> {
+        let mut alts = keys.split(" / ");
+        let Some(base) = alts.next() else {
+            return Vec::new();
+        };
+        let base_steps: Vec<&str> = base.split(' ').collect();
+        let base_last = base_steps.last().copied().unwrap_or("");
+        let base_mods = base_last.rfind('+').map_or("", |i| &base_last[..=i]);
+        let mut out = vec![canonical_chord(base)];
+        for alt in alts {
+            let mut steps: Vec<String> = alt.split(' ').map(str::to_string).collect();
+            if let Some(last) = steps.last_mut()
+                && !last.contains('+')
+            {
+                *last = format!("{base_mods}{last}");
+            }
+            let lead = base_steps.len().saturating_sub(steps.len());
+            let mut all: Vec<String> = base_steps[..lead].iter().map(|s| s.to_string()).collect();
+            all.extend(steps);
+            out.push(canonical_chord(&all.join(" ")));
+        }
+        out
+    }
+
+    /// Every default chord the command palette shows for a command is on the
+    /// F1 shortcuts panel, so no binding is left for the user to discover by
+    /// accident. Hints that are context rather than a chord ("S in diff") are
+    /// matched by the row's own prose.
+    #[test]
+    fn every_palette_keybinding_hint_is_listed_in_the_shortcuts_panel() {
+        let listed: std::collections::HashSet<String> = SHORTCUT_GROUPS
+            .iter()
+            .flat_map(|g| g.entries.iter())
+            .flat_map(|e| chords_of(e.keys))
+            .collect();
+        let missing: Vec<String> = crate::widgets::command_palette::ALL_COMMANDS
+            .iter()
+            .map(|c| (c, c.keybinding_hint()))
+            .filter(|(_, h)| !h.is_empty() && !h.contains(" in "))
+            .filter(|(_, h)| !chords_of(h).iter().any(|c| listed.contains(c)))
+            .map(|(c, h)| format!("{c:?}: {h}"))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "these palette key hints are not on the F1 panel (add a ShortcutEntry):\n  {}",
+            missing.join("\n  ")
+        );
+    }
 
     #[test]
     fn shortcut_groups_cover_every_pane_the_user_can_focus() {
