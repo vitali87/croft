@@ -1,0 +1,1 @@
+fix: The F1 shortcut sheet names keys that work: Cmd/Ctrl+Shift+Enter opens a line above (Cmd/Ctrl+Shift+O is Go to Symbol), and Go to / Select to Bracket are Cmd+Shift+\ and Cmd+Opt+\, with no Ctrl form on Linux (#2087, #2111).
