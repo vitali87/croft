@@ -216,6 +216,7 @@ src/
 │   │   ├── symbols.rs           document outline, workspace symbol search
 │   │   ├── tests.rs             the language-server manager's own tests
 │   │   ├── text_ranges.rs       symbol occurrences, linked editing ranges, selection ranges
+│   │   ├── worker.rs            the worker loop that routes each command to the servers
 │   ├── manifest.rs           declarative `extension.toml` loader for the extension system: parses a manifest's `[[languages]]`, `[[language_servers]]`, `[[themes]]`, `[[debug_adapters]]`, `[[test_runners]]`, `[[mcp_servers]]`, `[[commands]]` and `[[viewers]]` blocks
 │   ├── registry.rs      ServerRegistry (language -> ordered servers); built from the bundled manifests in assets/extensions/* plus user-installed extensions, instead of hardcoding configs
 │   ├── runtime.rs       Tokio runtime owned by the LSP manager
