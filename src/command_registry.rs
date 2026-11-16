@@ -2494,6 +2494,17 @@ commands! {
         title: "Preferences: Open Workspace Settings — Local (JSON)",
         hint: "",
     }
+    /// The user's own short menu (`menu.json`) as a drop-down over the editor.
+    OpenUserMenu {
+        id: "open_user_menu",
+        title: "User Menu: Open",
+        hint: "Cmd+K Shift+N",
+    }
+    OpenUserMenuJson {
+        id: "open_user_menu_json",
+        title: "Preferences: Open User Menu (JSON)",
+        hint: "",
+    }
     OpenKeybindingsJson {
         id: "open_keybindings_json",
         title: "Preferences: Open Keyboard Shortcuts (JSON)",

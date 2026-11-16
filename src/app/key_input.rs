@@ -173,6 +173,12 @@ impl App {
                 self.run_code_lens_at_cursor();
                 true
             }
+            // Cmd+K Shift+N: the user's menu (menu.json). Must precede any
+            // plain N arm, which matches either case.
+            KeyCode::Char(c) if shifted && plain && !cmd_held && c.eq_ignore_ascii_case(&'n') => {
+                self.open_user_menu();
+                true
+            }
             // Cmd+K Shift+U / Shift+D: supertypes ("up") and subtypes
             // ("down") of the type at the caret (#613). Case-insensitive for
             // CSI-u hosts; must precede the plain U and D arms below.

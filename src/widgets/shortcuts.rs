@@ -122,6 +122,11 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 handler: "",
             },
             ShortcutEntry {
+                keys: "Cmd/Ctrl+K Shift+N",
+                description: "User Menu: your own commands from menu.json",
+                handler: "",
+            },
+            ShortcutEntry {
                 keys: "Cmd/Ctrl+K F",
                 description: "Toggle Format on Save",
                 handler: "",
