@@ -95,6 +95,22 @@ class Ranges(unittest.TestCase):
         text = "/*\n#[cfg(test)]\n*/\nmod helper;\nfn main() {}\n"
         self.assertEqual(filt.cfg_test_ranges(text), [])
 
+    def test_a_comment_line_that_ends_in_code_yields_no_ranges(self):
+        """#2217 review: `/* comment */ }` closes the module after its
+        comment; a reading that skips the line as a comment never counts the
+        brace, and the span runs on over shipped code."""
+        text = (
+            "mod outer {\n    #[cfg(test)]\n    mod tests {\n    /* comment */ }\n"
+            '    pub const SRC: &str = include_str!("helper.rs");\n}\n'
+        )
+        self.assertEqual(filt.cfg_test_ranges(text), [])
+
+    def test_lines_are_counted_as_git_counts_them(self):
+        """A U+2028 inside a string is one character to Rust and git, not a
+        line break, so the span after it keeps git's line numbers."""
+        text = 'const S: &str = "a\u2028b";\n#[cfg(test)]\nmod tests {\n    fn t() {}\n}\n'
+        self.assertEqual(filt.cfg_test_ranges(text), [(2, 5)])
+
     def test_a_file_with_no_tests_has_no_ranges(self):
         self.assertEqual(filt.cfg_test_ranges("fn f() {}\n"), [])
 
@@ -848,6 +864,39 @@ class TestOnlyModules(unittest.TestCase):
                     "src/main.rs": (
                         'mod helper;\n#[path = "production.inc"]\nmod production;\nfn main() {}\n'
                     ),
+                    "src/helper.rs": body.format("true"),
+                },
+            )
+            self.change(repo, {"src/helper.rs": body.format("false")})
+            self.assertFalse(repo.verdict("src/helper.rs"))
+
+    def test_an_include_after_a_comment_that_closes_a_test_module_ships(self):
+        """#2217 review: the `include_str!` sits outside the test module,
+        whose closing brace follows a comment on the same line."""
+        self.assertFalse(
+            self.shipped_by(
+                {
+                    "src/main.rs": (
+                        "mod outer {\n    #[cfg(test)]\n    mod tests {\n    /* comment */ }\n"
+                        '    pub const SRC: &str = include_str!("helper.rs");\n}\n'
+                        "#[cfg(test)]\nmod helper;\nfn main() {}\n"
+                    )
+                }
+            )
+        )
+
+    def test_an_edit_inside_the_tests_of_a_file_an_escaped_path_module_can_embed_ships(self):
+        """#2217 review: `"product\\x69on.inc"` is `production.inc` to Rust,
+        a module this never reads, which can embed any file."""
+        with tempfile.TemporaryDirectory() as tmp:
+            body = "pub fn f() -> u8 {{\n    1\n}}\n\n#[cfg(test)]\nmod tests {{\n    #[test]\n    fn t() {{\n        assert!({});\n    }}\n}}\n"
+            repo = self.repo(
+                tmp,
+                {
+                    "src/main.rs": (
+                        'mod helper;\n#[path = "product\\x69on.inc"]\nmod production;\nfn main() {}\n'
+                    ),
+                    "src/production.inc": 'pub const SRC: &str = include_str!("helper.rs");\n',
                     "src/helper.rs": body.format("true"),
                 },
             )

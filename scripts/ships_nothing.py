@@ -74,6 +74,20 @@ def git(*args, cwd=None, allow_missing_path=False):
 # Matched against a line's code, so a trailing `// comment` does not hide it.
 MOD_DECLARATION = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+[A-Za-z_]\w*\s*;\s*$")
 
+def source_lines(text):
+    """`text`'s lines as git and rustc count them: split at `\\n` only.
+
+    `str.splitlines` also breaks at U+2028, U+2029, form feeds and a few
+    more, which Rust reads as ordinary characters. A string literal holding
+    one (croft's SARIF reader tests U+2028 as a newline sequence) shifted
+    every later line by one against the diff's line numbers.
+    """
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    return [line.removesuffix("\r") for line in lines]
+
+
 def literal_lines(text):
     """Line numbers (1-indexed) that sit INSIDE a multi-line string literal.
 
@@ -83,7 +97,7 @@ def literal_lines(text):
     binary does. `BlockTracker` already tracks the open-literal state for its
     brace counting, so this reads it rather than re-deriving it.
     """
-    lines = text.splitlines()
+    lines = source_lines(text)
     kinds = classify(lines)
     tracker = BlockTracker()
     inside = set()
@@ -112,10 +126,21 @@ def cfg_test_ranges(text):
     (`"src/**/*.rs"`) opens no comment, and a comment right after a string
     (`"x" /* { */`) still does.
     """
-    lines = text.splitlines()
+    lines = source_lines(text)
     kinds = classify(lines)
     stripper = BlockTracker()
     if any(kinds[i] == CODE and "/*" in stripper.feed(l) for i, l in enumerate(lines)):
+        return []
+    # A line `classify` reads as a comment can still hold code: `/* x */ }`
+    # closes a module after its comment, and that brace is never counted.
+    # The token reader sets comments aside exactly, so any token it finds on
+    # such a line is code this reading would miss.
+    token_lines = []
+    try:
+        rust_tokens(text, token_lines)
+    except LexError:
+        return []
+    if any(kinds[n - 1] in (SKIP, DOC) for n in set(token_lines)):
         return []
     tracker = BlockTracker()
     ranges = []
@@ -606,12 +631,16 @@ def _module_loaders(commit, cwd):
         roots += [None for _ in missing]
         names += [None for _ in missing]
         paths = sorted(r for r in loaded if r in tree)
+    unknown_load = None in roots or None in folders
     return (
         frozenset(r for r in roots if r is not None),
         tuple(f for f in folders if f is not None),
         frozenset(n for n in names if n is not None),
-        None in roots or None in folders,
-        None in names,
+        unknown_load,
+        # A module this could not pin down, or one a `#[path]` loads from a
+        # folder without naming the file, is never read: it can embed any
+        # file.
+        None in names or unknown_load or bool(folders),
     )
 
 
@@ -742,8 +771,8 @@ def ships_nothing(base, head, path, cwd=None):
         return bool(base_text) and bool(head_text)
     base_ranges = cfg_test_ranges(base_text)
     head_ranges = cfg_test_ranges(head_text)
-    base_lines = base_text.splitlines()
-    head_lines = head_text.splitlines()
+    base_lines = source_lines(base_text)
+    head_lines = source_lines(head_text)
 
     base_literals = literal_lines(base_text)
     head_literals = literal_lines(head_text)
