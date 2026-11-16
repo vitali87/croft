@@ -1027,6 +1027,8 @@ The async-lsp client wrapper. Its router forwards diagnostics and work-done prog
 
 **Server stderr keeps its severity.** stderr lines land in OUTPUT at the severity of their tracing level token (`stderr_level`), not a blanket info.
 
+**async-lsp is built from `vendor/async-lsp`.** It is the 0.2.4 release with one change, described in that folder's `PATCHED.md` and wired in through `[patch.crates-io]`: a message from a server is parsed once. Published, every reply went through serde's `flatten` over an `untagged` enum, which buffers the whole message into a tree, copies it, and builds a `Value` from the copy, before the waiting request converts it into its own type; the semantic tokens of a 2 MB file briefly took ~90 MB that way. Now a response's result stays the JSON text it arrived as until the request decodes it straight into its type. The remote source sync ships `vendor/` with the rest of the build inputs, and CI runs the vendored crate's tests, which pin the patched decode.
+
 ### command_history.rs
 
 Durable cross-session shell command history, the atuin model embedded in the editor. Every command a shell-integrated pane finishes is appended as one JSONL line under `~/.config/croft/command_history.jsonl` with cwd, exit, duration and timestamp.
