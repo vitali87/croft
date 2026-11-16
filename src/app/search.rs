@@ -708,7 +708,9 @@ impl App {
             .unwrap_or_else(|| std::sync::Arc::new(Vec::new()));
         let entries = self.without_project_excludes(entries);
         let count = entries.len();
-        self.file_finder = Some(crate::widgets::file_finder::FileFinder::new(entries));
+        let mut finder = crate::widgets::file_finder::FileFinder::new(entries);
+        finder.set_open_lines(self.open_text_line_counts());
+        self.file_finder = Some(finder);
         self.overlays.file_finder_clear.request();
         self.status = format!("Go to File: {count} files indexed — Esc to close");
     }

@@ -2825,3 +2825,64 @@ fn the_editor_caret_is_hidden_while_a_list_picker_is_open() {
         "and returns with the picker closed"
     );
 }
+
+/// #2127 review: Quick Open's `:line` filter counts the buffer a pick would
+/// open, as it is now. A buffer that grows while Quick Open is up (a reload
+/// from disk, an agent's edit) is recounted on the next tick. With the
+/// editor split, the active group's copy is what counts: a pick opens
+/// there, and groups share no buffers.
+#[test]
+fn quick_open_line_hint_counts_the_buffer_a_pick_opens_as_it_is_now() {
+    let tmp = tempfile::tempdir().unwrap();
+    let numbered = |n: usize| -> Vec<String> { (1..=n).map(|i| format!("line {i}")).collect() };
+    for (rel, n) in [("web/a.ts", 50), ("api/a.ts", 400)] {
+        let path = tmp.path().join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, numbered(n).join("\n") + "\n").unwrap();
+    }
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor
+        .open_preview(&tmp.path().join("web/a.ts"))
+        .unwrap();
+    let listed = |app: &mut App| -> Vec<String> {
+        let finder = app.file_finder.as_mut().expect("Quick Open is open");
+        finder.finish_line_check();
+        let mut rels: Vec<String> = finder
+            .visible_results()
+            .iter()
+            .map(|r| r.entry.rel.clone())
+            .collect();
+        rels.sort_unstable();
+        rels
+    };
+    let quick_open = |app: &mut App| {
+        app.handle_key(key(KeyCode::Char('p'), KeyModifiers::SUPER))
+            .unwrap();
+        type_keys(app, "a.ts:318");
+    };
+
+    quick_open(&mut app);
+    assert_eq!(listed(&mut app), ["api/a.ts"], "the open web/a.ts is short");
+    app.editor.replace_all_lines(numbered(400));
+    assert!(
+        app.sync_file_finder_open_lines(),
+        "the grown buffer is recounted"
+    );
+    assert_eq!(listed(&mut app), ["api/a.ts", "web/a.ts"]);
+    assert!(!app.sync_file_finder_open_lines(), "nothing changed since");
+
+    // The new active group opens web/a.ts afresh, with its 50 saved lines;
+    // the grown buffer stays in the other group, where a pick does not go.
+    app.close_file_finder();
+    app.split_editor();
+    assert!(
+        app.editor.lines.len() < 318,
+        "the split opened the saved file"
+    );
+    quick_open(&mut app);
+    assert_eq!(
+        listed(&mut app),
+        ["api/a.ts"],
+        "a pick opens the active group's short copy"
+    );
+}
