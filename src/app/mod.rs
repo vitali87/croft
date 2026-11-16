@@ -1596,18 +1596,19 @@ pub struct App {
     /// bar paints in every pane, not only the focused one.
     provenance_overlay: bool,
     /// Indentation guides (#129), VS Code `editor.guides.indentation`: on by
-    /// default, pushed to every editor by the per-frame focus sync.
+    /// default, copied to every open tab by `apply_view_prefs`.
     indent_guides_enabled: bool,
     /// Home walks back one wrapped row per press (`home_walks_wrapped_rows`).
     home_walks_rows: bool,
-    /// Bracket-pair colorization (#131): on by default, pushed to every
-    /// editor by the per-frame focus sync like the indent guides.
+    /// Bracket-pair colorization (#131): on by default, copied to every
+    /// open tab by `apply_view_prefs` like the indent guides.
     bracket_colors_enabled: bool,
-    /// Whitespace rendering mode (#133), frame-synced to every editor;
+    /// Whitespace rendering mode (#133), copied to every open tab (under each
+    /// tab's language override) by `apply_view_prefs`;
     /// "selection" by default, the palette command cycles it.
     whitespace_mode: crate::widgets::editor::WhitespaceMode,
-    /// Ruler columns (#1524) from the `rulers` setting, synced onto every
-    /// editor each frame like `whitespace_mode`.
+    /// Ruler columns (#1524) from the `rulers` setting, copied to every open
+    /// tab by `apply_view_prefs` like `whitespace_mode`.
     rulers: Vec<u16>,
     /// Gutter line numbers (#1576): on, relative, interval or off.
     line_numbers: crate::widgets::editor::LineNumbers,
@@ -5326,6 +5327,36 @@ impl App {
         crate::dap::configs::workspace_folders(self.roots.iter())
     }
 
+    /// The lines of every text buffer open in the active group, by path
+    /// (#2127): a Quick Open `:line` query counts these, since a pick opens
+    /// into the active group and reuses its tab for the file, unsaved edits
+    /// and all. Groups share no buffers, so a file open only in another
+    /// group opens from disk, and its saved file is what counts.
+    fn open_text_line_counts(&self) -> std::collections::HashMap<PathBuf, usize> {
+        self.editor
+            .editors
+            .iter()
+            .filter(|e| !e.has_non_text_view())
+            .filter_map(|e| Some((e.path.clone()?, e.lines.len())))
+            .collect()
+    }
+
+    /// Keep an open Quick Open's buffer line counts current (#2127). A
+    /// buffer can change while Quick Open is up (the file watcher reloads
+    /// it, an agent or a collab peer edits it), and a `:line` query must
+    /// count it as a pick would open it now. Cheap: one entry per tab of the
+    /// active group, and the check reruns only when a count changed. True
+    /// when the list changed.
+    pub(super) fn sync_file_finder_open_lines(&mut self) -> bool {
+        if self.file_finder.is_none() {
+            return false;
+        }
+        let open = self.open_text_line_counts();
+        self.file_finder
+            .as_mut()
+            .is_some_and(|f| f.set_open_lines(open))
+    }
+
     /// Every open buffer's path, across the active leaf and every inactive
     /// one. `App::editor` is the hoisted active leaf and `inactive_leaf_tabs`
     /// walks the rest, so together they cover each leaf exactly once.
@@ -5437,6 +5468,29 @@ impl App {
         }
     }
 
+    /// Copy the editor view settings onto every open tab, in every group:
+    /// indent guides, bracket-pair colours, rendered whitespace (with each
+    /// tab's language override), the Home walk, rulers and line numbers.
+    /// Each tab draws from its own copy, and nothing copies them again per
+    /// frame, so a settings reload, a toggle and a focus change all come
+    /// through here: one that set only the active tab left the rest, and
+    /// every tab of another group, on the old look (#2075).
+    pub(super) fn apply_view_prefs(&mut self) {
+        let (langs, ws_global) = (&self.language_prefs, self.whitespace_mode);
+        for group in
+            std::iter::once(&mut self.editor).chain(self.editor_layout.inactive_groups_mut())
+        {
+            for ed in &mut group.editors {
+                ed.show_indent_guides = self.indent_guides_enabled;
+                ed.show_bracket_colors = self.bracket_colors_enabled;
+                ed.whitespace_mode = whitespace_mode_in(langs, ws_global, editor_scope_id(ed));
+                ed.home_walks_rows = self.home_walks_rows;
+                ed.rulers.clone_from(&self.rulers);
+                ed.line_numbers = self.line_numbers;
+            }
+        }
+    }
+
     fn sync_focus_flags(&mut self) {
         // Focus must never rest on a COLLAPSED pane (#313). A folded pane is
         // one column wide and is never rendered, so it paints no cursor and no
@@ -5533,20 +5587,13 @@ impl App {
         // when disabled, the editor opens those file types as plain text.
         let pdf_on = self.is_extension_enabled("pdf");
         let csv_on = self.is_extension_enabled("csv");
-        let (langs, ws_global) = (&self.language_prefs, self.whitespace_mode);
         for ed in self.editor.editors.iter_mut() {
             ed.focus_gradient = gradient;
             ed.theme = self.theme;
             ed.pdf_viewer_enabled = pdf_on;
             ed.csv_viewer_enabled = csv_on;
-            ed.show_indent_guides = self.indent_guides_enabled;
-            ed.home_walks_rows = self.home_walks_rows;
-            ed.show_bracket_colors = self.bracket_colors_enabled;
             ed.provenance_overlay = self.provenance_overlay;
-            ed.whitespace_mode = whitespace_mode_in(langs, ws_global, editor_scope_id(ed));
-            ed.line_numbers = self.line_numbers;
             ed.diff_ws_default = self.diff_ws_default;
-            ed.rulers.clone_from(&self.rulers);
         }
         for group in self.editor_layout.inactive_groups_mut() {
             for ed in group.editors.iter_mut() {
@@ -5554,16 +5601,11 @@ impl App {
                 ed.theme = self.theme;
                 ed.pdf_viewer_enabled = pdf_on;
                 ed.csv_viewer_enabled = csv_on;
-                ed.show_indent_guides = self.indent_guides_enabled;
-                ed.home_walks_rows = self.home_walks_rows;
-                ed.show_bracket_colors = self.bracket_colors_enabled;
                 ed.provenance_overlay = self.provenance_overlay;
-                ed.whitespace_mode = whitespace_mode_in(langs, ws_global, editor_scope_id(ed));
-                ed.line_numbers = self.line_numbers;
                 ed.diff_ws_default = self.diff_ws_default;
-                ed.rulers.clone_from(&self.rulers);
             }
         }
+        self.apply_view_prefs();
         self.tree.focus_gradient = gradient;
         self.tree.theme = self.theme;
         self.search.focus_gradient = gradient;
@@ -6587,6 +6629,11 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let log_index_changed = app.poll_log_index();
         let remote_changed = app.refresh_remote_if_config_changed();
         let pulls_changed = app.drain_remote_pulls() | app.drain_relay_copies();
+        let finder_changed = app.sync_file_finder_open_lines()
+            | app
+                .file_finder
+                .as_mut()
+                .is_some_and(|f| f.poll_line_check());
         let view_changed = app.drain_view_requests();
         let hook_changed = app.drain_hook_requests()
             | app.poll_pr_gh()
@@ -6774,6 +6821,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || log_index_changed
             || remote_changed
             || pulls_changed
+            || finder_changed
             || view_changed
             || hook_changed
             || kernel_changed

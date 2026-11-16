@@ -1,0 +1,2 @@
+fix: Quick Open with `name:line` lists only the files long enough to have that line, counting lines as the editor does and an open file as it stands, unsaved edits included; when none has it, every match is listed, longest first, with a note that the line is out of reach. The check runs in the background, so a slow or stalled disk never holds up typing (#2127).
+fix: Quick Open keeps the row picked when a file is made or removed in the workspace while it is open, so Enter opens the file chosen rather than one a new file pushed into its place (#2127).

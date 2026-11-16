@@ -31,6 +31,19 @@ pub(super) fn header_query_for_status(query: &str) -> String {
 }
 
 impl App {
+    /// The unsaved editor buffers a workspace search reads in place of
+    /// their files on disk. A scratch tab (a Search Editor, the git output)
+    /// is no file and is left out: a rerun leaves a Search Editor edited,
+    /// and its own results turned up as hits under its `Search: …` label
+    /// (#2074 review).
+    pub(super) fn unsaved_buffers_for_search(&self) -> Vec<(PathBuf, String)> {
+        self.editor
+            .iter_tabs()
+            .filter(|t| t.dirty && !t.scratch)
+            .filter_map(|t| t.path.clone().map(|p| (p, t.lines.join("\n"))))
+            .collect()
+    }
+
     /// Push the current search query string and toggle state onto the
     /// worker channel and keep the editor's match highlight synced to the
     /// same term so the active file lights up matches as the user types.
@@ -46,12 +59,7 @@ impl App {
         // content (and skips the stale disk copy). This is what makes an
         // unsaved edit — e.g. a Rename Symbol — findable before save, matching
         // VS Code / Zed. Sent before the query so the next scan sees it.
-        let dirty: Vec<(PathBuf, String)> = self
-            .editor
-            .iter_tabs()
-            .filter(|t| t.dirty)
-            .filter_map(|t| t.path.clone().map(|p| (p, t.lines.join("\n"))))
-            .collect();
+        let dirty = self.unsaved_buffers_for_search();
         let _ = self
             .search_query_tx
             .send(SearchRequest::SetDirtyBuffers(dirty));
@@ -700,7 +708,9 @@ impl App {
             .unwrap_or_else(|| std::sync::Arc::new(Vec::new()));
         let entries = self.without_project_excludes(entries);
         let count = entries.len();
-        self.file_finder = Some(crate::widgets::file_finder::FileFinder::new(entries));
+        let mut finder = crate::widgets::file_finder::FileFinder::new(entries);
+        finder.set_open_lines(self.open_text_line_counts());
+        self.file_finder = Some(finder);
         self.overlays.file_finder_clear.request();
         self.status = format!("Go to File: {count} files indexed — Esc to close");
     }
@@ -2007,9 +2017,12 @@ impl App {
         let text = crate::search_editor::render(&header, &hits, &self.tree.root);
         let lines: Vec<String> = text.lines().map(str::to_string).collect();
         let mut landed = false;
+        // A whole-buffer replacement like Replace All (#2074): one undo step,
+        // the old selection and extra carets dropped (left on rows the new
+        // results no longer have, they crashed the next frame), and the
+        // tab's layout and highlights rebuilt for the new text.
         self.for_each_tab_of(&label, |tab| {
-            tab.lines = lines.clone();
-            tab.cursor_row = tab.cursor_row.min(tab.lines.len().saturating_sub(1));
+            tab.replace_all_lines(lines.clone());
             tab.cursor_col = 0;
             landed = true;
         });

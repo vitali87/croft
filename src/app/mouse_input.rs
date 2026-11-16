@@ -3121,7 +3121,7 @@ impl App {
                             };
                             let was_here = pr == r && pc == c;
                             if !was_here && view.commit_edit().is_some() {
-                                self.editor.dirty = true;
+                                self.editor.mark_dirty();
                             }
                             let view = self.editor.sheet.as_mut().expect("checked");
                             let data = &mut view.sheets[current];

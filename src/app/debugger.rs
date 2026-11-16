@@ -1922,7 +1922,9 @@ impl App {
     }
 
     /// File names of the editors with unsaved edits, deduped, the active
-    /// tab first: what [`Self::launch_with_unsaved_saved`] warns about.
+    /// tab first: what [`Self::launch_with_unsaved_saved`] warns about. A
+    /// scratch tab (a Search Editor, the git output) is no file a run reads,
+    /// so it is never named (#2074 review).
     pub(super) fn unsaved_editor_names(&self) -> Vec<String> {
         let mut seen: Vec<&std::path::Path> = Vec::new();
         let mut names = Vec::new();
@@ -1931,7 +1933,7 @@ impl App {
         let tabs = active
             .into_iter()
             .chain(groups.flat_map(|g| g.editors.iter()));
-        for ed in tabs.filter(|e| e.dirty) {
+        for ed in tabs.filter(|e| e.dirty && !e.scratch) {
             let Some(path) = ed.path.as_deref() else {
                 continue;
             };
