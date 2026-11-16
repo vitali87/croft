@@ -207,6 +207,7 @@ src/
 │   │   ├── discovery.rs         a file's language and project root, server config, finding the executable, rustup
 │   │   ├── hover.rs             hover, rust-analyzer's own requests
 │   │   ├── navigation.rs        definition, declaration, type definition, implementation, references, hierarchies
+│   │   ├── rename.rs            rename, prepare rename, file renames
 │   │   ├── semantic_tokens.rs   semantic tokens, whole and by range, the server's legend
 │   │   ├── symbols.rs           document outline, workspace symbol search
 │   │   ├── tests.rs             the language-server manager's own tests
