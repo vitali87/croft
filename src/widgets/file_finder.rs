@@ -94,6 +94,9 @@ pub struct FileFinder {
     open_lines: HashMap<PathBuf, usize>,
     /// The `:line` check counting off the UI thread, if one is running.
     line_check: Option<LineCheck>,
+    /// The files the last `:line` query ranked for its check, so an open
+    /// buffer's change reruns the check only when it is one of them.
+    line_candidates: Vec<PathBuf>,
     /// Bumped by every check started, so an older query's answer is never
     /// applied to a newer one.
     line_check_generation: u64,
@@ -102,14 +105,13 @@ pub struct FileFinder {
 }
 
 /// A `:line` check running on its own thread (#2127): the matches it is
-/// checking, best first, and where its answer comes back.
+/// checking, best first. Its answer comes back on the worker's channel.
 struct LineCheck {
     generation: u64,
     needed: usize,
     candidates: Vec<ScoredResult>,
     /// More files matched than the ranking kept.
     more_matched: bool,
-    rx: std::sync::mpsc::Receiver<LineCheckDone>,
 }
 
 /// What a `:line` check found.
@@ -117,7 +119,8 @@ struct LineCheckDone {
     generation: u64,
     /// The lines of each candidate checked, in rank order, counted no
     /// further than the line asked for; `None` for one it could not tell.
-    /// Shorter than the candidates when the check stopped early.
+    /// Shorter than the candidates when the check stopped early: a page of
+    /// them reached the line, or a newer query replaced it.
     lines: Vec<Option<usize>>,
     /// Counts read from disk, for the cache.
     counted: Vec<(PathBuf, LineCount)>,
@@ -136,7 +139,6 @@ struct LineBatch {
     generation: u64,
     jobs: Vec<LineJob>,
     needed: usize,
-    tx: std::sync::mpsc::Sender<LineCheckDone>,
 }
 
 /// What the finder and its worker thread share: the one query waiting to be
@@ -150,10 +152,14 @@ struct WorkerSlot {
 /// The one thread a Quick Open counts lines on (#2127). It holds at most one
 /// query waiting, and a newer query replaces it: a file on a stalled network
 /// mount blocks this thread alone, and keystrokes typed meanwhile leave one
-/// query to check when it is free, not a thread each. Dropped with the
-/// finder, it tells the thread to stop once the read it is in returns.
+/// query to check when it is free, not a thread each. A check a newer query
+/// replaced stops at the next file, as does one whose finder has gone, so
+/// the thread ends once the file it is reading is done. Every check answers
+/// on one channel, kept for the finder's life, so even a check cut short
+/// fills the cache, and the next one starts from what it read.
 struct LineWorker {
     shared: Arc<(Mutex<WorkerSlot>, std::sync::Condvar)>,
+    answers: std::sync::mpsc::Receiver<LineCheckDone>,
 }
 
 impl LineWorker {
@@ -162,11 +168,12 @@ impl LineWorker {
     fn start() -> Option<Self> {
         let shared = Arc::new((Mutex::new(WorkerSlot::default()), std::sync::Condvar::new()));
         let theirs = Arc::clone(&shared);
+        let (tx, answers) = std::sync::mpsc::channel();
         std::thread::Builder::new()
             .name(String::from("quick-open-lines"))
-            .spawn(move || run_line_worker(&theirs))
+            .spawn(move || run_line_worker(&theirs, &tx))
             .ok()?;
-        Some(Self { shared })
+        Some(Self { shared, answers })
     }
 
     /// Queue `batch`, in place of any query still waiting.
@@ -188,9 +195,17 @@ impl Drop for LineWorker {
 }
 
 /// The worker thread: check each query handed over, newest first, until the
-/// finder goes.
-fn run_line_worker(shared: &(Mutex<WorkerSlot>, std::sync::Condvar)) {
+/// finder goes. A check stops early once a newer query waits or the finder
+/// has gone, and answers with what it counted so far.
+fn run_line_worker(
+    shared: &(Mutex<WorkerSlot>, std::sync::Condvar),
+    answers: &std::sync::mpsc::Sender<LineCheckDone>,
+) {
     let (slot, wake) = shared;
+    let replaced = || {
+        let slot = slot.lock().unwrap_or_else(|e| e.into_inner());
+        slot.closed || slot.next.is_some()
+    };
     loop {
         let batch = {
             let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
@@ -204,12 +219,15 @@ fn run_line_worker(shared: &(Mutex<WorkerSlot>, std::sync::Condvar)) {
                 slot = wake.wait(slot).unwrap_or_else(|e| e.into_inner());
             }
         };
-        let (lines, counted) = check_lines(batch.jobs, batch.needed);
-        let _ = batch.tx.send(LineCheckDone {
+        let (lines, counted) = check_lines(batch.jobs, batch.needed, &replaced);
+        let sent = answers.send(LineCheckDone {
             generation: batch.generation,
             lines,
             counted,
         });
+        if sent.is_err() {
+            return;
+        }
     }
 }
 
@@ -240,6 +258,7 @@ impl FileFinder {
             line_counts: HashMap::new(),
             open_lines: HashMap::new(),
             line_check: None,
+            line_candidates: Vec::new(),
             line_check_generation: 0,
             line_worker: None,
         };
@@ -251,16 +270,19 @@ impl FileFinder {
     /// `:line` query to count instead of the saved file. The app hands these
     /// over on every tick while Quick Open is up, since a buffer can change
     /// behind it: a reload from disk, an agent's or a collab peer's edit.
-    /// Only a change reruns the check, and the row picked stays picked if
-    /// it is still listed. True when the list changed.
+    /// Only a change to a file the `:line` query ranked reruns the check:
+    /// an edit to any other (an agent writing elsewhere) changes nothing it
+    /// lists, so a stream of them cannot keep restarting it. The row picked
+    /// stays picked if it is still listed. True when the list changed.
     pub fn set_open_lines(&mut self, open: HashMap<PathBuf, usize>) -> bool {
         if open == self.open_lines {
             return false;
         }
-        self.open_lines = open;
+        let before = std::mem::replace(&mut self.open_lines, open);
         self.line_counts
             .retain(|path, _| !self.open_lines.contains_key(path));
-        if self.line_hint().is_none() {
+        let changed = |path: &PathBuf| before.get(path) != self.open_lines.get(path);
+        if self.line_hint().is_none() || !self.line_candidates.iter().any(changed) {
             return false;
         }
         self.rerun_keeping_the_pick();
@@ -296,26 +318,55 @@ impl FileFinder {
         self.scroll = self.scroll.min(self.selected);
     }
 
-    /// Apply a `:line` check's answer if it has come. True when the list
+    /// Apply the `:line` checks' answers that have come. True when the list
     /// changed, so the frame is redrawn.
     pub fn poll_line_check(&mut self) -> bool {
-        let done = match self.line_check.as_ref().map(|c| c.rx.try_recv()) {
-            Some(Ok(done)) => done,
-            Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) => {
-                self.line_check = None;
-                return false;
+        let mut changed = false;
+        while let Some(worker) = self.line_worker.as_ref() {
+            match worker.answers.try_recv() {
+                Ok(done) => changed |= self.apply_line_check(done),
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                // The thread is gone: the matches stay listed unchecked,
+                // and the next `:line` query starts another.
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.line_worker = None;
+                    self.line_check = None;
+                    break;
+                }
             }
-            _ => return false,
-        };
-        self.apply_line_check(done);
-        true
+        }
+        changed
+    }
+
+    /// Apply answers as they come, for up to `wait`, until the running
+    /// check's own lands.
+    fn await_line_check(&mut self, wait: std::time::Duration) {
+        let deadline = std::time::Instant::now() + wait;
+        while self.line_check.is_some() {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            let Some(done) = self
+                .line_worker
+                .as_ref()
+                .and_then(|w| w.answers.recv_timeout(left).ok())
+            else {
+                return;
+            };
+            self.apply_line_check(done);
+        }
     }
 
     /// Wait for the running `:line` check's answer and apply it, for a test
     /// that asserts what the check decides.
     #[cfg(test)]
     pub(crate) fn finish_line_check(&mut self) {
-        if let Some(done) = self.line_check.as_ref().and_then(|c| c.rx.recv().ok()) {
+        while self.line_check.is_some() {
+            let Some(done) = self
+                .line_worker
+                .as_ref()
+                .and_then(|w| w.answers.recv().ok())
+            else {
+                return;
+            };
             self.apply_line_check(done);
         }
     }
@@ -459,8 +510,10 @@ impl FileFinder {
         // match nothing at all (#472).
         let (file_part, hint) = split_line_hint(&self.query);
         self.notice = None;
-        // A check still running answers the query before this one.
+        // A check still running answers the query before this one: its
+        // answer, when it comes, only fills the cache.
         self.line_check = None;
+        self.line_candidates.clear();
         let mut needle: String = file_part.trim().to_lowercase();
         // A hint with no file (`:236`) names a line in nothing: listing every
         // file and opening the first at that line would be a surprise, so it
@@ -589,6 +642,7 @@ impl FileFinder {
         }
         self.line_check_generation += 1;
         let generation = self.line_check_generation;
+        self.line_candidates = candidates.iter().map(|r| r.entry.path.clone()).collect();
         let jobs: Vec<LineJob> = candidates
             .iter()
             .map(|r| LineJob {
@@ -603,40 +657,32 @@ impl FileFinder {
         let Some(worker) = self.line_worker.as_ref() else {
             return;
         };
-        let (tx, rx) = std::sync::mpsc::channel();
         worker.submit(LineBatch {
             generation,
             jobs,
             needed,
-            tx,
         });
-        // No wait means no look: the answer is applied when it is polled,
-        // never here, however soon it comes.
-        let answer = if wait.is_zero() {
-            None
-        } else {
-            rx.recv_timeout(wait).ok()
-        };
         self.line_check = Some(LineCheck {
             generation,
             needed,
             candidates,
             more_matched,
-            rx,
         });
-        if let Some(done) = answer {
-            self.apply_line_check(done);
+        // No wait means no look: the answer is applied when it is polled,
+        // never here, however soon it comes.
+        if !wait.is_zero() {
+            self.await_line_check(wait);
         }
     }
 
     /// Filter the matches by what a `:line` check found. An answer to an
-    /// older query only fills the cache.
-    fn apply_line_check(&mut self, done: LineCheckDone) {
+    /// older query only fills the cache. True when the list changed.
+    fn apply_line_check(&mut self, done: LineCheckDone) -> bool {
         for (path, count) in done.counted {
             self.line_counts.insert(path, count);
         }
         let Some(check) = self.line_check.take_if(|c| c.generation == done.generation) else {
-            return;
+            return false;
         };
         let kept: Vec<ScoredResult> = check
             .candidates
@@ -667,7 +713,7 @@ impl FileFinder {
             self.selected = keep_choice(&kept).unwrap_or(0);
             self.scroll = self.scroll.min(self.selected);
             self.results = kept;
-            return;
+            return true;
         }
         // Every match was counted whole and is short of the line. A stable
         // sort keeps the match order among files of one length.
@@ -694,24 +740,27 @@ impl FileFinder {
             .collect();
         self.selected = keep_choice(&self.results).unwrap_or(0);
         self.scroll = self.scroll.min(self.selected);
+        true
     }
 }
 
 /// Count, in rank order, the lines of the matches a `:line` query names,
-/// until a page of them is known to reach `needed` or can't be told (#2127).
-/// Off the UI thread: every read here may wait on the filesystem. Returns
-/// each checked candidate's lines (`None` when unknown) and the counts read
-/// from disk, for the cache.
+/// until a page of them is known to reach `needed` or can't be told (#2127),
+/// or `replaced` says a newer query waits or the finder has gone. Off the UI
+/// thread: every read here may wait on the filesystem. Returns each checked
+/// candidate's lines (`None` when unknown) and the counts read from disk,
+/// for the cache.
 fn check_lines(
     jobs: Vec<LineJob>,
     needed: usize,
+    replaced: &dyn Fn() -> bool,
 ) -> (Vec<Option<usize>>, Vec<(PathBuf, LineCount)>) {
     let mut budget = LINE_COUNT_BUDGET;
     let mut lines = Vec::with_capacity(MAX_RESULTS);
     let mut counted = Vec::new();
     let mut kept = 0;
     for job in jobs {
-        if kept == MAX_RESULTS {
+        if kept == MAX_RESULTS || replaced() {
             break;
         }
         let found = match job.open {
@@ -2027,6 +2076,101 @@ mod tests {
         }
     }
 
+    /// #2127 review: a check a newer query replaced stops at the next file
+    /// rather than reading on to its end, and what it counted still reaches
+    /// the cache, through the one channel every check answers on, so the
+    /// next check starts from it.
+    #[test]
+    fn a_replaced_check_stops_early_and_still_fills_the_cache() {
+        let tmp = tempfile::tempdir().unwrap();
+        let jobs = |n: usize| -> Vec<LineJob> {
+            (0..n)
+                .map(|i| LineJob {
+                    path: file_with_lines(tmp.path(), &format!("d{i}/a.ts"), 2).path,
+                    open: None,
+                    cached: None,
+                })
+                .collect()
+        };
+        let (lines, counted) = check_lines(jobs(5), 10, &|| false);
+        assert_eq!((lines.len(), counted.len()), (5, 5), "all short: all read");
+        let asked = std::cell::Cell::new(0);
+        let replaced = || {
+            asked.set(asked.get() + 1);
+            asked.get() > 2
+        };
+        let (lines, counted) = check_lines(jobs(5), 10, &replaced);
+        assert_eq!(
+            (lines.len(), counted.len()),
+            (2, 2),
+            "replaced after two files, it reads no third"
+        );
+
+        let short = file_with_lines(tmp.path(), "web/a.ts", 2);
+        let path = short.path.clone();
+        let mut finder = FileFinder::new(Arc::new(vec![short]));
+        query(&mut finder, "a.ts:5");
+        finder.line_counts.clear();
+        // The answer to a query since replaced lists nothing, but its
+        // counts land.
+        finder
+            .line_worker
+            .as_ref()
+            .expect("the query started it")
+            .submit(LineBatch {
+                generation: 0,
+                jobs: vec![LineJob {
+                    path: path.clone(),
+                    open: None,
+                    cached: None,
+                }],
+                needed: 5,
+            });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !finder.line_counts.contains_key(&path) {
+            assert!(!finder.poll_line_check(), "an older answer changes no list");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the older answer fills the cache"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+    }
+
+    /// #2127 review: an edit to an open file the `:line` query did not rank
+    /// leaves its check be, so a stream of edits elsewhere (an agent writing
+    /// to another file) cannot keep restarting it. An edit to a ranked one,
+    /// or closing it, reruns the check.
+    #[test]
+    fn an_edit_to_a_file_the_query_did_not_rank_reruns_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let entries = vec![
+            file_with_lines(tmp.path(), "web/a.ts", 50),
+            file_with_lines(tmp.path(), "api/a.ts", 400),
+            file_with_lines(tmp.path(), "notes.md", 5),
+        ];
+        let (web, notes) = (entries[0].path.clone(), entries[2].path.clone());
+        let mut finder = FileFinder::new(Arc::new(entries));
+        query(&mut finder, "a.ts:318");
+        assert_eq!(listed(&finder), ["api/a.ts"]);
+        let checks = finder.line_check_generation;
+        for n in 6..20 {
+            assert!(!finder.set_open_lines(HashMap::from([(notes.clone(), n)])));
+        }
+        assert_eq!(finder.line_check_generation, checks, "no check restarted");
+
+        assert!(finder.set_open_lines(HashMap::from([(notes.clone(), 20), (web.clone(), 400)])));
+        assert_eq!(finder.line_check_generation, checks + 1);
+        finder.finish_line_check();
+        assert_eq!(listed(&finder).len(), 2, "the grown buffer has the line");
+        assert!(
+            finder.set_open_lines(HashMap::from([(notes, 21)])),
+            "closing a ranked file's tab reruns too"
+        );
+        finder.finish_line_check();
+        assert_eq!(listed(&finder), ["api/a.ts"], "its saved file is short");
+    }
+
     /// #2127 review: an answer that lands after the keystroke can find a row
     /// already picked from the unchecked list. It stays picked when it is
     /// still listed, so Enter opens the file chosen, not the first one.
@@ -2045,13 +2189,11 @@ mod tests {
         let candidates = finder.results.clone();
         finder.line_check_generation += 1;
         let generation = finder.line_check_generation;
-        let (_tx, rx) = std::sync::mpsc::channel();
         finder.line_check = Some(LineCheck {
             generation,
             needed: 5,
             candidates: candidates.clone(),
             more_matched: false,
-            rx,
         });
         // The last long match is picked; one long match is listed above it.
         finder.selected = candidates.iter().rposition(|r| !short(r)).unwrap();
