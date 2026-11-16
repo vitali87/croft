@@ -2520,6 +2520,39 @@ fn a_cell_edited_in_a_preview_sheet_pins_the_tab() {
     assert!(app.editor.editors[0].dirty, "the unsaved cell must stay");
 }
 
+/// A cell still being typed into, not yet committed with Enter, is unsaved
+/// work too: a one-click open of another file pins the sheet's tab instead
+/// of replacing it, and the half-typed value stays (#2073 review).
+#[test]
+fn a_cell_being_typed_in_a_preview_sheet_survives_a_one_click_open() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("data.csv"), csv_body(5)).unwrap();
+    std::fs::write(tmp.path().join("notes.txt"), "notes\n").unwrap();
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    click_open_in_explorer(&mut app, "data.csv");
+    assert_eq!(app.editor.preview_index(), Some(0), "setup: a preview tab");
+    app.handle_key(key(KeyCode::Char('9'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(
+        app.editor.sheet_pending_cell().is_some(),
+        "setup: the cell is being typed into"
+    );
+
+    click_open_in_explorer(&mut app, "notes.txt");
+    assert_eq!(
+        app.editor.tab_count(),
+        2,
+        "the one-click open must not replace the sheet being typed into"
+    );
+    let sheet = &app.editor.editors[0];
+    assert!(!sheet.preview, "the sheet's tab is pinned");
+    assert!(
+        sheet.sheet_pending_cell().is_some() || sheet.dirty,
+        "the typed value must stay"
+    );
+}
+
 /// Output scrolling under an on-screen inline image moves only the
 /// placement row; re-running the full decode + Lanczos resize + PNG encode
 /// per scrolled row froze the render thread for the whole pane height on
