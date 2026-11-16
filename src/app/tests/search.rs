@@ -2482,6 +2482,35 @@ fn rerun_search_editor_and_wait(app: &mut App) {
     }
 }
 
+/// #2074 review: a rerun leaves the Search Editor edited, but it is a
+/// scratch tab, not a file. A workspace search must not read its results as
+/// a file's unsaved text, and a task or debug run must not warn about it.
+#[test]
+fn a_rerun_search_editor_is_no_unsaved_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::write(root.join("a.txt"), "common\n").unwrap();
+    let mut app = App::new(root.clone()).unwrap();
+    app.editor.open_pinned(&root.join("a.txt")).unwrap();
+    app.editor.mark_dirty();
+    app.run_command(crate::widgets::command_palette::Command::OpenSearchEditor);
+    app.focus_pane(Pane::Editor);
+    app.editor.lines[0] = String::from("# Query: common");
+    rerun_search_editor_and_wait(&mut app);
+    assert!(
+        app.editor.dirty && app.editor.scratch,
+        "setup: the rerun leaves the Search Editor edited"
+    );
+
+    let searched: Vec<PathBuf> = app
+        .unsaved_buffers_for_search()
+        .into_iter()
+        .map(|(path, _)| path)
+        .collect();
+    assert_eq!(searched, [root.join("a.txt")], "only the real file");
+    assert_eq!(app.unsaved_editor_names(), ["a.txt"]);
+}
+
 /// A rerun lands like Replace All (#2074). A word selected and an extra
 /// caret on rows the shorter new results no longer have go with the old
 /// text, so the next frame and a copy work instead of indexing past the

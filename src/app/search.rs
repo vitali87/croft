@@ -37,6 +37,19 @@ impl App {
     /// Called whenever the search input or one of the toggles changes.
     /// Clears the live result list so streamed `Hits` events accumulate
     /// from zero rather than appending to leftover hits from the prior query.
+    /// The unsaved editor buffers a workspace search reads in place of
+    /// their files on disk. A scratch tab (a Search Editor, the git output)
+    /// is no file and is left out: a rerun leaves a Search Editor edited,
+    /// and its own results turned up as hits under its `Search: …` label
+    /// (#2074 review).
+    pub(super) fn unsaved_buffers_for_search(&self) -> Vec<(PathBuf, String)> {
+        self.editor
+            .iter_tabs()
+            .filter(|t| t.dirty && !t.scratch)
+            .filter_map(|t| t.path.clone().map(|p| (p, t.lines.join("\n"))))
+            .collect()
+    }
+
     pub(super) fn submit_search_query(&mut self) {
         self.search.complete = false;
         self.search.hits.clear();
@@ -46,12 +59,7 @@ impl App {
         // content (and skips the stale disk copy). This is what makes an
         // unsaved edit — e.g. a Rename Symbol — findable before save, matching
         // VS Code / Zed. Sent before the query so the next scan sees it.
-        let dirty: Vec<(PathBuf, String)> = self
-            .editor
-            .iter_tabs()
-            .filter(|t| t.dirty)
-            .filter_map(|t| t.path.clone().map(|p| (p, t.lines.join("\n"))))
-            .collect();
+        let dirty = self.unsaved_buffers_for_search();
         let _ = self
             .search_query_tx
             .send(SearchRequest::SetDirtyBuffers(dirty));
