@@ -204,6 +204,7 @@ src/
 │   │   ├── completion.rs        completion, trigger characters, signature help, inline completion
 │   │   ├── diagnostics.rs       diagnostics pushed and pulled, per document and workspace-wide
 │   │   ├── discovery.rs         a file's language and project root, server config, finding the executable, rustup
+│   │   ├── hover.rs             hover, rust-analyzer's own requests
 │   │   ├── tests.rs             the language-server manager's own tests
 │   ├── manifest.rs           declarative `extension.toml` loader for the extension system: parses a manifest's `[[languages]]`, `[[language_servers]]`, `[[themes]]`, `[[debug_adapters]]`, `[[test_runners]]`, `[[mcp_servers]]`, `[[commands]]` and `[[viewers]]` blocks
 │   ├── registry.rs      ServerRegistry (language -> ordered servers); built from the bundled manifests in assets/extensions/* plus user-installed extensions, instead of hardcoding configs
