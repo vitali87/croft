@@ -247,6 +247,8 @@ _BLOCK_EDGE = re.compile(r"/\*|\*/")
 _OPENERS = {"(": ")", "[": "]", "{": "}"}
 
 # The macros that read a file at compile time, whatever its module tree says.
+# `include!` pastes the file in as code, which can declare modules and read
+# further files itself; `include_str!` and `include_bytes!` only embed it.
 INCLUDE_MACROS = {"include", "include_str", "include_bytes"}
 
 # A name `mod` can declare, so one a file can be the module of.
@@ -432,8 +434,17 @@ def _resolved(folder, value):
 def _loaders_in(path, toks):
     """What one file's own text can load beside its plain `mod` children:
     `(files a top-level #[path] mod x; loads, folders another #[path] can
-    load from, names an include!-family macro reads)`. None stands for one
-    this cannot pin down.
+    load from, names an include_str! or include_bytes! reads)`. None stands
+    for one this cannot pin down: an `include!`, whose pasted code can
+    declare modules or read files that nothing here follows, and an include
+    macro renamed by a `use` (`use std::include_str as text;`), after which
+    `text!("helper.rs")` reads a file under a name this does not know. Only a
+    `use` can rename a macro; elsewhere `include` is an ordinary name (croft
+    has a search field called that).
+
+    A macro this does not know can still read files: a procedural macro, or
+    a `macro_rules!` handed `include_str` as an argument. croft has neither,
+    and this does not try to see them.
 
     A `#[path]` on a top-level `mod x;` loads exactly one file, relative to
     this one's folder, and that file then finds its own children beside it,
@@ -444,7 +455,12 @@ def _loaders_in(path, toks):
     depths = _brace_depths(toks)
     folder = posixpath.dirname(path)
     roots, folders, names = [], [], []
+    in_use = False
     for i, tok in enumerate(toks):
+        if tok == ("ident", "use"):
+            in_use = True
+        elif tok == ("punct", ";"):
+            in_use = False
         if tok == ("punct", "#"):
             j = i + 1
             inner = j < len(toks) and toks[j] == ("punct", "!")
@@ -457,7 +473,9 @@ def _loaders_in(path, toks):
             values = [
                 body[n + 2][1] if n + 2 < len(body) and body[n + 2][0] == "str" else None
                 for n in range(len(body) - 1)
-                if body[n] == ("ident", "path") and body[n + 1] == ("punct", "=")
+                if body[n][0] == "ident"
+                and body[n][1].removeprefix("r#") == "path"
+                and body[n + 1] == ("punct", "=")
             ]
             if not values:
                 continue
@@ -477,14 +495,14 @@ def _loaders_in(path, toks):
                     folders.append(None)
                 else:
                     folders.append(folder)
-        elif (
-            tok[0] == "ident"
-            and tok[1] in INCLUDE_MACROS
-            and i + 2 < len(toks)
-            and toks[i + 1] == ("punct", "!")
-            and _opens(toks[i + 2])
-        ):
-            names.append(_included_name(toks[i + 3 : _closing(toks, i + 2)]))
+        elif tok[0] == "ident" and tok[1].removeprefix("r#") in INCLUDE_MACROS:
+            called = (
+                i + 2 < len(toks) and toks[i + 1] == ("punct", "!") and _opens(toks[i + 2])
+            )
+            if called and tok[1].removeprefix("r#") != "include":
+                names.append(_included_name(toks[i + 3 : _closing(toks, i + 2)]))
+            elif called or in_use:
+                names.append(None)
     return roots, folders, names
 
 
@@ -519,6 +537,8 @@ def module_loaders(rev, cwd=None):
     Roots are the files that find their children beside them: `src/main.rs`,
     `src/lib.rs`, `build.rs`, `src/bin/*.rs`, `src/bin/*/main.rs`, any target
     `Cargo.toml` names, and every file a top-level `#[path] mod x;` loads.
+    Every Rust file in the tree is read for these, and a non-Rust file can
+    only take part through an `include!`, which counts as unknown.
     The answer is the same for every file a check asks about at one commit,
     so it is worked out once per commit.
     """
@@ -533,19 +553,10 @@ def _module_loaders(commit, cwd):
     roots += [p for p in tree if re.fullmatch(r"src/bin/[^/]+\.rs|src/bin/[^/]+/main\.rs", p)]
     roots += _cargo_roots(commit, cwd)
     folders, names = [], []
-    listed = subprocess.run(
-        (
-            "git", "grep", "-l", "-z", "-I", "-E",
-            "-e", "path[[:space:]]*(=|$)",
-            "-e", "include(_str|_bytes)?[[:space:]]*(!|$)",
-            commit, "--", "*.rs",
-        ),
-        cwd=cwd,
-        capture_output=True,
-    )
-    if listed.returncode not in (0, 1):
-        raise SystemExit(f"git grep failed: {listed.stderr.decode().strip()}")
-    paths = [hit.split(b":", 1)[1].decode() for hit in listed.stdout.split(b"\0") if hit]
+    # Every Rust file, read whole: a text search that picks candidates first
+    # misses a comment between tokens (`path /* x */ = "helper.rs"`), which
+    # Rust reads as plain whitespace.
+    paths = sorted(p for p in tree if p.endswith(".rs"))
     for path, text in zip(paths, _blobs(commit, paths, cwd)):
         try:
             more_roots, more_folders, more_names = _loaders_in(path, rust_tokens(text))

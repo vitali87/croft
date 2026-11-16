@@ -773,6 +773,51 @@ class TestOnlyModules(unittest.TestCase):
                     )
                 )
 
+    def test_a_comment_inside_a_loader_still_ships(self):
+        """#2217 review: Rust reads a comment between tokens as whitespace,
+        so `path /* shared */ =` is a `#[path]` and `include_str /* x */ !`
+        an `include_str!`."""
+        for loader in (
+            '#[path /* shared */ = "helper.rs"]\nmod production;\n',
+            'const SRC: &str = include_str /* shared */ !("helper.rs");\n',
+        ):
+            with self.subTest(loader=loader):
+                self.assertFalse(
+                    self.shipped_by(
+                        {"src/main.rs": "#[cfg(test)]\nmod helper;\n" + loader + "fn main() {}\n"}
+                    )
+                )
+
+    def test_code_pasted_in_by_include_ships(self):
+        """#2217 review: `include!` pastes a file in as code, and that code
+        can declare modules or read files itself (here `production.inc`
+        reads `helper.rs`); nothing follows it, so it counts as unknown."""
+        self.assertFalse(
+            self.shipped_by(
+                {
+                    "src/main.rs": (
+                        '#[cfg(test)]\nmod helper;\ninclude!("production.inc");\n'
+                        'fn main() {\n    print!("{SRC}");\n}\n'
+                    ),
+                    "src/production.inc": 'const SRC: &str = include_str!("helper.rs");\n',
+                }
+            )
+        )
+
+    def test_a_renamed_include_macro_ships(self):
+        """After `use std::include_str as text;`, `text!("helper.rs")` reads
+        the file under a name this does not know."""
+        self.assertFalse(
+            self.shipped_by(
+                {
+                    "src/main.rs": (
+                        "#[cfg(test)]\nmod helper;\nuse std::include_str as text;\n"
+                        'const SRC: &str = text!("helper.rs");\nfn main() {}\n'
+                    )
+                }
+            )
+        )
+
     def test_an_include_of_another_file_leaves_the_exemption(self):
         """croft's own shape: `concat!(env!("OUT_DIR"), "/notes.md")` reads a
         `notes.md`, which is not `src/helper.rs`."""
