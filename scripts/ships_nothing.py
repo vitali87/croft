@@ -537,8 +537,9 @@ def module_loaders(rev, cwd=None):
     Roots are the files that find their children beside them: `src/main.rs`,
     `src/lib.rs`, `build.rs`, `src/bin/*.rs`, `src/bin/*/main.rs`, any target
     `Cargo.toml` names, and every file a top-level `#[path] mod x;` loads.
-    Every Rust file in the tree is read for these, and a non-Rust file can
-    only take part through an `include!`, which counts as unknown.
+    Every Rust file in the tree is read for these, and so is every file a
+    `#[path]` loads, whatever its name; a non-Rust file can otherwise take
+    part only through an `include!`, which counts as unknown.
     The answer is the same for every file a check asks about at one commit,
     so it is worked out once per commit.
     """
@@ -557,14 +558,24 @@ def _module_loaders(commit, cwd):
     # misses a comment between tokens (`path /* x */ = "helper.rs"`), which
     # Rust reads as plain whitespace.
     paths = sorted(p for p in tree if p.endswith(".rs"))
-    for path, text in zip(paths, _blobs(commit, paths, cwd)):
-        try:
-            more_roots, more_folders, more_names = _loaders_in(path, rust_tokens(text))
-        except LexError:
-            more_roots, more_folders, more_names = [None], [], []
-        roots += more_roots
-        folders += more_folders
-        names += more_names
+    read = set()
+    while paths:
+        read.update(paths)
+        for path, text in zip(paths, _blobs(commit, paths, cwd)):
+            try:
+                more_roots, more_folders, more_names = _loaders_in(path, rust_tokens(text))
+            except LexError:
+                more_roots, more_folders, more_names = [None], [], []
+            roots += more_roots
+            folders += more_folders
+            names += more_names
+        # A `#[path]` can load a file of any name (`production.inc`), and
+        # that file's own loaders count as much as a `.rs` file's: read
+        # each one too, until none is new. One that is not in the tree is
+        # unknown.
+        loaded = {r for r in roots if r is not None and r not in read}
+        roots += [None for r in loaded if r not in tree]
+        paths = sorted(r for r in loaded if r in tree)
     unknown = None in roots or None in folders or None in names
     return (
         frozenset(r for r in roots if r is not None),

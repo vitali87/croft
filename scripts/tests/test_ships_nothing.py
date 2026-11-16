@@ -649,6 +649,7 @@ class TestOnlyModules(unittest.TestCase):
                 tmp,
                 {
                     "build.rs": '#[path = "src/select.rs"]\nmod select;\nfn main() {}\n',
+                    "src/select.rs": "pub fn baked() -> u8 {\n    1\n}\n",
                     "src/main.rs": (
                         "#[cfg(test)]\nmod helper;\n"
                         'fn main() {\n    let p = "x";\n    print!("{path}", path = p);\n}\n'
@@ -787,6 +788,34 @@ class TestOnlyModules(unittest.TestCase):
                         {"src/main.rs": "#[cfg(test)]\nmod helper;\n" + loader + "fn main() {}\n"}
                     )
                 )
+
+    def test_a_module_file_of_any_name_is_read_for_loaders(self):
+        """#2217 review: `#[path]` loads a file whatever its name, so
+        `production.inc` is a module whose `include_str!("helper.rs")` puts
+        the file in the binary."""
+        self.assertFalse(
+            self.shipped_by(
+                {
+                    "src/main.rs": (
+                        '#[cfg(test)]\nmod helper;\n#[path = "production.inc"]\nmod production;\n'
+                        'fn main() {\n    print!("{}", production::SRC);\n}\n'
+                    ),
+                    "src/production.inc": 'pub const SRC: &str = include_str!("helper.rs");\n',
+                }
+            )
+        )
+
+    def test_a_path_attribute_naming_a_missing_file_ships(self):
+        self.assertFalse(
+            self.shipped_by(
+                {
+                    "src/main.rs": (
+                        '#[cfg(test)]\nmod helper;\n#[path = "gone.inc"]\nmod production;\n'
+                        "fn main() {}\n"
+                    )
+                }
+            )
+        )
 
     def test_code_pasted_in_by_include_ships(self):
         """#2217 review: `include!` pastes a file in as code, and that code
