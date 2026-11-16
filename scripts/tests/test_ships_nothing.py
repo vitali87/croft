@@ -903,6 +903,26 @@ class TestOnlyModules(unittest.TestCase):
             self.change(repo, {"src/helper.rs": body.format("false")})
             self.assertFalse(repo.verdict("src/helper.rs"))
 
+    def test_an_edit_inside_the_tests_of_a_file_a_nested_path_module_can_embed_ships(self):
+        """#2217 review: `#[path]` on a module inside `mod outer { .. }` loads
+        `src/outer/production.inc`, which this does not read, and which
+        embeds `helper.rs`."""
+        with tempfile.TemporaryDirectory() as tmp:
+            body = "pub fn f() -> u8 {{\n    1\n}}\n\n#[cfg(test)]\nmod tests {{\n    #[test]\n    fn t() {{\n        assert!({});\n    }}\n}}\n"
+            repo = self.repo(
+                tmp,
+                {
+                    "src/main.rs": (
+                        'mod helper;\nmod outer {\n    #[path = "production.inc"]\n    pub mod production;\n}\n'
+                        "fn main() {}\n"
+                    ),
+                    "src/outer/production.inc": 'pub const SRC: &str = include_str!("../helper.rs");\n',
+                    "src/helper.rs": body.format("true"),
+                },
+            )
+            self.change(repo, {"src/helper.rs": body.format("false")})
+            self.assertFalse(repo.verdict("src/helper.rs"))
+
     def test_an_include_inside_a_test_module_does_not_count(self):
         """croft's port detector has a test that reads its own source with
         `include_str!`; inside `#[cfg(test)]` that compiles only for tests,
