@@ -72,11 +72,19 @@ fn server_spawn(decl: &McpServerDecl) -> ServerSpawn {
 /// explicit config dir: the app carries the dir it was built with, so a
 /// test can seed a scratch dir instead of mutating the process-wide
 /// environment (which races sibling tests).
+///
+/// Under test the developer's own config dir gives no user extensions: an
+/// app a test builds carries that dir, and an extension the developer
+/// installed must never steer a test's palette, menus or snapshots (#624,
+/// #2218). A test that wants one seeds a scratch dir.
 fn all_sources_in_dir(config_dir: &Path) -> Vec<String> {
     let mut sources: Vec<String> = manifest::BUNDLED_MANIFESTS
         .iter()
         .map(|s| s.to_string())
         .collect();
+    if cfg!(test) && config_dir == crate::paths::config_dir() {
+        return sources;
+    }
     sources.extend(manifest::read_extension_sources(
         &config_dir.join("extensions"),
     ));
@@ -461,6 +469,23 @@ prompt = "URL"
 
     fn sources() -> Vec<String> {
         vec![FETCH.to_string()]
+    }
+
+    /// #2218: an app a test builds carries the developer's real config dir,
+    /// so that dir must give no user extensions under test, while a scratch
+    /// dir a test seeds still does.
+    #[test]
+    fn under_test_only_a_scratch_config_dir_gives_user_extensions() {
+        let bundled = manifest::BUNDLED_MANIFESTS.len();
+        assert_eq!(
+            all_sources_in_dir(&crate::paths::config_dir()).len(),
+            bundled
+        );
+        let scratch = tempfile::tempdir().unwrap();
+        let ext = scratch.path().join("extensions").join("mcp-fetch");
+        std::fs::create_dir_all(&ext).unwrap();
+        std::fs::write(ext.join("extension.toml"), FETCH).unwrap();
+        assert_eq!(all_sources_in_dir(scratch.path()).len(), bundled + 1);
     }
 
     #[test]
