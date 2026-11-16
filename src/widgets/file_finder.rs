@@ -100,7 +100,8 @@ pub struct FileFinder {
     /// The thread the checks run on, started by the first one.
     line_worker: Option<LineWorker>,
     /// How long a keystroke waits for a check's answer: [`LINE_CHECK_WAIT`],
-    /// or none in a test that needs the answer to land late.
+    /// or none in a test that needs the answer to land late, which leaves it
+    /// for [`Self::poll_line_check`] however soon it comes.
     line_check_wait: std::time::Duration,
 }
 
@@ -271,7 +272,13 @@ impl FileFinder {
         if self.line_hint().is_none() {
             return false;
         }
-        let chosen = self.selected_entry().map(|e| e.path.clone());
+        // A recheck still running may be keeping a row its unchecked list
+        // does not show; this one replaces it and keeps that row instead.
+        let chosen = self
+            .line_check
+            .as_ref()
+            .and_then(|c| c.chosen.clone())
+            .or_else(|| self.selected_entry().map(|e| e.path.clone()));
         self.refresh_results();
         let listed = chosen
             .as_ref()
@@ -614,7 +621,13 @@ impl FileFinder {
             needed,
             tx,
         });
-        let answer = rx.recv_timeout(self.line_check_wait).ok();
+        // No wait means no look: the answer is applied when it is polled,
+        // never here, however soon it comes.
+        let answer = if self.line_check_wait.is_zero() {
+            None
+        } else {
+            rx.recv_timeout(self.line_check_wait).ok()
+        };
         self.line_check = Some(LineCheck {
             generation,
             needed,
@@ -2299,6 +2312,16 @@ mod tests {
         );
         finder.finish_line_check();
         assert_eq!(finder.selected_entry().map(|e| &e.path), Some(&b));
+
+        // A second recheck before the first lands keeps the same row.
+        assert!(finder.set_open_lines(HashMap::from([(a.clone(), 21)])));
+        assert!(finder.set_open_lines(HashMap::from([(a.clone(), 22)])));
+        finder.finish_line_check();
+        assert_eq!(
+            finder.selected_entry().map(|e| &e.path),
+            Some(&b),
+            "a recheck replacing a running one keeps the row it kept"
+        );
 
         // Picking a row while the next recheck runs drops the kept one.
         assert!(finder.set_open_lines(HashMap::from([(a.clone(), 30)])));
