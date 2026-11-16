@@ -31,12 +31,6 @@ pub(super) fn header_query_for_status(query: &str) -> String {
 }
 
 impl App {
-    /// Push the current search query string and toggle state onto the
-    /// worker channel and keep the editor's match highlight synced to the
-    /// same term so the active file lights up matches as the user types.
-    /// Called whenever the search input or one of the toggles changes.
-    /// Clears the live result list so streamed `Hits` events accumulate
-    /// from zero rather than appending to leftover hits from the prior query.
     /// The unsaved editor buffers a workspace search reads in place of
     /// their files on disk. A scratch tab (a Search Editor, the git output)
     /// is no file and is left out: a rerun leaves a Search Editor edited,
@@ -50,6 +44,12 @@ impl App {
             .collect()
     }
 
+    /// Push the current search query string and toggle state onto the
+    /// worker channel and keep the editor's match highlight synced to the
+    /// same term so the active file lights up matches as the user types.
+    /// Called whenever the search input or one of the toggles changes.
+    /// Clears the live result list so streamed `Hits` events accumulate
+    /// from zero rather than appending to leftover hits from the prior query.
     pub(super) fn submit_search_query(&mut self) {
         self.search.complete = false;
         self.search.hits.clear();
