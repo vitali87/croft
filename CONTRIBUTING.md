@@ -57,16 +57,21 @@ see [docs/MACOS.md](docs/MACOS.md#spotlight-indexing-and-the-build-directory).
   `scripts/move_items.py` moves the items a manifest assigns to a file and
   writes the move's glue, release note and docs row; it split
   `src/app/mod.rs` into feature files (#2062) from
-  `scripts/split_manifest.tsv`, and with `--target editor` split
-  `src/widgets/editor.rs` from `scripts/split_editor_manifest.tsv`
-  (`--tests-out` first moved the editor's inline tests to their own file).
-* **Adding to the app or the editor?** Put a feature's code in its file under
-  `src/app/` or `src/widgets/editor/` (see the lists in
+  `scripts/split_manifest.tsv`, with `--target editor` split
+  `src/widgets/editor.rs` from `scripts/split_editor_manifest.tsv`, and with
+  `--target lsp` split `src/lsp/manager.rs` from
+  `scripts/split_lsp_manifest.tsv` (`--tests-out` first moved each file's
+  inline tests to their own file).
+* **Adding to the app, the editor or the language-server manager?** Put a
+  feature's code in its file under `src/app/`, `src/widgets/editor/` or
+  `src/lsp/manager/` (see the lists in
   [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)), not in `src/app/mod.rs`,
-  which keeps only the `App` struct, its state, start-up and the main loop, nor
-  in `src/widgets/editor.rs`, which keeps only the `Editor` type, its
-  constructor and the data types its parts share. A new feature that fits no
-  file gets a file of its own.
+  which keeps only the `App` struct, its state, start-up and the main loop,
+  nor in `src/widgets/editor.rs`, which keeps only the `Editor` type, its
+  constructor and the data types its parts share, nor in
+  `src/lsp/manager.rs`, which keeps only the `LspManager` type, the command
+  enum, the worker's and each server's state and the helpers several features
+  share. A new feature that fits no file gets a file of its own.
 * **New or changed module?** Update its entry in
   [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). CI fails if you shorten a
   module's description without moving its reasoning into a `### <module>`
