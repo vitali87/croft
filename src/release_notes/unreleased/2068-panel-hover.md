@@ -1,0 +1,1 @@
+fix: The row under the mouse in PROBLEMS, OUTPUT, PORTS and CAPTURES lights up as the pointer moves and goes dark when it leaves, instead of sticking on an old row; the Explorer's OUTLINE shows focus with the secondary side bar open, and a restored session draws focus on the pane that has it (#2068).
