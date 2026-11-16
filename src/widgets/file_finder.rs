@@ -97,6 +97,8 @@ pub struct FileFinder {
     /// Bumped by every check started, so an older query's answer is never
     /// applied to a newer one.
     line_check_generation: u64,
+    /// The thread the checks run on, started by the first one.
+    line_worker: Option<LineWorker>,
 }
 
 /// A `:line` check running on its own thread (#2127): the matches it is
@@ -129,6 +131,88 @@ struct LineJob {
     cached: Option<LineCount>,
 }
 
+/// One query's `:line` check, as the worker takes it.
+struct LineBatch {
+    generation: u64,
+    jobs: Vec<LineJob>,
+    needed: usize,
+    tx: std::sync::mpsc::Sender<LineCheckDone>,
+}
+
+/// What the finder and its worker thread share: the one query waiting to be
+/// checked, and whether the finder has gone.
+#[derive(Default)]
+struct WorkerSlot {
+    next: Option<LineBatch>,
+    closed: bool,
+}
+
+/// The one thread a Quick Open counts lines on (#2127). It holds at most one
+/// query waiting, and a newer query replaces it: a file on a stalled network
+/// mount blocks this thread alone, and keystrokes typed meanwhile leave one
+/// query to check when it is free, not a thread each. Dropped with the
+/// finder, it tells the thread to stop once the read it is in returns.
+struct LineWorker {
+    shared: Arc<(Mutex<WorkerSlot>, std::sync::Condvar)>,
+}
+
+impl LineWorker {
+    /// Start the thread, or `None` when the system will not give one: the
+    /// matches are then listed unchecked rather than the app stopping.
+    fn start() -> Option<Self> {
+        let shared = Arc::new((Mutex::new(WorkerSlot::default()), std::sync::Condvar::new()));
+        let theirs = Arc::clone(&shared);
+        std::thread::Builder::new()
+            .name(String::from("quick-open-lines"))
+            .spawn(move || run_line_worker(&theirs))
+            .ok()?;
+        Some(Self { shared })
+    }
+
+    /// Queue `batch`, in place of any query still waiting.
+    fn submit(&self, batch: LineBatch) {
+        let (slot, wake) = &*self.shared;
+        slot.lock().unwrap_or_else(|e| e.into_inner()).next = Some(batch);
+        wake.notify_one();
+    }
+}
+
+impl Drop for LineWorker {
+    fn drop(&mut self) {
+        let (slot, wake) = &*self.shared;
+        let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
+        slot.closed = true;
+        slot.next = None;
+        wake.notify_one();
+    }
+}
+
+/// The worker thread: check each query handed over, newest first, until the
+/// finder goes.
+fn run_line_worker(shared: &(Mutex<WorkerSlot>, std::sync::Condvar)) {
+    let (slot, wake) = shared;
+    loop {
+        let batch = {
+            let mut slot = slot.lock().unwrap_or_else(|e| e.into_inner());
+            loop {
+                if slot.closed {
+                    return;
+                }
+                if let Some(batch) = slot.next.take() {
+                    break batch;
+                }
+                slot = wake.wait(slot).unwrap_or_else(|e| e.into_inner());
+            }
+        };
+        let (lines, counted) = check_lines(batch.jobs, batch.needed);
+        let _ = batch.tx.send(LineCheckDone {
+            generation: batch.generation,
+            lines,
+            counted,
+        });
+    }
+}
+
 /// What counting a file's lines found (#2127).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct LineCount {
@@ -157,6 +241,7 @@ impl FileFinder {
             open_lines: HashMap::new(),
             line_check: None,
             line_check_generation: 0,
+            line_worker: None,
         };
         me.refresh_results();
         me
@@ -475,14 +560,18 @@ impl FileFinder {
                 cached: self.line_counts.get(&r.entry.path).copied(),
             })
             .collect();
+        if self.line_worker.is_none() {
+            self.line_worker = LineWorker::start();
+        }
+        let Some(worker) = self.line_worker.as_ref() else {
+            return;
+        };
         let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let (lines, counted) = check_lines(jobs, needed);
-            let _ = tx.send(LineCheckDone {
-                generation,
-                lines,
-                counted,
-            });
+        worker.submit(LineBatch {
+            generation,
+            jobs,
+            needed,
+            tx,
         });
         let answer = rx.recv_timeout(LINE_CHECK_WAIT).ok();
         self.line_check = Some(LineCheck {
@@ -518,10 +607,22 @@ impl FileFinder {
             .map(|(_, r)| r.clone())
             .take(MAX_RESULTS)
             .collect();
-        self.selected = 0;
-        self.scroll = 0;
+        // An answer that comes after the keystroke can find a row already
+        // picked from the unchecked list: it stays picked if it is still
+        // listed, so Enter opens the file chosen, not the first one.
+        let chosen = self
+            .results
+            .get(self.selected)
+            .map(|r| r.entry.path.clone());
+        let keep_choice = |list: &[ScoredResult]| {
+            chosen
+                .as_ref()
+                .and_then(|p| list.iter().position(|r| &r.entry.path == p))
+        };
         if !kept.is_empty() {
             self.notice = None;
+            self.selected = keep_choice(&kept).unwrap_or(0);
+            self.scroll = self.scroll.min(self.selected);
             self.results = kept;
             return;
         }
@@ -548,6 +649,8 @@ impl FileFinder {
             .take(MAX_RESULTS)
             .map(|(r, _)| r)
             .collect();
+        self.selected = keep_choice(&self.results).unwrap_or(0);
+        self.scroll = self.scroll.min(self.selected);
     }
 }
 
@@ -1843,6 +1946,85 @@ mod tests {
             .iter()
             .map(|r| r.entry.rel.as_str())
             .collect()
+    }
+
+    /// #2127 review: every keystroke of a `:line` query checks on the one
+    /// worker thread the finder started, not on a thread of its own, so a
+    /// stalled read cannot pile threads up; and the thread ends when the
+    /// finder goes.
+    #[test]
+    fn line_checks_share_one_worker_that_ends_with_the_finder() {
+        let tmp = tempfile::tempdir().unwrap();
+        let entries = vec![
+            file_with_lines(tmp.path(), "web/a.ts", 50),
+            file_with_lines(tmp.path(), "api/a.ts", 400),
+        ];
+        let mut finder = FileFinder::new(Arc::new(entries));
+        for line in 1..=30 {
+            query(&mut finder, &format!("a.ts:{line}"));
+        }
+        let worker = finder
+            .line_worker
+            .as_ref()
+            .expect("the first check starts it");
+        assert_eq!(
+            Arc::strong_count(&worker.shared),
+            2,
+            "the finder and one thread hold the worker, after 30 queries"
+        );
+        let gone = Arc::downgrade(&worker.shared);
+        drop(finder);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while gone.strong_count() > 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the worker thread must end with the finder"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// #2127 review: an answer that lands after the keystroke can find a row
+    /// already picked from the unchecked list. It stays picked when it is
+    /// still listed, so Enter opens the file chosen, not the first one.
+    #[test]
+    fn a_late_line_check_answer_keeps_the_chosen_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let entries = vec![
+            file_with_lines(tmp.path(), "a/x.ts", 10),
+            file_with_lines(tmp.path(), "b/x.ts", 2),
+            file_with_lines(tmp.path(), "c/x.ts", 10),
+        ];
+        let mut finder = FileFinder::new(Arc::new(entries));
+        query(&mut finder, "x.ts");
+        let short = |r: &ScoredResult| r.entry.rel.starts_with("b/");
+        // As a check still running when the list was drawn would leave it.
+        let candidates = finder.results.clone();
+        finder.line_check_generation += 1;
+        let generation = finder.line_check_generation;
+        let (_tx, rx) = std::sync::mpsc::channel();
+        finder.line_check = Some(LineCheck {
+            generation,
+            needed: 5,
+            candidates: candidates.clone(),
+            more_matched: false,
+            rx,
+        });
+        // The last long match is picked; one long match is listed above it.
+        finder.selected = candidates.iter().rposition(|r| !short(r)).unwrap();
+        let chosen = finder.selected_entry().unwrap().path.clone();
+
+        finder.apply_line_check(LineCheckDone {
+            generation,
+            lines: candidates
+                .iter()
+                .map(|r| Some(if short(r) { 2 } else { 10 }))
+                .collect(),
+            counted: Vec::new(),
+        });
+        assert_eq!(listed(&finder).len(), 2, "the short file goes");
+        assert_eq!(finder.selected_entry().map(|e| &e.path), Some(&chosen));
+        assert_eq!(finder.selected_index(), 1);
     }
 
     /// #2127: `a.ts:318` lists only the `a.ts` long enough to have a line
