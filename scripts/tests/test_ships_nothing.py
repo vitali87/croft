@@ -89,6 +89,12 @@ class Ranges(unittest.TestCase):
         text = "fn f() {}\n#[cfg(test)]\nfn helper() -> u8 {\n    1\n}\n"
         self.assertEqual(filt.cfg_test_ranges(text), [])
 
+    def test_an_attribute_inside_a_block_comment_is_not_a_range(self):
+        """#2217 review: `#[cfg(test)]` inside `/* */` is comment text and
+        guards nothing; the `mod helper;` below it ships."""
+        text = "/*\n#[cfg(test)]\n*/\nmod helper;\nfn main() {}\n"
+        self.assertEqual(filt.cfg_test_ranges(text), [])
+
     def test_a_file_with_no_tests_has_no_ranges(self):
         self.assertEqual(filt.cfg_test_ranges("fn f() {}\n"), [])
 
@@ -421,6 +427,34 @@ class Verdicts(unittest.TestCase):
             repo.commit("a.rs", "#[cfg(test)]\npub fn helper() {}\n")
             self.assertFalse(repo.verdict())
 
+    def test_a_declaration_slipped_above_a_test_module_ships(self):
+        """#2217 review: `mod added;` between an existing `#[cfg(test)]` and
+        the module it guarded takes the attribute off that module, which
+        then ships, though the attribute opens a span on both sides."""
+        module = "mod existing {\n    fn t() {}\n}\n"
+        for base, head in (
+            ("#[cfg(test)]\n" + module, "#[cfg(test)]\nmod added;\n" + module),
+            ("#[cfg(test)]\nmod added;\n" + module, "#[cfg(test)]\n" + module),
+        ):
+            with self.subTest(base=base, head=head), tempfile.TemporaryDirectory() as tmp:
+                repo = Repo(Path(tmp))
+                repo.commit("a.rs", base)
+                run(repo.path, "git", "checkout", "-q", "-b", "change")
+                repo.commit("a.rs", head)
+                self.assertFalse(repo.verdict())
+
+    def test_a_test_module_that_grows_over_shipped_code_ships(self):
+        """A brace added inside a test module can move its end below shipped
+        code that did not change: that code leaves the release build."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp))
+            repo.commit("a.rs", "#[cfg(test)]\nmod t {\n}\nfn shipped() {}\n")
+            run(repo.path, "git", "checkout", "-q", "-b", "change")
+            repo.commit(
+                "a.rs", "#[cfg(test)]\nmod t {\nfn helper() {\n}\nfn shipped() {}\n}\n"
+            )
+            self.assertFalse(repo.verdict())
+
     def test_edits_in_two_test_modules_that_shift_each_other_ship_nothing(self):
         """The attribute check follows each span to its line on the other
         side, past the lines an earlier hunk added."""
@@ -624,6 +658,158 @@ class TestOnlyModules(unittest.TestCase):
             )
             self.change(repo, {"src/helper.rs": "pub fn f() -> u8 {\n    2\n}\n"})
             self.assertTrue(repo.verdict("src/helper.rs"))
+
+    def shipped_by(self, files, path="src/helper.rs"):
+        """The verdict on an edit to `path` in a repo of `files`."""
+        with tempfile.TemporaryDirectory() as tmp:
+            files = {path: "pub fn f() -> u8 {\n    1\n}\n", **files}
+            repo = self.repo(tmp, files)
+            self.change(repo, {path: "pub fn f() -> u8 {\n    2\n}\n"})
+            return repo.verdict(path)
+
+    def test_a_release_declaration_hidden_from_a_line_reading_ships(self):
+        """#2217 review: Rust lets a declaration break after `mod`, carry a
+        comment between its words, or spell the name as `r#helper`; each
+        still declares `helper` for the release build."""
+        for release in (
+            "pub mod\n    helper;\n",
+            "pub mod /* shared */ helper;\n",
+            "pub mod r#helper;\n",
+        ):
+            with self.subTest(release=release):
+                self.assertFalse(
+                    self.shipped_by(
+                        {
+                            "src/main.rs": "#[cfg(test)]\nmod helper;\nfn main() {}\n",
+                            "src/lib.rs": release,
+                        }
+                    )
+                )
+
+    def test_a_test_only_declaration_over_two_lines_ships_nothing(self):
+        self.assertTrue(
+            self.shipped_by({"src/main.rs": "#[cfg(test)]\nmod\n    helper;\nfn main() {}\n"})
+        )
+
+    def test_an_attribute_in_a_block_comment_does_not_make_a_module_test_only(self):
+        """#2217 review: the `#[cfg(test)]` is comment text, so `mod helper;`
+        compiles for the release build."""
+        self.assertFalse(
+            self.shipped_by({"src/main.rs": "/*\n#[cfg(test)]\n*/\nmod helper;\nfn main() {}\n"})
+        )
+
+    def test_a_path_attribute_with_an_escape_ships(self):
+        """#2217 review: `"hel\\x70er.rs"` is `"helper.rs"` to Rust; a value
+        this does not decode counts as naming any file."""
+        self.assertFalse(
+            self.shipped_by(
+                {
+                    "src/main.rs": (
+                        "#[cfg(test)]\nmod helper;\n"
+                        '#[path = "hel\\x70er.rs"]\nmod production;\nfn main() {}\n'
+                    )
+                }
+            )
+        )
+
+    def test_a_path_attribute_on_an_inline_module_ships_what_it_can_reach(self):
+        """#2217 review: `#[path = "widgets"]` on an inline module makes its
+        children load from `src/widgets/`, so `production::helper` loads
+        `src/widgets/helper.rs` for the release build."""
+        self.assertFalse(
+            self.shipped_by(
+                {
+                    "src/main.rs": (
+                        "mod widgets;\n"
+                        '#[path = "widgets"]\nmod production {\n    pub mod helper;\n}\n'
+                        "fn main() {}\n"
+                    ),
+                    "src/widgets.rs": "#[cfg(test)]\npub mod helper;\n",
+                },
+                path="src/widgets/helper.rs",
+            )
+        )
+
+    def test_a_file_a_path_attribute_loads_declares_its_neighbours(self):
+        """A file loaded by `#[path]` finds its own children beside it, as a
+        crate root does: `src/select.rs` declaring `pub mod helper;` loads
+        `src/helper.rs` into the build script."""
+        self.assertFalse(
+            self.shipped_by(
+                {
+                    "build.rs": '#[path = "src/select.rs"]\nmod select;\nfn main() {}\n',
+                    "src/select.rs": "pub mod helper;\n",
+                    "src/main.rs": "#[cfg(test)]\nmod helper;\nfn main() {}\n",
+                }
+            )
+        )
+
+    def test_an_inline_module_further_up_ships_the_file(self):
+        """`pub mod a { pub mod helper; }` in lib.rs loads `src/a/helper.rs`
+        though `src/a.rs` declares it only for tests."""
+        self.assertFalse(
+            self.shipped_by(
+                {
+                    "src/main.rs": "mod a;\nfn main() {}\n",
+                    "src/a.rs": "#[cfg(test)]\nmod helper;\n",
+                    "src/lib.rs": "pub mod a {\n    pub mod helper;\n}\n",
+                },
+                path="src/a/helper.rs",
+            )
+        )
+
+    def test_a_file_an_include_macro_reads_ships(self):
+        """`include_str!` puts the file's text in the binary, and `include!`
+        its code, whatever the module tree says. A name the macro's
+        argument does not pin down counts as any name."""
+        for reader in (
+            'const SRC: &str = include_str!("helper.rs");\n',
+            'include!(concat!(env!("OUT_DIR"), "/", env!("NAME")));\n',
+        ):
+            with self.subTest(reader=reader):
+                self.assertFalse(
+                    self.shipped_by(
+                        {"src/main.rs": "#[cfg(test)]\nmod helper;\n" + reader + "fn main() {}\n"}
+                    )
+                )
+
+    def test_an_include_of_another_file_leaves_the_exemption(self):
+        """croft's own shape: `concat!(env!("OUT_DIR"), "/notes.md")` reads a
+        `notes.md`, which is not `src/helper.rs`."""
+        self.assertTrue(
+            self.shipped_by(
+                {
+                    "src/main.rs": (
+                        "#[cfg(test)]\nmod helper;\n"
+                        'const N: &str = include_str!(concat!(env!("OUT_DIR"), "/notes.md"));\n'
+                        "fn main() {}\n"
+                    )
+                }
+            )
+        )
+
+    def test_a_crate_root_cargo_names_declares_its_neighbours(self):
+        """A `[lib] path` in Cargo.toml is a crate root like `src/lib.rs`."""
+        self.assertFalse(
+            self.shipped_by(
+                {
+                    "Cargo.toml": '[package]\nname = "x"\n\n[lib]\npath = "src/core.rs"\n',
+                    "src/core.rs": "pub mod helper;\n",
+                    "src/main.rs": "#[cfg(test)]\nmod helper;\nfn main() {}\n",
+                }
+            )
+        )
+
+    def test_a_binary_in_src_bin_declares_its_neighbours(self):
+        self.assertFalse(
+            self.shipped_by(
+                {
+                    "src/bin/tool.rs": "pub mod helper;\nfn main() {}\n",
+                    "src/bin/check.rs": "#[cfg(test)]\nmod helper;\nfn main() {}\n",
+                },
+                path="src/bin/helper.rs",
+            )
+        )
 
     def test_making_a_shipped_module_test_only_ships(self):
         """Adding `#[cfg(test)]` above a declaration takes a module out of

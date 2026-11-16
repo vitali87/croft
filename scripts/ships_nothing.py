@@ -22,9 +22,11 @@ Exit 0 when the change ships nothing, 1 when it ships something.
 """
 
 import functools
+import posixpath
 import re
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -71,20 +73,6 @@ def git(*args, cwd=None, allow_missing_path=False):
 # A module declared without a body, `mod name;` (its body is another file).
 # Matched against a line's code, so a trailing `// comment` does not hide it.
 MOD_DECLARATION = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+[A-Za-z_]\w*\s*;\s*$")
-
-# Where an attribute opens, `#[` or `#![`: rustfmt keeps it together, but
-# Rust lets whitespace, even a line break, split it.
-ATTRIBUTE_OPEN = re.compile(r"#\s*!?\s*\[")
-
-# `path =` inside an attribute, read off code with its literals removed: the
-# attribute names a module's file, directly or through `cfg_attr`.
-PATH_KEY = re.compile(r"\bpath\s*=")
-
-# The file a `path` attribute names, read off the attribute's raw text. A
-# value that is not a plain string literal is not read, and counts as
-# naming any file.
-PATH_VALUE = re.compile(r'\bpath\s*=\s*"((?:[^"\\]|\\.)*)"')
-
 
 def literal_lines(text):
     """Line numbers (1-indexed) that sit INSIDE a multi-line string literal.
@@ -149,7 +137,9 @@ def cfg_test_ranges(text):
         if in_literal:
             attr_at = None
             continue
-        if CFG_TEST.match(line):
+        if kinds[i] == ATTR and CFG_TEST.match(line):
+            # Only a line `classify` read as an attribute: the same text in a
+            # block comment is SKIP, and guards nothing.
             attr_at = i
             continue
         if attr_at is None:
@@ -226,139 +216,441 @@ def inside(line_no, ranges):
     return any(start <= line_no <= end for start, end in ranges)
 
 
-def path_attribute_targets(rev, cwd=None):
-    """The file names that `#[path]` attributes at `rev` load modules from,
-    with `None` for one whose value cannot be read. Such an attribute can
-    load a file under any module name, so a reading of the parents by name
-    cannot rule out a release build loading it.
+class LexError(Exception):
+    """Text `rust_tokens` cannot read as Rust: an unterminated string or
+    comment, or an unclosed bracket. Whatever asked then answers "ships"."""
 
-    Read from each file's code with comments and literals removed, across
-    lines, and only inside an attribute's brackets: `#[path\n = "x.rs"]`
-    and a `cfg_attr` rustfmt wrapped over several lines count, while a
-    `format!` argument named `path` or a string holding `#[path = ..]` does
-    not. The answer is the same for every file a check asks about at one
-    commit, so it is worked out once per commit.
+
+# Rust's tokens, as far as telling items apart from comments and literals
+# needs: a `mod` inside a string or a comment declares nothing, and a real
+# declaration can run over lines or carry a comment between its words, which
+# a line-by-line reading misses. Numbers and multi-character operators come
+# apart into pieces that nothing here looks at.
+_TOKEN = re.compile(
+    r"""
+    (?P<ws>\s+)
+    |(?P<line>//[^\n]*)
+    |(?P<block>/\*)
+    |(?P<raw>[bc]?r(?P<hashes>\#*)")
+    |(?P<str>[bc]?"(?:[^"\\]|\\.)*")
+    |(?P<char>b?'(?:[^'\\\n]|\\u\{[0-9a-fA-F_]*\}|\\x[0-9a-fA-F]{2}|\\.)')
+    |(?P<life>'(?:r\#)?[^\W\d]\w*)
+    |(?P<ident>r\#[^\W\d]\w*|[^\W\d]\w*)
+    |(?P<num>\d\w*)
+    |(?P<punct>.)
+    """,
+    re.X | re.S,
+)
+
+_BLOCK_EDGE = re.compile(r"/\*|\*/")
+
+_OPENERS = {"(": ")", "[": "]", "{": "}"}
+
+# The macros that read a file at compile time, whatever its module tree says.
+INCLUDE_MACROS = {"include", "include_str", "include_bytes"}
+
+# A name `mod` can declare, so one a file can be the module of.
+MODULE_NAME = re.compile(r"[^\W\d]\w*")
+
+CARGO_TARGETS = ("lib", "bin", "test", "bench", "example")
+
+
+def rust_tokens(text):
+    """`(kind, text)` for every token of `text` but whitespace and comments.
+    Kinds are `ident`, `str`, `char`, `life`, `num` and `punct`. A string
+    token's text is its contents, or None when they hold an escape, which
+    nothing here decodes. Block comments nest, as Rust's do."""
+    out = []
+    pos, end = 0, len(text)
+    while pos < end:
+        m = _TOKEN.match(text, pos)
+        kind = m.lastgroup
+        if kind == "block":
+            depth = 1
+            for edge in _BLOCK_EDGE.finditer(text, m.end()):
+                depth += 1 if edge.group() == "/*" else -1
+                if depth == 0:
+                    pos = edge.end()
+                    break
+            else:
+                raise LexError("unterminated block comment")
+            continue
+        if m.group("raw") is not None:
+            close = '"' + m.group("hashes")
+            stop = text.find(close, m.end())
+            if stop < 0:
+                raise LexError("unterminated raw string")
+            out.append(("str", text[m.end() : stop]))
+            pos = stop + len(close)
+            continue
+        pos = m.end()
+        if kind in ("ws", "line"):
+            continue
+        if kind == "str":
+            body = m.group()[m.group().index('"') + 1 : -1]
+            out.append(("str", None if "\\" in body else body))
+        elif kind == "punct" and m.group() in "\"'":
+            raise LexError(f"unterminated {m.group()}")
+        else:
+            out.append((kind, m.group()))
+    return out
+
+
+def _closing(toks, i):
+    """The index of the bracket that closes the one at `toks[i]`."""
+    opener = toks[i]
+    closer = ("punct", _OPENERS[opener[1]])
+    depth = 0
+    for j in range(i, len(toks)):
+        if toks[j] == opener:
+            depth += 1
+        elif toks[j] == closer:
+            depth -= 1
+            if depth == 0:
+                return j
+    raise LexError("unclosed bracket")
+
+
+def _opening(toks, j):
+    """The index of the bracket that opens the one closing at `toks[j]`."""
+    closer = toks[j]
+    opener = ("punct", {v: k for k, v in _OPENERS.items()}[closer[1]])
+    depth = 0
+    for i in range(j, -1, -1):
+        if toks[i] == closer:
+            depth += 1
+        elif toks[i] == opener:
+            depth -= 1
+            if depth == 0:
+                return i
+    raise LexError("unopened bracket")
+
+
+def _opens(tok):
+    return tok[0] == "punct" and tok[1] in _OPENERS
+
+
+def _brace_depths(toks):
+    """How many `{` enclose each token: 0 is an item at the file's top."""
+    depths, depth = [], 0
+    for tok in toks:
+        if tok == ("punct", "}"):
+            depth -= 1
+        depths.append(depth)
+        if tok == ("punct", "{"):
+            depth += 1
+    return depths
+
+
+def _past_attributes(toks, k):
+    """The first token at or after `k` past outer attributes and a
+    visibility (`pub`, `pub(crate)`): where the item itself starts."""
+    while k + 1 < len(toks) and toks[k] == ("punct", "#") and toks[k + 1] == ("punct", "["):
+        k = _closing(toks, k + 1) + 1
+    if k < len(toks) and toks[k] == ("ident", "pub"):
+        k += 1
+        if k < len(toks) and toks[k] == ("punct", "("):
+            k = _closing(toks, k) + 1
+    return k
+
+
+def _attributes_of(toks, m):
+    """The texts inside each outer attribute on the item whose keyword is
+    `toks[m]`, read back past its visibility."""
+    k = m
+    if k >= 1 and toks[k - 1] == ("ident", "pub"):
+        k -= 1
+    elif k >= 1 and toks[k - 1] == ("punct", ")"):
+        opened = _opening(toks, k - 1)
+        if opened >= 1 and toks[opened - 1] == ("ident", "pub"):
+            k = opened - 1
+    found = []
+    while k >= 2 and toks[k - 1] == ("punct", "]"):
+        opened = _opening(toks, k - 1)
+        if opened < 1 or toks[opened - 1] != ("punct", "#"):
+            break
+        found.append([text for _, text in toks[opened + 1 : k - 1]])
+        k = opened - 1
+    return found
+
+
+def _file_name(value):
+    """The last component of a path a macro or attribute names, or None
+    when there is none to read."""
+    if value is None:
+        return None
+    return posixpath.basename(value) or None
+
+
+def _included_name(arg):
+    """The name of the file an `include!`-family macro reads, from its
+    argument's tokens; None when this cannot tell. A plain string names
+    it, and so does a `concat!` whose last pieces are strings that hold a
+    `/`: `concat!(env!("OUT_DIR"), "/notes.md")` reads a `notes.md`, while
+    `concat!(env!("D"), "x.rs")` could read any name ending in `x.rs`."""
+    if arg and arg[-1] == ("punct", ","):
+        arg = arg[:-1]
+    if len(arg) == 1 and arg[0][0] == "str":
+        return _file_name(arg[0][1])
+    if (
+        len(arg) >= 4
+        and arg[0] == ("ident", "concat")
+        and arg[1] == ("punct", "!")
+        and _opens(arg[2])
+        and _closing(arg, 2) == len(arg) - 1
+    ):
+        pieces = arg[3:-1]
+        if pieces and pieces[-1] == ("punct", ","):
+            pieces = pieces[:-1]
+        tail = []
+        while pieces and pieces[-1][0] == "str":
+            tail.insert(0, pieces[-1][1])
+            pieces = pieces[:-1]
+            if pieces and pieces[-1] == ("punct", ","):
+                pieces = pieces[:-1]
+            else:
+                break
+        if tail and None not in tail:
+            joined = "".join(tail)
+            if not pieces or "/" in joined:
+                return _file_name(joined)
+    return None
+
+
+def _resolved(folder, value):
+    """`value`, a `#[path]` relative to `folder`, as a path in the
+    repository; None when it is unreadable, absolute or leaves the
+    repository."""
+    if value is None or value.startswith("/"):
+        return None
+    target = posixpath.normpath(posixpath.join(folder, value))
+    if target == ".." or target.startswith("../"):
+        return None
+    return target
+
+
+def _loaders_in(path, toks):
+    """What one file's own text can load beside its plain `mod` children:
+    `(files a top-level #[path] mod x; loads, folders another #[path] can
+    load from, names an include!-family macro reads)`. None stands for one
+    this cannot pin down.
+
+    A `#[path]` on a top-level `mod x;` loads exactly one file, relative to
+    this one's folder, and that file then finds its own children beside it,
+    as a crate root does. Anywhere else - on an inline `mod x { .. }`, or on
+    a module nested in one - the path is relative to the module's folder,
+    somewhere under this file's, so all of that folder counts.
+    """
+    depths = _brace_depths(toks)
+    folder = posixpath.dirname(path)
+    roots, folders, names = [], [], []
+    for i, tok in enumerate(toks):
+        if tok == ("punct", "#"):
+            j = i + 1
+            inner = j < len(toks) and toks[j] == ("punct", "!")
+            if inner:
+                j += 1
+            if j >= len(toks) or toks[j] != ("punct", "["):
+                continue
+            end = _closing(toks, j)
+            body = toks[j + 1 : end]
+            values = [
+                body[n + 2][1] if n + 2 < len(body) and body[n + 2][0] == "str" else None
+                for n in range(len(body) - 1)
+                if body[n] == ("ident", "path") and body[n + 1] == ("punct", "=")
+            ]
+            if not values:
+                continue
+            k = _past_attributes(toks, end + 1)
+            file_module = (
+                not inner
+                and depths[i] == 0
+                and k + 2 < len(toks)
+                and toks[k] == ("ident", "mod")
+                and toks[k + 1][0] == "ident"
+                and toks[k + 2] == ("punct", ";")
+            )
+            for value in values:
+                if file_module:
+                    roots.append(_resolved(folder, value))
+                elif value is None or value.startswith("/") or ".." in value.split("/"):
+                    folders.append(None)
+                else:
+                    folders.append(folder)
+        elif (
+            tok[0] == "ident"
+            and tok[1] in INCLUDE_MACROS
+            and i + 2 < len(toks)
+            and toks[i + 1] == ("punct", "!")
+            and _opens(toks[i + 2])
+        ):
+            names.append(_included_name(toks[i + 3 : _closing(toks, i + 2)]))
+    return roots, folders, names
+
+
+def _cargo_roots(commit, cwd):
+    """The crate roots `Cargo.toml` names with a `path` or `build` key,
+    and None when it cannot be read."""
+    text = git("show", f"{commit}:Cargo.toml", cwd=cwd, allow_missing_path=True)
+    if not text:
+        return []
+    try:
+        manifest = tomllib.loads(text)
+    except tomllib.TOMLDecodeError:
+        return [None]
+    found = []
+    for key in CARGO_TARGETS:
+        targets = manifest.get(key, [])
+        for target in targets if isinstance(targets, list) else [targets]:
+            if isinstance(target, dict) and "path" in target:
+                found.append(_resolved("", target["path"]) if isinstance(target["path"], str) else None)
+    build = manifest.get("package", {}).get("build")
+    if isinstance(build, str):
+        found.append(_resolved("", build))
+    return found
+
+
+def module_loaders(rev, cwd=None):
+    """Everything at `rev` that can load a source file into a build,
+    other than a plain `mod name;` in a conventional parent:
+    `(root files, folders a #[path] can load from, file names an
+    include!-family macro reads, whether any of it could not be read)`.
+
+    Roots are the files that find their children beside them: `src/main.rs`,
+    `src/lib.rs`, `build.rs`, `src/bin/*.rs`, `src/bin/*/main.rs`, any target
+    `Cargo.toml` names, and every file a top-level `#[path] mod x;` loads.
+    The answer is the same for every file a check asks about at one commit,
+    so it is worked out once per commit.
     """
     commit = git("rev-parse", "--verify", f"{rev}^{{commit}}", cwd=cwd).strip()
-    return _path_attribute_targets(commit, None if cwd is None else str(cwd))
+    return _module_loaders(commit, None if cwd is None else str(cwd))
 
 
 @functools.lru_cache(maxsize=None)
-def _path_attribute_targets(commit, cwd):
+def _module_loaders(commit, cwd):
+    tree = set(git("ls-tree", "-r", "-z", "--name-only", commit, cwd=cwd).split("\0")) - {""}
+    roots = [p for p in ("src/main.rs", "src/lib.rs", "build.rs") if p in tree]
+    roots += [p for p in tree if re.fullmatch(r"src/bin/[^/]+\.rs|src/bin/[^/]+/main\.rs", p)]
+    roots += _cargo_roots(commit, cwd)
+    folders, names = [], []
     listed = subprocess.run(
         (
             "git", "grep", "-l", "-z", "-I", "-E",
-            "-e", "path[[:space:]]*=", "-e", "path[[:space:]]*$",
+            "-e", "path[[:space:]]*(=|$)",
+            "-e", "include(_str|_bytes)?[[:space:]]*(!|$)",
             commit, "--", "*.rs",
         ),
         cwd=cwd,
         capture_output=True,
     )
-    if listed.returncode == 1:
-        return ()
-    if listed.returncode != 0:
+    if listed.returncode not in (0, 1):
         raise SystemExit(f"git grep failed: {listed.stderr.decode().strip()}")
-    names = [hit.split(b":", 1)[1].decode() for hit in listed.stdout.split(b"\0") if hit]
-    blobs = subprocess.run(
+    paths = [hit.split(b":", 1)[1].decode() for hit in listed.stdout.split(b"\0") if hit]
+    for path, text in zip(paths, _blobs(commit, paths, cwd)):
+        try:
+            more_roots, more_folders, more_names = _loaders_in(path, rust_tokens(text))
+        except LexError:
+            more_roots, more_folders, more_names = [None], [], []
+        roots += more_roots
+        folders += more_folders
+        names += more_names
+    unknown = None in roots or None in folders or None in names
+    return (
+        frozenset(r for r in roots if r is not None),
+        tuple(f for f in folders if f is not None),
+        frozenset(n for n in names if n is not None),
+        unknown,
+    )
+
+
+def _blobs(commit, paths, cwd):
+    """The text of each of `paths` at `commit`, read in one `git cat-file`."""
+    if not paths:
+        return []
+    out = subprocess.run(
         ("git", "cat-file", "--batch"),
         cwd=cwd,
-        input="".join(f"{commit}:{name}\n" for name in names).encode(),
+        input="".join(f"{commit}:{p}\n" for p in paths).encode(),
         capture_output=True,
         check=True,
     ).stdout
-    targets = []
-    at = 0
-    for _ in names:
-        header_end = blobs.index(b"\n", at)
-        size = int(blobs[at:header_end].split()[2])
-        text = blobs[header_end + 1 : header_end + 1 + size].decode(errors="replace")
+    texts, at = [], 0
+    for _ in paths:
+        header_end = out.index(b"\n", at)
+        size = int(out[at:header_end].split()[2])
+        texts.append(out[header_end + 1 : header_end + 1 + size].decode(errors="replace"))
         at = header_end + 1 + size + 1
-        targets.extend(_path_attributes_in(text))
-    return tuple(targets)
+    return texts
 
 
-def _path_attributes_in(text):
-    """The `path` attribute values in one file's text, as for
-    `path_attribute_targets`."""
-    lines = text.splitlines()
-    kinds = classify(lines)
-    tracker = BlockTracker()
-    code = "\n".join(
-        tracker.feed(line) if kinds[i] in (CODE, ATTR) else "" for i, line in enumerate(lines)
-    )
-    found = []
-    for opened in ATTRIBUTE_OPEN.finditer(code):
-        depth, end = 0, opened.end() - 1
-        while end < len(code):
-            if code[end] == "[":
-                depth += 1
-            elif code[end] == "]":
-                depth -= 1
-                if depth == 0:
-                    break
-            end += 1
-        if not PATH_KEY.search(code[opened.end() : end]):
-            continue
-        first, last = code.count("\n", 0, opened.start()), code.count("\n", 0, end)
-        values = PATH_VALUE.findall("\n".join(lines[first : last + 1]))
-        if values:
-            found.extend(Path(value).name for value in values)
-        else:
-            found.append(None)
-    return found
+def _under(path, folder):
+    """Whether `path` is `folder` or inside it; "" is the repository."""
+    return folder == "" or path == folder or path.startswith(folder + "/")
 
 
 def declared_for_tests_only(rev, path, cwd=None):
-    """Whether, at `rev`, the module in `path` is declared only for tests:
-    its parent file declares it as `#[cfg(test)] mod name;` at least once and
-    never otherwise, so nothing in it compiles into a release build. A test
-    helper module like `src/test_git.rs` is the case.
+    """Whether, at `rev`, nothing but tests compiles the file `path`: a
+    parent declares its module as `#[cfg(test)] mod name;` and nothing else
+    that can load the file names it. A test helper module like
+    `src/test_git.rs` is the case.
 
-    Anything else that names the module in a parent's code - an inline
-    `mod name { .. }`, two declarations on one line, `#[cfg(test)] mod name;`
-    written on one line - leaves the file counted as shipped, and so does a
-    `#[path]` attribute that names a file of this one's name or whose value
-    cannot be read (see `path_attribute_targets`). Literals and `//` comments are
-    removed first, so a trailing comment cannot hide a release declaration
-    and a string cannot fake a test-only one.
+    The parents that can declare it with a plain `mod name;` are the roots in
+    its folder and the `<folder>.rs` / `<folder>/mod.rs` above it, and there
+    every mention of `mod name` must be that test-only declaration, at the top
+    of the file. A file further up can reach it through inline modules
+    (`mod folder { mod name; }`), so any mention of `mod name` there counts as
+    shipped, and so does a file a `#[path]` or an `include!` can load (see
+    `module_loaders`). The parents are read as tokens, so a comment inside a
+    declaration, a line break after `mod` or a raw identifier `r#name` cannot
+    hide one, and a string or comment cannot fake one.
     """
     parts = Path(path).parts
     if len(parts) < 2 or parts[0] != "src" or not path.endswith(".rs"):
         return False
+    roots, folders, names, unknown = module_loaders(rev, cwd=cwd)
+    if unknown or path in roots or Path(path).name in names:
+        return False
+    if any(_under(path, folder) for folder in folders):
+        return False
     if parts[-1] == "mod.rs":
         if len(parts) < 3:
             return False
-        name, dir_parts = parts[-2], parts[:-2]
+        name, home = parts[-2], "/".join(parts[:-2])
     else:
-        name, dir_parts = Path(parts[-1]).stem, parts[:-1]
-    if dir_parts == ("src",):
-        if name in ("main", "lib"):
-            return False
-        parents = ["src/main.rs", "src/lib.rs"]
-    else:
-        folder = "/".join(dir_parts)
-        parents = [f"{folder}.rs", f"{folder}/mod.rs"]
-    file_name = Path(path).name
-    if any(t is None or t == file_name for t in path_attribute_targets(rev, cwd=cwd)):
+        name, home = Path(parts[-1]).stem, "/".join(parts[:-1])
+    if not MODULE_NAME.fullmatch(name):
         return False
-    mention = re.compile(rf"\bmod\s+{re.escape(name)}\b")
+    steps = home.split("/")
+    declarers = {r for r in roots if posixpath.dirname(r) == home}
+    declarers |= {f"{home}.rs", f"{home}/mod.rs"}
+    reachers = {
+        r for r in roots if posixpath.dirname(r) != home and _under(home, posixpath.dirname(r))
+    }
+    reachers |= {
+        f"{'/'.join(steps[:n])}{suffix}" for n in range(1, len(steps)) for suffix in (".rs", "/mod.rs")
+    }
     found = False
-    for parent in parents:
+    for parent in sorted(declarers | reachers):
         text = git("show", f"{rev}:{parent}", cwd=cwd, allow_missing_path=True)
-        ranges = cfg_test_ranges(text)
-        lines = text.splitlines()
-        kinds = classify(lines)
-        tracker = BlockTracker()
-        for n, line in enumerate(lines, 1):
-            if kinds[n - 1] != CODE:
-                continue
-            in_literal = tracker.open_string is not None
-            code = tracker.feed(line)
-            if not mention.search(code):
-                continue
-            if in_literal or not MOD_DECLARATION.match(code) or not inside(n, ranges):
-                return False
-            found = True
+        if not text:
+            continue
+        try:
+            toks = rust_tokens(text)
+            depths = _brace_depths(toks)
+            for m in range(len(toks) - 1):
+                if toks[m] != ("ident", "mod") or toks[m + 1][0] != "ident":
+                    continue
+                if toks[m + 1][1].removeprefix("r#") != name:
+                    continue
+                if parent not in declarers:
+                    return False
+                if depths[m] != 0 or m + 2 >= len(toks) or toks[m + 2] != ("punct", ";"):
+                    return False
+                if ["cfg", "(", "test", ")"] not in _attributes_of(toks, m):
+                    return False
+                found = True
+        except LexError:
+            return False
     return found
 
 
@@ -428,8 +720,8 @@ def ships_nothing(base, head, path, cwd=None):
     # to. `mod tests;` inserted under an existing `#[cfg(test)]` takes the
     # attribute off the item below, which then ships; deleting it does the
     # reverse. Every span the change touched must therefore open at an
-    # untouched attribute that opened a span on the other side too, or have
-    # moved with its attribute (checked above).
+    # untouched attribute that guards the same code on the other side too,
+    # or have moved with its attribute (checked above).
     return _attribute_kept_its_span(
         head_ranges, added, base_ranges, hunks, "head"
     ) and _attribute_kept_its_span(base_ranges, removed, head_ranges, hunks, "base")
@@ -437,15 +729,33 @@ def ships_nothing(base, head, path, cwd=None):
 
 def _attribute_kept_its_span(ranges, touched, other_ranges, hunks, side):
     """True when every span holding a touched line either had its attribute
-    touched too (a module added or removed whole) or opens at an attribute
-    that opens a span on the other side of the diff as well."""
+    touched too (a module added or removed whole) or opens at an untouched
+    attribute that still guards the same code on the other side of the diff.
+
+    Opening a span on both sides is not enough. `mod added;` inserted between
+    an existing `#[cfg(test)]` and the module it guarded takes the attribute
+    off that module, which then ships, while the attribute still opens a span
+    on both sides. So every unchanged line of either span must sit in the
+    other side's span: the change only touched lines inside the module, and
+    the module still covers the code it covered."""
+    other_side = "base" if side == "head" else "head"
+    other_end = dict(other_ranges)
     marked = set(touched)
-    other_starts = {start for start, _ in other_ranges}
     for start, end in ranges:
         if start in marked or not any(start <= n <= end for n in marked):
             continue
-        if counterpart(start, hunks, side) not in other_starts:
+        twin = counterpart(start, hunks, side)
+        if twin not in other_end:
             return False
+        twin_end = other_end[twin]
+        for n in range(start, end + 1):
+            moved = counterpart(n, hunks, side)
+            if moved is not None and not twin <= moved <= twin_end:
+                return False
+        for n in range(twin, twin_end + 1):
+            moved = counterpart(n, hunks, other_side)
+            if moved is not None and not start <= moved <= end:
+                return False
     return True
 
 
