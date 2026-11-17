@@ -58,7 +58,7 @@ Per platform:
 
 ### `Cmd+K` chords
 
-`Cmd`/`Ctrl`+`K` is a leader (VS Code's two-key model): press it, then a second key within 1.5s. Pressing anything that completes no chord cancels the leader and keeps its normal meaning. On Linux `Ctrl`+`K` leads everywhere except the terminal pane, where it goes to the shell, and the editor while vim mode is on, where it kills to the end of the line; a `Cmd` on the second key (`Cmd+K` `Cmd+S`) is `Ctrl` there too.
+`Cmd`/`Ctrl`+`K` is a leader (VS Code's two-key model): press it, then a second key. As in VS Code, the status bar says `(Ctrl+K) was pressed. Waiting for second key of chord...` while it waits, and it stops waiting after 5 seconds or when the window croft runs in loses focus. A second key that completes no chord, `Esc` included, only cancels it, and the status bar says `The key combination (Ctrl+K, X) is not a command.` for 10 seconds. On Linux `Ctrl`+`K` leads everywhere except the terminal pane, where it goes to the shell, and the editor while vim mode is on, where it kills to the end of the line; a `Cmd` on the second key (`Cmd+K` `Cmd+S`) is `Ctrl` there too.
 
 | Keys | Action |
 |------|--------|
