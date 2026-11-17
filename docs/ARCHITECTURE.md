@@ -292,6 +292,7 @@ src/
     ├── workspace_symbols.rs  Go to Symbol in Workspace picker: query fans out to every running server as `workspace/symbol`, rows show kind icon, name and workspace-relative path; Enter opens the definition
     ├── terminal.rs           `portable-pty` + `alacritty_terminal` + ratatui integration: the embedded terminal with selection, scrollback, drag-reorderable panes and maximize mode
     ├── terminal/             the terminal pane's feature files, beside terminal.rs; each file's `//!` doc says what it holds
+    │   ├── mouse.rs         mouse reporting to the program in the pane; which grid cell a screen point is
     │   ├── tests.rs         the terminal pane's own tests
     ├── update_popup.rs   the update popup as a card in the manner of Ghostty's: glyph and title, a label / value grid of the release, rounded pill buttons with the one primary action flush right, and a link row under a divider; framed per theme (gradient box, `surfaces` card, accent line) and pure, handing back where each control landed
     ├── timeline.rs      collapsible TIMELINE section: the active file's git history (`git log --follow`) fetched off-thread, two rows per commit (summary + author/age), click-to-open the commit's diff; a ⋯-menu Explorer sub-view
