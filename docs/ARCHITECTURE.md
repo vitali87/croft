@@ -39,6 +39,7 @@ src/
 │   ├── patches.rs        applying a hunk or line patch to the index or working tree, CRLF endings kept
 │   ├── status.rs         the status snapshot: branch, ahead/behind, changes, ignored paths, the prepared commit message, repositories one folder down
 │   ├── tests.rs          git.rs's own tests
+│   ├── worktrees.rs      lanes and pull-request checkouts in worktrees of their own, and when one is kept
 ├── magic.rs              content-based format detection: a magic-byte signature table (images, PDF, zip family, gzip, xz, bzip2, zstd, tar, SQLite) used as the SECOND routing hint in `Editor::open` — extension first, sniffing decides when it gave no answer or lied
 ├── markdown.rs           rendered Markdown preview (Cmd/Ctrl+Shift+V): pulldown-cmark events to styled ratatui lines, tree-sitter fenced code, inline local images; pure, the editor holds the state
 ├── media.rs              audio/video info view for `.mp3`/`.wav`/`.flac`/`.m4a`/`.mp4`/`.m4v`/`.mov`: pure-Rust header parsers over a bounded head read, never decoding streams, rendered as a markdown card with an optional ffmpeg poster frame
