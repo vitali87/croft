@@ -82,16 +82,17 @@ fn merge(current: Option<&str>, probed: &str) -> String {
 /// printed by an inner `/bin/sh` reading the *environment*: fish expands its
 /// own quoted `$PATH` list space-joined, while the exported variable is
 /// colon-joined in every shell. stdin is closed so a shell that prompts gets
-/// EOF instead of blocking, and the whole thing is bounded by
-/// [`PROBE_TIMEOUT`]. `inherited` is what a GUI launch hands the shell, never
-/// a PATH already repaired from memory (see [`probe_and_remember`]).
-fn probe(shell: &str, inherited: Option<&str>) -> Option<String> {
+/// EOF instead of blocking, and the whole thing is bounded by `timeout`,
+/// [`PROBE_TIMEOUT`] in croft itself. `inherited` is what a GUI launch hands
+/// the shell, never a PATH already repaired from memory (see
+/// [`probe_and_remember`]).
+fn probe(shell: &str, inherited: Option<&str>, timeout: Duration) -> Option<String> {
     let mut cmd = probe_cmd(shell);
     match inherited {
         Some(path) => cmd.env("PATH", path),
         None => cmd.env_remove("PATH"),
     };
-    run_probe(cmd, PROBE_TIMEOUT)
+    run_probe(cmd, timeout)
 }
 
 /// The probe invocation for `shell`, before it is spawned. Split from
@@ -229,8 +230,9 @@ fn remember(file: &Path, shell: &str, path: &str) -> std::io::Result<()> {
 /// remembered when the shell does not answer. The shell must not inherit a
 /// PATH already repaired from memory: whatever it remembered would come back
 /// in its answer, and a directory taken out of an rc file would never leave.
-fn probe_and_remember(shell: &str, inherited: Option<&str>, file: &Path) {
-    if let Some(path) = probe(shell, inherited) {
+/// The shell gets `timeout` to answer, as for [`probe`].
+fn probe_and_remember(shell: &str, inherited: Option<&str>, file: &Path, timeout: Duration) {
+    if let Some(path) = probe(shell, inherited, timeout) {
         let _ = remember(file, shell, &path);
     }
 }
@@ -242,7 +244,12 @@ fn probe_and_remember(shell: &str, inherited: Option<&str>, file: &Path) {
 /// answers exactly what it would for a GUI launch.
 pub fn remember_login_path() {
     let launchd = LAUNCHD_DIRS.join(":");
-    probe_and_remember(&login_shell(), Some(&launchd), &memory_path());
+    probe_and_remember(
+        &login_shell(),
+        Some(&launchd),
+        &memory_path(),
+        PROBE_TIMEOUT,
+    );
 }
 
 /// The user's login shell. launchd sets `SHELL` from the user record for GUI
@@ -292,23 +299,53 @@ pub fn refresh_in_background() {
         return;
     };
     ASKED.call_once(|| {
-        spawn_refresh(login_shell(), inherited.clone(), memory_path());
+        spawn_refresh(
+            login_shell(),
+            inherited.clone(),
+            memory_path(),
+            PROBE_TIMEOUT,
+        );
     });
 }
 
 /// Ask `shell` again on a thread of its own, under the `inherited` PATH, and
-/// remember its answer in `file`, for the next launch.
+/// remember its answer in `file`, for the next launch; `timeout` as for
+/// [`probe`].
 fn spawn_refresh(
     shell: String,
     inherited: Option<String>,
     file: PathBuf,
+    timeout: Duration,
 ) -> std::thread::JoinHandle<()> {
-    std::thread::spawn(move || probe_and_remember(&shell, inherited.as_deref(), &file))
+    std::thread::spawn(move || probe_and_remember(&shell, inherited.as_deref(), &file, timeout))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The probe's deadline stretched for the load the suite puts on this
+    /// machine (#307, #2221): a healthy shell can take longer than
+    /// [`PROBE_TIMEOUT`] to start while thousands of tests run beside it.
+    fn loaded_timeout() -> Duration {
+        crate::test_budget::spawn_budget(PROBE_TIMEOUT)
+    }
+
+    /// Write `script` to `path` as a stand-in login shell and make it ready
+    /// to run (#2221). A test forking while the script was open for writing
+    /// holds it "Text file busy" until that child execs, and a probe takes a
+    /// failed spawn for a shell with no answer. So the stand-in runs once
+    /// here, waiting that out, with `CROFT_STUB_WARMUP` set for a script that
+    /// would otherwise do its slow part. Returns the path as the shell name.
+    fn stand_in_shell(path: &Path, script: &str) -> String {
+        std::fs::write(path, script).unwrap();
+        let mut perm = std::fs::metadata(path).unwrap().permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o755);
+        std::fs::set_permissions(path, perm).unwrap();
+        crate::review_ops::output_retrying_busy(Command::new(path).env("CROFT_STUB_WARMUP", "1"))
+            .expect("the stand-in shell runs");
+        path.display().to_string()
+    }
 
     #[test]
     fn launchd_path_reads_as_stripped() {
@@ -433,22 +470,24 @@ mod tests {
     #[test]
     fn a_gui_launch_never_waits_for_the_login_shell() {
         let dir = tempfile::tempdir().unwrap();
-        let stub = dir.path().join("slow-shell");
-        std::fs::write(
-            &stub,
-            format!("#!/bin/sh\nsleep 1\nprintf '{BEGIN}/new/tools/bin:/usr/bin{END}'\n"),
-        )
-        .unwrap();
-        let mut perm = std::fs::metadata(&stub).unwrap().permissions();
-        std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o755);
-        std::fs::set_permissions(&stub, perm).unwrap();
-        let shell = stub.display().to_string();
+        let shell = stand_in_shell(
+            &dir.path().join("slow-shell"),
+            &format!(
+                "#!/bin/sh\n[ -n \"$CROFT_STUB_WARMUP\" ] && exit 0\nsleep 1\n\
+                 printf '{BEGIN}/new/tools/bin:/usr/bin{END}'\n"
+            ),
+        );
         let file = dir.path().join("login-path");
         remember(&file, &shell, "/old/tools/bin:/usr/bin").unwrap();
         let dock = "/usr/bin:/bin:/usr/sbin:/sbin";
         let start = std::time::Instant::now();
         let fixed = repaired(Some(dock), || recall(&file, &shell));
-        let refresh = spawn_refresh(shell.clone(), Some(dock.into()), file.clone());
+        let refresh = spawn_refresh(
+            shell.clone(),
+            Some(dock.into()),
+            file.clone(),
+            loaded_timeout(),
+        );
         assert!(
             start.elapsed() < Duration::from_millis(500),
             "startup waited {:?} for the login shell",
@@ -472,19 +511,13 @@ mod tests {
     #[test]
     fn a_directory_taken_out_of_the_rc_files_leaves_the_memory() {
         let dir = tempfile::tempdir().unwrap();
-        let stub = dir.path().join("stub-shell");
-        std::fs::write(
-            &stub,
-            format!("#!/bin/sh\nprintf '{BEGIN}/now/bin:%s{END}' \"$PATH\"\n"),
-        )
-        .unwrap();
-        let mut perm = std::fs::metadata(&stub).unwrap().permissions();
-        std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o755);
-        std::fs::set_permissions(&stub, perm).unwrap();
-        let shell = stub.display().to_string();
+        let shell = stand_in_shell(
+            &dir.path().join("stub-shell"),
+            &format!("#!/bin/sh\nprintf '{BEGIN}/now/bin:%s{END}' \"$PATH\"\n"),
+        );
         let file = dir.path().join("login-path");
         remember(&file, &shell, "/gone/bin:/usr/bin:/bin").unwrap();
-        probe_and_remember(&shell, Some("/usr/bin:/bin"), &file);
+        probe_and_remember(&shell, Some("/usr/bin:/bin"), &file, loaded_timeout());
         assert_eq!(
             recall(&file, &shell).as_deref(),
             Some("/now/bin:/usr/bin:/bin")
@@ -528,11 +561,8 @@ mod tests {
         // startup cannot hang; under suite load a healthy shell legitimately
         // exceeds it, so the TEST scales that same deadline (#307) instead of
         // asserting production's startup budget is generous enough for CI.
-        let path = run_probe(
-            probe_cmd(shell),
-            crate::test_budget::spawn_budget(PROBE_TIMEOUT),
-        )
-        .expect("the login shell must report a PATH");
+        let path = run_probe(probe_cmd(shell), loaded_timeout())
+            .expect("the login shell must report a PATH");
         assert!(path.contains("/bin"), "got {path:?}");
     }
 
@@ -549,9 +579,8 @@ mod tests {
     #[test]
     fn a_dock_launch_ends_up_seeing_the_users_own_directories() {
         let dir = tempfile::tempdir().unwrap();
-        let stub = dir.path().join("stub-shell");
-        std::fs::write(
-            &stub,
+        let shell = stand_in_shell(
+            &dir.path().join("stub-shell"),
             "#!/bin/sh\n\
              [ \"$1\" = -l ] || exit 64\n\
              [ \"$2\" = -i ] || exit 64\n\
@@ -559,16 +588,11 @@ mod tests {
              [ $# -eq 4 ] || exit 64\n\
              PATH=\"/stub/tools/bin:$PATH\"; export PATH\n\
              exec /bin/sh -c \"$4\"\n",
-        )
-        .unwrap();
-        let mut perm = std::fs::metadata(&stub).unwrap().permissions();
-        std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o755);
-        std::fs::set_permissions(&stub, perm).unwrap();
+        );
         let dock = "/usr/bin:/bin:/usr/sbin:/sbin:/Applications/Ghostty.app/Contents/MacOS";
         // One launch asks the shell and remembers; the next one runs under it.
-        let shell = stub.display().to_string();
         let file = dir.path().join("login-path");
-        probe_and_remember(&shell, Some(dock), &file);
+        probe_and_remember(&shell, Some(dock), &file, loaded_timeout());
         let fixed = repaired(Some(dock), || recall(&file, &shell))
             .expect("a Dock launch must have its PATH repaired");
         assert!(
@@ -612,7 +636,8 @@ mod tests {
             eprintln!("skipping: tcsh not installed");
             return;
         }
-        let path = probe("/bin/tcsh", Some("/usr/bin:/bin")).expect("tcsh must report a PATH");
+        let path = probe("/bin/tcsh", Some("/usr/bin:/bin"), loaded_timeout())
+            .expect("tcsh must report a PATH");
         assert!(path.contains("/bin"), "got {path:?}");
     }
 
@@ -636,7 +661,7 @@ mod tests {
         .unwrap();
         let mut cmd = probe_cmd("/bin/tcsh");
         cmd.env("HOME", home.path());
-        let path = run_probe(cmd, PROBE_TIMEOUT).expect("tcsh must answer");
+        let path = run_probe(cmd, loaded_timeout()).expect("tcsh must answer");
         assert!(
             path.split(':').any(|e| e == "/from/login"),
             "~/.login was not sourced; the csh user's PATH is lost: {path:?}"
@@ -660,20 +685,15 @@ mod tests {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
-        let stub = dir.path().join("stub-shell");
-        std::fs::write(
-            &stub,
-            format!(
+        let shell = stand_in_shell(
+            &dir.path().join("stub-shell"),
+            &format!(
                 "#!/bin/sh\n\
                  exec python3 -c 'import os; \
                  print(\"{BEGIN}%d{END}\" % os.getsid(0))'\n"
             ),
-        )
-        .unwrap();
-        let mut perm = std::fs::metadata(&stub).unwrap().permissions();
-        std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o755);
-        std::fs::set_permissions(&stub, perm).unwrap();
-        let sid = run_probe(probe_cmd(&stub.display().to_string()), PROBE_TIMEOUT)
+        );
+        let sid = run_probe(probe_cmd(&shell), loaded_timeout())
             .expect("the stub must report its session id");
         let own = unsafe { libc::getsid(0) };
         assert_ne!(
@@ -704,7 +724,7 @@ mod tests {
         let mut cmd = Command::new("/bin/sh");
         cmd.args(["-c", &format!("printf '{BEGIN}/opt/x:/usr/bin{END}'")]);
         assert_eq!(
-            run_probe(cmd, PROBE_TIMEOUT).as_deref(),
+            run_probe(cmd, loaded_timeout()).as_deref(),
             Some("/opt/x:/usr/bin")
         );
     }

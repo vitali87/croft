@@ -1477,10 +1477,13 @@ impl App {
         };
         self.codeql_version = None;
         let text = crate::codeql_query::version_information(env!("CARGO_PKG_VERSION"), &cli);
-        copy_to_clipboard(&text);
+        let landing = self.copy_where_pasted(&text);
         self.status = match cli {
-            Ok(_) => String::from("Copied CodeQL version information"),
-            Err(why) => format!("Copied version information; the CodeQL CLI is unavailable: {why}"),
+            Ok(_) => format!("Copied CodeQL version information{}", landing.note()),
+            Err(why) => format!(
+                "Copied version information{}; the CodeQL CLI is unavailable: {why}",
+                landing.note()
+            ),
         };
         true
     }
@@ -2857,11 +2860,12 @@ impl App {
         };
         self.status = match crate::codeql_submit::repository_list(&run) {
             Some(list) => {
-                copy_to_clipboard(&list);
+                let landing = self.copy_where_pasted(&list);
                 format!(
-                    "Copied the {} repositories of variant analysis {}",
+                    "Copied the {} repositories of variant analysis {}{}",
                     list.lines().count(),
-                    run.id
+                    run.id,
+                    landing.note()
                 )
             }
             None => format!(

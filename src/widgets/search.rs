@@ -3546,7 +3546,7 @@ mod tests {
     fn dotfile_repo() -> TempDir {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path();
-        let ok = std::process::Command::new("git")
+        let ok = crate::test_git::test_git_command()
             .args(["init", "-q"])
             .current_dir(root)
             .status()

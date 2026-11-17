@@ -667,6 +667,7 @@ impl App {
             // post-draw OSC image flush both treat it as absent (no ghosting).
             self.sidebar_areas = SidebarAreas::default();
         }
+        crate::startup_trace::mark("activity bar drawn");
 
         // Secondary side bar: the active file's Outline, on the edge opposite
         // the primary side bar.
@@ -697,6 +698,7 @@ impl App {
             self.agent_lane_panel.hover_pointer = panel_pointer;
             self.dependencies.hover_pointer = panel_pointer;
             self.extensions.hover_pointer = panel_pointer;
+            self.testing.hover_pointer = panel_pointer;
             self.commit_graph.hover_pointer = panel_pointer;
             // Explorer stacks its toggled sub-views (Open Editors / Folders /
             // Outline / Timeline / Dependencies) inside the usable strip.
@@ -752,6 +754,7 @@ impl App {
                 }
             }
         }
+        crate::startup_trace::mark("side bar drawn");
         if !self.editor_layout.is_split() && self.editor.is_blank_initial() {
             self.render_welcome(frame, editor_area);
             // The previous frame may have rendered an image-preview tab
@@ -1143,6 +1146,7 @@ impl App {
             };
             self.paint_layout_icons(frame, strip_row);
         }
+        crate::startup_trace::mark("editor drawn");
         if let Some(area) = terminal_area {
             // Left/Right panel alignment narrows the terminal to one half of
             // its band; paint the leftover strip with the editor background so
@@ -1182,6 +1186,14 @@ impl App {
                 area
             };
             self.paint_panel_tabs(frame, strip);
+            // The render-time pointer cell, fed to the panel's views as it is
+            // to the side bar's above, so the row under the mouse lights up on
+            // every move and goes dark when the pointer leaves (#2068).
+            let panel_pointer = self.pointer_cell;
+            self.problems.hover_pointer = panel_pointer;
+            self.output.hover_pointer = panel_pointer;
+            self.ports.hover_pointer = panel_pointer;
+            self.captures.hover_pointer = panel_pointer;
             match self.bottom_panel_tab {
                 BottomPanelTab::Terminal => {
                     let n = self.terminals.len().max(1);
@@ -1573,6 +1585,7 @@ impl App {
             );
         }
 
+        crate::startup_trace::mark("panel drawn");
         // Owned snapshot: the spans borrow the status, and borrowing it
         // through scm_worker() would pin all of &self for the whole render.
         let scm_status = self.scm_worker().status().clone();
@@ -2486,6 +2499,7 @@ impl App {
             frame.set_cursor_position((cx, cy));
         }
         self.park_screen_reader_cursor(frame);
+        crate::startup_trace::mark("status bar and popups drawn");
     }
 
     /// What screen reader mode describes this frame (#621).

@@ -120,7 +120,8 @@ pub(super) const TREE_TYPEAHEAD_WINDOW: std::time::Duration = std::time::Duratio
 ///
 /// Test-side entry with no viewer lookup, so a viewer installed on the host
 /// can never reach the built-in rows these tests assert; the app itself goes
-/// through [`build_tree_context_menu_items_in_dir`] with the dir it carries.
+/// through [`App::tree_context_menu_items`] with the dir and the disabled set
+/// it carries.
 #[cfg(test)]
 pub(super) fn build_tree_context_menu_items(
     node: Option<&crate::widgets::file_tree::Node>,
@@ -140,32 +141,6 @@ pub(super) fn build_tree_context_menu_items(
         clipboard,
         compare_anchor,
         |_| None,
-    )
-}
-
-/// [`build_tree_context_menu_items`] reading the viewers under an explicit
-/// config dir: the app passes the dir it carries, so the row it builds and
-/// the click that resolves the row read the same extensions.
-pub(super) fn build_tree_context_menu_items_in_dir(
-    config_dir: &Path,
-    node: Option<&crate::widgets::file_tree::Node>,
-    root: &Path,
-    selection: &[PathBuf],
-    target_dir: &Path,
-    clipboard: Option<&ExplorerClipboard>,
-    compare_anchor: Option<&Path>,
-) -> Vec<(String, MenuAction)> {
-    build_tree_context_menu_items_with(
-        node,
-        root,
-        selection,
-        target_dir,
-        clipboard,
-        compare_anchor,
-        |file| {
-            crate::mcp::registry::viewer_for_path_in_dir(config_dir, file)
-                .map(|v| (v.label.clone(), v.key()))
-        },
     )
 }
 
@@ -374,6 +349,35 @@ pub(super) fn zoxide_jump_status(jump: &crate::widgets::zoxide_jump::ZoxideJump)
 }
 
 impl App {
+    /// The Explorer's right-click menu (see [`build_tree_context_menu_items`]),
+    /// with the viewer row read from the extensions under the app's config
+    /// dir and its own disabled set, so the row it builds and the click that
+    /// resolves the row read the same extensions, on or off as the
+    /// Extensions panel shows them (#2076).
+    pub(super) fn tree_context_menu_items(
+        &self,
+        node: Option<&crate::widgets::file_tree::Node>,
+        selection: &[PathBuf],
+        target_dir: &Path,
+    ) -> Vec<(String, MenuAction)> {
+        build_tree_context_menu_items_with(
+            node,
+            &self.tree.root,
+            selection,
+            target_dir,
+            self.tree_clipboard.as_ref(),
+            self.compare_anchor.as_deref(),
+            |file| {
+                crate::mcp::registry::viewer_for_path_in_dir(
+                    &self.config_dir,
+                    &self.disabled_extensions,
+                    file,
+                )
+                .map(|v| (v.label.clone(), v.key()))
+            },
+        )
+    }
+
     /// What the poll stats for open tabs: each tab's file, and for a SQLite
     /// tab its write-ahead log too, where a WAL-mode app's commits land
     /// while the database file stays untouched (#1643). The log may not

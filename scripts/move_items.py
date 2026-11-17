@@ -299,7 +299,159 @@ APP = Target(
 )
 
 # What each file split out of src/widgets/editor.rs holds, as FILES above.
-EDITOR_FILES = {}
+EDITOR_FILES = {
+    "viewers": (
+        "Files the editor shows rather than edits as text: pictures and SVG, PDF pages,\n"
+        "spreadsheet and SQLite grids (their edits and saves too), archives, hex, logs and gzip,\n"
+        "SARIF, and the Markdown and notebook previews.",
+        "editor's file viewer",
+        "pictures, PDF, spreadsheets and SQLite, archives, hex, logs, Markdown and notebook previews",
+    ),
+    "diff_view": (
+        "The diff and merge views: side-by-side and inline diffs, the three-way merge panes and\n"
+        "their accept chips, merge conflicts, and a file as it was at a commit.",
+        "editor's diff and merge view",
+        "side-by-side and inline diffs, merge panes, conflicts, a file at a commit",
+    ),
+    "span_edits": (
+        "Edits that arrive from elsewhere: language servers, formatters and peers, applied as\n"
+        "text spans that keep the caret, the view and the undo history in step.",
+        "editor's span edit",
+        "edits from language servers, formatters and peers, applied as text spans",
+    ),
+    "undo": (
+        "Undo and redo: snapshots, undo groups and coalescing, the stack limits, and the history\n"
+        "a closed tab keeps for when its file is opened again.",
+        "editor's undo history",
+        "undo and redo, undo groups, history kept for a reopened file",
+    ),
+    "disk": (
+        "Opening, reloading and saving a file: reading and decoding it, line endings and\n"
+        "encodings, outside changes and conflicts, write protection, and the cleanups on save.",
+        "editor's open and save",
+        "opening, reloading and saving: encodings, line endings, outside changes, save cleanups",
+    ),
+    "gutter": (
+        "The gutter and its marks: breakpoints, bookmarks, git change marks and blame, the\n"
+        "overview ruler, line numbers, and keeping marks on their lines as text moves.",
+        "editor gutter",
+        "breakpoints, bookmarks, git marks and blame, overview ruler, line numbers",
+    ),
+    "wrap": (
+        "Soft wrap and comment boxes: the rows each line takes on screen, and drawing and\n"
+        "clicking the comment boxes shown between lines.",
+        "editor's soft wrap and comment box",
+        "soft wrap rows, comment boxes between lines",
+    ),
+    "highlighting": (
+        "Syntax colouring: highlight passes on and off the UI thread, carrying colours across an\n"
+        "edit, bracket-pair colours and colour swatches.",
+        "editor's syntax colouring",
+        "syntax highlight passes, colours carried across edits, bracket colours, swatches",
+    ),
+    "lsp_overlays": (
+        "What language servers report, laid over the text: semantic tokens, inlay hints, links,\n"
+        "colours, occurrences, diagnostics, inline values, code lenses and ghost text.",
+        "editor's language-server overlay",
+        "semantic tokens, inlay hints, diagnostics, links, code lenses, ghost text",
+    ),
+    "typing": (
+        "Typing and deleting: inserting and pasting text, overwrite mode, auto-closed pairs,\n"
+        "quotes and tags, and what completion needs to know about the caret.",
+        "editor's typing",
+        "typing, pasting and deleting, auto-closed pairs, quotes and tags",
+    ),
+    "on_enter": (
+        "What Enter does: auto-indent, continuing comments and lists, the per-language Enter\n"
+        "rules (Markdown, YAML and others), and re-indenting a paste.",
+        "editor's Enter and auto-indent",
+        "Enter, auto-indent, comment continuation, per-language Enter rules, paste re-indent",
+    ),
+    "snippets": (
+        "Snippets and their tab stops, and Emmet: expanding abbreviations, wrapping, and editing\n"
+        "the tag at the caret.",
+        "editor's snippet and Emmet",
+        "snippets and tab stops, Emmet",
+    ),
+    "multi_cursor": (
+        "Several carets at once: adding carets, selecting occurrences, box and column\n"
+        "selection, and applying an edit at every caret.",
+        "editor's multi-cursor",
+        "multiple carets, occurrence selection, box and column selection",
+    ),
+    "selection": (
+        "Selections: making and clearing them, the selected text, linked editing, and expanding\n"
+        "or shrinking a selection by syntax.",
+        "editor's selection",
+        "selections, linked editing, expand and shrink selection",
+    ),
+    "folding": (
+        "Folding and indent guides: fold ranges from indentation, language servers and #region\n"
+        "markers, hidden lines, and the guides drawn at each indent.",
+        "editor's folding",
+        "fold ranges and hidden lines, #region markers, indent guides",
+    ),
+    "line_commands": (
+        "Whole-line commands: move, duplicate, delete, join and sort lines, indent and dedent,\n"
+        "trim whitespace, replace in place, and converting indentation.",
+        "editor's line command",
+        "move, duplicate, delete, join, sort and indent lines, convert indentation",
+    ),
+    "comments": (
+        "Comment toggling: line and block comments for each language, JSX comments, and the\n"
+        "comment tokens each language uses.",
+        "editor's comment toggling",
+        "toggle line and block comments, per-language comment tokens",
+    ),
+    "transforms": (
+        "Text transforms: changing case, bumping the number at the caret, and transposing\n"
+        "characters.",
+        "editor's text transform",
+        "change case, bump numbers, transpose characters",
+    ),
+    "navigation": (
+        "Moving the caret and the view: arrows, words, Home and End, pages, Go to Line,\n"
+        "scrolling, the minimap and the scrollbar.",
+        "editor's caret movement and scrolling",
+        "caret movement, scrolling, Go to Line, minimap",
+    ),
+    "symbol_tabs": (
+        "Symbol tabs and sibling tabs of one file: keeping a symbol tab on its symbol, and\n"
+        "mirroring a sibling's text, unsaved state and caret.",
+        "editor's symbol tab",
+        "symbol tabs, sibling tabs of one file kept in step",
+    ),
+    "brackets": (
+        "Brackets: matching pairs, jumping and selecting to the matching bracket, and\n"
+        "highlighting the pair at the caret.",
+        "editor's bracket matching",
+        "bracket matching, jump and select to the matching bracket",
+    ),
+    "mouse": (
+        "The mouse in the editor: clicks, double and triple clicks, drags, and what lies under\n"
+        "the pointer (a word, a diagnostic, a hover region).",
+        "editor's mouse handling",
+        "clicks, drags, and what lies under the pointer",
+    ),
+    "language": (
+        "Language and indentation settings: picking a buffer's language, detecting and setting\n"
+        "its indentation, whitespace display and rulers.",
+        "editor's language and indentation setting",
+        "language picking, indentation detection, whitespace display, rulers",
+    ),
+    "render": (
+        "Drawing the editor: each row's text, colours and overlays, the caret, selections and\n"
+        "search matches, diagnostics, and how wide each character is drawn.",
+        "editor drawing",
+        "drawing rows, caret, selections, search matches and diagnostics; character widths",
+    ),
+    "tabs": (
+        "The editor's tabs: opening, closing, pinning and moving them, previews and diff tabs,\n"
+        "the tab strip and its labels, and the breadcrumbs.",
+        "editor tab",
+        "editor tabs: open, close, pin, move, previews, tab strip, breadcrumbs",
+    ),
+}
 
 EDITOR = Target(
     "editor", "scripts/split_editor_manifest.tsv", "src/widgets/editor.rs",
@@ -318,7 +470,251 @@ EDITOR = Target(
     ),
 )
 
-TARGETS = {t.name: t for t in (APP, EDITOR)}
+# What each file split out of src/lsp/manager.rs holds, as FILES above.
+LSP_FILES = {
+    "discovery": (
+        "Finding each file's server: its language and project root, the server's config, and\n"
+        "the executable on PATH, in a toolchain's folders or through rustup, and the note shown\n"
+        "once when a server is missing.",
+        "language-server manager's server discovery",
+        "a file's language and project root, server config, finding the executable, rustup",
+    ),
+    "capabilities": (
+        "What croft tells a server it can do: the client capabilities sent at initialize, and\n"
+        "the standard semantic token types and modifiers it declares.",
+        "language-server manager's client capabilities",
+        "the client capabilities sent at initialize, standard semantic token types",
+    ),
+    "diagnostics": (
+        "Diagnostics: the problems servers report, pushed or pulled per document and for the\n"
+        "whole workspace, with their result ids, debounce and timeouts.",
+        "language-server manager's diagnostics",
+        "diagnostics pushed and pulled, per document and workspace-wide",
+    ),
+    "completion": (
+        "Completion and its kin: completion lists and resolving an item, trigger characters,\n"
+        "signature help, and inline (ghost text) completion.",
+        "language-server manager's completion",
+        "completion, trigger characters, signature help, inline completion",
+    ),
+    "hover": (
+        "Hover, and rust-analyzer's own requests (expand macro, parent module and others).",
+        "language-server manager's hover",
+        "hover, rust-analyzer's own requests",
+    ),
+    "navigation": (
+        "Going to code: definition, declaration, type definition, implementation, references,\n"
+        "and the call and type hierarchies.",
+        "language-server manager's go-to navigation",
+        "definition, declaration, type definition, implementation, references, hierarchies",
+    ),
+    "symbols": (
+        "Symbols: a document's outline, and workspace symbol search.",
+        "language-server manager's symbols",
+        "document outline, workspace symbol search",
+    ),
+    "semantic_tokens": (
+        "Semantic tokens: whole-document and range requests, the server's legend, and turning\n"
+        "its token stream into the editor's batches.",
+        "language-server manager's semantic tokens",
+        "semantic tokens, whole and by range, the server's legend",
+    ),
+    "decorations": (
+        "What servers lay over the text besides tokens: inlay hints, document links, code\n"
+        "lenses, folding ranges, and document colours and their presentations.",
+        "language-server manager's text decorations",
+        "inlay hints, links, code lenses, folding ranges, document colours",
+    ),
+    "text_ranges": (
+        "Ranges a server reports around the caret: occurrences of the symbol, linked editing\n"
+        "ranges, and the selection ranges that expand and shrink a selection.",
+        "language-server manager's text range",
+        "symbol occurrences, linked editing ranges, selection ranges",
+    ),
+    "rename": (
+        "Renaming: rename and prepare rename, and the edits servers make when files are renamed.",
+        "language-server manager's rename",
+        "rename, prepare rename, file renames",
+    ),
+    "code_actions": (
+        "Code actions: asking for them with the diagnostics at hand, resolving one, and running\n"
+        "a server command.",
+        "language-server manager's code action",
+        "code actions, resolving them, server commands",
+    ),
+    "formatting": (
+        "Formatting: a whole document, a range, and as you type.",
+        "language-server manager's formatting",
+        "formatting a document, a range, and on type",
+    ),
+    "documents": (
+        "Keeping servers in step with open documents: open, change, save and close, the text\n"
+        "each server last saw, and the files the workspace watcher reports changed.",
+        "language-server manager's document sync",
+        "open, change, save and close notifications, watched files",
+    ),
+    "servers": (
+        "Running the servers: starting the ones a file needs, pre-warming the workspace,\n"
+        "restarting a server that died, swapping in a new registry, and which server serves a\n"
+        "document.",
+        "language-server manager's server lifecycle",
+        "starting, pre-warming, restarting and replacing servers; which server serves a file",
+    ),
+    "worker": (
+        "The worker loop: the manager's thread that takes each command and routes it to the\n"
+        "servers.",
+        "language-server manager's worker loop",
+        "the worker loop that routes each command to the servers",
+    ),
+}
+
+LSP = Target(
+    "lsp", "scripts/split_lsp_manifest.tsv", "src/lsp/manager.rs",
+    "src/lsp/manager", LSP_FILES,
+    Tree(
+        "│   ├── manager.rs ",
+        "│   ├── manager/              the language-server manager's feature files, beside "
+        "manager.rs; each file's `//!` doc says what it holds",
+        "│   │   ├── ", 20,
+    ),
+    "lsp-",
+    (
+        "The language-server manager's own tests, moved out of manager.rs (#2062).",
+        "the language-server manager's tests",
+        "the language-server manager's own tests",
+    ),
+)
+
+# What each file split out of src/widgets/terminal.rs holds, as FILES above.
+TERMINAL_FILES = {
+    "mouse": (
+        "Mouse reporting: whether the program in the pane asked for mouse events, a click, drag or\n"
+        "wheel encoded as the report it expects, and which grid cell a screen point falls on.",
+        "terminal pane's mouse reporting",
+        "mouse reporting to the program in the pane; which grid cell a screen point is",
+    ),
+    "selection": (
+        "Selecting text: making, extending and clearing a selection, words and blocks, keeping it\n"
+        "on its text as output scrolls, alt-screen selections, the copy cursor, and the text a\n"
+        "selection holds.",
+        "terminal pane's selection",
+        "selections: make, extend, clear, words and blocks, keep them on their text as output "
+        "scrolls; the selected text",
+    ),
+    "clock": (
+        "The scroll clock and row times: how far output has scrolled, which keeps selections and\n"
+        "notes on their text, and the time each row was printed.",
+        "terminal pane's scroll clock",
+        "the scroll clock that keeps selections and notes in place; each row's print time",
+    ),
+    "captures": (
+        "What a clear wipes away: spotting a program clearing the screen, keeping the rows it\n"
+        "cleared, finding a captured line again, and the rewind buffer.",
+        "terminal pane's captured rows",
+        "spotting screen clears, keeping the rows they wipe, the rewind buffer",
+    ),
+    "annotations": (
+        "Notes pinned to output, and the text under a masked secret for click-to-reveal.",
+        "terminal pane's note",
+        "notes pinned to output; revealing a masked secret",
+    ),
+    "commands": (
+        "Shell integration: the prompt and command marks the shell reports, finished commands and\n"
+        "their decorations, a command's input and output text, jumping between prompts, and the\n"
+        "prompt line as typed.",
+        "terminal pane's shell integration",
+        "shell-integration marks, finished commands and their decorations, prompt jumps, the "
+        "typed prompt line",
+    ),
+    "shell_env": (
+        "The environment a pane's shell starts in: shell integration for each shell, the terminal\n"
+        "and locale variables, and croft's helpers on PATH.",
+        "terminal pane's shell environment",
+        "the shell's start-up environment: integration for each shell, terminal and locale "
+        "variables, croft's helpers on PATH",
+    ),
+    "processes": (
+        "The pane's processes: the shell and the foreground process, their names, command lines\n"
+        "and working directories, and changing directory.",
+        "terminal pane's process",
+        "the shell and foreground process: names, command lines, working directories, `cd`",
+    ),
+    "spawn": (
+        "Starting a pane: spawning the shell or a program, attaching to a hosted pane, the reader\n"
+        "thread that parses its output, and replaying a saved transcript.",
+        "terminal pane's start-up",
+        "starting a pane: spawn or attach, the output reader thread, replaying a saved "
+        "transcript",
+    ),
+    "backend": (
+        "The process behind a pane: the local pty or the session host, waiting on its output,\n"
+        "resizing it, noticing it exit, and shutting it down.",
+        "terminal pane's process link",
+        "the local pty or session host behind a pane: output waits, resize, exit, shutdown",
+    ),
+    "text": (
+        "Reading the grid as text: visible and wrapped lines, logical rows across soft wraps, find\n"
+        "lines, and the screen as ANSI with its colours.",
+        "terminal pane's grid text",
+        "the grid as text: visible and wrapped lines, logical rows, find lines, ANSI with colours",
+    ),
+    "scroll": (
+        "Scrolling and resizing: the scrollback offset, scrolling to a line, clearing the screen\n"
+        "and scrollback, and reflowing the grid on resize.",
+        "terminal pane's scrolling",
+        "scrolling, clearing the scrollback, reflowing the grid on resize",
+    ),
+    "input": (
+        "Writing to the pane: typed input, pastes and bracketed paste, and the clipboard\n"
+        "sequences.",
+        "terminal pane's input",
+        "typed input, pastes, bracketed paste, clipboard sequences",
+    ),
+    "images": (
+        "Pictures a program prints into the pane: keeping them and placing them on the grid.",
+        "terminal pane's image",
+        "pictures printed into the pane and where they sit",
+    ),
+    "overlays": (
+        "What is painted over the text: find matches, quick-select hints, trigger highlights,\n"
+        "problem-matcher watches, links and the colour palette.",
+        "terminal pane's overlay",
+        "find matches, quick-select hints, triggers, problem watches, links, the palette",
+    ),
+    "status": (
+        "The pane's state the app reads each frame: its label and name, the agent in it, its\n"
+        "reported status and progress, bells, notifications and ports, and whether it is quiet\n"
+        "or untouched.",
+        "terminal pane's status",
+        "label and name, agent, status and progress, bells, notifications, ports, quiet and "
+        "untouched",
+    ),
+    "render": (
+        "Drawing the pane: each cell's text and colours, selections, overlays, decorations and\n"
+        "notes.",
+        "terminal pane's drawing",
+        "drawing each cell, selections, overlays, decorations and notes",
+    ),
+}
+
+TERMINAL = Target(
+    "terminal", "scripts/split_terminal_manifest.tsv", "src/widgets/terminal.rs",
+    "src/widgets/terminal", TERMINAL_FILES,
+    Tree(
+        "    ├── terminal.rs ",
+        "    ├── terminal/             the terminal pane's feature files, beside terminal.rs; "
+        "each file's `//!` doc says what it holds",
+        "    │   ├── ", 16,
+    ),
+    "terminal-",
+    (
+        "The terminal pane's own tests, moved out of terminal.rs (#2062).",
+        "the terminal pane's tests",
+        "the terminal pane's own tests",
+    ),
+)
+
+TARGETS = {t.name: t for t in (APP, EDITOR, LSP, TERMINAL)}
 
 # Kinds whose declaration can carry a visibility.
 VISIBLE = {"fn", "const", "static", "struct", "enum", "union", "trait", "type"}
@@ -597,18 +993,26 @@ def add_arch_row(text, file, t=APP, desc=None):
     lines = text.split("\n")
     tree = t.tree
     name = f"{file}.rs"
-    if any(ln.startswith(f"{tree.row}{name} ") for ln in lines):
-        return text
     start = next((n for n, ln in enumerate(lines) if ln.startswith(tree.anchor)), None)
     if start is None:
         raise ManifestError(f"{ARCH} has no row starting {tree.anchor.strip()!r} to list {name} by")
+    folder = tree.folder and lines[start + 1].startswith(tree.folder.split("/")[0] + "/")
     if tree.folder:
-        if not lines[start + 1].startswith(tree.folder.split("/")[0] + "/"):
-            lines.insert(start + 1, tree.folder)
         start += 1
     row = re.compile("^" + re.escape(tree.row) + r"(\S+)")
+    # Only the target's own rows count: another folder (the editor's beside
+    # the terminal's) lists its files with the same indentation.
+    end = start + 1
+    while end < len(lines) and row.match(lines[end]):
+        end += 1
+    if (folder or not tree.folder) and any(
+            ln.startswith(f"{tree.row}{name} ") for ln in lines[start + 1:end]):
+        return text
+    if tree.folder and not folder:
+        lines.insert(start, tree.folder)
+        end = start + 1
     n = start + 1
-    while n < len(lines) and (m := row.match(lines[n])) and m.group(1) < name \
+    while n < end and (m := row.match(lines[n])) and m.group(1) < name \
             and not m.group(1).endswith("/"):
         n += 1
     text_ = t.files[file][2] if desc is None else desc

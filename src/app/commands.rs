@@ -462,17 +462,21 @@ impl App {
         // they're discoverable alongside the built-ins (eager registration; the
         // server is only spawned when one is actually invoked).
         let ext_commands: Vec<crate::widgets::command_palette::ExtensionCommand> =
-            crate::mcp::registry::contributed_commands()
-                .into_iter()
-                .chain(crate::mcp::registry::contributed_viewer_commands_in_dir(
-                    &self.config_dir,
-                ))
-                .map(|c| crate::widgets::command_palette::ExtensionCommand {
-                    ext_id: c.ext_id,
-                    id: c.id,
-                    title: c.title,
-                })
-                .collect();
+            crate::mcp::registry::contributed_commands_in_dir(
+                &self.config_dir,
+                &self.disabled_extensions,
+            )
+            .into_iter()
+            .chain(crate::mcp::registry::contributed_viewer_commands_in_dir(
+                &self.config_dir,
+                &self.disabled_extensions,
+            ))
+            .map(|c| crate::widgets::command_palette::ExtensionCommand {
+                ext_id: c.ext_id,
+                id: c.id,
+                title: c.title,
+            })
+            .collect();
         palette.set_extension_commands(ext_commands);
         // VS Code offers Pin Editor on an unpinned tab and Unpin Editor on
         // a pinned one (#852), never the one that would do nothing.
@@ -725,8 +729,11 @@ impl App {
     /// A palette `viewer:<extension id>/<viewer id>` row: open the active
     /// editor file in that viewer, if the file is a kind it handles.
     pub(super) fn run_viewer_command(&mut self, viewer_id: &str) {
-        let Some(viewer) = crate::mcp::registry::viewer_by_id_in_dir(&self.config_dir, viewer_id)
-        else {
+        let Some(viewer) = crate::mcp::registry::viewer_by_id_in_dir(
+            &self.config_dir,
+            &self.disabled_extensions,
+            viewer_id,
+        ) else {
             self.status = format!("Viewer '{viewer_id}' is unavailable");
             return;
         };
@@ -782,9 +789,11 @@ impl App {
             self.run_viewer_command(viewer_id);
             return;
         }
-        let Some(resolved) =
-            crate::mcp::registry::resolve_command_in_dir(&self.config_dir, command_id)
-        else {
+        let Some(resolved) = crate::mcp::registry::resolve_command_in_dir(
+            &self.config_dir,
+            &self.disabled_extensions,
+            command_id,
+        ) else {
             self.status = format!("Extension command '{command_id}' is unavailable");
             return;
         };
@@ -2227,6 +2236,7 @@ impl App {
             Cmd::OpenWorkspaceOnSshHost => self.open_workspace_on_ssh_host(),
             Cmd::ScrubHistory => self.scrub_history(),
             Cmd::DebugInstallDelve => self.install_delve(),
+            Cmd::DropToLocal => self.drop_to_local_if_remote(),
             Cmd::RemoteSyncConfigNow => {
                 self.open_input_prompt(crate::widgets::input_prompt::InputPrompt::new(
                     crate::widgets::input_prompt::InputPurpose::SyncConfigHost,

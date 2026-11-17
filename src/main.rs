@@ -132,6 +132,8 @@ mod terminal_session;
 mod termux;
 #[cfg(test)]
 mod test_budget;
+#[cfg(test)]
+mod test_git;
 mod testing;
 mod tex_text;
 mod text_edit;

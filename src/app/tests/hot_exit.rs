@@ -2750,3 +2750,24 @@ fn an_unsaved_edit_after_reopen_as_text_is_still_backed_up() {
             .starts_with("xtop")
     );
 }
+
+/// #2068: a restored session that had the editor focused draws the editor
+/// focused, not the Explorer. Restoring set the focus without the flags each
+/// pane draws from, so keys went to an editor drawn as unfocused.
+#[test]
+fn a_restored_editor_focus_is_drawn_on_the_editor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("a.txt");
+    std::fs::write(&p, "one\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&p).unwrap();
+    app.focus_pane(Pane::Editor);
+    let state = app.capture_session_state();
+
+    let mut next = App::new(tmp.path().to_path_buf()).unwrap();
+    assert!(next.tree.focused, "a new window starts in the Explorer");
+    next.apply_session_state(&state);
+    assert!(next.focus == Pane::Editor, "keys go to the editor");
+    assert!(next.editor.focused, "the editor draws focused");
+    assert!(!next.tree.focused, "the Explorer does not");
+}
