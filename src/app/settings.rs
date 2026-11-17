@@ -1394,30 +1394,17 @@ impl App {
         self.inline_blame_enabled = !p.disable_inline_blame;
         self.editor.blame_enabled = self.inline_blame_enabled;
         self.indent_guides_enabled = !p.disable_indent_guides;
-        self.editor.show_indent_guides = self.indent_guides_enabled;
         self.home_walks_rows = p.home_walks_wrapped_rows;
         self.bracket_colors_enabled = !p.disable_bracket_colors;
-        self.editor.show_bracket_colors = self.bracket_colors_enabled;
         self.whitespace_mode =
             crate::widgets::editor::WhitespaceMode::from_pref(&p.render_whitespace);
-        self.editor.whitespace_mode = self.whitespace_mode;
         self.rulers = crate::widgets::editor::normalize_rulers(&p.rulers);
-        // Straight onto every open editor: the focus sync that otherwise
-        // carries them does not run per frame, so a reload would leave open
-        // tabs on the old rulers and Home walk until an unrelated focus
-        // change.
-        for ed in self.editor.editors.iter_mut() {
-            ed.rulers.clone_from(&self.rulers);
-            ed.home_walks_rows = self.home_walks_rows;
-        }
-        for group in self.editor_layout.inactive_groups_mut() {
-            for ed in group.editors.iter_mut() {
-                ed.rulers.clone_from(&self.rulers);
-                ed.home_walks_rows = self.home_walks_rows;
-            }
-        }
         self.line_numbers = crate::widgets::editor::LineNumbers::from_pref(&p.line_numbers);
-        self.apply_line_numbers();
+        // Straight onto every open tab in every group: the focus sync that
+        // otherwise carries them does not run per frame, so a reload would
+        // leave the other tabs, and a split, on the old look until an
+        // unrelated focus change (#2075).
+        self.apply_view_prefs();
         self.word_suggestions =
             crate::word_suggest::WordSuggestions::from_pref(&p.word_based_suggestions);
         self.quick_suggestions = !p.disable_quick_suggestions;

@@ -46,6 +46,23 @@ pub(super) type PendingCargoLaunch = (
     PathBuf,
 );
 
+/// The Testing folder being worked out on a thread of its own (#1973): the
+/// workspace folder and focused file it is for, and where the answer
+/// arrives.
+pub(super) type PendingTestRoot = (
+    (PathBuf, Option<PathBuf>),
+    std::sync::mpsc::Receiver<PathBuf>,
+);
+
+#[cfg(test)]
+thread_local! {
+    /// How many times this thread worked the Testing folder out itself
+    /// ([`App::followed_test_root`]), for the tests that pin which paths
+    /// leave it to a thread (#1973).
+    pub(super) static TEST_ROOTS_WORKED_OUT_HERE: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
 /// The test run Testing: Rerun Last Run repeats (#1535), as it was asked.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum LastTestRun {
@@ -70,6 +87,8 @@ impl App {
         {
             return v.clone();
         }
+        #[cfg(test)]
+        TEST_ROOTS_WORKED_OUT_HERE.with(|n| n.set(n.get() + 1));
         let found = crate::testing::registry::test_root_for(
             &self.extensions_dir(),
             &key.0,
@@ -79,12 +98,89 @@ impl App {
         found
     }
 
+    /// [`Self::followed_test_root`] for the per-tick follow, off the UI
+    /// thread (#1973): the answer reads manifests and, with the CodeQL runner
+    /// added, walks the folder four deep for test packs, which in a home
+    /// folder held the first frame for seconds. `None` while a thread works
+    /// it out; that thread waits for the first frame, and only one runs at
+    /// a time, so switching tabs fast queues no pile of walks.
+    pub(super) fn poll_followed_test_root(&mut self, root: PathBuf) -> Option<PathBuf> {
+        let key = (root, self.editor.path.clone());
+        if let Some((asked, rx)) = &self.test_root_pending {
+            let answer = match rx.try_recv() {
+                Ok(found) => Some(found),
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                // The thread died without answering: settle on the folder
+                // itself, the answer for no runner, rather than ask again
+                // every tick.
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(asked.0.clone()),
+            };
+            if let Some(found) = answer {
+                self.test_root_follow = Some((asked.clone(), found));
+                self.test_root_pending = None;
+            }
+        }
+        if let Some((k, v)) = &self.test_root_follow
+            && *k == key
+        {
+            return Some(v.clone());
+        }
+        if self.test_root_pending.is_none() {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let extensions = self.extensions_dir();
+            let (root, file) = key.clone();
+            std::thread::spawn(move || {
+                crate::startup_gate::wait();
+                let _ = tx.send(crate::testing::registry::test_root_for(
+                    &extensions,
+                    &root,
+                    file.as_deref(),
+                ));
+            });
+            self.test_root_pending = Some((key, rx));
+        }
+        None
+    }
+
+    /// Drop the remembered Testing folder and any answer still being worked
+    /// out, which was asked before whatever made the caller drop it.
+    pub(super) fn forget_followed_test_root(&mut self) {
+        self.test_root_follow = None;
+        self.test_root_pending = None;
+    }
+
+    /// Bind the Testing stack to the folder the focused file follows, working
+    /// it out here when the per-tick follow has not answered for this focus
+    /// yet (#1973). For run gestures: while the thread works, the stack is
+    /// still bound to the folder of the file focused before, and a run must
+    /// never go there. Whether it rebound.
+    pub(super) fn settle_followed_test_root(&mut self) -> bool {
+        let root = self.active_workspace_root();
+        let key = (root.clone(), self.editor.path.clone());
+        if self
+            .test_root_follow
+            .as_ref()
+            .is_some_and(|(k, _)| *k == key)
+        {
+            return false;
+        }
+        // Answered here instead: whatever the thread sends back was asked
+        // for this focus or an earlier one.
+        self.test_root_pending = None;
+        let found = self.followed_test_root(root);
+        if found == self.active_test_root {
+            return false;
+        }
+        self.rebind_test_root(found);
+        true
+    }
+
     /// Resolve the followed Testing folder afresh and rebind to it if it
     /// moved (#1520): a runner enabled or a package marker added since the
     /// focus last changed can change the answer the cache still holds.
     /// Whether it rebound.
     pub(super) fn refollow_test_root(&mut self) -> bool {
-        self.test_root_follow = None;
+        self.forget_followed_test_root();
         let root = self.followed_test_root(self.active_workspace_root());
         if root == self.active_test_root {
             return false;
@@ -160,6 +256,7 @@ impl App {
     /// runner still ran (and rebuilt) the workspace, and a disabled Python
     /// runner ran cargo in a directory with no Cargo.toml.
     pub(super) fn testing_runner_available(&mut self) -> bool {
+        self.settle_followed_test_root();
         if crate::testing::worker::runner_for(&self.extensions_dir(), &self.active_test_root)
             .is_some()
         {
@@ -191,8 +288,11 @@ impl App {
         self.pending_test_debug = None;
         // Its names belong to the old project (#1535).
         self.last_test_run = None;
+        // `root` was just worked out, on a thread when the per-tick follow
+        // landed it (#1973): `discover_tests` would work it out again here,
+        // on the UI thread, for the walk that thread was there to take off.
         if self.sidebar_view == SidebarView::Testing {
-            self.discover_tests();
+            self.queue_test_discovery();
         }
     }
 
@@ -564,6 +664,10 @@ impl App {
         if self.testing_busy_says_so() {
             return;
         }
+        // Settled before the last run is read (#1973): a rebind to the
+        // focused file's folder clears it, and a copy taken first would run
+        // the folder before's tests in the new one.
+        self.settle_followed_test_root();
         let Some(last) = self.last_test_run.clone() else {
             self.status = String::from("Rerun Last Run: no test has run yet");
             return;
@@ -743,6 +847,12 @@ impl App {
         {
             return;
         }
+        self.queue_test_discovery();
+    }
+
+    /// Hand the worker a quiet discovery of the folder the Testing stack is
+    /// bound to now, unless a run or a discovery is already under way.
+    pub(super) fn queue_test_discovery(&mut self) {
         if self.testing.is_busy() || self.test_worker.discover_queued() {
             return;
         }
@@ -1403,8 +1513,8 @@ impl App {
         let Some((_, resolved, _)) = self.http_request_under_caret() else {
             return;
         };
-        copy_to_clipboard(&crate::http_file::to_curl(&resolved));
-        self.status = String::from("curl command copied");
+        let landing = self.copy_where_pasted(&crate::http_file::to_curl(&resolved));
+        self.status = format!("curl command copied{}", landing.note());
     }
 
     /// The parsed and variable-resolved request under the caret, or a

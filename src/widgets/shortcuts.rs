@@ -137,9 +137,9 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 handler: "is_remote_jump_key",
             },
             ShortcutEntry {
-                keys: "Cmd/Ctrl+Shift+L",
-                description: "Disconnect a remote session and drop back into the local croft",
-                handler: "is_drop_to_local_key",
+                keys: "Cmd+K L",
+                description: "Disconnect a remote session and drop back into the local croft (palette: Remote: Drop to Local)",
+                handler: "",
             },
             ShortcutEntry {
                 keys: "Cmd+Shift+T",
@@ -468,7 +468,12 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
             },
             ShortcutEntry {
                 keys: "Cmd+K →",
-                description: "Close the tabs right of the active one (palette: View: Close Editors to the Right in Group; View: Close Other Editors in Group closes all but it)",
+                description: "Close the tabs right of the active one (palette: View: Close Editors to the Right in Group)",
+                handler: "",
+            },
+            ShortcutEntry {
+                keys: "Cmd+K Shift+X",
+                description: "Close the other tabs of this group, keeping pinned and unsaved ones (palette: View: Close Other Editors in Group)",
                 handler: "",
             },
             ShortcutEntry {
@@ -512,12 +517,12 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 handler: "is_transpose_key",
             },
             ShortcutEntry {
-                keys: "Cmd/Ctrl+Shift+\\",
+                keys: "Cmd+Shift+\\",
                 description: "Go to the matching bracket",
                 handler: "is_goto_bracket_key",
             },
             ShortcutEntry {
-                keys: "Cmd/Ctrl+Opt+\\",
+                keys: "Cmd+Opt+\\",
                 description: "Select to the matching bracket",
                 handler: "is_select_to_bracket_key",
             },
@@ -932,7 +937,7 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 handler: "is_editor_open_line_below_key",
             },
             ShortcutEntry {
-                keys: "Cmd+Shift+O",
+                keys: "Cmd/Ctrl+Shift+Enter",
                 description: "Open a new line above, inheriting indent",
                 handler: "is_editor_open_line_above_key",
             },

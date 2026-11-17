@@ -807,3 +807,40 @@ fn show_memory_usage_renders_in_the_active_theme() {
         "the title is in the theme's accent"
     );
 }
+
+/// #2077: a crash in a background thread leaves croft's terminal as it is
+/// and says on the status bar what crashed. Only a crash on the thread that
+/// drives the screen ends croft, and only then does the panic hook reset the
+/// terminal. Every crash reset it, leaving a still-running croft off the
+/// alternate screen, with keys echoed and the mouse dead.
+#[test]
+fn a_background_crash_keeps_the_terminal_and_says_what_crashed() {
+    let ui = std::thread::current().id();
+    assert!(
+        panic_ends_croft(ui, ui),
+        "a crash on the screen's thread ends croft"
+    );
+    std::thread::Builder::new()
+        .name(String::from("git-status"))
+        .spawn(move || {
+            let me = std::thread::current();
+            assert!(
+                !panic_ends_croft(me.id(), ui),
+                "a background thread's crash does not"
+            );
+            note_background_panic(me.name().unwrap());
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    assert!(app.poll_background_panic(), "the crash is shown");
+    assert!(
+        app.status.contains("(git-status)") && app.status.contains("restart croft"),
+        "{}",
+        app.status
+    );
+    assert!(!app.poll_background_panic(), "and shown once");
+}

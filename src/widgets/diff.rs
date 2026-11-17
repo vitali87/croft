@@ -2516,7 +2516,7 @@ mod tests {
     /// oracle that matters for the patch shape.
     fn git_apply_check(root: &std::path::Path, patch: &str) -> Result<(), String> {
         use std::io::Write;
-        let mut child = std::process::Command::new("git")
+        let mut child = crate::test_git::test_git_command()
             .args(["-C", root.to_str().unwrap(), "apply", "--cached", "--check"])
             .stdin(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -2538,7 +2538,7 @@ mod tests {
 
     fn git_repo_with(root: &std::path::Path, content: &str) {
         let run = |args: &[&str]| {
-            let ok = std::process::Command::new("git")
+            let ok = crate::test_git::test_git_command()
                 .args(["-C", root.to_str().unwrap()])
                 .args(args)
                 .output()
@@ -2692,7 +2692,7 @@ mod tests {
 
     fn git_apply(root: &std::path::Path, patch: &str, args: &[&str]) -> Result<(), String> {
         use std::io::Write;
-        let mut child = std::process::Command::new("git")
+        let mut child = crate::test_git::test_git_command()
             .args(["-C", root.to_str().unwrap(), "apply"])
             .args(args)
             .stdin(std::process::Stdio::piped())
@@ -2714,7 +2714,7 @@ mod tests {
     }
 
     fn staged_text(root: &std::path::Path) -> String {
-        let out = std::process::Command::new("git")
+        let out = crate::test_git::test_git_command()
             .args(["-C", root.to_str().unwrap(), "show", ":f.txt"])
             .output()
             .unwrap();
@@ -2885,7 +2885,7 @@ mod tests {
         if let Err(e) = git_apply_check(root, &patch) {
             panic!("git rejected the patch:\n{patch}\n{e}");
         }
-        let applied = std::process::Command::new("git")
+        let applied = crate::test_git::test_git_command()
             .args(["-C", root.to_str().unwrap(), "apply", "--cached"])
             .stdin(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -2898,7 +2898,7 @@ mod tests {
             .map(|st| st.success())
             .unwrap_or(false);
         assert!(applied, "git apply --cached must succeed for:\n{patch}");
-        let staged = std::process::Command::new("git")
+        let staged = crate::test_git::test_git_command()
             .args(["-C", root.to_str().unwrap(), "show", ":f.txt"])
             .output()
             .unwrap();
@@ -2923,7 +2923,7 @@ mod tests {
         if let Err(e) = git_apply_check(root, &patch) {
             panic!("git rejected the selected-lines patch:\n{patch}\n{e}");
         }
-        let ok = std::process::Command::new("git")
+        let ok = crate::test_git::test_git_command()
             .args(["-C", root.to_str().unwrap(), "apply", "--cached"])
             .stdin(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -2937,7 +2937,7 @@ mod tests {
             .unwrap_or(false);
         assert!(ok, "git apply --cached must succeed for:\n{patch}");
         // The staged blob holds the FIRST change only: X applied, c intact.
-        let staged = std::process::Command::new("git")
+        let staged = crate::test_git::test_git_command()
             .args(["-C", root.to_str().unwrap(), "show", ":f.txt"])
             .output()
             .unwrap();

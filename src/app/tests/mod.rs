@@ -5,6 +5,7 @@
 
 use super::*;
 use crate::gradient::lerp_rgb;
+use crate::test_git::*;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 mod agents;
@@ -160,7 +161,6 @@ fn key_predicates() -> Vec<(&'static str, KeyPredicate)> {
         is_run_debug_jump_key,
         is_remote_jump_key,
         is_extensions_jump_key,
-        is_drop_to_local_key,
         is_run_build_task_key,
         is_markdown_preview_key,
         is_run_fence_key,
@@ -702,92 +702,6 @@ fn nav_switch_fixture() -> (tempfile::TempDir, App, PathBuf, PathBuf) {
     (tmp, app, a, b)
 }
 
-/// The author and committer of every commit a test makes with
-/// [`test_git`]. [`git_init_with_identity`] also writes it into the
-/// repository's own config, for fixtures where the app commits; a fixture
-/// that writes an identity of its own keeps that one for the app's commits.
-const TEST_GIT_NAME: &str = "a";
-const TEST_GIT_EMAIL: &str = "a@b";
-
-/// `git -C dir`, shut off from the developer's own git setup. Every git
-/// command a test runs itself, to build a fixture or to read one back,
-/// starts here. It inherits no `GIT_*` variable: no setting passed in the
-/// environment (`GIT_CONFIG_COUNT` and `GIT_CONFIG_PARAMETERS` entries, a
-/// template dir, a hash, dates, pathspec modes), and no `GIT_DIR`,
-/// `GIT_WORK_TREE` or `GIT_INDEX_FILE` that would point it at another
-/// repository (git exports those to a hook that runs the tests). It reads
-/// no global or system config (so no default branch, signing, hooks,
-/// aliases or identity of theirs) and no global ignore or attributes file.
-/// Commits are made as [`TEST_GIT_NAME`] and no editor opens. All of it is
-/// set on the command, never on the process. The app's own git calls are
-/// production code and never come here.
-fn test_git(dir: &Path) -> std::process::Command {
-    let mut git = std::process::Command::new("git");
-    for (name, _) in std::env::vars_os() {
-        if name.as_encoded_bytes().starts_with(b"GIT_") {
-            git.env_remove(name);
-        }
-    }
-    git.arg("-C")
-        .arg(dir)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        // Where git finds the global `ignore` and `attributes` files, which
-        // it reads whatever `GIT_CONFIG_GLOBAL` says.
-        .env("XDG_CONFIG_HOME", "/dev/null")
-        .env("GIT_AUTHOR_NAME", TEST_GIT_NAME)
-        .env("GIT_AUTHOR_EMAIL", TEST_GIT_EMAIL)
-        .env("GIT_COMMITTER_NAME", TEST_GIT_NAME)
-        .env("GIT_COMMITTER_EMAIL", TEST_GIT_EMAIL)
-        .env("GIT_EDITOR", "true");
-    git
-}
-
-/// `git init -q -b main` in `dir`: the first branch is `main` whatever the
-/// developer's `init.defaultBranch` says.
-fn git_init(dir: &Path) {
-    git_ok(dir, &["init", "-q", "-b", "main"]);
-}
-
-/// [`git_init`], then [`TEST_GIT_NAME`] as the repository's own identity,
-/// so the app's own commits there do not need the developer's.
-fn git_init_with_identity(dir: &Path) {
-    git_init(dir);
-    git_ok(dir, &["config", "user.email", TEST_GIT_EMAIL]);
-    git_ok(dir, &["config", "user.name", TEST_GIT_NAME]);
-}
-
-/// Runs [`test_git`] in `dir`, failing the test with git's error unless it
-/// succeeds; its stdout, trimmed.
-fn git_ok(dir: &Path, args: &[&str]) -> String {
-    let out = test_git(dir).args(args).output().unwrap();
-    assert!(
-        out.status.success(),
-        "git {args:?} in {}: {}",
-        dir.display(),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
-}
-
-/// Runs [`test_git`] in `dir`; true when it succeeded. A git that cannot
-/// start fails the test. A caller that ignores the answer tolerates a step
-/// that fails.
-fn git_succeeds(dir: &Path, args: &[&str]) -> bool {
-    test_git(dir).args(args).output().unwrap().status.success()
-}
-
-/// Runs [`test_git`] in `dir`, succeeding or not; its stdout, trimmed.
-fn git_stdout(dir: &Path, args: &[&str]) -> String {
-    git_stdout_untrimmed(dir, args).trim().to_string()
-}
-
-/// [`git_stdout`] with git's trailing newline kept.
-fn git_stdout_untrimmed(dir: &Path, args: &[&str]) -> String {
-    let out = test_git(dir).args(args).output().unwrap();
-    String::from_utf8_lossy(&out.stdout).into_owned()
-}
-
 fn file_node(path: &Path) -> crate::widgets::file_tree::Node {
     crate::widgets::file_tree::Node {
         path: path.to_path_buf(),
@@ -1031,6 +945,24 @@ fn wait_for_git_net(app: &mut App) {
     );
 }
 
+/// Tick the follow until the Testing folder for the current focus, worked
+/// out off the UI thread (#1973), has landed and been applied.
+fn settle_test_root(app: &mut App) {
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the Testing folder to be worked out",
+        || {
+            app.drain_git_responses();
+            let key = (app.active_workspace_root(), app.editor.path.clone());
+            app.test_root_pending.is_none()
+                && app
+                    .test_root_follow
+                    .as_ref()
+                    .is_some_and(|(k, _)| *k == key)
+        },
+    );
+}
+
 /// The issue's repo (#1356): `main` and `feat` both change `f` from
 /// `base`, so merging, rebasing or cherry-picking one onto the other stops
 /// on a conflict.
@@ -1167,6 +1099,22 @@ fn own_settings(app: &mut App) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     app.config_dir = dir.path().to_path_buf();
     dir
+}
+
+/// Run `copy` on a relay session and return what it sent home to the local
+/// clipboard, or `None` when nothing went over the relay.
+fn relay_copied(app: &mut App, copy: impl FnOnce(&mut App)) -> Option<String> {
+    let home = tempfile::tempdir().unwrap();
+    app.is_relay_session = true;
+    let (log, inbox) = with_relay_home(home.path(), || {
+        let log = app.relay_log_path().expect("relay log path derivable");
+        let inbox = app.relay_inbox_path().expect("relay inbox path derivable");
+        copy(app);
+        (log, inbox)
+    });
+    let written = std::fs::read_to_string(&log).ok()?;
+    let id = written.lines().last()?.strip_prefix("copy\t")?.to_string();
+    std::fs::read_to_string(inbox.join(format!("{id}.txt"))).ok()
 }
 
 fn with_relay_home<T>(home: &std::path::Path, body: impl FnOnce() -> T) -> T {

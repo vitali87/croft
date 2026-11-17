@@ -1596,18 +1596,19 @@ pub struct App {
     /// bar paints in every pane, not only the focused one.
     provenance_overlay: bool,
     /// Indentation guides (#129), VS Code `editor.guides.indentation`: on by
-    /// default, pushed to every editor by the per-frame focus sync.
+    /// default, copied to every open tab by `apply_view_prefs`.
     indent_guides_enabled: bool,
     /// Home walks back one wrapped row per press (`home_walks_wrapped_rows`).
     home_walks_rows: bool,
-    /// Bracket-pair colorization (#131): on by default, pushed to every
-    /// editor by the per-frame focus sync like the indent guides.
+    /// Bracket-pair colorization (#131): on by default, copied to every
+    /// open tab by `apply_view_prefs` like the indent guides.
     bracket_colors_enabled: bool,
-    /// Whitespace rendering mode (#133), frame-synced to every editor;
+    /// Whitespace rendering mode (#133), copied to every open tab (under each
+    /// tab's language override) by `apply_view_prefs`;
     /// "selection" by default, the palette command cycles it.
     whitespace_mode: crate::widgets::editor::WhitespaceMode,
-    /// Ruler columns (#1524) from the `rulers` setting, synced onto every
-    /// editor each frame like `whitespace_mode`.
+    /// Ruler columns (#1524) from the `rulers` setting, copied to every open
+    /// tab by `apply_view_prefs` like `whitespace_mode`.
     rulers: Vec<u16>,
     /// Gutter line numbers (#1576): on, relative, interval or off.
     line_numbers: crate::widgets::editor::LineNumbers,
@@ -1852,6 +1853,12 @@ pub struct App {
     /// The last `followed_test_root` answer and the workspace folder and
     /// focused file it was for (#1520).
     test_root_follow: Option<((PathBuf, Option<PathBuf>), PathBuf)>,
+    /// The folder and focused file a `poll_followed_test_root` thread is
+    /// resolving the Testing folder for, and where its answer arrives. With
+    /// the CodeQL runner added, the answer walks the workspace four folders
+    /// deep, seconds in a home folder (#1973), so it never runs on the UI
+    /// thread.
+    test_root_pending: Option<PendingTestRoot>,
     /// Folder set from an explicitly opened `.code-workspace` (#163):
     /// consumed by `change_workspace_root` INSTEAD of the automatic
     /// per-primary restore, so the file defines the arrangement exactly.
@@ -2247,6 +2254,9 @@ pub struct App {
     /// Drops awaiting reverse-pull from the user's local Mac via the
     /// drop-relay launched by the local croft parent. Polled each frame.
     pending_remote_pulls: Vec<PendingRemotePull>,
+    /// Copies sent home over the relay whose pump answer is still due; see
+    /// `drain_relay_copies`.
+    pending_relay_copies: Vec<PendingRelayCopy>,
     /// This croft's `croft view` listener (#362).
     ///
     /// `None` when the bind failed: a croft that cannot offer `croft view`
@@ -4485,6 +4495,7 @@ impl App {
             scm_follow_root: root.clone(),
             active_test_root: root.clone(),
             test_root_follow: None,
+            test_root_pending: None,
             pending_workspace_folders: None,
             git_head_oids: std::collections::BTreeMap::new(),
             git,
@@ -4617,6 +4628,7 @@ impl App {
             tree_drag: None,
             pending_scp_uploads: Vec::new(),
             pending_remote_pulls: Vec::new(),
+            pending_relay_copies: Vec::new(),
             view_listener,
             hook_listener,
             hook_root: root.clone(),
@@ -5322,6 +5334,36 @@ impl App {
         crate::dap::configs::workspace_folders(self.roots.iter())
     }
 
+    /// The lines of every text buffer open in the active group, by path
+    /// (#2127): a Quick Open `:line` query counts these, since a pick opens
+    /// into the active group and reuses its tab for the file, unsaved edits
+    /// and all. Groups share no buffers, so a file open only in another
+    /// group opens from disk, and its saved file is what counts.
+    fn open_text_line_counts(&self) -> std::collections::HashMap<PathBuf, usize> {
+        self.editor
+            .editors
+            .iter()
+            .filter(|e| !e.has_non_text_view())
+            .filter_map(|e| Some((e.path.clone()?, e.lines.len())))
+            .collect()
+    }
+
+    /// Keep an open Quick Open's buffer line counts current (#2127). A
+    /// buffer can change while Quick Open is up (the file watcher reloads
+    /// it, an agent or a collab peer edits it), and a `:line` query must
+    /// count it as a pick would open it now. Cheap: one entry per tab of the
+    /// active group, and the check reruns only when a count changed. True
+    /// when the list changed.
+    pub(super) fn sync_file_finder_open_lines(&mut self) -> bool {
+        if self.file_finder.is_none() {
+            return false;
+        }
+        let open = self.open_text_line_counts();
+        self.file_finder
+            .as_mut()
+            .is_some_and(|f| f.set_open_lines(open))
+    }
+
     /// Every open buffer's path, across the active leaf and every inactive
     /// one. `App::editor` is the hoisted active leaf and `inactive_leaf_tabs`
     /// walks the rest, so together they cover each leaf exactly once.
@@ -5433,6 +5475,29 @@ impl App {
         }
     }
 
+    /// Copy the editor view settings onto every open tab, in every group:
+    /// indent guides, bracket-pair colours, rendered whitespace (with each
+    /// tab's language override), the Home walk, rulers and line numbers.
+    /// Each tab draws from its own copy, and nothing copies them again per
+    /// frame, so a settings reload, a toggle and a focus change all come
+    /// through here: one that set only the active tab left the rest, and
+    /// every tab of another group, on the old look (#2075).
+    pub(super) fn apply_view_prefs(&mut self) {
+        let (langs, ws_global) = (&self.language_prefs, self.whitespace_mode);
+        for group in
+            std::iter::once(&mut self.editor).chain(self.editor_layout.inactive_groups_mut())
+        {
+            for ed in &mut group.editors {
+                ed.show_indent_guides = self.indent_guides_enabled;
+                ed.show_bracket_colors = self.bracket_colors_enabled;
+                ed.whitespace_mode = whitespace_mode_in(langs, ws_global, editor_scope_id(ed));
+                ed.home_walks_rows = self.home_walks_rows;
+                ed.rulers.clone_from(&self.rulers);
+                ed.line_numbers = self.line_numbers;
+            }
+        }
+    }
+
     fn sync_focus_flags(&mut self) {
         // Focus must never rest on a COLLAPSED pane (#313). A folded pane is
         // one column wide and is never rendered, so it paints no cursor and no
@@ -5505,6 +5570,8 @@ impl App {
             self.focus == Pane::Tree && self.sidebar_view == SidebarView::RunDebug;
         self.extensions.focused =
             self.focus == Pane::Tree && self.sidebar_view == SidebarView::Extensions;
+        self.testing.focused =
+            self.focus == Pane::Tree && self.sidebar_view == SidebarView::Testing;
         self.editor.focused = self.focus == Pane::Editor;
         // Inactive groups are by definition NOT the focused editor group, so
         // their borders never light up even while the editor pane holds focus.
@@ -5527,20 +5594,13 @@ impl App {
         // when disabled, the editor opens those file types as plain text.
         let pdf_on = self.is_extension_enabled("pdf");
         let csv_on = self.is_extension_enabled("csv");
-        let (langs, ws_global) = (&self.language_prefs, self.whitespace_mode);
         for ed in self.editor.editors.iter_mut() {
             ed.focus_gradient = gradient;
             ed.theme = self.theme;
             ed.pdf_viewer_enabled = pdf_on;
             ed.csv_viewer_enabled = csv_on;
-            ed.show_indent_guides = self.indent_guides_enabled;
-            ed.home_walks_rows = self.home_walks_rows;
-            ed.show_bracket_colors = self.bracket_colors_enabled;
             ed.provenance_overlay = self.provenance_overlay;
-            ed.whitespace_mode = whitespace_mode_in(langs, ws_global, editor_scope_id(ed));
-            ed.line_numbers = self.line_numbers;
             ed.diff_ws_default = self.diff_ws_default;
-            ed.rulers.clone_from(&self.rulers);
         }
         for group in self.editor_layout.inactive_groups_mut() {
             for ed in group.editors.iter_mut() {
@@ -5548,16 +5608,11 @@ impl App {
                 ed.theme = self.theme;
                 ed.pdf_viewer_enabled = pdf_on;
                 ed.csv_viewer_enabled = csv_on;
-                ed.show_indent_guides = self.indent_guides_enabled;
-                ed.home_walks_rows = self.home_walks_rows;
-                ed.show_bracket_colors = self.bracket_colors_enabled;
                 ed.provenance_overlay = self.provenance_overlay;
-                ed.whitespace_mode = whitespace_mode_in(langs, ws_global, editor_scope_id(ed));
-                ed.line_numbers = self.line_numbers;
                 ed.diff_ws_default = self.diff_ws_default;
-                ed.rulers.clone_from(&self.rulers);
             }
         }
+        self.apply_view_prefs();
         self.tree.focus_gradient = gradient;
         self.tree.theme = self.theme;
         self.search.focus_gradient = gradient;
@@ -5569,6 +5624,8 @@ impl App {
         self.run_debug.theme = self.theme;
         self.codeql.focus_gradient = gradient;
         self.codeql.theme = self.theme;
+        self.testing.focus_gradient = gradient;
+        self.testing.theme = self.theme;
         let explorer_focused =
             self.focus == Pane::Tree && self.sidebar_view == SidebarView::Explorer;
         self.outline.focus_gradient = gradient;
@@ -5595,7 +5652,6 @@ impl App {
         self.problems.focus_gradient = gradient;
         self.problems.theme = self.theme;
         self.problems.focused = self.focus == Pane::Terminal;
-        self.problems.hover_pointer = self.pointer_cell;
         self.problems.fix_glyph = match self.problems_fix_started {
             Some(t) => update_spinner_frame(t.elapsed().as_millis()),
             None => "",
@@ -5603,19 +5659,16 @@ impl App {
         self.output.focus_gradient = gradient;
         self.output.theme = self.theme;
         self.output.focused = self.focus == Pane::Terminal;
-        self.output.hover_pointer = self.pointer_cell;
         self.output.sync();
         self.ports.focus_gradient = gradient;
         self.ports.theme = self.theme;
         self.ports.focused = self.focus == Pane::Terminal;
-        self.ports.hover_pointer = self.pointer_cell;
         for t in self.terminals.iter_mut() {
             t.show_timestamps = self.show_terminal_timestamps;
         }
         self.captures.focus_gradient = gradient;
         self.captures.theme = self.theme;
         self.captures.focused = self.focus == Pane::Terminal;
-        self.captures.hover_pointer = self.pointer_cell;
         for t in self.terminals.iter_mut() {
             t.focus_gradient = gradient;
             t.theme = self.theme;
@@ -5862,40 +5915,6 @@ use crate::widgets::terminal::cwd_is_observable;
 fn cells_in(buf: &ratatui::buffer::Buffer, r: Rect) -> Vec<ratatui::buffer::Cell> {
     let r = r.intersection(buf.area);
     r.positions().map(|p| buf[p].clone()).collect()
-}
-
-/// Copy `text` to the host system clipboard.
-///
-/// Order of attempts:
-///   1. **macOS native** — `clipboard::write_string` posts directly to
-///      `NSPasteboard.generalPasteboard` (with `pbcopy` as a process-level
-///      fall-back inside the same helper). This is the canonical Cocoa
-///      clipboard API and is the *only* path that survives every iTerm2
-///      configuration we have seen in the wild. OSC 52 is, empirically,
-///      silently dropped by iTerm2 in some setups even with
-///      `AllowClipboardAccess` enabled in `com.googlecode.iterm2` — and
-///      writing escape bytes directly to the alt-screen stdout always
-///      risks racing with the next ratatui frame.
-///   2. **OSC 52 fall-back** — only if the native write returned false
-///      (non-macOS croft binary on a Linux remote host, where the only
-///      hand-shake with the user's local terminal is via escape bytes
-///      through the SSH PTY). The fall-back is best-effort.
-///
-/// Returns true when the native path acknowledged the write so the call
-/// site can downgrade the status message if it ever needs to. Today all
-/// call sites discard the boolean; the return value is here so future
-/// code can branch on it.
-fn copy_to_clipboard(text: &str) -> bool {
-    crate::clipboard::remember_copy(text);
-    if crate::clipboard::write_string(text) {
-        return true;
-    }
-    use std::io::Write;
-    let bytes = crate::widgets::terminal::osc52_copy_seq(text);
-    let mut out = std::io::stdout();
-    let _ = out.write_all(&bytes);
-    let _ = out.flush();
-    false
 }
 
 /// Cap a string at `max` characters by inserting an ellipsis in the
@@ -6581,6 +6600,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         // Pull in any filesystem-watcher events first so the tree reflects
         // disk reality on the very next frame.
         let fs_changed = app.drain_fs_events();
+        crate::startup_trace::mark("file changes read");
         // Peek without clearing so we can coalesce PTY-only redraws without
         // losing bytes that the reader thread has already advanced into the
         // terminal grid.
@@ -6615,12 +6635,18 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let search_changed = app.drain_search_results();
         let log_index_changed = app.poll_log_index();
         let remote_changed = app.refresh_remote_if_config_changed();
-        let pulls_changed = app.drain_remote_pulls();
+        let pulls_changed = app.drain_remote_pulls() | app.drain_relay_copies();
+        let finder_changed = app.sync_file_finder_open_lines()
+            | app
+                .file_finder
+                .as_mut()
+                .is_some_and(|f| f.poll_line_check());
         let view_changed = app.drain_view_requests();
         let hook_changed = app.drain_hook_requests()
             | app.poll_pr_gh()
             | app.poll_pr_checkout()
             | app.poll_code_scanning();
+        crate::startup_trace::mark("background results collected");
         app.sync_approval_check();
         app.persist_agent_ledger(false);
         let kernel_changed = app.poll_notebook_kernels();
@@ -6628,6 +6654,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let session_presence_changed = app.poll_session_presence();
         let session_typing_changed = app.poll_session_typing();
         let collab_changed = app.poll_collab();
+        crate::startup_trace::mark("agents, ports and collaborators polled");
         let symbol_views_changed = app.sync_symbol_views() | symbol_views_settled;
         let bells_changed = app.drain_terminal_bells();
         // A block whose command has finished gets its output box (#354).
@@ -6640,12 +6667,14 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         app.flush_terminal_session();
         let auto_save_changed = app.tick_auto_save();
         app.tick_hot_exit(std::time::Instant::now());
+        crate::startup_trace::mark("terminal panes and saves ticked");
         let highlights_changed = app.poll_highlights();
         // Pictures baked off the UI thread (#1973) go up as they land.
         let images_changed =
             app.poll_chrome_bake() | app.poll_welcome_bake() | app.poll_saved_session();
         // A closed tab's bookmarks are kept, and come back with its file.
         let bookmarks_changed = app.settle_bookmarks();
+        crate::startup_trace::mark("highlights and pictures polled");
         let live_run_changed = app.tick_live_run()
             | app.sync_markdown_side_previews()
             | app.sync_markdown_scroll()
@@ -6658,12 +6687,14 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             | app.drain_review_ops();
         let connect_changed = app.poll_connect_dialog() | app.drain_scrub_views();
         let install_changed = app.poll_install_session();
-        let update_changed = app.poll_update_watch();
+        let update_changed = app.poll_update_watch() | app.poll_background_panic();
         let http_changed = app.drain_http_responses();
         let reveal_changed = app.tick_redaction_reveal();
+        crate::startup_trace::mark("watchers and dialogs polled");
         app.sync_lsp();
         app.send_due_completion_ask();
         app.send_due_completion_reask();
+        crate::startup_trace::mark("language servers synced");
         let markdown_lint_changed = app.sync_markdown_lint();
         let sarif_diagnostics_changed = app.sync_sarif_diagnostics();
         app.sync_sarif_selection_to_cursor();
@@ -6674,6 +6705,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         app.sync_blame();
         app.sync_provenance();
         let blame_changed = app.drain_blame() | app.drain_git_net() | app.drain_git_view();
+        crate::startup_trace::mark("lint, gutters and blame synced");
         // Request/refresh the OUTLINE for the active file (after sync_lsp so the
         // edit-seq it reads is current) and advance follow-cursor.
         let outline_sync_changed = app.sync_outline();
@@ -6683,6 +6715,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         // Refresh the Explorer's other stacked sub-views (Open Editors list,
         // Timeline git history, Dependencies) and drain their workers.
         let explorer_panels_changed = app.sync_explorer_panels();
+        crate::startup_trace::mark("outline and Explorer views synced");
         app.refresh_semantic_tokens_if_requested();
         app.refresh_inlay_hints_if_requested();
         app.refresh_workspace_diagnostics_if_requested();
@@ -6720,6 +6753,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let color_pres_changed = app.drain_lsp_color_presentations();
         let diagnostics_changed = app.drain_lsp_diagnostics();
         let progress_changed = app.drain_lsp_progress();
+        crate::startup_trace::mark("language server replies read");
         let dap_changed = app.poll_dap() | app.poll_debug_build();
         let tests_changed = app.test_worker.drain(&mut app.testing)
             | app.drain_pending_test_debug()
@@ -6748,9 +6782,11 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                 &remote_host_label(),
             );
         }
+        crate::startup_trace::mark("debugger and tests polled");
         let mcp_changed = app.poll_mcp();
         let pair_changed =
             app.maybe_seat_navigator() | app.poll_pair() | app.tick_proactive_navigator();
+        crate::startup_trace::mark("AI tools polled");
         let voice_changed = app.drain_voice();
         let zen_hint_changed = app.expire_zen_hint(std::time::Instant::now());
         let screencast_changed = app.screencast.expire(std::time::Instant::now());
@@ -6792,6 +6828,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || log_index_changed
             || remote_changed
             || pulls_changed
+            || finder_changed
             || view_changed
             || hook_changed
             || kernel_changed
@@ -6906,11 +6943,13 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                 app.overlays.hero.mark_dirty();
                 app.forget_sent_images();
             }
+            crate::startup_trace::mark("loop work done");
             let draw_start = std::time::Instant::now();
             let drawn = terminal.draw(|f| app.render_for_terminal(f))?;
+            crate::startup_trace::mark("frame drawn");
             app.sync_caret_style();
             let mut underlays = app.image_underlays(drawn.buffer);
-            app.drawn_buffer = Some(drawn.buffer.clone());
+            app.keep_drawn_buffer(drawn.buffer);
             // Record render+flush time and the bytes ratatui shipped this
             // frame so the F8 HUD can show where remote latency goes.
             app.perf.record_draw(draw_start.elapsed().as_micros());
@@ -6926,7 +6965,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                 app.forget_sent_images();
                 let drawn = terminal.draw(|f| app.render_for_terminal(f))?;
                 underlays = app.image_underlays(drawn.buffer);
-                app.drawn_buffer = Some(drawn.buffer.clone());
+                app.keep_drawn_buffer(drawn.buffer);
             }
             // After ratatui flushes its diff, paint the activity-bar icons
             // directly via OSC-1337 on every redraw. We previously gated

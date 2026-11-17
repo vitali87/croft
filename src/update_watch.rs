@@ -697,7 +697,7 @@ mod tests {
     fn probe_reports_drift_against_a_real_repo_and_silence_when_current() {
         let dir = scratch_dir("drift");
         let git = |args: &[&str]| {
-            let out = std::process::Command::new("git")
+            let out = crate::test_git::test_git_command()
                 .arg("-C")
                 .arg(&dir)
                 .args(args)
@@ -719,7 +719,10 @@ mod tests {
             "one",
         ]);
         let full = git(&["rev-parse", "HEAD"]);
-        let short = git(&["rev-parse", "--short", "HEAD"]);
+        // Read through `probe_drift`'s own `git_in`, so a `core.abbrev` in
+        // the developer's git config lengthens both alike and an inherited
+        // `GIT_DIR` is dropped on both sides.
+        let short = git_in(dir.to_str().unwrap(), &["rev-parse", "--short", "HEAD"]).unwrap();
 
         assert_eq!(probe_drift(dir.to_str().unwrap(), &full), None);
         assert_eq!(probe_drift(dir.to_str().unwrap(), "unknown"), None);
@@ -730,7 +733,9 @@ mod tests {
         assert_eq!(probe_drift(dir.to_str().unwrap(), &full), None);
         git(&["config", "--unset", "core.abbrev"]);
         // ...and a baked short label must never be passed for comparison.
-        assert_ne!(probe_drift(dir.to_str().unwrap(), &short), None);
+        // Git's shortest label, not `short`: a `core.abbrev` of 40 in the
+        // developer's config makes `short` the full ID.
+        assert_ne!(probe_drift(dir.to_str().unwrap(), &full[..7]), None);
         // Real drift surfaces the short display label, not the full ID.
         assert_eq!(
             probe_drift(dir.to_str().unwrap(), &"0".repeat(40)),

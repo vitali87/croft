@@ -122,6 +122,26 @@ pub fn last_copy() -> Option<String> {
     }
 }
 
+/// Copy `text` by OSC 52: escape bytes on stdout that ask the terminal croft
+/// draws in to set the clipboard of the machine that terminal runs on. Best
+/// effort, since whether the terminal acts on them is its choice. Under test
+/// the request is only recorded, so a test run never sets the developer's
+/// clipboard through the terminal it runs in.
+pub fn send_osc52(text: &str) {
+    #[cfg(test)]
+    {
+        test_clip::record_osc52(text);
+    }
+    #[cfg(not(test))]
+    {
+        use std::io::Write;
+        let bytes = crate::widgets::terminal::osc52_copy_seq(text);
+        let mut out = std::io::stdout();
+        let _ = out.write_all(&bytes);
+        let _ = out.flush();
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
     use std::io::Write;
@@ -723,6 +743,20 @@ pub(crate) mod test_clip {
 
     pub(crate) fn last_copy() -> Option<String> {
         LAST_COPY.with(|b| b.borrow().clone())
+    }
+
+    thread_local! {
+        /// What `super::send_osc52` was asked to send on this thread.
+        static OSC52_SENT: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    }
+
+    pub(crate) fn record_osc52(text: &str) {
+        OSC52_SENT.with(|b| b.borrow_mut().push(text.to_string()));
+    }
+
+    /// The OSC 52 copies this thread sent since the last call, oldest first.
+    pub(crate) fn take_osc52_sent() -> Vec<String> {
+        OSC52_SENT.with(|b| std::mem::take(&mut *b.borrow_mut()))
     }
 
     /// Read the host clipboard through the platform-native backend, bypassing

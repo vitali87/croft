@@ -20,11 +20,10 @@ fn drop_to_local_with_unsaved_edits_asks_first() {
     let tmp = tempfile::tempdir().unwrap();
     let (mut app, a) = app_with_unsaved_file(tmp.path());
     app.is_remote = true;
-    let drop_key = key(
-        KeyCode::Char('l'),
-        KeyModifiers::SUPER | KeyModifiers::SHIFT,
-    );
-    app.handle_key(drop_key).unwrap();
+    app.handle_key(key(KeyCode::Char('k'), KeyModifiers::SUPER))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('l'), KeyModifiers::NONE))
+        .unwrap();
     assert!(!app.quit && !app.drop_to_local);
     assert_eq!(app.pending_unsaved, Some(UnsavedExit::DropToLocal));
     app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE))
@@ -160,57 +159,66 @@ fn cmd_shift_r_jumps_to_remote_from_any_pane() {
     assert_eq!(app.sidebar_view, SidebarView::Remote);
 }
 
+/// #2071: Drop to Local is `Cmd+K L`, the same on every pane, and the
+/// palette's Remote: Drop to Local; on a remote session either ends it and
+/// hands back to the local croft.
 #[test]
-fn is_drop_to_local_key_matches_only_cmd_shift_l() {
-    assert!(is_drop_to_local_key(key(
-        KeyCode::Char('l'),
-        KeyModifiers::SUPER | KeyModifiers::SHIFT
-    )));
-    assert!(is_drop_to_local_key(key(
-        KeyCode::Char('L'),
-        KeyModifiers::CONTROL | KeyModifiers::SHIFT
-    )));
-    assert!(!is_drop_to_local_key(key(
-        KeyCode::Char('l'),
-        KeyModifiers::SUPER
-    )));
-    assert!(!is_drop_to_local_key(key(
-        KeyCode::Char('q'),
-        KeyModifiers::CONTROL
-    )));
-    assert!(!is_drop_to_local_key(key(
-        KeyCode::Char('r'),
-        KeyModifiers::SUPER | KeyModifiers::SHIFT
-    )));
-}
-
-#[test]
-fn cmd_shift_l_on_remote_requests_drop_to_local() {
+fn cmd_k_l_on_remote_requests_drop_to_local() {
     let mut app = editor_app_with_lines(&["x"]);
     app.is_remote = true;
-    app.handle_key(key(
-        KeyCode::Char('l'),
-        KeyModifiers::SUPER | KeyModifiers::SHIFT,
-    ))
-    .unwrap();
+    app.handle_key(key(KeyCode::Char('k'), KeyModifiers::SUPER))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('l'), KeyModifiers::NONE))
+        .unwrap();
     assert!(
         app.drop_to_local && app.quit,
-        "Cmd+Shift+L on a remote-launched croft must request a clean hand-back to the local croft"
+        "Cmd+K L on a remote-launched croft must request a clean hand-back to the local croft"
+    );
+    let mut app = editor_app_with_lines(&["x"]);
+    app.is_remote = true;
+    app.run_command(crate::widgets::command_palette::Command::DropToLocal);
+    assert!(
+        app.drop_to_local && app.quit,
+        "and so does the palette's row"
     );
 }
 
+/// #2071: Cmd+Shift+L selects all occurrences on a remote session, as it
+/// does locally. It used to end the session instead, at once when nothing
+/// was unsaved, leaving Select All Occurrences no key there.
 #[test]
-fn cmd_shift_l_on_local_is_inert() {
+fn cmd_shift_l_selects_all_occurrences_on_remote_too() {
+    for remote in [false, true] {
+        let mut app = editor_app_with_lines(&["foo bar foo", "foo"]);
+        app.is_remote = remote;
+        app.handle_key(key(
+            KeyCode::Char('l'),
+            KeyModifiers::SUPER | KeyModifiers::SHIFT,
+        ))
+        .unwrap();
+        assert!(!app.drop_to_local && !app.quit, "remote={remote}");
+        assert!(
+            app.status.contains("Selected 3 occurrences"),
+            "remote={remote}: {}",
+            app.status
+        );
+    }
+}
+
+/// #2071: on a local croft, Drop to Local has nothing to leave and says so.
+#[test]
+fn drop_to_local_on_local_says_there_is_nothing_to_leave() {
     let mut app = editor_app_with_lines(&["x"]);
     app.is_remote = false;
-    app.handle_key(key(
-        KeyCode::Char('l'),
-        KeyModifiers::SUPER | KeyModifiers::SHIFT,
-    ))
-    .unwrap();
+    app.handle_key(key(KeyCode::Char('k'), KeyModifiers::SUPER))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('l'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(!app.drop_to_local && !app.quit);
     assert!(
-        !app.drop_to_local && !app.quit,
-        "Cmd+Shift+L on a local croft must do nothing - there is no remote session to leave"
+        app.status.contains("not a remote session"),
+        "{}",
+        app.status
     );
 }
 
@@ -1305,4 +1313,129 @@ fn the_output_ports_and_captures_tabs_are_announced_by_name_and_row() {
     let snap = app.a11y_snapshot();
     assert_eq!(snap.focus, "Captures, 1 capture");
     assert_eq!(snap.item.as_deref(), Some("Build failed, from zsh"));
+}
+
+/// #2070: on a relay session every copy goes home to the clipboard of the
+/// machine the user types at, not only the terminal's (#1667). The editor's
+/// Copy and Delete Line, Copy Path and the Ports view's copy all wrote the
+/// remote box's clipboard, so pasting at home gave the old text.
+#[test]
+fn every_copy_on_a_relay_session_reaches_the_local_clipboard() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("a.txt");
+    std::fs::write(&p, "alpha beta\nsecond\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&p).unwrap();
+    app.focus_pane(Pane::Editor);
+
+    app.handle_key(key(KeyCode::Char('a'), KeyModifiers::SUPER))
+        .unwrap();
+    let sent = relay_copied(&mut app, |app| {
+        app.handle_key(key(KeyCode::Char('c'), KeyModifiers::SUPER))
+            .unwrap();
+    });
+    assert_eq!(sent.as_deref(), Some("alpha beta\nsecond"), "editor Copy");
+    assert!(app.status.contains("local clipboard"), "{}", app.status);
+
+    let sent = relay_copied(&mut app, |app| app.copy_path_to_clipboard(p.clone()));
+    assert_eq!(sent, Some(p.display().to_string()), "Copy Path");
+    assert!(
+        app.status.ends_with("sent to the local clipboard"),
+        "{}",
+        app.status
+    );
+
+    app.editor.clear_selection();
+    app.editor.cursor_row = 0;
+    let sent = relay_copied(&mut app, |app| app.delete_current_line());
+    assert_eq!(sent.as_deref(), Some("alpha beta\n"), "Delete Line");
+
+    app.ports
+        .upsert(3000, None, None, crate::widgets::ports::PortOrigin::Local);
+    let sent = relay_copied(&mut app, |app| app.ports_copy_selected());
+    assert_eq!(
+        sent.as_deref(),
+        Some("http://127.0.0.1:3000/"),
+        "Ports copy"
+    );
+}
+
+/// #2070: a copy on a relay session goes home and leaves this box's
+/// clipboard alone, so a paste inside croft must not read that clipboard
+/// first. Cut then Paste put back what was on it before the cut.
+#[test]
+fn a_cut_then_paste_on_a_relay_session_puts_back_the_cut_text() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("a.txt");
+    std::fs::write(&p, "alpha beta\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.clipboard_reader = || Some(String::from("stale remote text"));
+    app.editor.open(&p).unwrap();
+    app.focus_pane(Pane::Editor);
+    app.editor.selection = Some(crate::widgets::editor::EditorSelection {
+        anchor: (0, 0),
+        head: (0, 5),
+    });
+    app.editor.cursor_col = 5;
+
+    let sent = relay_copied(&mut app, |app| {
+        app.handle_key(key(KeyCode::Char('x'), KeyModifiers::SUPER))
+            .unwrap();
+    });
+    assert_eq!(sent.as_deref(), Some("alpha"), "the cut went home");
+    assert_eq!(app.editor.lines[0], " beta");
+
+    app.editor.cursor_col = app.editor.lines[0].chars().count();
+    app.handle_key(key(KeyCode::Char('v'), KeyModifiers::SUPER))
+        .unwrap();
+    assert_eq!(app.editor.lines[0], " betaalpha", "{}", app.status);
+}
+
+/// #2070: when the local machine has no clipboard to write, its pump
+/// answers the copy with `.err`, and the copy goes by OSC 52 from here, as
+/// it did before copies went home. A copy with no answer sends nothing.
+#[test]
+fn a_relay_copy_the_local_machine_could_not_take_goes_by_osc52() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.is_relay_session = true;
+    let _ = crate::clipboard::test_clip::take_osc52_sent();
+    with_relay_home(home.path(), || {
+        let inbox = app.relay_inbox_path().expect("relay inbox derivable");
+        assert_eq!(app.copy_where_pasted("landed"), CopyLanding::Local);
+        assert_eq!(app.copy_where_pasted("refused"), CopyLanding::Local);
+        let ids: Vec<String> = app
+            .pending_relay_copies
+            .iter()
+            .map(|c| c.request_id.clone())
+            .collect();
+        assert_eq!(ids.len(), 2, "both copies wait for an answer");
+
+        assert!(!app.drain_relay_copies(), "no answer yet");
+        assert!(crate::clipboard::test_clip::take_osc52_sent().is_empty());
+
+        let refused = inbox.join(&ids[1]);
+        std::fs::create_dir_all(&refused).unwrap();
+        std::fs::write(refused.join(".err"), "no clipboard to write").unwrap();
+        assert!(app.drain_relay_copies());
+        assert_eq!(
+            crate::clipboard::test_clip::take_osc52_sent(),
+            vec![String::from("refused")]
+        );
+        assert!(app.status.contains("via OSC 52"), "{}", app.status);
+        assert!(!refused.exists(), "the answer is cleared");
+        assert_eq!(app.pending_relay_copies.len(), 1, "the other still waits");
+
+        app.pending_relay_copies[0].started_at -= RELAY_COPY_ANSWER_WAIT;
+        assert!(!app.drain_relay_copies());
+        assert!(
+            app.pending_relay_copies.is_empty(),
+            "silence means it landed"
+        );
+        assert!(crate::clipboard::test_clip::take_osc52_sent().is_empty());
+    });
 }

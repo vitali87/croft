@@ -1556,10 +1556,10 @@ fn plain_ctrl_c_is_not_terminal_copy() {
 /// terminal-pane selection, and `App::copy_terminal_selection` must
 /// land the text on the macOS system clipboard. Exercises the full
 /// wire from PTY bytes → alacritty grid → `selection_text` →
-/// `copy_to_clipboard` → `NSPasteboard.setString:forType:` → what
+/// `App::copy_where_pasted` → `NSPasteboard.setString:forType:` → what
 /// `pbpaste` / `NSPasteboard.stringForType:` returns. A refactor
 /// that reintroduces an OSC-52-only path in the terminal copy
-/// handler would fail this test even if `copy_to_clipboard` itself
+/// handler would fail this test even if `copy_where_pasted` itself
 /// still resolved to the native path elsewhere.
 #[cfg(target_os = "macos")]
 #[test]
@@ -2837,22 +2837,6 @@ fn cmd_c_inside_a_mouse_tracking_program_says_why_nothing_was_copied() {
         "and must name the gesture that DOES select inside a tracking program, got {:?}",
         app.status
     );
-}
-
-/// Run `copy` on a relay session and return what it sent home to the local
-/// clipboard, or `None` when nothing went over the relay.
-fn relay_copied(app: &mut App, copy: impl FnOnce(&mut App)) -> Option<String> {
-    let home = tempfile::tempdir().unwrap();
-    app.is_relay_session = true;
-    let (log, inbox) = with_relay_home(home.path(), || {
-        let log = app.relay_log_path().expect("relay log path derivable");
-        let inbox = app.relay_inbox_path().expect("relay inbox path derivable");
-        copy(app);
-        (log, inbox)
-    });
-    let written = std::fs::read_to_string(&log).ok()?;
-    let id = written.lines().last()?.strip_prefix("copy\t")?.to_string();
-    std::fs::read_to_string(inbox.join(format!("{id}.txt"))).ok()
 }
 
 /// A pane whose script emits one OSC 133 command printing `out-1667`, and

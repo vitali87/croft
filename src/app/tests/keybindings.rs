@@ -3390,7 +3390,7 @@ fn the_keyboard_shortcuts_editor_lists_the_editor_tab_commands() {
         (
             "close_other_editors",
             "View: Close Other Editors in Group",
-            "\u{2014}",
+            "Cmd+K Shift+X",
         ),
         (
             "close_editors_to_the_right",

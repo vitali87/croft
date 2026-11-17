@@ -1,0 +1,367 @@
+# Stage B of the refactor program (#2062): where each item of src/lsp/manager.rs goes.
+# One row per item, in file order. pr 0 means the item stays in manager.rs; the others
+# move to src/lsp/manager/<file>.rs in that PR. kind, impl and name are as
+# `scripts/check_pure_move.py list` prints them. Run
+# `scripts/move_items.py --target lsp --check` after adding an item to manager.rs.
+# A struct whose private fields other files read (and the tests do) stays in manager.rs,
+# where every file under manager/ and the tests can still read them; its methods move.
+pr	file	kind	impl	name
+4	completion	struct	-	CompletionItem
+4	completion	struct	-	CompletionResult
+4	completion	enum	-	CompletionTrigger
+5	hover	struct	-	RustAnalyzerResult
+5	hover	struct	-	HoverResult
+4	completion	struct	-	SignatureInfo
+4	completion	struct	-	SignatureHelpResult
+6	navigation	struct	-	DefinitionResult
+7	symbols	enum	-	OutlineKind
+7	symbols	fn	impl OutlineKind	from_lsp
+7	symbols	struct	-	OutlineSymbol
+7	symbols	struct	-	DocumentSymbolsResult
+6	navigation	struct	-	DeclarationResult
+6	navigation	struct	-	TypeDefinitionResult
+6	navigation	struct	-	ImplementationResult
+7	symbols	struct	-	WorkspaceSymbolItem
+7	symbols	struct	-	WorkspaceSymbolsResult
+6	navigation	struct	-	ReferencesResult
+11	rename	struct	-	RenameResult
+11	rename	struct	-	FileRenameOp
+11	rename	struct	-	WillRenameFilesResult
+11	rename	struct	-	PrepareRenameResult
+12	code_actions	struct	-	CodeActionCommand
+12	code_actions	struct	-	CodeActionItem
+12	code_actions	struct	-	CodeActionResult
+13	formatting	struct	-	FormatResult
+8	semantic_tokens	struct	-	SemanticTokensUpdate
+9	decorations	struct	-	InlayHintItem
+9	decorations	struct	-	InlayHintsUpdate
+9	decorations	struct	-	DocumentLinkItem
+9	decorations	struct	-	CodeLensItem
+9	decorations	struct	-	CodeLensUpdate
+9	decorations	struct	-	DocumentLinksUpdate
+9	decorations	struct	-	FoldingRangeItem
+9	decorations	enum	-	FoldRangeKind
+9	decorations	struct	-	FoldingRangesUpdate
+9	decorations	struct	-	ColorItem
+9	decorations	struct	-	DocumentColorsUpdate
+9	decorations	struct	-	ColorPresentationsResult
+6	navigation	struct	-	CallSite
+6	navigation	enum	-	HierarchyKind
+6	navigation	fn	impl HierarchyKind	noun
+6	navigation	struct	-	CallHierarchyResult
+10	text_ranges	struct	-	OccurrenceItem
+10	text_ranges	struct	-	DocumentHighlightsResult
+10	text_ranges	struct	-	LinkedEditingResult
+4	completion	struct	-	InlineCompletionResult
+4	completion	struct	-	InlineItem
+10	text_ranges	struct	-	SelectionRangesResult
+3	diagnostics	enum	-	DiagnosticSeverity
+3	diagnostics	struct	-	Diagnostic
+3	diagnostics	fn	impl PartialEq for Diagnostic	eq
+3	diagnostics	struct	-	DiagnosticOrigin
+3	diagnostics	fn	impl Diagnostic	related
+3	diagnostics	struct	-	RelatedLocation
+3	diagnostics	fn	impl RelatedLocation	label
+3	diagnostics	fn	-	one_line
+3	diagnostics	struct	-	DiagnosticCode
+3	diagnostics	fn	impl DiagnosticCode	label
+3	diagnostics	struct	-	DiagnosticTags
+3	diagnostics	fn	impl DiagnosticTags	any
+3	diagnostics	struct	-	DiagnosticsUpdate
+3	diagnostics	const	-	PULLED_DIAGNOSTICS
+3	diagnostics	fn	-	diagnostics_store_key
+3	diagnostics	fn	-	diagnostics_source
+3	diagnostics	fn	-	diagnostics_by_source
+0		struct	-	ServerUpdate
+0		enum	-	ServerEvent
+0		fn	-	message_is_shown
+0		enum	-	Cmd
+0		struct	-	LangCapabilitySupport
+0		type	-	CapabilitySupport
+15	servers	fn	-	registered_servers_of
+0		struct	-	LspManager
+0		fn	impl Drop for LspManager	drop
+0		fn	-	document_end
+0		fn	-	rows_end
+0		fn	impl LspManager	new
+0		fn	impl LspManager	workspace_root
+14	documents	fn	impl LspManager	open_doc
+15	servers	fn	impl LspManager	prewarm_workspace
+15	servers	fn	impl LspManager	set_extra_roots
+14	documents	fn	impl LspManager	change_doc
+14	documents	fn	impl LspManager	save_doc
+14	documents	fn	impl LspManager	close_doc
+15	servers	fn	impl LspManager	restart_servers_for
+15	servers	fn	impl LspManager	reload_extensions
+4	completion	fn	impl LspManager	request_completion
+0		fn	impl LspManager	send_request
+4	completion	fn	impl LspManager	request_completion_resolve
+4	completion	fn	impl LspManager	drain_completion
+4	completion	fn	impl LspManager	request_signature_help
+4	completion	fn	impl LspManager	drain_signature_help
+5	hover	fn	impl LspManager	request_hover
+5	hover	fn	impl LspManager	drain_hover
+5	hover	fn	impl LspManager	push_hover_for_test
+5	hover	fn	impl LspManager	request_rust_analyzer
+5	hover	fn	impl LspManager	drain_rust_analyzer
+8	semantic_tokens	fn	impl LspManager	request_semantic_tokens
+8	semantic_tokens	fn	impl LspManager	next_semantic_generation
+8	semantic_tokens	fn	impl LspManager	request_semantic_tokens_range
+8	semantic_tokens	fn	impl LspManager	drain_semantic_tokens
+9	decorations	fn	impl LspManager	request_inlay_hints
+9	decorations	fn	impl LspManager	drain_inlay_hints
+9	decorations	fn	impl LspManager	request_document_links
+9	decorations	fn	impl LspManager	drain_document_links
+9	decorations	fn	impl LspManager	request_code_lens
+9	decorations	fn	impl LspManager	drain_code_lens
+9	decorations	fn	impl LspManager	request_folding_ranges
+9	decorations	fn	impl LspManager	drain_folding_ranges
+9	decorations	fn	impl LspManager	request_document_colors
+9	decorations	fn	impl LspManager	drain_document_colors
+9	decorations	fn	impl LspManager	request_color_presentations
+9	decorations	fn	impl LspManager	drain_color_presentations
+9	decorations	fn	impl LspManager	take_inlay_refresh
+3	diagnostics	fn	impl LspManager	drain_diagnostics
+3	diagnostics	fn	impl LspManager	push_diagnostics_for_test
+15	servers	fn	impl LspManager	drain_server_update
+8	semantic_tokens	fn	impl LspManager	take_semantic_refresh
+15	servers	fn	impl LspManager	take_servers_restarted
+3	diagnostics	fn	impl LspManager	take_diagnostic_refresh
+3	diagnostics	fn	impl LspManager	request_workspace_diagnostics
+6	navigation	fn	impl LspManager	request_definition
+6	navigation	fn	impl LspManager	drain_definition
+6	navigation	fn	impl LspManager	push_definition_for_test
+6	navigation	fn	impl LspManager	push_declaration_for_test
+6	navigation	fn	impl LspManager	push_type_definition_for_test
+7	symbols	fn	impl LspManager	request_document_symbols
+7	symbols	fn	impl LspManager	drain_document_symbols
+6	navigation	fn	impl LspManager	request_declaration
+6	navigation	fn	impl LspManager	drain_declaration
+6	navigation	fn	impl LspManager	request_type_definition
+6	navigation	fn	impl LspManager	drain_type_definition
+6	navigation	fn	impl LspManager	request_implementation
+6	navigation	fn	impl LspManager	drain_implementation
+6	navigation	fn	impl LspManager	request_references
+7	symbols	fn	impl LspManager	request_workspace_symbols
+7	symbols	fn	impl LspManager	drain_workspace_symbols
+6	navigation	fn	impl LspManager	drain_references
+10	text_ranges	fn	impl LspManager	request_document_highlights
+10	text_ranges	fn	impl LspManager	drain_document_highlights
+10	text_ranges	fn	impl LspManager	request_linked_editing
+10	text_ranges	fn	impl LspManager	request_selection_ranges
+10	text_ranges	fn	impl LspManager	drain_linked_editing
+10	text_ranges	fn	impl LspManager	push_linked_editing_for_test
+4	completion	fn	impl LspManager	request_inline_completion
+4	completion	fn	impl LspManager	drain_inline_completion
+4	completion	fn	impl LspManager	push_inline_completion_for_test
+10	text_ranges	fn	impl LspManager	drain_selection_ranges
+6	navigation	fn	impl LspManager	request_call_hierarchy
+6	navigation	fn	impl LspManager	drain_call_hierarchy
+6	navigation	fn	impl LspManager	request_type_hierarchy
+11	rename	fn	impl LspManager	any_server_wants_file_renames
+3	diagnostics	fn	impl LspManager	document_reported_by
+15	servers	fn	impl LspManager	server_registered
+15	servers	fn	impl LspManager	set_registered_servers_for_test
+15	servers	fn	impl LspManager	document_served_by
+15	servers	fn	impl LspManager	document_has_server
+15	servers	fn	impl LspManager	set_document_servers_for_test
+15	servers	fn	impl LspManager	set_document_clients_for_test
+14	documents	fn	impl LspManager	synced_text_for_test
+14	documents	fn	impl LspManager	record_synced_text
+6	navigation	fn	impl LspManager	language_supports_call_hierarchy
+4	completion	fn	impl LspManager	document_offers_inline_completion
+4	completion	fn	impl LspManager	set_inline_completion_for_test
+6	navigation	fn	impl LspManager	language_supports_declaration
+6	navigation	fn	impl LspManager	language_supports_type_definition
+6	navigation	fn	impl LspManager	language_supports_implementation
+6	navigation	fn	impl LspManager	language_supports_references
+11	rename	fn	impl LspManager	request_rename
+11	rename	fn	impl LspManager	request_prepare_rename
+11	rename	fn	impl LspManager	drain_prepare_rename
+11	rename	fn	impl LspManager	drain_rename
+11	rename	fn	impl LspManager	request_will_rename_files
+11	rename	fn	impl LspManager	drain_will_rename_files
+11	rename	fn	impl LspManager	did_rename_files
+14	documents	fn	impl LspManager	did_change_watched_files
+13	formatting	fn	impl LspManager	request_formatting
+13	formatting	fn	impl LspManager	request_on_type_formatting
+13	formatting	fn	impl LspManager	drain_on_type_formatting
+13	formatting	fn	impl LspManager	language_on_type_triggers
+4	completion	fn	impl LspManager	completion_triggers
+4	completion	fn	impl LspManager	set_completion_triggers_for_test
+13	formatting	fn	impl LspManager	request_range_formatting
+13	formatting	fn	impl LspManager	drain_formatting
+13	formatting	fn	impl LspManager	language_supports_formatting
+12	code_actions	fn	impl LspManager	request_code_action
+12	code_actions	fn	impl LspManager	request_code_action_resolve
+12	code_actions	fn	impl LspManager	execute_command
+12	code_actions	fn	impl LspManager	drain_code_action
+12	code_actions	fn	impl LspManager	language_supports_code_action
+0		fn	impl LspManager	language_supports
+0		struct	-	ManagedClient
+0		type	-	ClientKey
+0		enum	-	NoServer
+0		struct	-	WorkerState
+15	servers	const	-	MAX_RESTARTS
+15	servers	const	-	RESTART_WINDOW
+0		struct	-	ServerRestarts
+15	servers	fn	impl ServerRestarts	reporting_to
+15	servers	fn	impl ServerRestarts	try_restart
+0		struct	-	DocState
+0		struct	-	ResultSenders
+16	worker	fn	-	worker_loop
+15	servers	fn	impl WorkerState	shutdown_all
+15	servers	fn	impl WorkerState	restart_dead_servers
+15	servers	fn	impl WorkerState	restart_servers_for
+15	servers	fn	impl WorkerState	restart_key
+15	servers	fn	impl WorkerState	retire_key
+15	servers	fn	impl WorkerState	replace_registry
+15	servers	fn	impl WorkerState	ensure_clients
+15	servers	fn	impl WorkerState	pick_server
+15	servers	fn	impl WorkerState	prewarm_workspace
+15	servers	fn	impl WorkerState	prewarm_root
+14	documents	fn	impl WorkerState	open_doc
+14	documents	fn	impl WorkerState	change_doc
+14	documents	fn	impl WorkerState	save_doc
+14	documents	fn	impl WorkerState	close_doc
+4	completion	fn	impl WorkerState	request_completion
+4	completion	fn	impl WorkerState	resolve_completion
+4	completion	fn	impl WorkerState	request_signature_help
+5	hover	fn	impl WorkerState	request_rust_analyzer
+5	hover	fn	impl WorkerState	request_hover
+8	semantic_tokens	fn	impl WorkerState	request_semantic_tokens
+9	decorations	fn	impl WorkerState	request_inlay_hints
+9	decorations	fn	impl WorkerState	request_document_links
+9	decorations	fn	impl WorkerState	request_code_lens
+9	decorations	fn	impl WorkerState	request_folding_ranges
+9	decorations	fn	impl WorkerState	request_document_colors
+9	decorations	fn	impl WorkerState	request_color_presentations
+8	semantic_tokens	fn	impl WorkerState	request_semantic_tokens_range
+6	navigation	fn	impl WorkerState	request_definition
+7	symbols	fn	impl WorkerState	request_document_symbols
+6	navigation	fn	impl WorkerState	request_declaration
+6	navigation	fn	impl WorkerState	request_type_definition
+6	navigation	fn	impl WorkerState	request_implementation
+3	diagnostics	fn	impl WorkerState	request_workspace_diagnostics
+7	symbols	fn	impl WorkerState	request_workspace_symbols
+6	navigation	fn	impl WorkerState	request_references
+10	text_ranges	fn	impl WorkerState	request_document_highlights
+10	text_ranges	fn	impl WorkerState	request_linked_editing
+4	completion	fn	impl WorkerState	request_inline_completion
+10	text_ranges	fn	impl WorkerState	request_selection_ranges
+6	navigation	fn	impl WorkerState	request_call_hierarchy
+6	navigation	fn	impl WorkerState	request_type_hierarchy
+12	code_actions	fn	impl WorkerState	request_code_action
+12	code_actions	fn	impl WorkerState	resolve_code_action
+12	code_actions	fn	impl WorkerState	execute_command
+11	rename	fn	impl WorkerState	request_rename
+11	rename	fn	impl WorkerState	file_op_clients
+11	rename	fn	impl WorkerState	request_will_rename_files
+11	rename	fn	impl WorkerState	did_rename_files
+14	documents	fn	impl WorkerState	did_change_watched_files
+11	rename	fn	impl WorkerState	request_prepare_rename
+13	formatting	fn	impl WorkerState	request_formatting
+13	formatting	fn	impl WorkerState	request_on_type_formatting
+13	formatting	fn	impl WorkerState	request_range_formatting
+0		fn	-	workspace_edits
+12	code_actions	fn	-	code_action_items
+12	code_actions	fn	-	to_lsp_diagnostic
+12	code_actions	fn	-	code_action_diagnostics
+0		fn	-	text_edit_to_span
+4	completion	fn	-	into_item
+4	completion	fn	-	listed_item
+5	hover	fn	-	marked_string_text
+5	hover	fn	-	hover_text
+11	rename	fn	-	prepare_rename_supported
+11	rename	fn	-	range_tuple
+9	decorations	fn	-	color_provider_supported
+9	decorations	fn	-	color_item
+12	code_actions	fn	-	code_action_supported
+4	completion	fn	-	first_inline_item
+10	text_ranges	fn	-	linked_editing_supported
+9	decorations	fn	-	folding_range_supported
+10	text_ranges	fn	-	flatten_selection_chain
+10	text_ranges	fn	-	selection_range_supported
+7	symbols	fn	-	workspace_symbol_items
+9	decorations	fn	-	normalise_inlay_hint
+9	decorations	fn	-	normalise_folding_range
+6	navigation	fn	-	call_hierarchy_supported
+15	servers	fn	-	one_of_supported
+13	formatting	fn	-	answer_unsupported
+5	hover	fn	-	hover_supported
+4	completion	fn	-	signature_help_supported
+4	completion	fn	-	completion_triggers_of
+14	documents	enum	-	SaveNotify
+14	documents	fn	-	save_notify_of
+0		struct	-	DiagnosticResultIds
+3	diagnostics	fn	impl DiagnosticResultIds	previous
+3	diagnostics	fn	impl DiagnosticResultIds	record
+3	diagnostics	fn	impl DiagnosticResultIds	len
+3	diagnostics	fn	impl DiagnosticResultIds	is_empty
+3	diagnostics	const	-	WORKSPACE_PULL_TIMEOUT
+9	decorations	const	-	MAX_CODE_LENSES
+9	decorations	const	-	CODE_LENS_TIMEOUT
+11	rename	const	-	PREPARE_RENAME_TIMEOUT
+0		struct	-	PrepareRenameAsk
+11	rename	fn	-	spawn_prepare_rename
+11	rename	const	-	WILL_RENAME_TIMEOUT
+0		struct	-	WorkspacePull
+3	diagnostics	fn	-	workspace_pull_targets
+3	diagnostics	fn	-	spawn_workspace_pull
+3	diagnostics	fn	-	spawn_workspace_pull_within
+3	diagnostics	fn	-	apply_workspace_report
+3	diagnostics	const	-	DOCUMENT_PULL_DEBOUNCE
+3	diagnostics	const	-	DOCUMENT_PULL_TIMEOUT
+3	diagnostics	static	-	NEXT_DOCUMENT_PULL
+3	diagnostics	struct	-	DocumentPull
+3	diagnostics	fn	impl DocumentPull	is_current
+3	diagnostics	fn	impl DocumentPull	retire
+3	diagnostics	fn	-	document_pull_targets
+3	diagnostics	fn	-	spawn_document_pulls
+3	diagnostics	fn	-	spawn_document_pulls_within
+3	diagnostics	fn	-	document_report_items
+3	diagnostics	fn	-	diagnostic_identifier_of
+3	diagnostics	fn	-	workspace_diagnostics_supported
+4	completion	fn	-	normalise_signature_help
+7	symbols	fn	-	flatten_symbols
+7	symbols	fn	-	push_nested
+6	navigation	fn	-	declaration_supported
+6	navigation	fn	-	type_definition_supported
+6	navigation	fn	-	implementation_supported
+6	navigation	fn	-	def_location
+6	navigation	fn	-	def_locations
+6	navigation	fn	-	incoming_call_sites
+6	navigation	fn	-	outgoing_call_sites
+6	navigation	fn	-	type_hierarchy_sites
+10	text_ranges	fn	-	occurrence_items
+6	navigation	fn	-	reference_locations
+8	semantic_tokens	fn	-	semantic_legend_of
+8	semantic_tokens	fn	-	semantic_tokens_range_supported
+8	semantic_tokens	fn	-	flatten_semantic_tokens
+2	capabilities	fn	-	standard_semantic_token_types
+2	capabilities	fn	-	standard_semantic_token_modifiers
+2	capabilities	fn	-	build_client_capabilities
+1	discovery	fn	-	path_to_language
+1	discovery	fn	-	manifest_names
+1	discovery	fn	-	project_root_for_roots
+1	discovery	fn	-	project_root_within
+1	discovery	fn	-	resolve_config
+1	discovery	fn	-	missing_servers_note
+1	discovery	fn	-	report_missing_servers_once
+1	discovery	fn	-	is_on_path
+1	discovery	fn	-	is_executable_file
+1	discovery	fn	-	toolchain_fallback_dirs
+1	discovery	fn	-	find_executable_in
+1	discovery	fn	-	resolve_path_only
+1	discovery	fn	-	resolve_for_root
+1	discovery	static	-	RUSTUP_VERDICTS
+1	discovery	type	-	RustupVerdicts
+1	discovery	const	-	RUSTUP_RECHECK
+0		struct	-	RustupLack
+1	discovery	const	-	RUSTUP_DEADLINE
+1	discovery	fn	-	command_path
+1	discovery	fn	-	rustup_behind
+1	discovery	fn	-	file_id
+1	discovery	fn	-	file_id
+1	discovery	fn	-	rustup_lacks
+1	discovery	fn	-	rustup_says

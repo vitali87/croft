@@ -1772,15 +1772,7 @@ impl App {
                     let target_dir =
                         crate::widgets::file_tree::create_target_dir_for(node, &self.tree.root);
                     let selection = self.tree.action_paths();
-                    let mut items = build_tree_context_menu_items_in_dir(
-                        &self.config_dir,
-                        node,
-                        &self.tree.root,
-                        &selection,
-                        &target_dir,
-                        self.tree_clipboard.as_ref(),
-                        self.compare_anchor.as_deref(),
-                    );
+                    let mut items = self.tree_context_menu_items(node, &selection, &target_dir);
                     let clicked = node.map(|n| n.path.clone());
                     maybe_add_reveal_in_finder(
                         &mut items,
@@ -2834,7 +2826,29 @@ impl App {
                     } else if rect_contains(self.testing.last_stop, m.column, m.row) {
                         self.cancel_test_run();
                     } else {
-                        match self.testing.hit_at(m.column, m.row) {
+                        use crate::widgets::testing::RowHit;
+                        let hit = self.testing.hit_at(m.column, m.row);
+                        // A run glyph on a row the panel still shows from the
+                        // folder before the focus moved (#1973): the follow is
+                        // worked out off the UI thread, so the panel can lag
+                        // the focus. The settle rebinds and clears it, and
+                        // that row's test is not the new folder's to run.
+                        let runs = matches!(
+                            hit,
+                            Some(
+                                RowHit::RunCase(_)
+                                    | RowHit::RunSuite(_)
+                                    | RowHit::CoverCase(_)
+                                    | RowHit::CoverSuite(_)
+                            )
+                        );
+                        if runs && self.settle_followed_test_root() {
+                            self.status = String::from(
+                                "Testing moved to the focused file's folder; that test was not run",
+                            );
+                            return;
+                        }
+                        match hit {
                             Some(crate::widgets::testing::RowHit::ToggleWatch(scope)) => {
                                 self.toggle_test_watch(scope)
                             }
@@ -3129,7 +3143,7 @@ impl App {
                             };
                             let was_here = pr == r && pc == c;
                             if !was_here && view.commit_edit().is_some() {
-                                self.editor.dirty = true;
+                                self.editor.mark_dirty();
                             }
                             let view = self.editor.sheet.as_mut().expect("checked");
                             let data = &mut view.sheets[current];

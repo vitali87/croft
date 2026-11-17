@@ -158,13 +158,18 @@ impl App {
         if active != self.active_scm_root {
             self.seed_active_scm(active);
         }
-        let test_root = self.followed_test_root(follow);
-        if test_root != self.active_test_root {
-            self.rebind_test_root(test_root);
-        }
         // Ship any refresh the debounce window coalesced once the gap clears,
         // so the trailing edge of an edit burst lands without another FS event.
         let mut changed = false;
+        // Worked out off this thread (#1973): the answer lands a tick or more
+        // later, and a rebind then owes the Testing view a redraw.
+        let mut test_rebound = false;
+        if let Some(test_root) = self.poll_followed_test_root(follow)
+            && test_root != self.active_test_root
+        {
+            self.rebind_test_root(test_root);
+            test_rebound = true;
+        }
         self.take_default_branch();
         // Roots whose HEAD oid moved in this drain: the open Source Control
         // diffs for THESE re-read their HEAD blob (#471); the rest are
@@ -268,7 +273,7 @@ impl App {
         // redraw even when the status itself was unchanged.
         let diffs_refreshed = (changed || status_arrived)
             && self.refresh_open_diff_views(true, &heads_moved, &std::collections::BTreeSet::new());
-        changed || diffs_refreshed
+        changed || diffs_refreshed || test_rebound
     }
 
     /// Resolve the active repository's default branch on a thread of its
@@ -2462,7 +2467,7 @@ impl App {
                     && view.editable()
                     && view.commit_edit().is_some()
                 {
-                    ed.dirty = true;
+                    ed.mark_dirty();
                 }
             }
         }
@@ -4146,18 +4151,15 @@ impl App {
                 });
             }
             CommitAction::CopyHash => {
-                self.status = if copy_to_clipboard(hash) {
-                    format!("Copied commit hash {short}")
-                } else {
-                    String::from("Could not copy the commit hash to the clipboard")
-                };
+                let landing = self.copy_where_pasted(hash);
+                self.status = format!("Copied commit hash {short}{}", landing.note());
             }
             CommitAction::CopyMessage => {
                 self.status = match crate::git::commit_message(&root, hash) {
-                    Ok(message) if copy_to_clipboard(&message) => {
-                        format!("Copied the message of {short}")
+                    Ok(message) => {
+                        let landing = self.copy_where_pasted(&message);
+                        format!("Copied the message of {short}{}", landing.note())
                     }
-                    Ok(_) => String::from("Could not copy the commit message to the clipboard"),
                     Err(e) => format!("Could not read the message of {short}: {e}"),
                 };
             }
@@ -4189,12 +4191,8 @@ impl App {
         }
         // The clipboard the user pastes from, as any copy reaches it: the
         // local one over the relay, else this machine's, else OSC 52.
-        let via_relay = self.is_relay_session && self.push_clipboard_via_relay(&url);
-        self.status = if via_relay || copy_to_clipboard(&url) {
-            format!("Copied {url}")
-        } else {
-            format!("Copied {url} via OSC 52 (the host terminal decides)")
-        };
+        let landing = self.copy_where_pasted(&url);
+        self.status = format!("Copied {url}{}", landing.note());
     }
 
     /// The 1-based lines a shared link points at: the selection's, less a

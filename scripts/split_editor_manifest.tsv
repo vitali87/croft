@@ -1,0 +1,949 @@
+# Stage B of the refactor program (#2062): where each item of src/widgets/editor.rs goes.
+# One row per item, in file order. pr 0 means the item stays in editor.rs; the others
+# move to src/widgets/editor/<file>.rs in that PR. kind, impl and name are as
+# `scripts/check_pure_move.py list` prints them. Run
+# `scripts/move_items.py --target editor --check` after adding an item to editor.rs.
+# A struct whose private fields other files read (and the tests do) stays in editor.rs,
+# where every file under editor/ and the tests can still read them; its methods move.
+pr	file	kind	impl	name
+5	disk	const	-	MAX_FILE_BYTES
+1	viewers	const	-	MAX_GUNZIP_BYTES
+2	diff_view	const	-	STEP_MARK_COLOR
+1	viewers	const	-	MAX_IMAGE_BYTES
+1	viewers	fn	-	image_dimensions_of
+1	viewers	const	-	IMAGE_EXTENSIONS
+1	viewers	struct	-	ImageView
+1	viewers	fn	-	next_image_generation
+4	undo	fn	-	next_undo_step_id
+1	viewers	struct	-	PdfState
+1	viewers	fn	-	canvas_bg
+1	viewers	fn	-	image_canvas_bg
+1	viewers	fn	-	render_image_placeholder
+1	viewers	fn	-	css_px_size
+0		struct	-	CellImage
+1	viewers	type	-	HalfBlocks
+0		macro	-	thread_local!
+1	viewers	fn	-	halfblock_cells
+1	viewers	fn	-	paint_cell_image
+1	viewers	fn	-	ansi_color_to_tui
+1	viewers	fn	-	render_log
+1	viewers	fn	-	paint_log_cells
+1	viewers	fn	-	render_hex
+1	viewers	fn	-	render_archive
+1	viewers	fn	-	render_sheet
+2	diff_view	const	-	MERGE_BUTTON_ROW_MIN_BODY
+2	diff_view	fn	-	render_merge_panes
+2	diff_view	fn	-	clip_pad_cells
+2	diff_view	struct	-	DiffInkLift
+2	diff_view	fn	impl DiffInkLift	new
+2	diff_view	fn	impl DiffInkLift	ink
+2	diff_view	fn	-	paint_intraline_range
+2	diff_view	fn	-	paint_diff_syntax
+0		struct	-	DiffInks
+2	diff_view	const	-	DIFF_ROW_TINT
+2	diff_view	const	-	DIFF_CHANGE_TINT
+2	diff_view	const	-	DIFF_TINT_GREY
+2	diff_view	fn	-	diff_tint
+2	diff_view	fn	-	diff_inks
+2	diff_view	fn	-	paint_diff_filler
+2	diff_view	fn	-	split_diff_label
+2	diff_view	fn	-	diff_header_notes
+2	diff_view	fn	-	paint_surface_diff_header
+2	diff_view	fn	-	paint_surface_diff_footer
+2	diff_view	fn	-	render_diff
+2	diff_view	fn	-	paint_diff_selection_band
+2	diff_view	fn	-	diff_hit_test
+2	diff_view	fn	-	diff_side_line
+2	diff_view	fn	-	char_at_cell_from
+2	diff_view	fn	-	paint_diff_nav_arrows
+2	diff_view	fn	-	render_unified_deletion
+24	render	fn	-	write_cell
+24	render	fn	-	visible_control
+1	viewers	fn	-	format_bytes_human
+1	viewers	fn	-	extension_is_image
+1	viewers	fn	-	extension_is_pdf
+1	viewers	fn	-	image_format_label_from_ext
+14	selection	struct	-	EditorSelection
+14	selection	fn	impl EditorSelection	new
+14	selection	fn	impl EditorSelection	normalised
+14	selection	fn	impl EditorSelection	has_area
+14	selection	struct	-	LinkedRange
+14	selection	struct	-	SelectExpandStacks
+14	selection	struct	-	ExpandStack
+13	multi_cursor	struct	-	ColumnBox
+13	multi_cursor	type	-	ColumnBoxCarets
+3	span_edits	fn	-	apply_span_edits_to_lines
+3	span_edits	fn	-	apply_char_span_edits
+3	span_edits	fn	-	char_span_edits
+3	span_edits	fn	-	in_application_order
+3	span_edits	fn	-	span_new_end
+3	span_edits	fn	-	shift_past_span
+3	span_edits	fn	-	map_through_span_edits
+3	span_edits	fn	-	view_top_after_span_edits
+3	span_edits	fn	-	map_through_edit_refs
+3	span_edits	fn	-	position_after_span_edits
+1	viewers	fn	-	sheet_delim
+3	span_edits	fn	-	replace_span
+0		enum	-	EditKind
+18	transforms	enum	-	CaseTransform
+13	multi_cursor	enum	-	CaretEdit
+13	multi_cursor	type	-	CaretPlaces
+10	typing	enum	-	PairAction
+0		struct	-	Snapshot
+4	undo	fn	impl Snapshot	take_peer_splice
+3	span_edits	fn	-	rebase_history
+4	undo	const	-	UNDO_STACK_LIMIT
+4	undo	const	-	UNDO_BYTES_LIMIT
+4	undo	const	-	UNDO_MIN_STEPS
+4	undo	struct	-	ClosedHistory
+4	undo	const	-	CLOSED_HISTORY_FILES
+4	undo	const	-	CLOSED_HISTORY_BYTES
+0		macro	-	thread_local!
+4	undo	fn	-	lines_hash
+4	undo	fn	-	closed_history_key
+14	selection	const	-	SELECTION_HIGHLIGHT_MAX_LEN
+5	disk	enum	-	ExternalChange
+5	disk	struct	-	DiskReport
+5	disk	enum	-	SaveReason
+5	disk	enum	-	SaveOutcome
+5	disk	const	-	SCRATCH_SAVE_REFUSAL
+5	disk	enum	-	WriteProtection
+5	disk	fn	-	write_protection
+5	disk	fn	-	is_permission_denied
+5	disk	struct	-	ExternalReloadReport
+5	disk	fn	impl ExternalReloadReport	is_empty
+7	wrap	const	-	NAVIGATOR_ACCENT
+7	wrap	const	-	IGNORE_TAIL_COLS
+7	wrap	struct	-	CommentBox
+7	wrap	enum	-	CommentHit
+7	wrap	struct	-	CommentFocus
+7	wrap	enum	-	VisRow
+5	disk	enum	-	LineEnding
+5	disk	fn	impl LineEnding	label
+5	disk	fn	impl LineEnding	sequence
+5	disk	fn	impl LineEnding	detect
+23	language	struct	-	IndentStyle
+23	language	fn	-	detect_indentation
+23	language	fn	impl IndentStyle	unit
+23	language	fn	impl IndentStyle	label
+6	gutter	enum	-	GitMark
+6	gutter	enum	-	LineBlame
+6	gutter	enum	-	OverviewMark
+6	gutter	fn	impl OverviewMark	color
+0		struct	-	SnippetSession
+0		macro	-	thread_local!
+0		fn	impl Drop for Editor	drop
+0		struct	-	Editor
+0		fn	impl Editor	new
+0		fn	impl Editor	set_search_highlight
+6	gutter	fn	impl Editor	toggle_breakpoint
+6	gutter	fn	impl Editor	toggle_breakpoint_line
+6	gutter	fn	impl Editor	gutter_line_at
+6	gutter	fn	impl Editor	line_number_line_at
+6	gutter	fn	impl Editor	breakpoint_lane_line_at
+6	gutter	fn	impl Editor	fold_chevron_at
+6	gutter	fn	impl Editor	test_glyph_at
+6	gutter	fn	impl Editor	sign_cell_taken
+6	gutter	fn	impl Editor	stream_stop_at
+6	gutter	fn	impl Editor	screen_row_of_line
+6	gutter	fn	impl Editor	toggle_bookmark_at
+6	gutter	fn	impl Editor	toggle_bookmark
+6	gutter	fn	impl Editor	bookmarked_lines
+6	gutter	fn	impl Editor	restore_bookmarks
+6	gutter	fn	impl Editor	adopt_bookmarks
+6	gutter	fn	impl Editor	bookmarks_on_disk
+6	gutter	fn	impl Editor	is_bookmarked
+6	gutter	fn	impl Editor	goto_next_bookmark
+6	gutter	fn	impl Editor	goto_prev_bookmark
+6	gutter	fn	impl Editor	clear_bookmarks
+6	gutter	fn	impl Editor	has_line_marks
+6	gutter	fn	impl Editor	has_breakpoints_in
+6	gutter	fn	impl Editor	seed_bookmark_shadow
+6	gutter	fn	impl Editor	sync_bookmarks_to_buffer
+6	gutter	fn	impl Editor	jump_to_bookmark
+6	gutter	fn	impl Editor	breakpoint_lines
+6	gutter	fn	impl Editor	source_breakpoints
+0		fn	impl Editor	mark_buffer_changed
+6	gutter	fn	impl Editor	set_git_head_lines
+6	gutter	fn	impl Editor	set_blame
+6	gutter	fn	impl Editor	current_line_blame_annotation
+6	gutter	fn	impl Editor	committed_blame_annotation
+6	gutter	fn	impl Editor	cursor_line_blame
+6	gutter	fn	impl Editor	blame_commit_at
+2	diff_view	fn	impl Editor	conflicts
+2	diff_view	fn	impl Editor	resolve_conflict_at
+2	diff_view	fn	impl Editor	splice_result_rows
+6	gutter	fn	impl Editor	refresh_git_marks
+6	gutter	fn	impl Editor	overview_ruler_rows
+6	gutter	fn	impl Editor	overview_ruler_rows_wrapped
+2	diff_view	fn	impl Editor	historical
+2	diff_view	fn	impl Editor	historical_plain
+24	render	fn	impl Editor	warm_render_caches
+6	gutter	fn	impl Editor	git_change_from
+6	gutter	fn	impl Editor	git_mark_at
+6	gutter	fn	impl Editor	current_git_mark_at
+7	wrap	fn	impl Editor	wrap_enabled
+7	wrap	fn	impl Editor	content_cols
+7	wrap	comment	impl Editor	// -- Comment-box geometry ---------------------------------
+7	wrap	fn	impl Editor	text_row
+7	wrap	fn	impl Editor	comment_body_lines
+7	wrap	fn	impl Editor	comment_box_height
+7	wrap	fn	impl Editor	box_rows_at_line
+7	wrap	fn	impl Editor	box_rows_between
+7	wrap	fn	impl Editor	paint_comment_box_row
+7	wrap	fn	impl Editor	comment_box_hit
+7	wrap	comment	impl Editor	// -- Soft-wrap visual-row geometry ------------------------
+7	wrap	fn	impl Editor	line_segments
+7	wrap	fn	impl Editor	line_visual_rows
+7	wrap	fn	impl Editor	group_visual_rows
+7	wrap	fn	impl Editor	total_visual_rows
+7	wrap	fn	impl Editor	top_visual_row
+7	wrap	fn	impl Editor	cursor_visual_row
+7	wrap	fn	impl Editor	segment_index_of_col
+7	wrap	fn	impl Editor	set_top_to_visual_row
+7	wrap	fn	impl Editor	logical_pos_at_visual_row
+7	wrap	fn	impl Editor	visual_row_is_box
+7	wrap	fn	impl Editor	wrap_set_top
+7	wrap	fn	impl Editor	wrap_move_vertical
+10	typing	fn	impl Editor	word_before_cursor
+10	typing	fn	impl Editor	caret_in_code
+5	disk	fn	impl Editor	open
+4	undo	fn	impl Editor	stash_history
+4	undo	fn	impl Editor	restore_history
+5	disk	fn	impl Editor	open_file
+5	disk	fn	impl Editor	open_new_file
+5	disk	fn	impl Editor	load_text
+1	viewers	fn	impl Editor	open_image
+1	viewers	fn	impl Editor	open_sheet
+1	viewers	fn	impl Editor	open_media_preview
+1	viewers	fn	impl Editor	open_sqlite
+1	viewers	fn	impl Editor	open_doc_preview
+1	viewers	fn	impl Editor	open_archive
+1	viewers	fn	impl Editor	open_svg
+1	viewers	fn	impl Editor	install_sheet_view
+1	viewers	fn	impl Editor	open_pdf
+1	viewers	fn	impl Editor	has_non_text_view
+5	disk	fn	impl Editor	holds_exactly
+5	disk	fn	impl Editor	bytes_for_disk
+5	disk	fn	impl Editor	provenance_to_record
+1	viewers	fn	impl Editor	route_gzip
+1	viewers	fn	impl Editor	open_gunzipped
+1	viewers	fn	impl Editor	open_log
+5	disk	fn	impl Editor	disk_stamp
+5	disk	fn	impl Editor	restore_unsaved_text
+5	disk	fn	impl Editor	set_disk_stamp
+1	viewers	fn	impl Editor	open_sarif
+1	viewers	fn	impl Editor	should_open_as_log
+1	viewers	fn	impl Editor	open_hex
+1	viewers	fn	impl Editor	hex_save
+1	viewers	fn	impl Editor	sheet_save
+1	viewers	fn	impl Editor	sheet_pending_cell
+1	viewers	fn	impl Editor	sheet_backup
+1	viewers	fn	impl Editor	restore_sheet_edits
+1	viewers	fn	impl Editor	pdf_page
+1	viewers	fn	impl Editor	change_pdf_page
+1	viewers	fn	impl Editor	set_pdf_page
+1	viewers	fn	impl Editor	render_pdf_page
+8	highlighting	fn	impl Editor	rehighlight_for_theme
+1	viewers	fn	impl Editor	rebuild_markdown_preview
+1	viewers	fn	impl Editor	rebuild_markdown_preview_from
+8	highlighting	fn	impl Editor	recompute_highlights
+8	highlighting	fn	impl Editor	recompute_highlights_within
+1	viewers	fn	impl Editor	is_plain_log
+1	viewers	fn	impl Editor	refresh_log_highlight
+1	viewers	fn	impl Editor	plain_log_highlights
+8	highlighting	fn	impl Editor	start_highlight_pass
+8	highlighting	fn	impl Editor	await_highlight_pass
+8	highlighting	fn	impl Editor	poll_highlights
+8	highlighting	fn	impl Editor	highlight_generation
+8	highlighting	fn	impl Editor	land_highlight_pass
+8	highlighting	fn	impl Editor	highlight_pending
+8	highlighting	fn	impl Editor	defer_highlights_for_test
+8	highlighting	fn	impl Editor	highlights_for_test
+9	lsp_overlays	fn	impl Editor	apply_semantic_tokens
+9	lsp_overlays	fn	impl Editor	apply_inlay_hints
+9	lsp_overlays	fn	impl Editor	apply_document_links
+9	lsp_overlays	fn	impl Editor	document_link_at
+9	lsp_overlays	fn	impl Editor	apply_document_colors
+9	lsp_overlays	fn	impl Editor	color_at
+9	lsp_overlays	fn	impl Editor	utf16_col_to_char_pub
+9	lsp_overlays	fn	impl Editor	apply_occurrences
+9	lsp_overlays	fn	impl Editor	clear_occurrences
+9	lsp_overlays	fn	impl Editor	clear_inlay_hints
+9	lsp_overlays	fn	impl Editor	recompute_inlay_spans
+9	lsp_overlays	fn	impl Editor	set_step_marks
+9	lsp_overlays	fn	impl Editor	row_inlay_spans
+9	lsp_overlays	fn	impl Editor	inlay_spans_for_test
+8	highlighting	fn	impl Editor	line_spans_for_test
+8	highlighting	fn	impl Editor	clean_cache_text
+9	lsp_overlays	fn	impl Editor	semantic_overlay_for_test
+9	lsp_overlays	fn	impl Editor	occurrence_count_for_test
+0		fn	impl Editor	lines_for_test
+9	lsp_overlays	fn	impl Editor	apply_diagnostics
+9	lsp_overlays	fn	impl Editor	diagnostics_path
+9	lsp_overlays	fn	impl Editor	diagnostics_in_line_range
+9	lsp_overlays	fn	impl Editor	diagnostic_spans_for_test
+9	lsp_overlays	fn	impl Editor	diagnostic_row
+9	lsp_overlays	fn	impl Editor	recompute_diagnostic_spans
+9	lsp_overlays	fn	impl Editor	recompute_semantic_overlay
+9	lsp_overlays	fn	impl Editor	document_end
+1	viewers	fn	impl Editor	toggle_markdown_preview
+1	viewers	fn	impl Editor	build_notebook_preview
+1	viewers	fn	impl Editor	rebuild_notebook_preview
+1	viewers	fn	impl Editor	set_notebook_running
+1	viewers	fn	impl Editor	scroll_markdown_preview
+0		fn	impl Editor	line_char_len
+0		fn	impl Editor	byte_index
+0		fn	impl Editor	pin_on_edit
+10	typing	fn	impl Editor	insert_char
+10	typing	fn	impl Editor	overwrite_applies
+10	typing	fn	impl Editor	joins_cluster_before_caret
+10	typing	fn	impl Editor	overwrite_char
+10	typing	fn	impl Editor	insert_closing_tag
+10	typing	fn	impl Editor	insert_char_with_pairs
+10	typing	fn	impl Editor	pair_action
+10	typing	fn	impl Editor	surround_selection_raw
+10	typing	fn	impl Editor	insert_pair_raw
+10	typing	fn	impl Editor	earlier_construct_end
+3	span_edits	fn	impl Editor	apply_span_edits_as
+3	span_edits	fn	impl Editor	apply_span_edits_as_in
+3	span_edits	fn	impl Editor	apply_span_edits_moving_caret
+3	span_edits	fn	impl Editor	apply_span_edits
+3	span_edits	fn	impl Editor	apply_remote_span_edits
+3	span_edits	fn	impl Editor	apply_peer_span_edit
+3	span_edits	fn	impl Editor	apply_span_edits_grouped
+3	span_edits	fn	impl Editor	apply_document_edits
+3	span_edits	fn	impl Editor	follow_span_edits
+3	span_edits	fn	impl Editor	end_remote_undo_group
+23	language	fn	impl Editor	indent_style
+23	language	fn	impl Editor	set_indent_style
+23	language	fn	impl Editor	indent_unit
+24	render	fn	impl Editor	row_origin
+24	render	fn	impl Editor	cursor_visual_col
+24	render	fn	impl Editor	sync_tab_cells
+23	language	fn	impl Editor	indent_preference
+23	language	fn	impl Editor	language_label
+23	language	fn	impl Editor	language
+23	language	fn	impl Editor	set_language
+23	language	fn	impl Editor	pick_language
+23	language	fn	impl Editor	language_picked_by_hand
+5	disk	fn	impl Editor	reopen_with_encoding
+19	navigation	fn	impl Editor	clamp_cursor
+10	typing	fn	impl Editor	insert_str
+10	typing	fn	impl Editor	paste_str
+10	typing	fn	impl Editor	insert_str_as
+10	typing	fn	impl Editor	insert_str_as_in
+10	typing	fn	impl Editor	insert_char_raw
+23	language	fn	impl Editor	scope_id
+12	snippets	fn	impl Editor	snippet_active
+12	snippets	fn	impl Editor	cancel_snippet
+12	snippets	fn	impl Editor	expand_snippet
+12	snippets	fn	impl Editor	snippet_var
+12	snippets	fn	impl Editor	expand_snippet_with
+12	snippets	fn	impl Editor	expand_snippet_with_in
+12	snippets	fn	impl Editor	snippet_next
+12	snippets	fn	impl Editor	span_text
+12	snippets	fn	impl Editor	place_at_snippet_stop
+11	on_enter	fn	impl Editor	insert_newline_raw
+11	on_enter	fn	impl Editor	insert_newline
+11	on_enter	fn	impl Editor	note_auto_indent
+11	on_enter	fn	impl Editor	is_auto_indent_line
+11	on_enter	fn	impl Editor	trim_auto_indent
+11	on_enter	fn	impl Editor	smart_insert_newline_inner
+11	on_enter	fn	impl Editor	apply_on_enter
+11	on_enter	fn	impl Editor	continue_comment
+10	typing	fn	impl Editor	backspace
+10	typing	fn	impl Editor	backspace_in
+10	typing	fn	impl Editor	backspace_raw
+10	typing	fn	impl Editor	delete_forward
+10	typing	fn	impl Editor	delete_forward_raw
+10	typing	fn	impl Editor	delete_word_left
+10	typing	fn	impl Editor	delete_word_right
+10	typing	fn	impl Editor	delete_cols_on_line
+20	symbol_tabs	fn	impl Editor	at_symbol_edge
+13	multi_cursor	fn	impl Editor	has_multi_cursor
+13	multi_cursor	fn	impl Editor	collapse_carets
+13	multi_cursor	fn	impl Editor	select_all_occurrences_of_word_at_cursor
+13	multi_cursor	fn	impl Editor	occurrence_starts
+13	multi_cursor	fn	impl Editor	select_all_occurrences
+13	multi_cursor	fn	impl Editor	add_cursors_to_line_ends
+13	multi_cursor	fn	impl Editor	select_next_occurrence
+13	multi_cursor	fn	impl Editor	multi_insert_char
+13	multi_cursor	fn	impl Editor	multi_backspace
+13	multi_cursor	fn	impl Editor	multi_delete_forward
+13	multi_cursor	fn	impl Editor	multi_apply
+13	multi_cursor	fn	impl Editor	types_over_at_every_caret
+13	multi_cursor	fn	impl Editor	caret_places
+13	multi_cursor	fn	impl Editor	caret_selections
+13	multi_cursor	fn	impl Editor	apply_caret_edit_raw
+14	selection	fn	impl Editor	start_selection_at_cursor
+14	selection	fn	impl Editor	extend_selection_to_cursor
+14	selection	fn	impl Editor	pos_to_utf16
+14	selection	fn	impl Editor	clear_selection
+13	multi_cursor	fn	impl Editor	sync_occurrence_word_sel
+14	selection	comment	impl Editor	// ---- Linked editing (#254) ------------------------------
+14	selection	fn	impl Editor	set_linked_ranges
+14	selection	fn	impl Editor	cursor_position_utf16
+14	selection	fn	impl Editor	clear_linked_ranges
+14	selection	fn	impl Editor	has_linked_ranges
+14	selection	fn	impl Editor	linked_ranges_contain
+14	selection	fn	impl Editor	resnapshot_linked_rows
+14	selection	fn	impl Editor	mirror_linked_edit
+14	selection	comment	impl Editor	// ---- Expand / Shrink Selection (#254) -------------------
+14	selection	fn	impl Editor	cursor_selections
+14	selection	fn	impl Editor	validate_expand_stacks
+14	selection	fn	impl Editor	apply_expand_steps
+14	selection	fn	impl Editor	expand_selection_from_stack
+14	selection	fn	impl Editor	shrink_selection_step
+14	selection	fn	impl Editor	install_selection_chains
+14	selection	fn	impl Editor	expand_selection_syntax
+14	selection	fn	impl Editor	syntax_enclosing_range
+14	selection	fn	impl Editor	textual_enclosing_range
+14	selection	fn	impl Editor	char_pos_to_byte
+14	selection	fn	impl Editor	ts_point_to_char
+14	selection	fn	impl Editor	cursor_positions_utf16
+14	selection	fn	impl Editor	select_all
+14	selection	fn	impl Editor	selection_text
+14	selection	fn	impl Editor	selection_occurrence_needle
+14	selection	fn	impl Editor	delete_selection
+14	selection	fn	impl Editor	delete_selection_inner
+15	folding	fn	impl Editor	indent_width
+15	folding	fn	impl Editor	fold_range
+15	folding	fn	impl Editor	indent_fold_range
+15	folding	fn	impl Editor	is_foldable
+15	folding	fn	impl Editor	lsp_folds_current
+15	folding	fn	impl Editor	set_lsp_folds
+15	folding	fn	impl Editor	refresh_fold_tables
+15	folding	fn	impl Editor	fold_kind_at
+15	folding	fn	impl Editor	fold_all_of_kind
+15	folding	fn	impl Editor	unfold_all_of_kind
+15	folding	fn	impl Editor	outermost_enclosing_header
+9	lsp_overlays	fn	impl Editor	set_inline_values_from_locals
+9	lsp_overlays	fn	impl Editor	paint_ghost_row
+9	lsp_overlays	fn	impl Editor	live_ghost
+9	lsp_overlays	fn	impl Editor	live_ghost_full
+9	lsp_overlays	fn	impl Editor	lenses_on_line
+9	lsp_overlays	fn	impl Editor	code_lens_at
+9	lsp_overlays	fn	impl Editor	live_note
+15	folding	fn	impl Editor	guide_step
+15	folding	fn	impl Editor	guide_indent_width
+15	folding	fn	impl Editor	guide_indent
+15	folding	fn	impl Editor	active_indent_guide
+15	folding	fn	impl Editor	enclosing_fold_header
+6	gutter	fn	impl Editor	gutter_number
+15	folding	fn	impl Editor	visible_line_distance
+0		fn	impl Editor	is_caret_line
+15	folding	fn	impl Editor	is_line_hidden
+15	folding	fn	impl Editor	rebuild_hidden_ranges
+15	folding	fn	impl Editor	forget_folds_in
+15	folding	fn	impl Editor	reveal_cursor_fold
+15	folding	fn	impl Editor	next_visible_line
+15	folding	fn	impl Editor	prev_visible_line
+15	folding	fn	impl Editor	toggle_fold
+15	folding	fn	impl Editor	fold_all
+15	folding	fn	impl Editor	fold_headers_with_levels
+15	folding	fn	impl Editor	fold_level
+15	folding	fn	impl Editor	fold_recursively
+15	folding	fn	impl Editor	unfold_recursively
+15	folding	fn	impl Editor	unfold_all
+4	undo	fn	impl Editor	snapshot
+4	undo	fn	impl Editor	trim_undo_stack
+4	undo	fn	impl Editor	trim_redo_stack
+4	undo	fn	impl Editor	undo_history_size
+4	undo	fn	impl Editor	push_undo
+4	undo	fn	impl Editor	push_undo_step
+4	undo	fn	impl Editor	undo
+4	undo	fn	impl Editor	redo
+4	undo	fn	impl Editor	restore_snapshot
+4	undo	fn	impl Editor	break_undo_coalescing
+4	undo	fn	impl Editor	begin_undo_group
+4	undo	fn	impl Editor	end_undo_group
+4	undo	fn	impl Editor	undo_group_open
+4	undo	fn	impl Editor	adopt_undo_step
+22	mouse	fn	impl Editor	mouse_down
+22	mouse	fn	impl Editor	mouse_drag
+5	disk	fn	impl Editor	matches_open_path
+5	disk	fn	impl Editor	disk_stamp_of
+5	disk	fn	impl Editor	disk_stamp_with_wal
+1	viewers	fn	impl Editor	is_sqlite_view
+5	disk	fn	impl Editor	current_disk_stamp
+5	disk	fn	impl Editor	mark_synced_with_disk
+5	disk	fn	impl Editor	disk_changed_externally
+5	disk	fn	impl Editor	reload_if_clean
+5	disk	fn	impl Editor	reload_from_disk
+1	viewers	fn	impl Editor	sqlite_place
+1	viewers	fn	impl Editor	restore_sqlite_place
+5	disk	fn	impl Editor	carry_history_across_reload
+5	disk	fn	impl Editor	revert_to_disk
+5	disk	fn	impl Editor	revert_as_undo_step
+5	disk	fn	impl Editor	reload_or_flag_conflict
+5	disk	fn	impl Editor	deleted_on_disk
+5	disk	fn	impl Editor	save_to_disk
+5	disk	fn	impl Editor	auto_save_to_disk
+5	disk	fn	impl Editor	save_to_disk_for
+5	disk	fn	impl Editor	save_to_disk_force
+5	disk	fn	impl Editor	save_as
+5	disk	fn	impl Editor	encode_for_disk
+5	disk	fn	impl Editor	unmappable_chars
+5	disk	fn	impl Editor	document_text
+5	disk	fn	impl Editor	sends_final_newline
+5	disk	fn	impl Editor	has_final_newline
+5	disk	fn	impl Editor	content_for_disk
+5	disk	fn	impl Editor	write_buffer_to_disk
+5	disk	fn	impl Editor	write_lifting_protection
+5	disk	fn	impl Editor	prepare_bytes_for_save
+5	disk	fn	impl Editor	settle_save_made_elsewhere
+19	navigation	fn	impl Editor	move_up
+19	navigation	fn	impl Editor	move_down
+19	navigation	fn	impl Editor	arrow_up
+19	navigation	fn	impl Editor	arrow_down
+19	navigation	fn	impl Editor	goto_top
+19	navigation	fn	impl Editor	goto_bottom
+19	navigation	fn	impl Editor	cursor_top
+19	navigation	fn	impl Editor	cursor_bottom
+20	symbol_tabs	fn	impl Editor	copy_view_position_from
+19	navigation	fn	impl Editor	goto_line
+16	line_commands	fn	impl Editor	yank_lines
+16	line_commands	fn	impl Editor	delete_lines
+16	line_commands	fn	impl Editor	delete_caret_lines
+16	line_commands	fn	impl Editor	kill_to_bol
+16	line_commands	fn	impl Editor	open_line_below
+16	line_commands	fn	impl Editor	open_line_above
+16	line_commands	fn	impl Editor	kill_to_eol
+16	line_commands	fn	impl Editor	replace_find_match
+16	line_commands	fn	impl Editor	replace_all_lines
+20	symbol_tabs	fn	impl Editor	mirror_lines_from
+20	symbol_tabs	fn	impl Editor	seed_unsaved
+20	symbol_tabs	fn	impl Editor	mark_clean_like_sibling
+16	line_commands	fn	impl Editor	lines_slice_text
+19	navigation	fn	impl Editor	move_left
+19	navigation	fn	impl Editor	move_right
+19	navigation	fn	impl Editor	move_word_right
+16	line_commands	fn	impl Editor	duplicate_lines_down
+16	line_commands	fn	impl Editor	duplicate_lines_up
+16	line_commands	fn	impl Editor	selected_or_cursor_row_range
+13	multi_cursor	fn	impl Editor	selections_with_primary
+16	line_commands	fn	impl Editor	selected_row_blocks
+16	line_commands	fn	impl Editor	selected_row_blocks_over_folds
+15	folding	fn	impl Editor	folded_end
+15	folding	fn	impl Editor	folded_header_hiding
+15	folding	fn	impl Editor	move_folds
+13	multi_cursor	fn	impl Editor	remap_carets
+13	multi_cursor	fn	impl Editor	set_selections
+13	multi_cursor	fn	impl Editor	dedup_carets
+13	multi_cursor	fn	impl Editor	pin_from_end
+13	multi_cursor	fn	impl Editor	unpin_from_end
+16	line_commands	fn	impl Editor	char_range_text
+16	line_commands	fn	impl Editor	replace_char_range
+16	line_commands	fn	impl Editor	move_lines_down
+16	line_commands	fn	impl Editor	move_lines_up
+17	comments	fn	impl Editor	toggle_line_comment
+17	comments	fn	impl Editor	line_comment_marker
+17	comments	fn	impl Editor	has_line_comment_syntax
+17	comments	fn	impl Editor	toggle_lines_in_block_comment
+17	comments	fn	impl Editor	toggle_block_comment
+17	comments	fn	impl Editor	jsx_child_rows
+17	comments	fn	impl Editor	jsx_children_at
+13	multi_cursor	fn	impl Editor	place_pinned_carets
+16	line_commands	fn	impl Editor	join_lines
+18	transforms	fn	impl Editor	transform_selection_case
+16	line_commands	fn	impl Editor	sort_lines
+16	line_commands	fn	impl Editor	trim_trailing_whitespace
+5	disk	fn	impl Editor	trim_trailing_whitespace_on_save
+5	disk	fn	impl Editor	apply_editorconfig_on_save
+5	disk	fn	impl Editor	trim_final_newlines_on_save
+5	disk	fn	impl Editor	editorconfig_props
+21	brackets	fn	impl Editor	char_at
+21	brackets	fn	impl Editor	bracket_zones
+21	brackets	fn	impl Editor	match_bracket_forward
+21	brackets	fn	impl Editor	match_bracket_backward
+21	brackets	fn	impl Editor	enclosing_brackets
+21	brackets	fn	impl Editor	next_bracket_pair
+21	brackets	fn	impl Editor	find_bracket_pair
+21	brackets	fn	impl Editor	adjacent_bracket_pair
+21	brackets	fn	impl Editor	bracket_match_pair
+21	brackets	fn	impl Editor	cached_bracket_match_pair
+21	brackets	fn	impl Editor	jump_to_matching_bracket
+21	brackets	fn	impl Editor	select_to_matching_bracket
+18	transforms	fn	impl Editor	bump_number
+12	snippets	fn	impl Editor	emmet_profile
+12	snippets	fn	impl Editor	emmet_available
+12	snippets	fn	impl Editor	expand_emmet_abbreviation
+12	snippets	fn	impl Editor	emmet_text_and_offset
+12	snippets	fn	impl Editor	emmet_position
+12	snippets	fn	impl Editor	emmet_set_text
+12	snippets	fn	impl Editor	emmet_wrap
+12	snippets	fn	impl Editor	emmet_element_at_caret
+12	snippets	fn	impl Editor	emmet_remove_tag
+12	snippets	fn	impl Editor	emmet_update_tag
+12	snippets	fn	impl Editor	emmet_match_tag
+12	snippets	fn	impl Editor	emmet_balance
+18	transforms	fn	impl Editor	transpose_chars
+18	transforms	fn	impl Editor	transpose_cells
+18	transforms	fn	impl Editor	transpose_at
+16	line_commands	fn	impl Editor	indentation_to_spaces
+16	line_commands	fn	impl Editor	indentation_to_tabs
+16	line_commands	fn	impl Editor	convert_indentation
+16	line_commands	fn	impl Editor	trim_final_newlines
+13	multi_cursor	fn	impl Editor	add_cursor_below
+13	multi_cursor	fn	impl Editor	add_caret_at_screen
+13	multi_cursor	fn	impl Editor	begin_box_select
+13	multi_cursor	fn	impl Editor	box_selecting
+13	multi_cursor	fn	impl Editor	box_drag_to_screen
+13	multi_cursor	fn	impl Editor	box_select_to
+13	multi_cursor	fn	impl Editor	end_box_select
+13	multi_cursor	fn	impl Editor	column_select
+13	multi_cursor	fn	impl Editor	column_box_carets
+13	multi_cursor	fn	impl Editor	column_select_page
+13	multi_cursor	fn	impl Editor	add_cursor_above
+7	wrap	fn	impl Editor	toggle_wrap
+14	selection	fn	impl Editor	selection_is_multiline
+16	line_commands	fn	impl Editor	indent_at_cursor
+16	line_commands	fn	impl Editor	indent_lines
+16	line_commands	fn	impl Editor	dedent_lines
+19	navigation	fn	impl Editor	move_word_left
+19	navigation	fn	impl Editor	scroll_left_by
+19	navigation	fn	impl Editor	scroll_right_by
+19	navigation	fn	impl Editor	visible_text_width
+19	navigation	fn	impl Editor	ensure_cursor_col_visible
+19	navigation	fn	impl Editor	page_size
+19	navigation	fn	impl Editor	page_down_one_screen
+19	navigation	fn	impl Editor	page_up_one_screen
+19	navigation	fn	impl Editor	home_line
+19	navigation	fn	impl Editor	end_line
+19	navigation	fn	impl Editor	home_key
+7	wrap	fn	impl Editor	wrapped_row_above
+19	navigation	fn	impl Editor	end_key
+7	wrap	fn	impl Editor	wrapped_row_of_cursor
+1	viewers	fn	impl Editor	scroll_sheet_rows
+19	navigation	fn	impl Editor	scroll_up
+19	navigation	fn	impl Editor	scroll_down
+20	symbol_tabs	fn	impl Editor	leave_symbol_view
+20	symbol_tabs	fn	impl Editor	drop_symbol_clip
+20	symbol_tabs	fn	impl Editor	symbol_clip
+20	symbol_tabs	fn	impl Editor	find_scope
+20	symbol_tabs	fn	impl Editor	clip_content_rows
+20	symbol_tabs	fn	impl Editor	clamp_to_symbol_view
+19	navigation	fn	impl Editor	scroll_to_bar_y
+19	navigation	fn	impl Editor	scroll_to_bar_x
+19	navigation	fn	impl Editor	text_rows
+19	navigation	fn	impl Editor	visible_rows
+19	navigation	fn	impl Editor	selection_rows
+19	navigation	fn	impl Editor	minimap_span
+19	navigation	fn	impl Editor	goto_line_centered
+19	navigation	fn	impl Editor	minimap_rgba
+19	navigation	fn	impl Editor	nonwrap_top_content_row
+19	navigation	fn	impl Editor	nonwrap_set_top
+1	viewers	fn	impl Editor	settle_log_reload
+1	viewers	fn	impl Editor	cancel_log_reload
+19	navigation	fn	impl Editor	scroll_view_to
+19	navigation	fn	impl Editor	caret_floor_row
+14	selection	fn	impl Editor	select_word_at
+14	selection	fn	impl Editor	whole_lines
+14	selection	fn	impl Editor	select_lines_at
+14	selection	fn	impl Editor	expand_line_selection
+22	mouse	fn	impl Editor	click
+22	mouse	fn	impl Editor	buffer_pos_at
+22	mouse	fn	impl Editor	buffer_col_at_display
+22	mouse	fn	impl Editor	word_at
+22	mouse	fn	impl Editor	identifier_run_at
+22	mouse	fn	impl Editor	word_string_at
+22	mouse	fn	impl Editor	diagnostics_at
+22	mouse	fn	impl Editor	hover_region_at
+21	brackets	struct	-	BracketZones
+21	brackets	fn	impl BracketZones<'_>	zone
+21	brackets	fn	impl BracketZones<'_>	zone_at
+19	navigation	fn	-	chars_back
+19	navigation	fn	-	char_byte
+19	navigation	fn	-	prev_grapheme_col
+19	navigation	fn	-	next_grapheme_col
+19	navigation	fn	-	floor_grapheme_col
+19	navigation	fn	-	is_word_char
+19	navigation	fn	-	word_char_at
+19	navigation	fn	-	word_start_before
+19	navigation	fn	-	word_end_after
+21	brackets	type	-	BPos
+21	brackets	type	-	BracketPairCache
+21	brackets	const	-	BRACKET_PAIRS
+21	brackets	fn	-	is_open_bracket
+21	brackets	fn	-	is_close_bracket
+21	brackets	fn	-	matching_close
+21	brackets	fn	-	matching_open
+13	multi_cursor	fn	-	find_word_occurrences
+17	comments	const	-	JSX_COMMENT_OPEN
+17	comments	const	-	JSX_COMMENT_CLOSE
+17	comments	fn	-	is_jsx_comment
+17	comments	fn	-	jsx_child_starts_at
+17	comments	fn	-	in_jsx_or_error
+13	multi_cursor	fn	-	find_text_occurrences
+17	comments	fn	-	line_comment_token
+17	comments	fn	-	line_comment_token_for_path
+17	comments	fn	-	line_comment_prefix_len
+17	comments	fn	-	block_comment_tokens
+16	line_commands	fn	-	merge_row_blocks
+16	line_commands	fn	-	rows_in_blocks
+16	line_commands	fn	-	shift_col
+16	line_commands	fn	-	text_end
+18	transforms	fn	-	title_case
+18	transforms	fn	-	identifier_case
+18	transforms	fn	-	case_run
+18	transforms	fn	-	case_words
+5	disk	struct	-	SaveCleanup
+5	disk	fn	impl SaveCleanup	from_prefs
+23	language	const	-	MAX_RULERS
+23	language	fn	-	normalize_rulers
+6	gutter	enum	-	LineNumbers
+6	gutter	fn	impl LineNumbers	pref_id
+6	gutter	fn	impl LineNumbers	from_pref
+6	gutter	fn	impl LineNumbers	next
+23	language	enum	-	WhitespaceMode
+23	language	fn	impl WhitespaceMode	pref_id
+23	language	fn	impl WhitespaceMode	from_pref
+23	language	fn	impl WhitespaceMode	label
+23	language	fn	impl WhitespaceMode	next
+8	highlighting	fn	-	identifier_tokens
+8	highlighting	const	-	UNEXPECTED_BRACKET
+8	highlighting	type	-	BracketColors
+8	highlighting	fn	-	bracket_col
+8	highlighting	const	-	BRACKET_SCAN_MAX_BYTES
+1	viewers	const	-	LOG_HIGHLIGHT_MAX_BYTES
+1	viewers	fn	-	log_span_style
+8	highlighting	const	-	BRACKET_COLOR_CYCLE
+8	highlighting	fn	-	scan_bracket_colors
+8	highlighting	const	-	HIGHLIGHT_INLINE_BUDGET
+8	highlighting	struct	-	HighlightJob
+0		struct	-	HighlightPass
+8	highlighting	fn	-	embedded_line_lens
+8	highlighting	fn	-	run_highlight_pass
+8	highlighting	const	-	CARRY_DIFF_BUDGET
+8	highlighting	fn	-	carry_highlights
+8	highlighting	fn	-	carry_changed_lines
+8	highlighting	fn	-	common_affixes
+8	highlighting	fn	-	swatch_luma
+8	highlighting	fn	-	swatch_fg_for_bg
+8	highlighting	fn	-	hex_digit
+8	highlighting	fn	-	parse_hex_color
+8	highlighting	fn	-	parse_rgb_color
+8	highlighting	fn	-	hsl_to_rgb
+8	highlighting	fn	-	parse_hsl_color
+8	highlighting	const	-	COLOR_SWATCH_SCAN_MAX_BYTES
+8	highlighting	fn	-	scan_color_swatches
+23	language	fn	-	indent_unit_for
+18	transforms	enum	-	NumberRadix
+18	transforms	struct	-	NumberToken
+18	transforms	fn	impl NumberToken	bumped
+18	transforms	fn	-	number_token_at_or_after
+18	transforms	fn	-	number_tokens
+18	transforms	fn	-	radix_prefixed_token
+18	transforms	fn	-	is_word_or_digit
+12	snippets	fn	-	emmet_profile_for
+23	language	fn	-	language_scope_id
+23	language	const	-	SELECTABLE_LANGUAGES
+11	on_enter	fn	-	leading_outdent_chars
+11	on_enter	struct	-	CommentEnter
+11	on_enter	enum	-	CommentBelow
+11	on_enter	fn	-	has_block_doc_comments
+11	on_enter	fn	-	comment_on_enter
+11	on_enter	fn	-	block_closed_below
+11	on_enter	fn	-	extra_indent_triggered
+11	on_enter	enum	-	OnEnter
+11	on_enter	fn	-	on_enter_rule
+11	on_enter	fn	-	in_markdown_fence
+11	on_enter	fn	-	markdown_on_enter
+11	on_enter	fn	-	yaml_newline_indent
+11	on_enter	fn	-	yaml_strip_comment
+11	on_enter	fn	-	yaml_key_colon
+11	on_enter	fn	-	is_bracket_pair_split
+1	viewers	fn	-	gunzip_scratch_dir
+5	disk	fn	-	read_file_head
+5	disk	fn	-	decode_blob
+5	disk	fn	-	is_binary
+0		fn	-	byte_index_of_char
+0		fn	-	utf16_to_char_col
+7	wrap	fn	-	is_wrap_break_after
+0		macro	-	thread_local!
+24	render	fn	-	set_tab_cells
+24	render	fn	-	char_cells
+24	render	fn	-	tab_cells_at
+24	render	fn	-	char_cells_at
+24	render	fn	-	cluster_cells_at
+24	render	fn	-	char_cells_from
+24	render	fn	-	cells_from
+24	render	fn	-	cells_before
+24	render	fn	-	blank_tabs
+24	render	fn	-	blank_tabs_from
+7	wrap	fn	-	wrap_segments
+6	gutter	fn	-	shift_bookmark_lines
+6	gutter	fn	-	line_mapper
+6	gutter	fn	-	carry_marks
+6	gutter	fn	-	shift_line_mapper
+6	gutter	fn	-	follow_moved_bookmark_lines
+11	on_enter	fn	-	split_into_lines
+11	on_enter	fn	-	paste_reindent_edits
+5	disk	fn	-	normalize_newlines
+24	render	fn	-	shift_spans_for_view
+24	render	fn	-	span_rgb
+24	render	fn	-	merge_overlay
+24	render	fn	-	build_line_spans
+24	render	fn	impl Widget for &mut Editor	render
+1	viewers	fn	impl Editor	render_markdown_preview
+24	render	fn	impl Editor	paint_highlighted_line
+24	render	fn	impl Editor	sticky_line_at
+24	render	fn	impl Editor	cursor_screen_pos
+24	render	fn	impl Editor	inlay_cells_before_cursor
+2	diff_view	fn	impl Editor	diff_caret_screen_pos
+24	render	fn	-	inlay_cells_before
+24	render	fn	-	inlay_cells_strictly_before
+24	render	struct	-	RowCells
+24	render	fn	impl RowCells	of_line
+24	render	fn	impl RowCells	of_line_at
+24	render	fn	impl RowCells	fill
+24	render	fn	impl RowCells	text_before
+24	render	fn	impl RowCells	cell
+24	render	fn	impl RowCells	caret
+24	render	fn	impl RowCells	end
+24	render	fn	impl RowCells	width
+24	render	fn	-	paint_row_cells
+24	render	fn	-	inlay_text_segment
+24	render	fn	-	search_highlight_styles
+6	gutter	fn	-	paint_overview_ruler
+24	render	fn	-	paint_search_highlight
+24	render	fn	-	paint_selection_occurrences
+24	render	fn	-	paint_block_cursor
+24	render	fn	-	paint_ghost_caret
+21	brackets	fn	-	paint_bracket_match
+10	typing	const	-	VOID_ELEMENTS
+10	typing	fn	-	lang_auto_closes_tags
+10	typing	fn	-	in_sfc_script_or_style
+10	typing	fn	-	tag_auto_close_name
+10	typing	fn	-	ends_in_script_string_or_comment
+10	typing	fn	-	ends_in_string_or_comment
+10	typing	fn	-	quote_opens_string
+10	typing	fn	-	rust_lifetime_at
+10	typing	fn	-	opens_generics_after
+10	typing	fn	-	inside_angle_brackets
+10	typing	fn	-	backslash_escapes
+10	typing	fn	-	is_python_string_prefix
+10	typing	fn	-	trailing_word
+10	typing	fn	-	auto_close_partner
+10	typing	const	-	AUTO_CLOSE_BEFORE
+10	typing	fn	-	is_pair_closer
+10	typing	fn	-	is_pair_quote
+2	diff_view	fn	-	conflict_row_tint
+0		struct	-	AcceptChip
+2	diff_view	fn	impl AcceptChip	new
+2	diff_view	fn	impl AcceptChip	ticked
+2	diff_view	const	-	ACCEPT_CURRENT_FILL
+2	diff_view	const	-	ACCEPT_INCOMING_FILL
+2	diff_view	const	-	ACCEPT_BOTH_FILL
+2	diff_view	fn	-	lay_out_accept_chips
+2	diff_view	fn	-	paint_accept_chips
+24	render	fn	-	paint_full_row_bg
+24	render	fn	-	paint_selection_band
+24	render	fn	-	paint_diagnostic_underline
+24	render	fn	-	message_with_code
+24	render	fn	-	paint_diagnostic_tags
+25	tabs	struct	-	Crumb
+25	tabs	type	-	BreadcrumbRange
+1	viewers	struct	-	SqlitePlace
+1	viewers	fn	-	sqlite_wal_path
+0		struct	-	EditorTabs
+25	tabs	fn	impl EditorTabs	new
+25	tabs	fn	impl EditorTabs	tab_count
+25	tabs	fn	impl EditorTabs	set_search_highlight
+25	tabs	fn	impl EditorTabs	active_index
+25	tabs	fn	impl EditorTabs	active_editor_mut
+25	tabs	fn	impl EditorTabs	wheel_scroll_active
+25	tabs	fn	impl EditorTabs	tab_display_label
+25	tabs	fn	impl EditorTabs	tab_path
+25	tabs	fn	impl EditorTabs	tab_display_labels
+25	tabs	fn	impl EditorTabs	tab_strip_y_for_test
+25	tabs	fn	impl EditorTabs	iter_tabs
+25	tabs	fn	impl EditorTabs	end_open_undo_groups
+25	tabs	fn	impl EditorTabs	select
+25	tabs	fn	impl EditorTabs	trim_auto_indents
+25	tabs	fn	impl EditorTabs	reload_externally_changed_tabs
+25	tabs	fn	impl EditorTabs	revert_paths_to_disk
+25	tabs	fn	impl EditorTabs	rename_open_path
+25	tabs	fn	impl EditorTabs	open_in_new_tab
+25	tabs	fn	impl EditorTabs	open_unreadable_tab
+25	tabs	fn	impl EditorTabs	add_tab_with_path
+25	tabs	fn	impl EditorTabs	close_active
+25	tabs	fn	impl EditorTabs	close_clean_tabs_under
+25	tabs	fn	impl EditorTabs	close_tab
+25	tabs	fn	impl EditorTabs	release_bookmarks
+25	tabs	fn	impl EditorTabs	take_released_bookmarks
+25	tabs	fn	impl EditorTabs	close_others
+25	tabs	fn	impl EditorTabs	close_to_right
+25	tabs	fn	impl EditorTabs	close_all
+25	tabs	fn	impl EditorTabs	close_saved
+25	tabs	fn	impl EditorTabs	tab_at
+25	tabs	fn	impl EditorTabs	tab_strip_contains
+25	tabs	fn	impl EditorTabs	set_tab_reserved_right
+25	tabs	fn	impl EditorTabs	tab_list_button_at
+25	tabs	fn	impl EditorTabs	scroll_tabs_wheel
+25	tabs	fn	impl EditorTabs	scroll_tabs
+25	tabs	fn	impl EditorTabs	tab_full_path
+25	tabs	fn	impl EditorTabs	tab_screen_x
+25	tabs	fn	impl EditorTabs	close_screen_x
+25	tabs	fn	impl EditorTabs	close_at
+25	tabs	fn	impl EditorTabs	find_tab_with_path
+25	tabs	fn	impl EditorTabs	find_any_tab_with_path
+25	tabs	fn	impl EditorTabs	find_buffer_tab
+25	tabs	fn	impl EditorTabs	apply_rename_to_open_tab
+25	tabs	fn	impl EditorTabs	edit_seqs
+25	tabs	fn	impl EditorTabs	edited_since
+25	tabs	fn	impl EditorTabs	find_tab_matching
+25	tabs	fn	impl EditorTabs	preview_index
+25	tabs	fn	impl EditorTabs	pin_active
+25	tabs	fn	impl EditorTabs	is_preview
+25	tabs	fn	impl EditorTabs	keep_open
+25	tabs	fn	impl EditorTabs	is_pinned
+25	tabs	fn	impl EditorTabs	toggle_pin
+25	tabs	fn	impl EditorTabs	move_tab
+25	tabs	fn	impl EditorTabs	move_active_tab
+25	tabs	fn	impl EditorTabs	take_active_editor
+25	tabs	fn	impl EditorTabs	push_editor
+25	tabs	fn	impl EditorTabs	open_preview
+25	tabs	fn	impl EditorTabs	text_to_diff
+25	tabs	fn	impl EditorTabs	unsaved_text_of
+25	tabs	fn	impl EditorTabs	open_diff
+25	tabs	fn	impl EditorTabs	open_diff_resolved
+25	tabs	fn	impl EditorTabs	open_head_diff_with_text
+25	tabs	fn	impl EditorTabs	open_head_diff_with_text_resolved
+25	tabs	fn	impl EditorTabs	open_head_diff_with_texts
+25	tabs	fn	impl EditorTabs	open_deleted_diff_with_text
+25	tabs	fn	impl EditorTabs	open_git_diff_side_by_side
+25	tabs	fn	impl EditorTabs	open_fleet
+25	tabs	fn	impl EditorTabs	open_pr_review
+25	tabs	fn	impl EditorTabs	open_text_buffer
+25	tabs	fn	impl EditorTabs	open_pinned
+25	tabs	fn	impl EditorTabs	open_new_pinned
+25	tabs	fn	impl EditorTabs	open_pinned_with
+25	tabs	fn	impl EditorTabs	is_blank_initial
+25	tabs	fn	impl EditorTabs	new_untitled
+25	tabs	fn	impl EditorTabs	add_preview_tab_with_path
+25	tabs	fn	impl EditorTabs	repoint_preview_to
+25	tabs	fn	impl Default for EditorTabs	default
+25	tabs	type	impl Deref for EditorTabs	Target
+25	tabs	fn	impl Deref for EditorTabs	deref
+25	tabs	fn	impl DerefMut for EditorTabs	deref_mut
+25	tabs	struct	-	TabStripState
+25	tabs	const	-	TAB_LIST_W
+25	tabs	const	-	TAB_WHEEL_GAP
+25	tabs	const	-	TAB_INACTIVE_FG
+25	tabs	const	-	TAB_ACTIVE_FG
+25	tabs	fn	-	close_pill_fg
+25	tabs	fn	-	tab_icon
+25	tabs	struct	-	SurfaceTab
+25	tabs	fn	-	paint_surface_tab
+25	tabs	fn	impl Widget for &mut EditorTabs	render
+25	tabs	fn	impl EditorTabs	breadcrumb_target_at
+25	tabs	fn	impl EditorTabs	breadcrumb_index_at
+25	tabs	fn	impl EditorTabs	breadcrumb_anchor
+25	tabs	fn	-	disambiguated_tab_labels
+25	tabs	fn	-	dir_suffix
+15	folding	fn	-	region_marker
+15	folding	fn	-	comment_line
+25	tabs	fn	-	gone_from_disk
+25	tabs	fn	-	tab_label

@@ -534,6 +534,10 @@ impl App {
         } else {
             Pane::Tree
         };
+        // Every pane's focused look follows `focus` only through here: without
+        // it a restored editor focus took keys while the editor drew as
+        // unfocused and the Explorer kept its focused look (#2068).
+        self.sync_focus_flags();
         left
     }
 
@@ -1234,7 +1238,7 @@ impl App {
             && view.editable()
             && view.commit_edit().is_some()
         {
-            self.editor.dirty = true;
+            self.editor.mark_dirty();
         }
         // A CSV/TSV sheet with grid edits saves through its own
         // serialisation path (#177), same shape as the hex branch above.
@@ -1754,6 +1758,18 @@ impl App {
         self.pending_lossy_save = None;
         self.force_save_armed = false;
         self.status = String::from("Not saved: the file on disk is unchanged");
+    }
+
+    /// Remote: Drop to Local (`Cmd+K L`, #2071): on a remote session, end it
+    /// and hand back to the local croft it was launched from, asking first
+    /// about unsaved edits as a quit does. A local croft has nothing to
+    /// leave, and says so rather than doing nothing.
+    pub(super) fn drop_to_local_if_remote(&mut self) {
+        if self.is_remote {
+            self.guard_unsaved(UnsavedExit::DropToLocal);
+        } else {
+            self.status = String::from("Drop to Local: this croft is not a remote session");
+        }
     }
 
     /// Go on with `exit`, unless it would drop unsaved changes (#862): then
