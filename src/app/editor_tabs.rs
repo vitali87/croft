@@ -1604,6 +1604,38 @@ impl App {
                 }
             }
         }
+        // A file no tab shows any more keeps its marks (a closed tab hands
+        // them to the App): list them too, with the text now on disk, and
+        // let Enter open the file at the line.
+        self.settle_bookmarks();
+        let shown: std::collections::HashSet<PathBuf> =
+            found.iter().map(|(t, _)| t.path.clone()).collect();
+        let mut closed: Vec<(PathBuf, std::collections::BTreeSet<usize>)> = self
+            .all_bookmarks()
+            .into_iter()
+            .filter(|(path, _)| !shown.contains(path))
+            .collect();
+        closed.sort();
+        for (path, set) in closed {
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let lines: Vec<&str> = text.lines().collect();
+            for line in set {
+                // Marks are 1-based lines; one past the file's end is gone.
+                if let Some(l) = line.checked_sub(1).and_then(|i| lines.get(i)) {
+                    found.push((
+                        BookmarkTarget {
+                            group: active,
+                            tab: usize::MAX,
+                            path: path.clone(),
+                            line,
+                        },
+                        l.trim().chars().take(80).collect(),
+                    ));
+                }
+            }
+        }
         found.sort_by(|(a, _), (b, _)| (&a.path, a.line).cmp(&(&b.path, b.line)));
         self.pending_bookmarks.clear();
         let mut rows = Vec::with_capacity(found.len());
