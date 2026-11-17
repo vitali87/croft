@@ -297,6 +297,7 @@ src/
     │   ├── clock.rs         the scroll clock that keeps selections and notes in place; each row's print time
     │   ├── commands.rs      shell-integration marks, finished commands and their decorations, prompt jumps, the typed prompt line
     │   ├── mouse.rs         mouse reporting to the program in the pane; which grid cell a screen point is
+    │   ├── processes.rs     the shell and foreground process: names, command lines, working directories, `cd`
     │   ├── selection.rs     selections: make, extend, clear, words and blocks, keep them on their text as output scrolls; the selected text
     │   ├── shell_env.rs     the shell's start-up environment: integration for each shell, terminal and locale variables, croft's helpers on PATH
     │   ├── tests.rs         the terminal pane's own tests
