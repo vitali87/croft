@@ -46,6 +46,14 @@ pub(super) type PendingCargoLaunch = (
     PathBuf,
 );
 
+/// The Testing folder being worked out on a thread of its own (#1973): the
+/// workspace folder and focused file it is for, and where the answer
+/// arrives.
+pub(super) type PendingTestRoot = (
+    (PathBuf, Option<PathBuf>),
+    std::sync::mpsc::Receiver<PathBuf>,
+);
+
 /// The test run Testing: Rerun Last Run repeats (#1535), as it was asked.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum LastTestRun {
@@ -79,12 +87,63 @@ impl App {
         found
     }
 
+    /// [`Self::followed_test_root`] for the per-tick follow, off the UI
+    /// thread (#1973): the answer reads manifests and, with the CodeQL runner
+    /// added, walks the folder four deep for test packs, which in a home
+    /// folder held the first frame for seconds. `None` while a thread works
+    /// it out; that thread waits for the first frame, and only one runs at
+    /// a time, so switching tabs fast queues no pile of walks.
+    pub(super) fn poll_followed_test_root(&mut self, root: PathBuf) -> Option<PathBuf> {
+        let key = (root, self.editor.path.clone());
+        if let Some((asked, rx)) = &self.test_root_pending {
+            let answer = match rx.try_recv() {
+                Ok(found) => Some(found),
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                // The thread died without answering: settle on the folder
+                // itself, the answer for no runner, rather than ask again
+                // every tick.
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(asked.0.clone()),
+            };
+            if let Some(found) = answer {
+                self.test_root_follow = Some((asked.clone(), found));
+                self.test_root_pending = None;
+            }
+        }
+        if let Some((k, v)) = &self.test_root_follow
+            && *k == key
+        {
+            return Some(v.clone());
+        }
+        if self.test_root_pending.is_none() {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let extensions = self.extensions_dir();
+            let (root, file) = key.clone();
+            std::thread::spawn(move || {
+                crate::startup_gate::wait();
+                let _ = tx.send(crate::testing::registry::test_root_for(
+                    &extensions,
+                    &root,
+                    file.as_deref(),
+                ));
+            });
+            self.test_root_pending = Some((key, rx));
+        }
+        None
+    }
+
+    /// Drop the remembered Testing folder and any answer still being worked
+    /// out, which was asked before whatever made the caller drop it.
+    pub(super) fn forget_followed_test_root(&mut self) {
+        self.test_root_follow = None;
+        self.test_root_pending = None;
+    }
+
     /// Resolve the followed Testing folder afresh and rebind to it if it
     /// moved (#1520): a runner enabled or a package marker added since the
     /// focus last changed can change the answer the cache still holds.
     /// Whether it rebound.
     pub(super) fn refollow_test_root(&mut self) -> bool {
-        self.test_root_follow = None;
+        self.forget_followed_test_root();
         let root = self.followed_test_root(self.active_workspace_root());
         if root == self.active_test_root {
             return false;

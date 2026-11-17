@@ -326,16 +326,50 @@ fn the_testing_view_follows_the_focused_package_in_a_monorepo() {
         std::fs::write(pkg.join("src/a.test.ts"), "test('a', () => {});\n").unwrap();
     }
     let mut app = App::new(root.clone()).unwrap();
-    app.drain_git_responses();
+    settle_test_root(&mut app);
     assert_eq!(app.active_test_root, root.join("packages/math"));
     assert!(app.testing_runner_available(), "{}", app.status);
 
     app.editor
         .open_pinned(&root.join("packages/web/src/a.test.ts"))
         .unwrap();
-    app.drain_git_responses();
+    settle_test_root(&mut app);
     assert_eq!(app.active_test_root, root.join("packages/web"));
     assert_eq!(app.test_worker.root(), root.join("packages/web"));
+}
+
+/// #1973: the tick that follows the focus never works the Testing folder
+/// out itself. With the CodeQL runner added that walks the folder four
+/// deep for test packs, and in a home folder on macOS it held the first
+/// frame for 1.3 to 4.4 seconds. The tick hands it to a thread and returns
+/// still bound to the folder; the answer is applied on a later tick.
+#[test]
+fn the_testing_folder_is_worked_out_off_the_ui_thread() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::write(
+        root.join("package.json"),
+        r#"{"name":"vmono","private":true,"workspaces":["packages/*"]}"#,
+    )
+    .unwrap();
+    let pkg = root.join("packages/math");
+    std::fs::create_dir_all(&pkg).unwrap();
+    std::fs::write(pkg.join("vitest.config.ts"), "export default {};\n").unwrap();
+    let mut app = App::new(root.clone()).unwrap();
+
+    app.drain_git_responses();
+    assert!(
+        app.test_root_pending.is_some(),
+        "the tick asks a thread for the folder"
+    );
+    assert_eq!(
+        app.active_test_root, root,
+        "and stays bound until it answers"
+    );
+
+    settle_test_root(&mut app);
+    assert_eq!(app.active_test_root, pkg);
+    assert_eq!(app.test_worker.root(), pkg);
 }
 
 /// #1520 review: the followed package is cached per focused file, so a
@@ -355,7 +389,7 @@ fn a_runner_added_under_the_open_file_is_followed_on_refresh() {
     std::fs::write(pkg.join("src/a.test.ts"), "test('a', () => {});\n").unwrap();
     let mut app = App::new(root.clone()).unwrap();
     app.editor.open_pinned(&pkg.join("src/a.test.ts")).unwrap();
-    app.drain_git_responses();
+    settle_test_root(&mut app);
     assert_eq!(app.active_test_root, root);
     assert!(!app.testing_runner_available());
 
@@ -379,7 +413,7 @@ fn a_folder_with_no_runner_keeps_its_root_and_says_so() {
     )
     .unwrap();
     let mut app = App::new(root.clone()).unwrap();
-    app.drain_git_responses();
+    settle_test_root(&mut app);
     assert_eq!(app.active_test_root, root);
     assert!(!app.testing_runner_available());
     assert_eq!(app.status, crate::testing::NO_RUNNER_STATUS);
