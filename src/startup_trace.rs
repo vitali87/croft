@@ -57,17 +57,27 @@ pub fn init() {
             path,
             start,
             start_cpu: thread_cpu(),
-            marks: Vec::with_capacity(32),
+            marks: Vec::with_capacity(64),
         });
         ON.store(true, Ordering::Relaxed);
     }
 }
 
 /// Note that the startup step `label` has just finished.
+///
+/// The first frame's own steps are marked from the main loop and the frame's
+/// render, which keep running long after it: there every call finds the
+/// trace finished and costs one load.
+#[inline]
 pub fn mark(label: &'static str) {
-    if !ON.load(Ordering::Relaxed) {
-        return;
+    if ON.load(Ordering::Relaxed) {
+        record(label);
     }
+}
+
+/// [`mark`]'s work, while the trace is still recording.
+#[cold]
+fn record(label: &'static str) {
     let mark = Mark {
         label,
         at: Instant::now(),

@@ -1422,6 +1422,58 @@ fn reloaded_home_walk_reaches_every_open_editor() {
     assert!(app.editor.editors.iter().all(|e| !e.home_walks_rows));
 }
 
+/// Every open editor: the active group's tabs and every tab of the split.
+fn every_editor(app: &App) -> Vec<&crate::widgets::editor::Editor> {
+    app.editor
+        .editors
+        .iter()
+        .chain(
+            app.editor_layout
+                .inactive_groups()
+                .into_iter()
+                .flat_map(|g| g.editors.iter()),
+        )
+        .collect()
+}
+
+/// #2075: a settings reload and the palette toggles change indent guides,
+/// bracket colours and rendered whitespace on every open tab of every group
+/// at once. They reached only the active tab; the rest, and a split, kept
+/// the old look until something moved focus.
+#[test]
+fn view_settings_reach_every_tab_of_every_group_without_a_focus_change() {
+    use crate::widgets::command_palette::Command;
+    use crate::widgets::editor::WhitespaceMode;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.rs", "fn a() {\n    (1)\n}\n");
+    let b = tmp.path().join("b.rs");
+    std::fs::write(&b, "fn b() {\n    (2)\n}\n").unwrap();
+    app.editor.open_pinned(&b).unwrap();
+    app.split_editor();
+    assert_eq!(every_editor(&app).len(), 3, "setup: two tabs and a split");
+
+    app.apply_merged_settings(&crate::prefs::Prefs {
+        disable_indent_guides: true,
+        disable_bracket_colors: true,
+        render_whitespace: String::from("all"),
+        ..Default::default()
+    });
+    for ed in every_editor(&app) {
+        assert!(!ed.show_indent_guides, "{:?}: indent guides", ed.path);
+        assert!(!ed.show_bracket_colors, "{:?}: bracket colours", ed.path);
+        assert_eq!(ed.whitespace_mode, WhitespaceMode::All, "{:?}", ed.path);
+    }
+
+    app.run_command(Command::ToggleIndentGuides);
+    app.run_command(Command::ToggleBracketColors);
+    app.run_command(Command::ToggleRenderWhitespace);
+    for ed in every_editor(&app) {
+        assert!(ed.show_indent_guides, "{:?}: indent guides", ed.path);
+        assert!(ed.show_bracket_colors, "{:?}: bracket colours", ed.path);
+        assert_eq!(ed.whitespace_mode, WhitespaceMode::None, "{:?}", ed.path);
+    }
+}
+
 #[test]
 fn build_sticky_lines_pins_enclosing_headers_scrolled_above_the_viewport() {
     use crate::lsp::manager::OutlineKind;
@@ -2707,6 +2759,21 @@ fn overwrite_mode_is_shown_by_a_glyph_after_the_workspace_cap_not_in_the_positio
         "overwrite glyph after the workspace cap: {over}"
     );
     assert!(!over.contains("OVR"), "the Ln/Col segment stays unchanged");
+}
+
+#[test]
+fn centring_a_line_before_the_first_render_leaves_context_above() {
+    // A file opened for the first time has no viewport yet (zero text rows),
+    // so there is no middle to centre on: the target must still be brought
+    // near the top instead of staying at scroll 0 (a Global Search hit).
+    let mut e = crate::widgets::editor::Editor::new();
+    e.lines = (0..200).map(|i| format!("line {i}")).collect();
+    assert_eq!(e.text_rows(), 0, "precondition: not rendered yet");
+    e.goto_line_centered(100);
+    assert_eq!(e.cursor_row, 100);
+    assert_eq!(e.scroll, 95, "five lines of context above the target");
+    e.goto_line_centered(2);
+    assert_eq!(e.scroll, 0, "near the top it saturates at 0");
 }
 
 #[test]

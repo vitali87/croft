@@ -485,16 +485,8 @@ fn opening_a_modified_file_diff_parks_scroll_on_the_first_change_hunk() {
     let tmp = make_committed_repo();
     let big = (0..50).map(|i| format!("line {i}\n")).collect::<String>();
     std::fs::write(tmp.path().join("seed.txt"), &big).unwrap();
-    let _ = std::process::Command::new("git")
-        .args(["-C"])
-        .arg(tmp.path())
-        .args(["add", "seed.txt"])
-        .status();
-    let _ = std::process::Command::new("git")
-        .args(["-C"])
-        .arg(tmp.path())
-        .args(["commit", "-q", "-m", "big seed"])
-        .status();
+    let _ = git_succeeds(tmp.path(), &["add", "seed.txt"]);
+    let _ = git_succeeds(tmp.path(), &["commit", "-q", "-m", "big seed"]);
     // Now change a line deep in the file so the first hunk lives well
     // past row 0.
     let mut lines: Vec<String> = big.lines().map(str::to_string).collect();
@@ -532,16 +524,8 @@ fn f7_in_the_diff_view_jumps_to_the_next_change_hunk() {
     // Build a multi-hunk file: edits at lines 10 and 40.
     let original: String = (0..50).map(|i| format!("line {i}\n")).collect();
     std::fs::write(tmp.path().join("seed.txt"), &original).unwrap();
-    let _ = std::process::Command::new("git")
-        .args(["-C"])
-        .arg(tmp.path())
-        .args(["add", "seed.txt"])
-        .status();
-    let _ = std::process::Command::new("git")
-        .args(["-C"])
-        .arg(tmp.path())
-        .args(["commit", "-q", "-m", "seed"])
-        .status();
+    let _ = git_succeeds(tmp.path(), &["add", "seed.txt"]);
+    let _ = git_succeeds(tmp.path(), &["commit", "-q", "-m", "seed"]);
     let mut edited: Vec<String> = original.lines().map(str::to_string).collect();
     edited[10] = "edited-10".to_string();
     edited[40] = "edited-40".to_string();
@@ -591,16 +575,8 @@ fn forward_diff_jump_wraps_from_the_last_hunk_back_to_the_first() {
     let tmp = make_committed_repo();
     let original: String = (0..60).map(|i| format!("line {i}\n")).collect();
     std::fs::write(tmp.path().join("seed.txt"), &original).unwrap();
-    let _ = std::process::Command::new("git")
-        .args(["-C"])
-        .arg(tmp.path())
-        .args(["add", "seed.txt"])
-        .status();
-    let _ = std::process::Command::new("git")
-        .args(["-C"])
-        .arg(tmp.path())
-        .args(["commit", "-q", "-m", "seed"])
-        .status();
+    let _ = git_succeeds(tmp.path(), &["add", "seed.txt"]);
+    let _ = git_succeeds(tmp.path(), &["commit", "-q", "-m", "seed"]);
     // Two hunks: one near the top, one near the very bottom so the bottom
     // hunk falls inside the clamped viewport region.
     let mut edited: Vec<String> = original.lines().map(str::to_string).collect();
@@ -772,9 +748,12 @@ fn taking_the_incoming_deletion_removes_the_file() {
     app.run_command(crate::widgets::command_palette::Command::MergeAcceptAllIncoming);
     app.complete_merge();
     assert!(!tmp.path().join("gone.txt").exists(), "{}", app.status);
-    assert_eq!(git_out(tmp.path(), &["ls-files", "gone.txt"]), "");
     assert_eq!(
-        git_out(tmp.path(), &["status", "--porcelain", "gone.txt"]),
+        git_stdout_untrimmed(tmp.path(), &["ls-files", "gone.txt"]),
+        ""
+    );
+    assert_eq!(
+        git_stdout_untrimmed(tmp.path(), &["status", "--porcelain", "gone.txt"]),
         "D  gone.txt\n"
     );
     assert!(app.status.contains("removed gone.txt"), "{}", app.status);
@@ -793,7 +772,10 @@ fn taking_the_current_deletion_removes_the_file() {
     app.run_command(crate::widgets::command_palette::Command::MergeAcceptAllCurrent);
     app.complete_merge();
     assert!(!tmp.path().join("gone.txt").exists(), "{}", app.status);
-    assert_eq!(git_out(tmp.path(), &["ls-files", "gone.txt"]), "");
+    assert_eq!(
+        git_stdout_untrimmed(tmp.path(), &["ls-files", "gone.txt"]),
+        ""
+    );
 }
 
 #[test]

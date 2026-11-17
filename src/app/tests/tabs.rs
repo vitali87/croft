@@ -2102,7 +2102,7 @@ fn typing_the_tab_menus_keep_open_in_the_palette_keeps_the_preview_tab() {
     let p = tmp.path().join("p.rs");
     std::fs::write(&p, "x\n").unwrap();
     app.editor.open_preview(&p).unwrap();
-    let ran = run_in_palette_852(&mut app, "keep open");
+    let ran = run_palette_top_match(&mut app, "keep open");
     assert_eq!(ran.as_deref(), Some("View: Keep Editor"));
     assert!(!app.editor.preview, "the preview tab is kept");
 }
@@ -2201,7 +2201,7 @@ fn tab_commands_with_no_editor_open_only_say_so() {
             "No tabs to the right to close",
         ),
     ] {
-        let ran = run_in_palette_852(&mut app, title);
+        let ran = run_palette_top_match(&mut app, title);
         assert_eq!(ran.as_deref(), Some(title));
         assert_eq!(app.status, status, "{title}");
         assert!(app.editor.is_blank_initial(), "{title}");
@@ -2680,5 +2680,49 @@ fn the_gutter_menus_toggle_bookmark_leaves_the_caret_and_selection_alone() {
             .get(&path)
             .is_some_and(|s| s.contains(&8)),
         "line 8 is bookmarked"
+    );
+}
+
+/// #2072: Cmd+K Shift+X closes the other tabs of the group, and it is the
+/// key the tab menu's Close Others shows. The menu said ⌥⌘T, which iTerm2
+/// keeps for New Tab and many Linux desktops for a new terminal, so the key
+/// it named never reached croft. A key the user binds to Close Others shows
+/// in the menu instead, and plain Cmd+K X keeps its own meaning.
+#[test]
+fn cmd_k_shift_x_closes_the_other_tabs_and_the_menu_names_it() {
+    let (mut app, _tmp) = tabs_app_852(&["a.rs", "b.rs", "c.rs"]);
+    app.editor.select(1);
+    app.handle_key(key(KeyCode::Char('k'), KeyModifiers::SUPER))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        tab_names_852(&app.editor),
+        ["a.rs", "b.rs", "c.rs"],
+        "plain Cmd+K X is not Close Others"
+    );
+    app.handle_key(key(KeyCode::Char('k'), KeyModifiers::SUPER))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('X'), KeyModifiers::SHIFT))
+        .unwrap();
+    assert_eq!(tab_names_852(&app.editor), ["b.rs"]);
+
+    let menu = |app: &App| menu_hint(&MenuAction::CloseOtherTabs(0), &app.keymap).unwrap();
+    assert_eq!(
+        platform_shortcut_for(&MenuAction::CloseOtherTabs(0), true).as_deref(),
+        Some("⌘K ⇧X")
+    );
+    assert!(
+        menu(&app).contains('X'),
+        "the menu names the chord: {}",
+        menu(&app)
+    );
+    app.keymap = crate::keymap::Keymap::from_json(
+        r#"[{ "key": "ctrl+alt+o", "command": "close_other_editors" }]"#,
+    );
+    assert!(
+        menu(&app).to_lowercase().contains('o') && !menu(&app).contains('X'),
+        "a bound key shows instead: {}",
+        menu(&app)
     );
 }

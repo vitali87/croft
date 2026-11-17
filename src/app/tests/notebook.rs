@@ -175,8 +175,7 @@ fn notebook_with_kernel(
     .unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.editor.open(&path).unwrap();
-    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
-    term.draw(|f| app.render(f)).unwrap();
+    draw(&mut app, 100, 30);
     let (run, kernel_tx, _requests) = crate::notebook_kernel::NotebookRun::for_test();
     app.notebook_kernels.insert(path.clone(), run);
     let started: StartedKernels = Default::default();

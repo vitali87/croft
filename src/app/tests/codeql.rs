@@ -1785,10 +1785,7 @@ fn codeql_pack_commands_install_dependencies_and_download_packs() {
         assert_eq!(app.status, "Installed the dependencies of acme/rust");
 
         app.run_command(Command::CodeqlDownloadPacks);
-        for c in "codeql/java-queries codeql/python-all@1.0.0".chars() {
-            app.input_prompt.as_mut().unwrap().push_char(c);
-        }
-        app.submit_input_prompt();
+        append_and_submit_prompt(&mut app, "codeql/java-queries codeql/python-all@1.0.0");
         wait(&mut app);
         assert_eq!(
             app.status,
@@ -1805,10 +1802,7 @@ fn codeql_pack_commands_install_dependencies_and_download_packs() {
 
         app.codeql_program = fake_codeql(bin.path(), "", 1, "ERROR: no such pack");
         app.run_command(Command::CodeqlDownloadPacks);
-        for c in "acme/missing".chars() {
-            app.input_prompt.as_mut().unwrap().push_char(c);
-        }
-        app.submit_input_prompt();
+        append_and_submit_prompt(&mut app, "acme/missing");
         wait(&mut app);
         assert_eq!(
             app.status,

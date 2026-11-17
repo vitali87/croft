@@ -1539,15 +1539,7 @@ fn an_external_rewrite_of_the_open_file_dims_its_coverage() {
 fn a_save_of_an_ignored_file_does_not_rerun_watched_tests() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().canonicalize().unwrap();
-    let git = |args: &[&str]| {
-        std::process::Command::new("git")
-            .arg("-C")
-            .arg(&root)
-            .args(args)
-            .output()
-            .unwrap()
-    };
-    git(&["init", "-q", "-b", "main"]);
+    git_init(&root);
     std::fs::write(root.join(".gitignore"), "*.log\nout/\n").unwrap();
     std::fs::create_dir_all(root.join("out")).unwrap();
     let mut app = App::new(root.clone()).unwrap();
@@ -1652,4 +1644,44 @@ fn cancel_test_run_stops_a_run_and_says_so_when_idle() {
         .on_busy_started(crate::testing::model::Activity::Running);
     app.handle_testing_key(key(KeyCode::Char('s'), KeyModifiers::NONE));
     assert_eq!(app.status, "Cancelling test run");
+}
+
+/// #2067: the Testing view wears the chosen theme and shows that it has
+/// focus, like every other side-bar view. It used to keep Croft Loch's
+/// colours and never light up, whatever the theme and focus.
+#[test]
+fn testing_view_follows_the_theme_and_shows_focus() {
+    use crate::theme::Theme;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    for theme in [Theme::DARK_BLUE, Theme::BLACK] {
+        assert_ne!(theme, Theme::LOCH);
+        app.apply_theme_visuals(theme);
+        // The Search view, focused, is the frame every side-bar view shares.
+        app.set_sidebar_view(SidebarView::Search);
+        let search = draw_buffer(&mut app, 100, 30);
+        app.set_sidebar_view(SidebarView::Testing);
+        assert_eq!(app.testing.theme, theme);
+        assert_eq!(app.testing.focus_gradient, theme.gradient());
+        assert!(app.testing.focused, "opening Testing focuses it");
+        let testing = draw_buffer(&mut app, 100, 30);
+        let area = app.testing.last_area;
+        assert!(area.width > 2 && area.height > 2, "Testing drawn: {area:?}");
+        let bottom = area.y + area.height - 1;
+        let right = area.x + area.width - 1;
+        for (x, y) in [
+            (area.x, bottom),
+            (right, bottom),
+            (area.x, area.y + area.height / 2),
+        ] {
+            let (t, s) = (&testing[(x, y)], &search[(x, y)]);
+            assert_eq!(
+                (t.symbol(), t.fg, t.bg),
+                (s.symbol(), s.fg, s.bg),
+                "{theme:?}: the Testing view's frame at ({x}, {y}) matches the Search view's"
+            );
+        }
+        app.focus_pane(Pane::Editor);
+        assert!(!app.testing.focused, "focus left the side bar");
+    }
 }

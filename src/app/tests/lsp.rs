@@ -1909,6 +1909,38 @@ fn change_all_occurrences_key_accepts_cmd_ctrl_or_alt_f2() {
 }
 
 #[test]
+fn the_references_picker_starts_on_the_reference_under_the_caret() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.rs");
+    std::fs::write(&a, "let x = x + x;\nfoo(x);\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&a).unwrap();
+    let targets = vec![
+        (a.clone(), 0, 4),
+        (a.clone(), 0, 8),
+        (a.clone(), 0, 12),
+        (a.clone(), 1, 4),
+        (tmp.path().join("b.rs"), 1, 4),
+    ];
+    // On the second `x` of line 1 (col 8..9, caret inside it).
+    app.editor.cursor_row = 0;
+    app.editor.cursor_col = 9;
+    app.open_location_picker(targets.clone(), "references");
+    assert_eq!(app.context_menu.as_ref().unwrap().selected, 1);
+    // Another file's reference on the same line is not this one.
+    app.context_menu = None;
+    app.editor.cursor_row = 1;
+    app.editor.cursor_col = 4;
+    app.open_location_picker(targets.clone(), "references");
+    assert_eq!(app.context_menu.as_ref().unwrap().selected, 3);
+    // A caret on a line with no reference leaves the highlight on top.
+    app.context_menu = None;
+    app.editor.cursor_row = 5;
+    app.open_location_picker(targets, "references");
+    assert_eq!(app.context_menu.as_ref().unwrap().selected, 0);
+}
+
+#[test]
 fn implementation_picker_lists_every_target_as_a_jump_item() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
@@ -2690,6 +2722,7 @@ fn a_cancelled_rename_disarms_the_in_flight_prepare_request() {
     app.prompt = Some(Prompt {
         label: String::from("Rename Symbol 'value'"),
         buffer: String::from("value"),
+        caret: usize::MAX,
         kind: PromptKind::RenameSymbol {
             path: path.clone(),
             row: 1,
@@ -3864,11 +3897,14 @@ fn app_with_week_notes(tmp: &tempfile::TempDir) -> (App, PathBuf) {
         "# shopping list\nmilk\neggs\n# todo\ncall bob\npay rent\n",
     );
     let file = app.editor.path.clone().unwrap();
-    type_at_line_end(&mut app, 1, "\nbread");
+    insert_at_line_end(&mut app, 1, "\nbread");
     (app, file)
 }
 
-fn type_at_line_end(app: &mut App, row: usize, text: &str) {
+/// Puts the caret at the end of `row` and inserts `text` straight into the
+/// editor's buffer, `\n` as a new line. No keystroke goes through
+/// `App::handle_key`, as it does with [`type_keys`].
+fn insert_at_line_end(app: &mut App, row: usize, text: &str) {
     app.editor.cursor_row = row;
     app.editor.cursor_col = app.editor.lines[row].chars().count();
     for c in text.chars() {
@@ -3908,7 +3944,7 @@ fn a_format_on_save_reply_for_a_buffer_typed_into_since_saves_it_unformatted() {
     let tmp = tempfile::tempdir().unwrap();
     let (mut app, file) = app_with_week_notes(&tmp);
     send_format_request(&mut app, &file, true);
-    type_at_line_end(&mut app, 2, "\nbutter");
+    insert_at_line_end(&mut app, 2, "\nbutter");
     app.land_format(Some(uppercase_headings()), false, Some(file.clone()), None);
     let typed = "# shopping list\nmilk\nbread\nbutter\neggs\n# todo\ncall bob\npay rent";
     assert_eq!(app.editor.lines.join("\n"), typed, "eggs survives");
@@ -3929,7 +3965,7 @@ fn a_format_document_reply_for_a_buffer_typed_into_since_is_dropped() {
     let tmp = tempfile::tempdir().unwrap();
     let (mut app, file) = app_with_week_notes(&tmp);
     send_format_request(&mut app, &file, false);
-    type_at_line_end(&mut app, 2, "\nbutter");
+    insert_at_line_end(&mut app, 2, "\nbutter");
     let before = app.editor.lines.clone();
     app.land_format(Some(uppercase_headings()), false, Some(file.clone()), None);
     assert_eq!(app.editor.lines, before);
@@ -3982,7 +4018,7 @@ fn the_language_servers_get_the_files_final_newline() {
     let synced = |app: &App| app.lsp.as_ref().unwrap().synced_text_for_test(&file);
     app.sync_lsp();
     assert_eq!(synced(&app).as_deref(), Some(SHOP_PY));
-    type_at_line_end(&mut app, 1, "  # all");
+    insert_at_line_end(&mut app, 1, "  # all");
     app.sync_lsp();
     assert_eq!(
         synced(&app).as_deref(),
@@ -5000,9 +5036,7 @@ fn app_with_long_hover() -> (
         doc,
         (col, row),
     ));
-    let backend = ratatui::backend::TestBackend::new(100, 30);
-    let mut term = ratatui::Terminal::new(backend).unwrap();
-    term.draw(|frame| app.render(frame)).unwrap();
+    let term = draw_terminal(&mut app, 100, 30);
     (app, tmp, term)
 }
 

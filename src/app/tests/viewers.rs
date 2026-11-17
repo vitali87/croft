@@ -559,7 +559,12 @@ fn xlsx_grid_editing_saves_cells_and_holds_formulas_for_consent() {
     ws.cell_mut((2u32, 1u32)).set_value("qty");
     ws.cell_mut((1u32, 2u32)).set_value("apples");
     ws.cell_mut((2u32, 2u32)).set_value_number(3);
-    ws.cell_mut((2u32, 3u32)).set_formula("SUM(B2)");
+    // With its cached result, as Excel saves it: calamine 0.38 reads a
+    // formula whose cached value is a bare `<v/>` as empty, which would
+    // leave this row out of the used range and so out of the grid.
+    ws.cell_mut((2u32, 3u32))
+        .set_formula("SUM(B2)")
+        .set_formula_result_default("3");
     umya_spreadsheet::writer::xlsx::write(&book, &p).unwrap();
 
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
@@ -1302,8 +1307,9 @@ extensions = ["csv"]
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.config_dir = croft.clone();
     app.consented_extensions = consent_on_disk(&croft);
-    let viewer = crate::mcp::registry::viewer_by_id_in_dir(&croft, "tviewer/sh")
-        .expect("the scratch viewer");
+    let viewer =
+        crate::mcp::registry::viewer_by_id_in_dir(&croft, &app.disabled_extensions, "tviewer/sh")
+            .expect("the scratch viewer");
     let before = app.terminals.len();
     app.open_in_viewer(&viewer, &data);
     assert!(
@@ -1367,15 +1373,7 @@ extensions = ["csv"]
     app.consented_extensions = consent_on_disk(&croft);
     app.consented_extensions.insert("tviewer".into());
     let n = file_node(&csv);
-    let items = build_tree_context_menu_items_in_dir(
-        &croft,
-        Some(&n),
-        tmp.path(),
-        std::slice::from_ref(&csv),
-        tmp.path(),
-        None,
-        None,
-    );
+    let items = app.tree_context_menu_items(Some(&n), std::slice::from_ref(&csv), tmp.path());
     let row = items
         .iter()
         .find_map(|(label, a)| match a {
@@ -1394,10 +1392,11 @@ extensions = ["csv"]
         before + 1,
         "and the row resolves and opens"
     );
-    let palette_ids: Vec<String> = crate::mcp::registry::contributed_viewer_commands_in_dir(&croft)
-        .into_iter()
-        .map(|c| c.id)
-        .collect();
+    let palette_ids: Vec<String> =
+        crate::mcp::registry::contributed_viewer_commands_in_dir(&croft, &app.disabled_extensions)
+            .into_iter()
+            .map(|c| c.id)
+            .collect();
     assert!(
         palette_ids.iter().any(|id| id == "viewer:tviewer/sh"),
         "the palette row comes from the same dir: {palette_ids:?}"
@@ -2395,6 +2394,170 @@ fn a_spreadsheet_opened_with_one_click_scrolls_with_the_arrow_keys() {
     );
 }
 
+/// One click on a Markdown file, Cmd+Shift+V for its rendered preview, then
+/// one click on `next`: the preview tab now shows `next`, and its keys must
+/// reach it. The rendered preview used to survive the swap hidden under the
+/// new view, so it took every key and Cmd+W did nothing (#2069).
+fn markdown_preview_then_one_click(
+    next: &str,
+    write_next: impl FnOnce(&std::path::Path),
+) -> (tempfile::TempDir, App) {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("notes.md"), "# Notes\n\nSome text.\n").unwrap();
+    write_next(&tmp.path().join(next));
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    click_open_in_explorer(&mut app, "notes.md");
+    app.toggle_markdown_preview();
+    assert!(
+        app.editor.markdown_preview.is_some(),
+        "setup: the rendered Markdown must be showing"
+    );
+    click_open_in_explorer(&mut app, next);
+    assert_eq!(
+        app.editor.tab_count(),
+        1,
+        "setup: {next} must reuse the preview tab"
+    );
+    assert!(
+        app.editor.markdown_preview.is_none(),
+        "opening {next} in the preview tab must drop the rendered Markdown it showed"
+    );
+    (tmp, app)
+}
+
+#[test]
+fn a_spreadsheet_opened_over_a_markdown_preview_takes_the_keys() {
+    let (_tmp, mut app) =
+        markdown_preview_then_one_click("data.csv", |p| std::fs::write(p, csv_body(40)).unwrap());
+
+    app.handle_key(key(KeyCode::Down, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        sheet_cursor(&app).0,
+        1,
+        "Down must move the grid's cell cursor"
+    );
+    app.handle_key(key(KeyCode::Char('w'), KeyModifiers::SUPER))
+        .unwrap();
+    assert!(app.editor.sheet.is_none(), "Cmd+W must close the sheet tab");
+}
+
+#[test]
+fn a_pdf_opened_over_a_markdown_preview_pages_with_the_keys() {
+    require_pdf_backend();
+    let (_tmp, mut app) = markdown_preview_then_one_click("doc.pdf", write_three_page_pdf);
+
+    app.handle_key(key(KeyCode::PageDown, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(current_pdf_page(&app), 2, "PageDown must turn the page");
+    app.handle_key(key(KeyCode::Char('w'), KeyModifiers::SUPER))
+        .unwrap();
+    assert!(app.editor.image.is_none(), "Cmd+W must close the PDF tab");
+}
+
+#[test]
+fn an_image_opened_over_a_markdown_preview_closes_with_cmd_w() {
+    let (_tmp, mut app) = markdown_preview_then_one_click("pic.png", write_test_png);
+
+    assert!(app.editor.image.is_some(), "the image must be showing");
+    app.handle_key(key(KeyCode::Char('w'), KeyModifiers::SUPER))
+        .unwrap();
+    assert!(app.editor.image.is_none(), "Cmd+W must close the image tab");
+}
+
+/// Cmd+W on a tab showing rendered Markdown closes it. The rendered view
+/// takes every key and returned before the close-tab check, so the tab could
+/// not be closed from the keyboard (#2069).
+#[test]
+fn cmd_w_closes_a_rendered_markdown_tab() {
+    let tmp = tempfile::tempdir().unwrap();
+    let md = tmp.path().join("notes.md");
+    std::fs::write(&md, "# Notes\n\nSome text.\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&md).unwrap();
+    app.focus = Pane::Editor;
+    app.toggle_markdown_preview();
+    assert!(
+        app.editor.markdown_preview.is_some(),
+        "setup: the rendered Markdown must be showing"
+    );
+
+    app.handle_key(key(KeyCode::Char('w'), KeyModifiers::SUPER))
+        .unwrap();
+
+    assert_ne!(
+        app.editor.path.as_deref(),
+        Some(md.as_path()),
+        "Cmd+W on rendered Markdown must close the tab"
+    );
+    assert!(app.editor.markdown_preview.is_none());
+}
+
+/// A cell typed into a spreadsheet opened with one click pins its tab, as an
+/// edit in a text tab does: the next one-click open goes beside it, and the
+/// unsaved cell stays (#2073).
+#[test]
+fn a_cell_edited_in_a_preview_sheet_pins_the_tab() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("data.csv"), csv_body(5)).unwrap();
+    std::fs::write(tmp.path().join("notes.txt"), "notes\n").unwrap();
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    click_open_in_explorer(&mut app, "data.csv");
+    assert_eq!(app.editor.preview_index(), Some(0), "setup: a preview tab");
+    app.handle_key(key(KeyCode::Char('9'), KeyModifiers::NONE))
+        .unwrap();
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.editor.dirty, "setup: Enter commits the cell");
+    assert!(
+        !app.editor.editors[0].preview,
+        "a committed cell must pin the tab"
+    );
+
+    click_open_in_explorer(&mut app, "notes.txt");
+    assert_eq!(
+        app.editor.tab_count(),
+        2,
+        "the next one-click open must not replace the edited sheet"
+    );
+    assert!(app.editor.editors[0].dirty, "the unsaved cell must stay");
+}
+
+/// A cell still being typed into, not yet committed with Enter, is unsaved
+/// work too: a one-click open of another file pins the sheet's tab instead
+/// of replacing it, and the half-typed value stays (#2073 review).
+#[test]
+fn a_cell_being_typed_in_a_preview_sheet_survives_a_one_click_open() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("data.csv"), csv_body(5)).unwrap();
+    std::fs::write(tmp.path().join("notes.txt"), "notes\n").unwrap();
+
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    click_open_in_explorer(&mut app, "data.csv");
+    assert_eq!(app.editor.preview_index(), Some(0), "setup: a preview tab");
+    app.handle_key(key(KeyCode::Char('9'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(
+        app.editor.sheet_pending_cell().is_some(),
+        "setup: the cell is being typed into"
+    );
+
+    click_open_in_explorer(&mut app, "notes.txt");
+    assert_eq!(
+        app.editor.tab_count(),
+        2,
+        "the one-click open must not replace the sheet being typed into"
+    );
+    let sheet = &app.editor.editors[0];
+    assert!(!sheet.preview, "the sheet's tab is pinned");
+    assert!(
+        sheet.sheet_pending_cell().is_some() || sheet.dirty,
+        "the typed value must stay"
+    );
+}
+
 /// Output scrolling under an on-screen inline image moves only the
 /// placement row; re-running the full decode + Lanczos resize + PNG encode
 /// per scrolled row froze the render thread for the whole pane height on
@@ -3035,15 +3198,8 @@ fn an_http_file_runs_requests_and_keeps_secrets_out_of_history_and_the_tab() {
     // family: hold their lock and restore via RAII, exactly as
     // `with_relay_home` does, so a panic cannot leak the redirect into
     // later tests (#428 review).
-    struct RestoreCacheDir;
-    impl Drop for RestoreCacheDir {
-        fn drop(&mut self) {
-            *crate::paths::CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap() = None;
-        }
-    }
     let _cache_lock = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
-    let _restore = RestoreCacheDir;
-    *crate::paths::CACHE_DIR_OVERRIDE_FOR_TEST.lock().unwrap() = Some(tmp.path().join("cache"));
+    let _restore = override_cache_dir(tmp.path().join("cache"));
 
     // A 1x1 PNG via the image crate, so the decode on open genuinely works.
     let png_bytes = {
@@ -3827,4 +3983,100 @@ fn a_wal_reload_keeps_the_sqlite_table_page_and_cell() {
     assert_eq!((data.cur_row, data.cur_col), (4, 1));
     assert!(data.scroll_row <= data.cur_row);
     drop(writer);
+}
+
+/// #2076: with a profile active, an extension is on or off as the
+/// Extensions panel shows it, which is the app's own set, saved to the
+/// profile's settings. The Explorer's viewer row, opening a viewer, the
+/// palette's rows and running a command all follow that set. They read the
+/// Default profile's config.json instead, so a viewer turned off in a
+/// profile was still offered, and a command the palette listed would not run.
+#[test]
+fn an_extension_is_on_or_off_as_the_app_s_own_set_says_everywhere() {
+    const VIEWER: &str = r#"
+id = "tviewer"
+name = "tviewer"
+api_version = 1
+[[viewers]]
+id = "sh"
+label = "Open in sh"
+command = "/bin/sh"
+args = ["-c", "sleep 30", "sh", "{file}"]
+extensions = ["csv"]
+"#;
+    const COMMAND: &str = r#"
+id = "tcmd"
+name = "tcmd"
+api_version = 1
+[[mcp_servers]]
+id = "srv"
+command = "/bin/true"
+[[commands]]
+id = "tcmd.now"
+title = "TCmd: Now"
+server = "srv"
+tool = "now"
+"#;
+    let (_scratch, croft) = scratch_config(&[("tviewer", VIEWER), ("tcmd", COMMAND)]);
+    // The Default profile's file: tcmd off, tviewer on.
+    std::fs::write(
+        croft.join("config.json"),
+        r#"{"disabled_extensions": ["tcmd"]}"#,
+    )
+    .unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let csv = tmp.path().join("data.csv");
+    std::fs::write(&csv, "a,b\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.config_dir = croft.clone();
+    // The active profile's set, as the Extensions panel holds it: the other
+    // way round, tviewer off and tcmd on.
+    app.disabled_extensions = std::collections::BTreeSet::from([String::from("tviewer")]);
+
+    let n = file_node(&csv);
+    let items = app.tree_context_menu_items(Some(&n), std::slice::from_ref(&csv), tmp.path());
+    assert!(
+        !items
+            .iter()
+            .any(|(_, a)| matches!(a, MenuAction::OpenInViewer(..))),
+        "the turned-off viewer gets no Explorer row: {items:?}"
+    );
+
+    app.open_command_palette();
+    let listed: Vec<String> = app
+        .command_palette
+        .as_ref()
+        .expect("the palette opens")
+        .extensions
+        .iter()
+        .map(|c| c.id.clone())
+        .collect();
+    app.command_palette = None;
+    assert!(
+        listed.iter().any(|id| id == "tcmd.now"),
+        "the turned-on command is listed: {listed:?}"
+    );
+    assert!(
+        !listed.iter().any(|id| id.contains("tviewer")),
+        "the turned-off viewer is not: {listed:?}"
+    );
+
+    let before = app.terminals.len();
+    app.dispatch_menu_action(
+        MenuAction::OpenInViewer(String::from("tviewer/sh"), csv.clone()),
+        tmp.path().to_path_buf(),
+    );
+    assert_eq!(
+        app.terminals.len(),
+        before,
+        "the turned-off viewer never opens"
+    );
+
+    app.status.clear();
+    app.run_extension_command("tcmd.now");
+    assert!(
+        !app.status.contains("unavailable"),
+        "the listed command runs (here, asks for consent first): {}",
+        app.status
+    );
 }

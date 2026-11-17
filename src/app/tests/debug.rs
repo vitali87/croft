@@ -559,8 +559,7 @@ fn debug_toolbar_app(
     app.debug_sessions.push("app.py", session);
     app.set_sidebar_view(SidebarView::RunDebug);
     app.refresh_debug_panel();
-    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 32)).unwrap();
-    term.draw(|f| app.render(f)).unwrap();
+    let term = draw_terminal(&mut app, 120, 32);
     (tmp, app, term, log)
 }
 
@@ -1392,10 +1391,7 @@ fn add_watch_via_the_palette_prompt_then_clear_all() {
         .as_ref()
         .expect("Debug: Add Watch Expression must open an input prompt");
     assert_eq!(prompt.purpose, InputPurpose::AddWatch);
-    for c in "len(cart)".chars() {
-        app.input_prompt.as_mut().unwrap().push_char(c);
-    }
-    app.submit_input_prompt();
+    append_and_submit_prompt(&mut app, "len(cart)");
     assert!(app.input_prompt.is_none(), "submitting closes the prompt");
     assert_eq!(app.watch_exprs, vec!["len(cart)"]);
     assert!(app.status.contains("Watching len(cart)"));
@@ -2723,8 +2719,10 @@ fn pick_row_id(app: &mut App, id: &str) {
     app.confirm_list_picker();
 }
 
-/// Type `value` over whatever the open prompt holds and press Enter.
-fn answer_prompt(app: &mut App, value: &str) {
+/// Sets the open prompt's value to `value`, replacing whatever it holds,
+/// and presses Enter. [`append_and_submit_prompt`] adds to the value
+/// instead.
+fn replace_and_submit_prompt(app: &mut App, value: &str) {
     app.input_prompt.as_mut().expect("a prompt is open").value = value.to_string();
     app.submit_input_prompt();
 }
@@ -2743,21 +2741,21 @@ fn add_debug_configuration_writes_a_launch_entry() {
     pick_row_id(&mut app, "launch");
     let prompt = app.input_prompt.as_ref().expect("the name is asked");
     assert_eq!(prompt.value, "Launch Python", "seeded with a name");
-    answer_prompt(&mut app, "Serve");
+    replace_and_submit_prompt(&mut app, "Serve");
     assert_eq!(app.input_prompt.as_ref().unwrap().value, "${file}");
-    answer_prompt(&mut app, "${workspaceFolder}/api.py");
-    answer_prompt(&mut app, "--port \"80 00");
+    replace_and_submit_prompt(&mut app, "${workspaceFolder}/api.py");
+    replace_and_submit_prompt(&mut app, "--port \"80 00");
     assert!(app.status.contains("quote"), "{}", app.status);
     assert_eq!(
         app.input_prompt.as_ref().unwrap().value,
         "--port \"80 00",
         "the refused value is offered back to fix"
     );
-    answer_prompt(&mut app, "--port 8000");
+    replace_and_submit_prompt(&mut app, "--port 8000");
     // Optional fields take a blank Enter.
-    answer_prompt(&mut app, "");
-    answer_prompt(&mut app, "DEBUG=1");
-    answer_prompt(&mut app, "");
+    replace_and_submit_prompt(&mut app, "");
+    replace_and_submit_prompt(&mut app, "DEBUG=1");
+    replace_and_submit_prompt(&mut app, "");
     assert!(app.input_prompt.is_none(), "the draft is complete");
     assert!(app.status.contains("Added \"Serve\""), "{}", app.status);
     assert_eq!(app.selected_debug_config.as_deref(), Some("Serve"));
@@ -2793,10 +2791,10 @@ fn add_debug_configuration_attaches_by_port() {
     app.run_command(crate::widgets::command_palette::Command::AddDebugConfig);
     pick_row_id(&mut app, "node");
     pick_row_id(&mut app, "attach");
-    answer_prompt(&mut app, "Web");
-    answer_prompt(&mut app, "nope");
+    replace_and_submit_prompt(&mut app, "Web");
+    replace_and_submit_prompt(&mut app, "nope");
     assert!(app.status.contains("Not a port"), "{}", app.status);
-    answer_prompt(&mut app, "9229");
+    replace_and_submit_prompt(&mut app, "9229");
     assert!(app.input_prompt.is_none());
     let cfgs = crate::dap::configs::discover_configs(tmp.path());
     assert_eq!(
@@ -3067,7 +3065,8 @@ fn compound_members_resolve_with_the_compound_answers() {
     );
 }
 
-/// Open the debug picker and confirm the row whose label starts with `label`.
+/// Open the debug picker and confirm the row whose label starts with
+/// `label`, which starts that configuration as the user's click does.
 fn pick_debug_row(app: &mut App, label: &str) {
     app.open_debug_config_picker();
     let idx = app
@@ -4176,7 +4175,7 @@ fn step_into_target_steps_into_the_picked_call() {
         }
         false
     };
-    assert!(run_from_palette(&mut app, "Debug: Step Out"));
+    assert!(run_palette_row_titled(&mut app, "Debug: Step Out"));
     assert!(sent("\"command\":\"stepOut\""));
 
     app.offer_step_in_targets(vec![
@@ -4243,7 +4242,7 @@ fn one_or_no_step_in_target_needs_no_picker() {
 fn continue_with_no_session_starts_nothing() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    assert!(run_from_palette(&mut app, "Debug: Continue"));
+    assert!(run_palette_row_titled(&mut app, "Debug: Continue"));
     assert!(app.debug_sessions.is_empty());
     assert_eq!(app.status, "No debug session to continue");
 }
@@ -5249,22 +5248,6 @@ fn a_refused_debug_launch_says_why() {
     );
 }
 
-/// Pick the launch.json configuration `label` in the Run and Debug picker,
-/// which starts it, as the user's click does.
-fn start_debug_config(app: &mut App, label: &str) {
-    app.open_debug_config_picker();
-    let idx = app
-        .list_picker
-        .as_ref()
-        .expect("picker open")
-        .rows
-        .iter()
-        .position(|r| r.label.starts_with(label))
-        .unwrap_or_else(|| panic!("{label} is listed"));
-    app.list_picker.as_mut().unwrap().selected = idx;
-    app.confirm_list_picker();
-}
-
 /// Drive the app's debug machinery (the preLaunchTask pane and the adapter)
 /// until the focused session is stopped with `local` loaded, or `secs` pass.
 fn debug_until_local(app: &mut App, local: &str, secs: u64) -> Option<String> {
@@ -5316,7 +5299,7 @@ fn a_launch_json_python_config_passes_args_and_env_file() {
         .entry(root.join("app.py"))
         .or_default()
         .insert(4);
-    start_debug_config(&mut app, "Py");
+    pick_debug_row(&mut app, "Py");
     let greeting = debug_until_local(&mut app, "greeting", 90);
     let who = app
         .debug_sessions
@@ -5561,7 +5544,7 @@ fn a_launch_json_rust_config_builds_first_and_passes_args_and_env() {
         .entry(root.join("src/main.rs"))
         .or_default()
         .insert(4);
-    start_debug_config(&mut app, "Rs");
+    pick_debug_row(&mut app, "Rs");
     assert!(
         app.pending_debug_launch.is_some(),
         "the launch waits for the build: {}",
@@ -5631,7 +5614,7 @@ fn a_launch_json_node_attach_config_attaches_by_port() {
         .entry(root.join("server.js"))
         .or_default()
         .insert(5);
-    start_debug_config(&mut app, "Attach");
+    pick_debug_row(&mut app, "Attach");
     let label = debug_until_local(&mut app, "label", 90);
     app.debug_stop();
     let _ = node.kill();

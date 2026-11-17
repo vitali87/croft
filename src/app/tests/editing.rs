@@ -142,16 +142,19 @@ fn shift_cmd_z_reserved_for_redo_not_undo() {
 /// real macOS clipboard. This is the user-visible regression test
 /// for the long-standing "I copied from croft and pbpaste shows the
 /// previous value" bug, where the old OSC 52 path was silently
-/// dropped by the host terminal. The contract: writing through
-/// `copy_to_clipboard` puts the text on the system pasteboard such
+/// dropped by the host terminal. The contract: a copy through
+/// `App::copy_where_pasted`, which every copy croft makes goes through
+/// (#2070), puts the text on the system pasteboard such
 /// that `clipboard::read_string` (which is what Cmd+V uses) returns
 /// the same bytes. If this ever fails again, copy/paste between
 /// croft and other apps is broken and the test must catch it before
 /// the binary ships.
 #[cfg(target_os = "macos")]
 #[test]
-fn copy_to_clipboard_writes_text_to_the_macos_system_pasteboard() {
+fn a_copy_writes_text_to_the_macos_system_pasteboard() {
     let _g = crate::clipboard::lock_clipboard_for_test();
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     let sentinel = format!(
         "croft-copy-helper-{}-{}",
         std::process::id(),
@@ -160,10 +163,10 @@ fn copy_to_clipboard_writes_text_to_the_macos_system_pasteboard() {
             .map(|d| d.as_nanos())
             .unwrap_or(0)
     );
-    let used_native = copy_to_clipboard(&sentinel);
-    assert!(
-        used_native,
-        "on macOS, copy_to_clipboard must succeed via NSPasteboard and return true so the call site can skip the OSC 52 fallback (and the host terminal's quirks can't silently drop the write)"
+    assert_eq!(
+        app.copy_where_pasted(&sentinel),
+        CopyLanding::Clipboard,
+        "on macOS, a copy must land via NSPasteboard rather than fall back to OSC 52 (whose host-terminal quirks can silently drop the write)"
     );
     let got = crate::clipboard::read_string().expect("read_string must see what we just wrote");
     assert_eq!(
@@ -1367,7 +1370,7 @@ fn shift_alt_i_adds_a_cursor_at_each_line_end() {
 
     let mut app = occurrences_app(tmp.path());
     select(&mut app, (0, 0), (2, 0));
-    assert!(run_from_palette(&mut app, "Add Cursors to Line Ends"));
+    assert!(run_palette_row_titled(&mut app, "Add Cursors to Line Ends"));
     type_char(&mut app, ';');
     assert_eq!(
         app.editor.lines,
@@ -1397,7 +1400,7 @@ fn ctrl_l_selects_the_line_and_each_press_adds_the_next() {
     app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
         .unwrap();
     (app.editor.cursor_row, app.editor.cursor_col) = (1, 2);
-    assert!(run_from_palette(&mut app, "Expand Line Selection"));
+    assert!(run_palette_row_titled(&mut app, "Expand Line Selection"));
     type_char(&mut app, 'Z');
     assert_eq!(app.editor.lines, ["a = 1", "Zc = 3"]);
 }

@@ -38,12 +38,12 @@ byte assertions:
 ## Two invariants of the codebase
 
 **croft renders exactly one view per process.** `app::run`
-(`src/app/mod.rs:29963`) constructs one `App`, one
-`Terminal<CrosstermBackend>` over the process `stdout()`
-(`src/app/mod.rs:30087`), one blocking crossterm event loop
-(`src/app/mod.rs:30744`), and one global terminal size from `window_size()`
-(`src/app/mod.rs:3581`). Inline images use absolute cursor addressing every
-frame (`src/app/mod.rs:30636`). There is no per-client anything; a second
+(`src/app/mod.rs`) constructs one `App` and one
+`Terminal<CrosstermBackend>` over the process `stdout()`. `main_loop`
+(`src/app/mod.rs`) runs one blocking crossterm event loop, and
+`App::init_graphics` (`src/app/inline_images.rs`) reads one global terminal
+size from `window_size()`. Inline images use absolute cursor addressing every
+frame (`src/app/inline_images.rs`). There is no per-client anything; a second
 independent viewport would need a second backend, a second event source and a
 second geometry, none of which exist.
 
@@ -57,12 +57,14 @@ already share a screen. What dtach cannot do: say who is attached, tell which
 client typed a byte, enforce read-only, or reconcile two window sizes (last
 writer wins).
 
-The editor (`src/widgets/editor.rs`) is equally single-author: the buffer is a
+The editor (`src/widgets/editor.rs` and its feature files in
+`src/widgets/editor/`) is equally single-author: the buffer is a
 `Vec<String>`, undo is a stack of full-buffer snapshots assuming one linear
-timeline (`src/widgets/editor.rs:1111`), LSP sync is full-text only
-(`src/lsp/client.rs:434`), there is no single apply-edit chokepoint, and a
+timeline (`Editor::snapshot` and `Editor::push_undo_step` in
+`src/widgets/editor/undo.rs`), LSP sync is full-text only
+(`LspClient::did_change_full` in `src/lsp/client.rs`), there is no single apply-edit chokepoint, and a
 split view is two independent copies re-read from disk
-(`src/app/mod.rs:9943`).
+(`App::split_editor_dir`, `src/app/editor_tabs.rs`).
 
 ## Shared process means no sync engine
 
@@ -131,7 +133,8 @@ host  tty ── croft attach ──┘        (one accept loop,          (uncha
 - **Winsize**: minimum cols and rows across connected clients (the tmux rule).
   On any attach, detach or resize the server recomputes and sends SIGWINCH;
   croft's existing resize-wipe plus `mode_reassert_seq()` path
-  (`src/app/mod.rs:30772`, gated on `CROFT_SESSION_PERSISTENT`) handles the
+  (`main_loop`'s resize arm in `src/app/mod.rs`, with the sequence in
+  `src/app/host_integration.rs`, gated on `CROFT_SESSION_PERSISTENT`) handles the
   repaint, so the dead-mouse class of bug is already covered.
 - **Input policy**: server-side. A read-only client's PTY-byte frames are
   dropped at the server; only control frames pass. Enforcement, not abduco's
@@ -151,8 +154,8 @@ The inner croft cannot see socket clients; it only has a PTY. The server
 writes a presence sidecar next to the socket
 (`~/.cache/croft/sessions/<hash>.presence.json`, atomic rename on change) and
 the inner croft, when `CROFT_SESSION_PERSISTENT=1`, polls it on the existing
-tick (which already drains a dozen pollers per iteration,
-`src/app/mod.rs:30540`). A file beats a second socket because the relay
+tick (which already drains a dozen pollers per iteration, `main_loop` in
+`src/app/mod.rs`). A file beats a second socket because the relay
 protocol already proved file-based signaling works across every transport
 croft has (`src/remote.rs:726`), and it leaves the event loop untouched.
 Attributed guest input upgrades this to a control FD, but presence and the
@@ -255,9 +258,9 @@ the `.host-stale` marker rather than refusing clients forever.
 
 A guest with control can drive the shared primary cursor (pairing over tmux,
 but with names and permission) or their **own caret**. The editor already has
-the machinery for the latter: `carets: Vec<EditorSelection>`
-(`src/widgets/editor.rs:1378`) and `multi_apply`
-(`src/widgets/editor.rs:3262`) fan an edit across carets. Attributed guest
+the machinery for the latter: `carets: Vec<EditorSelection>` (a field of
+`Editor` in `src/widgets/editor.rs`) and `multi_apply`
+(`src/widgets/editor/multi_cursor.rs`) fan an edit across carets. Attributed guest
 keystrokes route to a per-guest caret instead of the primary cursor, rendered
 in the guest's color. Because it all still happens in one buffer in one
 process, undo, LSP sync, save and the FS watcher keep working unchanged. Undo

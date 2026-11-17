@@ -33,25 +33,11 @@ fn cmd_shift_s_jumps_to_source_control_from_explorer() {
 fn git_gutter_baselines_are_fetched_for_inactive_split_groups() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
-    for args in [
-        vec!["init", "-q", "-b", "main"],
-        vec!["config", "user.email", "a@b"],
-        vec!["config", "user.name", "a"],
-    ] {
-        let _ = std::process::Command::new("git")
-            .arg("-C")
-            .arg(root)
-            .args(&args)
-            .status();
-    }
+    git_init_with_identity(root);
     let f = root.join("seed.txt");
     std::fs::write(&f, "one\ntwo\n").unwrap();
     for args in [vec!["add", "."], vec!["commit", "-m", "init", "--quiet"]] {
-        let _ = std::process::Command::new("git")
-            .arg("-C")
-            .arg(root)
-            .args(&args)
-            .status();
+        let _ = git_succeeds(root, &args);
     }
 
     let mut app = App::new(root.to_path_buf()).unwrap();
@@ -163,30 +149,13 @@ fn click_on_a_deleted_source_control_entry_opens_unified_diff_with_head_lines_al
     use crate::git::{ChangeEntry, ChangeKind};
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
-    let init = std::process::Command::new("git")
-        .args(["init", "-q", "-b", "main"])
-        .current_dir(root)
-        .status()
-        .unwrap();
-    assert!(init.success());
-    let _ = std::process::Command::new("git")
-        .args(["config", "user.email", "t@t"])
-        .current_dir(root)
-        .status();
-    let _ = std::process::Command::new("git")
-        .args(["config", "user.name", "t"])
-        .current_dir(root)
-        .status();
+    git_init(root);
+    let _ = git_succeeds(root, &["config", "user.email", "t@t"]);
+    let _ = git_succeeds(root, &["config", "user.name", "t"]);
     let f = root.join("doomed.txt");
     std::fs::write(&f, b"alpha\nbeta\ngamma\n").unwrap();
-    let _ = std::process::Command::new("git")
-        .args(["add", "doomed.txt"])
-        .current_dir(root)
-        .status();
-    let _ = std::process::Command::new("git")
-        .args(["commit", "-q", "-m", "seed"])
-        .current_dir(root)
-        .status();
+    let _ = git_succeeds(root, &["add", "doomed.txt"]);
+    let _ = git_succeeds(root, &["commit", "-q", "-m", "seed"]);
     // Delete in the working tree but leave it tracked in HEAD/index
     // — that's exactly the `Deleted` (unstaged) state.
     std::fs::remove_file(&f).unwrap();
@@ -227,30 +196,13 @@ fn click_on_a_modified_source_control_entry_opens_a_diff_view_against_head() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     // Init a real repo so git show HEAD:<path> returns content.
-    let init = std::process::Command::new("git")
-        .args(["init", "-q", "-b", "main"])
-        .current_dir(root)
-        .status()
-        .unwrap();
-    assert!(init.success());
-    let _ = std::process::Command::new("git")
-        .args(["config", "user.email", "t@t"])
-        .current_dir(root)
-        .status();
-    let _ = std::process::Command::new("git")
-        .args(["config", "user.name", "t"])
-        .current_dir(root)
-        .status();
+    git_init(root);
+    let _ = git_succeeds(root, &["config", "user.email", "t@t"]);
+    let _ = git_succeeds(root, &["config", "user.name", "t"]);
     let f = root.join("a.py");
     std::fs::write(&f, b"print(1)\n").unwrap();
-    let _ = std::process::Command::new("git")
-        .args(["add", "a.py"])
-        .current_dir(root)
-        .status();
-    let _ = std::process::Command::new("git")
-        .args(["commit", "-q", "-m", "init"])
-        .current_dir(root)
-        .status();
+    let _ = git_succeeds(root, &["add", "a.py"]);
+    let _ = git_succeeds(root, &["commit", "-q", "-m", "init"]);
     std::fs::write(&f, b"print(2)\n").unwrap();
     let mut app = App::new(root.to_path_buf()).unwrap();
     app.source_control.entries = vec![ChangeEntry {
@@ -273,17 +225,8 @@ fn scm_two_hunk_app() -> (tempfile::TempDir, App) {
     use crate::git::{ChangeEntry, ChangeKind};
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
-    let git = |args: &[&str]| {
-        let ok = std::process::Command::new("git")
-            .args(args)
-            .current_dir(root)
-            .output()
-            .unwrap()
-            .status
-            .success();
-        assert!(ok, "git {args:?} failed");
-    };
-    git(&["init", "-q", "-b", "main"]);
+    let git = |args: &[&str]| git_ok(root, args);
+    git_init(root);
     git(&["config", "user.email", "t@t"]);
     git(&["config", "user.name", "t"]);
     let original: String = (1..=20).map(|i| format!("line{i}\n")).collect();
@@ -317,7 +260,7 @@ fn pressing_s_in_a_scm_diff_stages_only_the_hunk_under_the_caret() {
         .start_selection(crate::widgets::diff::DiffSide::Right, 1, 0);
     app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE))
         .unwrap();
-    let staged = git_stdout_in(tmp.path(), &["diff", "--cached"]);
+    let staged = git_stdout_untrimmed(tmp.path(), &["diff", "--cached"]);
     assert!(
         staged.contains("+LINE2"),
         "hunk 1 must land in the index: {staged}"
@@ -326,7 +269,7 @@ fn pressing_s_in_a_scm_diff_stages_only_the_hunk_under_the_caret() {
         !staged.contains("LINE18"),
         "hunk 2 must stay unstaged: {staged}"
     );
-    let unstaged = git_stdout_in(tmp.path(), &["diff"]);
+    let unstaged = git_stdout_untrimmed(tmp.path(), &["diff"]);
     assert!(
         unstaged.contains("+LINE18"),
         "hunk 2 must remain a working-tree change: {unstaged}"
@@ -340,7 +283,7 @@ fn pressing_s_with_no_caret_stages_the_first_visible_hunk() {
     let (tmp, mut app) = scm_two_hunk_app();
     app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE))
         .unwrap();
-    let staged = git_stdout_in(tmp.path(), &["diff", "--cached"]);
+    let staged = git_stdout_untrimmed(tmp.path(), &["diff", "--cached"]);
     assert!(
         staged.contains("+LINE2") && !staged.contains("LINE18"),
         "the first hunk is the default target: {staged}"
@@ -358,12 +301,12 @@ fn enter_commits_only_the_hunk_staged_with_s() {
     app.source_control.message_cursor = 11;
     app.handle_source_control_key(key(KeyCode::Enter, KeyModifiers::NONE));
     wait_for_git_net(&mut app);
-    let committed = git_stdout_in(tmp.path(), &["show", "HEAD:f.txt"]);
+    let committed = git_stdout_untrimmed(tmp.path(), &["show", "HEAD:f.txt"]);
     assert!(
         committed.contains("LINE2") && !committed.contains("LINE18"),
         "only the staged hunk is committed: {committed}"
     );
-    let unstaged = git_stdout_in(tmp.path(), &["diff"]);
+    let unstaged = git_stdout_untrimmed(tmp.path(), &["diff"]);
     assert!(
         unstaged.contains("+LINE18"),
         "the unstaged hunk stays a working-tree change: {unstaged}"
@@ -373,14 +316,7 @@ fn enter_commits_only_the_hunk_staged_with_s() {
 #[test]
 fn pressing_u_in_a_scm_diff_unstages_only_the_hunk_under_the_caret() {
     let (tmp, mut app) = scm_two_hunk_app();
-    let ok = std::process::Command::new("git")
-        .args(["add", "f.txt"])
-        .current_dir(tmp.path())
-        .output()
-        .unwrap()
-        .status
-        .success();
-    assert!(ok);
+    assert!(git_succeeds(tmp.path(), &["add", "f.txt"]));
     app.editor
         .diff
         .as_mut()
@@ -388,7 +324,7 @@ fn pressing_u_in_a_scm_diff_unstages_only_the_hunk_under_the_caret() {
         .start_selection(crate::widgets::diff::DiffSide::Right, 1, 0);
     app.handle_key(key(KeyCode::Char('u'), KeyModifiers::NONE))
         .unwrap();
-    let staged = git_stdout_in(tmp.path(), &["diff", "--cached"]);
+    let staged = git_stdout_untrimmed(tmp.path(), &["diff", "--cached"]);
     assert!(
         !staged.contains("LINE2"),
         "hunk 1 must leave the index: {staged}"
@@ -926,21 +862,7 @@ fn clicking_source_control_does_not_block_on_git_and_posts_a_changes_request() {
     // non-blocking `mpsc::Sender::send` and returns within the
     // microsecond range.
     let tmp = tempfile::tempdir().unwrap();
-    let _ = std::process::Command::new("git")
-        .args(["-C"])
-        .arg(tmp.path())
-        .args(["init", "-q", "-b", "main"])
-        .output();
-    let _ = std::process::Command::new("git")
-        .args(["-C"])
-        .arg(tmp.path())
-        .args(["config", "user.email", "a@b"])
-        .status();
-    let _ = std::process::Command::new("git")
-        .args(["-C"])
-        .arg(tmp.path())
-        .args(["config", "user.name", "a"])
-        .status();
+    git_init_with_identity(tmp.path());
     std::fs::write(tmp.path().join("dirty.txt"), "x").unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     // Pretend the worker is idle by draining its initial Status
@@ -992,11 +914,7 @@ fn git_worker_status_response_feeds_the_explorer_decorations() {
     // and drain pushes them into the file tree, so a new file and its
     // folder are marked untracked in the Explorer.
     let tmp = tempfile::tempdir().unwrap();
-    let _ = std::process::Command::new("git")
-        .args(["-C"])
-        .arg(tmp.path())
-        .args(["init", "-q", "-b", "main"])
-        .output();
+    git_init(tmp.path());
     std::fs::create_dir(tmp.path().join("pkg")).unwrap();
     std::fs::write(tmp.path().join("pkg/new.py"), "x = 1\n").unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
@@ -1026,11 +944,7 @@ fn git_worker_status_response_feeds_the_explorer_ignored_set() {
     // into the file tree, where descendants of a collapsed ignored dir
     // resolve via the ancestor walk.
     let tmp = tempfile::tempdir().unwrap();
-    let _ = std::process::Command::new("git")
-        .args(["-C"])
-        .arg(tmp.path())
-        .args(["init", "-q", "-b", "main"])
-        .output();
+    git_init(tmp.path());
     std::fs::write(tmp.path().join(".gitignore"), "build/\n").unwrap();
     std::fs::create_dir(tmp.path().join("build")).unwrap();
     std::fs::write(tmp.path().join("build/out.txt"), "").unwrap();
@@ -1062,33 +976,13 @@ fn source_control_stages_a_toplevel_entry_from_a_subdir_workspace() {
     let outer = tempfile::tempdir().unwrap();
     let repo = outer.path().join("repo");
     std::fs::create_dir(&repo).unwrap();
-    for args in [
-        vec!["init", "-q", "-b", "main"],
-        vec!["config", "user.email", "a@b"],
-        vec!["config", "user.name", "a"],
-    ] {
-        let ok = std::process::Command::new("git")
-            .args(["-C"])
-            .arg(&repo)
-            .args(&args)
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        assert!(ok, "git setup step failed: {args:?}");
-    }
+    git_init_with_identity(&repo);
     std::fs::write(repo.join("seed.txt"), "one\ntwo\n").unwrap();
     let sub = repo.join("crates").join("foo");
     std::fs::create_dir_all(&sub).unwrap();
     std::fs::write(sub.join("keep.txt"), "x\n").unwrap();
     for args in [vec!["add", "."], vec!["commit", "-qm", "init"]] {
-        let ok = std::process::Command::new("git")
-            .args(["-C"])
-            .arg(&repo)
-            .args(&args)
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        assert!(ok, "git setup step failed: {args:?}");
+        git_ok(&repo, &args);
     }
     // A tracked TOPLEVEL file goes dirty while the workspace opens the
     // subdirectory two levels down.
@@ -1121,15 +1015,9 @@ fn source_control_stages_a_toplevel_entry_from_a_subdir_workspace() {
 
     app.stage_source_control_entry(entry_idx);
 
-    let staged = std::process::Command::new("git")
-        .args(["-C"])
-        .arg(&repo)
-        .args(["diff", "--cached", "--name-only"])
-        .output()
-        .unwrap();
-    assert!(staged.status.success(), "git diff --cached failed");
+    let staged = git_ok(&repo, &["diff", "--cached", "--name-only"]);
     assert!(
-        String::from_utf8_lossy(&staged.stdout).contains("seed.txt"),
+        staged.contains("seed.txt"),
         "staging from the panel must address the file by its toplevel-relative path; \
          `git -C <subdir> add seed.txt` matches nothing"
     );
@@ -1147,21 +1035,7 @@ fn change_workspace_root_into_a_git_subdir_flips_source_control_into_repo_state(
     let outer = tempfile::tempdir().unwrap();
     let repo = outer.path().join("repo");
     std::fs::create_dir(&repo).unwrap();
-    let _ = std::process::Command::new("git")
-        .args(["-C"])
-        .arg(&repo)
-        .args(["init", "-q", "-b", "main"])
-        .output();
-    let _ = std::process::Command::new("git")
-        .args(["-C"])
-        .arg(&repo)
-        .args(["config", "user.email", "a@b"])
-        .status();
-    let _ = std::process::Command::new("git")
-        .args(["-C"])
-        .arg(&repo)
-        .args(["config", "user.name", "a"])
-        .status();
+    git_init_with_identity(&repo);
     let mut app = App::new(outer.path().to_path_buf()).unwrap();
     std::thread::sleep(std::time::Duration::from_millis(150));
     let _ = app.drain_git_responses();
@@ -1290,38 +1164,22 @@ fn discard_all_requires_confirmation_and_then_reverts_tracked_changes() {
     );
 }
 
-/// `git -C dir <args>` for app tests, asserting success; stdout trimmed.
-fn git_checked(dir: &Path, args: &[&str]) -> String {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "git {args:?}: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
-}
-
 /// #1350: Undo Last Commit (⋯ → Commit) takes the commit back: HEAD is
 /// the parent, its changes are staged, and its message is in the box.
 #[test]
 fn undo_last_commit_via_the_menu_puts_the_message_back_in_the_box() {
     use crate::widgets::scm_menu::ScmAction;
     let tmp = make_committed_repo();
-    let parent = git_checked(tmp.path(), &["rev-parse", "HEAD"]);
+    let parent = git_ok(tmp.path(), &["rev-parse", "HEAD"]);
     std::fs::write(tmp.path().join("b.txt"), "b\n").unwrap();
-    git_checked(tmp.path(), &["add", "b.txt"]);
-    git_checked(tmp.path(), &["commit", "-q", "-m", "Add b too early"]);
+    git_ok(tmp.path(), &["add", "b.txt"]);
+    git_ok(tmp.path(), &["commit", "-q", "-m", "Add b too early"]);
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.dispatch_scm_action(ScmAction::UndoLastCommit);
-    assert_eq!(git_checked(tmp.path(), &["rev-parse", "HEAD"]), parent);
+    assert_eq!(git_ok(tmp.path(), &["rev-parse", "HEAD"]), parent);
     assert_eq!(app.source_control.message, "Add b too early");
     assert_eq!(
-        git_checked(tmp.path(), &["diff", "--cached", "--name-only"]),
+        git_ok(tmp.path(), &["diff", "--cached", "--name-only"]),
         "b.txt"
     );
     assert!(
@@ -1339,8 +1197,8 @@ fn undo_last_commit_is_in_the_palette() {
     assert_eq!(cmd.title(), "Git: Undo Last Commit");
     let tmp = make_committed_repo();
     std::fs::write(tmp.path().join("b.txt"), "b\n").unwrap();
-    git_checked(tmp.path(), &["add", "b.txt"]);
-    git_checked(tmp.path(), &["commit", "-q", "-m", "second"]);
+    git_ok(tmp.path(), &["add", "b.txt"]);
+    git_ok(tmp.path(), &["commit", "-q", "-m", "second"]);
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.run_command(cmd);
     assert_eq!(app.source_control.message, "second");
@@ -1354,20 +1212,16 @@ fn undo_last_commit_warns_before_undoing_a_pushed_commit() {
     use crate::widgets::scm_menu::ScmAction;
     let tmp = make_committed_repo();
     let remote = tempfile::tempdir().unwrap();
-    git_checked(remote.path(), &["init", "-q", "--bare"]);
-    git_checked(
+    git_ok(remote.path(), &["init", "-q", "--bare", "-b", "main"]);
+    git_ok(
         tmp.path(),
         &["remote", "add", "origin", remote.path().to_str().unwrap()],
     );
-    git_checked(tmp.path(), &["push", "-q", "-u", "origin", "main"]);
-    let head = git_checked(tmp.path(), &["rev-parse", "HEAD"]);
+    git_ok(tmp.path(), &["push", "-q", "-u", "origin", "main"]);
+    let head = git_ok(tmp.path(), &["rev-parse", "HEAD"]);
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.dispatch_scm_action(ScmAction::UndoLastCommit);
-    assert_eq!(
-        git_checked(tmp.path(), &["rev-parse", "HEAD"]),
-        head,
-        "not yet"
-    );
+    assert_eq!(git_ok(tmp.path(), &["rev-parse", "HEAD"]), head, "not yet");
     let warning = app
         .source_control
         .commit_feedback
@@ -1388,16 +1242,13 @@ fn undo_last_commit_keeps_a_message_the_user_typed() {
     use crate::widgets::scm_menu::ScmAction;
     let tmp = make_committed_repo();
     std::fs::write(tmp.path().join("b.txt"), "b\n").unwrap();
-    git_checked(tmp.path(), &["add", "b.txt"]);
-    git_checked(tmp.path(), &["commit", "-q", "-m", "second"]);
+    git_ok(tmp.path(), &["add", "b.txt"]);
+    git_ok(tmp.path(), &["commit", "-q", "-m", "second"]);
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.source_control.insert_str("my draft");
     app.dispatch_scm_action(ScmAction::UndoLastCommit);
     assert_eq!(app.source_control.message, "my draft");
-    assert_eq!(
-        git_checked(tmp.path(), &["log", "-1", "--format=%s"]),
-        "init"
-    );
+    assert_eq!(git_ok(tmp.path(), &["log", "-1", "--format=%s"]), "init");
 }
 
 /// #1352: Git: Revert Hunk with the caret on line 5 of an editor tab
@@ -1481,10 +1332,7 @@ fn create_tag_via_the_menu_opens_an_input_then_creates_the_tag() {
         .as_ref()
         .expect("Create Tag must open an input prompt");
     assert_eq!(prompt.purpose, InputPurpose::CreateTag);
-    for c in "v9.9.9".chars() {
-        app.input_prompt.as_mut().unwrap().push_char(c);
-    }
-    app.submit_input_prompt();
+    append_and_submit_prompt(&mut app, "v9.9.9");
     // #1582: then the optional message; Enter on a blank one makes a
     // lightweight tag.
     assert_eq!(
@@ -1511,20 +1359,13 @@ fn create_tag_via_the_menu_opens_an_input_then_creates_the_tag() {
 fn repo_with_bare_origin() -> (tempfile::TempDir, tempfile::TempDir) {
     let tmp = make_committed_repo();
     let bare = tempfile::tempdir().unwrap();
-    git_stdout(bare.path(), &["init", "-q", "--bare"]);
+    git_stdout(bare.path(), &["init", "-q", "--bare", "-b", "main"]);
     git_stdout(
         tmp.path(),
         &["remote", "add", "origin", bare.path().to_str().unwrap()],
     );
     git_stdout(tmp.path(), &["push", "-q", "-u", "origin", "main"]);
     (tmp, bare)
-}
-
-fn type_and_submit(app: &mut App, text: &str) {
-    for c in text.chars() {
-        app.input_prompt.as_mut().unwrap().push_char(c);
-    }
-    app.submit_input_prompt();
 }
 
 /// #1582: the Tags menu makes an annotated tag from a message, pushes it,
@@ -1537,8 +1378,8 @@ fn the_tags_menu_annotates_pushes_and_deletes_a_remote_tag() {
     let (tmp, bare) = repo_with_bare_origin();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.dispatch_scm_action(ScmAction::CreateTag);
-    type_and_submit(&mut app, "v1.0");
-    type_and_submit(&mut app, "Release 1.0");
+    append_and_submit_prompt(&mut app, "v1.0");
+    append_and_submit_prompt(&mut app, "Release 1.0");
     assert_eq!(git_stdout(tmp.path(), &["cat-file", "-t", "v1.0"]), "tag");
     assert_eq!(
         git_stdout(
@@ -1665,8 +1506,8 @@ fn a_remote_tag_is_not_deleted_after_source_control_moved_repos() {
 fn delete_branch_via_the_menu_opens_the_branch_picker_in_delete_mode() {
     use crate::widgets::scm_menu::ScmAction;
     let tmp = make_committed_repo();
-    crate::git::create_branch(tmp.path(), "doomed").unwrap();
-    crate::git::checkout_branch(tmp.path(), "main").unwrap();
+    git_ok(tmp.path(), &["switch", "-c", "doomed"]);
+    git_ok(tmp.path(), &["switch", "main"]);
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.dispatch_scm_action(ScmAction::DeleteBranch);
     assert!(
@@ -1701,13 +1542,7 @@ const HOOK_UNTIL_GO: &str =
     "i=0; while [ ! -f go ] && [ $i -lt 100 ]; do sleep 0.05; i=$((i+1)); done";
 
 fn last_commit_subject(root: &Path) -> String {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["log", "-1", "--format=%s"])
-        .output()
-        .unwrap();
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
+    git_stdout(root, &["log", "-1", "--format=%s"])
 }
 
 fn app_with_commit_message(root: &Path, message: &str) -> App {
@@ -1812,15 +1647,8 @@ fn an_empty_commit_message_is_still_refused_on_the_spot() {
 fn a_push_runs_off_the_ui_thread_and_reports_when_it_lands() {
     let tmp = make_committed_repo();
     let bare = tempfile::tempdir().unwrap();
-    let git = |dir: &std::path::Path, args: &[&str]| {
-        std::process::Command::new("git")
-            .arg("-C")
-            .arg(dir)
-            .args(args)
-            .output()
-            .unwrap()
-    };
-    git(bare.path(), &["init", "-q", "--bare"]);
+    let git = git_stdout_untrimmed;
+    git(bare.path(), &["init", "-q", "--bare", "-b", "main"]);
     git(
         tmp.path(),
         &["remote", "add", "origin", bare.path().to_str().unwrap()],
@@ -1839,20 +1667,9 @@ fn a_push_runs_off_the_ui_thread_and_reports_when_it_lands() {
         "{:?}",
         app.source_control.commit_feedback
     );
-    let remote_head = git(bare.path(), &["rev-parse", "main"]).stdout;
-    let local_head = git(tmp.path(), &["rev-parse", "HEAD"]).stdout;
+    let remote_head = git(bare.path(), &["rev-parse", "main"]);
+    let local_head = git(tmp.path(), &["rev-parse", "HEAD"]);
     assert_eq!(remote_head, local_head);
-}
-
-/// Run git in `dir` and return its trimmed stdout ("" on failure).
-fn git_stdout(dir: &std::path::Path, args: &[&str]) -> String {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
-        .unwrap();
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
 
 /// #1356: a conflicted merge is reported as one, and Abort Merge from
@@ -2090,7 +1907,7 @@ fn unpublished_topic_repo(remotes: &[&str]) -> (tempfile::TempDir, Vec<tempfile:
         .iter()
         .map(|name| {
             let bare = tempfile::tempdir().unwrap();
-            git_stdout(bare.path(), &["init", "-q", "--bare"]);
+            git_stdout(bare.path(), &["init", "-q", "--bare", "-b", "main"]);
             git_stdout(
                 tmp.path(),
                 &["remote", "add", name, bare.path().to_str().unwrap()],
@@ -2778,17 +2595,9 @@ fn list_keys_stage_unstage_and_discard_the_selected_change() {
 fn list_keys_keep_a_partly_staged_files_halves_apart() {
     use crate::git::ChangeSection;
     let tmp = make_committed_repo();
-    let git_ok = |args: &[&str]| {
-        std::process::Command::new("git")
-            .arg("-C")
-            .arg(tmp.path())
-            .args(args)
-            .status()
-            .unwrap()
-            .success()
-    };
+    let git = |args: &[&str]| git_succeeds(tmp.path(), args);
     std::fs::write(tmp.path().join("seed.txt"), b"staged\n").unwrap();
-    assert!(git_ok(&["add", "seed.txt"]));
+    assert!(git(&["add", "seed.txt"]));
     std::fs::write(tmp.path().join("seed.txt"), b"staged\nunstaged\n").unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     wait_for_changes(&mut app, |a| a.source_control.entries.len() >= 2);
@@ -2802,12 +2611,12 @@ fn list_keys_keep_a_partly_staged_files_halves_apart() {
     app.source_control.selected_change = row(&app, ChangeSection::Staged);
     app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE))
         .unwrap();
-    assert!(!git_ok(&["diff", "--quiet"]), "s staged the unstaged half");
+    assert!(!git(&["diff", "--quiet"]), "s staged the unstaged half");
     app.source_control.selected_change = row(&app, ChangeSection::Changes);
     app.handle_key(key(KeyCode::Char('u'), KeyModifiers::NONE))
         .unwrap();
     assert!(
-        !git_ok(&["diff", "--cached", "--quiet"]),
+        !git(&["diff", "--cached", "--quiet"]),
         "u unstaged the staged half"
     );
 }
@@ -2858,13 +2667,7 @@ fn cmd_enter_in_source_control_falls_back_to_plain_commit_without_pushing() {
     app.source_control.message_cursor = app.source_control.message.chars().count();
     app.handle_source_control_key(key(KeyCode::Enter, KeyModifiers::SUPER));
     wait_for_git_net(&mut app);
-    let log = std::process::Command::new("git")
-        .args(["-C"])
-        .arg(tmp.path())
-        .args(["log", "--oneline"])
-        .output()
-        .unwrap();
-    let log_out = String::from_utf8_lossy(&log.stdout);
+    let log_out = git_stdout_untrimmed(tmp.path(), &["log", "--oneline"]);
     assert!(
         log_out.contains("fix: plain cmd-enter"),
         "Cmd+Enter must still commit locally (push is bound to Ctrl+Enter only): log={log_out:?}"
@@ -2876,14 +2679,14 @@ fn cmd_enter_in_source_control_falls_back_to_plain_commit_without_pushing() {
 #[test]
 fn commit_with_an_unsaved_tab_in_the_repo_asks_before_committing() {
     let (tmp, mut app) = scm_with_unsaved_tab();
-    let head = git_out(tmp.path(), &["rev-parse", "HEAD"]);
+    let head = git_stdout_untrimmed(tmp.path(), &["rev-parse", "HEAD"]);
     app.handle_source_control_key(key(KeyCode::Enter, KeyModifiers::NONE));
     wait_for_git_net(&mut app);
     let pending = app.pending_unsaved_scm.as_ref().expect("the prompt opens");
     assert_eq!(pending.op, ScmWrite::Commit);
     assert_eq!(pending.files, vec![tmp.path().join("seed.txt")]);
     assert_eq!(
-        git_out(tmp.path(), &["rev-parse", "HEAD"]),
+        git_stdout_untrimmed(tmp.path(), &["rev-parse", "HEAD"]),
         head,
         "no commit yet"
     );
@@ -2903,7 +2706,10 @@ fn commit_anyway_commits_the_disk_text_and_leaves_the_tab_unsaved() {
         .unwrap();
     wait_for_git_net(&mut app);
     assert!(app.pending_unsaved_scm.is_none());
-    assert_eq!(git_out(tmp.path(), &["show", "HEAD:seed.txt"]), "changed\n");
+    assert_eq!(
+        git_stdout_untrimmed(tmp.path(), &["show", "HEAD:seed.txt"]),
+        "changed\n"
+    );
     assert!(app.editor.dirty, "Commit Anyway saves nothing");
 }
 
@@ -2911,13 +2717,16 @@ fn commit_anyway_commits_the_disk_text_and_leaves_the_tab_unsaved() {
 #[test]
 fn cancelling_the_unsaved_prompt_commits_nothing() {
     let (tmp, mut app) = scm_with_unsaved_tab();
-    let head = git_out(tmp.path(), &["rev-parse", "HEAD"]);
+    let head = git_stdout_untrimmed(tmp.path(), &["rev-parse", "HEAD"]);
     app.handle_source_control_key(key(KeyCode::Enter, KeyModifiers::NONE));
     app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
         .unwrap();
     wait_for_git_net(&mut app);
     assert!(app.pending_unsaved_scm.is_none());
-    assert_eq!(git_out(tmp.path(), &["rev-parse", "HEAD"]), head);
+    assert_eq!(
+        git_stdout_untrimmed(tmp.path(), &["rev-parse", "HEAD"]),
+        head
+    );
     assert!(app.editor.dirty);
     assert_eq!(
         app.source_control.message, "bump seed",
@@ -2941,7 +2750,10 @@ fn an_unsaved_tab_outside_the_repo_does_not_hold_the_commit() {
     app.handle_source_control_key(key(KeyCode::Enter, KeyModifiers::NONE));
     wait_for_git_net(&mut app);
     assert!(app.pending_unsaved_scm.is_none(), "no prompt");
-    assert_eq!(git_out(tmp.path(), &["show", "HEAD:seed.txt"]), "changed\n");
+    assert_eq!(
+        git_stdout_untrimmed(tmp.path(), &["show", "HEAD:seed.txt"]),
+        "changed\n"
+    );
     assert_eq!(last_commit_message(tmp.path()), "bump seed\n\n");
 }
 
@@ -2951,7 +2763,7 @@ fn an_unsaved_tab_outside_the_repo_does_not_hold_the_commit() {
 #[test]
 fn the_unsaved_prompt_does_not_commit_after_source_control_moved_repos() {
     let (tmp, mut app) = scm_with_unsaved_tab();
-    let head = git_out(tmp.path(), &["rev-parse", "HEAD"]);
+    let head = git_stdout_untrimmed(tmp.path(), &["rev-parse", "HEAD"]);
     app.handle_source_control_key(key(KeyCode::Enter, KeyModifiers::NONE));
     let other = tempfile::tempdir().unwrap();
     app.pending_unsaved_scm
@@ -2962,7 +2774,10 @@ fn the_unsaved_prompt_does_not_commit_after_source_control_moved_repos() {
         .unwrap();
     wait_for_git_net(&mut app);
     assert!(app.pending_unsaved_scm.is_none());
-    assert_eq!(git_out(tmp.path(), &["rev-parse", "HEAD"]), head);
+    assert_eq!(
+        git_stdout_untrimmed(tmp.path(), &["rev-parse", "HEAD"]),
+        head
+    );
     assert!(
         app.status.contains("moved to another repository"),
         "{}",
@@ -2985,7 +2800,7 @@ fn an_empty_message_is_refused_before_the_unsaved_prompt() {
 }
 
 fn stash_names(root: &std::path::Path) -> String {
-    git_out(root, &["stash", "list", "--format=%gs"])
+    git_stdout_untrimmed(root, &["stash", "list", "--format=%gs"])
 }
 
 /// #1581: Stash asks what to call the stash, seeded with the commit box's
@@ -3059,9 +2874,9 @@ fn a_blank_stash_name_is_wip_and_esc_stashes_nothing() {
 fn view_stash_lists_files_and_opens_the_patch() {
     let (tmp, mut app) = scm_ready_to_commit();
     std::fs::write(tmp.path().join("seed.txt"), b"retries = 5\n").unwrap();
-    crate::git::stash_push(tmp.path(), Some("retries")).unwrap();
+    git_ok(tmp.path(), &["stash", "push", "-m", "retries"]);
     std::fs::write(tmp.path().join("other.txt"), b"x\n").unwrap();
-    crate::git::stash_push_untracked(tmp.path(), Some("other")).unwrap();
+    git_ok(tmp.path(), &["stash", "push", "-u", "-m", "other"]);
     app.run_command(crate::widgets::command_palette::Command::GitViewStash);
     let picker = app.list_picker.as_ref().expect("the picker opens");
     assert_eq!(picker.title, "View Stash");
@@ -3113,15 +2928,8 @@ fn view_stash_without_stashes_opens_nothing() {
 /// picker open on the second.
 fn drop_stash_picker_1128() -> (tempfile::TempDir, App) {
     let tmp = tempfile::tempdir().unwrap();
-    let git = |args: &[&str]| {
-        let out = std::process::Command::new("git")
-            .args(args)
-            .current_dir(tmp.path())
-            .output()
-            .unwrap();
-        assert!(out.status.success(), "git {args:?}: {out:?}");
-    };
-    git(&["init", "-q"]);
+    let git = |args: &[&str]| git_ok(tmp.path(), args);
+    git_init(tmp.path());
     git(&["config", "user.email", "t@example.com"]);
     git(&["config", "user.name", "t"]);
     std::fs::write(tmp.path().join("billing.py"), "v1\n").unwrap();
@@ -3190,16 +2998,6 @@ fn drop_stash_answered_no_keeps_the_stash() {
     }
 }
 
-/// Runs `git` in `root` for the #1128 tests, failing the test on error.
-fn git_1128(root: &Path, args: &[&str]) {
-    let out = std::process::Command::new("git")
-        .args(args)
-        .current_dir(root)
-        .output()
-        .unwrap();
-    assert!(out.status.success(), "git {args:?}: {out:?}");
-}
-
 /// #1128: only a plain (or shifted) Y answers. Ctrl+Shift+Y is terminal copy
 /// mode, and pressing it with the question up must not drop the stash.
 #[test]
@@ -3235,7 +3033,7 @@ fn drop_stash_drops_the_named_stash_after_the_list_moves() {
     let (tmp, mut app) = drop_stash_picker_1128();
     app.confirm_list_picker();
     std::fs::write(tmp.path().join("billing.py"), "v3\n").unwrap();
-    git_1128(
+    git_ok(
         tmp.path(),
         &["stash", "push", "-q", "-m", "pushed meanwhile"],
     );
@@ -3260,7 +3058,7 @@ fn drop_stash_drops_the_named_stash_after_the_list_moves() {
 fn drop_stash_refuses_when_the_named_stash_is_gone() {
     let (tmp, mut app) = drop_stash_picker_1128();
     app.confirm_list_picker();
-    git_1128(tmp.path(), &["stash", "drop", "-q", "stash@{1}"]);
+    git_ok(tmp.path(), &["stash", "drop", "-q", "stash@{1}"]);
     app.handle_key(key(KeyCode::Char('y'), KeyModifiers::NONE))
         .unwrap();
     let left = stash_messages_1128(tmp.path());
@@ -3322,23 +3120,14 @@ fn scm_home_end_follow_the_carets_line_and_ctrl_takes_the_whole_message() {
 fn finishing_a_conflicted_revert_commits_gits_whole_message() {
     let tmp = make_committed_repo();
     let root = tmp.path();
-    let git = |args: &[&str]| {
-        std::process::Command::new("git")
-            .arg("-C")
-            .arg(root)
-            .args(["-c", "user.name=t", "-c", "user.email=t@t"])
-            .args(args)
-            .output()
-            .unwrap()
-    };
+    let git = |args: &[&str]| git_succeeds(root, args);
     std::fs::write(root.join("seed.txt"), b"rate = 2\n").unwrap();
     git(&["commit", "-qam", "Raise rate", "-m", "Body explaining why."]);
     let reverted = git_stdout(root, &["rev-parse", "HEAD"]);
     std::fs::write(root.join("seed.txt"), b"rate = 3\n").unwrap();
     git(&["commit", "-qam", "Raise rate again"]);
-    let out = git(&["revert", "--no-edit", "HEAD~1"]);
     assert!(
-        !out.status.success(),
+        !git(&["revert", "--no-edit", "HEAD~1"]),
         "staging: the revert stops on a conflict"
     );
     std::fs::write(root.join("seed.txt"), b"rate = 1\n").unwrap();
@@ -3463,22 +3252,12 @@ fn ctrl_enter_in_source_control_commits_and_pushes() {
     // Wire a bare remote and set it as origin so `git push` has
     // somewhere to send.
     let remote = tempfile::tempdir().unwrap();
-    let _ = std::process::Command::new("git")
-        .args(["-C"])
-        .arg(remote.path())
-        .args(["init", "--bare", "-q", "-b", "main"])
-        .status();
-    let _ = std::process::Command::new("git")
-        .args(["-C"])
-        .arg(tmp.path())
+    let _ = git_succeeds(remote.path(), &["init", "--bare", "-q", "-b", "main"]);
+    let _ = test_git(tmp.path())
         .args(["remote", "add", "origin"])
         .arg(remote.path())
         .status();
-    let _ = std::process::Command::new("git")
-        .args(["-C"])
-        .arg(tmp.path())
-        .args(["push", "-u", "origin", "main"])
-        .status();
+    let _ = git_succeeds(tmp.path(), &["push", "-u", "origin", "main"]);
     // Make a tracked change and stage it so commit-all-tracked has
     // something to commit.
     std::fs::write(tmp.path().join("seed.txt"), b"changed\n").unwrap();
@@ -3497,13 +3276,7 @@ fn ctrl_enter_in_source_control_commits_and_pushes() {
     wait_for_git_net(&mut app);
     // Verify the remote received the commit (its log now reports two
     // commits — the initial push + our new one).
-    let log = std::process::Command::new("git")
-        .args(["-C"])
-        .arg(remote.path())
-        .args(["log", "--oneline"])
-        .output()
-        .unwrap();
-    let log_out = String::from_utf8_lossy(&log.stdout);
+    let log_out = git_stdout_untrimmed(remote.path(), &["log", "--oneline"]);
     assert!(
         log_out.lines().count() >= 2,
         "Cmd+Enter must have committed AND pushed (remote log: {log_out:?})"
@@ -3522,11 +3295,7 @@ fn focused_source_control_input_drives_a_visible_caret_at_the_message_cursor() {
     // repo, `cursor_should_be_visible()` must report true and the
     // caret cell must point inside the rendered input box.
     let tmp = tempfile::tempdir().unwrap();
-    let _ = std::process::Command::new("git")
-        .args(["-C"])
-        .arg(tmp.path())
-        .args(["init", "-q", "-b", "main"])
-        .output();
+    git_init(tmp.path());
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
     while std::time::Instant::now() < deadline {
@@ -3865,19 +3634,7 @@ fn cmd_shift_g_no_longer_jumps_to_source_control() {
 fn the_default_branch_is_resolved_off_the_ui_thread() {
     let tmp = tempfile::tempdir().unwrap();
     let p = tmp.path().canonicalize().unwrap();
-    let git = |args: &[&str]| {
-        let o = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&p)
-            .args(args)
-            .output()
-            .unwrap();
-        assert!(
-            o.status.success(),
-            "{args:?}: {}",
-            String::from_utf8_lossy(&o.stderr)
-        );
-    };
+    let git = |args: &[&str]| git_ok(&p, args);
     git(&["init", "-q", "-b", "trunk"]);
     git(&["config", "user.email", "a@b"]);
     git(&["config", "user.name", "a"]);
@@ -3914,23 +3671,8 @@ fn the_default_branch_is_resolved_off_the_ui_thread() {
 fn view_changes_vs_default_branch_starts_from_the_merge_base() {
     let tmp = tempfile::tempdir().unwrap();
     let p = tmp.path().canonicalize().unwrap();
-    let git = |args: &[&str]| {
-        let o = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&p)
-            .args(args)
-            .output()
-            .unwrap();
-        assert!(
-            o.status.success(),
-            "{args:?}: {}",
-            String::from_utf8_lossy(&o.stderr)
-        );
-        String::from_utf8_lossy(&o.stdout).trim().to_string()
-    };
-    git(&["init", "-q", "-b", "main"]);
-    git(&["config", "user.email", "a@b"]);
-    git(&["config", "user.name", "a"]);
+    let git = |args: &[&str]| git_ok(&p, args);
+    git_init_with_identity(&p);
     std::fs::write(p.join("app.py"), "def a():\n    return 1\n").unwrap();
     git(&["add", "."]);
     git(&["commit", "-qm", "init"]);
@@ -3979,16 +3721,7 @@ fn repositories_overview_lists_every_folder_and_a_pin_overrides_the_follow() {
             vec!["config", "user.email", "a@b"],
             vec!["config", "user.name", "a"],
         ] {
-            assert!(
-                std::process::Command::new("git")
-                    .args(["-C"])
-                    .arg(&dir)
-                    .args(&args)
-                    .status()
-                    .map(|s| s.success())
-                    .unwrap_or(false),
-                "git setup failed: {args:?}"
-            );
+            git_ok(&dir, &args);
         }
         std::fs::write(dir.join("f.txt"), "x\n").unwrap();
         dir
@@ -4082,15 +3815,7 @@ fn clicking_a_repositories_overview_row_switches_the_panel() {
             vec!["config", "user.email", "a@b"],
             vec!["config", "user.name", "a"],
         ] {
-            assert!(
-                std::process::Command::new("git")
-                    .args(["-C"])
-                    .arg(&dir)
-                    .args(&args)
-                    .status()
-                    .map(|s| s.success())
-                    .unwrap_or(false),
-            );
+            git_ok(&dir, &args);
         }
         std::fs::write(dir.join("f.txt"), "x\n").unwrap();
         dir
@@ -4140,19 +3865,8 @@ fn clicking_a_commit_graph_row_opens_the_commit_patch_tab() {
     use crossterm::event::{MouseButton, MouseEventKind};
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(tmp.path().join("a.txt"), "one\n").unwrap();
-    let git = |args: &[&str]| {
-        std::process::Command::new("git")
-            .arg("-C")
-            .arg(tmp.path())
-            .args(args)
-            .env("GIT_AUTHOR_NAME", "t")
-            .env("GIT_AUTHOR_EMAIL", "t@t")
-            .env("GIT_COMMITTER_NAME", "t")
-            .env("GIT_COMMITTER_EMAIL", "t@t")
-            .output()
-            .unwrap()
-    };
-    git(&["init", "-q"]);
+    let git = |args: &[&str]| git_succeeds(tmp.path(), args);
+    git_init(tmp.path());
     git(&["add", "-A"]);
     git(&["commit", "-qm", "first commit"]);
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
@@ -4291,7 +4005,7 @@ fn open_commit_for_line_shows_the_lines_commit_diff() {
 #[test]
 fn copy_commit_hash_for_line_copies_the_lines_commit() {
     let (tmp, mut app) = blamed_line_app();
-    let head = git_stdout_in(tmp.path(), &["rev-parse", "HEAD"]);
+    let head = git_stdout_untrimmed(tmp.path(), &["rev-parse", "HEAD"]);
     app.run_command(crate::widgets::command_palette::Command::GitCopyLineCommitHash);
     assert_eq!(crate::clipboard::last_copy().as_deref(), Some(head.trim()));
     assert_eq!(app.status, format!("Copied commit hash {}", &head[..8]));
@@ -4940,11 +4654,7 @@ fn accept_all_incoming_then_complete_merge_stages_the_resolved_file() {
         !disk.contains("<<<<<<<"),
         "the resolved file must be on disk, marker-free"
     );
-    let porcelain = std::process::Command::new("git")
-        .args(["-C", tmp.path().to_str().unwrap(), "status", "--porcelain"])
-        .output()
-        .unwrap();
-    let out = String::from_utf8_lossy(&porcelain.stdout).to_string();
+    let out = git_stdout_untrimmed(tmp.path(), &["status", "--porcelain"]);
     let line = out
         .lines()
         .find(|l| l.contains("shared.txt"))
@@ -5012,7 +4722,10 @@ fn a_hand_resolved_conflict_opens_as_its_own_result_and_completes() {
     assert!(!app.editor.dirty, "nothing in the file was replaced");
     app.complete_merge();
     assert!(app.status.contains("staged shared.txt"), "{}", app.status);
-    assert_eq!(git_out(tmp.path(), &["show", ":shared.txt"]), resolved);
+    assert_eq!(
+        git_stdout_untrimmed(tmp.path(), &["show", ":shared.txt"]),
+        resolved
+    );
 }
 
 /// #906: with one block resolved and a line added beside it, the merge
@@ -5051,8 +4764,14 @@ fn keeping_the_modified_side_of_a_modify_delete_stages_it() {
     let mut app = open_modify_delete(tmp.path(), true);
     app.run_command(crate::widgets::command_palette::Command::MergeAcceptAllCurrent);
     app.complete_merge();
-    assert_eq!(git_out(tmp.path(), &["show", ":gone.txt"]), "x\ny-main\n");
-    assert_eq!(git_out(tmp.path(), &["ls-files", "-u", "gone.txt"]), "");
+    assert_eq!(
+        git_stdout_untrimmed(tmp.path(), &["show", ":gone.txt"]),
+        "x\ny-main\n"
+    );
+    assert_eq!(
+        git_stdout_untrimmed(tmp.path(), &["ls-files", "-u", "gone.txt"]),
+        ""
+    );
     assert!(tmp.path().join("gone.txt").exists());
 }
 
@@ -5596,25 +5315,13 @@ fn scrubbing_shows_the_file_at_each_commit_and_its_changes() {
 /// text after each version.
 fn renamed_file_repo() -> (tempfile::TempDir, [&'static str; 3]) {
     let tmp = tempfile::tempdir().unwrap();
-    let git = |args: &[&str]| {
-        let ok = std::process::Command::new("git")
-            .arg("-C")
-            .arg(tmp.path())
-            .args(args)
-            .output()
-            .unwrap()
-            .status
-            .success();
-        assert!(ok, "git {args:?}");
-    };
+    let git = |args: &[&str]| git_ok(tmp.path(), args);
     let texts = [
         "def v1():\n    pass\n",
         "def v1():\n    pass\n\ndef v2():\n    pass\n",
         "def v1():\n    pass\n\ndef v2():\n    pass\n\ndef v3():\n    pass\n",
     ];
-    git(&["init", "-q", "-b", "main"]);
-    git(&["config", "user.email", "a@b"]);
-    git(&["config", "user.name", "a"]);
+    git_init_with_identity(tmp.path());
     std::fs::write(tmp.path().join("old.py"), texts[0]).unwrap();
     git(&["add", "old.py"]);
     git(&["commit", "-q", "-m", "v1 in old.py"]);
@@ -6131,20 +5838,8 @@ const PRICING_858: &str = "TAX_RATE = 0.21\nFREE_SHIPPING_OVER = 50\n\n\ndef shi
 fn pricing_repo_858(feature_pricing: &str) -> tempfile::TempDir {
     let tmp = tempfile::tempdir().unwrap();
     let p = tmp.path().to_path_buf();
-    let git = |args: &[&str]| {
-        let out = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&p)
-            .args(args)
-            .output()
-            .unwrap();
-        assert!(
-            out.status.success(),
-            "git setup step failed: {args:?}: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    };
-    git(&["init", "-q", "-b", "main"]);
+    let git = |args: &[&str]| git_ok(&p, args);
+    git_init(&p);
     for (key, value) in [
         ("user.email", "a@b"),
         ("user.name", "a"),
@@ -6286,12 +5981,9 @@ fn a_failed_scm_op_names_the_operation_and_git_s_error_line() {
     );
     one_line(&app);
 
-    crate::git::create_tag(tmp.path(), "v1", None).unwrap();
+    git_ok(tmp.path(), &["tag", "v1"]);
     app.dispatch_scm_action(ScmAction::CreateTag);
-    for c in "v1".chars() {
-        app.input_prompt.as_mut().unwrap().push_char(c);
-    }
-    app.submit_input_prompt();
+    append_and_submit_prompt(&mut app, "v1");
     // The optional message (#1582), left blank.
     app.submit_input_prompt();
     assert_eq!(
@@ -6301,9 +5993,7 @@ fn a_failed_scm_op_names_the_operation_and_git_s_error_line() {
     one_line(&app);
 
     // No upstream: a worker op, reported when it lands.
-    std::process::Command::new("git")
-        .arg("-C")
-        .arg(tmp.path())
+    test_git(tmp.path())
         .args(["checkout", "-q", "--", "."])
         .status()
         .unwrap();
@@ -6322,15 +6012,7 @@ fn a_failed_scm_op_names_the_operation_and_git_s_error_line() {
 #[test]
 fn a_pull_sync_or_stash_pop_stopped_on_a_conflict_names_the_conflict() {
     let tmp = make_committed_repo();
-    let git = |args: &[&str]| {
-        let out = std::process::Command::new("git")
-            .arg("-C")
-            .arg(tmp.path())
-            .args(args)
-            .output()
-            .unwrap();
-        assert!(out.status.success(), "git {args:?}");
-    };
+    let git = |args: &[&str]| git_ok(tmp.path(), args);
     std::fs::write(tmp.path().join("seed.txt"), "stashed\n").unwrap();
     git(&["stash", "-q"]);
     std::fs::write(tmp.path().join("seed.txt"), "committed\n").unwrap();
@@ -6531,23 +6213,6 @@ fn scm_feedback_paints_nothing_over_the_merge_editor() {
     assert_row_crosses_the_merge_panes_858(&app, row);
 }
 
-/// Run git in `dir` for a #858 fixture, asserting it succeeded.
-fn git_858(dir: &std::path::Path, args: &[&str]) -> String {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "git {args:?} in {}: {}",
-        dir.display(),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
-}
-
 /// Local settings for a #858 fixture repo: an identity, no signing and
 /// no push negotiation from the user's global config, and how `git pull`
 /// reconciles (`pull.rebase`).
@@ -6559,7 +6224,7 @@ fn configure_858(dir: &std::path::Path, pull_rebase: &str) {
         ("push.negotiate", "false"),
         ("pull.rebase", pull_rebase),
     ] {
-        git_858(dir, &["config", key, value]);
+        git_ok(dir, &["config", key, value]);
     }
 }
 
@@ -6580,21 +6245,21 @@ fn remote_858(pull_rebase: &str) -> Remote858 {
     let theirs = dir.path().join("theirs");
     let mine = dir.path().join("mine");
     std::fs::create_dir(&theirs).unwrap();
-    git_858(
+    git_ok(
         dir.path(),
         &["init", "-q", "--bare", "-b", "main", "remote.git"],
     );
-    git_858(&theirs, &["init", "-q", "-b", "main"]);
+    git_init(&theirs);
     configure_858(&theirs, "false");
     std::fs::write(theirs.join("f.txt"), "one\n").unwrap();
-    git_858(&theirs, &["add", "-A"]);
-    git_858(&theirs, &["commit", "-qm", "one"]);
-    git_858(
+    git_ok(&theirs, &["add", "-A"]);
+    git_ok(&theirs, &["commit", "-qm", "one"]);
+    git_ok(
         &theirs,
         &["remote", "add", "origin", bare.to_str().unwrap()],
     );
-    git_858(&theirs, &["push", "-q", "-u", "origin", "main"]);
-    git_858(dir.path(), &["clone", "-q", bare.to_str().unwrap(), "mine"]);
+    git_ok(&theirs, &["push", "-q", "-u", "origin", "main"]);
+    git_ok(dir.path(), &["clone", "-q", bare.to_str().unwrap(), "mine"]);
     configure_858(&mine, pull_rebase);
     Remote858 {
         _dir: dir,
@@ -6607,8 +6272,8 @@ fn remote_858(pull_rebase: &str) -> Remote858 {
 /// Commit `text` to `file` in `repo`.
 fn commit_858(repo: &std::path::Path, file: &str, text: &str) {
     std::fs::write(repo.join(file), text).unwrap();
-    git_858(repo, &["add", "-A"]);
-    git_858(repo, &["commit", "-qm", file]);
+    git_ok(repo, &["add", "-A"]);
+    git_ok(repo, &["commit", "-qm", file]);
 }
 
 /// #858: Pull reported git's whole text, "Pulled: Updating a..b\n
@@ -6619,7 +6284,7 @@ fn commit_858(repo: &std::path::Path, file: &str, text: &str) {
 fn a_fast_forward_pull_reports_fast_forward_on_one_line() {
     let r = remote_858("false");
     commit_858(&r.theirs, "f.txt", "one\ntwo\n");
-    git_858(&r.theirs, &["push", "-q"]);
+    git_ok(&r.theirs, &["push", "-q"]);
     let mut app = App::new(r.mine.clone()).unwrap();
     app.pull_source_control();
     wait_for_git_net(&mut app);
@@ -6645,7 +6310,7 @@ fn a_fast_forward_pull_reports_fast_forward_on_one_line() {
 fn a_rebasing_pull_reports_the_rebase_not_the_fetch() {
     let r = remote_858("true");
     commit_858(&r.theirs, "f.txt", "one\ntwo\n");
-    git_858(&r.theirs, &["push", "-q"]);
+    git_ok(&r.theirs, &["push", "-q"]);
     commit_858(&r.mine, "g.txt", "mine\n");
     let mut app = App::new(r.mine.clone()).unwrap();
     app.pull_source_control();
@@ -6677,9 +6342,9 @@ fn a_pull_that_is_already_up_to_date_still_says_so() {
 #[test]
 fn a_failed_or_conflicted_pull_still_says_why() {
     let r = remote_858("false");
-    git_858(&r.mine, &["config", "pull.ff", "only"]);
+    git_ok(&r.mine, &["config", "pull.ff", "only"]);
     commit_858(&r.theirs, "f.txt", "one\ntheirs\n");
-    git_858(&r.theirs, &["push", "-q"]);
+    git_ok(&r.theirs, &["push", "-q"]);
     commit_858(&r.mine, "f.txt", "one\nmine\n");
     let mut app = App::new(r.mine.clone()).unwrap();
     app.pull_source_control();
@@ -6691,7 +6356,7 @@ fn a_failed_or_conflicted_pull_still_says_why() {
     );
     assert_one_line_858(&app);
 
-    git_858(&r.mine, &["config", "pull.ff", "false"]);
+    git_ok(&r.mine, &["config", "pull.ff", "false"]);
     app.pull_source_control();
     wait_for_git_net(&mut app);
     assert!(app.source_control.commit_feedback_is_error);
@@ -6710,7 +6375,7 @@ fn a_failed_or_conflicted_pull_still_says_why() {
 fn a_sync_reports_both_halves_on_one_line() {
     let r = remote_858("false");
     commit_858(&r.theirs, "f.txt", "one\ntwo\n");
-    git_858(&r.theirs, &["push", "-q"]);
+    git_ok(&r.theirs, &["push", "-q"]);
     commit_858(&r.mine, "g.txt", "mine\n");
     let mut app = App::new(r.mine.clone()).unwrap();
     app.sync_source_control();
@@ -6784,7 +6449,7 @@ fn fetch_and_force_push_report_the_ref_update_not_the_url() {
     use crate::widgets::scm_menu::ScmAction;
     let r = remote_858("false");
     commit_858(&r.theirs, "f.txt", "one\ntwo\n");
-    git_858(&r.theirs, &["push", "-q"]);
+    git_ok(&r.theirs, &["push", "-q"]);
     let mut app = App::new(r.mine.clone()).unwrap();
     app.dispatch_scm_action(ScmAction::Fetch);
     wait_for_git_net(&mut app);
@@ -6795,10 +6460,10 @@ fn fetch_and_force_push_report_the_ref_update_not_the_url() {
     );
     assert_one_line_858(&app);
 
-    git_858(&r.mine, &["merge", "-q", "--ff-only", "origin/main"]);
+    git_ok(&r.mine, &["merge", "-q", "--ff-only", "origin/main"]);
     commit_858(&r.mine, "g.txt", "mine\n");
-    git_858(&r.mine, &["push", "-q"]);
-    git_858(
+    git_ok(&r.mine, &["push", "-q"]);
+    git_ok(
         &r.mine,
         &["commit", "-q", "--amend", "-m", "g.txt, reworded"],
     );
@@ -6821,7 +6486,7 @@ fn switching_branch_reports_one_line() {
     use crate::widgets::scm_menu::ScmAction;
     let tmp = make_committed_repo();
     configure_858(tmp.path(), "false");
-    git_858(tmp.path(), &["branch", "feature"]);
+    git_ok(tmp.path(), &["branch", "feature"]);
     std::fs::write(tmp.path().join("seed.txt"), "edited\n").unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.set_sidebar_view(SidebarView::SourceControl);
@@ -6834,11 +6499,11 @@ fn switching_branch_reports_one_line() {
     );
 
     // `main` moves on under the edit: switching back would overwrite it.
-    git_858(tmp.path(), &["stash", "-q"]);
-    git_858(tmp.path(), &["checkout", "-q", "main"]);
+    git_ok(tmp.path(), &["stash", "-q"]);
+    git_ok(tmp.path(), &["checkout", "-q", "main"]);
     commit_858(tmp.path(), "seed.txt", "main moved\n");
-    git_858(tmp.path(), &["checkout", "-q", "feature"]);
-    git_858(tmp.path(), &["stash", "pop", "-q"]);
+    git_ok(tmp.path(), &["checkout", "-q", "feature"]);
+    git_ok(tmp.path(), &["stash", "pop", "-q"]);
     pick_branch_858(&mut app, ScmAction::CheckoutTo, "main");
     assert!(app.source_control.commit_feedback_is_error);
     assert_eq!(
@@ -6855,10 +6520,10 @@ fn blocked_switch_repo_925() -> tempfile::TempDir {
     let tmp = make_committed_repo();
     configure_858(tmp.path(), "false");
     commit_858(tmp.path(), "seed.txt", "one\ntwo\nthree\nfour\nfive\n");
-    git_858(tmp.path(), &["checkout", "-qb", "feature"]);
-    git_858(tmp.path(), &["checkout", "-q", "main"]);
+    git_ok(tmp.path(), &["checkout", "-qb", "feature"]);
+    git_ok(tmp.path(), &["checkout", "-q", "main"]);
     commit_858(tmp.path(), "seed.txt", "ONE\ntwo\nthree\nfour\nfive\n");
-    git_858(tmp.path(), &["checkout", "-q", "feature"]);
+    git_ok(tmp.path(), &["checkout", "-q", "feature"]);
     std::fs::write(tmp.path().join("seed.txt"), "one\ntwo\nthree\nfour\nFIVE\n").unwrap();
     tmp
 }
@@ -6881,21 +6546,18 @@ fn a_switch_blocked_by_local_changes_offers_stash_and_checkout() {
     );
     app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
         .unwrap();
-    assert_eq!(
-        git_858(tmp.path(), &["branch", "--show-current"]),
-        "feature"
-    );
-    assert_eq!(git_858(tmp.path(), &["stash", "list"]), "");
+    assert_eq!(git_ok(tmp.path(), &["branch", "--show-current"]), "feature");
+    assert_eq!(git_ok(tmp.path(), &["stash", "list"]), "");
 
     pick_branch_858(&mut app, ScmAction::CheckoutTo, "main");
     app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
         .unwrap();
-    assert_eq!(git_858(tmp.path(), &["branch", "--show-current"]), "main");
+    assert_eq!(git_ok(tmp.path(), &["branch", "--show-current"]), "main");
     assert_eq!(
         std::fs::read_to_string(&seed).unwrap(),
         "ONE\ntwo\nthree\nfour\nfive\n"
     );
-    assert_eq!(git_858(tmp.path(), &["stash", "list"]).lines().count(), 1);
+    assert_eq!(git_ok(tmp.path(), &["stash", "list"]).lines().count(), 1);
     assert!(!app.source_control.commit_feedback_is_error);
     assert_eq!(app.status, "Stashed your changes and switched to main");
 }
@@ -6913,12 +6575,12 @@ fn migrate_changes_brings_the_blocked_edit_along() {
         .unwrap();
     app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
         .unwrap();
-    assert_eq!(git_858(tmp.path(), &["branch", "--show-current"]), "main");
+    assert_eq!(git_ok(tmp.path(), &["branch", "--show-current"]), "main");
     assert_eq!(
         std::fs::read_to_string(tmp.path().join("seed.txt")).unwrap(),
         "ONE\ntwo\nthree\nfour\nFIVE\n"
     );
-    assert_eq!(git_858(tmp.path(), &["stash", "list"]), "");
+    assert_eq!(git_ok(tmp.path(), &["stash", "list"]), "");
     assert_eq!(app.status, "Switched to main with your changes");
 }
 
@@ -6947,7 +6609,7 @@ fn migrate_changes_pops_its_own_stash_when_a_checkout_hook_stashes_too() {
         .unwrap();
     app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
         .unwrap();
-    assert_eq!(git_858(tmp.path(), &["branch", "--show-current"]), "main");
+    assert_eq!(git_ok(tmp.path(), &["branch", "--show-current"]), "main");
     assert_eq!(
         std::fs::read_to_string(tmp.path().join("seed.txt")).unwrap(),
         "ONE\ntwo\nthree\nfour\nFIVE\n"
@@ -6956,7 +6618,7 @@ fn migrate_changes_pops_its_own_stash_when_a_checkout_hook_stashes_too() {
         !tmp.path().join("hook.txt").exists(),
         "the hook's stash stays put"
     );
-    let stashes = git_858(tmp.path(), &["stash", "list"]);
+    let stashes = git_ok(tmp.path(), &["stash", "list"]);
     assert_eq!(stashes.lines().count(), 1, "{stashes}");
     assert!(stashes.contains("hook"), "{stashes}");
     assert_eq!(app.status, "Switched to main with your changes");
@@ -6977,13 +6639,13 @@ fn migrating_changes_that_conflict_names_the_conflict_and_keeps_the_stash() {
         .unwrap();
     app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
         .unwrap();
-    assert_eq!(git_858(tmp.path(), &["branch", "--show-current"]), "main");
+    assert_eq!(git_ok(tmp.path(), &["branch", "--show-current"]), "main");
     assert_eq!(
         app.status,
         "Switched to main \u{b7} Migrate changes: 1 conflict (seed.txt)"
     );
     assert!(app.source_control.commit_feedback_is_error);
-    assert_eq!(git_858(tmp.path(), &["stash", "list"]).lines().count(), 1);
+    assert_eq!(git_ok(tmp.path(), &["stash", "list"]).lines().count(), 1);
 }
 
 /// #925: git stashes the files on disk, so with an edit still only in a
@@ -7005,17 +6667,14 @@ fn stash_and_checkout_asks_to_save_an_unsaved_tab_first() {
         .unwrap();
     let pending = app.pending_unsaved_scm.as_ref().expect("the prompt opens");
     assert_eq!(pending.op, ScmWrite::StashAndSwitch);
-    assert_eq!(
-        git_858(tmp.path(), &["branch", "--show-current"]),
-        "feature"
-    );
-    assert_eq!(git_858(tmp.path(), &["stash", "list"]), "");
+    assert_eq!(git_ok(tmp.path(), &["branch", "--show-current"]), "feature");
+    assert_eq!(git_ok(tmp.path(), &["stash", "list"]), "");
     app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE))
         .unwrap();
     assert!(app.pending_unsaved_scm.is_none());
-    assert_eq!(git_858(tmp.path(), &["branch", "--show-current"]), "main");
+    assert_eq!(git_ok(tmp.path(), &["branch", "--show-current"]), "main");
     assert_eq!(
-        git_858(tmp.path(), &["show", "stash@{0}:seed.txt"]),
+        git_ok(tmp.path(), &["show", "stash@{0}:seed.txt"]),
         "zero\none\ntwo\nthree\nfour\nFIVE"
     );
     assert_eq!(app.status, "Stashed your changes and switched to main");
@@ -7038,14 +6697,14 @@ fn stash_and_checkout_stops_when_the_branch_changed_meanwhile() {
     app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
         .unwrap();
     assert!(app.pending_unsaved_scm.is_some(), "the prompt opens");
-    git_858(tmp.path(), &["switch", "-q", "-c", "elsewhere"]);
+    git_ok(tmp.path(), &["switch", "-q", "-c", "elsewhere"]);
     app.handle_key(key(KeyCode::Char('s'), KeyModifiers::NONE))
         .unwrap();
     assert_eq!(
-        git_858(tmp.path(), &["branch", "--show-current"]),
+        git_ok(tmp.path(), &["branch", "--show-current"]),
         "elsewhere"
     );
-    assert_eq!(git_858(tmp.path(), &["stash", "list"]), "");
+    assert_eq!(git_ok(tmp.path(), &["stash", "list"]), "");
     assert_eq!(
         app.status,
         "Stash & Checkout cancelled: the branch changed since the switch was refused"
@@ -7059,7 +6718,7 @@ fn stash_and_checkout_stops_when_the_branch_changed_meanwhile() {
 fn popping_a_stash_reports_the_dropped_entry_on_one_line() {
     let tmp = make_committed_repo();
     std::fs::write(tmp.path().join("seed.txt"), "stashed\n").unwrap();
-    git_858(tmp.path(), &["stash", "-q"]);
+    git_ok(tmp.path(), &["stash", "-q"]);
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.stash_pop_source_control();
     assert!(!app.source_control.commit_feedback_is_error);
@@ -7280,7 +6939,7 @@ fn staging_a_hunk_in_a_non_utf8_diff_is_refused() {
     app.stage_hunk_at_caret();
     assert!(app.status.contains("windows-1252"), "{}", app.status);
     assert_eq!(
-        git_stdout_in(tmp.path(), &["diff", "--cached", "--name-only"]),
+        git_stdout_untrimmed(tmp.path(), &["diff", "--cached", "--name-only"]),
         ""
     );
 }
@@ -7288,21 +6947,23 @@ fn staging_a_hunk_in_a_non_utf8_diff_is_refused() {
 /// #989: an App on the issue's repro, a merge stopped on a conflict.
 fn app_in_a_conflicted_merge() -> (App, tempfile::TempDir) {
     let tmp = tempfile::tempdir().unwrap();
-    let script = r#"set -e
-git init -q -b main && git config user.email a@b && git config user.name a
-printf '# Orders\n\nRun `python pricing.py`.\n' > README.md && git add . && git commit -qm init
-git checkout -qb hotfix && sed 's/python pricing.py/python -m pricing/' README.md > README.tmp && mv README.tmp README.md && git commit -qam fix
-git checkout -q main && sed 's/python pricing.py/uv run pricing.py/' README.md > README.tmp && mv README.tmp README.md && git commit -qam uv
-! git merge -q hotfix >/dev/null 2>&1"#;
-    let out = std::process::Command::new("sh")
-        .args(["-c", script])
-        .current_dir(tmp.path())
-        .output()
-        .unwrap();
+    let p = tmp.path();
+    let readme = |run: &str| {
+        std::fs::write(p.join("README.md"), format!("# Orders\n\nRun `{run}`.\n")).unwrap()
+    };
+    git_init_with_identity(p);
+    readme("python pricing.py");
+    git_ok(p, &["add", "."]);
+    git_ok(p, &["commit", "-qm", "init"]);
+    git_ok(p, &["checkout", "-qb", "hotfix"]);
+    readme("python -m pricing");
+    git_ok(p, &["commit", "-qam", "fix"]);
+    git_ok(p, &["checkout", "-q", "main"]);
+    readme("uv run pricing.py");
+    git_ok(p, &["commit", "-qam", "uv"]);
     assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
+        !git_succeeds(p, &["merge", "-q", "hotfix"]),
+        "the merge stops on the conflict"
     );
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.source_control.message = String::from("Merge hotfix");
@@ -7310,13 +6971,7 @@ git checkout -q main && sed 's/python pricing.py/uv run pricing.py/' README.md >
 }
 
 fn committed_readme(root: &std::path::Path) -> String {
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(root)
-        .args(["show", "HEAD:README.md"])
-        .output()
-        .unwrap();
-    String::from_utf8_lossy(&out.stdout).into_owned()
+    git_stdout_untrimmed(root, &["show", "HEAD:README.md"])
 }
 
 #[test]
@@ -7366,25 +7021,11 @@ fn nested_repo_1227() -> (tempfile::TempDir, std::path::PathBuf) {
     let tmp = tempfile::tempdir().unwrap();
     let sub = tmp.path().join("sub");
     std::fs::create_dir(&sub).unwrap();
-    for args in [
-        vec!["init", "-q", "-b", "main"],
-        vec!["config", "user.email", "a@b"],
-        vec!["config", "user.name", "a"],
-    ] {
-        let _ = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&sub)
-            .args(&args)
-            .status();
-    }
+    git_init_with_identity(&sub);
     let f = sub.join("plain.txt");
     std::fs::write(&f, "one\ntwo\n").unwrap();
     for args in [vec!["add", "."], vec!["commit", "-m", "plain", "--quiet"]] {
-        let _ = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&sub)
-            .args(&args)
-            .status();
+        let _ = git_succeeds(&sub, &args);
     }
     (tmp, f)
 }
@@ -7455,9 +7096,7 @@ fn repo_with_moved_dirty_submodule() -> (tempfile::TempDir, std::path::PathBuf) 
     let app = tmp.path().join("app");
     for dir in [&lib, &app] {
         std::fs::create_dir_all(dir).unwrap();
-        git_ok(dir, &["init", "-q", "-b", "main"]);
-        git_ok(dir, &["config", "user.email", "a@b"]);
-        git_ok(dir, &["config", "user.name", "a"]);
+        git_init_with_identity(dir);
     }
     std::fs::write(lib.join("lib.txt"), "v1\n").unwrap();
     git_ok(&lib, &["add", "."]);
@@ -7519,7 +7158,7 @@ fn clicking_a_changed_submodule_shows_its_diff() {
 #[test]
 fn discarding_a_submodule_refuses_instead_of_claiming_success() {
     let (_tmp, root) = repo_with_moved_dirty_submodule();
-    let inner_head = git_out(&root.join("lib"), &["rev-parse", "HEAD"]);
+    let inner_head = git_stdout_untrimmed(&root.join("lib"), &["rev-parse", "HEAD"]);
     let mut app = App::new(root.clone()).unwrap();
     app.pending_discard = Some(PendingDiscard {
         rel_path: "lib".into(),
@@ -7534,7 +7173,7 @@ fn discarding_a_submodule_refuses_instead_of_claiming_success() {
     );
     assert!(app.status.contains("submodule"), "status: {}", app.status);
     assert_eq!(
-        git_out(&root.join("lib"), &["rev-parse", "HEAD"]),
+        git_stdout_untrimmed(&root.join("lib"), &["rev-parse", "HEAD"]),
         inner_head
     );
     assert_eq!(
@@ -7609,30 +7248,17 @@ fn clone_with_two_remotes() -> (tempfile::TempDir, std::path::PathBuf) {
     let tmp = tempfile::tempdir().unwrap();
     let up = tmp.path().join("up");
     std::fs::create_dir(&up).unwrap();
-    git_checked(&up, &["init", "-q", "-b", "main"]);
-    git_checked(
-        &up,
-        &[
-            "-c",
-            "user.name=a",
-            "-c",
-            "user.email=a@b",
-            "commit",
-            "-q",
-            "--allow-empty",
-            "-m",
-            "i",
-        ],
-    );
-    git_checked(&up, &["branch", "feat"]);
+    git_init(&up);
+    git_ok(&up, &["commit", "-q", "--allow-empty", "-m", "i"]);
+    git_ok(&up, &["branch", "feat"]);
     let fork = tmp.path().join("fork");
-    git_checked(tmp.path(), &["clone", "-q", "up", "fork"]);
-    git_checked(&fork, &["branch", "solo"]);
-    git_checked(tmp.path(), &["clone", "-q", "up", "clone"]);
+    git_ok(tmp.path(), &["clone", "-q", "up", "fork"]);
+    git_ok(&fork, &["branch", "solo"]);
+    git_ok(tmp.path(), &["clone", "-q", "up", "clone"]);
     let clone = tmp.path().join("clone");
-    git_checked(&clone, &["remote", "add", "upstream", "../up"]);
-    git_checked(&clone, &["remote", "add", "my/fork", "../fork"]);
-    git_checked(&clone, &["fetch", "-q", "--all"]);
+    git_ok(&clone, &["remote", "add", "upstream", "../up"]);
+    git_ok(&clone, &["remote", "add", "my/fork", "../fork"]);
+    git_ok(&clone, &["fetch", "-q", "--all"]);
     (tmp, clone)
 }
 
@@ -7682,9 +7308,9 @@ fn picking_a_branch_on_two_remotes_tracks_the_remote_picked() {
         "the switch worked: {}",
         app.status
     );
-    assert_eq!(git_checked(&clone, &["branch", "--show-current"]), "feat");
+    assert_eq!(git_ok(&clone, &["branch", "--show-current"]), "feat");
     assert_eq!(
-        git_checked(&clone, &["rev-parse", "--abbrev-ref", "feat@{upstream}"]),
+        git_ok(&clone, &["rev-parse", "--abbrev-ref", "feat@{upstream}"]),
         "upstream/feat"
     );
 }
@@ -7700,9 +7326,9 @@ fn a_remote_named_with_a_slash_checks_out_its_branch() {
         "the switch worked: {}",
         app.status
     );
-    assert_eq!(git_checked(&clone, &["branch", "--show-current"]), "solo");
+    assert_eq!(git_ok(&clone, &["branch", "--show-current"]), "solo");
     assert_eq!(
-        git_checked(&clone, &["rev-parse", "--abbrev-ref", "solo@{upstream}"]),
+        git_ok(&clone, &["rev-parse", "--abbrev-ref", "solo@{upstream}"]),
         "my/fork/solo"
     );
 }
@@ -7712,7 +7338,7 @@ fn a_remote_named_with_a_slash_checks_out_its_branch() {
 #[test]
 fn a_local_branch_hides_its_remotes_and_switches_plainly() {
     let (_tmp, clone) = clone_with_two_remotes();
-    git_checked(&clone, &["switch", "-q", "-c", "side"]);
+    git_ok(&clone, &["switch", "-q", "-c", "side"]);
     let mut app = App::new(clone.clone()).unwrap();
     app.open_branch_picker();
     let shown: Vec<String> = app
@@ -7727,7 +7353,7 @@ fn a_local_branch_hides_its_remotes_and_switches_plainly() {
     drop(app);
     let app = pick_branch(&clone, "main");
     assert!(app.branch_picker.is_none(), "{}", app.status);
-    assert_eq!(git_checked(&clone, &["branch", "--show-current"]), "main");
+    assert_eq!(git_ok(&clone, &["branch", "--show-current"]), "main");
 }
 
 /// A modified file whose tab has unsaved edits, opened from Source Control
@@ -7847,16 +7473,10 @@ fn hunk_actions_refuse_a_source_control_diff_of_unsaved_text() {
         app.status,
         "Save the file first: hunk actions apply to the file on disk"
     );
-    let staged = std::process::Command::new("git")
-        .arg("-C")
-        .arg(tmp.path())
-        .args(["diff", "--cached", "--name-only"])
-        .output()
-        .unwrap();
+    let staged = git_stdout_untrimmed(tmp.path(), &["diff", "--cached", "--name-only"]);
     assert!(
-        staged.stdout.is_empty(),
-        "unsaved text must never reach the index: {}",
-        String::from_utf8_lossy(&staged.stdout)
+        staged.is_empty(),
+        "unsaved text must never reach the index: {staged}"
     );
 }
 
@@ -7958,11 +7578,10 @@ fn copy_permalink_puts_the_selected_lines_link_on_the_clipboard() {
 fn copy_permalink_refuses_an_unpushed_commit() {
     use crate::widgets::command_palette::Command;
     let (mut app, tmp, sha) = app_on_a_pushed_github_file();
-    let _ = std::process::Command::new("git")
-        .arg("-C")
-        .arg(tmp.path())
-        .args(["update-ref", "-d", "refs/remotes/origin/main"])
-        .status();
+    let _ = git_succeeds(
+        tmp.path(),
+        &["update-ref", "-d", "refs/remotes/origin/main"],
+    );
     crate::clipboard::test_clip::mock_write("before");
     app.run_command(Command::GitCopyPermalink);
     assert_eq!(

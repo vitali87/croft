@@ -995,28 +995,9 @@ fn drift_hint_arms_the_updater_only_while_idle() {
 #[test]
 fn drift_probe_verdict_arms_the_rebuild_hint() {
     let repo = tempfile::tempdir().unwrap();
-    let git = |args: &[&str]| {
-        let out = std::process::Command::new("git")
-            .arg("-C")
-            .arg(repo.path())
-            .args(args)
-            .output()
-            .unwrap();
-        assert!(out.status.success(), "git {args:?} failed");
-        String::from_utf8(out.stdout).unwrap().trim().to_string()
-    };
-    git(&["init", "-q"]);
-    git(&[
-        "-c",
-        "user.email=t@t",
-        "-c",
-        "user.name=t",
-        "commit",
-        "-q",
-        "--allow-empty",
-        "-m",
-        "one",
-    ]);
+    let git = |args: &[&str]| git_ok(repo.path(), args);
+    git_init(repo.path());
+    git(&["commit", "-q", "--allow-empty", "-m", "one"]);
     let head = git(&["rev-parse", "--short", "HEAD"]);
 
     let tmp = tempfile::tempdir().unwrap();

@@ -2753,19 +2753,8 @@ fn a_failed_spawner_releases_the_lock_so_another_window_can_host() {
 fn status_elision_never_fires_on_a_message_that_fits() {
     let tmp = tempfile::tempdir().unwrap();
     // A git repo puts the branch segment in the bar, like any real session.
-    let git = |args: &[&str]| {
-        std::process::Command::new("git")
-            .arg("-C")
-            .arg(tmp.path())
-            .args(args)
-            .env("GIT_AUTHOR_NAME", "t")
-            .env("GIT_AUTHOR_EMAIL", "t@t")
-            .env("GIT_COMMITTER_NAME", "t")
-            .env("GIT_COMMITTER_EMAIL", "t@t")
-            .output()
-            .unwrap()
-    };
-    git(&["init", "-q", "-b", "main"]);
+    let git = |args: &[&str]| git_succeeds(tmp.path(), args);
+    git_init(tmp.path());
     std::fs::write(tmp.path().join("a.txt"), "x\n").unwrap();
     git(&["add", "-A"]);
     git(&["commit", "-qm", "init"]);
@@ -4409,4 +4398,88 @@ fn dismissing_the_panel_alignment_picker_keeps_the_alignment() {
         .unwrap();
     assert!(app.list_picker.is_none());
     assert_eq!(app.panel_alignment, PanelAlignment::Right);
+}
+
+/// #2068: the row under the mouse in PROBLEMS, OUTPUT, PORTS and CAPTURES
+/// lights up on every move and goes dark when the pointer leaves, as in the
+/// side bar. These panels read a pointer copied in only at focus changes, so
+/// the highlight stuck on whatever row the pointer was over then.
+#[test]
+fn bottom_panel_hover_follows_the_pointer() {
+    use crate::widgets::ports::PortOrigin;
+    use crossterm::event::MouseEventKind;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    for tab in [
+        BottomPanelTab::Problems,
+        BottomPanelTab::Output,
+        BottomPanelTab::Ports,
+        BottomPanelTab::Captures,
+    ] {
+        app.bottom_panel_tab = tab;
+        draw(&mut app, 140, 50);
+        for (x, y) in [(3, 45), (9, 47), (100, 2)] {
+            app.handle_mouse(mouse(MouseEventKind::Moved, x, y));
+            draw(&mut app, 140, 50);
+            let fed = match tab {
+                BottomPanelTab::Problems => app.problems.hover_pointer,
+                BottomPanelTab::Output => app.output.hover_pointer,
+                BottomPanelTab::Ports => app.ports.hover_pointer,
+                _ => app.captures.hover_pointer,
+            };
+            assert_eq!(
+                fed,
+                Some((x, y)),
+                "{tab:?} draws with the pointer of the last move"
+            );
+        }
+    }
+
+    // What the user sees: PORTS fills the row under the pointer, and no other
+    // row but the selected one, with the selected row's colour. Rows two and
+    // three, clear of the selected first row.
+    for port in [3000, 3001, 3002] {
+        app.ports
+            .upsert(port, None, None, PortOrigin::Remote("box".into()));
+    }
+    app.bottom_panel_tab = BottomPanelTab::Ports;
+    draw(&mut app, 140, 50);
+    let area = app.ports.last_area;
+    let (x, second, third) = (area.x + 2, area.y + 2, area.y + 3);
+    let lift = crate::gradient::rgb_color(crate::gradient::POPUP_SEL_BG);
+    let lit = |app: &mut App, at: Option<(u16, u16)>| {
+        if let Some((px, py)) = at {
+            app.handle_mouse(mouse(MouseEventKind::Moved, px, py));
+        }
+        let buf = draw_buffer(app, 140, 50);
+        (buf[(x, second)].bg == lift, buf[(x, third)].bg == lift)
+    };
+    assert_eq!(lit(&mut app, Some((x, second))), (true, false));
+    assert_eq!(
+        lit(&mut app, Some((x, third))),
+        (false, true),
+        "the lift follows the pointer"
+    );
+    assert_eq!(
+        lit(&mut app, Some((x, 2))),
+        (false, false),
+        "and leaves with it"
+    );
+}
+
+/// #2068: with the secondary side bar open, the Explorer's own OUTLINE
+/// section shows the Explorer's focus. The secondary bar drew its Outline
+/// unfocused by clearing the flag both share, every frame, and never put
+/// it back.
+#[test]
+fn the_secondary_side_bar_leaves_the_explorer_outline_s_focus_alone() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.secondary_side_bar_visible = true;
+    app.set_sidebar_view(SidebarView::Explorer);
+    draw(&mut app, 140, 40);
+    assert!(app.outline.focused, "the Explorer has focus");
+    app.focus_pane(Pane::Editor);
+    draw(&mut app, 140, 40);
+    assert!(!app.outline.focused, "and then it does not");
 }

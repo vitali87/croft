@@ -2265,10 +2265,6 @@ fn the_settings_editor_asks_for_a_number_and_refuses_one_that_is_not() {
     assert_eq!(written["terminal_scrollback"], serde_json::json!(5000));
 }
 
-fn written_settings(cfg: &std::path::Path) -> serde_json::Value {
-    serde_json::from_str(&std::fs::read_to_string(cfg.join("config.json")).unwrap()).unwrap()
-}
-
 /// #1555: Enter on the unset UI language picks a language in place; it used
 /// to close the editor and open `config.json` at line 1.
 #[test]
@@ -2280,7 +2276,7 @@ fn enter_on_the_unset_language_picks_one_in_the_editor() {
     app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
         .unwrap();
     assert!(app.settings_editor.is_some(), "still in the editor");
-    let lang = written_settings(cfg.path())["locale"].clone();
+    let lang = user_config(cfg.path())["locale"].clone();
     assert!(lang.is_string(), "a language was set: {lang}");
     let row = app
         .settings_editor
@@ -2314,11 +2310,11 @@ fn an_unset_number_setting_takes_a_number_and_an_empty_entry_unsets_it() {
     app.close_input_prompt();
     app.submit_setting_value("terminal_rewind_mb", "500");
     assert_eq!(
-        written_settings(cfg.path())["terminal_rewind_mb"],
+        user_config(cfg.path())["terminal_rewind_mb"],
         serde_json::json!(500)
     );
     app.submit_setting_value("terminal_rewind_mb", "");
-    let written = written_settings(cfg.path());
+    let written = user_config(cfg.path());
     assert!(
         written.get("terminal_rewind_mb").is_none(),
         "unset, so its default applies: {written}"
@@ -2341,7 +2337,7 @@ fn a_value_the_setting_cannot_hold_is_refused() {
         .unwrap();
     assert!(app.input_prompt.is_none(), "a choice: no free text to type");
     assert_eq!(
-        written_settings(cfg.path())["code_scanning"],
+        user_config(cfg.path())["code_scanning"],
         serde_json::json!("on")
     );
 }
@@ -2421,7 +2417,7 @@ fn confirming_an_empty_review_prefix_keeps_it_empty() {
     app.close_input_prompt();
     app.submit_setting_value("review_ai_prefix", &value);
     assert_eq!(
-        written_settings(cfg.path())["review_ai_prefix"],
+        user_config(cfg.path())["review_ai_prefix"],
         serde_json::json!("")
     );
 }

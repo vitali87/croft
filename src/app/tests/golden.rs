@@ -1226,7 +1226,7 @@ fn search_view_with_results() {
 /// fixture's, so the scene could only time out. Settings passed in the
 /// environment outrank the repository's own config, so a `log.decorate`
 /// there would change what COMMITS shows.
-fn refuse_inherited_git_state() {
+pub(super) fn refuse_inherited_git_state() {
     for var in [
         "GIT_DIR",
         "GIT_WORK_TREE",
@@ -1251,21 +1251,16 @@ fn refuse_inherited_git_state() {
     }
 }
 
-/// Run `git` in `dir` as a fixed author and committer on a fixed date,
-/// reading no configuration but the repository's own and running no hook,
-/// so the commit (and its hash) is the same on every machine. The date is
-/// in 2099, past any clock this suite runs on: COMMITS can show a commit's
-/// age, which a past date would grow by a year every year; a future one
-/// clamps to `0 seconds ago`, every run.
+/// Run `git` in `dir` through [`test_git`] as a fixed author and committer
+/// on a fixed date, running no hook, so the commit (and its hash) is the
+/// same on every machine. The date is in 2099, past any clock this suite
+/// runs on: COMMITS can show a commit's age, which a past date would grow
+/// by a year every year; a future one clamps to `0 seconds ago`, every run.
 fn hermetic_git(dir: &Path, args: &[&str]) {
     const WHEN: &str = "2099-01-01T00:00:00+00:00";
-    let out = std::process::Command::new("git")
-        .arg("-C")
-        .arg(dir)
+    let out = test_git(dir)
         .args(["-c", "core.hooksPath=/dev/null"])
         .args(args)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_AUTHOR_NAME", "Golden Author")
         .env("GIT_AUTHOR_EMAIL", "author@example.invalid")
         .env("GIT_AUTHOR_DATE", WHEN)

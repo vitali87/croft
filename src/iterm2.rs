@@ -180,10 +180,11 @@ const CMD_SHIFT_X_HEX: &str = "0x1b 0x5b 0x38 0x38 0x3b 0x31 0x30 0x75";
 /// 86), virtualKeyCode `kVK_ANSI_V` = 0x09. CSI-u `ESC [ 86 ; 10 u`.
 const CMD_SHIFT_V_KEY: &str = "0x56-0x120000-0x9";
 const CMD_SHIFT_V_HEX: &str = "0x1b 0x5b 0x38 0x36 0x3b 0x31 0x30 0x75";
-/// `Cmd+Shift+L` — disconnect a remote session and drop back into the local
-/// croft. Codepoint 'L' (0x4c = 76), virtualKeyCode `kVK_ANSI_L` = 0x25.
-/// CSI-u `ESC [ 76 ; 10 u`. Forwarded defensively so AppKit / iTerm2 cannot
-/// consume the chord before the remote croft's handler sees it.
+/// `Cmd+Shift+L` — Select All Occurrences of Find Match, locally and on a
+/// remote session alike (Drop to Local, which once took it on a remote
+/// session, is `Cmd+K L`, #2071). Codepoint 'L' (0x4c = 76), virtualKeyCode
+/// `kVK_ANSI_L` = 0x25. CSI-u `ESC [ 76 ; 10 u`. Forwarded defensively so
+/// AppKit / iTerm2 cannot consume the chord before croft's handler sees it.
 const CMD_SHIFT_L_KEY: &str = "0x4c-0x120000-0x25";
 const CMD_SHIFT_L_HEX: &str = "0x1b 0x5b 0x37 0x36 0x3b 0x31 0x30 0x75";
 /// `Cmd+Shift+N` — Explorer "New Folder". Codepoint 'N' (0x4e = 78),
@@ -1626,7 +1627,7 @@ mod tests {
             (
                 CMD_SHIFT_L_KEY,
                 CMD_SHIFT_L_HEX,
-                "Cmd+Shift+L (disconnect remote, drop to local)",
+                "Cmd+Shift+L (select all occurrences)",
             ),
         ] {
             assert_eq!(

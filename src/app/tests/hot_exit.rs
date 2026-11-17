@@ -131,8 +131,7 @@ fn draw_and_cursor(
     ratatui::Terminal<ratatui::backend::TestBackend>,
     ratatui::layout::Position,
 ) {
-    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
-    term.draw(|f| app.render(f)).unwrap();
+    let mut term = draw_terminal(app, 100, 30);
     let pos = term.get_cursor_position().unwrap();
     (term, pos)
 }
@@ -398,7 +397,7 @@ fn without_a_dialog_the_editor_is_announced_and_mode_off_stays_quiet() {
 fn a_run_block_confirm_over_the_broadcast_one_takes_the_key() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = markdown_fence_app(tmp.path());
-    assert!(run_from_palette(
+    assert!(run_palette_row_titled(
         &mut app,
         "Markdown: Run Code Block at Cursor"
     ));
@@ -2750,4 +2749,25 @@ fn an_unsaved_edit_after_reopen_as_text_is_still_backed_up() {
             .unwrap()
             .starts_with("xtop")
     );
+}
+
+/// #2068: a restored session that had the editor focused draws the editor
+/// focused, not the Explorer. Restoring set the focus without the flags each
+/// pane draws from, so keys went to an editor drawn as unfocused.
+#[test]
+fn a_restored_editor_focus_is_drawn_on_the_editor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let p = tmp.path().join("a.txt");
+    std::fs::write(&p, "one\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&p).unwrap();
+    app.focus_pane(Pane::Editor);
+    let state = app.capture_session_state();
+
+    let mut next = App::new(tmp.path().to_path_buf()).unwrap();
+    assert!(next.tree.focused, "a new window starts in the Explorer");
+    next.apply_session_state(&state);
+    assert!(next.focus == Pane::Editor, "keys go to the editor");
+    assert!(next.editor.focused, "the editor draws focused");
+    assert!(!next.tree.focused, "the Explorer does not");
 }
