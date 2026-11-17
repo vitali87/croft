@@ -884,18 +884,26 @@ def add_arch_row(text, file, t=APP, desc=None):
     lines = text.split("\n")
     tree = t.tree
     name = f"{file}.rs"
-    if any(ln.startswith(f"{tree.row}{name} ") for ln in lines):
-        return text
     start = next((n for n, ln in enumerate(lines) if ln.startswith(tree.anchor)), None)
     if start is None:
         raise ManifestError(f"{ARCH} has no row starting {tree.anchor.strip()!r} to list {name} by")
+    folder = tree.folder and lines[start + 1].startswith(tree.folder.split("/")[0] + "/")
     if tree.folder:
-        if not lines[start + 1].startswith(tree.folder.split("/")[0] + "/"):
-            lines.insert(start + 1, tree.folder)
         start += 1
     row = re.compile("^" + re.escape(tree.row) + r"(\S+)")
+    # Only the target's own rows count: another folder (the editor's beside
+    # the terminal's) lists its files with the same indentation.
+    end = start + 1
+    while end < len(lines) and row.match(lines[end]):
+        end += 1
+    if (folder or not tree.folder) and any(
+            ln.startswith(f"{tree.row}{name} ") for ln in lines[start + 1:end]):
+        return text
+    if tree.folder and not folder:
+        lines.insert(start, tree.folder)
+        end = start + 1
     n = start + 1
-    while n < len(lines) and (m := row.match(lines[n])) and m.group(1) < name \
+    while n < end and (m := row.match(lines[n])) and m.group(1) < name \
             and not m.group(1).endswith("/"):
         n += 1
     text_ = t.files[file][2] if desc is None else desc
