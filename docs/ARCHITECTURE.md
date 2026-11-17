@@ -30,6 +30,7 @@ src/
 ├── git.rs                branch / dirty / ahead-behind status plus the working-tree operations the Source Control panel drives; multi-root, one `GitWorker` per workspace root
 ├── git/                  git's feature files, beside git.rs; each file's `//!` doc says what it holds
 │   ├── changes.rs        changed files from `git status --porcelain`: kind, section and badge; Explorer decorations; line counts
+│   ├── contents.rs       a file at HEAD, a commit or an index stage; a conflict re-merged in diff3 style; a path's clean/smudge filter
 │   ├── operations.rs     a merge, rebase, cherry-pick, revert or bisect in progress; continuing, skipping or aborting it
 │   ├── status.rs         the status snapshot: branch, ahead/behind, changes, ignored paths, the prepared commit message, repositories one folder down
 │   ├── tests.rs          git.rs's own tests
