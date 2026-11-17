@@ -138,6 +138,32 @@ impl App {
         self.test_root_pending = None;
     }
 
+    /// Bind the Testing stack to the folder the focused file follows, working
+    /// it out here when the per-tick follow has not answered for this focus
+    /// yet (#1973). For run gestures: while the thread works, the stack is
+    /// still bound to the folder of the file focused before, and a run must
+    /// never go there. Whether it rebound.
+    pub(super) fn settle_followed_test_root(&mut self) -> bool {
+        let root = self.active_workspace_root();
+        let key = (root.clone(), self.editor.path.clone());
+        if self
+            .test_root_follow
+            .as_ref()
+            .is_some_and(|(k, _)| *k == key)
+        {
+            return false;
+        }
+        // Answered here instead: whatever the thread sends back was asked
+        // for this focus or an earlier one.
+        self.test_root_pending = None;
+        let found = self.followed_test_root(root);
+        if found == self.active_test_root {
+            return false;
+        }
+        self.rebind_test_root(found);
+        true
+    }
+
     /// Resolve the followed Testing folder afresh and rebind to it if it
     /// moved (#1520): a runner enabled or a package marker added since the
     /// focus last changed can change the answer the cache still holds.
@@ -219,6 +245,7 @@ impl App {
     /// runner still ran (and rebuilt) the workspace, and a disabled Python
     /// runner ran cargo in a directory with no Cargo.toml.
     pub(super) fn testing_runner_available(&mut self) -> bool {
+        self.settle_followed_test_root();
         if crate::testing::worker::runner_for(&self.extensions_dir(), &self.active_test_root)
             .is_some()
         {

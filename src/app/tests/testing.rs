@@ -372,6 +372,42 @@ fn the_testing_folder_is_worked_out_off_the_ui_thread() {
     assert_eq!(app.test_worker.root(), pkg);
 }
 
+/// #1973 review: a run asked for while the follow for a newly focused file
+/// is still being worked out must run in that file's package, not in the
+/// one the stack is still bound to from the file focused before.
+#[test]
+fn a_run_before_the_follow_answers_goes_to_the_focused_package() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::write(
+        root.join("package.json"),
+        r#"{"name":"vmono","private":true,"workspaces":["packages/*"]}"#,
+    )
+    .unwrap();
+    for (name, marker) in [("math", "vitest.config.ts"), ("web", "jest.config.js")] {
+        let pkg = root.join("packages").join(name);
+        std::fs::create_dir_all(pkg.join("src")).unwrap();
+        std::fs::write(pkg.join(marker), "export default {};\n").unwrap();
+        std::fs::write(pkg.join("src/a.test.ts"), "test('a', () => {});\n").unwrap();
+    }
+    let mut app = App::new(root.clone()).unwrap();
+    settle_test_root(&mut app);
+    assert_eq!(app.active_test_root, root.join("packages/math"));
+
+    app.editor
+        .open_pinned(&root.join("packages/web/src/a.test.ts"))
+        .unwrap();
+    app.drain_git_responses();
+    assert_eq!(
+        app.active_test_root,
+        root.join("packages/math"),
+        "the tick only asked; the stack is still on the package before"
+    );
+    assert!(app.testing_runner_available(), "{}", app.status);
+    assert_eq!(app.active_test_root, root.join("packages/web"));
+    assert_eq!(app.test_worker.root(), root.join("packages/web"));
+}
+
 /// #1520 review: the followed package is cached per focused file, so a
 /// runner marker added while the same file stays open must still be picked
 /// up by the next Testing refresh or run gesture, not only by a focus change.
