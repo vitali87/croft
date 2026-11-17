@@ -291,6 +291,18 @@ src/
     ├── symbol_picker.rs VS Code "Go to Symbol in Editor" (Cmd/Ctrl+Shift+O): a fuzzy picker over the active file's outline symbols (kind-iconed, depth-indented); a `:` prefix switches to Go to Line; the App jumps via go_to_definition
     ├── workspace_symbols.rs  Go to Symbol in Workspace picker: query fans out to every running server as `workspace/symbol`, rows show kind icon, name and workspace-relative path; Enter opens the definition
     ├── terminal.rs           `portable-pty` + `alacritty_terminal` + ratatui integration: the embedded terminal with selection, scrollback, drag-reorderable panes and maximize mode
+    ├── terminal/             the terminal pane's feature files, beside terminal.rs; each file's `//!` doc says what it holds
+    │   ├── annotations.rs   notes pinned to output; revealing a masked secret
+    │   ├── backend.rs       the local pty or session host behind a pane: output waits, resize, exit, shutdown
+    │   ├── captures.rs      spotting screen clears, keeping the rows they wipe, the rewind buffer
+    │   ├── clock.rs         the scroll clock that keeps selections and notes in place; each row's print time
+    │   ├── commands.rs      shell-integration marks, finished commands and their decorations, prompt jumps, the typed prompt line
+    │   ├── mouse.rs         mouse reporting to the program in the pane; which grid cell a screen point is
+    │   ├── processes.rs     the shell and foreground process: names, command lines, working directories, `cd`
+    │   ├── selection.rs     selections: make, extend, clear, words and blocks, keep them on their text as output scrolls; the selected text
+    │   ├── shell_env.rs     the shell's start-up environment: integration for each shell, terminal and locale variables, croft's helpers on PATH
+    │   ├── spawn.rs         starting a pane: spawn or attach, the output reader thread, replaying a saved transcript
+    │   ├── tests.rs         the terminal pane's own tests
     ├── update_popup.rs   the update popup as a card in the manner of Ghostty's: glyph and title, a label / value grid of the release, rounded pill buttons with the one primary action flush right, and a link row under a divider; framed per theme (gradient box, `surfaces` card, accent line) and pure, handing back where each control landed
     ├── timeline.rs      collapsible TIMELINE section: the active file's git history (`git log --follow`) fetched off-thread, two rows per commit (summary + author/age), click-to-open the commit's diff; a ⋯-menu Explorer sub-view
     └── zoxide_jump.rs   Cmd+Z zoxide jump popup: fuzzy directory jumper that re-roots + cd's the terminal

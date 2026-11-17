@@ -1,0 +1,301 @@
+# Stage B of the refactor program (#2062): where each item of src/widgets/terminal.rs goes.
+# One row per item, in file order. pr 0 means the item stays in terminal.rs; the others
+# move to src/widgets/terminal/<file>.rs in that PR. kind, impl and name are as
+# `scripts/check_pure_move.py list` prints them. Run
+# `scripts/move_items.py --target terminal --check` after adding an item to terminal.rs.
+# A struct whose private fields other files read (and the tests do) stays in terminal.rs,
+# where every file under terminal/ and the tests can still read them; its methods move.
+pr	file	kind	impl	name
+0		const	-	SCROLLBACK_LINES
+1	mouse	enum	-	MouseButtonKind
+1	mouse	enum	-	MouseAction
+1	mouse	struct	-	MouseMods
+2	selection	struct	-	Selection
+0		struct	-	AltSelAnchor
+2	selection	fn	impl Selection	new
+2	selection	fn	impl Selection	normalised
+2	selection	fn	impl Selection	block_bounds
+2	selection	fn	impl Selection	has_area
+0		struct	-	VoidListener
+9	spawn	fn	impl EventListener for VoidListener	send_event
+3	clock	const	-	STALL_GAP_MS
+0		struct	-	ScrollClock
+3	clock	fn	impl ScrollClock	new
+3	clock	fn	impl ScrollClock	plant_tracer
+3	clock	fn	impl ScrollClock	tracer_line
+3	clock	fn	impl ScrollClock	now
+3	clock	fn	impl ScrollClock	tick
+4	captures	struct	-	WipeSniffer
+4	captures	const	-	WIPE_CARRY_MAX
+0		struct	-	Wipe
+4	captures	fn	impl WipeSniffer	scan
+3	clock	fn	-	stamp_chunk
+0		struct	-	PaneAnnotation
+11	text	type	-	ScreenAnsi
+0		struct	-	PtyTerminal
+0		struct	-	StoredImage
+14	images	struct	-	PaneImage
+14	images	const	-	IMAGES_MAX
+4	captures	const	-	CAPTURE_SLACK
+15	overlays	struct	-	HintSpan
+6	commands	static	-	NEXT_MARK_ID
+6	commands	fn	-	next_mark_id
+0		struct	-	StoredMark
+6	commands	struct	-	FinishedCommand
+6	commands	const	-	FINISHED_OUTPUT_CAP_LINES
+0		struct	-	RunningCommand
+6	commands	fn	impl RunningCommand	follow_wipe
+9	spawn	enum	-	ReadStop
+0		struct	-	CaptureRows
+0		struct	-	CapturedRow
+4	captures	enum	-	RowAt
+4	captures	fn	impl CaptureRows	record
+4	captures	fn	impl CaptureRows	line
+4	captures	fn	impl CaptureRows	follow_wipe
+4	captures	fn	impl CaptureRows	reflow
+4	captures	fn	-	line_starts_upward
+6	commands	struct	-	CommandDecoration
+6	commands	struct	-	MarkView
+6	commands	fn	-	pair_decorations
+6	commands	fn	-	human_duration
+6	commands	const	-	MARKS_MAX
+6	commands	fn	-	pick_prompt_jump
+7	shell_env	fn	-	apply_shell_integration_env
+7	shell_env	fn	-	interactive_shell_command
+7	shell_env	fn	-	bash_env_injection_supported
+7	shell_env	fn	-	parse_bash_version_supported
+7	shell_env	fn	-	interactive_shell_invocation
+7	shell_env	fn	-	parse_shells
+8	processes	fn	-	process_name
+8	processes	fn	-	process_cmdline
+8	processes	fn	-	cwd_of_pid
+8	processes	fn	-	cwd_of_pid
+8	processes	fn	-	cwd_of_pid
+8	processes	fn	-	cwd_is_observable
+9	spawn	fn	-	transcript_bytes
+16	status	fn	-	pick_pane_label
+7	shell_env	fn	-	apply_pane_env
+7	shell_env	const	-	HOST_TERMINAL_VARS
+14	images	static	-	SIXEL_HOST
+14	images	fn	-	pane_images_shown
+7	shell_env	fn	-	utf8_ctype_fix
+0		fn	-	now_ms
+7	shell_env	fn	-	live_exe
+7	shell_env	fn	-	sequence_editor_command
+7	shell_env	fn	-	apply_pane_bin
+7	shell_env	fn	-	pane_bin_dir
+9	spawn	fn	impl PtyTerminal	new
+9	spawn	fn	impl PtyTerminal	new_with_transcript
+9	spawn	fn	impl PtyTerminal	new_shell
+9	spawn	fn	impl PtyTerminal	new_running
+11	text	fn	impl PtyTerminal	visible_text
+11	text	fn	impl PtyTerminal	grid_lines
+11	text	fn	impl PtyTerminal	grid_lines_wrapped
+11	text	fn	impl PtyTerminal	find_lines
+11	text	fn	impl PtyTerminal	find_lines_and_clock
+11	text	fn	impl PtyTerminal	grid_lines_ansi
+11	text	fn	impl PtyTerminal	grid_lines_ansi_wrapped
+11	text	fn	impl PtyTerminal	screen_ansi_wrapped
+15	overlays	fn	impl PtyTerminal	hyperlink_at
+15	overlays	fn	impl PtyTerminal	set_search
+15	overlays	fn	impl PtyTerminal	set_current_match
+15	overlays	fn	impl PtyTerminal	set_hints
+11	text	fn	impl PtyTerminal	visible_lines
+11	text	fn	impl PtyTerminal	visible_lines_and_clock
+15	overlays	fn	impl PtyTerminal	set_triggers
+15	overlays	fn	impl PtyTerminal	drain_trigger_hits
+15	overlays	fn	impl PtyTerminal	set_watch_set
+15	overlays	fn	impl PtyTerminal	set_pane_watch
+15	overlays	fn	impl PtyTerminal	drain_watch_batches
+15	overlays	fn	impl PtyTerminal	set_palette
+14	images	fn	impl PtyTerminal	pane_images
+16	status	fn	impl PtyTerminal	alt_screen
+13	input	fn	impl PtyTerminal	app_cursor_keys
+12	scroll	fn	impl PtyTerminal	scroll_display_offset
+12	scroll	fn	impl PtyTerminal	scroll_to_line
+9	spawn	fn	impl PtyTerminal	spawn_with
+9	spawn	fn	impl PtyTerminal	spawn_with_preamble
+9	spawn	fn	impl PtyTerminal	attach_hosted
+9	spawn	fn	impl PtyTerminal	spawn_from
+6	commands	fn	impl PtyTerminal	command_marks
+6	commands	fn	impl PtyTerminal	marks_snapshot
+6	commands	fn	impl PtyTerminal	command_decorations
+6	commands	fn	impl PtyTerminal	drain_finished_commands
+6	commands	fn	impl PtyTerminal	command_output_text
+6	commands	fn	impl PtyTerminal	command_input_text
+6	commands	fn	impl PtyTerminal	select_command_output
+6	commands	fn	impl PtyTerminal	decoration_at_screen
+6	commands	fn	impl PtyTerminal	prompt_lines
+8	processes	fn	impl PtyTerminal	shell_cwd
+8	processes	fn	impl PtyTerminal	kernel_shell_cwd
+16	status	fn	impl PtyTerminal	drain_notifications
+12	scroll	fn	impl PtyTerminal	viewport_top_line
+12	scroll	fn	impl PtyTerminal	scroll_line_to_top
+16	status	fn	impl PtyTerminal	take_bell
+13	input	fn	impl PtyTerminal	take_clipboard_store
+8	processes	fn	impl PtyTerminal	foreground_pid
+8	processes	fn	impl PtyTerminal	shell_pid
+16	status	fn	impl PtyTerminal	label
+16	status	fn	impl PtyTerminal	set_auto_label
+13	input	fn	impl PtyTerminal	awaiting_echo
+16	status	fn	impl PtyTerminal	quiet_for
+16	status	fn	impl PtyTerminal	agent
+16	status	fn	impl PtyTerminal	set_agent
+16	status	fn	impl PtyTerminal	reported_status
+16	status	fn	impl PtyTerminal	sample_reporter
+11	text	fn	impl PtyTerminal	tail_rows
+16	status	fn	impl PtyTerminal	manual_name
+16	status	fn	impl PtyTerminal	set_manual_name
+16	status	fn	impl PtyTerminal	take_dirty
+16	status	fn	impl PtyTerminal	progress
+6	commands	fn	impl PtyTerminal	prompt_tail
+6	commands	fn	impl PtyTerminal	screen_cursor
+6	commands	fn	impl PtyTerminal	prompt_click_arrows
+16	status	fn	impl PtyTerminal	shell_host
+8	processes	fn	impl PtyTerminal	local_shell_cwd
+3	clock	fn	impl PtyTerminal	scroll_clock
+5	annotations	fn	impl PtyTerminal	add_annotation
+5	annotations	fn	impl PtyTerminal	annotations_current
+4	captures	fn	impl PtyTerminal	find_captured_line
+5	annotations	fn	impl PtyTerminal	annotations_at_clock
+5	annotations	fn	impl PtyTerminal	redacted_at
+5	annotations	fn	impl PtyTerminal	annotation_at
+5	annotations	fn	impl PtyTerminal	remove_annotation
+5	annotations	fn	impl PtyTerminal	set_annotation_text
+3	clock	fn	impl PtyTerminal	row_time
+16	status	fn	impl PtyTerminal	drain_ports
+13	input	fn	impl PtyTerminal	peek_pending_bytes
+8	processes	fn	impl PtyTerminal	pid
+10	backend	fn	impl PtyTerminal	poll_exit
+10	backend	fn	impl PtyTerminal	has_exited
+10	backend	fn	impl PtyTerminal	is_run_pane
+10	backend	fn	impl PtyTerminal	host_socket
+16	status	fn	impl PtyTerminal	peek_dirty
+1	mouse	fn	impl PtyTerminal	cell_at
+1	mouse	fn	impl PtyTerminal	clamp_to_grid
+12	scroll	fn	impl PtyTerminal	display_offset
+11	text	fn	impl PtyTerminal	line_text_at
+15	overlays	fn	impl PtyTerminal	hyperlink_at_screen
+3	clock	fn	impl PtyTerminal	clock_now
+3	clock	fn	impl PtyTerminal	tick_clock
+2	selection	fn	impl PtyTerminal	stamp_selection_clock
+2	selection	fn	impl PtyTerminal	rebase_alt_selection
+2	selection	fn	impl PtyTerminal	rebase_selection
+2	selection	fn	impl PtyTerminal	start_selection_at
+9	spawn	fn	impl PtyTerminal	replay_transcript
+12	scroll	fn	impl PtyTerminal	grid_extent
+4	captures	fn	impl PtyTerminal	rewind
+0		fn	impl PtyTerminal	feed_bytes_for_test
+0		fn	impl PtyTerminal	grid_lock_for_test
+3	clock	fn	impl PtyTerminal	stamp_chunk_for_test
+3	clock	fn	impl PtyTerminal	line_time_entries_for_test
+6	commands	fn	impl PtyTerminal	push_mark_for_test
+14	images	fn	impl PtyTerminal	push_image_for_test
+15	overlays	fn	impl PtyTerminal	has_hints_for_test
+15	overlays	fn	impl PtyTerminal	has_search_for_test
+2	selection	fn	impl PtyTerminal	debug_sel_state
+2	selection	fn	impl PtyTerminal	end_drag
+2	selection	fn	impl PtyTerminal	extend_selection_to
+2	selection	fn	impl PtyTerminal	drag_select_to
+2	selection	fn	impl PtyTerminal	autoscroll_select
+2	selection	fn	impl PtyTerminal	clear_selection
+2	selection	fn	impl PtyTerminal	select_word_at
+2	selection	fn	impl PtyTerminal	selection
+2	selection	fn	impl PtyTerminal	set_selection
+2	selection	fn	impl PtyTerminal	set_copy_cursor
+2	selection	fn	impl PtyTerminal	cursor_line_col
+2	selection	fn	impl PtyTerminal	selection_and_clock
+2	selection	fn	impl PtyTerminal	cursor_bounds_and_clock
+11	text	fn	impl PtyTerminal	row_text
+12	scroll	fn	impl PtyTerminal	grid_bounds
+2	selection	fn	impl PtyTerminal	selection_text
+16	status	fn	impl PtyTerminal	uid
+13	input	fn	impl PtyTerminal	write_input
+13	input	fn	impl PtyTerminal	written_bytes_for_test
+6	commands	fn	impl PtyTerminal	finish_command_for_test
+1	mouse	fn	impl PtyTerminal	mouse_reporting
+1	mouse	fn	impl PtyTerminal	mouse_motion_reporting
+1	mouse	fn	impl PtyTerminal	report_mouse
+8	processes	fn	impl PtyTerminal	change_cwd
+13	input	fn	impl PtyTerminal	bracketed_paste
+13	input	fn	impl PtyTerminal	paste_input
+8	processes	fn	impl PtyTerminal	foreground_is_shell
+8	processes	fn	impl PtyTerminal	cwd_seed_is_safe
+8	processes	fn	impl PtyTerminal	foreground_resolved_for_test
+16	status	fn	impl PtyTerminal	is_pristine
+12	scroll	fn	impl PtyTerminal	scroll_up
+12	scroll	fn	impl PtyTerminal	scroll_down
+12	scroll	fn	impl PtyTerminal	scroll_to_top
+12	scroll	fn	impl PtyTerminal	reset_scrollback
+12	scroll	fn	impl PtyTerminal	clear_screen_and_scrollback
+12	scroll	fn	impl PtyTerminal	grid_cols
+12	scroll	fn	impl PtyTerminal	resize
+10	backend	enum	-	PaneSource
+10	backend	enum	-	PaneBackend
+10	backend	fn	impl PaneBackend	pid
+10	backend	fn	impl PaneBackend	process_group_leader
+10	backend	fn	impl PaneBackend	resize
+10	backend	fn	impl PaneBackend	try_exit
+10	backend	fn	impl PaneBackend	end
+8	processes	fn	-	foreground_group_of
+8	processes	fn	-	foreground_group_of
+8	processes	fn	-	foreground_group_of
+8	processes	fn	-	parse_tpgid
+9	spawn	fn	-	persistent_panes_enabled
+0		struct	-	PaneLink
+10	backend	struct	-	HostInput
+10	backend	fn	impl Write for HostInput	write
+10	backend	fn	impl Write for HostInput	flush
+10	backend	fn	impl PaneLink	open
+10	backend	fn	impl PaneLink	local
+10	backend	fn	impl PaneLink	attach
+10	backend	fn	-	wait_pty_readable
+10	backend	const	-	PORT_URL_SETTLE_MS
+10	backend	const	-	EXIT_OUTPUT_GRACE
+10	backend	enum	-	PtyWait
+10	backend	fn	-	poll_pty
+10	backend	fn	impl Drop for PtyTerminal	drop
+11	text	fn	-	logical_row_text
+11	text	fn	-	logical_row_span
+11	text	fn	-	grid_rows_wrapped
+11	text	struct	-	FindLine
+11	text	fn	impl FindLine	line_of
+11	text	fn	-	join_wrapped_rows
+11	text	fn	-	ansi_rows
+11	text	fn	-	ansi_rows_from
+12	scroll	const	-	CLIPPED
+12	scroll	fn	-	resize_term
+12	scroll	fn	-	clip_row
+12	scroll	fn	-	unclip_row
+11	text	fn	-	row_wraps
+11	text	fn	-	cell_glyph
+11	text	fn	-	row_text_and_cols
+6	commands	fn	-	last_command_input_text
+6	commands	fn	-	without_continuation_prompts
+6	commands	fn	-	command_output_text
+3	clock	fn	-	hhmmss
+2	selection	fn	-	partial_overlap_cols
+2	selection	fn	-	capture_alt_anchor
+2	selection	fn	-	extract_selection_text
+2	selection	fn	-	select_word_at_in_term
+2	selection	fn	-	is_terminal_word_char
+1	mouse	fn	-	encode_mouse_report
+8	processes	const	-	CLEAR_TYPED_LINE
+8	processes	fn	-	format_cd_command
+13	input	fn	-	osc52_copy_seq
+11	text	const	-	SGR_FLAGS
+11	text	fn	-	cell_sgr
+11	text	fn	-	style_is_default
+11	text	fn	-	color_sgr
+11	text	fn	-	named_slot
+17	render	fn	-	ansi_to_ratatui
+17	render	fn	-	pal
+17	render	fn	-	named_to_ratatui
+17	render	fn	impl PtyTerminal	quiet_ok_ink
+17	render	fn	impl Widget for &mut PtyTerminal	render
+0		struct	-	TrigCell
+17	render	type	-	TrigRowPaint
+12	scroll	fn	-	scroll_offset_for_line
+2	selection	fn	-	block_selection_text
+2	selection	fn	-	cell_in_block_selection
+2	selection	fn	-	cell_in_selection
