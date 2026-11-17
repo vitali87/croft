@@ -1,0 +1,1 @@
+fix: croft opened in your home folder shows its first frame in milliseconds again. With the CodeQL extension added, working out which folder the Testing view follows walked the home folder four deep before the first frame and on every tab switch, which took 1.3 to 4.4 seconds on an M4 Mac; it now runs on a thread of its own after the first frame.
