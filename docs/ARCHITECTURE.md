@@ -298,6 +298,7 @@ src/
     │   ├── commands.rs      shell-integration marks, finished commands and their decorations, prompt jumps, the typed prompt line
     │   ├── mouse.rs         mouse reporting to the program in the pane; which grid cell a screen point is
     │   ├── selection.rs     selections: make, extend, clear, words and blocks, keep them on their text as output scrolls; the selected text
+    │   ├── shell_env.rs     the shell's start-up environment: integration for each shell, terminal and locale variables, croft's helpers on PATH
     │   ├── tests.rs         the terminal pane's own tests
     ├── update_popup.rs   the update popup as a card in the manner of Ghostty's: glyph and title, a label / value grid of the release, rounded pill buttons with the one primary action flush right, and a link row under a divider; framed per theme (gradient box, `surfaces` card, accent line) and pure, handing back where each control landed
     ├── timeline.rs      collapsible TIMELINE section: the active file's git history (`git log --follow`) fetched off-thread, two rows per commit (summary + author/age), click-to-open the commit's diff; a ⋯-menu Explorer sub-view
