@@ -29,6 +29,7 @@ src/
 ├── quickfix.rs           parses the last `grep`/`rg`/`git grep` command line into a pattern plus Search toggles and include/exclude globs, so "Search & Replace from Last grep/rg" seeds and runs the Search sidebar via `SearchPanel::seed`
 ├── git.rs                branch / dirty / ahead-behind status plus the working-tree operations the Source Control panel drives; multi-root, one `GitWorker` per workspace root
 ├── git/                  git's feature files, beside git.rs; each file's `//!` doc says what it holds
+│   ├── blame.rs          which commit last changed each line of a file
 │   ├── changes.rs        changed files from `git status --porcelain`: kind, section and badge; Explorer decorations; line counts
 │   ├── contents.rs       a file at HEAD, a commit or an index stage; a conflict re-merged in diff3 style; a path's clean/smudge filter
 │   ├── diffs.rs          staged diffs; against a branch, its merge base or the previous commit; submodule diffs
