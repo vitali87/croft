@@ -31,6 +31,7 @@ src/
 ├── git/                  git's feature files, beside git.rs; each file's `//!` doc says what it holds
 │   ├── blame.rs          which commit last changed each line of a file
 │   ├── changes.rs        changed files from `git status --porcelain`: kind, section and badge; Explorer decorations; line counts
+│   ├── commits.rs        commit and amend with their refusals, undo the last commit, the commit graph's cherry-pick, revert, checkout, tag and reset
 │   ├── contents.rs       a file at HEAD, a commit or an index stage; a conflict re-merged in diff3 style; a path's clean/smudge filter
 │   ├── diffs.rs          staged diffs; against a branch, its merge base or the previous commit; submodule diffs
 │   ├── history.rs        a file's history across renames, the commit graph, a branch's commits, a commit's files, diffs, message and card
