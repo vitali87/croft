@@ -686,6 +686,11 @@ commands! {
         title: "Bookmarks: View Bookmarks",
         hint: "Cmd+K Cmd+M",
     }
+    ViewAllBookmarks {
+        id: "view_all_bookmarks",
+        title: "Bookmarks: View All Bookmarks (Including Closed Files)",
+        hint: "Cmd+K Shift+B",
+    }
     FormatDocument {
         id: "format_document",
         title: "Format Document",

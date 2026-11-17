@@ -193,7 +193,13 @@ impl App {
             // trailing Cmd, so plain `Cmd+K M` below still maximizes the
             // terminal pane.
             KeyCode::Char(c) if plain && cmd_held && c.eq_ignore_ascii_case(&'m') => {
-                self.open_bookmark_picker();
+                self.open_bookmark_picker(false);
+                true
+            }
+            // Cmd+K Shift+B: View All Bookmarks, closed files' included. Must
+            // precede the case-insensitive B arm further down.
+            KeyCode::Char('B') if shifted && plain => {
+                self.open_bookmark_picker(true);
                 true
             }
             // Cmd+K Shift+W: reopen the most recently closed editor tab
