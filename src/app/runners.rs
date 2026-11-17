@@ -54,6 +54,15 @@ pub(super) type PendingTestRoot = (
     std::sync::mpsc::Receiver<PathBuf>,
 );
 
+#[cfg(test)]
+thread_local! {
+    /// How many times this thread worked the Testing folder out itself
+    /// ([`App::followed_test_root`]), for the tests that pin which paths
+    /// leave it to a thread (#1973).
+    pub(super) static TEST_ROOTS_WORKED_OUT_HERE: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
 /// The test run Testing: Rerun Last Run repeats (#1535), as it was asked.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum LastTestRun {
@@ -78,6 +87,8 @@ impl App {
         {
             return v.clone();
         }
+        #[cfg(test)]
+        TEST_ROOTS_WORKED_OUT_HERE.with(|n| n.set(n.get() + 1));
         let found = crate::testing::registry::test_root_for(
             &self.extensions_dir(),
             &key.0,
@@ -277,8 +288,11 @@ impl App {
         self.pending_test_debug = None;
         // Its names belong to the old project (#1535).
         self.last_test_run = None;
+        // `root` was just worked out, on a thread when the per-tick follow
+        // landed it (#1973): `discover_tests` would work it out again here,
+        // on the UI thread, for the walk that thread was there to take off.
         if self.sidebar_view == SidebarView::Testing {
-            self.discover_tests();
+            self.queue_test_discovery();
         }
     }
 
@@ -829,6 +843,12 @@ impl App {
         {
             return;
         }
+        self.queue_test_discovery();
+    }
+
+    /// Hand the worker a quiet discovery of the folder the Testing stack is
+    /// bound to now, unless a run or a discovery is already under way.
+    pub(super) fn queue_test_discovery(&mut self) {
         if self.testing.is_busy() || self.test_worker.discover_queued() {
             return;
         }

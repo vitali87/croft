@@ -372,6 +372,39 @@ fn the_testing_folder_is_worked_out_off_the_ui_thread() {
     assert_eq!(app.test_worker.root(), pkg);
 }
 
+/// #1973 review: with the Testing view showing, a folder the per-tick follow
+/// worked out on a thread is discovered as it came. The rebind used to go
+/// through `discover_tests`, which works the folder out again on the UI
+/// thread: the very walk the thread was there to take off it.
+#[test]
+fn a_followed_folder_landing_with_testing_shown_is_not_worked_out_again() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::write(
+        root.join("package.json"),
+        r#"{"name":"vmono","private":true,"workspaces":["packages/*"]}"#,
+    )
+    .unwrap();
+    let pkg = root.join("packages/math");
+    std::fs::create_dir_all(&pkg).unwrap();
+    std::fs::write(pkg.join("vitest.config.ts"), "export default {};\n").unwrap();
+    let mut app = App::new(root.clone()).unwrap();
+    app.sidebar_view = SidebarView::Testing;
+    let worked_out_here = TEST_ROOTS_WORKED_OUT_HERE.with(|n| n.get());
+
+    settle_test_root(&mut app);
+    assert_eq!(app.active_test_root, pkg);
+    assert!(
+        app.test_worker.discover_queued(),
+        "the rebind discovers the new folder"
+    );
+    assert_eq!(
+        TEST_ROOTS_WORKED_OUT_HERE.with(|n| n.get()),
+        worked_out_here,
+        "and never works the folder out again on this thread"
+    );
+}
+
 /// #1973 review: a run asked for while the follow for a newly focused file
 /// is still being worked out must run in that file's package, not in the
 /// one the stack is still bound to from the file focused before.
