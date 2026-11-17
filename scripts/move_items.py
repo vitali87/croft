@@ -848,7 +848,33 @@ GIT = Target(
     ),
 )
 
-TARGETS = {t.name: t for t in (APP, EDITOR, LSP, TERMINAL, GIT)}
+# remote.rs's feature files (#2062): (module doc, release-note phrase, docs row).
+REMOTE_FILES = {}
+
+REMOTE = Target(
+    "remote", "scripts/split_remote_manifest.tsv", "src/remote.rs", "src/remote", REMOTE_FILES,
+    Tree(
+        "├── remote.rs ",
+        "├── remote/               remote's feature files, beside remote.rs; each file's `//!` doc "
+        "says what it holds",
+        "│   ├── ", 17,
+    ),
+    "remote-",
+    (
+        "remote.rs's own tests, moved out of remote.rs (#2062).",
+        "remote's tests",
+        "remote.rs's own tests",
+    ),
+    {
+        "offer_tests": (
+            "The ssh-pane offer's tests, moved out of remote.rs (#2062).",
+            "the ssh-pane offer's tests",
+            "the ssh-pane offer's tests",
+        ),
+    },
+)
+
+TARGETS = {t.name: t for t in (APP, EDITOR, LSP, TERMINAL, GIT, REMOTE)}
 
 # Kinds whose declaration can carry a visibility.
 VISIBLE = {"fn", "const", "static", "struct", "enum", "union", "trait", "type"}
