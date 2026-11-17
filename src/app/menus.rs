@@ -1673,7 +1673,7 @@ impl App {
         use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
         let line = self.editor.cursor_row + 1;
         self.open_input_prompt(
-            InputPrompt::new(InputPurpose::GoToLine, "Go to Line", "line number")
+            InputPrompt::new(InputPurpose::GoToLine, "Go to Line", "line or line:column")
                 .with_value(line.to_string()),
         );
     }

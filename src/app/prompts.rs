@@ -309,8 +309,8 @@ impl App {
         match purpose {
             InputPurpose::GoToLine => {
                 self.close_input_prompt();
-                match value.trim().parse::<usize>() {
-                    Ok(n) if n > 0 => {
+                match parse_line_and_column(&value) {
+                    Some((n, col)) if n > 0 => {
                         // The typed line is 1-based (what the status bar shows);
                         // goto_line_centered takes a 0-based row index. A
                         // selection left behind would be replaced by the next
@@ -328,7 +328,16 @@ impl App {
                         self.focus_pane(Pane::Editor);
                         self.editor.clear_selection();
                         self.editor.goto_line_centered(n - 1);
-                        self.status = format!("Line {n}");
+                        // `line:column` also puts the caret on the column, as
+                        // the status bar counts it; a bare line keeps the
+                        // caret's column, as it always did.
+                        self.status = match col {
+                            Some(col) => {
+                                self.editor.goto_visual_col(col);
+                                format!("Line {n}, column {col}")
+                            }
+                            None => format!("Line {n}"),
+                        };
                     }
                     _ => self.status = format!("Not a line number: {}", value.trim()),
                 }
@@ -1768,4 +1777,47 @@ pub(super) fn resolve_typed_path(value: &str, home: Option<&Path>, root: &Path) 
         None => PathBuf::from(v),
     };
     Some(if p.is_absolute() { p } else { root.join(p) })
+}
+
+/// What Go to Line was given: `N` or `N:M` (also `N,M` and `N M`, the way
+/// the status bar's `Ln N, Col M` reads), as the 1-based line and, when
+/// there is one, the 1-based column. `None` for anything else.
+fn parse_line_and_column(value: &str) -> Option<(usize, Option<usize>)> {
+    let mut parts = value
+        .trim()
+        .split(|c: char| c == ':' || c == ',' || c.is_whitespace())
+        .filter(|p| !p.is_empty());
+    let line = parts.next()?.parse().ok()?;
+    let col = match parts.next() {
+        Some(p) => Some(p.parse().ok()?),
+        None => None,
+    };
+    parts.next().is_none().then_some((line, col))
+}
+
+#[cfg(test)]
+mod line_and_column_tests {
+    use super::parse_line_and_column;
+
+    #[test]
+    fn a_line_alone_or_with_a_column_parses() {
+        assert_eq!(parse_line_and_column("8"), Some((8, None)));
+        assert_eq!(parse_line_and_column(" 8 "), Some((8, None)));
+        assert_eq!(parse_line_and_column("8:12"), Some((8, Some(12))));
+        assert_eq!(parse_line_and_column("8,12"), Some((8, Some(12))));
+        assert_eq!(parse_line_and_column("8, 12"), Some((8, Some(12))));
+        assert_eq!(parse_line_and_column("8 12"), Some((8, Some(12))));
+    }
+
+    #[test]
+    fn anything_else_does_not() {
+        for bad in ["", ":", "x", "8:", "8:x", "8:1:2", "-3", "8.5"] {
+            assert_eq!(
+                parse_line_and_column(bad),
+                bad.strip_suffix(':')
+                    .and_then(|l| l.parse().ok().map(|l| (l, None))),
+                "{bad:?}"
+            );
+        }
+    }
 }
