@@ -592,7 +592,7 @@ class OtherTargets(unittest.TestCase):
         self.assertEqual(mi.add_arch_row(twice, "undo", SPLIT), twice)
 
     def test_every_target_names_its_own_manifest_file_and_folder(self):
-        self.assertEqual(sorted(mi.TARGETS), ["app", "editor", "lsp"])
+        self.assertEqual(sorted(mi.TARGETS), ["app", "editor", "lsp", "terminal"])
         for t in mi.TARGETS.values():
             with self.subTest(target=t.name):
                 self.assertTrue(t.source.endswith(".rs") and t.manifest.endswith(".tsv"))

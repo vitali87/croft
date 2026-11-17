@@ -585,7 +585,27 @@ LSP = Target(
     ),
 )
 
-TARGETS = {t.name: t for t in (APP, EDITOR, LSP)}
+# What each file split out of src/widgets/terminal.rs holds, as FILES above.
+TERMINAL_FILES = {}
+
+TERMINAL = Target(
+    "terminal", "scripts/split_terminal_manifest.tsv", "src/widgets/terminal.rs",
+    "src/widgets/terminal", TERMINAL_FILES,
+    Tree(
+        "    ├── terminal.rs ",
+        "    ├── terminal/             the terminal pane's feature files, beside terminal.rs; "
+        "each file's `//!` doc says what it holds",
+        "    │   ├── ", 16,
+    ),
+    "terminal-",
+    (
+        "The terminal pane's own tests, moved out of terminal.rs (#2062).",
+        "the terminal pane's tests",
+        "the terminal pane's own tests",
+    ),
+)
+
+TARGETS = {t.name: t for t in (APP, EDITOR, LSP, TERMINAL)}
 
 # Kinds whose declaration can carry a visibility.
 VISIBLE = {"fn", "const", "static", "struct", "enum", "union", "trait", "type"}
