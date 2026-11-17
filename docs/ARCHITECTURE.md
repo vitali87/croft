@@ -92,6 +92,7 @@ src/
 ├── remote/               remote's feature files, beside remote.rs; each file's `//!` doc says what it holds
 │   ├── clipboard.rs      the relay's clipboard requests: pasting from and copying to this machine's clipboard
 │   ├── control.rs        the SSH control master: starting or adopting it, commands over its socket
+│   ├── cross_build.rs    building a static croft for the remote here: toolchain probes, the build, shipping it
 │   ├── forward.rs        the relay's open and forward requests: links in the local browser, forwarded ports
 │   ├── hosts.rs          the hosts in ~/.ssh/config, and the host a running ssh's argv names
 │   ├── install.rs        whether the remote needs croft, the release binary, the remote build, swapping the binary in
