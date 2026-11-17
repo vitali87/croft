@@ -50,12 +50,15 @@ A file whose tests sit in an inline `#[cfg(test)] mod tests { ... }` can
 first move them to their own file: `--tests-out` writes the block's body,
 dedented, to <folder>/tests.rs and leaves `#[cfg(test)] mod tests;` in its
 place. Lines that start inside a string keep their indentation, since it is
-part of the string. A test file can then be split like any other target.
+part of the string. `--tests-out NAME` does the same for another inline test
+module the target has words for (`mod NAME`, to <folder>/NAME.rs). A test
+file can then be split like any other target.
 
 Usage:
   move_items.py [--target T] --pr N    move PR N's items (run from the repository root)
   move_items.py [--target T] --check   only check the manifest against mod.rs
-  move_items.py --target T --tests-out move mod.rs's inline tests to their own file
+  move_items.py --target T --tests-out [NAME]
+                                       move mod.rs's inline tests (or test module NAME) to their own file
 """
 
 import argparse
@@ -291,7 +294,8 @@ Tree = namedtuple("Tree", "anchor folder row width")
 # each piece holds (as FILES above), where the docs list them, the prefix of
 # its release-note fragments, and the docs and note words for its tests
 # moved out (`--tests-out`): (module doc, release-note phrase, docs row).
-Target = namedtuple("Target", "name manifest source dir files tree note_prefix tests")
+Target = namedtuple("Target", "name manifest source dir files tree note_prefix tests more_tests",
+                    defaults=({},))
 
 APP = Target(
     "app", MANIFEST, MOD, "src/app", FILES,
@@ -1437,25 +1441,33 @@ def check(root, t=APP):
     return 0
 
 
-TESTS_HEADER = re.compile(r"(^|\n)\s*mod\s+tests\s*\{$")
 
 
-def tests_out(root, t, fmt=True):
-    """Move the inline `mod tests { ... }` at the top level of the target's
-    file to <dir>/tests.rs: the block's body, dedented by its indentation,
-    and `mod tests;` where the block was. The header's attributes and the
-    docs and comments above it stay. A line that starts inside a string keeps
-    its indentation, which is part of the string. Writes the release note and
-    the docs row too. Returns the number of lines moved."""
-    if not t.tests:
-        raise ManifestError(f"the {t.name} target has no words for its tests")
+def tests_header(name):
+    return re.compile(rf"(^|\n)\s*mod\s+{re.escape(name)}\s*\{{$")
+
+
+def tests_out(root, t, fmt=True, name="tests"):
+    """Move the inline `mod <name> { ... }` (`mod tests` unless the target
+    names another test module) at the top level of the target's file to
+    <dir>/<name>.rs: the block's body, dedented by its indentation, and
+    `mod <name>;` where the block was. The module keeps its name and its
+    place, so its `use super::*;` still reaches the split file. The header's
+    attributes and the docs and comments above it stay. A line that starts
+    inside a string keeps its indentation, which is part of the string.
+    Writes the release note and the docs row too. Returns the number of
+    lines moved."""
+    words = t.tests if name == "tests" else t.more_tests.get(name)
+    if not words:
+        raise ManifestError(f"the {t.name} target has no words for its {name} module")
     src = os.path.join(root, t.source)
     with open(src, encoding="utf-8") as f:
         text = f.read()
     _, glue = cpm.parse(text, t.source)
-    heads = [g for g in glue if g.kind == "header" and not g.scope and TESTS_HEADER.search(g.text)]
+    header = tests_header(name)
+    heads = [g for g in glue if g.kind == "header" and not g.scope and header.search(g.text)]
     if len(heads) != 1:
-        raise ManifestError(f"{t.source} has {len(heads)} top-level `mod tests {{` blocks; expected one")
+        raise ManifestError(f"{t.source} has {len(heads)} top-level `mod {name} {{` blocks; expected one")
     head = heads[0]
     block = next(b for b in impl_blocks(glue) if b[0] == head.start)
     _, open_line, close = block
@@ -1475,27 +1487,27 @@ def tests_out(root, t, fmt=True):
             out.append(ln[len(indent):] if ln.startswith(indent) else ln.strip())
     while out and not out[0].strip():
         out.pop(0)
-    doc = ["//! " + ln if ln else "//!" for ln in t.tests[0].split("\n")]
-    target = os.path.join(root, t.dir, "tests.rs")
+    doc = ["//! " + ln if ln else "//!" for ln in words[0].split("\n")]
+    target = os.path.join(root, t.dir, f"{name}.rs")
     if os.path.exists(target):
-        raise ManifestError(f"{t.dir}/tests.rs exists already")
-    decl = re.sub(r"mod\s+tests\s*\{$", "mod tests;", lines[open_line])
+        raise ManifestError(f"{t.dir}/{name}.rs exists already")
+    decl = re.sub(rf"mod\s+{re.escape(name)}\s*\{{$", f"mod {name};", lines[open_line])
     rest = lines[:open_line] + [decl] + lines[close + 1:]
     arch = os.path.join(root, ARCH)
     with open(arch, encoding="utf-8") as f:
-        arch_text = add_arch_row(f.read(), "tests", t, t.tests[2])
+        arch_text = add_arch_row(f.read(), name, t, words[2])
     write_all([
         (target, "\n".join(doc + [""] + out).rstrip("\n") + "\n"),
         (src, "\n".join(rest)),
-        (os.path.join(root, NOTES, f"2062-split-{t.note_prefix}tests.md"),
-         f"refactor: Groundwork for the refactor program (#2062): {t.tests[1]} moved "
-         f"to their own file, {t.dir}/tests.rs. Nothing changes in use.\n"),
+        (os.path.join(root, NOTES, f"2062-split-{t.note_prefix}{name.replace('_', '-')}.md"),
+         f"refactor: Groundwork for the refactor program (#2062): {words[1]} moved "
+         f"to their own file, {t.dir}/{name}.rs. Nothing changes in use.\n"),
         (arch, arch_text),
     ])
     if fmt:
         subprocess.run(["cargo", "fmt"], cwd=root, check=True)
     moved = close - open_line - 1
-    print(f"moved {moved} line(s) of tests from {t.source} to {t.dir}/tests.rs")
+    print(f"moved {moved} line(s) of tests from {t.source} to {t.dir}/{name}.rs")
     return moved
 
 
@@ -1504,8 +1516,8 @@ def main(argv=None):
     ap.add_argument("--target", default="app", choices=sorted(TARGETS), help="the file to split")
     ap.add_argument("--pr", type=int, help="the PR whose items to move")
     ap.add_argument("--check", action="store_true", help="only check the manifest")
-    ap.add_argument("--tests-out", action="store_true",
-                    help="move the file's inline `mod tests` to its own file")
+    ap.add_argument("--tests-out", nargs="?", const="tests", metavar="MODULE",
+                    help="move the file's inline `mod tests` (or the test module named) to its own file")
     ap.add_argument("--root", default=".", help="the repository root")
     ap.add_argument("--no-fmt", action="store_true", help="skip `cargo fmt` (for tests)")
     ap.add_argument("--no-build", action="store_true", help="skip the build and its glue fixes (for tests)")
@@ -1513,7 +1525,7 @@ def main(argv=None):
     t = TARGETS[args.target]
     try:
         if args.tests_out:
-            tests_out(args.root, t, fmt=not args.no_fmt)
+            tests_out(args.root, t, fmt=not args.no_fmt, name=args.tests_out)
             return 0
         if args.check:
             return check(args.root, t)

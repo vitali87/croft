@@ -591,6 +591,39 @@ class OtherTargets(unittest.TestCase):
         self.assertRegex(arch, r"editor\.rs +The editor\.\n    ├── editor/ +the editor's feature "
                                r"files.*\n    │   ├── tests\.rs +the editor's own tests\n    ├── editor_find")
 
+    def test_another_named_test_module_moves_to_a_file_of_its_name(self):
+        """A file with a second inline test module (remote.rs's
+        `offer_tests`) moves it to <folder>/<name>.rs: same module name and
+        place, so its `use super::*;` still reaches the split file."""
+        second = EDITOR + ("\n/// The offer's tests.\n#[cfg(test)]\nmod offer_tests {\n"
+                           "    use super::*;\n\n    #[test]\n    fn shows() {\n"
+                           "        assert_eq!(Editor { n: 3 }.shown(), 3);\n    }\n}\n")
+        (self.tmp / SPLIT.source).write_text(second)
+        self.root.commit()
+        before = subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.tmp, capture_output=True,
+                                text=True, check=True).stdout.strip()
+        target = SPLIT._replace(more_tests={
+            "offer_tests": ("The offer's tests.", "the offer's tests", "the offer's tests")})
+        moved, out = quiet(mi.tests_out, str(self.tmp), target, False, "offer_tests")
+        self.assertEqual(moved, 6, out)
+        self.assertIn("to src/widgets/editor/offer_tests.rs", out)
+        self.assertTrue(self.root.read(SPLIT.source).endswith(
+            "/// The offer's tests.\n#[cfg(test)]\nmod offer_tests;\n"))
+        self.assertIn("mod tests {", self.root.read(SPLIT.source), "the other module stays")
+        offer = self.root.read("src/widgets/editor/offer_tests.rs")
+        self.assertTrue(offer.startswith("//! The offer's tests.\n\nuse super::*;\n\n#[test]\nfn shows() {\n"))
+        note = self.root.read(os.path.join(mi.NOTES, "2062-split-editor-offer-tests.md"))
+        self.assertIn("the offer's tests moved to their own file, src/widgets/editor/offer_tests.rs.", note)
+        self.assertRegex(self.root.read(mi.ARCH), r"│   ├── offer_tests\.rs +the offer's tests\n")
+        self.root.commit()
+        code, report = self.root.pure(before)
+        self.assertEqual(code, 0, report)
+
+    def test_a_test_module_the_target_has_no_words_for_is_refused(self):
+        with self.assertRaises(mi.ManifestError) as e:
+            mi.tests_out(str(self.tmp), SPLIT, False, "offer_tests")
+        self.assertIn("no words for its offer_tests module", str(e.exception))
+
     def test_a_file_without_one_tests_block_is_refused(self):
         (self.tmp / SPLIT.source).write_text(EDITOR.split("/// The editor's tests.")[0])
         code, out = self.tests_out()
