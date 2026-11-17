@@ -293,6 +293,7 @@ src/
     ├── terminal.rs           `portable-pty` + `alacritty_terminal` + ratatui integration: the embedded terminal with selection, scrollback, drag-reorderable panes and maximize mode
     ├── terminal/             the terminal pane's feature files, beside terminal.rs; each file's `//!` doc says what it holds
     │   ├── annotations.rs   notes pinned to output; revealing a masked secret
+    │   ├── backend.rs       the local pty or session host behind a pane: output waits, resize, exit, shutdown
     │   ├── captures.rs      spotting screen clears, keeping the rows they wipe, the rewind buffer
     │   ├── clock.rs         the scroll clock that keeps selections and notes in place; each row's print time
     │   ├── commands.rs      shell-integration marks, finished commands and their decorations, prompt jumps, the typed prompt line
