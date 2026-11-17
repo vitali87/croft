@@ -43,6 +43,7 @@ src/
 │   ├── staging.rs        stage, unstage, remove and discard paths, one or all
 │   ├── stash.rs          stash, list, show, apply, pop and drop stashes
 │   ├── status.rs         the status snapshot: branch, ahead/behind, changes, ignored paths, the prepared commit message, repositories one folder down
+│   ├── tags.rs           list, create, delete and push tags, here and on a remote
 │   ├── tests.rs          git.rs's own tests
 │   ├── worktrees.rs      lanes and pull-request checkouts in worktrees of their own, and when one is kept
 ├── magic.rs              content-based format detection: a magic-byte signature table (images, PDF, zip family, gzip, xz, bzip2, zstd, tar, SQLite) used as the SECOND routing hint in `Editor::open` — extension first, sniffing decides when it gave no answer or lied
