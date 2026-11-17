@@ -300,6 +300,7 @@ src/
     │   ├── images.rs        pictures printed into the pane and where they sit
     │   ├── input.rs         typed input, pastes, bracketed paste, clipboard sequences
     │   ├── mouse.rs         mouse reporting to the program in the pane; which grid cell a screen point is
+    │   ├── overlays.rs      find matches, quick-select hints, triggers, problem watches, links, the palette
     │   ├── processes.rs     the shell and foreground process: names, command lines, working directories, `cd`
     │   ├── scroll.rs        scrolling, clearing the scrollback, reflowing the grid on resize
     │   ├── selection.rs     selections: make, extend, clear, words and blocks, keep them on their text as output scrolls; the selected text
