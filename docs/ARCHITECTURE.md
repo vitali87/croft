@@ -95,6 +95,7 @@ src/
 │   ├── hosts.rs          the hosts in ~/.ssh/config, and the host a running ssh's argv names
 │   ├── offer.rs          the ssh-pane offer: a pane's host and folder, whether to offer, hosts whose install failed
 │   ├── offer_tests.rs    the ssh-pane offer's tests
+│   ├── pull.rs           the relay's pull request: copying remote files to this machine
 │   ├── relay.rs          the drop relay's pump: reading, claiming and answering a remote croft's requests
 │   ├── tests.rs          remote.rs's own tests
 ├── remote_bulk.rs       bulk lane for background installs: dedicated BatchMode SSH connection when key auth works (throttled shared mux otherwise) so update bytes never queue ahead of live-session keystrokes
