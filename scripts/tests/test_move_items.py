@@ -232,6 +232,22 @@ class Moves(unittest.TestCase):
         code, out = root.pure(first)
         self.assertEqual(code, 0, out)
 
+    def test_appending_to_a_file_whose_glob_was_dropped_puts_it_back(self):
+        where = {"bump": (2, "codeql"), "inc": (3, "codeql")}
+        root = Root(self.tmp, MOD, where)
+        code, out = root.move(2)
+        self.assertEqual(code, 0, out)
+        path = self.tmp / "src/app/codeql.rs"
+        text = path.read_text()
+        self.assertIn("\nuse super::*;\n\n", text)
+        path.write_text(text.replace("\nuse super::*;\n\n", "\n", 1))
+        root.commit()
+        code, out = root.move(3)
+        self.assertEqual(code, 0, out)
+        text = root.read("src/app/codeql.rs")
+        self.assertEqual(text.count("use super::*;"), 1)
+        self.assertLess(text.index("use super::*;"), text.index("fn bump"))
+
     def test_attributes_over_several_lines_and_comments_between_them_are_passed(self):
         spread = (MOD + "\n#[cfg(any(\n    unix,\n    windows\n))]\n// Why it is allowed.\n"
                   "#[allow(dead_code)] #[inline]\nfn spread() {}\n")
@@ -395,6 +411,19 @@ class Helpers(unittest.TestCase):
         self.assertEqual(mi.without_super_glob(lines),
                          ["//! What git said, in one line.", "",
                           "pub fn headline(output: &str) -> &str {", "    output", "}", ""])
+
+    def test_a_later_move_puts_the_parent_glob_back_before_appending(self):
+        """An earlier move may have dropped `use super::*;` from a file that
+        needed nothing from its parent; items a later move appends may need
+        it. The glob goes back after the `//!` doc (the build step drops it
+        again if it is still unused), and a file that has it is untouched."""
+        bare = ["//! What git said, in one line.", "",
+                "pub fn headline(output: &str) -> &str {", "    output", "}", ""]
+        full = ["//! What git said, in one line.", "", "use super::*;", "",
+                "pub fn headline(output: &str) -> &str {", "    output", "}", ""]
+        self.assertEqual(mi.with_super_glob(bare), full)
+        self.assertEqual(mi.with_super_glob(full), full)
+        self.assertEqual(mi.with_super_glob(mi.without_super_glob(full)), full)
 
     def test_an_item_too_narrow_for_its_outside_users_stops_the_tool(self):
         errors = [("E0603", "function import `seq` is private")]

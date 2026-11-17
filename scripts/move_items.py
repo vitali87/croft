@@ -1203,7 +1203,7 @@ def move(root, pr, fmt=True, build=True, t=APP):
     target = os.path.join(root, t.dir, f"{file}.rs")
     if os.path.exists(target):
         with open(target, encoding="utf-8") as f:
-            existing = f.read().rstrip("\n").split("\n")
+            existing = with_super_glob(f.read().rstrip("\n").split("\n"))
         new_file = existing + [""] + body
         glue_free = free and not any(re.match(rf"^use {file}::\*;$", ln) for ln in lines)
     else:
@@ -1357,6 +1357,19 @@ def fix_glue(lines, app, tests, homes, scope="app"):
 
 
 UNUSED_SUPER = ("unused_imports", "unused import: `super::*`")
+
+
+def with_super_glob(lines):
+    """A feature file's lines with `use super::*;` after its `//!` doc. An
+    earlier move's build step drops the import from a file that needs nothing
+    from the split file; a later move appending items that do would then not
+    build. The build step drops it again if it is still unused."""
+    if "use super::*;" in lines:
+        return lines
+    at = 0
+    while at < len(lines) and lines[at].startswith("//!"):
+        at += 1
+    return lines[:at] + ["", "use super::*;"] + lines[at:]
 
 
 def without_super_glob(lines):
