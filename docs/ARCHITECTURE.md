@@ -302,6 +302,7 @@ src/
     │   ├── mouse.rs         mouse reporting to the program in the pane; which grid cell a screen point is
     │   ├── overlays.rs      find matches, quick-select hints, triggers, problem watches, links, the palette
     │   ├── processes.rs     the shell and foreground process: names, command lines, working directories, `cd`
+    │   ├── render.rs        drawing each cell, selections, overlays, decorations and notes
     │   ├── scroll.rs        scrolling, clearing the scrollback, reflowing the grid on resize
     │   ├── selection.rs     selections: make, extend, clear, words and blocks, keep them on their text as output scrolls; the selected text
     │   ├── shell_env.rs     the shell's start-up environment: integration for each shell, terminal and locale variables, croft's helpers on PATH
