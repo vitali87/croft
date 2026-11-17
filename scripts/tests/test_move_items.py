@@ -385,6 +385,17 @@ class Helpers(unittest.TestCase):
         self.assertIn("pub use settings::GitStatus;", lines)
         self.assertEqual(done, ["re-exported settings::GitStatus (pub): used outside git"])
 
+    def test_a_new_file_that_needs_nothing_from_its_parent_loses_the_glob(self):
+        """A moved file of plain text handling (git.rs's one-line summaries
+        of git's output) uses nothing from git.rs, and `use super::*;` is
+        then an unused import that fails the build: it goes, with the blank
+        line after it."""
+        lines = ["//! What git said, in one line.", "", "use super::*;", "",
+                 "pub fn headline(output: &str) -> &str {", "    output", "}", ""]
+        self.assertEqual(mi.without_super_glob(lines),
+                         ["//! What git said, in one line.", "",
+                          "pub fn headline(output: &str) -> &str {", "    output", "}", ""])
+
     def test_an_item_too_narrow_for_its_outside_users_stops_the_tool(self):
         errors = [("E0603", "function import `seq` is private")]
         with self.assertRaises(mi.BuildError) as e:

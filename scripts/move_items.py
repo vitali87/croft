@@ -1231,7 +1231,7 @@ def move(root, pr, fmt=True, build=True, t=APP):
     print(f"PR {pr}: moved {len(picked)} item(s) from {t.source} to {t.dir}/{file}.rs, "
           f"{widened} widened to pub(super)")
     if build:
-        for line in settle(root, rows, t=t):
+        for line in settle(root, rows, t=t, new=file):
             print(f"  glue: {line}")
         print("  the app and its tests build clean under clippy")
     return file
@@ -1356,15 +1356,38 @@ def fix_glue(lines, app, tests, homes, scope="app"):
     return lines, done
 
 
-def settle(root, rows, rounds=5, t=APP):
+UNUSED_SUPER = ("unused_imports", "unused import: `super::*`")
+
+
+def without_super_glob(lines):
+    """A new file's `lines` without the `use super::*;` its header got, and
+    the blank line after it."""
+    at = lines.index("use super::*;")
+    end = at + 2 if at + 1 < len(lines) and lines[at + 1] == "" else at + 1
+    return lines[:at] + lines[end:]
+
+
+def settle(root, rows, rounds=5, t=APP, new=None):
     """Build, fix the glue the build asks for, and build again until the app
-    and its tests are clean. Returns what was done."""
+    and its tests are clean. `new` is the file this move wrote, whose
+    `use super::*;` goes when nothing moved into it needs the split file,
+    in the app and its tests alike: every other file built clean before.
+    Returns what was done."""
     done = []
     mod_path = os.path.join(root, t.source)
     for _ in range(rounds):
         app, tests = cargo_errors(root, "--bins"), cargo_errors(root, "--tests")
         if not app and not tests:
             return done
+        if new and UNUSED_SUPER in app and UNUSED_SUPER in tests:
+            path = os.path.join(root, t.dir, f"{new}.rs")
+            with open(path, encoding="utf-8") as f:
+                lines = f.read().split("\n")
+            if "use super::*;" in lines:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write("\n".join(without_super_glob(lines)))
+                done.append(f"dropped use super::* from {new}.rs: nothing in it needs {t.source}")
+                continue
         homes = {}
         for pr, file, kind, impl, name in rows:
             path = os.path.join(root, t.dir, f"{file}.rs")
