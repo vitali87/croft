@@ -89,6 +89,19 @@ src/
 ├── quick_select.rs       WezTerm-style quick-select pure core for the terminal pane (Ctrl+Shift+Space): a priority-ordered pattern set matched over soft-wrap-stitched logical lines, with home-row labels
 ├── release_notes.rs      hand-curated "IN THIS RELEASE" highlights on the welcome panel; the text is DATA, one file per version in `src/release_notes/<version>.md`, or the pending fragments in `src/release_notes/unreleased/` for a build past its release (headed "IN THIS BUILD"), baked in by `build.rs` through `release_notes/select.rs` — no git log, no network, and a build with neither is a build error
 ├── remote.rs             remote (SSH) target metadata and launch dispatch, plus the ssh-pane re-root offer: `ssh_destination` parses a pane's foreground argv using ssh's own flag grammar
+├── remote/               remote's feature files, beside remote.rs; each file's `//!` doc says what it holds
+│   ├── clipboard.rs      the relay's clipboard requests: pasting from and copying to this machine's clipboard
+│   ├── control.rs        the SSH control master: starting or adopting it, commands over its socket
+│   ├── forward.rs        the relay's open and forward requests: links in the local browser, forwarded ports
+│   ├── hosts.rs          the hosts in ~/.ssh/config, and the host a running ssh's argv names
+│   ├── install_stream.rs the install the connect dialog runs, its output streamed and logged; the background install
+│   ├── launch_command.rs the command line that starts croft on the remote, and the sockets it names
+│   ├── offer.rs          the ssh-pane offer: a pane's host and folder, whether to offer, hosts whose install failed
+│   ├── offer_tests.rs    the ssh-pane offer's tests
+│   ├── pull.rs           the relay's pull request: copying remote files to this machine
+│   ├── relay.rs          the drop relay's pump: reading, claiming and answering a remote croft's requests
+│   ├── session.rs        launching a remote croft session, its outcome, and reconnecting after a drop
+│   ├── tests.rs          remote.rs's own tests
 ├── remote_bulk.rs       bulk lane for background installs: dedicated BatchMode SSH connection when key auth works (throttled shared mux otherwise) so update bytes never queue ahead of live-session keystrokes
 ├── remote_connect.rs    interactive SSH connect flow (host + password prompt phases) behind the connect dialog
 ├── review_ops.rs         the write side of review (#366): reply, resolve, submit a review, as `gh` jobs off the frame loop

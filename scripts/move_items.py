@@ -50,12 +50,15 @@ A file whose tests sit in an inline `#[cfg(test)] mod tests { ... }` can
 first move them to their own file: `--tests-out` writes the block's body,
 dedented, to <folder>/tests.rs and leaves `#[cfg(test)] mod tests;` in its
 place. Lines that start inside a string keep their indentation, since it is
-part of the string. A test file can then be split like any other target.
+part of the string. `--tests-out NAME` does the same for another inline test
+module the target has words for (`mod NAME`, to <folder>/NAME.rs). A test
+file can then be split like any other target.
 
 Usage:
   move_items.py [--target T] --pr N    move PR N's items (run from the repository root)
   move_items.py [--target T] --check   only check the manifest against mod.rs
-  move_items.py --target T --tests-out move mod.rs's inline tests to their own file
+  move_items.py --target T --tests-out [NAME]
+                                       move mod.rs's inline tests (or test module NAME) to their own file
 """
 
 import argparse
@@ -291,7 +294,8 @@ Tree = namedtuple("Tree", "anchor folder row width")
 # each piece holds (as FILES above), where the docs list them, the prefix of
 # its release-note fragments, and the docs and note words for its tests
 # moved out (`--tests-out`): (module doc, release-note phrase, docs row).
-Target = namedtuple("Target", "name manifest source dir files tree note_prefix tests")
+Target = namedtuple("Target", "name manifest source dir files tree note_prefix tests more_tests",
+                    defaults=({},))
 
 APP = Target(
     "app", MANIFEST, MOD, "src/app", FILES,
@@ -844,7 +848,131 @@ GIT = Target(
     ),
 )
 
-TARGETS = {t.name: t for t in (APP, EDITOR, LSP, TERMINAL, GIT)}
+# remote.rs's feature files (#2062): (module doc, release-note phrase, docs row).
+REMOTE_FILES = {
+    "hosts": (
+        "The SSH hosts croft knows: the targets in ~/.ssh/config and the state of each entry,\n"
+        "and the host a running ssh is connected to, read from its argv with ssh's own flag\n"
+        "grammar.",
+        "remote host",
+        "the hosts in ~/.ssh/config, and the host a running ssh's argv names",
+    ),
+    "offer": (
+        "The ssh-pane offer: which host and folder a pane's ssh is in, whether to offer to\n"
+        "re-root there, and the hosts whose install failed, remembered for a week.",
+        "remote ssh-pane offer",
+        "the ssh-pane offer: a pane's host and folder, whether to offer, hosts whose install "
+        "failed",
+    ),
+    "control": (
+        "The SSH control master a remote session runs over: starting or adopting it, the\n"
+        "commands sent through its socket, and the socket's private directory.",
+        "remote SSH control master",
+        "the SSH control master: starting or adopting it, commands over its socket",
+    ),
+    "relay": (
+        "The drop relay: the pump that tails a remote croft's request log and runs each\n"
+        "request on this machine, the requests it understands, and how each is claimed and\n"
+        "answered.",
+        "remote drop relay",
+        "the drop relay's pump: reading, claiming and answering a remote croft's requests",
+    ),
+    "clipboard": (
+        "The relay's clipboard requests: this machine's clipboard for a remote paste, and a\n"
+        "remote croft's copied text put on this machine's clipboard.",
+        "remote clipboard relay",
+        "the relay's clipboard requests: pasting from and copying to this machine's clipboard",
+    ),
+    "pull": (
+        "The relay's pull request: which remote paths may be pulled, and copying them to this\n"
+        "machine.",
+        "remote pull relay",
+        "the relay's pull request: copying remote files to this machine",
+    ),
+    "forward": (
+        "The relay's open, forward and unforward requests: opening a link in this machine's\n"
+        "browser, and forwarding a remote port to a free local one.",
+        "remote open and port forward relay",
+        "the relay's open and forward requests: links in the local browser, forwarded ports",
+    ),
+    "session": (
+        "A remote croft session: launching it, its outcome, and keeping it alive across a\n"
+        "dropped connection by reconnecting the master and handing the terminal back.",
+        "remote session",
+        "launching a remote croft session, its outcome, and reconnecting after a drop",
+    ),
+    "launch_command": (
+        "The command line that starts croft on the remote, and the session, mux and collab\n"
+        "sockets it names.",
+        "remote launch command",
+        "the command line that starts croft on the remote, and the sockets it names",
+    ),
+    "install_stream": (
+        "The install as the connect dialog runs it, each step's output streamed to the\n"
+        "dialog and kept in the install log, and the background install beside an attached\n"
+        "session.",
+        "streamed remote install",
+        "the install the connect dialog runs, its output streamed and logged; the background "
+        "install",
+    ),
+    "install": (
+        "Installing croft on the remote: whether it needs an install or an update, the release\n"
+        "binary when this croft is one, the remote build when nothing faster can run, and\n"
+        "swapping the new binary in.",
+        "remote install",
+        "whether the remote needs croft, the release binary, the remote build, swapping the "
+        "binary in",
+    ),
+    "cross_build": (
+        "The local cross-build: whether a static croft for the remote can be built here,\n"
+        "finding the toolchain from the checkout, building it and shipping it.",
+        "remote cross-build",
+        "building a static croft for the remote here: toolchain probes, the build, shipping it",
+    ),
+    "source": (
+        "This croft's source: the stamp that says whether the remote is up to date, and\n"
+        "syncing the source to the remote by allow-list.",
+        "remote source sync",
+        "the source stamp, and syncing the source to the remote by allow-list",
+    ),
+    "config_push": (
+        "Pushing the user's config to the remote: the files that sync, how each is shipped\n"
+        "and logged, and `croft sync-config` with its diff.",
+        "remote config push",
+        "pushing the user's config to the remote; `croft sync-config` and its diff",
+    ),
+    "config_repush": (
+        "The live config re-push: watching the synced files during a session and shipping\n"
+        "each change over the bulk lane.",
+        "remote config re-push",
+        "re-pushing changed config during a session over the bulk lane",
+    ),
+}
+
+REMOTE = Target(
+    "remote", "scripts/split_remote_manifest.tsv", "src/remote.rs", "src/remote", REMOTE_FILES,
+    Tree(
+        "├── remote.rs ",
+        "├── remote/               remote's feature files, beside remote.rs; each file's `//!` doc "
+        "says what it holds",
+        "│   ├── ", 17,
+    ),
+    "remote-",
+    (
+        "remote.rs's own tests, moved out of remote.rs (#2062).",
+        "remote's tests",
+        "remote.rs's own tests",
+    ),
+    {
+        "offer_tests": (
+            "The ssh-pane offer's tests, moved out of remote.rs (#2062).",
+            "the ssh-pane offer's tests",
+            "the ssh-pane offer's tests",
+        ),
+    },
+)
+
+TARGETS = {t.name: t for t in (APP, EDITOR, LSP, TERMINAL, GIT, REMOTE)}
 
 # Kinds whose declaration can carry a visibility.
 VISIBLE = {"fn", "const", "static", "struct", "enum", "union", "trait", "type"}
@@ -1203,7 +1331,7 @@ def move(root, pr, fmt=True, build=True, t=APP):
     target = os.path.join(root, t.dir, f"{file}.rs")
     if os.path.exists(target):
         with open(target, encoding="utf-8") as f:
-            existing = f.read().rstrip("\n").split("\n")
+            existing = with_super_glob(f.read().rstrip("\n").split("\n"))
         new_file = existing + [""] + body
         glue_free = free and not any(re.match(rf"^use {file}::\*;$", ln) for ln in lines)
     else:
@@ -1359,6 +1487,19 @@ def fix_glue(lines, app, tests, homes, scope="app"):
 UNUSED_SUPER = ("unused_imports", "unused import: `super::*`")
 
 
+def with_super_glob(lines):
+    """A feature file's lines with `use super::*;` after its `//!` doc. An
+    earlier move's build step drops the import from a file that needs nothing
+    from the split file; a later move appending items that do would then not
+    build. The build step drops it again if it is still unused."""
+    if "use super::*;" in lines:
+        return lines
+    at = 0
+    while at < len(lines) and lines[at].startswith("//!"):
+        at += 1
+    return lines[:at] + ["", "use super::*;"] + lines[at:]
+
+
 def without_super_glob(lines):
     """A new file's `lines` without the `use super::*;` its header got, and
     the blank line after it."""
@@ -1424,25 +1565,33 @@ def check(root, t=APP):
     return 0
 
 
-TESTS_HEADER = re.compile(r"(^|\n)\s*mod\s+tests\s*\{$")
 
 
-def tests_out(root, t, fmt=True):
-    """Move the inline `mod tests { ... }` at the top level of the target's
-    file to <dir>/tests.rs: the block's body, dedented by its indentation,
-    and `mod tests;` where the block was. The header's attributes and the
-    docs and comments above it stay. A line that starts inside a string keeps
-    its indentation, which is part of the string. Writes the release note and
-    the docs row too. Returns the number of lines moved."""
-    if not t.tests:
-        raise ManifestError(f"the {t.name} target has no words for its tests")
+def tests_header(name):
+    return re.compile(rf"(^|\n)\s*mod\s+{re.escape(name)}\s*\{{$")
+
+
+def tests_out(root, t, fmt=True, name="tests"):
+    """Move the inline `mod <name> { ... }` (`mod tests` unless the target
+    names another test module) at the top level of the target's file to
+    <dir>/<name>.rs: the block's body, dedented by its indentation, and
+    `mod <name>;` where the block was. The module keeps its name and its
+    place, so its `use super::*;` still reaches the split file. The header's
+    attributes and the docs and comments above it stay. A line that starts
+    inside a string keeps its indentation, which is part of the string.
+    Writes the release note and the docs row too. Returns the number of
+    lines moved."""
+    words = t.tests if name == "tests" else t.more_tests.get(name)
+    if not words:
+        raise ManifestError(f"the {t.name} target has no words for its {name} module")
     src = os.path.join(root, t.source)
     with open(src, encoding="utf-8") as f:
         text = f.read()
     _, glue = cpm.parse(text, t.source)
-    heads = [g for g in glue if g.kind == "header" and not g.scope and TESTS_HEADER.search(g.text)]
+    header = tests_header(name)
+    heads = [g for g in glue if g.kind == "header" and not g.scope and header.search(g.text)]
     if len(heads) != 1:
-        raise ManifestError(f"{t.source} has {len(heads)} top-level `mod tests {{` blocks; expected one")
+        raise ManifestError(f"{t.source} has {len(heads)} top-level `mod {name} {{` blocks; expected one")
     head = heads[0]
     block = next(b for b in impl_blocks(glue) if b[0] == head.start)
     _, open_line, close = block
@@ -1462,27 +1611,27 @@ def tests_out(root, t, fmt=True):
             out.append(ln[len(indent):] if ln.startswith(indent) else ln.strip())
     while out and not out[0].strip():
         out.pop(0)
-    doc = ["//! " + ln if ln else "//!" for ln in t.tests[0].split("\n")]
-    target = os.path.join(root, t.dir, "tests.rs")
+    doc = ["//! " + ln if ln else "//!" for ln in words[0].split("\n")]
+    target = os.path.join(root, t.dir, f"{name}.rs")
     if os.path.exists(target):
-        raise ManifestError(f"{t.dir}/tests.rs exists already")
-    decl = re.sub(r"mod\s+tests\s*\{$", "mod tests;", lines[open_line])
+        raise ManifestError(f"{t.dir}/{name}.rs exists already")
+    decl = re.sub(rf"mod\s+{re.escape(name)}\s*\{{$", f"mod {name};", lines[open_line])
     rest = lines[:open_line] + [decl] + lines[close + 1:]
     arch = os.path.join(root, ARCH)
     with open(arch, encoding="utf-8") as f:
-        arch_text = add_arch_row(f.read(), "tests", t, t.tests[2])
+        arch_text = add_arch_row(f.read(), name, t, words[2])
     write_all([
         (target, "\n".join(doc + [""] + out).rstrip("\n") + "\n"),
         (src, "\n".join(rest)),
-        (os.path.join(root, NOTES, f"2062-split-{t.note_prefix}tests.md"),
-         f"refactor: Groundwork for the refactor program (#2062): {t.tests[1]} moved "
-         f"to their own file, {t.dir}/tests.rs. Nothing changes in use.\n"),
+        (os.path.join(root, NOTES, f"2062-split-{t.note_prefix}{name.replace('_', '-')}.md"),
+         f"refactor: Groundwork for the refactor program (#2062): {words[1]} moved "
+         f"to their own file, {t.dir}/{name}.rs. Nothing changes in use.\n"),
         (arch, arch_text),
     ])
     if fmt:
         subprocess.run(["cargo", "fmt"], cwd=root, check=True)
     moved = close - open_line - 1
-    print(f"moved {moved} line(s) of tests from {t.source} to {t.dir}/tests.rs")
+    print(f"moved {moved} line(s) of tests from {t.source} to {t.dir}/{name}.rs")
     return moved
 
 
@@ -1491,8 +1640,8 @@ def main(argv=None):
     ap.add_argument("--target", default="app", choices=sorted(TARGETS), help="the file to split")
     ap.add_argument("--pr", type=int, help="the PR whose items to move")
     ap.add_argument("--check", action="store_true", help="only check the manifest")
-    ap.add_argument("--tests-out", action="store_true",
-                    help="move the file's inline `mod tests` to its own file")
+    ap.add_argument("--tests-out", nargs="?", const="tests", metavar="MODULE",
+                    help="move the file's inline `mod tests` (or the test module named) to its own file")
     ap.add_argument("--root", default=".", help="the repository root")
     ap.add_argument("--no-fmt", action="store_true", help="skip `cargo fmt` (for tests)")
     ap.add_argument("--no-build", action="store_true", help="skip the build and its glue fixes (for tests)")
@@ -1500,7 +1649,7 @@ def main(argv=None):
     t = TARGETS[args.target]
     try:
         if args.tests_out:
-            tests_out(args.root, t, fmt=not args.no_fmt)
+            tests_out(args.root, t, fmt=not args.no_fmt, name=args.tests_out)
             return 0
         if args.check:
             return check(args.root, t)
