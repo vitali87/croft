@@ -39,6 +39,7 @@ src/
 │   ├── messages.rs       one-line summaries of git's output: results, conflicts, errors and refusals
 │   ├── operations.rs     a merge, rebase, cherry-pick, revert or bisect in progress; continuing, skipping or aborting it
 │   ├── patches.rs        applying a hunk or line patch to the index or working tree, CRLF endings kept
+│   ├── remotes.rs        pull, push, publish, fetch and clone; add and remove remotes; a file's web link
 │   ├── staging.rs        stage, unstage, remove and discard paths, one or all
 │   ├── status.rs         the status snapshot: branch, ahead/behind, changes, ignored paths, the prepared commit message, repositories one folder down
 │   ├── tests.rs          git.rs's own tests
