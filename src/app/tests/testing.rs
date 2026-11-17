@@ -441,6 +441,88 @@ fn a_run_before_the_follow_answers_goes_to_the_focused_package() {
     assert_eq!(app.test_worker.root(), root.join("packages/web"));
 }
 
+/// A monorepo whose `math` package runs vitest and `web` package runs
+/// jest, each with one test file, the app bound to `math` with its follow
+/// settled, then `web`'s test file focused and one tick run, so the follow
+/// for it is still being worked out. Returns the app, the `web` package
+/// and the tempdir that holds them.
+fn focused_web_while_bound_to_math() -> (App, PathBuf, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::write(
+        root.join("package.json"),
+        r#"{"name":"vmono","private":true,"workspaces":["packages/*"]}"#,
+    )
+    .unwrap();
+    for (name, marker) in [("math", "vitest.config.ts"), ("web", "jest.config.js")] {
+        let pkg = root.join("packages").join(name);
+        std::fs::create_dir_all(pkg.join("src")).unwrap();
+        std::fs::write(pkg.join(marker), "export default {};\n").unwrap();
+        std::fs::write(pkg.join("src/a.test.ts"), "test('a', () => {});\n").unwrap();
+    }
+    let mut app = App::new(root.clone()).unwrap();
+    settle_test_root(&mut app);
+    assert_eq!(app.active_test_root, root.join("packages/math"));
+    let web = root.join("packages/web");
+    app.editor.open_pinned(&web.join("src/a.test.ts")).unwrap();
+    app.drain_git_responses();
+    assert_eq!(app.active_test_root, root.join("packages/math"));
+    (app, web, tmp)
+}
+
+/// #1973 review: Rerun Last Run while the follow for a newly focused
+/// package is still being worked out reruns nothing of the package before.
+/// The rebind to the new package clears the last run, so it is settled
+/// before the last run is read, not after a copy of it was taken.
+#[test]
+fn rerun_last_run_never_runs_the_package_befores_tests_in_the_new_one() {
+    let (mut app, web, _tmp) = focused_web_while_bound_to_math();
+    app.last_test_run = Some(LastTestRun::One(String::from("adds")));
+
+    app.rerun_last_test_run();
+    assert_eq!(app.active_test_root, web);
+    assert_eq!(app.last_test_run, None, "{}", app.status);
+    assert_eq!(app.status, "Rerun Last Run: no test has run yet");
+}
+
+/// #1973 review: a run glyph on a row the Testing panel still shows from
+/// the package before the focus moved runs nothing. The panel lags the
+/// focus while the follow is worked out off the UI thread; the click
+/// settles it, which clears the panel, and the row's test is not the new
+/// package's.
+#[test]
+fn a_row_left_from_the_package_before_runs_nothing_in_the_new_one() {
+    use crate::testing::model::{TestCase, TestStatus};
+    use crate::widgets::testing::RowHit;
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let (mut app, web, _tmp) = focused_web_while_bound_to_math();
+    app.testing.apply_case(TestCase {
+        name: String::from("adds"),
+        status: TestStatus::Passed,
+    });
+    app.sidebar_view = SidebarView::Testing;
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let area = app.testing.last_area;
+    let (x, y) = (area.y..area.y + area.height)
+        .flat_map(|y| (area.x..area.x + area.width).map(move |x| (x, y)))
+        .find(|&(x, y)| app.testing.hit_at(x, y) == Some(RowHit::RunCase("adds".into())))
+        .expect("the row's run glyph");
+
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: x,
+        row: y,
+        modifiers: KeyModifiers::NONE,
+    });
+    assert_eq!(app.active_test_root, web);
+    assert_eq!(
+        app.status,
+        "Testing moved to the focused file's folder; that test was not run"
+    );
+    assert_eq!(app.last_test_run, None);
+}
+
 /// #1520 review: the followed package is cached per focused file, so a
 /// runner marker added while the same file stays open must still be picked
 /// up by the next Testing refresh or run gesture, not only by a focus change.

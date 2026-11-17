@@ -2826,7 +2826,29 @@ impl App {
                     } else if rect_contains(self.testing.last_stop, m.column, m.row) {
                         self.cancel_test_run();
                     } else {
-                        match self.testing.hit_at(m.column, m.row) {
+                        use crate::widgets::testing::RowHit;
+                        let hit = self.testing.hit_at(m.column, m.row);
+                        // A run glyph on a row the panel still shows from the
+                        // folder before the focus moved (#1973): the follow is
+                        // worked out off the UI thread, so the panel can lag
+                        // the focus. The settle rebinds and clears it, and
+                        // that row's test is not the new folder's to run.
+                        let runs = matches!(
+                            hit,
+                            Some(
+                                RowHit::RunCase(_)
+                                    | RowHit::RunSuite(_)
+                                    | RowHit::CoverCase(_)
+                                    | RowHit::CoverSuite(_)
+                            )
+                        );
+                        if runs && self.settle_followed_test_root() {
+                            self.status = String::from(
+                                "Testing moved to the focused file's folder; that test was not run",
+                            );
+                            return;
+                        }
+                        match hit {
                             Some(crate::widgets::testing::RowHit::ToggleWatch(scope)) => {
                                 self.toggle_test_watch(scope)
                             }

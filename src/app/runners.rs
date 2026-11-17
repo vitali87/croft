@@ -664,6 +664,10 @@ impl App {
         if self.testing_busy_says_so() {
             return;
         }
+        // Settled before the last run is read (#1973): a rebind to the
+        // focused file's folder clears it, and a copy taken first would run
+        // the folder before's tests in the new one.
+        self.settle_followed_test_root();
         let Some(last) = self.last_test_run.clone() else {
             self.status = String::from("Rerun Last Run: no test has run yet");
             return;
