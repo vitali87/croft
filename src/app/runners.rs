@@ -1403,8 +1403,8 @@ impl App {
         let Some((_, resolved, _)) = self.http_request_under_caret() else {
             return;
         };
-        copy_to_clipboard(&crate::http_file::to_curl(&resolved));
-        self.status = String::from("curl command copied");
+        let landing = self.copy_where_pasted(&crate::http_file::to_curl(&resolved));
+        self.status = format!("curl command copied{}", landing.note());
     }
 
     /// The parsed and variable-resolved request under the caret, or a

@@ -383,8 +383,8 @@ impl TestWorker {
         self.send(TestRequest::RunOne(name));
     }
 
-    pub fn run_many(&self, names: Vec<String>) {
-        let _ = self.request_tx.send(TestRequest::RunMany(names));
+    pub fn run_many(&mut self, names: Vec<String>) {
+        self.send(TestRequest::RunMany(names));
     }
 
     /// Run the tests matching `pattern`, with the runner for `file`'s
@@ -3275,6 +3275,51 @@ mod tests {
             std::fs::write(&p, format!("#!/bin/sh\n{text}\n")).unwrap();
             std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
+    }
+
+    /// #2078: Cancel during Rerun Failed Tests stops the whole rerun, not
+    /// only the test running then. `run_many` queued its request without
+    /// counting it, so the cancel stopped one request short: the running
+    /// test died and the next name still started. It is counted now, like
+    /// every other request.
+    #[cfg(unix)]
+    #[test]
+    fn cancelling_a_rerun_of_failed_tests_stops_the_names_after_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        std::fs::write(root.join("pyproject.toml"), "[project]\nname = \"g\"\n").unwrap();
+        fake_venv(
+            root,
+            ".venv",
+            "echo \"$*\" >> \"$0.log\"\ncase \"$*\" in *test_a*) sleep 1000;; esac\nfor a; do last=$a; done\necho \"$last PASSED\"\nexit 0",
+        );
+        let log = root.join(".venv/bin/python.log");
+        let calls = || std::fs::read_to_string(&log).unwrap_or_default();
+
+        let mut worker = TestWorker::spawn(root.to_path_buf());
+        let mut panel = TestingPanel::new();
+        worker.set_extensions_dir(PathBuf::from(NO_EXTENSIONS));
+        let before = worker.requests_sent();
+        // As `App::start_many_tests` starts a rerun.
+        let names = vec![String::from("t.py::test_a"), String::from("t.py::test_b")];
+        panel.start_many(&names);
+        worker.run_many(names);
+        assert_eq!(worker.requests_sent(), before + 1, "the rerun is counted");
+        wait_until("the first name starts", || {
+            worker.drain(&mut panel);
+            panel.is_busy() && calls().contains("test_a")
+        });
+        worker.cancel();
+        wait_until("the rerun ends", || {
+            worker.drain(&mut panel);
+            !panel.is_busy()
+        });
+        assert!(panel.take_cancelled(), "the end reads as cancelled");
+        assert!(
+            !calls().contains("test_b"),
+            "the name after the cancelled one never starts: {}",
+            calls()
+        );
     }
 
     /// #1535: Rerun Failed Tests runs each name exactly, all of them even

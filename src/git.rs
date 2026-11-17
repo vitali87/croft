@@ -4702,6 +4702,7 @@ mod tests {
         assert_eq!(result_line(""), "");
     }
     use super::*;
+    use crate::test_git::test_git_command;
     use tempfile::TempDir;
 
     #[test]
@@ -4790,7 +4791,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let root = tmp.path().canonicalize().unwrap();
         let run = |args: &[&str]| {
-            let ok = Command::new("git")
+            let ok = test_git_command()
                 .args(["-C", root.to_str().unwrap()])
                 .args(args)
                 .output()
@@ -4843,7 +4844,7 @@ mod tests {
     /// so the working tree carries two well-separated hunks.
     fn repo_with_two_hunks(root: &Path) {
         let run = |args: &[&str]| {
-            let ok = Command::new("git")
+            let ok = test_git_command()
                 .args(["-C", root.to_str().unwrap()])
                 .args(args)
                 .output()
@@ -4866,7 +4867,7 @@ mod tests {
     }
 
     fn git_stdout(root: &Path, args: &[&str]) -> String {
-        let out = Command::new("git")
+        let out = test_git_command()
             .args(["-C", root.to_str().unwrap()])
             .args(args)
             .output()
@@ -4914,7 +4915,7 @@ mod tests {
     /// with `echo two` changed to `echo TWO`; `config` is extra setup.
     fn crlf_checkout_with_one_edit(root: &Path, attrs: &str, config: &[(&str, &str)]) -> String {
         let git = |args: &[&str]| {
-            let out = Command::new("git")
+            let out = test_git_command()
                 .arg("-C")
                 .arg(root)
                 .args(args)
@@ -5041,7 +5042,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let p = tmp.path();
         // Init the repo non-interactively.
-        let _ = Command::new("git")
+        let _ = test_git_command()
             .args(["-C"])
             .arg(p)
             .args(["init", "-q", "-b", "main"])
@@ -5058,7 +5059,7 @@ mod tests {
     fn query_reports_dirty_after_a_file_appears() {
         let tmp = TempDir::new().unwrap();
         let p = tmp.path();
-        let _ = Command::new("git")
+        let _ = test_git_command()
             .args(["-C"])
             .arg(p)
             .args(["init", "-q", "-b", "main"])
@@ -5074,7 +5075,7 @@ mod tests {
     fn query_collects_ignored_files_and_collapsed_dirs() {
         let tmp = TempDir::new().unwrap();
         let p = tmp.path();
-        let _ = Command::new("git")
+        let _ = test_git_command()
             .args(["-C"])
             .arg(p)
             .args(["init", "-q", "-b", "main"])
@@ -5106,7 +5107,7 @@ mod tests {
         // paints normally (it asks check-ignore per resource).
         let tmp = TempDir::new().unwrap();
         let p = tmp.path();
-        let _ = Command::new("git")
+        let _ = test_git_command()
             .args(["-C"])
             .arg(p)
             .args(["init", "-q", "-b", "main"])
@@ -5135,7 +5136,7 @@ mod tests {
         // uses ~1 MB. On the single-threaded version this test hangs.
         let tmp = TempDir::new().unwrap();
         let p = tmp.path();
-        let _ = Command::new("git")
+        let _ = test_git_command()
             .args(["-C"])
             .arg(p)
             .args(["init", "-q", "-b", "main"])
@@ -5165,7 +5166,7 @@ mod tests {
         // file that does not exist while the real one stays unmarked.
         let tmp = TempDir::new().unwrap();
         let p = tmp.path();
-        let _ = Command::new("git")
+        let _ = test_git_command()
             .args(["-C"])
             .arg(p)
             .args(["init", "-q", "-b", "main"])
@@ -5186,7 +5187,7 @@ mod tests {
     fn one_paths_ignore_verdict_matches_the_rules() {
         let tmp = TempDir::new().unwrap();
         let p = tmp.path();
-        let _ = Command::new("git")
+        let _ = test_git_command()
             .args(["-C"])
             .arg(p)
             .args(["init", "-q", "-b", "main"])
@@ -5217,7 +5218,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let p = tmp.path();
         let git = |args: &[&str]| {
-            Command::new("git")
+            test_git_command()
                 .arg("-C")
                 .arg(p)
                 .args(["-c", "user.email=t@t", "-c", "user.name=t"])
@@ -5479,7 +5480,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let p = tmp.path();
         let git = |args: &[&str]| {
-            Command::new("git")
+            test_git_command()
                 .arg("-C")
                 .arg(p)
                 .args(args)
@@ -5522,28 +5523,28 @@ mod tests {
     fn commit_creates_a_commit_in_a_real_repo() {
         let tmp = TempDir::new().unwrap();
         let p = tmp.path();
-        let _ = Command::new("git")
+        let _ = test_git_command()
             .args(["-C"])
             .arg(p)
             .args(["init", "-q", "-b", "main"])
             .output();
-        let _ = Command::new("git")
+        let _ = test_git_command()
             .args(["-C"])
             .arg(p)
             .args(["config", "user.email", "a@b"])
             .status();
-        let _ = Command::new("git")
+        let _ = test_git_command()
             .args(["-C"])
             .arg(p)
             .args(["config", "user.name", "a"])
             .status();
         std::fs::write(p.join("hello.txt"), "hi").unwrap();
-        let _ = Command::new("git")
+        let _ = test_git_command()
             .args(["-C"])
             .arg(p)
             .args(["add", "."])
             .status();
-        let _ = Command::new("git")
+        let _ = test_git_command()
             .args(["-C"])
             .arg(p)
             .args(["commit", "-m", "init", "--quiet"])
@@ -5580,17 +5581,17 @@ mod tests {
     fn git_worker_loop_processes_a_status_and_changes_request_and_returns_entries() {
         let tmp = TempDir::new().unwrap();
         let p = tmp.path();
-        let _ = Command::new("git")
+        let _ = test_git_command()
             .args(["-C"])
             .arg(p)
             .args(["init", "-q", "-b", "main"])
             .output();
-        let _ = Command::new("git")
+        let _ = test_git_command()
             .args(["-C"])
             .arg(p)
             .args(["config", "user.email", "a@b"])
             .status();
-        let _ = Command::new("git")
+        let _ = test_git_command()
             .args(["-C"])
             .arg(p)
             .args(["config", "user.name", "a"])
@@ -5624,17 +5625,17 @@ mod tests {
         let tmp_no_repo = TempDir::new().unwrap();
         let tmp_repo = TempDir::new().unwrap();
         let p_repo = tmp_repo.path();
-        let _ = Command::new("git")
+        let _ = test_git_command()
             .args(["-C"])
             .arg(p_repo)
             .args(["init", "-q", "-b", "feature-x"])
             .output();
-        let _ = Command::new("git")
+        let _ = test_git_command()
             .args(["-C"])
             .arg(p_repo)
             .args(["config", "user.email", "a@b"])
             .status();
-        let _ = Command::new("git")
+        let _ = test_git_command()
             .args(["-C"])
             .arg(p_repo)
             .args(["config", "user.name", "a"])
@@ -5674,17 +5675,17 @@ mod tests {
         // logical refresh.
         let tmp = TempDir::new().unwrap();
         let p = tmp.path();
-        let _ = Command::new("git")
+        let _ = test_git_command()
             .args(["-C"])
             .arg(p)
             .args(["init", "-q", "-b", "main"])
             .output();
-        let _ = Command::new("git")
+        let _ = test_git_command()
             .args(["-C"])
             .arg(p)
             .args(["config", "user.email", "a@b"])
             .status();
-        let _ = Command::new("git")
+        let _ = test_git_command()
             .args(["-C"])
             .arg(p)
             .args(["config", "user.name", "a"])
@@ -5715,12 +5716,32 @@ mod tests {
     }
 
     fn sh_git(p: &Path, args: &[&str]) -> String {
-        let out = Command::new("git")
+        let out = test_git_command()
             .arg("-C")
             .arg(p)
             .args(args)
             .output()
             .unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
+
+    /// What `git <args>` prints in `p` when run as the app runs git, to
+    /// compare with the app's own output: both read the developer's git
+    /// config, so a setting there (diff prefixes, `core.abbrev`, a log
+    /// format) changes both alike. A `diff` or `show` also drops colour and
+    /// an external diff tool, as the app's `diff_text` always does (#1447),
+    /// so a `color.diff = always` or a `diff.external` there leaves the two
+    /// sides equal.
+    fn app_git_out(p: &Path, args: &[&str]) -> String {
+        let mut git = crate::test_git::app_git(p);
+        match args.split_first() {
+            Some((sub, rest)) if matches!(*sub, "diff" | "show") => git
+                .arg(sub)
+                .args(["--no-color", "--no-ext-diff"])
+                .args(rest),
+            _ => git.args(args),
+        };
+        let out = git.output().unwrap();
         String::from_utf8_lossy(&out.stdout).into_owned()
     }
 
@@ -5824,7 +5845,7 @@ mod tests {
     fn a_pull_request_head_checks_out_into_a_sibling_worktree() {
         let tmp = tempfile::tempdir().unwrap();
         let git = |dir: &Path, args: &[&str]| {
-            let out = Command::new("git")
+            let out = test_git_command()
                 .arg("-C")
                 .arg(dir)
                 .args(args)
@@ -5913,7 +5934,7 @@ mod tests {
             ("origin", "git@github.com:me/fork.git"),
             ("upstream", "https://github.com/Owner/Repo"),
         ] {
-            let _ = Command::new("git")
+            let _ = test_git_command()
                 .arg("-C")
                 .arg(tmp.path())
                 .args(["remote", "add", name, url])
@@ -5924,37 +5945,47 @@ mod tests {
     }
 
     fn init_repo_with_commit(p: &Path) {
-        let _ = Command::new("git")
+        let _ = test_git_command()
             .args(["-C"])
             .arg(p)
             .args(["init", "-q", "-b", "main"])
             .output();
-        let _ = Command::new("git")
+        let _ = test_git_command()
             .args(["-C"])
             .arg(p)
             .args(["config", "user.email", "a@b"])
             .status();
-        let _ = Command::new("git")
+        let _ = test_git_command()
             .args(["-C"])
             .arg(p)
             .args(["config", "user.name", "a"])
             .status();
         std::fs::write(p.join("seed.txt"), "one\ntwo\n").unwrap();
-        let _ = Command::new("git")
+        let _ = test_git_command()
             .args(["-C"])
             .arg(p)
             .args(["add", "."])
             .status();
-        let _ = Command::new("git")
+        let _ = test_git_command()
             .args(["-C"])
             .arg(p)
             .args(["commit", "-m", "init", "--quiet"])
             .status();
     }
 
+    /// Pin git's own `a/` and `b/` diff prefixes in `p`'s repository config,
+    /// which outranks the developer's: a test that looks for them in the
+    /// app's diff output then holds whatever `diff.noprefix` or
+    /// `diff.mnemonicPrefix` the developer set. The app reads either form
+    /// (#2020); only the test's expected text names one.
+    fn pin_diff_prefixes(p: &Path) {
+        git_in(p, &["config", "diff.noprefix", "false"]);
+        git_in(p, &["config", "diff.mnemonicPrefix", "false"]);
+    }
+
     /// `git -C p <args>`, asserting it succeeded; its stdout, trimmed.
     fn git_in(p: &Path, args: &[&str]) -> String {
-        let out = Command::new("git")
+        let out = test_git_command()
             .arg("-C")
             .arg(p)
             .args(args)
@@ -5994,7 +6025,7 @@ mod tests {
         let p = tmp.path();
         init_repo_with_commit(p);
         assert_eq!(undo_last_commit(p).as_deref(), Ok("init"));
-        let head = Command::new("git")
+        let head = test_git_command()
             .arg("-C")
             .arg(p)
             .args(["rev-parse", "--verify", "-q", "HEAD"])
@@ -6296,7 +6327,7 @@ mod tests {
         std::fs::write(p.join("sub/e.py"), "x = 1\ny = 2\n").unwrap();
         std::fs::write(p.join("c.py"), "new = 1\n").unwrap();
         std::fs::write(p.join("d.py"), "staged = 1\n").unwrap();
-        Command::new("git")
+        test_git_command()
             .arg("-C")
             .arg(p)
             .args(["add", "d.py"])
@@ -6584,7 +6615,7 @@ mod tests {
         let lane = side.path().join("lane-clean");
 
         let git = |args: &[&str]| {
-            let _ = Command::new("git").args(["-C"]).arg(p).args(args).status();
+            let _ = test_git_command().args(["-C"]).arg(p).args(args).status();
         };
         git(&[
             "worktree",
@@ -6616,7 +6647,7 @@ mod tests {
         std::fs::remove_file(lane.join("scratch.txt")).unwrap();
         std::fs::write(lane.join(".gitignore"), "*.local\n").unwrap();
         let lane_git0 = |args: &[&str]| {
-            let _ = Command::new("git")
+            let _ = test_git_command()
                 .args(["-C"])
                 .arg(&lane)
                 .args(args)
@@ -6638,7 +6669,7 @@ mod tests {
 
         // Committing it makes the lane clean again.
         let lane_git = |args: &[&str]| {
-            let _ = Command::new("git")
+            let _ = test_git_command()
                 .args(["-C"])
                 .arg(&lane)
                 .args(args)
@@ -6652,7 +6683,7 @@ mod tests {
             "a committed lane is clean again"
         );
 
-        let _ = Command::new("git")
+        let _ = test_git_command()
             .args(["-C"])
             .arg(p)
             .args(["worktree", "remove", "--force", lane.to_str().unwrap()])
@@ -6694,14 +6725,14 @@ mod tests {
         init_repo_with_commit(p);
 
         let git = |args: &[&str]| {
-            let _ = Command::new("git").args(["-C"]).arg(p).args(args).status();
+            let _ = test_git_command().args(["-C"]).arg(p).args(args).status();
         };
         // A sibling branch whose commit dates FUTURE, so any date- or
         // topo-ordered listing across all branches puts it first.
         git(&["checkout", "-q", "-b", "sibling"]);
         std::fs::write(p.join("sibling.txt"), "s").unwrap();
         git(&["add", "-A"]);
-        let _ = Command::new("git")
+        let _ = test_git_command()
             .args(["-C"])
             .arg(p)
             .args(["commit", "-q", "-m", "sibling-future"])
@@ -6711,7 +6742,7 @@ mod tests {
         // Back to the original branch.
         git(&["checkout", "-q", "-"]);
 
-        let head = Command::new("git")
+        let head = test_git_command()
             .args(["-C"])
             .arg(p)
             .args(["rev-parse", "HEAD"])
@@ -6750,7 +6781,7 @@ mod tests {
         let p = tmp.path();
         init_repo_with_commit(p);
         let git = |args: &[&str]| {
-            let _ = Command::new("git").args(["-C"]).arg(p).args(args).status();
+            let _ = test_git_command().args(["-C"]).arg(p).args(args).status();
         };
         std::fs::create_dir_all(p.join("sub/deep")).unwrap();
         std::fs::write(p.join("sub/deep/new.txt"), "n").unwrap();
@@ -6777,7 +6808,7 @@ mod tests {
 
         // A submodule's contents are never listed, so they count as present.
         let head_sha = String::from_utf8(
-            Command::new("git")
+            test_git_command()
                 .arg("-C")
                 .arg(p)
                 .args(["rev-parse", "HEAD"])
@@ -6799,7 +6830,7 @@ mod tests {
     /// control for the ignored-file case: it must see NOTHING there, or the
     /// assertion that `lane_removal_block` catches it proves nothing.
     fn plain_status_is_clean(lane: &Path) -> bool {
-        let out = Command::new("git")
+        let out = test_git_command()
             .args(["-C"])
             .arg(lane)
             .args(["status", "--porcelain"])
@@ -6884,7 +6915,7 @@ mod tests {
         assert!(lane.path.is_dir(), "the lane directory exists");
 
         // The branch really was created, and the lane is on it.
-        let out = Command::new("git")
+        let out = test_git_command()
             .args(["-C"])
             .arg(&lane.path)
             .args(["rev-parse", "--abbrev-ref", "HEAD"])
@@ -6909,7 +6940,7 @@ mod tests {
         // because it is why the caller runs git BEFORE dropping the
         // workspace folder: the other order leaves the lane gone from the
         // workspace and the directory still on disk.
-        let _ = Command::new("git")
+        let _ = test_git_command()
             .args(["-C"])
             .arg(p)
             .args(["worktree", "lock", lane.path.to_str().unwrap()])
@@ -6924,7 +6955,7 @@ mod tests {
             "git must refuse a locked worktree, and the caller must hear it"
         );
         assert!(lane.path.is_dir(), "the refusal left the lane in place");
-        let _ = Command::new("git")
+        let _ = test_git_command()
             .args(["-C"])
             .arg(p)
             .args(["worktree", "unlock", lane.path.to_str().unwrap()])
@@ -6940,7 +6971,7 @@ mod tests {
         let p = tmp.path();
         init_repo_with_commit(p);
         std::fs::write(p.join("seed.txt"), "one\ntwo\nthree\n").unwrap();
-        let _ = Command::new("git")
+        let _ = test_git_command()
             .args(["-C"])
             .arg(p)
             .args(["add", "seed.txt"])
@@ -7032,11 +7063,14 @@ mod tests {
     fn git_diff_views_are_unchanged_without_colour_config() {
         let (tmp, _) = repo_with_a_staged_edit();
         let p = tmp.path();
-        assert_eq!(diff_staged(p).unwrap(), sh_git(p, &["diff", "--staged"]));
+        assert_eq!(
+            diff_staged(p).unwrap(),
+            app_git_out(p, &["diff", "--staged"])
+        );
         sh_git(p, &["commit", "-qm", "two"]);
         assert_eq!(
             show_commit(p, "HEAD").unwrap(),
-            sh_git(p, &["show", "--stat", "--patch", "HEAD"])
+            app_git_out(p, &["show", "--stat", "--patch", "HEAD"])
         );
     }
 
@@ -7060,7 +7094,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let p = tmp.path();
         let git = |args: &[&str]| {
-            let o = Command::new("git")
+            let o = test_git_command()
                 .arg("-C")
                 .arg(p)
                 .args(args)
@@ -7096,6 +7130,7 @@ mod tests {
     #[test]
     fn diff_against_branch_starts_from_the_merge_base() {
         let tmp = branch_behind_a_moved_main();
+        pin_diff_prefixes(tmp.path());
         let out = diff_against_branch(tmp.path(), "main").unwrap();
         assert!(out.contains("+++ b/feature.py"), "{out}");
         assert!(!out.contains("teammate.py"), "{out}");
@@ -7124,7 +7159,7 @@ mod tests {
         let p = tmp.path();
         init_repo_with_commit(p);
         let git = |args: &[&str]| {
-            Command::new("git")
+            test_git_command()
                 .arg("-C")
                 .arg(p)
                 .args(args)
@@ -7136,7 +7171,7 @@ mod tests {
         git(&["commit", "-qam", "three"]);
         std::fs::write(p.join("new.txt"), "x\n").unwrap();
         git(&["add", "new.txt"]);
-        let plain = String::from_utf8(git(&["diff", "main"]).stdout).unwrap();
+        let plain = app_git_out(p, &["diff", "main"]);
         assert!(plain.contains("+three"), "{plain}");
         assert_eq!(diff_against_branch(p, "main").unwrap(), plain);
     }
@@ -7149,7 +7184,7 @@ mod tests {
         let p = tmp.path();
         init_repo_with_commit(p);
         let git = |args: &[&str]| {
-            Command::new("git")
+            test_git_command()
                 .arg("-C")
                 .arg(p)
                 .args(args)
@@ -7162,7 +7197,7 @@ mod tests {
         git(&["add", "."]);
         git(&["commit", "-qm", "other root"]);
         assert_eq!(merge_base(p, "main"), None);
-        let plain = String::from_utf8(git(&["diff", "main"]).stdout).unwrap();
+        let plain = app_git_out(p, &["diff", "main"]);
         assert!(plain.contains("seed.txt"), "{plain}");
         assert_eq!(diff_against_branch(p, "main").unwrap(), plain);
     }
@@ -7180,7 +7215,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let p = tmp.path();
         let git = |args: &[&str]| {
-            let o = Command::new("git")
+            let o = test_git_command()
                 .arg("-C")
                 .arg(p)
                 .args(args)
@@ -7236,7 +7271,7 @@ mod tests {
         let p = tmp.path();
         let git = |args: &[&str]| {
             assert!(
-                Command::new("git")
+                test_git_command()
                     .arg("-C")
                     .arg(p)
                     .args(args)
@@ -7282,7 +7317,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let p = tmp.path();
         let git = |args: &[&str]| {
-            let out = Command::new("git")
+            let out = test_git_command()
                 .arg("-C")
                 .arg(p)
                 .args(args)
@@ -7442,6 +7477,7 @@ filename seed.txt
         let sub = tmp.path().join("sub");
         std::fs::create_dir(&sub).unwrap();
         init_repo_with_commit(&sub);
+        pin_diff_prefixes(&sub);
         let raw = show_commit_file_diff(tmp.path(), "HEAD", "sub/seed.txt").unwrap();
         assert!(raw.contains("diff --git a/seed.txt b/seed.txt"), "{raw}");
         assert!(raw.lines().any(|l| l == "+two"), "{raw}");
@@ -7465,12 +7501,12 @@ filename seed.txt
         init_repo_with_commit(p);
         std::fs::create_dir(p.join("dir")).unwrap();
         std::fs::write(p.join("dir/x.txt"), "x\n").unwrap();
-        let _ = Command::new("git")
+        let _ = test_git_command()
             .arg("-C")
             .arg(p)
             .args(["add", "."])
             .status();
-        let _ = Command::new("git")
+        let _ = test_git_command()
             .arg("-C")
             .arg(p)
             .args(["commit", "-qm", "x"])
@@ -7530,7 +7566,7 @@ filename seed.txt
 
     /// Stage a path so we can exercise `unstage_*` against a real index.
     fn stage(p: &Path, rel: &str) {
-        let _ = Command::new("git")
+        let _ = test_git_command()
             .args(["-C"])
             .arg(p)
             .args(["add", rel])
@@ -7979,7 +8015,7 @@ filename seed.txt
         init_repo_with_commit(up);
         let clone = TempDir::new().unwrap();
         let clone_path = clone.path().join("work");
-        let ok = Command::new("git")
+        let ok = test_git_command()
             .args(["clone", "-q"])
             .arg(up)
             .arg(&clone_path)
@@ -8019,7 +8055,7 @@ git checkout -q main && sed 's/python pricing.py/uv run pricing.py/' README.md >
     }
 
     fn head_of(p: &Path) -> String {
-        let out = Command::new("git")
+        let out = test_git_command()
             .arg("-C")
             .arg(p)
             .args(["rev-parse", "HEAD"])
@@ -8061,7 +8097,7 @@ git checkout -q main && sed 's/python pricing.py/uv run pricing.py/' README.md >
         run_mutation(p, &["add", "README.md"]).unwrap();
         assert!(unmerged_paths(p).is_empty());
         commit(p, "Merge hotfix").expect("a resolved merge commits");
-        let parents = Command::new("git")
+        let parents = test_git_command()
             .arg("-C")
             .arg(p)
             .args(["rev-list", "--parents", "-n1", "HEAD"])
@@ -8233,7 +8269,7 @@ sed -n '1,7p' GUIDE.md > g.tmp && echo 'Run `uv run -m pricing`.' >> g.tmp && mv
     fn filtered_repo_with(root: &Path, name: &str) {
         let run = |args: &[&str]| {
             assert!(
-                Command::new("git")
+                test_git_command()
                     .arg("-C")
                     .arg(root)
                     .args(args)
@@ -8429,7 +8465,7 @@ sed -n '1,7p' GUIDE.md > g.tmp && echo 'Run `uv run -m pricing`.' >> g.tmp && mv
         let raw = show_commit_file_diff(tmp.path(), hash.trim(), "notes.md").unwrap();
         assert_eq!(
             raw,
-            sh_git(tmp.path(), &["show", hash.trim(), "--", "notes.md"]),
+            app_git_out(tmp.path(), &["show", hash.trim(), "--", "notes.md"]),
             "an unfiltered file keeps git's own diff, commit header and all"
         );
         // And what git stores for the filtered file is still the cleaned
@@ -8495,7 +8531,7 @@ sed -n '1,7p' GUIDE.md > g.tmp && echo 'Run `uv run -m pricing`.' >> g.tmp && mv
         .unwrap();
         let git = |args: &[&str]| {
             assert!(
-                Command::new("git")
+                test_git_command()
                     .arg("-C")
                     .arg(p)
                     .args(args)
@@ -8554,7 +8590,7 @@ sed -n '1,7p' GUIDE.md > g.tmp && echo 'Run `uv run -m pricing`.' >> g.tmp && mv
         let err = share_link(&file, None, LinkRev::Branch).unwrap_err();
         assert!(err.contains("branch main is not on origin"), "{err}");
         std::fs::write(tmp.path().join("src/new.rs"), "x\n").unwrap();
-        let _ = Command::new("git")
+        let _ = test_git_command()
             .arg("-C")
             .arg(tmp.path())
             .args(["update-ref", "refs/remotes/origin/main", "HEAD"])
@@ -8564,7 +8600,7 @@ sed -n '1,7p' GUIDE.md > g.tmp && echo 'Run `uv run -m pricing`.' >> g.tmp && mv
         // Staged but not committed is still not on the remote.
         let git = |args: &[&str]| {
             assert!(
-                Command::new("git")
+                test_git_command()
                     .arg("-C")
                     .arg(tmp.path())
                     .args(args)

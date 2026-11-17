@@ -25,7 +25,7 @@ pub(super) fn shortcut_for(action: &MenuAction) -> Option<&'static str> {
         MenuAction::RevealInExplorer(_) => Some("⌘K E"),
         MenuAction::Delete { .. } => Some("⌫"),
         MenuAction::CloseTab(_) => Some("⌘W"),
-        MenuAction::CloseOtherTabs(_) => Some("⌥⌘T"),
+        MenuAction::CloseOtherTabs(_) => Some("⌘K ⇧X"),
         MenuAction::CloseAllTabs => Some("⌘K W"),
         MenuAction::CloseSavedTabs => Some("⌘K U"),
         MenuAction::KeepTabOpen(_) => Some("⌘K ⇧P"),
@@ -123,6 +123,7 @@ pub(super) fn menu_action_command(
         MenuAction::TerminalCopyMode => Cmd::TerminalCopyMode,
         MenuAction::TerminalCommandHistory => Cmd::TerminalCommandHistory,
         MenuAction::OpenScrollbackInEditor => Cmd::TerminalOpenScrollback,
+        MenuAction::CloseOtherTabs(_) => Cmd::CloseOtherEditors,
         _ => return None,
     })
 }
@@ -1179,7 +1180,11 @@ impl App {
             MenuAction::OpenInViewer(id, path) => {
                 // The row was built when the menu opened; an extension
                 // removed since then must not make the click a silent no-op.
-                match crate::mcp::registry::viewer_by_id_in_dir(&self.config_dir, &id) {
+                match crate::mcp::registry::viewer_by_id_in_dir(
+                    &self.config_dir,
+                    &self.disabled_extensions,
+                    &id,
+                ) {
                     Some(viewer) => self.open_in_viewer(&viewer, &path),
                     None => self.status = format!("{id} is no longer available"),
                 }
@@ -1478,7 +1483,7 @@ impl App {
                     self.editor.eol = eol;
                     // The content is unchanged but the on-disk bytes will differ:
                     // mark dirty so the user saves to apply the new EOL.
-                    self.editor.dirty = true;
+                    self.editor.mark_dirty();
                 }
                 self.status = format!("End of Line: {}", eol.label());
             }

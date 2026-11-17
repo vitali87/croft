@@ -417,13 +417,14 @@ class Helpers(unittest.TestCase):
 
     def test_every_file_in_the_manifest_has_its_doc_note_and_row(self):
         root = Path(__file__).resolve().parents[2]
-        rows = mi.read_manifest(root / mi.MANIFEST)
-        files = {file for pr, file, *_ in rows if pr}
-        self.assertEqual(files, set(mi.FILES))
-        for file, (doc, phrase, row) in mi.FILES.items():
-            with self.subTest(file=file):
-                self.assertTrue(doc and phrase and row)
-                self.assertTrue(all(len("//! " + ln) <= 100 for ln in doc.split("\n")))
+        for t in mi.TARGETS.values():
+            rows = mi.read_manifest(root / t.manifest)
+            files = {file for pr, file, *_ in rows if pr}
+            self.assertEqual(files, set(t.files), t.name)
+            for file, (doc, phrase, row) in t.files.items():
+                with self.subTest(target=t.name, file=file):
+                    self.assertTrue(doc and phrase and row)
+                    self.assertTrue(all(len("//! " + ln) <= 100 for ln in doc.split("\n")))
 
 
 # A file split into a folder beside it (the editor), its tests inline.
@@ -590,8 +591,22 @@ class OtherTargets(unittest.TestCase):
                                 r"    │   ├── undo\.rs +undo and redo\n    ├── editor_find")
         self.assertEqual(mi.add_arch_row(twice, "undo", SPLIT), twice)
 
+    def test_a_row_another_folder_has_does_not_stop_this_folder_getting_it(self):
+        # editor/ and terminal/ list their files with the same indentation:
+        # editor/ having an undo.rs row must not keep terminal/ from one.
+        widgets = WIDGETS.replace("    ├── editor_find.rs        Find.\n",
+                                  "    ├── editor_find.rs        Find.\n"
+                                  "    ├── terminal.rs           The terminal.\n")
+        term = mi.TERMINAL._replace(files={"undo": ("Undo.", "terminal undo", "terminal undo")})
+        both = mi.add_arch_row(mi.add_arch_row(widgets, "undo", SPLIT), "undo", term)
+        self.assertRegex(both, r"├── editor/ .*\n    │   ├── undo\.rs +undo and redo\n"
+                               r"    ├── editor_find")
+        self.assertRegex(both, r"├── terminal\.rs .*\n    ├── terminal/ .*\n"
+                               r"    │   ├── undo\.rs +terminal undo\n```")
+        self.assertEqual(mi.add_arch_row(both, "undo", term), both)
+
     def test_every_target_names_its_own_manifest_file_and_folder(self):
-        self.assertEqual(sorted(mi.TARGETS), ["app", "editor"])
+        self.assertEqual(sorted(mi.TARGETS), ["app", "editor", "lsp", "terminal"])
         for t in mi.TARGETS.values():
             with self.subTest(target=t.name):
                 self.assertTrue(t.source.endswith(".rs") and t.manifest.endswith(".tsv"))

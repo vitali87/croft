@@ -57,10 +57,12 @@ already share a screen. What dtach cannot do: say who is attached, tell which
 client typed a byte, enforce read-only, or reconcile two window sizes (last
 writer wins).
 
-The editor (`src/widgets/editor.rs`) is equally single-author: the buffer is a
+The editor (`src/widgets/editor.rs` and its feature files in
+`src/widgets/editor/`) is equally single-author: the buffer is a
 `Vec<String>`, undo is a stack of full-buffer snapshots assuming one linear
-timeline (`src/widgets/editor.rs:1111`), LSP sync is full-text only
-(`src/lsp/client.rs:434`), there is no single apply-edit chokepoint, and a
+timeline (`Editor::snapshot` and `Editor::push_undo_step` in
+`src/widgets/editor/undo.rs`), LSP sync is full-text only
+(`LspClient::did_change_full` in `src/lsp/client.rs`), there is no single apply-edit chokepoint, and a
 split view is two independent copies re-read from disk
 (`App::split_editor_dir`, `src/app/editor_tabs.rs`).
 
@@ -256,9 +258,9 @@ the `.host-stale` marker rather than refusing clients forever.
 
 A guest with control can drive the shared primary cursor (pairing over tmux,
 but with names and permission) or their **own caret**. The editor already has
-the machinery for the latter: `carets: Vec<EditorSelection>`
-(`src/widgets/editor.rs:1378`) and `multi_apply`
-(`src/widgets/editor.rs:3262`) fan an edit across carets. Attributed guest
+the machinery for the latter: `carets: Vec<EditorSelection>` (a field of
+`Editor` in `src/widgets/editor.rs`) and `multi_apply`
+(`src/widgets/editor/multi_cursor.rs`) fan an edit across carets. Attributed guest
 keystrokes route to a per-guest caret instead of the primary cursor, rendered
 in the guest's color. Because it all still happens in one buffer in one
 process, undo, LSP sync, save and the FS watcher keep working unchanged. Undo

@@ -2462,7 +2462,7 @@ impl App {
                     && view.editable()
                     && view.commit_edit().is_some()
                 {
-                    ed.dirty = true;
+                    ed.mark_dirty();
                 }
             }
         }
@@ -4146,18 +4146,15 @@ impl App {
                 });
             }
             CommitAction::CopyHash => {
-                self.status = if copy_to_clipboard(hash) {
-                    format!("Copied commit hash {short}")
-                } else {
-                    String::from("Could not copy the commit hash to the clipboard")
-                };
+                let landing = self.copy_where_pasted(hash);
+                self.status = format!("Copied commit hash {short}{}", landing.note());
             }
             CommitAction::CopyMessage => {
                 self.status = match crate::git::commit_message(&root, hash) {
-                    Ok(message) if copy_to_clipboard(&message) => {
-                        format!("Copied the message of {short}")
+                    Ok(message) => {
+                        let landing = self.copy_where_pasted(&message);
+                        format!("Copied the message of {short}{}", landing.note())
                     }
-                    Ok(_) => String::from("Could not copy the commit message to the clipboard"),
                     Err(e) => format!("Could not read the message of {short}: {e}"),
                 };
             }
@@ -4189,12 +4186,8 @@ impl App {
         }
         // The clipboard the user pastes from, as any copy reaches it: the
         // local one over the relay, else this machine's, else OSC 52.
-        let via_relay = self.is_relay_session && self.push_clipboard_via_relay(&url);
-        self.status = if via_relay || copy_to_clipboard(&url) {
-            format!("Copied {url}")
-        } else {
-            format!("Copied {url} via OSC 52 (the host terminal decides)")
-        };
+        let landing = self.copy_where_pasted(&url);
+        self.status = format!("Copied {url}{}", landing.note());
     }
 
     /// The 1-based lines a shared link points at: the selection's, less a
