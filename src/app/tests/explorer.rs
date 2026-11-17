@@ -2438,7 +2438,7 @@ fn focusing_a_secondary_roots_file_rebinds_the_test_runner_and_tasks() {
     app.editor
         .open_pinned(&proj_canon.join("src/main.rs"))
         .unwrap();
-    let _ = app.drain_git_responses();
+    settle_test_root(&mut app);
     assert_eq!(
         app.active_test_root, proj_canon,
         "the Testing stack follows"

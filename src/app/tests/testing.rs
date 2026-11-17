@@ -326,16 +326,201 @@ fn the_testing_view_follows_the_focused_package_in_a_monorepo() {
         std::fs::write(pkg.join("src/a.test.ts"), "test('a', () => {});\n").unwrap();
     }
     let mut app = App::new(root.clone()).unwrap();
-    app.drain_git_responses();
+    settle_test_root(&mut app);
     assert_eq!(app.active_test_root, root.join("packages/math"));
     assert!(app.testing_runner_available(), "{}", app.status);
 
     app.editor
         .open_pinned(&root.join("packages/web/src/a.test.ts"))
         .unwrap();
-    app.drain_git_responses();
+    settle_test_root(&mut app);
     assert_eq!(app.active_test_root, root.join("packages/web"));
     assert_eq!(app.test_worker.root(), root.join("packages/web"));
+}
+
+/// #1973: the tick that follows the focus never works the Testing folder
+/// out itself. With the CodeQL runner added that walks the folder four
+/// deep for test packs, and in a home folder on macOS it held the first
+/// frame for 1.3 to 4.4 seconds. The tick hands it to a thread and returns
+/// still bound to the folder; the answer is applied on a later tick.
+#[test]
+fn the_testing_folder_is_worked_out_off_the_ui_thread() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::write(
+        root.join("package.json"),
+        r#"{"name":"vmono","private":true,"workspaces":["packages/*"]}"#,
+    )
+    .unwrap();
+    let pkg = root.join("packages/math");
+    std::fs::create_dir_all(&pkg).unwrap();
+    std::fs::write(pkg.join("vitest.config.ts"), "export default {};\n").unwrap();
+    let mut app = App::new(root.clone()).unwrap();
+
+    app.drain_git_responses();
+    assert!(
+        app.test_root_pending.is_some(),
+        "the tick asks a thread for the folder"
+    );
+    assert_eq!(
+        app.active_test_root, root,
+        "and stays bound until it answers"
+    );
+
+    settle_test_root(&mut app);
+    assert_eq!(app.active_test_root, pkg);
+    assert_eq!(app.test_worker.root(), pkg);
+}
+
+/// #1973 review: with the Testing view showing, a folder the per-tick follow
+/// worked out on a thread is discovered as it came. The rebind used to go
+/// through `discover_tests`, which works the folder out again on the UI
+/// thread: the very walk the thread was there to take off it.
+#[test]
+fn a_followed_folder_landing_with_testing_shown_is_not_worked_out_again() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::write(
+        root.join("package.json"),
+        r#"{"name":"vmono","private":true,"workspaces":["packages/*"]}"#,
+    )
+    .unwrap();
+    let pkg = root.join("packages/math");
+    std::fs::create_dir_all(&pkg).unwrap();
+    std::fs::write(pkg.join("vitest.config.ts"), "export default {};\n").unwrap();
+    let mut app = App::new(root.clone()).unwrap();
+    app.sidebar_view = SidebarView::Testing;
+    let worked_out_here = TEST_ROOTS_WORKED_OUT_HERE.with(|n| n.get());
+
+    settle_test_root(&mut app);
+    assert_eq!(app.active_test_root, pkg);
+    assert!(
+        app.test_worker.discover_queued(),
+        "the rebind discovers the new folder"
+    );
+    assert_eq!(
+        TEST_ROOTS_WORKED_OUT_HERE.with(|n| n.get()),
+        worked_out_here,
+        "and never works the folder out again on this thread"
+    );
+}
+
+/// #1973 review: a run asked for while the follow for a newly focused file
+/// is still being worked out must run in that file's package, not in the
+/// one the stack is still bound to from the file focused before.
+#[test]
+fn a_run_before_the_follow_answers_goes_to_the_focused_package() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::write(
+        root.join("package.json"),
+        r#"{"name":"vmono","private":true,"workspaces":["packages/*"]}"#,
+    )
+    .unwrap();
+    for (name, marker) in [("math", "vitest.config.ts"), ("web", "jest.config.js")] {
+        let pkg = root.join("packages").join(name);
+        std::fs::create_dir_all(pkg.join("src")).unwrap();
+        std::fs::write(pkg.join(marker), "export default {};\n").unwrap();
+        std::fs::write(pkg.join("src/a.test.ts"), "test('a', () => {});\n").unwrap();
+    }
+    let mut app = App::new(root.clone()).unwrap();
+    settle_test_root(&mut app);
+    assert_eq!(app.active_test_root, root.join("packages/math"));
+
+    app.editor
+        .open_pinned(&root.join("packages/web/src/a.test.ts"))
+        .unwrap();
+    app.drain_git_responses();
+    assert_eq!(
+        app.active_test_root,
+        root.join("packages/math"),
+        "the tick only asked; the stack is still on the package before"
+    );
+    assert!(app.testing_runner_available(), "{}", app.status);
+    assert_eq!(app.active_test_root, root.join("packages/web"));
+    assert_eq!(app.test_worker.root(), root.join("packages/web"));
+}
+
+/// A monorepo whose `math` package runs vitest and `web` package runs
+/// jest, each with one test file, the app bound to `math` with its follow
+/// settled, then `web`'s test file focused and one tick run, so the follow
+/// for it is still being worked out. Returns the app, the `web` package
+/// and the tempdir that holds them.
+fn focused_web_while_bound_to_math() -> (App, PathBuf, tempfile::TempDir) {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().canonicalize().unwrap();
+    std::fs::write(
+        root.join("package.json"),
+        r#"{"name":"vmono","private":true,"workspaces":["packages/*"]}"#,
+    )
+    .unwrap();
+    for (name, marker) in [("math", "vitest.config.ts"), ("web", "jest.config.js")] {
+        let pkg = root.join("packages").join(name);
+        std::fs::create_dir_all(pkg.join("src")).unwrap();
+        std::fs::write(pkg.join(marker), "export default {};\n").unwrap();
+        std::fs::write(pkg.join("src/a.test.ts"), "test('a', () => {});\n").unwrap();
+    }
+    let mut app = App::new(root.clone()).unwrap();
+    settle_test_root(&mut app);
+    assert_eq!(app.active_test_root, root.join("packages/math"));
+    let web = root.join("packages/web");
+    app.editor.open_pinned(&web.join("src/a.test.ts")).unwrap();
+    app.drain_git_responses();
+    assert_eq!(app.active_test_root, root.join("packages/math"));
+    (app, web, tmp)
+}
+
+/// #1973 review: Rerun Last Run while the follow for a newly focused
+/// package is still being worked out reruns nothing of the package before.
+/// The rebind to the new package clears the last run, so it is settled
+/// before the last run is read, not after a copy of it was taken.
+#[test]
+fn rerun_last_run_never_runs_the_package_befores_tests_in_the_new_one() {
+    let (mut app, web, _tmp) = focused_web_while_bound_to_math();
+    app.last_test_run = Some(LastTestRun::One(String::from("adds")));
+
+    app.rerun_last_test_run();
+    assert_eq!(app.active_test_root, web);
+    assert_eq!(app.last_test_run, None, "{}", app.status);
+    assert_eq!(app.status, "Rerun Last Run: no test has run yet");
+}
+
+/// #1973 review: a run glyph on a row the Testing panel still shows from
+/// the package before the focus moved runs nothing. The panel lags the
+/// focus while the follow is worked out off the UI thread; the click
+/// settles it, which clears the panel, and the row's test is not the new
+/// package's.
+#[test]
+fn a_row_left_from_the_package_before_runs_nothing_in_the_new_one() {
+    use crate::testing::model::{TestCase, TestStatus};
+    use crate::widgets::testing::RowHit;
+    use crossterm::event::{MouseButton, MouseEventKind};
+    let (mut app, web, _tmp) = focused_web_while_bound_to_math();
+    app.testing.apply_case(TestCase {
+        name: String::from("adds"),
+        status: TestStatus::Passed,
+    });
+    app.sidebar_view = SidebarView::Testing;
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let area = app.testing.last_area;
+    let (x, y) = (area.y..area.y + area.height)
+        .flat_map(|y| (area.x..area.x + area.width).map(move |x| (x, y)))
+        .find(|&(x, y)| app.testing.hit_at(x, y) == Some(RowHit::RunCase("adds".into())))
+        .expect("the row's run glyph");
+
+    app.handle_mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: x,
+        row: y,
+        modifiers: KeyModifiers::NONE,
+    });
+    assert_eq!(app.active_test_root, web);
+    assert_eq!(
+        app.status,
+        "Testing moved to the focused file's folder; that test was not run"
+    );
+    assert_eq!(app.last_test_run, None);
 }
 
 /// #1520 review: the followed package is cached per focused file, so a
@@ -355,7 +540,7 @@ fn a_runner_added_under_the_open_file_is_followed_on_refresh() {
     std::fs::write(pkg.join("src/a.test.ts"), "test('a', () => {});\n").unwrap();
     let mut app = App::new(root.clone()).unwrap();
     app.editor.open_pinned(&pkg.join("src/a.test.ts")).unwrap();
-    app.drain_git_responses();
+    settle_test_root(&mut app);
     assert_eq!(app.active_test_root, root);
     assert!(!app.testing_runner_available());
 
@@ -379,7 +564,7 @@ fn a_folder_with_no_runner_keeps_its_root_and_says_so() {
     )
     .unwrap();
     let mut app = App::new(root.clone()).unwrap();
-    app.drain_git_responses();
+    settle_test_root(&mut app);
     assert_eq!(app.active_test_root, root);
     assert!(!app.testing_runner_available());
     assert_eq!(app.status, crate::testing::NO_RUNNER_STATUS);

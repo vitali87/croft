@@ -372,6 +372,30 @@ class Helpers(unittest.TestCase):
             with self.subTest(errors=errors), self.assertRaises(mi.BuildError):
                 mi.fix_glue(self.GLUE, errors, [], {})
 
+    def test_an_error_that_follows_from_a_private_import_waits_for_the_re_export(self):
+        """A struct reached through a private glob import is not resolved, so
+        rustc also reports what it then could not infer about the struct's
+        fields (E0277 on a `let Some(x) = status.branch.clone()`). The
+        re-export goes in rather than the tool stopping; the next build says
+        whether the other error was only a consequence."""
+        errors = [("E0603", "struct import `GitStatus` is private"),
+                  ("E0277", "the size for values of type `str` cannot be known at compilation time")]
+        homes = {"GitStatus": ("settings", "pub")}
+        lines, done = mi.fix_glue(self.GLUE, errors, errors, homes, "git")
+        self.assertIn("pub use settings::GitStatus;", lines)
+        self.assertEqual(done, ["re-exported settings::GitStatus (pub): used outside git"])
+
+    def test_a_new_file_that_needs_nothing_from_its_parent_loses_the_glob(self):
+        """A moved file of plain text handling (git.rs's one-line summaries
+        of git's output) uses nothing from git.rs, and `use super::*;` is
+        then an unused import that fails the build: it goes, with the blank
+        line after it."""
+        lines = ["//! What git said, in one line.", "", "use super::*;", "",
+                 "pub fn headline(output: &str) -> &str {", "    output", "}", ""]
+        self.assertEqual(mi.without_super_glob(lines),
+                         ["//! What git said, in one line.", "",
+                          "pub fn headline(output: &str) -> &str {", "    output", "}", ""])
+
     def test_an_item_too_narrow_for_its_outside_users_stops_the_tool(self):
         errors = [("E0603", "function import `seq` is private")]
         with self.assertRaises(mi.BuildError) as e:
@@ -606,7 +630,7 @@ class OtherTargets(unittest.TestCase):
         self.assertEqual(mi.add_arch_row(both, "undo", term), both)
 
     def test_every_target_names_its_own_manifest_file_and_folder(self):
-        self.assertEqual(sorted(mi.TARGETS), ["app", "editor", "lsp", "terminal"])
+        self.assertEqual(sorted(mi.TARGETS), ["app", "editor", "git", "lsp", "terminal"])
         for t in mi.TARGETS.values():
             with self.subTest(target=t.name):
                 self.assertTrue(t.source.endswith(".rs") and t.manifest.endswith(".tsv"))

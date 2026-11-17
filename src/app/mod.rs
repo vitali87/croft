@@ -1855,6 +1855,12 @@ pub struct App {
     /// The last `followed_test_root` answer and the workspace folder and
     /// focused file it was for (#1520).
     test_root_follow: Option<((PathBuf, Option<PathBuf>), PathBuf)>,
+    /// The folder and focused file a `poll_followed_test_root` thread is
+    /// resolving the Testing folder for, and where its answer arrives. With
+    /// the CodeQL runner added, the answer walks the workspace four folders
+    /// deep, seconds in a home folder (#1973), so it never runs on the UI
+    /// thread.
+    test_root_pending: Option<PendingTestRoot>,
     /// Folder set from an explicitly opened `.code-workspace` (#163):
     /// consumed by `change_workspace_root` INSTEAD of the automatic
     /// per-primary restore, so the file defines the arrangement exactly.
@@ -4491,6 +4497,7 @@ impl App {
             scm_follow_root: root.clone(),
             active_test_root: root.clone(),
             test_root_follow: None,
+            test_root_pending: None,
             pending_workspace_folders: None,
             git_head_oids: std::collections::BTreeMap::new(),
             git,

@@ -23,6 +23,7 @@ impl App {
     /// with the reason, when the workspace's runner is not the CodeQL one.
     pub(super) fn run_codeql_tests(&mut self) {
         use crate::testing::worker::{Runner, runner_for};
+        self.settle_followed_test_root();
         if runner_for(&self.extensions_dir(), &self.active_test_root) != Some(Runner::Codeql) {
             self.status = String::from(
                 "No CodeQL tests here: a test pack's qlpack.yml declares tests: or extractor:",
