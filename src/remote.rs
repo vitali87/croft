@@ -4027,6 +4027,9 @@ const SOURCE_STAMP_INPUTS: &[&str] = &[
     "rust-toolchain.toml",
     "src",
     "assets",
+    // Dependencies croft builds from its own tree (`[patch.crates-io]` in
+    // Cargo.toml): without them a remote `cargo install --locked` fails.
+    "vendor",
 ];
 
 fn source_stamp_for(root: &PathBuf) -> Result<String> {
@@ -4555,6 +4558,7 @@ mod tests {
         for dir in [
             "src",
             "assets",
+            "vendor/async-lsp/src",
             "target.noindex/debug",
             "target/debug",
             ".git",
@@ -4567,6 +4571,7 @@ mod tests {
         std::fs::write(src.join("Cargo.lock"), "lock").unwrap();
         std::fs::write(src.join("build.rs"), "fn main() {}").unwrap();
         std::fs::write(src.join("rust-toolchain.toml"), "[toolchain]").unwrap();
+        std::fs::write(src.join("vendor/async-lsp/src/lib.rs"), "//").unwrap();
         // The three things that must never cross the wire.
         std::fs::write(src.join("target.noindex/debug/croft"), "HUGE").unwrap();
         std::fs::write(src.join("target/debug/croft"), "HUGE").unwrap();
@@ -4595,6 +4600,7 @@ mod tests {
             "Cargo.lock",
             "build.rs",
             "rust-toolchain.toml",
+            "vendor/async-lsp/src/lib.rs",
         ] {
             assert!(dst.join(shipped).exists(), "{shipped} must be shipped");
         }
