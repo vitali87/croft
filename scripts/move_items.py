@@ -849,7 +849,105 @@ GIT = Target(
 )
 
 # remote.rs's feature files (#2062): (module doc, release-note phrase, docs row).
-REMOTE_FILES = {}
+REMOTE_FILES = {
+    "hosts": (
+        "The SSH hosts croft knows: the targets in ~/.ssh/config and the state of each entry,\n"
+        "and the host a running ssh is connected to, read from its argv with ssh's own flag\n"
+        "grammar.",
+        "remote host",
+        "the hosts in ~/.ssh/config, and the host a running ssh's argv names",
+    ),
+    "offer": (
+        "The ssh-pane offer: which host and folder a pane's ssh is in, whether to offer to\n"
+        "re-root there, and the hosts whose install failed, remembered for a week.",
+        "remote ssh-pane offer",
+        "the ssh-pane offer: a pane's host and folder, whether to offer, hosts whose install "
+        "failed",
+    ),
+    "control": (
+        "The SSH control master a remote session runs over: starting or adopting it, the\n"
+        "commands sent through its socket, and the socket's private directory.",
+        "remote SSH control master",
+        "the SSH control master: starting or adopting it, commands over its socket",
+    ),
+    "relay": (
+        "The drop relay: the pump that tails a remote croft's request log and runs each\n"
+        "request on this machine, the requests it understands, and how each is claimed and\n"
+        "answered.",
+        "remote drop relay",
+        "the drop relay's pump: reading, claiming and answering a remote croft's requests",
+    ),
+    "clipboard": (
+        "The relay's clipboard requests: this machine's clipboard for a remote paste, and a\n"
+        "remote croft's copied text put on this machine's clipboard.",
+        "remote clipboard relay",
+        "the relay's clipboard requests: pasting from and copying to this machine's clipboard",
+    ),
+    "pull": (
+        "The relay's pull request: which remote paths may be pulled, and copying them to this\n"
+        "machine.",
+        "remote pull relay",
+        "the relay's pull request: copying remote files to this machine",
+    ),
+    "forward": (
+        "The relay's open, forward and unforward requests: opening a link in this machine's\n"
+        "browser, and forwarding a remote port to a free local one.",
+        "remote open and port forward relay",
+        "the relay's open and forward requests: links in the local browser, forwarded ports",
+    ),
+    "session": (
+        "A remote croft session: launching it, its outcome, and keeping it alive across a\n"
+        "dropped connection by reconnecting the master and handing the terminal back.",
+        "remote session",
+        "launching a remote croft session, its outcome, and reconnecting after a drop",
+    ),
+    "launch_command": (
+        "The command line that starts croft on the remote, and the session, mux and collab\n"
+        "sockets it names.",
+        "remote launch command",
+        "the command line that starts croft on the remote, and the sockets it names",
+    ),
+    "install_stream": (
+        "The install as the connect dialog runs it, each step's output streamed to the\n"
+        "dialog and kept in the install log, and the background install beside an attached\n"
+        "session.",
+        "streamed remote install",
+        "the install the connect dialog runs, its output streamed and logged; the background "
+        "install",
+    ),
+    "install": (
+        "Installing croft on the remote: whether it needs an install or an update, the release\n"
+        "binary when this croft is one, the remote build when nothing faster can run, and\n"
+        "swapping the new binary in.",
+        "remote install",
+        "whether the remote needs croft, the release binary, the remote build, swapping the "
+        "binary in",
+    ),
+    "cross_build": (
+        "The local cross-build: whether a static croft for the remote can be built here,\n"
+        "finding the toolchain from the checkout, building it and shipping it.",
+        "remote cross-build",
+        "building a static croft for the remote here: toolchain probes, the build, shipping it",
+    ),
+    "source": (
+        "This croft's source: the stamp that says whether the remote is up to date, and\n"
+        "syncing the source to the remote by allow-list.",
+        "remote source sync",
+        "the source stamp, and syncing the source to the remote by allow-list",
+    ),
+    "config_push": (
+        "Pushing the user's config to the remote: the files that sync, how each is shipped\n"
+        "and logged, and `croft sync-config` with its diff.",
+        "remote config push",
+        "pushing the user's config to the remote; `croft sync-config` and its diff",
+    ),
+    "config_repush": (
+        "The live config re-push: watching the synced files during a session and shipping\n"
+        "each change over the bulk lane.",
+        "remote config re-push",
+        "re-pushing changed config during a session over the bulk lane",
+    ),
+}
 
 REMOTE = Target(
     "remote", "scripts/split_remote_manifest.tsv", "src/remote.rs", "src/remote", REMOTE_FILES,
