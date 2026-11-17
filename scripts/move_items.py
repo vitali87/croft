@@ -1312,7 +1312,12 @@ def fix_glue(lines, app, tests, homes, scope="app"):
                 unused_one[side].add((m[1], m[2]))
             else:
                 unknown.append(f"{side}: {code}: {message}")
-    if unknown:
+    # An error this does not fix can follow from a private import: a type
+    # reached through one is not resolved, and rustc then reports what it
+    # could not infer about the type's fields too. So the re-exports go in,
+    # and the next build says whether anything else is left. Any other
+    # error stops the tool.
+    if unknown and not private:
         raise BuildError("the build fails in a way this tool does not fix:\n  " + "\n  ".join(unknown))
     for name in sorted(private):
         file, vis = homes[name]

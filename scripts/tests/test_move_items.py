@@ -372,6 +372,19 @@ class Helpers(unittest.TestCase):
             with self.subTest(errors=errors), self.assertRaises(mi.BuildError):
                 mi.fix_glue(self.GLUE, errors, [], {})
 
+    def test_an_error_that_follows_from_a_private_import_waits_for_the_re_export(self):
+        """A struct reached through a private glob import is not resolved, so
+        rustc also reports what it then could not infer about the struct's
+        fields (E0277 on a `let Some(x) = status.branch.clone()`). The
+        re-export goes in rather than the tool stopping; the next build says
+        whether the other error was only a consequence."""
+        errors = [("E0603", "struct import `GitStatus` is private"),
+                  ("E0277", "the size for values of type `str` cannot be known at compilation time")]
+        homes = {"GitStatus": ("settings", "pub")}
+        lines, done = mi.fix_glue(self.GLUE, errors, errors, homes, "git")
+        self.assertIn("pub use settings::GitStatus;", lines)
+        self.assertEqual(done, ["re-exported settings::GitStatus (pub): used outside git"])
+
     def test_an_item_too_narrow_for_its_outside_users_stops_the_tool(self):
         errors = [("E0603", "function import `seq` is private")]
         with self.assertRaises(mi.BuildError) as e:
