@@ -2571,7 +2571,7 @@ fn the_bookmark_picker_lists_every_tabs_marks_and_jumps_to_one() {
     assert_eq!(app.editor.cursor_row, 1);
 }
 
-/// View Bookmarks also lists the marks of a file no tab shows any more: a
+/// View All Bookmarks also lists the marks of a file no tab shows any more: a
 /// preview tab that moved on from the file still holds them, and a closed
 /// tab hands them to the App. Their text comes from disk, and Enter opens
 /// the file at the line.
@@ -2596,6 +2596,12 @@ fn the_bookmark_picker_lists_a_file_no_tab_shows_and_opens_it() {
         "the preview slot moved on to b.txt"
     );
     app.run_command(Command::ViewBookmarks);
+    assert!(
+        app.list_picker.is_none(),
+        "View Bookmarks lists open files only"
+    );
+    assert!(app.status.contains("No bookmarks"), "was {:?}", app.status);
+    app.run_command(Command::ViewAllBookmarks);
     assert!(app.list_picker.is_some(), "a.txt's mark is listed");
     assert_eq!(app.pending_bookmarks.len(), 1);
     assert_eq!(app.pending_bookmarks[0].path, a);
@@ -2607,7 +2613,8 @@ fn the_bookmark_picker_lists_a_file_no_tab_shows_and_opens_it() {
     assert_eq!(app.editor.cursor_row, 1);
 }
 
-/// Closing the tab keeps the marks too: View Bookmarks still lists them.
+/// Closing the tab keeps the marks too: View All Bookmarks still lists them,
+/// while View Bookmarks stays on the open files.
 #[test]
 fn the_bookmark_picker_lists_the_marks_of_a_closed_tab() {
     use crate::widgets::command_palette::Command;
@@ -2621,6 +2628,8 @@ fn the_bookmark_picker_lists_the_marks_of_a_closed_tab() {
     let tab = app.editor.active_index();
     assert!(app.editor.close_tab(tab));
     app.run_command(Command::ViewBookmarks);
+    assert!(app.list_picker.is_none(), "the file is closed");
+    app.run_command(Command::ViewAllBookmarks);
     assert_eq!(app.pending_bookmarks.len(), 1, "{:?}", app.status);
     assert_eq!(app.pending_bookmarks[0].path, a);
     assert_eq!(app.pending_bookmarks[0].line, 1);
