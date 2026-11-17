@@ -91,6 +91,7 @@ src/
 ├── remote.rs             remote (SSH) target metadata and launch dispatch, plus the ssh-pane re-root offer: `ssh_destination` parses a pane's foreground argv using ssh's own flag grammar
 ├── remote/               remote's feature files, beside remote.rs; each file's `//!` doc says what it holds
 │   ├── clipboard.rs      the relay's clipboard requests: pasting from and copying to this machine's clipboard
+│   ├── config_push.rs    pushing the user's config to the remote; `croft sync-config` and its diff
 │   ├── control.rs        the SSH control master: starting or adopting it, commands over its socket
 │   ├── cross_build.rs    building a static croft for the remote here: toolchain probes, the build, shipping it
 │   ├── forward.rs        the relay's open and forward requests: links in the local browser, forwarded ports
