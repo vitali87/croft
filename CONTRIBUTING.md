@@ -32,8 +32,8 @@ see [docs/MACOS.md](docs/MACOS.md#spotlight-indexing-and-the-build-directory).
 
 ## Make the change
 
-* **Keep PRs small.** The PR Split Score check flags anything over about 400
-  changed lines. Split bigger work into stacked PRs.
+* **Keep PRs small.** Aim for under about 400 changed lines. Split bigger work
+  into stacked PRs.
 * **Tests** go beside the code in a `#[cfg(test)]` module. Whole-app behaviour is
   tested in `src/app/tests/`, one file per area (`terminal.rs`, `scm.rs`,
   `lsp.rs`, ...), and the CLI in `tests/`. Put a whole-app test in the file for
