@@ -292,6 +292,7 @@ src/
     ├── workspace_symbols.rs  Go to Symbol in Workspace picker: query fans out to every running server as `workspace/symbol`, rows show kind icon, name and workspace-relative path; Enter opens the definition
     ├── terminal.rs           `portable-pty` + `alacritty_terminal` + ratatui integration: the embedded terminal with selection, scrollback, drag-reorderable panes and maximize mode
     ├── terminal/             the terminal pane's feature files, beside terminal.rs; each file's `//!` doc says what it holds
+    │   ├── clock.rs         the scroll clock that keeps selections and notes in place; each row's print time
     │   ├── mouse.rs         mouse reporting to the program in the pane; which grid cell a screen point is
     │   ├── selection.rs     selections: make, extend, clear, words and blocks, keep them on their text as output scrolls; the selected text
     │   ├── tests.rs         the terminal pane's own tests
