@@ -1842,9 +1842,61 @@ pub(super) fn restore_host_terminal_state() {
 pub(super) const TERMINAL_RESTORE_SEQ: &[u8] =
     b"\x1b[?2026l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l\x1b[?1015l\x1b[?2004l\x1b[?1004l\x1b[?1049l\x1b[ q\x1b]110\x07\x1b]111\x07";
 
+impl App {
+    /// Say on the status bar that a background task crashed (#2077). croft
+    /// carries on, but without whatever that task did, so the message says
+    /// to save and restart, and where the crash's record is.
+    pub(super) fn poll_background_panic(&mut self) -> bool {
+        let Some(thread) = take_background_panic() else {
+            return false;
+        };
+        self.status = format!(
+            "A background task crashed ({thread}). Save your work and restart croft; \
+             details in ~/.cache/croft/panic.log"
+        );
+        true
+    }
+}
+
+/// The name of the last background thread that crashed, until the app has
+/// shown it (#2077). Set by the panic hook, read by
+/// [`App::poll_background_panic`].
+static BACKGROUND_PANIC: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Whether a panic on `panicking` ends croft. Only the thread that drives
+/// the screen, `ui`, does: a panic there unwinds past the normal teardown,
+/// so the hook restores the terminal. A background thread's panic only
+/// ends that thread, and croft carries on in the terminal as it was set
+/// up; resetting it then left the screen off the alternate screen, keys
+/// echoed and the mouse dead under a croft still running (#2077).
+pub(super) fn panic_ends_croft(
+    panicking: std::thread::ThreadId,
+    ui: std::thread::ThreadId,
+) -> bool {
+    panicking == ui
+}
+
+/// Keep `thread`'s name for the app to show: a background task crashed.
+pub(super) fn note_background_panic(thread: &str) {
+    let mut slot = BACKGROUND_PANIC
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *slot = Some(thread.to_string());
+}
+
+/// The background thread that crashed since the last call, if one did.
+pub(super) fn take_background_panic() -> Option<String> {
+    BACKGROUND_PANIC
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
+}
+
 pub(super) fn install_terminal_restore_panic_hook() {
     static HOOK: std::sync::Once = std::sync::Once::new();
     HOOK.call_once(|| {
+        // Installed by `run`, on the thread that drives the screen.
+        let ui = std::thread::current().id();
         let original = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             use std::io::Write;
@@ -1852,6 +1904,13 @@ pub(super) fn install_terminal_restore_panic_hook() {
             // can garble or scroll away the message printed to stderr, so a file
             // is the only reliable record (read with `cat ~/.cache/croft/panic.log`).
             log_panic_to_file(info);
+            let current = std::thread::current();
+            if !panic_ends_croft(current.id(), ui) {
+                // croft carries on: the terminal stays as it is, and nothing
+                // is printed over the screen. The app says what crashed.
+                note_background_panic(current.name().unwrap_or("<unnamed>"));
+                return;
+            }
             let _ = disable_raw_mode();
             let mut out = stdout();
             let _ = out.write_all(TERMINAL_RESTORE_SEQ);

@@ -685,9 +685,11 @@ impl App {
                 // one removed while the prompt was up gets a status line and
                 // no consent, since what was allowed no longer exists.
                 self.close_input_prompt();
-                let Some(viewer) =
-                    crate::mcp::registry::viewer_by_id_in_dir(&self.config_dir, &key)
-                else {
+                let Some(viewer) = crate::mcp::registry::viewer_by_id_in_dir(
+                    &self.config_dir,
+                    &self.disabled_extensions,
+                    &key,
+                ) else {
                     self.status = format!("{key} is no longer available");
                     return;
                 };
@@ -708,9 +710,12 @@ impl App {
                 // run ends on its own argument prompt with no status of its
                 // own, so a failure reported after it would sit under that
                 // prompt and be cleared with it.
-                let ext_id =
-                    crate::mcp::registry::resolve_command_in_dir(&self.config_dir, &command_id)
-                        .map(|r| r.ext_id);
+                let ext_id = crate::mcp::registry::resolve_command_in_dir(
+                    &self.config_dir,
+                    &self.disabled_extensions,
+                    &command_id,
+                )
+                .map(|r| r.ext_id);
                 if let Some(ext_id) = &ext_id {
                     self.consented_extensions.insert(ext_id.clone());
                     self.persist_extension_consent(ext_id);
@@ -719,9 +724,11 @@ impl App {
             }
             InputPurpose::McpArg { command_id } => {
                 self.close_input_prompt();
-                if let Some(resolved) =
-                    crate::mcp::registry::resolve_command_in_dir(&self.config_dir, &command_id)
-                {
+                if let Some(resolved) = crate::mcp::registry::resolve_command_in_dir(
+                    &self.config_dir,
+                    &self.disabled_extensions,
+                    &command_id,
+                ) {
                     self.spawn_mcp_command(resolved, Some(value));
                 }
             }

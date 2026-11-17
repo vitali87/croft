@@ -1,6 +1,6 @@
 [package]
 name = "croft-software"
-version = "0.2.145"
+version = "0.2.154"
 edition = "2024"
 description = "VSCode-style TUI written in Rust"
 license = "MIT"
@@ -215,13 +215,15 @@ regex-syntax = "0.8"
 # direct dep adds no new version to the lock.
 url = "2"
 csv = "1.4"
-calamine = "0.34"
+calamine = "0.38"
 # xlsx WRITE path for the sheet grid's workbook editing (#178): calamine
 # stays the fast read side; on save the workbook is re-read through umya,
 # the user's cell edits are applied, and umya writes the file back with
 # styles, widths, and untouched formulas preserved. Pure Rust.
-# 3.1.0 verified current on crates.io 2026-08-18.
-umya-spreadsheet = { version = "3.1", default-features = false }
+# Pinned to 4.0.0-beta.1: it is the only release on zip 9.0.5+, and every
+# 3.x line pulls zip 8.x with the extraction/parser advisories fixed in
+# 9.0.5 (GHSA-m665-v7pm-7grj and friends). Move to 4.0.0 once it ships.
+umya-spreadsheet = { version = "=4.0.0-beta.1", default-features = false }
 # Decompression for the `Provision::Binary` LSP backend (src/lsp/install.rs):
 # release binaries ship as a single gzipped executable (taplo) or a zip with
 # sibling files (clangd). Both crates are already in the tree transitively
@@ -307,3 +309,12 @@ lto = false
 codegen-units = 16
 debug = false
 strip = "symbols"
+
+# async-lsp 0.2.4 as published, with one change to how it reads a message
+# from a language server (vendor/async-lsp/PATCHED.md). Published, it parsed
+# every reply three times over before croft saw it; a big file's semantic
+# tokens alone briefly took ~90 MB. Drop this once upstream reads messages
+# the same way. `cargo publish` leaves [patch] out of the published manifest,
+# so `cargo install croft-software` builds against the crates.io release.
+[patch.crates-io]
+async-lsp = { path = "vendor/async-lsp" }

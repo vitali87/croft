@@ -223,16 +223,19 @@ impl App {
             return false;
         }
         let bytes = text.len();
-        copy_to_clipboard(&text);
+        let landing = self.copy_where_pasted(&text);
         // Say what was actually copied. `clamped` is true for the byte CAP
         // and for a sweep that ran out of budget on escape-heavy text, and in
         // the second case the copy can be far short of the cap: naming the
         // cap then tells the user they got four megabytes when they got a
         // fraction of one.
         self.status = if clamped {
-            format!("Copied {bytes} bytes; the selection was larger than one copy allows")
+            format!(
+                "Copied {bytes} bytes{}; the selection was larger than one copy allows",
+                landing.note()
+            )
         } else {
-            format!("Copied {bytes} bytes")
+            format!("Copied {bytes} bytes{}", landing.note())
         };
         true
     }
@@ -380,7 +383,7 @@ impl App {
                         .map(|md| md.selection_text())
                         .unwrap_or_default();
                     if !text.is_empty() {
-                        copy_to_clipboard(&text);
+                        self.copy_where_pasted(&text);
                     }
                 }
                 true
@@ -690,7 +693,7 @@ impl App {
             .unwrap_or_else(|| format!("column {}", col + 1));
         let ascending = data.sort_by_column(col);
         sheet.dirty = true;
-        self.editor.dirty = true;
+        self.editor.mark_dirty();
         self.status = format!(
             "Sorted by {name}, {}",
             if ascending { "ascending" } else { "descending" }
@@ -784,7 +787,7 @@ impl App {
                     return;
                 }
                 let (r, c) = sheet.commit_edit().expect("checked");
-                self.editor.dirty = true;
+                self.editor.mark_dirty();
                 let data = &mut self.editor.sheet.as_mut().expect("checked").sheets[current];
                 data.cur_row = r
                     .saturating_add_signed(next.0 as isize)
@@ -885,7 +888,7 @@ impl App {
                     sheet.cell_edits.push((current, r, c));
                 }
                 sheet.dirty = true;
-                self.editor.dirty = true;
+                self.editor.mark_dirty();
                 return;
             }
             KeyCode::Tab if total_sheets > 1 => {
@@ -1045,7 +1048,8 @@ impl App {
                 view.undo_edit()
             };
             if did {
-                self.editor.dirty = self.editor.hex.as_ref().is_some_and(|v| v.has_edits());
+                let edited = self.editor.hex.as_ref().is_some_and(|v| v.has_edits());
+                self.editor.set_dirty(edited);
             } else {
                 self.status = String::from(if select {
                     "Nothing to redo"
@@ -1078,7 +1082,8 @@ impl App {
                 wrote = true;
             }
             if wrote {
-                self.editor.dirty = self.editor.hex.as_ref().is_some_and(|v| v.has_edits());
+                let edited = self.editor.hex.as_ref().is_some_and(|v| v.has_edits());
+                self.editor.set_dirty(edited);
                 return;
             }
             // Not a typable char for this pane: fall through to the
@@ -1100,7 +1105,8 @@ impl App {
             KeyCode::Delete => {
                 let off = view.cursor;
                 view.revert_edit(off);
-                self.editor.dirty = self.editor.hex.as_ref().is_some_and(|v| v.has_edits());
+                let edited = self.editor.hex.as_ref().is_some_and(|v| v.has_edits());
+                self.editor.set_dirty(edited);
                 return;
             }
             _ => {}
@@ -1195,7 +1201,7 @@ impl App {
             if let Some(view) = self.editor.sheet.as_mut() {
                 sheet_follow_cursor(view, current, visible);
             }
-            self.editor.dirty = true;
+            self.editor.mark_dirty();
         } else {
             self.status = String::from("Nothing to remove there");
         }

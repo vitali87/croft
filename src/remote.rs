@@ -1456,8 +1456,13 @@ fn handle_clipboard_request(host: &str, socket: &Path, inbox_dir: &str, request_
 ///
 /// The payload file is removed in the same command that reads it: a copy is
 /// transient, and leaving them behind grows the relay dir for the life of the
-/// session. There is no inbox sentinel to write — nothing on the remote side
-/// is waiting on the answer.
+/// session.
+///
+/// Only a copy that did NOT reach this clipboard is answered, with `.err` in
+/// the request's inbox directory: this machine had no clipboard to write (a
+/// Linux box with no clipboard tool), or the payload never arrived. The
+/// remote croft then sends it by OSC 52, which reaches this machine's
+/// terminal over the SSH session. A copy that landed costs no round trip.
 fn handle_copy_request(host: &str, socket: &Path, inbox_dir: &str, request_id: &str) {
     // The id indexes a file in the inbox this pump owns, and it is
     // interpolated into a remote shell command, so it is checked before use:
@@ -1512,13 +1517,22 @@ fn handle_copy_request(host: &str, socket: &Path, inbox_dir: &str, request_id: &
         Err(_) => {
             let _ = child.kill();
             let _ = child.wait();
+            write_relay_err(
+                host,
+                socket,
+                inbox_dir,
+                request_id,
+                "copy payload timed out",
+            );
             return;
         }
     };
     if payload.is_empty() || payload.len() > MAX_COPY_PAYLOAD_BYTES {
         return;
     }
-    let _ = crate::clipboard::write_string(&String::from_utf8_lossy(&payload));
+    if !crate::clipboard::write_string(&String::from_utf8_lossy(&payload)) {
+        write_relay_err(host, socket, inbox_dir, request_id, "no clipboard to write");
+    }
 }
 
 /// A copy payload the pump will bring home, capped because it lands in THIS
@@ -4013,6 +4027,9 @@ const SOURCE_STAMP_INPUTS: &[&str] = &[
     "rust-toolchain.toml",
     "src",
     "assets",
+    // Dependencies croft builds from its own tree (`[patch.crates-io]` in
+    // Cargo.toml): without them a remote `cargo install --locked` fails.
+    "vendor",
 ];
 
 fn source_stamp_for(root: &PathBuf) -> Result<String> {
@@ -4541,6 +4558,7 @@ mod tests {
         for dir in [
             "src",
             "assets",
+            "vendor/async-lsp/src",
             "target.noindex/debug",
             "target/debug",
             ".git",
@@ -4553,6 +4571,7 @@ mod tests {
         std::fs::write(src.join("Cargo.lock"), "lock").unwrap();
         std::fs::write(src.join("build.rs"), "fn main() {}").unwrap();
         std::fs::write(src.join("rust-toolchain.toml"), "[toolchain]").unwrap();
+        std::fs::write(src.join("vendor/async-lsp/src/lib.rs"), "//").unwrap();
         // The three things that must never cross the wire.
         std::fs::write(src.join("target.noindex/debug/croft"), "HUGE").unwrap();
         std::fs::write(src.join("target/debug/croft"), "HUGE").unwrap();
@@ -4581,6 +4600,7 @@ mod tests {
             "Cargo.lock",
             "build.rs",
             "rust-toolchain.toml",
+            "vendor/async-lsp/src/lib.rs",
         ] {
             assert!(dst.join(shipped).exists(), "{shipped} must be shipped");
         }
