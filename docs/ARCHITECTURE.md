@@ -32,6 +32,7 @@ src/
 │   ├── changes.rs        changed files from `git status --porcelain`: kind, section and badge; Explorer decorations; line counts
 │   ├── contents.rs       a file at HEAD, a commit or an index stage; a conflict re-merged in diff3 style; a path's clean/smudge filter
 │   ├── operations.rs     a merge, rebase, cherry-pick, revert or bisect in progress; continuing, skipping or aborting it
+│   ├── patches.rs        applying a hunk or line patch to the index or working tree, CRLF endings kept
 │   ├── status.rs         the status snapshot: branch, ahead/behind, changes, ignored paths, the prepared commit message, repositories one folder down
 │   ├── tests.rs          git.rs's own tests
 ├── magic.rs              content-based format detection: a magic-byte signature table (images, PDF, zip family, gzip, xz, bzip2, zstd, tar, SQLite) used as the SECOND routing hint in `Editor::open` — extension first, sniffing decides when it gave no answer or lied
