@@ -1,0 +1,236 @@
+# Stage B of the refactor program (#2062): where each item of src/git.rs goes.
+# One row per item, in file order. pr 0 means the item stays in git.rs; the others
+# move to src/git/<file>.rs in that PR. kind, impl and name are as
+# `scripts/check_pure_move.py list` prints them. Run
+# `scripts/move_items.py --target git --check` after adding an item to git.rs.
+# git.rs keeps the helpers every feature uses to run git.
+pr	file	kind	impl	name
+2	status	struct	-	GitStatus
+2	status	fn	impl GitStatus	head_label
+1	operations	enum	-	RepoOp
+1	operations	fn	impl RepoOp	label
+1	operations	fn	impl RepoOp	command
+1	operations	fn	-	repo_operation
+1	operations	fn	-	abort_operation
+1	operations	fn	-	continue_operation
+1	operations	fn	-	skip_operation
+1	operations	fn	-	bisect_mark
+2	status	fn	-	query
+1	operations	fn	-	rebasing_branch
+2	status	fn	-	prepared_message
+2	status	fn	-	without_comments
+2	status	fn	-	comment_marker
+2	status	fn	-	commit_template
+2	status	fn	-	query_ignored
+2	status	fn	-	is_ignored
+0		fn	-	join_raw
+0		fn	-	git_raw
+2	status	fn	-	child_repos
+0		fn	-	repo_toplevel
+0		fn	-	run_git
+0		fn	-	never_prompt
+0		fn	-	detach_from_tty
+0		fn	-	run_mutation
+0		fn	-	run_mutation_keeping_conflicts
+0		fn	-	run_mutation_with
+0		fn	-	run_mutation_with_env
+0		fn	-	run_mutation_inner
+2	status	fn	-	parse_branch
+3	changes	struct	-	ChangeEntry
+3	changes	fn	impl Default for ChangeEntry	default
+3	changes	enum	-	ChangeKind
+3	changes	enum	-	ChangeSection
+3	changes	fn	impl ChangeKind	section
+3	changes	fn	impl ChangeKind	badge
+3	changes	fn	-	unquote_porcelain_path
+3	changes	fn	-	status_kinds
+3	changes	fn	-	parse_porcelain_changes
+3	changes	enum	-	GitDecoration
+3	changes	fn	impl GitDecoration	letter
+3	changes	fn	impl GitDecoration	from_kind
+3	changes	fn	-	parse_decorations
+3	changes	fn	-	porcelain_z_count
+3	changes	fn	-	query_changes
+3	changes	fn	-	parse_numstat
+3	changes	fn	-	numstat_map
+3	changes	fn	-	count_lines_in_file
+4	contents	fn	-	path_filter
+4	contents	fn	-	filter_driver_configured
+4	contents	fn	-	read_file_at_head
+4	contents	fn	-	read_bytes_at_head
+4	contents	fn	-	show_blob
+4	contents	fn	-	read_file_at_rev
+4	contents	fn	-	read_file_at_stage
+4	contents	fn	-	remerge_diff3
+5	patches	enum	-	HunkSide
+5	patches	fn	-	retarget_hunk_starts
+5	patches	fn	-	patch_path
+5	patches	fn	-	strips_cr_on_add
+5	patches	fn	-	strip_added_crs
+5	patches	fn	-	add_crs_to_head_lines
+5	patches	fn	-	apply_patch
+12	commits	fn	-	commit
+6	messages	const	-	AUTO_MERGING
+6	messages	const	-	MERGE_CONFLICT_IN
+6	messages	fn	-	shown
+6	messages	fn	-	squash
+6	messages	fn	-	headline
+6	messages	fn	-	summary_line
+6	messages	fn	-	result_line
+6	messages	fn	-	conflict_summary
+6	messages	fn	-	error_line
+6	messages	fn	-	with_listed_files
+6	messages	fn	-	local_changes_block_switch
+6	messages	fn	-	failure_line
+14	remotes	fn	-	push_current_branch
+7	diffs	fn	-	diff_staged
+7	diffs	fn	-	merge_base
+7	diffs	fn	-	diff_against_branch
+7	diffs	fn	-	diff_previous_commit
+7	diffs	fn	-	diff_text
+8	history	struct	-	FileHistoryEntry
+8	history	fn	-	file_cwd
+8	history	fn	-	repo_top_and_path
+8	history	fn	-	file_history
+8	history	fn	-	parse_file_history
+8	history	fn	-	show_commit_file_diff
+8	history	fn	-	follow_names
+8	history	fn	-	filtered_commit_file_diff
+8	history	fn	-	path_at_commit
+8	history	fn	-	show_commit
+8	history	struct	-	GraphCommit
+8	history	fn	-	commit_graph
+10	worktrees	struct	-	WorktreeLane
+10	worktrees	fn	impl WorktreeLane	plan
+10	worktrees	fn	-	lane_slug
+10	worktrees	fn	-	lane_removal_block
+0		fn	-	run_git_mut
+10	worktrees	fn	-	add_worktree_lane
+13	branches	fn	-	current_branch
+10	worktrees	fn	-	remove_worktree_lane
+10	worktrees	fn	-	pr_worktree_path
+10	worktrees	fn	-	remote_for_slug
+10	worktrees	fn	-	is_worktree_of
+10	worktrees	struct	-	PrWorktree
+10	worktrees	fn	-	checkout_pr_worktree
+10	worktrees	fn	-	worktree_head
+10	worktrees	fn	-	pr_worktree_keep_reason
+8	history	fn	-	branch_history
+8	history	fn	-	branch_history_range
+8	history	struct	-	CommitTree
+8	history	fn	impl CommitTree	contains
+8	history	fn	-	tree_paths
+8	history	fn	-	parse_commit_graph
+9	blame	struct	-	BlameCommit
+9	blame	fn	impl BlameCommit	short_hash
+9	blame	struct	-	Blame
+9	blame	fn	impl Blame	new
+9	blame	fn	impl Blame	len
+9	blame	fn	impl Blame	is_empty
+9	blame	fn	impl Blame	line
+9	blame	fn	-	blame
+9	blame	fn	-	parse_blame
+13	branches	fn	-	default_branch
+11	staging	fn	-	stage_path
+11	staging	fn	-	remove_path
+11	staging	fn	-	stage_paths
+11	staging	fn	-	unstage_path
+11	staging	fn	-	unstage_paths
+7	diffs	fn	-	is_submodule
+7	diffs	fn	-	submodule_diff
+11	staging	fn	-	discard_path
+14	remotes	fn	-	pull_current_branch
+13	branches	struct	-	BranchInfo
+13	branches	fn	-	list_branches
+13	branches	const	-	ENGLISH_MESSAGES
+13	branches	fn	-	checkout_branch
+13	branches	fn	-	track_remote_branch
+13	branches	fn	-	create_branch
+15	stash	fn	-	stash_push
+15	stash	enum	-	StashKind
+15	stash	fn	-	stash_push_args
+15	stash	fn	-	stash_pop
+14	remotes	comment	-	// --- Fetch / Clone ---------------------------------------
+14	remotes	fn	-	fetch_all
+14	remotes	fn	-	clone_dir_name
+14	remotes	fn	-	clone_into
+12	commits	comment	-	// --- Commit variants -------------------------------------
+12	commits	fn	-	unmerged_paths
+12	commits	fn	-	refuse_unmerged
+12	commits	fn	-	has_staged_changes
+12	commits	fn	-	first_paths
+12	commits	fn	-	refuse_conflict_markers
+12	commits	fn	-	leftover_conflict_markers
+12	commits	fn	-	commit_staged
+12	commits	fn	-	commit_amend
+12	commits	fn	-	commit_amend_no_edit
+12	commits	fn	-	undo_last_commit
+1	operations	fn	-	operation_in_progress
+12	commits	fn	-	head_is_on_upstream
+11	staging	comment	-	// --- Bulk staging ----------------------------------------
+11	staging	fn	-	stage_all
+11	staging	fn	-	unstage_all
+11	staging	fn	-	discard_all_tracked
+14	remotes	comment	-	// --- Pull / Push variants --------------------------------
+14	remotes	fn	-	pull_rebase
+14	remotes	fn	-	push_force
+14	remotes	fn	-	push_to_remote
+14	remotes	fn	-	publish_branch
+14	remotes	fn	-	unpublished_branch
+14	remotes	fn	-	publish_remote
+14	remotes	fn	-	default_push_remote
+16	tags	fn	-	tag_remote
+14	remotes	fn	-	push_or_publish
+13	branches	comment	-	// --- Branch management -----------------------------------
+13	branches	fn	-	create_branch_from
+13	branches	fn	-	rename_branch
+13	branches	fn	-	delete_branch
+13	branches	fn	-	merge_branch
+13	branches	fn	-	rebase_branch
+12	commits	comment	-	// --- Commit actions (the COMMITS graph's right-click menu,
+12	commits	fn	-	cherry_pick
+12	commits	fn	-	revert_commit
+12	commits	fn	-	checkout_detached
+12	commits	fn	-	create_tag_at
+12	commits	enum	-	ResetMode
+12	commits	fn	impl ResetMode	flag
+12	commits	fn	-	reset_to
+12	commits	fn	-	worktree_fingerprint
+8	history	fn	-	commit_message
+8	history	fn	-	commit_card
+14	remotes	comment	-	// --- Remotes ---------------------------------------------
+14	remotes	struct	-	RemoteInfo
+14	remotes	fn	-	list_remotes
+14	remotes	fn	-	add_remote
+14	remotes	fn	-	remove_remote
+15	stash	comment	-	// --- Stash (full set) ------------------------------------
+15	stash	fn	-	stash_push_untracked
+15	stash	fn	-	stash_push_staged
+15	stash	struct	-	StashInfo
+15	stash	fn	impl StashInfo	label
+15	stash	fn	-	list_stashes
+15	stash	fn	-	show_stash
+15	stash	fn	-	stash_apply
+15	stash	fn	-	stash_pop_at
+15	stash	fn	-	stash_drop
+15	stash	fn	-	stash_oid
+15	stash	fn	-	stash_drop_oid
+15	stash	fn	-	stash_pop_oid
+15	stash	fn	-	stash_index_of
+16	tags	comment	-	// --- Tags ------------------------------------------------
+16	tags	fn	-	list_tags
+16	tags	fn	-	create_tag
+16	tags	fn	-	push_tags
+16	tags	fn	-	list_remote_tags
+16	tags	fn	-	parse_remote_tags
+16	tags	fn	-	delete_remote_tag
+16	tags	fn	-	delete_tag
+8	history	fn	-	humanize_age
+8	history	fn	-	current_unix_seconds
+2	status	fn	-	parse_ahead_behind
+17	worker	enum	-	GitRequest
+17	worker	fn	impl GitRequest	merge
+17	worker	enum	-	GitResponse
+17	worker	fn	-	git_worker_loop
+14	remotes	enum	-	LinkRev
+14	remotes	fn	-	share_link
