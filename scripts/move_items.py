@@ -714,7 +714,26 @@ TERMINAL = Target(
     ),
 )
 
-TARGETS = {t.name: t for t in (APP, EDITOR, LSP, TERMINAL)}
+# What each file split out of src/git.rs holds, as FILES above.
+GIT_FILES = {}
+
+GIT = Target(
+    "git", "scripts/split_git_manifest.tsv", "src/git.rs", "src/git", GIT_FILES,
+    Tree(
+        "├── git.rs ",
+        "├── git/                  git's feature files, beside git.rs; each file's `//!` doc "
+        "says what it holds",
+        "│   ├── ", 17,
+    ),
+    "git-",
+    (
+        "git.rs's own tests, moved out of git.rs (#2062).",
+        "git's tests",
+        "git.rs's own tests",
+    ),
+)
+
+TARGETS = {t.name: t for t in (APP, EDITOR, LSP, TERMINAL, GIT)}
 
 # Kinds whose declaration can carry a visibility.
 VISIBLE = {"fn", "const", "static", "struct", "enum", "union", "trait", "type"}
