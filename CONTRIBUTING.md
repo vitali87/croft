@@ -60,21 +60,23 @@ see [docs/MACOS.md](docs/MACOS.md#spotlight-indexing-and-the-build-directory).
   `scripts/split_manifest.tsv`, with `--target editor` split
   `src/widgets/editor.rs` from `scripts/split_editor_manifest.tsv`, with
   `--target lsp` split `src/lsp/manager.rs` from
-  `scripts/split_lsp_manifest.tsv`, and with `--target terminal` split
-  `src/widgets/terminal.rs` from `scripts/split_terminal_manifest.tsv`
+  `scripts/split_lsp_manifest.tsv`, with `--target terminal` split
+  `src/widgets/terminal.rs` from `scripts/split_terminal_manifest.tsv`, and
+  with `--target git` split `src/git.rs` from `scripts/split_git_manifest.tsv`
   (`--tests-out` first moved each file's inline tests to their own file).
-* **Adding to the app, the editor, the language-server manager or the
-  terminal pane?** Put a feature's code in its file under `src/app/`,
-  `src/widgets/editor/`, `src/lsp/manager/` or `src/widgets/terminal/` (see
-  the lists in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)), not in
-  `src/app/mod.rs`, which keeps only the `App` struct, its state, start-up and
-  the main loop, nor in `src/widgets/editor.rs`, which keeps only the `Editor`
-  type, its constructor and the data types its parts share, nor in
-  `src/lsp/manager.rs`, which keeps only the `LspManager` type, the command
+* **Adding to the app, the editor, the language-server manager, the
+  terminal pane or git?** Put a feature's code in its file under `src/app/`,
+  `src/widgets/editor/`, `src/lsp/manager/`, `src/widgets/terminal/` or
+  `src/git/` (see the lists in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)),
+  not in `src/app/mod.rs`, which keeps only the `App` struct, its state,
+  start-up and the main loop, nor in `src/widgets/editor.rs`, which keeps only
+  the `Editor` type, its constructor and the data types its parts share, nor
+  in `src/lsp/manager.rs`, which keeps only the `LspManager` type, the command
   enum, the worker's and each server's state and the helpers several features
   share, nor in `src/widgets/terminal.rs`, which keeps only the `PtyTerminal`
-  type and the structs its parts share. A new feature that fits no file gets
-  a file of its own.
+  type and the structs its parts share, nor in `src/git.rs`, which keeps only
+  the git runner and the mutation wrappers every part shares. A new feature
+  that fits no file gets a file of its own.
 * **New or changed module?** Update its entry in
   [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). CI fails if you shorten a
   module's description without moving its reasoning into a `### <module>`
