@@ -306,6 +306,7 @@ src/
     │   ├── selection.rs     selections: make, extend, clear, words and blocks, keep them on their text as output scrolls; the selected text
     │   ├── shell_env.rs     the shell's start-up environment: integration for each shell, terminal and locale variables, croft's helpers on PATH
     │   ├── spawn.rs         starting a pane: spawn or attach, the output reader thread, replaying a saved transcript
+    │   ├── status.rs        label and name, agent, status and progress, bells, notifications, ports, quiet and untouched
     │   ├── tests.rs         the terminal pane's own tests
     │   ├── text.rs          the grid as text: visible and wrapped lines, logical rows, find lines, ANSI with colours
     ├── update_popup.rs   the update popup as a card in the manner of Ghostty's: glyph and title, a label / value grid of the release, rounded pill buttons with the one primary action flush right, and a link row under a divider; framed per theme (gradient box, `surfaces` card, accent line) and pure, handing back where each control landed
