@@ -92,6 +92,7 @@ src/
 ├── remote/               remote's feature files, beside remote.rs; each file's `//!` doc says what it holds
 │   ├── clipboard.rs      the relay's clipboard requests: pasting from and copying to this machine's clipboard
 │   ├── control.rs        the SSH control master: starting or adopting it, commands over its socket
+│   ├── forward.rs        the relay's open and forward requests: links in the local browser, forwarded ports
 │   ├── hosts.rs          the hosts in ~/.ssh/config, and the host a running ssh's argv names
 │   ├── offer.rs          the ssh-pane offer: a pane's host and folder, whether to offer, hosts whose install failed
 │   ├── offer_tests.rs    the ssh-pane offer's tests
