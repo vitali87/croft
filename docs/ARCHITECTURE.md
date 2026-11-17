@@ -92,6 +92,7 @@ src/
 ├── remote/               remote's feature files, beside remote.rs; each file's `//!` doc says what it holds
 │   ├── clipboard.rs      the relay's clipboard requests: pasting from and copying to this machine's clipboard
 │   ├── config_push.rs    pushing the user's config to the remote; `croft sync-config` and its diff
+│   ├── config_repush.rs  re-pushing changed config during a session over the bulk lane
 │   ├── control.rs        the SSH control master: starting or adopting it, commands over its socket
 │   ├── cross_build.rs    building a static croft for the remote here: toolchain probes, the build, shipping it
 │   ├── forward.rs        the relay's open and forward requests: links in the local browser, forwarded ports
