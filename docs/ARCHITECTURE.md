@@ -91,6 +91,7 @@ src/
 ├── remote.rs             remote (SSH) target metadata and launch dispatch, plus the ssh-pane re-root offer: `ssh_destination` parses a pane's foreground argv using ssh's own flag grammar
 ├── remote/               remote's feature files, beside remote.rs; each file's `//!` doc says what it holds
 │   ├── hosts.rs          the hosts in ~/.ssh/config, and the host a running ssh's argv names
+│   ├── offer.rs          the ssh-pane offer: a pane's host and folder, whether to offer, hosts whose install failed
 │   ├── offer_tests.rs    the ssh-pane offer's tests
 │   ├── tests.rs          remote.rs's own tests
 ├── remote_bulk.rs       bulk lane for background installs: dedicated BatchMode SSH connection when key auth works (throttled shared mux otherwise) so update bytes never queue ahead of live-session keystrokes
