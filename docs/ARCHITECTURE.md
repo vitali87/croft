@@ -199,6 +199,18 @@ src/
 │   ├── languages.rs     language table: file-extension -> language, root markers, and server family, all built from extension manifests' [[languages]] blocks (replaces the old hardcoded Language enum match arms), rebuilt when an extension is added or removed
 │   ├── log_file.rs      LSP stderr / debug log sink at ~/.croft/lsp.log
 │   ├── manager.rs            LSP lifecycle: workspace pre-warm at startup, spawn, did_open / did_change / did_save, completion, inline completion, documentSymbol, inlay hints, documentHighlight and whole-project pull diagnostics; a new server registry swapped in when an extension is added, removed or toggled
+│   ├── manager/              the language-server manager's feature files, beside manager.rs; each file's `//!` doc says what it holds
+│   │   ├── capabilities.rs      the client capabilities sent at initialize, standard semantic token types
+│   │   ├── completion.rs        completion, trigger characters, signature help, inline completion
+│   │   ├── decorations.rs       inlay hints, links, code lenses, folding ranges, document colours
+│   │   ├── diagnostics.rs       diagnostics pushed and pulled, per document and workspace-wide
+│   │   ├── discovery.rs         a file's language and project root, server config, finding the executable, rustup
+│   │   ├── hover.rs             hover, rust-analyzer's own requests
+│   │   ├── navigation.rs        definition, declaration, type definition, implementation, references, hierarchies
+│   │   ├── semantic_tokens.rs   semantic tokens, whole and by range, the server's legend
+│   │   ├── symbols.rs           document outline, workspace symbol search
+│   │   ├── tests.rs             the language-server manager's own tests
+│   │   ├── text_ranges.rs       symbol occurrences, linked editing ranges, selection ranges
 │   ├── manifest.rs           declarative `extension.toml` loader for the extension system: parses a manifest's `[[languages]]`, `[[language_servers]]`, `[[themes]]`, `[[debug_adapters]]`, `[[test_runners]]`, `[[mcp_servers]]`, `[[commands]]` and `[[viewers]]` blocks
 │   ├── registry.rs      ServerRegistry (language -> ordered servers); built from the bundled manifests in assets/extensions/* plus user-installed extensions, instead of hardcoding configs
 │   ├── runtime.rs       Tokio runtime owned by the LSP manager
