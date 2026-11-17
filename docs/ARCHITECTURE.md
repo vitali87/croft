@@ -98,6 +98,7 @@ src/
 │   ├── offer_tests.rs    the ssh-pane offer's tests
 │   ├── pull.rs           the relay's pull request: copying remote files to this machine
 │   ├── relay.rs          the drop relay's pump: reading, claiming and answering a remote croft's requests
+│   ├── session.rs        launching a remote croft session, its outcome, and reconnecting after a drop
 │   ├── tests.rs          remote.rs's own tests
 ├── remote_bulk.rs       bulk lane for background installs: dedicated BatchMode SSH connection when key auth works (throttled shared mux otherwise) so update bytes never queue ahead of live-session keystrokes
 ├── remote_connect.rs    interactive SSH connect flow (host + password prompt phases) behind the connect dialog
