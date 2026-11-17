@@ -90,6 +90,7 @@ src/
 ├── release_notes.rs      hand-curated "IN THIS RELEASE" highlights on the welcome panel; the text is DATA, one file per version in `src/release_notes/<version>.md`, or the pending fragments in `src/release_notes/unreleased/` for a build past its release (headed "IN THIS BUILD"), baked in by `build.rs` through `release_notes/select.rs` — no git log, no network, and a build with neither is a build error
 ├── remote.rs             remote (SSH) target metadata and launch dispatch, plus the ssh-pane re-root offer: `ssh_destination` parses a pane's foreground argv using ssh's own flag grammar
 ├── remote/               remote's feature files, beside remote.rs; each file's `//!` doc says what it holds
+│   ├── control.rs        the SSH control master: starting or adopting it, commands over its socket
 │   ├── hosts.rs          the hosts in ~/.ssh/config, and the host a running ssh's argv names
 │   ├── offer.rs          the ssh-pane offer: a pane's host and folder, whether to offer, hosts whose install failed
 │   ├── offer_tests.rs    the ssh-pane offer's tests
