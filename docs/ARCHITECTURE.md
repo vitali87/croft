@@ -28,6 +28,8 @@ src/
 ├── file_ref.rs          `path:line[:col]` references detected in terminal text (rustc / grep / pytest / Python-traceback forms); backs Cmd/Ctrl+click-to-jump from any terminal pane with zero per-tool problem-matcher config
 ├── quickfix.rs           parses the last `grep`/`rg`/`git grep` command line into a pattern plus Search toggles and include/exclude globs, so "Search & Replace from Last grep/rg" seeds and runs the Search sidebar via `SearchPanel::seed`
 ├── git.rs                branch / dirty / ahead-behind status plus the working-tree operations the Source Control panel drives; multi-root, one `GitWorker` per workspace root
+├── git/                  git's feature files, beside git.rs; each file's `//!` doc says what it holds
+│   ├── tests.rs          git.rs's own tests
 ├── magic.rs              content-based format detection: a magic-byte signature table (images, PDF, zip family, gzip, xz, bzip2, zstd, tar, SQLite) used as the SECOND routing hint in `Editor::open` — extension first, sniffing decides when it gave no answer or lied
 ├── markdown.rs           rendered Markdown preview (Cmd/Ctrl+Shift+V): pulldown-cmark events to styled ratatui lines, tree-sitter fenced code, inline local images; pure, the editor holds the state
 ├── media.rs              audio/video info view for `.mp3`/`.wav`/`.flac`/`.m4a`/`.mp4`/`.m4v`/`.mov`: pure-Rust header parsers over a bounded head read, never decoding streams, rendered as a markdown card with an optional ffmpeg poster frame
