@@ -26,6 +26,7 @@ mod backend;
 mod captures;
 mod clock;
 mod commands;
+mod images;
 mod input;
 mod mouse;
 mod processes;
@@ -41,6 +42,8 @@ pub use commands::CommandDecoration;
 pub use commands::human_duration;
 pub use commands::pick_prompt_jump;
 use commands::*;
+pub use images::SIXEL_HOST;
+use images::*;
 pub use input::osc52_copy_seq;
 pub use mouse::MouseAction;
 pub use mouse::MouseButtonKind;
@@ -483,19 +486,6 @@ struct StoredImage {
     clock_rec: i64,
 }
 
-/// A pane inline image surfaced to the app: its per-pane id, the raw image
-/// bytes, and the anchor's CURRENT grid line (negative = scrolled into
-/// history).
-#[derive(Clone)]
-pub struct PaneImage {
-    pub seq: u64,
-    pub data: std::sync::Arc<Vec<u8>>,
-    pub line: i32,
-}
-
-/// Most inline images kept per pane; older ones scroll away like text.
-const IMAGES_MAX: usize = 4;
-
 /// One quick-select hint for the render loop: the match span on absolute
 /// grid line `line` (char indices into the spacer-skipped row text; the
 /// colmap translates back to grid columns), the label overlaid at its start,
@@ -592,18 +582,6 @@ struct CapturedRow {
 /// process name.
 pub fn pick_pane_label<'a>(manual: Option<&'a str>, auto: &'a str) -> &'a str {
     manual.unwrap_or(auto)
-}
-
-/// Set once the DA1 probe finds a sixel host, which no variable advertises.
-pub static SIXEL_HOST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// Whether this croft draws a pane's captured images (#1453): the outer
-/// terminal speaks some image protocol. A pane opened before the sixel probe
-/// answers says no, which costs a picture, never a blank chart.
-fn pane_images_shown() -> bool {
-    crate::iterm2_inline::detect_inline_image_protocol()
-        != crate::iterm2_inline::InlineImageProtocol::None
-        || SIXEL_HOST.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Milliseconds since the epoch, the clock `last_output_ms` keeps.
@@ -723,26 +701,6 @@ impl PtyTerminal {
             self.palette = palette;
             self.pty_dirty.store(true, Ordering::Release);
         }
-    }
-
-    /// Inline images captured from the pane's output, oldest first, each
-    /// with its anchor's CURRENT grid line (drift model identical to command
-    /// marks). Images whose anchor scrolled past the scrollback floor are
-    /// garbage-collected here.
-    pub fn pane_images(&self) -> Vec<PaneImage> {
-        let mut term = self.term.lock();
-        let now = self.clock.lock().unwrap().tick(&mut term);
-        let floor = term.grid().topmost_line().0;
-        drop(term);
-        let mut imgs = self.images.lock().unwrap();
-        imgs.retain(|m| m.line_rec - (now - m.clock_rec) as i32 >= floor);
-        imgs.iter()
-            .map(|m| PaneImage {
-                seq: m.seq,
-                data: m.data.clone(),
-                line: m.line_rec - (now - m.clock_rec) as i32,
-            })
-            .collect()
     }
 
     /// Whether the pane is in the alternate screen (a full-screen app owns
@@ -896,24 +854,6 @@ impl PtyTerminal {
     #[cfg(test)]
     pub fn grid_lock_for_test(&self) -> Arc<FairMutex<Term<VoidListener>>> {
         self.term.clone()
-    }
-
-    /// Test-only: record an inline image as the reader thread would,
-    /// anchored at the grid's CURRENT cursor row.
-    #[cfg(test)]
-    pub fn push_image_for_test(&self, data: Vec<u8>) {
-        let mut term = self.term.lock();
-        let line_rec = term.grid().cursor.point.line.0;
-        let clock_rec = self.clock.lock().unwrap().tick(&mut term);
-        drop(term);
-        let mut imgs = self.images.lock().unwrap();
-        let seq = imgs.last().map_or(0, |m| m.seq) + 1;
-        imgs.push(StoredImage {
-            seq,
-            data: std::sync::Arc::new(data),
-            line_rec,
-            clock_rec,
-        });
     }
 
     /// Test-only: whether a quick-select hint overlay is currently set.

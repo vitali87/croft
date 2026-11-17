@@ -297,6 +297,7 @@ src/
     │   ├── captures.rs      spotting screen clears, keeping the rows they wipe, the rewind buffer
     │   ├── clock.rs         the scroll clock that keeps selections and notes in place; each row's print time
     │   ├── commands.rs      shell-integration marks, finished commands and their decorations, prompt jumps, the typed prompt line
+    │   ├── images.rs        pictures printed into the pane and where they sit
     │   ├── input.rs         typed input, pastes, bracketed paste, clipboard sequences
     │   ├── mouse.rs         mouse reporting to the program in the pane; which grid cell a screen point is
     │   ├── processes.rs     the shell and foreground process: names, command lines, working directories, `cd`
