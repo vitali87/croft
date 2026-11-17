@@ -32,6 +32,7 @@ src/
 │   ├── changes.rs        changed files from `git status --porcelain`: kind, section and badge; Explorer decorations; line counts
 │   ├── contents.rs       a file at HEAD, a commit or an index stage; a conflict re-merged in diff3 style; a path's clean/smudge filter
 │   ├── diffs.rs          staged diffs; against a branch, its merge base or the previous commit; submodule diffs
+│   ├── history.rs        a file's history across renames, the commit graph, a branch's commits, a commit's files, diffs, message and card
 │   ├── messages.rs       one-line summaries of git's output: results, conflicts, errors and refusals
 │   ├── operations.rs     a merge, rebase, cherry-pick, revert or bisect in progress; continuing, skipping or aborting it
 │   ├── patches.rs        applying a hunk or line patch to the index or working tree, CRLF endings kept
