@@ -295,6 +295,7 @@ src/
     │   ├── annotations.rs   notes pinned to output; revealing a masked secret
     │   ├── captures.rs      spotting screen clears, keeping the rows they wipe, the rewind buffer
     │   ├── clock.rs         the scroll clock that keeps selections and notes in place; each row's print time
+    │   ├── commands.rs      shell-integration marks, finished commands and their decorations, prompt jumps, the typed prompt line
     │   ├── mouse.rs         mouse reporting to the program in the pane; which grid cell a screen point is
     │   ├── selection.rs     selections: make, extend, clear, words and blocks, keep them on their text as output scrolls; the selected text
     │   ├── tests.rs         the terminal pane's own tests
