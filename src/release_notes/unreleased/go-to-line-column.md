@@ -1,0 +1,1 @@
+feat(editor): Go to Line also takes a column: `Ln:Col` (or `Ln,Col`) puts the caret on that column as the status bar counts it, tabs included, and scrolls to it on a long line. A plain line number works as before.

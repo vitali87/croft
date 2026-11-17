@@ -500,6 +500,35 @@ impl Editor {
         self.symbol_clip().unwrap_or((0, self.lines.len()))
     }
 
+    /// Put the caret on the 1-based status-bar column `col` of its line: the
+    /// column `Ln X, Col Y` reports, where a tab counts its cells and every
+    /// other character one. A column inside a tab lands after it, one past
+    /// the end of the line lands at the end, and 0 counts as 1. Scrolls
+    /// sideways to show the caret on a long line.
+    pub fn goto_visual_col(&mut self, col: usize) {
+        self.sync_tab_cells();
+        let Some(line) = self.lines.get(self.cursor_row) else {
+            return;
+        };
+        let want = col.max(1);
+        let mut visual = 1;
+        let mut at = 0;
+        for c in line.chars() {
+            if visual >= want {
+                break;
+            }
+            visual += if c == '\t' {
+                super::render::tab_cells_at(visual - 1)
+            } else {
+                1
+            };
+            at += 1;
+        }
+        self.cursor_col = floor_grapheme_col(&self.lines[self.cursor_row], at);
+        self.ensure_cursor_col_visible();
+        self.last_edit_kind = None;
+    }
+
     /// Move the cursor to `line` and center the viewport on it (minimap click /
     /// drag navigation). The cursor moves too because the render's scroll-follow
     /// snaps the viewport back to keep the caret visible; centering the caret
