@@ -586,7 +586,116 @@ LSP = Target(
 )
 
 # What each file split out of src/widgets/terminal.rs holds, as FILES above.
-TERMINAL_FILES = {}
+TERMINAL_FILES = {
+    "mouse": (
+        "Mouse reporting: whether the program in the pane asked for mouse events, a click, drag or\n"
+        "wheel encoded as the report it expects, and which grid cell a screen point falls on.",
+        "terminal pane's mouse reporting",
+        "mouse reporting to the program in the pane; which grid cell a screen point is",
+    ),
+    "selection": (
+        "Selecting text: making, extending and clearing a selection, words and blocks, keeping it\n"
+        "on its text as output scrolls, alt-screen selections, the copy cursor, and the text a\n"
+        "selection holds.",
+        "terminal pane's selection",
+        "selections: make, extend, clear, words and blocks, keep them on their text as output "
+        "scrolls; the selected text",
+    ),
+    "clock": (
+        "The scroll clock and row times: how far output has scrolled, which keeps selections and\n"
+        "notes on their text, and the time each row was printed.",
+        "terminal pane's scroll clock",
+        "the scroll clock that keeps selections and notes in place; each row's print time",
+    ),
+    "captures": (
+        "What a clear wipes away: spotting a program clearing the screen, keeping the rows it\n"
+        "cleared, finding a captured line again, and the rewind buffer.",
+        "terminal pane's captured rows",
+        "spotting screen clears, keeping the rows they wipe, the rewind buffer",
+    ),
+    "annotations": (
+        "Notes pinned to output, and the text under a masked secret for click-to-reveal.",
+        "terminal pane's note",
+        "notes pinned to output; revealing a masked secret",
+    ),
+    "commands": (
+        "Shell integration: the prompt and command marks the shell reports, finished commands and\n"
+        "their decorations, a command's input and output text, jumping between prompts, and the\n"
+        "prompt line as typed.",
+        "terminal pane's shell integration",
+        "shell-integration marks, finished commands and their decorations, prompt jumps, the "
+        "typed prompt line",
+    ),
+    "shell_env": (
+        "The environment a pane's shell starts in: shell integration for each shell, the terminal\n"
+        "and locale variables, and croft's helpers on PATH.",
+        "terminal pane's shell environment",
+        "the shell's start-up environment: integration for each shell, terminal and locale "
+        "variables, croft's helpers on PATH",
+    ),
+    "processes": (
+        "The pane's processes: the shell and the foreground process, their names, command lines\n"
+        "and working directories, and changing directory.",
+        "terminal pane's process",
+        "the shell and foreground process: names, command lines, working directories, `cd`",
+    ),
+    "spawn": (
+        "Starting a pane: spawning the shell or a program, attaching to a hosted pane, the reader\n"
+        "thread that parses its output, and replaying a saved transcript.",
+        "terminal pane's start-up",
+        "starting a pane: spawn or attach, the output reader thread, replaying a saved "
+        "transcript",
+    ),
+    "backend": (
+        "The process behind a pane: the local pty or the session host, waiting on its output,\n"
+        "resizing it, noticing it exit, and shutting it down.",
+        "terminal pane's process link",
+        "the local pty or session host behind a pane: output waits, resize, exit, shutdown",
+    ),
+    "text": (
+        "Reading the grid as text: visible and wrapped lines, logical rows across soft wraps, find\n"
+        "lines, and the screen as ANSI with its colours.",
+        "terminal pane's grid text",
+        "the grid as text: visible and wrapped lines, logical rows, find lines, ANSI with colours",
+    ),
+    "scroll": (
+        "Scrolling and resizing: the scrollback offset, scrolling to a line, clearing the screen\n"
+        "and scrollback, and reflowing the grid on resize.",
+        "terminal pane's scrolling",
+        "scrolling, clearing the scrollback, reflowing the grid on resize",
+    ),
+    "input": (
+        "Writing to the pane: typed input, pastes and bracketed paste, and the clipboard\n"
+        "sequences.",
+        "terminal pane's input",
+        "typed input, pastes, bracketed paste, clipboard sequences",
+    ),
+    "images": (
+        "Pictures a program prints into the pane: keeping them and placing them on the grid.",
+        "terminal pane's image",
+        "pictures printed into the pane and where they sit",
+    ),
+    "overlays": (
+        "What is painted over the text: find matches, quick-select hints, trigger highlights,\n"
+        "problem-matcher watches, links and the colour palette.",
+        "terminal pane's overlay",
+        "find matches, quick-select hints, triggers, problem watches, links, the palette",
+    ),
+    "status": (
+        "The pane's state the app reads each frame: its label and name, the agent in it, its\n"
+        "reported status and progress, bells, notifications and ports, and whether it is quiet\n"
+        "or untouched.",
+        "terminal pane's status",
+        "label and name, agent, status and progress, bells, notifications, ports, quiet and "
+        "untouched",
+    ),
+    "render": (
+        "Drawing the pane: each cell's text and colours, selections, overlays, decorations and\n"
+        "notes.",
+        "terminal pane's drawing",
+        "drawing each cell, selections, overlays, decorations and notes",
+    ),
+}
 
 TERMINAL = Target(
     "terminal", "scripts/split_terminal_manifest.tsv", "src/widgets/terminal.rs",
