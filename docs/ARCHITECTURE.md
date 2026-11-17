@@ -30,6 +30,7 @@ src/
 ├── git.rs                branch / dirty / ahead-behind status plus the working-tree operations the Source Control panel drives; multi-root, one `GitWorker` per workspace root
 ├── git/                  git's feature files, beside git.rs; each file's `//!` doc says what it holds
 │   ├── blame.rs          which commit last changed each line of a file
+│   ├── branches.rs       the default branch; list, switch, track, create, rename, delete, merge and rebase branches
 │   ├── changes.rs        changed files from `git status --porcelain`: kind, section and badge; Explorer decorations; line counts
 │   ├── commits.rs        commit and amend with their refusals, undo the last commit, the commit graph's cherry-pick, revert, checkout, tag and reset
 │   ├── contents.rs       a file at HEAD, a commit or an index stage; a conflict re-merged in diff3 style; a path's clean/smudge filter
