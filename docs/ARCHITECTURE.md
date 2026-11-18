@@ -318,6 +318,8 @@ src/
     ├── testing.rs            Testing sidebar widget: the test suite tree with pass/fail/skip glyphs, the Activity summary line, and the failing-test count feeding the beaker activity badge
     ├── scrollbar.rs     shared vertical- and horizontal-scrollbar geometry
     ├── search.rs        sidebar search panel (query/replace/include/exclude inputs) + .gitignore-aware walker, glob filtering, and replace
+    ├── search/          the search panel's feature files, beside search.rs; each file's `//!` doc says what it holds
+    │   ├── tests.rs         the search panel's own tests
     ├── shortcuts.rs     F1 shortcuts modal: every binding grouped by pane, scrollable
     ├── branch_picker.rs Checkout / Create Branch quick-pick overlay: type to filter the repo's branches, Enter to switch or create-and-switch (also drives the Branch submenu's merge / rebase / delete / create-from via `branch_purpose`); pure widget fed by `git::list_branches`
     ├── input_prompt.rs  single-line text modal for SCM ops that need a typed value (clone URL, branch rename, remote name/URL, tag name), tagged by `InputPurpose`; `InputPrompt::confirm` is the same box with no field, a Y/N question (trash, uninstall, remove, consent) that nothing typed can answer
