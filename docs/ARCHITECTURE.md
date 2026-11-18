@@ -116,6 +116,7 @@ src/
 ├── session_cli.rs        local session persistence: `croft attach` / `croft ls` run croft under the session host so terminals/LSP/DAP survive closing the window; legacy dtach sessions keep reattaching, and `ls` lists only session sockets, never the relay, hook or pane-host sockets beside them
 ├── session_host.rs       the multiplayer session mux: a hidden `croft session-host` subcommand owning the inner croft's PTY and broadcasting it verbatim to N unix-socket clients, with write control and a presence roster
 ├── session_host/         the session host's feature files, beside session_host.rs; each file's `//!` doc says what it holds
+│   ├── attach.rs         the attaching client: the pump, the version banner, reconnects across a swap, the exit
 │   ├── connection.rs     one client's connection: its thread, typing attribution, write control, kicks
 │   ├── detach_chord.rs   spotting the detach chord in a client's own keystrokes
 │   ├── frame_write.rs    writing one frame to a socket within a deadline
