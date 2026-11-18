@@ -119,6 +119,7 @@ src/
 │   ├── connection.rs     one client's connection: its thread, typing attribution, write control, kicks
 │   ├── frame_write.rs    writing one frame to a socket within a deadline
 │   ├── identity.rs       a client's roster name and its stable identity across reconnects
+│   ├── launch.rs         attach-or-create: spawning the detached server, ending a stale one
 │   ├── outbox.rs         each client's outbound queue, its delivery count, and the writer thread that drains it
 │   ├── protocol.rs       the wire format: frame tags, control messages, encoding and decoding frames
 │   ├── pty.rs            the PTY master and the inner command, held fresh or inherited: resize and wait
