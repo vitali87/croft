@@ -350,6 +350,25 @@ class Helpers(unittest.TestCase):
         _, done = mi.fix_glue(self.GLUE, errors, errors, homes, "editor")
         self.assertTrue(all(d.endswith("used outside editor") for d in done), done)
 
+    def test_a_test_only_item_is_re_exported_for_the_tests_alone(self):
+        """An item that only exists under `#[cfg(test)]` (pair.rs's
+        `inject_note`, which the App's navigator tests call by path) gets a
+        re-export guarded the same way: an unguarded one names, in the app
+        build, an item that is not there (E0432)."""
+        errors = [("E0603", "function import `inject_note` is private")]
+        homes = {"inject_note": ("settings", "pub(crate)", ["#[cfg(test)]"])}
+        lines, done = mi.fix_glue(self.GLUE, [], errors, homes)
+        self.assertEqual(lines[5:8], ["use settings::*;", "#[cfg(test)]",
+                                      "pub(crate) use settings::inject_note;"])
+        self.assertEqual(done, ["re-exported settings::inject_note (pub(crate)) only under "
+                                "cfg(test): used outside app"])
+
+    def test_an_items_cfg_lines_are_read_from_above_its_declaration(self):
+        text = ("/// Test-only: anchors a seed note.\n#[cfg(test)]\n#[allow(dead_code)]\n"
+                "pub(crate) fn inject_note() {\n    #[cfg(unix)]\n    let x = 1;\n}")
+        self.assertEqual(mi.item_cfgs(text), ["#[cfg(test)]"])
+        self.assertEqual(mi.item_cfgs("pub fn plain() {}"), [])
+
     def test_a_glob_only_the_tests_need_is_kept_for_the_tests_and_an_unneeded_one_goes(self):
         app = [("unused_imports", "unused import: `commands::*`"),
                ("unused_imports", "unused import: `settings::*`")]

@@ -1731,10 +1731,26 @@ def reexport_line(lines, file, name):
     return next((n for n, ln in enumerate(lines) if pat.match(ln)), None)
 
 
+def item_cfgs(text):
+    """The `#[cfg(...)]` lines on an item, from its text: the attributes
+    among its doc comment, above its declaration."""
+    cfgs = []
+    for line in text.split("\n"):
+        line = line.strip()
+        if line.startswith("#[cfg(") and line.endswith(")]"):
+            cfgs.append(line)
+        elif not (line.startswith(("//", "#[")) or not line):
+            break
+    return cfgs
+
+
 def fix_glue(lines, app, tests, homes, scope="app"):
     """mod.rs `lines` with the glue the build errors ask for, and what was
     done. `scope` names the module being split, for the messages. `app` and `tests` are the errors of the two builds; `homes` maps a
-    moved free item's name to (file, visibility). Raises BuildError when an
+    moved free item's name to (file, visibility) or (file, visibility,
+    cfgs): `cfgs` are the item's own `#[cfg(...)]` lines, which its
+    re-export takes too, so a test-only item is re-exported for the tests
+    alone and the app build does not look for it. Raises BuildError when an
     error is not one this fixes."""
     lines, done, unknown = list(lines), [], []
     private, unused = set(), {"app": set(), "tests": set()}
@@ -1759,14 +1775,16 @@ def fix_glue(lines, app, tests, homes, scope="app"):
     if unknown and not private:
         raise BuildError("the build fails in a way this tool does not fix:\n  " + "\n  ".join(unknown))
     for name in sorted(private):
-        file, vis = homes[name]
+        file, vis, *rest = homes[name]
+        cfgs = list(rest[0]) if rest else []
         if vis not in ("pub", "pub(crate)"):
             raise BuildError(f"{name} is used outside {scope} but is {vis or 'private'} in {file}.rs")
         at = glob_line(lines, file)
         if at is None:
             at = next(n for n, ln in enumerate(lines) if ln == f"mod {file};")
-        lines.insert(at + 1, f"{vis} use {file}::{name};")
-        done.append(f"re-exported {file}::{name} ({vis}): used outside {scope}")
+        lines[at + 1:at + 1] = cfgs + [f"{vis} use {file}::{name};"]
+        only = f" only under {', '.join(c[2:-1] for c in cfgs)}" if cfgs else ""
+        done.append(f"re-exported {file}::{name} ({vis}){only}: used outside {scope}")
     for file in sorted(unused["app"] | unused["tests"]):
         at = glob_line(lines, file)
         guarded = at > 0 and lines[at - 1].startswith("#[cfg(")
@@ -1851,8 +1869,8 @@ def settle(root, rows, rounds=5, t=APP, new=None):
             with open(path, encoding="utf-8") as f:
                 for it in cpm.parse(f.read(), path)[0]:
                     if not it.ctx and not it.mods:
-                        vis[(file, it.name)] = it.vis
-        homes = {n: (f, vis[(f, n)]) for n, f in homes.items() if (f, n) in vis}
+                        vis[(file, it.name)] = (it.vis, item_cfgs(it.norm))
+        homes = {n: (f, *vis[(f, n)]) for n, f in homes.items() if (f, n) in vis}
         with open(mod_path, encoding="utf-8") as f:
             lines = f.read().split("\n")
         lines, now = fix_glue(lines, app, tests, homes, t.name)
