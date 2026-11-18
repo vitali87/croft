@@ -1174,8 +1174,115 @@ SESSION_HOST = Target(
     ),
 )
 
+PAIR_FILES = {
+    "fence": (
+        "The fenced edit protocol's parser: the fence markers, the events the machine resolves\n"
+        "from streamed text, the machine itself and its header parsers.",
+        "pair fence parser",
+        "the fence machine: the `<<<EDIT>>>` / `<<<NOTE>>>` markers, the events it "
+        "resolves from streamed text, and its header parsers",
+    ),
+    "offsets": (
+        "Byte offsets into a file's replica text: a fence's range and a note's row as offsets,\n"
+        "and keeping a tracked offset true through other participants' edits.",
+        "pair byte offset",
+        "byte offsets into the replica text: a fence range or a note row as offsets, kept "
+        "true through remote edits",
+    ),
+    "provider": (
+        "Which model the navigator talks to and what it is taught: the provider (the claude CLI\n"
+        "or a local endpoint), the config `croft pair` sits down with, and the system prompt\n"
+        "each provider's model gets.",
+        "pair provider",
+        "the provider (the claude CLI or a local endpoint), `PairConfig`, and the system "
+        "prompt each model is taught",
+    ),
+    "state": (
+        "The pilot state's turn books: a fresh seat, a file's live lines, whether a turn is\n"
+        "running, arming a turn and undoing a staged one, what the navigator last saw of a file,\n"
+        "and the bounded lock the App's threads take on the state.",
+        "pair turn state",
+        "the turn books: arming a turn and undoing a staged one, what the navigator last "
+        "saw, and the bounded lock the App's threads take",
+    ),
+    "notes": (
+        "The navigator's anchored notes: listing them, dropping one or all, replying in one, and\n"
+        "landing one from the app side.",
+        "pair note",
+        "the navigator's anchored notes: listing, dropping and replying to them, and "
+        "landing one from the app side",
+    ),
+    "caret": (
+        "The navigator's visible caret: parking it at a row until the file goes live, moving it\n"
+        "with an edit or a note, and this seat's site ids.",
+        "pair caret",
+        "the navigator's caret: parking it at a row until the file is live, and this "
+        "seat's site ids",
+    ),
+    "voice": (
+        "Where the pilot's words go: the model's prose and the pilot's diagnostics, to the\n"
+        "in-process host when seated inside croft, else the REPL's stdout and stderr.",
+        "pair voice",
+        "the pilot's voice and diagnostics: to the in-process host inside croft, else "
+        "stdout and stderr",
+    ),
+    "claude_cli": (
+        "The claude CLI: the tools and settings it may use, finding it on a stripped GUI PATH,\n"
+        "the command that launches it, reading its stream-json events, and the scripted fake\n"
+        "claude the tests drive.",
+        "pair claude CLI",
+        "the claude CLI: its sandbox, finding it on a GUI PATH, its launch command, its "
+        "stream-json events, and the tests' fake claude",
+    ),
+    "seat": (
+        "Seating the pilot: connecting the collab seat, the claude and local-endpoint seats and\n"
+        "their threads, what a turn's end reports, and tearing a seat down.",
+        "pair seat",
+        "seating the pilot: the claude and local-endpoint seats, their threads, and "
+        "teardown",
+    ),
+    "apply": (
+        "Applying the stream to the collab seat: waiting for a file to go live, applying each\n"
+        "fence event, opening and reverting the streamed region, and the pump tick that keeps it\n"
+        "true against the relay.",
+        "pair fence apply",
+        "applying fence events to the collab seat: the bootstrap wait, the streamed "
+        "region and its revert, and the pump tick",
+    ),
+    "turns": (
+        "User turns: where a turn goes (the claude child's stdin or the local worker), composing\n"
+        "the task, ask, yield and reply turns, and sending one with any pending cancel note.",
+        "pair user turn",
+        "user turns: the sink, composing task, ask, yield and reply turns, and sending "
+        "one",
+    ),
+    "repl": (
+        "`croft pair --repl`: the debug REPL driver, joining the relay and running until stdin\n"
+        "closes.",
+        "pair REPL",
+        "`croft pair --repl`, the debug REPL driver",
+    ),
+}
+
+PAIR = Target(
+    "pair", "scripts/split_pair_manifest.tsv", "src/pair.rs", "src/pair", PAIR_FILES,
+    Tree(
+        "├── pair.rs ",
+        "├── pair/                 the pilot's feature files, beside pair.rs; "
+        "each file's `//!` doc says what it holds",
+        "│   ├── ", 17,
+    ),
+    "pair-",
+    (
+        "The pilot's own tests, moved out of pair.rs (#2062).",
+        "the pilot's tests",
+        "the pilot's own tests",
+    ),
+)
+
 TARGETS = {
-    t.name: t for t in (APP, EDITOR, LSP, TERMINAL, GIT, REMOTE, SEARCH, SESSION_HOST)
+    t.name: t
+    for t in (APP, EDITOR, LSP, TERMINAL, GIT, REMOTE, SEARCH, SESSION_HOST, PAIR)
 }
 
 # Kinds whose declaration can carry a visibility.
