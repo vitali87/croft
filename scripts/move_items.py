@@ -1513,9 +1513,14 @@ def add_glue(lines, file, free):
     """`mod file;` after the last `mod x;` at the top of mod.rs and, when the
     file has free items, `use file::*;` after the `use` lines that follow. A
     file with no `mod x;` yet gets its first after the `use` declarations at
-    its top, a blank line between."""
+    its top, a blank line between. The top ends at the file's first item:
+    a split file that has shrunk keeps its `#[cfg(test)] mod tests;` at the
+    bottom, below its last struct, and a new file's `mod` goes with the
+    others, not beside that one."""
     decl = re.compile(r"^(pub(\(\w+\))? )?mod \w+;$")
-    mods = [n for n, ln in enumerate(lines[:200]) if decl.match(ln)]
+    items, _ = cpm.parse("\n".join(lines))
+    first = min((it.start for it in items), default=len(lines))
+    mods = [n for n, ln in enumerate(lines[:first]) if decl.match(ln)]
     if mods:
         last_mod = max(mods)
     else:

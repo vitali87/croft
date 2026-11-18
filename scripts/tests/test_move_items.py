@@ -350,6 +350,20 @@ class Helpers(unittest.TestCase):
         _, done = mi.fix_glue(self.GLUE, errors, errors, homes, "editor")
         self.assertTrue(all(d.endswith("used outside editor") for d in done), done)
 
+    def test_a_new_mod_joins_the_top_block_not_the_tests_at_the_bottom(self):
+        """A split file shrinks until its `mod tests;`, below its last struct,
+        is near the top of the file. A later file's `mod` (and its glob) still
+        go with the other files' at the top: pair.rs's `turns` once landed
+        after `mod tests;`, where rustfmt kept it."""
+        lines = ["//! The pilot.", "", "mod apply;", "mod fence;", "use apply::*;",
+                 "use fence::*;", "", "use std::sync::Mutex;", "",
+                 "pub(crate) struct PairState {", "    n: u8,", "}", "",
+                 "#[cfg(test)]", "mod tests;", ""]
+        out = mi.add_glue(list(lines), "turns", True)
+        self.assertEqual(out[2:5], ["mod apply;", "mod fence;", "mod turns;"])
+        self.assertLess(out.index("use turns::*;"), out.index("pub(crate) struct PairState {"))
+        self.assertEqual(out[-3:], ["#[cfg(test)]", "mod tests;", ""])
+
     def test_a_test_only_item_is_re_exported_for_the_tests_alone(self):
         """An item that only exists under `#[cfg(test)]` (pair.rs's
         `inject_note`, which the App's navigator tests call by path) gets a
