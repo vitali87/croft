@@ -369,7 +369,11 @@ impl Editor {
             self.cursor_row = sel.head.0.min(last);
             self.cursor_col = sel.head.1.min(self.line_char_len(self.cursor_row));
             self.delete_selection_inner();
-            self.insert_newline_raw();
+            // The smart Enter, not the raw one: each caret keeps its line's
+            // indentation and gets the language's own rule (a continued
+            // comment, a list marker, a doc comment), exactly as a single
+            // caret does.
+            self.smart_insert_newline_inner();
             placed.push((
                 is_primary,
                 self.pin_from_end((self.cursor_row, self.cursor_col)),

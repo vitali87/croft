@@ -1629,6 +1629,27 @@ fn multi_cursor_persist_keeps_every_caret_through_moves_typing_and_enter() {
     assert!(!app.editor.has_multi_cursor(), "Esc collapses to one");
 }
 
+/// Enter keeps each caret's indentation, as one caret's Enter does: the
+/// smart rule, not a bare line split.
+#[test]
+fn multi_cursor_enter_keeps_every_carets_indentation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "m.py", "def f():\n    a = 1\n    b = 2");
+    app.apply_merged_settings(&crate::prefs::Prefs {
+        multi_cursor_persist: true,
+        ..Default::default()
+    });
+    (app.editor.cursor_row, app.editor.cursor_col) = (1, 9);
+    app.editor.carets = vec![crate::widgets::editor::EditorSelection::new(2, 9)];
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        app.editor.lines,
+        ["def f():", "    a = 1", "    ", "    b = 2", "    "],
+        "both new lines carry the indentation of the line they split"
+    );
+}
+
 /// Negative: with the pref off, the first movement still drops every extra
 /// caret and falls through to single-caret handling, as it always has.
 #[test]
