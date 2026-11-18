@@ -55,6 +55,7 @@ pub use disk::SaveOutcome;
 pub use disk::decode_blob;
 pub use disk::is_permission_denied;
 pub(crate) use disk::normalize_newlines;
+pub use disk::read_text_for_listing;
 use disk::*;
 pub use gutter::GitMark;
 pub use gutter::LineBlame;

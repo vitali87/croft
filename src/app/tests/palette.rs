@@ -2635,6 +2635,52 @@ fn the_bookmark_picker_lists_the_marks_of_a_closed_tab() {
     assert_eq!(app.pending_bookmarks[0].line, 1);
 }
 
+/// A closed file is listed the way the editor would open it: a UTF-16 file
+/// with a byte-order mark reads as text, and one past the editor's size cap
+/// (which it would refuse to open) is left out without being read.
+#[test]
+fn the_bookmark_picker_reads_closed_files_as_the_editor_does() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    let big = tmp.path().join("big.log");
+    let mut utf16 = vec![0xFF, 0xFE];
+    for u in "alpha\nb\u{e9}ta\n".encode_utf16() {
+        utf16.extend(u.to_le_bytes());
+    }
+    std::fs::write(&a, utf16).unwrap();
+    let f = std::fs::File::create(&big).unwrap();
+    f.set_len(50 * 1024 * 1024 + 1).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.closed_bookmarks
+        .insert(a.clone(), [2].into_iter().collect());
+    app.closed_bookmarks
+        .insert(big.clone(), [1].into_iter().collect());
+    app.run_command(Command::ViewAllBookmarks);
+    let picker = app.list_picker.as_ref().expect("a.txt's mark is listed");
+    let labels: Vec<&str> = picker.rows.iter().map(|r| r.label.as_str()).collect();
+    assert_eq!(labels, ["a.txt:2  b\u{e9}ta"]);
+}
+
+/// Cmd+K Shift+B opens View All Bookmarks whichever case the terminal
+/// reports the letter in (CSI-u sends `b` with SHIFT).
+#[test]
+fn cmd_k_shift_b_opens_all_bookmarks_in_either_case() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    std::fs::write(&a, "alpha\n").unwrap();
+    for c in ['B', 'b'] {
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.closed_bookmarks
+            .insert(a.clone(), [1].into_iter().collect());
+        app.handle_key(key(KeyCode::Char('k'), KeyModifiers::CONTROL))
+            .unwrap();
+        app.handle_key(key(KeyCode::Char(c), KeyModifiers::SHIFT))
+            .unwrap();
+        assert!(app.list_picker.is_some(), "{c:?} opens the bookmark list");
+    }
+}
+
 /// The marks of a tab in another editor group are listed too, and Enter on
 /// one moves focus to that group rather than opening the file again here.
 #[test]
