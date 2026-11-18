@@ -317,7 +317,7 @@ src/
     ├── run_debug.rs          Run and Debug sidebar widget: the Run button empty state, and when a session is live the call stack, expandable variables, WATCH, a debug console and a `❯` REPL prompt; the App builds the rows and maps clicks back to frames and variables
     ├── testing.rs            Testing sidebar widget: the test suite tree with pass/fail/skip glyphs, the Activity summary line, and the failing-test count feeding the beaker activity badge
     ├── scrollbar.rs     shared vertical- and horizontal-scrollbar geometry
-    ├── search.rs        sidebar search panel (query/replace/include/exclude inputs) + .gitignore-aware walker, glob filtering, and replace
+    ├── search.rs        sidebar search panel (query/replace/include/exclude inputs) + .gitignore-aware walker, glob filtering, and replace: the `SearchPanel` type, its constructor and the types its parts share (`SearchHit`, `SearchOpts`, `SearchField`, `SearchToggle`); each feature lives in a file in `search/` below
     ├── search/          the search panel's feature files, beside search.rs; each file's `//!` doc says what it holds
     │   ├── fields.rs        the input fields: caret, selection, typing, focus, the Replace and details rows
     │   ├── highlight.rs     splitting a hit's line around its matches, for highlighting
@@ -1290,7 +1290,7 @@ Parses the last `grep`, `rg` or `git grep` command line (the last search of a pi
 
 **Flag handling.** `-g`/`--glob`s accumulate comma-separated. rg's `!`-negated globs and grep's `--exclude`/`--exclude-dir` land in files-to-exclude. rg and ag treat `-s` as forcing case sensitivity, while grep's `-s` stays the no-messages flag. Match Case starts from the tool's own default (case-sensitive, except ag's smart case) and `-i`/`-s`/`-S` overwrite it in order, as in rg. Smart case is resolved the way each tool reads the pattern: rg's on the literals of its regex-syntax AST (so `\W` isn't uppercase), ag's on every byte, and case-sensitive where unsure, since a narrower seed can't make Replace All touch a line the terminal never listed (#922).
 
-**The seed replaces wholesale.** `SearchPanel::seed` swaps the panel's query and both filter lists outright, and also resets field selections, because a stale byte range into shorter seeded text panicked. It then refocuses the query.
+**The seed replaces wholesale.** `SearchPanel::seed` swaps the panel's query and both filter lists outright, and also resets field selections, because a stale byte range into shorter seeded text panicked. It then refocuses the query. Code: `seed` in `widgets/search/fields.rs`.
 
 ### registry_index.rs
 
@@ -1605,7 +1605,7 @@ A collapsible, language-aware DEPENDENCIES section, offered as a ⋯-menu Explor
 
 A VS Code-style inline Find bar (Cmd+F) with an active-match orange highlight, Enter / Shift+Enter to walk matches, and case-sensitive / whole-word / regex toggles. The Replace row (Cmd+Opt+F) adds Tab to switch field, Enter to replace-and-advance, and Cmd+Opt+Enter to replace all in one undo step.
 
-**Replace All uses the same enumeration as the display.** It walks matches via the same `split_for_highlight` that the count, paint and navigation use, so it never touches what the bar cannot show, and it recounts afterwards.
+**Replace All uses the same enumeration as the display.** It walks matches via the same `split_for_highlight` that the count, paint and navigation use, so it never touches what the bar cannot show, and it recounts afterwards. Code: `split_for_highlight` in `widgets/search/highlight.rs`.
 
 **Regex replacements expand `$n` captures** plus VS Code's `\n`/`\t` escapes, where a replacement newline splits the line.
 
