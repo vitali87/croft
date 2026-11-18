@@ -232,6 +232,22 @@ class Moves(unittest.TestCase):
         code, out = root.pure(first)
         self.assertEqual(code, 0, out)
 
+    def test_appending_to_a_file_whose_glob_was_dropped_puts_it_back(self):
+        where = {"bump": (2, "codeql"), "inc": (3, "codeql")}
+        root = Root(self.tmp, MOD, where)
+        code, out = root.move(2)
+        self.assertEqual(code, 0, out)
+        path = self.tmp / "src/app/codeql.rs"
+        text = path.read_text()
+        self.assertIn("\nuse super::*;\n\n", text)
+        path.write_text(text.replace("\nuse super::*;\n\n", "\n", 1))
+        root.commit()
+        code, out = root.move(3)
+        self.assertEqual(code, 0, out)
+        text = root.read("src/app/codeql.rs")
+        self.assertEqual(text.count("use super::*;"), 1)
+        self.assertLess(text.index("use super::*;"), text.index("fn bump"))
+
     def test_attributes_over_several_lines_and_comments_between_them_are_passed(self):
         spread = (MOD + "\n#[cfg(any(\n    unix,\n    windows\n))]\n// Why it is allowed.\n"
                   "#[allow(dead_code)] #[inline]\nfn spread() {}\n")
@@ -371,6 +387,43 @@ class Helpers(unittest.TestCase):
         for errors in cases:
             with self.subTest(errors=errors), self.assertRaises(mi.BuildError):
                 mi.fix_glue(self.GLUE, errors, [], {})
+
+    def test_an_error_that_follows_from_a_private_import_waits_for_the_re_export(self):
+        """A struct reached through a private glob import is not resolved, so
+        rustc also reports what it then could not infer about the struct's
+        fields (E0277 on a `let Some(x) = status.branch.clone()`). The
+        re-export goes in rather than the tool stopping; the next build says
+        whether the other error was only a consequence."""
+        errors = [("E0603", "struct import `GitStatus` is private"),
+                  ("E0277", "the size for values of type `str` cannot be known at compilation time")]
+        homes = {"GitStatus": ("settings", "pub")}
+        lines, done = mi.fix_glue(self.GLUE, errors, errors, homes, "git")
+        self.assertIn("pub use settings::GitStatus;", lines)
+        self.assertEqual(done, ["re-exported settings::GitStatus (pub): used outside git"])
+
+    def test_a_new_file_that_needs_nothing_from_its_parent_loses_the_glob(self):
+        """A moved file of plain text handling (git.rs's one-line summaries
+        of git's output) uses nothing from git.rs, and `use super::*;` is
+        then an unused import that fails the build: it goes, with the blank
+        line after it."""
+        lines = ["//! What git said, in one line.", "", "use super::*;", "",
+                 "pub fn headline(output: &str) -> &str {", "    output", "}", ""]
+        self.assertEqual(mi.without_super_glob(lines),
+                         ["//! What git said, in one line.", "",
+                          "pub fn headline(output: &str) -> &str {", "    output", "}", ""])
+
+    def test_a_later_move_puts_the_parent_glob_back_before_appending(self):
+        """An earlier move may have dropped `use super::*;` from a file that
+        needed nothing from its parent; items a later move appends may need
+        it. The glob goes back after the `//!` doc (the build step drops it
+        again if it is still unused), and a file that has it is untouched."""
+        bare = ["//! What git said, in one line.", "",
+                "pub fn headline(output: &str) -> &str {", "    output", "}", ""]
+        full = ["//! What git said, in one line.", "", "use super::*;", "",
+                "pub fn headline(output: &str) -> &str {", "    output", "}", ""]
+        self.assertEqual(mi.with_super_glob(bare), full)
+        self.assertEqual(mi.with_super_glob(full), full)
+        self.assertEqual(mi.with_super_glob(mi.without_super_glob(full)), full)
 
     def test_an_item_too_narrow_for_its_outside_users_stops_the_tool(self):
         errors = [("E0603", "function import `seq` is private")]
@@ -538,6 +591,39 @@ class OtherTargets(unittest.TestCase):
         self.assertRegex(arch, r"editor\.rs +The editor\.\n    ├── editor/ +the editor's feature "
                                r"files.*\n    │   ├── tests\.rs +the editor's own tests\n    ├── editor_find")
 
+    def test_another_named_test_module_moves_to_a_file_of_its_name(self):
+        """A file with a second inline test module (remote.rs's
+        `offer_tests`) moves it to <folder>/<name>.rs: same module name and
+        place, so its `use super::*;` still reaches the split file."""
+        second = EDITOR + ("\n/// The offer's tests.\n#[cfg(test)]\nmod offer_tests {\n"
+                           "    use super::*;\n\n    #[test]\n    fn shows() {\n"
+                           "        assert_eq!(Editor { n: 3 }.shown(), 3);\n    }\n}\n")
+        (self.tmp / SPLIT.source).write_text(second)
+        self.root.commit()
+        before = subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.tmp, capture_output=True,
+                                text=True, check=True).stdout.strip()
+        target = SPLIT._replace(more_tests={
+            "offer_tests": ("The offer's tests.", "the offer's tests", "the offer's tests")})
+        moved, out = quiet(mi.tests_out, str(self.tmp), target, False, "offer_tests")
+        self.assertEqual(moved, 6, out)
+        self.assertIn("to src/widgets/editor/offer_tests.rs", out)
+        self.assertTrue(self.root.read(SPLIT.source).endswith(
+            "/// The offer's tests.\n#[cfg(test)]\nmod offer_tests;\n"))
+        self.assertIn("mod tests {", self.root.read(SPLIT.source), "the other module stays")
+        offer = self.root.read("src/widgets/editor/offer_tests.rs")
+        self.assertTrue(offer.startswith("//! The offer's tests.\n\nuse super::*;\n\n#[test]\nfn shows() {\n"))
+        note = self.root.read(os.path.join(mi.NOTES, "2062-split-editor-offer-tests.md"))
+        self.assertIn("the offer's tests moved to their own file, src/widgets/editor/offer_tests.rs.", note)
+        self.assertRegex(self.root.read(mi.ARCH), r"│   ├── offer_tests\.rs +the offer's tests\n")
+        self.root.commit()
+        code, report = self.root.pure(before)
+        self.assertEqual(code, 0, report)
+
+    def test_a_test_module_the_target_has_no_words_for_is_refused(self):
+        with self.assertRaises(mi.ManifestError) as e:
+            mi.tests_out(str(self.tmp), SPLIT, False, "offer_tests")
+        self.assertIn("no words for its offer_tests module", str(e.exception))
+
     def test_a_file_without_one_tests_block_is_refused(self):
         (self.tmp / SPLIT.source).write_text(EDITOR.split("/// The editor's tests.")[0])
         code, out = self.tests_out()
@@ -606,7 +692,7 @@ class OtherTargets(unittest.TestCase):
         self.assertEqual(mi.add_arch_row(both, "undo", term), both)
 
     def test_every_target_names_its_own_manifest_file_and_folder(self):
-        self.assertEqual(sorted(mi.TARGETS), ["app", "editor", "lsp", "terminal"])
+        self.assertEqual(sorted(mi.TARGETS), ["app", "editor", "git", "lsp", "remote", "terminal"])
         for t in mi.TARGETS.values():
             with self.subTest(target=t.name):
                 self.assertTrue(t.source.endswith(".rs") and t.manifest.endswith(".tsv"))

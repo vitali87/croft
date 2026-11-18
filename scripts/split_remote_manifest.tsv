@@ -1,0 +1,189 @@
+# Stage B of the refactor program (#2062): where each item of src/remote.rs goes.
+# One row per item, in file order. pr 0 means the item stays in remote.rs; the others
+# move to src/remote/<file>.rs in that PR. kind, impl and name are as
+# `scripts/check_pure_move.py list` prints them. Run
+# `scripts/move_items.py --target remote --check` after adding an item to remote.rs.
+# remote.rs keeps the shell quoting every feature uses, and the structs whose private
+# fields code in several files reads (the SSH control master's, and the config
+# re-push's the tests read), and the test thread's stand-in for ssh, which the SSH
+# control master and the tests both read.
+pr	file	kind	impl	name
+1	hosts	struct	-	RemoteTarget
+1	hosts	fn	impl RemoteTarget	detail
+1	hosts	struct	-	SshConfigState
+1	hosts	struct	-	SshConfigEntryState
+1	hosts	fn	-	ssh_config_state
+1	hosts	struct	-	HostBlock
+1	hosts	const	-	SSH_PROGRAMS
+1	hosts	const	-	SSH_FLAGS_WITH_ARG
+1	hosts	fn	-	ssh_destination
+2	offer	fn	-	resolve_offer_host
+2	offer	fn	-	ssh_reroot_decision
+1	hosts	fn	-	discover_ssh_targets
+1	hosts	fn	-	ssh_config_paths
+1	hosts	fn	-	primary_ssh_config_path
+1	hosts	fn	-	parse_ssh_config
+1	hosts	fn	-	flush_block
+1	hosts	fn	-	strip_comment
+1	hosts	fn	-	is_explicit_host_alias
+8	session	fn	-	launch_croft
+10	install_stream	fn	-	install_only_streaming
+10	install_stream	fn	-	install_only_streaming_over
+10	install_stream	fn	-	spawn_log_tee
+10	install_stream	fn	-	install_log_path
+8	session	const	-	DROP_TO_LOCAL_EXIT_CODE
+8	session	enum	-	RemoteOutcome
+8	session	enum	-	RemoteStatusClass
+8	session	fn	-	classify_remote_status
+8	session	fn	-	outcome_or_bail
+8	session	fn	-	remote_has_session_supervisor
+8	session	fn	-	session_supervisor_check_command
+8	session	fn	-	lost_session_release_seq
+8	session	fn	-	release_lost_session_terminal
+8	session	fn	-	reconnect_master
+8	session	fn	-	run_croft_session
+8	session	fn	-	launch_only
+10	install_stream	fn	-	run_command_streaming
+10	install_stream	fn	-	install_remote_croft_streaming
+12	cross_build	fn	-	cross_build_unavailable
+12	cross_build	fn	-	cross_build_static
+10	install_stream	fn	-	try_local_cross_install_streaming
+10	install_stream	fn	-	sync_local_source_to_remote_streaming
+8	session	fn	-	launch_croft_with
+10	install_stream	fn	-	spawn_background_install
+0		struct	-	SshControl
+3	control	struct	-	AdoptedMaster
+3	control	fn	impl SshControl	adopt
+3	control	fn	impl SshControl	start
+3	control	fn	impl SshControl	command
+3	control	fn	impl SshControl	background_command
+3	control	fn	impl SshControl	background_shell
+0		macro	-	thread_local!
+3	control	fn	-	ssh_program
+3	control	fn	-	ssh_socket_read
+14	config_push	fn	-	read_remote_hashes
+3	control	fn	-	ssh_socket_command
+3	control	fn	impl Drop for SshControl	drop
+4	relay	struct	-	DropPump
+4	relay	fn	-	relay_setup_error
+4	relay	fn	impl DropPump	start
+4	relay	fn	impl Drop for DropPump	drop
+4	relay	const	-	MISSING_PULL_GRACE
+4	relay	fn	-	run_pump
+5	clipboard	fn	-	handle_clipboard_request
+5	clipboard	fn	-	handle_copy_request
+5	clipboard	const	-	MAX_COPY_PAYLOAD_BYTES
+5	clipboard	const	-	COPY_READ_TIMEOUT
+5	clipboard	fn	-	copy_request_id_is_safe
+4	relay	enum	-	RelayRequest
+4	relay	fn	impl RelayRequest	id
+4	relay	fn	-	parse_relay_request
+7	forward	fn	-	url_is_safe_to_open
+6	pull	fn	-	pull_source_allowed
+6	pull	fn	-	pull_tar_args
+6	pull	fn	-	handle_pull_request
+3	control	fn	-	ssh_exec
+4	relay	fn	-	claim_command
+7	forward	fn	-	open_local_url
+7	forward	fn	-	handle_open_request
+7	forward	fn	-	pick_local_port
+7	forward	fn	-	handle_forward_request
+7	forward	fn	-	handle_unforward_request
+4	relay	fn	-	write_relay_err
+4	relay	fn	-	relay_session_id
+9	launch_command	fn	-	client_process_nonce
+3	control	fn	-	ssh_control_dir
+8	session	fn	-	run_remote_croft
+11	install	fn	-	install_remote_croft
+12	cross_build	fn	-	raise_fd_limit
+12	cross_build	fn	-	cross_compile_unavailable_reason
+12	cross_build	fn	-	probe_cross_tool
+12	cross_build	fn	-	cross_tool_search_dirs_from
+12	cross_build	fn	-	push_unique_path
+12	cross_build	fn	-	cross_tool_search_dirs
+12	cross_build	fn	-	cross_tool_path
+12	cross_build	fn	-	cross_tool_path_from
+12	cross_build	fn	-	cross_tool_program
+12	cross_build	fn	-	find_executable_in_dirs
+12	cross_build	fn	-	is_executable_file
+12	cross_build	fn	-	cross_tool_command
+12	cross_build	fn	-	checkout_dir
+12	cross_build	fn	-	cross_tool_command_in_checkout
+12	cross_build	fn	-	cargo_zigbuild_command
+12	cross_build	fn	-	sync_workspace_lock
+14	config_push	fn	-	push_config_files
+14	config_push	struct	-	SyncResolution
+14	config_push	fn	-	sync_config_now
+15	config_repush	struct	-	ConfigRepush
+15	config_repush	fn	impl ConfigRepush	start
+15	config_repush	fn	impl ConfigRepush	retarget
+14	config_push	fn	-	print_config_diff
+15	config_repush	fn	impl Drop for ConfigRepush	drop
+0		struct	-	SyncExclusions
+14	config_push	fn	impl SyncExclusions	load
+14	config_push	fn	impl SyncExclusions	current
+14	config_push	fn	impl SyncExclusions	update
+15	config_repush	enum	-	RepushGate
+15	config_repush	const	-	REPUSH_RETRY
+0		struct	-	RepushState
+15	config_repush	fn	impl RepushState	new
+15	config_repush	type	-	Pushes
+0		struct	-	PushResult
+15	config_repush	fn	-	repush_tick
+15	config_repush	fn	-	push_over_bulk_lane
+14	config_push	fn	-	config_sync_log
+14	config_push	fn	-	ship_file_rsync_command
+13	source	fn	-	remote_source_dir_prep
+13	source	fn	-	source_sync_filter_args
+13	source	fn	-	source_sync_tar_members
+13	source	fn	-	source_sync_rsync_command
+11	install	static	-	FORCE_SOURCE_BUILD
+11	install	fn	-	try_prebuilt_install
+11	install	fn	-	remote_target_triple
+11	install	fn	-	arch_to_musl_triple
+12	cross_build	fn	-	rust_target_installed
+12	cross_build	fn	-	try_local_cross_install
+11	install	const	-	REMOTE_COMPILE_SIDE_EFFECTS
+11	install	fn	-	confirm_remote_compile_on_tty
+9	launch_command	fn	-	remote_croft_command
+9	launch_command	fn	-	remote_croft_command_for_terminal
+9	launch_command	fn	-	dtach_socket_path
+9	launch_command	fn	-	mux_socket_path
+9	launch_command	fn	-	collab_socket_path
+8	session	fn	-	is_transport_failure
+11	install	fn	-	remote_install_needed
+11	install	fn	-	remote_install_check_command
+13	source	fn	-	sync_local_source_to_remote
+13	source	fn	-	sync_via_rsync
+13	source	fn	-	sync_via_tar
+13	source	fn	-	shell_quote_for_e_arg
+8	session	fn	-	running_over_ssh
+11	install	fn	-	remote_install_command
+11	install	fn	-	activate_command
+11	install	fn	-	mark_remote_updating
+11	install	fn	-	clear_remote_updating
+11	install	fn	-	remote_croft_present
+13	source	fn	-	local_source_stamp
+13	source	fn	-	build_stamp_for
+13	source	fn	-	source_snapshot_warning
+13	source	fn	-	source_dir_is_snapshot
+13	source	const	-	SOURCE_SKIP_NAMES
+13	source	const	-	SOURCE_STAMP_INPUTS
+13	source	fn	-	source_stamp_for
+13	source	fn	-	hash_source_dir
+0		fn	-	shell_quote
+3	control	fn	-	ssh_control_socket_path_for_test
+2	offer	type	-	RefusedHosts
+2	offer	fn	-	refusal_live
+2	offer	fn	-	offer_allowed
+2	offer	type	-	CwdReport
+2	offer	fn	-	remote_workspace_path
+2	offer	fn	-	same_host
+2	offer	fn	-	ssh_pane_samples
+2	offer	fn	-	is_ssh_program
+2	offer	fn	-	ssh_offer_host
+2	offer	const	-	REFUSED_HOST_TTL
+2	offer	fn	-	refused_hosts_path
+2	offer	fn	-	load_refused_hosts
+2	offer	fn	-	forget_refused_host
+2	offer	fn	-	remember_refused_host
