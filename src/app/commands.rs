@@ -1020,6 +1020,7 @@ impl App {
                     String::from("Word wrap: off")
                 };
             }
+            Cmd::ToggleMultiCursorPersist => self.toggle_multi_cursor_persist(),
             Cmd::AddCursorAbove => self.editor.add_cursor_above(),
             Cmd::AddCursorBelow => self.editor.add_cursor_below(),
             Cmd::ColumnSelectUp => self.editor.column_select(-1, 0),

@@ -266,6 +266,10 @@ pub enum Command {
     NavigateForward,
     GoToLastEditLocation,
     ToggleVimMode,
+    /// `multi_cursor_persist`: keep every caret through ordinary movement
+    /// and Enter, as VS Code does, instead of collapsing to one on the first
+    /// move. Saved to config like Vim mode.
+    ToggleMultiCursorPersist,
     MacroStartStopRecording,
     MacroReplayLast,
     MacroReplayTimes,
@@ -822,6 +826,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::NavigateForward,
     Command::GoToLastEditLocation,
     Command::ToggleVimMode,
+    Command::ToggleMultiCursorPersist,
     Command::MacroStartStopRecording,
     Command::MacroReplayLast,
     Command::MacroReplayTimes,
@@ -1315,6 +1320,7 @@ impl Command {
             Command::NavigateForward => "Go Forward",
             Command::GoToLastEditLocation => "Go to Last Edit Location",
             Command::ToggleVimMode => "Toggle Vim Mode",
+            Command::ToggleMultiCursorPersist => "Toggle Multi-Cursor Persistence",
             Command::MacroStartStopRecording => "Macro: Start/Stop Recording",
             Command::MacroReplayLast => "Macro: Replay Last",
             Command::MacroReplayTimes => "Macro: Replay N Times…",
@@ -1820,6 +1826,7 @@ impl Command {
             Command::NavigateForward => "Ctrl+Shift+-",
             Command::GoToLastEditLocation => "Cmd+K Cmd+Q",
             Command::ToggleVimMode => "Cmd+E",
+            Command::ToggleMultiCursorPersist => "",
             Command::MacroStartStopRecording => "",
             Command::MacroReplayLast => "",
             Command::MacroReplayTimes => "",
@@ -2309,6 +2316,7 @@ impl Command {
             Command::NavigateForward => "navigate_forward",
             Command::GoToLastEditLocation => "go_to_last_edit_location",
             Command::ToggleVimMode => "toggle_vim_mode",
+            Command::ToggleMultiCursorPersist => "toggle_multi_cursor_persist",
             Command::MacroStartStopRecording => "macro_record",
             Command::MacroReplayLast => "macro_replay_last",
             Command::MacroReplayTimes => "macro_replay_times",
