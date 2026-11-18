@@ -5989,6 +5989,23 @@ fn multi_newline_splits_the_line_at_every_caret() {
     assert_eq!(e.lines, ["abc", "def", "ghi"], "one step");
 }
 
+/// Overlapping selections describe the same text once: Enter splits their
+/// line once, not once per caret, and no caret is left misplaced.
+#[test]
+fn multi_newline_ignores_a_caret_inside_another_selection() {
+    let mut e = editor_with("abcd");
+    e.cursor_row = 0;
+    e.cursor_col = 4;
+    e.selection = Some(EditorSelection {
+        anchor: (0, 0),
+        head: (0, 4),
+    });
+    e.carets = vec![EditorSelection::new(0, 2)];
+    e.multi_newline();
+    assert_eq!(e.lines, ["", ""], "the selection is replaced once");
+    assert!(!e.has_multi_cursor(), "the covered caret added no split");
+}
+
 fn three_foos() -> Editor {
     editor_with("foo = 1\nfoo = 2\nfoo = 3")
 }

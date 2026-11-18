@@ -361,6 +361,21 @@ impl Editor {
             .enumerate()
             .map(|(i, sel)| (i == 0, sel))
             .collect();
+        // Overlapping selections name the same text once. A caret starting
+        // inside one already handled would split the same line again and
+        // leave the later carets in the wrong place, so it is dropped.
+        all.sort_by_key(|(_, sel)| sel.normalised().0);
+        let mut kept: Vec<(bool, EditorSelection)> = Vec::new();
+        let mut covered: Option<(usize, usize)> = None;
+        for (primary, sel) in all {
+            let (start, end) = sel.normalised();
+            if covered.is_some_and(|prev_end| start < prev_end) {
+                continue;
+            }
+            covered = Some(if end > start { end } else { start });
+            kept.push((primary, sel));
+        }
+        let mut all = kept;
         all.sort_by_key(|(_, sel)| std::cmp::Reverse(sel.normalised().0));
         let mut placed: Vec<(bool, (usize, usize))> = Vec::with_capacity(all.len());
         for (is_primary, sel) in all {
