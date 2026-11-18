@@ -321,6 +321,7 @@ src/
     ├── search/          the search panel's feature files, beside search.rs; each file's `//!` doc says what it holds
     │   ├── fields.rs        the input fields: caret, selection, typing, focus, the Replace and details rows
     │   ├── highlight.rs     splitting a hit's line around its matches, for highlighting
+    │   ├── hit_test.rs      what a click or the pointer lands on: toggles, buttons, fields, result rows
     │   ├── matcher.rs       the query's matcher and its toggles, the pattern the Find bar shares, an invalid query's error
     │   ├── path_filter.rs   the files to include / exclude globs, and the test a path must pass
     │   ├── replace.rs       replacement text, replacing in a line, a text or a file, and Replace All
