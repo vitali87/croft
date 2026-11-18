@@ -136,6 +136,7 @@ src/
 ├── collab_agent.rs       a headless collab guest exposed as an MCP server on stdio (`croft collab-agent --workspace <path>`): joins the relay and serves five `collab_*` tools over JSON-RPC NDJSON so an external AI co-edits with a live named caret; croft itself contains no LLM code
 ├── pair.rs               the AI pilot core ("croft pair" / resident navigator): spawns the `claude` CLI as a persistent stream-json conversation and parses its fenced `<<<EDIT>>>` / `<<<NOTE>>>` protocol
 ├── pair/                 the pilot's feature files, beside pair.rs; each file's `//!` doc says what it holds
+│   ├── apply.rs          applying fence events to the collab seat: the bootstrap wait, the streamed region and its revert, and the pump tick
 │   ├── caret.rs          the navigator's caret: parking it at a row until the file is live, and this seat's site ids
 │   ├── claude_cli.rs     the claude CLI: its sandbox, finding it on a GUI PATH, its launch command, its stream-json events, and the tests' fake claude
 │   ├── fence.rs          the fence machine: the `<<<EDIT>>>` / `<<<NOTE>>>` markers, the events it resolves from streamed text, and its header parsers
