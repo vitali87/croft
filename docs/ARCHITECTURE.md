@@ -371,6 +371,7 @@ src/
     │   ├── change_list.rs    the change list: git's status, selecting and moving through rows, scrolling, and its layout
     │   ├── clicks.rs         what a click lands on: the header pills, the branch, a row's action icons and the buttons
     │   ├── commit_menu.rs    the Commit button's dropdown: its items, labels and icons, and the clicks that open and pick from it
+    │   ├── empty_state.rs    the "No repository detected" card and its Git fork drawing
     │   ├── message.rs        the commit message box: typing, the caret across subject and body, git's prepared message, and clearing it
     │   ├── palette.rs        the panel's colours and glyphs, and the width of a row's action icons
     │   ├── repositories.rs   the multi-root REPOSITORIES overview: its rows, drawing them, and the click that picks one
