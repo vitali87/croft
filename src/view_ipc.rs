@@ -286,7 +286,11 @@ fn send_once(socket: &Path, req: &ViewRequest) -> std::io::Result<ViewReply> {
 /// the one reply [`send`] retries, so a busy shell printed "Broken pipe"
 /// where croft had asked for a second attempt. Only a broken pipe is read
 /// through: any other write error, and a broken pipe with no reply behind
-/// it, is reported as the write error it is.
+/// it, is reported as the write error it is. A reply that did arrive is
+/// croft's answer whatever it says, so one that does not parse is reported
+/// as malformed, as it is when the write went through, and not as a croft
+/// that is gone: that would send git's sequence editor to its fallback for
+/// a croft that answered.
 fn exchange(
     stream: &mut std::os::unix::net::UnixStream,
     req: &ViewRequest,
@@ -301,7 +305,13 @@ fn exchange(
         if e.kind() != std::io::ErrorKind::BrokenPipe {
             return Err(e);
         }
-        return read_reply(stream).map_err(|_| e);
+        // `InvalidData` is the one read error with bytes behind it (a reply
+        // that is not JSON, not UTF-8, or too long); every other one says
+        // nothing came back.
+        return match read_reply(stream) {
+            Err(read) if read.kind() != std::io::ErrorKind::InvalidData => Err(e),
+            answer => answer,
+        };
     }
     read_reply(stream)
 }
@@ -1491,6 +1501,23 @@ mod tests {
 
         let err = exchange(&mut client, &ViewRequest::new(Path::new("/tmp/x"))).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe, "{err}");
+    }
+
+    /// A malformed reply behind a broken pipe is reported as malformed.
+    ///
+    /// Something answered, so this is not a croft that is gone: reported as
+    /// the write error, it became `NoCroft` and sent git's sequence editor to
+    /// its fallback editor, while the same reply after a write that went
+    /// through is reported as the bad reply it is.
+    #[test]
+    fn a_malformed_reply_behind_a_broken_pipe_is_reported_as_malformed() {
+        use std::os::unix::net::UnixStream;
+        let (mut client, mut croft) = UnixStream::pair().unwrap();
+        croft.write_all(b"not a reply\n").unwrap();
+        drop(croft);
+
+        let err = exchange(&mut client, &ViewRequest::new(Path::new("/tmp/x"))).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData, "{err}");
     }
 
     /// One retry, not a loop (#362).
