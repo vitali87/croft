@@ -120,6 +120,7 @@ src/
 │   ├── identity.rs       a client's roster name and its stable identity across reconnects
 │   ├── outbox.rs         each client's outbound queue, its delivery count, and the writer thread that drains it
 │   ├── protocol.rs       the wire format: frame tags, control messages, encoding and decoding frames
+│   ├── pty.rs            the PTY master and the inner command, held fresh or inherited: resize and wait
 │   ├── roster.rs         what the roster says: stale clients, the session's version, the detach target, the shared size
 │   ├── sidecars.rs       the files beside the socket: the presence roster, the stale-binary marker, the host's version
 │   ├── tests.rs          the session host's own tests
