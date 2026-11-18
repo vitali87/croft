@@ -201,10 +201,12 @@ impl Editor {
 
     pub fn scroll_left_by(&mut self, n: usize) {
         self.scroll_col = self.scroll_col.saturating_sub(n);
+        self.caret_scroll_col = None;
     }
 
     pub fn scroll_right_by(&mut self, n: usize) {
         self.scroll_col = self.scroll_col.saturating_add(n);
+        self.caret_scroll_col = None;
     }
 
     /// Recompute the visible text width from `last_inner` / `last_gutter_width`
@@ -261,6 +263,7 @@ impl Editor {
                 }
                 self.scroll_col = target.min(self.cursor_col);
             }
+            self.caret_scroll_col = Some(self.scroll_col);
         }
     }
 
@@ -463,6 +466,7 @@ impl Editor {
             return false;
         };
         self.scroll_col = scrollbar::scroll_for_x(metrics, x);
+        self.caret_scroll_col = None;
         true
     }
 
