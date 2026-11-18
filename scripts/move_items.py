@@ -972,7 +972,27 @@ REMOTE = Target(
     },
 )
 
-TARGETS = {t.name: t for t in (APP, EDITOR, LSP, TERMINAL, GIT, REMOTE)}
+# The search panel's feature files (#2062): (module doc, release-note phrase, docs row).
+SEARCH_FILES = {}
+
+SEARCH = Target(
+    "search", "scripts/split_search_manifest.tsv", "src/widgets/search.rs",
+    "src/widgets/search", SEARCH_FILES,
+    Tree(
+        "    ├── search.rs ",
+        "    ├── search/          the search panel's feature files, beside search.rs; each "
+        "file's `//!` doc says what it holds",
+        "    │   ├── ", 16,
+    ),
+    "search-",
+    (
+        "The search panel's own tests, moved out of search.rs (#2062).",
+        "the search panel's tests",
+        "the search panel's own tests",
+    ),
+)
+
+TARGETS = {t.name: t for t in (APP, EDITOR, LSP, TERMINAL, GIT, REMOTE, SEARCH)}
 
 # Kinds whose declaration can carry a visibility.
 VISIBLE = {"fn", "const", "static", "struct", "enum", "union", "trait", "type"}
