@@ -117,6 +117,7 @@ src/
 ├── session_host.rs       the multiplayer session mux: a hidden `croft session-host` subcommand owning the inner croft's PTY and broadcasting it verbatim to N unix-socket clients, with write control and a presence roster
 ├── session_host/         the session host's feature files, beside session_host.rs; each file's `//!` doc says what it holds
 │   ├── connection.rs     one client's connection: its thread, typing attribution, write control, kicks
+│   ├── detach_chord.rs   spotting the detach chord in a client's own keystrokes
 │   ├── frame_write.rs    writing one frame to a socket within a deadline
 │   ├── identity.rs       a client's roster name and its stable identity across reconnects
 │   ├── launch.rs         attach-or-create: spawning the detached server, ending a stale one
