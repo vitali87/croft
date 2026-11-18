@@ -144,6 +144,7 @@ src/
 │   ├── offsets.rs        byte offsets into the replica text: a fence range or a note row as offsets, kept true through remote edits
 │   ├── proactive.rs      the proactive-look detector (pure text-in/row-out): tree-sitter judges that the driver completed a new construct since the navigator's last look; `App::tick_proactive_navigator` owns the gates and hands the seat a comment-only yield turn
 │   ├── provider.rs       the provider (the claude CLI or a local endpoint), `PairConfig`, and the system prompt each model is taught
+│   ├── seat.rs           seating the pilot: the claude and local-endpoint seats, their threads, and teardown
 │   ├── state.rs          the turn books: arming a turn and undoing a staged one, what the navigator last saw, and the bounded lock the App's threads take
 │   ├── tests.rs          the pilot's own tests
 │   ├── voice.rs          the pilot's voice and diagnostics: to the in-process host inside croft, else stdout and stderr
