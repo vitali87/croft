@@ -1280,9 +1280,95 @@ PAIR = Target(
     ),
 )
 
+# The Source Control panel's feature files (#2062): (module doc, release-note phrase, docs row).
+SOURCE_CONTROL_FILES = {
+    "palette": (
+        "The panel's colours and glyphs, and the width a row's action icons take.",
+        "source control colour and glyph",
+        "the panel's colours and glyphs, and the width of a row's action icons",
+    ),
+    "commit_menu": (
+        "The Commit button's dropdown: its items in VS Code's order, their labels and icons, and\n"
+        "the clicks that open it and pick an item.",
+        "source control commit menu",
+        "the Commit button's dropdown: its items, labels and icons, and the clicks that "
+        "open and pick from it",
+    ),
+    "repositories": (
+        "The multi-root REPOSITORIES overview: one row per workspace folder that is a git\n"
+        "repository, drawing them, and the click that picks one.",
+        "source control repositories overview",
+        "the multi-root REPOSITORIES overview: its rows, drawing them, and the click that "
+        "picks one",
+    ),
+    "message": (
+        "The commit message box: its placeholder and key hint, typing and moving the caret across\n"
+        "the subject and body lines, git's prepared message, clearing it after a commit, and where\n"
+        "its caret is on screen.",
+        "source control commit message",
+        "the commit message box: typing, the caret across subject and body, git's "
+        "prepared message, and clearing it",
+    ),
+    "change_list": (
+        "The change list: taking in git's status, selecting rows (one, several or all), moving the\n"
+        "selection in the order rows are drawn, scrolling, and laying the list out as section\n"
+        "headers and entry rows.",
+        "source control change list",
+        "the change list: git's status, selecting and moving through rows, scrolling, and "
+        "its layout",
+    ),
+    "clicks": (
+        "What a click lands on: the header pills, the branch name, a row's stage, unstage and\n"
+        "discard icons, the Commit and Initialize buttons, and a nested repository's Open button.",
+        "source control hit-testing",
+        "what a click lands on: the header pills, the branch, a row's action icons and "
+        "the buttons",
+    ),
+    "empty_state": (
+        "The \"No repository detected\" card: its text, its buttons and the Git fork drawing, full\n"
+        "size or compact.",
+        "source control empty state",
+        "the \"No repository detected\" card and its Git fork drawing",
+    ),
+    "buttons": (
+        "The buttons every view draws: the primary button (Commit, Initialize, Open, Run and Debug)\n"
+        "in its boxed and rounded looks, the Commit split button, their colours and the lift a\n"
+        "pointer gives them.",
+        "source control button",
+        "the primary button every view draws, the Commit split button, their colours and "
+        "hover",
+    ),
+    "render": (
+        "Drawing the panel: the header, the branch summary, the message box, the Commit button,\n"
+        "the change list and the commit feedback, wrapped to fit.",
+        "source control panel drawing",
+        "drawing the panel: header, branch, message box, Commit button, change list and "
+        "feedback",
+    ),
+}
+
+SOURCE_CONTROL = Target(
+    "source_control", "scripts/split_source_control_manifest.tsv",
+    "src/widgets/source_control.rs", "src/widgets/source_control", SOURCE_CONTROL_FILES,
+    Tree(
+        "    ├── source_control.rs ",
+        "    ├── source_control/       the Source Control panel's feature files, beside "
+        "source_control.rs; each file's `//!` doc says what it holds",
+        "    │   ├── ", 17,
+    ),
+    "source-control-",
+    (
+        "The Source Control panel's own tests, moved out of source_control.rs (#2062).",
+        "the Source Control panel's tests",
+        "the Source Control panel's own tests",
+    ),
+)
+
 TARGETS = {
     t.name: t
-    for t in (APP, EDITOR, LSP, TERMINAL, GIT, REMOTE, SEARCH, SESSION_HOST, PAIR)
+    for t in (
+        APP, EDITOR, LSP, TERMINAL, GIT, REMOTE, SEARCH, SESSION_HOST, PAIR, SOURCE_CONTROL,
+    )
 }
 
 # Kinds whose declaration can carry a visibility.
