@@ -368,6 +368,7 @@ src/
     ├── surface.rs            pane and overlay chrome for a `surfaces` theme (Croft Loch): padding frames on the bordered inset, hairline seams, section hairlines, the focused pane's rule and the overlay card with its shadow
     ├── source_control.rs     Source Control sidebar widget: multi-root REPOSITORIES overview, branch summary, commit input, change list, inline stage/unstage/discard actions, commit split-button and menu
     ├── source_control/       the Source Control panel's feature files, beside source_control.rs; each file's `//!` doc says what it holds
+    │   ├── commit_menu.rs    the Commit button's dropdown: its items, labels and icons, and the clicks that open and pick from it
     │   ├── palette.rs        the panel's colours and glyphs, and the width of a row's action icons
     │   ├── tests.rs          the Source Control panel's own tests
     ├── symbol_picker.rs VS Code "Go to Symbol in Editor" (Cmd/Ctrl+Shift+O): a fuzzy picker over the active file's outline symbols (kind-iconed, depth-indented); a `:` prefix switches to Go to Line; the App jumps via go_to_definition
