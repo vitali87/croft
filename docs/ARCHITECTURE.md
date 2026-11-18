@@ -370,6 +370,7 @@ src/
     ├── source_control/       the Source Control panel's feature files, beside source_control.rs; each file's `//!` doc says what it holds
     │   ├── commit_menu.rs    the Commit button's dropdown: its items, labels and icons, and the clicks that open and pick from it
     │   ├── palette.rs        the panel's colours and glyphs, and the width of a row's action icons
+    │   ├── repositories.rs   the multi-root REPOSITORIES overview: its rows, drawing them, and the click that picks one
     │   ├── tests.rs          the Source Control panel's own tests
     ├── symbol_picker.rs VS Code "Go to Symbol in Editor" (Cmd/Ctrl+Shift+O): a fuzzy picker over the active file's outline symbols (kind-iconed, depth-indented); a `:` prefix switches to Go to Line; the App jumps via go_to_definition
     ├── workspace_symbols.rs  Go to Symbol in Workspace picker: query fans out to every running server as `workspace/symbol`, rows show kind icon, name and workspace-relative path; Enter opens the definition
