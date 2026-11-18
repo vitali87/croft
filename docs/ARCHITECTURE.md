@@ -322,6 +322,7 @@ src/
     │   ├── highlight.rs     splitting a hit's line around its matches, for highlighting
     │   ├── matcher.rs       the query's matcher and its toggles, the pattern the Find bar shares, an invalid query's error
     │   ├── path_filter.rs   the files to include / exclude globs, and the test a path must pass
+    │   ├── replace.rs       replacement text, replacing in a line, a text or a file, and Replace All
     │   ├── tests.rs         the search panel's own tests
     │   ├── walk.rs          walking the workspace and streaming each file's hits; searching an unsaved buffer
     │   ├── worker.rs        the background search worker, its requests and events, and the typing pause
