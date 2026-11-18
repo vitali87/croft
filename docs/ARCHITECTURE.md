@@ -319,6 +319,7 @@ src/
     ├── scrollbar.rs     shared vertical- and horizontal-scrollbar geometry
     ├── search.rs        sidebar search panel (query/replace/include/exclude inputs) + .gitignore-aware walker, glob filtering, and replace
     ├── search/          the search panel's feature files, beside search.rs; each file's `//!` doc says what it holds
+    │   ├── fields.rs        the input fields: caret, selection, typing, focus, the Replace and details rows
     │   ├── highlight.rs     splitting a hit's line around its matches, for highlighting
     │   ├── matcher.rs       the query's matcher and its toggles, the pattern the Find bar shares, an invalid query's error
     │   ├── path_filter.rs   the files to include / exclude globs, and the test a path must pass
