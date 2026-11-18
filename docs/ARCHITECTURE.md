@@ -319,6 +319,7 @@ src/
     ├── scrollbar.rs     shared vertical- and horizontal-scrollbar geometry
     ├── search.rs        sidebar search panel (query/replace/include/exclude inputs) + .gitignore-aware walker, glob filtering, and replace
     ├── search/          the search panel's feature files, beside search.rs; each file's `//!` doc says what it holds
+    │   ├── matcher.rs       the query's matcher and its toggles, the pattern the Find bar shares, an invalid query's error
     │   ├── tests.rs         the search panel's own tests
     ├── shortcuts.rs     F1 shortcuts modal: every binding grouped by pane, scrollable
     ├── branch_picker.rs Checkout / Create Branch quick-pick overlay: type to filter the repo's branches, Enter to switch or create-and-switch (also drives the Branch submenu's merge / rebase / delete / create-from via `branch_purpose`); pure widget fed by `git::list_branches`
