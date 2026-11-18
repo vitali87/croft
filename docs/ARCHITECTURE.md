@@ -117,6 +117,7 @@ src/
 ├── session_host.rs       the multiplayer session mux: a hidden `croft session-host` subcommand owning the inner croft's PTY and broadcasting it verbatim to N unix-socket clients, with write control and a presence roster
 ├── session_host/         the session host's feature files, beside session_host.rs; each file's `//!` doc says what it holds
 │   ├── protocol.rs       the wire format: frame tags, control messages, encoding and decoding frames
+│   ├── roster.rs         what the roster says: stale clients, the session's version, the detach target, the shared size
 │   ├── tests.rs          the session host's own tests
 ├── session_record.rs     `croft record`: a 0x0 observer client writing a session to an asciicast; its pidfile names the recorder by pid and start time, so `--stop` never signals a recycled pid (see docs/MULTIPLAYER.md)
 ├── collab.rs             multiplayer Phase D, the collab layer below the app: `CollabDoc` over the `cola` text CRDT, `text_delta_ops` diffing, remote-op integration and `CollabMsg`
