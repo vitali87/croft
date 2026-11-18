@@ -1235,6 +1235,7 @@ impl App {
                     "toggle:render_whitespace" => self.toggle_render_whitespace(),
                     "toggle:line_numbers" => self.cycle_line_numbers(),
                     "toggle:vim_mode" => self.toggle_vim_mode(),
+                    "toggle:multi_cursor_persist" => self.toggle_multi_cursor_persist(),
                     "toggle:inline_values" => self.toggle_inline_values(),
                     "toggle:inlay_hints" => self.toggle_inlay_hints(),
                     "toggle:copy_on_select" => self.toggle_copy_on_select(),

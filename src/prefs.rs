@@ -364,6 +364,13 @@ pub struct Prefs {
     /// only while the `vim` extension is enabled.
     #[serde(default)]
     pub vim_mode: bool,
+    /// Keep every caret through ordinary movement (arrows, Home/End,
+    /// word-wise moves, Enter), as VS Code does, instead of collapsing to
+    /// one caret on the first move. Off by default, so croft's own
+    /// collapse-on-move behaviour is what people get unless they ask for
+    /// this; Esc and a mouse click still collapse either way.
+    #[serde(default)]
+    pub multi_cursor_persist: bool,
     /// Whitespace rendering mode (#133): "selection" (VS Code's default,
     /// also what the empty string an older config deserializes to means),
     /// "all", or "none". Parsed by `WhitespaceMode::from_pref`.
@@ -1454,6 +1461,15 @@ pub fn save_vim_mode_in(config_dir: &Path, enabled: bool) -> Result<()> {
     prefs.save(&path)
 }
 
+/// Persist the multi-cursor persistence toggle, under an explicit config dir
+/// so a test can point it at a scratch dir.
+pub fn save_multi_cursor_persist_in(config_dir: &Path, enabled: bool) -> Result<()> {
+    let path = prefs_file_in(config_dir);
+    let mut prefs = Prefs::load_for_update(&path)?;
+    prefs.multi_cursor_persist = enabled;
+    prefs.save(&path)
+}
+
 /// Persist the whitespace rendering mode ("selection" / "all" / "none").
 pub fn save_render_whitespace(mode: &str) -> Result<()> {
     let path = config_path();
@@ -2045,6 +2061,24 @@ mod tests {
         let old = Prefs::load(&path).expect("load old");
         assert!(!old.copy_on_select);
         assert_eq!(old.terminal_scrollback, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Multi-cursor persistence is off unless the user asks for it: a fresh
+    /// config, and one written before the field existed, both read false.
+    #[test]
+    fn round_trips_multi_cursor_persist_and_defaults_off() {
+        assert!(!Prefs::default().multi_cursor_persist, "off by default");
+        let dir = std::env::temp_dir().join(format!("croft-prefs-mcp-test-{}", std::process::id()));
+        let path = dir.join("config.json");
+        let prefs = Prefs {
+            multi_cursor_persist: true,
+            ..Prefs::default()
+        };
+        prefs.save(&path).expect("save");
+        assert!(Prefs::load(&path).expect("load").multi_cursor_persist);
+        std::fs::write(&path, r#"{"theme":"dark"}"#).expect("write old config");
+        assert!(!Prefs::load(&path).expect("load old").multi_cursor_persist);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

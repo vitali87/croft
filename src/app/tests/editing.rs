@@ -1588,6 +1588,65 @@ fn column_select_commands_are_in_the_palette() {
     assert_eq!(app.editor.carets.len(), 1);
 }
 
+/// AC2: with `multi_cursor_persist` read from config, three carets on three
+/// lines survive two Downs, type at all three, split all three lines on
+/// Enter, and Esc collapses them back to one.
+#[test]
+fn multi_cursor_persist_keeps_every_caret_through_moves_typing_and_enter() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "m.py", "aaa\nbbb\nccc\nddd\neee");
+    app.apply_merged_settings(&crate::prefs::Prefs {
+        multi_cursor_persist: true,
+        ..Default::default()
+    });
+    assert!(app.multi_cursor_persist, "read from the merged settings");
+    (app.editor.cursor_row, app.editor.cursor_col) = (0, 3);
+    app.editor.carets = vec![
+        crate::widgets::editor::EditorSelection::new(1, 3),
+        crate::widgets::editor::EditorSelection::new(2, 3),
+    ];
+    for _ in 0..2 {
+        app.handle_key(key(KeyCode::Down, KeyModifiers::NONE))
+            .unwrap();
+    }
+    let mut places = vec![(app.editor.cursor_row, app.editor.cursor_col)];
+    places.extend(app.editor.carets.iter().map(|c| c.head));
+    assert_eq!(places, vec![(2, 3), (3, 3), (4, 3)]);
+
+    type_char(&mut app, 'X');
+    assert_eq!(app.editor.lines, ["aaa", "bbb", "cccX", "dddX", "eeeX"]);
+
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        app.editor.lines,
+        ["aaa", "bbb", "cccX", "", "dddX", "", "eeeX", ""]
+    );
+    assert_eq!(app.editor.carets.len() + 1, 3, "still three carets");
+
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(!app.editor.has_multi_cursor(), "Esc collapses to one");
+}
+
+/// Negative: with the pref off, the first movement still drops every extra
+/// caret and falls through to single-caret handling, as it always has.
+#[test]
+fn without_multi_cursor_persist_a_move_still_collapses_to_one_caret() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "m.py", "aaa\nbbb\nccc");
+    assert!(!app.multi_cursor_persist, "off unless the user asks");
+    (app.editor.cursor_row, app.editor.cursor_col) = (0, 0);
+    app.editor.carets = vec![
+        crate::widgets::editor::EditorSelection::new(1, 0),
+        crate::widgets::editor::EditorSelection::new(2, 0),
+    ];
+    app.handle_key(key(KeyCode::Down, KeyModifiers::NONE))
+        .unwrap();
+    assert!(!app.editor.has_multi_cursor());
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (1, 0));
+}
+
 #[test]
 fn cmd_shift_k_deletes_the_current_line() {
     let tmp = tempfile::tempdir().unwrap();

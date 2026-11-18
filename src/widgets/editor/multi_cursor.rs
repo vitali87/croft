@@ -30,6 +30,22 @@ pub(super) enum CaretEdit {
     DeleteForward,
 }
 
+/// A movement to apply at every multi-cursor caret when the
+/// `multi_cursor_persist` preference is on: one step of the single-caret
+/// mover of the same name, so multi-caret movement can never drift from
+/// single-caret movement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CaretMotion {
+    Left,
+    Right,
+    Up,
+    Down,
+    WordLeft,
+    WordRight,
+    Home,
+    End,
+}
+
 /// Caret places, `(row, col)` each.
 pub(super) type CaretPlaces = Vec<(usize, usize)>;
 
@@ -290,6 +306,78 @@ impl Editor {
     /// Forward-delete at every caret. One undo step.
     pub fn multi_delete_forward(&mut self) {
         self.multi_apply(CaretEdit::DeleteForward);
+    }
+
+    /// Move every caret one step of `motion`, or extend a selection at each
+    /// of them when `extend`. Each caret runs the one-caret mover on its
+    /// own, so graphemes, words, line ends and the clamp to a line's own
+    /// length all behave exactly as they do with a single caret. Carets
+    /// that land together are merged, as VS Code does.
+    pub fn multi_move(&mut self, motion: CaretMotion, extend: bool) {
+        self.multi_typing = None;
+        let mut all = self.caret_selections();
+        for sel in &mut all {
+            // Park the editor on this caret and let the one-caret mover do
+            // the walking; the selection (when extending) keeps its anchor.
+            self.selection = extend.then_some(*sel);
+            self.cursor_row = sel.head.0;
+            self.cursor_col = sel.head.1;
+            match motion {
+                CaretMotion::Left => self.move_left(),
+                CaretMotion::Right => self.move_right(),
+                CaretMotion::Up => self.arrow_up(),
+                CaretMotion::Down => self.arrow_down(),
+                CaretMotion::WordLeft => self.move_word_left(),
+                CaretMotion::WordRight => self.move_word_right(),
+                CaretMotion::Home => self.home_key(),
+                CaretMotion::End => self.end_key(),
+            }
+            let head = (self.cursor_row, self.cursor_col);
+            *sel = EditorSelection {
+                anchor: if extend { sel.anchor } else { head },
+                head,
+            };
+        }
+        self.set_selections(&all);
+        self.ensure_cursor_col_visible();
+    }
+
+    /// Insert a newline at every caret, splitting each caret's line where
+    /// it sits, as one Enter would, as a single undo step. Carets are taken
+    /// bottom-up so a split never moves a caret still to be done; each one's
+    /// place is then pinned from the buffer's end, which the edits above it
+    /// leave true.
+    pub fn multi_newline(&mut self) {
+        if self.lines.is_empty() {
+            self.lines.push(String::new());
+        }
+        self.multi_typing = None;
+        self.pin_on_edit();
+        self.break_undo_coalescing();
+        self.push_undo(EditKind::MultiEdit);
+        let mut all: Vec<(bool, EditorSelection)> = self
+            .caret_selections()
+            .into_iter()
+            .enumerate()
+            .map(|(i, sel)| (i == 0, sel))
+            .collect();
+        all.sort_by_key(|(_, sel)| std::cmp::Reverse(sel.normalised().0));
+        let mut placed: Vec<(bool, (usize, usize))> = Vec::with_capacity(all.len());
+        for (is_primary, sel) in all {
+            self.selection = sel.has_area().then_some(sel);
+            let last = self.lines.len().saturating_sub(1);
+            self.cursor_row = sel.head.0.min(last);
+            self.cursor_col = sel.head.1.min(self.line_char_len(self.cursor_row));
+            self.delete_selection_inner();
+            self.insert_newline_raw();
+            placed.push((
+                is_primary,
+                self.pin_from_end((self.cursor_row, self.cursor_col)),
+            ));
+        }
+        self.selection = None;
+        self.place_pinned_carets(&placed);
+        self.recompute_highlights();
     }
 
     /// Apply `edit` at the primary caret and every secondary caret as a
