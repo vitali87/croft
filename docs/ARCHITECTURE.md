@@ -148,6 +148,7 @@ src/
 │   ├── seat.rs           seating the pilot: the claude and local-endpoint seats, their threads, and teardown
 │   ├── state.rs          the turn books: arming a turn and undoing a staged one, what the navigator last saw, and the bounded lock the App's threads take
 │   ├── tests.rs          the pilot's own tests
+│   ├── turns.rs          user turns: the sink, composing task, ask, yield and reply turns, and sending one
 │   ├── voice.rs          the pilot's voice and diagnostics: to the in-process host inside croft, else stdout and stderr
 ├── pair_host.rs          the resident navigator's in-process host: the App spawns the pilot from the workspace's `<hash>.pair.json` record, drains `PairEvent`s per tick, and drives ask / yield turns
 ├── session_state.rs     captures open tabs / layout so a self-update re-exec can restore them, and is what a clean exit saves for the next launch: one file per workspace under `~/.local/state/croft/sessions/<workspace digest>.json` holding the open files, carets, layout and bookmarks but no unsaved text (hot exit keeps that), read after the first frame off the UI thread; its tabs come back only into a blank editor, its bookmarks always, each on the text its line read when saved if the file changed since
