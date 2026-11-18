@@ -24,8 +24,9 @@ impl Editor {
             self.wrap_move_vertical(-1);
         } else if self.cursor_row > 0 {
             // Step over a collapsed region, as `move_down` does.
+            let goal = self.vertical_goal_from(self.cursor_col);
             self.cursor_row = self.prev_visible_line(self.cursor_row - 1);
-            self.cursor_col = floor_grapheme_col(&self.lines[self.cursor_row], self.cursor_col);
+            self.land_on_goal(goal);
         }
         self.last_edit_kind = None;
     }
@@ -38,11 +39,29 @@ impl Editor {
             // does: the fold stays shut and the caret lands on the next line
             // the user can actually see.
             if let Some(next) = self.next_visible_line(self.cursor_row + 1) {
+                let goal = self.vertical_goal_from(self.cursor_col);
                 self.cursor_row = next;
-                self.cursor_col = floor_grapheme_col(&self.lines[self.cursor_row], self.cursor_col);
+                self.land_on_goal(goal);
             }
         }
         self.last_edit_kind = None;
+    }
+
+    /// The column a vertical move from the caret should aim for: the one an
+    /// earlier Up/Down carried over a shorter line, if the caret has not
+    /// moved since, else `here` (Vim's `curswant`).
+    pub(super) fn vertical_goal_from(&self, here: usize) -> usize {
+        match self.vertical_goal {
+            Some((row, col, goal)) if row == self.cursor_row && col == self.cursor_col => goal,
+            _ => here,
+        }
+    }
+
+    /// Put the caret on `goal` in its (new) row, as far along as the line
+    /// goes, and remember the goal for the next vertical move.
+    fn land_on_goal(&mut self, goal: usize) {
+        self.cursor_col = floor_grapheme_col(&self.lines[self.cursor_row], goal);
+        self.vertical_goal = Some((self.cursor_row, self.cursor_col, goal));
     }
 
     /// The Up arrow: [`Self::move_up`], and on the first line (or wrapped
@@ -285,8 +304,9 @@ impl Editor {
         let max_row = self.lines.len().saturating_sub(1);
         let new_top = (self.scroll + page).min(max_row);
         self.scroll = new_top;
+        let goal = self.vertical_goal_from(self.cursor_col);
         self.cursor_row = new_top;
-        self.cursor_col = self.cursor_col.min(self.line_char_len(self.cursor_row));
+        self.land_on_goal(goal);
         self.last_edit_kind = None;
     }
 
@@ -302,8 +322,9 @@ impl Editor {
         }
         let new_top = self.scroll.saturating_sub(page);
         self.scroll = new_top;
+        let goal = self.vertical_goal_from(self.cursor_col);
         self.cursor_row = new_top;
-        self.cursor_col = self.cursor_col.min(self.line_char_len(self.cursor_row));
+        self.land_on_goal(goal);
         self.last_edit_kind = None;
     }
 

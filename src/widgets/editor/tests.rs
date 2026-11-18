@@ -22246,3 +22246,48 @@ fn the_toggle_disables_every_pair_behavior() {
     e.backspace();
     assert_eq!(e.lines[0], ")", "off means plain backspace");
 }
+/// Up and Down carry the column over a line too short to hold it, as Vim
+/// does: through an empty line the caret comes back out on the column it
+/// went in on, wrapped or not.
+#[test]
+fn up_and_down_carry_the_column_through_empty_and_short_lines() {
+    for wrap in [false, true] {
+        let long = "abcdefghijklmnopqrstuvwxyz";
+        let mut e = editor_with(&format!("{long}\n\nab\n{long}\n"));
+        e.wrap_override = Some(wrap);
+        render_at(&mut e, 60, 10);
+        e.cursor_col = 20;
+        e.move_down();
+        assert_eq!((e.cursor_row, e.cursor_col), (1, 0), "wrap {wrap}");
+        e.move_down();
+        assert_eq!((e.cursor_row, e.cursor_col), (2, 2), "wrap {wrap}");
+        e.move_down();
+        assert_eq!((e.cursor_row, e.cursor_col), (3, 20), "wrap {wrap}");
+        e.move_up();
+        e.move_up();
+        e.move_up();
+        assert_eq!(
+            (e.cursor_row, e.cursor_col),
+            (0, 20),
+            "wrap {wrap}: and back up"
+        );
+    }
+}
+
+/// The carried column is forgotten as soon as the caret moves any other way.
+#[test]
+fn a_horizontal_move_ends_the_carried_column() {
+    let long = "abcdefghijklmnopqrstuvwxyz";
+    let mut e = editor_with(&format!("{long}\nabc\n{long}\n"));
+    render_at(&mut e, 60, 10);
+    e.cursor_col = 20;
+    e.move_down();
+    assert_eq!(e.cursor_col, 3);
+    e.move_left();
+    e.move_down();
+    assert_eq!(
+        (e.cursor_row, e.cursor_col),
+        (2, 2),
+        "from column 2, not 20"
+    );
+}
