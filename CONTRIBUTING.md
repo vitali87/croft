@@ -67,15 +67,17 @@ see [docs/MACOS.md](docs/MACOS.md#spotlight-indexing-and-the-build-directory).
   `scripts/split_remote_manifest.tsv`, with `--target search` split
   `src/widgets/search.rs` from `scripts/split_search_manifest.tsv`, with
   `--target session_host` split `src/session_host.rs` from
-  `scripts/split_session_host_manifest.tsv`, and with `--target pair` split
-  `src/pair.rs` from `scripts/split_pair_manifest.tsv` (`--tests-out` first
-  moved each file's inline tests to their own file).
+  `scripts/split_session_host_manifest.tsv`, with `--target pair` split
+  `src/pair.rs` from `scripts/split_pair_manifest.tsv`, and with
+  `--target source_control` split `src/widgets/source_control.rs` from
+  `scripts/split_source_control_manifest.tsv` (`--tests-out` first moved each
+  file's inline tests to their own file).
 * **Adding to the app, the editor, the language-server manager, the
-  terminal pane, git, remote sessions, the search panel, the session host or
-  the pair pilot?** Put a feature's code in its file under `src/app/`,
-  `src/widgets/editor/`, `src/lsp/manager/`, `src/widgets/terminal/`,
-  `src/git/`, `src/remote/`, `src/widgets/search/`, `src/session_host/` or
-  `src/pair/`
+  terminal pane, git, remote sessions, the search panel, the session host,
+  the pair pilot or the Source Control panel?** Put a feature's code in its
+  file under `src/app/`, `src/widgets/editor/`, `src/lsp/manager/`,
+  `src/widgets/terminal/`, `src/git/`, `src/remote/`, `src/widgets/search/`,
+  `src/session_host/`, `src/pair/` or `src/widgets/source_control/`
   (see the lists in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)),
   not in `src/app/mod.rs`, which keeps only the `App` struct, its state,
   start-up and the main loop, nor in `src/widgets/editor.rs`, which keeps only
@@ -89,8 +91,10 @@ see [docs/MACOS.md](docs/MACOS.md#spotlight-indexing-and-the-build-directory).
   nor in `src/widgets/search.rs`, which keeps only the `SearchPanel` type, its
   constructor and the types its parts share, nor in `src/session_host.rs`,
   which keeps only the structs whose private fields its parts share, nor in
-  `src/pair.rs`, which keeps only the pilot's shared state. A new feature that
-  fits no file gets a file of its own.
+  `src/pair.rs`, which keeps only the pilot's shared state, nor in
+  `src/widgets/source_control.rs`, which keeps only the `SourceControlPanel`
+  type, its constructor and the row action areas. A new feature that fits no
+  file gets a file of its own.
 * **New or changed module?** Update its entry in
   [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). CI fails if you shorten a
   module's description without moving its reasoning into a `### <module>`

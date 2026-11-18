@@ -366,7 +366,7 @@ src/
     ├── list_picker.rs   generic single-choice picker for SCM ops that act on one of a git-owned list (apply/pop/drop a stash, delete a tag, remove/push-to a remote), tagged by `ListPurpose`
     ├── scm_menu.rs      the Source Control "⋯" title menu: a static tree of leaves + one-level fly-out submenus (Commit/Changes/Pull-Push/Branch/Remote/Stash/Tags); every leaf is an `ScmAction` dispatched in `App::dispatch_scm_action`
     ├── surface.rs            pane and overlay chrome for a `surfaces` theme (Croft Loch): padding frames on the bordered inset, hairline seams, section hairlines, the focused pane's rule and the overlay card with its shadow
-    ├── source_control.rs     Source Control sidebar widget: multi-root REPOSITORIES overview, branch summary, commit input, change list, inline stage/unstage/discard actions, commit split-button and menu
+    ├── source_control.rs     Source Control sidebar widget: multi-root REPOSITORIES overview, branch summary, commit input, change list, inline stage/unstage/discard actions, commit split-button and menu: what every part shares (the `SourceControlPanel` type, its constructor and the row action areas); each feature lives in a file in `source_control/` below
     ├── source_control/       the Source Control panel's feature files, beside source_control.rs; each file's `//!` doc says what it holds
     │   ├── buttons.rs        the primary button every view draws, the Commit split button, their colours and hover
     │   ├── change_list.rs    the change list: git's status, selecting and moving through rows, scrolling, and its layout
@@ -1078,9 +1078,9 @@ An `ignore::WalkBuilder`-backed tree with lazy children, fs-watcher refresh, mul
 
 ### source_control.rs
 
-The Source Control sidebar widget, including the multi-root REPOSITORIES overview.
+The Source Control sidebar widget, including the multi-root REPOSITORIES overview. `source_control.rs` keeps the panel itself: `SourceControlPanel`, whose private fields every part reads, its constructor, and `RowActionAreas`, which the drawing fills in and the clicks read. Each feature lives in a file of its own in `source_control/`.
 
-**The repositories overview.** One row per workspace folder that is a repo, each with a disambiguated label, its branch, and a porcelain change count from `GitStatus.changed_count`. The active row is highlighted, and the overview paints in the no-repo state too so other folders' repos stay reachable. Clicking a row PINS the panel via `App::scm_pin`, released when the focus-derived folder changes. The activity badge sums `changed_count` across all workers.
+**The repositories overview.** One row per workspace folder that is a repo, each with a disambiguated label, its branch, and a porcelain change count from `GitStatus.changed_count`. The active row is highlighted, and the overview paints in the no-repo state too so other folders' repos stay reachable. Clicking a row PINS the panel via `App::scm_pin`, released when the focus-derived folder changes. The activity badge sums `changed_count` across all workers. Code: `source_control/repositories.rs`.
 ### agents.rs
 
 Tracks agent lanes: which panes are running a coding agent, and whether that agent is working, waiting for the user, or idle. `claude`, `codex`, `aider`, `gemini` and `crush` are built in, and `~/.config/croft/agents.json` extends or replaces those rows and is reloaded on save. A row's `launch` is the command a worktree lane starts the agent with.
