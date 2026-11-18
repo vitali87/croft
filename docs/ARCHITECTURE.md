@@ -367,6 +367,8 @@ src/
     ├── scm_menu.rs      the Source Control "⋯" title menu: a static tree of leaves + one-level fly-out submenus (Commit/Changes/Pull-Push/Branch/Remote/Stash/Tags); every leaf is an `ScmAction` dispatched in `App::dispatch_scm_action`
     ├── surface.rs            pane and overlay chrome for a `surfaces` theme (Croft Loch): padding frames on the bordered inset, hairline seams, section hairlines, the focused pane's rule and the overlay card with its shadow
     ├── source_control.rs     Source Control sidebar widget: multi-root REPOSITORIES overview, branch summary, commit input, change list, inline stage/unstage/discard actions, commit split-button and menu
+    ├── source_control/       the Source Control panel's feature files, beside source_control.rs; each file's `//!` doc says what it holds
+    │   ├── tests.rs          the Source Control panel's own tests
     ├── symbol_picker.rs VS Code "Go to Symbol in Editor" (Cmd/Ctrl+Shift+O): a fuzzy picker over the active file's outline symbols (kind-iconed, depth-indented); a `:` prefix switches to Go to Line; the App jumps via go_to_definition
     ├── workspace_symbols.rs  Go to Symbol in Workspace picker: query fans out to every running server as `workspace/symbol`, rows show kind icon, name and workspace-relative path; Enter opens the definition
     ├── terminal.rs           the embedded terminal pane (`portable-pty` + `alacritty_terminal` drawn through ratatui): the `PtyTerminal` type, the scrollback size, and the structs its parts share (selection anchors, marks, images, notes, captured rows, the scroll clock); each feature lives in a file in `terminal/` below
