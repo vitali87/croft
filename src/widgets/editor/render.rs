@@ -704,7 +704,10 @@ impl Widget for &mut Editor {
         // final text column may be narrower than the provisional one.
         let content_cols = self.content_cols(text_width as usize);
         let max_scroll_col = content_cols.saturating_sub(text_width as usize);
-        self.scroll_col = self.scroll_col.min(max_scroll_col);
+        // The caret's own scroll may exceed the text's extent by the cell
+        // after the last character; manual scrolling may not.
+        let caret_scroll = self.caret_scroll_col.unwrap_or(0);
+        self.scroll_col = self.scroll_col.min(max_scroll_col.max(caret_scroll));
         let hbar_metrics = scrollbar::horizontal_metrics(
             Rect {
                 x: text_x,
