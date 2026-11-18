@@ -318,6 +318,18 @@ src/
     ├── testing.rs            Testing sidebar widget: the test suite tree with pass/fail/skip glyphs, the Activity summary line, and the failing-test count feeding the beaker activity badge
     ├── scrollbar.rs     shared vertical- and horizontal-scrollbar geometry
     ├── search.rs        sidebar search panel (query/replace/include/exclude inputs) + .gitignore-aware walker, glob filtering, and replace
+    ├── search/          the search panel's feature files, beside search.rs; each file's `//!` doc says what it holds
+    │   ├── fields.rs        the input fields: caret, selection, typing, focus, the Replace and details rows
+    │   ├── highlight.rs     splitting a hit's line around its matches, for highlighting
+    │   ├── hit_test.rs      what a click or the pointer lands on: toggles, buttons, fields, result rows
+    │   ├── matcher.rs       the query's matcher and its toggles, the pattern the Find bar shares, an invalid query's error
+    │   ├── path_filter.rs   the files to include / exclude globs, and the test a path must pass
+    │   ├── render.rs        drawing the panel and each input field
+    │   ├── replace.rs       replacement text, replacing in a line, a text or a file, and Replace All
+    │   ├── results.rs       the results list: hits in order, counts, selection, scrolling, the mode toggles
+    │   ├── tests.rs         the search panel's own tests
+    │   ├── walk.rs          walking the workspace and streaming each file's hits; searching an unsaved buffer
+    │   ├── worker.rs        the background search worker, its requests and events, and the typing pause
     ├── shortcuts.rs     F1 shortcuts modal: every binding grouped by pane, scrollable
     ├── branch_picker.rs Checkout / Create Branch quick-pick overlay: type to filter the repo's branches, Enter to switch or create-and-switch (also drives the Branch submenu's merge / rebase / delete / create-from via `branch_purpose`); pure widget fed by `git::list_branches`
     ├── input_prompt.rs  single-line text modal for SCM ops that need a typed value (clone URL, branch rename, remote name/URL, tag name), tagged by `InputPurpose`; `InputPrompt::confirm` is the same box with no field, a Y/N question (trash, uninstall, remove, consent) that nothing typed can answer

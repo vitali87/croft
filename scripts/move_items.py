@@ -972,7 +972,92 @@ REMOTE = Target(
     },
 )
 
-TARGETS = {t.name: t for t in (APP, EDITOR, LSP, TERMINAL, GIT, REMOTE)}
+# The search panel's feature files (#2062): (module doc, release-note phrase, docs row).
+SEARCH_FILES = {
+    "matcher": (
+        "How a query matches text: the matcher built from the query and its Aa / ab / .*\n"
+        "toggles, the pattern the editor's Find bar shares, and the error an invalid query shows.",
+        "search query matcher",
+        "the query's matcher and its toggles, the pattern the Find bar shares, an invalid "
+        "query's error",
+    ),
+    "path_filter": (
+        "The files to include and to exclude: their comma-separated globs, compiled as VS Code\n"
+        "reads them (a bare pattern matches at any depth, a folder's name admits what is in\n"
+        "it), and the test a path must pass.",
+        "search include and exclude filter",
+        "the files to include / exclude globs, and the test a path must pass",
+    ),
+    "walk": (
+        "The search itself: walking the workspace in parallel, honouring .gitignore and leaving\n"
+        "out binaries and version-control stores, streaming each file's hits, and searching an\n"
+        "unsaved buffer's text the same way.",
+        "workspace search walk",
+        "walking the workspace and streaming each file's hits; searching an unsaved buffer",
+    ),
+    "highlight": (
+        "Where a hit's line splits so its matches are highlighted, for a plain query and for a\n"
+        "regex.",
+        "search match highlighting",
+        "splitting a hit's line around its matches, for highlighting",
+    ),
+    "worker": (
+        "The background search worker: the requests the panel sends it, the events it answers\n"
+        "with, and the pause in typing it waits for before a search starts.",
+        "search worker",
+        "the background search worker, its requests and events, and the typing pause",
+    ),
+    "replace": (
+        "Replace: a replacement's $1 and ${name} references and Preserve Case, replacing in a\n"
+        "line, a text or a file, and the panel's Replace All on disk.",
+        "search replace",
+        "replacement text, replacing in a line, a text or a file, and Replace All",
+    ),
+    "fields": (
+        "The panel's input fields: the caret and selection in each, typing and deleting, which\n"
+        "field has focus, the Replace and details rows shown or hidden, and the include and\n"
+        "exclude filter the fields make.",
+        "search panel input field",
+        "the input fields: caret, selection, typing, focus, the Replace and details rows",
+    ),
+    "hit_test": (
+        "What a click lands on: the toggles, the buttons beside the fields, the fields\n"
+        "themselves, a result row and its path, and the tooltip under the pointer.",
+        "search panel hit-testing",
+        "what a click or the pointer lands on: toggles, buttons, fields, result rows",
+    ),
+    "results": (
+        "The results list: the worker's hits added in order, the counts in the header, the\n"
+        "query's error, moving the selection and scrolling, and the mode toggles.",
+        "search results list",
+        "the results list: hits in order, counts, selection, scrolling, the mode toggles",
+    ),
+    "render": (
+        "Drawing the panel: each input field with its fill, caret and glob caption, and the\n"
+        "whole panel, results included.",
+        "search panel drawing",
+        "drawing the panel and each input field",
+    ),
+}
+
+SEARCH = Target(
+    "search", "scripts/split_search_manifest.tsv", "src/widgets/search.rs",
+    "src/widgets/search", SEARCH_FILES,
+    Tree(
+        "    ├── search.rs ",
+        "    ├── search/          the search panel's feature files, beside search.rs; each "
+        "file's `//!` doc says what it holds",
+        "    │   ├── ", 16,
+    ),
+    "search-",
+    (
+        "The search panel's own tests, moved out of search.rs (#2062).",
+        "the search panel's tests",
+        "the search panel's own tests",
+    ),
+)
+
+TARGETS = {t.name: t for t in (APP, EDITOR, LSP, TERMINAL, GIT, REMOTE, SEARCH)}
 
 # Kinds whose declaration can carry a visibility.
 VISIBLE = {"fn", "const", "static", "struct", "enum", "union", "trait", "type"}
