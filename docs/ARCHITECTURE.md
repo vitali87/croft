@@ -122,6 +122,7 @@ src/
 │   ├── protocol.rs       the wire format: frame tags, control messages, encoding and decoding frames
 │   ├── pty.rs            the PTY master and the inner command, held fresh or inherited: resize and wait
 │   ├── roster.rs         what the roster says: stale clients, the session's version, the detach target, the shared size
+│   ├── server.rs         the host proper: starting a session, broadcasting output, the shared PTY size, the roster
 │   ├── sidecars.rs       the files beside the socket: the presence roster, the stale-binary marker, the host's version
 │   ├── swap.rs           moving a live session onto an updated binary: the watch, the handoff, the adoption, the fence
 │   ├── tests.rs          the session host's own tests
