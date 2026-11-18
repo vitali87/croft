@@ -138,6 +138,7 @@ src/
 ├── pair/                 the pilot's feature files, beside pair.rs; each file's `//!` doc says what it holds
 │   ├── fence.rs          the fence machine: the `<<<EDIT>>>` / `<<<NOTE>>>` markers, the events it resolves from streamed text, and its header parsers
 │   ├── local.rs          the navigator's local-model transport: one Anthropic-compatible `/v1/messages` streaming call per turn (Ollama, LM Studio, llama.cpp, vLLM), deliberately not the claude CLI; selected by `croft pair --provider ollama [--base-url <url>] --model <m>`
+│   ├── offsets.rs        byte offsets into the replica text: a fence range or a note row as offsets, kept true through remote edits
 │   ├── proactive.rs      the proactive-look detector (pure text-in/row-out): tree-sitter judges that the driver completed a new construct since the navigator's last look; `App::tick_proactive_navigator` owns the gates and hands the seat a comment-only yield turn
 │   ├── tests.rs          the pilot's own tests
 ├── pair_host.rs          the resident navigator's in-process host: the App spawns the pilot from the workspace's `<hash>.pair.json` record, drains `PairEvent`s per tick, and drives ask / yield turns
