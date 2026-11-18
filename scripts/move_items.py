@@ -1057,7 +1057,29 @@ SEARCH = Target(
     ),
 )
 
-TARGETS = {t.name: t for t in (APP, EDITOR, LSP, TERMINAL, GIT, REMOTE, SEARCH)}
+# The session host's feature files (#2062): (module doc, release-note phrase, docs row).
+SESSION_HOST_FILES = {}
+
+SESSION_HOST = Target(
+    "session_host", "scripts/split_session_host_manifest.tsv", "src/session_host.rs",
+    "src/session_host", SESSION_HOST_FILES,
+    Tree(
+        "├── session_host.rs ",
+        "├── session_host/         the session host's feature files, beside session_host.rs; "
+        "each file's `//!` doc says what it holds",
+        "│   ├── ", 17,
+    ),
+    "session-host-",
+    (
+        "The session host's own tests, moved out of session_host.rs (#2062).",
+        "the session host's tests",
+        "the session host's own tests",
+    ),
+)
+
+TARGETS = {
+    t.name: t for t in (APP, EDITOR, LSP, TERMINAL, GIT, REMOTE, SEARCH, SESSION_HOST)
+}
 
 # Kinds whose declaration can carry a visibility.
 VISIBLE = {"fn", "const", "static", "struct", "enum", "union", "trait", "type"}

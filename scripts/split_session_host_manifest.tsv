@@ -1,0 +1,2 @@
+# Stage B of the refactor program (#2062): where each item of src/session_host.rs goes.
+pr	file	kind	impl	name
