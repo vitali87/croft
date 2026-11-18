@@ -64,15 +64,17 @@ see [docs/MACOS.md](docs/MACOS.md#spotlight-indexing-and-the-build-directory).
   `src/widgets/terminal.rs` from `scripts/split_terminal_manifest.tsv`, with
   `--target git` split `src/git.rs` from `scripts/split_git_manifest.tsv`,
   with `--target remote` split `src/remote.rs` from
-  `scripts/split_remote_manifest.tsv`, and with `--target search` split
-  `src/widgets/search.rs` from `scripts/split_search_manifest.tsv`
-  (`--tests-out` first moved each file's inline tests to their own file).
+  `scripts/split_remote_manifest.tsv`, with `--target search` split
+  `src/widgets/search.rs` from `scripts/split_search_manifest.tsv`, and with
+  `--target session_host` split `src/session_host.rs` from
+  `scripts/split_session_host_manifest.tsv` (`--tests-out` first moved each
+  file's inline tests to their own file).
 * **Adding to the app, the editor, the language-server manager, the
-  terminal pane, git, remote sessions or the search panel?** Put a feature's
-  code in its file under `src/app/`, `src/widgets/editor/`,
-  `src/lsp/manager/`, `src/widgets/terminal/`, `src/git/`, `src/remote/` or
-  `src/widgets/search/` (see the lists in
-  [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)),
+  terminal pane, git, remote sessions, the search panel or the session
+  host?** Put a feature's code in its file under `src/app/`,
+  `src/widgets/editor/`, `src/lsp/manager/`, `src/widgets/terminal/`,
+  `src/git/`, `src/remote/`, `src/widgets/search/` or `src/session_host/`
+  (see the lists in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)),
   not in `src/app/mod.rs`, which keeps only the `App` struct, its state,
   start-up and the main loop, nor in `src/widgets/editor.rs`, which keeps only
   the `Editor` type, its constructor and the data types its parts share, nor
@@ -83,8 +85,9 @@ see [docs/MACOS.md](docs/MACOS.md#spotlight-indexing-and-the-build-directory).
   the git runner and the mutation wrappers every part shares, nor in
   `src/remote.rs`, which keeps only the structs and helpers its parts share,
   nor in `src/widgets/search.rs`, which keeps only the `SearchPanel` type, its
-  constructor and the types its parts share. A new feature that fits no file
-  gets a file of its own.
+  constructor and the types its parts share, nor in `src/session_host.rs`,
+  which keeps only the structs whose private fields its parts share. A new
+  feature that fits no file gets a file of its own.
 * **New or changed module?** Update its entry in
   [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). CI fails if you shorten a
   module's description without moving its reasoning into a `### <module>`
