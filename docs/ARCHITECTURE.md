@@ -121,6 +121,7 @@ src/
 │   ├── detach_chord.rs   spotting the detach chord in a client's own keystrokes
 │   ├── frame_write.rs    writing one frame to a socket within a deadline
 │   ├── identity.rs       a client's roster name and its stable identity across reconnects
+│   ├── inner_channel.rs  the inner croft's privileged channel: typing, write control, kicks
 │   ├── launch.rs         attach-or-create: spawning the detached server, ending a stale one
 │   ├── outbox.rs         each client's outbound queue, its delivery count, and the writer thread that drains it
 │   ├── protocol.rs       the wire format: frame tags, control messages, encoding and decoding frames
