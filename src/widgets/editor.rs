@@ -509,6 +509,11 @@ pub struct Editor {
     /// each line at this column and `move_right`/`move_left` keep the
     /// cursor visible.
     pub scroll_col: usize,
+    /// The column Up/Down are carrying across lines too short to hold it
+    /// (Vim's `curswant`): `(row, col, goal)` as the last vertical move left
+    /// the caret. It counts only while the caret is still on that `(row,
+    /// col)`; anything that moved it since starts the goal afresh.
+    pub(super) vertical_goal: Option<(usize, usize, usize)>,
     /// Cursor column as a CHARACTER index (not bytes), for the current line.
     pub cursor_row: usize,
     pub cursor_col: usize,
@@ -1172,6 +1177,7 @@ impl Editor {
             scroll_sub: 0,
             wrap_total_cache: Vec::new(),
             scroll_col: 0,
+            vertical_goal: None,
             cursor_row: 0,
             cursor_col: 0,
             focused: false,
