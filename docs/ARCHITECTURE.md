@@ -116,6 +116,7 @@ src/
 ├── session_cli.rs        local session persistence: `croft attach` / `croft ls` run croft under the session host so terminals/LSP/DAP survive closing the window; legacy dtach sessions keep reattaching, and `ls` lists only session sockets, never the relay, hook or pane-host sockets beside them
 ├── session_host.rs       the multiplayer session mux: a hidden `croft session-host` subcommand owning the inner croft's PTY and broadcasting it verbatim to N unix-socket clients, with write control and a presence roster
 ├── session_host/         the session host's feature files, beside session_host.rs; each file's `//!` doc says what it holds
+│   ├── protocol.rs       the wire format: frame tags, control messages, encoding and decoding frames
 │   ├── tests.rs          the session host's own tests
 ├── session_record.rs     `croft record`: a 0x0 observer client writing a session to an asciicast; its pidfile names the recorder by pid and start time, so `--stop` never signals a recycled pid (see docs/MULTIPLAYER.md)
 ├── collab.rs             multiplayer Phase D, the collab layer below the app: `CollabDoc` over the `cola` text CRDT, `text_delta_ops` diffing, remote-op integration and `CollabMsg`
