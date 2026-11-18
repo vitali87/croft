@@ -1714,6 +1714,28 @@ pub fn decode_blob(bytes: &[u8], enc: &'static encoding_rs::Encoding) -> Option<
     Some(enc.decode(bytes).0.into_owned())
 }
 
+/// A file's text decoded the way the editor decodes it on open (a byte-order
+/// mark first, else the remembered, `.editorconfig` or default encoding,
+/// else UTF-8), for a list that only quotes lines of it. `None` for what the
+/// editor would not open as text: over `MAX_FILE_BYTES`, unreadable or binary.
+pub fn read_text_for_listing(path: &Path) -> Option<String> {
+    if std::fs::metadata(path).ok()?.len() > MAX_FILE_BYTES {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    let enc = match encoding_rs::Encoding::for_bom(&bytes) {
+        Some((enc, _)) => enc,
+        None => {
+            if is_binary(&bytes) {
+                return None;
+            }
+            crate::file_encoding::declared_for(path, &crate::editorconfig::for_file(path))
+                .map_or(encoding_rs::UTF_8, |c| c.encoding)
+        }
+    };
+    Some(enc.decode(&bytes).0.into_owned())
+}
+
 pub(super) fn is_binary(data: &[u8]) -> bool {
     let sample = &data[..data.len().min(4096)];
     if sample.contains(&0) {

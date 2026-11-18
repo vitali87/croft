@@ -730,6 +730,10 @@ impl App {
                 self.editor = self.editor_layout.refocus_to_dfs(reduced, target);
                 self.editor.receive_moved(moved);
                 if source_emptied {
+                    // The marks its last tab left go before the group does,
+                    // as `collapse_split_if_empty` does; after the push, so
+                    // the moved tab's own marks still count as held.
+                    self.settle_bookmarks();
                     self.editor_layout
                         .prune_blank_inactive(|t| t.is_blank_initial());
                 }
@@ -1644,22 +1648,29 @@ impl App {
             .collect();
         closed.sort();
         for (path, set) in closed {
-            let Ok(text) = std::fs::read_to_string(&path) else {
+            // Read as the editor would open it (its size cap, byte-order
+            // mark and declared encoding); a file it could not open has no
+            // row to offer. Only the marked lines are kept.
+            let Some(text) = crate::widgets::editor::read_text_for_listing(&path) else {
                 continue;
             };
-            let lines: Vec<&str> = text.lines().collect();
-            for line in set {
+            let mut wanted = set.iter().copied().peekable();
+            for (i, l) in text.lines().enumerate() {
                 // Marks are 1-based lines; one past the file's end is gone.
-                if let Some(l) = line.checked_sub(1).and_then(|i| lines.get(i)) {
+                while wanted.next_if(|&w| w < i + 1).is_some() {}
+                if wanted.next_if(|&w| w == i + 1).is_some() {
                     found.push((
                         BookmarkTarget {
                             group: active,
                             tab: usize::MAX,
                             path: path.clone(),
-                            line,
+                            line: i + 1,
                         },
                         l.trim().chars().take(80).collect(),
                     ));
+                }
+                if wanted.peek().is_none() {
+                    break;
                 }
             }
         }
