@@ -2537,6 +2537,16 @@ fn go_to_line_accepts_a_column() {
         app.input_prompt.as_mut().unwrap().value = v.to_string();
         app.submit_input_prompt();
     };
+    app.editor.cursor_row = 2;
+    app.editor.cursor_col = 2;
+    app.open_go_to_line_prompt();
+    assert_eq!(
+        app.input_prompt.as_ref().unwrap().value,
+        "3:6",
+        "the prompt opens on the caret's line and status-bar column"
+    );
+    app.submit_input_prompt();
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (2, 2));
     go(&mut app, "2:250");
     assert_eq!(app.editor.cursor_row, 1);
     assert_eq!(app.editor.cursor_col, 249);
