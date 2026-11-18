@@ -375,6 +375,7 @@ src/
     │   ├── empty_state.rs    the "No repository detected" card and its Git fork drawing
     │   ├── message.rs        the commit message box: typing, the caret across subject and body, git's prepared message, and clearing it
     │   ├── palette.rs        the panel's colours and glyphs, and the width of a row's action icons
+    │   ├── render.rs         drawing the panel: header, branch, message box, Commit button, change list and feedback
     │   ├── repositories.rs   the multi-root REPOSITORIES overview: its rows, drawing them, and the click that picks one
     │   ├── tests.rs          the Source Control panel's own tests
     ├── symbol_picker.rs VS Code "Go to Symbol in Editor" (Cmd/Ctrl+Shift+O): a fuzzy picker over the active file's outline symbols (kind-iconed, depth-indented); a `:` prefix switches to Go to Line; the App jumps via go_to_definition
