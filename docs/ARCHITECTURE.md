@@ -118,6 +118,7 @@ src/
 ├── session_host/         the session host's feature files, beside session_host.rs; each file's `//!` doc says what it holds
 │   ├── frame_write.rs    writing one frame to a socket within a deadline
 │   ├── identity.rs       a client's roster name and its stable identity across reconnects
+│   ├── outbox.rs         each client's outbound queue, its delivery count, and the writer thread that drains it
 │   ├── protocol.rs       the wire format: frame tags, control messages, encoding and decoding frames
 │   ├── roster.rs         what the roster says: stale clients, the session's version, the detach target, the shared size
 │   ├── sidecars.rs       the files beside the socket: the presence roster, the stale-binary marker, the host's version
