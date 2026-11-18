@@ -1,2 +1,131 @@
 # Stage B of the refactor program (#2062): where each item of src/session_host.rs goes.
+# One row per item, in file order. pr 0 means the item stays in session_host.rs; the others
+# move to src/session_host/<file>.rs in that PR. kind, impl and name are as
+# `scripts/check_pure_move.py list` prints them. Run
+# `scripts/move_items.py --target session_host --check` after adding an item to session_host.rs.
+# session_host.rs keeps the structs whose private fields more than one of its parts reads:
+# the host, its clients, the swap handoff, a client's outbox and the inner channel.
 pr	file	kind	impl	name
+1	protocol	const	-	FRAME_BYTES
+1	protocol	const	-	FRAME_CONTROL
+1	protocol	enum	-	Control
+1	protocol	struct	-	Participant
+2	roster	fn	-	stale_client_notice
+2	roster	fn	-	stale_client_notice_on_change
+2	roster	fn	-	sole_detach_target
+2	roster	fn	-	session_version
+2	roster	fn	-	parse_version
+2	roster	fn	-	version_is_older
+1	protocol	enum	-	Frame
+1	protocol	fn	-	encode_bytes_frame
+1	protocol	fn	-	encode_control_frame
+1	protocol	fn	-	encode_frame
+1	protocol	struct	-	FrameReader
+1	protocol	fn	impl FrameReader	new
+1	protocol	fn	impl FrameReader	push
+2	roster	fn	-	min_winsize
+3	sidecars	fn	-	presence_path
+3	sidecars	fn	-	stale_marker_path
+3	sidecars	fn	-	host_version_path
+3	sidecars	fn	-	write_host_version
+3	sidecars	fn	-	read_host_version
+8	swap	fn	-	image_identity
+8	swap	fn	-	spawn_stale_image_watcher
+8	swap	fn	-	spawn_marker_only_watcher
+8	swap	const	-	RESUME_LISTENER_ENV
+8	swap	const	-	RESUME_MASTER_ENV
+8	swap	const	-	RESUME_CHILD_ENV
+8	swap	const	-	RESUME_TOKEN_ENV
+0		struct	-	HandoffFds
+8	swap	fn	-	sigpipe_action
+8	swap	fn	-	set_cloexec
+8	swap	fn	-	swap_to_new_image
+8	swap	struct	-	ResumedSession
+8	swap	fn	-	resume_from
+7	pty	enum	-	MasterHandle
+7	pty	fn	impl MasterHandle	resize
+7	pty	fn	impl MasterHandle	as_raw_fd
+7	pty	enum	-	ChildHandle
+7	pty	fn	impl ChildHandle	process_id
+7	pty	fn	impl ChildHandle	wait_code
+6	outbox	const	-	CLIENT_QUEUE_LIMIT
+0		struct	-	Outbox
+0		struct	-	OutboxState
+6	outbox	fn	impl Outbox	new
+6	outbox	fn	impl Outbox	push
+6	outbox	fn	impl Outbox	push_seq
+6	outbox	fn	impl Outbox	mark_delivered
+6	outbox	fn	impl Outbox	delivered_through
+6	outbox	fn	impl Outbox	close_when_drained
+6	outbox	fn	impl Outbox	kill
+6	outbox	fn	impl Outbox	is_dead
+6	outbox	fn	impl Outbox	pop_blocking
+6	outbox	fn	-	shutdown_now
+6	outbox	fn	-	spawn_writer
+0		struct	-	Client
+0		struct	-	Host
+9	server	fn	-	collab_socket_for_mux
+9	server	fn	-	serve
+9	server	fn	-	random_token
+9	server	fn	-	serve_with_token
+8	swap	fn	-	run_resumed
+9	server	fn	-	run_host
+9	server	fn	-	broadcast_tracked
+9	server	fn	-	await_delivery
+8	swap	fn	-	seal_against_new_arrivals
+9	server	fn	-	broadcast
+9	server	fn	-	apply_winsize
+9	server	fn	-	update_presence
+10	connection	fn	-	client_thread
+10	connection	fn	-	announce_typing
+10	connection	fn	-	set_control
+10	connection	fn	-	control_change_allowed
+10	connection	fn	-	sole_participant_lacks_control
+10	connection	fn	-	kick
+11	launch	fn	-	attach_or_create
+11	launch	fn	-	kill_stale_server
+11	launch	fn	-	detached_server_argv
+11	launch	fn	-	spawn_detached_server
+13	attach	enum	-	PumpOutcome
+13	attach	const	-	SERVER_HELLO_DEADLINE
+13	attach	enum	-	MismatchAction
+13	attach	fn	-	mismatch_action
+13	attach	fn	-	mismatch_banner
+13	attach	fn	-	attach_client
+13	attach	fn	-	client_teardown_seq
+13	attach	fn	-	attach_end_note
+13	attach	fn	-	stdin_readable_within
+12	detach_chord	struct	-	DetachChord
+12	detach_chord	const	-	DETACH_CHORD_HOLD
+12	detach_chord	fn	impl DetachChord	feed
+12	detach_chord	fn	impl DetachChord	holding
+12	detach_chord	fn	impl DetachChord	flush
+12	detach_chord	fn	-	may_become_chord_key
+12	detach_chord	fn	-	token_len
+12	detach_chord	fn	-	kitty_key
+12	detach_chord	fn	-	held_mods
+12	detach_chord	fn	-	is_super_only
+12	detach_chord	fn	-	is_detach_key
+13	attach	fn	-	attach_client_loop
+13	attach	fn	-	reconnect_after_swap
+13	attach	fn	-	attach_client_pump
+0		struct	-	InnerChannel
+14	inner_channel	fn	impl InnerChannel	from_env
+14	inner_channel	fn	impl InnerChannel	connect
+14	inner_channel	fn	impl InnerChannel	drain_typing
+14	inner_channel	fn	impl InnerChannel	is_dead
+14	inner_channel	fn	impl InnerChannel	set_control
+14	inner_channel	fn	impl InnerChannel	kick
+5	frame_write	const	-	WRITE_FRAME_DEADLINE
+8	swap	const	-	SWAP_INVITATION_DEADLINE
+8	swap	const	-	FAREWELL_GRACE
+8	swap	const	-	SWAP_FENCE_CAP
+5	frame_write	fn	-	write_frame_blocking
+5	frame_write	fn	-	write_frame_bounded
+5	frame_write	fn	-	write_frame_blocking_with_deadline
+3	sidecars	fn	-	read_presence
+4	identity	fn	-	client_name
+4	identity	fn	-	client_identity
+4	identity	fn	-	compose_client_identity
+4	identity	fn	-	hostname
+4	identity	fn	-	hostname

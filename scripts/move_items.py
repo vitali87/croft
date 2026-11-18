@@ -1058,7 +1058,104 @@ SEARCH = Target(
 )
 
 # The session host's feature files (#2062): (module doc, release-note phrase, docs row).
-SESSION_HOST_FILES = {}
+SESSION_HOST_FILES = {
+    "protocol": (
+        "The wire format between the host and its clients: the frame tags, the control messages\n"
+        "and the roster entry they carry, encoding a frame, and the decoder that turns socket\n"
+        "chunks back into frames.",
+        "session host wire format",
+        "the wire format: frame tags, control messages, encoding and decoding frames",
+    ),
+    "roster": (
+        "What the roster says: the notice for clients older than this croft, the version\n"
+        "clients are measured against, the one client a Session: Detach can come from, and the\n"
+        "PTY size every client can show.",
+        "session roster",
+        "what the roster says: stale clients, the session's version, the detach target, the "
+        "shared size",
+    ),
+    "sidecars": (
+        "The files the host keeps beside its socket for the inner croft: the presence roster,\n"
+        "the stale-binary marker and the host's version, with their paths and readers.",
+        "session host sidecar",
+        "the files beside the socket: the presence roster, the stale-binary marker, the "
+        "host's version",
+    ),
+    "identity": (
+        "Who a client is: the user@host name the roster shows, and the stable identity that\n"
+        "lets a reconnect displace its own earlier registration.",
+        "session client identity",
+        "a client's roster name and its stable identity across reconnects",
+    ),
+    "frame_write": (
+        "Writing one frame to a socket within a deadline, so a stopped or wedged peer can never\n"
+        "hang the writer.",
+        "session frame write",
+        "writing one frame to a socket within a deadline",
+    ),
+    "outbox": (
+        "A client's outbound queue: queueing frames without ever blocking on the socket,\n"
+        "counting what was delivered, closing once drained, and the writer thread that drains\n"
+        "it.",
+        "session client outbox",
+        "each client's outbound queue, its delivery count, and the writer thread that drains "
+        "it",
+    ),
+    "pty": (
+        "The PTY master and the inner command as the host holds them, whether it spawned them\n"
+        "itself or inherited them across a host swap: resizing the master and waiting for the\n"
+        "child.",
+        "session host PTY handle",
+        "the PTY master and the inner command, held fresh or inherited: resize and wait",
+    ),
+    "swap": (
+        "Moving a live session onto an updated binary (#238): spotting the replaced image,\n"
+        "handing the socket, PTY and child across an exec, adopting them in the successor, and\n"
+        "the fence that lets clients reconnect.",
+        "session host swap",
+        "moving a live session onto an updated binary: the watch, the handoff, the adoption, "
+        "the fence",
+    ),
+    "server": (
+        "The host proper: starting a session, pumping PTY output to every client, keeping the\n"
+        "PTY at the smallest client size, and publishing the roster.",
+        "session host server",
+        "the host proper: starting a session, broadcasting output, the shared PTY size, the "
+        "roster",
+    ),
+    "connection": (
+        "One client's connection: its thread, whose typing reaches the PTY, granting and\n"
+        "revoking write control and the rules for it, and disconnecting a participant.",
+        "session client connection",
+        "one client's connection: its thread, typing attribution, write control, kicks",
+    ),
+    "launch": (
+        "Attaching to a session or starting one first: the detached server's command line and\n"
+        "its spawn, and ending a stale server.",
+        "session launch",
+        "attach-or-create: spawning the detached server, ending a stale one",
+    ),
+    "detach_chord": (
+        "Spotting Cmd+K Shift+Q (Session: Detach) in a client's own keystrokes, so any client\n"
+        "can leave, one without write control included.",
+        "session detach chord",
+        "spotting the detach chord in a client's own keystrokes",
+    ),
+    "attach": (
+        "The attaching client: raw mode, pumping stdin to the socket and output to the\n"
+        "terminal, the version-mismatch banner, reconnecting across a host swap, and handing\n"
+        "the terminal back on exit.",
+        "session attach client",
+        "the attaching client: the pump, the version banner, reconnects across a swap, the "
+        "exit",
+    ),
+    "inner_channel": (
+        "The inner croft's privileged channel to its host: who is typing, granting and revoking\n"
+        "write control, and disconnecting clients.",
+        "session inner channel",
+        "the inner croft's privileged channel: typing, write control, kicks",
+    ),
+}
 
 SESSION_HOST = Target(
     "session_host", "scripts/split_session_host_manifest.tsv", "src/session_host.rs",
