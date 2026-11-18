@@ -140,6 +140,7 @@ src/
 │   ├── local.rs          the navigator's local-model transport: one Anthropic-compatible `/v1/messages` streaming call per turn (Ollama, LM Studio, llama.cpp, vLLM), deliberately not the claude CLI; selected by `croft pair --provider ollama [--base-url <url>] --model <m>`
 │   ├── offsets.rs        byte offsets into the replica text: a fence range or a note row as offsets, kept true through remote edits
 │   ├── proactive.rs      the proactive-look detector (pure text-in/row-out): tree-sitter judges that the driver completed a new construct since the navigator's last look; `App::tick_proactive_navigator` owns the gates and hands the seat a comment-only yield turn
+│   ├── provider.rs       the provider (the claude CLI or a local endpoint), `PairConfig`, and the system prompt each model is taught
 │   ├── tests.rs          the pilot's own tests
 ├── pair_host.rs          the resident navigator's in-process host: the App spawns the pilot from the workspace's `<hash>.pair.json` record, drains `PairEvent`s per tick, and drives ask / yield turns
 ├── session_state.rs     captures open tabs / layout so a self-update re-exec can restore them, and is what a clean exit saves for the next launch: one file per workspace under `~/.local/state/croft/sessions/<workspace digest>.json` holding the open files, carets, layout and bookmarks but no unsaved text (hot exit keeps that), read after the first frame off the UI thread; its tabs come back only into a blank editor, its bookmarks always, each on the text its line read when saved if the file changed since
