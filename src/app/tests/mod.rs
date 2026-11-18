@@ -945,6 +945,24 @@ fn wait_for_git_net(app: &mut App) {
     );
 }
 
+/// Tick the follow until the Testing folder for the current focus, worked
+/// out off the UI thread (#1973), has landed and been applied.
+fn settle_test_root(app: &mut App) {
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_millis(500),
+        "the Testing folder to be worked out",
+        || {
+            app.drain_git_responses();
+            let key = (app.active_workspace_root(), app.editor.path.clone());
+            app.test_root_pending.is_none()
+                && app
+                    .test_root_follow
+                    .as_ref()
+                    .is_some_and(|(k, _)| *k == key)
+        },
+    );
+}
+
 /// The issue's repo (#1356): `main` and `feat` both change `f` from
 /// `base`, so merging, rebasing or cherry-picking one onto the other stops
 /// on a conflict.

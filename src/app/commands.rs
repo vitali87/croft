@@ -52,7 +52,7 @@ impl App {
     /// on disk and the current disable set.
     pub(super) fn refresh_extensions(&mut self) {
         // A runner toggled on or off changes which folder Testing follows.
-        self.test_root_follow = None;
+        self.forget_followed_test_root();
         let mut vscode: Vec<String> = self
             .roots
             .iter()
