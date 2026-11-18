@@ -368,6 +368,7 @@ src/
     ├── surface.rs            pane and overlay chrome for a `surfaces` theme (Croft Loch): padding frames on the bordered inset, hairline seams, section hairlines, the focused pane's rule and the overlay card with its shadow
     ├── source_control.rs     Source Control sidebar widget: multi-root REPOSITORIES overview, branch summary, commit input, change list, inline stage/unstage/discard actions, commit split-button and menu
     ├── source_control/       the Source Control panel's feature files, beside source_control.rs; each file's `//!` doc says what it holds
+    │   ├── change_list.rs    the change list: git's status, selecting and moving through rows, scrolling, and its layout
     │   ├── commit_menu.rs    the Commit button's dropdown: its items, labels and icons, and the clicks that open and pick from it
     │   ├── message.rs        the commit message box: typing, the caret across subject and body, git's prepared message, and clearing it
     │   ├── palette.rs        the panel's colours and glyphs, and the width of a row's action icons
