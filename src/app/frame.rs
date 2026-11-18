@@ -1931,7 +1931,7 @@ impl App {
         // leader waits for its second key the slot says so, as VS Code's
         // does; the message under it shows again once the wait ends.
         let status_text = one_line(if let Some(waiting) = self.cmd_k_waiting_line() {
-            waiting
+            crate::i18n::tr(&waiting).into_owned()
         } else if self.screen_reader && !self.announcer.line.is_empty() {
             self.announcer.line.clone()
         } else {

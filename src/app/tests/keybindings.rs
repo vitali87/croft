@@ -976,6 +976,99 @@ fn a_second_key_that_completes_no_cmd_k_chord_only_cancels_it_with_vs_codes_note
     assert_eq!(app.status, "Saved notes.txt");
 }
 
+/// A character after a stray `Cmd+K` where typing is secret (the shell, a
+/// masked prompt) may be the first one of a password: the "is not a
+/// command" note does not name it, though it still ends the wait.
+#[test]
+fn a_secret_character_after_a_stray_cmd_k_is_not_named_in_the_note() {
+    use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let hidden = format!(
+        "The key combination ({}, \u{2022}) is not a command.",
+        super_k_label()
+    );
+
+    app.focus = Pane::Terminal;
+    app.handle_key(key(KeyCode::Char('k'), KeyModifiers::SUPER))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('#'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.cmd_k_leader.is_none(), "the wait is over");
+    assert_eq!(app.status, hidden, "the shell's character is not named");
+
+    // A masked prompt that opens while the wait runs (a connection asking
+    // for its password) gets the same care: the wait takes the first key.
+    app.status.clear();
+    app.focus = Pane::Editor;
+    app.handle_key(key(KeyCode::Char('k'), KeyModifiers::SUPER))
+        .unwrap();
+    app.input_prompt = Some(InputPrompt::new(InputPurpose::NewWorktreeLane, "Token", "").masked());
+    app.handle_key(key(KeyCode::Char('%'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.status, hidden, "nor a masked prompt's");
+    assert_eq!(
+        app.input_prompt.as_ref().unwrap().value,
+        "",
+        "and the prompt did not take it"
+    );
+
+    // Where typing shows, the key is named, as VS Code names it.
+    app.input_prompt = None;
+    app.status.clear();
+    app.handle_key(key(KeyCode::Char('k'), KeyModifiers::SUPER))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('!'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        app.status,
+        format!(
+            "The key combination ({}, !) is not a command.",
+            super_k_label()
+        )
+    );
+}
+
+/// The chord's two status lines go through the UI catalog, so a language
+/// that translates them shows them translated (#849).
+#[test]
+fn the_cmd_k_status_lines_are_translated() {
+    let catalog = r#"{
+        "({}) was pressed. Waiting for second key of chord...": "({}) gedrückt. Warte auf die zweite Taste...",
+        "The key combination ({}) is not a command.": "Die Tastenkombination ({}) ist kein Befehl."
+    }"#;
+    crate::i18n::with_test_catalog(catalog, || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let draw = |app: &mut App| {
+            let mut term =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 20)).unwrap();
+            term.draw(|f| app.render(f)).unwrap();
+            screen_text(&term)
+        };
+        app.handle_key(key(KeyCode::Char('k'), KeyModifiers::SUPER))
+            .unwrap();
+        let screen = draw(&mut app);
+        assert!(
+            screen.contains(&format!(
+                "({}) gedrückt. Warte auf die zweite Taste...",
+                super_k_label()
+            )),
+            "{screen}"
+        );
+        app.handle_key(key(KeyCode::Char('!'), KeyModifiers::NONE))
+            .unwrap();
+        let screen = draw(&mut app);
+        assert!(
+            screen.contains(&format!(
+                "Die Tastenkombination ({}, !) ist kein Befehl.",
+                super_k_label()
+            )),
+            "{screen}"
+        );
+    });
+}
+
 /// A modifier going down on its way to the second key (`Shift` for
 /// `Cmd+K Shift+X`, reported on its own by the kitty protocol) leaves the
 /// leader waiting, as VS Code's does: it is no answer.

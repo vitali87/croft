@@ -788,21 +788,25 @@ impl App {
             match screencast::key_label(key, cfg!(target_os = "macos")) {
                 None => self.cmd_k_leader = Some(leader),
                 Some(second) => {
+                    // A character where typing is secret (a masked prompt,
+                    // the shell) may be the first one of a password typed
+                    // after a stray Cmd+K: neither the note nor Screencast
+                    // Mode names it.
+                    let secret =
+                        screencast::types_a_character(key) && self.screencast_hides_typing();
                     let ran = self.handle_cmd_k_chord(key);
                     if !ran {
-                        self.status = cmd_k_miss_text(&leader.label, &second);
+                        let second = if secret { "\u{2022}" } else { &second };
+                        self.status = cmd_k_miss_text(&leader.label, second);
                         self.cmd_k_miss_note = Some((
                             std::time::Instant::now() + CMD_K_MISS_NOTE_FOR,
                             self.status.clone(),
                         ));
                     }
                     // Screencast Mode shows the key as the chord's second
-                    // step, but not a character that completed nothing where
-                    // typing is left out (a masked prompt, the shell): it may
-                    // be the first one of a secret typed after a stray Cmd+K.
-                    if ran
-                        || !(screencast::types_a_character(key) && self.screencast_hides_typing())
-                    {
+                    // step, unless it is such a character that completed
+                    // nothing.
+                    if ran || !secret {
                         self.screencast.note_chord_step();
                     }
                     return Ok(());
