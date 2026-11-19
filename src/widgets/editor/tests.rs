@@ -22538,6 +22538,30 @@ fn align_cursors_counts_a_later_groups_earlier_padding() {
     assert_eq!(e.lines[1], "abc--  d");
 }
 
+/// A caret at the end of a selection shares its address with the next
+/// column front padding. It stays in front of that padding, as an end caret
+/// should, instead of being carried along past it on one row only.
+#[test]
+fn align_cursors_keeps_an_end_caret_before_the_next_columns_padding() {
+    let mut e = with_carets(
+        &["ab", "x---y"],
+        &[
+            ((0, 0), (0, 1)),
+            ((0, 1), (0, 2)),
+            ((1, 0), (1, 1)),
+            ((1, 4), (1, 5)),
+        ],
+    );
+    e.align_cursors();
+    assert_eq!(e.lines[0], "a   b", "three cells of front padding");
+    assert_eq!(e.lines[1], "x---y", "nothing to pad");
+    assert_eq!(
+        e.caret_places(),
+        [(0, 1), (0, 5), (1, 1), (1, 5)],
+        "both end carets of the first column stay in column 1"
+    );
+}
+
 /// Tabs cannot stop short of a stop, so the end they are padded to is the
 /// next stop at or after the longest selection: both selections end in the
 /// same cell instead of one running past the other.

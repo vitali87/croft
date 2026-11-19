@@ -288,10 +288,13 @@ impl Editor {
     /// of `heads` was pushed to by the padding at or before it.
     ///
     /// A pad inserted at or left of a caret feeds it forward with its line, so
-    /// a place pinned from the line's end before the edits still names the
-    /// caret's own spot afterwards. Padding right of it on the same line is
-    /// the exception — the line grows without the caret moving — so the pin
-    /// counts those chars in.
+    /// a place pinned from the line end before the edits still names the spot
+    /// of the caret afterwards. Padding right of it on the same line is the
+    /// exception — the line grows without the caret moving — so the pin counts
+    /// those chars in. A pad exactly at a caret is the end padding of that
+    /// selection and feeds it forward; the front padding of the next block can
+    /// share that address, and an end caret has to stay in front of it, so the
+    /// pin counts front pads at the caret in too.
     fn apply_alignment(&mut self, pads: &[Pad], heads: &[(usize, usize)]) {
         if pads.is_empty() || self.lines.is_empty() {
             return;
@@ -306,7 +309,7 @@ impl Editor {
             .map(|(i, &(row, col))| {
                 let right: usize = pads
                     .iter()
-                    .filter(|p| p.row == row && p.col > col)
+                    .filter(|p| p.row == row && (p.col > col || (p.col == col && p.front)))
                     .map(|p| p.text.chars().count())
                     .sum();
                 let (from_bottom, from_end) = self.pin_from_end((row, col));
