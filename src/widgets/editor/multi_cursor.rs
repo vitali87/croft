@@ -363,16 +363,23 @@ impl Editor {
             .collect();
         // Overlapping selections name the same text once. A caret starting
         // inside one already handled would split the same line again and
-        // leave the later carets in the wrong place, so it is dropped.
-        all.sort_by_key(|(_, sel)| sel.normalised().0);
+        // leave the later carets in the wrong place, so it is dropped — and of
+        // two spans sharing a start the longer is the one kept, so a bare
+        // caret sat on the first character of a selection gives way to the
+        // selection instead of being handled first and splitting in front of
+        // the text it covers.
+        all.sort_by_key(|(_, sel)| {
+            let (start, end) = sel.normalised();
+            (start, std::cmp::Reverse(end))
+        });
         let mut kept: Vec<(bool, EditorSelection)> = Vec::new();
         let mut covered: Option<(usize, usize)> = None;
         for (primary, sel) in all {
             let (start, end) = sel.normalised();
-            if covered.is_some_and(|prev_end| start < prev_end) {
+            if covered.is_some_and(|furthest| start < furthest) {
                 continue;
             }
-            covered = Some(if end > start { end } else { start });
+            covered = Some(covered.map_or(end, |furthest| furthest.max(end)));
             kept.push((primary, sel));
         }
         let mut all = kept;

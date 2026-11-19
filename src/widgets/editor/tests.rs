@@ -6006,6 +6006,25 @@ fn multi_newline_ignores_a_caret_inside_another_selection() {
     assert!(!e.has_multi_cursor(), "the covered caret added no split");
 }
 
+/// Alt-clicking at the start of a selection leaves a bare caret and the
+/// selection sharing one start, and the caret can come first: the selection
+/// still owns the text, so Enter replaces it once instead of splitting in
+/// front of it and leaving `abcd` behind.
+#[test]
+fn multi_newline_ignores_a_caret_at_the_start_of_a_selection() {
+    let mut e = editor_with("abcd");
+    e.cursor_row = 0;
+    e.cursor_col = 0;
+    e.selection = None;
+    e.carets = vec![EditorSelection {
+        anchor: (0, 0),
+        head: (0, 4),
+    }];
+    e.multi_newline();
+    assert_eq!(e.lines, ["", ""], "the selection is replaced once");
+    assert!(!e.has_multi_cursor(), "the bare caret added no split");
+}
+
 fn three_foos() -> Editor {
     editor_with("foo = 1\nfoo = 2\nfoo = 3")
 }
