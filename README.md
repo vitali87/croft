@@ -1,5 +1,8 @@
 <div align="center">
-  <img src="assets/logo-tight.png" alt="croft" width="180">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/logo-dark.png">
+    <img src="docs/images/logo-light.png" alt="croft" width="180">
+  </picture>
 </div>
 
 # croft
