@@ -27,6 +27,7 @@ src/
 │   ├── plot.rs           `croft plot`: a chart of stdin, as an inline image or as text, in the theme's colours
 │   ├── terminal_setup.rs `croft setup-terminal`, `setup-iterm2` and `setup-ghostty`: setting up macOS terminals for croft
 │   ├── tests.rs          the command line's own tests
+│   ├── theme_import.rs   `croft theme-import`: converting a VS Code theme from a file or the marketplace, and installing it
 │   ├── typos.rs          a misspelled subcommand clap took as a folder, turned into an error that names the one meant
 │   ├── version.rs        the plain version `--version` prints, and the provenance line `--build-info` prints
 │   ├── vscode_import.rs  `croft import-vscode`: converting a VS Code profile, and the report of what came across
