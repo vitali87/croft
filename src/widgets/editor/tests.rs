@@ -22458,31 +22458,48 @@ fn align_cursors_measures_existing_tabs_in_columns() {
     }
 }
 
-/// A wide character is two cells on screen, so it moves the column after it:
-/// the two `x`s below start at cells 2 and 1, and one space lines them up.
+/// The extension counts every code point as one cell, wide glyphs included,
+/// because the rendered width cannot be known from the buffer. A tab is the
+/// only character that spans more than one, so these two `x`s need no padding.
 #[test]
-fn align_cursors_measures_wide_characters_in_cells() {
+fn align_cursors_counts_every_code_point_as_one_cell() {
     let mut e = with_carets(&["界x", "ax"], &[((0, 1), (0, 2)), ((1, 1), (1, 2))]);
     e.align_cursors();
-    assert_eq!(e.lines[0], "界x");
-    assert_eq!(e.lines[1], "a x", "one cell, because 界 takes two");
+    assert_eq!(e.lines, ["界x", "ax"], "identical columns, nothing to do");
 }
 
-/// A line indented with a tab cannot be pushed right by a space in front of
-/// that tab — the tab jumps to the same stop — so the padding goes in after
-/// the indentation.
+/// Align Line Last Cursors inserts at column 0, as the extension does. On a
+/// tab-indented line the tab then jumps to the same stop and swallows the
+/// space, so the line does not move — the extension's own known limitation
+/// (yo1dog/vscode-cursor-align#14), kept here rather than quietly diverging.
 #[test]
-fn align_line_last_cursors_moves_a_tab_indented_line() {
+fn align_line_last_cursors_inserts_at_column_zero_as_the_extension_does() {
     let mut e = with_carets(&["\tx", "\txy"], &[((0, 2), (0, 2)), ((1, 3), (1, 3))]);
     e.align_line_last_cursors();
-    assert_eq!(e.lines[0], "\t x", "the space sits after the tab");
+    assert_eq!(e.lines[0], " \tx", "the space lands before the tab");
     assert_eq!(e.lines[1], "\txy");
-    for row in 0..2 {
-        let cells = e.lines[row]
-            .chars()
-            .fold(0, |col, c| col + if c == '\t' { 4 - col % 4 } else { 1 });
-        assert_eq!(cells, 6, "row {row} ends in the same cell");
-    }
+}
+
+/// The extension's signature case: two selections on one line are two columns,
+/// and each column is padded on its own — the first column's width feeds the
+/// second's start, so the second one lines up too.
+#[test]
+fn align_cursors_treats_two_selections_on_a_line_as_two_columns() {
+    let mut e = with_carets(
+        &["aaa  bbb", "aa  bb"],
+        &[
+            ((0, 0), (0, 3)),
+            ((0, 5), (0, 8)),
+            ((1, 0), (1, 2)),
+            ((1, 4), (1, 6)),
+        ],
+    );
+    e.align_cursors();
+    assert_eq!(e.lines[0], "aaa  bbb", "already the widest in both columns");
+    assert_eq!(
+        e.lines[1], "aa   bb ",
+        "one column of padding in each column"
+    );
 }
 
 /// Two groups on one row: the second is aligned against where its selections

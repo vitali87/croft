@@ -1053,6 +1053,7 @@ impl App {
             | Cmd::AlignCursorsPadFront
             | Cmd::AlignCursorsUsingTabs
             | Cmd::AlignLineLastCursors
+            | Cmd::AlignCursorsUsingAuto
                 if self.editor.has_non_text_view() =>
             {
                 self.status = format!("{} needs a text file", cmd.title());
@@ -1070,6 +1071,9 @@ impl App {
             }
             Cmd::AlignLineLastCursors => {
                 self.report_align(cmd.title(), |e| e.align_line_last_cursors())
+            }
+            Cmd::AlignCursorsUsingAuto => {
+                self.report_align(cmd.title(), |e| e.align_cursors_using_auto())
             }
             Cmd::AddCursorAbove => self.editor.add_cursor_above(),
             Cmd::AddCursorBelow => self.editor.add_cursor_below(),

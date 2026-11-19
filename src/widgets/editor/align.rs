@@ -1,123 +1,156 @@
-//! Aligning carets: padding every caret's selection into one column, with
-//! spaces, with tabs, or at the end of its line.
+//! Aligning carets: a port of Mike Moore's "Cursor Align" VS Code extension
+//! (`yo1dog/vscode-cursor-align` v2.1.1, `extension.js`), so the same gestures
+//! produce the same text here as they do there.
+//!
+//! The model the extension uses, and this file follows:
+//!
+//! * one *block* per single-line selection, ordered by line then start char; a
+//!   selection spanning lines is ignored;
+//! * blocks are grouped into *table columns* by their order on their line — the
+//!   first selection on a line joins column 0, the second column 1, and so on —
+//!   so several selections on one line each get their own column;
+//! * a block's *padding* is the text between the previous block's end on that
+//!   line (0 for the first there) and its own start, measured in display cells;
+//! * every block in a column takes that column's widest padding at its start,
+//!   and then the column's widest selection at its end (or at its start for Pad
+//!   Front), so every selection in a column starts and ends in the same cells;
+//! * with tabs a column's padding and selection widths are rounded up to tab
+//!   stops and the counts become tab characters — the extension's "extra tabs
+//!   are necessary" rule;
+//! * columns are laid out left to right, each column's width feeding the next,
+//!   which is why padding a left column cannot push a right one out of line.
 
 use super::*;
 
-/// How a column's padding is split between a selection's two ends.
+/// Where a column's extra selection length goes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum AlignPad {
-    /// Spaces at the front until every start in the column lines up, then at
-    /// the end until every selection is as long as the longest.
-    Both,
-    /// Spaces, all at the front, so the selected text right-aligns.
+    /// At the end: every selection in the column keeps its start and grows to
+    /// the column's longest.
+    End,
+    /// At the start, so the selected text right-aligns into the column.
     Front,
 }
 
-/// One run of padding to insert: the line it goes on, the char column it
-/// starts at, and the whitespace itself.
+/// One run of whitespace to insert.
 struct Pad {
     row: usize,
     col: usize,
     text: String,
+    /// Pad Front puts a column's padding and a selection's own length at the
+    /// same spot; the padding has to end up left of the length, so it goes in
+    /// second.
+    front: bool,
 }
 
-/// Chars a run of `tabs` tab stops advances a position `from` columns into a
-/// line, on a `width`-wide tab grid. No tab moves nothing, so `from` comes
-/// back unchanged; any tab at all takes a column already on a stop a whole
-/// stop further, since a tab can never stand still.
-pub(super) fn tab_advance(from: usize, tabs: usize, width: usize) -> usize {
-    if tabs == 0 {
-        return from;
-    }
-    let width = width.max(1);
-    (from / width + tabs) * width
+/// One selection, with the numbers the column layout gives it.
+struct Block {
+    row: usize,
+    start: usize,
+    end: usize,
+    /// Char column the block's padding starts at: the previous block's end on
+    /// its line, or 0 when it is the first there.
+    padding_start: usize,
+    /// Display cells of padding this block brings to its column, and of the
+    /// selection itself.
+    padding_cols: usize,
+    block_cols: usize,
+    column: usize,
 }
 
-/// Tabs that carry a position `from` columns into a line to the first tab stop
-/// at or after `to`. Zero when `from` has already reached `to`, and at least
-/// one whenever it has not: a tab never leaves its column where it was.
-pub(super) fn tabs_to_reach(from: usize, to: usize, width: usize) -> usize {
+/// A column of blocks, and the widths every block in it is padded out to.
+#[derive(Default)]
+struct Column {
+    pad_cols: usize,
+    block_cols: usize,
+}
+
+/// Display cells a run of text takes, starting at `start_col`: a tab jumps to
+/// the next stop of `width`, and every other character counts one — the
+/// extension's own rule, which counts code points and ignores grapheme clusters
+/// because the rendered width cannot be known.
+fn text_cols(text: &str, start_col: usize, width: usize) -> usize {
     let width = width.max(1);
-    if from >= to {
-        return 0;
+    let mut cols = 0;
+    for c in text.chars() {
+        cols += if c == '\t' {
+            width - (start_col + cols) % width
+        } else {
+            1
+        };
     }
-    // The stop `to` needs, less the one `from` sits in. Integer division is
-    // the floor the stop index needs, so this counts stops rather than
-    // columns: `from` 3 to `to` 9 on a 4-wide grid is 3 stops (12), not the
-    // two a rounded-up column count would give (8, still short).
-    to.div_ceil(width) - from / width
+    cols
 }
 
 impl Editor {
-    /// Align Cursors (`Alt+A`): pad every caret's selection with spaces so
-    /// that every selection starting in the same column starts in one column,
-    /// as long as the longest of them. Selections are grouped left to right
-    /// by the columns they touch — carets stacked over one another
-    /// (`3..5`, `5..9`, `9..10`) are one column, not three — so a second
-    /// group further right is aligned on its own. One undo step; fewer than
-    /// two carets is a no-op.
+    /// Align Cursors (`Alt+A`): pad every column of selections with spaces so
+    /// each selection starts and ends in the same cells as the rest of its
+    /// column. One undo step; fewer than two blocks is a no-op.
     pub fn align_cursors(&mut self) -> bool {
-        self.align_columns(AlignPad::Both, None)
+        self.align_columns(AlignPad::End, None)
     }
 
-    /// Align Cursors (Pad Front) (`Alt+F`): the same columns, but every space
-    /// goes at the front, so the selected text right-aligns into one column
-    /// instead of starting in one. One undo step.
+    /// Align Cursors (Pad Front) (`Alt+F`): the same columns, but a column's
+    /// extra selection length goes to the front too, right-aligning the text.
     pub fn align_cursors_pad_front(&mut self) -> bool {
         self.align_columns(AlignPad::Front, None)
     }
 
-    /// Align Cursors Using Tabs (`Ctrl+Alt+A`): the same columns, padded with
-    /// tab characters snapped to stops `tab_width` apart, so the text starts
-    /// and ends on tab stops rather than on the exact columns spaces would
-    /// reach. `tab_width` is the buffer's own indent width, never a fixed 4.
-    /// One undo step.
+    /// Align Cursors Using Tabs (`Ctrl+Alt+A`): the same columns padded with
+    /// tabs, with every start and end snapped to a tab stop of `tab_width`.
     pub fn align_cursors_using_tabs(&mut self, tab_width: usize) -> bool {
-        self.align_columns(AlignPad::Both, Some(tab_width))
+        self.align_columns(AlignPad::End, Some(tab_width))
     }
 
-    /// Align Line Last Cursors (`Ctrl+Alt+Shift+A`): pad the front of every
-    /// affected line with spaces so the right-most selection end on each of
-    /// them lands in one column — whole lines shift right rather than the
-    /// selected text moving inside them. One undo step; fewer than two carets
-    /// is a no-op.
-    pub fn align_line_last_cursors(&mut self) -> bool {
-        let all = self.caret_selections();
-        if all.len() < 2 {
-            return false;
+    /// Align Cursors Using Indentation Settings: the extension's "auto"
+    /// variant — tabs when the buffer indents with them, spaces when not.
+    pub fn align_cursors_using_auto(&mut self) -> bool {
+        let style = self.indent_style();
+        if style.use_spaces {
+            self.align_columns(AlignPad::End, None)
+        } else {
+            self.align_columns(AlignPad::End, Some(style.width as usize))
         }
+    }
+
+    /// Align Line Last Cursors (`Ctrl+Alt+Shift+A`): spaces at the start of
+    /// every affected line until the right-most selection end of all of them
+    /// lines up — whole lines shift right, as the extension does.
+    pub fn align_line_last_cursors(&mut self) -> bool {
         let width = self.indent_style().width as usize;
-        // The right-most selection end on each affected line, in display
-        // columns. A selection across lines has no single column of its own,
-        // so only single-line ones name their line's end.
-        let mut last: Vec<(usize, usize)> = Vec::new();
+        let all = self.caret_selections();
+        // The right-most selection end on each line, in char columns.
+        let mut ends: Vec<(usize, usize)> = Vec::new();
         for sel in &all {
             let (start, end) = sel.normalised();
             if start.0 != end.0 {
                 continue;
             }
-            let end = self.display_col(end.0, end.1, width.max(1));
-            match last.iter_mut().find(|(row, _)| *row == start.0) {
-                Some(slot) => slot.1 = slot.1.max(end),
-                None => last.push((start.0, end)),
+            match ends.iter_mut().find(|(row, _)| *row == start.0) {
+                Some(slot) => slot.1 = slot.1.max(end.1),
+                None => ends.push((start.0, end.1)),
             }
         }
-        let target = last.iter().map(|&(_, end)| end).max().unwrap_or(0);
-        // The padding goes in after the line's own indentation: a space put
-        // before a tab is swallowed by the tab's jump to its stop, so a line
-        // indented with tabs would never move. Past the indentation every
-        // space carries the rest of the line exactly one cell right.
-        let pads: Vec<Pad> = last
+        if ends.len() < 2 {
+            return false;
+        }
+        let cols: Vec<(usize, usize)> = ends
             .iter()
-            .filter(|&&(_, end)| end < target)
-            .map(|&(row, end)| Pad {
+            .map(|&(row, end)| (row, text_cols(&self.text_between(row, 0, end), 0, width)))
+            .collect();
+        let target = cols.iter().map(|&(_, c)| c).max().unwrap_or(0);
+        if target == 0 {
+            return false;
+        }
+        // At column 0, exactly where the extension puts it.
+        let pads: Vec<Pad> = cols
+            .iter()
+            .filter(|&&(_, c)| c < target)
+            .map(|&(row, c)| Pad {
                 row,
-                col: self
-                    .lines
-                    .get(row)
-                    .map(|l| l.chars().take_while(|c| *c == ' ' || *c == '\t').count())
-                    .unwrap_or(0),
-                text: " ".repeat(target - end),
+                col: 0,
+                text: " ".repeat(target - c),
+                front: false,
             })
             .collect();
         let heads: Vec<(usize, usize)> = all.iter().map(|s| s.head).collect();
@@ -126,175 +159,131 @@ impl Editor {
         applied
     }
 
-    /// The display column `col` chars into `row` occupy: a tab takes the cells
-    /// to the next stop of `width`-wide tabs, exactly as the editor draws it,
-    /// so alignment is measured on screen rather than in characters and a line
-    /// that already holds tabs still lines up.
-    fn display_col(&self, row: usize, col: usize, width: usize) -> usize {
-        let width = width.max(1);
-        let mut display = 0;
-        let Some(line) = self.lines.get(row) else {
-            return display;
-        };
-        for c in line.chars().take(col) {
-            display += if c == '\t' {
-                width - display % width
-            } else {
-                // A wide character is two cells on screen, and a combining
-                // mark none, exactly as the renderer draws it.
-                unicode_width::UnicodeWidthChar::width(c).unwrap_or(0)
-            };
-        }
-        display
+    /// The text of `row` between two char columns.
+    fn text_between(&self, row: usize, from: usize, to: usize) -> String {
+        self.lines
+            .get(row)
+            .map(|l| l.chars().skip(from).take(to.saturating_sub(from)).collect())
+            .unwrap_or_default()
     }
 
-    /// The column commands' shared geometry: group the carets' selections into
-    /// columns, work out each one's front and back padding, and lay it down as
-    /// one edit.
-    ///
-    /// Everything is measured in display columns, and each row carries the
-    /// width already inserted left of where it stands: a pad worked out from
-    /// the original columns lands short by exactly that much, so only the
-    /// shortfall goes in and a second group further right still lines up.
+    /// The column geometry every align command shares, in the extension's
+    /// passes over the blocks.
     fn align_columns(&mut self, how: AlignPad, tabs: Option<usize>) -> bool {
-        let all = self.caret_selections();
-        if all.len() < 2 {
-            return false;
-        }
-        let spans: Vec<((usize, usize), (usize, usize))> =
-            all.iter().map(|s| s.normalised()).collect();
-        // A selection across lines has no single column and no single line to
-        // pad, so it takes no part in the geometry; its caret keeps its place.
-        let single: Vec<usize> = (0..all.len())
-            .filter(|&i| spans[i].0.0 == spans[i].1.0)
-            .collect();
-        // Tabs in the line before a selection also set its column, so the tab
-        // stop is needed even when the padding itself is spaces.
         let width = tabs
             .unwrap_or_else(|| self.indent_style().width as usize)
             .max(1);
+
+        // Pass 1: one block per single-line selection, in reading order.
+        let mut blocks: Vec<Block> = Vec::new();
+        for sel in self.caret_selections() {
+            let (start, end) = sel.normalised();
+            if start.0 != end.0 {
+                continue;
+            }
+            blocks.push(Block {
+                row: start.0,
+                start: start.1,
+                end: end.1,
+                padding_start: 0,
+                padding_cols: 0,
+                block_cols: 0,
+                column: 0,
+            });
+        }
+        blocks.sort_by_key(|b| (b.row, b.start));
+        if blocks.len() < 2 {
+            return false;
+        }
+
+        // Group into columns: the nth selection on a line joins column n, and
+        // its padding starts where the previous one on that line ended.
+        let mut columns: Vec<Column> = Vec::new();
+        let (mut cur_row, mut cur_char, mut index) = (blocks[0].row, 0usize, 0usize);
+        for block in blocks.iter_mut() {
+            if block.row != cur_row {
+                cur_row = block.row;
+                cur_char = 0;
+                index = 0;
+            }
+            if index == columns.len() {
+                columns.push(Column::default());
+            }
+            block.column = index;
+            block.padding_start = cur_char;
+            cur_char = block.end;
+            index += 1;
+        }
+
+        // Passes 2 and 3: each column's padding and selection widths, left to
+        // right, because a column's cells depend on the ones before it.
+        let mut col_start = 0usize;
+        for c in 0..columns.len() {
+            for b in blocks.iter_mut().filter(|b| b.column == c) {
+                let text = self.text_between(b.row, b.padding_start, b.start);
+                b.padding_cols = text_cols(&text, col_start, width);
+                columns[c].pad_cols = columns[c].pad_cols.max(b.padding_cols);
+            }
+            if tabs.is_some() {
+                columns[c].pad_cols = columns[c].pad_cols.div_ceil(width) * width;
+            }
+            col_start += columns[c].pad_cols;
+
+            for b in blocks.iter_mut().filter(|b| b.column == c) {
+                let text = self.text_between(b.row, b.start, b.end);
+                b.block_cols = text_cols(&text, col_start, width);
+                columns[c].block_cols = columns[c].block_cols.max(b.block_cols);
+            }
+            if tabs.is_some() {
+                columns[c].block_cols = columns[c].block_cols.div_ceil(width) * width;
+            }
+            col_start += columns[c].block_cols;
+        }
+
+        // Lay the whitespace down in reading order, so the counts stay the
+        // extension's own.
+        let unit = if tabs.is_some() { "\t" } else { " " };
         let mut pads: Vec<Pad> = Vec::new();
-        let mut shifted: std::collections::BTreeMap<usize, usize> =
-            std::collections::BTreeMap::new();
-        // A tab in front of a selection moves it right without moving its char
-        // index, so two selections in one column on screen can have different
-        // char starts. Grouping compares the columns they occupy on screen.
-        let spans_d: Vec<(usize, usize)> = spans
-            .iter()
-            .map(|&(start, end)| {
-                (
-                    self.display_col(start.0, start.1, width),
-                    self.display_col(end.0, end.1, width),
-                )
-            })
-            .collect();
-        // Bare carets have no width to group by, so they are all one column:
-        // "line these carets up" is the whole meaning of the command when
-        // nothing is selected. Selections keep their own columns, where only
-        // the ones that touch share.
-        let groups = if single.len() > 1 && single.iter().all(|&i| spans[i].0 == spans[i].1) {
-            vec![single.clone()]
-        } else {
-            column_groups(&spans_d, &single)
-        };
-        for group in groups {
-            let start_d = |e: &Editor, i: usize| e.display_col(spans[i].0.0, spans[i].0.1, width);
-            let end_d = |e: &Editor, i: usize| e.display_col(spans[i].1.0, spans[i].1.1, width);
-            // Where this group's selections stand now: earlier groups on the
-            // same row already pushed them right, and aligning to the original
-            // columns would leave the second group short by exactly that.
-            let target = group
-                .iter()
-                .map(|&i| start_d(self, i) + shifted.get(&spans[i].0.0).copied().unwrap_or(0))
-                .max()
-                .unwrap_or(0);
-            let longest = group
-                .iter()
-                .map(|&i| end_d(self, i) - start_d(self, i))
-                .max()
-                .unwrap_or(0);
-            // The column every selection in this group starts in: the
-            // right-most start, or — for the tab variant — the first tab stop
-            // at or after it, because starts only line up if they all sit on
-            // that one stop. The end every selection is padded out to follows
-            // from it: the aligned column plus the longest selection.
-            let align_col = if tabs.is_some() {
-                target.div_ceil(width) * width
-            } else {
-                target
-            };
-            // Tabs can only land on a stop, so with the tab variant the end
-            // every selection is padded out to is the next stop at or after
-            // the longest one — otherwise a longer selection would end on the
-            // stop and a shorter one exactly at its own length, and the ends
-            // would not line up.
-            let aim_end = if tabs.is_some() {
-                (align_col + longest).div_ceil(width) * width
-            } else {
-                align_col + longest
-            };
-            let mut members = group.clone();
-            members.sort_by_key(|&i| start_d(self, i));
-            for i in members {
-                let (start, end) = spans[i];
-                let len = end_d(self, i) - start_d(self, i);
-                let row = start.0;
-                let moved = shifted.get(&row).copied().unwrap_or(0);
-                let (front, back, advance) = match (how, tabs) {
-                    (_, Some(_)) => {
-                        let from = start_d(self, i) + moved;
-                        let front = tabs_to_reach(from, align_col, width);
-                        let after_front = tab_advance(from, front, width);
-                        let back = tabs_to_reach(after_front + len, aim_end, width);
-                        let after = tab_advance(after_front + len, back, width);
-                        (
-                            front,
-                            back,
-                            (after_front - from) + (after - after_front - len),
-                        )
-                    }
-                    // All the padding at the front pushes the text's end out
-                    // to the column the longest selection reaches.
-                    (AlignPad::Front, None) => {
-                        let front = (align_col - start_d(self, i)).max(0) + (longest - len);
-                        (front.saturating_sub(moved), 0, front.saturating_sub(moved))
-                    }
-                    (AlignPad::Both, None) => {
-                        let front = (align_col - start_d(self, i)).saturating_sub(moved);
-                        (front, longest - len, front + (longest - len))
-                    }
-                };
-                if front > 0 {
-                    pads.push(Pad {
-                        row,
-                        col: start.1,
-                        text: if tabs.is_some() {
-                            "\t".repeat(front)
-                        } else {
-                            " ".repeat(front)
-                        },
-                    });
-                }
-                if back > 0 {
-                    pads.push(Pad {
-                        row,
-                        col: end.1,
-                        text: if tabs.is_some() {
-                            "\t".repeat(back)
-                        } else {
-                            " ".repeat(back)
-                        },
-                    });
-                }
-                *shifted.entry(row).or_insert(0) += advance;
+        for b in &blocks {
+            let column = &columns[b.column];
+            let mut add_pad = column.pad_cols - b.padding_cols;
+            let mut add_block = column.block_cols - b.block_cols;
+            if tabs.is_some() {
+                // These counts are cells; one tab covers a whole stop of them.
+                add_pad = add_pad.div_ceil(width);
+                add_block = add_block.div_ceil(width);
+            }
+            if add_pad > 0 {
+                pads.push(Pad {
+                    row: b.row,
+                    col: b.start,
+                    text: unit.repeat(add_pad),
+                    front: true,
+                });
+            }
+            if add_block > 0 {
+                pads.push(Pad {
+                    row: b.row,
+                    col: if how == AlignPad::Front {
+                        b.start
+                    } else {
+                        b.end
+                    },
+                    text: unit.repeat(add_block),
+                    front: false,
+                });
             }
         }
-        let heads: Vec<(usize, usize)> = all.iter().map(|s| s.head).collect();
-        let applied = !pads.is_empty();
+        if pads.is_empty() {
+            return false;
+        }
+        let heads: Vec<(usize, usize)> = self.caret_selections().iter().map(|s| s.head).collect();
         self.apply_alignment(&pads, &heads);
-        applied
+        true
     }
+}
 
+impl Editor {
     /// Insert every pad as one undo step, then leave a bare caret where each
     /// of `heads` was pushed to by the padding at or before it.
     ///
@@ -324,10 +313,11 @@ impl Editor {
                 (i == 0, (from_bottom, from_end + right))
             })
             .collect();
-        // Bottom-up and right-to-left, so an insert never shifts a place
-        // still to be written.
+        // Bottom-up and right-to-left, so an insert never shifts a place still
+        // to be written. At one spot the selection's length goes in first, so
+        // the column's padding ends up to its left.
         let mut order: Vec<usize> = (0..pads.len()).collect();
-        order.sort_by_key(|&i| std::cmp::Reverse((pads[i].row, pads[i].col)));
+        order.sort_by_key(|&i| std::cmp::Reverse((pads[i].row, pads[i].col, !pads[i].front)));
         self.selection = None;
         let last = self.lines.len().saturating_sub(1);
         for i in order {
@@ -342,31 +332,4 @@ impl Editor {
         self.place_pinned_carets(&pins);
         self.recompute_highlights();
     }
-}
-
-/// The columns `spans` fall into, left to right, as indices into `spans`.
-///
-/// A span joins the column whose furthest end it starts at or before, so
-/// touching and overlapping selections — carets stacked over one another —
-/// share a column, and only a gap starts a new one. `spans` holds display
-/// columns, so a tab in front of a selection counts for where it stands.
-fn column_groups(spans: &[(usize, usize)], members: &[usize]) -> Vec<Vec<usize>> {
-    let mut order: Vec<usize> = members.to_vec();
-    order.sort_by_key(|&i| (spans[i].0, spans[i].1));
-    let mut groups: Vec<Vec<usize>> = Vec::new();
-    let mut furthest = 0;
-    for i in order {
-        let (start, end) = spans[i];
-        match groups.last_mut() {
-            Some(group) if start <= furthest => {
-                group.push(i);
-                furthest = furthest.max(end);
-            }
-            _ => {
-                groups.push(vec![i]);
-                furthest = end.max(start);
-            }
-        }
-    }
-    groups
 }
