@@ -96,10 +96,11 @@ see [docs/MACOS.md](docs/MACOS.md#spotlight-indexing-and-the-build-directory).
   `src/pair.rs`, which keeps only the pilot's shared state, nor in
   `src/widgets/source_control.rs`, which keeps only the `SourceControlPanel`
   type, its constructor and the row action areas, nor in `src/cli.rs`, which
-  keeps only the clap root, `Cli`. A new subcommand's code goes in a file of
-  its own under `src/cli/`, its flags in `src/cli/commands.rs` and its line
-  in `Cli::run` (`src/cli/run.rs`). A new feature that fits no file gets a
-  file of its own.
+  keeps only the clap root, `Cli`. A new subcommand's flags go in
+  `src/cli/commands.rs` and its line in `Cli::run` (`src/cli/run.rs`); its
+  own code goes in a file under `src/cli/`, or in the module of the feature
+  it drives (as `croft remote` calls into `src/remote/`). A new feature that
+  fits no file gets a file of its own.
 * **New or changed module?** Update its entry in
   [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). CI fails if you shorten a
   module's description without moving its reasoning into a `### <module>`

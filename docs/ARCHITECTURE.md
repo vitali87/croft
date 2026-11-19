@@ -17,7 +17,7 @@ Resizes call `master.resize(...)` and `term.resize(...)` so programs like `htop`
 ```
 src/
 ├── main.rs              entry point + module declarations
-├── cli.rs               clap CLI: open path, setup-terminal / setup-iterm2 / setup-cross / remote / view / keys subcommands: what every part shares (the clap root, `Cli`); each subcommand's code lives in a file in `cli/` below
+├── cli.rs               clap CLI: open path, setup-terminal / setup-iterm2 / setup-cross / remote / view / keys subcommands: what every part shares (the clap root, `Cli`); the command line's own code is in the files in `cli/` below, while a subcommand that drives a feature (remote, attach, record, view, ...) calls into that feature's module
 ├── cli/                 the command line's feature files, beside cli.rs; each file's `//!` doc says what it holds
 │   ├── commands.rs       every subcommand and its flags, as clap parses them
 │   ├── cross.rs          `croft setup-cross`: the cross-build's targets, and installing zig, cargo-zigbuild and the targets
