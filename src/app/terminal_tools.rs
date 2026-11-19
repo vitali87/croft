@@ -133,19 +133,20 @@ impl App {
         };
     }
 
-    /// Terminal: Run Selected Text in Active Terminal (#1292): send the
+    /// Send Selection/Line to Terminal (#1292, #2340), `Alt+X`: send the
     /// editor's selection, or with none the caret's line, to the active
     /// pane, then Enter. A block goes as one paste, bracketed when the
     /// program in the pane asked for it, and Enter follows outside the
-    /// brackets so it runs. Without a selection the caret steps to the next
-    /// non-blank line, so repeated runs walk through a script. Focus stays
-    /// in the editor.
+    /// brackets so it runs. With several carets every selection is sent, in
+    /// buffer order and one per line, so a multi-caret edit runs the way it
+    /// reads. Without a selection the caret steps to the next non-blank line,
+    /// so repeated runs walk through a script. Focus stays in the editor.
     pub(super) fn run_selected_text_in_terminal(&mut self) {
         if !self.editor_is_text() {
             self.status = String::from("Run Selected Text works on text tabs");
             return;
         }
-        let selected = self.editor.selection_text();
+        let selected = self.editor.selections_text();
         let stepping = selected.is_empty();
         let text = if stepping {
             self.editor

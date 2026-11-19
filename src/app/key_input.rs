@@ -1919,6 +1919,23 @@ pub(super) fn is_toggle_wrap_key(key: KeyEvent) -> bool {
         && !key.modifiers.contains(KeyModifiers::CONTROL)
 }
 
+/// `Alt+X`: Send Selection/Line to Terminal (#1292, #2340) — send the
+/// selection, or the caret's line with none, to the terminal pane and run it.
+/// Rejects Shift, Ctrl and the command modifier, so an editor-level `Alt+X`
+/// never steals a chord another pane owns.
+pub(super) fn is_run_selected_text_key(key: KeyEvent) -> bool {
+    let KeyCode::Char(c) = key.code else {
+        return false;
+    };
+    if !c.eq_ignore_ascii_case(&'x') {
+        return false;
+    }
+    key.modifiers.contains(KeyModifiers::ALT)
+        && !key.modifiers.contains(KeyModifiers::SHIFT)
+        && !key.modifiers.contains(KeyModifiers::SUPER)
+        && !key.modifiers.contains(KeyModifiers::CONTROL)
+}
+
 /// The Cursor Align chords, one predicate each so the F1 cheat sheet and the
 /// key ledger can name the handler that answers each chord: `Alt+A` aligns
 /// every caret's selection into one column, `Alt+F` pads the front only

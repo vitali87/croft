@@ -151,6 +151,7 @@ fn key_predicates() -> Vec<(&'static str, KeyPredicate)> {
         is_align_cursors_pad_front_key,
         is_align_cursors_using_tabs_key,
         is_align_line_last_cursors_key,
+        is_run_selected_text_key,
         is_switch_header_source_key,
         is_tree_zoxide_jump_key,
         is_tree_new_file_key,

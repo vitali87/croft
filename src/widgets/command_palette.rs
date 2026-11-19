@@ -452,8 +452,8 @@ pub enum Command {
     ProblemsToggleScope,
     DiffToggleIgnoreWhitespace,
     NewTerminal,
-    /// Terminal: Run Selected Text in Active Terminal (#1292): the
-    /// editor's selection, or the caret's line, run in the active pane.
+    /// Send Selection/Line to Terminal (#1292, #2340): the editor's
+    /// selection, or the caret's line, run in the active pane.
     RunSelectedText,
     /// Terminal: Focus Next / Previous Terminal (#843): Cmd+] / Cmd+[, which
     /// have no `Ctrl` form (`Ctrl+[` is `Esc`).
@@ -1494,7 +1494,7 @@ impl Command {
             Command::ProblemsToggleScope => "Problems: Toggle Scope (Open Files / Whole Project)",
             Command::DiffToggleIgnoreWhitespace => "Diff: Toggle Ignore Whitespace",
             Command::NewTerminal => "Terminal: Create New Terminal",
-            Command::RunSelectedText => "Terminal: Run Selected Text in Active Terminal",
+            Command::RunSelectedText => "Send Selection/Line to Terminal",
             Command::FocusNextTerminal => "Terminal: Focus Next Terminal",
             Command::FocusPreviousTerminal => "Terminal: Focus Previous Terminal",
             Command::TerminalClear => "Terminal: Clear",
@@ -2005,7 +2005,7 @@ impl Command {
             Command::ProblemsToggleScope => "",
             Command::DiffToggleIgnoreWhitespace => "",
             Command::NewTerminal => "Cmd+T",
-            Command::RunSelectedText => "",
+            Command::RunSelectedText => "Alt+X",
             Command::FocusNextTerminal => "Cmd+]",
             Command::FocusPreviousTerminal => "Cmd+[",
             Command::TerminalClear => "Cmd+K K",
@@ -2671,8 +2671,13 @@ impl Command {
     /// sends its terminal commands' chords past the shell the same way
     /// (`terminal.integrated.commandsToSkipShell`): a user who binds
     /// Terminal: Clear means it for the terminal.
+    ///
+    /// Run Selected Text keeps its place here even though #2340 dropped the
+    /// `Terminal: ` prefix from its palette title: the chord is still meant to
+    /// run the editor's selection while the terminal has focus, not to reach
+    /// the shell.
     pub fn skips_the_shell(self) -> bool {
-        self.title().starts_with("Terminal: ")
+        self == Self::RunSelectedText || self.title().starts_with("Terminal: ")
     }
 
     /// Whether this command belongs to the CodeQL extension: its side bar,

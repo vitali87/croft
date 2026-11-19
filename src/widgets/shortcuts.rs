@@ -402,6 +402,11 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
                 handler: "is_align_line_last_cursors_key",
             },
             ShortcutEntry {
+                keys: "Alt+x",
+                description: "Run the selection, or the caret's line, in the terminal pane",
+                handler: "is_run_selected_text_key",
+            },
+            ShortcutEntry {
                 keys: "Alt+Z",
                 description: "Toggle word wrap for this file",
                 handler: "is_toggle_wrap_key",

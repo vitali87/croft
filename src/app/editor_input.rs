@@ -513,6 +513,12 @@ impl App {
             }
             return;
         }
+        // Alt+X: Send Selection/Line to Terminal — send the selection, or the
+        // caret's line, to the terminal pane and run it.
+        if is_run_selected_text_key(key) {
+            self.run_selected_text_in_terminal();
+            return;
+        }
         // Alt+O: C/C++: Switch Header/Source (#1360), as VS Code's clangd
         // extension binds it. Other files keep the chord.
         if is_switch_header_source_key(key)
@@ -768,7 +774,11 @@ impl App {
         // With `multi_cursor_persist` on, movement and Enter act on every
         // caret instead; Esc and a mouse click still collapse.
         if self.editor.has_multi_cursor() {
-            if self.multi_cursor_persist {
+            // Vim Normal and Visual modes own their keys (Enter included), so
+            // the preference never reaches into them.
+            if self.multi_cursor_persist
+                && !(self.vim.enabled && self.vim.mode() != crate::vim::VimMode::Insert)
+            {
                 if let Some((motion, extend)) = multi_caret_motion(key) {
                     self.editor.multi_move(motion, extend);
                     return;

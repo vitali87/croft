@@ -11750,6 +11750,24 @@ fn selection_text_single_line() {
     assert_eq!(e.selection_text(), "world");
 }
 
+/// Several carets: the terminal run gets every selection, in buffer order
+/// even when the carets were added bottom-up, one per line.
+#[test]
+fn selections_text_joins_every_caret_in_buffer_order() {
+    let e = with_carets(
+        &["let a = run();", "let b = run();", "let c = run();"],
+        &[((2, 8), (2, 13)), ((0, 8), (0, 13)), ((1, 8), (1, 13))],
+    );
+    assert_eq!(e.selections_text(), "run()\nrun()\nrun()");
+    // A caret with no area adds nothing, so a stray caret cannot inject a
+    // blank line into a run.
+    let e = with_carets(&["aa", "bb"], &[((0, 0), (0, 1)), ((1, 1), (1, 1))]);
+    assert_eq!(e.selections_text(), "a");
+    // No selections at all: empty, so the caller falls back to the line.
+    let e = with_carets(&["aa"], &[((0, 1), (0, 1))]);
+    assert_eq!(e.selections_text(), "");
+}
+
 #[test]
 fn selection_text_handles_reversed_endpoints() {
     let mut e = editor_with("hello world");

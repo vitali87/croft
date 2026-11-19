@@ -558,12 +558,14 @@ impl Editor {
     /// editor's char-indexed coordinates.  Returns "" when there's no
     /// selection or the selection is zero-area.
     pub fn selection_text(&self) -> String {
-        let Some(sel) = self.selection else {
-            return String::new();
-        };
-        if !sel.has_area() {
-            return String::new();
+        match self.selection {
+            Some(sel) if sel.has_area() => self.text_of(sel),
+            _ => String::new(),
         }
+    }
+
+    /// The text of one selection, `\n`-joined across rows.
+    fn text_of(&self, sel: EditorSelection) -> String {
         let ((sr, sc), (er, ec)) = sel.normalised();
         if sr == er {
             let line = &self.lines[sr];
@@ -587,6 +589,23 @@ impl Editor {
         let to = char_byte(last, ec);
         out.push_str(&last[..to]);
         out
+    }
+
+    /// Every caret's selected text, in buffer order and one per line: what a
+    /// run hands the terminal when several carets are in play. Empty when no
+    /// caret has an area, so the caller can fall back to the caret's line.
+    pub fn selections_text(&self) -> String {
+        let mut spans: Vec<EditorSelection> = self
+            .caret_selections()
+            .into_iter()
+            .filter(|sel| sel.has_area())
+            .collect();
+        spans.sort_by_key(|sel| sel.normalised().0);
+        spans
+            .iter()
+            .map(|&sel| self.text_of(sel))
+            .collect::<Vec<String>>()
+            .join("\n")
     }
 
     /// The literal text to light up as "other occurrences" of the current

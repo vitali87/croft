@@ -67,6 +67,7 @@ editor | alt+shift+right | caret=4:13 sel=4:8-4:13
 editor | alt+shift+up | tabs=*● main.rs text=16L#321d831e
 editor | alt+up | tabs=*● main.rs text=15L#614ba9a0 caret=3:8
 editor | alt+w | -
+editor | alt+x | caret=5:0 status="Ran 1 line in " typed=0:"    let total = add(1, 2);\r"
 editor | alt+z | +wrap
 editor | backspace | tabs=*● main.rs text=15L#9e4f1a90 caret=4:7
 editor | cmd+[ | -
@@ -338,6 +339,7 @@ selection | alt+shift+right | caret=4:26 sel=4:4-4:26
 selection | alt+shift+up | tabs=*● main.rs text=16L#321d831e
 selection | alt+up | tabs=*● main.rs text=15L#614ba9a0 caret=3:13 sel=3:8-3:13
 selection | alt+w | -
+selection | alt+x | status="Ran 1 line in " typed=0:"total\r"
 selection | alt+z | +wrap
 selection | backspace | tabs=*● main.rs text=15L#bb0bf786 caret=4:8 sel=-
 selection | cmd+[ | -
@@ -609,6 +611,7 @@ explorer | alt+shift+right | status="Opened <root>/main.rs"
 explorer | alt+shift+up | tree=./+,.vscode/,docs/,main.rs > docs marked=.,.vscode,docs
 explorer | alt+up | tree=./+,.vscode/,docs/,main.rs > docs
 explorer | alt+w | -
+explorer | alt+x | -
 explorer | alt+z | -
 explorer | backspace | +input("Move 'main.rs' to Trash?" "" @0)
 explorer | cmd+[ | -
@@ -879,6 +882,7 @@ terminal | alt+shift+right | typed=0:"\u{1b}[1;4C"
 terminal | alt+shift+up | typed=0:"\u{1b}[1;4A"
 terminal | alt+up | typed=0:"\u{1b}[1;3A"
 terminal | alt+w | typed=0:"\u{1b}w"
+terminal | alt+x | typed=0:"\u{1b}x"
 terminal | alt+z | typed=0:"\u{1b}z"
 terminal | backspace | typed=0:"\u{7f}"
 terminal | cmd+[ | -
@@ -1150,6 +1154,7 @@ search | alt+shift+right | -
 search | alt+shift+up | -
 search | alt+up | -
 search | alt+w | status="Search: Match Whole Word on" search="total" @Query:5 +word hits=0@0
+search | alt+x | -
 search | alt+z | -
 search | backspace | search="tota" @Query:4 hits=0@0
 search | cmd+[ | status="Search: unhandled Cmd+["
@@ -1421,6 +1426,7 @@ scm | alt+shift+right | -
 scm | alt+shift+up | -
 scm | alt+up | -
 scm | alt+w | -
+scm | alt+x | -
 scm | alt+z | -
 scm | backspace | scm="Ship i"@6 +focus StagedModified:docs/notes.md Untracked:todo.txt
 scm | cmd+[ | -
@@ -1692,6 +1698,7 @@ palette | alt+shift+right | -
 palette | alt+shift+up | -
 palette | alt+up | -
 palette | alt+w | ~palette("w" @1 > "File: Save with Sudo")
+palette | alt+x | ~palette("x" @1 > "Quick Fix")
 palette | alt+z | ~palette("z" @1 > "View: Toggle Zen Mode")
 palette | backspace | -
 palette | cmd+[ | -
@@ -1966,6 +1973,7 @@ confirm | alt+shift+right | -
 confirm | alt+shift+up | -
 confirm | alt+up | -
 confirm | alt+w | -
+confirm | alt+x | -
 confirm | alt+z | -
 confirm | backspace | -
 confirm | cmd+[ | -
