@@ -123,6 +123,7 @@ pub(super) fn menu_action_command(
         MenuAction::TerminalCopyMode => Cmd::TerminalCopyMode,
         MenuAction::TerminalCommandHistory => Cmd::TerminalCommandHistory,
         MenuAction::OpenScrollbackInEditor => Cmd::TerminalOpenScrollback,
+        MenuAction::RunCommand(cmd) => *cmd,
         MenuAction::CloseOtherTabs(_) => Cmd::CloseOtherEditors,
         _ => return None,
     })
@@ -159,6 +160,11 @@ pub(super) fn menu_hint(action: &MenuAction, keymap: &crate::keymap::Keymap) -> 
     menu_action_command(action)
         .and_then(|cmd| keymap.chord_for(cmd))
         .or_else(|| {
+            if let MenuAction::RunCommand(cmd) = action {
+                let hint = cmd.keybinding_hint();
+                return (!hint.is_empty())
+                    .then(|| crate::widgets::command_palette::platform_hint(hint).into_owned());
+            }
             platform_shortcut_for(action, cfg!(target_os = "macos")).map(|s| s.into_owned())
         })
 }
@@ -1444,6 +1450,7 @@ impl App {
             MenuAction::ToggleBroadcastInput => self.toggle_broadcast_input(),
             MenuAction::ToggleBroadcastExclusion => self.toggle_broadcast_exclusion(),
             MenuAction::UndoCloseTerminal => self.undo_close_terminal(),
+            MenuAction::RunCommand(cmd) => self.run_command(cmd),
             MenuAction::SplitTerminal => self.split_terminal_reporting(),
             MenuAction::KillTerminal(idx) => self.close_terminal_reporting(idx),
             MenuAction::CopyCommandOutput(idx, d) => self.copy_command_output(idx, d),
@@ -1529,6 +1536,54 @@ impl App {
                 short,
             } => self.run_commit_action(action, &hash, &short),
         }
+    }
+
+    /// Open the user's menu (`menu.json`) as a drop-down over the editor: one
+    /// row per command, submenus for groups, a short note when the file is
+    /// empty or does not parse.
+    pub(super) fn open_user_menu(&mut self) {
+        self.open_user_menu_with(crate::user_menu::UserMenu::load());
+    }
+
+    pub(super) fn open_user_menu_with(&mut self, menu: crate::user_menu::UserMenu) {
+        use crate::user_menu::UserMenuItem;
+        fn entries(items: &[UserMenuItem]) -> Vec<MenuEntry> {
+            items
+                .iter()
+                .map(|item| match item {
+                    UserMenuItem::Command { label, command, .. } => MenuEntry::item(
+                        label.clone().unwrap_or_else(|| command.title().to_string()),
+                        MenuAction::RunCommand(*command),
+                    ),
+                    UserMenuItem::Group { label, items } => MenuEntry::Submenu {
+                        label: label.clone(),
+                        items: entries(items),
+                    },
+                    UserMenuItem::Separator => MenuEntry::Separator,
+                })
+                .collect()
+        }
+        if let Some(problem) = &menu.problem {
+            self.status = format!("User menu: {problem}");
+            return;
+        }
+        if menu.is_empty() {
+            self.status = String::from(
+                "User menu is empty: Preferences: Open User Menu (JSON) to add commands",
+            );
+            return;
+        }
+        let body = self.editor.last_body;
+        self.open_status_menu(
+            body.x.saturating_add(4),
+            body.y.saturating_add(2),
+            entries(&menu.items),
+        );
+        self.status = if menu.skipped > 0 {
+            format!("User menu: {} row(s) in menu.json skipped", menu.skipped)
+        } else {
+            String::from("User menu — Enter runs, Esc closes")
+        };
     }
 
     /// Build a status-bar popup menu at `(col, row)`. `menu_rect` clamps it up

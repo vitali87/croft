@@ -191,6 +191,7 @@ editor | ctrl+k shift+f | tabs=main.rs,*Search Editor text=3L#6cabf539 caret=0:0
 editor | ctrl+k shift+h | status="Call hierarchy: no language server for this file"
 editor | ctrl+k shift+i | status=" excluded from broadcast input"
 editor | ctrl+k shift+l | +input("New worktree lane" "" @0)
+editor | ctrl+k shift+m | status="User menu is empty: Preferences: Open User Menu (JSON) to add commands"
 editor | ctrl+k shift+n | tabs=*● main.rs text=15L#dd47e8c2 caret=4:9
 editor | ctrl+k shift+o | status="New Window failed: opening a new window is only supported on macOS"
 editor | ctrl+k shift+p | status="Tab is already kept open"
@@ -237,7 +238,7 @@ editor | ctrl+shift+l | caret=4:13 sel=4:8-4:13 carets=1:35-1:40,5:7-5:12,6:19-6
 editor | ctrl+shift+m | focus=panel panel=Problems
 editor | ctrl+shift+n | -
 editor | ctrl+shift+o | status="Go to Symbol: 0 symbols — Esc to close" +go_to_symbol("" @0 > "")
-editor | ctrl+shift+p | status="Command Palette: 387 commands — Esc to close" +palette("" @0 > "Move Line Up")
+editor | ctrl+shift+p | status="Command Palette: 389 commands — Esc to close" +palette("" @0 > "Move Line Up")
 editor | ctrl+shift+pagedown | status="Move: the editor is already the last tab"
 editor | ctrl+shift+pageup | status="Move: the editor is already the first tab"
 editor | ctrl+shift+r | focus=side side=Remote
@@ -459,6 +460,7 @@ selection | ctrl+k shift+f | tabs=main.rs,*Search Editor text=3L#6cabf539 caret=
 selection | ctrl+k shift+h | status="Call hierarchy: no language server for this file"
 selection | ctrl+k shift+i | status=" excluded from broadcast input"
 selection | ctrl+k shift+l | +input("New worktree lane" "" @0)
+selection | ctrl+k shift+m | status="User menu is empty: Preferences: Open User Menu (JSON) to add commands"
 selection | ctrl+k shift+n | tabs=*● main.rs text=15L#1d098ee2 caret=4:9 sel=-
 selection | ctrl+k shift+o | status="New Window failed: opening a new window is only supported on macOS"
 selection | ctrl+k shift+p | status="Tab is already kept open"
@@ -505,7 +507,7 @@ selection | ctrl+shift+l | carets=1:35-1:40,5:7-5:12,6:19-6:24 status="Selected 
 selection | ctrl+shift+m | focus=panel panel=Problems
 selection | ctrl+shift+n | -
 selection | ctrl+shift+o | status="Go to Symbol: 0 symbols — Esc to close" +go_to_symbol("" @0 > "")
-selection | ctrl+shift+p | status="Command Palette: 387 commands — Esc to close" +palette("" @0 > "Move Line Up")
+selection | ctrl+shift+p | status="Command Palette: 389 commands — Esc to close" +palette("" @0 > "Move Line Up")
 selection | ctrl+shift+pagedown | status="Move: the editor is already the last tab"
 selection | ctrl+shift+pageup | status="Move: the editor is already the first tab"
 selection | ctrl+shift+r | focus=side side=Remote
@@ -727,6 +729,7 @@ explorer | ctrl+k shift+f | focus=editor tabs=main.rs,*Search Editor text=3L#6ca
 explorer | ctrl+k shift+h | status="Call hierarchy: no language server for this file"
 explorer | ctrl+k shift+i | status=" excluded from broadcast input"
 explorer | ctrl+k shift+l | +input("New worktree lane" "" @0)
+explorer | ctrl+k shift+m | status="User menu is empty: Preferences: Open User Menu (JSON) to add commands"
 explorer | ctrl+k shift+n | -
 explorer | ctrl+k shift+o | status="New Window failed: opening a new window is only supported on macOS"
 explorer | ctrl+k shift+p | status="Tab is already kept open"
@@ -773,7 +776,7 @@ explorer | ctrl+shift+l | -
 explorer | ctrl+shift+m | focus=panel panel=Problems
 explorer | ctrl+shift+n | +prompt("New Folder in ." "")
 explorer | ctrl+shift+o | status="Go to Symbol: 0 symbols — Esc to close" +go_to_symbol("" @0 > "")
-explorer | ctrl+shift+p | status="Command Palette: 387 commands — Esc to close" +palette("" @0 > "Move Line Up")
+explorer | ctrl+shift+p | status="Command Palette: 389 commands — Esc to close" +palette("" @0 > "Move Line Up")
 explorer | ctrl+shift+pagedown | tree=./+,.vscode/,docs/,main.rs > main.rs marked=.,.vscode,docs,main.rs
 explorer | ctrl+shift+pageup | tree=./+,.vscode/,docs/,main.rs > . marked=.
 explorer | ctrl+shift+r | side=Remote
@@ -994,6 +997,7 @@ terminal | ctrl+k shift+f | typed=0:"\u{b}F"
 terminal | ctrl+k shift+h | typed=0:"\u{b}H"
 terminal | ctrl+k shift+i | typed=0:"\u{b}I"
 terminal | ctrl+k shift+l | typed=0:"\u{b}L"
+terminal | ctrl+k shift+m | typed=0:"\u{b}M"
 terminal | ctrl+k shift+n | typed=0:"\u{b}N"
 terminal | ctrl+k shift+o | typed=0:"\u{b}O"
 terminal | ctrl+k shift+p | typed=0:"\u{b}P"
@@ -1040,7 +1044,7 @@ terminal | ctrl+shift+l | typed=0:"\u{c}"
 terminal | ctrl+shift+m | panel=Problems
 terminal | ctrl+shift+n | typed=0:"\u{e}"
 terminal | ctrl+shift+o | status="Go to Symbol: 0 symbols — Esc to close" +go_to_symbol("" @0 > "")
-terminal | ctrl+shift+p | status="Command Palette: 387 commands — Esc to close" +palette("" @0 > "Move Line Up")
+terminal | ctrl+shift+p | status="Command Palette: 389 commands — Esc to close" +palette("" @0 > "Move Line Up")
 terminal | ctrl+shift+pagedown | -
 terminal | ctrl+shift+pageup | -
 terminal | ctrl+shift+r | focus=side side=Remote
@@ -1262,6 +1266,7 @@ search | ctrl+k shift+f | focus=editor tabs=main.rs,*Search: total text=9L#c0995
 search | ctrl+k shift+h | status="Call hierarchy: no language server for this file"
 search | ctrl+k shift+i | status=" excluded from broadcast input"
 search | ctrl+k shift+l | +input("New worktree lane" "" @0)
+search | ctrl+k shift+m | status="User menu is empty: Preferences: Open User Menu (JSON) to add commands"
 search | ctrl+k shift+n | search="totalN" @Query:6 hits=0@0
 search | ctrl+k shift+o | status="New Window failed: opening a new window is only supported on macOS"
 search | ctrl+k shift+p | status="Tab is already kept open"
@@ -1308,7 +1313,7 @@ search | ctrl+shift+l | status="Search: unhandled Ctrl+L"
 search | ctrl+shift+m | focus=panel panel=Problems search="total" hits=4@0
 search | ctrl+shift+n | status="Search: unhandled Ctrl+N"
 search | ctrl+shift+o | status="Go to Symbol: 0 symbols — Esc to close" +go_to_symbol("" @0 > "")
-search | ctrl+shift+p | status="Command Palette: 387 commands — Esc to close" +palette("" @0 > "Move Line Up")
+search | ctrl+shift+p | status="Command Palette: 389 commands — Esc to close" +palette("" @0 > "Move Line Up")
 search | ctrl+shift+pagedown | -
 search | ctrl+shift+pageup | -
 search | ctrl+shift+r | side=Remote search="total" hits=4@0
@@ -1530,6 +1535,7 @@ scm | ctrl+k shift+f | focus=editor tabs=main.rs,*Search Editor text=3L#6cabf539
 scm | ctrl+k shift+h | status="Call hierarchy: no language server for this file"
 scm | ctrl+k shift+i | status=" excluded from broadcast input"
 scm | ctrl+k shift+l | +input("New worktree lane" "" @0)
+scm | ctrl+k shift+m | status="User menu is empty: Preferences: Open User Menu (JSON) to add commands"
 scm | ctrl+k shift+n | scm="Ship itN"@8 +focus StagedModified:docs/notes.md Untracked:todo.txt
 scm | ctrl+k shift+o | status="New Window failed: opening a new window is only supported on macOS"
 scm | ctrl+k shift+p | status="Tab is already kept open"
@@ -1576,7 +1582,7 @@ scm | ctrl+shift+l | -
 scm | ctrl+shift+m | focus=panel panel=Problems scm="Ship it"@7 StagedModified:docs/notes.md Untracked:todo.txt
 scm | ctrl+shift+n | -
 scm | ctrl+shift+o | status="Go to Symbol: 0 symbols — Esc to close" +go_to_symbol("" @0 > "")
-scm | ctrl+shift+p | status="Command Palette: 387 commands — Esc to close" +palette("" @0 > "Move Line Up")
+scm | ctrl+shift+p | status="Command Palette: 389 commands — Esc to close" +palette("" @0 > "Move Line Up")
 scm | ctrl+shift+pagedown | -
 scm | ctrl+shift+pageup | -
 scm | ctrl+shift+r | side=Remote scm="Ship it"@7 StagedModified:docs/notes.md Untracked:todo.txt
@@ -1800,6 +1806,7 @@ palette | ctrl+k shift+g | ~palette("G" @1 > "Go Back")
 palette | ctrl+k shift+h | ~palette("H" @1 > "Git: Stage Hunk")
 palette | ctrl+k shift+i | ~palette("I" @1 > "Replace in File")
 palette | ctrl+k shift+l | ~palette("L" @1 > "View: Toggle Primary Side Bar")
+palette | ctrl+k shift+m | ~palette("M" @1 > "Move Line Up")
 palette | ctrl+k shift+n | ~palette("N" @1 > "Go to Next Change")
 palette | ctrl+k shift+o | ~palette("O" @1 > "View: Keep Editor")
 palette | ctrl+k shift+p | ~palette("P" @1 > "Git: Push")
@@ -2071,6 +2078,7 @@ confirm | ctrl+k shift+g | -
 confirm | ctrl+k shift+h | -
 confirm | ctrl+k shift+i | -
 confirm | ctrl+k shift+l | -
+confirm | ctrl+k shift+m | -
 confirm | ctrl+k shift+n | status="Cancelled: did not quit" -unsaved
 confirm | ctrl+k shift+o | -
 confirm | ctrl+k shift+p | -

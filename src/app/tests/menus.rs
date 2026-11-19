@@ -495,3 +495,32 @@ fn the_editor_menu_without_a_selection_offers_only_paste() {
         "{labels:?}"
     );
 }
+
+/// The user's menu opens as a drop-down over the editor, lists its rows and
+/// runs the chosen command through the real menu key path.
+#[test]
+fn the_user_menu_opens_as_a_drop_down_and_runs_the_chosen_command() {
+    let tmp = tempfile::tempdir().unwrap();
+    let f = tmp.path().join("a.txt");
+    std::fs::write(&f, "one\ntwo\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&f).unwrap();
+    app.open_user_menu_with(crate::user_menu::UserMenu::from_json(
+        r#"[{"command":"fold_all","label":"Fold it"},{"command":"select_all"}]"#,
+    ));
+    let menu = app.context_menu.as_ref().expect("the user menu opened");
+    assert_eq!(menu_labels(&menu.items), vec!["Fold it", "Select All"]);
+    app.context_menu.as_mut().unwrap().selected = 1;
+    app.handle_menu_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(app.context_menu.is_none());
+    assert!(app.editor.selection.is_some(), "Select All ran");
+}
+
+#[test]
+fn an_empty_user_menu_says_so_instead_of_opening() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.open_user_menu_with(crate::user_menu::UserMenu::from_json("[]"));
+    assert!(app.context_menu.is_none());
+    assert!(app.status.contains("User menu is empty"), "{}", app.status);
+}

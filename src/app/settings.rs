@@ -678,6 +678,7 @@ impl App {
                 ConfigFileSeed::Triggers => crate::triggers::TEMPLATE.to_string(),
                 ConfigFileSeed::Agents => crate::agents::TEMPLATE.to_string(),
                 ConfigFileSeed::Matchers => crate::problem_matchers::TEMPLATE.to_string(),
+                ConfigFileSeed::UserMenu => crate::user_menu::TEMPLATE.to_string(),
             };
             if let Err(e) = std::fs::write(&path, contents) {
                 self.status = format!("Could not create {}: {e}", path.display());
@@ -713,6 +714,9 @@ impl App {
             }
             ConfigFileSeed::Matchers => {
                 String::from("Editing matchers.json — save to apply immediately")
+            }
+            ConfigFileSeed::UserMenu => {
+                String::from("Editing menu.json — save; the menu reads it each time it opens")
             }
         };
     }
@@ -1538,6 +1542,7 @@ pub(super) enum ConfigFileSeed {
     Triggers,
     Matchers,
     Agents,
+    UserMenu,
 }
 
 /// Starter contents for a fresh settings overlay layer.

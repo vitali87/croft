@@ -143,6 +143,7 @@ mod triggers;
 mod undo_rebase;
 mod update_check;
 mod update_watch;
+mod user_menu;
 mod view_ipc;
 mod vim;
 mod voice;

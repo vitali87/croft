@@ -549,6 +549,8 @@ struct PendingCapture {
 #[derive(Clone, PartialEq, Eq, Debug)]
 enum MenuAction {
     Create(CreateKind),
+    /// Run a palette command: a row of the user's menu (`menu.json`).
+    RunCommand(crate::widgets::command_palette::Command),
     /// Move every path in `paths` to the OS trash (recoverable). One entry
     /// for a single right-click, more when a multi-selection is active.
     Delete {

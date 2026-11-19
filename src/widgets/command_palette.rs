@@ -531,6 +531,8 @@ pub enum Command {
     OpenTriggersJson,
     OpenAgentsJson,
     OpenMatchersJson,
+    OpenUserMenu,
+    OpenUserMenuJson,
     ToggleTerminalTimestamps,
     ToggleLogHighlight,
     CollapseTerminalPane,
@@ -1049,6 +1051,8 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::OpenTriggersJson,
     Command::OpenAgentsJson,
     Command::OpenMatchersJson,
+    Command::OpenUserMenu,
+    Command::OpenUserMenuJson,
     Command::ToggleTerminalTimestamps,
     Command::ToggleLogHighlight,
     Command::CollapseTerminalPane,
@@ -1548,6 +1552,8 @@ impl Command {
             Command::OpenTriggersJson => "Preferences: Open Terminal Triggers (JSON)",
             Command::OpenAgentsJson => "Preferences: Open Agent Lanes (JSON)",
             Command::OpenMatchersJson => "Preferences: Open Problem Matchers (JSON)",
+            Command::OpenUserMenu => "User Menu: Open",
+            Command::OpenUserMenuJson => "Preferences: Open User Menu (JSON)",
             Command::ToggleTerminalTimestamps => "Terminal: Toggle Timestamps",
             Command::ToggleLogHighlight => "Log: Toggle Highlighting (tailspin)",
             Command::CollapseTerminalPane => "Terminal: Collapse Pane",
@@ -2054,6 +2060,8 @@ impl Command {
             Command::OpenTriggersJson => "",
             Command::OpenAgentsJson => "",
             Command::OpenMatchersJson => "",
+            Command::OpenUserMenu => "Cmd+K Shift+M",
+            Command::OpenUserMenuJson => "",
             Command::ToggleTerminalTimestamps => "",
             Command::ToggleLogHighlight => "",
             Command::CollapseTerminalPane => "Cmd+K [",
@@ -2533,6 +2541,8 @@ impl Command {
             Command::OpenTriggersJson => "open_triggers_json",
             Command::OpenAgentsJson => "open_agents_json",
             Command::OpenMatchersJson => "open_matchers_json",
+            Command::OpenUserMenu => "open_user_menu",
+            Command::OpenUserMenuJson => "open_user_menu_json",
             Command::ToggleTerminalTimestamps => "toggle_terminal_timestamps",
             Command::ToggleLogHighlight => "toggle_log_highlight",
             Command::CollapseTerminalPane => "collapse_terminal_pane",
@@ -2782,6 +2792,9 @@ pub struct CommandPalette {
     /// Shortcuts that differ from a command's built-in hint (#1482): the
     /// user's own chord, or empty where a user binding took the chord.
     pub hint_overrides: Vec<(Command, String)>,
+    /// The user's menu commands (`menu.json`), listed first while the query
+    /// is empty and marked with a star.
+    pub pinned: Vec<Command>,
     pub selected: usize,
     pub scroll: usize,
     pub last_rect: Rect,
@@ -2801,6 +2814,7 @@ impl CommandPalette {
             extensions: Vec::new(),
             hidden: Vec::new(),
             hint_overrides: Vec::new(),
+            pinned: Vec::new(),
             selected: 0,
             scroll: 0,
             last_rect: Rect::default(),
@@ -2829,6 +2843,21 @@ impl CommandPalette {
         self.refresh_results();
         self.selected = 0;
         self.scroll = 0;
+    }
+
+    /// Put the user's menu commands first while the query is empty, then
+    /// re-rank. Called by the app when opening the palette.
+    pub fn set_pinned(&mut self, pinned: Vec<Command>) {
+        self.pinned = pinned;
+        self.refresh_results();
+        self.selected = 0;
+        self.scroll = 0;
+    }
+
+    /// Whether `item` is shown in the pinned block at the top of the list.
+    pub fn is_pinned(&self, item: &PaletteItem) -> bool {
+        self.query.trim().is_empty()
+            && matches!(item, PaletteItem::Builtin(c) if self.pinned.contains(c) && !self.hidden.contains(c))
     }
 
     /// Leave `hidden` out of the list (see [`CommandPalette::hidden`]),
@@ -2957,7 +2986,15 @@ impl CommandPalette {
             .collect();
         let needle = self.query.trim().to_lowercase();
         if needle.is_empty() {
-            self.results = all;
+            let (mut first, rest): (Vec<PaletteItem>, Vec<PaletteItem>) = all
+                .into_iter()
+                .partition(|i| matches!(i, PaletteItem::Builtin(c) if self.pinned.contains(c)));
+            first.sort_by_key(|i| match i {
+                PaletteItem::Builtin(c) => self.pinned.iter().position(|p| p == c),
+                PaletteItem::Extension(_) => None,
+            });
+            first.extend(rest);
+            self.results = first;
             return;
         }
         let mut scored: Vec<(i32, usize, PaletteItem)> = all
@@ -3151,7 +3188,13 @@ pub fn render_command_palette(
         } else {
             Style::default().fg(theme.ui(Color::Rgb(0x8e, 0x95, 0xa4)))
         };
-        let prefix = if is_selected { "> " } else { "  " };
+        let prefix = if is_selected {
+            "> "
+        } else if palette.is_pinned(cmd) {
+            "\u{2605} "
+        } else {
+            "  "
+        };
         let title = crate::i18n::tr(cmd.title());
         // Borrowed as written unless the platform respells it.
         let hint_spans: Vec<Span<'static>> = vec![Span::styled(palette.hint_for(cmd), hint_style)];
@@ -3260,7 +3303,9 @@ fn render_palette_card(
             t,
             Row {
                 selected,
-                glyph: None,
+                glyph: palette
+                    .is_pinned(cmd)
+                    .then(|| Span::styled("\u{2605}", Style::default().fg(t.muted()))),
                 label,
                 trail,
             },
