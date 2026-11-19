@@ -3,9 +3,11 @@ use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod git_editor;
 mod typos;
 mod version;
 mod workspace;
+use git_editor::*;
 pub use typos::misspelled_subcommand;
 use version::*;
 use workspace::*;
@@ -1077,45 +1079,6 @@ impl Cli {
             }
         }
     }
-}
-
-/// The user's own `sequence.editor` for the repository git is running in,
-/// if they set one (#620).
-fn configured_sequence_editor() -> Option<String> {
-    let out = std::process::Command::new("git")
-        .args(["config", "--get", "sequence.editor"])
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (out.status.success() && !value.is_empty()).then_some(value)
-}
-
-/// The editor git itself would run: `GIT_EDITOR`, `core.editor`, `VISUAL`,
-/// `EDITOR`, then git's built-in default, as `git var GIT_EDITOR` reports.
-/// `None` when git names none (a dumb terminal with no editor set): git
-/// fails there, so no editor is invented. git's own reason reaches stderr.
-fn git_editor() -> Option<String> {
-    std::process::Command::new("git")
-        .args(["var", "GIT_EDITOR"])
-        .stderr(std::process::Stdio::inherit())
-        .output()
-        .ok()
-        .filter(|out| out.status.success())
-        .map(|out| String::from_utf8_lossy(&out.stdout).trim().to_string())
-        .filter(|editor| !editor.is_empty())
-}
-
-/// Run the editor value `editor` on `path` exactly as git itself runs one,
-/// and return its exit code.
-fn run_git_editor(editor: &str, path: &std::ffi::OsStr) -> i32 {
-    let status = std::process::Command::new("sh")
-        .arg("-c")
-        .arg(format!("{editor} \"$@\""))
-        .arg(editor)
-        .arg(path)
-        .status();
-    status.ok().and_then(|s| s.code()).unwrap_or(1)
 }
 
 /// `croft open-link` (#359): check the link, then become the `croft remote`
