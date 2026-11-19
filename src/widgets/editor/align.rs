@@ -153,7 +153,10 @@ impl Editor {
                 front: false,
             })
             .collect();
-        let heads: Vec<(usize, usize)> = all.iter().map(|s| s.head).collect();
+        let heads: Vec<((usize, usize), bool)> = all
+            .iter()
+            .map(|s| (s.head, s.head == s.normalised().0))
+            .collect();
         let applied = !pads.is_empty();
         self.apply_alignment(&pads, &heads);
         applied
@@ -277,7 +280,11 @@ impl Editor {
         if pads.is_empty() {
             return false;
         }
-        let heads: Vec<(usize, usize)> = self.caret_selections().iter().map(|s| s.head).collect();
+        let heads: Vec<((usize, usize), bool)> = self
+            .caret_selections()
+            .iter()
+            .map(|s| (s.head, s.head == s.normalised().0))
+            .collect();
         self.apply_alignment(&pads, &heads);
         true
     }
@@ -291,11 +298,13 @@ impl Editor {
     /// a place pinned from the line end before the edits still names the spot
     /// of the caret afterwards. Padding right of it on the same line is the
     /// exception — the line grows without the caret moving — so the pin counts
-    /// those chars in. A pad exactly at a caret is the end padding of that
-    /// selection and feeds it forward; the front padding of the next block can
-    /// share that address, and an end caret has to stay in front of it, so the
-    /// pin counts front pads at the caret in too.
-    fn apply_alignment(&mut self, pads: &[Pad], heads: &[(usize, usize)]) {
+    /// those chars in. A pad exactly at a caret is that selection's own end
+    /// padding and feeds it forward; a front pad there belongs to the next
+    /// block, and an end caret has to stay in front of it, so the pin counts it
+    /// in — unless the caret is the start of its own selection (a bare caret
+    /// or one drawn backwards), where that front pad is its own and carries the
+    /// caret along.
+    fn apply_alignment(&mut self, pads: &[Pad], heads: &[((usize, usize), bool)]) {
         if pads.is_empty() || self.lines.is_empty() {
             return;
         }
@@ -306,10 +315,12 @@ impl Editor {
         let pins: Vec<(bool, (usize, usize))> = heads
             .iter()
             .enumerate()
-            .map(|(i, &(row, col))| {
+            .map(|(i, &((row, col), at_start))| {
                 let right: usize = pads
                     .iter()
-                    .filter(|p| p.row == row && (p.col > col || (p.col == col && p.front)))
+                    .filter(|p| {
+                        p.row == row && (p.col > col || (p.col == col && p.front && !at_start))
+                    })
                     .map(|p| p.text.chars().count())
                     .sum();
                 let (from_bottom, from_end) = self.pin_from_end((row, col));

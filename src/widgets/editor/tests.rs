@@ -22562,6 +22562,21 @@ fn align_cursors_keeps_an_end_caret_before_the_next_columns_padding() {
     );
 }
 
+/// A bare caret has no selection end of its own, so front padding inserted
+/// exactly at it is its own and has to carry it into the column instead of
+/// being left behind.
+#[test]
+fn align_cursors_carries_a_bare_caret_into_the_column() {
+    let mut e = with_carets(&["ab", "abcd"], &[((0, 1), (0, 1)), ((1, 4), (1, 4))]);
+    e.align_cursors();
+    assert_eq!(e.lines[0], "a   b", "three cells of front padding");
+    assert_eq!(
+        e.caret_places(),
+        [(0, 4), (1, 4)],
+        "both bare carets end up in column 4"
+    );
+}
+
 /// Tabs cannot stop short of a stop, so the end they are padded to is the
 /// next stop at or after the longest selection: both selections end in the
 /// same cell instead of one running past the other.
