@@ -19,6 +19,7 @@ pub use crate::sheet::SheetCellEdit;
 pub use crate::text_edit::TextSpanEdit;
 use crate::widgets::scrollbar;
 
+mod align;
 mod brackets;
 mod comments;
 mod diff_view;

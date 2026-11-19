@@ -22357,3 +22357,291 @@ fn the_toggle_disables_every_pair_behavior() {
     e.backspace();
     assert_eq!(e.lines[0], ")", "off means plain backspace");
 }
+
+// ---- Align Cursors (Alt+A, Alt+F, Ctrl+Alt+A, Ctrl+Alt+Shift+A) ----
+
+/// An editor over `lines` with a selection at each `(anchor, head)` pair, the
+/// first of them the primary.
+fn with_carets(lines: &[&str], sels: &[((usize, usize), (usize, usize))]) -> Editor {
+    let mut e = editor_with(&lines.join("\n"));
+    let all: Vec<EditorSelection> = sels
+        .iter()
+        .map(|&(anchor, head)| EditorSelection { anchor, head })
+        .collect();
+    e.set_selections(&all);
+    e
+}
+
+/// Three selections over one another — starts at 3, 5 and 9, lengths 2, 4 and
+/// 1 — are one column, and every start comes out in column 9 with every
+/// selection four long.
+#[test]
+fn align_cursors_pads_every_selection_into_one_column() {
+    let mut e = with_carets(
+        &["abcdefghijklm", "abcdefghijklm", "abcdefghijklm"],
+        &[((0, 3), (0, 5)), ((1, 5), (1, 9)), ((2, 9), (2, 10))],
+    );
+    e.align_cursors();
+    assert_eq!(e.lines[0], "abc      de  fghijklm", "6 in front, 2 behind");
+    assert_eq!(e.lines[1], "abcde    fghijklm", "4 in front, none behind");
+    assert_eq!(e.lines[2], "abcdefghij   klm", "nothing in front, 3 behind");
+    for row in 0..3 {
+        let aligned: String = e.lines[row].chars().skip(9).take(4).collect();
+        assert_eq!(
+            aligned.trim_end(),
+            ["de", "fghi", "j"][row],
+            "selection {row} starts in column 9"
+        );
+        assert_eq!(aligned.chars().count(), 4, "and is as long as the longest");
+    }
+    // The carets end up at the end of their padded selections, crouched on
+    // the same column, with multi-cursor still on.
+    let heads: Vec<(usize, usize)> = e.caret_places();
+    assert_eq!(heads, [(0, 13), (1, 13), (2, 13)]);
+    assert_eq!(e.caret_selections().len(), 3);
+}
+
+#[test]
+fn align_cursors_pad_front_right_aligns_the_text() {
+    let mut e = with_carets(
+        &["abcdefghijklm", "abcdefghijklm", "abcdefghijklm"],
+        &[((0, 3), (0, 5)), ((1, 5), (1, 9)), ((2, 9), (2, 10))],
+    );
+    e.align_cursors_pad_front();
+    assert_eq!(e.lines[0], "abc        defghijklm");
+    assert_eq!(e.lines[1], "abcde    fghijklm");
+    assert_eq!(e.lines[2], "abcdefghi   jklm");
+    for (row, text) in ["de", "fghi", "j"].iter().enumerate() {
+        let line: Vec<char> = e.lines[row].chars().collect();
+        let end = 13;
+        let start = end - text.chars().count();
+        let selected: String = line[start..end].iter().collect();
+        assert_eq!(&selected, text, "the text ends in column 13 on row {row}");
+    }
+}
+
+#[test]
+fn align_cursors_using_tabs_snaps_to_tab_stops() {
+    let mut e = with_carets(
+        &["abcdefghijklm", "abcdefghijklm", "abcdefghijklm"],
+        &[((0, 3), (0, 5)), ((1, 5), (1, 9)), ((2, 9), (2, 10))],
+    );
+    e.align_cursors_using_tabs(4);
+    // Starts at 3, 5 and 9 all move to the 12 stop (a tab cannot stand still,
+    // so the right-most start goes up to the next stop and the others follow
+    // it), then end padding takes each selection to 16, a selection already
+    // four wide included — it needs none.
+    assert_eq!(e.lines[0], "abc\t\t\tde\tfghijklm");
+    assert_eq!(e.lines[1], "abcde\t\tfghijklm");
+    assert_eq!(e.lines[2], "abcdefghi\tj\tklm");
+    for (row, prefix, tabs) in [(0, "abc", 3), (1, "abcde", 2), (2, "abcdefghi", 1)] {
+        assert!(
+            e.lines[row].starts_with(&format!("{prefix}{}", "\t".repeat(tabs))),
+            "row {row} snaps its start onto a stop: {:?}",
+            e.lines[row]
+        );
+    }
+}
+
+/// A tab already in the line moves the selection on screen, so columns are
+/// counted in cells, not characters: the two `foo`s below start at cells 4
+/// and 5 and only one space is needed.
+#[test]
+fn align_cursors_measures_existing_tabs_in_columns() {
+    let mut e = with_carets(&["\tfoo", "\t foo"], &[((0, 1), (0, 4)), ((1, 2), (1, 5))]);
+    e.align_cursors();
+    assert_eq!(e.lines[0], "\t foo", "one column of padding, not two");
+    assert_eq!(e.lines[1], "\t foo");
+    for row in 0..2 {
+        let line: Vec<char> = e.lines[row].chars().collect();
+        assert_eq!(line[2..5].iter().collect::<String>(), "foo");
+    }
+}
+
+/// A wide character is two cells on screen, so it moves the column after it:
+/// the two `x`s below start at cells 2 and 1, and one space lines them up.
+#[test]
+fn align_cursors_measures_wide_characters_in_cells() {
+    let mut e = with_carets(&["界x", "ax"], &[((0, 1), (0, 2)), ((1, 1), (1, 2))]);
+    e.align_cursors();
+    assert_eq!(e.lines[0], "界x");
+    assert_eq!(e.lines[1], "a x", "one cell, because 界 takes two");
+}
+
+/// A line indented with a tab cannot be pushed right by a space in front of
+/// that tab — the tab jumps to the same stop — so the padding goes in after
+/// the indentation.
+#[test]
+fn align_line_last_cursors_moves_a_tab_indented_line() {
+    let mut e = with_carets(&["\tx", "\txy"], &[((0, 2), (0, 2)), ((1, 3), (1, 3))]);
+    e.align_line_last_cursors();
+    assert_eq!(e.lines[0], "\t x", "the space sits after the tab");
+    assert_eq!(e.lines[1], "\txy");
+    for row in 0..2 {
+        let cells = e.lines[row]
+            .chars()
+            .fold(0, |col, c| col + if c == '\t' { 4 - col % 4 } else { 1 });
+        assert_eq!(cells, 6, "row {row} ends in the same cell");
+    }
+}
+
+/// Two groups on one row: the second is aligned against where its selections
+/// stand after the first group's padding, not against the original columns.
+#[test]
+fn align_cursors_counts_a_later_groups_earlier_padding() {
+    let mut e = with_carets(
+        &["a----b", "abc--d"],
+        &[
+            ((0, 0), (0, 1)),
+            ((0, 5), (0, 6)),
+            ((1, 0), (1, 3)),
+            ((1, 5), (1, 6)),
+        ],
+    );
+    e.align_cursors();
+    assert_eq!(e.lines[0], "a  ----b");
+    assert_eq!(e.lines[1], "abc--  d");
+}
+
+/// Tabs cannot stop short of a stop, so the end they are padded to is the
+/// next stop at or after the longest selection: both selections end in the
+/// same cell instead of one running past the other.
+#[test]
+fn align_cursors_using_tabs_ends_every_selection_on_the_same_stop() {
+    let mut e = with_carets(&["abcdef", "abcdef"], &[((0, 1), (0, 3)), ((1, 2), (1, 3))]);
+    e.align_cursors_using_tabs(4);
+    assert_eq!(e.lines[0], "a\tbc\tdef");
+    assert_eq!(e.lines[1], "ab\tc\tdef");
+    for (row, want) in [(0usize, 8usize), (1, 8)] {
+        let mut cell = 0;
+        for c in e.lines[row].chars() {
+            if cell >= want {
+                break;
+            }
+            cell += if c == '\t' { 4 - cell % 4 } else { 1 };
+        }
+        assert!(cell >= want, "row {row} reaches cell {want}");
+    }
+}
+
+#[test]
+fn align_cursors_using_tabs_follows_the_buffers_own_tab_width() {
+    // The same carets on an 8-wide grid reach the next stop instead: 3, 5 and
+    // 9 all land on 16, and the end padding on 24.
+    let mut e = with_carets(
+        &["abcdefghijklm", "abcdefghijklm", "abcdefghijklm"],
+        &[((0, 3), (0, 5)), ((1, 5), (1, 9)), ((2, 9), (2, 10))],
+    );
+    e.align_cursors_using_tabs(8);
+    // Starts 3, 5 and 9 all move to the 16 stop; every end then reaches the
+    // 24 stop, the one at or after the longest selection, so the ends line up
+    // on a stop too.
+    assert_eq!(e.lines[0], "abc\t\tde\tfghijklm");
+    assert_eq!(e.lines[1], "abcde\t\tfghi\tjklm");
+    assert_eq!(e.lines[2], "abcdefghi\tj\tklm");
+}
+
+#[test]
+fn align_line_last_cursors_lines_up_the_line_ends() {
+    let mut e = with_carets(
+        &["abcdefg", "abcdefghi", "abc"],
+        &[((0, 3), (0, 5)), ((1, 0), (1, 9)), ((2, 0), (2, 2))],
+    );
+    e.align_line_last_cursors();
+    assert_eq!(e.lines[0], "    abcdefg", "5 out of 9: 4 spaces in front");
+    assert_eq!(e.lines[1], "abcdefghi", "already the right-most");
+    // The end that lines up is the selection's, not the line's: row 2's
+    // selection stops at column 2, so it moves 7 columns, not 6.
+    assert_eq!(e.lines[2], "       abc", "2 out of 9: 7 spaces in front");
+}
+
+#[test]
+fn align_cursors_leaves_already_aligned_selections_alone() {
+    let lines = ["ab   cd", "ef   gh"];
+    let mut e = with_carets(&lines, &[((0, 5), (0, 7)), ((1, 5), (1, 7))]);
+    let steps = e.undo_history_size().0;
+    e.align_cursors();
+    assert_eq!(e.lines, lines);
+    assert_eq!(
+        e.undo_history_size().0,
+        steps,
+        "nothing to pad, no undo step"
+    );
+}
+
+#[test]
+fn every_align_command_is_a_noop_with_fewer_than_two_carets() {
+    let mut e = editor_with("abcdef\nghijkl");
+    e.selection = Some(EditorSelection {
+        anchor: (0, 2),
+        head: (0, 4),
+    });
+    e.cursor_row = 0;
+    e.cursor_col = 4;
+    let steps = e.undo_history_size().0;
+    e.align_cursors();
+    e.align_cursors_pad_front();
+    e.align_cursors_using_tabs(4);
+    e.align_line_last_cursors();
+    assert_eq!(e.lines, ["abcdef", "ghijkl"]);
+    assert_eq!(
+        e.undo_history_size().0,
+        steps,
+        "no command adds an undo step"
+    );
+    assert!(e.carets.is_empty());
+}
+
+#[test]
+fn each_align_command_is_one_undo_step() {
+    let lines = ["abcdefghijklm", "abcdefghijklm", "abcdefghijklm"];
+    for command in 0..4 {
+        let mut e = with_carets(
+            &lines,
+            &[((0, 3), (0, 5)), ((1, 5), (1, 9)), ((2, 9), (2, 10))],
+        );
+        let steps = e.undo_history_size().0;
+        let applied = match command {
+            0 => e.align_cursors(),
+            1 => e.align_cursors_pad_front(),
+            2 => e.align_cursors_using_tabs(4),
+            _ => e.align_line_last_cursors(),
+        };
+        assert!(applied, "command {command} had something to align");
+        assert_eq!(
+            e.undo_history_size().0,
+            steps + 1,
+            "command {command} is one step"
+        );
+        assert!(e.undo());
+        assert_eq!(e.lines, lines, "command {command} undoes in one press");
+    }
+}
+
+/// Grouping follows the columns on screen, not the char indices: once a tab
+/// has pushed a line right, `xx` at cells 4..6 and `yy` at 5..6 are one
+/// column even though their char starts are 1 and 5. Measured in chars they
+/// look like two groups, and the command would pad neither.
+#[test]
+fn align_cursors_groups_selections_by_display_cells() {
+    let mut e = with_carets(&["\txx!", "abcdey?"], &[((0, 1), (0, 3)), ((1, 5), (1, 6))]);
+    e.align_cursors();
+    assert_eq!(
+        e.lines[0], "\t xx!",
+        "one space past the tab, to reach cell 5"
+    );
+    assert_eq!(e.lines[1], "abcdey ?", "none in front, one behind");
+    // Both carets end in one cell on screen, the tab in front counted.
+    let places = e.caret_places();
+    let cell = |&(row, col): &(usize, usize)| {
+        e.lines[row]
+            .chars()
+            .take(col)
+            .fold(0, |c, ch| c + if ch == '\t' { 4 - c % 4 } else { 1 })
+    };
+    assert_eq!(
+        cell(&places[0]),
+        cell(&places[1]),
+        "both selections end in one column"
+    );
+}

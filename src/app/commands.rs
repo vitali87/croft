@@ -932,6 +932,26 @@ impl App {
     /// editor buffer; view / navigation commands defer to the same methods
     /// their dedicated chords use, so the palette can never drift from the
     /// keyboard surface.
+    /// Run one Cursor Align command and say in the status bar what it did. A
+    /// command that quietly does nothing reads as a broken shortcut, and the
+    /// two commonest answers are worth naming: it needs more than one caret,
+    /// or every caret is already in its column.
+    fn report_align(
+        &mut self,
+        name: &str,
+        align: impl FnOnce(&mut crate::widgets::editor::Editor) -> bool,
+    ) {
+        if !self.editor.has_multi_cursor() {
+            self.status = format!("{name} needs more than one caret");
+            return;
+        }
+        if align(&mut self.editor) {
+            self.status = String::from("Aligned every caret");
+        } else {
+            self.status = format!("{name}: nothing to align");
+        }
+    }
+
     pub(crate) fn run_command(&mut self, cmd: crate::widgets::command_palette::Command) {
         use crate::widgets::command_palette::Command as Cmd;
         use crate::widgets::editor::CaseTransform;
@@ -1021,6 +1041,36 @@ impl App {
                 };
             }
             Cmd::ToggleMultiCursorPersist => self.toggle_multi_cursor_persist(),
+            // Cursor Align pads the carets' selections into columns. The tab
+            // variant reads the buffer's own indent width: a tab stop is not
+            // always four columns, and the padding has to land on the same
+            // stops the buffer's own tabs do.
+            // A preview's placeholder lines are not the file: aligning them
+            // would edit text no save can write, exactly as the line commands
+            // above refuse to. The chord path checks this too; the palette
+            // runs the command directly.
+            Cmd::AlignCursors
+            | Cmd::AlignCursorsPadFront
+            | Cmd::AlignCursorsUsingTabs
+            | Cmd::AlignLineLastCursors
+                if self.editor.has_non_text_view() =>
+            {
+                self.status = format!("{} needs a text file", cmd.title());
+            }
+            // Both say what happened: a command that quietly did nothing
+            // reads as a broken shortcut, and the commonest real answer is
+            // "one caret" or "already in one column".
+            Cmd::AlignCursors => self.report_align(cmd.title(), |e| e.align_cursors()),
+            Cmd::AlignCursorsPadFront => {
+                self.report_align(cmd.title(), |e| e.align_cursors_pad_front())
+            }
+            Cmd::AlignCursorsUsingTabs => {
+                let width = self.editor.indent_style().width as usize;
+                self.report_align(cmd.title(), |e| e.align_cursors_using_tabs(width))
+            }
+            Cmd::AlignLineLastCursors => {
+                self.report_align(cmd.title(), |e| e.align_line_last_cursors())
+            }
             Cmd::AddCursorAbove => self.editor.add_cursor_above(),
             Cmd::AddCursorBelow => self.editor.add_cursor_below(),
             Cmd::ColumnSelectUp => self.editor.column_select(-1, 0),

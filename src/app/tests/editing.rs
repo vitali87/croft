@@ -1650,6 +1650,95 @@ fn multi_cursor_enter_keeps_every_carets_indentation() {
     );
 }
 
+/// The user's own sequence: carets added from the palette, `End` to put each
+/// one at its line end, two characters selected leftwards, then Align Cursors
+/// from the palette. Every selection must start in the same column.
+#[test]
+fn aligning_after_end_and_two_chars_moves_every_selection_into_one_column() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "t.txt", "aaa\nbbbbb\ncc\ndddddd");
+    app.apply_merged_settings(&crate::prefs::Prefs {
+        multi_cursor_persist: true,
+        ..Default::default()
+    });
+    (app.editor.cursor_row, app.editor.cursor_col) = (0, 0);
+    app.run_command(Command::AddCursorBelow);
+    app.run_command(Command::AddCursorBelow);
+    app.handle_key(key(KeyCode::End, KeyModifiers::NONE))
+        .unwrap();
+    for _ in 0..2 {
+        app.handle_key(key(KeyCode::Left, KeyModifiers::SHIFT))
+            .unwrap();
+    }
+    app.run_command(Command::AlignCursors);
+    assert_eq!(
+        app.editor.lines,
+        ["a  aa", "bbbbb", "   cc", "dddddd"],
+        "every selection starts in column 3"
+    );
+}
+
+/// A command that does nothing must say so: silence reads as a broken
+/// shortcut, which is exactly how it was reported to us.
+#[test]
+fn align_cursors_says_in_the_status_bar_what_it_did() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "t.txt", "aaa\nbbbbb\ncc");
+    app.run_command(Command::AlignCursors);
+    assert_eq!(app.status, "Align Cursors needs more than one caret");
+
+    (app.editor.cursor_row, app.editor.cursor_col) = (0, 3);
+    app.editor.carets = vec![crate::widgets::editor::EditorSelection::new(1, 3)];
+    app.run_command(Command::AlignCursors);
+    assert_eq!(
+        app.status, "Align Cursors: nothing to align",
+        "two carets in one column have nothing to do"
+    );
+
+    app.editor.carets = vec![crate::widgets::editor::EditorSelection::new(1, 5)];
+    app.run_command(Command::AlignCursors);
+    assert_eq!(
+        app.status, "Aligned every caret",
+        "lines now: {:?}",
+        app.editor.lines
+    );
+}
+
+/// The palette runs the same command as the chord, so "Align Cursors" from
+/// the palette pads every caret exactly as `Alt+A` does.
+#[test]
+fn aligning_cursors_from_the_command_palette_pads_every_caret() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "m.py", "abc\ndefgh\nij");
+    // The primary caret carries the first selection; the other two ride in
+    // `carets`, as every multi-caret edit sees them.
+    (app.editor.cursor_row, app.editor.cursor_col) = (0, 3);
+    app.editor.selection = Some(crate::widgets::editor::EditorSelection {
+        anchor: (0, 1),
+        head: (0, 3),
+    });
+    app.editor.carets = vec![
+        crate::widgets::editor::EditorSelection {
+            anchor: (1, 3),
+            head: (1, 5),
+        },
+        crate::widgets::editor::EditorSelection {
+            anchor: (2, 0),
+            head: (2, 1),
+        },
+    ];
+    app.run_command(crate::widgets::command_palette::Command::AlignCursors);
+    // Starts 1, 3 and 0 with lengths 2, 2 and 1: every start moves to column
+    // 3 and every selection is padded to the longest, two.
+    assert_eq!(app.editor.lines, ["a  bc", "defgh", "   i j"]);
+    assert!(
+        app.editor.has_multi_cursor(),
+        "aligning leaves every caret in place"
+    );
+}
+
 /// Negative: with the pref off, the first movement still drops every extra
 /// caret and falls through to single-caret handling, as it always has.
 #[test]

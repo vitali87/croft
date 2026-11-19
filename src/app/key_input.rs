@@ -1919,6 +1919,66 @@ pub(super) fn is_toggle_wrap_key(key: KeyEvent) -> bool {
         && !key.modifiers.contains(KeyModifiers::CONTROL)
 }
 
+/// The Cursor Align chords, one predicate each so the F1 cheat sheet and the
+/// key ledger can name the handler that answers each chord: `Alt+A` aligns
+/// every caret's selection into one column, `Alt+F` pads the front only
+/// (right-aligning the text), `Ctrl+Alt+A` pads with tabs, and
+/// `Ctrl+Alt+Shift+A` pads whole lines so the right-most selection end of
+/// each lines up. `Shift+Alt+A` is Toggle Block Comment and is never matched
+/// here, and no Super chord is.
+fn is_align_chord(key: KeyEvent, letter: char, ctrl: bool, shift: bool) -> bool {
+    let KeyCode::Char(c) = key.code else {
+        return false;
+    };
+    if !c.eq_ignore_ascii_case(&letter) {
+        return false;
+    }
+    key.modifiers.contains(KeyModifiers::ALT)
+        && key.modifiers.contains(KeyModifiers::CONTROL) == ctrl
+        && key.modifiers.contains(KeyModifiers::SHIFT) == shift
+        && !key.modifiers.contains(KeyModifiers::SUPER)
+}
+
+/// `Alt+A`: Align Cursors.
+pub(super) fn is_align_cursors_key(key: KeyEvent) -> bool {
+    is_align_chord(key, 'a', false, false)
+}
+
+/// `Alt+F`: Align Cursors (Pad Front). Not `Alt+Shift+A`, which is Toggle
+/// Block Comment.
+pub(super) fn is_align_cursors_pad_front_key(key: KeyEvent) -> bool {
+    is_align_chord(key, 'f', false, false)
+}
+
+/// `Ctrl+Alt+A`: Align Cursors Using Tabs.
+pub(super) fn is_align_cursors_using_tabs_key(key: KeyEvent) -> bool {
+    is_align_chord(key, 'a', true, false)
+}
+
+/// `Ctrl+Alt+Shift+A`: Align Line Last Cursors.
+pub(super) fn is_align_line_last_cursors_key(key: KeyEvent) -> bool {
+    is_align_chord(key, 'a', true, true)
+}
+
+/// The Cursor Align command `key` asks for, if it is one of the four: returned
+/// as the palette [`Command`](crate::widgets::command_palette::Command) so the
+/// chord and the palette run the same code, which matters on terminals that
+/// never deliver an Alt+letter chord.
+pub(super) fn align_command_for(key: KeyEvent) -> Option<crate::widgets::command_palette::Command> {
+    use crate::widgets::command_palette::Command;
+    if is_align_cursors_key(key) {
+        Some(Command::AlignCursors)
+    } else if is_align_cursors_pad_front_key(key) {
+        Some(Command::AlignCursorsPadFront)
+    } else if is_align_cursors_using_tabs_key(key) {
+        Some(Command::AlignCursorsUsingTabs)
+    } else if is_align_line_last_cursors_key(key) {
+        Some(Command::AlignLineLastCursors)
+    } else {
+        None
+    }
+}
+
 /// Explorer-pane shortcut: `Cmd+Z` / `Ctrl+Z` — open the zoxide jump popup.
 /// `z` for **z**oxide; the user's shell still uses `j` for the same jump.
 /// `Ctrl+Z` counts on every platform, as the Make Root chords do (#1294):

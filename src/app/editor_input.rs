@@ -503,6 +503,16 @@ impl App {
             }
             return;
         }
+        // Cursor Align (Alt+A / Alt+F / Ctrl+Alt+A / Ctrl+Alt+Shift+A) pads
+        // every caret's selection into one column. It needs a real text
+        // buffer, so a diff, sheet or image tab swallows the chord untouched,
+        // as the comment and wrap chords above do.
+        if let Some(cmd) = align_command_for(key) {
+            if self.editor_is_text() {
+                self.run_command(cmd);
+            }
+            return;
+        }
         // Alt+O: C/C++: Switch Header/Source (#1360), as VS Code's clangd
         // extension binds it. Other files keep the chord.
         if is_switch_header_source_key(key)
