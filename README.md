@@ -1,8 +1,5 @@
 <div align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/images/logo-dark.png">
-    <img src="docs/images/logo-light.png" alt="croft" width="180">
-  </picture>
+  <img src="docs/images/logo.png" alt="croft" width="180">
 </div>
 
 # croft
