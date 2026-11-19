@@ -25,6 +25,7 @@ src/
 │   ├── links.rs          `croft open-link` and `croft install-link-handler`: following a link into a session, and handling the links
 │   ├── pair_provider.rs  `croft pair`'s provider flags: `--base-url` alone means ollama, which defaults to its local port
 │   ├── plot.rs           `croft plot`: a chart of stdin, as an inline image or as text, in the theme's colours
+│   ├── terminal_setup.rs `croft setup-terminal`, `setup-iterm2` and `setup-ghostty`: setting up macOS terminals for croft
 │   ├── tests.rs          the command line's own tests
 │   ├── typos.rs          a misspelled subcommand clap took as a folder, turned into an error that names the one meant
 │   ├── version.rs        the plain version `--version` prints, and the provenance line `--build-info` prints
