@@ -81,7 +81,7 @@ sudo mv "croft-$arch-$os/croft" /usr/local/bin/
 
 ## Building from source
 
-Building needs Rust and a C compiler; see [Install Rust](#install-rust) below.
+Building needs Rust 1.93+ stable (edition 2024) and a C compiler, because the tree-sitter grammars compile C; see [Install Rust](#install-rust) below.
 
 ```bash
 cargo install croft-software --locked
