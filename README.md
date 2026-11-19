@@ -21,7 +21,7 @@ The non-negotiables behind every decision in croft:
 
 ## Layout
 
-![croft: Explorer, a Rust file with highlighting and inline blame, Go to File, and cargo run in the terminal](docs/images/overview.gif)
+https://github.com/user-attachments/assets/ed14f363-573f-4cff-ad32-7debd038035a
 
 Three panes in the VS Code arrangement: an **Explorer sidebar** on the left, a **code editor** top right, and a **panel** bottom right with PROBLEMS, OUTPUT, TERMINAL, CAPTURES, and PORTS tabs. An activity bar down the far left switches the sidebar between Explorer, Search, Source Control, Remote (SSH), Run and Debug, Extensions, and Testing, and holds the theme picker. Every seam drags to resize, and a **Customize Layout** popup mirrors VS Code's title-bar controls.
 

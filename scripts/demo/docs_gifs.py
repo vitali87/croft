@@ -189,24 +189,6 @@ def open_file(d: Demo, query: str, shown: bool = True) -> None:
         time.sleep(1.0)
 
 
-def overview(binary: str, gif: Path) -> None:
-    """Explorer, a Rust file with highlighting and inline blame, Go to File, cargo run."""
-    with wordcount(binary) as d:
-        d.start()
-        d.snap(1800)
-        open_file(d, "main")
-        d.snap(3000)
-        open_file(d, "tally")
-        d.snap(2200)
-        run_command(d, "focus terminal", shown=False)
-        d.snap(300)
-        d.type("cargo run -q", per_char_ms=70, hold_ms=500)
-        d.key("Enter")
-        time.sleep(6)
-        d.snap(4000)
-        d.save(gif)
-
-
 def search(binary: str, gif: Path) -> None:
     """Find TODO across the workspace and open a hit at its line."""
     with wordcount(binary) as d:
@@ -378,7 +360,6 @@ def settings_editor_scene(binary: str, gif: Path) -> None:
 
 
 SCENES = {
-    "overview": overview,
     "search": search,
     "command-palette": command_palette,
     "customize-layout": customize_layout,
