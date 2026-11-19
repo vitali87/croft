@@ -66,9 +66,9 @@ struct Column {
 }
 
 /// Display cells a run of text takes, starting at `start_col`: a tab jumps to
-/// the next stop of `width`, and every other character counts one — the
-/// extension's own rule, which counts code points and ignores grapheme clusters
-/// because the rendered width cannot be known.
+/// the next stop of `width`, and every other character takes the cells the
+/// renderer gives it, so `界` counts two and a combining mark none — the
+/// extension could only count code points, but here the widths are known.
 fn text_cols(text: &str, start_col: usize, width: usize) -> usize {
     let width = width.max(1);
     let mut cols = 0;
@@ -76,7 +76,7 @@ fn text_cols(text: &str, start_col: usize, width: usize) -> usize {
         cols += if c == '\t' {
             width - (start_col + cols) % width
         } else {
-            1
+            unicode_width::UnicodeWidthChar::width(c).unwrap_or(0)
         };
     }
     cols

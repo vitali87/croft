@@ -22458,14 +22458,32 @@ fn align_cursors_measures_existing_tabs_in_columns() {
     }
 }
 
-/// The extension counts every code point as one cell, wide glyphs included,
-/// because the rendered width cannot be known from the buffer. A tab is the
-/// only character that spans more than one, so these two `x`s need no padding.
+/// Wide glyphs take the cells the renderer gives them, so a `界` before a
+/// selection moves it one cell further than its code-point count suggests.
+/// These two `foo`s already start in the same column, so nothing is padded —
+/// counting code points would push the first line a cell out of line.
 #[test]
-fn align_cursors_counts_every_code_point_as_one_cell() {
-    let mut e = with_carets(&["界x", "ax"], &[((0, 1), (0, 2)), ((1, 1), (1, 2))]);
+fn align_cursors_measures_wide_glyphs_in_cells() {
+    let mut e = with_carets(
+        &["界  foo", "ab  foo"],
+        &[((0, 3), (0, 6)), ((1, 4), (1, 7))],
+    );
     e.align_cursors();
-    assert_eq!(e.lines, ["界x", "ax"], "identical columns, nothing to do");
+    assert_eq!(
+        e.lines,
+        ["界  foo", "ab  foo"],
+        "same column already, nothing to pad"
+    );
+    let cell = |row: usize, col: usize| {
+        let prefix: String = e.lines[row].chars().take(col).collect();
+        unicode_width::UnicodeWidthStr::width(prefix.as_str())
+    };
+    let places = e.caret_places();
+    assert_eq!(
+        cell(places[0].0, places[0].1),
+        cell(places[1].0, places[1].1),
+        "both selections end in one screen column"
+    );
 }
 
 /// Align Line Last Cursors inserts at column 0, as the extension does. On a
