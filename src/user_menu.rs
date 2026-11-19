@@ -8,8 +8,9 @@
 //! uses; tasks and shell commands are deliberately not part of it.
 //!
 //! The file is JSONC like `keybindings.json`. A row is a command, a group of
-//! rows (a submenu) or a divider; a row that does not parse, or names an
-//! unknown command, is skipped and counted, never fatal.
+//! rows (a submenu, one level: the menu opens no submenu inside a submenu) or
+//! a divider; a row that does not parse, names an unknown command or is a
+//! group inside a group, is skipped and counted, never fatal.
 
 use std::path::PathBuf;
 
@@ -90,7 +91,7 @@ impl UserMenu {
                 }
             };
         let mut skipped = 0;
-        let items = parse_rows(rows, &mut skipped);
+        let items = parse_rows(rows, &mut skipped, false);
         Self {
             items,
             skipped,
@@ -124,7 +125,11 @@ impl UserMenu {
     }
 }
 
-fn parse_rows(rows: Vec<serde_json::Value>, skipped: &mut usize) -> Vec<UserMenuItem> {
+fn parse_rows(
+    rows: Vec<serde_json::Value>,
+    skipped: &mut usize,
+    in_group: bool,
+) -> Vec<UserMenuItem> {
     let mut out = Vec::new();
     for value in rows {
         let Ok(row) = serde_json::from_value::<Row>(value) else {
@@ -136,8 +141,12 @@ fn parse_rows(rows: Vec<serde_json::Value>, skipped: &mut usize) -> Vec<UserMenu
             if !matches!(out.last(), None | Some(UserMenuItem::Separator)) {
                 out.push(UserMenuItem::Separator);
             }
+        } else if row.items.is_some() && in_group {
+            // The menu opens one submenu level; a group inside a group would
+            // show but never open, its commands out of reach.
+            *skipped += 1;
         } else if let Some(items) = row.items {
-            let items = parse_rows(items, skipped);
+            let items = parse_rows(items, skipped, true);
             match row.label {
                 Some(label) if !items.is_empty() => out.push(UserMenuItem::Group { label, items }),
                 _ => *skipped += 1,
@@ -169,7 +178,7 @@ pub const TEMPLATE: &str = r##"// croft user menu: the commands you use every da
 //   { "command": "format_document" }                    a command, by its id
 //   { "command": "toggle_bookmark", "label": "Mark" }   ... under your own label
 //   { "command": "fold_all", "pinned": false }          ... kept out of the palette's star block
-//   { "label": "Folding", "items": [ ... ] }            a submenu
+//   { "label": "Folding", "items": [ ... ] }            a submenu (one level)
 //   { "separator": true }                               a divider
 // Command ids are the ones keybindings.json uses (palette: Preferences: Open
 // Keyboard Shortcuts lists them). Save the file; it is read each time the menu
@@ -230,6 +239,22 @@ mod tests {
         assert!(
             matches!(&menu.items[2], UserMenuItem::Group { label, items } if label == "G" && items.len() == 1)
         );
+    }
+
+    #[test]
+    fn a_group_inside_a_group_is_skipped_and_counted() {
+        let menu = UserMenu::from_json(
+            r#"[{"label":"Outer","items":[{"command":"toggle_fold"},
+                  {"label":"Inner","items":[{"command":"fold_all"}]}]},
+                {"command":"fold_all"}]"#,
+        );
+        assert_eq!(menu.skipped, 1, "the inner group, once");
+        assert_eq!(menu.items.len(), 2);
+        assert!(matches!(
+            &menu.items[0],
+            UserMenuItem::Group { items, .. }
+                if items.len() == 1 && matches!(items[0], UserMenuItem::Command { .. })
+        ));
     }
 
     #[test]
