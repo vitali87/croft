@@ -1364,10 +1364,143 @@ SOURCE_CONTROL = Target(
     ),
 )
 
+# The command line's feature files (#2062): (module doc, release-note phrase, docs row).
+CLI_FILES = {
+    "version": (
+        "croft's version: the plain `x.y.z` that `--version` prints, and the provenance\n"
+        "`--build-info` prints (commit and build time, and how the binary was installed when a\n"
+        "package manager owns it).",
+        "CLI version",
+        "the plain version `--version` prints, and the provenance line `--build-info` "
+        "prints",
+    ),
+    "typos": (
+        "A misspelled subcommand: the word clap took as the `PATH` argument when it is a typo of\n"
+        "a subcommand, turned into a usage error that names the subcommand meant, rather than a\n"
+        "folder to open.",
+        "misspelled subcommand",
+        "a misspelled subcommand clap took as a folder, turned into an error that names "
+        "the one meant",
+    ),
+    "workspace": (
+        "The `PATH` and `--open-file` arguments: the workspace root and the file to open, a\n"
+        "`file:line[:col]` location, a `.code-workspace` file's folders, and a file not written\n"
+        "yet.",
+        "launch workspace",
+        "the `PATH` and `--open-file` arguments: the workspace root, the file to open and "
+        "its `file:line[:col]` location",
+    ),
+    "git_editor": (
+        "`croft edit` as git's editor: the user's own `sequence.editor`, the editor git itself\n"
+        "would run, and running it as git does, for when no croft is there to edit in.",
+        "git editor",
+        "`croft edit` as git's editor: the user's own sequence editor, and git's own "
+        "editor when no croft is there",
+    ),
+    "links": (
+        "`croft open-link` and `croft install-link-handler`: checking a link and becoming the\n"
+        "`croft remote` or `croft attach` it describes, and making croft the link's handler.",
+        "link",
+        "`croft open-link` and `croft install-link-handler`: following a link into a "
+        "session, and handling the links",
+    ),
+    "plot": (
+        "`croft plot`: a chart of what arrives on stdin, printed as an inline image where the\n"
+        "terminal shows one and as text otherwise, in the active theme's colours.",
+        "plot command",
+        "`croft plot`: a chart of stdin, as an inline image or as text, in the theme's "
+        "colours",
+    ),
+    "pair_provider": (
+        "`croft pair`'s provider flags as recorded: `--base-url` alone means ollama, and ollama\n"
+        "without an endpoint gets the standard local port.",
+        "pair provider flag",
+        "`croft pair`'s provider flags: `--base-url` alone means ollama, which defaults "
+        "to its local port",
+    ),
+    "hook": (
+        "`croft hook`: Claude Code's `PreToolUse` hook itself, and installing or removing it in\n"
+        "Claude Code's settings.",
+        "agent hook command",
+        "`croft hook`: Claude Code's edit hook itself, and installing or removing it",
+    ),
+    "keys": (
+        "`croft keys`: the diagnostic that prints each key and mouse event as croft receives it,\n"
+        "with its kind and modifiers.",
+        "key diagnostic",
+        "`croft keys`: printing each key and mouse event as croft receives it",
+    ),
+    "terminal_setup": (
+        "`croft setup-terminal`, `setup-iterm2` and `setup-ghostty`: the fonts they set, and\n"
+        "setting up Terminal.app, iTerm2 and Ghostty for croft on macOS.",
+        "terminal setup",
+        "`croft setup-terminal`, `setup-iterm2` and `setup-ghostty`: setting up macOS "
+        "terminals for croft",
+    ),
+    "vscode_import": (
+        "`croft import-vscode`: converting a VS Code profile into croft's config, and the report\n"
+        "of what was adopted, compared, dropped or refused.",
+        "VS Code import",
+        "`croft import-vscode`: converting a VS Code profile, and the report of what came "
+        "across",
+    ),
+    "theme_import": (
+        "`croft theme-import`: converting a VS Code theme, from a file or the marketplace, and\n"
+        "installing it.",
+        "theme import",
+        "`croft theme-import`: converting a VS Code theme from a file or the marketplace, "
+        "and installing it",
+    ),
+    "launcher_install": (
+        "`croft install-launcher`: the macOS Croft.app that opens a folder or a file in croft\n"
+        "inside a new Ghostty window.",
+        "launcher install",
+        "`croft install-launcher`: the macOS Croft.app that opens croft in a new Ghostty "
+        "window",
+    ),
+    "cross": (
+        "`croft setup-cross`: the targets the local cross-build for `croft <host>` builds for, and\n"
+        "installing zig, cargo-zigbuild and those targets.",
+        "cross-build setup",
+        "`croft setup-cross`: the cross-build's targets, and installing zig, "
+        "cargo-zigbuild and the targets",
+    ),
+    "commands": (
+        "Every subcommand and its flags, as clap parses them: `CliCommand`, and `croft hook`'s\n"
+        "actions.",
+        "CLI subcommand",
+        "every subcommand and its flags, as clap parses them",
+    ),
+    "run": (
+        "Running what was parsed: `Cli::run` hands each subcommand to its code, or opens the\n"
+        "workspace; and a closed stdout ends a command that only prints quietly.",
+        "CLI dispatch",
+        "running what was parsed: each subcommand handed to its code, or the workspace "
+        "opened",
+    ),
+}
+
+CLI = Target(
+    "cli", "scripts/split_cli_manifest.tsv", "src/cli.rs", "src/cli", CLI_FILES,
+    Tree(
+        "├── cli.rs ",
+        "├── cli/                 the command line's feature files, beside cli.rs; "
+        "each file's `//!` doc says what it holds",
+        "│   ├── ", 17,
+    ),
+    "cli-",
+    (
+        "The command line's own tests, moved out of cli.rs (#2062).",
+        "the command line's tests",
+        "the command line's own tests",
+    ),
+)
+
 TARGETS = {
     t.name: t
     for t in (
         APP, EDITOR, LSP, TERMINAL, GIT, REMOTE, SEARCH, SESSION_HOST, PAIR, SOURCE_CONTROL,
+        CLI,
     )
 }
 
