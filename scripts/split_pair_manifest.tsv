@@ -1,0 +1,96 @@
+# Stage B of the refactor program (#2062): where each item of src/pair.rs goes.
+# One row per item, in file order. pr 0 means the item stays in pair.rs; the others
+# move to src/pair/<file>.rs in that PR. kind, impl and name are as
+# `scripts/check_pure_move.py list` prints them. Run
+# `scripts/move_items.py --target pair --check` after adding an item to pair.rs.
+# pair.rs keeps the one struct whose private fields nearly every part reads: the pilot's
+# shared state, PairState.
+pr	file	kind	impl	name
+1	fence	const	-	EDIT_MARKER
+1	fence	const	-	NOTE_MARKER
+1	fence	const	-	END_MARKER
+1	fence	enum	-	FenceEvent
+1	fence	enum	-	FenceState
+1	fence	struct	-	FenceMachine
+1	fence	fn	impl FenceMachine	new
+1	fence	fn	impl FenceMachine	push
+1	fence	fn	impl FenceMachine	finish
+1	fence	fn	-	parse_header
+1	fence	fn	-	parse_char_range_header
+1	fence	fn	-	parse_whole_line_header
+1	fence	fn	-	parse_note_header
+2	offsets	fn	-	range_bytes
+2	offsets	fn	-	note_offset
+2	offsets	fn	-	shift_notes
+2	offsets	fn	-	shift_offset
+0		comment	-	// ---------------------------------------------------------
+8	claude_cli	const	-	ALLOWED_TOOLS
+8	claude_cli	const	-	BUILTIN_TOOLS
+8	claude_cli	const	-	SETTING_SOURCES
+10	apply	const	-	LIVE_TIMEOUT
+3	provider	const	-	PAIR_SYSTEM_PROMPT
+3	provider	const	-	LOCAL_MODEL_PROMPT_SUFFIX
+3	provider	enum	-	Provider
+3	provider	fn	impl Provider	from_record
+3	provider	fn	-	system_prompt
+3	provider	struct	-	PairConfig
+10	apply	struct	-	StreamRegion
+4	state	struct	-	StagedTurn
+5	notes	struct	-	Note
+0		struct	-	PairState
+4	state	fn	impl PairState	new
+4	state	fn	impl PairState	doc_lines
+5	notes	fn	impl PairState	notes_in
+4	state	fn	impl PairState	turn_active
+5	notes	fn	impl PairState	clear_all_notes
+5	notes	fn	impl PairState	remove_note
+5	notes	fn	impl PairState	append_to_note
+5	notes	fn	impl PairState	take_note_id
+4	state	fn	impl PairState	begin_turn
+4	state	fn	impl PairState	stage_turn
+4	state	fn	impl PairState	unstage_turn
+6	caret	fn	impl PairState	park_caret
+6	caret	fn	impl PairState	caret_now
+6	caret	fn	impl PairState	my_site_ids
+4	state	fn	impl PairState	last_seen_of
+6	caret	fn	impl PairState	send_parked_caret
+6	caret	fn	impl PairState	resolve_pending_caret
+4	state	fn	-	lock_briefly
+7	voice	fn	-	diag
+7	voice	fn	-	say
+10	apply	fn	-	wait_live
+11	turns	enum	-	TurnSink
+11	turns	fn	impl TurnSink	send_user
+9	seat	struct	-	ChildGuard
+9	seat	fn	impl Drop for ChildGuard	drop
+9	seat	struct	-	TurnEnd
+8	claude_cli	fn	-	claude_search_dirs
+8	claude_cli	fn	-	resolve_claude_in
+8	claude_cli	fn	-	claude_program
+8	claude_cli	fn	-	claude_command
+12	repl	fn	-	run
+9	seat	fn	-	connect_session
+9	seat	struct	-	Pilot
+9	seat	enum	-	Transport
+9	seat	fn	impl Pilot	reader_finished
+9	seat	fn	impl Pilot	shutdown
+9	seat	fn	-	seat_pilot
+9	seat	fn	-	seat_local
+12	repl	fn	-	run_pilot
+8	claude_cli	fn	-	handle_claude_event
+10	apply	fn	-	apply_fence_event
+10	apply	fn	-	open_region
+10	apply	fn	-	revert_region
+10	apply	fn	-	pump_session
+11	turns	fn	-	parse_task_line
+11	turns	fn	-	compose_turn_text
+11	turns	fn	-	numbered
+11	turns	fn	-	compose_ask_turn
+11	turns	fn	-	compose_yield_turn
+11	turns	fn	-	compose_reply_turn
+5	notes	fn	-	inject_note
+5	notes	fn	-	inject_note_now
+11	turns	fn	-	send_turn
+11	turns	fn	-	write_user_turn
+11	turns	fn	-	with_pending_note
+8	claude_cli	const	-	FAKE_CLAUDE
