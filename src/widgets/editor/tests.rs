@@ -22372,6 +22372,21 @@ fn with_carets(lines: &[&str], sels: &[((usize, usize), (usize, usize))]) -> Edi
     e
 }
 
+/// A caret sitting inside another caret's selection must not split the line
+/// twice. Alt-clicking between the letters of a selected word is one gesture
+/// that does exactly this: the interior caret gives way, so the selection is
+/// replaced by a single line break — exactly what Enter does with one
+/// selection — and a caret on another line still splits that line.
+#[test]
+fn a_caret_inside_a_selection_does_not_split_the_line_twice() {
+    let mut e = with_carets(
+        &["abcd", "xy"],
+        &[((0, 0), (0, 4)), ((0, 2), (0, 2)), ((1, 1), (1, 1))],
+    );
+    e.multi_newline();
+    assert_eq!(e.lines, ["", "", "x", "y"]);
+}
+
 /// Three selections over one another — starts at 3, 5 and 9, lengths 2, 4 and
 /// 1 — are one column, and every start comes out in column 9 with every
 /// selection four long.
