@@ -47,16 +47,15 @@ Building from source needs a Rust toolchain; see [INSTALL.md](docs/INSTALL.md#bu
 
 ## Install
 
+To build and install croft from the latest source on `main`:
+
 ```bash
-brew install vitali87/croft/croft
+cargo install --git https://github.com/vitali87/croft.git --locked
 ```
 
-Homebrew on macOS or Linux installs a prebuilt binary, with no toolchain and no compile.
-`cargo binstall croft-software` or a plain `curl | tar` of the release archive gets the same
-binary, and `cargo install croft-software --locked` builds it from source.
-
-See **[INSTALL.md](docs/INSTALL.md)** for every method, upgrading, and verifying a release's
-signature.
+Prefer a prebuilt binary? Visit **[croft.software](https://croft.software)**.
+See **[INSTALL.md](docs/INSTALL.md)** for build prerequisites, other install methods,
+upgrading, and verifying release signatures.
 
 ## Run
 
