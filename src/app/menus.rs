@@ -1626,9 +1626,10 @@ impl App {
     pub(super) fn open_go_to_line_prompt(&mut self) {
         use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
         let line = self.editor.cursor_row + 1;
+        let col = self.editor.cursor_visual_col();
         self.open_input_prompt(
-            InputPrompt::new(InputPurpose::GoToLine, "Go to Line", "line number")
-                .with_value(line.to_string()),
+            InputPrompt::new(InputPurpose::GoToLine, "Go to Line", "line or line:column")
+                .with_value(format!("{line}:{col}")),
         );
     }
 

@@ -22246,3 +22246,31 @@ fn the_toggle_disables_every_pair_behavior() {
     e.backspace();
     assert_eq!(e.lines[0], ")", "off means plain backspace");
 }
+
+/// A jump to the end of the longest line keeps the caret on screen: its
+/// cell after the last character needs one more column of scroll than the
+/// text's extent offers, which only the wheel and the bar are held to.
+#[test]
+fn the_caret_after_the_last_character_of_the_longest_line_is_on_screen() {
+    let mut e = editor_with(&"a".repeat(100));
+    render_at(&mut e, 30, 6);
+    e.goto_visual_col(101);
+    let buf = guide_buf(&mut e, 30, 6);
+    let text_x = e.last_inner.x + e.last_gutter_width + 1;
+    let (cx, cy) = e.cursor_screen_pos().expect("the caret is on screen");
+    assert!(
+        cx >= text_x && cx < e.last_inner.x + e.last_inner.width,
+        "{cx}"
+    );
+    assert_eq!(buf[(cx, cy)].symbol(), " ", "past the last 'a'");
+    assert_eq!(buf[(cx - 1, cy)].symbol(), "a", "right after the last 'a'");
+    // The wheel still stops at the text's own end.
+    e.scroll_right_by(500);
+    render_at(&mut e, 30, 6);
+    let text_w = (e.last_inner.width - e.last_gutter_width - 2) as usize;
+    assert_eq!(
+        e.scroll_col,
+        100 - text_w,
+        "the wheel cannot go past the text"
+    );
+}

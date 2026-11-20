@@ -2524,6 +2524,50 @@ fn status_bar_go_to_line_drops_the_selection_it_leaves_behind() {
     );
 }
 
+/// Go to Line takes `line:column` too, the column as the status bar counts
+/// it, tabs included; a bare line leaves the caret's column alone.
+#[test]
+fn go_to_line_accepts_a_column() {
+    let tmp = tempfile::tempdir().unwrap();
+    let long = "x".repeat(300);
+    let body = format!("short\n{long}\n\tabc\n");
+    let mut app = app_with_open_file(tmp.path(), "a.txt", &body);
+    let go = |app: &mut App, v: &str| {
+        app.open_go_to_line_prompt();
+        app.input_prompt.as_mut().unwrap().value = v.to_string();
+        app.submit_input_prompt();
+    };
+    app.editor.cursor_row = 2;
+    app.editor.cursor_col = 2;
+    app.open_go_to_line_prompt();
+    assert_eq!(
+        app.input_prompt.as_ref().unwrap().value,
+        "3:6",
+        "the prompt opens on the caret's line and status-bar column"
+    );
+    app.submit_input_prompt();
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (2, 2));
+    go(&mut app, "2:250");
+    assert_eq!(app.editor.cursor_row, 1);
+    assert_eq!(app.editor.cursor_col, 249);
+    assert_eq!(app.editor.cursor_visual_col(), 250);
+    assert_eq!(app.status, "Line 2, column 250");
+    go(&mut app, "1:99");
+    assert_eq!(app.editor.cursor_col, 5, "past the end lands at the end");
+    go(&mut app, "2:0");
+    assert_eq!(app.editor.cursor_col, 0, "column 0 counts as 1");
+    go(&mut app, "3:6");
+    assert_eq!(app.editor.cursor_row, 2);
+    assert_eq!(app.editor.cursor_visual_col(), 6);
+    assert_eq!(app.editor.cursor_col, 2, "column 6 is after the tab and a");
+    app.editor.cursor_col = 3;
+    go(&mut app, "1");
+    assert_eq!(app.editor.cursor_row, 0);
+    assert_eq!(app.editor.cursor_col, 3, "a bare line keeps the column");
+    go(&mut app, "2:x");
+    assert!(app.status.starts_with("Not a line number"));
+}
+
 /// A wheel burst over a PDF in a background split steps one page, as it does
 /// in the focused group: every step is a synchronous rasterise, and without
 /// the cooldown a flick froze the UI for one render per queued event.
