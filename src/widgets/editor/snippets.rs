@@ -281,7 +281,7 @@ impl Editor {
 
         self.pin_on_edit();
         self.push_undo(EditKind::EmmetExpand);
-        self.last_edit_kind = None;
+        self.end_caret_action();
 
         let chars: Vec<char> = line.chars().collect();
         let before: String = chars[..start_col].iter().collect();
@@ -367,7 +367,7 @@ impl Editor {
         };
         self.pin_on_edit();
         self.push_undo(EditKind::EmmetExpand);
-        self.last_edit_kind = None;
+        self.end_caret_action();
         let old_end = self.lines.len() - tail;
         let added = new.len() - tail - head;
         self.lines

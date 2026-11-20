@@ -529,7 +529,7 @@ impl Editor {
             self.cursor_row = line;
             self.cursor_col = col.min(self.line_char_len(line));
         }
-        self.last_edit_kind = None;
+        self.end_caret_action();
     }
 
     /// Move the cursor one visual row up (`dir = -1`) or down (`dir = 1`) in
@@ -558,7 +558,14 @@ impl Editor {
             .find(|&(s, _)| s == seg_start)
             .unwrap_or((seg_start, seg_start));
         self.cursor_row = line;
-        self.cursor_col = floor_grapheme_col(&self.lines[line], (s + goal_col).min(e));
+        // A non-final segment ends where the next begins: stay on its last
+        // grapheme, or the caret would hop onto the next screen row.
+        let limit = if e < self.line_char_len(line) {
+            e.saturating_sub(1).max(s)
+        } else {
+            e
+        };
+        self.cursor_col = floor_grapheme_col(&self.lines[line], (s + goal_col).min(limit));
         self.vertical_goal = Some((self.cursor_row, self.cursor_col, goal_col));
     }
 

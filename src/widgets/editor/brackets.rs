@@ -262,7 +262,7 @@ impl Editor {
         self.clear_selection();
         self.cursor_row = target.0;
         self.cursor_col = target.1;
-        self.last_edit_kind = None;
+        self.end_caret_action();
         self.ensure_cursor_col_visible();
         true
     }
@@ -279,7 +279,7 @@ impl Editor {
         self.selection = Some(EditorSelection { anchor: open, head });
         self.cursor_row = head.0;
         self.cursor_col = head.1;
-        self.last_edit_kind = None;
+        self.end_caret_action();
         self.ensure_cursor_col_visible();
         true
     }

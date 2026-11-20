@@ -19,6 +19,14 @@ impl Editor {
         self.cursor_col = self.cursor_col.min(max_col);
     }
 
+    /// End of a caret action that is not an Up/Down: the carried column
+    /// (Vim's `curswant`) no longer applies, even if the caret comes back to
+    /// the spot it was recorded at.
+    pub(super) fn end_caret_action(&mut self) {
+        self.last_edit_kind = None;
+        self.vertical_goal = None;
+    }
+
     pub fn move_up(&mut self) {
         if self.wrap_enabled() {
             self.wrap_move_vertical(-1);
@@ -60,7 +68,10 @@ impl Editor {
     /// Put the caret on `goal` in its (new) row, as far along as the line
     /// goes, and remember the goal for the next vertical move.
     fn land_on_goal(&mut self, goal: usize) {
-        self.cursor_col = floor_grapheme_col(&self.lines[self.cursor_row], goal);
+        self.cursor_col = self
+            .lines
+            .get(self.cursor_row)
+            .map_or(0, |line| floor_grapheme_col(line, goal));
         self.vertical_goal = Some((self.cursor_row, self.cursor_col, goal));
     }
 
@@ -93,7 +104,7 @@ impl Editor {
         self.clear_selection();
         self.cursor_row = 0;
         self.cursor_col = 0;
-        self.last_edit_kind = None;
+        self.end_caret_action();
     }
 
     pub fn goto_bottom(&mut self) {
@@ -103,7 +114,7 @@ impl Editor {
         }
         self.cursor_row = self.lines.len() - 1;
         self.cursor_col = 0;
-        self.last_edit_kind = None;
+        self.end_caret_action();
     }
 
     /// `Ctrl+Home` (`Cmd+Home` on macOS), VS Code's `cursorTop`. Unlike
@@ -111,7 +122,7 @@ impl Editor {
     pub fn cursor_top(&mut self) {
         self.cursor_row = 0;
         self.cursor_col = 0;
-        self.last_edit_kind = None;
+        self.end_caret_action();
     }
 
     /// `Ctrl+End`, VS Code's `cursorBottom`: after the last line's last
@@ -119,7 +130,7 @@ impl Editor {
     pub fn cursor_bottom(&mut self) {
         self.cursor_row = self.lines.len().saturating_sub(1);
         self.cursor_col = self.line_char_len(self.cursor_row);
-        self.last_edit_kind = None;
+        self.end_caret_action();
     }
 
     pub fn goto_line(&mut self, one_based: usize) {
@@ -131,7 +142,7 @@ impl Editor {
         let target = one_based.saturating_sub(1).min(max);
         self.cursor_row = target;
         self.cursor_col = 0;
-        self.last_edit_kind = None;
+        self.end_caret_action();
     }
 
     pub fn move_left(&mut self) {
@@ -142,7 +153,7 @@ impl Editor {
             self.cursor_col = self.line_char_len(self.cursor_row);
         }
         self.ensure_cursor_col_visible();
-        self.last_edit_kind = None;
+        self.end_caret_action();
     }
 
     pub fn move_right(&mut self) {
@@ -153,7 +164,7 @@ impl Editor {
             self.cursor_col = 0;
         }
         self.ensure_cursor_col_visible();
-        self.last_edit_kind = None;
+        self.end_caret_action();
     }
 
     /// Word-step right (Option+Right on macOS, Ctrl+Right elsewhere). Skips
@@ -176,7 +187,7 @@ impl Editor {
                 self.cursor_col = 0;
             } else {
                 self.ensure_cursor_col_visible();
-                self.last_edit_kind = None;
+                self.end_caret_action();
                 return;
             }
         }
@@ -185,7 +196,7 @@ impl Editor {
             self.cursor_col += 1;
         }
         self.ensure_cursor_col_visible();
-        self.last_edit_kind = None;
+        self.end_caret_action();
     }
 
     /// Word-step left (Option+Left on macOS). Symmetric to `move_word_right`:
@@ -206,7 +217,7 @@ impl Editor {
                 self.cursor_col = self.line_char_len(self.cursor_row);
             } else {
                 self.ensure_cursor_col_visible();
-                self.last_edit_kind = None;
+                self.end_caret_action();
                 return;
             }
         }
@@ -215,7 +226,7 @@ impl Editor {
             self.cursor_col -= 1;
         }
         self.ensure_cursor_col_visible();
-        self.last_edit_kind = None;
+        self.end_caret_action();
     }
 
     pub fn scroll_left_by(&mut self, n: usize) {
@@ -331,13 +342,13 @@ impl Editor {
     /// Start of the logical line (`Ctrl+A`), before any indentation.
     pub fn home_line(&mut self) {
         self.cursor_col = 0;
-        self.last_edit_kind = None;
+        self.end_caret_action();
     }
 
     /// End of the logical line (`Ctrl+E`, and End's second step).
     pub fn end_line(&mut self) {
         self.cursor_col = self.line_char_len(self.cursor_row);
-        self.last_edit_kind = None;
+        self.end_caret_action();
     }
 
     /// The Home key, VS Code's `cursorHome`: to the line's first
@@ -367,7 +378,7 @@ impl Editor {
             },
             None => smart,
         };
-        self.last_edit_kind = None;
+        self.end_caret_action();
     }
 
     /// The End key. With wrap on (#1569) it first goes to the end of the
@@ -383,7 +394,7 @@ impl Editor {
             }
             _ => len,
         };
-        self.last_edit_kind = None;
+        self.end_caret_action();
     }
 
     pub fn scroll_up(&mut self, n: usize) {
@@ -543,7 +554,7 @@ impl Editor {
                 .saturating_sub(viewport / 2)
                 .min(self.lines.len().saturating_sub(viewport));
         }
-        self.last_edit_kind = None;
+        self.end_caret_action();
     }
 
     /// Rasterize the whole document into a `w`x`h` RGBA buffer for the minimap:
@@ -664,7 +675,7 @@ impl Editor {
             self.cursor_row = last_visible;
         }
         self.cursor_col = self.cursor_col.min(self.line_char_len(self.cursor_row));
-        self.last_edit_kind = None;
+        self.end_caret_action();
     }
 
     pub(super) fn scroll_view_to(&mut self, top: usize) {
@@ -685,7 +696,7 @@ impl Editor {
             self.scroll = 0;
             self.cursor_row = 0;
             self.cursor_col = 0;
-            self.last_edit_kind = None;
+            self.end_caret_action();
             return;
         }
         self.scroll = top.min(self.lines.len().saturating_sub(viewport));
@@ -697,7 +708,7 @@ impl Editor {
             self.cursor_row = last_visible;
         }
         self.cursor_col = self.cursor_col.min(self.line_char_len(self.cursor_row));
-        self.last_edit_kind = None;
+        self.end_caret_action();
     }
 
     /// Topmost line the caret may be dragged to when the viewport scrolls out
