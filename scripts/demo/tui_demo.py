@@ -76,12 +76,12 @@ def ghostty_version() -> str:
         return ""
 
 
-def new_window(before: dict[str, int], after: dict[str, int]) -> tuple[str, int] | None:
-    """The (CGWindowID, width in points) of the one window in `after` but not `before`."""
-    new = [(w, width) for w, width in after.items() if w not in before]
-    if len(new) > 1:
-        raise RuntimeError("Ghostty opened more than one window; close the others and record again")
-    return new[0] if new else None
+def window_titled(windows: list[tuple[str, str, int]], title: str) -> tuple[str, int] | None:
+    """The (CGWindowID, width in points) of the one window in `windows` named `title`."""
+    hits = [(w, width) for w, name, width in windows if name == title]
+    if len(hits) > 1:
+        raise RuntimeError(f"more than one Ghostty window is titled {title!r}")
+    return hits[0] if hits else None
 
 
 def shot_scale(points: int, pixels: int) -> float:
@@ -251,14 +251,19 @@ class Demo:
         env = {**env, "ZDOTDIR": str(self.home), "PATH": path}
         with (self.home / ".zshrc").open("a") as rc:
             rc.write(f"export PATH={_q(path)}\n")
+        # A title only this recording uses names its window; croft starts once
+        # that window is found, and replaces the title with its own.
+        title = f"croft-demo-{uuid.uuid4().hex[:12]}"
+        go = self.home / ".go"
         run = self.home / ".run.sh"
         run.write_text(
+            f"printf '\\033]2;%s\\007' {title}\n"
+            f"while [ ! -e {_q(str(go))} ]; do sleep 0.05; done\n"
             f"echo $$ > {_q(str(self.home / '.pid'))}\n"
             f"cd {_q(str(self.project))} && exec env -u XDG_CONFIG_HOME "
             + " ".join(f"{k}={_q(v)}" for k, v in env.items())
             + f" {_q(str(self.binary))} .\n"
         )
-        before = _ghostty_window_ids()
         self.window = _osascript(
             'tell application "Ghostty"',
             "set cfg to new surface configuration",
@@ -269,9 +274,10 @@ class Demo:
         )
         for _ in range(100):
             time.sleep(0.1)
-            found = new_window(before, _ghostty_window_ids())
+            found = window_titled(_ghostty_windows(), title)
             if found:
                 self.window_id, self.window_width = found
+                go.touch()
                 break
         else:
             raise RuntimeError("Ghostty opened no window to record")
@@ -398,8 +404,8 @@ class Demo:
         ).stdout
 
 
-def _ghostty_window_ids() -> dict[str, int]:
-    """Ghostty's on-screen windows: CGWindowID to width in points."""
+def _ghostty_windows() -> list[tuple[str, str, int]]:
+    """Ghostty's on-screen windows as (CGWindowID, title, width in points)."""
     script = """
 ObjC.import('CoreGraphics');
 function run() {
@@ -411,16 +417,18 @@ function run() {
     if (ObjC.unwrap(w.objectForKey('kCGWindowOwnerName')) === 'Ghostty'
         && ObjC.unwrap(w.objectForKey('kCGWindowLayer')) === 0) {
       const bounds = ObjC.deepUnwrap(w.objectForKey('kCGWindowBounds'));
-      out.push(ObjC.unwrap(w.objectForKey('kCGWindowNumber')) + ':' + Math.round(bounds.Width));
+      out.push([String(ObjC.unwrap(w.objectForKey('kCGWindowNumber'))),
+                String(ObjC.unwrap(w.objectForKey('kCGWindowName')) || ''),
+                Math.round(bounds.Width)]);
     }
   }
-  return out.join(' ');
+  return JSON.stringify(out);
 }
 """
     out = subprocess.run(["osascript", "-l", "JavaScript", "-e", script], capture_output=True, text=True, check=False)
     if out.returncode != 0:
         raise RuntimeError(f"could not list Ghostty's windows: {out.stderr.strip()}")
-    return {w: int(width) for w, width in (item.split(":") for item in out.stdout.split())}
+    return [(w, name, int(width)) for w, name, width in json.loads(out.stdout)]
 
 
 def _osascript(*lines: str, check: bool = True) -> str:

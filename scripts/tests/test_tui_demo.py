@@ -94,15 +94,18 @@ class GhosttyKeys(unittest.TestCase):
 
 
 class RecordedWindow(unittest.TestCase):
-    def test_the_one_window_ghostty_just_opened_is_recorded(self):
-        self.assertEqual(tui_demo.new_window({"7": 900}, {"7": 900, "9": 1440}), ("9", 1440))
+    WINDOWS = [("7", "croft  test", 900), ("9", "croft-demo-ab12", 1440), ("11", "zsh", 800)]
 
-    def test_no_new_window_yet_is_none(self):
-        self.assertIsNone(tui_demo.new_window({"7": 900}, {"7": 900}))
+    def test_the_window_with_the_recordings_title_is_recorded(self):
+        self.assertEqual(tui_demo.window_titled(self.WINDOWS, "croft-demo-ab12"), ("9", 1440))
 
-    def test_two_new_windows_are_refused_rather_than_guessed(self):
+    def test_an_unrelated_new_window_is_never_recorded(self):
+        self.assertIsNone(tui_demo.window_titled(self.WINDOWS[:1] + self.WINDOWS[2:], "croft-demo-ab12"))
+
+    def test_two_windows_with_the_recordings_title_are_refused(self):
+        twins = self.WINDOWS + [("13", "croft-demo-ab12", 1440)]
         with self.assertRaisesRegex(RuntimeError, "more than one"):
-            tui_demo.new_window({}, {"9": 1440, "11": 800})
+            tui_demo.window_titled(twins, "croft-demo-ab12")
 
 
 class ShotScale(unittest.TestCase):
