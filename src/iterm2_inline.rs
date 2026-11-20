@@ -346,15 +346,21 @@ pub fn compose_count_badge(
         return None;
     }
     let mut canvas: RgbaImage = ImageBuffer::from_pixel(w, h, bg);
-    // Stadium pill: full height, corner radius = half height (a circle when the
-    // pill is roughly square, which the 2-cell width gives on a ~1:2 cell).
+    // Stadium pill: radius = half the shorter side, centred on the canvas. A
+    // circle when the pill is roughly square; on a cell narrower than 1:2 the
+    // 2-cell width is the shorter side, so the circle shrinks to fit instead of
+    // being cut off at the left and right edges.
     let accent_px = Rgba([accent.0, accent.1, accent.2, 0xff]);
-    let r = h as f32 / 2.0;
+    let r = w.min(h) as f32 / 2.0;
     for y in 0..h {
         for x in 0..w {
             let (fx, fy) = (x as f32 + 0.5, y as f32 + 0.5);
             let cx = fx.clamp(r, (w as f32 - r).max(r));
-            let cy = fy.clamp(r, (h as f32 - r).max(r));
+            let cy = if h as f32 > 2.0 * r {
+                h as f32 / 2.0
+            } else {
+                fy.clamp(r, (h as f32 - r).max(r))
+            };
             if (fx - cx).hypot(fy - cy) <= r {
                 canvas.put_pixel(x, y, accent_px);
             }
@@ -1421,6 +1427,27 @@ mod tests {
             "accent pill"
         );
         assert!(has(Rgba([0xff, 0xff, 0xff, 0xff])), "white digit");
+    }
+
+    #[test]
+    fn count_badge_is_a_whole_circle_on_a_cell_narrower_than_one_to_two() {
+        let bg = Rgba([0x20, 0x20, 0x20, 0xff]);
+        let accent = (0x4e, 0x9a, 0xff);
+        let lit = Rgba([accent.0, accent.1, accent.2, 0xff]);
+        // 10x24 cells: the badge is 20 wide, 24 tall. The circle must span the
+        // full width (not be cut at the right) and sit centred, clear of the
+        // top and bottom rows.
+        let png = compose_count_badge(3, 10, 24, accent, bg).expect("badge png");
+        let img = image::load_from_memory(&png).expect("decode").to_rgba8();
+        assert_eq!((img.width(), img.height()), (20, 24));
+        assert_eq!(*img.get_pixel(0, 12), lit, "left edge reached");
+        assert_eq!(
+            *img.get_pixel(19, 12),
+            lit,
+            "right edge reached, not clipped"
+        );
+        assert_eq!(*img.get_pixel(10, 0), bg, "top row stays background");
+        assert_eq!(*img.get_pixel(10, 23), bg, "bottom row stays background");
     }
 
     #[test]

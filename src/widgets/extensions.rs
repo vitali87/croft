@@ -35,7 +35,6 @@ const DESC_FG: Color = Color::Rgb(0x79, 0x82, 0x90); // blurb / dim text
 /// every Nerd Font (Powerline glyphs are universal).
 const SWITCH_CAP_L: char = '\u{e0b6}'; // left half-circle
 const SWITCH_CAP_R: char = '\u{e0b4}'; // right half-circle
-const SWITCH_KNOB: char = '\u{ebb4}'; // codicon circle-large-filled, cell-centered
 const SWITCH_OFF_TRACK: Color = Color::Rgb(0x3c, 0x44, 0x4e); // grey track (off)
 const SWITCH_KNOB_OFF: Color = Color::Rgb(0xcd, 0xd3, 0xdc); // dim knob (off)
 /// Codicon `search` magnifier for the filter box (matches the activity bar's
@@ -49,10 +48,10 @@ const REFRESH_GLYPH: char = '\u{eb37}';
 /// Each list item is two cells tall: mark + name + toggle on the first line,
 /// blurb on the second, like VS Code's two-line extension rows.
 const ROW_H: u16 = 2;
-/// Cells reserved at the right edge for the toggle pill: 4 for the switch
-/// (2 caps + track + knob) plus a 1-cell margin. The click zone is everything
+/// Cells reserved at the right edge for the toggle pill: 5 for the switch
+/// (2 caps + 3 track cells the knob rides on) plus a 1-cell margin. The click zone is everything
 /// from `last_switch_left` to the panel edge.
-const SWITCH_ZONE: u16 = 5;
+const SWITCH_ZONE: u16 = 6;
 /// Cells reserved just left of the switch for a row's uninstall (trash) button,
 /// drawn only on removable INSTALLED rows: the glyph plus a 1-cell gap. The
 /// click zone is `[last_uninstall_left, last_switch_left)`.
@@ -89,8 +88,12 @@ impl Palette {
 /// Paint the rounded toggle pill at `(sw_x, y)` over the row background `row_bg`
 /// (so the half-circle caps blend into the panel or the selection fill). On =
 /// the theme's lit track with the knob to the right; off = a grey track with the
-/// knob to the left. Occupies 4 cells: `[cap, track, track, cap]` with the knob
-/// overlaying a track cell.
+/// knob to the left. Occupies 5 cells: `[cap, track, track, track, cap]`.
+///
+/// The knob is a full circle glued from two half-circle glyphs in adjacent
+/// cells (left half, right half), so it fits its two cells in any font; a single
+/// wide glyph spilled out of its cell and was clipped next to a cap. It covers
+/// cells 1-2 (off) or 2-3 (on).
 fn draw_switch(
     buf: &mut Buffer,
     sw_x: u16,
@@ -104,7 +107,7 @@ fn draw_switch(
         .fg(track)
         .bg(row_bg.unwrap_or(Color::Reset));
     buf.set_string(sw_x, y, SWITCH_CAP_L.to_string(), cap_style);
-    for i in 1..=2 {
+    for i in 1..=3 {
         buf.set_string(sw_x + i, y, " ", Style::default().bg(track));
     }
     let (knob_i, knob_fg) = if on {
@@ -112,13 +115,10 @@ fn draw_switch(
     } else {
         (1, SWITCH_KNOB_OFF)
     };
-    buf.set_string(
-        sw_x + knob_i,
-        y,
-        SWITCH_KNOB.to_string(),
-        Style::default().fg(knob_fg).bg(track),
-    );
-    buf.set_string(sw_x + 3, y, SWITCH_CAP_R.to_string(), cap_style);
+    let knob_style = Style::default().fg(knob_fg).bg(track);
+    buf.set_string(sw_x + knob_i, y, SWITCH_CAP_L.to_string(), knob_style);
+    buf.set_string(sw_x + knob_i + 1, y, SWITCH_CAP_R.to_string(), knob_style);
+    buf.set_string(sw_x + 4, y, SWITCH_CAP_R.to_string(), cap_style);
 }
 
 #[cfg(test)]
@@ -1080,6 +1080,28 @@ mod tests {
             Some(SWITCH_OFF_TRACK),
             "a disabled row's pill track is grey"
         );
+    }
+
+    #[test]
+    fn the_knob_is_two_half_circles_in_adjacent_cells_inside_the_pill() {
+        let mut panel = ExtensionsPanel::new();
+        panel.set_items(items());
+        panel.theme = Theme::BLACK;
+        let (buf, _) = render(&mut panel, 44, 16);
+        let sw_x = panel.last_switch_left;
+        // Row 0 is enabled (knob right, cells 2-3), row 1 disabled (cells 1-2).
+        for (row, left) in [(0usize, 2u16), (1, 1)] {
+            let y = panel.row_hits[row].0;
+            let sym = |i: u16| buf[(sw_x + i, y)].symbol().chars().next();
+            assert_eq!(sym(left), Some(SWITCH_CAP_L), "row {row}: knob left half");
+            assert_eq!(
+                sym(left + 1),
+                Some(SWITCH_CAP_R),
+                "row {row}: knob right half"
+            );
+            assert_eq!(sym(0), Some(SWITCH_CAP_L), "row {row}: pill left cap");
+            assert_eq!(sym(4), Some(SWITCH_CAP_R), "row {row}: pill right cap");
+        }
     }
 
     #[test]
