@@ -11,6 +11,7 @@ impl Editor {
         // A pass already running bakes the old palette's colors.
         self.highlight_job = None;
         self.recompute_highlights();
+        self.restyle_semantic_overlay();
         // A diff view's colours are baked the same way (#2020).
         if let Some(diff) = self.diff.as_mut() {
             diff.syntax.restart();

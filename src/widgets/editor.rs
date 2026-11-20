@@ -903,6 +903,20 @@ pub struct Editor {
     /// the buffer after each edit. `semantic_path` records which file the
     /// batch is for, so a stale batch is ignored after a tab switch.
     semantic_data: Vec<u32>,
+    /// The lines the overlay was decoded against. An edit carries the overlay
+    /// through the change like the syntax spans (`carry_highlights`), never
+    /// re-decodes the old batch against the new text: its positions are the
+    /// old text's, and until the server answers (a big file can take long, or
+    /// never) they would colour the wrong characters.
+    semantic_base: PackedLines,
+    semantic_carry_brackets: BracketColors,
+    /// The batch was decoded during a launch's first frame, which does not
+    /// get the copy of the text that carrying needs: `Some(edit_seq)` it was
+    /// decoded at, until [`Self::settle_semantic_carry`] builds it.
+    semantic_carry_pending: Option<u64>,
+    /// No edit has moved the overlay since it was decoded, so the raw batch
+    /// still fits the text and a theme switch can decode it again.
+    semantic_exact: bool,
     semantic_legend: Option<std::sync::Arc<Vec<String>>>,
     semantic_path: Option<PathBuf>,
     /// Whether the retained batch covers the WHOLE document (a
@@ -1265,6 +1279,10 @@ impl Editor {
             highlight_generation: 0,
             semantic_overlay: Vec::new(),
             semantic_data: Vec::new(),
+            semantic_base: PackedLines::default(),
+            semantic_carry_brackets: Vec::new(),
+            semantic_carry_pending: None,
+            semantic_exact: false,
             semantic_legend: None,
             semantic_path: None,
             semantic_is_full: false,

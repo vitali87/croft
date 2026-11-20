@@ -27,7 +27,7 @@ impl Editor {
         self.semantic_data = data;
         self.semantic_legend = Some(legend);
         self.semantic_is_full = is_full;
-        self.recompute_semantic_overlay();
+        self.decode_semantic_overlay();
     }
 
     /// Store a fresh inlay-hint set from the LSP and decode it into per-line
@@ -409,18 +409,29 @@ impl Editor {
         self.diagnostic_tag_spans = tag_spans;
     }
 
-    /// Re-decode the retained semantic-token batch against the current
-    /// buffer. A no-op (clears the overlay) unless the batch belongs to
-    /// the file currently loaded, so a stale batch never colors the wrong
-    /// file after a tab switch.
-    pub(super) fn recompute_semantic_overlay(&mut self) {
+    /// Decode the semantic-token batch just received against the current
+    /// buffer (the reply is only applied while the text is the one it was
+    /// measured on). Clears the overlay unless the batch belongs to the file
+    /// currently loaded, so a stale batch never colors the wrong file after a
+    /// tab switch.
+    pub(super) fn decode_semantic_overlay(&mut self) {
+        // The first frame does not show a copy of the text, so a launch
+        // builds it after that frame (see `settle_semantic_carry`).
+        self.decode_semantic_overlay_deferring(crate::startup_gate::first_frame_pending());
+    }
+
+    pub(super) fn decode_semantic_overlay_deferring(&mut self, defer_carry: bool) {
+        self.semantic_carry_pending = None;
+        self.semantic_exact = false;
         let same_file = self.semantic_path.as_deref() == self.path.as_deref();
         let Some(legend) = self.semantic_legend.as_ref().filter(|_| same_file) else {
             self.semantic_overlay = Vec::new();
+            self.semantic_base = PackedLines::default();
             return;
         };
         if self.semantic_data.is_empty() {
             self.semantic_overlay = Vec::new();
+            self.semantic_base = PackedLines::default();
             return;
         }
         let text = self.lines.join("\n");
@@ -428,6 +439,92 @@ impl Editor {
         let line_starts = compute_line_starts(bytes);
         self.semantic_overlay =
             decode_semantic_tokens(&self.semantic_data, legend, bytes, &line_starts);
+        self.semantic_exact = true;
+        if defer_carry {
+            self.semantic_base = PackedLines::default();
+            self.semantic_carry_brackets = Vec::new();
+            self.semantic_carry_pending = Some(self.edit_seq);
+        } else {
+            self.semantic_base = PackedLines::from(&self.lines[..]);
+            self.semantic_carry_brackets = vec![Vec::new(); self.lines.len()];
+        }
+    }
+
+    /// Build the copy of the text that carrying the overlay through an edit
+    /// needs, once the first frame is up. A buffer edited before then has
+    /// moved past the text the batch was measured on and drops it; the
+    /// server's next reply paints it again.
+    pub fn settle_semantic_carry(&mut self) {
+        let Some(seq) = self.semantic_carry_pending else {
+            return;
+        };
+        if crate::startup_gate::first_frame_pending() {
+            return;
+        }
+        self.semantic_carry_pending = None;
+        if seq == self.edit_seq {
+            self.semantic_base = PackedLines::from(&self.lines[..]);
+            self.semantic_carry_brackets = vec![Vec::new(); self.lines.len()];
+        } else {
+            self.semantic_overlay = Vec::new();
+            self.semantic_exact = false;
+        }
+    }
+
+    /// After a theme switch: the overlay's spans carry colours baked from the
+    /// old palette. Decode the batch again if it still fits the text; one an
+    /// edit has moved is dropped, as it cannot be decoded against the new
+    /// text, and the reply to that edit paints it in the new colours.
+    pub(super) fn restyle_semantic_overlay(&mut self) {
+        if self.semantic_overlay.is_empty() {
+            return;
+        }
+        if self.semantic_exact
+            && self
+                .semantic_carry_pending
+                .is_none_or(|s| s == self.edit_seq)
+        {
+            self.decode_semantic_overlay_deferring(self.semantic_carry_pending.is_some());
+        } else {
+            self.semantic_overlay = Vec::new();
+            self.semantic_base = PackedLines::default();
+            self.semantic_carry_pending = None;
+            self.semantic_exact = false;
+        }
+    }
+
+    /// After an edit: move the overlay with the text it was decoded for. Lines
+    /// the edit touched keep the tokens of their unchanged stretches, new
+    /// text has none (the syntax colours show) until the server answers.
+    pub(super) fn recompute_semantic_overlay(&mut self) {
+        if let Some(seq) = self.semantic_carry_pending {
+            // Decoded in the first frame, with no copy of the text to carry
+            // from: unchanged since, it stays; edited, it is dropped.
+            if seq != self.edit_seq {
+                self.semantic_carry_pending = None;
+                self.semantic_overlay = Vec::new();
+                self.semantic_exact = false;
+            }
+            return;
+        }
+        if self.semantic_overlay.is_empty() && self.semantic_base.len() == 0 {
+            return;
+        }
+        if self.semantic_path.as_deref() != self.path.as_deref() {
+            // Saved under another name: the batch is another file's.
+            self.semantic_overlay = Vec::new();
+            self.semantic_base = PackedLines::default();
+            self.semantic_exact = false;
+            return;
+        }
+        if carry_highlights(
+            &mut self.semantic_base,
+            &mut self.semantic_overlay,
+            &mut self.semantic_carry_brackets,
+            &self.lines,
+        ) {
+            self.semantic_exact = false;
+        }
     }
 
     /// Where the buffer ends, as an LSP position: the end of an inlay-hint

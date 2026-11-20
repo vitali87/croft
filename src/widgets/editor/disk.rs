@@ -698,6 +698,7 @@ impl Editor {
         // batch triggered by the seq bump arrives.
         self.semantic_data = Vec::new();
         self.semantic_overlay = Vec::new();
+        self.semantic_base = PackedLines::default();
         self.semantic_is_full = false;
         // Same for inlay hints: anchors measured against another file's text
         // must never splice into this one.
