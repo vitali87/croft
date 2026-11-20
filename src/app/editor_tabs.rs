@@ -687,6 +687,10 @@ impl App {
                 self.editor = self.editor_layout.refocus_to_dfs(reduced, target);
                 self.editor.push_editor(moved);
                 if source_emptied {
+                    // The marks its last tab left go before the group does,
+                    // as `collapse_split_if_empty` does; after the push, so
+                    // the moved tab's own marks still count as held.
+                    self.settle_bookmarks();
                     self.editor_layout
                         .prune_blank_inactive(|t| t.is_blank_initial());
                 }
@@ -1566,7 +1570,7 @@ impl App {
     /// the open tabs of every editor group (`file:line  text of the line`),
     /// Enter jumps to it. Only the file a tab shows counts: the marks a tab
     /// still holds for a file it showed earlier are not of an open file.
-    pub(super) fn open_bookmark_picker(&mut self) {
+    pub(super) fn open_bookmark_picker(&mut self, include_closed: bool) {
         use crate::widgets::list_picker::{ListPicker, ListPurpose, ListRow};
         let root = self.tree.root.clone();
         // The focused group first, so a mark it shares with another group
@@ -1601,6 +1605,47 @@ impl App {
                             text,
                         ));
                     }
+                }
+            }
+        }
+        // A file no tab shows any more keeps its marks (a closed tab hands
+        // them to the App): list them too, with the text now on disk, and
+        // let Enter open the file at the line.
+        if include_closed {
+            self.settle_bookmarks();
+        }
+        let shown: std::collections::HashSet<PathBuf> =
+            found.iter().map(|(t, _)| t.path.clone()).collect();
+        let mut closed: Vec<(PathBuf, std::collections::BTreeSet<usize>)> = self
+            .all_bookmarks()
+            .into_iter()
+            .filter(|(path, _)| include_closed && !shown.contains(path))
+            .collect();
+        closed.sort();
+        for (path, set) in closed {
+            // Read as the editor would open it (its size cap, byte-order
+            // mark and declared encoding); a file it could not open has no
+            // row to offer. Only the marked lines are kept.
+            let Some(text) = crate::widgets::editor::read_text_for_listing(&path) else {
+                continue;
+            };
+            let mut wanted = set.iter().copied().peekable();
+            for (i, l) in text.lines().enumerate() {
+                // Marks are 1-based lines; one past the file's end is gone.
+                while wanted.next_if(|&w| w < i + 1).is_some() {}
+                if wanted.next_if(|&w| w == i + 1).is_some() {
+                    found.push((
+                        BookmarkTarget {
+                            group: active,
+                            tab: usize::MAX,
+                            path: path.clone(),
+                            line: i + 1,
+                        },
+                        l.trim().chars().take(80).collect(),
+                    ));
+                }
+                if wanted.peek().is_none() {
+                    break;
                 }
             }
         }

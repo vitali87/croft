@@ -1774,6 +1774,60 @@ fn a_files_bookmarks_outlive_its_last_tab() {
     assert_eq!(app.editor.bookmarked_lines(), vec![2]);
 }
 
+/// A diff opened over a file's own tab replaces that tab; the file's marks
+/// are kept as if the tab had been closed.
+#[test]
+fn a_diff_replacing_a_files_tab_keeps_its_bookmarks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    std::fs::write(&a, "one\ntwo\nthree\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&a).unwrap();
+    app.editor.cursor_row = 1;
+    app.toggle_bookmark();
+    app.editor
+        .open_head_diff_with_text(PathBuf::from("a.txt@HEAD"), "one\nthree\n", &a, true)
+        .unwrap();
+    app.settle_bookmarks();
+    let saved = app.capture_session_state().bookmarks;
+    assert_eq!(
+        saved.get(&a).map(|s| s.iter().copied().collect::<Vec<_>>()),
+        Some(vec![2]),
+        "the session keeps a.txt's mark"
+    );
+}
+
+/// A diff that replaced the only tab of a split group, then moved to the
+/// other group, empties the group the layout prunes: the marks the
+/// replaced tab left must be kept before the group goes.
+#[test]
+fn moving_a_diff_out_of_its_group_keeps_the_marks_its_tab_left() {
+    let tmp = tempfile::tempdir().unwrap();
+    let a = tmp.path().join("a.txt");
+    let b = tmp.path().join("b.txt");
+    std::fs::write(&a, "one\ntwo\nthree\n").unwrap();
+    std::fs::write(&b, "x\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.editor.open(&b).unwrap();
+    app.split_editor_dir(crate::app::editor_layout::SplitDir::Horizontal, true);
+    // The new, active group holds a.txt alone.
+    app.editor.open_in_new_tab(&a).unwrap();
+    assert!(app.editor.close_tab(0));
+    app.editor.cursor_row = 1;
+    app.toggle_bookmark();
+    app.editor
+        .open_head_diff_with_text(PathBuf::from("a.txt@HEAD"), "one\nthree\n", &a, true)
+        .unwrap();
+    app.move_active_editor_to_group(Some(0), crate::app::editor_layout::Dir::Left);
+    app.settle_bookmarks();
+    let saved = app.capture_session_state().bookmarks;
+    assert_eq!(
+        saved.get(&a).map(|s| s.iter().copied().collect::<Vec<_>>()),
+        Some(vec![2]),
+        "the session keeps a.txt's mark"
+    );
+}
+
 /// A tab closed on unsaved edits leaves its marks on their lines as saved,
 /// which is how the file opens next.
 #[test]
