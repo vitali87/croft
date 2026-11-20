@@ -169,14 +169,21 @@ file into the PR description.
 <details>
 <summary>Recording without a browser (agents, headless machines)</summary>
 
-`scripts/demo/tui_demo.py` drives the real binary in tmux and writes a GIF. It
-needs tmux, node, Pillow and Chromium. Copy the scenario in
-`scripts/demo/examples/`:
+`scripts/demo/tui_demo.py` drives the real binary and writes a GIF. On macOS
+with Ghostty 1.4+ it runs croft in a new window of your Ghostty and screenshots
+it (allow Screen Recording and Automation once; leave the window alone while
+it records). Elsewhere, or with `CROFT_DEMO_TERMINAL=xterm`, it uses tmux and
+replays the frames in headless Chromium, which needs tmux, node and Chromium.
+Both need Pillow. Copy the scenario in `scripts/demo/examples/`:
 
 ```bash
 cargo build
 python3 scripts/demo/examples/settings_editor.py target/debug/croft out.gif
 ```
+
+`scripts/demo/docs_gifs.py target/debug/croft [scene ...]` re-records the GIFs
+in `docs/images/`. Record from a clean checkout, so the status bar shows no
+rebuild hint.
 
 If you have push access, commit the GIF to the never-merged `pr-media` branch at
 `<pr>/<name>.gif`. Then embed it with a URL pinned to that commit's SHA, so the
