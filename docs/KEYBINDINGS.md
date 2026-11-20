@@ -59,7 +59,8 @@ Per platform:
 | Click the layout icons (top-right of the editor / welcome) | Toggle the primary side bar, toggle the panel, or open the **Customize Layout** popup |
 | Drag a seam | Resize the sidebar, the split between editor columns, or the editor/terminal split |
 
-* `Ctrl+s` / `Cmd+s`: a folder of the file's path that is gone (removed by a `git checkout`, say) is created again. A tab with no file behind it closes without asking.
+* `Ctrl+s` / `Cmd+s`: a folder of the file's path that is gone (removed by a `git checkout`, say) is created again.
+  * A tab with no file behind it (a past version, a Search Editor, a commit, Git Output) is never written, by save or auto save. Saving it closes the tab without asking; `File: Save As…` keeps a copy.
 
 * `Ctrl+q`: Save all stays open, naming each file, when something cannot be saved: an untitled buffer, a file changed on disk, text its encoding cannot hold, a merge with conflicts left, or a file open in two groups with different unsaved text.
 

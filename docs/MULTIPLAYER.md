@@ -18,8 +18,8 @@ Verified over real SSH against a Linux host:
 - The control holder's keystrokes reach both clients; a read-only client's
   reach neither. Enforcement is server-side, not advisory.
 - The socket is mode `0600` from creation: bound in a private 0700 staging
-  dir and renamed into place (shared with the collab relay). A umask
-  save/restore is process-global, so racing binds could corrupt it.
+  dir and renamed into place (shared with the collab relay). The earlier umask
+  save/restore was process-global, so racing binds could corrupt it.
 - A per-target lock file, held across probe, stale removal, bind and publish,
   serializes creation. Two attach-or-create racers never both publish; the
   loser attaches to the winner.
