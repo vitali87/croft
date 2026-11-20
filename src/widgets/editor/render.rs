@@ -1282,8 +1282,23 @@ impl Widget for &mut Editor {
             // bracket colorization so a color literal's own brackets (e.g.
             // `rgb(...)`) still read against the tint, and before the
             // overlays below (selection, search) so those still win over it.
+            // A buffer past the scan cap keeps no table; its visible lines
+            // are scanned here, a handful per frame, so a big file's
+            // literals are tinted too.
+            let scanned;
+            let hits = match self.color_swatches.get(line_idx) {
+                Some(hits) => Some(hits),
+                None if self.show_color_swatches => {
+                    scanned = scan_color_swatches(
+                        std::slice::from_ref(&self.lines[line_idx]),
+                        self.swatch_decimal_short(),
+                    );
+                    scanned.first()
+                }
+                None => None,
+            };
             if self.show_color_swatches
-                && let Some(hits) = self.color_swatches.get(line_idx)
+                && let Some(hits) = hits
             {
                 for &(start_c, end_c, bg, fg) in hits {
                     if end_c <= row_start {
