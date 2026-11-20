@@ -11,7 +11,7 @@ The Explorer, with VS Code style icons. Search and a Remote (SSH) explorer swap 
 #### Files
 
 * **File operations:** multi-select, cut / copy / paste, and drag-and-drop moves.
-* **Rename and move:** croft asks the language servers first, so imports that name the file are updated to match (rust-analyzer, TypeScript and any server that supports it).
+* **Rename and move:** croft asks the language servers first, so imports that name the file are updated to match (rust-analyzer, TypeScript and any server that supports `willRenameFiles`).
 * **Git-ignored** files and folders show their names in dimmed grey. A fully ignored folder dims along with everything under it.
 * The dimming follows `.gitignore` edits.
 * **Changed files** show git decorations: the name takes the status colour and its letter sits at the right edge of the row.
@@ -146,7 +146,7 @@ A read-only log viewer, as in VS Code's Output panel.
 
 Channels appear as producers log:
 
-* One per language server: its log messages, shown messages, and stderr.
+* One per language server: its `window/logMessage`, `showMessage`, and stderr.
 * **Debug Adapter.**
 * **Debug Console:** the Run and Debug console's program output and REPL results, at full width.
 * **Git:** the exact git commands the Source Control panel runs.
@@ -192,7 +192,7 @@ The popup groups:
 * **Panel Alignment** — Left/Center/Right/Justify, where Justify spans the panel across the full content width under the side bar.
 * **Quick Input Position** — Top/Center, for the Command Palette / Go to File.
 * **Zen Mode** (`Cmd`/`Ctrl`+`K` `Z`) — hides all chrome and restores it on the next toggle, or on `Esc` `Esc` in the editor.
-  * It centres the editor too. Set `"zen_center_layout": false` under `layout` to keep the full width.
+  * It centres the editor too, as VS Code's `zenMode.centerLayout` does. Set `"zen_center_layout": false` under `layout` to keep the full width.
   * For a few seconds after entering it, a box at the bottom says how to leave, since the status bar is hidden.
 * **Centered Layout** (also **View: Toggle Centered Layout**) — keeps the editor `centered_layout_width` columns wide (120 by default) in the middle of its column, with plain margins either side.
   * A window no wider than that is unchanged.
@@ -447,7 +447,7 @@ A pane whose foreground process is a coding agent (claude, codex, aider, gemini,
 * **Broadcast:** `Cmd`/`Ctrl`+`K` `I` broadcasts your typing to every pane at once for multi-server work.
   * It sits behind a confirm popup, and red `⇶` pills mark the receiving panes.
 * **Inline images:** `imgcat` pictures render inline at their output row.
-* **Progress:** a program that reports progress to the terminal (systemd, winget, cargo wrappers) turns the pane's bottom border into a live gauge.
+* **Progress:** a program reporting OSC `9;4` progress (systemd, winget, cargo wrappers) turns the pane's bottom border into a live gauge.
   * Blue advancing, red frozen on error, yellow paused, a sweeping segment while indeterminate.
   * The percent is echoed in the pane's name pill.
 
@@ -823,9 +823,9 @@ Choosing and adding:
 Compounds declared in the same file are listed too, with their member configurations.
 
 * Selecting one that names a SINGLE configuration launches it.
-* One that names several is refused rather than launched as a subset. Running several sessions at once is not supported.
+* One that names several is refused rather than launched as a subset. Running several sessions at once is [still to build](https://github.com/vitali87/croft/issues/310).
 * `presentation.hidden` keeps a compound out of that picker entirely, and one asking only to be hidden launches normally.
-* `presentation.group` and `presentation.order` want an ordering the picker does not have, so a single-member compound setting either is refused rather than launched without it.
+* `presentation.group` and `presentation.order` want an ordering the picker does not have, so a single-member compound setting either is refused rather than launched without it ([#318](https://github.com/vitali87/croft/issues/318)).
 * A compound's own `preLaunchTask` runs before its member starts and gates the launch on exit 0, as a configuration's own task does.
 * It chains with the member's task if it has one.
 
