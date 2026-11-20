@@ -56,7 +56,7 @@ The same protocol tells `Ctrl`+`Shift`+a letter from `Ctrl`+that letter. Without
 tmux does not speak the kitty protocol. Inside it, `Shift` reaches croft only through tmux's own extended keys, and only in one setup:
 
 * **tmux 3.2 to 3.4 with `set -g extended-keys always`:** the chord arrives as `CSI 83;6u` and jumps to Source Control.
-* **`extended-keys on`:** tmux sends extended keys only to a program that asks for xterm's modifyOtherKeys, which croft does not. tmux 3.2 to 3.4 then drop the chord.
+* **`extended-keys on`:** tmux sends extended keys only to a program that asks for xterm's modifyOtherKeys, which croft does not, so tmux 3.2 to 3.4 drop the chord.
 * **tmux 3.5 and later:** the chord arrives as the plain `Ctrl`+`S` byte whatever `extended-keys` says, so it saves.
 
 ## Nerd Font

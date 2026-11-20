@@ -8,10 +8,10 @@ key by key:
    The file every toggle and the theme picker write to.
    - **Synced** — `~/.config/croft/config.synced.json`. Written by config
      sync when you `croft remote` here from another machine (see below).
-   - It holds that machine's theme and editor toggles, limited to the same
-     allowlist as a workspace layer.
-   - It wins over this machine's `config.json`, so your theme follows you,
-     and loses to `config.local.json`.
+     - It holds that machine's theme and editor toggles, limited to the same
+       allowlist as a workspace layer.
+     - It wins over this machine's `config.json`, so your theme follows you,
+       and loses to `config.local.json`.
 3. **User, machine-local** — `~/.config/croft/config.local.json`. Overrides
    for this machine only; keep `config.json` in your dotfiles repo and put
    the per-box exceptions here.
