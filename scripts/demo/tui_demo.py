@@ -10,7 +10,8 @@ scenario. Two ways to draw the frames:
   directly in a new window of your running Ghostty, with your Ghostty
   config, so it sees a real Ghostty (fonts, Kitty images, keys). Keys go in
   through Ghostty's AppleScript `send key`, and each snapshot is a
-  screenshot of that window. Needs Ghostty 1.3 or newer; macOS asks once
+  screenshot of that window. Needs Ghostty 1.4 or newer (older ones
+  drop typed characters, so they record with xterm); macOS asks once
   for Screen Recording and Automation permission. Leave the window alone
   while it records.
 * xterm (everywhere else): croft runs in a sized tmux session and the frames
@@ -29,6 +30,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import plistlib
 import os
 import shutil
 import signal
@@ -50,11 +52,47 @@ FONT_SHA256 = "0e58ff9c1f9378922b7f324fdba953929d88d61b36aedd80ee43964567b226cc"
 FONTS = ("DejaVuSansMNerdFontMono-Regular.ttf", "DejaVuSansMNerdFontMono-Bold.ttf")
 GHOSTTY_FONT_SIZE = 18
 GHOSTTY_APP = Path("/Applications/Ghostty.app/Contents/MacOS/ghostty")
+GHOSTTY_PLIST = GHOSTTY_APP.parents[1] / "Info.plist"
+# The first release whose `send key` delivers character keys.
+GHOSTTY_MIN = (1, 4)
 TERMINALS = ("ghostty", "xterm")
 
 
-def choose_terminal(env: dict, platform: str, ghostty: Path | None) -> str:
-    """The terminal that draws the frames: CROFT_DEMO_TERMINAL, else Ghostty on a Mac that has it."""
+def ghostty_supported(version: str) -> bool:
+    """Whether Ghostty `version` (e.g. "1.4.0") can drive a recording."""
+    try:
+        parts = tuple(int(p) for p in version.split(".")[:2])
+    except ValueError:
+        return False
+    return parts >= GHOSTTY_MIN
+
+
+def ghostty_version() -> str:
+    """The installed Ghostty.app's version, or "" when it cannot be read."""
+    try:
+        with GHOSTTY_PLIST.open("rb") as f:
+            return str(plistlib.load(f).get("CFBundleShortVersionString", ""))
+    except (OSError, plistlib.InvalidFileException):
+        return ""
+
+
+def new_window(before: dict[str, int], after: dict[str, int]) -> tuple[str, int] | None:
+    """The (CGWindowID, width in points) of the one window in `after` but not `before`."""
+    new = [(w, width) for w, width in after.items() if w not in before]
+    if len(new) > 1:
+        raise RuntimeError("Ghostty opened more than one window; close the others and record again")
+    return new[0] if new else None
+
+
+def shot_scale(points: int, pixels: int) -> float:
+    """The factor that brings a `pixels`-wide screenshot of a `points`-wide window to 1x."""
+    if pixels <= 0:
+        raise ValueError(f"screenshot is {pixels} pixels wide")
+    return points / pixels
+
+
+def choose_terminal(env: dict, platform: str, ghostty: Path | None, version: str = "") -> str:
+    """The terminal that draws the frames: CROFT_DEMO_TERMINAL, else Ghostty 1.4+ on a Mac that has it."""
     asked = env.get("CROFT_DEMO_TERMINAL")
     if asked is not None and asked not in TERMINALS:
         raise ValueError(f"CROFT_DEMO_TERMINAL={asked!r}; expected one of {', '.join(TERMINALS)}")
@@ -65,8 +103,11 @@ def choose_terminal(env: dict, platform: str, ghostty: Path | None) -> str:
             raise RuntimeError("CROFT_DEMO_TERMINAL=ghostty records a macOS window; use xterm here")
         if ghostty is None:
             raise RuntimeError(f"CROFT_DEMO_TERMINAL=ghostty, but Ghostty is not at {GHOSTTY_APP}")
+        if not ghostty_supported(version):
+            raise RuntimeError(f"CROFT_DEMO_TERMINAL=ghostty needs Ghostty 1.4 or newer; this is {version or 'unknown'}")
         return "ghostty"
-    return "ghostty" if platform == "darwin" and ghostty is not None else "xterm"
+    usable = platform == "darwin" and ghostty is not None and ghostty_supported(version)
+    return "ghostty" if usable else "xterm"
 
 
 # tmux key names (what scenarios pass to `key`) as Ghostty physical keys.
@@ -147,9 +188,11 @@ class Demo:
         self.project = self.home / "proj"
         self.frames: list[tuple[str, int]] = []
         found = GHOSTTY_APP if GHOSTTY_APP.exists() else None
-        self.terminal = choose_terminal(dict(os.environ), sys.platform, found)
+        version = ghostty_version() if found else ""
+        self.terminal = choose_terminal(dict(os.environ), sys.platform, found, version)
         self.window = ""  # Ghostty's AppleScript id for the window
         self.window_id = ""  # its CGWindowID, for screencapture
+        self.window_width = 0  # its width in points, to undo Retina scaling
         self.shots = self.home / ".shots"
         config = {"suppress_terminal_warning": True, **(user_config or {})}
         _write_json(self.home / ".config/croft/config.json", config)
@@ -215,7 +258,7 @@ class Demo:
             + " ".join(f"{k}={_q(v)}" for k, v in env.items())
             + f" {_q(str(self.binary))} .\n"
         )
-        before = set(_ghostty_window_ids())
+        before = _ghostty_window_ids()
         self.window = _osascript(
             'tell application "Ghostty"',
             "set cfg to new surface configuration",
@@ -226,9 +269,9 @@ class Demo:
         )
         for _ in range(100):
             time.sleep(0.1)
-            new = [w for w in _ghostty_window_ids() if w not in before]
-            if new:
-                self.window_id = new[0]
+            found = new_window(before, _ghostty_window_ids())
+            if found:
+                self.window_id, self.window_width = found
                 break
         else:
             raise RuntimeError("Ghostty opened no window to record")
@@ -290,7 +333,11 @@ class Demo:
             self._close_ghostty()
             try:
                 index = [{"file": s, "ms": ms} for s, ms in self.frames]
-                _write_gif(Path("/"), index, Path(gif), scale=0.5)
+                from PIL import Image
+
+                with Image.open(self.frames[0][0]) as first:
+                    scale = shot_scale(self.window_width, first.width)
+                _write_gif(Path("/"), index, Path(gif), scale=scale)
                 if still is not None:
                     shutil.copy(self.frames[still_frame][0], still)
             finally:
@@ -318,9 +365,12 @@ class Demo:
 
     def close(self) -> None:
         """Stop croft (its Ghostty window, or tmux server) and delete the temporary HOME."""
-        self._close_ghostty()
-        subprocess.run(["tmux", "-L", self.socket, "kill-server"], capture_output=True)
-        shutil.rmtree(self.home, ignore_errors=True)
+        try:
+            self._close_ghostty()
+            if self.terminal == "xterm":
+                subprocess.run(["tmux", "-L", self.socket, "kill-server"], capture_output=True)
+        finally:
+            shutil.rmtree(self.home, ignore_errors=True)
 
     def _close_ghostty(self) -> None:
         """Stop croft and close its Ghostty window, if this recording opened one."""
@@ -348,8 +398,8 @@ class Demo:
         ).stdout
 
 
-def _ghostty_window_ids() -> list[str]:
-    """CGWindowIDs of Ghostty's on-screen windows."""
+def _ghostty_window_ids() -> dict[str, int]:
+    """Ghostty's on-screen windows: CGWindowID to width in points."""
     script = """
 ObjC.import('CoreGraphics');
 function run() {
@@ -360,14 +410,17 @@ function run() {
     const w = list.objectAtIndex(i);
     if (ObjC.unwrap(w.objectForKey('kCGWindowOwnerName')) === 'Ghostty'
         && ObjC.unwrap(w.objectForKey('kCGWindowLayer')) === 0) {
-      out.push(String(ObjC.unwrap(w.objectForKey('kCGWindowNumber'))));
+      const bounds = ObjC.deepUnwrap(w.objectForKey('kCGWindowBounds'));
+      out.push(ObjC.unwrap(w.objectForKey('kCGWindowNumber')) + ':' + Math.round(bounds.Width));
     }
   }
   return out.join(' ');
 }
 """
     out = subprocess.run(["osascript", "-l", "JavaScript", "-e", script], capture_output=True, text=True, check=False)
-    return out.stdout.split()
+    if out.returncode != 0:
+        raise RuntimeError(f"could not list Ghostty's windows: {out.stderr.strip()}")
+    return {w: int(width) for w, width in (item.split(":") for item in out.stdout.split())}
 
 
 def _osascript(*lines: str, check: bool = True) -> str:

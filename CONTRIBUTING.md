@@ -170,7 +170,7 @@ file into the PR description.
 <summary>Recording without a browser (agents, headless machines)</summary>
 
 `scripts/demo/tui_demo.py` drives the real binary and writes a GIF. On macOS
-with Ghostty 1.3+ it runs croft in a new window of your Ghostty and screenshots
+with Ghostty 1.4+ it runs croft in a new window of your Ghostty and screenshots
 it (allow Screen Recording and Automation once; leave the window alone while
 it records). Elsewhere, or with `CROFT_DEMO_TERMINAL=xterm`, it uses tmux and
 replays the frames in headless Chromium, which needs tmux, node and Chromium.
