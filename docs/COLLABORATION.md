@@ -12,26 +12,34 @@ croft attach ~/projects          # ...for a specific folder
 croft ls                         # list running persistent sessions
 ```
 
-`croft attach` runs the session under croft's built-in session host, so its terminals,
-language servers, debugger, and open files keep running after you close the window (or lose
-the SSH connection). Close the window to detach; run `croft attach` again in the same folder
-to reattach where you left off. This is the persistence `croft remote` gives you over SSH,
-available locally with no external dependency.
-
-Sessions started by an older croft under dtach keep reattaching through dtach until they end.
+* `croft attach` runs the session under croft's built-in session host.
+* Its terminals, language servers, debugger, and open files keep running after
+  you close the window (or lose the SSH connection).
+* **Detach:** close the window.
+* **Reattach:** run `croft attach` again in the same folder; you are back where
+  you left off.
+* This is the persistence `croft remote` gives you over SSH, available locally
+  with no external dependency.
+* Sessions started by an older croft under dtach keep reattaching through dtach
+  until they end.
 
 ## Shared sessions
 
-Several people (or several of your own windows) can `croft attach` the same folder and share
-the session live. The first attacher holds write control and later attachers join as read-only
-observers, enforced by the host, with everyone's window sized to the smallest participant.
+Several people (or several of your own windows) can `croft attach` the same
+folder and share the session live.
 
-The status bar shows an "N attached" badge whenever someone else is on, and
-**Session: Participants** (`Cmd+K A`) lists everyone so you can grant or revoke write control
-or disconnect a participant. **Session: Detach** (`Cmd+K Shift+Q`) leaves the session without
-ending it, from any client, read-only ones included. When several people hold control and take
-turns typing, each keeps their own caret: croft parks the previous typist's cursor, restores the new typist's, and shows
-everyone else's position as a colored ghost caret in the editor.
+* **Write control:** the first attacher holds it. Later attachers join as
+  read-only observers, enforced by the host.
+* **Window size:** everyone's window is sized to the smallest participant.
+* **Badge:** the status bar shows "N attached" whenever someone else is on.
+* **Session: Participants** (`Cmd+K A`) lists everyone, so you can grant or
+  revoke write control or disconnect a participant.
+* **Session: Detach** (`Cmd+K Shift+Q`) leaves the session without ending it,
+  from any client, read-only ones included.
+* **Carets:** when several people hold control and take turns typing, each keeps
+  their own caret. croft parks the previous typist's cursor, restores the new
+  typist's, and shows everyone else's position as a colored ghost caret in the
+  editor.
 
 ## Independent viewports (`--solo`)
 
@@ -40,14 +48,18 @@ croft attach --solo ~/projects            # locally
 croft remote <host> <path> --solo         # over SSH
 ```
 
-`--solo` opens an independent viewport on the same workspace: your own croft process,
-scrolling and navigating freely, while edits to shared files replicate live between
-participants and always converge (a CRDT under the hood, no central server). Peers' cursors
-appear as colored ghost carets wearing their owner's name while they move (VS Code Live Share
-style), and the session owner is the single writer to disk, so saves, history, and the file
-watcher see one author. Undo is your own: Ctrl+Z takes back your last change and keeps what
-your partners typed since, and they see your undo as an ordinary edit. A navigator's edit is
-the exception: it undoes in one step, so you can reject it.
+`--solo` opens an independent viewport on the same workspace: your own croft
+process, scrolling and navigating freely.
+
+* **Edits replicate live:** edits to shared files replicate between participants
+  and always converge (a CRDT under the hood, no central server).
+* **Peers' cursors** appear as colored ghost carets wearing their owner's name
+  while they move (VS Code Live Share style).
+* **One writer to disk:** the session owner, so saves, history, and the file
+  watcher see one author.
+* **Undo is your own:** Ctrl+Z takes back your last change and keeps what your
+  partners typed since. They see your undo as an ordinary edit.
+* **Except a navigator's edit:** it undoes in one step, so you can reject it.
 
 ## An AI seat via MCP
 
@@ -57,15 +69,16 @@ Register croft's collab agent as an MCP server, for example with Claude Code:
 claude mcp add croft-collab -- croft collab-agent --workspace /abs/path/to/project
 ```
 
-The seat needs croft to host the workspace as a session: open it with
-`croft attach /abs/path/to/project`. A plain `croft` window does not serve agents, and
-`collab_open` says so rather than waiting on it.
-
-The agent joins the running session as a guest with `collab_open` / `collab_read` /
-`collab_replace` / `collab_caret` / `collab_status` tools: its edits stream into your editor
-live, its caret shows up named (default `claude`, `--name` overrides), and it can never write
-your disk — the session owner persists what lands. Croft ships no LLM; any MCP-speaking agent
-can drive the seat.
+* **The seat needs croft to host the workspace as a session:** open it with
+  `croft attach /abs/path/to/project`.
+* A plain `croft` window does not serve agents, and `collab_open` says so rather
+  than waiting on it.
+* The agent joins the running session as a guest with `collab_open` /
+  `collab_read` / `collab_replace` / `collab_caret` / `collab_status` tools.
+* Its edits stream into your editor live.
+* Its caret shows up named (default `claude`, `--name` overrides).
+* It can never write your disk — the session owner persists what lands.
+* Croft ships no LLM; any MCP-speaking agent can drive the seat.
 
 ## Agents: edit approvals through croft
 
@@ -77,16 +90,22 @@ croft hook install --global   # every project: ~/.claude/settings.json
 croft hook install --uninstall
 ```
 
-`install` prints the settings diff, then adds one `PreToolUse` entry that runs
-`croft hook claude-code`. Nothing else in the file changes. `--uninstall` takes
-out that entry and nothing else. If the file is still exactly what `install`
-wrote, uninstalling puts back the original bytes, and deletes the file if
-`install` created it.
+### Installing and uninstalling the hook
 
-For each edit, the hook finds the croft whose workspace encloses Claude Code's
-working directory (socket `<hash>.hook.sock` beside the session sockets). It
-sends croft the tool name and input as one JSON line, and waits up to 120 s
-for `{"decision": "allow" | "deny" | "ask", "reason": ...}`.
+* `install` prints the settings diff, then adds one `PreToolUse` entry that runs
+  `croft hook claude-code`. Nothing else in the file changes.
+* `--uninstall` takes out that entry and nothing else.
+* If the file is still exactly what `install` wrote, uninstalling puts back the
+  original bytes, and deletes the file if `install` created it.
+
+### How the hook asks croft
+
+For each edit, the hook:
+
+1. finds the croft whose workspace encloses Claude Code's working directory
+   (socket `<hash>.hook.sock` beside the session sockets);
+2. sends croft the tool name and input as one JSON line;
+3. waits up to 120 s for `{"decision": "allow" | "deny" | "ask", "reason": ...}`.
 
 - **No croft open:** the hook prints nothing and exits at once. Claude Code's
   own permission prompt decides, so a closed editor never stalls an agent and
@@ -97,20 +116,30 @@ for `{"decision": "allow" | "deny" | "ask", "reason": ...}`.
 The request carries no Claude-specific fields, so another agent with a hook
 system needs only a settings writer and its own reply shape.
 
-In croft, each proposal opens a popup over everything else. The title reads
-`claude-code wants to edit src/foo.rs`, and the body is the change as a
-unified diff against the file on disk. More than one proposal queues in
-arrival order, and the title counts the ones waiting (`· 2 pending`).
+### The approval popup
 
-When the file's language has a server, croft sends it the proposed text as
-the file's content while the popup is up, so problems the edit introduces show
-before you approve. A line above the diff says what the servers found (still
-checking, nothing, or how many errors and warnings with the first one), and a
-proposed row a problem names carries it at its end. Those diagnostics belong to
-the proposal: the editor and PROBLEMS keep the buffer's own. When the proposal
-is answered or leaves, the server gets the file back: an open tab's text is
-sent again, and a file no tab holds is closed. Edits to that tab meanwhile are
-sent once the check ends.
+* Each proposal opens a popup over everything else.
+* The title reads `claude-code wants to edit src/foo.rs`.
+* The body is the change as a unified diff against the file on disk.
+* More than one proposal queues in arrival order, and the title counts the ones
+  waiting (`· 2 pending`).
+
+### Diagnostics before you approve
+
+When the file's language has a server, croft sends it the proposed text as the
+file's content while the popup is up, so problems the edit introduces show
+before you approve.
+
+* A line above the diff says what the servers found: still checking, nothing,
+  or how many errors and warnings with the first one.
+* A proposed row a problem names carries it at its end.
+* Those diagnostics belong to the proposal. The editor and PROBLEMS keep the
+  buffer's own.
+* When the proposal is answered or leaves, the server gets the file back: an
+  open tab's text is sent again, and a file no tab holds is closed.
+* Edits to that tab meanwhile are sent once the check ends.
+
+### Popup keys
 
 | Key | Does |
 |---|---|
@@ -120,78 +149,109 @@ sent once the check ends.
 | `e` | edit, then approve: the proposed file opens as a scratch tab; saving it approves your version, closing it unsaved returns to the popup |
 | `↑` `↓` `PgUp` `PgDn` `Home` `End` | scroll the diff |
 
-For its first 400 ms the popup ignores keys, so an `Enter` meant for the pane
-you were typing in cannot approve an edit you have not seen. Approving only
-answers the agent, which then makes the edit itself; croft writes nothing.
-An edited approval goes back as Claude Code's `updatedInput`, in the shape the
-tool already takes. A `Write` carries your text as its content. An `Edit` becomes
-one replacement of the file's current text with yours. An `Edit` of an empty
-file cannot carry an edited version, so `e` refuses it.
+* **400 ms key guard:** for its first 400 ms the popup ignores keys, so an
+  `Enter` meant for the pane you were typing in cannot approve an edit you have
+  not seen.
+* **croft writes nothing:** approving only answers the agent, which then makes
+  the edit itself.
+* **Edited approvals** go back as Claude Code's `updatedInput`, in the shape the
+  tool already takes:
+  * a `Write` carries your text as its content;
+  * an `Edit` becomes one replacement of the file's current text with yours;
+  * an `Edit` of an empty file cannot carry an edited version, so `e` refuses
+    it.
 
-**When the file has unsaved edits in croft.** An agent's proposal is computed
-from the file on disk, so it knows nothing of your unsaved edits. Approving it
-as proposed would put the agent's write under them. For such a file the popup
-says so, and `Enter` or `e` opens a three-way merge instead: the disk text both
-started from, your edits as Current, and the agent's as Incoming. Changes
-only one side made are applied automatically. Saving approves the result once
-no conflict is left, and your tab takes the same text, one Undo away from your
-edits. Approve-all (`a`) never auto-approves such a file.
-If an edit can't be worked out against the file on disk (its text is missing,
-or ambiguous without `replace_all`), croft answers `ask` without showing the
-popup. A proposal still waiting when the hook's 120 s run out leaves the
-queue.
+### When the file has unsaved edits in croft
+
+An agent's proposal is computed from the file on disk, so it knows nothing of
+your unsaved edits. Approving it as proposed would put the agent's write under
+them.
+
+* For such a file the popup says so.
+* `Enter` or `e` opens a three-way merge instead: the disk text both started
+  from, your edits as Current, and the agent's as Incoming.
+* Changes only one side made are applied automatically.
+* Saving approves the result once no conflict is left. Your tab takes the same
+  text, one Undo away from your edits.
+* Approve-all (`a`) never auto-approves such a file.
+
+### Edits croft cannot show
+
+* If an edit can't be worked out against the file on disk (its text is missing,
+  or ambiguous without `replace_all`), croft answers `ask` without showing the
+  popup.
+* A proposal still waiting when the hook's 120 s run out leaves the queue.
 
 ## The resident navigator
 
-A driver/navigator pair-programming seat that croft itself hosts, with no second terminal to
-babysit:
+A driver/navigator pair-programming seat that croft itself hosts, with no second
+terminal to babysit:
 
 ```sh
 croft pair --workspace /abs/path/to/project --model claude-haiku-4-5-20251001 --name navigator
 ```
 
-The command records the activation and exits; the running croft (or the next one you start
-there) seats the pilot within a second and wears a `◆ navigator seated` badge. While seated it
-keeps its own orange caret in the file — parked wherever you last engaged it, at every comment
-it leaves, and riding its edits as they stream. Inside the editor:
+* The command records the activation and exits.
+* The running croft (or the next one you start there) seats the pilot within a
+  second and wears a `◆ navigator seated` badge.
+* While seated it keeps its own orange caret in the file: parked wherever you
+  last engaged it, at every comment it leaves, and riding its edits as they
+  stream.
 
-- **Ask it** about a line or a selection — right-click the gutter ("Ask Navigator"), right-click
-  a selection ("Ask Navigator About Selection"), or press `Cmd+K Q`. From the CAPTURES panel, `n` on a
-  captured line asks about that line with the pane rows around it. From the PROBLEMS panel,
-  right-click a diagnostic → **Fix with Navigator** (also the last row of the `Cmd+.` Quick Fix
-  picker) sends it the diagnostic with the server's quick fixes as hints; the row wears a spinner
-  until the turn ends, and `Cmd+K X` cancels and reverts. Its edits stream into the
-  buffer **token by token**, the way a human types, with a named caret riding the stream.
-- **Yield it the turn** with `Cmd+K Y`: it reviews the active file *comment-only* — everything
-  it says appears as **comment boxes** in the file, unnumbered blocks between the lines they
-  belong to (never part of the buffer, never saved). Each box carries a reply field and an
-  **Ignore** button: type back and press `Enter` to continue the conversation in place, or
-  dismiss it and keep working. A reply is your turn: ask for the change a box proposes
-  ("correct this") and the edit streams in, exactly as for `Cmd+K Q`. `F4` hops to the next
-  box, `Shift+F4` ignores one. Any edit it attempts on a yielded turn is discarded by the
-  host, not just discouraged.
-- **Cancel a stream mid-run**: click the orange `■` stop button in the gutter or press
-  `Cmd+K X` — the streamed text is reverted and the conversation stays alive for your next
-  instruction.
-- **It re-engages on its own**: once it has seen a file, finishing a new function, struct, or
-  markdown section and pausing hands it another comment-only look — a pair partner glancing
-  over, never able to edit uninvited. Turn it off with "Navigator: Toggle Proactive Comments".
+Inside the editor:
 
-The model's toolbox is read-only (`Read`/`Grep`/`Glob` plus a read-only collab seat); the only
-way it can change a buffer is the visible, cancellable stream. `croft pair --off` (or the
-"Navigator: Activate or Deactivate" palette entry) unseats it.
+- **Ask it** about a line or a selection:
+  - right-click the gutter ("Ask Navigator");
+  - right-click a selection ("Ask Navigator About Selection");
+  - or press `Cmd+K Q`.
+  - From the CAPTURES panel, `n` on a captured line asks about that line with
+    the pane rows around it.
+  - From the PROBLEMS panel, right-click a diagnostic → **Fix with Navigator**
+    (also the last row of the `Cmd+.` Quick Fix picker). It sends the diagnostic
+    with the server's quick fixes as hints. The row wears a spinner until the
+    turn ends, and `Cmd+K X` cancels and reverts.
+  - Its edits stream into the buffer **token by token**, the way a human types,
+    with a named caret riding the stream.
+- **Yield it the turn** with `Cmd+K Y`: it reviews the active file
+  *comment-only*.
+  - Everything it says appears as **comment boxes** in the file: unnumbered
+    blocks between the lines they belong to (never part of the buffer, never
+    saved).
+  - Each box carries a reply field and an **Ignore** button. Type back and press
+    `Enter` to continue the conversation in place, or dismiss it and keep
+    working.
+  - A reply is your turn: ask for the change a box proposes ("correct this") and
+    the edit streams in, exactly as for `Cmd+K Q`.
+  - `F4` hops to the next box, `Shift+F4` ignores one.
+  - Any edit it attempts on a yielded turn is discarded by the host, not just
+    discouraged.
+- **Cancel a stream mid-run**: click the orange `■` stop button in the gutter or
+  press `Cmd+K X`. The streamed text is reverted and the conversation stays
+  alive for your next instruction.
+- **It re-engages on its own**: once it has seen a file, finishing a new
+  function, struct, or markdown section and pausing hands it another
+  comment-only look — a pair partner glancing over, never able to edit
+  uninvited. Turn it off with "Navigator: Toggle Proactive Comments".
+
+Safety and switching off:
+
+* The model's toolbox is read-only (`Read`/`Grep`/`Glob` plus a read-only collab
+  seat).
+* The only way it can change a buffer is the visible, cancellable stream.
+* `croft pair --off` (or the "Navigator: Activate or Deactivate" palette entry)
+  unseats it.
 
 ### Local models
 
-The navigator is not claude-only. Point it at any local Anthropic-compatible endpoint — Ollama,
-LM Studio, llama.cpp, vLLM — and your own open-weight model takes the seat: same fences, same
-streaming, same cancel.
+The navigator is not claude-only. Point it at any local Anthropic-compatible
+endpoint — Ollama, LM Studio, llama.cpp, vLLM — and your own open-weight model
+takes the seat: same fences, same streaming, same cancel.
 
 ```sh
 croft pair --provider ollama --model qwen3-coder:30b          # Ollama on localhost:11434
 croft pair --base-url http://box:8080 --model qwen3-coder:30b # any compatible server (implies ollama)
 ```
 
-Local turns go straight to `/v1/messages` with a minimal payload (the claude CLI's ~213 KB
-tool-schema prefill is exactly what local servers choke on), and the badge names who is typing:
-`◆ claude (qwen3-coder:30b) seated`.
+* Local turns go straight to `/v1/messages` with a minimal payload. The claude
+  CLI's ~213 KB tool-schema prefill is exactly what local servers choke on.
+* The badge names who is typing: `◆ claude (qwen3-coder:30b) seated`.
