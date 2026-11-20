@@ -22759,3 +22759,51 @@ fn a_horizontal_move_ends_the_carried_column() {
         "from column 2, not 20"
     );
 }
+
+/// Page Up/Down on a buffer with no lines (a fresh untitled tab) must not
+/// index past the end.
+#[test]
+fn page_keys_on_an_empty_buffer_do_not_panic() {
+    let mut e = editor_with("");
+    e.lines.clear();
+    render_at(&mut e, 60, 10);
+    e.wrap_override = Some(false);
+    e.page_down_one_screen();
+    e.page_up_one_screen();
+    assert_eq!((e.cursor_row, e.cursor_col), (0, 0));
+}
+
+/// Moving away and back to the very same spot (or typing and erasing) does
+/// not resurrect the old carried column.
+#[test]
+fn returning_to_the_same_spot_forgets_the_carried_column() {
+    let long = "abcdefghijklmnopqrstuvwxyz";
+    let mut e = editor_with(&format!("{long}\nabc\n{long}\n"));
+    e.wrap_override = Some(false);
+    render_at(&mut e, 60, 10);
+    e.cursor_col = 20;
+    e.move_down();
+    assert_eq!((e.cursor_row, e.cursor_col), (1, 3));
+    e.move_left();
+    e.move_right();
+    e.move_down();
+    assert_eq!((e.cursor_row, e.cursor_col), (2, 3));
+}
+
+/// In wrap mode a landing inside a non-final screen row stays on that row,
+/// so repeated Up keeps moving instead of sticking.
+#[test]
+fn wrapped_up_is_not_stuck_after_landing_in_a_non_final_row() {
+    let mut e = editor_with("abcdefghi\nab abcdefghij\n");
+    e.wrap_override = Some(true);
+    render_at(&mut e, 40, 10);
+    let gutter = 40 - e.visible_text_width() as u16;
+    render_at(&mut e, gutter + 10, 10);
+    assert_eq!(e.visible_text_width(), 10);
+    e.cursor_col = 7;
+    e.move_down();
+    assert_eq!(e.cursor_row, 1);
+    assert!(e.cursor_col < 3, "stays on the first screen row of line 1");
+    e.move_up();
+    assert_eq!((e.cursor_row, e.cursor_col), (0, 7));
+}

@@ -280,7 +280,7 @@ impl Editor {
         };
 
         self.undoable_edit(EditKind::EmmetExpand, |this| {
-            this.last_edit_kind = None;
+            this.end_caret_action();
 
             let chars: Vec<char> = line.chars().collect();
             let before: String = chars[..start_col].iter().collect();
@@ -364,7 +364,7 @@ impl Editor {
             (head, tail)
         };
         self.undoable_edit(EditKind::EmmetExpand, |this| {
-            this.last_edit_kind = None;
+            this.end_caret_action();
             let old_end = this.lines.len() - tail;
             let added = new.len() - tail - head;
             this.lines

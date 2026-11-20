@@ -717,7 +717,7 @@ impl Editor {
             anchor: (r, start),
             head: (r, end),
         });
-        self.last_edit_kind = None;
+        self.end_caret_action();
     }
 
     /// Lines `from` through `to` as one whole-line selection (#1570): from
@@ -766,6 +766,6 @@ impl Editor {
             })
             .collect();
         self.set_selections(&all);
-        self.last_edit_kind = None;
+        self.end_caret_action();
     }
 }
