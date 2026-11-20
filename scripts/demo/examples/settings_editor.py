@@ -5,6 +5,7 @@
 """
 
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -26,6 +27,13 @@ def main(binary: str, gif: str) -> None:
 def record(d: Demo, gif: str) -> None:
     """The steps: open the editor, flip a bool, set a number, use the workspace."""
     d.start()
+    # A file open, so no Welcome-screen image sits under the modal (#2419).
+    d.key("C-p")
+    time.sleep(0.5)
+    d.send_text("main.rs")
+    time.sleep(0.6)
+    d.key("Enter")
+    time.sleep(0.8)
     d.snap(1200)
 
     d.ctrl_shift("p")
