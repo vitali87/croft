@@ -73,7 +73,13 @@ jobs:
     # does, unlike a workflow-token push). That run finds nothing pending and
     # pushes nothing, so it needs no skip; a skip by commit message would
     # also skip a merged PR whose title began the same way.
-    runs-on: ubuntu-latest
+    # On our own servers when one has a free slot, on GitHub's
+    # otherwise; forks and releases always on GitHub's: https://github.com/vitali87/code-graph-rag/tree/main/infra/runner-pool
+    runs-on: >-
+      ${{ vars.OWN_RUNNERS_FREE == 'true' && github.event_name != 'release'
+      && !startsWith(github.ref, 'refs/tags/')
+      && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+      && fromJSON('["self-hosted","own-linux"]') || 'ubuntu-latest' }}
     timeout-minutes: 10
     steps:
       - name: The deploy key is set
