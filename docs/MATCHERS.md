@@ -1,28 +1,35 @@
 # Problem matchers
 
-croft turns command output into PROBLEMS entries with zero configuration:
-every finished command in a terminal pane runs through built-in matchers
-for rustc/cargo, tsc (both output shapes), gcc/clang and anything else
-using the `file:line:col: severity: message` shape, mypy and javac
-(`file:line: severity: message`, no column), `go build` and `go vet`,
-flake8, pylint and ruff (both its concise and default output), Python
-tracebacks (the deepest frame), eslint's stylish and compact formats, and
-MSBuild's `file(line,col): error CODE: message`. The go and
-flake8-style rows (`file:line:col: CODE message`) are loose enough to
-match other output, so they count only for a file that exists. Rerunning a command in
-a pane replaces that pane's previous entries, so a clean rebuild clears its
-errors.
+croft turns command output into PROBLEMS entries with zero configuration.
+Every finished command in a terminal pane runs through built-in matchers
+for:
+
+- rustc/cargo
+- tsc (both output shapes)
+- gcc/clang, and anything else using the `file:line:col: severity: message` shape
+- mypy and javac (`file:line: severity: message`, no column)
+- `go build` and `go vet`
+- flake8, pylint and ruff (both its concise and default output)
+- Python tracebacks (the deepest frame)
+- eslint's stylish and compact formats
+- MSBuild's `file(line,col): error CODE: message`
+
+The go and flake8-style rows (`file:line:col: CODE message`) are loose
+enough to match other output, so they count only for a file that exists.
+
+Rerunning a command in a pane replaces that pane's previous entries, so a
+clean rebuild clears its errors.
 
 `matchers.json` extends that to tools croft does not know, and to watch
 tasks that never exit.
 
 ## matchers.json
 
-Lives next to `triggers.json` in `~/.config/croft/` (palette:
-**Preferences: Open Problem Matchers (JSON)**, reloaded on save). A
-workspace may add its own at `<root>/.croft/matchers.json`; workspace
-matchers are regexes applied to output — they never execute anything.
-JSONC (comments, trailing commas) is fine.
+- Lives next to `triggers.json` in `~/.config/croft/` (palette:
+  **Preferences: Open Problem Matchers (JSON)**, reloaded on save).
+- A workspace may add its own at `<root>/.croft/matchers.json`. Workspace
+  matchers are regexes applied to output; they never execute anything.
+- JSONC (comments, trailing commas) is fine.
 
 ```jsonc
 [
@@ -57,23 +64,26 @@ Each entry:
   into a watch matcher (below).
 - **`"enabled": false`** — keep an entry without running it.
 
-Custom matchers run alongside the built-in table; a built-in row at the
-same file/line/column as a custom row is dropped, so a matcher for a
-gcc-shaped format never double-reports. Regexes that fail to compile are
-dropped with a warning in **OUTPUT · Matchers** at load — a broken entry
-never blocks startup or the stream path.
+- Custom matchers run alongside the built-in table. A built-in row at the
+  same file/line/column as a custom row is dropped, so a matcher for a
+  gcc-shaped format never double-reports.
+- Regexes that fail to compile are dropped with a warning in
+  **OUTPUT · Matchers** at load. A broken entry never blocks startup or
+  the stream path.
 
 ## Watch tasks (background matchers)
 
 `tsc --watch`, `cargo watch`, vite: long-running watchers never hit the
 finished-command boundary, so batch scanning never sees them. A matcher
-with a `background` block runs on the live stream instead: when a pane's
-output matches `begins`, croft starts collecting; on `ends` the window
-is scanned and published to PROBLEMS, replacing the pane's previous
-batch. Every recompile cycle republishes, and a clean cycle publishes an
-empty batch, which is what clears the errors you just fixed. The
-watcher's own exit does not re-scan its scrollback, so old cycles never
-resurrect.
+with a `background` block runs on the live stream instead:
+
+- When a pane's output matches `begins`, croft starts collecting.
+- On `ends`, the window is scanned and published to PROBLEMS, replacing
+  the pane's previous batch.
+- Every recompile cycle republishes. A clean cycle publishes an empty
+  batch, which clears the errors you just fixed.
+- The watcher's own exit does not re-scan its scrollback, so old cycles
+  never resurrect.
 
 ```jsonc
 [
