@@ -1,0 +1,1 @@
+feature: Editor: Alt+X runs the selection in the terminal pane, or the caret's line when nothing is selected — and with several carets it runs every selection, in buffer order and one per line (#2340).

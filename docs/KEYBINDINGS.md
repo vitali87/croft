@@ -575,6 +575,10 @@ Not supported yet: transforms such as `${TM_FILENAME/(.*)\\..+$/$1/}`, a picker 
 | `Insert` | Switch between Insert and Overwrite typing for all tabs: in Overwrite a character replaces the one under the caret. The status bar shows ⎁ and the caret becomes a block |
 | `Cmd`+`/` / `Ctrl`+`/` | Toggle line comment for the current line or every line the selection touches |
 | `Shift`+`Alt`+`A` | Toggle block comment around the selection (languages with a block comment) |
+| `Alt`+`A` | Align Cursors: pad every caret's selection with spaces so that selections in one column start at the same column and are all as long as the longest, then leave them so (also Command Palette "Align Cursors"; with fewer than two carets it does nothing) |
+| `Alt`+`F` | Align Cursors (Pad Front): the same padding, all at the front, so the selected text right-aligns into one column |
+| `Ctrl`+`Alt`+`A` | Align Cursors Using Tabs: the same alignment with tabs, snapped to the buffer's own tab stops (the indent width from `.editorconfig`, detection or the status bar, not a fixed four) |
+| `Ctrl`+`Alt`+`Shift`+`A` | Align Line Last Cursors: pad the front of each affected line so the right-most selection end of every line lands in one column |
 | `Alt`+`Z` | Toggle soft word wrap for this file, until the file is reopened |
 | `Alt`+`O` | C/C++: Switch Header/Source: open the header of the C, C++ or Objective-C source, or the source of the header. Command id: `switch_header_source` |
 | `Cmd`/`Ctrl`+`Shift`+`V` | Markdown: Toggle Preview: switch the active Markdown tab between source and rendered view; arrows / PgUp / PgDn / Home / End / wheel scroll it |
@@ -1084,6 +1088,7 @@ Disabling takes effect immediately: a disabled PDF/CSV viewer opens that file ty
 
 | Keys | Action |
 |------|--------|
+| `Alt`+`X` | Send Selection/Line to Terminal: run the editor's selection in the active terminal pane, then Enter: a block goes as one paste (bracketed when the program asked for it), so a `python3`, `psql` or `node` REPL gets it whole. With no selection it runs the caret's line and moves the caret to the next non-blank line, so repeated runs step through a script. With several carets every selection runs, in buffer order and one per line. Focus stays in the editor. Also Command Palette: `Send Selection/Line to Terminal`, and `run_selected_text` in keybindings.json |
 | Any key croft does not bind | Forwarded to the shell (arrows, most `Ctrl+letter`, `Alt+x`, function keys) |
 | A chord croft binds | **Claimed by croft, whatever pane has focus**; the shell never sees it. Everything else is forwarded. The claimed chords are listed below the table |
 | Command Palette: `Terminal: Clear` / `Rename` / `Kill the Active Terminal Instance` / `Split Terminal` / `Create New Terminal (With Profile)` / `Quick Select` / `Enter Copy Mode` / `Show Command History` / `Open Scrollback in Editor` | The terminal's actions as commands, acting on the active pane. A chord bound to one in `keybindings.json` is taken before the shell sees it. Command ids are below the table |

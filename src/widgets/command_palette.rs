@@ -28,6 +28,15 @@ pub enum Command {
     CopyLineDown,
     ToggleLineComment,
     ToggleBlockComment,
+    /// Cursor Align: pad every caret's selection into one column, with spaces
+    /// at both ends (`Alt+A`), at the front only (`Alt+F`), with tabs
+    /// (`Ctrl+Alt+A`), or pad whole lines so their selection ends line up
+    /// (`Ctrl+Alt+Shift+A`).
+    AlignCursors,
+    AlignCursorsPadFront,
+    AlignCursorsUsingTabs,
+    AlignLineLastCursors,
+    AlignCursorsUsingAuto,
     JoinLines,
     InsertLineBelow,
     InsertLineAbove,
@@ -266,6 +275,10 @@ pub enum Command {
     NavigateForward,
     GoToLastEditLocation,
     ToggleVimMode,
+    /// `multi_cursor_persist`: keep every caret through ordinary movement
+    /// and Enter, as VS Code does, instead of collapsing to one on the first
+    /// move. Saved to config like Vim mode.
+    ToggleMultiCursorPersist,
     MacroStartStopRecording,
     MacroReplayLast,
     MacroReplayTimes,
@@ -439,8 +452,8 @@ pub enum Command {
     ProblemsToggleScope,
     DiffToggleIgnoreWhitespace,
     NewTerminal,
-    /// Terminal: Run Selected Text in Active Terminal (#1292): the
-    /// editor's selection, or the caret's line, run in the active pane.
+    /// Send Selection/Line to Terminal (#1292, #2340): the editor's
+    /// selection, or the caret's line, run in the active pane.
     RunSelectedText,
     /// Terminal: Focus Next / Previous Terminal (#843): Cmd+] / Cmd+[, which
     /// have no `Ctrl` form (`Ctrl+[` is `Esc`).
@@ -641,6 +654,11 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::CopyLineDown,
     Command::ToggleLineComment,
     Command::ToggleBlockComment,
+    Command::AlignCursors,
+    Command::AlignCursorsPadFront,
+    Command::AlignCursorsUsingTabs,
+    Command::AlignLineLastCursors,
+    Command::AlignCursorsUsingAuto,
     Command::JoinLines,
     Command::InsertLineBelow,
     Command::InsertLineAbove,
@@ -822,6 +840,7 @@ pub const ALL_COMMANDS: &[Command] = &[
     Command::NavigateForward,
     Command::GoToLastEditLocation,
     Command::ToggleVimMode,
+    Command::ToggleMultiCursorPersist,
     Command::MacroStartStopRecording,
     Command::MacroReplayLast,
     Command::MacroReplayTimes,
@@ -1133,6 +1152,11 @@ impl Command {
             Command::CopyLineDown => "Copy Line Down",
             Command::ToggleLineComment => "Toggle Line Comment",
             Command::ToggleBlockComment => "Toggle Block Comment",
+            Command::AlignCursors => "Align Cursors",
+            Command::AlignCursorsPadFront => "Align Cursors (Pad Front)",
+            Command::AlignCursorsUsingTabs => "Align Cursors Using Tabs",
+            Command::AlignLineLastCursors => "Align Line Last Cursors",
+            Command::AlignCursorsUsingAuto => "Align Cursors Using Indentation Settings",
             Command::JoinLines => "Join Lines",
             Command::InsertLineBelow => "Insert Line Below",
             Command::InsertLineAbove => "Insert Line Above",
@@ -1315,6 +1339,7 @@ impl Command {
             Command::NavigateForward => "Go Forward",
             Command::GoToLastEditLocation => "Go to Last Edit Location",
             Command::ToggleVimMode => "Toggle Vim Mode",
+            Command::ToggleMultiCursorPersist => "Toggle Multi-Cursor Persistence",
             Command::MacroStartStopRecording => "Macro: Start/Stop Recording",
             Command::MacroReplayLast => "Macro: Replay Last",
             Command::MacroReplayTimes => "Macro: Replay N Times…",
@@ -1469,7 +1494,7 @@ impl Command {
             Command::ProblemsToggleScope => "Problems: Toggle Scope (Open Files / Whole Project)",
             Command::DiffToggleIgnoreWhitespace => "Diff: Toggle Ignore Whitespace",
             Command::NewTerminal => "Terminal: Create New Terminal",
-            Command::RunSelectedText => "Terminal: Run Selected Text in Active Terminal",
+            Command::RunSelectedText => "Send Selection/Line to Terminal",
             Command::FocusNextTerminal => "Terminal: Focus Next Terminal",
             Command::FocusPreviousTerminal => "Terminal: Focus Previous Terminal",
             Command::TerminalClear => "Terminal: Clear",
@@ -1646,6 +1671,11 @@ impl Command {
             Command::EmmetMatchTag => "",
             Command::ToggleLineComment => "Cmd+/",
             Command::ToggleBlockComment => "Shift+Alt+A",
+            Command::AlignCursors => "Alt+A",
+            Command::AlignCursorsPadFront => "Alt+F",
+            Command::AlignCursorsUsingTabs => "Ctrl+Alt+A",
+            Command::AlignLineLastCursors => "Ctrl+Alt+Shift+A",
+            Command::AlignCursorsUsingAuto => "",
             Command::ToggleWordWrap => "Alt+Z",
             Command::ExpandSelection => "Shift+Alt+\u{2192}",
             Command::ShrinkSelection => "Shift+Alt+\u{2190}",
@@ -1820,6 +1850,7 @@ impl Command {
             Command::NavigateForward => "Ctrl+Shift+-",
             Command::GoToLastEditLocation => "Cmd+K Cmd+Q",
             Command::ToggleVimMode => "Cmd+E",
+            Command::ToggleMultiCursorPersist => "",
             Command::MacroStartStopRecording => "",
             Command::MacroReplayLast => "",
             Command::MacroReplayTimes => "",
@@ -1974,7 +2005,7 @@ impl Command {
             Command::ProblemsToggleScope => "",
             Command::DiffToggleIgnoreWhitespace => "",
             Command::NewTerminal => "Cmd+T",
-            Command::RunSelectedText => "",
+            Command::RunSelectedText => "Alt+X",
             Command::FocusNextTerminal => "Cmd+]",
             Command::FocusPreviousTerminal => "Cmd+[",
             Command::TerminalClear => "Cmd+K K",
@@ -2127,6 +2158,11 @@ impl Command {
             Command::CopyLineDown => "copy_line_down",
             Command::ToggleLineComment => "toggle_line_comment",
             Command::ToggleBlockComment => "toggle_block_comment",
+            Command::AlignCursors => "align_cursors",
+            Command::AlignCursorsPadFront => "align_cursors_pad_front",
+            Command::AlignCursorsUsingTabs => "align_cursors_using_tabs",
+            Command::AlignLineLastCursors => "align_line_last_cursors",
+            Command::AlignCursorsUsingAuto => "align_cursors_using_auto",
             Command::JoinLines => "join_lines",
             Command::InsertLineBelow => "insert_line_below",
             Command::InsertLineAbove => "insert_line_above",
@@ -2309,6 +2345,7 @@ impl Command {
             Command::NavigateForward => "navigate_forward",
             Command::GoToLastEditLocation => "go_to_last_edit_location",
             Command::ToggleVimMode => "toggle_vim_mode",
+            Command::ToggleMultiCursorPersist => "toggle_multi_cursor_persist",
             Command::MacroStartStopRecording => "macro_record",
             Command::MacroReplayLast => "macro_replay_last",
             Command::MacroReplayTimes => "macro_replay_times",
@@ -2634,8 +2671,13 @@ impl Command {
     /// sends its terminal commands' chords past the shell the same way
     /// (`terminal.integrated.commandsToSkipShell`): a user who binds
     /// Terminal: Clear means it for the terminal.
+    ///
+    /// Run Selected Text keeps its place here even though #2340 dropped the
+    /// `Terminal: ` prefix from its palette title: the chord is still meant to
+    /// run the editor's selection while the terminal has focus, not to reach
+    /// the shell.
     pub fn skips_the_shell(self) -> bool {
-        self.title().starts_with("Terminal: ")
+        self == Self::RunSelectedText || self.title().starts_with("Terminal: ")
     }
 
     /// Whether this command belongs to the CodeQL extension: its side bar,

@@ -5914,6 +5914,117 @@ fn multi_backspace_deletes_at_every_caret() {
     assert_eq!(e.lines, vec!["  ".to_string()]);
 }
 
+/// With the persistence pref on, a Down moves every caret one row of its
+/// own and clamps each to its own line's length.
+#[test]
+fn multi_move_down_steps_every_caret_and_clamps_to_its_own_line() {
+    let mut e = editor_with("abcd\nx\npqrs\ntail");
+    e.cursor_row = 0;
+    e.cursor_col = 3;
+    e.carets = vec![EditorSelection::new(2, 3)];
+    e.multi_move(CaretMotion::Down, false);
+    assert_eq!(e.caret_places(), vec![(1, 1), (3, 3)], "row 1 is one char");
+}
+
+/// Two Downs on three carets over three lines keep all three, one row on.
+#[test]
+fn multi_move_down_keeps_three_carets_moving_together() {
+    let mut e = editor_with("one\ntwoooo\nthree\nfour\nfive");
+    e.cursor_row = 0;
+    e.cursor_col = 1;
+    e.carets = vec![EditorSelection::new(1, 3), EditorSelection::new(2, 4)];
+    e.multi_move(CaretMotion::Down, false);
+    e.multi_move(CaretMotion::Down, false);
+    assert_eq!(e.caret_places(), vec![(2, 1), (3, 3), (4, 4)]);
+}
+
+/// A Right at a line's end steps onto the next line, as one caret's does,
+/// while the caret below moves on its own line.
+#[test]
+fn multi_move_right_walks_off_a_line_end_like_one_caret_does() {
+    let mut e = editor_with("ab\ncd");
+    e.cursor_col = 2;
+    e.carets = vec![EditorSelection::new(1, 1)];
+    e.multi_move(CaretMotion::Right, false);
+    assert_eq!(e.caret_places(), vec![(1, 0), (1, 2)]);
+}
+
+/// Word-wise and line-end motions run at every caret.
+#[test]
+fn multi_move_word_and_line_ends_apply_at_every_caret() {
+    let mut e = editor_with("one two\nthree four");
+    e.cursor_col = 0;
+    e.carets = vec![EditorSelection::new(1, 0)];
+    e.multi_move(CaretMotion::WordRight, false);
+    assert_eq!(e.caret_places(), vec![(0, 3), (1, 5)]);
+    e.multi_move(CaretMotion::End, false);
+    assert_eq!(e.caret_places(), vec![(0, 7), (1, 10)]);
+    e.multi_move(CaretMotion::Home, false);
+    assert_eq!(e.caret_places(), vec![(0, 0), (1, 0)]);
+}
+
+/// `extend` grows a selection at every caret instead of moving the carets.
+#[test]
+fn multi_move_with_extend_selects_at_every_caret() {
+    let mut e = editor_with("abcd\nwxyz");
+    e.cursor_col = 0;
+    e.carets = vec![EditorSelection::new(1, 0)];
+    e.multi_move(CaretMotion::Right, true);
+    e.multi_move(CaretMotion::Right, true);
+    assert_eq!(e.selection.unwrap().normalised(), ((0, 0), (0, 2)));
+    assert_eq!(e.carets[0].normalised(), ((1, 0), (1, 2)));
+}
+
+/// Enter splits the line under every caret in one undo step.
+#[test]
+fn multi_newline_splits_the_line_at_every_caret() {
+    let mut e = editor_with("abc\ndef\nghi");
+    e.cursor_row = 0;
+    e.cursor_col = 1;
+    e.carets = vec![EditorSelection::new(1, 2), EditorSelection::new(2, 3)];
+    e.multi_newline();
+    assert_eq!(e.lines, ["a", "bc", "de", "f", "ghi", ""]);
+    assert_eq!(e.caret_places(), vec![(1, 0), (3, 0), (5, 0)]);
+    assert!(e.undo());
+    assert_eq!(e.lines, ["abc", "def", "ghi"], "one step");
+}
+
+/// Overlapping selections describe the same text once: Enter splits their
+/// line once, not once per caret, and no caret is left misplaced.
+#[test]
+fn multi_newline_ignores_a_caret_inside_another_selection() {
+    let mut e = editor_with("abcd");
+    e.cursor_row = 0;
+    e.cursor_col = 4;
+    e.selection = Some(EditorSelection {
+        anchor: (0, 0),
+        head: (0, 4),
+    });
+    e.carets = vec![EditorSelection::new(0, 2)];
+    e.multi_newline();
+    assert_eq!(e.lines, ["", ""], "the selection is replaced once");
+    assert!(!e.has_multi_cursor(), "the covered caret added no split");
+}
+
+/// Alt-clicking at the start of a selection leaves a bare caret and the
+/// selection sharing one start, and the caret can come first: the selection
+/// still owns the text, so Enter replaces it once instead of splitting in
+/// front of it and leaving `abcd` behind.
+#[test]
+fn multi_newline_ignores_a_caret_at_the_start_of_a_selection() {
+    let mut e = editor_with("abcd");
+    e.cursor_row = 0;
+    e.cursor_col = 0;
+    e.selection = None;
+    e.carets = vec![EditorSelection {
+        anchor: (0, 0),
+        head: (0, 4),
+    }];
+    e.multi_newline();
+    assert_eq!(e.lines, ["", ""], "the selection is replaced once");
+    assert!(!e.has_multi_cursor(), "the bare caret added no split");
+}
+
 fn three_foos() -> Editor {
     editor_with("foo = 1\nfoo = 2\nfoo = 3")
 }
@@ -11637,6 +11748,24 @@ fn selection_text_single_line() {
     e.cursor_col = 11;
     e.extend_selection_to_cursor();
     assert_eq!(e.selection_text(), "world");
+}
+
+/// Several carets: the terminal run gets every selection, in buffer order
+/// even when the carets were added bottom-up, one per line.
+#[test]
+fn selections_text_joins_every_caret_in_buffer_order() {
+    let e = with_carets(
+        &["let a = run();", "let b = run();", "let c = run();"],
+        &[((2, 8), (2, 13)), ((0, 8), (0, 13)), ((1, 8), (1, 13))],
+    );
+    assert_eq!(e.selections_text(), "run()\nrun()\nrun()");
+    // A caret with no area adds nothing, so a stray caret cannot inject a
+    // blank line into a run.
+    let e = with_carets(&["aa", "bb"], &[((0, 0), (0, 1)), ((1, 1), (1, 1))]);
+    assert_eq!(e.selections_text(), "a");
+    // No selections at all: empty, so the caller falls back to the line.
+    let e = with_carets(&["aa"], &[((0, 1), (0, 1))]);
+    assert_eq!(e.selections_text(), "");
 }
 
 #[test]
@@ -22245,4 +22374,384 @@ fn the_toggle_disables_every_pair_behavior() {
     e.cursor_col = 1;
     e.backspace();
     assert_eq!(e.lines[0], ")", "off means plain backspace");
+}
+
+// ---- Align Cursors (Alt+A, Alt+F, Ctrl+Alt+A, Ctrl+Alt+Shift+A) ----
+
+/// One caret, as the `(anchor, head)` pair `with_carets` takes.
+type CaretPair = ((usize, usize), (usize, usize));
+
+/// An editor over `lines` with a selection at each `(anchor, head)` pair, the
+/// first of them the primary.
+fn with_carets(lines: &[&str], sels: &[CaretPair]) -> Editor {
+    let mut e = editor_with(&lines.join("\n"));
+    let all: Vec<EditorSelection> = sels
+        .iter()
+        .map(|&(anchor, head)| EditorSelection { anchor, head })
+        .collect();
+    e.set_selections(&all);
+    e
+}
+
+/// A caret sitting inside another caret's selection must not split the line
+/// twice. Alt-clicking between the letters of a selected word is one gesture
+/// that does exactly this: the interior caret gives way, so the selection is
+/// replaced by a single line break — exactly what Enter does with one
+/// selection — and a caret on another line still splits that line.
+#[test]
+fn a_caret_inside_a_selection_does_not_split_the_line_twice() {
+    let mut e = with_carets(
+        &["abcd", "xy"],
+        &[((0, 0), (0, 4)), ((0, 2), (0, 2)), ((1, 1), (1, 1))],
+    );
+    e.multi_newline();
+    assert_eq!(e.lines, ["", "", "x", "y"]);
+}
+
+/// Three selections over one another — starts at 3, 5 and 9, lengths 2, 4 and
+/// 1 — are one column, and every start comes out in column 9 with every
+/// selection four long.
+#[test]
+fn align_cursors_pads_every_selection_into_one_column() {
+    let mut e = with_carets(
+        &["abcdefghijklm", "abcdefghijklm", "abcdefghijklm"],
+        &[((0, 3), (0, 5)), ((1, 5), (1, 9)), ((2, 9), (2, 10))],
+    );
+    e.align_cursors();
+    assert_eq!(e.lines[0], "abc      de  fghijklm", "6 in front, 2 behind");
+    assert_eq!(e.lines[1], "abcde    fghijklm", "4 in front, none behind");
+    assert_eq!(e.lines[2], "abcdefghij   klm", "nothing in front, 3 behind");
+    for row in 0..3 {
+        let aligned: String = e.lines[row].chars().skip(9).take(4).collect();
+        assert_eq!(
+            aligned.trim_end(),
+            ["de", "fghi", "j"][row],
+            "selection {row} starts in column 9"
+        );
+        assert_eq!(aligned.chars().count(), 4, "and is as long as the longest");
+    }
+    // The carets end up at the end of their padded selections, crouched on
+    // the same column, with multi-cursor still on.
+    let heads: Vec<(usize, usize)> = e.caret_places();
+    assert_eq!(heads, [(0, 13), (1, 13), (2, 13)]);
+    assert_eq!(e.caret_selections().len(), 3);
+}
+
+#[test]
+fn align_cursors_pad_front_right_aligns_the_text() {
+    let mut e = with_carets(
+        &["abcdefghijklm", "abcdefghijklm", "abcdefghijklm"],
+        &[((0, 3), (0, 5)), ((1, 5), (1, 9)), ((2, 9), (2, 10))],
+    );
+    e.align_cursors_pad_front();
+    assert_eq!(e.lines[0], "abc        defghijklm");
+    assert_eq!(e.lines[1], "abcde    fghijklm");
+    assert_eq!(e.lines[2], "abcdefghi   jklm");
+    for (row, text) in ["de", "fghi", "j"].iter().enumerate() {
+        let line: Vec<char> = e.lines[row].chars().collect();
+        let end = 13;
+        let start = end - text.chars().count();
+        let selected: String = line[start..end].iter().collect();
+        assert_eq!(&selected, text, "the text ends in column 13 on row {row}");
+    }
+}
+
+#[test]
+fn align_cursors_using_tabs_snaps_to_tab_stops() {
+    let mut e = with_carets(
+        &["abcdefghijklm", "abcdefghijklm", "abcdefghijklm"],
+        &[((0, 3), (0, 5)), ((1, 5), (1, 9)), ((2, 9), (2, 10))],
+    );
+    e.align_cursors_using_tabs(4);
+    // Starts at 3, 5 and 9 all move to the 12 stop (a tab cannot stand still,
+    // so the right-most start goes up to the next stop and the others follow
+    // it), then end padding takes each selection to 16, a selection already
+    // four wide included — it needs none.
+    assert_eq!(e.lines[0], "abc\t\t\tde\tfghijklm");
+    assert_eq!(e.lines[1], "abcde\t\tfghijklm");
+    assert_eq!(e.lines[2], "abcdefghi\tj\tklm");
+    for (row, prefix, tabs) in [(0, "abc", 3), (1, "abcde", 2), (2, "abcdefghi", 1)] {
+        assert!(
+            e.lines[row].starts_with(&format!("{prefix}{}", "\t".repeat(tabs))),
+            "row {row} snaps its start onto a stop: {:?}",
+            e.lines[row]
+        );
+    }
+}
+
+/// A tab already in the line moves the selection on screen, so columns are
+/// counted in cells, not characters: the two `foo`s below start at cells 4
+/// and 5 and only one space is needed.
+#[test]
+fn align_cursors_measures_existing_tabs_in_columns() {
+    let mut e = with_carets(&["\tfoo", "\t foo"], &[((0, 1), (0, 4)), ((1, 2), (1, 5))]);
+    e.align_cursors();
+    assert_eq!(e.lines[0], "\t foo", "one column of padding, not two");
+    assert_eq!(e.lines[1], "\t foo");
+    for row in 0..2 {
+        let line: Vec<char> = e.lines[row].chars().collect();
+        assert_eq!(line[2..5].iter().collect::<String>(), "foo");
+    }
+}
+
+/// Wide glyphs take the cells the renderer gives them, so a `界` before a
+/// selection moves it one cell further than its code-point count suggests.
+/// These two `foo`s already start in the same column, so nothing is padded —
+/// counting code points would push the first line a cell out of line.
+#[test]
+fn align_cursors_measures_wide_glyphs_in_cells() {
+    let mut e = with_carets(
+        &["界  foo", "ab  foo"],
+        &[((0, 3), (0, 6)), ((1, 4), (1, 7))],
+    );
+    e.align_cursors();
+    assert_eq!(
+        e.lines,
+        ["界  foo", "ab  foo"],
+        "same column already, nothing to pad"
+    );
+    let cell = |row: usize, col: usize| {
+        let prefix: String = e.lines[row].chars().take(col).collect();
+        unicode_width::UnicodeWidthStr::width(prefix.as_str())
+    };
+    let places = e.caret_places();
+    assert_eq!(
+        cell(places[0].0, places[0].1),
+        cell(places[1].0, places[1].1),
+        "both selections end in one screen column"
+    );
+}
+
+/// Align Line Last Cursors inserts at column 0, as the extension does. On a
+/// tab-indented line the tab then jumps to the same stop and swallows the
+/// space, so the line does not move — the extension's own known limitation
+/// (yo1dog/vscode-cursor-align#14), kept here rather than quietly diverging.
+#[test]
+fn align_line_last_cursors_inserts_at_column_zero_as_the_extension_does() {
+    let mut e = with_carets(&["\tx", "\txy"], &[((0, 2), (0, 2)), ((1, 3), (1, 3))]);
+    e.align_line_last_cursors();
+    assert_eq!(e.lines[0], " \tx", "the space lands before the tab");
+    assert_eq!(e.lines[1], "\txy");
+}
+
+/// The extension's signature case: two selections on one line are two columns,
+/// and each column is padded on its own — the first column's width feeds the
+/// second's start, so the second one lines up too.
+#[test]
+fn align_cursors_treats_two_selections_on_a_line_as_two_columns() {
+    let mut e = with_carets(
+        &["aaa  bbb", "aa  bb"],
+        &[
+            ((0, 0), (0, 3)),
+            ((0, 5), (0, 8)),
+            ((1, 0), (1, 2)),
+            ((1, 4), (1, 6)),
+        ],
+    );
+    e.align_cursors();
+    assert_eq!(e.lines[0], "aaa  bbb", "already the widest in both columns");
+    assert_eq!(
+        e.lines[1], "aa   bb ",
+        "one column of padding in each column"
+    );
+}
+
+/// Two groups on one row: the second is aligned against where its selections
+/// stand after the first group's padding, not against the original columns.
+#[test]
+fn align_cursors_counts_a_later_groups_earlier_padding() {
+    let mut e = with_carets(
+        &["a----b", "abc--d"],
+        &[
+            ((0, 0), (0, 1)),
+            ((0, 5), (0, 6)),
+            ((1, 0), (1, 3)),
+            ((1, 5), (1, 6)),
+        ],
+    );
+    e.align_cursors();
+    assert_eq!(e.lines[0], "a  ----b");
+    assert_eq!(e.lines[1], "abc--  d");
+}
+
+/// A caret at the end of a selection shares its address with the next
+/// column front padding. It stays in front of that padding, as an end caret
+/// should, instead of being carried along past it on one row only.
+#[test]
+fn align_cursors_keeps_an_end_caret_before_the_next_columns_padding() {
+    let mut e = with_carets(
+        &["ab", "x---y"],
+        &[
+            ((0, 0), (0, 1)),
+            ((0, 1), (0, 2)),
+            ((1, 0), (1, 1)),
+            ((1, 4), (1, 5)),
+        ],
+    );
+    e.align_cursors();
+    assert_eq!(e.lines[0], "a   b", "three cells of front padding");
+    assert_eq!(e.lines[1], "x---y", "nothing to pad");
+    assert_eq!(
+        e.caret_places(),
+        [(0, 1), (0, 5), (1, 1), (1, 5)],
+        "both end carets of the first column stay in column 1"
+    );
+}
+
+/// A bare caret has no selection end of its own, so front padding inserted
+/// exactly at it is its own and has to carry it into the column instead of
+/// being left behind.
+#[test]
+fn align_cursors_carries_a_bare_caret_into_the_column() {
+    let mut e = with_carets(&["ab", "abcd"], &[((0, 1), (0, 1)), ((1, 4), (1, 4))]);
+    e.align_cursors();
+    assert_eq!(e.lines[0], "a   b", "three cells of front padding");
+    assert_eq!(
+        e.caret_places(),
+        [(0, 4), (1, 4)],
+        "both bare carets end up in column 4"
+    );
+}
+
+/// Tabs cannot stop short of a stop, so the end they are padded to is the
+/// next stop at or after the longest selection: both selections end in the
+/// same cell instead of one running past the other.
+#[test]
+fn align_cursors_using_tabs_ends_every_selection_on_the_same_stop() {
+    let mut e = with_carets(&["abcdef", "abcdef"], &[((0, 1), (0, 3)), ((1, 2), (1, 3))]);
+    e.align_cursors_using_tabs(4);
+    assert_eq!(e.lines[0], "a\tbc\tdef");
+    assert_eq!(e.lines[1], "ab\tc\tdef");
+    for (row, want) in [(0usize, 8usize), (1, 8)] {
+        let mut cell = 0;
+        for c in e.lines[row].chars() {
+            if cell >= want {
+                break;
+            }
+            cell += if c == '\t' { 4 - cell % 4 } else { 1 };
+        }
+        assert!(cell >= want, "row {row} reaches cell {want}");
+    }
+}
+
+#[test]
+fn align_cursors_using_tabs_follows_the_buffers_own_tab_width() {
+    // The same carets on an 8-wide grid reach the next stop instead: 3, 5 and
+    // 9 all land on 16, and the end padding on 24.
+    let mut e = with_carets(
+        &["abcdefghijklm", "abcdefghijklm", "abcdefghijklm"],
+        &[((0, 3), (0, 5)), ((1, 5), (1, 9)), ((2, 9), (2, 10))],
+    );
+    e.align_cursors_using_tabs(8);
+    // Starts 3, 5 and 9 all move to the 16 stop; every end then reaches the
+    // 24 stop, the one at or after the longest selection, so the ends line up
+    // on a stop too.
+    assert_eq!(e.lines[0], "abc\t\tde\tfghijklm");
+    assert_eq!(e.lines[1], "abcde\t\tfghi\tjklm");
+    assert_eq!(e.lines[2], "abcdefghi\tj\tklm");
+}
+
+#[test]
+fn align_line_last_cursors_lines_up_the_line_ends() {
+    let mut e = with_carets(
+        &["abcdefg", "abcdefghi", "abc"],
+        &[((0, 3), (0, 5)), ((1, 0), (1, 9)), ((2, 0), (2, 2))],
+    );
+    e.align_line_last_cursors();
+    assert_eq!(e.lines[0], "    abcdefg", "5 out of 9: 4 spaces in front");
+    assert_eq!(e.lines[1], "abcdefghi", "already the right-most");
+    // The end that lines up is the selection's, not the line's: row 2's
+    // selection stops at column 2, so it moves 7 columns, not 6.
+    assert_eq!(e.lines[2], "       abc", "2 out of 9: 7 spaces in front");
+}
+
+#[test]
+fn align_cursors_leaves_already_aligned_selections_alone() {
+    let lines = ["ab   cd", "ef   gh"];
+    let mut e = with_carets(&lines, &[((0, 5), (0, 7)), ((1, 5), (1, 7))]);
+    let steps = e.undo_history_size().0;
+    e.align_cursors();
+    assert_eq!(e.lines, lines);
+    assert_eq!(
+        e.undo_history_size().0,
+        steps,
+        "nothing to pad, no undo step"
+    );
+}
+
+#[test]
+fn every_align_command_is_a_noop_with_fewer_than_two_carets() {
+    let mut e = editor_with("abcdef\nghijkl");
+    e.selection = Some(EditorSelection {
+        anchor: (0, 2),
+        head: (0, 4),
+    });
+    e.cursor_row = 0;
+    e.cursor_col = 4;
+    let steps = e.undo_history_size().0;
+    e.align_cursors();
+    e.align_cursors_pad_front();
+    e.align_cursors_using_tabs(4);
+    e.align_line_last_cursors();
+    assert_eq!(e.lines, ["abcdef", "ghijkl"]);
+    assert_eq!(
+        e.undo_history_size().0,
+        steps,
+        "no command adds an undo step"
+    );
+    assert!(e.carets.is_empty());
+}
+
+#[test]
+fn each_align_command_is_one_undo_step() {
+    let lines = ["abcdefghijklm", "abcdefghijklm", "abcdefghijklm"];
+    for command in 0..4 {
+        let mut e = with_carets(
+            &lines,
+            &[((0, 3), (0, 5)), ((1, 5), (1, 9)), ((2, 9), (2, 10))],
+        );
+        let steps = e.undo_history_size().0;
+        let applied = match command {
+            0 => e.align_cursors(),
+            1 => e.align_cursors_pad_front(),
+            2 => e.align_cursors_using_tabs(4),
+            _ => e.align_line_last_cursors(),
+        };
+        assert!(applied, "command {command} had something to align");
+        assert_eq!(
+            e.undo_history_size().0,
+            steps + 1,
+            "command {command} is one step"
+        );
+        assert!(e.undo());
+        assert_eq!(e.lines, lines, "command {command} undoes in one press");
+    }
+}
+
+/// Grouping follows the columns on screen, not the char indices: once a tab
+/// has pushed a line right, `xx` at cells 4..6 and `yy` at 5..6 are one
+/// column even though their char starts are 1 and 5. Measured in chars they
+/// look like two groups, and the command would pad neither.
+#[test]
+fn align_cursors_groups_selections_by_display_cells() {
+    let mut e = with_carets(&["\txx!", "abcdey?"], &[((0, 1), (0, 3)), ((1, 5), (1, 6))]);
+    e.align_cursors();
+    assert_eq!(
+        e.lines[0], "\t xx!",
+        "one space past the tab, to reach cell 5"
+    );
+    assert_eq!(e.lines[1], "abcdey ?", "none in front, one behind");
+    // Both carets end in one cell on screen, the tab in front counted.
+    let places = e.caret_places();
+    let cell = |&(row, col): &(usize, usize)| {
+        e.lines[row]
+            .chars()
+            .take(col)
+            .fold(0, |c, ch| c + if ch == '\t' { 4 - c % 4 } else { 1 })
+    };
+    assert_eq!(
+        cell(&places[0]),
+        cell(&places[1]),
+        "both selections end in one column"
+    );
 }

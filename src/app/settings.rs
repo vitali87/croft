@@ -223,6 +223,14 @@ impl App {
                 ),
             },
             ListRow {
+                id: String::from("toggle:multi_cursor_persist"),
+                label: format!(
+                    "Editor: Multi-Cursor Persistence: {}{}",
+                    on_off(self.multi_cursor_persist),
+                    prov("multi_cursor_persist")
+                ),
+            },
+            ListRow {
                 id: String::from("toggle:inline_values"),
                 label: format!(
                     "Debugger: Inline Values: {}{}",
@@ -1312,6 +1320,7 @@ impl App {
         self.auto_save = p.auto_save;
         self.auto_save_on_focus_change = p.auto_save_on_focus_change;
         self.copy_on_select = p.copy_on_select;
+        self.multi_cursor_persist = p.multi_cursor_persist;
         self.apply_project_excludes(p);
         self.tree.set_compact_folders(!p.disable_compact_folders);
         self.apply_file_associations(p);

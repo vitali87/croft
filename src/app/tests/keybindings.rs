@@ -2542,6 +2542,26 @@ fn toggle_wrap_key_is_alt_z() {
 }
 
 #[test]
+fn run_selected_text_key_is_alt_x() {
+    assert!(is_run_selected_text_key(key(
+        KeyCode::Char('x'),
+        KeyModifiers::ALT
+    )));
+    assert!(!is_run_selected_text_key(key(
+        KeyCode::Char('x'),
+        KeyModifiers::ALT | KeyModifiers::SHIFT
+    )));
+    assert!(!is_run_selected_text_key(key(
+        KeyCode::Char('x'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT
+    )));
+    assert!(!is_run_selected_text_key(key(
+        KeyCode::Char('x'),
+        KeyModifiers::NONE
+    )));
+}
+
+#[test]
 fn switch_header_source_key_is_alt_o() {
     assert!(is_switch_header_source_key(key(
         KeyCode::Char('o'),
@@ -3435,4 +3455,31 @@ fn a_multiline_paste_confirm_disarms_a_pending_cmd_k_chord() {
         .unwrap();
     assert!(!app.pending_broadcast_enable, "no broadcast prompt");
     assert!(!app.broadcast_input);
+}
+
+/// #2340 dropped the `Terminal: ` prefix from this command's palette title,
+/// but a user's chord for it is still meant for the terminal: pressed with the
+/// terminal focused, it must run the selection rather than reach the shell
+/// (#1562).
+#[test]
+fn a_user_keybinding_to_run_selected_text_skips_the_shell() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.keymap = crate::keymap::Keymap::from_json(
+        r#"[{ "key": "ctrl+alt+g", "command": "run_selected_text" }]"#,
+    );
+    app.editor.lines = vec![String::from("echo hi")];
+    app.focus = Pane::Terminal;
+    app.bottom_panel_tab = BottomPanelTab::Terminal;
+    app.handle_key(key(
+        KeyCode::Char('g'),
+        KeyModifiers::CONTROL | KeyModifiers::ALT,
+    ))
+    .unwrap();
+    assert!(
+        app.status.starts_with("Ran 1 line"),
+        "the chord must run the selection, not the shell; status was {:?}",
+        app.status
+    );
+    assert!(app.show_terminal, "running it reveals the terminal");
 }
