@@ -221,6 +221,7 @@ src/
 │   │   ├── queue.rs            the run queue: many queries in turn, or one query on several databases
 │   │   ├── results.rs          a run's results: result sets, the alert and raw views, Compare Results, Export Results
 │   │   ├── run.rs              running a query, quick evaluation and Debug Query, cancelling and recording a run
+│   │   ├── side_bar.rs         the side bar itself: availability, its keys and what each row does
 │   │   ├── test_runs.rs        CodeQL: Run Tests through the Testing view, and Accept Test Output
 │   │   ├── variant_repos.rs    variant analysis targets: the controller, lists, repositories, owners and Code Search
 │   │   ├── variant_runs.rs     variant analysis runs: submitting, following, fetching and exporting results
