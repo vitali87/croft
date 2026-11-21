@@ -12,6 +12,7 @@ mod decorations;
 mod format;
 mod go_to_symbol;
 mod hierarchy;
+mod hover_text;
 mod inlay_hints;
 mod messages;
 mod navigation;
@@ -29,6 +30,8 @@ mod workspace_symbols;
 pub(super) use breadcrumbs::breadcrumb_symbol_chain;
 #[cfg(test)]
 pub(super) use breadcrumbs::sibling_symbols;
+pub(super) use hover_text::compose_hover;
+pub(super) use hover_text::format_diagnostics;
 pub(super) use outline::syntax_kind_of;
 #[cfg(test)]
 pub(super) use peek::peek_excerpt;
@@ -106,50 +109,3 @@ pub(super) const HOVER_DIVIDER: &str = "────────";
 /// What Show or Focus Hover says when the caret has nothing to describe
 /// (#1518): a keyboard command that does nothing must say why.
 pub(super) const NO_HOVER_AT_CARET: &str = "No hover information at the caret";
-
-/// Render the diagnostics under the hovered point into a single labelled text
-/// block, errors first (so the most severe message leads), each line prefixed
-/// with its severity. `None` when there are no diagnostics. The severity word
-/// answers the user's "what type of error is it" directly, since a TUI can't
-/// show VS Code's coloured marker icon.
-pub(super) fn format_diagnostics(
-    diags: &[(crate::lsp::manager::DiagnosticSeverity, String)],
-) -> Option<String> {
-    use crate::lsp::manager::DiagnosticSeverity;
-    if diags.is_empty() {
-        return None;
-    }
-    let rank = |s: &DiagnosticSeverity| match s {
-        DiagnosticSeverity::Error => 0,
-        DiagnosticSeverity::Warning => 1,
-        DiagnosticSeverity::Information => 2,
-        DiagnosticSeverity::Hint => 3,
-    };
-    let label = |s: &DiagnosticSeverity| match s {
-        DiagnosticSeverity::Error => "Error",
-        DiagnosticSeverity::Warning => "Warning",
-        DiagnosticSeverity::Information => "Info",
-        DiagnosticSeverity::Hint => "Hint",
-    };
-    let mut ordered: Vec<&(DiagnosticSeverity, String)> = diags.iter().collect();
-    ordered.sort_by_key(|(s, _)| rank(s));
-    Some(
-        ordered
-            .iter()
-            .map(|(s, m)| format!("{}: {}", label(s), m))
-            .collect::<Vec<_>>()
-            .join("\n\n"),
-    )
-}
-
-/// Stack the diagnostic block above the language hover content, divided by a
-/// rule, matching VS Code (PR microsoft/vscode#166560 put marker hovers on
-/// top). Either side may be absent; `None` when both are.
-pub(super) fn compose_hover(diagnostic: Option<&str>, hover: Option<&str>) -> Option<String> {
-    match (diagnostic, hover) {
-        (Some(d), Some(h)) => Some(format!("{d}\n{HOVER_DIVIDER}\n{h}")),
-        (Some(d), None) => Some(d.to_string()),
-        (None, Some(h)) => Some(h.to_string()),
-        (None, None) => None,
-    }
-}
