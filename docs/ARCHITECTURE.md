@@ -29,6 +29,7 @@ src/
 │   ├── tests.rs          the command line's own tests
 │   ├── typos.rs          a misspelled subcommand clap took as a folder, turned into an error that names the one meant
 │   ├── version.rs        the plain version `--version` prints, and the provenance line `--build-info` prints
+│   ├── vscode_import.rs  `croft import-vscode`: converting a VS Code profile, and the report of what came across
 │   ├── workspace.rs      the `PATH` and `--open-file` arguments: the workspace root, the file to open and its `file:line[:col]` location
 ├── clipboard.rs         native macOS clipboard read/write (NSPasteboard) with pbpaste fallback, wl-paste / xclip / xsel on Linux, and croft's own last copy, which a paste inside croft falls back to where the host clipboard can't be read (an SSH host with no clipboard tool)
 ├── command_history.rs    durable cross-session shell command history as JSONL under `~/.config/croft/command_history.jsonl` (cwd / exit / duration), read off OSC 133 marks with no shell hooks; Ctrl+Shift+H opens the search popup
