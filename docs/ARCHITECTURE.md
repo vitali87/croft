@@ -237,6 +237,7 @@ src/
 │   │   ├── events.rs           the sessions' events, drained each frame: stops, output and endings
 │   │   ├── python.rs           which Python a debugged program runs under, and the note on an old one
 │   │   ├── view.rs             the view: its keys, button, paused-state tree, clicks, row menu and errors
+│   │   ├── watches.rs          watch expressions: adding, removing and evaluating them
 │   ├── diff_merge.rs    diff editor upkeep and navigation, merge conflicts and the three-way merge editor, the history scrubber, local history and the who-wrote-this lens
 │   ├── editor_input.rs  editor keys, vim mode, macros, multi-cursor and line commands, typing toggles, copy, cut and paste routing and the clipboard, and reading dropped file paths out of a paste
 │   ├── editor_layout.rs the tree of editor groups: splitting, moving focus between and collapsing them, and each group's rectangle; the focused group's tabs live in `App::editor`
