@@ -972,7 +972,404 @@ REMOTE = Target(
     },
 )
 
-TARGETS = {t.name: t for t in (APP, EDITOR, LSP, TERMINAL, GIT, REMOTE)}
+# The search panel's feature files (#2062): (module doc, release-note phrase, docs row).
+SEARCH_FILES = {
+    "matcher": (
+        "How a query matches text: the matcher built from the query and its Aa / ab / .*\n"
+        "toggles, the pattern the editor's Find bar shares, and the error an invalid query shows.",
+        "search query matcher",
+        "the query's matcher and its toggles, the pattern the Find bar shares, an invalid "
+        "query's error",
+    ),
+    "path_filter": (
+        "The files to include and to exclude: their comma-separated globs, compiled as VS Code\n"
+        "reads them (a bare pattern matches at any depth, a folder's name admits what is in\n"
+        "it), and the test a path must pass.",
+        "search include and exclude filter",
+        "the files to include / exclude globs, and the test a path must pass",
+    ),
+    "walk": (
+        "The search itself: walking the workspace in parallel, honouring .gitignore and leaving\n"
+        "out binaries and version-control stores, streaming each file's hits, and searching an\n"
+        "unsaved buffer's text the same way.",
+        "workspace search walk",
+        "walking the workspace and streaming each file's hits; searching an unsaved buffer",
+    ),
+    "highlight": (
+        "Where a hit's line splits so its matches are highlighted, for a plain query and for a\n"
+        "regex.",
+        "search match highlighting",
+        "splitting a hit's line around its matches, for highlighting",
+    ),
+    "worker": (
+        "The background search worker: the requests the panel sends it, the events it answers\n"
+        "with, and the pause in typing it waits for before a search starts.",
+        "search worker",
+        "the background search worker, its requests and events, and the typing pause",
+    ),
+    "replace": (
+        "Replace: a replacement's $1 and ${name} references and Preserve Case, replacing in a\n"
+        "line, a text or a file, and the panel's Replace All on disk.",
+        "search replace",
+        "replacement text, replacing in a line, a text or a file, and Replace All",
+    ),
+    "fields": (
+        "The panel's input fields: the caret and selection in each, typing and deleting, which\n"
+        "field has focus, the Replace and details rows shown or hidden, and the include and\n"
+        "exclude filter the fields make.",
+        "search panel input field",
+        "the input fields: caret, selection, typing, focus, the Replace and details rows",
+    ),
+    "hit_test": (
+        "What a click lands on: the toggles, the buttons beside the fields, the fields\n"
+        "themselves, a result row and its path, and the tooltip under the pointer.",
+        "search panel hit-testing",
+        "what a click or the pointer lands on: toggles, buttons, fields, result rows",
+    ),
+    "results": (
+        "The results list: the worker's hits added in order, the counts in the header, the\n"
+        "query's error, moving the selection and scrolling, and the mode toggles.",
+        "search results list",
+        "the results list: hits in order, counts, selection, scrolling, the mode toggles",
+    ),
+    "render": (
+        "Drawing the panel: each input field with its fill, caret and glob caption, and the\n"
+        "whole panel, results included.",
+        "search panel drawing",
+        "drawing the panel and each input field",
+    ),
+}
+
+SEARCH = Target(
+    "search", "scripts/split_search_manifest.tsv", "src/widgets/search.rs",
+    "src/widgets/search", SEARCH_FILES,
+    Tree(
+        "    ├── search.rs ",
+        "    ├── search/          the search panel's feature files, beside search.rs; each "
+        "file's `//!` doc says what it holds",
+        "    │   ├── ", 16,
+    ),
+    "search-",
+    (
+        "The search panel's own tests, moved out of search.rs (#2062).",
+        "the search panel's tests",
+        "the search panel's own tests",
+    ),
+)
+
+# The session host's feature files (#2062): (module doc, release-note phrase, docs row).
+SESSION_HOST_FILES = {
+    "protocol": (
+        "The wire format between the host and its clients: the frame tags, the control messages\n"
+        "and the roster entry they carry, encoding a frame, and the decoder that turns socket\n"
+        "chunks back into frames.",
+        "session host wire format",
+        "the wire format: frame tags, control messages, encoding and decoding frames",
+    ),
+    "roster": (
+        "What the roster says: the notice for clients older than this croft, the version\n"
+        "clients are measured against, the one client a Session: Detach can come from, and the\n"
+        "PTY size every client can show.",
+        "session roster",
+        "what the roster says: stale clients, the session's version, the detach target, the "
+        "shared size",
+    ),
+    "sidecars": (
+        "The files the host keeps beside its socket for the inner croft: the presence roster,\n"
+        "the stale-binary marker and the host's version, with their paths and readers.",
+        "session host sidecar",
+        "the files beside the socket: the presence roster, the stale-binary marker, the "
+        "host's version",
+    ),
+    "identity": (
+        "Who a client is: the user@host name the roster shows, and the stable identity that\n"
+        "lets a reconnect displace its own earlier registration.",
+        "session client identity",
+        "a client's roster name and its stable identity across reconnects",
+    ),
+    "frame_write": (
+        "Writing one frame to a socket within a deadline, so a stopped or wedged peer can never\n"
+        "hang the writer.",
+        "session frame write",
+        "writing one frame to a socket within a deadline",
+    ),
+    "outbox": (
+        "A client's outbound queue: queueing frames without ever blocking on the socket,\n"
+        "counting what was delivered, closing once drained, and the writer thread that drains\n"
+        "it.",
+        "session client outbox",
+        "each client's outbound queue, its delivery count, and the writer thread that drains "
+        "it",
+    ),
+    "pty": (
+        "The PTY master and the inner command as the host holds them, whether it spawned them\n"
+        "itself or inherited them across a host swap: resizing the master and waiting for the\n"
+        "child.",
+        "session host PTY handle",
+        "the PTY master and the inner command, held fresh or inherited: resize and wait",
+    ),
+    "swap": (
+        "Moving a live session onto an updated binary (#238): spotting the replaced image,\n"
+        "handing the socket, PTY and child across an exec, adopting them in the successor, and\n"
+        "the fence that lets clients reconnect.",
+        "session host swap",
+        "moving a live session onto an updated binary: the watch, the handoff, the adoption, "
+        "the fence",
+    ),
+    "server": (
+        "The host proper: starting a session, pumping PTY output to every client, keeping the\n"
+        "PTY at the smallest client size, and publishing the roster.",
+        "session host server",
+        "the host proper: starting a session, broadcasting output, the shared PTY size, the "
+        "roster",
+    ),
+    "connection": (
+        "One client's connection: its thread, whose typing reaches the PTY, granting and\n"
+        "revoking write control and the rules for it, and disconnecting a participant.",
+        "session client connection",
+        "one client's connection: its thread, typing attribution, write control, kicks",
+    ),
+    "launch": (
+        "Attaching to a session or starting one first: the detached server's command line and\n"
+        "its spawn, and ending a stale server.",
+        "session launch",
+        "attach-or-create: spawning the detached server, ending a stale one",
+    ),
+    "detach_chord": (
+        "Spotting Cmd+K Shift+Q (Session: Detach) in a client's own keystrokes, so any client\n"
+        "can leave, one without write control included.",
+        "session detach chord",
+        "spotting the detach chord in a client's own keystrokes",
+    ),
+    "attach": (
+        "The attaching client: raw mode, pumping stdin to the socket and output to the\n"
+        "terminal, the version-mismatch banner, reconnecting across a host swap, and handing\n"
+        "the terminal back on exit.",
+        "session attach client",
+        "the attaching client: the pump, the version banner, reconnects across a swap, the "
+        "exit",
+    ),
+    "inner_channel": (
+        "The inner croft's privileged channel to its host: who is typing, granting and revoking\n"
+        "write control, and disconnecting clients.",
+        "session inner channel",
+        "the inner croft's privileged channel: typing, write control, kicks",
+    ),
+}
+
+SESSION_HOST = Target(
+    "session_host", "scripts/split_session_host_manifest.tsv", "src/session_host.rs",
+    "src/session_host", SESSION_HOST_FILES,
+    Tree(
+        "├── session_host.rs ",
+        "├── session_host/         the session host's feature files, beside session_host.rs; "
+        "each file's `//!` doc says what it holds",
+        "│   ├── ", 17,
+    ),
+    "session-host-",
+    (
+        "The session host's own tests, moved out of session_host.rs (#2062).",
+        "the session host's tests",
+        "the session host's own tests",
+    ),
+)
+
+PAIR_FILES = {
+    "fence": (
+        "The fenced edit protocol's parser: the fence markers, the events the machine resolves\n"
+        "from streamed text, the machine itself and its header parsers.",
+        "pair fence parser",
+        "the fence machine: the `<<<EDIT>>>` / `<<<NOTE>>>` markers, the events it "
+        "resolves from streamed text, and its header parsers",
+    ),
+    "offsets": (
+        "Byte offsets into a file's replica text: a fence's range and a note's row as offsets,\n"
+        "and keeping a tracked offset true through other participants' edits.",
+        "pair byte offset",
+        "byte offsets into the replica text: a fence range or a note row as offsets, kept "
+        "true through remote edits",
+    ),
+    "provider": (
+        "Which model the navigator talks to and what it is taught: the provider (the claude CLI\n"
+        "or a local endpoint), the config `croft pair` sits down with, and the system prompt\n"
+        "each provider's model gets.",
+        "pair provider",
+        "the provider (the claude CLI or a local endpoint), `PairConfig`, and the system "
+        "prompt each model is taught",
+    ),
+    "state": (
+        "The pilot state's turn books: a fresh seat, a file's live lines, whether a turn is\n"
+        "running, arming a turn and undoing a staged one, what the navigator last saw of a file,\n"
+        "and the bounded lock the App's threads take on the state.",
+        "pair turn state",
+        "the turn books: arming a turn and undoing a staged one, what the navigator last "
+        "saw, and the bounded lock the App's threads take",
+    ),
+    "notes": (
+        "The navigator's anchored notes: listing them, dropping one or all, replying in one, and\n"
+        "landing one from the app side.",
+        "pair note",
+        "the navigator's anchored notes: listing, dropping and replying to them, and "
+        "landing one from the app side",
+    ),
+    "caret": (
+        "The navigator's visible caret: parking it at a row until the file goes live, moving it\n"
+        "with an edit or a note, and this seat's site ids.",
+        "pair caret",
+        "the navigator's caret: parking it at a row until the file is live, and this "
+        "seat's site ids",
+    ),
+    "voice": (
+        "Where the pilot's words go: the model's prose and the pilot's diagnostics, to the\n"
+        "in-process host when seated inside croft, else the REPL's stdout and stderr.",
+        "pair voice",
+        "the pilot's voice and diagnostics: to the in-process host inside croft, else "
+        "stdout and stderr",
+    ),
+    "claude_cli": (
+        "The claude CLI: the tools and settings it may use, finding it on a stripped GUI PATH,\n"
+        "the command that launches it, reading its stream-json events, and the scripted fake\n"
+        "claude the tests drive.",
+        "pair claude CLI",
+        "the claude CLI: its sandbox, finding it on a GUI PATH, its launch command, its "
+        "stream-json events, and the tests' fake claude",
+    ),
+    "seat": (
+        "Seating the pilot: connecting the collab seat, the claude and local-endpoint seats and\n"
+        "their threads, what a turn's end reports, and tearing a seat down.",
+        "pair seat",
+        "seating the pilot: the claude and local-endpoint seats, their threads, and "
+        "teardown",
+    ),
+    "apply": (
+        "Applying the stream to the collab seat: waiting for a file to go live, applying each\n"
+        "fence event, opening and reverting the streamed region, and the pump tick that keeps it\n"
+        "true against the relay.",
+        "pair fence apply",
+        "applying fence events to the collab seat: the bootstrap wait, the streamed "
+        "region and its revert, and the pump tick",
+    ),
+    "turns": (
+        "User turns: where a turn goes (the claude child's stdin or the local worker), composing\n"
+        "the task, ask, yield and reply turns, and sending one with any pending cancel note.",
+        "pair user turn",
+        "user turns: the sink, composing task, ask, yield and reply turns, and sending "
+        "one",
+    ),
+    "repl": (
+        "`croft pair --repl`: the debug REPL driver, joining the relay and running until stdin\n"
+        "closes.",
+        "pair REPL",
+        "`croft pair --repl`, the debug REPL driver",
+    ),
+}
+
+PAIR = Target(
+    "pair", "scripts/split_pair_manifest.tsv", "src/pair.rs", "src/pair", PAIR_FILES,
+    Tree(
+        "├── pair.rs ",
+        "├── pair/                 the pilot's feature files, beside pair.rs; "
+        "each file's `//!` doc says what it holds",
+        "│   ├── ", 17,
+    ),
+    "pair-",
+    (
+        "The pilot's own tests, moved out of pair.rs (#2062).",
+        "the pilot's tests",
+        "the pilot's own tests",
+    ),
+)
+
+# The Source Control panel's feature files (#2062): (module doc, release-note phrase, docs row).
+SOURCE_CONTROL_FILES = {
+    "palette": (
+        "The panel's colours and glyphs, and the width a row's action icons take.",
+        "source control colour and glyph",
+        "the panel's colours and glyphs, and the width of a row's action icons",
+    ),
+    "commit_menu": (
+        "The Commit button's dropdown: its items in VS Code's order, their labels and icons, and\n"
+        "the clicks that open it and pick an item.",
+        "source control commit menu",
+        "the Commit button's dropdown: its items, labels and icons, and the clicks that "
+        "open and pick from it",
+    ),
+    "repositories": (
+        "The multi-root REPOSITORIES overview: one row per workspace folder that is a git\n"
+        "repository, drawing them, and the click that picks one.",
+        "source control repositories overview",
+        "the multi-root REPOSITORIES overview: its rows, drawing them, and the click that "
+        "picks one",
+    ),
+    "message": (
+        "The commit message box: its placeholder and key hint, typing and moving the caret across\n"
+        "the subject and body lines, git's prepared message, clearing it after a commit, and where\n"
+        "its caret is on screen.",
+        "source control commit message",
+        "the commit message box: typing, the caret across subject and body, git's "
+        "prepared message, and clearing it",
+    ),
+    "change_list": (
+        "The change list: taking in git's status, selecting rows (one, several or all), moving the\n"
+        "selection in the order rows are drawn, scrolling, and laying the list out as section\n"
+        "headers and entry rows.",
+        "source control change list",
+        "the change list: git's status, selecting and moving through rows, scrolling, and "
+        "its layout",
+    ),
+    "clicks": (
+        "What a click lands on: the header pills, the branch name, a row's stage, unstage and\n"
+        "discard icons, the Commit and Initialize buttons, and a nested repository's Open button.",
+        "source control hit-testing",
+        "what a click lands on: the header pills, the branch, a row's action icons and "
+        "the buttons",
+    ),
+    "empty_state": (
+        "The \"No repository detected\" card: its text, its buttons and the Git fork drawing, full\n"
+        "size or compact.",
+        "source control empty state",
+        "the \"No repository detected\" card and its Git fork drawing",
+    ),
+    "buttons": (
+        "The buttons every view draws: the primary button (Commit, Initialize, Open, Run and Debug)\n"
+        "in its boxed and rounded looks, the Commit split button, their colours and the lift a\n"
+        "pointer gives them.",
+        "source control button",
+        "the primary button every view draws, the Commit split button, their colours and "
+        "hover",
+    ),
+    "render": (
+        "Drawing the panel: the header, the branch summary, the message box, the Commit button,\n"
+        "the change list and the commit feedback, wrapped to fit.",
+        "source control panel drawing",
+        "drawing the panel: header, branch, message box, Commit button, change list and "
+        "feedback",
+    ),
+}
+
+SOURCE_CONTROL = Target(
+    "source_control", "scripts/split_source_control_manifest.tsv",
+    "src/widgets/source_control.rs", "src/widgets/source_control", SOURCE_CONTROL_FILES,
+    Tree(
+        "    ├── source_control.rs ",
+        "    ├── source_control/       the Source Control panel's feature files, beside "
+        "source_control.rs; each file's `//!` doc says what it holds",
+        "    │   ├── ", 17,
+    ),
+    "source-control-",
+    (
+        "The Source Control panel's own tests, moved out of source_control.rs (#2062).",
+        "the Source Control panel's tests",
+        "the Source Control panel's own tests",
+    ),
+)
+
+TARGETS = {
+    t.name: t
+    for t in (
+        APP, EDITOR, LSP, TERMINAL, GIT, REMOTE, SEARCH, SESSION_HOST, PAIR, SOURCE_CONTROL,
+    )
+}
 
 # Kinds whose declaration can carry a visibility.
 VISIBLE = {"fn", "const", "static", "struct", "enum", "union", "trait", "type"}
@@ -1202,9 +1599,14 @@ def add_glue(lines, file, free):
     """`mod file;` after the last `mod x;` at the top of mod.rs and, when the
     file has free items, `use file::*;` after the `use` lines that follow. A
     file with no `mod x;` yet gets its first after the `use` declarations at
-    its top, a blank line between."""
+    its top, a blank line between. The top ends at the file's first item:
+    a split file that has shrunk keeps its `#[cfg(test)] mod tests;` at the
+    bottom, below its last struct, and a new file's `mod` goes with the
+    others, not beside that one."""
     decl = re.compile(r"^(pub(\(\w+\))? )?mod \w+;$")
-    mods = [n for n, ln in enumerate(lines[:200]) if decl.match(ln)]
+    items, _ = cpm.parse("\n".join(lines))
+    first = min((it.start for it in items), default=len(lines))
+    mods = [n for n, ln in enumerate(lines[:first]) if decl.match(ln)]
     if mods:
         last_mod = max(mods)
     else:
@@ -1420,10 +1822,26 @@ def reexport_line(lines, file, name):
     return next((n for n, ln in enumerate(lines) if pat.match(ln)), None)
 
 
+def item_cfgs(text):
+    """The `#[cfg(...)]` lines on an item, from its text: the attributes
+    among its doc comment, above its declaration."""
+    cfgs = []
+    for line in text.split("\n"):
+        line = line.strip()
+        if line.startswith("#[cfg(") and line.endswith(")]"):
+            cfgs.append(line)
+        elif not (line.startswith(("//", "#[")) or not line):
+            break
+    return cfgs
+
+
 def fix_glue(lines, app, tests, homes, scope="app"):
     """mod.rs `lines` with the glue the build errors ask for, and what was
     done. `scope` names the module being split, for the messages. `app` and `tests` are the errors of the two builds; `homes` maps a
-    moved free item's name to (file, visibility). Raises BuildError when an
+    moved free item's name to (file, visibility) or (file, visibility,
+    cfgs): `cfgs` are the item's own `#[cfg(...)]` lines, which its
+    re-export takes too, so a test-only item is re-exported for the tests
+    alone and the app build does not look for it. Raises BuildError when an
     error is not one this fixes."""
     lines, done, unknown = list(lines), [], []
     private, unused = set(), {"app": set(), "tests": set()}
@@ -1448,14 +1866,16 @@ def fix_glue(lines, app, tests, homes, scope="app"):
     if unknown and not private:
         raise BuildError("the build fails in a way this tool does not fix:\n  " + "\n  ".join(unknown))
     for name in sorted(private):
-        file, vis = homes[name]
+        file, vis, *rest = homes[name]
+        cfgs = list(rest[0]) if rest else []
         if vis not in ("pub", "pub(crate)"):
             raise BuildError(f"{name} is used outside {scope} but is {vis or 'private'} in {file}.rs")
         at = glob_line(lines, file)
         if at is None:
             at = next(n for n, ln in enumerate(lines) if ln == f"mod {file};")
-        lines.insert(at + 1, f"{vis} use {file}::{name};")
-        done.append(f"re-exported {file}::{name} ({vis}): used outside {scope}")
+        lines[at + 1:at + 1] = cfgs + [f"{vis} use {file}::{name};"]
+        only = f" only under {', '.join(c[2:-1] for c in cfgs)}" if cfgs else ""
+        done.append(f"re-exported {file}::{name} ({vis}){only}: used outside {scope}")
     for file in sorted(unused["app"] | unused["tests"]):
         at = glob_line(lines, file)
         guarded = at > 0 and lines[at - 1].startswith("#[cfg(")
@@ -1540,8 +1960,8 @@ def settle(root, rows, rounds=5, t=APP, new=None):
             with open(path, encoding="utf-8") as f:
                 for it in cpm.parse(f.read(), path)[0]:
                     if not it.ctx and not it.mods:
-                        vis[(file, it.name)] = it.vis
-        homes = {n: (f, vis[(f, n)]) for n, f in homes.items() if (f, n) in vis}
+                        vis[(file, it.name)] = (it.vis, item_cfgs(it.norm))
+        homes = {n: (f, *vis[(f, n)]) for n, f in homes.items() if (f, n) in vis}
         with open(mod_path, encoding="utf-8") as f:
             lines = f.read().split("\n")
         lines, now = fix_glue(lines, app, tests, homes, t.name)
