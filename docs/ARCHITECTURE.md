@@ -217,6 +217,7 @@ src/
 │   │   ├── packs.rs            suites and packs: installing, downloading and running them
 │   │   ├── queries.rs          the workspace's queries: finding and creating them, Quick Query, query help
 │   │   ├── results.rs          a run's results: result sets, the alert and raw views, Compare Results, Export Results
+│   │   ├── run.rs              running a query, quick evaluation and Debug Query, cancelling and recording a run
 │   │   ├── test_runs.rs        CodeQL: Run Tests through the Testing view, and Accept Test Output
 │   ├── commands.rs      `run_command`, the Command Palette, the Extensions view, extension commands (MCP tools, viewers) and Show Memory Usage
 │   ├── completion.rs    the completion popup, auto-imports, snippets, signature help, ghost-text suggestions and Emmet
