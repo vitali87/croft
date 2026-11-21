@@ -1760,11 +1760,178 @@ DEBUGGER = Target(
     None,
 )
 
+# What each file split out of src/app/language_servers.rs holds, as FILES above.
+LANGUAGE_SERVERS_FILES = {
+    "sync": (
+        "Keeping the language servers in step with the open files: each tab's document opened,\n"
+        "changed and closed on its servers, the notice when shellcheck is missing, re-opening the\n"
+        "files a just-installed server covers, filing each server's diagnostics, the\n"
+        "workspace-diagnostics refresh, and Language Servers: Restart All and Restart for This\n"
+        "File.",
+        "language server sync",
+        "keeping servers in step with the open files, their diagnostics, and restarts",
+    ),
+    "rust_analyzer": (
+        "rust-analyzer's own `Rust:` commands: whether it serves the active file, sending one for\n"
+        "the caret, and acting on the answer (a macro's expansion opened as a tab, a jump to the\n"
+        "parent module or Cargo.toml, a proc-macro rebuild or workspace reload reported).",
+        "rust-analyzer command",
+        "rust-analyzer's `Rust:` commands: sending them and acting on the answers",
+    ),
+    "semantic": (
+        "Semantic highlighting: semantic-token replies handed to every editor showing the file,\n"
+        "the refresh a server asks for, which of two overlapping replies wins, and swapping in\n"
+        "each tab's finished background syntax pass.",
+        "semantic token",
+        "semantic tokens, their refresh, and the background syntax pass landing",
+    ),
+    "inlay_hints": (
+        "Inlay hints: replies routed to every editor showing the file (the seq-gated fan-out\n"
+        "that links and colors share), the refresh a server asks for, the range each request\n"
+        "covers, and Editor: Toggle Inlay Hints.",
+        "inlay hint",
+        "inlay hints: their replies, refresh, requests and the toggle",
+    ),
+    "decorations": (
+        "What a server marks in the text besides tokens and hints: document links and following\n"
+        "one, folding ranges, color swatches, and Change Color Presentation's picker.",
+        "document link, folding range and color",
+        "document links, folding ranges, colors and Change Color Presentation",
+    ),
+    "messages": (
+        "What the servers tell croft: work-done progress and the status-bar line it makes,\n"
+        "`window/*` messages as status lines, a server's questions in the list picker, and\n"
+        "`window/showDocument`.",
+        "server message",
+        "server progress, messages, questions and show-document requests",
+    ),
+    "navigation": (
+        "Go to Definition, Declaration, Type Definition, Implementations and References: the\n"
+        "request at the caret or under a Cmd-click, jumping to the answer with navigation\n"
+        "history, and the picker when there are several.",
+        "go-to",
+        "Go to Definition and its kin: requests, jumps and the multi-location picker",
+    ),
+    "peek": (
+        "Peek Definition and Peek References: the popup with its numbered excerpt, stepping\n"
+        "through the references, and closing it.",
+        "peek",
+        "Peek Definition and Peek References: the popup, its excerpt and stepping",
+    ),
+    "hierarchy": (
+        "Call and type hierarchies: asking for the callers, callees, supertypes or subtypes at\n"
+        "the caret, and the picker their answer opens.",
+        "hierarchy",
+        "call and type hierarchies: the requests and the picker of answers",
+    ),
+    "capabilities": (
+        "The active editor's language and whether its server supports a feature (declaration,\n"
+        "type definition, implementations, references, call hierarchy, code actions): the gates\n"
+        "on the right-click menu's rows.",
+        "language capability",
+        "the active file's language and which features its server supports",
+    ),
+    "breadcrumbs": (
+        "The breadcrumbs bar and sticky scroll: the crumbs for the caret, each crumb's picker of\n"
+        "folders, files or sibling symbols and its filter, View: Focus and Select Breadcrumbs,\n"
+        "and the scope headers pinned above the editor.",
+        "breadcrumb",
+        "breadcrumbs, their pickers, and the sticky-scroll headers",
+    ),
+    "outline": (
+        "The OUTLINE: keeping it in step with the active editor, the syntax-tree outline (parsed\n"
+        "off the UI thread for a large buffer) until the server's `documentSymbol` answer lands,\n"
+        "the secondary side bar that shows it, and the grammar symbol tabs parse with.",
+        "outline",
+        "the OUTLINE: syntax and server symbols, and the secondary side bar",
+    ),
+    "typing": (
+        "What a server does as you type: on-type formatting, linked editing of paired tags, the\n"
+        "characters that open parameter hints, and user snippets as completion items.",
+        "as-you-type",
+        "on-type formatting, linked editing, parameter-hint triggers and snippet items",
+    ),
+    "selection": (
+        "Expand and Shrink Selection by the server's selection ranges, and highlighting the\n"
+        "other occurrences of the symbol under a resting caret.",
+        "smart select and highlight",
+        "Expand and Shrink Selection, and occurrence highlights",
+    ),
+    "workspace_edits": (
+        "Applying a server's workspace edit: open buffers in any split edited in memory as one\n"
+        "undo step, closed files written on disk, and refusing an edit to a buffer typed into\n"
+        "since the request.",
+        "workspace edit",
+        "applying workspace edits to buffers and files, and refusing stale ones",
+    ),
+    "rename": (
+        "Rename Symbol (F2): the prompt, pre-filled from prepare-rename or the word at the caret,\n"
+        "the rename request, and landing its reply.",
+        "rename",
+        "Rename Symbol: the prompt, prepare-rename and landing the reply",
+    ),
+    "format": (
+        "Format Document and Format Selection: the server's reply or Prettier's run applied to\n"
+        "the tab it formats, and format-on-save, which writes the file unformatted once its\n"
+        "formatter has taken too long.",
+        "formatting",
+        "Format Document and Selection, Prettier, and format-on-save",
+    ),
+    "code_actions": (
+        "Quick Fix (Cmd+.): the range and diagnostics it asks about, the picker of actions, and\n"
+        "applying the chosen one's edit and command, resolving it first when the server sent it\n"
+        "bare.",
+        "code action",
+        "Quick Fix: requesting, picking, resolving and applying code actions",
+    ),
+    "go_to_symbol": (
+        "Go to Symbol in Editor (Cmd/Ctrl+Shift+O): opening it on the active file's outline,\n"
+        "its keys, mouse and drawing, and jumping to the chosen symbol.",
+        "Go to Symbol in Editor",
+        "Go to Symbol in Editor: the picker, its keys, mouse and drawing",
+    ),
+    "workspace_symbols": (
+        "Go to Symbol in Workspace (`#` in Quick Open): the debounced query to every running\n"
+        "server, its replies, the picker's keys, mouse and drawing, and jumping to the chosen\n"
+        "symbol.",
+        "Go to Symbol in Workspace",
+        "Go to Symbol in Workspace: the debounced query, replies and the picker",
+    ),
+    "code_lens": (
+        "CodeLens: asking for the active file's lenses once its edits settle, landing them on\n"
+        "every tab showing the file, running one by click or from the keyboard, and Editor:\n"
+        "Toggle CodeLens.",
+        "CodeLens",
+        "CodeLens: requesting, landing, running and toggling lenses",
+    ),
+    "hover_text": (
+        "What a hover says: the diagnostics under the pointer as one block, errors first, above\n"
+        "the server's hover text.",
+        "hover text",
+        "the hover's text: diagnostics first, then the server's answer",
+    ),
+}
+
+LANGUAGE_SERVERS = Target(
+    "language_servers", "scripts/split_language_servers_manifest.tsv",
+    "src/app/language_servers.rs", "src/app/language_servers",
+    LANGUAGE_SERVERS_FILES,
+    Tree(
+        "│   ├── language_servers.rs ",
+        "│   ├── language_servers/ the language server feature files, beside "
+        "language_servers.rs; each file's `//!` doc says what it holds",
+        "│   │   ├── ", 20,
+    ),
+    "language-servers-",
+    # Its tests are already their own file, src/app/tests/lsp.rs.
+    None,
+)
+
 TARGETS = {
     t.name: t
     for t in (
         APP, EDITOR, LSP, TERMINAL, GIT, REMOTE, SEARCH, SESSION_HOST, PAIR, SOURCE_CONTROL,
-        CLI, CODEQL, DEBUGGER,
+        CLI, CODEQL, DEBUGGER, LANGUAGE_SERVERS,
     )
 }
 
