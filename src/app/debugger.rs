@@ -16,6 +16,7 @@ mod console;
 mod controls;
 mod debug_test;
 mod events;
+mod inline_values;
 mod launch;
 mod python;
 mod view;
@@ -146,72 +147,3 @@ impl PreLaunchWait {
 /// to a plain shell — a long build keeps a non-shell foreground and waits
 /// indefinitely, exactly like the FinishedCommand path.
 pub(super) const PRELAUNCH_MARK_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
-
-impl App {
-    /// Rebuild the inline-value trailers (#135) from the current stop's
-    /// already-fetched VARIABLES data, on every editor showing the stopped
-    /// file (inactive split groups render too).
-    pub(super) fn refresh_inline_values(&mut self) {
-        use crate::dap::session::SessionPhase;
-        if !self.inline_values_enabled {
-            return;
-        }
-        let Some(session) = self.debug_sessions.focused() else {
-            return;
-        };
-        if session.phase != SessionPhase::Stopped {
-            return;
-        }
-        let Some((path, line)) = session.current_location.clone() else {
-            return;
-        };
-        let locals = crate::dap::session::inline_locals(&session.scopes, &session.variables);
-        for ed in self.editor.editors.iter_mut() {
-            if ed.path.as_deref() == Some(path.as_path()) {
-                ed.set_inline_values_from_locals(line, &locals);
-            }
-        }
-        for group in self.editor_layout.inactive_groups_mut() {
-            for ed in group.editors.iter_mut() {
-                if ed.path.as_deref() == Some(path.as_path()) {
-                    ed.set_inline_values_from_locals(line, &locals);
-                }
-            }
-        }
-    }
-
-    /// Drop every inline-value trailer, in every editor of every group —
-    /// called wherever the stop arrow clears (resume, step, terminate).
-    pub(super) fn clear_inline_values(&mut self) {
-        for ed in self.editor.editors.iter_mut() {
-            ed.inline_values.clear();
-        }
-        for group in self.editor_layout.inactive_groups_mut() {
-            for ed in group.editors.iter_mut() {
-                ed.inline_values.clear();
-            }
-        }
-    }
-
-    pub(super) fn toggle_inline_values(&mut self) {
-        self.inline_values_enabled = !self.inline_values_enabled;
-        if self.inline_values_enabled {
-            self.refresh_inline_values();
-        } else {
-            self.clear_inline_values();
-        }
-        self.status = format!(
-            "Debug Inline Values: {}",
-            if self.inline_values_enabled {
-                "on"
-            } else {
-                "off"
-            }
-        );
-        if !cfg!(test) {
-            self.report_unsaved_setting(crate::prefs::save_inline_values(
-                self.inline_values_enabled,
-            ));
-        }
-    }
-}
