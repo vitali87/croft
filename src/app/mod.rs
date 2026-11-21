@@ -3207,9 +3207,14 @@ pub struct App {
     editor_vim_chord: EditorVimChord,
     /// `Cmd+K` leader: armed when the user presses the prefix, holding the
     /// instant it started so the next key within `CMD_K_LEADER_TIMEOUT`
-    /// completes a `Cmd+K`-prefixed chord (VS Code's two-key model). `None`
-    /// when no chord is in flight.
-    cmd_k_leader: Option<std::time::Instant>,
+    /// completes a `Cmd+K`-prefixed chord (VS Code's two-key model), and the
+    /// leader's name for the status bar's "Waiting for second key" line.
+    /// `None` when no chord is in flight.
+    cmd_k_leader: Option<CmdKLeader>,
+    /// VS Code's "The key combination (Ctrl+K, X) is not a command." note:
+    /// when it comes off the bar, and its text, so a message that replaced
+    /// it in the meantime stays.
+    cmd_k_miss_note: Option<(std::time::Instant, String)>,
     /// Whether croft asked the terminal for the kitty keyboard protocol at
     /// startup (what `croft keys` reports as `kitty=`). A terminal that
     /// honours it reports `Shift` held with `Ctrl` explicitly, so
@@ -4789,6 +4794,7 @@ impl App {
             completion_popup: None,
             editor_vim_chord: EditorVimChord::default(),
             cmd_k_leader: None,
+            cmd_k_miss_note: None,
             kitty_keys: false,
             legacy_ctrl_punct: false,
             vim: crate::vim::VimState::new(),
@@ -6789,6 +6795,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         crate::startup_trace::mark("AI tools polled");
         let voice_changed = app.drain_voice();
         let zen_hint_changed = app.expire_zen_hint(std::time::Instant::now());
+        let cmd_k_changed = app.expire_cmd_k(std::time::Instant::now());
         let screencast_changed = app.screencast.expire(std::time::Instant::now());
         let zoxide_changed = app.poll_zoxide_install();
         // Surface managed language-server install progress in the status bar so
@@ -6812,6 +6819,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
 
         let non_pty_dirty = needs_redraw
             || zen_hint_changed
+            || cmd_k_changed
             || screencast_changed
             || zoxide_changed
             || fs_changed

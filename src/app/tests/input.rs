@@ -515,7 +515,9 @@ fn screencast_mode_leaves_out_typing_into_a_password_field_or_the_shell() {
         .unwrap();
     assert_eq!(app.screencast.row_text(200), " Esc   Ctrl+C ");
     // `Cmd+K` leads in the shell too. A second key that completes no chord
-    // goes on to the shell, so it is left out; one that does is shown.
+    // only ends the wait, as in VS Code, and a character is still left out:
+    // it may be the start of a secret typed after a stray Cmd+K. One that
+    // completes a chord is shown.
     let cmd = if cfg!(target_os = "macos") {
         "Cmd"
     } else {
@@ -528,7 +530,11 @@ fn screencast_mode_leaves_out_typing_into_a_password_field_or_the_shell() {
     assert_eq!(
         app.screencast.row_text(200),
         format!(" Esc   Ctrl+C   {cmd}+K "),
-        "the ? went to the shell"
+        "the ? is left out"
+    );
+    assert!(
+        app.status.ends_with("is not a command."),
+        "the ? only ended the wait"
     );
     app.handle_key(key(KeyCode::Char('k'), KeyModifiers::SUPER))
         .unwrap();
