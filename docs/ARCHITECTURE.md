@@ -260,6 +260,8 @@ src/
 │   ├── inline_images.rs pictures in the terminal: support detection, the background chrome bake, sending and clearing each picture every frame (the activity-bar icons included), the editor, terminal and Markdown overlays, and the minimap
 │   ├── key_input.rs     `handle_key` and `handle_key_inner`, Cmd+K chords, every `is_*_key` predicate, the key and mouse contexts for user keymaps, voice input and the on-screen keyboard
 │   ├── language_servers.rs language servers: sync, messages and progress, decorations, go-to and peek, hierarchies, rename, code actions, formatting, linked editing, smart select, highlights, symbol pickers, code lens, outline, breadcrumbs, sticky scroll, restart
+│   ├── language_servers/ the language server feature files, beside language_servers.rs; each file's `//!` doc says what it holds
+│   │   ├── sync.rs              keeping servers in step with the open files, their diagnostics, and restarts
 │   ├── memory_report.rs Developer: Show Memory Usage: the per-subsystem figures laid out as Markdown, opened as a rendered preview so typing can't edit it
 │   ├── menus.rs         right-click and dropdown menus: shortcut hints, ContextMenu methods, geometry, keys, drawing, `dispatch_menu_action`, and the status-bar click menus
 │   ├── mouse_input.rs   all mouse handling (`handle_mouse_inner`), hover popups and tooltips, and closing stale popups on a click
