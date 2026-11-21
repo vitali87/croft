@@ -159,7 +159,11 @@ class Moves(unittest.TestCase):
         root = Root(self.tmp, MOD, ONE_PR)
         code, out = root.move(1)
         self.assertEqual(code, 0, out)
-        self.assertIn("moved 6 item(s) from src/app/mod.rs to src/app/code_scanning.rs, 4 widened", out)
+        self.assertIn(
+            "moved 6 item(s) from src/app/mod.rs to src/app/code_scanning.rs, "
+            "4 private -> pub(super), 1 pub(super) -> pub(crate)",
+            out,
+        )
         root.commit()
         code, out = root.pure()
         self.assertEqual(code, 0, out)
@@ -175,7 +179,11 @@ class Moves(unittest.TestCase):
         self.assertIn("impl fmt::Display for App {", text)
         self.assertIn("\n\n/// The counter.\nimpl App {\n", text, "an emptied block's docs go with it")
 
-    def test_private_items_widen_to_the_parent_and_nothing_else_does(self):
+    def test_each_moved_item_keeps_exactly_its_reach(self):
+        """A private item of mod.rs reached all of `app`, which is `pub(super)`
+        from a file under src/app/; a `pub(super)` one reached the whole crate,
+        which from there is `pub(crate)`: kept as `pub(super)` it would reach
+        only `app`, narrower than before."""
         root = Root(self.tmp, MOD, ONE_PR)
         root.move(1)
         text = root.read("src/app/code_scanning.rs")
@@ -183,8 +191,9 @@ class Moves(unittest.TestCase):
         self.assertIn("    #[cfg(test)] pub(super) fn probe(&self) {}", text)
         self.assertIn("// Adds one.\n#[must_use]\npub(super) fn inc(x: u8)", text)
         self.assertIn("pub(super) const LIMIT: u8 = 3;", text)
-        self.assertIn("    pub(super) fn shown(&self)", text)
+        self.assertIn("    pub(crate) fn shown(&self)", text)
         self.assertNotIn("pub(super) pub(super)", text)
+        self.assertNotIn("pub(crate) pub(super)", text)
         self.assertIn("    fn fmt(&self, f: &mut fmt::Formatter<'_>)", text, "a trait method takes no visibility")
 
     def test_mod_rs_loses_emptied_blocks_and_gains_the_module_glue(self):
@@ -335,6 +344,30 @@ class Refusals(unittest.TestCase):
 class Helpers(unittest.TestCase):
     GLUE = ["mod commands;", "mod remote_sessions;", "mod settings;", "use commands::*;",
             "use remote_sessions::*;", "use settings::*;", "", "pub struct App;"]
+
+    def test_a_visibility_is_respelled_to_reach_what_it_reached(self):
+        """Moving from src/app/codeql.rs into src/app/codeql/: a private item
+        reached all of `codeql`, now `pub(super)`; a `pub(super)` one reached
+        all of `app`, now `pub(in crate::app)`; wider ones stay. Without the
+        modules, only a private item changes, to `pub(super)`."""
+        src, dst = ("crate", "app", "codeql"), ("crate", "app", "codeql", "run")
+        for vis, want in [("", "pub(super)"), ("pub(super)", "pub(incrate::app)"),
+                          ("pub(crate)", "pub(crate)"), ("pub", "pub")]:
+            self.assertEqual(mi.respell(vis, src, dst), want, vis)
+        self.assertEqual(mi.respell(""), "pub(super)")
+        self.assertEqual(mi.respell("pub(super)"), "pub(super)")
+
+    def test_a_moved_pub_super_method_names_the_module_it_reached(self):
+        text = "impl App {\n    /// Runs.\n    pub(super) fn run(&self) {}\n\n    fn helper(&self) {}\n}\n"
+        code, starts_in, _ = pm.lex(text)
+        lines, clines = text.split("\n"), code.split("\n")
+        kinds = [pm.line_kind(ln, c, starts_in.get(i)) for i, (ln, c) in enumerate(zip(lines, clines))]
+        run, helper = pm.parse(text, "src/app/codeql.rs")[0]
+        src, dst = ("crate", "app", "codeql"), ("crate", "app", "codeql", "run")
+        self.assertEqual(mi.widen(lines, run, kinds, clines, "impl App", src, dst),
+                         ["    /// Runs.", "    pub(in crate::app) fn run(&self) {}"])
+        self.assertEqual(mi.widen(lines, helper, kinds, clines, "impl App", src, dst),
+                         ["    pub(super) fn helper(&self) {}"])
 
     def test_an_item_used_outside_app_is_re_exported_at_its_own_visibility(self):
         errors = [("E0603", "function import `takeover_mode_seq` is private"),
