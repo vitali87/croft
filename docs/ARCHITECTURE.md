@@ -19,6 +19,7 @@ src/
 ├── main.rs              entry point + module declarations
 ├── cli.rs               clap CLI: open path, setup-terminal / setup-iterm2 / setup-cross / remote / view / keys subcommands
 ├── cli/                 the command line's feature files, beside cli.rs; each file's `//!` doc says what it holds
+│   ├── commands.rs       every subcommand and its flags, as clap parses them
 │   ├── cross.rs          `croft setup-cross`: the cross-build's targets, and installing zig, cargo-zigbuild and the targets
 │   ├── git_editor.rs     `croft edit` as git's editor: the user's own sequence editor, and git's own editor when no croft is there
 │   ├── hook.rs           `croft hook`: Claude Code's edit hook itself, and installing or removing it
