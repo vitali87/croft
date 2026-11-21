@@ -263,6 +263,7 @@ src/
 │   ├── language_servers/ the language server feature files, beside language_servers.rs; each file's `//!` doc says what it holds
 │   │   ├── decorations.rs       document links, folding ranges, colors and Change Color Presentation
 │   │   ├── inlay_hints.rs       inlay hints: their replies, refresh, requests and the toggle
+│   │   ├── messages.rs          server progress, messages, questions and show-document requests
 │   │   ├── rust_analyzer.rs     rust-analyzer's `Rust:` commands: sending them and acting on the answers
 │   │   ├── semantic.rs          semantic tokens, their refresh, and the background syntax pass landing
 │   │   ├── sync.rs              keeping servers in step with the open files, their diagnostics, and restarts
