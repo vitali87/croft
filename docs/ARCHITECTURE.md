@@ -271,6 +271,7 @@ src/
 │   │   ├── outline.rs           the OUTLINE: syntax and server symbols, and the secondary side bar
 │   │   ├── peek.rs              Peek Definition and Peek References: the popup, its excerpt and stepping
 │   │   ├── rust_analyzer.rs     rust-analyzer's `Rust:` commands: sending them and acting on the answers
+│   │   ├── selection.rs         Expand and Shrink Selection, and occurrence highlights
 │   │   ├── semantic.rs          semantic tokens, their refresh, and the background syntax pass landing
 │   │   ├── sync.rs              keeping servers in step with the open files, their diagnostics, and restarts
 │   │   ├── typing.rs            on-type formatting, linked editing, parameter-hint triggers and snippet items
