@@ -207,7 +207,7 @@ src/
 │   ├── bottom_panel.rs  the bottom panel and its tab strip, the OUTPUT picker, PROBLEMS and the diagnostics store, the whole-project check, build matchers, and the PORTS panel
 │   ├── click.rs         double / triple click detection
 │   ├── code_scanning.rs SARIF results viewer (list, open, preview, baselines, export, fixes and step marks), GitHub code scanning (pick, download, follow branch, dismiss) and SARIF logs shown as problems
-│   ├── codeql.rs        the CodeQL side bar: databases, query history and logs, running queries, suites and packs, result viewers, AST and CFG, the model editor, the run queue, variant analysis, and downloading and updating the CLI
+│   ├── codeql.rs        the CodeQL side bar: databases, query history and logs, running queries, suites and packs, result viewers, AST and CFG, the model editor, the run queue, variant analysis, and downloading and updating the CLI: what every part shares (the run mode, the results its worker threads send back, the database sources and the variant analysis poll intervals); each feature is in a file in `codeql/` below
 │   ├── codeql/          the CodeQL side bar's feature files, beside codeql.rs; each file's `//!` doc says what it holds
 │   │   ├── cli_install.rs      the CodeQL CLI: which `codeql` runs, its version, downloading it and checking for updates
 │   │   ├── contextual.rs       contextual queries: View AST and View CFG
