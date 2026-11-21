@@ -266,6 +266,7 @@ src/
 │   │   ├── code_actions.rs      Quick Fix: requesting, picking, resolving and applying code actions
 │   │   ├── decorations.rs       document links, folding ranges, colors and Change Color Presentation
 │   │   ├── format.rs            Format Document and Selection, Prettier, and format-on-save
+│   │   ├── go_to_symbol.rs      Go to Symbol in Editor: the picker, its keys, mouse and drawing
 │   │   ├── hierarchy.rs         call and type hierarchies: the requests and the picker of answers
 │   │   ├── inlay_hints.rs       inlay hints: their replies, refresh, requests and the toggle
 │   │   ├── messages.rs          server progress, messages, questions and show-document requests
