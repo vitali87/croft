@@ -1,0 +1,155 @@
+# Stage B of the refactor program (#2062): where each item of src/widgets/search.rs goes.
+# One row per item, in file order. pr 0 means the item stays in search.rs; the others
+# move to src/widgets/search/<file>.rs in that PR. kind, impl and name are as
+# `scripts/check_pure_move.py list` prints them. Run
+# `scripts/move_items.py --target search --check` after adding an item to search.rs.
+# search.rs keeps the types its parts share: a hit, the search options, the panel and
+# its fields, the toggles, and the panel's constructor.
+pr	file	kind	impl	name
+3	walk	const	-	MAX_LINE_LEN
+10	render	const	-	FIELD_FILL_LIFT_IDLE
+10	render	const	-	FIELD_FILL_LIFT_FOCUS
+10	render	const	-	FIELD_BAR_IDLE
+10	render	fn	-	lift_bg
+10	render	fn	-	draw_field_divider
+0		struct	-	SearchHit
+0		struct	-	SearchOpts
+0		fn	impl SearchOpts	same_matching
+1	matcher	fn	-	build_matcher
+1	matcher	fn	-	compile_matcher
+1	matcher	enum	-	SearchMatcher
+1	matcher	type	impl Matcher for SearchMatcher	Captures
+1	matcher	type	impl Matcher for SearchMatcher	Error
+1	matcher	fn	impl Matcher for SearchMatcher	find_at
+1	matcher	fn	impl Matcher for SearchMatcher	new_captures
+1	matcher	fn	impl Matcher for SearchMatcher	shortest_match_at
+1	matcher	fn	impl Matcher for SearchMatcher	is_match_at
+1	matcher	fn	impl Matcher for SearchMatcher	non_matching_bytes
+1	matcher	fn	impl Matcher for SearchMatcher	line_terminator
+1	matcher	fn	impl Matcher for SearchMatcher	find_candidate_line
+1	matcher	enum	-	Pattern
+1	matcher	fn	impl Pattern	new
+1	matcher	fn	impl Pattern	for_find
+1	matcher	fn	impl Pattern	has_group
+1	matcher	fn	impl Pattern	captures_len
+1	matcher	fn	impl Pattern	spans
+1	matcher	fn	impl Pattern	expand_at
+1	matcher	fn	-	query_error
+1	matcher	fn	-	build_searcher
+2	path_filter	struct	-	PathFilter
+2	path_filter	fn	-	compile_glob
+2	path_filter	fn	-	invalid_globs
+2	path_filter	fn	-	build_glob_set
+2	path_filter	fn	-	build_glob_set_of
+2	path_filter	fn	-	names_a_folder
+2	path_filter	fn	-	matches_self_or_parent
+2	path_filter	fn	impl PathFilter	new
+2	path_filter	fn	impl PathFilter	is_empty
+2	path_filter	fn	impl PathFilter	allows
+2	path_filter	fn	impl PathFilter	excludes
+2	path_filter	fn	impl PathFilter	excluding
+3	walk	struct	-	HitSink
+3	walk	type	impl<'a> Sink for HitSink<'a>	Error
+3	walk	fn	impl<'a> Sink for HitSink<'a>	matched
+3	walk	fn	-	as_typed
+3	walk	fn	-	search_workspace_streaming
+3	walk	fn	-	search_workspace_streaming_skipping
+3	walk	fn	-	search_workspace_streaming_filtered
+3	walk	fn	-	is_vcs_store
+3	walk	fn	-	search_workspace
+3	walk	fn	-	line_may_match
+4	highlight	fn	-	split_for_highlight
+4	highlight	fn	-	split_for_highlight_regex
+5	worker	enum	-	SearchEvent
+5	worker	enum	-	SearchRequest
+5	worker	const	-	SEARCH_DEBOUNCE
+5	worker	fn	-	search_worker_loop
+3	walk	fn	-	collect_matches_in_text
+6	replace	fn	-	build_replace_regex
+6	replace	fn	-	replace_in_line
+6	replace	fn	-	count_in_line
+6	replace	fn	-	trim_leading_context
+6	replace	fn	-	brace_refs
+6	replace	fn	-	numbered_ref
+6	replace	fn	-	replace_in_text
+6	replace	fn	-	preserve_case
+6	replace	fn	-	expand_replacement
+6	replace	fn	-	replace_in_file
+6	replace	fn	-	is_whole_word_match
+6	replace	fn	-	is_word_char
+0		struct	-	SearchPanel
+0		enum	-	SearchField
+0		fn	impl SearchField	index
+0		fn	impl SearchPanel	new
+7	fields	fn	impl SearchPanel	cursor_screen_pos
+8	hit_test	fn	impl SearchPanel	paste_button_at
+7	fields	fn	impl SearchPanel	selection_range
+7	fields	fn	impl SearchPanel	seed
+7	fields	fn	impl SearchPanel	caret
+7	fields	fn	impl SearchPanel	field_text
+7	fields	fn	impl SearchPanel	field_caret
+7	fields	fn	impl SearchPanel	store_caret
+7	fields	fn	impl SearchPanel	set_caret
+7	fields	fn	impl SearchPanel	move_caret
+7	fields	fn	impl SearchPanel	click_caret
+7	fields	fn	impl SearchPanel	edit_active
+7	fields	fn	impl SearchPanel	select_all_query
+7	fields	fn	impl SearchPanel	clear_selection
+7	fields	fn	impl SearchPanel	delete_selection
+7	fields	fn	impl SearchPanel	selection_text
+7	fields	fn	impl SearchPanel	active_text_mut
+7	fields	fn	impl SearchPanel	active_text
+7	fields	fn	impl SearchPanel	active_text_mut_clear
+7	fields	fn	impl SearchPanel	clear_active_selection
+7	fields	fn	impl SearchPanel	active_selection
+7	fields	fn	impl SearchPanel	set_active_selection
+7	fields	fn	impl SearchPanel	type_char
+7	fields	fn	impl SearchPanel	backspace
+7	fields	fn	impl SearchPanel	backspace_by
+7	fields	fn	impl SearchPanel	delete_forward
+7	fields	fn	impl SearchPanel	insert_str
+7	fields	fn	impl SearchPanel	select_all_active
+7	fields	fn	impl SearchPanel	delete_active_selection
+7	fields	fn	impl SearchPanel	active_selection_text
+7	fields	fn	impl SearchPanel	focus_next_field
+7	fields	fn	impl SearchPanel	focus_field
+7	fields	fn	impl SearchPanel	visible_fields
+7	fields	fn	impl SearchPanel	toggle_replace
+7	fields	fn	impl SearchPanel	open_replace
+7	fields	fn	impl SearchPanel	toggle_details
+7	fields	fn	impl SearchPanel	path_filter
+7	fields	fn	impl SearchPanel	effective_exclude
+8	hit_test	fn	impl SearchPanel	chevron_at
+8	hit_test	fn	impl SearchPanel	ellipsis_at
+8	hit_test	fn	impl SearchPanel	replace_all_at
+8	hit_test	fn	impl SearchPanel	refresh_at
+8	hit_test	fn	impl SearchPanel	clear_at
+8	hit_test	fn	impl SearchPanel	tooltip_at
+8	hit_test	fn	impl SearchPanel	result_path_at
+9	results	fn	impl SearchPanel	clear_all
+8	hit_test	fn	impl SearchPanel	field_at
+8	hit_test	fn	impl SearchPanel	project_exclude_toggle_at
+6	replace	fn	impl SearchPanel	replace_all_on_disk
+6	replace	fn	impl SearchPanel	count_replacements
+6	replace	fn	impl SearchPanel	replace_all_skipping
+9	results	fn	impl SearchPanel	hit_order
+9	results	fn	impl SearchPanel	add_hits
+9	results	fn	impl SearchPanel	query_error
+9	results	fn	impl SearchPanel	run_query
+8	hit_test	fn	impl SearchPanel	toggle_at
+9	results	fn	impl SearchPanel	move_up
+9	results	fn	impl SearchPanel	move_down
+9	results	fn	impl SearchPanel	ensure_selected_visible
+9	results	fn	impl SearchPanel	scroll_up
+9	results	fn	impl SearchPanel	scroll_down
+9	results	fn	impl SearchPanel	scroll_to_bar_y
+9	results	fn	impl SearchPanel	results_viewport_height
+9	results	fn	impl SearchPanel	selected_hit
+9	results	fn	impl SearchPanel	toggle_opt
+9	results	fn	impl SearchPanel	result_counts
+8	hit_test	fn	impl SearchPanel	hit_at_y
+0		enum	-	SearchToggle
+10	render	struct	-	FieldArgs
+10	render	fn	-	draw_glob_caption
+10	render	fn	-	render_field
+10	render	fn	impl Widget for &mut SearchPanel	render

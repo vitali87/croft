@@ -114,13 +114,43 @@ src/
 ├── scrubber.rs           moving through a branch's history, the cursor behind "Source Control: Scrub History"; the working tree is a `Position::Working` in the cursor, so leaving restores the live buffer exactly
 ├── session.rs            the files behind local persistent sessions: per-workspace socket paths (mux, legacy dtach, collab relay, hook, pair records), the start-time sidecar, the liveness probe (a probe that fails because the machine is out of file descriptors or memory counts as alive, so nothing respawns over a live server) and the owner-only socket bind; shared by the session host, collab relay, web view and agent hooks, so it sits below all of them
 ├── session_cli.rs        local session persistence: `croft attach` / `croft ls` run croft under the session host so terminals/LSP/DAP survive closing the window; legacy dtach sessions keep reattaching, and `ls` lists only session sockets, never the relay, hook or pane-host sockets beside them
-├── session_host.rs       the multiplayer session mux: a hidden `croft session-host` subcommand owning the inner croft's PTY and broadcasting it verbatim to N unix-socket clients, with write control and a presence roster
+├── session_host.rs       the multiplayer session mux: a hidden `croft session-host` subcommand owning the inner croft's PTY and broadcasting it verbatim to N unix-socket clients, with write control and a presence roster: what every part shares (the `Host` and `Client` structs, the swap handoff's descriptors, a client's outbox, the inner channel); each feature lives in a file in `session_host/` below
+├── session_host/         the session host's feature files, beside session_host.rs; each file's `//!` doc says what it holds
+│   ├── attach.rs         the attaching client: the pump, the version banner, reconnects across a swap, the exit
+│   ├── connection.rs     one client's connection: its thread, typing attribution, write control, kicks
+│   ├── detach_chord.rs   spotting the detach chord in a client's own keystrokes
+│   ├── frame_write.rs    writing one frame to a socket within a deadline
+│   ├── identity.rs       a client's roster name and its stable identity across reconnects
+│   ├── inner_channel.rs  the inner croft's privileged channel: typing, write control, kicks
+│   ├── launch.rs         attach-or-create: spawning the detached server, ending a stale one
+│   ├── outbox.rs         each client's outbound queue, its delivery count, and the writer thread that drains it
+│   ├── protocol.rs       the wire format: frame tags, control messages, encoding and decoding frames
+│   ├── pty.rs            the PTY master and the inner command, held fresh or inherited: resize and wait
+│   ├── roster.rs         what the roster says: stale clients, the session's version, the detach target, the shared size
+│   ├── server.rs         the host proper: starting a session, broadcasting output, the shared PTY size, the roster
+│   ├── sidecars.rs       the files beside the socket: the presence roster, the stale-binary marker, the host's version
+│   ├── swap.rs           moving a live session onto an updated binary: the watch, the handoff, the adoption, the fence
+│   ├── tests.rs          the session host's own tests
 ├── session_record.rs     `croft record`: a 0x0 observer client writing a session to an asciicast; its pidfile names the recorder by pid and start time, so `--stop` never signals a recycled pid (see docs/MULTIPLAYER.md)
 ├── collab.rs             multiplayer Phase D, the collab layer below the app: `CollabDoc` over the `cola` text CRDT, `text_delta_ops` diffing, remote-op integration and `CollabMsg`
 ├── collab_agent.rs       a headless collab guest exposed as an MCP server on stdio (`croft collab-agent --workspace <path>`): joins the relay and serves five `collab_*` tools over JSON-RPC NDJSON so an external AI co-edits with a live named caret; croft itself contains no LLM code
-├── pair.rs               the AI pilot core ("croft pair" / resident navigator): spawns the `claude` CLI as a persistent stream-json conversation and parses its fenced `<<<EDIT>>>` / `<<<NOTE>>>` protocol
-├── pair/local.rs         the navigator's local-model transport: one Anthropic-compatible `/v1/messages` streaming call per turn (Ollama, LM Studio, llama.cpp, vLLM), deliberately not the claude CLI; selected by `croft pair --provider ollama [--base-url <url>] --model <m>`
-├── pair/proactive.rs     the proactive-look detector (pure text-in/row-out): tree-sitter judges that the driver completed a new construct since the navigator's last look; `App::tick_proactive_navigator` owns the gates and hands the seat a comment-only yield turn
+├── pair.rs               the AI pilot core ("croft pair" / resident navigator): spawns the `claude` CLI as a persistent stream-json conversation and parses its fenced `<<<EDIT>>>` / `<<<NOTE>>>` protocol: what every part shares (the pilot's state, `PairState`); each feature lives in a file in `pair/` below
+├── pair/                 the pilot's feature files, beside pair.rs; each file's `//!` doc says what it holds
+│   ├── apply.rs          applying fence events to the collab seat: the bootstrap wait, the streamed region and its revert, and the pump tick
+│   ├── caret.rs          the navigator's caret: parking it at a row until the file is live, and this seat's site ids
+│   ├── claude_cli.rs     the claude CLI: its sandbox, finding it on a GUI PATH, its launch command, its stream-json events, and the tests' fake claude
+│   ├── fence.rs          the fence machine: the `<<<EDIT>>>` / `<<<NOTE>>>` markers, the events it resolves from streamed text, and its header parsers
+│   ├── local.rs          the navigator's local-model transport: one Anthropic-compatible `/v1/messages` streaming call per turn (Ollama, LM Studio, llama.cpp, vLLM), deliberately not the claude CLI; selected by `croft pair --provider ollama [--base-url <url>] --model <m>`
+│   ├── notes.rs          the navigator's anchored notes: listing, dropping and replying to them, and landing one from the app side
+│   ├── offsets.rs        byte offsets into the replica text: a fence range or a note row as offsets, kept true through remote edits
+│   ├── proactive.rs      the proactive-look detector (pure text-in/row-out): tree-sitter judges that the driver completed a new construct since the navigator's last look; `App::tick_proactive_navigator` owns the gates and hands the seat a comment-only yield turn
+│   ├── provider.rs       the provider (the claude CLI or a local endpoint), `PairConfig`, and the system prompt each model is taught
+│   ├── repl.rs           `croft pair --repl`, the debug REPL driver
+│   ├── seat.rs           seating the pilot: the claude and local-endpoint seats, their threads, and teardown
+│   ├── state.rs          the turn books: arming a turn and undoing a staged one, what the navigator last saw, and the bounded lock the App's threads take
+│   ├── tests.rs          the pilot's own tests
+│   ├── turns.rs          user turns: the sink, composing task, ask, yield and reply turns, and sending one
+│   ├── voice.rs          the pilot's voice and diagnostics: to the in-process host inside croft, else stdout and stderr
 ├── pair_host.rs          the resident navigator's in-process host: the App spawns the pilot from the workspace's `<hash>.pair.json` record, drains `PairEvent`s per tick, and drives ask / yield turns
 ├── session_state.rs     captures open tabs / layout so a self-update re-exec can restore them, and is what a clean exit saves for the next launch: one file per workspace under `~/.local/state/croft/sessions/<workspace digest>.json` holding the open files, carets, layout and bookmarks but no unsaved text (hot exit keeps that), read after the first frame off the UI thread; its tabs come back only into a blank editor, its bookmarks always, each on the text its line read when saved if the file changed since
 ├── sheet.rs             CSV / TSV / XLSX / XLS / XLSB / ODS parsing via the csv and calamine crates
@@ -318,14 +348,37 @@ src/
     ├── run_debug.rs          Run and Debug sidebar widget: the Run button empty state, and when a session is live the call stack, expandable variables, WATCH, a debug console and a `❯` REPL prompt; the App builds the rows and maps clicks back to frames and variables
     ├── testing.rs            Testing sidebar widget: the test suite tree with pass/fail/skip glyphs, the Activity summary line, and the failing-test count feeding the beaker activity badge
     ├── scrollbar.rs     shared vertical- and horizontal-scrollbar geometry
-    ├── search.rs        sidebar search panel (query/replace/include/exclude inputs) + .gitignore-aware walker, glob filtering, and replace
+    ├── search.rs        sidebar search panel (query/replace/include/exclude inputs) + .gitignore-aware walker, glob filtering, and replace: the `SearchPanel` type, its constructor and the types its parts share (`SearchHit`, `SearchOpts`, `SearchField`, `SearchToggle`); each feature lives in a file in `search/` below
+    ├── search/          the search panel's feature files, beside search.rs; each file's `//!` doc says what it holds
+    │   ├── fields.rs        the input fields: caret, selection, typing, focus, the Replace and details rows
+    │   ├── highlight.rs     splitting a hit's line around its matches, for highlighting
+    │   ├── hit_test.rs      what a click or the pointer lands on: toggles, buttons, fields, result rows
+    │   ├── matcher.rs       the query's matcher and its toggles, the pattern the Find bar shares, an invalid query's error
+    │   ├── path_filter.rs   the files to include / exclude globs, and the test a path must pass
+    │   ├── render.rs        drawing the panel and each input field
+    │   ├── replace.rs       replacement text, replacing in a line, a text or a file, and Replace All
+    │   ├── results.rs       the results list: hits in order, counts, selection, scrolling, the mode toggles
+    │   ├── tests.rs         the search panel's own tests
+    │   ├── walk.rs          walking the workspace and streaming each file's hits; searching an unsaved buffer
+    │   ├── worker.rs        the background search worker, its requests and events, and the typing pause
     ├── shortcuts.rs     F1 shortcuts modal: every binding grouped by pane, scrollable
     ├── branch_picker.rs Checkout / Create Branch quick-pick overlay: type to filter the repo's branches, Enter to switch or create-and-switch (also drives the Branch submenu's merge / rebase / delete / create-from via `branch_purpose`); pure widget fed by `git::list_branches`
     ├── input_prompt.rs  single-line text modal for SCM ops that need a typed value (clone URL, branch rename, remote name/URL, tag name), tagged by `InputPurpose`; `InputPrompt::confirm` is the same box with no field, a Y/N question (trash, uninstall, remove, consent) that nothing typed can answer
     ├── list_picker.rs   generic single-choice picker for SCM ops that act on one of a git-owned list (apply/pop/drop a stash, delete a tag, remove/push-to a remote), tagged by `ListPurpose`
     ├── scm_menu.rs      the Source Control "⋯" title menu: a static tree of leaves + one-level fly-out submenus (Commit/Changes/Pull-Push/Branch/Remote/Stash/Tags); every leaf is an `ScmAction` dispatched in `App::dispatch_scm_action`
     ├── surface.rs            pane and overlay chrome for a `surfaces` theme (Croft Loch): padding frames on the bordered inset, hairline seams, section hairlines, the focused pane's rule and the overlay card with its shadow
-    ├── source_control.rs     Source Control sidebar widget: multi-root REPOSITORIES overview, branch summary, commit input, change list, inline stage/unstage/discard actions, commit split-button and menu
+    ├── source_control.rs     Source Control sidebar widget: multi-root REPOSITORIES overview, branch summary, commit input, change list, inline stage/unstage/discard actions, commit split-button and menu: what every part shares (the `SourceControlPanel` type, its constructor and the row action areas); each feature lives in a file in `source_control/` below
+    ├── source_control/       the Source Control panel's feature files, beside source_control.rs; each file's `//!` doc says what it holds
+    │   ├── buttons.rs        the primary button every view draws, the Commit split button, their colours and hover
+    │   ├── change_list.rs    the change list: git's status, selecting and moving through rows, scrolling, and its layout
+    │   ├── clicks.rs         what a click lands on: the header pills, the branch, a row's action icons and the buttons
+    │   ├── commit_menu.rs    the Commit button's dropdown: its items, labels and icons, and the clicks that open and pick from it
+    │   ├── empty_state.rs    the "No repository detected" card and its Git fork drawing
+    │   ├── message.rs        the commit message box: typing, the caret across subject and body, git's prepared message, and clearing it
+    │   ├── palette.rs        the panel's colours and glyphs, and the width of a row's action icons
+    │   ├── render.rs         drawing the panel: header, branch, message box, Commit button, change list and feedback
+    │   ├── repositories.rs   the multi-root REPOSITORIES overview: its rows, drawing them, and the click that picks one
+    │   ├── tests.rs          the Source Control panel's own tests
     ├── symbol_picker.rs VS Code "Go to Symbol in Editor" (Cmd/Ctrl+Shift+O): a fuzzy picker over the active file's outline symbols (kind-iconed, depth-indented); a `:` prefix switches to Go to Line; the App jumps via go_to_definition
     ├── workspace_symbols.rs  Go to Symbol in Workspace picker: query fans out to every running server as `workspace/symbol`, rows show kind icon, name and workspace-relative path; Enter opens the definition
     ├── terminal.rs           the embedded terminal pane (`portable-pty` + `alacritty_terminal` drawn through ratatui): the `PtyTerminal` type, the scrollback size, and the structs its parts share (selection anchors, marks, images, notes, captured rows, the scroll clock); each feature lives in a file in `terminal/` below
@@ -566,19 +619,19 @@ The inline-image baking pipeline and protocol dispatch: iTerm2 OSC 1337, Kitty g
 
 ### session_host.rs
 
-The multiplayer session mux (docs/MULTIPLAYER.md): a hidden `croft session-host` subcommand whose server owns the inner croft's PTY and broadcasts output verbatim to N unix-socket clients. It is byte-transparent, so Kitty graphics survive.
+The multiplayer session mux (docs/MULTIPLAYER.md): a hidden `croft session-host` subcommand whose server owns the inner croft's PTY and broadcasts output verbatim to N unix-socket clients. It is byte-transparent, so Kitty graphics survive. `session_host.rs` keeps the structs whose private fields more than one of its parts reads: `Host` and `Client`, `HandoffFds` (built by the server and read by the swap), `Outbox` and its state (read by the tests), and `InnerChannel` (read by the tests); every feature, and those structs' methods, lives in a file in `session_host/`.
 
-**What the mux adds over dtach.** Per-connection input attribution with server-enforced write control: the first attacher holds it, Grant/Revoke frames move it, and read-only input is dropped at the host. Winsize is the min of clients, with a same-size repaint jiggle on attach — the role dtach's `-r winch` played. There is a presence roster (an atomic sidecar JSON next to the socket plus Presence frames), and inner exit-code propagation, so drop-to-local's 88 survives the mux where dtach swallowed it.
+**What the mux adds over dtach.** Per-connection input attribution with server-enforced write control: the first attacher holds it, Grant/Revoke frames move it, and read-only input is dropped at the host. Winsize is the min of clients, with a same-size repaint jiggle on attach — the role dtach's `-r winch` played. There is a presence roster (an atomic sidecar JSON next to the socket plus Presence frames), and inner exit-code propagation, so drop-to-local's 88 survives the mux where dtach swallowed it. Code: write control in `session_host/connection.rs`; the shared size in `session_host/roster.rs` (`min_winsize`) and `session_host/server.rs` (`apply_winsize`); the roster's sidecar in `session_host/sidecars.rs` and its Presence frames in `session_host/server.rs` (`update_presence`); the inner exit code in `session_host/pty.rs` (`ChildHandle::wait_code`).
 
-**Framing.** Both ways: `[type u8][len u32 be][payload]`. Type 0 is raw PTY bytes; type 1 is one compact-JSON Control message.
+**Framing.** Both ways: `[type u8][len u32 be][payload]`. Type 0 is raw PTY bytes; type 1 is one compact-JSON Control message. Code: `session_host/protocol.rs`.
 
-**The privileged channel.** A token-authenticated channel (CROFT_SESSION_TOKEN, `InnerChannel`) lets the inner croft grant, revoke and kick, and receive Typing attribution frames, sent on writer change and ordered before that client's bytes reach the PTY. Those drive per-participant parked carets and the editor's colored ghost carets. The env read is inert under `cfg(test)` so test-built Apps never authenticate to a live host. The remote launcher prefers the mux behind a `--probe` guard and falls back to dtach.
+**The privileged channel.** A token-authenticated channel (CROFT_SESSION_TOKEN, `InnerChannel`) lets the inner croft grant, revoke and kick, and receive Typing attribution frames, sent on writer change and ordered before that client's bytes reach the PTY. Those drive per-participant parked carets and the editor's colored ghost carets. The env read is inert under `cfg(test)` so test-built Apps never authenticate to a live host. The remote launcher prefers the mux behind a `--probe` guard and falls back to dtach. Code: the inner croft's side in `session_host/inner_channel.rs` (the `InnerChannel` struct itself stays in `session_host.rs`); the host's side, the token check and the Typing frames, in `session_host/connection.rs`.
 
-**Version mismatch no longer strands an attach.** A stale server that survived binary upgrades used to. Now Hello carries the client version, the server answers with ServerHello before any PTY bytes, and a mismatch — or a pre-0.1.698 server, detected by a 2s reply timeout — shows a plain-text banner offering continue, restart (SIGTERM via the socket-unique argv, then respawn), or detach, never a silent blank screen.
+**Version mismatch no longer strands an attach.** A stale server that survived binary upgrades used to. Now Hello carries the client version, the server answers with ServerHello before any PTY bytes, and a mismatch — or a pre-0.1.698 server, detected by a 2s reply timeout — shows a plain-text banner offering continue, restart (SIGTERM via the socket-unique argv, then respawn), or detach, never a silent blank screen. Code: the client's side, the 2s wait and the banner, in `session_host/attach.rs`; the ServerHello in `session_host/connection.rs`; the restart's kill in `session_host/launch.rs` (`kill_stale_server`).
 
-**Host self-replacement.** A host replacing its own image latches `swapping` under the clients lock BEFORE it broadcasts HostSwap, and from then on answers a newly accepted connection with HostSwap plus close instead of seating it. The reconnect its own invitation triggers arrives ~200ms later, inside the flush pause, and a client seated by a process about to `exec` reads the resulting EOF as "session over" and exits — which is how a background update kicked every attached client off a live remote session. The latch is released if the exec fails, so a stale host still serves.
+**Host self-replacement.** A host replacing its own image latches `swapping` under the clients lock BEFORE it broadcasts HostSwap, and from then on answers a newly accepted connection with HostSwap plus close instead of seating it. The reconnect its own invitation triggers arrives ~200ms later, inside the flush pause, and a client seated by a process about to `exec` reads the resulting EOF as "session over" and exits — which is how a background update kicked every attached client off a live remote session. The latch is released if the exec fails, so a stale host still serves. Code: the swap and its latch in `session_host/swap.rs`; the answer to a connection arriving mid-swap in `session_host/connection.rs`; a client's reconnect across the swap in `session_host/attach.rs`.
 
-**Two smaller fixes.** The attach repaint jiggle runs even when every client is a size-less observer; `min_winsize` returning None used to skip it. And `broadcast` bounds each client write with `poll(2)` at `WRITE_FRAME_DEADLINE`, evicting a non-draining peer and recomputing the shared size so a dead ghost releases the min winsize it pinned — a plain `write_all` used to wedge the PTY pump forever while holding the clients lock.
+**Two smaller fixes.** The attach repaint jiggle runs even when every client is a size-less observer; `min_winsize` returning None used to skip it. And `broadcast` bounds each client write with `poll(2)` at `WRITE_FRAME_DEADLINE`, evicting a non-draining peer and recomputing the shared size so a dead ghost releases the min winsize it pinned — a plain `write_all` used to wedge the PTY pump forever while holding the clients lock. Code: `min_winsize` in `session_host/roster.rs`; `broadcast` and the jiggle (`apply_winsize`) in `session_host/server.rs`; `WRITE_FRAME_DEADLINE` in `session_host/frame_write.rs`; each client's bounded queue in `session_host/outbox.rs`.
 
 ### fleet.rs
 
@@ -694,19 +747,19 @@ Writing a session as an asciicast v2 recording, behind "Session: Record Terminal
 
 ### pair.rs
 
-The AI pilot core (docs/MULTIPLAYER.md, "croft pair" / "resident navigator"). It spawns the `claude` CLI as a persistent stream-json conversation on stdio and teaches it a fenced protocol via `--append-system-prompt`.
+The AI pilot core (docs/MULTIPLAYER.md, "croft pair" / "resident navigator"). It spawns the `claude` CLI as a persistent stream-json conversation on stdio and teaches it a fenced protocol via `--append-system-prompt`. `pair.rs` keeps the one struct whose private fields nearly every part reads: `PairState`, the pilot's shared state, which the reader, pump and driver threads each lock briefly. A file in `pair/` is a child of `pair.rs` and can reach those fields, where a sibling could not. Each feature lives in a file of its own in `pair/`, beside `local.rs` and `proactive.rs`.
 
-**The protocol.** `<<<EDIT file:R:C-R:C>>>` bodies stream into buffers token by token; `<<<NOTE file:R>>>` bodies anchor commentary to a line. Coordinates are 0-based char coordinates throughout. `FenceMachine` parses the token deltas incrementally, correctly across arbitrary splits, even mid-marker. EDIT headers also take a two-integer whole-line form `<file>:SR-ER` (rows inclusive, no column counting), which is what local models are steered to.
+**The protocol.** `<<<EDIT file:R:C-R:C>>>` bodies stream into buffers token by token; `<<<NOTE file:R>>>` bodies anchor commentary to a line. Coordinates are 0-based char coordinates throughout. `FenceMachine` parses the token deltas incrementally, correctly across arbitrary splits, even mid-marker. EDIT headers also take a two-integer whole-line form `<file>:SR-ER` (rows inclusive, no column counting), which is what local models are steered to. Code: `pair/fence.rs`.
 
-**Applying edits.** Edits apply through a regular collab guest seat at a tracked byte anchor. Both the anchor and every note offset shift via `shift_offset` over incoming RemoteEdit spans.
+**Applying edits.** Edits apply through a regular collab guest seat at a tracked byte anchor. Both the anchor and every note offset shift via `shift_offset` over incoming RemoteEdit spans. Code: `pair/apply.rs`, with `shift_offset` in `pair/offsets.rs` and the notes in `pair/notes.rs`.
 
-**Cancellation.** Any participant cancels mid-run via the gutter `■`, Cmd+K X, or the palette, which sends `CollabMsg::StreamCancel`. The pilot interrupts claude (`control_request`, feature-detected), reverts the streamed region, and broadcasts `CollabMsg::StreamState` inactive.
+**Cancellation.** Any participant cancels mid-run via the gutter `■`, Cmd+K X, or the palette, which sends `CollabMsg::StreamCancel`. The pilot interrupts claude (`control_request`, feature-detected), reverts the streamed region, and broadcasts `CollabMsg::StreamState` inactive. Code: `pump_session` and `revert_region` in `pair/apply.rs`.
 
-**Comment-only turns.** Yielded turns are comment-only at the host: `PairState::comment_only` discards EDIT fences whatever the model says.
+**Comment-only turns.** Yielded turns are comment-only at the host: `PairState::comment_only` discards EDIT fences whatever the model says. Code: the discard in `apply_fence_event` (`pair/apply.rs`); `PairState::begin_turn` (`pair/state.rs`) sets the flag.
 
-**Sandboxing.** The claude child is sandboxed read-only — Read/Grep/Glob plus a read-only collab-agent MCP seat, `--strict-mcp-config`. The fence is the only write path. `--tools Read,Grep,Glob` makes those three its only built-in tools, and they carry no allow rule, so `dontAsk` runs them inside the workspace and denies them outside it. `--setting-sources user` loads only the user's own Claude Code settings: the workspace's `.claude/settings.json`, and the hooks in it, would otherwise run as soon as the navigator starts (#1926).
+**Sandboxing.** The claude child is sandboxed read-only — Read/Grep/Glob plus a read-only collab-agent MCP seat, `--strict-mcp-config`. The fence is the only write path. `--tools Read,Grep,Glob` makes those three its only built-in tools, and they carry no allow rule, so `dontAsk` runs them inside the workspace and denies them outside it. `--setting-sources user` loads only the user's own Claude Code settings: the workspace's `.claude/settings.json`, and the hooks in it, would otherwise run as soon as the navigator starts (#1926). Code: `claude_command` and the tool and settings lists in `pair/claude_cli.rs`.
 
-**Seats and drivers.** `seat_pilot` builds the claude seat (child plus reader, stderr and pump threads); `seat_local` builds the childless local-endpoint seat (pair/local.rs). Both return the transport-polymorphic `Pilot`: a shared `TurnSink` for turn injection plus a `Transport` enum for teardown. That serves both drivers, the hidden `croft pair --repl` terminal REPL and the in-process PairHost. `Provider` (claude or local `base_url`) rides `PairConfig` and dispatches the seat. It is e2e-tested against a scripted python3 fake claude.
+**Seats and drivers.** `seat_pilot` builds the claude seat (child plus reader, stderr and pump threads); `seat_local` builds the childless local-endpoint seat (pair/local.rs). Both return the transport-polymorphic `Pilot`: a shared `TurnSink` for turn injection plus a `Transport` enum for teardown. That serves both drivers, the hidden `croft pair --repl` terminal REPL and the in-process PairHost. `Provider` (claude or local `base_url`) rides `PairConfig` and dispatches the seat. It is e2e-tested against a scripted python3 fake claude. Code: the seats, `Pilot` and `Transport` in `pair/seat.rs`, `TurnSink` in `pair/turns.rs`, `Provider` and `PairConfig` in `pair/provider.rs`, the REPL in `pair/repl.rs`, and the fake claude in `pair/claude_cli.rs`.
 
 ### hex.rs
 
@@ -1026,9 +1079,9 @@ An `ignore::WalkBuilder`-backed tree with lazy children, fs-watcher refresh, mul
 
 ### source_control.rs
 
-The Source Control sidebar widget, including the multi-root REPOSITORIES overview.
+The Source Control sidebar widget, including the multi-root REPOSITORIES overview. `source_control.rs` keeps the panel itself: `SourceControlPanel`, whose private fields every part reads, its constructor, and `RowActionAreas`, which the drawing fills in and the clicks read. Each feature lives in a file of its own in `source_control/`.
 
-**The repositories overview.** One row per workspace folder that is a repo, each with a disambiguated label, its branch, and a porcelain change count from `GitStatus.changed_count`. The active row is highlighted, and the overview paints in the no-repo state too so other folders' repos stay reachable. Clicking a row PINS the panel via `App::scm_pin`, released when the focus-derived folder changes. The activity badge sums `changed_count` across all workers.
+**The repositories overview.** One row per workspace folder that is a repo, each with a disambiguated label, its branch, and a porcelain change count from `GitStatus.changed_count`. The active row is highlighted, and the overview paints in the no-repo state too so other folders' repos stay reachable. Clicking a row PINS the panel via `App::scm_pin`, released when the focus-derived folder changes. The activity badge sums `changed_count` across all workers. Code: `source_control/repositories.rs`.
 ### agents.rs
 
 Tracks agent lanes: which panes are running a coding agent, and whether that agent is working, waiting for the user, or idle. `claude`, `codex`, `aider`, `gemini` and `crush` are built in, and `~/.config/croft/agents.json` extends or replaces those rows and is reloaded on save. A row's `launch` is the command a worktree lane starts the agent with.
@@ -1279,7 +1332,7 @@ Parses the last `grep`, `rg` or `git grep` command line (the last search of a pi
 
 **Flag handling.** `-g`/`--glob`s accumulate comma-separated. rg's `!`-negated globs and grep's `--exclude`/`--exclude-dir` land in files-to-exclude. rg and ag treat `-s` as forcing case sensitivity, while grep's `-s` stays the no-messages flag. Match Case starts from the tool's own default (case-sensitive, except ag's smart case) and `-i`/`-s`/`-S` overwrite it in order, as in rg. Smart case is resolved the way each tool reads the pattern: rg's on the literals of its regex-syntax AST (so `\W` isn't uppercase), ag's on every byte, and case-sensitive where unsure, since a narrower seed can't make Replace All touch a line the terminal never listed (#922).
 
-**The seed replaces wholesale.** `SearchPanel::seed` swaps the panel's query and both filter lists outright, and also resets field selections, because a stale byte range into shorter seeded text panicked. It then refocuses the query.
+**The seed replaces wholesale.** `SearchPanel::seed` swaps the panel's query and both filter lists outright, and also resets field selections, because a stale byte range into shorter seeded text panicked. It then refocuses the query. Code: `seed` in `widgets/search/fields.rs`.
 
 ### registry_index.rs
 
@@ -1594,7 +1647,7 @@ A collapsible, language-aware DEPENDENCIES section, offered as a ⋯-menu Explor
 
 A VS Code-style inline Find bar (Cmd+F) with an active-match orange highlight, Enter / Shift+Enter to walk matches, and case-sensitive / whole-word / regex toggles. The Replace row (Cmd+Opt+F) adds Tab to switch field, Enter to replace-and-advance, and Cmd+Opt+Enter to replace all in one undo step.
 
-**Replace All uses the same enumeration as the display.** It walks matches via the same `split_for_highlight` that the count, paint and navigation use, so it never touches what the bar cannot show, and it recounts afterwards.
+**Replace All uses the same enumeration as the display.** It walks matches via the same `split_for_highlight` that the count, paint and navigation use, so it never touches what the bar cannot show, and it recounts afterwards. Code: `split_for_highlight` in `widgets/search/highlight.rs`.
 
 **Regex replacements expand `$n` captures** plus VS Code's `\n`/`\t` escapes, where a replacement newline splits the line.
 
