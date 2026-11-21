@@ -230,6 +230,7 @@ src/
 │   ├── cursor_blink.rs  caret blink timing
 │   ├── debugger.rs      Run and Debug: launch configs and Add Configuration, compounds and preLaunchTask waits, adapters, debug builds, attach pickers, the paused view, watches, the console, stepping, every kind of breakpoint, Debug Test and inline values
 │   ├── debugger/        the Run and Debug feature files, beside debugger.rs; each file's `//!` doc says what it holds
+│   │   ├── active_file.rs      running and debugging the active file, the adapter picked by its kind
 │   │   ├── adapters.rs         finding lldb-dap, telling a runnable binary, and installing delve
 │   │   ├── builds.rs           debug builds: `cargo`, C/C++ and single Rust files, then lldb-dap on the binary
 │   │   ├── debug_test.rs       Debug Test: the test at the caret or by name, its build, launch and failure breakpoint
