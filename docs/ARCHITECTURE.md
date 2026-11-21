@@ -19,6 +19,7 @@ src/
 ├── main.rs              entry point + module declarations
 ├── cli.rs               clap CLI: open path, setup-terminal / setup-iterm2 / setup-cross / remote / view / keys subcommands
 ├── cli/                 the command line's feature files, beside cli.rs; each file's `//!` doc says what it holds
+│   ├── git_editor.rs     `croft edit` as git's editor: the user's own sequence editor, and git's own editor when no croft is there
 │   ├── tests.rs          the command line's own tests
 │   ├── typos.rs          a misspelled subcommand clap took as a folder, turned into an error that names the one meant
 │   ├── version.rs        the plain version `--version` prints, and the provenance line `--build-info` prints
