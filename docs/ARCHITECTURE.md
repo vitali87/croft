@@ -236,6 +236,7 @@ src/
 │   │   ├── console.rs          the debug console, its REPL and OUTPUT mirror, and hover-to-evaluate
 │   │   ├── debug_test.rs       Debug Test: the test at the caret or by name, its build, launch and failure breakpoint
 │   │   ├── events.rs           the sessions' events, drained each frame: stops, output and endings
+│   │   ├── launch.rs           F5 and launching a configuration: saving first, resolving, spawning, installing
 │   │   ├── python.rs           which Python a debugged program runs under, and the note on an old one
 │   │   ├── view.rs             the view: its keys, button, paused-state tree, clicks, row menu and errors
 │   │   ├── watches.rs          watch expressions: adding, removing and evaluating them
