@@ -269,6 +269,7 @@ src/
 │   │   ├── format.rs            Format Document and Selection, Prettier, and format-on-save
 │   │   ├── go_to_symbol.rs      Go to Symbol in Editor: the picker, its keys, mouse and drawing
 │   │   ├── hierarchy.rs         call and type hierarchies: the requests and the picker of answers
+│   │   ├── hover_text.rs        the hover's text: diagnostics first, then the server's answer
 │   │   ├── inlay_hints.rs       inlay hints: their replies, refresh, requests and the toggle
 │   │   ├── messages.rs          server progress, messages, questions and show-document requests
 │   │   ├── navigation.rs        Go to Definition and its kin: requests, jumps and the multi-location picker
