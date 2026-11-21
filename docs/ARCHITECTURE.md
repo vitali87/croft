@@ -275,6 +275,7 @@ src/
 │   │   ├── semantic.rs          semantic tokens, their refresh, and the background syntax pass landing
 │   │   ├── sync.rs              keeping servers in step with the open files, their diagnostics, and restarts
 │   │   ├── typing.rs            on-type formatting, linked editing, parameter-hint triggers and snippet items
+│   │   ├── workspace_edits.rs   applying workspace edits to buffers and files, and refusing stale ones
 │   ├── memory_report.rs Developer: Show Memory Usage: the per-subsystem figures laid out as Markdown, opened as a rendered preview so typing can't edit it
 │   ├── menus.rs         right-click and dropdown menus: shortcut hints, ContextMenu methods, geometry, keys, drawing, `dispatch_menu_action`, and the status-bar click menus
 │   ├── mouse_input.rs   all mouse handling (`handle_mouse_inner`), hover popups and tooltips, and closing stale popups on a click
