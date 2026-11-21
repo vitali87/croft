@@ -28,6 +28,7 @@ src/
 │   ├── links.rs          `croft open-link` and `croft install-link-handler`: following a link into a session, and handling the links
 │   ├── pair_provider.rs  `croft pair`'s provider flags: `--base-url` alone means ollama, which defaults to its local port
 │   ├── plot.rs           `croft plot`: a chart of stdin, as an inline image or as text, in the theme's colours
+│   ├── run.rs            running what was parsed: each subcommand handed to its code, or the workspace opened
 │   ├── terminal_setup.rs `croft setup-terminal`, `setup-iterm2` and `setup-ghostty`: setting up macOS terminals for croft
 │   ├── tests.rs          the command line's own tests
 │   ├── theme_import.rs   `croft theme-import`: converting a VS Code theme from a file or the marketplace, and installing it
