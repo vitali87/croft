@@ -928,10 +928,6 @@ impl App {
         true
     }
 
-    /// Execute a Command Palette entry. Editor text commands act on the active
-    /// editor buffer; view / navigation commands defer to the same methods
-    /// their dedicated chords use, so the palette can never drift from the
-    /// keyboard surface.
     /// Run one Cursor Align command and say in the status bar what it did. A
     /// command that quietly does nothing reads as a broken shortcut, and the
     /// two commonest answers are worth naming: it needs more than one caret,
@@ -952,6 +948,10 @@ impl App {
         }
     }
 
+    /// Execute a Command Palette entry. Editor text commands act on the active
+    /// editor buffer; view / navigation commands defer to the same methods
+    /// their dedicated chords use, so the palette can never drift from the
+    /// keyboard surface.
     pub(crate) fn run_command(&mut self, cmd: crate::widgets::command_palette::Command) {
         use crate::widgets::command_palette::Command as Cmd;
         use crate::widgets::editor::CaseTransform;
