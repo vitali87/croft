@@ -228,7 +228,7 @@ src/
 │   ├── commands.rs      `run_command`, the Command Palette, the Extensions view, extension commands (MCP tools, viewers) and Show Memory Usage
 │   ├── completion.rs    the completion popup, auto-imports, snippets, signature help, ghost-text suggestions and Emmet
 │   ├── cursor_blink.rs  caret blink timing
-│   ├── debugger.rs      Run and Debug: launch configs and Add Configuration, compounds and preLaunchTask waits, adapters, debug builds, attach pickers, the paused view, watches, the console, stepping, every kind of breakpoint, Debug Test and inline values
+│   ├── debugger.rs      Run and Debug: launch configs and Add Configuration, compounds and preLaunchTask waits, adapters, debug builds, attach pickers, the paused view, watches, the console, stepping, every kind of breakpoint, Debug Test and inline values: what every part shares (a launch parked behind its `preLaunchTask` and how it waits, what became of a compound member, whether a launch replaces the running set or joins it, what runs once a launch's `${input:...}` questions are answered, and the js-debug teardown grace); each feature is in a file in `debugger/` below
 │   ├── debugger/        the Run and Debug feature files, beside debugger.rs; each file's `//!` doc says what it holds
 │   │   ├── active_file.rs      running and debugging the active file, the adapter picked by its kind
 │   │   ├── adapters.rs         finding lldb-dap, telling a runnable binary, and installing delve
