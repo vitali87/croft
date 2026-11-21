@@ -38,6 +38,7 @@
 # not pressed | editor selection explorer terminal search scm | ctrl+k shift+g | asks a model when ANTHROPIC_API_KEY is set
 # not pressed | editor selection explorer terminal search scm | ctrl+shift+f9 | reads CROFT_NO_UPDATE_CHECK and CROFT_REMOTE_AUTOUPDATE
 # not pressed | explorer | ctrl+z | jumps with zoxide, installed or not
+editor | alt+a | status="Align Cursors needs more than one caret"
 editor | alt+backspace | tabs=*● main.rs text=15L#ac09b3f1 caret=4:4
 editor | alt+c | -
 editor | alt+cmd+\ | caret=8:1 sel=3:10-8:1
@@ -47,6 +48,7 @@ editor | alt+cmd+right | -
 editor | alt+d | -
 editor | alt+delete | tabs=*● main.rs text=15L#bb0bf786
 editor | alt+down | tabs=*● main.rs text=15L#1cf61342 caret=5:8
+editor | alt+f | status="Align Cursors (Pad Front) needs more than one caret"
 editor | alt+f12 | status="No language server for this file"
 editor | alt+f9 | status="Start debugging first to set exception breakpoints"
 editor | alt+l | -
@@ -95,6 +97,7 @@ editor | ctrl+alt+, | status="No bookmarks in this file (Cmd+Opt+Shift+K sets on
 editor | ctrl+alt+- | tabs=*● main.rs text=15L#247221d3 caret=4:20
 editor | ctrl+alt+. | status="No bookmarks in this file (Cmd+Opt+Shift+K sets one)"
 editor | ctrl+alt+= | tabs=*● main.rs text=15L#91ea7155 caret=4:20
+editor | ctrl+alt+a | status="Align Cursors Using Tabs needs more than one caret"
 editor | ctrl+alt+b | status="Secondary side bar shown" +aux
 editor | ctrl+alt+c | status="Copied path: <root>/main.rs" clip="<root>/main.rs"
 editor | ctrl+alt+down | carets=5:8
@@ -102,7 +105,7 @@ editor | ctrl+alt+f | status="Replace: Tab switches field, Enter replaces, Cmd+O
 editor | ctrl+alt+m | status="Minimap off" -minimap
 editor | ctrl+alt+r | -
 editor | ctrl+alt+s | status="Save All: nothing to save"
-editor | ctrl+alt+shift+a | tabs=*● main.rs text=15L#4c3e40da
+editor | ctrl+alt+shift+a | status="Align Line Last Cursors needs more than one caret"
 editor | ctrl+alt+shift+b | status="No bookmarks in this file"
 editor | ctrl+alt+shift+c | status="Copied relative path: main.rs" clip="main.rs"
 editor | ctrl+alt+shift+d | tabs=*● main.rs text=14L#80f7c600
@@ -237,7 +240,7 @@ editor | ctrl+shift+l | caret=4:13 sel=4:8-4:13 carets=1:35-1:40,5:7-5:12,6:19-6
 editor | ctrl+shift+m | focus=panel panel=Problems
 editor | ctrl+shift+n | -
 editor | ctrl+shift+o | status="Go to Symbol: 0 symbols — Esc to close" +go_to_symbol("" @0 > "")
-editor | ctrl+shift+p | status="Command Palette: 387 commands — Esc to close" +palette("" @0 > "Move Line Up")
+editor | ctrl+shift+p | status="Command Palette: 393 commands — Esc to close" +palette("" @0 > "Move Line Up")
 editor | ctrl+shift+pagedown | status="Move: the editor is already the last tab"
 editor | ctrl+shift+pageup | status="Move: the editor is already the first tab"
 editor | ctrl+shift+r | focus=side side=Remote
@@ -306,6 +309,7 @@ editor | space | tabs=*● main.rs text=15L#867a5b88 caret=4:9
 editor | tab | tabs=*● main.rs text=15L#5cff89ae caret=4:12
 editor | u | tabs=*● main.rs text=15L#f0fe86db caret=4:9
 editor | up | caret=3:8
+selection | alt+a | status="Align Cursors needs more than one caret"
 selection | alt+backspace | tabs=*● main.rs text=15L#bb0bf786 caret=4:8 sel=-
 selection | alt+c | -
 selection | alt+cmd+\ | caret=8:1 sel=3:10-8:1
@@ -315,6 +319,7 @@ selection | alt+cmd+right | -
 selection | alt+d | -
 selection | alt+delete | tabs=*● main.rs text=15L#bb0bf786 caret=4:8 sel=-
 selection | alt+down | tabs=*● main.rs text=15L#1cf61342 caret=5:13 sel=5:8-5:13
+selection | alt+f | status="Align Cursors (Pad Front) needs more than one caret"
 selection | alt+f12 | status="No language server for this file"
 selection | alt+f9 | status="Start debugging first to set exception breakpoints"
 selection | alt+l | -
@@ -363,6 +368,7 @@ selection | ctrl+alt+, | status="No bookmarks in this file (Cmd+Opt+Shift+K sets
 selection | ctrl+alt+- | tabs=*● main.rs text=15L#247221d3 caret=4:20 sel=-
 selection | ctrl+alt+. | status="No bookmarks in this file (Cmd+Opt+Shift+K sets one)"
 selection | ctrl+alt+= | tabs=*● main.rs text=15L#91ea7155 caret=4:20 sel=-
+selection | ctrl+alt+a | status="Align Cursors Using Tabs needs more than one caret"
 selection | ctrl+alt+b | status="Secondary side bar shown" +aux
 selection | ctrl+alt+c | status="Copied path: <root>/main.rs" clip="<root>/main.rs"
 selection | ctrl+alt+down | carets=5:13
@@ -370,7 +376,7 @@ selection | ctrl+alt+f | status="Replace: Tab switches field, Enter replaces, Cm
 selection | ctrl+alt+m | status="Minimap off" -minimap
 selection | ctrl+alt+r | -
 selection | ctrl+alt+s | status="Save All: nothing to save"
-selection | ctrl+alt+shift+a | -
+selection | ctrl+alt+shift+a | status="Align Line Last Cursors needs more than one caret"
 selection | ctrl+alt+shift+b | status="No bookmarks in this file"
 selection | ctrl+alt+shift+c | status="Copied relative path: main.rs" clip="main.rs"
 selection | ctrl+alt+shift+d | -
@@ -505,7 +511,7 @@ selection | ctrl+shift+l | carets=1:35-1:40,5:7-5:12,6:19-6:24 status="Selected 
 selection | ctrl+shift+m | focus=panel panel=Problems
 selection | ctrl+shift+n | -
 selection | ctrl+shift+o | status="Go to Symbol: 0 symbols — Esc to close" +go_to_symbol("" @0 > "")
-selection | ctrl+shift+p | status="Command Palette: 387 commands — Esc to close" +palette("" @0 > "Move Line Up")
+selection | ctrl+shift+p | status="Command Palette: 393 commands — Esc to close" +palette("" @0 > "Move Line Up")
 selection | ctrl+shift+pagedown | status="Move: the editor is already the last tab"
 selection | ctrl+shift+pageup | status="Move: the editor is already the first tab"
 selection | ctrl+shift+r | focus=side side=Remote
@@ -574,6 +580,7 @@ selection | space | tabs=*● main.rs text=15L#cdca88e0 caret=4:9 sel=-
 selection | tab | tabs=*● main.rs text=15L#5f6f8816 caret=4:12 sel=-
 selection | u | tabs=*● main.rs text=15L#f9473661 caret=4:9 sel=-
 selection | up | caret=3:11 sel=-
+explorer | alt+a | -
 explorer | alt+backspace | +input("Move 'main.rs' to Trash?" "" @0)
 explorer | alt+c | -
 explorer | alt+cmd+\ | -
@@ -583,6 +590,7 @@ explorer | alt+cmd+right | -
 explorer | alt+d | -
 explorer | alt+delete | +input("Move 'main.rs' to Trash?" "" @0)
 explorer | alt+down | -
+explorer | alt+f | -
 explorer | alt+f12 | -
 explorer | alt+f9 | status="Start debugging first to set exception breakpoints"
 explorer | alt+l | -
@@ -631,6 +639,7 @@ explorer | ctrl+alt+, | -
 explorer | ctrl+alt+- | -
 explorer | ctrl+alt+. | -
 explorer | ctrl+alt+= | -
+explorer | ctrl+alt+a | tree=./+,.vscode/,docs/,main.rs > main.rs marked=.,.vscode,docs,main.rs
 explorer | ctrl+alt+b | status="Secondary side bar shown" +aux
 explorer | ctrl+alt+c | status="Copied 1 item"
 explorer | ctrl+alt+down | -
@@ -773,7 +782,7 @@ explorer | ctrl+shift+l | -
 explorer | ctrl+shift+m | focus=panel panel=Problems
 explorer | ctrl+shift+n | +prompt("New Folder in ." "")
 explorer | ctrl+shift+o | status="Go to Symbol: 0 symbols — Esc to close" +go_to_symbol("" @0 > "")
-explorer | ctrl+shift+p | status="Command Palette: 387 commands — Esc to close" +palette("" @0 > "Move Line Up")
+explorer | ctrl+shift+p | status="Command Palette: 393 commands — Esc to close" +palette("" @0 > "Move Line Up")
 explorer | ctrl+shift+pagedown | tree=./+,.vscode/,docs/,main.rs > main.rs marked=.,.vscode,docs,main.rs
 explorer | ctrl+shift+pageup | tree=./+,.vscode/,docs/,main.rs > . marked=.
 explorer | ctrl+shift+r | side=Remote
@@ -841,6 +850,7 @@ explorer | space | -
 explorer | tab | -
 explorer | u | -
 explorer | up | tree=./+,.vscode/,docs/,main.rs > docs
+terminal | alt+a | typed=0:"\u{1b}a"
 terminal | alt+backspace | typed=0:"\u{1b}\u{7f}"
 terminal | alt+c | typed=0:"\u{1b}c"
 terminal | alt+cmd+\ | typed=0:"\u{1b}\\"
@@ -850,6 +860,7 @@ terminal | alt+cmd+right | -
 terminal | alt+d | typed=0:"\u{1b}d"
 terminal | alt+delete | typed=0:"\u{1b}[3;3~"
 terminal | alt+down | typed=0:"\u{1b}[1;3B"
+terminal | alt+f | typed=0:"\u{1b}f"
 terminal | alt+f12 | typed=0:"\u{1b}[24;3~"
 terminal | alt+f9 | status="Start debugging first to set exception breakpoints"
 terminal | alt+l | typed=0:"\u{1b}l"
@@ -898,6 +909,7 @@ terminal | ctrl+alt+, | -
 terminal | ctrl+alt+- | -
 terminal | ctrl+alt+. | -
 terminal | ctrl+alt+= | -
+terminal | ctrl+alt+a | typed=0:"\u{1b}\u{1}"
 terminal | ctrl+alt+b | status="Secondary side bar shown" +aux
 terminal | ctrl+alt+c | typed=0:"\u{1b}\u{3}"
 terminal | ctrl+alt+down | status="No command marks yet (shell integration needs a zsh prompt)"
@@ -1040,7 +1052,7 @@ terminal | ctrl+shift+l | typed=0:"\u{c}"
 terminal | ctrl+shift+m | panel=Problems
 terminal | ctrl+shift+n | typed=0:"\u{e}"
 terminal | ctrl+shift+o | status="Go to Symbol: 0 symbols — Esc to close" +go_to_symbol("" @0 > "")
-terminal | ctrl+shift+p | status="Command Palette: 387 commands — Esc to close" +palette("" @0 > "Move Line Up")
+terminal | ctrl+shift+p | status="Command Palette: 393 commands — Esc to close" +palette("" @0 > "Move Line Up")
 terminal | ctrl+shift+pagedown | -
 terminal | ctrl+shift+pageup | -
 terminal | ctrl+shift+r | focus=side side=Remote
@@ -1109,6 +1121,7 @@ terminal | space | typed=0:" "
 terminal | tab | typed=0:"\t"
 terminal | u | typed=0:"u"
 terminal | up | typed=0:"\u{1b}[A"
+search | alt+a | -
 search | alt+backspace | search="" @Query:0 hits=0@0
 search | alt+c | status="Search: Match Case on" search="total" @Query:5 +case hits=0@0
 search | alt+cmd+\ | status="Search: unhandled Cmd+\\"
@@ -1118,6 +1131,7 @@ search | alt+cmd+right | -
 search | alt+d | search="total" @Query:5 include="" exclude="" hits=4@0
 search | alt+delete | -
 search | alt+down | search="total" @Query:5 hits=4@1
+search | alt+f | -
 search | alt+f12 | -
 search | alt+f9 | status="Start debugging first to set exception breakpoints"
 search | alt+l | -
@@ -1166,6 +1180,7 @@ search | ctrl+alt+, | status="Search: unhandled Ctrl+,"
 search | ctrl+alt+- | status="Search: unhandled Ctrl+-"
 search | ctrl+alt+. | status="Search: unhandled Ctrl+."
 search | ctrl+alt+= | status="Search: unhandled Ctrl+="
+search | ctrl+alt+a | search="total" @Query:5 sel=0-5 hits=4@0
 search | ctrl+alt+b | status="Secondary side bar shown" +aux
 search | ctrl+alt+c | -
 search | ctrl+alt+down | search="total" @Query:5 hits=4@1
@@ -1308,7 +1323,7 @@ search | ctrl+shift+l | status="Search: unhandled Ctrl+L"
 search | ctrl+shift+m | focus=panel panel=Problems search="total" hits=4@0
 search | ctrl+shift+n | status="Search: unhandled Ctrl+N"
 search | ctrl+shift+o | status="Go to Symbol: 0 symbols — Esc to close" +go_to_symbol("" @0 > "")
-search | ctrl+shift+p | status="Command Palette: 387 commands — Esc to close" +palette("" @0 > "Move Line Up")
+search | ctrl+shift+p | status="Command Palette: 393 commands — Esc to close" +palette("" @0 > "Move Line Up")
 search | ctrl+shift+pagedown | -
 search | ctrl+shift+pageup | -
 search | ctrl+shift+r | side=Remote search="total" hits=4@0
@@ -1377,6 +1392,7 @@ search | space | search="total " @Query:6 hits=0@0
 search | tab | -
 search | u | search="totalu" @Query:6 hits=0@0
 search | up | -
+scm | alt+a | -
 scm | alt+backspace | scm="Ship i"@6 +focus StagedModified:docs/notes.md Untracked:todo.txt
 scm | alt+c | -
 scm | alt+cmd+\ | -
@@ -1386,6 +1402,7 @@ scm | alt+cmd+right | -
 scm | alt+d | -
 scm | alt+delete | -
 scm | alt+down | scm="Ship it"@7 +focus +list sel=0 multi=0 StagedModified:docs/notes.md Untracked:todo.txt
+scm | alt+f | -
 scm | alt+f12 | -
 scm | alt+f9 | status="Start debugging first to set exception breakpoints"
 scm | alt+l | -
@@ -1434,6 +1451,7 @@ scm | ctrl+alt+, | -
 scm | ctrl+alt+- | -
 scm | ctrl+alt+. | -
 scm | ctrl+alt+= | -
+scm | ctrl+alt+a | status="Selected 2 change(s)" scm="Ship it"@7 +focus sel=0 multi=0-1 StagedModified:docs/notes.md Untracked:todo.txt
 scm | ctrl+alt+b | status="Secondary side bar shown" +aux
 scm | ctrl+alt+c | -
 scm | ctrl+alt+down | scm="Ship it"@7 +focus +list sel=0 multi=0 StagedModified:docs/notes.md Untracked:todo.txt
@@ -1576,7 +1594,7 @@ scm | ctrl+shift+l | -
 scm | ctrl+shift+m | focus=panel panel=Problems scm="Ship it"@7 StagedModified:docs/notes.md Untracked:todo.txt
 scm | ctrl+shift+n | -
 scm | ctrl+shift+o | status="Go to Symbol: 0 symbols — Esc to close" +go_to_symbol("" @0 > "")
-scm | ctrl+shift+p | status="Command Palette: 387 commands — Esc to close" +palette("" @0 > "Move Line Up")
+scm | ctrl+shift+p | status="Command Palette: 393 commands — Esc to close" +palette("" @0 > "Move Line Up")
 scm | ctrl+shift+pagedown | -
 scm | ctrl+shift+pageup | -
 scm | ctrl+shift+r | side=Remote scm="Ship it"@7 StagedModified:docs/notes.md Untracked:todo.txt
@@ -1645,6 +1663,7 @@ scm | space | scm="Ship it "@8 +focus StagedModified:docs/notes.md Untracked:tod
 scm | tab | scm="Ship it"@7 +focus +list sel=0 multi=0 StagedModified:docs/notes.md Untracked:todo.txt
 scm | u | scm="Ship itu"@8 +focus StagedModified:docs/notes.md Untracked:todo.txt
 scm | up | -
+palette | alt+a | ~palette("a" @1 > "Fold All")
 palette | alt+backspace | -
 palette | alt+c | ~palette("c" @1 > "Git: Commit")
 palette | alt+cmd+\ | -
@@ -1654,6 +1673,7 @@ palette | alt+cmd+right | -
 palette | alt+d | ~palette("d" @1 > "Delete Line")
 palette | alt+delete | -
 palette | alt+down | ~palette("" @0 > "Move Line Down")
+palette | alt+f | ~palette("f" @1 > "Quick Fix")
 palette | alt+f12 | -
 palette | alt+f9 | -
 palette | alt+l | ~palette("l" @1 > "View: Toggle Primary Side Bar")
@@ -1702,6 +1722,7 @@ palette | ctrl+alt+, | -
 palette | ctrl+alt+- | -
 palette | ctrl+alt+. | -
 palette | ctrl+alt+= | -
+palette | ctrl+alt+a | -
 palette | ctrl+alt+b | -
 palette | ctrl+alt+c | -
 palette | ctrl+alt+down | ~palette("" @0 > "Move Line Down")
@@ -1722,7 +1743,7 @@ palette | ctrl+alt+shift+k | -
 palette | ctrl+alt+shift+l | -
 palette | ctrl+alt+shift+left | -
 palette | ctrl+alt+shift+n | -
-palette | ctrl+alt+shift+pagedown | ~palette("" @0 > "Kill to End of Line")
+palette | ctrl+alt+shift+pagedown | ~palette("" @0 > "Align Cursors Using Indentation Settings")
 palette | ctrl+alt+shift+pageup | -
 palette | ctrl+alt+shift+right | -
 palette | ctrl+alt+shift+s | -
@@ -1848,7 +1869,7 @@ palette | ctrl+shift+m | -
 palette | ctrl+shift+n | -
 palette | ctrl+shift+o | -
 palette | ctrl+shift+p | -
-palette | ctrl+shift+pagedown | ~palette("" @0 > "Kill to End of Line")
+palette | ctrl+shift+pagedown | ~palette("" @0 > "Align Cursors Using Indentation Settings")
 palette | ctrl+shift+pageup | -
 palette | ctrl+shift+r | -
 palette | ctrl+shift+s | -
@@ -1889,7 +1910,7 @@ palette | f9 | -
 palette | home | -
 palette | left | -
 palette | n | ~palette("n" @1 > "Go to Next Change")
-palette | pagedown | ~palette("" @0 > "Kill to End of Line")
+palette | pagedown | ~palette("" @0 > "Align Cursors Using Indentation Settings")
 palette | pageup | -
 palette | r | ~palette("r" @1 > "Redo")
 palette | right | -
@@ -1908,7 +1929,7 @@ palette | shift+f8 | -
 palette | shift+f9 | -
 palette | shift+home | -
 palette | shift+left | -
-palette | shift+pagedown | ~palette("" @0 > "Kill to End of Line")
+palette | shift+pagedown | ~palette("" @0 > "Align Cursors Using Indentation Settings")
 palette | shift+pageup | -
 palette | shift+right | -
 palette | shift+up | -
@@ -1916,6 +1937,7 @@ palette | space | ~palette(" " @1 > "Move Line Up")
 palette | tab | -
 palette | u | ~palette("u" @1 > "Undo")
 palette | up | -
+confirm | alt+a | -
 confirm | alt+backspace | -
 confirm | alt+c | -
 confirm | alt+cmd+\ | -
@@ -1925,6 +1947,7 @@ confirm | alt+cmd+right | -
 confirm | alt+d | -
 confirm | alt+delete | -
 confirm | alt+down | -
+confirm | alt+f | -
 confirm | alt+f12 | -
 confirm | alt+f9 | -
 confirm | alt+l | -
@@ -1973,6 +1996,7 @@ confirm | ctrl+alt+, | -
 confirm | ctrl+alt+- | -
 confirm | ctrl+alt+. | -
 confirm | ctrl+alt+= | -
+confirm | ctrl+alt+a | -
 confirm | ctrl+alt+b | -
 confirm | ctrl+alt+c | -
 confirm | ctrl+alt+down | -

@@ -1588,6 +1588,175 @@ fn column_select_commands_are_in_the_palette() {
     assert_eq!(app.editor.carets.len(), 1);
 }
 
+/// AC2: with `multi_cursor_persist` read from config, three carets on three
+/// lines survive two Downs, type at all three, split all three lines on
+/// Enter, and Esc collapses them back to one.
+#[test]
+fn multi_cursor_persist_keeps_every_caret_through_moves_typing_and_enter() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "m.py", "aaa\nbbb\nccc\nddd\neee");
+    app.apply_merged_settings(&crate::prefs::Prefs {
+        multi_cursor_persist: true,
+        ..Default::default()
+    });
+    assert!(app.multi_cursor_persist, "read from the merged settings");
+    (app.editor.cursor_row, app.editor.cursor_col) = (0, 3);
+    app.editor.carets = vec![
+        crate::widgets::editor::EditorSelection::new(1, 3),
+        crate::widgets::editor::EditorSelection::new(2, 3),
+    ];
+    for _ in 0..2 {
+        app.handle_key(key(KeyCode::Down, KeyModifiers::NONE))
+            .unwrap();
+    }
+    let mut places = vec![(app.editor.cursor_row, app.editor.cursor_col)];
+    places.extend(app.editor.carets.iter().map(|c| c.head));
+    assert_eq!(places, vec![(2, 3), (3, 3), (4, 3)]);
+
+    type_char(&mut app, 'X');
+    assert_eq!(app.editor.lines, ["aaa", "bbb", "cccX", "dddX", "eeeX"]);
+
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        app.editor.lines,
+        ["aaa", "bbb", "cccX", "", "dddX", "", "eeeX", ""]
+    );
+    assert_eq!(app.editor.carets.len() + 1, 3, "still three carets");
+
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(!app.editor.has_multi_cursor(), "Esc collapses to one");
+}
+
+/// Enter keeps each caret's indentation, as one caret's Enter does: the
+/// smart rule, not a bare line split.
+#[test]
+fn multi_cursor_enter_keeps_every_carets_indentation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "m.py", "def f():\n    a = 1\n    b = 2");
+    app.apply_merged_settings(&crate::prefs::Prefs {
+        multi_cursor_persist: true,
+        ..Default::default()
+    });
+    (app.editor.cursor_row, app.editor.cursor_col) = (1, 9);
+    app.editor.carets = vec![crate::widgets::editor::EditorSelection::new(2, 9)];
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        app.editor.lines,
+        ["def f():", "    a = 1", "    ", "    b = 2", "    "],
+        "both new lines carry the indentation of the line they split"
+    );
+}
+
+/// The user's own sequence: carets added from the palette, `End` to put each
+/// one at its line end, two characters selected leftwards, then Align Cursors
+/// from the palette. Every selection must start in the same column.
+#[test]
+fn aligning_after_end_and_two_chars_moves_every_selection_into_one_column() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "t.txt", "aaa\nbbbbb\ncc\ndddddd");
+    app.apply_merged_settings(&crate::prefs::Prefs {
+        multi_cursor_persist: true,
+        ..Default::default()
+    });
+    (app.editor.cursor_row, app.editor.cursor_col) = (0, 0);
+    app.run_command(Command::AddCursorBelow);
+    app.run_command(Command::AddCursorBelow);
+    app.handle_key(key(KeyCode::End, KeyModifiers::NONE))
+        .unwrap();
+    for _ in 0..2 {
+        app.handle_key(key(KeyCode::Left, KeyModifiers::SHIFT))
+            .unwrap();
+    }
+    app.run_command(Command::AlignCursors);
+    assert_eq!(
+        app.editor.lines,
+        ["a  aa", "bbbbb", "   cc", "dddddd"],
+        "every selection starts in column 3"
+    );
+}
+
+/// A command that does nothing must say so: silence reads as a broken
+/// shortcut, which is exactly how it was reported to us.
+#[test]
+fn align_cursors_says_in_the_status_bar_what_it_did() {
+    use crate::widgets::command_palette::Command;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "t.txt", "aaa\nbbbbb\ncc");
+    app.run_command(Command::AlignCursors);
+    assert_eq!(app.status, "Align Cursors needs more than one caret");
+
+    (app.editor.cursor_row, app.editor.cursor_col) = (0, 3);
+    app.editor.carets = vec![crate::widgets::editor::EditorSelection::new(1, 3)];
+    app.run_command(Command::AlignCursors);
+    assert_eq!(
+        app.status, "Align Cursors: nothing to align",
+        "two carets in one column have nothing to do"
+    );
+
+    app.editor.carets = vec![crate::widgets::editor::EditorSelection::new(1, 5)];
+    app.run_command(Command::AlignCursors);
+    assert_eq!(
+        app.status, "Aligned every caret",
+        "lines now: {:?}",
+        app.editor.lines
+    );
+}
+
+/// The palette runs the same command as the chord, so "Align Cursors" from
+/// the palette pads every caret exactly as `Alt+A` does.
+#[test]
+fn aligning_cursors_from_the_command_palette_pads_every_caret() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "m.py", "abc\ndefgh\nij");
+    // The primary caret carries the first selection; the other two ride in
+    // `carets`, as every multi-caret edit sees them.
+    (app.editor.cursor_row, app.editor.cursor_col) = (0, 3);
+    app.editor.selection = Some(crate::widgets::editor::EditorSelection {
+        anchor: (0, 1),
+        head: (0, 3),
+    });
+    app.editor.carets = vec![
+        crate::widgets::editor::EditorSelection {
+            anchor: (1, 3),
+            head: (1, 5),
+        },
+        crate::widgets::editor::EditorSelection {
+            anchor: (2, 0),
+            head: (2, 1),
+        },
+    ];
+    app.run_command(crate::widgets::command_palette::Command::AlignCursors);
+    // Starts 1, 3 and 0 with lengths 2, 2 and 1: every start moves to column
+    // 3 and every selection is padded to the longest, two.
+    assert_eq!(app.editor.lines, ["a  bc", "defgh", "   i j"]);
+    assert!(
+        app.editor.has_multi_cursor(),
+        "aligning leaves every caret in place"
+    );
+}
+
+/// Negative: with the pref off, the first movement still drops every extra
+/// caret and falls through to single-caret handling, as it always has.
+#[test]
+fn without_multi_cursor_persist_a_move_still_collapses_to_one_caret() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "m.py", "aaa\nbbb\nccc");
+    assert!(!app.multi_cursor_persist, "off unless the user asks");
+    (app.editor.cursor_row, app.editor.cursor_col) = (0, 0);
+    app.editor.carets = vec![
+        crate::widgets::editor::EditorSelection::new(1, 0),
+        crate::widgets::editor::EditorSelection::new(2, 0),
+    ];
+    app.handle_key(key(KeyCode::Down, KeyModifiers::NONE))
+        .unwrap();
+    assert!(!app.editor.has_multi_cursor());
+    assert_eq!((app.editor.cursor_row, app.editor.cursor_col), (1, 0));
+}
+
 #[test]
 fn cmd_shift_k_deletes_the_current_line() {
     let tmp = tempfile::tempdir().unwrap();
@@ -2973,5 +3142,67 @@ fn tab_expands_each_word_of_an_array_prefix() {
     assert_eq!(
         expand_with_array_prefix_snippets("main"),
         "if __name__ == '__main__':"
+    );
+}
+
+/// Alt (Option) is the word modifier for ←/→ on the single-caret path, so a
+/// persisted multi-caret move has to word-step every caret rather than fall
+/// through to the collapse that used to leave just the primary moving.
+#[test]
+fn multi_cursor_alt_arrows_word_step_every_caret() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "m.py", "foo bar\nfoo bar\nfoo bar");
+    app.apply_merged_settings(&crate::prefs::Prefs {
+        multi_cursor_persist: true,
+        ..Default::default()
+    });
+    (app.editor.cursor_row, app.editor.cursor_col) = (0, 7);
+    app.editor.carets = vec![
+        crate::widgets::editor::EditorSelection::new(1, 7),
+        crate::widgets::editor::EditorSelection::new(2, 7),
+    ];
+    app.handle_key(key(KeyCode::Left, KeyModifiers::ALT))
+        .unwrap();
+    let mut places = vec![(app.editor.cursor_row, app.editor.cursor_col)];
+    places.extend(app.editor.carets.iter().map(|c| c.head));
+    assert_eq!(
+        places,
+        vec![(0, 4), (1, 4), (2, 4)],
+        "Alt+Left steps every caret one word left"
+    );
+    app.handle_key(key(KeyCode::Right, KeyModifiers::ALT))
+        .unwrap();
+    let mut places = vec![(app.editor.cursor_row, app.editor.cursor_col)];
+    places.extend(app.editor.carets.iter().map(|c| c.head));
+    assert_eq!(
+        places,
+        vec![(0, 7), (1, 7), (2, 7)],
+        "Alt+Right steps every caret one word right"
+    );
+    app.handle_key(key(KeyCode::Left, KeyModifiers::CONTROL))
+        .unwrap();
+    assert!(
+        app.editor.has_multi_cursor(),
+        "Ctrl word motion keeps every caret too"
+    );
+}
+
+/// Shift+Alt+←/→ is still the smart-select chord: with carets live it
+/// collapses to one and expands, rather than word-moving every caret.
+#[test]
+fn multi_cursor_shift_alt_arrow_still_expands_the_selection() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "m.py", "foo bar\nbaz qux");
+    app.apply_merged_settings(&crate::prefs::Prefs {
+        multi_cursor_persist: true,
+        ..Default::default()
+    });
+    (app.editor.cursor_row, app.editor.cursor_col) = (0, 0);
+    app.editor.carets = vec![crate::widgets::editor::EditorSelection::new(1, 0)];
+    app.handle_key(key(KeyCode::Right, KeyModifiers::ALT | KeyModifiers::SHIFT))
+        .unwrap();
+    assert!(
+        !app.editor.has_multi_cursor(),
+        "smart-select stays a single-caret gesture"
     );
 }
