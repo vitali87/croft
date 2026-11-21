@@ -1499,11 +1499,140 @@ CLI = Target(
     ),
 )
 
+# The CodeQL side bar's feature files (#2062): (module doc, release-note phrase, docs row).
+# The App methods move a level down, from src/app/codeql.rs into src/app/codeql/, so a
+# `pub(super)` one becomes `pub(in crate::app)`: the same reach, all of `app`.
+CODEQL_FILES = {
+    "test_runs": (
+        "CodeQL: Run Tests and Accept Test Output: every CodeQL test run through the Testing\n"
+        "view's run-all, and a failing test's output made its expected output.",
+        "CodeQL test run",
+        "CodeQL: Run Tests through the Testing view, and Accept Test Output",
+    ),
+    "cli_install": (
+        "The CodeQL CLI: which `codeql` every run uses (settings, `PATH` or croft's own copy),\n"
+        "its version, downloading it into croft's cache, and checking for a newer release.",
+        "CodeQL CLI install",
+        "the CodeQL CLI: which `codeql` runs, its version, downloading it and checking for "
+        "updates",
+    ),
+    "databases": (
+        "The CodeQL database list: the current database, removing, renaming, sorting and\n"
+        "revealing databases, upgrading one to the CLI's schema, deleting unused copies, and\n"
+        "where databases and their sources are kept.",
+        "CodeQL database list",
+        "the database list: removing, renaming, sorting, upgrading, deleting unused copies, "
+        "and where databases are kept",
+    ),
+    "database_sources": (
+        "Adding a CodeQL database: the places one comes from (a folder, an archive, a URL,\n"
+        "GitHub), the database picker, downloading and unpacking it on a worker thread,\n"
+        "registering it, and adding a database's source to the workspace.",
+        "CodeQL database source",
+        "adding a database from a folder, an archive, a URL or GitHub, and its source to the "
+        "workspace",
+    ),
+    "history": (
+        "The CodeQL query history: where runs and their results are kept, listing, removing,\n"
+        "renaming and sorting entries, an entry's query and its text, its evaluator log, and\n"
+        "its results folder.",
+        "CodeQL query history",
+        "the query history: its entries, their queries, logs and results folders",
+    ),
+    "logs": (
+        "A run's logs: the evaluator log as raw JSON, as summary text and in the log viewer,\n"
+        "the query log, and comparing two runs' performance.",
+        "CodeQL log",
+        "a run's evaluator and query logs, the log viewer, and Compare Performance",
+    ),
+    "results": (
+        "A run's results: walking a results table, decoding result sets, choosing a set, the\n"
+        "alert and raw-results views, comparing two runs' results, and exporting them.",
+        "CodeQL result",
+        "a run's results: result sets, the alert and raw views, Compare Results, Export "
+        "Results",
+    ),
+    "queries": (
+        "The workspace's queries: finding them for the side bar on a worker thread, creating\n"
+        "one, a quick query, the query a `.qlref` points at, and previewing a query's help.",
+        "CodeQL query",
+        "the workspace's queries: finding and creating them, Quick Query, query help",
+    ),
+    "packs": (
+        "Suites and packs: installing a pack's dependencies, downloading packs on a worker\n"
+        "thread, running a suite, a pack, or a published pack, and refusing a suite whose\n"
+        "results cannot be shown.",
+        "CodeQL pack",
+        "suites and packs: installing, downloading and running them",
+    ),
+    "run": (
+        "Running a query: the open query on the current database or another, quick\n"
+        "evaluation, Debug Query, running `codeql` and cancelling it, and recording a\n"
+        "finished run in the query history.",
+        "CodeQL query run",
+        "running a query, quick evaluation and Debug Query, cancelling and recording a run",
+    ),
+    "queue": (
+        "The run queue: several queries run one after another (all queries in the workspace,\n"
+        "those in selected files), one query on several databases and their checklist, and\n"
+        "cancelling what waits.",
+        "CodeQL run queue",
+        "the run queue: many queries in turn, or one query on several databases",
+    ),
+    "contextual": (
+        "Contextual queries: what they run on and the queries they resolve, View AST and its\n"
+        "viewer, and View CFG.",
+        "CodeQL AST and CFG",
+        "contextual queries: View AST and View CFG",
+    ),
+    "model_editor": (
+        "The model editor: reading a database's endpoints, modeling an endpoint, and writing\n"
+        "the models to the database's model pack.",
+        "CodeQL model editor",
+        "the model editor: endpoints, their models, and the model pack",
+    ),
+    "variant_repos": (
+        "What variant analysis runs against: its config, the controller repository, lists,\n"
+        "repositories and owners, adding repositories from a Code Search, and opening the\n"
+        "selected one on GitHub.",
+        "variant analysis repository list",
+        "variant analysis targets: the controller, lists, repositories, owners and Code "
+        "Search",
+    ),
+    "variant_runs": (
+        "Variant analysis runs: submitting the open query, following the runs, their logs,\n"
+        "fetching and opening their results, and exporting them.",
+        "variant analysis run",
+        "variant analysis runs: submitting, following, fetching and exporting results",
+    ),
+    "side_bar": (
+        "The CodeQL side bar itself: whether it is available, revealing it, its keys, what\n"
+        "each row does when activated, and keeping the chrome in step when CodeQL is added,\n"
+        "removed, enabled or disabled.",
+        "CodeQL side bar",
+        "the side bar itself: availability, its keys and what each row does",
+    ),
+}
+
+CODEQL = Target(
+    "codeql", "scripts/split_codeql_manifest.tsv", "src/app/codeql.rs", "src/app/codeql",
+    CODEQL_FILES,
+    Tree(
+        "│   ├── codeql.rs ",
+        "│   ├── codeql/          the CodeQL side bar's feature files, beside codeql.rs; "
+        "each file's `//!` doc says what it holds",
+        "│   │   ├── ", 19,
+    ),
+    "codeql-",
+    # Its tests are already their own file, src/app/tests/codeql.rs.
+    None,
+)
+
 TARGETS = {
     t.name: t
     for t in (
         APP, EDITOR, LSP, TERMINAL, GIT, REMOTE, SEARCH, SESSION_HOST, PAIR, SOURCE_CONTROL,
-        CLI,
+        CLI, CODEQL,
     )
 }
 
