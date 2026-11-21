@@ -70,16 +70,18 @@ see [docs/MACOS.md](docs/MACOS.md#spotlight-indexing-and-the-build-directory).
   `scripts/split_session_host_manifest.tsv`, with `--target pair` split
   `src/pair.rs` from `scripts/split_pair_manifest.tsv`, with
   `--target source_control` split `src/widgets/source_control.rs` from
-  `scripts/split_source_control_manifest.tsv`, and with `--target cli` split
-  `src/cli.rs` from `scripts/split_cli_manifest.tsv` (`--tests-out` first
-  moved each file's inline tests to their own file).
+  `scripts/split_source_control_manifest.tsv`, with `--target cli` split
+  `src/cli.rs` from `scripts/split_cli_manifest.tsv`, and with
+  `--target codeql` split `src/app/codeql.rs` from
+  `scripts/split_codeql_manifest.tsv` (`--tests-out` first moved a file's
+  inline tests to their own file).
 * **Adding to the app, the editor, the language-server manager, the
   terminal pane, git, remote sessions, the search panel, the session host,
-  the pair pilot, the Source Control panel or the command line?** Put a
-  feature's code in its file under `src/app/`, `src/widgets/editor/`,
-  `src/lsp/manager/`, `src/widgets/terminal/`, `src/git/`, `src/remote/`,
-  `src/widgets/search/`, `src/session_host/`, `src/pair/`,
-  `src/widgets/source_control/` or `src/cli/`
+  the pair pilot, the Source Control panel, the command line or the CodeQL
+  side bar?** Put a feature's code in its file under `src/app/`,
+  `src/widgets/editor/`, `src/lsp/manager/`, `src/widgets/terminal/`,
+  `src/git/`, `src/remote/`, `src/widgets/search/`, `src/session_host/`,
+  `src/pair/`, `src/widgets/source_control/`, `src/cli/` or `src/app/codeql/`
   (see the lists in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)),
   not in `src/app/mod.rs`, which keeps only the `App` struct, its state,
   start-up and the main loop, nor in `src/widgets/editor.rs`, which keeps only
@@ -96,7 +98,8 @@ see [docs/MACOS.md](docs/MACOS.md#spotlight-indexing-and-the-build-directory).
   `src/pair.rs`, which keeps only the pilot's shared state, nor in
   `src/widgets/source_control.rs`, which keeps only the `SourceControlPanel`
   type, its constructor and the row action areas, nor in `src/cli.rs`, which
-  keeps only the clap root, `Cli`. A new subcommand's flags go in
+  keeps only the clap root, `Cli`, nor in `src/app/codeql.rs`, which keeps
+  only the types and constants its parts share. A new subcommand's flags go in
   `src/cli/commands.rs` and its line in `Cli::run` (`src/cli/run.rs`); its
   own code goes in a file under `src/cli/`, or in the module of the feature
   it drives (as `croft remote` calls into `src/remote/`). A new feature that
