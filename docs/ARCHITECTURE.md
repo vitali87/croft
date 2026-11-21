@@ -234,6 +234,7 @@ src/
 │   │   ├── adapters.rs         finding lldb-dap, telling a runnable binary, and installing delve
 │   │   ├── builds.rs           debug builds: `cargo`, C/C++ and single Rust files, then lldb-dap on the binary
 │   │   ├── debug_test.rs       Debug Test: the test at the caret or by name, its build, launch and failure breakpoint
+│   │   ├── events.rs           the sessions' events, drained each frame: stops, output and endings
 │   │   ├── python.rs           which Python a debugged program runs under, and the note on an old one
 │   ├── diff_merge.rs    diff editor upkeep and navigation, merge conflicts and the three-way merge editor, the history scrubber, local history and the who-wrote-this lens
 │   ├── editor_input.rs  editor keys, vim mode, macros, multi-cursor and line commands, typing toggles, copy, cut and paste routing and the clipboard, and reading dropped file paths out of a paste
