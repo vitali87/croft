@@ -150,7 +150,7 @@ def wordcount(binary: str) -> Demo:
 
 def send(d: Demo, text: str) -> None:
     """Type `text` in one go, off camera."""
-    d._tmux("send-keys", "-t", "demo", "-l", text)
+    d.send_text(text)
 
 
 def quietly(d: Demo, *keys: str, pause: float = 0.6) -> None:
@@ -187,24 +187,6 @@ def open_file(d: Demo, query: str, shown: bool = True) -> None:
     d.key("Enter")
     if not shown:
         time.sleep(1.0)
-
-
-def overview(binary: str, gif: Path) -> None:
-    """Explorer, a Rust file with highlighting and inline blame, Go to File, cargo run."""
-    with wordcount(binary) as d:
-        d.start()
-        d.snap(1800)
-        open_file(d, "main")
-        d.snap(3000)
-        open_file(d, "tally")
-        d.snap(2200)
-        run_command(d, "focus terminal", shown=False)
-        d.snap(300)
-        d.type("cargo run -q", per_char_ms=70, hold_ms=500)
-        d.key("Enter")
-        time.sleep(6)
-        d.snap(4000)
-        d.save(gif)
 
 
 def search(binary: str, gif: Path) -> None:
@@ -287,8 +269,7 @@ def symbol_tabs(binary: str, gif: Path) -> None:
         open_file(d, "shapes", shown=False)
         quietly(d, "Down", "Down", "Down", "Down", "Down", "Down", "Down", "Down", "Down")
         d.snap(1500)
-        d.key("C-k")
-        d.key("V")
+        run_command(d, "open symbol as its own tab", shown=False)
         d.snap(2200)
         d.key("End")
         d.snap(300)
@@ -355,8 +336,7 @@ def live_run(binary: str, gif: Path) -> None:
         run_command(d, "toggle activity bar", shown=False)
         run_command(d, "toggle minimap", shown=False)
         d.snap(1800)
-        d.key("C-k")
-        d.key("v")
+        run_command(d, "toggle live run", shown=False)
         time.sleep(2)
         d.snap(4500)
         # Into the brackets of `mean([])` on line 20.
@@ -378,7 +358,6 @@ def settings_editor_scene(binary: str, gif: Path) -> None:
 
 
 SCENES = {
-    "overview": overview,
     "search": search,
     "command-palette": command_palette,
     "customize-layout": customize_layout,
