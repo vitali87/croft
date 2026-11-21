@@ -210,6 +210,7 @@ src/
 │   ├── codeql.rs        the CodeQL side bar: databases, query history and logs, running queries, suites and packs, result viewers, AST and CFG, the model editor, the run queue, variant analysis, and downloading and updating the CLI
 │   ├── codeql/          the CodeQL side bar's feature files, beside codeql.rs; each file's `//!` doc says what it holds
 │   │   ├── cli_install.rs      the CodeQL CLI: which `codeql` runs, its version, downloading it and checking for updates
+│   │   ├── databases.rs        the database list: removing, renaming, sorting, upgrading, deleting unused copies, and where databases are kept
 │   │   ├── test_runs.rs        CodeQL: Run Tests through the Testing view, and Accept Test Output
 │   ├── commands.rs      `run_command`, the Command Palette, the Extensions view, extension commands (MCP tools, viewers) and Show Memory Usage
 │   ├── completion.rs    the completion popup, auto-imports, snippets, signature help, ghost-text suggestions and Emmet
