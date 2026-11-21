@@ -5914,6 +5914,117 @@ fn multi_backspace_deletes_at_every_caret() {
     assert_eq!(e.lines, vec!["  ".to_string()]);
 }
 
+/// With the persistence pref on, a Down moves every caret one row of its
+/// own and clamps each to its own line's length.
+#[test]
+fn multi_move_down_steps_every_caret_and_clamps_to_its_own_line() {
+    let mut e = editor_with("abcd\nx\npqrs\ntail");
+    e.cursor_row = 0;
+    e.cursor_col = 3;
+    e.carets = vec![EditorSelection::new(2, 3)];
+    e.multi_move(CaretMotion::Down, false);
+    assert_eq!(e.caret_places(), vec![(1, 1), (3, 3)], "row 1 is one char");
+}
+
+/// Two Downs on three carets over three lines keep all three, one row on.
+#[test]
+fn multi_move_down_keeps_three_carets_moving_together() {
+    let mut e = editor_with("one\ntwoooo\nthree\nfour\nfive");
+    e.cursor_row = 0;
+    e.cursor_col = 1;
+    e.carets = vec![EditorSelection::new(1, 3), EditorSelection::new(2, 4)];
+    e.multi_move(CaretMotion::Down, false);
+    e.multi_move(CaretMotion::Down, false);
+    assert_eq!(e.caret_places(), vec![(2, 1), (3, 3), (4, 4)]);
+}
+
+/// A Right at a line's end steps onto the next line, as one caret's does,
+/// while the caret below moves on its own line.
+#[test]
+fn multi_move_right_walks_off_a_line_end_like_one_caret_does() {
+    let mut e = editor_with("ab\ncd");
+    e.cursor_col = 2;
+    e.carets = vec![EditorSelection::new(1, 1)];
+    e.multi_move(CaretMotion::Right, false);
+    assert_eq!(e.caret_places(), vec![(1, 0), (1, 2)]);
+}
+
+/// Word-wise and line-end motions run at every caret.
+#[test]
+fn multi_move_word_and_line_ends_apply_at_every_caret() {
+    let mut e = editor_with("one two\nthree four");
+    e.cursor_col = 0;
+    e.carets = vec![EditorSelection::new(1, 0)];
+    e.multi_move(CaretMotion::WordRight, false);
+    assert_eq!(e.caret_places(), vec![(0, 3), (1, 5)]);
+    e.multi_move(CaretMotion::End, false);
+    assert_eq!(e.caret_places(), vec![(0, 7), (1, 10)]);
+    e.multi_move(CaretMotion::Home, false);
+    assert_eq!(e.caret_places(), vec![(0, 0), (1, 0)]);
+}
+
+/// `extend` grows a selection at every caret instead of moving the carets.
+#[test]
+fn multi_move_with_extend_selects_at_every_caret() {
+    let mut e = editor_with("abcd\nwxyz");
+    e.cursor_col = 0;
+    e.carets = vec![EditorSelection::new(1, 0)];
+    e.multi_move(CaretMotion::Right, true);
+    e.multi_move(CaretMotion::Right, true);
+    assert_eq!(e.selection.unwrap().normalised(), ((0, 0), (0, 2)));
+    assert_eq!(e.carets[0].normalised(), ((1, 0), (1, 2)));
+}
+
+/// Enter splits the line under every caret in one undo step.
+#[test]
+fn multi_newline_splits_the_line_at_every_caret() {
+    let mut e = editor_with("abc\ndef\nghi");
+    e.cursor_row = 0;
+    e.cursor_col = 1;
+    e.carets = vec![EditorSelection::new(1, 2), EditorSelection::new(2, 3)];
+    e.multi_newline();
+    assert_eq!(e.lines, ["a", "bc", "de", "f", "ghi", ""]);
+    assert_eq!(e.caret_places(), vec![(1, 0), (3, 0), (5, 0)]);
+    assert!(e.undo());
+    assert_eq!(e.lines, ["abc", "def", "ghi"], "one step");
+}
+
+/// Overlapping selections describe the same text once: Enter splits their
+/// line once, not once per caret, and no caret is left misplaced.
+#[test]
+fn multi_newline_ignores_a_caret_inside_another_selection() {
+    let mut e = editor_with("abcd");
+    e.cursor_row = 0;
+    e.cursor_col = 4;
+    e.selection = Some(EditorSelection {
+        anchor: (0, 0),
+        head: (0, 4),
+    });
+    e.carets = vec![EditorSelection::new(0, 2)];
+    e.multi_newline();
+    assert_eq!(e.lines, ["", ""], "the selection is replaced once");
+    assert!(!e.has_multi_cursor(), "the covered caret added no split");
+}
+
+/// Alt-clicking at the start of a selection leaves a bare caret and the
+/// selection sharing one start, and the caret can come first: the selection
+/// still owns the text, so Enter replaces it once instead of splitting in
+/// front of it and leaving `abcd` behind.
+#[test]
+fn multi_newline_ignores_a_caret_at_the_start_of_a_selection() {
+    let mut e = editor_with("abcd");
+    e.cursor_row = 0;
+    e.cursor_col = 0;
+    e.selection = None;
+    e.carets = vec![EditorSelection {
+        anchor: (0, 0),
+        head: (0, 4),
+    }];
+    e.multi_newline();
+    assert_eq!(e.lines, ["", ""], "the selection is replaced once");
+    assert!(!e.has_multi_cursor(), "the bare caret added no split");
+}
+
 fn three_foos() -> Editor {
     editor_with("foo = 1\nfoo = 2\nfoo = 3")
 }

@@ -1504,6 +1504,10 @@ pub struct App {
     /// mouse selection lands on the clipboard without an explicit Cmd+C.
     /// Loaded from prefs at startup, toggled in the Settings hub.
     copy_on_select: bool,
+    /// `multi_cursor_persist`: keep every caret through arrows, Home/End,
+    /// word-wise moves and Enter rather than collapsing on the first move.
+    /// Loaded from prefs at startup, toggled in the Settings hub.
+    multi_cursor_persist: bool,
     /// The project's `files_exclude` globs (#1345), as last applied to the
     /// Explorer, so a settings reload re-lists the tree only on a change.
     files_exclude: Vec<String>,
@@ -4330,6 +4334,7 @@ impl App {
             foreign_formatters_noted: std::collections::BTreeSet::new(),
             language_prefs: loaded_prefs.languages.clone(),
             copy_on_select: loaded_prefs.copy_on_select,
+            multi_cursor_persist: loaded_prefs.multi_cursor_persist,
             files_exclude: Vec::new(),
             files_associations: std::collections::BTreeMap::new(),
             files_associations_roots: Vec::new(),

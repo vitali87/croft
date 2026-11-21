@@ -69,6 +69,7 @@ pub use language::language_scope_id;
 pub use language::normalize_rulers;
 use language::*;
 use line_commands::*;
+pub use multi_cursor::CaretMotion;
 use multi_cursor::*;
 pub(crate) use navigation::is_word_char;
 #[cfg(test)]
