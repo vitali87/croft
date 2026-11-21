@@ -264,6 +264,7 @@ src/
 │   │   ├── breadcrumbs.rs       breadcrumbs, their pickers, and the sticky-scroll headers
 │   │   ├── capabilities.rs      the active file's language and which features its server supports
 │   │   ├── decorations.rs       document links, folding ranges, colors and Change Color Presentation
+│   │   ├── format.rs            Format Document and Selection, Prettier, and format-on-save
 │   │   ├── hierarchy.rs         call and type hierarchies: the requests and the picker of answers
 │   │   ├── inlay_hints.rs       inlay hints: their replies, refresh, requests and the toggle
 │   │   ├── messages.rs          server progress, messages, questions and show-document requests
