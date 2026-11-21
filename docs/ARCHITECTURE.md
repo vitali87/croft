@@ -231,6 +231,7 @@ src/
 │   ├── debugger.rs      Run and Debug: launch configs and Add Configuration, compounds and preLaunchTask waits, adapters, debug builds, attach pickers, the paused view, watches, the console, stepping, every kind of breakpoint, Debug Test and inline values
 │   ├── debugger/        the Run and Debug feature files, beside debugger.rs; each file's `//!` doc says what it holds
 │   │   ├── adapters.rs         finding lldb-dap, telling a runnable binary, and installing delve
+│   │   ├── python.rs           which Python a debugged program runs under, and the note on an old one
 │   ├── diff_merge.rs    diff editor upkeep and navigation, merge conflicts and the three-way merge editor, the history scrubber, local history and the who-wrote-this lens
 │   ├── editor_input.rs  editor keys, vim mode, macros, multi-cursor and line commands, typing toggles, copy, cut and paste routing and the clipboard, and reading dropped file paths out of a paste
 │   ├── editor_layout.rs the tree of editor groups: splitting, moving focus between and collapsing them, and each group's rectangle; the focused group's tabs live in `App::editor`
