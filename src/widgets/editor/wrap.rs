@@ -529,7 +529,7 @@ impl Editor {
             self.cursor_row = line;
             self.cursor_col = col.min(self.line_char_len(line));
         }
-        self.last_edit_kind = None;
+        self.end_caret_action();
     }
 
     /// Move the cursor one visual row up (`dir = -1`) or down (`dir = 1`) in
@@ -540,7 +540,7 @@ impl Editor {
         let width = self.visible_text_width().max(1);
         let segs = self.line_segments(self.cursor_row, width);
         let seg_idx = self.segment_index_of_col(self.cursor_row, self.cursor_col, width);
-        let goal_col = self.cursor_col - segs[seg_idx].0;
+        let goal_col = self.vertical_goal_from(self.cursor_col - segs[seg_idx].0);
         let current = self.cursor_visual_row(width) as isize;
         let total = self.total_visual_rows(width) as isize;
         let mut target = current + dir;
@@ -558,7 +558,15 @@ impl Editor {
             .find(|&(s, _)| s == seg_start)
             .unwrap_or((seg_start, seg_start));
         self.cursor_row = line;
-        self.cursor_col = floor_grapheme_col(&self.lines[line], (s + goal_col).min(e));
+        // A non-final segment ends where the next begins: stay on its last
+        // grapheme, or the caret would hop onto the next screen row.
+        let limit = if e < self.line_char_len(line) {
+            e.saturating_sub(1).max(s)
+        } else {
+            e
+        };
+        self.cursor_col = floor_grapheme_col(&self.lines[line], (s + goal_col).min(limit));
+        self.vertical_goal = Some((self.cursor_row, self.cursor_col, goal_col));
     }
 
     /// VS Code "View: Toggle Word Wrap" (Alt+Z): flip this buffer's soft-wrap
