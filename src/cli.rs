@@ -3,30 +3,15 @@ use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+mod version;
+use version::*;
+
 const SETUP_FONT_PS_NAME: &str = "MesloLGSNFM-Regular";
 const SETUP_FONT_SIZE: u32 = 13;
 
 const ITERM2_FONT_PS_NAME: &str = "MesloLGSNFM-Regular";
 const ITERM2_NONASCII_PS_NAME: &str = "SymbolsNFM";
 const ITERM2_FONT_SIZE: u32 = 13;
-
-/// What `croft --version` prints: the plain crate version (#282).
-const VERSION: &str = env!("CARGO_PKG_VERSION");
-
-/// Version plus build provenance, for `--build-info`. Two builds can share a
-/// crate version — 0.1.758 was both the broken and the fixed binary in the
-/// 2026-08-22 session-host incident — so provenance stays one flag away
-/// rather than in everybody's face. Drift detection is unaffected either way:
-/// `DriftProbe` compares the baked `CROFT_GIT_HASH_FULL` against the repo's
-/// current commit and never read a version string.
-const VERBOSE_VERSION: &str = concat!(
-    env!("CARGO_PKG_VERSION"),
-    " (",
-    env!("CROFT_GIT_HASH"),
-    ", built ",
-    env!("CROFT_BUILD_TIME"),
-    ")"
-);
 
 #[derive(Parser, Debug)]
 #[command(name = "croft", version = VERSION, about = "Terminal-based VS Code replica")]
@@ -567,18 +552,6 @@ pub enum CliCommand {
         #[arg(short, long, default_value_t = false)]
         yes: bool,
     },
-}
-
-/// `--build-info`'s text: version, commit and build time, plus how the
-/// binary was installed when a package manager owns it (#375).
-fn build_info_line(source: crate::update_check::InstallSource) -> String {
-    match source {
-        crate::update_check::InstallSource::Homebrew => format!(
-            "{}, installed with Homebrew)",
-            VERBOSE_VERSION.trim_end_matches(')')
-        ),
-        crate::update_check::InstallSource::SelfManaged => VERBOSE_VERSION.to_string(),
-    }
 }
 
 impl Cli {
