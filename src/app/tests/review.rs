@@ -1659,6 +1659,39 @@ fn the_review_comment_pr_lookup_without_a_usable_gh_says_how_to_fix_it() {
     }
 }
 
+/// #2422: a `gh` just written, as a fresh install or update is, can't run
+/// for a moment ("Text file busy") while another process still holds it open
+/// for writing. The PR lookup behind Add Comment and Submit Review waits that
+/// moment out, as croft's other `gh` calls do, instead of reporting it.
+#[test]
+fn the_review_comment_pr_lookup_waits_out_a_briefly_busy_gh() {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let gh = tmp.path().join("gh");
+    let mut writer = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o755)
+        .open(&gh)
+        .unwrap();
+    writer.write_all(b"#!/bin/sh\necho 42\n").unwrap();
+    writer.flush().unwrap();
+    let release = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        drop(writer);
+    });
+    app.review_gh = gh.display().to_string();
+    assert_eq!(
+        app.review_pr_number(tmp.path()),
+        Some(String::from("42")),
+        "{}",
+        app.status
+    );
+    release.join().unwrap();
+}
+
 /// Load x/y#42 through `gh` and wait for its viewed-state read to settle.
 fn open_synced_pr(app: &mut App) {
     app.submit_pr_number("42");
