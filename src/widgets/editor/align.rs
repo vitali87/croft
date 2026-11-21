@@ -221,26 +221,26 @@ impl Editor {
         // Passes 2 and 3: each column's padding and selection widths, left to
         // right, because a column's cells depend on the ones before it.
         let mut col_start = 0usize;
-        for c in 0..columns.len() {
+        for (c, column) in columns.iter_mut().enumerate() {
             for b in blocks.iter_mut().filter(|b| b.column == c) {
                 let text = self.text_between(b.row, b.padding_start, b.start);
                 b.padding_cols = text_cols(&text, col_start, width);
-                columns[c].pad_cols = columns[c].pad_cols.max(b.padding_cols);
+                column.pad_cols = column.pad_cols.max(b.padding_cols);
             }
             if tabs.is_some() {
-                columns[c].pad_cols = columns[c].pad_cols.div_ceil(width) * width;
+                column.pad_cols = column.pad_cols.div_ceil(width) * width;
             }
-            col_start += columns[c].pad_cols;
+            col_start += column.pad_cols;
 
             for b in blocks.iter_mut().filter(|b| b.column == c) {
                 let text = self.text_between(b.row, b.start, b.end);
                 b.block_cols = text_cols(&text, col_start, width);
-                columns[c].block_cols = columns[c].block_cols.max(b.block_cols);
+                column.block_cols = column.block_cols.max(b.block_cols);
             }
             if tabs.is_some() {
-                columns[c].block_cols = columns[c].block_cols.div_ceil(width) * width;
+                column.block_cols = column.block_cols.div_ceil(width) * width;
             }
-            col_start += columns[c].block_cols;
+            col_start += column.block_cols;
         }
 
         // Lay the whitespace down in reading order, so the counts stay the

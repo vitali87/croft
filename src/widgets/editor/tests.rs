@@ -22378,9 +22378,12 @@ fn the_toggle_disables_every_pair_behavior() {
 
 // ---- Align Cursors (Alt+A, Alt+F, Ctrl+Alt+A, Ctrl+Alt+Shift+A) ----
 
+/// One caret, as the `(anchor, head)` pair `with_carets` takes.
+type CaretPair = ((usize, usize), (usize, usize));
+
 /// An editor over `lines` with a selection at each `(anchor, head)` pair, the
 /// first of them the primary.
-fn with_carets(lines: &[&str], sels: &[((usize, usize), (usize, usize))]) -> Editor {
+fn with_carets(lines: &[&str], sels: &[CaretPair]) -> Editor {
     let mut e = editor_with(&lines.join("\n"));
     let all: Vec<EditorSelection> = sels
         .iter()
