@@ -261,6 +261,7 @@ src/
 │   ├── key_input.rs     `handle_key` and `handle_key_inner`, Cmd+K chords, every `is_*_key` predicate, the key and mouse contexts for user keymaps, voice input and the on-screen keyboard
 │   ├── language_servers.rs language servers: sync, messages and progress, decorations, go-to and peek, hierarchies, rename, code actions, formatting, linked editing, smart select, highlights, symbol pickers, code lens, outline, breadcrumbs, sticky scroll, restart
 │   ├── language_servers/ the language server feature files, beside language_servers.rs; each file's `//!` doc says what it holds
+│   │   ├── decorations.rs       document links, folding ranges, colors and Change Color Presentation
 │   │   ├── inlay_hints.rs       inlay hints: their replies, refresh, requests and the toggle
 │   │   ├── rust_analyzer.rs     rust-analyzer's `Rust:` commands: sending them and acting on the answers
 │   │   ├── semantic.rs          semantic tokens, their refresh, and the background syntax pass landing
