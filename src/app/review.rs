@@ -1800,7 +1800,8 @@ impl App {
 /// start or ran out of time (it is then killed and reaped). For the few
 /// short commands that still run on the UI thread. A program just written,
 /// such as a freshly installed `gh`, is waited out while it is "Text file
-/// busy" (#2422), as croft's other `gh` calls do.
+/// busy" (#2422), as croft's other `gh` calls do, and that wait comes out of
+/// the same budget.
 pub(super) fn bounded_output(
     cmd: &mut std::process::Command,
     budget: std::time::Duration,
@@ -1810,7 +1811,14 @@ pub(super) fn bounded_output(
     cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null());
-    let mut child = crate::review_ops::spawn_retrying_busy(cmd).ok()?;
+    let mut child = crate::review_ops::retry_while_busy(
+        || cmd.spawn(),
+        |r| {
+            r.as_ref().is_err_and(crate::review_ops::text_file_busy)
+                && std::time::Instant::now() < deadline
+        },
+    )
+    .ok()?;
     let mut stdout = child.stdout.take()?;
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -1818,7 +1826,9 @@ pub(super) fn bounded_output(
         let _ = stdout.read_to_end(&mut buf);
         let _ = tx.send(buf);
     });
-    let bytes = rx.recv_timeout(budget).ok();
+    let bytes = rx
+        .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+        .ok();
     loop {
         match child.try_wait() {
             Ok(Some(status)) => return bytes.map(|b| (status, b)),
