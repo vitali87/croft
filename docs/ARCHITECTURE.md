@@ -232,6 +232,7 @@ src/
 │   ├── debugger/        the Run and Debug feature files, beside debugger.rs; each file's `//!` doc says what it holds
 │   │   ├── active_file.rs      running and debugging the active file, the adapter picked by its kind
 │   │   ├── adapters.rs         finding lldb-dap, telling a runnable binary, and installing delve
+│   │   ├── breakpoints.rs      line, conditional, hit-count, function and data breakpoints, logpoints, exceptions
 │   │   ├── builds.rs           debug builds: `cargo`, C/C++ and single Rust files, then lldb-dap on the binary
 │   │   ├── compounds.rs        compounds, preLaunchTask waits, postDebugTask and switching sessions
 │   │   ├── configs.rs          Add Configuration and the Select and Start Debugging picker
