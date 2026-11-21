@@ -1,0 +1,1 @@
+refactor: Groundwork for the refactor program (#2062): three doc comments in `debugger.rs` sit above the functions they describe again (`run_active_file`, `debug_end_message` and `launch_resolved_in`), not above `poll_dap`, `PendingLaunchStep` and `launch_resolved_config`, before the file is split into feature files. Nothing changes in use.
