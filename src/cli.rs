@@ -1920,12 +1920,6 @@ fn theme_import(
     Ok(())
 }
 
-/// Resolve a marketplace reference to a theme JSON on disk.
-///
-/// Returns the extracted file and the temporary directory holding it: the
-/// caller keeps that alive until the conversion has read the file, and
-/// dropping it takes the `.vsix` and everything lifted from it with it.
-/// Nothing from the archive outlives this function.
 /// A per-run value for the scratch directory's name. Not a secret and not a
 /// CSPRNG: it only has to be unpredictable enough that another user cannot
 /// pre-create the path, and `create_dir` failing on collision is what
@@ -1938,6 +1932,12 @@ fn scratch_nonce() -> u128 {
         ^ (&scratch_nonce as *const _ as u128)
 }
 
+/// Resolve a marketplace reference to a theme JSON on disk.
+///
+/// Returns the extracted file and the temporary directory holding it: the
+/// caller keeps that alive until the conversion has read the file, and
+/// dropping it takes the `.vsix` and everything lifted from it with it.
+/// Nothing from the archive outlives this function.
 fn fetch_marketplace_theme(
     reference: &str,
     wanted: Option<&str>,
