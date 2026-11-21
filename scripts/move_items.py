@@ -1631,11 +1631,140 @@ CODEQL = Target(
     None,
 )
 
+# What each file split out of src/app/debugger.rs holds, as FILES above.
+DEBUGGER_FILES = {
+    "adapters": (
+        "Finding and installing debug adapters: lldb-dap under each name LLVM ships it as, what\n"
+        "to say when it is missing, whether a file is a runnable binary, and Debug: Install Go\n"
+        "Debugger (delve).",
+        "debug adapter",
+        "finding lldb-dap, telling a runnable binary, and installing delve",
+    ),
+    "python": (
+        "The interpreter a debugged Python program runs under: the project's own (its venv, or\n"
+        "`python3`), the one a launch request or a launch.json config names, Debug Test's, and\n"
+        "the note on one older than attach's floor.",
+        "debuggee Python",
+        "which Python a debugged program runs under, and the note on an old one",
+    ),
+    "debug_test": (
+        "Debug Test: the test at the caret or a named one, the runner for the focused file, its\n"
+        "build (`cargo test --no-run`) and launch under lldb-dap, debugpy or delve, and the\n"
+        "temporary breakpoint on the assertion the last run failed at.",
+        "Debug Test",
+        "Debug Test: the test at the caret or by name, its build, launch and failure breakpoint",
+    ),
+    "builds": (
+        "Debug builds: a launch.json `cargo` config's build, F5's C/C++ build and a single Rust\n"
+        "file's, each on a worker thread, and launching lldb-dap on the binary they make.",
+        "debug build",
+        "debug builds: `cargo`, C/C++ and single Rust files, then lldb-dap on the binary",
+    ),
+    "active_file": (
+        "The active file: Run (how to run a file, in a new terminal) and F5 with no launch\n"
+        "configuration, which picks the adapter by the file's kind: debugpy, delve, js-debug or\n"
+        "lldb-dap.",
+        "active file's run and debug",
+        "running and debugging the active file, the adapter picked by its kind",
+    ),
+    "events": (
+        "The debug sessions' events, drained every frame: stops and the paused line, output, a\n"
+        "session ending (and which one, in a compound) and the message it leaves.",
+        "debug event",
+        "the sessions' events, drained each frame: stops, output and endings",
+    ),
+    "view": (
+        "The Run and Debug view: its keys, the Run or Debug button, the paused-state tree (call\n"
+        "stack, variables), clicks and the row menu with Copy Value and Copy Call Stack,\n"
+        "revealing the view, and how a launch failure shows.",
+        "Run and Debug view",
+        "the view: its keys, button, paused-state tree, clicks, row menu and errors",
+    ),
+    "watches": (
+        "Watch expressions: adding and removing them, evaluating them at each stop, and what\n"
+        "they keep when a session ends.",
+        "watch expression",
+        "watch expressions: adding, removing and evaluating them",
+    ),
+    "console": (
+        "The debug console: its lines, program output, the REPL, mirroring to OUTPUT's Debug\n"
+        "Console channel, and hover-to-evaluate while paused.",
+        "debug console",
+        "the debug console, its REPL and OUTPUT mirror, and hover-to-evaluate",
+    ),
+    "launch": (
+        "Starting a launch: saving unsaved editors first, F5 (start or continue), the selected\n"
+        "configuration, resolving a launch.json configuration and its program, spawning its\n"
+        "adapter (a headless browser when there is no display), and installing the new session.",
+        "debug launch",
+        "F5 and launching a configuration: saving first, resolving, spawning, installing",
+    ),
+    "compounds": (
+        "Compounds and the tasks around a launch: launching a compound's members, parking a\n"
+        "launch behind its `preLaunchTask` until the task ends, `postDebugTask`, a member\n"
+        "ending, and switching between the running sessions.",
+        "compound launch",
+        "compounds, preLaunchTask waits, postDebugTask and switching sessions",
+    ),
+    "configs": (
+        "Launch configurations: Debug: Add Configuration's form, writing the draft to\n"
+        "`.croft/launch.json`, and Debug: Select and Start Debugging's picker.",
+        "launch configuration",
+        "Add Configuration and the Select and Start Debugging picker",
+    ),
+    "breakpoints": (
+        "Every kind of breakpoint: line breakpoints with conditions, hit counts and logpoints,\n"
+        "function and data breakpoints, break on raised exceptions, and sending a file's\n"
+        "breakpoints to the running sessions.",
+        "breakpoint",
+        "line, conditional, hit-count, function and data breakpoints, logpoints, exceptions",
+    ),
+    "breakpoint_list": (
+        "The BREAKPOINTS list in the Run and Debug view: its rows, keeping it current, a click\n"
+        "on one, and removing a breakpoint from it.",
+        "breakpoint list",
+        "the BREAKPOINTS list: its rows, clicks and removal",
+    ),
+    "controls": (
+        "The debug toolbar's controls: continue, pause, step over, into and out, Step Into\n"
+        "Target, Run to Cursor, restart and stop.",
+        "debug control",
+        "continue, pause, stepping, Step Into Target, Run to Cursor, restart and stop",
+    ),
+    "attach": (
+        "Attaching: the process picker for a `${command:pickProcess}` attach and for Debug:\n"
+        "Attach to Python Process, its keys, mouse and drawing, and attaching to the chosen\n"
+        "process.",
+        "attach picker",
+        "the attach process pickers and attaching to the chosen process",
+    ),
+    "inline_values": (
+        "Inline values: the values of the variables on the paused line, shown after them in the\n"
+        "editor, cleared and toggled.",
+        "inline value",
+        "inline values beside the paused lines",
+    ),
+}
+
+DEBUGGER = Target(
+    "debugger", "scripts/split_debugger_manifest.tsv", "src/app/debugger.rs", "src/app/debugger",
+    DEBUGGER_FILES,
+    Tree(
+        "│   ├── debugger.rs ",
+        "│   ├── debugger/        the Run and Debug feature files, beside debugger.rs; "
+        "each file's `//!` doc says what it holds",
+        "│   │   ├── ", 19,
+    ),
+    "debugger-",
+    # Its tests are already their own file, src/app/tests/debug.rs.
+    None,
+)
+
 TARGETS = {
     t.name: t
     for t in (
         APP, EDITOR, LSP, TERMINAL, GIT, REMOTE, SEARCH, SESSION_HOST, PAIR, SOURCE_CONTROL,
-        CLI, CODEQL,
+        CLI, CODEQL, DEBUGGER,
     )
 }
 
