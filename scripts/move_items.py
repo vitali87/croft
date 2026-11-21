@@ -37,7 +37,10 @@ the glue the build asks for, until both are clean:
 
 - an item used outside the target's module (as `crate::app::name`) is
   private through the glob, so mod.rs re-exports it by name at the item's
-  own visibility;
+  own visibility; so is one named bare where a file above globs mod.rs
+  (src/app/mod.rs's `use debugger::*;` for src/app/debugger.rs), which
+  mod.rs's own private `use <file>::*;` does not pass on, the re-export
+  spelled to reach what the item reaches;
 - a `use <file>::*;` that only the tests need gets `#[cfg(test)]` (and one
   only the app needs, `#[cfg(not(test))]`); one nothing needs goes.
 
@@ -1628,11 +1631,140 @@ CODEQL = Target(
     None,
 )
 
+# What each file split out of src/app/debugger.rs holds, as FILES above.
+DEBUGGER_FILES = {
+    "adapters": (
+        "Finding and installing debug adapters: lldb-dap under each name LLVM ships it as, what\n"
+        "to say when it is missing, whether a file is a runnable binary, and Debug: Install Go\n"
+        "Debugger (delve).",
+        "debug adapter",
+        "finding lldb-dap, telling a runnable binary, and installing delve",
+    ),
+    "python": (
+        "The interpreter a debugged Python program runs under: the project's own (its venv, or\n"
+        "`python3`), the one a launch request or a launch.json config names, Debug Test's, and\n"
+        "the note on one older than attach's floor.",
+        "debuggee Python",
+        "which Python a debugged program runs under, and the note on an old one",
+    ),
+    "debug_test": (
+        "Debug Test: the test at the caret or a named one, the runner for the focused file, its\n"
+        "build (`cargo test --no-run`) and launch under lldb-dap, debugpy or delve, and the\n"
+        "temporary breakpoint on the assertion the last run failed at.",
+        "Debug Test",
+        "Debug Test: the test at the caret or by name, its build, launch and failure breakpoint",
+    ),
+    "builds": (
+        "Debug builds: a launch.json `cargo` config's build, F5's C/C++ build and a single Rust\n"
+        "file's, each on a worker thread, and launching lldb-dap on the binary they make.",
+        "debug build",
+        "debug builds: `cargo`, C/C++ and single Rust files, then lldb-dap on the binary",
+    ),
+    "active_file": (
+        "The active file: Run (how to run a file, in a new terminal) and F5 with no launch\n"
+        "configuration, which picks the adapter by the file's kind: debugpy, delve, js-debug or\n"
+        "lldb-dap.",
+        "active file's run and debug",
+        "running and debugging the active file, the adapter picked by its kind",
+    ),
+    "events": (
+        "The debug sessions' events, drained every frame: stops and the paused line, output, a\n"
+        "session ending (and which one, in a compound) and the message it leaves.",
+        "debug event",
+        "the sessions' events, drained each frame: stops, output and endings",
+    ),
+    "view": (
+        "The Run and Debug view: its keys, the Run or Debug button, the paused-state tree (call\n"
+        "stack, variables), clicks and the row menu with Copy Value and Copy Call Stack,\n"
+        "revealing the view, and how a launch failure shows.",
+        "Run and Debug view",
+        "the view: its keys, button, paused-state tree, clicks, row menu and errors",
+    ),
+    "watches": (
+        "Watch expressions: adding and removing them, evaluating them at each stop, and what\n"
+        "they keep when a session ends.",
+        "watch expression",
+        "watch expressions: adding, removing and evaluating them",
+    ),
+    "console": (
+        "The debug console: its lines, program output, the REPL, mirroring to OUTPUT's Debug\n"
+        "Console channel, and hover-to-evaluate while paused.",
+        "debug console",
+        "the debug console, its REPL and OUTPUT mirror, and hover-to-evaluate",
+    ),
+    "launch": (
+        "Starting a launch: saving unsaved editors first, F5 (start or continue), the selected\n"
+        "configuration, resolving a launch.json configuration and its program, spawning its\n"
+        "adapter (a headless browser when there is no display), and installing the new session.",
+        "debug launch",
+        "F5 and launching a configuration: saving first, resolving, spawning, installing",
+    ),
+    "compounds": (
+        "Compounds and the tasks around a launch: launching a compound's members, parking a\n"
+        "launch behind its `preLaunchTask` until the task ends, `postDebugTask`, a member\n"
+        "ending, and switching between the running sessions.",
+        "compound launch",
+        "compounds, preLaunchTask waits, postDebugTask and switching sessions",
+    ),
+    "configs": (
+        "Launch configurations: Debug: Add Configuration's form, writing the draft to\n"
+        "`.croft/launch.json`, and Debug: Select and Start Debugging's picker.",
+        "launch configuration",
+        "Add Configuration and the Select and Start Debugging picker",
+    ),
+    "breakpoints": (
+        "Every kind of breakpoint: line breakpoints with conditions, hit counts and logpoints,\n"
+        "function and data breakpoints, break on raised exceptions, and sending a file's\n"
+        "breakpoints to the running sessions.",
+        "breakpoint",
+        "line, conditional, hit-count, function and data breakpoints, logpoints, exceptions",
+    ),
+    "breakpoint_list": (
+        "The BREAKPOINTS list in the Run and Debug view: its rows, keeping it current, a click\n"
+        "on one, and removing a breakpoint from it.",
+        "breakpoint list",
+        "the BREAKPOINTS list: its rows, clicks and removal",
+    ),
+    "controls": (
+        "The debug toolbar's controls: continue, pause, step over, into and out, Step Into\n"
+        "Target, Run to Cursor, restart and stop.",
+        "debug control",
+        "continue, pause, stepping, Step Into Target, Run to Cursor, restart and stop",
+    ),
+    "attach": (
+        "Attaching: the process picker for a `${command:pickProcess}` attach and for Debug:\n"
+        "Attach to Python Process, its keys, mouse and drawing, and attaching to the chosen\n"
+        "process.",
+        "attach picker",
+        "the attach process pickers and attaching to the chosen process",
+    ),
+    "inline_values": (
+        "Inline values: the values of the variables on the paused line, shown after them in the\n"
+        "editor, cleared and toggled.",
+        "inline value",
+        "inline values beside the paused lines",
+    ),
+}
+
+DEBUGGER = Target(
+    "debugger", "scripts/split_debugger_manifest.tsv", "src/app/debugger.rs", "src/app/debugger",
+    DEBUGGER_FILES,
+    Tree(
+        "│   ├── debugger.rs ",
+        "│   ├── debugger/        the Run and Debug feature files, beside debugger.rs; "
+        "each file's `//!` doc says what it holds",
+        "│   │   ├── ", 19,
+    ),
+    "debugger-",
+    # Its tests are already their own file, src/app/tests/debug.rs.
+    None,
+)
+
 TARGETS = {
     t.name: t
     for t in (
         APP, EDITOR, LSP, TERMINAL, GIT, REMOTE, SEARCH, SESSION_HOST, PAIR, SOURCE_CONTROL,
-        CLI, CODEQL,
+        CLI, CODEQL, DEBUGGER,
     )
 }
 
@@ -1654,6 +1786,11 @@ class BuildError(Exception):
 PRIVATE_IMPORT = re.compile(r"^[a-z]+(?: [a-z]+)* import `(\w+)` is private$")
 UNUSED_GLOB = re.compile(r"^unused import: `(\w+)::\*`$")
 UNUSED_ONE = re.compile(r"^unused import: `(\w+)::(\w+)`$")
+# A name code outside a nested split found through its parent's glob, bare
+# or as `super::name`, which the split file's own private `use <file>::*;` no
+# longer passes on.
+NOT_FOUND = re.compile(r"^(?:cannot find [a-z ,]+ `(\w+)` in (?:this scope|module `[\w:]+`)"
+                       r"|failed to resolve: use of undeclared type `(\w+)`)$")
 
 
 def item_key(it):
@@ -2102,6 +2239,23 @@ def read_errors(mode, status, stdout, stderr):
     return sorted(set(errors))
 
 
+def reexport_spelling(vis, file, paths=None):
+    """How the split file spells a re-export of an item of visibility `vis`
+    in its feature file `file`, so the re-export reaches what the item
+    reaches, or None when that is no further than the split file itself and
+    no user outside it could have reached the item. `paths` is the split
+    file and its folder; without them a `pub` or `pub(crate)` item keeps its
+    spelling and nothing else is re-exported."""
+    if paths is None:
+        return vis if vis in ("pub", "pub(crate)") else None
+    source, folder = paths
+    split = cpm.module_of(source)
+    reach = cpm.scope(re.sub(r"\s+", "", vis), cpm.module_of(f"{folder}/{file}.rs"))
+    if split is None or reach is None or len(reach) >= len(split) or split[:len(reach)] != reach:
+        return None
+    return cpm.shown(cpm.spelled(reach, split))
+
+
 def glob_line(lines, file):
     """The line of `use <file>::*;` in mod.rs, or None."""
     return next((n for n, ln in enumerate(lines) if ln == f"use {file}::*;"), None)
@@ -2109,7 +2263,7 @@ def glob_line(lines, file):
 
 def reexport_line(lines, file, name):
     """The line of a re-export `<vis> use <file>::<name>;` in mod.rs, or None."""
-    pat = re.compile(rf"^pub(\(\w+\))? use {file}::{name};$")
+    pat = re.compile(rf"^pub(\([^)]*\))? use {file}::{name};$")
     return next((n for n, ln in enumerate(lines) if pat.match(ln)), None)
 
 
@@ -2126,14 +2280,23 @@ def item_cfgs(text):
     return cfgs
 
 
-def fix_glue(lines, app, tests, homes, scope="app"):
+def fix_glue(lines, app, tests, homes, scope="app", paths=None):
     """mod.rs `lines` with the glue the build errors ask for, and what was
     done. `scope` names the module being split, for the messages. `app` and `tests` are the errors of the two builds; `homes` maps a
     moved free item's name to (file, visibility) or (file, visibility,
     cfgs): `cfgs` are the item's own `#[cfg(...)]` lines, which its
     re-export takes too, so a test-only item is re-exported for the tests
-    alone and the app build does not look for it. Raises BuildError when an
-    error is not one this fixes."""
+    alone and the app build does not look for it. `paths` is the split
+    file and the folder its files go to, so a re-export is spelled from
+    the reach the item has in its file; without them only `pub` and
+    `pub(crate)` items, which read the same anywhere, are re-exported.
+    Raises BuildError when an error is not one this fixes.
+
+    An item is re-exported when code outside the split file names it: by a
+    path through the split file's private glob (E0603), or, when the split
+    file sits below another file that globs it (src/app/mod.rs's `use
+    debugger::*;`), by the bare name that glob used to pass on and the
+    split file's own private `use <file>::*;` does not (E0425 and kin)."""
     lines, done, unknown = list(lines), [], []
     private, unused = set(), {"app": set(), "tests": set()}
     unused_one = {"app": set(), "tests": set()}
@@ -2141,6 +2304,8 @@ def fix_glue(lines, app, tests, homes, scope="app"):
         for code, message in errors:
             if code == "E0603" and (m := PRIVATE_IMPORT.match(message)) and m[1] in homes:
                 private.add(m[1])
+            elif (m := NOT_FOUND.match(message)) and (m[1] or m[2]) in homes:
+                private.add(m[1] or m[2])
             elif code == "unused_imports" and (m := UNUSED_GLOB.match(message)) \
                     and glob_line(lines, m[1]) is not None:
                 unused[side].add(m[1])
@@ -2159,14 +2324,16 @@ def fix_glue(lines, app, tests, homes, scope="app"):
     for name in sorted(private):
         file, vis, *rest = homes[name]
         cfgs = list(rest[0]) if rest else []
-        if vis not in ("pub", "pub(crate)"):
-            raise BuildError(f"{name} is used outside {scope} but is {vis or 'private'} in {file}.rs")
+        again = reexport_spelling(vis, file, paths)
+        if again is None:
+            shown = cpm.shown(re.sub(r"\s+", "", vis))
+            raise BuildError(f"{name} is used outside {scope} but is {shown} in {file}.rs")
         at = glob_line(lines, file)
         if at is None:
             at = next(n for n, ln in enumerate(lines) if ln == f"mod {file};")
-        lines[at + 1:at + 1] = cfgs + [f"{vis} use {file}::{name};"]
+        lines[at + 1:at + 1] = cfgs + [f"{again} use {file}::{name};"]
         only = f" only under {', '.join(c[2:-1] for c in cfgs)}" if cfgs else ""
-        done.append(f"re-exported {file}::{name} ({vis}){only}: used outside {scope}")
+        done.append(f"re-exported {file}::{name} ({again}){only}: used outside {scope}")
     for file in sorted(unused["app"] | unused["tests"]):
         at = glob_line(lines, file)
         guarded = at > 0 and lines[at - 1].startswith("#[cfg(")
@@ -2255,7 +2422,7 @@ def settle(root, rows, rounds=5, t=APP, new=None):
         homes = {n: (f, *vis[(f, n)]) for n, f in homes.items() if (f, n) in vis}
         with open(mod_path, encoding="utf-8") as f:
             lines = f.read().split("\n")
-        lines, now = fix_glue(lines, app, tests, homes, t.name)
+        lines, now = fix_glue(lines, app, tests, homes, t.name, (t.source, t.dir))
         with open(mod_path, "w", encoding="utf-8") as f:
             f.write("\n".join(lines))
         subprocess.run(["cargo", "fmt"], cwd=root, check=True)

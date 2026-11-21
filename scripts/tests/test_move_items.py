@@ -497,6 +497,60 @@ class Helpers(unittest.TestCase):
             mi.fix_glue(self.GLUE, errors, [], {"seq": ("commands", "pub(super)")})
         self.assertIn("seq is used outside app but is pub(super) in commands.rs", str(e.exception))
 
+    NESTED = ("src/app/debugger.rs", "src/app/debugger")
+    DEBUGGER_GLUE = ["//! Run and Debug.", "", "use super::*;", "", "mod adapters;",
+                     "use adapters::*;", "", "pub(super) const GRACE: u64 = 250;", ""]
+
+    def test_a_name_a_nested_split_hides_is_re_exported_at_the_same_reach(self):
+        """src/app/mod.rs has `use debugger::*;`, so the app's tests called
+        debugger.rs's `pub(super)` free functions by name. Moved a level down
+        into debugger/adapters.rs, they are found only through debugger.rs's
+        own `use adapters::*;`, which is private to debugger, so the tests
+        no longer find them (E0425), bare or as `super::name`. debugger.rs
+        re-exports each by name,
+        spelled to reach exactly what the item reaches: `pub(super)` there is
+        the `pub(in crate::app)` the move gave it, and a `pub(crate)` item
+        stays `pub(crate)`."""
+        tests = [("E0425", "cannot find function `lldb_dap_rank` in this scope"),
+                 ("E0412", "cannot find type `Probe` in this scope"),
+                 ("E0433", "failed to resolve: use of undeclared type `Probe`"),
+                 # A test in app/tests/debug.rs calling `super::debuggee_python`.
+                 ("E0425", "cannot find function `debuggee_python` in module `super`")]
+        homes = {"lldb_dap_rank": ("adapters", "pub(in crate::app)"),
+                 "Probe": ("adapters", "pub(crate)"),
+                 "debuggee_python": ("adapters", "pub(in crate::app)")}
+        lines, done = mi.fix_glue(self.DEBUGGER_GLUE, [], tests, homes, "debugger", self.NESTED)
+        self.assertEqual(lines[5:9], ["use adapters::*;", "pub(super) use adapters::lldb_dap_rank;",
+                                      "pub(super) use adapters::debuggee_python;",
+                                      "pub(crate) use adapters::Probe;"])
+        self.assertEqual(done, [
+            "re-exported adapters::Probe (pub(crate)): used outside debugger",
+            "re-exported adapters::debuggee_python (pub(super)): used outside debugger",
+            "re-exported adapters::lldb_dap_rank (pub(super)): used outside debugger",
+        ])
+
+    def test_a_hidden_name_that_reaches_only_its_split_file_stops_the_tool(self):
+        """`pub(super)` in debugger/adapters.rs reaches only debugger: a
+        re-export cannot give users outside it more than the item has."""
+        tests = [("E0425", "cannot find function `probe` in this scope")]
+        with self.assertRaises(mi.BuildError) as e:
+            mi.fix_glue(self.DEBUGGER_GLUE, [], tests, {"probe": ("adapters", "pub(super)")},
+                        "debugger", self.NESTED)
+        self.assertIn("probe is used outside debugger but is pub(super) in adapters.rs",
+                      str(e.exception))
+
+    def test_a_re_export_of_any_spelling_is_found_again(self):
+        """The re-exports a nested split writes (`pub(super)`, `pub(in ...)`)
+        are found again when the app build then finds one unused, so it gets
+        `#[cfg(test)]` like any other."""
+        for vis in ("pub(super)", "pub(in crate::app)", "pub(crate)", "pub"):
+            glue = ["mod adapters;", "use adapters::*;", f"{vis} use adapters::lldb_dap_rank;"]
+            with self.subTest(vis=vis):
+                self.assertEqual(mi.reexport_line(glue, "adapters", "lldb_dap_rank"), 2)
+                app = [("unused_imports", "unused import: `adapters::lldb_dap_rank`")]
+                lines, _ = mi.fix_glue(glue, app, [], {}, "debugger", self.NESTED)
+                self.assertEqual(lines[2:], ["#[cfg(test)]", f"{vis} use adapters::lldb_dap_rank;"])
+
     @staticmethod
     def message(level, text, code=None):
         body = {"level": level, "message": text, "code": {"code": code} if code else None}
@@ -760,8 +814,8 @@ class OtherTargets(unittest.TestCase):
     def test_every_target_names_its_own_manifest_file_and_folder(self):
         self.assertEqual(
             sorted(mi.TARGETS),
-            ["app", "cli", "codeql", "editor", "git", "lsp", "pair", "remote", "search",
-             "session_host", "source_control", "terminal"],
+            ["app", "cli", "codeql", "debugger", "editor", "git", "lsp", "pair", "remote",
+             "search", "session_host", "source_control", "terminal"],
         )
         for t in mi.TARGETS.values():
             with self.subTest(target=t.name):

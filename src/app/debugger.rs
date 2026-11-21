@@ -142,10 +142,6 @@ pub(super) fn push_variable_rows(
 /// recognise it as an orphan. See [`crate::dap::reaper`].
 pub(super) const REAPER_TEARDOWN_GRACE_MS: u64 = 250;
 
-/// The end-of-session feedback line. When breakpoints were set but the program
-/// exited without ever stopping, say so explicitly — that is the common "I set a
-/// breakpoint and nothing happened" confusion (e.g. running a library module
-/// whose breakpointed code is never called). Otherwise a plain end message.
 /// What a parked launch does once its task exits 0.
 ///
 /// Two shapes, because a compound's task and a config's task are different
@@ -358,6 +354,10 @@ pub(super) fn pending_abort_reason(
     None
 }
 
+/// The end-of-session feedback line. When breakpoints were set but the program
+/// exited without ever stopping, say so explicitly — that is the common "I set a
+/// breakpoint and nothing happened" confusion (e.g. running a library module
+/// whose breakpointed code is never called). Otherwise a plain end message.
 pub(super) fn debug_end_message(had_breakpoints: bool, ever_stopped: bool) -> &'static str {
     if had_breakpoints && !ever_stopped {
         "Program exited without hitting a breakpoint"
@@ -898,9 +898,6 @@ impl App {
         })
     }
 
-    /// Spawn a fresh PTY at the resolved working directory, seed it with the
-    /// runner command for the active editor tab's file, and focus the
-    /// terminal pane so the user sees output immediately.
     /// Drain the debug session each frame. Returns true if anything changed
     /// (so the frame loop redraws). Mirrors the paused location into the
     /// editor's stop-line, surfaces program output + stop reasons, and tears
@@ -2902,8 +2899,6 @@ impl App {
             .collect()
     }
 
-    /// Spawn the adapter for a resolved launch.json configuration and hand it
-    /// the built launch/attach request.
     /// Launch a resolved config, replacing whatever was running.
     pub(super) fn launch_resolved_config(&mut self, rc: crate::dap::configs::ResolvedConfig) {
         self.launch_resolved_in(rc, LaunchSlot::Replace);
@@ -2914,6 +2909,8 @@ impl App {
         self.launch_resolved_in(rc, LaunchSlot::Add);
     }
 
+    /// Spawn the adapter for a resolved launch.json configuration and hand it
+    /// the built launch/attach request.
     pub(super) fn launch_resolved_in(
         &mut self,
         mut rc: crate::dap::configs::ResolvedConfig,
@@ -4485,6 +4482,9 @@ impl App {
         self.refresh_debug_panel();
     }
 
+    /// Spawn a fresh PTY at the resolved working directory, seed it with the
+    /// runner command for the active editor tab's file, and focus the
+    /// terminal pane so the user sees output immediately.
     pub fn run_active_file(&mut self) {
         if self.editor.path.is_none() {
             self.run_debug.feedback = Some(String::from("Open a file first"));
