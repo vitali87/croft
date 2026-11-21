@@ -210,6 +210,7 @@ src/
 │   ├── codeql.rs        the CodeQL side bar: databases, query history and logs, running queries, suites and packs, result viewers, AST and CFG, the model editor, the run queue, variant analysis, and downloading and updating the CLI
 │   ├── codeql/          the CodeQL side bar's feature files, beside codeql.rs; each file's `//!` doc says what it holds
 │   │   ├── cli_install.rs      the CodeQL CLI: which `codeql` runs, its version, downloading it and checking for updates
+│   │   ├── contextual.rs       contextual queries: View AST and View CFG
 │   │   ├── database_sources.rs adding a database from a folder, an archive, a URL or GitHub, and its source to the workspace
 │   │   ├── databases.rs        the database list: removing, renaming, sorting, upgrading, deleting unused copies, and where databases are kept
 │   │   ├── history.rs          the query history: its entries, their queries, logs and results folders
