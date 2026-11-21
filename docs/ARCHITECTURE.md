@@ -234,6 +234,7 @@ src/
 │   │   ├── adapters.rs         finding lldb-dap, telling a runnable binary, and installing delve
 │   │   ├── builds.rs           debug builds: `cargo`, C/C++ and single Rust files, then lldb-dap on the binary
 │   │   ├── compounds.rs        compounds, preLaunchTask waits, postDebugTask and switching sessions
+│   │   ├── configs.rs          Add Configuration and the Select and Start Debugging picker
 │   │   ├── console.rs          the debug console, its REPL and OUTPUT mirror, and hover-to-evaluate
 │   │   ├── debug_test.rs       Debug Test: the test at the caret or by name, its build, launch and failure breakpoint
 │   │   ├── events.rs           the sessions' events, drained each frame: stops, output and endings
