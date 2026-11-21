@@ -264,6 +264,7 @@ src/
 │   │   ├── breadcrumbs.rs       breadcrumbs, their pickers, and the sticky-scroll headers
 │   │   ├── capabilities.rs      the active file's language and which features its server supports
 │   │   ├── code_actions.rs      Quick Fix: requesting, picking, resolving and applying code actions
+│   │   ├── code_lens.rs         CodeLens: requesting, landing, running and toggling lenses
 │   │   ├── decorations.rs       document links, folding ranges, colors and Change Color Presentation
 │   │   ├── format.rs            Format Document and Selection, Prettier, and format-on-save
 │   │   ├── go_to_symbol.rs      Go to Symbol in Editor: the picker, its keys, mouse and drawing
