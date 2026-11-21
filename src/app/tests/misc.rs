@@ -246,6 +246,69 @@ fn bounded_output_gives_up_on_a_command_that_hangs() {
     assert_eq!(out, b"42");
 }
 
+/// Open `path` for writing as a hanging script and hold it open for `hold`,
+/// so starting it fails with "Text file busy" until then.
+fn busy_script(path: &std::path::Path, hold: std::time::Duration) -> std::thread::JoinHandle<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut writer = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o755)
+        .open(path)
+        .unwrap();
+    writer.write_all(b"#!/bin/sh\nsleep 30\n").unwrap();
+    writer.flush().unwrap();
+    std::thread::spawn(move || {
+        std::thread::sleep(hold);
+        drop(writer);
+    })
+}
+
+/// #2422: waiting out a "Text file busy" program counts against the budget.
+/// A program busy past the budget is given up on at the budget, not after
+/// the retries run out, and one that comes free late gets only what is left
+/// of the budget to answer, not the whole budget again.
+#[test]
+fn bounded_output_counts_a_busy_program_against_its_budget() {
+    use std::time::{Duration, Instant};
+    let tmp = tempfile::tempdir().unwrap();
+
+    let always_busy = tmp.path().join("always-busy");
+    let release = busy_script(&always_busy, Duration::from_secs(2));
+    let started = Instant::now();
+    assert!(
+        bounded_output(
+            &mut std::process::Command::new(&always_busy),
+            Duration::from_millis(50)
+        )
+        .is_none()
+    );
+    let waited = started.elapsed();
+    assert!(
+        waited < Duration::from_millis(400),
+        "a 50 ms budget waited {waited:?} on a busy program"
+    );
+    release.join().unwrap();
+
+    let late = tmp.path().join("late");
+    let release = busy_script(&late, Duration::from_millis(400));
+    let started = Instant::now();
+    assert!(
+        bounded_output(
+            &mut std::process::Command::new(&late),
+            Duration::from_millis(450)
+        )
+        .is_none()
+    );
+    let waited = started.elapsed();
+    assert!(
+        waited < Duration::from_millis(700),
+        "a 450 ms budget waited {waited:?} on a program busy for 400 ms"
+    );
+    release.join().unwrap();
+}
+
 #[test]
 fn cwd_of_pid_on_self_returns_a_directory_under_tempdir() {
     // The harness runs each test from the crate root by default, but
