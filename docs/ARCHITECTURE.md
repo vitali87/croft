@@ -238,6 +238,7 @@ src/
 │   │   ├── compounds.rs        compounds, preLaunchTask waits, postDebugTask and switching sessions
 │   │   ├── configs.rs          Add Configuration and the Select and Start Debugging picker
 │   │   ├── console.rs          the debug console, its REPL and OUTPUT mirror, and hover-to-evaluate
+│   │   ├── controls.rs         continue, pause, stepping, Step Into Target, Run to Cursor, restart and stop
 │   │   ├── debug_test.rs       Debug Test: the test at the caret or by name, its build, launch and failure breakpoint
 │   │   ├── events.rs           the sessions' events, drained each frame: stops, output and endings
 │   │   ├── launch.rs           F5 and launching a configuration: saving first, resolving, spawning, installing
