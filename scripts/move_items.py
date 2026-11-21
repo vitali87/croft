@@ -37,7 +37,10 @@ the glue the build asks for, until both are clean:
 
 - an item used outside the target's module (as `crate::app::name`) is
   private through the glob, so mod.rs re-exports it by name at the item's
-  own visibility;
+  own visibility; so is one named bare where a file above globs mod.rs
+  (src/app/mod.rs's `use debugger::*;` for src/app/debugger.rs), which
+  mod.rs's own private `use <file>::*;` does not pass on, the re-export
+  spelled to reach what the item reaches;
 - a `use <file>::*;` that only the tests need gets `#[cfg(test)]` (and one
   only the app needs, `#[cfg(not(test))]`); one nothing needs goes.
 
@@ -1654,6 +1657,11 @@ class BuildError(Exception):
 PRIVATE_IMPORT = re.compile(r"^[a-z]+(?: [a-z]+)* import `(\w+)` is private$")
 UNUSED_GLOB = re.compile(r"^unused import: `(\w+)::\*`$")
 UNUSED_ONE = re.compile(r"^unused import: `(\w+)::(\w+)`$")
+# A name code outside a nested split found through its parent's glob, bare
+# or as `super::name`, which the split file's own private `use <file>::*;` no
+# longer passes on.
+NOT_FOUND = re.compile(r"^(?:cannot find [a-z ,]+ `(\w+)` in (?:this scope|module `[\w:]+`)"
+                       r"|failed to resolve: use of undeclared type `(\w+)`)$")
 
 
 def item_key(it):
@@ -2102,6 +2110,23 @@ def read_errors(mode, status, stdout, stderr):
     return sorted(set(errors))
 
 
+def reexport_spelling(vis, file, paths=None):
+    """How the split file spells a re-export of an item of visibility `vis`
+    in its feature file `file`, so the re-export reaches what the item
+    reaches, or None when that is no further than the split file itself and
+    no user outside it could have reached the item. `paths` is the split
+    file and its folder; without them a `pub` or `pub(crate)` item keeps its
+    spelling and nothing else is re-exported."""
+    if paths is None:
+        return vis if vis in ("pub", "pub(crate)") else None
+    source, folder = paths
+    split = cpm.module_of(source)
+    reach = cpm.scope(re.sub(r"\s+", "", vis), cpm.module_of(f"{folder}/{file}.rs"))
+    if split is None or reach is None or len(reach) >= len(split) or split[:len(reach)] != reach:
+        return None
+    return cpm.shown(cpm.spelled(reach, split))
+
+
 def glob_line(lines, file):
     """The line of `use <file>::*;` in mod.rs, or None."""
     return next((n for n, ln in enumerate(lines) if ln == f"use {file}::*;"), None)
@@ -2109,7 +2134,7 @@ def glob_line(lines, file):
 
 def reexport_line(lines, file, name):
     """The line of a re-export `<vis> use <file>::<name>;` in mod.rs, or None."""
-    pat = re.compile(rf"^pub(\(\w+\))? use {file}::{name};$")
+    pat = re.compile(rf"^pub(\([^)]*\))? use {file}::{name};$")
     return next((n for n, ln in enumerate(lines) if pat.match(ln)), None)
 
 
@@ -2126,14 +2151,23 @@ def item_cfgs(text):
     return cfgs
 
 
-def fix_glue(lines, app, tests, homes, scope="app"):
+def fix_glue(lines, app, tests, homes, scope="app", paths=None):
     """mod.rs `lines` with the glue the build errors ask for, and what was
     done. `scope` names the module being split, for the messages. `app` and `tests` are the errors of the two builds; `homes` maps a
     moved free item's name to (file, visibility) or (file, visibility,
     cfgs): `cfgs` are the item's own `#[cfg(...)]` lines, which its
     re-export takes too, so a test-only item is re-exported for the tests
-    alone and the app build does not look for it. Raises BuildError when an
-    error is not one this fixes."""
+    alone and the app build does not look for it. `paths` is the split
+    file and the folder its files go to, so a re-export is spelled from
+    the reach the item has in its file; without them only `pub` and
+    `pub(crate)` items, which read the same anywhere, are re-exported.
+    Raises BuildError when an error is not one this fixes.
+
+    An item is re-exported when code outside the split file names it: by a
+    path through the split file's private glob (E0603), or, when the split
+    file sits below another file that globs it (src/app/mod.rs's `use
+    debugger::*;`), by the bare name that glob used to pass on and the
+    split file's own private `use <file>::*;` does not (E0425 and kin)."""
     lines, done, unknown = list(lines), [], []
     private, unused = set(), {"app": set(), "tests": set()}
     unused_one = {"app": set(), "tests": set()}
@@ -2141,6 +2175,8 @@ def fix_glue(lines, app, tests, homes, scope="app"):
         for code, message in errors:
             if code == "E0603" and (m := PRIVATE_IMPORT.match(message)) and m[1] in homes:
                 private.add(m[1])
+            elif (m := NOT_FOUND.match(message)) and (m[1] or m[2]) in homes:
+                private.add(m[1] or m[2])
             elif code == "unused_imports" and (m := UNUSED_GLOB.match(message)) \
                     and glob_line(lines, m[1]) is not None:
                 unused[side].add(m[1])
@@ -2159,14 +2195,16 @@ def fix_glue(lines, app, tests, homes, scope="app"):
     for name in sorted(private):
         file, vis, *rest = homes[name]
         cfgs = list(rest[0]) if rest else []
-        if vis not in ("pub", "pub(crate)"):
-            raise BuildError(f"{name} is used outside {scope} but is {vis or 'private'} in {file}.rs")
+        again = reexport_spelling(vis, file, paths)
+        if again is None:
+            shown = cpm.shown(re.sub(r"\s+", "", vis))
+            raise BuildError(f"{name} is used outside {scope} but is {shown} in {file}.rs")
         at = glob_line(lines, file)
         if at is None:
             at = next(n for n, ln in enumerate(lines) if ln == f"mod {file};")
-        lines[at + 1:at + 1] = cfgs + [f"{vis} use {file}::{name};"]
+        lines[at + 1:at + 1] = cfgs + [f"{again} use {file}::{name};"]
         only = f" only under {', '.join(c[2:-1] for c in cfgs)}" if cfgs else ""
-        done.append(f"re-exported {file}::{name} ({vis}){only}: used outside {scope}")
+        done.append(f"re-exported {file}::{name} ({again}){only}: used outside {scope}")
     for file in sorted(unused["app"] | unused["tests"]):
         at = glob_line(lines, file)
         guarded = at > 0 and lines[at - 1].startswith("#[cfg(")
@@ -2255,7 +2293,7 @@ def settle(root, rows, rounds=5, t=APP, new=None):
         homes = {n: (f, *vis[(f, n)]) for n, f in homes.items() if (f, n) in vis}
         with open(mod_path, encoding="utf-8") as f:
             lines = f.read().split("\n")
-        lines, now = fix_glue(lines, app, tests, homes, t.name)
+        lines, now = fix_glue(lines, app, tests, homes, t.name, (t.source, t.dir))
         with open(mod_path, "w", encoding="utf-8") as f:
             f.write("\n".join(lines))
         subprocess.run(["cargo", "fmt"], cwd=root, check=True)
