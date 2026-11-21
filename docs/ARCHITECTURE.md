@@ -270,6 +270,7 @@ src/
 │   │   ├── navigation.rs        Go to Definition and its kin: requests, jumps and the multi-location picker
 │   │   ├── outline.rs           the OUTLINE: syntax and server symbols, and the secondary side bar
 │   │   ├── peek.rs              Peek Definition and Peek References: the popup, its excerpt and stepping
+│   │   ├── rename.rs            Rename Symbol: the prompt, prepare-rename and landing the reply
 │   │   ├── rust_analyzer.rs     rust-analyzer's `Rust:` commands: sending them and acting on the answers
 │   │   ├── selection.rs         Expand and Shrink Selection, and occurrence highlights
 │   │   ├── semantic.rs          semantic tokens, their refresh, and the background syntax pass landing
