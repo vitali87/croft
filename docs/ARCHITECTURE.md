@@ -212,6 +212,7 @@ src/
 │   │   ├── cli_install.rs      the CodeQL CLI: which `codeql` runs, its version, downloading it and checking for updates
 │   │   ├── database_sources.rs adding a database from a folder, an archive, a URL or GitHub, and its source to the workspace
 │   │   ├── databases.rs        the database list: removing, renaming, sorting, upgrading, deleting unused copies, and where databases are kept
+│   │   ├── history.rs          the query history: its entries, their queries, logs and results folders
 │   │   ├── test_runs.rs        CodeQL: Run Tests through the Testing view, and Accept Test Output
 │   ├── commands.rs      `run_command`, the Command Palette, the Extensions view, extension commands (MCP tools, viewers) and Show Memory Usage
 │   ├── completion.rs    the completion popup, auto-imports, snippets, signature help, ghost-text suggestions and Emmet
