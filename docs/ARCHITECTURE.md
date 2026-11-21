@@ -223,6 +223,7 @@ src/
 │   │   ├── run.rs              running a query, quick evaluation and Debug Query, cancelling and recording a run
 │   │   ├── test_runs.rs        CodeQL: Run Tests through the Testing view, and Accept Test Output
 │   │   ├── variant_repos.rs    variant analysis targets: the controller, lists, repositories, owners and Code Search
+│   │   ├── variant_runs.rs     variant analysis runs: submitting, following, fetching and exporting results
 │   ├── commands.rs      `run_command`, the Command Palette, the Extensions view, extension commands (MCP tools, viewers) and Show Memory Usage
 │   ├── completion.rs    the completion popup, auto-imports, snippets, signature help, ghost-text suggestions and Emmet
 │   ├── cursor_blink.rs  caret blink timing
