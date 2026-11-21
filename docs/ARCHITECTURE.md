@@ -214,6 +214,7 @@ src/
 │   │   ├── databases.rs        the database list: removing, renaming, sorting, upgrading, deleting unused copies, and where databases are kept
 │   │   ├── history.rs          the query history: its entries, their queries, logs and results folders
 │   │   ├── logs.rs             a run's evaluator and query logs, the log viewer, and Compare Performance
+│   │   ├── queries.rs          the workspace's queries: finding and creating them, Quick Query, query help
 │   │   ├── results.rs          a run's results: result sets, the alert and raw views, Compare Results, Export Results
 │   │   ├── test_runs.rs        CodeQL: Run Tests through the Testing view, and Accept Test Output
 │   ├── commands.rs      `run_command`, the Command Palette, the Extensions view, extension commands (MCP tools, viewers) and Show Memory Usage
