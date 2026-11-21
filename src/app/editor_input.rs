@@ -3153,11 +3153,13 @@ pub(super) fn is_plain_letter(key: KeyEvent, letter: char) -> bool {
 }
 
 /// The multi-caret motion `key` asks for when `multi_cursor_persist` is on,
-/// and whether Shift extends the selection: arrows, Ctrl+Left/Right
-/// word-wise, Home and End. Chords that mean something else on the way in —
-/// Alt+Up/Down moves a line, Cmd+Alt adds a caret, Shift+Alt+Left/Right
-/// grows a selection, Cmd+Home/End jumps to the file's ends — are left to
-/// their own handlers, so the preference only ever takes plain movement.
+/// and whether Shift extends the selection: arrows, Alt/Ctrl+Left/Right
+/// word-wise (Alt is the word modifier on macOS and Linux, as in the
+/// single-caret path), Home and End. Chords that mean something else on the
+/// way in — Alt+Up/Down moves a line, Cmd+Alt adds a caret,
+/// Shift+Alt+Left/Right grows a selection, Cmd+Home/End jumps to the file's
+/// ends — are left to their own handlers, so the preference only ever takes
+/// plain movement.
 fn multi_caret_motion(key: KeyEvent) -> Option<(crate::widgets::editor::CaretMotion, bool)> {
     use crate::widgets::editor::CaretMotion;
     let shift = key.modifiers.contains(KeyModifiers::SHIFT);
@@ -3169,16 +3171,16 @@ fn multi_caret_motion(key: KeyEvent) -> Option<(crate::widgets::editor::CaretMot
     match key.code {
         KeyCode::Up if !ctrl && !alt => Some((CaretMotion::Up, shift)),
         KeyCode::Down if !ctrl && !alt => Some((CaretMotion::Down, shift)),
-        KeyCode::Left if !alt => Some((
-            if ctrl {
+        KeyCode::Left if !(alt && shift) => Some((
+            if alt || ctrl {
                 CaretMotion::WordLeft
             } else {
                 CaretMotion::Left
             },
             shift,
         )),
-        KeyCode::Right if !alt => Some((
-            if ctrl {
+        KeyCode::Right if !(alt && shift) => Some((
+            if alt || ctrl {
                 CaretMotion::WordRight
             } else {
                 CaretMotion::Right

@@ -1650,6 +1650,68 @@ fn multi_cursor_enter_keeps_every_carets_indentation() {
     );
 }
 
+/// Alt (Option) is the word modifier for ←/→ on the single-caret path, so a
+/// persisted multi-caret move has to word-step every caret rather than fall
+/// through to the collapse that used to leave just the primary moving.
+#[test]
+fn multi_cursor_alt_arrows_word_step_every_caret() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "m.py", "foo bar\nfoo bar\nfoo bar");
+    app.apply_merged_settings(&crate::prefs::Prefs {
+        multi_cursor_persist: true,
+        ..Default::default()
+    });
+    (app.editor.cursor_row, app.editor.cursor_col) = (0, 7);
+    app.editor.carets = vec![
+        crate::widgets::editor::EditorSelection::new(1, 7),
+        crate::widgets::editor::EditorSelection::new(2, 7),
+    ];
+    app.handle_key(key(KeyCode::Left, KeyModifiers::ALT))
+        .unwrap();
+    let mut places = vec![(app.editor.cursor_row, app.editor.cursor_col)];
+    places.extend(app.editor.carets.iter().map(|c| c.head));
+    assert_eq!(
+        places,
+        vec![(0, 4), (1, 4), (2, 4)],
+        "Alt+Left steps every caret one word left"
+    );
+    app.handle_key(key(KeyCode::Right, KeyModifiers::ALT))
+        .unwrap();
+    let mut places = vec![(app.editor.cursor_row, app.editor.cursor_col)];
+    places.extend(app.editor.carets.iter().map(|c| c.head));
+    assert_eq!(
+        places,
+        vec![(0, 7), (1, 7), (2, 7)],
+        "Alt+Right steps every caret one word right"
+    );
+    app.handle_key(key(KeyCode::Left, KeyModifiers::CONTROL))
+        .unwrap();
+    assert!(
+        app.editor.has_multi_cursor(),
+        "Ctrl word motion keeps every caret too"
+    );
+}
+
+/// Shift+Alt+←/→ is still the smart-select chord: with carets live it
+/// collapses to one and expands, rather than word-moving every caret.
+#[test]
+fn multi_cursor_shift_alt_arrow_still_expands_the_selection() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "m.py", "foo bar\nbaz qux");
+    app.apply_merged_settings(&crate::prefs::Prefs {
+        multi_cursor_persist: true,
+        ..Default::default()
+    });
+    (app.editor.cursor_row, app.editor.cursor_col) = (0, 0);
+    app.editor.carets = vec![crate::widgets::editor::EditorSelection::new(1, 0)];
+    app.handle_key(key(KeyCode::Right, KeyModifiers::ALT | KeyModifiers::SHIFT))
+        .unwrap();
+    assert!(
+        !app.editor.has_multi_cursor(),
+        "smart-select stays a single-caret gesture"
+    );
+}
+
 /// Negative: with the pref off, the first movement still drops every extra
 /// caret and falls through to single-caret handling, as it always has.
 #[test]
