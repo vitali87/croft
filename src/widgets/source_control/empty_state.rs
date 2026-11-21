@@ -206,7 +206,7 @@ impl SourceControlPanel {
 /// How many rows ratatui needs to render `text` as a centered, wrapped
 /// `Paragraph` at `width`. Uses the same word-wrap rules as ratatui itself
 /// (whitespace-separated, no mid-word breaks unless a word exceeds the
-/// width). Returns at least 1 unless `width == 0`.
+/// width). Returns 0 when `width == 0` or `text` is empty, otherwise at least 1.
 pub(super) fn paragraph_line_count(text: &str, width: u16) -> usize {
     if width == 0 || text.is_empty() {
         return 0;
@@ -219,8 +219,8 @@ pub(super) fn paragraph_line_count(text: &str, width: u16) -> usize {
         if current == 0 {
             current = wlen.min(max);
             if wlen > max {
-                lines += wlen / max;
-                current = wlen % max;
+                lines += (wlen - 1) / max;
+                current = (wlen - 1) % max + 1;
             }
         } else if current + 1 + wlen <= max {
             current += 1 + wlen;
@@ -228,8 +228,8 @@ pub(super) fn paragraph_line_count(text: &str, width: u16) -> usize {
             lines += 1;
             current = wlen.min(max);
             if wlen > max {
-                lines += wlen / max;
-                current = wlen % max;
+                lines += (wlen - 1) / max;
+                current = (wlen - 1) % max + 1;
             }
         }
     }
