@@ -263,6 +263,7 @@ src/
 │   ├── language_servers/ the language server feature files, beside language_servers.rs; each file's `//!` doc says what it holds
 │   │   ├── breadcrumbs.rs       breadcrumbs, their pickers, and the sticky-scroll headers
 │   │   ├── capabilities.rs      the active file's language and which features its server supports
+│   │   ├── code_actions.rs      Quick Fix: requesting, picking, resolving and applying code actions
 │   │   ├── decorations.rs       document links, folding ranges, colors and Change Color Presentation
 │   │   ├── format.rs            Format Document and Selection, Prettier, and format-on-save
 │   │   ├── hierarchy.rs         call and type hierarchies: the requests and the picker of answers
