@@ -22,6 +22,7 @@ src/
 │   ├── git_editor.rs     `croft edit` as git's editor: the user's own sequence editor, and git's own editor when no croft is there
 │   ├── hook.rs           `croft hook`: Claude Code's edit hook itself, and installing or removing it
 │   ├── keys.rs           `croft keys`: printing each key and mouse event as croft receives it
+│   ├── launcher_install.rs `croft install-launcher`: the macOS Croft.app that opens croft in a new Ghostty window
 │   ├── links.rs          `croft open-link` and `croft install-link-handler`: following a link into a session, and handling the links
 │   ├── pair_provider.rs  `croft pair`'s provider flags: `--base-url` alone means ollama, which defaults to its local port
 │   ├── plot.rs           `croft plot`: a chart of stdin, as an inline image or as text, in the theme's colours
