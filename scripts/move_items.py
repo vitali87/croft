@@ -16,12 +16,15 @@ this cuts that PR's items out of mod.rs and writes them into the file:
 - a method goes under a copy of its original `impl` header, so App methods
   sit in `impl App {` blocks and the methods of other types under theirs;
 - items keep their order, and the second PR into a file appends to it;
-- a private item becomes `pub(super)`. That is exactly what it could reach
-  before: everything in `app`, its sibling files and its tests included. So
-  no other file can fail to build for want of it, whatever order the moves
-  and other PRs merge in. An item that is already `pub(super)` or wider keeps
-  its visibility; a method in a trait impl, a macro call and a comment carry
-  none and are copied as they are;
+- each item's visibility is spelled to reach, from its new file, exactly
+  what it reached before: a private item becomes `pub(super)` (everything in
+  `app`, its sibling files and its tests included), a `pub(super)` one
+  moving a level down names the module it reached (`pub(in crate::app)`
+  from src/app/codeql.rs into src/app/codeql/), and `pub(crate)` and `pub`
+  stay. So no other file can fail to build for want of it, whatever order
+  the moves and other PRs merge in, and nothing can see more than before.
+  A method in a trait impl, a macro call and a comment carry no visibility
+  and are copied as they are;
 - an `impl` block that has nothing left in mod.rs goes, with its header;
 - mod.rs gets `mod <file>;` and, when the file has free items (anything
   outside an `impl`), `use <file>::*;`, so code that named them still does.
@@ -1496,11 +1499,140 @@ CLI = Target(
     ),
 )
 
+# The CodeQL side bar's feature files (#2062): (module doc, release-note phrase, docs row).
+# The App methods move a level down, from src/app/codeql.rs into src/app/codeql/, so a
+# `pub(super)` one becomes `pub(in crate::app)`: the same reach, all of `app`.
+CODEQL_FILES = {
+    "test_runs": (
+        "CodeQL: Run Tests and Accept Test Output: every CodeQL test run through the Testing\n"
+        "view's run-all, and a failing test's output made its expected output.",
+        "CodeQL test run",
+        "CodeQL: Run Tests through the Testing view, and Accept Test Output",
+    ),
+    "cli_install": (
+        "The CodeQL CLI: which `codeql` every run uses (settings, `PATH` or croft's own copy),\n"
+        "its version, downloading it into croft's cache, and checking for a newer release.",
+        "CodeQL CLI install",
+        "the CodeQL CLI: which `codeql` runs, its version, downloading it and checking for "
+        "updates",
+    ),
+    "databases": (
+        "The CodeQL database list: the current database, removing, renaming, sorting and\n"
+        "revealing databases, upgrading one to the CLI's schema, deleting unused copies, and\n"
+        "where databases and their sources are kept.",
+        "CodeQL database list",
+        "the database list: removing, renaming, sorting, upgrading, deleting unused copies, "
+        "and where databases are kept",
+    ),
+    "database_sources": (
+        "Adding a CodeQL database: the places one comes from (a folder, an archive, a URL,\n"
+        "GitHub), the database picker, downloading and unpacking it on a worker thread,\n"
+        "registering it, and adding a database's source to the workspace.",
+        "CodeQL database source",
+        "adding a database from a folder, an archive, a URL or GitHub, and its source to the "
+        "workspace",
+    ),
+    "history": (
+        "The CodeQL query history: where runs and their results are kept, listing, removing,\n"
+        "renaming and sorting entries, an entry's query and its text, its evaluator log, and\n"
+        "its results folder.",
+        "CodeQL query history",
+        "the query history: its entries, their queries, logs and results folders",
+    ),
+    "logs": (
+        "A run's logs: the evaluator log as raw JSON, as summary text and in the log viewer,\n"
+        "the query log, and comparing two runs' performance.",
+        "CodeQL log",
+        "a run's evaluator and query logs, the log viewer, and Compare Performance",
+    ),
+    "results": (
+        "A run's results: walking a results table, decoding result sets, choosing a set, the\n"
+        "alert and raw-results views, comparing two runs' results, and exporting them.",
+        "CodeQL result",
+        "a run's results: result sets, the alert and raw views, Compare Results, Export "
+        "Results",
+    ),
+    "queries": (
+        "The workspace's queries: finding them for the side bar on a worker thread, creating\n"
+        "one, a quick query, the query a `.qlref` points at, and previewing a query's help.",
+        "CodeQL query",
+        "the workspace's queries: finding and creating them, Quick Query, query help",
+    ),
+    "packs": (
+        "Suites and packs: installing a pack's dependencies, downloading packs on a worker\n"
+        "thread, running a suite, a pack, or a published pack, and refusing a suite whose\n"
+        "results cannot be shown.",
+        "CodeQL pack",
+        "suites and packs: installing, downloading and running them",
+    ),
+    "run": (
+        "Running a query: the open query on the current database or another, quick\n"
+        "evaluation, Debug Query, running `codeql` and cancelling it, and recording a\n"
+        "finished run in the query history.",
+        "CodeQL query run",
+        "running a query, quick evaluation and Debug Query, cancelling and recording a run",
+    ),
+    "queue": (
+        "The run queue: several queries run one after another (all queries in the workspace,\n"
+        "those in selected files), one query on several databases and their checklist, and\n"
+        "cancelling what waits.",
+        "CodeQL run queue",
+        "the run queue: many queries in turn, or one query on several databases",
+    ),
+    "contextual": (
+        "Contextual queries: what they run on and the queries they resolve, View AST and its\n"
+        "viewer, and View CFG.",
+        "CodeQL AST and CFG",
+        "contextual queries: View AST and View CFG",
+    ),
+    "model_editor": (
+        "The model editor: reading a database's endpoints, modeling an endpoint, and writing\n"
+        "the models to the database's model pack.",
+        "CodeQL model editor",
+        "the model editor: endpoints, their models, and the model pack",
+    ),
+    "variant_repos": (
+        "What variant analysis runs against: its config, the controller repository, lists,\n"
+        "repositories and owners, adding repositories from a Code Search, and opening the\n"
+        "selected one on GitHub.",
+        "variant analysis repository list",
+        "variant analysis targets: the controller, lists, repositories, owners and Code "
+        "Search",
+    ),
+    "variant_runs": (
+        "Variant analysis runs: submitting the open query, following the runs, their logs,\n"
+        "fetching and opening their results, and exporting them.",
+        "variant analysis run",
+        "variant analysis runs: submitting, following, fetching and exporting results",
+    ),
+    "side_bar": (
+        "The CodeQL side bar itself: whether it is available, revealing it, its keys, what\n"
+        "each row does when activated, and keeping the chrome in step when CodeQL is added,\n"
+        "removed, enabled or disabled.",
+        "CodeQL side bar",
+        "the side bar itself: availability, its keys and what each row does",
+    ),
+}
+
+CODEQL = Target(
+    "codeql", "scripts/split_codeql_manifest.tsv", "src/app/codeql.rs", "src/app/codeql",
+    CODEQL_FILES,
+    Tree(
+        "│   ├── codeql.rs ",
+        "│   ├── codeql/          the CodeQL side bar's feature files, beside codeql.rs; "
+        "each file's `//!` doc says what it holds",
+        "│   │   ├── ", 19,
+    ),
+    "codeql-",
+    # Its tests are already their own file, src/app/tests/codeql.rs.
+    None,
+)
+
 TARGETS = {
     t.name: t
     for t in (
         APP, EDITOR, LSP, TERMINAL, GIT, REMOTE, SEARCH, SESSION_HOST, PAIR, SOURCE_CONTROL,
-        CLI,
+        CLI, CODEQL,
     )
 }
 
@@ -1638,11 +1770,29 @@ def emptied(picked, blocks, items):
     return out
 
 
-def widen(lines, it, kinds, clines, ctx):
-    """`lines` of item `it` with `pub(super) ` before its declaration when it
-    is private and can carry a visibility; otherwise as they are."""
+def respell(vis, src=None, dst=None):
+    """The visibility (whitespace-free, as `cpm` keeps it) that lets an item
+    moved from module `src` to module `dst` reach exactly what `vis` reached
+    in `src`: `pub(super)` for a private item moving a level down, and
+    `pub(in crate::app)` for a `pub(super)` one moving from src/app/codeql.rs
+    into src/app/codeql/. Without the two modules (or a reach that cannot be
+    told), a private item gets `pub(super)` and any other keeps `vis`."""
+    reach = cpm.scope(vis, src) if dst is not None else None
+    if reach is None or dst[: len(reach)] != reach:
+        return vis or "pub(super)"
+    return re.sub(r"\s+", "", cpm.spelled(reach, dst))
+
+
+def widen(lines, it, kinds, clines, ctx, src=None, dst=None):
+    """`lines` of item `it` with its visibility spelled by `respell` for a
+    move from module `src` to module `dst`: `pub(super) ` put before a
+    private declaration, or the old visibility replaced. An item that cannot
+    carry a visibility, or keeps its spelling, is as it is."""
     body = lines[it.start : it.end + 1]
-    if it.vis or it.kind not in VISIBLE or (ctx and TRAIT_IMPL.search(ctx)):
+    if it.kind not in VISIBLE or (ctx and TRAIT_IMPL.search(ctx)):
+        return body
+    want = respell(it.vis, src, dst)
+    if want == it.vis:
         return body
     # Past the docs, comments and attributes, whichever lines they take, to
     # the declaration itself.
@@ -1658,11 +1808,14 @@ def widen(lines, it, kinds, clines, ctx):
         j, col = cpm.balanced_end(clines, j, m.end() - 1, it.end + 1)
     rest = lines[j][col:]
     at = col + len(rest) - len(rest.lstrip())
-    body[j - it.start] = lines[j][:at] + "pub(super) " + lines[j][at:]
+    end = at
+    if it.vis and (m := cpm.VIS.match(lines[j], at)):
+        at, end = m.start(1), m.end(1)
+    body[j - it.start] = lines[j][:at] + cpm.shown(want) + " " + lines[j][end:]
     return body
 
 
-def render_items(lines, picked, blocks, kinds, clines, gone=frozenset()):
+def render_items(lines, picked, blocks, kinds, clines, gone=frozenset(), src=None, dst=None):
     """The moved items as Rust text: free items as they are, methods under a
     copy of their impl header, consecutive methods of one block together. A
     block in `gone` leaves mod.rs with this move, so its header comes whole,
@@ -1687,7 +1840,7 @@ def render_items(lines, picked, blocks, kinds, clines, gone=frozenset()):
         elif out and out[-1] != "" and not out[-1].rstrip().endswith("{"):
             out.append("")
         ctx = it.ctx if block is not None else ""
-        out.extend(widen(lines, it, kinds, clines, ctx))
+        out.extend(widen(lines, it, kinds, clines, ctx, src, dst))
     if current is not None:
         out.append("}")
     return out
@@ -1860,7 +2013,9 @@ def move(root, pr, fmt=True, build=True, t=APP):
     clines = code.split("\n")
     kinds = [cpm.line_kind(ln, c, starts_in.get(i)) for i, (ln, c) in enumerate(zip(lines, clines))]
     blocks = impl_blocks(glue)
-    body = render_items(lines, picked, blocks, kinds, clines, emptied(picked, blocks, items))
+    src, dst = cpm.module_of(t.source), cpm.module_of(f"{t.dir}/{file}.rs")
+    body = render_items(lines, picked, blocks, kinds, clines, emptied(picked, blocks, items),
+                        src, dst)
     free = any(enclosing(blocks, it) is None for it in picked)
 
     target = os.path.join(root, t.dir, f"{file}.rs")
@@ -1889,10 +2044,13 @@ def move(root, pr, fmt=True, build=True, t=APP):
     ])
     if fmt:
         subprocess.run(["cargo", "fmt"], cwd=root, check=True)
-    widened = sum(1 for it in picked if not it.vis and it.kind in VISIBLE
-                  and not (enclosing(blocks, it) and TRAIT_IMPL.search(it.ctx or "")))
-    print(f"PR {pr}: moved {len(picked)} item(s) from {t.source} to {t.dir}/{file}.rs, "
-          f"{widened} widened to pub(super)")
+    respelled = Counter(
+        (cpm.shown(it.vis), cpm.shown(respell(it.vis, src, dst))) for it in picked
+        if it.kind in VISIBLE and not (enclosing(blocks, it) and TRAIT_IMPL.search(it.ctx or ""))
+        and respell(it.vis, src, dst) != it.vis
+    )
+    print(f"PR {pr}: moved {len(picked)} item(s) from {t.source} to {t.dir}/{file}.rs"
+          + "".join(f", {k} {a} -> {b}" for (a, b), k in sorted(respelled.items())))
     if build:
         for line in settle(root, rows, t=t, new=file):
             print(f"  glue: {line}")

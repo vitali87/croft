@@ -8,8 +8,13 @@ block - and matches them by text. An item's text is the item plus the docs,
 attributes and `//` comments directly above it; before comparing, only the
 common indentation and the visibility on its signature line are normalised.
 A move may keep or widen that visibility; narrowing it, or changing it to one
-that does not compare (`pub(super)` to `pub(in a)`), is a change. Each widening
-is listed. A wider visibility can push a line past the width limit, so
+that does not compare, is a change. Under src/ a visibility is compared by the
+modules it reaches from the file it sits in, so `pub(super)` in
+src/app/codeql.rs and `pub(in crate::app)` in src/app/codeql/run.rs are the
+same reach, and `pub(super)` moved a level down is narrower; elsewhere, where
+the crate root is not known, two spellings at one rank (`pub(super)` and
+`pub(in a)`) do not compare. Each widening is listed, and so is a visibility
+respelled to the same reach. A wider visibility can push a line past the width limit, so
 rustfmt lays the item out anew; an item whose text differs is still a match
 when rustfmt, given both versions without their visibility, prints the same
 text for each. rustfmt changes layout only, never meaning, and it keeps every
@@ -397,14 +402,115 @@ def vis_rank(vis):
     return {"pub(crate)": 2, "pub": 3}.get(vis)
 
 
-def widens(old, new):
+def module_of(file, mods=()):
+    """The module an item of `file` sits in, inside its inline `mods`, as
+    path segments from the crate root: src/main.rs is `("crate",)`,
+    src/app/mod.rs `("crate", "app")` and src/app/codeql.rs `("crate",
+    "app", "codeql")`. None for a file outside src/, or under src/bin/, whose
+    crate root is not known here."""
+    if not (file.startswith("src/") and file.endswith(".rs")):
+        return None
+    parts = file[len("src/") : -len(".rs")].split("/")
+    if parts[0] == "bin":
+        return None
+    if parts in (["main"], ["lib"]):
+        parts = []
+    elif parts[-1] == "mod":
+        parts.pop()
+    return ("crate", *parts, *mods)
+
+
+def scope(vis, module):
+    """The module that, with everything inside it, can see an item of
+    visibility `vis` (whitespace-free) declared in `module`: the module
+    itself when private, its parent for `pub(super)`, `("crate",)` for
+    `pub(crate)`, the path named by `pub(in path)`, and `()` for `pub`, which
+    everything can see. None when it cannot be told."""
+    if module is None:
+        return None
+    if vis in ("", "pub(self)", "pub(inself)"):
+        return module
+    if vis == "pub(super)":
+        return module[:-1] if len(module) > 1 else None
+    if vis == "pub(crate)":
+        return ("crate",)
+    if vis == "pub":
+        return ()
+    m = re.fullmatch(r"pub\(in(.+)\)", vis)
+    if not m:
+        return None
+    head, *rest = m[1].split("::")
+    path = {"crate": ["crate"], "self": list(module), "super": list(module[:-1])}.get(head)
+    if path is None or (head == "super" and len(module) < 2):
+        return None
+    for seg in rest:
+        if seg == "super":
+            if len(path) < 2:
+                return None
+            path.pop()
+        elif seg != "self":
+            path.append(seg)
+    return tuple(path)
+
+
+def spelled(reach, module):
+    """The visibility that gives an item declared in `module` the `reach`
+    `scope` returns: private, `pub(super)`, `pub(crate)`, `pub`, or else
+    `pub(in path)` naming the module, as written in Rust."""
+    if reach == module:
+        return ""
+    if reach == module[:-1]:
+        return "pub(super)"
+    if reach == ("crate",):
+        return "pub(crate)"
+    if reach == ():
+        return "pub"
+    return "pub(in " + "::".join(reach) + ")"
+
+
+def widens(old, new, old_module=None, new_module=None):
     """Whether visibility `old` -> `new` keeps or widens the item's reach. A
     move may need a wider visibility; a narrower one can hide what callers
-    used, so it is a change, and so is one that cannot be compared."""
+    used, so it is a change, and so is one that cannot be compared. Given
+    the modules the two sit in, they compare by the modules they reach, so
+    `pub(super)` in src/app/codeql.rs and `pub(in crate::app)` in
+    src/app/codeql/run.rs are the same reach, and `pub(super)` moved a
+    level down is narrower; without them, by spelling and rank."""
+    a, b = scope(old, old_module), scope(new, new_module)
+    if a is not None and b is not None:
+        return a[: len(b)] == b
     if old == new:
         return True
     a, b = vis_rank(old), vis_rank(new)
     return a is not None and b is not None and b > a
+
+
+# Kinds whose declaration can carry a visibility of its own.
+CARRIES_VIS = {"fn", "const", "static", "struct", "enum", "union", "trait", "type"}
+# An item of a trait, or of a trait impl (`impl Trait for Type`, not a
+# higher-ranked `for<`), takes its reach from the trait, not a visibility.
+TRAIT_CTX = re.compile(r"(^|\s)trait\s|\bfor\s+(?!<)")
+
+
+def vis_module(it):
+    """The module `it`'s visibility is read from, or None when it has none
+    of its own (a macro, an item of a trait or trait impl): those compare
+    by spelling."""
+    if it.kind not in CARRIES_VIS or (it.ctx and TRAIT_CTX.search(it.ctx)):
+        return None
+    return module_of(it.file, it.mods)
+
+
+def item_widens(o, n):
+    """`widens` for two items, by the modules they sit in."""
+    return widens(o.vis, n.vis, vis_module(o), vis_module(n))
+
+
+def same_reach(o, n):
+    """Whether two items' visibilities, however spelled, reach the same
+    modules: a move into a deeper file can need a new spelling for that."""
+    a = scope(o.vis, vis_module(o))
+    return a is not None and a == scope(n.vis, vis_module(n))
 
 
 def pair_by_visibility(olds, news):
@@ -417,7 +523,7 @@ def pair_by_visibility(olds, news):
 
     def place(i, tried):
         for j, n in enumerate(news):
-            if j in tried or not widens(olds[i].vis, n.vis):
+            if j in tried or not item_widens(olds[i], n):
                 continue
             tried.add(j)
             if owner[j] is None or place(owner[j], tried):
@@ -443,7 +549,10 @@ def shown(vis):
 def reach(o, n):
     """`, private -> pub(super)` when a move or an edit in place widened the
     item's visibility, for the reviewer to see; nothing when it kept it."""
-    return f", {shown(o.vis)} -> {shown(n.vis)}" if o.vis != n.vis else ""
+    if o.vis == n.vis:
+        return ""
+    same = ", the same reach" if same_reach(o, n) else ""
+    return f", {shown(o.vis)} -> {shown(n.vis)}{same}"
 
 
 def edition():
@@ -511,9 +620,9 @@ def compare(old, new, alike=None):
         for o in olds:
             if at[(o.file, o.mods, o.name)]:
                 n = at[(o.file, o.mods, o.name)].pop()
-                if o.vis != n.vis and widens(o.vis, n.vis):
+                if o.vis != n.vis and item_widens(o, n):
                     widened.append((o, n))
-                elif widens(o.vis, n.vis):
+                elif item_widens(o, n):
                     unchanged += 1
                 else:
                     narrowed.append((o, n))
@@ -541,7 +650,7 @@ def compare(old, new, alike=None):
     relaid, still = [], []
     for o, n in changed:
         if (alike and o.kind == n.kind and o.ctx == n.ctx and o.norm != n.norm
-                and widens(o.vis, n.vis) and alike(o, n)):
+                and item_widens(o, n) and alike(o, n)):
             relaid.append((o, n))
             in_place = (o.file, o.mods, o.name) == (n.file, n.mods, n.name)
             (widened if in_place and o.vis != n.vis else moved).append((o, n))
@@ -608,12 +717,15 @@ def check(base, head, if_declared):
     unchanged, widened, moved, changed, removed, added, relaid = compare(
         sides[0][0], sides[1][0], lambda o, n: laid_out_alike(o, n, ed)
     )
-    wider = sum(1 for o, n in widened + moved if o.vis != n.vis)
+    respelled = [(o, n) for o, n in widened + moved if o.vis != n.vis]
+    same = sum(1 for o, n in respelled if same_reach(o, n))
+    wider = len(respelled) - same
     print(f"Pure-move check of {len(changed_files)} changed Rust file(s), {base}..{head}")
     print(
         f"  {unchanged} unchanged, {len(moved)} moved, {len(changed)} changed, "
         f"{len(added)} added, {len(removed)} removed; {wider} visibility widened, "
-        f"{len(relaid)} laid out anew by rustfmt"
+        + (f"{same} respelled to the same reach, " if same else "")
+        + f"{len(relaid)} laid out anew by rustfmt"
     )
     anew = {(id(o), id(n)) for o, n in relaid}
 
