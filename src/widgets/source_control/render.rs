@@ -795,7 +795,7 @@ pub(super) const FEEDBACK_MAX_ROWS: usize = 4;
 /// the last ending in `…` when the message runs longer.
 pub(super) fn wrap_feedback(msg: &str, width: usize, max_rows: usize) -> Vec<String> {
     use unicode_width::UnicodeWidthStr as _;
-    if width == 0 {
+    if width == 0 || max_rows == 0 {
         return Vec::new();
     }
     let mut rows: Vec<String> = Vec::new();

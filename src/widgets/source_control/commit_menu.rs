@@ -21,7 +21,7 @@ pub enum CommitMenuItem {
 }
 
 impl CommitMenuItem {
-    /// Ordered to mirror VS Code's Source Control "" menu: the sync trio
+    /// Ordered to mirror VS Code's Source Control "…" menu: the sync trio
     /// (push / pull / sync), then branch, then the stash pair, then the
     /// diff views.
     pub const ALL: [CommitMenuItem; 10] = [
