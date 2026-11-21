@@ -727,7 +727,8 @@ class OtherTargets(unittest.TestCase):
     def test_every_target_names_its_own_manifest_file_and_folder(self):
         self.assertEqual(
             sorted(mi.TARGETS),
-            ["app", "editor", "git", "lsp", "pair", "remote", "search", "session_host", "terminal"],
+            ["app", "editor", "git", "lsp", "pair", "remote", "search", "session_host",
+             "source_control", "terminal"],
         )
         for t in mi.TARGETS.values():
             with self.subTest(target=t.name):
