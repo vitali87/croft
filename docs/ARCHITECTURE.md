@@ -262,6 +262,7 @@ src/
 │   ├── language_servers.rs language servers: sync, messages and progress, decorations, go-to and peek, hierarchies, rename, code actions, formatting, linked editing, smart select, highlights, symbol pickers, code lens, outline, breadcrumbs, sticky scroll, restart
 │   ├── language_servers/ the language server feature files, beside language_servers.rs; each file's `//!` doc says what it holds
 │   │   ├── decorations.rs       document links, folding ranges, colors and Change Color Presentation
+│   │   ├── hierarchy.rs         call and type hierarchies: the requests and the picker of answers
 │   │   ├── inlay_hints.rs       inlay hints: their replies, refresh, requests and the toggle
 │   │   ├── messages.rs          server progress, messages, questions and show-document requests
 │   │   ├── navigation.rs        Go to Definition and its kin: requests, jumps and the multi-location picker
