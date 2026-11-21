@@ -216,6 +216,7 @@ src/
 │   │   ├── logs.rs             a run's evaluator and query logs, the log viewer, and Compare Performance
 │   │   ├── packs.rs            suites and packs: installing, downloading and running them
 │   │   ├── queries.rs          the workspace's queries: finding and creating them, Quick Query, query help
+│   │   ├── queue.rs            the run queue: many queries in turn, or one query on several databases
 │   │   ├── results.rs          a run's results: result sets, the alert and raw views, Compare Results, Export Results
 │   │   ├── run.rs              running a query, quick evaluation and Debug Query, cancelling and recording a run
 │   │   ├── test_runs.rs        CodeQL: Run Tests through the Testing view, and Accept Test Output
