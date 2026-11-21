@@ -265,6 +265,7 @@ src/
 │   │   ├── inlay_hints.rs       inlay hints: their replies, refresh, requests and the toggle
 │   │   ├── messages.rs          server progress, messages, questions and show-document requests
 │   │   ├── navigation.rs        Go to Definition and its kin: requests, jumps and the multi-location picker
+│   │   ├── peek.rs              Peek Definition and Peek References: the popup, its excerpt and stepping
 │   │   ├── rust_analyzer.rs     rust-analyzer's `Rust:` commands: sending them and acting on the answers
 │   │   ├── semantic.rs          semantic tokens, their refresh, and the background syntax pass landing
 │   │   ├── sync.rs              keeping servers in step with the open files, their diagnostics, and restarts
