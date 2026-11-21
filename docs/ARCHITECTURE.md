@@ -215,6 +215,7 @@ src/
 │   │   ├── databases.rs        the database list: removing, renaming, sorting, upgrading, deleting unused copies, and where databases are kept
 │   │   ├── history.rs          the query history: its entries, their queries, logs and results folders
 │   │   ├── logs.rs             a run's evaluator and query logs, the log viewer, and Compare Performance
+│   │   ├── model_editor.rs     the model editor: endpoints, their models, and the model pack
 │   │   ├── packs.rs            suites and packs: installing, downloading and running them
 │   │   ├── queries.rs          the workspace's queries: finding and creating them, Quick Query, query help
 │   │   ├── queue.rs            the run queue: many queries in turn, or one query on several databases
