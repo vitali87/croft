@@ -1,0 +1,96 @@
+# Stage B of the refactor program (#2062): where each item of src/widgets/source_control.rs goes.
+# One row per item, in file order. pr 0 means the item stays in source_control.rs; the others
+# move to src/widgets/source_control/<file>.rs in that PR. kind, impl and name are as
+# `scripts/check_pure_move.py list` prints them. Run
+# `scripts/move_items.py --target source_control --check` after adding an item to source_control.rs.
+# source_control.rs keeps the panel itself, SourceControlPanel, with its constructor, and the
+# row action areas the drawing sets and the clicks read.
+pr	file	kind	impl	name
+1	palette	const	-	INPUT_PROMPT_RGB
+1	palette	const	-	BUTTON_BG_RGB
+1	palette	const	-	BUTTON_FG_RGB
+1	palette	const	-	SECTION_HEADER_RGB
+1	palette	const	-	ADDITIONS_RGB
+1	palette	const	-	DELETIONS_RGB
+1	palette	const	-	DISCARD_GLYPH
+1	palette	const	-	STAGE_GLYPH
+1	palette	const	-	UNSTAGE_GLYPH
+1	palette	const	-	ROW_ACTIONS_WIDTH
+0		struct	-	RowActionAreas
+2	commit_menu	enum	-	CommitMenuItem
+2	commit_menu	const	impl CommitMenuItem	ALL
+2	commit_menu	fn	impl CommitMenuItem	label
+2	commit_menu	fn	impl CommitMenuItem	icon
+3	repositories	struct	-	RepoRow
+4	message	const	-	MESSAGE_MAX_ROWS
+4	message	const	-	MESSAGE_LIST_MIN_ROWS
+4	message	const	-	COMMIT_PLACEHOLDER
+4	message	const	-	COMMIT_PLACEHOLDER_HINTS
+4	message	fn	-	commit_placeholder_hint
+0		struct	-	SourceControlPanel
+0		fn	impl SourceControlPanel	new
+6	clicks	fn	impl SourceControlPanel	click_more
+6	clicks	fn	impl SourceControlPanel	click_discard_action
+6	clicks	fn	impl SourceControlPanel	click_stage_action
+6	clicks	fn	impl SourceControlPanel	click_unstage_action
+6	clicks	fn	impl SourceControlPanel	click_branch
+6	clicks	fn	impl SourceControlPanel	click_header_refresh
+5	change_list	fn	impl SourceControlPanel	set_status
+5	change_list	fn	impl SourceControlPanel	select_change_at
+5	change_list	fn	impl SourceControlPanel	select_all_changes
+5	change_list	fn	impl SourceControlPanel	changes_count
+5	change_list	fn	impl SourceControlPanel	focus_list
+5	change_list	fn	impl SourceControlPanel	move_selection
+5	change_list	fn	impl SourceControlPanel	entry_order
+5	change_list	fn	impl SourceControlPanel	select_only
+5	change_list	fn	impl SourceControlPanel	reveal_selected
+4	message	fn	impl SourceControlPanel	insert_char
+4	message	fn	impl SourceControlPanel	insert_str
+4	message	fn	impl SourceControlPanel	caret_line_col
+4	message	fn	impl SourceControlPanel	set_caret_line_col
+4	message	fn	impl SourceControlPanel	move_cursor_up
+4	message	fn	impl SourceControlPanel	move_cursor_down
+4	message	fn	impl SourceControlPanel	backspace
+4	message	fn	impl SourceControlPanel	delete_char
+4	message	fn	impl SourceControlPanel	move_cursor_left
+4	message	fn	impl SourceControlPanel	move_cursor_right
+4	message	fn	impl SourceControlPanel	home
+4	message	fn	impl SourceControlPanel	end
+4	message	fn	impl SourceControlPanel	message_start
+4	message	fn	impl SourceControlPanel	message_end
+4	message	fn	impl SourceControlPanel	seed_prepared_message
+4	message	fn	impl SourceControlPanel	clear_after_commit
+4	message	fn	impl SourceControlPanel	clear_message
+5	change_list	fn	impl SourceControlPanel	entry_at_y
+6	clicks	fn	impl SourceControlPanel	click_button
+2	commit_menu	fn	impl SourceControlPanel	click_commit_caret
+2	commit_menu	fn	impl SourceControlPanel	click_commit_menu_item
+4	message	fn	impl SourceControlPanel	click_input
+6	clicks	fn	impl SourceControlPanel	click_init_repo_button
+6	clicks	fn	impl SourceControlPanel	click_nested_repo
+5	change_list	fn	impl SourceControlPanel	scroll_up
+5	change_list	fn	impl SourceControlPanel	scroll_down
+5	change_list	fn	impl SourceControlPanel	scroll_to_bar_y
+4	message	fn	impl SourceControlPanel	byte_index_at_cursor
+4	message	fn	impl SourceControlPanel	cursor_screen_pos
+5	change_list	fn	impl SourceControlPanel	list_layout
+3	repositories	fn	impl SourceControlPanel	render_repositories_section
+8	buttons	fn	impl SourceControlPanel	render_soft_split_button
+3	repositories	fn	impl SourceControlPanel	click_repository
+7	empty_state	fn	impl SourceControlPanel	render_no_repo_empty_state
+7	empty_state	fn	-	paragraph_line_count
+7	empty_state	fn	-	paint_y_fork_illustration
+7	empty_state	fn	-	paint_y_fork_compact
+5	change_list	enum	-	ListLine
+0		fn	impl Default for SourceControlPanel	default
+5	change_list	fn	-	section_label
+6	clicks	fn	-	rect_hit
+8	buttons	fn	-	render_rounded_button
+8	buttons	fn	-	primary_button_colors
+8	buttons	fn	-	lift_button
+8	buttons	fn	-	paint_button_label
+8	buttons	fn	-	render_button
+9	render	fn	-	badge_color
+9	render	fn	impl Widget for &mut SourceControlPanel	render
+9	render	const	-	FEEDBACK_MAX_ROWS
+9	render	fn	-	wrap_feedback

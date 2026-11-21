@@ -62,15 +62,23 @@ see [docs/MACOS.md](docs/MACOS.md#spotlight-indexing-and-the-build-directory).
   `--target lsp` split `src/lsp/manager.rs` from
   `scripts/split_lsp_manifest.tsv`, with `--target terminal` split
   `src/widgets/terminal.rs` from `scripts/split_terminal_manifest.tsv`, with
-  `--target git` split `src/git.rs` from `scripts/split_git_manifest.tsv`, and
+  `--target git` split `src/git.rs` from `scripts/split_git_manifest.tsv`,
   with `--target remote` split `src/remote.rs` from
-  `scripts/split_remote_manifest.tsv` (`--tests-out` first moved each file's
-  inline tests to their own file).
+  `scripts/split_remote_manifest.tsv`, with `--target search` split
+  `src/widgets/search.rs` from `scripts/split_search_manifest.tsv`, with
+  `--target session_host` split `src/session_host.rs` from
+  `scripts/split_session_host_manifest.tsv`, with `--target pair` split
+  `src/pair.rs` from `scripts/split_pair_manifest.tsv`, and with
+  `--target source_control` split `src/widgets/source_control.rs` from
+  `scripts/split_source_control_manifest.tsv` (`--tests-out` first moved each
+  file's inline tests to their own file).
 * **Adding to the app, the editor, the language-server manager, the
-  terminal pane, git or remote sessions?** Put a feature's code in its file
-  under `src/app/`, `src/widgets/editor/`, `src/lsp/manager/`,
-  `src/widgets/terminal/`, `src/git/` or `src/remote/` (see the lists in
-  [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)),
+  terminal pane, git, remote sessions, the search panel, the session host,
+  the pair pilot or the Source Control panel?** Put a feature's code in its
+  file under `src/app/`, `src/widgets/editor/`, `src/lsp/manager/`,
+  `src/widgets/terminal/`, `src/git/`, `src/remote/`, `src/widgets/search/`,
+  `src/session_host/`, `src/pair/` or `src/widgets/source_control/`
+  (see the lists in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)),
   not in `src/app/mod.rs`, which keeps only the `App` struct, its state,
   start-up and the main loop, nor in `src/widgets/editor.rs`, which keeps only
   the `Editor` type, its constructor and the data types its parts share, nor
@@ -79,8 +87,14 @@ see [docs/MACOS.md](docs/MACOS.md#spotlight-indexing-and-the-build-directory).
   share, nor in `src/widgets/terminal.rs`, which keeps only the `PtyTerminal`
   type and the structs its parts share, nor in `src/git.rs`, which keeps only
   the git runner and the mutation wrappers every part shares, nor in
-  `src/remote.rs`, which keeps only the structs and helpers its parts share.
-  A new feature that fits no file gets a file of its own.
+  `src/remote.rs`, which keeps only the structs and helpers its parts share,
+  nor in `src/widgets/search.rs`, which keeps only the `SearchPanel` type, its
+  constructor and the types its parts share, nor in `src/session_host.rs`,
+  which keeps only the structs whose private fields its parts share, nor in
+  `src/pair.rs`, which keeps only the pilot's shared state, nor in
+  `src/widgets/source_control.rs`, which keeps only the `SourceControlPanel`
+  type, its constructor and the row action areas. A new feature that fits no
+  file gets a file of its own.
 * **New or changed module?** Update its entry in
   [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). CI fails if you shorten a
   module's description without moving its reasoning into a `### <module>`
@@ -159,14 +173,21 @@ file into the PR description.
 <details>
 <summary>Recording without a browser (agents, headless machines)</summary>
 
-`scripts/demo/tui_demo.py` drives the real binary in tmux and writes a GIF. It
-needs tmux, node, Pillow and Chromium. Copy the scenario in
-`scripts/demo/examples/`:
+`scripts/demo/tui_demo.py` drives the real binary and writes a GIF. On macOS
+with Ghostty 1.4+ it runs croft in a new window of your Ghostty and screenshots
+it (allow Screen Recording and Automation once; leave the window alone while
+it records). Elsewhere, or with `CROFT_DEMO_TERMINAL=xterm`, it uses tmux and
+replays the frames in headless Chromium, which needs tmux, node and Chromium.
+Both need Pillow. Copy the scenario in `scripts/demo/examples/`:
 
 ```bash
 cargo build
 python3 scripts/demo/examples/settings_editor.py target/debug/croft out.gif
 ```
+
+`scripts/demo/docs_gifs.py target/debug/croft [scene ...]` re-records the GIFs
+in `docs/images/`. Record from a clean checkout, so the status bar shows no
+rebuild hint.
 
 If you have push access, commit the GIF to the never-merged `pr-media` branch at
 `<pr>/<name>.gif`. Then embed it with a URL pinned to that commit's SHA, so the
