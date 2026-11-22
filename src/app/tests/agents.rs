@@ -4072,3 +4072,36 @@ fn completing_an_approval_merge_approves_it_and_stages_nothing() {
         assert_eq!(input["content"], "one\ntheirs\nthree\n");
     });
 }
+
+/// #2552: an extension command whose thread ends without a result (it
+/// panicked, or never started) must not leave "Running …" on the status line
+/// with nothing running.
+#[test]
+fn an_extension_command_that_dies_says_so() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    drop(tx);
+    app.mcp_rx = Some(rx);
+    app.mcp_started = Some(std::time::Instant::now());
+    app.mcp_busy_label = Some(String::from("Running Fetch"));
+    app.status = String::from("Running Fetch");
+    assert!(app.poll_mcp(), "a command that died is news to draw");
+    assert!(app.mcp_rx.is_none() && app.mcp_started.is_none() && app.mcp_busy_label.is_none());
+    assert_eq!(app.status, "The extension command stopped without a result");
+}
+
+/// A status that has moved on since the command started (the crash notice,
+/// say) is left alone.
+#[test]
+fn an_extension_command_that_dies_keeps_a_newer_status() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    drop(tx);
+    app.mcp_rx = Some(rx);
+    app.mcp_busy_label = Some(String::from("Running Fetch"));
+    app.status = String::from("A background task crashed");
+    assert!(app.poll_mcp());
+    assert_eq!(app.status, "A background task crashed");
+}

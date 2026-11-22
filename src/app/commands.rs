@@ -897,11 +897,18 @@ impl App {
         let outcome = match rx.try_recv() {
             Ok(o) => o,
             Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            // The command's thread ended without a result: it panicked, or it
+            // never started. The status line said "Running …" and would go on
+            // saying it with nothing running (#2552), so it says the command
+            // stopped, unless something newer (the crash notice) has replaced
+            // it since.
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 self.mcp_rx = None;
                 self.mcp_started = None;
-                self.mcp_busy_label = None;
-                return false;
+                if self.mcp_busy_label.take().as_deref() == Some(self.status.as_str()) {
+                    self.status = String::from("The extension command stopped without a result");
+                }
+                return true;
             }
         };
         self.mcp_rx = None;
