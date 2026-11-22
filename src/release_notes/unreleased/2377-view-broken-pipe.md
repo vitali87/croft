@@ -1,1 +1,0 @@
-fix: `croft view` and `croft edit` run in a busy terminal pane no longer fail with "Broken pipe": when croft has already turned the request away for arriving too late, the command reads that answer and tries once more, as it already did when the request got through (#2377).

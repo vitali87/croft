@@ -1,1 +1,0 @@
-refactor: Groundwork for the refactor program (#2062): the doc comment saying what `fetch_marketplace_theme` returns sits above it again, not above `scratch_nonce`, before `cli.rs` is split into feature files. Nothing changes in use.
