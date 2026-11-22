@@ -1102,6 +1102,7 @@ impl App {
         }
         if stopped {
             self.status = String::from(INLINE_SUGGESTIONS_STOPPED);
+            claim_background_panic(crate::inline_complete::THREAD);
             changed = true;
         }
         changed |= self.land_inline_lsp();

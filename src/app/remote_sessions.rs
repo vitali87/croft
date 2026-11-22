@@ -546,7 +546,17 @@ impl App {
             if let Some(dialog) = self.connect_dialog.as_mut() {
                 dialog.set_failed(detail.clone());
             }
-            self.install_session = None;
+            // Nothing will run through the install's SSH connection now: close
+            // it, as an install that could not start does, instead of leaving
+            // it open until croft exits (#2610). An install that already let
+            // the user into the remote croft never gets here.
+            if let Some(adopted) = self
+                .install_session
+                .take()
+                .and_then(|mut session| session.take_adopted())
+            {
+                crate::remote::close_master(adopted);
+            }
             // An install whose thread crashed leaves the status line to the
             // crash notice, as every background job does (#2562); the dialog
             // says what happened to the connect.

@@ -3776,16 +3776,16 @@ pub struct App {
     /// Cached workspace file index. Built lazily on first Cmd+P and
     /// shared across reopens so repeated invocations are instant.
     file_finder_index: Option<std::sync::Arc<Vec<crate::widgets::file_finder::FileEntry>>>,
-    /// Background-build receiver: App::new spawns a thread that walks
-    /// the workspace and sends the index here; Cmd+P opens against the
-    /// hot index instead of walking on the UI thread. None once the
-    /// index has been received (or if a build was never kicked off).
-    file_finder_index_rx:
-        Option<std::sync::mpsc::Receiver<Vec<crate::widgets::file_finder::FileEntry>>>,
+    /// The background build of that index: App::new starts one that walks
+    /// the workspace, so Cmd+P opens against the hot index instead of
+    /// walking on the UI thread, and file changes start rebuilds. None once
+    /// the index has landed, or the build's thread died (#2618), or no build
+    /// was started.
+    file_finder_index_job: Option<crate::jobs::Job<Vec<crate::widgets::file_finder::FileEntry>>>,
     /// Set when a rebuild was requested while one was already in flight.
-    /// poll_file_finder_index drains it on completion and re-kicks the
-    /// background walker so a long-running rebuild (multi-GB monorepo)
-    /// can never miss a later FS event that landed mid-walk.
+    /// poll_file_finder_index starts it once that one ends, landed or
+    /// crashed (#2618), so a long-running rebuild (multi-GB monorepo) can
+    /// never miss a later FS event that landed mid-walk.
     file_finder_index_dirty: bool,
 }
 
@@ -4244,19 +4244,18 @@ impl App {
                 search_results_tx,
             );
         });
-        // Pre-build the Cmd+P file index on a background thread so the
-        // first Cmd+P keystroke does not stall the UI for the length
-        // of a workspace walk. The result is delivered via channel;
-        // open_file_finder calls poll_file_finder_index to consume it.
-        let (file_finder_index_tx, file_finder_index_rx) =
-            std::sync::mpsc::channel::<Vec<crate::widgets::file_finder::FileEntry>>();
+        // Pre-build the Cmd+P file index on a background job so the
+        // first Cmd+P keystroke does not stall the UI for the length of a
+        // workspace walk (a home folder's included), started after the
+        // first frame. open_file_finder calls poll_file_finder_index to
+        // take it; if no thread can start, the first Cmd+P walks instead.
         let index_root = root.clone();
-        std::thread::spawn(move || {
-            // A walk of the whole workspace, a home folder's included.
-            crate::startup_gate::wait();
-            let entries = crate::widgets::file_finder::build_file_index(&index_root);
-            let _ = file_finder_index_tx.send(entries);
-        });
+        let file_finder_index_job = crate::jobs::Job::spawn(
+            FILE_INDEX_THREAD,
+            crate::jobs::Start::AfterFirstFrame,
+            move || crate::widgets::file_finder::build_file_index(&index_root),
+        )
+        .ok();
         let fs_watch = FsWatch::spawn(&root, &tree);
         crate::startup_trace::mark("file watcher started");
         // Persisted layout preferences (Customize Layout popup). Skipped under
@@ -4981,7 +4980,7 @@ impl App {
             pending_stash_drop: None,
             pending_replace_all: None,
             file_finder_index: None,
-            file_finder_index_rx: Some(file_finder_index_rx),
+            file_finder_index_job,
             file_finder_index_dirty: false,
             completion_request_id: None,
             completion_origin: None,
@@ -6595,6 +6594,10 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         // symbol tab leaves its siblings holding the saved text, so the
         // change event reads as their own write, not a conflict (#369).
         let symbol_views_settled = app.sync_symbol_views();
+        // A background task's crash notice comes before the polls that
+        // settle the task, so a task that says what its crash cost, or how
+        // to start it again, has the status line after it (#2609).
+        let panic_changed = app.poll_background_panic();
         // Pull in any filesystem-watcher events first so the tree reflects
         // disk reality on the very next frame.
         let fs_changed = app.drain_fs_events();
@@ -6685,7 +6688,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             | app.drain_review_ops();
         let connect_changed = app.poll_connect_dialog() | app.drain_scrub_views();
         let install_changed = app.poll_install_session();
-        let update_changed = app.poll_update_watch() | app.poll_background_panic();
+        let update_changed = app.poll_update_watch();
         let http_changed = app.drain_http_responses();
         let reveal_changed = app.tick_redaction_reveal();
         crate::startup_trace::mark("watchers and dialogs polled");
@@ -6843,6 +6846,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || connect_changed
             || install_changed
             || update_changed
+            || panic_changed
             || http_changed
             || reveal_changed
             || lsp_changed

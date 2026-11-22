@@ -140,6 +140,42 @@ fn a_remote_install_whose_thread_crashed_fails_the_connect() {
     assert!(app.connect_dialog.is_none(), "Esc closes it");
 }
 
+/// #2610: a failed install closes the SSH connection it was handed, its
+/// socket's private directory included, instead of leaving it open until
+/// croft exits.
+#[test]
+fn a_failed_remote_install_closes_its_ssh_connection() {
+    // A failed install is remembered on disk: keep it off this machine's.
+    let _serial = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::tempdir().unwrap();
+    let _restore = override_cache_dir(tmp.path().join("cache"));
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let socket_dir = tmp.path().join("ctl");
+    std::fs::create_dir(&socket_dir).unwrap();
+    let adopted = crate::remote::AdoptedMaster {
+        host: String::from("devbox"),
+        socket_dir: socket_dir.clone(),
+        socket_path: socket_dir.join("ctl"),
+    };
+    app.connect_dialog = Some(crate::widgets::connect_dialog::ConnectDialog::new(
+        String::from("devbox"),
+    ));
+    app.install_session = Some(crate::install_session::InstallSession::with_events(
+        "devbox",
+        None,
+        Some(adopted),
+        vec![crate::install_session::InstallEvent::Done(Err(
+            String::from("no space left on device"),
+        ))],
+    ));
+    app.poll_install_session();
+    assert!(app.install_session.is_none());
+    assert!(
+        !socket_dir.exists(),
+        "the connection's socket directory is gone"
+    );
+}
+
 /// #862 negative: S at the handoff prompt whose save is refused (the file
 /// changed on disk) stays here, and drops the launch: left armed, the next
 /// ordinary Ctrl+Q would have connected instead of quitting.

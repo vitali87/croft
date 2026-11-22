@@ -871,6 +871,67 @@ fn show_memory_usage_renders_in_the_active_theme() {
     );
 }
 
+/// The crash notice's slot is one for the whole process: tests that fill and
+/// read it take turns.
+fn crash_slot_lock() -> std::sync::MutexGuard<'static, ()> {
+    static SLOT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    SLOT.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// #2609: the crash notice of a task croft recovers from (a job, stream or
+/// worker) says croft carried on, instead of asking for a restart the task
+/// does not need; the record's place is still named.
+#[test]
+fn a_recovered_tasks_crash_notice_does_not_ask_for_a_restart() {
+    let _slot = crash_slot_lock();
+    note_background_panic("check-project", true);
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    assert!(app.poll_background_panic(), "the crash is shown");
+    assert!(
+        app.status.contains("(check-project)")
+            && app.status.contains("croft carried on")
+            && !app.status.contains("restart")
+            && app.status.contains("~/.cache/croft/panic.log"),
+        "{}",
+        app.status
+    );
+}
+
+/// #2616 review: crashes between two notices are all kept, and one croft
+/// did not recover from wins: its work is gone, so the notice still asks for
+/// a restart, and names every thread that crashed.
+#[test]
+fn an_unrecovered_crash_keeps_the_restart_advice_beside_a_recovered_one() {
+    let _slot = crash_slot_lock();
+    note_background_panic("pane-reader", false);
+    note_background_panic("check-project", true);
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    assert!(app.poll_background_panic());
+    assert!(
+        app.status.contains("(pane-reader, check-project)") && app.status.contains("restart croft"),
+        "{}",
+        app.status
+    );
+}
+
+/// #2616 review: a task that says on the status line what its crash cost
+/// claims its notice, so the generic one never replaces that message on a
+/// later tick.
+#[test]
+fn a_task_that_says_what_its_crash_cost_keeps_the_status_line() {
+    let _slot = crash_slot_lock();
+    note_background_panic(crate::voice::THREAD, true);
+    claim_background_panic(crate::voice::THREAD);
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.status = String::from("the task's own message");
+    assert!(!app.poll_background_panic(), "nothing left to say");
+    assert_eq!(app.status, "the task's own message");
+}
+
 /// #2077: a crash in a background thread leaves croft's terminal as it is
 /// and says on the status bar what crashed. Only a crash on the thread that
 /// drives the screen ends croft, and only then does the panic hook reset the
@@ -878,6 +939,7 @@ fn show_memory_usage_renders_in_the_active_theme() {
 /// alternate screen, with keys echoed and the mouse dead.
 #[test]
 fn a_background_crash_keeps_the_terminal_and_says_what_crashed() {
+    let _slot = crash_slot_lock();
     let ui = std::thread::current().id();
     assert!(
         panic_ends_croft(ui, ui),
@@ -891,7 +953,7 @@ fn a_background_crash_keeps_the_terminal_and_says_what_crashed() {
                 !panic_ends_croft(me.id(), ui),
                 "a background thread's crash does not"
             );
-            note_background_panic(me.name().unwrap());
+            note_background_panic(me.name().unwrap(), false);
         })
         .unwrap()
         .join()

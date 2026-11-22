@@ -36,6 +36,10 @@ use std::thread;
 
 use crate::jobs::{Job, Poll, Start};
 
+/// The name of the thread that reads a voice session's result, which the
+/// crash notice names.
+pub const THREAD: &str = "croft-voice";
+
 use crate::lsp::log_file;
 
 /// The Termux:API CLI that fronts Android's `SpeechRecognizer`. The `speech`
@@ -263,7 +267,7 @@ impl VoiceHandle {
         VoiceHandle {
             child: Arc::new(Mutex::new(None)),
             result: Some(
-                Job::spawn("croft-voice", Start::Now, || {
+                Job::spawn(THREAD, Start::Now, || {
                     panic!("the voice reader crashed (on purpose, in a test)")
                 })
                 .unwrap(),
@@ -320,7 +324,7 @@ pub fn start() -> VoiceHandle {
     let mut stderr = child.stderr.take();
     let shared: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(Some(child)));
     let reader_shared = Arc::clone(&shared);
-    let reader = Job::spawn("croft-voice", Start::Now, move || {
+    let reader = Job::spawn(THREAD, Start::Now, move || {
         // The dialog prints a single small JSON object at end-of-speech; read it
         // whole rather than line-by-line.
         let mut json = String::new();
@@ -428,7 +432,7 @@ mod tests {
         let mut handle = VoiceHandle {
             child: Arc::new(Mutex::new(Some(child))),
             result: Some(
-                Job::spawn("croft-voice", Start::Now, || {
+                Job::spawn(THREAD, Start::Now, || {
                     panic!("the voice reader crashed (on purpose, in a test)")
                 })
                 .unwrap(),
