@@ -2744,6 +2744,11 @@ fn a_search_stopped_by_leaving_search_runs_again_on_coming_back() {
         matches!(req_rx.try_recv(), Ok(SearchRequest::Cancel)),
         "leaving Search stops the scan"
     );
+    assert_eq!(
+        app.search.progress,
+        SearchProgress::Cancelled,
+        "stopped from the moment it is asked to stop"
+    );
     // The worker stops the run part-way: its end says so.
     tx.send(SearchEvent::Cancelled(run)).unwrap();
     assert!(app.drain_search_results());
@@ -2763,6 +2768,44 @@ fn a_search_stopped_by_leaving_search_runs_again_on_coming_back() {
         matches!(requests.last(), Some(SearchRequest::Query { run: r, query, .. }) if *r == app.search.run && query == "needle"),
         "{requests:?}"
     );
+}
+
+/// #2612 review: leaving Search and coming back before the worker's
+/// `Cancelled` lands still runs the search again; and a `Done` that beat the
+/// cancel keeps the run finished.
+#[test]
+fn a_search_left_and_reopened_before_its_cancel_lands_runs_again() {
+    use crate::widgets::search::{SearchEvent, SearchRequest};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::Search);
+    let (req_tx, req_rx) = std::sync::mpsc::channel();
+    app.search_query_tx = req_tx;
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.search_results_rx = rx;
+    app.search.query = String::from("needle");
+    app.submit_search_query();
+    let run = app.search.run;
+    app.set_sidebar_view(SidebarView::Explorer);
+    app.set_sidebar_view(SidebarView::Search);
+    assert!(app.search.run > run, "coming back starts a new run");
+    assert_eq!(app.search.progress, SearchProgress::Running);
+    let requests: Vec<SearchRequest> = req_rx.try_iter().collect();
+    assert!(
+        matches!(requests.last(), Some(SearchRequest::Query { run: r, .. }) if *r == app.search.run),
+        "{requests:?}"
+    );
+    // The old run's cancel lands late, and is dropped.
+    tx.send(SearchEvent::Cancelled(run)).unwrap();
+    assert!(!app.drain_search_results());
+    assert_eq!(app.search.progress, SearchProgress::Running);
+
+    // A run that finished before its cancel reached the worker stays
+    // finished.
+    app.set_sidebar_view(SidebarView::Explorer);
+    tx.send(SearchEvent::Done(app.search.run)).unwrap();
+    assert!(app.drain_search_results());
+    assert_eq!(app.search.progress, SearchProgress::Finished);
 }
 
 /// #2608: a new Explorer root cuts the run in flight short: its hits for
