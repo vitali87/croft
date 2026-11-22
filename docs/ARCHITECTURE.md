@@ -419,7 +419,7 @@ src/
     ├── editor_find.rs        VS Code-style inline Find bar (`Cmd+F`) with match highlight, Enter/Shift+Enter walk, case/whole-word/regex toggles and a Replace row (`Cmd+Opt+F`); Replace All runs through the same `split_for_highlight` as count and paint
     ├── extensions.rs         Extensions sidebar widget: projects bundled and user manifests into a theme-aware list grouped under BUILT-IN/INSTALLED/AVAILABLE, with pill toggles, +Add, trash, a local filter box and clear/refresh; reports clicks back to App, which owns the state
     ├── file_finder.rs   VS Code-style Quick Open (Cmd+P) fuzzy file picker with tiered match ranking (exact filename > prefix > substring > path > subsequence)
-    ├── file_tree.rs          `ignore::WalkBuilder` backed file tree: lazy children, fs-watcher refresh, multi-select, drag-drop, bulk trash, reveal-path, multi-root section rows, sticky scroll and compact folders
+    ├── file_tree.rs          `ignore::WalkBuilder` backed file tree: lazy children, fs-watcher refresh, multi-select, drag-drop, bulk trash, reveal-path, multi-root section rows, sticky scroll and compact folders: what its parts share (`FileTree`, its constructor, and `Node`, the row its fields hold); each part is in a file in `file_tree/` below
     ├── file_tree/        the Explorer's file tree's feature files, beside file_tree.rs; each file's `//!` doc says what it holds
     │   ├── android_trash.rs   the freedesktop home trash on Android, where the `trash` crate has none
     │   ├── decorations.rs     a row's git decoration, name and icon colours, the active indent guide, and ignored or agent-changed paths
@@ -1151,7 +1151,7 @@ VS Code colour theme import: converts a theme `.json` (JSONC, plus `include` cha
 
 ### file_tree.rs
 
-An `ignore::WalkBuilder`-backed tree with lazy children, fs-watcher refresh, multi-select, drag-drop, bulk trash, and reveal-path on `Cmd+P` open.
+An `ignore::WalkBuilder`-backed tree with lazy children, fs-watcher refresh, multi-select, drag-drop, bulk trash, and reveal-path on `Cmd+P` open. `file_tree.rs` keeps the tree itself: `FileTree`, whose private fields every part reads, its constructor, and `Node`, the row it lists. Each feature lives in a file of its own in `file_tree/`.
 
 **Multi-root ready.** `add_root` appends further workspace roots as depth-0 section rows (`root_paths` enumerates them; `self.root` stays the primary). Every root-special behavior keys on the row's *depth*, not index 0: Collapse All spares all root rows, the delete guard refuses them, and `reveal_path` plus the ignored-set ancestor walk resolve through the owning root (longest prefix, so nested roots pick the deeper one). Sticky ancestors were depth-based already.
 

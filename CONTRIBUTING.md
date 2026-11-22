@@ -76,20 +76,23 @@ see [docs/MACOS.md](docs/MACOS.md#spotlight-indexing-and-the-build-directory).
   `scripts/split_codeql_manifest.tsv`, with `--target debugger` split
   `src/app/debugger.rs` from `scripts/split_debugger_manifest.tsv`, with
   `--target language_servers` split `src/app/language_servers.rs` from
-  `scripts/split_language_servers_manifest.tsv`, and with
+  `scripts/split_language_servers_manifest.tsv`, with
   `--target dap_session` split `src/dap/session.rs` from
-  `scripts/split_dap_session_manifest.tsv` (`--tests-out` first moved a
-  file's inline tests to their own file).
+  `scripts/split_dap_session_manifest.tsv`, and with `--target file_tree`
+  split `src/widgets/file_tree.rs` from `scripts/split_file_tree_manifest.tsv`
+  (`--tests-out` first moved a file's inline tests, and any other inline
+  module, to their own file).
 * **Adding to the app, the editor, the language-server manager, the
   terminal pane, git, remote sessions, the search panel, the session host,
   the pair pilot, the Source Control panel, the command line, the CodeQL
   side bar, Run and Debug, a language feature such as go-to, rename or the
-  outline, or a debug session's talk with its adapter?** Put a feature's code
-  in its file under `src/app/`, `src/widgets/editor/`, `src/lsp/manager/`,
-  `src/widgets/terminal/`, `src/git/`, `src/remote/`, `src/widgets/search/`,
-  `src/session_host/`, `src/pair/`, `src/widgets/source_control/`,
-  `src/cli/`, `src/app/codeql/`, `src/app/debugger/`,
-  `src/app/language_servers/` or `src/dap/session/`
+  outline, a debug session's talk with its adapter, or the Explorer's file
+  tree?** Put a feature's code in its file under `src/app/`,
+  `src/widgets/editor/`, `src/lsp/manager/`, `src/widgets/terminal/`,
+  `src/git/`, `src/remote/`, `src/widgets/search/`, `src/session_host/`,
+  `src/pair/`, `src/widgets/source_control/`, `src/cli/`, `src/app/codeql/`,
+  `src/app/debugger/`, `src/app/language_servers/`, `src/dap/session/` or
+  `src/widgets/file_tree/`
   (see the lists in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)),
   not in `src/app/mod.rs`, which keeps only the `App` struct, its state,
   start-up and the main loop, nor in `src/widgets/editor.rs`, which keeps only
@@ -110,7 +113,9 @@ see [docs/MACOS.md](docs/MACOS.md#spotlight-indexing-and-the-build-directory).
   `src/app/debugger.rs` or `src/app/language_servers.rs`, which keep only the
   types and constants their parts share, nor in `src/dap/session.rs`, which
   keeps only `DapSession`, the types its fields hold and the `DapEvent`s it
-  returns. A new subcommand's flags go in
+  returns, nor in `src/widgets/file_tree.rs`, which keeps only `FileTree`,
+  its constructor and `Node`, the row its fields hold. A new subcommand's
+  flags go in
   `src/cli/commands.rs` and its line in `Cli::run` (`src/cli/run.rs`); its
   own code goes in a file under `src/cli/`, or in the module of the feature
   it drives (as `croft remote` calls into `src/remote/`). A new feature that
