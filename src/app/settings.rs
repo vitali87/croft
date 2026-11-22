@@ -721,7 +721,45 @@ impl App {
         let Some(modal) = self.shortcuts_modal.as_mut() else {
             return;
         };
+        // While the filter is being typed, characters go to it; the arrows,
+        // PgUp/PgDn and Home/End still scroll the (shortened) list.
+        if modal.editing {
+            match (key.code, key.modifiers) {
+                (KeyCode::F(1), _) => self.close_shortcuts_modal(),
+                (KeyCode::Esc, _) => {
+                    modal.editing = false;
+                    modal.set_filter(String::new());
+                }
+                (KeyCode::Enter, _) => modal.editing = false,
+                (KeyCode::Backspace, _) => {
+                    let mut f = modal.filter.clone();
+                    f.pop();
+                    modal.set_filter(f);
+                }
+                (KeyCode::Char('u'), KeyModifiers::CONTROL) => modal.set_filter(String::new()),
+                (KeyCode::Char(c), m)
+                    if !m.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                {
+                    let mut f = modal.filter.clone();
+                    f.push(c);
+                    modal.set_filter(f);
+                }
+                (KeyCode::Down, _) => modal.scroll_down(1),
+                (KeyCode::Up, _) => modal.scroll_up(1),
+                (KeyCode::PageDown, _) => modal.scroll_down(10),
+                (KeyCode::PageUp, _) => modal.scroll_up(10),
+                (KeyCode::Home, _) => modal.scroll_to_top(),
+                (KeyCode::End, _) => modal.scroll_to_bottom(),
+                _ => {}
+            }
+            return;
+        }
         match (key.code, key.modifiers) {
+            (KeyCode::Char('/'), KeyModifiers::NONE)
+            | (KeyCode::Char('/'), KeyModifiers::SHIFT)
+            | (KeyCode::Char('f'), KeyModifiers::CONTROL) => modal.editing = true,
+            // A kept filter is cleared first; a second Esc leaves the view.
+            (KeyCode::Esc, _) if !modal.filter.is_empty() => modal.set_filter(String::new()),
             (KeyCode::Esc, _) | (KeyCode::F(1), _) => self.close_shortcuts_modal(),
             (KeyCode::Char('q'), KeyModifiers::NONE) => self.close_shortcuts_modal(),
             (KeyCode::Down, _) | (KeyCode::Char('j'), _) => modal.scroll_down(1),

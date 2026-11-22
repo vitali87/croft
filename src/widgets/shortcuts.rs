@@ -1212,6 +1212,12 @@ pub const SHORTCUT_GROUPS: &[ShortcutGroup] = &[
 
 #[derive(Default)]
 pub struct ShortcutsModal {
+    /// Words typed after `/` (or Ctrl+F): an entry stays when every word
+    /// occurs in its keys, description or group title, case-insensitively.
+    pub filter: String,
+    /// True while the filter takes typed characters; false once Enter
+    /// committed it (or before it was opened), when the scroll keys work.
+    pub editing: bool,
     pub scroll: u16,
     pub last_inner_height: u16,
     pub last_content_height: u16,
@@ -1219,6 +1225,38 @@ pub struct ShortcutsModal {
 }
 
 impl ShortcutsModal {
+    /// Whether an entry of `group` passes the filter.
+    fn entry_matches(&self, group: &ShortcutGroup, entry: &ShortcutEntry) -> bool {
+        let words: Vec<String> = self
+            .filter
+            .split_whitespace()
+            .map(str::to_lowercase)
+            .collect();
+        if words.is_empty() {
+            return true;
+        }
+        let hay = format!("{} {} {}", group.title, entry.keys, entry.description).to_lowercase();
+        words.iter().all(|w| hay.contains(w))
+    }
+
+    /// How many entries pass the filter.
+    pub fn match_count(&self) -> usize {
+        SHORTCUT_GROUPS
+            .iter()
+            .map(|g| {
+                g.entries
+                    .iter()
+                    .filter(|e| self.entry_matches(g, e))
+                    .count()
+            })
+            .sum()
+    }
+
+    pub fn set_filter(&mut self, filter: String) {
+        self.filter = filter;
+        self.scroll = 0;
+    }
+
     pub fn lines(&self, theme: crate::theme::Theme) -> Vec<Line<'static>> {
         let mut out: Vec<Line<'static>> = Vec::new();
         // A `surfaces` theme sets the sheet in its type ramp: group titles
@@ -1241,21 +1279,34 @@ impl ShortcutsModal {
                 Style::default().fg(theme.ui(Color::Rgb(0xd0, 0xd0, 0xd0))),
             ),
         };
-        for (i, group) in SHORTCUT_GROUPS.iter().enumerate() {
-            if i > 0 {
+        let mut shown = 0;
+        for group in SHORTCUT_GROUPS.iter() {
+            let entries: Vec<&ShortcutEntry> = group
+                .entries
+                .iter()
+                .filter(|e| self.entry_matches(group, e))
+                .collect();
+            if entries.is_empty() {
+                continue;
+            }
+            if shown > 0 {
                 out.push(Line::from(""));
             }
+            shown += 1;
             out.push(Line::from(Span::styled(group.title, title)));
             out.push(Line::from(Span::styled(
                 "─".repeat(group.title.chars().count()),
                 rule,
             )));
-            for entry in group.entries {
+            for entry in entries {
                 out.push(Line::from(vec![
                     Span::styled(format!("  {:<32} ", entry.keys), keys),
                     Span::styled(entry.description, what),
                 ]));
             }
+        }
+        if shown == 0 {
+            out.push(Line::from(Span::styled("  No shortcuts match", what)));
         }
         out
     }
@@ -1420,8 +1471,22 @@ pub fn render_shortcuts_modal(
     modal.last_rect = rect;
 
     Widget::render(Clear, rect, buf);
+    let title_text = if modal.editing {
+        format!(
+            " Shortcuts — filter: {}\u{258f}  (Enter keeps, Esc clears) ",
+            modal.filter
+        )
+    } else if !modal.filter.is_empty() {
+        format!(
+            " Shortcuts — filter: {} ({} found) — / edits, Esc clears ",
+            modal.filter,
+            modal.match_count()
+        )
+    } else {
+        " Shortcuts — / to search, Esc/q to close, ↑/↓ PgUp/PgDn Home/End to scroll ".to_string()
+    };
     let title = Span::styled(
-        " Shortcuts — Esc/q to close, ↑/↓ PgUp/PgDn Home/End to scroll ",
+        title_text,
         Style::default()
             .fg(theme.ui(Color::Rgb(0xff, 0xff, 0xff)))
             .add_modifier(Modifier::BOLD),
@@ -1613,6 +1678,7 @@ mod tests {
             last_inner_height: 10,
             last_content_height: 25,
             last_rect: Rect::default(),
+            ..Default::default()
         };
         modal.scroll_down(100);
         assert_eq!(
@@ -1628,6 +1694,7 @@ mod tests {
             last_inner_height: 10,
             last_content_height: 25,
             last_rect: Rect::default(),
+            ..Default::default()
         };
         modal.scroll_up(100);
         assert_eq!(modal.scroll, 0);
@@ -1657,6 +1724,7 @@ mod tests {
             last_inner_height: 8,
             last_content_height: 30,
             last_rect: Rect::default(),
+            ..Default::default()
         };
         modal.scroll_to_bottom();
         assert_eq!(modal.scroll, 22);
@@ -1703,5 +1771,47 @@ mod tests {
             "after scroll_to_bottom the final entry '{}' must be visible; wrapped rows are not counted in the scroll ceiling so the bottom of the list is unreachable\n--- rendered ---\n{text}",
             last_entry.description
         );
+    }
+}
+
+#[cfg(test)]
+mod filter_tests {
+    use super::*;
+
+    fn flat(m: &ShortcutsModal, w: u16) -> String {
+        m.wrapped_lines(crate::theme::Theme::default(), w)
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Every word must occur (keys, description or group title, any case);
+    /// groups with no match disappear; no match says so.
+    #[test]
+    fn the_filter_keeps_matching_entries_and_drops_empty_groups() {
+        let mut m = ShortcutsModal::default();
+        let all = m.match_count();
+        assert!(all > 20);
+        m.set_filter("TERMINAL".into());
+        let some = m.match_count();
+        assert!(0 < some && some < all);
+        let text = flat(&m, 100);
+        assert!(text.to_lowercase().contains("terminal"));
+        let groups = text
+            .lines()
+            .filter(|l| l.chars().all(|c| c == '─') && !l.is_empty())
+            .count();
+        assert!(groups < SHORTCUT_GROUPS.len(), "empty groups are dropped");
+        m.set_filter("terminal zzzzqqq".into());
+        assert_eq!(m.match_count(), 0);
+        assert!(flat(&m, 100).contains("No shortcuts match"));
+        m.set_filter(String::new());
+        assert_eq!(m.match_count(), all);
     }
 }

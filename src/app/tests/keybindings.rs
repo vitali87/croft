@@ -3752,3 +3752,32 @@ fn a_multiline_paste_confirm_disarms_a_pending_cmd_k_chord() {
     assert!(!app.pending_broadcast_enable, "no broadcast prompt");
     assert!(!app.broadcast_input);
 }
+
+/// `/` starts a filter in the shortcuts view; typed characters go to it (even
+/// `q`), Enter keeps it, Esc clears it and only then does Esc leave the view.
+#[test]
+fn shortcuts_view_filter_flow() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = App::new(dir.path().to_path_buf()).unwrap();
+    app.open_shortcuts_modal();
+    let key = |app: &mut App, c: KeyCode| {
+        app.handle_key(KeyEvent::new(c, KeyModifiers::NONE))
+            .unwrap()
+    };
+    key(&mut app, KeyCode::Char('/'));
+    assert!(app.shortcuts_modal.as_ref().unwrap().editing);
+    for c in "quit".chars() {
+        key(&mut app, KeyCode::Char(c));
+    }
+    let m = app.shortcuts_modal.as_ref().unwrap();
+    assert_eq!(m.filter, "quit", "q is typed, not a close key");
+    key(&mut app, KeyCode::Backspace);
+    assert_eq!(app.shortcuts_modal.as_ref().unwrap().filter, "qui");
+    key(&mut app, KeyCode::Enter);
+    assert!(!app.shortcuts_modal.as_ref().unwrap().editing);
+    key(&mut app, KeyCode::Esc);
+    let m = app.shortcuts_modal.as_ref().expect("first Esc only clears");
+    assert!(m.filter.is_empty());
+    key(&mut app, KeyCode::Esc);
+    assert!(app.shortcuts_modal.is_none());
+}

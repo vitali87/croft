@@ -1,0 +1,1 @@
+The shortcuts view (F1) can be filtered: press `/` or `Ctrl+F` and type words that must appear in a shortcut's keys, description or group; `Enter` keeps the filter, `Esc` clears it, a second `Esc` closes the view.

@@ -1,6 +1,6 @@
 # croft keybindings
 
-Every action in croft is reachable from the keyboard. Press `F1` inside croft for the same reference, grouped by pane and scrollable.
+Every action in croft is reachable from the keyboard. Press `F1` inside croft for the same reference, grouped by pane and scrollable. Press `/` (or `Ctrl+F`) in it to filter the list: type words (each must appear in the keys, the description or the group name), `Enter` keeps the filter, `Esc` clears it, and a further `Esc` closes the view.
 
 Per platform:
 
@@ -23,7 +23,7 @@ Per platform:
 | A file you have unsaved edits in changes on disk | A prompt asks. `reload` + Enter loads the disk version, saving yours to Local History (TIMELINE); Esc or any other answer keeps your edits |
 | Typing `(` `[` `{` or a quote | Auto-closing pairs: the closer is inserted; typing it steps over; a selection is surrounded; backspace in an empty pair deletes both. Settings gear → "Auto Closing Pairs" toggles |
 | `Ctrl+q` | Quit (not from a focused terminal, where the key goes to its app). Unsaved changes prompt: `S` / `Enter` save all, `D` discard, `Esc` / `N` cancel |
-| `F1` | Open the shortcuts modal |
+| `F1` | Open the shortcuts modal; `/` or `Ctrl+F` inside it filters the list |
 | `F6` | Cycle focus across panes (tree → editor → terminal → tree) |
 | `Shift+F8` | Screencast Mode (`Developer: Toggle Screencast Mode`): show each key, the command it ran, and clicks. Password and shell input are never shown |
 | `Ctrl+b` / `Cmd+b` | Toggle the primary side bar (left pane) |
