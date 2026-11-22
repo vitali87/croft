@@ -3175,7 +3175,7 @@ fn run_project_check(tmp: &tempfile::TempDir) -> (String, String) {
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.run_command(crate::widgets::command_palette::Command::ProblemsCheckProject);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-    while app.project_check_running && std::time::Instant::now() < deadline {
+    while app.project_check.is_some() && std::time::Instant::now() < deadline {
         if !app.drain_project_check() {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
