@@ -113,7 +113,7 @@ src/
 │   ├── clipboard.rs      the relay's clipboard requests: pasting from and copying to this machine's clipboard
 │   ├── config_push.rs    pushing the user's config to the remote; `croft sync-config` and its diff
 │   ├── config_repush.rs  re-pushing changed config during a session over the bulk lane
-│   ├── control.rs        the SSH control master: starting or adopting it, commands over its socket
+│   ├── control.rs        the SSH control master: starting or adopting it, commands over its socket, and closing one an install could not use (#2610)
 │   ├── cross_build.rs    building a static croft for the remote here: toolchain probes, the build, shipping it
 │   ├── forward.rs        the relay's open and forward requests: links in the local browser, forwarded ports
 │   ├── hosts.rs          the hosts in ~/.ssh/config, and the host a running ssh's argv names
