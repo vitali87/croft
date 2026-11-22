@@ -325,6 +325,7 @@ src/
 │   │   ├── tests.rs             the debug session's own tests
 │   ├── configs.rs            launch.json, `.croft` over `.vscode`: its configurations and compounds, `inputs`, `presentation`, `${...}` variables and `envFile`, each entry resolved into its adapter's DAP request, and the entry Debug: Add Configuration… writes
 │   ├── configs/         launch.json's feature files, beside configs.rs; each file's `//!` doc says what it holds
+│   │   ├── compounds.rs         compounds: reading them and resolving their members
 │   │   ├── discovery.rs         finding every launch.json and what it declares, and the folders a name points at
 │   │   ├── inputs.rs            the `inputs` array, the `${input:id}` ids a configuration uses, and which are still to ask
 │   │   ├── presentation.rs      `presentation` blocks: hidden entries, groups and order, and the picker's sort
