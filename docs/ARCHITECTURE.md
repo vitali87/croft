@@ -326,6 +326,7 @@ src/
 │   ├── configs.rs            launch.json, `.croft` over `.vscode`: its configurations and compounds, `inputs`, `presentation`, `${...}` variables and `envFile`, each entry resolved into its adapter's DAP request, and the entry Debug: Add Configuration… writes
 │   ├── configs/         launch.json's feature files, beside configs.rs; each file's `//!` doc says what it holds
 │   │   ├── compounds.rs         compounds: reading them and resolving their members
+│   │   ├── debug_test.rs        the configuration for debugging tests, laid over croft's pytest launch
 │   │   ├── discovery.rs         finding every launch.json and what it declares, and the folders a name points at
 │   │   ├── env_files.rs         reading a dotenv `envFile`: quotes, escapes, comments and `${NAME}` references
 │   │   ├── inputs.rs            the `inputs` array, the `${input:id}` ids a configuration uses, and which are still to ask
