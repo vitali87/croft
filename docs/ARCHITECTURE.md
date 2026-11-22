@@ -331,6 +331,7 @@ src/
 │   │   ├── env_files.rs         reading a dotenv `envFile`: quotes, escapes, comments and `${NAME}` references
 │   │   ├── go.rs                delve's requests, `auto` mode, and Connect to server
 │   │   ├── inputs.rs            the `inputs` array, the `${input:id}` ids a configuration uses, and which are still to ask
+│   │   ├── js.rs                vscode-js-debug's requests: browsers, `node-terminal`, and what a Node launch must name
 │   │   ├── lldb.rs              lldb-dap's requests, the processes to attach to, and building a `cargo` block
 │   │   ├── presentation.rs      `presentation` blocks: hidden entries, groups and order, and the picker's sort
 │   │   ├── python.rs            debugpy's `launch` and `attach` requests
