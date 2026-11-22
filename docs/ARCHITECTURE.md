@@ -359,6 +359,7 @@ src/
 │       ├── commands.rs          cargo's command line, and its build-status lines as progress
 │       ├── control.rs           cancelling a run by killing its runner's process group
 │       ├── coverage.rs          coverage runs: LCOV, scopes, and each runner's coverage tool
+│       ├── discovery.rs         listing each runner's tests without running them
 │       ├── go_and_codeql.rs     `go test -json` and `codeql test run`: their command lines and results
 │       ├── handle.rs            queueing runs and discoveries, cancelling, re-rooting, and draining results
 │       ├── js_args.rs           vitest's and jest's command lines, and the arguments that pick a test, a suite or a file
