@@ -13,6 +13,19 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::{Duration, Instant};
 
+thread_local! {
+    /// Set on a thread that runs a job, stream or worker: its owner settles
+    /// its death, so croft carries on after it crashes (#2609).
+    static SUPERVISED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether the current thread runs a job, stream or worker, whose crash
+/// croft recovers from: the crash notice then says croft carried on instead
+/// of asking for a restart (#2609).
+pub fn on_supervised_thread() -> bool {
+    SUPERVISED.get()
+}
+
 /// When a job's work may start. There is no default: each caller decides
 /// whether the first frame waits for it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,6 +68,7 @@ impl<T: Send + 'static> Job<T> {
         std::thread::Builder::new()
             .name(name.to_string())
             .spawn(move || {
+                SUPERVISED.set(true);
                 if start == Start::AfterFirstFrame {
                     crate::startup_gate::wait();
                 }
@@ -180,6 +194,7 @@ impl<T: Send + 'static> Stream<T> {
         let thread = std::thread::Builder::new()
             .name(name.to_string())
             .spawn(move || {
+                SUPERVISED.set(true);
                 if start == Start::AfterFirstFrame {
                     crate::startup_gate::wait();
                 }
@@ -467,6 +482,7 @@ fn start_worker_thread<Req: Send + 'static, Resp: Send + 'static>(
     let thread = std::thread::Builder::new()
         .name(name.to_string())
         .spawn(move || {
+            SUPERVISED.set(true);
             if start == Start::AfterFirstFrame {
                 crate::startup_gate::wait();
             }
@@ -510,6 +526,30 @@ mod tests {
         })
         .unwrap();
         assert!(matches!(settle(&job), Poll::Died));
+    }
+
+    /// #2609: a job's, a stream's and a worker's threads are the ones croft
+    /// recovers from; any other thread is not.
+    #[test]
+    fn jobs_streams_and_workers_run_on_supervised_threads() {
+        let job = Job::spawn("supervised-job", Start::Now, on_supervised_thread).unwrap();
+        assert!(matches!(settle(&job), Poll::Done(true)));
+        let mut stream = Stream::spawn("supervised-stream", Start::Now, |sink| {
+            sink.send(on_supervised_thread());
+        })
+        .unwrap();
+        assert_eq!(drain_stream(&mut stream), (vec![true], true));
+        let mut worker: Worker<(), bool> =
+            Worker::spawn("supervised-worker", Start::Now, |rx, tx| {
+                while rx.recv().is_ok() {
+                    let _ = tx.send(on_supervised_thread());
+                }
+            })
+            .unwrap();
+        worker.send(());
+        assert!(matches!(next(&mut worker), WorkerPoll::Answer(true)));
+        let plain = std::thread::spawn(on_supervised_thread).join().unwrap();
+        assert!(!plain, "a plain thread is not");
     }
 
     /// Outside a launch, as under test, a job held for the first frame

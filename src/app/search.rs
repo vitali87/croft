@@ -24,6 +24,10 @@ pub(super) fn is_search_editor_tab(path: Option<&Path>) -> bool {
     })
 }
 
+/// The name of the thread that builds Go to File's index, which the crash
+/// notice names (#2618).
+pub(super) const FILE_INDEX_THREAD: &str = "file-index";
+
 /// A query as the status line quotes it, shortened.
 pub(super) fn header_query_for_status(query: &str) -> String {
     let q: String = query.chars().take(40).collect();
@@ -633,7 +637,7 @@ impl App {
         self.overlays.file_finder_clear.consume()
     }
 
-    /// Drain the background-build receiver into `file_finder_index`
+    /// Take the background build's index into `file_finder_index`
     /// without blocking. Called from `open_file_finder` and from the
     /// main loop tick. Accepts REPLACEMENT results too: when the FS
     /// watcher or a workspace re-root has triggered a rebuild, the
@@ -641,52 +645,55 @@ impl App {
     /// (if any) so an in-progress Cmd+P session immediately re-ranks
     /// against the new file set. If a follow-up rebuild was queued
     /// while this one was in flight (the `file_finder_index_dirty`
-    /// flag), it is re-kicked here so a long-running build on a
-    /// multi-GB monorepo can never miss a later FS event.
+    /// flag), it starts here once this one ends, so a long-running
+    /// build on a multi-GB monorepo can never miss a later FS event.
+    /// A build whose thread crashed ends too (#2618): the index it was
+    /// replacing stays, and the queued rebuild still starts, rather than
+    /// waiting for the next file change.
     pub(super) fn poll_file_finder_index(&mut self) {
-        let Some(rx) = self.file_finder_index_rx.as_ref() else {
+        let Some(job) = self.file_finder_index_job.as_ref() else {
             return;
         };
-        match rx.try_recv() {
-            Ok(entries) => {
+        match job.poll() {
+            crate::jobs::Poll::Pending => return,
+            crate::jobs::Poll::Done(entries) => {
                 let arc = std::sync::Arc::new(entries);
                 self.file_finder_index = Some(arc.clone());
-                self.file_finder_index_rx = None;
                 let visible = self.without_project_excludes(arc);
                 if let Some(finder) = self.file_finder.as_mut() {
                     finder.replace_entries(visible);
                 }
-                if self.file_finder_index_dirty {
-                    self.kick_file_finder_index_rebuild();
-                }
             }
-            Err(std::sync::mpsc::TryRecvError::Empty) => {}
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                self.file_finder_index_rx = None;
-            }
+            crate::jobs::Poll::Died => {}
+        }
+        self.file_finder_index_job = None;
+        if self.file_finder_index_dirty {
+            self.kick_file_finder_index_rebuild();
         }
     }
 
-    /// Spawn a background walker that rebuilds the Cmd+P file index
-    /// against the current `workspace_root`. If a rebuild is already
-    /// in flight, sets the dirty flag instead; `poll_file_finder_index`
-    /// will re-kick on completion. Called from `change_workspace_root`
-    /// so Cmd+P reflects the new project, and from `drain_fs_events`
-    /// so creates, deletes, and git-checkout-driven swaps land in the
-    /// index without a croft restart.
+    /// Start a background build of the Cmd+P file index against the
+    /// current roots. If a rebuild is already in flight, sets the dirty
+    /// flag instead; `poll_file_finder_index` starts it when that one
+    /// ends. Called from `change_workspace_root` so Cmd+P reflects the
+    /// new project, and from `drain_fs_events` so creates, deletes, and
+    /// git-checkout-driven swaps land in the index without a croft
+    /// restart. When no thread can start, the index there is kept and the
+    /// status line says so; the next file change tries again.
     pub(super) fn kick_file_finder_index_rebuild(&mut self) {
-        if self.file_finder_index_rx.is_some() {
+        if self.file_finder_index_job.is_some() {
             self.file_finder_index_dirty = true;
             return;
         }
-        let (tx, rx) = std::sync::mpsc::channel::<Vec<crate::widgets::file_finder::FileEntry>>();
-        let roots: Vec<PathBuf> = self.roots.iter().map(Path::to_path_buf).collect();
-        std::thread::spawn(move || {
-            let entries = crate::widgets::file_finder::build_multi_file_index(&roots);
-            let _ = tx.send(entries);
-        });
-        self.file_finder_index_rx = Some(rx);
         self.file_finder_index_dirty = false;
+        let roots: Vec<PathBuf> = self.roots.iter().map(Path::to_path_buf).collect();
+        let job = crate::jobs::Job::spawn(FILE_INDEX_THREAD, crate::jobs::Start::Now, move || {
+            crate::widgets::file_finder::build_multi_file_index(&roots)
+        });
+        match job {
+            Ok(job) => self.file_finder_index_job = Some(job),
+            Err(e) => self.status = format!("Could not update Go to File's file list: {e}"),
+        }
     }
 
     /// C/C++: Switch Header/Source (#1360): open the header of the source
@@ -730,7 +737,7 @@ impl App {
             let roots: Vec<PathBuf> = self.roots.iter().map(Path::to_path_buf).collect();
             let entries = crate::widgets::file_finder::build_multi_file_index(&roots);
             self.file_finder_index = Some(std::sync::Arc::new(entries));
-            self.file_finder_index_rx = None;
+            self.file_finder_index_job = None;
             found = crate::header_source::counterpart(&path, &root, &index_paths(self), &is_file);
         }
         let Some(found) = found else {
@@ -764,7 +771,7 @@ impl App {
             let roots: Vec<PathBuf> = self.roots.iter().map(Path::to_path_buf).collect();
             let entries = crate::widgets::file_finder::build_multi_file_index(&roots);
             self.file_finder_index = Some(std::sync::Arc::new(entries));
-            self.file_finder_index_rx = None;
+            self.file_finder_index_job = None;
         }
         let entries = self
             .file_finder_index

@@ -2317,12 +2317,12 @@ impl App {
         self.search.hits.clear();
         self.search.selected = 0;
         self.search.scroll = 0;
-        // Drop any in-flight walker for the OLD root so its result is
+        // Drop any in-flight build for the OLD root so its result is
         // discarded when it tries to send. Then kick a fresh walk
         // against the new root. file_finder_index keeps the old entries
         // for now so a Cmd+P press during the rebuild window shows
         // stale-but-immediate results instead of a UI freeze.
-        self.file_finder_index_rx = None;
+        self.file_finder_index_job = None;
         self.file_finder_index_dirty = false;
         self.kick_file_finder_index_rebuild();
         // Rebind the resident navigator: the activation record, relay

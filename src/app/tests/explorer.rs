@@ -1252,6 +1252,41 @@ fn cmd_p_index_refreshes_after_a_new_file_lands_on_disk() {
     );
 }
 
+/// #2618: a Go to File index rebuild asked for while another was running
+/// still runs when the running one crashes, instead of waiting for the next
+/// file change.
+#[test]
+fn a_rebuild_queued_behind_a_crashed_index_build_still_runs() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(tmp.path().join(".git")).unwrap();
+    std::fs::write(tmp.path().join("alpha.rs"), b"").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // A build whose thread crashes.
+    app.file_finder_index_job = Some(
+        crate::jobs::Job::spawn(
+            "file-index",
+            crate::jobs::Start::Now,
+            || -> Vec<crate::widgets::file_finder::FileEntry> {
+                panic!("the index build crashed (on purpose, in a test)")
+            },
+        )
+        .unwrap(),
+    );
+    // A file lands while it runs, and asks for a rebuild.
+    std::fs::write(tmp.path().join("beta.rs"), b"").unwrap();
+    app.kick_file_finder_index_rebuild();
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(5),
+        "the rebuild queued behind the crashed build to land",
+        || {
+            app.poll_file_finder_index();
+            app.file_finder_index
+                .as_ref()
+                .is_some_and(|index| index.iter().any(|e| e.rel == "beta.rs"))
+        },
+    );
+}
+
 #[test]
 fn click_on_tree_row_aligned_with_terminal_splitter_y_selects_the_row_not_the_splitter() {
     // Regression for the user's "I can't click on the last two files,

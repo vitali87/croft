@@ -35,6 +35,9 @@ use std::process::{Command, Stdio};
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
 
+/// The name of Live Run's runner thread, which the crash notice names.
+pub const THREAD: &str = "croft-live-run";
+
 use crate::jobs::{Start, Worker, WorkerPoll};
 
 /// The Python side: an AST rewrite plus a JSON report writer.
@@ -313,7 +316,7 @@ impl Runner {
     fn spawn_with(
         run_job: impl Fn(&Job) -> Result<Report, String> + Send + Sync + 'static,
     ) -> Self {
-        let worker = Worker::spawn("croft-live-run", Start::Now, move |job_rx, done_tx| {
+        let worker = Worker::spawn(THREAD, Start::Now, move |job_rx, done_tx| {
             serve(&job_rx, &done_tx, &run_job)
         })
         .expect("spawn live-run thread");

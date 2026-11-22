@@ -20,9 +20,11 @@ impl TestWorker {
         let owners = Arc::new(Owners::default());
         let (thread_control, thread_owners) = (control.clone(), Arc::clone(&owners));
         let first_root = workspace_root.clone();
-        let worker = Worker::spawn("test-runner", Start::AfterFirstFrame, move |rx, tx| {
-            work(first_root.clone(), rx, tx, &thread_control, &thread_owners)
-        })
+        let worker = Worker::spawn(
+            super::RUNNER_THREAD,
+            Start::AfterFirstFrame,
+            move |rx, tx| work(first_root.clone(), rx, tx, &thread_control, &thread_owners),
+        )
         .expect("start the test runner");
         let worker = Self::around(worker, control, workspace_root);
         #[cfg(test)]
