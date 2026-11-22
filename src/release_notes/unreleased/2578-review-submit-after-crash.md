@@ -1,0 +1,1 @@
+fix: After a review submission's thread crashes, the next Submit Review or export of notes posts the pending comments, instead of every later one saying "A review is already being submitted" until a restart.

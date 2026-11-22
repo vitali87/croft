@@ -3000,9 +3000,10 @@ pub struct App {
     /// typed, the `gh` to run, and where finished jobs report.
     review_pending: Vec<crate::review_threads::PendingComment>,
     review_pending_pr: Option<(PathBuf, String)>,
-    /// A Submit Review or export is in flight; another is refused until it
-    /// reports, so the same comments are never posted twice.
-    review_submitting: bool,
+    /// The Submit Review or export in flight, as the `review-submit` job;
+    /// another is refused while it runs, so the same comments are never
+    /// posted twice. A job whose thread crashed no longer counts (#2578).
+    review_submit: Option<crate::jobs::Job<crate::review_ops::Outcome>>,
     /// Sticky notes (#367): every note in the workspace, where the owner
     /// keeps them (`None` under test), and which box id is which note.
     notes: crate::sticky_notes::Notes,
@@ -5022,7 +5023,7 @@ impl App {
             review_boxes: None,
             review_pending: Vec::new(),
             review_pending_pr: None,
-            review_submitting: false,
+            review_submit: None,
             notes: crate::startup_trace::after(
                 "sticky notes read",
                 notes_path
