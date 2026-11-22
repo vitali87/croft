@@ -422,6 +422,7 @@ src/
     ├── file_tree.rs          `ignore::WalkBuilder` backed file tree: lazy children, fs-watcher refresh, multi-select, drag-drop, bulk trash, reveal-path, multi-root section rows, sticky scroll and compact folders
     ├── file_tree/        the Explorer's file tree's feature files, beside file_tree.rs; each file's `//!` doc says what it holds
     │   ├── android_trash.rs   the freedesktop home trash on Android, where the `trash` crate has none
+    │   ├── decorations.rs     a row's git decoration, name and icon colours, the active indent guide, and ignored or agent-changed paths
     │   ├── roots.rs           the workspace roots: replacing the primary, adding and removing the others, and which owns a path
     │   ├── tests.rs           the file tree's own tests
     ├── header_pill.rs   shared section-header pill button (chip-backed codicon affordance + theme colours) used by both the Remote Explorer (+ / refresh) and Source Control (refresh) headers
