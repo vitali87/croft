@@ -31,9 +31,10 @@ use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::thread;
+
+use crate::jobs::{Job, Poll, Start};
 
 use crate::lsp::log_file;
 
@@ -192,6 +193,10 @@ pub fn ensure_api_installed_in_background() {
 /// finish on Android's own end-of-speech detection.
 pub struct VoiceHandle {
     child: Arc<Mutex<Option<Child>>>,
+    /// The session's result, read on a thread of its own. A reader that
+    /// crashed reads as dead, so the session ends instead of listening for
+    /// good (#2602). `None` once it has answered.
+    result: Option<Job<VoiceMsg>>,
 }
 
 impl VoiceHandle {
@@ -214,26 +219,66 @@ impl VoiceHandle {
             let _ = child.kill();
         }
     }
+
+    /// The session's result, nothing yet, or that its reader crashed, once:
+    /// after either it reads as still waiting. A crashed reader never
+    /// cleared the listening flag, so it is cleared here, and the dialog it
+    /// was reading is closed and reaped.
+    pub fn poll(&mut self) -> Poll<VoiceMsg> {
+        let Some(result) = &self.result else {
+            return Poll::Pending;
+        };
+        let poll = result.poll();
+        if !matches!(poll, Poll::Pending) {
+            self.result = None;
+        }
+        if matches!(poll, Poll::Died) {
+            // Nothing will read the dialog's answer or reap it now: close it
+            // as a cancel tap would, and reap it, so it does not keep the
+            // microphone after the session has ended (#2603 review).
+            self.stop();
+            if let Some(mut child) = self.child.lock().ok().and_then(|mut guard| guard.take()) {
+                let _ = child.wait();
+            }
+            set_listening(false);
+        }
+        poll
+    }
 }
 
 #[cfg(test)]
 impl VoiceHandle {
-    /// A session whose recognizer has already exited: how the app holds its
-    /// handle between the worker sending the result and the frame loop
+    /// A session whose recognizer has already exited with `msg`: how the
+    /// app holds its handle between the reader finishing and the frame loop
     /// draining it.
-    pub fn finished() -> Self {
+    pub fn finished(msg: VoiceMsg) -> Self {
         VoiceHandle {
             child: Arc::new(Mutex::new(None)),
+            result: Some(Job::finished(msg)),
+        }
+    }
+
+    /// A session whose reader crashed before it had a result (#2602).
+    pub fn crashed() -> Self {
+        VoiceHandle {
+            child: Arc::new(Mutex::new(None)),
+            result: Some(
+                Job::spawn("croft-voice", Start::Now, || {
+                    panic!("the voice reader crashed (on purpose, in a test)")
+                })
+                .unwrap(),
+            ),
         }
     }
 }
 
-/// Start a recognition session. Spawns `termux-dialog speech`, reads its single
-/// JSON result object on a background thread, and sends the recognized text as
-/// the transcript over `tx` (or `Failed`/`Empty` on a recognizer error or
-/// nothing heard). Returns a handle the app keeps to cancel on a second mic tap.
-/// On a spawn failure the session never opens and `VoiceMsg::Failed` is sent.
-pub fn start(tx: Sender<VoiceMsg>) -> VoiceHandle {
+/// Start a recognition session. Spawns `termux-dialog speech` and reads its
+/// single JSON result object on a background job, whose result is the
+/// recognized text as the transcript (or `Failed`/`Empty` on a recognizer
+/// error or nothing heard). Returns a handle the app keeps to read that
+/// result and to cancel on a second mic tap. On a spawn failure the session
+/// never opens and its result is `VoiceMsg::Failed`.
+pub fn start() -> VoiceHandle {
     set_listening(true);
     // `termux-dialog speech` opens the system speech dialog and prints one JSON
     // object - `{"code":..,"text":".."[, "error":".."]}` - when the recognizer
@@ -263,9 +308,11 @@ pub fn start(tx: Sender<VoiceMsg>) -> VoiceHandle {
         Err(e) => {
             set_listening(false);
             log_file::log(&format!("voice: could not start `{BINARY}`: {e}"));
-            let _ = tx.send(VoiceMsg::Failed(format!("voice input unavailable: {e}")));
             return VoiceHandle {
                 child: Arc::new(Mutex::new(None)),
+                result: Some(Job::finished(VoiceMsg::Failed(format!(
+                    "voice input unavailable: {e}"
+                )))),
             };
         }
     };
@@ -273,7 +320,7 @@ pub fn start(tx: Sender<VoiceMsg>) -> VoiceHandle {
     let mut stderr = child.stderr.take();
     let shared: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(Some(child)));
     let reader_shared = Arc::clone(&shared);
-    thread::spawn(move || {
+    let reader = Job::spawn("croft-voice", Start::Now, move || {
         // The dialog prints a single small JSON object at end-of-speech; read it
         // whole rather than line-by-line.
         let mut json = String::new();
@@ -312,7 +359,7 @@ pub fn start(tx: Sender<VoiceMsg>) -> VoiceHandle {
             text.chars().count(),
             err.trim()
         ));
-        let msg = if !text.is_empty() {
+        if !text.is_empty() {
             VoiceMsg::Transcript(text)
         } else if rec_err == ERR_NO_MIC_PERMISSION {
             VoiceMsg::Failed(String::from(
@@ -322,10 +369,30 @@ pub fn start(tx: Sender<VoiceMsg>) -> VoiceHandle {
             VoiceMsg::Failed(format!("Voice input error: {rec_err}"))
         } else {
             VoiceMsg::Empty
-        };
-        let _ = tx.send(msg);
+        }
     });
-    VoiceHandle { child: shared }
+    let handle = VoiceHandle {
+        child: shared,
+        result: None,
+    };
+    match reader {
+        Ok(reader) => VoiceHandle {
+            result: Some(reader),
+            ..handle
+        },
+        // No thread to read the dialog's answer: close the dialog rather
+        // than leave it listening for nobody.
+        Err(e) => {
+            handle.stop();
+            set_listening(false);
+            VoiceHandle {
+                result: Some(Job::finished(VoiceMsg::Failed(format!(
+                    "voice input unavailable: {e}"
+                )))),
+                ..handle
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -340,6 +407,48 @@ mod tests {
         assert_eq!(install_state(), InstallState::Done);
         set_install_state(InstallState::Idle);
         assert_eq!(install_state(), InstallState::Idle);
+    }
+
+    /// #2603 review: a session whose reader crashed closes the dialog it
+    /// was reading, its whole process group, and reaps it, so it does not
+    /// keep the microphone after the session has ended.
+    #[cfg(unix)]
+    #[test]
+    fn a_session_whose_reader_crashed_closes_its_dialog() {
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30");
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+        let child = cmd.spawn().unwrap();
+        let pid = child.id() as i32;
+        let mut handle = VoiceHandle {
+            child: Arc::new(Mutex::new(Some(child))),
+            result: Some(
+                Job::spawn("croft-voice", Start::Now, || {
+                    panic!("the voice reader crashed (on purpose, in a test)")
+                })
+                .unwrap(),
+            ),
+        };
+        let mut died = false;
+        crate::test_budget::await_spawned(
+            std::time::Duration::from_secs(1),
+            "the reader's death",
+            || {
+                died |= matches!(handle.poll(), Poll::Died);
+                died
+            },
+        );
+        assert!(
+            handle.child.lock().unwrap().is_none(),
+            "the dialog is reaped"
+        );
+        // Reaped, so the pid names no process at all.
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "the dialog is gone");
     }
 
     #[test]
