@@ -1351,13 +1351,13 @@ impl DapSession {
         breakpoints: BTreeMap<PathBuf, Vec<SourceBreakpoint>>,
     ) -> Result<DapSession> {
         let host = "127.0.0.1";
-        let port = super::transport::free_port()?;
+        let port = crate::dap::transport::free_port()?;
         let args = vec![
             server_js.to_string_lossy().into_owned(),
             port.to_string(),
             host.to_string(),
         ];
-        let node_dir = super::install::node_bin_dir(node);
+        let node_dir = crate::dap::install::node_bin_dir(node);
         let transport =
             DapTransport::connect_tcp_server(node, &args, cwd, host, port, node_dir.as_deref())?;
         transport.send(initialize_request(true))?;
@@ -1386,7 +1386,7 @@ impl DapSession {
             None => start_request,
         };
         let host = "127.0.0.1";
-        let port = super::transport::free_port()?;
+        let port = crate::dap::transport::free_port()?;
         let args = vec![String::from("dap"), format!("--listen={host}:{port}")];
         let transport =
             DapTransport::connect_tcp_server(&dlv.to_string_lossy(), &args, cwd, host, port, None)?;
@@ -1965,7 +1965,7 @@ impl DapSession {
                 self.child = Some(child);
             }
             Err(e) => {
-                super::log::log(&format!("js-debug child connect failed: {e}"));
+                crate::dap::log::log(&format!("js-debug child connect failed: {e}"));
             }
         }
     }
