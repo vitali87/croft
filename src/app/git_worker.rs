@@ -16,8 +16,6 @@ pub struct GitWorker {
     root: PathBuf,
     /// The worker stopped since the last [`Self::take_stopped`].
     stopped_news: bool,
-    /// The current stop has been seen, so it is reported once.
-    stop_seen: bool,
     status: GitStatus,
     last_check: Instant,
     /// A refresh that arrived inside the `MIN_GAP` debounce window and was
@@ -58,7 +56,6 @@ impl GitWorker {
             worker,
             root: git_root,
             stopped_news: false,
-            stop_seen: false,
             status: GitStatus::default(),
             last_check: Instant::now(),
             pending: None,
@@ -126,7 +123,6 @@ impl GitWorker {
     /// user asked (#2589).
     pub fn request_status_and_changes(&mut self) {
         if self.worker.is_stopped() && self.worker.restart().is_ok() {
-            self.stop_seen = false;
             self.worker.send(GitRequest::SetRoot(self.root.clone()));
         }
         self.worker.send(GitRequest::StatusAndChanges);
@@ -181,10 +177,8 @@ impl GitWorker {
                     self.worker.send(GitRequest::StatusAndChanges);
                 }
                 WorkerPoll::Stopped => {
-                    if !std::mem::replace(&mut self.stop_seen, true) {
-                        self.stopped_news = true;
-                        changed = true;
-                    }
+                    self.stopped_news = true;
+                    changed = true;
                     break;
                 }
             }
@@ -225,7 +219,6 @@ mod tests {
                 worker: Worker::from_channels(request_tx, response_rx),
                 root: PathBuf::new(),
                 stopped_news: false,
-                stop_seen: false,
                 status: GitStatus::default(),
                 last_check: Instant::now()
                     .checked_sub(MIN_GAP * 2)
@@ -246,7 +239,6 @@ mod tests {
                 worker: Worker::from_channels(request_tx, response_rx),
                 root: PathBuf::new(),
                 stopped_news: false,
-                stop_seen: false,
                 status: GitStatus::default(),
                 last_check: Instant::now(),
                 pending: None,

@@ -102,7 +102,8 @@ pub enum WorkerPoll<T> {
     Restarted,
     /// Its thread ended again within [`RESTART_WINDOW`] of the last
     /// restart, or could not be started: it stays stopped until
-    /// [`Worker::restart`].
+    /// [`Worker::restart`]. Said once: after that the worker reads as
+    /// `Idle`, so a caller that says so on the status line says it once.
     Stopped,
 }
 
@@ -125,6 +126,8 @@ pub struct Worker<Req, Resp> {
     thread: Liveness,
     restarted_at: Option<Instant>,
     stopped: bool,
+    /// [`WorkerPoll::Stopped`] has been reported for the current stop.
+    stop_reported: bool,
 }
 
 /// How a [`Worker`] knows its thread has ended. The answer channel alone
@@ -163,6 +166,7 @@ impl<Req: Send + 'static, Resp: Send + 'static> Worker<Req, Resp> {
             thread: Liveness::Thread(thread),
             restarted_at: None,
             stopped: false,
+            stop_reported: false,
         })
     }
 
@@ -176,6 +180,9 @@ impl<Req: Send + 'static, Resp: Send + 'static> Worker<Req, Resp> {
     /// drains it in a loop until [`WorkerPoll::Idle`].
     pub fn poll(&mut self) -> WorkerPoll<Resp> {
         if self.stopped {
+            if std::mem::replace(&mut self.stop_reported, true) {
+                return WorkerPoll::Idle;
+            }
             return WorkerPoll::Stopped;
         }
         match self.rx.try_recv() {
@@ -197,6 +204,7 @@ impl<Req: Send + 'static, Resp: Send + 'static> Worker<Req, Resp> {
             .is_some_and(|at| at.elapsed() < RESTART_WINDOW);
         if again || self.restart().is_err() {
             self.stopped = true;
+            self.stop_reported = true;
             return WorkerPoll::Stopped;
         }
         WorkerPoll::Restarted
@@ -229,6 +237,7 @@ impl<Req: Send + 'static, Resp: Send + 'static> Worker<Req, Resp> {
         self.thread = Liveness::Thread(thread);
         self.restarted_at = Some(Instant::now());
         self.stopped = false;
+        self.stop_reported = false;
         Ok(())
     }
 
@@ -253,6 +262,7 @@ impl<Req, Resp> Worker<Req, Resp> {
             thread: Liveness::ChannelOnly,
             restarted_at: None,
             stopped: false,
+            stop_reported: false,
         }
     }
 }
@@ -422,10 +432,8 @@ mod tests {
         worker.send(2);
         assert!(matches!(next(&mut worker), WorkerPoll::Stopped));
         assert!(worker.is_stopped());
-        assert!(
-            matches!(worker.poll(), WorkerPoll::Stopped),
-            "it stays stopped"
-        );
+        assert!(matches!(worker.poll(), WorkerPoll::Idle), "it says so once");
+        assert!(worker.is_stopped(), "and stays stopped");
         worker.restart().unwrap();
         worker.send(3);
         assert!(matches!(next(&mut worker), WorkerPoll::Answer(3)));

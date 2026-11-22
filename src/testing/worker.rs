@@ -211,8 +211,6 @@ pub struct TestWorker {
     extensions: Option<PathBuf>,
     /// The worker stopped since the last [`Self::take_stopped`].
     stopped_news: bool,
-    /// The current stop has been seen, so it is reported once.
-    stop_seen: bool,
 }
 
 /// A response sender bound to the epoch of the request it serves, so every

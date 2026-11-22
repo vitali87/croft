@@ -48,7 +48,6 @@ impl TestWorker {
             codeql: None,
             extensions: None,
             stopped_news: false,
-            stop_seen: false,
         }
     }
 
@@ -93,7 +92,6 @@ impl TestWorker {
     /// twice starts again here: the user asked for tests (#2592).
     fn ask(&mut self, request: TestRequest) {
         if self.worker.is_stopped() && self.worker.restart().is_ok() {
-            self.stop_seen = false;
             self.resend_settings();
         }
         self.send(request);
@@ -225,11 +223,9 @@ impl TestWorker {
                     continue;
                 }
                 WorkerPoll::Stopped => {
-                    if !std::mem::replace(&mut self.stop_seen, true) {
-                        self.thread_ended(panel);
-                        self.stopped_news = true;
-                        changed = true;
-                    }
+                    self.thread_ended(panel);
+                    self.stopped_news = true;
+                    changed = true;
                     break;
                 }
             };
