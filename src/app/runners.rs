@@ -1299,7 +1299,7 @@ impl App {
                 }
             };
         let hosts: Vec<String> = picked.into_iter().cloned().collect();
-        if self.fleet_running {
+        if self.fleet_run.is_some() {
             self.status = String::from("A fleet run is already in flight");
             return;
         }
@@ -1311,17 +1311,21 @@ impl App {
         // Off the event loop: the run waits on the network for up to
         // FLEET_TIMEOUT, and blocking the loop for that would freeze the
         // editor — the user could not scroll, type, or cancel while their
-        // fleet answered. Results arrive through `fleet_rx` and are drained
-        // on a later tick, the same shape the port poll and label lookup use.
+        // fleet answered. It runs as the `fleet-run` job, collected on a
+        // later tick.
         let host_count = hosts.len();
-        let tx = self.fleet_tx.clone();
         let command = command.to_string();
         self.fleet_command = command.clone();
-        self.fleet_running = true;
-        std::thread::spawn(move || {
-            let _ = tx.send(crate::fleet::run_on_hosts(&hosts, &command, FLEET_TIMEOUT));
+        let job = crate::jobs::Job::spawn("fleet-run", crate::jobs::Start::Now, move || {
+            crate::fleet::run_on_hosts(&hosts, &command, FLEET_TIMEOUT)
         });
-        self.status = format!("Fleet: running on {host_count} hosts…");
+        match job {
+            Ok(job) => {
+                self.fleet_run = Some(job);
+                self.status = format!("Fleet: running on {host_count} hosts…");
+            }
+            Err(e) => self.status = format!("Could not start the fleet run: {e}"),
+        }
     }
 
     /// Report a finished fleet run, if one arrived (#363).
@@ -1330,67 +1334,75 @@ impl App {
     /// whether anything landed, so the caller can redraw only when there is
     /// something new.
     pub(super) fn drain_fleet_results(&mut self) -> bool {
-        // Every queued run, not just the newest. Each message is ONE run's
-        // results, unlike the label channel this idiom comes from where each
-        // message is a complete snapshot — taking `.last()` there is right
-        // and here would drop a whole run's output with no trace of it.
-        let batches: Vec<Vec<crate::fleet::HostResult>> = self.fleet_rx.try_iter().collect();
-        if batches.is_empty() {
-            return false;
-        }
-        self.fleet_running = false;
-        for results in batches {
-            let reference = crate::fleet::reference_output(&results).map(String::from);
-            for r in &results {
-                let mark = match (r.ok(), Some(r.output.as_str()) == reference.as_deref()) {
-                    (false, _) => "FAILED",
-                    (true, true) => "same",
-                    (true, false) => "DIFFERS",
-                };
+        let results = match self.fleet_run.as_ref().map(crate::jobs::Job::poll) {
+            None | Some(crate::jobs::Poll::Pending) => return false,
+            // Its thread crashed, and the crash notice said so. The run is
+            // no longer in flight, so the next one can start (#2566); FLEET
+            // says why this one has no results.
+            Some(crate::jobs::Poll::Died) => {
+                self.fleet_run = None;
                 crate::output::push(
                     crate::output::CHANNEL_FLEET,
-                    if r.ok() {
-                        crate::output::OutputLevel::Info
-                    } else {
-                        crate::output::OutputLevel::Error
-                    },
-                    &format!(
-                        "{}  [{mark}]  ({:.1}s)  {}",
-                        r.host,
-                        r.elapsed.as_secs_f64(),
-                        r.output.replace('\n', " ")
-                    ),
+                    crate::output::OutputLevel::Error,
+                    "the fleet run stopped without results",
                 );
-                // A differing host lists the lines that differ from the
-                // reference, so the row says WHAT differs, not only that
-                // something does.
-                if mark == "DIFFERS"
-                    && let Some(reference) = reference.as_deref()
-                {
-                    for line in crate::fleet::differing_lines(reference, &r.output) {
-                        crate::output::push(
-                            crate::output::CHANNEL_FLEET,
-                            crate::output::OutputLevel::Info,
-                            &format!("    {line}"),
-                        );
-                    }
-                }
+                return true;
             }
-            let summary = crate::fleet::summarise(&results, reference.as_deref());
+            Some(crate::jobs::Poll::Done(results)) => {
+                self.fleet_run = None;
+                results
+            }
+        };
+        let reference = crate::fleet::reference_output(&results).map(String::from);
+        for r in &results {
+            let mark = match (r.ok(), Some(r.output.as_str()) == reference.as_deref()) {
+                (false, _) => "FAILED",
+                (true, true) => "same",
+                (true, false) => "DIFFERS",
+            };
             crate::output::push(
                 crate::output::CHANNEL_FLEET,
-                crate::output::OutputLevel::Info,
-                &summary.line(),
+                if r.ok() {
+                    crate::output::OutputLevel::Info
+                } else {
+                    crate::output::OutputLevel::Error
+                },
+                &format!(
+                    "{}  [{mark}]  ({:.1}s)  {}",
+                    r.host,
+                    r.elapsed.as_secs_f64(),
+                    r.output.replace('\n', " ")
+                ),
             );
-            self.status = format!("Fleet: {}", summary.line());
-            // The tiles (#363); OUTPUT keeps the text record above.
-            self.editor
-                .open_fleet(crate::widgets::fleet::FleetView::new(
-                    self.fleet_command.clone(),
-                    results,
-                ));
-            self.focus_pane(Pane::Editor);
+            // A differing host lists the lines that differ from the
+            // reference, so the row says WHAT differs, not only that
+            // something does.
+            if mark == "DIFFERS"
+                && let Some(reference) = reference.as_deref()
+            {
+                for line in crate::fleet::differing_lines(reference, &r.output) {
+                    crate::output::push(
+                        crate::output::CHANNEL_FLEET,
+                        crate::output::OutputLevel::Info,
+                        &format!("    {line}"),
+                    );
+                }
+            }
         }
+        let summary = crate::fleet::summarise(&results, reference.as_deref());
+        crate::output::push(
+            crate::output::CHANNEL_FLEET,
+            crate::output::OutputLevel::Info,
+            &summary.line(),
+        );
+        self.status = format!("Fleet: {}", summary.line());
+        // The tiles (#363); OUTPUT keeps the text record above.
+        self.editor
+            .open_fleet(crate::widgets::fleet::FleetView::new(
+                self.fleet_command.clone(),
+                results,
+            ));
+        self.focus_pane(Pane::Editor);
         true
     }
 
