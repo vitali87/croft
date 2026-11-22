@@ -959,6 +959,14 @@ struct CodeScanList {
     rx: std::sync::mpsc::Receiver<Result<Vec<crate::sarif::github::Analysis>, String>>,
 }
 
+/// Chosen code scanning analyses downloading as SARIF (#577).
+struct CodeScanFetch {
+    /// What the status line said when the download started, so a download
+    /// that dies says so only while nothing newer has replaced it (#2550).
+    loading: String,
+    rx: std::sync::mpsc::Receiver<Vec<Result<PathBuf, String>>>,
+}
+
 /// A pull request head checked out into a sibling worktree (#365).
 struct PrCheckout {
     number: u64,
@@ -2205,8 +2213,9 @@ pub struct App {
     /// A code scanning lookup in flight: the branch it is for, whether to
     /// load what it finds, and where the chosen analyses arrive.
     code_scan_list: Option<CodeScanList>,
-    /// Chosen analyses fetching as SARIF: where their saved files arrive.
-    code_scan_fetch: Option<std::sync::mpsc::Receiver<Vec<Result<PathBuf, String>>>>,
+    /// Chosen analyses fetching as SARIF: what the status line said, and
+    /// where their saved files arrive.
+    code_scan_fetch: Option<CodeScanFetch>,
     /// Hosts whose provisioning failed recently (#364), loaded from the
     /// cache file at startup and extended when an install fails.
     remote_offer_refused: crate::remote::RefusedHosts,

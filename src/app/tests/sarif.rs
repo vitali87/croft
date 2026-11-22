@@ -1175,6 +1175,51 @@ fn a_code_scanning_analysis_opens_from_github_in_the_sarif_viewer() {
     });
 }
 
+/// #2550: a code scanning download whose thread dies without sending must
+/// not leave "Loading code scanning results…" with nothing coming. The
+/// download goes and the status says it stopped, as a lookup that stopped
+/// already does.
+#[test]
+fn a_code_scanning_download_that_dies_says_so() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    drop(tx);
+    app.status = String::from("Loading code scanning results for main\u{2026}");
+    app.code_scan_fetch = Some(CodeScanFetch {
+        loading: app.status.clone(),
+        rx,
+    });
+    assert!(
+        app.poll_code_scanning(),
+        "a download that died is news to draw"
+    );
+    assert!(app.code_scan_fetch.is_none(), "the download goes");
+    assert_eq!(
+        app.status,
+        "Code scanning: the download stopped without answering"
+    );
+}
+
+/// A status that has moved on since the download started (the crash notice,
+/// shown on an earlier frame than the one that finds the download gone) is
+/// left alone.
+#[test]
+fn a_code_scanning_download_that_dies_keeps_a_newer_status() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    drop(tx);
+    app.code_scan_fetch = Some(CodeScanFetch {
+        loading: String::from("Loading code scanning results for main\u{2026}"),
+        rx,
+    });
+    app.status = String::from("A background task crashed");
+    assert!(app.poll_code_scanning());
+    assert!(app.code_scan_fetch.is_none(), "the download goes");
+    assert_eq!(app.status, "A background task crashed");
+}
+
 #[cfg(unix)]
 #[test]
 fn code_scanning_reports_githubs_own_error() {

@@ -903,9 +903,18 @@ impl App {
                 }
             }
         }
-        if let Some(rx) = self.code_scan_fetch.as_ref()
-            && let Ok(files) = rx.try_recv()
-        {
+        let fetched = self.code_scan_fetch.as_ref().map(|f| f.rx.try_recv());
+        if let Some(Err(std::sync::mpsc::TryRecvError::Disconnected)) = fetched {
+            // The download thread ended without sending (a panic). Waiting on
+            // would leave "Loading code scanning results…" with nothing coming
+            // (#2550). It says the download stopped, unless something newer
+            // (the crash notice) has replaced the loading message since.
+            let loading = self.code_scan_fetch.take().map(|f| f.loading);
+            changed = true;
+            if loading.as_deref() == Some(self.status.as_str()) {
+                self.status = String::from("Code scanning: the download stopped without answering");
+            }
+        } else if let Some(Ok(files)) = fetched {
             self.code_scan_fetch = None;
             changed = true;
             let mut opened = 0;
@@ -964,8 +973,11 @@ impl App {
                 .collect();
             let _ = tx.send(files);
         });
-        self.code_scan_fetch = Some(rx);
         self.status = format!("Loading code scanning results for {shown}…");
+        self.code_scan_fetch = Some(CodeScanFetch {
+            loading: self.status.clone(),
+            rx,
+        });
     }
 
     /// Dismiss the selected result's code scanning alert (#577): the alert
