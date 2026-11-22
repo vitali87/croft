@@ -392,7 +392,7 @@ fn typed_char(key: KeyEvent) -> Option<char> {
 /// Whether a key types a character into a text field or the shell: a
 /// character with neither `Ctrl` nor `Cmd` held, the test a masked input
 /// prompt applies before it takes one, `Alt` included.
-fn types_a_character(key: KeyEvent) -> bool {
+pub(super) fn types_a_character(key: KeyEvent) -> bool {
     matches!(key.code, KeyCode::Char(_))
         && !key
             .modifiers
@@ -422,7 +422,7 @@ fn modifier_names(mods: KeyModifiers, shift: bool, macos: bool) -> Vec<&'static 
 /// A key as the palette spells shortcuts (`Ctrl+Shift+P`, `Cmd+↓`, `F5`),
 /// or `None` for one that is only a modifier going down (the kitty
 /// protocol reports those) or has no name worth a chip.
-fn key_label(key: KeyEvent, macos: bool) -> Option<String> {
+pub(super) fn key_label(key: KeyEvent, macos: bool) -> Option<String> {
     let name = match key.code {
         KeyCode::Char(' ') => String::from("Space"),
         KeyCode::Char(c) => c.to_uppercase().collect(),

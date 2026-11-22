@@ -3,10 +3,64 @@
 
 use super::*;
 
-/// How long an armed `Cmd+K` leader waits for its second key.
-pub(super) const CMD_K_LEADER_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
+/// How long an armed `Cmd+K` leader waits for its second key: VS Code's
+/// five seconds, after which it leaves chord mode on its own.
+pub(super) const CMD_K_LEADER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// How long VS Code's "is not a command" note stays in the status bar.
+pub(super) const CMD_K_MISS_NOTE_FOR: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// An armed `Cmd+K` leader: when it was pressed, and how it reads in the
+/// status bar while croft waits for the second key (`Ctrl+K`, `Cmd+K`).
+pub(super) struct CmdKLeader {
+    pub(super) at: std::time::Instant,
+    pub(super) label: String,
+}
+
+/// The status bar's line while a `Cmd+K` leader waits, VS Code's words.
+pub(super) fn cmd_k_waiting_text(leader: &str) -> String {
+    format!("({leader}) was pressed. Waiting for second key of chord...")
+}
+
+/// VS Code's note for a second key that completes no `Cmd+K` chord.
+pub(super) fn cmd_k_miss_text(leader: &str, second: &str) -> String {
+    format!("The key combination ({leader}, {second}) is not a command.")
+}
 
 impl App {
+    /// Leave `Cmd+K` chord mode once its wait is up, and take VS Code's "is
+    /// not a command" note off the bar once it has shown its ten seconds,
+    /// unless another message has replaced it since. True when either went,
+    /// so the frame without it is drawn.
+    pub(super) fn expire_cmd_k(&mut self, now: std::time::Instant) -> bool {
+        let mut changed = false;
+        if self
+            .cmd_k_leader
+            .as_ref()
+            .is_some_and(|leader| now.saturating_duration_since(leader.at) > CMD_K_LEADER_TIMEOUT)
+        {
+            self.cmd_k_leader = None;
+            changed = true;
+        }
+        if let Some((until, note)) = &self.cmd_k_miss_note
+            && now >= *until
+        {
+            if self.status == *note {
+                self.status.clear();
+            }
+            self.cmd_k_miss_note = None;
+            changed = true;
+        }
+        changed
+    }
+
+    /// The status bar's line for an armed `Cmd+K` leader, if one waits.
+    pub(super) fn cmd_k_waiting_line(&self) -> Option<String> {
+        self.cmd_k_leader
+            .as_ref()
+            .map(|leader| cmd_k_waiting_text(&leader.label))
+    }
+
     /// [`ctrl_k_leads`] for the pane that has the keyboard now.
     pub(super) fn ctrl_k_leads_here(&self) -> bool {
         let shell_focused = self.focus == Pane::Terminal
@@ -594,7 +648,8 @@ impl App {
         let leader_armed = screencast_key
             && self
                 .cmd_k_leader
-                .is_some_and(|at| at.elapsed() <= CMD_K_LEADER_TIMEOUT);
+                .as_ref()
+                .is_some_and(|leader| leader.at.elapsed() <= CMD_K_LEADER_TIMEOUT);
         let hide_typing = screencast_key && self.screencast_hides_typing();
         if screencast_key && !leader_armed {
             self.screencast
@@ -721,15 +776,42 @@ impl App {
         self.hover_diagnostic = None;
         self.hover_request_id = None;
         // `Cmd+K` leader: if armed, this keystroke is the second half of a
-        // `Cmd+K`-prefixed chord. Consume the leader regardless; dispatch the
-        // chord if it matches and the window has not lapsed, otherwise fall
-        // through so the key keeps its normal meaning (e.g. Esc cancels).
-        if let Some(started) = self.cmd_k_leader.take()
-            && started.elapsed() <= CMD_K_LEADER_TIMEOUT
-            && self.handle_cmd_k_chord(key)
+        // `Cmd+K`-prefixed chord, as in VS Code. A key that only goes down,
+        // a modifier on its way to `Shift+X` (the kitty protocol reports
+        // those), leaves the leader waiting. Any other key ends the wait:
+        // it runs the chord it completes, and one that completes none, Esc
+        // included, does nothing but say so. A leader older than
+        // `CMD_K_LEADER_TIMEOUT` has lapsed and answers nothing.
+        if let Some(leader) = self.cmd_k_leader.take()
+            && leader.at.elapsed() <= CMD_K_LEADER_TIMEOUT
         {
-            self.screencast.note_chord_step();
-            return Ok(());
+            match screencast::key_label(key, cfg!(target_os = "macos")) {
+                None => self.cmd_k_leader = Some(leader),
+                Some(second) => {
+                    // A character where typing is secret (a masked prompt,
+                    // the shell) may be the first one of a password typed
+                    // after a stray Cmd+K: neither the note nor Screencast
+                    // Mode names it.
+                    let secret =
+                        screencast::types_a_character(key) && self.screencast_hides_typing();
+                    let ran = self.handle_cmd_k_chord(key);
+                    if !ran {
+                        let second = if secret { "\u{2022}" } else { &second };
+                        self.status = cmd_k_miss_text(&leader.label, second);
+                        self.cmd_k_miss_note = Some((
+                            std::time::Instant::now() + CMD_K_MISS_NOTE_FOR,
+                            self.status.clone(),
+                        ));
+                    }
+                    // Screencast Mode shows the key as the chord's second
+                    // step, unless it is such a character that completed
+                    // nothing.
+                    if ran || !secret {
+                        self.screencast.note_chord_step();
+                    }
+                    return Ok(());
+                }
+            }
         }
         // Modal layer: the unsupported-terminal nudge sits on top of everything
         // at startup. Any key dismisses it for this session; D also persists the
@@ -1180,7 +1262,11 @@ impl App {
         // of this fn. Cmd is SUPER everywhere; off macOS Ctrl+K arms it too,
         // except in a focused shell and the vim-mode editor (`ctrl_k_leads`).
         if is_cmd_k_leader_key(key, self.ctrl_k_leads_here()) {
-            self.cmd_k_leader = Some(std::time::Instant::now());
+            self.cmd_k_leader = Some(CmdKLeader {
+                at: std::time::Instant::now(),
+                label: screencast::key_label(key, cfg!(target_os = "macos"))
+                    .unwrap_or_else(|| String::from("Cmd+K")),
+            });
             return Ok(());
         }
         if is_file_finder_key(key) {
