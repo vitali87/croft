@@ -26,14 +26,26 @@ const COLOR_SUMMARY: Color = Color::Rgb(0xCC, 0xCC, 0xCC);
 /// the file rows above (this panel draws only a bottom separator).
 const CONTENT_INDENT: u16 = 1;
 
+/// Where the tracked file's history stands, which picks the message an
+/// empty list shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Listing {
+    /// The lookup has not answered yet.
+    Loading,
+    /// The lookup answered, even with nothing.
+    Listed,
+    /// The lookup crashed or never started (#2574).
+    Failed,
+}
+
 pub struct TimelinePanel {
     pub collapsed: bool,
     /// The file the current history describes; `None` until the first fetch.
     pub path: Option<PathBuf>,
     entries: Vec<FileHistoryEntry>,
-    /// `true` once a fetch (even an empty one) has landed for `path`, so the
-    /// panel can show "No history" instead of spinning on "Loading".
-    loaded: bool,
+    /// Whether the lookup for `path` has answered, so an empty list shows
+    /// "No history" or the failure instead of spinning on "Loading".
+    listing: Listing,
     scroll: usize,
     pub focus_gradient: bool,
     pub theme: Theme,
@@ -57,7 +69,7 @@ impl TimelinePanel {
             collapsed: true,
             path: None,
             entries: Vec::new(),
-            loaded: false,
+            listing: Listing::Loading,
             scroll: 0,
             focus_gradient: false,
             theme: Theme::default(),
@@ -80,29 +92,40 @@ impl TimelinePanel {
         let same_file = self.path.as_ref() == Some(&path);
         self.path = Some(path);
         self.entries = entries;
-        self.loaded = true;
+        self.listing = Listing::Listed;
         if !same_file {
             self.scroll = 0;
         }
     }
 
     /// Mark the panel as loading history for `path` (the active file just
-    /// changed). Shows "Loading" until the background fetch lands. No-op when
-    /// already tracking `path`, so it never resets a fetched view.
+    /// changed). Shows "Loading" until the background fetch lands. When
+    /// already tracking `path` it never resets a fetched view, but a lookup
+    /// that had failed is loading again.
     pub fn begin_loading(&mut self, path: PathBuf) {
         if self.path.as_ref() != Some(&path) {
             self.path = Some(path);
             self.entries.clear();
-            self.loaded = false;
+            self.listing = Listing::Loading;
             self.scroll = 0;
+        } else if self.listing == Listing::Failed {
+            self.listing = Listing::Loading;
         }
+    }
+
+    /// The lookup crashed or could not start: say so rather than "Loading"
+    /// for a history that is not coming (#2574).
+    pub fn set_failed(&mut self) {
+        self.entries.clear();
+        self.listing = Listing::Failed;
+        self.scroll = 0;
     }
 
     /// Forget the history (the editor returned to the welcome screen).
     pub fn clear(&mut self) {
         self.path = None;
         self.entries.clear();
-        self.loaded = false;
+        self.listing = Listing::Loading;
         self.scroll = 0;
     }
 
@@ -253,12 +276,11 @@ impl Widget for &mut TimelinePanel {
         self.viewport_rows = body_h;
 
         if self.entries.is_empty() {
-            let msg = if self.path.is_some() && !self.loaded {
-                "Loading"
-            } else if self.path.is_some() {
-                "No history"
-            } else {
-                "No file open"
+            let msg = match (&self.path, self.listing) {
+                (None, _) => "No file open",
+                (Some(_), Listing::Loading) => "Loading",
+                (Some(_), Listing::Listed) => "No history",
+                (Some(_), Listing::Failed) => "Could not load history",
             };
             Paragraph::new(Line::from(Span::styled(
                 msg,
@@ -390,6 +412,21 @@ mod tests {
         p.set_history("a.rs".into(), vec![]);
         let text = rendered_text(&mut p, 30, 6);
         assert!(text.contains("No history"), "got:\n{text}");
+    }
+
+    /// #2574: a lookup that crashed says so, and the next lookup for the
+    /// same file shows "Loading" again rather than the old failure.
+    #[test]
+    fn a_failed_lookup_says_so_until_the_next_one_starts() {
+        let mut p = TimelinePanel::new();
+        p.collapsed = false;
+        p.begin_loading("a.rs".into());
+        p.set_failed();
+        let text = rendered_text(&mut p, 30, 6);
+        assert!(text.contains("Could not load history"), "got:\n{text}");
+        p.begin_loading("a.rs".into());
+        let text = rendered_text(&mut p, 30, 6);
+        assert!(text.contains("Loading"), "got:\n{text}");
     }
 
     #[test]

@@ -1545,10 +1545,10 @@ pub struct App {
     /// When a format-on-save stops waiting on its formatter and writes the
     /// file unformatted (#1491). Set with `save_after_format`.
     format_save_deadline: Option<std::time::Instant>,
-    /// Background `git log` results for the TIMELINE, keyed by the file they
-    /// describe so a stale reply for a since-closed file is ignored on drain.
-    timeline_rx: std::sync::mpsc::Receiver<(PathBuf, Vec<crate::git::FileHistoryEntry>)>,
-    timeline_tx: std::sync::mpsc::Sender<(PathBuf, Vec<crate::git::FileHistoryEntry>)>,
+    /// The TIMELINE lookup for the active file, while it runs, tagged with
+    /// the file it describes. Starting another drops it, so an older list can
+    /// never replace a newer one (#2575).
+    timeline_fetch: Option<crate::jobs::Job<(PathBuf, Vec<crate::git::FileHistoryEntry>)>>,
     /// Background folder-size scans for the CodeQL database card (#578): a
     /// large database is many files, so the walk stays off the input path.
     codeql_size_rx: std::sync::mpsc::Receiver<(PathBuf, Option<u64>)>,
@@ -4197,7 +4197,6 @@ impl App {
         } else {
             crate::mcp::catalog::installed_ids(&crate::lsp::manifest::user_extensions_dir())
         };
-        let (timeline_tx, timeline_rx) = std::sync::mpsc::channel();
         let (codeql_size_tx, codeql_size_rx) = std::sync::mpsc::channel();
         let (history_done_tx, history_done_rx) = std::sync::mpsc::channel();
         let (project_hint_tx, project_hint_rx) = std::sync::mpsc::channel();
@@ -4348,8 +4347,7 @@ impl App {
             explorer_views,
             settings_chain: merged_settings.chain,
             settings_provenance: merged_settings.provenance,
-            timeline_rx,
-            timeline_tx,
+            timeline_fetch: None,
             codeql_size_rx,
             codeql_size_tx,
             codeql_size_pending: std::collections::HashSet::new(),

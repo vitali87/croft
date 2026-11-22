@@ -2160,6 +2160,94 @@ fn a_lookup_for_the_folder_just_left_never_lands_in_the_new_one() {
     assert!(!text.contains("serde"), "got:\n{text}");
 }
 
+/// An app on a repo whose committed `seed.txt` is open, with the TIMELINE
+/// section shown and open.
+fn seed_timeline_app() -> (tempfile::TempDir, App, PathBuf) {
+    let tmp = make_committed_repo();
+    let file = tmp.path().join("seed.txt");
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.open_file_at_launch(&file);
+    if !app.explorer_views.is_visible(ExplorerView::Timeline) {
+        app.explorer_views.toggle(ExplorerView::Timeline);
+    }
+    app.timeline.collapsed = false;
+    (tmp, app, file)
+}
+
+/// The TIMELINE section as it draws.
+fn timeline_text(app: &mut App) -> String {
+    let area = ratatui::layout::Rect::new(0, 0, 40, 8);
+    let mut buf = ratatui::buffer::Buffer::empty(area);
+    ratatui::widgets::Widget::render(&mut app.timeline, area, &mut buf);
+    (0..area.height)
+        .map(|y| {
+            (0..area.width)
+                .map(|x| buf[(x, y)].symbol())
+                .collect::<String>()
+                + "\n"
+        })
+        .collect()
+}
+
+/// #2574: a TIMELINE lookup whose thread crashed settles the section on
+/// saying so, instead of "Loading" until another file is opened.
+#[test]
+fn a_timeline_lookup_whose_thread_crashed_says_it_could_not_load() {
+    let (_tmp, mut app, _file) = seed_timeline_app();
+    app.sync_explorer_panels();
+    app.timeline_fetch = Some(
+        crate::jobs::Job::spawn(
+            "timeline",
+            crate::jobs::Start::Now,
+            || -> (PathBuf, Vec<crate::git::FileHistoryEntry>) {
+                panic!("the lookup crashed (on purpose, in a test)")
+            },
+        )
+        .unwrap(),
+    );
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(1),
+        "the crashed lookup to settle",
+        || {
+            app.sync_explorer_panels();
+            app.timeline_fetch.is_none()
+        },
+    );
+    let text = timeline_text(&mut app);
+    assert!(text.contains("Could not load history"), "got:\n{text}");
+    assert!(!text.contains("Loading"), "got:\n{text}");
+}
+
+/// #2575: starting a lookup drops the one still out, so an older list for
+/// the same file, read before the newest version existed, can never
+/// replace the newer one, even when it answers last.
+#[test]
+fn an_older_timeline_lookup_never_replaces_a_newer_one() {
+    let (_tmp, mut app, file) = seed_timeline_app();
+    // An older lookup for this file is still out, and has answered.
+    app.timeline_fetch = Some(crate::jobs::Job::finished((
+        file,
+        vec![crate::git::FileHistoryEntry {
+            short_hash: "0ld0ld0".into(),
+            summary: "an older list".into(),
+            author: "someone".into(),
+            age_secs: 60,
+        }],
+    )));
+    // A save's new version asks for the history again.
+    app.timeline_fetched = None;
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(5),
+        "the newer list to land",
+        || {
+            app.sync_explorer_panels();
+            timeline_text(&mut app).contains("init")
+        },
+    );
+    let text = timeline_text(&mut app);
+    assert!(!text.contains("an older list"), "got:\n{text}");
+}
+
 #[test]
 fn toggling_an_explorer_view_flips_and_persists_its_visibility() {
     let tmp = tempfile::tempdir().unwrap();
