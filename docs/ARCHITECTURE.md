@@ -364,6 +364,7 @@ src/
 │       ├── js_args.rs           vitest's and jest's command lines, and the arguments that pick a test, a suite or a file
 │       ├── pytest.rs            pytest's command line: which Python or script runs it, and its verbosity
 │       ├── runners.rs           which runner runs a folder's, a file's or a test's tests
+│       ├── runs.rs              running every test, one, several, or a filter's
 │       ├── streaming.rs         streaming a runner's output, tagged with its request, and its exit code
 │       ├── test_binaries.rs     the cargo test harnesses built, and the one that holds a test
 │       ├── tests.rs             the test runner's own tests
