@@ -1313,7 +1313,7 @@ fn source_control_with_a_staged_and_an_unstaged_change() {
             app.source_control.entries.len() == 2
                 && app.default_branch_ask.is_none()
                 && app.commit_graph.is_loaded()
-                && !app.graph_fetch_inflight
+                && !app.graph_fetch.is_some()
         },
     );
     workbench_scene("source-control", &mut app);

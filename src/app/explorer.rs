@@ -744,14 +744,25 @@ impl App {
                 changed = true;
             }
         }
-        // Drain any COMMITS graph replies; ignore one for a since-left root.
-        while let Ok((root, revspec, rows)) = self.graph_rx.try_recv() {
-            self.graph_fetch_inflight = false;
-            if root == self.active_scm_root && revspec == self.graph_revspec {
+        // Collect the COMMITS graph fetch; ignore a reply for a since-left root.
+        let settled = match self.graph_fetch.as_ref().map(crate::jobs::Job::poll) {
+            None | Some(crate::jobs::Poll::Pending) => None,
+            Some(crate::jobs::Poll::Done(reply)) => Some(Some(reply)),
+            // Its thread crashed, and the crash notice said so. It is no
+            // longer running, so the next refresh fetches again instead of
+            // waiting on it until a restart (#2564).
+            Some(crate::jobs::Poll::Died) => Some(None),
+        };
+        if let Some(reply) = settled {
+            self.graph_fetch = None;
+            if let Some((root, revspec, rows)) = reply
+                && root == self.active_scm_root
+                && revspec == self.graph_revspec
+            {
                 self.commit_graph.set_rows(rows);
                 changed = true;
             }
-            // A trigger arrived while this reply was in flight: what it
+            // A trigger arrived while this fetch was in flight: what it
             // asked for (new root, newer HEAD) is not what just landed.
             if self.graph_refetch_queued {
                 self.graph_refetch_queued = false;

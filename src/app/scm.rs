@@ -109,10 +109,6 @@ pub(super) type GraphReply = (
     Vec<crate::widgets::commit_graph::GraphRow>,
 );
 
-pub(super) type GraphReplyRx = std::sync::mpsc::Receiver<GraphReply>;
-
-pub(super) type GraphReplyTx = std::sync::mpsc::Sender<GraphReply>;
-
 impl App {
     /// Re-query git status, but no more than once every ~400ms to avoid
     /// spawning a `git` process on every keystroke.  Called after the file
@@ -1366,32 +1362,34 @@ impl App {
     }
 
     /// Refetch the COMMITS graph off-thread: `git log --topo-order` plus the
-    /// pure lane layout both run on the fetch thread, and the finished rows
-    /// land in [`graph_rx`] tagged with the root they describe. The inflight
-    /// latch collapses a burst of triggers into one shell-out plus one
+    /// pure lane layout both run as the `commit-graph` job, and the finished
+    /// rows come back tagged with the root they describe. The job in flight
+    /// collapses a burst of triggers into one shell-out plus one
     /// queued refetch: a trigger during flight is answering a question the
     /// in-flight fetch predates (a Make Root, a newer HEAD), so it must
     /// re-fire when the reply drains rather than be dropped — a root change
     /// racing the fetch otherwise left the panel on "Loading" until HEAD
     /// next moved.
     pub(super) fn refresh_commit_graph(&mut self) {
-        if self.graph_fetch_inflight {
+        if self.graph_fetch.is_some() {
             self.graph_refetch_queued = true;
             return;
         }
-        self.graph_fetch_inflight = true;
         // The COMMITS section follows the active repo (#149).
         let root = self.active_scm_root.clone();
         let revspec = self.graph_revspec.clone();
-        let tx = self.graph_tx.clone();
-        std::thread::spawn(move || {
+        let job = crate::jobs::Job::spawn("commit-graph", crate::jobs::Start::Now, move || {
             let commits = match revspec.as_deref() {
                 Some(spec) => crate::git::branch_history_range(&root, spec, 400),
                 None => crate::git::commit_graph(&root, 400),
             };
             let rows = crate::widgets::commit_graph::layout_graph(commits);
-            let _ = tx.send((root, revspec, rows));
+            (root, revspec, rows)
         });
+        match job {
+            Ok(job) => self.graph_fetch = Some(job),
+            Err(e) => self.status = format!("Could not start the commit graph: {e}"),
+        }
     }
 
     /// View Stash (#1581): stash `index`'s changes against the commit it
