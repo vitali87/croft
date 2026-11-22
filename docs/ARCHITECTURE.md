@@ -329,6 +329,7 @@ src/
 │   │   ├── debug_test.rs        the configuration for debugging tests, laid over croft's pytest launch
 │   │   ├── discovery.rs         finding every launch.json and what it declares, and the folders a name points at
 │   │   ├── env_files.rs         reading a dotenv `envFile`: quotes, escapes, comments and `${NAME}` references
+│   │   ├── go.rs                delve's requests, `auto` mode, and Connect to server
 │   │   ├── inputs.rs            the `inputs` array, the `${input:id}` ids a configuration uses, and which are still to ask
 │   │   ├── lldb.rs              lldb-dap's requests, the processes to attach to, and building a `cargo` block
 │   │   ├── presentation.rs      `presentation` blocks: hidden entries, groups and order, and the picker's sort
