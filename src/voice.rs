@@ -222,7 +222,8 @@ impl VoiceHandle {
 
     /// The session's result, nothing yet, or that its reader crashed, once:
     /// after either it reads as still waiting. A crashed reader never
-    /// cleared the listening flag, so it is cleared here.
+    /// cleared the listening flag, so it is cleared here, and the dialog it
+    /// was reading is closed and reaped.
     pub fn poll(&mut self) -> Poll<VoiceMsg> {
         let Some(result) = &self.result else {
             return Poll::Pending;
@@ -232,6 +233,13 @@ impl VoiceHandle {
             self.result = None;
         }
         if matches!(poll, Poll::Died) {
+            // Nothing will read the dialog's answer or reap it now: close it
+            // as a cancel tap would, and reap it, so it does not keep the
+            // microphone after the session has ended (#2603 review).
+            self.stop();
+            if let Some(mut child) = self.child.lock().ok().and_then(|mut guard| guard.take()) {
+                let _ = child.wait();
+            }
             set_listening(false);
         }
         poll
@@ -399,6 +407,48 @@ mod tests {
         assert_eq!(install_state(), InstallState::Done);
         set_install_state(InstallState::Idle);
         assert_eq!(install_state(), InstallState::Idle);
+    }
+
+    /// #2603 review: a session whose reader crashed closes the dialog it
+    /// was reading, its whole process group, and reaps it, so it does not
+    /// keep the microphone after the session has ended.
+    #[cfg(unix)]
+    #[test]
+    fn a_session_whose_reader_crashed_closes_its_dialog() {
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30");
+        unsafe {
+            cmd.pre_exec(|| {
+                libc::setsid();
+                Ok(())
+            });
+        }
+        let child = cmd.spawn().unwrap();
+        let pid = child.id() as i32;
+        let mut handle = VoiceHandle {
+            child: Arc::new(Mutex::new(Some(child))),
+            result: Some(
+                Job::spawn("croft-voice", Start::Now, || {
+                    panic!("the voice reader crashed (on purpose, in a test)")
+                })
+                .unwrap(),
+            ),
+        };
+        let mut died = false;
+        crate::test_budget::await_spawned(
+            std::time::Duration::from_secs(1),
+            "the reader's death",
+            || {
+                died |= matches!(handle.poll(), Poll::Died);
+                died
+            },
+        );
+        assert!(
+            handle.child.lock().unwrap().is_none(),
+            "the dialog is reaped"
+        );
+        // Reaped, so the pid names no process at all.
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "the dialog is gone");
     }
 
     #[test]
