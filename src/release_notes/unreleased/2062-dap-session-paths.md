@@ -1,1 +1,0 @@
-refactor: Groundwork for the refactor program (#2062): the debug session names the debugger modules it calls (the transport, the installer and the wire log) by their full paths, as `crate::dap::…` rather than `super::…`, so its code still finds them once `session.rs` is split into feature files a level down. Nothing changes in use.
