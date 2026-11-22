@@ -4213,3 +4213,120 @@ fn share_links_refuse_what_the_remote_cannot_show() {
     std::fs::write(outside.path().join("a.txt"), "x").unwrap();
     assert!(share_link(&outside.path().join("a.txt"), None, LinkRev::Commit).is_err());
 }
+
+/// #2577: a repository whose `main` has two commits, so a ref can be moved
+/// back and forth between them.
+fn repo_with_two_commits() -> TempDir {
+    let tmp = TempDir::new().unwrap();
+    init_repo_with_commit(tmp.path());
+    git_in(
+        tmp.path(),
+        &["commit", "-q", "--allow-empty", "-m", "second"],
+    );
+    tmp
+}
+
+/// #2577: a watch on `p` with its stamps taken, and still quiet.
+fn settled_watch(p: &Path) -> GitStateWatch {
+    let mut watch = GitStateWatch::default();
+    assert!(!watch.moved(&query(p)), "the first look only takes stamps");
+    assert!(!watch.moved(&query(p)), "nothing moved yet");
+    watch
+}
+
+/// #2577: a commit run outside croft moves the git state once.
+#[test]
+fn an_outside_commit_moves_the_git_state() {
+    let tmp = repo_with_two_commits();
+    let p = tmp.path();
+    let mut watch = settled_watch(p);
+    git_in(p, &["commit", "-q", "--allow-empty", "-m", "made outside"]);
+    assert!(watch.moved(&query(p)), "the commit is seen");
+    assert!(!watch.moved(&query(p)), "and only once");
+}
+
+/// #2577: staging and checkouts run outside croft move the git state.
+#[test]
+fn outside_staging_and_checkout_move_the_git_state() {
+    let tmp = repo_with_two_commits();
+    let p = tmp.path();
+    std::fs::write(p.join("seed.txt"), "changed\n").unwrap();
+    let mut watch = settled_watch(p);
+    git_in(p, &["add", "seed.txt"]);
+    assert!(watch.moved(&query(p)), "staging is seen");
+    git_in(p, &["checkout", "-q", "-b", "other"]);
+    assert!(watch.moved(&query(p)), "a checkout is seen");
+}
+
+/// #2577 and #898: croft's own status reads write nothing git's state is
+/// stamped from, even when the index's stat data is out of date and a
+/// plain `git status` would rewrite it, so a refresh cannot set off the
+/// next one.
+#[test]
+fn croft_s_own_status_reads_leave_the_git_state_still() {
+    let tmp = repo_with_two_commits();
+    let p = tmp.path();
+    let mut watch = settled_watch(p);
+    // Same bytes, new mtime: the index's stat data for it is now stale.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    std::fs::write(p.join("seed.txt"), "one\ntwo\n").unwrap();
+    for _ in 0..3 {
+        let status = query(p);
+        let _ = query_changes(p);
+        assert!(!watch.moved(&status), "a status read moved git's state");
+    }
+}
+
+/// #2577: a push run outside croft moves the upstream the ahead count is
+/// measured from, and that is seen.
+#[test]
+fn an_outside_push_moves_the_upstream() {
+    let tmp = repo_with_two_commits();
+    let p = tmp.path();
+    // A remote that is never contacted: the upstream only has to resolve.
+    git_in(
+        p,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://example.invalid/repo.git",
+        ],
+    );
+    git_in(p, &["update-ref", "refs/remotes/origin/main", "HEAD~1"]);
+    git_in(p, &["config", "branch.main.remote", "origin"]);
+    git_in(p, &["config", "branch.main.merge", "refs/heads/main"]);
+    let status = query(p);
+    assert_eq!(status.upstream.as_deref(), Some("refs/remotes/origin/main"));
+    assert_eq!(status.ahead, 1);
+    let mut watch = settled_watch(p);
+    // What a push leaves behind: the remote-tracking ref moved to HEAD.
+    git_in(p, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    assert!(watch.moved(&query(p)), "the push is seen");
+    assert_eq!(query(p).ahead, 0);
+}
+
+/// #2577: in a linked worktree, `.git` is a file naming the worktree's own
+/// git dir, whose `commondir` names the shared one; a commit there is seen.
+#[test]
+fn a_commit_in_a_linked_worktree_moves_its_git_state() {
+    let tmp = TempDir::new().unwrap();
+    let p = tmp.path().join("main");
+    std::fs::create_dir(&p).unwrap();
+    init_repo_with_commit(&p);
+    let wt = tmp.path().join("wt");
+    git_in(
+        &p,
+        &["worktree", "add", "-q", "-b", "other", wt.to_str().unwrap()],
+    );
+    let dirs = git_dirs(&wt).expect("the worktree's git dirs");
+    let canon = |d: &Path| d.canonicalize().unwrap();
+    assert_eq!(canon(&dirs.git_dir), canon(&p.join(".git/worktrees/wt")));
+    assert_eq!(canon(&dirs.common_dir), canon(&p.join(".git")));
+    let mut watch = settled_watch(&wt);
+    git_in(
+        &wt,
+        &["commit", "-q", "--allow-empty", "-m", "made outside"],
+    );
+    assert!(watch.moved(&query(&wt)), "the worktree's commit is seen");
+}

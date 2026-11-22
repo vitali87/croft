@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
 
-use crate::git::{GitRequest, GitResponse, GitStatus, git_worker_loop};
+use crate::git::{GitRequest, GitResponse, GitStateWatch, GitStatus, git_worker_loop};
 use crate::widgets::source_control::SourceControlPanel;
 
 const MIN_GAP: Duration = Duration::from_millis(400);
@@ -24,6 +24,9 @@ pub struct GitWorker {
     /// alone would never re-run that view; "a status refresh completed" is
     /// the signal that the index may have moved.
     status_arrived: bool,
+    /// Stamps on the files in git's own folder that git used outside croft
+    /// writes (#2577); see [`Self::refresh_if_git_moved`].
+    state_watch: GitStateWatch,
 }
 
 impl GitWorker {
@@ -43,6 +46,7 @@ impl GitWorker {
             last_check: Instant::now(),
             pending: None,
             status_arrived: false,
+            state_watch: GitStateWatch::default(),
         }
     }
 
@@ -83,6 +87,18 @@ impl GitWorker {
             self.last_check = Instant::now();
             let _ = self.request_tx.send(req);
         }
+    }
+
+    /// Re-read the status when git's own state moved since the last call:
+    /// a commit, checkout, staging, fetch or push run outside croft (#2577),
+    /// which the file watcher cannot see. A few file stamps, so it rides the
+    /// watcher's poll. Debounced like any refresh. True when it asked.
+    pub fn refresh_if_git_moved(&mut self, want_changes: bool) -> bool {
+        if !self.state_watch.moved(&self.status) {
+            return false;
+        }
+        self.request_status_debounced(want_changes);
+        true
     }
 
     /// Refresh the full source-control state in one shot: branch, ahead/behind,
@@ -167,6 +183,7 @@ mod tests {
                     .unwrap_or_else(Instant::now),
                 pending: None,
                 status_arrived: false,
+                state_watch: GitStateWatch::default(),
             };
             (worker, request_rx)
         }
@@ -183,6 +200,7 @@ mod tests {
                 last_check: Instant::now(),
                 pending: None,
                 status_arrived: false,
+                state_watch: GitStateWatch::default(),
             };
             (worker, response_tx)
         }

@@ -121,6 +121,19 @@ impl App {
         }
     }
 
+    /// Re-read git status for each repository whose git state moved outside
+    /// croft (#2577): a commit, checkout, staging, fetch or push run in
+    /// another terminal changes only git's own folder, which the file
+    /// watcher skips. Called on the watcher's poll. True when any asked.
+    pub(super) fn refresh_git_status_if_git_moved(&mut self) -> bool {
+        let want_changes = self.sidebar_view == SidebarView::SourceControl;
+        let mut asked = self.git.refresh_if_git_moved(want_changes);
+        for (_, w) in &mut self.git_extra {
+            asked |= w.refresh_if_git_moved(want_changes);
+        }
+        asked
+    }
+
     /// Drain everything the git worker has shipped back since the last
     /// tick and apply each response to the matching cache (`git_status`
     /// for the status-bar badge, `source_control.entries` for the SC

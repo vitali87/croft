@@ -448,6 +448,7 @@ fn branch_status(dirty: bool) -> crate::git::GitStatus {
         prepared_message: None,
         operation: None,
         rebasing_branch: None,
+        upstream: None,
     }
 }
 
@@ -533,6 +534,7 @@ fn git_status_spans_renders_detached_hash_when_no_branch() {
         prepared_message: None,
         operation: None,
         rebasing_branch: None,
+        upstream: None,
     };
     let spans = git_status_spans(&st, crate::theme::Theme::default());
     let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
@@ -556,6 +558,7 @@ fn git_status_spans_renders_ahead_behind_counts() {
         prepared_message: None,
         operation: None,
         rebasing_branch: None,
+        upstream: None,
     };
     let spans = git_status_spans(&st, crate::theme::Theme::default());
     let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
@@ -4185,6 +4188,69 @@ fn commit_graph_app(p: &std::path::Path) -> App {
         ));
     draw(&mut app, 110, 44);
     app
+}
+
+/// Whether COMMITS, drawn, shows the commit whose summary is `summary`.
+fn commits_show(app: &mut App, summary: &str) -> bool {
+    draw(app, 110, 44);
+    let area = app.commit_graph.last_area;
+    (area.y..area.y + area.height).any(|y| {
+        app.commit_graph
+            .commit_at(y)
+            .is_some_and(|c| c.summary == summary)
+    })
+}
+
+/// One pass of the main loop's file, git and Explorer steps.
+fn run_git_ticks(app: &mut App) {
+    app.poll_filesystem_changes();
+    app.try_install_pending_init();
+    app.sync_explorer_panels();
+}
+
+/// #2577: a commit run in another terminal reaches COMMITS with nothing
+/// done in croft. It changes only git's own folder, which the file
+/// watcher skips, so before the fix COMMITS stayed stale until a file in
+/// the folder changed or Source Control was opened again.
+#[test]
+fn a_commit_made_outside_croft_reaches_commits() {
+    let tmp = commit_actions_repo();
+    let p = tmp.path();
+    let mut app = App::new(p.to_path_buf()).unwrap();
+    app.show_tree = true;
+    app.set_sidebar_view(SidebarView::SourceControl);
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(5),
+        "COMMITS to show the history",
+        || {
+            run_git_ticks(&mut app);
+            commits_show(&mut app, "update readme")
+        },
+    );
+    // Let the first status land and its git state be stamped, as the next
+    // poll would, so what follows is a change to it.
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(5),
+        "the first status",
+        || {
+            run_git_ticks(&mut app);
+            app.git.status().head_oid.is_some()
+        },
+    );
+    app.git.refresh_if_git_moved(true);
+    assert!(git_succeeds(
+        p,
+        &["commit", "-q", "--allow-empty", "-m", "made outside"]
+    ));
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(5),
+        "COMMITS to show the outside commit",
+        || {
+            run_git_ticks(&mut app);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            commits_show(&mut app, "made outside")
+        },
+    );
 }
 
 /// Right-click the COMMITS row whose summary is `summary`.
