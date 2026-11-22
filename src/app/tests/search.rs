@@ -2765,6 +2765,41 @@ fn a_search_stopped_by_leaving_search_runs_again_on_coming_back() {
     );
 }
 
+/// #2611: a search whose scan crashed is not left "still running": the
+/// panel takes it as stopped, Replace All asks for a new search, and Refresh
+/// runs it again.
+#[test]
+fn a_search_whose_scan_crashed_stops_and_can_be_run_again() {
+    use crate::widgets::search::SearchEvent;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::Search);
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.search_results_rx = rx;
+    app.search.query = String::from("needle");
+    app.search.replace = String::from("pin");
+    app.submit_search_query();
+    let run = app.search.run;
+    tx.send(SearchEvent::Crashed(run)).unwrap();
+    assert!(app.drain_search_results());
+    assert_eq!(app.search.progress, SearchProgress::Crashed);
+    app.run_search_replace_all();
+    assert!(app.pending_replace_all.is_none(), "nothing is replaced");
+    assert!(
+        app.status.contains("stopped when its scan crashed"),
+        "{}",
+        app.status
+    );
+    // Coming back to Search does not run a crashed search again on its own.
+    app.set_sidebar_view(SidebarView::Explorer);
+    app.set_sidebar_view(SidebarView::Search);
+    assert_eq!(app.search.run, run);
+    // Refresh does.
+    app.submit_search_query();
+    assert!(app.search.run > run);
+    assert_eq!(app.search.progress, SearchProgress::Running);
+}
+
 /// #2608: a new Explorer root cuts the run in flight short: its hits for
 /// the old root are dropped instead of landing in the cleared list, and the
 /// search is not taken as finished.

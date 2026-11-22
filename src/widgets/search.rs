@@ -85,6 +85,9 @@ pub enum SearchProgress {
     /// Search or the workspace's folders changed: the list is not the whole
     /// answer, and coming back to Search runs it again.
     Cancelled,
+    /// Its scan crashed before it looked at every file: the list is not the
+    /// whole answer, and Refresh runs it again (#2611).
+    Crashed,
 }
 
 /// Side-panel widget shown when the active sidebar view is "Search".

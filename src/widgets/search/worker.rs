@@ -2,6 +2,7 @@
 //! with, and the pause in typing it waits for before a search starts.
 
 use super::*;
+use crate::jobs::{Job, Poll, Start};
 
 /// One unit of streamed output from the search worker, for the search run
 /// whose number it carries. The panel keeps only the events of the run it is
@@ -17,6 +18,9 @@ pub enum SearchEvent {
     /// The run was stopped before it looked at every file, by a request
     /// that came after it: the hits so far are not all of them.
     Cancelled(u64),
+    /// The run's scan crashed before it looked at every file. The crash
+    /// notice has said so; the hits so far are not all of them (#2611).
+    Crashed(u64),
 }
 
 /// Work submitted to the search worker. `Query` carries the query string and
@@ -79,20 +83,29 @@ pub fn search_worker_loop(
     rx: std::sync::mpsc::Receiver<SearchRequest>,
     tx: std::sync::mpsc::Sender<SearchEvent>,
 ) {
+    search_worker_loop_with(root, rx, tx, scan_root);
+}
+
+/// [`search_worker_loop`], scanning each root with `scan_root_fn`.
+pub(super) fn search_worker_loop_with(
+    root: PathBuf,
+    rx: std::sync::mpsc::Receiver<SearchRequest>,
+    tx: std::sync::mpsc::Sender<SearchEvent>,
+    scan_root_fn: ScanRoot,
+) {
     let mut roots: Vec<PathBuf> = vec![root];
     use std::sync::mpsc::RecvTimeoutError;
-    let mut current: Option<(std::thread::JoinHandle<()>, Arc<AtomicBool>)> = None;
+    let mut current: Option<Scan> = None;
     // Latest snapshot of unsaved editor buffers, refreshed by SetDirtyBuffers.
     let mut dirty: Vec<(PathBuf, String)> = Vec::new();
     // Latest include/exclude glob filter, refreshed by SetFilter.
     let mut filter = PathFilter::default();
-    'requests: while let Ok(mut latest) = rx.recv() {
+    'requests: while let Some(mut latest) = next_request(&rx, &mut current, &tx) {
         // A new message landed: cancel the in-flight scan (if any) so its
         // worker thread bails out before the user pauses long enough to
         // trigger the next scan.
-        if let Some((handle, cancel)) = current.take() {
-            cancel.store(true, Ordering::Relaxed);
-            let _ = handle.join();
+        if let Some(scan) = current.take() {
+            scan.stop(&tx);
         }
         // State updates (root rebind, dirty-buffer snapshot) are not queries
         // and do not debounce: apply and wait for the next message. A
@@ -162,7 +175,7 @@ pub fn search_worker_loop(
         let query_for_thread = query.clone();
         let dirty_for_thread = dirty.clone();
         let filter_for_thread = filter.clone();
-        let handle = std::thread::spawn(move || {
+        let spawned = Job::spawn("search-scan", Start::Now, move || {
             let tx_for_emit = tx_for_thread.clone();
             // First, search the unsaved buffers in-memory and collect the set
             // of their canonical paths so the disk walk skips the stale copies.
@@ -196,16 +209,16 @@ pub fn search_worker_loop(
                 if cancel_for_thread.load(Ordering::Relaxed) {
                     break;
                 }
-                let tx_for_root = tx_for_emit.clone();
-                search_workspace_streaming_filtered(
+                scan_root_fn(
                     scan_root,
                     &query_for_thread,
                     opts,
                     &cancel_for_thread,
                     &skip,
                     &filter_for_thread,
-                    move |batch| {
-                        let _ = tx_for_root.send(SearchEvent::Hits(run, batch));
+                    Emit {
+                        tx: tx_for_emit.clone(),
+                        run,
                     },
                 );
             }
@@ -216,10 +229,106 @@ pub fn search_worker_loop(
                 SearchEvent::Done(run)
             });
         });
-        current = Some((handle, cancel));
+        match spawned {
+            Ok(job) => current = Some(Scan { job, cancel, run }),
+            // No thread for the scan: the run ends here, as one that crashed.
+            Err(_) => {
+                if tx.send(SearchEvent::Crashed(run)).is_err() {
+                    return;
+                }
+            }
+        }
     }
-    if let Some((handle, cancel)) = current.take() {
-        cancel.store(true, Ordering::Relaxed);
-        let _ = handle.join();
+    if let Some(scan) = current.take() {
+        scan.stop(&tx);
     }
+}
+
+/// How often the worker looks at the scan in flight while it waits for a
+/// request, so a scan that crashed is reported within a moment.
+const SCAN_WATCH: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// A scan in flight: its job, the flag that stops it, and its run.
+struct Scan {
+    job: Job<()>,
+    cancel: Arc<AtomicBool>,
+    run: u64,
+}
+
+impl Scan {
+    /// Stop it, and wait until it has ended. One whose thread crashed says
+    /// so for its run: the panel may still be waiting on it, as after a
+    /// `Cancel` (#2611).
+    fn stop(self, tx: &std::sync::mpsc::Sender<SearchEvent>) {
+        self.cancel.store(true, Ordering::Relaxed);
+        if self.job.wait().is_none() {
+            let _ = tx.send(SearchEvent::Crashed(self.run));
+        }
+    }
+}
+
+/// The next request, or `None` once the panel has gone. While it waits it
+/// watches the scan in flight, and reports one whose thread crashed as
+/// `Crashed` for its run, so the panel never waits on it for good (#2611).
+fn next_request(
+    rx: &std::sync::mpsc::Receiver<SearchRequest>,
+    current: &mut Option<Scan>,
+    tx: &std::sync::mpsc::Sender<SearchEvent>,
+) -> Option<SearchRequest> {
+    use std::sync::mpsc::RecvTimeoutError;
+    loop {
+        let Some(scan) = current.as_ref() else {
+            return rx.recv().ok();
+        };
+        match rx.recv_timeout(SCAN_WATCH) {
+            Ok(request) => return Some(request),
+            Err(RecvTimeoutError::Disconnected) => return None,
+            Err(RecvTimeoutError::Timeout) => {
+                let run = scan.run;
+                match scan.job.poll() {
+                    Poll::Pending => {}
+                    Poll::Done(()) => *current = None,
+                    Poll::Died => {
+                        *current = None;
+                        if tx.send(SearchEvent::Crashed(run)).is_err() {
+                            return None;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Where a scan sends one root's hits: the run they belong to.
+#[derive(Clone)]
+pub(super) struct Emit {
+    tx: std::sync::mpsc::Sender<SearchEvent>,
+    run: u64,
+}
+
+impl Emit {
+    fn send(&self, batch: Vec<SearchHit>) {
+        let _ = self.tx.send(SearchEvent::Hits(self.run, batch));
+    }
+}
+
+/// Scan one root, sending each file's hits as they are found: the walker
+/// below, or a test's stand-in.
+pub(super) type ScanRoot =
+    fn(&Path, &str, SearchOpts, &Arc<AtomicBool>, &HashSet<PathBuf>, &PathFilter, Emit);
+
+/// The walker behind [`ScanRoot`].
+fn scan_root(
+    root: &Path,
+    query: &str,
+    opts: SearchOpts,
+    cancel: &Arc<AtomicBool>,
+    skip: &HashSet<PathBuf>,
+    filter: &PathFilter,
+    emit: Emit,
+) {
+    search_workspace_streaming_filtered(root, query, opts, cancel, skip, filter, move |batch| {
+        emit.send(batch)
+    });
 }

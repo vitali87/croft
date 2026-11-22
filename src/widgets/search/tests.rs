@@ -661,7 +661,7 @@ fn collect_until_done(
                 saw_done = true;
                 break;
             }
-            Ok(SearchEvent::Cancelled(run)) => last_run = Some(run),
+            Ok(SearchEvent::Cancelled(run) | SearchEvent::Crashed(run)) => last_run = Some(run),
             Err(_) => break,
         }
     }
@@ -752,7 +752,7 @@ fn search_worker_loop_streams_per_file_batches_for_a_typed_query() {
                 done_events += 1;
                 break;
             }
-            Ok(SearchEvent::Cancelled(_)) | Err(_) => break,
+            Ok(SearchEvent::Cancelled(_) | SearchEvent::Crashed(_)) | Err(_) => break,
         }
     }
     drop(q_tx);
@@ -926,6 +926,97 @@ fn search_worker_loop_cancels_a_run_still_waiting_for_the_pause() {
         e_rx.recv_timeout(super::worker::SEARCH_DEBOUNCE * 2)
             .is_err(),
         "a cancelled run sends nothing else"
+    );
+    drop(q_tx);
+    join.join().unwrap();
+}
+
+/// A stand-in for the walker whose scan crashes.
+fn crashing_scan(
+    _: &Path,
+    _: &str,
+    _: SearchOpts,
+    _: &Arc<AtomicBool>,
+    _: &HashSet<PathBuf>,
+    _: &PathFilter,
+    _: super::worker::Emit,
+) {
+    panic!("the scan crashed (on purpose, in a test)")
+}
+
+/// #2611: a run whose scan crashed says so, instead of leaving the panel
+/// waiting on it for good.
+#[test]
+fn search_worker_loop_reports_a_scan_that_crashed() {
+    let tmp = TempDir::new().unwrap();
+    write(&tmp.path().join("a.txt"), "needle\n");
+    let (q_tx, q_rx) = std::sync::mpsc::channel::<SearchRequest>();
+    let (e_tx, e_rx) = std::sync::mpsc::channel::<SearchEvent>();
+    let root = tmp.path().to_path_buf();
+    let join = std::thread::spawn(move || {
+        super::worker::search_worker_loop_with(root, q_rx, e_tx, crashing_scan)
+    });
+    q_tx.send(query_request(1, "needle")).unwrap();
+    assert_eq!(
+        e_rx.recv_timeout(std::time::Duration::from_secs(10)),
+        Ok(SearchEvent::Crashed(1))
+    );
+    // The worker carries on: the next run is scanned too.
+    q_tx.send(query_request(2, "needle")).unwrap();
+    assert_eq!(
+        e_rx.recv_timeout(std::time::Duration::from_secs(10)),
+        Ok(SearchEvent::Crashed(2))
+    );
+    drop(q_tx);
+    join.join().unwrap();
+}
+
+/// Set by [`scan_crashing_when_stopped`] once it is scanning.
+static STOPPABLE_SCAN_STARTED: AtomicBool = AtomicBool::new(false);
+
+/// A stand-in for the walker that scans until it is stopped, then crashes.
+fn scan_crashing_when_stopped(
+    _: &Path,
+    _: &str,
+    _: SearchOpts,
+    cancel: &Arc<AtomicBool>,
+    _: &HashSet<PathBuf>,
+    _: &PathFilter,
+    _: super::worker::Emit,
+) {
+    STOPPABLE_SCAN_STARTED.store(true, Ordering::SeqCst);
+    while !cancel.load(Ordering::Relaxed) {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    panic!("the scan crashed as it stopped (on purpose, in a test)")
+}
+
+/// #2611: a scan that crashes as `Cancel` stops it still ends its run, so
+/// a panel that left Search is not left waiting on it.
+#[test]
+fn search_worker_loop_reports_a_scan_that_crashed_as_it_was_stopped() {
+    let tmp = TempDir::new().unwrap();
+    let (q_tx, q_rx) = std::sync::mpsc::channel::<SearchRequest>();
+    let (e_tx, e_rx) = std::sync::mpsc::channel::<SearchEvent>();
+    let root = tmp.path().to_path_buf();
+    let join = std::thread::spawn(move || {
+        super::worker::search_worker_loop_with(root, q_rx, e_tx, scan_crashing_when_stopped)
+    });
+    q_tx.send(query_request(1, "needle")).unwrap();
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(1),
+        "the scan to start",
+        || STOPPABLE_SCAN_STARTED.load(Ordering::SeqCst),
+    );
+    q_tx.send(SearchRequest::Cancel).unwrap();
+    assert_eq!(
+        e_rx.recv_timeout(std::time::Duration::from_secs(10)),
+        Ok(SearchEvent::Crashed(1))
+    );
+    assert!(
+        e_rx.recv_timeout(std::time::Duration::from_millis(300))
+            .is_err(),
+        "said once"
     );
     drop(q_tx);
     join.join().unwrap();

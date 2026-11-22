@@ -87,8 +87,8 @@ impl App {
 
     /// Apply any pending search events from the background worker, keeping
     /// only those of the run the panel shows (#2608). `Hits` events append
-    /// to the live result list as files yield matches; `Done` and
-    /// `Cancelled` say how far the run got. Returns true iff the panel
+    /// to the live result list as files yield matches; `Done`, `Cancelled`
+    /// and `Crashed` say how far the run got. Returns true iff the panel
     /// changed, so the main loop knows to redraw.
     pub fn drain_search_results(&mut self) -> bool {
         use crate::widgets::search::SearchEvent;
@@ -107,6 +107,11 @@ impl App {
                 }
                 SearchEvent::Cancelled(run) if run == self.search.run => {
                     self.search.progress = SearchProgress::Cancelled;
+                    applied = true;
+                }
+                // The crash notice has said so on the status line (#2611).
+                SearchEvent::Crashed(run) if run == self.search.run => {
+                    self.search.progress = SearchProgress::Crashed;
                     applied = true;
                 }
                 _ => {}
@@ -397,6 +402,12 @@ impl App {
             SearchProgress::Cancelled => {
                 self.status = String::from(
                     "Replace All: the search was stopped before it finished — refresh to search again",
+                );
+                return;
+            }
+            SearchProgress::Crashed => {
+                self.status = String::from(
+                    "Replace All: the search stopped when its scan crashed — refresh to search again",
                 );
                 return;
             }
