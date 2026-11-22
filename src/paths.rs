@@ -11,14 +11,48 @@ use std::path::PathBuf;
 
 /// croft's config directory: `$XDG_CONFIG_HOME/croft` when that is set and
 /// non-empty, otherwise `~/.config/croft`.
+#[cfg(not(test))]
 pub(crate) fn config_dir() -> PathBuf {
-    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
+    config_dir_from(
+        std::env::var_os("XDG_CONFIG_HOME"),
+        std::env::var_os("HOME"),
+    )
+}
+
+/// Test builds' config directory: one of the test process's own, under the
+/// temp directory, never the developer's (#2062). `App::new` reads the
+/// user's macros, snippets, triggers and agents from here, so a file in the
+/// real one used to steer every test that built an app. It starts empty, as
+/// on CI. The settings layers stay in a directory of their own that nothing
+/// creates (`config_layers::user_layers_dir`, #624), so a test that writes a
+/// file here never changes the settings every app test reads.
+#[cfg(test)]
+pub(crate) fn config_dir() -> PathBuf {
+    std::env::temp_dir().join(format!("croft-test-config-dir-{}", std::process::id()))
+}
+
+/// The config directory a release build would use in this environment: in a
+/// test build, the developer's own. Tests check they never reach it.
+#[cfg(test)]
+pub(crate) fn real_config_dir() -> PathBuf {
+    config_dir_from(
+        std::env::var_os("XDG_CONFIG_HOME"),
+        std::env::var_os("HOME"),
+    )
+}
+
+/// [`config_dir`] from the given `XDG_CONFIG_HOME` and `HOME`.
+fn config_dir_from(
+    xdg_config_home: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+) -> PathBuf {
+    if let Some(xdg) = xdg_config_home.filter(|v| !v.is_empty()) {
         return PathBuf::from(xdg).join("croft");
     }
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    home.join(".config").join("croft")
+    home.map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".config")
+        .join("croft")
 }
 
 /// Where croft keeps data that is the user's own and must outlive a cache
@@ -74,6 +108,33 @@ pub(crate) fn croft_cache_dir() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    /// #2062: a test build never reads or writes the developer's own config
+    /// directory, the one croft itself would use with this environment.
+    #[test]
+    fn a_test_build_has_a_config_dir_of_its_own() {
+        let dir = super::config_dir();
+        assert!(!dir.starts_with(super::real_config_dir()), "{dir:?}");
+        assert!(dir.starts_with(std::env::temp_dir()), "{dir:?}");
+        assert_eq!(dir, super::config_dir(), "one directory for the whole run");
+    }
+
+    /// The config directory is `$XDG_CONFIG_HOME/croft`, or `~/.config/croft`
+    /// when that is unset or empty.
+    #[test]
+    fn the_config_dir_follows_xdg_config_home_then_home() {
+        use std::path::PathBuf;
+        assert_eq!(
+            super::config_dir_from(Some("/x/config".into()), Some("/home/u".into())),
+            PathBuf::from("/x/config/croft")
+        );
+        for unset in [None, Some("".into())] {
+            assert_eq!(
+                super::config_dir_from(unset, Some("/home/u".into())),
+                PathBuf::from("/home/u/.config/croft")
+            );
+        }
+    }
+
     /// #1578: hot-exit backups and sticky notes are the user's own text, so
     /// they live in XDG's state directory, not the cache that cleaners and
     /// `rm -rf ~/.cache` are free to delete.
