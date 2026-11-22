@@ -3,13 +3,21 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use crate::git::{GitRequest, GitResponse, GitStateWatch, GitStatus, git_worker_loop};
+use crate::jobs::{Start, Worker, WorkerPoll};
 use crate::widgets::source_control::SourceControlPanel;
 
 const MIN_GAP: Duration = Duration::from_millis(400);
 
 pub struct GitWorker {
-    request_tx: Sender<GitRequest>,
-    response_rx: Receiver<GitResponse>,
+    /// The `git-status` thread: one per workspace folder, started again
+    /// once if it crashes, then stopped (#2589).
+    worker: Worker<GitRequest, GitResponse>,
+    /// The folder the worker reads, sent again to a restarted thread.
+    root: PathBuf,
+    /// The worker stopped since the last [`Self::take_stopped`].
+    stopped_news: bool,
+    /// The current stop has been seen, so it is reported once.
+    stop_seen: bool,
     status: GitStatus,
     last_check: Instant,
     /// A refresh that arrived inside the `MIN_GAP` debounce window and was
@@ -31,17 +39,26 @@ pub struct GitWorker {
 
 impl GitWorker {
     pub fn spawn(git_root: PathBuf) -> Self {
-        let (request_tx, request_rx) = std::sync::mpsc::channel::<GitRequest>();
-        let (response_tx, response_rx) = std::sync::mpsc::channel::<GitResponse>();
-        std::thread::spawn(move || {
-            // The first frame shows no git state; its git processes wait.
-            crate::startup_gate::wait();
-            git_worker_loop(git_root, request_rx, response_tx);
-        });
-        let _ = request_tx.send(GitRequest::Status);
+        Self::spawn_with(git_root, git_worker_loop)
+    }
+
+    /// [`Self::spawn`] with the worker's loop given, so a test can crash it.
+    fn spawn_with(
+        git_root: PathBuf,
+        work: impl Fn(PathBuf, Receiver<GitRequest>, Sender<GitResponse>) + Send + Sync + 'static,
+    ) -> Self {
+        let first_root = git_root.clone();
+        // The first frame shows no git state; its git processes wait.
+        let worker = Worker::spawn("git-status", Start::AfterFirstFrame, move |rx, tx| {
+            work(first_root.clone(), rx, tx)
+        })
+        .expect("start the git status worker");
+        worker.send(GitRequest::Status);
         Self {
-            request_tx,
-            response_rx,
+            worker,
+            root: git_root,
+            stopped_news: false,
+            stop_seen: false,
             status: GitStatus::default(),
             last_check: Instant::now(),
             pending: None,
@@ -71,7 +88,7 @@ impl GitWorker {
         }
         self.last_check = Instant::now();
         self.pending = None;
-        let _ = self.request_tx.send(req);
+        self.worker.send(req);
     }
 
     /// Ship a refresh that was coalesced by the debounce window once that
@@ -85,7 +102,7 @@ impl GitWorker {
         }
         if let Some(req) = self.pending.take() {
             self.last_check = Instant::now();
-            let _ = self.request_tx.send(req);
+            self.worker.send(req);
         }
     }
 
@@ -105,12 +122,19 @@ impl GitWorker {
     /// dirty flag, AND the change list. Used by the explicit refresh action and
     /// after a commit, where the branch sync counts (e.g. `↑1`) must update,
     /// not just the file list. Still off-thread — the worker replies async.
+    /// A worker that stopped after crashing twice starts again here: the
+    /// user asked (#2589).
     pub fn request_status_and_changes(&mut self) {
-        let _ = self.request_tx.send(GitRequest::StatusAndChanges);
+        if self.worker.is_stopped() && self.worker.restart().is_ok() {
+            self.stop_seen = false;
+            self.worker.send(GitRequest::SetRoot(self.root.clone()));
+        }
+        self.worker.send(GitRequest::StatusAndChanges);
     }
 
     pub fn set_root(&mut self, root: PathBuf) {
-        let _ = self.request_tx.send(GitRequest::SetRoot(root));
+        self.root = root.clone();
+        self.worker.send(GitRequest::SetRoot(root));
     }
 
     pub fn bypass_debounce(&mut self) {
@@ -128,8 +152,8 @@ impl GitWorker {
     pub fn drain_into(&mut self, mut panel: Option<&mut SourceControlPanel>) -> bool {
         let mut changed = false;
         loop {
-            match self.response_rx.try_recv() {
-                Ok(GitResponse::Status(s)) => {
+            match self.worker.poll() {
+                WorkerPoll::Answer(GitResponse::Status(s)) => {
                     self.status_arrived = true;
                     if self.status != s {
                         self.status = s.clone();
@@ -140,7 +164,7 @@ impl GitWorker {
                         changed = true;
                     }
                 }
-                Ok(GitResponse::StatusAndChanges(s, entries)) => {
+                WorkerPoll::Answer(GitResponse::StatusAndChanges(s, entries)) => {
                     self.status_arrived = true;
                     self.status = s.clone();
                     if let Some(p) = panel.as_deref_mut() {
@@ -148,10 +172,30 @@ impl GitWorker {
                     }
                     changed = true;
                 }
-                Err(_) => break,
+                WorkerPoll::Idle => break,
+                // Its thread crashed, and the crash notice said so. A fresh
+                // one reads the same folder and answers the status the old
+                // one owed, so nothing about git freezes (#2589).
+                WorkerPoll::Restarted => {
+                    self.worker.send(GitRequest::SetRoot(self.root.clone()));
+                    self.worker.send(GitRequest::StatusAndChanges);
+                }
+                WorkerPoll::Stopped => {
+                    if !std::mem::replace(&mut self.stop_seen, true) {
+                        self.stopped_news = true;
+                        changed = true;
+                    }
+                    break;
+                }
             }
         }
         changed
+    }
+
+    /// True once when the worker has stopped after crashing again soon
+    /// after a restart (#2589), so the app can say so.
+    pub fn take_stopped(&mut self) -> bool {
+        std::mem::take(&mut self.stopped_news)
     }
 
     /// True once per completed status refresh since the last call, changed
@@ -173,10 +217,15 @@ mod tests {
         /// request fires immediately, matching a freshly idle worker.
         fn for_test() -> (Self, Receiver<GitRequest>) {
             let (request_tx, request_rx) = std::sync::mpsc::channel::<GitRequest>();
-            let (_response_tx, response_rx) = std::sync::mpsc::channel::<GitResponse>();
+            let (response_tx, response_rx) = std::sync::mpsc::channel::<GitResponse>();
+            // Kept open for the test's life: a closed answer channel reads
+            // as a crashed worker (#2589).
+            std::mem::forget(response_tx);
             let worker = Self {
-                request_tx,
-                response_rx,
+                worker: Worker::from_channels(request_tx, response_rx),
+                root: PathBuf::new(),
+                stopped_news: false,
+                stop_seen: false,
                 status: GitStatus::default(),
                 last_check: Instant::now()
                     .checked_sub(MIN_GAP * 2)
@@ -194,8 +243,10 @@ mod tests {
             let (request_tx, _request_rx) = std::sync::mpsc::channel::<GitRequest>();
             let (response_tx, response_rx) = std::sync::mpsc::channel::<GitResponse>();
             let worker = Self {
-                request_tx,
-                response_rx,
+                worker: Worker::from_channels(request_tx, response_rx),
+                root: PathBuf::new(),
+                stopped_news: false,
+                stop_seen: false,
                 status: GitStatus::default(),
                 last_check: Instant::now(),
                 pending: None,
@@ -246,5 +297,72 @@ mod tests {
             Ok(GitRequest::StatusAndChanges),
             "the final change in a burst must be fetched on the trailing edge",
         );
+    }
+
+    /// A folder that is a git repository, for a real worker to read.
+    fn repo() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        let ok = crate::test_git::test_git_command()
+            .arg("-C")
+            .arg(tmp.path())
+            .args(["init", "-q"])
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok, "git init");
+        tmp
+    }
+
+    /// The real worker loop, whose first `crashes` threads panic on their
+    /// first request.
+    fn crashing_worker(root: PathBuf, crashes: usize) -> GitWorker {
+        let started = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        GitWorker::spawn_with(root, move |root, rx, tx| {
+            if started.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < crashes {
+                let _ = rx.recv();
+                panic!("the git worker crashed (on purpose, in a test)");
+            }
+            git_worker_loop(root, rx, tx);
+        })
+    }
+
+    /// Drain `worker` until `done`, within a load-scaled second.
+    fn drain_until(
+        worker: &mut GitWorker,
+        what: &str,
+        mut done: impl FnMut(&mut GitWorker) -> bool,
+    ) {
+        crate::test_budget::await_spawned(Duration::from_secs(5), what, || {
+            worker.drain_into(None);
+            done(worker)
+        });
+    }
+
+    /// #2589: a git worker whose thread crashed is started again and
+    /// answers the status the old one owed, instead of every git read
+    /// freezing until a restart.
+    #[test]
+    fn a_git_worker_whose_thread_crashed_still_answers() {
+        let tmp = repo();
+        let mut worker = crashing_worker(tmp.path().to_path_buf(), 1);
+        drain_until(&mut worker, "the restarted worker's status", |w| {
+            w.status().in_repo
+        });
+        assert!(!worker.take_stopped());
+    }
+
+    /// #2589: a worker that crashes again soon after its restart stops,
+    /// says so once, and Refresh starts it again.
+    #[test]
+    fn a_git_worker_that_crashes_again_stops_until_refresh() {
+        let tmp = repo();
+        let mut worker = crashing_worker(tmp.path().to_path_buf(), 2);
+        drain_until(&mut worker, "the worker to stop", GitWorker::take_stopped);
+        assert!(!worker.take_stopped(), "it says so once");
+        assert!(!worker.status().in_repo);
+        worker.request_status_and_changes();
+        drain_until(&mut worker, "the status after Refresh", |w| {
+            w.status().in_repo
+        });
     }
 }

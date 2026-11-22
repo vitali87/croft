@@ -89,7 +89,7 @@ src/
 ├── inline_complete.rs    inline suggestions (#607): ghost text from a model after a pause in typing, or from the file's language server when it offers LSP 3.18 inline completions; a server's replace-range answer that only types ahead becomes plain ghost text, any other is applied whole by Tab
 ├── iterm2.rs             iTerm2 plist mutation helpers for fonts and Croft key mappings; forwarders are tracked in a `Croft User Keymap Forwarders` ledger and swept before inserts, only while still the exact croft forwarder
 ├── iterm2_inline.rs      inline-image baking pipeline and protocol dispatch (iTerm2 OSC 1337 / Kitty graphics / DEC sixel): wordmark, image and PDF previews, activity-bar icons, minimap
-├── jobs.rs               background work that hands the UI one result: started now or after the first frame, on a thread named after the job, and read as dead when that thread ends without a result
+├── jobs.rs               background work that hands the UI one result, and long-lived workers that answer many: started now or after the first frame, on a thread named after the job, a job read as dead and a worker started again once when its thread ends
 ├── jsonc.rs              JSONC (VS Code's JSON with comments and trailing commas) to strict JSON: the one stripper every settings, tasks, launch, keybindings and theme reader shares; a leaf, so readers need not depend on `tasks`
 ├── keymap.rs             user key bindings from `~/.config/croft/keybindings.json`: parses chord strings into normalized Chords mapped to palette Command ids, consulted ahead of the built-in chords; tolerant JSONC, reloads on save
 ├── launcher.rs           macOS `croft install-launcher`: builds a clickable Croft.app via `osacompile` (an AppleScript applet, so double-clicked documents arrive as `odoc` events), brands the plist with PlistBuddy, then ad-hoc `codesign` and `lsregister`
@@ -1655,6 +1655,8 @@ Background work that runs off the UI thread and hands back one result, which the
 **A thread named after the job.** The crash notice (`poll_background_panic`) names the thread that crashed, so a crashed job says which one it was.
 
 **A dead job is not a running one.** `poll` reports `Died` when the job's thread ended without a result, which a channel whose sender the `App` also kept could never see: Check Project stayed "already running" after its thread crashed (#2562). A thread that cannot be started at all is an error from `spawn`, reported where it happens. The places that collect a background thread's result by hand move onto this module one at a time (#2062).
+
+**Long-lived workers.** `Worker<Req, Resp>` is a thread croft sends requests to and reads answers from for as long as croft runs, the git status worker first (#2062). It is spawned with a `Start` and on a thread named after it, like a job. `poll` gives one answer at a time, `Idle`, or what happened to a thread that ended: `Restarted`, when a fresh thread has been started and the caller sends again what it needs (what was sent to the old one is lost), or `Stopped`, when it ended again within `RESTART_WINDOW` (a minute) of the last restart, so a crash that repeats on the same input cannot loop; `restart` starts it again when the user asks. The git worker resends its folder and a full status request on a restart, and on a stop says so on the status line, with Source Control: Refresh starting it again (#2589).
 
 ### keymap.rs
 

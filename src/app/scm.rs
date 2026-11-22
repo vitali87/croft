@@ -222,6 +222,14 @@ impl App {
             if w.take_status_arrival() {
                 status_arrived = true;
             }
+            // Its worker crashed again soon after being started again, so
+            // it stopped rather than loop (#2589): say what is frozen and
+            // how to retry.
+            if w.take_stopped() {
+                self.status = String::from(
+                    "Git status stopped after its worker crashed twice: Source Control: Refresh starts it again",
+                );
+            }
             if !this_changed {
                 continue;
             }
