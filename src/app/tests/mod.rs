@@ -1253,11 +1253,15 @@ fn search_hit_paths(app: &mut App, root: &std::path::Path, query: &str) -> Vec<S
     app.search.query = String::from(query);
     app.submit_search_query();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while !app.search.complete && std::time::Instant::now() < deadline {
+    while app.search.progress != SearchProgress::Finished && std::time::Instant::now() < deadline {
         app.drain_search_results();
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    assert!(app.search.complete, "the search must finish");
+    assert_eq!(
+        app.search.progress,
+        SearchProgress::Finished,
+        "the search must finish"
+    );
     let mut paths: Vec<String> = app
         .search
         .hits

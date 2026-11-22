@@ -3,17 +3,20 @@
 
 use super::*;
 
-/// One unit of streamed output from the search worker. The query and opts
-/// are echoed back on every event so the receiver can drop stale events
-/// when the user has typed past or flipped a toggle since the scan started.
+/// One unit of streamed output from the search worker, for the search run
+/// whose number it carries. The panel keeps only the events of the run it is
+/// showing, so nothing from an earlier run lands in it, the same query's
+/// included (#2608).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SearchEvent {
     /// A batch of hits, one batch per file as the parallel walker finds them.
-    Hits(String, SearchOpts, Vec<SearchHit>),
-    /// Sentinel emitted exactly once per submitted request when the scan
-    /// finishes (or short-circuits on an empty query). UI uses this to flip
-    /// the "(searching…)" caption off.
-    Done(String, SearchOpts),
+    Hits(u64, Vec<SearchHit>),
+    /// The run looked at every file (or its query was empty): its hits are
+    /// all of them, so Replace All may go ahead.
+    Done(u64),
+    /// The run was stopped before it looked at every file, by a request
+    /// that came after it: the hits so far are not all of them.
+    Cancelled(u64),
 }
 
 /// Work submitted to the search worker. `Query` carries the query string and
@@ -24,7 +27,17 @@ pub enum SearchEvent {
 /// when the worker was spawned.
 #[derive(Clone, Debug)]
 pub enum SearchRequest {
-    Query(String, SearchOpts),
+    /// Search run `run` for `query` with `opts`. Every event of the run
+    /// carries `run`.
+    Query {
+        run: u64,
+        query: String,
+        opts: SearchOpts,
+    },
+    /// Stop the run in flight, or the one waiting for the pause in typing,
+    /// which then ends with `Cancelled`: the panel left Search, and the scan
+    /// should stop using every core.
+    Cancel,
     SetRoot(PathBuf),
     /// Replace the whole root set (multi-root workspaces, #147): the scan
     /// walks every root, so hits come from all workspace folders.
@@ -56,9 +69,11 @@ pub(super) const SEARCH_DEBOUNCE: std::time::Duration = std::time::Duration::fro
 /// only after the user has actually paused. The scan runs on a dedicated
 /// thread so a new keystroke arriving DURING a scan can cancel it via
 /// the shared `Arc<AtomicBool>` and start fresh. Each scan emits per-file
-/// `Hits` batches followed by exactly one `Done`, even when canceled,
-/// so the receiver always sees a balanced event stream. The thread exits
-/// cleanly when the channel closes.
+/// `Hits` batches followed by exactly one `Done`, or `Cancelled` when a
+/// later request stopped it first, so the receiver always sees a balanced
+/// event stream. A run replaced by a newer query before its scan started
+/// sends nothing; one stopped by `Cancel` before its scan started sends
+/// `Cancelled`. The thread exits cleanly when the channel closes.
 pub fn search_worker_loop(
     root: PathBuf,
     rx: std::sync::mpsc::Receiver<SearchRequest>,
@@ -71,7 +86,7 @@ pub fn search_worker_loop(
     let mut dirty: Vec<(PathBuf, String)> = Vec::new();
     // Latest include/exclude glob filter, refreshed by SetFilter.
     let mut filter = PathFilter::default();
-    while let Ok(mut latest) = rx.recv() {
+    'requests: while let Ok(mut latest) = rx.recv() {
         // A new message landed: cancel the in-flight scan (if any) so its
         // worker thread bails out before the user pauses long enough to
         // trigger the next scan.
@@ -80,7 +95,8 @@ pub fn search_worker_loop(
             let _ = handle.join();
         }
         // State updates (root rebind, dirty-buffer snapshot) are not queries
-        // and do not debounce: apply and wait for the next message.
+        // and do not debounce: apply and wait for the next message. A
+        // `Cancel` has done its work above.
         match latest {
             SearchRequest::SetRoot(new_root) => {
                 roots = vec![new_root];
@@ -90,7 +106,7 @@ pub fn search_worker_loop(
                 roots = new_roots;
                 continue;
             }
-            SearchRequest::SetRoots(_) => continue,
+            SearchRequest::SetRoots(_) | SearchRequest::Cancel => continue,
             SearchRequest::SetDirtyBuffers(buffers) => {
                 dirty = buffers;
                 continue;
@@ -99,7 +115,7 @@ pub fn search_worker_loop(
                 filter = PathFilter::new(include, exclude);
                 continue;
             }
-            SearchRequest::Query(..) => {}
+            SearchRequest::Query { .. } => {}
         }
         // Trailing-edge debounce: each new keystroke resets the timer.
         // The search fires only after `SEARCH_DEBOUNCE` of silence. A
@@ -116,16 +132,25 @@ pub fn search_worker_loop(
                 Ok(SearchRequest::SetFilter(include, exclude)) => {
                     filter = PathFilter::new(&include, &exclude)
                 }
+                // The waiting run never starts, and says so.
+                Ok(SearchRequest::Cancel) => {
+                    if let SearchRequest::Query { run, .. } = latest
+                        && tx.send(SearchEvent::Cancelled(run)).is_err()
+                    {
+                        return;
+                    }
+                    continue 'requests;
+                }
                 Ok(newer) => latest = newer,
                 Err(RecvTimeoutError::Timeout) => break,
                 Err(RecvTimeoutError::Disconnected) => return,
             }
         }
-        let SearchRequest::Query(query, opts) = latest else {
+        let SearchRequest::Query { run, query, opts } = latest else {
             continue;
         };
         if as_typed(&query).is_empty() {
-            if tx.send(SearchEvent::Done(query, opts)).is_err() {
+            if tx.send(SearchEvent::Done(run)).is_err() {
                 return;
             }
             continue;
@@ -138,7 +163,6 @@ pub fn search_worker_loop(
         let dirty_for_thread = dirty.clone();
         let filter_for_thread = filter.clone();
         let handle = std::thread::spawn(move || {
-            let q_for_emit = query_for_thread.clone();
             let tx_for_emit = tx_for_thread.clone();
             // First, search the unsaved buffers in-memory and collect the set
             // of their canonical paths so the disk walk skips the stale copies.
@@ -164,7 +188,7 @@ pub fn search_worker_loop(
                 collect_matches_in_text(path, content, &query_for_thread, opts, &mut buf_hits);
             }
             if !buf_hits.is_empty() {
-                let _ = tx_for_emit.send(SearchEvent::Hits(q_for_emit.clone(), opts, buf_hits));
+                let _ = tx_for_emit.send(SearchEvent::Hits(run, buf_hits));
             }
             // Every workspace root in order: one balanced Hits stream, one
             // Done after the last root (#147).
@@ -173,7 +197,6 @@ pub fn search_worker_loop(
                     break;
                 }
                 let tx_for_root = tx_for_emit.clone();
-                let q_for_root = q_for_emit.clone();
                 search_workspace_streaming_filtered(
                     scan_root,
                     &query_for_thread,
@@ -182,12 +205,16 @@ pub fn search_worker_loop(
                     &skip,
                     &filter_for_thread,
                     move |batch| {
-                        let _ =
-                            tx_for_root.send(SearchEvent::Hits(q_for_root.clone(), opts, batch));
+                        let _ = tx_for_root.send(SearchEvent::Hits(run, batch));
                     },
                 );
             }
-            let _ = tx_for_thread.send(SearchEvent::Done(query_for_thread, opts));
+            // A scan stopped part-way has not looked at every file.
+            let _ = tx_for_thread.send(if cancel_for_thread.load(Ordering::Relaxed) {
+                SearchEvent::Cancelled(run)
+            } else {
+                SearchEvent::Done(run)
+            });
         });
         current = Some((handle, cancel));
     }

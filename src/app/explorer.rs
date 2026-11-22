@@ -2015,6 +2015,7 @@ impl App {
         let _ = self
             .search_query_tx
             .send(SearchRequest::SetRoots(roots.clone()));
+        self.search_roots_changed();
         self.search.roots = roots.clone();
         if let Some(lsp) = &self.lsp {
             lsp.set_extra_roots(roots.into_iter().skip(1).collect());
@@ -2310,9 +2311,13 @@ impl App {
         let _ = self
             .search_query_tx
             .send(SearchRequest::SetRoot(new_root.clone()));
+        self.search_roots_changed();
         self.search.root = new_root.clone();
         self.search.roots = vec![new_root.clone()];
         self.search.hits.clear();
+        // The cleared list answers nothing under the new root, so the
+        // query is searched again on coming back to Search.
+        self.search.progress = SearchProgress::Cancelled;
         self.search.selected = 0;
         self.search.scroll = 0;
         // Drop any in-flight walker for the OLD root so its result is

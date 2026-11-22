@@ -131,7 +131,7 @@ use crate::widgets::{
     outline::OutlinePanel,
     remote::RemotePanel,
     run_debug::RunDebugPanel,
-    search::{SearchPanel, SearchRequest},
+    search::{SearchPanel, SearchProgress, SearchRequest},
     source_control::SourceControlPanel,
     terminal::{MouseAction, MouseButtonKind, MouseMods, PtyTerminal},
     timeline::TimelinePanel,

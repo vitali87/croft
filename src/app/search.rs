@@ -51,7 +51,10 @@ impl App {
     /// Clears the live result list so streamed `Hits` events accumulate
     /// from zero rather than appending to leftover hits from the prior query.
     pub(super) fn submit_search_query(&mut self) {
-        self.search.complete = false;
+        // A new run: whatever an earlier one still sends is dropped, the same
+        // query's included (#2608).
+        self.search.run += 1;
+        self.search.progress = SearchProgress::Running;
         self.search.hits.clear();
         self.search.selected = 0;
         self.search.scroll = 0;
@@ -69,10 +72,11 @@ impl App {
             self.search.include.clone(),
             self.search.effective_exclude(),
         ));
-        let _ = self.search_query_tx.send(SearchRequest::Query(
-            self.search.query.clone(),
-            self.search.opts,
-        ));
+        let _ = self.search_query_tx.send(SearchRequest::Query {
+            run: self.search.run,
+            query: self.search.query.clone(),
+            opts: self.search.opts,
+        });
         let term = if crate::widgets::search::as_typed(&self.search.query).is_empty() {
             None
         } else {
@@ -81,11 +85,11 @@ impl App {
         self.editor.set_search_highlight(term, self.search.opts);
     }
 
-    /// Apply any pending search events from the background worker. Drops
-    /// stale events whose query no longer matches the input field (the
-    /// user has typed past it). `Hits` events append to the live result
-    /// list as files yield matches; `Done` is informational. Returns true
-    /// iff hits were updated, so the main loop knows to redraw.
+    /// Apply any pending search events from the background worker, keeping
+    /// only those of the run the panel shows (#2608). `Hits` events append
+    /// to the live result list as files yield matches; `Done` and
+    /// `Cancelled` say how far the run got. Returns true iff the panel
+    /// changed, so the main loop knows to redraw.
     pub fn drain_search_results(&mut self) -> bool {
         use crate::widgets::search::SearchEvent;
         let mut applied = false;
@@ -93,22 +97,51 @@ impl App {
         let mut arrived = Vec::new();
         while let Ok(event) = self.search_results_rx.try_recv() {
             match event {
-                SearchEvent::Hits(q, opts, batch) => {
-                    if q == self.search.query && opts.same_matching(&self.search.opts) {
-                        arrived.extend(batch);
-                        applied = true;
-                    }
+                SearchEvent::Hits(run, batch) if run == self.search.run => {
+                    arrived.extend(batch);
+                    applied = true;
                 }
-                SearchEvent::Done(q, opts) => {
-                    if q == self.search.query && opts.same_matching(&self.search.opts) {
-                        self.search.complete = true;
-                        applied = true;
-                    }
+                SearchEvent::Done(run) if run == self.search.run => {
+                    self.search.progress = SearchProgress::Finished;
+                    applied = true;
                 }
+                SearchEvent::Cancelled(run) if run == self.search.run => {
+                    self.search.progress = SearchProgress::Cancelled;
+                    applied = true;
+                }
+                _ => {}
             }
         }
         self.search.add_hits(arrived);
         applied
+    }
+
+    /// Stop the panel's run if its scan is still going, when the panel
+    /// leaves Search: the walker threads stop using every core. The hits so
+    /// far stay listed, and coming back to Search runs the query again
+    /// (#2608).
+    pub(super) fn cancel_search_run(&mut self) {
+        if self.search.progress == SearchProgress::Running {
+            let _ = self.search_query_tx.send(SearchRequest::Cancel);
+        }
+    }
+
+    /// Run the panel's query again on coming back to Search, when its last
+    /// run was stopped before it finished (#2608).
+    pub(super) fn resume_cancelled_search(&mut self) {
+        if self.search.progress == SearchProgress::Cancelled {
+            self.submit_search_query();
+        }
+    }
+
+    /// The workspace's folders changed under the panel: a run still
+    /// scanning the old ones is cut short, and anything it still sends is
+    /// dropped (#2608).
+    pub(super) fn search_roots_changed(&mut self) {
+        if self.search.progress == SearchProgress::Running {
+            self.search.run += 1;
+            self.search.progress = SearchProgress::Cancelled;
+        }
     }
 
     /// The Replace All confirmation modal (#123): counts up front, commits
@@ -351,12 +384,22 @@ impl App {
             self.status = String::from("Replace All: enter a search term first");
             return;
         }
-        if !self.search.complete {
+        match self.search.progress {
+            SearchProgress::Finished => {}
             // Hits stream in batches; replacing before Done would silently
             // miss files found after confirmation (#124 review).
-            self.status =
-                String::from("Replace All: search still running — retry when it finishes");
-            return;
+            SearchProgress::Running => {
+                self.status =
+                    String::from("Replace All: search still running — retry when it finishes");
+                return;
+            }
+            // The list is only what the run found before it was stopped.
+            SearchProgress::Cancelled => {
+                self.status = String::from(
+                    "Replace All: the search was stopped before it finished — refresh to search again",
+                );
+                return;
+            }
         }
         // Count first, write only after the modal confirms: a workspace-wide
         // disk rewrite is exactly what the confirm-destructive rule is for

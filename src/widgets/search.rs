@@ -74,15 +74,17 @@ pub struct SearchOpts {
     pub preserve_case: bool,
 }
 
-impl SearchOpts {
-    /// Whether `other` finds the same hits: Preserve Case shapes the
-    /// replacements only, so a worker's results under either value of it
-    /// still belong to the query.
-    pub fn same_matching(&self, other: &SearchOpts) -> bool {
-        self.case_sensitive == other.case_sensitive
-            && self.whole_word == other.whole_word
-            && self.use_regex == other.use_regex
-    }
+/// How far the Search panel's run got (#2608).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SearchProgress {
+    /// Its hits are still streaming in.
+    Running,
+    /// It looked at every file: the list is the whole answer.
+    Finished,
+    /// It was stopped before it looked at every file, when the panel left
+    /// Search or the workspace's folders changed: the list is not the whole
+    /// answer, and coming back to Search runs it again.
+    Cancelled,
 }
 
 /// Side-panel widget shown when the active sidebar view is "Search".
@@ -149,10 +151,13 @@ pub struct SearchPanel {
     /// Which input field currently receives typed characters. Tab cycles
     /// through the visible fields; clicking an input focuses it directly.
     pub field: SearchField,
-    /// True once the worker's `Done` for the CURRENT query has drained:
-    /// Replace All refuses while hits are still streaming, or files found
-    /// after confirmation would be silently missed (#124 review).
-    pub complete: bool,
+    /// The number of the search run the panel shows: the worker's events
+    /// for any other run are dropped (#2608).
+    pub run: u64,
+    /// How far that run got. Replace All goes ahead only once it is
+    /// `Finished`: while hits still stream, or after the run stopped early,
+    /// files the scan never reached would be silently missed (#124 review).
+    pub progress: SearchProgress,
     /// Selection range within the currently focused field's text.
     pub field_selection: Option<(usize, usize)>,
     /// Caret of each field as a char index (#1729), indexed by
@@ -264,7 +269,8 @@ impl SearchPanel {
             replace_open: false,
             details_open: false,
             field: SearchField::Query,
-            complete: false,
+            run: 0,
+            progress: SearchProgress::Running,
             field_selection: None,
             carets: [None; 4],
             field_origin: [(0, 0); 4],

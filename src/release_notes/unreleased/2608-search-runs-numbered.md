@@ -1,0 +1,1 @@
+fix: Search no longer takes a search it cut short as finished. Leaving the Search view mid-search, running the same search again, or changing the Explorer root no longer lets Replace All skip the files the search never reached, or lists results twice; coming back to Search finishes a search that leaving it stopped.

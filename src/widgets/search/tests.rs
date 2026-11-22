@@ -630,30 +630,42 @@ fn split_highlight_handles_match_at_start_and_end() {
     );
 }
 
+/// Search run `run` for `query` with the default options.
+fn query_request(run: u64, query: &str) -> SearchRequest {
+    SearchRequest::Query {
+        run,
+        query: query.into(),
+        opts: SearchOpts::default(),
+    }
+}
+
+/// The events up to the first `Done`: the run the last event was for, the
+/// hits, and whether the `Done` came.
 fn collect_until_done(
     rx: &std::sync::mpsc::Receiver<SearchEvent>,
     deadline: std::time::Duration,
-) -> (Option<String>, Vec<SearchHit>, bool) {
+) -> (Option<u64>, Vec<SearchHit>, bool) {
     let until = std::time::Instant::now() + deadline;
-    let mut last_q: Option<String> = None;
+    let mut last_run: Option<u64> = None;
     let mut hits: Vec<SearchHit> = Vec::new();
     let mut saw_done = false;
     while std::time::Instant::now() < until {
         let remaining = until.saturating_duration_since(std::time::Instant::now());
         match rx.recv_timeout(remaining.max(std::time::Duration::from_millis(50))) {
-            Ok(SearchEvent::Hits(q, _, batch)) => {
-                last_q = Some(q);
+            Ok(SearchEvent::Hits(run, batch)) => {
+                last_run = Some(run);
                 hits.extend(batch);
             }
-            Ok(SearchEvent::Done(q, _)) => {
-                last_q = Some(q);
+            Ok(SearchEvent::Done(run)) => {
+                last_run = Some(run);
                 saw_done = true;
                 break;
             }
+            Ok(SearchEvent::Cancelled(run)) => last_run = Some(run),
             Err(_) => break,
         }
     }
-    (last_q, hits, saw_done)
+    (last_run, hits, saw_done)
 }
 
 #[test]
@@ -676,21 +688,13 @@ fn search_worker_loop_searches_dirty_buffer_and_skips_stale_disk_copy() {
     )]))
     .unwrap();
 
-    q_tx.send(SearchRequest::Query(
-        "newname".into(),
-        SearchOpts::default(),
-    ))
-    .unwrap();
+    q_tx.send(query_request(1, "newname")).unwrap();
     let (_, hits, done) = collect_until_done(&e_rx, std::time::Duration::from_secs(2));
     assert!(done);
     assert_eq!(hits.len(), 1, "the unsaved buffer's new name must be found");
     assert_eq!(hits[0].line_text, "newname");
 
-    q_tx.send(SearchRequest::Query(
-        "oldname".into(),
-        SearchOpts::default(),
-    ))
-    .unwrap();
+    q_tx.send(query_request(2, "oldname")).unwrap();
     let (_, stale, done2) = collect_until_done(&e_rx, std::time::Duration::from_secs(2));
     assert!(done2);
     assert_eq!(
@@ -711,10 +715,9 @@ fn search_worker_loop_returns_hits_for_a_typed_query() {
     let (e_tx, e_rx) = std::sync::mpsc::channel::<SearchEvent>();
     let root = tmp.path().to_path_buf();
     let join = std::thread::spawn(move || search_worker_loop(root, q_rx, e_tx));
-    q_tx.send(SearchRequest::Query("needle".into(), SearchOpts::default()))
-        .unwrap();
-    let (q, hits, done) = collect_until_done(&e_rx, std::time::Duration::from_secs(2));
-    assert_eq!(q.as_deref(), Some("needle"));
+    q_tx.send(query_request(1, "needle")).unwrap();
+    let (run, hits, done) = collect_until_done(&e_rx, std::time::Duration::from_secs(2));
+    assert_eq!(run, Some(1));
     assert_eq!(hits.len(), 1);
     assert!(done, "worker must terminate the stream with a Done event");
     drop(q_tx);
@@ -734,23 +737,22 @@ fn search_worker_loop_streams_per_file_batches_for_a_typed_query() {
     let (e_tx, e_rx) = std::sync::mpsc::channel::<SearchEvent>();
     let root = tmp.path().to_path_buf();
     let join = std::thread::spawn(move || search_worker_loop(root, q_rx, e_tx));
-    q_tx.send(SearchRequest::Query("needle".into(), SearchOpts::default()))
-        .unwrap();
+    q_tx.send(query_request(1, "needle")).unwrap();
     let mut total = 0usize;
     let mut hits_events = 0usize;
     let mut done_events = 0usize;
     let until = std::time::Instant::now() + std::time::Duration::from_secs(3);
     while std::time::Instant::now() < until {
         match e_rx.recv_timeout(std::time::Duration::from_millis(500)) {
-            Ok(SearchEvent::Hits(_, _, batch)) => {
+            Ok(SearchEvent::Hits(_, batch)) => {
                 hits_events += 1;
                 total += batch.len();
             }
-            Ok(SearchEvent::Done(_, _)) => {
+            Ok(SearchEvent::Done(_)) => {
                 done_events += 1;
                 break;
             }
-            Err(_) => break,
+            Ok(SearchEvent::Cancelled(_)) | Err(_) => break,
         }
     }
     drop(q_tx);
@@ -774,18 +776,11 @@ fn search_worker_loop_coalesces_a_burst_of_keystrokes() {
     let (e_tx, e_rx) = std::sync::mpsc::channel::<SearchEvent>();
     let root = tmp.path().to_path_buf();
     let join = std::thread::spawn(move || search_worker_loop(root, q_rx, e_tx));
-    q_tx.send(SearchRequest::Query("o".into(), SearchOpts::default()))
-        .unwrap();
-    q_tx.send(SearchRequest::Query("on".into(), SearchOpts::default()))
-        .unwrap();
-    q_tx.send(SearchRequest::Query("one".into(), SearchOpts::default()))
-        .unwrap();
-    let (q, hits, done) = collect_until_done(&e_rx, std::time::Duration::from_secs(2));
-    assert_eq!(
-        q.as_deref(),
-        Some("one"),
-        "coalesce must drop intermediate prefixes"
-    );
+    q_tx.send(query_request(1, "o")).unwrap();
+    q_tx.send(query_request(2, "on")).unwrap();
+    q_tx.send(query_request(3, "one")).unwrap();
+    let (run, hits, done) = collect_until_done(&e_rx, std::time::Duration::from_secs(2));
+    assert_eq!(run, Some(3), "coalesce must drop intermediate prefixes");
     assert_eq!(hits.len(), 1);
     assert!(done);
     drop(q_tx);
@@ -806,29 +801,25 @@ fn search_worker_loop_resets_debounce_on_each_keystroke() {
     let join = std::thread::spawn(move || search_worker_loop(root, q_rx, e_tx));
     // Each gap is well under SEARCH_DEBOUNCE (200 ms), so each new
     // send resets the timer and no search should fire mid-burst.
-    q_tx.send(SearchRequest::Query("o".into(), SearchOpts::default()))
-        .unwrap();
+    q_tx.send(query_request(1, "o")).unwrap();
     std::thread::sleep(std::time::Duration::from_millis(100));
-    q_tx.send(SearchRequest::Query("on".into(), SearchOpts::default()))
-        .unwrap();
+    q_tx.send(query_request(2, "on")).unwrap();
     std::thread::sleep(std::time::Duration::from_millis(100));
-    q_tx.send(SearchRequest::Query("one".into(), SearchOpts::default()))
-        .unwrap();
+    q_tx.send(query_request(3, "one")).unwrap();
     // Now stop typing and let the debounce expire + the scan finish.
-    let mut dones: Vec<String> = Vec::new();
+    let mut dones: Vec<u64> = Vec::new();
     let until = std::time::Instant::now() + std::time::Duration::from_secs(2);
     while std::time::Instant::now() < until {
-        if let Ok(SearchEvent::Done(q, _)) =
-            e_rx.recv_timeout(std::time::Duration::from_millis(200))
+        if let Ok(SearchEvent::Done(run)) = e_rx.recv_timeout(std::time::Duration::from_millis(200))
         {
-            dones.push(q)
+            dones.push(run)
         }
     }
     drop(q_tx);
     join.join().unwrap();
     assert_eq!(
         dones,
-        vec!["one".to_string()],
+        vec![3],
         "exactly one search should have fired - for the trailing query - not one per keystroke"
     );
 }
@@ -854,8 +845,7 @@ fn search_worker_loop_cancels_in_flight_scan_when_a_new_request_arrives() {
     let (e_tx, e_rx) = std::sync::mpsc::channel::<SearchEvent>();
     let root = tmp.path().to_path_buf();
     let join = std::thread::spawn(move || search_worker_loop(root, q_rx, e_tx));
-    q_tx.send(SearchRequest::Query("c".into(), SearchOpts::default()))
-        .unwrap();
+    q_tx.send(query_request(1, "c")).unwrap();
     // Stage on the scan observably RUNNING — the first Hits batch —
     // not on sleeping past the debounce: a sleep equal to the
     // debounce races the worker's own timer on a knife edge, and
@@ -865,9 +855,8 @@ fn search_worker_loop_cancels_in_flight_scan_when_a_new_request_arrives() {
     let mut c_hits = 0usize;
     let staging = std::time::Instant::now() + std::time::Duration::from_secs(30);
     while c_hits == 0 && std::time::Instant::now() < staging {
-        if let Ok(SearchEvent::Hits(q, _, hits)) =
+        if let Ok(SearchEvent::Hits(1, hits)) =
             e_rx.recv_timeout(std::time::Duration::from_millis(100))
-            && q == "c"
         {
             c_hits += hits.len();
         }
@@ -876,11 +865,7 @@ fn search_worker_loop_cancels_in_flight_scan_when_a_new_request_arrives() {
         c_hits > 0,
         "staging: the \"c\" scan never started streaming"
     );
-    q_tx.send(SearchRequest::Query(
-        "zzznoneatall".into(),
-        SearchOpts::default(),
-    ))
-    .unwrap();
+    q_tx.send(query_request(2, "zzznoneatall")).unwrap();
     // The cancellation proof is structural, not wall-clock (#68): a
     // cancelled "c" scan is cut short, streaming fewer than its full
     // 4M matches before its Done; an uncancelled one streams every
@@ -889,11 +874,15 @@ fn search_worker_loop_cancels_in_flight_scan_when_a_new_request_arrives() {
     // under suite load — the long timeout here only guards a hang.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     let mut second_done = false;
+    // How the cut-short "c" run ended (#2608): it never looked at every
+    // file, so it must not claim it did.
+    let mut first_end = None;
     while std::time::Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(std::time::Instant::now());
         match e_rx.recv_timeout(remaining.max(std::time::Duration::from_millis(50))) {
-            Ok(SearchEvent::Hits(q, _, hits)) if q == "c" => c_hits += hits.len(),
-            Ok(SearchEvent::Done(q, _)) if q == "zzznoneatall" => {
+            Ok(SearchEvent::Hits(1, hits)) => c_hits += hits.len(),
+            Ok(end @ (SearchEvent::Done(1) | SearchEvent::Cancelled(1))) => first_end = Some(end),
+            Ok(SearchEvent::Done(2)) => {
                 second_done = true;
                 break;
             }
@@ -906,10 +895,40 @@ fn search_worker_loop_cancels_in_flight_scan_when_a_new_request_arrives() {
         second_done,
         "worker must emit Done for the new query after cancelling the in-flight scan"
     );
+    assert_eq!(
+        first_end,
+        Some(SearchEvent::Cancelled(1)),
+        "the cut-short run ends Cancelled, before the new run's events"
+    );
     assert!(
         c_hits < 4_000_000,
         "the in-flight scan must be cancelled, not run to completion; it streamed all {c_hits} matches"
     );
+}
+
+/// #2608: a run stopped by `Cancel` while it waits for the pause in typing
+/// never scans, and says so, so the panel does not wait on it.
+#[test]
+fn search_worker_loop_cancels_a_run_still_waiting_for_the_pause() {
+    let tmp = TempDir::new().unwrap();
+    write(&tmp.path().join("a.txt"), "needle\n");
+    let (q_tx, q_rx) = std::sync::mpsc::channel::<SearchRequest>();
+    let (e_tx, e_rx) = std::sync::mpsc::channel::<SearchEvent>();
+    let root = tmp.path().to_path_buf();
+    let join = std::thread::spawn(move || search_worker_loop(root, q_rx, e_tx));
+    q_tx.send(query_request(1, "needle")).unwrap();
+    q_tx.send(SearchRequest::Cancel).unwrap();
+    assert_eq!(
+        e_rx.recv_timeout(std::time::Duration::from_secs(5)),
+        Ok(SearchEvent::Cancelled(1))
+    );
+    assert!(
+        e_rx.recv_timeout(super::worker::SEARCH_DEBOUNCE * 2)
+            .is_err(),
+        "a cancelled run sends nothing else"
+    );
+    drop(q_tx);
+    join.join().unwrap();
 }
 
 #[test]
@@ -920,10 +939,9 @@ fn search_worker_loop_short_circuits_empty_queries() {
     let (e_tx, e_rx) = std::sync::mpsc::channel::<SearchEvent>();
     let root = tmp.path().to_path_buf();
     let join = std::thread::spawn(move || search_worker_loop(root, q_rx, e_tx));
-    q_tx.send(SearchRequest::Query("".into(), SearchOpts::default()))
-        .unwrap();
-    let (q, hits, done) = collect_until_done(&e_rx, std::time::Duration::from_secs(2));
-    assert_eq!(q.as_deref(), Some(""));
+    q_tx.send(query_request(1, "")).unwrap();
+    let (run, hits, done) = collect_until_done(&e_rx, std::time::Duration::from_secs(2));
+    assert_eq!(run, Some(1));
     assert!(hits.is_empty());
     assert!(done, "empty query still emits a Done sentinel");
     drop(q_tx);
@@ -942,10 +960,9 @@ fn search_worker_loop_targets_the_directory_set_by_the_latest_set_root() {
     let join = std::thread::spawn(move || search_worker_loop(start_root, q_rx, e_tx));
     q_tx.send(SearchRequest::SetRoot(dir_b.path().to_path_buf()))
         .unwrap();
-    q_tx.send(SearchRequest::Query("needle".into(), SearchOpts::default()))
-        .unwrap();
-    let (q, hits, done) = collect_until_done(&e_rx, std::time::Duration::from_secs(2));
-    assert_eq!(q.as_deref(), Some("needle"));
+    q_tx.send(query_request(1, "needle")).unwrap();
+    let (run, hits, done) = collect_until_done(&e_rx, std::time::Duration::from_secs(2));
+    assert_eq!(run, Some(1));
     assert_eq!(
         hits.len(),
         1,
@@ -2047,8 +2064,7 @@ fn search_worker_loop_applies_set_filter_to_subsequent_query() {
     let join = std::thread::spawn(move || search_worker_loop(root, q_rx, e_tx));
     q_tx.send(SearchRequest::SetFilter("*.rs".into(), String::new()))
         .unwrap();
-    q_tx.send(SearchRequest::Query("needle".into(), SearchOpts::default()))
-        .unwrap();
+    q_tx.send(query_request(1, "needle")).unwrap();
     let (_, hits, done) = collect_until_done(&e_rx, std::time::Duration::from_secs(2));
     assert!(done);
     assert_eq!(hits.len(), 1, "filter must restrict the scan to *.rs");

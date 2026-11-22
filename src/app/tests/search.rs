@@ -1089,12 +1089,8 @@ fn a_search_result_hint_follows_the_rows_that_move_under_a_resting_pointer() {
     let before = row_path(&app);
     let (tx, rx) = std::sync::mpsc::channel();
     app.search_results_rx = rx;
-    tx.send(SearchEvent::Hits(
-        app.search.query.clone(),
-        app.search.opts,
-        vec![hit("a")],
-    ))
-    .unwrap();
+    tx.send(SearchEvent::Hits(app.search.run, vec![hit("a")]))
+        .unwrap();
     assert!(app.drain_search_results());
     app.poll_ui_tooltip();
     assert_ne!(row_path(&app), before);
@@ -1309,11 +1305,15 @@ fn seeded_search_matches_case_the_way_the_grep_did() {
 fn seeded_lines(app: &mut App, cmd: &str) -> Vec<String> {
     assert!(seed_at_root(app, cmd), "{cmd}");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while !app.search.complete && std::time::Instant::now() < deadline {
+    while app.search.progress != SearchProgress::Finished && std::time::Instant::now() < deadline {
         app.drain_search_results();
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    assert!(app.search.complete, "{cmd}: the search must finish");
+    assert_eq!(
+        app.search.progress,
+        SearchProgress::Finished,
+        "{cmd}: the search must finish"
+    );
     let mut lines: Vec<String> = app
         .search
         .hits
@@ -1742,12 +1742,12 @@ fn replace_all_requires_confirmation_and_esc_cancels() {
 
     // A still-streaming search refuses: hits arriving after confirmation
     // would be silently missed.
-    app.search.complete = false;
+    app.search.progress = SearchProgress::Running;
     app.run_search_replace_all();
     assert!(app.pending_replace_all.is_none());
     assert!(app.status.contains("still running"));
 
-    app.search.complete = true;
+    app.search.progress = SearchProgress::Finished;
     app.run_search_replace_all();
     assert_eq!(
         app.pending_replace_all,
@@ -1797,7 +1797,7 @@ fn replace_all_skips_files_open_with_unsaved_changes() {
     app.search.query = String::from("beta");
     app.search.replace = String::from("delta");
     app.search.run_query();
-    app.search.complete = true;
+    app.search.progress = SearchProgress::Finished;
     app.run_search_replace_all();
     assert_eq!(
         app.pending_replace_all,
@@ -2631,8 +2631,9 @@ fn alt_p_toggles_preserve_case_in_the_search_side_bar() {
 }
 
 /// #1612: flipping Preserve Case while a search runs keeps its results:
-/// the worker's events carry the old toggle, and the search still
-/// completes so Replace All is not left blocked.
+/// it shapes the replacements only, so the run goes on and still completes,
+/// and Replace All is not left blocked. A matching toggle starts a new run,
+/// whose predecessor's events are dropped.
 #[test]
 fn toggling_preserve_case_mid_search_keeps_the_search_live() {
     use crate::widgets::search::SearchEvent;
@@ -2640,27 +2641,161 @@ fn toggling_preserve_case_mid_search_keeps_the_search_live() {
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.set_sidebar_view(SidebarView::Search);
     app.search.query = String::from("user");
-    let before = app.search.opts;
+    app.submit_search_query();
+    let run = app.search.run;
     app.toggle_search_opt(crate::widgets::search::SearchToggle::PreserveCase);
     assert!(app.search.opts.preserve_case);
-    // Drain whatever the real worker sent, then hand in events stamped
-    // with the options from before the toggle.
+    assert_eq!(app.search.run, run, "the run goes on");
+    // Drain whatever the real worker sent, then hand in the run's end.
     app.drain_search_results();
-    app.search.complete = false;
+    app.search.progress = SearchProgress::Running;
     let (tx, rx) = std::sync::mpsc::channel();
     app.search_results_rx = rx;
-    tx.send(SearchEvent::Done(String::from("user"), before))
-        .unwrap();
+    tx.send(SearchEvent::Done(run)).unwrap();
     assert!(app.drain_search_results());
-    assert!(app.search.complete, "the search must finish");
-    // Negative: a result under a different Match Case is still dropped.
-    app.search.complete = false;
-    let mut other = before;
-    other.case_sensitive = !other.case_sensitive;
-    tx.send(SearchEvent::Done(String::from("user"), other))
-        .unwrap();
+    assert_eq!(
+        app.search.progress,
+        SearchProgress::Finished,
+        "the search must finish"
+    );
+    // Negative: Match Case starts a new run, and the old one's end is
+    // dropped.
+    app.toggle_search_opt(crate::widgets::search::SearchToggle::CaseSensitive);
+    assert_ne!(app.search.run, run);
+    app.drain_search_results();
+    tx.send(SearchEvent::Done(run)).unwrap();
     assert!(!app.drain_search_results());
-    assert!(!app.search.complete);
+    assert_eq!(app.search.progress, SearchProgress::Running);
+}
+
+/// #2608: a search run again while its scan is still going (Refresh)
+/// drops whatever the earlier run still sends: its hits would be listed
+/// twice, and its end would let Replace All go ahead before the new run had
+/// looked at anything.
+#[test]
+fn a_search_run_again_drops_what_the_earlier_run_still_sends() {
+    use crate::widgets::search::{SearchEvent, SearchHit};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::Search);
+    app.search.query = String::from("needle");
+    app.submit_search_query();
+    let first = app.search.run;
+    app.submit_search_query();
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.search_results_rx = rx;
+    let hit = SearchHit {
+        path: tmp.path().join("a.txt"),
+        line_no: 1,
+        line_text: String::from("needle"),
+        matches: 1,
+    };
+    tx.send(SearchEvent::Hits(first, vec![hit.clone()]))
+        .unwrap();
+    tx.send(SearchEvent::Cancelled(first)).unwrap();
+    tx.send(SearchEvent::Done(first)).unwrap();
+    assert!(
+        !app.drain_search_results(),
+        "nothing of the earlier run lands"
+    );
+    assert!(app.search.hits.is_empty());
+    assert_eq!(app.search.progress, SearchProgress::Running);
+    app.run_search_replace_all();
+    assert!(app.status.contains("still running"), "{}", app.status);
+    tx.send(SearchEvent::Hits(app.search.run, vec![hit]))
+        .unwrap();
+    tx.send(SearchEvent::Done(app.search.run)).unwrap();
+    assert!(app.drain_search_results());
+    assert_eq!(app.search.hits.len(), 1);
+    assert_eq!(app.search.progress, SearchProgress::Finished);
+}
+
+/// #2608: leaving Search stops the scan in flight; the hits so far stay,
+/// but the search is not finished, so Replace All asks for a new search
+/// instead of replacing only what was found, and coming back runs it again.
+#[test]
+fn a_search_stopped_by_leaving_search_runs_again_on_coming_back() {
+    use crate::widgets::search::{SearchEvent, SearchRequest};
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("a.txt"),
+        "needle
+",
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::Search);
+    let (req_tx, req_rx) = std::sync::mpsc::channel();
+    app.search_query_tx = req_tx;
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.search_results_rx = rx;
+    app.search.query = String::from("needle");
+    app.search.replace = String::from("pin");
+    app.submit_search_query();
+    let run = app.search.run;
+    let requests: Vec<SearchRequest> = req_rx.try_iter().collect();
+    assert!(
+        matches!(requests.last(), Some(SearchRequest::Query { run: r, .. }) if *r == run),
+        "{requests:?}"
+    );
+
+    app.set_sidebar_view(SidebarView::Explorer);
+    assert!(
+        matches!(req_rx.try_recv(), Ok(SearchRequest::Cancel)),
+        "leaving Search stops the scan"
+    );
+    // The worker stops the run part-way: its end says so.
+    tx.send(SearchEvent::Cancelled(run)).unwrap();
+    assert!(app.drain_search_results());
+    assert_eq!(app.search.progress, SearchProgress::Cancelled);
+    app.run_search_replace_all();
+    assert!(app.pending_replace_all.is_none(), "nothing is replaced");
+    assert!(
+        app.status.contains("stopped before it finished"),
+        "{}",
+        app.status
+    );
+
+    app.set_sidebar_view(SidebarView::Search);
+    assert!(app.search.run > run, "coming back starts a new run");
+    let requests: Vec<SearchRequest> = req_rx.try_iter().collect();
+    assert!(
+        matches!(requests.last(), Some(SearchRequest::Query { run: r, query, .. }) if *r == app.search.run && query == "needle"),
+        "{requests:?}"
+    );
+}
+
+/// #2608: a new Explorer root cuts the run in flight short: its hits for
+/// the old root are dropped instead of landing in the cleared list, and the
+/// search is not taken as finished.
+#[test]
+fn a_new_root_drops_the_old_roots_search() {
+    use crate::widgets::search::{SearchEvent, SearchHit};
+    let tmp = tempfile::tempdir().unwrap();
+    let new_root = tmp.path().join("sub");
+    std::fs::create_dir(&new_root).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::Search);
+    app.search.query = String::from("needle");
+    app.submit_search_query();
+    let run = app.search.run;
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.search_results_rx = rx;
+    app.change_workspace_root(new_root);
+    tx.send(SearchEvent::Hits(
+        run,
+        vec![SearchHit {
+            path: tmp.path().join("a.txt"),
+            line_no: 1,
+            line_text: String::from("needle"),
+            matches: 1,
+        }],
+    ))
+    .unwrap();
+    tx.send(SearchEvent::Cancelled(run)).unwrap();
+    app.drain_search_results();
+    assert!(app.search.hits.is_empty(), "nothing of the old root lands");
+    assert_eq!(app.search.progress, SearchProgress::Cancelled);
 }
 
 /// #860: `Ctrl/Cmd+Shift+H` is Replace in Files: the Search side bar opens
