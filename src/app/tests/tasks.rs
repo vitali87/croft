@@ -1505,6 +1505,37 @@ fn live_run_whose_runner_crashed_twice_stops_until_turned_on() {
     });
 }
 
+/// Codex's finding on #2600: a runner whose second crash no tick has seen
+/// yet is started again when Live Run is turned on for a file, and the
+/// file runs, instead of the next tick finding it stopped with the file
+/// marked as sent.
+#[test]
+fn live_run_turned_on_after_a_crash_no_tick_saw_runs_the_file() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.py", "x = 1\n");
+    app.live_run_runner = Some(crate::live_run::Runner::crashing(2));
+    let thread_ends = |app: &mut App| {
+        crate::test_budget::await_spawned(
+            std::time::Duration::from_secs(5),
+            "the runner's thread to end",
+            || app.live_run_runner.as_mut().unwrap().has_ended(),
+        );
+    };
+    app.run_command(crate::widgets::command_palette::Command::ToggleLiveRun);
+    app.tick_live_run();
+    thread_ends(&mut app);
+    // This tick sees the first crash, starts a fresh thread and sends the
+    // file again, which crashes it too, unseen.
+    app.tick_live_run();
+    thread_ends(&mut app);
+    app.run_command(crate::widgets::command_palette::Command::ToggleLiveRun);
+    app.run_command(crate::widgets::command_palette::Command::ToggleLiveRun);
+    tick_live_run_until(&mut app, "the run after turning it on", |app| {
+        app.editor.live_run.is_some()
+    });
+    assert_ne!(app.status, LIVE_RUN_STOPPED);
+}
+
 /// #856 (comment): a task set "Running <label>" and kept it after its pane
 /// was back at the prompt. The pane's command-finished report now replaces
 /// it with the exit code and how long the command took.

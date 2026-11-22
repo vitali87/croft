@@ -245,6 +245,26 @@ impl<Req: Send + 'static, Resp: Send + 'static> Worker<Req, Resp> {
     pub fn is_stopped(&self) -> bool {
         self.stopped
     }
+
+    /// Start it again now if it stopped, or if its thread has ended though
+    /// no [`Self::poll`] has seen it yet: for a caller acting on the user's
+    /// request, which the next poll would otherwise answer with a stop.
+    /// Whatever the old thread sent that was not read goes with it. True
+    /// when a fresh thread started.
+    pub fn restart_if_down(&mut self) -> std::io::Result<bool> {
+        if !self.stopped && !self.thread_ended() {
+            return Ok(false);
+        }
+        self.restart()?;
+        Ok(true)
+    }
+
+    /// Whether its thread has ended, for a test that must see a crash no
+    /// poll has seen.
+    #[cfg(test)]
+    pub fn has_ended(&mut self) -> bool {
+        self.thread_ended()
+    }
 }
 
 #[cfg(test)]
@@ -437,6 +457,24 @@ mod tests {
         worker.restart().unwrap();
         worker.send(3);
         assert!(matches!(next(&mut worker), WorkerPoll::Answer(3)));
+    }
+
+    /// Codex's finding on #2600: a worker whose thread ended where no poll
+    /// saw it is started again on request, and a running one is left be.
+    #[test]
+    fn a_worker_down_where_no_poll_saw_it_is_restarted_on_request() {
+        let mut worker = echo_crashing(1);
+        assert!(
+            !worker.restart_if_down().unwrap(),
+            "a running worker is left be"
+        );
+        worker.send(1);
+        crate::test_budget::await_spawned(Duration::from_secs(1), "the thread to end", || {
+            worker.has_ended()
+        });
+        assert!(worker.restart_if_down().unwrap());
+        worker.send(2);
+        assert!(matches!(next(&mut worker), WorkerPoll::Answer(2)));
     }
 
     #[test]
