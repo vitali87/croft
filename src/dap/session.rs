@@ -19,6 +19,10 @@ use serde_json::{Value, json};
 
 use super::transport::DapTransport;
 
+mod events;
+pub use events::output_is_user_visible;
+use events::*;
+
 /// What [`DapSession::request_step_in_targets`] did (#1543).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StepInTargetsAsk {
@@ -85,18 +89,6 @@ pub enum DapEvent {
     StepInTargets { targets: Vec<(i64, String)> },
 }
 
-/// Why an adapter refused `launch`/`attach`: DAP puts the full text in
-/// `body.error.format` (delve's "Failed to launch …: Go version … is too old
-/// for this version of Delve"), the short form in `message`.
-fn launch_failure_reason(msg: &Value) -> String {
-    msg.pointer("/body/error/format")
-        .and_then(Value::as_str)
-        .or_else(|| msg.get("message").and_then(Value::as_str))
-        .filter(|s| !s.is_empty())
-        .unwrap_or("the debug adapter refused to start the program")
-        .to_string()
-}
-
 /// One breakpoint's binding status as reported by the adapter: the source file,
 /// the (possibly adjusted) 1-based line, and whether the adapter could actually
 /// place it. An unverified breakpoint never pauses execution, so surfacing it is
@@ -138,52 +130,6 @@ pub fn breakpoint_reports(msg: &Value) -> Vec<BreakpointReport> {
             })
         })
         .collect()
-}
-
-/// Classify a raw incoming DAP message into a [`DapEvent`], or `None` for
-/// messages the app doesn't surface (responses, bookkeeping events). Pure.
-pub fn classify_event(msg: &Value) -> Option<DapEvent> {
-    if msg.get("type")?.as_str()? != "event" {
-        return None;
-    }
-    let body = msg.get("body");
-    match msg.get("event")?.as_str()? {
-        "initialized" => Some(DapEvent::Initialized),
-        "stopped" => Some(DapEvent::Stopped {
-            thread_id: body
-                .and_then(|b| b.get("threadId"))
-                .and_then(Value::as_i64)
-                .unwrap_or(0),
-            reason: body
-                .and_then(|b| b.get("reason"))
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string(),
-        }),
-        "continued" => Some(DapEvent::Continued),
-        "output" => Some(DapEvent::Output {
-            category: body
-                .and_then(|b| b.get("category"))
-                .and_then(Value::as_str)
-                .unwrap_or("console")
-                .to_string(),
-            text: body
-                .and_then(|b| b.get("output"))
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string(),
-        }),
-        "terminated" | "exited" => Some(DapEvent::Terminated),
-        _ => None,
-    }
-}
-
-/// Whether a DAP `output` event of this `category` is user-facing program
-/// output worth showing in the debug console. `telemetry` (debugpy's own
-/// `ptvsd` / `debugpy` banner lines) is adapter noise and is filtered out;
-/// `stdout` / `stderr` / `console` / `important` are kept.
-pub fn output_is_user_visible(category: &str) -> bool {
-    category != "telemetry"
 }
 
 /// Build the `initialize` request body (sans `seq`, which the transport stamps).
