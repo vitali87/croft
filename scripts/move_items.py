@@ -1927,11 +1927,116 @@ LANGUAGE_SERVERS = Target(
     None,
 )
 
+# The debug session's feature files (#2062): (module doc, release-note phrase, docs row).
+DAP_SESSION_FILES = {
+    "events": (
+        "Reading what an adapter sends: a raw DAP message classified into the [`DapEvent`]\n"
+        "the app acts on, which program output is worth showing, and why an adapter refused\n"
+        "to start.",
+        "debug event",
+        "a raw DAP message classified into a `DapEvent`, the output worth showing, and why "
+        "an adapter refused to start",
+    ),
+    "start_requests": (
+        "The requests that start and end a session: `initialize`, each adapter family's\n"
+        "`launch` (debugpy, lldb-dap, delve and vscode-js-debug), `configurationDone` and\n"
+        "`disconnect`, and the adapter families themselves.",
+        "debug start request",
+        "`initialize`, each adapter family's `launch`, `configurationDone` and "
+        "`disconnect`",
+    ),
+    "child_sessions": (
+        "vscode-js-debug's child sessions: its `startDebugging` reverse request, the answer\n"
+        "every reverse request needs, and opening the child.",
+        "js-debug child session",
+        "vscode-js-debug's `startDebugging` reverse request, the answer every reverse "
+        "request needs, and opening the child",
+    ),
+    "breakpoints": (
+        "Breakpoints: line, function and data breakpoints and logpoints, what the adapter\n"
+        "reports back about each, pushing them mid-session, and Run to Cursor's one-stop\n"
+        "breakpoint.",
+        "debug breakpoint",
+        "line, function and data breakpoints, what the adapter reports back, and Run to "
+        "Cursor",
+    ),
+    "exceptions": (
+        "Exception breakpoints: the filters an adapter offers, which of them mean \"break on\n"
+        "raised exceptions\", turning those on and off, and the one-line summary of what was\n"
+        "thrown.",
+        "exception breakpoint",
+        "the exception filters an adapter offers, breaking on raised exceptions, and what "
+        "was thrown",
+    ),
+    "stepping": (
+        "Running and stepping: pause, continue, step over, into and out, and Step Into\n"
+        "Target's choice among the calls on the line.",
+        "debug stepping",
+        "pause, continue, step over, into and out, and Step Into Target",
+    ),
+    "inspection": (
+        "Inspecting a stopped program: threads, the call stack, scopes and variables,\n"
+        "expensive scopes, evaluate and the hover's lookup, and the locals inline values\n"
+        "draw from.",
+        "debug inspection",
+        "threads, the call stack, scopes and variables, evaluate, and the locals inline "
+        "values draw from",
+    ),
+    "running_set": (
+        "The debug sessions in flight: each one's name, Debug Console streams and background\n"
+        "backlog, and which one is focused.",
+        "debug session set",
+        "the sessions in flight: their names, console streams and backlogs, and which one "
+        "is focused",
+    ),
+    "launch": (
+        "Starting and ending a session: spawning or reaching each adapter (debugpy, lldb-dap,\n"
+        "delve, vscode-js-debug, a server already listening), where delve builds the program,\n"
+        "the fresh session around its transport, and disconnecting.",
+        "debug launch",
+        "spawning or reaching each adapter, delve's build folder, the fresh session, and "
+        "disconnecting",
+    ),
+    "messages": (
+        "The per-frame poll: draining what the adapters sent, the handshake, each message's\n"
+        "effect on the session, and which connection and capabilities user-facing requests\n"
+        "go to.",
+        "debug message",
+        "the per-frame poll: the handshake, each message's effect on the session, and the "
+        "adapter's capabilities",
+    ),
+}
+
+DAP_SESSION = Target(
+    "dap_session", "scripts/split_dap_session_manifest.tsv", "src/dap/session.rs",
+    "src/dap/session", DAP_SESSION_FILES,
+    Tree(
+        # remote/session.rs's row starts the same way, and comes first.
+        "│   ├── session.rs            one debug launch session",
+        "│   ├── session/         the debug session's feature files, beside session.rs; "
+        "each file's `//!` doc says what it holds",
+        "│   │   ├── ", 20,
+    ),
+    "dap-session-",
+    (
+        "The debug session's own tests, moved out of session.rs (#2062).",
+        "the debug session's tests",
+        "the debug session's own tests",
+    ),
+    {
+        "session_set_tests": (
+            "The tests of the set of debug sessions in flight, moved out of session.rs (#2062).",
+            "the session set's tests",
+            "the tests of the set of debug sessions in flight",
+        ),
+    },
+)
+
 TARGETS = {
     t.name: t
     for t in (
         APP, EDITOR, LSP, TERMINAL, GIT, REMOTE, SEARCH, SESSION_HOST, PAIR, SOURCE_CONTROL,
-        CLI, CODEQL, DEBUGGER, LANGUAGE_SERVERS,
+        CLI, CODEQL, DEBUGGER, LANGUAGE_SERVERS, DAP_SESSION,
     )
 }
 
