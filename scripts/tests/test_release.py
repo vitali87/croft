@@ -1208,7 +1208,7 @@ class Workflows(unittest.TestCase):
         return subprocess.run(
             ["bash", "-c", step_script(CI, GATE_STEP)],
             cwd=repo.path,
-            env={**os.environ, "GITHUB_BASE_REF": "main"},
+            env={**os.environ, "PR_BASE_REF": "main"},
             capture_output=True,
             text=True,
             check=False,

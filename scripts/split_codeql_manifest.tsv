@@ -1,0 +1,192 @@
+# Stage B of the refactor program (#2062): where each item of src/app/codeql.rs goes.
+# One row per item, in file order. pr 0 means the item stays in codeql.rs; the others
+# move to src/app/codeql/<file>.rs in that PR. kind, impl and name are as
+# `scripts/check_pure_move.py list` prints them. Run
+# `scripts/move_items.py --target codeql --check` after adding an item to codeql.rs.
+# codeql.rs keeps the types and constants the App's fields and every part share.
+pr	file	kind	impl	name
+16	side_bar	fn	impl App	codeql_unavailable
+1	test_runs	fn	impl App	run_codeql_tests
+1	test_runs	fn	impl App	accept_codeql_test_output
+2	cli_install	fn	impl App	set_codeql_program
+2	cli_install	fn	impl App	resolve_codeql_cli
+16	side_bar	fn	impl App	open_codeql_view
+16	side_bar	fn	impl App	handle_codeql_key
+4	database_sources	fn	impl App	open_codeql_database_sources
+4	database_sources	fn	impl App	open_codeql_database_picker
+16	side_bar	fn	impl App	activate_codeql
+14	variant_repos	fn	impl App	codeql_variant_path
+14	variant_repos	fn	impl App	refresh_codeql_variant
+14	variant_repos	fn	impl App	edit_codeql_variant
+14	variant_repos	fn	impl App	prompt_codeql_controller
+14	variant_repos	fn	impl App	submit_codeql_controller
+14	variant_repos	fn	impl App	prompt_add_codeql_variant_repo
+14	variant_repos	fn	impl App	submit_add_codeql_variant_repo
+14	variant_repos	fn	impl App	prompt_codeql_variant_code_search
+14	variant_repos	fn	impl App	codeql_search_language
+14	variant_repos	fn	impl App	start_codeql_variant_code_search
+14	variant_repos	fn	impl App	drain_codeql_code_search
+14	variant_repos	fn	impl App	prompt_add_codeql_variant_list
+14	variant_repos	fn	impl App	submit_add_codeql_variant_list
+14	variant_repos	fn	impl App	prompt_add_codeql_variant_owner
+9	packs	fn	impl App	install_codeql_pack_dependencies
+8	queries	fn	impl App	open_codeql_quick_query
+9	packs	fn	impl App	prompt_download_codeql_packs
+9	packs	fn	impl App	submit_download_codeql_packs
+9	packs	fn	impl App	start_codeql_pack_job
+9	packs	fn	impl App	drain_codeql_pack_job
+14	variant_repos	fn	impl App	submit_add_codeql_variant_owner
+14	variant_repos	fn	impl App	prompt_rename_codeql_variant_list
+14	variant_repos	fn	impl App	submit_rename_codeql_variant_list
+14	variant_repos	fn	impl App	remove_codeql_variant_item
+14	variant_repos	fn	impl App	perform_remove_codeql_variant_list
+16	side_bar	fn	impl App	keep_codeql_selection_on_a_row
+14	variant_repos	fn	impl App	select_codeql_variant_item
+14	variant_repos	fn	impl App	open_codeql_variant_config
+14	variant_repos	fn	impl App	codeql_variant_github_url
+14	variant_repos	fn	impl App	open_codeql_variant_on_github
+3	databases	fn	impl App	current_codeql_database
+3	databases	fn	impl App	confirm_remove_codeql_database
+3	databases	fn	impl App	codeql_cached_copy
+3	databases	fn	impl App	cache_entry_holding
+3	databases	fn	impl App	perform_remove_codeql_database
+3	databases	fn	impl App	prompt_rename_codeql_database
+3	databases	fn	impl App	submit_rename_codeql_database
+3	databases	fn	impl App	sort_codeql_databases
+3	databases	fn	impl App	reveal_codeql_database
+3	databases	fn	impl App	upgrade_codeql_database
+3	databases	fn	impl App	start_codeql_db_job
+3	databases	fn	impl App	drain_codeql_upgrade
+2	cli_install	fn	impl App	copy_codeql_version
+2	cli_install	fn	impl App	drain_codeql_version
+2	cli_install	fn	impl App	read_codeql_version
+2	cli_install	fn	impl App	download_codeql_cli
+2	cli_install	fn	impl App	start_codeql_cli_download
+2	cli_install	fn	impl App	drain_codeql_cli_download
+2	cli_install	fn	impl App	check_codeql_cli_updates
+2	cli_install	fn	impl App	drain_codeql_cli_check
+4	database_sources	fn	impl App	add_codeql_database_source
+3	databases	fn	impl App	unused_codeql_databases
+3	databases	fn	impl App	confirm_delete_unused_codeql_databases
+3	databases	fn	impl App	perform_delete_unused_codeql_databases
+3	databases	fn	impl App	codeql_db_store_path
+3	databases	fn	impl App	codeql_db_cache_dir
+3	databases	fn	impl App	codeql_source_cache_dir
+5	history	fn	impl App	codeql_history_path
+5	history	fn	impl App	codeql_results_dir
+5	history	fn	impl App	refresh_codeql_history
+5	history	fn	impl App	current_codeql_history
+5	history	fn	impl App	codeql_cached_results
+5	history	fn	impl App	confirm_remove_codeql_history
+5	history	fn	impl App	perform_remove_codeql_history
+5	history	fn	impl App	prompt_rename_codeql_history
+5	history	fn	impl App	submit_rename_codeql_history
+5	history	fn	impl App	sort_codeql_history
+5	history	fn	impl App	view_codeql_history_query
+5	history	fn	impl App	view_codeql_history_query_text
+5	history	fn	impl App	codeql_history_log
+6	logs	fn	impl App	show_codeql_evaluator_log
+6	logs	fn	impl App	show_codeql_query_log
+6	logs	fn	impl App	show_codeql_evaluator_log_summary
+6	logs	fn	impl App	drain_codeql_log_summary
+6	logs	fn	impl App	codeql_log_predicates
+6	logs	fn	impl App	show_codeql_evaluator_log_viewer
+6	logs	fn	impl App	drain_codeql_log_viewer
+6	logs	fn	impl App	compare_codeql_performance
+6	logs	fn	impl App	drain_codeql_perf_compare
+7	results	fn	impl App	prompt_export_codeql_results
+7	results	fn	impl App	submit_export_codeql_results
+8	queries	fn	impl App	preview_codeql_query_help
+8	queries	fn	impl App	drain_codeql_query_help
+7	results	fn	impl App	compare_codeql_results
+5	history	fn	impl App	open_codeql_results_directory
+5	history	fn	impl App	open_codeql_history_results_dir
+8	queries	fn	impl App	refresh_codeql_queries
+8	queries	fn	impl App	discover_codeql_queries
+8	queries	fn	impl App	drain_codeql_queries
+8	queries	fn	impl App	prompt_create_codeql_query
+8	queries	fn	impl App	submit_create_codeql_query
+15	variant_runs	fn	impl App	refresh_codeql_variant_runs
+15	variant_runs	fn	impl App	open_codeql_variant_run
+15	variant_runs	fn	impl App	poll_codeql_variant_runs
+15	variant_runs	fn	impl App	codeql_variant_run
+15	variant_runs	fn	impl App	copy_codeql_variant_repo_list
+15	variant_runs	fn	impl App	view_codeql_variant_logs
+15	variant_runs	fn	impl App	open_codeql_variant_results
+15	variant_runs	fn	impl App	fetch_codeql_variant_results
+15	variant_runs	fn	impl App	drain_codeql_variant_results
+15	variant_runs	fn	impl App	prompt_export_codeql_variant_results
+15	variant_runs	fn	impl App	start_export_codeql_variant_results
+15	variant_runs	fn	impl App	drain_codeql_variant_export
+15	variant_runs	fn	impl App	codeql_variant_runs_path
+15	variant_runs	fn	impl App	run_codeql_variant_analysis
+15	variant_runs	fn	impl App	drain_codeql_variant_submit
+10	run	fn	impl App	run_codeql_query
+9	packs	fn	impl App	run_codeql_query_suite
+10	run	fn	impl App	run_codeql_file
+10	run	fn	impl App	run_codeql_file_with
+9	packs	fn	impl App	prompt_run_codeql_published_pack
+9	packs	fn	impl App	run_codeql_published_pack
+10	run	fn	impl App	run_codeql_file_on
+9	packs	fn	impl App	check_codeql_suite
+10	run	fn	impl App	quick_eval_codeql
+10	run	fn	impl App	debug_codeql_query
+10	run	fn	impl App	codeql_command_until
+10	run	fn	impl App	cancel_codeql_run
+7	results	fn	impl App	walk_codeql_results
+7	results	fn	impl App	codeql_source_file
+7	results	fn	impl App	codeql_decode_sets
+7	results	fn	impl App	show_codeql_result_sets
+10	run	fn	impl App	codeql_stdout
+12	contextual	fn	impl App	codeql_contextual_target
+12	contextual	fn	impl App	codeql_contextual_dir
+12	contextual	fn	impl App	codeql_contextual_query
+12	contextual	fn	impl App	view_codeql_cfg
+12	contextual	fn	impl App	drain_codeql_doc
+8	queries	fn	impl App	open_codeql_referenced_file
+7	results	fn	impl App	codeql_chosen_run
+7	results	fn	impl App	codeql_run_database
+7	results	fn	impl App	view_codeql_alerts
+7	results	fn	impl App	view_codeql_raw_results
+13	model_editor	fn	impl App	open_codeql_model_editor
+13	model_editor	fn	impl App	model_codeql_endpoint
+13	model_editor	fn	impl App	choose_codeql_model
+13	model_editor	fn	impl App	save_codeql_model
+13	model_editor	fn	impl App	write_codeql_models
+13	model_editor	fn	impl App	drain_codeql_model
+12	contextual	fn	impl App	view_codeql_ast
+12	contextual	fn	impl App	drain_codeql_ast
+10	run	fn	impl App	codeql_command
+10	run	fn	impl App	drain_codeql_run
+10	run	fn	impl App	record_codeql_run
+9	packs	fn	impl App	run_codeql_pack
+11	queue	fn	impl App	run_codeql_batch
+11	queue	fn	impl App	run_codeql_query_on_databases
+11	queue	fn	impl App	open_codeql_multi_db_picker
+11	queue	fn	impl App	choose_codeql_multi_db
+11	queue	fn	impl App	run_all_codeql_queries
+11	queue	fn	impl App	run_selected_codeql_queries
+11	queue	fn	impl App	start_next_queued_codeql
+11	queue	fn	impl App	cancel_codeql_queue
+3	databases	fn	impl App	refresh_codeql_databases
+4	database_sources	fn	impl App	submit_codeql_database
+4	database_sources	fn	impl App	drain_codeql_db_job
+4	database_sources	fn	impl App	register_codeql_database
+4	database_sources	fn	impl App	extract_codeql_zip
+4	database_sources	fn	impl App	download_codeql_zip_from_url
+4	database_sources	fn	impl App	download_codeql_db_from_github
+16	side_bar	fn	impl App	codeql_availability_changed
+0		enum	-	CodeqlRunMode
+0		type	-	CodeqlCliCheck
+0		type	-	CodeqlQueryHelp
+0		type	-	CodeqlPackJob
+0		type	-	CodeqlDocJob
+0		type	-	CodeqlLogViewerJob
+0		const	-	CODEQL_DB_SOURCES
+0		type	-	CodeqlModelJob
+0		type	-	CodeqlUpgrade
+0		type	-	VariantResults
+0		type	-	CodeqlRunPoll
+0		const	-	CODEQL_VARIANT_POLL
+0		const	-	CODEQL_VARIANT_FOLLOW
+0		type	-	CodeqlCodeSearch

@@ -17,7 +17,25 @@ Resizes call `master.resize(...)` and `term.resize(...)` so programs like `htop`
 ```
 src/
 ├── main.rs              entry point + module declarations
-├── cli.rs               clap CLI: open path, setup-terminal / setup-iterm2 / setup-cross / remote / view / keys subcommands
+├── cli.rs               clap CLI: open path, setup-terminal / setup-iterm2 / setup-cross / remote / view / keys subcommands: what every part shares (the clap root, `Cli`); the command line's own code is in the files in `cli/` below, while a subcommand that drives a feature (remote, attach, record, view, ...) calls into that feature's module
+├── cli/                 the command line's feature files, beside cli.rs; each file's `//!` doc says what it holds
+│   ├── commands.rs       every subcommand and its flags, as clap parses them
+│   ├── cross.rs          `croft setup-cross`: the cross-build's targets, and installing zig, cargo-zigbuild and the targets
+│   ├── git_editor.rs     `croft edit` as git's editor: the user's own sequence editor, and git's own editor when no croft is there
+│   ├── hook.rs           `croft hook`: Claude Code's edit hook itself, and installing or removing it
+│   ├── keys.rs           `croft keys`: printing each key and mouse event as croft receives it
+│   ├── launcher_install.rs `croft install-launcher`: the macOS Croft.app that opens croft in a new Ghostty window
+│   ├── links.rs          `croft open-link` and `croft install-link-handler`: following a link into a session, and handling the links
+│   ├── pair_provider.rs  `croft pair`'s provider flags: `--base-url` alone means ollama, which defaults to its local port
+│   ├── plot.rs           `croft plot`: a chart of stdin, as an inline image or as text, in the theme's colours
+│   ├── run.rs            running what was parsed: each subcommand handed to its code, or the workspace opened
+│   ├── terminal_setup.rs `croft setup-terminal`, `setup-iterm2` and `setup-ghostty`: setting up macOS terminals for croft
+│   ├── tests.rs          the command line's own tests
+│   ├── theme_import.rs   `croft theme-import`: converting a VS Code theme from a file or the marketplace, and installing it
+│   ├── typos.rs          a misspelled subcommand clap took as a folder, turned into an error that names the one meant
+│   ├── version.rs        the plain version `--version` prints, and the provenance line `--build-info` prints
+│   ├── vscode_import.rs  `croft import-vscode`: converting a VS Code profile, and the report of what came across
+│   ├── workspace.rs      the `PATH` and `--open-file` arguments: the workspace root, the file to open and its `file:line[:col]` location
 ├── clipboard.rs         native macOS clipboard read/write (NSPasteboard) with pbpaste fallback, wl-paste / xclip / xsel on Linux, and croft's own last copy, which a paste inside croft falls back to where the host clipboard can't be read (an SSH host with no clipboard tool)
 ├── command_history.rs    durable cross-session shell command history as JSONL under `~/.config/croft/command_history.jsonl` (cwd / exit / duration), read off OSC 133 marks with no shell hooks; Ctrl+Shift+H opens the search popup
 ├── fleet.rs              running one command across N ssh hosts and diffing the results, behind "Terminal: Fleet Run"; the fleet must be named (`hosts: command`, `*` for explicit broadcast)
@@ -189,11 +207,46 @@ src/
 │   ├── bottom_panel.rs  the bottom panel and its tab strip, the OUTPUT picker, PROBLEMS and the diagnostics store, the whole-project check, build matchers, and the PORTS panel
 │   ├── click.rs         double / triple click detection
 │   ├── code_scanning.rs SARIF results viewer (list, open, preview, baselines, export, fixes and step marks), GitHub code scanning (pick, download, follow branch, dismiss) and SARIF logs shown as problems
-│   ├── codeql.rs        the CodeQL side bar: databases, query history and logs, running queries, suites and packs, result viewers, AST and CFG, the model editor, the run queue, variant analysis, and downloading and updating the CLI
+│   ├── codeql.rs        the CodeQL side bar: databases, query history and logs, running queries, suites and packs, result viewers, AST and CFG, the model editor, the run queue, variant analysis, and downloading and updating the CLI: what every part shares (the run mode, the results its worker threads send back, the database sources and the variant analysis poll intervals); each feature is in a file in `codeql/` below
+│   ├── codeql/          the CodeQL side bar's feature files, beside codeql.rs; each file's `//!` doc says what it holds
+│   │   ├── cli_install.rs      the CodeQL CLI: which `codeql` runs, its version, downloading it and checking for updates
+│   │   ├── contextual.rs       contextual queries: View AST and View CFG
+│   │   ├── database_sources.rs adding a database from a folder, an archive, a URL or GitHub, and its source to the workspace
+│   │   ├── databases.rs        the database list: removing, renaming, sorting, upgrading, deleting unused copies, and where databases are kept
+│   │   ├── history.rs          the query history: its entries, their queries, logs and results folders
+│   │   ├── logs.rs             a run's evaluator and query logs, the log viewer, and Compare Performance
+│   │   ├── model_editor.rs     the model editor: endpoints, their models, and the model pack
+│   │   ├── packs.rs            suites and packs: installing, downloading and running them
+│   │   ├── queries.rs          the workspace's queries: finding and creating them, Quick Query, query help
+│   │   ├── queue.rs            the run queue: many queries in turn, or one query on several databases
+│   │   ├── results.rs          a run's results: result sets, the alert and raw views, Compare Results, Export Results
+│   │   ├── run.rs              running a query, quick evaluation and Debug Query, cancelling and recording a run
+│   │   ├── side_bar.rs         the side bar itself: availability, its keys and what each row does
+│   │   ├── test_runs.rs        CodeQL: Run Tests through the Testing view, and Accept Test Output
+│   │   ├── variant_repos.rs    variant analysis targets: the controller, lists, repositories, owners and Code Search
+│   │   ├── variant_runs.rs     variant analysis runs: submitting, following, fetching and exporting results
 │   ├── commands.rs      `run_command`, the Command Palette, the Extensions view, extension commands (MCP tools, viewers) and Show Memory Usage
 │   ├── completion.rs    the completion popup, auto-imports, snippets, signature help, ghost-text suggestions and Emmet
 │   ├── cursor_blink.rs  caret blink timing
-│   ├── debugger.rs      Run and Debug: launch configs and Add Configuration, compounds and preLaunchTask waits, adapters, debug builds, attach pickers, the paused view, watches, the console, stepping, every kind of breakpoint, Debug Test and inline values
+│   ├── debugger.rs      Run and Debug: launch configs and Add Configuration, compounds and preLaunchTask waits, adapters, debug builds, attach pickers, the paused view, watches, the console, stepping, every kind of breakpoint, Debug Test and inline values: what every part shares (a launch parked behind its `preLaunchTask` and how it waits, what became of a compound member, whether a launch replaces the running set or joins it, what runs once a launch's `${input:...}` questions are answered, and the js-debug teardown grace); each feature is in a file in `debugger/` below
+│   ├── debugger/        the Run and Debug feature files, beside debugger.rs; each file's `//!` doc says what it holds
+│   │   ├── active_file.rs      running and debugging the active file, the adapter picked by its kind
+│   │   ├── adapters.rs         finding lldb-dap, telling a runnable binary, and installing delve
+│   │   ├── attach.rs           the attach process pickers and attaching to the chosen process
+│   │   ├── breakpoint_list.rs  the BREAKPOINTS list: its rows, clicks and removal
+│   │   ├── breakpoints.rs      line, conditional, hit-count, function and data breakpoints, logpoints, exceptions
+│   │   ├── builds.rs           debug builds: `cargo`, C/C++ and single Rust files, then lldb-dap on the binary
+│   │   ├── compounds.rs        compounds, preLaunchTask waits, postDebugTask and switching sessions
+│   │   ├── configs.rs          Add Configuration and the Select and Start Debugging picker
+│   │   ├── console.rs          the debug console, its REPL and OUTPUT mirror, and hover-to-evaluate
+│   │   ├── controls.rs         continue, pause, stepping, Step Into Target, Run to Cursor, restart and stop
+│   │   ├── debug_test.rs       Debug Test: the test at the caret or by name, its build, launch and failure breakpoint
+│   │   ├── events.rs           the sessions' events, drained each frame: stops, output and endings
+│   │   ├── inline_values.rs    inline values beside the paused lines
+│   │   ├── launch.rs           F5 and launching a configuration: saving first, resolving, spawning, installing
+│   │   ├── python.rs           which Python a debugged program runs under, and the note on an old one
+│   │   ├── view.rs             the view: its keys, button, paused-state tree, clicks, row menu and errors
+│   │   ├── watches.rs          watch expressions: adding, removing and evaluating them
 │   ├── diff_merge.rs    diff editor upkeep and navigation, merge conflicts and the three-way merge editor, the history scrubber, local history and the who-wrote-this lens
 │   ├── editor_input.rs  editor keys, vim mode, macros, multi-cursor and line commands, typing toggles, copy, cut and paste routing and the clipboard, and reading dropped file paths out of a paste
 │   ├── editor_layout.rs the tree of editor groups: splitting, moving focus between and collapsing them, and each group's rectangle; the focused group's tabs live in `App::editor`
@@ -206,7 +259,30 @@ src/
 │   ├── hover.rs         LSP hover dwell timing
 │   ├── inline_images.rs pictures in the terminal: support detection, the background chrome bake, sending and clearing each picture every frame (the activity-bar icons included), the editor, terminal and Markdown overlays, and the minimap
 │   ├── key_input.rs     `handle_key` and `handle_key_inner`, Cmd+K chords, every `is_*_key` predicate, the key and mouse contexts for user keymaps, voice input and the on-screen keyboard
-│   ├── language_servers.rs language servers: sync, messages and progress, decorations, go-to and peek, hierarchies, rename, code actions, formatting, linked editing, smart select, highlights, symbol pickers, code lens, outline, breadcrumbs, sticky scroll, restart
+│   ├── language_servers.rs language servers: sync, messages and progress, decorations, go-to and peek, hierarchies, rename, code actions, formatting, linked editing, smart select, highlights, symbol pickers, code lens, outline, breadcrumbs, sticky scroll, restart: the types and constants its parts share (what an on-type formatting reply means, what a crumb stands for, the outline's key and its parse channel, a place Peek References shows, the shell server and its missing-tool notices, CodeLens's settle time, sticky scroll's row cap, the inline-outline size cap, the restart notice during an update build, and the hover's divider and empty-caret message); each feature is in a file in `language_servers/` below
+│   ├── language_servers/ the language server feature files, beside language_servers.rs; each file's `//!` doc says what it holds
+│   │   ├── breadcrumbs.rs       breadcrumbs, their pickers, and the sticky-scroll headers
+│   │   ├── capabilities.rs      the active file's language and which features its server supports
+│   │   ├── code_actions.rs      Quick Fix: requesting, picking, resolving and applying code actions
+│   │   ├── code_lens.rs         CodeLens: requesting, landing, running and toggling lenses
+│   │   ├── decorations.rs       document links, folding ranges, colors and Change Color Presentation
+│   │   ├── format.rs            Format Document and Selection, Prettier, and format-on-save
+│   │   ├── go_to_symbol.rs      Go to Symbol in Editor: the picker, its keys, mouse and drawing
+│   │   ├── hierarchy.rs         call and type hierarchies: the requests and the picker of answers
+│   │   ├── hover_text.rs        the hover's text: diagnostics first, then the server's answer
+│   │   ├── inlay_hints.rs       inlay hints: their replies, refresh, requests and the toggle
+│   │   ├── messages.rs          server progress, messages, questions and show-document requests
+│   │   ├── navigation.rs        Go to Definition and its kin: requests, jumps and the multi-location picker
+│   │   ├── outline.rs           the OUTLINE: syntax and server symbols, and the secondary side bar
+│   │   ├── peek.rs              Peek Definition and Peek References: the popup, its excerpt and stepping
+│   │   ├── rename.rs            Rename Symbol: the prompt, prepare-rename and landing the reply
+│   │   ├── rust_analyzer.rs     rust-analyzer's `Rust:` commands: sending them and acting on the answers
+│   │   ├── selection.rs         Expand and Shrink Selection, and occurrence highlights
+│   │   ├── semantic.rs          semantic tokens, their refresh, and the background syntax pass landing
+│   │   ├── sync.rs              keeping servers in step with the open files, their diagnostics, and restarts
+│   │   ├── typing.rs            on-type formatting, linked editing, parameter-hint triggers and snippet items
+│   │   ├── workspace_edits.rs   applying workspace edits to buffers and files, and refusing stale ones
+│   │   ├── workspace_symbols.rs Go to Symbol in Workspace: the debounced query, replies and the picker
 │   ├── memory_report.rs Developer: Show Memory Usage: the per-subsystem figures laid out as Markdown, opened as a rendered preview so typing can't edit it
 │   ├── menus.rs         right-click and dropdown menus: shortcut hints, ContextMenu methods, geometry, keys, drawing, `dispatch_menu_action`, and the status-bar click menus
 │   ├── mouse_input.rs   all mouse handling (`handle_mouse_inner`), hover popups and tooltips, and closing stale popups on a click

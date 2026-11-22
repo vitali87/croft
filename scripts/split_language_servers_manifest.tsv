@@ -1,0 +1,179 @@
+# Stage B of the refactor program (#2062): where each item of
+# src/app/language_servers.rs goes. One row per item, in file order. pr 0 means the item
+# stays in language_servers.rs; the others move to src/app/language_servers/<file>.rs in
+# that PR. kind, impl and name are as `scripts/check_pure_move.py list` prints them. Run
+# `scripts/move_items.py --target language_servers --check` after adding an item to
+# language_servers.rs. language_servers.rs keeps the types and constants its parts share.
+pr	file	kind	impl	name
+0		enum	-	OnTypeReply
+0		enum	-	CrumbTarget
+0		type	-	OutlineKey
+0		type	-	OutlineParse
+0		type	-	PeekLocation
+0		const	-	CODE_LENS_SETTLE
+0		const	-	STICKY_SCROLL_MAX
+6	messages	fn	-	server_message_status
+1	sync	fn	impl App	sync_lsp
+2	rust_analyzer	fn	impl App	rust_analyzer_serves_active_file
+2	rust_analyzer	fn	impl App	request_rust_analyzer
+2	rust_analyzer	fn	impl App	drain_lsp_rust_analyzer
+2	rust_analyzer	fn	impl App	apply_rust_analyzer_result
+3	semantic	fn	impl App	drain_lsp_semantic_tokens
+4	inlay_hints	fn	impl App	drain_lsp_inlay_hints
+4	inlay_hints	fn	impl App	fan_out_batch
+5	decorations	fn	impl App	drain_lsp_document_links
+5	decorations	fn	impl App	open_document_link
+5	decorations	fn	impl App	drain_lsp_folding_ranges
+5	decorations	fn	impl App	drain_lsp_document_colors
+5	decorations	fn	impl App	change_color_presentation
+5	decorations	fn	impl App	drain_lsp_color_presentations
+6	messages	fn	impl App	drain_lsp_progress
+6	messages	fn	impl App	apply_server_update
+6	messages	fn	impl App	ask_next_lsp_question
+6	messages	fn	impl App	show_server_document
+6	messages	fn	impl App	lsp_progress_status
+3	semantic	fn	impl App	refresh_semantic_tokens_if_requested
+4	inlay_hints	fn	impl App	refresh_inlay_hints_if_requested
+1	sync	fn	impl App	refresh_workspace_diagnostics_if_requested
+4	inlay_hints	fn	impl App	request_inlay_hints_for_open_editors
+4	inlay_hints	fn	impl App	inlay_hint_targets
+4	inlay_hints	fn	impl App	toggle_inlay_hints
+7	navigation	fn	impl App	go_to_definition
+7	navigation	fn	impl App	try_go_to_definition
+11	breadcrumbs	fn	impl App	build_breadcrumbs
+11	breadcrumbs	fn	impl App	breadcrumb_targets
+11	breadcrumbs	fn	impl App	open_breadcrumb_picker
+11	breadcrumbs	fn	impl App	open_crumb_folder_picker
+11	breadcrumbs	fn	impl App	show_crumb_picker
+11	breadcrumbs	fn	impl App	apply_crumb_filter
+11	breadcrumbs	fn	impl App	open_crumb_file
+11	breadcrumbs	fn	impl App	focus_breadcrumbs
+11	breadcrumbs	fn	impl App	build_sticky_lines
+12	outline	fn	impl App	sync_outline
+12	outline	fn	impl App	start_outline_parse
+12	outline	fn	impl App	drain_outline_parse
+12	outline	fn	impl App	apply_outline_symbols
+12	outline	fn	impl App	compute_syntax_outline
+12	outline	fn	impl App	drain_lsp_document_symbols
+7	navigation	fn	impl App	drain_lsp_definition
+8	peek	fn	impl App	open_peek_popup
+8	peek	fn	impl App	open_peek_popup_titled
+8	peek	fn	impl App	close_peek_popup
+8	peek	fn	impl App	show_peeked_reference
+8	peek	fn	impl App	step_peeked_reference
+8	peek	fn	impl App	peek_references_at_cursor
+7	navigation	fn	impl App	drain_lsp_declaration
+7	navigation	fn	impl App	drain_lsp_type_definition
+7	navigation	fn	impl App	finish_jump
+7	navigation	fn	impl App	drain_lsp_implementation
+7	navigation	fn	impl App	drain_lsp_references
+9	hierarchy	fn	impl App	drain_lsp_call_hierarchy
+9	hierarchy	fn	impl App	present_call_hierarchy_menu
+9	hierarchy	fn	impl App	request_call_hierarchy_at_cursor
+9	hierarchy	fn	impl App	request_type_hierarchy_at_cursor
+10	capabilities	fn	impl App	editor_language_supports_call_hierarchy
+10	capabilities	fn	impl App	editor_language
+10	capabilities	fn	impl App	editor_language_supports
+13	typing	fn	impl App	tick_on_type_formatting
+13	typing	fn	impl App	on_type_reply_disposition
+13	typing	fn	impl App	drain_lsp_on_type_format
+13	typing	fn	impl App	apply_on_type_edits
+13	typing	fn	impl App	tick_linked_editing
+13	typing	fn	impl App	drain_lsp_linked_editing
+14	selection	fn	impl App	expand_selection
+14	selection	fn	impl App	shrink_selection
+14	selection	fn	impl App	drain_lsp_selection_ranges
+14	selection	fn	impl App	tick_occurrences
+14	selection	fn	impl App	drain_lsp_document_highlights
+7	navigation	fn	impl App	open_location_picker
+7	navigation	fn	impl App	location_under_caret
+7	navigation	fn	impl App	trigger_definition_at
+8	peek	fn	impl App	peek_definition_at_cursor
+7	navigation	fn	impl App	request_definition_at_cursor
+7	navigation	fn	impl App	request_at_cursor
+7	navigation	fn	impl App	request_declaration_at_cursor
+7	navigation	fn	impl App	request_type_definition_at_cursor
+7	navigation	fn	impl App	request_implementation_at_cursor
+7	navigation	fn	impl App	request_references_at_cursor
+10	capabilities	fn	impl App	editor_language_supports_declaration
+10	capabilities	fn	impl App	editor_language_supports_type_definition
+10	capabilities	fn	impl App	editor_language_supports_implementation
+10	capabilities	fn	impl App	editor_language_supports_references
+10	capabilities	fn	impl App	editor_language_supports_code_action
+16	rename	fn	impl App	start_rename_symbol
+16	rename	fn	impl App	open_rename_prompt_fallback
+16	rename	fn	impl App	drain_lsp_prepare_rename
+16	rename	fn	impl App	apply_prepare_rename_verdict
+16	rename	fn	impl App	drain_lsp_rename
+16	rename	fn	impl App	land_rename
+15	workspace_edits	fn	impl App	stale_edit_target
+15	workspace_edits	fn	impl App	edit_seqs_in_every_group
+15	workspace_edits	fn	impl App	buffer_group
+15	workspace_edits	fn	impl App	apply_edits_to_open_buffer
+15	workspace_edits	fn	impl App	apply_rename_edits
+17	format	fn	impl App	start_format_document
+17	format	fn	impl App	format_target_seq
+17	format	fn	impl App	format_selection
+17	format	fn	impl App	drain_prettier_format
+17	format	fn	impl App	drain_lsp_format
+17	format	fn	impl App	drain_lsp_format_at
+17	format	fn	impl App	save_without_formatting
+17	format	fn	impl App	path_is_saved
+17	format	fn	impl App	land_format
+18	code_actions	fn	impl App	code_action_request
+18	code_actions	fn	impl App	start_code_action
+18	code_actions	fn	impl App	drain_lsp_code_actions
+18	code_actions	fn	impl App	open_code_action_picker
+18	code_actions	fn	impl App	apply_code_action
+18	code_actions	fn	impl App	apply_resolved_code_action
+18	code_actions	fn	impl App	resolve_and_apply_code_action
+12	outline	fn	impl App	render_secondary_side_bar
+12	outline	fn	impl App	with_secondary_outline
+12	outline	fn	impl App	click_secondary_outline
+1	sync	fn	impl App	restart_language_servers
+1	sync	fn	impl App	restart_language_servers_for_file
+19	go_to_symbol	fn	impl App	open_go_to_symbol
+19	go_to_symbol	fn	impl App	close_go_to_symbol
+19	go_to_symbol	fn	impl App	handle_go_to_symbol_key
+19	go_to_symbol	fn	impl App	jump_to_go_to_symbol_selection
+19	go_to_symbol	fn	impl App	handle_go_to_symbol_mouse
+19	go_to_symbol	fn	impl App	render_go_to_symbol
+20	workspace_symbols	fn	impl App	open_workspace_symbols
+20	workspace_symbols	fn	impl App	close_workspace_symbols
+20	workspace_symbols	fn	impl App	workspace_symbols_requery
+20	workspace_symbols	fn	impl App	workspace_symbols_dispatch_due
+20	workspace_symbols	fn	impl App	apply_workspace_symbols
+20	workspace_symbols	fn	impl App	drain_lsp_workspace_symbols
+20	workspace_symbols	fn	impl App	handle_workspace_symbols_key
+20	workspace_symbols	fn	impl App	jump_to_workspace_symbol_selection
+20	workspace_symbols	fn	impl App	handle_workspace_symbols_mouse
+20	workspace_symbols	fn	impl App	render_workspace_symbols
+21	code_lens	fn	impl App	tick_code_lens
+21	code_lens	fn	impl App	drain_lsp_code_lens
+21	code_lens	fn	impl App	run_code_lens
+21	code_lens	fn	impl App	run_code_lens_at_cursor
+21	code_lens	fn	impl App	toggle_code_lens
+3	semantic	fn	impl App	poll_highlights
+0		const	-	BASH_SERVER
+0		const	-	SHFMT_MISSING
+0		const	-	SHELLCHECK_MISSING
+1	sync	fn	-	is_shell_script
+1	sync	fn	-	tool_on_path
+8	peek	fn	-	peek_excerpt
+0		const	-	LSP_PAUSED_FOR_BUILD
+12	outline	fn	-	syntax_outline_for
+0		const	-	OUTLINE_INLINE_MAX_BYTES
+12	outline	fn	-	outline_parses_inline
+11	breadcrumbs	fn	-	breadcrumb_symbol_chain
+11	breadcrumbs	fn	-	sibling_symbols
+13	typing	fn	-	is_signature_help_trigger
+13	typing	fn	-	snippet_completion_item
+1	sync	fn	-	lsp_server_family
+1	sync	fn	-	just_installed_covers_path
+3	semantic	fn	-	semantic_reply_is_current
+1	sync	fn	-	store_diagnostics_update
+0		const	-	HOVER_DIVIDER
+0		const	-	NO_HOVER_AT_CARET
+22	hover_text	fn	-	format_diagnostics
+22	hover_text	fn	-	compose_hover
+12	outline	fn	-	syntax_kind_of
