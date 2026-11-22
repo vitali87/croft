@@ -420,6 +420,9 @@ src/
     ├── extensions.rs         Extensions sidebar widget: projects bundled and user manifests into a theme-aware list grouped under BUILT-IN/INSTALLED/AVAILABLE, with pill toggles, +Add, trash, a local filter box and clear/refresh; reports clicks back to App, which owns the state
     ├── file_finder.rs   VS Code-style Quick Open (Cmd+P) fuzzy file picker with tiered match ranking (exact filename > prefix > substring > path > subsequence)
     ├── file_tree.rs          `ignore::WalkBuilder` backed file tree: lazy children, fs-watcher refresh, multi-select, drag-drop, bulk trash, reveal-path, multi-root section rows, sticky scroll and compact folders
+    ├── file_tree/        the Explorer's file tree's feature files, beside file_tree.rs; each file's `//!` doc says what it holds
+    │   ├── android_trash.rs   the freedesktop home trash on Android, where the `trash` crate has none
+    │   ├── tests.rs           the file tree's own tests
     ├── header_pill.rs   shared section-header pill button (chip-backed codicon affordance + theme colours) used by both the Remote Explorer (+ / refresh) and Source Control (refresh) headers
     ├── captures.rs           the panel group's CAPTURES tab (iTerm2's Capture Output): lines collected by `capture` triggers, with Enter jumping to the originating pane row; pure widget capped at 500 entries, and it also shapes the "Ask Navigator about this line" turn
     ├── history_popup.rs      `Ctrl+Shift+H` command-history popup over command_history.rs: query line, newest-first deduped results with exit/duration/cwd meta, `Ctrl+R` scope filter
