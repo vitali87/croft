@@ -2469,6 +2469,61 @@ fn a_search_editor_reruns_its_header_and_opens_results() {
     assert_eq!(app.editor.cursor_row, 1, "the match's line, 0-based");
 }
 
+/// #2549: a rerun whose search thread dies without sending must not leave
+/// the tab waiting on results that never come, with "Searching for …" still
+/// on screen. The job goes, the status says the search stopped, and the tab
+/// keeps its text.
+#[test]
+fn a_search_editor_rerun_whose_search_dies_says_so() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().canonicalize().unwrap()).unwrap();
+    app.run_command(crate::widgets::command_palette::Command::OpenSearchEditor);
+    app.editor.lines[0] = String::from("# Query: needle");
+    let before = app.editor.lines.clone();
+    assert!(app.handle_cmd_k_chord(key(KeyCode::Char('R'), KeyModifiers::SHIFT)));
+    // The search thread dies without sending.
+    let (label, header, _) = app
+        .search_editor_job
+        .take()
+        .expect("setup: the rerun started a search");
+    let (tx, rx) = std::sync::mpsc::channel();
+    drop(tx);
+    app.search_editor_job = Some((label, header, rx));
+    assert!(
+        app.drain_search_editor(),
+        "a search that died is news to draw"
+    );
+    assert!(app.search_editor_job.is_none(), "the job goes");
+    assert_eq!(
+        app.status,
+        "Search Editor: the search stopped without answering"
+    );
+    assert_eq!(app.editor.lines, before, "the tab keeps its text");
+}
+
+/// A status that has moved on since the rerun started (the crash notice,
+/// shown on an earlier frame than the one that finds the search gone) is
+/// left alone.
+#[test]
+fn a_search_editor_rerun_whose_search_dies_keeps_a_newer_status() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().canonicalize().unwrap()).unwrap();
+    app.run_command(crate::widgets::command_palette::Command::OpenSearchEditor);
+    app.editor.lines[0] = String::from("# Query: needle");
+    assert!(app.handle_cmd_k_chord(key(KeyCode::Char('R'), KeyModifiers::SHIFT)));
+    let (label, header, _) = app
+        .search_editor_job
+        .take()
+        .expect("setup: the rerun started a search");
+    let (tx, rx) = std::sync::mpsc::channel();
+    drop(tx);
+    app.search_editor_job = Some((label, header, rx));
+    app.status = String::from("A background task crashed");
+    assert!(app.drain_search_editor());
+    assert!(app.search_editor_job.is_none(), "the job goes");
+    assert_eq!(app.status, "A background task crashed");
+}
+
 /// Re-run the active Search Editor and wait for its results to land.
 fn rerun_search_editor_and_wait(app: &mut App) {
     assert!(app.handle_cmd_k_chord(key(KeyCode::Char('R'), KeyModifiers::SHIFT)));

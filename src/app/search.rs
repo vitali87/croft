@@ -30,6 +30,11 @@ pub(super) fn header_query_for_status(query: &str) -> String {
     format!("\u{201c}{q}\u{201d}")
 }
 
+/// What the status line says while a Search Editor rerun for `query` runs.
+fn searching_status(query: &str) -> String {
+    format!("Searching for {}\u{2026}", header_query_for_status(query))
+}
+
 impl App {
     /// The unsaved editor buffers a workspace search reads in place of
     /// their files on disk. A scratch tab (a Search Editor, the git output)
@@ -1999,10 +2004,7 @@ impl App {
             let _ = tx.send(all);
         });
         self.search_editor_job = Some((label, header, rx));
-        self.status = format!(
-            "Searching for {}\u{2026}",
-            header_query_for_status(&header_query)
-        );
+        self.status = searching_status(&header_query);
     }
 
     /// Land a finished Search Editor rerun in its tab (#615).
@@ -2010,8 +2012,22 @@ impl App {
         let Some((_, _, rx)) = self.search_editor_job.as_ref() else {
             return false;
         };
-        let Ok(hits) = rx.try_recv() else {
-            return false;
+        let hits = match rx.try_recv() {
+            Ok(hits) => hits,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
+            // The search thread ended without sending (a panic in the walk).
+            // Waiting on would keep the tab on results that never come, with
+            // nothing saying so (#2549). It says the search stopped, unless
+            // something newer (the crash notice) has replaced "Searching for
+            // …" since.
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                let (_, header, _) = self.search_editor_job.take().expect("checked");
+                if self.status == searching_status(&header.query) {
+                    self.status =
+                        String::from("Search Editor: the search stopped without answering");
+                }
+                return true;
+            }
         };
         let (label, header, _) = self.search_editor_job.take().expect("checked");
         let text = crate::search_editor::render(&header, &hits, &self.tree.root);
