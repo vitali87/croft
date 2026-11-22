@@ -99,9 +99,10 @@ fn cancelling_the_remote_handoff_stays_here_with_the_edits() {
     assert!(app.status.contains("did not connect"), "{}", app.status);
 }
 
-/// A remote install whose thread crashed fails the connect and says so, so
-/// the dialog reads as failed and closes like any failed connect. It used to
-/// show the install as under way for good.
+/// A remote install whose thread crashed fails the connect and its dialog
+/// says so, reading as failed and closing like any failed connect, even
+/// while a helper of the install still holds its log (#2607 review). It used
+/// to show the install as under way for good.
 #[test]
 fn a_remote_install_whose_thread_crashed_fails_the_connect() {
     // A failed install is remembered on disk: keep it off this machine's.
@@ -127,8 +128,13 @@ fn a_remote_install_whose_thread_crashed_fails_the_connect() {
         crate::widgets::connect_dialog::DialogPhase::Failed
     );
     assert_eq!(
-        app.status,
-        "Remote install failed: the install's thread crashed"
+        dialog.error.as_deref(),
+        Some(crate::install_session::CRASHED_DETAIL)
+    );
+    assert!(
+        !app.status.contains("Remote install failed"),
+        "the status line is left to the crash notice: {}",
+        app.status
     );
     app.handle_connect_dialog_key(key(KeyCode::Esc, KeyModifiers::NONE));
     assert!(app.connect_dialog.is_none(), "Esc closes it");

@@ -547,7 +547,12 @@ impl App {
                 dialog.set_failed(detail.clone());
             }
             self.install_session = None;
-            self.status = format!("Remote install failed: {detail}");
+            // An install whose thread crashed leaves the status line to the
+            // crash notice, as every background job does (#2562); the dialog
+            // says what happened to the connect.
+            if detail != crate::install_session::CRASHED_DETAIL {
+                self.status = format!("Remote install failed: {detail}");
+            }
             changed = true;
         } else if done {
             if let Some(mut session) = self.install_session.take()
