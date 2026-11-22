@@ -345,12 +345,18 @@ impl Worker {
         self.worker.is_stopped()
     }
 
-    /// Start a worker that stopped after crashing twice again, as inline
-    /// suggestions are turned on.
-    pub fn restart_if_stopped(&mut self) {
-        if self.worker.is_stopped() {
-            let _ = self.worker.restart();
-        }
+    /// Start the worker again as suggestions are turned on, if it stopped
+    /// after crashing twice or its thread has ended where no tick saw it
+    /// yet; true when a fresh thread started.
+    pub fn restart_if_down(&mut self) -> std::io::Result<bool> {
+        self.worker.restart_if_down()
+    }
+
+    /// Whether its thread has ended, for a test that must see a crash no
+    /// tick has seen.
+    #[cfg(test)]
+    pub fn has_ended(&mut self) -> bool {
+        self.worker.has_ended()
     }
 }
 

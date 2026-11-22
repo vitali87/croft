@@ -1028,14 +1028,24 @@ impl App {
     /// started, or started again when it stopped after crashing twice
     /// (#2598).
     pub(super) fn turn_inline_model_on(&mut self, config: crate::inline_complete::Config) {
+        let worker = self
+            .inline_worker
+            .get_or_insert_with(crate::inline_complete::Worker::spawn);
+        match worker.restart_if_down() {
+            // What the old thread owed went with it: the next pause asks
+            // afresh.
+            Ok(true) => self.inline_job = None,
+            Ok(false) => {}
+            Err(e) => {
+                self.status = format!("Inline suggestions could not start their worker: {e}");
+                return;
+            }
+        }
         self.status = format!(
             "Inline suggestions: on ({}); Tab accepts, Esc dismisses",
             config.model
         );
         self.inline_config = Some(config);
-        self.inline_worker
-            .get_or_insert_with(crate::inline_complete::Worker::spawn)
-            .restart_if_stopped();
         self.inline_enabled = true;
     }
 

@@ -2923,6 +2923,39 @@ fn inline_suggestions_whose_worker_crashed_twice_stop_until_turned_on() {
     });
 }
 
+/// Codex's finding on #2601: a worker whose second crash no tick has seen
+/// yet is started again when suggestions are turned on, and the next pause
+/// gets a suggestion, instead of the next tick finding it stopped.
+#[test]
+fn inline_suggestions_turned_on_after_a_crash_no_tick_saw_come_back() {
+    let tmp = tempfile::tempdir().unwrap();
+    let worker = crate::inline_complete::Worker::crashing(2, "1 + 1;");
+    let mut app = app_paused_for_inline(tmp.path(), worker);
+    let thread_ends = |app: &mut App| {
+        crate::test_budget::await_spawned(
+            std::time::Duration::from_secs(5),
+            "the worker's thread to end",
+            || app.inline_worker.as_mut().unwrap().has_ended(),
+        );
+    };
+    app.tick_inline_complete();
+    thread_ends(&mut app);
+    // This tick sees the first crash; the next pause's request crashes the
+    // fresh thread too, unseen.
+    app.tick_inline_complete();
+    type_and_pause(&mut app, "y");
+    app.tick_inline_complete();
+    thread_ends(&mut app);
+    app.toggle_inline_suggestions();
+    let config = app.inline_config.clone().unwrap();
+    app.turn_inline_model_on(config);
+    type_and_pause(&mut app, "z");
+    tick_inline_until(&mut app, "the suggestion after turning them on", |app| {
+        app.editor.live_ghost().is_some()
+    });
+    assert_ne!(app.status, INLINE_SUGGESTIONS_STOPPED);
+}
+
 #[test]
 fn an_inline_suggestion_appears_after_a_pause_and_tab_takes_it() {
     let (url, requests) = fake_messages_endpoint("1 + 1;");
