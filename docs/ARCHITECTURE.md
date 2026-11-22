@@ -359,6 +359,7 @@ src/
 │       ├── commands.rs          cargo's command line, and its build-status lines as progress
 │       ├── control.rs           cancelling a run by killing its runner's process group
 │       ├── handle.rs            queueing runs and discoveries, cancelling, re-rooting, and draining results
+│       ├── pytest.rs            pytest's command line: which Python or script runs it, and its verbosity
 │       ├── runners.rs           which runner runs a folder's, a file's or a test's tests
 │       ├── tests.rs             the test runner's own tests
 ├── mcp/                 MCP sidecar host (Tier-1 extensions): croft is a DETERMINISTIC MCP host — a human invokes a contributed palette command and croft calls one pre-known tool on one vetted local server (no LLM picks tools), which removes MCP's whole prompt-injection/tool-poisoning attack family
