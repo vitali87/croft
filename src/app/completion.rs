@@ -958,16 +958,7 @@ impl App {
                     )
                 });
         match crate::inline_complete::resolve(local, |k| std::env::var(k).ok()) {
-            Ok(config) => {
-                self.status = format!(
-                    "Inline suggestions: on ({}); Tab accepts, Esc dismisses",
-                    config.model
-                );
-                self.inline_config = Some(config);
-                self.inline_worker
-                    .get_or_insert_with(crate::inline_complete::Worker::spawn);
-                self.inline_enabled = true;
-            }
+            Ok(config) => self.turn_inline_model_on(config),
             Err(why) if self.editor_offers_inline_completion() => {
                 self.inline_config = None;
                 self.inline_enabled = true;
@@ -1033,6 +1024,21 @@ impl App {
         changed
     }
 
+    /// Turn inline suggestions on from `config`'s model. Its worker is
+    /// started, or started again when it stopped after crashing twice
+    /// (#2598).
+    pub(super) fn turn_inline_model_on(&mut self, config: crate::inline_complete::Config) {
+        self.status = format!(
+            "Inline suggestions: on ({}); Tab accepts, Esc dismisses",
+            config.model
+        );
+        self.inline_config = Some(config);
+        self.inline_worker
+            .get_or_insert_with(crate::inline_complete::Worker::spawn)
+            .restart_if_stopped();
+        self.inline_enabled = true;
+    }
+
     /// Ask for a suggestion once typing has paused with the caret at the end
     /// of a non-blank line, and land answers that still apply (#607).
     pub fn tick_inline_complete(&mut self) -> bool {
@@ -1040,29 +1046,53 @@ impl App {
             return false;
         }
         let mut changed = false;
-        if let Some(worker) = &self.inline_worker {
-            while let Some(done) = worker.try_recv() {
-                let Some((id, path, seq, row, col)) = self.inline_job.clone() else {
-                    continue;
-                };
-                if done.id != id {
-                    continue;
-                }
-                self.inline_job = None;
-                let still = self.editor.path.as_ref() == Some(&path)
-                    && self.editor.edit_seq == seq
-                    && self.editor.cursor_row == row
-                    && self.editor.cursor_col == col;
-                match done.result {
-                    Ok(Some(text)) if still => {
-                        self.editor.ghost =
-                            Some(crate::inline_complete::Ghost::insert(row, col, seq, text));
-                        changed = true;
+        let mut landed = Vec::new();
+        let (mut restarted, mut stopped) = (false, false);
+        if let Some(worker) = &mut self.inline_worker {
+            loop {
+                match worker.poll() {
+                    crate::jobs::WorkerPoll::Answer(done) => landed.push(done),
+                    crate::jobs::WorkerPoll::Idle => break,
+                    crate::jobs::WorkerPoll::Restarted => restarted = true,
+                    crate::jobs::WorkerPoll::Stopped => {
+                        stopped = true;
+                        break;
                     }
-                    Ok(_) => {}
-                    Err(e) => self.status = format!("Inline suggestion: {e}"),
                 }
             }
+        }
+        for done in landed {
+            let Some((id, path, seq, row, col)) = self.inline_job.clone() else {
+                continue;
+            };
+            if done.id != id {
+                continue;
+            }
+            self.inline_job = None;
+            let still = self.editor.path.as_ref() == Some(&path)
+                && self.editor.edit_seq == seq
+                && self.editor.cursor_row == row
+                && self.editor.cursor_col == col;
+            match done.result {
+                Ok(Some(text)) if still => {
+                    self.editor.ghost =
+                        Some(crate::inline_complete::Ghost::insert(row, col, seq, text));
+                    changed = true;
+                }
+                Ok(_) => {}
+                Err(e) => self.status = format!("Inline suggestion: {e}"),
+            }
+        }
+        // Its thread crashed, and the crash notice said so. The request it
+        // was on is not sent again, as each one is a model call: the next
+        // pause in typing asks afresh, and after a second crash the status
+        // line says how to start it again (#2598).
+        if restarted || stopped {
+            self.inline_job = None;
+        }
+        if stopped {
+            self.status = String::from(INLINE_SUGGESTIONS_STOPPED);
+            changed = true;
         }
         changed |= self.land_inline_lsp();
         let ed = &*self.editor;
@@ -1116,6 +1146,9 @@ impl App {
         let (Some(worker), Some(config)) = (&self.inline_worker, &self.inline_config) else {
             return changed;
         };
+        if worker.is_stopped() {
+            return changed;
+        }
         let id = self.inline_next_id;
         self.inline_next_id += 1;
         worker.submit(crate::inline_complete::Job {
@@ -1209,3 +1242,7 @@ pub(super) enum EmmetEdit {
     BalanceOutward,
     BalanceInward,
 }
+
+/// The status when the inline suggestion worker crashed again soon after a
+/// restart: turning suggestions on starts it again (#2598).
+pub(super) const INLINE_SUGGESTIONS_STOPPED: &str = "Inline suggestions stopped after their worker crashed twice: turn them off and on to start them again";
