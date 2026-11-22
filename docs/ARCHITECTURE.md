@@ -317,6 +317,7 @@ src/
 │   │   ├── exceptions.rs        the exception filters an adapter offers, breaking on raised exceptions, and what was thrown
 │   │   ├── inspection.rs        threads, the call stack, scopes and variables, evaluate, and the locals inline values draw from
 │   │   ├── launch.rs            spawning or reaching each adapter, delve's build folder, the fresh session, and disconnecting
+│   │   ├── messages.rs          the per-frame poll: the handshake, each message's effect on the session, and the adapter's capabilities
 │   │   ├── running_set.rs       the sessions in flight: their names, console streams and backlogs, and which one is focused
 │   │   ├── session_set_tests.rs the tests of the set of debug sessions in flight
 │   │   ├── start_requests.rs    `initialize`, each adapter family's `launch`, `configurationDone` and `disconnect`
