@@ -897,7 +897,11 @@ impl App {
                     if !self.any_update_in_progress() {
                         self.update_spinner_start = None;
                     }
-                    self.status = match source {
+                    // A build whose thread crashed leaves the status line to
+                    // the crash notice, which names the thread and where its
+                    // record is, as every background job does (#2562); it
+                    // wrote no log of its own to point at.
+                    let status = match source {
                         UpdateSource::Staged => {
                             let staging = self.staged_install.take();
                             let reason = staging
@@ -912,36 +916,29 @@ impl App {
                                 failed: Some(reason),
                                 ..UpdateToast::offer(version.as_str().into())
                             });
-                            // A build whose thread crashed wrote no log;
-                            // the crash notice says where its record is.
-                            let log = if reason == crate::update_check::CRASHED_REASON {
-                                String::new()
-                            } else {
-                                format!(" - see {}", staged_install_log_path().display())
-                            };
-                            format!(
-                                "croft v{version} was not installed: {reason}{log} (still on v{})",
-                                env!("CARGO_PKG_VERSION")
-                            )
+                            (reason != crate::update_check::CRASHED_REASON).then(|| {
+                                format!(
+                                    "croft v{version} was not installed: {reason} - see {} (still on v{})",
+                                    staged_install_log_path().display(),
+                                    env!("CARGO_PKG_VERSION")
+                                )
+                            })
                         }
                         UpdateSource::SelfInstall => {
-                            // A rebuild whose thread crashed wrote no log;
-                            // the crash notice says where its record is.
-                            if self.self_install.take().is_some_and(|i| i.crashed()) {
-                                String::from(
-                                    "croft rebuild failed: its thread crashed (still on the old binary)",
-                                )
-                            } else {
+                            (!self.self_install.take().is_some_and(|i| i.crashed())).then(|| {
                                 format!(
                                     "croft rebuild failed - see {} (still on the old binary)",
                                     self_install_log_path().display()
                                 )
-                            }
+                            })
                         }
-                        UpdateSource::Watch => String::from(
+                        UpdateSource::Watch => Some(String::from(
                             "Background croft update failed; staying on current version",
-                        ),
+                        )),
                     };
+                    if let Some(status) = status {
+                        self.status = status;
+                    }
                 }
                 crate::update_watch::UpdateEvent::Ready => {
                     if staged {

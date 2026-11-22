@@ -469,7 +469,7 @@ impl SelfInstall {
     }
 
     /// Whether its thread crashed before the rebuild finished, which ended
-    /// it with `Failed`.
+    /// it with `Failed`: the crash notice has said so, and there is no log.
     pub fn crashed(&self) -> bool {
         self.crashed
     }
