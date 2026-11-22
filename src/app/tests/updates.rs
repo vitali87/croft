@@ -197,6 +197,41 @@ fn the_update_command_checks_now_and_reports_the_answer() {
     });
 }
 
+/// #2579: a check whose thread crashed is let go, so the next Help: Update
+/// croft asks again instead of saying it is already checking.
+#[test]
+fn an_update_check_whose_thread_crashed_lets_the_next_one_run() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.update_fetch = || panic!("the check crashed (on purpose, in a test)");
+        app.update_croft();
+        assert!(app.manual_update_check.is_some(), "{}", app.status);
+        crate::test_budget::await_spawned(
+            std::time::Duration::from_millis(500),
+            "the crashed check to settle",
+            || {
+                app.poll_update_watch();
+                app.manual_update_check.is_none()
+            },
+        );
+        app.update_fetch = || Ok(None);
+        app.update_croft();
+        assert_eq!(app.status, "Checking for croft updates\u{2026}");
+        crate::test_budget::await_spawned(
+            std::time::Duration::from_millis(500),
+            "the next check to answer",
+            || app.poll_update_watch(),
+        );
+        assert_eq!(
+            app.status,
+            format!("croft v{} is up to date", env!("CARGO_PKG_VERSION"))
+        );
+    });
+}
+
 /// #1844: Help: Update croft checks for a release only where the startup
 /// check would: never on a remote-launched croft, which the croft that
 /// launched it updates, nor with `CROFT_NO_UPDATE_CHECK` set.
