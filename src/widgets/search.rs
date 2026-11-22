@@ -82,8 +82,8 @@ pub enum SearchProgress {
     /// It looked at every file: the list is the whole answer.
     Finished,
     /// It was stopped before it looked at every file, when the panel left
-    /// Search or the workspace's folders changed: the list is not the whole
-    /// answer, and coming back to Search runs it again.
+    /// Search, or the workspace's folders changed after it ran: the list is
+    /// not the whole answer, and coming back to Search runs it again.
     Cancelled,
 }
 

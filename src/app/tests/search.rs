@@ -2755,11 +2755,7 @@ fn a_search_stopped_by_leaving_search_runs_again_on_coming_back() {
     assert_eq!(app.search.progress, SearchProgress::Cancelled);
     app.run_search_replace_all();
     assert!(app.pending_replace_all.is_none(), "nothing is replaced");
-    assert!(
-        app.status.contains("stopped before it finished"),
-        "{}",
-        app.status
-    );
+    assert!(app.status.contains("was stopped"), "{}", app.status);
 
     app.set_sidebar_view(SidebarView::Search);
     assert!(app.search.run > run, "coming back starts a new run");
@@ -2843,6 +2839,61 @@ fn a_new_root_after_leaving_search_drops_the_stopped_runs_events() {
         app.search.progress,
         SearchProgress::Cancelled,
         "and the search is not taken as finished"
+    );
+}
+
+/// #2612 review: a finished search whose workspace then gains or loses a
+/// folder is not the whole answer for the new folders, so Replace All asks
+/// for the search to run again instead of replacing only what the old
+/// folders held (or editing a folder no longer in the workspace), and
+/// coming back to Search runs it again.
+#[test]
+fn a_finished_search_is_not_replaced_after_the_folders_change() {
+    use crate::widgets::search::{SearchEvent, SearchHit};
+    let tmp = tempfile::tempdir().unwrap();
+    let added = tempfile::tempdir().unwrap();
+    std::fs::write(tmp.path().join("a.txt"), "needle\n").unwrap();
+    std::fs::write(added.path().join("b.txt"), "needle\n").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::Search);
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.search_results_rx = rx;
+    app.search.query = String::from("needle");
+    app.search.replace = String::from("pin");
+    app.submit_search_query();
+    let run = app.search.run;
+    tx.send(SearchEvent::Hits(
+        run,
+        vec![SearchHit {
+            path: tmp.path().join("a.txt"),
+            line_no: 1,
+            line_text: String::from("needle"),
+            matches: 1,
+        }],
+    ))
+    .unwrap();
+    tx.send(SearchEvent::Done(run)).unwrap();
+    app.drain_search_results();
+    assert_eq!(app.search.progress, SearchProgress::Finished);
+
+    app.set_sidebar_view(SidebarView::Explorer);
+    app.add_workspace_folder(added.path().to_path_buf());
+    app.run_search_replace_all();
+    assert!(app.pending_replace_all.is_none(), "nothing is replaced");
+    assert!(
+        app.status.contains("refresh to search again"),
+        "{}",
+        app.status
+    );
+    assert_eq!(
+        std::fs::read_to_string(tmp.path().join("a.txt")).unwrap(),
+        "needle\n"
+    );
+    app.set_sidebar_view(SidebarView::Search);
+    assert_eq!(
+        app.search.progress,
+        SearchProgress::Running,
+        "coming back to Search runs it again, over every folder"
     );
 }
 
