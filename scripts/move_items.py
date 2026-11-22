@@ -300,6 +300,9 @@ Tree = namedtuple("Tree", "anchor folder row width")
 # each piece holds (as FILES above), where the docs list them, the prefix of
 # its release-note fragments, and the docs and note words for its tests
 # moved out (`--tests-out`): (module doc, release-note phrase, docs row).
+# `more_tests` has the same words for any other inline module moved out
+# whole, by name: remote.rs's second test module, file_tree.rs's Android
+# trash.
 Target = namedtuple("Target", "name manifest source dir files tree note_prefix tests more_tests",
                     defaults=({},))
 
@@ -2032,11 +2035,117 @@ DAP_SESSION = Target(
     },
 )
 
+# The Explorer's file tree's feature files (#2062): (module doc, release-note phrase, docs row).
+FILE_TREE_FILES = {
+    "roots": (
+        "The workspace roots the Explorer lists: replacing the primary root, adding and\n"
+        "removing the others' sections, and which root owns a path.",
+        "Explorer root",
+        "the workspace roots: replacing the primary, adding and removing the others, and "
+        "which owns a path",
+    ),
+    "decorations": (
+        "How a row looks: its git decoration and name colour, the folder icon's colour, the\n"
+        "active indent guide, and whether a path is ignored, gone at the scrubbed commit, or\n"
+        "changed by an agent and not yet reviewed.",
+        "Explorer row decoration",
+        "a row's git decoration, name and icon colours, the active indent guide, and "
+        "ignored or agent-changed paths",
+    ),
+    "selection": (
+        "Selecting rows: the cursor, the multi-selection and its shift-anchor, Select All,\n"
+        "and the paths Cut, Copy, Delete and drag act on.",
+        "Explorer selection",
+        "the cursor, the multi-selection and its anchor, and the paths an action takes",
+    ),
+    "listing": (
+        "Listing a folder's entries: reading them, Explorer order, compact folders, loading\n"
+        "and refreshing children with their expansion kept, and which folder a file system\n"
+        "event refreshes.",
+        "Explorer listing",
+        "reading a folder, Explorer order, compact folders, and refreshing children on "
+        "file system events",
+    ),
+    "navigation": (
+        "Moving through the tree: the arrow, page, Home and End keys with and without\n"
+        "Shift, scrolling, expanding and collapsing, Collapse All, revealing a path, and\n"
+        "type-to-find.",
+        "Explorer navigation",
+        "the arrow, page, Home and End keys, scrolling, expanding and collapsing, "
+        "revealing a path, and type-to-find",
+    ),
+    "sticky": (
+        "Sticky scroll: the folders pinned at the top while their contents scroll, and a\n"
+        "click on one.",
+        "Explorer sticky scroll",
+        "the folders pinned at the top while their contents scroll",
+    ),
+    "new_and_rename": (
+        "New File, New Folder and Rename: where a new entry goes, checking the name typed,\n"
+        "creating it, and renaming, a respelling that only changes case included.",
+        "Explorer new and rename",
+        "New File, New Folder and Rename: where an entry goes, checking its name, and "
+        "renaming",
+    ),
+    # Not `trash`: a module of that name in file_tree.rs would shadow the `trash` crate
+    # its code calls as `trash::delete`.
+    "deletion": (
+        "Delete: which rows may be deleted, and moving one or many paths to the system's\n"
+        "trash, recoverably.",
+        "Explorer delete",
+        "which rows may be deleted, and moving paths to the system's trash",
+    ),
+    "move_and_copy": (
+        "Pasting and dropping: a destination name that collides with nothing, refusing a\n"
+        "folder into itself, and moving or copying across file systems.",
+        "Explorer move and copy",
+        "pasting and dropping: a free destination name, no folder into itself, moving and "
+        "copying",
+    ),
+    "filter": (
+        "The tree filter: VS Code's fuzzy match of what was typed, and a row's name with the\n"
+        "matched letters bold.",
+        "Explorer filter",
+        "the tree filter's fuzzy match, and the matched letters bold in a row's name",
+    ),
+    "drawing": (
+        "Drawing the tree: its rows, icons, marks and guides, the sticky band, the scrollbar,\n"
+        "and the dot on a file an agent changed.",
+        "Explorer drawing",
+        "drawing the rows, icons, guides, sticky band and scrollbar",
+    ),
+}
+
+FILE_TREE = Target(
+    "file_tree", "scripts/split_file_tree_manifest.tsv", "src/widgets/file_tree.rs",
+    "src/widgets/file_tree", FILE_TREE_FILES,
+    Tree(
+        "    ├── file_tree.rs ",
+        "    ├── file_tree/        the Explorer's file tree's feature files, beside "
+        "file_tree.rs; each file's `//!` doc says what it holds",
+        "    │   ├── ", 18,
+    ),
+    "file-tree-",
+    (
+        "The Explorer's file tree's own tests, moved out of file_tree.rs (#2062).",
+        "the file tree's tests",
+        "the file tree's own tests",
+    ),
+    {
+        "android_trash": (
+            "Moving an entry to the trash on Android, where the `trash` crate has none: the\n"
+            "freedesktop.org home trash, moved out of file_tree.rs (#2062).",
+            "the Android trash's functions",
+            "the freedesktop home trash on Android, where the `trash` crate has none",
+        ),
+    },
+)
+
 TARGETS = {
     t.name: t
     for t in (
         APP, EDITOR, LSP, TERMINAL, GIT, REMOTE, SEARCH, SESSION_HOST, PAIR, SOURCE_CONTROL,
-        CLI, CODEQL, DEBUGGER, LANGUAGE_SERVERS, DAP_SESSION,
+        CLI, CODEQL, DEBUGGER, LANGUAGE_SERVERS, DAP_SESSION, FILE_TREE,
     )
 }
 
@@ -2726,11 +2835,12 @@ def tests_header(name):
 
 def tests_out(root, t, fmt=True, name="tests"):
     """Move the inline `mod <name> { ... }` (`mod tests` unless the target
-    names another test module) at the top level of the target's file to
+    names another module) at the top level of the target's file to
     <dir>/<name>.rs: the block's body, dedented by its indentation, and
-    `mod <name>;` where the block was, keeping the module's visibility. The module keeps its name and its
-    place, so its `use super::*;` still reaches the split file. The header's
-    attributes and the docs and comments above it stay. A line that starts
+    `mod <name>;` where the block was, keeping the module's visibility. The
+    module keeps its name and its place, so its `use super::*;` still
+    reaches the split file. The header's attributes (a `#[cfg(...)]`
+    included) and the docs and comments above it stay. A line that starts
     inside a string keeps its indentation, which is part of the string.
     Writes the release note and the docs row too. Returns the number of
     lines moved."""
@@ -2784,7 +2894,7 @@ def tests_out(root, t, fmt=True, name="tests"):
     if fmt:
         subprocess.run(["cargo", "fmt"], cwd=root, check=True)
     moved = close - open_line - 1
-    print(f"moved {moved} line(s) of tests from {t.source} to {t.dir}/{name}.rs")
+    print(f"moved {moved} line(s) of `mod {name}` from {t.source} to {t.dir}/{name}.rs")
     return moved
 
 
@@ -2794,7 +2904,7 @@ def main(argv=None):
     ap.add_argument("--pr", type=int, help="the PR whose items to move")
     ap.add_argument("--check", action="store_true", help="only check the manifest")
     ap.add_argument("--tests-out", nargs="?", const="tests", metavar="MODULE",
-                    help="move the file's inline `mod tests` (or the test module named) to its own file")
+                    help="move the file's inline `mod tests` (or the inline module named) to its own file")
     ap.add_argument("--root", default=".", help="the repository root")
     ap.add_argument("--no-fmt", action="store_true", help="skip `cargo fmt` (for tests)")
     ap.add_argument("--no-build", action="store_true", help="skip the build and its glue fixes (for tests)")
