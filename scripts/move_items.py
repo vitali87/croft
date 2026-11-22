@@ -2141,11 +2141,117 @@ FILE_TREE = Target(
     },
 )
 
+# What each file split out of src/dap/configs.rs holds, as FILES above.
+DAP_CONFIGS_FILES = {
+    "inputs": (
+        "launch.json's `inputs`: reading the array, the `${input:id}` ids a configuration\n"
+        "uses, and which of them are still to ask for.",
+        "launch input",
+        "the `inputs` array, the `${input:id}` ids a configuration uses, and which are still to "
+        "ask",
+    ),
+    "discovery": (
+        "Finding the configurations: `.croft/launch.json`, then `.vscode/launch.json`, each\n"
+        "workspace folder's, the configurations and compounds each declares, and the folders\n"
+        "`${workspaceFolder:name}` names.",
+        "launch configuration discovery",
+        "finding every launch.json and what it declares, and the folders a name points at",
+    ),
+    "presentation": (
+        "`presentation` blocks: hiding an entry, its group and order, the malformed shapes\n"
+        "reported, and the picker's order, as VS Code sorts it.",
+        "launch presentation",
+        "`presentation` blocks: hidden entries, groups and order, and the picker's sort",
+    ),
+    "compounds": (
+        "Compounds: several configurations launched together, read from `compounds` and\n"
+        "resolved against the configurations beside them.",
+        "launch compound",
+        "compounds: reading them and resolving their members",
+    ),
+    "substitution": (
+        "`${...}` variables: what they resolve against, and expanding them in a string or a\n"
+        "whole configuration, with an unknown one a hard error.",
+        "launch variable",
+        "`${...}` variables: expanding them, with an unknown one an error",
+    ),
+    "env_files": (
+        "`envFile`: reading a dotenv file as python-dotenv and VS Code do, its quotes,\n"
+        "escapes, comments and `${NAME}` references.",
+        "env file",
+        "reading a dotenv `envFile`: quotes, escapes, comments and `${NAME}` references",
+    ),
+    "resolve": (
+        "Resolving a configuration: substitution done, the `envFile` loaded and the mapped\n"
+        "fields split out, cppdbg's spellings and the keys lldb-dap ignores, and the adapter\n"
+        "family a `type` maps to.",
+        "launch resolve",
+        "resolving a configuration: substitution, `envFile`, the mapped fields and the adapter a "
+        "`type` maps to",
+    ),
+    "debug_test": (
+        "The configuration for debugging tests: the one whose `purpose` says so, and laying\n"
+        "it over croft's own pytest launch.",
+        "debug-test configuration",
+        "the configuration for debugging tests, laid over croft's pytest launch",
+    ),
+    "python": (
+        "debugpy's `launch` and `attach` requests, and where an attach with `connect` goes.",
+        "debugpy request",
+        "debugpy's `launch` and `attach` requests",
+    ),
+    "lldb": (
+        "lldb-dap's `launch` and `attach` requests, the processes an attach can pick from, and\n"
+        "CodeLLDB's `cargo` block: building with cargo and picking the executable it built.",
+        "lldb request",
+        "lldb-dap's requests, the processes to attach to, and building a `cargo` block",
+    ),
+    "go": (
+        "delve's `launch` and `attach` requests: the Go extension's `auto` mode resolved, and\n"
+        "where Connect to server finds a headless delve.",
+        "delve request",
+        "delve's requests, `auto` mode, and Connect to server",
+    ),
+    "js": (
+        "vscode-js-debug's `launch` and `attach` requests: browsers and their headless\n"
+        "launch, `node-terminal`'s command, what a Node launch must name, and the\n"
+        "`__workspaceFolder` it sends.",
+        "js-debug request",
+        "vscode-js-debug's requests: browsers, `node-terminal`, and what a Node launch must name",
+    ),
+    "add_configuration": (
+        "Debug: Add Configuration…: the fields it asks for, checking each answer, the\n"
+        "launch.json entry it makes, and writing it into `.croft/launch.json` safely.",
+        "Add Configuration",
+        "Debug: Add Configuration…: its fields, the entry it makes, and writing "
+        "`.croft/launch.json`",
+    ),
+}
+
+DAP_CONFIGS = Target(
+    "dap_configs", "scripts/split_dap_configs_manifest.tsv", "src/dap/configs.rs",
+    "src/dap/configs", DAP_CONFIGS_FILES,
+    Tree(
+        # The app's debugger/configs.rs row is one level deeper, so it never starts this way.
+        "│   ├── configs.rs ",
+        "│   ├── configs/         launch.json's feature files, beside configs.rs; each file's "
+        "`//!` doc says what it holds",
+        "│   │   ├── ", 20,
+    ),
+    "dap-configs-",
+    (
+        "The launch configurations' own tests, moved out of configs.rs (#2062).",
+        "the launch configurations' tests",
+        "the launch configurations' own tests",
+    ),
+)
+
+
 TARGETS = {
     t.name: t
     for t in (
         APP, EDITOR, LSP, TERMINAL, GIT, REMOTE, SEARCH, SESSION_HOST, PAIR, SOURCE_CONTROL,
-        CLI, CODEQL, DEBUGGER, LANGUAGE_SERVERS, DAP_SESSION, FILE_TREE,
+        CLI, CODEQL, DEBUGGER, LANGUAGE_SERVERS, DAP_SESSION, FILE_TREE, DAP_CONFIGS,
     )
 }
 

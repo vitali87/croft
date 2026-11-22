@@ -834,9 +834,9 @@ class OtherTargets(unittest.TestCase):
     def test_every_target_names_its_own_manifest_file_and_folder(self):
         self.assertEqual(
             sorted(mi.TARGETS),
-            ["app", "cli", "codeql", "dap_session", "debugger", "editor", "file_tree", "git",
-             "language_servers", "lsp", "pair", "remote", "search", "session_host", "source_control",
-             "terminal"],
+            ["app", "cli", "codeql", "dap_configs", "dap_session", "debugger", "editor", "file_tree",
+             "git", "language_servers", "lsp", "pair", "remote", "search", "session_host",
+             "source_control", "terminal"],
         )
         for t in mi.TARGETS.values():
             with self.subTest(target=t.name):
