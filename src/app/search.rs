@@ -124,10 +124,14 @@ impl App {
     /// Stop the panel's run if its scan is still going, when the panel
     /// leaves Search: the walker threads stop using every core. The hits so
     /// far stay listed, and coming back to Search runs the query again
-    /// (#2608).
+    /// (#2608). The run counts as stopped from here, not from when the
+    /// worker's `Cancelled` lands: coming back before it does still runs
+    /// the query again (#2612 review). A `Done` that beats the cancel says
+    /// the run finished after all.
     pub(super) fn cancel_search_run(&mut self) {
         if self.search.progress == SearchProgress::Running {
             let _ = self.search_query_tx.send(SearchRequest::Cancel);
+            self.search.progress = SearchProgress::Cancelled;
         }
     }
 
