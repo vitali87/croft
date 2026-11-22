@@ -1,0 +1,1 @@
+fix: After a voice input session's reader thread crashes, the session ends and says so, and the next mic tap starts a new one, instead of voice input staying "listening" for good with every tap cancelling it again.
