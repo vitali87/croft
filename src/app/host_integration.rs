@@ -655,28 +655,33 @@ impl App {
             return;
         }
         self.staged_status = UpdateStatus::Idle;
-        // One progress indicator, not two (#1852): the status bar's spinner
-        // carries the build from here, as it does every other update, so
-        // the popup goes. It comes back by itself when the build ends: with
-        // Relaunch when it lands, with the reason and Retry when it fails.
-        self.update_toast = None;
         // Tests never download or build croft: they get a staging that has
         // only started.
         #[cfg(test)]
-        {
-            self.staged_install = Some(crate::update_check::StagedInstall::preloaded(
-                &[],
-                PathBuf::new(),
-                &version,
-            ));
-        }
+        let staging = std::io::Result::Ok(crate::update_check::StagedInstall::preloaded(
+            &[],
+            PathBuf::new(),
+            &version,
+        ));
         #[cfg(not(test))]
-        {
-            self.staged_install = Some(crate::update_check::StagedInstall::start(
-                croft_cache_dir(),
-                version,
-                staged_install_log_path(),
-            ));
+        let staging = crate::update_check::StagedInstall::start(
+            croft_cache_dir(),
+            version.clone(),
+            staged_install_log_path(),
+        );
+        match staging {
+            Ok(install) => {
+                // One progress indicator, not two (#1852): the status bar's
+                // spinner carries the build from here, as it does every other
+                // update, so the popup goes. It comes back by itself when the
+                // build ends: with Relaunch when it lands, with the reason and
+                // Retry when it fails.
+                self.update_toast = None;
+                self.staged_install = Some(install);
+            }
+            // No thread could start: nothing is building, and the popup
+            // stays up with Update one click away.
+            Err(e) => self.status = format!("croft v{version} could not be installed: {e}"),
         }
     }
 
@@ -738,11 +743,12 @@ impl App {
             self.self_install = Some(crate::update_watch::SelfInstall::preloaded(&[]));
         }
         #[cfg(not(test))]
-        {
-            self.self_install = Some(crate::update_watch::SelfInstall::start(
-                String::from(env!("CARGO_MANIFEST_DIR")),
-                self_install_log_path(),
-            ));
+        match crate::update_watch::SelfInstall::start(
+            String::from(env!("CARGO_MANIFEST_DIR")),
+            self_install_log_path(),
+        ) {
+            Ok(install) => self.self_install = Some(install),
+            Err(e) => self.status = format!("croft could not start its rebuild: {e}"),
         }
     }
 
@@ -848,7 +854,7 @@ impl App {
         if let Some(watch) = self.update_watch.as_ref() {
             events.extend(watch.drain().into_iter().map(|e| (UpdateSource::Watch, e)));
         }
-        if let Some(install) = self.self_install.as_ref() {
+        if let Some(install) = self.self_install.as_mut() {
             events.extend(
                 install
                     .drain()
@@ -856,7 +862,7 @@ impl App {
                     .map(|e| (UpdateSource::SelfInstall, e)),
             );
         }
-        if let Some(staged) = self.staged_install.as_ref() {
+        if let Some(staged) = self.staged_install.as_mut() {
             events.extend(
                 staged
                     .drain()
@@ -906,18 +912,31 @@ impl App {
                                 failed: Some(reason),
                                 ..UpdateToast::offer(version.as_str().into())
                             });
+                            // A build whose thread crashed wrote no log;
+                            // the crash notice says where its record is.
+                            let log = if reason == crate::update_check::CRASHED_REASON {
+                                String::new()
+                            } else {
+                                format!(" - see {}", staged_install_log_path().display())
+                            };
                             format!(
-                                "croft v{version} was not installed: {reason} - see {} (still on v{})",
-                                staged_install_log_path().display(),
+                                "croft v{version} was not installed: {reason}{log} (still on v{})",
                                 env!("CARGO_PKG_VERSION")
                             )
                         }
                         UpdateSource::SelfInstall => {
-                            self.self_install = None;
-                            format!(
-                                "croft rebuild failed - see {} (still on the old binary)",
-                                self_install_log_path().display()
-                            )
+                            // A rebuild whose thread crashed wrote no log;
+                            // the crash notice says where its record is.
+                            if self.self_install.take().is_some_and(|i| i.crashed()) {
+                                String::from(
+                                    "croft rebuild failed: its thread crashed (still on the old binary)",
+                                )
+                            } else {
+                                format!(
+                                    "croft rebuild failed - see {} (still on the old binary)",
+                                    self_install_log_path().display()
+                                )
+                            }
                         }
                         UpdateSource::Watch => String::from(
                             "Background croft update failed; staying on current version",
