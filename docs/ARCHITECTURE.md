@@ -425,6 +425,7 @@ src/
     │   ├── decorations.rs     a row's git decoration, name and icon colours, the active indent guide, and ignored or agent-changed paths
     │   ├── deletion.rs        which rows may be deleted, and moving paths to the system's trash
     │   ├── listing.rs         reading a folder, Explorer order, compact folders, and refreshing children on file system events
+    │   ├── move_and_copy.rs   pasting and dropping: a free destination name, no folder into itself, moving and copying
     │   ├── navigation.rs      the arrow, page, Home and End keys, scrolling, expanding and collapsing, revealing a path, and type-to-find
     │   ├── new_and_rename.rs  New File, New Folder and Rename: where an entry goes, checking its name, and renaming
     │   ├── roots.rs           the workspace roots: replacing the primary, adding and removing the others, and which owns a path
