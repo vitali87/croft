@@ -113,15 +113,31 @@ enum StreamItem<T> {
 /// and whatever it showed as in progress stayed that way until a restart.
 pub struct Stream<T> {
     rx: Receiver<StreamItem<T>>,
+    work: StreamWork,
     /// Holds a test's stream open, as a thread still at work would.
     #[cfg(test)]
     _open: Option<Sender<StreamItem<T>>>,
 }
 
-/// Where a [`Stream`]'s work sends its updates. A clone handed to a helper
-/// thread of the work's own keeps the stream open until the helper ends
-/// too, so a stream whose work crashed reads as dead once its helpers have
-/// let go.
+/// How a [`Stream`] knows its work's thread has ended. The channel alone
+/// cannot say: a helper thread of the work's own may hold a clone of the
+/// sink, as a remote install's log reader does while its build runs on, and
+/// that keeps the channel open after the work's thread has crashed (#2605).
+enum StreamWork {
+    /// Its thread, watched until it ends.
+    Thread(std::thread::JoinHandle<()>),
+    /// Its thread ended and was joined.
+    Ended,
+    /// No thread of its own (a test's stream): it ends when its sender is
+    /// dropped.
+    #[cfg(test)]
+    Held,
+}
+
+/// Where a [`Stream`]'s work sends its updates. A clone may go to a helper
+/// thread of the work's own; an update a helper sends after the work has
+/// returned may never be read, so work waits for its helpers before it
+/// returns.
 pub struct Sink<T> {
     tx: Sender<StreamItem<T>>,
 }
@@ -154,7 +170,7 @@ impl<T: Send + 'static> Stream<T> {
         work: impl FnOnce(&Sink<T>) + Send + 'static,
     ) -> std::io::Result<Self> {
         let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::Builder::new()
+        let thread = std::thread::Builder::new()
             .name(name.to_string())
             .spawn(move || {
                 if start == Start::AfterFirstFrame {
@@ -166,6 +182,7 @@ impl<T: Send + 'static> Stream<T> {
             })?;
         Ok(Self {
             rx,
+            work: StreamWork::Thread(thread),
             #[cfg(test)]
             _open: None,
         })
@@ -181,6 +198,7 @@ impl<T: Send + 'static> Stream<T> {
         }
         Self {
             rx,
+            work: StreamWork::Held,
             _open: Some(tx),
         }
     }
@@ -191,12 +209,38 @@ impl<T> Stream<T> {
     /// drains it in a loop until [`StreamPoll::Pending`]. After
     /// [`StreamPoll::Ended`] or [`StreamPoll::Died`] it has nothing more to
     /// say, so the caller drops it.
-    pub fn poll(&self) -> StreamPoll<T> {
+    pub fn poll(&mut self) -> StreamPoll<T> {
+        match self.rx.try_recv() {
+            Ok(StreamItem::Update(update)) => return StreamPoll::Update(update),
+            Ok(StreamItem::End) => return StreamPoll::Ended,
+            Err(TryRecvError::Disconnected) => return StreamPoll::Died,
+            Err(TryRecvError::Empty) if !self.work_ended() => return StreamPoll::Pending,
+            Err(TryRecvError::Empty) => {}
+        }
+        // Its thread has ended, so all it sent is in the channel: read again,
+        // as it may have sent its last since the read above.
         match self.rx.try_recv() {
             Ok(StreamItem::Update(update)) => StreamPoll::Update(update),
             Ok(StreamItem::End) => StreamPoll::Ended,
-            Err(TryRecvError::Empty) => StreamPoll::Pending,
-            Err(TryRecvError::Disconnected) => StreamPoll::Died,
+            Err(_) => StreamPoll::Died,
+        }
+    }
+
+    /// Whether its work's thread has ended, joining it once it has.
+    fn work_ended(&mut self) -> bool {
+        match &self.work {
+            StreamWork::Thread(thread) if !thread.is_finished() => false,
+            StreamWork::Thread(_) => {
+                if let StreamWork::Thread(thread) =
+                    std::mem::replace(&mut self.work, StreamWork::Ended)
+                {
+                    let _ = thread.join();
+                }
+                true
+            }
+            StreamWork::Ended => true,
+            #[cfg(test)]
+            StreamWork::Held => false,
         }
     }
 }
@@ -471,7 +515,7 @@ mod tests {
 
     /// Every update `stream` sends until it ends or dies, then how it
     /// finished: `true` when it ended.
-    fn drain_stream<T>(stream: &Stream<T>) -> (Vec<T>, bool) {
+    fn drain_stream<T>(stream: &mut Stream<T>) -> (Vec<T>, bool) {
         let mut updates = Vec::new();
         let mut ended = None;
         crate::test_budget::await_spawned(Duration::from_secs(1), "the stream to finish", || {
@@ -492,12 +536,12 @@ mod tests {
 
     #[test]
     fn a_stream_sends_its_updates_in_order_then_ends_on_a_thread_named_after_it() {
-        let stream = Stream::spawn("croft-update", Start::Now, |sink| {
+        let mut stream = Stream::spawn("croft-update", Start::Now, |sink| {
             sink.send(std::thread::current().name().map(String::from));
             sink.send(None);
         })
         .unwrap();
-        let (updates, ended) = drain_stream(&stream);
+        let (updates, ended) = drain_stream(&mut stream);
         assert_eq!(updates, vec![Some(String::from("croft-update")), None]);
         assert!(ended, "the stream ended");
     }
@@ -506,20 +550,41 @@ mod tests {
     /// not as work still going.
     #[test]
     fn a_stream_whose_work_panics_reads_as_dead_after_its_updates() {
-        let stream: Stream<u32> = Stream::spawn("a-stream-that-panics", Start::Now, |sink| {
+        let mut stream: Stream<u32> = Stream::spawn("a-stream-that-panics", Start::Now, |sink| {
             sink.send(1);
             panic!("the work crashed (on purpose, in a test)")
         })
         .unwrap();
-        let (updates, ended) = drain_stream(&stream);
+        let (updates, ended) = drain_stream(&mut stream);
         assert_eq!(updates, vec![1]);
         assert!(!ended, "the stream died");
+    }
+
+    /// #2605: a stream whose work crashed reads as dead while a helper
+    /// thread of the work's own still holds a clone of its sink.
+    #[test]
+    fn a_stream_whose_work_crashed_reads_as_dead_while_a_helper_holds_its_sink() {
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let mut stream: Stream<u32> = Stream::spawn("a-stream-with-a-helper", Start::Now, |sink| {
+            let helper = sink.clone();
+            std::thread::spawn(move || {
+                let _ = release_rx.recv();
+                helper.send(2);
+            });
+            sink.send(1);
+            panic!("the work crashed (on purpose, in a test)")
+        })
+        .unwrap();
+        let (updates, ended) = drain_stream(&mut stream);
+        assert_eq!(updates, vec![1]);
+        assert!(!ended, "the stream died, its helper still running");
+        let _ = release_tx.send(());
     }
 
     /// A test's running stream says what it was given, then nothing more.
     #[test]
     fn a_running_stream_stays_pending_after_its_updates() {
-        let stream = Stream::running([1, 2]);
+        let mut stream = Stream::running([1, 2]);
         assert!(matches!(stream.poll(), StreamPoll::Update(1)));
         assert!(matches!(stream.poll(), StreamPoll::Update(2)));
         assert!(matches!(stream.poll(), StreamPoll::Pending));

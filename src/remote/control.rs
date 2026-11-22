@@ -13,6 +13,13 @@ pub struct AdoptedMaster {
     pub socket_path: PathBuf,
 }
 
+/// Close a handed-off control master that nothing will use, ending its ssh
+/// process and removing its socket's directory: an install that could not
+/// start (#2605).
+pub fn close_master(a: AdoptedMaster) {
+    drop(SshControl::adopt(a));
+}
+
 impl SshControl {
     pub fn adopt(a: AdoptedMaster) -> Self {
         Self {

@@ -751,7 +751,7 @@ impl StagedInstall {
     /// nothing it showed stays in progress.
     pub fn drain(&mut self) -> Vec<UpdateEvent> {
         let mut out = Vec::new();
-        while let Some(progress) = self.progress.as_ref() {
+        while let Some(progress) = self.progress.as_mut() {
             match progress.poll() {
                 crate::jobs::StreamPoll::Update(event) => out.push(event),
                 crate::jobs::StreamPoll::Pending => break,

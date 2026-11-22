@@ -35,38 +35,56 @@ pub struct InstallSession {
     fallback_answer_tx: Sender<bool>,
 }
 
+/// The install itself: [`crate::remote::install_only_streaming`], or a
+/// test's stand-in. It sends its log lines and its "can launch" signal on the
+/// two senders, and asks the fallback question through the callback.
+type Install = fn(
+    AdoptedMaster,
+    Sender<String>,
+    Sender<()>,
+    &mut dyn FnMut(&str) -> bool,
+) -> anyhow::Result<AdoptedMaster>;
+
 impl InstallSession {
     /// Run the install as the `remote-install` stream. Fails only when no
-    /// thread can be started.
+    /// thread can be started, and then closes the control master it was
+    /// handed, which nothing else will use.
     pub fn start(
         adopted: AdoptedMaster,
         host: String,
         path: Option<String>,
     ) -> std::io::Result<Self> {
+        Self::start_with(adopted, host, path, crate::remote::install_only_streaming)
+    }
+
+    fn start_with(
+        adopted: AdoptedMaster,
+        host: String,
+        path: Option<String>,
+        install: Install,
+    ) -> std::io::Result<Self> {
         let adopted_for_thread = adopted.clone();
         let (fallback_answer_tx, fallback_answer_rx) = channel::<bool>();
-        let events = Stream::spawn("remote-install", Start::Now, move |events| {
-            let log_tx_for_install: Sender<String> = {
+        let spawned = Stream::spawn("remote-install", Start::Now, move |events| {
+            let (log_tx_for_install, log_rx) = channel::<String>();
+            let log_forwarder = {
                 let events = events.clone();
-                let (s, r) = channel::<String>();
                 std::thread::spawn(move || {
-                    while let Ok(line) = r.recv() {
+                    while let Ok(line) = log_rx.recv() {
                         if !events.send(InstallEvent::Log(line)) {
                             break;
                         }
                     }
-                });
-                s
+                })
             };
-            let can_launch_tx: Sender<()> = {
+            let (can_launch_tx, can_launch_rx) = channel::<()>();
+            let can_launch_forwarder = {
                 let events = events.clone();
-                let (s, r) = channel::<()>();
                 std::thread::spawn(move || {
-                    if r.recv().is_ok() {
+                    if can_launch_rx.recv().is_ok() {
                         events.send(InstallEvent::CanLaunch);
                     }
-                });
-                s
+                })
             };
             let mut confirm_fallback = move |reason: &str| {
                 if !events.send(InstallEvent::FallbackPrompt {
@@ -78,18 +96,30 @@ impl InstallSession {
                 // the answer sender, which reads as a decline.
                 fallback_answer_rx.recv().unwrap_or(false)
             };
-            let result = crate::remote::install_only_streaming(
+            let result = install(
                 adopted_for_thread,
                 log_tx_for_install,
                 can_launch_tx,
                 &mut confirm_fallback,
             );
+            // The install has let go of both senders, so the forwarders end
+            // once they have passed on what it sent: its last log lines and
+            // its "can launch" always arrive before its outcome (#2605).
+            let _ = log_forwarder.join();
+            let _ = can_launch_forwarder.join();
             let payload = match result {
                 Ok(_) => Ok(()),
                 Err(e) => Err(format!("{e:#}")),
             };
             events.send(InstallEvent::Done(payload));
-        })?;
+        });
+        let events = match spawned {
+            Ok(events) => events,
+            Err(e) => {
+                crate::remote::close_master(adopted);
+                return Err(e);
+            }
+        };
         Ok(Self {
             host,
             path,
@@ -104,7 +134,7 @@ impl InstallSession {
     /// so the connect dialog never waits on it for good.
     pub fn drain_events(&mut self) -> Vec<InstallEvent> {
         let mut out = Vec::new();
-        while let Some(events) = self.events.as_ref() {
+        while let Some(events) = self.events.as_mut() {
             match events.poll() {
                 StreamPoll::Update(event) => out.push(event),
                 StreamPoll::Pending => break,
@@ -152,20 +182,90 @@ impl InstallSession {
         }
     }
 
-    /// A session whose installer logs a line and then crashes.
+    /// A session whose installer logs a line and then crashes while a
+    /// helper of its own, like a build's output reader, still holds its log
+    /// sender (#2605).
     pub fn crashing(host: &str) -> Self {
-        let (fallback_answer_tx, _) = channel();
-        let events = Stream::spawn("remote-install", Start::Now, |events| {
-            events.send(InstallEvent::Log(String::from("Probing the remote")));
+        fn install(
+            _: AdoptedMaster,
+            log_tx: Sender<String>,
+            _: Sender<()>,
+            _: &mut dyn FnMut(&str) -> bool,
+        ) -> anyhow::Result<AdoptedMaster> {
+            let _ = log_tx.send(String::from("Probing the remote"));
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_secs(60));
+                drop(log_tx);
+            });
             panic!("the install crashed (on purpose, in a test)")
-        })
-        .unwrap();
-        Self {
-            host: host.to_string(),
-            path: None,
-            adopted: None,
-            events: Some(events),
-            fallback_answer_tx,
+        }
+        Self::start_with(test_master(host), host.to_string(), None, install).unwrap()
+    }
+}
+
+/// A control master for a test's install session, at paths that do not
+/// exist: nothing connects through it.
+#[cfg(test)]
+fn test_master(host: &str) -> AdoptedMaster {
+    AdoptedMaster {
+        host: host.to_string(),
+        socket_dir: std::path::PathBuf::from("/nonexistent/croft-test-ctl"),
+        socket_path: std::path::PathBuf::from("/nonexistent/croft-test-ctl/ctl"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// #2605 review: an install that says croft can launch and then fails
+    /// reports the launch before its outcome, so the user is dropped into the
+    /// croft already there instead of being told the connect failed.
+    #[test]
+    fn an_install_that_could_launch_and_then_failed_reports_the_launch_first() {
+        fn install(
+            _: AdoptedMaster,
+            log_tx: Sender<String>,
+            can_launch_tx: Sender<()>,
+            _: &mut dyn FnMut(&str) -> bool,
+        ) -> anyhow::Result<AdoptedMaster> {
+            let _ = log_tx.send(String::from("croft is already installed"));
+            let _ = can_launch_tx.send(());
+            anyhow::bail!("the reinstall failed")
+        }
+        for _ in 0..20 {
+            let mut session =
+                InstallSession::start_with(test_master("devbox"), "devbox".into(), None, install)
+                    .unwrap();
+            let mut events = Vec::new();
+            crate::test_budget::await_spawned(
+                std::time::Duration::from_secs(1),
+                "the install to end",
+                || {
+                    events.extend(session.drain_events());
+                    events.iter().any(|e| matches!(e, InstallEvent::Done(_)))
+                },
+            );
+            let done = events
+                .iter()
+                .position(|e| matches!(e, InstallEvent::Done(_)))
+                .unwrap();
+            assert!(
+                events[..done]
+                    .iter()
+                    .any(|e| matches!(e, InstallEvent::CanLaunch)),
+                "{events:?}"
+            );
+            assert!(
+                events[..done]
+                    .iter()
+                    .any(|e| matches!(e, InstallEvent::Log(_))),
+                "{events:?}"
+            );
+            assert!(
+                matches!(&events[done], InstallEvent::Done(Err(e)) if e == "the reinstall failed"),
+                "{events:?}"
+            );
         }
     }
 }
