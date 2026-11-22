@@ -324,6 +324,8 @@ src/
 │   │   ├── stepping.rs          pause, continue, step over, into and out, and Step Into Target
 │   │   ├── tests.rs             the debug session's own tests
 │   ├── configs.rs            launch.json, `.croft` over `.vscode`: its configurations and compounds, `inputs`, `presentation`, `${...}` variables and `envFile`, each entry resolved into its adapter's DAP request, and the entry Debug: Add Configuration… writes
+│   ├── configs/         launch.json's feature files, beside configs.rs; each file's `//!` doc says what it holds
+│   │   ├── tests.rs             the launch configurations' own tests
 │   ├── registry.rs           data-driven debug-adapter registry: maps a file extension to an AdapterKind from the `[[debug_adapters]]` blocks in bundled + user manifests, skipping adapters whose extension is disabled in the Extensions panel
 │   ├── log.rs           optional DAP wire log at ~/.croft/dap.log (gated by CROFT_DAP_LOG), mirroring lsp/log_file.rs
 │   ├── install.rs       provisions a private debugpy venv at ~/.croft/debug-venv via uv (PEP 668 forbids pip-ing into the uv-managed CPython; mirrors ~/.croft/servers), and the vscode-js-debug server at ~/.croft/js-debug from a release pinned by version and SHA-256
