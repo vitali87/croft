@@ -360,6 +360,7 @@ src/
 │       ├── control.rs           cancelling a run by killing its runner's process group
 │       ├── go_and_codeql.rs     `go test -json` and `codeql test run`: their command lines and results
 │       ├── handle.rs            queueing runs and discoveries, cancelling, re-rooting, and draining results
+│       ├── js_args.rs           vitest's and jest's command lines, and the arguments that pick a test, a suite or a file
 │       ├── pytest.rs            pytest's command line: which Python or script runs it, and its verbosity
 │       ├── runners.rs           which runner runs a folder's, a file's or a test's tests
 │       ├── test_binaries.rs     the cargo test harnesses built, and the one that holds a test
