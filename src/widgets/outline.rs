@@ -44,6 +44,9 @@ pub struct OutlinePanel {
     /// `true` once a reply for the active file has arrived (even an empty one),
     /// so the panel can distinguish "still loading" from "no symbols here".
     loaded: bool,
+    /// The outline could not be read: its parse crashed or never started
+    /// (#2587). The panel says so instead of "Loading".
+    failed: bool,
     /// Black theme: highlight rows with the brand's dark-teal instead of the
     /// legacy blue. Mirrors `FileTree::focus_gradient`, set by the app.
     pub focus_gradient: bool,
@@ -129,6 +132,7 @@ impl OutlinePanel {
             current: None,
             scroll: 0,
             loaded: false,
+            failed: false,
             focus_gradient: false,
             theme: Theme::default(),
             focused: false,
@@ -249,6 +253,7 @@ impl OutlinePanel {
     /// Shared body of [`set_symbols`]/[`set_syntax_symbols`]: swap in the new
     /// symbols and reset the view only when the file actually changed.
     fn adopt(&mut self, path: PathBuf, symbols: Vec<OutlineSymbol>) {
+        self.failed = false;
         let same_file = self.path.as_ref() == Some(&path);
         self.path = Some(path);
         self.symbols = symbols;
@@ -265,6 +270,15 @@ impl OutlinePanel {
         self.symbols.clear();
         self.new_file_generation();
         self.loaded = false;
+        self.failed = false;
+    }
+
+    /// `path`'s outline could not be read (#2587): say so rather than
+    /// "Loading" for one that is not coming.
+    pub fn set_failed(&mut self, path: PathBuf) {
+        self.adopt(path, Vec::new());
+        self.loaded = true;
+        self.failed = true;
     }
 
     pub fn toggle_collapse(&mut self) {
@@ -461,7 +475,9 @@ impl Widget for &mut OutlinePanel {
         // file open (welcome screen) there is nothing to load, so show
         // "No symbols" instead of spinning forever.
         if self.symbols.is_empty() {
-            let msg = if self.path.is_some() && !self.loaded {
+            let msg = if self.failed {
+                "Could not read the outline"
+            } else if self.path.is_some() && !self.loaded {
                 "Loading"
             } else {
                 "No symbols"
@@ -810,6 +826,21 @@ mod tests {
         p.set_syntax_symbols("a.rs".into(), vec![], true);
         p.toggle_collapse();
         let text = rendered_text(&mut p, 24, 6);
+        assert!(text.contains("Loading"), "got:\n{text}");
+    }
+
+    /// #2587: an outline that could not be read says so, and the next
+    /// symbols for the file replace the message.
+    #[test]
+    fn a_failed_outline_says_so_until_symbols_land() {
+        let mut p = OutlinePanel::new();
+        p.set_failed("a.rs".into());
+        p.toggle_collapse();
+        let text = rendered_text(&mut p, 32, 6);
+        assert!(text.contains("Could not read the outline"), "got:\n{text}");
+        assert!(!text.contains("Loading"), "got:\n{text}");
+        p.set_syntax_symbols("a.rs".into(), vec![], true);
+        let text = rendered_text(&mut p, 32, 6);
         assert!(text.contains("Loading"), "got:\n{text}");
     }
 
