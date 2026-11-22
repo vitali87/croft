@@ -424,6 +424,7 @@ src/
     │   ├── android_trash.rs   the freedesktop home trash on Android, where the `trash` crate has none
     │   ├── decorations.rs     a row's git decoration, name and icon colours, the active indent guide, and ignored or agent-changed paths
     │   ├── roots.rs           the workspace roots: replacing the primary, adding and removing the others, and which owns a path
+    │   ├── selection.rs       the cursor, the multi-selection and its anchor, and the paths an action takes
     │   ├── tests.rs           the file tree's own tests
     ├── header_pill.rs   shared section-header pill button (chip-backed codicon affordance + theme colours) used by both the Remote Explorer (+ / refresh) and Source Control (refresh) headers
     ├── captures.rs           the panel group's CAPTURES tab (iTerm2's Capture Output): lines collected by `capture` triggers, with Enter jumping to the originating pane row; pure widget capped at 500 entries, and it also shapes the "Ask Navigator about this line" turn
