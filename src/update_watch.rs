@@ -363,27 +363,32 @@ fn self_install_command_with(cargo: PathBuf, manifest_dir: &str) -> std::process
     cmd
 }
 
+/// What a rebuild's work is given: where to send its progress, and where
+/// to record the binary cargo installed before it sends `Ready`.
+type RebuildWork =
+    dyn FnOnce(&crate::jobs::Sink<UpdateEvent>, &std::sync::Mutex<Option<PathBuf>>) + Send;
+
 /// A background `cargo install --path <repo> --locked` reinstalling the
 /// local croft, reported through the same [`UpdateEvent`] lifecycle the
 /// remote watcher uses so the app consumes both with one state machine:
 /// `InProgress` immediately, then `Ready` (new binary at the install path,
 /// the updater re-execs into it) or `Failed` (old binary keeps running).
 pub struct SelfInstall {
-    rx: Receiver<UpdateEvent>,
+    /// The rebuild's progress, until it ends or its thread dies.
+    progress: Option<crate::jobs::Stream<UpdateEvent>>,
     /// Where cargo said it wrote the binary, parsed from its output on
     /// success; read by the updater's re-exec.
     installed: std::sync::Arc<std::sync::Mutex<Option<PathBuf>>>,
+    /// Its thread crashed before the rebuild finished.
+    crashed: bool,
 }
 
 impl SelfInstall {
     /// Full build output lands in `log_path` so a failure is diagnosable
-    /// without scrollback.
-    pub fn start(manifest_dir: String, log_path: PathBuf) -> Self {
-        let (tx, rx) = channel();
-        let installed = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let installed_writer = std::sync::Arc::clone(&installed);
-        std::thread::spawn(move || {
-            let _ = tx.send(UpdateEvent::InProgress);
+    /// without scrollback. Fails only when no thread can be started.
+    pub fn start(manifest_dir: String, log_path: PathBuf) -> std::io::Result<Self> {
+        Self::spawn_with(Box::new(move |progress, installed| {
+            progress.send(UpdateEvent::InProgress);
             // The cache dir may not exist yet (nothing else in the local
             // drift flow creates it), and for a refusal below the log is
             // the only place the reason is recorded.
@@ -410,7 +415,7 @@ impl SelfInstall {
                         env!("CARGO_PKG_NAME")
                     ),
                 );
-                let _ = tx.send(UpdateEvent::Failed);
+                progress.send(UpdateEvent::Failed);
                 return;
             }
             let result = self_install_command(&manifest_dir).output();
@@ -420,9 +425,10 @@ impl SelfInstall {
                     log.extend_from_slice(&out.stderr);
                     let _ = std::fs::write(&log_path, &log);
                     if out.status.success() {
-                        if let Ok(mut slot) = installed_writer.lock() {
-                            *slot = parse_installed_binary(&String::from_utf8_lossy(&log));
-                        }
+                        *installed
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            parse_installed_binary(&String::from_utf8_lossy(&log));
                         UpdateEvent::Ready
                     } else {
                         UpdateEvent::Failed
@@ -433,37 +439,80 @@ impl SelfInstall {
                     UpdateEvent::Failed
                 }
             };
-            let _ = tx.send(event);
-        });
-        Self { rx, installed }
+            progress.send(event);
+        }))
+    }
+
+    /// Run `work` as the `croft-rebuild` stream.
+    fn spawn_with(work: Box<RebuildWork>) -> std::io::Result<Self> {
+        let installed = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let installed_for_work = std::sync::Arc::clone(&installed);
+        let progress = crate::jobs::Stream::spawn(
+            "croft-rebuild",
+            crate::jobs::Start::Now,
+            move |progress| work(progress, &installed_for_work),
+        )?;
+        Ok(Self {
+            progress: Some(progress),
+            installed,
+            crashed: false,
+        })
     }
 
     /// The path cargo reported installing to, once `Ready` has been sent.
     /// `None` before that, or when the output had no binary line.
     pub fn installed_path(&self) -> Option<PathBuf> {
-        self.installed.lock().ok()?.clone()
+        self.installed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
-    pub fn drain(&self) -> Vec<UpdateEvent> {
+    /// Whether its thread crashed before the rebuild finished, which ended
+    /// it with `Failed`: the crash notice has said so, and there is no log.
+    pub fn crashed(&self) -> bool {
+        self.crashed
+    }
+
+    /// The events sent since the last call. A rebuild whose thread crashed
+    /// before it finished ends with `Failed`, so nothing it showed stays in
+    /// progress.
+    pub fn drain(&mut self) -> Vec<UpdateEvent> {
         let mut out = Vec::new();
-        while let Ok(ev) = self.rx.try_recv() {
-            out.push(ev);
+        while let Some(progress) = self.progress.as_mut() {
+            match progress.poll() {
+                crate::jobs::StreamPoll::Update(event) => out.push(event),
+                crate::jobs::StreamPoll::Pending => break,
+                crate::jobs::StreamPoll::Ended => self.progress = None,
+                crate::jobs::StreamPoll::Died => {
+                    self.progress = None;
+                    self.crashed = true;
+                    out.push(UpdateEvent::Failed);
+                }
+            }
         }
         out
     }
 
-    /// A finished install with a scripted outcome, for exercising the app's
-    /// event handling without running a real `cargo install`.
+    /// A rebuild that has sent `events` and is still running, for exercising
+    /// the app's event handling without running a real `cargo install`.
     #[cfg(test)]
     pub fn preloaded(events: &[UpdateEvent]) -> Self {
-        let (tx, rx) = channel();
-        for ev in events {
-            let _ = tx.send(*ev);
-        }
         Self {
-            rx,
+            progress: Some(crate::jobs::Stream::running(events.iter().copied())),
             installed: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            crashed: false,
         }
+    }
+
+    /// A rebuild whose thread reports it under way and then crashes.
+    #[cfg(test)]
+    pub fn crashing() -> Self {
+        Self::spawn_with(Box::new(|progress, _| {
+            progress.send(UpdateEvent::InProgress);
+            panic!("the rebuild crashed (on purpose, in a test)")
+        }))
+        .unwrap()
     }
 }
 
@@ -625,7 +674,8 @@ mod tests {
         )
         .unwrap();
         let log = dir.join("install.log");
-        let install = SelfInstall::start(dir.to_string_lossy().into_owned(), log.clone());
+        let mut install =
+            SelfInstall::start(dir.to_string_lossy().into_owned(), log.clone()).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         let mut events = Vec::new();
         while std::time::Instant::now() < deadline {

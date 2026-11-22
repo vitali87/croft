@@ -99,6 +99,47 @@ fn cancelling_the_remote_handoff_stays_here_with_the_edits() {
     assert!(app.status.contains("did not connect"), "{}", app.status);
 }
 
+/// A remote install whose thread crashed fails the connect and its dialog
+/// says so, reading as failed and closing like any failed connect, even
+/// while a helper of the install still holds its log (#2607 review). It used
+/// to show the install as under way for good.
+#[test]
+fn a_remote_install_whose_thread_crashed_fails_the_connect() {
+    // A failed install is remembered on disk: keep it off this machine's.
+    let _serial = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::tempdir().unwrap();
+    let _restore = override_cache_dir(tmp.path().join("cache"));
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.connect_dialog = Some(crate::widgets::connect_dialog::ConnectDialog::new(
+        String::from("devbox"),
+    ));
+    app.install_session = Some(crate::install_session::InstallSession::crashing("devbox"));
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(1),
+        "the crashed install to end",
+        || {
+            app.poll_install_session();
+            app.install_session.is_none()
+        },
+    );
+    let dialog = app.connect_dialog.as_ref().expect("the dialog says why");
+    assert_eq!(
+        dialog.phase,
+        crate::widgets::connect_dialog::DialogPhase::Failed
+    );
+    assert_eq!(
+        dialog.error.as_deref(),
+        Some(crate::install_session::CRASHED_DETAIL)
+    );
+    assert!(
+        !app.status.contains("Remote install failed"),
+        "the status line is left to the crash notice: {}",
+        app.status
+    );
+    app.handle_connect_dialog_key(key(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(app.connect_dialog.is_none(), "Esc closes it");
+}
+
 /// #862 negative: S at the handoff prompt whose save is refused (the file
 /// changed on disk) stays here, and drops the launch: left armed, the next
 /// ordinary Ctrl+Q would have connected instead of quitting.

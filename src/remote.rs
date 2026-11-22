@@ -30,6 +30,7 @@ pub use config_push::SyncResolution;
 pub use config_push::sync_config_now;
 use config_push::*;
 pub use control::AdoptedMaster;
+pub use control::close_master;
 pub use control::ssh_control_dir;
 use control::*;
 pub(crate) use cross_build::cross_build_static;
