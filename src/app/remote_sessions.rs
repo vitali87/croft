@@ -448,11 +448,22 @@ impl App {
         {
             let adopted = auth.hand_off();
             let path = self.pending_remote_launch_path.take();
-            self.install_session = Some(crate::install_session::InstallSession::start(
-                adopted,
-                host.clone(),
-                path,
-            ));
+            let session =
+                match crate::install_session::InstallSession::start(adopted, host.clone(), path) {
+                    Ok(session) => session,
+                    // No thread could start: the connect ends here, failed,
+                    // as an install that failed at once would.
+                    Err(e) => {
+                        let detail = format!("croft could not start the install: {e}");
+                        if let Some(dialog) = self.connect_dialog.as_mut() {
+                            dialog.set_failed(detail.clone());
+                        }
+                        self.tear_down_connect_auth();
+                        self.status = format!("Remote install failed: {detail}");
+                        return true;
+                    }
+                };
+            self.install_session = Some(session);
             crate::output::push(
                 crate::output::CHANNEL_REMOTE,
                 crate::output::OutputLevel::Info,
