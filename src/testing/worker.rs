@@ -24,7 +24,7 @@ use crate::output::{self, OutputLevel};
 use crate::widgets::testing::TestingPanel;
 
 /// Which built-in run mechanism a workspace's tests use. Which one a given
-/// root resolves to is manifest data ([`super::registry`]), not code.
+/// root resolves to is manifest data ([`crate::testing::registry`]), not code.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Runner {
     Cargo,
@@ -39,13 +39,13 @@ pub enum Runner {
 /// `[[test_runners]]` declarations. `None` means no recognised test project,
 /// so the Testing view stays empty instead of shelling a tool that would error.
 pub fn runner_for(extensions_dir: &Path, root: &Path) -> Option<Runner> {
-    super::registry::runner_for(extensions_dir, root)
+    crate::testing::registry::runner_for(extensions_dir, root)
 }
 
 /// Every runner that claims `root` (#1408): a folder with two languages'
 /// tests has a runner for each, and the Testing view lists both.
 pub fn runners_for(extensions_dir: &Path, root: &Path) -> Vec<Runner> {
-    super::registry::runners_for(extensions_dir, root)
+    crate::testing::registry::runners_for(extensions_dir, root)
 }
 
 /// The runners whose tests a file of this kind holds, by its extension.
@@ -96,7 +96,7 @@ fn choose_runner(
     // A suite owns what sits under it at the `::` separator, not every
     // name that starts with its text: Rust's `tests` is not pytest's
     // `tests/test_x.py`.
-    let suite = super::suite_pattern(name);
+    let suite = crate::testing::suite_pattern(name);
     let by_name = owners
         .get(name)
         .or_else(|| {
@@ -148,7 +148,7 @@ pub enum TestRequest {
     /// run (#1535: Rerun Failed Tests). Ends once, failed if any failed.
     RunMany(Vec<String>),
     /// Run a whole suite by its unanchored name (a header click). The cargo
-    /// arm anchors it with [`super::suite_pattern`] so `parse` cannot sweep
+    /// arm anchors it with [`crate::testing::suite_pattern`] so `parse` cannot sweep
     /// `parse_utils::b`; pytest gets it positionally as a node-ID prefix.
     RunSuite(String),
     /// Run with the runner's coverage tool on (#263): everything, or only
@@ -204,7 +204,7 @@ pub enum TestResponse {
     QuietDiscovery,
     /// A coverage run's report, or why there is none. Sent before its
     /// `Finished`.
-    Coverage(Result<super::coverage::Coverage, CoverageError>),
+    Coverage(Result<crate::testing::coverage::Coverage, CoverageError>),
 }
 
 /// Why a coverage run produced no report.
@@ -813,12 +813,12 @@ fn go_cmd<S: AsRef<std::ffi::OsStr>>(root: &Path, args: &[S]) -> Command {
 
 /// Run `go test -json` and stream its finished tests, showing the text the
 /// tests printed (not the JSON events) in the OUTPUT channel. `./...` is
-/// spelled for the root's modules (see [`super::gotest::Modules::expand`]).
+/// spelled for the root's modules (see [`crate::testing::gotest::Modules::expand`]).
 fn run_go<S: AsRef<str>>(tx: &EpochTx, root: &Path, args: &[S]) -> Option<bool> {
-    let modules = super::gotest::Modules::of(root);
+    let modules = crate::testing::gotest::Modules::of(root);
     let cmd = go_cmd(root, &modules.expand(args));
-    run_streaming_shown(tx, cmd, super::gotest::shown, |line| {
-        super::gotest::parse_event(&modules, line)
+    run_streaming_shown(tx, cmd, crate::testing::gotest::shown, |line| {
+        crate::testing::gotest::parse_event(&modules, line)
             .into_iter()
             .collect()
     })
@@ -836,8 +836,8 @@ fn run_codeql(tx: &EpochTx, root: &Path, args: &[String]) -> Option<bool> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    let stream = std::cell::RefCell::new(super::codeqltest::RunStream::new(root));
-    let report = |o: super::codeqltest::Outcome| {
+    let stream = std::cell::RefCell::new(crate::testing::codeqltest::RunStream::new(root));
+    let report = |o: crate::testing::codeqltest::Outcome| {
         if let Some(summary) = o.failure_summary() {
             output::push(output::CHANNEL_TESTS, OutputLevel::Error, &summary);
         }
@@ -911,7 +911,7 @@ fn js_id_parts(id: &str) -> (&str, Option<&str>) {
 /// Whether a run-filter pattern is a node-ID (prefix) rooted at a test file,
 /// as opposed to a bare title from run-at-cursor.
 fn is_js_file(pattern: &str) -> bool {
-    super::parse::is_js_test_file(js_id_parts(pattern).0)
+    crate::testing::parse::is_js_test_file(js_id_parts(pattern).0)
 }
 
 /// One test-harness executable out of `cargo test --no-run`'s JSON: its
@@ -1452,8 +1452,8 @@ fn run_all_with(runner: Runner, root: &Path, tx: &EpochTx) -> bool {
         }
         Runner::Go => run_go(tx, root, &[String::from("./...")]),
         Runner::Codeql => {
-            let packs = super::codeqltest::test_packs(root, &codeql_markers());
-            match super::codeqltest::all_args(root, &packs) {
+            let packs = crate::testing::codeqltest::test_packs(root, &codeql_markers());
+            match crate::testing::codeqltest::all_args(root, &packs) {
                 Some(args) => run_codeql(tx, root, &args),
                 // No test pack: nothing to run, and nothing failed.
                 None => Some(true),
@@ -1523,7 +1523,7 @@ fn coverage_scope_args(runner: Runner, scope: &CoverageScope) -> Vec<String> {
         // a suite anchored as its plain run anchors it.
         Runner::Cargo => {
             let name = if scope.suite {
-                super::suite_pattern(name)
+                crate::testing::suite_pattern(name)
             } else {
                 name.to_string()
             };
@@ -1536,9 +1536,9 @@ fn coverage_scope_args(runner: Runner, scope: &CoverageScope) -> Vec<String> {
         }
         Runner::Go => {
             if scope.exact {
-                super::gotest::one_args(name)
+                crate::testing::gotest::one_args(name)
             } else {
-                super::gotest::filter_args(name, scope.suite)
+                crate::testing::gotest::filter_args(name, scope.suite)
             }
         }
         // Refused before any argv is built (see run_coverage).
@@ -1723,14 +1723,14 @@ fn run_coverage(root: &Path, tx: &EpochTx, scope: Option<&CoverageScope>) {
     .unwrap_or(false);
     let lcov = if runner == Runner::Go {
         std::fs::read_to_string(go_cover_profile(&dir)).map(|profile| {
-            let modules = super::gotest::Modules::of(root);
-            super::gotest::cover_profile_to_lcov(&profile, &modules)
+            let modules = crate::testing::gotest::Modules::of(root);
+            crate::testing::gotest::cover_profile_to_lcov(&profile, &modules)
         })
     } else {
         std::fs::read_to_string(coverage_report(&dir))
     };
     let report = lcov
-        .map(|text| super::coverage::Coverage::from_lcov(&text, root))
+        .map(|text| crate::testing::coverage::Coverage::from_lcov(&text, root))
         .map_err(|_| CoverageError::NoReport);
     tx.send(TestResponse::Coverage(report));
     tx.send(TestResponse::Finished { ok: Some(ok) });
@@ -1824,14 +1824,14 @@ fn run_one_case(root: &Path, tx: &EpochTx, runner: Runner, name: &str) -> bool {
             let cmd = cargo_cmd(root, &["test", name, "--color=never", "--", "--exact"]);
             run_streaming(tx, cmd, one(parse_test_line))
         }
-        Runner::Go => run_go(tx, root, &super::gotest::one_args(name)),
-        Runner::Codeql => run_codeql(tx, root, &super::codeqltest::select_args(name)),
+        Runner::Go => run_go(tx, root, &crate::testing::gotest::one_args(name)),
+        Runner::Codeql => run_codeql(tx, root, &crate::testing::codeqltest::select_args(name)),
     }
     .unwrap_or(false)
 }
 
 /// Run every test matching a name filter. `suite` marks a header click: the
-/// cargo arm then anchors the pattern with [`super::suite_pattern`], since a
+/// cargo arm then anchors the pattern with [`crate::testing::suite_pattern`], since a
 /// bare substring like `parse` would also sweep `parse_utils::b`. pytest
 /// splits the two shapes: a suite is a node-ID prefix (`tests/test_x.py`,
 /// `tests/test_x.py::TestGroup`) passed positionally, a bare function name
@@ -1872,7 +1872,7 @@ fn run_filter_in(root: &Path, tx: &EpochTx, pattern: &str, suite: bool, file: Op
         Runner::Cargo => {
             let anchored;
             let pattern = if suite {
-                anchored = super::suite_pattern(pattern);
+                anchored = crate::testing::suite_pattern(pattern);
                 &anchored
             } else {
                 pattern
@@ -1880,10 +1880,14 @@ fn run_filter_in(root: &Path, tx: &EpochTx, pattern: &str, suite: bool, file: Op
             let cmd = cargo_cmd(root, &["test", pattern, "--no-fail-fast", "--color=never"]);
             run_streaming(tx, cmd, one(parse_test_line))
         }
-        Runner::Go => run_go(tx, root, &super::gotest::filter_args(pattern, suite)),
+        Runner::Go => run_go(
+            tx,
+            root,
+            &crate::testing::gotest::filter_args(pattern, suite),
+        ),
         // A suite is its folder; any other filter is taken as the path (or
         // id) of what to run.
-        Runner::Codeql => run_codeql(tx, root, &super::codeqltest::select_args(pattern)),
+        Runner::Codeql => run_codeql(tx, root, &crate::testing::codeqltest::select_args(pattern)),
     }
     .unwrap_or(false);
     tx.send(TestResponse::Finished { ok: Some(ok) });
@@ -1989,10 +1993,10 @@ fn discover_with(runner: Runner, root: &Path, tx: &EpochTx) -> bool {
         }
         // `go test -list` compiles each package's tests but runs none.
         Runner::Go => {
-            let modules = super::gotest::Modules::of(root);
+            let modules = crate::testing::gotest::Modules::of(root);
             let cmd = go_cmd(root, &modules.expand(&["-list", ".", "./..."]));
-            run_streaming_shown(tx, cmd, super::gotest::shown, |line| {
-                super::gotest::parse_list_event(&modules, line)
+            run_streaming_shown(tx, cmd, crate::testing::gotest::shown, |line| {
+                crate::testing::gotest::parse_list_event(&modules, line)
                     .map(not_run)
                     .into_iter()
                     .collect()
@@ -2000,8 +2004,8 @@ fn discover_with(runner: Runner, root: &Path, tx: &EpochTx) -> bool {
         }
         // Tests are files; listing them needs no CLI, and cannot fail.
         Runner::Codeql => {
-            let packs = super::codeqltest::test_packs(root, &codeql_markers());
-            for id in super::codeqltest::discover(root, &packs) {
+            let packs = crate::testing::codeqltest::test_packs(root, &codeql_markers());
+            for id in crate::testing::codeqltest::discover(root, &packs) {
                 tx.send(TestResponse::Case(not_run(id)));
             }
             Some(true)
