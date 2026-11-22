@@ -317,6 +317,7 @@ src/
 │   │   ├── exceptions.rs        the exception filters an adapter offers, breaking on raised exceptions, and what was thrown
 │   │   ├── session_set_tests.rs the tests of the set of debug sessions in flight
 │   │   ├── start_requests.rs    `initialize`, each adapter family's `launch`, `configurationDone` and `disconnect`
+│   │   ├── stepping.rs          pause, continue, step over, into and out, and Step Into Target
 │   │   ├── tests.rs             the debug session's own tests
 │   ├── registry.rs           data-driven debug-adapter registry: maps a file extension to an AdapterKind from the `[[debug_adapters]]` blocks in bundled + user manifests, skipping adapters whose extension is disabled in the Extensions panel
 │   ├── log.rs           optional DAP wire log at ~/.croft/dap.log (gated by CROFT_DAP_LOG), mirroring lsp/log_file.rs
