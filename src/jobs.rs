@@ -88,6 +88,13 @@ impl<T: Send + 'static> Job<T> {
 }
 
 impl<T> Job<T> {
+    /// Wait for the job to settle: its result, or `None` when its thread
+    /// ended without one. For a caller that has asked the work to stop and
+    /// must not go on until it has, like a search scan cut short.
+    pub fn wait(&self) -> Option<T> {
+        self.rx.recv().ok()
+    }
+
     /// What the job has to report now. After [`Poll::Done`] or
     /// [`Poll::Died`] it has nothing more to say, so the caller drops it.
     pub fn poll(&self) -> Poll<T> {

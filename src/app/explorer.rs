@@ -2015,6 +2015,7 @@ impl App {
         let _ = self
             .search_query_tx
             .send(SearchRequest::SetRoots(roots.clone()));
+        self.search_roots_changed();
         self.search.roots = roots.clone();
         if let Some(lsp) = &self.lsp {
             lsp.set_extra_roots(roots.into_iter().skip(1).collect());
@@ -2310,6 +2311,7 @@ impl App {
         let _ = self
             .search_query_tx
             .send(SearchRequest::SetRoot(new_root.clone()));
+        self.search_roots_changed();
         self.search.root = new_root.clone();
         self.search.roots = vec![new_root.clone()];
         self.search.hits.clear();

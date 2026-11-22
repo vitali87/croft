@@ -1213,7 +1213,7 @@ fn search_view_with_results() {
         "the search to finish",
         || {
             app.drain_search_results();
-            app.search.complete
+            app.search.progress == SearchProgress::Finished
         },
     );
     assert!(!app.search.hits.is_empty());
