@@ -387,37 +387,40 @@ pub fn fetch_latest_checked() -> Result<Option<Release>, String> {
 /// the network, offers a version they said Later to, and says what it
 /// found, failures included.
 pub struct ManualCheck {
-    rx: Receiver<Result<Option<Release>, String>>,
+    job: crate::jobs::Job<Result<Option<Release>, String>>,
 }
 
 impl ManualCheck {
-    /// Ask with `fetch` off-thread, recording its answer for the daily
-    /// check. The verdict is the newer release to offer, `None` when croft
-    /// is up to date, or why the network could not be asked.
+    /// Ask with `fetch` as the `update-check` job, recording its answer for
+    /// the daily check. The verdict is the newer release to offer, `None`
+    /// when croft is up to date, or why the network could not be asked.
+    /// Fails only when no thread can be started.
     pub fn start_with(
         cache_dir: PathBuf,
         current_version: String,
         fetch: fn() -> Result<Option<Release>, String>,
-    ) -> Self {
-        let (tx, rx) = channel();
-        std::thread::spawn(move || {
-            // A download the first frame never shows.
-            crate::startup_gate::wait();
-            let verdict = fetch().map(|latest| {
-                let mut cache = CheckCache::load(&cache_dir);
-                cache.set_latest(latest.clone());
-                cache.checked_at = now_secs();
-                let _ = cache.save(&cache_dir);
-                latest.filter(|r| is_newer(&r.version, &current_version))
-            });
-            let _ = tx.send(verdict);
-        });
-        Self { rx }
+    ) -> std::io::Result<Self> {
+        // A download the first frame never shows.
+        let job = crate::jobs::Job::spawn(
+            "update-check",
+            crate::jobs::Start::AfterFirstFrame,
+            move || {
+                fetch().map(|latest| {
+                    let mut cache = CheckCache::load(&cache_dir);
+                    cache.set_latest(latest.clone());
+                    cache.checked_at = now_secs();
+                    let _ = cache.save(&cache_dir);
+                    latest.filter(|r| is_newer(&r.version, &current_version))
+                })
+            },
+        )?;
+        Ok(Self { job })
     }
 
-    /// The verdict once it lands; `None` while still checking.
-    pub fn take(&self) -> Option<Result<Option<Release>, String>> {
-        self.rx.try_recv().ok()
+    /// The verdict once it lands, `Pending` while still checking, or
+    /// `Died` when the check's thread ended without one (#2579).
+    pub fn poll(&self) -> crate::jobs::Poll<Result<Option<Release>, String>> {
+        self.job.poll()
     }
 }
 
@@ -1175,10 +1178,11 @@ mod tests {
             Ok(Some(Release::from("1.0.0")))
         }
         let wait = |check: ManualCheck| loop {
-            if let Some(v) = check.take() {
-                return v;
+            match check.poll() {
+                crate::jobs::Poll::Done(v) => return v,
+                crate::jobs::Poll::Died => panic!("the check died"),
+                crate::jobs::Poll::Pending => std::thread::sleep(Duration::from_millis(5)),
             }
-            std::thread::sleep(Duration::from_millis(5));
         };
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().to_path_buf();
@@ -1192,7 +1196,8 @@ mod tests {
         }
         .save(&dir)
         .unwrap();
-        let start = |fetch| ManualCheck::start_with(dir.clone(), String::from("1.0.0"), fetch);
+        let start =
+            |fetch| ManualCheck::start_with(dir.clone(), String::from("1.0.0"), fetch).unwrap();
         assert_eq!(wait(start(offline)), Err(String::from(OFFLINE_REASON)));
         assert_eq!(wait(start(same)), Ok(None));
         assert_eq!(wait(start(newer)), Ok(newer().unwrap()));

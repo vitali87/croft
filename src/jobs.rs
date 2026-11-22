@@ -19,10 +19,8 @@ use std::time::{Duration, Instant};
 pub enum Start {
     /// At once: someone is waiting on the result.
     Now,
-    /// Once the first frame is on screen, which outside a launch is at once.
-    /// Its first users are the startup jobs that move onto this module next
-    /// (#2062).
-    #[allow(dead_code)]
+    /// Once the first frame is on screen, which outside a launch is at once:
+    /// work the first frame does not show, like Help: Update croft's check.
     AfterFirstFrame,
 }
 
