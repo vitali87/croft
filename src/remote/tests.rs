@@ -6,15 +6,41 @@
 fn fake_ssh(dir: &Path, home: &Path) {
     use std::os::unix::fs::PermissionsExt;
     let shim = dir.join("ssh");
-    std::fs::write(
-        &shim,
-        format!(
-            "#!/bin/sh\nwhile [ $# -gt 0 ]; do case \"$1\" in -S|-o) shift 2;; -*) shift;; *) break;; esac; done\nshift\nHOME='{}' exec sh -c \"$*\"\n",
-            home.display()
-        ),
-    )
-    .unwrap();
+    std::fs::write(&shim, fake_ssh_script(home)).unwrap();
     std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    TEST_SSH.with(|p| *p.borrow_mut() = Some(shim));
+}
+
+/// [`fake_ssh`]'s script: drop ssh's own flags and the host, then run the
+/// remote command with `home` as `$HOME`.
+#[cfg(unix)]
+fn fake_ssh_script(home: &Path) -> String {
+    format!(
+        "#!/bin/sh\nwhile [ $# -gt 0 ]; do case \"$1\" in -S|-o) shift 2;; -*) shift;; *) break;; esac; done\nshift\nHOME='{}' exec sh -c \"$*\"\n",
+        home.display()
+    )
+}
+
+/// [`fake_ssh`], still open for writing for `hold`, the way a test's
+/// freshly written script is while another test thread forks: running it
+/// fails with "Text file busy" until the writer lets go (#2560).
+#[cfg(unix)]
+fn busy_fake_ssh(dir: &Path, home: &Path, hold: std::time::Duration) {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt;
+    let shim = dir.join("ssh");
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o755)
+        .open(&shim)
+        .unwrap();
+    f.write_all(fake_ssh_script(home).as_bytes()).unwrap();
+    f.flush().unwrap();
+    std::thread::spawn(move || {
+        std::thread::sleep(hold);
+        drop(f);
+    });
     TEST_SSH.with(|p| *p.borrow_mut() = Some(shim));
 }
 
@@ -51,14 +77,28 @@ fn the_config_diff_read_returns_the_remote_copy() {
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("triggers.json"), "remote copy\n").unwrap();
     fake_ssh(bin.path(), home.path());
-    let out = ssh_socket_read(
-        &bin.path().join("ctl"),
-        "box",
-        "cat ~/.config/croft/triggers.json 2>/dev/null",
-    )
-    .output()
-    .unwrap();
-    assert_eq!(String::from_utf8_lossy(&out.stdout), "remote copy\n");
+    let got = read_remote_config(&bin.path().join("ctl"), "box", "triggers.json").unwrap();
+    assert_eq!(String::from_utf8_lossy(&got), "remote copy\n");
+}
+
+/// #2560: an ssh that is "Text file busy" for a moment (just installed or
+/// updated, or a test's stand-in written while another test forked) still
+/// gives the remote's copy, as the hash read already did.
+#[cfg(unix)]
+#[test]
+fn a_briefly_busy_ssh_still_reads_the_remote_copy() {
+    let bin = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let dir = home.path().join(".config/croft");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("triggers.json"), "remote copy\n").unwrap();
+    busy_fake_ssh(
+        bin.path(),
+        home.path(),
+        std::time::Duration::from_millis(100),
+    );
+    let got = read_remote_config(&bin.path().join("ctl"), "box", "triggers.json").unwrap();
+    assert_eq!(String::from_utf8_lossy(&got), "remote copy\n");
 }
 
 #[cfg(unix)]
@@ -72,7 +112,10 @@ fn a_read_still_keeps_ssh_off_the_terminal() {
     fake_ssh(bin.path(), home.path());
     let mut cmd = ssh_socket_read(&bin.path().join("ctl"), "box", "cat && echo done >&2");
     assert!(cmd.get_args().any(|a| a == "-n"));
-    let out = cmd.output().unwrap();
+    // Started as croft starts its reads, waiting out "Text file busy" (#2560).
+    let out = crate::review_ops::spawn_retrying_busy(&mut cmd)
+        .and_then(std::process::Child::wait_with_output)
+        .unwrap();
     assert!(out.stdout.is_empty());
     assert!(out.stderr.is_empty(), "stderr stays off the terminal");
 }
