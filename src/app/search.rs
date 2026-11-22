@@ -136,7 +136,8 @@ impl App {
     }
 
     /// Run the panel's query again on coming back to Search, when its last
-    /// run was stopped before it finished (#2608).
+    /// run was stopped before it finished (#2608), or the workspace's
+    /// folders changed after it ran (#2612 review).
     pub(super) fn resume_cancelled_search(&mut self) {
         if self.search.progress == SearchProgress::Cancelled {
             self.submit_search_query();
@@ -146,12 +147,15 @@ impl App {
     /// The workspace's folders changed under the panel: anything a run
     /// still sends is for the old folders and is dropped, even from a run
     /// already counted as stopped, whose events may still be on the way
-    /// (#2612 review); a run that had not finished is cut short (#2608).
+    /// (#2612 review). The list answered for the old folders, so no run
+    /// counts as the whole answer any more, a finished one included: a run
+    /// in flight is cut short (#2608), Replace All asks for the search to
+    /// run again rather than skip an added folder's matches or edit a
+    /// removed folder's files, and coming back to Search runs it again
+    /// (#2612 review).
     pub(super) fn search_roots_changed(&mut self) {
         self.search.run += 1;
-        if self.search.progress != SearchProgress::Finished {
-            self.search.progress = SearchProgress::Cancelled;
-        }
+        self.search.progress = SearchProgress::Cancelled;
     }
 
     /// The Replace All confirmation modal (#123): counts up front, commits
@@ -403,10 +407,11 @@ impl App {
                     String::from("Replace All: search still running — retry when it finishes");
                 return;
             }
-            // The list is only what the run found before it was stopped.
+            // The list is only what the run found before it was stopped,
+            // or answered for the workspace's folders before they changed.
             SearchProgress::Cancelled => {
                 self.status = String::from(
-                    "Replace All: the search was stopped before it finished — refresh to search again",
+                    "Replace All: the search was stopped or its folders changed — refresh to search again",
                 );
                 return;
             }

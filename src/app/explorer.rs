@@ -2315,9 +2315,6 @@ impl App {
         self.search.root = new_root.clone();
         self.search.roots = vec![new_root.clone()];
         self.search.hits.clear();
-        // The cleared list answers nothing under the new root, so the
-        // query is searched again on coming back to Search.
-        self.search.progress = SearchProgress::Cancelled;
         self.search.selected = 0;
         self.search.scroll = 0;
         // Drop any in-flight walker for the OLD root so its result is
