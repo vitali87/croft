@@ -2005,6 +2005,91 @@ fn a_syntax_parse_landing_after_the_language_servers_outline_does_not_replace_it
     assert_eq!(names, vec!["FromServer"]);
 }
 
+/// The OUTLINE section as it draws.
+fn outline_text(app: &mut App) -> String {
+    app.outline.collapsed = false;
+    let area = ratatui::layout::Rect::new(0, 0, 40, 6);
+    let mut buf = ratatui::buffer::Buffer::empty(area);
+    ratatui::widgets::Widget::render(&mut app.outline, area, &mut buf);
+    (0..area.height)
+        .map(|y| {
+            (0..area.width)
+                .map(|x| buf[(x, y)].symbol())
+                .collect::<String>()
+                + "\n"
+        })
+        .collect()
+}
+
+/// #2586: going back to a large file that no language server handles, after
+/// a smaller one whose outline is read inline, parses its outline again
+/// instead of leaving OUTLINE on "Loading" for good.
+#[test]
+fn going_back_to_a_large_file_reads_its_outline_again() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "big.py", &python_module(20_000));
+    let big = app.editor.path.clone().unwrap();
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(60),
+        "the large file's outline",
+        || {
+            app.sync_outline();
+            !app.outline.symbols().is_empty()
+        },
+    );
+    let small = tmp.path().join("small.py");
+    std::fs::write(&small, "def small(x):\n    return x\n").unwrap();
+    app.editor.open(&small).unwrap();
+    app.sync_outline();
+    assert_eq!(app.outline.symbols().len(), 1, "the small file's outline");
+    app.editor.open(&big).unwrap();
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(60),
+        "the large file's outline again",
+        || {
+            app.sync_outline();
+            app.outline.symbols().len() > 1
+        },
+    );
+}
+
+/// #2587: a large file's outline parse whose thread crashed settles OUTLINE
+/// on saying so, instead of "Loading" for one that is not coming.
+#[test]
+fn a_large_outline_parse_whose_thread_crashed_says_it_could_not_read() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "big.py", &python_module(20_000));
+    app.sync_outline();
+    let key = app
+        .outline_parse
+        .as_ref()
+        .expect("the parse is running")
+        .0
+        .clone();
+    app.outline_parse = Some((
+        key,
+        crate::jobs::Job::spawn(
+            "outline-parse",
+            crate::jobs::Start::Now,
+            || -> Vec<crate::lsp::manager::OutlineSymbol> {
+                panic!("the parse crashed (on purpose, in a test)")
+            },
+        )
+        .unwrap(),
+    ));
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(1),
+        "the crashed parse to settle",
+        || {
+            app.sync_outline();
+            app.outline_parse.is_none()
+        },
+    );
+    let text = outline_text(&mut app);
+    assert!(text.contains("Could not read the outline"), "got:\n{text}");
+    assert!(!text.contains("Loading"), "got:\n{text}");
+}
+
 fn app_outline_symbol_named(name: &str) -> crate::lsp::manager::OutlineSymbol {
     let tmp = tempfile::tempdir().unwrap();
     let mut probe = app_with_open_file(tmp.path(), "one.py", "def one(x):\n    return x\n");
