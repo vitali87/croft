@@ -423,6 +423,7 @@ src/
     ├── file_tree/        the Explorer's file tree's feature files, beside file_tree.rs; each file's `//!` doc says what it holds
     │   ├── android_trash.rs   the freedesktop home trash on Android, where the `trash` crate has none
     │   ├── decorations.rs     a row's git decoration, name and icon colours, the active indent guide, and ignored or agent-changed paths
+    │   ├── listing.rs         reading a folder, Explorer order, compact folders, and refreshing children on file system events
     │   ├── roots.rs           the workspace roots: replacing the primary, adding and removing the others, and which owns a path
     │   ├── selection.rs       the cursor, the multi-selection and its anchor, and the paths an action takes
     │   ├── tests.rs           the file tree's own tests
