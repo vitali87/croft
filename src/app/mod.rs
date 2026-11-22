@@ -2579,15 +2579,14 @@ pub struct App {
     /// on the event loop (keeps input at 0ms). A full set, not individual hits,
     /// so the app can reconcile ports that stopped listening.
     port_poll_rx: std::sync::mpsc::Receiver<PortPoll>,
-    /// Results of a running fleet command (#363), delivered off the event
+    /// The fleet command in flight (#363), if one is, run off the event
     /// loop. A fleet run waits on the network for up to `FLEET_TIMEOUT`, and
     /// blocking the loop for that would freeze the editor — the user could
-    /// not scroll, type, or cancel while their fleet answered.
-    fleet_rx: std::sync::mpsc::Receiver<Vec<crate::fleet::HostResult>>,
-    fleet_tx: std::sync::mpsc::Sender<Vec<crate::fleet::HostResult>>,
-    /// True while a run is in flight, so a second invocation says so rather
-    /// than starting a competing fleet against the same hosts.
-    fleet_running: bool,
+    /// not scroll, type, or cancel while their fleet answered. While it
+    /// runs, a second invocation says so rather than starting a competing
+    /// fleet against the same hosts; one whose thread crashed is no longer
+    /// running (#2566).
+    fleet_run: Option<crate::jobs::Job<Vec<crate::fleet::HostResult>>>,
     /// The command the fleet run in flight is running, for its tab (#363).
     fleet_command: String,
     port_poll_tx: std::sync::mpsc::Sender<PortPoll>,
@@ -4253,7 +4252,6 @@ impl App {
         let (search_query_tx, search_query_rx) = std::sync::mpsc::channel();
         let (search_results_tx, search_results_rx) = std::sync::mpsc::channel();
         let (port_poll_tx, port_poll_rx) = std::sync::mpsc::channel();
-        let (fleet_tx, fleet_rx) = std::sync::mpsc::channel();
         let (label_tx, label_rx) = std::sync::mpsc::channel();
         let (ssh_tx, ssh_rx) = std::sync::mpsc::channel();
         let search_root = root.clone();
@@ -4725,9 +4723,7 @@ impl App {
             port_toast: None,
             last_port_poll: std::time::Instant::now(),
             port_poll_rx,
-            fleet_rx,
-            fleet_tx,
-            fleet_running: false,
+            fleet_run: None,
             fleet_command: String::new(),
             port_poll_tx,
             port_poll_inflight: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),

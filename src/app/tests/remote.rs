@@ -782,11 +782,10 @@ fn a_fleet_run_reports_through_the_channel_rather_than_blocking() {
             elapsed: std::time::Duration::ZERO,
         },
     ];
-    app.fleet_running = true;
-    app.fleet_tx.send(results).unwrap();
+    app.fleet_run = Some(crate::jobs::Job::finished(results));
 
     assert!(app.drain_fleet_results(), "a delivered result must report");
-    assert!(!app.fleet_running, "the run is no longer in flight");
+    assert!(app.fleet_run.is_none(), "the run is no longer in flight");
     assert!(
         app.status.contains("2 identical") && app.status.contains("1 differ"),
         "the summary must reach the user: {}",
@@ -1106,14 +1105,11 @@ fn fleet_output_shows_each_hosts_time_and_the_lines_that_differ() {
         exit: Some(0),
         elapsed: std::time::Duration::from_millis(ms),
     };
-    app.fleet_running = true;
-    app.fleet_tx
-        .send(vec![
-            r("zz363-a", "Linux\n6.8.0-45", 120),
-            r("zz363-b", "Linux\n6.8.0-45", 80),
-            r("zz363-odd", "Linux\n6.8.0-31", 1500),
-        ])
-        .unwrap();
+    app.fleet_run = Some(crate::jobs::Job::finished(vec![
+        r("zz363-a", "Linux\n6.8.0-45", 120),
+        r("zz363-b", "Linux\n6.8.0-45", 80),
+        r("zz363-odd", "Linux\n6.8.0-31", 1500),
+    ]));
     assert!(app.drain_fleet_results());
     let lines: Vec<String> = crate::output::snapshot(crate::output::CHANNEL_FLEET)
         .unwrap()
@@ -1142,6 +1138,43 @@ fn fleet_output_shows_each_hosts_time_and_the_lines_that_differ() {
             .any(|l| l.ends_with(" Linux") && l.starts_with("    ")),
         "an equal line is not marked"
     );
+}
+
+/// #2566: a fleet run whose thread crashed is no longer in flight. The
+/// crash notice tells the user and FLEET says the run stopped; the next run
+/// then starts instead of answering "A fleet run is already in flight".
+#[test]
+fn a_fleet_run_whose_thread_crashed_lets_the_next_one_run() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.fleet_run = Some(
+        crate::jobs::Job::spawn("fleet-run", crate::jobs::Start::Now, || {
+            panic!("the run crashed (on purpose, in a test)")
+        })
+        .unwrap(),
+    );
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(1),
+        "the crashed run to settle",
+        || {
+            app.drain_fleet_results();
+            app.fleet_run.is_none()
+        },
+    );
+    let lines: Vec<String> = crate::output::snapshot(crate::output::CHANNEL_FLEET)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|l| l.text)
+        .collect();
+    assert!(
+        lines
+            .iter()
+            .any(|l| l == "the fleet run stopped without results"),
+        "{lines:?}"
+    );
+    app.run_fleet_command("localhost: echo fleet-again");
+    assert_eq!(app.status, "Fleet: running on 1 hosts…");
+    assert!(app.fleet_run.is_some(), "the next run started");
 }
 
 /// #363 end to end: a fleet run's results open as tiles in the Fleet tab,
