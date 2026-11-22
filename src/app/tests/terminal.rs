@@ -7758,21 +7758,33 @@ fn a_restore_reattaches_a_shell_still_running_in_its_pane_host() {
     app.restore_terminal_session_with(true);
     assert_eq!(app.terminals.len(), 2);
     let kept = &app.terminals[0];
-    assert_eq!(kept.host_socket(), Some(socket.as_path()), "reattached");
-    assert_eq!(kept.manual_name(), Some("kept"));
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
-    loop {
-        let (lines, _) = kept.grid_lines();
-        if lines.iter().any(|l| l.contains("still-42")) {
-            assert!(
-                !lines.iter().any(|l| l.contains("old transcript")),
-                "the live screen, not the saved transcript: {lines:?}"
-            );
-            break;
-        }
-        assert!(std::time::Instant::now() < deadline, "{lines:?}");
-        std::thread::sleep(std::time::Duration::from_millis(20));
+    if kept.host_socket() != Some(socket.as_path()) {
+        // Rare, and only under a loaded suite so far (#2553): the restore
+        // gave this pane a fresh shell. Say why, so the failure names its
+        // cause: whether the host still answers, and what attaching gives.
+        let alive = crate::session::is_alive(&socket);
+        let attach = crate::widgets::terminal::PtyTerminal::attach_hosted(&socket)
+            .map(|_| ())
+            .map_err(|e| format!("{e:#}"));
+        panic!(
+            "not reattached: the pane's host is {:?}; the live host answers a probe now: \
+             {alive}; attaching to it now gives {attach:?}",
+            kept.host_socket()
+        );
     }
+    assert_eq!(kept.manual_name(), Some("kept"));
+    // A real shell painting into the pane, so a load-scaled wait (#307): a
+    // fixed 4 s ran out under a full parallel suite (#2553).
+    crate::test_budget::await_spawned(
+        crate::test_budget::tests::SHELL_PAINT_BASE,
+        "the reattached pane to show the live shell's screen",
+        || kept.grid_lines().0.iter().any(|l| l.contains("still-42")),
+    );
+    let (lines, _) = kept.grid_lines();
+    assert!(
+        !lines.iter().any(|l| l.contains("old transcript")),
+        "the live screen, not the saved transcript: {lines:?}"
+    );
     let gone = &app.terminals[1];
     assert_eq!(
         gone.host_socket(),
