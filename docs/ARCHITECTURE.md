@@ -327,6 +327,7 @@ src/
 │   ├── configs/         launch.json's feature files, beside configs.rs; each file's `//!` doc says what it holds
 │   │   ├── compounds.rs         compounds: reading them and resolving their members
 │   │   ├── discovery.rs         finding every launch.json and what it declares, and the folders a name points at
+│   │   ├── env_files.rs         reading a dotenv `envFile`: quotes, escapes, comments and `${NAME}` references
 │   │   ├── inputs.rs            the `inputs` array, the `${input:id}` ids a configuration uses, and which are still to ask
 │   │   ├── presentation.rs      `presentation` blocks: hidden entries, groups and order, and the picker's sort
 │   │   ├── substitution.rs      `${...}` variables: expanding them, with an unknown one an error
