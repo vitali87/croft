@@ -3,6 +3,10 @@
 
 use super::*;
 
+/// What the status line says while a refresh of the extensions index the
+/// user asked for runs.
+const REFRESHING_EXT_INDEX: &str = "Refreshing extensions index\u{2026}";
+
 impl App {
     /// Pull the one-shot remote-extension-index refresh if it has finished.
     /// Rebuilds the Extensions panel exactly once, when the verified cache
@@ -29,9 +33,19 @@ impl App {
                 updated
             }
             Err(std::sync::mpsc::TryRecvError::Empty) => false,
+            // The refresh thread ended without answering (a panic). A
+            // refresh the user asked for says so, as one that finished does,
+            // instead of leaving "Refreshing extensions index…" (#2551),
+            // unless something newer (the crash notice) has replaced that
+            // since. The silent startup refresh still says nothing.
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 self.ext_index_refresh = None;
-                false
+                let manual = std::mem::take(&mut self.ext_index_manual_refresh);
+                if manual && self.status == REFRESHING_EXT_INDEX {
+                    self.status =
+                        String::from("Extensions index refresh stopped without answering");
+                }
+                manual
             }
         }
     }
@@ -43,7 +57,7 @@ impl App {
     pub(super) fn refresh_extension_index(&mut self) {
         self.ext_index_manual_refresh = true;
         self.ext_index_refresh = Some(crate::mcp::registry_index::spawn_refresh());
-        self.status = String::from("Refreshing extensions index\u{2026}");
+        self.status = String::from(REFRESHING_EXT_INDEX);
     }
 
     /// Rebuild the Extensions panel's row list from the bundled + user manifests,

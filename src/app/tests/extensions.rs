@@ -334,3 +334,61 @@ tool = "go"
         "another extension's record stays"
     );
 }
+
+/// #2551: a refresh of the extensions index the user asked for, whose thread
+/// dies without answering, says so and resets its manual flag, instead of
+/// leaving "Refreshing extensions index…" on screen.
+#[test]
+fn a_manual_extensions_index_refresh_that_dies_says_so() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel::<bool>();
+    drop(tx);
+    app.ext_index_refresh = Some(rx);
+    app.ext_index_manual_refresh = true;
+    app.status = String::from("Refreshing extensions index\u{2026}");
+    assert!(
+        app.drain_ext_index_refresh(),
+        "a refresh that died is news to draw"
+    );
+    assert!(app.ext_index_refresh.is_none());
+    assert!(!app.ext_index_manual_refresh, "the manual flag is reset");
+    assert_eq!(
+        app.status,
+        "Extensions index refresh stopped without answering"
+    );
+}
+
+/// The silent startup refresh dying still says nothing: it must not clobber
+/// whatever the status line shows.
+#[test]
+fn a_silent_extensions_index_refresh_that_dies_says_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel::<bool>();
+    drop(tx);
+    app.ext_index_refresh = Some(rx);
+    app.ext_index_manual_refresh = false;
+    app.status = String::from("something else");
+    assert!(!app.drain_ext_index_refresh());
+    assert!(app.ext_index_refresh.is_none());
+    assert_eq!(app.status, "something else");
+}
+
+/// A status that has moved on since the refresh the user asked for started
+/// (the crash notice, shown on an earlier frame than the one that finds the
+/// refresh gone) is left alone; the manual flag is still reset.
+#[test]
+fn a_manual_extensions_index_refresh_that_dies_keeps_a_newer_status() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel::<bool>();
+    drop(tx);
+    app.ext_index_refresh = Some(rx);
+    app.ext_index_manual_refresh = true;
+    app.status = String::from("A background task crashed");
+    app.drain_ext_index_refresh();
+    assert!(app.ext_index_refresh.is_none());
+    assert!(!app.ext_index_manual_refresh, "the manual flag is reset");
+    assert_eq!(app.status, "A background task crashed");
+}
