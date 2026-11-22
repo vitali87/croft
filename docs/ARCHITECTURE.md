@@ -325,6 +325,7 @@ src/
 │   │   ├── tests.rs             the debug session's own tests
 │   ├── configs.rs            launch.json, `.croft` over `.vscode`: its configurations and compounds, `inputs`, `presentation`, `${...}` variables and `envFile`, each entry resolved into its adapter's DAP request, and the entry Debug: Add Configuration… writes
 │   ├── configs/         launch.json's feature files, beside configs.rs; each file's `//!` doc says what it holds
+│   │   ├── inputs.rs            the `inputs` array, the `${input:id}` ids a configuration uses, and which are still to ask
 │   │   ├── tests.rs             the launch configurations' own tests
 │   ├── registry.rs           data-driven debug-adapter registry: maps a file extension to an AdapterKind from the `[[debug_adapters]]` blocks in bundled + user manifests, skipping adapters whose extension is disabled in the Extensions panel
 │   ├── log.rs           optional DAP wire log at ~/.croft/dap.log (gated by CROFT_DAP_LOG), mirroring lsp/log_file.rs
