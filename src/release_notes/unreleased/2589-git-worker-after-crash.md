@@ -1,1 +1,0 @@
-fix: After the git status worker's thread crashes, it starts again, so the branch, change list, gutter marks and COMMITS keep updating; if it crashes again within a minute it stops and says so, and Source Control: Refresh starts it again.

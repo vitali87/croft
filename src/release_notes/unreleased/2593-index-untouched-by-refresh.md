@@ -1,1 +1,0 @@
-fix: Source Control's background refresh no longer rewrites git's index, briefly locking it, when a file's timestamp changed but not its contents, so it cannot make your own git command fail with "index.lock: File exists".

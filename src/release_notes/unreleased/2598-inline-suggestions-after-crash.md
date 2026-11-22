@@ -1,1 +1,0 @@
-fix: After the inline suggestion worker's thread crashes, it starts again and the next pause in typing gets a suggestion, instead of suggestions stopping for good, even after turning them off and on; the request it was on is never sent again on its own, and if it crashes again within a minute it stops and says so until suggestions are turned off and on.
