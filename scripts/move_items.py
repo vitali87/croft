@@ -2246,12 +2246,112 @@ DAP_CONFIGS = Target(
     ),
 )
 
+# What each file split out of src/testing/worker.rs holds, as FILES above.
+TEST_WORKER_FILES = {
+    "runners": (
+        "Which runner runs a workspace's tests: the extensions' `[[test_runners]]`, every\n"
+        "runner that claims a folder, and the one a file's or a test's language picks.",
+        "test runner choice",
+        "which runner runs a folder's, a file's or a test's tests",
+    ),
+    "control": (
+        "Cancelling a run: the process group of the runner the worker is blocked on, and\n"
+        "killing it.",
+        "test cancel",
+        "cancelling a run by killing its runner's process group",
+    ),
+    "handle": (
+        "The app's side of the worker: queueing each kind of run and discovery, cancelling,\n"
+        "re-rooting, and draining the streamed results into the panel.",
+        "test worker handle",
+        "queueing runs and discoveries, cancelling, re-rooting, and draining results",
+    ),
+    "commands": (
+        "cargo's command line: rooted at the workspace, with `--workspace` when it has one,\n"
+        "and its build-status lines as progress.",
+        "cargo test command",
+        "cargo's command line, and its build-status lines as progress",
+    ),
+    "pytest": (
+        "pytest's command line: the interpreter or script that runs it, whether the project's\n"
+        "Python has it, and its verbosity for runs and discovery.",
+        "pytest command",
+        "pytest's command line: which Python or script runs it, and its verbosity",
+    ),
+    "go_and_codeql": (
+        "`go test -json` and `codeql test run`: finding `go`, their command lines, and\n"
+        "streaming their results.",
+        "go and CodeQL test command",
+        "`go test -json` and `codeql test run`: their command lines and results",
+    ),
+    "test_binaries": (
+        "Debugging a Rust test: the harness executables `cargo test --no-run` builds, and the\n"
+        "one that holds the test.",
+        "test binary",
+        "the cargo test harnesses built, and the one that holds a test",
+    ),
+    "js_args": (
+        "vitest's and jest's command lines: the project's own binary, vitest projects, and\n"
+        "the arguments that pick one test, a suite or a file.",
+        "JS test command",
+        "vitest's and jest's command lines, and the arguments that pick a test, a suite or a file",
+    ),
+    "streaming": (
+        "Streaming a runner's output: each line tagged with its request's epoch and runner,\n"
+        "stderr teed to OUTPUT, and the exit code.",
+        "test output streaming",
+        "streaming a runner's output, tagged with its request, and its exit code",
+    ),
+    "coverage": (
+        "Coverage runs: the LCOV each runner writes, narrowing a run to a scope, the tool that\n"
+        "measures it and installing it, and why a run produced no report.",
+        "test coverage",
+        "coverage runs: LCOV, scopes, and each runner's coverage tool",
+    ),
+    "runs": (
+        "Running tests: everything, one, several, or those matching a filter, with each\n"
+        "runner's arguments.",
+        "test run",
+        "running every test, one, several, or a filter's",
+    ),
+    "discovery": (
+        "Discovering tests without running them: each runner's lister, streamed.",
+        "test discovery",
+        "listing each runner's tests without running them",
+    ),
+    "main_loop": (
+        "The worker thread's loop: taking each request in turn and handing it to its run or\n"
+        "discovery.",
+        "test worker loop",
+        "the worker thread's loop",
+    ),
+}
+
+TEST_WORKER = Target(
+    "test_worker", "scripts/split_test_worker_manifest.tsv", "src/testing/worker.rs",
+    "src/testing/worker", TEST_WORKER_FILES,
+    Tree(
+        # git/worker.rs's row starts the same way, and comes first.
+        "│   ├── worker.rs             the test-runner command layer",
+        "│   └── worker/          the test runner's feature files, beside worker.rs; each file's "
+        "`//!` doc says what it holds",
+        "│       ├── ", 20,
+    ),
+    "test-worker-",
+    (
+        "The test runner's own tests, moved out of worker.rs (#2062).",
+        "the test runner's tests",
+        "the test runner's own tests",
+    ),
+)
+
 
 TARGETS = {
     t.name: t
     for t in (
         APP, EDITOR, LSP, TERMINAL, GIT, REMOTE, SEARCH, SESSION_HOST, PAIR, SOURCE_CONTROL,
         CLI, CODEQL, DEBUGGER, LANGUAGE_SERVERS, DAP_SESSION, FILE_TREE, DAP_CONFIGS,
+        TEST_WORKER,
     )
 }
 

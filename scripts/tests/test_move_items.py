@@ -836,7 +836,7 @@ class OtherTargets(unittest.TestCase):
             sorted(mi.TARGETS),
             ["app", "cli", "codeql", "dap_configs", "dap_session", "debugger", "editor", "file_tree",
              "git", "language_servers", "lsp", "pair", "remote", "search", "session_host",
-             "source_control", "terminal"],
+             "source_control", "terminal", "test_worker"],
         )
         for t in mi.TARGETS.values():
             with self.subTest(target=t.name):
