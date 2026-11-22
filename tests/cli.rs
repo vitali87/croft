@@ -1912,12 +1912,13 @@ fn the_steps_before_the_first_frame_are_exactly_the_known_ones_in_order() {
         "sockets bound",
         "terminal shell spawned",
         "file watcher started",
-        // The steps inside `App::new`'s struct literal that read a file or
-        // start a thread, each marked where it runs (#2062): before these,
+        // The steps inside `App::new`'s struct literal that read or stat a
+        // file or start a thread, each marked where it runs (#2062): before these,
         // the whole literal was one step, so a slow one could not be told
         // apart from the rest.
         "test runner started",
         "macros loaded",
+        "settings watcher set up",
         "snippets loaded",
         "refused remote hosts read",
         "extension consents read",
