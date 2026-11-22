@@ -1654,7 +1654,7 @@ Background work that runs off the UI thread and hands back one result, which the
 
 **A start choice, made on purpose.** `Job::spawn` takes a `Start` with no default: `Now` for work someone is waiting on, `AfterFirstFrame` for work the first frame does not need, which then waits on `startup_gate`.
 
-**A thread named after the job.** The crash notice (`poll_background_panic`) names the thread that crashed, so a crashed job says which one it was.
+**A thread named after the job.** The crash notice (`poll_background_panic`) names the thread that crashed, so a crashed job says which one it was. A job's, stream's or worker's thread is marked as one croft recovers from (`on_supervised_thread`), so its notice says croft carried on, where any other thread's still says to save and restart; and the notice is shown before the polls that settle the task, so a task's own message about its crash is the one left on the status line (#2609).
 
 **A dead job is not a running one.** `poll` reports `Died` when the job's thread ended without a result, which a channel whose sender the `App` also kept could never see: Check Project stayed "already running" after its thread crashed (#2562). A thread that cannot be started at all is an error from `spawn`, reported where it happens. The places that collect a background thread's result by hand move onto this module one at a time (#2062).
 

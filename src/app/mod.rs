@@ -6601,6 +6601,10 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         // symbol tab leaves its siblings holding the saved text, so the
         // change event reads as their own write, not a conflict (#369).
         let symbol_views_settled = app.sync_symbol_views();
+        // A background task's crash notice comes before the polls that
+        // settle the task, so a task that says what its crash cost, or how
+        // to start it again, has the status line after it (#2609).
+        let panic_changed = app.poll_background_panic();
         // Pull in any filesystem-watcher events first so the tree reflects
         // disk reality on the very next frame.
         let fs_changed = app.drain_fs_events();
@@ -6691,7 +6695,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             | app.drain_review_ops();
         let connect_changed = app.poll_connect_dialog() | app.drain_scrub_views();
         let install_changed = app.poll_install_session();
-        let update_changed = app.poll_update_watch() | app.poll_background_panic();
+        let update_changed = app.poll_update_watch();
         let http_changed = app.drain_http_responses();
         let reveal_changed = app.tick_redaction_reveal();
         crate::startup_trace::mark("watchers and dialogs polled");
@@ -6849,6 +6853,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             || connect_changed
             || install_changed
             || update_changed
+            || panic_changed
             || http_changed
             || reveal_changed
             || lsp_changed

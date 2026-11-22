@@ -871,6 +871,34 @@ fn show_memory_usage_renders_in_the_active_theme() {
     );
 }
 
+/// The crash notice's slot is one for the whole process: tests that fill and
+/// read it take turns.
+fn crash_slot_lock() -> std::sync::MutexGuard<'static, ()> {
+    static SLOT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    SLOT.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// #2609: the crash notice of a task croft recovers from (a job, stream or
+/// worker) says croft carried on, instead of asking for a restart the task
+/// does not need; the record's place is still named.
+#[test]
+fn a_recovered_tasks_crash_notice_does_not_ask_for_a_restart() {
+    let _slot = crash_slot_lock();
+    note_background_panic("check-project", true);
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    assert!(app.poll_background_panic(), "the crash is shown");
+    assert!(
+        app.status.contains("(check-project)")
+            && app.status.contains("croft carried on")
+            && !app.status.contains("restart")
+            && app.status.contains("~/.cache/croft/panic.log"),
+        "{}",
+        app.status
+    );
+}
+
 /// #2077: a crash in a background thread leaves croft's terminal as it is
 /// and says on the status bar what crashed. Only a crash on the thread that
 /// drives the screen ends croft, and only then does the panic hook reset the
@@ -878,6 +906,7 @@ fn show_memory_usage_renders_in_the_active_theme() {
 /// alternate screen, with keys echoed and the mouse dead.
 #[test]
 fn a_background_crash_keeps_the_terminal_and_says_what_crashed() {
+    let _slot = crash_slot_lock();
     let ui = std::thread::current().id();
     assert!(
         panic_ends_croft(ui, ui),
@@ -891,7 +920,7 @@ fn a_background_crash_keeps_the_terminal_and_says_what_crashed() {
                 !panic_ends_croft(me.id(), ui),
                 "a background thread's crash does not"
             );
-            note_background_panic(me.name().unwrap());
+            note_background_panic(me.name().unwrap(), false);
         })
         .unwrap()
         .join()
