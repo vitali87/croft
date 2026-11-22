@@ -424,6 +424,7 @@ src/
     │   ├── android_trash.rs   the freedesktop home trash on Android, where the `trash` crate has none
     │   ├── decorations.rs     a row's git decoration, name and icon colours, the active indent guide, and ignored or agent-changed paths
     │   ├── listing.rs         reading a folder, Explorer order, compact folders, and refreshing children on file system events
+    │   ├── navigation.rs      the arrow, page, Home and End keys, scrolling, expanding and collapsing, revealing a path, and type-to-find
     │   ├── roots.rs           the workspace roots: replacing the primary, adding and removing the others, and which owns a path
     │   ├── selection.rs       the cursor, the multi-selection and its anchor, and the paths an action takes
     │   ├── tests.rs           the file tree's own tests
