@@ -78,21 +78,23 @@ see [docs/MACOS.md](docs/MACOS.md#spotlight-indexing-and-the-build-directory).
   `--target language_servers` split `src/app/language_servers.rs` from
   `scripts/split_language_servers_manifest.tsv`, with
   `--target dap_session` split `src/dap/session.rs` from
-  `scripts/split_dap_session_manifest.tsv`, and with `--target file_tree`
-  split `src/widgets/file_tree.rs` from `scripts/split_file_tree_manifest.tsv`
+  `scripts/split_dap_session_manifest.tsv`, with `--target file_tree`
+  split `src/widgets/file_tree.rs` from `scripts/split_file_tree_manifest.tsv`,
+  and with `--target dap_configs` split `src/dap/configs.rs` from
+  `scripts/split_dap_configs_manifest.tsv`
   (`--tests-out` first moved a file's inline tests, and any other inline
   module, to their own file).
 * **Adding to the app, the editor, the language-server manager, the
   terminal pane, git, remote sessions, the search panel, the session host,
   the pair pilot, the Source Control panel, the command line, the CodeQL
   side bar, Run and Debug, a language feature such as go-to, rename or the
-  outline, a debug session's talk with its adapter, or the Explorer's file
-  tree?** Put a feature's code in its file under `src/app/`,
+  outline, a debug session's talk with its adapter, the Explorer's file
+  tree or launch.json?** Put a feature's code in its file under `src/app/`,
   `src/widgets/editor/`, `src/lsp/manager/`, `src/widgets/terminal/`,
   `src/git/`, `src/remote/`, `src/widgets/search/`, `src/session_host/`,
   `src/pair/`, `src/widgets/source_control/`, `src/cli/`, `src/app/codeql/`,
-  `src/app/debugger/`, `src/app/language_servers/`, `src/dap/session/` or
-  `src/widgets/file_tree/`
+  `src/app/debugger/`, `src/app/language_servers/`, `src/dap/session/`,
+  `src/widgets/file_tree/` or `src/dap/configs/`
   (see the lists in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)),
   not in `src/app/mod.rs`, which keeps only the `App` struct, its state,
   start-up and the main loop, nor in `src/widgets/editor.rs`, which keeps only
@@ -114,8 +116,9 @@ see [docs/MACOS.md](docs/MACOS.md#spotlight-indexing-and-the-build-directory).
   types and constants their parts share, nor in `src/dap/session.rs`, which
   keeps only `DapSession`, the types its fields hold and the `DapEvent`s it
   returns, nor in `src/widgets/file_tree.rs`, which keeps only `FileTree`,
-  its constructor and `Node`, the row its fields hold. A new subcommand's
-  flags go in
+  its constructor and `Node`, the row its fields hold, nor in
+  `src/dap/configs.rs`, which keeps only `DebugConfig`, its `RequestKind`
+  and its `preLaunchTask`. A new subcommand's flags go in
   `src/cli/commands.rs` and its line in `Cli::run` (`src/cli/run.rs`); its
   own code goes in a file under `src/cli/`, or in the module of the feature
   it drives (as `croft remote` calls into `src/remote/`). A new feature that
