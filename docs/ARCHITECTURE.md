@@ -423,6 +423,7 @@ src/
     ├── file_tree/        the Explorer's file tree's feature files, beside file_tree.rs; each file's `//!` doc says what it holds
     │   ├── android_trash.rs   the freedesktop home trash on Android, where the `trash` crate has none
     │   ├── decorations.rs     a row's git decoration, name and icon colours, the active indent guide, and ignored or agent-changed paths
+    │   ├── deletion.rs        which rows may be deleted, and moving paths to the system's trash
     │   ├── listing.rs         reading a folder, Explorer order, compact folders, and refreshing children on file system events
     │   ├── navigation.rs      the arrow, page, Home and End keys, scrolling, expanding and collapsing, revealing a path, and type-to-find
     │   ├── new_and_rename.rs  New File, New Folder and Rename: where an entry goes, checking its name, and renaming
