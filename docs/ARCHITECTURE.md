@@ -331,6 +331,7 @@ src/
 │   │   ├── env_files.rs         reading a dotenv `envFile`: quotes, escapes, comments and `${NAME}` references
 │   │   ├── inputs.rs            the `inputs` array, the `${input:id}` ids a configuration uses, and which are still to ask
 │   │   ├── presentation.rs      `presentation` blocks: hidden entries, groups and order, and the picker's sort
+│   │   ├── python.rs            debugpy's `launch` and `attach` requests
 │   │   ├── resolve.rs           resolving a configuration: substitution, `envFile`, the mapped fields and the adapter a `type` maps to
 │   │   ├── substitution.rs      `${...}` variables: expanding them, with an unknown one an error
 │   │   ├── tests.rs             the launch configurations' own tests
