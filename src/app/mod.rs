@@ -4331,9 +4331,10 @@ impl App {
             ),
             macro_replaying: false,
             macros_path: crate::macros::macros_path(),
-            config_watch: crate::config_sync::ConfigWatch::new(config_watch_paths(
-                &merged_settings.chain,
-            )),
+            config_watch: crate::startup_trace::after(
+                "settings watcher set up",
+                crate::config_sync::ConfigWatch::new(config_watch_paths(&merged_settings.chain)),
+            ),
             snippets: crate::startup_trace::after(
                 "snippets loaded",
                 load_all_snippets([root.as_path()]),
