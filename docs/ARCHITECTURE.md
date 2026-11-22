@@ -313,6 +313,7 @@ src/
 │   ├── session/         the debug session's feature files, beside session.rs; each file's `//!` doc says what it holds
 │   │   ├── events.rs            a raw DAP message classified into a `DapEvent`, the output worth showing, and why an adapter refused to start
 │   │   ├── session_set_tests.rs the tests of the set of debug sessions in flight
+│   │   ├── start_requests.rs    `initialize`, each adapter family's `launch`, `configurationDone` and `disconnect`
 │   │   ├── tests.rs             the debug session's own tests
 │   ├── registry.rs           data-driven debug-adapter registry: maps a file extension to an AdapterKind from the `[[debug_adapters]]` blocks in bundled + user manifests, skipping adapters whose extension is disabled in the Extensions panel
 │   ├── log.rs           optional DAP wire log at ~/.croft/dap.log (gated by CROFT_DAP_LOG), mirroring lsp/log_file.rs
