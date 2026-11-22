@@ -4304,7 +4304,10 @@ impl App {
             run_debug,
             testing: crate::widgets::testing::TestingPanel::new(),
             codeql: crate::widgets::codeql::CodeqlPanel::new(),
-            test_worker: crate::testing::worker::TestWorker::spawn(root.clone()),
+            test_worker: crate::startup_trace::after(
+                "test runner started",
+                crate::testing::worker::TestWorker::spawn(root.clone()),
+            ),
             test_run_status: None,
             last_test_run: None,
             pane_run_statuses: Vec::new(),
@@ -4322,13 +4325,19 @@ impl App {
             tab_click_target: None,
             macro_recording: None,
             macro_last: None,
-            macro_registers: crate::macros::load(&crate::macros::macros_path()),
+            macro_registers: crate::startup_trace::after(
+                "macros loaded",
+                crate::macros::load(&crate::macros::macros_path()),
+            ),
             macro_replaying: false,
             macros_path: crate::macros::macros_path(),
             config_watch: crate::config_sync::ConfigWatch::new(config_watch_paths(
                 &merged_settings.chain,
             )),
-            snippets: load_all_snippets([root.as_path()]),
+            snippets: crate::startup_trace::after(
+                "snippets loaded",
+                load_all_snippets([root.as_path()]),
+            ),
             format_on_save: loaded_prefs.format_on_save,
             default_formatter: loaded_prefs.default_formatter.clone(),
             language_formatters: loaded_prefs.language_formatters.clone(),
@@ -4612,9 +4621,12 @@ impl App {
             code_scan_seen: None,
             code_scan_list: None,
             code_scan_fetch: None,
-            remote_offer_refused: crate::remote::load_refused_hosts(
-                &crate::remote::refused_hosts_path(&croft_cache_dir()),
-                std::time::SystemTime::now(),
+            remote_offer_refused: crate::startup_trace::after(
+                "refused remote hosts read",
+                crate::remote::load_refused_hosts(
+                    &crate::remote::refused_hosts_path(&croft_cache_dir()),
+                    std::time::SystemTime::now(),
+                ),
             ),
             lane_agent: loaded_prefs.lane_agent.clone(),
             color_depth: loaded_prefs
@@ -4686,7 +4698,10 @@ impl App {
             terminal_profile_buttons: Vec::new(),
             terminal_close_buttons: Vec::new(),
             terminal_collapse_buttons: Vec::new(),
-            consented_extensions: crate::prefs::Prefs::load_or_default().mcp_consented,
+            consented_extensions: crate::startup_trace::after(
+                "extension consents read",
+                crate::prefs::Prefs::load_or_default().mcp_consented,
+            ),
             config_dir: crate::paths::config_dir(),
             settings_profile: if cfg!(test) {
                 None
@@ -4736,13 +4751,16 @@ impl App {
             osk_auto: crate::iterm2_inline::detect_osk_auto(),
             last_content_width: 0,
             last_content_height: 0,
-            lsp: match crate::lsp::LspManager::new(root.clone()) {
-                Ok(m) => Some(m),
-                Err(e) => {
-                    eprintln!("lsp manager init failed: {e}");
-                    None
-                }
-            },
+            lsp: crate::startup_trace::after(
+                "language server manager built",
+                match crate::lsp::LspManager::new(root.clone()) {
+                    Ok(m) => Some(m),
+                    Err(e) => {
+                        eprintln!("lsp manager init failed: {e}");
+                        None
+                    }
+                },
+            ),
             lsp_last_seen: std::collections::HashMap::new(),
             shell_lint_notice_shown: false,
             tool_search_path: std::env::var_os("PATH"),
@@ -4853,14 +4871,17 @@ impl App {
             // files so app tests that run commands or split panes can never
             // touch (or race on) the user's real history / session files;
             // tests that exercise the stores inject their own paths.
-            command_history: crate::command_history::CommandHistory::load(&if cfg!(test) {
-                std::env::temp_dir().join(format!(
-                    "croft-test-command-history-{}.jsonl",
-                    std::process::id()
-                ))
-            } else {
-                crate::command_history::history_path()
-            }),
+            command_history: crate::startup_trace::after(
+                "command history read",
+                crate::command_history::CommandHistory::load(&if cfg!(test) {
+                    std::env::temp_dir().join(format!(
+                        "croft-test-command-history-{}.jsonl",
+                        std::process::id()
+                    ))
+                } else {
+                    crate::command_history::history_path()
+                }),
+            ),
             command_history_popup: None,
             terminal_session_dirty: false,
             terminal_store_error: None,
@@ -4882,8 +4903,14 @@ impl App {
                 crate::workspace::folders_store_path()
             },
             terminal_copy_mode: None,
-            triggers: load_trigger_set(!loaded_prefs.disable_secret_redaction),
-            agents: crate::agents::AgentTable::load(&crate::agents::agents_path()),
+            triggers: crate::startup_trace::after(
+                "triggers loaded",
+                load_trigger_set(!loaded_prefs.disable_secret_redaction),
+            ),
+            agents: crate::startup_trace::after(
+                "agents loaded",
+                crate::agents::AgentTable::load(&crate::agents::agents_path()),
+            ),
             agent_events: std::collections::VecDeque::new(),
             status_agents_rect: Rect::default(),
             status_position_rect: Rect::default(),
@@ -5029,10 +5056,13 @@ impl App {
             review_pending: Vec::new(),
             review_pending_pr: None,
             review_submitting: false,
-            notes: notes_path
-                .as_deref()
-                .map(crate::sticky_notes::Notes::load)
-                .unwrap_or_default(),
+            notes: crate::startup_trace::after(
+                "sticky notes read",
+                notes_path
+                    .as_deref()
+                    .map(crate::sticky_notes::Notes::load)
+                    .unwrap_or_default(),
+            ),
             notes_path,
             note_box_ids: std::collections::HashMap::new(),
             notes_shown_gen: 0,

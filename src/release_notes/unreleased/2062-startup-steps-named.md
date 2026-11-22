@@ -1,0 +1,1 @@
+fix: The startup trace (~/.cache/croft/startup-trace.txt) now times each step of building the editor that reads a file or starts a thread, such as macros, snippets, the command history and the language server manager, so a launch that is slow there says which step held it.
