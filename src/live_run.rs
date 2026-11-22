@@ -348,10 +348,24 @@ impl Runner {
         self.worker.poll()
     }
 
-    /// Start a runner that stopped after crashing twice again, as Live Run
-    /// is turned on; true when it did.
-    pub fn restart_if_stopped(&mut self) -> bool {
-        self.worker.is_stopped() && self.worker.restart().is_ok()
+    /// Start the runner again as Live Run is turned on, if it stopped after
+    /// crashing twice or its thread has ended where no tick saw it yet;
+    /// true when a fresh thread started, so what the old one was sent must
+    /// be sent again.
+    pub fn restart_if_down(&mut self) -> std::io::Result<bool> {
+        self.worker.restart_if_down()
+    }
+
+    /// Whether it stopped after crashing twice: nothing is sent to it then.
+    pub fn is_stopped(&self) -> bool {
+        self.worker.is_stopped()
+    }
+
+    /// Whether its thread has ended, for a test that must see a crash no
+    /// tick has seen.
+    #[cfg(test)]
+    pub fn has_ended(&mut self) -> bool {
+        self.worker.has_ended()
     }
 }
 

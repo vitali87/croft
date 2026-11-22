@@ -2429,16 +2429,21 @@ impl App {
             self.status = format!("Live Run: off for {name}");
             return;
         }
-        self.live_run_files.insert(path);
         let runner = self
             .live_run_runner
             .get_or_insert_with(crate::live_run::Runner::spawn);
-        // A runner that stopped after crashing twice starts again: what
-        // it was sent went with it, so every armed file is sent again
-        // (#2597).
-        if runner.restart_if_stopped() {
-            self.live_run_sent.clear();
+        // A runner that stopped after crashing twice, or whose thread has
+        // ended where no tick saw it, starts again: what it was sent went
+        // with it, so every armed file is sent again (#2597).
+        match runner.restart_if_down() {
+            Ok(true) => self.live_run_sent.clear(),
+            Ok(false) => {}
+            Err(e) => {
+                self.status = format!("Live Run could not start its runner: {e}");
+                return;
+            }
         }
+        self.live_run_files.insert(path);
         self.status = format!("Live Run: on for {name}, re-running on every pause in typing");
     }
 
@@ -2537,14 +2542,17 @@ impl App {
         let root = self.roots.primary().to_path_buf();
         let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
         let python = project_python_for(&dir, &root);
-        self.live_run_sent.insert(path.clone(), lines.clone());
-        if let Some(runner) = &self.live_run_runner {
-            runner.submit(crate::live_run::Job {
-                path,
-                lines,
-                python,
-            });
-        }
+        // Nothing is sent to a runner that stopped, so nothing reads as
+        // sent: turning Live Run on starts it again and sends the file.
+        let Some(runner) = self.live_run_runner.as_ref().filter(|r| !r.is_stopped()) else {
+            return changed;
+        };
+        runner.submit(crate::live_run::Job {
+            path: path.clone(),
+            lines: lines.clone(),
+            python,
+        });
+        self.live_run_sent.insert(path, lines);
         changed
     }
 }
