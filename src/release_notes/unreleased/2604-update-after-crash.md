@@ -1,0 +1,1 @@
+fix: A croft update or rebuild whose background thread crashed now fails and says so, with Retry or the updater chord ready to try again, instead of the status bar spinning "Updating croft" for good and every new try answering "croft is already updating in the background".

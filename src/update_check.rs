@@ -20,6 +20,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, channel};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use crate::update_watch::UpdateEvent;
@@ -646,78 +647,98 @@ pub fn failure_reason(log: &str) -> &'static str {
     }
 }
 
+/// Why a staged build did not install when its thread crashed before it
+/// finished, in the words the popup and status line use.
+pub const CRASHED_REASON: &str = "the update's thread crashed";
+
+/// What a staged build's work is given: where to send its progress, and
+/// where to record why it failed before it sends `Failed`.
+type StageWork = dyn FnOnce(&crate::jobs::Sink<UpdateEvent>, &Mutex<Option<&'static str>>) + Send;
+
 /// A background staged build, reported through the same [`UpdateEvent`]
 /// lifecycle the remote watcher and the drift reinstall use so the app's
 /// spinner and "ready" pill need no third state machine.
 pub struct StagedInstall {
-    rx: Receiver<UpdateEvent>,
+    /// The build's progress, until it ends or its thread dies.
+    progress: Option<crate::jobs::Stream<UpdateEvent>>,
     binary: PathBuf,
     pub version: String,
     /// Why it failed, set before `Failed` is sent (#1844).
-    failure: std::sync::Arc<std::sync::Mutex<Option<&'static str>>>,
+    failure: Arc<Mutex<Option<&'static str>>>,
 }
 
 impl StagedInstall {
-    /// Build output lands in `log_path` so a failure is diagnosable.
+    /// Build output lands in `log_path` so a failure is diagnosable. Fails
+    /// only when no thread can be started.
     // Tests never download or build croft: the app stages a preloaded
     // install instead.
     #[cfg_attr(test, allow(dead_code))]
-    pub fn start(cache_dir: PathBuf, version: String, log_path: PathBuf) -> Self {
-        let (tx, rx) = channel();
+    pub fn start(cache_dir: PathBuf, version: String, log_path: PathBuf) -> std::io::Result<Self> {
         let binary = staged_binary_path(&cache_dir);
         let stage_root = cache_dir.join(STAGE_DIR);
         let ver = version.clone();
-        let failure = std::sync::Arc::new(std::sync::Mutex::new(None));
-        let failure_tx = failure.clone();
-        std::thread::spawn(move || {
-            let _ = tx.send(UpdateEvent::InProgress);
-            if let Some(dir) = log_path.parent() {
-                let _ = std::fs::create_dir_all(dir);
-            }
-            let build = || {
-                stage_command(
-                    crate::widgets::dependencies::cargo_binary(),
-                    &ver,
-                    &stage_root,
-                )
-                .output()
-            };
-            let cache = crate::session_state::dirs_cache_croft().join("prebuilt");
-            let prepare = |version: &str, triple: &str| {
-                crate::remote_prebuilt::prepare(
-                    version,
-                    triple,
-                    &cache,
-                    &crate::remote_prebuilt::http_get,
-                    &crate::remote_prebuilt::cosign_verify,
-                )
-            };
-            // A release binary only stands in for a release: a croft from
-            // crates.io or a release archive, never a source build.
-            let prebuilt = prebuilt_triple()
-                .filter(|_| crate::remote_prebuilt::eligible(env!("CARGO_MANIFEST_DIR")))
-                .map(|t| (t, &prepare as &PrepareRelease<'_>));
-            let staged = staged_binary_path(&cache_dir);
-            let (event, log) = stage_update(&ver, &staged, prebuilt, &build);
-            if event == UpdateEvent::Failed
-                && let Ok(mut reason) = failure_tx.lock()
-            {
-                *reason = Some(failure_reason(&log));
-            }
-            let _ = std::fs::write(&log_path, log);
-            let _ = tx.send(event);
-        });
-        Self {
-            rx,
+        Self::spawn_with(
+            binary,
+            version,
+            Box::new(move |progress, failure| {
+                progress.send(UpdateEvent::InProgress);
+                if let Some(dir) = log_path.parent() {
+                    let _ = std::fs::create_dir_all(dir);
+                }
+                let build = || {
+                    stage_command(
+                        crate::widgets::dependencies::cargo_binary(),
+                        &ver,
+                        &stage_root,
+                    )
+                    .output()
+                };
+                let cache = crate::session_state::dirs_cache_croft().join("prebuilt");
+                let prepare = |version: &str, triple: &str| {
+                    crate::remote_prebuilt::prepare(
+                        version,
+                        triple,
+                        &cache,
+                        &crate::remote_prebuilt::http_get,
+                        &crate::remote_prebuilt::cosign_verify,
+                    )
+                };
+                // A release binary only stands in for a release: a croft from
+                // crates.io or a release archive, never a source build.
+                let prebuilt = prebuilt_triple()
+                    .filter(|_| crate::remote_prebuilt::eligible(env!("CARGO_MANIFEST_DIR")))
+                    .map(|t| (t, &prepare as &PrepareRelease<'_>));
+                let staged = staged_binary_path(&cache_dir);
+                let (event, log) = stage_update(&ver, &staged, prebuilt, &build);
+                if event == UpdateEvent::Failed {
+                    *failure.lock().unwrap_or_else(PoisonError::into_inner) =
+                        Some(failure_reason(&log));
+                }
+                let _ = std::fs::write(&log_path, log);
+                progress.send(event);
+            }),
+        )
+    }
+
+    /// Run `work` as the `croft-update` stream.
+    fn spawn_with(binary: PathBuf, version: String, work: Box<StageWork>) -> std::io::Result<Self> {
+        let failure = Arc::new(Mutex::new(None));
+        let failure_for_work = Arc::clone(&failure);
+        let progress =
+            crate::jobs::Stream::spawn("croft-update", crate::jobs::Start::Now, move |progress| {
+                work(progress, &failure_for_work)
+            })?;
+        Ok(Self {
+            progress: Some(progress),
             binary,
             version,
             failure,
-        }
+        })
     }
 
     /// Why the staging failed, once `Failed` has been sent.
     pub fn failure_reason(&self) -> Option<&'static str> {
-        self.failure.lock().ok().and_then(|r| *r)
+        *self.failure.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// The staged binary's path (present once `Ready` was sent).
@@ -725,22 +746,31 @@ impl StagedInstall {
         &self.binary
     }
 
-    pub fn drain(&self) -> Vec<UpdateEvent> {
+    /// The events sent since the last call. A build whose thread crashed
+    /// before it finished ends with `Failed`, for [`CRASHED_REASON`], so
+    /// nothing it showed stays in progress.
+    pub fn drain(&mut self) -> Vec<UpdateEvent> {
         let mut out = Vec::new();
-        while let Ok(ev) = self.rx.try_recv() {
-            out.push(ev);
+        while let Some(progress) = self.progress.as_ref() {
+            match progress.poll() {
+                crate::jobs::StreamPoll::Update(event) => out.push(event),
+                crate::jobs::StreamPoll::Pending => break,
+                crate::jobs::StreamPoll::Ended => self.progress = None,
+                crate::jobs::StreamPoll::Died => {
+                    self.progress = None;
+                    *self.failure.lock().unwrap_or_else(PoisonError::into_inner) =
+                        Some(CRASHED_REASON);
+                    out.push(UpdateEvent::Failed);
+                }
+            }
         }
         out
     }
 
     #[cfg(test)]
     pub fn preloaded(events: &[UpdateEvent], binary: PathBuf, version: &str) -> Self {
-        let (tx, rx) = channel();
-        for ev in events {
-            let _ = tx.send(*ev);
-        }
         Self {
-            rx,
+            progress: Some(crate::jobs::Stream::running(events.iter().copied())),
             binary,
             version: version.to_string(),
             failure: Default::default(),
@@ -752,6 +782,20 @@ impl StagedInstall {
     pub fn failing_with(self, reason: &'static str) -> Self {
         *self.failure.lock().unwrap() = Some(reason);
         self
+    }
+
+    /// A staging whose thread reports the build under way and then crashes.
+    #[cfg(test)]
+    pub fn crashing(version: &str) -> Self {
+        Self::spawn_with(
+            PathBuf::new(),
+            version.to_string(),
+            Box::new(|progress, _| {
+                progress.send(UpdateEvent::InProgress);
+                panic!("the staged build crashed (on purpose, in a test)")
+            }),
+        )
+        .unwrap()
     }
 }
 
