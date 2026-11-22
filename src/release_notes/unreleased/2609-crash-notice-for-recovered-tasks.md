@@ -1,0 +1,1 @@
+fix: The status line's notice that a background task crashed no longer tells you to save and restart croft when croft recovered that task, and no longer replaces the task's own message saying how to start it again.

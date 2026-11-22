@@ -1687,6 +1687,8 @@ impl App {
                 self.voice_handle = None;
                 self.voice_canceling = false;
                 self.status = String::from(VOICE_READER_CRASHED);
+                // This says what the crash cost: the generic notice stays away.
+                claim_background_panic(crate::voice::THREAD);
                 return true;
             }
         };

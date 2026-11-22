@@ -23,6 +23,9 @@ use crate::jobs::{Start, Worker, WorkerPoll};
 use crate::output::{self, OutputLevel};
 use crate::widgets::testing::TestingPanel;
 
+/// The name of the test runner's thread, which the crash notice names.
+pub const RUNNER_THREAD: &str = "test-runner";
+
 mod commands;
 mod control;
 mod coverage;

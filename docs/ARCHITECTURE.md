@@ -113,7 +113,7 @@ src/
 │   ├── clipboard.rs      the relay's clipboard requests: pasting from and copying to this machine's clipboard
 │   ├── config_push.rs    pushing the user's config to the remote; `croft sync-config` and its diff
 │   ├── config_repush.rs  re-pushing changed config during a session over the bulk lane
-│   ├── control.rs        the SSH control master: starting or adopting it, commands over its socket
+│   ├── control.rs        the SSH control master: starting or adopting it, commands over its socket, and closing one an install could not use (#2610)
 │   ├── cross_build.rs    building a static croft for the remote here: toolchain probes, the build, shipping it
 │   ├── forward.rs        the relay's open and forward requests: links in the local browser, forwarded ports
 │   ├── hosts.rs          the hosts in ~/.ssh/config, and the host a running ssh's argv names
@@ -1654,7 +1654,7 @@ Background work that runs off the UI thread and hands back one result, which the
 
 **A start choice, made on purpose.** `Job::spawn` takes a `Start` with no default: `Now` for work someone is waiting on, `AfterFirstFrame` for work the first frame does not need, which then waits on `startup_gate`.
 
-**A thread named after the job.** The crash notice (`poll_background_panic`) names the thread that crashed, so a crashed job says which one it was.
+**A thread named after the job.** The crash notice (`poll_background_panic`) names the thread that crashed, so a crashed job says which one it was. A job's, stream's or worker's thread is marked as one croft recovers from (`on_supervised_thread`), so its notice says croft carried on, where any other thread's still says to save and restart; and the notice is shown before the polls that settle the task, and a task that says what its crash cost claims its notice (`claim_background_panic`), so that message is the one left on the status line. Crashes between two notices are all named, and one croft did not recover from keeps the advice to restart (#2609).
 
 **A dead job is not a running one.** `poll` reports `Died` when the job's thread ended without a result, which a channel whose sender the `App` also kept could never see: Check Project stayed "already running" after its thread crashed (#2562). Go to File's index is built by the `file-index` job: a rebuild queued while one runs starts when that one ends, whether it landed or crashed, where it used to wait for the next file change after a crash (#2618). A thread that cannot be started at all is an error from `spawn`, reported where it happens. The places that collect a background thread's result by hand move onto this module one at a time (#2062).
 

@@ -249,9 +249,11 @@ impl App {
         }
         if self.testing.take_stopped() {
             self.status = String::from(TEST_RUNNER_CRASHED);
+            claim_background_panic(crate::testing::worker::RUNNER_THREAD);
         }
         if self.test_worker.take_stopped() {
             self.status = String::from(TEST_RUNNER_STOPPED);
+            claim_background_panic(crate::testing::worker::RUNNER_THREAD);
         }
     }
 
@@ -2523,6 +2525,7 @@ impl App {
         // After what landed before it, so no run's summary hides it.
         if stopped {
             self.status = String::from(LIVE_RUN_STOPPED);
+            claim_background_panic(crate::live_run::THREAD);
             changed = true;
         }
         let tab = &*self.editor;
