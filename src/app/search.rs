@@ -143,12 +143,13 @@ impl App {
         }
     }
 
-    /// The workspace's folders changed under the panel: a run still
-    /// scanning the old ones is cut short, and anything it still sends is
-    /// dropped (#2608).
+    /// The workspace's folders changed under the panel: anything a run
+    /// still sends is for the old folders and is dropped, even from a run
+    /// already counted as stopped, whose events may still be on the way
+    /// (#2612 review); a run that had not finished is cut short (#2608).
     pub(super) fn search_roots_changed(&mut self) {
-        if self.search.progress == SearchProgress::Running {
-            self.search.run += 1;
+        self.search.run += 1;
+        if self.search.progress != SearchProgress::Finished {
             self.search.progress = SearchProgress::Cancelled;
         }
     }
