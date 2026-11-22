@@ -1,1 +1,0 @@
-fix: After Live Run's runner thread crashes, it starts again and runs the armed file again, instead of its values staying frozen for good, even after turning Live Run off and on; if it crashes again within a minute it stops and says so, and turning Live Run on for a file starts it again.

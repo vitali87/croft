@@ -1,1 +1,0 @@
-fix: After the test runner's thread crashes, the run it was on ends as stopped and says so, instead of Testing staying on "Running" and refusing every run until a restart; the runner it left is killed, the next run works, and if it crashes again within a minute it stops and says so until the next run.
