@@ -827,14 +827,20 @@ impl App {
                         crate::gh::signed_out(status).then(|| String::from(crate::gh::SIGNED_OUT))
                     }
                     // No output: gh did not start, or ran past the budget.
-                    None => std::process::Command::new(&self.review_gh)
-                        .arg("--version")
-                        .stdin(std::process::Stdio::null())
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .status()
+                    None => {
+                        let mut probe = std::process::Command::new(&self.review_gh);
+                        probe
+                            .arg("--version")
+                            .stdin(std::process::Stdio::null())
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null());
+                        crate::review_ops::retry_while_busy(
+                            || probe.status(),
+                            |r| r.as_ref().is_err_and(crate::review_ops::text_file_busy),
+                        )
                         .err()
-                        .map(|e| crate::gh::spawn_error(&e, Some(root))),
+                        .map(|e| crate::gh::spawn_error(&e, Some(root)))
+                    }
                 };
                 self.status = match why {
                     Some(why) => format!("Could not find this branch's PR: {why}"),
@@ -1792,19 +1798,27 @@ impl App {
 
 /// Run `cmd` for at most `budget`, collecting stdout; None when it could not
 /// start or ran out of time (it is then killed and reaped). For the few
-/// short commands that still run on the UI thread.
+/// short commands that still run on the UI thread. A program just written,
+/// such as a freshly installed `gh`, is waited out while it is "Text file
+/// busy" (#2422), as croft's other `gh` calls do, and that wait comes out of
+/// the same budget.
 pub(super) fn bounded_output(
     cmd: &mut std::process::Command,
     budget: std::time::Duration,
 ) -> Option<(std::process::ExitStatus, Vec<u8>)> {
     use std::io::Read;
     let deadline = std::time::Instant::now() + budget;
-    let mut child = cmd
-        .stdin(std::process::Stdio::null())
+    cmd.stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .ok()?;
+        .stderr(std::process::Stdio::null());
+    let mut child = crate::review_ops::retry_while_busy(
+        || cmd.spawn(),
+        |r| {
+            r.as_ref().is_err_and(crate::review_ops::text_file_busy)
+                && std::time::Instant::now() < deadline
+        },
+    )
+    .ok()?;
     let mut stdout = child.stdout.take()?;
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -1812,7 +1826,9 @@ pub(super) fn bounded_output(
         let _ = stdout.read_to_end(&mut buf);
         let _ = tx.send(buf);
     });
-    let bytes = rx.recv_timeout(budget).ok();
+    let bytes = rx
+        .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+        .ok();
     loop {
         match child.try_wait() {
             Ok(Some(status)) => return bytes.map(|b| (status, b)),
