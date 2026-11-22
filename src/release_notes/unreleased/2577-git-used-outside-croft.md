@@ -1,1 +1,0 @@
-fix: A commit, checkout, staging, fetch or push run outside croft now shows in Source Control within a moment, as in VS Code, instead of only after a file in the folder changed or Source Control was opened again.

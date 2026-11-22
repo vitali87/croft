@@ -1,1 +1,0 @@
-refactor: A background worker that stopped after crashing twice is said to have stopped once by the shared worker type, rather than by a flag of its own in the git status worker and the test runner (#2062). Nothing changes in use.
