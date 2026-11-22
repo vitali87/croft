@@ -280,7 +280,7 @@ fn a_history_reply_does_not_replace_the_lane_diff() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-    while app.graph_fetch_inflight {
+    while app.graph_fetch.is_some() {
         app.sync_explorer_panels();
         assert!(
             std::time::Instant::now() < deadline,
@@ -330,16 +330,14 @@ fn a_history_reply_does_not_replace_the_lane_diff() {
 
     // A plain history reply for the SAME root arrives (revspec None) carrying
     // a DIFFERENT commit. Same root, different view: the tag must drop it.
-    app.graph_tx
-        .send((
-            app.active_scm_root.clone(),
-            None,
-            crate::widgets::commit_graph::layout_graph(vec![row(
-                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-                "a background history refresh",
-            )]),
-        ))
-        .unwrap();
+    app.graph_fetch = Some(crate::jobs::Job::finished((
+        app.active_scm_root.clone(),
+        None,
+        crate::widgets::commit_graph::layout_graph(vec![row(
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "a background history refresh",
+        )]),
+    )));
     app.sync_explorer_panels();
     assert_eq!(
         shown(&mut app, &mut term),
@@ -349,16 +347,14 @@ fn a_history_reply_does_not_replace_the_lane_diff() {
 
     // The matching reply IS taken, so the drop above is the tag working
     // rather than the channel being dead.
-    app.graph_tx
-        .send((
-            app.active_scm_root.clone(),
-            Some(String::from("main..lane")),
-            crate::widgets::commit_graph::layout_graph(vec![row(
-                "cccccccccccccccccccccccccccccccccccccccc",
-                "the refreshed lane diff",
-            )]),
-        ))
-        .unwrap();
+    app.graph_fetch = Some(crate::jobs::Job::finished((
+        app.active_scm_root.clone(),
+        Some(String::from("main..lane")),
+        crate::widgets::commit_graph::layout_graph(vec![row(
+            "cccccccccccccccccccccccccccccccccccccccc",
+            "the refreshed lane diff",
+        )]),
+    )));
     app.sync_explorer_panels();
     assert_eq!(
         shown(&mut app, &mut term),

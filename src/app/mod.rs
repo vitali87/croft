@@ -1368,11 +1368,12 @@ pub struct App {
     /// The Source Control COMMITS section: the repo-wide commit graph with
     /// lane rails, stacked under the change list. See [`CommitGraphPanel`].
     pub commit_graph: crate::widgets::commit_graph::CommitGraphPanel,
-    /// Background `git log --topo-order` + lane layout for the COMMITS
-    /// section, tagged by the root it describes so a stale reply after a
-    /// Make Root is ignored on drain.
-    graph_rx: GraphReplyRx,
-    graph_tx: GraphReplyTx,
+    /// The COMMITS section's fetch in flight, if one is: background `git log
+    /// --topo-order` plus the lane layout. Its reply is tagged by the root it
+    /// describes, so a stale reply after a Make Root is ignored on drain.
+    /// While it runs, a burst of StatusAndChanges responses spawns no
+    /// duplicates; one whose thread crashed is no longer running (#2564).
+    graph_fetch: Option<crate::jobs::Job<GraphReply>>,
     /// What the COMMITS panel is currently showing: `None` for the root's
     /// own history, `Some("base..lane")` for a worktree lane's diff (#348).
     ///
@@ -1381,9 +1382,6 @@ pub struct App {
     /// already discarded replies for a since-left ROOT, and this is the same
     /// rule at the resolution the lane diff needs.
     graph_revspec: Option<String>,
-    /// A graph fetch is running; suppresses duplicate spawns when a burst of
-    /// StatusAndChanges responses lands. Cleared when the reply drains.
-    graph_fetch_inflight: bool,
     /// A refresh was requested while a fetch was in flight (Make Root, a
     /// newer HEAD): re-fire once the stale reply drains instead of dropping
     /// the request (see [`Self::refresh_commit_graph`]).
@@ -4212,7 +4210,6 @@ impl App {
         let (history_done_tx, history_done_rx) = std::sync::mpsc::channel();
         let (project_hint_tx, project_hint_rx) = std::sync::mpsc::channel();
         let (test_jump_tx, test_jump_rx) = std::sync::mpsc::channel();
-        let (graph_tx, graph_rx) = std::sync::mpsc::channel();
         let (blame_tx, blame_rx) = std::sync::mpsc::channel();
         let (deps_tx, deps_rx) = std::sync::mpsc::channel();
         let (voice_tx, voice_rx) = std::sync::mpsc::channel();
@@ -4293,10 +4290,8 @@ impl App {
             remote,
             source_control,
             commit_graph: crate::widgets::commit_graph::CommitGraphPanel::new(),
-            graph_rx,
             graph_revspec: None,
-            graph_tx,
-            graph_fetch_inflight: false,
+            graph_fetch: None,
             graph_refetch_queued: false,
             run_debug,
             testing: crate::widgets::testing::TestingPanel::new(),
