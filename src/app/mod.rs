@@ -1646,16 +1646,14 @@ pub struct App {
     /// TIMELINE once the snapshot actually exists on disk.
     history_done_rx: std::sync::mpsc::Receiver<PathBuf>,
     history_done_tx: std::sync::mpsc::Sender<PathBuf>,
-    /// The whole-project check's result: where it ran, and what the process
-    /// did (#256). The `io::Result` carries a spawn failure separately from
-    /// a run that produced output, because those need different messages.
+    /// The whole-project check in flight, if one is (#256). Its result is
+    /// where it ran and what the process did; the `io::Result` carries a
+    /// spawn failure separately from a run that produced output, because
+    /// those need different messages. While it runs, a second invocation
+    /// says so rather than stacking compilers; one whose thread crashed is
+    /// no longer running (#2562).
     #[allow(clippy::type_complexity)]
-    project_check_rx: std::sync::mpsc::Receiver<(PathBuf, std::io::Result<std::process::Output>)>,
-    #[allow(clippy::type_complexity)]
-    project_check_tx: std::sync::mpsc::Sender<(PathBuf, std::io::Result<std::process::Output>)>,
-    /// Whether a sweep is in flight, so a second invocation says so rather
-    /// than stacking compilers.
-    project_check_running: bool,
+    project_check: Option<crate::jobs::Job<(PathBuf, std::io::Result<std::process::Output>)>>,
     /// How many rows the last sweep produced (#256), counted before its
     /// items join a store shared with every other producer.
     project_check_rows: usize,
@@ -4212,7 +4210,6 @@ impl App {
         let (timeline_tx, timeline_rx) = std::sync::mpsc::channel();
         let (codeql_size_tx, codeql_size_rx) = std::sync::mpsc::channel();
         let (history_done_tx, history_done_rx) = std::sync::mpsc::channel();
-        let (project_check_tx, project_check_rx) = std::sync::mpsc::channel();
         let (project_hint_tx, project_hint_rx) = std::sync::mpsc::channel();
         let (test_jump_tx, test_jump_rx) = std::sync::mpsc::channel();
         let (graph_tx, graph_rx) = std::sync::mpsc::channel();
@@ -4376,9 +4373,7 @@ impl App {
             codeql_size_pending: std::collections::HashSet::new(),
             history_done_rx,
             history_done_tx,
-            project_check_rx,
-            project_check_tx,
-            project_check_running: false,
+            project_check: None,
             project_check_rows: 0,
             project_hint_rx,
             project_hint_tx,

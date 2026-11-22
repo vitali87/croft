@@ -252,10 +252,22 @@ impl App {
     /// the user their code is fine when the checker never checked it.
     /// Otherwise the count is this producer's own, not the panel's.
     pub(super) fn drain_project_check(&mut self) -> bool {
-        let Ok((cwd, done)) = self.project_check_rx.try_recv() else {
+        let Some(job) = self.project_check.as_ref() else {
             return false;
         };
-        self.project_check_running = false;
+        let (cwd, done) = match job.poll() {
+            crate::jobs::Poll::Pending => return false,
+            // The check's thread crashed. The crash notice has said so; the
+            // check is no longer running, so the next one can start (#2562).
+            crate::jobs::Poll::Died => {
+                self.project_check = None;
+                return true;
+            }
+            crate::jobs::Poll::Done(result) => {
+                self.project_check = None;
+                result
+            }
+        };
         match done {
             Err(e) => {
                 // true, not false: the status changed, so the frame must be
@@ -293,7 +305,7 @@ impl App {
         }
     }
 
-    /// Queue a finished check on the REAL channel WITHOUT draining (#256).
+    /// Queue a finished check as the REAL job WITHOUT draining (#256).
     ///
     /// Test-only. The sibling helper drains immediately, which is right for
     /// testing the reporting logic but wrong for the same-tick race: the
@@ -313,8 +325,7 @@ impl App {
             stdout: stdout.as_bytes().to_vec(),
             stderr: stderr.as_bytes().to_vec(),
         };
-        self.project_check_running = true;
-        let _ = self.project_check_tx.send((cwd.to_path_buf(), Ok(out)));
+        self.project_check = Some(crate::jobs::Job::finished((cwd.to_path_buf(), Ok(out))));
     }
 
     /// Whether the session's one-shot size hint has been spent (#256).
@@ -333,11 +344,11 @@ impl App {
         let _ = self.project_hint_tx.send(());
     }
 
-    /// Push a finished check through the REAL channel and drain it (#256).
+    /// Hand a finished check to the REAL job slot and drain it (#256).
     ///
-    /// Test-only, and deliberately not a shortcut: it sends down
-    /// `project_check_tx` and calls `drain_project_check`, so the reporting
-    /// logic under test is the shipped one. A helper that set the status
+    /// Test-only, and deliberately not a shortcut: it fills `project_check`
+    /// and calls `drain_project_check`, so the reporting logic under test is
+    /// the shipped one. A helper that set the status
     /// itself would pass while the drain was broken.
     /// Unix-only: `ExitStatusExt::from_raw` has a different meaning on
     /// Windows, and an ungated spawning helper breaks that target's test
@@ -356,8 +367,7 @@ impl App {
             stdout: stdout.as_bytes().to_vec(),
             stderr: stderr.as_bytes().to_vec(),
         };
-        self.project_check_running = true;
-        let _ = self.project_check_tx.send((cwd.to_path_buf(), Ok(out)));
+        self.project_check = Some(crate::jobs::Job::finished((cwd.to_path_buf(), Ok(out))));
         self.drain_project_check();
     }
 

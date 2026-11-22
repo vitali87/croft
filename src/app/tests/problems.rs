@@ -1232,6 +1232,33 @@ fn the_project_check_checks_each_referenced_tsconfig() {
     assert_eq!(status, "Whole-project check: 1 problem");
 }
 
+/// #2562: a check whose thread crashed is no longer running. The crash
+/// notice tells the user; the next Check Project then runs, instead of
+/// answering "A whole-project check is already running" until a restart.
+#[cfg(unix)]
+#[test]
+fn a_project_check_whose_thread_crashed_lets_the_next_one_run() {
+    let tmp = fake_tsc_workspace(r#"{ "files": ["src/main.ts"] }"#);
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.project_check = Some(
+        crate::jobs::Job::spawn("check-project", crate::jobs::Start::Now, || {
+            panic!("the check crashed (on purpose, in a test)")
+        })
+        .unwrap(),
+    );
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(1),
+        "the crashed check to settle",
+        || {
+            app.drain_project_check();
+            app.project_check.is_none()
+        },
+    );
+    app.run_command(crate::widgets::command_palette::Command::ProblemsCheckProject);
+    assert_eq!(app.status, "Checking the whole project...");
+    assert!(app.project_check.is_some(), "the next check started");
+}
+
 /// A root tsconfig with `references` that also owns files gets its own
 /// `--noEmit` run: tsc does not check references on a plain project
 /// check, so skipping the root would hide its files' errors (#1291).
