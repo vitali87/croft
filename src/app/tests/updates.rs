@@ -584,8 +584,8 @@ fn clicking_update_leaves_one_progress_indicator() {
 }
 
 /// A staged build whose thread crashed ends as a failed one: the spinner
-/// stops, the popup says why and offers Retry, and the update can be started
-/// again. It used to spin for good, and every try answered "croft is already
+/// stops, the popup says why and offers Retry, the status line is left to the
+/// crash notice, and the update can be started again. It used to spin for good, and every try answered "croft is already
 /// updating in the background" until a restart.
 #[test]
 fn a_staged_build_whose_thread_crashed_fails_and_can_be_retried() {
@@ -603,9 +603,8 @@ fn a_staged_build_whose_thread_crashed_fails_and_can_be_retried() {
     );
     assert!(!app.any_update_in_progress(), "the spinner stopped");
     assert!(
-        app.status
-            .contains("croft v9.9.9 was not installed: the update's thread crashed (still on v"),
-        "{}",
+        !app.status.contains("not installed"),
+        "the status line is left to the crash notice: {}",
         app.status
     );
     let toast = app.update_toast.as_ref().expect("the popup is back");
@@ -623,7 +622,8 @@ fn a_staged_build_whose_thread_crashed_fails_and_can_be_retried() {
 }
 
 /// A drift rebuild whose thread crashed ends as a failed one: the spinner
-/// stops, the status line says so, and the updater can rebuild again. It
+/// stops, the status line is left to the crash notice, and the updater can
+/// rebuild again. It
 /// used to spin for good, with every try "already updating".
 #[test]
 fn a_rebuild_whose_thread_crashed_fails_and_can_be_started_again() {
@@ -640,9 +640,10 @@ fn a_rebuild_whose_thread_crashed_fails_and_can_be_started_again() {
         },
     );
     assert!(!app.any_update_in_progress(), "the spinner stopped");
-    assert_eq!(
-        app.status,
-        "croft rebuild failed: its thread crashed (still on the old binary)"
+    assert!(
+        !app.status.contains("rebuild failed"),
+        "the status line is left to the crash notice: {}",
+        app.status
     );
     app.run_command(crate::widgets::command_palette::Command::UpdateCroft);
     assert!(
