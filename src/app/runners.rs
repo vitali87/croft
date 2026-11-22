@@ -2430,8 +2430,15 @@ impl App {
             return;
         }
         self.live_run_files.insert(path);
-        self.live_run_runner
+        let runner = self
+            .live_run_runner
             .get_or_insert_with(crate::live_run::Runner::spawn);
+        // A runner that stopped after crashing twice starts again: what
+        // it was sent went with it, so every armed file is sent again
+        // (#2597).
+        if runner.restart_if_stopped() {
+            self.live_run_sent.clear();
+        }
         self.status = format!("Live Run: on for {name}, re-running on every pause in typing");
     }
 
@@ -2464,9 +2471,22 @@ impl App {
         }
         let mut changed = false;
         let mut landed = Vec::new();
-        if let Some(runner) = &self.live_run_runner {
-            while let Some(done) = runner.try_recv() {
-                landed.push(done);
+        let mut stopped = false;
+        if let Some(runner) = &mut self.live_run_runner {
+            loop {
+                match runner.poll() {
+                    crate::jobs::WorkerPoll::Answer(done) => landed.push(done),
+                    crate::jobs::WorkerPoll::Idle => break,
+                    // Its thread crashed, and the crash notice said so.
+                    // What it was sent went with it, so each armed file is
+                    // sent to the fresh one again once typing has paused
+                    // (#2597).
+                    crate::jobs::WorkerPoll::Restarted => self.live_run_sent.clear(),
+                    crate::jobs::WorkerPoll::Stopped => {
+                        stopped = true;
+                        break;
+                    }
+                }
             }
         }
         for done in landed {
@@ -2493,6 +2513,11 @@ impl App {
                     }
                 }
             }
+            changed = true;
+        }
+        // After what landed before it, so no run's summary hides it.
+        if stopped {
+            self.status = String::from(LIVE_RUN_STOPPED);
             changed = true;
         }
         let tab = &*self.editor;
@@ -2800,6 +2825,11 @@ pub(super) fn cwd_matches(cwd: Option<&Path>, root: &Path, observable: bool) -> 
 
 /// The status a run gesture gets while another run is in flight (#1534).
 pub(super) const TEST_RUN_IN_PROGRESS: &str = "A test run is in progress (s in Testing stops it)";
+
+/// The status when Live Run's runner crashed again soon after a restart and
+/// waits to be turned on again (#2597).
+pub(super) const LIVE_RUN_STOPPED: &str =
+    "Live Run stopped after its runner crashed twice: turning it on for a file starts it again";
 
 /// The status when the test runner crashed with a run in flight (#2592).
 pub(super) const TEST_RUNNER_CRASHED: &str = "Test run stopped: the test runner crashed";

@@ -1460,6 +1460,51 @@ fn live_run_lands_a_real_run_on_the_tab() {
     assert!(app.status.starts_with("Live Run: ok"), "{}", app.status);
 }
 
+/// Tick Live Run until `done`, within a load-scaled five seconds.
+fn tick_live_run_until(app: &mut App, what: &str, mut done: impl FnMut(&App) -> bool) {
+    crate::test_budget::await_spawned(std::time::Duration::from_secs(5), what, || {
+        app.tick_live_run();
+        done(app)
+    });
+}
+
+/// #2597: Live Run's runner crashing on the armed file's run is started
+/// again, and the file is sent to the fresh one, so its values land
+/// instead of staying frozen for good.
+#[test]
+fn live_run_whose_runner_crashed_runs_the_file_again() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.py", "x = 1\n");
+    app.live_run_runner = Some(crate::live_run::Runner::crashing(1));
+    app.run_command(crate::widgets::command_palette::Command::ToggleLiveRun);
+    tick_live_run_until(&mut app, "the run after the crash", |app| {
+        app.editor.live_run.is_some()
+    });
+    assert_eq!(app.status, "Live Run: ok (stand-in)");
+}
+
+/// #2597: a runner that crashes again soon after its restart stops and
+/// says so, and turning Live Run on for a file starts it again.
+#[test]
+fn live_run_whose_runner_crashed_twice_stops_until_turned_on() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "a.py", "x = 1\n");
+    app.live_run_runner = Some(crate::live_run::Runner::crashing(2));
+    app.run_command(crate::widgets::command_palette::Command::ToggleLiveRun);
+    tick_live_run_until(&mut app, "the runner to stop", |app| {
+        app.status == LIVE_RUN_STOPPED
+    });
+    assert!(app.editor.live_run.is_none(), "no run landed");
+    app.status.clear();
+    app.tick_live_run();
+    assert_eq!(app.status, "", "it says so once");
+    app.run_command(crate::widgets::command_palette::Command::ToggleLiveRun);
+    app.run_command(crate::widgets::command_palette::Command::ToggleLiveRun);
+    tick_live_run_until(&mut app, "the run after turning it on", |app| {
+        app.editor.live_run.is_some()
+    });
+}
+
 /// #856 (comment): a task set "Running <label>" and kept it after its pane
 /// was back at the prompt. The pane's command-finished report now replaces
 /// it with the exit code and how long the command took.
