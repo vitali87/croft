@@ -1042,6 +1042,50 @@ fn a_staged_rename_counts_the_lines_it_changed() {
     assert_eq!((renamed.additions, renamed.deletions), (1, 1));
 }
 
+/// #2593: the change list's line counts never rewrite git's index. A file
+/// whose timestamp changed but whose bytes did not leaves the index's stat
+/// data out of date, and a plain `git diff` writes the refreshed index
+/// back, taking `index.lock` from under the user's own git commands,
+/// whatever `GIT_OPTIONAL_LOCKS` says.
+#[test]
+fn the_change_list_never_rewrites_a_stale_index() {
+    let tmp = TempDir::new().unwrap();
+    let p = tmp.path();
+    init_repo_with_commit(p);
+    std::fs::write(p.join("edited.txt"), "one\n").unwrap();
+    std::fs::write(p.join("touched.txt"), "same\n").unwrap();
+    sh_git(p, &["add", "."]);
+    sh_git(p, &["commit", "-qm", "two files"]);
+    let stamp = || {
+        std::fs::metadata(p.join(".git/index"))
+            .unwrap()
+            .modified()
+            .unwrap()
+    };
+    let before = stamp();
+    std::fs::write(p.join("edited.txt"), "one\ntwo\n").unwrap();
+    // Same bytes, an hour older: the index's stat data for it is stale, by
+    // more than the whole seconds a git built without nanosecond times
+    // compares.
+    std::fs::File::options()
+        .write(true)
+        .open(p.join("touched.txt"))
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600))
+        .unwrap();
+    let entries = query_changes(p);
+    assert_eq!(stamp(), before, "reading the change list rewrote the index");
+    let edited = entries
+        .iter()
+        .find(|e| e.path == "edited.txt")
+        .expect("the edit is listed");
+    assert_eq!((edited.additions, edited.deletions), (1, 0));
+    assert!(
+        entries.iter().all(|e| e.path != "touched.txt"),
+        "a file with the same bytes is not a change: {entries:?}"
+    );
+}
+
 #[test]
 fn change_kind_section_groups_correctly() {
     assert_eq!(ChangeKind::StagedAdded.section(), ChangeSection::Staged);

@@ -1545,10 +1545,10 @@ pub struct App {
     /// When a format-on-save stops waiting on its formatter and writes the
     /// file unformatted (#1491). Set with `save_after_format`.
     format_save_deadline: Option<std::time::Instant>,
-    /// Background `git log` results for the TIMELINE, keyed by the file they
-    /// describe so a stale reply for a since-closed file is ignored on drain.
-    timeline_rx: std::sync::mpsc::Receiver<(PathBuf, Vec<crate::git::FileHistoryEntry>)>,
-    timeline_tx: std::sync::mpsc::Sender<(PathBuf, Vec<crate::git::FileHistoryEntry>)>,
+    /// The TIMELINE lookup for the active file, while it runs, tagged with
+    /// the file it describes. Starting another drops it, so an older list can
+    /// never replace a newer one (#2575).
+    timeline_fetch: Option<crate::jobs::Job<(PathBuf, Vec<crate::git::FileHistoryEntry>)>>,
     /// Background folder-size scans for the CodeQL database card (#578): a
     /// large database is many files, so the walk stays off the input path.
     codeql_size_rx: std::sync::mpsc::Receiver<(PathBuf, Option<u64>)>,
@@ -1683,9 +1683,10 @@ pub struct App {
     test_jump_rx: std::sync::mpsc::Receiver<(PathBuf, String, Option<(PathBuf, u32)>)>,
     #[allow(clippy::type_complexity)]
     test_jump_tx: std::sync::mpsc::Sender<(PathBuf, String, Option<(PathBuf, u32)>)>,
-    /// Background per-ecosystem dependency-resolution result for DEPENDENCIES.
-    deps_rx: std::sync::mpsc::Receiver<Vec<Dependency>>,
-    deps_tx: std::sync::mpsc::Sender<Vec<Dependency>>,
+    /// The DEPENDENCIES lookup for the current root, while it runs. A
+    /// re-root replaces it, so a slower lookup for the folder just left can
+    /// never land in the new folder's list (#2573).
+    deps_fetch: Option<crate::jobs::Job<Vec<Dependency>>>,
     /// The workspace root DEPENDENCIES was detected/fetched for, so detection
     /// and the fetch fire once per root (re-fired by Make Root / re-root).
     deps_fetched: Option<PathBuf>,
@@ -2999,9 +3000,10 @@ pub struct App {
     /// typed, the `gh` to run, and where finished jobs report.
     review_pending: Vec<crate::review_threads::PendingComment>,
     review_pending_pr: Option<(PathBuf, String)>,
-    /// A Submit Review or export is in flight; another is refused until it
-    /// reports, so the same comments are never posted twice.
-    review_submitting: bool,
+    /// The Submit Review or export in flight, as the `review-submit` job;
+    /// another is refused while it runs, so the same comments are never
+    /// posted twice. A job whose thread crashed no longer counts (#2578).
+    review_submit: Option<crate::jobs::Job<crate::review_ops::Outcome>>,
     /// Sticky notes (#367): every note in the workspace, where the owner
     /// keeps them (`None` under test), and which box id is which note.
     notes: crate::sticky_notes::Notes,
@@ -4196,13 +4198,11 @@ impl App {
         } else {
             crate::mcp::catalog::installed_ids(&crate::lsp::manifest::user_extensions_dir())
         };
-        let (timeline_tx, timeline_rx) = std::sync::mpsc::channel();
         let (codeql_size_tx, codeql_size_rx) = std::sync::mpsc::channel();
         let (history_done_tx, history_done_rx) = std::sync::mpsc::channel();
         let (project_hint_tx, project_hint_rx) = std::sync::mpsc::channel();
         let (test_jump_tx, test_jump_rx) = std::sync::mpsc::channel();
         let (blame_tx, blame_rx) = std::sync::mpsc::channel();
-        let (deps_tx, deps_rx) = std::sync::mpsc::channel();
         let (voice_tx, voice_rx) = std::sync::mpsc::channel();
         let editor = EditorTabs::new();
         // Bound before the first pane, so that pane's shell carries the
@@ -4348,8 +4348,7 @@ impl App {
             explorer_views,
             settings_chain: merged_settings.chain,
             settings_provenance: merged_settings.provenance,
-            timeline_rx,
-            timeline_tx,
+            timeline_fetch: None,
             codeql_size_rx,
             codeql_size_tx,
             codeql_size_pending: std::collections::HashSet::new(),
@@ -4409,8 +4408,7 @@ impl App {
                 crate::history::history_dir()
             },
             history_restore: None,
-            deps_rx,
-            deps_tx,
+            deps_fetch: None,
             deps_fetched: None,
             voice_rx,
             voice_tx,
@@ -5025,7 +5023,7 @@ impl App {
             review_boxes: None,
             review_pending: Vec::new(),
             review_pending_pr: None,
-            review_submitting: false,
+            review_submit: None,
             notes: crate::startup_trace::after(
                 "sticky notes read",
                 notes_path

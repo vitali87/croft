@@ -796,19 +796,32 @@ impl App {
         } else {
             // Nothing on offer: ask now, and say what the answer was, a
             // missing network included (#1844).
-            self.status = String::from("Checking for croft updates\u{2026}");
-            self.manual_update_check = Some(crate::update_check::ManualCheck::start_with(
+            match crate::update_check::ManualCheck::start_with(
                 croft_cache_dir(),
                 String::from(env!("CARGO_PKG_VERSION")),
                 self.update_fetch,
-            ));
+            ) {
+                Ok(check) => {
+                    self.status = String::from("Checking for croft updates\u{2026}");
+                    self.manual_update_check = Some(check);
+                }
+                Err(e) => self.status = format!("Could not check for croft updates: {e}"),
+            }
         }
     }
 
     /// The answer to a check Help: Update croft asked for (#1844).
     pub(super) fn poll_manual_update_check(&mut self) -> bool {
-        let Some(verdict) = self.manual_update_check.as_ref().and_then(|c| c.take()) else {
-            return false;
+        let verdict = match self.manual_update_check.as_ref().map(|c| c.poll()) {
+            None | Some(crate::jobs::Poll::Pending) => return false,
+            Some(crate::jobs::Poll::Done(verdict)) => verdict,
+            // Its thread crashed, and the crash notice said so. The check is
+            // let go, so the next Help: Update croft asks again instead of
+            // saying it is already checking (#2579).
+            Some(crate::jobs::Poll::Died) => {
+                self.manual_update_check = None;
+                return true;
+            }
         };
         self.manual_update_check = None;
         self.status = match verdict {
