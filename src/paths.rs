@@ -19,16 +19,27 @@ pub(crate) fn config_dir() -> PathBuf {
     )
 }
 
-/// Test builds' config directory: one of the test process's own, under the
-/// temp directory, never the developer's (#2062). `App::new` reads the
-/// user's macros, snippets, triggers and agents from here, so a file in the
-/// real one used to steer every test that built an app. It starts empty, as
-/// on CI. The settings layers stay in a directory of their own that nothing
-/// creates (`config_layers::user_layers_dir`, #624), so a test that writes a
-/// file here never changes the settings every app test reads.
+/// Test builds' config directory: one of the test process's own, never the
+/// developer's (#2062). `App::new` reads the user's macros, snippets,
+/// triggers and agents from here, so a file in the real one used to steer
+/// every test that built an app. It is made fresh under the temp directory,
+/// with a random name, the first time it is asked for, so it starts empty as
+/// on CI: a name from the process id alone could find what an earlier run
+/// with the same id left there. The settings layers stay in a directory of
+/// their own that nothing creates (`config_layers::user_layers_dir`, #624), so
+/// a test that writes a file here never changes the settings every app test
+/// reads.
 #[cfg(test)]
 pub(crate) fn config_dir() -> PathBuf {
-    std::env::temp_dir().join(format!("croft-test-config-dir-{}", std::process::id()))
+    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        tempfile::Builder::new()
+            .prefix("croft-test-config-dir-")
+            .tempdir()
+            .expect("a fresh temp dir for the test build's config dir")
+            .keep()
+    })
+    .clone()
 }
 
 /// The config directory a release build would use in this environment: in a
@@ -114,6 +125,13 @@ mod tests {
     fn a_test_build_has_a_config_dir_of_its_own() {
         let dir = super::config_dir();
         assert!(!dir.starts_with(super::real_config_dir()), "{dir:?}");
+        // Made fresh for this run, not named from the process id alone,
+        // which a later run can be given again (review on #2547).
+        assert!(dir.is_dir(), "{dir:?}");
+        assert_ne!(
+            dir.file_name().unwrap(),
+            format!("croft-test-config-dir-{}", std::process::id()).as_str()
+        );
         assert!(dir.starts_with(std::env::temp_dir()), "{dir:?}");
         assert_eq!(dir, super::config_dir(), "one directory for the whole run");
     }
