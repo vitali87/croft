@@ -5,26 +5,44 @@ use super::*;
 
 impl TestWorker {
     pub fn spawn(workspace_root: PathBuf) -> Self {
-        let (request_tx, request_rx) = std::sync::mpsc::channel::<TestRequest>();
-        let (response_tx, response_rx) = std::sync::mpsc::channel::<(u64, TestResponse)>();
-        #[cfg(test)]
-        let root = workspace_root.clone();
+        Self::spawn_with(workspace_root, worker_loop)
+    }
+
+    /// A worker whose thread runs `work`, the real loop outside tests.
+    pub(super) fn spawn_with(
+        workspace_root: PathBuf,
+        work: impl Fn(PathBuf, Receiver<Sent>, Sender<(u64, TestResponse)>, &RunControl)
+        + Send
+        + Sync
+        + 'static,
+    ) -> Self {
         let control = RunControl::default();
-        let worker_control = control.clone();
-        std::thread::spawn(move || {
-            crate::startup_gate::wait();
-            worker_loop(workspace_root, request_rx, response_tx, &worker_control)
-        });
+        let thread_control = control.clone();
+        let first_root = workspace_root.clone();
+        let worker = Worker::spawn("test-runner", Start::AfterFirstFrame, move |rx, tx| {
+            work(first_root.clone(), rx, tx, &thread_control)
+        })
+        .expect("start the test runner");
+        Self::around(worker, control, workspace_root)
+    }
+
+    fn around(
+        worker: Worker<Sent, (u64, TestResponse)>,
+        control: RunControl,
+        root: PathBuf,
+    ) -> Self {
         Self {
-            request_tx,
+            worker,
             control,
             sent: 0,
             cancel_pending: false,
-            response_rx,
             discover_queued: false,
             expected_epoch: 0,
-            #[cfg(test)]
             root,
+            codeql: None,
+            extensions: None,
+            stopped_news: false,
+            stop_seen: false,
         }
     }
 
@@ -32,62 +50,94 @@ impl TestWorker {
     /// inject tagged responses straight into the drain.
     #[cfg(test)]
     pub(super) fn for_test() -> (Self, Sender<(u64, TestResponse)>) {
-        let (request_tx, _request_rx) = std::sync::mpsc::channel::<TestRequest>();
+        let (request_tx, _request_rx) = std::sync::mpsc::channel::<Sent>();
         let (response_tx, response_rx) = std::sync::mpsc::channel::<(u64, TestResponse)>();
+        let worker = Worker::from_channels(request_tx, response_rx);
         (
-            Self {
-                request_tx,
-                control: RunControl::default(),
-                sent: 0,
-                cancel_pending: false,
-                response_rx,
-                discover_queued: false,
-                expected_epoch: 0,
-                root: PathBuf::new(),
-            },
+            Self::around(worker, RunControl::default(), PathBuf::new()),
             response_tx,
         )
     }
 
-    /// Queue `req`, numbered as the worker will number it.
-    pub(super) fn send(&mut self, req: TestRequest) {
+    /// The real worker, whose first `crashes` threads panic on their first
+    /// request (#2592).
+    #[cfg(test)]
+    pub(crate) fn crashing(root: PathBuf, crashes: usize) -> Self {
+        let started = Arc::new(AtomicU64::new(0));
+        Self::spawn_with(root, move |root, rx, tx, control| {
+            if started.fetch_add(1, Ordering::SeqCst) < crashes as u64 {
+                let _ = rx.recv();
+                panic!("the test runner crashed (on purpose, in a test)");
+            }
+            worker_loop(root, rx, tx, control);
+        })
+    }
+
+    /// Queue `request`, numbered and tagged with the current root.
+    pub(super) fn send(&mut self, request: TestRequest) {
         self.sent += 1;
-        let _ = self.request_tx.send(req);
+        self.worker.send(Sent {
+            number: self.sent,
+            epoch: self.expected_epoch,
+            request,
+        });
+    }
+
+    /// Queue a run or discovery. A worker that stopped after crashing
+    /// twice starts again here: the user asked for tests (#2592).
+    fn ask(&mut self, request: TestRequest) {
+        if self.worker.is_stopped() && self.worker.restart().is_ok() {
+            self.stop_seen = false;
+            self.resend_settings();
+        }
+        self.send(request);
+    }
+
+    /// Give a fresh thread the root and settings its crashed one had
+    /// (#2592), under the same epoch: nothing about the root changed.
+    fn resend_settings(&mut self) {
+        self.send(TestRequest::SetRoot(self.root.clone()));
+        if let Some(program) = self.codeql.clone() {
+            self.send(TestRequest::SetCodeqlProgram(program));
+        }
+        if let Some(dir) = self.extensions.clone() {
+            self.send(TestRequest::SetExtensionsDir(dir));
+        }
     }
 
     pub fn run_coverage(&mut self) {
-        self.send(TestRequest::RunCoverage(None));
+        self.ask(TestRequest::RunCoverage(None));
     }
 
     /// Run only the tests `scope` names with coverage on (#263).
     pub fn run_coverage_scoped(&mut self, scope: CoverageScope) {
-        self.send(TestRequest::RunCoverage(Some(scope)));
+        self.ask(TestRequest::RunCoverage(Some(scope)));
     }
 
     pub fn run_all(&mut self) {
-        self.send(TestRequest::RunAll);
+        self.ask(TestRequest::RunAll);
     }
 
     pub fn run_one(&mut self, name: String) {
-        self.send(TestRequest::RunOne(name));
+        self.ask(TestRequest::RunOne(name));
     }
 
     pub fn run_many(&mut self, names: Vec<String>) {
-        self.send(TestRequest::RunMany(names));
+        self.ask(TestRequest::RunMany(names));
     }
 
     /// Run the tests matching `pattern`, with the runner for `file`'s
     /// language when the run came from one (#1408).
     pub fn run_filter(&mut self, pattern: String, file: Option<PathBuf>) {
-        self.send(TestRequest::RunFilter(pattern, file));
+        self.ask(TestRequest::RunFilter(pattern, file));
     }
 
     pub fn run_suite(&mut self, suite: String) {
-        self.send(TestRequest::RunSuite(suite));
+        self.ask(TestRequest::RunSuite(suite));
     }
 
     pub fn discover(&mut self) {
-        self.send(TestRequest::Discover { quiet: false });
+        self.ask(TestRequest::Discover { quiet: false });
     }
 
     /// Discover from the Testing view (#1841): queued without looking for a
@@ -95,7 +145,7 @@ impl TestWorker {
     /// worker finds the runner and stays silent when there is none.
     pub fn discover_quietly(&mut self) {
         self.discover_queued = true;
-        self.send(TestRequest::Discover { quiet: true });
+        self.ask(TestRequest::Discover { quiet: true });
     }
 
     /// A quiet discovery is queued and has not started yet.
@@ -110,10 +160,12 @@ impl TestWorker {
     }
 
     pub fn set_codeql_program(&mut self, program: PathBuf) {
+        self.codeql = Some(program.clone());
         self.send(TestRequest::SetCodeqlProgram(program));
     }
 
     pub fn set_extensions_dir(&mut self, dir: PathBuf) {
+        self.extensions = Some(dir.clone());
         self.send(TestRequest::SetExtensionsDir(dir));
     }
 
@@ -129,10 +181,7 @@ impl TestWorker {
     /// Everything still streaming for the old root carries the old epoch and
     /// is dropped by [`Self::drain`].
     pub fn set_root(&mut self, root: PathBuf) {
-        #[cfg(test)]
-        {
-            self.root = root.clone();
-        }
+        self.root = root.clone();
         self.expected_epoch += 1;
         // A discovery queued for the old root reports under the old epoch,
         // which the drain drops: nothing would ever clear it.
@@ -156,7 +205,28 @@ impl TestWorker {
     /// previous project and are dropped.
     pub fn drain(&mut self, panel: &mut TestingPanel) -> bool {
         let mut changed = false;
-        while let Ok((epoch, resp)) = self.response_rx.try_recv() {
+        loop {
+            let (epoch, resp) = match self.worker.poll() {
+                WorkerPoll::Answer(answer) => answer,
+                WorkerPoll::Idle => break,
+                // Its thread crashed, and the crash notice said so. A
+                // fresh one has the same root and settings; the run it
+                // was on is not sent again, as a run can have side
+                // effects (#2592).
+                WorkerPoll::Restarted => {
+                    changed |= self.thread_ended(panel);
+                    self.resend_settings();
+                    continue;
+                }
+                WorkerPoll::Stopped => {
+                    if !std::mem::replace(&mut self.stop_seen, true) {
+                        self.thread_ended(panel);
+                        self.stopped_news = true;
+                        changed = true;
+                    }
+                    break;
+                }
+            };
             if epoch != self.expected_epoch {
                 continue;
             }
@@ -183,5 +253,27 @@ impl TestWorker {
             changed = true;
         }
         changed
+    }
+
+    /// The worker's thread ended (#2592). What was sent to it went with
+    /// it: the runner it was reading from is killed, a run or discovery
+    /// in flight ends as stopped, and a queued quiet discovery is
+    /// forgotten so the Testing view can queue another. True when the
+    /// panel changed.
+    fn thread_ended(&mut self, panel: &mut TestingPanel) -> bool {
+        self.control.abandon(self.sent);
+        self.discover_queued = false;
+        self.cancel_pending = false;
+        if !panel.is_busy() {
+            return false;
+        }
+        panel.on_stopped();
+        true
+    }
+
+    /// True once when the worker has stopped after crashing again soon
+    /// after a restart (#2592), so the app can say so.
+    pub fn take_stopped(&mut self) -> bool {
+        std::mem::take(&mut self.stopped_news)
     }
 }

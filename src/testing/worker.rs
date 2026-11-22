@@ -20,6 +20,7 @@ use super::parse::{
     parse_test_line, parse_vitest_list_json, parse_vitest_list_line, parse_vitest_tap_line,
 };
 use super::regex_escape;
+use crate::jobs::{Start, Worker, WorkerPoll};
 use crate::output::{self, OutputLevel};
 use crate::widgets::testing::TestingPanel;
 
@@ -153,9 +154,10 @@ pub enum CoverageError {
 
 /// What a cancel (#1534) needs to reach the runner the worker thread is
 /// blocked on: the process group of the child it is streaming, and how
-/// many requests the app has cancelled. Requests are counted on both sides
-/// in channel order, so a cancel covers the request in flight and any the
-/// worker has not picked up yet, and never a later one.
+/// many requests the app has cancelled. The app numbers its requests in
+/// the order it sends them and the thread serves them in that order, so a
+/// cancel covers the request in flight and any the worker has not picked
+/// up yet, and never a later one.
 #[derive(Clone, Default)]
 pub struct RunControl {
     /// The streaming child's pid, which is its process group (it is
@@ -165,32 +167,49 @@ pub struct RunControl {
     cancelled_upto: Arc<AtomicU64>,
 }
 
+/// A request as the worker thread takes it, numbered and tagged with the
+/// root it was sent under by the app. The thread used to count both again
+/// on its side, and a fresh thread after a crash (#2592) would have
+/// started again from zero: every request numbered up to the last cancel
+/// would have read as cancelled, and every answer as from an old root.
+struct Sent {
+    /// Requests are numbered from 1 in the order they were sent.
+    number: u64,
+    /// The root the request was sent under: its answers carry it.
+    epoch: u64,
+    request: TestRequest,
+}
+
 pub struct TestWorker {
-    request_tx: Sender<TestRequest>,
+    /// The thread the runs happen on, started again when it crashes
+    /// (#2592).
+    worker: Worker<Sent, (u64, TestResponse)>,
     /// Reaches the runner the worker thread is blocked on (#1534).
     control: RunControl,
-    /// Requests sent so far: the worker numbers them in the same order.
+    /// Requests sent so far: the number of the last one.
     sent: u64,
     /// A cancel is waiting for its run's end, which the drain reports as
     /// cancelled rather than as a verdict.
     cancel_pending: bool,
-    /// Responses arrive tagged with the epoch of the root they ran under; the
-    /// drain drops tags older than [`Self::expected_epoch`] so a run still
-    /// streaming when the Explorer re-roots can't pollute the new project's
-    /// tree (same idea as the commit graph's root-tagged drain).
-    response_rx: Receiver<(u64, TestResponse)>,
     /// A quiet discovery is queued and has not started yet (#1841). Until
     /// the worker reaches it the panel is not busy, so without this every
     /// reopen of the Testing view would queue another.
     discover_queued: bool,
-    /// Bumped on every [`Self::set_root`], in lockstep with the loop's own
-    /// counter: the request channel is FIFO, so both sides count the same
-    /// `SetRoot`s in the same order.
+    /// Bumped on every [`Self::set_root`]. Every request carries the epoch
+    /// it was sent under and its answers come back tagged with it, so the
+    /// drain drops what a run still streaming when the Explorer re-roots
+    /// sends for the old project (same idea as the commit graph's
+    /// root-tagged drain).
     expected_epoch: u64,
-    // Mirror of the root the loop last saw, for tests that assert the re-root
-    // wiring. The loop owns its own copy via `SetRoot`; prod never reads this.
-    #[cfg(test)]
+    /// The root, `codeql` program and extensions folder the worker was last
+    /// given, given again to a fresh thread after a crash (#2592).
     root: PathBuf,
+    codeql: Option<PathBuf>,
+    extensions: Option<PathBuf>,
+    /// The worker stopped since the last [`Self::take_stopped`].
+    stopped_news: bool,
+    /// The current stop has been seen, so it is reported once.
+    stop_seen: bool,
 }
 
 /// A response sender bound to the epoch of the request it serves, so every

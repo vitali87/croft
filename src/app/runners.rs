@@ -237,6 +237,24 @@ impl App {
         true
     }
 
+    /// Say why a test run the drain just ended has no verdict: the worker
+    /// refused it (runner disabled after the entry check, its cases rolled
+    /// back), it was cancelled, or the test runner crashed (#2592).
+    pub(super) fn say_why_test_runs_ended(&mut self) {
+        if self.testing.take_refusal() {
+            self.status = String::from(crate::testing::NO_RUNNER_STATUS);
+        }
+        if self.testing.take_cancelled() {
+            self.status = String::from("Test run cancelled");
+        }
+        if self.testing.take_stopped() {
+            self.status = String::from(TEST_RUNNER_CRASHED);
+        }
+        if self.test_worker.take_stopped() {
+            self.status = String::from(TEST_RUNNER_STOPPED);
+        }
+    }
+
     /// Testing: Cancel Test Run, `s` in the Testing view, or its Stop
     /// control (#1534): kill the run or discovery in flight. The panel
     /// settles when the worker reports the run's end.
@@ -2782,6 +2800,14 @@ pub(super) fn cwd_matches(cwd: Option<&Path>, root: &Path, observable: bool) -> 
 
 /// The status a run gesture gets while another run is in flight (#1534).
 pub(super) const TEST_RUN_IN_PROGRESS: &str = "A test run is in progress (s in Testing stops it)";
+
+/// The status when the test runner crashed with a run in flight (#2592).
+pub(super) const TEST_RUNNER_CRASHED: &str = "Test run stopped: the test runner crashed";
+
+/// The status when the test runner crashed again soon after a restart and
+/// waits for the next run to start it (#2592).
+pub(super) const TEST_RUNNER_STOPPED: &str =
+    "Testing stopped after its runner crashed twice: running tests starts it again";
 
 /// `task` with `answers` for its `${input:…}` variables (#1424).
 pub(super) fn with_answers(

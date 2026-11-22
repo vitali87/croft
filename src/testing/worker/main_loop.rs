@@ -5,30 +5,32 @@ use super::*;
 
 pub(super) fn worker_loop(
     mut root: PathBuf,
-    rx: Receiver<TestRequest>,
+    rx: Receiver<Sent>,
     tx: Sender<(u64, TestResponse)>,
     control: &RunControl,
 ) {
-    let mut epoch = 0u64;
     // Found on PATH, as the CodeQL side bar finds it, until the app says
     // otherwise.
     let mut codeql = PathBuf::from("codeql");
     let mut extensions = crate::lsp::manifest::user_extensions_dir();
-    let mut request = 0u64;
     let owners = RefCell::new(BTreeMap::new());
-    while let Ok(req) = rx.recv() {
-        request += 1;
+    while let Ok(Sent {
+        number,
+        epoch,
+        request,
+    }) = rx.recv()
+    {
         let etx = EpochTx {
             tx: &tx,
             epoch,
             codeql: &codeql,
             extensions: &extensions,
             control,
-            request,
+            request: number,
             owners: Some(&owners),
             tag: None,
         };
-        match req {
+        match request {
             TestRequest::RunAll => run_all(&root, &etx),
             TestRequest::RunCoverage(scope) => run_coverage(&root, &etx, scope.as_ref()),
             TestRequest::RunOne(name) => run_one(&root, &etx, &name),
@@ -40,7 +42,6 @@ pub(super) fn worker_loop(
             TestRequest::Discover { quiet } => discover(&root, &etx, quiet),
             TestRequest::SetRoot(p) => {
                 root = p;
-                epoch += 1;
                 owners.borrow_mut().clear();
             }
             TestRequest::SetCodeqlProgram(p) => codeql = p,
