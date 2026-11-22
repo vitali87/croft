@@ -33,6 +33,10 @@ use std::ops::Range;
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
 
+/// The name of the inline suggestion worker's thread, which the crash
+/// notice names.
+pub const THREAD: &str = "croft-inline-complete";
+
 use crate::jobs::{Start, WorkerPoll};
 
 use serde_json::{Value, json};
@@ -307,11 +311,9 @@ impl Worker {
     fn spawn_with(
         ask: impl Fn(&Config, &str) -> Result<Option<String>, String> + Send + Sync + 'static,
     ) -> Self {
-        let worker = crate::jobs::Worker::spawn(
-            "croft-inline-complete",
-            Start::Now,
-            move |job_rx, done_tx| serve(&job_rx, &done_tx, &ask),
-        )
+        let worker = crate::jobs::Worker::spawn(THREAD, Start::Now, move |job_rx, done_tx| {
+            serve(&job_rx, &done_tx, &ask)
+        })
         .expect("spawn inline-complete thread");
         Worker { worker }
     }

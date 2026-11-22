@@ -1876,20 +1876,27 @@ impl App {
     /// where the crash's record is. A job, stream or worker is one croft
     /// recovers from: what it showed as in progress is settled and it can be
     /// run again, so the notice says croft carried on (#2609). Any other
-    /// thread's work is simply gone, so that notice says to save and restart.
+    /// thread's work is simply gone, so that notice says to save and restart;
+    /// it wins when both kinds crashed since the last notice.
     pub(super) fn poll_background_panic(&mut self) -> bool {
-        let Some(crash) = take_background_panic() else {
+        let crashes = take_background_panics();
+        if crashes.is_empty() {
             return false;
-        };
-        let thread = crash.thread;
-        self.status = if crash.recovered {
+        }
+        let recovered = crashes.iter().all(|c| c.recovered);
+        let threads = crashes
+            .iter()
+            .map(|c| c.thread.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.status = if recovered {
             format!(
-                "A background task crashed ({thread}); croft carried on without it. \
+                "A background task crashed ({threads}); croft carried on without it. \
                  Details in ~/.cache/croft/panic.log"
             )
         } else {
             format!(
-                "A background task crashed ({thread}). Save your work and restart croft; \
+                "A background task crashed ({threads}). Save your work and restart croft; \
                  details in ~/.cache/croft/panic.log"
             )
         };
@@ -1905,9 +1912,9 @@ pub(super) struct BackgroundPanic {
     pub(super) recovered: bool,
 }
 
-/// The last background thread that crashed, until the app has shown it
+/// The background threads that crashed, until the app has shown them
 /// (#2077). Set by the panic hook, read by [`App::poll_background_panic`].
-static BACKGROUND_PANIC: std::sync::Mutex<Option<BackgroundPanic>> = std::sync::Mutex::new(None);
+static BACKGROUND_PANIC: std::sync::Mutex<Vec<BackgroundPanic>> = std::sync::Mutex::new(Vec::new());
 
 /// Whether a panic on `panicking` ends croft. Only the thread that drives
 /// the screen, `ui`, does: a panic there unwinds past the normal teardown,
@@ -1925,21 +1932,32 @@ pub(super) fn panic_ends_croft(
 /// Keep `thread`'s name for the app to show: a background task crashed,
 /// one croft `recovered` from or not.
 pub(super) fn note_background_panic(thread: &str, recovered: bool) {
-    let mut slot = BACKGROUND_PANIC
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    *slot = Some(BackgroundPanic {
-        thread: thread.to_string(),
-        recovered,
-    });
-}
-
-/// The background thread that crashed since the last call, if one did.
-pub(super) fn take_background_panic() -> Option<BackgroundPanic> {
     BACKGROUND_PANIC
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .take()
+        .push(BackgroundPanic {
+            thread: thread.to_string(),
+            recovered,
+        });
+}
+
+/// The background threads that crashed since the last call.
+pub(super) fn take_background_panics() -> Vec<BackgroundPanic> {
+    std::mem::take(
+        &mut *BACKGROUND_PANIC
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
+}
+
+/// Drop the crash notice for `thread`: the task it ran has said on the
+/// status line what its crash cost and how to start it again, which the
+/// generic notice must not replace on a later tick (#2616 review).
+pub(super) fn claim_background_panic(thread: &str) {
+    BACKGROUND_PANIC
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .retain(|crash| crash.thread != thread);
 }
 
 pub(super) fn install_terminal_restore_panic_hook() {

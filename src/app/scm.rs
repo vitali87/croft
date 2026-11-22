@@ -229,6 +229,7 @@ impl App {
                 self.status = String::from(
                     "Git status stopped after its worker crashed twice: Source Control: Refresh starts it again",
                 );
+                claim_background_panic(git_worker::THREAD);
             }
             if !this_changed {
                 continue;

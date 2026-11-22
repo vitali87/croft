@@ -2,6 +2,10 @@ use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
 
+/// The name of the git status worker's thread, which the crash notice
+/// names.
+pub(super) const THREAD: &str = "git-status";
+
 use crate::git::{GitRequest, GitResponse, GitStateWatch, GitStatus, git_worker_loop};
 use crate::jobs::{Start, Worker, WorkerPoll};
 use crate::widgets::source_control::SourceControlPanel;
@@ -47,7 +51,7 @@ impl GitWorker {
     ) -> Self {
         let first_root = git_root.clone();
         // The first frame shows no git state; its git processes wait.
-        let worker = Worker::spawn("git-status", Start::AfterFirstFrame, move |rx, tx| {
+        let worker = Worker::spawn(THREAD, Start::AfterFirstFrame, move |rx, tx| {
             work(first_root.clone(), rx, tx)
         })
         .expect("start the git status worker");
