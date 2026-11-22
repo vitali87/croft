@@ -8071,6 +8071,17 @@ fn recorded_frames(app: &App) -> Vec<String> {
 fn a_recorded_frame_keeps_the_panes_colours_and_cursor() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // A child that prints nothing cannot move the cursor, so the only bytes
+    // on the grid are the ones this test feeds. A live shell prints its
+    // prompt whenever it gets to it: on a busy host that was after half a
+    // second of quiet, between the recording and the read below, and the
+    // cursor the frame put back was no longer the pane's.
+    app.terminals[0] = crate::widgets::terminal::PtyTerminal::new_running(
+        "/bin/sh",
+        &[String::from("-c"), String::from("exec sleep 600")],
+        tmp.path(),
+    )
+    .unwrap();
     app.terminals[0].last_inner = ratatui::layout::Rect {
         x: 1,
         y: 1,
@@ -8078,21 +8089,6 @@ fn a_recorded_frame_keeps_the_panes_colours_and_cursor() {
         height: 10,
     };
     app.terminals[0].resize(60, 10);
-    // The pane runs a live shell: let its prompt land first, or a late one
-    // moves the cursor between the recording and the read below.
-    let mut last = app.terminals[0].screen_ansi_wrapped();
-    let mut quiet_since = std::time::Instant::now();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    while quiet_since.elapsed() < std::time::Duration::from_millis(500)
-        && std::time::Instant::now() < deadline
-    {
-        std::thread::sleep(std::time::Duration::from_millis(25));
-        let now = app.terminals[0].screen_ansi_wrapped();
-        if now != last {
-            last = now;
-            quiet_since = std::time::Instant::now();
-        }
-    }
     app.terminals[0].feed_bytes_for_test(b"\r\n\x1b[1;31mQQRED\x1b[0m plain\r\n");
 
     app.run_command(crate::widgets::command_palette::Command::ToggleSessionRecording);
@@ -8105,18 +8101,17 @@ fn a_recorded_frame_keeps_the_panes_colours_and_cursor() {
         frame.contains("\u{1b}[1;31mQQRED\u{1b}[0m plain"),
         "the red, bold run is recorded as SGR: {frame:?}"
     );
-    let shown = frame.rsplit_once('\u{1b}').map(|(_, tail)| tail);
+    // Nothing in the pane hides its cursor, so the frame shows it, where the
+    // pane has it: on the line after the fed one. A hidden cursor's frame is
+    // `a_hidden_cursor_is_recorded_hidden`'s.
+    let (row, col) = app.terminals[0]
+        .screen_ansi_wrapped()
+        .1
+        .expect("the quiet pane shows its cursor");
     assert!(
-        matches!(shown, Some("[?25h" | "[?25l")),
-        "the frame ends by setting the cursor: {frame:?}"
+        frame.ends_with(&format!("\u{1b}[{};{}H\u{1b}[?25h", row + 1, col + 1)),
+        "the cursor is put back where the pane has it: {frame:?}"
     );
-    if shown == Some("[?25h") {
-        let (row, col) = app.terminals[0].screen_ansi_wrapped().1.unwrap();
-        assert!(
-            frame.ends_with(&format!("\u{1b}[{};{}H\u{1b}[?25h", row + 1, col + 1)),
-            "the cursor is put back where the pane has it: {frame:?}"
-        );
-    }
 }
 
 #[test]
