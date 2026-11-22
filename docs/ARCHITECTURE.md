@@ -316,6 +316,7 @@ src/
 │   │   ├── events.rs            a raw DAP message classified into a `DapEvent`, the output worth showing, and why an adapter refused to start
 │   │   ├── exceptions.rs        the exception filters an adapter offers, breaking on raised exceptions, and what was thrown
 │   │   ├── inspection.rs        threads, the call stack, scopes and variables, evaluate, and the locals inline values draw from
+│   │   ├── running_set.rs       the sessions in flight: their names, console streams and backlogs, and which one is focused
 │   │   ├── session_set_tests.rs the tests of the set of debug sessions in flight
 │   │   ├── start_requests.rs    `initialize`, each adapter family's `launch`, `configurationDone` and `disconnect`
 │   │   ├── stepping.rs          pause, continue, step over, into and out, and Step Into Target
