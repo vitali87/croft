@@ -118,9 +118,22 @@ pub struct Stream<T> {
     _open: Option<Sender<StreamItem<T>>>,
 }
 
-/// Where a [`Stream`]'s work sends its updates.
+/// Where a [`Stream`]'s work sends its updates. A clone handed to a helper
+/// thread of the work's own keeps the stream open until the helper ends
+/// too, so a stream whose work crashed reads as dead once its helpers have
+/// let go.
 pub struct Sink<T> {
     tx: Sender<StreamItem<T>>,
+}
+
+// Not derived: that would ask `T: Clone`, and a sink is cloned for a helper
+// thread of the work's own, never its updates.
+impl<T> Clone for Sink<T> {
+    fn clone(&self) -> Self {
+        Self {
+            tx: self.tx.clone(),
+        }
+    }
 }
 
 impl<T> Sink<T> {

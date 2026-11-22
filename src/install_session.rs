@@ -1,6 +1,6 @@
-use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
-use std::thread::JoinHandle;
+use std::sync::mpsc::{Sender, channel};
 
+use crate::jobs::{Start, Stream, StreamPoll};
 use crate::remote::AdoptedMaster;
 
 #[derive(Debug)]
@@ -22,52 +22,56 @@ pub enum InstallEvent {
     Done(Result<(), String>),
 }
 
+/// What an install whose thread crashed before it finished says, in the
+/// connect dialog and on the status line.
+pub const CRASHED_DETAIL: &str = "the install's thread crashed";
+
 pub struct InstallSession {
     pub host: String,
     pub path: Option<String>,
     pub adopted: Option<AdoptedMaster>,
-    events_rx: Receiver<InstallEvent>,
+    /// The install's progress, until it ends or its thread dies.
+    events: Option<Stream<InstallEvent>>,
     fallback_answer_tx: Sender<bool>,
-    _handle: Option<JoinHandle<()>>,
 }
 
 impl InstallSession {
-    pub fn start(adopted: AdoptedMaster, host: String, path: Option<String>) -> Self {
-        let (tx, rx): (Sender<InstallEvent>, Receiver<InstallEvent>) = channel();
+    /// Run the install as the `remote-install` stream. Fails only when no
+    /// thread can be started.
+    pub fn start(
+        adopted: AdoptedMaster,
+        host: String,
+        path: Option<String>,
+    ) -> std::io::Result<Self> {
         let adopted_for_thread = adopted.clone();
-        let log_tx_for_install: Sender<String> = {
-            let tx = tx.clone();
-            let (s, r) = channel::<String>();
-            std::thread::spawn(move || {
-                while let Ok(line) = r.recv() {
-                    if tx.send(InstallEvent::Log(line)).is_err() {
-                        break;
-                    }
-                }
-            });
-            s
-        };
-        let can_launch_tx: Sender<()> = {
-            let tx = tx.clone();
-            let (s, r) = channel::<()>();
-            std::thread::spawn(move || {
-                if r.recv().is_ok() {
-                    let _ = tx.send(InstallEvent::CanLaunch);
-                }
-            });
-            s
-        };
         let (fallback_answer_tx, fallback_answer_rx) = channel::<bool>();
-        let prompt_tx = tx.clone();
-        let done_tx = tx.clone();
-        let handle = std::thread::spawn(move || {
+        let events = Stream::spawn("remote-install", Start::Now, move |events| {
+            let log_tx_for_install: Sender<String> = {
+                let events = events.clone();
+                let (s, r) = channel::<String>();
+                std::thread::spawn(move || {
+                    while let Ok(line) = r.recv() {
+                        if !events.send(InstallEvent::Log(line)) {
+                            break;
+                        }
+                    }
+                });
+                s
+            };
+            let can_launch_tx: Sender<()> = {
+                let events = events.clone();
+                let (s, r) = channel::<()>();
+                std::thread::spawn(move || {
+                    if r.recv().is_ok() {
+                        events.send(InstallEvent::CanLaunch);
+                    }
+                });
+                s
+            };
             let mut confirm_fallback = move |reason: &str| {
-                if prompt_tx
-                    .send(InstallEvent::FallbackPrompt {
-                        reason: reason.to_string(),
-                    })
-                    .is_err()
-                {
+                if !events.send(InstallEvent::FallbackPrompt {
+                    reason: reason.to_string(),
+                }) {
                     return false;
                 }
                 // Blocks until the dialog answers. A torn-down dialog drops
@@ -84,25 +88,31 @@ impl InstallSession {
                 Ok(_) => Ok(()),
                 Err(e) => Err(format!("{e:#}")),
             };
-            let _ = done_tx.send(InstallEvent::Done(payload));
-        });
-        Self {
+            events.send(InstallEvent::Done(payload));
+        })?;
+        Ok(Self {
             host,
             path,
             adopted: Some(adopted),
-            events_rx: rx,
+            events: Some(events),
             fallback_answer_tx,
-            _handle: Some(handle),
-        }
+        })
     }
 
+    /// The events sent since the last call. An install whose thread crashed
+    /// before it finished ends with a failed `Done`, for [`CRASHED_DETAIL`],
+    /// so the connect dialog never waits on it for good.
     pub fn drain_events(&mut self) -> Vec<InstallEvent> {
         let mut out = Vec::new();
-        loop {
-            match self.events_rx.try_recv() {
-                Ok(ev) => out.push(ev),
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => break,
+        while let Some(events) = self.events.as_ref() {
+            match events.poll() {
+                StreamPoll::Update(event) => out.push(event),
+                StreamPoll::Pending => break,
+                StreamPoll::Ended => self.events = None,
+                StreamPoll::Died => {
+                    self.events = None;
+                    out.push(InstallEvent::Done(Err(String::from(CRASHED_DETAIL))));
+                }
             }
         }
         out
@@ -124,26 +134,38 @@ impl InstallSession {
 
 #[cfg(test)]
 impl InstallSession {
-    /// A session whose installer has already reported `events` and runs
-    /// nothing, so a test can drive the App's handling of them without ssh.
+    /// A session whose installer has reported `events` and is still running,
+    /// so a test can drive the App's handling of them without ssh.
     pub fn with_events(
         host: &str,
         path: Option<String>,
         adopted: Option<AdoptedMaster>,
         events: Vec<InstallEvent>,
     ) -> Self {
-        let (tx, events_rx) = channel();
-        for ev in events {
-            let _ = tx.send(ev);
-        }
         let (fallback_answer_tx, _) = channel();
         Self {
             host: host.to_string(),
             path,
             adopted,
-            events_rx,
+            events: Some(Stream::running(events)),
             fallback_answer_tx,
-            _handle: None,
+        }
+    }
+
+    /// A session whose installer logs a line and then crashes.
+    pub fn crashing(host: &str) -> Self {
+        let (fallback_answer_tx, _) = channel();
+        let events = Stream::spawn("remote-install", Start::Now, |events| {
+            events.send(InstallEvent::Log(String::from("Probing the remote")));
+            panic!("the install crashed (on purpose, in a test)")
+        })
+        .unwrap();
+        Self {
+            host: host.to_string(),
+            path: None,
+            adopted: None,
+            events: Some(events),
+            fallback_answer_tx,
         }
     }
 }
