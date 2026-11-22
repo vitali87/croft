@@ -2574,11 +2574,13 @@ pub struct App {
     /// Last time the socket poll was kicked off, so it fires on a low cadence
     /// rather than every tick.
     last_port_poll: std::time::Instant,
-    /// Socket-poll snapshots arrive here from a one-shot background thread (one
-    /// complete listener set per cycle), so the blocking `lsof`/`ps` never runs
-    /// on the event loop (keeps input at 0ms). A full set, not individual hits,
-    /// so the app can reconcile ports that stopped listening.
-    port_poll_rx: std::sync::mpsc::Receiver<PortPoll>,
+    /// The socket poll in flight, if one is: a one-shot background job (one
+    /// complete listener set per cycle), so the blocking `lsof`/`ps` never
+    /// runs on the event loop (keeps input at 0ms). A full set, not
+    /// individual hits, so the app can reconcile ports that stopped
+    /// listening. While one runs, cadence ticks start no overlapping `lsof`;
+    /// one whose thread crashed is no longer running (#2568).
+    port_poll: Option<crate::jobs::Job<PortPoll>>,
     /// The fleet command in flight (#363), if one is, run off the event
     /// loop. A fleet run waits on the network for up to `FLEET_TIMEOUT`, and
     /// blocking the loop for that would freeze the editor — the user could
@@ -2589,10 +2591,6 @@ pub struct App {
     fleet_run: Option<crate::jobs::Job<Vec<crate::fleet::HostResult>>>,
     /// The command the fleet run in flight is running, for its tab (#363).
     fleet_command: String,
-    port_poll_tx: std::sync::mpsc::Sender<PortPoll>,
-    /// True while a poll thread is in flight, so cadence ticks don't pile up
-    /// overlapping `lsof` invocations.
-    port_poll_inflight: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Auto-label refresh for terminal panes: `(shell_pid, process_name,
     /// script)` resolved off the event loop, applied to the pane with that
     /// shell pid. `script` is what a script runtime (`node`) runs, for agent
@@ -4251,7 +4249,6 @@ impl App {
 
         let (search_query_tx, search_query_rx) = std::sync::mpsc::channel();
         let (search_results_tx, search_results_rx) = std::sync::mpsc::channel();
-        let (port_poll_tx, port_poll_rx) = std::sync::mpsc::channel();
         let (label_tx, label_rx) = std::sync::mpsc::channel();
         let (ssh_tx, ssh_rx) = std::sync::mpsc::channel();
         let search_root = root.clone();
@@ -4722,11 +4719,9 @@ impl App {
             captures: crate::widgets::captures::CapturesPanel::new(),
             port_toast: None,
             last_port_poll: std::time::Instant::now(),
-            port_poll_rx,
+            port_poll: None,
             fleet_run: None,
             fleet_command: String::new(),
-            port_poll_tx,
-            port_poll_inflight: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_label_refresh: std::time::Instant::now(),
             label_rx,
             label_tx,

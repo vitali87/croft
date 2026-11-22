@@ -454,6 +454,40 @@ fn a_detected_port_renders_in_the_ports_panel() {
     assert!(text.contains("node"), "its process is listed");
 }
 
+/// #2568: a port poll whose thread crashed is no longer in flight. The
+/// crash notice tells the user; the next poll then starts on cadence,
+/// instead of no poll ever starting again until a restart.
+#[test]
+fn a_port_poll_whose_thread_crashed_lets_the_next_one_run() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    assert!(
+        app.terminals.iter().any(|t| t.pid().is_some()),
+        "setup: a pane with a shell to poll"
+    );
+    app.port_poll = Some(
+        crate::jobs::Job::spawn("port-poll", crate::jobs::Start::Now, || -> PortPoll {
+            panic!("the poll crashed (on purpose, in a test)")
+        })
+        .unwrap(),
+    );
+    // Not yet time for the next poll, so only the crashed one settles.
+    app.last_port_poll = std::time::Instant::now();
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(1),
+        "the crashed poll to settle",
+        || {
+            app.drain_ports_and_poll();
+            app.port_poll.is_none()
+        },
+    );
+    app.last_port_poll = std::time::Instant::now()
+        .checked_sub(crate::app::bottom_panel::PORT_POLL_INTERVAL)
+        .expect("the clock is past one poll interval");
+    app.drain_ports_and_poll();
+    assert!(app.port_poll.is_some(), "the next poll started");
+}
+
 #[test]
 fn opening_a_forwarded_remote_port_routes_to_the_local_browser_via_relay() {
     use crate::widgets::ports::{PortOrigin, PortsPanel};
