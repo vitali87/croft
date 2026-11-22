@@ -11,19 +11,23 @@ impl TestWorker {
     /// A worker whose thread runs `work`, the real loop outside tests.
     pub(super) fn spawn_with(
         workspace_root: PathBuf,
-        work: impl Fn(PathBuf, Receiver<Sent>, Sender<(u64, TestResponse)>, &RunControl)
+        work: impl Fn(PathBuf, Receiver<Sent>, Sender<(u64, TestResponse)>, &RunControl, &Owners)
         + Send
         + Sync
         + 'static,
     ) -> Self {
         let control = RunControl::default();
-        let thread_control = control.clone();
+        let owners = Arc::new(Owners::default());
+        let (thread_control, thread_owners) = (control.clone(), Arc::clone(&owners));
         let first_root = workspace_root.clone();
         let worker = Worker::spawn("test-runner", Start::AfterFirstFrame, move |rx, tx| {
-            work(first_root.clone(), rx, tx, &thread_control)
+            work(first_root.clone(), rx, tx, &thread_control, &thread_owners)
         })
         .expect("start the test runner");
-        Self::around(worker, control, workspace_root)
+        let worker = Self::around(worker, control, workspace_root);
+        #[cfg(test)]
+        let worker = Self { owners, ..worker };
+        worker
     }
 
     fn around(
@@ -34,6 +38,8 @@ impl TestWorker {
         Self {
             worker,
             control,
+            #[cfg(test)]
+            owners: Arc::default(),
             sent: 0,
             cancel_pending: false,
             discover_queued: false,
@@ -64,12 +70,12 @@ impl TestWorker {
     #[cfg(test)]
     pub(crate) fn crashing(root: PathBuf, crashes: usize) -> Self {
         let started = Arc::new(AtomicU64::new(0));
-        Self::spawn_with(root, move |root, rx, tx, control| {
+        Self::spawn_with(root, move |root, rx, tx, control, owners| {
             if started.fetch_add(1, Ordering::SeqCst) < crashes as u64 {
                 let _ = rx.recv();
                 panic!("the test runner crashed (on purpose, in a test)");
             }
-            worker_loop(root, rx, tx, control);
+            worker_loop(root, rx, tx, control, owners);
         })
     }
 

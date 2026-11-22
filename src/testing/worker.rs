@@ -5,7 +5,6 @@
 //! populate the tree without running); per-test granularity and other
 //! ecosystems come in later milestones.
 
-use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -186,6 +185,10 @@ pub struct TestWorker {
     worker: Worker<Sent, (u64, TestResponse)>,
     /// Reaches the runner the worker thread is blocked on (#1534).
     control: RunControl,
+    /// The runner list every thread the worker runs on shares, for tests
+    /// to read.
+    #[cfg(test)]
+    owners: Arc<Owners>,
     /// Requests sent so far: the number of the last one.
     sent: u64,
     /// A cancel is waiting for its run's end, which the drain reports as
@@ -231,8 +234,22 @@ struct EpochTx<'a> {
     /// Which runner listed or ran each test (#1408), so a later run of one
     /// goes back to it; `tag` is the runner whose cases this sender
     /// carries.
-    owners: Option<&'a RefCell<BTreeMap<String, Runner>>>,
+    owners: Option<&'a Owners>,
     tag: Option<Runner>,
+}
+
+/// Which runner listed or ran each test (#1408). It lives outside the
+/// worker's thread, so a thread started again after a crash still sends a
+/// test to the runner that listed it (#2592), and is cleared only when the
+/// root changes.
+#[derive(Default)]
+pub(super) struct Owners(Mutex<OwnerMap>);
+
+#[derive(Default)]
+pub(super) struct OwnerMap {
+    /// The root, by its epoch, the map is for.
+    epoch: u64,
+    by_test: BTreeMap<String, Runner>,
 }
 
 #[cfg(test)]

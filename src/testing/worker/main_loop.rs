@@ -8,12 +8,12 @@ pub(super) fn worker_loop(
     rx: Receiver<Sent>,
     tx: Sender<(u64, TestResponse)>,
     control: &RunControl,
+    owners: &Owners,
 ) {
     // Found on PATH, as the CodeQL side bar finds it, until the app says
     // otherwise.
     let mut codeql = PathBuf::from("codeql");
     let mut extensions = crate::lsp::manifest::user_extensions_dir();
-    let owners = RefCell::new(BTreeMap::new());
     while let Ok(Sent {
         number,
         epoch,
@@ -27,7 +27,7 @@ pub(super) fn worker_loop(
             extensions: &extensions,
             control,
             request: number,
-            owners: Some(&owners),
+            owners: Some(owners),
             tag: None,
         };
         match request {
@@ -42,7 +42,7 @@ pub(super) fn worker_loop(
             TestRequest::Discover { quiet } => discover(&root, &etx, quiet),
             TestRequest::SetRoot(p) => {
                 root = p;
-                owners.borrow_mut().clear();
+                owners.for_root(epoch);
             }
             TestRequest::SetCodeqlProgram(p) => codeql = p,
             TestRequest::SetExtensionsDir(p) => extensions = p,

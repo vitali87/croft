@@ -69,6 +69,43 @@ impl RunControl {
     }
 }
 
+impl Owners {
+    /// The map, also after a thread that crashed holding it: an insert
+    /// leaves it whole.
+    pub(super) fn map(&self) -> std::sync::MutexGuard<'_, OwnerMap> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// `runner` listed or ran `test`.
+    pub(super) fn record(&self, test: String, runner: Runner) {
+        self.map().by_test.insert(test, runner);
+    }
+
+    /// The root is now the one of `epoch`: a new root's tests are another
+    /// project's, while the same root sent again to a fresh thread keeps
+    /// them.
+    pub(super) fn for_root(&self, epoch: u64) {
+        let mut map = self.map();
+        if map.epoch != epoch {
+            map.by_test.clear();
+            map.epoch = epoch;
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn get(&self, test: &str) -> Option<Runner> {
+        self.map().by_test.get(test).copied()
+    }
+}
+
+impl OwnerMap {
+    pub(super) fn by_test(&self) -> &BTreeMap<String, Runner> {
+        &self.by_test
+    }
+}
+
 fn kill_group(pgid: i32) {
     // SAFETY: `pgid` is the group of a child this worker spawned as its own
     // group leader, so only the test run is signalled.

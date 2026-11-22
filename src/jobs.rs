@@ -122,8 +122,25 @@ pub struct Worker<Req, Resp> {
     run: WorkerRun<Req, Resp>,
     tx: Sender<Req>,
     rx: Receiver<Resp>,
+    thread: Liveness,
     restarted_at: Option<Instant>,
     stopped: bool,
+}
+
+/// How a [`Worker`] knows its thread has ended. The answer channel alone
+/// cannot say: the thread may hand a sender to a thread of its own, as the
+/// test runner does to the reader of a runner's error output, and that
+/// sender keeps the channel open after the worker's thread has crashed
+/// (#2592).
+enum Liveness {
+    /// Its thread, watched until it ends.
+    Thread(std::thread::JoinHandle<()>),
+    /// Its thread ended and was joined.
+    Ended,
+    /// No thread of its own (a test's channels): it ends when the other
+    /// end of its answer channel is dropped.
+    #[cfg(test)]
+    ChannelOnly,
 }
 
 impl<Req: Send + 'static, Resp: Send + 'static> Worker<Req, Resp> {
@@ -136,13 +153,14 @@ impl<Req: Send + 'static, Resp: Send + 'static> Worker<Req, Resp> {
         run: impl Fn(Receiver<Req>, Sender<Resp>) + Send + Sync + 'static,
     ) -> std::io::Result<Self> {
         let run: WorkerRun<Req, Resp> = Arc::new(run);
-        let (tx, rx) = start_worker_thread(name, start, &run)?;
+        let (tx, rx, thread) = start_worker_thread(name, start, &run)?;
         Ok(Self {
             name: name.to_string(),
             start,
             run,
             tx,
             rx,
+            thread: Liveness::Thread(thread),
             restarted_at: None,
             stopped: false,
         })
@@ -161,17 +179,43 @@ impl<Req: Send + 'static, Resp: Send + 'static> Worker<Req, Resp> {
             return WorkerPoll::Stopped;
         }
         match self.rx.try_recv() {
-            Ok(answer) => WorkerPoll::Answer(answer),
-            Err(TryRecvError::Empty) => WorkerPoll::Idle,
-            Err(TryRecvError::Disconnected) => {
-                let again = self
-                    .restarted_at
-                    .is_some_and(|at| at.elapsed() < RESTART_WINDOW);
-                if again || self.restart().is_err() {
-                    self.stopped = true;
-                    return WorkerPoll::Stopped;
+            Ok(answer) => return WorkerPoll::Answer(answer),
+            Err(TryRecvError::Disconnected) => {}
+            Err(TryRecvError::Empty) => {
+                if !self.thread_ended() {
+                    return WorkerPoll::Idle;
                 }
-                WorkerPoll::Restarted
+                // Joined, so what it sent before it ended is all in the
+                // channel: that is read before it is started again.
+                if let Ok(answer) = self.rx.try_recv() {
+                    return WorkerPoll::Answer(answer);
+                }
+            }
+        }
+        let again = self
+            .restarted_at
+            .is_some_and(|at| at.elapsed() < RESTART_WINDOW);
+        if again || self.restart().is_err() {
+            self.stopped = true;
+            return WorkerPoll::Stopped;
+        }
+        WorkerPoll::Restarted
+    }
+
+    /// Whether its thread has ended, joining it once it has.
+    fn thread_ended(&mut self) -> bool {
+        match &self.thread {
+            Liveness::Thread(thread) if !thread.is_finished() => false,
+            #[cfg(test)]
+            Liveness::ChannelOnly => false,
+            Liveness::Ended => true,
+            Liveness::Thread(_) => {
+                if let Liveness::Thread(thread) =
+                    std::mem::replace(&mut self.thread, Liveness::Ended)
+                {
+                    let _ = thread.join();
+                }
+                true
             }
         }
     }
@@ -179,9 +223,10 @@ impl<Req: Send + 'static, Resp: Send + 'static> Worker<Req, Resp> {
     /// Start a fresh thread now, as after a death: for a caller retrying a
     /// stopped worker at the user's request.
     pub fn restart(&mut self) -> std::io::Result<()> {
-        let (tx, rx) = start_worker_thread(&self.name, self.start, &self.run)?;
+        let (tx, rx, thread) = start_worker_thread(&self.name, self.start, &self.run)?;
         self.tx = tx;
         self.rx = rx;
+        self.thread = Liveness::Thread(thread);
         self.restarted_at = Some(Instant::now());
         self.stopped = false;
         Ok(())
@@ -205,21 +250,24 @@ impl<Req, Resp> Worker<Req, Resp> {
             run: Arc::new(|_, _| {}),
             tx,
             rx,
+            thread: Liveness::ChannelOnly,
             restarted_at: None,
             stopped: false,
         }
     }
 }
 
+type Started<Req, Resp> = (Sender<Req>, Receiver<Resp>, std::thread::JoinHandle<()>);
+
 fn start_worker_thread<Req: Send + 'static, Resp: Send + 'static>(
     name: &str,
     start: Start,
     run: &WorkerRun<Req, Resp>,
-) -> std::io::Result<(Sender<Req>, Receiver<Resp>)> {
+) -> std::io::Result<Started<Req, Resp>> {
     let (req_tx, req_rx) = std::sync::mpsc::channel();
     let (resp_tx, resp_rx) = std::sync::mpsc::channel();
     let run = Arc::clone(run);
-    std::thread::Builder::new()
+    let thread = std::thread::Builder::new()
         .name(name.to_string())
         .spawn(move || {
             if start == Start::AfterFirstFrame {
@@ -227,7 +275,7 @@ fn start_worker_thread<Req: Send + 'static, Resp: Send + 'static>(
             }
             run(req_rx, resp_tx);
         })?;
-    Ok((req_tx, resp_rx))
+    Ok((req_tx, resp_rx, thread))
 }
 
 #[cfg(test)]
@@ -328,6 +376,40 @@ mod tests {
         assert!(matches!(next(&mut worker), WorkerPoll::Restarted));
         worker.send(2);
         assert!(matches!(next(&mut worker), WorkerPoll::Answer(2)));
+    }
+
+    /// #2592: a thread that hands a sender to a thread of its own and then
+    /// crashes is seen to have ended while that sender is still held, as
+    /// the test runner's reader of a runner's error output holds one.
+    #[test]
+    fn a_worker_whose_thread_crashed_while_its_helper_holds_a_sender_is_started_again() {
+        let (let_go, held) = std::sync::mpsc::channel::<()>();
+        let held = std::sync::Mutex::new(Some(held));
+        let started = std::sync::atomic::AtomicUsize::new(0);
+        let mut worker: Worker<u32, u32> = Worker::spawn("helper", Start::Now, move |rx, tx| {
+            if started.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                let helper_tx = tx.clone();
+                let held = held.lock().unwrap().take().unwrap();
+                std::thread::spawn(move || {
+                    let _ = held.recv();
+                    drop(helper_tx);
+                });
+                let _ = rx.recv();
+                panic!("the worker crashed (on purpose, in a test)");
+            }
+            while let Ok(n) = rx.recv() {
+                let _ = tx.send(n);
+            }
+        })
+        .unwrap();
+        worker.send(1);
+        assert!(
+            matches!(next(&mut worker), WorkerPoll::Restarted),
+            "its end is seen while the helper still holds a sender"
+        );
+        worker.send(2);
+        assert!(matches!(next(&mut worker), WorkerPoll::Answer(2)));
+        let _ = let_go.send(());
     }
 
     /// #2589: a second crash soon after a restart stops the worker instead
