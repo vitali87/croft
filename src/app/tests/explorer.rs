@@ -2071,6 +2071,95 @@ fn explorer_views_menu_labels_dependencies_for_the_detected_ecosystem() {
     );
 }
 
+/// An app on a Node folder whose `package.json` lists `left-pad`, with the
+/// DEPENDENCIES section shown and open.
+fn left_pad_app() -> (tempfile::TempDir, App) {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("package.json"),
+        r#"{ "dependencies": { "left-pad": "1.3.0" } }"#,
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    if !app.explorer_views.is_visible(ExplorerView::Dependencies) {
+        app.explorer_views.toggle(ExplorerView::Dependencies);
+    }
+    app.dependencies.collapsed = false;
+    (tmp, app)
+}
+
+/// The DEPENDENCIES section as it draws.
+fn dependencies_text(app: &mut App) -> String {
+    let area = ratatui::layout::Rect::new(0, 0, 40, 6);
+    let mut buf = ratatui::buffer::Buffer::empty(area);
+    ratatui::widgets::Widget::render(&mut app.dependencies, area, &mut buf);
+    (0..area.height)
+        .map(|y| {
+            (0..area.width)
+                .map(|x| buf[(x, y)].symbol())
+                .collect::<String>()
+                + "\n"
+        })
+        .collect()
+}
+
+/// #2572: a dependency lookup whose thread crashed settles the
+/// section on saying so, instead of "Loading" until the folder changes.
+#[test]
+fn a_dependency_lookup_whose_thread_crashed_says_it_could_not_list() {
+    let (_tmp, mut app) = left_pad_app();
+    app.sync_explorer_panels();
+    app.deps_fetch = Some(
+        crate::jobs::Job::spawn(
+            "dependencies",
+            crate::jobs::Start::Now,
+            || -> Vec<crate::widgets::dependencies::Dependency> {
+                panic!("the lookup crashed (on purpose, in a test)")
+            },
+        )
+        .unwrap(),
+    );
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(1),
+        "the crashed lookup to settle",
+        || {
+            app.sync_explorer_panels();
+            app.deps_fetch.is_none()
+        },
+    );
+    let text = dependencies_text(&mut app);
+    assert!(text.contains("Could not list dependencies"), "got:\n{text}");
+    assert!(!text.contains("Loading"), "got:\n{text}");
+}
+
+/// #2573: a lookup still out for the folder just left is dropped, so
+/// its list can never land in the new folder's section, even when it
+/// answers last.
+#[test]
+fn a_lookup_for_the_folder_just_left_never_lands_in_the_new_one() {
+    let (_tmp, mut app) = left_pad_app();
+    // The folder just left still has its lookup out, and it has answered.
+    app.deps_fetch = Some(crate::jobs::Job::finished(vec![
+        crate::widgets::dependencies::Dependency {
+            name: "serde".into(),
+            version: "1.0.0".into(),
+            ecosystem: crate::widgets::dependencies::Ecosystem::Rust,
+        },
+    ]));
+    // The re-root that left it.
+    app.deps_fetched = None;
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(1),
+        "this folder's list to land",
+        || {
+            app.sync_explorer_panels();
+            dependencies_text(&mut app).contains("left-pad")
+        },
+    );
+    let text = dependencies_text(&mut app);
+    assert!(!text.contains("serde"), "got:\n{text}");
+}
+
 #[test]
 fn toggling_an_explorer_view_flips_and_persists_its_visibility() {
     let tmp = tempfile::tempdir().unwrap();

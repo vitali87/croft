@@ -785,18 +785,42 @@ impl App {
                     &self.dep_ecosystems,
                 ));
             changed = true;
+            // Whatever ran for the folder just left is dropped here, so its
+            // list cannot land in this one's (#2573).
+            self.deps_fetch = None;
             if !self.dep_ecosystems.is_empty()
                 && self.explorer_views.is_visible(ExplorerView::Dependencies)
             {
-                let tx = self.deps_tx.clone();
-                std::thread::spawn(move || {
-                    let deps = crate::widgets::dependencies::fetch_dependencies(&root);
-                    let _ = tx.send(deps);
-                });
+                let job =
+                    crate::jobs::Job::spawn("dependencies", crate::jobs::Start::Now, move || {
+                        crate::widgets::dependencies::fetch_dependencies(&root)
+                    });
+                match job {
+                    Ok(job) => {
+                        self.dependencies.lookup_started();
+                        self.deps_fetch = Some(job);
+                    }
+                    Err(e) => {
+                        self.dependencies.set_failed();
+                        self.status = format!("Could not list the dependencies: {e}");
+                    }
+                }
             }
         }
-        while let Ok(deps) = self.deps_rx.try_recv() {
-            self.dependencies.set_deps(deps);
+        let settled = match self.deps_fetch.as_ref().map(crate::jobs::Job::poll) {
+            None | Some(crate::jobs::Poll::Pending) => None,
+            Some(crate::jobs::Poll::Done(deps)) => Some(Some(deps)),
+            // Its thread crashed, and the crash notice said so. The section
+            // says the list could not be made instead of "Loading" until the
+            // folder changes (#2572).
+            Some(crate::jobs::Poll::Died) => Some(None),
+        };
+        if let Some(deps) = settled {
+            self.deps_fetch = None;
+            match deps {
+                Some(deps) => self.dependencies.set_deps(deps),
+                None => self.dependencies.set_failed(),
+            }
             changed = true;
         }
 

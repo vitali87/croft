@@ -1683,9 +1683,10 @@ pub struct App {
     test_jump_rx: std::sync::mpsc::Receiver<(PathBuf, String, Option<(PathBuf, u32)>)>,
     #[allow(clippy::type_complexity)]
     test_jump_tx: std::sync::mpsc::Sender<(PathBuf, String, Option<(PathBuf, u32)>)>,
-    /// Background per-ecosystem dependency-resolution result for DEPENDENCIES.
-    deps_rx: std::sync::mpsc::Receiver<Vec<Dependency>>,
-    deps_tx: std::sync::mpsc::Sender<Vec<Dependency>>,
+    /// The DEPENDENCIES lookup for the current root, while it runs. A
+    /// re-root replaces it, so a slower lookup for the folder just left can
+    /// never land in the new folder's list (#2573).
+    deps_fetch: Option<crate::jobs::Job<Vec<Dependency>>>,
     /// The workspace root DEPENDENCIES was detected/fetched for, so detection
     /// and the fetch fire once per root (re-fired by Make Root / re-root).
     deps_fetched: Option<PathBuf>,
@@ -4202,7 +4203,6 @@ impl App {
         let (project_hint_tx, project_hint_rx) = std::sync::mpsc::channel();
         let (test_jump_tx, test_jump_rx) = std::sync::mpsc::channel();
         let (blame_tx, blame_rx) = std::sync::mpsc::channel();
-        let (deps_tx, deps_rx) = std::sync::mpsc::channel();
         let (voice_tx, voice_rx) = std::sync::mpsc::channel();
         let editor = EditorTabs::new();
         // Bound before the first pane, so that pane's shell carries the
@@ -4409,8 +4409,7 @@ impl App {
                 crate::history::history_dir()
             },
             history_restore: None,
-            deps_rx,
-            deps_tx,
+            deps_fetch: None,
             deps_fetched: None,
             voice_rx,
             voice_tx,
