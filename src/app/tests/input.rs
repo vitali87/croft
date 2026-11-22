@@ -1040,10 +1040,9 @@ fn focus_reports_are_turned_on_at_startup_and_off_on_exit() {
 fn a_transcript_queued_when_the_mic_is_tapped_to_cancel_is_not_typed() {
     let (mut app, _tmp, _f) = app_with_painted_file("x\n");
     app.focus = Pane::Editor;
-    app.voice_handle = Some(crate::voice::VoiceHandle::finished());
-    app.voice_tx
-        .send(crate::voice::VoiceMsg::Transcript(String::from("hello")))
-        .unwrap();
+    app.voice_handle = Some(crate::voice::VoiceHandle::finished(
+        crate::voice::VoiceMsg::Transcript(String::from("hello")),
+    ));
 
     app.toggle_voice_input();
     assert!(app.drain_voice(), "draining the result must redraw");
@@ -1063,10 +1062,9 @@ fn a_transcript_queued_when_the_mic_is_tapped_to_cancel_is_not_typed() {
 fn a_cancel_tap_read_after_the_drain_that_received_the_transcript_still_wins() {
     let (mut app, _tmp, _f) = app_with_painted_file("x\n");
     app.focus = Pane::Editor;
-    app.voice_handle = Some(crate::voice::VoiceHandle::finished());
-    app.voice_tx
-        .send(crate::voice::VoiceMsg::Transcript(String::from("hello")))
-        .unwrap();
+    app.voice_handle = Some(crate::voice::VoiceHandle::finished(
+        crate::voice::VoiceMsg::Transcript(String::from("hello")),
+    ));
 
     app.drain_voice();
     assert_eq!(
@@ -1095,14 +1093,39 @@ fn a_cancel_tap_read_after_the_drain_that_received_the_transcript_still_wins() {
 fn a_transcript_with_no_cancel_tap_is_typed() {
     let (mut app, _tmp, _f) = app_with_painted_file("x\n");
     app.focus = Pane::Editor;
-    app.voice_handle = Some(crate::voice::VoiceHandle::finished());
-    app.voice_tx
-        .send(crate::voice::VoiceMsg::Transcript(String::from("hello")))
-        .unwrap();
+    app.voice_handle = Some(crate::voice::VoiceHandle::finished(
+        crate::voice::VoiceMsg::Transcript(String::from("hello")),
+    ));
 
     app.drain_voice();
     assert!(app.drain_voice(), "typing the transcript must redraw");
 
     assert_eq!(app.editor.lines[0], "hellox");
     assert!(app.voice_handle.is_none());
+}
+
+/// #2602: a session whose reader crashed before it had a result ends, the
+/// status line says so, and the next tap starts a session instead of
+/// cancelling the dead one again.
+#[test]
+fn a_voice_session_whose_reader_crashed_ends_and_the_next_tap_starts_one() {
+    let (mut app, _tmp, _f) = app_with_painted_file("x\n");
+    app.focus = Pane::Editor;
+    app.voice_handle = Some(crate::voice::VoiceHandle::crashed());
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(5),
+        "the crashed session to end",
+        || {
+            app.drain_voice();
+            app.voice_handle.is_none()
+        },
+    );
+    assert_eq!(app.status, VOICE_READER_CRASHED);
+    assert!(!app.voice_canceling);
+    app.toggle_voice_input();
+    assert_ne!(
+        app.status, "Voice input canceled",
+        "the tap starts a session rather than cancel the dead one"
+    );
+    assert!(!app.voice_canceling);
 }

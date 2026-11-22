@@ -63,9 +63,9 @@ impl<T: Send + 'static> Job<T> {
         Ok(Self { rx })
     }
 
-    /// A job that has already finished with `value`, for tests that hand
-    /// the UI a result without running the work.
-    #[cfg(test)]
+    /// A job that has already finished with `value`: for work that failed
+    /// before it could start (voice input whose dialog would not open), and
+    /// for tests that hand the UI a result without running the work.
     pub fn finished(value: T) -> Self {
         let (tx, rx) = std::sync::mpsc::channel();
         let _ = tx.send(value);
