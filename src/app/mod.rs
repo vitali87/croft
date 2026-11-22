@@ -2183,11 +2183,6 @@ pub struct App {
     /// What each pane (by uid) was last seen connected to, so an ssh session
     /// is offered once when it starts rather than on every sample.
     ssh_offer_seen: std::collections::BTreeMap<u64, Option<String>>,
-    /// The label thread's ssh samples (#364): `(shell pid, resolved host)`
-    /// per pane it looked at, shipped beside the names it already resolves
-    /// so the argv read and the `~/.ssh/config` parse stay off the loop.
-    ssh_rx: std::sync::mpsc::Receiver<Vec<(i32, Option<String>)>>,
-    ssh_tx: std::sync::mpsc::Sender<Vec<(i32, Option<String>)>>,
     /// `disable_remote_offer` from prefs (#364).
     remote_offer_disabled: bool,
     /// `remote_offer_excluded_hosts` from prefs (#364).
@@ -2591,14 +2586,13 @@ pub struct App {
     fleet_run: Option<crate::jobs::Job<Vec<crate::fleet::HostResult>>>,
     /// The command the fleet run in flight is running, for its tab (#363).
     fleet_command: String,
-    /// Auto-label refresh for terminal panes: `(shell_pid, process_name,
-    /// script)` resolved off the event loop, applied to the pane with that
-    /// shell pid. `script` is what a script runtime (`node`) runs, for agent
-    /// recognition (#1380); `None` for anything else.
+    /// When the terminal panes' labels were last looked up.
     last_label_refresh: std::time::Instant,
-    label_rx: std::sync::mpsc::Receiver<Vec<(i32, String, Option<String>)>>,
-    label_tx: std::sync::mpsc::Sender<Vec<(i32, String, Option<String>)>>,
-    label_inflight: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The pane-label lookup in flight, if one is: each pane's foreground
+    /// process resolved off the event loop (see [`terminal_panes::LabelPass`]).
+    /// While it runs, cadence ticks start no other; one whose thread crashed
+    /// is no longer running (#2569).
+    label_pass: Option<crate::jobs::Job<terminal_panes::LabelPass>>,
     /// Hit-test rect of the "PROBLEMS" tab in the panel tab strip. Empty when
     /// the panel is hidden.
     problems_tab_rect: Rect,
@@ -4249,8 +4243,6 @@ impl App {
 
         let (search_query_tx, search_query_rx) = std::sync::mpsc::channel();
         let (search_results_tx, search_results_rx) = std::sync::mpsc::channel();
-        let (label_tx, label_rx) = std::sync::mpsc::channel();
-        let (ssh_tx, ssh_rx) = std::sync::mpsc::channel();
         let search_root = root.clone();
         std::thread::spawn(move || {
             crate::widgets::search::search_worker_loop(
@@ -4603,8 +4595,6 @@ impl App {
             pending_remote_launch_path: None,
             ssh_offer: None,
             ssh_offer_seen: std::collections::BTreeMap::new(),
-            ssh_rx,
-            ssh_tx,
             remote_offer_disabled: loaded_prefs.disable_remote_offer,
             remote_offer_excluded: loaded_prefs.remote_offer_excluded_hosts.clone(),
             fleet_groups: loaded_prefs.fleet_groups.clone(),
@@ -4723,9 +4713,7 @@ impl App {
             fleet_run: None,
             fleet_command: String::new(),
             last_label_refresh: std::time::Instant::now(),
-            label_rx,
-            label_tx,
-            label_inflight: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            label_pass: None,
             problems_tab_rect: Rect::default(),
             output_tab_rect: Rect::default(),
             ports_tab_rect: Rect::default(),
