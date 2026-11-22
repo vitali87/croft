@@ -2808,6 +2808,44 @@ fn a_search_left_and_reopened_before_its_cancel_lands_runs_again() {
     assert_eq!(app.search.progress, SearchProgress::Finished);
 }
 
+/// #2612 review: a new root after leaving Search, before the stopped run's
+/// events have landed, still drops them: the run counted as stopped, but
+/// its hits for the old root and its end must not fill the cleared list.
+#[test]
+fn a_new_root_after_leaving_search_drops_the_stopped_runs_events() {
+    use crate::widgets::search::{SearchEvent, SearchHit};
+    let tmp = tempfile::tempdir().unwrap();
+    let new_root = tmp.path().join("sub");
+    std::fs::create_dir(&new_root).unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.set_sidebar_view(SidebarView::Search);
+    app.search.query = String::from("needle");
+    app.submit_search_query();
+    let run = app.search.run;
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.search_results_rx = rx;
+    app.set_sidebar_view(SidebarView::Explorer);
+    app.change_workspace_root(new_root);
+    tx.send(SearchEvent::Hits(
+        run,
+        vec![SearchHit {
+            path: tmp.path().join("a.txt"),
+            line_no: 1,
+            line_text: String::from("needle"),
+            matches: 1,
+        }],
+    ))
+    .unwrap();
+    tx.send(SearchEvent::Done(run)).unwrap();
+    app.drain_search_results();
+    assert!(app.search.hits.is_empty(), "nothing of the old root lands");
+    assert_eq!(
+        app.search.progress,
+        SearchProgress::Cancelled,
+        "and the search is not taken as finished"
+    );
+}
+
 /// #2608: a new Explorer root cuts the run in flight short: its hits for
 /// the old root are dropped instead of landing in the cleared list, and the
 /// search is not taken as finished.
