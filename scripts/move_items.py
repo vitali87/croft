@@ -300,6 +300,9 @@ Tree = namedtuple("Tree", "anchor folder row width")
 # each piece holds (as FILES above), where the docs list them, the prefix of
 # its release-note fragments, and the docs and note words for its tests
 # moved out (`--tests-out`): (module doc, release-note phrase, docs row).
+# `more_tests` has the same words for any other inline module moved out
+# whole, by name: remote.rs's second test module, file_tree.rs's Android
+# trash.
 Target = namedtuple("Target", "name manifest source dir files tree note_prefix tests more_tests",
                     defaults=({},))
 
@@ -1927,11 +1930,428 @@ LANGUAGE_SERVERS = Target(
     None,
 )
 
+# The debug session's feature files (#2062): (module doc, release-note phrase, docs row).
+DAP_SESSION_FILES = {
+    "events": (
+        "Reading what an adapter sends: a raw DAP message classified into the [`DapEvent`]\n"
+        "the app acts on, which program output is worth showing, and why an adapter refused\n"
+        "to start.",
+        "debug event",
+        "a raw DAP message classified into a `DapEvent`, the output worth showing, and why "
+        "an adapter refused to start",
+    ),
+    "start_requests": (
+        "The requests that start and end a session: `initialize`, each adapter family's\n"
+        "`launch` (debugpy, lldb-dap, delve and vscode-js-debug), `configurationDone` and\n"
+        "`disconnect`, and the adapter families themselves.",
+        "debug start request",
+        "`initialize`, each adapter family's `launch`, `configurationDone` and "
+        "`disconnect`",
+    ),
+    "child_sessions": (
+        "vscode-js-debug's child sessions: its `startDebugging` reverse request, the answer\n"
+        "every reverse request needs, and opening the child.",
+        "js-debug child session",
+        "vscode-js-debug's `startDebugging` reverse request, the answer every reverse "
+        "request needs, and opening the child",
+    ),
+    "breakpoints": (
+        "Breakpoints: line, function and data breakpoints and logpoints, what the adapter\n"
+        "reports back about each, pushing them mid-session, and Run to Cursor's one-stop\n"
+        "breakpoint.",
+        "debug breakpoint",
+        "line, function and data breakpoints, what the adapter reports back, and Run to "
+        "Cursor",
+    ),
+    "exceptions": (
+        "Exception breakpoints: the filters an adapter offers, which of them mean \"break on\n"
+        "raised exceptions\", turning those on and off, and the one-line summary of what was\n"
+        "thrown.",
+        "exception breakpoint",
+        "the exception filters an adapter offers, breaking on raised exceptions, and what "
+        "was thrown",
+    ),
+    "stepping": (
+        "Running and stepping: pause, continue, step over, into and out, and Step Into\n"
+        "Target's choice among the calls on the line.",
+        "debug stepping",
+        "pause, continue, step over, into and out, and Step Into Target",
+    ),
+    "inspection": (
+        "Inspecting a stopped program: threads, the call stack, scopes and variables,\n"
+        "expensive scopes, evaluate and the hover's lookup, and the locals inline values\n"
+        "draw from.",
+        "debug inspection",
+        "threads, the call stack, scopes and variables, evaluate, and the locals inline "
+        "values draw from",
+    ),
+    "running_set": (
+        "The debug sessions in flight: each one's name, Debug Console streams and background\n"
+        "backlog, and which one is focused.",
+        "debug session set",
+        "the sessions in flight: their names, console streams and backlogs, and which one "
+        "is focused",
+    ),
+    "launch": (
+        "Starting and ending a session: spawning or reaching each adapter (debugpy, lldb-dap,\n"
+        "delve, vscode-js-debug, a server already listening), where delve builds the program,\n"
+        "the fresh session around its transport, and disconnecting.",
+        "debug launch",
+        "spawning or reaching each adapter, delve's build folder, the fresh session, and "
+        "disconnecting",
+    ),
+    "messages": (
+        "The per-frame poll: draining what the adapters sent, the handshake, each message's\n"
+        "effect on the session, and which connection and capabilities user-facing requests\n"
+        "go to.",
+        "debug message",
+        "the per-frame poll: the handshake, each message's effect on the session, and the "
+        "adapter's capabilities",
+    ),
+}
+
+DAP_SESSION = Target(
+    "dap_session", "scripts/split_dap_session_manifest.tsv", "src/dap/session.rs",
+    "src/dap/session", DAP_SESSION_FILES,
+    Tree(
+        # remote/session.rs's row starts the same way, and comes first.
+        "│   ├── session.rs            one debug launch session",
+        "│   ├── session/         the debug session's feature files, beside session.rs; "
+        "each file's `//!` doc says what it holds",
+        "│   │   ├── ", 20,
+    ),
+    "dap-session-",
+    (
+        "The debug session's own tests, moved out of session.rs (#2062).",
+        "the debug session's tests",
+        "the debug session's own tests",
+    ),
+    {
+        "session_set_tests": (
+            "The tests of the set of debug sessions in flight, moved out of session.rs (#2062).",
+            "the session set's tests",
+            "the tests of the set of debug sessions in flight",
+        ),
+    },
+)
+
+# The Explorer's file tree's feature files (#2062): (module doc, release-note phrase, docs row).
+FILE_TREE_FILES = {
+    "roots": (
+        "The workspace roots the Explorer lists: replacing the primary root, adding and\n"
+        "removing the others' sections, and which root owns a path.",
+        "Explorer root",
+        "the workspace roots: replacing the primary, adding and removing the others, and "
+        "which owns a path",
+    ),
+    "decorations": (
+        "How a row looks: its git decoration and name colour, the folder icon's colour, the\n"
+        "active indent guide, and whether a path is ignored, gone at the scrubbed commit, or\n"
+        "changed by an agent and not yet reviewed.",
+        "Explorer row decoration",
+        "a row's git decoration, name and icon colours, the active indent guide, and "
+        "ignored or agent-changed paths",
+    ),
+    "selection": (
+        "Selecting rows: the cursor, the multi-selection and its shift-anchor, Select All,\n"
+        "and the paths Cut, Copy, Delete and drag act on.",
+        "Explorer selection",
+        "the cursor, the multi-selection and its anchor, and the paths an action takes",
+    ),
+    "listing": (
+        "Listing a folder's entries: reading them, Explorer order, compact folders, loading\n"
+        "and refreshing children with their expansion kept, and which folder a file system\n"
+        "event refreshes.",
+        "Explorer listing",
+        "reading a folder, Explorer order, compact folders, and refreshing children on "
+        "file system events",
+    ),
+    "navigation": (
+        "Moving through the tree: the arrow, page, Home and End keys with and without\n"
+        "Shift, scrolling, expanding and collapsing, Collapse All, revealing a path, and\n"
+        "type-to-find.",
+        "Explorer navigation",
+        "the arrow, page, Home and End keys, scrolling, expanding and collapsing, "
+        "revealing a path, and type-to-find",
+    ),
+    "sticky": (
+        "Sticky scroll: the folders pinned at the top while their contents scroll, and a\n"
+        "click on one.",
+        "Explorer sticky scroll",
+        "the folders pinned at the top while their contents scroll",
+    ),
+    "new_and_rename": (
+        "New File, New Folder and Rename: where a new entry goes, checking the name typed,\n"
+        "creating it, and renaming, a respelling that only changes case included.",
+        "Explorer new and rename",
+        "New File, New Folder and Rename: where an entry goes, checking its name, and "
+        "renaming",
+    ),
+    # Not `trash`: a module of that name in file_tree.rs would shadow the `trash` crate
+    # its code calls as `trash::delete`.
+    "deletion": (
+        "Delete: which rows may be deleted, and moving one or many paths to the system's\n"
+        "trash, recoverably.",
+        "Explorer delete",
+        "which rows may be deleted, and moving paths to the system's trash",
+    ),
+    "move_and_copy": (
+        "Pasting and dropping: a destination name that collides with nothing, refusing a\n"
+        "folder into itself, and moving or copying across file systems.",
+        "Explorer move and copy",
+        "pasting and dropping: a free destination name, no folder into itself, moving and "
+        "copying",
+    ),
+    "filter": (
+        "The tree filter: VS Code's fuzzy match of what was typed, and a row's name with the\n"
+        "matched letters bold.",
+        "Explorer filter",
+        "the tree filter's fuzzy match, and the matched letters bold in a row's name",
+    ),
+    "drawing": (
+        "Drawing the tree: its rows, icons, marks and guides, the sticky band, the scrollbar,\n"
+        "and the dot on a file an agent changed.",
+        "Explorer drawing",
+        "drawing the rows, icons, guides, sticky band and scrollbar",
+    ),
+}
+
+FILE_TREE = Target(
+    "file_tree", "scripts/split_file_tree_manifest.tsv", "src/widgets/file_tree.rs",
+    "src/widgets/file_tree", FILE_TREE_FILES,
+    Tree(
+        "    ├── file_tree.rs ",
+        "    ├── file_tree/        the Explorer's file tree's feature files, beside "
+        "file_tree.rs; each file's `//!` doc says what it holds",
+        "    │   ├── ", 18,
+    ),
+    "file-tree-",
+    (
+        "The Explorer's file tree's own tests, moved out of file_tree.rs (#2062).",
+        "the file tree's tests",
+        "the file tree's own tests",
+    ),
+    {
+        "android_trash": (
+            "Moving an entry to the trash on Android, where the `trash` crate has none: the\n"
+            "freedesktop.org home trash, moved out of file_tree.rs (#2062).",
+            "the Android trash's functions",
+            "the freedesktop home trash on Android, where the `trash` crate has none",
+        ),
+    },
+)
+
+# What each file split out of src/dap/configs.rs holds, as FILES above.
+DAP_CONFIGS_FILES = {
+    "inputs": (
+        "launch.json's `inputs`: reading the array, the `${input:id}` ids a configuration\n"
+        "uses, and which of them are still to ask for.",
+        "launch input",
+        "the `inputs` array, the `${input:id}` ids a configuration uses, and which are still to "
+        "ask",
+    ),
+    "discovery": (
+        "Finding the configurations: `.croft/launch.json`, then `.vscode/launch.json`, each\n"
+        "workspace folder's, the configurations and compounds each declares, and the folders\n"
+        "`${workspaceFolder:name}` names.",
+        "launch configuration discovery",
+        "finding every launch.json and what it declares, and the folders a name points at",
+    ),
+    "presentation": (
+        "`presentation` blocks: hiding an entry, its group and order, the malformed shapes\n"
+        "reported, and the picker's order, as VS Code sorts it.",
+        "launch presentation",
+        "`presentation` blocks: hidden entries, groups and order, and the picker's sort",
+    ),
+    "compounds": (
+        "Compounds: several configurations launched together, read from `compounds` and\n"
+        "resolved against the configurations beside them.",
+        "launch compound",
+        "compounds: reading them and resolving their members",
+    ),
+    "substitution": (
+        "`${...}` variables: what they resolve against, and expanding them in a string or a\n"
+        "whole configuration, with an unknown one a hard error.",
+        "launch variable",
+        "`${...}` variables: expanding them, with an unknown one an error",
+    ),
+    "env_files": (
+        "`envFile`: reading a dotenv file as python-dotenv and VS Code do, its quotes,\n"
+        "escapes, comments and `${NAME}` references.",
+        "env file",
+        "reading a dotenv `envFile`: quotes, escapes, comments and `${NAME}` references",
+    ),
+    "resolve": (
+        "Resolving a configuration: substitution done, the `envFile` loaded and the mapped\n"
+        "fields split out, cppdbg's spellings and the keys lldb-dap ignores, and the adapter\n"
+        "family a `type` maps to.",
+        "launch resolve",
+        "resolving a configuration: substitution, `envFile`, the mapped fields and the adapter a "
+        "`type` maps to",
+    ),
+    "debug_test": (
+        "The configuration for debugging tests: the one whose `purpose` says so, and laying\n"
+        "it over croft's own pytest launch.",
+        "debug-test configuration",
+        "the configuration for debugging tests, laid over croft's pytest launch",
+    ),
+    "python": (
+        "debugpy's `launch` and `attach` requests, and where an attach with `connect` goes.",
+        "debugpy request",
+        "debugpy's `launch` and `attach` requests",
+    ),
+    "lldb": (
+        "lldb-dap's `launch` and `attach` requests, the processes an attach can pick from, and\n"
+        "CodeLLDB's `cargo` block: building with cargo and picking the executable it built.",
+        "lldb request",
+        "lldb-dap's requests, the processes to attach to, and building a `cargo` block",
+    ),
+    "go": (
+        "delve's `launch` and `attach` requests: the Go extension's `auto` mode resolved, and\n"
+        "where Connect to server finds a headless delve.",
+        "delve request",
+        "delve's requests, `auto` mode, and Connect to server",
+    ),
+    "js": (
+        "vscode-js-debug's `launch` and `attach` requests: browsers and their headless\n"
+        "launch, `node-terminal`'s command, what a Node launch must name, and the\n"
+        "`__workspaceFolder` it sends.",
+        "js-debug request",
+        "vscode-js-debug's requests: browsers, `node-terminal`, and what a Node launch must name",
+    ),
+    "add_configuration": (
+        "Debug: Add Configuration…: the fields it asks for, checking each answer, the\n"
+        "launch.json entry it makes, and writing it into `.croft/launch.json` safely.",
+        "Add Configuration",
+        "Debug: Add Configuration…: its fields, the entry it makes, and writing "
+        "`.croft/launch.json`",
+    ),
+}
+
+DAP_CONFIGS = Target(
+    "dap_configs", "scripts/split_dap_configs_manifest.tsv", "src/dap/configs.rs",
+    "src/dap/configs", DAP_CONFIGS_FILES,
+    Tree(
+        # The app's debugger/configs.rs row is one level deeper, so it never starts this way.
+        "│   ├── configs.rs ",
+        "│   ├── configs/         launch.json's feature files, beside configs.rs; each file's "
+        "`//!` doc says what it holds",
+        "│   │   ├── ", 20,
+    ),
+    "dap-configs-",
+    (
+        "The launch configurations' own tests, moved out of configs.rs (#2062).",
+        "the launch configurations' tests",
+        "the launch configurations' own tests",
+    ),
+)
+
+# What each file split out of src/testing/worker.rs holds, as FILES above.
+TEST_WORKER_FILES = {
+    "runners": (
+        "Which runner runs a workspace's tests: the extensions' `[[test_runners]]`, every\n"
+        "runner that claims a folder, and the one a file's or a test's language picks.",
+        "test runner choice",
+        "which runner runs a folder's, a file's or a test's tests",
+    ),
+    "control": (
+        "Cancelling a run: the process group of the runner the worker is blocked on, and\n"
+        "killing it.",
+        "test cancel",
+        "cancelling a run by killing its runner's process group",
+    ),
+    "handle": (
+        "The app's side of the worker: queueing each kind of run and discovery, cancelling,\n"
+        "re-rooting, and draining the streamed results into the panel.",
+        "test worker handle",
+        "queueing runs and discoveries, cancelling, re-rooting, and draining results",
+    ),
+    "commands": (
+        "cargo's command line: rooted at the workspace, with `--workspace` when it has one,\n"
+        "and its build-status lines as progress.",
+        "cargo test command",
+        "cargo's command line, and its build-status lines as progress",
+    ),
+    "pytest": (
+        "pytest's command line: the interpreter or script that runs it, whether the project's\n"
+        "Python has it, and its verbosity for runs and discovery.",
+        "pytest command",
+        "pytest's command line: which Python or script runs it, and its verbosity",
+    ),
+    "go_and_codeql": (
+        "`go test -json` and `codeql test run`: finding `go`, their command lines, and\n"
+        "streaming their results.",
+        "go and CodeQL test command",
+        "`go test -json` and `codeql test run`: their command lines and results",
+    ),
+    "test_binaries": (
+        "Debugging a Rust test: the harness executables `cargo test --no-run` builds, and the\n"
+        "one that holds the test.",
+        "test binary",
+        "the cargo test harnesses built, and the one that holds a test",
+    ),
+    "js_args": (
+        "vitest's and jest's command lines: the project's own binary, vitest projects, and\n"
+        "the arguments that pick one test, a suite or a file.",
+        "JS test command",
+        "vitest's and jest's command lines, and the arguments that pick a test, a suite or a file",
+    ),
+    "streaming": (
+        "Streaming a runner's output: each line tagged with its request's epoch and runner,\n"
+        "stderr teed to OUTPUT, and the exit code.",
+        "test output streaming",
+        "streaming a runner's output, tagged with its request, and its exit code",
+    ),
+    "coverage": (
+        "Coverage runs: the LCOV each runner writes, narrowing a run to a scope, the tool that\n"
+        "measures it and installing it, and why a run produced no report.",
+        "test coverage",
+        "coverage runs: LCOV, scopes, and each runner's coverage tool",
+    ),
+    "runs": (
+        "Running tests: everything, one, several, or those matching a filter, with each\n"
+        "runner's arguments.",
+        "test run",
+        "running every test, one, several, or a filter's",
+    ),
+    "discovery": (
+        "Discovering tests without running them: each runner's lister, streamed.",
+        "test discovery",
+        "listing each runner's tests without running them",
+    ),
+    "main_loop": (
+        "The worker thread's loop: taking each request in turn and handing it to its run or\n"
+        "discovery.",
+        "test worker loop",
+        "the worker thread's loop",
+    ),
+}
+
+TEST_WORKER = Target(
+    "test_worker", "scripts/split_test_worker_manifest.tsv", "src/testing/worker.rs",
+    "src/testing/worker", TEST_WORKER_FILES,
+    Tree(
+        # git/worker.rs's row starts the same way, and comes first.
+        "│   ├── worker.rs             the test-runner command layer",
+        "│   └── worker/          the test runner's feature files, beside worker.rs; each file's "
+        "`//!` doc says what it holds",
+        "│       ├── ", 20,
+    ),
+    "test-worker-",
+    (
+        "The test runner's own tests, moved out of worker.rs (#2062).",
+        "the test runner's tests",
+        "the test runner's own tests",
+    ),
+)
+
+
 TARGETS = {
     t.name: t
     for t in (
         APP, EDITOR, LSP, TERMINAL, GIT, REMOTE, SEARCH, SESSION_HOST, PAIR, SOURCE_CONTROL,
-        CLI, CODEQL, DEBUGGER, LANGUAGE_SERVERS,
+        CLI, CODEQL, DEBUGGER, LANGUAGE_SERVERS, DAP_SESSION, FILE_TREE, DAP_CONFIGS,
+        TEST_WORKER,
     )
 }
 
@@ -2613,16 +3033,20 @@ def check(root, t=APP):
 
 
 def tests_header(name):
-    return re.compile(rf"(^|\n)\s*mod\s+{re.escape(name)}\s*\{{$")
+    """The header line of an inline `mod <name> {`, with or without a
+    visibility: dap/session.rs's tests are `pub(crate) mod tests`, as the
+    app's tests borrow its fake adapters."""
+    return re.compile(rf"(^|\n)\s*(?:pub(?:\([^()]*\))?\s+)?mod\s+{re.escape(name)}\s*\{{$")
 
 
 def tests_out(root, t, fmt=True, name="tests"):
     """Move the inline `mod <name> { ... }` (`mod tests` unless the target
-    names another test module) at the top level of the target's file to
+    names another module) at the top level of the target's file to
     <dir>/<name>.rs: the block's body, dedented by its indentation, and
-    `mod <name>;` where the block was. The module keeps its name and its
-    place, so its `use super::*;` still reaches the split file. The header's
-    attributes and the docs and comments above it stay. A line that starts
+    `mod <name>;` where the block was, keeping the module's visibility. The
+    module keeps its name and its place, so its `use super::*;` still
+    reaches the split file. The header's attributes (a `#[cfg(...)]`
+    included) and the docs and comments above it stay. A line that starts
     inside a string keeps its indentation, which is part of the string.
     Writes the release note and the docs row too. Returns the number of
     lines moved."""
@@ -2676,7 +3100,7 @@ def tests_out(root, t, fmt=True, name="tests"):
     if fmt:
         subprocess.run(["cargo", "fmt"], cwd=root, check=True)
     moved = close - open_line - 1
-    print(f"moved {moved} line(s) of tests from {t.source} to {t.dir}/{name}.rs")
+    print(f"moved {moved} line(s) of `mod {name}` from {t.source} to {t.dir}/{name}.rs")
     return moved
 
 
@@ -2686,7 +3110,7 @@ def main(argv=None):
     ap.add_argument("--pr", type=int, help="the PR whose items to move")
     ap.add_argument("--check", action="store_true", help="only check the manifest")
     ap.add_argument("--tests-out", nargs="?", const="tests", metavar="MODULE",
-                    help="move the file's inline `mod tests` (or the test module named) to its own file")
+                    help="move the file's inline `mod tests` (or the inline module named) to its own file")
     ap.add_argument("--root", default=".", help="the repository root")
     ap.add_argument("--no-fmt", action="store_true", help="skip `cargo fmt` (for tests)")
     ap.add_argument("--no-build", action="store_true", help="skip the build and its glue fixes (for tests)")

@@ -309,7 +309,36 @@ src/
 ├── dap/                 debugger stack: Debug Adapter Protocol client. debugpy (Python: the adapter on a private 3.14+ venv, the program on the project's own interpreter, #864) is the verified mechanism; Rust/C/C++ route to lldb-dap; JS/TS route to vscode-js-debug; Go routes to delve (`dlv dap` over TCP, single-session, #264). Which file types each handles is a data-driven extension axis (see registry.rs)
 │   ├── mod.rs
 │   ├── transport.rs     DAP wire framing (Content-Length + seq envelope, not JSON-RPC, so async-lsp can't be reused); spawns the adapter detached via setsid (so the debuggee can't tcsetpgrp-background and SIGTTIN-suspend croft, and so teardown can killpg the whole group), blocking reader thread frames stdout into an mpsc channel; Drop signals the process group and reaps the child, except after a `disconnect` (#1536): then a detached teardown thread gives the adapter up to 2 s to answer and end the debuggee, kills the group, and SIGKILLs the debuggee pid from the `process` event if a launched program is still running (debugpy's launcher puts it in its own group, out of `killpg`'s reach); quit stops every session and joins these teardowns
-│   ├── session.rs            one debug launch session: the initialize → setBreakpoints → configurationDone → stopped state machine, event classifier, the stackTrace → scopes → variables chain, evaluate, breakpoints and logpoints, over one adapter-agnostic launch_with
+│   ├── session.rs            one debug launch session: the initialize → setBreakpoints → configurationDone → stopped state machine, event classifier, the stackTrace → scopes → variables chain, evaluate, breakpoints and logpoints, over one adapter-agnostic launch_with: what its parts share (`DapSession` and the types its fields hold: its phase, a source breakpoint, a stack frame, a scope, a variable and delve's build folder; and the `DapEvent`s `poll` returns); each part is in a file in `session/` below
+│   ├── session/         the debug session's feature files, beside session.rs; each file's `//!` doc says what it holds
+│   │   ├── breakpoints.rs       line, function and data breakpoints, what the adapter reports back, and Run to Cursor
+│   │   ├── child_sessions.rs    vscode-js-debug's `startDebugging` reverse request, the answer every reverse request needs, and opening the child
+│   │   ├── events.rs            a raw DAP message classified into a `DapEvent`, the output worth showing, and why an adapter refused to start
+│   │   ├── exceptions.rs        the exception filters an adapter offers, breaking on raised exceptions, and what was thrown
+│   │   ├── inspection.rs        threads, the call stack, scopes and variables, evaluate, and the locals inline values draw from
+│   │   ├── launch.rs            spawning or reaching each adapter, delve's build folder, the fresh session, and disconnecting
+│   │   ├── messages.rs          the per-frame poll: the handshake, each message's effect on the session, and the adapter's capabilities
+│   │   ├── running_set.rs       the sessions in flight: their names, console streams and backlogs, and which one is focused
+│   │   ├── session_set_tests.rs the tests of the set of debug sessions in flight
+│   │   ├── start_requests.rs    `initialize`, each adapter family's `launch`, `configurationDone` and `disconnect`
+│   │   ├── stepping.rs          pause, continue, step over, into and out, and Step Into Target
+│   │   ├── tests.rs             the debug session's own tests
+│   ├── configs.rs            launch.json, `.croft` over `.vscode`: its configurations and compounds, `inputs`, `presentation`, `${...}` variables and `envFile`, each entry resolved into its adapter's DAP request, and the entry Debug: Add Configuration… writes: what its parts share (`DebugConfig`, its `RequestKind` and its `preLaunchTask`); each part is in a file in `configs/` below
+│   ├── configs/         launch.json's feature files, beside configs.rs; each file's `//!` doc says what it holds
+│   │   ├── add_configuration.rs Debug: Add Configuration…: its fields, the entry it makes, and writing `.croft/launch.json`
+│   │   ├── compounds.rs         compounds: reading them and resolving their members
+│   │   ├── debug_test.rs        the configuration for debugging tests, laid over croft's pytest launch
+│   │   ├── discovery.rs         finding every launch.json and what it declares, and the folders a name points at
+│   │   ├── env_files.rs         reading a dotenv `envFile`: quotes, escapes, comments and `${NAME}` references
+│   │   ├── go.rs                delve's requests, `auto` mode, and Connect to server
+│   │   ├── inputs.rs            the `inputs` array, the `${input:id}` ids a configuration uses, and which are still to ask
+│   │   ├── js.rs                vscode-js-debug's requests: browsers, `node-terminal`, and what a Node launch must name
+│   │   ├── lldb.rs              lldb-dap's requests, the processes to attach to, and building a `cargo` block
+│   │   ├── presentation.rs      `presentation` blocks: hidden entries, groups and order, and the picker's sort
+│   │   ├── python.rs            debugpy's `launch` and `attach` requests
+│   │   ├── resolve.rs           resolving a configuration: substitution, `envFile`, the mapped fields and the adapter a `type` maps to
+│   │   ├── substitution.rs      `${...}` variables: expanding them, with an unknown one an error
+│   │   ├── tests.rs             the launch configurations' own tests
 │   ├── registry.rs           data-driven debug-adapter registry: maps a file extension to an AdapterKind from the `[[debug_adapters]]` blocks in bundled + user manifests, skipping adapters whose extension is disabled in the Extensions panel
 │   ├── log.rs           optional DAP wire log at ~/.croft/dap.log (gated by CROFT_DAP_LOG), mirroring lsp/log_file.rs
 │   ├── install.rs       provisions a private debugpy venv at ~/.croft/debug-venv via uv (PEP 668 forbids pip-ing into the uv-managed CPython; mirrors ~/.croft/servers), and the vscode-js-debug server at ~/.croft/js-debug from a release pinned by version and SHA-256
@@ -325,7 +354,22 @@ src/
 │   ├── model.rs         TestStatus (NotRun/Running/Passed/Failed/Skipped) + TestCase; suite_and_leaf splits a `module::name` path for the tree
 │   ├── registry.rs           data-driven test-runner registry: maps a workspace root to a Runner from the `[[test_runners]]` blocks in bundled + user manifests, skipping runners whose extension is disabled in the Extensions panel
 │   ├── parse.rs              per-tool output parsers — libtest, pytest (plain `-v` lines and pytest-xdist's outcome-first `[gwN]` lines), vitest, jest — with all node IDs normalised to `::` separators so one panel tree serves every runner
-│   └── worker.rs             the test-runner command layer: RunAll / RunOne / RunFilter / RunSuite / Discover per runner, building each tool's argv and streaming cases over an mpsc channel
+│   ├── worker.rs             the test-runner command layer: RunAll / RunOne / RunFilter / RunSuite / Discover per runner, building each tool's argv and streaming cases over an mpsc channel: what its parts share (`Runner`, `TestRequest`, `TestResponse` with the `CoverageError` it carries, `TestWorker`, the handle the app holds, and the `RunControl` and `EpochTx` structs whose fields several parts read); each part is in a file in `worker/` below
+│   └── worker/          the test runner's feature files, beside worker.rs; each file's `//!` doc says what it holds
+│       ├── commands.rs          cargo's command line, and its build-status lines as progress
+│       ├── control.rs           cancelling a run by killing its runner's process group
+│       ├── coverage.rs          coverage runs: LCOV, scopes, and each runner's coverage tool
+│       ├── discovery.rs         listing each runner's tests without running them
+│       ├── go_and_codeql.rs     `go test -json` and `codeql test run`: their command lines and results
+│       ├── handle.rs            queueing runs and discoveries, cancelling, re-rooting, and draining results
+│       ├── js_args.rs           vitest's and jest's command lines, and the arguments that pick a test, a suite or a file
+│       ├── main_loop.rs         the worker thread's loop
+│       ├── pytest.rs            pytest's command line: which Python or script runs it, and its verbosity
+│       ├── runners.rs           which runner runs a folder's, a file's or a test's tests
+│       ├── runs.rs              running every test, one, several, or a filter's
+│       ├── streaming.rs         streaming a runner's output, tagged with its request, and its exit code
+│       ├── test_binaries.rs     the cargo test harnesses built, and the one that holds a test
+│       ├── tests.rs             the test runner's own tests
 ├── mcp/                 MCP sidecar host (Tier-1 extensions): croft is a DETERMINISTIC MCP host — a human invokes a contributed palette command and croft calls one pre-known tool on one vetted local server (no LLM picks tools), which removes MCP's whole prompt-injection/tool-poisoning attack family
 │   ├── mod.rs           module overview + McpOutcome (the off-thread worker's result)
 │   ├── transport.rs     JSON-RPC 2.0 over newline-delimited JSON on the server's stdio (the MCP stdio framing; simpler than DAP's Content-Length); setsid-detached child, reader thread -> mpsc, stderr drained into an 8 KiB tail whose last line names why a server exited before answering, least-privilege env_clear()+envs()
@@ -406,7 +450,21 @@ src/
     ├── editor_find.rs        VS Code-style inline Find bar (`Cmd+F`) with match highlight, Enter/Shift+Enter walk, case/whole-word/regex toggles and a Replace row (`Cmd+Opt+F`); Replace All runs through the same `split_for_highlight` as count and paint
     ├── extensions.rs         Extensions sidebar widget: projects bundled and user manifests into a theme-aware list grouped under BUILT-IN/INSTALLED/AVAILABLE, with pill toggles, +Add, trash, a local filter box and clear/refresh; reports clicks back to App, which owns the state
     ├── file_finder.rs   VS Code-style Quick Open (Cmd+P) fuzzy file picker with tiered match ranking (exact filename > prefix > substring > path > subsequence)
-    ├── file_tree.rs          `ignore::WalkBuilder` backed file tree: lazy children, fs-watcher refresh, multi-select, drag-drop, bulk trash, reveal-path, multi-root section rows, sticky scroll and compact folders
+    ├── file_tree.rs          `ignore::WalkBuilder` backed file tree: lazy children, fs-watcher refresh, multi-select, drag-drop, bulk trash, reveal-path, multi-root section rows, sticky scroll and compact folders: what its parts share (`FileTree`, its constructor, and `Node`, the row its fields hold); each part is in a file in `file_tree/` below
+    ├── file_tree/        the Explorer's file tree's feature files, beside file_tree.rs; each file's `//!` doc says what it holds
+    │   ├── android_trash.rs   the freedesktop home trash on Android, where the `trash` crate has none
+    │   ├── decorations.rs     a row's git decoration, name and icon colours, the active indent guide, and ignored or agent-changed paths
+    │   ├── deletion.rs        which rows may be deleted, and moving paths to the system's trash
+    │   ├── drawing.rs         drawing the rows, icons, guides, sticky band and scrollbar
+    │   ├── filter.rs          the tree filter's fuzzy match, and the matched letters bold in a row's name
+    │   ├── listing.rs         reading a folder, Explorer order, compact folders, and refreshing children on file system events
+    │   ├── move_and_copy.rs   pasting and dropping: a free destination name, no folder into itself, moving and copying
+    │   ├── navigation.rs      the arrow, page, Home and End keys, scrolling, expanding and collapsing, revealing a path, and type-to-find
+    │   ├── new_and_rename.rs  New File, New Folder and Rename: where an entry goes, checking its name, and renaming
+    │   ├── roots.rs           the workspace roots: replacing the primary, adding and removing the others, and which owns a path
+    │   ├── selection.rs       the cursor, the multi-selection and its anchor, and the paths an action takes
+    │   ├── sticky.rs          the folders pinned at the top while their contents scroll
+    │   ├── tests.rs           the file tree's own tests
     ├── header_pill.rs   shared section-header pill button (chip-backed codicon affordance + theme colours) used by both the Remote Explorer (+ / refresh) and Source Control (refresh) headers
     ├── captures.rs           the panel group's CAPTURES tab (iTerm2's Capture Output): lines collected by `capture` triggers, with Enter jumping to the originating pane row; pure widget capped at 500 entries, and it also shapes the "Ask Navigator about this line" turn
     ├── history_popup.rs      `Ctrl+Shift+H` command-history popup over command_history.rs: query line, newest-first deduped results with exit/duration/cwd meta, `Ctrl+R` scope filter
@@ -939,7 +997,7 @@ Fetches a theme from a marketplace. It resolves a `publisher.name` id, a marketp
 
 ### testing/
 
-Test Runner. A background worker runs the project's test tool off the render loop and streams parsed cases into the Testing panel, mirroring the drain-per-tick pattern of app/git_worker and dap.
+Test Runner. A background worker runs the project's test tool off the render loop and streams parsed cases into the Testing panel, mirroring the drain-per-tick pattern of app/git_worker and dap. `worker.rs` keeps what the app and the worker's parts share: `Runner`, `TestRequest`, `TestResponse` with the `CoverageError` it carries, `TestWorker`, and the `RunControl` and `EpochTx` structs whose fields several parts read. Each part of the worker lives in a file of its own in `worker/`.
 
 **Runner selection.** `cargo test` for Rust, `pytest` for Python, `vitest` or `jest` for JS/TS, `go test` for Go, picked per workspace by `registry::runner_for` from `[[test_runners]]` manifest data. When no enabled runner claims the root, the four run entry points refuse with a status, and the worker refuses a queued request with a dedicated `Refused` response *before* any `Started`. The panel rolls the Running marks back and keeps its tree. Neither layer ever falls through to cargo, so a disabled runner extension really does stop runs. Opening the Testing view never looks for the runner on the UI thread (#1841): finding it reads every runner manifest and can walk the tree for CodeQL test packs, so the view queues a *quiet* discover and the worker decides. The worker answers a quiet discover with a `QuietDiscovery` marker before anything else, and only that marker clears the view's queued flag, so another request's answers cannot let a reopen queue a second discover. A root no runner claims ends at the marker, which says nothing; `r` in the view asks loudly and gets the refusal.
 
@@ -1124,7 +1182,7 @@ VS Code colour theme import: converts a theme `.json` (JSONC, plus `include` cha
 
 ### file_tree.rs
 
-An `ignore::WalkBuilder`-backed tree with lazy children, fs-watcher refresh, multi-select, drag-drop, bulk trash, and reveal-path on `Cmd+P` open.
+An `ignore::WalkBuilder`-backed tree with lazy children, fs-watcher refresh, multi-select, drag-drop, bulk trash, and reveal-path on `Cmd+P` open. `file_tree.rs` keeps the tree itself: `FileTree`, whose private fields every part reads, its constructor, and `Node`, the row it lists. Each feature lives in a file of its own in `file_tree/`.
 
 **Multi-root ready.** `add_root` appends further workspace roots as depth-0 section rows (`root_paths` enumerates them; `self.root` stays the primary). Every root-special behavior keys on the row's *depth*, not index 0: Collapse All spares all root rows, the delete guard refuses them, and `reveal_path` plus the ignored-set ancestor walk resolve through the owning root (longest prefix, so nested roots pick the deeper one). Sticky ancestors were depth-based already.
 
@@ -1520,7 +1578,7 @@ A per-agent ledger of the files an agent changed while you were looking elsewher
 
 ### dap/configs.rs
 
-Reads `launch.json` (`.croft` over `.vscode`), both its `configurations` and its `compounds`, and resolves a chosen entry into a DAP request.
+Reads `launch.json` (`.croft` over `.vscode`), both its `configurations` and its `compounds`, and resolves a chosen entry into a DAP request. `configs.rs` keeps `DebugConfig`, the configuration every part reads, with its `RequestKind` and its `preLaunchTask`. Each feature lives in a file of its own in `configs/`.
 
 **`presentation` is honoured for configurations AND compounds, in one sorted list.** VS Code puts both kinds through the same comparator, so a config and a compound naming the same `presentation.group` belong together; sorting the two kinds separately would split that group no matter what the file asked for. `visible_and_sorted` is transcribed from VS Code's `getVisibleAndSorted` rather than invented, because each of its rules is one croft would otherwise get subtly wrong: an entry that HAS a `presentation` sorts ahead of one that has none, a grouped entry ahead of an ungrouped one, groups by name rather than first-seen, and a numeric `order` ahead of a missing one. The sort is stable, which is what leaves a workspace declaring no `presentation` in exactly its file order. One divergence, deliberate: VS Code compares group names with locale-aware `localeCompare` where croft compares bytewise, which agrees on ASCII and would otherwise cost a collation dependency for a picker's ordering.
 

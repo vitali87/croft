@@ -739,6 +739,26 @@ class OtherTargets(unittest.TestCase):
         code, report = self.root.pure(before)
         self.assertEqual(code, 0, report)
 
+    def test_a_test_module_with_a_visibility_moves_and_keeps_it(self):
+        """dap/session.rs's tests are `pub(crate) mod tests`, for the app's
+        tests that borrow its fake adapters: the module moves all the same,
+        and its declaration keeps the visibility, so those paths still
+        reach it."""
+        shared = EDITOR.replace("\nmod tests {", "\npub(crate) mod tests {")
+        self.assertNotEqual(shared, EDITOR)
+        (self.tmp / SPLIT.source).write_text(shared)
+        self.root.commit()
+        before = subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.tmp, capture_output=True,
+                                text=True, check=True).stdout.strip()
+        code, out = self.tests_out()
+        self.assertEqual(code, 0, out)
+        self.assertTrue(self.root.read(SPLIT.source).endswith(
+            "/// The editor's tests.\n#[cfg(test)]\npub(crate) mod tests;\n"))
+        self.assertIn("\n#[test]\nfn bumps() {\n", self.root.read("src/widgets/editor/tests.rs"))
+        self.root.commit()
+        code, report = self.root.pure(before)
+        self.assertEqual(code, 0, report)
+
     def test_a_test_module_the_target_has_no_words_for_is_refused(self):
         with self.assertRaises(mi.ManifestError) as e:
             mi.tests_out(str(self.tmp), SPLIT, False, "offer_tests")
@@ -814,13 +834,37 @@ class OtherTargets(unittest.TestCase):
     def test_every_target_names_its_own_manifest_file_and_folder(self):
         self.assertEqual(
             sorted(mi.TARGETS),
-            ["app", "cli", "codeql", "debugger", "editor", "git", "language_servers", "lsp",
-             "pair", "remote", "search", "session_host", "source_control", "terminal"],
+            ["app", "cli", "codeql", "dap_configs", "dap_session", "debugger", "editor", "file_tree",
+             "git", "language_servers", "lsp", "pair", "remote", "search", "session_host",
+             "source_control", "terminal", "test_worker"],
         )
         for t in mi.TARGETS.values():
             with self.subTest(target=t.name):
                 self.assertTrue(t.source.endswith(".rs") and t.manifest.endswith(".tsv"))
                 self.assertFalse(t.dir.endswith("/mod"), "never foo/mod.rs (#2062 guardrail 7)")
+
+    def test_no_file_is_named_after_a_crate_or_a_keyword(self):
+        # A module named after a crate shadows it in the file it splits, so the
+        # moved code's `trash::delete` would look in the new module and fail to
+        # build; a keyword (`loop`, `move`) cannot name a module at all.
+        import tomllib
+
+        cargo = tomllib.loads((Path(__file__).resolve().parents[2] / "Cargo.toml").read_text())
+        tables = [cargo, *cargo.get("target", {}).values()]
+        crates = {name.replace("-", "_") for t in tables
+                  for kind in ("dependencies", "dev-dependencies", "build-dependencies")
+                  for name in t.get(kind, {})}
+        self.assertIn("trash", crates)
+        keywords = set(
+            "as async await break const continue crate dyn else enum extern false fn for gen if "
+            "impl in let loop match mod move mut pub ref return self Self static struct super "
+            "trait true try type unsafe use where while abstract become box do final macro "
+            "override priv typeof unsized virtual yield".split())
+        for t in mi.TARGETS.values():
+            for name in [*t.files, *t.more_tests]:
+                with self.subTest(target=t.name, file=name):
+                    self.assertFalse(name in crates, f"`{name}` shadows the crate of that name")
+                    self.assertFalse(name in keywords, f"`{name}` is a keyword")
 
 
 if __name__ == "__main__":

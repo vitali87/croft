@@ -1,0 +1,99 @@
+# Stage B of the refactor program (#2062): where each item of src/widgets/file_tree.rs goes.
+# One row per item, in file order. pr 0 means the item stays in file_tree.rs; the others
+# move to src/widgets/file_tree/<file>.rs in that PR. kind, impl and name are as
+# `scripts/check_pure_move.py list` prints them. Run
+# `scripts/move_items.py --target file_tree --check` after adding an item to file_tree.rs.
+# file_tree.rs keeps FileTree, its constructor, and Node, the row its fields hold.
+pr	file	kind	impl	name
+0		struct	-	Node
+0		fn	impl Node	shown_paths
+0		fn	impl Node	shows
+0		fn	impl Node	label
+0		struct	-	FileTree
+11	drawing	const	-	AGENT_DOT
+0		fn	impl FileTree	new
+1	roots	fn	impl FileTree	set_root
+1	roots	fn	impl FileTree	add_root
+1	roots	fn	impl FileTree	remove_root
+1	roots	fn	impl FileTree	root_paths
+1	roots	fn	impl FileTree	owning_root
+1	roots	fn	impl FileTree	is_root_path
+2	decorations	fn	impl FileTree	git_decoration
+2	decorations	fn	impl FileTree	name_fg
+2	decorations	fn	impl FileTree	folder_icon_fg
+2	decorations	fn	impl FileTree	active_indent_guide
+2	decorations	fn	impl FileTree	is_ignored
+2	decorations	fn	impl FileTree	is_absent_at_scrub
+2	decorations	fn	impl FileTree	is_agent_touched
+2	decorations	fn	impl FileTree	hides_agent_touched
+3	selection	fn	impl FileTree	node_at_y
+3	selection	fn	impl FileTree	select
+3	selection	fn	impl FileTree	select_replace
+3	selection	fn	impl FileTree	toggle_mark
+3	selection	fn	impl FileTree	extend_to
+3	selection	fn	impl FileTree	clear_marks
+3	selection	fn	impl FileTree	is_marked
+3	selection	fn	impl FileTree	select_all_visible
+3	selection	fn	impl FileTree	action_paths
+4	listing	fn	impl FileTree	read_entries
+4	listing	fn	impl FileTree	fold
+4	listing	fn	impl FileTree	load_children
+4	listing	fn	impl FileTree	load_children_preserving_expansion
+5	navigation	fn	impl FileTree	collapse
+5	navigation	fn	impl FileTree	move_up
+5	navigation	fn	impl FileTree	move_down
+5	navigation	fn	impl FileTree	page_up
+5	navigation	fn	impl FileTree	page_down
+5	navigation	fn	impl FileTree	move_up_extend
+5	navigation	fn	impl FileTree	move_down_extend
+5	navigation	fn	impl FileTree	page_up_extend
+5	navigation	fn	impl FileTree	page_down_extend
+5	navigation	fn	impl FileTree	scroll_up
+5	navigation	fn	impl FileTree	scroll_down
+5	navigation	fn	impl FileTree	scroll_to_bar_y
+5	navigation	fn	impl FileTree	scroll_to
+5	navigation	fn	impl FileTree	home
+5	navigation	fn	impl FileTree	end
+5	navigation	fn	impl FileTree	home_extend
+5	navigation	fn	impl FileTree	end_extend
+5	navigation	fn	impl FileTree	activate
+5	navigation	fn	impl FileTree	expand_selected
+5	navigation	fn	impl FileTree	collapse_selected
+5	navigation	fn	impl FileTree	collapse_all
+6	sticky	fn	impl FileTree	visible_indices
+6	sticky	fn	impl FileTree	sticky_rows_for_test
+6	sticky	fn	impl FileTree	sticky_row_at
+3	selection	fn	impl FileTree	selected_path
+5	navigation	fn	impl FileTree	reveal_path
+5	navigation	fn	impl FileTree	make_selected_visible
+5	navigation	fn	impl FileTree	find_prefix
+4	listing	fn	impl FileTree	refresh_children
+3	selection	fn	impl FileTree	prune_marks
+4	listing	fn	impl FileTree	index_of_dir
+4	listing	fn	impl FileTree	row_of
+4	listing	fn	impl FileTree	set_compact_folders
+7	new_and_rename	fn	-	create_target_dir_for
+7	new_and_rename	fn	-	validate_new_name
+7	new_and_rename	fn	-	create_file_in
+8	deletion	fn	-	delete_target_for
+8	deletion	fn	-	move_to_trash
+8	deletion	fn	-	move_to_trash_bulk
+7	new_and_rename	fn	-	rename_in
+7	new_and_rename	fn	-	is_case_only_respelling
+7	new_and_rename	fn	-	rename_target
+4	listing	fn	-	affected_dir_for_event
+9	move_and_copy	fn	-	unique_destination_in
+9	move_and_copy	fn	-	is_descendant_or_same
+9	move_and_copy	fn	-	is_directly_in
+9	move_and_copy	fn	-	move_into
+9	move_and_copy	fn	-	copy_into
+9	move_and_copy	fn	-	copy_recursive
+9	move_and_copy	fn	-	remove_recursive
+10	filter	fn	-	subsequence_match
+10	filter	const	-	FILTER_MATCH_FG
+10	filter	fn	-	push_name_spans
+7	new_and_rename	fn	-	create_folder_in
+11	drawing	fn	impl Widget for &mut FileTree	render
+6	sticky	fn	-	sticky_ancestors
+4	listing	fn	-	explorer_name_cmp
+4	listing	fn	-	natural_cmp
