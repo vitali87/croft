@@ -651,28 +651,42 @@ impl App {
                             .ok()
                             .map(|r| r.to_string_lossy().into_owned());
                         let root = timeline_root;
-                        let tx = self.timeline_tx.clone();
                         let history_root = self.history_root.clone();
                         let abs = path.clone();
                         let now = now_millis();
-                        std::thread::spawn(move || {
-                            // Merge git commits with local snapshots so the
-                            // TIMELINE shows both sources, like VS Code. Git
-                            // history only exists inside the workspace, but
-                            // snapshots are path-keyed and repo-free, so a
-                            // file outside the root still lists its versions.
-                            let commits = rel
-                                .map(|rel| crate::git::file_history(&root, &rel, 50))
-                                .unwrap_or_default();
-                            let snaps = crate::history::entries_in(&history_root, &abs);
-                            let entries = crate::history::merged_timeline(commits, &snaps, now);
-                            let _ = tx.send((path, entries));
-                        });
+                        let job = crate::jobs::Job::spawn(
+                            "timeline",
+                            crate::jobs::Start::Now,
+                            move || {
+                                // Merge git commits with local snapshots so the
+                                // TIMELINE shows both sources, like VS Code. Git
+                                // history only exists inside the workspace, but
+                                // snapshots are path-keyed and repo-free, so a
+                                // file outside the root still lists its versions.
+                                let commits = rel
+                                    .map(|rel| crate::git::file_history(&root, &rel, 50))
+                                    .unwrap_or_default();
+                                let snaps = crate::history::entries_in(&history_root, &abs);
+                                let entries = crate::history::merged_timeline(commits, &snaps, now);
+                                (path, entries)
+                            },
+                        );
+                        // A lookup still running, for this file or the one
+                        // just left, is dropped: its list is older (#2575).
+                        match job {
+                            Ok(job) => self.timeline_fetch = Some(job),
+                            Err(e) => {
+                                self.timeline_fetch = None;
+                                self.timeline.set_failed();
+                                self.status = format!("Could not load the file's history: {e}");
+                            }
+                        }
                     }
                 }
                 None => {
                     if self.timeline_fetched.is_some() {
                         self.timeline_fetched = None;
+                        self.timeline_fetch = None;
                         self.timeline.clear();
                         changed = true;
                     }
@@ -737,11 +751,28 @@ impl App {
                 changed = true;
             }
         }
-        // Drain any TIMELINE replies; ignore one for a since-closed file.
-        while let Ok((path, entries)) = self.timeline_rx.try_recv() {
-            if self.editor.path.as_deref() == Some(path.as_path()) {
-                self.timeline.set_history(path, entries);
-                changed = true;
+        // Collect the TIMELINE lookup; ignore a list for a since-closed file.
+        let settled = match self.timeline_fetch.as_ref().map(crate::jobs::Job::poll) {
+            None | Some(crate::jobs::Poll::Pending) => None,
+            Some(crate::jobs::Poll::Done(reply)) => Some(Some(reply)),
+            // Its thread crashed, and the crash notice said so. The section
+            // says the history could not be loaded instead of "Loading" until
+            // another file is opened (#2574).
+            Some(crate::jobs::Poll::Died) => Some(None),
+        };
+        if let Some(reply) = settled {
+            self.timeline_fetch = None;
+            match reply {
+                Some((path, entries)) => {
+                    if self.editor.path.as_deref() == Some(path.as_path()) {
+                        self.timeline.set_history(path, entries);
+                        changed = true;
+                    }
+                }
+                None => {
+                    self.timeline.set_failed();
+                    changed = true;
+                }
             }
         }
         // Collect the COMMITS graph fetch; ignore a reply for a since-left root.
@@ -785,18 +816,42 @@ impl App {
                     &self.dep_ecosystems,
                 ));
             changed = true;
+            // Whatever ran for the folder just left is dropped here, so its
+            // list cannot land in this one's (#2573).
+            self.deps_fetch = None;
             if !self.dep_ecosystems.is_empty()
                 && self.explorer_views.is_visible(ExplorerView::Dependencies)
             {
-                let tx = self.deps_tx.clone();
-                std::thread::spawn(move || {
-                    let deps = crate::widgets::dependencies::fetch_dependencies(&root);
-                    let _ = tx.send(deps);
-                });
+                let job =
+                    crate::jobs::Job::spawn("dependencies", crate::jobs::Start::Now, move || {
+                        crate::widgets::dependencies::fetch_dependencies(&root)
+                    });
+                match job {
+                    Ok(job) => {
+                        self.dependencies.lookup_started();
+                        self.deps_fetch = Some(job);
+                    }
+                    Err(e) => {
+                        self.dependencies.set_failed();
+                        self.status = format!("Could not list the dependencies: {e}");
+                    }
+                }
             }
         }
-        while let Ok(deps) = self.deps_rx.try_recv() {
-            self.dependencies.set_deps(deps);
+        let settled = match self.deps_fetch.as_ref().map(crate::jobs::Job::poll) {
+            None | Some(crate::jobs::Poll::Pending) => None,
+            Some(crate::jobs::Poll::Done(deps)) => Some(Some(deps)),
+            // Its thread crashed, and the crash notice said so. The section
+            // says the list could not be made instead of "Loading" until the
+            // folder changes (#2572).
+            Some(crate::jobs::Poll::Died) => Some(None),
+        };
+        if let Some(deps) = settled {
+            self.deps_fetch = None;
+            match deps {
+                Some(deps) => self.dependencies.set_deps(deps),
+                None => self.dependencies.set_failed(),
+            }
             changed = true;
         }
 

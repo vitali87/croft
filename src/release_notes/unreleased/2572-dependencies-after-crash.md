@@ -1,0 +1,1 @@
+fix: After the dependency lookup's thread crashes, the Explorer's DEPENDENCIES section says "Could not list dependencies" instead of "Loading…" until the folder changes, and showing the section again retries.
