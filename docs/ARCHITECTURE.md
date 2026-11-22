@@ -356,6 +356,7 @@ src/
 │   ├── parse.rs              per-tool output parsers — libtest, pytest (plain `-v` lines and pytest-xdist's outcome-first `[gwN]` lines), vitest, jest — with all node IDs normalised to `::` separators so one panel tree serves every runner
 │   ├── worker.rs             the test-runner command layer: RunAll / RunOne / RunFilter / RunSuite / Discover per runner, building each tool's argv and streaming cases over an mpsc channel
 │   └── worker/          the test runner's feature files, beside worker.rs; each file's `//!` doc says what it holds
+│       ├── commands.rs          cargo's command line, and its build-status lines as progress
 │       ├── control.rs           cancelling a run by killing its runner's process group
 │       ├── handle.rs            queueing runs and discoveries, cancelling, re-rooting, and draining results
 │       ├── runners.rs           which runner runs a folder's, a file's or a test's tests
