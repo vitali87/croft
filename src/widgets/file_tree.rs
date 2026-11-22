@@ -14,12 +14,21 @@ use std::sync::Arc;
 mod decorations;
 mod listing;
 mod navigation;
+mod new_and_rename;
 mod roots;
 mod selection;
 mod sticky;
 pub use listing::affected_dir_for_event;
 #[cfg(test)]
 use listing::*;
+pub use new_and_rename::create_file_in;
+pub use new_and_rename::create_folder_in;
+pub use new_and_rename::create_target_dir_for;
+pub use new_and_rename::rename_in;
+pub use new_and_rename::rename_target;
+pub use new_and_rename::validate_new_name;
+#[cfg(test)]
+use new_and_rename::*;
 use sticky::*;
 
 pub struct Node {
@@ -216,61 +225,6 @@ impl FileTree {
     }
 }
 
-/// Decide where a "New File" / "New Folder" should be created relative to the
-/// node the user right-clicked on.
-///
-/// * Right-click on a directory → create *inside* that directory.
-/// * Right-click on a file       → create as a *sibling* (in the file's parent).
-/// * Right-click on empty space  → create in the workspace root.
-pub fn create_target_dir_for(node: Option<&Node>, root: &Path) -> PathBuf {
-    let Some(node) = node else {
-        return root.to_path_buf();
-    };
-    if node.is_dir {
-        node.path.clone()
-    } else {
-        node.path
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| root.to_path_buf())
-    }
-}
-
-/// Validate a name typed into the New File / New Folder prompt.
-/// Returns Ok(()) if it can become a single child entry safely.
-pub fn validate_new_name(name: &str) -> Result<(), &'static str> {
-    let trimmed = name.trim();
-    if trimmed.is_empty() {
-        return Err("name cannot be empty");
-    }
-    if trimmed == "." || trimmed == ".." {
-        return Err("name cannot be '.' or '..'");
-    }
-    if trimmed.contains('/') || trimmed.contains('\\') {
-        return Err("name cannot contain slashes");
-    }
-    if trimmed.contains('\0') {
-        return Err("name cannot contain NUL");
-    }
-    Ok(())
-}
-
-/// Create an empty file `name` inside `parent`. Errors if it already exists.
-pub fn create_file_in(parent: &Path, name: &str) -> std::io::Result<PathBuf> {
-    let target = parent.join(name);
-    if target.exists() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            format!("{} already exists", target.display()),
-        ));
-    }
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&target)?;
-    Ok(target)
-}
-
 /// Decide whether a given node may be deleted via the explorer's right-click
 /// menu, returning the path to delete. Refuses for the workspace root and
 /// returns `None` if `node` is None (i.e. right-click on empty tree space).
@@ -339,71 +293,6 @@ pub fn move_to_trash_bulk(paths: &[PathBuf]) -> std::io::Result<()> {
 /// of permanently unlinking the file. See the freedesktop Trash spec v1.0.
 #[cfg(target_os = "android")]
 mod android_trash;
-
-/// Rename the entry at `old_path` to `new_name` within `parent`. Validates
-/// `new_name` via `validate_new_name`, refuses to overwrite an existing
-/// entry, and returns the new absolute path on success. A no-op rename
-/// (same name) returns Ok with the original path unchanged so the user
-/// can hit Enter on the prompt without typing.
-pub fn rename_in(parent: &Path, old_path: &Path, new_name: &str) -> std::io::Result<PathBuf> {
-    let target = rename_target(parent, old_path, new_name)?;
-    if target != old_path {
-        std::fs::rename(old_path, &target)?;
-    }
-    Ok(target)
-}
-
-/// Whether renaming `old_path` to `new_name` in `parent` only respells the
-/// same entry on a case-insensitive volume (macOS by default), where
-/// `README.md` "exists" while `readme.md` is renamed to it. True only when
-/// the directory does not list `new_name` as an entry of its own (so a
-/// separate file, or a hard link to the same file, is still a clash) and
-/// the name resolves to the entry being renamed.
-fn is_case_only_respelling(parent: &Path, old_path: &Path, new_name: &str) -> bool {
-    let listed = std::fs::read_dir(parent).is_ok_and(|entries| {
-        entries
-            .flatten()
-            .any(|e| e.file_name() == std::ffi::OsStr::new(new_name))
-    });
-    if listed {
-        return false;
-    }
-    let target = parent.join(new_name);
-    match (
-        std::fs::symlink_metadata(&target),
-        std::fs::symlink_metadata(old_path),
-    ) {
-        #[cfg(unix)]
-        (Ok(a), Ok(b)) => {
-            use std::os::unix::fs::MetadataExt;
-            a.dev() == b.dev() && a.ino() == b.ino()
-        }
-        // No inode to compare: a name the directory does not list that
-        // still resolves can only be the same entry respelled.
-        #[cfg(not(unix))]
-        (Ok(_), Ok(_)) => true,
-        _ => false,
-    }
-}
-
-/// Where [`rename_in`] would put `old_path`, with the same validation and
-/// without touching the disk, so a caller can ask language servers about
-/// the rename before it happens (#610).
-pub fn rename_target(parent: &Path, old_path: &Path, new_name: &str) -> std::io::Result<PathBuf> {
-    let trimmed = new_name.trim();
-    if let Err(msg) = validate_new_name(trimmed) {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, msg));
-    }
-    let target = parent.join(trimmed);
-    if target != old_path && target.exists() && !is_case_only_respelling(parent, old_path, trimmed)
-    {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            format!("{} already exists", target.display()),
-        ));
-    }
-    Ok(target)
-}
 
 /// Suggest a non-colliding destination path for `source` placed inside
 /// `dest_dir`. If a sibling with the source's basename already exists,
@@ -610,19 +499,6 @@ fn push_name_spans(
     if cursor < name.len() {
         spans.push(Span::styled(name[cursor..].to_string(), base));
     }
-}
-
-/// Create directory `name` inside `parent`. Errors if it already exists.
-pub fn create_folder_in(parent: &Path, name: &str) -> std::io::Result<PathBuf> {
-    let target = parent.join(name);
-    if target.exists() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::AlreadyExists,
-            format!("{} already exists", target.display()),
-        ));
-    }
-    std::fs::create_dir(&target)?;
-    Ok(target)
 }
 
 impl Widget for &mut FileTree {
