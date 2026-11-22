@@ -4201,6 +4201,21 @@ fn commits_show(app: &mut App, summary: &str) -> bool {
     })
 }
 
+/// The ref labels COMMITS, drawn, shows on the commit whose summary is
+/// `summary`.
+fn commit_refs(app: &mut App, summary: &str) -> Vec<String> {
+    draw(app, 110, 44);
+    let area = app.commit_graph.last_area;
+    (area.y..area.y + area.height)
+        .find_map(|y| {
+            app.commit_graph
+                .commit_at(y)
+                .filter(|c| c.summary == summary)
+                .map(|c| c.refs.clone())
+        })
+        .unwrap_or_default()
+}
+
 /// One pass of the main loop's file, git and Explorer steps.
 fn run_git_ticks(app: &mut App) {
     app.poll_filesystem_changes();
@@ -4249,6 +4264,48 @@ fn a_commit_made_outside_croft_reaches_commits() {
             run_git_ticks(&mut app);
             std::thread::sleep(std::time::Duration::from_millis(10));
             commits_show(&mut app, "made outside")
+        },
+    );
+}
+
+/// #2577: a checkout made outside croft to a new branch at the same
+/// commit relabels HEAD in COMMITS, though HEAD's commit did not move.
+#[test]
+fn a_checkout_made_outside_croft_relabels_commits() {
+    let tmp = commit_actions_repo();
+    let p = tmp.path();
+    let mut app = App::new(p.to_path_buf()).unwrap();
+    app.show_tree = true;
+    app.set_sidebar_view(SidebarView::SourceControl);
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(5),
+        "COMMITS to label HEAD with main",
+        || {
+            run_git_ticks(&mut app);
+            commit_refs(&mut app, "update readme")
+                .iter()
+                .any(|r| r == "HEAD -> main")
+        },
+    );
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(5),
+        "the first status",
+        || {
+            run_git_ticks(&mut app);
+            app.git.status().head_oid.is_some()
+        },
+    );
+    app.git.refresh_if_git_moved(true);
+    assert!(git_succeeds(p, &["checkout", "-q", "-b", "fresh"]));
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(5),
+        "COMMITS to label HEAD with the new branch",
+        || {
+            run_git_ticks(&mut app);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            commit_refs(&mut app, "update readme")
+                .iter()
+                .any(|r| r == "HEAD -> fresh")
         },
     );
 }

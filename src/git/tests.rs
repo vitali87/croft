@@ -4258,6 +4258,19 @@ fn outside_staging_and_checkout_move_the_git_state() {
     assert!(watch.moved(&query(p)), "a checkout is seen");
 }
 
+/// #2577: a branch or a tag made outside croft is seen, though neither
+/// moves HEAD: COMMITS labels commits with them.
+#[test]
+fn a_branch_or_tag_made_outside_moves_the_git_state() {
+    let tmp = repo_with_two_commits();
+    let p = tmp.path();
+    let mut watch = settled_watch(p);
+    git_in(p, &["tag", "v1"]);
+    assert!(watch.moved(&query(p)), "a new tag is seen");
+    git_in(p, &["branch", "other"]);
+    assert!(watch.moved(&query(p)), "a new branch is seen");
+}
+
 /// #2577 and #898: croft's own status reads write nothing git's state is
 /// stamped from, even when the index's stat data is out of date and a
 /// plain `git status` would rewrite it, so a refresh cannot set off the

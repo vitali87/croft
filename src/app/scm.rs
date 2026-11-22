@@ -127,9 +127,25 @@ impl App {
     /// watcher skips. Called on the watcher's poll. True when any asked.
     pub(super) fn refresh_git_status_if_git_moved(&mut self) -> bool {
         let want_changes = self.sidebar_view == SidebarView::SourceControl;
-        let mut asked = self.git.refresh_if_git_moved(want_changes);
-        for (_, w) in &mut self.git_extra {
-            asked |= w.refresh_if_git_moved(want_changes);
+        let active = self.active_scm_root.clone();
+        let mut asked = false;
+        let mut active_moved = false;
+        if self.git.refresh_if_git_moved(want_changes) {
+            asked = true;
+            active_moved |= self.roots.primary() == active.as_path();
+        }
+        for (root, w) in &mut self.git_extra {
+            if w.refresh_if_git_moved(want_changes) {
+                asked = true;
+                active_moved |= *root == active;
+            }
+        }
+        // COMMITS labels each commit with its refs: a checkout to a branch
+        // at the same commit, a fetch, a push or a new tag relabels it
+        // without moving HEAD, which is all the status refresh refetches
+        // the graph for.
+        if active_moved {
+            self.refresh_commit_graph();
         }
         asked
     }

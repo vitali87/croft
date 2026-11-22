@@ -1,6 +1,6 @@
 //! Noticing git used outside croft (#2577). A commit, checkout, staging,
-//! fetch or push run in another terminal changes only files in git's own
-//! folder, which the file watcher skips (its write storms are what #898
+//! fetch, push, branch or tag run in another terminal changes only files
+//! in git's own folder, which the file watcher skips (its write storms are what #898
 //! fixed). So the few files those commands write are stamped on the
 //! watcher's poll instead, and a change to one re-reads the repository's
 //! status, as VS Code does when its `.git` watcher fires.
@@ -59,6 +59,11 @@ fn watched_files(dirs: &GitDirs, branch: Option<&str>, upstream: Option<&str>) -
         dirs.git_dir.join("FETCH_HEAD"),
         // Refs packed away, and refs moved while packed.
         dirs.common_dir.join("packed-refs"),
+        // A branch or tag made, deleted or renamed, and a top-level branch
+        // moved: git writes each ref beside its folder and renames it in,
+        // which changes the folder's own stamp.
+        dirs.common_dir.join("refs").join("heads"),
+        dirs.common_dir.join("refs").join("tags"),
     ];
     // A commit moves the branch even where reflogs are turned off.
     if let Some(branch) = branch {
