@@ -354,7 +354,7 @@ src/
 │   ├── model.rs         TestStatus (NotRun/Running/Passed/Failed/Skipped) + TestCase; suite_and_leaf splits a `module::name` path for the tree
 │   ├── registry.rs           data-driven test-runner registry: maps a workspace root to a Runner from the `[[test_runners]]` blocks in bundled + user manifests, skipping runners whose extension is disabled in the Extensions panel
 │   ├── parse.rs              per-tool output parsers — libtest, pytest (plain `-v` lines and pytest-xdist's outcome-first `[gwN]` lines), vitest, jest — with all node IDs normalised to `::` separators so one panel tree serves every runner
-│   ├── worker.rs             the test-runner command layer: RunAll / RunOne / RunFilter / RunSuite / Discover per runner, building each tool's argv and streaming cases over an mpsc channel
+│   ├── worker.rs             the test-runner command layer: RunAll / RunOne / RunFilter / RunSuite / Discover per runner, building each tool's argv and streaming cases over an mpsc channel: what its parts share (`Runner`, `TestRequest`, `TestResponse` with the `CoverageError` it carries, `TestWorker`, the handle the app holds, and the `RunControl` and `EpochTx` structs whose fields several parts read); each part is in a file in `worker/` below
 │   └── worker/          the test runner's feature files, beside worker.rs; each file's `//!` doc says what it holds
 │       ├── commands.rs          cargo's command line, and its build-status lines as progress
 │       ├── control.rs           cancelling a run by killing its runner's process group
@@ -997,7 +997,7 @@ Fetches a theme from a marketplace. It resolves a `publisher.name` id, a marketp
 
 ### testing/
 
-Test Runner. A background worker runs the project's test tool off the render loop and streams parsed cases into the Testing panel, mirroring the drain-per-tick pattern of app/git_worker and dap.
+Test Runner. A background worker runs the project's test tool off the render loop and streams parsed cases into the Testing panel, mirroring the drain-per-tick pattern of app/git_worker and dap. `worker.rs` keeps what the app and the worker's parts share: `Runner`, `TestRequest`, `TestResponse` with the `CoverageError` it carries, `TestWorker`, and the `RunControl` and `EpochTx` structs whose fields several parts read. Each part of the worker lives in a file of its own in `worker/`.
 
 **Runner selection.** `cargo test` for Rust, `pytest` for Python, `vitest` or `jest` for JS/TS, `go test` for Go, picked per workspace by `registry::runner_for` from `[[test_runners]]` manifest data. When no enabled runner claims the root, the four run entry points refuse with a status, and the worker refuses a queued request with a dedicated `Refused` response *before* any `Started`. The panel rolls the Running marks back and keeps its tree. Neither layer ever falls through to cargo, so a disabled runner extension really does stop runs. Opening the Testing view never looks for the runner on the UI thread (#1841): finding it reads every runner manifest and can walk the tree for CodeQL test packs, so the view queues a *quiet* discover and the worker decides. The worker answers a quiet discover with a `QuietDiscovery` marker before anything else, and only that marker clears the view's queued flag, so another request's answers cannot let a reopen queue a second discover. A root no runner claims ends at the marker, which says nothing; `r` in the view asks loudly and gets the refusal.
 

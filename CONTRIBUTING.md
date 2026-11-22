@@ -80,8 +80,9 @@ see [docs/MACOS.md](docs/MACOS.md#spotlight-indexing-and-the-build-directory).
   `--target dap_session` split `src/dap/session.rs` from
   `scripts/split_dap_session_manifest.tsv`, with `--target file_tree`
   split `src/widgets/file_tree.rs` from `scripts/split_file_tree_manifest.tsv`,
-  and with `--target dap_configs` split `src/dap/configs.rs` from
-  `scripts/split_dap_configs_manifest.tsv`
+  with `--target dap_configs` split `src/dap/configs.rs` from
+  `scripts/split_dap_configs_manifest.tsv`, and with `--target test_worker`
+  split `src/testing/worker.rs` from `scripts/split_test_worker_manifest.tsv`
   (`--tests-out` first moved a file's inline tests, and any other inline
   module, to their own file).
 * **Adding to the app, the editor, the language-server manager, the
@@ -89,12 +90,13 @@ see [docs/MACOS.md](docs/MACOS.md#spotlight-indexing-and-the-build-directory).
   the pair pilot, the Source Control panel, the command line, the CodeQL
   side bar, Run and Debug, a language feature such as go-to, rename or the
   outline, a debug session's talk with its adapter, the Explorer's file
-  tree or launch.json?** Put a feature's code in its file under `src/app/`,
+  tree, launch.json or the test runner?** Put a feature's code in its file
+  under `src/app/`,
   `src/widgets/editor/`, `src/lsp/manager/`, `src/widgets/terminal/`,
   `src/git/`, `src/remote/`, `src/widgets/search/`, `src/session_host/`,
   `src/pair/`, `src/widgets/source_control/`, `src/cli/`, `src/app/codeql/`,
   `src/app/debugger/`, `src/app/language_servers/`, `src/dap/session/`,
-  `src/widgets/file_tree/` or `src/dap/configs/`
+  `src/widgets/file_tree/`, `src/dap/configs/` or `src/testing/worker/`
   (see the lists in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)),
   not in `src/app/mod.rs`, which keeps only the `App` struct, its state,
   start-up and the main loop, nor in `src/widgets/editor.rs`, which keeps only
@@ -118,7 +120,9 @@ see [docs/MACOS.md](docs/MACOS.md#spotlight-indexing-and-the-build-directory).
   returns, nor in `src/widgets/file_tree.rs`, which keeps only `FileTree`,
   its constructor and `Node`, the row its fields hold, nor in
   `src/dap/configs.rs`, which keeps only `DebugConfig`, its `RequestKind`
-  and its `preLaunchTask`. A new subcommand's flags go in
+  and its `preLaunchTask`, nor in `src/testing/worker.rs`, which keeps only
+  `Runner`, `TestRequest`, `TestResponse`, its `CoverageError`,
+  `TestWorker`, `RunControl` and `EpochTx`. A new subcommand's flags go in
   `src/cli/commands.rs` and its line in `Cli::run` (`src/cli/run.rs`); its
   own code goes in a file under `src/cli/`, or in the module of the feature
   it drives (as `croft remote` calls into `src/remote/`). A new feature that
