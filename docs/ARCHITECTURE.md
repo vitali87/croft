@@ -314,6 +314,7 @@ src/
 │   │   ├── breakpoints.rs       line, function and data breakpoints, what the adapter reports back, and Run to Cursor
 │   │   ├── child_sessions.rs    vscode-js-debug's `startDebugging` reverse request, the answer every reverse request needs, and opening the child
 │   │   ├── events.rs            a raw DAP message classified into a `DapEvent`, the output worth showing, and why an adapter refused to start
+│   │   ├── exceptions.rs        the exception filters an adapter offers, breaking on raised exceptions, and what was thrown
 │   │   ├── session_set_tests.rs the tests of the set of debug sessions in flight
 │   │   ├── start_requests.rs    `initialize`, each adapter family's `launch`, `configurationDone` and `disconnect`
 │   │   ├── tests.rs             the debug session's own tests
