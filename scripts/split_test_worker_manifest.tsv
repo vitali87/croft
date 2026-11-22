@@ -1,0 +1,114 @@
+# Stage B of the refactor program (#2062): where each item of src/testing/worker.rs goes.
+# One row per item, in file order. pr 0 means the item stays in worker.rs; the others
+# move to src/testing/worker/<file>.rs in that PR. kind, impl and name are as
+# `scripts/check_pure_move.py list` prints them. Run
+# `scripts/move_items.py --target test_worker --check` after adding an item to worker.rs.
+# worker.rs keeps Runner, TestRequest, TestResponse and the CoverageError it carries, and TestWorker.
+# It also keeps the RunControl and EpochTx structs, whose fields code in several of the feature
+# files reads; their methods move.
+pr	file	kind	impl	name
+0		enum	-	Runner
+1	runners	fn	-	runner_for
+1	runners	fn	-	runners_for
+1	runners	fn	-	runners_of_file
+1	runners	fn	-	runner_for_file
+1	runners	fn	-	choose_runner
+1	runners	fn	-	file_owner
+0		enum	-	TestRequest
+0		enum	-	TestResponse
+0		enum	-	CoverageError
+0		struct	-	RunControl
+2	control	fn	impl RunControl	cancel
+2	control	fn	impl RunControl	is_cancelled
+2	control	fn	impl RunControl	spawn
+2	control	fn	impl RunControl	finished
+0		struct	-	TestWorker
+3	handle	fn	impl TestWorker	spawn
+3	handle	fn	impl TestWorker	for_test
+3	handle	fn	impl TestWorker	send
+3	handle	fn	impl TestWorker	run_coverage
+3	handle	fn	impl TestWorker	run_coverage_scoped
+3	handle	fn	impl TestWorker	run_all
+3	handle	fn	impl TestWorker	run_one
+3	handle	fn	impl TestWorker	run_many
+3	handle	fn	impl TestWorker	run_filter
+3	handle	fn	impl TestWorker	run_suite
+3	handle	fn	impl TestWorker	discover
+3	handle	fn	impl TestWorker	discover_quietly
+3	handle	fn	impl TestWorker	discover_queued
+3	handle	fn	impl TestWorker	requests_sent
+3	handle	fn	impl TestWorker	set_codeql_program
+3	handle	fn	impl TestWorker	set_extensions_dir
+3	handle	fn	impl TestWorker	cancel
+3	handle	fn	impl TestWorker	set_root
+3	handle	fn	impl TestWorker	root
+3	handle	fn	impl TestWorker	drain
+0		struct	-	EpochTx
+9	streaming	fn	impl<'a> EpochTx<'a>	send
+9	streaming	fn	impl<'a> EpochTx<'a>	tagged
+9	streaming	fn	impl<'a> EpochTx<'a>	choose
+9	streaming	fn	impl<'a> EpochTx<'a>	to_owned
+13	main_loop	fn	-	worker_loop
+4	commands	fn	-	workspace_args
+4	commands	fn	-	declares_workspace
+4	commands	fn	-	cargo_cmd
+5	pytest	fn	-	pytest_launch
+5	pytest	fn	-	pytest_launch_on
+5	pytest	fn	-	python3_program
+5	pytest	fn	-	python_has_pytest
+5	pytest	fn	-	pytest_script
+5	pytest	const	-	PYTEST_RUN_VERBOSITY
+5	pytest	const	-	PYTEST_COLLECT_VERBOSITY
+5	pytest	fn	-	pytest_cmd
+6	go_and_codeql	fn	-	go_binary
+6	go_and_codeql	fn	-	go_cmd
+6	go_and_codeql	fn	-	run_go
+6	go_and_codeql	fn	-	run_codeql
+8	js_args	fn	-	js_binary
+8	js_args	fn	-	js_cmd
+8	js_args	fn	-	js_id_parts
+8	js_args	fn	-	is_js_file
+7	test_binaries	struct	-	TestBinary
+7	test_binaries	fn	-	test_binary_candidates
+7	test_binaries	fn	-	binary_containing_test
+7	test_binaries	fn	-	build_test_binary
+8	js_args	const	-	VITEST_CONFIG_STEMS
+8	js_args	const	-	VITEST_CONFIG_EXTS
+8	js_args	fn	-	vitest_has_projects
+8	js_args	fn	-	declares_vitest_projects
+8	js_args	fn	-	run_vitest
+8	js_args	fn	-	vitest_one_args
+8	js_args	fn	-	exact_title_anchor
+8	js_args	const	-	JS_NAME_JOIN
+8	js_args	const	-	JS_SUITE_JOIN
+8	js_args	fn	-	full_name_regex
+8	js_args	fn	-	suite_title_anchor
+8	js_args	fn	-	vitest_filter_args
+8	js_args	fn	-	jest_file_args
+8	js_args	fn	-	jest_one_args
+8	js_args	fn	-	jest_filter_args
+9	streaming	fn	-	one
+9	streaming	fn	-	run_streaming
+9	streaming	fn	-	run_streaming_shown
+9	streaming	fn	-	run_streaming_exit
+4	commands	const	-	CARGO_PROGRESS_VERBS
+4	commands	fn	-	cargo_progress
+11	runs	fn	-	run_all
+11	runs	fn	-	run_all_with
+6	go_and_codeql	fn	-	codeql_markers
+10	coverage	fn	-	coverage_report
+10	coverage	struct	-	CoverageScope
+10	coverage	fn	-	coverage_scope_args
+10	coverage	fn	-	coverage_args
+10	coverage	fn	-	go_cover_profile
+10	coverage	fn	-	coverage_install
+10	coverage	fn	-	coverage_tool_present
+10	coverage	fn	-	run_coverage
+11	runs	fn	-	run_one
+11	runs	fn	-	run_many
+11	runs	fn	-	run_one_case_seen
+11	runs	fn	-	run_one_case
+11	runs	fn	-	run_filter
+11	runs	fn	-	run_filter_in
+12	discovery	fn	-	discover
+12	discovery	fn	-	discover_with
