@@ -1542,7 +1542,7 @@ A release-availability check plus a staged upgrade. Once a day, tracked by the c
 
 ### voice.rs
 
-Voice input for the Termux OSK mic key. It delegates to `termux-dialog speech` (Android's SpeechRecognizer, the same engine Gboard's mic uses), auto-installs the `termux-api` package via `InstallState`, and sends the transcript over a channel the app injects through `handle_key`.
+Voice input for the Termux OSK mic key. It delegates to `termux-dialog speech` (Android's SpeechRecognizer, the same engine Gboard's mic uses), auto-installs the `termux-api` package via `InstallState`, and reads each session's result on a background job whose transcript the app injects through `handle_key`. A reader that crashes reads as dead, so the session ends, the listening flag is cleared and the next tap starts a new one, instead of every tap cancelling a session nothing will ever answer (#2602).
 
 **`termux-dialog speech`, not `termux-speech-to-text`.** The service closes its output on `onEndOfSpeech` and so discards the final `onResults` transcript.
 

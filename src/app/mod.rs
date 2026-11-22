@@ -1690,11 +1690,8 @@ pub struct App {
     /// The workspace root DEPENDENCIES was detected/fetched for, so detection
     /// and the fetch fire once per root (re-fired by Make Root / re-root).
     deps_fetched: Option<PathBuf>,
-    /// Push-to-talk voice input (Termux OSK mic). The worker streams its
-    /// transcript over this channel; `voice_handle` lets the mic release kill
-    /// the in-flight recognizer.
-    voice_rx: std::sync::mpsc::Receiver<crate::voice::VoiceMsg>,
-    voice_tx: std::sync::mpsc::Sender<crate::voice::VoiceMsg>,
+    /// Push-to-talk voice input (Termux OSK mic): the live session, whose
+    /// result `drain_voice` reads and which a second mic tap cancels.
     voice_handle: Option<crate::voice::VoiceHandle>,
     /// Set when a mic tap cancels a live session, so the resulting empty result
     /// is reported as "canceled" rather than "no speech detected", and a
@@ -4203,7 +4200,6 @@ impl App {
         let (project_hint_tx, project_hint_rx) = std::sync::mpsc::channel();
         let (test_jump_tx, test_jump_rx) = std::sync::mpsc::channel();
         let (blame_tx, blame_rx) = std::sync::mpsc::channel();
-        let (voice_tx, voice_rx) = std::sync::mpsc::channel();
         let editor = EditorTabs::new();
         // Bound before the first pane, so that pane's shell carries the
         // socket like every later one. `spawn_with_preamble` reads
@@ -4410,8 +4406,6 @@ impl App {
             history_restore: None,
             deps_fetch: None,
             deps_fetched: None,
-            voice_rx,
-            voice_tx,
             voice_handle: None,
             voice_canceling: false,
             voice_ready: None,
