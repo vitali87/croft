@@ -66,8 +66,9 @@ pub(super) enum CrumbTarget {
 /// The file the OUTLINE shows and the edit seq it was synced at.
 pub(super) type OutlineKey = (PathBuf, Option<u64>);
 
-/// Where an off-thread outline parse delivers its symbols (#1150).
-pub(super) type OutlineParse = std::sync::mpsc::Receiver<Vec<crate::lsp::manager::OutlineSymbol>>;
+/// An off-thread outline parse (#1150), the `outline-parse` job: a parse
+/// whose thread crashed reads as dead (#2587).
+pub(super) type OutlineParse = crate::jobs::Job<Vec<crate::lsp::manager::OutlineSymbol>>;
 
 /// A place Peek References can show: path, 0-based line, UTF-16 column.
 pub(super) type PeekLocation = (PathBuf, u32, u32);

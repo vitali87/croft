@@ -83,6 +83,11 @@ impl App {
                 // that lands, another file's outline must never stand in.
                 self.outline
                     .set_syntax_symbols(path.clone(), Vec::new(), true);
+                // The panel no longer shows any parse of this file, so one
+                // must run: coming back to it after a smaller file, whose
+                // outline is computed inline, otherwise found the last
+                // parse's key unchanged and left it on "Loading" (#2586).
+                self.outline_parsed_for = None;
             }
             if lsp_pending && let (Some(lsp), Some(seq)) = (self.lsp.as_ref(), seq) {
                 lsp.request_document_symbols(path, seq);
@@ -111,34 +116,46 @@ impl App {
             return;
         }
         let (path, lines) = (key.0.clone(), self.editor.lines.clone());
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = tx.send(syntax_outline_for(&path, &lines));
+        let job = crate::jobs::Job::spawn("outline-parse", crate::jobs::Start::Now, move || {
+            syntax_outline_for(&path, &lines)
         });
         self.outline_parsed_for = Some(key.clone());
-        self.outline_parse = Some((key, rx));
+        match job {
+            Ok(job) => self.outline_parse = Some((key, job)),
+            Err(e) => {
+                self.outline.set_failed(key.0);
+                self.status = format!("Could not read the outline: {e}");
+            }
+        }
     }
 
     /// Apply a finished off-thread outline parse, if the buffer is still the
     /// one it parsed and the language server's outline of that same buffer
     /// has not landed first. True when the outline changed.
     pub(in crate::app) fn drain_outline_parse(&mut self) -> bool {
-        let Some((key, rx)) = &self.outline_parse else {
+        let Some((key, job)) = &self.outline_parse else {
             return false;
         };
-        let symbols = match rx.try_recv() {
-            Ok(symbols) => symbols,
-            Err(std::sync::mpsc::TryRecvError::Empty) => return false,
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                self.outline_parse = None;
-                return false;
-            }
+        let symbols = match job.poll() {
+            crate::jobs::Poll::Done(symbols) => Some(symbols),
+            crate::jobs::Poll::Pending => return false,
+            crate::jobs::Poll::Died => None,
         };
         let key = key.clone();
         self.outline_parse = None;
         if self.outline_synced.as_ref() != Some(&key) {
             return false;
         }
+        // Its thread crashed, and the crash notice said so. OUTLINE says the
+        // outline could not be read instead of "Loading" for one that is not
+        // coming; going back to the file parses it again (#2587).
+        let Some(symbols) = symbols else {
+            if self.outline.symbols().is_empty() {
+                self.outline.set_failed(key.0);
+                return true;
+            }
+            return false;
+        };
         let (path, seq) = key;
         if seq.is_some_and(|seq| self.outline_lsp_landed == Some((path.clone(), seq))) {
             return false;
