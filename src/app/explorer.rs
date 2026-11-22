@@ -566,6 +566,10 @@ impl App {
                 self.kick_file_finder_index_rebuild();
             }
         }
+        // Git used outside croft writes only to git's own folder, which the
+        // watcher skips: a few stamps there, on the same cadence (#2577).
+        // The status it asks for lands through `drain_git_responses`.
+        self.refresh_git_status_if_git_moved();
         // Stamp-gated, so an idle poll costs a stat per open diff view; on
         // hosts without a native watcher this is how a diff follows the
         // file (#471).

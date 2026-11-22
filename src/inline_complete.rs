@@ -30,8 +30,10 @@
 //! changed is thrown away on arrival anyway.
 
 use std::ops::Range;
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{Receiver, Sender};
 use std::time::Duration;
+
+use crate::jobs::{Start, WorkerPoll};
 
 use serde_json::{Value, json};
 
@@ -288,42 +290,90 @@ pub struct Done {
     pub result: Result<Option<String>, String>,
 }
 
-/// The background requester: one thread, newest job wins.
+/// The background requester: one thread, newest job wins. A thread that
+/// crashed is started again, and one that crashes again soon after stops
+/// until inline suggestions are next turned on (#2598).
 pub struct Worker {
-    tx: Sender<Job>,
-    rx: Receiver<Done>,
+    worker: crate::jobs::Worker<Job, Done>,
 }
 
 impl Worker {
     pub fn spawn() -> Self {
-        let (job_tx, job_rx) = mpsc::channel::<Job>();
-        let (done_tx, done_rx) = mpsc::channel::<Done>();
-        std::thread::Builder::new()
-            .name("croft-inline-complete".into())
-            .spawn(move || {
-                while let Ok(mut job) = job_rx.recv() {
-                    while let Ok(newer) = job_rx.try_recv() {
-                        job = newer;
-                    }
-                    let result = send(&job.config, &job.prompt);
-                    if done_tx.send(Done { id: job.id, result }).is_err() {
-                        return;
-                    }
-                }
-            })
-            .expect("spawn inline-complete thread");
-        Worker {
-            tx: job_tx,
-            rx: done_rx,
-        }
+        Self::spawn_with(send)
+    }
+
+    /// A worker whose thread answers each job with `ask`: [`send`] outside
+    /// tests.
+    fn spawn_with(
+        ask: impl Fn(&Config, &str) -> Result<Option<String>, String> + Send + Sync + 'static,
+    ) -> Self {
+        let worker = crate::jobs::Worker::spawn(
+            "croft-inline-complete",
+            Start::Now,
+            move |job_rx, done_tx| serve(&job_rx, &done_tx, &ask),
+        )
+        .expect("spawn inline-complete thread");
+        Worker { worker }
+    }
+
+    /// A worker whose first `crashes` threads panic on their first job, and
+    /// whose later ones suggest `text` for every job (#2598).
+    #[cfg(test)]
+    pub fn crashing(crashes: usize, text: &'static str) -> Self {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let asked = AtomicUsize::new(0);
+        Self::spawn_with(move |_, _| {
+            if asked.fetch_add(1, Ordering::SeqCst) < crashes {
+                panic!("the inline suggestion worker crashed (on purpose, in a test)");
+            }
+            Ok(Some(text.to_string()))
+        })
     }
 
     pub fn submit(&self, job: Job) {
-        let _ = self.tx.send(job);
+        self.worker.send(job);
     }
 
-    pub fn try_recv(&self) -> Option<Done> {
-        self.rx.try_recv().ok()
+    /// An answer, nothing more for now, or what happened to a thread that
+    /// ended (see [`WorkerPoll`]).
+    pub fn poll(&mut self) -> WorkerPoll<Done> {
+        self.worker.poll()
+    }
+
+    /// Whether it stopped after crashing twice: nothing is sent to it then.
+    pub fn is_stopped(&self) -> bool {
+        self.worker.is_stopped()
+    }
+
+    /// Start the worker again as suggestions are turned on, if it stopped
+    /// after crashing twice or its thread has ended where no tick saw it
+    /// yet; true when a fresh thread started.
+    pub fn restart_if_down(&mut self) -> std::io::Result<bool> {
+        self.worker.restart_if_down()
+    }
+
+    /// Whether its thread has ended, for a test that must see a crash no
+    /// tick has seen.
+    #[cfg(test)]
+    pub fn has_ended(&mut self) -> bool {
+        self.worker.has_ended()
+    }
+}
+
+/// What asks for one suggestion: [`send`] outside tests.
+type Ask = dyn Fn(&Config, &str) -> Result<Option<String>, String>;
+
+/// The worker thread's loop: only the newest request is asked, as typing
+/// outpaces the network.
+fn serve(job_rx: &Receiver<Job>, done_tx: &Sender<Done>, ask: &Ask) {
+    while let Ok(mut job) = job_rx.recv() {
+        while let Ok(newer) = job_rx.try_recv() {
+            job = newer;
+        }
+        let result = ask(&job.config, &job.prompt);
+        if done_tx.send(Done { id: job.id, result }).is_err() {
+            return;
+        }
     }
 }
 

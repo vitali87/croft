@@ -161,6 +161,196 @@ fn cancelling_a_hung_run_kills_its_processes_and_frees_the_worker() {
     assert_eq!(verdict, Some(Some(true)));
 }
 
+/// #2592: the test runner's thread crashing in the middle of a run (here
+/// while its `codeql` hangs, with a child of its own) ends the run as
+/// stopped instead of leaving it running for good, kills what it was
+/// running, and a fresh thread with the same root and settings runs the
+/// next run, which a cancel sent before the crash does not cover.
+#[cfg(unix)]
+#[test]
+fn a_run_whose_runner_crashed_ends_and_the_next_one_runs() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    std::fs::create_dir_all(root.join("test/Find")).unwrap();
+    std::fs::write(
+        root.join("test/qlpack.yml"),
+        "name: acme/tests\nextractor: javascript\ntests: .\n",
+    )
+    .unwrap();
+    std::fs::write(root.join("test/Find/Find.qlref"), "Find.ql\n").unwrap();
+    let bin = tempfile::tempdir().unwrap();
+    let hang = bin.path().join("hang");
+    std::fs::write(
+        &hang,
+        format!(
+            "#!/bin/sh\necho $$ > '{d}/runner.pid'\nsleep 1000 &\necho $! > '{d}/child.pid'\nwait\n",
+            d = bin.path().display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&hang, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let dir = bin.path().to_path_buf();
+    let pid = move |name: &str| -> Option<i32> {
+        std::fs::read_to_string(dir.join(name))
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+    };
+    let pid_in_thread = pid.clone();
+
+    // The first thread starts the hanging runner for the run, hands its
+    // error output to a reader holding a sender, as `run_streaming_exit`
+    // does, and crashes once it is going; every later one is the real loop.
+    let crashed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut worker =
+        TestWorker::spawn_with(root.to_path_buf(), move |root, rx, tx, control, owners| {
+            if crashed.swap(true, Ordering::SeqCst) {
+                return worker_loop(root, rx, tx, control, owners);
+            }
+            while let Ok(sent) = rx.recv() {
+                if matches!(sent.request, TestRequest::RunAll) {
+                    let _ = tx.send((sent.epoch, TestResponse::Started(Activity::Running)));
+                    let mut cmd = Command::new(&hang);
+                    cmd.stderr(Stdio::piped());
+                    // Left running, as a real crash leaves it: the
+                    // fresh thread's drain kills it.
+                    #[allow(clippy::zombie_processes)]
+                    let mut runner = control.spawn(sent.number, &mut cmd).unwrap().unwrap();
+                    let (err, reader_tx) = (runner.stderr.take().unwrap(), tx.clone());
+                    std::thread::spawn(move || {
+                        for _ in BufReader::new(err).lines() {}
+                        drop(reader_tx);
+                    });
+                    wait_until("the hung run starts", || {
+                        pid_in_thread("child.pid").is_some()
+                    });
+                    panic!("the test runner crashed mid-run (on purpose, in a test)");
+                }
+            }
+        });
+    let mut panel = TestingPanel::new();
+    let added = codeql_added();
+    // A session sends many requests before a crash, and the crash cancels
+    // them all: a fresh thread counting its own from one again would read
+    // its first ones as cancelled too.
+    for _ in 0..8 {
+        worker.set_extensions_dir(added.path().to_path_buf());
+    }
+    let codeql = fake_codeql(
+        bin.path(),
+        root,
+        "[1/1 comp 1.1s eval 20ms] PASSED @ROOT@/test/Find/Find.qlref\n",
+    );
+    worker.set_codeql_program(codeql);
+    worker.run_all();
+    wait_until("the hung run starts", || pid("child.pid").is_some());
+    let (runner, child) = (pid("runner.pid").unwrap(), pid("child.pid").unwrap());
+    // The run's start and the crash can land in one drain, so the stop is
+    // what is waited for: it is latched only for a run in flight.
+    let mut stopped = false;
+    wait_until("the run ends as stopped", || {
+        worker.drain(&mut panel);
+        stopped |= panel.take_stopped();
+        stopped
+    });
+    assert!(!panel.is_busy());
+    assert!(!panel.take_cancelled());
+    assert!(!worker.take_stopped(), "one crash starts it again");
+    wait_until("the runner dies", || !running(runner));
+    wait_until("the runner's child dies", || !running(child));
+
+    // The fresh thread has the root, `codeql` and extensions folder.
+    panel.take_finished();
+    worker.run_all();
+    let mut verdict = None;
+    wait_until("the next run ends", || {
+        worker.drain(&mut panel);
+        verdict = panel.take_finished();
+        verdict.is_some()
+    });
+    assert!(!panel.take_stopped());
+    assert_eq!(verdict, Some(Some(true)));
+}
+
+/// #2592: which runner listed each test outlives a thread that crashed, so
+/// a test listed by pytest in a folder Cargo also claims still goes to
+/// pytest; a new root forgets it, as its tests are another project's.
+#[cfg(unix)]
+#[test]
+fn a_restart_keeps_which_runner_listed_each_test() {
+    let tmp = tempfile::tempdir().unwrap();
+    let none = tempfile::tempdir().unwrap();
+    let crashed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut worker = TestWorker::spawn_with(
+        tmp.path().to_path_buf(),
+        move |root, rx, tx, control, owners| {
+            if crashed.swap(true, Ordering::SeqCst) {
+                return worker_loop(root, rx, tx, control, owners);
+            }
+            let _ = rx.recv();
+            owners.record(String::from("tests/test_x.py::test_a"), Runner::Pytest);
+            panic!("the test runner crashed (on purpose, in a test)");
+        },
+    );
+    worker.set_extensions_dir(none.path().to_path_buf());
+    let mut panel = TestingPanel::new();
+    let quiet_discovery_ends = |worker: &mut TestWorker, panel: &mut TestingPanel| {
+        worker.discover_quietly();
+        wait_until("the quiet discovery to end", || {
+            worker.drain(panel);
+            !worker.discover_queued()
+        });
+    };
+    // The first thread records the owner and crashes; the fresh one has
+    // its root sent again before it reaches the next discovery.
+    quiet_discovery_ends(&mut worker, &mut panel);
+    quiet_discovery_ends(&mut worker, &mut panel);
+    assert_eq!(
+        worker.owners.get("tests/test_x.py::test_a"),
+        Some(Runner::Pytest),
+        "the fresh thread still knows which runner listed the test"
+    );
+    worker.set_root(tmp.path().to_path_buf());
+    quiet_discovery_ends(&mut worker, &mut panel);
+    assert_eq!(worker.owners.get("tests/test_x.py::test_a"), None);
+}
+
+/// #2592: a test runner that crashes again soon after its restart stops,
+/// says so once, and the next run starts it again.
+#[cfg(unix)]
+#[test]
+fn a_test_runner_that_crashes_again_stops_until_the_next_run() {
+    let tmp = tempfile::tempdir().unwrap();
+    let none = tempfile::tempdir().unwrap();
+    let mut worker = TestWorker::crashing(tmp.path().to_path_buf(), 2);
+    worker.set_extensions_dir(none.path().to_path_buf());
+    let mut panel = TestingPanel::new();
+    panel.start_single("m::a");
+    worker.run_one(String::from("m::a"));
+    wait_until("the runner to stop", || {
+        worker.drain(&mut panel);
+        worker.take_stopped()
+    });
+    assert!(!panel.is_busy(), "the run it was on ended");
+    assert!(panel.take_stopped());
+    assert!(
+        panel.cases_for_test().is_empty(),
+        "the case the run added is gone again"
+    );
+    worker.drain(&mut panel);
+    assert!(!worker.take_stopped(), "it says so once");
+
+    panel.start_single("m::a");
+    worker.run_one(String::from("m::a"));
+    wait_until("the next run's answer", || {
+        worker.drain(&mut panel);
+        panel.take_refusal()
+    });
+    assert!(!panel.is_busy());
+}
+
 /// #1534 negative: a cancel covers the requests sent before it, never a
 /// later one, and refuses to start their further children.
 #[cfg(unix)]
@@ -1465,7 +1655,7 @@ fn maturin_project(root: &Path) {
 /// each test, as the worker loop's does.
 fn collect_with_owners(
     root: &Path,
-    owners: &RefCell<BTreeMap<String, Runner>>,
+    owners: &Owners,
     f: impl Fn(&Path, &EpochTx),
 ) -> (Vec<(String, TestStatus)>, Option<Option<bool>>) {
     let (tx, rx) = std::sync::mpsc::channel();
@@ -1500,7 +1690,7 @@ fn a_maturin_crate_lists_and_runs_its_rust_and_python_tests() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     maturin_project(root);
-    let owners = RefCell::new(BTreeMap::new());
+    let owners = Owners::default();
     let (cases, finished) = collect_with_owners(root, &owners, |r, t| discover(r, t, false));
     let names: Vec<&str> = cases.iter().map(|(n, _)| n.as_str()).collect();
     assert_eq!(
@@ -1512,8 +1702,11 @@ fn a_maturin_crate_lists_and_runs_its_rust_and_python_tests() {
         ],
     );
     assert_eq!(finished, Some(Some(true)));
-    assert_eq!(owners.borrow()["tests::adds"], Runner::Cargo);
-    assert_eq!(owners.borrow()["tests/test_x.py::test_a"], Runner::Pytest);
+    assert_eq!(owners.get("tests::adds").unwrap(), Runner::Cargo);
+    assert_eq!(
+        owners.get("tests/test_x.py::test_a").unwrap(),
+        Runner::Pytest
+    );
 
     let (cases, finished) = collect_with_owners(root, &owners, run_all);
     assert!(
@@ -1541,7 +1734,7 @@ fn a_python_test_in_a_maturin_crate_runs_under_pytest() {
     let root = tmp.path();
     maturin_project(root);
     let py = root.join("tests/test_x.py");
-    let owners = RefCell::new(BTreeMap::new());
+    let owners = Owners::default();
     let (cases, _) = collect_with_owners(root, &owners, |r, t| {
         run_filter_in(r, t, "test_a", false, Some(&py))
     });

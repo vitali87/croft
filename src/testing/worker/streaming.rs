@@ -8,7 +8,7 @@ impl<'a> EpochTx<'a> {
         if let (Some(owners), Some(runner), TestResponse::Case(case)) =
             (self.owners, self.tag, &resp)
         {
-            owners.borrow_mut().insert(case.name.clone(), runner);
+            owners.record(case.name.clone(), runner);
         }
         let _ = self.tx.send((self.epoch, resp));
     }
@@ -30,7 +30,7 @@ impl<'a> EpochTx<'a> {
     ) -> Option<Runner> {
         let empty = BTreeMap::new();
         match self.owners {
-            Some(owners) => choose_runner(runners, &owners.borrow(), name, file),
+            Some(owners) => choose_runner(runners, owners.map().by_test(), name, file),
             None => choose_runner(runners, &empty, name, file),
         }
     }

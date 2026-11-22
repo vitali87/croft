@@ -16,6 +16,7 @@ mod patches;
 mod remotes;
 mod staging;
 mod stash;
+mod state_watch;
 mod status;
 mod tags;
 mod worker;
@@ -144,6 +145,9 @@ pub use stash::stash_push_staged;
 pub use stash::stash_push_untracked;
 #[cfg(test)]
 use stash::*;
+pub use state_watch::GitStateWatch;
+#[cfg(test)]
+use state_watch::*;
 pub use status::GitStatus;
 pub use status::child_repos;
 pub use status::is_ignored;

@@ -121,6 +121,35 @@ impl App {
         }
     }
 
+    /// Re-read git status for each repository whose git state moved outside
+    /// croft (#2577): a commit, checkout, staging, fetch or push run in
+    /// another terminal changes only git's own folder, which the file
+    /// watcher skips. Called on the watcher's poll. True when any asked.
+    pub(super) fn refresh_git_status_if_git_moved(&mut self) -> bool {
+        let want_changes = self.sidebar_view == SidebarView::SourceControl;
+        let active = self.active_scm_root.clone();
+        let mut asked = false;
+        let mut active_moved = false;
+        if self.git.refresh_if_git_moved(want_changes) {
+            asked = true;
+            active_moved |= self.roots.primary() == active.as_path();
+        }
+        for (root, w) in &mut self.git_extra {
+            if w.refresh_if_git_moved(want_changes) {
+                asked = true;
+                active_moved |= *root == active;
+            }
+        }
+        // COMMITS labels each commit with its refs: a checkout to a branch
+        // at the same commit, a fetch, a push or a new tag relabels it
+        // without moving HEAD, which is all the status refresh refetches
+        // the graph for.
+        if active_moved {
+            self.refresh_commit_graph();
+        }
+        asked
+    }
+
     /// Drain everything the git worker has shipped back since the last
     /// tick and apply each response to the matching cache (`git_status`
     /// for the status-bar badge, `source_control.entries` for the SC
@@ -192,6 +221,14 @@ impl App {
             // not fully describe.
             if w.take_status_arrival() {
                 status_arrived = true;
+            }
+            // Its worker crashed again soon after being started again, so
+            // it stopped rather than loop (#2589): say what is frozen and
+            // how to retry.
+            if w.take_stopped() {
+                self.status = String::from(
+                    "Git status stopped after its worker crashed twice: Source Control: Refresh starts it again",
+                );
             }
             if !this_changed {
                 continue;

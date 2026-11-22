@@ -6762,14 +6762,7 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
         let tests_changed = app.test_worker.drain(&mut app.testing)
             | app.drain_pending_test_debug()
             | app.drain_pending_cargo_launch();
-        // A queued run the worker refused (runner disabled after the entry
-        // check) rolled its cases back in the drain; say why nothing ran.
-        if app.testing.take_refusal() {
-            app.status = String::from(crate::testing::NO_RUNNER_STATUS);
-        }
-        if app.testing.take_cancelled() {
-            app.status = String::from("Test run cancelled");
-        }
+        app.say_why_test_runs_ended();
         // One notification per red run (#358), from the latch the panel
         // sets when a run ends, never per test case.
         let coverage_changed = app.sync_coverage();
