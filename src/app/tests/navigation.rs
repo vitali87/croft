@@ -1172,7 +1172,7 @@ fn alt_o_resolves_against_the_root_that_owns_the_file() {
     let mut app = App::new(primary.path().to_path_buf()).unwrap();
     app.roots.add(secondary.path().to_path_buf());
     app.file_finder_index = Some(std::sync::Arc::new(Vec::new()));
-    app.file_finder_index_rx = None;
+    app.file_finder_index_job = None;
     app.editor
         .open(&secondary.path().join("src/foo.cpp"))
         .unwrap();
@@ -1193,7 +1193,7 @@ fn alt_o_resolves_against_the_root_that_owns_the_file() {
 fn alt_o_builds_the_index_when_it_has_not_landed() {
     let (tmp, mut app) = c_workspace(&["lib/geom.cpp", "api/geom.hpp"], "lib/geom.cpp");
     app.file_finder_index = None;
-    app.file_finder_index_rx = None;
+    app.file_finder_index_job = None;
     app.handle_key(key(KeyCode::Char('o'), KeyModifiers::ALT))
         .unwrap();
     assert_eq!(
