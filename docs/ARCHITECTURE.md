@@ -310,6 +310,9 @@ src/
 │   ├── mod.rs
 │   ├── transport.rs     DAP wire framing (Content-Length + seq envelope, not JSON-RPC, so async-lsp can't be reused); spawns the adapter detached via setsid (so the debuggee can't tcsetpgrp-background and SIGTTIN-suspend croft, and so teardown can killpg the whole group), blocking reader thread frames stdout into an mpsc channel; Drop signals the process group and reaps the child, except after a `disconnect` (#1536): then a detached teardown thread gives the adapter up to 2 s to answer and end the debuggee, kills the group, and SIGKILLs the debuggee pid from the `process` event if a launched program is still running (debugpy's launcher puts it in its own group, out of `killpg`'s reach); quit stops every session and joins these teardowns
 │   ├── session.rs            one debug launch session: the initialize → setBreakpoints → configurationDone → stopped state machine, event classifier, the stackTrace → scopes → variables chain, evaluate, breakpoints and logpoints, over one adapter-agnostic launch_with
+│   ├── session/         the debug session's feature files, beside session.rs; each file's `//!` doc says what it holds
+│   │   ├── session_set_tests.rs the tests of the set of debug sessions in flight
+│   │   ├── tests.rs             the debug session's own tests
 │   ├── registry.rs           data-driven debug-adapter registry: maps a file extension to an AdapterKind from the `[[debug_adapters]]` blocks in bundled + user manifests, skipping adapters whose extension is disabled in the Extensions panel
 │   ├── log.rs           optional DAP wire log at ~/.croft/dap.log (gated by CROFT_DAP_LOG), mirroring lsp/log_file.rs
 │   ├── install.rs       provisions a private debugpy venv at ~/.croft/debug-venv via uv (PEP 668 forbids pip-ing into the uv-managed CPython; mirrors ~/.croft/servers), and the vscode-js-debug server at ~/.croft/js-debug from a release pinned by version and SHA-256
