@@ -2613,14 +2613,17 @@ def check(root, t=APP):
 
 
 def tests_header(name):
-    return re.compile(rf"(^|\n)\s*mod\s+{re.escape(name)}\s*\{{$")
+    """The header line of an inline `mod <name> {`, with or without a
+    visibility: dap/session.rs's tests are `pub(crate) mod tests`, as the
+    app's tests borrow its fake adapters."""
+    return re.compile(rf"(^|\n)\s*(?:pub(?:\([^()]*\))?\s+)?mod\s+{re.escape(name)}\s*\{{$")
 
 
 def tests_out(root, t, fmt=True, name="tests"):
     """Move the inline `mod <name> { ... }` (`mod tests` unless the target
     names another test module) at the top level of the target's file to
     <dir>/<name>.rs: the block's body, dedented by its indentation, and
-    `mod <name>;` where the block was. The module keeps its name and its
+    `mod <name>;` where the block was, keeping the module's visibility. The module keeps its name and its
     place, so its `use super::*;` still reaches the split file. The header's
     attributes and the docs and comments above it stay. A line that starts
     inside a string keeps its indentation, which is part of the string.

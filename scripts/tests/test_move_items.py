@@ -739,6 +739,26 @@ class OtherTargets(unittest.TestCase):
         code, report = self.root.pure(before)
         self.assertEqual(code, 0, report)
 
+    def test_a_test_module_with_a_visibility_moves_and_keeps_it(self):
+        """dap/session.rs's tests are `pub(crate) mod tests`, for the app's
+        tests that borrow its fake adapters: the module moves all the same,
+        and its declaration keeps the visibility, so those paths still
+        reach it."""
+        shared = EDITOR.replace("\nmod tests {", "\npub(crate) mod tests {")
+        self.assertNotEqual(shared, EDITOR)
+        (self.tmp / SPLIT.source).write_text(shared)
+        self.root.commit()
+        before = subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.tmp, capture_output=True,
+                                text=True, check=True).stdout.strip()
+        code, out = self.tests_out()
+        self.assertEqual(code, 0, out)
+        self.assertTrue(self.root.read(SPLIT.source).endswith(
+            "/// The editor's tests.\n#[cfg(test)]\npub(crate) mod tests;\n"))
+        self.assertIn("\n#[test]\nfn bumps() {\n", self.root.read("src/widgets/editor/tests.rs"))
+        self.root.commit()
+        code, report = self.root.pure(before)
+        self.assertEqual(code, 0, report)
+
     def test_a_test_module_the_target_has_no_words_for_is_refused(self):
         with self.assertRaises(mi.ManifestError) as e:
             mi.tests_out(str(self.tmp), SPLIT, False, "offer_tests")
