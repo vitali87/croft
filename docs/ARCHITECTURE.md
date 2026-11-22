@@ -424,6 +424,7 @@ src/
     │   ├── android_trash.rs   the freedesktop home trash on Android, where the `trash` crate has none
     │   ├── decorations.rs     a row's git decoration, name and icon colours, the active indent guide, and ignored or agent-changed paths
     │   ├── deletion.rs        which rows may be deleted, and moving paths to the system's trash
+    │   ├── drawing.rs         drawing the rows, icons, guides, sticky band and scrollbar
     │   ├── filter.rs          the tree filter's fuzzy match, and the matched letters bold in a row's name
     │   ├── listing.rs         reading a folder, Explorer order, compact folders, and refreshing children on file system events
     │   ├── move_and_copy.rs   pasting and dropping: a free destination name, no folder into itself, moving and copying
