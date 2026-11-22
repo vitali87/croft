@@ -363,6 +363,7 @@ src/
 │       ├── js_args.rs           vitest's and jest's command lines, and the arguments that pick a test, a suite or a file
 │       ├── pytest.rs            pytest's command line: which Python or script runs it, and its verbosity
 │       ├── runners.rs           which runner runs a folder's, a file's or a test's tests
+│       ├── streaming.rs         streaming a runner's output, tagged with its request, and its exit code
 │       ├── test_binaries.rs     the cargo test harnesses built, and the one that holds a test
 │       ├── tests.rs             the test runner's own tests
 ├── mcp/                 MCP sidecar host (Tier-1 extensions): croft is a DETERMINISTIC MCP host — a human invokes a contributed palette command and croft calls one pre-known tool on one vetted local server (no LLM picks tools), which removes MCP's whole prompt-injection/tool-poisoning attack family
