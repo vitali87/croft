@@ -118,6 +118,25 @@ impl ActivityIcon {
         )
     }
 
+    /// The count badge the icon carries where the terminal shows pictures:
+    /// the badge picture's Kitty image id and its ink. `None` for icons
+    /// without one.
+    pub(super) fn badge(self) -> Option<(u32, BadgeInk)> {
+        use crate::iterm2_inline as ki;
+        match self {
+            ActivityIcon::Explorer => Some((ki::KITTY_ID_EXPLORER_BADGE, BadgeInk::Accent)),
+            ActivityIcon::SourceControl => Some((ki::KITTY_ID_SCM_BADGE, BadgeInk::Accent)),
+            ActivityIcon::Remote => Some((ki::KITTY_ID_REMOTE_BADGE, BadgeInk::Accent)),
+            ActivityIcon::Testing => Some((ki::KITTY_ID_TESTING_BADGE, BadgeInk::Failure)),
+            ActivityIcon::Search
+            | ActivityIcon::RunDebug
+            | ActivityIcon::Extensions
+            | ActivityIcon::CodeQL
+            | ActivityIcon::Sponsor
+            | ActivityIcon::Settings => None,
+        }
+    }
+
     /// The codicon drawn for the icon on a terminal without pictures.
     pub(super) fn glyph(self) -> char {
         match self {
@@ -161,6 +180,80 @@ impl std::ops::Index<ActivityIcon> for ActivityBlocks {
 impl std::ops::IndexMut<ActivityIcon> for ActivityBlocks {
     fn index_mut(&mut self, icon: ActivityIcon) -> &mut Rect {
         &mut self.0[icon as usize]
+    }
+}
+
+/// The ink an activity-bar count badge wears.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum BadgeInk {
+    /// The theme's accent: unsaved files, Source Control changes and
+    /// forwarded ports.
+    Accent,
+    /// The theme's red for removed lines: failed tests.
+    Failure,
+}
+
+/// A count drawn as a small picture at the bottom-right of an activity-bar
+/// icon (VS Code's activity badge), kept with the count it was built for so
+/// it is built again only when that count changes or the bar's pictures are
+/// baked again (#2062).
+#[derive(Clone, Debug, Default)]
+pub(super) struct CountBadge {
+    /// The picture; `None` while the count is 0 or the terminal shows no
+    /// pictures (the glyph renderer draws the count as text instead).
+    image: Option<String>,
+    /// The count `image` was built for. It decides whether the badge
+    /// changed, and how many cells wide the picture is.
+    count: usize,
+}
+
+impl CountBadge {
+    /// Forget the count, so the next refresh builds the picture again: the
+    /// bar's pictures were baked again, for a new theme or cell size.
+    pub(super) fn invalidate(&mut self) {
+        self.count = usize::MAX;
+    }
+
+    /// The count the badge was last brought up to.
+    #[cfg(test)]
+    pub(super) fn count(&self) -> usize {
+        self.count
+    }
+
+    /// Bring the badge up to `count`, building its picture with `build`
+    /// when the terminal shows `pictures` and the count is not 0. Returns
+    /// whether it changed, so the bar is sent again.
+    pub(super) fn refresh(
+        &mut self,
+        count: usize,
+        pictures: bool,
+        build: impl FnOnce() -> Option<String>,
+    ) -> bool {
+        if !pictures {
+            self.image = None;
+        }
+        if count == self.count {
+            return false;
+        }
+        self.count = count;
+        if pictures {
+            self.image = if count == 0 { None } else { build() };
+        }
+        true
+    }
+
+    /// The picture and the cells it covers: the bottom-right of `icon`'s
+    /// block, as wide as the count needs. `None` without a picture.
+    pub(super) fn placed(&self, icon: Rect) -> Option<(Rect, &str)> {
+        let image = self.image.as_deref()?;
+        let width = crate::iterm2_inline::count_badge_cells_w(self.count);
+        let cells = Rect {
+            x: icon.x + icon.width.saturating_sub(width),
+            y: icon.y + icon.height.saturating_sub(1),
+            width,
+            height: 1,
+        };
+        Some((cells, image))
     }
 }
 
@@ -506,36 +599,32 @@ pub(super) const ZEN_ESC_WINDOW: std::time::Duration = std::time::Duration::from
 pub(super) const ZEN_HINT_FOR: std::time::Duration = std::time::Duration::from_secs(4);
 
 impl App {
-    /// Rebuild the cached source-control change-count badge after the change
-    /// set, theme, or cell size shifts, and mark the activity overlay dirty so
-    /// the next post-draw flush re-emits. On the glyph-fallback path (no inline
-    /// images) it only tracks the count for the dirty check; that path draws a
-    /// text badge directly in `render_activity_bar`.
-    pub(super) fn refresh_scm_change_badge(&mut self) {
-        let count = self.scm_change_count();
-        if !self.overlays.activity.has_images() {
-            self.scm_change_badge = None;
-            if count != self.scm_change_badge_count {
-                self.scm_change_badge_count = count;
-                self.overlays.activity.mark_dirty();
-            }
-            return;
+    /// Keep every activity-bar count badge current. A badge is built again
+    /// only when its count changes (or after [`CountBadge::invalidate`]), and
+    /// the bar is sent again when one changed. On a terminal without
+    /// pictures it only tracks the counts, which the glyph renderer draws.
+    /// Cheap enough to run every frame.
+    pub(super) fn refresh_activity_badges(&mut self) {
+        let pictures = self.overlays.activity.has_images();
+        let mut changed = false;
+        for icon in ActivityIcon::ALL {
+            let Some((kitty_id, ink)) = icon.badge() else {
+                continue;
+            };
+            let count = self.activity_badge_count(icon);
+            let color = match ink {
+                BadgeInk::Accent => self.theme.accent_rgb(),
+                BadgeInk::Failure => self.theme.git_deleted_rgb(),
+            };
+            let mut badge = std::mem::take(&mut self.activity_badges[icon as usize]);
+            changed |= badge.refresh(count, pictures, || {
+                self.build_count_badge_image(count, kitty_id, color)
+            });
+            self.activity_badges[icon as usize] = badge;
         }
-        if count == 0 {
-            if self.scm_change_badge.is_some() {
-                self.scm_change_badge = None;
-                self.overlays.activity.mark_dirty();
-            }
-            self.scm_change_badge_count = 0;
-            return;
+        if changed {
+            self.overlays.activity.mark_dirty();
         }
-        self.scm_change_badge = self.build_count_badge_image(
-            count,
-            crate::iterm2_inline::KITTY_ID_SCM_BADGE,
-            self.theme.accent_rgb(),
-        );
-        self.scm_change_badge_count = count;
-        self.overlays.activity.mark_dirty();
     }
 
     /// The count on the Source Control icon, with or without pictures: the
@@ -577,101 +666,6 @@ impl App {
             1,
         )?;
         Some(self.wrap_for_terminal(raw))
-    }
-
-    /// Rebuild the cached Explorer unsaved-file badge when the count, theme, or
-    /// cell size shifts, and mark the activity overlay dirty so the next flush
-    /// re-emits. Cheap to call every frame: it recomputes the count and bails
-    /// unless it changed. The glyph-fallback path draws a text badge in
-    /// `render_activity_bar` instead.
-    pub fn refresh_explorer_unsaved_badge(&mut self) {
-        let count = self.unsaved_count();
-        if !self.overlays.activity.has_images() {
-            self.explorer_unsaved_badge = None;
-            if count != self.explorer_unsaved_count {
-                self.explorer_unsaved_count = count;
-                self.overlays.activity.mark_dirty();
-            }
-            return;
-        }
-        if count == self.explorer_unsaved_count {
-            return;
-        }
-        if count == 0 {
-            self.explorer_unsaved_badge = None;
-            self.explorer_unsaved_count = 0;
-            self.overlays.activity.mark_dirty();
-            return;
-        }
-        self.explorer_unsaved_badge = self.build_count_badge_image(
-            count,
-            crate::iterm2_inline::KITTY_ID_EXPLORER_BADGE,
-            self.theme.accent_rgb(),
-        );
-        self.explorer_unsaved_count = count;
-        self.overlays.activity.mark_dirty();
-    }
-
-    /// Rebuild the cached Remote forwarded-ports badge when the count, theme, or
-    /// cell size shifts. Count-gated like the Explorer badge so it's a cheap
-    /// per-frame no-op; the glyph-fallback path draws a text badge instead.
-    pub fn refresh_remote_ports_badge(&mut self) {
-        let count = self.ports.forwarded_count();
-        if !self.overlays.activity.has_images() {
-            self.remote_ports_badge = None;
-            if count != self.remote_ports_count {
-                self.remote_ports_count = count;
-                self.overlays.activity.mark_dirty();
-            }
-            return;
-        }
-        if count == self.remote_ports_count {
-            return;
-        }
-        if count == 0 {
-            self.remote_ports_badge = None;
-            self.remote_ports_count = 0;
-            self.overlays.activity.mark_dirty();
-            return;
-        }
-        self.remote_ports_badge = self.build_count_badge_image(
-            count,
-            crate::iterm2_inline::KITTY_ID_REMOTE_BADGE,
-            self.theme.accent_rgb(),
-        );
-        self.remote_ports_count = count;
-        self.overlays.activity.mark_dirty();
-    }
-
-    /// Rebuild the cached Testing failing-count badge (red pill) when the count,
-    /// theme, or cell size shifts. Count-gated per-frame no-op; the glyph path
-    /// draws a text badge instead.
-    pub fn refresh_testing_badge(&mut self) {
-        let count = self.testing.failed_count();
-        if !self.overlays.activity.has_images() {
-            self.testing_badge = None;
-            if count != self.testing_badge_count {
-                self.testing_badge_count = count;
-                self.overlays.activity.mark_dirty();
-            }
-            return;
-        }
-        if count == self.testing_badge_count {
-            return;
-        }
-        if count == 0 {
-            self.testing_badge = None;
-            self.testing_badge_count = 0;
-            self.overlays.activity.mark_dirty();
-            return;
-        }
-        self.testing_badge = self.build_count_badge_image(
-            count,
-            crate::iterm2_inline::KITTY_ID_TESTING_BADGE,
-            self.theme.git_deleted_rgb(),
-        );
-        self.testing_badge_count = count;
-        self.overlays.activity.mark_dirty();
     }
 
     /// Rebuild the cached PROBLEMS-tab circle badge (orange, like the activity
@@ -724,12 +718,11 @@ impl App {
         }
     }
 
-    /// The count drawn at the corner of `icon` on a terminal without
-    /// pictures, where 0 draws none: unsaved files on the Explorer, every
-    /// folder's Source Control rows on Source Control (the same count as with
-    /// pictures, #2629), forwarded ports on Remote and failed tests on
-    /// Testing.
-    fn activity_glyph_count(&self, icon: ActivityIcon) -> usize {
+    /// The count on `icon`'s badge, as a picture or as text, where 0 shows
+    /// none: unsaved files on the Explorer, every folder's Source Control
+    /// rows on Source Control (#2629), forwarded ports on Remote and failed
+    /// tests on Testing.
+    pub(super) fn activity_badge_count(&self, icon: ActivityIcon) -> usize {
         match icon {
             ActivityIcon::Explorer => self.unsaved_count(),
             ActivityIcon::SourceControl => self.scm_change_count(),
@@ -1390,12 +1383,10 @@ impl App {
         if area.width == 0 || area.height == 0 {
             return;
         }
-        // Keep the per-frame activity badges current before the post-draw flush
-        // emits them. Both are count-gated, so a frame with no churn is a cheap
-        // no-op. (The SCM badge refreshes off the git worker instead.)
-        self.refresh_explorer_unsaved_badge();
-        self.refresh_remote_ports_badge();
-        self.refresh_testing_badge();
+        // Keep the activity and PROBLEMS badges current before the post-draw
+        // flush emits them. Each is count-gated, so a frame with no churn is a
+        // cheap no-op.
+        self.refresh_activity_badges();
         self.refresh_problems_badge();
         self.overlays.activity.note_side_bar_shown(self.show_tree);
         // In images mode the activity bar inherits the iTerm session bg
@@ -1595,7 +1586,7 @@ impl App {
                     self.activity_icon_selected(icon),
                     hov == Some(icon),
                 );
-                render_count_badge(frame, block, self.activity_glyph_count(icon));
+                render_count_badge(frame, block, self.activity_badge_count(icon));
             }
         }
 

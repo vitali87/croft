@@ -425,16 +425,12 @@ impl App {
             self.overlays.ssh.set_image(card);
         }
         // The activity-bar count badges ride the same overlay machinery; rebuild
-        // them against the freshly-baked icons / new background or cell size. The
-        // Explorer badge's per-frame refresh is count-gated, so force a rebuild
-        // here by invalidating its cached count first.
-        self.refresh_scm_change_badge();
-        self.explorer_unsaved_count = usize::MAX;
-        self.refresh_explorer_unsaved_badge();
-        self.remote_ports_count = usize::MAX;
-        self.refresh_remote_ports_badge();
-        self.testing_badge_count = usize::MAX;
-        self.refresh_testing_badge();
+        // them against the freshly-baked icons / new background or cell size.
+        // Their refresh is count-gated, so invalidate each first.
+        for badge in &mut self.activity_badges {
+            badge.invalidate();
+        }
+        self.refresh_activity_badges();
         self.problems_badge_count = usize::MAX;
         self.refresh_problems_badge();
     }
@@ -1127,73 +1123,15 @@ impl App {
                     blocks.push((icons[icon], self.activity_icon_picture(images, icon)));
                 }
             }
-            let exp_block = icons[ActivityIcon::Explorer];
-            let scm_block = icons[ActivityIcon::SourceControl];
-            let rem_block = icons[ActivityIcon::Remote];
-            let tst_block = icons[ActivityIcon::Testing];
-            // Change-count badge over the SCM icon's bottom-right corner. Pushed
-            // after the SCM icon so the iTerm2 path (last writer wins each cell)
-            // paints it on top; the Kitty path baked it at z=1 for the same
-            // effect. Dropping it from the list when the count hits zero shifts
-            // the emit positions, which arms the overlay's move-detection clear.
-            if let Some(badge) = self.scm_change_badge.as_deref() {
-                let bw = crate::iterm2_inline::count_badge_cells_w(self.scm_change_badge_count);
-                let bx = scm_block.x + scm_block.width.saturating_sub(bw);
-                let by = scm_block.y + scm_block.height.saturating_sub(1);
-                blocks.push((
-                    Rect {
-                        x: bx,
-                        y: by,
-                        width: bw,
-                        height: 1,
-                    },
-                    badge,
-                ));
-            }
-            // Same badge over the Explorer icon for the unsaved-file count.
-            if let Some(badge) = self.explorer_unsaved_badge.as_deref() {
-                let bw = crate::iterm2_inline::count_badge_cells_w(self.explorer_unsaved_count);
-                let bx = exp_block.x + exp_block.width.saturating_sub(bw);
-                let by = exp_block.y + exp_block.height.saturating_sub(1);
-                blocks.push((
-                    Rect {
-                        x: bx,
-                        y: by,
-                        width: bw,
-                        height: 1,
-                    },
-                    badge,
-                ));
-            }
-            // And over the Remote icon for the forwarded-ports count.
-            if let Some(badge) = self.remote_ports_badge.as_deref() {
-                let bw = crate::iterm2_inline::count_badge_cells_w(self.remote_ports_count);
-                let bx = rem_block.x + rem_block.width.saturating_sub(bw);
-                let by = rem_block.y + rem_block.height.saturating_sub(1);
-                blocks.push((
-                    Rect {
-                        x: bx,
-                        y: by,
-                        width: bw,
-                        height: 1,
-                    },
-                    badge,
-                ));
-            }
-            // And the failing-test count over the Testing (beaker) icon.
-            if let Some(badge) = self.testing_badge.as_deref() {
-                let bw = crate::iterm2_inline::count_badge_cells_w(self.testing_badge_count);
-                let bx = tst_block.x + tst_block.width.saturating_sub(bw);
-                let by = tst_block.y + tst_block.height.saturating_sub(1);
-                blocks.push((
-                    Rect {
-                        x: bx,
-                        y: by,
-                        width: bw,
-                        height: 1,
-                    },
-                    badge,
-                ));
+            // Each count badge over its icon's bottom-right corner, pushed after
+            // every icon so the iTerm2 path (last writer wins each cell) paints
+            // it on top; the Kitty path baked it at z=1 for the same effect.
+            // Dropping one from the list when its count hits zero shifts the
+            // emit positions, which arms the overlay's move-detection clear.
+            for icon in ActivityIcon::ALL {
+                if let Some(badge) = self.activity_badges[icon as usize].placed(icons[icon]) {
+                    blocks.push(badge);
+                }
             }
         }
         // Customize Layout toolbar icons (top-right of the editor / welcome).
