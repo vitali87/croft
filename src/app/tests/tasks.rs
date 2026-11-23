@@ -1292,7 +1292,14 @@ fn a_task_problem_matcher_owns_its_pane_and_watch_publishes_win() {
 #[test]
 fn a_task_pane_whose_shell_left_the_directory_is_not_reused() {
     let tmp = tempfile::tempdir().unwrap();
-    std::fs::write(tmp.path().join("Makefile"), "build:\n\ttrue\n").unwrap();
+    // Only the build's own shell works out the sum, so the pane shows
+    // `built_42` once the build has run and never before: the typed
+    // `make build` line cannot contain it.
+    std::fs::write(
+        tmp.path().join("Makefile"),
+        "build:\n\t@echo built_$$((40 + 2))\n",
+    )
+    .unwrap();
     std::fs::create_dir_all(tmp.path().join("sub")).unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     let chord = key(
@@ -1301,15 +1308,21 @@ fn a_task_pane_whose_shell_left_the_directory_is_not_reused() {
     );
     app.handle_key(chord).unwrap();
 
-    // Wait for the pane's shell to reach its prompt, as the reuse path
-    // requires an idle pane.
+    // Wait for the build to finish and the pane's shell to come back to its
+    // prompt in the task's folder, as the reuse path requires an idle pane.
+    // The shell alone is not enough: a fresh pane's shell owns the
+    // foreground before it has even started the build, so under load the
+    // wait could pass at once and the check below meet `make` running
+    // (#2650; #2167 fixed the same race in the rerun test).
     let root = tmp.path().canonicalize().unwrap();
     crate::test_budget::await_spawned(
-        std::time::Duration::from_secs(10),
-        "the task pane's shell",
+        crate::test_budget::tests::TASK_PANE_PROMPT_BASE,
+        "the build to run and the task pane's shell to return to its prompt",
         || {
             let t = &app.terminals[app.active_terminal];
-            t.foreground_is_shell() && t.kernel_shell_cwd() == Some(root.clone())
+            t.visible_text().contains("built_42")
+                && t.foreground_is_shell()
+                && t.kernel_shell_cwd() == Some(root.clone())
         },
     );
     let idx = app.active_terminal;
