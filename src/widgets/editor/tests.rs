@@ -19804,6 +19804,50 @@ fn scan_color_swatches_recognizes_rgb_and_hsl() {
 }
 
 #[test]
+fn scan_color_swatches_recognizes_code_level_rgb_constructors() {
+    let line = "const C: Color = Color::Rgb(0xeb, 0xcb, 0x8b);";
+    let out = scan_color_swatches(&[String::from(line)], false);
+    assert_eq!(out[0].len(), 1, "found: {:?}", out[0]);
+    let (from, to, bg, fg) = out[0][0];
+    let start = line.find("Color::Rgb").unwrap();
+    assert_eq!((from, to), (start, line.find(')').unwrap() + 1));
+    assert_eq!(bg, Color::Rgb(0xeb, 0xcb, 0x8b));
+    assert_eq!(fg, Color::Black, "dark ink on a light colour");
+    for (text, rgb) in [
+        ("Rgb(235, 203, 139)", (235, 203, 139)),
+        ("Color::Rgb(0x1E, 0xFF_u8, 7,)", (0x1e, 0xff, 7)),
+        ("Color::from_rgb(1, 2, 3)", (1, 2, 3)),
+        ("x = from_rgb(0, 0, 0x80)", (0, 0, 0x80)),
+    ] {
+        let out = scan_color_swatches(&[String::from(text)], false);
+        assert_eq!(out[0].len(), 1, "{text}: {:?}", out[0]);
+        assert_eq!(out[0][0].2, Color::Rgb(rgb.0, rgb.1, rgb.2), "{text}");
+    }
+    // The alpha forms, and the `image` crate's array form.
+    for (text, rgb) in [
+        ("Rgba([0xe9, 0x7c, 0x41, 0xff])", (0xe9, 0x7c, 0x41)),
+        ("Rgba([0xff, 0xff, 0xff, 0xff]));", (255, 255, 255)),
+        ("Color::Rgba(1, 2, 3, 128)", (1, 2, 3)),
+        ("Rgb([1, 2, 3])", (1, 2, 3)),
+    ] {
+        let out = scan_color_swatches(&[String::from(text)], false);
+        assert_eq!(out[0].len(), 1, "{text}: {:?}", out[0]);
+        assert_eq!(out[0][0].2, Color::Rgb(rgb.0, rgb.1, rgb.2), "{text}");
+        assert_eq!(out[0][0].0, 0, "{text}: from the constructor's name");
+        assert_eq!(out[0][0].1, text.find(')').unwrap() + 1, "{text}");
+    }
+    // Not a colour: a number out of range.
+    for text in [
+        "Color::Rgb(256, 0, 0)",
+        "Color::Rgb(r, g, b)",
+        "Color::Rgb(1, 2)",
+    ] {
+        let out = scan_color_swatches(&[String::from(text)], false);
+        assert!(out[0].is_empty(), "{text}: {:?}", out[0]);
+    }
+}
+
+#[test]
 fn scan_color_swatches_ignores_hex_like_identifiers() {
     // A hex digit run of invalid CSS length (12 digits, immediately
     // followed by another hex digit) must not match as any color form.
@@ -19879,6 +19923,23 @@ fn plain_text_color_swatch_scan_is_gated_by_buffer_size() {
         e.color_swatches.iter().all(Vec::is_empty),
         "an oversized buffer opts out of the color-swatch scan"
     );
+}
+
+#[test]
+fn a_big_buffer_still_tints_the_literals_it_draws() {
+    let mut e = editor_with("");
+    e.lines = vec![String::from("x = Color::Rgb(0xff, 0, 0);")];
+    e.lines.extend(vec![
+        "y".repeat(64 * 1024);
+        COLOR_SWATCH_SCAN_MAX_BYTES / (64 * 1024) + 2
+    ]);
+    e.recompute_highlights();
+    assert!(e.color_swatches.is_empty(), "no whole-buffer table");
+    let buf = guide_buf(&mut e, 60, 6);
+    let text_x = e.last_inner.x + e.last_gutter_width + 1;
+    let y0 = e.last_inner.y;
+    assert_eq!(buf[(text_x + 4, y0)].bg, Color::Rgb(255, 0, 0));
+    assert_ne!(buf[(text_x, y0)].bg, Color::Rgb(255, 0, 0));
 }
 
 #[test]

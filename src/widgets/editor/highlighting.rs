@@ -109,17 +109,20 @@ impl Editor {
         self.color_swatches = if total_bytes > COLOR_SWATCH_SCAN_MAX_BYTES {
             Vec::new()
         } else {
-            scan_color_swatches(
-                &self.lines,
-                matches!(
-                    self.lang,
-                    Some(LangKind::Css | LangKind::Html | LangKind::Vue | LangKind::Svelte)
-                ),
-            )
+            scan_color_swatches(&self.lines, self.swatch_decimal_short())
         };
         self.recompute_semantic_overlay();
         self.recompute_diagnostic_spans();
         self.recompute_inlay_spans();
+    }
+
+    /// Whether a short run of decimal digits after `#` is a colour here:
+    /// only in stylesheet-like buffers (elsewhere it is an issue reference).
+    pub(super) fn swatch_decimal_short(&self) -> bool {
+        matches!(
+            self.lang,
+            Some(LangKind::Css | LangKind::Html | LangKind::Vue | LangKind::Svelte)
+        )
     }
 
     /// Hand the buffer's text to a worker thread for a syntax pass as `kind`.
@@ -840,6 +843,73 @@ pub(super) fn parse_rgb_color(line: &str, i: usize) -> Option<((u8, u8, u8), usi
     Some(((r, g, b), close + 1))
 }
 
+/// One integer of a code-level color call: decimal or `0x` hex, `_`
+/// separators allowed, an optional `u8` suffix (`0xeb`, `235`, `0xEB_u8`).
+fn parse_color_component(text: &str) -> Option<u8> {
+    let t = text.trim();
+    let t = t.strip_suffix("u8").unwrap_or(t).trim_end_matches('_');
+    let t: String = t.chars().filter(|&c| c != '_').collect();
+    let v = match t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+        None => t.parse().ok()?,
+    };
+    u8::try_from(v).ok()
+}
+
+/// Parse a Rust-style color constructor starting at byte `i`:
+/// `Color::Rgb(0xeb, 0xcb, 0x8b)`, `Rgb(235, 203, 139)`, `Color::from_rgb(..)`,
+/// a bare `from_rgb(..)`, and the alpha forms (`Rgba(..)`,
+/// `from_rgba_unmultiplied(..)`) whose fourth value is read but not drawn.
+/// The values may be wrapped in an array, as the `image` crate's
+/// `Rgba([0xff, 0, 0, 0xff])` has them. Every value is an integer literal.
+/// The whole call, path included, is the match. It must start at a path
+/// start (not glued to a word, `_` or `::`), so `x::Rgb(` is left alone.
+fn parse_code_rgb_color(line: &str, i: usize) -> Option<((u8, u8, u8), usize)> {
+    const PREFIXES: [&str; 8] = [
+        "Color::Rgba(",
+        "Color::Rgb(",
+        "Color::from_rgb(",
+        "Color::from_rgba_unmultiplied(",
+        "Rgba(",
+        "Rgb(",
+        "from_rgba_unmultiplied(",
+        "from_rgb(",
+    ];
+    let rest = &line[i..];
+    let prefix = PREFIXES.iter().find(|p| rest.starts_with(**p))?;
+    if i > 0 {
+        let prev = line.as_bytes()[i - 1];
+        if prev.is_ascii_alphanumeric() || prev == b'_' || prev == b':' {
+            return None;
+        }
+    }
+    let args = &rest[prefix.len()..];
+    let (inner, consumed) = match args.trim_start().strip_prefix('[') {
+        Some(array) => {
+            let end = array.find(']')?;
+            let tail = array[end + 1..].trim_start().strip_prefix(')')?;
+            (&array[..end], rest.len() - tail.len())
+        }
+        None => {
+            let end = args.find(')')?;
+            (&args[..end], prefix.len() + end + 1)
+        }
+    };
+    let mut parts = inner.split(',');
+    let r = parse_color_component(parts.next()?)?;
+    let g = parse_color_component(parts.next()?)?;
+    let b = parse_color_component(parts.next()?)?;
+    let alpha = parts.next().filter(|p| !p.trim().is_empty());
+    if alpha.is_some_and(|a| parse_color_component(a).is_none()) {
+        return None;
+    }
+    // At most one more (empty) piece, from a trailing comma.
+    if parts.any(|p| !p.trim().is_empty()) {
+        return None;
+    }
+    Some(((r, g, b), consumed))
+}
+
 /// Convert HSL (h in degrees, s/l as 0..=100 percentages) to sRGB.
 pub(super) fn hsl_to_rgb(h: f32, s: f32, l: f32) -> (u8, u8, u8) {
     let s = s / 100.0;
@@ -904,15 +974,16 @@ pub(super) fn parse_hsl_color(line: &str, i: usize) -> Option<((u8, u8, u8), usi
     Some((hsl_to_rgb(h, s, l), close + 1))
 }
 
-/// Buffers above this size skip the color-swatch scan, for the same reason
-/// [`BRACKET_SCAN_MAX_BYTES`] gates bracket colorization: a per-edit,
-/// per-line scan must not make typing in a huge file pay for it.
+/// Buffers above this size skip the whole-buffer color-swatch scan, for the
+/// same reason [`BRACKET_SCAN_MAX_BYTES`] gates bracket colorization: a
+/// per-edit, per-line scan must not make typing in a huge file pay for it.
+/// Their visible lines are scanned at draw time instead.
 pub(super) const COLOR_SWATCH_SCAN_MAX_BYTES: usize = 1_000_000;
 
 /// Inline color-literal decoration scan (the `naumovs.color-highlight`
 /// convention): per line, the `(start char col, end char col, background,
-/// foreground)` of every `#hex` / `rgb()` / `rgba()` / `hsl()` / `hsla()`
-/// literal found anywhere in the text — comments, strings, and plain prose
+/// foreground)` of every `#hex` / `rgb()` / `rgba()` / `hsl()` / `hsla()` /
+/// `Color::Rgb(0xeb, 0xcb, 0x8b)` literal found anywhere in the text — comments, strings, and plain prose
 /// alike, since (unlike syntax highlighting) a color swatch has no notion of
 /// "this isn't code here." A byte-position match is converted to a char
 /// column range so the renderer's column math (shared with bracket
@@ -931,6 +1002,7 @@ pub(super) fn scan_color_swatches(
         let mut i = 0usize;
         while i < bytes.len() {
             let hit = parse_hex_color(bytes, i, decimal_short)
+                .or_else(|| parse_code_rgb_color(line, i))
                 .or_else(|| parse_rgb_color(line, i))
                 .or_else(|| parse_hsl_color(line, i));
             match hit {
