@@ -233,6 +233,10 @@ fn the_background_pass_keeps_its_order() {
 /// times a second, and over SSH send it all each time.
 #[test]
 fn an_idle_background_pass_asks_for_no_redraw() {
+    // A pass takes any crash notice waiting in the process-wide slot: the
+    // tests that put one there on purpose must not lose it to this one, nor
+    // this one see theirs.
+    let _slot = crash_slot_lock();
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     crate::test_budget::await_spawned(
