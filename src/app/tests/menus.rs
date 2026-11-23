@@ -501,7 +501,7 @@ fn the_editor_menu_without_a_selection_offers_only_paste() {
 /// glyphs there, `Ctrl+Alt+Shift` elsewhere. The rows showed none.
 #[test]
 fn the_convert_indentation_rows_show_the_chords_that_run_them() {
-    use crate::widgets::command_palette::{Command, hint_for_platform};
+    use crate::command_registry::{Command, hint_for_platform};
     for (to_spaces, command, glyphs) in [
         (true, Command::IndentationToSpaces, "⌥⇧⌘S"),
         (false, Command::IndentationToTabs, "⌥⇧⌘T"),
