@@ -564,3 +564,28 @@ fn only_a_picture_whose_cells_changed_counts_as_covered() {
     app.picture_cover.start_frame();
     assert!(!app.picture_waits(PictureSpot::Minimap));
 }
+
+/// Codex on #2664: the editor tab's tooltip was drawn with the editor,
+/// before the pictures' cells were noted, so over an image it counted as
+/// part of the picture and the picture was sent over it. It is now drawn
+/// with the other pop-ups.
+#[test]
+fn an_editor_picture_waits_for_a_tab_tooltip_drawn_over_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = picture_app(tmp.path());
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 45)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let l = app
+        .editor_image_payload(0)
+        .map(|(_, l)| l.clone())
+        .expect("staging: the picture bakes");
+    app.tab_tooltip = Some(crate::widgets::hover_popup::HoverPopup::new_compact(
+        String::from("pic.png  ~/project"),
+        (l.cell_x + 4, l.cell_y + 2),
+    ));
+    term.draw(|f| app.render(f)).unwrap();
+    assert!(
+        app.editor_image_payload(0).is_none(),
+        "the tab tooltip is drawn over the picture, so the picture waits"
+    );
+}

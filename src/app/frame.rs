@@ -423,6 +423,9 @@ impl App {
         // Set again by the welcome panel when it paints the button.
         self.welcome_tour_button = Rect::default();
         self.picture_cover.start_frame();
+        // Where the editor tab's tooltip goes, once the focused group is
+        // known; it is drawn with the other pop-ups (#2663).
+        let mut tab_tooltip_area: Option<Rect> = None;
         let size = frame.area();
         self.last_frame_area = size;
         if let Some(menu) = self.context_menu.as_mut() {
@@ -1128,11 +1131,15 @@ impl App {
                     frame.render_widget(popup_ref, area);
                 }
             }
+            // Placed here, where the focused group is known, and drawn with
+            // the other pop-ups once the pictures' cells are noted: drawn
+            // here, a tooltip over an image's first rows counted as part of
+            // the picture, which was then sent over it (Codex, #2664).
             if let Some(popup) = self.tab_tooltip.as_mut() {
                 popup.theme = self.theme;
                 let area = popup.area_for(focused_area);
                 if area.width > 0 && area.height > 0 {
-                    frame.render_widget(&*popup, area);
+                    tab_tooltip_area = Some(area);
                 }
             }
             // Layout-control icons at the top-right of the editor tab strip.
@@ -2334,6 +2341,9 @@ impl App {
         // panes yet: what lies under each picture is noted, to compare with
         // the finished frame (#2663).
         self.note_pictures_before_popups(frame.buffer_mut());
+        if let (Some(area), Some(popup)) = (tab_tooltip_area, self.tab_tooltip.as_ref()) {
+            frame.render_widget(popup, area);
+        }
 
         // Overlays render last so they sit on top of everything else. The port
         // toast goes first so modals/menus paint above it.
