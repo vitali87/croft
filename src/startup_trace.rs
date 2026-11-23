@@ -75,6 +75,17 @@ pub fn mark(label: &'static str) {
     }
 }
 
+/// Mark `label` once `value` is computed, and hand `value` back: a step that
+/// runs inside an expression, such as one field of `App::new`'s struct
+/// literal, gets a mark of its own where it runs. Taking the step out of the
+/// literal to mark it would move it: the literal runs its fields top to
+/// bottom, and that order is the order startup does them in.
+#[inline]
+pub fn after<T>(label: &'static str, value: T) -> T {
+    mark(label);
+    value
+}
+
 /// [`mark`]'s work, while the trace is still recording.
 #[cold]
 fn record(label: &'static str) {

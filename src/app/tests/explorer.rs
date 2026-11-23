@@ -1252,6 +1252,41 @@ fn cmd_p_index_refreshes_after_a_new_file_lands_on_disk() {
     );
 }
 
+/// #2618: a Go to File index rebuild asked for while another was running
+/// still runs when the running one crashes, instead of waiting for the next
+/// file change.
+#[test]
+fn a_rebuild_queued_behind_a_crashed_index_build_still_runs() {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::create_dir(tmp.path().join(".git")).unwrap();
+    std::fs::write(tmp.path().join("alpha.rs"), b"").unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    // A build whose thread crashes.
+    app.file_finder_index_job = Some(
+        crate::jobs::Job::spawn(
+            "file-index",
+            crate::jobs::Start::Now,
+            || -> Vec<crate::widgets::file_finder::FileEntry> {
+                panic!("the index build crashed (on purpose, in a test)")
+            },
+        )
+        .unwrap(),
+    );
+    // A file lands while it runs, and asks for a rebuild.
+    std::fs::write(tmp.path().join("beta.rs"), b"").unwrap();
+    app.kick_file_finder_index_rebuild();
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(5),
+        "the rebuild queued behind the crashed build to land",
+        || {
+            app.poll_file_finder_index();
+            app.file_finder_index
+                .as_ref()
+                .is_some_and(|index| index.iter().any(|e| e.rel == "beta.rs"))
+        },
+    );
+}
+
 #[test]
 fn click_on_tree_row_aligned_with_terminal_splitter_y_selects_the_row_not_the_splitter() {
     // Regression for the user's "I can't click on the last two files,
@@ -2069,6 +2104,183 @@ fn explorer_views_menu_labels_dependencies_for_the_detected_ecosystem() {
         "a Cargo root labels the view 'Rust Dependencies': {:?}",
         menu.items
     );
+}
+
+/// An app on a Node folder whose `package.json` lists `left-pad`, with the
+/// DEPENDENCIES section shown and open.
+fn left_pad_app() -> (tempfile::TempDir, App) {
+    let tmp = tempfile::tempdir().unwrap();
+    std::fs::write(
+        tmp.path().join("package.json"),
+        r#"{ "dependencies": { "left-pad": "1.3.0" } }"#,
+    )
+    .unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    if !app.explorer_views.is_visible(ExplorerView::Dependencies) {
+        app.explorer_views.toggle(ExplorerView::Dependencies);
+    }
+    app.dependencies.collapsed = false;
+    (tmp, app)
+}
+
+/// The DEPENDENCIES section as it draws.
+fn dependencies_text(app: &mut App) -> String {
+    let area = ratatui::layout::Rect::new(0, 0, 40, 6);
+    let mut buf = ratatui::buffer::Buffer::empty(area);
+    ratatui::widgets::Widget::render(&mut app.dependencies, area, &mut buf);
+    (0..area.height)
+        .map(|y| {
+            (0..area.width)
+                .map(|x| buf[(x, y)].symbol())
+                .collect::<String>()
+                + "\n"
+        })
+        .collect()
+}
+
+/// #2572: a dependency lookup whose thread crashed settles the
+/// section on saying so, instead of "Loading" until the folder changes.
+#[test]
+fn a_dependency_lookup_whose_thread_crashed_says_it_could_not_list() {
+    let (_tmp, mut app) = left_pad_app();
+    app.sync_explorer_panels();
+    app.deps_fetch = Some(
+        crate::jobs::Job::spawn(
+            "dependencies",
+            crate::jobs::Start::Now,
+            || -> Vec<crate::widgets::dependencies::Dependency> {
+                panic!("the lookup crashed (on purpose, in a test)")
+            },
+        )
+        .unwrap(),
+    );
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(1),
+        "the crashed lookup to settle",
+        || {
+            app.sync_explorer_panels();
+            app.deps_fetch.is_none()
+        },
+    );
+    let text = dependencies_text(&mut app);
+    assert!(text.contains("Could not list dependencies"), "got:\n{text}");
+    assert!(!text.contains("Loading"), "got:\n{text}");
+}
+
+/// #2573: a lookup still out for the folder just left is dropped, so
+/// its list can never land in the new folder's section, even when it
+/// answers last.
+#[test]
+fn a_lookup_for_the_folder_just_left_never_lands_in_the_new_one() {
+    let (_tmp, mut app) = left_pad_app();
+    // The folder just left still has its lookup out, and it has answered.
+    app.deps_fetch = Some(crate::jobs::Job::finished(vec![
+        crate::widgets::dependencies::Dependency {
+            name: "serde".into(),
+            version: "1.0.0".into(),
+            ecosystem: crate::widgets::dependencies::Ecosystem::Rust,
+        },
+    ]));
+    // The re-root that left it.
+    app.deps_fetched = None;
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(1),
+        "this folder's list to land",
+        || {
+            app.sync_explorer_panels();
+            dependencies_text(&mut app).contains("left-pad")
+        },
+    );
+    let text = dependencies_text(&mut app);
+    assert!(!text.contains("serde"), "got:\n{text}");
+}
+
+/// An app on a repo whose committed `seed.txt` is open, with the TIMELINE
+/// section shown and open.
+fn seed_timeline_app() -> (tempfile::TempDir, App, PathBuf) {
+    let tmp = make_committed_repo();
+    let file = tmp.path().join("seed.txt");
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.open_file_at_launch(&file);
+    if !app.explorer_views.is_visible(ExplorerView::Timeline) {
+        app.explorer_views.toggle(ExplorerView::Timeline);
+    }
+    app.timeline.collapsed = false;
+    (tmp, app, file)
+}
+
+/// The TIMELINE section as it draws.
+fn timeline_text(app: &mut App) -> String {
+    let area = ratatui::layout::Rect::new(0, 0, 40, 8);
+    let mut buf = ratatui::buffer::Buffer::empty(area);
+    ratatui::widgets::Widget::render(&mut app.timeline, area, &mut buf);
+    (0..area.height)
+        .map(|y| {
+            (0..area.width)
+                .map(|x| buf[(x, y)].symbol())
+                .collect::<String>()
+                + "\n"
+        })
+        .collect()
+}
+
+/// #2574: a TIMELINE lookup whose thread crashed settles the section on
+/// saying so, instead of "Loading" until another file is opened.
+#[test]
+fn a_timeline_lookup_whose_thread_crashed_says_it_could_not_load() {
+    let (_tmp, mut app, _file) = seed_timeline_app();
+    app.sync_explorer_panels();
+    app.timeline_fetch = Some(
+        crate::jobs::Job::spawn(
+            "timeline",
+            crate::jobs::Start::Now,
+            || -> (PathBuf, Vec<crate::git::FileHistoryEntry>) {
+                panic!("the lookup crashed (on purpose, in a test)")
+            },
+        )
+        .unwrap(),
+    );
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(1),
+        "the crashed lookup to settle",
+        || {
+            app.sync_explorer_panels();
+            app.timeline_fetch.is_none()
+        },
+    );
+    let text = timeline_text(&mut app);
+    assert!(text.contains("Could not load history"), "got:\n{text}");
+    assert!(!text.contains("Loading"), "got:\n{text}");
+}
+
+/// #2575: starting a lookup drops the one still out, so an older list for
+/// the same file, read before the newest version existed, can never
+/// replace the newer one, even when it answers last.
+#[test]
+fn an_older_timeline_lookup_never_replaces_a_newer_one() {
+    let (_tmp, mut app, file) = seed_timeline_app();
+    // An older lookup for this file is still out, and has answered.
+    app.timeline_fetch = Some(crate::jobs::Job::finished((
+        file,
+        vec![crate::git::FileHistoryEntry {
+            short_hash: "0ld0ld0".into(),
+            summary: "an older list".into(),
+            author: "someone".into(),
+            age_secs: 60,
+        }],
+    )));
+    // A save's new version asks for the history again.
+    app.timeline_fetched = None;
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(5),
+        "the newer list to land",
+        || {
+            app.sync_explorer_panels();
+            timeline_text(&mut app).contains("init")
+        },
+    );
+    let text = timeline_text(&mut app);
+    assert!(!text.contains("an older list"), "got:\n{text}");
 }
 
 #[test]

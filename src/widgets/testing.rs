@@ -115,6 +115,8 @@ pub struct TestingPanel {
     refused: bool,
     /// Latched by [`Self::on_cancelled`] for the app's "Test run cancelled".
     cancelled: bool,
+    /// Latched by [`Self::on_stopped`] for the app to say the run stopped.
+    stopped: bool,
     /// The summary line's Stop control while a run is in flight (#1534).
     pub last_stop: Rect,
     /// Pre-run statuses of the cases the last `start_single`/`start_filter`
@@ -170,6 +172,7 @@ impl TestingPanel {
             progress: None,
             refused: false,
             cancelled: false,
+            stopped: false,
             last_stop: Rect::default(),
             prerun: Vec::new(),
             scroll: 0,
@@ -592,6 +595,20 @@ impl TestingPanel {
     /// Consume the cancel latch (one status message per cancel).
     pub fn take_cancelled(&mut self) -> bool {
         std::mem::take(&mut self.cancelled)
+    }
+
+    /// The test runner's thread crashed with this run or discovery in
+    /// flight (#2592): it ends as a cancelled one does, without a verdict,
+    /// and the stop is latched for the app to say why.
+    pub fn on_stopped(&mut self) {
+        self.on_cancelled();
+        self.cancelled = false;
+        self.stopped = true;
+    }
+
+    /// Consume the stop latch (one status message per stop).
+    pub fn take_stopped(&mut self) -> bool {
+        std::mem::take(&mut self.stopped)
     }
 
     pub fn is_running(&self) -> bool {

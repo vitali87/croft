@@ -99,6 +99,83 @@ fn cancelling_the_remote_handoff_stays_here_with_the_edits() {
     assert!(app.status.contains("did not connect"), "{}", app.status);
 }
 
+/// A remote install whose thread crashed fails the connect and its dialog
+/// says so, reading as failed and closing like any failed connect, even
+/// while a helper of the install still holds its log (#2607 review). It used
+/// to show the install as under way for good.
+#[test]
+fn a_remote_install_whose_thread_crashed_fails_the_connect() {
+    // A failed install is remembered on disk: keep it off this machine's.
+    let _serial = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::tempdir().unwrap();
+    let _restore = override_cache_dir(tmp.path().join("cache"));
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.connect_dialog = Some(crate::widgets::connect_dialog::ConnectDialog::new(
+        String::from("devbox"),
+    ));
+    app.install_session = Some(crate::install_session::InstallSession::crashing("devbox"));
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(1),
+        "the crashed install to end",
+        || {
+            app.poll_install_session();
+            app.install_session.is_none()
+        },
+    );
+    let dialog = app.connect_dialog.as_ref().expect("the dialog says why");
+    assert_eq!(
+        dialog.phase,
+        crate::widgets::connect_dialog::DialogPhase::Failed
+    );
+    assert_eq!(
+        dialog.error.as_deref(),
+        Some(crate::install_session::CRASHED_DETAIL)
+    );
+    assert!(
+        !app.status.contains("Remote install failed"),
+        "the status line is left to the crash notice: {}",
+        app.status
+    );
+    app.handle_connect_dialog_key(key(KeyCode::Esc, KeyModifiers::NONE));
+    assert!(app.connect_dialog.is_none(), "Esc closes it");
+}
+
+/// #2610: a failed install closes the SSH connection it was handed, its
+/// socket's private directory included, instead of leaving it open until
+/// croft exits.
+#[test]
+fn a_failed_remote_install_closes_its_ssh_connection() {
+    // A failed install is remembered on disk: keep it off this machine's.
+    let _serial = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::tempdir().unwrap();
+    let _restore = override_cache_dir(tmp.path().join("cache"));
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let socket_dir = tmp.path().join("ctl");
+    std::fs::create_dir(&socket_dir).unwrap();
+    let adopted = crate::remote::AdoptedMaster {
+        host: String::from("devbox"),
+        socket_dir: socket_dir.clone(),
+        socket_path: socket_dir.join("ctl"),
+    };
+    app.connect_dialog = Some(crate::widgets::connect_dialog::ConnectDialog::new(
+        String::from("devbox"),
+    ));
+    app.install_session = Some(crate::install_session::InstallSession::with_events(
+        "devbox",
+        None,
+        Some(adopted),
+        vec![crate::install_session::InstallEvent::Done(Err(
+            String::from("no space left on device"),
+        ))],
+    ));
+    app.poll_install_session();
+    assert!(app.install_session.is_none());
+    assert!(
+        !socket_dir.exists(),
+        "the connection's socket directory is gone"
+    );
+}
+
 /// #862 negative: S at the handoff prompt whose save is refused (the file
 /// changed on disk) stays here, and drops the launch: left armed, the next
 /// ordinary Ctrl+Q would have connected instead of quitting.
@@ -454,6 +531,40 @@ fn a_detected_port_renders_in_the_ports_panel() {
     assert!(text.contains("node"), "its process is listed");
 }
 
+/// #2568: a port poll whose thread crashed is no longer in flight. The
+/// crash notice tells the user; the next poll then starts on cadence,
+/// instead of no poll ever starting again until a restart.
+#[test]
+fn a_port_poll_whose_thread_crashed_lets_the_next_one_run() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    assert!(
+        app.terminals.iter().any(|t| t.pid().is_some()),
+        "setup: a pane with a shell to poll"
+    );
+    app.port_poll = Some(
+        crate::jobs::Job::spawn("port-poll", crate::jobs::Start::Now, || -> PortPoll {
+            panic!("the poll crashed (on purpose, in a test)")
+        })
+        .unwrap(),
+    );
+    // Not yet time for the next poll, so only the crashed one settles.
+    app.last_port_poll = std::time::Instant::now();
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(1),
+        "the crashed poll to settle",
+        || {
+            app.drain_ports_and_poll();
+            app.port_poll.is_none()
+        },
+    );
+    app.last_port_poll = std::time::Instant::now()
+        .checked_sub(crate::app::bottom_panel::PORT_POLL_INTERVAL)
+        .expect("the clock is past one poll interval");
+    app.drain_ports_and_poll();
+    assert!(app.port_poll.is_some(), "the next poll started");
+}
+
 #[test]
 fn opening_a_forwarded_remote_port_routes_to_the_local_browser_via_relay() {
     use crate::widgets::ports::{PortOrigin, PortsPanel};
@@ -782,11 +893,10 @@ fn a_fleet_run_reports_through_the_channel_rather_than_blocking() {
             elapsed: std::time::Duration::ZERO,
         },
     ];
-    app.fleet_running = true;
-    app.fleet_tx.send(results).unwrap();
+    app.fleet_run = Some(crate::jobs::Job::finished(results));
 
     assert!(app.drain_fleet_results(), "a delivered result must report");
-    assert!(!app.fleet_running, "the run is no longer in flight");
+    assert!(app.fleet_run.is_none(), "the run is no longer in flight");
     assert!(
         app.status.contains("2 identical") && app.status.contains("1 differ"),
         "the summary must reach the user: {}",
@@ -1106,14 +1216,11 @@ fn fleet_output_shows_each_hosts_time_and_the_lines_that_differ() {
         exit: Some(0),
         elapsed: std::time::Duration::from_millis(ms),
     };
-    app.fleet_running = true;
-    app.fleet_tx
-        .send(vec![
-            r("zz363-a", "Linux\n6.8.0-45", 120),
-            r("zz363-b", "Linux\n6.8.0-45", 80),
-            r("zz363-odd", "Linux\n6.8.0-31", 1500),
-        ])
-        .unwrap();
+    app.fleet_run = Some(crate::jobs::Job::finished(vec![
+        r("zz363-a", "Linux\n6.8.0-45", 120),
+        r("zz363-b", "Linux\n6.8.0-45", 80),
+        r("zz363-odd", "Linux\n6.8.0-31", 1500),
+    ]));
     assert!(app.drain_fleet_results());
     let lines: Vec<String> = crate::output::snapshot(crate::output::CHANNEL_FLEET)
         .unwrap()
@@ -1142,6 +1249,43 @@ fn fleet_output_shows_each_hosts_time_and_the_lines_that_differ() {
             .any(|l| l.ends_with(" Linux") && l.starts_with("    ")),
         "an equal line is not marked"
     );
+}
+
+/// #2566: a fleet run whose thread crashed is no longer in flight. The
+/// crash notice tells the user and FLEET says the run stopped; the next run
+/// then starts instead of answering "A fleet run is already in flight".
+#[test]
+fn a_fleet_run_whose_thread_crashed_lets_the_next_one_run() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.fleet_run = Some(
+        crate::jobs::Job::spawn("fleet-run", crate::jobs::Start::Now, || {
+            panic!("the run crashed (on purpose, in a test)")
+        })
+        .unwrap(),
+    );
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(1),
+        "the crashed run to settle",
+        || {
+            app.drain_fleet_results();
+            app.fleet_run.is_none()
+        },
+    );
+    let lines: Vec<String> = crate::output::snapshot(crate::output::CHANNEL_FLEET)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|l| l.text)
+        .collect();
+    assert!(
+        lines
+            .iter()
+            .any(|l| l == "the fleet run stopped without results"),
+        "{lines:?}"
+    );
+    app.run_fleet_command("localhost: echo fleet-again");
+    assert_eq!(app.status, "Fleet: running on 1 hosts…");
+    assert!(app.fleet_run.is_some(), "the next run started");
 }
 
 /// #363 end to end: a fleet run's results open as tiles in the Fleet tab,

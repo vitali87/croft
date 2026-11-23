@@ -210,18 +210,31 @@ pub fn sync_config_now(host: &str, resolution: &SyncResolution, diff: Option<&st
     }
 }
 
+/// The remote's copy of config file `name`, empty when it has none, read
+/// over the control socket at `socket_path`.
+pub(super) fn read_remote_config(
+    socket_path: &Path,
+    host: &str,
+    name: &str,
+) -> std::io::Result<Vec<u8>> {
+    let mut command = ssh_socket_read(
+        socket_path,
+        host,
+        &format!("cat ~/.config/croft/{name} 2>/dev/null"),
+    );
+    // Waits out "Text file busy", as `read_remote_hashes` does (#2560).
+    let out = crate::review_ops::spawn_retrying_busy(&mut command)
+        .and_then(std::process::Child::wait_with_output)?;
+    Ok(out.stdout)
+}
+
 /// Print a unified diff of the remote's copy of `name` against the local
 /// one, remote first, so `+` lines are what a push would bring.
 pub(super) fn print_config_diff(ssh: &SshControl, name: &str) -> Result<()> {
     let local = crate::paths::config_dir().join(name);
-    let out = ssh_socket_read(
-        &ssh.socket_path,
-        &ssh.host,
-        &format!("cat ~/.config/croft/{name} 2>/dev/null"),
-    )
-    .output()?;
+    let remote = read_remote_config(&ssh.socket_path, &ssh.host, name)?;
     let tmp = std::env::temp_dir().join(format!("croft-sync-{}-{name}", std::process::id()));
-    std::fs::write(&tmp, &out.stdout)?;
+    std::fs::write(&tmp, &remote)?;
     let local_arg = if local.is_file() {
         local
     } else {

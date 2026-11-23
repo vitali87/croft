@@ -1,0 +1,55 @@
+# Stage B of the refactor program (#2062): where each item of src/cli.rs goes.
+# One row per item, in file order. pr 0 means the item stays in cli.rs; the others
+# move to src/cli/<file>.rs in that PR. kind, impl and name are as
+# `scripts/check_pure_move.py list` prints them. Run
+# `scripts/move_items.py --target cli --check` after adding an item to cli.rs.
+# cli.rs keeps the clap root, Cli, whose fields every subcommand's code reads.
+pr	file	kind	impl	name
+10	terminal_setup	const	-	SETUP_FONT_PS_NAME
+10	terminal_setup	const	-	SETUP_FONT_SIZE
+10	terminal_setup	const	-	ITERM2_FONT_PS_NAME
+10	terminal_setup	const	-	ITERM2_NONASCII_PS_NAME
+10	terminal_setup	const	-	ITERM2_FONT_SIZE
+1	version	const	-	VERSION
+1	version	const	-	VERBOSE_VERSION
+0		struct	-	Cli
+15	commands	enum	-	HookAction
+15	commands	enum	-	CliCommand
+1	version	fn	-	build_info_line
+16	run	fn	impl Cli	run
+4	git_editor	fn	-	configured_sequence_editor
+4	git_editor	fn	-	git_editor
+4	git_editor	fn	-	run_git_editor
+5	links	fn	-	open_link
+5	links	fn	-	local_hostname
+5	links	fn	-	install_link_handler
+6	plot	fn	-	plot
+6	plot	fn	-	plot_palette
+7	pair_provider	fn	-	resolve_pair_provider
+10	terminal_setup	fn	-	setup_terminal
+8	hook	fn	-	hook_command
+9	keys	fn	-	key_kind_label
+9	keys	fn	-	keys_diagnostic
+9	keys	fn	-	is_paste_probe_key
+10	terminal_setup	fn	-	setup_iterm2
+11	vscode_import	fn	-	import_vscode
+11	vscode_import	fn	-	plural
+16	run	fn	-	end_quietly_when_stdout_closes
+12	theme_import	fn	-	theme_import
+12	theme_import	fn	-	scratch_nonce
+12	theme_import	fn	-	fetch_marketplace_theme
+10	terminal_setup	fn	-	setup_ghostty
+2	typos	fn	-	misspelled_subcommand
+2	typos	fn	-	edit_distance
+3	workspace	fn	-	resolve_workspace
+3	workspace	fn	-	split_launch_location
+3	workspace	fn	-	launch_root
+3	workspace	fn	-	resolve_open_file
+3	workspace	fn	-	new_file_in_existing_dir
+3	workspace	fn	-	resolve_workspace_from
+13	launcher_install	fn	-	install_launcher
+14	cross	const	-	CROSS_TARGETS
+14	cross	fn	-	setup_cross
+14	cross	fn	-	install_zig_if_missing
+14	cross	fn	-	install_cargo_zigbuild_if_missing
+14	cross	fn	-	install_rust_target_if_missing

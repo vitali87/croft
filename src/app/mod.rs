@@ -62,6 +62,7 @@ mod settings;
 pub(crate) mod sidebar_dwell;
 mod terminal_panes;
 mod terminal_tools;
+mod tick;
 mod viewers;
 mod welcome;
 mod welcome_screen;
@@ -108,6 +109,7 @@ use sidebar_dwell::{AUTO_HIDE_DWELL, SidebarDwell};
 use terminal_panes::*;
 #[cfg(test)]
 use terminal_tools::*;
+use tick::*;
 use viewers::*;
 use welcome::WelcomeState;
 #[cfg(test)]
@@ -131,7 +133,7 @@ use crate::widgets::{
     outline::OutlinePanel,
     remote::RemotePanel,
     run_debug::RunDebugPanel,
-    search::{SearchPanel, SearchRequest},
+    search::{SearchPanel, SearchProgress, SearchRequest},
     source_control::SourceControlPanel,
     terminal::{MouseAction, MouseButtonKind, MouseMods, PtyTerminal},
     timeline::TimelinePanel,
@@ -1368,11 +1370,12 @@ pub struct App {
     /// The Source Control COMMITS section: the repo-wide commit graph with
     /// lane rails, stacked under the change list. See [`CommitGraphPanel`].
     pub commit_graph: crate::widgets::commit_graph::CommitGraphPanel,
-    /// Background `git log --topo-order` + lane layout for the COMMITS
-    /// section, tagged by the root it describes so a stale reply after a
-    /// Make Root is ignored on drain.
-    graph_rx: GraphReplyRx,
-    graph_tx: GraphReplyTx,
+    /// The COMMITS section's fetch in flight, if one is: background `git log
+    /// --topo-order` plus the lane layout. Its reply is tagged by the root it
+    /// describes, so a stale reply after a Make Root is ignored on drain.
+    /// While it runs, a burst of StatusAndChanges responses spawns no
+    /// duplicates; one whose thread crashed is no longer running (#2564).
+    graph_fetch: Option<crate::jobs::Job<GraphReply>>,
     /// What the COMMITS panel is currently showing: `None` for the root's
     /// own history, `Some("base..lane")` for a worktree lane's diff (#348).
     ///
@@ -1381,9 +1384,6 @@ pub struct App {
     /// already discarded replies for a since-left ROOT, and this is the same
     /// rule at the resolution the lane diff needs.
     graph_revspec: Option<String>,
-    /// A graph fetch is running; suppresses duplicate spawns when a burst of
-    /// StatusAndChanges responses lands. Cleared when the reply drains.
-    graph_fetch_inflight: bool,
     /// A refresh was requested while a fetch was in flight (Make Root, a
     /// newer HEAD): re-fire once the stale reply drains instead of dropping
     /// the request (see [`Self::refresh_commit_graph`]).
@@ -1551,10 +1551,10 @@ pub struct App {
     /// When a format-on-save stops waiting on its formatter and writes the
     /// file unformatted (#1491). Set with `save_after_format`.
     format_save_deadline: Option<std::time::Instant>,
-    /// Background `git log` results for the TIMELINE, keyed by the file they
-    /// describe so a stale reply for a since-closed file is ignored on drain.
-    timeline_rx: std::sync::mpsc::Receiver<(PathBuf, Vec<crate::git::FileHistoryEntry>)>,
-    timeline_tx: std::sync::mpsc::Sender<(PathBuf, Vec<crate::git::FileHistoryEntry>)>,
+    /// The TIMELINE lookup for the active file, while it runs, tagged with
+    /// the file it describes. Starting another drops it, so an older list can
+    /// never replace a newer one (#2575).
+    timeline_fetch: Option<crate::jobs::Job<(PathBuf, Vec<crate::git::FileHistoryEntry>)>>,
     /// Background folder-size scans for the CodeQL database card (#578): a
     /// large database is many files, so the walk stays off the input path.
     codeql_size_rx: std::sync::mpsc::Receiver<(PathBuf, Option<u64>)>,
@@ -1650,16 +1650,14 @@ pub struct App {
     /// TIMELINE once the snapshot actually exists on disk.
     history_done_rx: std::sync::mpsc::Receiver<PathBuf>,
     history_done_tx: std::sync::mpsc::Sender<PathBuf>,
-    /// The whole-project check's result: where it ran, and what the process
-    /// did (#256). The `io::Result` carries a spawn failure separately from
-    /// a run that produced output, because those need different messages.
+    /// The whole-project check in flight, if one is (#256). Its result is
+    /// where it ran and what the process did; the `io::Result` carries a
+    /// spawn failure separately from a run that produced output, because
+    /// those need different messages. While it runs, a second invocation
+    /// says so rather than stacking compilers; one whose thread crashed is
+    /// no longer running (#2562).
     #[allow(clippy::type_complexity)]
-    project_check_rx: std::sync::mpsc::Receiver<(PathBuf, std::io::Result<std::process::Output>)>,
-    #[allow(clippy::type_complexity)]
-    project_check_tx: std::sync::mpsc::Sender<(PathBuf, std::io::Result<std::process::Output>)>,
-    /// Whether a sweep is in flight, so a second invocation says so rather
-    /// than stacking compilers.
-    project_check_running: bool,
+    project_check: Option<crate::jobs::Job<(PathBuf, std::io::Result<std::process::Output>)>>,
     /// How many rows the last sweep produced (#256), counted before its
     /// items join a store shared with every other producer.
     project_check_rows: usize,
@@ -1691,17 +1689,15 @@ pub struct App {
     test_jump_rx: std::sync::mpsc::Receiver<(PathBuf, String, Option<(PathBuf, u32)>)>,
     #[allow(clippy::type_complexity)]
     test_jump_tx: std::sync::mpsc::Sender<(PathBuf, String, Option<(PathBuf, u32)>)>,
-    /// Background per-ecosystem dependency-resolution result for DEPENDENCIES.
-    deps_rx: std::sync::mpsc::Receiver<Vec<Dependency>>,
-    deps_tx: std::sync::mpsc::Sender<Vec<Dependency>>,
+    /// The DEPENDENCIES lookup for the current root, while it runs. A
+    /// re-root replaces it, so a slower lookup for the folder just left can
+    /// never land in the new folder's list (#2573).
+    deps_fetch: Option<crate::jobs::Job<Vec<Dependency>>>,
     /// The workspace root DEPENDENCIES was detected/fetched for, so detection
     /// and the fetch fire once per root (re-fired by Make Root / re-root).
     deps_fetched: Option<PathBuf>,
-    /// Push-to-talk voice input (Termux OSK mic). The worker streams its
-    /// transcript over this channel; `voice_handle` lets the mic release kill
-    /// the in-flight recognizer.
-    voice_rx: std::sync::mpsc::Receiver<crate::voice::VoiceMsg>,
-    voice_tx: std::sync::mpsc::Sender<crate::voice::VoiceMsg>,
+    /// Push-to-talk voice input (Termux OSK mic): the live session, whose
+    /// result `drain_voice` reads and which a second mic tap cancels.
     voice_handle: Option<crate::voice::VoiceHandle>,
     /// Set when a mic tap cancels a live session, so the resulting empty result
     /// is reported as "canceled" rather than "no speech detected", and a
@@ -2189,11 +2185,6 @@ pub struct App {
     /// What each pane (by uid) was last seen connected to, so an ssh session
     /// is offered once when it starts rather than on every sample.
     ssh_offer_seen: std::collections::BTreeMap<u64, Option<String>>,
-    /// The label thread's ssh samples (#364): `(shell pid, resolved host)`
-    /// per pane it looked at, shipped beside the names it already resolves
-    /// so the argv read and the `~/.ssh/config` parse stay off the loop.
-    ssh_rx: std::sync::mpsc::Receiver<Vec<(i32, Option<String>)>>,
-    ssh_tx: std::sync::mpsc::Sender<Vec<(i32, Option<String>)>>,
     /// `disable_remote_offer` from prefs (#364).
     remote_offer_disabled: bool,
     /// `remote_offer_excluded_hosts` from prefs (#364).
@@ -2580,34 +2571,30 @@ pub struct App {
     /// Last time the socket poll was kicked off, so it fires on a low cadence
     /// rather than every tick.
     last_port_poll: std::time::Instant,
-    /// Socket-poll snapshots arrive here from a one-shot background thread (one
-    /// complete listener set per cycle), so the blocking `lsof`/`ps` never runs
-    /// on the event loop (keeps input at 0ms). A full set, not individual hits,
-    /// so the app can reconcile ports that stopped listening.
-    port_poll_rx: std::sync::mpsc::Receiver<PortPoll>,
-    /// Results of a running fleet command (#363), delivered off the event
+    /// The socket poll in flight, if one is: a one-shot background job (one
+    /// complete listener set per cycle), so the blocking `lsof`/`ps` never
+    /// runs on the event loop (keeps input at 0ms). A full set, not
+    /// individual hits, so the app can reconcile ports that stopped
+    /// listening. While one runs, cadence ticks start no overlapping `lsof`;
+    /// one whose thread crashed is no longer running (#2568).
+    port_poll: Option<crate::jobs::Job<PortPoll>>,
+    /// The fleet command in flight (#363), if one is, run off the event
     /// loop. A fleet run waits on the network for up to `FLEET_TIMEOUT`, and
     /// blocking the loop for that would freeze the editor — the user could
-    /// not scroll, type, or cancel while their fleet answered.
-    fleet_rx: std::sync::mpsc::Receiver<Vec<crate::fleet::HostResult>>,
-    fleet_tx: std::sync::mpsc::Sender<Vec<crate::fleet::HostResult>>,
-    /// True while a run is in flight, so a second invocation says so rather
-    /// than starting a competing fleet against the same hosts.
-    fleet_running: bool,
+    /// not scroll, type, or cancel while their fleet answered. While it
+    /// runs, a second invocation says so rather than starting a competing
+    /// fleet against the same hosts; one whose thread crashed is no longer
+    /// running (#2566).
+    fleet_run: Option<crate::jobs::Job<Vec<crate::fleet::HostResult>>>,
     /// The command the fleet run in flight is running, for its tab (#363).
     fleet_command: String,
-    port_poll_tx: std::sync::mpsc::Sender<PortPoll>,
-    /// True while a poll thread is in flight, so cadence ticks don't pile up
-    /// overlapping `lsof` invocations.
-    port_poll_inflight: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// Auto-label refresh for terminal panes: `(shell_pid, process_name,
-    /// script)` resolved off the event loop, applied to the pane with that
-    /// shell pid. `script` is what a script runtime (`node`) runs, for agent
-    /// recognition (#1380); `None` for anything else.
+    /// When the terminal panes' labels were last looked up.
     last_label_refresh: std::time::Instant,
-    label_rx: std::sync::mpsc::Receiver<Vec<(i32, String, Option<String>)>>,
-    label_tx: std::sync::mpsc::Sender<Vec<(i32, String, Option<String>)>>,
-    label_inflight: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The pane-label lookup in flight, if one is: each pane's foreground
+    /// process resolved off the event loop (see [`terminal_panes::LabelPass`]).
+    /// While it runs, cadence ticks start no other; one whose thread crashed
+    /// is no longer running (#2569).
+    label_pass: Option<crate::jobs::Job<terminal_panes::LabelPass>>,
     /// Hit-test rect of the "PROBLEMS" tab in the panel tab strip. Empty when
     /// the panel is hidden.
     problems_tab_rect: Rect,
@@ -3016,9 +3003,10 @@ pub struct App {
     /// typed, the `gh` to run, and where finished jobs report.
     review_pending: Vec<crate::review_threads::PendingComment>,
     review_pending_pr: Option<(PathBuf, String)>,
-    /// A Submit Review or export is in flight; another is refused until it
-    /// reports, so the same comments are never posted twice.
-    review_submitting: bool,
+    /// The Submit Review or export in flight, as the `review-submit` job;
+    /// another is refused while it runs, so the same comments are never
+    /// posted twice. A job whose thread crashed no longer counts (#2578).
+    review_submit: Option<crate::jobs::Job<crate::review_ops::Outcome>>,
     /// Sticky notes (#367): every note in the workspace, where the owner
     /// keeps them (`None` under test), and which box id is which note.
     notes: crate::sticky_notes::Notes,
@@ -3211,9 +3199,14 @@ pub struct App {
     editor_vim_chord: EditorVimChord,
     /// `Cmd+K` leader: armed when the user presses the prefix, holding the
     /// instant it started so the next key within `CMD_K_LEADER_TIMEOUT`
-    /// completes a `Cmd+K`-prefixed chord (VS Code's two-key model). `None`
-    /// when no chord is in flight.
-    cmd_k_leader: Option<std::time::Instant>,
+    /// completes a `Cmd+K`-prefixed chord (VS Code's two-key model), and the
+    /// leader's name for the status bar's "Waiting for second key" line.
+    /// `None` when no chord is in flight.
+    cmd_k_leader: Option<CmdKLeader>,
+    /// VS Code's "The key combination (Ctrl+K, X) is not a command." note:
+    /// when it comes off the bar, and its text, so a message that replaced
+    /// it in the meantime stays.
+    cmd_k_miss_note: Option<(std::time::Instant, String)>,
     /// Whether croft asked the terminal for the kitty keyboard protocol at
     /// startup (what `croft keys` reports as `kitty=`). A terminal that
     /// honours it reports `Shift` held with `Ctrl` explicitly, so
@@ -3789,16 +3782,16 @@ pub struct App {
     /// Cached workspace file index. Built lazily on first Cmd+P and
     /// shared across reopens so repeated invocations are instant.
     file_finder_index: Option<std::sync::Arc<Vec<crate::widgets::file_finder::FileEntry>>>,
-    /// Background-build receiver: App::new spawns a thread that walks
-    /// the workspace and sends the index here; Cmd+P opens against the
-    /// hot index instead of walking on the UI thread. None once the
-    /// index has been received (or if a build was never kicked off).
-    file_finder_index_rx:
-        Option<std::sync::mpsc::Receiver<Vec<crate::widgets::file_finder::FileEntry>>>,
+    /// The background build of that index: App::new starts one that walks
+    /// the workspace, so Cmd+P opens against the hot index instead of
+    /// walking on the UI thread, and file changes start rebuilds. None once
+    /// the index has landed, or the build's thread died (#2618), or no build
+    /// was started.
+    file_finder_index_job: Option<crate::jobs::Job<Vec<crate::widgets::file_finder::FileEntry>>>,
     /// Set when a rebuild was requested while one was already in flight.
-    /// poll_file_finder_index drains it on completion and re-kicks the
-    /// background walker so a long-running rebuild (multi-GB monorepo)
-    /// can never miss a later FS event that landed mid-walk.
+    /// poll_file_finder_index starts it once that one ends, landed or
+    /// crashed (#2618), so a long-running rebuild (multi-GB monorepo) can
+    /// never miss a later FS event that landed mid-walk.
     file_finder_index_dirty: bool,
 }
 
@@ -4208,16 +4201,11 @@ impl App {
         } else {
             crate::mcp::catalog::installed_ids(&crate::lsp::manifest::user_extensions_dir())
         };
-        let (timeline_tx, timeline_rx) = std::sync::mpsc::channel();
         let (codeql_size_tx, codeql_size_rx) = std::sync::mpsc::channel();
         let (history_done_tx, history_done_rx) = std::sync::mpsc::channel();
-        let (project_check_tx, project_check_rx) = std::sync::mpsc::channel();
         let (project_hint_tx, project_hint_rx) = std::sync::mpsc::channel();
         let (test_jump_tx, test_jump_rx) = std::sync::mpsc::channel();
-        let (graph_tx, graph_rx) = std::sync::mpsc::channel();
         let (blame_tx, blame_rx) = std::sync::mpsc::channel();
-        let (deps_tx, deps_rx) = std::sync::mpsc::channel();
-        let (voice_tx, voice_rx) = std::sync::mpsc::channel();
         let editor = EditorTabs::new();
         // Bound before the first pane, so that pane's shell carries the
         // socket like every later one. `spawn_with_preamble` reads
@@ -4254,10 +4242,6 @@ impl App {
 
         let (search_query_tx, search_query_rx) = std::sync::mpsc::channel();
         let (search_results_tx, search_results_rx) = std::sync::mpsc::channel();
-        let (port_poll_tx, port_poll_rx) = std::sync::mpsc::channel();
-        let (fleet_tx, fleet_rx) = std::sync::mpsc::channel();
-        let (label_tx, label_rx) = std::sync::mpsc::channel();
-        let (ssh_tx, ssh_rx) = std::sync::mpsc::channel();
         let search_root = root.clone();
         std::thread::spawn(move || {
             crate::widgets::search::search_worker_loop(
@@ -4266,19 +4250,18 @@ impl App {
                 search_results_tx,
             );
         });
-        // Pre-build the Cmd+P file index on a background thread so the
-        // first Cmd+P keystroke does not stall the UI for the length
-        // of a workspace walk. The result is delivered via channel;
-        // open_file_finder calls poll_file_finder_index to consume it.
-        let (file_finder_index_tx, file_finder_index_rx) =
-            std::sync::mpsc::channel::<Vec<crate::widgets::file_finder::FileEntry>>();
+        // Pre-build the Cmd+P file index on a background job so the
+        // first Cmd+P keystroke does not stall the UI for the length of a
+        // workspace walk (a home folder's included), started after the
+        // first frame. open_file_finder calls poll_file_finder_index to
+        // take it; if no thread can start, the first Cmd+P walks instead.
         let index_root = root.clone();
-        std::thread::spawn(move || {
-            // A walk of the whole workspace, a home folder's included.
-            crate::startup_gate::wait();
-            let entries = crate::widgets::file_finder::build_file_index(&index_root);
-            let _ = file_finder_index_tx.send(entries);
-        });
+        let file_finder_index_job = crate::jobs::Job::spawn(
+            FILE_INDEX_THREAD,
+            crate::jobs::Start::AfterFirstFrame,
+            move || crate::widgets::file_finder::build_file_index(&index_root),
+        )
+        .ok();
         let fs_watch = FsWatch::spawn(&root, &tree);
         crate::startup_trace::mark("file watcher started");
         // Persisted layout preferences (Customize Layout popup). Skipped under
@@ -4295,15 +4278,16 @@ impl App {
             remote,
             source_control,
             commit_graph: crate::widgets::commit_graph::CommitGraphPanel::new(),
-            graph_rx,
             graph_revspec: None,
-            graph_tx,
-            graph_fetch_inflight: false,
+            graph_fetch: None,
             graph_refetch_queued: false,
             run_debug,
             testing: crate::widgets::testing::TestingPanel::new(),
             codeql: crate::widgets::codeql::CodeqlPanel::new(),
-            test_worker: crate::testing::worker::TestWorker::spawn(root.clone()),
+            test_worker: crate::startup_trace::after(
+                "test runner started",
+                crate::testing::worker::TestWorker::spawn(root.clone()),
+            ),
             test_run_status: None,
             last_test_run: None,
             pane_run_statuses: Vec::new(),
@@ -4321,13 +4305,20 @@ impl App {
             tab_click_target: None,
             macro_recording: None,
             macro_last: None,
-            macro_registers: crate::macros::load(&crate::macros::macros_path()),
+            macro_registers: crate::startup_trace::after(
+                "macros loaded",
+                crate::macros::load(&crate::macros::macros_path()),
+            ),
             macro_replaying: false,
             macros_path: crate::macros::macros_path(),
-            config_watch: crate::config_sync::ConfigWatch::new(config_watch_paths(
-                &merged_settings.chain,
-            )),
-            snippets: load_all_snippets([root.as_path()]),
+            config_watch: crate::startup_trace::after(
+                "settings watcher set up",
+                crate::config_sync::ConfigWatch::new(config_watch_paths(&merged_settings.chain)),
+            ),
+            snippets: crate::startup_trace::after(
+                "snippets loaded",
+                load_all_snippets([root.as_path()]),
+            ),
             format_on_save: loaded_prefs.format_on_save,
             default_formatter: loaded_prefs.default_formatter.clone(),
             language_formatters: loaded_prefs.language_formatters.clone(),
@@ -4359,16 +4350,13 @@ impl App {
             explorer_views,
             settings_chain: merged_settings.chain,
             settings_provenance: merged_settings.provenance,
-            timeline_rx,
-            timeline_tx,
+            timeline_fetch: None,
             codeql_size_rx,
             codeql_size_tx,
             codeql_size_pending: std::collections::HashSet::new(),
             history_done_rx,
             history_done_tx,
-            project_check_rx,
-            project_check_tx,
-            project_check_running: false,
+            project_check: None,
             project_check_rows: 0,
             project_hint_rx,
             project_hint_tx,
@@ -4422,11 +4410,8 @@ impl App {
                 crate::history::history_dir()
             },
             history_restore: None,
-            deps_rx,
-            deps_tx,
+            deps_fetch: None,
             deps_fetched: None,
-            voice_rx,
-            voice_tx,
             voice_handle: None,
             voice_canceling: false,
             voice_ready: None,
@@ -4603,8 +4588,6 @@ impl App {
             pending_remote_launch_path: None,
             ssh_offer: None,
             ssh_offer_seen: std::collections::BTreeMap::new(),
-            ssh_rx,
-            ssh_tx,
             remote_offer_disabled: loaded_prefs.disable_remote_offer,
             remote_offer_excluded: loaded_prefs.remote_offer_excluded_hosts.clone(),
             fleet_groups: loaded_prefs.fleet_groups.clone(),
@@ -4612,9 +4595,12 @@ impl App {
             code_scan_seen: None,
             code_scan_list: None,
             code_scan_fetch: None,
-            remote_offer_refused: crate::remote::load_refused_hosts(
-                &crate::remote::refused_hosts_path(&croft_cache_dir()),
-                std::time::SystemTime::now(),
+            remote_offer_refused: crate::startup_trace::after(
+                "refused remote hosts read",
+                crate::remote::load_refused_hosts(
+                    &crate::remote::refused_hosts_path(&croft_cache_dir()),
+                    std::time::SystemTime::now(),
+                ),
             ),
             lane_agent: loaded_prefs.lane_agent.clone(),
             color_depth: loaded_prefs
@@ -4686,7 +4672,10 @@ impl App {
             terminal_profile_buttons: Vec::new(),
             terminal_close_buttons: Vec::new(),
             terminal_collapse_buttons: Vec::new(),
-            consented_extensions: crate::prefs::Prefs::load_or_default().mcp_consented,
+            consented_extensions: crate::startup_trace::after(
+                "extension consents read",
+                crate::prefs::Prefs::load_or_default().mcp_consented,
+            ),
             config_dir: crate::paths::config_dir(),
             settings_profile: if cfg!(test) {
                 None
@@ -4713,17 +4702,11 @@ impl App {
             captures: crate::widgets::captures::CapturesPanel::new(),
             port_toast: None,
             last_port_poll: std::time::Instant::now(),
-            port_poll_rx,
-            fleet_rx,
-            fleet_tx,
-            fleet_running: false,
+            port_poll: None,
+            fleet_run: None,
             fleet_command: String::new(),
-            port_poll_tx,
-            port_poll_inflight: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_label_refresh: std::time::Instant::now(),
-            label_rx,
-            label_tx,
-            label_inflight: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            label_pass: None,
             problems_tab_rect: Rect::default(),
             output_tab_rect: Rect::default(),
             ports_tab_rect: Rect::default(),
@@ -4736,13 +4719,16 @@ impl App {
             osk_auto: crate::iterm2_inline::detect_osk_auto(),
             last_content_width: 0,
             last_content_height: 0,
-            lsp: match crate::lsp::LspManager::new(root.clone()) {
-                Ok(m) => Some(m),
-                Err(e) => {
-                    eprintln!("lsp manager init failed: {e}");
-                    None
-                }
-            },
+            lsp: crate::startup_trace::after(
+                "language server manager built",
+                match crate::lsp::LspManager::new(root.clone()) {
+                    Ok(m) => Some(m),
+                    Err(e) => {
+                        eprintln!("lsp manager init failed: {e}");
+                        None
+                    }
+                },
+            ),
             lsp_last_seen: std::collections::HashMap::new(),
             shell_lint_notice_shown: false,
             tool_search_path: std::env::var_os("PATH"),
@@ -4794,6 +4780,7 @@ impl App {
             completion_popup: None,
             editor_vim_chord: EditorVimChord::default(),
             cmd_k_leader: None,
+            cmd_k_miss_note: None,
             kitty_keys: false,
             legacy_ctrl_punct: false,
             vim: crate::vim::VimState::new(),
@@ -4852,14 +4839,17 @@ impl App {
             // files so app tests that run commands or split panes can never
             // touch (or race on) the user's real history / session files;
             // tests that exercise the stores inject their own paths.
-            command_history: crate::command_history::CommandHistory::load(&if cfg!(test) {
-                std::env::temp_dir().join(format!(
-                    "croft-test-command-history-{}.jsonl",
-                    std::process::id()
-                ))
-            } else {
-                crate::command_history::history_path()
-            }),
+            command_history: crate::startup_trace::after(
+                "command history read",
+                crate::command_history::CommandHistory::load(&if cfg!(test) {
+                    std::env::temp_dir().join(format!(
+                        "croft-test-command-history-{}.jsonl",
+                        std::process::id()
+                    ))
+                } else {
+                    crate::command_history::history_path()
+                }),
+            ),
             command_history_popup: None,
             terminal_session_dirty: false,
             terminal_store_error: None,
@@ -4881,8 +4871,14 @@ impl App {
                 crate::workspace::folders_store_path()
             },
             terminal_copy_mode: None,
-            triggers: load_trigger_set(!loaded_prefs.disable_secret_redaction),
-            agents: crate::agents::AgentTable::load(&crate::agents::agents_path()),
+            triggers: crate::startup_trace::after(
+                "triggers loaded",
+                load_trigger_set(!loaded_prefs.disable_secret_redaction),
+            ),
+            agents: crate::startup_trace::after(
+                "agents loaded",
+                crate::agents::AgentTable::load(&crate::agents::agents_path()),
+            ),
             agent_events: std::collections::VecDeque::new(),
             status_agents_rect: Rect::default(),
             status_position_rect: Rect::default(),
@@ -4991,7 +4987,7 @@ impl App {
             pending_stash_drop: None,
             pending_replace_all: None,
             file_finder_index: None,
-            file_finder_index_rx: Some(file_finder_index_rx),
+            file_finder_index_job,
             file_finder_index_dirty: false,
             completion_request_id: None,
             completion_origin: None,
@@ -5027,11 +5023,14 @@ impl App {
             review_boxes: None,
             review_pending: Vec::new(),
             review_pending_pr: None,
-            review_submitting: false,
-            notes: notes_path
-                .as_deref()
-                .map(crate::sticky_notes::Notes::load)
-                .unwrap_or_default(),
+            review_submit: None,
+            notes: crate::startup_trace::after(
+                "sticky notes read",
+                notes_path
+                    .as_deref()
+                    .map(crate::sticky_notes::Notes::load)
+                    .unwrap_or_default(),
+            ),
             notes_path,
             note_box_ids: std::collections::HashMap::new(),
             notes_shown_gen: 0,
@@ -6598,303 +6597,16 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             run_pending_scp_uploads(app, terminal)?;
             needs_redraw = true;
         }
-        // Same-file tabs agree before the watcher is read: a save from one
-        // symbol tab leaves its siblings holding the saved text, so the
-        // change event reads as their own write, not a conflict (#369).
-        let symbol_views_settled = app.sync_symbol_views();
-        // Pull in any filesystem-watcher events first so the tree reflects
-        // disk reality on the very next frame.
-        let fs_changed = app.drain_fs_events();
-        crate::startup_trace::mark("file changes read");
-        // Peek without clearing so we can coalesce PTY-only redraws without
-        // losing bytes that the reader thread has already advanced into the
-        // terminal grid.
-        let pty_pending = app.peek_terminals_dirty();
-        let blink_visible = app.cursor_visible_phase();
+        // What the background work finished this tick, collected before
+        // anything is drawn (#2062).
+        let pass = tick_background(app);
+        let pty_pending = pass.pty_pending;
+        let blink_visible = pass.blink_visible;
         let blink_changed = blink_visible != last_blink_visible;
-        // Either spinner advancing must wake a redraw; both stay 0 when idle.
-        let spinner_phase =
-            app.update_spinner_phase() + app.mcp_spinner_phase() + app.problems_fix_spinner_phase();
+        let spinner_phase = pass.spinner_phase;
         let spinner_changed = spinner_phase != last_spinner_phase;
-        let ext_index_changed = app.drain_ext_index_refresh();
-        let codeql_changed = app.drain_codeql_run()
-            | app.drain_codeql_ast()
-            | app.drain_codeql_model()
-            | app.drain_codeql_doc()
-            | app.drain_codeql_upgrade()
-            | app.drain_codeql_version()
-            | app.drain_codeql_log_summary()
-            | app.drain_codeql_log_viewer()
-            | app.drain_codeql_perf_compare()
-            | app.drain_codeql_query_help()
-            | app.drain_codeql_pack_job()
-            | app.drain_codeql_db_job()
-            | app.drain_codeql_cli_download()
-            | app.drain_codeql_cli_check()
-            | app.drain_codeql_code_search()
-            | app.drain_codeql_variant_submit()
-            | app.poll_codeql_variant_runs()
-            | app.drain_codeql_variant_results()
-            | app.drain_codeql_variant_export()
-            | app.drain_codeql_queries();
-        let search_changed = app.drain_search_results();
-        let log_index_changed = app.poll_log_index();
-        let remote_changed = app.refresh_remote_if_config_changed();
-        let pulls_changed = app.drain_remote_pulls() | app.drain_relay_copies();
-        let finder_changed = app.sync_file_finder_open_lines()
-            | app
-                .file_finder
-                .as_mut()
-                .is_some_and(|f| f.poll_line_check());
-        let view_changed = app.drain_view_requests();
-        let hook_changed = app.drain_hook_requests()
-            | app.poll_pr_gh()
-            | app.poll_pr_checkout()
-            | app.poll_code_scanning();
-        crate::startup_trace::mark("background results collected");
-        app.sync_approval_check();
-        app.persist_agent_ledger(false);
-        let kernel_changed = app.poll_notebook_kernels();
-        let ports_changed = app.drain_ports_and_poll();
-        let session_presence_changed = app.poll_session_presence();
-        let session_typing_changed = app.poll_session_typing();
-        let collab_changed = app.poll_collab();
-        crate::startup_trace::mark("agents, ports and collaborators polled");
-        let symbol_views_changed = app.sync_symbol_views() | symbol_views_settled;
-        let bells_changed = app.drain_terminal_bells();
-        // A block whose command has finished gets its output box (#354).
-        let captures_changed = app.settle_block_captures();
-        // Every tick, not only when a capture settles: this is what notices
-        // the editor has moved to another document (#354 review).
-        app.publish_block_outputs();
-        let labels_changed =
-            app.refresh_terminal_labels() | app.drain_agent_events() | app.drain_fleet_results();
-        app.flush_terminal_session();
-        let auto_save_changed = app.tick_auto_save();
-        app.tick_hot_exit(std::time::Instant::now());
-        crate::startup_trace::mark("terminal panes and saves ticked");
-        let highlights_changed = app.poll_highlights();
-        // Pictures baked off the UI thread (#1973) go up as they land.
-        let images_changed =
-            app.poll_chrome_bake() | app.poll_welcome_bake() | app.poll_saved_session();
-        // A closed tab's bookmarks are kept, and come back with its file.
-        let bookmarks_changed = app.settle_bookmarks();
-        crate::startup_trace::mark("highlights and pictures polled");
-        let live_run_changed = app.tick_live_run()
-            | app.sync_markdown_side_previews()
-            | app.sync_markdown_scroll()
-            | app.tick_minimap();
-        app.tick_code_lens();
-        let code_lens_changed = app.tick_config_watch()
-            | app.drain_lsp_code_lens()
-            | app.drain_search_editor()
-            | app.tick_inline_complete()
-            | app.drain_review_ops();
-        let connect_changed = app.poll_connect_dialog() | app.drain_scrub_views();
-        let install_changed = app.poll_install_session();
-        let update_changed = app.poll_update_watch() | app.poll_background_panic();
-        let http_changed = app.drain_http_responses();
-        let reveal_changed = app.tick_redaction_reveal();
-        crate::startup_trace::mark("watchers and dialogs polled");
-        app.sync_lsp();
-        app.send_due_completion_ask();
-        app.send_due_completion_reask();
-        crate::startup_trace::mark("language servers synced");
-        let markdown_lint_changed = app.sync_markdown_lint();
-        let sarif_diagnostics_changed = app.sync_sarif_diagnostics();
-        app.sync_sarif_selection_to_cursor();
-        app.sync_sarif_step_marks();
-        app.refresh_sarif_preview();
-        app.poll_sarif_download();
-        app.sync_git_gutters();
-        app.sync_blame();
-        app.sync_provenance();
-        let blame_changed = app.drain_blame() | app.drain_git_net() | app.drain_git_view();
-        crate::startup_trace::mark("lint, gutters and blame synced");
-        // Request/refresh the OUTLINE for the active file (after sync_lsp so the
-        // edit-seq it reads is current) and advance follow-cursor.
-        let outline_sync_changed = app.sync_outline();
-        let outline_changed = app.drain_lsp_document_symbols();
-        app.workspace_symbols_dispatch_due();
-        let ws_symbols_changed = app.drain_lsp_workspace_symbols();
-        // Refresh the Explorer's other stacked sub-views (Open Editors list,
-        // Timeline git history, Dependencies) and drain their workers.
-        let explorer_panels_changed = app.sync_explorer_panels();
-        crate::startup_trace::mark("outline and Explorer views synced");
-        app.refresh_semantic_tokens_if_requested();
-        app.refresh_inlay_hints_if_requested();
-        app.refresh_workspace_diagnostics_if_requested();
-        let lsp_changed = app.drain_lsp_completion();
-        app.refresh_signature_help_if_moved();
-        let sig_help_changed = app.drain_lsp_signature_help();
-        app.poll_hover();
-        let hover_changed =
-            app.drain_lsp_hover() | app.drain_lsp_rust_analyzer() | app.drain_blame_hover();
-        let tab_hover_changed = app.poll_tab_hover();
-        let ui_tooltip_changed = app.poll_ui_tooltip();
-        let definition_changed = app.drain_lsp_definition();
-        let declaration_changed = app.drain_lsp_declaration();
-        let type_definition_changed = app.drain_lsp_type_definition();
-        let implementation_changed = app.drain_lsp_implementation();
-        let references_changed = app.drain_lsp_references();
-        let call_hierarchy_changed = app.drain_lsp_call_hierarchy();
-        let sidebar_hide_changed = app.tick_sidebar_auto_hide();
-        let occ_tick_changed = app.tick_occurrences();
-        let linked_tick_changed = app.tick_linked_editing();
-        let linked_changed = app.drain_lsp_linked_editing();
-        app.tick_on_type_formatting();
-        let on_type_changed = app.drain_lsp_on_type_format();
-        let prepare_rename_changed = app.drain_lsp_prepare_rename();
-        let occurrences_changed = app.drain_lsp_document_highlights();
-        let rename_changed = app.drain_lsp_rename() | app.tick_file_moves();
-        let format_changed = app.drain_lsp_format() | app.drain_prettier_format();
-        let code_action_changed = app.drain_lsp_code_actions();
-        let semantic_changed = app.drain_lsp_semantic_tokens();
-        let inlay_changed = app.drain_lsp_inlay_hints();
-        app.drain_lsp_document_links();
-        let folds_changed = app.drain_lsp_folding_ranges();
-        let selection_ranges_changed = app.drain_lsp_selection_ranges();
-        let colors_changed = app.drain_lsp_document_colors();
-        let color_pres_changed = app.drain_lsp_color_presentations();
-        let diagnostics_changed = app.drain_lsp_diagnostics();
-        let progress_changed = app.drain_lsp_progress();
-        crate::startup_trace::mark("language server replies read");
-        let dap_changed = app.poll_dap() | app.poll_debug_build();
-        let tests_changed = app.test_worker.drain(&mut app.testing)
-            | app.drain_pending_test_debug()
-            | app.drain_pending_cargo_launch();
-        // A queued run the worker refused (runner disabled after the entry
-        // check) rolled its cases back in the drain; say why nothing ran.
-        if app.testing.take_refusal() {
-            app.status = String::from(crate::testing::NO_RUNNER_STATUS);
-        }
-        if app.testing.take_cancelled() {
-            app.status = String::from("Test run cancelled");
-        }
-        // One notification per red run (#358), from the latch the panel
-        // sets when a run ends, never per test case.
-        let coverage_changed = app.sync_coverage();
-        let watch_changed = app.tick_test_watch();
-        if app.testing.take_failed_run() {
-            let (passed, failed, _) = app.testing.counts();
-            app.notifier.emit(
-                crate::notifications::Event::TestsFailed {
-                    failed,
-                    passed,
-                    reported: app.testing.run_reported_failed(),
-                },
-                app.roots.primary(),
-                &remote_host_label(),
-            );
-        }
-        crate::startup_trace::mark("debugger and tests polled");
-        let mcp_changed = app.poll_mcp();
-        let pair_changed =
-            app.maybe_seat_navigator() | app.poll_pair() | app.tick_proactive_navigator();
-        crate::startup_trace::mark("AI tools polled");
-        let voice_changed = app.drain_voice();
-        let zen_hint_changed = app.expire_zen_hint(std::time::Instant::now());
-        let screencast_changed = app.screencast.expire(std::time::Instant::now());
-        let zoxide_changed = app.poll_zoxide_install();
-        // Surface managed language-server install progress in the status bar so
-        // the background work (which can take a few seconds) is visible.
-        let install_status_changed = match crate::lsp::install::take_status() {
-            Some(msg) => {
-                app.status = msg;
-                true
-            }
-            None => false,
-        };
-        // When a managed install finishes, forget the LSP sync state for the
-        // docs that language serves so the next `sync_lsp` re-opens them. That
-        // re-open makes the manager re-probe and spawn the just-installed
-        // server, so "installed" becomes "working" without a further action.
-        let just_installed = crate::lsp::install::take_just_installed();
-        if !just_installed.is_empty() {
-            app.lsp_last_seen
-                .retain(|path, _| !just_installed_covers_path(&just_installed, path));
-        }
 
-        let non_pty_dirty = needs_redraw
-            || zen_hint_changed
-            || screencast_changed
-            || zoxide_changed
-            || fs_changed
-            || mcp_changed
-            || pair_changed
-            || tests_changed
-            || coverage_changed
-            || watch_changed
-            || blink_changed
-            || spinner_changed
-            || ext_index_changed
-            || codeql_changed
-            || search_changed
-            || log_index_changed
-            || remote_changed
-            || pulls_changed
-            || finder_changed
-            || view_changed
-            || hook_changed
-            || kernel_changed
-            || ports_changed
-            || session_presence_changed
-            || session_typing_changed
-            || collab_changed
-            || symbol_views_changed
-            || bells_changed
-            || captures_changed
-            || labels_changed
-            || auto_save_changed
-            || highlights_changed
-            || images_changed
-            || bookmarks_changed
-            || live_run_changed
-            || code_lens_changed
-            || ws_symbols_changed
-            || connect_changed
-            || install_changed
-            || update_changed
-            || http_changed
-            || reveal_changed
-            || lsp_changed
-            || sig_help_changed
-            || hover_changed
-            || tab_hover_changed
-            || ui_tooltip_changed
-            || definition_changed
-            || declaration_changed
-            || type_definition_changed
-            || implementation_changed
-            || references_changed
-            || call_hierarchy_changed
-            || sidebar_hide_changed
-            || occ_tick_changed
-            || linked_tick_changed
-            || linked_changed
-            || on_type_changed
-            || prepare_rename_changed
-            || occurrences_changed
-            || rename_changed
-            || format_changed
-            || code_action_changed
-            || semantic_changed
-            || inlay_changed
-            || folds_changed
-            || selection_ranges_changed
-            || colors_changed
-            || color_pres_changed
-            || diagnostics_changed
-            || progress_changed
-            || voice_changed
-            || outline_sync_changed
-            || outline_changed
-            || explorer_panels_changed
-            || install_status_changed
-            || blame_changed
-            || dap_changed
-            || markdown_lint_changed
-            || sarif_diagnostics_changed;
+        let non_pty_dirty = needs_redraw || pass.changed || blink_changed || spinner_changed;
         let pty_eligible = pty_pending
             && (app.peek_terminals_pending_bytes() <= PTY_SMALL_UPDATE_BYTES
                 || last_pty_redraw.elapsed() >= pty_min_interval);

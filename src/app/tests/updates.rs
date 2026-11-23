@@ -197,6 +197,41 @@ fn the_update_command_checks_now_and_reports_the_answer() {
     });
 }
 
+/// #2579: a check whose thread crashed is let go, so the next Help: Update
+/// croft asks again instead of saying it is already checking.
+#[test]
+fn an_update_check_whose_thread_crashed_lets_the_next_one_run() {
+    let _guard = relay_test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let home = tempfile::tempdir().unwrap();
+    with_relay_home(home.path(), || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.update_fetch = || panic!("the check crashed (on purpose, in a test)");
+        app.update_croft();
+        assert!(app.manual_update_check.is_some(), "{}", app.status);
+        crate::test_budget::await_spawned(
+            std::time::Duration::from_millis(500),
+            "the crashed check to settle",
+            || {
+                app.poll_update_watch();
+                app.manual_update_check.is_none()
+            },
+        );
+        app.update_fetch = || Ok(None);
+        app.update_croft();
+        assert_eq!(app.status, "Checking for croft updates\u{2026}");
+        crate::test_budget::await_spawned(
+            std::time::Duration::from_millis(500),
+            "the next check to answer",
+            || app.poll_update_watch(),
+        );
+        assert_eq!(
+            app.status,
+            format!("croft v{} is up to date", env!("CARGO_PKG_VERSION"))
+        );
+    });
+}
+
 /// #1844: Help: Update croft checks for a release only where the startup
 /// check would: never on a remote-launched croft, which the croft that
 /// launched it updates, nor with `CROFT_NO_UPDATE_CHECK` set.
@@ -546,6 +581,76 @@ fn clicking_update_leaves_one_progress_indicator() {
     assert!(app.poll_update_watch());
     let toast = app.update_toast.as_ref().expect("the ready popup");
     assert!(toast.ready && toast.release.version == "9.9.9");
+}
+
+/// A staged build whose thread crashed ends as a failed one: the spinner
+/// stops, the popup says why and offers Retry, the status line is left to the
+/// crash notice, and the update can be started again. It used to spin for good, and every try answered "croft is already
+/// updating in the background" until a restart.
+#[test]
+fn a_staged_build_whose_thread_crashed_fails_and_can_be_retried() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.install_source = crate::update_check::InstallSource::SelfManaged;
+    app.staged_install = Some(crate::update_check::StagedInstall::crashing("9.9.9"));
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(1),
+        "the crashed build to end",
+        || {
+            app.poll_update_watch();
+            app.staged_install.is_none()
+        },
+    );
+    assert!(!app.any_update_in_progress(), "the spinner stopped");
+    assert!(
+        !app.status.contains("not installed"),
+        "the status line is left to the crash notice: {}",
+        app.status
+    );
+    let toast = app.update_toast.as_ref().expect("the popup is back");
+    assert_eq!(
+        toast.failed,
+        Some(crate::update_check::CRASHED_REASON),
+        "it says why"
+    );
+    app.run_command(crate::widgets::command_palette::Command::UpdateCroft);
+    assert!(
+        app.staged_install.is_some(),
+        "the update starts again: {}",
+        app.status
+    );
+}
+
+/// A drift rebuild whose thread crashed ends as a failed one: the spinner
+/// stops, the status line is left to the crash notice, and the updater can
+/// rebuild again. It
+/// used to spin for good, with every try "already updating".
+#[test]
+fn a_rebuild_whose_thread_crashed_fails_and_can_be_started_again() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.local_drift = Some(String::from("abc123"));
+    app.self_install = Some(crate::update_watch::SelfInstall::crashing());
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(1),
+        "the crashed rebuild to end",
+        || {
+            app.poll_update_watch();
+            app.self_install.is_none()
+        },
+    );
+    assert!(!app.any_update_in_progress(), "the spinner stopped");
+    assert!(
+        !app.status.contains("rebuild failed"),
+        "the status line is left to the crash notice: {}",
+        app.status
+    );
+    app.run_command(crate::widgets::command_palette::Command::UpdateCroft);
+    assert!(
+        app.self_install.is_some(),
+        "the rebuild starts again: {}",
+        app.status
+    );
 }
 
 /// #333: the three update producers share one event type; a drift

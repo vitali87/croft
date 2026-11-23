@@ -1674,15 +1674,13 @@ impl App {
         // focus move.
         if self.sidebar_view != view {
             self.overlays.activity.mark_dirty();
-            // Leaving Search while a scan is in flight: send an
-            // empty-query request so the worker cancels the live walker
-            // threads instead of letting them keep saturating every core
-            // until the scan finishes. The user's hits stay populated for
-            // when they come back; only the live work is dropped.
+            // Leaving Search while a scan is in flight: the worker cancels
+            // the live walker threads instead of letting them keep
+            // saturating every core until the scan finishes. The user's hits
+            // stay populated for when they come back, when the search runs
+            // again to finish (#2608).
             if self.sidebar_view == SidebarView::Search && view != SidebarView::Search {
-                let _ = self
-                    .search_query_tx
-                    .send(SearchRequest::Query(String::new(), self.search.opts));
+                self.cancel_search_run();
             }
             // Leaving Run-Debug after the headline icon was on screen:
             // arm a one-shot `terminal.clear()` so iTerm2 evicts the
@@ -1723,6 +1721,8 @@ impl App {
             SidebarView::Search => {
                 self.focus_pane(Pane::Tree); // tree pane = side panel; dispatch by view
                 self.search.select_all_query();
+                // A run stopped on leaving Search finishes now.
+                self.resume_cancelled_search();
             }
             SidebarView::SourceControl => {
                 self.refresh_source_control();

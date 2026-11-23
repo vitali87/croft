@@ -253,6 +253,7 @@ fn dummy_status_with_branch(name: &str) -> GitStatus {
         prepared_message: None,
         operation: None,
         rebasing_branch: None,
+        upstream: None,
     }
 }
 

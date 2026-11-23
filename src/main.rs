@@ -58,6 +58,7 @@ mod inline_complete;
 mod install_session;
 mod iterm2;
 mod iterm2_inline;
+mod jobs;
 mod jsonc;
 mod jsonc_edit;
 mod keymap;

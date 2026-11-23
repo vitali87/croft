@@ -237,6 +237,26 @@ impl App {
         true
     }
 
+    /// Say why a test run the drain just ended has no verdict: the worker
+    /// refused it (runner disabled after the entry check, its cases rolled
+    /// back), it was cancelled, or the test runner crashed (#2592).
+    pub(super) fn say_why_test_runs_ended(&mut self) {
+        if self.testing.take_refusal() {
+            self.status = String::from(crate::testing::NO_RUNNER_STATUS);
+        }
+        if self.testing.take_cancelled() {
+            self.status = String::from("Test run cancelled");
+        }
+        if self.testing.take_stopped() {
+            self.status = String::from(TEST_RUNNER_CRASHED);
+            claim_background_panic(crate::testing::worker::RUNNER_THREAD);
+        }
+        if self.test_worker.take_stopped() {
+            self.status = String::from(TEST_RUNNER_STOPPED);
+            claim_background_panic(crate::testing::worker::RUNNER_THREAD);
+        }
+    }
+
     /// Testing: Cancel Test Run, `s` in the Testing view, or its Stop
     /// control (#1534): kill the run or discovery in flight. The panel
     /// settles when the worker reports the run's end.
@@ -1299,7 +1319,7 @@ impl App {
                 }
             };
         let hosts: Vec<String> = picked.into_iter().cloned().collect();
-        if self.fleet_running {
+        if self.fleet_run.is_some() {
             self.status = String::from("A fleet run is already in flight");
             return;
         }
@@ -1311,17 +1331,21 @@ impl App {
         // Off the event loop: the run waits on the network for up to
         // FLEET_TIMEOUT, and blocking the loop for that would freeze the
         // editor — the user could not scroll, type, or cancel while their
-        // fleet answered. Results arrive through `fleet_rx` and are drained
-        // on a later tick, the same shape the port poll and label lookup use.
+        // fleet answered. It runs as the `fleet-run` job, collected on a
+        // later tick.
         let host_count = hosts.len();
-        let tx = self.fleet_tx.clone();
         let command = command.to_string();
         self.fleet_command = command.clone();
-        self.fleet_running = true;
-        std::thread::spawn(move || {
-            let _ = tx.send(crate::fleet::run_on_hosts(&hosts, &command, FLEET_TIMEOUT));
+        let job = crate::jobs::Job::spawn("fleet-run", crate::jobs::Start::Now, move || {
+            crate::fleet::run_on_hosts(&hosts, &command, FLEET_TIMEOUT)
         });
-        self.status = format!("Fleet: running on {host_count} hosts…");
+        match job {
+            Ok(job) => {
+                self.fleet_run = Some(job);
+                self.status = format!("Fleet: running on {host_count} hosts…");
+            }
+            Err(e) => self.status = format!("Could not start the fleet run: {e}"),
+        }
     }
 
     /// Report a finished fleet run, if one arrived (#363).
@@ -1330,67 +1354,75 @@ impl App {
     /// whether anything landed, so the caller can redraw only when there is
     /// something new.
     pub(super) fn drain_fleet_results(&mut self) -> bool {
-        // Every queued run, not just the newest. Each message is ONE run's
-        // results, unlike the label channel this idiom comes from where each
-        // message is a complete snapshot — taking `.last()` there is right
-        // and here would drop a whole run's output with no trace of it.
-        let batches: Vec<Vec<crate::fleet::HostResult>> = self.fleet_rx.try_iter().collect();
-        if batches.is_empty() {
-            return false;
-        }
-        self.fleet_running = false;
-        for results in batches {
-            let reference = crate::fleet::reference_output(&results).map(String::from);
-            for r in &results {
-                let mark = match (r.ok(), Some(r.output.as_str()) == reference.as_deref()) {
-                    (false, _) => "FAILED",
-                    (true, true) => "same",
-                    (true, false) => "DIFFERS",
-                };
+        let results = match self.fleet_run.as_ref().map(crate::jobs::Job::poll) {
+            None | Some(crate::jobs::Poll::Pending) => return false,
+            // Its thread crashed, and the crash notice said so. The run is
+            // no longer in flight, so the next one can start (#2566); FLEET
+            // says why this one has no results.
+            Some(crate::jobs::Poll::Died) => {
+                self.fleet_run = None;
                 crate::output::push(
                     crate::output::CHANNEL_FLEET,
-                    if r.ok() {
-                        crate::output::OutputLevel::Info
-                    } else {
-                        crate::output::OutputLevel::Error
-                    },
-                    &format!(
-                        "{}  [{mark}]  ({:.1}s)  {}",
-                        r.host,
-                        r.elapsed.as_secs_f64(),
-                        r.output.replace('\n', " ")
-                    ),
+                    crate::output::OutputLevel::Error,
+                    "the fleet run stopped without results",
                 );
-                // A differing host lists the lines that differ from the
-                // reference, so the row says WHAT differs, not only that
-                // something does.
-                if mark == "DIFFERS"
-                    && let Some(reference) = reference.as_deref()
-                {
-                    for line in crate::fleet::differing_lines(reference, &r.output) {
-                        crate::output::push(
-                            crate::output::CHANNEL_FLEET,
-                            crate::output::OutputLevel::Info,
-                            &format!("    {line}"),
-                        );
-                    }
-                }
+                return true;
             }
-            let summary = crate::fleet::summarise(&results, reference.as_deref());
+            Some(crate::jobs::Poll::Done(results)) => {
+                self.fleet_run = None;
+                results
+            }
+        };
+        let reference = crate::fleet::reference_output(&results).map(String::from);
+        for r in &results {
+            let mark = match (r.ok(), Some(r.output.as_str()) == reference.as_deref()) {
+                (false, _) => "FAILED",
+                (true, true) => "same",
+                (true, false) => "DIFFERS",
+            };
             crate::output::push(
                 crate::output::CHANNEL_FLEET,
-                crate::output::OutputLevel::Info,
-                &summary.line(),
+                if r.ok() {
+                    crate::output::OutputLevel::Info
+                } else {
+                    crate::output::OutputLevel::Error
+                },
+                &format!(
+                    "{}  [{mark}]  ({:.1}s)  {}",
+                    r.host,
+                    r.elapsed.as_secs_f64(),
+                    r.output.replace('\n', " ")
+                ),
             );
-            self.status = format!("Fleet: {}", summary.line());
-            // The tiles (#363); OUTPUT keeps the text record above.
-            self.editor
-                .open_fleet(crate::widgets::fleet::FleetView::new(
-                    self.fleet_command.clone(),
-                    results,
-                ));
-            self.focus_pane(Pane::Editor);
+            // A differing host lists the lines that differ from the
+            // reference, so the row says WHAT differs, not only that
+            // something does.
+            if mark == "DIFFERS"
+                && let Some(reference) = reference.as_deref()
+            {
+                for line in crate::fleet::differing_lines(reference, &r.output) {
+                    crate::output::push(
+                        crate::output::CHANNEL_FLEET,
+                        crate::output::OutputLevel::Info,
+                        &format!("    {line}"),
+                    );
+                }
+            }
         }
+        let summary = crate::fleet::summarise(&results, reference.as_deref());
+        crate::output::push(
+            crate::output::CHANNEL_FLEET,
+            crate::output::OutputLevel::Info,
+            &summary.line(),
+        );
+        self.status = format!("Fleet: {}", summary.line());
+        // The tiles (#363); OUTPUT keeps the text record above.
+        self.editor
+            .open_fleet(crate::widgets::fleet::FleetView::new(
+                self.fleet_command.clone(),
+                results,
+            ));
+        self.focus_pane(Pane::Editor);
         true
     }
 
@@ -2399,9 +2431,21 @@ impl App {
             self.status = format!("Live Run: off for {name}");
             return;
         }
-        self.live_run_files.insert(path);
-        self.live_run_runner
+        let runner = self
+            .live_run_runner
             .get_or_insert_with(crate::live_run::Runner::spawn);
+        // A runner that stopped after crashing twice, or whose thread has
+        // ended where no tick saw it, starts again: what it was sent went
+        // with it, so every armed file is sent again (#2597).
+        match runner.restart_if_down() {
+            Ok(true) => self.live_run_sent.clear(),
+            Ok(false) => {}
+            Err(e) => {
+                self.status = format!("Live Run could not start its runner: {e}");
+                return;
+            }
+        }
+        self.live_run_files.insert(path);
         self.status = format!("Live Run: on for {name}, re-running on every pause in typing");
     }
 
@@ -2434,9 +2478,22 @@ impl App {
         }
         let mut changed = false;
         let mut landed = Vec::new();
-        if let Some(runner) = &self.live_run_runner {
-            while let Some(done) = runner.try_recv() {
-                landed.push(done);
+        let mut stopped = false;
+        if let Some(runner) = &mut self.live_run_runner {
+            loop {
+                match runner.poll() {
+                    crate::jobs::WorkerPoll::Answer(done) => landed.push(done),
+                    crate::jobs::WorkerPoll::Idle => break,
+                    // Its thread crashed, and the crash notice said so.
+                    // What it was sent went with it, so each armed file is
+                    // sent to the fresh one again once typing has paused
+                    // (#2597).
+                    crate::jobs::WorkerPoll::Restarted => self.live_run_sent.clear(),
+                    crate::jobs::WorkerPoll::Stopped => {
+                        stopped = true;
+                        break;
+                    }
+                }
             }
         }
         for done in landed {
@@ -2465,6 +2522,12 @@ impl App {
             }
             changed = true;
         }
+        // After what landed before it, so no run's summary hides it.
+        if stopped {
+            self.status = String::from(LIVE_RUN_STOPPED);
+            claim_background_panic(crate::live_run::THREAD);
+            changed = true;
+        }
         let tab = &*self.editor;
         let Some(path) = tab.path.clone() else {
             return changed;
@@ -2482,14 +2545,17 @@ impl App {
         let root = self.roots.primary().to_path_buf();
         let dir = path.parent().unwrap_or(Path::new(".")).to_path_buf();
         let python = project_python_for(&dir, &root);
-        self.live_run_sent.insert(path.clone(), lines.clone());
-        if let Some(runner) = &self.live_run_runner {
-            runner.submit(crate::live_run::Job {
-                path,
-                lines,
-                python,
-            });
-        }
+        // Nothing is sent to a runner that stopped, so nothing reads as
+        // sent: turning Live Run on starts it again and sends the file.
+        let Some(runner) = self.live_run_runner.as_ref().filter(|r| !r.is_stopped()) else {
+            return changed;
+        };
+        runner.submit(crate::live_run::Job {
+            path: path.clone(),
+            lines: lines.clone(),
+            python,
+        });
+        self.live_run_sent.insert(path, lines);
         changed
     }
 }
@@ -2770,6 +2836,19 @@ pub(super) fn cwd_matches(cwd: Option<&Path>, root: &Path, observable: bool) -> 
 
 /// The status a run gesture gets while another run is in flight (#1534).
 pub(super) const TEST_RUN_IN_PROGRESS: &str = "A test run is in progress (s in Testing stops it)";
+
+/// The status when Live Run's runner crashed again soon after a restart and
+/// waits to be turned on again (#2597).
+pub(super) const LIVE_RUN_STOPPED: &str =
+    "Live Run stopped after its runner crashed twice: turning it on for a file starts it again";
+
+/// The status when the test runner crashed with a run in flight (#2592).
+pub(super) const TEST_RUNNER_CRASHED: &str = "Test run stopped: the test runner crashed";
+
+/// The status when the test runner crashed again soon after a restart and
+/// waits for the next run to start it (#2592).
+pub(super) const TEST_RUNNER_STOPPED: &str =
+    "Testing stopped after its runner crashed twice: running tests starts it again";
 
 /// `task` with `answers` for its `${input:…}` variables (#1424).
 pub(super) fn with_answers(
