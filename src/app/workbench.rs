@@ -87,6 +87,37 @@ impl ActivityIcon {
         }
     }
 
+    /// The picture drawn for the icon where the terminal shows pictures,
+    /// and its Kitty image id, which its states share so swapping one for
+    /// another replaces the picture in place.
+    pub(super) fn picture(self) -> (&'static [u8], u32) {
+        use crate::iterm2_inline as ki;
+        match self {
+            ActivityIcon::Explorer => (ki::EXPLORER_SRC_SVG, ki::KITTY_ID_EXPLORER),
+            ActivityIcon::Search => (ki::SEARCH_SRC_SVG, ki::KITTY_ID_SEARCH),
+            ActivityIcon::SourceControl => {
+                (ki::SOURCE_CONTROL_SRC_SVG, ki::KITTY_ID_SOURCE_CONTROL)
+            }
+            ActivityIcon::Remote => (ki::REMOTE_SRC_SVG, ki::KITTY_ID_REMOTE),
+            ActivityIcon::RunDebug => (ki::RUN_DEBUG_SRC_SVG, ki::KITTY_ID_RUN_DEBUG_BAR),
+            ActivityIcon::Extensions => (ki::EXTENSIONS_SRC_SVG, ki::KITTY_ID_EXTENSIONS),
+            ActivityIcon::Testing => (ki::TESTING_SRC_SVG, ki::KITTY_ID_TESTING),
+            ActivityIcon::CodeQL => (ki::CODEQL_SRC_SVG, ki::KITTY_ID_CODEQL),
+            ActivityIcon::Sponsor => (ki::SPONSOR_HEART_SRC_SVG, ki::KITTY_ID_SPONSOR),
+            ActivityIcon::Settings => (ki::SETTINGS_GEAR_SRC_SVG, ki::KITTY_ID_SETTINGS),
+        }
+    }
+
+    /// Whether the icon can be missing from a laid-out bar: CodeQL's until
+    /// the CodeQL extension is added, and the sponsor heart and the settings
+    /// gear on a bar too short for them. The rest are always there.
+    pub(super) fn optional(self) -> bool {
+        matches!(
+            self,
+            ActivityIcon::CodeQL | ActivityIcon::Sponsor | ActivityIcon::Settings
+        )
+    }
+
     /// The codicon drawn for the icon on a terminal without pictures.
     pub(super) fn glyph(self) -> char {
         match self {

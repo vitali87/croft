@@ -437,47 +437,7 @@ fn resize_arms_a_one_shot_terminal_clear_to_evict_stale_activity_icons() {
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     // Pretend init_graphics baked the activity-bar icon images — images mode
     // is the only state in which the stale layer can exist.
-    app.overlays.activity.set_images(ActivityBarImages {
-        explorer_active: String::new(),
-        explorer_inactive: String::new(),
-        explorer_hovered: String::new(),
-        search_active: String::new(),
-        search_inactive: String::new(),
-        search_hovered: String::new(),
-        source_control_active: String::new(),
-        source_control_inactive: String::new(),
-        source_control_hovered: String::new(),
-        remote_active: String::new(),
-        remote_inactive: String::new(),
-        remote_hovered: String::new(),
-        run_debug_active: String::new(),
-        run_debug_inactive: String::new(),
-        run_debug_hovered: String::new(),
-        extensions_active: String::new(),
-        extensions_inactive: String::new(),
-        extensions_hovered: String::new(),
-        testing_active: String::new(),
-        testing_inactive: String::new(),
-        testing_hovered: String::new(),
-        codeql_active: String::new(),
-        codeql_inactive: String::new(),
-        codeql_hovered: String::new(),
-        sponsor_inactive: String::new(),
-        sponsor_hovered: String::new(),
-        settings_active: String::new(),
-        settings_inactive: String::new(),
-        settings_hovered: String::new(),
-        layout_sidebar_on: String::new(),
-        layout_sidebar_on_hover: String::new(),
-        layout_sidebar_off: String::new(),
-        layout_sidebar_off_hover: String::new(),
-        layout_panel_on: String::new(),
-        layout_panel_on_hover: String::new(),
-        layout_panel_off: String::new(),
-        layout_panel_off_hover: String::new(),
-        layout_customize: String::new(),
-        layout_customize_hover: String::new(),
-    });
+    app.overlays.activity.set_images(empty_activity_images());
     app.on_resize();
     assert!(
         app.consume_activity_image_clear(),
@@ -504,47 +464,7 @@ fn activity_bar_icons_moving_within_the_flush_arms_a_one_shot_terminal_clear() {
     use ratatui::layout::Rect;
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.overlays.activity.set_images(ActivityBarImages {
-        explorer_active: String::new(),
-        explorer_inactive: String::new(),
-        explorer_hovered: String::new(),
-        search_active: String::new(),
-        search_inactive: String::new(),
-        search_hovered: String::new(),
-        source_control_active: String::new(),
-        source_control_inactive: String::new(),
-        source_control_hovered: String::new(),
-        remote_active: String::new(),
-        remote_inactive: String::new(),
-        remote_hovered: String::new(),
-        run_debug_active: String::new(),
-        run_debug_inactive: String::new(),
-        run_debug_hovered: String::new(),
-        extensions_active: String::new(),
-        extensions_inactive: String::new(),
-        extensions_hovered: String::new(),
-        testing_active: String::new(),
-        testing_inactive: String::new(),
-        testing_hovered: String::new(),
-        codeql_active: String::new(),
-        codeql_inactive: String::new(),
-        codeql_hovered: String::new(),
-        sponsor_inactive: String::new(),
-        sponsor_hovered: String::new(),
-        settings_active: String::new(),
-        settings_inactive: String::new(),
-        settings_hovered: String::new(),
-        layout_sidebar_on: String::new(),
-        layout_sidebar_on_hover: String::new(),
-        layout_sidebar_off: String::new(),
-        layout_sidebar_off_hover: String::new(),
-        layout_panel_on: String::new(),
-        layout_panel_on_hover: String::new(),
-        layout_panel_off: String::new(),
-        layout_panel_off_hover: String::new(),
-        layout_customize: String::new(),
-        layout_customize_hover: String::new(),
-    });
+    app.overlays.activity.set_images(empty_activity_images());
     let place = |app: &mut App, base: u16| {
         app.sidebar_areas.activity_icons[ActivityIcon::Explorer] = Rect::new(0, base, 2, 1);
         app.sidebar_areas.activity_icons[ActivityIcon::Search] = Rect::new(0, base + 2, 2, 1);
@@ -1595,35 +1515,58 @@ fn hovering_a_non_selected_activity_icon_emits_its_hovered_variant() {
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     // Distinguishable payloads so the emitted set reveals which variant won.
     app.overlays.activity.set_images(ActivityBarImages {
-        explorer_active: "EA".into(),
-        explorer_inactive: "EI".into(),
-        explorer_hovered: "EH".into(),
-        search_active: "SA".into(),
-        search_inactive: "SI".into(),
-        search_hovered: "SH".into(),
-        source_control_active: "CA".into(),
-        source_control_inactive: "CI".into(),
-        source_control_hovered: "CH".into(),
-        remote_active: "RA".into(),
-        remote_inactive: "RI".into(),
-        remote_hovered: "RH".into(),
-        run_debug_active: "DA".into(),
-        run_debug_inactive: "DI".into(),
-        run_debug_hovered: "DH".into(),
-        extensions_active: "XA".into(),
-        extensions_inactive: "XI".into(),
-        extensions_hovered: "XH".into(),
-        testing_active: "TA".into(),
-        testing_inactive: "TI".into(),
-        testing_hovered: "TH".into(),
-        codeql_active: "CA".into(),
-        codeql_inactive: "CI".into(),
-        codeql_hovered: "CH".into(),
-        sponsor_inactive: "HI".into(),
-        sponsor_hovered: "HH".into(),
-        settings_active: "GA".into(),
-        settings_inactive: "GI".into(),
-        settings_hovered: "GH".into(),
+        icons: [
+            ActivityIconImages {
+                active: Some("EA".into()),
+                inactive: "EI".into(),
+                hovered: "EH".into(),
+            },
+            ActivityIconImages {
+                active: Some("SA".into()),
+                inactive: "SI".into(),
+                hovered: "SH".into(),
+            },
+            ActivityIconImages {
+                active: Some("CA".into()),
+                inactive: "CI".into(),
+                hovered: "CH".into(),
+            },
+            ActivityIconImages {
+                active: Some("RA".into()),
+                inactive: "RI".into(),
+                hovered: "RH".into(),
+            },
+            ActivityIconImages {
+                active: Some("DA".into()),
+                inactive: "DI".into(),
+                hovered: "DH".into(),
+            },
+            ActivityIconImages {
+                active: Some("XA".into()),
+                inactive: "XI".into(),
+                hovered: "XH".into(),
+            },
+            ActivityIconImages {
+                active: Some("TA".into()),
+                inactive: "TI".into(),
+                hovered: "TH".into(),
+            },
+            ActivityIconImages {
+                active: Some("CA".into()),
+                inactive: "CI".into(),
+                hovered: "CH".into(),
+            },
+            ActivityIconImages {
+                active: None,
+                inactive: "HI".into(),
+                hovered: "HH".into(),
+            },
+            ActivityIconImages {
+                active: Some("GA".into()),
+                inactive: "GI".into(),
+                hovered: "GH".into(),
+            },
+        ],
         layout_sidebar_on: "LS".into(),
         layout_sidebar_on_hover: "LSh".into(),
         layout_sidebar_off: "LF".into(),
@@ -1671,11 +1614,13 @@ fn hovering_a_non_selected_activity_icon_emits_its_hovered_variant() {
 fn hovering_the_sponsor_heart_emits_its_hovered_variant() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.overlays.activity.set_images(ActivityBarImages {
-        sponsor_inactive: "HI".into(),
-        sponsor_hovered: "HH".into(),
-        ..Default::default()
-    });
+    let mut images = ActivityBarImages::default();
+    images.icons[ActivityIcon::Sponsor as usize] = ActivityIconImages {
+        active: None,
+        inactive: "HI".into(),
+        hovered: "HH".into(),
+    };
+    app.overlays.activity.set_images(images);
     let emitted = |app: &App| -> Vec<String> {
         app.pending_activity_image_overlays()
             .into_iter()
@@ -1704,12 +1649,13 @@ fn hovering_the_sponsor_heart_emits_its_hovered_variant() {
 fn a_collapsed_side_bar_unpills_its_views_activity_icon() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
-    app.overlays.activity.set_images(ActivityBarImages {
-        explorer_active: "EA".into(),
-        explorer_inactive: "EI".into(),
-        explorer_hovered: "EH".into(),
-        ..Default::default()
-    });
+    let mut images = ActivityBarImages::default();
+    images.icons[ActivityIcon::Explorer as usize] = ActivityIconImages {
+        active: Some("EA".into()),
+        inactive: "EI".into(),
+        hovered: "EH".into(),
+    };
+    app.overlays.activity.set_images(images);
     let emitted = |app: &App| -> Vec<String> {
         app.pending_activity_image_overlays()
             .into_iter()
