@@ -38,6 +38,7 @@ src/
 │   ├── workspace.rs      the `PATH` and `--open-file` arguments: the workspace root, the file to open and its `file:line[:col]` location
 ├── clipboard.rs         native macOS clipboard read/write (NSPasteboard) with pbpaste fallback, wl-paste / xclip / xsel on Linux, and croft's own last copy, which a paste inside croft falls back to where the host clipboard can't be read (an SSH host with no clipboard tool)
 ├── command_history.rs    durable cross-session shell command history as JSONL under `~/.config/croft/command_history.jsonl` (cwd / exit / duration), read off OSC 133 marks with no shell hooks; Ctrl+Shift+H opens the search popup
+├── command_registry.rs   every built-in command: the `Command` enum, its palette order, titles, shortcut hints, `keybindings.json` ids and search words, and how a hint is spelled on each platform; the palette, menus and keybindings read it here
 ├── fleet.rs              running one command across N ssh hosts and diffing the results, behind "Terminal: Fleet Run"; the fleet must be named (`hosts: command`, `*` for explicit broadcast)
 ├── gh.rs                what croft says when the GitHub CLI is missing or signed out: one shared message for every `gh` caller (`croft pr`, PR review, code scanning, CodeQL), plus the installed-and-signed-in check `croft pr` runs before taking the terminal (offline `gh auth token` first)
 ├── ghostty.rs           Ghostty config keybinds (setup-ghostty): re-emit every croft chord as its CSI-u sequence so Ghostty's own binds don't swallow them
@@ -415,7 +416,7 @@ src/
 │   └── watched_files.rs the globs each server registers for `workspace/didChangeWatchedFiles` (#908); the manager forwards the workspace watcher's file events to every server whose globs cover them, less the documents it has open
 └── widgets/
     ├── mod.rs
-    ├── command_palette.rs   VS Code Command Palette (Cmd/Ctrl+Shift+P): a static command registry + fuzzy-filtered picker; the App's run_command dispatches each entry
+    ├── command_palette.rs   VS Code Command Palette (Cmd/Ctrl+Shift+P): the fuzzy-filtered picker over command_registry.rs; the App's run_command dispatches each entry
     ├── commit_graph.rs       the Source Control COMMITS section: a repo-wide commit graph with box-drawing lane rails; `layout_graph` is the pure lane algorithm, run on the fetch thread
     ├── completion_popup.rs  LSP completion popup (anchored at the cursor, filterable; a list the server marked `isIncomplete` re-asks it on each keystroke with trigger kind 3, keeping the old matches up until the reply replaces them (#1529); `area_for` clamps to the editor pane on all four edges — a popup wider than a narrow pane used to be pushed left past the pane's own edge and paint over the Explorer; rows are sized for label and signature, and `details_area_for` places the selected item's signature and documentation beside the list, or on the far side of it from the caret (#1527))
     ├── signature_help_popup.rs  LSP signature help / parameter hints: a one-line popup above the caret with the active parameter bolded, auto-triggered on `(`/`,` and dismissed on `)`/Esc (manager `RequestSignatureHelp` + `normalise_signature_help`)
@@ -1309,6 +1310,10 @@ Durable cross-session shell command history, the atuin model embedded in the edi
 **Search and compaction.** `search` is newest-first, case-insensitive substring, deduped to the newest run per command text, with scopes all / this-directory / failed-only. The file compacts back to the newest 10k entries once it doubles past the cap.
 
 **Using it.** Ctrl+Shift+H opens the popup (`widgets/history_popup.rs`); Enter types the pick at the prompt without running it.
+
+### command_registry.rs
+
+Every built-in command croft can run from the palette, a menu or a keybinding: the `Command` enum, `ALL_COMMANDS` (the palette's order before anything is typed), `LAYOUT_COMMANDS` (the Customize Layout popup's order), and per command its title, shortcut hint, `keybindings.json` id and extra search words. The hints are written with the macOS names; `hint_for_platform` and `glyph_hint_for_platform` spell a hint or a menu's glyph chord for another platform, `Ctrl` for `Cmd` except the chords with no `Ctrl` form, which read `Super` or the chord Linux uses. `src/app/tests/golden/commands.txt` saves every command as the palette knows it (#2062), and `every_command_matches_the_saved_registry` fails when any of it moves.
 
 ### extensions.rs
 

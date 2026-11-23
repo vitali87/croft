@@ -2899,7 +2899,7 @@ fn quick_open_line_hint_counts_the_buffer_a_pick_opens_as_it_is_now() {
 #[cfg(target_os = "linux")]
 #[test]
 fn every_command_matches_the_saved_registry() {
-    use crate::widgets::command_palette::{ALL_COMMANDS, LAYOUT_COMMANDS, hint_for_platform};
+    use crate::command_registry::{ALL_COMMANDS, LAYOUT_COMMANDS, hint_for_platform};
     use std::fmt::Write as _;
     let mut text = String::from(
         "# Every palette command: src/app/tests/palette.rs. Rewrite with CROFT_BLESS=1 after a change meant to move one.\n\

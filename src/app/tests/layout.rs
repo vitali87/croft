@@ -4225,7 +4225,7 @@ fn typing_customize_layout_in_the_palette_opens_the_popup() {
 /// the active one.
 #[test]
 fn every_customize_layout_row_has_a_palette_command_that_does_the_same() {
-    use crate::widgets::command_palette::{ALL_COMMANDS, Command, LAYOUT_COMMANDS};
+    use crate::command_registry::{ALL_COMMANDS, Command, LAYOUT_COMMANDS};
     fn command_for(action: &MenuAction) -> Option<Command> {
         match action {
             MenuAction::ToggleActivityBar => Some(Command::ToggleActivityBar),

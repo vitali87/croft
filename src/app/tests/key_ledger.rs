@@ -200,7 +200,7 @@ const COUNTED: &[&str] = &[
 /// The keys Linux presses for each key sequence `hint` names, or why one
 /// names none.
 fn linux_keys(hint: &str) -> Vec<Result<Vec<KeyEvent>, String>> {
-    use crate::widgets::command_palette::hint_for_platform;
+    use crate::command_registry::hint_for_platform;
     alternatives(hint)
         .iter()
         .map(|one| keys_of(&hint_for_platform(one, false)))
