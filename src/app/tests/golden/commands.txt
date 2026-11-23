@@ -13,7 +13,7 @@
 10 | KillToEndOfLine | kill_to_end_of_line | Kill to End of Line |  |  |  |
 11 | TransformUpper | transform_upper | Transform to Uppercase |  | Cmd+Opt+Shift+U | Ctrl+Alt+Shift+U |
 12 | TransformLower | transform_lower | Transform to Lowercase |  | Cmd+Opt+Shift+L | Ctrl+Alt+Shift+L |
-13 | TransformTitle | transform_title | Transform to Title Case |  | Cmd+Opt+Shift+C | Ctrl+Alt+Shift+C |
+13 | TransformTitle | transform_title | Transform to Title Case |  |  |  |
 14 | TransformSnake | transform_snake | Transform to Snake Case |  |  |  |
 15 | TransformCamel | transform_camel | Transform to Camel Case |  |  |  |
 16 | TransformPascal | transform_pascal | Transform to Pascal Case |  |  |  |

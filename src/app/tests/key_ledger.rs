@@ -324,6 +324,41 @@ fn shortcut_table_hints() -> BTreeSet<String> {
         .collect()
 }
 
+/// #2648: the palette listed Cmd+Opt+Shift+C for Transform to Title Case,
+/// though that chord copies the relative path. Whatever chord it lists must
+/// title-case the selection when pressed.
+#[test]
+fn the_chord_listed_for_title_case_title_cases_the_selection() {
+    let copy_relative = KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT;
+    assert!(is_copy_relative_path_key(KeyEvent::new(
+        KeyCode::Char('C'),
+        copy_relative
+    )));
+    let hint = crate::command_registry::Command::TransformTitle.keybinding_hint();
+    let listed = if hint.is_empty() {
+        Vec::new()
+    } else {
+        linux_keys(hint)
+    };
+    for keys in listed {
+        let keys = keys.unwrap_or_else(|why| panic!("{hint}: {why}"));
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("notes.txt");
+        std::fs::write(&file, "hello world\n").unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        app.editor.open_pinned(&file).unwrap();
+        app.focus_pane(Pane::Editor);
+        select(&mut app, (0, 0), (0, 11));
+        for key in keys {
+            app.handle_key(key).unwrap();
+        }
+        assert_eq!(
+            app.editor.lines[0], "Hello World",
+            "the palette lists {hint} for Transform to Title Case"
+        );
+    }
+}
+
 /// Menu shortcuts no walked menu row reaches, with why. None today: a new
 /// shortcut in the table fails until its menu is walked or it is listed here.
 const UNWALKED_MENU_HINTS: &[(&str, &str)] = &[];
