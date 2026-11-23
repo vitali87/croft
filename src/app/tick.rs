@@ -2,7 +2,9 @@
 //! finished since the last tick (file changes, language-server replies, jobs,
 //! workers, timers), collected in a fixed order before anything is drawn.
 //! The main loop calls it once per tick and decides from its answer whether
-//! to draw; a test calls it to run one real pass.
+//! to draw; a test calls it to run one real pass. The pass runs in named
+//! steps, one per group of the startup trace, each saying whether it changed
+//! anything on screen.
 
 use super::*;
 
@@ -26,6 +28,39 @@ pub(super) struct BackgroundTick {
 /// has always run them. Each call's own effects (the status line, a panel's
 /// state) happen here; the answer says only whether the screen needs drawing.
 pub(super) fn tick_background(app: &mut App) -> BackgroundTick {
+    let (mut changed, symbol_views_settled) = tick_file_changes(app);
+    // Peek without clearing so we can coalesce PTY-only redraws without
+    // losing bytes that the reader thread has already advanced into the
+    // terminal grid.
+    let pty_pending = app.peek_terminals_dirty();
+    let blink_visible = app.cursor_visible_phase();
+    // Either spinner advancing must wake a redraw; both stay 0 when idle.
+    let spinner_phase =
+        app.update_spinner_phase() + app.mcp_spinner_phase() + app.problems_fix_spinner_phase();
+    changed |= tick_background_results(app);
+    changed |= tick_agents_and_collaborators(app);
+    changed |= tick_panes_and_saves(app, symbol_views_settled);
+    changed |= tick_highlights_and_pictures(app);
+    changed |= tick_watchers_and_dialogs(app);
+    sync_language_servers(app);
+    changed |= tick_lint_gutters_and_blame(app);
+    changed |= tick_outline_and_explorer(app);
+    changed |= tick_language_server_replies(app);
+    changed |= tick_debugger_and_tests(app);
+    changed |= tick_ai_tools(app);
+    changed |= tick_timers_and_installs(app);
+    BackgroundTick {
+        changed,
+        pty_pending,
+        blink_visible,
+        spinner_phase,
+    }
+}
+
+/// Same-file tabs agree, the crash notice is read, and the file watcher's
+/// events come in: what croft shows of the disk. Also says whether the tabs
+/// were already settled, which the terminal-pane step reads.
+fn tick_file_changes(app: &mut App) -> (bool, bool) {
     // Same-file tabs agree before the watcher is read: a save from one
     // symbol tab leaves its siblings holding the saved text, so the
     // change event reads as their own write, not a conflict (#369).
@@ -38,14 +73,14 @@ pub(super) fn tick_background(app: &mut App) -> BackgroundTick {
     // disk reality on the very next frame.
     let fs_changed = app.drain_fs_events();
     crate::startup_trace::mark("file changes read");
-    // Peek without clearing so we can coalesce PTY-only redraws without
-    // losing bytes that the reader thread has already advanced into the
-    // terminal grid.
-    let pty_pending = app.peek_terminals_dirty();
-    let blink_visible = app.cursor_visible_phase();
-    // Either spinner advancing must wake a redraw; both stay 0 when idle.
-    let spinner_phase =
-        app.update_spinner_phase() + app.mcp_spinner_phase() + app.problems_fix_spinner_phase();
+    (panic_changed || fs_changed, symbol_views_settled)
+}
+
+/// The results background work has finished: the extension index,
+/// CodeQL's jobs, search hits, the log index, remote config, pulls and relay
+/// copies, Go to File's line checks, view and hook requests, and the
+/// pull-request and code-scanning polls.
+fn tick_background_results(app: &mut App) -> bool {
     let ext_index_changed = app.drain_ext_index_refresh();
     let codeql_changed = app.drain_codeql_run()
         | app.drain_codeql_ast()
@@ -82,6 +117,20 @@ pub(super) fn tick_background(app: &mut App) -> BackgroundTick {
         | app.poll_pr_checkout()
         | app.poll_code_scanning();
     crate::startup_trace::mark("background results collected");
+    ext_index_changed
+        || codeql_changed
+        || search_changed
+        || log_index_changed
+        || remote_changed
+        || pulls_changed
+        || finder_changed
+        || view_changed
+        || hook_changed
+}
+
+/// Agent approvals and their ledger, notebook kernels, forwarded ports,
+/// and the people in a shared session.
+fn tick_agents_and_collaborators(app: &mut App) -> bool {
     app.sync_approval_check();
     app.persist_agent_ledger(false);
     let kernel_changed = app.poll_notebook_kernels();
@@ -90,6 +139,17 @@ pub(super) fn tick_background(app: &mut App) -> BackgroundTick {
     let session_typing_changed = app.poll_session_typing();
     let collab_changed = app.poll_collab();
     crate::startup_trace::mark("agents, ports and collaborators polled");
+    kernel_changed
+        || ports_changed
+        || session_presence_changed
+        || session_typing_changed
+        || collab_changed
+}
+
+/// Same-file tabs again, terminal bells, finished blocks and their
+/// outputs, pane labels, agent and fleet events, the terminal session, auto
+/// save and hot exit.
+fn tick_panes_and_saves(app: &mut App, symbol_views_settled: bool) -> bool {
     let symbol_views_changed = app.sync_symbol_views() | symbol_views_settled;
     let bells_changed = app.drain_terminal_bells();
     // A block whose command has finished gets its output box (#354).
@@ -103,6 +163,12 @@ pub(super) fn tick_background(app: &mut App) -> BackgroundTick {
     let auto_save_changed = app.tick_auto_save();
     app.tick_hot_exit(std::time::Instant::now());
     crate::startup_trace::mark("terminal panes and saves ticked");
+    symbol_views_changed || bells_changed || captures_changed || labels_changed || auto_save_changed
+}
+
+/// Highlighting, pictures baked off the UI thread, and the bookmarks of
+/// closed tabs.
+fn tick_highlights_and_pictures(app: &mut App) -> bool {
     let highlights_changed = app.poll_highlights();
     // Pictures baked off the UI thread (#1973) go up as they land.
     let images_changed =
@@ -110,6 +176,13 @@ pub(super) fn tick_background(app: &mut App) -> BackgroundTick {
     // A closed tab's bookmarks are kept, and come back with its file.
     let bookmarks_changed = app.settle_bookmarks();
     crate::startup_trace::mark("highlights and pictures polled");
+    highlights_changed || images_changed || bookmarks_changed
+}
+
+/// Live Run, Markdown previews and the minimap, code lenses, the config
+/// watcher, inline suggestions, review jobs, the connect and install dialogs,
+/// update checks, HTTP replies and redaction reveals.
+fn tick_watchers_and_dialogs(app: &mut App) -> bool {
     let live_run_changed = app.tick_live_run()
         | app.sync_markdown_side_previews()
         | app.sync_markdown_scroll()
@@ -126,10 +199,27 @@ pub(super) fn tick_background(app: &mut App) -> BackgroundTick {
     let http_changed = app.drain_http_responses();
     let reveal_changed = app.tick_redaction_reveal();
     crate::startup_trace::mark("watchers and dialogs polled");
+    live_run_changed
+        || code_lens_changed
+        || connect_changed
+        || install_changed
+        || update_changed
+        || http_changed
+        || reveal_changed
+}
+
+/// The language servers are told what changed, and due completion
+/// requests are sent.
+fn sync_language_servers(app: &mut App) {
     app.sync_lsp();
     app.send_due_completion_ask();
     app.send_due_completion_reask();
     crate::startup_trace::mark("language servers synced");
+}
+
+/// Markdown lint, SARIF results and their marks, git gutters, blame and
+/// provenance.
+fn tick_lint_gutters_and_blame(app: &mut App) -> bool {
     let markdown_lint_changed = app.sync_markdown_lint();
     let sarif_diagnostics_changed = app.sync_sarif_diagnostics();
     app.sync_sarif_selection_to_cursor();
@@ -141,6 +231,11 @@ pub(super) fn tick_background(app: &mut App) -> BackgroundTick {
     app.sync_provenance();
     let blame_changed = app.drain_blame() | app.drain_git_net() | app.drain_git_view();
     crate::startup_trace::mark("lint, gutters and blame synced");
+    markdown_lint_changed || sarif_diagnostics_changed || blame_changed
+}
+
+/// The OUTLINE, workspace symbols, and the Explorer's other views.
+fn tick_outline_and_explorer(app: &mut App) -> bool {
     // Request/refresh the OUTLINE for the active file (after sync_lsp so the
     // edit-seq it reads is current) and advance follow-cursor.
     let outline_sync_changed = app.sync_outline();
@@ -151,6 +246,11 @@ pub(super) fn tick_background(app: &mut App) -> BackgroundTick {
     // Timeline git history, Dependencies) and drain their workers.
     let explorer_panels_changed = app.sync_explorer_panels();
     crate::startup_trace::mark("outline and Explorer views synced");
+    outline_sync_changed || outline_changed || ws_symbols_changed || explorer_panels_changed
+}
+
+/// The language servers' replies, each to its own feature.
+fn tick_language_server_replies(app: &mut App) -> bool {
     app.refresh_semantic_tokens_if_requested();
     app.refresh_inlay_hints_if_requested();
     app.refresh_workspace_diagnostics_if_requested();
@@ -189,98 +289,7 @@ pub(super) fn tick_background(app: &mut App) -> BackgroundTick {
     let diagnostics_changed = app.drain_lsp_diagnostics();
     let progress_changed = app.drain_lsp_progress();
     crate::startup_trace::mark("language server replies read");
-    let dap_changed = app.poll_dap() | app.poll_debug_build();
-    let tests_changed = app.test_worker.drain(&mut app.testing)
-        | app.drain_pending_test_debug()
-        | app.drain_pending_cargo_launch();
-    app.say_why_test_runs_ended();
-    // One notification per red run (#358), from the latch the panel
-    // sets when a run ends, never per test case.
-    let coverage_changed = app.sync_coverage();
-    let watch_changed = app.tick_test_watch();
-    if app.testing.take_failed_run() {
-        let (passed, failed, _) = app.testing.counts();
-        app.notifier.emit(
-            crate::notifications::Event::TestsFailed {
-                failed,
-                passed,
-                reported: app.testing.run_reported_failed(),
-            },
-            app.roots.primary(),
-            &remote_host_label(),
-        );
-    }
-    crate::startup_trace::mark("debugger and tests polled");
-    let mcp_changed = app.poll_mcp();
-    let pair_changed =
-        app.maybe_seat_navigator() | app.poll_pair() | app.tick_proactive_navigator();
-    crate::startup_trace::mark("AI tools polled");
-    let voice_changed = app.drain_voice();
-    let zen_hint_changed = app.expire_zen_hint(std::time::Instant::now());
-    let cmd_k_changed = app.expire_cmd_k(std::time::Instant::now());
-    let screencast_changed = app.screencast.expire(std::time::Instant::now());
-    let zoxide_changed = app.poll_zoxide_install();
-    // Surface managed language-server install progress in the status bar so
-    // the background work (which can take a few seconds) is visible.
-    let install_status_changed = match crate::lsp::install::take_status() {
-        Some(msg) => {
-            app.status = msg;
-            true
-        }
-        None => false,
-    };
-    // When a managed install finishes, forget the LSP sync state for the
-    // docs that language serves so the next `sync_lsp` re-opens them. That
-    // re-open makes the manager re-probe and spawn the just-installed
-    // server, so "installed" becomes "working" without a further action.
-    let just_installed = crate::lsp::install::take_just_installed();
-    if !just_installed.is_empty() {
-        app.lsp_last_seen
-            .retain(|path, _| !just_installed_covers_path(&just_installed, path));
-    }
-
-    let changed = zen_hint_changed
-        || cmd_k_changed
-        || screencast_changed
-        || zoxide_changed
-        || fs_changed
-        || mcp_changed
-        || pair_changed
-        || tests_changed
-        || coverage_changed
-        || watch_changed
-        || ext_index_changed
-        || codeql_changed
-        || search_changed
-        || log_index_changed
-        || remote_changed
-        || pulls_changed
-        || finder_changed
-        || view_changed
-        || hook_changed
-        || kernel_changed
-        || ports_changed
-        || session_presence_changed
-        || session_typing_changed
-        || collab_changed
-        || symbol_views_changed
-        || bells_changed
-        || captures_changed
-        || labels_changed
-        || auto_save_changed
-        || highlights_changed
-        || images_changed
-        || bookmarks_changed
-        || live_run_changed
-        || code_lens_changed
-        || ws_symbols_changed
-        || connect_changed
-        || install_changed
-        || update_changed
-        || panic_changed
-        || http_changed
-        || reveal_changed
-        || lsp_changed
+    lsp_changed
         || sig_help_changed
         || hover_changed
         || tab_hover_changed
@@ -309,20 +318,75 @@ pub(super) fn tick_background(app: &mut App) -> BackgroundTick {
         || color_pres_changed
         || diagnostics_changed
         || progress_changed
-        || voice_changed
-        || outline_sync_changed
-        || outline_changed
-        || explorer_panels_changed
-        || install_status_changed
-        || blame_changed
-        || dap_changed
-        || markdown_lint_changed
-        || sarif_diagnostics_changed;
+}
 
-    BackgroundTick {
-        changed,
-        pty_pending,
-        blink_visible,
-        spinner_phase,
+/// The debugger, the test runner and its coverage and watch, and the
+/// notice of a red test run.
+fn tick_debugger_and_tests(app: &mut App) -> bool {
+    let dap_changed = app.poll_dap() | app.poll_debug_build();
+    let tests_changed = app.test_worker.drain(&mut app.testing)
+        | app.drain_pending_test_debug()
+        | app.drain_pending_cargo_launch();
+    app.say_why_test_runs_ended();
+    // One notification per red run (#358), from the latch the panel
+    // sets when a run ends, never per test case.
+    let coverage_changed = app.sync_coverage();
+    let watch_changed = app.tick_test_watch();
+    if app.testing.take_failed_run() {
+        let (passed, failed, _) = app.testing.counts();
+        app.notifier.emit(
+            crate::notifications::Event::TestsFailed {
+                failed,
+                passed,
+                reported: app.testing.run_reported_failed(),
+            },
+            app.roots.primary(),
+            &remote_host_label(),
+        );
     }
+    crate::startup_trace::mark("debugger and tests polled");
+    dap_changed || tests_changed || coverage_changed || watch_changed
+}
+
+/// MCP servers and the pair navigator.
+fn tick_ai_tools(app: &mut App) -> bool {
+    let mcp_changed = app.poll_mcp();
+    let pair_changed =
+        app.maybe_seat_navigator() | app.poll_pair() | app.tick_proactive_navigator();
+    crate::startup_trace::mark("AI tools polled");
+    mcp_changed || pair_changed
+}
+
+/// Voice input, hints and Screencast Mode that expire, the zoxide
+/// install, and language-server installs.
+fn tick_timers_and_installs(app: &mut App) -> bool {
+    let voice_changed = app.drain_voice();
+    let zen_hint_changed = app.expire_zen_hint(std::time::Instant::now());
+    let cmd_k_changed = app.expire_cmd_k(std::time::Instant::now());
+    let screencast_changed = app.screencast.expire(std::time::Instant::now());
+    let zoxide_changed = app.poll_zoxide_install();
+    // Surface managed language-server install progress in the status bar so
+    // the background work (which can take a few seconds) is visible.
+    let install_status_changed = match crate::lsp::install::take_status() {
+        Some(msg) => {
+            app.status = msg;
+            true
+        }
+        None => false,
+    };
+    // When a managed install finishes, forget the LSP sync state for the
+    // docs that language serves so the next `sync_lsp` re-opens them. That
+    // re-open makes the manager re-probe and spawn the just-installed
+    // server, so "installed" becomes "working" without a further action.
+    let just_installed = crate::lsp::install::take_just_installed();
+    if !just_installed.is_empty() {
+        app.lsp_last_seen
+            .retain(|path, _| !just_installed_covers_path(&just_installed, path));
+    }
+    voice_changed
+        || zen_hint_changed
+        || cmd_k_changed
+        || screencast_changed
+        || zoxide_changed
+        || install_status_changed
 }

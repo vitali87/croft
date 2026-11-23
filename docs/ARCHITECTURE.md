@@ -303,7 +303,7 @@ src/
 │   ├── sidebar_dwell.rs side bar auto-hide's grace delay: how long focus must stay away before the side bar collapses
 │   ├── terminal_panes.rs terminal panes: split, layout, collapse, maximize and rail, reorder, profiles, rename, notes, close and undo, saving and restoring the panel, redraw tracking, recordings, bells and exits, labels and pane buttons
 │   ├── terminal_tools.rs typing into terminals (key encoding, broadcast, paste confirm, redaction, timestamps), find, quick select, copy mode, command history and decorations, CAPTURES, links and inline suggestions
-│   ├── tick.rs          the main loop's background pass: every poll and drain, in a fixed order, before anything is drawn, and whether the screen needs drawing; a test calls it to run one real pass
+│   ├── tick.rs          the main loop's background pass: every poll and drain, in a fixed order of named steps, before anything is drawn, and whether the screen needs drawing; a test calls it to run one real pass
 │   ├── viewers.rs       read-only viewers: the spreadsheet, CSV and SQLite grid, PDF, archives, hex, rendered logs, and the Markdown preview with its scroll sync
 │   ├── welcome.rs       welcome-screen state: the "IN THIS RELEASE" highlights, read synchronously from `release_notes::release_notes()` (no thread, no network)
 │   ├── welcome_screen.rs the welcome page (logo picture and its bake, wordmark, Start list, release-note card, Loch layout) and the guided tour
@@ -1771,7 +1771,7 @@ Holds a launch's background work until its first frame is up. Started all at onc
 
 Where a launch's time goes. `main` starts the clock, a handful of `mark`s through `Cli::run`, `app::run` and `App::new` note when each startup step finished and how much of it this thread spent computing, and `finish`, called the moment the first frame is flushed, writes the list to `~/.cache/croft/startup-trace.txt` (`CROFT_STARTUP_TRACE=<file>` moves it).
 
-**The first frame is split too (#1973).** Getting from "screen set up" to the frame on screen is the main loop's first pass over every poll and drain, then the draw, and a launch that spent seconds there said only that. The pass (`tick_background`, in `app/tick.rs`) marks itself in groups (file changes, background results, collaborators, panes and saves, language servers, the Explorer's views, AI tools, and so on) and `render` marks each part of the screen it draws, so a slow first frame names the group or the part that held it. The loop and the render keep running after the frame, where `mark` finds the trace finished and costs one load.
+**The first frame is split too (#1973).** Getting from "screen set up" to the frame on screen is the main loop's first pass over every poll and drain, then the draw, and a launch that spent seconds there said only that. The pass (`tick_background`, in `app/tick.rs`) runs in named steps and marks the end of each (file changes, background results, collaborators, panes and saves, language servers, the Explorer's views, AI tools, and so on) and `render` marks each part of the screen it draws, so a slow first frame names the group or the part that held it. The loop and the render keep running after the frame, where `mark` finds the trace finished and costs one load.
 
 **Always on.** A launch from Croft.app or a Dock icon carries no environment of ours, so a switch would never reach the launch that most needs measuring. A mark is a clock read and a push, a few dozen per launch, and the file goes out after the frame.
 
