@@ -34,9 +34,27 @@ pub fn remote_croft_command(path: Option<&str>, env: &[(String, String)], solo: 
             .ok()
             .as_deref(),
         crate::iterm2_inline::detect_osk_auto(),
-        env,
+        &with_underline_colors(
+            env,
+            crate::color_depth::underline_colors_supported(|name| std::env::var(name).ok()),
+        ),
         solo,
     )
+}
+
+/// `env` led by whether this terminal reads underline colours (#2661). The
+/// remote croft draws into this same terminal but cannot see the variables
+/// that name it, so it is told; an entry in `env` still wins, coming later.
+pub(super) fn with_underline_colors(
+    env: &[(String, String)],
+    supported: bool,
+) -> Vec<(String, String)> {
+    let mut out = vec![(
+        String::from(crate::color_depth::UNDERLINE_COLORS_ENV),
+        String::from(if supported { "1" } else { "0" }),
+    )];
+    out.extend_from_slice(env);
+    out
 }
 
 pub(super) fn remote_croft_command_for_terminal(

@@ -5,6 +5,9 @@
 //! macOS 26, `screen`, PuTTY's defaults) or the 16 ANSI colours (the Linux
 //! console) draws those wrong or not at all, so below truecolor every
 //! `Rgb` in the frame is mapped to the nearest colour the terminal has.
+//!
+//! The same pass drops underline colours where the terminal cannot read
+//! them (#2661): see [`underline_colors_supported`].
 
 use ratatui::buffer::Buffer;
 use ratatui::style::Color;
@@ -106,6 +109,64 @@ impl ColorDepth {
             cell.bg = self.fit(cell.bg);
             cell.underline_color = self.fit(cell.underline_color);
         }
+    }
+}
+
+/// The variable that carries [`underline_colors_supported`]'s answer to a
+/// croft that draws into the same terminal from elsewhere: over SSH or in a
+/// dev container, where the terminal's own variables do not follow. `1` or
+/// `0`; a user may also set it for a terminal the list below leaves out.
+pub const UNDERLINE_COLORS_ENV: &str = "CROFT_UNDERLINE_COLORS";
+
+/// Whether the terminal reads underline colours (SGR 58, #2661). One that
+/// does not skips the 58 and reads the numbers after it as codes of its own:
+/// in xterm `58;5;8` turns on blink and hides the text (code 8) for the rest
+/// of the frame. So underline colours go only to terminals known to read
+/// them: [`UNDERLINE_COLORS_ENV`] when set, then `TERM_PROGRAM` or `TERM`,
+/// tmux (which converts them for the terminal outside it), and VTE 0.52 or
+/// newer (GNOME Terminal and others). `COLORTERM` says nothing here: xterm
+/// draws 24-bit colour but not underline colours.
+pub fn underline_colors_supported(env: impl Fn(&str) -> Option<String>) -> bool {
+    match env(UNDERLINE_COLORS_ENV).as_deref().map(str::trim) {
+        Some("1") => return true,
+        Some("0") => return false,
+        _ => {}
+    }
+    let var = |name: &str| env(name).unwrap_or_default().to_ascii_lowercase();
+    const PROGRAMS: &[&str] = &[
+        "iterm.app",
+        "wezterm",
+        "ghostty",
+        "vscode",
+        "tmux",
+        "rio",
+        "croft",
+    ];
+    if PROGRAMS.contains(&var("TERM_PROGRAM").as_str()) {
+        return true;
+    }
+    const TERMS: &[&str] = &[
+        "kitty",
+        "ghostty",
+        "alacritty",
+        "wezterm",
+        "foot",
+        "contour",
+        "rio",
+        "tmux",
+    ];
+    let term = var("TERM");
+    if TERMS.iter().any(|t| term.contains(t)) {
+        return true;
+    }
+    var("VTE_VERSION").parse::<u32>().is_ok_and(|v| v >= 5200)
+}
+
+/// Clear every underline colour in a finished frame, for a terminal that
+/// cannot read them: the underline stays, in the text's own colour.
+pub fn drop_underline_colors(buffer: &mut Buffer) {
+    for cell in &mut buffer.content {
+        cell.underline_color = Color::Reset;
     }
 }
 
@@ -314,6 +375,77 @@ mod tests {
             assert_eq!(cell.bg, Color::Indexed(16));
             assert_eq!(cell.underline_color, Color::Indexed(196));
         }
+    }
+
+    #[test]
+    fn underline_colours_go_only_to_terminals_that_read_them() {
+        use super::underline_colors_supported as reads;
+        // xterm, whatever its depth: 24-bit colour is not underline colour.
+        assert!(!reads(env(&[("TERM", "xterm")])));
+        assert!(!reads(env(&[
+            ("TERM", "xterm-256color"),
+            ("COLORTERM", "truecolor")
+        ])));
+        assert!(!reads(env(&[("TERM", "linux")])));
+        assert!(!reads(env(&[("TERM", "screen-256color")])));
+        assert!(!reads(env(&[
+            ("TERM_PROGRAM", "Apple_Terminal"),
+            ("TERM", "xterm-256color")
+        ])));
+        assert!(!reads(env(&[])));
+        for (k, v) in [
+            ("TERM_PROGRAM", "iTerm.app"),
+            ("TERM_PROGRAM", "WezTerm"),
+            ("TERM_PROGRAM", "ghostty"),
+            ("TERM_PROGRAM", "vscode"),
+            ("TERM_PROGRAM", "tmux"),
+            ("TERM_PROGRAM", "croft"),
+            ("TERM", "xterm-kitty"),
+            ("TERM", "alacritty"),
+            ("TERM", "foot"),
+            ("TERM", "tmux-256color"),
+        ] {
+            assert!(reads(env(&[(k, v)])), "{k}={v}");
+        }
+        assert!(reads(env(&[
+            ("TERM", "xterm-256color"),
+            ("VTE_VERSION", "7600")
+        ])));
+        assert!(!reads(env(&[
+            ("TERM", "xterm-256color"),
+            ("VTE_VERSION", "5000")
+        ])));
+    }
+
+    /// The answer carried from another croft wins both ways.
+    #[test]
+    fn the_carried_answer_wins() {
+        use super::{UNDERLINE_COLORS_ENV, underline_colors_supported as reads};
+        assert!(reads(env(&[
+            ("TERM", "xterm"),
+            (UNDERLINE_COLORS_ENV, "1")
+        ])));
+        assert!(!reads(env(&[
+            ("TERM_PROGRAM", "ghostty"),
+            (UNDERLINE_COLORS_ENV, "0")
+        ])));
+        assert!(reads(env(&[
+            ("TERM_PROGRAM", "ghostty"),
+            (UNDERLINE_COLORS_ENV, "maybe")
+        ])));
+    }
+
+    #[test]
+    fn dropping_underline_colours_keeps_the_underline() {
+        use ratatui::style::Modifier;
+        let mut buf = Buffer::empty(Rect::new(0, 0, 2, 1));
+        buf.content[0].underline_color = Color::Rgb(0x4f, 0xb1, 0xa6);
+        buf.content[0].modifier = Modifier::UNDERLINED;
+        buf.content[0].fg = Color::Rgb(1, 2, 3);
+        super::drop_underline_colors(&mut buf);
+        assert_eq!(buf.content[0].underline_color, Color::Reset);
+        assert_eq!(buf.content[0].modifier, Modifier::UNDERLINED);
+        assert_eq!(buf.content[0].fg, Color::Rgb(1, 2, 3));
     }
 
     /// Negative: at truecolor the frame is left exactly as drawn.

@@ -1756,11 +1756,18 @@ fn the_multiline_paste_warning_setting_parses() {
 /// #1433: the bytes croft writes for one frame, through the real crossterm
 /// backend, at `depth`.
 fn frame_bytes_at(depth: crate::color_depth::ColorDepth) -> String {
+    frame_bytes_with(depth, true)
+}
+
+/// [`frame_bytes_at`] for a terminal that does or does not read underline
+/// colours (#2661).
+fn frame_bytes_with(depth: crate::color_depth::ColorDepth, underline_colors: bool) -> String {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(tmp.path().join("a.py"), "print(1)\n").unwrap();
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.editor.open(&tmp.path().join("a.py")).unwrap();
     app.color_depth = depth;
+    app.underline_colors = underline_colors;
     struct Sink(std::rc::Rc<std::cell::RefCell<Vec<u8>>>);
     impl std::io::Write for Sink {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -1810,6 +1817,31 @@ fn a_16_colour_terminal_gets_only_the_16_ansi_colours() {
         .collect();
     assert!(!indexes.is_empty());
     assert!(indexes.iter().all(|&i| i < 16), "{indexes:?}");
+}
+
+/// #2661: xterm reads `ESC[58;5;8m` as blink and "hide text" (code 8) and
+/// hid everything after the active tab's name. A terminal that cannot read
+/// underline colours gets no code 58 at any depth, and keeps the underline.
+#[test]
+fn a_terminal_without_underline_colours_gets_no_underline_colour() {
+    use crate::color_depth::ColorDepth;
+    for depth in [
+        ColorDepth::TrueColor,
+        ColorDepth::Ansi256,
+        ColorDepth::Ansi16,
+    ] {
+        let read = frame_bytes_with(depth, true);
+        assert!(
+            read.contains("\x1b[58;"),
+            "{depth:?}: the frame must hold an underline colour, or this proves nothing"
+        );
+        let out = frame_bytes_with(depth, false);
+        assert!(!out.contains("[58;"), "{depth:?}: {out:?}");
+        assert!(
+            out.contains("\x1b[4m"),
+            "{depth:?}: the underline itself stays"
+        );
+    }
 }
 
 /// #1433 negative: a truecolor terminal still gets the theme's exact
