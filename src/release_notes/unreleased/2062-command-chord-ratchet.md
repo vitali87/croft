@@ -1,0 +1,1 @@
+refactor: Groundwork for the refactor program (#2062): a test holds the number of Command Palette commands without a shortcut where it is, so it can only fall: a new command needs a chord. Nothing changes in use.

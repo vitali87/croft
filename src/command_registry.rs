@@ -2877,6 +2877,37 @@ mod tests {
         }
     }
 
+    /// How many palette commands show no chord on this platform: the ratchet
+    /// below holds it there or lower. Kill to End of Line has one on macOS
+    /// only, which is the difference between the two.
+    const WITHOUT_A_CHORD: usize = if cfg!(target_os = "macos") { 271 } else { 272 };
+
+    /// Everything has a shortcut (TENETS.md): every row of the table must
+    /// state its hint, and the number with none may only fall. A new command
+    /// needs a chord; one that gains a chord lowers the number here, so it
+    /// cannot rise again unseen.
+    #[test]
+    fn commands_without_a_chord_never_grow_in_number() {
+        let without: Vec<&Command> = ALL_COMMANDS
+            .iter()
+            .filter(|cmd| cmd.keybinding_hint().is_empty())
+            .collect();
+        assert!(
+            without.len() <= WITHOUT_A_CHORD,
+            "{} palette commands show no chord, more than the {WITHOUT_A_CHORD} allowed: \
+             a new command needs a chord in its row of the table",
+            without.len()
+        );
+        assert!(
+            without.len() >= WITHOUT_A_CHORD,
+            "{} palette commands show no chord, fewer than {WITHOUT_A_CHORD}: lower \
+             WITHOUT_A_CHORD to {} here (and the other platform's number with it) so \
+             the count cannot rise again",
+            without.len(),
+            without.len()
+        );
+    }
+
     #[test]
     fn every_command_has_a_nonempty_title() {
         for cmd in ALL_COMMANDS {
