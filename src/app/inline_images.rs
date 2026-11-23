@@ -721,7 +721,7 @@ impl App {
         self.overlays.run_debug.clear_emitted();
     }
 
-    pub fn flush_run_debug_icon_overlay(&mut self) {
+    pub fn flush_run_debug_icon_overlay(&mut self, drawn: &ratatui::buffer::Buffer) {
         if self.modal_overlay_open() {
             return;
         }
@@ -767,7 +767,7 @@ impl App {
             width: crate::widgets::run_debug::RUN_DEBUG_ICON_CELLS_W,
             height: crate::widgets::run_debug::RUN_DEBUG_ICON_CELLS_H,
         };
-        if !self.chrome_image_due("run_debug", &osc, at) {
+        if !self.chrome_image_due("run_debug", &osc, at, drawn) {
             return;
         }
         write_inline_image(
@@ -796,7 +796,7 @@ impl App {
     /// (like the activity-bar badges) so heavy SGR traffic can't evict it.
     /// Clears when the panel strip is hidden, the count is zero, or a modal owns
     /// the screen; arms a one-shot clear when the anchor moves so no ghost stacks.
-    pub fn flush_problems_badge_overlay(&mut self) {
+    pub fn flush_problems_badge_overlay(&mut self, drawn: &ratatui::buffer::Buffer) {
         if self.modal_overlay_open() {
             return;
         }
@@ -824,7 +824,7 @@ impl App {
             width: crate::iterm2_inline::count_badge_cells_w(self.problems_badge_count),
             height: 1,
         };
-        if !self.chrome_image_due("problems_badge", &osc, at) {
+        if !self.chrome_image_due("problems_badge", &osc, at, drawn) {
             return;
         }
         write_inline_image(
@@ -843,7 +843,7 @@ impl App {
     /// terminal can't render inline images. Called from the post-draw
     /// flush each frame so iTerm2 keeps the image painted even after
     /// surrounding cells redraw.
-    pub fn flush_no_repo_hero_overlay(&mut self) {
+    pub fn flush_no_repo_hero_overlay(&mut self, drawn: &ratatui::buffer::Buffer) {
         if self.modal_overlay_open() {
             return;
         }
@@ -904,7 +904,7 @@ impl App {
         let Some(osc) = self.overlays.hero.image().map(str::to_owned) else {
             return;
         };
-        if !self.chrome_image_due("hero", &osc, hero) {
+        if !self.chrome_image_due("hero", &osc, hero, drawn) {
             return;
         }
         write_inline_image(
@@ -924,7 +924,7 @@ impl App {
     /// `consume_ssh_empty_state_image_clear()` so iTerm2 evicts the
     /// cached image cells — otherwise the illustration ghosts onto
     /// whatever view (Explorer / Search / …) replaces it.
-    pub fn flush_ssh_empty_state_overlay(&mut self) {
+    pub fn flush_ssh_empty_state_overlay(&mut self, drawn: &ratatui::buffer::Buffer) {
         let should_show = self.shortcuts_modal.is_none()
             && self.file_finder.is_none()
             && self.zoxide_jump.is_none()
@@ -951,7 +951,7 @@ impl App {
             width: crate::widgets::remote::SSH_EMPTY_STATE_CELLS_W,
             height: crate::widgets::remote::SSH_EMPTY_STATE_CELLS_H,
         };
-        if self.update_card_covers(at) || !self.chrome_image_due("ssh", &osc, at) {
+        if self.update_card_covers(at) || !self.chrome_image_due("ssh", &osc, at, drawn) {
             return;
         }
         write_inline_image(
@@ -2578,43 +2578,40 @@ impl App {
         }
     }
 
-    /// Keep the buffer ratatui just drew for [`Self::chrome_image_due`], on
-    /// the terminals it reads it for: every one but Kitty's protocol, which
-    /// keeps pictures on a layer of their own. On Kitty (Ghostty, kitty) the
-    /// copy was a whole screen of cells cloned after every frame and never
-    /// read, so none is kept there.
-    pub(super) fn keep_drawn_buffer(&mut self, drawn: &ratatui::buffer::Buffer) {
-        if self.inline_protocol == crate::iterm2_inline::InlineImageProtocol::Kitty {
-            self.drawn_buffer = None;
-            return;
-        }
-        match self.drawn_buffer.as_mut() {
-            // Into the cells of the last copy, so a frame reuses them
-            // rather than allocating a screen's worth anew.
-            Some(kept) => {
-                kept.area = drawn.area;
-                kept.content.clone_from(&drawn.content);
-            }
-            None => self.drawn_buffer = Some(drawn.clone()),
-        }
+    /// Send the small chrome pictures due this frame (the Run and Debug
+    /// icon, the PROBLEMS badge, the source-control and SSH illustrations),
+    /// then forget the ones not on screen. `drawn` is the frame ratatui just
+    /// drew, read in place for the cells around each picture: nothing copies
+    /// it (#2062).
+    pub(super) fn flush_chrome_images(&mut self, drawn: &ratatui::buffer::Buffer) {
+        self.flush_run_debug_icon_overlay(drawn);
+        self.flush_problems_badge_overlay(drawn);
+        self.flush_no_repo_hero_overlay(drawn);
+        self.flush_ssh_empty_state_overlay(drawn);
+        self.end_chrome_flush();
     }
 
     /// Whether a small chrome image must be sent this frame (#682). These
     /// used to go out after every redraw, so a keystroke re-sent each one
     /// over SSH. Now one goes out when it is new, changed or moved, and on
-    /// iTerm2 and Sixel also when the cells around it were repainted (iTerm2
-    /// evicts an image under neighbouring traffic, and a cell-buffer picture
-    /// is erased by writes into it). Kitty keeps images on their own layer.
-    pub(super) fn chrome_image_due(&mut self, key: &'static str, image: &str, at: Rect) -> bool {
+    /// iTerm2 and Sixel also when the cells around it were repainted in
+    /// `drawn`, the frame ratatui just drew (iTerm2 evicts an image under
+    /// neighbouring traffic, and a cell-buffer picture is erased by writes
+    /// into it). Kitty keeps images on their own layer.
+    pub(super) fn chrome_image_due(
+        &mut self,
+        key: &'static str,
+        image: &str,
+        at: Rect,
+        drawn: &ratatui::buffer::Buffer,
+    ) -> bool {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
         image.hash(&mut h);
         (at.x, at.y, at.width, at.height).hash(&mut h);
-        if self.inline_protocol != crate::iterm2_inline::InlineImageProtocol::Kitty
-            && let Some(buf) = &self.drawn_buffer
-        {
+        if self.inline_protocol != crate::iterm2_inline::InlineImageProtocol::Kitty {
             cells_fingerprint(
-                buf,
+                drawn,
                 at.x.saturating_sub(1),
                 at.y.saturating_sub(1),
                 at.width.saturating_add(2),

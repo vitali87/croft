@@ -1,0 +1,1 @@
+refactor: Groundwork for the refactor program (#2062): croft no longer copies the whole screen after every redraw on terminals other than Kitty's; the small sidebar pictures read the frame just drawn instead. Nothing changes in use.

@@ -2147,11 +2147,10 @@ pub struct App {
     /// Whether the editor was wide enough for the strip on the last frame,
     /// so turning the minimap on can say why it does not show.
     minimap_room: bool,
-    /// The buffer ratatui drew last, and what each small chrome image (the
-    /// PROBLEMS badge, Run and Debug icon, sidebar illustrations) was sent
-    /// over, keyed by overlay, for [`App::chrome_image_due`]. Keys not
-    /// checked in a frame (the image was hidden) are dropped.
-    drawn_buffer: Option<ratatui::buffer::Buffer>,
+    /// What each small chrome image (the PROBLEMS badge, Run and Debug
+    /// icon, sidebar illustrations) was last sent over, keyed by overlay,
+    /// for [`App::chrome_image_due`]. Keys not checked in a frame (the image
+    /// was hidden) are dropped.
     chrome_sent: std::collections::HashMap<&'static str, u64>,
     chrome_seen: std::collections::HashSet<&'static str>,
     /// A left-drag is panning the view via the minimap strip.
@@ -4572,7 +4571,6 @@ impl App {
             minimap_text: false,
             minimap_text_cache: None,
             minimap_room: true,
-            drawn_buffer: None,
             chrome_sent: std::collections::HashMap::new(),
             chrome_seen: std::collections::HashSet::new(),
             minimap_drag: false,
@@ -6649,11 +6647,12 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             }
             crate::startup_trace::mark("loop work done");
             let draw_start = std::time::Instant::now();
-            let drawn = terminal.draw(|f| app.render_for_terminal(f))?;
+            // The frame ratatui just drew, read in place by the picture
+            // flushes below rather than copied (#2062).
+            let mut drawn = terminal.draw(|f| app.render_for_terminal(f))?.buffer;
             crate::startup_trace::mark("frame drawn");
             app.sync_caret_style();
-            let mut underlays = app.image_underlays(drawn.buffer);
-            app.keep_drawn_buffer(drawn.buffer);
+            let mut underlays = app.image_underlays(drawn);
             // Record render+flush time and the bytes ratatui shipped this
             // frame so the F8 HUD can show where remote latency goes.
             app.perf.record_draw(draw_start.elapsed().as_micros());
@@ -6667,9 +6666,8 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
                 app.overlays.welcome.mark_dirty();
                 app.overlays.hero.mark_dirty();
                 app.forget_sent_images();
-                let drawn = terminal.draw(|f| app.render_for_terminal(f))?;
-                underlays = app.image_underlays(drawn.buffer);
-                app.keep_drawn_buffer(drawn.buffer);
+                drawn = terminal.draw(|f| app.render_for_terminal(f))?.buffer;
+                underlays = app.image_underlays(drawn);
             }
             // After ratatui flushes its diff, paint the activity-bar icons
             // directly via OSC-1337 on every redraw. We previously gated
@@ -6790,17 +6788,15 @@ fn main_loop(app: &mut App, terminal: &mut CroftTerminal) -> Result<()> {
             } else {
                 app.overlays.minimap.forget_sent();
             }
-            // Run-and-Debug headline icon: same re-emit-every-frame trick.
-            // Only fires while the sidebar is on the Run-Debug view and the
-            // panel reserved a cell for the icon on its last render. On
-            // view change the `consume_run_debug_image_clear` gate above
-            // already armed `terminal.clear()`, evicting the cached
-            // image cells before the next sidebar paints.
-            app.flush_run_debug_icon_overlay();
-            app.flush_problems_badge_overlay();
-            app.flush_no_repo_hero_overlay();
-            app.flush_ssh_empty_state_overlay();
-            app.end_chrome_flush();
+            // The small chrome pictures: the Run-and-Debug headline icon,
+            // the PROBLEMS badge and the source-control and SSH
+            // illustrations. The icon only fires while the sidebar is on
+            // the Run-Debug view and the panel reserved a cell for it on
+            // its last render. On view change the
+            // `consume_run_debug_image_clear` gate above already armed
+            // `terminal.clear()`, evicting the cached image cells before
+            // the next sidebar paints.
+            app.flush_chrome_images(drawn);
             // Welcome-screen logo: same OSC-1337 trick, gated by its own
             // dirty flag and only emitted while the editor pane is in its
             // blank initial state.
