@@ -207,9 +207,16 @@ impl App {
             || self.pending_stash_drop.is_some()
             || self.pending_discard_all
             || self.pending_run_block.is_some()
-            || self.pending_terminal_paste.is_some()
-            || self.pending_broadcast_enable
         {
+            return true;
+        }
+        if self.pending_terminal_paste.is_some() {
+            // It holds the first paste, which this one neither replaces
+            // nor slips past into the shell.
+            self.status = String::from("Resolve the pending paste before pasting again");
+            return true;
+        }
+        if self.pending_broadcast_enable {
             return true;
         }
         // New File, Rename and the other single-line prompts take it at the
