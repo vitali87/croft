@@ -1,0 +1,1 @@
+refactor: Groundwork for the refactor program (#2062): every built-in command is declared once, as one row of a table with its id, title and shortcut hint, instead of in five separate lists that had to be kept in step by hand. Nothing changes in use.
