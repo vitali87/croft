@@ -1,1 +1,0 @@
-refactor: Groundwork for the refactor program (#2062): the main loop's background pass, which collects what croft's background work has finished before each frame, is a function of its own that the tests run the way the loop does. Nothing changes in use.

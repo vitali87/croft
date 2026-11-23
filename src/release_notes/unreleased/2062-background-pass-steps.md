@@ -1,1 +1,0 @@
-refactor: Groundwork for the refactor program (#2062): the main loop's background pass runs as a list of named steps, each saying whether it changed anything on screen, in the same order as before. Nothing changes in use.
