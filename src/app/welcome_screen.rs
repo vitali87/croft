@@ -1313,7 +1313,7 @@ impl App {
     }
 
     pub fn welcome_image_emit_payload(&self) -> Option<(&str, &WelcomeLayout)> {
-        if self.pictures_held_back()
+        if self.picture_waits(super::popups::PictureSpot::Welcome)
             || self.context_menu.is_some()
             || !self.editor.is_blank_initial()
             || self.terminal_maximized

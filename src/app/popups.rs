@@ -11,9 +11,15 @@
 //!
 //! Menus, tooltips, notices, hover cards, the find bars and the tour caption
 //! open next to what they belong to, so they are not listed: a picture
-//! yields to one of those only where they overlap.
+//! yields to one of those only where it lands on the picture. Which pictures
+//! that is, the frame tells: [`PictureCover`] notes the cells under every
+//! picture just before the frame draws its pop-ups, and again after, and a
+//! picture whose cells changed in between has something drawn over it
+//! (#2663).
 
 use super::App;
+use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
 
 /// A pop-up drawn over the middle of the screen.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -127,5 +133,123 @@ impl App {
     /// keeps pictures below the text and loses nothing by the wait.
     pub(super) fn pictures_held_back(&self) -> bool {
         Popup::ALL.iter().any(|p| p.is_open(self))
+    }
+
+    /// Whether the picture at `spot` waits this frame: a pop-up is open, or
+    /// something the frame drew after the panes landed on the picture.
+    pub(super) fn picture_waits(&self, spot: PictureSpot) -> bool {
+        self.pictures_held_back() || self.picture_cover.covered.contains(&spot)
+    }
+
+    /// Where each picture sits this frame, from the places the panes
+    /// recorded while they painted. A picture not on screen has no spot or
+    /// an empty one, which nothing can cover.
+    pub(super) fn picture_spots(&self) -> Vec<(PictureSpot, Rect)> {
+        let o = &self.overlays;
+        let mut spots = Vec::with_capacity(9);
+        for side in 0..2 {
+            if let Some(l) = o.editor[side].layout() {
+                let r = Rect::new(l.cell_x, l.cell_y, l.cell_w, l.cell_h);
+                spots.push((PictureSpot::Editor(side), r));
+            }
+        }
+        if let Some(l) = o.terminal_image.layout() {
+            let r = Rect::new(l.cell_x, l.cell_y, l.cell_w, l.cell_h);
+            spots.push((PictureSpot::Terminal, r));
+        }
+        if let Some(l) = o.markdown_image.layout() {
+            let r = Rect::new(l.cell_x, l.cell_y, l.cell_w, l.cell_h);
+            spots.push((PictureSpot::Markdown, r));
+        }
+        spots.push((PictureSpot::Minimap, self.minimap_img_rect));
+        if let Some(l) = o.welcome.layout() {
+            let r = Rect::new(l.cell_x, l.cell_y, l.cell_w, l.cell_h);
+            spots.push((PictureSpot::Welcome, r));
+        }
+        if let Some((x, y)) = self.run_debug.last_icon_cell {
+            use crate::widgets::run_debug::{RUN_DEBUG_ICON_CELLS_H, RUN_DEBUG_ICON_CELLS_W};
+            let r = Rect::new(x, y, RUN_DEBUG_ICON_CELLS_W, RUN_DEBUG_ICON_CELLS_H);
+            spots.push((PictureSpot::RunDebugIcon, r));
+        }
+        if let Some((x, y)) = self.problems_badge_cell {
+            let w = crate::iterm2_inline::count_badge_cells_w(self.problems_badge_count);
+            spots.push((PictureSpot::ProblemsBadge, Rect::new(x, y, w, 1)));
+        }
+        spots.push((
+            PictureSpot::SourceControlHero,
+            self.source_control.last_hero_area,
+        ));
+        if let Some((x, y)) = self.remote.last_image_cell {
+            use crate::widgets::remote::{SSH_EMPTY_STATE_CELLS_H, SSH_EMPTY_STATE_CELLS_W};
+            let r = Rect::new(x, y, SSH_EMPTY_STATE_CELLS_W, SSH_EMPTY_STATE_CELLS_H);
+            spots.push((PictureSpot::SshIllustration, r));
+        }
+        spots
+    }
+
+    /// Called just before the frame draws its pop-ups.
+    pub(super) fn note_pictures_before_popups(&mut self, buf: &Buffer) {
+        let spots = self.picture_spots();
+        self.picture_cover.note_before(buf, spots);
+    }
+
+    /// Called once the frame has drawn its last pop-up.
+    pub(super) fn note_pictures_after_popups(&mut self, buf: &Buffer) {
+        self.picture_cover.note_after(buf);
+    }
+}
+
+/// A place croft sends a picture to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum PictureSpot {
+    /// An image or PDF in the left (0) or right (1) editor group.
+    Editor(usize),
+    Terminal,
+    Markdown,
+    Minimap,
+    Welcome,
+    RunDebugIcon,
+    ProblemsBadge,
+    SourceControlHero,
+    SshIllustration,
+}
+
+/// What lay under each picture before the frame drew its pop-ups, and which
+/// pictures something was then drawn over (#2663).
+#[derive(Default)]
+pub(super) struct PictureCover {
+    before: Vec<(PictureSpot, Rect, u64)>,
+    covered: Vec<PictureSpot>,
+}
+
+impl PictureCover {
+    /// Forget the last frame's answer; a frame that never reaches its
+    /// pop-ups covers nothing.
+    pub(super) fn start_frame(&mut self) {
+        self.before.clear();
+        self.covered.clear();
+    }
+
+    fn note_before(&mut self, buf: &Buffer, spots: Vec<(PictureSpot, Rect)>) {
+        self.before.clear();
+        self.covered.clear();
+        for (spot, r) in spots {
+            if r.width > 0 && r.height > 0 {
+                let print =
+                    super::inline_images::cells_fingerprint(buf, r.x, r.y, r.width, r.height);
+                self.before.push((spot, r, print));
+            }
+        }
+    }
+
+    fn note_after(&mut self, buf: &Buffer) {
+        self.covered = self
+            .before
+            .iter()
+            .filter(|(_, r, print)| {
+                super::inline_images::cells_fingerprint(buf, r.x, r.y, r.width, r.height) != *print
+            })
+            .map(|(spot, _, _)| *spot)
+            .collect();
     }
 }

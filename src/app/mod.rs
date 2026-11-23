@@ -2063,6 +2063,8 @@ pub struct App {
     /// Hit-test rect of the on-screen minimap image (text-aligned rows), for
     /// click-to-scroll and the right-click menu. Empty when the minimap is off.
     minimap_img_rect: Rect,
+    /// Which pictures a pop-up was drawn over this frame (#2663).
+    picture_cover: popups::PictureCover,
     /// Pixel height the lines are mapped into within the image (top-aligned;
     /// `<=` the image's pixel height for short files). Click mapping divides by
     /// this, not the full strip height, so clicks land on the right line.
@@ -4495,6 +4497,7 @@ impl App {
             minimap_side: MinimapSide::Right,
             minimap_base: None,
             minimap_img_rect: Rect::default(),
+            picture_cover: popups::PictureCover::default(),
             minimap_content_h: 0,
             minimap_baked_at: None,
             minimap_edit_pending: false,

@@ -423,3 +423,169 @@ fn every_painter_in_the_overlay_pass_is_a_listed_popup_or_opens_beside_its_owner
         "listed but not painted in the overlay pass: {unpainted:?}"
     );
 }
+
+/// A picture wider than any pane, so it spans the terminal's whole width.
+fn wide_png() -> Vec<u8> {
+    let mut png = Vec::new();
+    image::RgbaImage::from_pixel(2400, 300, image::Rgba([0, 0, 255, 255]))
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .unwrap();
+    png
+}
+
+/// #2663: the terminal's Find bar opens at the top right of the pane, over
+/// a picture the terminal shows (`imgcat`). On iTerm2 croft sent the
+/// picture again over the bar; it now waits while the bar is drawn on it.
+#[test]
+fn a_terminal_picture_waits_for_the_find_bar_drawn_over_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.focus_pane(Pane::Terminal);
+    app.inline_protocol = crate::iterm2_inline::InlineImageProtocol::ITerm2;
+    app.cell_pixel = Some((8, 16));
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 45)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    // Clear the pane and print the picture at its third row, so its top
+    // rows are where the Find bar opens.
+    app.terminals[0].feed_bytes_for_test(b"\x1b[2J\x1b[3;1H");
+    app.terminals[0].push_image_for_test(wide_png());
+    term.draw(|f| app.render(f)).unwrap();
+    assert!(
+        app.terminal_image_payload().is_some(),
+        "staging: with nothing over it the picture is sent"
+    );
+    app.open_terminal_find();
+    term.draw(|f| app.render(f)).unwrap();
+    assert!(
+        app.terminal_image_payload().is_none(),
+        "the Find bar is drawn over the picture, so the picture waits"
+    );
+    app.terminal_find = None;
+    term.draw(|f| app.render(f)).unwrap();
+    assert!(
+        app.terminal_image_payload().is_some(),
+        "and comes back once the bar closes"
+    );
+}
+
+/// #2663: a tooltip under the editor's title-bar buttons lands on an image
+/// open in the editor; the picture waits. One elsewhere leaves it alone.
+#[test]
+fn an_editor_picture_waits_only_for_a_tooltip_drawn_over_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = picture_app(tmp.path());
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 45)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let l = app
+        .editor_image_payload(0)
+        .map(|(_, l)| l.clone())
+        .expect("staging: the picture bakes");
+    // A tooltip in the side bar, nowhere near the picture.
+    app.ui_tooltip = Some(crate::widgets::hover_popup::HoverPopup::new_compact(
+        String::from("New File"),
+        (8, 2),
+    ));
+    term.draw(|f| app.render(f)).unwrap();
+    assert!(
+        app.editor_image_payload(0).is_some(),
+        "a tooltip that misses the picture must not hold it back"
+    );
+    // A tooltip under the title bar's buttons, over the picture's top rows.
+    app.ui_tooltip = Some(crate::widgets::hover_popup::HoverPopup::new_compact(
+        String::from("Split Editor Right"),
+        (l.cell_x + l.cell_w - 20, l.cell_y.saturating_sub(2)),
+    ));
+    term.draw(|f| app.render(f)).unwrap();
+    assert!(
+        app.editor_image_payload(0).is_none(),
+        "the tooltip is drawn over the picture, so the picture waits"
+    );
+}
+
+/// #2663: the sidebar pictures wait the same way: a tooltip over the Source
+/// Control illustration of a folder that is not a repository.
+#[test]
+fn the_source_control_illustration_waits_for_a_tooltip_drawn_over_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.inline_protocol = crate::iterm2_inline::InlineImageProtocol::ITerm2;
+    app.cell_pixel = Some((10, 20));
+    app.show_tree = true;
+    app.sidebar_view = SidebarView::SourceControl;
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let hero = app.source_control.last_hero_area;
+    assert!(
+        hero.width > 0 && hero.height > 0,
+        "staging: the illustration has its place"
+    );
+    assert!(!app.picture_waits(crate::app::popups::PictureSpot::SourceControlHero));
+    // A one-line tooltip just above the illustration touches none of it.
+    app.ui_tooltip = Some(crate::widgets::hover_popup::HoverPopup::new_compact(
+        String::from("Initialize Repository"),
+        (hero.x + 1, hero.y + 1),
+    ));
+    term.draw(|f| app.render(f)).unwrap();
+    let above = app.ui_tooltip_area.expect("the tooltip is drawn");
+    assert!(
+        above.y + 1 < hero.y + 1
+            || !app.picture_waits(crate::app::popups::PictureSpot::SourceControlHero),
+        "a tooltip that misses the illustration must not hold it back"
+    );
+    // One whose line lands inside it does.
+    app.ui_tooltip = Some(crate::widgets::hover_popup::HoverPopup::new_compact(
+        String::from("Initialize Repository"),
+        (hero.x + 1, hero.y + hero.height - 1),
+    ));
+    term.draw(|f| app.render(f)).unwrap();
+    let over = app.ui_tooltip_area.expect("the tooltip is drawn");
+    assert!(
+        over.intersects(hero),
+        "staging: the tooltip {over:?} must land on the illustration {hero:?}"
+    );
+    assert!(app.picture_waits(crate::app::popups::PictureSpot::SourceControlHero));
+}
+
+/// The record itself: only a picture whose cells changed between the two
+/// notes counts as covered, and a new frame starts with none.
+#[test]
+fn only_a_picture_whose_cells_changed_counts_as_covered() {
+    use crate::app::popups::PictureSpot;
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let mut buf = ratatui::buffer::Buffer::empty(Rect::new(0, 0, 40, 20));
+    app.minimap_img_rect = Rect::new(30, 0, 4, 10);
+    app.source_control.last_hero_area = Rect::new(2, 2, 10, 4);
+    app.note_pictures_before_popups(&buf);
+    buf[(31, 3)].set_symbol("x");
+    app.note_pictures_after_popups(&buf);
+    assert!(app.picture_waits(PictureSpot::Minimap));
+    assert!(!app.picture_waits(PictureSpot::SourceControlHero));
+    app.picture_cover.start_frame();
+    assert!(!app.picture_waits(PictureSpot::Minimap));
+}
+
+/// Codex on #2664: the editor tab's tooltip was drawn with the editor,
+/// before the pictures' cells were noted, so over an image it counted as
+/// part of the picture and the picture was sent over it. It is now drawn
+/// with the other pop-ups.
+#[test]
+fn an_editor_picture_waits_for_a_tab_tooltip_drawn_over_it() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = picture_app(tmp.path());
+    let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(140, 45)).unwrap();
+    term.draw(|f| app.render(f)).unwrap();
+    let l = app
+        .editor_image_payload(0)
+        .map(|(_, l)| l.clone())
+        .expect("staging: the picture bakes");
+    app.tab_tooltip = Some(crate::widgets::hover_popup::HoverPopup::new_compact(
+        String::from("pic.png  ~/project"),
+        (l.cell_x + 4, l.cell_y + 2),
+    ));
+    term.draw(|f| app.render(f)).unwrap();
+    assert!(
+        app.editor_image_payload(0).is_none(),
+        "the tab tooltip is drawn over the picture, so the picture waits"
+    );
+}
