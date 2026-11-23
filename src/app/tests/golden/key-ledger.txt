@@ -195,7 +195,7 @@ editor | ctrl+k shift+f | tabs=main.rs,*Search Editor text=3L#6cabf539 caret=0:0
 editor | ctrl+k shift+h | status="Call hierarchy: no language server for this file"
 editor | ctrl+k shift+i | status=" excluded from broadcast input"
 editor | ctrl+k shift+l | +input("New worktree lane" "" @0)
-editor | ctrl+k shift+n | tabs=*● main.rs text=15L#dd47e8c2 caret=4:9
+editor | ctrl+k shift+n | status="The key combination (Ctrl+K, Shift+N) is not a command."
 editor | ctrl+k shift+o | status="New Window failed: opening a new window is only supported on macOS"
 editor | ctrl+k shift+p | status="Tab is already kept open"
 editor | ctrl+k shift+q | status="Not attached to a persistent session: nothing to detach from"
@@ -467,7 +467,7 @@ selection | ctrl+k shift+f | tabs=main.rs,*Search Editor text=3L#6cabf539 caret=
 selection | ctrl+k shift+h | status="Call hierarchy: no language server for this file"
 selection | ctrl+k shift+i | status=" excluded from broadcast input"
 selection | ctrl+k shift+l | +input("New worktree lane" "" @0)
-selection | ctrl+k shift+n | tabs=*● main.rs text=15L#1d098ee2 caret=4:9 sel=-
+selection | ctrl+k shift+n | status="The key combination (Ctrl+K, Shift+N) is not a command."
 selection | ctrl+k shift+o | status="New Window failed: opening a new window is only supported on macOS"
 selection | ctrl+k shift+p | status="Tab is already kept open"
 selection | ctrl+k shift+q | status="Not attached to a persistent session: nothing to detach from"
@@ -723,7 +723,7 @@ explorer | ctrl+k i | status="Broadcast input needs at least two terminal panes 
 explorer | ctrl+k k | status="Cleared terminal"
 explorer | ctrl+k l | status="Drop to Local: this croft is not a remote session"
 explorer | ctrl+k m | status="Only one terminal open"
-explorer | ctrl+k n | -
+explorer | ctrl+k n | status="The key combination (Ctrl+K, N) is not a command."
 explorer | ctrl+k o | status="New Window failed: opening a new window is only supported on macOS"
 explorer | ctrl+k p | status="Pinned tab"
 explorer | ctrl+k q | status="Navigator is not active (run croft pair in this workspace)"
@@ -739,7 +739,7 @@ explorer | ctrl+k shift+f | focus=editor tabs=main.rs,*Search Editor text=3L#6ca
 explorer | ctrl+k shift+h | status="Call hierarchy: no language server for this file"
 explorer | ctrl+k shift+i | status=" excluded from broadcast input"
 explorer | ctrl+k shift+l | +input("New worktree lane" "" @0)
-explorer | ctrl+k shift+n | -
+explorer | ctrl+k shift+n | status="The key combination (Ctrl+K, Shift+N) is not a command."
 explorer | ctrl+k shift+o | status="New Window failed: opening a new window is only supported on macOS"
 explorer | ctrl+k shift+p | status="Tab is already kept open"
 explorer | ctrl+k shift+q | status="Not attached to a persistent session: nothing to detach from"
@@ -1266,7 +1266,7 @@ search | ctrl+k i | status="Broadcast input needs at least two terminal panes (C
 search | ctrl+k k | status="Cleared terminal"
 search | ctrl+k l | status="Drop to Local: this croft is not a remote session"
 search | ctrl+k m | status="Only one terminal open"
-search | ctrl+k n | search="totaln" @Query:6 hits=0@0
+search | ctrl+k n | status="The key combination (Ctrl+K, N) is not a command."
 search | ctrl+k o | status="New Window failed: opening a new window is only supported on macOS"
 search | ctrl+k p | status="Pinned tab"
 search | ctrl+k q | status="Navigator is not active (run croft pair in this workspace)"
@@ -1282,7 +1282,7 @@ search | ctrl+k shift+f | focus=editor tabs=main.rs,*Search: total text=9L#c0995
 search | ctrl+k shift+h | status="Call hierarchy: no language server for this file"
 search | ctrl+k shift+i | status=" excluded from broadcast input"
 search | ctrl+k shift+l | +input("New worktree lane" "" @0)
-search | ctrl+k shift+n | search="totalN" @Query:6 hits=0@0
+search | ctrl+k shift+n | status="The key combination (Ctrl+K, Shift+N) is not a command."
 search | ctrl+k shift+o | status="New Window failed: opening a new window is only supported on macOS"
 search | ctrl+k shift+p | status="Tab is already kept open"
 search | ctrl+k shift+q | status="Not attached to a persistent session: nothing to detach from"
@@ -1538,7 +1538,7 @@ scm | ctrl+k i | status="Broadcast input needs at least two terminal panes (Cmd+
 scm | ctrl+k k | status="Cleared terminal"
 scm | ctrl+k l | status="Drop to Local: this croft is not a remote session"
 scm | ctrl+k m | status="Only one terminal open"
-scm | ctrl+k n | scm="Ship itn"@8 +focus StagedModified:docs/notes.md Untracked:todo.txt
+scm | ctrl+k n | status="The key combination (Ctrl+K, N) is not a command."
 scm | ctrl+k o | status="New Window failed: opening a new window is only supported on macOS"
 scm | ctrl+k p | status="Pinned tab"
 scm | ctrl+k q | status="Navigator is not active (run croft pair in this workspace)"
@@ -1554,7 +1554,7 @@ scm | ctrl+k shift+f | focus=editor tabs=main.rs,*Search Editor text=3L#6cabf539
 scm | ctrl+k shift+h | status="Call hierarchy: no language server for this file"
 scm | ctrl+k shift+i | status=" excluded from broadcast input"
 scm | ctrl+k shift+l | +input("New worktree lane" "" @0)
-scm | ctrl+k shift+n | scm="Ship itN"@8 +focus StagedModified:docs/notes.md Untracked:todo.txt
+scm | ctrl+k shift+n | status="The key combination (Ctrl+K, Shift+N) is not a command."
 scm | ctrl+k shift+o | status="New Window failed: opening a new window is only supported on macOS"
 scm | ctrl+k shift+p | status="Tab is already kept open"
 scm | ctrl+k shift+q | status="Not attached to a persistent session: nothing to detach from"

@@ -48,6 +48,7 @@ class Repo:
 
     def commit(self, files: dict, message: str = "c"):
         for name, text in files.items():
+            (self.path / name).parent.mkdir(parents=True, exist_ok=True)
             (self.path / name).write_text(text)
         git(self.path, "add", "-A")
         git(self.path, "commit", "-q", "--allow-empty", "-m", message)
@@ -264,6 +265,63 @@ class PureMoves(unittest.TestCase):
             repo.commit({"a.rs": "", "b.rs": INC.replace("fn inc", "pub(crate) fn inc")})
             code, out = repo.check()
             self.assertEqual(code, 0, out)
+
+    def test_under_src_visibility_compares_by_the_modules_it_reaches(self):
+        """Under src/ the file says which module an item is in, so a move a
+        level down (src/app/codeql.rs to src/app/codeql/run.rs) can keep an
+        item's reach exactly with a new spelling: `pub(super)` there reached
+        all of `app`, which is `pub(in crate::app)` here. Kept as
+        `pub(super)`, it would reach only `codeql`: narrower, a change."""
+        app = "mod codeql;\n"
+        impl = "impl App {\n    VIS fn run(&self) {}\n}\n"
+        cases = [
+            ("pub(super)", "pub(in crate::app)", 0, ", pub(super) -> pub(in crate::app), the same reach"),
+            ("", "pub(super)", 0, ", private -> pub(super), the same reach"),
+            ("pub(super)", "pub(crate)", 0, ", pub(super) -> pub(crate))"),
+            ("pub(super)", "pub(super)", 1, "visibility narrowed or not comparable"),
+            ("pub(crate)", "pub(in crate::app)", 1, "visibility narrowed or not comparable"),
+        ]
+        for before, after, want, says in cases:
+            with self.subTest(before=before, after=after), tempfile.TemporaryDirectory() as tmp:
+                old = impl.replace("VIS ", before + " " if before else "")
+                new = impl.replace("VIS ", after + " " if after else "")
+                repo = Repo(Path(tmp), {"src/app/mod.rs": app, "src/app/codeql.rs": old})
+                repo.commit({"src/app/codeql.rs": "mod run;\n", "src/app/codeql/run.rs": new})
+                code, out = repo.check()
+                self.assertEqual(code, want, out)
+                self.assertIn(says, out)
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Repo(Path(tmp), {"src/app/codeql.rs": impl.replace("VIS ", "pub(super) ")})
+            repo.commit({
+                "src/app/codeql.rs": "mod run;\n",
+                "src/app/codeql/run.rs": impl.replace("VIS ", "pub(in crate::app) "),
+            })
+            code, out = repo.check()
+            self.assertIn("0 visibility widened, 1 respelled to the same reach", out)
+
+    def test_module_scopes_read_every_spelling(self):
+        app = pm.module_of("src/app/codeql.rs")
+        self.assertEqual(app, ("crate", "app", "codeql"))
+        self.assertEqual(pm.module_of("src/app/mod.rs", ("tests",)), ("crate", "app", "tests"))
+        self.assertEqual(pm.module_of("src/main.rs"), ("crate",))
+        self.assertIsNone(pm.module_of("a.rs"))
+        self.assertIsNone(pm.module_of("src/bin/tool.rs"))
+        self.assertEqual(pm.scope("", app), app)
+        self.assertEqual(pm.scope("pub(self)", app), app)
+        self.assertEqual(pm.scope("pub(super)", app), ("crate", "app"))
+        self.assertEqual(pm.scope("pub(incrate::app)", app), ("crate", "app"))
+        self.assertEqual(pm.scope("pub(insuper)", app), ("crate", "app"))
+        self.assertEqual(pm.scope("pub(inself::run)", app), ("crate", "app", "codeql", "run"))
+        self.assertEqual(pm.scope("pub(crate)", app), ("crate",))
+        self.assertEqual(pm.scope("pub", app), ())
+        self.assertIsNone(pm.scope("pub(super)", ("crate",)))
+        self.assertIsNone(pm.scope("pub(inother::x)", app))
+        run = ("crate", "app", "codeql", "run")
+        for reach, spelling in [
+            (run, ""), (app, "pub(super)"), (("crate", "app"), "pub(in crate::app)"),
+            (("crate",), "pub(crate)"), ((), "pub"),
+        ]:
+            self.assertEqual(pm.spelled(reach, run), spelling)
 
     def test_identical_items_moving_together_pair_by_visibility(self):
         """A private helper and an identical `pub(crate)` one, moved to two

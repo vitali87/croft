@@ -40,6 +40,19 @@ const PACKAGE_GLYPH: char = '\u{eb29}';
 const HEADER_GENERIC: &str = "DEPENDENCIES";
 const EMPTY_MESSAGE: &str = "No dependencies";
 const LOADING_MESSAGE: &str = "Loading\u{2026}";
+const FAILED_MESSAGE: &str = "Could not list dependencies";
+
+/// Where the current root's list stands, which picks the message an empty
+/// list shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Listing {
+    /// The lookup has not answered yet.
+    Loading,
+    /// The lookup answered, even with nothing.
+    Listed,
+    /// The lookup crashed or never started (#2572).
+    Failed,
+}
 
 /// A package ecosystem croft can list dependencies for, identified by the
 /// manifest file it leaves in a project root. The discriminant order is the
@@ -429,9 +442,9 @@ pub struct DependenciesPanel {
     deps: Vec<Dependency>,
     /// Section header, set from the detected ecosystems via [`Self::set_header`].
     header: String,
-    /// `true` once a fetch (even an empty one) has landed, so the panel shows
-    /// the empty state instead of spinning on "Loading".
-    loaded: bool,
+    /// Whether the current root's lookup has answered, so an empty list
+    /// shows the empty state or the failure instead of spinning on "Loading".
+    listing: Listing,
     scroll: usize,
     pub focus_gradient: bool,
     pub theme: Theme,
@@ -455,7 +468,7 @@ impl DependenciesPanel {
             collapsed: true,
             deps: Vec::new(),
             header: HEADER_GENERIC.to_string(),
-            loaded: false,
+            listing: Listing::Loading,
             scroll: 0,
             focus_gradient: false,
             theme: Theme::default(),
@@ -473,21 +486,37 @@ impl DependenciesPanel {
     }
 
     /// Set the section header for the current root's detected ecosystem(s).
-    /// A change clears the loaded flag so the panel shows "Loading" until the
-    /// new root's fetch lands instead of flashing the old root's dependencies.
+    /// A change goes back to "Loading" until the new root's fetch lands
+    /// instead of flashing the old root's dependencies.
     pub fn set_header(&mut self, header: String) {
         if header != self.header {
             self.header = header;
             self.deps.clear();
-            self.loaded = false;
+            self.listing = Listing::Loading;
             self.scroll = 0;
         }
     }
 
     pub fn set_deps(&mut self, deps: Vec<Dependency>) {
         self.deps = deps;
-        self.loaded = true;
+        self.listing = Listing::Listed;
         self.scroll = self.scroll.min(self.max_scroll());
+    }
+
+    /// The lookup crashed or could not start: say so rather than "Loading"
+    /// for a list that is not coming (#2572).
+    pub fn set_failed(&mut self) {
+        self.deps.clear();
+        self.listing = Listing::Failed;
+        self.scroll = 0;
+    }
+
+    /// A new lookup started, as when the section is shown again: a list that
+    /// had failed is loading again.
+    pub fn lookup_started(&mut self) {
+        if self.listing == Listing::Failed {
+            self.listing = Listing::Loading;
+        }
     }
 
     pub fn toggle_collapse(&mut self) {
@@ -604,10 +633,10 @@ impl Widget for &mut DependenciesPanel {
         self.viewport_rows = body_h;
 
         if self.deps.is_empty() {
-            let msg = if self.loaded {
-                EMPTY_MESSAGE
-            } else {
-                LOADING_MESSAGE
+            let msg = match self.listing {
+                Listing::Loading => LOADING_MESSAGE,
+                Listing::Listed => EMPTY_MESSAGE,
+                Listing::Failed => FAILED_MESSAGE,
             };
             Paragraph::new(Line::from(Span::styled(
                 msg,
@@ -893,6 +922,20 @@ mod tests {
         p.set_deps(vec![]);
         let text = rendered_text(&mut p, 36, 4);
         assert!(text.contains("No dependencies"), "got:\n{text}");
+    }
+
+    /// #2572: a lookup that crashed says so, and the next lookup
+    /// shows "Loading" again rather than the old failure.
+    #[test]
+    fn a_failed_lookup_says_so_until_the_next_one_starts() {
+        let mut p = DependenciesPanel::new();
+        p.collapsed = false;
+        p.set_failed();
+        let text = rendered_text(&mut p, 36, 4);
+        assert!(text.contains(FAILED_MESSAGE), "got:\n{text}");
+        p.lookup_started();
+        let text = rendered_text(&mut p, 36, 4);
+        assert!(text.contains("Loading"), "got:\n{text}");
     }
 
     #[test]

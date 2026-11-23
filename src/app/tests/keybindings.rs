@@ -801,13 +801,317 @@ fn cmd_k_arms_leader_then_unmatched_second_key_clears_it() {
     app.handle_key(key(KeyCode::Char('k'), KeyModifiers::SUPER))
         .unwrap();
     assert!(app.cmd_k_leader.is_some(), "Cmd+K arms the chord leader");
-    // A key that completes no Cmd+K chord clears the leader and falls through
-    // to its normal meaning.
-    app.handle_key(key(KeyCode::Char('q'), KeyModifiers::NONE))
+    // A key that completes no Cmd+K chord clears the leader and, as in VS
+    // Code, does nothing else but say so.
+    app.handle_key(key(KeyCode::Char('!'), KeyModifiers::NONE))
         .unwrap();
     assert!(
         app.cmd_k_leader.is_none(),
         "an unmatched second key clears the leader"
+    );
+    assert_eq!(
+        app.status,
+        format!(
+            "The key combination ({}, !) is not a command.",
+            super_k_label()
+        )
+    );
+}
+
+/// How `Cmd` (`SUPER`) + `K` reads in croft's shortcut names here.
+fn super_k_label() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "Cmd+K"
+    } else {
+        "Super+K"
+    }
+}
+
+/// VS Code's chord wait: while a `Cmd+K` leader waits for its second key
+/// the status bar says "(Cmd+K) was pressed. Waiting for second key of
+/// chord...", and the message under it is back once the chord is done.
+#[test]
+fn an_armed_cmd_k_leader_says_it_waits_for_its_second_key() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.status = String::from("Saved notes.txt");
+    let waiting = format!(
+        "({}) was pressed. Waiting for second key of chord...",
+        super_k_label()
+    );
+    let draw = |app: &mut App| {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 20)).unwrap();
+        term.draw(|f| app.render(f)).unwrap();
+        screen_text(&term)
+    };
+    assert!(!draw(&mut app).contains(&waiting), "nothing waits yet");
+
+    app.handle_key(key(KeyCode::Char('k'), KeyModifiers::SUPER))
+        .unwrap();
+    let screen = draw(&mut app);
+    assert!(
+        screen.contains(&waiting),
+        "the bar says it waits:\n{screen}"
+    );
+    assert!(!screen.contains("Saved notes.txt"), "the wait has the slot");
+
+    app.handle_key(key(KeyCode::Char('b'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.sidebar_view, SidebarView::Testing, "Cmd+K B ran");
+    let screen = draw(&mut app);
+    assert!(!screen.contains(&waiting), "the wait is over:\n{screen}");
+
+    // A wait that ends without a chord hands the slot back to the message
+    // that was there.
+    app.status = String::from("Saved notes.txt");
+    app.handle_key(key(KeyCode::Char('k'), KeyModifiers::SUPER))
+        .unwrap();
+    assert!(draw(&mut app).contains(&waiting));
+    app.on_window_focus_lost();
+    let screen = draw(&mut app);
+    assert!(!screen.contains(&waiting), "the wait is over:\n{screen}");
+    assert!(
+        screen.contains("Saved notes.txt"),
+        "the message is back:\n{screen}"
+    );
+}
+
+/// VS Code waits five seconds for the second key, not croft's old 1.5: a
+/// second key four seconds in still completes the chord, and a leader past
+/// five has left chord mode, its status line with it.
+#[test]
+fn a_cmd_k_leader_waits_five_seconds_for_its_second_key_as_vs_codes_does() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let back = |app: &mut App, secs: u64| {
+        let leader = app.cmd_k_leader.as_mut().expect("the leader is armed");
+        leader.at = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(secs))
+            .unwrap();
+    };
+
+    app.handle_key(key(KeyCode::Char('k'), KeyModifiers::SUPER))
+        .unwrap();
+    back(&mut app, 4);
+    assert!(
+        !app.expire_cmd_k(std::time::Instant::now()),
+        "still waiting"
+    );
+    app.handle_key(key(KeyCode::Char('b'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        app.sidebar_view,
+        SidebarView::Testing,
+        "four seconds in, Cmd+K B ran"
+    );
+
+    app.sidebar_view = SidebarView::Explorer;
+    app.handle_key(key(KeyCode::Char('k'), KeyModifiers::SUPER))
+        .unwrap();
+    back(&mut app, 6);
+    assert!(
+        app.expire_cmd_k(std::time::Instant::now()),
+        "the wait ended"
+    );
+    assert!(app.cmd_k_leader.is_none());
+    assert_eq!(app.cmd_k_waiting_line(), None, "and its status line");
+    app.handle_key(key(KeyCode::Char('b'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        app.sidebar_view,
+        SidebarView::Explorer,
+        "a late B is no chord"
+    );
+}
+
+/// VS Code: a second key that completes no chord, Esc included, ends the
+/// wait and does nothing else, with "The key combination (Cmd+K, Esc) is
+/// not a command." on the bar for ten seconds; a message that replaced it
+/// in the meantime is left alone.
+#[test]
+fn a_second_key_that_completes_no_cmd_k_chord_only_cancels_it_with_vs_codes_note() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = app_with_open_file(tmp.path(), "notes.txt", "keep this");
+    app.focus_pane(Pane::Editor);
+    let select = |app: &mut App| {
+        app.editor.select_all();
+        assert!(app.editor.selection.is_some());
+    };
+    // Esc on its own clears the selection: the cancel below is no accident.
+    select(&mut app);
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.editor.selection.is_none(), "Esc clears the selection");
+
+    select(&mut app);
+    app.handle_key(key(KeyCode::Char('k'), KeyModifiers::SUPER))
+        .unwrap();
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.cmd_k_leader.is_none(), "the wait is over");
+    assert!(
+        app.editor.selection.is_some(),
+        "Esc only cancelled the chord"
+    );
+    let note = format!(
+        "The key combination ({}, Esc) is not a command.",
+        super_k_label()
+    );
+    assert_eq!(app.status, note);
+
+    let later = |secs| std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    assert!(!app.expire_cmd_k(later(9)), "the note shows ten seconds");
+    assert_eq!(app.status, note);
+    assert!(app.expire_cmd_k(later(11)));
+    assert_eq!(app.status, "", "then it goes");
+
+    // A message that came after the note outlives its ten seconds.
+    app.handle_key(key(KeyCode::Char('k'), KeyModifiers::SUPER))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('!'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.status.ends_with("is not a command."));
+    app.status = String::from("Saved notes.txt");
+    assert!(app.expire_cmd_k(later(11)));
+    assert_eq!(app.status, "Saved notes.txt");
+}
+
+/// A character after a stray `Cmd+K` where typing is secret (the shell, a
+/// masked prompt) may be the first one of a password: the "is not a
+/// command" note does not name it, though it still ends the wait.
+#[test]
+fn a_secret_character_after_a_stray_cmd_k_is_not_named_in_the_note() {
+    use crate::widgets::input_prompt::{InputPrompt, InputPurpose};
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let hidden = format!(
+        "The key combination ({}, \u{2022}) is not a command.",
+        super_k_label()
+    );
+
+    app.focus = Pane::Terminal;
+    app.handle_key(key(KeyCode::Char('k'), KeyModifiers::SUPER))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('#'), KeyModifiers::NONE))
+        .unwrap();
+    assert!(app.cmd_k_leader.is_none(), "the wait is over");
+    assert_eq!(app.status, hidden, "the shell's character is not named");
+
+    // A masked prompt that opens while the wait runs (a connection asking
+    // for its password) gets the same care: the wait takes the first key.
+    app.status.clear();
+    app.focus = Pane::Editor;
+    app.handle_key(key(KeyCode::Char('k'), KeyModifiers::SUPER))
+        .unwrap();
+    app.input_prompt = Some(InputPrompt::new(InputPurpose::NewWorktreeLane, "Token", "").masked());
+    app.handle_key(key(KeyCode::Char('%'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.status, hidden, "nor a masked prompt's");
+    assert_eq!(
+        app.input_prompt.as_ref().unwrap().value,
+        "",
+        "and the prompt did not take it"
+    );
+
+    // Where typing shows, the key is named, as VS Code names it.
+    app.input_prompt = None;
+    app.status.clear();
+    app.handle_key(key(KeyCode::Char('k'), KeyModifiers::SUPER))
+        .unwrap();
+    app.handle_key(key(KeyCode::Char('!'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(
+        app.status,
+        format!(
+            "The key combination ({}, !) is not a command.",
+            super_k_label()
+        )
+    );
+}
+
+/// The chord's two status lines go through the UI catalog, so a language
+/// that translates them shows them translated (#849).
+#[test]
+fn the_cmd_k_status_lines_are_translated() {
+    let catalog = r#"{
+        "({}) was pressed. Waiting for second key of chord...": "({}) gedrückt. Warte auf die zweite Taste...",
+        "The key combination ({}) is not a command.": "Die Tastenkombination ({}) ist kein Befehl."
+    }"#;
+    crate::i18n::with_test_catalog(catalog, || {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+        let draw = |app: &mut App| {
+            let mut term =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(160, 20)).unwrap();
+            term.draw(|f| app.render(f)).unwrap();
+            screen_text(&term)
+        };
+        app.handle_key(key(KeyCode::Char('k'), KeyModifiers::SUPER))
+            .unwrap();
+        let screen = draw(&mut app);
+        assert!(
+            screen.contains(&format!(
+                "({}) gedrückt. Warte auf die zweite Taste...",
+                super_k_label()
+            )),
+            "{screen}"
+        );
+        app.handle_key(key(KeyCode::Char('!'), KeyModifiers::NONE))
+            .unwrap();
+        let screen = draw(&mut app);
+        assert!(
+            screen.contains(&format!(
+                "Die Tastenkombination ({}, !) ist kein Befehl.",
+                super_k_label()
+            )),
+            "{screen}"
+        );
+    });
+}
+
+/// A modifier going down on its way to the second key (`Shift` for
+/// `Cmd+K Shift+X`, reported on its own by the kitty protocol) leaves the
+/// leader waiting, as VS Code's does: it is no answer.
+#[test]
+fn a_modifier_going_down_leaves_the_cmd_k_leader_waiting() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.handle_key(key(KeyCode::Char('k'), KeyModifiers::SUPER))
+        .unwrap();
+    app.handle_key(key(
+        KeyCode::Modifier(crossterm::event::ModifierKeyCode::LeftShift),
+        KeyModifiers::SHIFT,
+    ))
+    .unwrap();
+    assert!(
+        app.cmd_k_leader.is_some(),
+        "still waiting for the second key"
+    );
+    assert!(
+        !app.status.contains("is not a command"),
+        "no note for a modifier"
+    );
+    app.handle_key(key(KeyCode::Char('b'), KeyModifiers::NONE))
+        .unwrap();
+    assert_eq!(app.sidebar_view, SidebarView::Testing, "Cmd+K B still ran");
+}
+
+/// VS Code leaves chord mode when its window loses focus; so does croft
+/// when the terminal it runs in does.
+#[test]
+fn losing_window_focus_ends_the_cmd_k_wait() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.handle_key(key(KeyCode::Char('k'), KeyModifiers::SUPER))
+        .unwrap();
+    assert!(app.on_window_focus_lost(), "the status line changes");
+    assert!(app.cmd_k_leader.is_none());
+    app.handle_key(key(KeyCode::Char('b'), KeyModifiers::NONE))
+        .unwrap();
+    assert_ne!(
+        app.sidebar_view,
+        SidebarView::Testing,
+        "B after the focus left is no chord"
     );
 }
 
@@ -1454,20 +1758,29 @@ fn a_file_tree_scoped_chord_fires_only_over_the_explorer() {
 }
 
 /// Guard (#843): a `Ctrl`+`K` that leads, then a key that completes no chord,
-/// drops the leader and the key keeps its meaning: `!` is typed where the
-/// caret was, and nothing is killed.
+/// drops the leader and, as VS Code's Linux `Ctrl+K` does, the key only
+/// cancels it: nothing is typed and nothing is killed, and the bar says
+/// the combination is not a command.
 #[cfg(not(target_os = "macos"))]
 #[test]
-fn ctrl_k_then_a_key_that_completes_no_chord_types_it_and_kills_nothing() {
+fn ctrl_k_then_a_key_that_completes_no_chord_types_nothing_and_kills_nothing() {
     let tmp = tempfile::tempdir().unwrap();
     let mut app = app_with_open_file(tmp.path(), "notes.txt", "keep this");
     app.editor.cursor_col = 4;
     app.handle_key(key(KeyCode::Char('k'), KeyModifiers::CONTROL))
         .unwrap();
+    assert_eq!(
+        app.cmd_k_waiting_line().as_deref(),
+        Some("(Ctrl+K) was pressed. Waiting for second key of chord...")
+    );
     app.handle_key(key(KeyCode::Char('!'), KeyModifiers::NONE))
         .unwrap();
     assert!(app.cmd_k_leader.is_none());
-    assert_eq!(app.editor.lines[0], "keep! this");
+    assert_eq!(app.editor.lines[0], "keep this");
+    assert_eq!(
+        app.status,
+        "The key combination (Ctrl+K, !) is not a command."
+    );
 }
 
 #[test]
@@ -3447,7 +3760,10 @@ fn the_keyboard_shortcuts_editor_lists_the_editor_tab_commands() {
 #[test]
 fn a_multiline_paste_confirm_disarms_a_pending_cmd_k_chord() {
     let (mut app, _tmp) = plain_paste_app();
-    app.cmd_k_leader = Some(std::time::Instant::now());
+    app.cmd_k_leader = Some(CmdKLeader {
+        at: std::time::Instant::now(),
+        label: String::from("Cmd+K"),
+    });
     app.handle_paste(TWO_LINES);
     assert!(app.pending_terminal_paste.is_some());
     assert!(app.cmd_k_leader.is_none(), "the chord is disarmed");

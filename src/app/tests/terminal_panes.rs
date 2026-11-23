@@ -3,6 +3,42 @@
 
 use super::*;
 
+/// #2569: a pane-label lookup whose thread crashed is no longer in flight.
+/// The crash notice tells the user; the next lookup then runs on cadence,
+/// instead of labels, agent detection and the ssh offer freezing until a
+/// restart.
+#[test]
+fn a_pane_label_lookup_whose_thread_crashed_lets_the_next_one_run() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    app.label_pass = Some(
+        crate::jobs::Job::spawn(
+            "pane-labels",
+            crate::jobs::Start::Now,
+            || -> crate::app::terminal_panes::LabelPass {
+                panic!("the lookup crashed (on purpose, in a test)")
+            },
+        )
+        .unwrap(),
+    );
+    // Not yet time for the next lookup, so only the crashed one settles.
+    app.last_label_refresh = std::time::Instant::now();
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(1),
+        "the crashed lookup to settle",
+        || {
+            app.refresh_terminal_labels();
+            app.label_pass.is_none()
+        },
+    );
+    let due = std::time::Instant::now()
+        .checked_sub(crate::app::terminal_panes::TERMINAL_LABEL_INTERVAL)
+        .expect("the clock is past one lookup interval");
+    app.last_label_refresh = due;
+    app.refresh_terminal_labels();
+    assert!(app.last_label_refresh > due, "the next lookup ran");
+}
+
 /// User-visible regression: with the terminal maximised via
 /// Ctrl+Shift+J, a mouse drag inside the (now fullscreen) terminal
 /// pane must reach `PtyTerminal::extend_selection_to` so the user

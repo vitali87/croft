@@ -1846,11 +1846,24 @@ impl App {
     /// whether any label changed (for redraw).
     pub(super) fn refresh_terminal_labels(&mut self) -> bool {
         let mut changed = false;
-        // Apply whatever the last background lookup resolved.
-        if let Some(samples) = self.ssh_rx.try_iter().last() {
-            self.apply_ssh_samples(samples);
-        }
-        if let Some(labels) = self.label_rx.try_iter().last() {
+        // Apply whatever the last background lookup resolved. One whose
+        // thread crashed resolved nothing, and is no longer in flight, so
+        // the next starts on cadence (#2569).
+        let resolved = match self.label_pass.as_ref().map(crate::jobs::Job::poll) {
+            None | Some(crate::jobs::Poll::Pending) => None,
+            Some(crate::jobs::Poll::Done(pass)) => {
+                self.label_pass = None;
+                Some(pass)
+            }
+            Some(crate::jobs::Poll::Died) => {
+                self.label_pass = None;
+                None
+            }
+        };
+        if let Some(LabelPass { ssh, labels }) = resolved {
+            if let Some(samples) = ssh {
+                self.apply_ssh_samples(samples);
+            }
             for (shell_pid, name, _) in &labels {
                 if let Some(t) = self
                     .terminals
@@ -1871,10 +1884,7 @@ impl App {
                 .collect();
             changed |= self.apply_agent_samples(&samples, crate::agents::QUIET_AFTER);
         }
-        if self.last_label_refresh.elapsed() >= TERMINAL_LABEL_INTERVAL
-            && !self
-                .label_inflight
-                .load(std::sync::atomic::Ordering::Relaxed)
+        if self.last_label_refresh.elapsed() >= TERMINAL_LABEL_INTERVAL && self.label_pass.is_none()
         {
             self.last_label_refresh = std::time::Instant::now();
             // (shell_pid, foreground_pid) gathered cheaply on the loop.
@@ -1892,50 +1902,65 @@ impl App {
                 changed |= self.apply_agent_samples(&[], crate::agents::QUIET_AFTER);
             }
             if !targets.is_empty() {
-                let tx = self.label_tx.clone();
-                let ssh_tx = self.ssh_tx.clone();
                 let sample_ssh = !self.remote_offer_disabled;
-                let inflight = self.label_inflight.clone();
-                inflight.store(true, std::sync::atomic::Ordering::Relaxed);
-                std::thread::spawn(move || {
-                    let named: Vec<(i32, i32, String)> = targets
-                        .into_iter()
-                        .filter_map(|(sp, fg)| {
-                            crate::widgets::terminal::process_name(fg).map(|n| (sp, fg, n))
-                        })
-                        .collect();
-                    // The ssh-pane offer (#364) rides this thread: only a
-                    // pane whose foreground IS ssh pays the argv read (a
-                    // whole-process-table enumeration), and the config
-                    // parse runs once per pass and only when one does. The
-                    // verdicts themselves are `remote::ssh_pane_samples`,
-                    // kept pure so the gate is testable without a pane.
-                    if sample_ssh {
-                        let _ = ssh_tx.send(crate::remote::ssh_pane_samples(
-                            &named,
-                            crate::remote::discover_ssh_targets,
-                            crate::widgets::terminal::process_cmdline,
-                        ));
-                    }
-                    // Only a script runtime pays the argv read (#1380): its
-                    // name is `node` whatever agent it runs.
-                    let resolved: Vec<(i32, String, Option<String>)> = named
-                        .into_iter()
-                        .map(|(sp, fg, n)| {
-                            let script = crate::agents::is_script_runtime(&n)
-                                .then(|| crate::widgets::terminal::process_cmdline(fg))
-                                .flatten()
-                                .and_then(|argv| crate::agents::script_name(&argv));
-                            (sp, n, script)
-                        })
-                        .collect();
-                    let _ = tx.send(resolved);
-                    inflight.store(false, std::sync::atomic::Ordering::Relaxed);
-                });
+                // A lookup that cannot start is tried again on the next
+                // cadence tick.
+                let job =
+                    crate::jobs::Job::spawn("pane-labels", crate::jobs::Start::Now, move || {
+                        let named: Vec<(i32, i32, String)> = targets
+                            .into_iter()
+                            .filter_map(|(sp, fg)| {
+                                crate::widgets::terminal::process_name(fg).map(|n| (sp, fg, n))
+                            })
+                            .collect();
+                        // The ssh-pane offer (#364) rides this thread: only a
+                        // pane whose foreground IS ssh pays the argv read (a
+                        // whole-process-table enumeration), and the config
+                        // parse runs once per pass and only when one does. The
+                        // verdicts themselves are `remote::ssh_pane_samples`,
+                        // kept pure so the gate is testable without a pane.
+                        let ssh = sample_ssh.then(|| {
+                            crate::remote::ssh_pane_samples(
+                                &named,
+                                crate::remote::discover_ssh_targets,
+                                crate::widgets::terminal::process_cmdline,
+                            )
+                        });
+                        // Only a script runtime pays the argv read (#1380): its
+                        // name is `node` whatever agent it runs.
+                        let resolved: Vec<(i32, String, Option<String>)> = named
+                            .into_iter()
+                            .map(|(sp, fg, n)| {
+                                let script = crate::agents::is_script_runtime(&n)
+                                    .then(|| crate::widgets::terminal::process_cmdline(fg))
+                                    .flatten()
+                                    .and_then(|argv| crate::agents::script_name(&argv));
+                                (sp, n, script)
+                            })
+                            .collect();
+                        LabelPass {
+                            ssh,
+                            labels: resolved,
+                        }
+                    });
+                self.label_pass = job.ok();
             }
         }
         changed
     }
+}
+
+/// What one pane-label lookup resolved, keyed by shell pid so it lands on
+/// the right pane even if panes moved.
+pub(super) struct LabelPass {
+    /// `(shell pid, resolved host)` per pane it looked at (#364), when the
+    /// ssh offer is on: shipped beside the names so the argv read and the
+    /// `~/.ssh/config` parse stay off the loop.
+    ssh: Option<Vec<(i32, Option<String>)>>,
+    /// `(shell pid, process name, script)`: the name becomes the pane's
+    /// label; `script` is what a script runtime (`node`) runs, for agent
+    /// recognition (#1380), `None` for anything else.
+    labels: Vec<(i32, String, Option<String>)>,
 }
 
 /// The text terminal find searches: one string per logical line (#1275).

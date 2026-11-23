@@ -159,7 +159,11 @@ class Moves(unittest.TestCase):
         root = Root(self.tmp, MOD, ONE_PR)
         code, out = root.move(1)
         self.assertEqual(code, 0, out)
-        self.assertIn("moved 6 item(s) from src/app/mod.rs to src/app/code_scanning.rs, 4 widened", out)
+        self.assertIn(
+            "moved 6 item(s) from src/app/mod.rs to src/app/code_scanning.rs, "
+            "4 private -> pub(super), 1 pub(super) -> pub(crate)",
+            out,
+        )
         root.commit()
         code, out = root.pure()
         self.assertEqual(code, 0, out)
@@ -175,7 +179,11 @@ class Moves(unittest.TestCase):
         self.assertIn("impl fmt::Display for App {", text)
         self.assertIn("\n\n/// The counter.\nimpl App {\n", text, "an emptied block's docs go with it")
 
-    def test_private_items_widen_to_the_parent_and_nothing_else_does(self):
+    def test_each_moved_item_keeps_exactly_its_reach(self):
+        """A private item of mod.rs reached all of `app`, which is `pub(super)`
+        from a file under src/app/; a `pub(super)` one reached the whole crate,
+        which from there is `pub(crate)`: kept as `pub(super)` it would reach
+        only `app`, narrower than before."""
         root = Root(self.tmp, MOD, ONE_PR)
         root.move(1)
         text = root.read("src/app/code_scanning.rs")
@@ -183,8 +191,9 @@ class Moves(unittest.TestCase):
         self.assertIn("    #[cfg(test)] pub(super) fn probe(&self) {}", text)
         self.assertIn("// Adds one.\n#[must_use]\npub(super) fn inc(x: u8)", text)
         self.assertIn("pub(super) const LIMIT: u8 = 3;", text)
-        self.assertIn("    pub(super) fn shown(&self)", text)
+        self.assertIn("    pub(crate) fn shown(&self)", text)
         self.assertNotIn("pub(super) pub(super)", text)
+        self.assertNotIn("pub(crate) pub(super)", text)
         self.assertIn("    fn fmt(&self, f: &mut fmt::Formatter<'_>)", text, "a trait method takes no visibility")
 
     def test_mod_rs_loses_emptied_blocks_and_gains_the_module_glue(self):
@@ -336,6 +345,30 @@ class Helpers(unittest.TestCase):
     GLUE = ["mod commands;", "mod remote_sessions;", "mod settings;", "use commands::*;",
             "use remote_sessions::*;", "use settings::*;", "", "pub struct App;"]
 
+    def test_a_visibility_is_respelled_to_reach_what_it_reached(self):
+        """Moving from src/app/codeql.rs into src/app/codeql/: a private item
+        reached all of `codeql`, now `pub(super)`; a `pub(super)` one reached
+        all of `app`, now `pub(in crate::app)`; wider ones stay. Without the
+        modules, only a private item changes, to `pub(super)`."""
+        src, dst = ("crate", "app", "codeql"), ("crate", "app", "codeql", "run")
+        for vis, want in [("", "pub(super)"), ("pub(super)", "pub(incrate::app)"),
+                          ("pub(crate)", "pub(crate)"), ("pub", "pub")]:
+            self.assertEqual(mi.respell(vis, src, dst), want, vis)
+        self.assertEqual(mi.respell(""), "pub(super)")
+        self.assertEqual(mi.respell("pub(super)"), "pub(super)")
+
+    def test_a_moved_pub_super_method_names_the_module_it_reached(self):
+        text = "impl App {\n    /// Runs.\n    pub(super) fn run(&self) {}\n\n    fn helper(&self) {}\n}\n"
+        code, starts_in, _ = pm.lex(text)
+        lines, clines = text.split("\n"), code.split("\n")
+        kinds = [pm.line_kind(ln, c, starts_in.get(i)) for i, (ln, c) in enumerate(zip(lines, clines))]
+        run, helper = pm.parse(text, "src/app/codeql.rs")[0]
+        src, dst = ("crate", "app", "codeql"), ("crate", "app", "codeql", "run")
+        self.assertEqual(mi.widen(lines, run, kinds, clines, "impl App", src, dst),
+                         ["    /// Runs.", "    pub(in crate::app) fn run(&self) {}"])
+        self.assertEqual(mi.widen(lines, helper, kinds, clines, "impl App", src, dst),
+                         ["    pub(super) fn helper(&self) {}"])
+
     def test_an_item_used_outside_app_is_re_exported_at_its_own_visibility(self):
         errors = [("E0603", "function import `takeover_mode_seq` is private"),
                   ("E0603", "enum import `SideBarPosition` is private")]
@@ -463,6 +496,60 @@ class Helpers(unittest.TestCase):
         with self.assertRaises(mi.BuildError) as e:
             mi.fix_glue(self.GLUE, errors, [], {"seq": ("commands", "pub(super)")})
         self.assertIn("seq is used outside app but is pub(super) in commands.rs", str(e.exception))
+
+    NESTED = ("src/app/debugger.rs", "src/app/debugger")
+    DEBUGGER_GLUE = ["//! Run and Debug.", "", "use super::*;", "", "mod adapters;",
+                     "use adapters::*;", "", "pub(super) const GRACE: u64 = 250;", ""]
+
+    def test_a_name_a_nested_split_hides_is_re_exported_at_the_same_reach(self):
+        """src/app/mod.rs has `use debugger::*;`, so the app's tests called
+        debugger.rs's `pub(super)` free functions by name. Moved a level down
+        into debugger/adapters.rs, they are found only through debugger.rs's
+        own `use adapters::*;`, which is private to debugger, so the tests
+        no longer find them (E0425), bare or as `super::name`. debugger.rs
+        re-exports each by name,
+        spelled to reach exactly what the item reaches: `pub(super)` there is
+        the `pub(in crate::app)` the move gave it, and a `pub(crate)` item
+        stays `pub(crate)`."""
+        tests = [("E0425", "cannot find function `lldb_dap_rank` in this scope"),
+                 ("E0412", "cannot find type `Probe` in this scope"),
+                 ("E0433", "failed to resolve: use of undeclared type `Probe`"),
+                 # A test in app/tests/debug.rs calling `super::debuggee_python`.
+                 ("E0425", "cannot find function `debuggee_python` in module `super`")]
+        homes = {"lldb_dap_rank": ("adapters", "pub(in crate::app)"),
+                 "Probe": ("adapters", "pub(crate)"),
+                 "debuggee_python": ("adapters", "pub(in crate::app)")}
+        lines, done = mi.fix_glue(self.DEBUGGER_GLUE, [], tests, homes, "debugger", self.NESTED)
+        self.assertEqual(lines[5:9], ["use adapters::*;", "pub(super) use adapters::lldb_dap_rank;",
+                                      "pub(super) use adapters::debuggee_python;",
+                                      "pub(crate) use adapters::Probe;"])
+        self.assertEqual(done, [
+            "re-exported adapters::Probe (pub(crate)): used outside debugger",
+            "re-exported adapters::debuggee_python (pub(super)): used outside debugger",
+            "re-exported adapters::lldb_dap_rank (pub(super)): used outside debugger",
+        ])
+
+    def test_a_hidden_name_that_reaches_only_its_split_file_stops_the_tool(self):
+        """`pub(super)` in debugger/adapters.rs reaches only debugger: a
+        re-export cannot give users outside it more than the item has."""
+        tests = [("E0425", "cannot find function `probe` in this scope")]
+        with self.assertRaises(mi.BuildError) as e:
+            mi.fix_glue(self.DEBUGGER_GLUE, [], tests, {"probe": ("adapters", "pub(super)")},
+                        "debugger", self.NESTED)
+        self.assertIn("probe is used outside debugger but is pub(super) in adapters.rs",
+                      str(e.exception))
+
+    def test_a_re_export_of_any_spelling_is_found_again(self):
+        """The re-exports a nested split writes (`pub(super)`, `pub(in ...)`)
+        are found again when the app build then finds one unused, so it gets
+        `#[cfg(test)]` like any other."""
+        for vis in ("pub(super)", "pub(in crate::app)", "pub(crate)", "pub"):
+            glue = ["mod adapters;", "use adapters::*;", f"{vis} use adapters::lldb_dap_rank;"]
+            with self.subTest(vis=vis):
+                self.assertEqual(mi.reexport_line(glue, "adapters", "lldb_dap_rank"), 2)
+                app = [("unused_imports", "unused import: `adapters::lldb_dap_rank`")]
+                lines, _ = mi.fix_glue(glue, app, [], {}, "debugger", self.NESTED)
+                self.assertEqual(lines[2:], ["#[cfg(test)]", f"{vis} use adapters::lldb_dap_rank;"])
 
     @staticmethod
     def message(level, text, code=None):
@@ -652,6 +739,26 @@ class OtherTargets(unittest.TestCase):
         code, report = self.root.pure(before)
         self.assertEqual(code, 0, report)
 
+    def test_a_test_module_with_a_visibility_moves_and_keeps_it(self):
+        """dap/session.rs's tests are `pub(crate) mod tests`, for the app's
+        tests that borrow its fake adapters: the module moves all the same,
+        and its declaration keeps the visibility, so those paths still
+        reach it."""
+        shared = EDITOR.replace("\nmod tests {", "\npub(crate) mod tests {")
+        self.assertNotEqual(shared, EDITOR)
+        (self.tmp / SPLIT.source).write_text(shared)
+        self.root.commit()
+        before = subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.tmp, capture_output=True,
+                                text=True, check=True).stdout.strip()
+        code, out = self.tests_out()
+        self.assertEqual(code, 0, out)
+        self.assertTrue(self.root.read(SPLIT.source).endswith(
+            "/// The editor's tests.\n#[cfg(test)]\npub(crate) mod tests;\n"))
+        self.assertIn("\n#[test]\nfn bumps() {\n", self.root.read("src/widgets/editor/tests.rs"))
+        self.root.commit()
+        code, report = self.root.pure(before)
+        self.assertEqual(code, 0, report)
+
     def test_a_test_module_the_target_has_no_words_for_is_refused(self):
         with self.assertRaises(mi.ManifestError) as e:
             mi.tests_out(str(self.tmp), SPLIT, False, "offer_tests")
@@ -727,13 +834,37 @@ class OtherTargets(unittest.TestCase):
     def test_every_target_names_its_own_manifest_file_and_folder(self):
         self.assertEqual(
             sorted(mi.TARGETS),
-            ["app", "editor", "git", "lsp", "pair", "remote", "search", "session_host",
-             "source_control", "terminal"],
+            ["app", "cli", "codeql", "dap_configs", "dap_session", "debugger", "editor", "file_tree",
+             "git", "language_servers", "lsp", "pair", "remote", "search", "session_host",
+             "source_control", "terminal", "test_worker"],
         )
         for t in mi.TARGETS.values():
             with self.subTest(target=t.name):
                 self.assertTrue(t.source.endswith(".rs") and t.manifest.endswith(".tsv"))
                 self.assertFalse(t.dir.endswith("/mod"), "never foo/mod.rs (#2062 guardrail 7)")
+
+    def test_no_file_is_named_after_a_crate_or_a_keyword(self):
+        # A module named after a crate shadows it in the file it splits, so the
+        # moved code's `trash::delete` would look in the new module and fail to
+        # build; a keyword (`loop`, `move`) cannot name a module at all.
+        import tomllib
+
+        cargo = tomllib.loads((Path(__file__).resolve().parents[2] / "Cargo.toml").read_text())
+        tables = [cargo, *cargo.get("target", {}).values()]
+        crates = {name.replace("-", "_") for t in tables
+                  for kind in ("dependencies", "dev-dependencies", "build-dependencies")
+                  for name in t.get(kind, {})}
+        self.assertIn("trash", crates)
+        keywords = set(
+            "as async await break const continue crate dyn else enum extern false fn for gen if "
+            "impl in let loop match mod move mut pub ref return self Self static struct super "
+            "trait true try type unsafe use where while abstract become box do final macro "
+            "override priv typeof unsized virtual yield".split())
+        for t in mi.TARGETS.values():
+            for name in [*t.files, *t.more_tests]:
+                with self.subTest(target=t.name, file=name):
+                    self.assertFalse(name in crates, f"`{name}` shadows the crate of that name")
+                    self.assertFalse(name in keywords, f"`{name}` is a keyword")
 
 
 if __name__ == "__main__":

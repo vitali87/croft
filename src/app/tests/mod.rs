@@ -44,6 +44,7 @@ mod tasks;
 mod terminal;
 mod terminal_panes;
 mod testing;
+mod tick;
 mod updates;
 mod viewers;
 mod vim;
@@ -104,6 +105,14 @@ fn app_source() -> String {
         all.push_str(&text);
     }
     all
+}
+
+/// The crash notice's slot is one for the whole process: tests that fill it,
+/// read it, or run a background pass (which takes what is in it) take turns.
+fn crash_slot_lock() -> std::sync::MutexGuard<'static, ()> {
+    static SLOT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    SLOT.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
@@ -1258,11 +1267,15 @@ fn search_hit_paths(app: &mut App, root: &std::path::Path, query: &str) -> Vec<S
     app.search.query = String::from(query);
     app.submit_search_query();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    while !app.search.complete && std::time::Instant::now() < deadline {
+    while app.search.progress != SearchProgress::Finished && std::time::Instant::now() < deadline {
         app.drain_search_results();
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
-    assert!(app.search.complete, "the search must finish");
+    assert_eq!(
+        app.search.progress,
+        SearchProgress::Finished,
+        "the search must finish"
+    );
     let mut paths: Vec<String> = app
         .search
         .hits
@@ -3180,7 +3193,7 @@ fn run_project_check(tmp: &tempfile::TempDir) -> (String, String) {
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     app.run_command(crate::widgets::command_palette::Command::ProblemsCheckProject);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
-    while app.project_check_running && std::time::Instant::now() < deadline {
+    while app.project_check.is_some() && std::time::Instant::now() < deadline {
         if !app.drain_project_check() {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }

@@ -245,6 +245,7 @@ pub fn active() -> bool {
 /// template offers every one, and a test reads the sources and fails on any
 /// such string that is neither here nor a palette title (#849).
 pub const TRANSLATABLE: &[&str] = &[
+    "({}) was pressed. Waiting for second key of chord...",
     "Add Folder to Workspace",
     "Add to Watch",
     "Ask Navigator",
@@ -343,6 +344,7 @@ pub const TRANSLATABLE: &[&str] = &[
     "TERMINAL",
     "Terminal",
     "Testing",
+    "The key combination ({}) is not a command.",
     "This tab has unsaved changes:",
     "This will overwrite your local changes from HEAD.",
     "This will permanently delete the file from disk.",

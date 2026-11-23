@@ -448,6 +448,7 @@ fn branch_status(dirty: bool) -> crate::git::GitStatus {
         prepared_message: None,
         operation: None,
         rebasing_branch: None,
+        upstream: None,
     }
 }
 
@@ -533,6 +534,7 @@ fn git_status_spans_renders_detached_hash_when_no_branch() {
         prepared_message: None,
         operation: None,
         rebasing_branch: None,
+        upstream: None,
     };
     let spans = git_status_spans(&st, crate::theme::Theme::default());
     let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
@@ -556,6 +558,7 @@ fn git_status_spans_renders_ahead_behind_counts() {
         prepared_message: None,
         operation: None,
         rebasing_branch: None,
+        upstream: None,
     };
     let spans = git_status_spans(&st, crate::theme::Theme::default());
     let joined: String = spans.iter().map(|s| s.content.as_ref()).collect();
@@ -757,7 +760,7 @@ fn a_graph_refresh_swallowed_by_an_inflight_fetch_refires_when_the_reply_drains(
     let mut app = App::new(tmp.path().to_path_buf()).unwrap();
     // Settle any startup fetch so the latch state is ours alone.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
-    while app.graph_fetch_inflight {
+    while app.graph_fetch.is_some() {
         app.sync_explorer_panels();
         assert!(
             std::time::Instant::now() < deadline,
@@ -767,18 +770,15 @@ fn a_graph_refresh_swallowed_by_an_inflight_fetch_refires_when_the_reply_drains(
     }
 
     // A fetch is mid-flight for the old root when the trigger arrives; the
-    // root change has cleared the panel back to "Loading".
+    // root change has cleared the panel back to "Loading". Its stale reply
+    // lands next and is dropped by the root tag.
     app.commit_graph.clear();
-    app.graph_fetch_inflight = true;
+    app.graph_fetch = Some(crate::jobs::Job::finished((
+        std::path::PathBuf::from("/since-left/root"),
+        None,
+        Vec::new(),
+    )));
     app.refresh_commit_graph();
-    // The stale reply lands: dropped by the root tag.
-    app.graph_tx
-        .send((
-            std::path::PathBuf::from("/since-left/root"),
-            None,
-            Vec::new(),
-        ))
-        .unwrap();
     // The re-fire is the contract, but the inflight latch is transient: the
     // drain that re-fires can also drain the re-fired worker's reply in the
     // SAME call (an empty root answers in microseconds), legitimately
@@ -793,6 +793,50 @@ fn a_graph_refresh_swallowed_by_an_inflight_fetch_refires_when_the_reply_drains(
         );
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
+}
+
+/// #2564: a fetch whose thread crashed is no longer in flight. The crash
+/// notice tells the user; the next refresh then fetches again, instead of
+/// only queueing behind it until a restart.
+#[test]
+fn a_commit_graph_fetch_whose_thread_crashed_lets_the_next_one_run() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut app = App::new(tmp.path().to_path_buf()).unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    while app.graph_fetch.is_some() {
+        app.sync_explorer_panels();
+        assert!(
+            std::time::Instant::now() < deadline,
+            "startup graph fetch must settle"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    app.graph_fetch = Some(
+        crate::jobs::Job::spawn(
+            "commit-graph",
+            crate::jobs::Start::Now,
+            || -> (
+                std::path::PathBuf,
+                Option<String>,
+                Vec<crate::widgets::commit_graph::GraphRow>,
+            ) { panic!("the fetch crashed (on purpose, in a test)") },
+        )
+        .unwrap(),
+    );
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(1),
+        "the crashed fetch to settle",
+        || {
+            app.sync_explorer_panels();
+            app.graph_fetch.is_none()
+        },
+    );
+    app.refresh_commit_graph();
+    assert!(
+        app.graph_fetch.is_some(),
+        "the next refresh started a fetch"
+    );
+    assert!(!app.graph_refetch_queued, "rather than only queueing one");
 }
 
 #[test]
@@ -3906,7 +3950,7 @@ fn clicking_a_commit_graph_row_opens_the_commit_patch_tab() {
         ready,
         "precondition: the COMMITS graph must render with a clickable row; rect {graph_rect:?}, \
          inflight {:?}, probes {:?}",
-        app.graph_fetch_inflight,
+        app.graph_fetch.is_some(),
         (40u16..44)
             .map(|y| app.commit_graph.commit_at(y).map(|c| c.short_hash.clone()))
             .collect::<Vec<_>>()
@@ -4144,6 +4188,126 @@ fn commit_graph_app(p: &std::path::Path) -> App {
         ));
     draw(&mut app, 110, 44);
     app
+}
+
+/// Whether COMMITS, drawn, shows the commit whose summary is `summary`.
+fn commits_show(app: &mut App, summary: &str) -> bool {
+    draw(app, 110, 44);
+    let area = app.commit_graph.last_area;
+    (area.y..area.y + area.height).any(|y| {
+        app.commit_graph
+            .commit_at(y)
+            .is_some_and(|c| c.summary == summary)
+    })
+}
+
+/// The ref labels COMMITS, drawn, shows on the commit whose summary is
+/// `summary`.
+fn commit_refs(app: &mut App, summary: &str) -> Vec<String> {
+    draw(app, 110, 44);
+    let area = app.commit_graph.last_area;
+    (area.y..area.y + area.height)
+        .find_map(|y| {
+            app.commit_graph
+                .commit_at(y)
+                .filter(|c| c.summary == summary)
+                .map(|c| c.refs.clone())
+        })
+        .unwrap_or_default()
+}
+
+/// One pass of the main loop's file, git and Explorer steps.
+fn run_git_ticks(app: &mut App) {
+    app.poll_filesystem_changes();
+    app.try_install_pending_init();
+    app.sync_explorer_panels();
+}
+
+/// #2577: a commit run in another terminal reaches COMMITS with nothing
+/// done in croft. It changes only git's own folder, which the file
+/// watcher skips, so before the fix COMMITS stayed stale until a file in
+/// the folder changed or Source Control was opened again.
+#[test]
+fn a_commit_made_outside_croft_reaches_commits() {
+    let tmp = commit_actions_repo();
+    let p = tmp.path();
+    let mut app = App::new(p.to_path_buf()).unwrap();
+    app.show_tree = true;
+    app.set_sidebar_view(SidebarView::SourceControl);
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(5),
+        "COMMITS to show the history",
+        || {
+            run_git_ticks(&mut app);
+            commits_show(&mut app, "update readme")
+        },
+    );
+    // Let the first status land and its git state be stamped, as the next
+    // poll would, so what follows is a change to it.
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(5),
+        "the first status",
+        || {
+            run_git_ticks(&mut app);
+            app.git.status().head_oid.is_some()
+        },
+    );
+    app.git.refresh_if_git_moved(true);
+    assert!(git_succeeds(
+        p,
+        &["commit", "-q", "--allow-empty", "-m", "made outside"]
+    ));
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(5),
+        "COMMITS to show the outside commit",
+        || {
+            run_git_ticks(&mut app);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            commits_show(&mut app, "made outside")
+        },
+    );
+}
+
+/// #2577: a checkout made outside croft to a new branch at the same
+/// commit relabels HEAD in COMMITS, though HEAD's commit did not move.
+#[test]
+fn a_checkout_made_outside_croft_relabels_commits() {
+    let tmp = commit_actions_repo();
+    let p = tmp.path();
+    let mut app = App::new(p.to_path_buf()).unwrap();
+    app.show_tree = true;
+    app.set_sidebar_view(SidebarView::SourceControl);
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(5),
+        "COMMITS to label HEAD with main",
+        || {
+            run_git_ticks(&mut app);
+            commit_refs(&mut app, "update readme")
+                .iter()
+                .any(|r| r == "HEAD -> main")
+        },
+    );
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(5),
+        "the first status",
+        || {
+            run_git_ticks(&mut app);
+            app.git.status().head_oid.is_some()
+        },
+    );
+    app.git.refresh_if_git_moved(true);
+    assert!(git_succeeds(p, &["checkout", "-q", "-b", "fresh"]));
+    crate::test_budget::await_spawned(
+        std::time::Duration::from_secs(5),
+        "COMMITS to label HEAD with the new branch",
+        || {
+            run_git_ticks(&mut app);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            commit_refs(&mut app, "update readme")
+                .iter()
+                .any(|r| r == "HEAD -> fresh")
+        },
+    );
 }
 
 /// Right-click the COMMITS row whose summary is `summary`.

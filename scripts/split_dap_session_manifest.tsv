@@ -1,0 +1,134 @@
+# Stage B of the refactor program (#2062): where each item of src/dap/session.rs goes.
+# One row per item, in file order. pr 0 means the item stays in session.rs; the others
+# move to src/dap/session/<file>.rs in that PR. kind, impl and name are as
+# `scripts/check_pure_move.py list` prints them. Run
+# `scripts/move_items.py --target dap_session --check` after adding an item to session.rs.
+# session.rs keeps DapSession, the types its fields hold, and DapEvent, which it returns.
+pr	file	kind	impl	name
+6	stepping	enum	-	StepInTargetsAsk
+0		enum	-	SessionPhase
+0		enum	-	DapEvent
+1	events	fn	-	launch_failure_reason
+4	breakpoints	struct	-	BreakpointReport
+4	breakpoints	fn	-	breakpoint_reports
+1	events	fn	-	classify_event
+1	events	fn	-	output_is_user_visible
+2	start_requests	fn	-	initialize_request
+2	start_requests	enum	-	AdapterKind
+2	start_requests	fn	-	delve_zero_config_request
+2	start_requests	fn	-	with_remote_output
+2	start_requests	fn	-	delve_test_request
+2	start_requests	fn	-	lldb_launch_request
+2	start_requests	fn	-	lldb_test_launch_request
+2	start_requests	fn	-	pytest_debug_launch_request
+2	start_requests	fn	-	launch_request
+2	start_requests	fn	-	js_launch_request
+3	child_sessions	fn	-	js_child_launch_request
+3	child_sessions	struct	-	StartDebuggingRequest
+3	child_sessions	fn	-	start_debugging_request
+0		struct	-	SourceBreakpoint
+0		fn	impl SourceBreakpoint	plain
+4	breakpoints	fn	-	set_breakpoints_request
+3	child_sessions	fn	-	reverse_request_response
+4	breakpoints	fn	-	set_function_breakpoints_request
+4	breakpoints	fn	-	data_breakpoint_info_request
+4	breakpoints	fn	-	set_data_breakpoints_request
+2	start_requests	fn	-	configuration_done_request
+5	exceptions	const	-	RAISED_FILTER_IDS
+5	exceptions	const	-	THROW_FILTER_IDS
+5	exceptions	fn	-	raised_filter_ids
+5	exceptions	fn	-	offered_exception_filters
+5	exceptions	fn	-	set_exception_breakpoints_request
+6	stepping	fn	-	thread_request
+6	stepping	fn	-	step_in_targets_request
+6	stepping	fn	-	step_in_target_request
+6	stepping	fn	-	parse_step_in_targets
+7	inspection	fn	-	threads_request
+7	inspection	fn	-	parse_threads
+7	inspection	fn	-	stack_trace_request
+7	inspection	fn	-	evaluate_request
+7	inspection	fn	-	parse_evaluate_result
+5	exceptions	fn	-	exception_summary
+7	inspection	fn	-	scopes_request
+7	inspection	fn	-	variables_request
+0		struct	-	StackFrame
+0		struct	-	Scope
+0		struct	-	Variable
+7	inspection	fn	-	parse_stack_frames
+7	inspection	fn	-	parse_scopes
+7	inspection	fn	-	parse_variables
+4	breakpoints	fn	-	update_breakpoint_lines
+4	breakpoints	fn	-	fold_breakpoint_reports
+8	running_set	struct	-	NamedSession
+8	running_set	fn	impl<S> NamedSession<S>	console_stream
+8	running_set	struct	-	ConsoleStream
+8	running_set	struct	-	DebugSessions
+8	running_set	fn	impl<S> Default for DebugSessions<S>	default
+8	running_set	fn	impl<S> DebugSessions<S>	is_empty
+8	running_set	fn	impl<S> DebugSessions<S>	len
+8	running_set	fn	impl<S> DebugSessions<S>	focused
+8	running_set	fn	impl<S> DebugSessions<S>	focused_name
+8	running_set	fn	impl<S> DebugSessions<S>	focused_mut
+8	running_set	fn	impl<S> DebugSessions<S>	replace_with
+8	running_set	fn	impl<S> DebugSessions<S>	push
+8	running_set	fn	impl<S> DebugSessions<S>	focus
+8	running_set	fn	impl<S> DebugSessions<S>	names
+8	running_set	fn	impl<S> DebugSessions<S>	remove
+8	running_set	fn	impl<S> DebugSessions<S>	focused_index
+8	running_set	fn	impl<S> DebugSessions<S>	iter_named_mut_indexed
+8	running_set	fn	impl<S> DebugSessions<S>	take_focused_backlog
+8	running_set	fn	impl<S> DebugSessions<S>	clear
+8	running_set	fn	impl<S> DebugSessions<S>	iter_mut
+0		struct	-	DapSession
+9	launch	fn	impl DapSession	launch
+9	launch	fn	impl DapSession	launch_with
+9	launch	fn	impl DapSession	attach_tcp
+9	launch	fn	impl DapSession	launch_js
+9	launch	fn	impl DapSession	launch_js_with
+9	launch	fn	impl DapSession	launch_delve
+9	launch	fn	impl DapSession	attach_delve_server
+9	launch	fn	impl DapSession	new_with_transport
+10	messages	fn	impl DapSession	active
+6	stepping	fn	impl DapSession	pause
+5	exceptions	fn	impl DapSession	set_exception_filters
+5	exceptions	fn	impl DapSession	raised_exception_filters
+5	exceptions	fn	impl DapSession	toggle_raised_exceptions
+5	exceptions	fn	impl DapSession	has_exception_filter
+7	inspection	fn	impl DapSession	evaluate
+7	inspection	fn	impl DapSession	clear_inspection
+7	inspection	fn	impl DapSession	select_thread
+7	inspection	fn	impl DapSession	load_frame
+7	inspection	fn	impl DapSession	lookup_local
+7	inspection	fn	impl DapSession	scope_key
+7	inspection	fn	impl DapSession	scope_open
+7	inspection	fn	impl DapSession	toggle_expensive_scope
+7	inspection	fn	impl DapSession	expand_variable
+7	inspection	fn	impl DapSession	request_variables
+4	breakpoints	fn	impl DapSession	apply_breakpoint_reports
+10	messages	fn	impl DapSession	poll
+10	messages	fn	impl DapSession	handle_message
+3	child_sessions	fn	impl DapSession	open_child_session
+4	breakpoints	fn	impl DapSession	push_breakpoints
+10	messages	fn	impl DapSession	supports
+4	breakpoints	fn	impl DapSession	set_function_breakpoints
+4	breakpoints	fn	impl DapSession	run_to_cursor
+4	breakpoints	fn	impl DapSession	with_run_to
+4	breakpoints	fn	impl DapSession	break_on_change
+4	breakpoints	fn	impl DapSession	clear_data_breakpoints
+4	breakpoints	fn	impl DapSession	push_data_breakpoints
+6	stepping	fn	impl DapSession	continue_execution
+4	breakpoints	fn	impl DapSession	update_breakpoints
+6	stepping	fn	impl DapSession	step
+6	stepping	fn	impl DapSession	request_step_in_targets
+6	stepping	fn	impl DapSession	step_in_target
+9	launch	fn	impl DapSession	disconnect
+2	start_requests	fn	-	is_attach
+9	launch	fn	-	delve_builds
+9	launch	fn	-	with_build_output
+0		struct	-	DebugBuildDir
+0		fn	impl DebugBuildDir	create
+0		fn	impl DebugBuildDir	path
+0		fn	impl Drop for DebugBuildDir	drop
+2	start_requests	fn	-	disconnect_request
+7	inspection	fn	-	inline_locals
+4	breakpoints	fn	-	with_run_to

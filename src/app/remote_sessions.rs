@@ -448,11 +448,22 @@ impl App {
         {
             let adopted = auth.hand_off();
             let path = self.pending_remote_launch_path.take();
-            self.install_session = Some(crate::install_session::InstallSession::start(
-                adopted,
-                host.clone(),
-                path,
-            ));
+            let session =
+                match crate::install_session::InstallSession::start(adopted, host.clone(), path) {
+                    Ok(session) => session,
+                    // No thread could start: the connect ends here, failed,
+                    // as an install that failed at once would.
+                    Err(e) => {
+                        let detail = format!("croft could not start the install: {e}");
+                        if let Some(dialog) = self.connect_dialog.as_mut() {
+                            dialog.set_failed(detail.clone());
+                        }
+                        self.tear_down_connect_auth();
+                        self.status = format!("Remote install failed: {detail}");
+                        return true;
+                    }
+                };
+            self.install_session = Some(session);
             crate::output::push(
                 crate::output::CHANNEL_REMOTE,
                 crate::output::OutputLevel::Info,
@@ -535,8 +546,23 @@ impl App {
             if let Some(dialog) = self.connect_dialog.as_mut() {
                 dialog.set_failed(detail.clone());
             }
-            self.install_session = None;
-            self.status = format!("Remote install failed: {detail}");
+            // Nothing will run through the install's SSH connection now: close
+            // it, as an install that could not start does, instead of leaving
+            // it open until croft exits (#2610). An install that already let
+            // the user into the remote croft never gets here.
+            if let Some(adopted) = self
+                .install_session
+                .take()
+                .and_then(|mut session| session.take_adopted())
+            {
+                crate::remote::close_master(adopted);
+            }
+            // An install whose thread crashed leaves the status line to the
+            // crash notice, as every background job does (#2562); the dialog
+            // says what happened to the connect.
+            if detail != crate::install_session::CRASHED_DETAIL {
+                self.status = format!("Remote install failed: {detail}");
+            }
             changed = true;
         } else if done {
             if let Some(mut session) = self.install_session.take()

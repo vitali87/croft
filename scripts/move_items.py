@@ -16,12 +16,15 @@ this cuts that PR's items out of mod.rs and writes them into the file:
 - a method goes under a copy of its original `impl` header, so App methods
   sit in `impl App {` blocks and the methods of other types under theirs;
 - items keep their order, and the second PR into a file appends to it;
-- a private item becomes `pub(super)`. That is exactly what it could reach
-  before: everything in `app`, its sibling files and its tests included. So
-  no other file can fail to build for want of it, whatever order the moves
-  and other PRs merge in. An item that is already `pub(super)` or wider keeps
-  its visibility; a method in a trait impl, a macro call and a comment carry
-  none and are copied as they are;
+- each item's visibility is spelled to reach, from its new file, exactly
+  what it reached before: a private item becomes `pub(super)` (everything in
+  `app`, its sibling files and its tests included), a `pub(super)` one
+  moving a level down names the module it reached (`pub(in crate::app)`
+  from src/app/codeql.rs into src/app/codeql/), and `pub(crate)` and `pub`
+  stay. So no other file can fail to build for want of it, whatever order
+  the moves and other PRs merge in, and nothing can see more than before.
+  A method in a trait impl, a macro call and a comment carry no visibility
+  and are copied as they are;
 - an `impl` block that has nothing left in mod.rs goes, with its header;
 - mod.rs gets `mod <file>;` and, when the file has free items (anything
   outside an `impl`), `use <file>::*;`, so code that named them still does.
@@ -34,7 +37,10 @@ the glue the build asks for, until both are clean:
 
 - an item used outside the target's module (as `crate::app::name`) is
   private through the glob, so mod.rs re-exports it by name at the item's
-  own visibility;
+  own visibility; so is one named bare where a file above globs mod.rs
+  (src/app/mod.rs's `use debugger::*;` for src/app/debugger.rs), which
+  mod.rs's own private `use <file>::*;` does not pass on, the re-export
+  spelled to reach what the item reaches;
 - a `use <file>::*;` that only the tests need gets `#[cfg(test)]` (and one
   only the app needs, `#[cfg(not(test))]`); one nothing needs goes.
 
@@ -294,6 +300,9 @@ Tree = namedtuple("Tree", "anchor folder row width")
 # each piece holds (as FILES above), where the docs list them, the prefix of
 # its release-note fragments, and the docs and note words for its tests
 # moved out (`--tests-out`): (module doc, release-note phrase, docs row).
+# `more_tests` has the same words for any other inline module moved out
+# whole, by name: remote.rs's second test module, file_tree.rs's Android
+# trash.
 Target = namedtuple("Target", "name manifest source dir files tree note_prefix tests more_tests",
                     defaults=({},))
 
@@ -1364,10 +1373,985 @@ SOURCE_CONTROL = Target(
     ),
 )
 
+# The command line's feature files (#2062): (module doc, release-note phrase, docs row).
+CLI_FILES = {
+    "version": (
+        "croft's version: the plain `x.y.z` that `--version` prints, and the provenance\n"
+        "`--build-info` prints (commit and build time, and how the binary was installed when a\n"
+        "package manager owns it).",
+        "CLI version",
+        "the plain version `--version` prints, and the provenance line `--build-info` "
+        "prints",
+    ),
+    "typos": (
+        "A misspelled subcommand: the word clap took as the `PATH` argument when it is a typo of\n"
+        "a subcommand, turned into a usage error that names the subcommand meant, rather than a\n"
+        "folder to open.",
+        "misspelled subcommand",
+        "a misspelled subcommand clap took as a folder, turned into an error that names "
+        "the one meant",
+    ),
+    "workspace": (
+        "The `PATH` and `--open-file` arguments: the workspace root and the file to open, a\n"
+        "`file:line[:col]` location, a `.code-workspace` file's folders, and a file not written\n"
+        "yet.",
+        "launch workspace",
+        "the `PATH` and `--open-file` arguments: the workspace root, the file to open and "
+        "its `file:line[:col]` location",
+    ),
+    "git_editor": (
+        "`croft edit` as git's editor: the user's own `sequence.editor`, the editor git itself\n"
+        "would run, and running it as git does, for when no croft is there to edit in.",
+        "git editor",
+        "`croft edit` as git's editor: the user's own sequence editor, and git's own "
+        "editor when no croft is there",
+    ),
+    "links": (
+        "`croft open-link` and `croft install-link-handler`: checking a link and becoming the\n"
+        "`croft remote` or `croft attach` it describes, and making croft the link's handler.",
+        "link",
+        "`croft open-link` and `croft install-link-handler`: following a link into a "
+        "session, and handling the links",
+    ),
+    "plot": (
+        "`croft plot`: a chart of what arrives on stdin, printed as an inline image where the\n"
+        "terminal shows one and as text otherwise, in the active theme's colours.",
+        "plot command",
+        "`croft plot`: a chart of stdin, as an inline image or as text, in the theme's "
+        "colours",
+    ),
+    "pair_provider": (
+        "`croft pair`'s provider flags as recorded: `--base-url` alone means ollama, and ollama\n"
+        "without an endpoint gets the standard local port.",
+        "pair provider flag",
+        "`croft pair`'s provider flags: `--base-url` alone means ollama, which defaults "
+        "to its local port",
+    ),
+    "hook": (
+        "`croft hook`: Claude Code's `PreToolUse` hook itself, and installing or removing it in\n"
+        "Claude Code's settings.",
+        "agent hook command",
+        "`croft hook`: Claude Code's edit hook itself, and installing or removing it",
+    ),
+    "keys": (
+        "`croft keys`: the diagnostic that prints each key and mouse event as croft receives it,\n"
+        "with its kind and modifiers.",
+        "key diagnostic",
+        "`croft keys`: printing each key and mouse event as croft receives it",
+    ),
+    "terminal_setup": (
+        "`croft setup-terminal`, `setup-iterm2` and `setup-ghostty`: the fonts they set, and\n"
+        "setting up Terminal.app, iTerm2 and Ghostty for croft on macOS.",
+        "terminal setup",
+        "`croft setup-terminal`, `setup-iterm2` and `setup-ghostty`: setting up macOS "
+        "terminals for croft",
+    ),
+    "vscode_import": (
+        "`croft import-vscode`: converting a VS Code profile into croft's config, and the report\n"
+        "of what was adopted, compared, dropped or refused.",
+        "VS Code import",
+        "`croft import-vscode`: converting a VS Code profile, and the report of what came "
+        "across",
+    ),
+    "theme_import": (
+        "`croft theme-import`: converting a VS Code theme, from a file or the marketplace, and\n"
+        "installing it.",
+        "theme import",
+        "`croft theme-import`: converting a VS Code theme from a file or the marketplace, "
+        "and installing it",
+    ),
+    "launcher_install": (
+        "`croft install-launcher`: the macOS Croft.app that opens a folder or a file in croft\n"
+        "inside a new Ghostty window.",
+        "launcher install",
+        "`croft install-launcher`: the macOS Croft.app that opens croft in a new Ghostty "
+        "window",
+    ),
+    "cross": (
+        "`croft setup-cross`: the targets the local cross-build for `croft <host>` builds for, and\n"
+        "installing zig, cargo-zigbuild and those targets.",
+        "cross-build setup",
+        "`croft setup-cross`: the cross-build's targets, and installing zig, "
+        "cargo-zigbuild and the targets",
+    ),
+    "commands": (
+        "Every subcommand and its flags, as clap parses them: `CliCommand`, and `croft hook`'s\n"
+        "actions.",
+        "CLI subcommand",
+        "every subcommand and its flags, as clap parses them",
+    ),
+    "run": (
+        "Running what was parsed: `Cli::run` hands each subcommand to its code, or opens the\n"
+        "workspace; and a closed stdout ends a command that only prints quietly.",
+        "CLI dispatch",
+        "running what was parsed: each subcommand handed to its code, or the workspace "
+        "opened",
+    ),
+}
+
+CLI = Target(
+    "cli", "scripts/split_cli_manifest.tsv", "src/cli.rs", "src/cli", CLI_FILES,
+    Tree(
+        "├── cli.rs ",
+        "├── cli/                 the command line's feature files, beside cli.rs; "
+        "each file's `//!` doc says what it holds",
+        "│   ├── ", 17,
+    ),
+    "cli-",
+    (
+        "The command line's own tests, moved out of cli.rs (#2062).",
+        "the command line's tests",
+        "the command line's own tests",
+    ),
+)
+
+# The CodeQL side bar's feature files (#2062): (module doc, release-note phrase, docs row).
+# The App methods move a level down, from src/app/codeql.rs into src/app/codeql/, so a
+# `pub(super)` one becomes `pub(in crate::app)`: the same reach, all of `app`.
+CODEQL_FILES = {
+    "test_runs": (
+        "CodeQL: Run Tests and Accept Test Output: every CodeQL test run through the Testing\n"
+        "view's run-all, and a failing test's output made its expected output.",
+        "CodeQL test run",
+        "CodeQL: Run Tests through the Testing view, and Accept Test Output",
+    ),
+    "cli_install": (
+        "The CodeQL CLI: which `codeql` every run uses (settings, `PATH` or croft's own copy),\n"
+        "its version, downloading it into croft's cache, and checking for a newer release.",
+        "CodeQL CLI install",
+        "the CodeQL CLI: which `codeql` runs, its version, downloading it and checking for "
+        "updates",
+    ),
+    "databases": (
+        "The CodeQL database list: the current database, removing, renaming, sorting and\n"
+        "revealing databases, upgrading one to the CLI's schema, deleting unused copies, and\n"
+        "where databases and their sources are kept.",
+        "CodeQL database list",
+        "the database list: removing, renaming, sorting, upgrading, deleting unused copies, "
+        "and where databases are kept",
+    ),
+    "database_sources": (
+        "Adding a CodeQL database: the places one comes from (a folder, an archive, a URL,\n"
+        "GitHub), the database picker, downloading and unpacking it on a worker thread,\n"
+        "registering it, and adding a database's source to the workspace.",
+        "CodeQL database source",
+        "adding a database from a folder, an archive, a URL or GitHub, and its source to the "
+        "workspace",
+    ),
+    "history": (
+        "The CodeQL query history: where runs and their results are kept, listing, removing,\n"
+        "renaming and sorting entries, an entry's query and its text, its evaluator log, and\n"
+        "its results folder.",
+        "CodeQL query history",
+        "the query history: its entries, their queries, logs and results folders",
+    ),
+    "logs": (
+        "A run's logs: the evaluator log as raw JSON, as summary text and in the log viewer,\n"
+        "the query log, and comparing two runs' performance.",
+        "CodeQL log",
+        "a run's evaluator and query logs, the log viewer, and Compare Performance",
+    ),
+    "results": (
+        "A run's results: walking a results table, decoding result sets, choosing a set, the\n"
+        "alert and raw-results views, comparing two runs' results, and exporting them.",
+        "CodeQL result",
+        "a run's results: result sets, the alert and raw views, Compare Results, Export "
+        "Results",
+    ),
+    "queries": (
+        "The workspace's queries: finding them for the side bar on a worker thread, creating\n"
+        "one, a quick query, the query a `.qlref` points at, and previewing a query's help.",
+        "CodeQL query",
+        "the workspace's queries: finding and creating them, Quick Query, query help",
+    ),
+    "packs": (
+        "Suites and packs: installing a pack's dependencies, downloading packs on a worker\n"
+        "thread, running a suite, a pack, or a published pack, and refusing a suite whose\n"
+        "results cannot be shown.",
+        "CodeQL pack",
+        "suites and packs: installing, downloading and running them",
+    ),
+    "run": (
+        "Running a query: the open query on the current database or another, quick\n"
+        "evaluation, Debug Query, running `codeql` and cancelling it, and recording a\n"
+        "finished run in the query history.",
+        "CodeQL query run",
+        "running a query, quick evaluation and Debug Query, cancelling and recording a run",
+    ),
+    "queue": (
+        "The run queue: several queries run one after another (all queries in the workspace,\n"
+        "those in selected files), one query on several databases and their checklist, and\n"
+        "cancelling what waits.",
+        "CodeQL run queue",
+        "the run queue: many queries in turn, or one query on several databases",
+    ),
+    "contextual": (
+        "Contextual queries: what they run on and the queries they resolve, View AST and its\n"
+        "viewer, and View CFG.",
+        "CodeQL AST and CFG",
+        "contextual queries: View AST and View CFG",
+    ),
+    "model_editor": (
+        "The model editor: reading a database's endpoints, modeling an endpoint, and writing\n"
+        "the models to the database's model pack.",
+        "CodeQL model editor",
+        "the model editor: endpoints, their models, and the model pack",
+    ),
+    "variant_repos": (
+        "What variant analysis runs against: its config, the controller repository, lists,\n"
+        "repositories and owners, adding repositories from a Code Search, and opening the\n"
+        "selected one on GitHub.",
+        "variant analysis repository list",
+        "variant analysis targets: the controller, lists, repositories, owners and Code "
+        "Search",
+    ),
+    "variant_runs": (
+        "Variant analysis runs: submitting the open query, following the runs, their logs,\n"
+        "fetching and opening their results, and exporting them.",
+        "variant analysis run",
+        "variant analysis runs: submitting, following, fetching and exporting results",
+    ),
+    "side_bar": (
+        "The CodeQL side bar itself: whether it is available, revealing it, its keys, what\n"
+        "each row does when activated, and keeping the chrome in step when CodeQL is added,\n"
+        "removed, enabled or disabled.",
+        "CodeQL side bar",
+        "the side bar itself: availability, its keys and what each row does",
+    ),
+}
+
+CODEQL = Target(
+    "codeql", "scripts/split_codeql_manifest.tsv", "src/app/codeql.rs", "src/app/codeql",
+    CODEQL_FILES,
+    Tree(
+        "│   ├── codeql.rs ",
+        "│   ├── codeql/          the CodeQL side bar's feature files, beside codeql.rs; "
+        "each file's `//!` doc says what it holds",
+        "│   │   ├── ", 19,
+    ),
+    "codeql-",
+    # Its tests are already their own file, src/app/tests/codeql.rs.
+    None,
+)
+
+# What each file split out of src/app/debugger.rs holds, as FILES above.
+DEBUGGER_FILES = {
+    "adapters": (
+        "Finding and installing debug adapters: lldb-dap under each name LLVM ships it as, what\n"
+        "to say when it is missing, whether a file is a runnable binary, and Debug: Install Go\n"
+        "Debugger (delve).",
+        "debug adapter",
+        "finding lldb-dap, telling a runnable binary, and installing delve",
+    ),
+    "python": (
+        "The interpreter a debugged Python program runs under: the project's own (its venv, or\n"
+        "`python3`), the one a launch request or a launch.json config names, Debug Test's, and\n"
+        "the note on one older than attach's floor.",
+        "debuggee Python",
+        "which Python a debugged program runs under, and the note on an old one",
+    ),
+    "debug_test": (
+        "Debug Test: the test at the caret or a named one, the runner for the focused file, its\n"
+        "build (`cargo test --no-run`) and launch under lldb-dap, debugpy or delve, and the\n"
+        "temporary breakpoint on the assertion the last run failed at.",
+        "Debug Test",
+        "Debug Test: the test at the caret or by name, its build, launch and failure breakpoint",
+    ),
+    "builds": (
+        "Debug builds: a launch.json `cargo` config's build, F5's C/C++ build and a single Rust\n"
+        "file's, each on a worker thread, and launching lldb-dap on the binary they make.",
+        "debug build",
+        "debug builds: `cargo`, C/C++ and single Rust files, then lldb-dap on the binary",
+    ),
+    "active_file": (
+        "The active file: Run (how to run a file, in a new terminal) and F5 with no launch\n"
+        "configuration, which picks the adapter by the file's kind: debugpy, delve, js-debug or\n"
+        "lldb-dap.",
+        "active file's run and debug",
+        "running and debugging the active file, the adapter picked by its kind",
+    ),
+    "events": (
+        "The debug sessions' events, drained every frame: stops and the paused line, output, a\n"
+        "session ending (and which one, in a compound) and the message it leaves.",
+        "debug event",
+        "the sessions' events, drained each frame: stops, output and endings",
+    ),
+    "view": (
+        "The Run and Debug view: its keys, the Run or Debug button, the paused-state tree (call\n"
+        "stack, variables), clicks and the row menu with Copy Value and Copy Call Stack,\n"
+        "revealing the view, and how a launch failure shows.",
+        "Run and Debug view",
+        "the view: its keys, button, paused-state tree, clicks, row menu and errors",
+    ),
+    "watches": (
+        "Watch expressions: adding and removing them, evaluating them at each stop, and what\n"
+        "they keep when a session ends.",
+        "watch expression",
+        "watch expressions: adding, removing and evaluating them",
+    ),
+    "console": (
+        "The debug console: its lines, program output, the REPL, mirroring to OUTPUT's Debug\n"
+        "Console channel, and hover-to-evaluate while paused.",
+        "debug console",
+        "the debug console, its REPL and OUTPUT mirror, and hover-to-evaluate",
+    ),
+    "launch": (
+        "Starting a launch: saving unsaved editors first, F5 (start or continue), the selected\n"
+        "configuration, resolving a launch.json configuration and its program, spawning its\n"
+        "adapter (a headless browser when there is no display), and installing the new session.",
+        "debug launch",
+        "F5 and launching a configuration: saving first, resolving, spawning, installing",
+    ),
+    "compounds": (
+        "Compounds and the tasks around a launch: launching a compound's members, parking a\n"
+        "launch behind its `preLaunchTask` until the task ends, `postDebugTask`, a member\n"
+        "ending, and switching between the running sessions.",
+        "compound launch",
+        "compounds, preLaunchTask waits, postDebugTask and switching sessions",
+    ),
+    "configs": (
+        "Launch configurations: Debug: Add Configuration's form, writing the draft to\n"
+        "`.croft/launch.json`, and Debug: Select and Start Debugging's picker.",
+        "launch configuration",
+        "Add Configuration and the Select and Start Debugging picker",
+    ),
+    "breakpoints": (
+        "Every kind of breakpoint: line breakpoints with conditions, hit counts and logpoints,\n"
+        "function and data breakpoints, break on raised exceptions, and sending a file's\n"
+        "breakpoints to the running sessions.",
+        "breakpoint",
+        "line, conditional, hit-count, function and data breakpoints, logpoints, exceptions",
+    ),
+    "breakpoint_list": (
+        "The BREAKPOINTS list in the Run and Debug view: its rows, keeping it current, a click\n"
+        "on one, and removing a breakpoint from it.",
+        "breakpoint list",
+        "the BREAKPOINTS list: its rows, clicks and removal",
+    ),
+    "controls": (
+        "The debug toolbar's controls: continue, pause, step over, into and out, Step Into\n"
+        "Target, Run to Cursor, restart and stop.",
+        "debug control",
+        "continue, pause, stepping, Step Into Target, Run to Cursor, restart and stop",
+    ),
+    "attach": (
+        "Attaching: the process picker for a `${command:pickProcess}` attach and for Debug:\n"
+        "Attach to Python Process, its keys, mouse and drawing, and attaching to the chosen\n"
+        "process.",
+        "attach picker",
+        "the attach process pickers and attaching to the chosen process",
+    ),
+    "inline_values": (
+        "Inline values: the values of the variables on the paused line, shown after them in the\n"
+        "editor, cleared and toggled.",
+        "inline value",
+        "inline values beside the paused lines",
+    ),
+}
+
+DEBUGGER = Target(
+    "debugger", "scripts/split_debugger_manifest.tsv", "src/app/debugger.rs", "src/app/debugger",
+    DEBUGGER_FILES,
+    Tree(
+        "│   ├── debugger.rs ",
+        "│   ├── debugger/        the Run and Debug feature files, beside debugger.rs; "
+        "each file's `//!` doc says what it holds",
+        "│   │   ├── ", 19,
+    ),
+    "debugger-",
+    # Its tests are already their own file, src/app/tests/debug.rs.
+    None,
+)
+
+# What each file split out of src/app/language_servers.rs holds, as FILES above.
+LANGUAGE_SERVERS_FILES = {
+    "sync": (
+        "Keeping the language servers in step with the open files: each tab's document opened,\n"
+        "changed and closed on its servers, the notice when shellcheck is missing, re-opening the\n"
+        "files a just-installed server covers, filing each server's diagnostics, the\n"
+        "workspace-diagnostics refresh, and Language Servers: Restart All and Restart for This\n"
+        "File.",
+        "language server sync",
+        "keeping servers in step with the open files, their diagnostics, and restarts",
+    ),
+    "rust_analyzer": (
+        "rust-analyzer's own `Rust:` commands: whether it serves the active file, sending one for\n"
+        "the caret, and acting on the answer (a macro's expansion opened as a tab, a jump to the\n"
+        "parent module or Cargo.toml, a proc-macro rebuild or workspace reload reported).",
+        "rust-analyzer command",
+        "rust-analyzer's `Rust:` commands: sending them and acting on the answers",
+    ),
+    "semantic": (
+        "Semantic highlighting: semantic-token replies handed to every editor showing the file,\n"
+        "the refresh a server asks for, which of two overlapping replies wins, and swapping in\n"
+        "each tab's finished background syntax pass.",
+        "semantic token",
+        "semantic tokens, their refresh, and the background syntax pass landing",
+    ),
+    "inlay_hints": (
+        "Inlay hints: replies routed to every editor showing the file (the seq-gated fan-out\n"
+        "that links and colors share), the refresh a server asks for, the range each request\n"
+        "covers, and Editor: Toggle Inlay Hints.",
+        "inlay hint",
+        "inlay hints: their replies, refresh, requests and the toggle",
+    ),
+    "decorations": (
+        "What a server marks in the text besides tokens and hints: document links and following\n"
+        "one, folding ranges, color swatches, and Change Color Presentation's picker.",
+        "document link, folding range and color",
+        "document links, folding ranges, colors and Change Color Presentation",
+    ),
+    "messages": (
+        "What the servers tell croft: work-done progress and the status-bar line it makes,\n"
+        "`window/*` messages as status lines, a server's questions in the list picker, and\n"
+        "`window/showDocument`.",
+        "server message",
+        "server progress, messages, questions and show-document requests",
+    ),
+    "navigation": (
+        "Go to Definition, Declaration, Type Definition, Implementations and References: the\n"
+        "request at the caret or under a Cmd-click, jumping to the answer with navigation\n"
+        "history, and the picker when there are several.",
+        "go-to",
+        "Go to Definition and its kin: requests, jumps and the multi-location picker",
+    ),
+    "peek": (
+        "Peek Definition and Peek References: the popup with its numbered excerpt, stepping\n"
+        "through the references, and closing it.",
+        "peek",
+        "Peek Definition and Peek References: the popup, its excerpt and stepping",
+    ),
+    "hierarchy": (
+        "Call and type hierarchies: asking for the callers, callees, supertypes or subtypes at\n"
+        "the caret, and the picker their answer opens.",
+        "hierarchy",
+        "call and type hierarchies: the requests and the picker of answers",
+    ),
+    "capabilities": (
+        "The active editor's language and whether its server supports a feature (declaration,\n"
+        "type definition, implementations, references, call hierarchy, code actions): the gates\n"
+        "on the right-click menu's rows.",
+        "language capability",
+        "the active file's language and which features its server supports",
+    ),
+    "breadcrumbs": (
+        "The breadcrumbs bar and sticky scroll: the crumbs for the caret, each crumb's picker of\n"
+        "folders, files or sibling symbols and its filter, View: Focus and Select Breadcrumbs,\n"
+        "and the scope headers pinned above the editor.",
+        "breadcrumb",
+        "breadcrumbs, their pickers, and the sticky-scroll headers",
+    ),
+    "outline": (
+        "The OUTLINE: keeping it in step with the active editor, the syntax-tree outline (parsed\n"
+        "off the UI thread for a large buffer) until the server's `documentSymbol` answer lands,\n"
+        "the secondary side bar that shows it, and the grammar symbol tabs parse with.",
+        "outline",
+        "the OUTLINE: syntax and server symbols, and the secondary side bar",
+    ),
+    "typing": (
+        "What a server does as you type: on-type formatting, linked editing of paired tags, the\n"
+        "characters that open parameter hints, and user snippets as completion items.",
+        "as-you-type",
+        "on-type formatting, linked editing, parameter-hint triggers and snippet items",
+    ),
+    "selection": (
+        "Expand and Shrink Selection by the server's selection ranges, and highlighting the\n"
+        "other occurrences of the symbol under a resting caret.",
+        "smart select and highlight",
+        "Expand and Shrink Selection, and occurrence highlights",
+    ),
+    "workspace_edits": (
+        "Applying a server's workspace edit: open buffers in any split edited in memory as one\n"
+        "undo step, closed files written on disk, and refusing an edit to a buffer typed into\n"
+        "since the request.",
+        "workspace edit",
+        "applying workspace edits to buffers and files, and refusing stale ones",
+    ),
+    "rename": (
+        "Rename Symbol (F2): the prompt, pre-filled from prepare-rename or the word at the caret,\n"
+        "the rename request, and landing its reply.",
+        "rename",
+        "Rename Symbol: the prompt, prepare-rename and landing the reply",
+    ),
+    "format": (
+        "Format Document and Format Selection: the server's reply or Prettier's run applied to\n"
+        "the tab it formats, and format-on-save, which writes the file unformatted once its\n"
+        "formatter has taken too long.",
+        "formatting",
+        "Format Document and Selection, Prettier, and format-on-save",
+    ),
+    "code_actions": (
+        "Quick Fix (Cmd+.): the range and diagnostics it asks about, the picker of actions, and\n"
+        "applying the chosen one's edit and command, resolving it first when the server sent it\n"
+        "bare.",
+        "code action",
+        "Quick Fix: requesting, picking, resolving and applying code actions",
+    ),
+    "go_to_symbol": (
+        "Go to Symbol in Editor (Cmd/Ctrl+Shift+O): opening it on the active file's outline,\n"
+        "its keys, mouse and drawing, and jumping to the chosen symbol.",
+        "Go to Symbol in Editor",
+        "Go to Symbol in Editor: the picker, its keys, mouse and drawing",
+    ),
+    "workspace_symbols": (
+        "Go to Symbol in Workspace (`#` in Quick Open): the debounced query to every running\n"
+        "server, its replies, the picker's keys, mouse and drawing, and jumping to the chosen\n"
+        "symbol.",
+        "Go to Symbol in Workspace",
+        "Go to Symbol in Workspace: the debounced query, replies and the picker",
+    ),
+    "code_lens": (
+        "CodeLens: asking for the active file's lenses once its edits settle, landing them on\n"
+        "every tab showing the file, running one by click or from the keyboard, and Editor:\n"
+        "Toggle CodeLens.",
+        "CodeLens",
+        "CodeLens: requesting, landing, running and toggling lenses",
+    ),
+    "hover_text": (
+        "What a hover says: the diagnostics under the pointer as one block, errors first, above\n"
+        "the server's hover text.",
+        "hover text",
+        "the hover's text: diagnostics first, then the server's answer",
+    ),
+}
+
+LANGUAGE_SERVERS = Target(
+    "language_servers", "scripts/split_language_servers_manifest.tsv",
+    "src/app/language_servers.rs", "src/app/language_servers",
+    LANGUAGE_SERVERS_FILES,
+    Tree(
+        "│   ├── language_servers.rs ",
+        "│   ├── language_servers/ the language server feature files, beside "
+        "language_servers.rs; each file's `//!` doc says what it holds",
+        "│   │   ├── ", 20,
+    ),
+    "language-servers-",
+    # Its tests are already their own file, src/app/tests/lsp.rs.
+    None,
+)
+
+# The debug session's feature files (#2062): (module doc, release-note phrase, docs row).
+DAP_SESSION_FILES = {
+    "events": (
+        "Reading what an adapter sends: a raw DAP message classified into the [`DapEvent`]\n"
+        "the app acts on, which program output is worth showing, and why an adapter refused\n"
+        "to start.",
+        "debug event",
+        "a raw DAP message classified into a `DapEvent`, the output worth showing, and why "
+        "an adapter refused to start",
+    ),
+    "start_requests": (
+        "The requests that start and end a session: `initialize`, each adapter family's\n"
+        "`launch` (debugpy, lldb-dap, delve and vscode-js-debug), `configurationDone` and\n"
+        "`disconnect`, and the adapter families themselves.",
+        "debug start request",
+        "`initialize`, each adapter family's `launch`, `configurationDone` and "
+        "`disconnect`",
+    ),
+    "child_sessions": (
+        "vscode-js-debug's child sessions: its `startDebugging` reverse request, the answer\n"
+        "every reverse request needs, and opening the child.",
+        "js-debug child session",
+        "vscode-js-debug's `startDebugging` reverse request, the answer every reverse "
+        "request needs, and opening the child",
+    ),
+    "breakpoints": (
+        "Breakpoints: line, function and data breakpoints and logpoints, what the adapter\n"
+        "reports back about each, pushing them mid-session, and Run to Cursor's one-stop\n"
+        "breakpoint.",
+        "debug breakpoint",
+        "line, function and data breakpoints, what the adapter reports back, and Run to "
+        "Cursor",
+    ),
+    "exceptions": (
+        "Exception breakpoints: the filters an adapter offers, which of them mean \"break on\n"
+        "raised exceptions\", turning those on and off, and the one-line summary of what was\n"
+        "thrown.",
+        "exception breakpoint",
+        "the exception filters an adapter offers, breaking on raised exceptions, and what "
+        "was thrown",
+    ),
+    "stepping": (
+        "Running and stepping: pause, continue, step over, into and out, and Step Into\n"
+        "Target's choice among the calls on the line.",
+        "debug stepping",
+        "pause, continue, step over, into and out, and Step Into Target",
+    ),
+    "inspection": (
+        "Inspecting a stopped program: threads, the call stack, scopes and variables,\n"
+        "expensive scopes, evaluate and the hover's lookup, and the locals inline values\n"
+        "draw from.",
+        "debug inspection",
+        "threads, the call stack, scopes and variables, evaluate, and the locals inline "
+        "values draw from",
+    ),
+    "running_set": (
+        "The debug sessions in flight: each one's name, Debug Console streams and background\n"
+        "backlog, and which one is focused.",
+        "debug session set",
+        "the sessions in flight: their names, console streams and backlogs, and which one "
+        "is focused",
+    ),
+    "launch": (
+        "Starting and ending a session: spawning or reaching each adapter (debugpy, lldb-dap,\n"
+        "delve, vscode-js-debug, a server already listening), where delve builds the program,\n"
+        "the fresh session around its transport, and disconnecting.",
+        "debug launch",
+        "spawning or reaching each adapter, delve's build folder, the fresh session, and "
+        "disconnecting",
+    ),
+    "messages": (
+        "The per-frame poll: draining what the adapters sent, the handshake, each message's\n"
+        "effect on the session, and which connection and capabilities user-facing requests\n"
+        "go to.",
+        "debug message",
+        "the per-frame poll: the handshake, each message's effect on the session, and the "
+        "adapter's capabilities",
+    ),
+}
+
+DAP_SESSION = Target(
+    "dap_session", "scripts/split_dap_session_manifest.tsv", "src/dap/session.rs",
+    "src/dap/session", DAP_SESSION_FILES,
+    Tree(
+        # remote/session.rs's row starts the same way, and comes first.
+        "│   ├── session.rs            one debug launch session",
+        "│   ├── session/         the debug session's feature files, beside session.rs; "
+        "each file's `//!` doc says what it holds",
+        "│   │   ├── ", 20,
+    ),
+    "dap-session-",
+    (
+        "The debug session's own tests, moved out of session.rs (#2062).",
+        "the debug session's tests",
+        "the debug session's own tests",
+    ),
+    {
+        "session_set_tests": (
+            "The tests of the set of debug sessions in flight, moved out of session.rs (#2062).",
+            "the session set's tests",
+            "the tests of the set of debug sessions in flight",
+        ),
+    },
+)
+
+# The Explorer's file tree's feature files (#2062): (module doc, release-note phrase, docs row).
+FILE_TREE_FILES = {
+    "roots": (
+        "The workspace roots the Explorer lists: replacing the primary root, adding and\n"
+        "removing the others' sections, and which root owns a path.",
+        "Explorer root",
+        "the workspace roots: replacing the primary, adding and removing the others, and "
+        "which owns a path",
+    ),
+    "decorations": (
+        "How a row looks: its git decoration and name colour, the folder icon's colour, the\n"
+        "active indent guide, and whether a path is ignored, gone at the scrubbed commit, or\n"
+        "changed by an agent and not yet reviewed.",
+        "Explorer row decoration",
+        "a row's git decoration, name and icon colours, the active indent guide, and "
+        "ignored or agent-changed paths",
+    ),
+    "selection": (
+        "Selecting rows: the cursor, the multi-selection and its shift-anchor, Select All,\n"
+        "and the paths Cut, Copy, Delete and drag act on.",
+        "Explorer selection",
+        "the cursor, the multi-selection and its anchor, and the paths an action takes",
+    ),
+    "listing": (
+        "Listing a folder's entries: reading them, Explorer order, compact folders, loading\n"
+        "and refreshing children with their expansion kept, and which folder a file system\n"
+        "event refreshes.",
+        "Explorer listing",
+        "reading a folder, Explorer order, compact folders, and refreshing children on "
+        "file system events",
+    ),
+    "navigation": (
+        "Moving through the tree: the arrow, page, Home and End keys with and without\n"
+        "Shift, scrolling, expanding and collapsing, Collapse All, revealing a path, and\n"
+        "type-to-find.",
+        "Explorer navigation",
+        "the arrow, page, Home and End keys, scrolling, expanding and collapsing, "
+        "revealing a path, and type-to-find",
+    ),
+    "sticky": (
+        "Sticky scroll: the folders pinned at the top while their contents scroll, and a\n"
+        "click on one.",
+        "Explorer sticky scroll",
+        "the folders pinned at the top while their contents scroll",
+    ),
+    "new_and_rename": (
+        "New File, New Folder and Rename: where a new entry goes, checking the name typed,\n"
+        "creating it, and renaming, a respelling that only changes case included.",
+        "Explorer new and rename",
+        "New File, New Folder and Rename: where an entry goes, checking its name, and "
+        "renaming",
+    ),
+    # Not `trash`: a module of that name in file_tree.rs would shadow the `trash` crate
+    # its code calls as `trash::delete`.
+    "deletion": (
+        "Delete: which rows may be deleted, and moving one or many paths to the system's\n"
+        "trash, recoverably.",
+        "Explorer delete",
+        "which rows may be deleted, and moving paths to the system's trash",
+    ),
+    "move_and_copy": (
+        "Pasting and dropping: a destination name that collides with nothing, refusing a\n"
+        "folder into itself, and moving or copying across file systems.",
+        "Explorer move and copy",
+        "pasting and dropping: a free destination name, no folder into itself, moving and "
+        "copying",
+    ),
+    "filter": (
+        "The tree filter: VS Code's fuzzy match of what was typed, and a row's name with the\n"
+        "matched letters bold.",
+        "Explorer filter",
+        "the tree filter's fuzzy match, and the matched letters bold in a row's name",
+    ),
+    "drawing": (
+        "Drawing the tree: its rows, icons, marks and guides, the sticky band, the scrollbar,\n"
+        "and the dot on a file an agent changed.",
+        "Explorer drawing",
+        "drawing the rows, icons, guides, sticky band and scrollbar",
+    ),
+}
+
+FILE_TREE = Target(
+    "file_tree", "scripts/split_file_tree_manifest.tsv", "src/widgets/file_tree.rs",
+    "src/widgets/file_tree", FILE_TREE_FILES,
+    Tree(
+        "    ├── file_tree.rs ",
+        "    ├── file_tree/        the Explorer's file tree's feature files, beside "
+        "file_tree.rs; each file's `//!` doc says what it holds",
+        "    │   ├── ", 18,
+    ),
+    "file-tree-",
+    (
+        "The Explorer's file tree's own tests, moved out of file_tree.rs (#2062).",
+        "the file tree's tests",
+        "the file tree's own tests",
+    ),
+    {
+        "android_trash": (
+            "Moving an entry to the trash on Android, where the `trash` crate has none: the\n"
+            "freedesktop.org home trash, moved out of file_tree.rs (#2062).",
+            "the Android trash's functions",
+            "the freedesktop home trash on Android, where the `trash` crate has none",
+        ),
+    },
+)
+
+# What each file split out of src/dap/configs.rs holds, as FILES above.
+DAP_CONFIGS_FILES = {
+    "inputs": (
+        "launch.json's `inputs`: reading the array, the `${input:id}` ids a configuration\n"
+        "uses, and which of them are still to ask for.",
+        "launch input",
+        "the `inputs` array, the `${input:id}` ids a configuration uses, and which are still to "
+        "ask",
+    ),
+    "discovery": (
+        "Finding the configurations: `.croft/launch.json`, then `.vscode/launch.json`, each\n"
+        "workspace folder's, the configurations and compounds each declares, and the folders\n"
+        "`${workspaceFolder:name}` names.",
+        "launch configuration discovery",
+        "finding every launch.json and what it declares, and the folders a name points at",
+    ),
+    "presentation": (
+        "`presentation` blocks: hiding an entry, its group and order, the malformed shapes\n"
+        "reported, and the picker's order, as VS Code sorts it.",
+        "launch presentation",
+        "`presentation` blocks: hidden entries, groups and order, and the picker's sort",
+    ),
+    "compounds": (
+        "Compounds: several configurations launched together, read from `compounds` and\n"
+        "resolved against the configurations beside them.",
+        "launch compound",
+        "compounds: reading them and resolving their members",
+    ),
+    "substitution": (
+        "`${...}` variables: what they resolve against, and expanding them in a string or a\n"
+        "whole configuration, with an unknown one a hard error.",
+        "launch variable",
+        "`${...}` variables: expanding them, with an unknown one an error",
+    ),
+    "env_files": (
+        "`envFile`: reading a dotenv file as python-dotenv and VS Code do, its quotes,\n"
+        "escapes, comments and `${NAME}` references.",
+        "env file",
+        "reading a dotenv `envFile`: quotes, escapes, comments and `${NAME}` references",
+    ),
+    "resolve": (
+        "Resolving a configuration: substitution done, the `envFile` loaded and the mapped\n"
+        "fields split out, cppdbg's spellings and the keys lldb-dap ignores, and the adapter\n"
+        "family a `type` maps to.",
+        "launch resolve",
+        "resolving a configuration: substitution, `envFile`, the mapped fields and the adapter a "
+        "`type` maps to",
+    ),
+    "debug_test": (
+        "The configuration for debugging tests: the one whose `purpose` says so, and laying\n"
+        "it over croft's own pytest launch.",
+        "debug-test configuration",
+        "the configuration for debugging tests, laid over croft's pytest launch",
+    ),
+    "python": (
+        "debugpy's `launch` and `attach` requests, and where an attach with `connect` goes.",
+        "debugpy request",
+        "debugpy's `launch` and `attach` requests",
+    ),
+    "lldb": (
+        "lldb-dap's `launch` and `attach` requests, the processes an attach can pick from, and\n"
+        "CodeLLDB's `cargo` block: building with cargo and picking the executable it built.",
+        "lldb request",
+        "lldb-dap's requests, the processes to attach to, and building a `cargo` block",
+    ),
+    "go": (
+        "delve's `launch` and `attach` requests: the Go extension's `auto` mode resolved, and\n"
+        "where Connect to server finds a headless delve.",
+        "delve request",
+        "delve's requests, `auto` mode, and Connect to server",
+    ),
+    "js": (
+        "vscode-js-debug's `launch` and `attach` requests: browsers and their headless\n"
+        "launch, `node-terminal`'s command, what a Node launch must name, and the\n"
+        "`__workspaceFolder` it sends.",
+        "js-debug request",
+        "vscode-js-debug's requests: browsers, `node-terminal`, and what a Node launch must name",
+    ),
+    "add_configuration": (
+        "Debug: Add Configuration…: the fields it asks for, checking each answer, the\n"
+        "launch.json entry it makes, and writing it into `.croft/launch.json` safely.",
+        "Add Configuration",
+        "Debug: Add Configuration…: its fields, the entry it makes, and writing "
+        "`.croft/launch.json`",
+    ),
+}
+
+DAP_CONFIGS = Target(
+    "dap_configs", "scripts/split_dap_configs_manifest.tsv", "src/dap/configs.rs",
+    "src/dap/configs", DAP_CONFIGS_FILES,
+    Tree(
+        # The app's debugger/configs.rs row is one level deeper, so it never starts this way.
+        "│   ├── configs.rs ",
+        "│   ├── configs/         launch.json's feature files, beside configs.rs; each file's "
+        "`//!` doc says what it holds",
+        "│   │   ├── ", 20,
+    ),
+    "dap-configs-",
+    (
+        "The launch configurations' own tests, moved out of configs.rs (#2062).",
+        "the launch configurations' tests",
+        "the launch configurations' own tests",
+    ),
+)
+
+# What each file split out of src/testing/worker.rs holds, as FILES above.
+TEST_WORKER_FILES = {
+    "runners": (
+        "Which runner runs a workspace's tests: the extensions' `[[test_runners]]`, every\n"
+        "runner that claims a folder, and the one a file's or a test's language picks.",
+        "test runner choice",
+        "which runner runs a folder's, a file's or a test's tests",
+    ),
+    "control": (
+        "Cancelling a run: the process group of the runner the worker is blocked on, and\n"
+        "killing it.",
+        "test cancel",
+        "cancelling a run by killing its runner's process group",
+    ),
+    "handle": (
+        "The app's side of the worker: queueing each kind of run and discovery, cancelling,\n"
+        "re-rooting, and draining the streamed results into the panel.",
+        "test worker handle",
+        "queueing runs and discoveries, cancelling, re-rooting, and draining results",
+    ),
+    "commands": (
+        "cargo's command line: rooted at the workspace, with `--workspace` when it has one,\n"
+        "and its build-status lines as progress.",
+        "cargo test command",
+        "cargo's command line, and its build-status lines as progress",
+    ),
+    "pytest": (
+        "pytest's command line: the interpreter or script that runs it, whether the project's\n"
+        "Python has it, and its verbosity for runs and discovery.",
+        "pytest command",
+        "pytest's command line: which Python or script runs it, and its verbosity",
+    ),
+    "go_and_codeql": (
+        "`go test -json` and `codeql test run`: finding `go`, their command lines, and\n"
+        "streaming their results.",
+        "go and CodeQL test command",
+        "`go test -json` and `codeql test run`: their command lines and results",
+    ),
+    "test_binaries": (
+        "Debugging a Rust test: the harness executables `cargo test --no-run` builds, and the\n"
+        "one that holds the test.",
+        "test binary",
+        "the cargo test harnesses built, and the one that holds a test",
+    ),
+    "js_args": (
+        "vitest's and jest's command lines: the project's own binary, vitest projects, and\n"
+        "the arguments that pick one test, a suite or a file.",
+        "JS test command",
+        "vitest's and jest's command lines, and the arguments that pick a test, a suite or a file",
+    ),
+    "streaming": (
+        "Streaming a runner's output: each line tagged with its request's epoch and runner,\n"
+        "stderr teed to OUTPUT, and the exit code.",
+        "test output streaming",
+        "streaming a runner's output, tagged with its request, and its exit code",
+    ),
+    "coverage": (
+        "Coverage runs: the LCOV each runner writes, narrowing a run to a scope, the tool that\n"
+        "measures it and installing it, and why a run produced no report.",
+        "test coverage",
+        "coverage runs: LCOV, scopes, and each runner's coverage tool",
+    ),
+    "runs": (
+        "Running tests: everything, one, several, or those matching a filter, with each\n"
+        "runner's arguments.",
+        "test run",
+        "running every test, one, several, or a filter's",
+    ),
+    "discovery": (
+        "Discovering tests without running them: each runner's lister, streamed.",
+        "test discovery",
+        "listing each runner's tests without running them",
+    ),
+    "main_loop": (
+        "The worker thread's loop: taking each request in turn and handing it to its run or\n"
+        "discovery.",
+        "test worker loop",
+        "the worker thread's loop",
+    ),
+}
+
+TEST_WORKER = Target(
+    "test_worker", "scripts/split_test_worker_manifest.tsv", "src/testing/worker.rs",
+    "src/testing/worker", TEST_WORKER_FILES,
+    Tree(
+        # git/worker.rs's row starts the same way, and comes first.
+        "│   ├── worker.rs             the test-runner command layer",
+        "│   └── worker/          the test runner's feature files, beside worker.rs; each file's "
+        "`//!` doc says what it holds",
+        "│       ├── ", 20,
+    ),
+    "test-worker-",
+    (
+        "The test runner's own tests, moved out of worker.rs (#2062).",
+        "the test runner's tests",
+        "the test runner's own tests",
+    ),
+)
+
+
 TARGETS = {
     t.name: t
     for t in (
         APP, EDITOR, LSP, TERMINAL, GIT, REMOTE, SEARCH, SESSION_HOST, PAIR, SOURCE_CONTROL,
+        CLI, CODEQL, DEBUGGER, LANGUAGE_SERVERS, DAP_SESSION, FILE_TREE, DAP_CONFIGS,
+        TEST_WORKER,
     )
 }
 
@@ -1389,6 +2373,11 @@ class BuildError(Exception):
 PRIVATE_IMPORT = re.compile(r"^[a-z]+(?: [a-z]+)* import `(\w+)` is private$")
 UNUSED_GLOB = re.compile(r"^unused import: `(\w+)::\*`$")
 UNUSED_ONE = re.compile(r"^unused import: `(\w+)::(\w+)`$")
+# A name code outside a nested split found through its parent's glob, bare
+# or as `super::name`, which the split file's own private `use <file>::*;` no
+# longer passes on.
+NOT_FOUND = re.compile(r"^(?:cannot find [a-z ,]+ `(\w+)` in (?:this scope|module `[\w:]+`)"
+                       r"|failed to resolve: use of undeclared type `(\w+)`)$")
 
 
 def item_key(it):
@@ -1505,11 +2494,29 @@ def emptied(picked, blocks, items):
     return out
 
 
-def widen(lines, it, kinds, clines, ctx):
-    """`lines` of item `it` with `pub(super) ` before its declaration when it
-    is private and can carry a visibility; otherwise as they are."""
+def respell(vis, src=None, dst=None):
+    """The visibility (whitespace-free, as `cpm` keeps it) that lets an item
+    moved from module `src` to module `dst` reach exactly what `vis` reached
+    in `src`: `pub(super)` for a private item moving a level down, and
+    `pub(in crate::app)` for a `pub(super)` one moving from src/app/codeql.rs
+    into src/app/codeql/. Without the two modules (or a reach that cannot be
+    told), a private item gets `pub(super)` and any other keeps `vis`."""
+    reach = cpm.scope(vis, src) if dst is not None else None
+    if reach is None or dst[: len(reach)] != reach:
+        return vis or "pub(super)"
+    return re.sub(r"\s+", "", cpm.spelled(reach, dst))
+
+
+def widen(lines, it, kinds, clines, ctx, src=None, dst=None):
+    """`lines` of item `it` with its visibility spelled by `respell` for a
+    move from module `src` to module `dst`: `pub(super) ` put before a
+    private declaration, or the old visibility replaced. An item that cannot
+    carry a visibility, or keeps its spelling, is as it is."""
     body = lines[it.start : it.end + 1]
-    if it.vis or it.kind not in VISIBLE or (ctx and TRAIT_IMPL.search(ctx)):
+    if it.kind not in VISIBLE or (ctx and TRAIT_IMPL.search(ctx)):
+        return body
+    want = respell(it.vis, src, dst)
+    if want == it.vis:
         return body
     # Past the docs, comments and attributes, whichever lines they take, to
     # the declaration itself.
@@ -1525,11 +2532,14 @@ def widen(lines, it, kinds, clines, ctx):
         j, col = cpm.balanced_end(clines, j, m.end() - 1, it.end + 1)
     rest = lines[j][col:]
     at = col + len(rest) - len(rest.lstrip())
-    body[j - it.start] = lines[j][:at] + "pub(super) " + lines[j][at:]
+    end = at
+    if it.vis and (m := cpm.VIS.match(lines[j], at)):
+        at, end = m.start(1), m.end(1)
+    body[j - it.start] = lines[j][:at] + cpm.shown(want) + " " + lines[j][end:]
     return body
 
 
-def render_items(lines, picked, blocks, kinds, clines, gone=frozenset()):
+def render_items(lines, picked, blocks, kinds, clines, gone=frozenset(), src=None, dst=None):
     """The moved items as Rust text: free items as they are, methods under a
     copy of their impl header, consecutive methods of one block together. A
     block in `gone` leaves mod.rs with this move, so its header comes whole,
@@ -1554,7 +2564,7 @@ def render_items(lines, picked, blocks, kinds, clines, gone=frozenset()):
         elif out and out[-1] != "" and not out[-1].rstrip().endswith("{"):
             out.append("")
         ctx = it.ctx if block is not None else ""
-        out.extend(widen(lines, it, kinds, clines, ctx))
+        out.extend(widen(lines, it, kinds, clines, ctx, src, dst))
     if current is not None:
         out.append("}")
     return out
@@ -1727,7 +2737,9 @@ def move(root, pr, fmt=True, build=True, t=APP):
     clines = code.split("\n")
     kinds = [cpm.line_kind(ln, c, starts_in.get(i)) for i, (ln, c) in enumerate(zip(lines, clines))]
     blocks = impl_blocks(glue)
-    body = render_items(lines, picked, blocks, kinds, clines, emptied(picked, blocks, items))
+    src, dst = cpm.module_of(t.source), cpm.module_of(f"{t.dir}/{file}.rs")
+    body = render_items(lines, picked, blocks, kinds, clines, emptied(picked, blocks, items),
+                        src, dst)
     free = any(enclosing(blocks, it) is None for it in picked)
 
     target = os.path.join(root, t.dir, f"{file}.rs")
@@ -1756,10 +2768,13 @@ def move(root, pr, fmt=True, build=True, t=APP):
     ])
     if fmt:
         subprocess.run(["cargo", "fmt"], cwd=root, check=True)
-    widened = sum(1 for it in picked if not it.vis and it.kind in VISIBLE
-                  and not (enclosing(blocks, it) and TRAIT_IMPL.search(it.ctx or "")))
-    print(f"PR {pr}: moved {len(picked)} item(s) from {t.source} to {t.dir}/{file}.rs, "
-          f"{widened} widened to pub(super)")
+    respelled = Counter(
+        (cpm.shown(it.vis), cpm.shown(respell(it.vis, src, dst))) for it in picked
+        if it.kind in VISIBLE and not (enclosing(blocks, it) and TRAIT_IMPL.search(it.ctx or ""))
+        and respell(it.vis, src, dst) != it.vis
+    )
+    print(f"PR {pr}: moved {len(picked)} item(s) from {t.source} to {t.dir}/{file}.rs"
+          + "".join(f", {k} {a} -> {b}" for (a, b), k in sorted(respelled.items())))
     if build:
         for line in settle(root, rows, t=t, new=file):
             print(f"  glue: {line}")
@@ -1811,6 +2826,23 @@ def read_errors(mode, status, stdout, stderr):
     return sorted(set(errors))
 
 
+def reexport_spelling(vis, file, paths=None):
+    """How the split file spells a re-export of an item of visibility `vis`
+    in its feature file `file`, so the re-export reaches what the item
+    reaches, or None when that is no further than the split file itself and
+    no user outside it could have reached the item. `paths` is the split
+    file and its folder; without them a `pub` or `pub(crate)` item keeps its
+    spelling and nothing else is re-exported."""
+    if paths is None:
+        return vis if vis in ("pub", "pub(crate)") else None
+    source, folder = paths
+    split = cpm.module_of(source)
+    reach = cpm.scope(re.sub(r"\s+", "", vis), cpm.module_of(f"{folder}/{file}.rs"))
+    if split is None or reach is None or len(reach) >= len(split) or split[:len(reach)] != reach:
+        return None
+    return cpm.shown(cpm.spelled(reach, split))
+
+
 def glob_line(lines, file):
     """The line of `use <file>::*;` in mod.rs, or None."""
     return next((n for n, ln in enumerate(lines) if ln == f"use {file}::*;"), None)
@@ -1818,7 +2850,7 @@ def glob_line(lines, file):
 
 def reexport_line(lines, file, name):
     """The line of a re-export `<vis> use <file>::<name>;` in mod.rs, or None."""
-    pat = re.compile(rf"^pub(\(\w+\))? use {file}::{name};$")
+    pat = re.compile(rf"^pub(\([^)]*\))? use {file}::{name};$")
     return next((n for n, ln in enumerate(lines) if pat.match(ln)), None)
 
 
@@ -1835,14 +2867,23 @@ def item_cfgs(text):
     return cfgs
 
 
-def fix_glue(lines, app, tests, homes, scope="app"):
+def fix_glue(lines, app, tests, homes, scope="app", paths=None):
     """mod.rs `lines` with the glue the build errors ask for, and what was
     done. `scope` names the module being split, for the messages. `app` and `tests` are the errors of the two builds; `homes` maps a
     moved free item's name to (file, visibility) or (file, visibility,
     cfgs): `cfgs` are the item's own `#[cfg(...)]` lines, which its
     re-export takes too, so a test-only item is re-exported for the tests
-    alone and the app build does not look for it. Raises BuildError when an
-    error is not one this fixes."""
+    alone and the app build does not look for it. `paths` is the split
+    file and the folder its files go to, so a re-export is spelled from
+    the reach the item has in its file; without them only `pub` and
+    `pub(crate)` items, which read the same anywhere, are re-exported.
+    Raises BuildError when an error is not one this fixes.
+
+    An item is re-exported when code outside the split file names it: by a
+    path through the split file's private glob (E0603), or, when the split
+    file sits below another file that globs it (src/app/mod.rs's `use
+    debugger::*;`), by the bare name that glob used to pass on and the
+    split file's own private `use <file>::*;` does not (E0425 and kin)."""
     lines, done, unknown = list(lines), [], []
     private, unused = set(), {"app": set(), "tests": set()}
     unused_one = {"app": set(), "tests": set()}
@@ -1850,6 +2891,8 @@ def fix_glue(lines, app, tests, homes, scope="app"):
         for code, message in errors:
             if code == "E0603" and (m := PRIVATE_IMPORT.match(message)) and m[1] in homes:
                 private.add(m[1])
+            elif (m := NOT_FOUND.match(message)) and (m[1] or m[2]) in homes:
+                private.add(m[1] or m[2])
             elif code == "unused_imports" and (m := UNUSED_GLOB.match(message)) \
                     and glob_line(lines, m[1]) is not None:
                 unused[side].add(m[1])
@@ -1868,14 +2911,16 @@ def fix_glue(lines, app, tests, homes, scope="app"):
     for name in sorted(private):
         file, vis, *rest = homes[name]
         cfgs = list(rest[0]) if rest else []
-        if vis not in ("pub", "pub(crate)"):
-            raise BuildError(f"{name} is used outside {scope} but is {vis or 'private'} in {file}.rs")
+        again = reexport_spelling(vis, file, paths)
+        if again is None:
+            shown = cpm.shown(re.sub(r"\s+", "", vis))
+            raise BuildError(f"{name} is used outside {scope} but is {shown} in {file}.rs")
         at = glob_line(lines, file)
         if at is None:
             at = next(n for n, ln in enumerate(lines) if ln == f"mod {file};")
-        lines[at + 1:at + 1] = cfgs + [f"{vis} use {file}::{name};"]
+        lines[at + 1:at + 1] = cfgs + [f"{again} use {file}::{name};"]
         only = f" only under {', '.join(c[2:-1] for c in cfgs)}" if cfgs else ""
-        done.append(f"re-exported {file}::{name} ({vis}){only}: used outside {scope}")
+        done.append(f"re-exported {file}::{name} ({again}){only}: used outside {scope}")
     for file in sorted(unused["app"] | unused["tests"]):
         at = glob_line(lines, file)
         guarded = at > 0 and lines[at - 1].startswith("#[cfg(")
@@ -1964,7 +3009,7 @@ def settle(root, rows, rounds=5, t=APP, new=None):
         homes = {n: (f, *vis[(f, n)]) for n, f in homes.items() if (f, n) in vis}
         with open(mod_path, encoding="utf-8") as f:
             lines = f.read().split("\n")
-        lines, now = fix_glue(lines, app, tests, homes, t.name)
+        lines, now = fix_glue(lines, app, tests, homes, t.name, (t.source, t.dir))
         with open(mod_path, "w", encoding="utf-8") as f:
             f.write("\n".join(lines))
         subprocess.run(["cargo", "fmt"], cwd=root, check=True)
@@ -1988,16 +3033,20 @@ def check(root, t=APP):
 
 
 def tests_header(name):
-    return re.compile(rf"(^|\n)\s*mod\s+{re.escape(name)}\s*\{{$")
+    """The header line of an inline `mod <name> {`, with or without a
+    visibility: dap/session.rs's tests are `pub(crate) mod tests`, as the
+    app's tests borrow its fake adapters."""
+    return re.compile(rf"(^|\n)\s*(?:pub(?:\([^()]*\))?\s+)?mod\s+{re.escape(name)}\s*\{{$")
 
 
 def tests_out(root, t, fmt=True, name="tests"):
     """Move the inline `mod <name> { ... }` (`mod tests` unless the target
-    names another test module) at the top level of the target's file to
+    names another module) at the top level of the target's file to
     <dir>/<name>.rs: the block's body, dedented by its indentation, and
-    `mod <name>;` where the block was. The module keeps its name and its
-    place, so its `use super::*;` still reaches the split file. The header's
-    attributes and the docs and comments above it stay. A line that starts
+    `mod <name>;` where the block was, keeping the module's visibility. The
+    module keeps its name and its place, so its `use super::*;` still
+    reaches the split file. The header's attributes (a `#[cfg(...)]`
+    included) and the docs and comments above it stay. A line that starts
     inside a string keeps its indentation, which is part of the string.
     Writes the release note and the docs row too. Returns the number of
     lines moved."""
@@ -2051,7 +3100,7 @@ def tests_out(root, t, fmt=True, name="tests"):
     if fmt:
         subprocess.run(["cargo", "fmt"], cwd=root, check=True)
     moved = close - open_line - 1
-    print(f"moved {moved} line(s) of tests from {t.source} to {t.dir}/{name}.rs")
+    print(f"moved {moved} line(s) of `mod {name}` from {t.source} to {t.dir}/{name}.rs")
     return moved
 
 
@@ -2061,7 +3110,7 @@ def main(argv=None):
     ap.add_argument("--pr", type=int, help="the PR whose items to move")
     ap.add_argument("--check", action="store_true", help="only check the manifest")
     ap.add_argument("--tests-out", nargs="?", const="tests", metavar="MODULE",
-                    help="move the file's inline `mod tests` (or the test module named) to its own file")
+                    help="move the file's inline `mod tests` (or the inline module named) to its own file")
     ap.add_argument("--root", default=".", help="the repository root")
     ap.add_argument("--no-fmt", action="store_true", help="skip `cargo fmt` (for tests)")
     ap.add_argument("--no-build", action="store_true", help="skip the build and its glue fixes (for tests)")

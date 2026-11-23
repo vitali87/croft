@@ -32,8 +32,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
+
+/// The name of Live Run's runner thread, which the crash notice names.
+pub const THREAD: &str = "croft-live-run";
+
+use crate::jobs::{Start, Worker, WorkerPoll};
 
 /// The Python side: an AST rewrite plus a JSON report writer.
 pub const INSTRUMENTER: &str = include_str!("../assets/live_run/instrument.py");
@@ -294,59 +299,109 @@ pub struct Done {
     pub outcome: Result<Report, String>,
 }
 
-/// The background runner: one thread, newest job per file wins.
+/// The background runner: one thread, newest job per file wins. A thread
+/// that crashed is started again, and one that crashes again soon after
+/// stops until Live Run is next turned on (#2597).
 pub struct Runner {
-    tx: Sender<Job>,
-    rx: Receiver<Done>,
+    worker: Worker<Job, Done>,
 }
 
 impl Runner {
     pub fn spawn() -> Self {
-        let (job_tx, job_rx) = mpsc::channel::<Job>();
-        let (done_tx, done_rx) = mpsc::channel::<Done>();
-        std::thread::Builder::new()
-            .name("croft-live-run".into())
-            .spawn(move || {
-                // Typing outpaces runs: only the newest buffer of each file
-                // matters, but every armed file with a pending job still runs
-                // (the app won't resubmit a file whose text it already sent).
-                let mut pending: Vec<Job> = Vec::new();
-                loop {
-                    if pending.is_empty() {
-                        match job_rx.recv() {
-                            Ok(job) => pending.push(job),
-                            Err(_) => return,
-                        }
-                    }
-                    while let Ok(newer) = job_rx.try_recv() {
-                        pending.retain(|j| j.path != newer.path);
-                        pending.push(newer);
-                    }
-                    let job = pending.remove(0);
-                    let outcome = run(&job);
-                    let done = Done {
-                        path: job.path,
-                        lines: job.lines,
-                        outcome,
-                    };
-                    if done_tx.send(done).is_err() {
-                        return;
-                    }
-                }
+        Self::spawn_with(run)
+    }
+
+    /// A runner whose thread runs each job with `run_job`: [`run`] outside
+    /// tests.
+    fn spawn_with(
+        run_job: impl Fn(&Job) -> Result<Report, String> + Send + Sync + 'static,
+    ) -> Self {
+        let worker = Worker::spawn(THREAD, Start::Now, move |job_rx, done_tx| {
+            serve(&job_rx, &done_tx, &run_job)
+        })
+        .expect("spawn live-run thread");
+        Runner { worker }
+    }
+
+    /// A runner whose first `crashes` threads panic on their first job,
+    /// and whose later ones answer every job with an empty report that
+    /// says it ran (#2597).
+    #[cfg(test)]
+    pub fn crashing(crashes: usize) -> Self {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let runs = AtomicUsize::new(0);
+        Self::spawn_with(move |_| {
+            if runs.fetch_add(1, Ordering::SeqCst) < crashes {
+                panic!("Live Run's runner crashed (on purpose, in a test)");
+            }
+            Ok(Report {
+                summary: String::from("Live Run: ok (stand-in)"),
+                ..Report::default()
             })
-            .expect("spawn live-run thread");
-        Runner {
-            tx: job_tx,
-            rx: done_rx,
-        }
+        })
     }
 
     pub fn submit(&self, job: Job) {
-        let _ = self.tx.send(job);
+        self.worker.send(job);
     }
 
-    pub fn try_recv(&self) -> Option<Done> {
-        self.rx.try_recv().ok()
+    /// A finished run, nothing more for now, or what happened to a thread
+    /// that ended (see [`WorkerPoll`]).
+    pub fn poll(&mut self) -> WorkerPoll<Done> {
+        self.worker.poll()
+    }
+
+    /// Start the runner again as Live Run is turned on, if it stopped after
+    /// crashing twice or its thread has ended where no tick saw it yet;
+    /// true when a fresh thread started, so what the old one was sent must
+    /// be sent again.
+    pub fn restart_if_down(&mut self) -> std::io::Result<bool> {
+        self.worker.restart_if_down()
+    }
+
+    /// Whether it stopped after crashing twice: nothing is sent to it then.
+    pub fn is_stopped(&self) -> bool {
+        self.worker.is_stopped()
+    }
+
+    /// Whether its thread has ended, for a test that must see a crash no
+    /// tick has seen.
+    #[cfg(test)]
+    pub fn has_ended(&mut self) -> bool {
+        self.worker.has_ended()
+    }
+}
+
+/// The runner thread's loop. Typing outpaces runs: only the newest buffer of
+/// each file matters, but every armed file with a pending job still runs (the
+/// app won't resubmit a file whose text it already sent).
+fn serve(
+    job_rx: &Receiver<Job>,
+    done_tx: &Sender<Done>,
+    run_job: &dyn Fn(&Job) -> Result<Report, String>,
+) {
+    let mut pending: Vec<Job> = Vec::new();
+    loop {
+        if pending.is_empty() {
+            match job_rx.recv() {
+                Ok(job) => pending.push(job),
+                Err(_) => return,
+            }
+        }
+        while let Ok(newer) = job_rx.try_recv() {
+            pending.retain(|j| j.path != newer.path);
+            pending.push(newer);
+        }
+        let job = pending.remove(0);
+        let outcome = run_job(&job);
+        let done = Done {
+            path: job.path,
+            lines: job.lines,
+            outcome,
+        };
+        if done_tx.send(done).is_err() {
+            return;
+        }
     }
 }
 
